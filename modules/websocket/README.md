@@ -10,9 +10,17 @@ WSS endpoint and WebSocket proxying, but has no dependency on that server beyond
 // server: validate the client's Upgrade request, answer 101
 const accept = try websocket.handshake.acceptHandshake(request_head, .{ .protocols = &.{"chat"} });
 try websocket.handshake.writeResponse(response_writer, accept);
-// ...or, inside an `http.Server` handler (keeps reading frames from the
-// connection's reader afterwards — it may already hold the first one):
-try websocket.handshake.respond(rw, try websocket.handshake.acceptHandshake(req.head, .{}));
+// ...or, inside an `http.Server` handler: answer the 101 and take the
+// connection over (HTTP timeouts lifted; works behind `http.proxy` too):
+const up = try websocket.handshake.respondUpgraded(req, rw, try websocket.handshake.acceptHandshake(req.head, .{}));
+var c = websocket.conn.Conn.init(.server, up.reader, up.writer, &message_buf, .{});
+while (true) {
+    const m = c.readMessage() catch |err| switch (err) {
+        error.Closed => return, // closing handshake done
+        else => return err,
+    };
+    try c.writeMessage(m.opcode, m.payload); // echo
+}
 
 // then, per received frame:
 switch (try websocket.frame.parseFrame(read_buf, .server, max_frame_size)) {
@@ -35,7 +43,8 @@ const result = try websocket.handshake.verifyResponse(response_head, &key, &.{})
 ```
 
 - **`handshake`** — `acceptHandshake(head, options) ServerAccept` / `writeResponse(w, accept)` /
-  `respond(rw, accept)` (server; `respond` answers from an `http.Server` handler); `generateKey(random) [24]u8` / `writeRequest(w, options)` /
+  `respond(rw, accept)` / `respondUpgraded(req, rw, accept)` (server; from an `http.Server`
+  handler, the latter also hands over the connection); `generateKey(random) [24]u8` / `writeRequest(w, options)` /
   `verifyResponse(head, key, offered_protocols) ClientVerifyResult` (client); shared
   `computeAcceptKey(key) [28]u8`. Subprotocol negotiation via `ServerAcceptOptions.protocols` /
   `ClientRequestOptions.protocols`. `ServerAcceptOptions.origins` is the server's `Origin`

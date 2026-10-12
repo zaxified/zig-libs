@@ -491,4 +491,4 @@ The RED comes from the foreign corpus and from nothing else.
 - **Class A** — wire/interop format — other implementations must byte-agree with it.
 - **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
 
-**What the tests actually contain.** RFC 6455 sec.1.3/sec.5.7 worked-example bytes, byte-exact parse AND write
+**What the tests actually contain.** A loopback end-to-end session (2026-10-12, `src/proxy_e2e.zig`): this module's client against its server inside an `http.Server` handler (`respondUpgraded` + `Conn`), directly and behind `http.proxy`, idle past both read timeouts. RFC 6455 sec.1.3/sec.5.7 worked-example bytes, byte-exact parse AND write

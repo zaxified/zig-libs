@@ -386,6 +386,19 @@ pub fn respond(rw: *http.Server.ResponseWriter, accept: ServerAccept) http.Serve
     return rw.upgrade("websocket");
 }
 
+/// `respond`, then the connection itself: the reader and writer the
+/// handler runs the WebSocket on (`conn.Conn`), through
+/// `http.Server.Request.upgraded` — Go's `Hijack`, which gorilla's and
+/// coder's `Accept` do inside. The HTTP timeouts are lifted on it (a
+/// WebSocket owns its liveness: `Conn.ping`, an idle bound of the
+/// handler's own); the serving loop closes the connection when the handler
+/// returns. The reader may already hold the client's first frame. Behind a
+/// reverse proxy (`http.proxy`, which relays the Upgrade) nothing changes.
+pub fn respondUpgraded(req: *http.Server.Request, rw: *http.Server.ResponseWriter, accept: ServerAccept) http.Server.ResponseWriter.UpgradeError!http.Server.Upgraded {
+    try respond(rw, accept);
+    return req.upgraded(rw) orelse error.Unsupported;
+}
+
 // ── client side ─────────────────────────────────────────────────────────
 
 /// Generate a fresh `Sec-WebSocket-Key` (§4.1 point 7): 16 random bytes,
@@ -1282,6 +1295,50 @@ test "respond: a handler answers the RFC 1.3 handshake with a 101 through http.S
         "Upgrade: websocket\r\n\r\n", out.buffered());
     // The client's first frame (a close) is still there for the frame layer.
     try std.testing.expectEqualStrings("\x88\x80", in.buffered());
+}
+
+test "respondUpgraded: the handler speaks frames on the connection after the 101" {
+    const conn = @import("conn.zig");
+    const H = struct {
+        var echoed: [16]u8 = undefined;
+        var echoed_len: usize = 0;
+        fn handle(req: *http.Server.Request, rw: *http.Server.ResponseWriter) anyerror!void {
+            const up = try respondUpgraded(req, rw, try acceptHandshake(req.head, .{}));
+            var msg_buf: [64]u8 = undefined;
+            var c = conn.Conn.init(.server, up.reader, up.writer, &msg_buf, .{});
+            while (true) {
+                const m = c.readMessage() catch |err| switch (err) {
+                    error.Closed => return,
+                    else => return err,
+                };
+                @memcpy(echoed[0..m.payload.len], m.payload);
+                echoed_len = m.payload.len;
+                try c.writeMessage(m.opcode, m.payload);
+            }
+        }
+    };
+    // RFC 6455 §5.7: a masked "Hello", then a masked close with no body.
+    const wire = "GET /chat HTTP/1.1\r\nHost: server.example.com\r\nUpgrade: websocket\r\n" ++
+        "Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n" ++
+        "\x81\x85\x37\xfa\x21\x3d\x7f\x9f\x4d\x51\x58" ++ "\x88\x80\x00\x00\x00\x00";
+    // Writable: frames are unmasked in place in the reader's buffer.
+    var wire_buf = wire.*;
+    var in: std.Io.Reader = .fixed(&wire_buf);
+    var out_buf: [512]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var head_buf: [1024]u8 = undefined;
+    var body_buf: [64]u8 = undefined;
+    var resp_buf: [64]u8 = undefined;
+    var chunk_buf: [64]u8 = undefined;
+    http.Server.serveStream(.{ .handler = H.handle, .server_name = null }, &in, &out, .{
+        .head = &head_buf,
+        .request_body = &body_buf,
+        .response_body = &resp_buf,
+        .chunk = &chunk_buf,
+    });
+    try std.testing.expectEqualStrings("Hello", H.echoed[0..H.echoed_len]);
+    // The 101, then the unmasked echo (§5.7) and the close answered.
+    try std.testing.expect(std.mem.endsWith(u8, out.buffered(), "\r\n\r\n\x81\x05Hello\x88\x00"));
 }
 
 test "respond: refused on a writer that cannot upgrade, with no header left behind" {

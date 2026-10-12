@@ -153,7 +153,7 @@ const module_list = [_]Module{
     // concurrency invariants can only be exercised by real threads.
     // `zig build check-testonly` proves the published module never needs it.
     .{ .name = "http", .libs = &.{ "web", "crypto", "format", "net" }, .deps = &.{ "netaddr", "datefmt", "tlsclient", "crc32" }, .test_deps = &.{ "testkit", "workerpool" }, .loopback = true },
-    .{ .name = "websocket", .libs = &.{"web"}, .deps = &.{"http"}, .test_deps = &.{"testkit"} },
+    .{ .name = "websocket", .libs = &.{"web"}, .deps = &.{"http"}, .test_deps = &.{"testkit"}, .loopback = true },
     .{ .name = "accesslog", .libs = &.{"web"}, .deps = &.{ "http", "router" }, .test_deps = &.{"testkit"} },
     .{ .name = "staticfiles", .libs = &.{"web"}, .deps = &.{"http"}, .test_deps = &.{"testkit"} },
     .{ .name = "brotli", .libs = &.{"web"}, .test_deps = &.{"testkit"} },

@@ -74,4 +74,5 @@ test {
     _ = connection;
     _ = deflate;
     _ = conn;
+    _ = @import("proxy_e2e.zig");
 }

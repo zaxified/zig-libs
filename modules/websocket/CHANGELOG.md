@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-12** — **`handshake.respondUpgraded`: run the WebSocket inside an `http.Server`
+  handler, additive.** `respond` plus `http.Server.Request.upgraded`: the connection's reader and
+  writer for `conn.Conn`, with the HTTP timeouts lifted (gorilla's and coder's `Accept` hijack the
+  same way). Before, a socket-served handler could answer the 101 but not read a frame. New
+  loopback test: this module's client against its server directly and behind `http.proxy`; the
+  module's test lane now runs in the private network namespace (`.loopback`).
+
 - **2026-10-11** — Docs: owner accepted the bench installing `fastmem` as the measurement behind P2
   (`write_deflate` 0.93× with it, 2.0× with compiler_rt's byte-wise memset).
 
