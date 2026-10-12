@@ -347,12 +347,12 @@ Not claimed: any speedup. The in-memory `SimStorage` makes an inner read a memcp
   reader is parked mid-fill of the root page.
 - ~~**Narrowing the remaining `clear()`s.**~~ **DONE 2026-09-29.** `truncate` and
   sub-page/failed writes are narrowed to the handle (truncate: only pages at or past the new
-  length); `create_truncate` open, `rename` and `delete` stay whole-cache on purpose (see
-  Invalidation: handle -> path is opaque, so other handles on the same file cannot be found).
+  length); `create_truncate` open, `rename` and `delete` stayed whole-cache at the time (**superseded 2026-10-12**: per-file invalidation by file id, see Invalidation above; was: see
+  Invalidation: handle -> path was opaque, so other handles on the same file could not be found).
 - **Write-back / dirty buffering.** Deliberately excluded — incompatible with
   kvtree's ordered-commit durability model.
 - ~~**Prefetch / read-ahead.**~~ **DONE 2026-09-29**, opt-in (`Options.read_ahead_pages`, default 0 =
-  unchanged behaviour; see Read-ahead below). Only the copying `pread` path prefetches; a
+  unchanged behaviour; see Read-ahead above). Only the copying `pread` path prefetches; a
   `preadRef` miss records the access but does not read ahead (its slot is a single reservation).
 - **Cross-thread sharing.** Inherits `single_owner` from both `ramcache` and
   `kvtree`; a shared deployment must wrap the owner in its own lock.

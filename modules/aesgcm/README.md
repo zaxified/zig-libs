@@ -61,7 +61,7 @@ _ = aesgcm.backend(); // .aesni or .generic
   keep 12 unless a format fixes another — and tags of 16, 15, 14, 13, 12 bytes,
   or 8 and 4 under SP 800-38D Appendix C's limits (yours to enforce). Other
   lengths are compile errors.
-- **Size:** a `Context` is ≤ 320 bytes (AES-128) / ≤ 384 (AES-256).
+- **Size:** a `Context` is ≤ 320 bytes (AES-128) / ≤ 352 (AES-192) / ≤ 384 (AES-256).
 - `Gcm.initWith(.generic, key)` / `aesgcm.available(b)` pick a backend
   explicitly, for comparisons.
 
@@ -95,6 +95,6 @@ source was read for or translated into this code. Test
 vectors: the McGrew–Viega GCM test cases are the specification's own published
 examples; `src/testdata/openssl_kat.zig` is generated data from our own tooling
 (`tools/openssl_kat.py`), which runs OpenSSL as a black-box oracle over inputs
-of our choosing; `src/testdata/wycheproof.zig` reproduces 133 Wycheproof
+of our choosing; `src/testdata/wycheproof.zig` reproduces 310 Wycheproof
 vectors, Apache-2.0 test data — see [NOTICE](NOTICE), which must travel with
 the module.

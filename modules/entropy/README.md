@@ -1,9 +1,11 @@
 # entropy
 
 One blessed **fail-closed** entropy source for secret-bearing draws: `fill`
-takes bytes from `std.Io.randomSecure` or aborts the process. It implements no
-generator and holds no state — every byte it returns came out of
-`randomSecure` on that call.
+takes bytes from the kernel CRNG or aborts the process. It implements no
+generator: every byte it returns came out of `std.Io.randomSecure` or, on Linux
+without libc under std's own `Threaded` Io, out of the kernel's vDSO
+`getrandom` (the same CRNG, run in user space from a kernel-keyed state; see
+`src/vgetrandom.zig`).
 
 - **Why:** std 0.16's `std.Io.random` is a CSPRNG with a documented
   silent-degrade clause ("seeded by `randomSecure`, or a less secure mechanism
@@ -16,8 +18,10 @@ generator and holds no state — every byte it returns came out of
   bridge.
 - **Platform:** any (`std.Io` carries the OS-specific half — `getrandom(2)` on
   Linux, `arc4random_buf` under libc). **Role:** util.
-  **Concurrency:** reentrant (no state at all; `randomSecure` is documented
-  threadsafe). **Allocation:** none, anywhere.
+  **Concurrency:** reentrant (the vDSO path keeps a lock-free pool of
+  kernel-sized states in one mmap'd mapping, each taken by an atomic busy flag;
+  `randomSecure` is documented threadsafe). **Allocation:** none from an
+  allocator; the vDSO state pool is a kernel `mmap`, not heap.
 - **It aborts the host process.** That is a deliberate trade and it is the
   floor, not the recommendation — see [Which one to call](#which-one-to-call).
 
@@ -42,7 +46,7 @@ entropy.fill(io, &key);
 // A std.Random bound to randomSecure — the fail-closed counterpart of
 // std.Random.IoSource, for internals written against std.Random.
 var src: entropy.SecureSource = .{ .io = io };
-const random = src.interface();   // every draw is a randomSecure syscall
+const random = src.interface();   // every draw goes through fill (the vDSO path, else a randomSecure syscall)
 
 // The abort message is public, so a consumer can pin it in its own tests.
 _ = entropy.unavailable_message;
@@ -80,9 +84,12 @@ itself.
 
 - Zero-length buffers are legal and still make the call, so "no bytes needed"
   cannot be mistaken for "entropy works here".
-- `SecureSource` makes **every** draw a syscall, including the single bytes
-  `std.Random.int`/`uintLessThan` take. Correct for key and nonce material;
-  wasteful for anything else. Measured 2026-08-13, ReleaseFast: **816 ns per
+- `SecureSource` makes **every** draw a call to `fill`, including the single
+  bytes `std.Random.int`/`uintLessThan` take. Correct for key and nonce
+  material; wasteful for anything else. Where `fill` has to take the
+  `randomSecure` syscall each of those is a syscall, and the numbers below were
+  measured that way, **before the vDSO path (2026-10-10)** existed: measured
+  2026-08-13, ReleaseFast: **816 ns per
   `int(u32)`**, of which **771 ns is the bare `getrandom(2)`** — so 94% of it is
   the syscall and there is nothing in the adapter to tune. Against one bulk
   `fill` of the same bytes it is **65×**. A consumer that needs thousands of

@@ -11,7 +11,7 @@ of logging an `http` request/response pair.
   escaping rule) + Heroku/`kr/logfmt` (logfmt) + the common JSON-Lines access-log convention
   (Caddy/nginx json access log).
 - **Platform:** any. **Role:** codec. **Concurrency:** threadsafe (`Sink`; the formatters are pure functions, no shared
-  state). **Deps:** `http` (for the `entryFromRequest` bridge) + std only.
+  state). **Deps:** `http` (for the `entryFromRequest` bridge), `router` (the middleware) + std only.
 
 Provenance: original work of the zig-libs authors (MIT). No third-party code.
 DATA: `src/json_oracle_vectors.zig` holds entries our tooling drew

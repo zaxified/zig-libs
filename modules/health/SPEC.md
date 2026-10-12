@@ -29,7 +29,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [alexliesenfeld/health](https://github.com/alexliesenfeld/health) — **reference** | Go | MIT | 835 | v0.8.1 (2025-06-21); pushed 2026-06-15 | The best-documented standalone health-endpoint library. README-verified: an `http.Handler` answering 200/503 with a JSON body of per-component status; per-check and global timeouts; result caching (default 1 s); periodic (asynchronous) checks; a status-change listener; middleware/interceptors. |
 | [hellofresh/health-go](https://github.com/hellofresh/health-go) | Go | Apache-2.0 | 589 | v5.5.5 (2025-07-07) | README-verified: named components with per-component timeouts and ready-made checkers for common backends (Memcached and others), JSON response. |
 | [InVisionApp/go-health](https://github.com/InVisionApp/go-health) | Go | MIT | 748 | v2.1.4 (2023-07-24); **archived** | Background-polling checkers with HTTP status output; archived, listed only as the prior art. *(inferred from the archive flag and name)* |
-| Kubernetes probe model (liveness/readiness/startup) | — | n/a (documentation, not source) | — | — | The contract this module is modelled on. The kubelet reads only the status code; three probe kinds, of which we serve two. |
+| Kubernetes probe model (liveness/readiness/startup) | — | n/a (documentation, not source) | — | — | The contract this module is modelled on. The kubelet reads only the status code; three probe kinds, all served (the startup probe is opt-in). |
 | Zig (`karlseguin/http.zig`, `zigzap/zap`) | Zig | MIT | 1.6k / 3.4k | pushed 2026-08-26 / 2026-09-06 (zap **archived**) | Neither README documents a health-probe endpoint; a Zig service writes its own. |
 
 **Where we are ahead:** the only ready-made probe middleware found for a Zig server; zero allocation, immutable config, router-free `probeFor`/`respond`, `detail = false` to keep dependency names off an external probe, and each check runs exactly once per probe so body and status agree. **Where we are behind:** ~~the Go libraries answer with a JSON component report~~ DONE 2026-10-11 (opt-in `json`, the reference's `{"status","details":{name:{"status"}}}` shape, no timestamps or error strings since `Check`s return `bool`); ~~no startup probe~~ DONE 2026-10-11 (opt-in `startup = .{ .started = &flag }`). Per-check timeouts, result caching and periodic background checks are absent **by design** (SPEC: `Check`s are cheap atomic-flag loads the application updates; no dependency polling).
@@ -38,9 +38,9 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 Liveness always answers 200 — a bare "the server can run this handler" check; this module never
 fails liveness, since a liveness failure/no-response is what tells the orchestrator to restart, so
 the check itself has nothing to evaluate. Readiness answers 200 when every registered `Check`
-passes, else 503 with a `not ready: <name>` line per failing check in the body. A middleware, not
+passes, else 503 with a `not ready: <name>` line per failing check in the body; an opt-in startup probe (`Health.startup`) is a third path. A middleware, not
 handlers: a `router.Handler` is a stateless fn pointer with no per-instance state, so `Health` owns
-the config (checks, paths) and intercepts the two probe paths, passing every other path through
+the config (checks, paths) and intercepts the probe paths (liveness, readiness, and the opt-in startup path), passing every other path through
 unchanged. Register order matters: before auth/rate-limit middleware, so an orchestrator's probe
 (which cannot present a bearer token) is never gated. Zero allocation: the failing-check listing is
 assembled on the stack and written through the response writer. Concurrency: config is immutable

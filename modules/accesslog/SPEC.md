@@ -42,6 +42,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | `timestamp_ns` | `i64` | Nanoseconds since the Unix epoch. **Caller-supplied — see "Time contract" below.** |
 | `time_formatted` | `?[]const u8` | Preformatted `[%t]` bracket contents for Combined (e.g. `"22/Jul/2026:10:00:00 +0000"`). Ignored by JSON/logfmt. |
 | `remote_addr` | `?[]const u8` | Client address, e.g. `"192.0.2.1:54321"`. |
+| `user` | `?[]const u8` | Authenticated user as the server established it (Combined `%u`; a `user` key in JSON Lines and logfmt). Null by default: `-` in Combined, no key in the other two. Personal data. |
 | `method` | `[]const u8` | Request method token, e.g. `"GET"`. |
 | `target` | `[]const u8` | Raw request-target, e.g. `"/path?q=1"`. |
 | `protocol` | `[]const u8` | Protocol version string, default `"HTTP/1.1"`. |
@@ -54,6 +55,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | `request_id` | `?[]const u8` | Correlation / request id. |
 | `trace_id` | `?[]const u8` | Distributed-trace id (W3C `traceparent`'s trace-id). |
 | `span_id` | `?[]const u8` | Distributed-trace span id. |
+| `extra` | `[]const Field` | Extra key/value pairs rendered after the fixed fields in JSON Lines and logfmt (Combined ignores them, except `%{key}x` in a `LogFormat` template); invalid, colliding or repeated keys are skipped. Empty by default. |
 
 Only `timestamp_ns`, `method`, `target`, `status` are required; `protocol` defaults to
 `"HTTP/1.1"`; everything else is `?` and null when unknown.
@@ -74,9 +76,9 @@ malformed either, and it costs nothing extra to support.
 
 ### JSON Lines (`writeJsonLines`, `Format.json_lines`)
 
-One JSON object per line, LF-terminated, **fixed key order** (`ts`, `remote_addr`, `method`,
+One JSON object per line, LF-terminated, **fixed key order** (`ts`, `remote_addr`, `user` (only when set), `method`,
 `target`, `protocol`, `status`, `request_bytes`, `response_bytes`, `latency_ns`, `user_agent`,
-`referer`, `request_id`, `trace_id`, `span_id`), every key always present — an absent optional renders as JSON `null`
+`referer`, `request_id`, `trace_id`, `span_id`, then any `extra` keys), every key present (but `user`) — an absent optional renders as JSON `null`
 rather than being omitted, so the record has a stable schema for log-pipeline consumers.
 
 **Every emitted line is valid JSON, for any input bytes whatsoever** — see "Encoding contract"
@@ -90,8 +92,8 @@ optional **omits the key** entirely (the logfmt convention — there is no `null
 ### Combined (`writeCombined`, `Format.combined`)
 
 `%h %l %u %t "%r" %>s %b "%{Referer}i" "%{User-Agent}i"\n` — the Apache/NGINX Combined Log
-Format. `%l` (identity) and `%u` (authenticated user) are always `-`; this module tracks
-neither. `%b` is `-` when `response_bytes` is null, the decimal count otherwise (`0` prints
+Format. `%l` (identity) is always `-` and `%u` is `-` unless `Entry.user` is set; this module does not track identity
+(RFC 1413). `%b` is `-` when `response_bytes` is null, the decimal count otherwise (`0` prints
 literally, matching real servers — it is not treated as "unknown"). A missing Referer/User-Agent
 prints the literal `"-"` (quoted dash), matching `mod_log_config`'s own behavior for a missing
 header on what is normally a quoted field.

@@ -25,8 +25,8 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [SergioBenitez/cookie-rs](https://github.com/SergioBenitez/cookie-rs) (`cookie` crate) — **reference** | Rust | MIT OR Apache-2.0 (LICENSE-MIT taken) | 345 | tag 0.18.2 (no GH releases) | `Cookie` parse/build, `Set-Cookie` parsing, a `CookieJar` with delta tracking, signed and private (encrypted) child jars, percent-encoding. This module: request-header parser and `Set-Cookie` builder only. |
-| Go [`net/http`](https://pkg.go.dev/net/http#Cookie) cookies | Go | BSD-3-Clause | — | Go stdlib | `Request.Cookie(s)`, `Cookie.String`, `ParseSetCookie`, `net/http/cookiejar` (client jar with public-suffix support). Same server-side parse/build core; this module has no `Set-Cookie` parser or jar. |
+| [SergioBenitez/cookie-rs](https://github.com/SergioBenitez/cookie-rs) (`cookie` crate) — **reference** | Rust | MIT OR Apache-2.0 (LICENSE-MIT taken) | 345 | tag 0.18.2 (no GH releases) | `Cookie` parse/build, `Set-Cookie` parsing, a `CookieJar` with delta tracking, signed and private (encrypted) child jars, percent-encoding. This module: request-header parser, `Set-Cookie` builder, signed/private values, and (src/jar.zig) a `Set-Cookie` parser and client `Jar` with a caller-supplied public-suffix list. |
+| Go [`net/http`](https://pkg.go.dev/net/http#Cookie) cookies | Go | BSD-3-Clause | — | Go stdlib | `Request.Cookie(s)`, `Cookie.String`, `ParseSetCookie`, `net/http/cookiejar` (client jar with public-suffix support). Same server-side parse/build core; the builder has no `Set-Cookie` parser, but `Jar` (src/jar.zig) has both a parser and a client jar. |
 | [gorilla/securecookie](https://github.com/gorilla/securecookie) | Go | BSD-3-Clause | 729 | v1.1.2 (2023-11-05) | HMAC-signed and optionally encrypted cookie values with key rotation and an embedded timestamp (server-side max age). Here: `signed`/`private` with rotation, no embedded timestamp (since 2026-10-12). |
 | [jshttp/cookie](https://github.com/jshttp/cookie) | TypeScript | MIT | 1.5k | v2.0.1 (2026-06-30) | Minimal parse/serialize pair, the Node/Express cookie parser — the closest peer in scope. *(inferred)* |
 | [nektro/zig-cookies](https://github.com/nektro/zig-cookies) | Zig | MIT | 2 | push 2026-07-08 | Only Zig ecosystem hit; tiny. Zig `std` has no cookie support. *(inferred)* |
@@ -84,7 +84,7 @@ against the SameSite=None-without-Secure footgun; with `signed`/`private`, again
 forges, alters or (with `.bound`/`private`) moves a value to another cookie name, and with
 `private` against a client reading it. Does not: expire a signed/private value on the server
 (a value stays valid as long as its key; put an issue time inside or rotate keys), prevent
-replay of a captured value, enforce Domain/Path scoping or
+replay of a captured value, enforce (in the builder; `Jar` does) Domain/Path scoping or
 the public-suffix list, or evaluate Expires/Max-Age (no clock). `set` appends a `Set-Cookie` line
 per call (`addSetCookie`, as Go's `http.SetCookie`); it never replaces one. The parser is
 deliberately non-validating on read.
@@ -175,7 +175,7 @@ None recorded before the 2026-09-30 survey.
 - ~~**Client-side `CookieJar`**~~ — **DONE 2026-10-05** (`Jar` + `PublicSuffixList`, the list supplied by the caller; no list = host-only cookies). Was: (survey 2026-09-30) — Go `cookiejar`, cookie-rs `CookieJar`; Domain/Path matching needs the public-suffix list, a data dependency to decide. Effort: medium-large. Fits §2: only with a bundled PSL.
 
 ## Status
-`gap · any · codec · reentrant` + deps: `http` (the `get`/`set` helpers only; parser + builder are
+`gap · any · codec · threadsafe` + deps: `http` (the `get`/`set` helpers only; parser + builder are
 std-only), `aesgcm` (`private` values) — canonical source is `pub const meta` in src/root.zig.
 
 ## Anchoring

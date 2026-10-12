@@ -14,7 +14,7 @@ construction — never the removed `std.crypto.random`, never a test-only
 var cache = ramcache.Cache.init(gpa, .{ .max_bytes = 8 << 20, .max_entries = 4096 });
 defer cache.deinit();
 var store: sessions.RamcacheStore = .{ .cache = &cache };
-var mgr = sessions.Manager.init(gpa, store.store(), .{ .io = io });
+var mgr = try sessions.Manager.init(gpa, store.store(), .{ .io = io });
 try r.use(mgr.middleware()); // before the routes it guards
 
 fn dashboard(ctx: *router.Ctx) anyerror!void {
@@ -165,9 +165,10 @@ safe methods specially.
 A built `Manager`/`Csrf` is immutable and shared across `http.Server`'s
 connection threads. The only mutable state is the `Store`, whose default
 `RamcacheStore` serializes every cache touch behind its **own**
-`std.atomic.Mutex` (`ramcache` is single-owner). `ramcache` has no single-key
-delete, so deletion writes a zero-length **tombstone** (an empty record reads as
-absent; a real record is always ≥ 16 bytes). Per-request `Session` state lives
+`std.atomic.Mutex` (`ramcache` is single-owner). Deletion writes a
+**tombstone** rather than calling `ramcache`'s `remove`: the 8-byte bumped
+generation alone, which reads as absent but keeps the generation, so a racing
+compare-and-swap save sees the delete (a live record is always ≥ 8 + 16 bytes). Per-request `Session` state lives
 on the serving thread's stack. The `Set-Cookie` value is staged in a
 **thread-local** buffer: the response writer stores header slices uncopied and
 serializes them lazily at `writeHead`, *after* the handler returns — a stack
@@ -186,17 +187,10 @@ CSRF body form-field extraction (use `Csrf.verify` from the handler instead).
 
 Provenance: original work of the zig-libs authors (MIT); modeled after the
 OWASP Session Management and CSRF Prevention Cheat Sheets. No third-party
-source consulted or copied; built on the sibling `router`, `http`, `cookies`
-and `ramcache` modules. The comparative benchmark under `tools/` (`bench.zig` and its `go_bench/` reference side against alexedwards/scs v2.9.0, 2026-10-11) is our own tooling; it drives the reference only through its public API.
+source consulted or copied; built on the sibling `router`, `http`, `cookies`,
+`ramcache`, `entropy` and `kv` modules. The comparative benchmark under `tools/` (`bench.zig` and its `go_bench/` reference side against alexedwards/scs v2.9.0, 2026-10-11) is our own tooling; it drives the reference only through its public API.
 
 ## Verification
 
-`zig build test-sessions` — 16 offline tests (Debug + `-Doptimize=ReleaseFast`),
-`zig fmt --check modules/sessions`. Session core (6): create→save→load
-round-trip, forged id → absent, idle-expiry evict, absolute-cap expiry,
-regenerate (old id dead / data carried), insecure escape hatch. Middleware (3):
-hardened Set-Cookie + cookie round-trip, revoke expires+evicts, small-buffer
-early-flush (no cookie-buffer corruption). CSRF (6): token/verify round-trip +
-tamper, per-key distinctness, safe-GET issues a non-HttpOnly cookie, POST 403
-without a token / 200 with the right one, cross-session token rejected,
-query-param fallback. Plus the dark-tests aggregator pulling in `csrf.zig`.
+`scripts/modtest sessions` (Debug + `-Doptimize=ReleaseFast`), `zig fmt --check
+modules/sessions`. What the tests cover, by area, is listed under "Verification" in `SPEC.md`.

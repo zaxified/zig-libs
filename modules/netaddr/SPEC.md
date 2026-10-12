@@ -36,8 +36,8 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 ## Design & invariants
 Allocation model: none in the scalar API — parse/format work on caller buffers
 (`max_ip_text_len`/`max_prefix_text_len`), `sortDestinations` uses a fixed `max_sort_candidates`
-stack array; only `summarize`/`mergePrefixes` allocate, via a caller allocator, returning an owned
-slice. Never-panic parsing: `parseIp*`/`parsePrefix`/`parseHostPort` return `null` on malformed
+stack array; only `summarize`/`mergePrefixes`, `IpRange.prefixes` and the `IpSet`/`IpSetBuilder` family allocate, via a caller allocator (a slice is returned as an owned
+slice). Never-panic parsing: `parseIp*`/`parsePrefix`/`parseHostPort` return `null` on malformed
 input, strict like Go `netip` (no leading zeros, no zone suffix, `::` must elide ≥1 group). Strict
 family distinction: an IPv4-mapped v6 address stays `.v6`; a v4 `Prefix` never contains a mapped-v6
 address — mixing requires explicit `Ip.unmap`. All prefix bit math runs on the address as a
@@ -198,8 +198,5 @@ and lists over which glibc's own pair verdicts are not a strict weak ordering
 (RFC 6724's rules are not transitive, so every sort answers differently). Two
 unusable destinations: we, like glibc, go on to rules 2–9; Go stops and calls
 them equal. `--check` re-takes the vectors and compares.
-
-- **Class C** — internal algorithm or data structure — no outside exists, so correctness is defined by invariants or a brute-force reference. Not anchor debt.
-- **Oracle n/a** — class C/D carries no anchor debt, so there is no oracle grade to give.
 
 **What the tests actually contain.** RFC 6724 destination order replayed against glibc 2.43 getaddrinfo (6240 cases) and IPv6 source choice against Linux 7.0 (3040 cases), `src/rfc6724_oracle_test.zig` + `rfc6724_vectors.zig` from `tools/rfc6724_oracle.py`, three glibc divergences listed; parse verdicts and canonical text against glibc 2.43 inet_pton/inet_ntop over 2364 literals and prefixes/summarize/merge against Python ipaddress (`src/parse_oracle_test.zig` + `parse_vectors.zig` from `tools/parse_oracle.py`), plus the §10.2 worked examples and the module's own tables; self only: `selectSource` on IPv4, `systemSource`

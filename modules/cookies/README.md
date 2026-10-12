@@ -98,7 +98,7 @@ var client = http.Client.init(io, gpa, .{ .cookie_jar = jar.cookieJar() });
   HTTP client's).
 
 - **Role:** codec. **Platform:** any. **Deps:** `http`
-  (the `get`/`set` helpers; the parser + builder are std-only logic).
+  (the `get`/`set` helpers), `aesgcm` (`private` values); the parser + builder are std-only logic.
   **Concurrency:** threadsafe — `Jar` locks itself; the parser and the
   builder have no state and borrow their input.
 
@@ -117,7 +117,7 @@ is shipped.
 
 ## Verification
 
-`zig build test-cookies` — 39 offline tests (23 here + 16 frozen python-oracle
+`zig build test-cookies` — offline tests (parser, builder, helpers below, plus the jar, psl and secure tests and the frozen python-oracle
 goldens). Parser (7): simple pairs + `find`, OWS trimming, valueless cookies,
 quoted/unbalanced values, a quoted value containing a `;`, empty-name skipping,
 degenerate headers. Builder (11): full attribute set, `__Host-`/`__Secure-`

@@ -24,7 +24,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [go-chi/chi](https://github.com/go-chi/chi) — **reference** | Go | MIT | 22.9k | v5.3.2 (2026-08-20) | The yardstick (this module's README says "model after"). Beyond what we have: regexp and mid-segment params (`/{id:[0-9]+}`, `/files/{name}.{ext}`), `Mount` of a sub-router, inline `With(mw)` per-route middleware, per-host routing via a separate helper, and a `middleware` package. *(inferred from docs)* |
+| [go-chi/chi](https://github.com/go-chi/chi) — **reference** | Go | MIT | 22.9k | v5.3.2 (2026-08-20) | The yardstick (this module's README says "model after"). Regexp and mid-segment params (`/{id:[0-9]+}`, `/files/{name}.{ext}`), `Mount` of a sub-router, inline `With(mw)` per-route middleware and per-host routing (`HostRouter`) are all shipped here; beyond what we have: chi's own `middleware` package. *(inferred from docs)* |
 | [julienschmidt/httprouter](https://github.com/julienschmidt/httprouter) | Go | BSD-3-Clause | 17.1k | v1.3.0 (2019-09-30; push 2024-07) | The trie router whose 405/`Allow`, trailing-slash redirect and static-over-param precedence this module follows; no middleware, no backtracking (a conflicting table is refused at registration). Effectively frozen. |
 | [gorilla/mux](https://github.com/gorilla/mux) | Go | BSD-3-Clause | 21.8k | v1.8.1 (2023-11-05) | Regexp-rich matcher (host, header, query, scheme); linear scan, not a trie. Last release 2023. |
 | [ibraheemdev/matchit](https://github.com/ibraheemdev/matchit) | Rust | MIT | 537 | v0.9.2 (2026-04-08) | The radix matcher under axum; conflicts refused at insert, no middleware or 405 logic of its own. |
@@ -216,7 +216,7 @@ completeness reference) — a missed match, which the unit tests and the chi ora
 
 ## Status
 
-`extract · any · server · reentrant` + deps: `http` — canonical source is `pub const meta` in
+`extract · any · server · reentrant` + deps: `http`, `regex` — canonical source is `pub const meta` in
 src/root.zig.
 
 ## Anchoring

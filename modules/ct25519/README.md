@@ -21,8 +21,8 @@ algorithm, same table, same 64 iterations — the same cost, with the leak taken
 out of the tail. When the scalar is *public* (a signature's `s`, a Fiat-Shamir
 challenge a verifier replays) std's `mul`/`mulPublic`/`mulDoubleBasePublic` stay
 the right call; this module is only for the secret side. "Faster" there is
-modest, not categorical — measured on the base point, `mulPublic` is ~1.08×
-this module's `mulBase` (48.6 µs vs 52.5 µs) — the real reason to route a
+modest, not categorical — measured on the base point, `mulPublic` was ~1.08× faster than
+this module's then-ladder `mulBase` (48.6 µs vs the old ladder's 52.5 µs; `mulBase` now uses a comb) — the real reason to route a
 public scalar through std is that this module refuses to have the error
 union std's rejection would force on the caller, not raw speed.
 
@@ -46,8 +46,8 @@ signatures" §4 (ref10's `ge_scalarmult_base`): a comptime 32×8 table, 64
 additions and 4 doublings. It is still constant-time in `s`, still reads all
 256 bits and is still total — one extra always-performed add of `2^256·B`
 covers the recoding carry that ref10 avoids by requiring `s < 2^255`. This is
-a deliberate exception to "never a new algorithm", taken under
-`DECISIONS.md` P5 with its four pieces of evidence in [SPEC.md](SPEC.md) § C3.
+a deliberate exception to "never a new algorithm", taken
+on evidence: four pieces of it are in [SPEC.md](SPEC.md) § C3.
 `mul(Edwards25519.basePoint, s)` stays on the ladder and is the reference the
 comb is tested against. Measured ReleaseFast A/B, same process, 9
 interleaved rounds: `mulBase` 56.3 → 21.5 µs (2.62×), `mulRistrettoBase`

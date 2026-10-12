@@ -11,7 +11,7 @@ workloads (thousands of host checks per cycle).
   first-probe jitter, sendmmsg/recvmmsg).
 - **Why:** no small pure-Zig ICMP library exists; std has no ICMP support.
 - **Platform:** linux (raw errno-encoded `std.os.linux` syscalls, no libc —
-  conscious ceiling per BRIEF). **Role:** client. **Concurrency:**
+  conscious ceiling, see SPEC "Backlog / deferred"). **Role:** client. **Concurrency:**
   single_owner (one thread/loop owns a `Pinger`; `stop()` is
   async-signal-safe).
 - **Deps:** `seqmap` (reply correlation), `netaddr` (address parse/format).

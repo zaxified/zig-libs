@@ -48,7 +48,7 @@ after the Edwards multiscalar landed; rows unchanged, verdict below.
   exist to say so.
   ⚠ **One documented exception, since 2026-09-16:** `mulBase` and
   `mulRistrettoBase` use a fixed-base comb instead of the ladder (audit C3),
-  admitted under `DECISIONS.md` P5 with the evidence in § "C3 — the base point
+  admitted as an exception to "never a new algorithm", with the evidence in § "C3 — the base point
   uses a fixed-base comb" below. `mul(Edwards25519.basePoint, s)` is still the
   ladder, and it is the comb's reference.
 - **std recon (confirmed against `lib/std/crypto/25519/edwards25519.zig`,
@@ -88,7 +88,7 @@ after the Edwards multiscalar landed; rows unchanged, verdict below.
   not for `s mod L`. A caller that needs the reduced value reduces first
   (`scalar.reduce`/`reduce64`), exactly as it must for std.
 
-## C3 — the base point uses a fixed-base comb (a `DECISIONS.md` P5 change)
+## C3 — the base point uses a fixed-base comb (an exception to "never a new algorithm")
 
 **Why.** `mulBase` was `mul(basePoint, s)`: 64 window additions and **252
 doublings** over a 16-entry table, 71 % of its time in the doublings, 2.81×
@@ -197,7 +197,7 @@ to measure — which it now does, with a positive control that fires.
 `src/bench.zig` (`CT25519_BENCH=1 scripts/modtest ct25519
 -Doptimize=ReleaseFast`) re-runs the same pairs in-module (audit C9).
 
-## B9 — constant-time multi-scalar multiplication (a `DECISIONS.md` P5 addition)
+## B9 — constant-time multi-scalar multiplication (an exception to "never a new algorithm")
 
 **Why.** `bulletproofs`' prover sums `Σ s_i·P_i` over SECRET witness and
 blinding scalars (`A`, `S`, every IPA round's `L`/`R`). It did that as one

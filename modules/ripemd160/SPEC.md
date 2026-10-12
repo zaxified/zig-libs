@@ -129,7 +129,7 @@ implementations diverge.
 
 ## Backlog / deferred
 
-- 2026-10-07: 4–7% slower than the reference, Bitcoin Core v29.0 `CRIPEMD160` (`tools/bench.zig`: 1.07× at 64 B, 1.04× at 64 KiB and 1 MiB), so P is 3, not 2. Not profiled; a candidate is the compression function's register/schedule shape versus Bitcoin's hand-unrolled macros. Closing it needs a change in `src/`, outside the benchmark task.
+- 2026-10-07: 4–7% slower than the reference, Bitcoin Core v29.0 `CRIPEMD160` (`tools/bench.zig`: 1.07× at 64 B, 1.04× at 64 KiB and 1 MiB). Not profiled; a candidate is the compression function's register/schedule shape versus Bitcoin's hand-unrolled macros. Closing it needs a change in `src/`, outside the benchmark task.
 
 ## Status
 

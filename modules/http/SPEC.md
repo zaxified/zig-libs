@@ -184,8 +184,9 @@ Hardened for direct internet exposure (no reverse proxy required):
   unauthenticated h2c client's `:path` became a complete second HTTP/1.1 request on the
   backend's wire, answered 200. `proxy.zig`'s "A1 G1" integration test stands on that wire.
 - **Resource/DoS:** slowloris read/request timeouts bound the whole request (`request_timeout_ms`
-  covers keep-alive idle + head + body reads together; response writing and handler compute time
-  are not counted). The write-side stall timeout (`write_timeout_ms`) is a *per-write* budget that
+  covers head + body reads from the request's first byte, dribble included; the keep-alive wait is
+  bounded separately by `idle_timeout_ms`, the head alone by `read_header_timeout_ms`; response
+  writing and handler compute time are not counted). The write-side stall timeout (`write_timeout_ms`) is a *per-write* budget that
   resets on every successful write — it drops a peer that stops reading outright, but not one that
   keeps draining a response a trickle at a time (RUDY-style slow-read); see `TimeoutWriter`'s doc
   comment. Size caps (413/431/414); per-connection request-count cap; inbound gzip is
@@ -410,7 +411,6 @@ directly-exposed parser.
 
 **S3 → S2 plan (survey 2026-10-11, `go doc` of net/http + httputil + cookiejar + httptest; owner
 decisions the same day: every gap a Go user notices is implemented, TLS server planned separately).**
-Full report with pinned APIs: `~/CML/20261011-http-s2/survey.report.md` (CML notes, not shipped).
 - R1 graceful lifecycle — DONE 2026-10-12: `shutdownGraceful(timeout_ms)`, `close`, `isDraining`,
   `setKeepAlivesEnabled`, `registerOnShutdown` (8 hooks). Every socket connection registers a
   `ConnControl` (renamed from R2's `Deadlines`) with an atomic `active/idle/closing` state; the loop
@@ -704,7 +704,7 @@ pending a native std TLS server.
   anyway (e.g. bump-allocating from a buffer the request already dirtied); none is obvious.
 
 ## Status
-`extract+gap · any · both · single_owner` · deps: `netaddr`, `tlsclient` (+ `std.Io.net`,
+`extract+gap · any · both · single_owner` · deps: `netaddr`, `datefmt`, `tlsclient`, `crc32` (+ `std.Io.net`,
 `std.compress.flate`) — canonical source is `pub const meta` in src/root.zig.
 
 ## Known limits a consumer should size for

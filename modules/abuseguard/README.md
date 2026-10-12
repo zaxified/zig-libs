@@ -88,7 +88,7 @@ _ = guard.unbanPrefix(netaddr.parsePrefix("203.0.113.0/24").?);
 // Persist bans across a restart (the caller owns the file):
 const recs = try guard.snapshot(gpa); // bans, range bans, live greylists
 defer gpa.free(recs);
-try abuseguard.writeSnapshot(recs, writer); // "ban <prefix>" / "greylist <prefix> <ms>"
+try abuseguard.writeSnapshot(recs, writer); // "ban <prefix>" / "range <prefix>" / "greylist <prefix> <ms>"
 // ... after restart, per line of the file:
 if (try abuseguard.parseSnapshotLine(line)) |rec| try list.append(gpa, rec);
 try guard.restore(list.items);

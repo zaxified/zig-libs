@@ -55,12 +55,12 @@ search trail and reasoning.
   reentrant — `Context` is a plain caller-owned value, every free function
   touches only its parameters.
 - **Deps:** `p256` (DHKEM(P-256)'s group — byte-exact to
-  `std.crypto.ecc.P256`; the X25519 KEM path stays on `std`). Also `std`
-  directly: `std.crypto.dh.X25519`, `std.crypto.ecc.P384` (`P384Kem`'s
+  `std.crypto.ecc.P256`; the X25519 KEM path stays on `std`), `p521`
+  (DHKEM(P-521)'s group), `chachapoly` (the ChaCha20-Poly1305 AEAD) and
+  `entropy` (key generation). Also `std` directly: `std.crypto.dh.X25519`, `std.crypto.ecc.P384` (`P384Kem`'s
   group), `std.crypto.kdf.hkdf.HkdfSha256`/
   `.HkdfSha512`/`.Hkdf` (HKDF-SHA384's `Hkdf(std.crypto.auth.hmac.sha2.
-  HmacSha384)`, no named alias in `std`), `std.crypto.aead.aes_gcm`,
-  `std.crypto.aead.chacha_poly`.
+  HmacSha384)`, no named alias in `std`), `std.crypto.aead.aes_gcm`.
 
 ## Import
 
@@ -85,7 +85,7 @@ try hpke.suite.labeledExpand(HkdfSha256, &kem_suite_id, &prk, "shared_secret", k
 ```
 
 **KEM** (`dhkem.zig`, re-exported as `hpke.X25519Kem`/`hpke.P256Kem`/
-`hpke.P384Kem`):
+`hpke.P384Kem`/`hpke.P521Kem`):
 
 ```zig
 var kp: hpke.X25519Kem.KeyPair = undefined;

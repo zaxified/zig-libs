@@ -13,7 +13,7 @@ that see a consistent snapshot without blocking the writer.
 - **Platform:** any — all I/O goes through `kv`'s `Storage` seam. **Role:**
   both. **Concurrency:** `single_owner` — one writer; MVCC readers take lockless
   immutable snapshots.
-- **Deps:** `kv` (reuses its `Storage` seam and its deterministic crash/fault
+- **Deps:** `kv`, `crc32` (reuses its `Storage` seam and its deterministic crash/fault
   `SimStorage`).
 
 > **Status: core implemented.** The irreducible core — `commit`'s

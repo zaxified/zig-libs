@@ -26,7 +26,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [draft-ietf-httpapi-idempotency-key-header](https://datatracker.ietf.org/doc/draft-ietf-httpapi-idempotency-key-header/) (rev 07, 2026-04-18) and Stripe's idempotent-requests docs — **reference** | spec / API docs | IETF Trust (spec text) | — | rev 07, 2026-04-18 (datatracker `rev`/`time` fields) | The behaviour yardstick: key header, replay of the first response, 409 for a concurrent duplicate, 422 for a key reused with a different payload, bounded retention. This module implements all of those (tests: 16 in `root.zig`). Stripe's concrete numbers (255-byte key, 24 h) match our defaults *(inferred from memory of the docs, not re-read)*. |
+| [draft-ietf-httpapi-idempotency-key-header](https://datatracker.ietf.org/doc/draft-ietf-httpapi-idempotency-key-header/) (rev 07, 2026-04-18) and Stripe's idempotent-requests docs — **reference** | spec / API docs | IETF Trust (spec text) | — | rev 07, 2026-04-18 (datatracker `rev`/`time` fields) | The behaviour yardstick: key header, replay of the first response, 409 for a concurrent duplicate, 422 for a key reused with a different payload, bounded retention. This module implements all of those (tests in `root.zig`). Stripe's concrete numbers (255-byte key, 24 h) match our defaults *(inferred from memory of the docs, not re-read)*. |
 | [ikyriak/IdempotentAPI](https://github.com/ikyriak/IdempotentAPI) | C# (ASP.NET Core) | MIT | 328 | last push 2024-11-09 — quiet | README-verified: request-hash validation of key + payload; caches status, body and headers; pluggable cache (`IDistributedCache`, FusionCache); **distributed locks** (RedLock, DistributedLock) for a cluster; response captured without handler cooperation *(inferred: it works as ASP.NET attributes/filters)*. |
 | [WendellAdriel/laravel-idempotency](https://github.com/WendellAdriel/laravel-idempotency) | PHP (Laravel) | MIT | 160 | pushed 2026-09-07 | README-verified: TTL, scope choices (`Ip` among them), lock timeout; requires a cache driver with atomic locks, shared cache for multi-server. |
 | [rafael-piovesan/go-rocket-ride](https://github.com/rafael-piovesan/go-rocket-ride) | Go | MIT | 161 | pushed 2022-06-08 — stale | A worked example of Stripe's "rocket rides" idempotency design over Postgres; not a reusable library *(inferred from name/description)*. |
@@ -75,7 +75,7 @@ public docs + `draft-ietf-httpapi-idempotency-key-header`); built on sibling `ra
 **Concurrent first-flights of the same key ARE handled**, via an in-flight reservation set
 (`Store.in_flight`, a `StringHashMapUnmanaged(void)`): the first request to see a miss reserves the
 key for the duration of its handler; a second same-key request arriving before the first completes
-sees the reservation and is answered **409** (`reserve` returns `.in_flight`) rather than running the
+sees the reservation and is answered **409** (`begin` returns `.in_flight`) rather than running the
 handler a second time — proven by a reentrant test that fires the duplicate *from inside* the first
 handler while it is still executing (`"concurrent first-flight of the same key does not double-run
 (in-flight 409)"`). This closes the true concurrent-retry race for requests routed through the same
@@ -89,7 +89,7 @@ fingerprint matches), and not a security boundary — a key is whatever the clie
 authentication tying it to a caller identity.
 
 ## Verification
-13 offline tests through `http.Server.serveStream` with a real `router` + `ramcache`: first key runs
+Offline tests through `http.Server.serveStream` with a real `router` + `ramcache`: first key runs
 the handler once and a replay returns the cached response without re-running (hit-counter
 asserted), a concurrent same-key duplicate fired from inside the first handler is rejected 409
 in-flight without a second handler run, a different key runs again, a non-idempotent method (GET)
@@ -148,7 +148,7 @@ distributed lock to close the same race across processes.
 - **Streaming fingerprint for large bodies** *(survey 2026-09-30)* — hash the body incrementally so `max_body_bytes` is not a hard 413 for uploads. Effort: small-medium (needs the body-reader seam). Fits §2. Low priority.
 
 ## Status
-`gap · any · server · threadsafe` · deps: `router`, `http`, `ramcache` — canonical source is `pub
+`gap · any · server · threadsafe` · deps: `router`, `http`, `ramcache`, `kv` — canonical source is `pub
 const meta` in src/root.zig.
 
 ## Anchoring

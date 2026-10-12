@@ -42,8 +42,8 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   `DefaultPrng`) so it can neither be guessed nor forged. State lives in a pluggable `Store`
   (default `RamcacheStore` over `ramcache`); the cookie carries only the id. Greenfield, clean-room
   from the OWASP Session Management and CSRF Prevention Cheat Sheets — no third-party source
-  consulted or copied; composes the sibling `router`, `http`, `cookies`, `ramcache` modules (see
-  NOTICE).
+  consulted or copied; composes the sibling `router`, `http`, `cookies`, `ramcache`, `entropy` and
+  `kv` modules.
 - **Per-request lifecycle:** load the session named by the cookie (rejecting and evicting one past
   its idle or absolute timeout) or create a fresh one, attach `*Session` to `ctx.data` (the slot
   `router` reserves — the `aaa-gate` identity pattern; `sessionOf(ctx)` reads it back), run the
@@ -91,7 +91,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   single-owner). Each stored value is framed `[generation u64 LE] ++ record`; `save` is a
   compare-and-swap against the loaded generation, atomic under that lock, so a stale save from a
   concurrent request cannot resurrect a destroyed/rotated session (see the cross-request
-  resurrection note below). `ramcache` has no single-key delete, so deletion writes a **tombstone**
+  resurrection note below). Deletion writes a **tombstone** instead of `ramcache.Cache.remove`
   — the 8-byte bumped generation alone (reads as absent, but keeps the generation so the delete is
   visible to a racing CAS; a live record is always ≥ 8 + 16 bytes). The `Set-Cookie` value is staged in a
   **thread-local** buffer — the response writer stores header slices uncopied and serializes them

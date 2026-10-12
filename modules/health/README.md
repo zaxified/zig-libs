@@ -24,8 +24,8 @@ Kubernetes / load-balancer health-check contract.
   (the shape of alexliesenfeld/health, without its timestamps).
 
 It is a middleware (not handlers) because `router.Handler` carries no
-per-instance state: the middleware owns the config and intercepts the two probe
-paths, passing everything else through. **Register it before auth/rate-limit
+per-instance state: the middleware owns the config and intercepts the probe
+paths (liveness, readiness, and the opt-in startup path), passing everything else through. **Register it before auth/rate-limit
 middleware** so an orchestrator's probe (which cannot present a token) is never
 gated.
 

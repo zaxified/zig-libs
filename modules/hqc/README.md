@@ -68,14 +68,14 @@ SPEC.md's "Part 2"/"Part 3" sections and "Arc plan".
 const hqc = @import("hqc");
 
 var seed_kem: [32]u8 = undefined;
-std.crypto.random.bytes(&seed_kem);
+try io.randomSecure(&seed_kem); // `io: std.Io`
 // Secrets (the key pair, both shared secrets) are written in place.
 var kp: hqc.Hqc128.KeyPair = undefined;
 hqc.Hqc128.keypair(&kp, &seed_kem);
 defer kp.wipe();
 
 var coins: [hqc.Hqc128.coins_bytes]u8 = undefined; // m || salt
-std.crypto.random.bytes(&coins);
+try io.randomSecure(&coins);
 var ct: hqc.Hqc128.Ciphertext = undefined;
 var ss_enc: hqc.Hqc128.SharedSecret = undefined;
 hqc.Hqc128.encaps(&ct, &ss_enc, &kp.ek, &coins);

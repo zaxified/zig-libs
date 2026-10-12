@@ -35,7 +35,9 @@ switch (try websocket.frame.parseFrame(read_buf, .server, max_frame_size)) {
 // not a secret, so a fast non-CSPRNG is fine) — but RFC 6455 §4.1 point 7
 // requires it to be selected randomly FOR EACH CONNECTION, so the seed must
 // differ every time; never hardcode it the way this snippet used to.
-var prng = std.Random.DefaultPrng.init(std.crypto.random.int(u64));
+var seed: u64 = undefined;
+try io.randomSecure(std.mem.asBytes(&seed));
+var prng = std.Random.DefaultPrng.init(seed);
 const key = websocket.handshake.generateKey(prng.random());
 try websocket.handshake.writeRequest(w, .{ .host = "example.com", .target = "/ws", .key = &key });
 // … read the response head with http.h1.ResponseHead.parse …

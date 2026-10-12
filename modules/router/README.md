@@ -57,7 +57,8 @@ try api.use(.{ .run = requireAuth });   // gates every response under "/api",
 try api.get("/things/:id", thing);      // including 404/405/auto-OPTIONS/redirect
 try (try r.with(&.{audit})).post("/admin", admin); // middleware for one route
 try r.mount("/v2", &v2_router);         // a built router under a prefix
-try r.any("/hook", webhook);            // every method
+try r.any("/hook", webhook);            // every standard method (not `.other`)
+// extension methods (`.other`) need an explicit `add(.other, ...)` route and are never named in `Allow`
 
 var server = http.Server.init(io, gpa, .{
     .handler = r.handler(),

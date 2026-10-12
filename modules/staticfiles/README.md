@@ -132,5 +132,7 @@ before an edit finishes with the bytes it started with. Replace files by rename,
 | `cache_control` | `null` | `Cache-Control` value, emitted verbatim on 200/206. |
 | `mime_overrides` | `&.{}` | `extension → media-type` overrides, consulted before the table. |
 | `default_mime` | `"application/octet-stream"` | `Content-Type` for an unknown extension. |
+| `strong_etag` | `false` | Emit a strong `ETag` (enables `If-Range` resumes); off by default because a same-size, same-second edit keeps the validator — see `SPEC.md`. |
+| `redirect_to_trailing_slash` | `true` | 301 a directory URL without its trailing slash to the slash form (Go `FileServer`, nginx); `false` serves both. |
 | `fallback` | `null` | SPA fallback: this file (e.g. `"index.html"`) answers 200 for a GET/HEAD that would 404, whose last segment has no `.` and whose `Accept` has `text/html`. Same containment/dotfile rules; missing file = normal 404. `Handler` only. |
 | `precompressed` | `null` | `.{}` serves `name.br` / `.zst` / `.gz` in place of `name` when the client prefers one (`Content-Encoding`, `Vary: Accept-Encoding`, own `ETag`, Range on the encoded bytes). `Handler` only; a `Snapshot` has `SnapshotOptions.precompressed`. |

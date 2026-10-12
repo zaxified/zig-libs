@@ -132,7 +132,7 @@ it cannot read a record — never a second run.
 ## Attributes
 
 - **Role:** server. **Platform:** any. **Deps:** `router`,
-  `http`, `ramcache`. **Concurrency:** threadsafe — the `ramcache` store sits
+  `http`, `ramcache`, `kv`. **Concurrency:** threadsafe — the `ramcache` store sits
   behind an internal spinlock (`std.atomic.Mutex` + `spinLoopHint`, the std
   SmpAllocator pattern), so `respond` and the middleware may race across all
   connection threads; the cached bytes are copied out under the lock and
@@ -150,7 +150,7 @@ modules.
 
 ## Verification
 
-`zig build test-idempotency` — 16 offline tests through `http.Server.serveStream`
+`zig build test-idempotency` — offline tests through `http.Server.serveStream`
 with a real `router` + `ramcache`: first key runs the handler once and a replay
 returns the cached response without re-running (hit-counter asserted), a
 concurrent same-key duplicate fired from inside the first handler is rejected

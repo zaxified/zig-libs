@@ -168,8 +168,8 @@ using the same spelling. Grep before renaming.
 ## Verify
 
 ```
-zig build test-testkit                          # Debug       — 21 pass
-zig build test-testkit -Doptimize=ReleaseFast   # ReleaseFast — 21 pass
+zig build test-testkit                          # Debug
+zig build test-testkit -Doptimize=ReleaseFast   # ReleaseFast
 zig build check-testonly                        # the isolation claim
 ```
 

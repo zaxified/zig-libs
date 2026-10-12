@@ -30,7 +30,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [etcd-io/bbolt](https://github.com/etcd-io/bbolt) — **reference** | Go | MIT | 9.8k | v1.5.0 (2026-06-21) | Same design family (COW B+tree, double meta, one writer, MVCC readers). Has nested buckets, forward and backward cursors, backup/`Tx.WriteTo`, mmap zero-copy reads, multi-process readers, `Compact`. This module: flat keyspace, readers in-process; a cursor in both directions and a backup that is also a compaction (`copyTo`, like bbolt's offline `Compact`) since 2026-10-04. *(inferred from docs)* |
+| [etcd-io/bbolt](https://github.com/etcd-io/bbolt) — **reference** | Go | MIT | 9.8k | v1.5.0 (2026-06-21) | Same design family (COW B+tree, double meta, one writer, MVCC readers). Has nested buckets, forward and backward cursors, backup/`Tx.WriteTo`, mmap zero-copy reads, multi-process readers, `Compact`. This module: nested buckets and read-only openers in other processes (a shared lock) since 2026-10-11; a cursor in both directions and a backup that is also a compaction (`copyTo`, like bbolt's offline `Compact`) since 2026-10-04. *(inferred from docs)* |
 | [LMDB](https://github.com/LMDB/lmdb) | C | OpenLDAP Public License 2.8 | 3.0k | pushed 2026-08 | The original of the design. Named sub-databases, `MDB_PREV`/`LAST`, multi-process readers, dup-sort, ~500-byte key limit. Source not read. |
 | [cberner/redb](https://github.com/cberner/redb) | Rust | Apache-2.0 | 4.8k | v4.3.0 (2026-09-15) | Pure Rust COW B-tree, typed tables, savepoints, range iteration both directions, repair/compaction. |
 | [dgraph-io/badger](https://github.com/dgraph-io/badger) | Go | Apache-2.0 | 15.8k | v4.9.6 (2026-08-05) | LSM; write-heavy scale, TTL, iterators both ways, transactions with conflict detection. Different trade-off (write amplification, many files). |
@@ -192,7 +192,7 @@ accounting; it is named separately because the MVCC-safety property is
 genuinely distinct from crash-atomicity (LMDB implements them in separate
 places), not to pad the tier. Everything else — page/node codecs, in-node
 binary search, B-tree node **split** (textbook, unit-tested directly; deletes
-are in-place with no merge/rebalance yet — see backlog — except that a node
+are in-place, with node merge since 2026-09-29 (below), and a node
 left EMPTY is dropped, below), the
 `Pager`, the freelist container, the read/descend/cursor path, and fresh-store
 init — is mechanical scaffold, written and green today. If a future reviewer
@@ -309,8 +309,8 @@ is not provable by this harness" was not.
 ## Threat model / out of scope
 
 Not a security boundary; the "adversary" is timing, crash points and I/O faults
-(`kv.SimStorage`'s injectors). Guarantees, once the core is implemented and the
-gate flips: ordered scans, atomic multi-key commit/rollback, snapshot isolation
+(`kv.SimStorage`'s injectors). Guarantees, with the core implemented and the
+gate passing: ordered scans, atomic multi-key commit/rollback, snapshot isolation
 for lockless readers, and crash-recovery to a committed prefix — under the same
 `fsync`-honesty caveat `kv` documents (a lying drive/hypervisor is below this
 library). Cross-process: one writer per store (an exclusive `flock` on `<path>.lock`), or any number of read-only openers (a shared one) — never both at once.
@@ -447,7 +447,7 @@ one page" branch), removed.
 
 ## Status line
 
-`any · both · single_owner` + dep `kv`, model_after "LMDB / BoltDB (COW B-tree,
+`any · both · single_owner` + deps `kv`, `crc32`, model_after "LMDB / BoltDB (COW B-tree,
 meta double-buffer); VOPR = TigerBeetle" — canonical source is `pub const meta`
 in src/root.zig.
 

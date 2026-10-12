@@ -53,7 +53,7 @@ var ri = requestid.RequestId{ .options = .{ .generator = .{ .run = Gen.run } } }
 
 Provenance: clean-room from the conventional `X-Request-Id` correlation-ID
 pattern (nginx `request_id`, Envoy `x-request-id`) — original work of the
-zig-libs authors (MIT). No third-party source consulted or copied. The comparative benchmark under `tools/` (`bench.zig` and its `go_bench/` or `c_bench/` reference side, 2026-10-10) is our own tooling; it drives the reference only through its public API.
+zig-libs authors (MIT). No third-party source consulted or copied. The comparative benchmark under `tools/` (`bench.zig` and its `go_bench/` reference side, 2026-10-10) is our own tooling; it drives the reference only through its public API.
 
 ## Verification
 

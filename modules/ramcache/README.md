@@ -46,6 +46,12 @@ c.clear();     // drop everything; lifetime counters survive
 _ = c.stats;   // hits/misses/evictions/expired (lifetime) + entries/bytes (current)
 ```
 
+Also: `remove(key) bool` drops one entry and `removeMatching(prefix) usize`
+drops every entry whose key starts with `prefix` (returning the count). For
+zero-copy reads and fills there is a borrow seam: `pin` (like `get`, but the
+entry stays valid until `release`), and `reserve` / `commit` for filling a
+slot in place. See [SPEC.md](SPEC.md) § "Borrow seam".
+
 **Ownership:** keys and values are copied into the cache's allocator on `put`.
 A slice returned by `get` borrows the cache's storage — valid only until that
 key is replaced, evicted, or cleared; copy it if you need it longer.
