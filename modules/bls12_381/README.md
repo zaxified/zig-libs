@@ -5,7 +5,7 @@ KZG polynomial commitments, and threshold-BLS schemes — the base field
 `Fp`, the extension tower `Fp2`/`Fp6`/`Fp12`, the scalar field `Fr`, the
 two pairing groups `G1`/`G2`, and the pairing `e: G1 x G2 -> Gt`.
 
-**Status: Parts 1-5 complete.** Part 1's full
+**Status: Parts 1-6 complete.** Part 1's full
 field-tower and group arithmetic, every curve/field constant
 independently verified (see `NOTICE` — including a G2-cofactor
 scaffold bug found and fixed during the crypto-core pass),
@@ -78,6 +78,8 @@ This module is planned across several parts.
 | 4 | BLS signatures (draft-irtf-cfrg-bls-signature-05, min-pk/ProofOfPossession) | **done** |
 | 5 | KZG polynomial commitments (EIP-4844 / deneb) | **done** |
 | 6 | Threshold BLS (trusted-dealer Shamir + Feldman VSS + Lagrange combine) | **done** |
+
+**Deps:** `entropy` (batch-verify randomness, key material), `montint` (constant-time `Fr` arithmetic); no third-party code.
 
 ## Import
 
@@ -153,10 +155,10 @@ const ok7 = try kzg.verifyBlobKzgProofBatch(allocator, &blobs, &commitments, &pr
 
 // Threshold BLS (Part 6 — trusted-dealer, min-pk):
 const threshold = bls12_381.threshold;
-const split = try threshold.splitSecretKey(allocator, sk, 3, 5, coeffs); // t=3-of-5, coeffs.len == t-1
+const split = try threshold.splitSecretKey(allocator, &sk, 3, 5, coeffs); // t=3-of-5, coeffs.len == t-1
 defer allocator.free(split.shares);
 defer allocator.free(split.vvec.commitments);
-const partial1 = threshold.partialSign(split.shares[0], "message"); // thin over bls_sig.sign
+const partial1 = threshold.partialSign(&split.shares[0], "message"); // thin over bls_sig.sign
 const ok8 = threshold.verifyPartialSignature(threshold.derivePublicKeyShare(split.vvec, 1), "message", partial1);
 const combined = try threshold.combineSignatures(&.{ partial1, partial2, partial3 }, 3); // == bls.sign(sk, "message")
 const ok9 = bls.verify(threshold.groupPublicKey(split.vvec), "message", combined); // ordinary bls_sig.verify
@@ -183,6 +185,9 @@ caller already trusts only. A point built some other way still needs
 | `pairing.zig` | Part 2: `e: G1 x G2 -> Gt`, the optimal ate Miller loop + final exponentiation |
 | `hash_to_curve.zig` | Part 3: RFC 9380 hash-to-curve — `expandMessageXmd`, `hashToFieldFp`/`hashToFieldFp2`, Simplified SWU + 11-/3-isogeny maps, `hashToCurveG1`/`G2` + `encodeToCurveG1`/`G2` |
 | `bls_sig.zig` | Part 4: BLS signatures — `keyGen`/`skToPk`/`keyValidate`, `sign`/`verify`, `aggregate`/`aggregatePublicKeys`, `coreAggregateVerify`/`aggregateVerify`/`fastAggregateVerify`, `popProve`/`popVerify` |
+| `scheme.zig` | Part 4: the generic `Bls(variant, scheme)` ciphersuite behind `bls_sig` (min-pk / min-sig x Basic / MessageAugmentation / ProofOfPossession) |
+| `eip2333.zig` | EIP-2333/2334 Ethereum validator key derivation (`deriveMasterSk`/`deriveChildSk`/`derivePath`) |
+| `msm.zig` | Pippenger multi-scalar multiplication for `G1`/`G2` (public data only) |
 | `kzg.zig` | Part 5: EIP-4844 KZG — `loadTrustedSetup` (memoized), `blobToKzgCommitment`/`computeKzgProof`/`verifyKzgProof`/`computeBlobKzgProof`/`verifyBlobKzgProof`/`verifyBlobKzgProofBatch`, plus `fft`/`ifft` and `g1Msm` primitives |
 | `src/data/trusted_setup.txt` | The embedded official Ethereum KZG ceremony trusted setup (`@embedFile`d by `kzg.zig`) |
 | `src/data/kzg_test_vectors/` | Two embedded `c-kzg-4844` KAT blobs (constant-2 + random #4; see `NOTICE`) |

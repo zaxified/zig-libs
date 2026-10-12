@@ -154,16 +154,14 @@ and integrity mismatch but does not defend against a hostile writer supplying co
 (SHA-256 collision is out of scope by assumption). `casCommit`'s check-then-rename has a benign
 TOCTOU outside the ingest lock's reach only in the sense that two processes committing identical
 content just double-rename to the same bytes; the refcount bump itself is inside the lock, so it
-does not double-count. `.rc` sidecar writes are not crash-atomic (no temp+rename, unlike blob/named
-writes) — a torn write is read back as "no sidecar" (untracked/still-referenced), which is always
-the safe direction for reclaim bookkeeping. `gc`'s stale-temp reap is age-gated
-(`GcOptions.stale_after_ns`, default 10 min) specifically so it cannot race a slow-but-live `put`
+does not double-count. `.rc` sidecar writes are crash-atomic (temp + `renameDurable`, like blob/named
+writes; `casRefWrite`), so a torn sidecar cannot under-count references. `gc`'s stale-temp reap is age-gated
+(`GcOptions.stale_after_ns`, default 24 h, `0` refused with `error.StaleAfterTooSmall`) specifically so it cannot race a slow-but-live `put`
 still streaming into its own temp. Cross-process locking covers only blobstore's own ingest/refcount
 path — it is not a general-purpose file lock for caller-defined concurrent access patterns.
 
 ## Verification
-`zig build test-blobstore` (+ `-Doptimize=ReleaseFast`; `zig fmt --check modules/blobstore`). 20
-tests covering CAS put/dedup/has/open/verify(intact + bit-rot)/delete, `Digest.fromHex` round-trip,
+`scripts/modtest blobstore` (+ `zig fmt --check modules/blobstore`). Tests cover CAS put/dedup/has/open/verify(intact + bit-rot)/delete, `Digest.fromHex` round-trip,
 the raw createTemp→commit→openBlob→list crash-safe path, named put/read/list, `segmentSafe`
 rejecting `..`/leading-dot/traversal attempts on every public entry point, `gc` sweeping a
 zero-refcount orphan while keeping both a live-refcount blob and an explicitly-`keep`'d

@@ -16,7 +16,7 @@
 
 **Downstream consumer:** yes
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see /NOTICE.
+Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see this module's README "Provenance" note — clean-room, so there is deliberately no root `/NOTICE` entry to point at (root `NOTICE` §0).
 
 ## Compared with
 
@@ -93,7 +93,7 @@ quantile math. Platform: any (pure logic, no OS calls). Role: util. Concurrency:
 shared state). Depends on `dataset` only. Original work of the zig-libs authors, modeled after the
 Python `empyrical`/`ffn` metric set and a QuantLib subset (mirrored, not invented — behavior/
 metric-set only, no code consulted or copied); the numeric behavior is exact, pinned by the tests.
-See NOTICE.
+See README "Provenance".
 
 ## Threat model / out of scope
 Not security-sensitive; the contract is numerical fidelity to the documented conventions above, not

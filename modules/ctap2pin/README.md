@@ -17,10 +17,12 @@ Audit finding L5 (2026-09-05): the `aescbc` module exists precisely to give
 `xmlenc`/`jwe` a single shared CBC core instead of two hand-rolled copies —
 `ctap2pin` is a third, independent one, byte-exact to `aescbc` against the
 same NIST vector but written before `aescbc` existed and not folded onto it
-(that would add a dependency this module has never needed, and `aescbc`
+(that would add a dependency on a second AES-CBC module, and `aescbc`
 currently accepts `dst.len >= src.len`; this module requires exact equality,
 so folding is a behavior decision, not a doc fix). Noted here rather than
 silently left implying this is the repository's only from-scratch CBC.
+**Deps:** `p256` (the P-256 curve for ECDH; byte-exact to `std.crypto.ecc.P256`); AES/HKDF/HMAC stay on `std`.
+
 See `SPEC.md`.
 
 | File | Contents |

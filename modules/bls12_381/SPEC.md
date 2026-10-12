@@ -88,11 +88,8 @@ see "Part 6 design" below.
 
 - **All arithmetic implemented** (crypto-core pass, 2026-07-14): the
   scaffold's REAL/STUB split is resolved — every field and group
-  operation is now real, with one deliberate exception:
-  `Fp12.cyclotomicSquare` remains `@panic("TODO(part2)")` (a
-  pairing-only fast path that lands with its sole consumer, the Part-2
-  final exponentiation — see its doc comment for the day-one test
-  oracle Part 2 can use).
+  operation is now real (`Fp12.cyclotomicSquare`, the one stub left
+  at that date, landed with the Part-2 final exponentiation).
 - **Montgomery-storage decision (settled)**: `Fp`/`Fr` store values
   CANONICALLY (non-Montgomery) at rest; `std.crypto.ff` operations
   preserve the first operand's form, so canonical-in/canonical-out
@@ -329,11 +326,10 @@ see "Part 6 design" below.
   the ciphersuite Ethereum's consensus layer (and most production BLS
   deployments) actually use — the smaller (48-byte) element goes in
   the more-frequently-transmitted slot (public keys, stored/gossiped
-  far more often than the signatures verifying them). **Explicitly OUT
-  OF SCOPE**: the min-sig variant (pubkeys in `G2`, signatures in
-  `G1`) — "Part 4b" if a consumer needs it later, not implemented
-  here; the Basic and MessageAugmentation schemes (draft §3.1/§3.2 —
-  different rogue-key mitigations than ProofOfPossession's).
+  far more often than the signatures verifying them). The min-sig
+  variant (pubkeys in `G2`, signatures in `G1`) and the Basic and
+  MessageAugmentation schemes (draft §3.1/§3.2) were originally out of
+  scope and were added 2026-10-06 (`scheme.zig`).
 - **The exact verify equation, in this module's own argument
   convention.** `pairing.pairing(p: G1.Affine, q: G2.Affine)` fixes
   the FIRST argument to `G1`, second to `G2`. The draft's abstract
@@ -741,7 +737,7 @@ see "Part 6 design" below.
   constant time; a faster public-scalar `scalarMul` variant is a
   possible later addition if a hot public-input call site appears.
 - **Subgroup checks — endomorphism tests, not `[r]P == O` (2026-09-15,
-  A1 `drand` F4; a new algorithm under DECISIONS P5).**
+  A1 `drand` F4; a new algorithm).**
   `g1.Jacobian.subgroupCheck` is `isOnCurve(P) ∧ φ(P) == [−x²]P`,
   `φ(x, y) = (βx, y)`; `g2.Jacobian.subgroupCheck` is `isOnCurve(P) ∧
   ψ(P) == [x]P`, `ψ` untwist-Frobenius-twist. Source: Scott, ePrint

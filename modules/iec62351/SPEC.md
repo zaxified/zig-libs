@@ -15,7 +15,7 @@
 
 **Downstream consumer:** no
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see this module's README "Provenance" note — clean-room, so there is deliberately no root `/NOTICE` entry to point at (root `NOTICE` §0).
+Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: the code is clean-room (README "Provenance"); the three captured GOOSE frames used as fixtures are attributed in this module's `NOTICE`.
 
 ## Compared with
 
@@ -582,7 +582,7 @@ profile actually switched on. If either happens, the frozen frame in
 
 ## Coordinator notes
 
-- `NOTICE` needs **no entry**: this module is clean-room from public
+- `NOTICE` needs **no entry for code** (the module's own `NOTICE` exists only for the vendored GOOSE capture frames, added later): this module is clean-room from public
   specifications and public descriptions; no third-party source was ported and
   no third-party implementation was studied for algorithm or API shape. OpenSSL
   and `asn1crypto` were run purely as black-box test oracles, which

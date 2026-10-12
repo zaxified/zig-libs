@@ -25,9 +25,10 @@ Provenance: original work of the zig-libs authors (MIT). No third-party code.
 
 `+` and `-` also legitimately lead a number (`-12.34`, `+5`, `+.5`) or a
 `+`-prefixed international phone number (`+420 555 0101`). Guarding those would
-corrupt the value, so a `+`/`-` lead is guarded **only** when the byte after it
-is not a digit or the decimal separator — i.e. only when it is actually a
-formula/comment lead (`+SUM(...)`, `-- comment`, a lone `+`).
+corrupt the value, so a `+`/`-` lead passes unguarded **only** when the byte after
+it is a digit or the decimal separator and every following byte is a digit,
+`.`, `,`, the separator or a space; anything else is a formula/comment lead
+(`+SUM(...)`, `-1+cmd|...`, `-- comment`, a lone `+`) and is guarded.
 
 ## API
 

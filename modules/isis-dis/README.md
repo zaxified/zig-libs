@@ -62,7 +62,7 @@ router); for a neighbour it is the pseudonode-id observed in that neighbour's He
 ## Change effects (became / resigned DIS)
 
 The `Election` FSM stores the current DIS and, on each `recompute`, emits a
-`DisChange` iff the elected DIS system-id flipped:
+`DisChange` iff the elected DIS `lan_id` (system-id ‖ pseudonode-id) changed:
 
 - `old_dis` / `new_dis` — the old (or null on the first election) and new DIS ids.
 - `became_dis` — the local system just became DIS (was not, now is): originate the
@@ -71,7 +71,7 @@ The `Election` FSM stores the current DIS and, on each `recompute`, emits a
   pseudonode LSP it had been originating.
 - `at` — the `now` passed to that `recompute` (a timestamp only; see below).
 
-A steady recompute with the same winner returns no `change`. A flip between two
+A steady recompute with the same winner and pseudonode-id returns no `change`; the same system-id winning with a different pseudonode-id is a `change` (the caller must follow the new pseudonode LSP-ID). A flip between two
 *remote* routers is still a `change` (with both local flags false).
 
 ## Time-injection stance

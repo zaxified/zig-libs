@@ -108,7 +108,9 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 ## Threat model / out of scope
 
 Not a security boundary; it is a data-shaping codec over JSON that may originate from a remote
-feed. The only error it raises is `Error.BadJson` on malformed JSON — everything else (missing
+feed. Its errors are `Error.BadJson` on malformed JSON, `OutOfMemory`, and `Error.TooManyMatches` when a path
+matches (or flattens into) more than `ShapeSpec.max_matches` items (`MAX_MATCHES`, 65,536 by default — a
+refusal, not a truncation; it bounds the result, not the traversal) — everything else (missing
 keys, type mismatches per cell, a path that resolves to nothing) degrades to `.null` cells or an
 empty dataset rather than failing, so a shape mismatch never panics or propagates as an error. It
 does not validate the *semantics* of the resulting data (values are taken as given from the remote
@@ -160,9 +162,9 @@ boundary. Run: `zig build test-jsonshape`.
   indistinguishable (both give zero rows).
 - ~~**Nested column keys through the path engine**~~ *(survey 2026-09-30)* — **done 2026-10-04**.
 - ~~**RFC 9535 filter and selector completeness**~~ *(survey 2026-09-30)* — **done 2026-10-04**
-  except: **`match()` / `search()`** — need an I-Regexp (RFC 9485) engine; none in the collection,
-  and a backtracking one is a DoS surface over hostile data (a linear-time matcher is the
-  prerequisite). **The RFC 9535 compliance test suite** (jsonpath-standard/
+  except: **`match()` / `search()`** — need an I-Regexp (RFC 9485) engine; the sibling `regex` module is
+  linear-time (no backtracking, so not a DoS surface) but is not wired in yet — the I-Regexp
+  subset check and adapter remain to be written. **The RFC 9535 compliance test suite** (jsonpath-standard/
   jsonpath-compliance-test-suite) as an external oracle — not run: its licence was not checked
   this session and no network fetch was made; it is the next anchoring step (→ Anchoring).
   The predicate is evaluated recursively over its tree, not "non-recursively" as this item

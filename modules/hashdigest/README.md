@@ -1,7 +1,9 @@
 # hashdigest
 
-Streaming SHA-256 helpers — one-shot, incremental, and **file** hashing that is
-correct on size-0 virtual files (`/proc`, `/sys`).
+Streaming digest helpers — one-shot, incremental, and **file** hashing that is
+correct on size-0 virtual files (`/proc`, `/sys`). SHA-256 has dedicated
+shortcuts; a runtime-selectable `Algorithm` (SHA-2 family, SHA-3, BLAKE2b-256,
+BLAKE3) goes through `hex`/`MultiHasher`/`hashFile`.
 
 - One-shot (`sha256Hex`, `matches`), incremental,
   and read-to-EOF file hashing (`sha256File`).
@@ -34,4 +36,12 @@ hasher.finalHex(&hex);
 
 // file hashing that trusts EOF, not stat().size (works on /proc/*)
 if (hd.sha256File(io, "/proc/cpuinfo", &hex)) |n| { _ = n; }
+
+// any algorithm, chosen at runtime (`hd.Algorithm`)
+var out: [hd.max_hex_len]u8 = undefined;
+const sha512_hex = try hd.hex(.sha512, "abc", &out);      // slice of `out`
+var mh = hd.MultiHasher.init(.blake3);
+mh.update("abc");
+const blake_hex = try mh.finalHex(&out);
+_ = try hd.hashFile(.sha3_256, io, "/proc/cpuinfo", &out); // ?u64 bytes read
 ```

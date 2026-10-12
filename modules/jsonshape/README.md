@@ -73,7 +73,7 @@ honoring the column's declared `ColumnType`, including JSON's
   `Dataset` with the declared columns and zero rows. This lets a caller
   declare a spec against an endpoint that sometimes omits the array without
   special-casing it.
-- **Malformed JSON → `Error.BadJson`.** The only error this module raises;
+- **Malformed JSON → `Error.BadJson`.** The only error about the input's format;
   everything else (missing keys, type mismatches per cell, bad path/filter
   syntax, and numbers outside the target column's range) degrades to `.null`
   cells or an empty dataset. The errors it CAN raise are `BadJson`,
@@ -108,8 +108,8 @@ honoring the column's declared `ColumnType`, including JSON's
 const jsonshape = @import("jsonshape");
 
 const JsonCol = jsonshape.JsonCol; // { name, key = "", type: ColumnType = .float }
-const ShapeSpec = jsonshape.ShapeSpec; // { path = "", columns = &.{}, x = "", y = "" }
-const Error = jsonshape.Error; // error{ BadJson, OutOfMemory }
+const ShapeSpec = jsonshape.ShapeSpec; // { path = "", columns = &.{}, x = "", y = "", max_matches = 65536 }
+const Error = jsonshape.Error; // error{ BadJson, OutOfMemory, TooManyMatches }
 
 fn shape(a: Allocator, bytes: []const u8, spec: ShapeSpec) Error!Dataset;
 ```
@@ -148,5 +148,7 @@ an oversight:
   array/no-matches are indistinguishable (both give zero rows); a mode
   that reports which case occurred would need a richer return type.
 - **`match()` / `search()`** — RFC 9535's regex functions need an I-Regexp
-  (RFC 9485) engine; none exists in this collection yet, and a backtracking
-  one would be a DoS surface on operator-written paths over hostile data.
+  (RFC 9485) engine. The sibling `regex` module (linear-time, no backtracking)
+  now exists but is not wired in: the I-Regexp subset check and the adapter
+  are this module's own backlog item (a backtracking engine would be a DoS
+  surface on operator-written paths over hostile data).

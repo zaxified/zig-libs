@@ -136,7 +136,7 @@ computed by pyxirr, scipy, numpy, pandas and empyrical-reloaded
 const finstats = @import("finstats");
 
 const Error = finstats.Error;         // error{ NoSuchColumn, OutOfMemory }
-const XirrError = finstats.XirrError; // Error || error{ XirrNoRoot }
+const XirrError = finstats.XirrError; // Error || error{ XirrNoRoot, EmptyWindow }
 
 // scalar reducers
 fn xirr(a, d: Dataset, spec: XirrSpec) XirrError!f64;

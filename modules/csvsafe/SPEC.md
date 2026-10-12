@@ -45,7 +45,7 @@ handling (listed as out of scope), and it is not wired into a writer (a caller c
 - Neutralizes a cell a spreadsheet would read as a formula (leading `=`, `+`, `-`, `@`, tab, CR, and since 2026-09-30 LF, `|`, `%`) by
   prefixing a single apostrophe (`guard_char`), forcing literal-text rendering.
 - **Signed-number exception:** a `+`/`-` lead passes unguarded only when **every** byte after the
-  sign is a digit, the decimal separator or a space — so `-12.34`, `+.5` and `+420 555 0101` pass,
+  sign is a digit, `.`, `,`, the decimal separator or a space (and the first one a digit or the separator) — so `-12.34`, `+.5` and `+420 555 0101` pass,
   while `-1+cmd|'/c calc'!A1` is guarded. (Checking only the byte after the sign let that whole
   injection class through: audit F1, `isSignedNumber`.)
 - `needsGuard`/`writeSafe` are allocation-free (stream to `*std.Io.Writer`); only `guard` (returns

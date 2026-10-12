@@ -55,7 +55,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
     from-scratch CBC in this repo, extracted for `xmlenc`/`jwe` — see
     `README.md` for why this module keeps its own instead of depending
     on it.)
-  - `ecc.P256`: `fromAffineCoordinates` re-checks the curve equation
+  - `ecc.P256` (this module uses the byte-exact `p256` sibling module, same API): `fromAffineCoordinates` re-checks the curve equation
     (peer COSE-key validation), `Fe.fromBytes(.big)` rejects
     non-canonical coordinates, `mul(scalar, .big)` is the constant-time
     scalar-mult, `affineCoordinates().x.toBytes(.big)` yields Z, and
@@ -123,7 +123,7 @@ once and frozen offline (`pin_protocol_oracle_vectors.zig` /
 | Protocol framing (One/Two) | live `python-fido2` capture | `encapsulate`'s platform pubkey + shared secret; `pinHashEnc`; a simulated `pinUvAuthToken` exchange; `pinUvAuthParam` keyed by the shared secret AND by the token — all byte-exact |
 
 Green in Debug and ReleaseFast (`zig build test-ctap2pin
-[-Doptimize=ReleaseFast]`), 37 tests.
+[-Doptimize=ReleaseFast]`; `scripts/modtest ctap2pin`).
 
 ### Real finding: `authenticate`/`verify`'s `key` type was too narrow
 
@@ -138,7 +138,7 @@ and always 32 bytes for protocol Two — never the same length as
 `SharedSecret`. For protocol Two this made the token-keyed call
 **impossible to express at all** (a `[32]u8` cannot coerce to `[64]u8`);
 for protocol One it worked only when the token happened to be 32 bytes.
-Fixed by widening both to `key: []const u8` (§6.5.7/§6.5.8's own
+Fixed by widening both to `key: []const u8` (later narrowed again for protocol Two to `*const [32]u8`, audit H2) (§6.5.7/§6.5.8's own
 `authenticate` abstract operation is generic over `key`; `Two.authenticate`
 already only reads `key[0..32]`, which is correct unchanged for both a
 64-byte shared secret and a 32-byte token). All existing call sites

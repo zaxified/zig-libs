@@ -59,8 +59,8 @@ Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenan
 - **`max_frame` is a runtime parameter** (`Limits{ .max_frame = ... }`, default 1 MiB), not a
   compile-time constant, enforced on both `writeFrame` (before touching the writer) and
   `readFrame` (checked against both the announced length and the caller's buffer capacity).
-- Pure `std` (`std.Io.Writer`/`std.Io.Reader` + `std.json`), no allocation in the framing layer
-  itself (the envelope layer allocates via the caller's `gpa`). Reentrant — no shared/global state.
+- Pure `std` (`std.Io.Writer`/`std.Io.Reader` + `std.json`), no allocation in `writeFrame`/`readFrame`
+  (`readFrameAlloc`, `Decoder` and the envelope layer allocate via the caller's `gpa`). Reentrant — no shared/global state.
 
 - **Configurable prefix and `Decoder` (2026-10-04).** `Limits.prefix` (default unchanged, u32-LE)
   selects width 1/2/4/8 or LEB128 varint, byte order, and `includes_prefix` (the field counts its

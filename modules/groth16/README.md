@@ -117,7 +117,7 @@ _ = groth16.qap.checkDivisible(2, sys, &witness); // true
 const toxic_waste = groth16.ToxicWaste{ .tau = tau, .alpha = alpha, .beta = beta, .gamma = gamma, .delta = delta };
 const kp = try groth16.setup(2, allocator, sys, 1, &toxic_waste);
 defer groth16.freeKeyPair(allocator, kp);
-const pf = groth16.prove(2, kp.pk, sys, 1, &witness, &.{ .r = r, .s = s });
+const pf = try groth16.prove(2, kp.pk, sys, 1, &witness, &.{ .r = r, .s = s });
 try std.testing.expect(try @import("bn254").groth16Verify(kp.vk, pf, witness[1..2]));
 ```
 

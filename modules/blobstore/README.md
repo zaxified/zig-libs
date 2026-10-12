@@ -122,7 +122,7 @@ const keys = try store.listNamed(arena, "hostA");              // [][]const u8
   only function that actually reclaims disk space: it removes every CAS blob
   whose refcount has reached zero and is not named in `keep`, plus abandoned
   `cas/.ingest-*.part` temps older than `GcOptions.stale_after_ns` (default
-  10 min). Refcounting was chosen over pure mark-sweep because `put`/`delete`
+  24 h; `0` is refused with `error.StaleAfterTooSmall`). Refcounting was chosen over pure mark-sweep because `put`/`delete`
   already see every reference change as it happens, so `gc` doesn't need to
   understand `named` manifests or any other caller-defined pointer format;
   `keep` stays available as an explicit, additive allow-list for callers who
