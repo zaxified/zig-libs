@@ -18,11 +18,28 @@
 //!   message's `Connection` lines — dropped in both directions so per-hop
 //!   framing never leaks end-to-end. A repeated response field is relayed
 //!   whole: `Set-Cookie` line by line, any other joined with commas.
+//! - **Upgrade passthrough** (WebSocket and any other `Upgrade`, Go's
+//!   `handleUpgradeResponse`): a request whose `Connection` lists `upgrade`
+//!   keeps `Connection: Upgrade` + its one `Upgrade` protocol on the way to
+//!   an h1 backend; a backend `101` naming the same protocol is relayed and
+//!   the two connections are spliced, bytes copied both ways (two tasks of
+//!   the client's `Io`) until either side stops. A `101` for another
+//!   protocol, or one nobody asked for, answers 502. The upgraded client
+//!   connection is out of the HTTP timeouts (`Request.upgraded`).
 //! - **Forwarding headers:** appends the socket peer to `X-Forwarded-For`
 //!   (de-facto; every inbound line joins the chain, which is dropped when the
-//!   client lists the field in `Connection`), sets `X-Forwarded-Proto` / `X-Forwarded-Host`,
-//!   and injects `Via: 1.1 <pseudonym>` (RFC 9110 §7.6.3) on request and
-//!   response, appending to any existing `Via`.
+//!   client lists the field in `Connection`), sets `X-Forwarded-Proto` /
+//!   `X-Forwarded-Host` (replacing a client's own claim), and injects
+//!   `Via: 1.1 <pseudonym>` (RFC 9110 §7.6.3) on request and response,
+//!   appending to any existing `Via`.
+//! - **Hooks** (Go `ReverseProxy`): `Config.rewrite` edits the outbound
+//!   request (`ProxyRequest`: backend, path, query, headers,
+//!   `setXForwarded`), `Config.modify_response` the backend's answer
+//!   (`ProxyResponse`: status, headers, body), `Config.error_handler`
+//!   answers every failure before the response head is sent.
+//! - **Streaming responses flushed as they arrive** (`Config.flush`, Go's
+//!   `FlushInterval` default): SSE and responses of undeclared length are
+//!   pushed to the client after every backend read.
 //! - **Host rewrite:** the forwarded `Host` becomes the backend authority
 //!   (default; `rewrite_host = false` preserves the client's Host — nginx
 //!   `proxy_set_header Host $http_host`).
@@ -73,6 +90,15 @@
 //!
 //! ## Known gaps (this pass)
 //!
+//! - **Upgrade over HTTP/2** either way is not carried: an h2 client
+//!   cannot ask (RFC 9113 §8.6 removed Upgrade; RFC 8441 extended CONNECT
+//!   is not implemented), and to an `.h2c`/`.h2` backend the request goes
+//!   on as a plain one.
+//! - **Go's timed `FlushInterval`** (flush at most every N ms) has no
+//!   counterpart: `Flush` is per read or by buffer.
+//! - **A `Rewrite` hook sees the raw query.** Go re-encodes a query with a
+//!   `;` or a malformed escape before the hook (`cleanQueryParams`); the
+//!   query here goes on as the client sent it, as `url` treats `;` as a byte.
 //! - **h2 upstream bodies are buffered** (bounded), not streamed like the
 //!   h1 path — a limitation of reusing the existing multiplexing h2 client
 //!   rather than forking a streaming one. Flow control is still exercised
@@ -179,6 +205,193 @@ pub const Config = struct {
     /// streaming h1 path), so both directions are capped. A larger body
     /// answers 502. Ignored by the `.http1` path (which streams).
     h2_max_body_bytes: usize = 8 * 1024 * 1024,
+    /// When the relayed response body is pushed to the client (Go's
+    /// `FlushInterval`). See `Flush`.
+    flush: Flush = .auto,
+    /// Go's `Rewrite`: edit the outbound request — backend, path, query,
+    /// headers — before it is sent. Setting it switches the forwarding
+    /// headers to Go's `Rewrite` rules: the client's `Forwarded` and
+    /// `X-Forwarded-For/-Host/-Proto` are removed and nothing is added
+    /// unless the hook calls `ProxyRequest.setXForwarded` (a hook that
+    /// forgets it no longer passes a client-supplied chain on as if this
+    /// proxy had vouched for it). `Via` is still added after the hook.
+    rewrite: ?Rewrite = null,
+    /// Go's `ModifyResponse`: edit the backend's answer — status, headers,
+    /// body — before any of it is sent. An error discards the answer and
+    /// goes to `error_handler`.
+    modify_response: ?ModifyResponse = null,
+    /// Go's `ErrorHandler`: answer a failure that happens before the
+    /// response head is on the wire (no backend, backend unreachable or
+    /// timed out, a hook error, an answer that cannot be relayed). Null
+    /// answers the default 502/503/504 with `Via`. After the head is sent a
+    /// failure can only close the connection, with or without a hook.
+    error_handler: ?ErrorHandler = null,
+};
+
+pub const Rewrite = struct {
+    ctx: ?*anyopaque = null,
+    func: *const fn (ctx: ?*anyopaque, pr: *ProxyRequest) anyerror!void,
+};
+
+pub const ModifyResponse = struct {
+    ctx: ?*anyopaque = null,
+    func: *const fn (ctx: ?*anyopaque, pr: *ProxyResponse) anyerror!void,
+};
+
+pub const ErrorHandler = struct {
+    ctx: ?*anyopaque = null,
+    func: *const fn (ctx: ?*anyopaque, rw: *Server.ResponseWriter, req: *Server.Request, failure: Failure) anyerror!void,
+};
+
+/// What went wrong, for an `ErrorHandler`.
+pub const Failure = struct {
+    /// The cause: a `Client`/`h2_upstream` error, a hook's own error, or
+    /// one of `ForwardError`.
+    err: anyerror,
+    /// What the default handler answers for it (502, 503 or 504).
+    status: u16,
+};
+
+/// Failures this module names itself.
+pub const ForwardError = error{
+    /// No backend: the `Selector` returned null.
+    NoBackend,
+    /// The outbound request could not be built: too many header lines, a
+    /// target past the URL buffer, a rewritten path or query that is not
+    /// origin-form (must start with `/`, no control octets, SP or `#`).
+    BadOutboundRequest,
+    /// The client's request body could not be read or sent on.
+    RequestBodyFailed,
+    /// The backend's answer cannot go onto our response (see `relayFailed`).
+    ResponseNotRelayable,
+    /// An HTTP/2 backend was selected and `Config.h2_upstream` is null.
+    NoH2Upstream,
+    /// The backend answered `101` to a request that asked for no upgrade,
+    /// or switched to another protocol than the one asked for.
+    UpgradeMismatch,
+};
+
+/// The outbound request, as a `Rewrite` hook sees and edits it (Go's
+/// `ProxyRequest`: `In`, `Out`, `SetURL`, `SetXForwarded`).
+pub const ProxyRequest = struct {
+    /// The inbound request (Go `In`). Read only.
+    in: *Server.Request,
+    /// Where the request goes (Go `SetURL`).
+    backend: Backend,
+    /// The outbound path and raw query, encoded as sent (Go `Out.URL.Path`
+    /// / `RawQuery`). A replacement must outlive the forward (a literal, or
+    /// storage in the hook's `ctx`) and stay origin-form, else
+    /// `error.BadOutboundRequest`.
+    path: []const u8,
+    query: []const u8,
+    /// The outbound header lines, hop-by-hop already removed (Go
+    /// `Out.Header`). A `Host` line here is sent as the `Host` (h1) /
+    /// `:authority` (h2); without one the backend authority is used.
+    headers: Headers,
+    forwarded_proto: []const u8,
+    xff_buf: []u8,
+
+    /// Go's `SetXForwarded`: `X-Forwarded-For` becomes the outbound value
+    /// (if any) with the client's address appended (removed when serving
+    /// socket-free), `X-Forwarded-Host` the inbound `Host`,
+    /// `X-Forwarded-Proto` `Config.forwarded_proto`.
+    pub fn setXForwarded(pr: *ProxyRequest) error{TooManyHeaders}!void {
+        if (pr.in.peerAddress() == null) {
+            pr.headers.del("X-Forwarded-For");
+        } else {
+            var w: std.Io.Writer = .fixed(pr.xff_buf);
+            const fits = blk: {
+                for (pr.headers.slice()) |h| if (std.ascii.eqlIgnoreCase(h.name, "x-forwarded-for")) {
+                    w.print("{s}, ", .{h.value}) catch break :blk false;
+                };
+                var ip_buf: [netaddr.max_ip_text_len]u8 = undefined;
+                w.writeAll(peerText(pr.in, &ip_buf).?) catch break :blk false;
+                break :blk true;
+            };
+            if (fits) {
+                try pr.headers.set("X-Forwarded-For", w.buffered());
+            } else {
+                // Past the buffer: this hop's peer alone, as the default path does.
+                var ip_buf: [netaddr.max_ip_text_len]u8 = undefined;
+                const ip = peerText(pr.in, &ip_buf).?;
+                @memcpy(pr.xff_buf[0..ip.len], ip);
+                try pr.headers.set("X-Forwarded-For", pr.xff_buf[0..ip.len]);
+            }
+        }
+        if (pr.in.header("host")) |h| try pr.headers.set("X-Forwarded-Host", h) else pr.headers.del("X-Forwarded-Host");
+        try pr.headers.set("X-Forwarded-Proto", pr.forwarded_proto);
+    }
+};
+
+/// The backend's answer, as a `ModifyResponse` hook sees and edits it (Go's
+/// `*http.Response` handed to `ModifyResponse`).
+pub const ProxyResponse = struct {
+    /// The inbound request.
+    in: *Server.Request,
+    /// The status that will be sent; starts as the backend's.
+    status: u16,
+    /// The response being built, its headers already relayed (hop-by-hop
+    /// removed, `Via` added): edit them with `setHeader`/`addHeader`/
+    /// `delHeader`/`getHeader`. Do not write the body here.
+    rw: *Server.ResponseWriter,
+    /// The body to relay; starts as the backend's. A replacement must
+    /// outlive the forward (the hook's `ctx`), and the hook adjusts or
+    /// removes `Content-Length` to match it (Go: `ContentLength`).
+    body: *std.Io.Reader,
+};
+
+/// An editable list of header lines over caller storage.
+pub const Headers = struct {
+    store: []http.Header,
+    len: usize = 0,
+
+    pub fn slice(h: *const Headers) []const http.Header {
+        return h.store[0..h.len];
+    }
+
+    /// The first value of `name` (case-insensitive), or null.
+    pub fn get(h: *const Headers, name: []const u8) ?[]const u8 {
+        for (h.slice()) |x| if (std.ascii.eqlIgnoreCase(x.name, name)) return x.value;
+        return null;
+    }
+
+    /// Append a line.
+    pub fn add(h: *Headers, name: []const u8, value: []const u8) error{TooManyHeaders}!void {
+        if (h.len == h.store.len) return error.TooManyHeaders;
+        h.store[h.len] = .{ .name = name, .value = value };
+        h.len += 1;
+    }
+
+    /// Replace every line of `name` with one.
+    pub fn set(h: *Headers, name: []const u8, value: []const u8) error{TooManyHeaders}!void {
+        h.del(name);
+        return h.add(name, value);
+    }
+
+    /// Remove every line of `name`.
+    pub fn del(h: *Headers, name: []const u8) void {
+        var w: usize = 0;
+        for (h.store[0..h.len]) |x| {
+            if (std.ascii.eqlIgnoreCase(x.name, name)) continue;
+            h.store[w] = x;
+            w += 1;
+        }
+        h.len = w;
+    }
+};
+
+/// When the proxy flushes a relayed response body (h1 backends; an h2
+/// backend's body arrives whole, see "Known gaps").
+pub const Flush = enum {
+    /// Go's default: after every read for a `text/event-stream` response and
+    /// for one whose length the backend did not declare (chunked or
+    /// close-delimited — a stream of unknown length is a stream); otherwise
+    /// only as the writer's buffer fills.
+    auto,
+    /// After every read, whatever the response (Go's negative
+    /// `FlushInterval`). Go's positive interval — a timed flush — has no
+    /// counterpart.
+    immediate,
 };
 
 /// The proxy handler. Construct one, then point a `Server` at it:
@@ -210,25 +423,49 @@ pub const ProxyHandler = struct {
     /// `rw`. Callable directly (e.g. from a `router` route handler that
     /// already resolved `req.context` itself).
     pub fn forward(self: *ProxyHandler, req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
-        const backend = self.pickBackend(req) orelse
-            return gatewayError(rw, 503, self.config.via_pseudonym);
+        const picked = self.pickBackend(req) orelse return self.fail(rw, req, error.NoBackend, 503);
 
-        // Protocol split: h2/h2c forward over the multiplexing HTTP/2 client
-        // (a shared upstream connection per backend); h1 takes the streaming
-        // path below, byte-for-byte unchanged.
-        if (backend.protocol != .http1) return self.forwardH2(backend, req, rw);
-
-        // ── build the forwarded target URL ──────────────────────────────
-        var url_buf: [max_url_len]u8 = undefined;
-        const url = buildUrl(&url_buf, backend, req.path, req.query) catch
-            return gatewayError(rw, 502, self.config.via_pseudonym);
-
-        // ── build the forwarded request headers ─────────────────────────
+        // ── build the outbound request, then let the hook edit it ───────
         var hdr_store: [max_fwd_headers]http.Header = undefined;
         var xff_buf: [max_xff_len]u8 = undefined;
         var via_buf: [max_via_len]u8 = undefined;
-        const fwd = self.buildRequestHeaders(req, &hdr_store, &xff_buf, &via_buf) catch
-            return gatewayError(rw, 502, self.config.via_pseudonym);
+        var pr: ProxyRequest = .{
+            .in = req,
+            .backend = picked,
+            .path = req.path,
+            .query = req.query,
+            .headers = .{ .store = &hdr_store },
+            .forwarded_proto = self.config.forwarded_proto,
+            .xff_buf = &xff_buf,
+        };
+        self.buildRequestHeaders(&pr) catch return self.fail(rw, req, error.BadOutboundRequest, 502);
+        // An upgrade (WebSocket, …) asked for: the two hop-by-hop fields
+        // that carry it go on again (RFC 9110 §7.8; Go does the same).
+        const upgrade = upgradeRequested(req, rw);
+        if (upgrade) |protocol| {
+            pr.headers.add("Connection", "Upgrade") catch return self.fail(rw, req, error.BadOutboundRequest, 502);
+            pr.headers.add("Upgrade", protocol) catch return self.fail(rw, req, error.BadOutboundRequest, 502);
+        }
+        if (self.config.rewrite) |hook| {
+            hook.func(hook.ctx, &pr) catch |e| return self.fail(rw, req, e, 502);
+            if (!originForm(pr.path, pr.query)) return self.fail(rw, req, error.BadOutboundRequest, 502);
+        }
+        // Via (request side): append to the client's own, if any. A chain
+        // too long for `via_buf` omits it rather than failing the forward —
+        // the *response* side is where a header the peer never sees changes
+        // what the client believes, and that one answers 502 (`relayFailed`).
+        if (buildVia(&via_buf, req.header("via"), self.config.via_pseudonym)) |v| {
+            pr.headers.set("Via", v) catch return self.fail(rw, req, error.BadOutboundRequest, 502);
+        } else |_| {}
+
+        // Protocol split: h2/h2c forward over the multiplexing HTTP/2 client
+        // (a shared upstream connection per backend); h1 takes the streaming
+        // path below.
+        if (pr.backend.protocol != .http1) return self.forwardH2(&pr, rw);
+
+        var url_buf: [max_url_len]u8 = undefined;
+        const url = buildUrl(&url_buf, pr.backend, pr.path, pr.query) catch
+            return self.fail(rw, req, error.BadOutboundRequest, 502);
 
         const c = self.config.client;
         const has_body = req.head.chunked or (req.head.content_length orelse 0) != 0;
@@ -236,45 +473,93 @@ pub const ProxyHandler = struct {
         var res: Client.Response = if (has_body) blk: {
             // Stream the request body through with the same framing shape.
             const content_length: ?u64 = if (req.head.chunked) null else req.head.content_length;
-            var up = c.requestStreaming(req.method, url, .{ .headers = fwd }, content_length) catch |err|
-                return self.onBackendError(rw, err);
+            var up = c.requestStreaming(req.method, url, .{ .headers = pr.headers.slice() }, content_length) catch |err|
+                return self.onBackendError(rw, req, err);
             _ = req.reader().streamRemaining(up.writer()) catch {
                 up.abort();
-                return gatewayError(rw, 502, self.config.via_pseudonym);
+                return self.fail(rw, req, error.RequestBodyFailed, 502);
             };
-            break :blk up.finish() catch |err| return self.onBackendError(rw, err);
+            break :blk up.finish() catch |err| return self.onBackendError(rw, req, err);
         } else c.request(req.method, url, .{
-            .headers = fwd,
+            .headers = pr.headers.slice(),
             .follow_redirects = false, // a proxy relays 3xx, never chases them
-        }) catch |err| return self.onBackendError(rw, err);
+        }) catch |err| return self.onBackendError(rw, req, err);
         defer res.deinit();
 
         // ── relay status + response headers ─────────────────────────────
         rw.setStatus(res.status);
-        var it = res.head.iterate();
-        var at: usize = 0;
-        while (it.next()) |entry| : (at += 1) {
-            if (isHopByHop(entry.name, null) or connectionLists(res.head.iterate(), entry.name)) continue;
-            // `Transfer-Encoding` is hop-by-hop (above); `Content-Length` is
-            // copied so `rw` re-frames identity with the exact length. The
-            // writer manages `Connection`/`Date`/`Server` itself.
-            if (std.ascii.eqlIgnoreCase(entry.name, "connection") or
-                std.ascii.eqlIgnoreCase(entry.name, "via")) continue;
-            relayField(rw, res.head.iterate(), at, entry.name, entry.value) catch return self.relayFailed(rw);
+        relayHead(rw, res.head) catch return self.relayFailed(rw, req);
+        if (res.status == 101) return self.relayUpgrade(rw, req, &res, upgrade, &via_buf);
+        return self.finishResponse(rw, req, res.status, res.header("via"), res.reader(), &via_buf);
+    }
+
+    /// The backend switched protocols: answer the client's upgrade with the
+    /// backend's 101 (its end-to-end fields, `Via`, the `ModifyResponse`
+    /// hook), then copy bytes both ways until either side stops — Go's
+    /// `handleUpgradeResponse`.
+    fn relayUpgrade(
+        self: *ProxyHandler,
+        rw: *Server.ResponseWriter,
+        req: *Server.Request,
+        res: *Client.Response,
+        asked: ?[]const u8,
+        via_buf: []u8,
+    ) anyerror!void {
+        const want = asked orelse return self.fail(rw, req, error.UpgradeMismatch, 502);
+        const got = (if (connectionLists(res.head.iterate(), "upgrade")) res.header("upgrade") else null) orelse
+            return self.fail(rw, req, error.UpgradeMismatch, 502);
+        if (!std.ascii.eqlIgnoreCase(got, want)) return self.fail(rw, req, error.UpgradeMismatch, 502);
+
+        const via = buildVia(via_buf, res.header("via"), self.config.via_pseudonym) catch
+            return self.relayFailed(rw, req);
+        rw.setHeader("Via", via) catch return self.relayFailed(rw, req);
+        if (self.config.modify_response) |hook| {
+            // A 101 has no body; the hook edits the head only.
+            var none: std.Io.Reader = .fixed("");
+            var presp: ProxyResponse = .{ .in = req, .status = 101, .rw = rw, .body = &none };
+            hook.func(hook.ctx, &presp) catch |e| return self.fail(rw, req, e, 502);
         }
+        rw.upgrade(got) catch |e| return self.fail(rw, req, e, 502);
+        // `upgradeRequested` checked both ends can be handed over.
+        const front = req.upgraded(rw).?;
+        const back = res.upgraded().?;
+        splice(self.config.client.io, front, back);
+    }
+
+    /// The shared tail of both forward paths, once the backend's headers are
+    /// on `rw`: response-side `Via`, the `ModifyResponse` hook, the body.
+    fn finishResponse(
+        self: *ProxyHandler,
+        rw: *Server.ResponseWriter,
+        req: *Server.Request,
+        status: u16,
+        backend_via: ?[]const u8,
+        body: *std.Io.Reader,
+        via_buf: []u8,
+    ) anyerror!void {
         // Response-side Via (append to the backend's own, if any).
-        const via = buildVia(&via_buf, res.header("via"), self.config.via_pseudonym) catch
-            return self.relayFailed(rw);
-        rw.setHeader("Via", via) catch return self.relayFailed(rw);
+        const via = buildVia(via_buf, backend_via, self.config.via_pseudonym) catch
+            return self.relayFailed(rw, req);
+        rw.setHeader("Via", via) catch return self.relayFailed(rw, req);
+
+        var presp: ProxyResponse = .{ .in = req, .status = status, .rw = rw, .body = body };
+        if (self.config.modify_response) |hook| {
+            hook.func(hook.ctx, &presp) catch |e| return self.fail(rw, req, e, 502);
+            rw.setStatus(presp.status);
+        }
 
         // ── stream the response body back (no full buffering) ───────────
-        _ = res.reader().streamRemaining(rw.writer()) catch {
+        const flush_each = switch (self.config.flush) {
+            .immediate => true,
+            .auto => rw.declared_len == null or isEventStream(rw.getHeader("content-type")),
+        };
+        relayBody(presp.body, rw, flush_each) catch {
             // Head may already be on the wire (large body outgrew the
             // buffer) — then the only honest move is to close the
             // connection; the serving loop does that when we return an
             // error. If nothing was sent yet, a 502 still fits.
             if (rw.headSent()) return error.ProxyBackendStreamAborted;
-            return gatewayError(rw, 502, self.config.via_pseudonym);
+            return self.fail(rw, req, error.ResponseNotRelayable, 502);
         };
         // No early `end()`. It used to be forced here so `writeHead` read the
         // relayed header slices before the deferred `res.deinit()` freed the
@@ -283,35 +568,35 @@ pub const ProxyHandler = struct {
         // already framed onto the wire. The serving loop ends the response.
     }
 
-    /// Forward `req` to an HTTP/2 (h2/h2c) backend through the shared
+    /// Forward to an HTTP/2 (h2/h2c) backend through the shared
     /// `h2_upstream.Pool`: translate the request into a stream on the
     /// backend's one multiplexed connection, collect the response, relay it
-    /// back. Header translation (hop-by-hop, `X-Forwarded-*`, `Via`) is
-    /// shared with the h1 path; the h2 body is buffered (bounded — see
-    /// `Config.h2_max_body_bytes`).
-    fn forwardH2(self: *ProxyHandler, backend: Backend, req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
-        const pool = self.config.h2_upstream orelse
-            return gatewayError(rw, 502, self.config.via_pseudonym);
+    /// back. Header translation and the hooks are shared with the h1 path;
+    /// the h2 body is buffered (bounded — see `Config.h2_max_body_bytes`).
+    fn forwardH2(self: *ProxyHandler, pr: *ProxyRequest, rw: *Server.ResponseWriter) anyerror!void {
+        const req = pr.in;
+        const pool = self.config.h2_upstream orelse return self.fail(rw, req, error.NoH2Upstream, 502);
         const gpa = self.config.client.gpa;
+        const backend = pr.backend;
 
-        // Forwarded request headers (shared with the h1 path). Host is not
-        // among them (dropped there) — `:authority` carries it below.
-        var hdr_store: [max_fwd_headers]http.Header = undefined;
-        var xff_buf: [max_xff_len]u8 = undefined;
-        var via_buf: [max_via_len]u8 = undefined;
-        const fwd = self.buildRequestHeaders(req, &hdr_store, &xff_buf, &via_buf) catch
-            return gatewayError(rw, 502, self.config.via_pseudonym);
-
-        // `:authority` — backend authority when rewriting Host (default),
-        // else the client's original Host.
+        // `:authority` — a `Host` line in the outbound set (the client's,
+        // kept by `rewrite_host = false`, or a hook's), else the backend
+        // authority. Not sent as a field as well.
         var auth_buf: [max_authority_len]u8 = undefined;
-        const authority = blk: {
-            if (!self.config.rewrite_host) {
-                if (req.header("host")) |h| break :blk h;
-            }
-            break :blk buildAuthority(&auth_buf, backend) catch
-                return gatewayError(rw, 502, self.config.via_pseudonym);
-        };
+        const authority = pr.headers.get("host") orelse
+            (buildAuthority(&auth_buf, backend) catch return self.fail(rw, req, error.BadOutboundRequest, 502));
+        pr.headers.del("host");
+        // HTTP/2 has no Upgrade (RFC 9113 §8.6): an upgrade request goes on
+        // as a plain one.
+        pr.headers.del("connection");
+        pr.headers.del("upgrade");
+
+        // Origin-form target: the raw inbound target unless a hook rewrote it.
+        var target_buf: [max_url_len]u8 = undefined;
+        const target = if (self.config.rewrite == null)
+            (if (req.target.len == 0) "/" else req.target)
+        else
+            buildTarget(&target_buf, pr.path, pr.query) catch return self.fail(rw, req, error.BadOutboundRequest, 502);
 
         // Read the request body into memory (bounded); the h2 client streams
         // it out under §5.2 flow control (WINDOW_UPDATE past the window).
@@ -322,7 +607,7 @@ pub const ProxyHandler = struct {
             body_buf = req.reader().allocRemaining(gpa, .limited(self.config.h2_max_body_bytes)) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 // Over the cap or a read failure — nothing is on the wire yet.
-                else => return gatewayError(rw, 502, self.config.via_pseudonym),
+                else => return self.fail(rw, req, error.RequestBodyFailed, 502),
             };
         }
 
@@ -333,12 +618,12 @@ pub const ProxyHandler = struct {
         };
         var res = pool.roundtrip(be, .{
             .method = req.method,
-            .path = if (req.target.len == 0) "/" else req.target, // origin-form, query included
+            .path = target,
             .authority = authority,
             .scheme = if (backend.protocol == .h2) "https" else "http",
-            .headers = fwd,
+            .headers = pr.headers.slice(),
             .body = body_buf,
-        }) catch |err| return self.onH2Error(rw, err);
+        }) catch |err| return self.onH2Error(rw, req, err);
         defer res.deinit(gpa);
 
         // ── relay status + response headers ─────────────────────────────
@@ -348,35 +633,44 @@ pub const ProxyHandler = struct {
             if (isHopByHop(f.name, null) or connectionLists(FieldIter{ .fields = res.headers.fields }, f.name)) continue;
             if (std.ascii.eqlIgnoreCase(f.name, "connection") or
                 std.ascii.eqlIgnoreCase(f.name, "via")) continue;
-            relayField(rw, FieldIter{ .fields = res.headers.fields }, at, f.name, f.value) catch return self.relayFailed(rw);
+            relayField(rw, FieldIter{ .fields = res.headers.fields }, at, f.name, f.value) catch return self.relayFailed(rw, req);
         }
-        const via = buildVia(&via_buf, res.header("via"), self.config.via_pseudonym) catch
-            return self.relayFailed(rw);
-        rw.setHeader("Via", via) catch return self.relayFailed(rw);
-
-        // ── relay the (buffered) response body ──────────────────────────
-        // `res.body` is copied into the writer, so — as on the h1 path — the
-        // deferred `res.deinit(gpa)` is no longer racing an early `end()`.
-        rw.writeAll(res.body) catch {
-            if (rw.headSent()) return error.ProxyBackendStreamAborted;
-            return gatewayError(rw, 502, self.config.via_pseudonym);
-        };
+        // The (buffered) body is copied into the writer, so — as on the h1
+        // path — the deferred `res.deinit(gpa)` is not racing an `end()`.
+        var body: std.Io.Reader = .fixed(res.body);
+        var via_buf: [max_via_len]u8 = undefined;
+        return self.finishResponse(rw, req, res.status, res.header("via"), &body, &via_buf);
     }
 
     /// Map an `h2_upstream` forward error to a gateway status (or surface a
     /// genuine OOM as the server's 500).
-    fn onH2Error(self: *ProxyHandler, rw: *Server.ResponseWriter, err: anyerror) anyerror!void {
+    fn onH2Error(self: *ProxyHandler, rw: *Server.ResponseWriter, req: *Server.Request, err: anyerror) anyerror!void {
         if (err == error.OutOfMemory) return err;
         const status: u16 = switch (err) {
             error.Timeout => 504, // Gateway Timeout
             else => 502, // Bad Gateway (dial/protocol/reset/goaway/…)
         };
-        return gatewayError(rw, status, self.config.via_pseudonym);
+        return self.fail(rw, req, err, status);
     }
 
     fn pickBackend(self: *ProxyHandler, req: *Server.Request) ?Backend {
         if (self.config.selector) |sel| return sel.select(req);
         return self.config.backend;
+    }
+
+    /// Every failure before the response head is on the wire ends here: the
+    /// half-built response is discarded and `error_handler` (or the default
+    /// gateway page) answers.
+    fn fail(self: *ProxyHandler, rw: *Server.ResponseWriter, req: *Server.Request, err: anyerror, status: u16) anyerror!void {
+        if (rw.headSent()) return error.ProxyBackendStreamAborted;
+        // `headSent` was checked on the line above, so the error path is
+        // unreachable here — `try` rather than an assert so it stays that
+        // way in ReleaseFast.
+        try rw.reset();
+        if (self.config.error_handler) |hook| return hook.func(hook.ctx, rw, req, .{ .err = err, .status = status });
+        if (err == error.ResponseNotRelayable)
+            return gatewayErrorReason(rw, status, self.config.via_pseudonym, "Bad Gateway: backend response headers could not be relayed\n");
+        return gatewayError(rw, status, self.config.via_pseudonym);
     }
 
     /// A backend response header would not go onto our response — the
@@ -409,39 +703,27 @@ pub const ProxyHandler = struct {
     /// So the proxy reports what happened: it could not faithfully relay the
     /// backend's answer, which is a gateway failure. Nothing is on the wire
     /// yet (the head is written when the body starts, and no body byte has
-    /// been relayed), so `reset` discards the half-relayed set and the 502
+    /// been relayed), so `fail` discards the half-relayed set and the 502
     /// goes out clean, carrying `Via` so the failing hop is identifiable.
-    fn relayFailed(self: *ProxyHandler, rw: *Server.ResponseWriter) anyerror!void {
-        if (rw.headSent()) return error.ProxyBackendStreamAborted;
-        // A partly-relayed header set must not ride the 502. `headSent` was
-        // checked on the line above, so the error path is unreachable here —
-        // `try` rather than an assert so it stays that way in ReleaseFast.
-        try rw.reset();
-        return gatewayErrorReason(
-            rw,
-            502,
-            self.config.via_pseudonym,
-            "Bad Gateway: backend response headers could not be relayed\n",
-        );
+    fn relayFailed(self: *ProxyHandler, rw: *Server.ResponseWriter, req: *Server.Request) anyerror!void {
+        return self.fail(rw, req, error.ResponseNotRelayable, 502);
     }
 
     /// Map a `Client` error to a gateway status, or surface a genuine
     /// out-of-memory as a plain error (→ the server's 500).
-    fn onBackendError(self: *ProxyHandler, rw: *Server.ResponseWriter, err: Client.Error) anyerror!void {
+    fn onBackendError(self: *ProxyHandler, rw: *Server.ResponseWriter, req: *Server.Request, err: Client.Error) anyerror!void {
         if (err == error.OutOfMemory) return err;
-        return gatewayError(rw, statusForBackendError(err), self.config.via_pseudonym);
+        return self.fail(rw, req, err, statusForBackendError(err));
     }
 
     /// Assemble the forwarded header set: pass-through end-to-end headers,
-    /// drop hop-by-hop + client-managed framing, add the forwarding headers.
-    fn buildRequestHeaders(
-        self: *ProxyHandler,
-        req: *Server.Request,
-        store: []http.Header,
-        xff_buf: []u8,
-        via_buf: []u8,
-    ) error{TooManyHeaders}![]http.Header {
-        var n: usize = 0;
+    /// drop hop-by-hop + client-managed framing, add the forwarding headers
+    /// (Go's `Director` shape; with a `Rewrite` hook, Go's `Rewrite` shape —
+    /// see `Config.rewrite`). `Via` is added by the caller, after the hook.
+    fn buildRequestHeaders(self: *ProxyHandler, pr: *ProxyRequest) error{TooManyHeaders}!void {
+        const req = pr.in;
+        const h = &pr.headers;
+        const rewriting = self.config.rewrite != null;
         var it = req.head.iterate();
         while (it.next()) |entry| {
             const name = entry.name;
@@ -449,50 +731,31 @@ pub const ProxyHandler = struct {
             // headers are the client's job.
             if (std.ascii.eqlIgnoreCase(name, "host")) continue;
             if (std.ascii.eqlIgnoreCase(name, "content-length")) continue;
-            if (std.ascii.eqlIgnoreCase(name, "via")) continue; // re-injected below
+            if (std.ascii.eqlIgnoreCase(name, "via")) continue; // re-injected after the hook
             // Folded into the one chain built below, every line of it.
             if (std.ascii.eqlIgnoreCase(name, "x-forwarded-for")) continue;
+            // Set below (or by the hook): a client's own claim must not ride
+            // in front of ours — a backend reading the first line would take
+            // `X-Forwarded-Proto: https` from a plain-HTTP client.
+            if (std.ascii.eqlIgnoreCase(name, "x-forwarded-host") or
+                std.ascii.eqlIgnoreCase(name, "x-forwarded-proto")) continue;
             if (isHopByHop(name, null) or connectionLists(req.head.iterate(), name)) continue;
-            if (n == store.len) return error.TooManyHeaders;
-            store[n] = .{ .name = entry.name, .value = entry.value };
-            n += 1;
+            // Go's `Rewrite`: the client's `Forwarded` does not pass either.
+            if (rewriting and std.ascii.eqlIgnoreCase(name, "forwarded")) continue;
+            try h.add(entry.name, entry.value);
         }
 
         // Host: preserve the client's when not rewriting (rewrite = let the
         // client default it to the backend authority, so nothing is added).
         if (!self.config.rewrite_host) {
-            if (req.header("host")) |h| {
-                if (n == store.len) return error.TooManyHeaders;
-                store[n] = .{ .name = "Host", .value = h };
-                n += 1;
-            }
+            if (req.header("host")) |host| try h.add("Host", host);
         }
+        if (rewriting) return;
         // X-Forwarded-For: append this hop's socket peer.
-        if (buildForwardedFor(xff_buf, req)) |xff| {
-            if (n == store.len) return error.TooManyHeaders;
-            store[n] = .{ .name = "X-Forwarded-For", .value = xff };
-            n += 1;
-        }
-        // X-Forwarded-Proto.
-        if (n == store.len) return error.TooManyHeaders;
-        store[n] = .{ .name = "X-Forwarded-Proto", .value = self.config.forwarded_proto };
-        n += 1;
+        if (buildForwardedFor(pr.xff_buf, req)) |xff| try h.add("X-Forwarded-For", xff);
+        try h.add("X-Forwarded-Proto", self.config.forwarded_proto);
         // X-Forwarded-Host: the original Host the client asked for.
-        if (req.header("host")) |h| {
-            if (n == store.len) return error.TooManyHeaders;
-            store[n] = .{ .name = "X-Forwarded-Host", .value = h };
-            n += 1;
-        }
-        // Via (request side): append to the client's own, if any. A chain
-        // too long for `via_buf` omits it rather than failing the forward —
-        // the *response* side is where a header the peer never sees changes
-        // what the client believes, and that one answers 502 (`relayFailed`).
-        if (buildVia(via_buf, req.header("via"), self.config.via_pseudonym)) |v| {
-            if (n == store.len) return error.TooManyHeaders;
-            store[n] = .{ .name = "Via", .value = v };
-            n += 1;
-        } else |_| {}
-        return store[0..n];
+        if (req.header("host")) |host| try h.add("X-Forwarded-Host", host);
     }
 };
 
@@ -511,6 +774,30 @@ pub fn isHopByHop(name: []const u8, connection_value: ?[]const u8) bool {
     return false;
 }
 
+/// Copy a backend body into `rw`; with `flush_each`, push every read to the
+/// client at once (an event must not wait for the next one to fill a
+/// buffer).
+fn relayBody(r: *std.Io.Reader, rw: *Server.ResponseWriter, flush_each: bool) !void {
+    if (!flush_each) {
+        _ = try r.streamRemaining(rw.writer());
+        return;
+    }
+    while (true) {
+        _ = r.stream(rw.writer(), .unlimited) catch |e| switch (e) {
+            error.EndOfStream => return,
+            else => |x| return x,
+        };
+        try rw.flush();
+    }
+}
+
+/// Whether a response `Content-Type` is Server-Sent Events, as Go's
+/// `flushInterval` reads it (`mime.ParseMediaType`'s type).
+fn isEventStream(content_type: ?[]const u8) bool {
+    const ct = content_type orelse return false;
+    return std.ascii.eqlIgnoreCase(http.body.checkMediaType(ct).media_type, "text/event-stream");
+}
+
 /// Map a back-side `Client` error to the gateway status a client should see.
 pub fn statusForBackendError(err: Client.Error) u16 {
     return switch (err) {
@@ -522,13 +809,8 @@ pub fn statusForBackendError(err: Client.Error) u16 {
 /// `X-Forwarded-For` value: the existing chain (if any) with this hop's
 /// socket peer appended. Null when there is no peer (socket-free serving).
 fn buildForwardedFor(buf: []u8, req: *Server.Request) ?[]const u8 {
-    const peer = req.peerAddress() orelse return null;
-    const ip: netaddr.Ip = switch (peer) {
-        .ip4 => |a| .{ .v4 = a.bytes },
-        .ip6 => |a| .{ .v6 = a.bytes },
-    };
     var ip_buf: [netaddr.max_ip_text_len]u8 = undefined;
-    const ip_text = netaddr.formatIp(ip.unmap(), &ip_buf);
+    const ip_text = peerText(req, &ip_buf) orelse return null;
 
     // The existing chain is every `X-Forwarded-For` line, in order (RFC 9110
     // §5.3: repeated lines are one comma-separated list) — unless the client
@@ -545,6 +827,90 @@ fn buildForwardedFor(buf: []u8, req: *Server.Request) ?[]const u8 {
     return w.buffered();
 }
 
+/// The socket peer's address as text (IPv4-mapped IPv6 unmapped), or null
+/// when serving socket-free.
+fn peerText(req: *Server.Request, buf: *[netaddr.max_ip_text_len]u8) ?[]const u8 {
+    const peer = req.peerAddress() orelse return null;
+    const ip: netaddr.Ip = switch (peer) {
+        .ip4 => |a| .{ .v4 = a.bytes },
+        .ip6 => |a| .{ .v6 = a.bytes },
+    };
+    return netaddr.formatIp(ip.unmap(), buf);
+}
+
+/// The protocol `req` asks to switch to, when this proxy can carry the
+/// switch: `Connection` lists `upgrade`, `Upgrade` names one protocol
+/// (`name[/version]`, both tokens — a list could never match the backend's
+/// single answer), and the request is an HTTP/1.1 one without a body served
+/// over a socket (`ResponseWriter.upgrade` and `Request.upgraded` can hand
+/// the connection over). Otherwise null, and the two fields are dropped as
+/// hop-by-hop.
+fn upgradeRequested(req: *Server.Request, rw: *const Server.ResponseWriter) ?[]const u8 {
+    if (!rw.upgradable or rw.upgrade_in == null or req.control == null) return null;
+    if (!connectionLists(req.head.iterate(), "upgrade")) return null;
+    const protocol = req.header("upgrade") orelse return null;
+    const slash = std.mem.indexOfScalar(u8, protocol, '/');
+    if (!h1.isToken(protocol[0 .. slash orelse protocol.len])) return null;
+    if (slash) |i| if (!h1.isToken(protocol[i + 1 ..])) return null;
+    return protocol;
+}
+
+/// Copy bytes both ways between an upgraded client connection and an
+/// upgraded backend connection until either direction ends, then shut both
+/// down (Go: the first copier to finish ends the exchange). The client to
+/// backend direction runs in a task of its own.
+fn splice(io: std.Io, front: Server.Upgraded, back: Client.Upgraded) void {
+    var group: std.Io.Group = .init;
+    group.concurrent(io, pipeToBackend, .{ front, back }) catch {
+        front.shutdown();
+        back.shutdown();
+        return;
+    };
+    pipeToClient(front, back);
+    group.await(io) catch {};
+}
+
+fn pipeToBackend(front: Server.Upgraded, back: Client.Upgraded) void {
+    defer endSplice(front, back);
+    while (true) {
+        _ = front.reader.stream(back.writer(), .unlimited) catch return;
+        back.flush() catch return;
+    }
+}
+
+fn pipeToClient(front: Server.Upgraded, back: Client.Upgraded) void {
+    defer endSplice(front, back);
+    while (true) {
+        _ = back.reader().stream(front.writer, .unlimited) catch return;
+        front.writer.flush() catch return;
+    }
+}
+
+fn endSplice(front: Server.Upgraded, back: Client.Upgraded) void {
+    front.shutdown();
+    back.shutdown();
+}
+
+/// Whether a (rewritten) path and query can go on a request line as
+/// origin-form: the path starts with `/`, and neither holds a control octet,
+/// SP, DEL or `#` — anything else would split the request line or be cut
+/// off as a fragment.
+fn originForm(path: []const u8, query: []const u8) bool {
+    if (path.len == 0 or path[0] != '/') return false;
+    for ([_][]const u8{ path, query }) |part| for (part) |c| {
+        if (c <= 0x20 or c == 0x7f or c == '#') return false;
+    };
+    return true;
+}
+
+/// `path` + `?query` (when non-empty) into `buf`.
+fn buildTarget(buf: []u8, path: []const u8, query: []const u8) error{Overflow}![]const u8 {
+    var w: std.Io.Writer = .fixed(buf);
+    w.writeAll(path) catch return error.Overflow;
+    if (query.len != 0) w.print("?{s}", .{query}) catch return error.Overflow;
+    return w.buffered();
+}
+
 /// Whether any `Connection` field line in `fields` (an iterator yielding
 /// `.name`/`.value`) lists `name` (RFC 9110 §7.6.1). Every line counts:
 /// `Connection: a` + `Connection: b` is the one list `a, b` (§5.3).
@@ -554,6 +920,22 @@ fn connectionLists(fields: anytype, name: []const u8) bool {
         if (std.ascii.eqlIgnoreCase(e.name, "connection") and h1.tokenListContains(e.value, name)) return true;
     }
     return false;
+}
+
+/// Put an h1 backend response's end-to-end fields on `rw`: hop-by-hop ones
+/// (the fixed set, `Proxy-*`, every field a `Connection` line names) and
+/// `Via` (re-built by the caller) dropped, repeated ones relayed whole.
+/// `Transfer-Encoding` is hop-by-hop; `Content-Length` is copied so `rw`
+/// re-frames identity with the exact length. The writer manages
+/// `Connection`/`Date`/`Server` itself.
+fn relayHead(rw: *Server.ResponseWriter, head: h1.ResponseHead) !void {
+    var it = head.iterate();
+    var at: usize = 0;
+    while (it.next()) |entry| : (at += 1) {
+        if (isHopByHop(entry.name, null) or connectionLists(head.iterate(), entry.name)) continue;
+        if (std.ascii.eqlIgnoreCase(entry.name, "via")) continue;
+        try relayField(rw, head.iterate(), at, entry.name, entry.value);
+    }
 }
 
 /// `connectionLists`/`relayField` over an h2 response's field slice.
@@ -1072,6 +1454,240 @@ test "integration: a backend header set the proxy cannot relay answers 502, not 
     try testing.expectEqualStrings("ok", fits.body());
 }
 
+// ── integration: a streaming response reaches the client as it is produced ──
+
+/// An origin that answers each request with a chunked body in two halves and
+/// holds the second back until the client behind the proxy has the first —
+/// or until `wait_ms` runs out, which it records as "the first half was
+/// stuck in the proxy". Faked at the socket level so the origin itself
+/// flushes each half for certain.
+const StreamingOrigin = struct {
+    io: std.Io,
+    listener: *net.Server,
+    /// One response `Content-Type` per request, in order.
+    content_types: []const []const u8,
+    /// Set by the client once it has read the first half.
+    got_first: std.atomic.Value(bool) = .init(false),
+    /// Per request: did the client see the first half before the origin
+    /// sent the second?
+    in_time: [4]bool = @splat(false),
+    const wait_ms = 2000;
+
+    fn run(o: *StreamingOrigin) void {
+        for (o.content_types, 0..) |ct, i| {
+            const s = o.listener.accept(o.io) catch return;
+            defer s.close(o.io);
+            var rbuf: [4096]u8 = undefined;
+            var wbuf: [1024]u8 = undefined;
+            var sr = s.reader(o.io, &rbuf);
+            var sw = s.writer(o.io, &wbuf);
+            var head_buf: [4096]u8 = undefined;
+            _ = h1.readHead(&sr.interface, &head_buf) catch return;
+            const w = &sw.interface;
+            o.got_first.store(false, .release);
+            w.print("HTTP/1.1 200 OK\r\nContent-Type: {s}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n" ++
+                "b\r\ndata: one\n\n\r\n", .{ct}) catch return;
+            w.flush() catch return;
+            var waited: usize = 0;
+            while (!o.got_first.load(.acquire) and waited < wait_ms) : (waited += 5)
+                o.io.sleep(.fromMilliseconds(5), .awake) catch return;
+            o.in_time[i] = o.got_first.load(.acquire);
+            w.writeAll("b\r\ndata: two\n\n\r\n0\r\n\r\n") catch return;
+            w.flush() catch return;
+        }
+    }
+};
+
+/// One request through the proxy, signalling the origin once the first half
+/// is in. Never fails the test itself (see `Relayed`): the origin thread
+/// must always get its requests.
+fn readStreamed(client: *Client, url: []const u8, origin: *StreamingOrigin, out: []u8) []const u8 {
+    var res = client.request(.get, url, .{}) catch return "";
+    defer res.deinit();
+    // One `stream` per read: `readSliceShort` waits for a full buffer.
+    var w: std.Io.Writer = .fixed(out);
+    const r = res.reader();
+    while (true) {
+        _ = r.stream(&w, .unlimited) catch break;
+        if (std.mem.indexOf(u8, w.buffered(), "data: one\n\n") != null) origin.got_first.store(true, .release);
+    }
+    return w.buffered();
+}
+
+test "integration: a streaming response (SSE, or no declared length) is flushed through as it arrives" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var listener = addr.listen(io, .{}) catch |err| return testkit.loopbackSkip("origin listen failed ({t})", .{err});
+    defer listener.deinit(io);
+    var origin: StreamingOrigin = .{
+        .io = io,
+        .listener = &listener,
+        // Go's `flushInterval`: SSE by media type, anything of unknown length.
+        .content_types = &.{ "text/event-stream; charset=utf-8", "application/x-ndjson" },
+    };
+    const origin_thread = try std.Thread.spawn(.{}, StreamingOrigin.run, .{&origin});
+    defer origin_thread.join();
+
+    var proxy_client = Client.init(io, testing.allocator, .{});
+    defer proxy_client.deinit();
+    var ph = ProxyHandler.init(.{
+        .client = &proxy_client,
+        .backend = .{ .host = "127.0.0.1", .port = listener.socket.address.getPort() },
+    });
+    var proxy = Server.init(io, testing.allocator, .{ .handler = ProxyHandler.handler, .context = &ph });
+    defer proxy.deinit();
+    proxy.bind() catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+    const proxy_thread = try std.Thread.spawn(.{}, serveWrap, .{&proxy});
+    defer proxy_thread.join();
+    defer proxy.shutdown();
+
+    var client = Client.init(io, testing.allocator, .{});
+    defer client.deinit();
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{proxy.boundAddress().getPort()});
+    var bufs: [2][64]u8 = undefined;
+    const sse = readStreamed(&client, url, &origin, &bufs[0]);
+    const ndjson = readStreamed(&client, url, &origin, &bufs[1]);
+
+    try testing.expectEqualStrings("data: one\n\ndata: two\n\n", sse);
+    try testing.expectEqualStrings("data: one\n\ndata: two\n\n", ndjson);
+    try testing.expect(origin.in_time[0]);
+    try testing.expect(origin.in_time[1]);
+}
+
+// ── integration: an upgrade (WebSocket-style) passes through ───────────────
+
+/// A backend that switches to a toy `echo` protocol — or, on `/mismatch`, to
+/// one nobody asked for — and echoes until the peer closes. Records the
+/// request head it saw.
+const EchoBackend = struct {
+    io: std.Io,
+    listener: *net.Server,
+    n: usize,
+    saw_upgrade: [2]bool = @splat(false),
+    accepted: std.atomic.Value(usize) = .init(0),
+
+    fn run(b: *EchoBackend) void {
+        for (0..b.n) |i| b.one(i) catch {};
+    }
+
+    /// Dial whatever connections the test did not get to, so a failed
+    /// assertion fails the test instead of hanging its `join`.
+    fn release(b: *EchoBackend) void {
+        const port = b.listener.socket.address.getPort();
+        for (b.accepted.load(.acquire)..b.n) |_| {
+            const addr = net.IpAddress.parse("127.0.0.1", port) catch return;
+            const s = addr.connect(b.io, .{ .mode = .stream }) catch return;
+            s.close(b.io);
+        }
+    }
+
+    fn one(b: *EchoBackend, i: usize) !void {
+        const s = try b.listener.accept(b.io);
+        _ = b.accepted.fetchAdd(1, .release);
+        defer s.close(b.io);
+        var rbuf: [1024]u8 = undefined;
+        var wbuf: [1024]u8 = undefined;
+        var sr = s.reader(b.io, &rbuf);
+        var sw = s.writer(b.io, &wbuf);
+        var head_buf: [2048]u8 = undefined;
+        const block = try h1.readHead(&sr.interface, &head_buf);
+        const head = try h1.RequestHead.parse(block);
+        b.saw_upgrade[i] = std.ascii.eqlIgnoreCase(head.header("upgrade") orelse "", "echo") and
+            h1.tokenListContains(head.header("connection") orelse "", "upgrade");
+        const w = &sw.interface;
+        if (std.mem.startsWith(u8, block, "GET /mismatch")) {
+            try w.writeAll("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: other\r\n\r\n");
+            return w.flush();
+        }
+        try w.writeAll("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: echo\r\nX-Up: 1\r\nKeep-Alive: timeout=1\r\n\r\n");
+        try w.flush();
+        while (true) {
+            _ = sr.interface.stream(w, .unlimited) catch return;
+            try w.flush();
+        }
+    }
+};
+
+test "integration: an upgrade passes through — 101 relayed, bytes both ways, idle past the read timeout, ends when a side closes" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var listener = addr.listen(io, .{}) catch |err| return testkit.loopbackSkip("echo backend listen failed ({t})", .{err});
+    defer listener.deinit(io);
+    var backend: EchoBackend = .{ .io = io, .listener = &listener, .n = 2 };
+    const backend_thread = try std.Thread.spawn(.{}, EchoBackend.run, .{&backend});
+    defer backend_thread.join();
+    defer backend.release();
+
+    var proxy_client = Client.init(io, testing.allocator, .{});
+    defer proxy_client.deinit();
+    var ph = ProxyHandler.init(.{
+        .client = &proxy_client,
+        .backend = .{ .host = "127.0.0.1", .port = listener.socket.address.getPort() },
+    });
+    // A short per-read stall timeout: the upgraded connection must outlive it.
+    var proxy = Server.init(io, testing.allocator, .{ .handler = ProxyHandler.handler, .context = &ph, .read_timeout_ms = 200 });
+    defer proxy.deinit();
+    proxy.bind() catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+    const proxy_thread = try std.Thread.spawn(.{}, serveWrap, .{&proxy});
+    defer proxy_thread.join();
+    defer proxy.shutdown();
+    const front = try net.IpAddress.parse("127.0.0.1", proxy.boundAddress().getPort());
+
+    { // The switch, and an echo both ways.
+        const s = try front.connect(io, .{ .mode = .stream });
+        defer s.close(io);
+        var rbuf: [1024]u8 = undefined;
+        var wbuf: [256]u8 = undefined;
+        var sr = s.reader(io, &rbuf);
+        var sw = s.writer(io, &wbuf);
+        // "hello" rides right behind the request head.
+        try sw.interface.writeAll("GET /ws HTTP/1.1\r\nHost: t\r\nConnection: Upgrade\r\nUpgrade: echo\r\n\r\nhello");
+        try sw.interface.flush();
+        var head_buf: [1024]u8 = undefined;
+        const head = try h1.readHead(&sr.interface, &head_buf);
+        try testing.expect(std.mem.startsWith(u8, head, "HTTP/1.1 101 "));
+        const parsed = try h1.ResponseHead.parse(head);
+        try testing.expectEqualStrings("echo", parsed.header("upgrade").?);
+        try testing.expect(h1.tokenListContains(parsed.header("connection").?, "upgrade"));
+        try testing.expectEqualStrings("1", parsed.header("x-up").?); // end-to-end field relayed
+        try testing.expectEqual(@as(?[]const u8, null), parsed.header("keep-alive")); // hop-by-hop dropped
+        try testing.expect(std.mem.indexOf(u8, parsed.header("via").?, "zig-libs") != null);
+        var got: [5]u8 = undefined;
+        try sr.interface.readSliceAll(&got);
+        try testing.expectEqualStrings("hello", &got);
+        // Idle for twice the proxy's read timeout: HTTP timeouts no longer apply.
+        try io.sleep(.fromMilliseconds(400), .awake);
+        try sw.interface.writeAll("world");
+        try sw.interface.flush();
+        try sr.interface.readSliceAll(&got);
+        try testing.expectEqualStrings("world", &got);
+        // Our half-close reaches the backend, which closes; so does the proxy.
+        try s.shutdown(io, .send);
+        try testing.expectError(error.EndOfStream, sr.interface.takeByte());
+    }
+    { // The backend switches to a protocol nobody asked for: 502.
+        var client = Client.init(io, testing.allocator, .{});
+        defer client.deinit();
+        var url_buf: [64]u8 = undefined;
+        const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/mismatch", .{proxy.boundAddress().getPort()});
+        var res = try client.request(.get, url, .{ .headers = &.{
+            .{ .name = "Connection", .value = "Upgrade" },
+            .{ .name = "Upgrade", .value = "echo" },
+        } });
+        defer res.deinit();
+        try testing.expectEqual(@as(u16, 502), res.status);
+    }
+    try testing.expect(backend.saw_upgrade[0]);
+    try testing.expect(backend.saw_upgrade[1]);
+}
+
 // ── integration: h1 proxy forwarding over h2c to an HTTP/2 backend ──────────
 
 /// One concurrent client hitting the proxy — used to prove many clients
@@ -1513,4 +2129,96 @@ test "integration: h2c backend unreachable → 502 Bad Gateway" {
     defer res.deinit();
     try testing.expectEqual(@as(u16, 502), res.status);
     try testing.expect(std.mem.indexOf(u8, res.header("via").?, "zig-libs") != null);
+}
+
+// ── fuzz: a backend response head through the relay ─────────────────────────
+//
+// `relayHead` is where a backend's header section becomes ours: hop-by-hop
+// stripping over arbitrary `Connection` token lists, repeated fields joined.
+// The harness checks the property that matters on top of "no panic": no
+// field the backend made hop-by-hop reaches the client.
+
+const seed = testkit.fuzz.seed;
+const fz = @import("fuzz_test.zig");
+const RelayMark = fz.Marker(enum { rejected, relayed, refused, dropped, joined });
+
+/// Header lines (CRLF-separated, no status line, no final blank line).
+const relay_seeds = [_][]const u8{
+    seed("Content-Type: text/plain\r\nX-A: 1\r\nX-A: 2"),
+    seed("Connection: X-Secret, keep-alive\r\nX-Secret: 1\r\nKeep-Alive: timeout=5"),
+    seed("connection: x-a\r\nConnection: X-B\r\nX-A: 1\r\nX-B: 2\r\nX-C: 3"),
+    seed("Proxy-Authenticate: Basic\r\nProxy-Foo: x\r\nTE: trailers\r\nUpgrade: h2c"),
+    seed("Set-Cookie: a=1\r\nSet-Cookie: b=2\r\nVia: 1.1 other"),
+    seed("Connection: ,,Content-Type,\r\nContent-Type: text/html\r\nContent-Length: 2"),
+    seed("Transfer-Encoding: chunked\r\nTrailer: X-T\r\nX-T: 1"),
+    seed("Connection: X-A\r\nX-A: 1\r\nX-a: 2\r\nx-A: 3"),
+    seed(many_fields), // more fields than the writer holds: the relay refuses
+};
+
+const many_fields = blk: {
+    var s: []const u8 = "";
+    for (0..40) |i| s = s ++ std.fmt.comptimePrint("X{d}: 1\r\n", .{i});
+    break :blk s[0 .. s.len - 2];
+};
+
+test "fuzz: relayHead never panics, never relays a hop-by-hop field" {
+    try testing.fuzz({}, fuzzRelaySmith, .{ .corpus = &relay_seeds });
+}
+
+test "fuzz driver: HTTP_FUZZ (proxy relay)" {
+    try fz.fuzz_driver.run(fuzzRelay, .{ .prefix = "HTTP_FUZZ", .name = "http-proxy-relay" });
+}
+
+test "fuzz harness: proxy relay, 300 seeds, reaches every outcome" {
+    try RelayMark.reach(fuzzRelay, "http-proxy-relay", 300);
+}
+
+fn fuzzRelaySmith(_: void, smith: *std.testing.Smith) !void {
+    var script: [fz.script_cap]u8 = undefined;
+    const n = smith.slice(&script);
+    try fz.runFrom(fuzzRelay, smith, script[0..n]);
+}
+
+fn fuzzRelay(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    var lines: [512]u8 = undefined;
+    const len: usize = fz.drawInput(S, src, &lines, &relay_seeds);
+    var raw: [600]u8 = undefined;
+    const block = std.fmt.bufPrint(&raw, "HTTP/1.1 200 OK\r\n{s}\r\n\r\n", .{lines[0..len]}) catch unreachable;
+    const head = h1.ResponseHead.parse(block) catch return RelayMark.mark(.rejected);
+
+    var out_buf: [2048]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var body_buf: [64]u8 = undefined;
+    var chunk_buf: [64]u8 = undefined;
+    var rw: Server.ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+    relayHead(&rw, head) catch return RelayMark.mark(.refused);
+    RelayMark.mark(.relayed);
+
+    // No field the backend made hop-by-hop is on our response.
+    var it = head.iterate();
+    while (it.next()) |e| {
+        const hop = isHopByHop(e.name, null) or connectionLists(head.iterate(), e.name) or
+            std.ascii.eqlIgnoreCase(e.name, "via");
+        const got = rw.getHeader(e.name);
+        if (hop) {
+            // Managed names (`Connection`, framing) never read back anyway.
+            if (got != null) return error.HopByHopRelayed;
+            RelayMark.mark(.dropped);
+        }
+    }
+    // Only `Set-Cookie` may repeat: any other repeated field is one joined line.
+    for (rw.headers[0..rw.headers_len], 0..) |a, i| for (rw.headers[0..i]) |b| {
+        if (std.ascii.eqlIgnoreCase(a.name, b.name) and !std.ascii.eqlIgnoreCase(a.name, "set-cookie"))
+            return error.FieldNotJoined;
+    };
+    var repeated = false;
+    var names = head.iterate();
+    while (names.next()) |e| {
+        var count: usize = 0;
+        var again = head.iterate();
+        while (again.next()) |f| count += @intFromBool(std.ascii.eqlIgnoreCase(e.name, f.name));
+        if (count > 1 and rw.getHeader(e.name) != null) repeated = true;
+    }
+    if (repeated) RelayMark.mark(.joined);
 }

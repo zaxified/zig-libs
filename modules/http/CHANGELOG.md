@@ -5,6 +5,21 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-12** — **Reverse proxy: Go's `ReverseProxy` hooks, streaming flush, Upgrade passthrough
+  (S2 survey R7); fixes.** `proxy.Config.rewrite` / `modify_response` / `error_handler` with
+  `ProxyRequest` (backend, path, query, `headers`, `setXForwarded`), `ProxyResponse` (status, `rw`,
+  body), `Failure` and `ForwardError`; with `rewrite` set the client's `Forwarded`/`X-Forwarded-*`
+  are removed and only `setXForwarded` adds them (Go's `Rewrite` rule). `Config.flush` (`Flush.auto`
+  = Go: SSE and undeclared-length responses flushed per read; `.immediate`). A request asking for an
+  upgrade (WebSocket, …) is carried to an h1 backend and the connections spliced after its `101`.
+  New in `Server`: `Request.upgraded(rw)` / `Upgraded` (Go `Hijack`: the connection after a 101,
+  HTTP timeouts lifted). New in `Client`: a caller's `Connection: Upgrade` + `Upgrade` are sent
+  (they used to be dropped), `Response.upgraded()` / `Upgraded`. **Fix, `proxy`:** a streaming
+  response (SSE, chunked) used to wait in the writer's buffer until it filled or ended; a client's
+  own `X-Forwarded-Proto`/`X-Forwarded-Host` used to ride in front of the proxy's (a backend
+  reading the first line took the client's claim). **Behaviour change, `proxy`:** gateway failures
+  now `reset` the response before answering (they did only for unrelayable headers).
+
 - **2026-10-12** — **Request forms, Go's `ParseForm`/`FormValue` family (S2 survey R4), additive;
   fix in `multipart`.** New `http.form`: `Form.parse(arena, req, limits)` reads the query, an
   urlencoded body (POST/PUT/PATCH) or a multipart body (any method) by Go's rules and precedence,

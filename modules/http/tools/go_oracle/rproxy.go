@@ -64,6 +64,8 @@ var rpCases = []rpCase{
 	rp("te-gzip", "TE: gzip\r\n", ""),
 	rp("trailer", "Trailer: X-T\r\n", ""),
 	rp("upgrade", "Upgrade: websocket\r\n", ""),
+	rp("upgrade-asked", "Connection: Upgrade\r\nUpgrade: websocket\r\n", ""),
+	rp("upgrade-asked-list", "Connection: keep-alive, Upgrade\r\nUpgrade: websocket, h2c\r\n", ""),
 	rp("xff-one", "X-Forwarded-For: 10.0.0.1\r\n", ""),
 	rp("xff-two-lines", "X-Forwarded-For: 10.0.0.1\r\nX-Forwarded-For: 10.0.0.2\r\n", ""),
 	rp("xff-list", "X-Forwarded-For: 10.0.0.1, 10.0.0.2\r\n", ""),

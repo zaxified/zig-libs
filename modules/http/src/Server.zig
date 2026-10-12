@@ -2337,6 +2337,7 @@ fn serveOne(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers,
         .encoder_provider = if (compression_on and opts.encoder_provider != null) &opts.encoder_provider.? else null,
         .accept_encoding = head.header("accept-encoding"),
         .upgradable = !has_body and !head.http1_0,
+        .upgrade_in = if (!has_body and !head.http1_0) in else null,
         .continue_pending = continue_pending,
     });
     // `Expect: 100-continue` is answered LAZILY: the interim `100 Continue`
@@ -2570,6 +2571,33 @@ pub const Request = struct {
         }
     };
 
+    /// After `ResponseWriter.upgrade` put the 101 on the wire: the
+    /// connection itself, for the new protocol — Go's `Hijack`. The reader
+    /// may already hold bytes the client sent behind its request; write to
+    /// `writer` and flush it. The connection's HTTP timeouts (per-read and
+    /// per-write stalls, the request, phase and response deadlines) are
+    /// lifted: the new protocol owns its liveness (a WebSocket ping, an
+    /// idle bound of the handler's own). The serving loop closes the
+    /// connection when the handler returns. Null before a successful
+    /// `upgrade`.
+    pub fn upgraded(req: *Request, rw: *ResponseWriter) ?Upgraded {
+        if (rw.status != 101 or !rw.ended) return null;
+        const in = rw.upgrade_in orelse return null;
+        if (req.control) |c| {
+            if (c.tr) |t| {
+                t.timeout_ms = 0;
+                t.deadline_ns = 0;
+                t.phase = .body;
+                t.phase_deadline_ns = 0;
+            }
+            if (c.tw) |w| {
+                w.timeout_ms = 0;
+                w.response_deadline_ns = 0;
+            }
+        }
+        return .{ .reader = in, .writer = rw.out, .control = req.control };
+    }
+
     /// HTTP Basic credentials from the `Authorization` header (RFC 7617), as
     /// Go's `Request.BasicAuth`: scheme `Basic` in any case, one space,
     /// padded standard base64, split at the first `:`. `out` receives the
@@ -2636,6 +2664,22 @@ pub const Request = struct {
 };
 
 pub const BasicCredentials = helpers.BasicCredentials;
+
+/// An upgraded connection (see `Request.upgraded`).
+pub const Upgraded = struct {
+    /// Bytes from the client.
+    reader: *Reader,
+    /// Bytes to the client; flush to send them.
+    writer: *Writer,
+    control: ?*ConnControl,
+
+    /// Shut the socket down both ways: a read blocked in another task
+    /// returns. A no-op when served socket-free.
+    pub fn shutdown(u: Upgraded) void {
+        const c = u.control orelse return;
+        c.stream.shutdown(c.server.io, .both) catch {};
+    }
+};
 
 /// A request body capped below the server's `max_body_bytes` for one
 /// handler — Go's `MaxBytesReader`. The handler owns the storage:
@@ -3132,6 +3176,9 @@ pub const ResponseWriter = struct {
     /// See `upgrade`: only the h1 serving loop sets it, and only for a
     /// request that carries no body.
     upgradable: bool = false,
+    /// The connection's reader, handed over by `Request.upgraded` after a
+    /// 101; set with `upgradable`.
+    upgrade_in: ?*Reader = null,
     body: BodySink = .buffering,
     /// Body octets written through the `.until_close` sink (see
     /// `bodyBytesSent`); the chunked sinks count their own.
@@ -3207,6 +3254,9 @@ pub const ResponseWriter = struct {
         /// serving loop for an HTTP/1.1 request without a body; false
         /// everywhere else (h2, a hand-built writer), so `upgrade` refuses.
         upgradable: bool = false,
+        /// The connection's reader, for `Request.upgraded`. Set with
+        /// `upgradable` by the h1 serving loop.
+        upgrade_in: ?*Reader = null,
     };
 
     /// `body_buf` is the buffering/auto-Content-Length threshold;
@@ -3241,6 +3291,7 @@ pub const ResponseWriter = struct {
                 if (opts.encoder_provider) |p| p.prefers(p, opts.accept_encoding) else false,
             .field_sink = opts.field_sink,
             .upgradable = opts.upgradable,
+            .upgrade_in = opts.upgrade_in,
             .interface = .{
                 .vtable = &.{ .drain = drainFn },
                 .buffer = body_buf,

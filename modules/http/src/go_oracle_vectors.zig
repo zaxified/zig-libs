@@ -629,6 +629,8 @@ pub const rproxy = [_]RProxyCase{
     .{ .id = "te-gzip", .wire = "GET /p?q=1 HTTP/1.1\r\nHost: front.example\r\nAccept-Encoding: identity\r\nTE: gzip\r\n\r\n", .resp_extra = "", .up_line = "GET /p?q=1", .up = &.{ "accept-encoding: identity", "host: front.example", "x-forwarded-for: 127.0.0.1" }, .up_body = "", .status = 200, .down = &.{"content-type: text/plain"} },
     .{ .id = "trailer", .wire = "GET /p?q=1 HTTP/1.1\r\nHost: front.example\r\nAccept-Encoding: identity\r\nTrailer: X-T\r\n\r\n", .resp_extra = "", .up_line = "GET /p?q=1", .up = &.{ "accept-encoding: identity", "host: front.example", "x-forwarded-for: 127.0.0.1" }, .up_body = "", .status = 200, .down = &.{"content-type: text/plain"} },
     .{ .id = "upgrade", .wire = "GET /p?q=1 HTTP/1.1\r\nHost: front.example\r\nAccept-Encoding: identity\r\nUpgrade: websocket\r\n\r\n", .resp_extra = "", .up_line = "GET /p?q=1", .up = &.{ "accept-encoding: identity", "host: front.example", "x-forwarded-for: 127.0.0.1" }, .up_body = "", .status = 200, .down = &.{"content-type: text/plain"} },
+    .{ .id = "upgrade-asked", .wire = "GET /p?q=1 HTTP/1.1\r\nHost: front.example\r\nAccept-Encoding: identity\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n", .resp_extra = "", .up_line = "GET /p?q=1", .up = &.{ "accept-encoding: identity", "host: front.example", "upgrade: websocket", "x-forwarded-for: 127.0.0.1" }, .up_body = "", .status = 200, .down = &.{"content-type: text/plain"} },
+    .{ .id = "upgrade-asked-list", .wire = "GET /p?q=1 HTTP/1.1\r\nHost: front.example\r\nAccept-Encoding: identity\r\nConnection: keep-alive, Upgrade\r\nUpgrade: websocket, h2c\r\n\r\n", .resp_extra = "", .up_line = "GET /p?q=1", .up = &.{ "accept-encoding: identity", "host: front.example", "upgrade: websocket, h2c", "x-forwarded-for: 127.0.0.1" }, .up_body = "", .status = 200, .down = &.{"content-type: text/plain"} },
     .{ .id = "xff-one", .wire = "GET /p?q=1 HTTP/1.1\r\nHost: front.example\r\nAccept-Encoding: identity\r\nX-Forwarded-For: 10.0.0.1\r\n\r\n", .resp_extra = "", .up_line = "GET /p?q=1", .up = &.{ "accept-encoding: identity", "host: front.example", "x-forwarded-for: 10.0.0.1, 127.0.0.1" }, .up_body = "", .status = 200, .down = &.{"content-type: text/plain"} },
     .{ .id = "xff-two-lines", .wire = "GET /p?q=1 HTTP/1.1\r\nHost: front.example\r\nAccept-Encoding: identity\r\nX-Forwarded-For: 10.0.0.1\r\nX-Forwarded-For: 10.0.0.2\r\n\r\n", .resp_extra = "", .up_line = "GET /p?q=1", .up = &.{ "accept-encoding: identity", "host: front.example", "x-forwarded-for: 10.0.0.1, 10.0.0.2, 127.0.0.1" }, .up_body = "", .status = 200, .down = &.{"content-type: text/plain"} },
     .{ .id = "xff-list", .wire = "GET /p?q=1 HTTP/1.1\r\nHost: front.example\r\nAccept-Encoding: identity\r\nX-Forwarded-For: 10.0.0.1, 10.0.0.2\r\n\r\n", .resp_extra = "", .up_line = "GET /p?q=1", .up = &.{ "accept-encoding: identity", "host: front.example", "x-forwarded-for: 10.0.0.1, 10.0.0.2, 127.0.0.1" }, .up_body = "", .status = 200, .down = &.{"content-type: text/plain"} },
@@ -861,4 +863,36 @@ pub const query_escape = [_]EscapeCase{
     .{ .input = "100%", .out = "100%25" },
     .{ .input = "tab\there", .out = "tab%09here" },
     .{ .input = "A-Z0-9", .out = "A-Z0-9" },
+};
+
+pub const RProxyHookCase = struct {
+    id: []const u8,
+    /// The hook profile (see `rproxy_hooks` in go_oracle.zig).
+    profile: []const u8,
+    /// What Go's proxy sent the backend; `up_line` empty when no request reached it.
+    up_line: []const u8,
+    up: []const []const u8,
+    /// What Go's proxy returned to the client.
+    status: u16,
+    down: []const []const u8,
+    down_body: []const u8,
+};
+
+/// The request every rproxy_hooks case sends.
+pub const rproxy_hooks_wire = "GET /p?q=1 HTTP/1.1\r\nHost: front.example\r\nAccept-Encoding: identity\r\nX-Forwarded-For: 10.0.0.1\r\nX-Forwarded-Host: claimed.example\r\nX-Forwarded-Proto: https\r\nForwarded: for=192.0.2.1\r\nX-Drop: 1\r\nX-Keep: 2\r\n\r\n";
+
+/// What the live backend answers.
+pub const rproxy_hooks_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Type: text/plain\r\nX-Back: 1\r\nX-Keep: 2\r\n\r\nok";
+
+/// httputil.ReverseProxy with Rewrite / ModifyResponse / ErrorHandler.
+pub const rproxy_hooks = [_]RProxyHookCase{
+    .{ .id = "rewrite-bare", .profile = "rewrite-bare", .up_line = "GET /p?q=1", .up = &.{ "accept-encoding: identity", "host: backend", "x-drop: 1", "x-keep: 2" }, .status = 200, .down = &.{ "content-type: text/plain", "x-back: 1", "x-keep: 2" }, .down_body = "ok" },
+    .{ .id = "rewrite-xfwd", .profile = "rewrite-xfwd", .up_line = "GET /p?q=1", .up = &.{ "accept-encoding: identity", "host: backend", "x-drop: 1", "x-forwarded-for: 127.0.0.1", "x-forwarded-host: front.example", "x-forwarded-proto: http", "x-keep: 2" }, .status = 200, .down = &.{ "content-type: text/plain", "x-back: 1", "x-keep: 2" }, .down_body = "ok" },
+    .{ .id = "rewrite-keep-host", .profile = "rewrite-keep-host", .up_line = "GET /p?q=1", .up = &.{ "accept-encoding: identity", "host: front.example", "x-drop: 1", "x-forwarded-for: 127.0.0.1", "x-forwarded-host: front.example", "x-forwarded-proto: http", "x-keep: 2" }, .status = 200, .down = &.{ "content-type: text/plain", "x-back: 1", "x-keep: 2" }, .down_body = "ok" },
+    .{ .id = "rewrite-edit", .profile = "rewrite-edit", .up_line = "GET /rewritten?x=1", .up = &.{ "accept-encoding: identity", "host: backend", "x-added: 1", "x-keep: 2" }, .status = 200, .down = &.{ "content-type: text/plain", "x-back: 1", "x-keep: 2" }, .down_body = "ok" },
+    .{ .id = "modify", .profile = "modify", .up_line = "GET /p?q=1", .up = &.{ "accept-encoding: identity", "forwarded: for=192.0.2.1", "host: front.example", "x-drop: 1", "x-forwarded-for: 10.0.0.1, 127.0.0.1", "x-forwarded-host: claimed.example", "x-forwarded-proto: https", "x-keep: 2" }, .status = 201, .down = &.{ "content-type: text/plain", "x-keep: 2", "x-mod: 1" }, .down_body = "ok" },
+    .{ .id = "modify-body", .profile = "modify-body", .up_line = "GET /p?q=1", .up = &.{ "accept-encoding: identity", "forwarded: for=192.0.2.1", "host: front.example", "x-drop: 1", "x-forwarded-for: 10.0.0.1, 127.0.0.1", "x-forwarded-host: claimed.example", "x-forwarded-proto: https", "x-keep: 2" }, .status = 200, .down = &.{ "content-type: text/plain", "x-back: 1", "x-keep: 2" }, .down_body = "replaced" },
+    .{ .id = "modify-error", .profile = "modify-error", .up_line = "GET /p?q=1", .up = &.{ "accept-encoding: identity", "forwarded: for=192.0.2.1", "host: front.example", "x-drop: 1", "x-forwarded-for: 10.0.0.1, 127.0.0.1", "x-forwarded-host: claimed.example", "x-forwarded-proto: https", "x-keep: 2" }, .status = 418, .down = &.{ "content-type: text/plain", "x-err: 1" }, .down_body = "handled" },
+    .{ .id = "error-dead", .profile = "error-dead", .up_line = "", .up = &.{}, .status = 418, .down = &.{ "content-type: text/plain", "x-err: 1" }, .down_body = "handled" },
+    .{ .id = "dead-default", .profile = "dead-default", .up_line = "", .up = &.{}, .status = 502, .down = &.{}, .down_body = "" },
 };

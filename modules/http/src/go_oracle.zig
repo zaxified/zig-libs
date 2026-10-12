@@ -831,6 +831,7 @@ const rproxy_divergences = [_]RProxyDivergence{
     .{ .id = "te-gzip-trailers", .side = "up", .why = "TE is hop-by-hop (RFC 9110 §7.6.1); Go re-sends `TE: trailers` upstream, which promises the backend a trailer section reaches the client -- this proxy relays none (h1 streams the body only, h2 does not surface trailers), so it does not make the promise" },
     .{ .id = "proxy-other", .side = "up", .why = "every `Proxy-*` field is dropped (module doc): a proxy credential under any name never leaks to the origin; Go drops only Proxy-Authorization/-Authenticate/-Connection" },
     .{ .id = "resp-proxy-other", .side = "down", .why = "as proxy-other, on the response" },
+    .{ .id = "upgrade-asked-list", .side = "up", .why = "an `Upgrade` listing several protocols is not carried (dropped as hop-by-hop): the backend's 101 names one, and Go then refuses the switch anyway because the two values differ (`handleUpgradeResponse` compares them whole)" },
 };
 
 test "go oracle rproxy: the proxy passes on what Go's ReverseProxy passes on, or the difference is judged" {
@@ -1194,4 +1195,197 @@ test "go oracle form: escape answers as url.QueryEscape" {
         errdefer std.debug.print("escape {f}\n", .{std.zig.fmtString(c.input)});
         try testing.expectEqualStrings(c.out, w.buffered());
     }
+}
+
+// ── rproxy_hooks: Rewrite, ModifyResponse, ErrorHandler ──────────────────
+
+/// The profile of the case being replayed; every hook below reads it.
+var rh_profile: []const u8 = "";
+var rh_replaced: std.Io.Reader = undefined;
+
+fn rhIs(name: []const u8) bool {
+    return std.mem.eql(u8, rh_profile, name);
+}
+
+fn rhRewrite(_: ?*anyopaque, pr: *proxy_mod.ProxyRequest) anyerror!void {
+    if (rhIs("rewrite-xfwd") or rhIs("rewrite-keep-host")) try pr.setXForwarded();
+    if (rhIs("rewrite-edit")) {
+        pr.path = "/rewritten";
+        pr.query = "x=1";
+        try pr.headers.set("X-Added", "1");
+        pr.headers.del("X-Drop");
+    }
+}
+
+fn rhModify(_: ?*anyopaque, pr: *proxy_mod.ProxyResponse) anyerror!void {
+    if (rhIs("modify")) {
+        pr.status = 201;
+        try pr.rw.setHeader("X-Mod", "1");
+        try pr.rw.delHeader("X-Back");
+    } else if (rhIs("modify-body")) {
+        rh_replaced = .fixed("replaced");
+        pr.body = &rh_replaced;
+        try pr.rw.setHeader("Content-Length", "8");
+    } else if (rhIs("modify-error")) return error.Refused;
+}
+
+fn rhError(_: ?*anyopaque, rw: *Server.ResponseWriter, _: *Server.Request, _: proxy_mod.Failure) anyerror!void {
+    try rw.setHeader("Content-Type", "text/plain");
+    try rw.setHeader("X-Err", "1");
+    rw.setStatus(418);
+    try rw.writeAll("handled");
+}
+
+/// A raw backend answering every connection with `rproxy_hooks_response`,
+/// recording the request; `served` counts the requests read.
+const HookBackend = struct {
+    io: std.Io,
+    listener: *net.Server,
+    n: usize,
+    served: std.atomic.Value(usize) = .init(0),
+    head: [4096]u8 = undefined,
+    head_len: usize = 0,
+
+    fn run(b: *HookBackend) void {
+        for (0..b.n) |_| b.one() catch {};
+    }
+
+    fn one(b: *HookBackend) !void {
+        const s = try b.listener.accept(b.io);
+        defer s.close(b.io);
+        var rbuf: [4096]u8 = undefined;
+        var sr = s.reader(b.io, &rbuf);
+        var body: [256]u8 = undefined;
+        const msg = try readMessage(&sr.interface, &b.head, &body);
+        b.head_len = msg.head;
+        _ = b.served.fetchAdd(1, .release);
+        var wbuf: [512]u8 = undefined;
+        var sw = s.writer(b.io, &wbuf);
+        try sw.interface.writeAll(vectors.rproxy_hooks_response);
+        try sw.interface.flush();
+    }
+};
+
+/// Where the hooks answer differently from Go's, and why.
+const rproxy_hook_divergences = [_]RProxyDivergence{
+    .{ .id = "dead-default", .side = "down", .why = "the default gateway page names the failure (`Bad Gateway`, text/plain, `Via`); Go's default ErrorHandler answers an empty 502" },
+};
+
+test "go oracle rproxy_hooks: Rewrite/ModifyResponse/ErrorHandler edit what Go's do, or the difference is judged" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var listener = addr.listen(io, .{}) catch |err| return testkit.loopbackSkip("go oracle rproxy_hooks: listen failed ({t})", .{err});
+    defer listener.deinit(io);
+    // A port nothing listens on.
+    const dead_port = blk: {
+        var l = try addr.listen(io, .{});
+        defer l.deinit(io);
+        break :blk l.socket.address.getPort();
+    };
+    var live: usize = 0;
+    for (vectors.rproxy_hooks) |c| live += @intFromBool(c.up_line.len != 0);
+    var backend: HookBackend = .{ .io = io, .listener = &listener, .n = live };
+    const backend_thread = try std.Thread.spawn(.{}, HookBackend.run, .{&backend});
+    defer backend_thread.join();
+    const backend_port = listener.socket.address.getPort();
+    // However the cases went, release a backend still waiting in `accept`.
+    defer for (backend.served.load(.acquire)..live) |_| {
+        const s = (net.IpAddress.parse("127.0.0.1", backend_port) catch unreachable).connect(io, .{ .mode = .stream }) catch continue;
+        s.close(io);
+    };
+
+    var proxy_client = Client.init(io, gpa, .{ .pool = .{ .enabled = false } });
+    defer proxy_client.deinit();
+    var ph = proxy_mod.ProxyHandler.init(.{ .client = &proxy_client, .backend = .{ .host = "127.0.0.1", .port = backend_port } });
+    var front = Server.init(io, gpa, .{ .handler = proxy_mod.ProxyHandler.handler, .context = &ph });
+    defer front.deinit();
+    front.bind() catch |err| return testkit.loopbackSkip("go oracle rproxy_hooks: bind failed ({t})", .{err});
+    const front_thread = try std.Thread.spawn(.{}, rproxyServe, .{&front});
+    defer front_thread.join();
+    defer front.shutdown();
+    const front_addr = try net.IpAddress.parse("127.0.0.1", front.boundAddress().getPort());
+
+    var host_buf: [32]u8 = undefined;
+    const backend_host = try std.fmt.bufPrint(&host_buf, "127.0.0.1:{d}", .{backend_port});
+    var bad: usize = 0;
+    for (vectors.rproxy_hooks) |c| {
+        rh_profile = c.profile;
+        const rewriting = std.mem.startsWith(u8, c.profile, "rewrite");
+        ph.config.rewrite = if (rewriting) .{ .func = rhRewrite } else null;
+        ph.config.rewrite_host = !rewriting or !rhIs("rewrite-keep-host");
+        if (!rewriting) ph.config.rewrite_host = false; // Go's Director keeps the client's Host
+        ph.config.modify_response = if (std.mem.startsWith(u8, c.profile, "modify")) .{ .func = rhModify } else null;
+        ph.config.error_handler = if (rhIs("modify-error") or rhIs("error-dead")) .{ .func = rhError } else null;
+        ph.config.backend.?.port = if (c.up_line.len == 0) dead_port else backend_port;
+        const served_before = backend.served.load(.acquire);
+
+        const s = try front_addr.connect(io, .{ .mode = .stream });
+        var wbuf: [1024]u8 = undefined;
+        var sw = s.writer(io, &wbuf);
+        try sw.interface.writeAll(vectors.rproxy_hooks_wire);
+        try sw.interface.flush();
+        var rbuf: [4096]u8 = undefined;
+        var sr = s.reader(io, &rbuf);
+        var down_head: [4096]u8 = undefined;
+        var down_body: [256]u8 = undefined;
+        const msg = readMessage(&sr.interface, &down_head, &down_body) catch {
+            s.close(io);
+            std.debug.print("rproxy_hooks {s}: no response from our proxy\n", .{c.id});
+            bad += 1;
+            continue;
+        };
+        s.close(io);
+
+        // What the backend saw: its own address in Host as "backend", and the
+        // forwarding fields only where a Rewrite decides them (the Director
+        // shape is area rproxy's, which ignores them).
+        var t1: [4096]u8 = undefined;
+        var l1: [64][]const u8 = undefined;
+        var up_lines: [][]const u8 = &.{};
+        var up_line: []const u8 = "";
+        if (backend.served.load(.acquire) != served_before) {
+            var raw: [4096]u8 = undefined;
+            const n = std.mem.replace(u8, backend.head[0..backend.head_len], backend_host, "backend", &raw);
+            const len = backend.head_len - n * (backend_host.len - "backend".len);
+            const ignore_rw = [_][]const u8{ "connection", "content-length", "transfer-encoding", "via", "user-agent" };
+            const up = try normHead(raw[0..len], if (rewriting) &ignore_rw else &up_ignore, &t1, &l1);
+            up_line = if (std.mem.lastIndexOf(u8, up.first, " HTTP/")) |i| up.first[0..i] else up.first;
+            up_lines = up.lines;
+        }
+        var go_up_buf: [64][]const u8 = undefined;
+        var go_up_n: usize = 0;
+        for (c.up) |l| {
+            if (!rewriting and (std.mem.startsWith(u8, l, "x-forwarded-proto:") or std.mem.startsWith(u8, l, "x-forwarded-host:"))) continue;
+            go_up_buf[go_up_n] = l;
+            go_up_n += 1;
+        }
+        var t2: [4096]u8 = undefined;
+        var l2: [64][]const u8 = undefined;
+        const down = try normHead(down_head[0..msg.head], &down_ignore, &t2, &l2);
+        const status = std.fmt.parseInt(u16, down.first[9..12], 10) catch 0;
+
+        const up_ok = std.mem.eql(u8, up_line, c.up_line) and sameLines(up_lines, go_up_buf[0..go_up_n]);
+        const down_ok = status == c.status and sameLines(down.lines, c.down) and std.mem.eql(u8, down_body[0..msg.body], c.down_body);
+        for ([_]struct { side: []const u8, ok: bool }{ .{ .side = "up", .ok = up_ok }, .{ .side = "down", .ok = down_ok } }) |r| {
+            var listed = false;
+            for (rproxy_hook_divergences) |d| {
+                if (std.mem.eql(u8, d.id, c.id) and std.mem.eql(u8, d.side, r.side)) listed = true;
+            }
+            if (r.ok == !listed) continue;
+            bad += 1;
+            std.debug.print("rproxy_hooks {s} ({s}): {s}\n", .{ c.id, r.side, if (r.ok) "agrees now, drop its divergence entry" else "diverges" });
+            if (!r.ok) {
+                std.debug.print("  go:   {s} {d} body={f}", .{ c.up_line, c.status, std.zig.fmtString(c.down_body) });
+                for (if (std.mem.eql(u8, r.side, "up")) go_up_buf[0..go_up_n] else c.down) |l| std.debug.print(" [{s}]", .{l});
+                std.debug.print("\n  ours: {s} {d} body={f}", .{ up_line, status, std.zig.fmtString(down_body[0..msg.body]) });
+                for (if (std.mem.eql(u8, r.side, "up")) up_lines else down.lines) |l| std.debug.print(" [{s}]", .{l});
+                std.debug.print("\n", .{});
+            }
+        }
+    }
+    try testing.expectEqual(@as(usize, 0), bad);
 }

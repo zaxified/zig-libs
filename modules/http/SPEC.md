@@ -301,7 +301,8 @@ static).
 **Fuzz harnesses (HD1):** every untrusted-wire parser has a `std.testing.fuzz` harness asserting
 "typed error or valid result, never a panic" — `h1.RequestHead.parse`/`ResponseHead.parse`/
 `ChunkedReader` (request/status line, header block, chunked framing), `body.ContentType.parse`/
-`urlencoded` (Content-Type + form body), `form.parseSource` (a whole form over method, type, query
+`urlencoded` (Content-Type + form body), `proxy.relayHead` (a backend head through the reverse
+proxy: no hop-by-hop field relayed), `form.parseSource` (a whole form over method, type, query
 and body), `multipart.parse` (form-data boundary/part parse) and
 `multipart.Reader` (the streaming parser, fuzzed differentially against `parse` over arbitrary read
 sizes and buffer lengths: same parts, same end),
@@ -443,9 +444,20 @@ Full report with pinned APIs: `~/CML/20261011-http-s2/survey.report.md` (CML not
   `.on_error`, `ErrorKind` {handler_failed, request_refused, server_failed, accept_failed}; fired
   through one `noinline` call so the serving frame stays inside its budget (checked in ReleaseSafe).
 - R6 oracle divergences (a)(b)(e) above — DONE 2026-10-12.
-- R7 reverse proxy: rewrite/modify-response/error hooks, flush for streaming responses (the h1 relay
-  never flushes: SSE through it waits for a full buffer — survey reading, test first), Upgrade/WebSocket
-  passthrough.
+- R7 reverse proxy — DONE 2026-10-12. Flush: the h1 relay never flushed (a test with an origin
+  holding its second SSE event until the client has the first failed, then passed; negative control
+  done) — `Config.flush` (.auto = Go: SSE or undeclared length flushed per read; .immediate). Hooks
+  `rewrite`/`modify_response`/`error_handler` (Go `Rewrite`+`SetXForwarded`/`ModifyResponse`/
+  `ErrorHandler`), one failure path `fail` for everything before the head; Go oracle area
+  `rproxy_hooks` (9 profiles; one judged divergence: the default 502 page has a body, Go's is
+  empty; negative control: 3 mutants, 5 cases fail). Upgrade passthrough: `Request.upgraded`
+  (Go `Hijack`: the connection's reader/writer after a 101, HTTP timeouts lifted), client
+  `Response.upgraded` + `Connection: Upgrade` passed on (Go Transport), splice in two `Io` tasks;
+  integration test idles past the proxy's read timeout (negative control: without the lift it
+  fails). FIX found on the way: the default path relayed a client's own `X-Forwarded-Proto`/`-Host`
+  in front of ours. Fuzz harness `http-proxy-relay` (no hop-by-hop field relayed; negative control
+  caught). Not done: a `websocket`-module client against a `websocket` server behind the proxy
+  (that server cannot read after the 101 inside a handler until it adopts `Request.upgraded`).
 - R8 client: transparent gzip (opt-in), h2 via ALPN in `Client.request`, `max_conns_per_host`.
 - R9 extension methods (CONNECT, TRACE, `PURGE`, …) reach the handler instead of 501 — breaks
   exhaustive `switch (req.method)` in qap (5), metrics, mcp-http, openapi; patched together.

@@ -769,6 +769,17 @@ pub const Response = struct {
         };
     }
 
+    /// After `101 Switching Protocols` to a request that asked for an
+    /// upgrade (`Connection: Upgrade` + `Upgrade` in its headers): the
+    /// connection itself, to speak the new protocol on — Go's 101 response
+    /// body as an `io.ReadWriteCloser`. Its reader may already hold bytes
+    /// the server sent behind the 101. Valid until `deinit`, which closes the
+    /// connection (a 101 is never pooled). Null for any other status.
+    pub fn upgraded(res: *Response) ?Upgraded {
+        if (res.status != 101) return null;
+        return .{ .conn = res.conn };
+    }
+
     /// Return the connection to the pool when it left the exchange in a
     /// clean, fully-drained, keep-alive-eligible state (see
     /// `Conn.keep_alive_eligible` / `isBodyDrained`); otherwise close it.
@@ -782,6 +793,32 @@ pub const Response = struct {
             conn.destroy();
         }
         res.* = undefined;
+    }
+};
+
+/// An upgraded connection (see `Response.upgraded`).
+pub const Upgraded = struct {
+    conn: *Conn,
+
+    /// Bytes from the server.
+    pub fn reader(u: Upgraded) *std.Io.Reader {
+        return u.conn.plainReader();
+    }
+
+    /// Bytes to the server; `flush` sends them.
+    pub fn writer(u: Upgraded) *std.Io.Writer {
+        return u.conn.plainWriter();
+    }
+
+    /// Push what was written onto the socket (through TLS on `https`).
+    pub fn flush(u: Upgraded) Error!void {
+        return u.conn.flushAll();
+    }
+
+    /// Shut the socket down both ways: a read blocked in another task
+    /// returns. The connection is still closed by `Response.deinit`.
+    pub fn shutdown(u: Upgraded) void {
+        u.conn.stream.shutdown(u.conn.client.io, .both) catch {};
     }
 };
 
@@ -2221,15 +2258,25 @@ fn writeRequestHeadVia(
     var custom_host: ?[]const u8 = null;
     var custom_ua = false;
     var custom_ae = false;
+    var asks_upgrade = false;
+    var has_upgrade = false;
     for (headers) |hd| {
         if (std.ascii.eqlIgnoreCase(hd.name, "host")) custom_host = hd.value;
         if (std.ascii.eqlIgnoreCase(hd.name, "user-agent")) custom_ua = true;
         if (std.ascii.eqlIgnoreCase(hd.name, "accept-encoding")) custom_ae = true;
+        if (std.ascii.eqlIgnoreCase(hd.name, "connection") and h1.tokenListContains(hd.value, "upgrade")) asks_upgrade = true;
+        if (std.ascii.eqlIgnoreCase(hd.name, "upgrade")) has_upgrade = true;
     }
+    // `Connection` is managed, except for the one token a caller must be
+    // able to send: an upgrade request (RFC 9110 §7.8), as Go's Transport
+    // passes it on. Its `Connection: Upgrade` replaces `close`.
+    const connection: ConnectionHeader = if (asks_upgrade and has_upgrade) .upgrade else if (send_close) .close else .none;
 
-    writeHead(w, proxy, jar, method, url, headers, user_agent, plan, strip_sensitive, send_close, if (strip_sensitive) null else custom_host, custom_ua, custom_ae) catch
+    writeHead(w, proxy, jar, method, url, headers, user_agent, plan, strip_sensitive, connection, if (strip_sensitive) null else custom_host, custom_ua, custom_ae) catch
         return error.WriteFailed;
 }
+
+const ConnectionHeader = enum { none, close, upgrade };
 
 fn writeHead(
     w: *std.Io.Writer,
@@ -2241,7 +2288,7 @@ fn writeHead(
     user_agent: []const u8,
     plan: BodyPlan,
     strip_sensitive: bool,
-    send_close: bool,
+    connection: ConnectionHeader,
     custom_host: ?[]const u8,
     custom_ua: bool,
     custom_ae: bool,
@@ -2290,7 +2337,11 @@ fn writeHead(
 
     if (!custom_ua) try w.print("User-Agent: {s}\r\n", .{user_agent});
     if (!custom_ae) try w.writeAll("Accept-Encoding: identity\r\n");
-    if (send_close) try w.writeAll("Connection: close\r\n");
+    switch (connection) {
+        .none => {},
+        .close => try w.writeAll("Connection: close\r\n"),
+        .upgrade => try w.writeAll("Connection: Upgrade\r\n"),
+    }
     switch (plan) {
         .none => {},
         .content_length => |n| try w.print("Content-Length: {d}\r\n", .{n}),
