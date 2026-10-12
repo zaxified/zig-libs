@@ -95,6 +95,8 @@ const http = @import("root.zig");
 const h1 = @import("h1.zig");
 const h2_client = @import("h2_client.zig");
 const bufpool = @import("bufpool.zig");
+const gzip = @import("gzip.zig");
+const crc32 = @import("crc32");
 const net = std.Io.net;
 // std's TLS client, with the server chain verified by RFC 5280: std checks
 // no basicConstraints (ziglang/zig #35877), so any certificate holder could
@@ -261,6 +263,46 @@ pub const Options = struct {
     /// and the jar's cookies are appended to it. Null (default): no cookies
     /// beyond the caller's. Borrowed: must outlive the client.
     cookie_jar: ?CookieJar = null,
+    /// Transparent gzip decoding of response bodies — Go's default
+    /// `Transport` behavior (`DisableCompression: false`), switched on with
+    /// `.decompress = .gzip(max_bytes)`. Null (default) = off: every request
+    /// sends `Accept-Encoding: identity`, as before, and the decoder is not
+    /// even linked in (`Decompress`). On: a request that carries no caller
+    /// `Accept-Encoding` and no
+    /// `Range`, and is not a HEAD, asks for `Accept-Encoding: gzip`; when the
+    /// response then says `Content-Encoding: gzip`, `Response.reader` hands
+    /// out the decoded bytes, `Response.header` no longer reports
+    /// `Content-Encoding`/`Content-Length`, and `Response.uncompressed` is
+    /// set. A caller that sets its own `Accept-Encoding` gets the body as
+    /// sent, exactly as in Go (only the layer that asked decodes).
+    ///
+    /// `max_bytes` caps the decoded bytes of one response: beyond it the
+    /// read fails with `error.BodyTooLarge` (a zip bomb; Go has no such cap
+    /// — `maxInt(u64)` is Go's behavior). Every member's CRC-32/ISIZE trailer
+    /// is checked, as Go does: a corrupt, truncated or trailing-garbage body
+    /// fails with `error.CorruptGzip`. (The header's optional CRC-16, FHCRC,
+    /// is skipped unchecked where Go checks it — a judged divergence, see
+    /// `gzip.skipGzipHeader`.) Concatenated members are decoded one
+    /// after another (RFC 1952 §2.2, Go's multistream default). The decoder's
+    /// ~70 KiB of working memory is allocated per decoded response, only when
+    /// the server actually answered gzip.
+    decompress: ?Decompress = null,
+};
+
+/// How `Options.decompress` decodes; made only by `gzip`. A function
+/// pointer rather than a flag on purpose: the decoder (std's flate plus the
+/// gzip framing, ~23 KB on x86_64 ReleaseSmall) is linked into a binary only
+/// when something calls `gzip` — a client that never decodes does not pay
+/// for it (the plaintext size probe, `sizeprobe/`, measures exactly that).
+pub const Decompress = struct {
+    max_bytes: u64,
+    start: *const fn (g: *Gunzip, raw: *std.Io.Reader, max_bytes: u64) void,
+
+    /// gzip, as Go's `Transport` decodes it; `max_bytes` (decoded, per
+    /// response) is the zip-bomb cap, `maxInt(u64)` = Go's none.
+    pub fn gzip(max_bytes: u64) Decompress {
+        return .{ .max_bytes = max_bytes, .start = Gunzip.init };
+    }
 };
 
 /// Tunables for the idle-connection pool (`Options.pool`).
@@ -395,6 +437,11 @@ pub const Error = error{
     /// wanting credentials, a 403 policy refusal, a 502 it could not reach
     /// the origin with). Nothing was sent to the origin.
     ProxyRefused,
+    /// A body this client decodes (`Options.decompress`)
+    /// is not valid gzip: bad header, corrupt deflate data, a CRC-32/ISIZE
+    /// mismatch, a stream cut short, or bytes after the last member that
+    /// are not another member (Go: `gzip.ErrHeader` / `ErrChecksum`).
+    CorruptGzip,
 };
 
 /// The outbound half of the header-injection defence: every caller-supplied
@@ -506,6 +553,7 @@ fn requestInner(c: *Client, method: http.Method, url_text: []const u8, options: 
         // (CVE-2018-18074 class: cleartext credential / cross-service leak).
         const strip_sensitive = crossOrigin(original_url, url);
         const plan: BodyPlan = if (current_body) |b| .{ .content_length = b.len } else .none;
+        const ask_gzip = c.requestsGzip(current_method, options.headers);
 
         var reused = false;
         var conn = try c.acquireConn(url, &reused);
@@ -521,7 +569,7 @@ fn requestInner(c: *Client, method: http.Method, url_text: []const u8, options: 
         var owned = true;
         errdefer if (owned) conn.destroy();
 
-        const head = c.sendAndReadHead(conn, current_method, url, options.headers, plan, current_body, strip_sensitive) catch |err| retry: {
+        const head = c.sendAndReadHead(conn, current_method, url, options.headers, plan, current_body, strip_sensitive, ask_gzip) catch |err| retry: {
             // Retry exactly once, and only when BOTH hold: (1) `conn` came
             // from the pool (`reused`), so it might have gone stale while
             // parked — a freshly dialed connection failing this way is a
@@ -549,7 +597,7 @@ fn requestInner(c: *Client, method: http.Method, url_text: []const u8, options: 
             owned = false;
             conn = try c.dialConn(url);
             owned = true;
-            break :retry try c.sendAndReadHead(conn, current_method, url, options.headers, plan, current_body, strip_sensitive);
+            break :retry try c.sendAndReadHead(conn, current_method, url, options.headers, plan, current_body, strip_sensitive, ask_gzip);
         };
 
         redirect: {
@@ -595,8 +643,7 @@ fn requestInner(c: *Client, method: http.Method, url_text: []const u8, options: 
             continue;
         }
 
-        setupBody(conn, current_method, head);
-        return .{ .status = head.status, .reason = head.reason, .head = head, .conn = conn };
+        return c.makeResponse(conn, current_method, head, ask_gzip);
     }
 }
 
@@ -646,6 +693,7 @@ fn requestInnerPlain(c: *Client, method: http.Method, url_text: []const u8, opti
 
         const strip_sensitive = crossOrigin(original_url, url);
         const plan: BodyPlan = if (current_body) |b| .{ .content_length = b.len } else .none;
+        const ask_gzip = c.requestsGzip(current_method, options.headers);
 
         var reused = false;
         var conn = try c.acquireConnPlain(url, &reused);
@@ -661,14 +709,14 @@ fn requestInnerPlain(c: *Client, method: http.Method, url_text: []const u8, opti
         var owned = true;
         errdefer if (owned) conn.destroy();
 
-        const head = c.sendAndReadHead(conn, current_method, url, options.headers, plan, current_body, strip_sensitive) catch |err| retry: {
+        const head = c.sendAndReadHead(conn, current_method, url, options.headers, plan, current_body, strip_sensitive, ask_gzip) catch |err| retry: {
             if (!reused or !isStaleConnError(err)) return err;
             try c.checkDeadline(deadline);
             conn.destroy();
             owned = false;
             conn = try c.dialPlain(url);
             owned = true;
-            break :retry try c.sendAndReadHead(conn, current_method, url, options.headers, plan, current_body, strip_sensitive);
+            break :retry try c.sendAndReadHead(conn, current_method, url, options.headers, plan, current_body, strip_sensitive, ask_gzip);
         };
 
         redirect: {
@@ -707,8 +755,7 @@ fn requestInnerPlain(c: *Client, method: http.Method, url_text: []const u8, opti
             continue;
         }
 
-        setupBody(conn, current_method, head);
-        return .{ .status = head.status, .reason = head.reason, .head = head, .conn = conn };
+        return c.makeResponse(conn, current_method, head, ask_gzip);
     }
 }
 
@@ -717,17 +764,35 @@ fn requestInnerPlain(c: *Client, method: http.Method, url_text: []const u8, opti
 pub const Response = struct {
     status: u16,
     reason: []const u8,
+    /// The head as received — `Content-Encoding`/`Content-Length` included
+    /// even when `uncompressed` (use `header` for Go's view).
     head: h1.ResponseHead,
     conn: *Conn,
+    /// Set when this client asked for gzip and is decoding the body
+    /// (`Options.decompress`): `reader` yields the
+    /// decoded bytes. Go's `Response.Uncompressed`.
+    uncompressed: bool = false,
+    gunzip: ?*Gunzip = null,
 
-    /// First value of a response header (case-insensitive), or null.
+    /// First value of a response header (case-insensitive), or null. When
+    /// `uncompressed`, `Content-Encoding` and `Content-Length` read as
+    /// absent: they describe the bytes on the wire, not the ones `reader`
+    /// hands out (Go deletes both).
     pub fn header(res: *const Response, name: []const u8) ?[]const u8 {
+        if (res.uncompressed and (std.ascii.eqlIgnoreCase(name, "content-encoding") or
+            std.ascii.eqlIgnoreCase(name, "content-length"))) return null;
         return res.head.header(name);
     }
 
     /// Streaming body reader (chunked / Content-Length framing already
-    /// decoded; reads to end-of-body). Valid until `deinit`.
+    /// decoded, and gzip when `uncompressed`; reads to end-of-body). Valid
+    /// until `deinit`.
     pub fn reader(res: *Response) *std.Io.Reader {
+        if (res.gunzip) |g| return &g.reader;
+        return res.rawReader();
+    }
+
+    fn rawReader(res: *Response) *std.Io.Reader {
         return switch (res.conn.body) {
             .none => |*r| r,
             .chunked => |*cr| &cr.reader,
@@ -749,6 +814,7 @@ pub const Response = struct {
     /// right after `reader()` (or a parser over it) reports
     /// `error.ReadFailed` — it describes that failure, not a future one.
     pub fn readFailure(res: *Response) Error {
+        if (res.gunzip) |g| if (g.failure) |f| return f;
         return res.conn.readFailure();
     }
 
@@ -765,7 +831,7 @@ pub const Response = struct {
         return res.reader().allocRemaining(gpa, .limited(max_len)) catch |err| switch (err) {
             error.OutOfMemory => error.OutOfMemory,
             error.StreamTooLong => error.BodyTooLarge,
-            error.ReadFailed => res.conn.readFailure(),
+            error.ReadFailed => res.readFailure(),
         };
     }
 
@@ -787,6 +853,7 @@ pub const Response = struct {
     pub fn deinit(res: *Response) void {
         const conn = res.conn;
         const c = conn.client;
+        if (res.gunzip) |g| c.gpa.destroy(g);
         if (c.options.pool.enabled and conn.keep_alive_eligible and isBodyDrained(conn)) {
             c.pool.release(conn, c.nowMs());
         } else {
@@ -824,12 +891,200 @@ pub const Upgraded = struct {
 
 // ── streaming uploads ───────────────────────────────────────────────────────
 
+/// Whether this request asks for gzip (`Options.decompress`),
+/// by Go's rule (transport.go, `requestedGzip`): not when the caller set its
+/// own `Accept-Encoding` — the body is then the caller's to decode — nor
+/// with a `Range` (a decoded slice of a gzip stream cannot be decoded), nor
+/// on HEAD (nginx ticket 358). Go also treats an empty caller value as
+/// unset; here any caller `Accept-Encoding` counts (a judged divergence: an
+/// empty one is still a field the caller wrote, and goes on the wire).
+fn requestsGzip(c: *const Client, method: http.Method, headers: []const http.Header) bool {
+    if (c.options.decompress == null or method == .head) return false;
+    for (headers) |hd| {
+        if (std.ascii.eqlIgnoreCase(hd.name, "accept-encoding") or
+            std.ascii.eqlIgnoreCase(hd.name, "range")) return false;
+    }
+    return true;
+}
+
+/// Frame the body of a response whose head was just read, and wrap it in
+/// the gzip decoder when this client asked for gzip (`asked_gzip`, from
+/// `requestsGzip`) and got it — `Content-Encoding: gzip` exactly
+/// (case-insensitive), the only coding Go decodes; `x-gzip` or a coding
+/// list are handed over as sent. Only a response that may have a body is
+/// decoded: as in Go (whose `readLoop` wraps only when `hasBody`), a 204, a
+/// 304 or a `Content-Length: 0` keeps its `Content-Encoding` and is not
+/// `uncompressed`; a 101 hands the connection itself over. On error `conn`
+/// is still the caller's.
+fn makeResponse(c: *Client, conn: *Conn, method: http.Method, head: h1.ResponseHead, asked_gzip: bool) Error!Response {
+    setupBody(conn, method, head);
+    var res: Response = .{ .status = head.status, .reason = head.reason, .head = head, .conn = conn };
+    const has_body = conn.body != .none and head.content_length != 0 and head.status != 101;
+    if (asked_gzip and has_body) if (head.header("content-encoding")) |ce| {
+        if (std.ascii.eqlIgnoreCase(ce, "gzip")) {
+            const d = c.options.decompress.?;
+            const g = try c.gpa.create(Gunzip);
+            d.start(g, res.rawReader(), d.max_bytes);
+            res.gunzip = g;
+            res.uncompressed = true;
+        }
+    };
+    return res;
+}
+
+/// The response-body gzip decoder (`Options.decompress`),
+/// Go's `gzipReader` over a `gzip.Reader` in multistream mode: members back
+/// to back, each with its CRC-32/ISIZE trailer checked; an empty body
+/// decodes to nothing; anything after a member that is not another member
+/// is corrupt. Decodes raw deflate itself (`gzip.DecodeScratch`, `.raw`) so
+/// the header and trailer are parsed here — std's `.gzip` container reads
+/// the trailer but checks nothing. The source is `DecodeScratch`'s padded
+/// one, so a body cut short never reaches std's truncation abort (see
+/// `gzip.PaddedSource`) and is refused instead.
+///
+/// The decoder only ever reads the framed body, so once it reports the end,
+/// the framing reader is at the end of the body too and the connection can
+/// go back to the pool (`isBodyDrained`). Not movable after `init`.
+const Gunzip = struct {
+    scratch: gzip.DecodeScratch,
+    /// `scratch`'s padded reader: headers and trailers come off it.
+    src: *std.Io.Reader,
+    /// Decoded bytes still allowed.
+    remaining: u64,
+    state: enum { member_start, body, done },
+    /// CRC-32 / byte count (mod 2^32) of the current member so far.
+    crc: u32,
+    size: u32,
+    /// Why the last read failed, when it was the body and not the
+    /// transport (`Response.readFailure`). Sticky.
+    failure: ?Error,
+    reader: std.Io.Reader,
+
+    fn init(g: *Gunzip, raw: *std.Io.Reader, max_bytes: u64) void {
+        g.src = g.scratch.start(raw, .raw);
+        g.remaining = max_bytes;
+        g.state = .member_start;
+        g.crc = 0;
+        g.size = 0;
+        g.failure = null;
+        g.reader = .{ .vtable = &.{ .stream = stream }, .buffer = &g.scratch.out, .seek = 0, .end = 0 };
+    }
+
+    fn stream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        const g: *Gunzip = @alignCast(@fieldParentPtr("reader", r));
+        if (g.failure != null) return error.ReadFailed;
+        while (true) switch (g.state) {
+            .done => return error.EndOfStream,
+            .member_start => {
+                if (try g.rawAtEnd()) {
+                    g.state = .done;
+                    return error.EndOfStream;
+                }
+                gzip.skipGzipHeader(g.src) catch |err| switch (err) {
+                    error.ReadFailed => return error.ReadFailed,
+                    error.EndOfStream, error.BadHeader => return g.fail(error.CorruptGzip),
+                };
+                g.scratch.decompress = .init(g.src, .raw, &g.scratch.window);
+                if (g.scratch.paddingConsumed()) return g.fail(error.CorruptGzip);
+                g.crc = 0;
+                g.size = 0;
+                g.state = .body;
+            },
+            .body => {
+                const inner = &g.scratch.decompress.reader;
+                if (g.remaining == 0) {
+                    // At the cap: the member must end exactly here.
+                    const n = inner.discard(.limited(1)) catch |err| switch (err) {
+                        error.EndOfStream => {
+                            try g.endMember();
+                            continue;
+                        },
+                        error.ReadFailed => return g.decodeFailure(),
+                    };
+                    if (g.scratch.paddingConsumed()) return g.fail(error.CorruptGzip);
+                    if (n != 0) return g.fail(error.BodyTooLarge);
+                    continue;
+                }
+                // Decode into `w`'s free space without committing it: a read
+                // that ate into the padding is refused whole.
+                const dest = limit.min(.limited64(g.remaining)).slice(try w.writableSliceGreedy(1));
+                if (dest.len == 0) return 0;
+                var fw: std.Io.Writer = .fixed(dest);
+                const n = inner.stream(&fw, .limited(dest.len)) catch |err| switch (err) {
+                    error.EndOfStream => {
+                        try g.endMember();
+                        continue;
+                    },
+                    error.ReadFailed => return g.decodeFailure(),
+                    // `fw` holds exactly the limit; a decoder writing past
+                    // it would be a std bug — refuse, never crash.
+                    error.WriteFailed => return g.fail(error.CorruptGzip),
+                };
+                if (g.scratch.paddingConsumed()) return g.fail(error.CorruptGzip);
+                g.crc = crc32.extend(g.crc, dest[0..n]);
+                g.size +%= @as(u32, @truncate(n));
+                w.advance(n);
+                g.remaining -= n;
+                return n;
+            },
+        };
+    }
+
+    /// The current member's deflate stream ended: its trailer must follow.
+    fn endMember(g: *Gunzip) error{ReadFailed}!void {
+        gzip.checkTrailer(g.src, g.crc, g.size) catch |err| switch (err) {
+            error.ReadFailed => return error.ReadFailed,
+            error.EndOfStream, error.CrcMismatch, error.SizeMismatch => return g.fail(error.CorruptGzip),
+        };
+        if (g.scratch.paddingConsumed()) return g.fail(error.CorruptGzip);
+        g.state = .member_start;
+    }
+
+    /// Whether the framed body has no byte left: none of the source's bytes
+    /// still sit unread in the padded reader's buffer, and the source itself
+    /// reports its end. Asked through the padded reader, not the source: a
+    /// source need not have a buffer to peek into (std asserts one), and the
+    /// padded reader never ends — what it pulls in is real bytes, or padding
+    /// once the source is done.
+    fn rawAtEnd(g: *Gunzip) error{ReadFailed}!bool {
+        const p = &g.scratch.padded;
+        if (g.realBuffered()) return false;
+        if (p.source_done) return true;
+        _ = p.reader.peekByte() catch |err| switch (err) {
+            error.ReadFailed => return error.ReadFailed,
+            error.EndOfStream => unreachable, // padding never ends
+        };
+        return !g.realBuffered();
+    }
+
+    /// Whether some of the source's bytes sit unread in the padded buffer.
+    fn realBuffered(g: *const Gunzip) bool {
+        const p = &g.scratch.padded;
+        return p.delivered - (p.reader.end - p.reader.seek) < p.real;
+    }
+
+    /// std's decoder says `ReadFailed` both for its input failing (the
+    /// transport — left to `Conn.readFailure`) and for bad data, and parks
+    /// which one in `err`.
+    fn decodeFailure(g: *Gunzip) error{ReadFailed} {
+        if (g.scratch.decompress.err) |e| if (e != error.ReadFailed) return g.fail(error.CorruptGzip);
+        return error.ReadFailed;
+    }
+
+    fn fail(g: *Gunzip, why: Error) error{ReadFailed} {
+        g.failure = why;
+        return error.ReadFailed;
+    }
+};
+
 /// An in-flight streaming request body. Write via `writer`, then call
 /// `finish` (or `abort`). Do not copy after calling `writer`.
 pub const Upload = struct {
     conn: *Conn,
     method: http.Method,
     chunked: ?h1.ChunkedWriter,
+    /// Whether the head asked for gzip (`requestsGzip`).
+    ask_gzip: bool,
     /// The request URL, copied, when `Options.cookie_jar` is set: the jar
     /// takes the response's cookies in `finish`, long after the caller's
     /// URL text may be gone.
@@ -867,8 +1122,7 @@ pub const Upload = struct {
         try u.conn.flushAll();
         const head = try readResponseHead(u.conn);
         if (u.jar_url) |t| if (c.options.cookie_jar) |jar| jar.store(jar.ctx, http.Url.parse(t) catch unreachable, &head);
-        setupBody(u.conn, u.method, head);
-        return .{ .status = head.status, .reason = head.reason, .head = head, .conn = u.conn };
+        return c.makeResponse(u.conn, u.method, head, u.ask_gzip);
     }
 
     /// Drop the request without reading a response.
@@ -887,6 +1141,7 @@ pub fn requestStreaming(c: *Client, method: http.Method, url_text: []const u8, o
     const url = try http.Url.parse(url_text);
     try validateHeaders(options.headers);
     const plan: BodyPlan = if (content_length) |n| .{ .content_length = n } else .chunked;
+    const ask_gzip = c.requestsGzip(method, options.headers);
 
     var reused = false;
     var conn = try c.acquireConn(url, &reused);
@@ -897,7 +1152,7 @@ pub fn requestStreaming(c: *Client, method: http.Method, url_text: []const u8, o
     var owned = true;
     errdefer if (owned) conn.destroy();
 
-    writeRequestHeadVia(conn.plainWriter(), conn.forward_proxy, c.options.cookie_jar, method, url, options.headers, c.options.user_agent, plan, false, !c.options.pool.enabled) catch {
+    writeRequestHeadVia(conn.plainWriter(), conn.forward_proxy, c.options.cookie_jar, method, url, options.headers, c.options.user_agent, plan, false, !c.options.pool.enabled, ask_gzip) catch {
         // Recover the real cause the same way `sendAndReadHead` does, and
         // BEFORE `isStaleConnError` looks at it: `writeRequestHead` itself
         // can only ever hand back `error.WriteFailed`, so without this a
@@ -919,11 +1174,12 @@ pub fn requestStreaming(c: *Client, method: http.Method, url_text: []const u8, o
         owned = false;
         conn = try c.dialConn(url);
         owned = true;
-        writeRequestHeadVia(conn.plainWriter(), conn.forward_proxy, c.options.cookie_jar, method, url, options.headers, c.options.user_agent, plan, false, !c.options.pool.enabled) catch return conn.writeFailure();
+        writeRequestHeadVia(conn.plainWriter(), conn.forward_proxy, c.options.cookie_jar, method, url, options.headers, c.options.user_agent, plan, false, !c.options.pool.enabled, ask_gzip) catch return conn.writeFailure();
     };
     return .{
         .conn = conn,
         .method = method,
+        .ask_gzip = ask_gzip,
         .chunked = if (content_length == null) h1.ChunkedWriter.init(conn.plainWriter(), conn.body_buf) else null,
         .jar_url = if (c.options.cookie_jar != null) try c.gpa.dupe(u8, url_text) else null,
     };
@@ -940,6 +1196,7 @@ pub fn requestStreamingPlain(c: *Client, method: http.Method, url_text: []const 
     if (url.scheme != .http) return error.UnsupportedScheme;
     try validateHeaders(options.headers);
     const plan: BodyPlan = if (content_length) |n| .{ .content_length = n } else .chunked;
+    const ask_gzip = c.requestsGzip(method, options.headers);
 
     var reused = false;
     var conn = try c.acquireConnPlain(url, &reused);
@@ -948,7 +1205,7 @@ pub fn requestStreamingPlain(c: *Client, method: http.Method, url_text: []const 
     var owned = true;
     errdefer if (owned) conn.destroy();
 
-    writeRequestHeadVia(conn.plainWriter(), conn.forward_proxy, c.options.cookie_jar, method, url, options.headers, c.options.user_agent, plan, false, !c.options.pool.enabled) catch {
+    writeRequestHeadVia(conn.plainWriter(), conn.forward_proxy, c.options.cookie_jar, method, url, options.headers, c.options.user_agent, plan, false, !c.options.pool.enabled, ask_gzip) catch {
         // See `requestStreaming`'s identical catch for why this must consult
         // `conn.writeFailure()` before `isStaleConnError` rather than trust
         // `writeRequestHead`'s own always-`WriteFailed` result.
@@ -958,11 +1215,12 @@ pub fn requestStreamingPlain(c: *Client, method: http.Method, url_text: []const 
         owned = false;
         conn = try c.dialPlain(url);
         owned = true;
-        writeRequestHeadVia(conn.plainWriter(), conn.forward_proxy, c.options.cookie_jar, method, url, options.headers, c.options.user_agent, plan, false, !c.options.pool.enabled) catch return conn.writeFailure();
+        writeRequestHeadVia(conn.plainWriter(), conn.forward_proxy, c.options.cookie_jar, method, url, options.headers, c.options.user_agent, plan, false, !c.options.pool.enabled, ask_gzip) catch return conn.writeFailure();
     };
     return .{
         .conn = conn,
         .method = method,
+        .ask_gzip = ask_gzip,
         .chunked = if (content_length == null) h1.ChunkedWriter.init(conn.plainWriter(), conn.body_buf) else null,
         .jar_url = if (c.options.cookie_jar != null) try c.gpa.dupe(u8, url_text) else null,
     };
@@ -1003,7 +1261,7 @@ pub fn getToFile(c: *Client, url: []const u8, dir: std.Io.Dir, sub_path: []const
     // reported a cancelation as a file-system failure (A1 G13).
     const n = res.reader().streamRemaining(&fw.interface) catch |err| switch (err) {
         error.WriteFailed => return fileWriteFailure(&fw),
-        error.ReadFailed => return res.conn.readFailure(),
+        error.ReadFailed => return res.readFailure(),
     };
     fw.interface.flush() catch return fileWriteFailure(&fw);
     return n;
@@ -1668,6 +1926,7 @@ fn sendAndReadHead(
     plan: BodyPlan,
     body: ?[]const u8,
     strip_sensitive: bool,
+    ask_gzip: bool,
 ) Error!h1.ResponseHead {
     // `writeRequestHead`'s own `w: *std.Io.Writer` parameter has nowhere to
     // carry `Canceled` — like every other `std.Io.Writer` call, it can only
@@ -1679,7 +1938,7 @@ fn sendAndReadHead(
     // pooled connection worth retrying — with the cancelation already
     // spent, the retry then blocks a second time with nothing left to
     // interrupt it.
-    writeRequestHeadVia(conn.plainWriter(), conn.forward_proxy, c.options.cookie_jar, method, url, headers, c.options.user_agent, plan, strip_sensitive, !c.options.pool.enabled) catch return conn.writeFailure();
+    writeRequestHeadVia(conn.plainWriter(), conn.forward_proxy, c.options.cookie_jar, method, url, headers, c.options.user_agent, plan, strip_sensitive, !c.options.pool.enabled, ask_gzip) catch return conn.writeFailure();
     if (body) |b| conn.plainWriter().writeAll(b) catch return conn.writeFailure();
     try conn.flushAll();
     const head = try readResponseHead(conn);
@@ -2237,7 +2496,7 @@ fn writeRequestHead(
     strip_sensitive: bool,
     send_close: bool,
 ) error{WriteFailed}!void {
-    return writeRequestHeadVia(w, null, null, method, url, headers, user_agent, plan, strip_sensitive, send_close);
+    return writeRequestHeadVia(w, null, null, method, url, headers, user_agent, plan, strip_sensitive, send_close, false);
 }
 
 /// `writeRequestHead` for a connection that may be to a forwarding proxy:
@@ -2254,6 +2513,7 @@ fn writeRequestHeadVia(
     plan: BodyPlan,
     strip_sensitive: bool,
     send_close: bool,
+    ask_gzip: bool,
 ) error{WriteFailed}!void {
     var custom_host: ?[]const u8 = null;
     var custom_ua = false;
@@ -2272,7 +2532,7 @@ fn writeRequestHeadVia(
     // passes it on. Its `Connection: Upgrade` replaces `close`.
     const connection: ConnectionHeader = if (asks_upgrade and has_upgrade) .upgrade else if (send_close) .close else .none;
 
-    writeHead(w, proxy, jar, method, url, headers, user_agent, plan, strip_sensitive, connection, if (strip_sensitive) null else custom_host, custom_ua, custom_ae) catch
+    writeHead(w, proxy, jar, method, url, headers, user_agent, plan, strip_sensitive, connection, if (strip_sensitive) null else custom_host, custom_ua, custom_ae, ask_gzip) catch
         return error.WriteFailed;
 }
 
@@ -2292,6 +2552,7 @@ fn writeHead(
     custom_host: ?[]const u8,
     custom_ua: bool,
     custom_ae: bool,
+    ask_gzip: bool,
 ) std.Io.Writer.Error!void {
     try w.print("{s} ", .{method.token()});
     if (proxy != null) {
@@ -2336,7 +2597,9 @@ fn writeHead(
     };
 
     if (!custom_ua) try w.print("User-Agent: {s}\r\n", .{user_agent});
-    if (!custom_ae) try w.writeAll("Accept-Encoding: identity\r\n");
+    // `identity` also when decoding is on but `requestsGzip` said no (HEAD,
+    // a `Range`), where Go sends no field at all: same meaning, explicit.
+    if (!custom_ae) try w.writeAll(if (ask_gzip) "Accept-Encoding: gzip\r\n" else "Accept-Encoding: identity\r\n");
     switch (connection) {
         .none => {},
         .close => try w.writeAll("Connection: close\r\n"),
@@ -5503,11 +5766,567 @@ test "cookie jar: without a caller Cookie the jar writes its own field, and noth
     var echo: EchoJar = .{};
     const url = try http.Url.parse("http://h.test/x");
     var w: std.Io.Writer = .fixed(&buf);
-    try writeRequestHeadVia(&w, null, echo.jar(), .get, url, &.{}, "a", .none, false, true);
+    try writeRequestHeadVia(&w, null, echo.jar(), .get, url, &.{}, "a", .none, false, true, false);
     try testing.expect(std.mem.indexOf(u8, w.buffered(), "Cookie") == null);
     @memcpy(echo.value[0..3], "k=v");
     echo.len = 3;
     w = .fixed(&buf);
-    try writeRequestHeadVia(&w, null, echo.jar(), .get, url, &.{}, "a", .none, false, true);
+    try writeRequestHeadVia(&w, null, echo.jar(), .get, url, &.{}, "a", .none, false, true, false);
     try testing.expect(std.mem.indexOf(u8, w.buffered(), "\r\nCookie: k=v\r\n") != null);
+}
+
+// ── transparent gzip (`Options.decompress`) ───────────
+
+/// Keep-alive connections serving `answers` in order, recording each
+/// request head; a `Content-Length` request body is read and dropped. When
+/// the client drops a connection, the next answer goes to the next one it
+/// dials. Ends when the answers run out. `release` dials it once more, so a
+/// peer still waiting in `accept` after a failed assert cannot hang the join.
+const KeepAlivePeer = struct {
+    io: std.Io,
+    listener: *net.Server,
+    answers: []const []const u8,
+    heads: [6][1024]u8 = undefined,
+    head_lens: [6]usize = @splat(0),
+    stop: std.atomic.Value(u32) = .init(0),
+    accepted: std.atomic.Value(u32) = .init(0),
+
+    fn run(p: *KeepAlivePeer) void {
+        var n: usize = 0;
+        while (n < p.answers.len) {
+            const s = p.listener.accept(p.io) catch return;
+            p.accepted.store(1, .release);
+            defer s.close(p.io);
+            if (p.stop.load(.acquire) != 0) return;
+            p.serve(s, &n);
+        }
+    }
+
+    fn serve(p: *KeepAlivePeer, s: net.Stream, n: *usize) void {
+        var rbuf: [2048]u8 = undefined;
+        var sr = s.reader(p.io, &rbuf);
+        var wbuf: [4096]u8 = undefined;
+        var sw = s.writer(p.io, &wbuf);
+        while (n.* < p.answers.len) : (n.* += 1) {
+            const answer = p.answers[n.*];
+            var head_buf: [1024]u8 = undefined;
+            const got = h1.readHead(&sr.interface, &head_buf) catch return;
+            @memcpy(p.heads[n.*][0..got.len], got);
+            p.head_lens[n.*] = got.len;
+            if (std.mem.indexOf(u8, got, "Content-Length: ")) |at| {
+                const digits = got[at + "Content-Length: ".len ..];
+                const len = std.fmt.parseInt(usize, digits[0 .. std.mem.indexOfScalar(u8, digits, '\r') orelse return], 10) catch return;
+                sr.interface.discardAll(len) catch return;
+            }
+            sw.interface.writeAll(answer) catch return;
+            sw.interface.flush() catch return;
+        }
+    }
+
+    fn head(p: *const KeepAlivePeer, n: usize) []const u8 {
+        return p.heads[n][0..p.head_lens[n]];
+    }
+
+    fn release(p: *KeepAlivePeer, port: u16) void {
+        p.stop.store(1, .release);
+        const addr = net.IpAddress.parse("127.0.0.1", port) catch return;
+        const s = addr.connect(p.io, .{ .mode = .stream }) catch return;
+        s.close(p.io);
+    }
+};
+
+/// A gzip member of `plain` from this module's own encoder.
+fn testGzip(gpa: std.mem.Allocator, plain: []const u8, level: u4) ![]u8 {
+    const s = try gpa.create(gzip.Scratch);
+    defer gpa.destroy(s);
+    var aw: std.Io.Writer.Allocating = try .initCapacity(gpa, 64);
+    errdefer aw.deinit();
+    const w = try s.begin(&aw.writer, level);
+    try w.writeAll(plain);
+    try s.finish();
+    return aw.toOwnedSlice();
+}
+
+/// `HTTP/1.1 200` carrying `body` as `Content-Encoding: gzip`, framed with
+/// Content-Length, or chunked in 1000-byte chunks.
+fn gzipAnswer(gpa: std.mem.Allocator, body: []const u8, chunked: bool) ![]u8 {
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    errdefer aw.deinit();
+    const w = &aw.writer;
+    try w.writeAll("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Encoding: gzip\r\n");
+    if (!chunked) {
+        try w.print("Content-Length: {d}\r\n\r\n{s}", .{ body.len, body });
+    } else {
+        try w.writeAll("Transfer-Encoding: chunked\r\n\r\n");
+        var at: usize = 0;
+        while (at < body.len) : (at += 1000) {
+            const piece = body[at..@min(body.len, at + 1000)];
+            try w.print("{x}\r\n{s}\r\n", .{ piece.len, piece });
+        }
+        try w.writeAll("0\r\n\r\n");
+    }
+    return aw.toOwnedSlice();
+}
+
+/// Text that compresses but still spans several decoder buffers.
+fn testPlain(buf: []u8) []u8 {
+    for (buf, 0..) |*b, i| b.* = "abcdefghij klmnopqrstuvwxyz\n"[(i * 7 + i / 97) % 28];
+    return buf;
+}
+
+const GzipLoopback = struct {
+    listener: net.Server,
+    peer: KeepAlivePeer,
+    thread: std.Thread,
+    url_buf: [64]u8,
+    url: []const u8,
+
+    fn start(g: *GzipLoopback, io: std.Io, answers: []const []const u8, path: []const u8) !void {
+        const addr = try net.IpAddress.parse("127.0.0.1", 0);
+        g.listener = addr.listen(io, .{}) catch |err|
+            return testkit.loopbackSkip("gzip test listen failed ({t})", .{err});
+        errdefer g.listener.deinit(io);
+        g.peer = .{ .io = io, .listener = &g.listener, .answers = answers };
+        g.url = try std.fmt.bufPrint(&g.url_buf, "http://127.0.0.1:{d}{s}", .{ g.listener.socket.address.getPort(), path });
+        g.thread = try std.Thread.spawn(.{}, KeepAlivePeer.run, .{&g.peer});
+    }
+
+    fn finish(g: *GzipLoopback, io: std.Io) void {
+        g.peer.release(g.listener.socket.address.getPort());
+        g.thread.join();
+        g.listener.deinit(io);
+    }
+};
+
+test "gzip: decoded at levels 1/6/9, Content-Length and chunked framing, one pooled connection" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var plain_buf: [50_000]u8 = undefined;
+    const plain = testPlain(&plain_buf);
+    var answers: [3][]u8 = undefined;
+    var made: usize = 0;
+    defer for (answers[0..made]) |a| gpa.free(a);
+    for ([_]u4{ 1, 6, 9 }, 0..) |level, i| {
+        const gz = try testGzip(gpa, plain, level);
+        defer gpa.free(gz);
+        answers[i] = try gzipAnswer(gpa, gz, i == 2);
+        made += 1;
+    }
+
+    var lb: GzipLoopback = undefined;
+    try lb.start(io, &answers, "/");
+    defer lb.finish(io);
+    var client = Client.init(io, gpa, .{ .decompress = .gzip(1 << 20), .total_timeout_ms = 5000 });
+    defer client.deinit();
+    for (0..3) |i| {
+        var res = try client.request(.get, lb.url, .{});
+        defer res.deinit();
+        try testing.expect(res.uncompressed);
+        // Go's view: the wire coding and length are gone ...
+        try testing.expectEqual(@as(?[]const u8, null), res.header("Content-Encoding"));
+        try testing.expectEqual(@as(?[]const u8, null), res.header("content-length"));
+        try testing.expectEqualStrings("text/plain", res.header("content-type").?);
+        // ... the raw head keeps them.
+        try testing.expectEqualStrings("gzip", res.head.header("content-encoding").?);
+        const body = try res.readAllAlloc(gpa, 1 << 20);
+        defer gpa.free(body);
+        try testing.expectEqualSlices(u8, plain, body);
+        _ = i;
+    }
+    // Every decoded body left the framing drained: no redial.
+    try testing.expectEqual(@as(usize, 1), client.dialCount());
+    try testing.expectEqual(@as(usize, 1), client.poolIdleCount());
+    try testing.expect(std.mem.indexOf(u8, lb.peer.head(0), "\r\nAccept-Encoding: gzip\r\n") != null);
+}
+
+test "gzip: off by default — identity asked, a gzip body handed over as sent" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const gz = try testGzip(gpa, "hello", 6);
+    defer gpa.free(gz);
+    const answer = try gzipAnswer(gpa, gz, false);
+    defer gpa.free(answer);
+    var lb: GzipLoopback = undefined;
+    try lb.start(io, &.{answer}, "/");
+    defer lb.finish(io);
+    var client = Client.init(io, gpa, .{ .total_timeout_ms = 5000 });
+    defer client.deinit();
+    var res = try client.request(.get, lb.url, .{});
+    defer res.deinit();
+    try testing.expect(!res.uncompressed);
+    try testing.expectEqualStrings("gzip", res.header("content-encoding").?);
+    const body = try res.readAllAlloc(gpa, 1024);
+    defer gpa.free(body);
+    try testing.expectEqualSlices(u8, gz, body);
+    try testing.expect(std.mem.indexOf(u8, lb.peer.head(0), "\r\nAccept-Encoding: identity\r\n") != null);
+}
+
+test "gzip: a caller Accept-Encoding, a Range, HEAD, x-gzip — not asked or not decoded" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const gz = try testGzip(gpa, "hello", 6);
+    defer gpa.free(gz);
+    const answer = try gzipAnswer(gpa, gz, false);
+    defer gpa.free(answer);
+    const xgzip = try std.fmt.allocPrint(gpa, "HTTP/1.1 200 OK\r\nContent-Encoding: x-gzip\r\nContent-Length: {d}\r\n\r\n{s}", .{ gz.len, gz });
+    defer gpa.free(xgzip);
+    const head_answer = try std.fmt.allocPrint(gpa, "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: {d}\r\n\r\n", .{gz.len});
+    defer gpa.free(head_answer);
+
+    var lb: GzipLoopback = undefined;
+    try lb.start(io, &.{ answer, answer, head_answer, xgzip }, "/");
+    defer lb.finish(io);
+    var client = Client.init(io, gpa, .{ .decompress = .gzip(1 << 20), .total_timeout_ms = 5000 });
+    defer client.deinit();
+
+    const cases = [_]struct { method: http.Method, headers: []const http.Header, sent: []const u8 }{
+        // The caller asked: the body is the caller's to decode (Go).
+        .{ .method = .get, .headers = &.{.{ .name = "accept-encoding", .value = "gzip" }}, .sent = "\r\naccept-encoding: gzip\r\n" },
+        .{ .method = .get, .headers = &.{.{ .name = "Range", .value = "bytes=0-" }}, .sent = "\r\nAccept-Encoding: identity\r\n" },
+        .{ .method = .head, .headers = &.{}, .sent = "\r\nAccept-Encoding: identity\r\n" },
+        // Asked, but only `gzip` itself is decoded (Go's EqualFold).
+        .{ .method = .get, .headers = &.{}, .sent = "\r\nAccept-Encoding: gzip\r\n" },
+    };
+    for (cases, 0..) |case, i| {
+        var res = try client.request(case.method, lb.url, .{ .headers = case.headers });
+        defer res.deinit();
+        try testing.expect(!res.uncompressed);
+        try testing.expect(res.header("content-encoding") != null);
+        const body = try res.readAllAlloc(gpa, 1024);
+        defer gpa.free(body);
+        try testing.expectEqualSlices(u8, if (case.method == .head) "" else gz, body);
+        try testing.expect(std.mem.indexOf(u8, lb.peer.head(i), case.sent) != null);
+        try testing.expectEqual(@as(usize, 1), std.mem.count(u8, lb.peer.head(i), "ccept-")); // one Accept-Encoding
+    }
+}
+
+test "gzip: concatenated members decode like Go's multistream reader; a bodiless answer is left alone" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const a = try testGzip(gpa, "first,", 1);
+    defer gpa.free(a);
+    const b = try testGzip(gpa, "second", 9);
+    defer gpa.free(b);
+    const both = try std.mem.concat(gpa, u8, &.{ a, b });
+    defer gpa.free(both);
+    const multi = try gzipAnswer(gpa, both, true);
+    defer gpa.free(multi);
+    const empty = try gzipAnswer(gpa, "", false);
+    defer gpa.free(empty);
+    const no_content = "HTTP/1.1 204 No Content\r\nContent-Encoding: gzip\r\n\r\n";
+
+    var lb: GzipLoopback = undefined;
+    try lb.start(io, &.{ multi, empty, no_content }, "/");
+    defer lb.finish(io);
+    var client = Client.init(io, gpa, .{ .decompress = .gzip(1 << 20), .total_timeout_ms = 5000 });
+    defer client.deinit();
+    for ([_][]const u8{ "first,second", "", "" }, 0..) |want, i| {
+        var res = try client.request(.get, lb.url, .{});
+        defer res.deinit();
+        // Go wraps only a response that may have a body (CL 0 and 204: no).
+        try testing.expectEqual(i == 0, res.uncompressed);
+        try testing.expectEqual(i != 0, res.header("content-encoding") != null);
+        const body = try res.readAllAlloc(gpa, 1024);
+        defer gpa.free(body);
+        try testing.expectEqualStrings(want, body);
+    }
+    try testing.expectEqual(@as(usize, 1), client.dialCount());
+}
+
+test "gzip: optional header fields (FEXTRA, FNAME, FCOMMENT, FHCRC) are skipped" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const gz = try testGzip(gpa, "flagged", 6);
+    defer gpa.free(gz);
+    // Same deflate data and trailer behind a header that declares all four.
+    const flagged = try std.mem.concat(gpa, u8, &.{
+        &.{ 0x1f, 0x8b, 8, 0b0001_1110, 0, 0, 0, 0, 0, 3 },
+        &.{ 3, 0, 'x', 'y', 'z' }, // FEXTRA: XLEN 3
+        "name.txt\x00",
+        "a comment\x00",
+        &.{ 0xab, 0xcd }, // FHCRC, not checked (see gzip.skipGzipHeader)
+        gz[10..],
+    });
+    defer gpa.free(flagged);
+    const answer = try gzipAnswer(gpa, flagged, false);
+    defer gpa.free(answer);
+
+    var lb: GzipLoopback = undefined;
+    try lb.start(io, &.{answer}, "/");
+    defer lb.finish(io);
+    var client = Client.init(io, gpa, .{ .decompress = .gzip(1 << 20), .total_timeout_ms = 5000 });
+    defer client.deinit();
+    var res = try client.request(.get, lb.url, .{});
+    defer res.deinit();
+    const body = try res.readAllAlloc(gpa, 1024);
+    defer gpa.free(body);
+    try testing.expectEqualStrings("flagged", body);
+}
+
+test "gzip: corrupt, truncated or trailing-garbage bodies fail CorruptGzip; the next request is unharmed" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var plain_buf: [20_000]u8 = undefined;
+    const gz = try testGzip(gpa, testPlain(&plain_buf), 6);
+    defer gpa.free(gz);
+    const Mutation = enum { crc, size, cut_deflate, cut_trailer, garbage, zeros_after, magic, deflate_bits };
+    inline for (comptime std.enums.values(Mutation)) |m| {
+        var body: std.ArrayList(u8) = .empty;
+        defer body.deinit(gpa);
+        try body.appendSlice(gpa, gz);
+        switch (m) {
+            .crc => body.items[body.items.len - 8] ^= 1,
+            .size => body.items[body.items.len - 1] ^= 1,
+            .cut_deflate => body.shrinkRetainingCapacity(gz.len / 2),
+            .cut_trailer => body.shrinkRetainingCapacity(gz.len - 3),
+            .garbage => try body.appendSlice(gpa, "junk"),
+            .zeros_after => try body.appendNTimes(gpa, 0, 10),
+            .magic => body.items[1] = 0x8c,
+            // A reserved block type (BTYPE 11) in the first block header.
+            .deflate_bits => body.items[10] |= 0b110,
+        }
+        const good = try gzipAnswer(gpa, gz, false);
+        defer gpa.free(good);
+        for ([_]bool{ false, true }) |chunked| {
+            const answer = try gzipAnswer(gpa, body.items, chunked);
+            defer gpa.free(answer);
+            var lb: GzipLoopback = undefined;
+            try lb.start(io, &.{ answer, good }, "/");
+            defer lb.finish(io);
+            var client = Client.init(io, gpa, .{ .decompress = .gzip(1 << 20), .total_timeout_ms = 5000 });
+            defer client.deinit();
+            {
+                var res = try client.request(.get, lb.url, .{});
+                defer res.deinit();
+                try testing.expectError(error.CorruptGzip, res.readAllAlloc(gpa, 1 << 20));
+                // Sticky: the reader stays failed.
+                try testing.expectError(error.ReadFailed, res.reader().discardRemaining());
+                try testing.expectEqual(error.CorruptGzip, res.readFailure());
+            }
+            // The wire state, not the gzip verdict, decides pooling (as in
+            // Go, whose pool sees the raw body's EOF): whether or not the
+            // failed exchange left its connection reusable, the next
+            // request reads its own answer, not the rest of the bad one.
+            var res = try client.request(.get, lb.url, .{});
+            defer res.deinit();
+            const body2 = try res.readAllAlloc(gpa, 1 << 20);
+            defer gpa.free(body2);
+            try testing.expectEqualSlices(u8, &plain_buf, body2);
+        }
+    }
+}
+
+test "gzip: the decoded-size cap — exactly at it passes, one byte over is BodyTooLarge" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var plain_buf: [30_000]u8 = undefined;
+    const plain = testPlain(&plain_buf);
+    const gz = try testGzip(gpa, plain, 6);
+    defer gpa.free(gz);
+    const answer = try gzipAnswer(gpa, gz, false);
+    defer gpa.free(answer);
+    for ([_]u64{ plain.len, plain.len - 1 }) |cap| {
+        var lb: GzipLoopback = undefined;
+        try lb.start(io, &.{answer}, "/");
+        defer lb.finish(io);
+        var client = Client.init(io, gpa, .{ .decompress = .gzip(cap), .total_timeout_ms = 5000 });
+        defer client.deinit();
+        var res = try client.request(.get, lb.url, .{});
+        defer res.deinit();
+        if (cap == plain.len) {
+            const body = try res.readAllAlloc(gpa, 1 << 20);
+            defer gpa.free(body);
+            try testing.expectEqualSlices(u8, plain, body);
+        } else {
+            try testing.expectError(error.BodyTooLarge, res.readAllAlloc(gpa, 1 << 20));
+        }
+    }
+}
+
+test "gzip: requestStreaming's Upload and getToFile decode too" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var plain_buf: [70_000]u8 = undefined;
+    const plain = testPlain(&plain_buf);
+    const gz = try testGzip(gpa, plain, 6);
+    defer gpa.free(gz);
+    const answer = try gzipAnswer(gpa, gz, true);
+    defer gpa.free(answer);
+
+    var lb: GzipLoopback = undefined;
+    try lb.start(io, &.{ answer, answer }, "/");
+    defer lb.finish(io);
+    var client = Client.init(io, gpa, .{ .decompress = .gzip(1 << 20), .total_timeout_ms = 5000 });
+    defer client.deinit();
+    {
+        var up = try client.requestStreaming(.post, lb.url, .{}, 3);
+        try up.writer().writeAll("abc");
+        var res = try up.finish();
+        defer res.deinit();
+        try testing.expect(res.uncompressed);
+        const body = try res.readAllAlloc(gpa, 1 << 20);
+        defer gpa.free(body);
+        try testing.expectEqualSlices(u8, plain, body);
+    }
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try testing.expectEqual(@as(u64, plain.len), try client.getToFile(lb.url, tmp.dir, "out"));
+    const got = try tmp.dir.readFileAlloc(io, "out", gpa, .limited(1 << 20));
+    defer gpa.free(got);
+    try testing.expectEqualSlices(u8, plain, got);
+    try testing.expectEqual(@as(usize, 1), client.dialCount());
+}
+
+fn gzipServerHandler(_: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
+    var plain_buf: [40_000]u8 = undefined;
+    try rw.setHeader("Content-Type", "text/plain");
+    try rw.writer().writeAll(testPlain(&plain_buf));
+}
+
+test "gzip: against this module's own Server with compression on" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const server = try gpa.create(Server);
+    defer gpa.destroy(server);
+    server.* = Server.init(io, gpa, .{ .handler = gzipServerHandler, .compression = .{} });
+    defer server.deinit();
+    server.bind() catch |err| return testkit.loopbackSkip("gzip server bind failed ({t})", .{err});
+    const thread = try std.Thread.spawn(.{}, poolTestServeWrap, .{server});
+    defer thread.join();
+    defer server.shutdown();
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{server.boundAddress().getPort()});
+
+    var plain_buf: [40_000]u8 = undefined;
+    const plain = testPlain(&plain_buf);
+    var client = Client.init(io, gpa, .{ .decompress = .gzip(1 << 20) });
+    defer client.deinit();
+    for (0..2) |_| {
+        var res = try client.request(.get, url, .{});
+        defer res.deinit();
+        try testing.expect(res.uncompressed);
+        const body = try res.readAllAlloc(gpa, 1 << 20);
+        defer gpa.free(body);
+        try testing.expectEqualSlices(u8, plain, body);
+    }
+    try testing.expectEqual(@as(usize, 1), client.dialCount());
+}
+
+// ── fuzz: the response-body gzip decoder ────────────────────────────────────
+//
+// `Gunzip` reads bytes a server chose. On top of "no panic" (std's decoder
+// aborts on a cut stream; the padded source is what keeps it away): the cap
+// holds, a read that succeeds decoded members whose trailers all checked,
+// and a failure is always a typed one, never a transport `ReadFailed`.
+
+const fz = @import("fuzz_test.zig");
+const GunzipMark = fz.Marker(enum { decoded, decoded_multi, empty, corrupt, too_large });
+
+const gunzip_seeds = [_][]const u8{
+    testkit.fuzz.seed("\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\xcb\x48\xcd\xc9\xc9\x57\x48\xaf\xca\x2c\x00\x00\x19\x6a\xd2\xdf\x0a\x00\x00\x00"),
+    testkit.fuzz.seed("\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\x4b\x4c\x4a\x4e\x1c\xca\x08\x00\x81\x45\x57\x33\xc0\x00\x00\x00"),
+    testkit.fuzz.seed("\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\x03\x00\x00\x00\x00\x00\x00\x00\x00\x00"),
+    // Two members back to back.
+    testkit.fuzz.seed("\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\x03\x00\x00\x00\x00\x00\x00\x00\x00\x00" ++
+        "\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\xcb\x48\xcd\xc9\xc9\x57\x48\xaf\xca\x2c\x00\x00\x19\x6a\xd2\xdf\x0a\x00\x00\x00"),
+    // FNAME + FCOMMENT + FHCRC on an empty member.
+    testkit.fuzz.seed("\x1f\x8b\x08\x1a\x00\x00\x00\x00\x02\xffn\x00c\x00\xab\xcd\x03\x00\x00\x00\x00\x00\x00\x00\x00\x00"),
+    testkit.fuzz.seed(""),
+};
+
+/// The raw body in pieces of at most `piece` bytes: a server's segments.
+const PieceReader = struct {
+    data: []const u8,
+    piece: usize,
+    reader: std.Io.Reader,
+
+    fn stream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        const p: *PieceReader = @alignCast(@fieldParentPtr("reader", r));
+        if (p.data.len == 0) return error.EndOfStream;
+        const n = try w.write(p.data[0..limit.minInt(@min(p.data.len, p.piece))]);
+        p.data = p.data[n..];
+        return n;
+    }
+};
+
+test "fuzz driver: HTTP_FUZZ (client gunzip)" {
+    try fz.fuzz_driver.run(fuzzGunzip, .{ .prefix = "HTTP_FUZZ", .name = "http-client-gunzip" });
+}
+
+test "fuzz harness: client gunzip, 300 seeds, reaches every outcome" {
+    try GunzipMark.reach(fuzzGunzip, "http-client-gunzip", 300);
+}
+
+test "fuzz: the client's gzip decoder never panics, keeps its cap, fails typed" {
+    try testing.fuzz({}, fuzzGunzipSmith, .{ .corpus = &gunzip_seeds });
+}
+
+fn fuzzGunzipSmith(_: void, smith: *std.testing.Smith) !void {
+    var script: [fz.script_cap]u8 = undefined;
+    const n = smith.slice(&script);
+    try fz.runFrom(fuzzGunzip, smith, script[0..n]);
+}
+
+fn fuzzGunzip(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    var input: [512]u8 = undefined;
+    const len: usize = fz.drawInput(S, src, &input, &gunzip_seeds);
+    const cap: u64 = src.valueRangeAtMost(u16, 1, 300);
+    var raw: PieceReader = .{
+        .data = input[0..len],
+        .piece = src.valueRangeAtMost(u16, 1, 600),
+        .reader = .{ .vtable = &.{ .stream = PieceReader.stream }, .buffer = &.{}, .seek = 0, .end = 0 },
+    };
+    const g = try gpa.create(Gunzip);
+    defer gpa.destroy(g);
+    g.init(&raw.reader, cap);
+
+    var out: [400]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&out);
+    const got = g.reader.streamRemaining(&w) catch |err| switch (err) {
+        // `out` holds more than any cap: the decoder overran it.
+        error.WriteFailed => return error.CapNotHeld,
+        error.ReadFailed => {
+            // The source never fails, so every failure is the body's own.
+            const why = g.failure orelse return error.UntypedFailure;
+            switch (why) {
+                error.CorruptGzip => GunzipMark.mark(.corrupt),
+                error.BodyTooLarge => GunzipMark.mark(.too_large),
+                else => return error.UnexpectedFailure,
+            }
+            return;
+        },
+    };
+    if (got > cap) return error.CapNotHeld;
+    if (g.state != .done) return error.EndedEarly;
+    // Success: every member's trailer checked and the source at its end.
+    if (len == 0) return GunzipMark.mark(.empty);
+    if (std.mem.count(u8, input[0..len], "\x1f\x8b\x08") > 1 and got > 0) GunzipMark.mark(.decoded_multi);
+    GunzipMark.mark(.decoded);
 }

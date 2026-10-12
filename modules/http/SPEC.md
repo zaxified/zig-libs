@@ -458,7 +458,20 @@ Full report with pinned APIs: `~/CML/20261011-http-s2/survey.report.md` (CML not
   in front of ours. Fuzz harness `http-proxy-relay` (no hop-by-hop field relayed; negative control
   caught). Not done: a `websocket`-module client against a `websocket` server behind the proxy
   (that server cannot read after the 101 inside a handler until it adopts `Request.upgraded`).
-- R8 client: transparent gzip (opt-in), h2 via ALPN in `Client.request`, `max_conns_per_host`.
+- R8a client transparent gzip — DONE 2026-10-12: `Client.Options.decompress = .gzip(max_bytes)`
+  (null = off as before; on = Go's `DisableCompression: false`, `max_bytes` a decoded-size cap that
+  Go lacks). A function pointer, not a flag: the plaintext size probe measured +23 KB for every
+  client with a runtime flag, +1 KB this way (the decoder links only where `gzip` is called). Go's rule for asking (no caller `Accept-Encoding`, no `Range`, not HEAD) and for
+  decoding (`Content-Encoding: gzip` exactly, a response that may have a body); `Response.header`
+  hides `Content-Encoding`/`Content-Length`, `Response.uncompressed`; every member's CRC-32/ISIZE
+  checked, members decoded back to back, anything else after them `error.CorruptGzip`; the body
+  reader is std's padded decoder, so a cut stream is refused, never aborts. Go oracle area
+  `client_gzip` (26 cases, compress/gzip fixtures): three judged divergences (`identity` sent where
+  Go sends no field, on HEAD and Range; the header's FHCRC is skipped where Go checks it). The oracle
+  corrected the design once: Go leaves a 204 or `Content-Length: 0` answer undecoded. Negative
+  control: 13 mutants (trailer, padding, multistream, Range/HEAD, header hiding, cap, error mapping,
+  request field), all caught.
+- R8 rest: h2 via ALPN in `Client.request`, `max_conns_per_host`.
 - R9 extension methods (CONNECT, TRACE, `PURGE`, …) reach the handler instead of 501 — breaks
   exhaustive `switch (req.method)` in qap (5), metrics, mcp-http, openapi; patched together.
 - R10 a test recorder (`httptest.NewRecorder`) over `serveStream`.

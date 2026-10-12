@@ -370,7 +370,9 @@ pub const TrailerCheckError = error{
 /// `flate.Decompress.init(in, .raw, window)`. A reserved FLG bit set, or a
 /// magic/CM mismatch, is `error.BadHeader`. The FHCRC field (a CRC-16 of
 /// the header, present when its FLG bit is set) is consumed but not
-/// verified — zlib and Go's `compress/gzip` do not check it either.
+/// verified. zlib does not check it; Go's `compress/gzip` does (gunzip.go,
+/// `ErrHeader` on a mismatch) — a judged divergence: no encoder in common
+/// use sets FHCRC, and the trailer's CRC-32 still covers every body byte.
 pub fn skipGzipHeader(in: *std.Io.Reader) (std.Io.Reader.Error || HeaderError)!void {
     if (try in.takeByte() != 0x1f) return error.BadHeader;
     if (try in.takeByte() != 0x8b) return error.BadHeader;

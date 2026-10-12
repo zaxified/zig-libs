@@ -47,10 +47,15 @@ pub fn build(b: *std.Build) void {
     const p521_mod = dep.mod(b, target, optimize, "p521");
     p521_mod.addImport("entropy", dep.mod(b, target, optimize, "entropy"));
     x509_mod.addImport("p521", p521_mod);
+    const p256_mod = dep.mod(b, target, optimize, "p256");
+    x509_mod.addImport("p256", p256_mod);
     const tlsclient_mod = dep.mod(b, target, optimize, "tlsclient");
     tlsclient_mod.addImport("x509", x509_mod);
+    tlsclient_mod.addImport("p256", p256_mod);
+    tlsclient_mod.addImport("rsa", rsa_mod);
     http_mod.addImport("tlsclient", tlsclient_mod);
     http_mod.addImport("datefmt", dep.mod(b, target, optimize, "datefmt"));
+    http_mod.addImport("crc32", dep.mod(b, target, optimize, "crc32"));
 
     const names = [_][]const u8{ "before", "after" };
     inline for (names) |which| {

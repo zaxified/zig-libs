@@ -5,6 +5,18 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-12** — **Client: transparent gzip, Go's default `Transport` behaviour (S2 survey R8a),
+  opt-in, additive.** `Client.Options.decompress = .gzip(max_bytes)` (null, the default, keeps
+  `Accept-Encoding: identity` and links no decoder): a request without a caller `Accept-Encoding` or `Range`, not HEAD,
+  asks for gzip, and a `Content-Encoding: gzip` answer that may have a body is decoded —
+  `Response.reader` yields the plain bytes, `Response.header` no longer shows `Content-Encoding`/
+  `Content-Length`, `Response.uncompressed` is set. Every member's CRC-32/ISIZE is checked and
+  concatenated members are decoded; a corrupt, cut or trailing-garbage body reads as the new
+  `error.CorruptGzip`, a body past the cap as `error.BodyTooLarge`. `requestStreaming`'s `Upload`,
+  `getAlloc`, `getToFile` decode too. Doc fix, `gzip.skipGzipHeader`: Go's reader does check the
+  header CRC-16 (FHCRC), which this one skips. Fix, `sizeprobe/build.zig`: it no longer built
+  (tlsclient and x509 had gained `p256`), so `check-http-sizeprobe` failed on any run.
+
 - **2026-10-12** — **Reverse proxy: Go's `ReverseProxy` hooks, streaming flush, Upgrade passthrough
   (S2 survey R7); fixes.** `proxy.Config.rewrite` / `modify_response` / `error_handler` with
   `ProxyRequest` (backend, path, query, `headers`, `setXForwarded`), `ProxyResponse` (status, `rw`,

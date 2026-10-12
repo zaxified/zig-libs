@@ -626,6 +626,145 @@ test "go oracle client: responses frame as Go's Transport frames them, or the di
     try testing.expectEqual(@as(usize, 0), bad);
 }
 
+// ── client_gzip: transparent gzip in the client ──────────────────────────
+
+/// `OneShotPeer` that also keeps the request's `Accept-Encoding` value.
+const AePeer = struct {
+    io: std.Io,
+    listener: *net.Server,
+    response: []const u8,
+    ae_buf: [64]u8 = undefined,
+    ae_len: usize = 0,
+
+    fn run(p: *AePeer) void {
+        const s = p.listener.accept(p.io) catch return;
+        defer s.close(p.io);
+        var rbuf: [1024]u8 = undefined;
+        var sr = s.reader(p.io, &rbuf);
+        while (true) {
+            const line = sr.interface.takeDelimiterInclusive('\n') catch return;
+            if (std.mem.eql(u8, line, "\r\n")) break;
+            const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+            if (!std.ascii.eqlIgnoreCase(line[0..colon], "accept-encoding")) continue;
+            const v = std.mem.trim(u8, line[colon + 1 ..], " \t\r\n");
+            p.ae_len = @min(v.len, p.ae_buf.len);
+            @memcpy(p.ae_buf[0..p.ae_len], v[0..p.ae_len]);
+        }
+        var wbuf: [256]u8 = undefined;
+        var sw = s.writer(p.io, &wbuf);
+        sw.interface.writeAll(p.response) catch return;
+        sw.interface.flush() catch return;
+    }
+};
+
+const GzipOutcome = struct {
+    ae: [64]u8 = undefined,
+    ae_len: usize = 0,
+    status: u16 = 0,
+    uncompressed: bool = false,
+    ce: [32]u8 = undefined,
+    ce_len: usize = 0,
+    content_length: i64 = 0,
+    body: ?[]u8 = null,
+
+    fn sentAe(o: *const GzipOutcome) []const u8 {
+        return o.ae[0..o.ae_len];
+    }
+    fn visibleCe(o: *const GzipOutcome) []const u8 {
+        return o.ce[0..o.ce_len];
+    }
+};
+
+fn ourGzipClient(io: std.Io, gpa: std.mem.Allocator, c: vectors.GzipCase) !GzipOutcome {
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var listener = addr.listen(io, .{}) catch |err| {
+        return testkit.loopbackSkip("go oracle client_gzip: listen failed ({t})", .{err});
+    };
+    defer listener.deinit(io);
+    var peer: AePeer = .{ .io = io, .listener = &listener, .response = c.response };
+    const thread = try std.Thread.spawn(.{}, AePeer.run, .{&peer});
+    var out: GzipOutcome = .{};
+    {
+        // Go's default Transport: decoding on, no cap.
+        var client = Client.init(io, gpa, .{ .pool = .{ .enabled = false }, .decompress = .gzip(std.math.maxInt(u64)) });
+        defer client.deinit();
+        var url_buf: [64]u8 = undefined;
+        const url_text = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{listener.socket.address.getPort()});
+        const method: http_root.Method = if (std.mem.eql(u8, c.method, "HEAD")) .head else .get;
+        var hdr: [1]http_root.Header = undefined;
+        var headers: []const http_root.Header = &.{};
+        if (std.mem.indexOf(u8, c.header, ": ")) |at| {
+            hdr[0] = .{ .name = c.header[0..at], .value = c.header[at + 2 ..] };
+            headers = &hdr;
+        }
+        if (client.requestPlain(method, url_text, .{ .headers = headers, .follow_redirects = false })) |res_const| {
+            var res = res_const;
+            defer res.deinit();
+            out.status = res.status;
+            out.uncompressed = res.uncompressed;
+            const ce = res.header("content-encoding") orelse "";
+            out.ce_len = @min(ce.len, out.ce.len);
+            @memcpy(out.ce[0..out.ce_len], ce[0..out.ce_len]);
+            // Go's `Response.ContentLength`: -1 once decoded or when the
+            // framing does not say; 0 for a status that has no body.
+            out.content_length = if (res.uncompressed) -1 else if (res.header("content-length")) |v|
+                std.fmt.parseInt(i64, v, 10) catch -1
+            else if (res.status == 204 or res.status == 304) 0 else -1;
+            out.body = res.readAllAlloc(gpa, 1 << 20) catch null;
+        } else |_| {}
+    }
+    thread.join();
+    out.ae_len = peer.ae_len;
+    @memcpy(out.ae[0..peer.ae_len], peer.ae_buf[0..peer.ae_len]);
+    return out;
+}
+
+/// Where our client's gzip handling differs from Go's Transport, and why.
+/// `ae`: what we send instead; `body_ok`: whether our body read succeeds.
+const GzipDivergence = struct { id: []const u8, ae: []const u8, body_ok: bool, why: []const u8 };
+
+const gzip_divergences = [_]GzipDivergence{
+    .{ .id = "head", .ae = "identity", .body_ok = true, .why = "when this client does not ask for gzip it says `Accept-Encoding: identity` (the decoding-off default, kept for HEAD and Range); Go sends no field -- the same request to a server, spelled out" },
+    .{ .id = "range", .ae = "identity", .body_ok = true, .why = "as head" },
+    .{ .id = "bad-fhcrc", .ae = "gzip", .body_ok = true, .why = "the optional header CRC-16 (FHCRC) is skipped, not checked (gzip.skipGzipHeader): zlib does the same; Go refuses. The trailer's CRC-32 still covers the body" },
+};
+
+test "go oracle client_gzip: transparent gzip matches Go's Transport, or the difference is judged" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var bad: usize = 0;
+    for (vectors.client_gzip) |c| {
+        const ours = try ourGzipClient(io, gpa, c);
+        defer if (ours.body) |b| gpa.free(b);
+        const same_rest = ours.status == c.status and ours.uncompressed == c.uncompressed and
+            std.mem.eql(u8, ours.visibleCe(), c.content_encoding) and ours.content_length == c.content_length;
+        const agrees = same_rest and std.mem.eql(u8, ours.sentAe(), c.accept_encoding) and optEql(ours.body, c.body);
+        const verdict: ?[]const u8 = if (find(GzipDivergence, &gzip_divergences, c.id)) |d|
+            (if (agrees)
+                "agrees now, drop its divergence entry"
+            else if (!same_rest or !std.mem.eql(u8, ours.sentAe(), d.ae) or (ours.body != null) != d.body_ok)
+                "diverges, but not the way its entry says"
+            else
+                null)
+        else if (agrees) null else "diverges";
+        const v = verdict orelse continue;
+        bad += 1;
+        std.debug.print("client_gzip {s}: {s}\n  go:   ae={s} {d} uncompressed={} ce={s} cl={d} {f}\n  ours: ae={s} {d} uncompressed={} ce={s} cl={d} {f}\n", .{
+            c.id,                v,
+            c.accept_encoding,   c.status,
+            c.uncompressed,      c.content_encoding,
+            c.content_length,    std.zig.fmtString(c.body orelse "<error>"),
+            ours.sentAe(),       ours.status,
+            ours.uncompressed,   ours.visibleCe(),
+            ours.content_length, std.zig.fmtString(ours.body orelse "<error>"),
+        });
+    }
+    try testing.expectEqual(@as(usize, 0), bad);
+}
+
 // ── proxy: which proxy a URL goes through ────────────────────────────────
 
 const client_proxy = @import("client_proxy.zig");

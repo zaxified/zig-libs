@@ -701,8 +701,16 @@ provider is called concurrently too. For zstd, zig-libs `zstd.StreamWriter`
   — call `Response.readFailure()` right after such a read reports
   `error.ReadFailed` to recover the same distinction (`llmclient`'s
   `EventIterator.next`, built on `reader()`, is the reference consumer).
-- **Decompression is the caller's job** (`Accept-Encoding: identity` is sent
-  by default); adopt `std.compress` at the call site if you ask for gzip.
+- **Transparent gzip is opt-in** (`Accept-Encoding: identity` is sent by
+  default, and the decoder is not linked in). Set
+  `.decompress = .gzip(max_bytes)` (a decoded-size cap; `maxInt(u64)` = Go's
+  uncapped `Transport`) and the client asks for gzip and
+  decodes it the way Go's does: only when the caller set no
+  `Accept-Encoding`/`Range` and the method is not HEAD; `Response.uncompressed`
+  says it happened, `Response.header` then hides `Content-Encoding` and
+  `Content-Length`. Every trailer is checked; a bad body reads as
+  `error.CorruptGzip`. A caller that sends its own `Accept-Encoding` decodes
+  the body itself.
 - 1xx interim responses are skipped (101 returned as-is); HEAD/204/304
   responses get an empty body reader; chunked trailers are consumed and
   discarded.
