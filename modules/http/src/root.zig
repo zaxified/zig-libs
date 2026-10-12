@@ -150,6 +150,11 @@ pub const multipart = @import("multipart.zig");
 /// client-side `application/x-www-form-urlencoded` encoder.
 pub const form = @import("form.zig");
 
+/// Go's `httptest.ResponseRecorder`, socket-free: `record` runs a handler
+/// over canned request bytes through `Server.serveStream` and returns the
+/// responses parsed (status, headers, decoded body, trailers, tunnel bytes).
+pub const httptest = @import("httptest.zig");
+
 /// Server-Sent Events (`text/event-stream`) encoder over a streaming
 /// `ResponseWriter` — the push half of a live HTTP endpoint (SSE / MCP).
 pub const sse = @import("sse.zig");
@@ -537,6 +542,7 @@ test {
     _ = url;
     _ = multipart;
     _ = form;
+    _ = httptest;
     _ = sse;
     _ = range;
     _ = conneg;

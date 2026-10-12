@@ -543,7 +543,17 @@ Full report with pinned APIs: `~/CML/20261011-http-s2/survey.report.md` (CML not
   tunnel (DATA both ways, no :scheme/:path); Go's h2 server hands it to the handler. Needs a
   full-duplex handler surface on `h2_server` (request DATA read while response DATA is written);
   RFC 8441 extended CONNECT (WebSocket over h2) builds on the same.
-- R10 a test recorder (`httptest.NewRecorder`) over `serveStream`.
+- R10 test recorder — DONE 2026-10-12: `http.httptest.record(gpa, StreamOptions, wire, Config)`
+  (Go `httptest.NewRecorder` + `Result()`) runs `serveStream` over canned request bytes and parses
+  what the server wrote into `Recording.responses` (status, `h1.ResponseHead`, decoded body,
+  trailers, each response's own wire bytes, `complete` = false for a body cut short) and `tunnel`
+  (bytes after a 101 or a 2xx to CONNECT). Bodiless answers follow the request: HEAD is read off
+  the wire, 1xx/204/304 by status; interim 1xx are listed, `only()` skips them. Working memory
+  from `gpa` with the serving loop's default sizes, gzip scratch when `opts` asks for it; output
+  bounded (`max_output_bytes`, overrun = `error.OutputTooLarge`, never a cut recording). h1 only.
+  Negative control: HEAD given a body, chunked left undecoded, tunnel ignored — each fails a test.
+  Consumers' hand-rolled `runWire`/`headerValue`/`bodyOf` helpers (sessions, idempotency,
+  ratelimit, throttle, aaa-gate, router, qap) can move to it at their own pace.
 
 - ~~**h2 inbound gzip decode.**~~ — **DONE 2026-09-29**: `h2_server.Options.max_decompressed_request_bytes`
   / `verify_inbound_trailer` (forwarded by `connMain`), the same `GunzipBody` over the h2 request

@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-12** — **`http.httptest`: Go's `httptest.ResponseRecorder`, socket-free (S2 survey
+  R10), additive.** `httptest.record(gpa, opts, wire, .{})` serves canned request bytes through
+  `Server.serveStream` and returns a `Recording`: every response parsed (status, head, decoded
+  body, trailers, its raw bytes, `complete`), `only()` for the one-request case, `tunnel` for the
+  bytes after a 101 or a CONNECT 2xx. Output bounded by `Config.max_output_bytes`
+  (`error.OutputTooLarge`).
+
 - **2026-10-12** — **Every method token reaches the handler, Go's `Request.Method` (S2 survey R9).
   BREAKING (enum):** `http.Method` gains `.connect`, `.trace` and `.other` — an exhaustive
   `switch` over it needs the new arms (every in-repo one had an `else`). An unknown method is no
