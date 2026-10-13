@@ -15,6 +15,8 @@ API: get/set devices, peers and allowed-ips — no `wg` shell-outs.
   into its own module so other genetlink families (ethtool, devlink,
   nl80211, …) can reuse it too. Re-exported here as `wireguard.genl` for
   source compatibility; `netaddr` — `AllowedIp.parse`'s CIDR-text parsing.
+  The handshake/transport half additionally uses `chachapoly` (ChaCha20-Poly1305)
+  and `entropy` (ephemeral-key / cookie-secret randomness).
 - **Privileges:** CAP_NET_ADMIN for both `getDevice` and `setDevice` (the
   kernel registers the family with `GENL_UNS_ADMIN_PERM`). Family *resolve*
   is unprivileged.
@@ -122,7 +124,8 @@ The Noise_IKpsk2 data-plane handshake (message wire layouts + the
 `Handshake` state machine that produces/consumes them) lives alongside the
 netlink control-plane code above, sharing the module because both are the
 one WireGuard protocol. Implemented over `std.crypto` (X25519,
-ChaCha20-Poly1305, keyed BLAKE2s-128 for mac1, HKDF-over-HMAC-BLAKE2s); no
+keyed BLAKE2s-128 for mac1, HKDF-over-HMAC-BLAKE2s) and the in-repo
+`chachapoly` module (ChaCha20-Poly1305); no
 `netlink` dependency. Verified with a full-handshake known-answer vector,
 initiator↔responder self-consistency, and a netns-gated live interop
 against the in-kernel WireGuard implementation, whose exchanges in both

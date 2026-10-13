@@ -15,6 +15,7 @@ renewal predicate.
   RFC 7638 JWK thumbprint, RFC 2986 PKCS#10, RFC 5915 EC keys).
 - **Deps:** `http` (all ACME requests via `http.Client`; the challenge
   server is `http.Server`), `router` (the challenge responder middleware),
+  `p256` (the ES256 account/certificate key type), `entropy` (key generation),
   `std.crypto` (ecdsa P-256, sha2, Certificate), `std.json`, `std.base64`.
 
 Provenance: clean-room implementation from RFC 8555 (ACME), RFC 7515 (JWS),

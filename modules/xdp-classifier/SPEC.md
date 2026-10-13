@@ -139,7 +139,7 @@ and silent at the Zig-compile level). Two additions specific to this module:
   `map_update_elem`) or silently misbehave (two rules that differ only in
   don't-care bits look distinct in the Zig-side table but are
   indistinguishable to the trie). `validate`'s duplicate check is O(n²)
-  (measured, A1/xdp-classifier.md F3: 256 rules → 0.023ms, 32768 → 322.5ms
+  (measured in the A1 audit, F3: 256 rules → 0.023ms, 32768 → 322.5ms
   in ReleaseFast, ratio ~4.0x per doubling); `validateSorted` does the same
   check — byte-for-byte the same verdict on every input, including error
   *precedence* when a table has both a duplicate and a structural defect —

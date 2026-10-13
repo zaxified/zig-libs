@@ -23,16 +23,13 @@ handle into a scratch map before returning `XDP_PASS`.
 
 **Fully implemented, nothing gated.** Every function in this module is real
 code, not a stub. Every test runs and passes, or skips cleanly without
-`CAP_BPF`/root — that is six tests, not just the two real in-kernel-verifier
-loads: two `load:` tests hand a built program to the live verifier, and four
-more (`createLpmTrieMap`+`populateRule`, `createCpuMap`+`populateCpu`,
-`createScratchMap`+`readScratchClass`, `populateRuleSet`) are kernel-map
-round-trips that need a real map to exercise the key/value byte encodings
-(F6: an earlier version of this sentence undercounted these four as covered
-by "the real-load checks", which they are not — they never call
-`ebpf.load`). Since 2026-10-06 `src/kernel_test.zig` adds four more gated
-tests that load every VLAN/IPv6 program variant AND run it in the kernel on
-real frames (`BPF_PROG_TEST_RUN`), plus an IPv6-map round-trip in `maps.zig`.
+`CAP_BPF`/root. The gated tests fall in two groups: those that hand a built
+program to the live verifier (`load:` tests; `src/kernel_test.zig` loads every
+VLAN/IPv6 program variant AND runs it in the kernel on real frames with
+`BPF_PROG_TEST_RUN`), and kernel-map round-trips (`createLpmTrieMap`+`populateRule`,
+`createCpuMap`+`populateCpu`, `createScratchMap`+`readScratchClass`,
+`populateRuleSet`, the IPv6 map) that need a real map to exercise the key/value
+byte encodings -- these never call `ebpf.load`.
 See `SPEC.md` for the full argument; the short version:
 
 Every verifier-hard PATTERN this program needs — `ctx->data`/`ctx->data_end`
@@ -264,7 +261,7 @@ ruleset's intended behavior without a kernel).
   A LibreQoS-scale table (tens of thousands of subscriber prefixes,
   reloaded on every subscriber change) should call `validateSorted`
   instead: same verdict on every input (see `RuleSet`'s doc comments and
-  `A1/xdp-classifier.md` F3 for the measured cost of each), O(n log n),
+  `SPEC.md` for the measured cost of each), O(n log n),
   and still allocation-free — the caller supplies the sort scratch memory
   (one `usize` per rule) instead of the module allocating it.
 

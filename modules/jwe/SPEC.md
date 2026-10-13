@@ -22,7 +22,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [go-jose/go-jose](https://github.com/go-jose/go-jose) — **reference** (with `panva/jose`) | Go | Apache-2.0 | 536 | v4.1.5 (2026-09-03) | README table (read): RSA1_5, RSA-OAEP(-256), A128/192/256KW, A*GCMKW, ECDH-ES(+AxxxKW), dir, PBES2; A128/192/256CBC-HS*, A*GCM; DEFLATE (`zip`: DEF); compact and JSON serialization, multiple recipients. Here: compact only, no RSA1_5, no `zip`, no AES-192. |
+| [go-jose/go-jose](https://github.com/go-jose/go-jose) — **reference** (with `panva/jose`) | Go | Apache-2.0 | 536 | v4.1.5 (2026-09-03) | README table (read): RSA1_5, RSA-OAEP(-256), A128/192/256KW, A*GCMKW, ECDH-ES(+AxxxKW), dir, PBES2; A128/192/256CBC-HS*, A*GCM; DEFLATE (`zip`: DEF); compact and JSON serialization, multiple recipients. Here: compact only, no RSA1_5, no `zip`. |
 | [panva/jose](https://github.com/panva/jose) | TypeScript | MIT | 7.8k | v6.2.12 (2026-09-05) | README (read): JWE compact, flattened and general JSON serialization, EncryptJWT (encrypted JWTs), JWK/JWKS. Here: compact only; JWKs are handled as parsed `KeyMaterial`, JWKS is out of this module. |
 | [lestrrat-go/jwx](https://github.com/lestrrat-go/jwx) | Go | MIT | 2.4k | v4.5.0 (2026-09-08) | Full JOSE suite (JWA/JWE/JWK/JWS/JWT); feature list not read this run *(inferred)*. |
 | [hidekatsu-izuno/josekit-rs](https://github.com/hidekatsu-izuno/josekit-rs) | Rust | Apache-2.0 | 94 | v0.8.2 (2023-02-05; push 2025-05) | JOSE for Rust on OpenSSL bindings (links C) *(inferred)*; stale releases. |

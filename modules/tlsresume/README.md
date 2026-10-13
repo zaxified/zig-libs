@@ -75,7 +75,9 @@ try tlsresume.select.selectPsk(
     Hkdf, Hmac, tlsresume.stek.DefaultRing, &result, &ring,
     offered_identities, offered_binders,
     empty_transcript_hash, truncated_client_hello_transcript_hash,
-    now_ms, freshness_window_ms, &open_scratch,
+    now_ms, freshness_window_ms,
+    &strike, // ?*replay.StrikeRegister; null only if you never accept early data
+    &open_scratch,
 );
 
 // result.psk is the restored resumption PSK; result.selected_index is what

@@ -32,7 +32,7 @@ defer gpa.free(axis);
 
 // reference resolution (XML-DSig URI="#id")
 const target = doc.getElementById("assertion-1")       // xml:id / ID heuristic
-            orelse doc.findByAttr("", "ID", "assertion-1"); // exact control
+            orelse try doc.findByAttr(gpa, "", "ID", "assertion-1"); // exact control
 
 // raw bytes / subtree location
 const bytes = target.?.span.slice(source);

@@ -145,7 +145,7 @@ ACME v2 (RFC 8555) replay/downgrade paths all confirmed correct. A manual stagin
 - ~~**A run against a real staging CA in CI or a scheduled job**~~ — Pebble DONE 2026-10-06 (see Anchoring; by hand through `tools/pebble.sh`, replayed in the lane). Still open: a scheduled run against Let's Encrypt STAGING itself (Boulder, a public name, port 80), out of scope for a loopback lane.
 
 ## Status
-`gap · any · client · threadsafe` + deps `http`, `router`, `std.crypto` (ECDSA P-256, `Certificate`),
+`gap · any · client · threadsafe` + deps `http`, `router`, `p256`, `entropy`, `std.crypto` (ECDSA P-256, `Certificate`),
 `std.json` — canonical source is `pub const meta` in src/root.zig.
 
 ## Anchoring

@@ -415,9 +415,9 @@ NOT covered, honestly:
   (by design).
 
 ## Status
-`gap · linux · client · reentrant` + deps: `netlink`, `genetlink`, `chachapoly`, `netaddr` —
+`gap · linux · client · reentrant` + deps: `netlink`, `genetlink`, `chachapoly`, `entropy`, `netaddr` —
 canonical source is `pub const meta` in src/root.zig. (The handshake + transport half above depends
-only on `chachapoly`/std.crypto, not on either netlink module; `netaddr` is used only by
+only on `chachapoly`/`entropy`/std.crypto, not on either netlink module; `netaddr` is used only by
 `AllowedIp.parse`.)
 
 ## Public test-only entry points, unguarded

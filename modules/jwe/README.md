@@ -24,7 +24,8 @@ below. AES-192 (every `A192*`) runs on the `aes192` block cipher and
   I/O). **Concurrency:** reentrant — no shared/global state.
 - **Deps:** `rsa` (RSA-OAEP / RSA-OAEP-256 key wrap), `p256` (ECDH-ES's
   P-256 curve — X25519 stays on `std`), `aescbc` + `aeskw` (the shared
-  CBC content-encryption and RFC 3394 key-wrap cores).
+  CBC content-encryption and RFC 3394 key-wrap cores), `aes192` + `aesgcm`
+  (AES-192 block cipher and `Aes192Gcm` for every `A192*`).
 
 ## Status
 
