@@ -537,6 +537,7 @@ pub const ClientAuth = struct {
             };
         }
 
+        /// secret-api-ok: reads only the union's tag (which key TYPE this is), never the key bytes.
         /// Whether this key can sign `s` in `version` (RFC 8446 §4.2.3 binds
         /// ECDSA curves to schemes in TLS 1.3; TLS 1.2 schemes name the hash
         /// only).

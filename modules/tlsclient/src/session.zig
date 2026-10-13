@@ -138,6 +138,7 @@ pub const SessionCache = struct {
         if (c.lock) |l| l.mutex.unlock(l.io);
     }
 
+    /// secret-api-ok: compares only the cache key (the server name + port, public); the session secrets are not read.
     /// The entry for `key`, if any (caller holds the lock).
     pub fn find(c: *SessionCache, k: []const u8) ?*ClientSession {
         for (c.entries) |*e| {
@@ -146,6 +147,7 @@ pub const SessionCache = struct {
         return null;
     }
 
+    /// secret-api-ok: picks a slot by the public cache key and generation counters; no session secret is read or copied.
     /// The entry `key` is stored in from now on: its own, else a free one,
     /// else the oldest. Gets a new generation (caller holds the lock).
     pub fn reserve(c: *SessionCache, k: []const u8) ?*ClientSession {
