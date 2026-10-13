@@ -236,7 +236,7 @@ zig build test-dnp3 -Doptimize=ReleaseFast
 zig fmt --check modules/dnp3
 ```
 
-142 offline tests: DNP3 CRC-16 known-answer vectors (the reveng
+Offline tests (`scripts/modtest dnp3`): DNP3 CRC-16 known-answer vectors (the reveng
 CRC-catalogue "CRC-16/DNP" check value plus additional vectors cross-checked
 against an independent from-scratch bit-serial CRC reference — see SPEC.md),
 data-link frame round-trips (empty/short/exact-block-boundary/multi-block user

@@ -80,8 +80,9 @@ why it matters here:
   two-transcript Sigma-protocol argument — the exact privacy selective
   disclosure exists to provide.
 
-Coconut has no published byte-exact vector (`SPEC.md` §3), so no consumer needs
-a deterministic issuance. This module's own tests use
+Coconut has no published byte-exact vector for the show proof (`SPEC.md` §3; the
+PS-signature core is cross-checked against a foreign library, see Provenance), so
+no consumer needs a deterministic issuance. This module's own tests use
 `keygenSeededForTest` / `proveCredentialSeededForTest`; the names are the
 signal, and there is no seeded option on the production functions.
 

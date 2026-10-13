@@ -33,8 +33,8 @@ const n = try coap.serialize(.{
 ```
 
 Codes carry their `class()`/`detail()` (`Code.content.class() == 2`), and any
-code builds with `Code.init(class, detail)`. Options are value-agnostic here —
-the typed registry (Uri-Path = 11, Content-Format = 12, …) is the next part.
+code builds with `Code.init(class, detail)`. Options are value-agnostic in this codec layer —
+the typed registry (Uri-Path = 11, Content-Format = 12, …) lives in `coap.options` (below).
 
 - **Role:** util. **Platform:** any. **Deps:** none (std
   only). **Concurrency:** reentrant — no shared state; results borrow the
@@ -62,7 +62,7 @@ On top of the value-agnostic codec, `coap.options` gives options their meaning
   leading zeros, empty = 0).
 - **Accessors** over a parsed `Message` — `contentFormat`, `accept`, `maxAge`
   (default 60), and the `uriPath` / `uriQuery` segment iterators.
-- **URI ↔ options** (§6) — `optionsFromUri("coap://h/a/b?x=1")` → Uri-Host /
+- **URI ↔ options** (§6) — `optionsFromUri("coap://h/a/b?x=1", out, scratch)` → Uri-Host /
   Uri-Port (non-default) / Uri-Path* / Uri-Query* in ascending order (feeds
   `serialize` directly), and `uriFromOptions` back, with RFC 3986
   percent-encoding.
@@ -173,7 +173,7 @@ renegotiation mid-transfer.
 
 ## Verification
 
-`zig build test-coap` — 65 offline tests. Block-wise / Observe (16): the Block
+`scripts/modtest coap` — offline tests. Block-wise / Observe: the Block
 value codec (field packing, SZX sizes, minimal encoding, reserved-SZX / too-long
 / over-large-NUM errors), `split` boundary + `Assembler` completion, and two
 end-to-end block transfers (a 3000-byte Block2 GET loop reassembled and compared
@@ -185,16 +185,16 @@ a rejected hook neither registers nor evicts an existing entry, an admitted
 source still registers when the table is full, a per-source cap bounds one
 source's share without evicting), an end-to-end observe register →
 notifications → stale-reject → cancel, and the CON-notification-timeout / RST
-cancellation glue. Client/server (7): `buildRequest`
+cancellation glue. Client/server: `buildRequest`
 option assembly + counter advance, `Exchange.match` across all five reply
 kinds, NON typing, `isRequest` gating, `piggyback`/`ackOnly`/`separate`
-builders, and an end-to-end client→server→client round-trip. Reliability (9): the retransmit
+builders, and an end-to-end client→server→client round-trip. Reliability: the retransmit
 schedule (jitter selection, the full 4-retransmit backoff to `timed_out`,
 `ack`/`onReset`, custom `max_retransmit`) and the dedup window (fresh/duplicate,
-expiry-from-first-sight, independence, full-storage eviction). Codec (7): a hand-built CON GET
+expiry-from-first-sight, independence, full-storage eviction). Codec: a hand-built CON GET
 datagram round-trips to exact bytes; extended option nibbles across the 13/269
 boundaries; payload marker + lone `0xFF`; the full parse/serialize error matrix;
-`encodedLen` agreement. Options (19): class bits, `decodeUint`/`encodeUint`
+`encodedLen` agreement. Options: class bits, `decodeUint`/`encodeUint`
 boundaries + no-leading-zeros round-trip, the typed accessors, and
 `optionsFromUri`/`uriFromOptions` (host/port/path/query, percent-en/decoding,
 coaps, bad-scheme, URI round-trips). Original codec details: a hand-built CON GET datagram with a

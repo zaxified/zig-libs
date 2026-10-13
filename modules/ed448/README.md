@@ -41,19 +41,21 @@ const ed448 = @import("ed448");
 ```zig
 const x448 = ed448.x448;
 
-const kp = x448.KeyPair.generate(io);
-const shared = try x448.scalarmult(kp.secret_key, peer_public_key);
+var kp: x448.KeyPair = undefined;
+x448.KeyPair.generate(&kp, io); // secret half lands in `kp`, no temporary
+var shared: [x448.shared_length]u8 = undefined;
+try x448.scalarmult(&shared, &kp.secret_key, peer_public_key);
 ```
 
 ## Ed448 (signatures)
 
 ```zig
-const kp = ed448.ed448.KeyPair.create(seed); // 57-byte seed
-const sig = try ed448.ed448.sign(kp, msg, ctx); // ctx: []const u8, up to 255 bytes
+const kp = ed448.ed448.KeyPair.create(&seed); // *const [57]u8 seed
+const sig = try ed448.ed448.sign(&kp, msg, ctx); // ctx: []const u8, up to 255 bytes
 try ed448.ed448.verify(sig, msg, ctx, kp.public_key);
 
 // Ed448ph (prehashed) variant:
-const sig_ph = try ed448.ed448.signPh(kp, msg, ctx);
+const sig_ph = try ed448.ed448.signPh(&kp, msg, ctx);
 try ed448.ed448.verifyPh(sig_ph, msg, ctx, kp.public_key);
 ```
 
@@ -66,8 +68,9 @@ ed448 → field (Fp448) → std.crypto.sha3 (Shake256, via ed448.zig)
       → scalar (mod L)   → std only
 ```
 
-No sibling zig-libs module dependencies; pure `std` (`std.crypto.hash.
-sha3.Shake256`, `std.Io` for randomness).
+Sole sibling zig-libs dependency: `entropy` (the fail-closed seed draw behind
+the two `KeyPair.generate` functions); otherwise pure `std` (`std.crypto.hash.
+sha3.Shake256`, `std.Io`).
 
 ## Verify
 

@@ -39,8 +39,8 @@ central directory (authoritative under data descriptors) with a distinct `crcMis
 decompression-bomb cap and zip-slip name gate on both read and write; hostile-archive handling
 (truncated EOCD, bad offsets, lying sizes) with typed errors; `ArchiveWriter` output frozen against
 real `unzip`/`zipinfo`. **Where we are behind:** only Store + Deflate (zip2 also Bzip2, Zstandard,
-XZ, LZMA, Deflate64, PPMd), no encryption, no zip64 writing, no entry modification time or
-permissions (`Entry` carries neither; the writer stores date/time 0), writer buffers one entry's
+XZ, LZMA, Deflate64, PPMd), no encryption, no zip64 writing (entry modification time and mode are supported since
+2026-09-30), writer buffers one entry's
 compressed bytes (no data-descriptor streaming), reader needs a seekable `File` (→ Backlog).
 
 ## Design & invariants

@@ -242,7 +242,7 @@ leaving, which RFC 7432 also does by withdrawing its ES route).
 
 ## Verification
 
-`zig build test-df-elect` (54 tests):
+`zig build test-df-elect`:
 
 - **Fuzz sweep**, all three algorithms, 120 seeds in Debug and 400 optimized, every
   fault kind enabled: zero split-horizon violations; every duplicate explained

@@ -97,7 +97,7 @@ if (std.mem.eql(u8, decoded.message.commandName(), "version")) {
 const my_version: btcp2p.Version = .{
     .version = 70016,
     .services = btcp2p.NODE_NETWORK,
-    .timestamp = std.time.timestamp(),
+    .timestamp = unix_seconds, // i64; `std.time.timestamp()` was removed in Zig 0.16 — take it from the caller's clock
     .addr_recv = .{ .services = 0, .ip = btcp2p.NetAddr.fromIpv4(.{ 1, 2, 3, 4 }), .port = 8333 },
     .addr_from = .{ .services = 0, .ip = @splat(0), .port = 0 },
     .nonce = my_random_nonce,

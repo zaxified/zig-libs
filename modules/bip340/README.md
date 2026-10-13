@@ -1,8 +1,8 @@
 # bip340
 
 BIP340 Schnorr signatures over secp256k1 — the signature scheme behind
-Bitcoin Taproot, and the foundational primitive a future Taproot-tweak /
-Musig2 / adaptor-signature stack in this collection would build on.
+Bitcoin Taproot, and the foundational primitive the `taproot`, `musig2`, `adaptor` and
+`frost` modules in this collection build on.
 
 **Status: complete — sign, verify, and batch verification implemented and
 KAT-validated against all 19 official BIP340 test vectors** (the 8
@@ -29,8 +29,9 @@ const bip340 = @import("bip340");
 
 ```zig
 const sk = try bip340.SecretKey.fromBytes(sk_bytes); // rejects 0 and >= n
-const kp = try bip340.KeyPair.fromSecretKey(sk); // even-y-normalized secret + x-only pubkey
-const pk = try bip340.PublicKey.fromSecretKey(sk); // just the x-only pubkey half
+var kp: bip340.KeyPair = undefined;
+try bip340.KeyPair.fromSecretKey(&kp, &sk); // even-y-normalized secret + x-only pubkey, into `kp`
+const pk = try bip340.PublicKey.fromSecretKey(&sk); // just the x-only pubkey half
 ```
 
 **x-only public keys** (32 bytes, e.g. parsed off the wire):
@@ -50,7 +51,7 @@ const bytes = sig.toBytes();
 **Signing / verifying:**
 
 ```zig
-const sig_bytes = try bip340.sign(sk, msg, aux_rand, io); // includes the spec-mandated self-verify
+const sig_bytes = try bip340.sign(&sk, msg, aux_rand, io); // includes the spec-mandated self-verify
 const sig2 = try bip340.signWithKeyPair(&kp, msg, aux_rand, io); // same bytes, skips re-deriving P
 const ok = bip340.verify(xonly, msg, sig); // never panics/errors: false on every failure path
 const batch_ok = bip340.verifyBatch(&.{.{ .pubkey = xonly, .msg = msg, .sig = sig }}, io);

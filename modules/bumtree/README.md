@@ -92,7 +92,7 @@ which turns a synchronised link-state database (`isis-lsdb`) into an `spf-ect`
 graph the same way and consumes the resolved tree; this module never parses an
 LSDB itself.
 
-## Deferred (out of scope by design — see `SPEC.md`)
+## Deferred (see `SPEC.md`; all-source builds and the ECT variants are Backlog, not out of scope by design)
 
 - **All-source trees in one pass** — the caller loops over sources; there is no
   batched multi-source build here.

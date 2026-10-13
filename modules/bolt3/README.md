@@ -43,5 +43,5 @@ Debug + ReleaseFast.
 
 ## Dependencies
 
-std only — `std.crypto.ecc.Secp256k1` (curve group) and
+sibling [`k256`](../k256) (the `Secp256k1` curve group) and
 `std.crypto.hash.sha2.Sha256`. No third-party crypto.

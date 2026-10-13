@@ -17,7 +17,7 @@
 **Downstream consumer:** no
 
 CoAP (RFC 7252) client/server stack: message codec, typed options, reliability, block-wise transfer,
-observe. Usage: see ./README.md. Attribution/provenance: see /NOTICE.
+observe. Usage: see ./README.md. Attribution/provenance: see the README "Provenance" paragraph (no NOTICE entry).
 
 ## Compared with
 
@@ -181,15 +181,15 @@ resource definitions and no ports, and `aiocoap` is not installed on the audit h
 are frozen and cannot currently be re-taken by following what is written. Recorded, not fixed
 (2026-09-03); closing it means committing the capture client + server script.
 
-`zig build test-coap` — 85 offline tests. Codec (7): golden-byte CON GET round-trip, extended
+`scripts/modtest coap` — offline tests. Codec: golden-byte CON GET round-trip, extended
 option nibbles at the 13/269 boundaries, payload-marker edge cases, full parse/serialize error
-matrix, `encodedLen` agreement. Options (20): class bits, uint codec boundaries + round-trip, typed
+matrix, `encodedLen` agreement. Options: class bits, uint codec boundaries + round-trip, typed
 accessors, URI↔options mapping (percent-encoding, coaps, bad-scheme, a hostile Uri-Host escaped
-rather than emitted verbatim). Reliability (10): retransmit schedule (jitter, full backoff to
+rather than emitted verbatim). Reliability: retransmit schedule (jitter, full backoff to
 `timed_out`, `ack`/`onReset`, custom `max_retransmit`), dedup window (fresh/duplicate/expiry/eviction,
-zero-length storage never panics). Client/server (7): request assembly + counter advance,
+zero-length storage never panics). Client/server: request assembly + counter advance,
 `Exchange.match` across all five reply kinds, `isRequest` gating, response builders, an end-to-end
-client→server→client round-trip. Block-wise/Observe (21): Block codec edge cases, `split` boundary +
+client→server→client round-trip. Block-wise/Observe: Block codec edge cases, `split` boundary +
 `Assembler` completion (in-order assembly, a lone high-`num` final block rejected rather than
 reported complete, a mid-stream gap rejected, a mid-transfer SZX change rejected), two end-to-end
 block transfers (byte-exact 3000-byte Block2 GET reassembly; Block1 PUT with `2.31 Continue`),

@@ -15,7 +15,7 @@
 
 **Downstream consumer:** no
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see /NOTICE.
+Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see ./NOTICE.
 
 ## Compared with
 
@@ -246,7 +246,7 @@ derivation (the GMAC primitive is provided and KAT-validated; the caller supplie
 
 ## Verification
 
-142 offline tests (`zig build test-dnp3`, green in Debug + ReleaseFast; `zig fmt --check` clean).
+Offline tests (`zig build test-dnp3`, green in Debug + ReleaseFast; `zig fmt --check` clean).
 Breakdown: `link` (12) — CRC catalogue + KAT vectors, control-octet round-trip, frame round-trips
 (empty/short/multi-block/exact-16-byte-boundary user data), encode/decode error paths including a
 malformed-input sweep; `transport` (9) — transport-octet round-trip, empty-fragment/single-segment/

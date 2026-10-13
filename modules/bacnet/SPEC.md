@@ -16,7 +16,7 @@
 
 **Downstream consumer:** no
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see /NOTICE.
+Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see the README "Provenance" paragraph (the root NOTICE keeps no per-module entries).
 
 ## Compared with
 
@@ -255,8 +255,8 @@ client** against ours.
 **One honest caveat on provenance.** While probing bacpypes3's API to find the right call
 signature for tag encoding, its `primitivedata.Tag.encode` function was read. That is *source
 consulted as a design reference* under CONVENTIONS §5, not black-box use, even though the
-algorithm it contains is clause 20.2.1 restated. It needs a `/NOTICE` entry — see "What /NOTICE
-needs" below. Everything else about bacpypes3 was black-box: its objects were constructed, its
+algorithm it contains is clause 20.2.1 restated. It is declared in the README "Provenance" paragraph (the root
+`NOTICE` keeps no per-module entries since 2026-09-06) — see "What /NOTICE needs" below. Everything else about bacpypes3 was black-box: its objects were constructed, its
 encoders run, its output printed, and its processes driven over UDP. No other function of its
 source was read, and no design decision here was taken from it.
 
@@ -587,7 +587,8 @@ Everything below is out of scope for this module as it stands, deliberately and 
 
 ## What /NOTICE needs
 
-The existing entry is unchanged and still correct:
+The attribution below is declared in the README "Provenance" paragraph (there is no root `NOTICE` entry
+or module `NOTICE` file; the root `NOTICE` carries no per-module entries since 2026-09-06). It is unchanged and still correct:
 
 > **bacpypes3** (Joel Bender, MIT) — Python BACnet stack. Used as a black-box test oracle (wire
 > octets, live device peer, live client peer) throughout `modules/bacnet`, which needs no entry;

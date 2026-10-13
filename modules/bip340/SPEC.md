@@ -60,9 +60,9 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
     `@import("k256").Secp256k1`, byte-exact to `std.crypto.ecc.Secp256k1`
     (see `meta.deps` and `root.zig`'s top-of-file import), and calls the
     equivalent base-point multiply as `Secp256k1.combMulBase(scalar_bytes,
-    .big)` (`root.zig:163` — `KeyPair.fromSecretKey`'s public-key
-    derivation; `root.zig:322` — `sign`'s nonce-point `R = k'*G`;
-    `root.zig:517` — `verifyBatch`'s left-hand-side check). The recon above
+    .big)` (`KeyPair.fromSecretKey`'s public-key derivation and `sign`'s
+    nonce-point `R = k'*G`; `verifyBatch` uses a multi-base multiply
+    instead). The recon above
     describes `std`'s own API surface, which is still accurate for what
     `k256` mirrors; a reader chasing `basePoint.mul` through this module's
     actual call sites will not find it.

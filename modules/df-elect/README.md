@@ -76,9 +76,9 @@ algorithm in Debug and 400 optimized:
 
 - split-horizon: zero violations (live check, halts the run);
 - duplicates: every one follows a heal / link-up / restart within
-  `maxDuplicateWindow` (= 100; measured worst 50 ticks);
+  `maxDuplicateWindow` (= 100 with the default config);
 - zero-DF: every stretch without a DF, measured from the last disruptive
-  fault, stays within `maxZeroDfWindow` (= 420; measured worst 377);
+  fault, stays within `maxZeroDfWindow` (= 470 with the default config; measured worst: see SPEC);
 - fault-free runs: no duplicate at all, and the roles settle on the RFC
   assignment; explicit failover (DF crash + restart) and partition/heal cases;
 - negative control: `df_wait = 0` duplicates at startup with no fault to

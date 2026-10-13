@@ -177,7 +177,7 @@ covering:
 - `buildZip64` hand-builds a zip64-escaped archive (0xFFFFFFFF placeholders +
   real sizes/offset in a zip64 extra field, plus a zip64 EOCD + locator ahead
   of the classic EOCD) for both Store and Deflate members — exercises
-  `std.zip.Iterator`'s zip64 path without a multi-gigabyte fixture
+  this module's own zip64 central-directory path without a multi-gigabyte fixture
 - `ArchiveWriter`: a Store + Deflate archive written by this module round-trips
   byte-for-byte back through its own `Archive`/`EntryReader`, with the written
   CRC-32/sizes cross-checked independently via `std.zip.Iterator` directly (so

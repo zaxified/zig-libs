@@ -275,7 +275,7 @@ HelloRetryRequest section), and `handleFlight` is the only way to drive it, so
 taking a capability handle per datagram would hand a protocol engine the socket
 authority this design exists to withhold. A tagged union is a value, so it costs
 that invariant nothing — and, unlike a `…ForTest` twin entry point, it does not
-push all 263 tests onto a seeded path and leave production untested.
+push all of the module's tests onto a seeded path and leave production untested.
 
 The `dtls.keyschedule` and `dtls.aead` modules are the KAT-validated crypto
 core; `dtls.record`/`handshake`/`flight`/`messages` are the pure framing
@@ -298,7 +298,7 @@ every group is always advertised in `supported_groups`, so a
 preference-honoring server can retry a classical offer up to the hybrid on
 its own — that path is live-tested too.
 
-All four hybrid shapes are proven against wolfSSL, not just against this
+All three hybrid shapes are proven against wolfSSL, not just against this
 module's own mirror image: our client offering the hybrid, our client
 upgraded to it by a HelloRetryRequest, and a wolfSSL client's hybrid share
 answered by our server's encapsulation path. The construction is the draft's

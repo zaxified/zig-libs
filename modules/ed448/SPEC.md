@@ -311,8 +311,8 @@ self-check tests (field inverse/sqrt/mul-square agreement, point
 encode/decode round-trips and invalid-encoding rejects, scalar
 wrap-around identities) independent of the KAT vectors.
 
-Deferred (unchanged from the scaffold's "Out of scope" list): decaf448,
-hash-to-curve/Elligator2 (RFC 9380), `fromEd448` key conversion, batch
+Deferred (unchanged from the scaffold's "Out of scope" list; decaf448 has
+since shipped as its own module): hash-to-curve/Elligator2 (RFC 9380), `fromEd448` key conversion, batch
 verification / key blinding, plus the performance follow-ups noted
 inline (dedicated squaring, windowed scalar mul, `mulSmall`, fused
 `mulAdd` reduction).
