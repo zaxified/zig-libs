@@ -106,6 +106,22 @@ const sig = try p256.sign.ecdsaSign(&secret_key, msg, &nonce_k);
 const dsig = try p256.sign.ecdsaSignDeterministic(&secret_key, msg);
 const ok  = p256.sign.ecdsaVerify(pubkey_sec1, msg, sig);
 
+// ECDSA over any hash: `Ecdsa(Hash)` has `EcdsaP256Sha256`'s surface
+// (`EcdsaP256Sha256 = Ecdsa(Sha256)`); a digest over 32 bytes is cut to its
+// leftmost 256 bits. Signatures are byte-identical to std's `Ecdsa(P256, Hash)`.
+const Es384 = p256.Ecdsa(std.crypto.hash.sha2.Sha384);
+const kp = try Es384.KeyPair.generateDeterministic(seed);
+const s384 = try kp.sign(msg, null);
+try s384.verify(msg, kp.public_key);
+
+// ECDH: x of secret · peer, 32 bytes big-endian. The peer is a compressed or
+// uncompressed SEC1 point, validated (canonical, on the curve, not the identity);
+// the secret must be in [1, n − 1]. `ecdhInto` takes the secret by pointer and
+// leaves no residue on the dead stack.
+const shared = try p256.ecdh(secret_be, peer_sec1);
+var out: [32]u8 = undefined;
+try p256.ecdhInto(&out, &secret_be, peer_sec1);
+
 // X.509/OCSP/CMS carry the signature as DER; JWS/COSE/XML-DSig use raw r||s.
 const raw = p256.sign.derToRaw(sig_der) orelse return error.BadSignature;
 var der_buf: [p256.sign.der_max_len]u8 = undefined;
@@ -140,7 +156,10 @@ directions: p256 verifies std's signatures, and std verifies p256-produced ones)
 **241 Wycheproof ECDSA-P256/SHA-256 P1363 vectors** (173 must verify, 68 must
 not — run through both `ecdsaVerify` and the std-generic path, so the two cannot
 drift apart unnoticed) and **484 Wycheproof DER vectors** (310 malformed
-encodings) behind `derToRaw`, and two positive controls — a broken-Solinas-constant
+encodings) behind `derToRaw`, the SHA-512 (554 DER + 311 P1363) and SHA3-256 (482 DER)
+Wycheproof files through `Ecdsa(Hash)` and `sign.ecdsaVerifyDigest`, **363 Wycheproof
+ECDH vectors** and the NIST CAVP 186-4 SigVer/SigGen/KeyPair/PKV and ECC CDH rows
+(`tools/gen_vectors.py` regenerates them), and two positive controls — a broken-Solinas-constant
 reduction and a corrupted-comb-table gather — the harness flags RED.
 
 Provenance: clean-room from the NIST P-256 domain parameters. Design

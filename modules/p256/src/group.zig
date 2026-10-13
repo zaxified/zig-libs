@@ -81,7 +81,11 @@ pub const P256 = struct {
         const affine_0 = @intFromBool(p.x.equivalent(AffineCoordinates.identityElement.x)) &
             (@intFromBool(p.y.isZero()) | @intFromBool(p.y.equivalent(AffineCoordinates.identityElement.y)));
         const is_identity = @intFromBool(p.z.isZero()) | affine_0;
-        if (is_identity != 0) return error.IdentityElement;
+        // One branch, on the verdict the error reveals anyway. Laundered so
+        // LLVM computes the whole verdict first instead of branching on its
+        // parts (it split this into two jumps after the 2026-10-13 field
+        // changes — ctgrind counted both in every secret-scalar caller).
+        if (blackBox(is_identity) != 0) return error.IdentityElement;
     }
 
     /// Build a point from affine coordinates, checking the curve equation
@@ -445,39 +449,58 @@ pub const P256 = struct {
     /// GATED Fable core #2a — CONSTANT-TIME windowed variable-base multiply
     /// (secret scalars: ECDH). A fixed-window (w = 5) signed-digit form: the
     /// scalar is recoded branch-free into 52 signed digits d_i ∈ [−16, 15], a
-    /// runtime table of the magnitudes {1..16}·p is built with a PUBLIC
-    /// schedule, and the online phase does 5 doublings + one table add per
-    /// digit, top-down. The per-digit gather is a `blackBox`-guarded masked
-    /// linear scan over ALL sixteen entries at fixed offsets (never secret-
-    /// indexed — the k256/powMont lesson), and the digit sign is applied by a
-    /// masked point negation.
+    /// table of the magnitudes {1..16}·p is built with a PUBLIC schedule and
+    /// made AFFINE by one constant-time batch inversion, and the online phase
+    /// does 5 Jacobian doublings + one table add per digit, top-down. The
+    /// per-digit gather is a `blackBox`-guarded masked linear scan over ALL
+    /// sixteen entries at fixed offsets (never secret-indexed — the
+    /// k256/powMont lesson), and the digit sign is applied by a masked point
+    /// negation.
     ///
-    /// The DOUBLINGS run in Jacobian coordinates (`Jac.dbl`, 3M+5S against the
-    /// complete projective 8M+3S+2m_b), the ADDITION stays the complete RCB
-    /// Algorithm 4 on projective points: each window converts the accumulator
-    /// projective→Jacobian (`(XZ : YZ² : Z)`), doubles five times, converts
-    /// back (`(XZ : Y : Z³)`) and adds — 6 conversion multiplies buy 25 saved
-    /// per window. `Jac.dbl` is exception-free on a prime-order curve (no
-    /// 2-torsion; `Z = 0` stays `Z = 0`), and the only identity the
-    /// accumulator can be in is the leading run of zero digits, which the
-    /// conversion maps to `(1 : 1 : 0)` by a masked select (a fixed point of
-    /// `Jac.dbl` that converts back to std's `(0 : 1 : 0)`), so the addition
-    /// stays complete and nothing branches. Measured 2026-10-10 (ECDH bench):
-    /// 104 µs → see SPEC "Performance". Pinned bit-for-bit (as a point) to
-    /// `mulDoubleAddCt` by the gated differential.
+    /// Since 2026-10-13 the accumulator stays Jacobian throughout and the
+    /// windows above the last add with the INCOMPLETE mixed addition
+    /// (`Jac.addMixedCt`, 7M + 4S, against 6 conversion multiplies + the
+    /// complete RCB addition before). Its exceptional cases cannot occur
+    /// there, and the two that can are masked selects, not branches:
+    ///   * `P = ±Q`: before window i ≥ 1 the accumulator is `32·A·p` with
+    ///     `32·A·2^(5i) = k − Σ_{j≤i} d_j·2^(5j)`, so `|32·A| < 2^256/32 + 17
+    ///     < n/2` for every 256-bit `k` (reduced or not); `32·A ≡ ±d_i (mod n)`
+    ///     with `|d_i| ≤ 16` then forces `32·A = ±d_i` as integers, i.e.
+    ///     `A = 0`.
+    ///   * `A = 0` is exactly "no nonzero digit yet" (once one is, `|32·A| ≥
+    ///     32 > |d|` keeps it nonzero), tracked by the `started` mask: the
+    ///     first nonzero digit loads `(x, y, 1)` instead of the sum.
+    ///   * digit 0 keeps the accumulator (the sum over the all-zero gather is
+    ///     discarded by the `nonzero` mask).
+    /// The LAST window (i = 0), where `k ≡ 2·d_0` could make the operands
+    /// equal, converts to projective and adds with the complete RCB formula.
+    /// Pinned bit-for-bit (as a point) to `mulDoubleAddCt` by the gated
+    /// differential. An identity `p` returns `error.IdentityElement` up front
+    /// (the result is the identity for every scalar) — without a branch on
+    /// the point, which some callers derive from a secret (SPAKE2+): the
+    /// table of an identity `p` is garbage (its `Z`s are 0, the batch
+    /// inverse is 0), the schedule runs unchanged, and a mask taken from
+    /// `p.z` forces the result to the identity before the one
+    /// `rejectIdentity` branch.
     pub fn mulCtWindowed(p: P256, s_: [32]u8, endian: std.builtin.Endian) IdentityElementError!P256 {
+        const pz = p.z.limbs;
+        const pnz: u64 = pz[0] | pz[1] | pz[2] | pz[3];
+        const p_is_identity = blackBox(0 -% (((pnz | (0 -% pnz)) >> 63) ^ 1));
         const k = scalarValue(s_, endian);
         const half: u64 = 1 << (vb_w - 1); // 16
         const twow: u64 = 1 << vb_w; // 32
         const wmask: u64 = twow - 1;
 
         // Magnitude table {1..16}·p — the schedule is public (fixed loop), only
-        // the VALUES are secret-derived, so this is constant-time.
+        // the VALUES are secret-derived, so this is constant-time. Then affine
+        // with one constant-time batch inversion (no `Z` is zero: p has prime
+        // order n > 16; an identity `p` is masked at the end).
         var tab: [vb_teeth]P256 = undefined;
         tab[0] = p;
         tab[1] = p.dbl();
         var j: usize = 2;
         while (j < vb_teeth) : (j += 1) tab[j] = tab[j - 1].add(p);
+        const aff = batchToAffineCt(vb_teeth, &tab);
 
         // Branch-free signed-digit (Booth-style) recoding, bottom-up (the
         // carry propagates upward), stored for the top-down consumption below.
@@ -501,35 +524,38 @@ pub const P256 = struct {
             negs[i] = is_neg;
         }
 
-        // Top-down: acc = 2^w·acc + d_i·p. Fixed trip count, no branch.
-        var acc = P256.identityElement;
+        // Top-down, windows vb_t−1 .. 1: acc = 2^w·acc + d_i·p. Fixed trip
+        // count, no branch.
+        var acc = Jac.identity;
+        var started: u64 = 0; // all ones once a nonzero digit has been added
         i = vb_t;
-        while (i > 0) {
+        while (i > 1) {
             i -= 1;
-            var jac = jacFromProjectiveCt(acc);
-            jac = jac.dbl().dbl().dbl().dbl().dbl();
-            acc = jacToProjectiveCt(jac);
-            var g = P256.identityElement;
-            j = 0;
-            while (j < vb_teeth) : (j += 1) {
-                const match: u64 = @intFromBool(@as(u64, j + 1) == mags[i]);
-                const mask = blackBox(0 -% match);
-                blendLimbs(&g.x, tab[j].x, mask);
-                blendLimbs(&g.y, tab[j].y, mask);
-                blendLimbs(&g.z, tab[j].z, mask);
-            }
-            // Signed digit ⇒ conditional point negation as a masked blend of
-            // the unconditionally-computed −y, with the sign mask laundered
-            // through `blackBox` — a plain `cMov` here was observed to lower
-            // to a secret-dependent branch skipping the negation (the montint
-            // b199192 leak class) in ReleaseFast disasm.
-            const yneg = g.y.neg();
-            const smask = blackBox(0 -% negs[i]);
-            blendLimbs(&g.y, yneg, smask);
-            acc = acc.add(g);
+            acc = acc.dbl().dbl().dbl().dbl().dbl();
+            const g = gatherSigned(&aff, mags[i], negs[i]);
+            const sum = acc.addMixedCt(g);
+            const nonzero = blackBox(0 -% @as(u64, @intFromBool(mags[i] != 0)));
+            var cand = Jac{ .x = g.x, .y = g.y, .z = field.Fe.one };
+            blendJac(&cand, sum, blackBox(started));
+            blendJac(&acc, cand, nonzero);
+            started |= nonzero;
         }
-        try acc.rejectIdentity();
-        return acc;
+
+        // Last window: the complete projective addition (see the doc).
+        acc = acc.dbl().dbl().dbl().dbl().dbl();
+        var res = jacToProjectiveCt(acc);
+        const g0 = gatherSigned(&aff, mags[0], negs[0]);
+        var q = P256{ .x = g0.x, .y = g0.y, .z = field.Fe.one };
+        const zero_digit = blackBox(0 -% @as(u64, @intFromBool(mags[0] == 0)));
+        blendLimbs(&q.x, P256.identityElement.x, zero_digit);
+        blendLimbs(&q.y, P256.identityElement.y, zero_digit);
+        blendLimbs(&q.z, P256.identityElement.z, zero_digit);
+        res = res.add(q);
+        blendLimbs(&res.x, P256.identityElement.x, p_is_identity);
+        blendLimbs(&res.y, P256.identityElement.y, p_is_identity);
+        blendLimbs(&res.z, P256.identityElement.z, p_is_identity);
+        try res.rejectIdentity();
+        return res;
     }
 
     /// CONSTANT-TIME fixed-base multiply `s·G` for a possibly-SECRET scalar (the
@@ -573,7 +599,21 @@ pub const P256 = struct {
     pub fn combMulBaseFastWithTable(tab: *const BaseTable, s_: [32]u8, endian: std.builtin.Endian) IdentityElementError!P256 {
         const k = scalarValue(s_, endian);
 
-        var acc = P256.identityElement;
+        // Jacobian accumulator; windows 0 .. fb_t−2 add with the incomplete
+        // CT mixed addition (`Jac.addMixedCt`, 7M + 4S against the complete
+        // RCB mixed 11M + 2·m_b), the TOP window with the complete formula.
+        // Why the incomplete one is safe below the top (2026-10-13): before
+        // window i the accumulator is `L·G`, `L = Σ_{j<i} d_j·2^(6j)`, and the
+        // entry is `d_i·2^(6i)·G`. `|L| < 2^(6i) ≤ |d_i·2^(6i)| ≤ 2^(6i+5) ≤
+        // 2^251 < n/2` for i ≤ 41, so `L ≢ ±d_i·2^(6i) (mod n)` (P ≠ ±Q), and
+        // `L ≡ 0` only for `L = 0`, i.e. exactly while every lower digit was 0
+        // (the lowest nonzero digit d_m has `0 < |d_m| ≤ 32 < 64`, so it cannot
+        // cancel against multiples of 2^(6m+6)) — the `started` mask, under
+        // which the first nonzero digit LOADS its entry instead of adding.
+        // The top window's entry is up to 16·2^252 > n/2, where that argument
+        // fails, so it stays complete.
+        var acc = Jac.identity;
+        var started: u64 = 0;
         // Signed-digit (Booth-style) recoding with a running carry, folded into
         // the same loop that consumes the digits — fully branchless in `k`.
         // Digit d_i ∈ [−2^(w−1), 2^(w−1)−1], so Σ d_i·2^(w·i) = k exactly and
@@ -623,17 +663,29 @@ pub const P256 = struct {
             const smask = blackBox(0 -% is_neg);
             blendLimbs(&g.y, yneg, smask);
 
-            // Always add (fixed schedule), keep the sum iff the digit was
-            // nonzero. The mixed complete formula handles `acc = identity`.
-            const sum = acc.addMixed(g);
-            const nonzero: u64 = @intFromBool(m != 0);
-            const keep = blackBox(0 -% nonzero);
-            blendLimbs(&acc.x, sum.x, keep);
-            blendLimbs(&acc.y, sum.y, keep);
-            blendLimbs(&acc.z, sum.z, keep);
+            // Always add (fixed schedule), keep the result iff the digit was
+            // nonzero.
+            const nonzero: u64 = blackBox(0 -% @as(u64, @intFromBool(m != 0)));
+            if (i + 1 < fb_t) { // PUBLIC loop index
+                const sum = acc.addMixedCt(g);
+                var cand = Jac{ .x = g.x, .y = g.y, .z = Fe.one };
+                blendJac(&cand, sum, blackBox(started));
+                blendJac(&acc, cand, nonzero);
+                started |= nonzero;
+            } else {
+                // Top window: projective + the complete mixed formula, which
+                // handles `acc = identity` (the `(1 : 1 : 0)` Jacobian
+                // identity converts to `(0 : 1 : 0)`) and `acc = ±g`.
+                var proj = jacToProjectiveCt(acc);
+                const sum = proj.addMixed(g);
+                blendLimbs(&proj.x, sum.x, nonzero);
+                blendLimbs(&proj.y, sum.y, nonzero);
+                blendLimbs(&proj.z, sum.z, nonzero);
+                try proj.rejectIdentity();
+                return proj;
+            }
         }
-        try acc.rejectIdentity();
-        return acc;
+        unreachable;
     }
 
     /// VARIABLE-TIME scalar multiply for a PUBLIC scalar (verification). All
@@ -810,6 +862,26 @@ const Jac = struct {
             if (r.isZero()) return p.dbl(); // P = Q
             return identity; // P = −Q
         }
+        const hh = h.sq();
+        const i = hh.dbl().dbl(); // 4·HH
+        const j = h.mul(i);
+        const v = p.x.mul(i);
+        const x3 = r.sq().sub(j).sub(v.dbl());
+        const y3 = r.mul(v.sub(x3)).sub(p.y.mul(j).dbl());
+        const z3 = p.z.add(h).sq().sub(z1z1).sub(hh);
+        return .{ .x = x3, .y = y3, .z = z3 };
+    }
+
+    /// Mixed addition, `Q` affine (EFD madd-2007-bl), WITHOUT the
+    /// exceptional cases: a fixed schedule, no branch — for the constant-time
+    /// windowed multiply, whose caller rules out `P = O` and `P = ±Q` (see
+    /// `mulCtWindowed`). On those inputs the result is meaningless.
+    fn addMixedCt(p: Jac, q: AffineCoordinates) Jac {
+        const z1z1 = p.z.sq();
+        const uu2 = q.x.mul(z1z1);
+        const s2 = q.y.mul(p.z).mul(z1z1);
+        const h = uu2.sub(p.x);
+        const r = s2.sub(p.y).dbl();
         const hh = h.sq();
         const i = hh.dbl().dbl(); // 4·HH
         const j = h.mul(i);
@@ -1009,23 +1081,6 @@ comptime {
     std.debug.assert((@as(u64, 1) << @intCast(256 - (vb_t - 1) * vb_w)) < (1 << (vb_w - 1)));
 }
 
-/// Projective → Jacobian for the CONSTANT-TIME windowed core: `(XZ : YZ² : Z)`,
-/// except that the identity (`Z = 0`, which this map would send to the
-/// all-zero triple) becomes `(1 : 1 : 0)` by a masked select — a fixed point
-/// of `Jac.dbl` that `jacToProjectiveCt` maps back to `(0 : 1 : 0)`. The
-/// select mask is laundered through `blackBox`; no branch on the point.
-fn jacFromProjectiveCt(p: P256) Jac {
-    var j = Jac.fromProjective(p);
-    const zl = p.z.limbs;
-    const nz: u64 = zl[0] | zl[1] | zl[2] | zl[3];
-    // is_zero = 1 iff nz == 0, without a compare the optimizer can branch on.
-    const is_zero: u64 = ((nz | (0 -% nz)) >> 63) ^ 1;
-    const mask = blackBox(0 -% is_zero);
-    blendLimbs(&j.x, field.Fe.one, mask);
-    blendLimbs(&j.y, field.Fe.one, mask);
-    return j;
-}
-
 /// Jacobian → projective, branch-free: `(XZ : Y : Z³)`. For the `(1 : 1 : 0)`
 /// identity this is `(0 : 1 : 0)` with no special case.
 fn jacToProjectiveCt(p: Jac) P256 {
@@ -1077,6 +1132,52 @@ fn buildBaseTable() BaseTable {
 /// The fixed-base table for G (public constant; see `combMulBaseFast`,
 /// `mulPublic`).
 pub const base_table: BaseTable = buildBaseTable();
+
+/// Projective → affine for `n` points with ONE constant-time inversion
+/// (Montgomery's trick on a fixed schedule; every `Z` must be nonzero — the
+/// caller's table of small multiples of a prime-order point). Constant-time
+/// in the points: `Fe.invert` is, and the rest is multiplies at public
+/// indices.
+fn batchToAffineCt(comptime n: usize, pts: *const [n]P256) [n]AffineCoordinates {
+    var prefix: [n]field.Fe = undefined; // prefix[i] = z_0 ⋯ z_i
+    prefix[0] = pts[0].z;
+    var i: usize = 1;
+    while (i < n) : (i += 1) prefix[i] = prefix[i - 1].mul(pts[i].z);
+    var inv = prefix[n - 1].invert();
+    var out: [n]AffineCoordinates = undefined;
+    i = n;
+    while (i > 1) {
+        i -= 1;
+        const zinv = inv.mul(prefix[i - 1]);
+        inv = inv.mul(pts[i].z);
+        out[i] = .{ .x = pts[i].x.mul(zinv), .y = pts[i].y.mul(zinv) };
+    }
+    out[0] = .{ .x = pts[0].x.mul(inv), .y = pts[0].y.mul(inv) };
+    return out;
+}
+
+/// CONSTANT-TIME gather of `±tab[mag − 1]` (`mag` ∈ [0, 16], 0 → the
+/// all-zero non-point, which every caller masks away): a masked scan over
+/// every entry, then a masked negation by `neg` (0/1). Masks laundered.
+inline fn gatherSigned(tab: *const [vb_teeth]AffineCoordinates, mag: u64, neg: u64) AffineCoordinates {
+    var g = AffineCoordinates{ .x = field.Fe.zero, .y = field.Fe.zero };
+    var j: usize = 0;
+    while (j < vb_teeth) : (j += 1) {
+        const match: u64 = @intFromBool(@as(u64, j + 1) == mag);
+        const mask = blackBox(0 -% match);
+        blendLimbs(&g.x, tab[j].x, mask);
+        blendLimbs(&g.y, tab[j].y, mask);
+    }
+    const yneg = g.y.neg();
+    blendLimbs(&g.y, yneg, blackBox(0 -% neg));
+    return g;
+}
+
+inline fn blendJac(dst: *Jac, src: Jac, mask: u64) void {
+    blendLimbs(&dst.x, src.x, mask);
+    blendLimbs(&dst.y, src.y, mask);
+    blendLimbs(&dst.z, src.z, mask);
+}
 
 /// Optimization barrier (montint `b199192`): launder a value through an empty
 /// inline-asm so LLVM loses all equality/range knowledge about it. Applied to

@@ -22,6 +22,7 @@
 //! POSITIVE control (a call that parks `d` in a local, must find it).
 
 const std = @import("std");
+const burn = @import("burn.zig");
 const builtin = @import("builtin");
 const p256 = @import("root.zig");
 
@@ -343,6 +344,19 @@ noinline fn callFromSecretKey() void {
 
 noinline fn callEcdh() void {
     cur_peer.mulInto(&shared_sink, &cur_sk, .big) catch unreachable;
+    sinkSharedX();
+    burn.stack(burn.affine_burn);
+}
+
+/// The affine conversion of the shared point, one frame down and burned —
+/// what `ecdhInto` does inside the module. `affineCoordinates` returns the
+/// point by value, so its return slot is in the CALLER's frame and is the
+/// caller's to wipe (a `secureZero` of the local is not enough: LLVM keeps
+/// the slot separate from the variable). Until 2026-10-13 a later write
+/// happened to overwrite that slot here; after that day's field changes it
+/// survived (RESIDUE "shared x fe", 127..143 B below the region top), which
+/// says nothing about `mulInto`, the subject of this probe.
+noinline fn sinkSharedX() void {
     shared_x_sink = shared_sink.affineCoordinates().x.toBytes(.big);
 }
 
@@ -393,6 +407,34 @@ test "STACKPROBE: no key residue on the dead stack after KeyPair.fromSecretKey a
         n.addImage("shared x fe", std.mem.asBytes(&shared.x));
         n.sort();
         bad += try runProbe("ECDH P256.mulInto", callEcdh, &n);
+    }
+    try std.testing.expectEqual(@as(usize, 0), bad);
+}
+
+var cur_peer_sec1: [65]u8 = undefined;
+
+noinline fn callEcdhInto() void {
+    p256.ecdhInto(&shared_x_sink, &cur_sk, &cur_peer_sec1) catch unreachable;
+}
+
+test "STACKPROBE: no key or shared-point residue on the dead stack after ecdhInto" {
+    try skipUnlessOptimized();
+    var bad: usize = 0;
+    for (0..n_cases) |ci| {
+        cur_sk = caseKey(@intCast(ci));
+        leak_src = cur_sk;
+        cur_peer = try P256.basePoint.mul(caseKey(0xee), .big);
+        cur_peer_sec1 = cur_peer.toUncompressedSec1();
+
+        const shared = (try cur_peer.mul(cur_sk, .big)).affineCoordinates();
+        var n: Needles = .{};
+        n.addScalar("d", try Scalar.fromBytes(cur_sk, .big));
+        n.addBytes32("shared x", shared.x.toBytes(.big));
+        n.addBytes32("shared y", shared.y.toBytes(.big));
+        n.addImage("shared x fe", std.mem.asBytes(&shared.x));
+        n.addImage("shared y fe", std.mem.asBytes(&shared.y));
+        n.sort();
+        bad += try runProbe("ecdhInto", callEcdhInto, &n);
     }
     try std.testing.expectEqual(@as(usize, 0), bad);
 }

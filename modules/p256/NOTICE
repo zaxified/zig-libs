@@ -151,6 +151,36 @@ both return HTTP 404 while `.../LICENSE` returns 200. So §4(d) requires nothing
 here, and this file propagates no upstream NOTICE text because there is none to
 propagate.
 
+Added 2026-10-13: ECDH and further ECDSA vectors
+------------------------------------------------
+
+`src/wycheproof_ecdsa_vectors.zig` and `src/wycheproof_ecdh_vectors.zig`
+reproduce more Wycheproof data, from the same upstream
+(https://raw.githubusercontent.com/C2SP/wycheproof/main/testvectors_v1/,
+fetched 2026-10-13; sha256 sums in `tools/gen_vectors.py`), under the same
+conditions and the same copyright notice as above:
+
+  - `ecdsa_secp256r1_sha512_test.json` (DER): all 554 rows;
+  - `ecdsa_secp256r1_sha512_p1363_test.json`: 311 of 332 rows;
+  - `ecdsa_secp256r1_sha3_256_test.json` (DER): all 482 rows;
+  - `ecdh_secp256r1_test.json`: 363 of 612 rows.
+
+Data only (keys, messages, signatures, shared secrets, results, test ids); no
+code and no `comment`/`notes` prose. The changes, per Apache-2.0 §4(b), are the
+ones `tools/gen_vectors.py` makes: each test becomes a Zig struct literal
+keeping `tcId`, `msg`, `sig` (ECDSA) or `public`, `private`, `shared` (ECDH)
+and `result` (all three values kept, `acceptable` included), plus the group's
+`publicKey.uncompressed`; P1363 rows whose signature is not 64 bytes are
+omitted (the API's type is `[64]u8`); ECDH `public` is a DER
+SubjectPublicKeyInfo upstream, of which only the rows naming secp256r1 in
+strict DER are kept, stored as the SEC1 point taken out of it (249 rows
+dropped: they test an ASN.1 parser, which this module does not have), and
+`private` is left-padded to 32 bytes or stripped of a leading zero sign byte.
+Each generated file's header names the generator, the upstream file and the
+counts. `src/cavp_vectors.zig` holds NIST CAVP P-256 vectors (a US Government
+work, public domain). The two Wycheproof files carry
+`SPDX-License-Identifier: Apache-2.0`.
+
 Scope of this file
 ------------------
 

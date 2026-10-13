@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-07-18 · mutation 2026-10-04 (43/47, 3 eq) · src ?
 
-**Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, ACME_FUZZ) · ct 2026-10-13 (ctgrind: P-256 account / certificate scalar through jws.sign, x509.csrDer, ecPrivateKeyToPem/FromPem; 57 / 21 / 12 in-file = jws 13 delegated p256 signer + 44 base64 of the public signature, csr 13 signer + 8 Signature.toDer trimming, pem 12 = PEM layout decisions, the b64ct validity verdict, the DER length byte sharing a base64 character with key bits, p256 comb; the first measurement found std base64 indexing its table by the key in the key PEM paths (16 + 5 contexts) — fixed the same day with `b64ct.zig` and wiped stack buffers, itemised in `scripts/checks/ctgrind-expected.tsv`)
+**Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, ACME_FUZZ) · ct 2026-10-13 (ctgrind: P-256 account / certificate scalar through jws.sign, x509.csrDer, ecPrivateKeyToPem/FromPem; 57 / 21 / 12 in-file = jws 13 delegated p256 signer + 44 base64 of the public signature, csr 13 signer + 8 Signature.toDer trimming, pem 11 (12 until 2026-10-13: p256's `rejectIdentity` now one jump) = PEM layout decisions, the b64ct validity verdict, the DER length byte sharing a base64 character with key bits, p256 comb; the first measurement found std base64 indexing its table by the key in the key PEM paths (16 + 5 contexts) — fixed the same day with `b64ct.zig` and wiped stack buffers, itemised in `scripts/checks/ctgrind-expected.tsv`)
 
 **Performance:** n/a — the work is bound by network and CA round trips; the CPU parts are the crypto modules', measured on their own cards, and x/crypto/acme's JWS code is unexported (2026-10-10)
 

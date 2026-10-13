@@ -273,9 +273,7 @@ pub fn montSqPortable(a: [4]u64) [4]u64 {
 
 inline fn montMulLimbs(a: [4]u64, b: [4]u64) [4]u64 {
     if (field_asm_active and !@inComptime()) {
-        var z: [4]u64 = undefined;
-        fast_core.montMul(&z, &a, &b);
-        return z;
+        return fast_core.montMulRegs(&a, &b);
     }
     return montMulPortable(a, b);
 }
@@ -448,6 +446,7 @@ pub const Fe = struct {
     /// is needed. The 0/1 keep bit is laundered through `blackBox` so the
     /// masked select cannot become a branch (see the barrier note above).
     pub fn add(a: Fe, b: Fe) Fe {
+        if (field_asm_active and !@inComptime()) return .{ .limbs = fast_core.addRegs(a.limbs, b.limbs) };
         const s = @addWithOverflow(a.value(), b.value());
         const d = @subWithOverflow(s[0], field_order);
         // keep the sum iff no carry and a borrow (i.e. the true sum is < p).
@@ -463,6 +462,7 @@ pub const Fe = struct {
 
     /// `(a − b) mod p`, constant-time.
     pub fn sub(a: Fe, b: Fe) Fe {
+        if (field_asm_active and !@inComptime()) return .{ .limbs = fast_core.subRegs(a.limbs, b.limbs) };
         const d = @subWithOverflow(a.value(), b.value());
         // On borrow, add p back once (a,b < p ⇒ result lands in [0, p)). The
         // borrow bit is laundered through `blackBox` so the masked add does not
@@ -489,9 +489,7 @@ pub const Fe = struct {
     /// `a² mod p`. Dispatches like `mul` (same comptime/asm split).
     pub fn sq(a: Fe) Fe {
         if (field_asm_active and !@inComptime()) {
-            var z: [4]u64 = undefined;
-            fast_core.montSq(&z, &a.limbs);
-            return .{ .limbs = z };
+            return .{ .limbs = fast_core.montSqRegs(&a.limbs) };
         }
         return .{ .limbs = montSqPortable(a.limbs) };
     }

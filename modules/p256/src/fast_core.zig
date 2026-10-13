@@ -556,7 +556,7 @@ fn fieldSqAmd64(z: *[4]u64, a: *const [4]u64) void {
 // Constant-time: straight-line, no branch, no secret-indexed address, only
 // DIT-set instructions; the final select is the same `sbb` mask + XOR-blend as
 // the Solinas tail. Clobbers rax, rbx, rcx, rdx, rsi, r8..r15, flags.
-const mont_reduce =
+const mont_reduce_core =
     \\ movabsq $0xFFFFFFFF00000001, %%rsi
     // round 0: m = r8; (r8,r9,r10,r11) -> (r9,r10,r11,r8)
     \\ movq %%r8, %%rdx
@@ -609,29 +609,29 @@ const mont_reduce =
     \\ adcq %%r14, %%r10
     \\ adcq %%r15, %%r11
     \\ adcq $0, %%rax
-    // diff = acc - p
+    // acc − p in place; `carry − borrow` (rax) is then 0 (keep acc − p) or
+    // all ones (acc < p: add p back) — the borrow implies carry 0, and a
+    // carry implies a borrow, so it is never −2. p masked by it is added
+    // back: p0 = mask, p1 = mask & (2^32 − 1), p2 = 0, p3 = mask & rsi. Twelve
+    // instructions against the twenty-two of a subtract into copies and an
+    // XOR-blend (2026-10-13); branch-free, no CMOV.
     \\ movl $4294967295, %%ecx
-    \\ movq %%r8, %%r12
-    \\ subq $-1, %%r12
-    \\ movq %%r9, %%r13
-    \\ sbbq %%rcx, %%r13
-    \\ movq %%r10, %%r14
-    \\ sbbq $0, %%r14
-    \\ movq %%r11, %%r15
-    \\ sbbq %%rsi, %%r15
+    \\ subq $-1, %%r8
+    \\ sbbq %%rcx, %%r9
+    \\ sbbq $0, %%r10
+    \\ sbbq %%rsi, %%r11
     \\ sbbq $0, %%rax
-    \\ xorq %%r12, %%r8
-    \\ andq %%rax, %%r8
-    \\ xorq %%r12, %%r8
-    \\ xorq %%r13, %%r9
-    \\ andq %%rax, %%r9
-    \\ xorq %%r13, %%r9
-    \\ xorq %%r14, %%r10
-    \\ andq %%rax, %%r10
-    \\ xorq %%r14, %%r10
-    \\ xorq %%r15, %%r11
-    \\ andq %%rax, %%r11
-    \\ xorq %%r15, %%r11
+    \\ andq %%rax, %%rcx
+    \\ andq %%rax, %%rsi
+    \\ addq %%rax, %%r8
+    \\ adcq %%rcx, %%r9
+    \\ adcq $0, %%r10
+    \\ adcq %%rsi, %%r11
+;
+
+/// `mont_reduce_core` + the store of the result to `z` (rdi).
+const mont_reduce = mont_reduce_core ++
+    \\
     \\ movq %%r8, (%%rdi)
     \\ movq %%r9, 8(%%rdi)
     \\ movq %%r10, 16(%%rdi)
@@ -692,4 +692,307 @@ fn montSqAmd64(z: *[4]u64, a: *const [4]u64) void {
         : [zp] "{rdi}" (z),
           [ap] "{rsi}" (a),
         : .{ .r8 = true, .r9 = true, .r10 = true, .r11 = true, .r12 = true, .r13 = true, .r14 = true, .r15 = true, .cc = true, .memory = true });
+}
+
+// ── interleaved (CIOS) Montgomery multiply — the register-returning hot path ──
+//
+// Each row `a·b_i` is accumulated into a rotating 5-limb window and the
+// window's low limb is reduced right away (`m = t0`, the same two shifts and
+// one `MULX` by `p3` as `mont_reduce_core`), so the reduction of row i runs
+// while row i+1 multiplies instead of after the whole 512-bit product: the
+// critical path through a field multiply is what bounds the point doubling
+// chain (measured 2026-10-13: 14 % fewer instructions in `Jac.dbl` from the
+// cheaper tails moved ECDH by nothing). Invariant after every round: window
+// value < 2p (a, b < p), so five limbs suffice, the top one ∈ {0,1} at the
+// end, and one masked subtract canonicalises. Straight-line, no branch, no
+// CMOV, DIT-set instructions only. Pinned to `field.montMulPortable` by the
+// gated differential. rsi = a, rbx = b (neither modified); out in r12, r13,
+// r8, r9.
+const mont_mul_cios =
+    \\ movabsq $0xFFFFFFFF00000001, %%rdi
+    // round 0: (r8..r12) = a·b0, then reduce on r8 into (r9..r12, r13)
+    \\ movq (%%rbx), %%rdx
+    \\ mulxq (%%rsi), %%r8, %%r9
+    \\ mulxq 8(%%rsi), %%rax, %%r10
+    \\ addq %%rax, %%r9
+    \\ mulxq 16(%%rsi), %%rax, %%r11
+    \\ adcq %%rax, %%r10
+    \\ mulxq 24(%%rsi), %%rax, %%r12
+    \\ adcq %%rax, %%r11
+    \\ adcq $0, %%r12
+    \\ movl $0, %%r13d
+    \\ movq %%r8, %%rdx
+    \\ mulxq %%rdi, %%rax, %%rcx
+    \\ movq %%r8, %%r14
+    \\ shlq $32, %%r14
+    \\ shrq $32, %%r8
+    \\ addq %%r14, %%r9
+    \\ adcq %%r8, %%r10
+    \\ adcq %%rax, %%r11
+    \\ adcq %%rcx, %%r12
+    \\ adcq $0, %%r13
+    // round 1: window (r9,r10,r11,r12,r13) += a·b1, top in r8; reduce on r9
+    \\ movq 8(%%rbx), %%rdx
+    \\ xorl %%r8d, %%r8d
+    \\ mulxq (%%rsi), %%rax, %%rcx
+    \\ adcxq %%rax, %%r9
+    \\ adoxq %%rcx, %%r10
+    \\ mulxq 8(%%rsi), %%rax, %%rcx
+    \\ adcxq %%rax, %%r10
+    \\ adoxq %%rcx, %%r11
+    \\ mulxq 16(%%rsi), %%rax, %%rcx
+    \\ adcxq %%rax, %%r11
+    \\ adoxq %%rcx, %%r12
+    \\ mulxq 24(%%rsi), %%rax, %%rcx
+    \\ adcxq %%rax, %%r12
+    \\ adoxq %%rcx, %%r13
+    \\ adcxq %%r8, %%r13
+    \\ adoxq %%r8, %%r8
+    \\ movl $0, %%eax
+    \\ adcxq %%rax, %%r8
+    \\ movq %%r9, %%rdx
+    \\ mulxq %%rdi, %%rax, %%rcx
+    \\ movq %%r9, %%r14
+    \\ shlq $32, %%r14
+    \\ shrq $32, %%r9
+    \\ addq %%r14, %%r10
+    \\ adcq %%r9, %%r11
+    \\ adcq %%rax, %%r12
+    \\ adcq %%rcx, %%r13
+    \\ adcq $0, %%r8
+    // round 2: window (r10,r11,r12,r13,r8) += a·b2, top in r9; reduce on r10
+    \\ movq 16(%%rbx), %%rdx
+    \\ xorl %%r9d, %%r9d
+    \\ mulxq (%%rsi), %%rax, %%rcx
+    \\ adcxq %%rax, %%r10
+    \\ adoxq %%rcx, %%r11
+    \\ mulxq 8(%%rsi), %%rax, %%rcx
+    \\ adcxq %%rax, %%r11
+    \\ adoxq %%rcx, %%r12
+    \\ mulxq 16(%%rsi), %%rax, %%rcx
+    \\ adcxq %%rax, %%r12
+    \\ adoxq %%rcx, %%r13
+    \\ mulxq 24(%%rsi), %%rax, %%rcx
+    \\ adcxq %%rax, %%r13
+    \\ adoxq %%rcx, %%r8
+    \\ adcxq %%r9, %%r8
+    \\ adoxq %%r9, %%r9
+    \\ movl $0, %%eax
+    \\ adcxq %%rax, %%r9
+    \\ movq %%r10, %%rdx
+    \\ mulxq %%rdi, %%rax, %%rcx
+    \\ movq %%r10, %%r14
+    \\ shlq $32, %%r14
+    \\ shrq $32, %%r10
+    \\ addq %%r14, %%r11
+    \\ adcq %%r10, %%r12
+    \\ adcq %%rax, %%r13
+    \\ adcq %%rcx, %%r8
+    \\ adcq $0, %%r9
+    // round 3: window (r11,r12,r13,r8,r9) += a·b3, top in r10; reduce on r11
+    \\ movq 24(%%rbx), %%rdx
+    \\ xorl %%r10d, %%r10d
+    \\ mulxq (%%rsi), %%rax, %%rcx
+    \\ adcxq %%rax, %%r11
+    \\ adoxq %%rcx, %%r12
+    \\ mulxq 8(%%rsi), %%rax, %%rcx
+    \\ adcxq %%rax, %%r12
+    \\ adoxq %%rcx, %%r13
+    \\ mulxq 16(%%rsi), %%rax, %%rcx
+    \\ adcxq %%rax, %%r13
+    \\ adoxq %%rcx, %%r8
+    \\ mulxq 24(%%rsi), %%rax, %%rcx
+    \\ adcxq %%rax, %%r8
+    \\ adoxq %%rcx, %%r9
+    \\ adcxq %%r10, %%r9
+    \\ adoxq %%r10, %%r10
+    \\ movl $0, %%eax
+    \\ adcxq %%rax, %%r10
+    \\ movq %%r11, %%rdx
+    \\ mulxq %%rdi, %%rax, %%rcx
+    \\ movq %%r11, %%r14
+    \\ shlq $32, %%r14
+    \\ shrq $32, %%r11
+    \\ addq %%r14, %%r12
+    \\ adcq %%r11, %%r13
+    \\ adcq %%rax, %%r8
+    \\ adcq %%rcx, %%r9
+    \\ adcq $0, %%r10
+    // value < 2p in (r12, r13, r8, r9) + r10 ∈ {0,1}: subtract p in place, add it back masked
+    \\ movl $4294967295, %%ecx
+    \\ subq $-1, %%r12
+    \\ sbbq %%rcx, %%r13
+    \\ sbbq $0, %%r8
+    \\ sbbq %%rdi, %%r9
+    \\ sbbq $0, %%r10
+    \\ andq %%r10, %%rcx
+    \\ andq %%r10, %%rdi
+    \\ addq %%r10, %%r12
+    \\ adcq %%rcx, %%r13
+    \\ adcq $0, %%r8
+    \\ adcq %%rdi, %%r9
+;
+
+/// `montMul` returning the product in registers instead of storing it through
+/// a pointer: the caller's frame gets no out-buffer to fill and reload, so a
+/// chain of field operations keeps its values in registers between multiplies.
+pub fn montMulRegs(a: *const [4]u64, b: *const [4]u64) [4]u64 {
+    if (comptime !supported) unreachable;
+    var r0: u64 = undefined;
+    var r1: u64 = undefined;
+    var r2: u64 = undefined;
+    var r3: u64 = undefined;
+    var d0: u64 = undefined;
+    var d1: u64 = undefined;
+    var d2: u64 = undefined;
+    var d3: u64 = undefined;
+    var d4: u64 = undefined;
+    var d5: u64 = undefined;
+    asm volatile (mont_mul_cios
+        : [r0] "={r12}" (r0),
+          [r1] "={r13}" (r1),
+          [r2] "={r8}" (r2),
+          [r3] "={r9}" (r3),
+          [d0] "={rax}" (d0),
+          [d1] "={rcx}" (d1),
+          [d2] "={rdx}" (d2),
+          [d3] "={rdi}" (d3),
+          [d4] "={r10}" (d4),
+          [d5] "={r14}" (d5),
+        : [ap] "{rsi}" (a),
+          [bp] "{rbx}" (b),
+        : .{ .r11 = true, .cc = true, .memory = true });
+    return .{ r0, r1, r2, r3 };
+}
+
+/// `montSq` returning the square in registers (see `montMulRegs`).
+pub fn montSqRegs(a: *const [4]u64) [4]u64 {
+    if (comptime !supported) unreachable;
+    var r0: u64 = undefined;
+    var r1: u64 = undefined;
+    var r2: u64 = undefined;
+    var r3: u64 = undefined;
+    var d0: u64 = undefined;
+    var d1: u64 = undefined;
+    var d2: u64 = undefined;
+    var d3: u64 = undefined;
+    var d4: u64 = undefined;
+    asm volatile (sq_product ++ "\n" ++ mont_reduce_core
+        : [r0] "={r8}" (r0),
+          [r1] "={r9}" (r1),
+          [r2] "={r10}" (r2),
+          [r3] "={r11}" (r3),
+          [d0] "={rax}" (d0),
+          [d1] "={rcx}" (d1),
+          [d2] "={rdx}" (d2),
+          [d3] "={rsi}" (d3),
+          [d4] "={rbx}" (d4),
+        : [ap] "{rsi}" (a),
+        : .{ .r12 = true, .r13 = true, .r14 = true, .r15 = true, .cc = true, .memory = true });
+    return .{ r0, r1, r2, r3 };
+}
+
+/// `(a + b) mod p` for canonical `a`, `b`, in registers — the amd64 twin of
+/// `field.Fe.add`'s portable body. LLVM lowers the portable u256 version with
+/// `setb` to memory and a chain of `sbb $0` mask builds (about forty
+/// instructions and stack traffic); this is nineteen, with no memory operand.
+/// `p` is subtracted from the sum in place; the carry out of the add is
+/// collected into `c` (0/1) and `c − borrow` is then 0 (the sum was ≥ p: keep
+/// the difference) or all ones (sum < p: add `p` back, masked — the same
+/// tail as `mont_reduce_core`). Straight-line, no branch, no CMOV, DIT-set
+/// instructions only.
+pub fn addRegs(a: [4]u64, b: [4]u64) [4]u64 {
+    if (comptime !supported) unreachable;
+    var r0: u64 = undefined;
+    var r1: u64 = undefined;
+    var r2: u64 = undefined;
+    var r3: u64 = undefined;
+    var c: u64 = undefined;
+    var k: u64 = undefined;
+    var k3: u64 = undefined;
+    asm (
+        \\ movq $0, %[c]
+        \\ addq %[b0], %[r0]
+        \\ adcq %[b1], %[r1]
+        \\ adcq %[b2], %[r2]
+        \\ adcq %[b3], %[r3]
+        \\ adcq $0, %[c]
+        \\ subq $-1, %[r0]
+        \\ movabsq $0xffffffff, %[k]
+        \\ sbbq %[k], %[r1]
+        \\ sbbq $0, %[r2]
+        \\ movabsq $0xffffffff00000001, %[k3]
+        \\ sbbq %[k3], %[r3]
+        \\ sbbq $0, %[c]
+        \\ andq %[c], %[k]
+        \\ andq %[c], %[k3]
+        \\ addq %[c], %[r0]
+        \\ adcq %[k], %[r1]
+        \\ adcq $0, %[r2]
+        \\ adcq %[k3], %[r3]
+        : [r0] "=r" (r0),
+          [r1] "=r" (r1),
+          [r2] "=r" (r2),
+          [r3] "=r" (r3),
+          [c] "=&r" (c),
+          [k] "=&r" (k),
+          [k3] "=&r" (k3),
+        : [a0] "0" (a[0]),
+          [a1] "1" (a[1]),
+          [a2] "2" (a[2]),
+          [a3] "3" (a[3]),
+          [b0] "r" (b[0]),
+          [b1] "r" (b[1]),
+          [b2] "r" (b[2]),
+          [b3] "r" (b[3]),
+        : .{ .cc = true });
+    return .{ r0, r1, r2, r3 };
+}
+
+/// `(a − b) mod p` for canonical `a`, `b`, in registers — the amd64 twin of
+/// `field.Fe.sub`. On a borrow, `p` masked by the all-ones borrow mask is
+/// added back once (`p0 = 2^64 − 1` is the mask itself, `p1 = mask >> 32`,
+/// `p2 = 0`, `p3 = mask & (2^64 − 2^32 + 1)`). Straight-line, no branch.
+pub fn subRegs(a: [4]u64, b: [4]u64) [4]u64 {
+    if (comptime !supported) unreachable;
+    var r0: u64 = undefined;
+    var r1: u64 = undefined;
+    var r2: u64 = undefined;
+    var r3: u64 = undefined;
+    var t0: u64 = undefined;
+    var t1: u64 = undefined;
+    var t2: u64 = undefined;
+    var t3: u64 = undefined;
+    asm (
+        \\ subq %[t0], %[r0]
+        \\ sbbq %[t1], %[r1]
+        \\ sbbq %[t2], %[r2]
+        \\ sbbq %[t3], %[r3]
+        \\ sbbq %[t0], %[t0]
+        \\ movq %[t0], %[t1]
+        \\ shrq $32, %[t1]
+        \\ movabsq $0xffffffff00000001, %[t2]
+        \\ andq %[t0], %[t2]
+        \\ addq %[t0], %[r0]
+        \\ adcq %[t1], %[r1]
+        \\ adcq $0, %[r2]
+        \\ adcq %[t2], %[r3]
+        : [r0] "=r" (r0),
+          [r1] "=r" (r1),
+          [r2] "=r" (r2),
+          [r3] "=r" (r3),
+          [t0] "=r" (t0),
+          [t1] "=r" (t1),
+          [t2] "=r" (t2),
+          [t3] "=r" (t3),
+        : [a0] "0" (a[0]),
+          [a1] "1" (a[1]),
+          [a2] "2" (a[2]),
+          [a3] "3" (a[3]),
+          [b0] "4" (b[0]),
+          [b1] "5" (b[1]),
+          [b2] "6" (b[2]),
+          [b3] "7" (b[3]),
+        : .{ .cc = true });
+    return .{ r0, r1, r2, r3 };
 }

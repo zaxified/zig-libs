@@ -30,6 +30,7 @@
 //! See `gate.zig`, `fast_core.zig`, `SPEC.md`.
 
 const std = @import("std");
+const ecdh_impl = @import("ecdh.zig");
 
 pub const field = @import("field.zig");
 pub const group = @import("group.zig");
@@ -54,6 +55,21 @@ pub const Scalar = scalar.Scalar;
 /// codecs). Sign commits `k·G` constant-time; `verify` is vartime on public
 /// inputs. Rewired onto by jwt (ES256) + jwe (ECDH-ES). See `sign.zig`.
 pub const EcdsaP256Sha256 = sign.EcdsaP256Sha256;
+
+/// ECDSA over P-256 with any hash (`Ecdsa(Sha384)`, `Ecdsa(Sha512)`,
+/// `Ecdsa(Sha3_256)`, …): `EcdsaP256Sha256`'s surface and burns over std's
+/// `Ecdsa(P256, Hash)` scaffold; a digest longer than 32 bytes is truncated
+/// to its leftmost 256 bits (bits2int). `EcdsaP256Sha256 = Ecdsa(Sha256)`.
+pub const Ecdsa = sign.Ecdsa;
+
+/// What `ecdh` can fail with.
+pub const EcdhError = ecdh_impl.EcdhError;
+/// ECDH (SP 800-56A §5.7.1.2): the x-coordinate of `secret · peer`, 32 bytes
+/// big-endian. `secret` in [1, n − 1], `peer_sec1` a compressed or
+/// uncompressed SEC1 point (validated, not the identity). `ecdhInto` is the
+/// dead-stack-clean form. See `ecdh.zig`.
+pub const ecdh = ecdh_impl.ecdh;
+pub const ecdhInto = ecdh_impl.ecdhInto;
 
 /// True iff the field multiply/square hot path is running on the amd64
 /// `MULX/ADX` core rather than the portable Solinas reduction. Both gates are
@@ -85,11 +101,16 @@ test {
     _ = scalar;
     _ = modinv;
     _ = sign;
+    _ = ecdh_impl;
     _ = @import("kat_vectors.zig");
     _ = @import("kat_test.zig");
     _ = @import("wycheproof_kat_vectors.zig");
     _ = @import("wycheproof_der_kat_vectors.zig");
     _ = @import("wycheproof_kat_test.zig");
+    _ = @import("cavp_vectors.zig");
+    _ = @import("cavp_wycheproof_test.zig");
+    _ = @import("wycheproof_ecdsa_vectors.zig");
+    _ = @import("wycheproof_ecdh_vectors.zig");
     _ = @import("oracle_test.zig");
     _ = @import("bench.zig");
     _ = @import("stackprobe_test.zig");

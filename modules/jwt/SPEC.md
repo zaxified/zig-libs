@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-01 · mutation 2026-10-04 (105/111, 6 eq) · src ?
 
-**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, JWT_FUZZ) · ct 2026-10-13 (ctgrind: HMAC secrets HS256/384/512 sign + verify accept/reject, ES256/ES384/ES512/EdDSA signing keys, RS256/PS256 rsa secret members tainted; hmac 0 in-file, ec 10 in-file = ES256 9 delegated p256/std signer contexts (ES384 via p384 and ES512 via p521: 0) + 1 jwt-own `rejectIdentity` on R in the EdDSA signer, rsa 2 in-file = the rsa module's F3 fault-check verdict, one per signature; itemised in scripts/checks/ctgrind-expected.tsv)
+**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, JWT_FUZZ) · ct 2026-10-13 (ctgrind: HMAC secrets HS256/384/512 sign + verify accept/reject, ES256/ES384/ES512/EdDSA signing keys, RS256/PS256 rsa secret members tainted; hmac 0 in-file, ec 9 in-file = ES256 8 delegated p256/std signer contexts (9 until 2026-10-13, when p256's `rejectIdentity` went from two jumps to one) (ES384 via p384 and ES512 via p521: 0) + 1 jwt-own `rejectIdentity` on R in the EdDSA signer, rsa 2 in-file = the rsa module's F3 fault-check verdict, one per signature; itemised in scripts/checks/ctgrind-expected.tsv)
 
 **Performance:** ref 0.20–0.99× golang-jwt v5.3.1 (Go 1.26.0) · fastest ? (measured 2026-10-13)
 
