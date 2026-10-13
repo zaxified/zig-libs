@@ -33,7 +33,7 @@ to show what a "real TSDB" user expects; this module is a storage layer over `kv
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [prometheus/prometheus](https://github.com/prometheus/prometheus) `tsdb` — **reference** | Go | Apache-2.0 | 66.3k | v3.15.0 (2026-09-25) | Gorilla-style compressed chunks, WAL, inverted label index with matchers (`=`, `!=`, regex), time and size retention, series deletion, compaction. This module has exact-label lookup + name-scoped superset filter, time retention and a size budget, but one uncompressed key per sample. |
+| [prometheus/prometheus](https://github.com/prometheus/prometheus) `tsdb` — **reference** | Go | Apache-2.0 | 66.3k | v3.15.0 (2026-09-25) | Gorilla-style compressed chunks, WAL, inverted label index with matchers (`=`, `!=`, regex), time and size retention, series deletion, compaction. This module has exact-label lookup + name-scoped superset filter, time retention, a size budget, Gorilla-compressed blocks (`compact`) and `deleteSeries`; no regex/negative matchers. |
 | [nakabonne/tstorage](https://github.com/nakabonne/tstorage) | Go | Apache-2.0 | 1.3k | v0.3.6 (2023-03-24), pushed 2026-03 | Embeddable library: time-partitioned storage with `InsertRows`/`Select`, in-memory default, disk mode. Its README (read this run) leads with ingestion speed; compression/WAL details not verified *(inferred)*. |
 | [VictoriaMetrics/VictoriaMetrics](https://github.com/VictoriaMetrics/VictoriaMetrics) | Go | Apache-2.0 | 17.8k | v1.153.0 (2026-09-28) | A server: strong compression, downsampling, MetricsQL. Not an embeddable library *(inferred)*. |
 | [influxdata/influxdb](https://github.com/influxdata/influxdb) | Rust | Apache-2.0 | 31.8k | v3.11.4 (2026-09-08) | A server with SQL/InfluxQL; the TSM row-key shape this module's key codec follows is v1/v2-era. |
@@ -228,10 +228,11 @@ for every series in it (not just the one it failed in), and a `kv.SimStorage` cr
 batch of three series asserts all three end up with the SAME point count (0 or the full batch) —
 never a partial set.
 
-**A size budget (`Db.liveSize`, `Db.sweepToBudget`).** kvtree never shrinks its file — the
-high-water mark only grows, and it exposes no compaction/vacuum operation that would repack the
-file smaller (checked directly against `kvtree.Db`'s public API: there is none). So a byte BUDGET
-can only ever be a budget on LIVE data, never on file size. Retention does bound the file,
+**A size budget (`Db.liveSize`, `Db.sweepToBudget`).** kvtree exposes no compaction/vacuum
+operation that would repack the file smaller (checked against `kvtree.Db`'s public API when this
+was written; since 2026-09-29 it does give back a run of free pages at the END of the file,
+`Options.shrink_min_pages`). So a byte BUDGET can only ever be a budget on LIVE data, never on
+file size. Retention does bound the file,
 though: kvtree drops the leaves a sweep empties and recycles their pages (since 2026-09-28 —
 before, a time series never wrote those key ranges again, and the file grew ~60 KiB per 1000
 points appended and swept, linearly; the test "retention bounds the file" pins the steady size
@@ -337,14 +338,14 @@ their samples are raw until `compact` runs.
 - **Not concurrency-safe by itself.** `single_owner`, inherited: one writer at a
   time. A `Range` holds an MVCC snapshot, so a leaked `Range` pins kvtree's page
   reclaim — hence `defer r.deinit()`.
-- **Inherited caveats from kvtree**, unchanged and not re-argued here:
-  merge-less deletes (emptied leaves persist until overwritten — space, never
-  correctness), a single bounded freelist page, no overflow pages.
+- **Inherited caveats from kvtree**, not re-argued here: see `kvtree/SPEC.md` (this list used to
+  name merge-less deletes, a single bounded freelist page and no overflow pages; kvtree now has
+  node merge, a chained freelist and overflow chains).
 
 ## 7. Verification
 
-`zig build test-tsdb` — 89 tests, **no skips**, green in Debug, ReleaseSafe and
-ReleaseFast.
+`zig build test-tsdb` — **no skips**, green in Debug, ReleaseSafe and
+ReleaseFast (`scripts/modtest tsdb`).
 
 - **Codec property tests** (§2): pairwise order identity over boundary +
   random pairs; sort-by-bytes equals sort-by-logic; partition-order checks;

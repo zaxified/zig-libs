@@ -8,8 +8,8 @@ noise is reset rather than accumulated and an arbitrarily deep circuit stays
 correct. This module implements the TFHE/FHEW line (Chillotti–Gama–Georgieva–
 Izabachène; Ducas–Micciancio): LWE/GLWE/GGSW ciphertexts over the power-of-two
 torus `Z_{2^32}`, blind rotation by CMux over a GGSW bootstrap key, sample
-extraction, LWE key switching, and binary gates on top. It is **std-only** — no
-external C, and an exact integer NTT instead of a floating-point FFT.
+extraction, LWE key switching, and binary gates on top. It needs only `std` and
+the sibling `entropy` (deps: `entropy`) — no external C, and an exact integer NTT instead of a floating-point FFT.
 
 **Compatible with tfhe-rs 1.8.1's boolean layer.** The parameter sets are
 tfhe-rs's (`params.tfhers_default` = its `DEFAULT_PARAMETERS`, for which tfhe-rs

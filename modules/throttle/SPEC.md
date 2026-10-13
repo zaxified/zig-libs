@@ -39,7 +39,7 @@ bounded waiter set, an 8-thread over-admission stress test. **Where we are behin
 limit discovery (Netflix Gradient/Vegas, Envoy adaptive filter), FIFO fairness and weighted
 acquires (Go semaphore) and partitioned/priority limits (→ Backlog).
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see /NOTICE.
+Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see ./README.md (no NOTICE entry — design references only, no source copied).
 
 ## Design & invariants
 Layered: `tryAcquire()`/`release()` — the bare counting semaphore, lock-free (a CAS loop on one
@@ -56,7 +56,7 @@ not computed from bucket math (unlike `ratelimit`'s 429). Concurrency: pure atom
 hidden globals; all orderings are deliberately `seq_cst` so the waiter/releaser handoff (slot
 counter, waiter counter, release generation) stays auditable under a single total order. Modeled
 after Go `x/sync/semaphore` (slot semantics) + SEDA (bounded-queue load shedding) + Netflix
-concurrency-limits (design notes) — see NOTICE.
+concurrency-limits (design notes) — see README Provenance.
 
 ## Threat model / out of scope
 Not per-key: a single client can consume the whole in-flight budget same as a legitimate burst — pair

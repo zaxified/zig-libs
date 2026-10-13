@@ -16,8 +16,9 @@
 **Downstream consumer:** no
 
 Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance:
-see this module's README "Provenance" note — clean-room from the W3C spec, so
-there is deliberately no root `/NOTICE` entry to point at.
+see this module's README "Provenance" note (clean-room from the W3C spec, so no root
+`/NOTICE` entry) and the module-local `./NOTICE`, which carries the W3C licence condition for the
+§16 vectors reproduced in `src/vectors.zig`.
 
 ## Compared with
 
@@ -166,8 +167,9 @@ The synthetic inputs that close them are in `attestation_test.zig`'s re-audit bl
     proves the attestation statement's signature is internally consistent (the leaf cert really
     signed this blob with its own key), not that the leaf cert chains to a trusted root or that
     the authenticator model is one the RP is willing to accept. A caller that cares wires the
-    returned leaf-cert-adjacent data (todo: not currently exposed — see "Deferred") into the
-    sibling `x509` module's `verifyChain` against its own trust store / MDS-derived roots.
+    returned leaf certificate (`AttestationResult.leaf_cert_der`; intermediates are not exposed — see
+    "Deferred") into the sibling `x509` module's `verifyChain` against its own trust store /
+    MDS-derived roots.
   - **Account-recovery / backup codes** — a product-level fallback authentication mechanism
     layered *above* WebAuthn (e.g. "lost your passkey? use a recovery code"), not part of the W3C
     verification procedure this module implements. There is nothing WebAuthn-specific to verify

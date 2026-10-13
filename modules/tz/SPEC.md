@@ -16,7 +16,7 @@
 
 **Downstream consumer:** yes
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see /NOTICE.
+Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see ./README.md (no NOTICE entry — public-domain data, own code).
 
 ## Compared with
 
@@ -24,7 +24,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [eggert/tz](https://github.com/eggert/tz) (IANA tz code and data) — **reference** | C | public domain (`LICENSE`: "Unless specified below, all files … are in the public domain"; API says NOASSERTION; files with other terms not read) | 1.8k | pushed 2026-09-30, no GitHub release | The data source and the yardstick: `zic` output is what this module's table is generated from (`scripts/gen/tz-gen`, SHA-256-pinned tzdata 2026a). Its `localtime`/`mktime` give abbreviations, pre-1970 history and local-to-UTC conversion; this module gives offset and DST flag only. |
+| [eggert/tz](https://github.com/eggert/tz) (IANA tz code and data) — **reference** | C | public domain (`LICENSE`: "Unless specified below, all files … are in the public domain"; API says NOASSERTION; files with other terms not read) | 1.8k | pushed 2026-09-30, no GitHub release | The data source and the yardstick: `zic` output is what this module's table is generated from (`scripts/gen/tz-gen`, SHA-256-pinned tzdata 2026a). Its `localtime`/`mktime` give abbreviations and pre-1970 history; this module gives offset and DST flag only (plus local-to-UTC conversion since 2026-09-30). |
 | [Go `time.LoadLocation`](https://pkg.go.dev/time) | Go | BSD-3-Clause *(inferred; `go.dev/LICENSE` not read)* | — | Go stdlib | Zone by name, abbreviation, local-time construction with gap/overlap rules, system zoneinfo or an embedded `time/tzdata` *(inferred: docs not read this run)*. |
 | [chronotope/chrono-tz](https://github.com/chronotope/chrono-tz) | Rust | MIT OR Apache-2.0 (`LICENSE`: "dual-licensed under the MIT License and Apache 2.0"; tzdb folder public domain) | 281 | parse-zoneinfo-v0.5.0 (2025-07-15); pushed 2025-10-10 | Zones compiled into the binary by a build script (README) — the same shape as here, but as `TimeZone` impls for chrono, so local-to-UTC (`Pacific.ymd(..).and_hms(..)` in the README) comes with it. |
 | [BurntSushi/jiff](https://github.com/BurntSushi/jiff) | Rust | Unlicense OR MIT (`COPYING`) | 2.9k | 0.2.0 (2025-02-11); pushed 2026-09-12 | Reads system tzdata or embeds a copy; DST-aware arithmetic (README). |
@@ -58,13 +58,13 @@ end[/time]]]`) for the target year — the same mechanism `localtime(3)` uses be
 table. `find` binary-searches `zones` (case-sensitive, matching IANA spelling exactly) by name. No
 allocation anywhere; reentrant, no shared state. Composes `datefmt` (extracted separately) for the
 POSIX-TZ footer's calendar math. `src/root.zig` is original work of the zig-libs authors (MIT);
-`tz_data.zig` is generated data from the IANA tzdata 2026a release (public domain) — see NOTICE.
+`tz_data.zig` is generated data from the IANA tzdata 2026a release (public domain) — see README Provenance.
 
 ## Threat model / out of scope
 Not a security-sensitive module — a pure offset-lookup table over a fixed, trusted, compiled-in data
 set; there is no untrusted-input attack surface (the only "input" is a zone name string and an i64
 instant, both looked up/computed with bounded, panic-free logic). Resource bound: O(log n) binary
-search over a fixed 600-entry table, no unbounded loops. Failure mode: `find` returns `null` for an
+search over a fixed 598-entry table, no unbounded loops. Failure mode: `find` returns `null` for an
 unknown zone name (never panics); `offsetAt` on a zone whose POSIX footer uses an unsupported rule
 form falls back to the last explicit transition's offset rather than erroring (a documented
 approximation, not a crash).
@@ -92,7 +92,7 @@ than by these tests alone).
   Feb 29 never counted — day 60 is always March 1) and plain `n` (0<=n<=365, zero-based day of year,
   Feb 29 counted) rule forms, alongside the pre-existing `Mm.w.d` form, all through the same
   `ruleDateUnix`/`posixOffset` evaluation path (`src/root.zig`). No current tzdata-2026a zone's footer
-  actually uses `Jn`/`n` (all 600 use `Mm.w.d`), so this is forward cover for zones/releases that do,
+  actually uses `Jn`/`n` (all 598 use `Mm.w.d`), so this is forward cover for zones/releases that do,
   exercised by synthetic-zone tests (`Test/Jn`, `Test/n`) rather than a real IANA entry. A leap-year
   positive control (`J59` vs plain `59`) proves the two forms are not accidentally aliased: `J59` is
   Feb 28 in both a leap (2024) and non-leap (2023) year, while plain `59` is Feb 29 in the leap year
@@ -120,7 +120,7 @@ than by these tests alone).
 - **`-b fat` is load-bearing.** With `zic -b slim`, zic omits the transitions the POSIX-TZ footer can
   regenerate. This module reads transitions, so a slim tree yields a different (smaller, and
   differently-behaved before the footer takes over) table from identical input data.
-- **Local wall-clock to instant** *(survey 2026-09-30)*: `localToUnix(zone, y, m, d, hh, mm, ss, policy)` with an explicit policy for the DST gap (nonexistent time) and overlap (ambiguous time: earlier/later/error). Why: parsing "2026-03-29 02:30 Europe/Prague" is the commonest reason to load a zone at all; today the caller must probe `offsetAt` by hand and gets the gap/overlap cases wrong. Effort: small–medium (pure arithmetic over the existing `offsetAt`). Fits CONVENTIONS §2. Composes with `datefmt.partsToUnix`.
+- ~~**Local wall-clock to instant**~~ — DONE 2026-09-30 as `resolveLocal`/`localToUtc` (see the first item) *(survey 2026-09-30)*: `localToUnix(zone, y, m, d, hh, mm, ss, policy)` with an explicit policy for the DST gap (nonexistent time) and overlap (ambiguous time: earlier/later/error). Why: parsing "2026-03-29 02:30 Europe/Prague" is the commonest reason to load a zone at all; today the caller must probe `offsetAt` by hand and gets the gap/overlap cases wrong. Effort: small–medium (pure arithmetic over the existing `offsetAt`). Fits CONVENTIONS §2. Composes with `datefmt.partsToUnix`.
 - **Zone abbreviations** *(survey 2026-09-30)*: `Offset.abbr` (`CET`/`CEST`, `+05`). Why: log and report output shows `Europe/Prague` times as `CEST`; zeit's `%Z` and Go's `Zone()` provide it. Needs the generator to emit an abbreviation index per transition plus a string table (size cost to be measured); the footer already carries the names. Effort: medium (generator + data). Fits §2.
 - **Pre-1970 history** *(survey 2026-09-30; decided 2026-09-30)*: *not now*, for size. The
   table folds everything before 1970 into `init_off`, so a pre-1970 instant gets the 1970

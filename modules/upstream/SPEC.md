@@ -27,7 +27,7 @@ documentation and READMEs were consulted.
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [nginx/nginx](https://github.com/nginx/nginx) (`upstream`) — **reference** | C | BSD-2-Clause | 31.8k | release-1.31.6 (2026-09-15) | Round-robin, weights, least_conn, ip_hash/hash (incl. consistent), passive `max_fails`/`fail_timeout` *(inferred from documentation, not re-read this run)*. Here: rr, random, smooth WRR (the nginx algorithm), least-connections, EWMA; no key-hash strategy. |
+| [nginx/nginx](https://github.com/nginx/nginx) (`upstream`) — **reference** | C | BSD-2-Clause | 31.8k | release-1.31.6 (2026-09-15) | Round-robin, weights, least_conn, ip_hash/hash (incl. consistent), passive `max_fails`/`fail_timeout` *(inferred from documentation, not re-read this run)*. Here: rr, random, smooth WRR (the nginx algorithm), least-connections, EWMA, power-of-two least-request and consistent-hash `ring_hash` (`pickByKey`; since 2026-10-04). |
 | [envoyproxy/envoy](https://github.com/envoyproxy/envoy) (cluster manager) | C++ | Apache-2.0 | 29.0k | v1.39.1 (2026-08-27) | Adds ring-hash, maglev, least-request with power-of-two choices, outlier detection, slow start, priorities/locality, dynamic membership via xDS *(inferred)*. |
 | [haproxy/haproxy](https://github.com/haproxy/haproxy) | C | GPL-2.0 / LGPL mix (API: NOASSERTION; source not read) | 6.9k | push 2026-09-29 (no GitHub releases) | Active health checks with rise/fall thresholds, many balance algorithms *(inferred)*. |
 | [traefik/traefik](https://github.com/traefik/traefik) | Go | MIT | 65.0k | v3.7.13 (2026-09-04) | Server pools with weighted round-robin, health checks, sticky sessions, dynamic providers *(inferred)*. |
@@ -45,7 +45,7 @@ resolution belongs to `dns`). Built since the survey: runtime add/remove/drain w
 retirement, consistent hashing on a ring (`ring_hash`, `pickByKey`), power-of-two-choices
 (`least_request`).
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see /NOTICE.
+Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see ./README.md (no NOTICE entry — own code, design references only).
 
 ## Design & invariants
 Pick is a full admission: a non-null `pick()` has already taken the upstream's bulkhead slot and
@@ -56,16 +56,15 @@ the breaker only (`failure_threshold` consecutive failures trip it, `pick` skips
 admits a probe); `healthTick(now_ns)` is caller-driven and separate — a failing check sets a down mark
 (skipped regardless of breaker state), a passing check clears the mark and doubles as the breaker's
 recovery probe, walking `open → half_open → closed` across ticks without risking a live request.
-Five strategies (`Strategy` enum): `round_robin` (default, strict rotation), `random` (uniform,
+Seven strategies (`Strategy` enum; the last two are described under "Ring hash" below): `round_robin` (default, strict rotation), `random` (uniform,
 seeded `std.Random` from `Options.seed` — no ambient entropy), `weighted_round_robin` (smooth WRR,
 the nginx algorithm — each healthy upstream chosen exactly `weight` times per window of
 `sum(weights)`, interleaved not bursty), `least_connections` (fewest in-flight), `ewma_latency`
-(lowest EWMA of reported RTTs; never-measured upstreams score 0 and are tried first for warm-up). No
+(lowest EWMA of reported RTTs; never-measured upstreams score 0 and are tried first for warm-up), `least_request`, `ring_hash`. No
 hidden clock: `healthTick` is caller-driven; the breaker's clock is injected via
 `Options.breaker.clock`; the RTT stopwatch inside `call()` uses `Options.clock`. Concurrency:
 `pick`/`report`/`call`/`healthTick`/stats are internally synchronized (a pool spinlock for strategy
-state plus atomic counters); the breaker/bulkhead synchronize themselves independently; `add`
-(registration) and `deinit` are single-owner setup/teardown, not meant to race with pool use; the
+state plus atomic counters); the breaker/bulkhead synchronize themselves independently; membership (`add`/`remove`/`drain`/`reap`, see below) may change while the pool serves and only `deinit` is single-owner teardown; the
 injected `HealthChecker` runs outside the pool lock since it may perform I/O. Bounded, typed-error,
 no panics: the fleet is capped by `max_upstreams`; a malformed `host:port` is a typed error; `call()`
 returns the first success, the last operation error once `max_tries` picks are exhausted, or
@@ -73,7 +72,7 @@ returns the first success, the last operation error once `max_tries` picks are e
 them: a per-upstream `resilience.CircuitBreaker` (passive health) and optional per-upstream
 `resilience.Bulkhead` (concurrency cap), plus `probe`'s `Connector` seam for active checks.
 Clean-room; design references Envoy/HAProxy upstream-cluster semantics and resilience4j's Bulkhead
-(behavior only) — see NOTICE.
+(behavior only) — see README Provenance.
 
 **Membership while serving (2026-10-04).** `add`, `remove`, `drain`/`undrain`, `reap`, `getById`,
 `count` and `stats` take the pool lock (`add`/`remove` allocate under it). `remove(id)` sets
@@ -143,11 +142,9 @@ there; the breaker and active health already eject on consecutive failures) and 
 statistics per member; Maglev (the ring covers the use; Maglev trades rebuild cost for lookup
 speed, worth it only at fleet sizes no consumer has); priorities/locality (no consumer).
 
-Checked with `rg -n -i 'remove|hash|consistent|p2c|slow_start|outlier|drain' src/root.zig` (no code hits; the five `Strategy` arms are rr/random/wrr/least_connections/ewma_latency).
-
-- **(survey 2026-09-30) Runtime membership change** (remove, drain, re-add an upstream while the pool is serving) — `add`/`deinit` are documented as single-owner setup/teardown, so a fleet that changes (autoscaling, service discovery) needs a rebuilt pool; nginx reloads and Envoy/tower `Discover` handle it. Effort: medium (needs safe retirement while picks/reports are in flight). Fits §2: yes.
-- **(survey 2026-09-30) Key-based strategies: `hash` / consistent hash (ring or maglev)** — needed for cache affinity and sticky routing (nginx `hash`/`ip_hash`, Envoy ring-hash). Effort: small–medium. Fits §2: yes.
-- **(survey 2026-09-30) Power-of-two-choices least-request** — the usual scalable replacement for exact least-connections (Envoy, tower). Effort: small. Fits §2: yes.
+- ~~**(survey 2026-09-30) Runtime membership change**~~ — DONE 2026-10-04: (remove, drain, re-add an upstream while the pool is serving) — `add`/`deinit` are documented as single-owner setup/teardown, so a fleet that changes (autoscaling, service discovery) needs a rebuilt pool; nginx reloads and Envoy/tower `Discover` handle it. Effort: medium (needs safe retirement while picks/reports are in flight). Fits §2: yes.
+- ~~**(survey 2026-09-30) Key-based strategies: `hash` / consistent hash (ring or maglev)**~~ — DONE 2026-10-04 (ring; Maglev deferred): — needed for cache affinity and sticky routing (nginx `hash`/`ip_hash`, Envoy ring-hash). Effort: small–medium. Fits §2: yes.
+- ~~**(survey 2026-09-30) Power-of-two-choices least-request**~~ — DONE 2026-10-04: — the usual scalable replacement for exact least-connections (Envoy, tower). Effort: small. Fits §2: yes.
 - **(survey 2026-09-30) Slow start and outlier ejection beyond consecutive failures** (success-rate based) — Envoy features that stop a fresh or degraded member being hit at full weight. Effort: medium. Fits §2: yes.
 
 ## Status

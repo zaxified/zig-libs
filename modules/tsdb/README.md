@@ -128,7 +128,7 @@ try db.appendBatch(&.{
     .{ .series = mem, .points = &.{.{ .ts = 1, .value = 2 }} },
 });
 
-// A byte BUDGET on live data (kvtree never shrinks the file — see below):
+// A byte BUDGET on live data (kvtree does not repack the file — see below):
 // drops the globally oldest points, by timestamp across every series, until
 // live data fits (or opts.max_deletes is spent — call again to continue).
 const size = try db.liveSize();               // exact: raw points + block bytes
@@ -148,9 +148,9 @@ current-oldest candidate in a min-heap ordered by timestamp rather than rescanni
 per decision. Its crash-safety is narrower than `sweep`'s: each chunk of deletions commits
 atomically, but there is no persisted resume record, so an interrupted call's progress is not
 resumed — the next call just recomputes and reseeds (still correct, just not linear). **kvtree
-never shrinks its file** and exposes no compaction/vacuum — so `liveSize`/`sweepToBudget` are a
-budget on the point data, never on `stat().size` (which a caller reads for itself, e.g. via its
-own `Io.Dir.statFile`).
+does not repack its file** (it only gives back a free tail, `Options.shrink_min_pages`) — so
+`liveSize`/`sweepToBudget` are a budget on the point data, never on `stat().size` (which a caller
+reads for itself, e.g. via its own `Io.Dir.statFile`).
 
 **Retention does bound the file**, though: kvtree recycles the pages of leaves a sweep empties, so
 a store that appends and sweeps at the same rate reaches a steady size (since 2026-09-28; before,

@@ -16,7 +16,7 @@
 
 **Downstream consumer:** yes
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see /NOTICE.
+Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see ./README.md (no NOTICE entry — own code, clean-room from public techniques).
 
 ## Compared with
 
@@ -24,7 +24,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| traceroute(8) (Linux `traceroute` by D. Butskoy, sourceforge) — **reference** (named by this module's SPEC) | C | GPL-2.0-or-later *(inferred; source not read, not on GitHub)* | — | — | The tool everyone runs. Default method is UDP, with ICMP (`-I`), TCP (`-T`) and others; parallel probes per hop, source/interface options, packet size, ICMP extensions/MPLS labels, `-A` AS lookup *(all inferred)*. Here: ICMP echo only, one probe in flight, hop addresses + RTT + terminal unreachable code. |
+| traceroute(8) (Linux `traceroute` by D. Butskoy, sourceforge) — **reference** (named by this module's SPEC) | C | GPL-2.0-or-later *(inferred; source not read, not on GitHub)* | — | — | The tool everyone runs. Default method is UDP, with ICMP (`-I`), TCP (`-T`) and others; parallel probes per hop, source/interface options, packet size, ICMP extensions/MPLS labels, `-A` AS lookup *(all inferred)*. Here: ICMP echo and UDP methods (no TCP), one probe in flight, hop addresses + RTT + terminal unreachable code, RFC 4950 MPLS labels, interface/source/TOS/fwmark. |
 | [traviscross/mtr](https://github.com/traviscross/mtr) | C | GPL-2.0 | 3.4k | push 2026-09-24 | Continuous traceroute+ping with per-hop running statistics (its README); ICMP default, other methods *(inferred)*. Here one-shot `Trace` with per-hop `stats()`; running statistics would be the caller looping. |
 | [fujiapple852/trippy](https://github.com/fujiapple852/trippy) | Rust | Apache-2.0 | 8.0k | 0.13.0 (2025-05-05); push 2026-09-28 | Its README credits Paris and Dublin traceroute for multipath-aware strategies and uses Team Cymru for ASN mapping; ICMP/UDP/TCP methods *(inferred)*. Application plus library crates. Here: no ECMP-aware strategies (only `distinctAddresses()` reports load-balanced hops after the fact). |
 | [nxtrace/NTrace-core](https://github.com/nxtrace/NTrace-core) | Go | GPL-3.0 | 8.2k | push 2026-09-17 | Go tracer with geo/ASN annotations *(inferred)*; GPL, source not read. |
@@ -49,7 +49,7 @@ exactly two slices (`hops`, `probes`), sized to the used prefix and freed by `de
 (CAP_NET_RAW); per-probe TTL via setsockopt IP_TTL/IPV6_UNICAST_HOPS; ppoll for the timeout.
 Clean-room from the classic traceroute(8)/mtr ICMP method (Van Jacobson's TTL-stepping applied to
 ICMP Echo — a public technique) and RFC 792 ICMP formats via the sibling `icmp.echo` codec — see
-NOTICE.
+README Provenance.
 
 ### A transport failure returns a partial `Trace`, not just an error
 
@@ -152,14 +152,11 @@ themselves) was the actual gap. **A caller that exposes `trace`/`traceWith` to a
 by an untrusted party (the SSRF-shaped case) must apply its own `netaddr`-predicate validation before
 calling in** — this module will not do it for them.
 
-**Not covered by the ident/seq/source hardening above: the quoted IP header inside an ICMP error is
-parsed, used to find the quoted echo header, and then discarded** (`icmp.echo.Reply.icmp_error` has
-no field for the quoted destination/source/protocol) — so this module cannot compare a Time
-Exceeded's or Destination Unreachable's citation against what it actually sent, only the quoted
-ident+seq. That gap, and the fact that this module's receive path never verifies the ICMP checksum
-(nor does the kernel, on a raw socket, before delivery), are `icmp` module findings
-(`icmp`'s F2/F7 — A1 audit) shared with `pathmtu` and `icmp`'s own `Pinger`; fixing them here would
-duplicate `icmp`'s internal header parsing rather than close the gap at its source. Out of scope:
+**Quoted-header and checksum checks.** `icmp.echo.Reply.icmp_error` carries the quoted datagram's
+declared source, destination and protocol (`quoted_src`/`quoted_dst`/`quoted_proto`, A1 F2), and the ICMPv4
+checksum is verified before a message is used (`icmpMessage`, as `icmp.echo.parseV4` does); ICMPv6's checksum
+needs the pseudo-header, which only the kernel has. These are `icmp` module findings (`icmp`'s F2/F7 — A1
+audit) shared with `pathmtu` and `icmp`'s own `Pinger`. Out of scope:
 parallel/all-hops-at-once probing, the TCP trace method, non-Linux live path, MTU/PMTU discovery.
 
 ## Verification
@@ -184,8 +181,8 @@ and `iface`/`source`/`tos` are read back off the sockets. Mutation 2026-10-04: 2
 killed.
 
 ## Backlog / deferred
-Documented out-of-scope: parallel probing, UDP/TCP methods, non-Linux live path,
-MTU/PMTU discovery (the first two now also filed below from the survey).
+Documented out-of-scope: parallel probing, the TCP method, non-Linux live path,
+MTU/PMTU discovery (the first two also filed below from the survey).
 - **2026-10-04:** UDP method, ICMP extensions/MPLS and source/interface/TOS are **done** (see
   "UDP method, extensions, live options"). Still deferred: **TCP** (needs SYN probes on a raw TCP
   socket or connect()-per-probe, and RST/SYN-ACK matching — a separate receive path; no consumer
@@ -193,11 +190,11 @@ MTU/PMTU discovery (the first two now also filed below from the survey).
   traces many destinations), **Paris/Dublin** (flow-stable UDP needs a constant 5-tuple, i.e. the
   probe id carried in the checksum/payload — builds on the UDP method, now possible), RFC 5837
   interface-information objects.
-- **UDP and TCP probe methods** (survey 2026-09-30): traceroute(8)'s default is UDP and it offers TCP; trippy does ICMP/UDP/TCP. A user behind a firewall that drops ICMP echo gets a wall of `*`. Effort: medium (per-method probe encoding and matching the quoted transport header; the SPEC notes the quoted header is currently discarded by `icmp.echo`). Fits CONVENTIONS §2 (raw sockets via `std.os.linux`).
+- **UDP and TCP probe methods** (survey 2026-09-30; UDP done 2026-10-04, TCP still open): traceroute(8)'s default is UDP and it offers TCP; trippy does ICMP/UDP/TCP. A user behind a firewall that drops ICMP echo gets a wall of `*`. Effort: medium (per-method probe encoding and matching the quoted transport header; the SPEC notes the quoted header is currently discarded by `icmp.echo`). Fits CONVENTIONS §2 (raw sockets via `std.os.linux`).
 - **Parallel probing** (survey 2026-09-30): sequential by design today (one probe in flight); a 30-hop trace across silent hops costs up to 30×probes×timeout. traceroute(8) and mtr send concurrently. Effort: medium (slot scheme already correlates late replies, so the state machine mostly needs a window). Fits §2.
 - **Multipath-aware strategy (Paris/Dublin-style flow-stable probes)** (survey 2026-09-30): per-flow load balancers make classic traceroute show false paths; trippy implements the two strategies. Effort: medium-large, depends on the UDP/TCP methods above. Fits §2.
-- **ICMP extension objects / MPLS labels (RFC 4884/4950)** (survey 2026-09-30): traceroute(8) prints them *(inferred)*; needs the quoted-datagram parsing that `icmp.echo` currently drops. Effort: medium, partly in `icmp`. Fits §2.
-- **Source-address / interface / TOS options on the live path** (survey 2026-09-30): multi-homed hosts cannot pick the egress; `icmp.Pinger` has `iface`/`oiface`/`tos`. Effort: small. Fits §2.
+- ~~**ICMP extension objects / MPLS labels (RFC 4884/4950)**~~ — DONE 2026-10-04 (survey 2026-09-30): traceroute(8) prints them *(inferred)*; needs the quoted-datagram parsing that `icmp.echo` currently drops. Effort: medium, partly in `icmp`. Fits §2.
+- ~~**Source-address / interface / TOS options on the live path**~~ — DONE 2026-10-04 (survey 2026-09-30): multi-homed hosts cannot pick the egress; `icmp.Pinger` has `iface`/`oiface`/`tos`. Effort: small. Fits §2.
 
 ## Status
 `gap · linux · client · single_owner` + deps: `icmp`, `netaddr`, `latency-stats` — canonical source

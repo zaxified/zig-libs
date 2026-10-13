@@ -60,7 +60,7 @@ short `text/plain` body; the rest of the chain never runs. Registered
 router-level, 404/405 traffic is throttled too.
 
 Observability: `inFlight()`, `waiting()`, `maxInFlight()`, `maxWaiters()` —
-utilization is `inFlight() / maxInFlight()` (for the future `metrics`
+utilization is `inFlight() / maxInFlight()` (for the `metrics`
 module).
 
 ## Without the router

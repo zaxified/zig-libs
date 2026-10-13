@@ -40,9 +40,9 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [drand/kyber](https://github.com/drand/kyber) `encrypt/ibe` | Go | MPL-2.0 (`LICENSE` header; source NOT read) | 12 | v1.3.2 (2025-12-15) | The BF-IBE library `drand/tlock` uses. Its `LICENSE` file is the MPL-2.0 text (the module NOTICE calls it Apache-2.0/MIT dual: see the survey report); this module is validated byte-exact against a genuine `tle` ciphertext. |
 | Zig ecosystem | Zig | — | — | — | No Zig timelock/drand-encryption repository found by GitHub search (2026-09-30). |
 
-**Where we are ahead:** the only Zig timelock implementation; interop-verified in both directions against a ciphertext produced by drand's Go `tle`, which caught a real Gt-representation divergence; constant-time `fp12Pow` measured with ctgrind. **Where we are behind:** only the raw 128-byte IBE ciphertext of a 16-byte key - no age stanza/armor layer, no arbitrary-length payloads (a `tle` user's main use), only the G1-signature (quicknet) scheme, not the G2-signature testnet variant or BN254.
+**Where we are ahead:** the only Zig timelock implementation; interop-verified in both directions against a ciphertext produced by drand's Go `tle`, which caught a real Gt-representation divergence; constant-time `fp12Pow` measured with ctgrind. **Where we are behind:** only the G1-signature (quicknet) scheme, not the G2-signature testnet variant or BN254; whole buffers only, no streaming I/O (the age layer and arbitrary-length payloads have landed, see the 2026-10-06 note below).
 
-**Re-assessed 2026-10-06** (no new web survey): the age layer landed (`age.zig`: `tlock` stanza, header HMAC, STREAM payload, armor, any length) and is now **interop-proven**: drand/tlock's own whole-file fixture (`src/testdata/lorem-tle-testnet-quicknet-t-2024-01-17-15-28.tle`, Go-`tle`-produced, armored) decrypts here to its published plaintext byte-exactly, so armor, header MAC and STREAM agree with Go, not just with the age spec. **Even** with `drand/tlock` and `tlock_age` on the quicknet file format. Still **behind** (Backlog-grade) on the G2-signature testnet scheme and BN254, and on streaming I/O (whole buffers only). Scope `mvp` → `core`. (The "Where we are behind" sentence above predates the age layer; this note supersedes it.)
+**Re-assessed 2026-10-06** (no new web survey): the age layer landed (`age.zig`: `tlock` stanza, header HMAC, STREAM payload, armor, any length) and is now **interop-proven**: drand/tlock's own whole-file fixture (`src/testdata/lorem-tle-testnet-quicknet-t-2024-01-17-15-28.tle`, Go-`tle`-produced, armored) decrypts here to its published plaintext byte-exactly, so armor, header MAC and STREAM agree with Go, not just with the age spec. **Even** with `drand/tlock` and `tlock_age` on the quicknet file format. Still **behind** (Backlog-grade) on the G2-signature testnet scheme and BN254, and on streaming I/O (whole buffers only). Scope `mvp` → `core`.
 
 ## Scheme variant pinned: quicknet / `SigsOnG1ID`
 
@@ -82,7 +82,7 @@ encrypt(P_pub, round, &M, &sigma):      [FABLE CORE — tlock.encrypt]
   Gid   = pairing(Qid, P_pub) ∈ Gt
   r     = H3(sigma, M) ∈ Fr
   U     = r · G2_generator ∈ G2
-  gid_r = Gid^r ∈ Gt                    (Gt SCALAR EXPONENTIATION — see "Known gap" below)
+  gid_r = Gid^r ∈ Gt                    (Gt SCALAR EXPONENTIATION — see the `Gt` scalar exponentiation section below)
   V     = sigma XOR H2(gid_r)
   W     = M XOR H4(sigma)
   return (U, V, W)
@@ -206,8 +206,8 @@ interop vector proved the flag right, in an unexpected place:
   header refusals, the stanza and size caps, and 11 armor refusals. The
   primitives are anchored where they live (`chachapoly`: RFC 8439; std's
   HKDF/HMAC). A `testing.fuzz` harness drives `Header.parse`, `dearmor`
-  and the STREAM opener. **Not done:** a whole Go-produced `.tle` file
-  decrypted here — see Backlog.
+  and the STREAM opener. A whole Go-produced `.tle` file (drand/tlock's
+  armored fixture) is decrypted end-to-end in `kat_test.zig` (see Backlog).
 - **Mutation run 2026-10-05** (in-place, Debug, 16 mutants over
   `Ciphertext.fromBytes`, the FO check, `fp12Pow`'s window and
   constant-time lookup, `gtToDrandRepr`, and every hash's tag, DST,
@@ -226,8 +226,8 @@ are pinned in `scripts/checks/ctgrind-expected.tsv`.
 
 | target | tainted | in-file contexts | read at |
 |---|---|---|---|
-| `fp12pow` | `sigma`, `message` (hence `r = H3(sigma, message)`) | 5 | `tlock.zig:358`, `tlock.zig:361`, + `Fr.fromBytes`'s accept/reject ×2, `U`'s compression bit (2026-10-02) |
-| `decrypt` | the round signature handed to `pairing.pairing` | 8 | `tlock.zig:406`, `:430`, `:432`, + the FO compare at `:433` ×2 and the output points' `toAffine`/compression (2026-10-02) |
+| `fp12pow` | `sigma`, `message` (hence `r = H3(sigma, message)`) | 5 | in `tlock.zig`'s `encrypt`: the `H3` step and the `U = r·G2` scalar multiplication, + `Fr.fromBytes`'s accept/reject ×2, `U`'s compression bit (2026-10-02) |
+| `decrypt` | the round signature handed to `pairing.pairing` | 8 | in `tlock.zig`'s `decryptBody`: the pairing, the `H3` re-derivation and the `U` re-encryption, + the FO compare (`std.mem.eql`) ×2 and the output points' `toAffine`/compression (2026-10-02) |
 
 ⛔ These numbers are **not** a constant-time claim about the pairing.
 `bls12_381/src/pairing.zig` makes none, and `decrypt`'s contexts sit on top of

@@ -27,7 +27,7 @@ the reasoning is recorded at the call site.
 ## Compared with
 
 Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date. Note the shape of the competition: every
-mainstream library both parses **and** emits and (in Go, Rust, Python, JS) maps YAML onto native types; this module reads only.
+mainstream library both parses **and** emits and (in Go, Rust, Python, JS) maps YAML onto native types; at survey time this module read only — an emitter and typed mapping followed on 2026-10-04 (§9b).
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
@@ -454,9 +454,7 @@ consumer needing bignums has the exact text and can parse it itself.
   diagnostic against.
 - **UTF-16/UTF-32 input.** §5.2 allows a BOM to select them; this module reads
   UTF-8 only. A leading UTF-16/UTF-32 BOM is now *rejected* (`error.InvalidYaml`,
-  `Scanner.fetchStreamStart`) rather than silently misread as content — see the
-  duplicate-key-check note in §8 below for why "not detected" used to be worse
-  than it sounds. Actually decoding the other encodings is still not done.
+  `Scanner.fetchStreamStart`) rather than silently misread as content. Actually decoding the other encodings is still not done.
 - **`Options.max_nodes` bounds nodes; `Options.max_heap_bytes` bounds bytes**
   (A1/yaml.md F9: 64 000 sequence items, 500 890 B on the wire, peaked at
   59.6 MB live — 119×; `max_nodes = 10_000_000` alone let roughly half a

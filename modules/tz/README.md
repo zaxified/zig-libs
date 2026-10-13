@@ -12,7 +12,7 @@ IANA time-zone offset lookup: zone name → UTC offset/DST at a given instant.
 
 ## How it works
 
-Each of the 600 IANA zones carries an explicit list of UTC-offset
+Each of the 598 IANA zones carries an explicit list of UTC-offset
 transitions from 1970 onward, generated ahead of time from the real tzdata
 transition history (`zic` output). `offsetAt` binary-searches that list for
 the offset in effect at a given Unix instant. Past the last explicit

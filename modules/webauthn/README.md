@@ -25,7 +25,8 @@ specification; the §16 test vectors were fetched from w3.org and mechanically
 extracted (an early hand-copy introduced a transcription slip, which is why they
 are machine-extracted). Every signature check routes through an already-KAT'd
 primitive — no new crypto here. No third-party relying-party source consulted,
-so no `NOTICE` entry is required (root [`NOTICE`](../../NOTICE) §0).
+so no third-party-source `NOTICE` entry is required; the module's own [`NOTICE`](NOTICE)
+instead carries the W3C licence condition for the §16 test vectors reproduced in `src/vectors.zig`.
 
 ## Import
 

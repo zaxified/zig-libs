@@ -109,10 +109,11 @@ written is wiped). The parsers are bounded (`max_header_bytes`,
 exactly one `tlock` stanza; other recipient stanzas are parsed, MAC-covered
 and skipped.
 
-⚠ Anchoring: the stanza body is checked byte-exact against the genuine
-`tle` fixture's; the header MAC, STREAM and armor bytes are tested against
-the age specification and in round trip only — no whole `.tle` file is
-decrypted in the tests yet (see [SPEC.md](SPEC.md)'s KAT plan).
+Anchoring: the stanza body is checked byte-exact against the genuine
+`tle` fixture's, and drand/tlock's own whole armored `.tle` file decrypts
+here to its published plaintext byte-exactly (so header MAC, STREAM and
+armor agree with Go); round trips and the age specification cover the rest
+(see [SPEC.md](SPEC.md)'s KAT plan).
 
 ## Randomness
 
