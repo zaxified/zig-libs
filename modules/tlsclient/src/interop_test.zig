@@ -39,13 +39,19 @@ const Server = struct {
 
     /// The same with `extra` arguments (`-alpn`, `-Verify`, `-rev`, …).
     fn startWith(io: std.Io, dir: std.Io.Dir, cert: []const u8, key: []const u8, chain: []const u8, extra: []const []const u8) !Server {
+        return startProto(io, dir, "-tls1_3", cert, key, chain, extra);
+    }
+
+    /// The same with the protocol flag (`-tls1_2`, `-tls1_3`, or "" for both).
+    fn startProto(io: std.Io, dir: std.Io.Dir, proto: []const u8, cert: []const u8, key: []const u8, chain: []const u8, extra: []const []const u8) !Server {
         var argv_buf: [32][]const u8 = undefined;
-        const base = [_][]const u8{
-            "openssl", "s_server", "-accept",     "127.0.0.1:0", "-cert",   cert,
-            "-key",    key,        "-cert_chain", chain,         "-tls1_3", "-naccept",
-            "1",
+        const base_all = [_][]const u8{
+            "openssl", "s_server", "-accept",     "127.0.0.1:0", "-cert",    cert,
+            "-key",    key,        "-cert_chain", chain,         "-naccept", "1",
+            proto,
         };
-        @memcpy(argv_buf[0..base.len], &base);
+        const base = if (proto.len == 0) base_all[0 .. base_all.len - 1] else base_all[0..];
+        @memcpy(argv_buf[0..base.len], base);
         @memcpy(argv_buf[base.len..][0..extra.len], extra);
         var child = std.process.spawn(io, .{
             .argv = argv_buf[0 .. base.len + extra.len],
@@ -177,10 +183,17 @@ const Ext = struct {
     alpn: []const []const u8 = &.{},
     alert: ?*std.crypto.tls.Alert = null,
     client_auth: ?Client.ClientAuth = null,
+    min_version: std.crypto.tls.ProtocolVersion = .tls_1_2,
+    max_version: std.crypto.tls.ProtocolVersion = .tls_1_3,
+    groups: []const std.crypto.tls.NamedGroup = &Client.default_groups,
+    key_share_groups: []const std.crypto.tls.NamedGroup = &Client.default_key_share_groups,
 };
 
 const Session = struct {
     alpn: ?[]const u8,
+    version: std.crypto.tls.ProtocolVersion = .tls_1_3,
+    group: ?std.crypto.tls.NamedGroup = null,
+    hrr: bool = false,
     /// What the server's `-rev` mode sent back for "hello\n".
     echo: [16]u8 = undefined,
     echo_len: usize = 0,
@@ -214,8 +227,12 @@ fn session(io: std.Io, port: u16, bundle: *std.crypto.Certificate.Bundle, ext: E
         .realtime_now = std.Io.Clock.real.now(io),
         .alpn_protocols = ext.alpn,
         .client_auth = ext.client_auth,
+        .min_version = ext.min_version,
+        .max_version = ext.max_version,
+        .groups = ext.groups,
+        .key_share_groups = ext.key_share_groups,
     });
-    var out: Session = .{ .alpn = c.alpn_protocol };
+    var out: Session = .{ .alpn = c.alpn_protocol, .version = c.tls_version, .group = c.negotiated_group, .hrr = c.hello_retry_request };
     try c.writer.writeAll("hello\n");
     try c.writer.flush();
     try sw.interface.flush();
@@ -365,10 +382,211 @@ test "interop: defaults are std's -- a CertificateRequest without client_auth fa
     }
 }
 
+// ── S2 (2026-10-13): HelloRetryRequest, group preferences, version bounds ──
+
+test "interop: HelloRetryRequest -- a server limited to P-256 / P-384 / P-521 gets its group on the second hello" {
+    const io = testing.io;
+    var tmp = try setUp(io);
+    defer tmp.cleanup();
+    var bundle = try rootBundle(io, tmp.dir);
+    defer bundle.deinit(testing.allocator);
+    const T = std.crypto.tls.NamedGroup;
+    inline for (.{ .{ "P-256", T.secp256r1 }, .{ "P-384", T.secp384r1 }, .{ "P-521", T.secp521r1 } }) |c| {
+        var srv = try Server.startWith(io, tmp.dir, "leaf.pem", "leaf.key.pem", "inter.pem", &.{ "-groups", c[0], "-rev" });
+        defer srv.stop(io);
+        const s = try session(io, srv.port, &bundle, .{});
+        try testing.expectEqualStrings("olleh", s.echo[0..s.echo_len]);
+        try testing.expect(s.hrr);
+        try testing.expectEqual(@as(?T, c[1]), s.group);
+    }
+    {
+        // A share for its group already in the first hello: no HRR.
+        var srv = try Server.startWith(io, tmp.dir, "leaf.pem", "leaf.key.pem", "inter.pem", &.{ "-groups", "X25519", "-rev" });
+        defer srv.stop(io);
+        const s = try session(io, srv.port, &bundle, .{});
+        try testing.expect(!s.hrr);
+        try testing.expectEqual(@as(?T, .x25519), s.group);
+    }
+    {
+        // No share at all (an empty key_share): the server must ask.
+        var srv = try Server.startWith(io, tmp.dir, "leaf.pem", "leaf.key.pem", "inter.pem", &.{"-rev"});
+        defer srv.stop(io);
+        const s = try session(io, srv.port, &bundle, .{ .key_share_groups = &.{} });
+        try testing.expect(s.hrr);
+        try testing.expectEqualStrings("olleh", s.echo[0..s.echo_len]);
+    }
+    {
+        // No group in common: the server's handshake_failure.
+        var srv = try Server.startWith(io, tmp.dir, "leaf.pem", "leaf.key.pem", "inter.pem", &.{ "-groups", "P-521", "-rev" });
+        defer srv.stop(io);
+        try testing.expectError(error.TlsAlert, session(io, srv.port, &bundle, .{ .groups = &.{ .x25519, .secp256r1 }, .key_share_groups = &.{.x25519} }));
+    }
+}
+
+/// The client's output after a canned HelloRetryRequest carrying `exts`
+/// (with `second`, a second HRR follows the first), and the error `init`
+/// ended with. `s_server -stateless` sends no cookie on a plain TCP accept
+/// (checked 2026-10-13: an 88-byte HRR), so the cookie path is tested here.
+fn afterHrr(out: []u8, exts: []const u8, second: bool) !struct { written: []const u8, err: anyerror } {
+    var msg_buf: [512]u8 = undefined;
+    var m: std.Io.Writer = .fixed(&msg_buf);
+    const body_len = 2 + 32 + 1 + 32 + 2 + 1 + 2 + exts.len;
+    try m.writeAll(&.{ 0x16, 0x03, 0x03 });
+    try m.writeInt(u16, @intCast(4 + body_len), .big);
+    try m.writeByte(2);
+    try m.writeInt(u24, @intCast(body_len), .big);
+    try m.writeInt(u16, 0x0303, .big);
+    try m.writeAll(&std.crypto.tls.hello_retry_request_sequence);
+    try m.writeByte(32);
+    try m.writeAll(&([_]u8{0x5a} ** 32)); // the session id clientHelloWith's entropy gives
+    try m.writeInt(u16, 0x1301, .big);
+    try m.writeByte(0);
+    try m.writeInt(u16, @intCast(exts.len), .big);
+    try m.writeAll(exts);
+    const one = m.buffered();
+    var in_buf: [Client.min_buffer_len]u8 = undefined;
+    @memcpy(in_buf[0..one.len], one);
+    var in_len = one.len;
+    if (second) {
+        @memcpy(in_buf[one.len..][0..one.len], one);
+        in_len += one.len;
+    }
+    var in: std.Io.Reader = .fixed(&in_buf); // the client asserts a full-size buffer
+    in.end = in_len;
+    var w: std.Io.Writer = .fixed(out);
+    var tls_in: [Client.min_buffer_len]u8 = undefined;
+    var tls_out: [Client.min_buffer_len]u8 = undefined;
+    const entropy = [_]u8{0x5a} ** Client.Options.entropy_len;
+    if (Client.init(&in, &w, .{
+        .host = .{ .explicit = "good.example.test" },
+        .ca = .no_verification,
+        .read_buffer = &tls_in,
+        .write_buffer = &tls_out,
+        .entropy = &entropy,
+        .realtime_now = .{ .nanoseconds = 0 },
+    })) |_| return error.TestUnexpectedSuccess else |e| return .{ .written = w.buffered(), .err = e };
+}
+
+const versions_13 = "\x00\x2b\x00\x02\x03\x04";
+
+test "HelloRetryRequest (offline): a cookie is echoed, a selected group gets the only share" {
+    var a: [8192]u8 = undefined;
+    {
+        // Cookie only: the second hello repeats the shares and adds the cookie.
+        const r = try afterHrr(&a, versions_13 ++ "\x00\x2c\x00\x07\x00\x05c00k!", false);
+        try testing.expectEqual(error.TlsConnectionTruncated, r.err); // waiting for the ServerHello
+        const ch1_len = 5 + @as(usize, std.mem.readInt(u16, r.written[3..5], .big));
+        const ch2 = r.written[ch1_len..];
+        try testing.expectEqualSlices(u8, "\x16\x03\x03", ch2[0..3]); // 0x0303 after an HRR (RFC 8446 §5.1)
+        try testing.expect(std.mem.indexOf(u8, ch2, "\x00\x2c\x00\x07\x00\x05c00k!") != null);
+        try testing.expect(std.mem.indexOf(u8, r.written[0..ch1_len], "c00k!") == null);
+        try testing.expectEqual(ch1_len + 11, ch2.len);
+    }
+    {
+        // Group P-256 (no share in the first hello): one P-256 share.
+        const r = try afterHrr(&a, versions_13 ++ "\x00\x33\x00\x02\x00\x17", false);
+        try testing.expectEqual(error.TlsConnectionTruncated, r.err);
+        const ch1_len = 5 + @as(usize, std.mem.readInt(u16, r.written[3..5], .big));
+        const ch2 = r.written[ch1_len..];
+        const ks = std.mem.indexOf(u8, ch2, "\x00\x33\x00\x47\x00\x45\x00\x17\x00\x41\x04").?; // 65-byte SEC1
+        _ = ks;
+        try testing.expect(std.mem.indexOf(u8, ch2, "\x11\xec\x04\xc0") == null); // no hybrid share any more
+    }
+}
+
+test "HelloRetryRequest (offline): refusals -- a group we shared, no change, not offered, a second HRR, not TLS 1.3" {
+    var a: [8192]u8 = undefined;
+    // X25519 already had a share.
+    try testing.expectEqual(error.TlsIllegalParameter, (try afterHrr(&a, versions_13 ++ "\x00\x33\x00\x02\x00\x1d", false)).err);
+    // Neither a group nor a cookie: nothing would change.
+    try testing.expectEqual(error.TlsIllegalParameter, (try afterHrr(&a, versions_13, false)).err);
+    // A group we never listed (ffdhe2048).
+    try testing.expectEqual(error.TlsIllegalParameter, (try afterHrr(&a, versions_13 ++ "\x00\x33\x00\x02\x01\x00", false)).err);
+    // A second HRR.
+    try testing.expectEqual(error.TlsUnexpectedMessage, (try afterHrr(&a, versions_13 ++ "\x00\x33\x00\x02\x00\x17", true)).err);
+    // An HRR naming TLS 1.2.
+    try testing.expectEqual(error.TlsIllegalParameter, (try afterHrr(&a, "\x00\x33\x00\x02\x00\x17", false)).err);
+}
+
+test "interop: TLS 1.2 with an ECDSA certificate (ECDHE_ECDSA), each group" {
+    const io = testing.io;
+    var tmp = try setUp(io);
+    defer tmp.cleanup();
+    var bundle = try rootBundle(io, tmp.dir);
+    defer bundle.deinit(testing.allocator);
+    const T = std.crypto.tls.NamedGroup;
+    inline for (.{ .{ "X25519", T.x25519 }, .{ "P-256", T.secp256r1 }, .{ "P-384", T.secp384r1 }, .{ "P-521", T.secp521r1 } }) |c| {
+        var srv = try Server.startProto(io, tmp.dir, "-tls1_2", "leaf.pem", "leaf.key.pem", "inter.pem", &.{ "-groups", c[0], "-rev" });
+        defer srv.stop(io);
+        const s = try session(io, srv.port, &bundle, .{});
+        try testing.expectEqualStrings("olleh", s.echo[0..s.echo_len]);
+        try testing.expectEqual(std.crypto.tls.ProtocolVersion.tls_1_2, s.version);
+        try testing.expectEqual(@as(?T, c[1]), s.group);
+    }
+}
+
+test "interop: version bounds -- TLS 1.3 only refuses a 1.2 server, TLS 1.2 only talks 1.2 to a dual one" {
+    const io = testing.io;
+    var tmp = try setUp(io);
+    defer tmp.cleanup();
+    var bundle = try rootBundle(io, tmp.dir);
+    defer bundle.deinit(testing.allocator);
+    {
+        var srv = try Server.startProto(io, tmp.dir, "-tls1_2", "leaf.pem", "leaf.key.pem", "inter.pem", &.{"-rev"});
+        defer srv.stop(io);
+        // The server finds no common version: protocol_version alert.
+        var alert: std.crypto.tls.Alert = .{ .level = .warning, .description = .close_notify };
+        try testing.expectError(error.TlsAlert, session(io, srv.port, &bundle, .{ .min_version = .tls_1_3, .alert = &alert }));
+        try testing.expectEqual(std.crypto.tls.Alert.Description.protocol_version, alert.description);
+    }
+    {
+        var srv = try Server.startProto(io, tmp.dir, "", "leaf.pem", "leaf.key.pem", "inter.pem", &.{"-rev"});
+        defer srv.stop(io);
+        const s = try session(io, srv.port, &bundle, .{ .max_version = .tls_1_2 });
+        try testing.expectEqual(std.crypto.tls.ProtocolVersion.tls_1_2, s.version);
+        try testing.expectEqualStrings("olleh", s.echo[0..s.echo_len]);
+    }
+}
+
 // ── offline: the ClientHello, the ALPN answer, the CertificateRequest ──────
 
+/// The ClientHello this module writes with Go-shaped option overrides.
+const HelloOpts = struct {
+    min_version: std.crypto.tls.ProtocolVersion = .tls_1_2,
+    max_version: std.crypto.tls.ProtocolVersion = .tls_1_3,
+    groups: []const std.crypto.tls.NamedGroup = &Client.default_groups,
+    key_share_groups: []const std.crypto.tls.NamedGroup = &Client.default_key_share_groups,
+};
+
+fn clientHelloWith(out: []u8, o: HelloOpts) ![]const u8 {
+    var in_buf: [Client.min_buffer_len]u8 = undefined;
+    var in: std.Io.Reader = .fixed(&in_buf);
+    in.end = 0;
+    var w: std.Io.Writer = .fixed(out);
+    var tls_in: [Client.min_buffer_len]u8 = undefined;
+    var tls_out: [Client.min_buffer_len]u8 = undefined;
+    const entropy = [_]u8{0x5a} ** Client.Options.entropy_len;
+    if (Client.init(&in, &w, .{
+        .host = .{ .explicit = "good.example.test" },
+        .ca = .no_verification,
+        .read_buffer = &tls_in,
+        .write_buffer = &tls_out,
+        .entropy = &entropy,
+        .realtime_now = .{ .nanoseconds = 0 },
+        .min_version = o.min_version,
+        .max_version = o.max_version,
+        .groups = o.groups,
+        .key_share_groups = o.key_share_groups,
+    })) |_| return error.TestUnexpectedSuccess else |e| switch (e) {
+        error.VersionsInvalid, error.GroupsInvalid => |x| return x,
+        else => {},
+    }
+    return w.buffered();
+}
+
 /// The ClientHello a client type writes with these options before it
-/// blocks on the (empty) server stream.
+/// blocks on the (empty) server stream -- std's shape for this module
+/// (`std_groups`, a share each).
 fn clientHello(comptime C: type, out: []u8, alpn: []const []const u8) ![]const u8 {
     var in_buf: [C.min_buffer_len]u8 = undefined;
     var in: std.Io.Reader = .fixed(&in_buf);
@@ -386,6 +604,10 @@ fn clientHello(comptime C: type, out: []u8, alpn: []const []const u8) ![]const u
         .realtime_now = .{ .nanoseconds = 0 },
     };
     if (@hasField(C.Options, "alpn_protocols")) opts.alpn_protocols = alpn;
+    if (@hasField(C.Options, "groups")) {
+        opts.groups = &C.std_groups;
+        opts.key_share_groups = &C.std_groups;
+    }
     if (C.init(&in, &w, opts)) |_| return error.TestUnexpectedSuccess else |e| {
         // The option check comes before anything is written.
         if (std.mem.eql(u8, @errorName(e), "AlpnProtocolsInvalid")) return error.AlpnProtocolsInvalid;
@@ -393,13 +615,62 @@ fn clientHello(comptime C: type, out: []u8, alpn: []const []const u8) ![]const u
     return w.buffered();
 }
 
-test "default options: the ClientHello is std's, byte for byte" {
+test "std profile: with std's groups and shares the ClientHello is std's, plus the three ECDHE_ECDSA suites" {
     var a: [4096]u8 = undefined;
     var b: [4096]u8 = undefined;
     const ours = try clientHello(Client, &a, &.{});
     const theirs = try clientHello(std.crypto.tls.Client, &b, &.{});
-    try testing.expect(ours.len > 100);
-    try testing.expectEqualSlices(u8, theirs, ours);
+    try testing.expect(theirs.len > 100);
+    // record(5) handshake(4) version(2) random(32) session id(33): the
+    // cipher_suites vector starts at 76.
+    const cs = 5 + 4 + 2 + 32 + 33;
+    const n_std = std.mem.readInt(u16, theirs[cs..][0..2], .big);
+    try testing.expectEqual(n_std + 6, std.mem.readInt(u16, ours[cs..][0..2], .big));
+    // Ours = std's with 6 bytes of suites inserted after std's last suite
+    // (which ones depends on AES hardware, as std's order does) ...
+    const ins = cs + 2 + n_std;
+    try testing.expectEqualSlices(u8, theirs[ins..], ours[ins + 6 ..]);
+    const ecdsa = [_]u16{ 0xC02B, 0xC02C, 0xCCA9 };
+    for (0..3) |i| try testing.expect(std.mem.indexOfScalar(u16, &ecdsa, std.mem.readInt(u16, ours[ins + 2 * i ..][0..2], .big)) != null);
+    // ... and the three length fields in front of it grown by 6.
+    try testing.expectEqual(std.mem.readInt(u16, theirs[3..5], .big) + 6, std.mem.readInt(u16, ours[3..5], .big));
+    try testing.expectEqual(std.mem.readInt(u24, theirs[6..9], .big) + 6, std.mem.readInt(u24, ours[6..9], .big));
+    try testing.expectEqualSlices(u8, theirs[9..cs], ours[9..cs]);
+    try testing.expectEqualSlices(u8, theirs[cs + 2 .. ins], ours[cs + 2 .. ins]);
+}
+
+test "default options: Go's shape -- five groups listed, shares for X25519MLKEM768 and X25519 only" {
+    var a: [4096]u8 = undefined;
+    var b: [4096]u8 = undefined;
+    const go = try clientHelloWith(&a, .{});
+    const std_shape = try clientHello(Client, &b, &.{});
+    // Two shares instead of four: P-256 (65 + 4) and P-384 (97 + 4) bytes
+    // gone, P-521 (2) added to supported_groups.
+    try testing.expectEqual(std_shape.len - (65 + 4) - (97 + 4) + 2, go.len);
+    const groups = "\x00\x0a\x00\x0c\x00\x0a\x11\xec\x00\x1d\x00\x17\x00\x18\x00\x19";
+    try testing.expect(std.mem.indexOf(u8, go, groups) != null);
+    // key_share: X25519MLKEM768 (1184 + 32) then X25519 (32).
+    const ks_at = std.mem.indexOf(u8, go, "\x00\x33").?;
+    try testing.expectEqual(@as(u16, 4 + 1216 + 4 + 32), std.mem.readInt(u16, go[ks_at + 4 ..][0..2], .big));
+    try testing.expectEqualSlices(u8, "\x11\xec\x04\xc0", go[ks_at + 6 ..][0..4]);
+    try testing.expectEqualSlices(u8, "\x00\x1d\x00\x20", go[ks_at + 6 + 4 + 1216 ..][0..4]);
+}
+
+test "options: versions and groups are checked before anything is sent" {
+    var a: [4096]u8 = undefined;
+    try testing.expectError(error.VersionsInvalid, clientHelloWith(&a, .{ .min_version = .tls_1_3, .max_version = .tls_1_2 }));
+    try testing.expectError(error.VersionsInvalid, clientHelloWith(&a, .{ .min_version = .tls_1_1 }));
+    try testing.expectError(error.GroupsInvalid, clientHelloWith(&a, .{ .groups = &.{} }));
+    try testing.expectError(error.GroupsInvalid, clientHelloWith(&a, .{ .groups = &.{.ffdhe2048} }));
+    try testing.expectError(error.GroupsInvalid, clientHelloWith(&a, .{ .groups = &.{ .x25519, .x25519 } }));
+    try testing.expectError(error.GroupsInvalid, clientHelloWith(&a, .{ .groups = &.{.x25519}, .key_share_groups = &.{.secp256r1} }));
+    // TLS 1.3 only: supported_versions lists 1.3 alone.
+    const h = try clientHelloWith(&a, .{ .min_version = .tls_1_3 });
+    try testing.expect(std.mem.indexOf(u8, h, "\x00\x2b\x00\x03\x02\x03\x04") != null);
+    // TLS 1.2 only: no key_share at all.
+    const h2 = try clientHelloWith(&a, .{ .max_version = .tls_1_2 });
+    try testing.expect(std.mem.indexOf(u8, h2, "\x00\x2b\x00\x03\x02\x03\x03") != null);
+    try testing.expect(std.mem.indexOf(u8, h2, "\x00\x33\x00") == null);
 }
 
 test "ALPN offer: std's ClientHello plus the RFC 7301 extension, lengths grown by its size" {

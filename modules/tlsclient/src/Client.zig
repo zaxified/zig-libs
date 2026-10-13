@@ -13,6 +13,8 @@ const std = @import("std");
 const verify = @import("verify.zig");
 const p256 = @import("p256");
 const p384 = @import("p384");
+const p521 = @import("p521");
+const hello = @import("hello.zig");
 const keygen = @import("keygen.zig");
 const rsa = @import("rsa");
 // zig-libs tlsclient: dead-stack burn around the client-certificate signature.
@@ -68,6 +70,11 @@ ssl_key_log: ?*SslKeyLog,
 // zig-libs tlsclient: ALPN. The protocol the server selected, borrowed from
 // `Options.alpn_protocols` (null: none offered, or the server chose none).
 alpn_protocol: ?[]const u8 = null,
+// zig-libs tlsclient: the session view (Go `ConnectionState`).
+/// The key-exchange group the handshake used.
+negotiated_group: ?tls.NamedGroup = null,
+/// Whether the server sent a HelloRetryRequest.
+hello_retry_request: bool = false,
 
 pub const ReadError = error{
     /// The alert description will be stored in `alert`.
@@ -174,6 +181,24 @@ pub const Options = struct {
     /// not implemented (a TLS 1.2 CertificateRequest stays an error).
     client_auth: ?ClientAuth = null,
 
+    // zig-libs tlsclient: Go-shaped options (S2 survey 2026-10-13). The
+    // defaults are Go's `crypto/tls` client's.
+
+    /// Lowest and highest protocol version, TLS 1.2 or 1.3 (Go `MinVersion`
+    /// / `MaxVersion`). A server choosing outside them is
+    /// `error.TlsIllegalParameter`.
+    min_version: tls.ProtocolVersion = .tls_1_2,
+    max_version: tls.ProtocolVersion = .tls_1_3,
+    /// Key-exchange groups offered in supported_groups, most preferred first
+    /// (Go `CurvePreferences`); each one of `supported_groups`. Borrowed
+    /// during `init`.
+    groups: []const tls.NamedGroup = &default_groups,
+    /// The groups of `groups` that get a key share in the first ClientHello.
+    /// A TLS 1.3 server that wants another of `groups` asks for it with a
+    /// HelloRetryRequest, answered with a second ClientHello. Go's default is
+    /// these two; std sent a share for every group (`std_groups`, 4 shares).
+    key_share_groups: []const tls.NamedGroup = &default_key_share_groups,
+
     pub const entropy_len = 240;
 };
 
@@ -262,6 +287,11 @@ pub const InitError = error{
     ClientCertificateTooLarge,
     /// `ClientAuth.key` is not a valid key for its curve.
     ClientKeyInvalid,
+    /// `min_version` above `max_version`, or either not TLS 1.2 / 1.3.
+    VersionsInvalid,
+    /// `groups` empty, a group not in `supported_groups` or listed twice, or
+    /// a `key_share_groups` entry not in `groups`.
+    GroupsInvalid,
 } || std.Io.Writer.Error || std.Io.Reader.ShortError || std.Io.Cancelable;
 
 /// Initiates a TLS handshake and establishes a TLSv1.2 or TLSv1.3 session.
@@ -301,118 +331,47 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
         .no_verification => "",
         .explicit => |host| host,
     };
-    const host_len: u16 = @intCast(host.len);
 
     const client_hello_rand = options.entropy[0..32].*;
     var key_seq: u64 = 0;
     var server_hello_rand: [32]u8 = undefined;
     const legacy_session_id = options.entropy[32..64].*;
 
-    var key_share = KeyShare.init(options.entropy[64..240]) catch |err| switch (err) {
-        // Only possible to happen if the seed is all zeroes.
-        error.IdentityElement => return error.InsufficientEntropy,
-    };
-
-    const extensions_payload = tls.extension(.supported_versions, array(u8, tls.ProtocolVersion, .{
-        .tls_1_3,
-        .tls_1_2,
-    })) ++ tls.extension(.signature_algorithms, array(u16, tls.SignatureScheme, .{
-        .ecdsa_secp256r1_sha256,
-        .ecdsa_secp384r1_sha384,
-        .rsa_pkcs1_sha256,
-        .rsa_pkcs1_sha384,
-        .rsa_pkcs1_sha512,
-        .rsa_pss_rsae_sha256,
-        .rsa_pss_rsae_sha384,
-        .rsa_pss_rsae_sha512,
-        .rsa_pss_pss_sha256,
-        .rsa_pss_pss_sha384,
-        .rsa_pss_pss_sha512,
-        .rsa_pkcs1_sha1,
-        .ed25519,
-    })) ++ tls.extension(.supported_groups, array(u16, tls.NamedGroup, .{
-        .x25519_ml_kem768,
-        .secp256r1,
-        .secp384r1,
-        .x25519,
-    })) ++ tls.extension(.psk_key_exchange_modes, array(u8, tls.PskKeyExchangeMode, .{
-        .psk_dhe_ke,
-    })) ++ tls.extension(.key_share, array(
-        u16,
-        u8,
-        int(u16, @intFromEnum(tls.NamedGroup.x25519_ml_kem768)) ++
-            array(u16, u8, key_share.ml_kem768_kp.public_key.toBytes() ++ key_share.x25519_kp.public_key) ++
-            int(u16, @intFromEnum(tls.NamedGroup.secp256r1)) ++
-            array(u16, u8, key_share.secp256r1_sec1) ++
-            int(u16, @intFromEnum(tls.NamedGroup.secp384r1)) ++
-            array(u16, u8, key_share.secp384r1_sec1) ++
-            int(u16, @intFromEnum(tls.NamedGroup.x25519)) ++
-            array(u16, u8, key_share.x25519_kp.public_key),
-    ));
-    const server_name_extension = int(u16, @intFromEnum(tls.ExtensionType.server_name)) ++
-        int(u16, 2 + 1 + 2 + host_len) ++ // byte length of this extension payload
-        int(u16, 1 + 2 + host_len) ++ // server_name_list byte count
-        .{0x00} ++ // name_type
-        int(u16, host_len);
-    const server_name_extension_len = switch (options.host) {
-        .no_verification => 0,
-        .explicit => server_name_extension.len + host_len,
-    };
-
-    const extensions_header =
-        int(u16, @intCast(extensions_payload.len + server_name_extension_len)) ++
-        extensions_payload ++
-        server_name_extension;
-
-    const client_hello =
-        int(u16, @intFromEnum(tls.ProtocolVersion.tls_1_2)) ++
-        client_hello_rand ++
-        [1]u8{32} ++ legacy_session_id ++
-        cipher_suites ++
-        array(u8, tls.CompressionMethod, .{.null}) ++
-        extensions_header;
-
-    const out_handshake = .{@intFromEnum(tls.HandshakeType.client_hello)} ++
-        int(u24, @intCast(client_hello.len - server_name_extension.len + server_name_extension_len)) ++
-        client_hello;
-
-    const cleartext_header_buf = .{@intFromEnum(tls.ContentType.handshake)} ++
-        int(u16, @intFromEnum(tls.ProtocolVersion.tls_1_0)) ++
-        int(u16, @intCast(out_handshake.len - server_name_extension.len + server_name_extension_len)) ++
-        out_handshake;
-    const cleartext_header = switch (options.host) {
-        .no_verification => cleartext_header_buf[0 .. cleartext_header_buf.len - server_name_extension.len],
-        .explicit => &cleartext_header_buf,
-    };
-
-    // zig-libs tlsclient: ALPN. With no protocols the ClientHello is std's,
-    // byte for byte. Otherwise the extension goes last (after the host
-    // name) and the three length fields in front of it grow by its size.
+    // zig-libs tlsclient: the ClientHello is built at run time (hello.zig)
+    // from the options; std's comptime shape is `std_groups` with every addition off.
+    try checkVersions(options.min_version, options.max_version);
+    try checkGroups(options.groups, options.key_share_groups);
+    var key_share = KeyShare.init(options.entropy[64..240]);
+    var versions_buf: [2]tls.ProtocolVersion = undefined;
+    const versions = offeredVersions(&versions_buf, options.min_version, options.max_version);
     var alpn_ext_buf: [4 + 2 + max_alpn_len]u8 = undefined;
     const alpn_ext = try alpnExtension(&alpn_ext_buf, options.alpn_protocols);
-    var patched_header_buf: [cleartext_header_buf.len]u8 = undefined;
-    const hello_header: []const u8 = if (alpn_ext.len == 0) cleartext_header else blk: {
-        const h = patched_header_buf[0..cleartext_header.len];
-        @memcpy(h, cleartext_header);
-        const ext_len_at = tls.record_header_len + 4 + 2 + 32 + 1 + 32 + cipher_suites.len + 2;
-        const grow: u16 = @intCast(alpn_ext.len);
-        mem.writeInt(u16, h[3..5], mem.readInt(u16, h[3..5], .big) + grow, .big);
-        mem.writeInt(u24, h[6..9], mem.readInt(u24, h[6..9], .big) + grow, .big);
-        mem.writeInt(u16, h[ext_len_at..][0..2], mem.readInt(u16, h[ext_len_at..][0..2], .big) + grow, .big);
-        break :blk h;
+    var hello_params: hello.Params = .{
+        .random = &client_hello_rand,
+        .session_id = &legacy_session_id,
+        .cipher_suites = &cipher_suites,
+        .host = host,
+        .versions = versions,
+        .groups = options.groups,
+        .shares = &.{},
+        .alpn_ext = alpn_ext,
     };
-
-    {
-        var iovecs: [3][]const u8 = .{ hello_header, host, alpn_ext };
-        var n: usize = 0;
-        for (iovecs) |v| {
-            if (v.len == 0) continue;
-            iovecs[n] = v;
-            n += 1;
-        }
-        try output.writeVecAll(iovecs[0..n]);
-        try output.flush();
+    var shares_buf: [supported_groups.len]hello.Share = undefined;
+    // In TLS 1.2 only, no key_share is sent (RFC 8446 §4.2.8 is TLS 1.3's).
+    const share_groups = if (options.max_version == .tls_1_3) options.key_share_groups else &.{};
+    for (share_groups, 0..) |g, i| {
+        key_share.ensure(g) catch return error.InsufficientEntropy; // only an all-zero seed fails
+        shares_buf[i] = .{ .group = g, .key = key_share.publicKey(g) };
     }
+    hello_params.shares = shares_buf[0..share_groups.len];
+    var hello_buf: [hello.max_len]u8 = undefined;
+    var hello_msg: []const u8 = hello.write(&hello_buf, hello_params) catch unreachable; // bounded: max_len covers every share + host + ALPN
+    try writeHelloRecord(output, .tls_1_0, hello_msg);
+    // zig-libs tlsclient: HelloRetryRequest state (RFC 8446 §4.1.4).
+    var hrr_seen = false;
+    var hrr_suite: tls.CipherSuite = undefined;
+    var hrr_group: ?tls.NamedGroup = null;
+    var cookie_buf: [hello.max_cookie_len]u8 = undefined;
     // zig-libs tlsclient: client authentication -- the server's
     // CertificateRequest, when one came.
     var cert_request: ?CertRequest = null;
@@ -463,6 +422,9 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
     var handshake_cipher: tls.HandshakeCipher = undefined;
     var main_cert_pub_key: CertificatePublicKey = undefined;
     var tls12_negotiated_group: ?tls.NamedGroup = null;
+    // zig-libs tlsclient: session view.
+    var negotiated_group: ?tls.NamedGroup = null;
+    var negotiated_suite: tls.CipherSuite = undefined;
     const now_sec = options.realtime_now.toSeconds();
 
     var cleartext_fragment_start: usize = 0;
@@ -491,6 +453,9 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
             .cleartext => .{ record_decoder, record_ct },
             .handshake => {
                 assert(tls_version == .tls_1_3);
+                // zig-libs tlsclient: the middlebox-compatibility CCS stays
+                // cleartext (RFC 8446 §5, D.4) and is ignored below.
+                if (record_ct == .change_cipher_spec) break :content .{ record_decoder, record_ct };
                 if (record_ct != .application_data) return error.TlsUnexpectedMessage;
                 try record_decoder.ensure(record_len);
                 const cleartext_buf = &cleartext_bufs[cert_buf_index % 2];
@@ -585,11 +550,11 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
                         try hsd.ensure(2 + 32 + 1);
                         const legacy_version = hsd.decode(u16);
                         @memcpy(&server_hello_rand, hsd.array(32));
-                        if (mem.eql(u8, &server_hello_rand, &tls.hello_retry_request_sequence)) {
-                            // This is a HelloRetryRequest message. This client implementation
-                            // does not expect to get one.
-                            return error.TlsUnexpectedMessage;
-                        }
+                        // zig-libs tlsclient: a HelloRetryRequest (RFC 8446
+                        // §4.1.4) is answered with a second ClientHello; std
+                        // aborted on any.
+                        const is_hrr = mem.eql(u8, &server_hello_rand, &tls.hello_retry_request_sequence);
+                        if (is_hrr and hrr_seen) return error.TlsUnexpectedMessage; // a second HRR
                         const legacy_session_id_echo_len = hsd.decode(u8);
                         try hsd.ensure(legacy_session_id_echo_len + 2 + 1);
                         const legacy_session_id_echo = hsd.slice(legacy_session_id_echo_len);
@@ -598,6 +563,10 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
                         var supported_version: ?u16 = null;
                         // zig-libs tlsclient: ALPN.
                         var alpn_seen = false;
+                        // zig-libs tlsclient: HRR fields, and the ServerHello's group.
+                        var hrr_selected: ?tls.NamedGroup = null;
+                        var hrr_cookie: ?[]const u8 = null;
+                        var sh_group: ?tls.NamedGroup = null;
                         if (!hsd.eof()) {
                             try hsd.ensure(2);
                             const extensions_size = hsd.decode(u16);
@@ -613,16 +582,33 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
                                         try extd.ensure(2);
                                         supported_version = extd.decode(u16);
                                     },
-                                    .key_share => {
+                                    .key_share => if (is_hrr) {
+                                        // HRR: only the selected group.
+                                        if (hrr_selected != null) return error.TlsIllegalParameter;
+                                        try extd.ensure(2);
+                                        hrr_selected = extd.decode(tls.NamedGroup);
+                                    } else {
                                         if (key_share.getSharedSecret()) |_| return error.TlsIllegalParameter;
                                         try extd.ensure(4);
                                         const named_group = extd.decode(tls.NamedGroup);
                                         const key_size = extd.decode(u16);
                                         try extd.ensure(key_size);
+                                        // After an HRR the server must use the group it asked for.
+                                        if (hrr_group) |g| if (g != named_group) return error.TlsIllegalParameter;
                                         try key_share.exchange(named_group, extd.slice(key_size));
+                                        sh_group = named_group;
                                     },
+                                    .cookie => if (is_hrr) {
+                                        if (hrr_cookie != null) return error.TlsIllegalParameter;
+                                        try extd.ensure(2);
+                                        const len = extd.decode(u16);
+                                        if (len == 0 or len > hello.max_cookie_len) return error.TlsIllegalParameter;
+                                        try extd.ensure(len);
+                                        hrr_cookie = extd.slice(len);
+                                    } else return error.TlsIllegalParameter,
                                     // zig-libs tlsclient: ALPN (TLS 1.2 answers in ServerHello).
                                     .application_layer_protocol_negotiation => if (options.alpn_protocols.len != 0) {
+                                        if (is_hrr) return error.TlsIllegalParameter;
                                         if (alpn_seen) return error.TlsIllegalParameter;
                                         alpn_seen = true;
                                         alpn_selected = try alpnSelected(options.alpn_protocols, extd.rest());
@@ -633,38 +619,92 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
                         }
 
                         tls_version = @enumFromInt(supported_version orelse legacy_version);
+                        // zig-libs tlsclient: the version must be one we offered.
+                        if (!versionOffered(versions, tls_version)) return error.TlsIllegalParameter;
                         switch (tls_version) {
                             .tls_1_3 => if (!mem.eql(u8, legacy_session_id_echo, &legacy_session_id)) return error.TlsIllegalParameter,
+                            // RFC 8446 §4.1.3: a client that offered TLS 1.3
+                            // refuses either downgrade sentinel; one that did
+                            // not (max_version 1.2) only the TLS 1.1 one.
                             .tls_1_2 => if (mem.eql(u8, server_hello_rand[24..31], "DOWNGRD") and
-                                server_hello_rand[31] >> 1 == 0x00) return error.TlsIllegalParameter,
+                                (server_hello_rand[31] == 0x00 or
+                                    (server_hello_rand[31] == 0x01 and options.max_version == .tls_1_3))) return error.TlsIllegalParameter,
                             else => return error.TlsIllegalParameter,
                         }
 
-                        switch (cipher_suite_tag) {
-                            inline .AES_128_GCM_SHA256,
-                            .AES_256_GCM_SHA384,
-                            .CHACHA20_POLY1305_SHA256,
-                            .AEGIS_256_SHA512,
-                            .AEGIS_128L_SHA256,
-
-                            .ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-                            .ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-                            .ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
-                            => |tag| {
-                                handshake_cipher = @unionInit(tls.HandshakeCipher, @tagName(tag.with()), .{
-                                    .transcript_hash = .init(.{}),
-                                    .version = undefined,
-                                });
-                                const p = &@field(handshake_cipher, @tagName(tag.with()));
-                                p.transcript_hash.update(hello_header[tls.record_header_len..]); // Client Hello part 1
-                                p.transcript_hash.update(host); // Client Hello part 2
-                                p.transcript_hash.update(alpn_ext); // zig-libs tlsclient: ALPN (empty when off)
-                                p.transcript_hash.update(wrapped_handshake);
-                            },
-
-                            else => return error.TlsIllegalParameter,
+                        if (is_hrr) {
+                            // zig-libs tlsclient: RFC 8446 §4.1.4.
+                            if (tls_version != .tls_1_3) return error.TlsIllegalParameter;
+                            switch (cipher_suite_tag) {
+                                .AES_128_GCM_SHA256, .AES_256_GCM_SHA384, .CHACHA20_POLY1305_SHA256, .AEGIS_256_SHA512, .AEGIS_128L_SHA256 => {},
+                                else => return error.TlsIllegalParameter,
+                            }
+                            if (hrr_selected) |g| {
+                                // A group we offered, holding no share yet.
+                                if (mem.indexOfScalar(tls.NamedGroup, options.groups, g) == null) return error.TlsIllegalParameter;
+                                for (hello_params.shares) |sh| if (sh.group == g) return error.TlsIllegalParameter;
+                            } else if (hrr_cookie == null) return error.TlsIllegalParameter; // "would not result in any change"
+                            try initHandshakeCipher(&handshake_cipher, cipher_suite_tag);
+                            switch (handshake_cipher) {
+                                inline else => |*p| {
+                                    // Transcript: message_hash(Hash(ClientHello1)), HRR.
+                                    const H = @TypeOf(p.transcript_hash);
+                                    var h1: [H.digest_length]u8 = undefined;
+                                    H.hash(hello_msg, &h1, .{});
+                                    p.transcript_hash.update(&.{ @intFromEnum(tls.HandshakeType.message_hash), 0, 0, H.digest_length });
+                                    p.transcript_hash.update(&h1);
+                                    p.transcript_hash.update(wrapped_handshake);
+                                },
+                            }
+                            if (hrr_selected) |g| {
+                                key_share.ensure(g) catch return error.InsufficientEntropy;
+                                shares_buf[0] = .{ .group = g, .key = key_share.publicKey(g) };
+                                hello_params.shares = shares_buf[0..1];
+                                hrr_group = g;
+                            }
+                            if (hrr_cookie) |c| {
+                                @memcpy(cookie_buf[0..c.len], c);
+                                hello_params.cookie = cookie_buf[0..c.len];
+                            }
+                            hello_msg = hello.write(&hello_buf, hello_params) catch unreachable; // bounded as the first
+                            switch (handshake_cipher) {
+                                inline else => |*p| p.transcript_hash.update(hello_msg),
+                            }
+                            try writeHelloRecord(output, .tls_1_2, hello_msg);
+                            hrr_seen = true;
+                            hrr_suite = cipher_suite_tag;
+                        } else {
+                            if (hrr_seen) {
+                                // The ServerHello after an HRR keeps its suite and version.
+                                if (tls_version != .tls_1_3 or cipher_suite_tag != hrr_suite) return error.TlsIllegalParameter;
+                            } else {
+                                switch (cipher_suite_tag) {
+                                    .AES_128_GCM_SHA256,
+                                    .AES_256_GCM_SHA384,
+                                    .CHACHA20_POLY1305_SHA256,
+                                    .AEGIS_256_SHA512,
+                                    .AEGIS_128L_SHA256,
+                                    .ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+                                    .ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+                                    .ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+                                    .ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+                                    .ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+                                    .ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+                                    => {},
+                                    else => return error.TlsIllegalParameter,
+                                }
+                                try initHandshakeCipher(&handshake_cipher, cipher_suite_tag);
+                                switch (handshake_cipher) {
+                                    inline else => |*p| p.transcript_hash.update(hello_msg),
+                                }
+                            }
+                            switch (handshake_cipher) {
+                                inline else => |*p| p.transcript_hash.update(wrapped_handshake),
+                            }
+                            negotiated_group = sh_group;
+                            negotiated_suite = cipher_suite_tag;
                         }
-                        switch (tls_version) {
+                        if (!is_hrr) switch (tls_version) {
                             .tls_1_3 => {
                                 switch (cipher_suite_tag) {
                                     inline .AES_128_GCM_SHA256,
@@ -704,17 +744,26 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
                                     else => return error.TlsIllegalParameter,
                                 }
                                 pending_cipher_state = .handshake;
+                                // zig-libs tlsclient: TLS 1.3 encrypts from the
+                                // record after ServerHello whether or not a
+                                // ChangeCipherSpec came (RFC 8446 §5: CCS is
+                                // ignored). std waited for one, and after an HRR
+                                // the server's only CCS precedes this ServerHello.
+                                cipher_state = .handshake;
                                 handshake_state = .encrypted_extensions;
                             },
                             .tls_1_2 => switch (cipher_suite_tag) {
                                 .ECDHE_RSA_WITH_AES_128_GCM_SHA256,
                                 .ECDHE_RSA_WITH_AES_256_GCM_SHA384,
                                 .ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+                                .ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+                                .ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+                                .ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
                                 => handshake_state = .certificate,
                                 else => return error.TlsIllegalParameter,
                             },
                             else => return error.TlsIllegalParameter,
-                        }
+                        };
                     },
                     .encrypted_extensions => {
                         if (tls_version != .tls_1_3) return error.TlsUnexpectedMessage;
@@ -865,10 +914,30 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
                         if (curve_type != 0x03) return error.TlsIllegalParameter; // named_curve
                         const named_group = hsd.decode(tls.NamedGroup);
                         tls12_negotiated_group = named_group;
+                        negotiated_group = named_group;
                         const key_size = hsd.decode(u8);
                         try hsd.ensure(key_size);
                         const server_pub_key = hsd.slice(key_size);
+                        // zig-libs tlsclient: the suite names the certificate's
+                        // key type (RFC 5246 §7.4.2, RFC 8422 §5.3).
+                        const ecdsa_suite = switch (negotiated_suite) {
+                            .ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+                            .ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+                            .ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+                            => true,
+                            else => false,
+                        };
+                        const key_ok = if (ecdsa_suite)
+                            main_cert_pub_key.algo == .X9_62_id_ecPublicKey
+                        else
+                            main_cert_pub_key.algo == .rsaEncryption or main_cert_pub_key.algo == .rsassa_pss;
+                        if (!key_ok) return error.TlsBadSignatureScheme;
                         try main_cert_pub_key.verifySignature(&hsd, &.{ &client_hello_rand, &server_hello_rand, hsd.buf[0..hsd.idx] });
+                        // zig-libs tlsclient: one of our groups (and not the
+                        // TLS 1.3-only hybrid); its key pair is made now.
+                        if (named_group == .x25519_ml_kem768 or
+                            mem.indexOfScalar(tls.NamedGroup, options.groups, named_group) == null) return error.TlsIllegalParameter;
+                        key_share.ensure(named_group) catch return error.InsufficientEntropy;
                         try key_share.exchange(named_group, server_pub_key);
                         handshake_state = .server_hello_done;
                     },
@@ -877,12 +946,10 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
                         if (cipher_state != .cleartext) return error.TlsUnexpectedMessage;
                         if (handshake_state != .server_hello_done) return error.TlsUnexpectedMessage;
 
-                        const public_key_bytes: []const u8 = switch (tls12_negotiated_group orelse .secp256r1) {
-                            .secp256r1 => &key_share.secp256r1_sec1,
-                            .secp384r1 => &key_share.secp384r1_sec1,
-                            .x25519 => &key_share.x25519_kp.public_key,
-                            else => return error.TlsIllegalParameter,
-                        };
+                        // zig-libs tlsclient: the group's key, made at ServerKeyExchange.
+                        const group = tls12_negotiated_group orelse return error.TlsUnexpectedMessage;
+                        if (!key_share.has(group)) return error.TlsIllegalParameter;
+                        const public_key_bytes: []const u8 = key_share.publicKey(group);
 
                         const client_key_exchange_prefix = .{@intFromEnum(tls.ContentType.handshake)} ++
                             int(u16, @intFromEnum(tls.ProtocolVersion.tls_1_2)) ++
@@ -1120,6 +1187,8 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
                             .application_cipher = app_cipher,
                             .ssl_key_log = options.ssl_key_log,
                             .alpn_protocol = alpn_selected, // zig-libs tlsclient: ALPN
+                            .negotiated_group = negotiated_group,
+                            .hello_retry_request = hrr_seen,
                         };
                     },
                     else => return error.TlsUnexpectedMessage,
@@ -1131,6 +1200,77 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
         }
         cleartext_fragment_start = 0;
         cleartext_fragment_end = 0;
+    }
+}
+
+// ── zig-libs tlsclient: ClientHello helpers ──────────────────────────────
+
+fn checkVersions(min: tls.ProtocolVersion, max: tls.ProtocolVersion) error{VersionsInvalid}!void {
+    const ok = (min == .tls_1_2 or min == .tls_1_3) and (max == .tls_1_2 or max == .tls_1_3);
+    if (!ok or @intFromEnum(min) > @intFromEnum(max)) return error.VersionsInvalid;
+}
+
+fn checkGroups(groups: []const tls.NamedGroup, shares: []const tls.NamedGroup) error{GroupsInvalid}!void {
+    if (groups.len == 0 or groups.len > supported_groups.len) return error.GroupsInvalid;
+    for (groups, 0..) |g, i| {
+        if (!groupSupported(g)) return error.GroupsInvalid;
+        if (mem.indexOfScalar(tls.NamedGroup, groups[0..i], g) != null) return error.GroupsInvalid;
+    }
+    for (shares, 0..) |g, i| {
+        if (mem.indexOfScalar(tls.NamedGroup, groups, g) == null) return error.GroupsInvalid;
+        if (mem.indexOfScalar(tls.NamedGroup, shares[0..i], g) != null) return error.GroupsInvalid;
+    }
+}
+
+/// supported_versions, newest first.
+fn offeredVersions(buf: *[2]tls.ProtocolVersion, min: tls.ProtocolVersion, max: tls.ProtocolVersion) []const tls.ProtocolVersion {
+    var n: usize = 0;
+    if (max == .tls_1_3) {
+        buf[n] = .tls_1_3;
+        n += 1;
+    }
+    if (min == .tls_1_2) {
+        buf[n] = .tls_1_2;
+        n += 1;
+    }
+    return buf[0..n];
+}
+
+fn versionOffered(versions: []const tls.ProtocolVersion, v: tls.ProtocolVersion) bool {
+    return mem.indexOfScalar(tls.ProtocolVersion, versions, v) != null;
+}
+
+/// One handshake record holding `msg`. RFC 8446 §5.1: legacy_record_version
+/// 0x0301 is allowed for the first ClientHello only; std uses it there.
+fn writeHelloRecord(output: *Writer, record_version: tls.ProtocolVersion, msg: []const u8) Writer.Error!void {
+    const header = [_]u8{@intFromEnum(tls.ContentType.handshake)} ++ int(u16, @intFromEnum(record_version));
+    var len: [2]u8 = undefined;
+    mem.writeInt(u16, &len, @intCast(msg.len), .big);
+    var iovecs = [_][]const u8{ &header, &len, msg };
+    try output.writeVecAll(&iovecs);
+    try output.flush();
+}
+
+/// A fresh transcript for `suite` (std's ServerHello code, factored out so
+/// a HelloRetryRequest can start it).
+fn initHandshakeCipher(hc: *tls.HandshakeCipher, suite: tls.CipherSuite) error{TlsIllegalParameter}!void {
+    switch (suite) {
+        inline .AES_128_GCM_SHA256,
+        .AES_256_GCM_SHA384,
+        .CHACHA20_POLY1305_SHA256,
+        .AEGIS_256_SHA512,
+        .AEGIS_128L_SHA256,
+        .ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+        .ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+        .ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+        .ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+        .ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+        .ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+        => |tag| hc.* = @unionInit(tls.HandshakeCipher, @tagName(tag.with()), .{
+            .transcript_hash = .init(.{}),
+            .version = undefined,
+        }),
+        else => return error.TlsIllegalParameter,
     }
 }
 
@@ -1728,17 +1868,44 @@ fn big(x: anytype) @TypeOf(x) {
     };
 }
 
+/// zig-libs tlsclient: the groups this client can do ECDHE/KEM with, and Go's
+/// default preferences for them (Go `CurvePreferences`): every group listed,
+/// key shares for the two Go sends; the others are reached through a
+/// HelloRetryRequest.
+pub const supported_groups = [_]tls.NamedGroup{ .x25519_ml_kem768, .x25519, .secp256r1, .secp384r1, .secp521r1 };
+pub const default_groups = supported_groups;
+pub const default_key_share_groups = [_]tls.NamedGroup{ .x25519_ml_kem768, .x25519 };
+/// std's ClientHello shape: these groups, a share for each.
+pub const std_groups = [_]tls.NamedGroup{ .x25519_ml_kem768, .secp256r1, .secp384r1, .x25519 };
+
+fn groupSupported(g: tls.NamedGroup) bool {
+    return mem.indexOfScalar(tls.NamedGroup, &supported_groups, g) != null;
+}
+
 const KeyShare = struct {
     ml_kem768_kp: crypto.kem.ml_kem.MLKem768.KeyPair,
     secp256r1_kp: crypto.sign.ecdsa.EcdsaP256Sha256.KeyPair,
     secp384r1_kp: p384.EcdsaP384Sha384.KeyPair,
-    /// zig-libs tlsclient: the two NIST public keys' SEC1 encodings, made
-    /// once at generation. The ClientHello (and a TLS 1.2 ClientKeyExchange)
-    /// used to re-encode them, a field inversion each -- on std's slow
-    /// P-256 `divstep` for P-256.
+    secp521r1_kp: p521.EcdsaP521Sha512.KeyPair,
+    x25519_kp: crypto.dh.X25519.KeyPair,
+    /// zig-libs tlsclient: each share's wire encoding, made once at
+    /// generation. The ClientHello (and a TLS 1.2 ClientKeyExchange) used to
+    /// re-encode the NIST keys, a field inversion each -- on std's slow P-256
+    /// `divstep` for P-256.
+    hybrid_pub: [crypto.kem.ml_kem.MLKem768.PublicKey.encoded_length + crypto.dh.X25519.public_length]u8,
     secp256r1_sec1: [65]u8,
     secp384r1_sec1: [97]u8,
-    x25519_kp: crypto.dh.X25519.KeyPair,
+    secp521r1_sec1: [133]u8,
+    /// zig-libs tlsclient: which key pairs exist. A pair is generated when a
+    /// share is offered or a server picks its group (HelloRetryRequest, TLS
+    /// 1.2 ServerKeyExchange), so a handshake pays only for what it uses.
+    have_ml_kem: bool = false,
+    have_x25519: bool = false,
+    have_p256: bool = false,
+    have_p384: bool = false,
+    have_p521: bool = false,
+    /// `Options.entropy[64..240]`; read only during `init`.
+    seed: *const [176]u8,
     sk_buf: [sk_max_len]u8,
     sk_len: std.math.IntFittingRange(0, sk_max_len),
 
@@ -1746,26 +1913,93 @@ const KeyShare = struct {
         crypto.dh.X25519.shared_length + crypto.kem.ml_kem.MLKem768.shared_length,
         crypto.ecc.P256.scalar.encoded_length,
         crypto.ecc.P384.scalar.encoded_length,
+        66, // P-521 x
         crypto.dh.X25519.shared_length,
     );
 
-    fn init(seed: *const [176]u8) error{IdentityElement}!KeyShare {
-        var ks: KeyShare = .{
-            .ml_kem768_kp = try .generateDeterministic(seed[0..64].*),
-            // zig-libs tlsclient: std's key pairs, byte for byte, with the
-            // public keys from fixed-base combs (keygen.zig: p256's, p384's) —
-            // std's `basePoint.mul` for these two was ~2/3 of the client's CPU.
+    fn init(seed: *const [176]u8) KeyShare {
+        return .{
+            .ml_kem768_kp = undefined,
             .secp256r1_kp = undefined,
-            .secp384r1_kp = try keygen.keyPairP384(seed[96..144].*),
+            .secp384r1_kp = undefined,
+            .secp521r1_kp = undefined,
+            .x25519_kp = undefined,
+            .hybrid_pub = undefined,
             .secp256r1_sec1 = undefined,
             .secp384r1_sec1 = undefined,
-            .x25519_kp = try .generateDeterministic(seed[144..176].*),
+            .secp521r1_sec1 = undefined,
+            .seed = seed,
             .sk_buf = undefined,
             .sk_len = 0,
         };
-        ks.secp256r1_kp = try keygen.keyPairP256(seed[64..96].*, &ks.secp256r1_sec1);
-        ks.secp384r1_sec1 = ks.secp384r1_kp.public_key.toUncompressedSec1();
-        return ks;
+    }
+
+    /// Generate the key pair(s) `group` needs, once. The seeds are std's
+    /// (ML-KEM 0..64, P-256 64..96, P-384 96..144, X25519 144..176), so a
+    /// std-shaped hello carries std's keys; P-521, which std lacks, takes an
+    /// HKDF expansion of the whole seed.
+    fn ensure(ks: *KeyShare, group: tls.NamedGroup) error{ IdentityElement, TlsIllegalParameter }!void {
+        switch (group) {
+            .x25519_ml_kem768 => {
+                try ks.ensure(.x25519);
+                if (ks.have_ml_kem) return;
+                ks.ml_kem768_kp = try .generateDeterministic(ks.seed[0..64].*);
+                ks.hybrid_pub = ks.ml_kem768_kp.public_key.toBytes() ++ ks.x25519_kp.public_key;
+                ks.have_ml_kem = true;
+            },
+            .x25519 => if (!ks.have_x25519) {
+                ks.x25519_kp = try .generateDeterministic(ks.seed[144..176].*);
+                ks.have_x25519 = true;
+            },
+            // zig-libs tlsclient: std's key pairs, byte for byte, with the
+            // public keys from fixed-base combs (keygen.zig: p256's, p384's) —
+            // std's `basePoint.mul` for these two was ~2/3 of the client's CPU.
+            .secp256r1 => if (!ks.have_p256) {
+                ks.secp256r1_kp = try keygen.keyPairP256(ks.seed[64..96].*, &ks.secp256r1_sec1);
+                ks.have_p256 = true;
+            },
+            .secp384r1 => if (!ks.have_p384) {
+                ks.secp384r1_kp = try keygen.keyPairP384(ks.seed[96..144].*);
+                ks.secp384r1_sec1 = ks.secp384r1_kp.public_key.toUncompressedSec1();
+                ks.have_p384 = true;
+            },
+            .secp521r1 => if (!ks.have_p521) {
+                const Hkdf = crypto.kdf.hkdf.HkdfSha512;
+                var prk = Hkdf.extract("zig-libs tlsclient P-521 key share", ks.seed);
+                defer crypto.secureZero(u8, &prk);
+                var s: [p521.EcdsaP521Sha512.KeyPair.seed_length]u8 = undefined;
+                defer crypto.secureZero(u8, &s);
+                Hkdf.expand(&s, "", prk);
+                p521.EcdsaP521Sha512.KeyPair.generateDeterministicInto(&ks.secp521r1_kp, &s) catch return error.IdentityElement;
+                ks.secp521r1_sec1 = ks.secp521r1_kp.public_key.toUncompressedSec1();
+                ks.have_p521 = true;
+            },
+            else => return error.TlsIllegalParameter,
+        }
+    }
+
+    fn has(ks: *const KeyShare, group: tls.NamedGroup) bool {
+        return switch (group) {
+            .x25519_ml_kem768 => ks.have_ml_kem,
+            .x25519 => ks.have_x25519,
+            .secp256r1 => ks.have_p256,
+            .secp384r1 => ks.have_p384,
+            .secp521r1 => ks.have_p521,
+            else => false,
+        };
+    }
+
+    /// The key_share / ClientKeyExchange bytes of a generated group.
+    fn publicKey(ks: *const KeyShare, group: tls.NamedGroup) []const u8 {
+        assert(ks.has(group));
+        return switch (group) {
+            .x25519_ml_kem768 => &ks.hybrid_pub,
+            .x25519 => &ks.x25519_kp.public_key,
+            .secp256r1 => &ks.secp256r1_sec1,
+            .secp384r1 => &ks.secp384r1_sec1,
+            .secp521r1 => &ks.secp521r1_sec1,
+            else => unreachable,
+        };
     }
 
     fn exchange(
@@ -1773,6 +2007,9 @@ const KeyShare = struct {
         named_group: tls.NamedGroup,
         server_pub_key: []const u8,
     ) error{ TlsIllegalParameter, TlsDecryptFailure }!void {
+        // zig-libs tlsclient: a group we hold no key for (no share offered,
+        // none generated) is the server's error.
+        if (!ks.has(named_group)) return error.TlsIllegalParameter;
         switch (named_group) {
             .x25519_ml_kem768 => {
                 const hksl = crypto.kem.ml_kem.MLKem768.ciphertext_length;
@@ -1807,6 +2044,12 @@ const KeyShare = struct {
                 p384.ecdhInto(ks.sk_buf[0..48], &ks.secp384r1_kp.secret_key.bytes, server_pub_key) catch
                     return error.TlsDecryptFailure;
                 ks.sk_len = 48;
+            },
+            .secp521r1 => {
+                // zig-libs tlsclient: P-521 (std has none) through `p521`.
+                p521.ecdhInto(ks.sk_buf[0..66], &ks.secp521r1_kp.secret_key.bytes, server_pub_key) catch
+                    return error.TlsDecryptFailure;
+                ks.sk_len = 66;
             },
             .x25519 => {
                 const ksl = crypto.dh.X25519.public_length;
@@ -2088,6 +2331,11 @@ const cipher_suites = if (crypto.core.aes.has_hardware_support)
         .ECDHE_RSA_WITH_AES_256_GCM_SHA384,
         .CHACHA20_POLY1305_SHA256,
         .ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+        // zig-libs tlsclient: TLS 1.2 with an ECDSA certificate (Go offers
+        // these; std had RSA key exchange signatures only).
+        .ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+        .ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+        .ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
     })
 else
     array(u16, tls.CipherSuite, .{
@@ -2099,6 +2347,10 @@ else
         .ECDHE_RSA_WITH_AES_128_GCM_SHA256,
         .AES_256_GCM_SHA384,
         .ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+        // zig-libs tlsclient: see above.
+        .ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+        .ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+        .ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
     });
 
 // ── zig-libs tlsclient: unit tests for the additions ──────────────────────

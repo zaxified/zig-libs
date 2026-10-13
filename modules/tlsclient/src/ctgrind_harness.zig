@@ -95,6 +95,10 @@ fn callInit() !void {
         .read_buffer = &read_buf,
         .entropy = &entropy,
         .realtime_now = .{ .nanoseconds = 0 },
+        // Every key share generated, so every key generation is measured
+        // (Go's default would make only two).
+        .key_share_groups = &Client.std_groups,
+        .groups = &Client.std_groups,
     });
 }
 

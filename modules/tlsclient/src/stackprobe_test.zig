@@ -436,6 +436,10 @@ noinline fn callInit() void {
         .entropy = &kex_entropy,
         .realtime_now = .{ .nanoseconds = 0 },
         .ssl_key_log = if (use_key_log) &key_log else null,
+        // A share for every group the probe answers in (Go's default sends
+        // two; the canned ServerHellos pick P-256 and P-384 directly).
+        .key_share_groups = &Client.std_groups,
+        .groups = &Client.std_groups,
     };
     init_err = null;
     Client.initInto(&client_sink, &in_reader, &out_writer, opts) catch |e| {

@@ -48,12 +48,28 @@ impersonate any host. Here:
    for every issuer name the chain mentions as trust anchors, and
    `required_eku = .server_auth` (`verify.zig`).
 
-**No change to std's behaviour by default** (policy relaxed 2026-10-04 from
-"no new options"): every addition is an `Options` field whose default leaves
-the handshake byte-for-byte std's -- a test compares the ClientHello of both
-clients under default options, and another that a CertificateRequest without
-`client_auth` fails exactly as in std. A consumer still changes one import.
-The additions, each marked `zig-libs tlsclient` in `Client.zig`:
+**Defaults are Go's `crypto/tls` client's** (owner, 2026-10-13; until then
+"no change to std's behaviour by default"). The ClientHello is built at run
+time (`hello.zig`): Go's groups (X25519MLKEM768, X25519, P-256, P-384, P-521)
+with shares for the first two, the rest reached by HelloRetryRequest. std's
+shape stays reachable -- `groups = key_share_groups = std_groups` -- and a test
+pins that hello to std's byte for byte, except the three TLS 1.2 ECDHE_ECDSA
+suites this module adds. A CertificateRequest without `client_auth` still
+fails as in std. A consumer still changes one import. The additions, each
+marked `zig-libs tlsclient` in `Client.zig`:
+
+- **Version bounds** `min_version`/`max_version` (Go `MinVersion`/`MaxVersion`).
+- **Groups** `groups` (Go `CurvePreferences`) and `key_share_groups`; key pairs
+  are generated only for a share offered or a group a server picks. P-521
+  (std has none) through the `p521` module.
+- **HelloRetryRequest** (RFC 8446 §4.1.4): selected group and/or cookie,
+  message_hash transcript, second ClientHello on record version 0x0303; a
+  second HRR, an HRR that changes nothing, names a group we shared or never
+  listed, or is not TLS 1.3 is refused. TLS 1.3 now switches to the handshake
+  cipher right after ServerHello and ignores the compatibility
+  ChangeCipherSpec (std waited for one).
+- **TLS 1.2 ECDHE_ECDSA suites** (AES-GCM, ChaCha20); the suite must match the
+  certificate's key type.
 
 - **ALPN (RFC 7301).** `Options.alpn_protocols` (default empty: no
   extension) and `Client.alpn_protocol`. The extension goes last in the

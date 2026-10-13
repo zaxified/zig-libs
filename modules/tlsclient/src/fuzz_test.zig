@@ -314,7 +314,10 @@ fn ensureTemplates() !void {
     bw.writeInt(u16, 0x0303, .big) catch unreachable;
     bw.writeAll(&server_rand) catch unreachable;
     bw.writeByte(0) catch unreachable; // no session id
-    bw.writeInt(u16, @intFromEnum(tls.CipherSuite.ECDHE_RSA_WITH_AES_128_GCM_SHA256), .big) catch unreachable;
+    // The certificate's key is P-256, so the suite is ECDHE_ECDSA (RFC 8422
+    // §5.3; the client checks the pairing since 2026-10-13 -- std accepted
+    // ECDHE_RSA here).
+    bw.writeInt(u16, @intFromEnum(tls.CipherSuite.ECDHE_ECDSA_WITH_AES_128_GCM_SHA256), .big) catch unreachable;
     bw.writeByte(0) catch unreachable;
     putPlain(&w12, hsMsg(&m12, .server_hello, body[0..bw.end]));
 
