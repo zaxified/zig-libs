@@ -25,6 +25,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const p256 = @import("p256");
+const p384 = @import("p384");
 const root = @import("root.zig");
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -32,7 +33,7 @@ const Sha384 = std.crypto.hash.sha2.Sha384;
 const Sha512 = std.crypto.hash.sha2.Sha512;
 const Shake256 = std.crypto.hash.sha3.Shake256;
 const hmac_sha2 = std.crypto.auth.hmac.sha2;
-const P384Scalar = std.crypto.ecc.P384.scalar.Scalar;
+const P384Scalar = p384.Scalar;
 const Ed25519Scalar = std.crypto.ecc.Edwards25519.scalar;
 const P256Scalar = p256.Scalar;
 

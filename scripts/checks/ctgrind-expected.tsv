@@ -1418,28 +1418,26 @@ acme	ReleaseFast	pem	1	12	ff5034cfc42531e1	e3f3e71bec825dd7
 # (timing_safe.eql in verifyHmac) yields a tainted verdict that reaches only the
 # harness printer (67 witness); no branch or load of root.zig / encode.zig takes
 # the secret. Needs no declassification: the verdict is public by design.
-jwt	ReleaseFast	hmac	1	0	c077d53278717a03	82c3cf6208c0b9d8
-# ec 18 = ES256 9 + ES384 8 + EdDSA 1. Every ES context carries encode.zig:274
+jwt	ReleaseFast	hmac	1	0	a8319eb28aceb966	82c3cf6208c0b9d8
+# ec 10 = ES256 9 + EdDSA 1. Every ES context carries encode.zig:274
 # (signEc) in its stack, so the pattern attributes the DELEGATED signer to jwt,
 # exactly as acme's p256 contexts; none is a branch in jwt's own code and p256 /
-# std claim them in their own rows. ES512 (p521 module) raises 0.
+# std claim them in their own rows. ES384 (p384 module since 2026-10-13; was 8
+# on std's P-384) and ES512 (p521 module) raise 0.
 #  ES256 9 (p256 module + std ecdsa): common.zig:75 on the tainted scalar
 #   x5 (scalar.zig:87 via ecdsa.zig:408 deterministicScalar / 227 / 228, :202,
 #   :208, :190/:196 via ecdsa.zig:372/376 = the field-element canonical checks and
 #   the inverse in finalizePrehashed), group.zig:635 x2 (comb mulBase select),
 #   ecdsa.zig:225 and :230 (r == 0 / s == 0 rejection verdicts in finalizePrehashed).
-#  ES384 8 (std): common.zig:75 x4 (scalar canonical checks, same ecdsa.zig
-#   sites), p384.zig:380 x2 (pcMul16, the is-identity bit of the product),
-#   ecdsa.zig:225, :230 (same r/s == 0 verdicts).
 #  EdDSA 1 = jwt's OWN: encode.zig:313 (signEd25519), `big_r.rejectIdentity()`
 #   on R = r*B, where r is derived from the secret prefix. One bit, true with
 #   probability 2^-252, but a branch on a secret-derived value in jwt's file.
 #   Left as is (std's basePoint.mul has the same refusal); FINDING for the
 #   coordinator, not fixed here.
-jwt	ReleaseFast	ec	1	18	c077d53278717a03	2c18ff97d38dbf2d
+jwt	ReleaseFast	ec	1	10	a8319eb28aceb966	6c14c21a4454880c
 # rsa 2 = RS256 1 + PS256 1: rsa/src/root.zig:954 privateOpCrtPtr, the F3
 # Bellcore fault-check verdict `if (!eql(m^e, c)) return error.FaultDetected`
 # (the rsa module's own `crt` row, 2, documents the same verdict). Delegated to
 # the rsa module; jwt's files add none. PS256 salt and blinding come from a
 # seeded DefaultCsprng (deterministic output pins).
-jwt	ReleaseFast	rsa	1	2	c077d53278717a03	f2bee89c3c58cdaf
+jwt	ReleaseFast	rsa	1	2	a8319eb28aceb966	f2bee89c3c58cdaf

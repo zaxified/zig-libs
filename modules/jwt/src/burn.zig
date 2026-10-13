@@ -39,8 +39,10 @@ pub inline fn run(comptime n: usize, comptime R: type, comptime f: anytype, args
 pub const hmac_burn = 4 * 1024;
 
 /// ES256 / ES384 / Ed25519 signing: the body dirtied 9.6 KiB (ES256, through
-/// p256's own burned wrapper), 5.5 KiB (ES384, std's P-384) and 4.2 KiB
-/// (Ed25519) in ReleaseFast (2026-10-09). One size for the three.
+/// p256's own burned wrapper), 5.5 KiB (ES384 on std's P-384; since
+/// 2026-10-13 through p384, which burns its own signer) and 4.2 KiB
+/// (Ed25519) in ReleaseFast (2026-10-09). One size for the three; the
+/// stack probe still passes with it after the p384 move (2026-10-13).
 pub const ec_burn = 16 * 1024;
 
 /// ML-DSA signing, per parameter set: the signer's matrices and polynomial

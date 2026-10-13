@@ -206,7 +206,7 @@ pub const meta = .{
     .role = .both, // P6 = a `router` middleware guarding routes (server); P7 = an OAuth2/OIDC client building auth/token requests and accepting ID Tokens (relying party).
     .concurrency = .reentrant, // except Provider — one mutable cache, external sync (inject ResourceServer.lock under a threaded server); VerifiedCache is internally synchronized
     .model_after = "RFC 7515 (JWS) + RFC 7519 (JWT) + RFC 7518 (JWA) verify incl. RS256 (RSASSA-PKCS1-v1_5, RFC 8017) + RFC 7517 (JWK/JWKS key sets), RFC 8725 hardening + OpenID Connect Discovery 1.0 / RFC 8414 (issuer metadata -> jwks_uri/authorization_endpoint/token_endpoint) with cached, rotation-aware Provider; RFC 6750 Bearer resource-server middleware; RFC 7636 PKCE + OIDC Core 1.0 §3.1 authorization code flow + §3.1.3.7 ID Token validation; OAuth2/OIDC resource server AND relying party",
-    .deps = .{ "http", "router", "p256", "p521", "rsa", "ct25519" }, // p521: ES512 (std has no P-521); p256 supplies the fast ES256 curve (byte-exact to std.crypto.sign.ecdsa.EcdsaP256Sha256); rsa: RS*/PS* verify and sign; ct25519: the comb behind EdDSA signing
+    .deps = .{ "http", "router", "p256", "p384", "p521", "rsa", "ct25519" }, // p384: ES384 (std's P-384 is 2.8-4.2x golang-jwt); p521: ES512 (std has no P-521); p256 supplies the fast ES256 curve (byte-exact to std.crypto.sign.ecdsa.EcdsaP256Sha256); rsa: RS*/PS* verify and sign; ct25519: the comb behind EdDSA signing
 };
 
 // ── public API ──────────────────────────────────────────────────────────────
@@ -643,6 +643,7 @@ pub fn validateClaims(claims: Claims, opts: Options) ValidateError!void {
 /// The asm-accelerated P-256 module — supplies the ES256 key/signature types
 /// and the fast vartime verify on the P2 HTTPS per-request hot path.
 const p256_mod = @import("p256");
+const p384_mod = @import("p384");
 const p521_mod = @import("p521");
 /// The in-repo RSA module: RS* and PS* verification (`VerifyKey`) and RS*/PS*
 /// signing (`encode.zig`). Public so a caller can name its key types.
@@ -653,10 +654,16 @@ pub const rsa = @import("rsa");
 /// per-request hot path) runs on the asm-accelerated `p256` module: the key
 /// type is a byte-exact drop-in for `std.crypto.sign.ecdsa.EcdsaP256Sha256`,
 /// and verification routes through p256's combined 2-base vartime verify
-/// (`verifyEs256Fast` below), ~2.7× faster than std. P384 and Ed25519 stay on
-/// std (p256 covers only the P-256 curve).
+/// (`verifyEs256Fast` below), ~2.7× faster than std. Ed25519 stays on std
+/// (EdDSA signing goes through ct25519's comb in `encode.zig`).
 pub const EcdsaP256Sha256 = p256_mod.EcdsaP256Sha256;
-pub const EcdsaP384Sha384 = std.crypto.sign.ecdsa.EcdsaP384Sha384;
+/// ES384 (ECDSA P-384 + SHA-384): the `p384` module's type has std's
+/// `EcdsaP384Sha384` surface. Moved off std 2026-10-13: std's P-384 signed
+/// 4.2× and verified 2.8× slower than golang-jwt. Verification accepts
+/// exactly what std's did; signatures differ in bytes, because p384's nonces
+/// are RFC 6979 exactly (std mixes its noise in differently) — both are
+/// valid ECDSA signatures of the same key.
+pub const EcdsaP384Sha384 = p384_mod.EcdsaP384Sha384;
 /// ES512 (ECDSA P-521 + SHA-512): std has no P-521; the `p521` module's
 /// type has std's `Ecdsa` surface (raw 132-byte `R‖S` via `toBytes`/`fromBytes`).
 pub const EcdsaP521Sha512 = p521_mod.EcdsaP521Sha512;

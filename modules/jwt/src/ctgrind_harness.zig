@@ -19,7 +19,7 @@
 //!    The HMAC is std's; `verify`'s compare is `timing_safe.eql`, whose bool
 //!    verdict is the one branch the module takes on a tainted value (the
 //!    MAC verdict, public by design: a caller learns accept/reject).
-//!  * `ec` — ES256 (p256 module), ES384 (std), ES512 (p521 module), EdDSA
+//!  * `ec` — ES256 (p256 module), ES384 (p384 module), ES512 (p521 module), EdDSA
 //!    (std Ed25519; the 32-byte seed is tainted, the public half of the
 //!    64-byte secret key is not): `sign` with the tainted key.
 //!  * `rsa` — RS256 and PS256 `sign` through the `rsa` module. Tainted: the
@@ -36,7 +36,7 @@
 //! formatter is not constant-time, so the total is non-zero while the in-file
 //! count stays what the module itself does.
 //!
-//! The curve and RSA arithmetic are `p256`'s, `p521`'s, std's and `rsa`'s and
+//! The curve and RSA arithmetic are `p256`'s, `p384`'s, `p521`'s, std's and `rsa`'s and
 //! are claimed in their own rows; the contexts they raise on the tainted key
 //! are expected here too and are itemised in `ctgrind-expected.tsv`.
 

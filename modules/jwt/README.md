@@ -18,8 +18,10 @@ with these exceptions: **RS\*/PS\*** run on the in-repo `rsa` module
 (sign and verify; since 2026-10-13), **EdDSA signing** takes `R = r·B` from
 the `ct25519` comb (byte-identical to std's signer), and **ES256**, which runs on the in-repo
 `p256` module (byte-exact to `std.crypto.sign.ecdsa.EcdsaP256Sha256`, ~2.7×
-faster verify), and **ES512**, which runs on the in-repo `p521` module (std
-has no P-521) — see the Deps bullet below.
+faster verify), **ES384**, which runs on the in-repo `p384` module (since
+2026-10-13; RFC 6979 nonces, so its signature bytes differ from std's), and
+**ES512**, which runs on the in-repo `p521` module (std has no P-521) — see
+the Deps bullet below.
 
 On top of the offline core sit two turnkey layers: the **networked
 `Provider`** (P5) — OpenID Connect Discovery 1.0 (`<issuer>/.well-known/
@@ -74,7 +76,8 @@ copied.
 - **Deps:** `http` (the `HttpFetcher` + the middleware's request/response
   types, and P7's `TokenRequest.method`), `router` (the middleware), `p256`
   (the fast ES256 curve — byte-exact to `std.crypto.sign.ecdsa.EcdsaP256Sha256`),
-  `p521` (ES512: P-521, which std lacks), `rsa` (RS\*/PS\* sign and verify;
+  `p384` (ES384; std's P-384 was 2.8–4.2× golang-jwt), `p521` (ES512:
+  P-521, which std lacks), `rsa` (RS\*/PS\* sign and verify;
   `jwt.rsa` re-exports it for the key types), `ct25519` (the fixed-base comb
   behind EdDSA signing).
   The signature core and P7's request/response builders need neither `http`
@@ -144,7 +147,7 @@ ID-token acceptance).
 | `AudiencePolicy` / `IssuerPolicy` | mandatory-choice unions for `Options`: `.{ .required = "…" }` (must match) \| `.any` (conscious opt-out). No default — see "Mandatory audience/issuer" |
 | `validateClaims(claims, Options) ValidateError!void` | RFC 7519 §4.1 checks; pure, allocation-free |
 | `Alg` | RFC 7518 names (`HS256`…`EdDSA`) plus RFC 9964's `ML-DSA-44`/`ML-DSA-65`/`ML-DSA-87`, `none`, `unknown` — the verify dispatch |
-| `Key` | tagged union: `.hmac` (secret bytes) \| `.ecdsa_p256` \| `.ecdsa_p384` \| `.ecdsa_p521` \| `.ed25519` (std public keys) \| `.rsa` (`RsaPublicKey`) \| `.ml_dsa_44` / `.ml_dsa_65` / `.ml_dsa_87` (FIPS-204 public keys); constructors `ecdsaP256FromCoords(x, y)` / `ecdsaP384FromCoords(x, y)` / `ecdsaP521FromCoords(x, y)` (66-byte coordinates) / `ed25519FromBytes(x)` / `rsaFromModExp(n, e)` / `mlDsa44FromBytes(pub)` / `mlDsa65FromBytes(pub)` / `mlDsa87FromBytes(pub)` take exactly a JWK's decoded parameters (`KeyError.InvalidKey` on bad points/moduli/exponents/encodings). The tag binds the key TYPE to the token's `alg`, which is what closes algorithm confusion — including across the three ML-DSA parameter sets, where the tags are distinct types |
+| `Key` | tagged union: `.hmac` (secret bytes) \| `.ecdsa_p256` \| `.ecdsa_p384` \| `.ecdsa_p521` \| `.ed25519` (std-shaped public keys) \| `.rsa` (`RsaPublicKey`) \| `.ml_dsa_44` / `.ml_dsa_65` / `.ml_dsa_87` (FIPS-204 public keys); constructors `ecdsaP256FromCoords(x, y)` / `ecdsaP384FromCoords(x, y)` / `ecdsaP521FromCoords(x, y)` (66-byte coordinates) / `ed25519FromBytes(x)` / `rsaFromModExp(n, e)` / `mlDsa44FromBytes(pub)` / `mlDsa65FromBytes(pub)` / `mlDsa87FromBytes(pub)` take exactly a JWK's decoded parameters (`KeyError.InvalidKey` on bad points/moduli/exponents/encodings). The tag binds the key TYPE to the token's `alg`, which is what closes algorithm confusion — including across the three ML-DSA parameter sets, where the tags are distinct types |
 | `verify(&parsed, key) VerifyError!void` | recompute/check the signature over `signing_input`; RFC 8725 defenses baked in |
 | `parseAndVerify(gpa, token, key, Options) !ParsedToken` | the one-call API: parse → verify → validateClaims; frees on any failure |
 | `encode(gpa, claims, SigningKey, EncodeOptions) EncodeError![]u8` / `encodeJson(gpa, claims_json, ...)` | token issuance (compact JWS): the `SigningKey` variant (`hs256/384/512`, `es256/384/512`, Ed25519, ML-DSA, `rs256/384/512` over a `*const jwt.rsa.KeyPair`, `ps256/384/512` over `.{ .key, .random }` — PSS draws a salt) fixes `alg`, `none` is unrepresentable; HMAC secrets shorter than the hash output and RSA moduli below 2048 bits are refused; `SigningKey.verificationKey()` gives the matching `Key`; `SigningKey.sign(signing_input, &out)` signs an assembled JWS signing input (golang-jwt's `SigningMethod.Sign`) |
@@ -469,7 +472,7 @@ RFCs and cryptographically self-checking:
   `BadSignature`.
 
 Plus generated round-trips for every family (HS384/HS512 computed MACs;
-ES256/ES384 and EdDSA with deterministic std keypairs: sign → assemble
+ES256/ES384 and EdDSA with deterministic keypairs: sign → assemble
 token → parse → verify OK; tampered payload, corrupted signature and
 wrong-keypair key each → `BadSignature`); the RFC 8725 alg-confusion
 matrix (`alg:none` with any key → `UnsecuredToken`; HS token vs EC/Ed keys

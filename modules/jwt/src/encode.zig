@@ -396,6 +396,37 @@ test "encode: every algorithm round-trips through parseAndVerify, alg from the k
     try roundTrip(.{ .ml_dsa_87 = &ml87 }, .{});
 }
 
+test "encode: ES384 (p384 module) interoperates with std's EcdsaP384Sha384 both ways" {
+    // ES384 moved off std on 2026-10-13. p384's nonces are RFC 6979 exactly,
+    // so the signature bytes differ from std's; what must not change is that
+    // either side accepts the other's tokens for the same key.
+    const Std = std.crypto.sign.ecdsa.EcdsaP384Sha384;
+    const d = [_]u8{0x11} ** 48;
+    const ours = try root.EcdsaP384Sha384.KeyPair.fromSecretKey(try root.EcdsaP384Sha384.SecretKey.fromBytes(d));
+    const theirs = try Std.KeyPair.fromSecretKey(try Std.SecretKey.fromBytes(d));
+    try testing.expectEqualSlices(u8, &theirs.public_key.toUncompressedSec1(), &ours.public_key.toUncompressedSec1());
+
+    // Ours → std. Deterministic: the same claims sign to the same token.
+    const token = try encode(testing.allocator, TestClaims{}, .{ .es384 = &ours }, .{});
+    defer testing.allocator.free(token);
+    const again = try encode(testing.allocator, TestClaims{}, .{ .es384 = &ours }, .{});
+    defer testing.allocator.free(again);
+    try testing.expectEqualStrings(token, again);
+    var parsed = try root.parse(testing.allocator, token);
+    defer parsed.deinit();
+    try testing.expectEqual(@as(usize, 96), parsed.signature.len);
+    try Std.Signature.fromBytes(parsed.signature[0..96].*).verify(parsed.signing_input, theirs.public_key);
+
+    // Std → ours: std's signature over the same signing input, as a token.
+    const std_sig = (try theirs.sign(parsed.signing_input, null)).toBytes();
+    try testing.expect(!std.mem.eql(u8, &std_sig, parsed.signature[0..96]));
+    var sig_b64: [b64.calcSize(96)]u8 = undefined;
+    const std_token = try std.mem.concat(testing.allocator, u8, &.{ parsed.signing_input, ".", b64.encode(&sig_b64, &std_sig) });
+    defer testing.allocator.free(std_token);
+    var p_std = try root.parseAndVerify(testing.allocator, std_token, .{ .ecdsa_p384 = ours.public_key }, test_opts);
+    p_std.deinit();
+}
+
 test "encode: a token signed with one key does not verify with another" {
     const a = [_]u8{1} ** 32;
     const b = [_]u8{2} ** 32;
