@@ -95,8 +95,9 @@ fn parseTaint(s: []const u8) !Taint {
 }
 
 /// Message lengths chosen to cover every structural path of the lane-parallel
-/// MAC at `lanes = 4`: below one block, one full block plus remainder, exactly
-/// one wide group (192 B = 4 x 16 x 3), several groups, and a large buffer.
+/// MAC at `lanes = 8` (AVX2 and AVX-512): below one block, one full block plus
+/// remainder, the 4-lane half engine's entry (192 B = 4 x 16 x 3), and the
+/// 8-lane engine over several groups and a large buffer.
 const sizes = [_]usize{ 16, 64, 192, 1024, 8192 };
 
 pub fn main(init: std.process.Init.Minimal) !void {

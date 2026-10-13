@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-13** — Performance: ChaCha20 8×8 transpose as register shuffles, an LLVM reassociation barrier on the 16/8 rotates, `chachaCore` inlined; Poly1305 on AVX2 now 8 lanes (two chains) with a 4-lane half engine for 192–383 B runs and a shuffle load of the 8 blocks. AEAD 16 KiB 1.32 → 1.10× OpenSSL 3.5.5, 1420 B 1.08 → 1.04× (card P3 still, by 0.001). `poly1305.Path` gains `.wide_half` (test witness only).
 - **2026-10-10** — tools: comparative benchmark `tools/bench.zig` + `tools/c_bench/foreign_bench.c` (`zig build bench-chachapoly`) against OpenSSL 3.5.5 (reference) and libsodium 1.0.18; card Performance filled (0.80–1.33×, worst 16 KiB), SPEC "Performance — bench-chachapoly" section and the lever in the backlog.
 - **2026-10-09** — tests: deterministic fuzz driver `CHACHAPOLY_FUZZ` over the existing harnesses (decrypt gains a pristine/flipped overlay: a genuine seal must open, one flipped octet must be refused).
 - **2026-10-09** — Dead-stack sweep (`CONVENTIONS.md` §2.1.1). Pointer-keyed twins of the std-shaped

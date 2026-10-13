@@ -8,9 +8,9 @@
 
 **Audit:** review 2026-09-02 · mutation 2026-10-04 (44/54, 8 eq) · src ?
 
-**Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, _A_APOLY_FUZZ) · ct 2026-09-08 (ctgrind)
+**Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, _A_APOLY_FUZZ) · ct 2026-10-13 (ctgrind, re-checked after the transpose/lane pass: counts unchanged, digests updated)
 
-**Performance:** ref 0.80–1.33× OpenSSL 3.5.5 EVP ChaCha20-Poly1305 · fastest 1.33× OpenSSL 3.5.5 (measured 2026-10-10)
+**Performance:** ref 0.832–1.101× OpenSSL 3.5.5 EVP ChaCha20-Poly1305 · fastest 1.101× OpenSSL 3.5.5 (measured 2026-10-13)
 
 **Known defects:** none recorded
 
@@ -105,7 +105,7 @@ short-packet traffic, the module hands those lengths back to `std`:
 |---|---|---|---|
 | `delegate_max_bytes` = 64 | `ChaCha20.xor` / `.stream` | whole call, or the post-group tail, is ≤ 64 B | `std.crypto.stream.chacha.ChaCha20IETF` |
 | `aead_delegate_max` = 128 | `ChaCha20Poly1305.encrypt` / `.decrypt` | `m.len + ad.len ≤ 128` | `std.crypto.aead.chacha_poly.ChaCha20Poly1305` |
-| `wide_min_groups` = 3 | `poly1305.Generic(L).update` | fewer than 3 whole lane groups (< 192 B at L = 4) | `std.crypto.onetimeauth.Poly1305` |
+| `wide_min_groups` = 3 | `poly1305.Generic(L).update` | fewer than 3 whole groups of the narrowest engine (< 192 B: L = 4, or L = 8's 4-lane half engine) | `std.crypto.onetimeauth.Poly1305` |
 
 **Consumer-visible consequence, stated plainly:** for an AEAD call whose message
 plus AD is 128 bytes or less — a WireGuard keepalive, a tunnelled TCP ACK, a
@@ -140,7 +140,11 @@ The shape, in one paragraph: Poly1305 is `H = Σ mᵢ·r^(n−i+1)` in GF(2^130�
 with the shared multiplier `r^L` and folding the lanes at the end against
 `(r^L, …, r^1)`. That needs a limb layout SIMD can multiply — five 26-bit limbs,
 because the widest integer multiply x86 vectors have is `PMULUDQ`'s 32×32→64.
-`lanes` is picked at comptime (AVX-512F → 8, AVX2 → 4, otherwise 1).
+`lanes` is picked at comptime (AVX-512F or AVX2 → 8, otherwise 1). At L ≥ 8 a run of
+3·L/2 .. 3·L blocks takes an L/2-lane half engine over the same power table
+(`wideHalf`), so the vector entry point stays at 192 B (2026-10-13: AVX2 went 4 → 8
+lanes — two independent 4-lane Horner chains, 0.77 → 0.55 cycles/B at 16 KiB with the
+shuffle load `columns8`; without the half engine 192–383 B fell back to std at 1.9×).
 
 **It is a hybrid, and that is the load-bearing design decision.** The power table
 `r^1..r^L` costs `L−1` field multiplies up front, and the 26-bit layout is
@@ -372,7 +376,7 @@ routing:
 |---|---|---|---|
 | `delegate_max_bytes` (ChaCha20) | **64** | `root.chacha_path` | 65 B |
 | `aead_delegate_max` (whole AEAD, `m.len + ad.len`) | **128** | `root.aead_path` | 129 B |
-| `wide_min_groups` (Poly1305 lanes) | **3** | `poly1305.mac_path` | 96/192/384 B at L = 2/4/8 |
+| `wide_min_groups` (Poly1305 lanes) | **3** | `poly1305.mac_path` | 96/192/384 B at L = 2/4/8; L = 8's half engine (`.wide_half`) from 192 B |
 
 The witnesses are `void` outside a test build (`builtin.is_test` is comptime),
 so none of this reaches shipped code and the `.reentrant` claim is unaffected.
@@ -388,7 +392,7 @@ lane-parallel MAC off entirely: measured cost, MAC 4048 → 1698 MB/s at 8 KiB,
 different property — every comparison replayed against every implementation of
 it, which is how two real routing holes in `decrypt` and `stream` were found.
 
-## Performance — `bench-chachapoly` (2026-10-10)
+## Performance — `bench-chachapoly` (2026-10-10, re-measured 2026-10-13)
 
 The comparative benchmark behind the card's Performance line. Reference: OpenSSL 3.5.5 (the
 scope's reference; system `libcrypto.so.3`, EVP `chacha20-poly1305`, AVX2 assembly); also
@@ -398,36 +402,50 @@ row the faster of the two -- OpenSSL from 1420 B up, libsodium at 64 B. Host: In
 Method: `zig build bench-chachapoly` (`tools/bench.zig` driving `tools/c_bench/foreign_bench.c`): each side doubles its batch until it takes over 100 ms and keeps the best of five; per workload the sides alternate for `BENCH_ROUNDS` rounds and each keeps its best; ratio = ours/theirs by user-mode cycles; spread = (worst round − best round) / best round per side. Before timing, an interop check (both libraries' ciphertext and tag of the 1420-byte message must equal ours byte for byte).
 
 Workloads: encrypt and decrypt (`ChaCha20Poly1305.encryptInto`/`decryptInto`) of 64 B, 1420 B
-and 16 KiB with 13 bytes of AD. `BENCH_ROUNDS=5` (`alt` = libsodium):
+and 16 KiB with 13 bytes of AD. `BENCH_ROUNDS=5` (`alt` = libsodium), 2026-10-13 on a quiet host
+(largest spread 3.3 %):
 
 | workload | ours ns/op | ref ns/op | alt ns/op | ours/ref | ours/fastest | spread ours | spread ref | spread alt |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| `enc_64` | 378 | 448 | 369 | 0.841 | 1.010 | 1.5% | 6.0% | 2.1% |
-| `enc_1420` | 1356 | 1257 | 1662 | 1.081 | 1.081 | 1.9% | 3.4% | 8.8% |
-| `enc_16384` | 11043 | 8354 | 12017 | 1.325 | 1.325 | 6.0% | 4.9% | 10.8% |
-| `dec_64` | 373 | 464 | 375 | 0.804 | 0.995 | 1.7% | 5.3% | 2.6% |
-| `dec_1420` | 1337 | 1278 | 1675 | 1.054 | 1.054 | 6.0% | 3.6% | 14.0% |
-| `dec_16384` | 11047 | 8495 | 12062 | 1.314 | 1.314 | 1.6% | 4.5% | 33.5% |
+| `enc_64` | 378 | 451 | 369 | 0.846 | 1.035 | 0.4% | 2.0% | 2.6% |
+| `enc_1420` | 1331 | 1276 | 1683 | 1.043 | 1.043 | 0.6% | 3.3% | 1.6% |
+| `enc_16384` | 9395 | 8557 | 12158 | 1.101 | 1.101 | 0.9% | 1.7% | 0.7% |
+| `dec_64` | 381 | 463 | 372 | 0.832 | 1.023 | 0.4% | 2.2% | 1.2% |
+| `dec_1420` | 1322 | 1298 | 1696 | 1.029 | 1.029 | 0.6% | 1.7% | 1.7% |
+| `dec_16384` | 9335 | 8540 | 12143 | 1.096 | 1.096 | 1.1% | 0.8% | 1.1% |
+
+Three other runs the same day put the 16 KiB rows at 1.097–1.100 — on the P2 line, not under
+it; the card carries the worst figure unrounded. The 2026-10-10 run (before the pass below) read
+1.31–1.33 at 16 KiB and 1.05–1.08 at 1420 B.
+
+**The 2026-10-13 pass** (each step measured with this bench; profiles from `perf`): OpenSSL's
+EVP ChaCha20-Poly1305 is two passes too (its AEAD costs the sum of its ChaCha20 and Poly1305), so
+the stitched one-pass lever below was not the gap — both kernels were. (1) ChaCha20: the 8×8
+transpose was 128 scalar `vpinsrd` per 8 blocks → register shuffles (`transpose8`); LLVM rewrote
+`rotl(x ^ y, 16|8)` into two `vpshufb` → an empty-asm barrier (`noReassoc`, LLVM/x86 only);
+`chachaCore` inlined so its 16 vectors no longer round-trip through memory. (2) Poly1305: AVX2
+8 lanes (two independent chains) with a 4-lane half engine for 192–383 B, and the 8-block load
+as shuffles (`columns8`) instead of 32 `vpinsrd`. Tried and dropped: a two-chain carry in
+`mulRed` (no change), u64-lane accumulators (LLVM lost `vpmuludq` across the loop phi and
+emulated 64×64 multiplies — 25 % slower). Left: Poly1305 still widens/narrows its accumulator
+every step (~250 instructions per 128 B against ~170 needed), ChaCha20 ~1.15× OpenSSL's kernel.
 
 Cross-check, two earlier runs with the roles swapped (libsodium as `ref`): ours/libsodium
 0.80–1.02 and 0.80–1.04 (64 B rows 1.01–1.04, 1420 B 0.80–0.82, 16 KiB 0.92–0.93), ours/fastest
 1.32 both times.
 
-**Reading.** At 64 B we are level with libsodium and ahead of OpenSSL (its EVP per-call
-overhead); at 1420 B 1.05–1.08× OpenSSL; at 16 KiB 1.31–1.33× OpenSSL's AVX2 code, which is
-the card's worst → P3. Against libsodium alone (not the scope's reference) the worst would be
-1.04× (P2).
+**Reading (2026-10-13).** At 64 B level with libsodium and ahead of OpenSSL (its EVP per-call
+overhead); at 1420 B 1.03–1.04× OpenSSL; at 16 KiB 1.096–1.101× OpenSSL's AVX2 code, the card's
+worst → P3 by 0.001. Against libsodium alone the worst is 1.035× (64 B).
 
 ## Non-goals / backlog
 
-- **Performance: 16 KiB at 1.31–1.33× OpenSSL 3.5.5** *(bench 2026-10-10, `zig build
-  bench-chachapoly`; P3 → P2 needs ≤ 1.1× on every row, 1420 B is at 1.05–1.08×)*. OpenSSL's
-  x86-64 ChaCha20-Poly1305 interleaves the Poly1305 blocks into the 8-block AVX2 ChaCha20 loop
-  (one pass over the data); this module runs keystream-xor and the lane-parallel Poly1305 as two
-  passes. Lever (proposal, not measured): a stitched one-pass seal/open for the AVX2 width
-  (MAC each 512-byte keystream chunk while it is in registers), then re-measure; the 1420 B row
-  would follow, and wireguard's transport rows with it.
-- **AVX-512 (L = 8) is correctness-tested but perf-unmeasured** — no AVX-512
+- **Performance: 16 KiB at 1.096–1.101× OpenSSL 3.5.5** *(bench 2026-10-13; P2 needs ≤ 1.10
+  on every row)*. The gap is in both kernels, not in the pass structure (see "The 2026-10-13
+  pass"). Levers left, unmeasured: keep the Poly1305 accumulator in u64 lanes without losing
+  `vpmuludq` (an opaque barrier plus an explicit 32-bit mask on each limb, split into ymm halves
+  on AVX2); fewer ChaCha20 spills (183 `vmovdqa` per 8-block core).
+- **AVX-512 (L = 8, one zmm) is correctness-tested but perf-unmeasured** — no AVX-512
   hardware here. The selection is comptime, so a host that has it takes the
   8-lane path untested for *speed*; it is not untested for *correctness*.
 - **2-lane SSE2 / NEON Poly1305** — deliberately not taken: two 26-bit lanes do

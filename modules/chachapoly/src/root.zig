@@ -39,7 +39,8 @@
 //!
 //! The Poly1305 MAC is **lane-parallel** — see `poly1305.zig`, which holds the
 //! full design note. Short version: `L` blocks per multiply in a 5×26-bit limb
-//! layout, `L` comptime-selected from the target (AVX2 → 4), hybridised with
+//! layout, `L` comptime-selected from the target (AVX2/AVX-512 → 8, plus a
+//! 4-lane half engine for medium runs), hybridised with
 //! `std.crypto.onetimeauth.Poly1305` as the serial core so that inputs below the
 //! break-even size run std's code and cannot regress.
 //!
@@ -266,8 +267,12 @@ fn nonceToWords(nonce: [12]u8) [3]u32 {
 /// (block j uses counter `counter +% j`), returning the 16 post-`+= s` state
 /// words in the block-parallel **transpose layout**: word i of every one of the
 /// N blocks lives in lane i..N of `x[i]`. The words are NOT yet in memory order
-/// — `blockWords` does that transpose, and it is the only place that may.
-fn chachaCore(comptime N: usize, k: [8]u32, counter: u32, n: [3]u32) [16]@Vector(N, u32) {
+/// — `blockWords` / `transpose8` do that transpose, and only they may.
+///
+/// `inline`: as a call it returned the 16 vectors through memory and the
+/// transpose reloaded them; inlined into the group loop the AEAD went
+/// 1.14 → 1.10× OpenSSL at 16 KiB (2026-10-13).
+inline fn chachaCore(comptime N: usize, k: [8]u32, counter: u32, n: [3]u32) [16]@Vector(N, u32) {
     const V = @Vector(N, u32);
     const iota: V = comptime blk: {
         var a: [N]u32 = undefined;
@@ -318,9 +323,65 @@ inline fn blockWords(comptime N: usize, x: [16]@Vector(N, u32), comptime j: usiz
     return if (native_endian == .little) w else @byteSwap(w);
 }
 
+/// The 8-lane transpose as register shuffles: for word group `g` (words
+/// 4g..4g+3), `vpunpck{l,h}dq` then `vpunpck{l,h}qdq` leave block `j`'s four
+/// words in the low 128 bits and block `j+4`'s in the high 128 bits of `u[j]`;
+/// `vperm2i128` then joins two groups into 32 contiguous keystream bytes.
+/// `blockWords` at N = 8 lowered to 128 scalar `vpinsrd` per 8 blocks — the
+/// largest cost outside the rounds (2026-10-13, i7-7920HQ: ChaCha20 at
+/// 16 KiB 1.30 → 1.18 TSC cycles/B, OpenSSL 1.02–1.07). Returns, per block,
+/// its two 32-byte halves in memory order (little-endian targets only; the
+/// callers check `fast_transpose`).
+inline fn transpose8(x: [16]@Vector(8, u32)) [8][2]@Vector(8, u32) {
+    const V = @Vector(8, u32);
+    const lo32 = @Vector(8, i32){ 0, ~@as(i32, 0), 1, ~@as(i32, 1), 4, ~@as(i32, 4), 5, ~@as(i32, 5) };
+    const hi32 = @Vector(8, i32){ 2, ~@as(i32, 2), 3, ~@as(i32, 3), 6, ~@as(i32, 6), 7, ~@as(i32, 7) };
+    const lo64 = @Vector(8, i32){ 0, 1, ~@as(i32, 0), ~@as(i32, 1), 4, 5, ~@as(i32, 4), ~@as(i32, 5) };
+    const hi64 = @Vector(8, i32){ 2, 3, ~@as(i32, 2), ~@as(i32, 3), 6, 7, ~@as(i32, 6), ~@as(i32, 7) };
+    const lo128 = @Vector(8, i32){ 0, 1, 2, 3, ~@as(i32, 0), ~@as(i32, 1), ~@as(i32, 2), ~@as(i32, 3) };
+    const hi128 = @Vector(8, i32){ 4, 5, 6, 7, ~@as(i32, 4), ~@as(i32, 5), ~@as(i32, 6), ~@as(i32, 7) };
+
+    // u[g][j]: group g, block j in the low half and block j+4 in the high half.
+    var u: [4][4]V = undefined;
+    inline for (0..4) |g| {
+        const a = x[4 * g];
+        const b = x[4 * g + 1];
+        const c = x[4 * g + 2];
+        const d = x[4 * g + 3];
+        const t0 = @shuffle(u32, a, b, lo32);
+        const t1 = @shuffle(u32, c, d, lo32);
+        const t2 = @shuffle(u32, a, b, hi32);
+        const t3 = @shuffle(u32, c, d, hi32);
+        u[g] = .{
+            @shuffle(u32, t0, t1, lo64),
+            @shuffle(u32, t0, t1, hi64),
+            @shuffle(u32, t2, t3, lo64),
+            @shuffle(u32, t2, t3, hi64),
+        };
+    }
+    var out: [8][2]V = undefined;
+    inline for (0..4) |j| {
+        out[j] = .{ @shuffle(u32, u[0][j], u[1][j], lo128), @shuffle(u32, u[2][j], u[3][j], lo128) };
+        out[j + 4] = .{ @shuffle(u32, u[0][j], u[1][j], hi128), @shuffle(u32, u[2][j], u[3][j], hi128) };
+    }
+    return out;
+}
+
+/// Whether the shuffle transpose applies: the wide group is 8 blocks and the
+/// target stores u32 little-endian (so a word vector IS the keystream bytes).
+const fast_transpose = wide == 8 and native_endian == .little;
+
 /// Fill `ks` with the keystream for `N` blocks starting at `counter`.
 fn keystream(comptime N: usize, ks: *[64 * N]u8, k: [8]u32, counter: u32, n: [3]u32) void {
     const x = chachaCore(N, k, counter, n);
+    if (N == 8 and fast_transpose) {
+        const t = transpose8(x);
+        inline for (0..8) |j| {
+            ks[64 * j ..][0..32].* = @bitCast(t[j][0]);
+            ks[64 * j + 32 ..][0..32].* = @bitCast(t[j][1]);
+        }
+        return;
+    }
     inline for (0..N) |j| {
         ks[64 * j ..][0..64].* = @bitCast(blockWords(N, x, j));
     }
@@ -335,6 +396,18 @@ fn keystream(comptime N: usize, ks: *[64 * N]u8, k: [8]u32, counter: u32, n: [3]
 /// `out` and `in` may be the same pointer (in-place): every byte of a block is
 /// read before any byte of that block is written.
 inline fn xorBlocks(comptime N: usize, out: *[64 * N]u8, in: *const [64 * N]u8, x: [16]@Vector(N, u32)) void {
+    if (N == 8 and fast_transpose) {
+        const Half = @Vector(32, u8);
+        const t = transpose8(x);
+        inline for (0..8) |j| {
+            inline for (0..2) |h| {
+                const ks: Half = @bitCast(t[j][h]);
+                const src: Half = in[64 * j + 32 * h ..][0..32].*;
+                out[64 * j + 32 * h ..][0..32].* = @as([32]u8, src ^ ks);
+            }
+        }
+        return;
+    }
     const Block = @Vector(64, u8);
     inline for (0..N) |j| {
         const ks: Block = @bitCast(blockWords(N, x, j));
@@ -359,13 +432,37 @@ inline fn xorTail(out: []u8, in: []const u8, ks: []const u8) void {
     while (j < ks.len) : (j += 1) out[j] = in[j] ^ ks[j];
 }
 
+/// An empty asm statement the value passes through, so LLVM cannot move the
+/// next rotate across the XOR before it. Without it LLVM rewrote
+/// `rotl(x ^ y, 16|8)` as `rotl(x) ^ rotl(y)` — two `vpshufb` instead of one,
+/// 316 instead of 160 per 8 blocks, on Intel's single shuffle port
+/// (2026-10-13). LLVM backend on x86 only, and only when `V` fits one vector
+/// register (`"x"` cannot hold a 256-bit vector without AVX: the baseline
+/// build failed to allocate it); elsewhere the value passes as is.
+// Container-level, so they are comptime: `cpu.has` is an ordinary function,
+// and called inside `noReassoc` its test ran at run time, emitting the asm for
+// every target (the baseline build then failed on it).
+const asm_barrier_ok = builtin.zig_backend == .stage2_llvm and builtin.cpu.arch.isX86();
+const has_avx = builtin.cpu.has(.x86, .avx);
+const has_avx512f = builtin.cpu.has(.x86, .avx512f);
+
+inline fn noReassoc(comptime V: type, v: V) V {
+    const use = comptime asm_barrier_ok and (@bitSizeOf(V) <= 128 or
+        (@bitSizeOf(V) <= 256 and has_avx) or
+        (@bitSizeOf(V) <= 512 and has_avx512f));
+    return if (use) asm (""
+        : [out] "=x" (-> V),
+        : [in] "0" (v),
+    ) else v;
+}
+
 inline fn quarterRound(comptime V: type, x: *[16]V, a: usize, b: usize, c: usize, d: usize) void {
     x[a] +%= x[b];
-    x[d] = math.rotl(V, x[d] ^ x[a], @as(u32, 16));
+    x[d] = math.rotl(V, noReassoc(V, x[d] ^ x[a]), @as(u32, 16));
     x[c] +%= x[d];
     x[b] = math.rotl(V, x[b] ^ x[c], @as(u32, 12));
     x[a] +%= x[b];
-    x[d] = math.rotl(V, x[d] ^ x[a], @as(u32, 8));
+    x[d] = math.rotl(V, noReassoc(V, x[d] ^ x[a]), @as(u32, 8));
     x[c] +%= x[d];
     x[b] = math.rotl(V, x[b] ^ x[c], @as(u32, 7));
 }
@@ -961,7 +1058,7 @@ test "differential AEAD vs std: seal/open/tamper across edge lengths" {
 test "differential AEAD vs std with LONG associated data" {
     // The sweep above derives `ad_len` from `len % 64`, so it never sends more
     // than 63 bytes of AD, and the threshold test below caps it at 129. Neither
-    // reaches the MAC's own wide threshold (176 B at L = 4), so nothing else
+    // reaches the MAC's own wide threshold (176 B, at L = 4 and at L = 8 alike), so nothing else
     // here exercises the AEAD's real long-AD shape: the vector engine absorbs
     // the AD, `pad16` lands on the accumulator it just wrote back, and the
     // vector engine then absorbs the ciphertext. An AEAD open with a large AD
@@ -1858,10 +1955,11 @@ test "Wycheproof chacha20_poly1305_test.json: the RFC 8439 MAC input tags right 
             var diff: u8 = 0;
             for (t, tag) |x, y| diff |= x ^ y;
             try testing.expectEqual(v.valid, diff == 0);
-            if (poly1305.mac_path == .wide) wide_runs[i] += 1;
+            if (poly1305.mac_path != .serial_std) wide_runs[i] += 1;
         }
     }
-    // How many vectors the lane-parallel engine actually absorbed, per width
-    // (`wide_min_bytes` = 96 / 192 / 384 at L = 2 / 4 / 8; L = 1 is std's).
-    try testing.expectEqualSlices(usize, &.{ 0, 151, 38, 9 }, &wide_runs);
+    // How many vectors a lane-parallel engine actually absorbed, per width
+    // (vector entry 96 / 192 / 192 B at L = 2 / 4 / 8 — L = 8 starts on its
+    // 4-lane half engine; L = 1 is std's).
+    try testing.expectEqualSlices(usize, &.{ 0, 151, 38, 38 }, &wide_runs);
 }

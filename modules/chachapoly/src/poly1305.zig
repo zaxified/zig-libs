@@ -134,14 +134,18 @@ const mem = std.mem;
 /// "no SIMD win available here, use the std scalar MAC".
 ///
 /// * AVX-512F: `@Vector(8, u64)` is one zmm → 8 `vpmuludq` lanes.
-/// * AVX2:     `@Vector(4, u64)` is one ymm → 4 `vpmuludq` lanes.
+/// * AVX2:     8 lanes too — two ymm per limb, i.e. two independent 4-lane
+///             Horner chains the core can overlap. A 4-lane step is one
+///             dependency chain per 64 bytes and the loop waited on it:
+///             measured 2026-10-13 (i7-7920HQ), L = 8 against L = 4 is
+///             0.63 vs 0.77 cycles/B at 16 KiB, 0.72 vs 0.83 at 1420 B. Runs
+///             too short for 8 lanes (192–383 B) take the 4-lane half engine
+///             (see `Generic`), so the vector entry point stays at 192 B.
 /// * else:     scalar. SSE2 would give 2 lanes, and NEON's `umull` likewise,
 ///             but 2×26-bit lanes does not beat a 64×64→128 scalar multiply, so
 ///             claiming it would be a pessimisation dressed as portability.
-pub const lanes: usize = if (builtin.cpu.has(.x86, .avx512f))
+pub const lanes: usize = if (builtin.cpu.has(.x86, .avx512f) or builtin.cpu.has(.x86, .avx2))
     8
-else if (builtin.cpu.has(.x86, .avx2))
-    4
 else
     1;
 
@@ -167,8 +171,10 @@ pub const simd_active = lanes > 1;
 // single-threaded test binary. It is not runtime dispatch and non-test code
 // must never read it.
 
-/// Which engine the last `update` call used for its bulk.
-pub const Path = enum { serial_std, wide };
+/// Which engine the last `update` call used for its bulk: std's serial core,
+/// the `L`-lane engine, or (at `L ≥ 8`) the `L/2`-lane engine for runs too
+/// short for `L` lanes.
+pub const Path = enum { serial_std, wide, wide_half };
 
 const Witness = if (builtin.is_test) Path else void;
 const witness_init: Witness = if (builtin.is_test) .serial_std else {};
@@ -243,17 +249,20 @@ fn mulRed(
 /// blocks — the zero-padded final block is the serial engine's job — so the
 /// high bit is unconditional here.
 fn loadBlocks(comptime W: usize, m: *const [16 * W]u8) [5]@Vector(W, u32) {
-    var cols: [4][W]u32 = undefined;
-    inline for (0..W) |j| {
-        inline for (0..4) |k| {
-            cols[k][j] = mem.readInt(u32, m[16 * j + 4 * k ..][0..4], .little);
-        }
-    }
     const V = @Vector(W, u32);
-    const t0: V = cols[0];
-    const t1: V = cols[1];
-    const t2: V = cols[2];
-    const t3: V = cols[3];
+    const t = if (W == 8 and native_endian == .little) columns8(m) else blk: {
+        var cols: [4][W]u32 = undefined;
+        inline for (0..W) |j| {
+            inline for (0..4) |k| {
+                cols[k][j] = mem.readInt(u32, m[16 * j + 4 * k ..][0..4], .little);
+            }
+        }
+        break :blk [4]V{ cols[0], cols[1], cols[2], cols[3] };
+    };
+    const t0: V = t[0];
+    const t1: V = t[1];
+    const t2: V = t[2];
+    const t3: V = t[3];
     const mask: V = @splat(limb_mask);
     const hi: V = @splat(1 << 24);
     const s6: @Vector(W, u5) = @splat(6);
@@ -271,6 +280,40 @@ fn loadBlocks(comptime W: usize, m: *const [16 * W]u8) [5]@Vector(W, u32) {
         (t3 >> s8) | hi,
     };
 }
+
+/// Word `k` of each of 8 consecutive 16-byte blocks, block `j` in lane `j`,
+/// from four 32-byte loads and register shuffles (`vpunpck{l,h}dq`,
+/// `vpunpck{l,h}qdq`, one `vpermd` per column). The per-word gather it
+/// replaces lowered to 32 `vpinsrd` per 128 bytes (2026-10-13).
+inline fn columns8(m: *const [128]u8) [4]@Vector(8, u32) {
+    const V = @Vector(8, u32);
+    // y[p] = block 2p's words 0..3 | block 2p+1's words 0..3.
+    const y: [4]V = .{
+        @bitCast(m[0..32].*),
+        @bitCast(m[32..64].*),
+        @bitCast(m[64..96].*),
+        @bitCast(m[96..128].*),
+    };
+    const lo32 = @Vector(8, i32){ 0, ~@as(i32, 0), 1, ~@as(i32, 1), 4, ~@as(i32, 4), 5, ~@as(i32, 5) };
+    const hi32 = @Vector(8, i32){ 2, ~@as(i32, 2), 3, ~@as(i32, 3), 6, ~@as(i32, 6), 7, ~@as(i32, 7) };
+    const lo64 = @Vector(8, i32){ 0, 1, ~@as(i32, 0), ~@as(i32, 1), 4, 5, ~@as(i32, 4), ~@as(i32, 5) };
+    const hi64 = @Vector(8, i32){ 2, 3, ~@as(i32, 2), ~@as(i32, 3), 6, 7, ~@as(i32, 6), ~@as(i32, 7) };
+    // a = [b0w0 b2w0 b0w1 b2w1 | b1w0 b3w0 b1w1 b3w1], b likewise for blocks 4..7.
+    const a = @shuffle(u32, y[0], y[1], lo32);
+    const b = @shuffle(u32, y[2], y[3], lo32);
+    const c = @shuffle(u32, y[0], y[1], hi32);
+    const d = @shuffle(u32, y[2], y[3], hi32);
+    // Lane order after the 64-bit unpack: blocks 0 2 4 6 1 3 5 7.
+    const order = @Vector(8, i32){ 0, 4, 1, 5, 2, 6, 3, 7 };
+    return .{
+        @shuffle(u32, @shuffle(u32, a, b, lo64), undefined, order),
+        @shuffle(u32, @shuffle(u32, a, b, hi64), undefined, order),
+        @shuffle(u32, @shuffle(u32, c, d, lo64), undefined, order),
+        @shuffle(u32, @shuffle(u32, c, d, hi64), undefined, order),
+    };
+}
+
+const native_endian = builtin.cpu.arch.endian();
 
 /// Carry a 5-limb value whose limbs may be up to ~2^32 back into the
 /// `< 2^26` (limb 1: `< 2^27`) invariant. Used after the lane fold and on the
@@ -328,6 +371,16 @@ pub fn Generic(comptime L: usize) type {
         const wide_min_groups = 3;
         const wide_min_bytes = block_length * L * wide_min_groups;
 
+        /// At `L ≥ 8` a run of `3·H .. 3·L` blocks (`H = L/2`) goes through an
+        /// `H`-lane engine over the same power table instead of std: measured
+        /// 2026-10-13, L = 8 alone sent 192–383 B to std at 1.9 cycles/B where
+        /// 4 lanes ran 1.0–1.25. `H = 0` means no half engine.
+        const H: usize = if (L >= 8) L / 2 else 0;
+        const HalfV = @Vector(@max(H, 1), u32);
+        const half_min_bytes = block_length * H * wide_min_groups;
+        /// The shortest bulk any vector engine takes.
+        const entry_bytes = if (H > 0) half_min_bytes else wide_min_bytes;
+
         /// The serial engine and the single source of truth for the
         /// accumulator, the leftover buffer, the key and the tag.
         ///
@@ -354,6 +407,12 @@ pub fn Generic(comptime L: usize) type {
         /// Lane j holds r^(L−j) / 5·r^(L−j), for the final lane fold.
         rp: [5]V = undefined,
         sp: [5]V = undefined,
+        /// The half engine's r^H, 5·r^H and its fold vectors (lane j holds
+        /// r^(H−j)); unused when `H = 0`.
+        rh: [5]u32 = undefined,
+        sh: [5]u32 = undefined,
+        rph: [5]HalfV = undefined,
+        sph: [5]HalfV = undefined,
         /// Built lazily on first use of the wide path.
         powers_ready: bool = false,
 
@@ -428,6 +487,24 @@ pub fn Generic(comptime L: usize) type {
                 st.rp[i] = rp[i];
                 st.sp[i] = sp[i];
             }
+
+            if (H > 0) {
+                st.rh = pw[H - 1];
+                inline for (0..5) |i| st.sh[i] = st.rh[i] * 5;
+                var rph: [5][H]u32 = undefined;
+                var sph: [5][H]u32 = undefined;
+                inline for (0..H) |j| {
+                    const p = pw[H - 1 - j];
+                    inline for (0..5) |i| {
+                        rph[i][j] = p[i];
+                        sph[i][j] = p[i] * 5;
+                    }
+                }
+                inline for (0..5) |i| {
+                    st.rph[i] = rph[i];
+                    st.sph[i] = sph[i];
+                }
+            }
             st.powers_ready = true;
         }
 
@@ -457,10 +534,10 @@ pub fn Generic(comptime L: usize) type {
             };
         }
 
-        /// Absorb `m` (a whole number of lane groups) through the vector engine.
+        /// Absorb `m` (a whole number of `L`-block groups) through the vector
+        /// engine. The power table must already be built (`update` does it).
         fn wide(st: *Self, m: []const u8) void {
             std.debug.assert(m.len % (block_length * L) == 0 and m.len > 0);
-            if (!st.powers_ready) st.buildPowers();
 
             // Group 0: A = M₀, with the carried-in accumulator seeded into lane
             // 0 so that it ends up multiplied by r^n like every other term.
@@ -495,12 +572,52 @@ pub fn Generic(comptime L: usize) type {
             st.inner.h = exportAcc(carryLimbs(sum));
         }
 
+        /// `wide` over `H` lanes with the half tables, for runs too short for
+        /// `L` (`H > 0` only). A deliberate copy of `wide`, not a shared
+        /// generic: one function over both widths (tables picked by a comptime
+        /// flag, or passed in) lost LLVM's `vpmuludq` selection in the L-lane
+        /// loop — it emulated 64×64 multiplies, 16 KiB at L = 8 went 0.64 →
+        /// 1.17 cycles/B (2026-10-13). The byte-exact tests against std at the
+        /// half engine's lengths pin the two copies to the same arithmetic.
+        fn wideHalf(st: *Self, m: []const u8) void {
+            std.debug.assert(H > 0 and m.len % (block_length * H) == 0 and m.len > 0);
+
+            const seed_limbs = importAcc(st.inner.h);
+            var acc = loadBlocks(H, m[0..][0 .. block_length * H]);
+            inline for (0..5) |k| {
+                var seed: [H]u32 = .{0} ** H;
+                seed[0] = seed_limbs[k];
+                acc[k] += @as(HalfV, seed);
+            }
+
+            var rlv: [5]HalfV = undefined;
+            var slv: [5]HalfV = undefined;
+            inline for (0..5) |k| {
+                rlv[k] = @splat(st.rh[k]);
+                slv[k] = @splat(st.sh[k]);
+            }
+
+            var i: usize = block_length * H;
+            while (i < m.len) : (i += block_length * H) {
+                acc = mulRed(H, acc, rlv, slv);
+                const lm = loadBlocks(H, m[i..][0 .. block_length * H]);
+                inline for (0..5) |k| acc[k] += lm[k];
+            }
+
+            const folded = mulRed(H, acc, st.rph, st.sph);
+            var sum: [5]u64 = .{ 0, 0, 0, 0, 0 };
+            inline for (0..5) |k| {
+                inline for (0..H) |j| sum[k] += folded[k][j];
+            }
+            st.inner.h = exportAcc(carryLimbs(sum));
+        }
+
         pub fn update(st: *Self, m: []const u8) void {
             // Fast path: too short for the wide engine even after the current
             // partial block is filled, so this is pure std. One predictable
             // branch — the short-packet case must not pay for the wide path's
             // bookkeeping.
-            if (L == 1 or m.len + block_length < wide_min_bytes) {
+            if (L == 1 or m.len + block_length < entry_bytes) {
                 note(.serial_std);
                 st.inner.update(m);
                 return;
@@ -516,12 +633,25 @@ pub fn Generic(comptime L: usize) type {
                 mb = mb[want..];
             }
 
-            // 2. Long run of whole blocks → vector engine, whole groups only.
-            if (L > 1 and st.inner.leftover == 0 and mb.len >= wide_min_bytes) {
+            // 2. Long run of whole blocks → vector engine, whole groups only:
+            //    L lanes from 3·L blocks, H lanes from 3·H. The power table is
+            //    built here, the one call site, so it inlines (as two call
+            //    sites it did not, and cost ~500 cycles a call, 2026-10-13).
+            const aligned = st.inner.leftover == 0;
+            const use_wide = L > 1 and aligned and mb.len >= wide_min_bytes;
+            const use_half = H > 0 and aligned and !use_wide and mb.len >= half_min_bytes;
+            if ((use_wide or use_half) and !st.powers_ready) st.buildPowers();
+            if (use_wide) {
                 note(.wide);
                 const groups = mb.len / (block_length * L);
                 st.wide(mb[0 .. groups * block_length * L]);
                 mb = mb[groups * block_length * L ..];
+            } else if (use_half) {
+                // Too short for L lanes (< 3·L blocks), long enough for H.
+                note(.wide_half);
+                const groups = mb.len / (block_length * H);
+                st.wideHalf(mb[0 .. groups * block_length * H]);
+                mb = mb[groups * block_length * H ..];
             } else {
                 note(.serial_std);
             }
@@ -549,6 +679,12 @@ pub fn Generic(comptime L: usize) type {
                 std.crypto.secureZero(u32, &st.sl);
                 std.crypto.secureZero(u8, mem.asBytes(&st.rp));
                 std.crypto.secureZero(u8, mem.asBytes(&st.sp));
+                if (H > 0) {
+                    std.crypto.secureZero(u32, &st.rh);
+                    std.crypto.secureZero(u32, &st.sh);
+                    std.crypto.secureZero(u8, mem.asBytes(&st.rph));
+                    std.crypto.secureZero(u8, mem.asBytes(&st.sph));
+                }
                 st.powers_ready = false;
             }
         }
@@ -897,9 +1033,13 @@ test "wide_min_groups routes each length to the engine it was measured for" {
         .{ .L = 4, .len = 191, .want = .serial_std, .why = "one below" },
         .{ .L = 4, .len = 192, .want = .wide, .why = "at the threshold" },
         .{ .L = 4, .len = 1024, .want = .wide, .why = "well past it" },
-        // L = 8 — threshold 384 bytes (the AVX-512 width)
-        .{ .L = 8, .len = 383, .want = .serial_std, .why = "one below" },
+        // L = 8 — the shipped width on AVX2 and AVX-512: the 4-lane half
+        // engine from 192 bytes, the 8-lane one from 384
+        .{ .L = 8, .len = 191, .want = .serial_std, .why = "one below the half engine" },
+        .{ .L = 8, .len = 192, .want = .wide_half, .why = "at the half threshold" },
+        .{ .L = 8, .len = 383, .want = .wide_half, .why = "one below" },
         .{ .L = 8, .len = 384, .want = .wide, .why = "at the threshold" },
+        // L = 4 has no half engine: below 192 is serial (above), at it wide.
         // L = 1 has no wide engine at all, at any length.
         .{ .L = 1, .len = 1024, .want = .serial_std, .why = "no vector engine" },
     }) |c| {
@@ -970,6 +1110,40 @@ test "final wipes the key-derived power table it built" {
         for (st.sl) |w| try testing.expectEqual(@as(u32, 0), w);
         for (mem.asBytes(&st.rp)) |b| try testing.expectEqual(@as(u8, 0), b);
         for (mem.asBytes(&st.sp)) |b| try testing.expectEqual(@as(u8, 0), b);
+        if (Generic(L).H > 0) {
+            for (st.rh) |w| try testing.expectEqual(@as(u32, 0), w);
+            for (st.sh) |w| try testing.expectEqual(@as(u32, 0), w);
+            for (mem.asBytes(&st.rph)) |b| try testing.expectEqual(@as(u8, 0), b);
+            for (mem.asBytes(&st.sph)) |b| try testing.expectEqual(@as(u8, 0), b);
+        }
+    }
+}
+
+test "the half engine's power table is the full table's prefix" {
+    // The half engine steps by r^H and folds by r^H..r^1, all cut from the one
+    // r^1..r^L table. A wrong index there (r^(H+1), an off-by-one fold) fails
+    // the byte comparisons only at the lengths that take the half engine, so
+    // pin those lengths against std here, with a partial head, at L = 8.
+    const key = [_]u8{0xE1} ** 32;
+    var msg: [400]u8 = undefined;
+    for (&msg, 0..) |*b, i| b.* = @truncate(i *% 53 +% 7);
+    for ([_]usize{ 192, 200, 255, 256, 320, 383 }) |len| {
+        for ([_]usize{ 0, 3 }) |head| {
+            var st = Generic(8).init(&key);
+            st.update(msg[0..head]);
+            mac_path = .serial_std;
+            st.update(msg[head..len]);
+            // A head leaves a partial block; `update` tops it up to 16 bytes
+            // first, so the bulk the engines see is `len − 16`.
+            const bulk = if (head == 0) len else len - 16;
+            const want: Path = if (bulk >= 192) .wide_half else .serial_std;
+            try testing.expectEqual(want, mac_path);
+            var tag: [16]u8 = undefined;
+            st.final(&tag);
+            var ref: [16]u8 = undefined;
+            StdPoly.create(&ref, msg[0..len], &key);
+            try testing.expectEqualSlices(u8, &ref, &tag);
+        }
     }
 }
 
@@ -993,10 +1167,8 @@ test "exportAcc drains a limb the first carry pass leaves at exactly 2^26" {
 
 test "selected lane count matches the target's features" {
     // Documents (and pins) the comptime selection: no runtime dispatch.
-    if (builtin.cpu.has(.x86, .avx512f)) {
+    if (builtin.cpu.has(.x86, .avx512f) or builtin.cpu.has(.x86, .avx2)) {
         try testing.expectEqual(@as(usize, 8), lanes);
-    } else if (builtin.cpu.has(.x86, .avx2)) {
-        try testing.expectEqual(@as(usize, 4), lanes);
     } else {
         try testing.expectEqual(@as(usize, 1), lanes);
         try testing.expect(Poly1305 == StdPoly);
