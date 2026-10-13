@@ -26,8 +26,8 @@ exponential-jitter-backoff shapes follow the `resilience` sibling.
 
 ## Why an in-memory index over `kv`
 
-`kv` is a point store — `put` / `get` / `delete` by key and **nothing else**
-(no scan, private keydir). A queue must *enumerate* ready work, so jobqueue
+`kv` is a point store — `put` / `get` / `delete` by key, plus a key listing
+(`Db.keys(prefix)`, since 2026-09-30) but no record scan (private keydir). A queue must *enumerate* ready work, so jobqueue
 keeps its own index (a `jobs` map, the ready pair described below, a `leased`
 table, a `dlq` set) and uses `kv` purely as the durable record of truth,
 rebuilt on `open`.

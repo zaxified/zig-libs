@@ -120,7 +120,7 @@ directions**.
 `explain_bytes`, its own decoder. It was installed in a throwaway virtualenv and used **as a black
 box only**: to generate wire traffic, to decode ours, and to act as a live peer. Its source was not
 read, and no design decision here was taken from it. Under CONVENTIONS §5 that is a test oracle,
-not a design reference, so it needs no `/NOTICE` entry — the same status as diffing against `tar`
+not a design reference, so it needs no root `/NOTICE` entry (the module's own `NOTICE` records it) — the same status as diffing against `tar`
 or `nft`.
 
 1. **72 byte-exact captured goldens** (`goldens.zig`). A `c104` controlling station was pointed at a
@@ -186,8 +186,7 @@ no peer is present.
    `state.Connection` fast-forwarded to the capture's own starting point — genuinely external
    sequence numbers driving the state machine, not a hand-picked `c.recv_seq = 32766` self-test.
    The t1-timeout half of F6 (driving a real peer to an actual acknowledgement timeout) was not
-   attempted after this — the wrap already required real engineering (see "What is self-derived"
-   below for what remains open).
+   attempted in that run; it was done later — see "What is self-derived" below).
 
 6. **The global (broadcast) common address, captured from a real RTU** (`goldens.zig`'s
    `global_ca_*` constants; replayed in `outstation.zig`). A `c104` controlling station interrogated

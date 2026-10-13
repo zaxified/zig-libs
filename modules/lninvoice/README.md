@@ -1,8 +1,8 @@
 # lninvoice
 
 Pure-Zig **Lightning payment requests**: BOLT#11 invoices (bech32-encoded, full decode+verify and
-encode+sign) and BOLT#12 offers (bech32-*style* TLV, decode only — see `SPEC.md` for what's
-deferred and why).
+encode+sign) and BOLT#12 offers (bech32-*style* TLV, decode) plus signed `invoice_request`/`invoice`
+(decode and encode+sign) — see `SPEC.md` for what's deferred and why.
 
 - The `lnwire` module's own doc comment already named this as future work: "BOLT#11 invoices /
   BOLT#12 offers (bech32-based — a future `lninvoice` module)". It reuses `bech32`'s charset + BCH

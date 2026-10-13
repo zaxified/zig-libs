@@ -35,7 +35,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 
 ## Design & invariants
 
-- **Four files, each independently testable:** `bech32_raw.zig` (allocator-owned, length-uncapped
+- **Five source files, each independently testable:** `bech32_raw.zig` (allocator-owned, length-uncapped
   bech32 codec — BOLT#11 explicitly waives BIP173's 90-character ceiling, so the `bech32` module's
   capped `encode`/`decode` can't be reused; also a checksum-less variant for BOLT#12) ·
   `bitpack.zig` (5-bit-quintet ↔ byte/integer conversions, shared by both BOLTs) ·

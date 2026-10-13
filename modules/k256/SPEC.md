@@ -46,7 +46,7 @@ justified by two facts:
    field, no asm, no GLV in the constant-time path), which is ~9–14× slower than
    libsecp256k1, and we cannot patch std. **11 modules in this repo ride k256
    today, not std** (the 8 Bitcoin/Lightning modules plus `bitcoinscript`,
-   `lninvoice`, `bip32` — verified 2026-09-10, `@import("k256")` in 22 files;
+   `lninvoice`, `bip32` — verified 2026-09-10 against the root `build.zig`;
    see backlog item 5 below, which this closes).
 2. **The collection's thesis.** zig-libs exists so native Zig is usable INSTEAD
    of linking a C library. A secp256k1 that is within a small factor of
@@ -648,14 +648,16 @@ Constant-time contract (secret nonce — verified by disassembly of the ReleaseF
 3. ~~Fixed-base wNAF/precomp table for `G` (constant-time base-point mul).~~
    **DONE** — `group.combMulBase` (fixed-base comb, w=4, signed-digit,
    blackBox-guarded CT gather). Sign ~4.3× faster (~2.3× libsecp256k1).
-4. Addition-chain field inverse (replace the Fermat square-and-multiply).
+4. ~~Addition-chain field inverse (replace the Fermat square-and-multiply).~~ **DONE 2026-10-07**
+   (addition-chain `invert`/`sqrt`, plus the safegcd `Fe.invertPublic` for public inputs).
 5. ~~Rewire the 8 Bitcoin/Lightning modules from `std.crypto.ecc.Secp256k1` to
    k256.~~ **DONE, and undercounted** — verified 2026-09-10 (A1/k256.md F6):
    11 modules ride k256 in production, not 8 (the original 8 plus
    `bitcoinscript`, `lninvoice`, `bip32`); the only remaining
-   `std.crypto.ecc.Secp256k1` references are comments and one test oracle
-   (`sphinx/src/kat_test.zig:28`).
-6. Side-channel review of the CT paths (inverse, GLV sign handling).
+   `std.crypto.ecc.Secp256k1` references are comments and test oracles
+   (e.g. `musig2/src/kat_test.zig`).
+6. ~~Side-channel review of the CT paths (inverse, GLV sign handling).~~ **DONE** — ctgrind
+   measured (see "MEASURED, not merely asserted").
 7. ~~Variable-base constant-time multiply is still the plain ladder.~~
    **DONE 2026-09-16 (A1 F5), under DECISIONS P5** — `mul` is now the
    fixed-window signed-digit multiply described under "Scalar multiply
@@ -713,7 +715,7 @@ Constant-time contract (secret nonce — verified by disassembly of the ReleaseF
 - **Silent Payments (BIP352) helpers** (survey 2026-09-30): libsecp256k1 has a module; the ECDH and tweak arithmetic exist here (`Secp256k1.mul`, `add`). Effort M. Fits §2; a separate module (`bip352`) rather than `k256`.
 - **Context blinding / randomised secret-scalar multiply** (survey 2026-09-30): libsecp256k1's `context_randomize` hardens signing against power/EM side channels; k256 relies on the constant-time recoding alone. Effort S-M. Fits §2.
 - **aarch64 field asm** (survey 2026-09-30): arm64 (Lightning nodes on ARM boards, phones) runs the portable Solinas path only; decred's package ships amd64 assembly, libsecp256k1 has 32/64-bit generic and ARM asm. Effort M-L, untestable without arm64 CI. Fits §2.
-- **Item 4 above (addition-chain / safegcd inverse)** (survey 2026-09-30): confirmed as the top remaining speed item; libsecp256k1 uses safegcd for both field and scalar inverses and the scalar field here is std's. Effort M.
+- **Item 4 above (addition-chain / safegcd inverse)** (survey 2026-09-30): the field inverse is done (see item 4); what remains is the scalar-field inverse, which is std's here (libsecp256k1 uses safegcd for both). Effort M.
 
 ## Anchoring
 

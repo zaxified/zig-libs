@@ -166,7 +166,8 @@ injectable `Storage` vtable. Production uses `FsStorage`; tests use
 actually guarantees: file content is volatile until `sync`, the *namespace*
 (create/rename/delete) is volatile until `syncDir`, a lock belongs to an
 open file description and dies with it, and a crash collapses the world
-under one of three models (`lose_unsynced` / `keep_unsynced` / `torn_tail`).
+under one of four models (`lose_unsynced` / `keep_unsynced` / `torn_tail` /
+`reorder_unsynced`).
 
 Locking is modeled, not just implemented: `SimStorage` reproduces the three
 states that matter — acquired, contended (`holdForeignLock` stands in for
@@ -176,8 +177,8 @@ injection point, so the sweep crashes on it like any other side effect.
 
 The sweep (`fault_test.zig`) drives a scripted workload (puts, overwrites,
 deletes, two compactions, edge keys) once per **(injection point × crash
-mode)** — 57 injection points × 3 modes = 171 deterministic crash scenarios
-— and asserts after each reboot+reopen: no acknowledged write lost, the
+mode)** (the three simple modes; `reorder_unsynced` has its own exhaustive
+sweep) — and asserts after each reboot+reopen: no acknowledged write lost, the
 recovered state exactly equals the model with the in-flight op either
 atomically applied or absent (never a mix, never torn data), compaction
 crashes preserve the logical state, and the recovered store accepts new

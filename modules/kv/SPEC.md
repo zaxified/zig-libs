@@ -18,7 +18,7 @@
 
 **Downstream consumer:** yes
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see /NOTICE.
+Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see README § Provenance (design references only; no NOTICE).
 
 ## Compared with
 
@@ -40,7 +40,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 - **Append-only log + in-memory keydir:** writes append a record (crc + key + value) and update an
   in-memory `key → {file offset, size}` index; reads are one seek+read; recovery replays the log to
   rebuild the index. Deletes are tombstones. Modeled after Bitcask (Basho) / LMDB / xitdb; see
-  NOTICE.
+  README § Provenance.
 - **Crash consistency:** a torn/partial trailing record is detected (CRC + length bounds) and
   discarded on recovery — a crash mid-write never corrupts previously-committed data. Durability
   invariants are model-checked (see Verification).
@@ -203,7 +203,7 @@ self-test (≥10/12 runs catch a data-losing recovery). Run: `zig build test-kv`
   is not refused).
 - **Cross-process lock — modeled, not just implemented** (2026-08-06): `tryLockExclusive` is a
   `Storage` vtable op and an injection point, so the fixed sweep crashes on the acquisition like
-  any other side effect (57 points × 3 modes). `SimStorage` models a lock as belonging to an open
+  any other side effect (every point × the fixed sweep's three modes). `SimStorage` models a lock as belonging to an open
   file *description* (a second `Handle` on the same name contends), released by `close` and by our
   own crash but **not** by a `holdForeignLock` holder — which is what lets a sweep assert that a
   post-crash recovery contended by another process is refused with `error.Locked` and leaves the

@@ -147,5 +147,5 @@ what is third-party-validated versus self-derived, and what is deferred.
 
 Provenance: clean-room from the IEC 60870-5-104 / IEC 60870-5-101 frame
 layouts. No third-party source was consulted; a third-party stack was used as a
-black-box test oracle only. See SPEC.md and `/NOTICE`.
+black-box test oracle only. See SPEC.md and this module's `NOTICE` (a record of the oracle, no condition owed).
  DATA: `src/goldens.zig` holds APDUs captured through a recording TCP proxy from real traffic between two third-party IEC 60870-5-104 endpoints acting as our peers. Observed behaviour, exempt per root `NOTICE` §0; no upstream test corpus is reproduced.

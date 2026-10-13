@@ -16,7 +16,7 @@
 
 **Downstream consumer:** no
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see this module's README "Provenance" note — clean-room, so there is deliberately no root `/NOTICE` entry to point at (root `NOTICE` §0).
+Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see this module's README "Provenance" note — clean-room, so there is deliberately no root `/NOTICE` entry and no module NOTICE (root `NOTICE` §0).
 
 ## Compared with
 
@@ -896,8 +896,9 @@ IEC 61850 is **unauthenticated and unencrypted** by design, and its two halves f
   frame on the LAN can forge one with a higher `stNum` and a plausible `gocbRef`, and a subscriber
   has no way to tell. The `confRev` check, the `numDatSetEntries` cross-check and the TAL liveness
   window are **consistency** mechanisms, not security ones: they catch misconfiguration and loss,
-  not an attacker. IEC 61850-90-5 / IEC 62351-6 signing is **not implemented** — the `security [12]`
-  field is skipped on decode and never emitted. Physical and VLAN segregation of the station bus is
+  not an attacker. IEC 61850-90-5 / IEC 62351-6 signing is **not implemented here** — a GOOSE frame whose `Length` covers an extension after the PDU is
+  refused by `Frame.decode` (`error.SecurityExtensionPresent`) or handed back by `Frame.decodeSecured`
+  as `extension` for verification by the sibling `iec62351` module; this module never emits one. Physical and VLAN segregation of the station bus is
   the actual control.
 - **Writing is dangerous and is spelled out.** `FunctionalConstraint.isOperational` names the five
   constraints (`CO`, `SP`, `SV`, `SG`, `SE`) under which a write changes what the plant does rather
@@ -1025,8 +1026,8 @@ Not implemented at all:
   **GSSE** (the pre-2003 `0x88B9` framing) entirely.
 - **SV publisher/subscriber timing.** SV runs at 4000 or 4800 frames a second against a hard jitter
   budget; that belongs with a real-time scheduler, not a codec. Only the frame codec is here.
-- **IEC 62351 security**: no TLS on 102, no GOOSE/SV signing (`security [12]` is skipped), no
-  certificate handling, no RBAC.
+- **IEC 62351 security**: no TLS on 102, no GOOSE/SV signing here (`Frame.decodeSecured` exposes the extension; the sibling `iec62351` verifies it),
+  no certificate handling, no RBAC.
 - **IEC 61850-90-5** routable GOOSE/SV over UDP.
 - **MMS services outside the IEC 61850 profile**: domain download/upload, program invocations,
   semaphores, event conditions/actions/enrollments, scattered access, named types, `Status`,

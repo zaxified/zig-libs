@@ -139,8 +139,8 @@ in `core.decide`.
 ## Verify
 
 ```
-scripts/modtest liveness-hyst                         # Debug       — 26 pass
-scripts/modtest liveness-hyst -Doptimize=ReleaseSafe  # ReleaseSafe — 26 pass
+scripts/modtest liveness-hyst                         # Debug
+scripts/modtest liveness-hyst -Doptimize=ReleaseSafe  # ReleaseSafe
 ```
 
 The estimator is **scored, not merely asserted**: a replayable trace corpus in

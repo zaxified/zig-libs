@@ -49,3 +49,7 @@ const s2 = ls.compute(&[_]?u64{ 10, null, 14, 16 });
 `stddev_ns` is the population stddev (divide-by-n), matching fping / ping
 summary output; `jitter_ns` follows the RFC 3550 recurrence `J += (|D|-J)/16`
 over successive RTT differences.
+
+Percentiles are the separate, allocating `Histogram` type (counts array sized once
+at `init`): `Histogram.init(gpa, .{ .highest = ..., .sigfigs = 3 })`, then
+`record` / `recordCount` / `valueAtPercentile` / `percentileSnapshot` / `add` (merge).

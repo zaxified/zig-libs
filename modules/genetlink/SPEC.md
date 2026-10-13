@@ -16,7 +16,7 @@
 
 **Downstream consumer:** no
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see /NOTICE.
+Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see README § Provenance (no module NOTICE; the root `NOTICE` does not list this module).
 
 ## Compared with
 
@@ -193,7 +193,7 @@ The kernel UAPI header this module cites (`linux/genetlink.h`) is GPL-2.0, but t
 module a GPL derivative: only uncopyrightable ABI facts are taken from it (numeric constants,
 `genlmsghdr` layout), and separately, that header carries the **Linux-syscall-note** exception, which
 explicitly permits userspace of any license to use it to interface with the kernel. No kernel source
-was consulted or copied. Full attribution in /NOTICE.
+was consulted or copied. Attribution: see README § Provenance (no module NOTICE).
 
 ## Threat model / out of scope
 The untrusted input is the kernel's reply bytes; wire-format validation (bounds/length checks) is
@@ -248,10 +248,8 @@ pass/skip counts in Debug and `--release=fast`, and source compatibility is prov
 previous commit), not by inspection.
 
 ## Backlog / deferred
-- `nl80211` and `ethtool` still carry their private `findMcastGroupId` + `CTRL_ATTR_MCAST_GRP_*`
-  copies; they can adopt the shared ones in a later wave (mechanical, module-local).
-- `ethtool` sets `NETLINK_EXT_ACK` itself and keeps its own `err_buf`; the transport now does both,
-  so that copy can go the same way.
+- ~~`nl80211`/`ethtool` private `findMcastGroupId` copies~~ — done: both now wrap `genetlink.findMcastGroupId`, re-export the `CTRL_ATTR_MCAST_GRP_*` constants and call `resolveMcastGroup` (the batch `resolveMcastGroups` is not yet adopted by them).
+- ~~`ethtool` sets `NETLINK_EXT_ACK` itself~~ — done: the shared transport sets it (`ethtool/src/client.zig` header).
 
 - **`ListFamilies` (survey 2026-09-30)** — `CTRL_CMD_GETFAMILY` with `NLM_F_DUMP`, returning every registered family (id, name, version); mdlayher/genetlink has it and it is how a tool discovers what a kernel offers. Effort: small; fits CONVENTIONS §2.
 - **Family metadata (survey 2026-09-30)** — `CTRL_ATTR_VERSION`, `HDRSIZE`, `MAXATTR` from the same reply that yields the id, so a client can check version compatibility. Effort: small.

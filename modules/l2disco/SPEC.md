@@ -16,7 +16,7 @@
 
 **Downstream consumer:** yes
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see /NOTICE.
+Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see this module's `NOTICE` (vendored tcpdump capture frames).
 
 ## Compared with
 
@@ -126,9 +126,9 @@ alone here. Revisit only on a fresh, explicit ask; do not fold it into `tolerant
   rogue-DHCP check is DHCPv4). Also deferred: LLDP-MED location content (civic-address CAtypes,
   coordinate LCI) — returned as `format` + bytes; builders for power/location/inventory TLVs
   (`Builder.addOrgSpecific` takes the raw info).
-- **LLDP-MED (TIA-1057) and 802.3at power-via-MDI decoding** *(survey 2026-09-30)* — the org TLVs a VoIP-phone/PoE-switch neighbour advertises (capabilities, network policy, location, inventory, power); `rg -i 'med|tia|12bb' src/lldp.zig` finds none, only `oui_ieee_8021`/`oui_ieee_8023`. Small-medium (tables + bounds checks). Fits §2.
-- **More typed DHCPv4 options** *(survey 2026-09-30)* — relay agent information (82), classless static routes (121), domain search (119), vendor-specific/class id (43/60), TFTP/boot file (66/67), NTP (42), plus `Builder` support for them. Typed options today: message type, requested IP, server id, lease time, subnet mask, routers, DNS, domain/host name, parameter request list, client id (`Message` fields, `src/dhcp.zig:185`). Small each. Fits §2.
-- **DHCPv6 and ICMPv6 Neighbor Discovery codecs** *(survey 2026-09-30)* — the IPv6 counterparts every reference above has (`rawsock` lists ND as deferred too). Medium each; fits §2 (codec only).
+- ~~**LLDP-MED (TIA-1057) and 802.3at power-via-MDI decoding**~~ **DONE 2026-10-04** *(survey 2026-09-30)* — the org TLVs a VoIP-phone/PoE-switch neighbour advertises (capabilities, network policy, location, inventory, power). Small-medium (tables + bounds checks). Fits §2.
+- ~~**More typed DHCPv4 options**~~ **DONE 2026-10-04** *(survey 2026-09-30)* — relay agent information (82), classless static routes (121), domain search (119), vendor-specific/class id (43/60), TFTP/boot file (66/67), NTP (42), plus `Builder` support for them. Small each. Fits §2.
+- **DHCPv6 and ICMPv6 Neighbor Discovery codecs** *(survey 2026-09-30)* — ND is **DONE 2026-10-04** (`nd`); DHCPv6 stays open. The IPv6 counterparts every reference above has. Medium each; fits §2 (codec only).
 
 ## Status
 

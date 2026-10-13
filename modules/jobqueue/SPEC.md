@@ -44,7 +44,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   scheduled visibility (`delay_ns`/`run_at`). Greenfield over `kv`; the partition-FIFO dispatch
   shape is original design work; Faktory/Sidekiq (lease/reserve, retry-with-backoff, dead-letter)
   and the `resilience`/`jwt` sibling clock-injection pattern are behavioral/design references only.
-- **In-memory index over a point store.** `kv` is `put`/`get`/`delete` by key only (no scan); a
+- **In-memory index over a point store.** `kv` is `put`/`get`/`delete` by key (plus `Db.keys(prefix)` since 2026-09-30; no record scan, and the id-counter replay below does not use it); a
   queue must *enumerate* ready work, so jobqueue keeps its own index (`jobs`, the ready pair
   `pending`/`parts`, `leased`, `dlq`) and uses `kv` purely as the durable record of truth,
   rebuilt on `open`.

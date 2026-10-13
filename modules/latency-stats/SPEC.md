@@ -18,7 +18,7 @@
 
 **Downstream consumer:** yes
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see /NOTICE.
+Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see README § Provenance (no module NOTICE; the root `NOTICE` has no entry for this module).
 
 ## Compared with
 
@@ -52,7 +52,7 @@ concurrent or interval recording, no `Accumulator` merge (→ Backlog items).
   `Histogram` is a separate opt-in type (counts array fixed at `init`) so percentiles never
   compromise the allocation-free moment path. Feed both the same samples. Moment stats are the
   authors' own original work; `Histogram` is clean-room from Gil Tene's
-  HdrHistogram design (logarithmic bucketing with linear sub-buckets) — see NOTICE.
+  HdrHistogram design (logarithmic bucketing with linear sub-buckets) — see README § Provenance.
 - **Numerically stable:** mean + variance via Welford's online algorithm (no sum-of-squares
   overflow); `stddev_ns` is the *population* stddev (divide-by-n), matching fping/iputils-ping
   output; `jitter_ns` follows the RFC 3550 §6.4.1 recurrence `J += (|D| - J)/16` over successive RTT
@@ -95,9 +95,9 @@ added: `recordCount(v, 0)` leaves the histogram untouched, `max()` included.
 
 ## Backlog / deferred
 
-- **NOTICE citation nit — RESOLVED 2026-07-10:** the latency-stats NOTICE entry was rewritten
-  during the provenance reframe and is now complete and correct (moment stats attributed as the
-  authors' own original work; HdrHistogram design refs licensed; RFC 3550 + Welford cited).
+- **Provenance citation nit — RESOLVED 2026-07-10:** provenance is stated in the README
+  (moment stats are the authors' own original work; HdrHistogram design refs licensed;
+  RFC 3550 + Welford cited); there is no NOTICE entry for this module.
 - No functional/API backlog recorded (module README has no Deferred section).
 
 Survey 2026-09-30 — missing and it matters (pure Zig, fit CONVENTIONS §2):
@@ -111,7 +111,7 @@ Survey 2026-09-30 — missing and it matters (pure Zig, fit CONVENTIONS §2):
   parallel-combine formula). `Histogram.add` exists, the moment half has no equivalent. Effort: small.
 - (survey 2026-09-30) **Serialization of a `Histogram`** (HdrHistogram V2/compressed log format for interchange with the
   Java/C/Rust tools). Why: ship histograms between processes or feed HdrHistogram plotters. Effort: medium; needs
-  DEFLATE for the compressed variant (`std.compress.flate` covers decompression only *(inferred)*; sibling module to be checked) and the format spec, not source.
+  DEFLATE for the compressed variant (`std.compress.flate` has both `Compress` and `Decompress` in Zig 0.16) and the format spec, not source.
 - Deliberately not done (already in Threat model above): thread safety / interval recorders (single-owner by design) and
   exponential histograms / windowing / decay. `Histogram` of floating-point values (HdrHistogram "DoubleHistogram") is
   not listed anywhere — question for the owner.

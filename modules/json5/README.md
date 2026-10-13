@@ -58,10 +58,11 @@ defer alloc.free(q);
   **Concurrency:** reentrant (no shared state; both functions take an
   allocator and a borrowed input slice). **Deps:** std-only.
 - **Model after:** the JSON5 spec (json5.org) preprocessor-to-JSON
-  approach — this module rewrites every JSON5 numeric, string-continuation and
-  whitespace form; the few string escapes JSON lacks are deferred (see below).
+  approach — this module rewrites every JSON5 numeric, string-continuation,
+  whitespace and string-escape form (`\v`, `\0`, `\xHH`, escaped non-escape characters);
+  see below for what is deferred.
 
-Provenance: original work of the zig-libs authors (MIT), ~949 LOC. The
+Provenance: original work of the zig-libs authors (MIT). The
 conformance test suite additionally vendors the official `json5/json5-tests`
 fixture corpus (test data only, no source code) — see NOTICE. DATA:
 `src/ref_oracle_vectors.zig` holds the verdicts of the reference `json5`

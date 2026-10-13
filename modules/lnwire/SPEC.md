@@ -142,7 +142,7 @@ them (see "Verification" below):
 unit of work, not a corner cut inside a message this module claims to implement):
 
 - **BOLT#11 invoices / BOLT#12 offers** — bech32-based encodings, a distinct concern from
-  BOLT#1-style binary TLV wire messages; a future `lninvoice` module.
+  BOLT#1-style binary TLV wire messages; the sibling `lninvoice` module (BOLT#11 decode/encode, BOLT#12 offers and signed invoice_request/invoice).
 - **Signature verification** — every `signature`/`bip340sig`/`point` field is opaque bytes; no
   secp256k1 anywhere in this module (a pure codec has no business owning curve arithmetic — the
   caller verifies `channelAnnouncementDigest(payload)` etc. against the message's signature
@@ -305,7 +305,7 @@ Run: `zig build test-lnwire` (Debug and `-Doptimize=ReleaseFast`).
 
 - **Dual-funding / interactive-tx / splicing / `stfu` / `closing_complete`+`closing_sig` message set** *(survey 2026-09-30)* — what current LND/CLN/LDK peers negotiate. Effort: medium (mechanical, spec vectors exist); fits §2.
 - **Named BOLT#9 feature table and typed TLV records for the other messages** *(2026-10-06)* — `features.zig` takes bit numbers, and `channel_type`/`fee_range`/`attribution_data` etc. are still raw `(type, value)` pairs (only `channel_reestablish`'s two records are typed). Effort: small; fits §2.
-- **zlib-compressed `short_channel_id` lists** *(survey 2026-09-30)* — decode-only support would let extended queries interoperate with peers that compress (4 of the 10 spec rows). Effort: needs an inflate (no zlib/deflate module in this collection; std has `std.compress.flate`, *inferred, not checked*); fits §2 if std is used.
+- **zlib-compressed `short_channel_id` lists** *(survey 2026-09-30)* — decode-only support would let extended queries interoperate with peers that compress (4 of the 10 spec rows). Effort: needs an inflate (no zlib/deflate module in this collection; `std.compress.flate` in Zig 0.16 has a zlib-container `Decompress`); fits §2 if std is used.
 
 ## Anchoring
 

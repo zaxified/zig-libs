@@ -6,8 +6,8 @@ Montgomery field, no asm), which leaves it ~9–14× slower than libsecp256k1
 (hand-written asm + the GLV endomorphism + wNAF). **11** modules in this repo
 depend on k256 today — the 8 Bitcoin/Lightning modules (`bip340`, `taproot`,
 `musig2`, `adaptor`, `frost`, `sphinx`, `bolt3`, `bolt8`) plus `bitcoinscript`,
-`lninvoice`, and `bip32` (`@import("k256")` in 22 files; verified 2026-09-10
-against the root `build.zig`). k256 keeps the collection's
+`lninvoice`, and `bip32` (verified against the root `build.zig`;
+`rg -l '@import("k256")' modules`). k256 keeps the collection's
 **zero-C/no-libc** invariant (inline asm is still native Zig) while pulling in the
 three techniques std forgoes:
 
@@ -63,14 +63,14 @@ const R = try Q.mulPublic(scalar_be, .big); // variable-time (public scalar)
 const xy = R.affineCoordinates();
 
 // Signatures (the end-to-end anchor).
-const sig = try k256.sign.bip340Sign(secret_key, msg, aux_rand);
+const sig = try k256.sign.bip340Sign(&secret_key, msg, aux_rand);
 const ok  = k256.sign.bip340Verify(pubkey_xonly, msg, sig);
 const ok2 = k256.sign.ecdsaVerify(pubkey_sec1, msg, sig_rs);      // malleable, like std
 const ok3 = k256.sign.ecdsaVerifyLowS(pubkey_sec1, msg, sig_rs);  // rejects the high-S twin
 
 // Recoverable ECDSA (RFC 6979 deterministic sign + public-key recovery —
 // e.g. Lightning BOLT#11's invoice signature).
-const rsig = try k256.ecdsa_recover.sign(privkey, hash32);
+const rsig = try k256.ecdsa_recover.sign(&privkey, hash32);
 const q = try k256.ecdsa_recover.recoverPubkey(hash32, rsig.r, rsig.s, rsig.recid);
 ```
 
@@ -121,5 +121,5 @@ lattice basis) are public curve facts; the specific integer constants match
 correctness oracle (differential tests), not as a design reference. The
 `kat_vectors.zig` transcription of the official `bip-0340/test-vectors.csv` is a
 public BIP spec artifact used as a test oracle, not copied from any
-implementation's test suite. Asm is amd64-only with a portable fallback
+implementation's test suite (third-party test-vector attribution: see `NOTICE`). Asm is amd64-only with a portable fallback
 everywhere.
