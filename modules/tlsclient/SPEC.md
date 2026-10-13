@@ -70,6 +70,26 @@ marked `zig-libs tlsclient` in `Client.zig`:
   ChangeCipherSpec (std waited for one).
 - **TLS 1.2 ECDHE_ECDSA suites** (AES-GCM, ChaCha20); the suite must match the
   certificate's key type.
+- **Ed25519 server certificates** (TLS 1.3 CertificateVerify, TLS 1.2
+  ECDHE_ECDSA): std carried the verifier but its scheme→key mapping never
+  reached it.
+- **Session view** `Options.connection_info` → `ConnectionInfo` (Go
+  `ConnectionState`): version, suite, group, ALPN, HRR, EMS, the peer's
+  certificates as sent, the stapled OCSP response and SCTs, all copied into
+  caller storage (`ConnectionInfoTooSmall` rather than truncation). Also
+  `Client.cipher_suite`, `negotiated_group`, `hello_retry_request`.
+- **OCSP / SCT requests** on by default as in Go (`request_ocsp`,
+  `request_scts`); neither is verified (Go verifies neither). TLS 1.3: from
+  the leaf's CertificateEntry; TLS 1.2: SCTs from ServerHello, OCSP from the
+  CertificateStatus message (only after the server promised it).
+- **Verification hook** `verify_connection` (Go `VerifyConnection` /
+  `VerifyPeerCertificate`): runs once the server is authenticated, before our
+  Finished; an error is `TlsConnectionRejected`.
+- **TLS 1.2 extended master secret** (RFC 7627) and empty
+  renegotiation_info (RFC 5746), offered by default as in Go.
+- **Keying-material exporter** `exportKeyingMaterial(label, context, out)`:
+  RFC 8446 §7.5; TLS 1.2 RFC 5705 only with EMS and without the PRF's own
+  labels (Go's rules). Equal to `openssl s_server -keymatexport` in both.
 
 - **ALPN (RFC 7301).** `Options.alpn_protocols` (default empty: no
   extension) and `Client.alpn_protocol`. The extension goes last in the

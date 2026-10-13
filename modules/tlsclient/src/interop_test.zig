@@ -79,6 +79,21 @@ const Server = struct {
         s.child.kill(io);
     }
 
+    /// The rest of the first report line starting with `prefix`, copied
+    /// into `out` (s_server prints "Keying material: <hex>").
+    fn reportedValue(s: *Server, io: std.Io, prefix: []const u8, out: []u8) ?[]const u8 {
+        var r = s.child.stdout.?.reader(io, &s.out_buf);
+        while (r.interface.takeDelimiter('\n') catch null) |line| {
+            const t = std.mem.trim(u8, line, " \r");
+            if (std.mem.startsWith(u8, t, prefix)) {
+                const v = t[prefix.len..];
+                @memcpy(out[0..v.len], v);
+                return out[0..v.len];
+            }
+        }
+        return null;
+    }
+
     /// Whether the server's report (stdout, up to its exit after the one
     /// connection) has a line starting with `want`.
     fn reported(s: *Server, io: std.Io, want: []const u8) bool {
@@ -187,6 +202,17 @@ const Ext = struct {
     max_version: std.crypto.tls.ProtocolVersion = .tls_1_3,
     groups: []const std.crypto.tls.NamedGroup = &Client.default_groups,
     key_share_groups: []const std.crypto.tls.NamedGroup = &Client.default_key_share_groups,
+    connection_info: ?*Client.ConnectionInfo = null,
+    verify_connection: ?Client.VerifyConnection = null,
+    extended_master_secret: bool = true,
+    host: []const u8 = "good.example.test",
+    /// Trust the server's self-signed certificate instead of the bundle.
+    self_signed: bool = false,
+    /// Skip the "hello" round trip (a server without `-rev`).
+    no_echo: bool = false,
+    /// Export this many bytes under `export_label` after the handshake.
+    export_label: []const u8 = "",
+    export_len: usize = 0,
 };
 
 const Session = struct {
@@ -194,6 +220,7 @@ const Session = struct {
     version: std.crypto.tls.ProtocolVersion = .tls_1_3,
     group: ?std.crypto.tls.NamedGroup = null,
     hrr: bool = false,
+    exported: [64]u8 = undefined,
     /// What the server's `-rev` mode sent back for "hello\n".
     echo: [16]u8 = undefined,
     echo_len: usize = 0,
@@ -219,8 +246,8 @@ fn session(io: std.Io, port: u16, bundle: *std.crypto.Certificate.Bundle, ext: E
     var lock: std.Io.RwLock = .init;
     var c = try Client.init(&sr.interface, &sw.interface, .{
         .alert = ext.alert,
-        .host = .{ .explicit = "good.example.test" },
-        .ca = .{ .bundle = .{ .gpa = testing.allocator, .io = io, .lock = &lock, .bundle = bundle } },
+        .host = .{ .explicit = ext.host },
+        .ca = if (ext.self_signed) .self_signed else .{ .bundle = .{ .gpa = testing.allocator, .io = io, .lock = &lock, .bundle = bundle } },
         .read_buffer = &tls_in,
         .write_buffer = &tls_out,
         .entropy = &entropy,
@@ -231,8 +258,13 @@ fn session(io: std.Io, port: u16, bundle: *std.crypto.Certificate.Bundle, ext: E
         .max_version = ext.max_version,
         .groups = ext.groups,
         .key_share_groups = ext.key_share_groups,
+        .connection_info = ext.connection_info,
+        .verify_connection = ext.verify_connection,
+        .extended_master_secret = ext.extended_master_secret,
     });
     var out: Session = .{ .alpn = c.alpn_protocol, .version = c.tls_version, .group = c.negotiated_group, .hrr = c.hello_retry_request };
+    if (ext.export_len != 0) try c.exportKeyingMaterial(ext.export_label, null, out.exported[0..ext.export_len]);
+    if (ext.no_echo) return out;
     try c.writer.writeAll("hello\n");
     try c.writer.flush();
     try sw.interface.flush();
@@ -548,6 +580,158 @@ test "interop: version bounds -- TLS 1.3 only refuses a 1.2 server, TLS 1.2 only
     }
 }
 
+// ── S2 (2026-10-13): session view, OCSP/SCT, EMS, exporter, hook, Ed25519 ──
+
+/// A minimal valid OCSPResponse: status malformedRequest(1), no body
+/// (RFC 6960 §4.2.1). s_server staples any parseable response.
+const ocsp_der = "\x30\x03\x0a\x01\x01";
+
+test "interop: ConnectionInfo -- chain, version, group; stapled OCSP in TLS 1.3 and TLS 1.2; storage too small" {
+    const io = testing.io;
+    var tmp = try setUp(io);
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "ocsp.der", .data = ocsp_der });
+    var bundle = try rootBundle(io, tmp.dir);
+    defer bundle.deinit(testing.allocator);
+    inline for (.{ "-tls1_3", "-tls1_2" }) |proto| {
+        var srv = try Server.startProto(io, tmp.dir, proto, "leaf.pem", "leaf.key.pem", "inter.pem", &.{ "-status_file", "ocsp.der", "-rev" });
+        defer srv.stop(io);
+        var storage: [16 * 1024]u8 = undefined;
+        var ci: Client.ConnectionInfo = .init(&storage);
+        const s = try session(io, srv.port, &bundle, .{ .connection_info = &ci });
+        try testing.expectEqualStrings("olleh", s.echo[0..s.echo_len]);
+        try testing.expectEqual(@as(usize, 2), ci.peerCertificates().len);
+        try testing.expectEqualSlices(u8, derFromPem(@embedFile("testdata/leaf.pem")), ci.peerCertificates()[0]);
+        try testing.expectEqualSlices(u8, derFromPem(@embedFile("testdata/inter.pem")), ci.peerCertificates()[1]);
+        try testing.expectEqualSlices(u8, ocsp_der, ci.ocsp_response);
+        try testing.expectEqual(s.version, ci.version);
+        try testing.expectEqual(s.group, ci.negotiated_group);
+        if (comptime std.mem.eql(u8, proto, "-tls1_2")) {
+            try testing.expect(ci.extended_master_secret); // openssl agrees to EMS by default
+            try testing.expectEqual(std.crypto.tls.ProtocolVersion.tls_1_2, ci.version);
+        }
+        // A storage too small for the chain is refused, not truncated.
+        var srv2 = try Server.startProto(io, tmp.dir, proto, "leaf.pem", "leaf.key.pem", "inter.pem", &.{"-rev"});
+        defer srv2.stop(io);
+        var tiny: [64]u8 = undefined;
+        var ci2: Client.ConnectionInfo = .init(&tiny);
+        try testing.expectError(error.ConnectionInfoTooSmall, session(io, srv2.port, &bundle, .{ .connection_info = &ci2 }));
+    }
+}
+
+test "interop: TLS 1.2 SCTs from ServerHello (s_server -serverinfo)" {
+    const io = testing.io;
+    var tmp = try setUp(io);
+    defer tmp.cleanup();
+    // serverinfo v1: extension 18 (signed_certificate_timestamp) whose body
+    // is a SignedCertificateTimestampList of two SCTs, "SCT-one" and "SCT-2".
+    const body = "\x00\x12\x00\x12" ++ "\x00\x10" ++ "\x00\x07SCT-one" ++ "\x00\x05SCT-2";
+    var b64: [std.base64.standard.Encoder.calcSize(body.len)]u8 = undefined;
+    _ = std.base64.standard.Encoder.encode(&b64, body);
+    var pem_buf: [256]u8 = undefined;
+    const pem = try std.fmt.bufPrint(&pem_buf, "-----BEGIN SERVERINFO FOR signed_certificate_timestamp-----\n{s}\n-----END SERVERINFO FOR signed_certificate_timestamp-----\n", .{b64});
+    try tmp.dir.writeFile(io, .{ .sub_path = "sct.pem", .data = pem });
+    var bundle = try rootBundle(io, tmp.dir);
+    defer bundle.deinit(testing.allocator);
+    var srv = try Server.startProto(io, tmp.dir, "-tls1_2", "leaf.pem", "leaf.key.pem", "inter.pem", &.{ "-serverinfo", "sct.pem", "-rev" });
+    defer srv.stop(io);
+    var storage: [16 * 1024]u8 = undefined;
+    var ci: Client.ConnectionInfo = .init(&storage);
+    _ = try session(io, srv.port, &bundle, .{ .connection_info = &ci });
+    try testing.expectEqual(@as(usize, 2), ci.signedCertificateTimestamps().len);
+    try testing.expectEqualStrings("SCT-one", ci.signedCertificateTimestamps()[0]);
+    try testing.expectEqualStrings("SCT-2", ci.signedCertificateTimestamps()[1]);
+}
+
+const Hook = struct {
+    calls: usize = 0,
+    leaf_len: usize = 0,
+    refuse: bool,
+    fn verify(ctx: ?*anyopaque, info: *const Client.ConnectionInfo) anyerror!void {
+        const h: *Hook = @ptrCast(@alignCast(ctx.?));
+        h.calls += 1;
+        h.leaf_len = info.peerCertificates()[0].len;
+        if (h.refuse) return error.Pinned;
+    }
+};
+
+test "interop: verify_connection -- runs once with the chain; refusing aborts with TlsConnectionRejected" {
+    const io = testing.io;
+    var tmp = try setUp(io);
+    defer tmp.cleanup();
+    var bundle = try rootBundle(io, tmp.dir);
+    defer bundle.deinit(testing.allocator);
+    inline for (.{ "-tls1_3", "-tls1_2" }) |proto| {
+        var storage: [16 * 1024]u8 = undefined;
+        {
+            var srv = try Server.startProto(io, tmp.dir, proto, "leaf.pem", "leaf.key.pem", "inter.pem", &.{"-rev"});
+            defer srv.stop(io);
+            var ci: Client.ConnectionInfo = .init(&storage);
+            var h: Hook = .{ .refuse = false };
+            const s = try session(io, srv.port, &bundle, .{ .connection_info = &ci, .verify_connection = .{ .context = &h, .verify = Hook.verify } });
+            try testing.expectEqualStrings("olleh", s.echo[0..s.echo_len]);
+            try testing.expectEqual(@as(usize, 1), h.calls);
+            try testing.expectEqual(derFromPem(@embedFile("testdata/leaf.pem")).len, h.leaf_len);
+        }
+        {
+            var srv = try Server.startProto(io, tmp.dir, proto, "leaf.pem", "leaf.key.pem", "inter.pem", &.{"-rev"});
+            defer srv.stop(io);
+            var ci: Client.ConnectionInfo = .init(&storage);
+            var h: Hook = .{ .refuse = true };
+            try testing.expectError(error.TlsConnectionRejected, session(io, srv.port, &bundle, .{ .connection_info = &ci, .verify_connection = .{ .context = &h, .verify = Hook.verify } }));
+            try testing.expectEqual(@as(usize, 1), h.calls);
+        }
+    }
+    var h: Hook = .{ .refuse = false };
+    var srv = try Server.start(io, tmp.dir, "leaf.pem", "leaf.key.pem", "inter.pem");
+    defer srv.stop(io);
+    try testing.expectError(error.ConnectionInfoRequired, session(io, srv.port, &bundle, .{ .verify_connection = .{ .context = &h, .verify = Hook.verify } }));
+    try testing.expectEqual(@as(usize, 0), h.calls);
+}
+
+test "interop: exportKeyingMaterial equals openssl's -keymatexport (TLS 1.3; TLS 1.2 with EMS), refused without EMS" {
+    const io = testing.io;
+    var tmp = try setUp(io);
+    defer tmp.cleanup();
+    var bundle = try rootBundle(io, tmp.dir);
+    defer bundle.deinit(testing.allocator);
+    inline for (.{ "-tls1_3", "-tls1_2" }) |proto| {
+        var srv = try Server.startProto(io, tmp.dir, proto, "leaf.pem", "leaf.key.pem", "inter.pem", &.{ "-keymatexport", "EXPERIMENTAL-zig-libs", "-keymatexportlen", "40" });
+        defer srv.stop(io);
+        const s = try session(io, srv.port, &bundle, .{ .no_echo = true, .export_label = "EXPERIMENTAL-zig-libs", .export_len = 40 });
+        var hex_buf: [128]u8 = undefined;
+        const theirs = srv.reportedValue(io, "Keying material: ", &hex_buf) orelse return error.NoKeyingMaterialReported;
+        var want: [40]u8 = undefined;
+        _ = try std.fmt.hexToBytes(&want, theirs);
+        try testing.expectEqualSlices(u8, &want, s.exported[0..40]);
+    }
+    {
+        var srv = try Server.startProto(io, tmp.dir, "-tls1_2", "leaf.pem", "leaf.key.pem", "inter.pem", &.{"-rev"});
+        defer srv.stop(io);
+        try testing.expectError(error.ExporterUnavailable, session(io, srv.port, &bundle, .{ .extended_master_secret = false, .export_label = "x", .export_len = 8 }));
+    }
+}
+
+test "interop: an Ed25519 server certificate (TLS 1.3 CertificateVerify, TLS 1.2 ECDHE_ECDSA)" {
+    const io = testing.io;
+    var tmp = try setUp(io);
+    defer tmp.cleanup();
+    const gen = std.process.run(testing.allocator, io, .{
+        .argv = &.{ "openssl", "req", "-x509", "-newkey", "ed25519", "-nodes", "-keyout", "ed.key", "-out", "ed.pem", "-days", "2", "-subj", "/CN=ed.example.test", "-addext", "subjectAltName=DNS:ed.example.test" },
+        .cwd = .{ .dir = tmp.dir },
+    }) catch return error.SkipZigTest;
+    testing.allocator.free(gen.stdout);
+    testing.allocator.free(gen.stderr);
+    var bundle = try rootBundle(io, tmp.dir);
+    defer bundle.deinit(testing.allocator);
+    inline for (.{ "-tls1_3", "-tls1_2" }) |proto| {
+        var srv = try Server.startProto(io, tmp.dir, proto, "ed.pem", "ed.key", "ed.pem", &.{"-rev"});
+        defer srv.stop(io);
+        const s = try session(io, srv.port, &bundle, .{ .host = "ed.example.test", .self_signed = true });
+        try testing.expectEqualStrings("olleh", s.echo[0..s.echo_len]);
+    }
+}
+
 // ── offline: the ClientHello, the ALPN answer, the CertificateRequest ──────
 
 /// The ClientHello this module writes with Go-shaped option overrides.
@@ -607,6 +791,10 @@ fn clientHello(comptime C: type, out: []u8, alpn: []const []const u8) ![]const u
     if (@hasField(C.Options, "groups")) {
         opts.groups = &C.std_groups;
         opts.key_share_groups = &C.std_groups;
+        opts.request_ocsp = false;
+        opts.request_scts = false;
+        opts.extended_master_secret = false;
+        opts.renegotiation_info = false;
     }
     if (C.init(&in, &w, opts)) |_| return error.TestUnexpectedSuccess else |e| {
         // The option check comes before anything is written.
@@ -645,8 +833,11 @@ test "default options: Go's shape -- five groups listed, shares for X25519MLKEM7
     const go = try clientHelloWith(&a, .{});
     const std_shape = try clientHello(Client, &b, &.{});
     // Two shares instead of four: P-256 (65 + 4) and P-384 (97 + 4) bytes
-    // gone, P-521 (2) added to supported_groups.
-    try testing.expectEqual(std_shape.len - (65 + 4) - (97 + 4) + 2, go.len);
+    // gone, P-521 (2) added to supported_groups; then Go's requests:
+    // status_request (9), signed_certificate_timestamp (4),
+    // extended_master_secret (4), renegotiation_info (5).
+    try testing.expectEqual(std_shape.len - (65 + 4) - (97 + 4) + 2 + 9 + 4 + 4 + 5, go.len);
+    try testing.expect(std.mem.endsWith(u8, go, "\x00\x05\x00\x05\x01\x00\x00\x00\x00" ++ "\x00\x12\x00\x00" ++ "\x00\x17\x00\x00" ++ "\xff\x01\x00\x01\x00"));
     const groups = "\x00\x0a\x00\x0c\x00\x0a\x11\xec\x00\x1d\x00\x17\x00\x18\x00\x19";
     try testing.expect(std.mem.indexOf(u8, go, groups) != null);
     // key_share: X25519MLKEM768 (1184 + 32) then X25519 (32).

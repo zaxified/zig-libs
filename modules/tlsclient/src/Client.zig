@@ -75,6 +75,10 @@ alpn_protocol: ?[]const u8 = null,
 negotiated_group: ?tls.NamedGroup = null,
 /// Whether the server sent a HelloRetryRequest.
 hello_retry_request: bool = false,
+/// The negotiated cipher suite.
+cipher_suite: tls.CipherSuite = @enumFromInt(0),
+/// The keying-material exporter's secret (`exportKeyingMaterial`).
+exporter: Exporter = .none,
 
 pub const ReadError = error{
     /// The alert description will be stored in `alert`.
@@ -198,9 +202,264 @@ pub const Options = struct {
     /// HelloRetryRequest, answered with a second ClientHello. Go's default is
     /// these two; std sent a share for every group (`std_groups`, 4 shares).
     key_share_groups: []const tls.NamedGroup = &default_key_share_groups,
+    /// Ask for a stapled OCSP response (status_request, RFC 6066 §8) and for
+    /// the certificate's SCTs (RFC 6962 §3.3.1), as Go does. Neither is
+    /// verified (Go verifies neither); with `connection_info` the bytes are
+    /// kept.
+    request_ocsp: bool = true,
+    request_scts: bool = true,
+    /// TLS 1.2: offer the extended master secret (RFC 7627), as Go does; it
+    /// is used when the server agrees, and the keying-material exporter needs
+    /// it in TLS 1.2.
+    extended_master_secret: bool = true,
+    /// TLS 1.2: signal secure renegotiation (RFC 5746, an empty
+    /// renegotiation_info), as Go does. This client never renegotiates.
+    renegotiation_info: bool = true,
+    /// Where the session view goes (Go `ConnectionState`): version, suite,
+    /// group, the peer's certificates, OCSP response and SCTs. The bytes are
+    /// copied into `ConnectionInfo.storage`. Null: not kept.
+    connection_info: ?*ConnectionInfo = null,
+    /// Called once the server is authenticated (its chain checked per `ca`,
+    /// its signature verified), before the client Finished -- Go
+    /// `VerifyConnection` (and `VerifyPeerCertificate`, the chain being in
+    /// the view). An error aborts with `error.TlsConnectionRejected`.
+    /// Requires `connection_info`.
+    verify_connection: ?VerifyConnection = null,
 
     pub const entropy_len = 240;
 };
+
+// zig-libs tlsclient: the session view and the verification hook.
+
+/// The session as Go's `ConnectionState` shows it, filled during `init` when
+/// passed as `Options.connection_info`. Byte fields are copies in `storage`,
+/// so they outlive the handshake's buffers; a `storage` too small for them is
+/// `error.ConnectionInfoTooSmall`. Real chains with OCSP and SCTs take a few
+/// KiB; 16 KiB is ample.
+pub const ConnectionInfo = struct {
+    storage: []u8,
+    used: usize = 0,
+    version: tls.ProtocolVersion = .tls_1_3,
+    cipher_suite: tls.CipherSuite = @enumFromInt(0),
+    negotiated_group: ?tls.NamedGroup = null,
+    alpn_protocol: ?[]const u8 = null,
+    hello_retry_request: bool = false,
+    did_resume: bool = false,
+    /// TLS 1.2: the server agreed to the extended master secret.
+    extended_master_secret: bool = false,
+    peer_certificates_buf: [verify.max_chain_len][]const u8 = undefined,
+    peer_certificates_len: usize = 0,
+    /// The stapled OCSP response (DER), or empty.
+    ocsp_response: []const u8 = "",
+    scts_buf: [max_scts][]const u8 = undefined,
+    scts_len: usize = 0,
+
+    pub const max_scts = 16;
+
+    pub fn init(storage: []u8) ConnectionInfo {
+        return .{ .storage = storage };
+    }
+
+    /// The server's certificates as sent, leaf first (DER).
+    pub fn peerCertificates(ci: *const ConnectionInfo) []const []const u8 {
+        return ci.peer_certificates_buf[0..ci.peer_certificates_len];
+    }
+
+    /// The SignedCertificateTimestamps, each one SCT as RFC 6962 encodes it.
+    pub fn signedCertificateTimestamps(ci: *const ConnectionInfo) []const []const u8 {
+        return ci.scts_buf[0..ci.scts_len];
+    }
+
+    fn keep(ci: *ConnectionInfo, bytes: []const u8) error{ConnectionInfoTooSmall}![]const u8 {
+        if (ci.storage.len - ci.used < bytes.len) return error.ConnectionInfoTooSmall;
+        const out = ci.storage[ci.used..][0..bytes.len];
+        @memcpy(out, bytes);
+        ci.used += bytes.len;
+        return out;
+    }
+
+    fn reset(ci: *ConnectionInfo) void {
+        ci.* = .{ .storage = ci.storage };
+    }
+};
+
+/// `Options.verify_connection`: `verify(context, info)`; an error refuses
+/// the server.
+pub const VerifyConnection = struct {
+    context: ?*anyopaque = null,
+    verify: *const fn (context: ?*anyopaque, info: *const ConnectionInfo) anyerror!void,
+};
+
+/// The keying-material exporter's state (RFC 8446 §7.5; RFC 5705 for TLS
+/// 1.2, available only with the extended master secret, as in Go).
+pub const Exporter = union(enum) {
+    none,
+    tls13: struct { hash: HashKind, secret: [64]u8 },
+    tls12: struct { hash: HashKind, master: [48]u8, randoms: [64]u8 },
+};
+pub const HashKind = enum { sha256, sha384, sha512 };
+
+fn hashKind(comptime digest_len: usize) HashKind {
+    return switch (digest_len) {
+        32 => .sha256,
+        48 => .sha384,
+        64 => .sha512,
+        else => @compileError("hash"),
+    };
+}
+
+fn HashOf(comptime k: HashKind) type {
+    return switch (k) {
+        .sha256 => crypto.hash.sha2.Sha256,
+        .sha384 => crypto.hash.sha2.Sha384,
+        .sha512 => crypto.hash.sha2.Sha512,
+    };
+}
+
+pub const ExportError = error{
+    /// TLS 1.2 without the extended master secret (Go refuses it too).
+    ExporterUnavailable,
+    /// A TLS 1.2 label the PRF itself uses (RFC 5705 §4).
+    ExporterLabelReserved,
+    /// Longer than the KDF can give, or a label/context over its field.
+    ExporterLengthInvalid,
+};
+
+/// Keying material exported from the session into `out` (Go
+/// `ConnectionState.ExportKeyingMaterial`). TLS 1.3: RFC 8446 §7.5, where
+/// no context and an empty one are the same. TLS 1.2: RFC 5705, only with
+/// the extended master secret.
+pub fn exportKeyingMaterial(c: *const Client, label: []const u8, context: ?[]const u8, out: []u8) ExportError!void {
+    switch (c.exporter) {
+        .none => return error.ExporterUnavailable,
+        .tls13 => |*e| switch (e.hash) {
+            inline else => |k| try tls13Export(HashOf(k), e.secret[0..HashOf(k).digest_length], label, context orelse "", out),
+        },
+        .tls12 => |*e| {
+            for ([_][]const u8{ "client finished", "server finished", "master secret", "key expansion", "extended master secret" }) |r|
+                if (mem.eql(u8, label, r)) return error.ExporterLabelReserved;
+            switch (e.hash) {
+                inline .sha256, .sha384 => |k| try tls12Export(HashOf(k), &e.master, &e.randoms, label, context, out),
+                .sha512 => unreachable, // no TLS 1.2 suite here uses SHA-512
+            }
+        },
+    }
+}
+
+/// HKDF-Expand-Label (RFC 8446 §7.1) with a run-time length.
+fn expandLabelRt(comptime H: type, prk: *const [H.digest_length]u8, label: []const u8, context: []const u8, out: []u8) ExportError!void {
+    const Hkdf = crypto.kdf.hkdf.Hkdf(crypto.auth.hmac.Hmac(H));
+    if (out.len > 255 * H.digest_length or label.len > 255 - 6 or context.len > 255) return error.ExporterLengthInvalid;
+    var info: [2 + 1 + 255 + 1 + 255]u8 = undefined;
+    var n: usize = 0;
+    mem.writeInt(u16, info[0..2], @intCast(out.len), .big);
+    info[2] = @intCast(6 + label.len);
+    n = 3;
+    @memcpy(info[n..][0..6], "tls13 ");
+    n += 6;
+    @memcpy(info[n..][0..label.len], label);
+    n += label.len;
+    info[n] = @intCast(context.len);
+    n += 1;
+    @memcpy(info[n..][0..context.len], context);
+    n += context.len;
+    Hkdf.expand(out, info[0..n], prk.*);
+}
+
+fn tls13Export(comptime H: type, secret: *const [H.digest_length]u8, label: []const u8, context: []const u8, out: []u8) ExportError!void {
+    var empty: [H.digest_length]u8 = undefined;
+    H.hash("", &empty, .{});
+    var derived: [H.digest_length]u8 = undefined;
+    defer crypto.secureZero(u8, &derived);
+    try expandLabelRt(H, secret, label, &empty, &derived);
+    var ctx_hash: [H.digest_length]u8 = undefined;
+    H.hash(context, &ctx_hash, .{});
+    try expandLabelRt(H, &derived, "exporter", &ctx_hash, out);
+}
+
+/// RFC 5705 §4: PRF(master, label, client_random ‖ server_random [‖ u16
+/// context length ‖ context]) with the suite's P_hash (RFC 5246 §5).
+fn tls12Export(comptime H: type, master: *const [48]u8, randoms: *const [64]u8, label: []const u8, context: ?[]const u8, out: []u8) ExportError!void {
+    const Hmac = crypto.auth.hmac.Hmac(H);
+    if (context) |ctx| if (ctx.len > 0xffff) return error.ExporterLengthInvalid;
+    var ctx_len: [2]u8 = undefined;
+    if (context) |ctx| mem.writeInt(u16, &ctx_len, @intCast(ctx.len), .big);
+    const seed = [_][]const u8{ label, randoms, if (context != null) &ctx_len else "", context orelse "" };
+    var a: [Hmac.mac_length]u8 = undefined; // A(1) = HMAC(secret, seed)
+    defer crypto.secureZero(u8, &a);
+    {
+        var h = Hmac.init(master);
+        for (seed) |part| h.update(part);
+        h.final(&a);
+    }
+    var off: usize = 0;
+    while (off < out.len) {
+        var block: [Hmac.mac_length]u8 = undefined;
+        defer crypto.secureZero(u8, &block);
+        var h = Hmac.init(master);
+        h.update(&a);
+        for (seed) |part| h.update(part);
+        h.final(&block);
+        const k = @min(block.len, out.len - off);
+        @memcpy(out[off..][0..k], block[0..k]);
+        off += k;
+        Hmac.create(&a, &a, master);
+    }
+}
+
+fn fillInfo(ci: *ConnectionInfo, version: tls.ProtocolVersion, suite: tls.CipherSuite, group: ?tls.NamedGroup, alpn: ?[]const u8, hrr: bool, ems: bool) void {
+    ci.version = version;
+    ci.cipher_suite = suite;
+    ci.negotiated_group = group;
+    ci.alpn_protocol = alpn;
+    ci.hello_retry_request = hrr;
+    ci.extended_master_secret = ems;
+}
+
+/// CertificateStatus (RFC 6066 §8): status_type ocsp(1), then the response
+/// as opaque<1..2^24-1>, nothing after.
+fn parseCertificateStatus(body: []const u8) error{TlsDecodeError}![]const u8 {
+    if (body.len < 4 or body[0] != 1) return error.TlsDecodeError;
+    const len = mem.readInt(u24, body[1..4], .big);
+    if (len == 0 or len != body.len - 4) return error.TlsDecodeError;
+    return body[4..];
+}
+
+/// SignedCertificateTimestampList (RFC 6962 §3.3): u16 total, then SCTs as
+/// opaque<1..2^16-1>; each kept in `ci`.
+fn keepScts(ci: *ConnectionInfo, list: []const u8) error{ TlsDecodeError, ConnectionInfoTooSmall }!void {
+    if (list.len < 2 or mem.readInt(u16, list[0..2], .big) != list.len - 2) return error.TlsDecodeError;
+    var i: usize = 2;
+    while (i < list.len) {
+        if (list.len - i < 2) return error.TlsDecodeError;
+        const n = mem.readInt(u16, list[i..][0..2], .big);
+        i += 2;
+        if (n == 0 or list.len - i < n) return error.TlsDecodeError;
+        if (ci.scts_len == ConnectionInfo.max_scts) return error.ConnectionInfoTooSmall;
+        ci.scts_buf[ci.scts_len] = try ci.keep(list[i..][0..n]);
+        ci.scts_len += 1;
+        i += n;
+    }
+}
+
+/// The leaf's CertificateEntry extensions in TLS 1.3: status_request holds a
+/// CertificateStatus, signed_certificate_timestamp an SCT list.
+fn leafEntryExtensions(ci: *ConnectionInfo, exts: tls.Decoder, want_ocsp: bool, want_scts: bool) !void {
+    var d = exts;
+    while (!d.eof()) {
+        try d.ensure(4);
+        const et = d.decode(tls.ExtensionType);
+        const n = d.decode(u16);
+        const ed = try d.sub(n);
+        switch (et) {
+            .status_request => if (want_ocsp) {
+                ci.ocsp_response = try ci.keep(try parseCertificateStatus(ed.rest()));
+            },
+            .signed_certificate_timestamp => if (want_scts) try keepScts(ci, ed.rest()),
+            else => {},
+        }
+    }
+}
 
 // zig-libs tlsclient: ALPN and client-certificate types.
 
@@ -292,6 +551,13 @@ pub const InitError = error{
     /// `groups` empty, a group not in `supported_groups` or listed twice, or
     /// a `key_share_groups` entry not in `groups`.
     GroupsInvalid,
+    /// `connection_info.storage` cannot hold the peer's certificates, OCSP
+    /// response and SCTs.
+    ConnectionInfoTooSmall,
+    /// `verify_connection` without `connection_info`.
+    ConnectionInfoRequired,
+    /// `verify_connection` refused the server.
+    TlsConnectionRejected,
 } || std.Io.Writer.Error || std.Io.Reader.ShortError || std.Io.Cancelable;
 
 /// Initiates a TLS handshake and establishes a TLSv1.2 or TLSv1.3 session.
@@ -341,6 +607,10 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
     // from the options; std's comptime shape is `std_groups` with every addition off.
     try checkVersions(options.min_version, options.max_version);
     try checkGroups(options.groups, options.key_share_groups);
+    if (options.verify_connection != null and options.connection_info == null) return error.ConnectionInfoRequired;
+    const info: ?*ConnectionInfo = options.connection_info;
+    if (info) |ci| ci.reset();
+    const offer_12 = options.min_version == .tls_1_2;
     var key_share = KeyShare.init(options.entropy[64..240]);
     var versions_buf: [2]tls.ProtocolVersion = undefined;
     const versions = offeredVersions(&versions_buf, options.min_version, options.max_version);
@@ -355,6 +625,10 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
         .groups = options.groups,
         .shares = &.{},
         .alpn_ext = alpn_ext,
+        .status_request = options.request_ocsp,
+        .signed_certificate_timestamp = options.request_scts,
+        .extended_master_secret = options.extended_master_secret and offer_12,
+        .renegotiation_info = options.renegotiation_info and offer_12,
     };
     var shares_buf: [supported_groups.len]hello.Share = undefined;
     // In TLS 1.2 only, no key_share is sent (RFC 8446 §4.2.8 is TLS 1.3's).
@@ -425,6 +699,12 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
     // zig-libs tlsclient: session view.
     var negotiated_group: ?tls.NamedGroup = null;
     var negotiated_suite: tls.CipherSuite = undefined;
+    // zig-libs tlsclient: TLS 1.2 ServerHello answers (RFC 6066, 7627).
+    var ocsp_promised = false;
+    var ems_negotiated = false;
+    var tls12_master: [48]u8 = undefined;
+    defer crypto.secureZero(u8, &tls12_master);
+    var exporter: Exporter = .none;
     const now_sec = options.realtime_now.toSeconds();
 
     var cleartext_fragment_start: usize = 0;
@@ -613,7 +893,26 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
                                         alpn_seen = true;
                                         alpn_selected = try alpnSelected(options.alpn_protocols, extd.rest());
                                     },
-                                    else => {},
+                                    // zig-libs tlsclient: TLS 1.2 answers to what we asked for
+                                    // (a TLS 1.3 server sends these elsewhere; ignored here).
+                                    .status_request => if (!is_hrr and options.request_ocsp) {
+                                        if (ext_size != 0) return error.TlsDecodeError;
+                                        ocsp_promised = true;
+                                    },
+                                    .signed_certificate_timestamp => if (!is_hrr and options.request_scts) {
+                                        if (info) |ci| try keepScts(ci, extd.rest());
+                                    },
+                                    else => switch (@intFromEnum(et)) {
+                                        hello.ext_extended_master_secret => if (!is_hrr and options.extended_master_secret) {
+                                            if (ext_size != 0) return error.TlsDecodeError;
+                                            ems_negotiated = true;
+                                        },
+                                        // RFC 5746 §3.4: on an initial handshake it must be empty.
+                                        hello.ext_renegotiation_info => if (!is_hrr and options.renegotiation_info) {
+                                            if (ext_size != 1 or extd.rest()[0] != 0) return error.TlsIllegalParameter;
+                                        },
+                                        else => {},
+                                    },
                                 }
                             }
                         }
@@ -703,6 +1002,10 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
                             }
                             negotiated_group = sh_group;
                             negotiated_suite = cipher_suite_tag;
+                            if (tls_version == .tls_1_3) {
+                                ocsp_promised = false;
+                                ems_negotiated = false;
+                            }
                         }
                         if (!is_hrr) switch (tls_version) {
                             .tls_1_3 => {
@@ -818,7 +1121,9 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
                                 try certs_decoder.ensure(2);
                                 const total_ext_size = certs_decoder.decode(u16);
                                 const all_extd = try certs_decoder.sub(total_ext_size);
-                                _ = all_extd;
+                                // zig-libs tlsclient: the leaf's OCSP response and
+                                // SCTs ride in its entry (RFC 8446 §4.4.2.1).
+                                if (cert_index == 0) if (info) |ci| try leafEntryExtensions(ci, all_extd, options.request_ocsp, options.request_scts);
                             }
 
                             // zig-libs tlsclient: every certificate is proven
@@ -850,6 +1155,11 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
                         // An empty list: nothing to trust (std left the state
                         // at .certificate and failed on the next message).
                         if (peer_chain_len == 0) return error.TlsCertificateNotVerified;
+                        // zig-libs tlsclient: the session view keeps the chain.
+                        if (info) |ci| for (peer_chain[0..peer_chain_len]) |der| {
+                            ci.peer_certificates_buf[ci.peer_certificates_len] = try ci.keep(der);
+                            ci.peer_certificates_len += 1;
+                        };
                         switch (options.ca) {
                             .no_verification => handshake_state = .trust_chain_established,
                             .self_signed => {
@@ -897,6 +1207,19 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
                         }
                         cert_request = try parseCertRequest(&hsd, auth.key.scheme());
                     },
+                    // zig-libs tlsclient: TLS 1.2 stapled OCSP (RFC 6066 §8),
+                    // only after the server promised it in ServerHello.
+                    @as(tls.HandshakeType, @enumFromInt(hello.hs_certificate_status)) => {
+                        if (tls_version != .tls_1_2 or !ocsp_promised) return error.TlsUnexpectedMessage;
+                        if (cipher_state != .cleartext) return error.TlsUnexpectedMessage;
+                        if (handshake_state != .trust_chain_established) return error.TlsUnexpectedMessage;
+                        switch (handshake_cipher) {
+                            inline else => |*p| p.transcript_hash.update(wrapped_handshake),
+                        }
+                        const ocsp = try parseCertificateStatus(hsd.rest());
+                        if (info) |ci| ci.ocsp_response = try ci.keep(ocsp);
+                        ocsp_promised = false; // once
+                    },
                     .server_key_exchange => {
                         if (tls_version != .tls_1_2) return error.TlsUnexpectedMessage;
                         if (cipher_state != .cleartext) return error.TlsUnexpectedMessage;
@@ -928,7 +1251,7 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
                             else => false,
                         };
                         const key_ok = if (ecdsa_suite)
-                            main_cert_pub_key.algo == .X9_62_id_ecPublicKey
+                            main_cert_pub_key.algo == .X9_62_id_ecPublicKey or main_cert_pub_key.algo == .curveEd25519
                         else
                             main_cert_pub_key.algo == .rsaEncryption or main_cert_pub_key.algo == .rsassa_pss;
                         if (!key_ok) return error.TlsBadSignatureScheme;
@@ -945,6 +1268,13 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
                         if (tls_version != .tls_1_2) return error.TlsUnexpectedMessage;
                         if (cipher_state != .cleartext) return error.TlsUnexpectedMessage;
                         if (handshake_state != .server_hello_done) return error.TlsUnexpectedMessage;
+                        // zig-libs tlsclient: the server is authenticated
+                        // (chain + ServerKeyExchange signature): the hook runs
+                        // before anything of ours that depends on it is sent.
+                        if (info) |ci| {
+                            fillInfo(ci, tls_version, negotiated_suite, negotiated_group, alpn_selected, hrr_seen, ems_negotiated);
+                            if (options.verify_connection) |vc| vc.verify(vc.context, ci) catch return error.TlsConnectionRejected;
+                        }
 
                         // zig-libs tlsclient: the group's key, made at ServerKeyExchange.
                         const group = tls12_negotiated_group orelse return error.TlsUnexpectedMessage;
@@ -967,11 +1297,28 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
                                 p.transcript_hash.update(wrapped_handshake);
                                 p.transcript_hash.update(client_key_exchange_prefix[tls.record_header_len..]);
                                 p.transcript_hash.update(public_key_bytes);
-                                const master_secret = hmacExpandLabel(P.Hmac, pre_master_secret, &.{
-                                    "master secret",
-                                    &client_hello_rand,
-                                    &server_hello_rand,
-                                }, 48);
+                                // zig-libs tlsclient: RFC 7627 §4 -- with the
+                                // extended master secret the seed is the session
+                                // hash through ClientKeyExchange.
+                                const master_secret = if (ems_negotiated)
+                                    hmacExpandLabel(P.Hmac, pre_master_secret, &.{
+                                        "extended master secret",
+                                        &p.transcript_hash.peek(),
+                                    }, 48)
+                                else
+                                    hmacExpandLabel(P.Hmac, pre_master_secret, &.{
+                                        "master secret",
+                                        &client_hello_rand,
+                                        &server_hello_rand,
+                                    }, 48);
+                                if (ems_negotiated) {
+                                    tls12_master = master_secret;
+                                    exporter = .{ .tls12 = .{
+                                        .hash = hashKind(P.Hmac.mac_length),
+                                        .master = master_secret,
+                                        .randoms = client_hello_rand ++ server_hello_rand,
+                                    } };
+                                }
                                 if (options.ssl_key_log) |key_log| logSecrets(key_log.writer, .{
                                     .client_random = &client_hello_rand,
                                 }, .{
@@ -1052,6 +1399,11 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
                             },
                         }
                         handshake_state = .finished;
+                        // zig-libs tlsclient: authenticated -- the hook.
+                        if (info) |ci| {
+                            fillInfo(ci, tls_version, negotiated_suite, negotiated_group, alpn_selected, hrr_seen, false);
+                            if (options.verify_connection) |vc| vc.verify(vc.context, ci) catch return error.TlsConnectionRejected;
+                        }
                     },
                     .finished => {
                         if (cipher_state == .cleartext) return error.TlsUnexpectedMessage;
@@ -1117,6 +1469,12 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
                                         try output.flush();
                                     }
 
+                                    // zig-libs tlsclient: RFC 8446 §7.5 exporter_master_secret.
+                                    {
+                                        const exp = hkdfExpandLabel(P.Hkdf, pv.master_secret, "exp master", &handshake_hash, P.Hash.digest_length);
+                                        exporter = .{ .tls13 = .{ .hash = hashKind(P.Hash.digest_length), .secret = undefined } };
+                                        @memcpy(exporter.tls13.secret[0..exp.len], &exp);
+                                    }
                                     const client_secret = hkdfExpandLabel(P.Hkdf, pv.master_secret, "c ap traffic", &handshake_hash, P.Hash.digest_length);
                                     const server_secret = hkdfExpandLabel(P.Hkdf, pv.master_secret, "s ap traffic", &handshake_hash, P.Hash.digest_length);
                                     if (options.ssl_key_log) |key_log| logSecrets(key_log.writer, .{
@@ -1146,6 +1504,7 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
                                 else => unreachable,
                             },
                         };
+                        if (info) |ci| fillInfo(ci, tls_version, negotiated_suite, negotiated_group, alpn_selected, hrr_seen, ems_negotiated);
                         if (options.ssl_key_log) |ssl_key_log| ssl_key_log.* = .{
                             .client_key_seq = key_seq,
                             .server_key_seq = key_seq,
@@ -1189,6 +1548,8 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
                             .alpn_protocol = alpn_selected, // zig-libs tlsclient: ALPN
                             .negotiated_group = negotiated_group,
                             .hello_retry_request = hrr_seen,
+                            .cipher_suite = negotiated_suite,
+                            .exporter = exporter,
                         };
                     },
                     else => return error.TlsUnexpectedMessage,
@@ -2190,6 +2551,10 @@ const CertificatePublicKey = struct {
             .rsa_pss_pss_sha384,
             .rsa_pss_pss_sha512,
             => .rsassa_pss,
+            // zig-libs tlsclient: std had the Ed25519 verifier below but never
+            // reached it -- this mapping lacked the scheme, so an Ed25519
+            // server certificate was TlsBadSignatureScheme.
+            .ed25519 => .curveEd25519,
             else => return error.TlsBadSignatureScheme,
         })) return error.TlsBadSignatureScheme;
 
@@ -2614,4 +2979,44 @@ test "sweep: the server-controlled ALPN and CertificateRequest parsers on damage
     // 8 209 refused; 1 394 requests parsed, 8 606 refused.
     try std.testing.expect(reach[0] > 200 and reach[1] > 6000);
     try std.testing.expect(reach[2] > 1000 and reach[3] > 6000);
+}
+
+test "leafEntryExtensions: TLS 1.3 CertificateEntry OCSP and SCTs are kept; malformed ones refused" {
+    var storage: [256]u8 = undefined;
+    var ci: ConnectionInfo = .init(&storage);
+    // status_request: ocsp(1), u24 5, the response; then an SCT list of one.
+    const exts = "\x00\x05\x00\x09\x01\x00\x00\x05\x30\x03\x0a\x01\x01" ++
+        "\x00\x12\x00\x07\x00\x05\x00\x03abc";
+    try leafEntryExtensions(&ci, .fromTheirSlice(@constCast(exts)), true, true);
+    try std.testing.expectEqualSlices(u8, "\x30\x03\x0a\x01\x01", ci.ocsp_response);
+    try std.testing.expectEqual(@as(usize, 1), ci.signedCertificateTimestamps().len);
+    try std.testing.expectEqualStrings("abc", ci.signedCertificateTimestamps()[0]);
+    // Not asked for: ignored.
+    var ci2: ConnectionInfo = .init(&storage);
+    try leafEntryExtensions(&ci2, .fromTheirSlice(@constCast(exts)), false, false);
+    try std.testing.expectEqual(@as(usize, 0), ci2.ocsp_response.len);
+    // A list length that lies, an empty SCT, a status type that is not ocsp.
+    try std.testing.expectError(error.TlsDecodeError, keepScts(&ci2, "\x00\x09\x00\x03abc"));
+    try std.testing.expectError(error.TlsDecodeError, keepScts(&ci2, "\x00\x02\x00\x00"));
+    try std.testing.expectError(error.TlsDecodeError, parseCertificateStatus("\x02\x00\x00\x01\x00"));
+    try std.testing.expectError(error.TlsDecodeError, parseCertificateStatus("\x01\x00\x00\x02\x00"));
+}
+
+test "exportKeyingMaterial: TLS 1.2 refuses reserved labels; no exporter before a handshake" {
+    var c: Client = undefined;
+    c.exporter = .none;
+    var out: [8]u8 = undefined;
+    try std.testing.expectError(error.ExporterUnavailable, c.exportKeyingMaterial("EXPERIMENTAL-x", null, &out));
+    c.exporter = .{ .tls12 = .{ .hash = .sha256, .master = @splat(1), .randoms = @splat(2) } };
+    try std.testing.expectError(error.ExporterLabelReserved, c.exportKeyingMaterial("master secret", null, &out));
+    try c.exportKeyingMaterial("EXPERIMENTAL-x", null, &out);
+    var with_ctx: [8]u8 = undefined;
+    try c.exportKeyingMaterial("EXPERIMENTAL-x", "", &with_ctx);
+    // RFC 5705: an empty context is not no context in TLS 1.2.
+    try std.testing.expect(!std.mem.eql(u8, &out, &with_ctx));
+    c.exporter = .{ .tls13 = .{ .hash = .sha256, .secret = @splat(3) } };
+    try c.exportKeyingMaterial("EXPERIMENTAL-x", null, &out);
+    try c.exportKeyingMaterial("EXPERIMENTAL-x", "", &with_ctx);
+    // RFC 8446 §7.5: in TLS 1.3 they are the same.
+    try std.testing.expectEqualSlices(u8, &out, &with_ctx);
 }
