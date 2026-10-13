@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-13** — **Feature (grade 2, parity with Pithikos/C-Thread-Pool):** `pause` / `resume` /
+  `isPaused` (workers finish the job they have, then park on the `notify` futex; `drain` and
+  `shutdownNow` override a pause; lost-wakeup argument in SPEC §4, test seam `pause_seam`),
+  `workingCount`, `queuedCount`, and an opt-in bounded queue — `Options.max_queued` (default 0 =
+  unbounded, behaviour unchanged) with `SubmitError.QueueFull`, admission by a CAS counter reserved
+  before the box allocation and released on dequeue and on every rollback (SPEC §5). **Breaking
+  for exhaustive `switch`es over `SubmitError`** (a new member): `qap/src/offload.zig` has one.
+  Adds `tools/bench.zig` + `tools/c_bench/main.c` (comparative benchmark against the pinned
+  thpool; `zig build bench-workerpool`). Rejected with reasons: result handle, panic isolation,
+  dynamic resizing (SPEC §6b/§7).
 - **2026-10-04** — **Tests:** two test-only seams (`snapshot_seam`, `wait_seam`; comptime-gated
   on `builtin.is_test`, nothing in a release build) and two deterministic TEETH tests that pin
   the worker's final pre-park queue re-check and `shutdownNow` waking a `wait` caller — the two

@@ -1,0 +1,5 @@
+Pithikos/C-Thread-Pool at commit 2b56942a7347280ea4d0ede238cefacef96db4bb (2025-05-18), MIT (LICENSE).
+Unmodified copy except an added first line `/* SPDX-License-Identifier: MIT */` (the
+collection's licence-header gate); the sums below are of the UPSTREAM files. The reference side of `zig build bench-workerpool` only; never linked into the module.
+sha256 thpool.c 74be2a6efcbc27f93c378d6feedad2b4c56b490d4cddc5dad01e3dfdb12dd255
+sha256 thpool.h f34afa340172aa24d6373d66a854adef14e35589b4ea14c2288204d491c9282b

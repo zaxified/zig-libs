@@ -31,11 +31,16 @@
 //! shutdown that raced between the empty-observation and the park bumps the
 //! generation and makes the park return immediately (see `Worker.run`).
 //!
-//! **Backpressure — unbounded, non-blocking.** The MS-queue grows on demand,
-//! so `submit` never blocks on a full queue; it fails only with a typed error
-//! on allocator exhaustion (`error.SubmitFailed`) or after shutdown
-//! (`error.Shutdown`). A bounded/blocking variant is future work (SPEC §5,
-//! mirroring `lockfree` SPEC §6's "bounded ring MPMC").
+//! **Backpressure — unbounded by default, never blocking.** The MS-queue grows
+//! on demand, so `submit` never blocks; it fails with a typed error on
+//! allocator exhaustion (`error.SubmitFailed`), after shutdown
+//! (`error.Shutdown`) and, only when `Options.max_queued` is set, with
+//! `error.QueueFull` once that many jobs are queued and not yet started
+//! (SPEC §5). A blocking submit is deferred: a caller retries or sheds.
+//!
+//! **Pause.** `pause` stops workers from starting new jobs (jobs already
+//! running finish); `resume` lets them go on. Submissions are still accepted
+//! while paused. `drain`/`shutdownNow` override a pause (SPEC §4).
 //!
 //! See `SPEC.md` for the drain semantics, the wakeup correctness argument, the
 //! backpressure policy, and the interaction with `lockfree`'s EBR reclamation.
@@ -141,6 +146,12 @@ pub const Options = struct {
     /// park as before: an idle pool costs `spin_ns` of CPU per worker after
     /// its last job, then nothing.
     spin_ns: u64 = 0,
+    /// Upper bound on jobs that are submitted and not yet started
+    /// (`queuedCount`). 0 (the default) = unbounded, as before. When set,
+    /// `submit`/`Submitter.submit` refuse with `error.QueueFull` instead of
+    /// queueing past it; no box is allocated and no accounting changes. The
+    /// bound is exact -- concurrent submitters can never overshoot it.
+    max_queued: usize = 0,
 };
 
 pub const InitError = error{
@@ -162,6 +173,10 @@ pub const SubmitError = error{
     /// Backing storage for the job could not be allocated (queue node or job
     /// box). The job was NOT enqueued and no accounting changed.
     SubmitFailed,
+    /// `Options.max_queued` jobs are already queued and not yet started. The
+    /// job was NOT enqueued and no accounting changed; retry later or shed.
+    /// Only returned when `max_queued > 0`.
+    QueueFull,
 };
 
 pub const RegisterSubmitterError = error{
@@ -238,6 +253,26 @@ pub const WorkerPool = struct {
     idle: std.atomic.Value(usize) = .init(0),
     /// `Options.spin_ns`.
     spin_ns: u64 = 0,
+    /// `Options.max_queued` (0 = unbounded).
+    max_queued: usize = 0,
+    /// BOUNDED pools only (`max_queued > 0`): jobs reserved or queued and not
+    /// yet taken by a worker. Incremented at admission by a CAS loop below
+    /// `max_queued` BEFORE the box is allocated, decremented when a worker
+    /// dequeues (or `shutdownNow` frees the job) and on every rollback path of
+    /// `enqueueJob`. An unbounded pool never touches it: its `queuedCount` is
+    /// derived (`submitted − started − dropped`), so the hot path pays one
+    /// counter (`started`) for both `queuedCount` and `workingCount`, not four
+    /// read-modify-writes on lines every worker shares.
+    queued: std.atomic.Value(usize) = .init(0),
+    /// Jobs a worker has taken off the queue (`workingCount` = `started −
+    /// completed`; `queuedCount` of an unbounded pool = `submitted − started −
+    /// dropped`).
+    started: std.atomic.Value(u64) = .init(0),
+    /// Queued jobs `shutdownNow` freed without running them.
+    dropped: std.atomic.Value(u64) = .init(0),
+    /// `pause` flag. Workers park on `notify` while it is set and the pool is
+    /// `running`; `resume` clears it and wakes them (SPEC §4).
+    paused: std.atomic.Value(bool) = .init(false),
 
     state: std.atomic.Value(State) = .init(.running),
 
@@ -293,6 +328,7 @@ pub const WorkerPool = struct {
             .allocator = allocator,
             .io = options.io,
             .spin_ns = options.spin_ns,
+            .max_queued = options.max_queued,
             .domain = undefined,
             .qnodes = undefined,
             .queue = undefined,
@@ -375,6 +411,29 @@ pub const WorkerPool = struct {
         self.wakeWaiters();
     }
 
+    /// Stop workers from starting new jobs. Idempotent. Jobs a worker is
+    /// running when this is called finish; queued jobs and jobs submitted
+    /// meanwhile stay queued (`submit` keeps accepting, up to `max_queued`)
+    /// until `resume`. A worker that had already taken its next job off the
+    /// queue at the instant of the call counts as running and finishes it.
+    /// `drain` and `shutdownNow` override a pause. `wait` on a paused pool
+    /// with queued jobs blocks until `resume` (as the reference's
+    /// `thpool_wait` would). Does not block and wakes nobody: a parked
+    /// worker notices the flag when it next wakes.
+    pub fn pause(self: *WorkerPool) void {
+        self.paused.store(true, .seq_cst);
+    }
+
+    /// Undo `pause` and wake every parked worker. Idempotent.
+    pub fn @"resume"(self: *WorkerPool) void {
+        if (self.paused.swap(false, .seq_cst)) self.wakeAll();
+    }
+
+    /// Whether `pause` is in effect.
+    pub fn isPaused(self: *const WorkerPool) bool {
+        return self.paused.load(.seq_cst);
+    }
+
     /// Block until every job accepted so far has run — nothing queued,
     /// nothing in flight — with the pool still running afterwards; it keeps
     /// accepting work (Pithikos C-Thread-Pool's `thpool_wait`, a `WaitGroup`
@@ -441,8 +500,9 @@ pub const WorkerPool = struct {
     /// producer participant is single-owner at the moment of enqueue. For
     /// high-fan-in lock-free submission, use `registerSubmitter`.
     ///
-    /// Non-blocking; the queue is unbounded. Errors: `Shutdown` (pool no longer
-    /// accepting) or `SubmitFailed` (allocator exhaustion).
+    /// Non-blocking; the queue is unbounded unless `Options.max_queued` is set.
+    /// Errors: `Shutdown` (pool no longer accepting), `SubmitFailed`
+    /// (allocator exhaustion) or `QueueFull` (only with `max_queued`).
     pub fn submit(self: *WorkerPool, job: Job) SubmitError!void {
         self.producer_lock.lock();
         defer self.producer_lock.unlock();
@@ -469,6 +529,27 @@ pub const WorkerPool = struct {
     }
     pub fn workerCount(self: *const WorkerPool) usize {
         return self.workers.len;
+    }
+    /// Workers currently running a job (a snapshot, `started − completed`;
+    /// no lock and no counter of its own). A worker is counted from the moment it takes the job
+    /// off the queue until the job returns, so it is 0 whenever `wait`
+    /// reports idle.
+    pub fn workingCount(self: *const WorkerPool) usize {
+        // `completed` first: a job's `started` increment precedes its
+        // `completed` one, so the later `started` load is never behind it.
+        const done = self.completed.load(.seq_cst);
+        const began = self.started.load(.seq_cst);
+        return @intCast(began -| done);
+    }
+    /// Jobs submitted and not yet started (a snapshot; includes a job whose
+    /// submit is in flight). With `Options.max_queued` set it never exceeds it.
+    pub fn queuedCount(self: *const WorkerPool) usize {
+        if (self.max_queued != 0) return self.queued.load(.seq_cst);
+        // `started` and `dropped` first: both only ever trail `submitted`.
+        const began = self.started.load(.seq_cst);
+        const gone = self.dropped.load(.seq_cst);
+        const in = self.submitted.load(.seq_cst);
+        return @intCast(in -| began -| gone);
     }
     /// `JobBox`es currently checked out of the box pool. Must be 0 once the
     /// workers have joined and the queue has been drained (`drain`) or flushed
@@ -505,13 +586,21 @@ pub const WorkerPool = struct {
     fn enqueueJob(self: *WorkerPool, p: *Participant, job: Job) SubmitError!void {
         if (self.state.load(.seq_cst) != .running) return error.Shutdown;
 
-        const box = self.acquireBox() catch return error.SubmitFailed;
+        // Admission first, before anything is allocated or counted. Released
+        // by the worker that dequeues the job, or right here on a rollback.
+        try self.reserveSlot();
+
+        const box = self.acquireBox() catch {
+            self.releaseSlot();
+            return error.SubmitFailed;
+        };
         box.* = .{ .func = job.func, .ctx = job.ctx };
 
         _ = self.submitted.fetchAdd(1, .monotonic);
         self.queue.enqueue(p, @intFromPtr(box)) catch {
             _ = self.submitted.fetchSub(1, .monotonic);
             self.releaseBox(box);
+            self.releaseSlot();
             return error.SubmitFailed;
         };
 
@@ -525,6 +614,32 @@ pub const WorkerPool = struct {
         // call on every single submit for no one to receive it).
         _ = self.notify.fetchAdd(1, .seq_cst);
         if (self.idle.load(.seq_cst) > 0) self.io.futexWake(u32, &self.notify.raw, 1);
+    }
+
+    /// Reserve one queued-job slot: a plain increment when unbounded, a CAS
+    /// loop that refuses at `max_queued` otherwise (so concurrent submitters
+    /// can never overshoot the bound).
+    fn reserveSlot(self: *WorkerPool) error{QueueFull}!void {
+        if (self.max_queued == 0) return;
+        var cur = self.queued.load(.seq_cst);
+        while (true) {
+            if (cur >= self.max_queued) return error.QueueFull;
+            cur = self.queued.cmpxchgWeak(cur, cur + 1, .seq_cst, .seq_cst) orelse return;
+        }
+    }
+
+    /// Give back a slot `reserveSlot` took (bounded pools only).
+    fn releaseSlot(self: *WorkerPool) void {
+        if (self.max_queued != 0) _ = self.queued.fetchSub(1, .seq_cst);
+    }
+
+    /// Worker-side dequeue: the job is counted as started before its slot is
+    /// released, so `queued + working` never dips below the true count.
+    fn takeJob(self: *WorkerPool, p: *Participant) ?u64 {
+        const value = self.queue.dequeue(p) orelse return null;
+        _ = self.started.fetchAdd(1, .seq_cst);
+        self.releaseSlot();
+        return value;
     }
 
     /// Check a box out of the pool, counting it. Every `boxes.acquire` in the
@@ -576,6 +691,8 @@ pub const WorkerPool = struct {
         while (self.queue.dequeue(self.shared_producer)) |value| {
             const box: *JobBox = @ptrFromInt(@as(usize, @intCast(value)));
             self.releaseBox(box);
+            _ = self.dropped.fetchAdd(1, .seq_cst);
+            self.releaseSlot();
         }
     }
 };
@@ -629,6 +746,13 @@ var snapshot_seam: std.atomic.Value(?*const fn () void) = .init(null);
 /// `wakeWaiters`. Same rules as `park_seam`.
 var wait_seam: std.atomic.Value(?*const fn () void) = .init(null);
 
+/// **Test-only seam inside the pause park window**: after a worker has
+/// snapshotted `notify` and re-confirmed `paused`, before it counts itself idle
+/// and parks. A `resume` run there bumps the generation the worker is about to
+/// park on, so only the snapshot-before-recheck order keeps the park from
+/// sleeping through it. Same rules as `park_seam`.
+var pause_seam: std.atomic.Value(?*const fn () void) = .init(null);
+
 /// The pool whose worker the current thread is, if any — how `wait` detects
 /// being called from one of its own jobs.
 threadlocal var current_pool: ?*const WorkerPool = null;
@@ -645,7 +769,26 @@ fn workerRun(w: *Worker) void {
         // any, already completed before this loop turn).
         if (st == .stopping_now) break;
 
-        if (self.queue.dequeue(p)) |value| {
+        // `pause`: while paused (and still running -- `draining` overrides it)
+        // no new job is started. Park on `notify` with the same discipline as
+        // the empty-queue park: snapshot the generation FIRST, then re-check
+        // both the state and the flag, so a `resume` / shutdown that lands in
+        // between bumped the generation and makes the wait return at once.
+        if (st == .running and self.paused.load(.seq_cst)) {
+            const gen = self.notify.load(.seq_cst);
+            if (self.state.load(.seq_cst) == .running and self.paused.load(.seq_cst)) {
+                // Test seam -- see `pause_seam`.
+                if (builtin.is_test) {
+                    if (pause_seam.load(.seq_cst)) |f| f();
+                }
+                _ = self.idle.fetchAdd(1, .seq_cst);
+                self.io.futexWaitUncancelable(u32, &self.notify.raw, gen);
+                _ = self.idle.fetchSub(1, .seq_cst);
+            }
+            continue;
+        }
+
+        if (self.takeJob(p)) |value| {
             self.runBox(value);
             continue;
         }
@@ -676,7 +819,7 @@ fn workerRun(w: *Worker) void {
         // then re-check the queue and state, so any submit/shutdown that raced
         // in between bumped the generation and makes the wait return at once.
         const gen = self.notify.load(.seq_cst);
-        if (self.queue.dequeue(p)) |value| {
+        if (self.takeJob(p)) |value| {
             self.runBox(value);
             continue;
         }
@@ -1916,4 +2059,414 @@ test "wait: shutdownNow releases a waiter with false instead of hanging on dropp
     try testing.expectEqual(@as(u32, 2), result.load(.seq_cst)); // false: shut down
     try testing.expect(pool.completedCount() < pool.submittedCount()); // jobs were dropped
     try testing.expect(!pool.wait()); // and a later wait says so at once
+}
+
+// ── pause / resume ───────────────────────────────────────────────────────────
+
+/// Settle time for "nothing may happen now" assertions.
+const settle_ms = 50;
+
+test "pause: submitted jobs stay queued, nothing starts; resume + wait runs them all" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const pool = try WorkerPool.init(testing.allocator, .{ .io = io, .n_workers = 3 });
+    defer pool.deinit();
+    var wd = Watchdog{ .io = io, .timeout_ms = 15_000 };
+    try wd.start();
+    defer wd.finish();
+
+    try testing.expect(!pool.isPaused());
+    pool.pause();
+    pool.pause(); // idempotent
+    try testing.expect(pool.isPaused());
+    sleepMsIo(io, 20); // a worker caught between its check and its dequeue has settled
+
+    var c = Counter{};
+    const n: u64 = 200;
+    for (0..n) |_| try pool.submit(.{ .func = incr, .ctx = &c }); // still accepted
+    sleepMsIo(io, settle_ms);
+    try testing.expectEqual(@as(u64, 0), pool.completedCount());
+    try testing.expectEqual(@as(u64, 0), c.n.load(.seq_cst));
+    try testing.expectEqual(@as(usize, n), pool.queuedCount());
+    try testing.expectEqual(@as(usize, 0), pool.workingCount());
+
+    pool.@"resume"();
+    pool.@"resume"(); // idempotent
+    try testing.expect(!pool.isPaused());
+    try testing.expect(pool.wait());
+    try testing.expectEqual(n, c.n.load(.seq_cst));
+    try testing.expectEqual(@as(usize, 0), pool.queuedCount());
+    try testing.expectEqual(@as(i64, 0), pool.outstandingBoxes());
+}
+
+test "pause: a job already running when pause() is called finishes; the next one waits" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const pool = try WorkerPool.init(testing.allocator, .{ .io = io, .n_workers = 1 });
+    defer pool.deinit();
+    var wd = Watchdog{ .io = io, .timeout_ms = 15_000 };
+    try wd.start();
+    defer wd.finish();
+
+    var gate = Gate{ .io = io };
+    var c = Counter{};
+    try pool.submit(.{ .func = gatedJob, .ctx = &gate });
+    while (gate.entered.load(.seq_cst) == 0) io.futexWaitUncancelable(u32, &gate.entered.raw, 0);
+    try testing.expectEqual(@as(usize, 1), pool.workingCount());
+
+    pool.pause();
+    try pool.submit(.{ .func = incr, .ctx = &c }); // queued behind the paused pool
+    gate.open.store(1, .seq_cst);
+    io.futexWake(u32, &gate.open.raw, std.math.maxInt(u32));
+
+    // The running job completes ...
+    while (pool.completedCount() < 1) sleepMsIo(io, 1);
+    sleepMsIo(io, settle_ms);
+    // ... the worker does not start the next one.
+    try testing.expectEqual(@as(u64, 1), pool.completedCount());
+    try testing.expectEqual(@as(u64, 0), c.n.load(.seq_cst));
+    try testing.expectEqual(@as(usize, 1), pool.queuedCount());
+    try testing.expectEqual(@as(usize, 0), pool.workingCount());
+
+    pool.@"resume"();
+    try testing.expect(pool.wait());
+    try testing.expectEqual(@as(u64, 1), c.n.load(.seq_cst));
+}
+
+test "pause: drain overrides a pause and runs everything" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const pool = try WorkerPool.init(testing.allocator, .{ .io = io, .n_workers = 3 });
+    defer pool.deinit();
+    var wd = Watchdog{ .io = io, .timeout_ms = 15_000 };
+    try wd.start();
+    defer wd.finish();
+
+    pool.pause();
+    sleepMsIo(io, 20);
+    var c = Counter{};
+    for (0..100) |_| try pool.submit(.{ .func = incr, .ctx = &c });
+    sleepMsIo(io, settle_ms);
+    try testing.expectEqual(@as(u64, 0), c.n.load(.seq_cst));
+
+    pool.drain(); // must wake the parked workers and let them finish the queue
+    try testing.expectEqual(@as(u64, 100), c.n.load(.seq_cst));
+    try testing.expect(pool.drainedCleanly());
+    try testing.expectEqual(@as(i64, 0), pool.outstandingBoxes());
+}
+
+test "pause: shutdownNow overrides a pause and drops the queue (boxes returned)" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const pool = try WorkerPool.init(testing.allocator, .{ .io = io, .n_workers = 2 });
+    defer pool.deinit();
+    var wd = Watchdog{ .io = io, .timeout_ms = 15_000 };
+    try wd.start();
+    defer wd.finish();
+
+    pool.pause();
+    sleepMsIo(io, 20);
+    var c = Counter{};
+    for (0..50) |_| try pool.submit(.{ .func = incr, .ctx = &c });
+    sleepMsIo(io, settle_ms);
+
+    pool.shutdownNow();
+    try testing.expectEqual(@as(u64, 0), c.n.load(.seq_cst)); // never started
+    try testing.expectEqual(@as(i64, 0), pool.outstandingBoxes());
+    try testing.expectEqual(@as(usize, 0), pool.queuedCount()); // slots freed with the boxes
+}
+
+test "pause: a pause racing resume and submit never loses a wakeup (2000 rounds)" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const pool = try WorkerPool.init(testing.allocator, .{ .io = io, .n_workers = 3 });
+    defer pool.deinit();
+    var wd = Watchdog{ .io = io, .timeout_ms = 30_000 };
+    try wd.start();
+    defer wd.finish();
+
+    var c = Counter{};
+    // Sequential: each round pauses, submits behind the pause, resumes and
+    // waits. A missed resume wake parks the waiter on a job nobody starts.
+    for (0..2000) |i| {
+        pool.pause();
+        try pool.submit(.{ .func = incr, .ctx = &c });
+        pool.@"resume"();
+        try testing.expect(pool.wait());
+        try testing.expectEqual(@as(u64, i + 1), c.n.load(.seq_cst));
+    }
+
+    // Concurrent: a thread flips the flag while this one keeps submitting.
+    const Toggler = struct {
+        pool: *WorkerPool,
+        fn run(self: @This()) void {
+            for (0..2000) |_| {
+                self.pool.pause();
+                std.atomic.spinLoopHint();
+                self.pool.@"resume"();
+            }
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Toggler.run, .{Toggler{ .pool = pool }});
+    for (0..2000) |_| try pool.submit(.{ .func = incr, .ctx = &c });
+    t.join();
+    pool.@"resume"(); // the toggler ends on resume; make it explicit
+    try testing.expect(pool.wait());
+    try testing.expectEqual(@as(u64, 4000), c.n.load(.seq_cst));
+}
+
+/// `pause_seam` body: the worker is parked-to-be inside the pause window;
+/// resume the pool right there, from the worker's own thread.
+fn resumeInsidePauseWindow() void {
+    const ctx = seam_ctx.load(.seq_cst) orelse return;
+    if (ctx.used.cmpxchgStrong(0, 1, .seq_cst, .seq_cst) != null) return;
+    ctx.pool.?.@"resume"();
+}
+
+test "TEETH: a resume inside the pause window is not slept through (snapshot precedes the re-check)" {
+    // With the generation snapshotted AFTER the flag re-check, the bump made
+    // by `resume` here would land before the snapshot: the worker would park on
+    // the new generation with the flag already clear and the job queued, and
+    // nothing would ever wake it -- the watchdog fires.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var wd = Watchdog{ .io = io, .timeout_ms = 15_000 };
+    try wd.start();
+    defer wd.finish();
+
+    var ctx = SeamCtx{ .io = io };
+    ctx.used.store(1, .seq_cst); // held off until the pool pointer is set
+    seam_ctx.store(&ctx, .seq_cst);
+    defer seam_ctx.store(null, .seq_cst);
+    pause_seam.store(resumeInsidePauseWindow, .seq_cst);
+    defer pause_seam.store(null, .seq_cst);
+
+    const pool = try WorkerPool.init(testing.allocator, .{ .io = io, .n_workers = 1 });
+    defer pool.deinit();
+    ctx.pool = pool;
+    sleepMsIo(io, 20); // the worker is parked on the empty queue
+    pool.pause();
+    var c = Counter{};
+    try pool.submit(.{ .func = incr, .ctx = &c }); // wakes it; it finds the pause
+    sleepMsIo(io, settle_ms);
+    try testing.expectEqual(@as(u64, 0), c.n.load(.seq_cst));
+    // Arm: the next trip through the pause window resumes the pool. Kick the
+    // worker (spurious wake) so that trip happens.
+    ctx.used.store(0, .seq_cst);
+    pool.wakeAll();
+
+    while (c.n.load(.seq_cst) == 0) sleepMsIo(io, 1);
+    try testing.expectEqual(@as(u32, 1), ctx.used.load(.seq_cst));
+    try testing.expect(!pool.isPaused());
+}
+
+// ── workingCount ─────────────────────────────────────────────────────────────
+
+test "workingCount: N blocking jobs on N workers = N, back to 0 after" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const n = 3;
+    const pool = try WorkerPool.init(testing.allocator, .{ .io = io, .n_workers = n });
+    defer pool.deinit();
+    var wd = Watchdog{ .io = io, .timeout_ms = 15_000 };
+    try wd.start();
+    defer wd.finish();
+
+    try testing.expectEqual(@as(usize, 0), pool.workingCount());
+    var gates: [n]Gate = undefined;
+    for (&gates) |*g| {
+        g.* = .{ .io = io };
+        try pool.submit(.{ .func = gatedJob, .ctx = g });
+    }
+    for (&gates) |*g| while (g.entered.load(.seq_cst) == 0) sleepMsIo(io, 1);
+    try testing.expectEqual(@as(usize, n), pool.workingCount());
+    try testing.expectEqual(@as(usize, 0), pool.queuedCount());
+
+    // A fourth job has no free worker: queued, not working.
+    var c = Counter{};
+    try pool.submit(.{ .func = incr, .ctx = &c });
+    try testing.expectEqual(@as(usize, 1), pool.queuedCount());
+    try testing.expectEqual(@as(usize, n), pool.workingCount());
+
+    for (&gates) |*g| {
+        g.open.store(1, .seq_cst);
+        io.futexWake(u32, &g.open.raw, std.math.maxInt(u32));
+    }
+    try testing.expect(pool.wait());
+    try testing.expectEqual(@as(usize, 0), pool.workingCount());
+    try testing.expectEqual(@as(usize, 0), pool.queuedCount());
+}
+
+// ── max_queued ───────────────────────────────────────────────────────────────
+
+test "max_queued: 4 accepted on a paused pool, the 5th is QueueFull and changes nothing" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const pool = try WorkerPool.init(testing.allocator, .{ .io = io, .n_workers = 2, .max_queued = 4, .max_submitters = 1 });
+    defer pool.deinit();
+    var wd = Watchdog{ .io = io, .timeout_ms = 15_000 };
+    try wd.start();
+    defer wd.finish();
+
+    pool.pause();
+    sleepMsIo(io, 20);
+    var c = Counter{};
+    for (0..4) |_| try pool.submit(.{ .func = incr, .ctx = &c });
+    try testing.expectEqual(@as(usize, 4), pool.queuedCount());
+
+    const sub_before = pool.submittedCount();
+    const boxes_before = pool.outstandingBoxes();
+    try testing.expectError(error.QueueFull, pool.submit(.{ .func = incr, .ctx = &c }));
+    var s = try pool.registerSubmitter();
+    defer s.deinit();
+    try testing.expectError(error.QueueFull, s.submit(.{ .func = incr, .ctx = &c }));
+    try testing.expectEqual(sub_before, pool.submittedCount()); // accounting untouched
+    try testing.expectEqual(boxes_before, pool.outstandingBoxes()); // no box allocated
+    try testing.expectEqual(@as(usize, 4), pool.queuedCount());
+
+    pool.@"resume"();
+    try testing.expect(pool.wait());
+    try testing.expectEqual(@as(u64, 4), c.n.load(.seq_cst));
+    try testing.expectEqual(@as(usize, 0), pool.queuedCount()); // released on dequeue
+    // Room again: the slots really came back.
+    for (0..4) |_| try pool.submit(.{ .func = incr, .ctx = &c });
+    try testing.expect(pool.wait());
+    try testing.expectEqual(@as(u64, 8), c.n.load(.seq_cst));
+}
+
+test "max_queued = 0 is unbounded: a thousand queued jobs behind a pause are all accepted" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const pool = try WorkerPool.init(testing.allocator, .{ .io = io, .n_workers = 2 });
+    defer pool.deinit();
+    var wd = Watchdog{ .io = io, .timeout_ms = 15_000 };
+    try wd.start();
+    defer wd.finish();
+
+    pool.pause();
+    sleepMsIo(io, 20);
+    var c = Counter{};
+    for (0..1000) |_| try pool.submit(.{ .func = incr, .ctx = &c });
+    try testing.expectEqual(@as(usize, 1000), pool.queuedCount());
+    pool.@"resume"();
+    try testing.expect(pool.wait());
+    try testing.expectEqual(@as(u64, 1000), c.n.load(.seq_cst));
+}
+
+test "max_queued: the slot is released on both SubmitFailed rollbacks" {
+    // Each rollback on a FRESH pool: after one job has run, the queue's node
+    // pool holds a recycled node and `enqueue` no longer allocates, so a
+    // failing `qnodes` allocator would never be asked (the F3 tests above
+    // start fresh for the same reason).
+    try rollbackReleasesSlot(.boxes);
+    try rollbackReleasesSlot(.qnodes);
+}
+
+fn rollbackReleasesSlot(comptime which: enum { boxes, qnodes }) !void {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    // A bound of ONE: a slot leaked by the rollback makes the next submit
+    // QueueFull.
+    const pool = try WorkerPool.init(testing.allocator, .{ .io = io, .n_workers = 1, .max_queued = 1 });
+    defer pool.deinit();
+    var wd = Watchdog{ .io = io, .timeout_ms = 15_000 };
+    try wd.start();
+    defer wd.finish();
+
+    var c = Counter{};
+    {
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+        const target = switch (which) {
+            .boxes => &pool.boxes.allocator,
+            .qnodes => &pool.qnodes.allocator,
+        };
+        target.* = failing.allocator();
+        defer target.* = testing.allocator;
+        try testing.expectError(error.SubmitFailed, pool.submit(.{ .func = incr, .ctx = &c }));
+        try testing.expectEqual(@as(usize, 0), pool.queuedCount());
+        try testing.expectEqual(@as(i64, 0), pool.outstandingBoxes());
+    }
+    try pool.submit(.{ .func = incr, .ctx = &c });
+    try testing.expect(pool.wait());
+    try testing.expectEqual(@as(u64, 1), c.n.load(.seq_cst));
+}
+
+const Hammer = struct {
+    pool: *WorkerPool,
+    max: usize,
+    ran: std.atomic.Value(u64) = .init(0),
+    over_in_job: std.atomic.Value(u64) = .init(0),
+    over_after_submit: std.atomic.Value(u64) = .init(0),
+    refused: std.atomic.Value(u64) = .init(0),
+};
+fn hammerJob(ctx: *anyopaque) void {
+    const h: *Hammer = @ptrCast(@alignCast(ctx));
+    if (h.pool.queuedCount() > h.max) _ = h.over_in_job.fetchAdd(1, .monotonic);
+    var i: u32 = 0;
+    while (i < 200) : (i += 1) std.atomic.spinLoopHint();
+    _ = h.ran.fetchAdd(1, .monotonic);
+}
+
+test "max_queued: 8 producers hammering a bound of 3 never overshoot it; every accepted job runs once" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const n_producers = 8;
+    const per_producer: u64 = 3_000;
+    const pool = try WorkerPool.init(testing.allocator, .{ .io = io, .n_workers = 2, .max_queued = 3, .max_submitters = n_producers });
+    defer pool.deinit();
+    var wd = Watchdog{ .io = io, .timeout_ms = 60_000 };
+    try wd.start();
+    defer wd.finish();
+
+    var h = Hammer{ .pool = pool, .max = 3 };
+    const Producer = struct {
+        h: *Hammer,
+        accepted: u64 = 0,
+        fn run(self: *@This()) void {
+            var sub = self.h.pool.registerSubmitter() catch @panic("registerSubmitter");
+            defer sub.deinit();
+            while (self.accepted < per_producer) {
+                if (sub.submit(.{ .func = hammerJob, .ctx = self.h })) |_| {
+                    self.accepted += 1;
+                    if (self.h.pool.queuedCount() > self.h.max) _ = self.h.over_after_submit.fetchAdd(1, .monotonic);
+                } else |err| switch (err) {
+                    error.QueueFull => {
+                        _ = self.h.refused.fetchAdd(1, .monotonic);
+                        std.Thread.yield() catch {};
+                    },
+                    else => @panic("submit"),
+                }
+            }
+        }
+    };
+    var producers: [n_producers]Producer = undefined;
+    var threads: [n_producers]std.Thread = undefined;
+    for (&producers, &threads) |*pr, *t| {
+        pr.* = .{ .h = &h };
+        t.* = try std.Thread.spawn(.{}, Producer.run, .{pr});
+    }
+    for (&threads) |*t| t.join();
+    try testing.expect(pool.wait());
+
+    var accepted: u64 = 0;
+    for (producers) |pr| accepted += pr.accepted;
+    try testing.expectEqual(@as(u64, n_producers * per_producer), accepted);
+    try testing.expectEqual(accepted, h.ran.load(.seq_cst)); // exactly once each
+    try testing.expectEqual(accepted, pool.completedCount());
+    try testing.expectEqual(@as(u64, 0), h.over_in_job.load(.seq_cst));
+    try testing.expectEqual(@as(u64, 0), h.over_after_submit.load(.seq_cst));
+    try testing.expect(h.refused.load(.seq_cst) > 0); // the bound was actually hit
+    try testing.expectEqual(@as(usize, 0), pool.queuedCount());
+    try testing.expectEqual(@as(i64, 0), pool.outstandingBoxes());
 }

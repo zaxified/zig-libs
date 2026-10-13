@@ -405,7 +405,7 @@ way to recognise it.
 |---|:-:|---|---|---|
 | [`entropy`](modules/entropy/README.md) *(crypto)* | 2 (S,E,A,P) | Fail-closed entropy source — `fill` draws from the kernel CRNG (vDSO `getrandom` under std's Threaded Io on Linux, else `std.Io.randomSecure`) or aborts the process; no generator, no silent degrade. **Panics on failure.** | any | — |
 | [`netaddr`](modules/netaddr/README.md) *(net)* | 2 (S,A,P) | IP parse/format (RFC 5952) + RFC 6724 source/dest selection + CIDR/Prefix ops + Go netip/netipx parity (zones, AddrPort, ordering, IpRange, IpSet) | any | — |
-| [`p256`](modules/p256/README.md) *(crypto)* | 3 (S,P) | asm-accelerated NIST P-256 — Solinas field, constant-time comb sign, vartime wNAF verify; bit-exact vs `std.crypto.ecc.P256` and RFC 6979. | amd64 asm + portable fallback | — |
+| [`p256`](modules/p256/README.md) *(crypto)* | 3 (P) | asm-accelerated NIST P-256 — Solinas field, constant-time comb sign, vartime wNAF verify; bit-exact vs `std.crypto.ecc.P256` and RFC 6979. | amd64 asm + portable fallback | — |
 | [`protobuf`](modules/protobuf/README.md) *(format)* | 3 (S,E,P) | Protocol Buffers wire format (proto3) codec — schema derived at comptime from Zig structs (oneof, map, well-known types incl. Any/Struct), no `.proto` compiler; untrusted-input hardened. | any | — |
 | [`regex`](modules/regex/README.md) *(format)* | 2 (S,A,P) | RE2-syntax regular expressions at parity with Go regexp — linear time, comptime compile, alloc-free match | any | — |
 | [`rsa`](modules/rsa/README.md) *(crypto)* | 3 (S,P) | Pure-Zig RSA (PKCS#1 v2.2, RFC 8017) — keygen, PKCS1-v1.5/PSS sign+verify, OAEP/PKCS1 encrypt+decrypt, DER/PEM/OpenSSH key parsing. | any | montint |
@@ -487,7 +487,7 @@ way to recognise it.
 | [`traceroute`](modules/traceroute/README.md) | 3 (S,P) | ICMP-echo path discovery — TTL-stepped probes, per-hop address + RTT stats, load-balanced-path aware | **linux** | icmp, netaddr, latency-stats |
 | [`whois`](modules/whois/README.md) | 3 (S,E,P) | RFC 3912 whois client — query format + referral chasing (IANA→registrar) + field extraction, transport-agnostic seam | any | netaddr |
 | [`wireguard`](modules/wireguard/README.md) | 3 (S,H,P) | Native WireGuard device config over genetlink (retires `wg` shell-outs), plus the Noise_IKpsk2 handshake **and** the transport-data seal/open crypto data plane | **linux** | netlink, genetlink, chachapoly, entropy, netaddr |
-| [`workerpool`](modules/workerpool/README.md) | 3 (S,P) | In-process fixed-width worker pool over `lockfree.MpmcQueue` — type-erased closure jobs, Io-futex idle wakeup (no busy-spin, no lost-wakeup), graceful drain / abrupt shutdown | any | lockfree |
+| [`workerpool`](modules/workerpool/README.md) | 2 (S,E,A,P) | In-process fixed-width worker pool over `lockfree.MpmcQueue` — type-erased closure jobs, Io-futex idle wakeup (no busy-spin, no lost-wakeup), graceful drain / abrupt shutdown | any | lockfree |
 | [`writebehind`](modules/writebehind/README.md) | 4 (S) | Crash-safe write-behind cache coordinator — fast in-memory acks, async flush to a durable `Sink` via `workerpool`; WAL written before ack so a crash-recovered write survives | any | ramcache, workerpool, jobqueue, kvtree |
 | [`xdp-classifier`](modules/xdp-classifier/README.md) | 3 (S,E,P) | XDP packet classifier for a LibreQoS-style edge shaper — IPv4/IPv6 prefix→traffic-class via LPM-trie lookup behind 0-2 VLAN tags (802.1Q/QinQ), per-CPU scratch handoff, CPUMAP steering (bpf_redirect_map) | **linux** | ebpf |
 
@@ -523,7 +523,7 @@ way to recognise it.
 | [`kvtree`](modules/kvtree/README.md) | 2 (S,A,P) | Ordered transactional KV store — copy-on-write B-tree (LMDB/BoltDB lineage), MVCC snapshots, crash-safe range scans. | any | kv, crc32 |
 | [`ramcache`](modules/ramcache/README.md) | 2 (S,E,A,P) | Bounded in-memory cache — W-TinyLFU admission/eviction, TTL, generation invalidation; sharded thread-safe wrapper. | any | — |
 | [`tabular`](modules/tabular/README.md) | 3 (S,E,P) | Dataset algebra (pandas/dplyr-style verbs) over `dataset` — aggregate/pivot/resample/rolling/join, fx-aware. | any | dataset |
-| [`trie`](modules/trie/README.md) | 3 (S,P) | Prefix index for instant autocomplete over a large static string set. | any | — |
+| [`trie`](modules/trie/README.md) | 2 (S,A,P) | Prefix index for instant autocomplete over a large static string set. | any | — |
 | [`tsdb`](modules/tsdb/README.md) | 3 (S,P) | Time-series persistence over `kvtree` — ordered (series, timestamp) key codec, streaming range scans, Gorilla-compressed blocks, crash-safe retention by age or size budget. | any | kvtree |
 
 **Also worth reaching for from `storage`** — these are filed under another library (in brackets), and appear here because a consumer working in `storage` has a use for them:
@@ -593,7 +593,7 @@ way to recognise it.
 | [`opaque`](modules/opaque/README.md) | 4 (S) | OPAQUE — an asymmetric PAKE (RFC 9807), ristretto255-SHA-512 + 3DH — registration and login/AKE. Server compromise reveals no password. | any | voprf, ct25519 |
 | [`oscore`](modules/oscore/README.md) | 3 (S,P) | OSCORE (RFC 8613) — end-to-end object security for CoAP: HKDF context derivation, AES-CCM AEAD, anti-replay sliding window. | any | — |
 | [`otp`](modules/otp/README.md) | 3 (S,P) | HOTP + TOTP one-time passwords (RFC 4226 / RFC 6238) — the 2FA-authenticator primitive; caller supplies the counter/time (no wall clock); `otpauth://` provisioning-URI parse/format (base32 secrets). | any | base32 |
-| [`p256`](modules/p256/README.md) | 3 (S,P) | asm-accelerated NIST P-256 — Solinas field, constant-time comb sign, vartime wNAF verify; bit-exact vs `std.crypto.ecc.P256` and RFC 6979. | amd64 asm + portable fallback | — |
+| [`p256`](modules/p256/README.md) | 3 (P) | asm-accelerated NIST P-256 — Solinas field, constant-time comb sign, vartime wNAF verify; bit-exact vs `std.crypto.ecc.P256` and RFC 6979. | amd64 asm + portable fallback | — |
 | [`p384`](modules/p384/README.md) | 2 (S,E,A,P) | NIST P-384 (secp384r1): Montgomery field, constant-time ECDH and ECDSA-P384 (RFC 6979) with std `P384`/`Ecdsa`-shaped API, faster than std; CAVP + Wycheproof + OpenSSL anchored. | amd64 asm (ADX/BMI2) + portable fallback | entropy |
 | [`p521`](modules/p521/README.md) | 2 (S,E,A,P) | NIST P-521 (secp521r1): Mersenne field, constant-time ECDH and ECDSA-P521 (RFC 6979) with std `P384`/`Ecdsa`-shaped API; CAVP + Wycheproof + OpenSSL anchored. | any (portable, no asm) | entropy |
 | [`paillier`](modules/paillier/README.md) | 3 (S,P) | Paillier additively-homomorphic public-key encryption (EUROCRYPT 1999) — 2048-bit keygen, encrypt/decrypt, homomorphic add; const-time decrypt path. | any | montint |

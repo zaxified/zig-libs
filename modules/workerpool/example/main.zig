@@ -55,6 +55,11 @@ pub fn main() !void {
                 std.debug.print("backing storage exhausted, dropping remaining work\n", .{});
                 break;
             },
+            error.QueueFull => {
+                // Only with `Options.max_queued`; this pool is unbounded.
+                std.debug.print("queue full, shedding remaining work\n", .{});
+                break;
+            },
         };
     }
 
@@ -73,6 +78,6 @@ pub fn main() !void {
         unreachable; // the pool has already stopped accepting work
     } else |err| switch (err) {
         error.Shutdown => std.debug.print("post-drain submit correctly refused\n", .{}),
-        error.SubmitFailed => return err,
+        error.SubmitFailed, error.QueueFull => return err,
     }
 }

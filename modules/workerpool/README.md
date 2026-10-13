@@ -51,6 +51,12 @@ pool.drain();              // stop accepting; run everything queued; join
   jobs instead. Producers must pause for a guaranteed return (as for `drain`);
   never call it from one of the pool's own jobs (it panics rather than
   deadlocks).
+- `WorkerPool.pause()` / `resume()` / `isPaused()` — stop workers from **starting** new jobs and
+  let them go on again. Idempotent. A job already running when `pause` is called finishes (nothing is
+  interrupted); queued and newly submitted jobs stay queued until `resume`. `drain` and `shutdownNow`
+  override a pause; `wait` on a paused pool with queued jobs blocks until `resume`.
+- `WorkerPool.workingCount()` — workers currently running a job (a snapshot, one atomic inc/dec per
+  job). `queuedCount()` — jobs submitted and not yet started (a snapshot).
 - `WorkerPool.drain()` — **graceful**: stop accepting, run every already-queued
   and in-flight job, join all workers. After it returns the queue is empty and
   every submitted job has run.
@@ -69,10 +75,23 @@ callable (no per-job-type instantiation, smaller binary); a comptime job type
 would force one concrete `Job`/`run` per pool. The caller owns `ctx` and keeps
 it valid until the job runs.
 
-**Backpressure — unbounded, non-blocking.** The MS-queue grows on demand, so
-`submit` never blocks on a full queue; it fails only with `error.SubmitFailed`
-(allocator exhaustion) or `error.Shutdown` (pool no longer accepting). A
-bounded/blocking variant is future work (see `SPEC.md`).
+**Backpressure — unbounded by default, never blocking.** The MS-queue grows on demand, so
+`submit` never blocks; it fails with `error.SubmitFailed` (allocator exhaustion) or
+`error.Shutdown` (pool no longer accepting). Set `Options.max_queued = N` to bound it: a submit that
+would leave more than `N` jobs queued-and-not-started returns `error.QueueFull` (nothing allocated,
+nothing counted; the bound is exact under concurrent submitters), the caller retries or sheds. A
+blocking submit is deferred.
+
+```zig
+const pool = try workerpool.WorkerPool.init(allocator, .{ .io = io, .n_workers = 4, .max_queued = 64 });
+pool.submit(job) catch |err| switch (err) {
+    error.QueueFull => shed(job), // back-pressure: the 65th queued job is refused
+    error.Shutdown, error.SubmitFailed => return err,
+};
+pool.pause();            // workers finish what they run, start nothing new
+pool.@"resume"();        // ... and go on (a Zig keyword, hence the quoting)
+const busy = pool.workingCount();
+```
 
 **Lifecycle contract.** `submit`/`Submitter.submit` are safe from any thread and
 concurrently with each other. The **lifecycle** calls (`drain`, `shutdownNow`,
@@ -85,8 +104,12 @@ handles must be `deinit`'d before the pool is torn down.
   single-owner lifecycle.
 
 Provenance: clean-room. Models the shape of `std.Thread.Pool` / a crossbeam
-worker pool, built on this workspace's own `lockfree` MS-queue + EBR. No
-third-party source consulted or copied; no NOTICE entry required.
+worker pool, built on this workspace's own `lockfree` MS-queue + EBR. The
+module's source copies nothing. Pithikos/C-Thread-Pool (MIT) was read for the
+behaviour of `pause`/`resume`/`num_threads_working` (2026-10-13), and an
+unmodified copy of it (plus an SPDX line) sits in `tools/c_bench/thpool/` as
+the benchmark's reference side — attributed in `NOTICE`. Data: none beyond
+that benchmark; `tools/c_bench/main.c` is our own tooling.
 
 ## Verification
 
@@ -109,6 +132,12 @@ silent hang. **All pass, none skipped:**
 - **STRESS (MP):** 8 producer threads each submit 20 000 jobs via their own
   `Submitter` (lock-free concurrent enqueue) while 6 workers consume — all
   160 000 accounted for exactly once.
+
+- **pause / resume:** nothing starts while paused (200 jobs held for 50 ms), a running job
+  finishes, `drain` / `shutdownNow` override a pause, 2 000 racing pause/resume/submit rounds, and a
+  held-open lost-wakeup window.
+- **workingCount / max_queued:** N gated jobs on N workers read N; a bound of 4 refuses the 5th with
+  `QueueFull` and accepts again after `resume` + `wait`; 8 producers on a bound of 3 never overshoot it.
 
 See `SPEC.md` for the drain semantics, the wakeup/no-lost-wakeup design, the
 backpressure policy, and the interaction with `lockfree`'s EBR reclamation.

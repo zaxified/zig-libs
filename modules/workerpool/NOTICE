@@ -1,0 +1,13 @@
+workerpool — third-party attribution
+
+tools/c_bench/thpool/thpool.c and thpool.h are a copy of Pithikos/C-Thread-Pool
+(https://github.com/Pithikos/C-Thread-Pool) at commit
+2b56942a7347280ea4d0ede238cefacef96db4bb, MIT licence, copyright Johan Hanssen
+Seferidis — the licence text travels beside them in tools/c_bench/thpool/LICENSE.
+The only change is a first-line `SPDX-License-Identifier: MIT` comment
+(tools/c_bench/thpool/SOURCE records the upstream sha256 sums). They are SOURCE,
+compiled only into the comparative benchmark's reference program
+(`zig build bench-workerpool`), never into the module.
+
+The module itself (src/) copies nothing from it; thpool.c was read for the
+behaviour of pause/resume and num_threads_working only.
