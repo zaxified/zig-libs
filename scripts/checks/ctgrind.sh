@@ -318,6 +318,8 @@ declare -A TARGETS=(
     [tlsresume]="stek psk early"
     # ── 2026-10-13: acme: the P-256 account / certificate private key ──
     [acme]="jws csr pem"
+    # ── 2026-10-13: jwt: HMAC secrets (sign + verify), ES/EdDSA/RS/PS signing keys ──
+    [jwt]="hmac ec rsa"
 )
 declare -A MODES=(
     [bolt8]="ReleaseFast"
@@ -399,6 +401,7 @@ declare -A MODES=(
     [p521]="ReleaseFast"
     [tlsresume]="ReleaseFast"
     [acme]="ReleaseFast"
+    [jwt]="ReleaseFast"
 )
 # Keyed "<module>/<target>".
 declare -A PATTERN=(
@@ -742,6 +745,11 @@ declare -A PATTERN=(
     [acme/jws]='jws[.]zig|burn[.]zig'
     [acme/csr]='x509[.]zig|burn[.]zig'
     [acme/pem]='x509[.]zig|burn[.]zig'
+    # jwt (2026-10-13): the module's own files. `root.zig` also matches the
+    # delegated rsa/p521/p256 root.zig frames; the tsv comment itemises them.
+    [jwt/hmac]='root[.]zig|encode[.]zig|burn[.]zig'
+    [jwt/ec]='root[.]zig|encode[.]zig|burn[.]zig'
+    [jwt/rsa]='root[.]zig|encode[.]zig|burn[.]zig'
 )
 WITNESS='Writer[.]zig|Format[.]zig|fmt[.]zig'
 # WITNESS_CHAIN — the files a witness's stack may consist of BETWEEN the
@@ -980,6 +988,9 @@ declare -A LABEL=(
     [acme/jws]='acme jws.sign jwk+kid headers (account key tainted)'
     [acme/csr]='acme x509.csrDer 1+2 names (certificate key tainted)'
     [acme/pem]='acme ecPrivateKeyToPem + ecPrivateKeyFromPem (key / PEM tainted)'
+    [jwt/hmac]='jwt HS256/384/512 sign + verify accept + reject (secret tainted)'
+    [jwt/ec]='jwt ES256/ES384/ES512/EdDSA sign (signing key tainted)'
+    [jwt/rsa]='jwt RS256 + PS256 sign (rsa secret members tainted)'
 )
 
 # ── measurement ────────────────────────────────────────────────────────────

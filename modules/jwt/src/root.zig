@@ -206,7 +206,7 @@ pub const meta = .{
     .role = .both, // P6 = a `router` middleware guarding routes (server); P7 = an OAuth2/OIDC client building auth/token requests and accepting ID Tokens (relying party).
     .concurrency = .reentrant, // except Provider — one mutable cache, external sync (inject ResourceServer.lock under a threaded server); VerifiedCache is internally synchronized
     .model_after = "RFC 7515 (JWS) + RFC 7519 (JWT) + RFC 7518 (JWA) verify incl. RS256 (RSASSA-PKCS1-v1_5, RFC 8017) + RFC 7517 (JWK/JWKS key sets), RFC 8725 hardening + OpenID Connect Discovery 1.0 / RFC 8414 (issuer metadata -> jwks_uri/authorization_endpoint/token_endpoint) with cached, rotation-aware Provider; RFC 6750 Bearer resource-server middleware; RFC 7636 PKCE + OIDC Core 1.0 §3.1 authorization code flow + §3.1.3.7 ID Token validation; OAuth2/OIDC resource server AND relying party",
-    .deps = .{ "http", "router", "p256", "p521" }, // p521: ES512 (std has no P-521); p256 supplies the fast ES256 curve (byte-exact to std.crypto.sign.ecdsa.EcdsaP256Sha256)
+    .deps = .{ "http", "router", "p256", "p521", "rsa", "ct25519" }, // p521: ES512 (std has no P-521); p256 supplies the fast ES256 curve (byte-exact to std.crypto.sign.ecdsa.EcdsaP256Sha256); rsa: RS*/PS* verify and sign; ct25519: the comb behind EdDSA signing
 };
 
 // ── public API ──────────────────────────────────────────────────────────────
@@ -644,6 +644,9 @@ pub fn validateClaims(claims: Claims, opts: Options) ValidateError!void {
 /// and the fast vartime verify on the P2 HTTPS per-request hot path.
 const p256_mod = @import("p256");
 const p521_mod = @import("p521");
+/// The in-repo RSA module: RS* and PS* verification (`VerifyKey`) and RS*/PS*
+/// signing (`encode.zig`). Public so a caller can name its key types.
+pub const rsa = @import("rsa");
 
 /// std signature schemes re-exported so callers (and P4's JWKS) can name the
 /// key types without spelling out the std.crypto paths. ES256 (the P2 HTTPS
@@ -668,20 +671,24 @@ pub const MlDsa87 = std.crypto.sign.mldsa.MLDSA87;
 
 const hmac_sha2 = std.crypto.auth.hmac.sha2;
 const sha2 = std.crypto.hash.sha2;
-/// std's RSA verify machinery (it lives under Certificate because TLS
-/// certificate validation is its std consumer; the math is generic
-/// RFC 8017 RSASSA-PKCS1-v1_5 over std.crypto.ff big-integer modexp).
-const cert_rsa = std.crypto.Certificate.rsa;
-
-/// An RSA public verification key: the validated `(n, e)` pair plus the
-/// modulus octet length `k` (RFC 8017 §4.1) — an RS* JWS signature is
-/// valid only if it is exactly `k` bytes (RFC 7518 §3.3). Built via
-/// `Key.rsaFromModExp`; supports the common 2048/3072/4096-bit sizes.
+/// An RSA public verification key: the validated `(n, e)` pair (the `rsa`
+/// module's verify-only form) plus the modulus octet length `k` (RFC 8017
+/// §4.1) — an RS*/PS* JWS signature is valid only if it is exactly `k`
+/// bytes (RFC 7518 §3.3, §3.5). Built via `Key.rsaFromModExp` or
+/// `Key.rsaFromPublicKey`; any modulus of 2048 to 4096 bits.
+///
+/// BREAKING 2026-10-13: `inner` was `std.crypto.Certificate.rsa.PublicKey`.
+/// std has no PSS verify that survives every modulus size (its
+/// `EMSA_PSS_VERIFY` asserts `emLen == k`, false whenever modBits ≡ 1 mod 8),
+/// so RS* and PS* both go through the `rsa` module now.
 pub const RsaPublicKey = struct {
-    inner: cert_rsa.PublicKey,
-    /// Modulus length in octets: 256, 384 or 512.
+    inner: rsa.VerifyKey,
+    /// Modulus length in octets, 256..512.
     modulus_len: usize,
 };
+
+/// RFC 7518 §3.3 / §3.5: "A key of size 2048 bits or larger MUST be used".
+const rsa_min_bits = 2048;
 
 /// Errors from the `Key` constructors: the bytes do not encode a valid key
 /// (point not on the curve, non-canonical encoding, …).
@@ -705,7 +712,9 @@ pub const Key = union(enum) {
     ecdsa_p521: EcdsaP521Sha512.PublicKey,
     /// Ed25519 public key for EdDSA (RFC 8037).
     ed25519: Ed25519.PublicKey,
-    /// RSA public key for RS256/RS384/RS512 (RSASSA-PKCS1-v1_5).
+    /// RSA public key for RS256/RS384/RS512 (RSASSA-PKCS1-v1_5) and
+    /// PS256/PS384/PS512 (RSASSA-PSS). One key type for both, as in
+    /// golang-jwt: the token's `alg` picks the padding.
     rsa: RsaPublicKey,
     /// ML-DSA public keys (RFC 9964 / FIPS 204). One variant per parameter
     /// set rather than one variant plus a tag, because the three are distinct
@@ -773,25 +782,25 @@ pub const Key = union(enum) {
 
     /// RSA key from big-endian modulus + public-exponent bytes — exactly a
     /// JWK's decoded `n`/`e` (RFC 7518 §6.3.1); leading zero bytes are
-    /// tolerated on both. Accepts the common 2048/3072/4096-bit modulus
-    /// sizes and rejects everything else as `InvalidKey`: zero/empty or
-    /// odd-sized or oversized modulus, and (via std's checks, which mirror
-    /// what TLS accepts) an even exponent, e < 3, or e ≥ 2^32.
+    /// tolerated on both. Accepts any modulus of 2048 to 4096 bits (RFC 7518
+    /// §3.3 sets the floor; the `rsa` module the ceiling) and rejects
+    /// everything else as `InvalidKey`: empty, even, shorter or longer
+    /// modulus, and an even exponent, e < 3, or e ≥ 2^32.
     pub fn rsaFromModExp(n: []const u8, e: []const u8) KeyError!Key {
-        const n_bytes = std.mem.trimStart(u8, n, &.{0});
-        const e_bytes = std.mem.trimStart(u8, e, &.{0});
-        if (n_bytes.len == 0 or e_bytes.len == 0) return error.InvalidKey;
-        // std validates: modulus ≥ 512 bits (and ≤ 4096 by construction),
-        // exponent odd, in [3, 2^32). Anything off → InvalidKey.
-        const pk = cert_rsa.PublicKey.fromBytes(e_bytes, n_bytes) catch
-            return error.InvalidKey;
+        const vk = rsa.VerifyKey.fromBytes(n, e) catch return error.InvalidKey;
+        return rsaFromVerifyKey(vk);
+    }
+
+    /// The public half of an `rsa` module key pair — what an issuer that
+    /// signs RS*/PS* with `SigningKey` verifies its own tokens with.
+    pub fn rsaFromPublicKey(pk: *const rsa.PublicKey) KeyError!Key {
+        return rsaFromVerifyKey(pk.verifyKey());
+    }
+
+    fn rsaFromVerifyKey(vk: rsa.VerifyKey) KeyError!Key {
+        if (vk.bits() < rsa_min_bits) return error.InvalidKey;
         // k = the modulus octet length = the required signature length.
-        const k = (pk.n.bits() + 7) / 8;
-        switch (k) {
-            256, 384, 512 => {},
-            else => return error.InvalidKey,
-        }
-        return .{ .rsa = .{ .inner = pk, .modulus_len = k } };
+        return .{ .rsa = .{ .inner = vk, .modulus_len = (vk.bits() + 7) / 8 } };
     }
 };
 
@@ -803,8 +812,7 @@ pub const VerifyError = error{
     /// The token's `alg` does not match the provided key's type (e.g. an
     /// HS256 token offered an EC/Ed public key, or ES256 vs a P-384 key).
     AlgKeyMismatch,
-    /// `alg` is unrecognized, or recognized but not implemented here
-    /// (PS* — RSA-PSS).
+    /// `alg` is unrecognized.
     UnsupportedAlg,
     /// The signature has the wrong length for the alg, or does not verify
     /// over `signing_input`.
@@ -829,14 +837,15 @@ pub fn verify(parsed: *const ParsedToken, key: Key) VerifyError!void {
     switch (parsed.alg) {
         .none => return error.UnsecuredToken,
         .unknown => return error.UnsupportedAlg,
-        // PS* needs RSA-PSS.
-        .PS256, .PS384, .PS512 => return error.UnsupportedAlg,
         .HS256 => try verifyHmac(hmac_sha2.HmacSha256, parsed, key),
         .HS384 => try verifyHmac(hmac_sha2.HmacSha384, parsed, key),
         .HS512 => try verifyHmac(hmac_sha2.HmacSha512, parsed, key),
         .RS256 => try verifyRsaPkcs1(sha2.Sha256, parsed, key),
         .RS384 => try verifyRsaPkcs1(sha2.Sha384, parsed, key),
         .RS512 => try verifyRsaPkcs1(sha2.Sha512, parsed, key),
+        .PS256 => try verifyRsaPss(sha2.Sha256, parsed, key),
+        .PS384 => try verifyRsaPss(sha2.Sha384, parsed, key),
+        .PS512 => try verifyRsaPss(sha2.Sha512, parsed, key),
         .ES256 => switch (key) {
             .ecdsa_p256 => |pk| try verifyEs256Fast(pk, parsed),
             else => return error.AlgKeyMismatch,
@@ -991,32 +1000,38 @@ fn verifyEs256Fast(public_key: EcdsaP256Sha256.PublicKey, parsed: *const ParsedT
         return error.BadSignature;
 }
 
-/// RS256/384/512: RSASSA-PKCS1-v1_5 (RFC 8017 §8.2.2) via std —
-/// `s^e mod n` (std.crypto.ff modexp), then the full EMSA-PKCS1-v1_5
-/// check (`0x00 01 FF…FF 00 || DigestInfo(hash)`) against the SHA-2
-/// digest of `signing_input`. The signature must be exactly the modulus
-/// length (RFC 7518 §3.3); anything else — wrong length, s ≥ n, bad
-/// padding, wrong hash OID, digest mismatch — is `BadSignature`.
+/// RS256/384/512: RSASSA-PKCS1-v1_5 (RFC 8017 §8.2.2) through the `rsa`
+/// module — `s^e mod n`, then the full EMSA-PKCS1-v1_5 check
+/// (`0x00 01 FF…FF 00 || DigestInfo(hash)`) against the SHA-2 digest of
+/// `signing_input`. The signature must be exactly the modulus length (RFC
+/// 7518 §3.3); anything else — wrong length, s ≥ n, bad padding, wrong hash
+/// OID, digest mismatch — is `BadSignature`.
 fn verifyRsaPkcs1(comptime Hash: type, parsed: *const ParsedToken, key: Key) VerifyError!void {
+    const pk = try rsaKey(parsed, key);
+    pk.inner.verifyPkcs1v15(Hash, parsed.signing_input, parsed.signature) catch return error.BadSignature;
+}
+
+/// PS256/384/512: RSASSA-PSS (RFC 8017 §8.1.2) with MGF1 over the same
+/// SHA-2 and a salt exactly as long as the hash output, which is what RFC
+/// 7518 §3.5 fixes ("The size of the salt value is the same size as the hash
+/// function output"). golang-jwt verifies with `PSSSaltLengthAuto` by
+/// default and so also accepts other salt lengths; this checks the RFC's,
+/// which every conforming signer (golang-jwt's included) produces.
+fn verifyRsaPss(comptime Hash: type, parsed: *const ParsedToken, key: Key) VerifyError!void {
+    const pk = try rsaKey(parsed, key);
+    pk.inner.verifyPss(Hash, parsed.signing_input, parsed.signature, Hash.digest_length) catch return error.BadSignature;
+}
+
+fn rsaKey(parsed: *const ParsedToken, key: Key) VerifyError!*const RsaPublicKey {
     const pk = switch (key) {
-        .rsa => |k| k,
+        .rsa => |*k| k,
         else => return error.AlgKeyMismatch,
     };
+    // Length is public; checked before any arithmetic. A hand-assembled
+    // RsaPublicKey whose `modulus_len` disagrees with its modulus is refused.
+    if (pk.modulus_len != (pk.inner.bits() + 7) / 8) return error.InvalidKey;
     if (parsed.signature.len != pk.modulus_len) return error.BadSignature;
-    switch (pk.modulus_len) {
-        inline 256, 384, 512 => |k_len| {
-            cert_rsa.PKCS1v1_5Signature.verify(
-                k_len,
-                parsed.signature[0..k_len].*,
-                parsed.signing_input,
-                pk.inner,
-                Hash,
-            ) catch return error.BadSignature;
-        },
-        // A hand-assembled RsaPublicKey with a modulus_len the constructor
-        // never produces: refuse rather than trust it.
-        else => return error.InvalidKey,
-    }
+    return pk;
 }
 
 // ── JWKS key sets (Part 4, RFC 7517) ────────────────────────────────────────
@@ -3259,6 +3274,210 @@ fn tokenStringMember(obj: std.json.ObjectMap, name: []const u8) error{InvalidFie
     };
 }
 
+/// The `error` codes of RFC 6749 §5.2 (token endpoint) and §4.1.2.1
+/// (authorization endpoint). An extension code (RFC 6749 §8.5, e.g. OIDC's
+/// `login_required`) maps to `other`; its text is kept in
+/// `OAuthError.code_text`.
+pub const OAuthErrorCode = enum {
+    invalid_request,
+    invalid_client,
+    invalid_grant,
+    unauthorized_client,
+    unsupported_grant_type,
+    invalid_scope,
+    access_denied,
+    unsupported_response_type,
+    server_error,
+    temporarily_unavailable,
+    other,
+};
+
+/// A parsed OAuth 2.0 error response (RFC 6749 §5.2 token-endpoint body or
+/// §4.1.2.1 authorization-endpoint redirect query). Shape follows Go's
+/// `oauth2.RetrieveError` (ErrorCode / ErrorDescription / ErrorURI). Every
+/// slice lives in the internal arena; call `deinit()` when done. The
+/// description is server-supplied text: show it to a developer, never
+/// interpret it.
+pub const OAuthError = struct {
+    /// The registered code, or `.other` for an extension code.
+    code: OAuthErrorCode,
+    /// The `error` member verbatim.
+    code_text: []const u8,
+    /// `error_description` (human-readable, developer-facing).
+    description: ?[]const u8 = null,
+    /// `error_uri` (page with more information).
+    uri: ?[]const u8 = null,
+    /// `state` echoed by the authorization endpoint (§4.1.2.1 only).
+    state: ?[]const u8 = null,
+
+    arena: *std.heap.ArenaAllocator,
+
+    /// Free the arena and every slice in this value.
+    pub fn deinit(self: *OAuthError) void {
+        const gpa = self.arena.child_allocator;
+        self.arena.deinit();
+        gpa.destroy(self.arena);
+        self.* = undefined;
+    }
+};
+
+/// Errors from `parseOAuthError` / `parseAuthorizationError`.
+pub const OAuthErrorParseError = error{
+    InvalidJson,
+    NotAnObject,
+    /// The `error` member is absent.
+    MissingError,
+    /// A present member has the wrong JSON type, or `error` is empty.
+    InvalidField,
+    /// `error`, `error_description`, `error_uri` or `state` contains a byte
+    /// outside the character set RFC 6749 §5.2 / §A allows.
+    InvalidCharacter,
+    OutOfMemory,
+};
+
+/// RFC 6749 §5.2 `error` / `error_description` set: %x20-21 / %x23-5B / %x5D-7E.
+fn isOAuthTextByte(c: u8) bool {
+    return (c >= 0x20 and c <= 0x21) or (c >= 0x23 and c <= 0x5B) or (c >= 0x5D and c <= 0x7E);
+}
+
+/// RFC 6749 §5.2 `error_uri` set: %x21 / %x23-5B / %x5D-7E (no space).
+fn isOAuthUriByte(c: u8) bool {
+    return c == 0x21 or (c >= 0x23 and c <= 0x5B) or (c >= 0x5D and c <= 0x7E);
+}
+
+/// RFC 6749 §A.5 `state` set: VSCHAR = %x20-7E.
+fn isOAuthStateByte(c: u8) bool {
+    return c >= 0x20 and c <= 0x7E;
+}
+
+fn oauthCharsOk(s: []const u8, comptime allowed: fn (u8) bool) bool {
+    for (s) |c| if (!allowed(c)) return false;
+    return true;
+}
+
+/// Validate the members and assemble the result around `arena_state` (whose
+/// allocations the slices already live in).
+fn finishOAuthError(
+    arena_state: *std.heap.ArenaAllocator,
+    code_text: []const u8,
+    description: ?[]const u8,
+    uri: ?[]const u8,
+    state: ?[]const u8,
+) OAuthErrorParseError!OAuthError {
+    if (code_text.len == 0) return error.InvalidField;
+    if (!oauthCharsOk(code_text, isOAuthTextByte)) return error.InvalidCharacter;
+    if (description) |d| if (!oauthCharsOk(d, isOAuthTextByte)) return error.InvalidCharacter;
+    if (uri) |u| if (!oauthCharsOk(u, isOAuthUriByte)) return error.InvalidCharacter;
+    if (state) |s| if (!oauthCharsOk(s, isOAuthStateByte)) return error.InvalidCharacter;
+    return .{
+        .code = std.meta.stringToEnum(OAuthErrorCode, code_text) orelse .other,
+        .code_text = code_text,
+        .description = description,
+        .uri = uri,
+        .state = state,
+        .arena = arena_state,
+    };
+}
+
+/// RFC 6749 §5.2: parse a token-endpoint error body (HTTP status 400, or 401
+/// for a failed client authentication). `error` is a REQUIRED string; it and
+/// the optional `error_description` / `error_uri` strings must stay inside the
+/// character sets of §5.2 (`error`/`error_description` = %x20-21 / %x23-5B /
+/// %x5D-7E, `error_uri` = %x21 / %x23-5B / %x5D-7E), anything else is
+/// `InvalidCharacter`. Unknown members are ignored.
+pub fn parseOAuthError(gpa: std.mem.Allocator, json: []const u8) OAuthErrorParseError!OAuthError {
+    const arena_state = try gpa.create(std.heap.ArenaAllocator);
+    errdefer gpa.destroy(arena_state);
+    arena_state.* = .init(gpa);
+    errdefer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const val = std.json.parseFromSliceLeaky(std.json.Value, arena, json, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidJson,
+    };
+    if (val != .object) return error.NotAnObject;
+    const obj = val.object;
+
+    const code_text = (try tokenStringMember(obj, "error")) orelse return error.MissingError;
+    const description = try tokenStringMember(obj, "error_description");
+    const uri = try tokenStringMember(obj, "error_uri");
+    return finishOAuthError(arena_state, code_text, description, uri, null);
+}
+
+/// RFC 6749 §4.1.2.1: parse the authorization-endpoint error carried on the
+/// redirect URI's query (`error`, `error_description`, `error_uri`, `state`;
+/// `application/x-www-form-urlencoded`, so `%XX` and `+` = space are decoded
+/// first, with `http.body.urlencoded`). `query` is the part after `?`, without
+/// the fragment. Returns `null` when there is no `error` parameter (a success
+/// redirect). The decoded values obey the same character sets as
+/// `parseOAuthError` (`state` may be any printable ASCII); a repeated
+/// parameter keeps its first occurrence.
+pub fn parseAuthorizationError(gpa: std.mem.Allocator, query: []const u8) OAuthErrorParseError!?OAuthError {
+    const arena_state = try gpa.create(std.heap.ArenaAllocator);
+    errdefer gpa.destroy(arena_state);
+    arena_state.* = .init(gpa);
+    errdefer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const buf = try arena.dupe(u8, query);
+    var code_text: ?[]const u8 = null;
+    var description: ?[]const u8 = null;
+    var uri: ?[]const u8 = null;
+    var state: ?[]const u8 = null;
+    var it = http.body.urlencoded(buf);
+    while (it.next()) |p| {
+        const slot: *?[]const u8 = if (std.mem.eql(u8, p.name, "error"))
+            &code_text
+        else if (std.mem.eql(u8, p.name, "error_description"))
+            &description
+        else if (std.mem.eql(u8, p.name, "error_uri"))
+            &uri
+        else if (std.mem.eql(u8, p.name, "state"))
+            &state
+        else
+            continue;
+        if (slot.* == null) slot.* = p.value;
+    }
+    const code = code_text orelse {
+        arena_state.deinit();
+        gpa.destroy(arena_state);
+        return null;
+    };
+    return try finishOAuthError(arena_state, code, description, uri, state);
+}
+
+/// Outcome of `parseTokenEndpointResponse`: the success body or the OAuth
+/// error body. Owns its payload; call `deinit()`.
+pub const TokenEndpointResult = union(enum) {
+    ok: TokenResponse,
+    err: OAuthError,
+
+    /// Free the payload.
+    pub fn deinit(self: *TokenEndpointResult) void {
+        switch (self.*) {
+            .ok => |*r| r.deinit(),
+            .err => |*e| e.deinit(),
+        }
+        self.* = undefined;
+    }
+};
+
+/// Status-aware token-endpoint entry: 200 goes to `parseTokenResponse`, 400 /
+/// 401 (RFC 6749 §5.2) to `parseOAuthError`, any other status is
+/// `error.UnexpectedStatus`.
+pub fn parseTokenEndpointResponse(
+    gpa: std.mem.Allocator,
+    status: u16,
+    body: []const u8,
+) (TokenResponseError || OAuthErrorParseError || error{UnexpectedStatus})!TokenEndpointResult {
+    return switch (status) {
+        200 => .{ .ok = try parseTokenResponse(gpa, body) },
+        400, 401 => .{ .err = try parseOAuthError(gpa, body) },
+        else => error.UnexpectedStatus,
+    };
+}
+
 /// Errors from `acceptIdToken`/`acceptIdTokenJwks`/`acceptIdTokenProvider` —
 /// the underlying parse/verify/claims errors (signature, `exp`/`nbf`,
 /// mandatory `iss`/`aud`) plus the ID-Token-specific RP checks (OIDC Core
@@ -4536,6 +4755,7 @@ test "verify: EdDSA generated round-trip through a full token" {
 // binary -- see CONVENTIONS.md §6 step 3, the dark-tests rule.
 test {
     _ = @import("rfc9964_vectors.zig");
+    _ = @import("rfc7520_vectors.zig");
     _ = @import("encode.zig");
     _ = @import("cache.zig");
     _ = @import("fuzz_test.zig");
@@ -4805,16 +5025,16 @@ test "verify: alg confusion — token alg must match the key type" {
     try testing.expectError(error.AlgKeyMismatch, verify(&es_parsed, .{ .ed25519 = ed_kp.public_key }));
 }
 
-test "verify: unknown and not-yet-supported algs → UnsupportedAlg" {
+test "verify: an unknown alg → UnsupportedAlg; PS* against a non-RSA key → AlgKeyMismatch" {
     var buf: [512]u8 = undefined;
-    inline for (.{ "XS999", "PS256", "PS512" }) |alg_name| {
-        const si = signingInputInto(&buf, "{\"alg\":\"" ++ alg_name ++ "\"}",
+    inline for (.{ .{ "XS999", error.UnsupportedAlg }, .{ "PS256", error.AlgKeyMismatch }, .{ "PS512", error.AlgKeyMismatch } }) |case| {
+        const si = signingInputInto(&buf, "{\"alg\":\"" ++ case[0] ++ "\"}",
             \\{"exp":1000}
         );
         const token = finishToken(&buf, si.len, "some-signature");
         var parsed = try parse(testing.allocator, token);
         defer parsed.deinit();
-        try testing.expectError(error.UnsupportedAlg, verify(&parsed, .{ .hmac = "secret" }));
+        try testing.expectError(case[1], verify(&parsed, .{ .hmac = "secret" }));
     }
 }
 
@@ -5389,11 +5609,11 @@ test "JWKS: RFC 7517 A.1 example set parses into typed keys" {
     try testing.expectEqual(KeyUse.enc, ec.use.?);
     try testing.expect(ec.alg == null);
 
-    const rsa = jwks.keys[1];
-    try testing.expect(rsa.key == .rsa);
-    try testing.expectEqual(@as(usize, 256), rsa.key.rsa.modulus_len);
-    try testing.expectEqualStrings("2011-04-29", rsa.kid.?);
-    try testing.expectEqual(Alg.RS256, rsa.alg.?);
+    const rsa_jwk = jwks.keys[1];
+    try testing.expect(rsa_jwk.key == .rsa);
+    try testing.expectEqual(@as(usize, 256), rsa_jwk.key.rsa.modulus_len);
+    try testing.expectEqualStrings("2011-04-29", rsa_jwk.kid.?);
+    try testing.expectEqual(Alg.RS256, rsa_jwk.alg.?);
 
     // kid lookup honors `use`: the enc key is never offered for signatures.
     try testing.expect(jwks.keyForKid("2011-04-29") != null);
@@ -8058,6 +8278,124 @@ test "parseTokenResponse: full response, missing-required and wrong-typed-option
     ));
     try testing.expectError(error.InvalidJson, parseTokenResponse(gpa, "]][not json"));
     try testing.expectError(error.NotAnObject, parseTokenResponse(gpa, "[1,2,3]"));
+}
+
+test "parseOAuthError: every registered code maps, RFC 6749 section 5.2 example" {
+    const gpa = testing.allocator;
+    const names = [_][]const u8{
+        "invalid_request",         "invalid_client",            "invalid_grant",
+        "unauthorized_client",     "unsupported_grant_type",    "invalid_scope",
+        "access_denied",           "unsupported_response_type", "server_error",
+        "temporarily_unavailable",
+    };
+    inline for (names, 0..) |n, i| {
+        const body = "{\"error\":\"" ++ n ++ "\"}";
+        var e = try parseOAuthError(gpa, body);
+        defer e.deinit();
+        try testing.expectEqual(@as(OAuthErrorCode, @enumFromInt(i)), e.code);
+        try testing.expectEqualStrings(n, e.code_text);
+        try testing.expect(e.description == null and e.uri == null and e.state == null);
+    }
+    // RFC 6749 section 5.2 example body.
+    var e = try parseOAuthError(gpa, "{\"error\":\"invalid_request\"}");
+    defer e.deinit();
+    try testing.expectEqual(OAuthErrorCode.invalid_request, e.code);
+}
+
+test "parseOAuthError: extension code, captured members, unknown members ignored" {
+    const gpa = testing.allocator;
+    var e = try parseOAuthError(gpa,
+        \\{"error":"login_required","error_description":"Need a fresh login",
+        \\ "error_uri":"https://idp.example/err?x=1","trace_id":42}
+    );
+    defer e.deinit();
+    try testing.expectEqual(OAuthErrorCode.other, e.code);
+    try testing.expectEqualStrings("login_required", e.code_text);
+    try testing.expectEqualStrings("Need a fresh login", e.description.?);
+    try testing.expectEqualStrings("https://idp.example/err?x=1", e.uri.?);
+    try testing.expect(e.state == null);
+
+    var o = try parseOAuthError(gpa, "{\"error\":\"other\"}");
+    defer o.deinit();
+    try testing.expectEqual(OAuthErrorCode.other, o.code);
+    try testing.expectEqualStrings("other", o.code_text);
+}
+
+test "parseOAuthError: refusals" {
+    const gpa = testing.allocator;
+    try testing.expectError(error.MissingError, parseOAuthError(gpa, "{\"error_description\":\"x\"}"));
+    try testing.expectError(error.InvalidField, parseOAuthError(gpa, "{\"error\":5}"));
+    try testing.expectError(error.InvalidField, parseOAuthError(gpa, "{\"error\":null}"));
+    try testing.expectError(error.InvalidField, parseOAuthError(gpa, "{\"error\":\"\"}"));
+    try testing.expectError(error.InvalidField, parseOAuthError(gpa, "{\"error\":\"a\",\"error_description\":1}"));
+    try testing.expectError(error.InvalidField, parseOAuthError(gpa, "{\"error\":\"a\",\"error_uri\":[]}"));
+    // Characters outside the RFC 6749 section 5.2 sets.
+    try testing.expectError(error.InvalidCharacter, parseOAuthError(gpa, "{\"error\":\"in\\\"valid\"}"));
+    try testing.expectError(error.InvalidCharacter, parseOAuthError(gpa, "{\"error\":\"a\\\\b\"}"));
+    try testing.expectError(error.InvalidCharacter, parseOAuthError(gpa, "{\"error\":\"a\\nb\"}"));
+    try testing.expectError(error.InvalidCharacter, parseOAuthError(gpa, "{\"error\":\"a\\u0007\"}"));
+    try testing.expectError(error.InvalidCharacter, parseOAuthError(gpa, "{\"error\":\"a\\u007f\"}"));
+    try testing.expectError(error.InvalidCharacter, parseOAuthError(gpa, "{\"error\":\"caf\xc3\xa9\"}"));
+    try testing.expectError(error.InvalidCharacter, parseOAuthError(gpa, "{\"error\":\"a\",\"error_description\":\"say \\\"hi\\\"\"}"));
+    try testing.expectError(error.InvalidCharacter, parseOAuthError(gpa, "{\"error\":\"a\",\"error_uri\":\"has space\"}"));
+    try testing.expectError(error.InvalidJson, parseOAuthError(gpa, "]][not json"));
+    try testing.expectError(error.NotAnObject, parseOAuthError(gpa, "[\"error\"]"));
+}
+
+test "parseAuthorizationError: RFC 6749 section 4.1.2.1 example, decoding, success query" {
+    const gpa = testing.allocator;
+    // RFC example: error=access_denied&state=xyz
+    var e = (try parseAuthorizationError(gpa, "error=access_denied&state=xyz")).?;
+    defer e.deinit();
+    try testing.expectEqual(OAuthErrorCode.access_denied, e.code);
+    try testing.expectEqualStrings("xyz", e.state.?);
+    try testing.expect(e.description == null and e.uri == null);
+
+    var d = (try parseAuthorizationError(gpa, "code=ignored&error=server_error&error_description=It+broke%21+%28sorry%29" ++
+        "&error_uri=https%3A%2F%2Fidp.example%2Fe%3Fa%3D1&state=a%26b%3Dc&extra=1")).?;
+    defer d.deinit();
+    try testing.expectEqual(OAuthErrorCode.server_error, d.code);
+    try testing.expectEqualStrings("It broke! (sorry)", d.description.?);
+    try testing.expectEqualStrings("https://idp.example/e?a=1", d.uri.?);
+    try testing.expectEqualStrings("a&b=c", d.state.?);
+
+    var x = (try parseAuthorizationError(gpa, "error=interaction_required")).?;
+    defer x.deinit();
+    try testing.expectEqual(OAuthErrorCode.other, x.code);
+    try testing.expectEqualStrings("interaction_required", x.code_text);
+
+    // Success redirect: no `error` parameter.
+    try testing.expect((try parseAuthorizationError(gpa, "code=abc&state=xyz")) == null);
+    try testing.expect((try parseAuthorizationError(gpa, "")) == null);
+
+    try testing.expectError(error.InvalidField, parseAuthorizationError(gpa, "error="));
+    try testing.expectError(error.InvalidCharacter, parseAuthorizationError(gpa, "error=a%22b"));
+    try testing.expectError(error.InvalidCharacter, parseAuthorizationError(gpa, "error=a%00b"));
+    try testing.expectError(error.InvalidCharacter, parseAuthorizationError(gpa, "error=a%C3%A9"));
+    try testing.expectError(error.InvalidCharacter, parseAuthorizationError(gpa, "error=a&error_description=x%5Cy"));
+    try testing.expectError(error.InvalidCharacter, parseAuthorizationError(gpa, "error=a&error_uri=a+b"));
+    try testing.expectError(error.InvalidCharacter, parseAuthorizationError(gpa, "error=a&state=x%0Ay"));
+}
+
+test "parseTokenEndpointResponse: 200 ok, 400/401 error, other status refused" {
+    const gpa = testing.allocator;
+    var ok = try parseTokenEndpointResponse(gpa, 200, "{\"access_token\":\"at\",\"token_type\":\"Bearer\"}");
+    defer ok.deinit();
+    try testing.expectEqualStrings("at", ok.ok.access_token);
+
+    var e400 = try parseTokenEndpointResponse(gpa, 400, "{\"error\":\"invalid_grant\",\"error_description\":\"expired\"}");
+    defer e400.deinit();
+    try testing.expectEqual(OAuthErrorCode.invalid_grant, e400.err.code);
+    try testing.expectEqualStrings("expired", e400.err.description.?);
+
+    var e401 = try parseTokenEndpointResponse(gpa, 401, "{\"error\":\"invalid_client\"}");
+    defer e401.deinit();
+    try testing.expectEqual(OAuthErrorCode.invalid_client, e401.err.code);
+
+    try testing.expectError(error.UnexpectedStatus, parseTokenEndpointResponse(gpa, 500, "{\"error\":\"server_error\"}"));
+    try testing.expectError(error.UnexpectedStatus, parseTokenEndpointResponse(gpa, 302, ""));
+    try testing.expectError(error.MissingAccessToken, parseTokenEndpointResponse(gpa, 200, "{\"token_type\":\"Bearer\"}"));
+    try testing.expectError(error.MissingError, parseTokenEndpointResponse(gpa, 400, "{}"));
 }
 
 const id_token_issuer = "https://issuer.example";

@@ -4,7 +4,7 @@
 // github.com/golang-jwt/jwt/v5 (the reference; Go standard-library crypto
 // underneath) signing and verifying a typical access token, for the one
 // workload named by the second argument (`go.<alg>_<sign|verify>`, alg =
-// hs256, es256, eddsa), over the keys and claims the Zig program writes into
+// hs256, es256, es384, es512, eddsa, rs256, ps256), over the keys and claims the Zig program writes into
 // the directory given as the first. Prints one line: name, ns/op, 0 (no
 // cycle counter on this side, so the comparison is by wall time), and the
 // token length (sign) or 1 (verify).
@@ -24,7 +24,9 @@ import (
 	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/elliptic"
+	"crypto/rsa"
 	"fmt"
+	"math/big"
 	"os"
 	"path/filepath"
 	"runtime/debug"
@@ -103,11 +105,36 @@ func main() {
 		fmt.Fprintln(os.Stderr, "es256 key:", err)
 		os.Exit(1)
 	}
+	ec384, err := ecdsa.ParseRawPrivateKey(elliptic.P384(), slurp("es384.key"))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "es384 key:", err)
+		os.Exit(1)
+	}
+	ec521, err := ecdsa.ParseRawPrivateKey(elliptic.P521(), slurp("es512.key"))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "es512 key:", err)
+		os.Exit(1)
+	}
 	edKey := ed25519.NewKeyFromSeed(slurp("eddsa.seed"))
+	num := func(name string) *big.Int { return new(big.Int).SetBytes(slurp(name)) }
+	rsaKey := &rsa.PrivateKey{
+		PublicKey: rsa.PublicKey{N: num("rsa.n"), E: 65537},
+		D:         num("rsa.d"),
+		Primes:    []*big.Int{num("rsa.p"), num("rsa.q")},
+	}
+	rsaKey.Precompute()
+	if err := rsaKey.Validate(); err != nil {
+		fmt.Fprintln(os.Stderr, "rsa key:", err)
+		os.Exit(1)
+	}
 	algs := map[string]alg{
 		"hs256": {jwt.SigningMethodHS256, hmacKey, hmacKey},
 		"es256": {jwt.SigningMethodES256, ecKey, &ecKey.PublicKey},
+		"es384": {jwt.SigningMethodES384, ec384, &ec384.PublicKey},
+		"es512": {jwt.SigningMethodES512, ec521, &ec521.PublicKey},
 		"eddsa": {jwt.SigningMethodEdDSA, edKey, edKey.Public()},
+		"rs256": {jwt.SigningMethodRS256, rsaKey, &rsaKey.PublicKey},
+		"ps256": {jwt.SigningMethodPS256, rsaKey, &rsaKey.PublicKey},
 	}
 	claims := jwt.MapClaims{
 		"iss": issuer, "sub": "user-1234567890", "aud": audience,

@@ -6,15 +6,17 @@ parsing (RFC 7515 §3.1) into typed models, registered-claims validation
 (RFC 7519 §4.1), JWS signature verification (RFC 7515 §5.2 + RFC 7518)
 for **HS256/384/512** (HMAC-SHA-2), **ES256/ES384/ES512** (ECDSA P-256/P-384/P-521),
 **EdDSA** (Ed25519, RFC 8037), **RS256/384/512** (RSASSA-PKCS1-v1_5,
-RFC 8017 — the OIDC default) and **ML-DSA-44/65/87** (RFC 9964 — the
+RFC 8017 — the OIDC default), **PS256/384/512** (RSASSA-PSS, salt = hash
+length per RFC 7518 §3.5) and **ML-DSA-44/65/87** (RFC 9964 — the
 post-quantum FIPS-204 signatures, keys as `kty:"AKP"` JWKs), and **JWKS key
 sets** (RFC 7517): parse a
 `{"keys":[…]}` document into a typed `JwkSet`, select the key by the token
 header's `kid`, verify via `verifyWithJwks`/`parseVerifyJwks`. The signature
 core hand-rolls no crypto — `std.base64.url_safe_no_pad` for the segments,
-`std.json` for header/payload/JWKS, and `std.crypto` for the signatures (RSA
-via `std.crypto.Certificate.rsa`'s PKCS1-v1_5 verify over `std.crypto.ff`
-modexp), with two exceptions: **ES256**, which runs on the in-repo
+`std.json` for header/payload/JWKS, and `std.crypto` for the signatures,
+with these exceptions: **RS\*/PS\*** run on the in-repo `rsa` module
+(sign and verify; since 2026-10-13), **EdDSA signing** takes `R = r·B` from
+the `ct25519` comb (byte-identical to std's signer), and **ES256**, which runs on the in-repo
 `p256` module (byte-exact to `std.crypto.sign.ecdsa.EcdsaP256Sha256`, ~2.7×
 faster verify), and **ES512**, which runs on the in-repo `p521` module (std
 has no P-521) — see the Deps bullet below.
@@ -72,7 +74,9 @@ copied.
 - **Deps:** `http` (the `HttpFetcher` + the middleware's request/response
   types, and P7's `TokenRequest.method`), `router` (the middleware), `p256`
   (the fast ES256 curve — byte-exact to `std.crypto.sign.ecdsa.EcdsaP256Sha256`),
-  `p521` (ES512: P-521, which std lacks).
+  `p521` (ES512: P-521, which std lacks), `rsa` (RS\*/PS\* sign and verify;
+  `jwt.rsa` re-exports it for the key types), `ct25519` (the fixed-base comb
+  behind EdDSA signing).
   The signature core and P7's request/response builders need neither `http`
   nor `router`.
 
@@ -102,12 +106,14 @@ that. Never authorize from a `ParsedToken` alone.
 - **HMAC comparison is constant-time** (`std.crypto.timing_safe.eql`).
 - **JWS ECDSA signatures are the raw fixed-width `R‖S`** (RFC 7518 §3.4;
   32+32 for P-256, 48+48 for P-384) — not DER.
-- **RS\* signatures must be exactly the modulus length** (RFC 7518 §3.3);
+- **RS\*/PS\* signatures must be exactly the modulus length** (RFC 7518 §3.3, §3.5);
   the full EMSA-PKCS1-v1_5 encoding (`0x00 01 FF…FF 00 || DigestInfo`) is
   checked, including the SHA-2 OID — wrong length, `s ≥ n`, bad padding or
   a wrong-hash DigestInfo are all `BadSignature`. Keys are validated at
-  construction (2048/3072/4096-bit modulus; odd exponent in `[3, 2^32)`).
-- Unknown or not-yet-implemented algs (`PS*` — RSA-PSS) → `UnsupportedAlg`; wrong-length or garbage signatures →
+  construction (a 2048- to 4096-bit modulus; odd exponent in `[3, 2^32)`).
+  PS\* is checked with a salt exactly as long as the hash (RFC 7518 §3.5);
+  golang-jwt's verifier auto-detects the salt length, this one does not.
+- Unknown algs → `UnsupportedAlg`; wrong-length or garbage signatures →
   `BadSignature`, never a panic.
 - **JWKS selection cannot smuggle a mismatched key**: whatever
   `JwkSet.selectKey` resolves still goes through `verify`'s key-type check
@@ -141,7 +147,7 @@ ID-token acceptance).
 | `Key` | tagged union: `.hmac` (secret bytes) \| `.ecdsa_p256` \| `.ecdsa_p384` \| `.ecdsa_p521` \| `.ed25519` (std public keys) \| `.rsa` (`RsaPublicKey`) \| `.ml_dsa_44` / `.ml_dsa_65` / `.ml_dsa_87` (FIPS-204 public keys); constructors `ecdsaP256FromCoords(x, y)` / `ecdsaP384FromCoords(x, y)` / `ecdsaP521FromCoords(x, y)` (66-byte coordinates) / `ed25519FromBytes(x)` / `rsaFromModExp(n, e)` / `mlDsa44FromBytes(pub)` / `mlDsa65FromBytes(pub)` / `mlDsa87FromBytes(pub)` take exactly a JWK's decoded parameters (`KeyError.InvalidKey` on bad points/moduli/exponents/encodings). The tag binds the key TYPE to the token's `alg`, which is what closes algorithm confusion — including across the three ML-DSA parameter sets, where the tags are distinct types |
 | `verify(&parsed, key) VerifyError!void` | recompute/check the signature over `signing_input`; RFC 8725 defenses baked in |
 | `parseAndVerify(gpa, token, key, Options) !ParsedToken` | the one-call API: parse → verify → validateClaims; frees on any failure |
-| `encode(gpa, claims, SigningKey, EncodeOptions) EncodeError![]u8` / `encodeJson(gpa, claims_json, ...)` | token issuance (compact JWS): the `SigningKey` variant (`hs256/384/512`, `es256/384/512`, Ed25519, ML-DSA) fixes `alg`, `none` is unrepresentable; HMAC secrets shorter than the hash output are refused; `SigningKey.verificationKey()` gives the matching `Key`. No RS\* signing (std has none) — see SPEC.md |
+| `encode(gpa, claims, SigningKey, EncodeOptions) EncodeError![]u8` / `encodeJson(gpa, claims_json, ...)` | token issuance (compact JWS): the `SigningKey` variant (`hs256/384/512`, `es256/384/512`, Ed25519, ML-DSA, `rs256/384/512` over a `*const jwt.rsa.KeyPair`, `ps256/384/512` over `.{ .key, .random }` — PSS draws a salt) fixes `alg`, `none` is unrepresentable; HMAC secrets shorter than the hash output and RSA moduli below 2048 bits are refused; `SigningKey.verificationKey()` gives the matching `Key`; `SigningKey.sign(signing_input, &out)` signs an assembled JWS signing input (golang-jwt's `SigningMethod.Sign`) |
 | `parseJwks(gpa, json) JwksError!JwkSet` | parse an RFC 7517 `{"keys":[…]}` document — `kty` `RSA`/`EC`/`OKP`/`oct` and RFC 9964's `AKP` (ML-DSA, whose REQUIRED `alg` carries the parameter set and is never inferred from the key length); per-JWK problems skip that key (recorded in `skipped`), only a non-JWKS document errors |
 | `JwkSet` | `keys: []const Jwk` (converted, usable) + `skipped: []const SkippedJwk` (index + `JwkSkipReason`) + `deinit()`; one arena owns everything |
 | `Jwk` | `key: Key` + selection metadata: `kid`, `use` (`sig`/`enc`/`other`), `alg` (pinned `Alg`) |
@@ -171,6 +177,7 @@ ID-token acceptance).
 | `buildAuthorizationUrl(gpa, authorization_endpoint, AuthorizationRequest) ![]u8` | the full redirect URL (always `response_type=code`); percent-encoded, gpa-owned |
 | `buildTokenRequest(gpa, token_endpoint, TokenRequestParams) !TokenRequest` | the code→token exchange request (method/url/content_type/body — no I/O, `+deinit`); `ClientAuth` = `.none` (public/PKCE-only) \| `.client_secret_post` |
 | `parseTokenResponse(gpa, json) TokenResponseError!TokenResponse` | parse a 200-status token-endpoint body: `access_token`/`token_type` (required) + `id_token`/`expires_in`/`refresh_token`/`scope` (optional) |
+| `parseTokenEndpointResponse(gpa, status, body)` | status-aware entry: 200 → `.ok` (`TokenResponse`), 400/401 → `.err` (`OAuthError`: `code`, `code_text`, `description`, `uri`; RFC 6749 §5.2), else `error.UnexpectedStatus`; `parseOAuthError(gpa, json)` and `parseAuthorizationError(gpa, query)` (§4.1.2.1 redirect query, `null` on success) are the building blocks |
 | `acceptIdToken(gpa, id_token, key, IdTokenOptions) IdTokenError!ParsedToken` | RP-side ID Token acceptance (OIDC Core §3.1.3.7) over a direct `Key` — reuses `parseAndVerify`, then enforces `azp` (multi-`aud`) + mandatory `nonce` match |
 | `acceptIdTokenJwks(gpa, id_token, jwks, IdTokenOptions) IdTokenError!ParsedToken` | same, over a `JwkSet` — reuses `parseVerifyJwks` |
 | `acceptIdTokenProvider(provider, gpa, id_token, now_s, IdTokenProviderOptions) !ParsedToken` | same, over the turnkey `Provider` — reuses `Provider.verify` (issuer enforced automatically) |

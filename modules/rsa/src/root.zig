@@ -306,6 +306,13 @@ pub const PublicKey = struct {
         return try PublicKey.fromDer(block.der());
     }
 
+    /// The verify-only form of this key: same modulus, same exponent, no
+    /// `ff` constants (see `VerifyKey`). For a holder of a `KeyPair` that
+    /// hands its public half to a verifier that takes a `VerifyKey`.
+    pub fn verifyKey(pk: *const PublicKey) VerifyKey {
+        return .{ .mp = pk.n_mont, .e = pk.publicExponent() };
+    }
+
     /// `e` as the `u32` every constructor validated it to fit.
     fn publicExponent(pk: PublicKey) u32 {
         return pk.e.toPrimitive(u32) catch unreachable; // < 2^32 since fromBytes

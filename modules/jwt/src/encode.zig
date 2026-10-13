@@ -7,18 +7,22 @@
 //! variant, never from the caller alone, and there is no way to produce
 //! `alg: "none"`. An HMAC secret shorter than the hash output is refused
 //! (RFC 7518 §3.2: "A key of the same size as the hash output ... or larger
-//! MUST be used"). Signatures are deterministic (no noise argument): ECDSA
-//! per RFC 6979 as std implements it, Ed25519 by construction, ML-DSA in its
-//! deterministic mode — so the same input yields the same token, which is
-//! what a test wants and costs a production issuer nothing it relies on.
+//! MUST be used"). Signatures are deterministic except PS*: ECDSA per RFC
+//! 6979 as std implements it, Ed25519 by construction, ML-DSA in its
+//! deterministic mode, RS* (PKCS#1 v1.5) by construction — so the same input
+//! yields the same token, which is what a test wants and costs a production
+//! issuer nothing it relies on. PS* (RSASSA-PSS) draws a fresh salt per
+//! signature (RFC 7518 §3.5: salt length = hash length), so its key carries
+//! the caller's CSPRNG (`RsaPss`).
 //!
-//! Not offered: RS*/PS* (std has no RSA signing; the `rsa` module does, but
-//! pulling it in as a dependency is a separate change) — the same gap
-//! `verify` has. ES512 signs through the `p521` module.
+//! RS* and PS* sign through the `rsa` module (CRT with base blinding and the
+//! Bellcore fault check, which surfaces as `SigningFailed`); ES512 through
+//! the `p521` module.
 
 const std = @import("std");
 const root = @import("root.zig");
 const burn = @import("burn.zig");
+const ct25519 = @import("ct25519");
 
 const hmac_sha2 = std.crypto.auth.hmac.sha2;
 const b64 = std.base64.url_safe_no_pad.Encoder;
@@ -46,6 +50,42 @@ pub const SigningKey = union(enum) {
     ml_dsa_44: *const root.MlDsa44.KeyPair,
     ml_dsa_65: *const root.MlDsa65.KeyPair,
     ml_dsa_87: *const root.MlDsa87.KeyPair,
+    /// RSASSA-PKCS1-v1_5 with SHA-256/384/512 (RFC 7518 §3.3). The modulus
+    /// must be 2048 bits or more (`InvalidKey` otherwise), as for verifying.
+    rs256: *const root.rsa.KeyPair,
+    rs384: *const root.rsa.KeyPair,
+    rs512: *const root.rsa.KeyPair,
+    /// RSASSA-PSS with SHA-256/384/512, MGF1 over the same hash, salt as long
+    /// as the hash (RFC 7518 §3.5).
+    ps256: RsaPss,
+    ps384: RsaPss,
+    ps512: RsaPss,
+
+    /// A PS* signing key: the borrowed RSA key pair and the CSPRNG that
+    /// draws the PSS salt and the RSA blinding factor. `random` MUST be
+    /// cryptographically secure (`std.Random.DefaultCsprng` seeded from OS
+    /// entropy, or `std.Io`'s secure source).
+    pub const RsaPss = struct {
+        key: *const root.rsa.KeyPair,
+        random: std.Random,
+    };
+
+    /// The longest signature any variant produces (ML-DSA-87's), for a
+    /// caller-side buffer to `sign` into.
+    pub const max_signature_len = maxSignatureLen();
+
+    /// Sign an already assembled JWS signing input (`b64(header) '.'
+    /// b64(payload)`, RFC 7515 §5.1 step 5) — golang-jwt's
+    /// `SigningMethod.Sign`. For a JWS whose payload is not a JSON object or
+    /// whose header carries members `EncodeOptions` does not; `encode` and
+    /// `encodeJson` are the JWT path and call this. Returns the raw signature
+    /// in `out` (base64url-encode it for the compact form). The header's `alg`
+    /// is the caller's to get right here: it must be `k.alg()`.
+    // secret-api-ok: SigningKey is a union of BORROWED slices / pointers (see its doc comment); a by-value copy copies a pointer, never key bytes
+    pub fn sign(k: SigningKey, signing_input: []const u8, out: *[max_signature_len]u8) EncodeError![]const u8 {
+        try checkKey(k);
+        return signInput(k, signing_input, out);
+    }
 
     // secret-api-ok: SigningKey is a union of BORROWED slices / pointers (see its doc comment); a by-value copy copies a pointer, never key bytes
     pub fn alg(k: SigningKey) root.Alg {
@@ -60,11 +100,19 @@ pub const SigningKey = union(enum) {
             .ml_dsa_44 => .@"ML-DSA-44",
             .ml_dsa_65 => .@"ML-DSA-65",
             .ml_dsa_87 => .@"ML-DSA-87",
+            .rs256 => .RS256,
+            .rs384 => .RS384,
+            .rs512 => .RS512,
+            .ps256 => .PS256,
+            .ps384 => .PS384,
+            .ps512 => .PS512,
         };
     }
 
     /// The matching verification key, for a caller that issues and verifies
-    /// (or tests a round trip). A borrowed HMAC secret stays borrowed.
+    /// (or tests a round trip). A borrowed HMAC secret stays borrowed. An RSA
+    /// key below 2048 bits, which `encode` refuses too, has none: `.hmac = ""`
+    /// stands in, which every `verify` rejects.
     // secret-api-ok: SigningKey is a union of BORROWED slices / pointers (see its doc comment); a by-value copy copies a pointer, never key bytes
     pub fn verificationKey(k: SigningKey) root.Key {
         return switch (k) {
@@ -76,6 +124,8 @@ pub const SigningKey = union(enum) {
             .ml_dsa_44 => |kp| .{ .ml_dsa_44 = kp.public_key },
             .ml_dsa_65 => |kp| .{ .ml_dsa_65 = kp.public_key },
             .ml_dsa_87 => |kp| .{ .ml_dsa_87 = kp.public_key },
+            .rs256, .rs384, .rs512 => |kp| root.Key.rsaFromPublicKey(&kp.public_key) catch .{ .hmac = "" },
+            .ps256, .ps384, .ps512 => |p| root.Key.rsaFromPublicKey(&p.key.public_key) catch .{ .hmac = "" },
         };
     }
 };
@@ -90,11 +140,13 @@ pub const EncodeOptions = struct {
 };
 
 pub const EncodeError = error{
-    /// An HMAC secret shorter than its hash output, or empty.
+    /// An HMAC secret shorter than its hash output, or empty; an RSA modulus
+    /// below 2048 bits.
     InvalidKey,
     /// `encodeJson`: the claims are not one JSON object.
     InvalidClaims,
-    /// The signature primitive refused (a key pair whose halves disagree).
+    /// The signature primitive refused (a key pair whose halves disagree, an
+    /// RSA fault caught by the CRT check).
     SigningFailed,
     OutOfMemory,
 };
@@ -139,7 +191,7 @@ pub fn encodeJson(gpa: std.mem.Allocator, claims_json: []const u8, key: SigningK
     const signing_input = out[0..n];
 
     var sig_buf: [sig_max]u8 = undefined;
-    const sig = try sign(key, signing_input, &sig_buf);
+    const sig = try signInput(key, signing_input, &sig_buf);
     out[n] = '.';
     n += 1;
     n += b64.encode(out[n..], sig).len;
@@ -154,6 +206,16 @@ fn maxSignatureLen() usize {
 }
 
 fn checkKey(key: SigningKey) EncodeError!void {
+    const rsa_kp: ?*const root.rsa.KeyPair = switch (key) {
+        .rs256, .rs384, .rs512 => |kp| kp,
+        .ps256, .ps384, .ps512 => |p| p.key,
+        else => null,
+    };
+    if (rsa_kp) |kp| {
+        // RFC 7518 §3.3/§3.5; the same floor `Key.rsaFromModExp` applies.
+        if (kp.secret_key.n.bits() < 2048) return error.InvalidKey;
+        return;
+    }
     const min: usize = switch (key) {
         .hs256 => hmac_sha2.HmacSha256.mac_length,
         .hs384 => hmac_sha2.HmacSha384.mac_length,
@@ -172,7 +234,7 @@ fn checkKey(key: SigningKey) EncodeError!void {
 /// and measurements in `burn.zig`). The bodies are separate so that one
 /// frame does not grow to the largest algorithm's (ML-DSA's locals are
 /// hundreds of KiB): a burn only reaches as deep as its body is wide.
-fn sign(key: SigningKey, input: []const u8, buf: []u8) EncodeError![]const u8 {
+fn signInput(key: SigningKey, input: []const u8, buf: []u8) EncodeError![]const u8 {
     const R = EncodeError![]const u8;
     switch (key) {
         .hs256 => |s| return burn.run(burn.hmac_burn, R, mac, .{ hmac_sha2.HmacSha256, s, input, buf }),
@@ -183,17 +245,83 @@ fn sign(key: SigningKey, input: []const u8, buf: []u8) EncodeError![]const u8 {
         // p521's `sign` burns its own body (24 KiB); this burn covers the
         // frame above it.
         .es512 => |kp| return burn.run(burn.ec_burn, R, signEc, .{ kp, input, buf }),
-        .ed25519 => |kp| return burn.run(burn.ec_burn, R, signEc, .{ kp, input, buf }),
+        .ed25519 => |kp| return burn.run(burn.ec_burn, R, signEd25519, .{ kp, input, buf }),
         .ml_dsa_44 => |kp| return burn.run(burn.mldsa44_burn, R, signMlDsa, .{ kp, input, buf }),
         .ml_dsa_65 => |kp| return burn.run(burn.mldsa65_burn, R, signMlDsa, .{ kp, input, buf }),
         .ml_dsa_87 => |kp| return burn.run(burn.mldsa87_burn, R, signMlDsa, .{ kp, input, buf }),
+        // The `rsa` module burns its private operation's own stack; this
+        // burn covers the EMSA encoding frame above it.
+        .rs256 => |kp| return burn.run(burn.ec_burn, R, signRsaPkcs1, .{ std.crypto.hash.sha2.Sha256, kp, input, buf }),
+        .rs384 => |kp| return burn.run(burn.ec_burn, R, signRsaPkcs1, .{ std.crypto.hash.sha2.Sha384, kp, input, buf }),
+        .rs512 => |kp| return burn.run(burn.ec_burn, R, signRsaPkcs1, .{ std.crypto.hash.sha2.Sha512, kp, input, buf }),
+        .ps256 => |p| return burn.run(burn.ec_burn, R, signRsaPss, .{ std.crypto.hash.sha2.Sha256, p, input, buf }),
+        .ps384 => |p| return burn.run(burn.ec_burn, R, signRsaPss, .{ std.crypto.hash.sha2.Sha384, p, input, buf }),
+        .ps512 => |p| return burn.run(burn.ec_burn, R, signRsaPss, .{ std.crypto.hash.sha2.Sha512, p, input, buf }),
     }
+}
+
+fn signRsaPkcs1(comptime H: type, kp: *const root.rsa.KeyPair, input: []const u8, buf: []u8) EncodeError![]const u8 {
+    return root.rsa.signPkcs1v15(&kp.secret_key, H, input, buf) catch error.SigningFailed;
+}
+
+fn signRsaPss(comptime H: type, p: SigningKey.RsaPss, input: []const u8, buf: []u8) EncodeError![]const u8 {
+    return root.rsa.signPss(&p.key.secret_key, H, p.random, input, H.digest_length, buf) catch error.SigningFailed;
 }
 
 /// ES256 / ES384 / ES512 / Ed25519. JWS ECDSA signatures are the raw fixed-width R‖S
 /// (RFC 7518 §3.4), which is what `Signature.toBytes` yields — not DER.
 fn signEc(kp: anytype, input: []const u8, buf: []u8) EncodeError![]const u8 {
     return put(buf, &((kp.sign(input, null) catch return error.SigningFailed).toBytes()));
+}
+
+/// Ed25519 (RFC 8032 §5.1.6), std's algorithm step for step — so the
+/// signature is byte-identical to `std.crypto.sign.Ed25519.KeyPair.sign(msg,
+/// null)` — with one substitution: `R = r·B` runs on `ct25519.mulBase`, a
+/// constant-time fixed-base comb (~3× std's window ladder, ct25519 SPEC "C3"),
+/// instead of `Edwards25519.basePoint.mul`. That multiplication was most of
+/// EdDSA signing (bench-jwt 2026-10-10: `eddsa_sign` 1.6× golang-jwt). The
+/// scalar, prefix and nonce are wiped here; the frame is burned by the caller.
+fn signEd25519(kp: *const root.Ed25519.KeyPair, input: []const u8, buf: []u8) EncodeError![]const u8 {
+    const Curve = std.crypto.ecc.Edwards25519;
+    const Sha512 = std.crypto.hash.sha2.Sha512;
+    // std's KeyPair.sign refuses a pair whose halves disagree; so does this.
+    const pk = kp.public_key.toBytes();
+    if (!std.mem.eql(u8, &kp.secret_key.publicKeyBytes(), &pk)) return error.SigningFailed;
+
+    // (a, prefix) = SHA-512(seed), a clamped.
+    var az: [64]u8 = undefined;
+    defer std.crypto.secureZero(u8, &az);
+    var seed = kp.secret_key.seed();
+    defer std.crypto.secureZero(u8, &seed);
+    Sha512.hash(&seed, &az, .{});
+    var a = az[0..32].*;
+    defer std.crypto.secureZero(u8, &a);
+    Curve.scalar.clamp(&a);
+
+    // r = SHA-512(prefix || M) mod L; R = r·B.
+    var r64: [64]u8 = undefined;
+    defer std.crypto.secureZero(u8, &r64);
+    var h = Sha512.init(.{});
+    h.update(az[32..64]);
+    h.update(input);
+    h.final(&r64);
+    var r = Curve.scalar.reduce64(r64);
+    defer std.crypto.secureZero(u8, &r);
+    const big_r = ct25519.mulBase(r);
+    // std's `basePoint.mul` fails on the identity (r ≡ 0 mod L, probability
+    // 2^-252); keep the same refusal.
+    big_r.rejectIdentity() catch return error.SigningFailed;
+    const r_bytes = big_r.toBytes();
+
+    // S = r + SHA-512(R || A || M)·a mod L.
+    var k64: [64]u8 = undefined;
+    h = Sha512.init(.{});
+    h.update(&r_bytes);
+    h.update(&pk);
+    h.update(input);
+    h.final(&k64);
+    const s = Curve.scalar.mulAdd(Curve.scalar.reduce64(k64), a, r);
+    return put(buf, &(r_bytes ++ s));
 }
 
 /// ML-DSA through the streaming signer, which reads the secret key in place:
@@ -307,4 +435,19 @@ test "encodeJson: verbatim payload, deterministic output, known HS256 bytes" {
     opts.issuer = .any;
     var parsed = try root.parseAndVerify(testing.allocator, t1, .{ .hmac = &k }, opts);
     defer parsed.deinit();
+}
+
+test "Ed25519: the comb signer is byte-identical to std's KeyPair.sign" {
+    var seed: [32]u8 = undefined;
+    var msg: [300]u8 = undefined;
+    for (0..64) |i| {
+        for (&seed, 0..) |*b, j| b.* = @truncate(i *% 31 +% j *% 7 +% 1);
+        for (&msg, 0..) |*b, j| b.* = @truncate(j *% 13 +% i);
+        const kp = try root.Ed25519.KeyPair.generateDeterministic(seed);
+        const m = msg[0 .. i * 4];
+        var out: [SigningKey.max_signature_len]u8 = undefined;
+        const ours = try (SigningKey{ .ed25519 = &kp }).sign(m, &out);
+        const want = (try kp.sign(m, null)).toBytes();
+        try testing.expectEqualSlices(u8, &want, ours);
+    }
 }

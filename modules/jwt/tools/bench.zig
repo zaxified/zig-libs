@@ -13,7 +13,8 @@
 //! `tools/go_bench/main.go`, is copied into `.zig-cache/bench-jwt/go/` and
 //! built there. Run from the repository root.
 //!
-//! Workloads, for HS256, ES256 and EdDSA, over the same keys on both sides
+//! Workloads, for HS256, ES256, ES384, ES512, EdDSA, RS256 and PS256 (since
+//! 2026-10-13; HS256/ES256/EdDSA before), over the same keys on both sides
 //! and a typical access token (iss, sub, aud, exp, nbf, iat, scope):
 //!   <alg>_sign    `encodeJson(gpa, claims, key, .{})` (+ free) vs
 //!                 `jwt.NewWithClaims(...).SignedString(key)`
@@ -21,7 +22,8 @@
 //!                 (+ deinit) vs `jwt.Parse` with the method pinned and
 //!                 `WithIssuer`/`WithAudience`/`WithExpirationRequired`
 //! Ours allocates from `std.heap.smp_allocator`; Go's side runs under its GC.
-//! Keys and claims are written into `.zig-cache/bench-jwt/` from fixed seeds.
+//! Keys and claims are written into `.zig-cache/bench-jwt/` from fixed seeds;
+//! the RSA key (2048 bits) is RFC 7520 §3.4's, as raw n/d/p/q for Go.
 //!
 //! Method (shared driver at the bottom): each side doubles its batch until it
 //! takes over 100 ms and keeps the best of five; per workload the sides
@@ -41,7 +43,20 @@ const audience = "api.example.com";
 const claims_json =
     \\{"aud":"api.example.com","exp":4102444800,"iat":1700000000,"iss":"https://issuer.example.com","nbf":1700000000,"scope":"read write","sub":"user-1234567890"}
 ;
-const algs = [_][]const u8{ "hs256", "es256", "eddsa" };
+const algs = [_][]const u8{ "hs256", "es256", "es384", "es512", "eddsa", "rs256", "ps256" };
+
+/// RFC 7520 §3.4 (Figure 4), base64url.
+const rsa_n = "n4EPtAOCc9AlkeQHPzHStgAbgs7bTZLwUBZdR8_KuKPEHLd4rHVTeT-O-XV2jRojdNhxJWTDvNd7nqQ0VEiZQHz_" ++ "AJmSCpMaJMRBSFKrKb2wqVwGU_NsYOYL-QtiWN2lbzcEe6XC0dApr5ydQLrHqkHHig3RBordaZ6Aj-oBHqFEHYpP" ++ "e7Tpe-OfVfHd1E6cS6M1FZcD1NNLYD5lFHpPI9bTwJlsde3uhGqC0ZCuEHg8lhzwOHrtIQbS0FVbb9k3-tVTU4fg" ++ "_3L_vniUFAKwuCLqKnS2BYwdq_mzSnbLY7h_qixoR7jig3__kRhuaxwUkRz5iaiQkqgc5gHdrNP5zw";
+const rsa_d = "bWUC9B-EFRIo8kpGfh0ZuyGPvMNKvYWNtB_ikiH9k20eT-O1q_I78eiZkpXxXQ0UTEs2LsNRS-8uJbvQ-A1irkwM" ++ "SMkK1J3XTGgdrhCku9gRldY7sNA_AKZGh-Q661_42rINLRCe8W-nZ34ui_qOfkLnK9QWDDqpaIsA-bMwWWSDFu2M" ++ "UBYwkHTMEzLYGqOe04noqeq1hExBTHBOBdkMXiuFhUq1BU6l-DqEiWxqg82sXt2h-LMnT3046AOYJoRioz75tSUQ" ++ "fGCshWTBnP5uDjd18kKhyv07lhfSJdrPdM5Plyl21hsFf4L_mHCuoFau7gdsPfHPxxjVOcOpBrQzwQ";
+const rsa_p = "3Slxg_DwTXJcb6095RoXygQCAZ5RnAvZlno1yhHtnUex_fp7AZ_9nRaO7HX_-SFfGQeutao2TDjDAWU4Vupk8rw9" ++ "JR0AzZ0N2fvuIAmr_WCsmGpeNqQnev1T7IyEsnh8UMt-n5CafhkikzhEsrmndH6LxOrvRJlsPp6Zv8bUq0k";
+const rsa_q = "uKE2dh-cTf6ERF4k4e_jy78GfPYUIaUyoSSJuBzp3Cubk3OCqs6grT8bR_cu0Dm1MZwWmtdqDyI95HrUeq3MP15v" ++ "MMON8lHTeZu2lmKvwqW7anV5UzhM1iZ7z4yMkuUwFWoBvyY898EXvRD-hdqRxHlSqAZ192zB3pVFJ0s7pFc";
+
+fn b64Alloc(arena: std.mem.Allocator, s: []const u8) ![]u8 {
+    const dec = std.base64.url_safe_no_pad.Decoder;
+    const out = try arena.alloc(u8, try dec.calcSizeForSlice(s));
+    try dec.decode(out, s);
+    return out;
+}
 
 const Op = struct { alg: usize, verify: bool };
 
@@ -91,11 +106,39 @@ pub fn main(init: std.process.Init) !u8 {
     r.bytes(&ed_seed);
     const ed_kp = try arena.create(jwt.Ed25519.KeyPair);
     ed_kp.* = try jwt.Ed25519.KeyPair.generateDeterministic(ed_seed);
+    var ec384_seed: [jwt.EcdsaP384Sha384.KeyPair.seed_length]u8 = undefined;
+    r.bytes(&ec384_seed);
+    const ec384_kp = try arena.create(jwt.EcdsaP384Sha384.KeyPair);
+    ec384_kp.* = try jwt.EcdsaP384Sha384.KeyPair.generateDeterministic(ec384_seed);
+    var ec521_seed: [jwt.EcdsaP521Sha512.KeyPair.seed_length]u8 = undefined;
+    r.bytes(&ec521_seed);
+    const ec521_kp = try arena.create(jwt.EcdsaP521Sha512.KeyPair);
+    try jwt.EcdsaP521Sha512.KeyPair.generateDeterministicInto(ec521_kp, &ec521_seed);
+    const n = try b64Alloc(arena, rsa_n);
+    const rsa_kp = try arena.create(jwt.rsa.KeyPair);
+    try jwt.rsa.SecretKey.fromPrimes(&rsa_kp.secret_key, try b64Alloc(arena, rsa_p), try b64Alloc(arena, rsa_q), &.{ 1, 0, 1 });
+    rsa_kp.public_key = try jwt.rsa.PublicKey.fromBytes(n, &.{ 1, 0, 1 });
+    // PS256's salt and blinding: a fixed-seed CSPRNG (a bench, not a key).
+    var csprng = std.Random.DefaultCsprng.init([_]u8{0x5a} ** 32);
     try dir.writeFile(io, .{ .sub_path = "hs256.key", .data = &hmac_key });
     try dir.writeFile(io, .{ .sub_path = "es256.key", .data = &ec_kp.secret_key.toBytes() });
+    try dir.writeFile(io, .{ .sub_path = "es384.key", .data = &ec384_kp.secret_key.toBytes() });
+    try dir.writeFile(io, .{ .sub_path = "es512.key", .data = &ec521_kp.secret_key.toBytes() });
     try dir.writeFile(io, .{ .sub_path = "eddsa.seed", .data = &ed_seed });
+    try dir.writeFile(io, .{ .sub_path = "rsa.n", .data = n });
+    try dir.writeFile(io, .{ .sub_path = "rsa.d", .data = try b64Alloc(arena, rsa_d) });
+    try dir.writeFile(io, .{ .sub_path = "rsa.p", .data = try b64Alloc(arena, rsa_p) });
+    try dir.writeFile(io, .{ .sub_path = "rsa.q", .data = try b64Alloc(arena, rsa_q) });
 
-    var ctx: Ctx = .{ .signing = .{ .{ .hs256 = &hmac_key }, .{ .es256 = ec_kp }, .{ .ed25519 = ed_kp } }, .tokens = undefined };
+    var ctx: Ctx = .{ .signing = .{
+        .{ .hs256 = &hmac_key },
+        .{ .es256 = ec_kp },
+        .{ .es384 = ec384_kp },
+        .{ .es512 = ec521_kp },
+        .{ .ed25519 = ed_kp },
+        .{ .rs256 = rsa_kp },
+        .{ .ps256 = .{ .key = rsa_kp, .random = csprng.random() } },
+    }, .tokens = undefined };
     for (algs, 0..) |a, i| {
         ctx.tokens[i] = try jwt.encodeJson(arena, claims_json, ctx.signing[i], .{});
         try dir.writeFile(io, .{ .sub_path = try std.fmt.allocPrint(arena, "zig_{s}.jwt", .{a}), .data = ctx.tokens[i] });

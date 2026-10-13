@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-13** — PS256/384/512 verification and RS256/384/512 + PS256/384/512 signing through the `rsa` module (new dep; `jwt.rsa` re-exported); `SigningKey.sign` for a raw signing input; RFC 7520 §4.1 (RS256, byte-exact signer) and §4.2 (PS384) vectors. BREAKING: `RsaPublicKey.inner` is now `rsa.VerifyKey` (was std's `Certificate.rsa.PublicKey`, whose PSS verify asserts on 8k+1-bit moduli) and RSA keys are accepted from 2048 to 4096 bits (were 256/384/512-byte moduli, i.e. 2041+). EdDSA signing takes `R = r·B` from the `ct25519` comb (new dep): byte-identical to std, ~1.6× faster. OAuth2 error responses: `parseOAuthError` (RFC 6749 §5.2), `parseAuthorizationError` (§4.1.2.1), `parseTokenEndpointResponse`. `bench-jwt` covers ES384/ES512/RS256/PS256 too. Card Scope core → parity.
 - **2026-10-12** — `http.Method` grew `.connect`, `.trace`, `.other` (http R9): under
   `ResourceServer` `protect = .mutations` TRACE is a read (RFC 9110 §9.2.1), CONNECT and any
   extension method need a token (fail closed).
