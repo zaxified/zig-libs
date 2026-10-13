@@ -85,7 +85,7 @@ server: createRegistrationResponse(request, server_pk,
                                    credential_identifier, oprf_seed)
                                                          → response
 client: finalizeRegistrationRequest(password, blind, response,
-                                    identities, envelope_nonce)
+                                    identities, envelope_nonce, ksf)
                                                          → {record, export_key}
 ```
 
@@ -140,8 +140,7 @@ an `Allocator` and a `std.Io`), so it lives on the CALLER's side of
 to a real one without acquiring that dependency, it doesn't default to
 anything: a caller reaching for `Ksf.identity` outside a test has to
 write that name, not get it by omission (`.{}` does not compile — see
-`Ksf.identity`'s doc comment and `A1/opaque.md`'s M6 dispozice for the
-compile-error proof). See `kat_test.zig`'s `Argon2Ksf` for a worked
+`Ksf.identity`'s doc comment). See `kat_test.zig`'s `Argon2Ksf` for a worked
 example (used by two tests: a real Argon2id round-trip that still
 agrees on both sides and demonstrably changes
 `session_key`/`export_key`, and one proving `error.KsfFailed`
@@ -298,13 +297,13 @@ design); registers and the red zone below the stack pointer.
   ciphersuite `voprf` does not build.
 - ~~**Non-Identity KSFs** (Argon2id/scrypt): parameter policy belongs
   to the consumer; seam documented above.~~ **Now pluggable, 2026-09-15**
-  (A1/opaque.md M6): `Ksf`, see above — the CONCRETE
+  (audit finding M6): `Ksf`, see above — the CONCRETE
   algorithm/parameter choice is still the consumer's, this module never
   picks one, but the seam is now a public callback instead of "edit
   `randomizedPassword`".
 - ~~**The "Fake" credential flow KATs** (C.2): the fake-record response
   is a server policy using the same `generateKE2` code path; nothing
-  new to pin.~~ **Incorrect, fixed 2026-09-10** (A1/opaque.md L3): C.2.1
+  new to pin.~~ **Incorrect, fixed 2026-09-10** (audit finding L3): C.2.1
   (ristretto255) runs and is pinned (`kat_test.zig`) — it is the only
   vector in this suite exercising the §6.3.2.2 user-enumeration defense
   end-to-end, which C.1's "Real" vectors structurally cannot (there is no

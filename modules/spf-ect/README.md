@@ -68,10 +68,10 @@ const path = try spf.shortestPath(gpa, &g, 0, 2); // [0, 1, 2]
 defer gpa.free(path);
 
 var tree = try spf.shortestPathTree(gpa, &g, 0);
-defer tree.deinit(gpa);
+defer tree.deinit();
 
 var pair = try spf.disjointTrees(gpa, &g, 0); // primary + PRP second tree
-defer for (&pair) |*t| t.deinit(gpa);
+defer for (&pair) |*t| t.deinit();
 ```
 
 `comparePaths` and `comparePathsDisjoint` are public: the ordering is the
@@ -123,8 +123,8 @@ of the topology, not of the comparator.
 ## Verify
 
 ```
-zig build test-spf-ect                          # Debug       — 18 pass
-zig build test-spf-ect -Doptimize=ReleaseFast   # ReleaseFast — 18 pass
+zig build test-spf-ect                          # Debug
+zig build test-spf-ect -Doptimize=ReleaseFast   # ReleaseFast
 ```
 
 The property harness is the real check: reversal symmetry, strict-total-order

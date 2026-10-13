@@ -16,7 +16,7 @@
 **Downstream consumer:** no
 
 OPC-UA (IEC 62541 / OPC 10000) binary client **and** server. Usage: see
-./README.md. Attribution/provenance: see /NOTICE.
+./README.md. Attribution/provenance: see this module's [`NOTICE`](NOTICE) and README "Provenance" (root `NOTICE` has no opcua entry).
 
 ## Compared with
 

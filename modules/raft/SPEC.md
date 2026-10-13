@@ -165,7 +165,7 @@ by `onTimer` (`role == .leader` → return, deliberately not re-armed, so a
 step-down starts a fresh full timeout rather than the remainder of a stale one).
 So from one timeout after its election, a leader's only route back to an armed
 timer is a step-down that re-arms — every path that sets `role = .follower`
-therefore goes through `server.zig`'s `stepDown`. A step-down that skips the
+therefore went through the plumbing's `stepDown` (today: `Node.becomeFollower`, `node.zig`). A step-down that skips the
 re-arm produces a node that is **not wedged in any way a crash test can see**:
 it answers every RPC correctly and is simply never electable again, so if the
 rest of the cluster is gone the cluster is dead with a healthy-looking node in
@@ -320,8 +320,8 @@ Pure-logic + model-checking (CONVENTIONS.md §7): unit tests for codecs / log /
 checkers / the safety kernel (one test per documented wrong-but-plausible
 implementation, including the Figure-8 counterexample and the
 duplicated-AppendEntries rollback trap), plus `netsim` property + shrink +
-seed-sweep teeth tests. `scripts/modtest raft` 2026-10-04: 82 pass, 0 skip, LLVM
-Debug (~1 min; the harness ticks every 10 time units) — including the
+seed-sweep teeth tests. `scripts/modtest raft` (LLVM Debug, ~1 min as of 2026-10-04; the
+harness ticks every 10 time units) — including the
 real-`RaftServer` model-check tests (a 300-seed
 fuzzed fault sweep enforcing all five invariants live, a quiet-network
 election-liveness run, and the two step-down regressions, which drive a real
@@ -368,12 +368,12 @@ linearizable reads are the core items, still in the Backlog.
    never saw either. **Every liveness property this module relies on needs its
    own event-shaped test** — drive the cluster into the situation, advance time
    or deliver the next message, and assert the good thing HAPPENS. Two exist
-   (`re-arms its election timer`, `CLEARS votedFor`); the general property that
+   (`a leader demoted by a RESPONSE … stands for election again`, `CLEARS votedFor`); the general property that
    would subsume them does not.
 3. Membership changes (§6) — wire `jointMajority` in: joint consensus,
    config-entry semantics, fuzz churn. Note for whoever does it: a config change
    that removes this node from the voter set is another `role = .follower` site,
-   and must go through `stepDown` (or deliberately stop the timer) — see the
+   and must go through `Node.becomeFollower` (or deliberately stop the timer) — see the
    re-arm rule above.
 4. ~~Client command proposals in the harness (today only leader no-ops populate
    the log).~~ **Done** — `RaftConfig.propose_client_commands` (default on) makes

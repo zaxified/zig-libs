@@ -17,7 +17,7 @@
 **Downstream consumer:** no
 
 Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see
-/NOTICE.
+this module's [`NOTICE`](NOTICE) (root `NOTICE` has no `tc` entry).
 
 ## Compared with
 
@@ -607,8 +607,8 @@ formulas, the attribute emission order (including the per-action-kind order and 
 1-based ordinal numbering) and the client-side dump-filter rules. No source
 was copied; the algorithms are re-derived and re-expressed here, and the goldens are the
 independent check that the behaviour matches. The v1 statement that no third-party
-implementation was consulted no longer holds; `/NOTICE`'s `tc` entry carries the matching
-`design ref: iproute2` declaration required by CONVENTIONS §5.
+implementation was consulted no longer holds; this module's `NOTICE` carries the matching
+"Design reference — iproute2" declaration required by CONVENTIONS §5.
 
 ## Status
 

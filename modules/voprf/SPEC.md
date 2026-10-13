@@ -250,10 +250,11 @@ them" (*Modes built*); that is not a design refusal, so each is a backlog item.
   the suite also needs `expand_message_xmd` over SHA-256 (the local one is
   SHA-512-only, limited to 64 output bytes). Moderate; pure Zig; unblocks `opaque`'s P-256 configuration too.
 - **P384-SHA384 and P521-SHA512 suites (§4.4, §4.5)** *(survey 2026-09-30)*. No
-  sibling curve module for either (`ls modules/` shows only `p256`). Zig 0.16's
+  sibling module for P-384 (`ls modules/` shows `p256` and `p521`). Zig 0.16's
   `std.crypto.ecc.P384` exists (checked in `lib/std/crypto/pcurves/p384.zig`), so
-  P-384 needs only hash-to-curve plus the suite wiring; `std` has no P-521, so P521
-  would need a new curve. P-384 is the Privacy Pass choice *(inferred, from memory)*.
+  P-384 needs only hash-to-curve plus the suite wiring; `std` has no P-521, but the
+  sibling `p521` module now provides the curve (its hash-to-curve is in its own
+  Backlog, for this suite). P-384 is the Privacy Pass choice *(inferred, from memory)*.
   Moderate (P-384) / large (P-521); pure Zig either way. The shared hash-to-curve
   (RFC 9380 SSWU for P-256/P-384/P-521) is neither in `std` (searched
   `lib/std/crypto`) nor in a sibling.

@@ -154,7 +154,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   use `X25519.KeyPair.fromEd25519` and sign with plain Ed25519" (which
   would require a SEPARATE Ed25519 keypair per identity, the thing XEdDSA
   avoids).
-- **`respond`'s id-mismatch caveat**: `respond` takes `bob_opk: ?OneTimePreKey`
+- **`respond`'s id-mismatch caveat**: `respond` takes `bob_opk: ?*const OneTimePreKey`
   as a caller-supplied value; it does not itself check that
   `bob_opk.?.id == alice_initial.one_time_prekey_id`. A production
   integration MUST look up the one-time prekey BY the id Alice's message
@@ -205,7 +205,7 @@ the same `edwardsFromMontgomery` conversion:
 
 1. **`sign`/`verify` (spec variant)** — `sign`: Montgomery-seed ->
    sign-0-forced Edwards keypair (`calculateKeyPair`: clamp, reduce,
-   `basePoint.mul`, branchless negate-if-sign-1); `hash1`-domain-separated
+   `ct25519.mulBase`, branchless negate-if-sign-1); `hash1`-domain-separated
    nonce (`SHA-512(0xFE || 0xFF*31 || a || M || Z)`, wide-reduced mod L,
    over the possibly-negated scalar `a` per spec); `R = r·B`;
    plain-`SHA-512`-domain challenge `h = hash(R || A || M) mod L`;
@@ -260,8 +260,8 @@ exact bytes and that nonce isn't published).
   stored in the `State` and mixed into every message's AEAD associated
   data. Bob's INITIAL ratchet keypair is his signed-prekey keypair (the
   standard Signal binding — the DH key Alice already mixed into X3DH), so
-  `initAlice(sk, ad, bob_spk_pub, io)` and
-  `initBob(sk, ad, bob_spk_keypair)` land on the same first chain purely by
+  `initAlice(sk, ad, bob_spk_pub, io, out)` and
+  `initBob(sk, ad, bob_spk_keypair, out)` land on the same first chain purely by
   X25519 DH commutativity, exactly as X3DH's own two sides do.
 - **KDF instantiation** (spec §5.2 leaves these application-defined):
   - `KDF_RK(RK, dh_out)` = HKDF-SHA256, `salt = RK`, `ikm = dh_out`,

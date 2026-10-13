@@ -3,7 +3,8 @@
 RFC 9497 Oblivious Pseudorandom Functions — **ristretto255-SHA512**
 ciphersuite. All three modes: base **OPRF**, verifiable **VOPRF**
 (batched DLEQ proof), and partially-oblivious **POPRF** (public `info`
-input). Pure std (`std.crypto.ecc.Ristretto255` + SHA-512), no
+input). `std.crypto.ecc.Ristretto255` + SHA-512 for the group and hashes, the
+sibling `ct25519` for secret-scalar multiplication; no
 allocation, no internal RNG (blind/proof randomness is caller-supplied;
 see `scalarFromWideBytes`).
 

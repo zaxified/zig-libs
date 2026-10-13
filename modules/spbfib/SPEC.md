@@ -18,7 +18,7 @@
 
 Design + threat notes for auditors. Usage, API and the field contract: see
 [README.md](README.md) and the `src/root.zig` doc comments.
-Attribution/provenance: see `/NOTICE` — none needed here (clean-room from the
+Attribution/provenance: see this module's README "Provenance" note — none needed here, so there is no root `/NOTICE` entry (clean-room from the
 public IEEE 802.1aq / RFC 6329 standard; a public spec is not a copyrightable
 work, and no third-party source or implementation was ported or studied).
 

@@ -25,6 +25,8 @@ threat model.
 | `kat_vectors.zig` | The official BOLT#4 test vector, embedded |
 | `kat_test.zig` | KAT assertions against the official vector — all live, zero skips |
 
+**Deps:** `k256` (secp256k1 point and scalar arithmetic); the rest is `std.crypto`.
+
 ## Import
 
 ```zig

@@ -56,7 +56,8 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
     hop). Each carries the exact per-step algorithm in its own doc comment —
     see `core.zig` directly rather than duplicating that text here.
 - **std recon** (confirmed against `lib/std/crypto/pcurves/secp256k1.zig`
-  and `lib/std/crypto/chacha20.zig`, Zig 0.16.0):
+  and `lib/std/crypto/chacha20.zig`, Zig 0.16.0; the module itself now takes
+  `Secp256k1` from the sibling `k256`, whose API mirrors std's):
   - ECDH point: `Secp256k1.fromSec1(&pubkey_33_bytes)` parses a compressed
     (or uncompressed/identity) SEC1-encoded point, rejecting anything
     off-curve or malformed (`error.InvalidEncoding`/`.NotSquare`/
@@ -195,10 +196,10 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
     shared secret). Until 2026-10-06 it was `std.mem.allEqual`, an early-exit
     loop LLVM happened to vectorise into one `vptest`/`je` — safe by
     accident. It is now `timing_safe.eql` against an all-zero HMAC
-    (`core.zig:480`, pinned by `check-ct-compare`), constant-time by
-    construction like the HMAC gate (`core.zig:437`). Re-measured 2026-10-06:
+    (`process`'s final-hop check, pinned by `check-ct-compare`), constant-time by
+    construction like the HMAC gate (`process`'s `mu` check). Re-measured 2026-10-06:
     `process` 40 in-file contexts before and after, line for line the same;
-    the one at `core.zig:480` is the branch on the verdict (the hop's own
+    the one at the final-hop check is the branch on the verdict (the hop's own
     forward-or-deliver decision), not the comparison. Re-measured
     2026-10-08 after the dead-stack fix: `construct` 7 (k256's comb identity
     rejection 2 -> 1), `process` 44 — the +4 are memcpy contexts on the same

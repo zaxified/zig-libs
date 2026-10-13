@@ -6,7 +6,8 @@ Identity KSF**. The server never sees the password (not even at
 registration) and stores a record that resists precomputation attacks;
 each login yields a mutually authenticated `session_key` (both sides)
 plus a client-only `export_key`. OPRF layer reused from the sibling
-`voprf` module (RFC 9497 modeOPRF); the rest is pure std
+`voprf` module (RFC 9497 modeOPRF) and secret-scalar DH from the sibling
+`ct25519`; the rest is pure std
 (HKDF-SHA-512, HMAC-SHA-512, SHA-512, Ristretto255). No allocation, no
 internal RNG (all nonces/blinds/seeds are caller-supplied CSPRNG
 output; blinds via `scalarFromWideBytes`).

@@ -69,6 +69,7 @@ var bob_spk: signal.x3dh.SignedPreKey = undefined;
 signal.generateSignedPreKey(&bob_ik, /* id */ 1, z, io, &bob_spk); // z: 64 bytes from io.random
 var bob_opk_kp: signal.IdentityKey = undefined;
 signal.x3dh.generateKeyPair(io, &bob_opk_kp);
+const bob_opk: signal.x3dh.OneTimePreKey = .{ .key_pair = bob_opk_kp, .id = 42 };
 
 const bundle = signal.PreKeyBundle{
     .identity_key = bob_ik.public_key,
@@ -173,19 +174,24 @@ before you hit it.
 // last-resort alike, unlike curve one-time prekeys, because a curve prekey
 // is authenticated by the DH against Bob's identity key and a KEM prekey
 // has nothing equivalent.
-const bob_kem = signal.generateKemPreKey(bob_ik, 100, true, z, io);
+var bob_kem: signal.KemPreKey = undefined;
+signal.generateKemPreKey(&bob_ik, 100, true, z, io, &bob_kem);
 
 // Alice, with Bob offline. Verifies BOTH signatures before deriving
 // anything, and distinguishes which one failed: they are different keys on
 // different rotation schedules.
-const opened = try signal.pqInitiate(gpa, alice_ik, bundle, "", io);
+var opened: signal.pqxdh.InitiateOutput = undefined;
+try signal.pqInitiate(gpa, &alice_ik, bundle, "", io, &opened);
+defer opened.message.deinit(gpa);
 
 // Seed the ratchet — with the 64-byte form, not the full AD.
-var alice = try signal.initAlice(
-    opened.agreement.shared_secret,
+var alice: signal.ratchet.State = undefined;
+try signal.initAlice(
+    &opened.agreement.shared_secret,
     opened.agreement.ratchetAssociatedData(),
     bob_spk.key_pair.public_key,
     io,
+    &alice,
 );
 ```
 
@@ -222,7 +228,8 @@ signal → std.crypto.dh.X25519 / std.crypto.ecc.Edwards25519 /
          std.crypto.aead.chacha_poly.ChaCha20Poly1305
 ```
 
-No sibling-module dependency (`deps = .{}`).
+Sibling-module dependencies (`build.zig` `module_list`): `chachapoly`, `ct25519`
+and `entropy` (the latter for fail-closed randomness via `io`).
 
 ## Verify
 
