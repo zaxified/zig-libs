@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-13** — `ticket12`: a zero-length ticket is legal (RFC 5077 §3.3, the server withdrawing an announced ticket) — `encode`/`decode` accept it, `isWithdrawal` names it; `stek.depthFor(policy)` gives the ring depth that holds every key a policy accepts (8 for the Go defaults; `DefaultRing` holds ~2 periods). ctgrind harness (`stek`, `psk`, `early`); card Scope core → parity.
+- **2026-10-13** — `stek.RotationPolicy` + `StekRing.needsRotation`/`maybeRotate`/`expire`/`openAt` (scheduled rotation with a grace period, Go/rustls defaults); `rotate` now wipes the evicted key.
+- **2026-10-13** — new `ticket12.zig`: TLS 1.2 session tickets (RFC 5077 NewSessionTicket body + SessionTicket extension classifier).
+- **2026-10-13** — new `cache.zig`: `SessionCache(max_id_len, max_state_len)` stateful session cache (timeout, oldest eviction, single-use `take`).
+
 - **2026-10-10** — Comparative benchmark `tools/bench.zig` (`zig build bench-tlsresume`, kept instrument kind 3): card Performance 0.90–1.08× the same recipe on OpenSSL EVP (OpenSSL has no standalone resumption API), measured on a quiet host. Tooling only, no code change.
 
 - **2026-10-09** — tests: deterministic fuzz driver `TLSRESUME_FUZZ` over the existing harnesses (plus a generated-record overlay: serialize/encode then parse/decode must round-trip, every truncation and a trailing octet must be refused).

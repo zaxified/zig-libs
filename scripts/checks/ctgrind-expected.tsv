@@ -1355,3 +1355,42 @@ p521	ReleaseFast	keygen	1	0	786668597aa111f5	b44de7eb8b02a855
 p521	ReleaseFast	sign	1	0	786668597aa111f5	b620c1c667ef0084
 p521	ReleaseFast	ecdh	1	0	4fe6fcee141114ca	a348bd01a2bccfcc
 p521	ReleaseFast	vartime	1	>=1	4160fbdec86bc619	11557f4b46d4c2af
+# tlsresume (2026-10-13) — the STEK, the resumption secret / PSK / binder key and the
+# 0-RTT key schedule through the module's public API; SHA-256 and SHA-384 suites.
+# stek: STEK + session state tainted through seal, open, tampered open. 2 = the
+# AES-256-GCM tag verdict in std's decrypt (aes_gcm.zig:105) reached from
+# StekRing.openBody, one per open (good blob, tampered blob); seal has none.
+# psk: derivePsk/earlySecret/binderKey/computeBinder + verifyBinder (accept and
+# reject) on a tainted resumption master secret: 0, the binder compare is
+# timing_safe.eql and its verdict is only printed. early: clientEarlyTrafficSecret,
+# earlyExporterMasterSecret, earlyTrafficKeyIv (16/32), EarlyDataContext.derive
+# on a tainted PSK: 0. select.selectPsk is deliberately not a row: tainting the
+# STEK taints the nonce length / issue time inside the unsealed plaintext and
+# the row would pin that artefact (47 contexts measured; see the harness doc).
+tlsresume	ReleaseFast	stek	1	2	0cb282c45fba86a7	d08464d6d9f54d25
+tlsresume	ReleaseFast	psk	1	0	3df562eba5e33200	eacdeeff2d24e2c4
+tlsresume	ReleaseFast	early	1	0	958e96d1ea73a044	042b8c43588c7881
+# acme (2026-10-13) — the P-256 account / certificate private key (only the scalar
+# tainted; public key, headers, payloads, names defined). No EAB/HMAC in the module.
+# jws 57 = 13 + 44. 13 = the delegated p256 signer on the tainted scalar (Scalar
+# fromBytes canonical check 7, comb mulBase select 2, ecdsa finalizePrehashed 4;
+# p256 claims these in its own row, here they are attributed to jws.zig because
+# jws.sign is the caller). 44 = std base64 encode of the SIGNATURE (jws.zig:318,
+# appendJws): a public value, but memcheck propagates the taint through the ECDSA
+# arithmetic, so its alphabet-table index reads as undefined; 22 per sign call.
+# Not a leak of the key; unavoidable without declassifying inside jws.sign.
+# csr 21 = the same 13 p256 signer contexts + 8 = ecdsa Signature.toDer trimming
+# the leading zeros of r and s (ecdsa.zig:138,139,145,150 from x509.csrDerBody
+# x509.zig:180), 4 per csrDer call, on the public signature.
+# pem 12 (2026-10-13, after the fix; was 24 = a REAL finding): ecPrivateKeyToPem
+# 0 — b64ct.zig replaced std's table encoder (16 contexts indexing the alphabet
+# by key bytes), and the base64 text no longer passes through freed heap blocks.
+# ecPrivateKeyFromPem now reads back exactly what was written, so the taint
+# covers only characters carrying key bits: findPos for the END line (1) and
+# the whitespace switch (x509.zig pemDecodeSecret, 1) — a key character is
+# never '-' or whitespace, so both decisions are the layout's; b64ct's single
+# validity verdict (1); the private OCTET STRING's length byte (readElem, the
+# raw.len check, and the memcpy sized by it: 2 + 5) — public (32), but its
+# base64 character also carries key bits; p256's comb mulBase recomputing the
+# public key (2, p256's own `comb` row).
+acme	ReleaseFast	pem	1	12	ff5034cfc42531e1	e3f3e71bec825dd7

@@ -24,6 +24,8 @@
 //! | `psk.zig` | `derivePsk`/`earlySecret`/`binderKey`/`computeBinder`/`verifyBinder` (RFC 8446 §7.1/§4.2.11.2 HKDF/HMAC chain, byte-exact vs RFC 8448 §4) |
 //! | `earlydata.zig` | 0-RTT early-data key schedule (RFC 8446 §7.1 early branch + §7.3): `clientEarlyTrafficSecret`/`earlyExporterMasterSecret`/`earlyTrafficKeyIv` + `EarlyDataContext` convenience — byte-exact vs RFC 8448 §4's 0-RTT trace, incl. opening its real encrypted early-data record |
 //! | `replay.zig` | `obfuscateAge`/`deobfuscateAge`/`withinFreshnessWindow` (RFC 8446 §4.2.11.1) + `StrikeRegister` (RFC 8446 §8/§8.1 bounded single-use anti-replay) |
+//! | `ticket12.zig` | TLS 1.2 session tickets (RFC 5077): `NewSessionTicket12` codec + SessionTicket extension (type 35) classifier; tickets are `StekRing.seal` blobs |
+//! | `cache.zig` | `SessionCache(max_id, max_state)`: bounded stateful cache (session-ID resumption, stateful PSK identities), timeout, oldest-first eviction, single-use `take` |
 //! | `select.zig` | `SessionState(rms_len)` (de)serialization (this module's own STEK-plaintext layout) + `selectPsk` (the server-side §4.2.11 selection loop composing all of the above) |
 //!
 //! `psk.zig` remains the highest-severity file: a wrong or skipped PSK
@@ -57,8 +59,13 @@ pub const psk = @import("psk.zig");
 pub const earlydata = @import("earlydata.zig");
 pub const replay = @import("replay.zig");
 pub const select = @import("select.zig");
+pub const ticket12 = @import("ticket12.zig");
+pub const cache = @import("cache.zig");
 
 pub const StekRing = stek.StekRing;
+pub const RotationPolicy = stek.RotationPolicy;
+pub const depthFor = stek.depthFor;
+pub const SessionCache = cache.SessionCache;
 pub const NewSessionTicket = ticket.NewSessionTicket;
 pub const StrikeRegister = replay.StrikeRegister;
 pub const EarlyDataContext = earlydata.EarlyDataContext;
@@ -100,6 +107,8 @@ test {
     _ = earlydata;
     _ = replay;
     _ = select;
+    _ = ticket12;
+    _ = cache;
     _ = @import("stackprobe_test.zig");
 }
 

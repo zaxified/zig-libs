@@ -111,6 +111,7 @@ test {
     _ = x509;
     _ = Client;
     // External anchor: Pebble's answers, replayed (tools/pebble.sh).
+    _ = @import("b64ct.zig");
     _ = @import("pebble_replay_test.zig");
     _ = @import("stackprobe_test.zig");
     _ = @import("stackprobe2_test.zig");

@@ -88,6 +88,29 @@ pub const OpenError = error{
     BufferTooSmall,
 };
 
+/// STEK rotation schedule. The defaults mirror Go `crypto/tls` (a new session
+/// ticket key every 24 hours, each key accepted for 7 days after it was
+/// installed) and rustls' `Ticketer` (rotate at a fixed period, keep the
+/// previous key for a grace period). This module owns no clock: the caller
+/// passes `now_s` to every policy function.
+pub const RotationPolicy = struct {
+    /// Age of the active key (seconds) at which `needsRotation` turns true.
+    period_s: i64 = 24 * 3600,
+    /// Age (seconds since install) after which a key is no longer accepted
+    /// for `openAt` and is wiped by `expire`.
+    lifetime_s: i64 = 7 * 24 * 3600,
+};
+
+/// The smallest `StekRing` depth that holds every key `policy` still accepts:
+/// one key per `period_s` across `lifetime_s`, plus the active one. 8 for the
+/// Go defaults — `DefaultRing` (3) evicts a key after about two periods, well
+/// before its lifetime ends. Comptime-usable: `StekRing(depthFor(.{}))`.
+pub fn depthFor(policy: RotationPolicy) usize {
+    std.debug.assert(policy.period_s > 0 and policy.lifetime_s >= 0);
+    const periods = std.math.divCeil(i64, policy.lifetime_s, policy.period_s) catch unreachable;
+    return @intCast(periods + 1);
+}
+
 /// An N-deep ring of STEKs. `depth` bounds live keys the server accepts for
 /// `open` at once (RFC 8446 §4.6.1 / common practice: keep the last 2-3
 /// rotations live so tickets issued just before a rotation still work).
@@ -126,9 +149,54 @@ pub fn StekRing(comptime depth: usize) type {
         /// e.g. a monotonic counter mod 256).
         pub fn rotate(self: *Self, id: u8, key: *const [key_length]u8, now_s: i64) void {
             const slot = self.count % depth;
+            // Wipe the key being evicted before it is overwritten.
+            if (self.keys[slot]) |*old| std.crypto.secureZero(u8, &old.key);
             self.keys[slot] = .{ .id = id, .key = key.*, .installed_at_s = now_s };
             self.active = slot;
             self.count += 1;
+        }
+
+        /// True when the ring is empty or the active key is at least
+        /// `policy.period_s` old (`now_s - installed_at_s >= period_s`).
+        /// Go `crypto/tls` rotates every 24 h; rustls' `Ticketer` likewise on
+        /// a fixed period (the `RotationPolicy` default).
+        pub fn needsRotation(self: *const Self, policy: RotationPolicy, now_s: i64) bool {
+            const k = self.activeKey() orelse return true;
+            return now_s - k.installed_at_s >= policy.period_s;
+        }
+
+        /// Calls `rotate(id, key, now_s)` iff `needsRotation`, then `expire`.
+        /// Returns whether it rotated. The id is the previous active id
+        /// `+% 1` (0 for an empty ring), so the caller only supplies key
+        /// bytes from its CSPRNG. Keeping the previous keys until
+        /// `policy.lifetime_s` is the grace period Go (7 days) and rustls give
+        /// tickets issued just before a rotation. Ids wrap mod 256; with
+        /// `depth` far below 256 live keys never collide.
+        // secret-api-ok: the key is borrowed and handed straight to `rotate`, which copies it into the ring slot; no copy lands in this frame
+        pub fn maybeRotate(self: *Self, policy: RotationPolicy, key: *const [key_length]u8, now_s: i64) bool {
+            const rotated = self.needsRotation(policy, now_s);
+            if (rotated) {
+                const id: u8 = if (self.activeKey()) |k| k.id +% 1 else 0;
+                self.rotate(id, key, now_s);
+            }
+            self.expire(policy, now_s);
+            return rotated;
+        }
+
+        /// Clears (and wipes with `std.crypto.secureZero`) every NON-active
+        /// slot whose `installed_at_s + lifetime_s <= now_s`. The active key
+        /// is never expired here (a stalled rotation must not leave the
+        /// server unable to seal). Go's 7-day key lifetime is the default.
+        pub fn expire(self: *Self, policy: RotationPolicy, now_s: i64) void {
+            for (&self.keys, 0..) |*maybe, i| {
+                if (i == self.active) continue;
+                if (maybe.*) |*k| {
+                    if (k.installed_at_s + policy.lifetime_s <= now_s) {
+                        std.crypto.secureZero(u8, &k.key);
+                        maybe.* = null;
+                    }
+                }
+            }
         }
 
         /// The current encrypt-with key, or `null` if `rotate` was never
@@ -205,6 +273,17 @@ pub fn StekRing(comptime depth: usize) type {
         /// slice. `out` must not alias `blob`.
         pub fn open(self: *const Self, blob: []const u8, out: []u8) OpenError![]u8 {
             return burn.run(burn.ticket_burn, OpenError![]u8, openBody, .{ self, blob, out });
+        }
+
+        /// Like `open`, but additionally refuses (`error.UnknownKeyId`) a key
+        /// that is past `policy.lifetime_s` (`installed_at_s + lifetime_s <=
+        /// now_s`) even if `expire` has not removed it from the ring yet —
+        /// this includes an active key whose rotation is overdue.
+        pub fn openAt(self: *const Self, blob: []const u8, now_s: i64, policy: RotationPolicy, out: []u8) OpenError![]u8 {
+            if (blob.len < overhead) return error.Malformed;
+            const key = self.findKey(blob[0]) orelse return error.UnknownKeyId;
+            if (key.installed_at_s + policy.lifetime_s <= now_s) return error.UnknownKeyId;
+            return self.open(blob, out);
         }
 
         fn openBody(self: *const Self, blob: []const u8, out: []u8) OpenError![]u8 {
@@ -346,4 +425,100 @@ test "seal/open: an older still-live STEK still opens its tickets after rotation
     var blob_buf2: [128]u8 = undefined;
     const blob2 = try ring.seal("post-rotation ticket", [_]u8{0xC4} ** nonce_length, &blob_buf2);
     try testing.expectEqual(@as(u8, 2), blob2[0]);
+}
+
+test "RotationPolicy: needsRotation boundary, empty ring" {
+    var ring = DefaultRing.init();
+    const policy = RotationPolicy{ .period_s = 100, .lifetime_s = 1000 };
+    try testing.expect(ring.needsRotation(policy, 0));
+    ring.rotate(0, &([_]u8{1} ** key_length), 50);
+    try testing.expect(!ring.needsRotation(policy, 50 + 99));
+    try testing.expect(ring.needsRotation(policy, 50 + 100));
+}
+
+test "maybeRotate: rotates at the boundary, ids increment and wrap 255 -> 0" {
+    var ring = DefaultRing.init();
+    const policy = RotationPolicy{ .period_s = 100, .lifetime_s = 1000 };
+    const key = [_]u8{7} ** key_length;
+    try testing.expect(ring.maybeRotate(policy, &key, 0)); // empty -> id 0
+    try testing.expectEqual(@as(u8, 0), ring.activeKey().?.id);
+    try testing.expect(!ring.maybeRotate(policy, &key, 99));
+    try testing.expectEqual(@as(usize, 1), ring.count);
+    try testing.expect(ring.maybeRotate(policy, &key, 100));
+    try testing.expectEqual(@as(u8, 1), ring.activeKey().?.id);
+
+    var wrap = DefaultRing.init();
+    wrap.rotate(255, &key, 0);
+    try testing.expect(wrap.maybeRotate(policy, &key, 100));
+    try testing.expectEqual(@as(u8, 0), wrap.activeKey().?.id);
+}
+
+test "expire: wipes old non-active keys, keeps the active one" {
+    var ring = DefaultRing.init();
+    const policy = RotationPolicy{ .period_s = 100, .lifetime_s = 300 };
+    ring.rotate(1, &([_]u8{1} ** key_length), 0);
+    ring.rotate(2, &([_]u8{2} ** key_length), 100);
+    ring.expire(policy, 299);
+    try testing.expect(ring.findKey(1) != null);
+    ring.expire(policy, 300); // 0 + 300 <= 300
+    try testing.expect(ring.findKey(1) == null);
+    try testing.expect(ring.findKey(2) != null);
+    // The active key survives even far past its lifetime.
+    ring.expire(policy, 1_000_000);
+    try testing.expect(ring.findKey(2) != null);
+    // The wiped slot holds no key material.
+    for (ring.keys) |maybe| try testing.expect(maybe == null or maybe.?.id == 2);
+}
+
+test "maybeRotate expires in the same call" {
+    var ring = DefaultRing.init();
+    const policy = RotationPolicy{ .period_s = 100, .lifetime_s = 250 };
+    const key = [_]u8{3} ** key_length;
+    _ = ring.maybeRotate(policy, &key, 0);
+    _ = ring.maybeRotate(policy, &key, 100);
+    _ = ring.maybeRotate(policy, &key, 200);
+    try testing.expect(ring.findKey(0) != null);
+    _ = ring.maybeRotate(policy, &key, 300); // key 0 is 300 old >= 250
+    try testing.expect(ring.findKey(0) == null);
+    try testing.expect(ring.findKey(1) != null);
+}
+
+test "openAt refuses an over-lifetime key still in the ring" {
+    var ring = DefaultRing.init();
+    const policy = RotationPolicy{ .period_s = 100, .lifetime_s = 300 };
+    ring.rotate(1, &([_]u8{1} ** key_length), 0);
+    var blob_buf: [64]u8 = undefined;
+    var out_buf: [64]u8 = undefined;
+    const blob = try ring.seal("state", [_]u8{9} ** nonce_length, &blob_buf);
+    ring.rotate(2, &([_]u8{2} ** key_length), 100);
+    try testing.expectEqualSlices(u8, "state", try ring.openAt(blob, 299, policy, &out_buf));
+    try testing.expectError(error.UnknownKeyId, ring.openAt(blob, 300, policy, &out_buf));
+    // plain open still accepts it (not yet expired from the ring)
+    try testing.expectEqualSlices(u8, "state", try ring.open(blob, &out_buf));
+    try testing.expectError(error.Malformed, ring.openAt(blob[0 .. overhead - 1], 0, policy, &out_buf));
+}
+
+test "rotate wipes the evicted slot's key" {
+    var ring = StekRing(1).init();
+    ring.rotate(1, &([_]u8{0xEE} ** key_length), 0);
+    const old_ptr: *const [key_length]u8 = &ring.keys[0].?.key;
+    ring.rotate(2, &([_]u8{0x11} ** key_length), 1);
+    // single slot: overwritten in place with the new key, never the old bytes
+    try testing.expectEqual(@as(u8, 0x11), old_ptr[0]);
+    try testing.expectEqual(@as(u8, 2), ring.activeKey().?.id);
+}
+
+test "depthFor: a ring of that depth keeps every key the policy accepts" {
+    try testing.expectEqual(@as(usize, 8), depthFor(.{}));
+    try testing.expectEqual(@as(usize, 4), depthFor(.{ .period_s = 100, .lifetime_s = 300 }));
+    const policy = RotationPolicy{ .period_s = 100, .lifetime_s = 300 };
+    var ring = StekRing(depthFor(policy)).init();
+    const key = [_]u8{4} ** key_length;
+    var t: i64 = 0;
+    while (t <= 300) : (t += 100) _ = ring.maybeRotate(policy, &key, t);
+    // At t = 300 the key from t = 0 is exactly expired; 100, 200, 300 remain.
+    try testing.expect(ring.findKey(0) == null);
+    for ([_]u8{ 1, 2, 3 }) |id| try testing.expect(ring.findKey(id) != null);
+    _ = ring.maybeRotate(policy, &key, 399); // not due: 399 - 300 < 100
+    try testing.expect(ring.findKey(1) != null); // installed 100, alive until 400
 }

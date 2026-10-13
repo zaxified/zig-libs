@@ -314,6 +314,10 @@ declare -A TARGETS=(
     [aes192]="enc dec"
     # ── 2026-10-10: p521 (NIST P-521): mul/keygen/sign/ecdh claims + the vartime positive control ──
     [p521]="mul keygen sign ecdh vartime"
+    # ── 2026-10-13: tlsresume: STEK, resumption secret/PSK/binder key, 0-RTT key schedule ──
+    [tlsresume]="stek psk early"
+    # ── 2026-10-13: acme: the P-256 account / certificate private key ──
+    [acme]="jws csr pem"
 )
 declare -A MODES=(
     [bolt8]="ReleaseFast"
@@ -393,6 +397,8 @@ declare -A MODES=(
     [snmp]="ReleaseFast"
     [aes192]="ReleaseFast"
     [p521]="ReleaseFast"
+    [tlsresume]="ReleaseFast"
+    [acme]="ReleaseFast"
 )
 # Keyed "<module>/<target>".
 declare -A PATTERN=(
@@ -726,6 +732,16 @@ declare -A PATTERN=(
     [p521/sign]='field[.]zig|scalar[.]zig|group[.]zig|sign[.]zig|ct[.]zig|burn[.]zig|hmac[.]zig|sha2[.]zig'
     [p521/ecdh]='field[.]zig|scalar[.]zig|group[.]zig|ct[.]zig|burn[.]zig'
     [p521/vartime]='field[.]zig|scalar[.]zig|group[.]zig'
+    # tlsresume (2026-10-13): the module's own files; the AES-GCM tag verdict
+    # and the HKDF/HMAC are std's and show up as in-file only through the
+    # module frame that consumes them.
+    [tlsresume/stek]='stek[.]zig|burn[.]zig'
+    [tlsresume/psk]='psk[.]zig|burn[.]zig'
+    [tlsresume/early]='earlydata[.]zig|psk[.]zig|burn[.]zig'
+    # acme (2026-10-13): the module's own files; the ECDSA signer is p256's.
+    [acme/jws]='jws[.]zig|burn[.]zig'
+    [acme/csr]='x509[.]zig|burn[.]zig'
+    [acme/pem]='x509[.]zig|burn[.]zig'
 )
 WITNESS='Writer[.]zig|Format[.]zig|fmt[.]zig'
 # WITNESS_CHAIN — the files a witness's stack may consist of BETWEEN the
@@ -958,6 +974,12 @@ declare -A LABEL=(
     [p521/sign]='p521 generateDeterministicInto+signPrehashedInto (seed tainted)'
     [p521/ecdh]='p521 ecdhInto (secret tainted)'
     [p521/vartime]='p521 mulPublic POSITIVE CONTROL (scalar tainted, must flag)'
+    [tlsresume/stek]='tlsresume StekRing seal/open/tampered open (STEK + session state tainted)'
+    [tlsresume/psk]='tlsresume derivePsk/earlySecret/binderKey/computeBinder/verifyBinder SHA-256+384 (rms tainted)'
+    [tlsresume/early]='tlsresume 0-RTT key schedule SHA-256+384 (PSK tainted)'
+    [acme/jws]='acme jws.sign jwk+kid headers (account key tainted)'
+    [acme/csr]='acme x509.csrDer 1+2 names (certificate key tainted)'
+    [acme/pem]='acme ecPrivateKeyToPem + ecPrivateKeyFromPem (key / PEM tainted)'
 )
 
 # ── measurement ────────────────────────────────────────────────────────────

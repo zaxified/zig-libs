@@ -63,6 +63,26 @@ var wire_buf: [256]u8 = undefined;
 const wire_bytes = try nst.encode(&wire_buf); // real today — send after the handshake header
 ```
 
+**Scheduled STEK rotation** (`stek.zig`; Go `crypto/tls` defaults: rotate every 24 h, keys valid 7 days):
+
+```zig
+const policy = tlsresume.RotationPolicy{}; // period_s = 24 h, lifetime_s = 7 d
+// Call on every ticket issue (or from a timer). Only the key bytes come from your CSPRNG;
+// the id is previous +% 1. Also wipes keys past their lifetime.
+_ = ring.maybeRotate(policy, &fresh_32_byte_key, now_s);
+// Open refusing keys past their lifetime even if not yet expired from the ring:
+const plain = try ring.openAt(blob, now_s, policy, &out_buf);
+```
+
+**TLS 1.2 tickets** (`ticket12.zig`, RFC 5077): the ticket is a `ring.seal` blob of your own 1.2
+session state; `ticket12.NewSessionTicket12{ .lifetime_hint_s = 7200, .ticket = blob }.encode(&buf)` frames
+it, `classifyClientExtension(ext_data)` (extension type `ticket12.extension_type` = 35) says whether the
+client offers a ticket to `open` or only supports them.
+
+**Stateful session cache** (`cache.zig`): `var c = try tlsresume.SessionCache(32, 128).init(gpa, 10_000, 300);`
+then `put(id, state, now_s)`, `get`, and single-use `take` (TLS 1.3 0-RTT / session-ID resumption);
+oldest entry evicted when full, expired entries wiped on touch, `deinit` wipes everything. Single owner, linear scan.
+
 **Accepting a resumed ClientHello** (`select.zig`, composing `psk.zig` +
 `replay.zig` + `stek.zig`):
 

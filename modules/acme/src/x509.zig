@@ -15,6 +15,7 @@
 //! parser used by tests and by the mock CA to validate what we emit.
 
 const std = @import("std");
+const b64ct = @import("b64ct.zig");
 const Allocator = std.mem.Allocator;
 const burn = @import("burn.zig");
 
@@ -613,6 +614,70 @@ pub fn pemDecode(gpa: Allocator, label: []const u8, text: []const u8) PemDecodeE
     };
 }
 
+/// The longest private-key DER the secret PEM paths handle (a P-256
+/// `EC PRIVATE KEY` is 121 bytes).
+const max_secret_der = 1024;
+
+/// `pemEncode` for a SECRET DER: constant-time base64 (`b64ct.zig`), and the
+/// base64 text exists only in a wiped stack buffer and in the one returned
+/// allocation — `pemEncode` leaves it in a freed heap block and in the
+/// `Allocating` writer's discarded growth buffers.
+fn pemEncodeSecret(gpa: Allocator, label: []const u8, der_bytes: []const u8) error{OutOfMemory}![]u8 {
+    std.debug.assert(der_bytes.len <= max_secret_der);
+    var b64_buf: [b64ct.encodedLen(max_secret_der)]u8 = undefined;
+    defer std.crypto.secureZero(u8, &b64_buf);
+    const b64_text = b64ct.encode(&b64_buf, der_bytes);
+
+    const lines = (b64_text.len + 63) / 64;
+    const begin_len = "-----BEGIN -----\n".len + label.len;
+    const end_len = "-----END -----\n".len + label.len;
+    const out = try gpa.alloc(u8, begin_len + b64_text.len + lines + end_len);
+    var w: std.Io.Writer = .fixed(out);
+    writePem(&w, label, b64_text) catch unreachable; // sized exactly above
+    std.debug.assert(w.end == out.len);
+    return out;
+}
+
+/// `pemDecode` for a SECRET DER, into `out` (no allocation): the base64 body
+/// is stripped of whitespace into a wiped stack buffer and decoded in
+/// constant time (`b64ct.zig`). Locating the BEGIN/END lines and dropping the
+/// line breaks still branch on the text: those decisions come out the same
+/// for every key character (a base64 character is never `-` or whitespace),
+/// so they reveal the PEM's layout, not the key — the `pem` row of
+/// `scripts/checks/ctgrind-expected.tsv` itemises them.
+fn pemDecodeSecret(label: []const u8, text: []const u8, out: []u8) PemDecodeError![]u8 {
+    if (label.len > max_pem_label_len) return error.LabelTooLong;
+    var begin_buf: [max_pem_label_len + 16]u8 = undefined;
+    var end_buf: [max_pem_label_len + 16]u8 = undefined;
+    const begin = std.fmt.bufPrint(&begin_buf, "-----BEGIN {s}-----", .{label}) catch unreachable;
+    const end = std.fmt.bufPrint(&end_buf, "-----END {s}-----", .{label}) catch unreachable;
+
+    const bi = std.mem.indexOf(u8, text, begin) orelse return error.MissingPemBlock;
+    const body_start = bi + begin.len;
+    const ei = std.mem.indexOfPos(u8, text, body_start, end) orelse return error.InvalidPem;
+    const body = text[body_start..ei];
+
+    var b64_buf: [b64ct.encodedLen(max_secret_der)]u8 = undefined;
+    defer std.crypto.secureZero(u8, &b64_buf);
+    var n: usize = 0;
+    for (body) |c| switch (c) {
+        ' ', '\t', '\r', '\n' => {},
+        else => {
+            if (n == b64_buf.len) return error.InvalidPem;
+            b64_buf[n] = c;
+            n += 1;
+        },
+    };
+    if (n == 0) return error.InvalidPem;
+    if (out.len < n / 4 * 3) return error.InvalidPem;
+    const der_bytes = b64ct.decode(out, b64_buf[0..n]) catch {
+        std.crypto.secureZero(u8, out);
+        return error.InvalidPem;
+    };
+    if (der_bytes.len == 0) return error.InvalidPem;
+    return der_bytes;
+}
+
 /// Number of `-----BEGIN <label>-----` blocks in `text`.
 pub fn pemBlockCount(label: []const u8, text: []const u8) error{LabelTooLong}!usize {
     if (label.len > max_pem_label_len) return error.LabelTooLong;
@@ -648,7 +713,7 @@ noinline fn ecPrivateKeyToPemUnburned(gpa: Allocator, key_pair: *const Es256.Key
         error.OutOfMemory => return error.OutOfMemory,
         error.ValueTooLarge => unreachable, // fixed-size structure
     };
-    return pemEncode(gpa, "EC PRIVATE KEY", ec);
+    return pemEncodeSecret(gpa, "EC PRIVATE KEY", ec);
 }
 
 fn ecKeyDer(d: Der, sk: []const u8, pub_sec1: []const u8) DerEncodeError![]const u8 {
@@ -662,15 +727,16 @@ fn ecKeyDer(d: Der, sk: []const u8, pub_sec1: []const u8) DerEncodeError![]const
 
 /// Load a P-256 key pair from an `EC PRIVATE KEY` PEM (RFC 5915 — the
 /// format `ecPrivateKeyToPem` and `openssl ecparam -genkey` write; PKCS#8
-/// `PRIVATE KEY` wrapping is not supported). `gpa` is scratch only. The pair
-/// goes into `out` (zeroed on error), never through a return value: a
-/// returned pair would sit in the caller's error-union temporary.
+/// `PRIVATE KEY` wrapping is not supported). The pair goes into `out`
+/// (zeroed on error), never through a return value: a returned pair would sit
+/// in the caller's error-union temporary. `gpa` is no longer used (since
+/// 2026-10-13 the DER is decoded into a wiped stack buffer, in constant time;
+/// a `realloc`ed heap copy could not be wiped) and stays for the signature.
 pub fn ecPrivateKeyFromPem(out: *Es256.KeyPair, gpa: Allocator, text: []const u8) KeyPemError!void {
-    const der_bytes = try pemDecode(gpa, "EC PRIVATE KEY", text);
-    defer {
-        std.crypto.secureZero(u8, der_bytes);
-        gpa.free(der_bytes);
-    }
+    _ = gpa;
+    var der_buf: [max_secret_der]u8 = undefined;
+    defer std.crypto.secureZero(u8, &der_buf);
+    const der_bytes = try pemDecodeSecret("EC PRIVATE KEY", text, &der_buf);
     const r = ecPrivateKeyFromDerBurned(out, der_bytes);
     return r catch error.MalformedKey;
 }

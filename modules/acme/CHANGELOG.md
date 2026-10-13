@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-13** — SECURITY (local key files): `ecPrivateKeyToPem`/`ecPrivateKeyFromPem` base64-coded the private key through std's alphabet tables (key-dependent load addresses, found by the new ctgrind harness) and left the key's base64 / DER in freed heap blocks (`pemEncode`'s scratch, `pemDecode`'s `realloc`). Now constant-time `b64ct.zig` over wiped stack buffers; `ecPrivateKeyFromPem`'s `gpa` is unused. ctgrind harness (`jws`, `csr`, `pem`).
 - **2026-10-10** — Card Performance `n/a` with the reason (no timeable reference implementation). Docs only.
 
 - **2026-10-09** — tests: deterministic fuzz driver `ACME_FUZZ` over the existing harnesses (parseOrder, parseAuthz, parseCsr also build a genuine response / signed CSR from the drawn octets: it must parse back to its fields; truncations, a trailing octet and any flipped CSR bit must be refused).
