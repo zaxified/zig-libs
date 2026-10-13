@@ -125,8 +125,9 @@ caching** entirely (every miss re-hits the loader).
   intended.
 
 - **`invalidate(key)`** is the one thing `ramcache` does *not* offer directly:
-  it has `get` / `put` / `clear` / generation, but **no per-key remove** (see
-  §7). So a single-key invalidation shadows the entry by overwriting it with a
+  it has `get` / `put` / `clear` / generation, but had **no per-key remove**
+  when this was written (see §7; `ramcache` has a `remove` now, and this module
+  still uses the shadow below). So a single-key invalidation shadows the entry by overwriting it with a
   reserved **poison generation** (`maxInt(u64)`, which the live generation never
   reaches), making the next `get` see it stale and drop it. To avoid inserting a
   junk entry for a key that was never cached, presence is first probed with
@@ -178,7 +179,7 @@ lock**, so `f` must be cheap and non-reentrant.
 The task brief said "`ramcache` already supports generation invalidation — reuse
 it" for **both** `invalidate(key)` and `invalidateAll()`. That is accurate for
 `invalidateAll` (the generation axis is exactly right) but **not** for
-`invalidate(key)`: `ramcache` exposes no per-key remove, and its generation axis
+`invalidate(key)`: `ramcache` then exposed no per-key remove (it has `remove` now), and its generation axis
 is a single global counter, not per-key. The per-key path is therefore
 implemented in this module via the poison-generation shadow described in §4,
 using only `ramcache`'s public `get`/`put`/`isDirty`. No change to `ramcache`

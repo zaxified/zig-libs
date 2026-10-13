@@ -107,7 +107,7 @@ batching, `TPACKET_V3`, IPv6 Neighbor Discovery (only ARP is implemented), pcapn
 ## Verification
 
 Root-free tests (pure helpers, `sockaddr_ll` decode, BPF encoding, struct ABI sizes, fuzz-style
-never-panic checks) always run; the two socket tests need `CAP_NET_RAW` and `SkipZigTest`
+never-panic checks) always run; the socket tests need `CAP_NET_RAW` and `SkipZigTest`
 without it. Under an unprivileged network namespace where root has the capability
 (`unshare -rn zig build test-rawsock`) all tests pass, including open/filter/promisc and an
 inject→capture loopback round-trip on `lo`. **2026-10-04:** the filter compiler is checked frame by frame against libpcap 1.10.6 (`tcpdump
@@ -164,6 +164,6 @@ src/root.zig.
 - **Class A** — wire/interop format — other implementations must byte-agree with it.
 - **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
 
-**What the tests actually contain.** src/root.zig:709+ freezes a real ARP exchange and a real Ethernet/IPv4/ICMP frame captured with tcpdump off a veth pair in an unprivileged netns -- loopback cannot do ARP at all, which is why the pre-existing hand-computed fixture had never met a real L2 segment; since 2026-10-06 `arp.buildRequest` is anchored by the Linux kernel ANSWERING it (`unshare -rn zig build interop-rawsock -- --capture`: this module's `open`/`sendRaw`/`recv` on a veth pair, the kernel owning the target; request and the kernel's reply frozen in `src/testdata/kernel_arp.zig`, replayed by the "kernel ARP" test). The socket wrappers meet the kernel as a foreign peer only when that program runs (by hand); in the lane they stay self (loopback inject + capture of their own frames) -- what keeps this MIXED
+**What the tests actually contain.** the `golden: real capture` tests in src/root.zig freeze a real ARP exchange and a real Ethernet/IPv4/ICMP frame captured with tcpdump off a veth pair in an unprivileged netns -- loopback cannot do ARP at all, which is why the pre-existing hand-computed fixture had never met a real L2 segment; since 2026-10-06 `arp.buildRequest` is anchored by the Linux kernel ANSWERING it (`unshare -rn zig build interop-rawsock -- --capture`: this module's `open`/`sendRaw`/`recv` on a veth pair, the kernel owning the target; request and the kernel's reply frozen in `src/testdata/kernel_arp.zig`, replayed by the "kernel ARP" test). The socket wrappers meet the kernel as a foreign peer only when that program runs (by hand); in the lane they stay self (loopback inject + capture of their own frames) -- what keeps this MIXED
 
 **How it got there.** The anchoring work landed. DONE a326e4a: real ARP + IPv4 frames off a veth pair (loopback cannot do ARP)

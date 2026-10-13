@@ -19,7 +19,7 @@
 **Downstream consumer:** no
 
 Design + invariants for auditors. Usage: see ./README.md. Attribution/provenance:
-see /NOTICE.
+see ./README.md (design reference only, no NOTICE entry).
 
 ## Compared with
 

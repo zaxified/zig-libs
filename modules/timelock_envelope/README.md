@@ -43,6 +43,7 @@ recording the ciphertext now can and cannot do.
 |---|---|
 | `root.zig` | Module doc, `meta`, re-exports, dark-tests aggregator |
 | `envelope.zig` | The construction: `Envelope(Kem)` generic (`seal`/`open`/`parse`), the HKDF `deriveKeys`, wire constants, error sets; wire-framing + KDF-binding unit tests |
+| `stream.zig` | Wire version 2: `Envelope(Kem).sealStream` / `.openStream` (age STREAM, any size) |
 | `security_test.zig` | Acceptance harness — round-trip vs real quicknet data, the three AND negatives, per-region tamper, malformed-input fuzz, positive controls |
 
 ## Import
@@ -144,11 +145,13 @@ KDF inputs/domain-separation, and the nonce derivation are in
 timelock_envelope → tlock  (→ bls12_381)   time lock
                   → hqc                     PQ lock
                   → chachapoly              content AEAD
+                  → entropy                 SealRandomness.generate
                   → std.crypto.kdf.hkdf     key derivation
 ```
 
-`meta.deps = .{ "tlock", "hqc", "chachapoly" }`. (`bls12_381` types are
-reached transitively via `tlock`.)
+`meta.deps = .{ "tlock", "hqc", "chachapoly", "entropy" }` (`entropy` for
+`SealRandomness.generate`). (`bls12_381` types are reached transitively via
+`tlock`.)
 
 ## Verify
 
@@ -158,7 +161,7 @@ zig build test-timelock_envelope -Doptimize=ReleaseFast --summary all
 zig fmt --check modules/timelock_envelope/
 ```
 
-All **21** tests pass in both Debug and ReleaseFast. (The fuzz test's
+Run `scripts/modtest timelock_envelope` for the module's tests. (The fuzz test's
 body runs deterministically in normal test mode; interactive `--fuzz`
 mode is currently blocked by an unrelated Zig 0.16 `test_runner` bug,
 repo-wide.)

@@ -18,7 +18,7 @@
 
 **Downstream consumer:** yes
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see /NOTICE.
+Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see ./README.md (design references only, no NOTICE entry).
 
 ## Compared with
 
@@ -88,7 +88,7 @@ multi-currency correctness fix (income rows store a null rate).
 `root.zig` carries a dark-tests aggregator (`test { _ = transforms; _ = series; }`) so both
 submodules' tests run — a bare re-export would not pull them in (repo-wide dark-tests gotcha).
 Reentrant — no shared state. Original work of the zig-libs authors (MIT); modeled after pandas/dplyr
-verb algebra + TA rolling-window idioms — see NOTICE.
+verb algebra + TA rolling-window idioms — see README Provenance.
 
 ## Threat model / out of scope
 Not a security boundary — a pure computational library over caller-provided in-memory datasets;

@@ -18,7 +18,7 @@
 
 **Downstream consumer:** yes
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see /NOTICE.
+Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see ./README.md (design references only, no NOTICE entry).
 
 ## Compared with
 
@@ -43,7 +43,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   `error.BulkheadFull` or a bounded poll-wait), `Retry` (pure `nextDelay(attempt, random)` math —
   exponential + cap + jitter, no I/O), `Deadline` (cooperative `expired()`/`remainingMs()`).
   `run(op, policy)` composes `breaker → retry → timeout` per attempt. Clean-room; design references
-  only (behavior, no source consulted or copied — see NOTICE): resilience4j (breaker state machine,
+  only (behavior, no source consulted or copied — see README Provenance): resilience4j (breaker state machine,
   composition order, retry/Bulkhead semantics), Polly (consecutive-failure breaker), failsafe-go
   (delay/jitter shapes), AWS's "Exponential Backoff And Jitter" (Brooker 2015; full/equal jitter).
 - **Allocation:** none — all four types are value types with fixed fields; no allocator anywhere in

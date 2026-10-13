@@ -49,7 +49,7 @@ try cap.setFilter(&rawsock.etherTypeFilter(rawsock.eth_p.arp)); // in-kernel BPF
 try cap.setPromisc(try rawsock.ifaceByName("eth0"), true);
 
 var buf: [2048]u8 = undefined;
-const frame = try cap.recv(&buf); // Frame{ bytes, ifindex, src_hwaddr, ethertype, pkttype }
+const frame = try cap.recv(&buf); // Frame{ bytes, wire_len, ifindex, src_hwaddr, ethertype, pkttype, vlan_tci, timestamp_ns }
 if (rawsock.EthHeader.parse(frame.bytes)) |eth| _ = .{ eth.dst, eth.src, eth.ethertype };
 
 // Inject — a SOCK_DGRAM (cooked) socket; the kernel builds the Ethernet header.
@@ -107,8 +107,8 @@ zig build test-rawsock                          # needs CAP_NET_RAW for the sock
 zig build test-rawsock -Doptimize=ReleaseFast
 ```
 
-The two socket tests (open/filter/promisc, and an inject→capture loopback
-round-trip on `lo`) need `CAP_NET_RAW`; without it they `SkipZigTest`. Run them
+The socket tests (open/filter/promisc, an inject→capture loopback
+round-trip on `lo`, `stats`, …) need `CAP_NET_RAW`; without it they `SkipZigTest`. Run them
 under an unprivileged network namespace, where root has the capability:
 
 ```

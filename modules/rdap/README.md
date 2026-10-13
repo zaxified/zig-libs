@@ -93,5 +93,5 @@ HTTP 404 maps to `error.NotFound`; a non-2xx status with an RDAP error body
 returns the typed `rdap_error` document; non-2xx without one is
 `error.HttpStatus`, and `Client.query`'s `status_out` out-parameter carries
 the real HTTP status in that case (e.g. telling a 429 rate limit apart from a
-500 server error). No test reaches the public network; three bind a loopback
+500 server error). No test reaches the public network; two bind a loopback
 socket (cancellation, and the redirect-gate test).
