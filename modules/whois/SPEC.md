@@ -46,7 +46,8 @@ format; `fieldValue` (case-insensitive key, trimmed value) is the only concessio
 inject a second WHOIS command) and enforces `max_query_len`. Reentrant — no shared state anywhere.
 Clean-room from RFC 3912 plus the documented IANA/registry referral-line conventions (IANA `refer:`,
 ARIN `ReferralServer:`, Verisign `Registrar WHOIS Server:`, the `whois://` URL form) — no third-party
-whois implementation consulted or copied; nothing to attribute (no NOTICE entry needed).
+whois implementation consulted or copied; nothing to attribute (the module-local `NOTICE` is a
+provenance note only, no licence condition).
 
 ## Threat model / out of scope
 WHOIS is plaintext over TCP/43 with no authentication or encryption; transport security is out of

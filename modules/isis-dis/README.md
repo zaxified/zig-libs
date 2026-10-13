@@ -9,7 +9,7 @@ Hellos + adjacency state) plus a monotonic `now`, and acts on the `Effect` it
 returns — chiefly the `became_dis` / `resigned_dis` triggers that start or stop
 originating the LAN's pseudonode LSP.
 
-Status: **gap** — first increment. Implements the election rule + preemption +
+Status: **core** (grade 3). Implements the election rule + preemption +
 the pseudonode LSP-ID derivation + the DIS-change effect. The pseudonode LSP's
 *content*, LAN adjacency formation, and multi-level DIS are deliberately deferred
 — see `SPEC.md`.

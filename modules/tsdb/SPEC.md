@@ -140,8 +140,8 @@ Allocation is one transaction writing the forward index, the reverse index and
 the incremented counter together, so no crash can expose an id whose reverse
 entry is missing, or hand out an id the counter has not moved past.
 
-Bounds: components ≤ 1024 bytes, canonical form ≤ 3072 bytes. kvtree stores a
-whole entry inside one 4 KiB page; these caps surface as a clean
+Bounds: components ≤ 1024 bytes, canonical form ≤ 3072 bytes. kvtree spills long
+values into overflow chains, but a key must still fit its page; these caps surface as a clean
 `ComponentTooLong` / `SeriesTooLong` instead of `EntryTooLarge` from deep inside
 a commit.
 

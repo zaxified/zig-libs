@@ -204,6 +204,11 @@ store and lookup, so every age is unchanged). No source defects found.
 
 ## 8. Deliberately deferred
 
+- **`invalidate` via `ramcache.Cache.remove`** (2026-10-13). `ramcache` gained a per-key
+  `remove` after the poison-generation shadow (§4) was built. Switching would drop the shadow
+  entry, but it needs an analysis of the race with a load in flight for the same key (the
+  shadow's generation is what makes that load's late `put` lose) before it replaces a mechanism
+  that is tested and correct. Not a defect; a simplification to evaluate.
 - **Stale-while-revalidate (SWR).** Serving a stale entry immediately while a
   single background refresh runs is valuable but needs either a background
   executor (a `workerpool` dep this module intentionally does not take — it
