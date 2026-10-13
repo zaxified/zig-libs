@@ -531,6 +531,37 @@ test "HelloRetryRequest (offline): a cookie is echoed, a selected group gets the
     }
 }
 
+test "ServerHello with a 253..255-byte session id echo is refused, not a u8 overflow (std bug, TLSCLIENT_FUZZ 2026-10-13)" {
+    inline for (.{ 253, 255 }) |len| {
+        var rec: [5 + 4 + 2 + 32 + 1 + 4]u8 = undefined;
+        rec[0..3].* = .{ 22, 3, 3 };
+        std.mem.writeInt(u16, rec[3..5], rec.len - 5, .big);
+        rec[5] = 2; // server_hello
+        std.mem.writeInt(u24, rec[6..9], rec.len - 9, .big);
+        rec[9..11].* = .{ 3, 3 };
+        @memset(rec[11..43], 0x42);
+        rec[43] = len; // claims far more than follows
+        @memset(rec[44..], 0);
+        var in_buf: [Client.min_buffer_len]u8 = undefined;
+        @memcpy(in_buf[0..rec.len], &rec);
+        var in: std.Io.Reader = .fixed(&in_buf);
+        in.end = rec.len;
+        var out: [8192]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&out);
+        var tls_in: [Client.min_buffer_len]u8 = undefined;
+        var tls_out: [Client.min_buffer_len]u8 = undefined;
+        const entropy = [_]u8{0x5a} ** Client.Options.entropy_len;
+        try testing.expectError(error.TlsDecodeError, Client.init(&in, &w, .{
+            .host = .no_verification,
+            .ca = .no_verification,
+            .read_buffer = &tls_in,
+            .write_buffer = &tls_out,
+            .entropy = &entropy,
+            .realtime_now = .{ .nanoseconds = 0 },
+        }));
+    }
+}
+
 test "HelloRetryRequest (offline): refusals -- a group we shared, no change, not offered, a second HRR, not TLS 1.3" {
     var a: [8192]u8 = undefined;
     // X25519 already had a share.
@@ -966,6 +997,50 @@ test "interop: resumption is not offered to another name, nor after the ticket's
     try testing.expect(cache.find("good.example.test").?.usable);
 }
 
+// ── S2 (2026-10-13): IP-address hosts, SAN-only names ──────────────────────
+
+test "interop: an IP host -- no SNI, matched against iPAddress SANs; a CN-only certificate is refused" {
+    const io = testing.io;
+    var tmp = try setUp(io);
+    defer tmp.cleanup();
+    inline for (.{
+        .{ "ip.pem", "ip.key", "/CN=ignored", "subjectAltName=IP:127.0.0.1,IP:::1" },
+        .{ "cn.pem", "cn.key", "/CN=cn-only.example.test", "basicConstraints=critical,CA:TRUE" },
+    }) |c| {
+        const gen = std.process.run(testing.allocator, io, .{
+            .argv = &.{ "openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes", "-keyout", c[1], "-out", c[0], "-days", "2", "-subj", c[2], "-addext", c[3] },
+            .cwd = .{ .dir = tmp.dir },
+        }) catch return error.SkipZigTest;
+        testing.allocator.free(gen.stdout);
+        testing.allocator.free(gen.stderr);
+    }
+    var bundle = try rootBundle(io, tmp.dir);
+    defer bundle.deinit(testing.allocator);
+    inline for (.{ "127.0.0.1", "[127.0.0.1]" }) |host| {
+        var srv = try Server.startWith(io, tmp.dir, "ip.pem", "ip.key", "ip.pem", &.{"-rev"});
+        defer srv.stop(io);
+        const s = try session(io, srv.port, &bundle, .{ .host = host, .self_signed = true });
+        try testing.expectEqualStrings("olleh", s.echo[0..s.echo_len]);
+    }
+    {
+        var srv = try Server.startWith(io, tmp.dir, "ip.pem", "ip.key", "ip.pem", &.{"-rev"});
+        defer srv.stop(io);
+        try testing.expectError(error.CertificateHostMismatch, session(io, srv.port, &bundle, .{ .host = "127.0.0.2", .self_signed = true }));
+    }
+    {
+        // RFC 9525 / Go: the commonName is never consulted (std fell back to it).
+        var srv = try Server.startWith(io, tmp.dir, "cn.pem", "cn.key", "cn.pem", &.{"-rev"});
+        defer srv.stop(io);
+        try testing.expectError(error.CertificateHostMismatch, session(io, srv.port, &bundle, .{ .host = "cn-only.example.test", .self_signed = true }));
+    }
+    // Offline: the hello for an IP host carries no server_name extension.
+    var a: [4096]u8 = undefined;
+    const h = try clientHelloWith(&a, .{ .host = "192.0.2.1" });
+    try testing.expect(std.mem.indexOf(u8, h, "192.0.2.1") == null);
+    const named = try clientHelloWith(&a, .{});
+    try testing.expect(std.mem.indexOf(u8, named, "good.example.test") != null);
+}
+
 // ── offline: the ClientHello, the ALPN answer, the CertificateRequest ──────
 
 /// The ClientHello this module writes with Go-shaped option overrides.
@@ -974,6 +1049,7 @@ const HelloOpts = struct {
     max_version: std.crypto.tls.ProtocolVersion = .tls_1_3,
     groups: []const std.crypto.tls.NamedGroup = &Client.default_groups,
     key_share_groups: []const std.crypto.tls.NamedGroup = &Client.default_key_share_groups,
+    host: []const u8 = "good.example.test",
 };
 
 fn clientHelloWith(out: []u8, o: HelloOpts) ![]const u8 {
@@ -985,7 +1061,7 @@ fn clientHelloWith(out: []u8, o: HelloOpts) ![]const u8 {
     var tls_out: [Client.min_buffer_len]u8 = undefined;
     const entropy = [_]u8{0x5a} ** Client.Options.entropy_len;
     if (Client.init(&in, &w, .{
-        .host = .{ .explicit = "good.example.test" },
+        .host = .{ .explicit = o.host },
         .ca = .no_verification,
         .read_buffer = &tls_in,
         .write_buffer = &tls_out,

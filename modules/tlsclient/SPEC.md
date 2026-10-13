@@ -113,6 +113,19 @@ marked `zig-libs tlsclient` in `Client.zig`:
   Not offered past the ticket lifetime (≤ 7 days) or the leaf's notAfter.
   PSK derivation, binder and the NewSessionTicket codec are `tlsresume`'s.
   TLS 1.2 session tickets (RFC 5077) are not resumed.
+- **Host names as Go checks them** (`x509.hostname`, RFC 9525): SAN only --
+  std fell back to the subject's commonName -- and an IP-literal host
+  (`127.0.0.1`, `[::1]`) is matched against iPAddress SANs and sent without
+  SNI (RFC 6066 §3 forbids an address there; std sent it and could not match
+  an IP at all).
+- **std defects fixed on the way** (all remotely triggerable by a server,
+  found by `TLSCLIENT_FUZZ` 2026-10-13, regression tests in place): a
+  ServerHello session-id echo of 253..255 bytes overflowed a `u8` sum; a TLS
+  1.3 record shorter than the AEAD tag and a TLS 1.2 record shorter than IV +
+  MAC underflowed their length; an all-zero TLS 1.3 plaintext (no content
+  type) indexed `msg[-1]` after the handshake and underflowed the fragment
+  end during it (RFC 8446 §5.4: unexpected_message); `tls_version` was read
+  undefined by handlers of messages arriving before the ServerHello.
 - **KeyUpdate sent** (RFC 8446 §4.6.3): a server's update_requested is
   answered with our KeyUpdate before our next record, and the client updates
   on its own after `key_update_after` (2^23) records. std switched its write

@@ -11,6 +11,7 @@ const native_endian = builtin.cpu.arch.endian();
 
 const std = @import("std");
 const verify = @import("verify.zig");
+const x509 = @import("x509");
 const p256 = @import("p256");
 const p384 = @import("p384");
 const p521 = @import("p521");
@@ -697,11 +698,14 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
     const versions = offeredVersions(&versions_buf, options.min_version, options.max_version);
     var alpn_ext_buf: [4 + 2 + max_alpn_len]u8 = undefined;
     const alpn_ext = try alpnExtension(&alpn_ext_buf, options.alpn_protocols);
+    // zig-libs tlsclient: an IP literal is not a server name -- RFC 6066 §3
+    // forbids it in SNI (Go sends none); it is checked against iPAddress SANs.
+    const host_is_ip = if (x509.hostname.parseHost(host)) |h| h != .dns else false;
     var hello_params: hello.Params = .{
         .random = &client_hello_rand,
         .session_id = &legacy_session_id,
         .cipher_suites = &cipher_suites,
-        .host = host,
+        .host = if (host_is_ip) "" else host,
         .versions = versions,
         .groups = options.groups,
         .shares = &.{},
@@ -758,7 +762,10 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
     // CertificateRequest, when one came.
     var cert_request: ?CertRequest = null;
 
-    var tls_version: tls.ProtocolVersion = undefined;
+    // zig-libs tlsclient: defined until the ServerHello sets it (std left it
+    // undefined and compared it in several message handlers before then; a
+    // version no ServerHello can negotiate here keeps those checks honest).
+    var tls_version: tls.ProtocolVersion = .tls_1_0;
     var chain: Certificate.Chain = if (Certificate.Chain != void) .empty;
     defer if (Certificate.Chain != void) chain.deinit();
     // These are used for two purposes:
@@ -873,7 +880,12 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
                         P.AEAD.decrypt(cleartext, ciphertext, auth_tag, record_header, nonce, pv.server_handshake_key) catch
                             return error.TlsBadRecordMac;
                         // TODO use scalar, non-slice version
-                        cleartext_fragment_end += mem.trimEnd(u8, cleartext, "\x00").len;
+                        const inner = mem.trimEnd(u8, cleartext, "\x00");
+                        // zig-libs tlsclient: RFC 8446 §5.4 -- an all-zero
+                        // plaintext has no content type; std underflowed
+                        // `cleartext_fragment_end` below.
+                        if (inner.len == 0) return error.TlsUnexpectedMessage;
+                        cleartext_fragment_end += inner.len;
                     },
                 }
                 read_seq += 1;
@@ -954,7 +966,10 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
                         const is_hrr = mem.eql(u8, &server_hello_rand, &tls.hello_retry_request_sequence);
                         if (is_hrr and hrr_seen) return error.TlsUnexpectedMessage; // a second HRR
                         const legacy_session_id_echo_len = hsd.decode(u8);
-                        try hsd.ensure(legacy_session_id_echo_len + 2 + 1);
+                        // zig-libs tlsclient: widened -- std summed in u8, so an echo length of
+                        // 253..255 overflowed (a remote panic in safe modes, a short check
+                        // in ReleaseFast). Found by TLSCLIENT_FUZZ, 2026-10-13.
+                        try hsd.ensure(@as(usize, legacy_session_id_echo_len) + 2 + 1);
                         const legacy_session_id_echo = hsd.slice(legacy_session_id_echo_len);
                         const cipher_suite_tag = hsd.decode(tls.CipherSuite);
                         hsd.skip(1); // legacy_compression_method
@@ -1293,9 +1308,17 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
                             if (cert_index == 0) {
                                 const subject = try (Certificate{ .buffer = der, .index = 0 }).parse();
                                 // Verify the host on the first certificate.
+                                // zig-libs tlsclient: Go's rules via `x509.hostname`
+                                // (RFC 9525): SAN only -- no commonName fallback,
+                                // which std's `verifyHostName` still had -- and IP
+                                // hosts against iPAddress entries, which std could
+                                // not match at all.
                                 switch (options.host) {
                                     .no_verification => {},
-                                    .explicit => try subject.verifyHostName(host),
+                                    .explicit => x509.hostname.verify(der, host) catch |e| return switch (e) {
+                                        error.CertificateHostMismatch => error.CertificateHostMismatch,
+                                        else => error.TlsCertificateNotVerified,
+                                    },
                                 }
 
                                 // Keep track of the public key for the
@@ -1363,7 +1386,7 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
                             .tls_1_3 => if (cipher_state != .handshake or handshake_state != .certificate) return error.TlsUnexpectedMessage,
                             // TLS 1.2: after ServerKeyExchange, before ServerHelloDone.
                             .tls_1_2 => if (cipher_state != .cleartext or handshake_state != .server_hello_done) return error.TlsUnexpectedMessage,
-                            else => unreachable,
+                            else => return error.TlsUnexpectedMessage, // before any ServerHello
                         }
                         switch (handshake_cipher) {
                             inline else => |*p| p.transcript_hash.update(wrapped_handshake),
@@ -2634,6 +2657,9 @@ fn readIndirect(c: *Client) Reader.Error!usize {
             .tls_1_3 => {
                 const pv = &p.tls_1_3;
                 const P = @TypeOf(p.*);
+                // zig-libs tlsclient: std subtracted unchecked -- a record
+                // shorter than the tag underflowed (TLSCLIENT_FUZZ, 2026-10-13).
+                if (record_len < P.AEAD.tag_length) return failRead(c, error.TlsBadLength);
                 const ad = input.take(tls.record_header_len) catch unreachable; // already peeked
                 const ciphertext_len = record_len - P.AEAD.tag_length;
                 const ciphertext = input.take(ciphertext_len) catch unreachable; // already peeked
@@ -2650,11 +2676,16 @@ fn readIndirect(c: *Client) Reader.Error!usize {
                     return failRead(c, error.TlsBadRecordMac);
                 // TODO use scalar, non-slice version
                 const msg = mem.trimEnd(u8, cleartext, "\x00");
+                // zig-libs tlsclient: RFC 8446 §5.4 -- no non-zero octet (no
+                // content type) is unexpected_message; std indexed msg[-1].
+                if (msg.len == 0) return failRead(c, error.TlsUnexpectedMessage);
                 break :cleartext .{ msg.len - 1, @enumFromInt(msg[msg.len - 1]) };
             },
             .tls_1_2 => {
                 const pv = &p.tls_1_2;
                 const P = @TypeOf(p.*);
+                // zig-libs tlsclient: checked, as the handshake path already was.
+                if (record_len < P.record_iv_length + P.mac_length) return failRead(c, error.TlsBadLength);
                 const message_len: u16 = record_len - P.record_iv_length - P.mac_length;
                 const ad_header = input.take(tls.record_header_len) catch unreachable; // already peeked
                 const ad = mem.toBytes(big(c.read_seq)) ++

@@ -11,7 +11,8 @@
 //!   that the client ACCEPTS undamaged, and a plaintext TLS 1.2 flight
 //!   (ServerHello, Certificate, ServerKeyExchange with a real signature,
 //!   ServerHelloDone) that the client takes up to the point of sending its
-//!   own Finished. The driver damages 0-3 octets (half of them in the first
+//!   own Finished, and (2026-10-13) the TLS 1.3 flight after a cookie
+//!   HelloRetryRequest. The driver damages 0-3 octets (half of them in the first
 //!   96 bytes: the hello's structure), maybe truncates. Oracle: a flight that
 //!   differs from the genuine 1.3 one anywhere but a record's ignored
 //!   legacy_version octets is REFUSED; a TLS 1.2 flight never completes
@@ -117,6 +118,16 @@ const Templates = struct {
     /// Offset of every record header in `f13`.
     f13_records: [12]usize = undefined,
     f13_nrecords: usize = 0,
+    /// The same flight after a cookie HelloRetryRequest (added 2026-10-13):
+    /// HRR record first, transcript message_hash(CH1) ‖ HRR ‖ CH2 ‖ ….
+    f13h: [6144]u8 = undefined,
+    f13h_len: usize = 0,
+    f13h_records: [12]usize = undefined,
+    f13h_nrecords: usize = 0,
+    /// The genuine flight's server application key and IV (for crafted
+    /// application records in the regression tests).
+    akey: [16]u8 = undefined,
+    aiv: [12]u8 = undefined,
     f12: [4096]u8 = undefined,
     f12_len: usize = 0,
 };
@@ -128,6 +139,12 @@ var read_buf: [Client.min_buffer_len]u8 = undefined;
 var write_buf: [Client.min_buffer_len]u8 = undefined;
 var out_buf: [8192]u8 = undefined;
 var sink: Client = undefined;
+var info_storage: [16 * 1024]u8 = undefined;
+var info: Client.ConnectionInfo = undefined;
+
+fn selectNone(_: ?*anyopaque, _: *const Client.CertificateRequestInfo) ?Client.ClientAuth {
+    return null;
+}
 
 const Outcome = struct {
     /// `initInto`'s error, if any.
@@ -149,6 +166,10 @@ fn runClient(input: []const u8, out_copy: ?*Writer) Outcome {
     var dw: Writer.Discarding = .init(&out_buf);
     var fw = Writer.fixed(&out_buf);
     const w: *Writer = if (out_copy != null) &fw else &dw.writer;
+    // The session view and a client-certificate selector are on (2026-10-13)
+    // so the OCSP/SCT, chain-copy and CertificateRequest parsers see the
+    // damaged flights too.
+    info = .init(&info_storage);
     const opts: Client.Options = .{
         .host = .no_verification,
         .ca = .no_verification,
@@ -156,6 +177,8 @@ fn runClient(input: []const u8, out_copy: ?*Writer) Outcome {
         .read_buffer = &read_buf,
         .entropy = &tm.entropy,
         .realtime_now = .{ .nanoseconds = 0 },
+        .connection_info = &info,
+        .client_auth_select = .{ .select = selectNone },
     };
     var o: Outcome = .{};
     if (Client.initInto(&sink, &reader, w, opts)) |_| {
@@ -173,9 +196,13 @@ fn hsMsg(buf: []u8, typ: tls.HandshakeType, body: []const u8) []const u8 {
     return buf[0 .. 4 + body.len];
 }
 
+/// Where `putRecord` notes record offsets (the template being built).
+var cur_records: *[12]usize = &tm.f13_records;
+var cur_nrecords: *usize = &tm.f13_nrecords;
+
 fn putRecord(w: *Writer, ct: tls.ContentType, body: []const u8) void {
-    tm.f13_records[tm.f13_nrecords] = w.end;
-    tm.f13_nrecords += 1;
+    cur_records[cur_nrecords.*] = w.end;
+    cur_nrecords.* += 1;
     w.writeByte(@intFromEnum(ct)) catch unreachable;
     w.writeAll(&.{ 3, 3 }) catch unreachable;
     w.writeInt(u16, @intCast(body.len), .big) catch unreachable;
@@ -239,11 +266,111 @@ fn ensureTemplates() !void {
     std.mem.writeInt(u24, sh[1..4], @intCast(shw.end - 4), .big);
     const server_hello = sh[0..shw.end];
 
-    var th = Sha256.init(.{});
-    th.update(client_hello[tls.record_header_len..]);
+    cur_records = &tm.f13_records;
+    cur_nrecords = &tm.f13_nrecords;
+    var th0 = Sha256.init(.{});
+    th0.update(client_hello[tls.record_header_len..]);
+    tm.f13_len = try buildFlight13(&tm.f13, "", th0, server_hello, srv_sk, client_x25519.public_key);
+
+    // The same after a cookie HRR: the client's two hellos, then the flight
+    // over message_hash(CH1) ‖ HRR ‖ CH2.
+    {
+        var hrr_buf: [256]u8 = undefined;
+        var hw = Writer.fixed(&hrr_buf);
+        const cookie = "fuzz-cookie-0123";
+        hw.writeAll(&.{ 22, 3, 3 }) catch unreachable;
+        hw.writeInt(u16, 0, .big) catch unreachable; // patched
+        hw.writeByte(@intFromEnum(tls.HandshakeType.server_hello)) catch unreachable;
+        hw.writeInt(u24, 0, .big) catch unreachable; // patched
+        hw.writeInt(u16, 0x0303, .big) catch unreachable;
+        hw.writeAll(&tls.hello_retry_request_sequence) catch unreachable;
+        hw.writeByte(32) catch unreachable;
+        hw.writeAll(session_echo) catch unreachable;
+        hw.writeInt(u16, @intFromEnum(tls.CipherSuite.AES_128_GCM_SHA256), .big) catch unreachable;
+        hw.writeByte(0) catch unreachable;
+        hw.writeInt(u16, 6 + 4 + 2 + cookie.len, .big) catch unreachable;
+        hw.writeAll(&.{ 0, 43, 0, 2, 3, 4 }) catch unreachable; // supported_versions: 1.3
+        hw.writeInt(u16, @intFromEnum(tls.ExtensionType.cookie), .big) catch unreachable;
+        hw.writeInt(u16, 2 + cookie.len, .big) catch unreachable;
+        hw.writeInt(u16, cookie.len, .big) catch unreachable;
+        hw.writeAll(cookie) catch unreachable;
+        std.mem.writeInt(u16, hrr_buf[3..5], @intCast(hw.end - 5), .big);
+        std.mem.writeInt(u24, hrr_buf[6..9], @intCast(hw.end - 9), .big);
+        const hrr_record = hrr_buf[0..hw.end];
+        var two: Writer = undefined;
+        const e2 = runClient(hrr_record, &two);
+        try testing.expectEqual(@as(?anyerror, error.TlsConnectionTruncated), e2.init_err);
+        const ch2 = two.buffered()[tm.hello_len + tls.record_header_len ..];
+        var h1: [32]u8 = undefined;
+        Sha256.hash(client_hello[tls.record_header_len..], &h1, .{});
+        var thh = Sha256.init(.{});
+        thh.update(&.{ @intFromEnum(tls.HandshakeType.message_hash), 0, 0, 32 });
+        thh.update(&h1);
+        thh.update(hrr_record[tls.record_header_len..]);
+        thh.update(ch2);
+        cur_records = &tm.f13h_records;
+        cur_nrecords = &tm.f13h_nrecords;
+        tm.f13h_records[0] = 0;
+        tm.f13h_nrecords = 1;
+        tm.f13h_len = try buildFlight13(&tm.f13h, hrr_record, thh, server_hello, srv_sk, client_x25519.public_key);
+        cur_records = &tm.f13_records;
+        cur_nrecords = &tm.f13_nrecords;
+    }
+
+    // ── TLS 1.2 (plaintext until the server's Finished, which never comes) ──
+    var body: [2048]u8 = undefined;
+    const der = server_cert_der;
+    const kp = try Es256.KeyPair.fromSecretKey(try Es256.SecretKey.fromBytes(server_key_der[7..39].*));
+    var sig_der: [Es256.Signature.der_encoded_length_max]u8 = undefined;
+    var w12 = Writer.fixed(&tm.f12);
+    var m12: [1024]u8 = undefined;
+    var bw = Writer.fixed(&body);
+    bw.writeInt(u16, 0x0303, .big) catch unreachable;
+    bw.writeAll(&server_rand) catch unreachable;
+    bw.writeByte(0) catch unreachable; // no session id
+    // The certificate's key is P-256, so the suite is ECDHE_ECDSA (RFC 8422
+    // §5.3; the client checks the pairing since 2026-10-13 -- std accepted
+    // ECDHE_RSA here).
+    bw.writeInt(u16, @intFromEnum(tls.CipherSuite.ECDHE_ECDSA_WITH_AES_128_GCM_SHA256), .big) catch unreachable;
+    bw.writeByte(0) catch unreachable;
+    putPlain(&w12, hsMsg(&m12, .server_hello, body[0..bw.end]));
+
+    bw = Writer.fixed(&body);
+    bw.writeInt(u24, @intCast(3 + der.len), .big) catch unreachable;
+    bw.writeInt(u24, @intCast(der.len), .big) catch unreachable;
+    bw.writeAll(der) catch unreachable;
+    putPlain(&w12, hsMsg(&m12, .certificate, body[0..bw.end]));
+
+    var params: [3 + 1 + 32]u8 = undefined;
+    params[0] = 3;
+    std.mem.writeInt(u16, params[1..3], @intFromEnum(tls.NamedGroup.x25519), .big);
+    params[3] = 32;
+    params[4..][0..32].* = srv_pub;
+    var to_sign: [32 + 32 + params.len]u8 = undefined;
+    to_sign[0..32].* = client_rand.*;
+    to_sign[32..64].* = server_rand;
+    to_sign[64..].* = params;
+    const sig12 = (try kp.sign(&to_sign, null)).toDer(&sig_der);
+    bw = Writer.fixed(&body);
+    bw.writeAll(&params) catch unreachable;
+    bw.writeInt(u16, @intFromEnum(tls.SignatureScheme.ecdsa_secp256r1_sha256), .big) catch unreachable;
+    bw.writeInt(u16, @intCast(sig12.len), .big) catch unreachable;
+    bw.writeAll(sig12) catch unreachable;
+    putPlain(&w12, hsMsg(&m12, .server_key_exchange, body[0..bw.end]));
+    putPlain(&w12, hsMsg(&m12, .server_hello_done, ""));
+    tm.f12_len = w12.end;
+    tm_ready = true;
+}
+
+/// The TLS 1.3 server flight after `prefix` (records already sent) over the
+/// transcript `th0` (everything before the ServerHello): ServerHello, CCS,
+/// EncryptedExtensions, Certificate, CertificateVerify, Finished, then the
+/// application stream. Returns its length in `out`.
+fn buildFlight13(out: []u8, prefix: []const u8, th0: Sha256, server_hello: []const u8, srv_sk: [32]u8, client_x25519_pub: [32]u8) !usize {
+    var th = th0;
     th.update(server_hello);
     const hello_hash = th.peek();
-    const shared = try X25519.scalarmult(srv_sk, client_x25519.public_key);
+    const shared = try X25519.scalarmult(srv_sk, client_x25519_pub);
     const zeroes = [1]u8{0} ** 32;
     const early = Hkdf.extract(&[1]u8{0}, &zeroes);
     const empty = tls.emptyHash(Sha256);
@@ -253,7 +380,8 @@ fn ensureTemplates() !void {
     const key = tls.hkdfExpandLabel(Hkdf, s_ts, "key", "", 16);
     const iv = tls.hkdfExpandLabel(Hkdf, s_ts, "iv", "", 12);
 
-    var w13 = Writer.fixed(&tm.f13);
+    var w13 = Writer.fixed(out);
+    w13.writeAll(prefix) catch unreachable;
     putRecord(&w13, .handshake, server_hello);
     putRecord(&w13, .change_cipher_spec, &.{1});
     var buf: [2048]u8 = undefined;
@@ -299,53 +427,17 @@ fn ensureTemplates() !void {
     const s_ap = tls.hkdfExpandLabel(Hkdf, master, "s ap traffic", &th.peek(), 32);
     const akey = tls.hkdfExpandLabel(Hkdf, s_ap, "key", "", 16);
     const aiv = tls.hkdfExpandLabel(Hkdf, s_ap, "iv", "", 12);
+    if (prefix.len == 0) { // the plain flight's keys, not the HRR variant's
+        tm.akey = akey;
+        tm.aiv = aiv;
+    }
     putEncrypted(&w13, akey, aiv, 0, .application_data, "ping");
     const ku = hsMsg(&buf, .key_update, &.{0});
     putEncrypted(&w13, akey, aiv, 1, .handshake, ku);
     const s_ap2 = tls.hkdfExpandLabel(Hkdf, s_ap, "traffic upd", "", 32);
     putEncrypted(&w13, tls.hkdfExpandLabel(Hkdf, s_ap2, "key", "", 16), tls.hkdfExpandLabel(Hkdf, s_ap2, "iv", "", 12), 0, .application_data, "pong");
     putEncrypted(&w13, tls.hkdfExpandLabel(Hkdf, s_ap2, "key", "", 16), tls.hkdfExpandLabel(Hkdf, s_ap2, "iv", "", 12), 1, .alert, &.{ 1, 0 });
-    tm.f13_len = w13.end;
-
-    // ── TLS 1.2 (plaintext until the server's Finished, which never comes) ──
-    var w12 = Writer.fixed(&tm.f12);
-    var m12: [1024]u8 = undefined;
-    var bw = Writer.fixed(&body);
-    bw.writeInt(u16, 0x0303, .big) catch unreachable;
-    bw.writeAll(&server_rand) catch unreachable;
-    bw.writeByte(0) catch unreachable; // no session id
-    // The certificate's key is P-256, so the suite is ECDHE_ECDSA (RFC 8422
-    // §5.3; the client checks the pairing since 2026-10-13 -- std accepted
-    // ECDHE_RSA here).
-    bw.writeInt(u16, @intFromEnum(tls.CipherSuite.ECDHE_ECDSA_WITH_AES_128_GCM_SHA256), .big) catch unreachable;
-    bw.writeByte(0) catch unreachable;
-    putPlain(&w12, hsMsg(&m12, .server_hello, body[0..bw.end]));
-
-    bw = Writer.fixed(&body);
-    bw.writeInt(u24, @intCast(3 + der.len), .big) catch unreachable;
-    bw.writeInt(u24, @intCast(der.len), .big) catch unreachable;
-    bw.writeAll(der) catch unreachable;
-    putPlain(&w12, hsMsg(&m12, .certificate, body[0..bw.end]));
-
-    var params: [3 + 1 + 32]u8 = undefined;
-    params[0] = 3;
-    std.mem.writeInt(u16, params[1..3], @intFromEnum(tls.NamedGroup.x25519), .big);
-    params[3] = 32;
-    params[4..][0..32].* = srv_pub;
-    var to_sign: [32 + 32 + params.len]u8 = undefined;
-    to_sign[0..32].* = client_rand.*;
-    to_sign[32..64].* = server_rand;
-    to_sign[64..].* = params;
-    const sig12 = (try kp.sign(&to_sign, null)).toDer(&sig_der);
-    bw = Writer.fixed(&body);
-    bw.writeAll(&params) catch unreachable;
-    bw.writeInt(u16, @intFromEnum(tls.SignatureScheme.ecdsa_secp256r1_sha256), .big) catch unreachable;
-    bw.writeInt(u16, @intCast(sig12.len), .big) catch unreachable;
-    bw.writeAll(sig12) catch unreachable;
-    putPlain(&w12, hsMsg(&m12, .server_key_exchange, body[0..bw.end]));
-    putPlain(&w12, hsMsg(&m12, .server_hello_done, ""));
-    tm.f12_len = w12.end;
-    tm_ready = true;
+    return w13.end;
 }
 
 fn putPlain(w: *Writer, msg: []const u8) void {
@@ -357,6 +449,7 @@ fn putPlain(w: *Writer, msg: []const u8) void {
 
 const FlightMark = Marker(enum {
     genuine_accepted,
+    hrr_genuine_accepted,
     tls13_refused_mac,
     tls13_refused_hello,
     app_refused,
@@ -368,15 +461,16 @@ const FlightMark = Marker(enum {
     raw,
 });
 
-/// True when `got` differs from the genuine TLS 1.3 flight only in the
-/// ignored legacy_version octets of the two cleartext records' headers.
-fn sameButVersions(got: []const u8) bool {
-    if (got.len != tm.f13_len) return false;
-    for (got, tm.f13[0..tm.f13_len], 0..) |a, b, i| {
+/// True when `got` differs from a genuine TLS 1.3 flight only in the
+/// ignored legacy_version octets of its cleartext records' headers (the
+/// first `clear` records: ServerHello and CCS, with an HRR before them).
+fn sameButVersions(got: []const u8, want: []const u8, records: []const usize, clear: usize) bool {
+    if (got.len != want.len) return false;
+    for (got, want, 0..) |a, b, i| {
         if (a == b) continue;
         var ignored = false;
-        // Only the two cleartext records: an encrypted record's header is AAD.
-        for (tm.f13_records[0..2]) |r| {
+        // Only cleartext records: an encrypted record's header is AAD.
+        for (records[0..clear]) |r| {
             if (i == r + 1 or i == r + 2) ignored = true;
         }
         if (!ignored) return false;
@@ -387,15 +481,19 @@ fn sameButVersions(got: []const u8) bool {
 pub fn fuzzFlight(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     _ = gpa;
     try ensureTemplates();
-    var buf: [6000]u8 = undefined;
-    var kind: enum { f13, f12, alert, raw } = .raw;
+    var buf: [6144]u8 = undefined;
+    var kind: enum { f13, f13h, f12, alert, raw } = .raw;
     var n: usize = 0;
     if (S != fuzz_driver.Rng) {
         n = src.slice(&buf);
-    } else switch (src.valueRangeAtMost(u8, 0, 9)) {
+    } else switch (src.valueRangeAtMost(u8, 0, 11)) {
         0...4 => {
             kind = .f13;
             n = damage(src, &buf, tm.f13[0..tm.f13_len]);
+        },
+        10, 11 => {
+            kind = .f13h;
+            n = damage(src, &buf, tm.f13h[0..tm.f13h_len]);
         },
         5...7 => {
             kind = .f12;
@@ -410,14 +508,18 @@ pub fn fuzzFlight(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!vo
     }
     const o = runClient(buf[0..n], null);
     const err: ?anyerror = if (o.init_err) |e| e else o.read_err;
-    const same = kind == .f13 and sameButVersions(buf[0..n]);
+    const same = switch (kind) {
+        .f13 => sameButVersions(buf[0..n], tm.f13[0..tm.f13_len], &tm.f13_records, 2),
+        .f13h => sameButVersions(buf[0..n], tm.f13h[0..tm.f13h_len], &tm.f13h_records, 3),
+        else => false,
+    };
     if (err == null) {
         // Established and read to a clean close_notify: only the genuine flight.
         if (!same or o.app_octets != 8) {
             std.debug.print("tlsclient-flight: a flight that is not the genuine one was ACCEPTED (kind {t}, {d} application octets)\n", .{ kind, o.app_octets });
             return error.DamagedFlightAccepted;
         }
-        FlightMark.mark(.genuine_accepted);
+        if (kind == .f13h) FlightMark.mark(.hrr_genuine_accepted) else FlightMark.mark(.genuine_accepted);
         return;
     }
     if (same) {
@@ -430,7 +532,7 @@ pub fn fuzzFlight(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!vo
         error.TlsAlert => FlightMark.mark(.alert),
         error.TlsConnectionTruncated => FlightMark.mark(.truncated),
         error.TlsDecodeError => FlightMark.mark(.decode),
-        else => if (kind == .f13) FlightMark.mark(.tls13_refused_hello),
+        else => if (kind == .f13 or kind == .f13h) FlightMark.mark(.tls13_refused_hello),
     };
     switch (kind) {
         .f12 => if (o.written > tm.hello_len) FlightMark.mark(.tls12_took_flight) else FlightMark.mark(.tls12_refused),
@@ -461,7 +563,59 @@ test "the genuine flights: TLS 1.3 is accepted and read to close_notify, TLS 1.2
     try testing.expectEqual(@as(?anyerror, null), o13.init_err);
     try testing.expectEqual(@as(?anyerror, null), o13.read_err);
     try testing.expectEqual(@as(u64, 8), o13.app_octets); // "ping" + "pong", across a KeyUpdate
+    // The same flight after a cookie HelloRetryRequest.
+    const o13h = runClient(tm.f13h[0..tm.f13h_len], null);
+    try testing.expectEqual(@as(?anyerror, null), o13h.init_err);
+    try testing.expectEqual(@as(u64, 8), o13h.app_octets);
+    try testing.expect(sink.hello_retry_request);
     const o12 = runClient(tm.f12[0..tm.f12_len], null);
     try testing.expectEqual(@as(?anyerror, error.TlsConnectionTruncated), o12.init_err);
     try testing.expect(o12.written > tm.hello_len);
+}
+
+test "a short or all-zero application record ends the read with an error, not an underflow (std bugs, TLSCLIENT_FUZZ 2026-10-13)" {
+    try ensureTemplates();
+    // The genuine handshake, up to its first application record (index 6:
+    // SH, CCS, EE, Certificate, CertificateVerify, Finished).
+    const hs_end = tm.f13_records[6];
+    var input: [4096]u8 = undefined;
+    @memcpy(input[0..hs_end], tm.f13[0..hs_end]);
+    // A record shorter than the AEAD tag.
+    const short = [_]u8{ 23, 3, 3, 0, 5, 1, 2, 3, 4, 5 };
+    @memcpy(input[hs_end..][0..short.len], &short);
+    const o1 = runClient(input[0 .. hs_end + short.len], null);
+    try testing.expectEqual(@as(?anyerror, null), o1.init_err);
+    // The Reader reports ReadFailed; the cause is kept in `read_err`.
+    try testing.expectEqual(@as(?anyerror, error.ReadFailed), o1.read_err);
+    try testing.expectEqual(@as(?Client.ReadError, error.TlsBadLength), sink.read_err);
+    // A record whose plaintext is all zeros: authentic, but no content type.
+    var w = Writer.fixed(input[hs_end..]);
+    var rec_store: [12]usize = undefined;
+    var nrec: usize = 0;
+    cur_records = &rec_store;
+    cur_nrecords = &nrec;
+    defer {
+        cur_records = &tm.f13_records;
+        cur_nrecords = &tm.f13_nrecords;
+    }
+    var zeros: [8]u8 = @splat(0);
+    putEncryptedRaw(&w, tm.akey, tm.aiv, 0, &zeros);
+    const o2 = runClient(input[0 .. hs_end + w.end], null);
+    try testing.expectEqual(@as(?anyerror, null), o2.init_err);
+    try testing.expectEqual(@as(?anyerror, error.ReadFailed), o2.read_err);
+    try testing.expectEqual(@as(?Client.ReadError, error.TlsUnexpectedMessage), sink.read_err);
+}
+
+/// One TLS 1.3 record over the raw inner plaintext `inner` (content type and
+/// padding included by the caller).
+fn putEncryptedRaw(w: *Writer, key: [16]u8, iv: [12]u8, seq: u64, inner: []const u8) void {
+    var rec: [2048 + 16]u8 = undefined;
+    var header: [5]u8 = .{ @intFromEnum(tls.ContentType.application_data), 3, 3, 0, 0 };
+    std.mem.writeInt(u16, header[3..5], @intCast(inner.len + 16), .big);
+    var nonce = iv;
+    var seq_be: [8]u8 = undefined;
+    std.mem.writeInt(u64, &seq_be, seq, .big);
+    for (nonce[4..], seq_be) |*b, sb| b.* ^= sb;
+    Aead.encrypt(rec[0..inner.len], rec[inner.len..][0..16], inner, &header, nonce, key);
+    putRecord(w, .application_data, rec[0 .. inner.len + 16]);
 }
