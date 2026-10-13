@@ -751,7 +751,7 @@ pub const P256 = struct {
             carry = @intFromBool(is_neg);
             const m = if (is_neg) fb_twow - x else x;
             if (m == 0) continue;
-            var q = base_table[i][m - 1];
+            var q = base_table[i][@intCast(m - 1)];
             if (is_neg) q.y = q.y.neg();
             acc = acc.addMixed(q);
         }

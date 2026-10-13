@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-13** — Fix: the variable-time base-table walk indexed the table with a `u64` window digit, which does not compile on 32-bit targets (`check-portable` linux32 via dns → http → tlsclient); now `@intCast` (the digit is < 2^w).
 - **2026-10-13** — **New module.** NIST P-384: Montgomery field in std's `P384.Fe` representation
   (portable `mont.zig`, shared with the scalar field; amd64 `MULX`/`ADCX`/`ADOX` CIOS core in
   `fast_core.zig`, asm text generated at comptime), `p521`'s group algorithms (Jacobian loops,

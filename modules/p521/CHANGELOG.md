@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-13** — Fix: the variable-time base-table walk indexed the table with a `u64` window digit, which does not compile on 32-bit targets (`check-portable` linux32 via dns → http → tlsclient); now `@intCast` (the digit is < 2^w).
 - **2026-10-11** — **Speed (P3 → P2):** scalar multiplication in Jacobian coordinates. Secret
   scalar (`mul`, ECDH): reduced mod n, folded to min(s, n − s), 106 signed 5-bit digits over a
   16-entry affine table (one batch inversion), masked scans and blends; the incomplete formulas'

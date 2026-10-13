@@ -591,10 +591,10 @@ pub const P521 = struct {
             if (x >= fb_half) {
                 carry = 1;
                 if (x == fb_twow) continue; // digit 0, carry out
-                acc = acc.addAffineVt(base_table[i][fb_twow - x - 1].neg());
+                acc = acc.addAffineVt(base_table[i][@intCast(fb_twow - x - 1)].neg());
             } else {
                 carry = 0;
-                acc = acc.addAffineVt(base_table[i][x - 1]);
+                acc = acc.addAffineVt(base_table[i][@intCast(x - 1)]);
             }
         }
         return acc;
