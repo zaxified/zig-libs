@@ -732,6 +732,62 @@ test "interop: an Ed25519 server certificate (TLS 1.3 CertificateVerify, TLS 1.2
     }
 }
 
+test "interop: KeyUpdate -- the server's update_requested is answered before our next record (s_server K / k)" {
+    const io = testing.io;
+    var tmp = try setUp(io);
+    defer tmp.cleanup();
+    var bundle = try rootBundle(io, tmp.dir);
+    defer bundle.deinit(testing.allocator);
+    inline for (.{ "K", "k" }) |cmd| {
+        var srv = try Server.start(io, tmp.dir, "leaf.pem", "leaf.key.pem", "inter.pem");
+        defer srv.stop(io);
+        const addr = try std.Io.net.IpAddress.parse("127.0.0.1", srv.port);
+        const stream = try addr.connect(io, .{ .mode = .stream });
+        defer stream.close(io);
+        const tv: std.posix.timeval = .{ .sec = 5, .usec = 0 };
+        std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
+        var net_in: [Client.min_buffer_len]u8 = undefined;
+        var net_out: [Client.min_buffer_len]u8 = undefined;
+        var tls_in: [Client.min_buffer_len]u8 = undefined;
+        var tls_out: [Client.min_buffer_len]u8 = undefined;
+        var sr = stream.reader(io, &net_in);
+        var sw = stream.writer(io, &net_out);
+        var entropy: [Client.Options.entropy_len]u8 = undefined;
+        io.random(&entropy);
+        var lock: std.Io.RwLock = .init;
+        var c = try Client.init(&sr.interface, &sw.interface, .{
+            .host = .{ .explicit = "good.example.test" },
+            .ca = .{ .bundle = .{ .gpa = testing.allocator, .io = io, .lock = &lock, .bundle = &bundle } },
+            .read_buffer = &tls_in,
+            .write_buffer = &tls_out,
+            .entropy = &entropy,
+            .realtime_now = std.Io.Clock.real.now(io),
+        });
+        // The server sends a KeyUpdate (K: update_requested, k: not), then "hello".
+        var cmd_buf: [16]u8 = undefined;
+        var sin = srv.child.stdin.?.writer(io, &cmd_buf);
+        // Two writes: s_server acts on a command line and drops the rest of
+        // that read (checked by hand, 2026-10-13).
+        try sin.interface.writeAll(cmd ++ "\n");
+        try sin.interface.flush();
+        io.sleep(.fromMilliseconds(300), .awake) catch {};
+        try sin.interface.writeAll("hello\n");
+        try sin.interface.flush();
+        const line = (try c.reader.takeDelimiter('\n')) orelse return error.EndOfStream;
+        try testing.expectEqualStrings("hello", line);
+        try testing.expectEqual(std.mem.eql(u8, cmd, "K"), c.key_update_pending);
+        // Our next record: preceded by our KeyUpdate after "K"; either way the
+        // server must read it.
+        try c.writer.writeAll("ping-after-update\n");
+        try c.writer.flush();
+        try sw.interface.flush();
+        try testing.expect(!c.key_update_pending);
+        try c.end(); // close_notify: s_server ends the connection and exits (-naccept 1)
+        try sw.interface.flush();
+        try testing.expect(srv.reported(io, "ping-after-update"));
+    }
+}
+
 // ── offline: the ClientHello, the ALPN answer, the CertificateRequest ──────
 
 /// The ClientHello this module writes with Go-shaped option overrides.

@@ -90,6 +90,11 @@ marked `zig-libs tlsclient` in `Client.zig`:
 - **Keying-material exporter** `exportKeyingMaterial(label, context, out)`:
   RFC 8446 §7.5; TLS 1.2 RFC 5705 only with EMS and without the PRF's own
   labels (Go's rules). Equal to `openssl s_server -keymatexport` in both.
+- **KeyUpdate sent** (RFC 8446 §4.6.3): a server's update_requested is
+  answered with our KeyUpdate before our next record, and the client updates
+  on its own after `key_update_after` (2^23) records. std switched its write
+  key on update_requested without telling the server, so the next record was
+  refused (bad_record_mac; reproduced with `s_server`'s `K`).
 
 - **ALPN (RFC 7301).** `Options.alpn_protocols` (default empty: no
   extension) and `Client.alpn_protocol`. The extension goes last in the

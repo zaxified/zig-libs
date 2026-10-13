@@ -79,6 +79,10 @@ hello_retry_request: bool = false,
 cipher_suite: tls.CipherSuite = @enumFromInt(0),
 /// The keying-material exporter's secret (`exportKeyingMaterial`).
 exporter: Exporter = .none,
+/// zig-libs tlsclient: a KeyUpdate of ours is due before the next record --
+/// the server asked (update_requested) or `write_seq` reached
+/// `key_update_after`.
+key_update_pending: bool = false,
 
 pub const ReadError = error{
     /// The alert description will be stored in `alert`.
@@ -113,6 +117,11 @@ pub const SslKeyLog = struct {
 /// The `Reader` supplied to `init` requires a buffer capacity
 /// at least this amount.
 pub const min_buffer_len = tls.max_ciphertext_record_len;
+
+/// zig-libs tlsclient: records sent under one TLS 1.3 key before the client
+/// updates it on its own -- well inside RFC 8446 §5.5's AES-GCM limit of
+/// 2^24.5 records.
+pub const key_update_after: u64 = 1 << 23;
 
 pub const Options = struct {
     /// How to perform host verification of server certificates.
@@ -1927,6 +1936,30 @@ fn prepareCiphertextRecord(
                         .ciphertext_end = ciphertext_end,
                         .cleartext_len = bytes_i,
                     };
+                    // zig-libs tlsclient: a due KeyUpdate goes first, under
+                    // the current key; the record after it uses the next.
+                    if (c.write_seq >= key_update_after) c.key_update_pending = true;
+                    if (c.key_update_pending) {
+                        const ku_len = tls.record_header_len + 4 + 1 + 1 + P.AEAD.tag_length;
+                        if (ciphertext_buf.len - ciphertext_end < ku_len + overhead_len + 1) return .{
+                            .ciphertext_end = ciphertext_end,
+                            .cleartext_len = bytes_i,
+                        };
+                        ciphertext_end += sealRecord13(P, pv, c.write_seq, ciphertext_buf[ciphertext_end..], &.{ @intFromEnum(tls.HandshakeType.key_update), 0, 0, 1, @intFromEnum(tls.KeyUpdateRequest.update_not_requested) }, .handshake);
+                        const client_secret = hkdfExpandLabel(P.Hkdf, pv.client_secret, "traffic upd", "", P.Hash.digest_length);
+                        if (c.ssl_key_log) |key_log| logSecrets(key_log.writer, .{
+                            .counter = key_log.clientCounter(),
+                            .client_random = &key_log.client_random,
+                        }, .{
+                            .CLIENT_TRAFFIC_SECRET = &client_secret,
+                        });
+                        pv.client_secret = client_secret;
+                        pv.client_key = hkdfExpandLabel(P.Hkdf, client_secret, "key", "", P.AEAD.key_length);
+                        pv.client_iv = hkdfExpandLabel(P.Hkdf, client_secret, "iv", "", P.AEAD.nonce_length);
+                        c.write_seq = 0;
+                        c.key_update_pending = false;
+                        continue; // re-size the content against the space left
+                    }
 
                     @memcpy(cleartext_buf[0..encrypted_content_len], bytes[bytes_i..][0..encrypted_content_len]);
                     cleartext_buf[encrypted_content_len] = @intFromEnum(inner_content_type);
@@ -1950,7 +1983,7 @@ fn prepareCiphertextRecord(
                         break :nonce @as(V, pv.client_iv) ^ operand;
                     };
                     P.AEAD.encrypt(ciphertext, auth_tag, cleartext, ad, nonce, pv.client_key);
-                    c.write_seq += 1; // TODO send key_update on overflow
+                    c.write_seq += 1; // zig-libs tlsclient: a KeyUpdate is due at key_update_after (above)
                 }
             },
             .tls_1_2 => {
@@ -1992,12 +2025,33 @@ fn prepareCiphertextRecord(
                     const auth_tag = ciphertext_buf[ciphertext_end..][0..P.mac_length];
                     ciphertext_end += P.mac_length;
                     P.AEAD.encrypt(ciphertext, auth_tag, cleartext, ad, nonce, pv.client_write_key);
-                    c.write_seq += 1; // TODO send key_update on overflow
+                    c.write_seq += 1; // TLS 1.2 has no key update; 2^64 records are out of reach
                 }
             },
             else => unreachable,
         },
     }
+}
+
+/// zig-libs tlsclient: one TLS 1.3 record holding `content` of type `ct`,
+/// sealed with sequence number `seq`; returns the bytes written.
+fn sealRecord13(comptime P: type, pv: anytype, seq: u64, out: []u8, content: []const u8, ct: tls.ContentType) usize {
+    var clear: [16]u8 = undefined;
+    @memcpy(clear[0..content.len], content);
+    clear[content.len] = @intFromEnum(ct);
+    const clen = content.len + 1;
+    const ad = out[0..tls.record_header_len];
+    ad.* = .{@intFromEnum(tls.ContentType.application_data)} ++
+        int(u16, @intFromEnum(tls.ProtocolVersion.tls_1_2)) ++
+        int(u16, @intCast(clen + P.AEAD.tag_length));
+    const nonce = nonce: {
+        const V = @Vector(P.AEAD.nonce_length, u8);
+        const pad = [1]u8{0} ** (P.AEAD.nonce_length - 8);
+        const operand: V = pad ++ mem.toBytes(big(seq));
+        break :nonce @as(V, pv.client_iv) ^ operand;
+    };
+    P.AEAD.encrypt(out[ad.len..][0..clen], out[ad.len + clen ..][0..P.AEAD.tag_length], clear[0..clen], ad, nonce, pv.client_key);
+    return ad.len + clen + P.AEAD.tag_length;
 }
 
 pub fn eof(c: Client) bool {
@@ -2161,25 +2215,12 @@ fn readIndirect(c: *Client) Reader.Error!usize {
                         c.read_seq = 0;
 
                         switch (@as(tls.KeyUpdateRequest, @enumFromInt(handshake[0]))) {
-                            .update_requested => {
-                                switch (c.application_cipher) {
-                                    inline else => |*p| {
-                                        const pv = &p.tls_1_3;
-                                        const P = @TypeOf(p.*);
-                                        const client_secret = hkdfExpandLabel(P.Hkdf, pv.client_secret, "traffic upd", "", P.Hash.digest_length);
-                                        if (c.ssl_key_log) |key_log| logSecrets(key_log.writer, .{
-                                            .counter = key_log.clientCounter(),
-                                            .client_random = &key_log.client_random,
-                                        }, .{
-                                            .CLIENT_TRAFFIC_SECRET = &client_secret,
-                                        });
-                                        pv.client_secret = client_secret;
-                                        pv.client_key = hkdfExpandLabel(P.Hkdf, client_secret, "key", "", P.AEAD.key_length);
-                                        pv.client_iv = hkdfExpandLabel(P.Hkdf, client_secret, "iv", "", P.AEAD.nonce_length);
-                                    },
-                                }
-                                c.write_seq = 0;
-                            },
+                            // zig-libs tlsclient: RFC 8446 §4.6.3 -- answer with a
+                            // KeyUpdate of our own before our next record, and
+                            // switch keys only then. std switched at once and sent
+                            // nothing, so the server kept our old key and refused
+                            // our next record (bad_record_mac).
+                            .update_requested => c.key_update_pending = true,
                             .update_not_requested => {},
                             _ => return failRead(c, error.TlsIllegalParameter),
                         }
