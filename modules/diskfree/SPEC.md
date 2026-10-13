@@ -147,13 +147,13 @@ equal). `df`(1) reports "Available" and computes its use-percentage from
 wrong field, which is exactly the bug this module's doc comments are written
 to prevent.
 
-**Use-percentage rounding: this module does not compute one, and the two
-common `df` implementations disagree on how.** `Usage` exposes the raw block
-counters (`blocks_total`/`blocks_free`/`blocks_available`) and byte
-convenience wrappers (`totalBytes`/`freeBytes`/`availableBytes`); it
-deliberately stops short of a "percent used" number, because there is no
-single correct rounding rule to bake in — a consumer replacing `df` output
-has to pick one, and the two real-world implementations pick differently:
+**Use-percentage rounding: `Usage.usePercent()` follows coreutils `df` (round up);
+the two common `df` implementations disagree on how.** `Usage` exposes the raw block
+counters (`blocks_total`/`blocks_free`/`blocks_available`), byte convenience wrappers
+(`totalBytes`/`freeBytes`/`availableBytes`/`usedBytes`) and `usePercent()`, which
+computes used / (used + available) rounded up and is pinned to captured `df` output (see
+Anchoring). There is no single correct rounding rule, and the two real-world
+implementations pick differently:
 
 - **coreutils `df`** rounds *up* (`df.c`'s `usage_percent` in GNU coreutils
   computes `used`/`total` and takes the `ceiling`, so any nonzero remainder
@@ -170,23 +170,11 @@ one more than round-to-nearest). This is not a hypothetical: measured on real
 OpenWRT 25.12.4 hardware, `/boot` at a true 36.37% used prints **36%** under
 busybox's `df` and **37%** under a round-up implementation — a one-point
 difference from the identical underlying `f_blocks`/`f_bavail` numbers, pure
-rounding-rule choice. A consumer computing a percentage from this module's
-`Usage` fields should pick one of the two conventions above deliberately
-(most OpenWRT/embedded targets — this module's `.linux32` audience — report
-busybox's round-to-nearest; most desktop/server Linux reports coreutils'
-round-up) rather than inventing a third (e.g. plain truncation, which matches
-neither and would read low compared to both real-world tools).
-
-**`/proc/self/mounts` and `/proc/self/mountinfo`.** Both covered — see
-`README.md`'s "Why this exists" section for the choice between them (short
-version: `mounts` for the common `df`-adjacent case and its stable four-
-column shape going back to `mtab`(5); `mountinfo` for the mount tree, bind-
-mount root, and device number, and because it is what modern tooling
-actually reads). Both parsers reverse the kernel's `mangle_path`
-(`fs/seq_file.c`) octal-escape encoding of space/tab/newline/backslash in
-path fields (`mounts.unescapeOctal`, shared by both files) — decoded
-generically as any `\` followed by three octal digits, not limited to the
-four bytes the kernel happens to emit today.
+rounding-rule choice. A consumer that wants busybox's round-to-nearest convention (most OpenWRT/embedded
+targets - this module's `.linux32` audience - report it; most desktop/server Linux reports
+coreutils' round-up) computes it from the raw `Usage` fields rather than from
+`usePercent()`; plain truncation matches neither and would read low compared to both
+real-world tools.
 
 ## Constant-time contract
 

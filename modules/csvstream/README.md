@@ -107,7 +107,7 @@ disables quoting, mirroring the reader's convention), and `line_terminator`
 
 Note: a writer-emitted field with an embedded `\n`/`\r` is valid RFC 4180, but
 this module's own reader cannot re-parse it back into one record (see
-"Quoting semantics" above) — that's a permanent, documented asymmetry, not a
+"Quoting semantics" below) — that's a permanent, documented asymmetry, not a
 bug. ⚠ It was described here as *the* asymmetry; a second one was not
 documented at all and was pinned as correct by the writer's own test — a
 single empty field was written unquoted, i.e. as an empty line, which the

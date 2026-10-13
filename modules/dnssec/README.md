@@ -41,7 +41,7 @@ multi-zone-cut resolver that walks the chain root→TLD→… is also out of sco
 - **Deps:** `dns` (this module reads `dns.Record`/`dns.Message`; DNSSEC RR
   types are not in `dns.message.Type`, so they arrive as
   `Record.Data.unknown` raw RDATA — see "Recon notes" below), `rsa` (RSA
-  signature verification; std's own internal RSA verifier is not `pub`).
+  signature verification; std's own internal RSA verifier is not `pub`), `base32` (base32hex for NSEC3 owner-hash labels).
 
 ## Layout
 

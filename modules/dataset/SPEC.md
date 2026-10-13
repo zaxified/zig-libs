@@ -30,7 +30,7 @@ container/type layer of a dataframe library.
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [apache/arrow](https://github.com/apache/arrow) (columnar format) — **reference** | C++ (spec + many languages) | Apache-2.0 | 17.2k | apache-arrow-25.0.1 (2026-08-10) | The standard for typed columnar tables: per-column typed arrays with validity bitmaps, timestamp/decimal128/list/struct types, IPC and Parquet interchange *(inferred from the Arrow specification, not re-read this run)*. This module: row-major boxed cells, six scalar column types, a private wire format. |
+| [apache/arrow](https://github.com/apache/arrow) (columnar format) — **reference** | C++ (spec + many languages) | Apache-2.0 | 17.2k | apache-arrow-25.0.1 (2026-08-10) | The standard for typed columnar tables: per-column typed arrays with validity bitmaps, timestamp/decimal128/list/struct types, IPC and Parquet interchange *(inferred from the Arrow specification, not re-read this run)*. This module: row-major boxed cells, seven scalar column types, a private wire format. |
 | [pandas-dev/pandas](https://github.com/pandas-dev/pandas) | Python | BSD-3-Clause | 49.9k | v3.0.6 (2026-09-17) | The DataFrame mental model (index, dtypes, nullable types, datetime) that this module's README says it follows; a full library of I/O and verbs. |
 | [pola-rs/polars](https://github.com/pola-rs/polars) | Rust | MIT | 39.9k | py-1.44.2 (2026-09-09) | Arrow-backed columnar engine, lazy/eager, multi-language; the top Rust choice. Its README (read this run) is a banner and links; feature claims here are *(inferred)*. |
 | [apache/arrow-rs](https://github.com/apache/arrow-rs) | Rust | Apache-2.0 | 3.6k | 60.0.0 (2026-09-15) | The Rust Arrow implementation: typed arrays, compute kernels, IPC. |
@@ -52,7 +52,7 @@ is a different representation, not a missing feature of this one.
 
 ## Design & invariants
 - Every origin normalizes to one shape: `{ columns: [{name,type}], rows: [[Value…]] }`; consumers
-  never see a source schema, only a `Dataset`. `ColumnType`: int/float/text/bool/date/decimal. `Value`
+  never see a source schema, only a `Dataset`. `ColumnType`: int/float/text/bool/date/decimal/timestamp. `Value`
   is a tagged union with `asFloat`/`asInt`/`asText`/`isNull`/`eql`/`order`/`cast`.
 - `.decimal` (`ColumnType`) / `Value.decimal: i128` — exact fixed-point money/quantity type. Stores
   a RAW `i128` at `decimal_scale = 1_000_000_000_000` (12 fractional digits), the exact convention of
@@ -124,7 +124,7 @@ against a 1 B/cell wire minimum). A caller sizing an untrusted-input budget must
 this factor, not around `bytes.len` — see the doc comment on `deserialize`. `Value.order` treats
 NaN as the greatest value and NaN == NaN (both floats reach `order` unfiltered from wire tag `2`
 with no finiteness check — see the doc comment on `Value.order`). `Date.ordinal` is not a certified
-calendar-math primitive (see Design notes) — do not use it for legal/financial date arithmetic
+calendar-math primitive (see Design & invariants) — do not use it for legal/financial date arithmetic
 requiring exact historical calendar correctness.
 
 ## Verification
@@ -156,7 +156,7 @@ From README "Deferred (backlog, not implemented here)":
 `dataset` is the anchor of a sibling family already extracted (`tabular` = dataset algebra,
 `jsonshape` = JSON→dataset projection) — those are separate modules, not gaps in this one.
 
-- **Date-time (timestamp) column type** *(survey 2026-09-30)*: `ColumnType` has `date` (y/m/d) but no
+- ~~**Date-time (timestamp) column type**~~ *(survey 2026-09-30; done, see the struck entry below)*: `ColumnType` had `date` (y/m/d) but no
   instant with time-of-day or zone, which every dataframe library has; sub-daily data
   (ticks, logs) must go through int/text. Effort M (new tag appended on the wire, like `.decimal`).
   Fits §2.

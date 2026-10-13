@@ -36,12 +36,13 @@ keygen/signing function — see SPEC.md's Threat model section for the
 methodology and its scope). This costs ~5x (host-dependent) on signing vs
 native f64; that CT tax is accepted and is the security-correct default.
 `gaussian.samplerZ` reproduces the reference's constant-time branch/table
-structure, whose only secret-structured branches are the documented BerExp
-lazy-break + norm-bound rejection retry. **Remaining gate**: no
-machine-checked side-channel verification (dudect/ctgrind/binsec) has been
-run on the compiled artifact — a subtly leaky sampler still produces
-signatures that *verify*, so run one before production signing (see
-`gaussian.zig`'s module doc). Out of scope: the padded/CT signature format
+structure, including the documented BerExp lazy-break + norm-bound
+rejection retry as secret-structured branches. **Remaining gate**: the in-repo ctgrind
+harness (`src/ctgrind_harness.zig`, `scripts/checks/ctgrind.sh falcon`) still
+reports secret-dependent branches in `fpr` and the sampler (SPEC.md's Threat
+model has the measurement), and no dudect/binsec run exists, so treat signing as
+not yet side-channel-verified before production use (see `gaussian.zig`'s
+module doc). Out of scope: the padded/CT signature format
 (the compressed format the KATs use is implemented).
 
 The KAT oracle is the official **NIST Round-3** `falcon512-KAT.rsp` and

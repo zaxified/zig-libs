@@ -16,7 +16,7 @@
 
 **Downstream consumer:** yes
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see /NOTICE.
+Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see ./NOTICE.
 
 ## Compared with
 
@@ -82,7 +82,7 @@ stream). It is a per-attempt, per-server budget, not a per-call one: `query` may
 value. The DoH-JSON `name` is validated by the wire path's rule and percent-encoded into the URL.
 
 ## Verification
-`zig build test-dns`: 64 offline tests + 7 live (71). Offline: golden query bytes; canned responses
+`zig build test-dns`: offline tests plus a few live ones. Offline: golden query bytes; canned responses
 (name compression, CNAME chain, MX/TXT/SOA/OPT, PTR); adversarial packets (truncations at every
 offset, pointer loops, bad rdata lengths incl. SOA/MX shorter than their fields, hostile section
 counts **under a 4 KiB memory limit** so the up-front count guard is pinned by the allocation it
@@ -104,7 +104,7 @@ The exchange that proves the question check ON A SOCKET is a separate program,
 loaded gate cannot promise: as a test in `src/` it failed 10 runs in 20 under 32-way load
 (audit F20). `-- --capture` re-takes the frames.
 
-⚠ The 7 `live:` tests (UDP, TCP, DoH POST/GET, DoH-JSON, PTR of 8.8.8.8, lookupIp) **query
+⚠ The `live:` tests (UDP, TCP, DoH POST/GET, DoH-JSON, PTR of 8.8.8.8, lookupIp) **query
 public resolvers when the network is up** — they skip via `error.SkipZigTest` only when it is not.
 A gate run on a connected machine is therefore not offline.
 

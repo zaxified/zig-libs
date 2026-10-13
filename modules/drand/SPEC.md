@@ -275,10 +275,10 @@ pair with an altered key/hash/groupHash MUST fail to parse, and a pair
 with an altered signature, randomness, round or scheme MUST NOT verify.
 The empty input — the one the runner feeds without `--fuzz` — is the
 intact case, so the positive control runs on every gate run; the same
-function backs ten deterministic tests. A third harness
+function also backs deterministic tests. A third harness
 (`checkChainedFixture`, 2026-10-06) does the same over the genuine
 default-chain `/info` and round 1000000, adding `previous_signature` as a
-damaged field; thirteen deterministic tests back it.
+damaged field; deterministic tests back it too.
 
 ## Verification bar / KAT
 

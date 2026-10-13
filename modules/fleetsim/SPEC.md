@@ -699,7 +699,7 @@ would break the total order that makes replay work).
 - **`shim.zig` — added, in this module.** See "Why `shim.zig` lives here" above
   for why it cannot live in `iec104` or `bacnet`, and why a module of its own
   would be worse than either. It is public (`fleetsim.Window`,
-  `fleetsim.StreamShim`, `fleetsim.DatagramShim`), because a consumer holding
+  `fleetsim.shim.StreamShim`, `fleetsim.shim.DatagramShim`), because a consumer holding
   one of those two responders outside a fleet wants exactly this, and both
   `LoopTransport`s are the wrong shape for it.
 
@@ -770,7 +770,7 @@ and the multi-connection binding. What is still open:
   from source rather than installed — nothing of it is vendored, and Apache-2.0
   would have permitted vendoring, which is what makes the choice not to a clean
   statement rather than an attribution obligation; **c104 is GPL-3.0-or-later**,
-  the strictest in the list, and is stated exactly in the root NOTICE;
+  the strictest in the list, and is stated exactly in this module's `NOTICE`;
   **asyncua is LGPL-3.0-or-later** and is the one whose session is not frozen at
   all. It did not need much: asyncua is run as a
   separate process inside a disposable guest, nothing from it is copied,

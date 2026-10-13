@@ -84,7 +84,7 @@ never swallowed. Neither direction ever errors on content (only on allocation fa
 only silently degrade fidelity (which is the documented, deliberate contract, not a bug to fix).
 Out of scope *not now* (reason under *Backlog / deferred*): broader WHATWG Encoding Standard coverage — other
 single-byte pages (windows-1251/1253–1258, KOI8, ISO-8859-3..16), multi-byte/CJK (Shift-JIS, EUC-JP,
-GBK/GB18030, Big5), and UTF-16. The `build(&overrides)` table pattern would generalize but there is
+GBK/GB18030, Big5). (UTF-16 is covered since 2026-10-04, see above.) The `build(&overrides)` table pattern would generalize but there is
 no in-house need beyond the European subset; reopen only on a concrete requirement.
 
 ## Verification
@@ -126,7 +126,7 @@ canonical statement of this boundary.
   needed, it lands through the existing `build(&overrides)` table pattern with the WHATWG
   `index-*.txt` vendored as data, and behind a build option if the set grows, so a size-sensitive
   consumer does not carry pages it never uses.
-- **Streaming decoder/encoder** *(survey 2026-09-30)*: stateful decode of chunked input (needed only for multi-byte/UTF-8 boundaries once UTF-16 lands; single-byte pages are stateless). Why: reading large exports without buffering the whole file. Effort: medium. Fits §2.
+- ~~**Streaming decoder/encoder**~~ — decoder **done 2026-10-04** (`Decoder`); `encodeUtf16` stays whole-buffer. *(survey 2026-09-30)*: stateful decode of chunked input (needed only for multi-byte/UTF-8 boundaries once UTF-16 lands; single-byte pages are stateless). Why: reading large exports without buffering the whole file. Effort: medium. Fits §2.
 
 ## Status
 `extract · any · codec · reentrant` · deps: none — canonical source is `pub const meta` in

@@ -40,7 +40,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 
 ## Design decision — Levenshtein automaton over the frozen `trie`
 
-Three structures were on the table (per the brief): (A) a Levenshtein automaton
+Three structures were on the table: (A) a Levenshtein automaton
 walked over the frozen `trie`; (B) a standalone BK-tree frozen to a flat buffer;
 (C) an n-gram inverted index with a distance-verify pass.
 

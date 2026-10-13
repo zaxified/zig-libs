@@ -2,8 +2,9 @@
 
 ECVRF-EDWARDS25519-SHA512-TAI, the elliptic-curve Verifiable Random
 Function (VRF) ciphersuite from RFC 9381 ("Verifiable Random Functions
-(VRFs)", IRTF CFRG, August 2023), built entirely on
-`std.crypto.ecc.Edwards25519` and `std.crypto.hash.sha2.Sha512`.
+(VRFs)", IRTF CFRG, August 2023), built on
+`std.crypto.ecc.Edwards25519`, `std.crypto.hash.sha2.Sha512` and the sibling
+`ct25519` module (constant-time secret-scalar multiplication).
 
 A VRF is the public-key analogue of a keyed cryptographic hash: only the
 holder of the secret key can compute a proof `pi` for an input
@@ -48,11 +49,11 @@ const ecvrf = @import("ecvrf");
 // shape as an Ed25519 seed, RFC 8032 §5.1.5).
 var sk: ecvrf.SecretKey = undefined;
 io.random(&sk);
-const pk = ecvrf.publicKey(sk);
+const pk = ecvrf.publicKey(&sk);
 
 // Prove: only the secret-key holder can do this.
 const alpha = "some public input";
-const pi = ecvrf.prove(sk, alpha); // 80-byte proof
+const pi = ecvrf.prove(&sk, alpha); // 80-byte proof
 
 // Anyone can independently derive beta from pi alone (no pk/alpha
 // needed — this is just "does pi decode", not "is pi valid for this
@@ -67,7 +68,7 @@ const beta = try ecvrf.verify(pk, alpha, pi); // error.InvalidProof / error.Inva
 // Many proofs under one key: derive the public key once (~23 % faster
 // per proof, same bytes). Build it only with fromSecretKey.
 var kp: ecvrf.KeyPair = undefined;
-ecvrf.KeyPair.fromSecretKey(&kp, sk);
+ecvrf.KeyPair.fromSecretKey(&kp, &sk);
 const pi2 = kp.prove(alpha);
 ```
 
@@ -94,11 +95,12 @@ non-elliptic-curve **RSA-FDH-VRF** family (RFC 9381 Appendix A).
 ## Import graph
 
 ```
-ecvrf → std.crypto.ecc.Edwards25519 (+ its scalar submodule)
+ecvrf → ct25519 (constant-time mul / mulBase for secret scalars)
+      → std.crypto.ecc.Edwards25519 (+ its scalar submodule)
       → std.crypto.hash.sha2.Sha512
 ```
 
-No sibling zig-libs module dependencies; pure `std`.
+One sibling zig-libs module dependency (`ct25519`); otherwise pure `std`.
 
 ## Verify
 

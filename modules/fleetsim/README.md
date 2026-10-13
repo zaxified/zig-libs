@@ -260,7 +260,7 @@ pip install --user --break-system-packages \
 `c104` is the only one carrying a compiled extension (it wraps lib60870-C) and
 the only one under a copyleft licence (**GPL-3.0-or-later**; it runs as a
 separate process in a throwaway guest, nothing is linked against it and nothing
-from it is redistributed — see the root `NOTICE`). Its published wheels stop at
+from it is redistributed — see this module's `NOTICE`). Its published wheels stop at
 CPython 3.13, so on a **newer** interpreter pip falls back to a source build and
 needs `build-essential` and `cmake`. Checked, not inherited: Debian 13 (trixie)
 ships Python 3.13 and c104 2.2.1 publishes a `cp313-manylinux_2_28_x86_64`

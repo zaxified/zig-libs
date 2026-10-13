@@ -34,7 +34,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [rthalley/dnspython](https://github.com/rthalley/dnspython) | Python | ISC | 2.7k | v2.8.0 (2025-09-07) | `dns.dnssec` validates RRSIGs and can sign; no chain walking or denial proofs *(inferred)*. |
 | Zig `std` / Zig ecosystem | Zig | MIT (std) | — | Zig 0.16.0 | `std` has no DNSSEC. Only unrelated hit on GitHub search "dnssec language:zig" was a 3-star repo (`jackboykin/hark`, MIT), not a comparable library. Nothing to compare against in Zig. |
 
-**Where we are ahead:** the only DNSSEC validation core in Zig; unlike the Go and Python libraries it ships the NSEC and NSEC3 denial-of-existence proofs (opt-out, wildcard, NODATA, insecure delegation) and the RFC 9276 iteration cap (`max_nsec3_iterations`, `nsec3.zig:186`), oracle-checked against `ldns` for algorithms 8/13/14/15 · **Where we are behind:** no delegation-chain walker from a root anchor and no RFC 5011 (Unbound, Hickory do), no RFC 8624 algorithm policy, no Ed448 (algorithm 16), no zone signing or key generation (miekg/dns, ldns, dnspython have it), only the CDS/CDNSKEY type numbers (`rdata.zig:359`), no dedicated parser *(searched: `rg -i 'cds|cdnskey|ed448' src/`)* (→ Backlog).
+**Where we are ahead:** the only DNSSEC validation core in Zig; unlike the Go and Python libraries it ships the NSEC and NSEC3 denial-of-existence proofs (opt-out, wildcard, NODATA, insecure delegation) and the RFC 9276 iteration cap (`nsec3.max_nsec3_iterations`), oracle-checked against `ldns` for algorithms 8/13/14/15 · **Where we are behind:** no delegation-chain walker from a root anchor and no RFC 5011 (Unbound, Hickory do), no RFC 8624 algorithm policy, no Ed448 (algorithm 16), no zone signing or key generation (miekg/dns, ldns, dnspython have it), only the CDS/CDNSKEY type numbers (`rdata.zig:359`), no dedicated parser *(searched: `rg -i 'cds|cdnskey|ed448' src/`)* (→ Backlog).
 
 ## Design & invariants
 
@@ -57,7 +57,7 @@ canonical name order, NODATA, wildcard, and insecure-delegation), unit-tested
 but not yet `ldns`-oracle-verified the way the NSEC3 proof is.
 
 Out of scope in this module (see "Threat model" below): RFC 8624
-algorithm-downgrade policy, RFC 9276 NSEC3 iteration caps, and the
+algorithm-downgrade policy and the
 multi-zone-cut resolver orchestration.
 
 - **Bounds-checked, no panics on attacker input.** `rdata.zig`/`wire.zig`
@@ -92,8 +92,8 @@ The `.secure`/`.bogus` verdict IS attackable now, so:
 - `rdata.zig`/`wire.zig` parsers reject malformed RDATA (bad lengths,
   out-of-range Type Bit Map windows, oversized names) with a typed error;
   the validation core (`canonical`/`chain`/`nsec3`/`validate`) turns every
-  non-OOM error into `.bogus`. Corpus-fuzzing these the way `dns.message`
-  fuzzes its own decoder remains a natural follow-up (not done yet).
+  non-OOM error into `.bogus`. These parsers have a deterministic fuzz driver (`src/fuzz_test.zig`,
+  `DNSSEC_FUZZ=<runs>`).
 - `keys.zig`'s signature verification fails closed: any decode or verify
   error collapses to `error.SignatureVerificationFailed`/
   `error.InvalidKeyEncoding`/`error.InvalidSignatureEncoding` — never a
@@ -176,8 +176,8 @@ deliberately does NOT do is reproduce the committed vectors byte for byte:
 those were signed with keys that no longer exist. The extraction step (wire
 rdata → the `Vec` literals) is the piece that was lost and is not
 reconstructed.
-Remaining: corpus-fuzz the parsers; external RFC 6605/8080 published test
-vectors as a second independent cross-check.
+Remaining: external RFC 6605/8080 published test vectors as a second
+independent cross-check.
 
 ## Anchoring
 
@@ -194,4 +194,4 @@ vectors as a second independent cross-check.
 - **RFC 8624 algorithm policy and RFC 5011 trust-anchor rollover** *(survey 2026-09-30)*. Both are in the resolvers above; `SPEC.md` "Threat model" already lists 8624 as needed before production use. Effort: small (policy table) and medium (5011 state machine with clock). Fits §2.
 - **Zone/RRset signing (`rrsig` creation, DS from DNSKEY, key-tag) for algorithms 8/13/14/15** *(survey 2026-09-30)*. miekg/dns, ldns and dnspython sign; someone building an authoritative tool or a test-zone generator needs it. Effort: medium; std has the ECDSA/Ed25519 signers, RSA signing in the `rsa` sibling *(inferred, not checked)*. Fits §2.
 - **CDS/CDNSKEY (RFC 7344/8078) parsing** (only the type numbers exist, `rdata.zig:359`) *(survey 2026-09-30)*. Same wire shape as DS/DNSKEY; needed for automated DS updates. Effort: small. Fits §2.
-- **Ed448 (algorithm 16, RFC 8080)** *(survey 2026-09-30)*. Unbound supports it; rare in the wild. Needs an Ed448 primitive that `std` does not have. Effort: medium-large. Fits §2 only if written in pure Zig.
+- **Ed448 (algorithm 16, RFC 8080)** *(survey 2026-09-30)*. Unbound supports it; rare in the wild. `std` has no Ed448, but the sibling `ed448` module has `verify` (RFC 8032), so this is a key-decode plus dispatch entry in `keys.zig`, not a new primitive. Effort: small-medium. Fits §2.

@@ -105,7 +105,7 @@ are absent), no NFC/BLE framing, and no device transport at all (by design).
 
 ## Validation
 
-- `oracle_test.zig` runs 20 cases against `fido2_vectors.zig` (captured from
+- `oracle_test.zig` runs its cases against `fido2_vectors.zig` (captured from
   python-fido2 2.2.1, black-box, by `tools/gen_fido2_vectors.py`): getPINRetries,
   getUVRetries, setPIN (ASCII and multi-byte PIN), changePIN, getPinToken (legacy),
   get-token-with-PIN-and-permissions (mc+ga with rpId; cm without rpId; lbw+acfg+be),
@@ -193,11 +193,8 @@ against the spec's layouts and by round trip (no external CTAPHID capture).
   facility normalizes to Form C; CTAP 2.1 §6.5.5.5 requires the platform to collect
   the PIN in NFC). Workaround today: the caller normalizes; this module validates
   UTF-8 and counts code points. Wanted: a `unicode` module with `normalize(nfc)`.
-- **Survey** (`SURVEY-PLAYBOOK.md`) to set the Scope line and star/release figures.
 - Further CTAP2 commands on the same `Transport` (getAssertion / makeCredential) if a
   consumer appears.
 - Keep-alive status surfacing (`CTAPHID_KEEPALIVE` UPNEEDED vs PROCESSING) to the
   caller for UI; `Channel` currently discards keep-alives.
 - Cancel (`CTAPHID_CANCEL`) and timeouts are the `ReportDevice`'s business today.
-- `ctap2pin`'s SPEC still lists this layer as a future module in its Non-goals and
-  Backlog; that text is outside this module's scope to edit.

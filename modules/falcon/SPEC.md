@@ -144,8 +144,8 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   build variant) is intentionally NOT exposed as an in-file toggle, to avoid
   a footgun that could silently reopen the leak — add it as a separate module
   variant if a fast-path, non-adversarial-timing consumer ever appears.
-  **Remaining gate**: no machine-checked side-channel verification
-  (dudect/ctgrind/binsec) has been run on the compiled artifact — an
+  **Remaining gate**: the ctgrind row below still reports
+  secret-dependent branches, and no dudect/binsec run exists — an
   out-of-toolchain dudect run before production signing remains the honest
   ask. **This module HAS an in-repo ctgrind harness since 2026-09-09, and the
   argument that it should not is recorded here because measuring it is what
