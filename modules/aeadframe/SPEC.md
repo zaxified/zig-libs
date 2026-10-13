@@ -70,19 +70,20 @@ ciphertext-length field**: `N = record.len − overhead`, recovered by `parse`.
 Omitting the length field removes a whole class of parser bug (length-field vs
 actual-length disagreement) — the slice length *is* the length.
 
-The header is **not** concatenated into the AEAD associated data. It does not
-need to be: every header field is already integrity-protected.
+The header is **also bound into the AEAD associated data**: both sides
+prepend the 13 header bytes (which carry `version`) to the caller's `aad` in a
+fixed-size stack scratch buffer (`effectiveAad` in `channel.zig`), so a tampered
+`version`, `epoch` or `seq` breaks authentication, not merely the `parse`-time
+check. In addition:
 
 - `epoch` and `seq` are the nonce (§3). Flipping either changes the nonce the
   receiver derives, so the tag fails — a tampered `epoch`/`seq` is caught as
   `EpochMismatch` (epoch is also checked explicitly) or `AuthenticationFailed`.
 - `version` is validated explicitly (`UnsupportedVersion`).
 
-So the caller's `aad` is passed to the AEAD verbatim, keeping `seal`/`open`
-zero-allocation (no need to build a `header ‖ aad` buffer for an arbitrary-length
-`aad`), while header tampering remains a guaranteed failure. This is the one
-non-obvious design choice; it is deliberately documented here so an auditor does
-not read the missing header-in-AAD as an oversight.
+Because the scratch buffer is fixed-size, the caller's `aad` is limited to
+`max_caller_aad` (1024) bytes; longer returns `error.AadTooLarge`. This keeps
+`seal`/`open` zero-allocation.
 
 ## 3. Nonce construction and its uniqueness argument
 
@@ -221,7 +222,7 @@ arbitrary bytes:
   `AuthenticationFailed`) the plaintext region of `out` is zeroed — including
   the AES-GCM path, where std leaves `m` undefined on auth failure, so both
   instantiations honour "never garbage plaintext".
-- A `std.testing.fuzz` harness (`fuzzOpen`) drives `open` over Smith-generated
+- A `std.testing.fuzz` harness (untrusted-decode section of `channel.zig`) drives `open` over Smith-generated
   bytes and asserts only a typed error or a plaintext length `≤` input — never a
   panic, OOB, or hang.
 - **No stream-termination signal — a per-record guarantee, not a stream one.**

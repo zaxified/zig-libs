@@ -3,8 +3,8 @@
 Raw AES-CBC mode (NIST SP800-38A) over `std.crypto.core.aes`'s
 `Aes128`/`Aes256`, plus PKCS#7 and XML-Encryption padding helpers. `std`
 ships the AES block cipher but no CBC mode; this is the one place CBC gets
-implemented in this repo, so `xmlenc` and `jwe` (which each hand-rolled their
-own CBC loop) can build on it instead. See `SPEC.md` for the full design,
+implemented in this repo; `xmlenc`, `jwe` and `megolm` build on it (the first
+two used to hand-roll their own CBC loop). See `SPEC.md` for the full design,
 the padding-oracle caveat, and how AES-192 is passed in.
 
 - **Status:** `extract`. Zero dependencies.

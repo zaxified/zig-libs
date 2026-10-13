@@ -39,8 +39,8 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   validated against the google/brotli reference vectors (see Validation).
 - **Encoder — a real, if unambitious, compressor.** LZ77 backward references
   plus a per-meta-block Huffman code for literals, insert-and-copy commands and
-  distances, with a store-mode fallback for blocks that would not shrink. It
-  lands between reference `brotli` quality 1 and 5 on text (see Encoder).
+  distances, with a store-mode fallback for blocks that would not shrink. At
+  `.default` it lands between reference `brotli` quality 5 and 9 on text (see Encoder).
 
 ## Decoder — RFC 7932 feature completeness
 

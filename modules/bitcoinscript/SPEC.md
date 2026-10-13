@@ -31,7 +31,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [bitcoin-core/btcdeb](https://github.com/bitcoin-core/btcdeb) | C++ | MIT | 595 | push 2026-07-26 | Script debugger built on Core's interpreter — a step-through tool this module has no counterpart of. |
 | [bitcoinjs/bitcoinjs-lib](https://github.com/bitcoinjs/bitcoinjs-lib) | JavaScript | MIT | 6.0k | v7.0.1 (tag; push 2026-02-17) | Script compile/decompile/toASM and payments; no consensus interpreter *(inferred)*. |
 
-**Where we are ahead:** the only consensus script interpreter in pure Zig (no libbitcoinconsensus link, unlike the Rust/JS ecosystems that bind it): all `SCRIPT_VERIFY_*` flags, BIP342 tapscript incl. `OP_SUCCESSx` and validation weight, a per-transaction sighash cache; Core's own FindAndDelete/tx_valid rows pinned. **Where we are behind:** no sigop counting, no script builder / disassembler exported (`asmparser.zig` exists but `root.zig` only pulls it into tests), no standardness/template classification or destination extraction, and only part of `script_tests.json` (no `script_assets_test.json`).
+**Where we are ahead:** the only consensus script interpreter in pure Zig (no libbitcoinconsensus link, unlike the Rust/JS ecosystems that bind it): all `SCRIPT_VERIFY_*` flags, BIP342 tapscript incl. `OP_SUCCESSx` and validation weight, a per-transaction sighash cache; Core's own FindAndDelete/tx_valid rows pinned. **Where we are behind:** no sigop counting, no script builder / disassembler exported (`asmparser.zig` exists but `root.zig` only pulls it into tests), no standardness check (basic template classification and destination extraction live in the sibling `btcaddr` module), and only part of `script_tests.json` (no `script_assets_test.json`).
 
 ## Design & invariants
 
@@ -49,7 +49,7 @@ A stack machine executing UNTRUSTED, attacker-supplied bytes, layered bottom-up:
   module-added bound (`max_stack_items_in_witness`, see "Defensive bounds beyond consensus" below).
 - `flags.zig` — `ScriptFlags`, the `SCRIPT_VERIFY_*` set. Each field is documented with exactly
   what it gates; `.none`/`.standard` are convenience presets.
-- `txctx.zig` — `SigVersion` (`.base`/`.witness_v0`, selects legacy vs. BIP143 sighash) and
+- `txctx.zig` — `SigVersion` (`.base`/`.witness_v0`/`.tapscript`, selects legacy vs. BIP143 vs. BIP341/342 sighash) and
   `TxContext` (the spending tx + input index + every input's spent output — BIP341 needs all of
   them, not just the one being signed), plus the optional `precomputed`
   (`bitcointx.PrecomputedTransactionData`) sighash cache. BIP143/BIP341 exist because legacy
@@ -408,5 +408,5 @@ remain fully implemented at consensus level (flag off); the flag only makes them
 
 - **Sigop counting (legacy, P2SH, witness) — `GetLegacySigOpCount`/`GetTransactionSigOpCost` equivalents** (survey 2026-09-30) — block validation is impossible without it (block sigop cost limit) and btcd/Core expose it. `rg -i sigop src/` finds only the tapscript validation-weight budget. Effort M. Fits §2.
 - **Script builder + disassembler (`toAsm`) as public API** (survey 2026-09-30) — btcd has `ScriptBuilder`/`DisasmString`; here `asmparser.assemble` exists but is test-only and there is no inverse. Effort S. Fits §2.
-- **Template classification / destination extraction (Solver, IsStandard, ExtractDestination)** (survey 2026-09-30) — needed to tell a wallet what an output pays to; btcd `standard.go`, Core `solver.cpp`. Effort M. Fits §2; possible home is the `bech32` address layer item.
-- **Pin the full `script_tests.json` and `script_assets_test.json`** (survey 2026-09-30) — 297 of ~1100 non-witness rows are a sample by design; the BIP342 corpus (`script_assets_test.json`) is not used. Effort M (vendoring size). Fits §2.
+- **Template classification / destination extraction (Solver, IsStandard, ExtractDestination)** (survey 2026-09-30) — needed to tell a wallet what an output pays to; btcd `standard.go`, Core `solver.cpp`. Effort M. Fits §2. Partly covered since: `btcaddr.classify` / `btcaddr.toScriptPubKey` recognise the standard output templates and extract the payload; Solver-style standardness is still absent.
+- **Pin the full `script_tests.json` and `script_assets_test.json`** (survey 2026-09-30) — 297 of ~1100 non-witness rows are a sample by design; from the BIP342 corpus (`script_assets_test.json`) only the 5-transaction slice in `consensus_kat_vectors.zig` is pinned. Effort M (vendoring size). Fits §2.

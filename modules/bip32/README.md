@@ -8,7 +8,7 @@ phrase in, a full tree of derived keypairs out.
 **Status: complete — BIP-39 (English) entropy↔mnemonic↔seed and BIP-32
 master/child derivation + xprv/xpub Base58Check serialization + derivation-
 path parsing, all KAT-validated against the official BIP-32 Test Vectors
-1/2/3/5 and the BIP-39 Trezor test-vector corpus.** See `SPEC.md` for the
+1/2/3/4/5 and the BIP-39 Trezor test-vector corpus.** See `SPEC.md` for the
 design and threat model.
 
 | File | Contents |
@@ -109,4 +109,5 @@ including a round-trip back to entropy and a checksum-tamper positive
 control.
 
 Provenance: see [SPEC.md](SPEC.md) (public-spec merger-doctrine note; no
-`NOTICE` entry required for the BIP-39/BIP-32 algorithms themselves).
+attribution is required for the BIP-39/BIP-32 algorithms themselves) and
+[NOTICE](NOTICE) for the third-party test vectors embedded in `src/`.

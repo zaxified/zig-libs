@@ -17,7 +17,7 @@
 **Downstream consumer:** no
 
 Bitcoin address encodings: bech32 (BIP173) + bech32m (BIP350) segwit addresses, and
-base58/base58check (P2PKH/P2SH/WIF). Usage: see ./README.md. Attribution/provenance: see this module's README "Provenance" note — clean-room, so there is deliberately no root `/NOTICE` entry to point at (root `NOTICE` §0).
+base58/base58check (P2PKH/P2SH/WIF). Usage: see ./README.md. Attribution/provenance: see this module's README "Provenance" note (clean-room code) and the module's own `NOTICE` (Bitcoin Core `base58_encode_decode.json` test-case data).
 
 ## Compared with
 
@@ -32,7 +32,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [bitcoinjs/bitcoinjs-lib](https://github.com/bitcoinjs/bitcoinjs-lib) | JavaScript | MIT | 6.0k | v7.0.1 (tag; push 2026-02-17) | `address.toBase58Check`/`fromBech32`/`toOutputScript`: script <-> address in one call *(inferred)*. |
 | [The-King-of-Toasters/zig-bech32](https://github.com/The-King-of-Toasters/zig-bech32) | Zig | MIT | 5 | push 2023-05-15 | Zig bech32 only (as listed); stale since 2023. Zig `std` has no bech32 or base58 (checked: `rg -il bech32` over 0.16.0 `lib/std` finds nothing). |
 
-**Where we are ahead:** the only maintained pure-Zig bech32/bech32m + base58check codec in one module; BIP350 variant rule enforced with one typed error per rejection reason; complete BIP173/BIP350 vector appendices and 21 Core base58 vectors; fixed-size, allocation-free, secrets wiped in the base58 scratch. **Where we are behind:** no address layer (parse any address string, detect network, scriptPubKey <-> address), no WIF or P2SH helpers, no bech32 error location (→ Backlog items).
+**Where we are ahead:** the only maintained pure-Zig bech32/bech32m + base58check codec in one module; BIP350 variant rule enforced with one typed error per rejection reason; complete BIP173/BIP350 vector appendices and 21 Core base58 vectors; fixed-size, allocation-free, secrets wiped in the base58 scratch. **Where we are behind:** no bech32 error location (→ Backlog). The address layer (parse any address string, detect network, scriptPubKey <-> address, WIF, P2SH helpers) lives in the sibling `btcaddr` module, not here.
 
 ## Design & invariants
 
@@ -78,7 +78,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 - **Fail-closed on untrusted input, with a specific typed error per rejection reason** (not one
   catch-all): `bech32.DecodeError` distinguishes `MixedCase` / `NoSeparator` / `EmptyHrp` /
   `HrpTooLong` / `HrpCharOutOfRange` / `DataTooShort` / `InvalidDataChar` / `InvalidChecksum` /
-  `TooLong`; `segwit.SegwitError` adds `InvalidHrp` / `EmptyDataSection` / `InvalidWitnessVersion`
+  `TooLong`; `SegwitError` adds `InvalidHrp` / `EmptyDataSection` / `InvalidWitnessVersion`
   / `InvalidVariant` (BIP350's headline rule: witver 0 must checksum as bech32, witver 1+ must
   checksum as bech32m — a bech32 string with a v1 witver, or a bech32m string with a v0 witver,
   is rejected here, not silently accepted under the wrong scheme) / `InvalidPadding` (BIP173's
@@ -174,8 +174,8 @@ no-overflow case described above.
   exactly this case. `lninvoice`'s allocator-owned BOLT#11/#12 codec (`bech32_raw.zig`) uses them
   instead of carrying its own copy (M6, `A1/bech32.md`, 2026-09-15) — see that module's SPEC for
   what still has to differ (the HRP length cap, buffer ownership).
-- **Address layer: parse any address string, scriptPubKey <-> address for P2PKH/P2SH/P2WPKH/P2WSH/P2TR** (survey 2026-09-30) — every wallet-side competitor (Core `DecodeDestination`, rust-bitcoin `Address`, btcutil, bitcoinjs) offers it; here `decodeSegwit` needs the expected HRP and base58 needs the caller to know version bytes. Effort S–M (pure byte templates; no script interpretation). Fits CONVENTIONS §2. Check first whether it belongs here or in a new module above `bitcoinscript`.
-- **WIF encode/decode and P2SH address helper** (survey 2026-09-30) — `base58.encodeP2PKH` exists, its P2SH and WIF siblings do not (`rg 'fn ' src/base58.zig`: only `encode/decode/checkEncode/checkDecode/encodeP2PKH/p2wpkhWitnessProgram`); `bip32` users need WIF to export a key. Effort S. Fits §2.
+- ~~**Address layer: parse any address string, scriptPubKey <-> address**~~ — done in the sibling `btcaddr` module (`toScriptPubKey`/`fromScriptPubKey`, network detection).
+- ~~**WIF encode/decode and P2SH address helper**~~ — done in `btcaddr` (`wifEncode`/`wifDecode`, `p2shOfRedeemScript` and friends).
 
 ## Status
 

@@ -122,9 +122,10 @@ for every secret the entry points handle. What stays with the caller: the
 
 ```
 bbs → bls12_381 (G1/G2 point arithmetic, the pairing, RFC 9380 hash-to-curve)
+    → entropy   (the blinding-scalar draw in calculateRandomScalars)
 ```
 
-`meta.deps = .{"bls12_381"}`.
+`meta.deps = .{ "bls12_381", "entropy" }`.
 
 ## Verify
 

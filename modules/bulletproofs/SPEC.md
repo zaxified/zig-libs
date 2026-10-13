@@ -163,7 +163,7 @@ EVERY input. `prove` is not changed and cannot be changed this way: its `h'`
 feeds the recursive IPA fold as real points.
 
 Because a mistake here would accept forgeries rather than slow anything
-down, the change was made under `DECISIONS.md` P5. The four items it asks for:
+down, the change was made with four safeguards:
 
 1. **Bit-identical to the previous implementation.**
    `src/verify_b8_diff_test.zig` keeps the pre-B8 `verify`/`verifyIpa`

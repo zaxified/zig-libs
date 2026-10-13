@@ -18,7 +18,8 @@
 
 Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: RFC 8949 / RFC
 9052 are public specifications; clean-room, no third-party implementation ported or consulted
-(CONVENTIONS.md §5 merger doctrine — no NOTICE entry).
+(CONVENTIONS.md §5 merger doctrine — no attribution for the code). The RFC example vectors
+embedded in `src/` are covered by the module's `NOTICE`.
 
 ## Compared with
 
@@ -80,7 +81,7 @@ no `COSE_Mac0`/`Encrypt0`/`Sign` (libcbor has no COSE at all).
     input bytes can supply (each element decode consumes ≥1 real byte and fails `Truncated` at
     EOF) — never by `n` itself.
   - **Fail-closed typed errors.** `DecodeError` is a closed set (`Truncated`, `Malformed`,
-    `DepthLimitExceeded`, `TrailingGarbage`, `OutOfMemory`); no code path panics or performs an
+    `DepthLimitExceeded`, `TrailingGarbage`, `DuplicateKey`, `NotDeterministic`, `OutOfMemory`); no code path panics or performs an
     out-of-bounds read on malformed input — verified by the hostile-input KATs (truncated header,
     declared-length-exceeds-input, depth bomb, trailing garbage, reserved additional-info,
     bare `break`, wrong-major-type indefinite chunk, invalid UTF-8) plus an arbitrary-bytes fuzz

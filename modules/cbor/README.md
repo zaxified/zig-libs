@@ -12,8 +12,8 @@ authenticator data, COSE public keys) and any other CBOR/COSE-based wire format 
   state).
 - **Deps:** none (std only).
 
-Provenance: RFC 8949/9052 are public specifications (merger doctrine — CONVENTIONS.md §5); no
-NOTICE entry needed.
+Provenance: RFC 8949/9052 are public specifications (merger doctrine — CONVENTIONS.md §5), so the
+code needs no attribution; the RFC example vectors embedded in `src/` are covered by [NOTICE](NOTICE).
 
 ## What it does
 
@@ -126,7 +126,7 @@ fn typed.encode(gpa: Allocator, x: anytype, o: cbor.EncodeOptions) Allocator.Err
 
 // ── COSE ──
 const cose = cbor.cose;
-fn cose.parseKey(value: Value) cose.KeyError!cose.Key; // .ec2: Ec2Key | .okp: OkpKey
+fn cose.parseKey(value: Value) cose.KeyError!cose.Key; // .ec2: Ec2Key | .okp: OkpKey | .akp: AkpKey
 fn cose.encodeEc2Key(a: Allocator, k: cose.Ec2Key) Allocator.Error!Value;
 fn cose.encodeOkpKey(a: Allocator, k: cose.OkpKey) Allocator.Error!Value;
 

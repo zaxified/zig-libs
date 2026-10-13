@@ -33,7 +33,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [btcsuite/btcd (`btcutil/hdkeychain`)](https://github.com/btcsuite/btcd/tree/master/btcutil) | Go | ISC | 6.7k | v0.26.2 (2026-07-24) | HD keychain with network params; BIP39 lives in third-party `go-bip39` (not surveyed). |
 | [vrischmann/zig-bip39, loftafi/bip39](https://github.com/loftafi/bip39) | Zig | MIT | 0–1 | 2022-12 / 2025-04 | Mnemonic-only Zig packages, one push each and little activity. Zig `std` has neither BIP32 nor BIP39. |
 
-**Where we are ahead:** BIP32 and BIP39 in one pure-Zig, allocation-free module with all five BIP32 vector sets and the Trezor BIP39 corpus; ctgrind-measured wordlist lookup (`wordIndex` is a masked linear scan) and wiped scratch buffers — rust-bip39/bitcoinjs make no such statement. **Where we are behind:** English wordlist only, no NFKD normalisation of passphrase/mnemonic, no SLIP-132 (ypub/zpub) prefixes, no WIF export (see `bech32` backlog).
+**Where we are ahead:** BIP32 and BIP39 in one pure-Zig, allocation-free module with all five BIP32 vector sets and the Trezor BIP39 corpus; ctgrind-measured wordlist lookup (`wordIndex` is a masked linear scan) and wiped scratch buffers — rust-bip39/bitcoinjs make no such statement. **Where we are behind:** English wordlist only, no NFKD normalisation of passphrase/mnemonic, no SLIP-132 (ypub/zpub) prefixes, no WIF export here (WIF lives in the sibling `btcaddr` module).
 
 ## Design
 
@@ -41,7 +41,8 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   generating deterministic keys") and BIP-0032 ("Hierarchical Deterministic
   Wallets"). Both are public specifications — implementing them, however
   closely, is not "derived from" anyone's source (merger doctrine), so no
-  `NOTICE` entry is required for the algorithms themselves. The embedded
+  attribution is required for the algorithms themselves (the embedded test
+  vectors are covered by the module's `NOTICE`). The embedded
   English wordlist (`wordlist.zig`) and the test vectors
   (`bip32_vectors.zig` / `bip39_vectors.zig`) are machine-transcribed
   verbatim from `bitcoin/bips/bip-0039/english.txt`,

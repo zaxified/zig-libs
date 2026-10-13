@@ -14,7 +14,9 @@ a specific typed error, never a best-effort partial parse.
 Provenance: original work of the zig-libs authors (MIT), from the public BIP173/BIP350 specs and
 the well-known Base58Check bignum technique — no third-party source ported. The BIP173/BIP350 test
 vectors are a public specification artifact, fetched directly from the `bitcoin/bips` repository
-(see `SPEC.md` for the transcription method).
+(see `SPEC.md` for the transcription method); the base58 corpus is Bitcoin Core's
+`base58_encode_decode.json` (MIT test data, see `NOTICE`). For the full address layer (scriptPubKey
+<-> address, WIF, P2SH) see the `btcaddr` module.
 
 ## bech32 / bech32m — generic codec
 
@@ -50,7 +52,7 @@ const dec = try bech32.decodeSegwit("bc", addr.slice());
 0-16, program 2-40 bytes, **version 0 must be exactly 20 or 32 bytes**, and — BIP350's headline
 addition — **version 0 must checksum as bech32, version 1+ must checksum as bech32m**; a
 bech32-checksummed v1+ address (or a bech32m-checksummed v0 address) is rejected with
-`error.InvalidVariant`, not silently accepted. `segwit.SegwitError` extends `DecodeError` with
+`error.InvalidVariant`, not silently accepted. `SegwitError` extends `DecodeError` with
 `InvalidHrp` (doesn't match the `expected_hrp` you passed in), `EmptyDataSection`,
 `InvalidWitnessVersion`, `InvalidVariant`, `InvalidPadding` (BIP173's 5-to-8-bit conversion:
 non-canonical padding), and `InvalidProgramLength`.

@@ -991,8 +991,8 @@ role.
   — pairing" above.
 - Part 5: EIP-196/197 precompile-exact semantics (point-at-infinity
   encoding, gas-irrelevant validation rules, the exact error/success
-  behavior the EVM expects) — depends on Part 4's core landing first
-  (`pairingCheck` is the `ecPairing` precompile's actual primitive).
+  behavior the EVM expects): **done** — `precompiles.zig`, see "Part 5 —
+  EVM precompiles" above.
 - Part 6 (Groth16 zk-SNARK verifier over the pairing): **done** —
   `groth16.zig`'s `VerifyingKey`/`Proof`/`verify`, byte/semantically
   exact against a REAL snarkjs-produced Groth16/BN254 proof

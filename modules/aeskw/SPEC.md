@@ -108,8 +108,8 @@ namespace (SAv2 session-key wrap, IEEE 1815-2012 §7), and `modules/xmlenc/src/r
 unwrap-only local core (`kw-aes128`/`kw-aes256`, XML Encryption 1.1). All three were already
 byte-exact against RFC 3394 §4.1; this module additionally proves §4.3/§4.5/§4.6 (covering both
 KEK widths and the n=2/3/4 block-count cases) and is the version those three modules now import (`jwe/src/alg.zig`, `dnp3/src/sa.zig`,
-`xmlenc/src/root.zig`; no code from them is imported here — this module has zero deps, per the
-pre-registered `build.zig` entry).
+`xmlenc/src/root.zig`; no code from them is imported here — the only dep is the sibling `aes192`, for the 24-byte
+KEK arm, per the `build.zig` entry).
 
 No GPL/LGPL/AGPL source was consulted or copied. `std.crypto.core.aes` (`Aes128`/`Aes256`),
 `std.crypto.timing_safe.eql`, and `std.crypto.secureZero` are used via their public std APIs

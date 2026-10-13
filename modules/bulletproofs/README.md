@@ -113,8 +113,8 @@ multi-party dealer/party protocol is not offered.
   **0 in-file contexts** with `v` and `gamma` tainted through `prove`. ⚠ The
   blinding `prove` draws internally is outside that measurement. See SPEC.md.
 - `n` and `m` are powers of two; dalek interoperates for `n` in {8, 16,
-  32, 64} (it refuses other widths). No batch verification of several
-  independent proofs yet.
+  32, 64} (it refuses other widths). Several independent proofs verify
+  together with `verifyBatch` (above).
 
 ## Wire compatibility — dalek-cryptography/bulletproofs 4.0
 

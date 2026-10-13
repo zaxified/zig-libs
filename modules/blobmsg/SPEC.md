@@ -31,7 +31,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 **Where we are ahead:** the only pure-Zig, libc-free ubus client we found; the codec is a bounds-checked, fuzzed, platform-pure library with byte-parity against a real `ubus`/`ubusd` capture; call-level byte and wall-clock budget (`CallBudget`) that libubus's per-recv timeout does not give · **Where we are behind:** no event `send`, no `wait_for`, no monitor, no configurable call timeout (fixed 2 s call deadline / 5 s recv), no fd passing, no provider side (by design) (→ Backlog).
 
 OpenWRT ubus wire codec + Linux unix-socket client. Usage: see ./README.md. Attribution/provenance:
-see /NOTICE.
+see this module's `NOTICE` and README "Provenance".
 
 ## Design & invariants
 - **The codec is the security boundary, and it is platform-pure.** `codec.zig` has no I/O, compiles

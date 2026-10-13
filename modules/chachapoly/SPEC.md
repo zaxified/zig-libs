@@ -445,7 +445,7 @@ the card's worst → P3. Against libsodium alone (not the scope's reference) the
 
 Consumers already wired to this module (`@import("chachapoly")`, all using
 `ChaCha20Poly1305`): `noise`, `wireguard`, `dtls`, `quic-crypto`, `hpke`,
-`signal`, `aeadframe`, `timelock_envelope`. `bolt8` still uses `std`'s. Any
+`signal`, `aeadframe`, `timelock_envelope`, `megolm`, `tlock`. `bolt8` reaches it through `noise` (its `handshake.Suite` binds `noise.ChaCha20Poly1305`; a `std` suite is kept only as a differential oracle). Any
 change to the delegation thresholds or the MAC is therefore live on those
 paths, not staged behind a rewiring step.
 - **XChaCha20-Poly1305 (24-byte nonce, HChaCha20)** *(survey 2026-09-30)*: `std`, libsodium, Go `NewX` and RustCrypto all provide it; it is the usual choice when nonces are random (age-style files, secretbox-alikes, cloud KMS envelopes). Consumers here do not need it today (existing bullet above), but a user rewiring from `std` loses it. Effort: small (HChaCha20 over the existing block function plus the delegation thresholds). Fits §2.

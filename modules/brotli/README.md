@@ -12,11 +12,12 @@ Brotli, so an HTTPS server that wants `br` needs this.
   dictionary** (Appendix A, 122 784 bytes) + **transforms** (Appendix B).
   Byte-exact against the google/brotli reference vectors.
 - **Encoder:** LZ77 backward references + a per-meta-block Huffman code for
-  literals, insert-and-copy commands and distances, with an automatic
+  literals, insert-and-copy commands and distances, with literal context
+  modelling (`.default`/`.best`), distance short codes, and an automatic
   **store-mode fallback** so the output is never meaningfully larger than the
-  input. ~2.8x on English text (`alice29.txt` 152 089 -> 54 605), between
-  reference `brotli` quality 1 and 5. No block splitting, no context modelling,
-  no static-dictionary references, no distance short codes — see `SPEC.md`.
+  input. ~3x on English text (`alice29.txt` 152 089 -> 51 467 at `.default`),
+  between reference `brotli` quality 5 and 9. No block splitting, no
+  static-dictionary references, no optimal parse — see `SPEC.md`.
 - **Platform:** any (pure logic, no OS calls). **Role:** util.
   **Concurrency:** reentrant (no shared state). **Allocation:** explicit
   allocator; decode output is caller-owned, per-meta-block scratch is arena-freed.

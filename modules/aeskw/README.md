@@ -3,7 +3,7 @@
 **RFC 3394 AES Key Wrap.** std ships no key-wrap primitive; this module extracts the
 canonical implementation that had previously accreted three times independently in this repo
 (`jwe`'s `A128KW`/`A256KW`, `dnp3`'s SAv2 session-key wrap, `xmlenc`'s `kw-aes128`/`kw-aes256`
-unwrap) into one place. No allocation, no deps, no panics — every buffer is caller-supplied.
+unwrap) into one place. No allocation, no panics, no deps beyond `aes192` — every buffer is caller-supplied.
 
 - **Model after:** RFC 3394 (AES Key Wrap).
 - **Platform:** any. **Role:** crypto primitive. **Concurrency:** reentrant (no shared state, no

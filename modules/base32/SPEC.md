@@ -15,8 +15,8 @@
 
 **Downstream consumer:** no
 
-Purpose and API: [README.md](README.md). Consumer in this repo: `otp` (`otpauth://`
-secrets).
+Purpose and API: [README.md](README.md). Consumers in this repo: `otp` (`otpauth://`
+secrets) and `dnssec` (NSEC3 owner-hash labels).
 
 ## Compared with
 

@@ -40,7 +40,7 @@ Raw AES-CBC (NIST SP800-38A §6.2) over `std.crypto.core.aes`'s
 `std.crypto.core.aes` (Zig 0.16) ships the AES block cipher but no CBC mode;
 CBC had been hand-rolled independently in `xmlenc` (XML-Encryption content
 decryption) and `jwe` (`AxxxCBC-HSxxx`, RFC 7518 §5.2). This module is the
-single extracted core both are expected to collapse onto.
+single extracted core both now build on (see Status).
 
 ## API
 
@@ -66,7 +66,7 @@ pub fn unpadXmlEnc(buf: []const u8) PaddingError!usize;
 (`plaintext.len`/`ciphertext.len % 16 == 0`, including zero) — pad first if
 your input isn't already block-aligned. No allocation; caller supplies `out`,
 which must be at least as long as the input. Both are `comptime`-generic over
-`Aes` (`std.crypto.core.aes.Aes128` or `Aes256`); the key array size is
+`Aes` (`std.crypto.core.aes.Aes128`/`Aes256`, or `aes192.Aes192`); the key array size is
 derived from `Aes.key_bits`, so the compiler enforces the right key length
 per cipher — there is no runtime key-length check to get wrong.
 
@@ -170,9 +170,8 @@ fuzz harness draws AES-192 for a third of its inputs.
   - Appendix F.2.3/F.2.4 (AES-192-CBC, over `aes192.Aes192`) — encrypt and
     decrypt, byte-exact (re-checked against OpenSSL 3 `aes-192-cbc`).
   - Appendix F.2.5 (AES-256-CBC) — encrypt and decrypt, byte-exact (same
-    vector transcribed in `ctap2pin/src/kat_vectors.zig` and
-    `xmlenc/src/root.zig`; this module carries its own copy so it stays
-    zero-dep).
+    vector transcribed in `ctap2pin/src/kat_vectors.zig`; `xmlenc` no longer
+    carries its own copy and relies on this module's, which stays zero-dep).
 - Raw-CBC edge cases: rejects non-block-aligned input/output on both
   directions, rejects an undersized `out` buffer, round-trips an empty
   message and a multi-block message.

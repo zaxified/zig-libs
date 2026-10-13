@@ -34,9 +34,10 @@ independently-SOURCED reference vectors, all passing in Debug AND
 ReleaseFast.
 
 This module was built by careful, verified ADAPTATION of the sibling
-[`bls12_381`](../bls12_381) module: `std.crypto.ff`-backed `Fr` (`Fp`
-has since moved to this module's own constant-time CIOS/SOS Montgomery
-arithmetic — see `fp.zig`), same tower-arithmetic formula shapes, the same
+[`bls12_381`](../bls12_381) module (the base fields have since moved off
+`std.crypto.ff`: `Fp` to this module's own constant-time CIOS/SOS Montgomery
+arithmetic in `fp.zig`, `Fr` to `montint.Field(r)` in `scalar.zig` — `montint`
+is the module's only dependency), with the same tower-arithmetic formula shapes, the same
 Jacobian point-arithmetic formulas (all generic in the field's
 non-residue / the curve's `b` constant, so they carry over unchanged),
 and the same pairing STRUCTURE (`bls12_381/src/pairing.zig`),
@@ -135,8 +136,8 @@ comments.
 | `fp.zig` | Base field `Fp` (mod `p`) — this module's own constant-time CIOS/SOS Montgomery arithmetic over four 64-bit limbs |
 | `fp2.zig` | `Fp2 = Fp[u]/(u²+1)` |
 | `fp6.zig` | `Fp6 = Fp2[v]/(v³−ξ)`, `ξ = 9+u` (differs from `bls12_381`'s `u+1`) |
-| `fp12.zig` | `Fp12 = Fp6[w]/(w²−v)` — the future pairing's target field |
-| `scalar.zig` | Scalar field `Fr` (mod `r`, the group order), built on `std.crypto.ff.Modulus(256)`, Montgomery-resident |
+| `fp12.zig` | `Fp12 = Fp6[w]/(w²−v)` — the pairing's target field `Gt` |
+| `scalar.zig` | Scalar field `Fr` (mod `r`, the group order), `montint.Field(r)`, Montgomery-resident |
 | `g1.zig` | `G1`: `E(Fp): y²=x³+3`, cofactor 1, Jacobian arithmetic, EIP-196 64-byte codec |
 | `g2.zig` | `G2`: the sextic twist `E'(Fp2): y²=x³+b'`, `b'=3/(9+u)`, cofactor > 1 (subgroup check mandatory), Jacobian arithmetic, EIP-197 128-byte codec |
 | `gate.zig` | Part 4 test gate — `pairing_core_implemented` (now `true`, the cores landed); documents the scaffold-era split between core-independent and core-driven tests |
