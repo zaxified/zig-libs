@@ -15,12 +15,14 @@
 //! reproduces that against `openssl s_server` and keeps a tripwire test that
 //! goes red the day std refuses the forged chain -- then this module retires.
 //!
-//! The API is std's: `Client.init(reader, writer, options)` with the same
-//! `Options`, so a consumer switches by changing one import. Two opt-in
-//! additions (2026-10-04), off by default: ALPN (`Options.alpn_protocols`,
-//! `Client.alpn_protocol`) and TLS 1.3 client certificates
-//! (`Options.client_auth`); with the defaults the handshake is std's byte
-//! for byte.
+//! The API is std's: `Client.init(reader, writer, options)` with std's
+//! `Options` fields, so a consumer switches by changing one import. Since the
+//! S2 work (2026-10-13) the defaults are Go `crypto/tls`'s client's and the
+//! options cover Go's: version bounds, group preferences, HelloRetryRequest,
+//! ALPN, client certificates (TLS 1.3 and 1.2, ECDSA/Ed25519/RSA, a selection
+//! callback), a session view with a verification hook, OCSP/SCT, the
+//! keying-material exporter, TLS 1.3 resumption. std's ClientHello stays
+//! reachable (`Client.std_groups`). SPEC.md lists them and what is deferred.
 
 const std = @import("std");
 
@@ -37,14 +39,14 @@ comptime {
 pub const meta = .{
     // The module catalog's one-line entry -- README.md's table is rendered
     // from this by `zig build gen-catalog`.
-    .doc = "std's TLS 1.3/1.2 client with the server chain verified by RFC 5280 (x509.verifyChain) — closes ziglang/zig #35877; opt-in ALPN and TLS 1.3 client certificates, std's handshake byte for byte by default.",
+    .doc = "std's TLS 1.3/1.2 client with the server chain verified by RFC 5280 (x509.verifyChain) — closes ziglang/zig #35877 — grown to Go crypto/tls client parity: Go's defaults (2 key shares + HelloRetryRequest, OCSP/SCT, EMS), client certificates incl. RSA and TLS 1.2, session view + verification hook, exporter, TLS 1.3 resumption.",
     .platform_note = "any",
     .targets = .{.linux64},
     .platform = .any,
     .role = .client,
     // A `Client` is one connection's state, owned by one caller, like std's.
     .concurrency = .single_owner,
-    .model_after = "Zig 0.16.0 std.crypto.tls.Client (copied, MIT) + RFC 5280 §6.1 path validation via x509",
+    .model_after = "Zig 0.16.0 std.crypto.tls.Client (copied, MIT) + RFC 5280 §6.1 path validation via x509; options and defaults after Go crypto/tls (go1.26 client)",
     .deps = .{ "x509", "p256", "p384", "p521", "rsa", "tlsresume" }, // tlsresume: the TLS 1.3 PSK binder, PSK derivation and NewSessionTicket codec for resumption; p521: the P-521 key share (std has no P-521); p384: the P-384 key share, ECDHE, client-cert signing and server-signature verify; p256 + rsa: the server CertificateVerify / ServerKeyExchange signature
 };
 

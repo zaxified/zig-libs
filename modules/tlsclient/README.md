@@ -1,7 +1,8 @@
 # tlsclient
 
-std's TLS client (TLS 1.3 and 1.2), with one fix and two opt-in additions.
-The fix: the certificate chain a
+std's TLS client (TLS 1.3 and 1.2), made into a client a Go programmer
+recognises: Go `crypto/tls`'s defaults and options (S2 parity, 2026-10-13),
+on top of the fix it was forked for. The fix: the certificate chain a
 server sends is verified by RFC 5280 path validation (`x509.verifyChain`), not
 link by link. Zig 0.16's `std.crypto.tls.Client` checks the issuer name, the
 validity and the signature of each link and nothing else -- no
@@ -9,7 +10,9 @@ basicConstraints, pathLenConstraint or keyUsage (ziglang/zig #35877) -- so
 anyone holding one valid certificate for any name can sign a leaf for any
 other name with its key, put it in front of its own chain, and std's client
 accepts it. This module refuses that chain, and parses no peer certificate
-before `x509.safe` has proven its DER in bounds.
+before `x509.safe` has proven its DER in bounds. It also fixes five
+server-triggerable crashes and a KeyUpdate desynchronisation found in std's
+code (SPEC.md).
 
 **Status:** gap -- a fork of one std file, to be retired when std fixes
 #35877. `interop_test.zig` carries a tripwire: the same forged chain offered
@@ -44,30 +47,53 @@ What changes for a caller: a chain std would have accepted is refused with
 pathLen/keyUsage/nameConstraints rule is broken, or the leaf's extKeyUsage
 excludes serverAuth. `http.Client` uses this module for every https dial.
 
-## Additions (off by default; with the defaults the handshake is std's, byte for byte)
+## Go's defaults, and the options beyond std's
+
+With no extra options the handshake is Go's client's: groups X25519MLKEM768,
+X25519, P-256, P-384, P-521 with shares for the first two (a server wanting
+another asks with a HelloRetryRequest), OCSP and SCTs requested, TLS 1.2
+extended master secret and renegotiation_info offered, host names matched
+against SANs only (RFC 9525; an IP host against iPAddress SANs, sent without
+SNI). std's ClientHello stays reachable: `.groups = &tls.Client.std_groups,
+.key_share_groups = &tls.Client.std_groups` plus the four request flags off.
 
 ```zig
-const key: tls.Client.ClientAuth.PrivateKey = .{ .ecdsa_secp256r1_sha256 = scalar }; // or .ecdsa_secp384r1_sha384 / .ed25519
+var storage: [16 * 1024]u8 = undefined;
+var info: tls.Client.ConnectionInfo = .init(&storage);
+var entries: [8]tls.Client.ClientSession = undefined;
+var cache: tls.Client.SessionCache = .init(&entries, null); // shared: pass a std.Io.Mutex
+const key: tls.Client.ClientAuth.PrivateKey = .{ .ecdsa_secp256r1_sha256 = scalar }; // or P-384, .ed25519, .rsa = &rsa_pair
 var client = try tls.Client.init(&r.interface, &w.interface, .{
     // ... std's options ...
+    .min_version = .tls_1_3,                            // Go MinVersion / MaxVersion
+    .groups = &.{ .x25519, .secp256r1 },                // Go CurvePreferences
+    .key_share_groups = &.{.x25519},
     .alpn_protocols = &.{ "h2", "http/1.1" },          // RFC 7301 offer
-    .client_auth = .{                                   // TLS 1.3 client certificate
-        .certificate_chain = &.{ leaf_der, intermediate_der },
-        .key = &key,                                    // borrowed for the connection
-    },
+    .client_auth = .{ .certificate_chain = &.{ leaf_der, intermediate_der }, .key = &key },
+    // or .client_auth_select = .{ .context = ctx, .select = pick }  (Go GetClientCertificate)
+    .connection_info = &info,                           // Go ConnectionState
+    .verify_connection = .{ .context = ctx, .verify = check }, // Go VerifyConnection
+    .session_cache = &cache,                            // TLS 1.3 resumption (Go ClientSessionCache)
 });
-const proto = client.alpn_protocol; // ?[]const u8, one of ours
+const proto = client.alpn_protocol;                     // ?[]const u8, one of ours
+var km: [32]u8 = undefined;
+try client.exportKeyingMaterial("EXPERIMENTAL-my-proto", null, &km); // RFC 8446 §7.5 / RFC 5705
 ```
 
-- **ALPN:** a server answer that is not exactly one of the offered names is
-  `TlsIllegalParameter`; a server that refuses all of them sends
-  no_application_protocol (`TlsAlert`).
-- **Client certificates (TLS 1.3 only):** answered with Certificate +
-  CertificateVerify (RFC 8446 §4.4.3). When the server's CertificateRequest
-  does not accept our key's scheme, an empty Certificate is sent (RFC 8446
-  §4.4.2.3) and the server decides. Without `client_auth`, and in TLS 1.2, a
-  CertificateRequest is `TlsUnexpectedMessage`, as in std. RSA keys and
-  session resumption are not supported.
+- **ConnectionInfo:** version, suite, group, ALPN, HRR, resumption, EMS, the
+  peer's certificates, the stapled OCSP response and the SCTs, copied into
+  your storage (`ConnectionInfoTooSmall` rather than truncation).
+- **verify_connection** runs once the server is authenticated (also on a
+  resumed session, with the chain kept from the first one), before the
+  client Finished; an error is `TlsConnectionRejected`.
+- **Client certificates** in TLS 1.3 and 1.2: ECDSA P-256/P-384, Ed25519 (1.3
+  only) and RSA (PSS in 1.3; PKCS#1 v1.5 or PSS in 1.2), the scheme picked
+  from the server's list. With no acceptable key an empty Certificate is sent
+  (RFC 8446 §4.4.2.3) and the server decides.
+- **Resumption:** TLS 1.3 tickets, psk_dhe_ke (a fresh ECDHE still runs), no
+  0-RTT; not TLS 1.2. ECH is not supported (deferred).
+- **KeyUpdate:** answered when the server asks, and sent on our own after
+  2^23 records.
 
 Provenance: Zig 0.16.0 `lib/std/crypto/tls/Client.zig` copied under the MIT
 license (see ./NOTICE); the change is this collection's.
