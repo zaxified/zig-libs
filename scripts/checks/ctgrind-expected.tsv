@@ -1148,8 +1148,8 @@ noise	ReleaseFast	transport	1	6	dde901de8c90da98	b4443cf65f6c3849
 # (fromSecretKey, pcMul16, scalar range, r/s == 0 verdicts, toDer + trimStart)
 # and Ed25519 internals; the 14 std P-384 signer contexts are gone. The cv
 # result changed: p384's P-384 signature is RFC 6979 exact, not std's bytes.
-tlsclient	ReleaseFast	kex	1	18	ab0d39dc2251edbc	73e6ffdaf71d18ad
-tlsclient	ReleaseFast	cv	1	18	93c22b1edff08188	ec6c57e652dc770e
+tlsclient	ReleaseFast	kex	1	18	68f2cce0658eb2f0	73e6ffdaf71d18ad
+tlsclient	ReleaseFast	cv	1	18	e6a1d689cc7b656a	ec6c57e652dc770e
 # dtls (2026-10-10) — hs: in-memory PSK handshake (AES-128-GCM), the PSK
 # tainted on both sides; app: after an untainted handshake both directions'
 # record keys (key, IV, sn mask key) tainted, send/recv both ways under

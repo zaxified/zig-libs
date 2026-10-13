@@ -40,8 +40,10 @@ pub fn keyPairP384(seed: [Ecdsa.KeyPair.seed_length]u8) IdentityElementError!Ecd
 
 /// std's `EcdsaP256Sha256.KeyPair.generateDeterministic(seed)`, byte for
 /// byte, with the public key from `p256.P256.combMulBase` (converted to std's
-/// point through its SEC1 encoding, a public value).
-pub fn keyPairP256(seed: [EcdsaP256.KeyPair.seed_length]u8) IdentityElementError!EcdsaP256.KeyPair {
+/// point through its SEC1 encoding, a public value). `sec1` receives that
+/// encoding: re-encoding std's point costs a field inversion on std's slow
+/// `divstep` (~4 % of a handshake's client CPU, 2026-10-13 profile).
+pub fn keyPairP256(seed: [EcdsaP256.KeyPair.seed_length]u8, sec1_out: *[65]u8) IdentityElementError!EcdsaP256.KeyPair {
     const sk = deterministicSecret(EcdsaP256, crypto.ecc.P256, crypto.hash.sha2.Sha256, seed);
     const q = try p256.P256.combMulBase(sk, .big);
     // The public key goes out in the ClientHello: declassified for ctgrind
@@ -49,6 +51,7 @@ pub fn keyPairP256(seed: [EcdsaP256.KeyPair.seed_length]u8) IdentityElementError
     const sec1 = q.toUncompressedSec1();
     std.valgrind.memcheck.makeMemDefined(&sec1);
     const p = crypto.ecc.P256.fromSec1(&sec1) catch unreachable; // a valid point by construction
+    sec1_out.* = sec1;
     return .{ .secret_key = .{ .bytes = sk }, .public_key = .{ .p = p } };
 }
 
@@ -115,8 +118,10 @@ test "keygen: keyPairP384 / keyPairP256 == std generateDeterministic, byte for b
         var seed2: [EcdsaP256.KeyPair.seed_length]u8 = undefined;
         prng.random().bytes(&seed2);
         const want2 = try EcdsaP256.KeyPair.generateDeterministic(seed2);
-        const got2 = try keyPairP256(seed2);
+        var sec1: [65]u8 = undefined;
+        const got2 = try keyPairP256(seed2, &sec1);
         try testing.expectEqualSlices(u8, &want2.secret_key.bytes, &got2.secret_key.bytes);
         try testing.expectEqualSlices(u8, &want2.public_key.toUncompressedSec1(), &got2.public_key.toUncompressedSec1());
+        try testing.expectEqualSlices(u8, &want2.public_key.toUncompressedSec1(), &sec1);
     }
 }

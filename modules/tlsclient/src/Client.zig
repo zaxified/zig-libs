@@ -343,9 +343,9 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
         int(u16, @intFromEnum(tls.NamedGroup.x25519_ml_kem768)) ++
             array(u16, u8, key_share.ml_kem768_kp.public_key.toBytes() ++ key_share.x25519_kp.public_key) ++
             int(u16, @intFromEnum(tls.NamedGroup.secp256r1)) ++
-            array(u16, u8, key_share.secp256r1_kp.public_key.toUncompressedSec1()) ++
+            array(u16, u8, key_share.secp256r1_sec1) ++
             int(u16, @intFromEnum(tls.NamedGroup.secp384r1)) ++
-            array(u16, u8, key_share.secp384r1_kp.public_key.toUncompressedSec1()) ++
+            array(u16, u8, key_share.secp384r1_sec1) ++
             int(u16, @intFromEnum(tls.NamedGroup.x25519)) ++
             array(u16, u8, key_share.x25519_kp.public_key),
     ));
@@ -878,8 +878,8 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
                         if (handshake_state != .server_hello_done) return error.TlsUnexpectedMessage;
 
                         const public_key_bytes: []const u8 = switch (tls12_negotiated_group orelse .secp256r1) {
-                            .secp256r1 => &key_share.secp256r1_kp.public_key.toUncompressedSec1(),
-                            .secp384r1 => &key_share.secp384r1_kp.public_key.toUncompressedSec1(),
+                            .secp256r1 => &key_share.secp256r1_sec1,
+                            .secp384r1 => &key_share.secp384r1_sec1,
                             .x25519 => &key_share.x25519_kp.public_key,
                             else => return error.TlsIllegalParameter,
                         };
@@ -1732,6 +1732,12 @@ const KeyShare = struct {
     ml_kem768_kp: crypto.kem.ml_kem.MLKem768.KeyPair,
     secp256r1_kp: crypto.sign.ecdsa.EcdsaP256Sha256.KeyPair,
     secp384r1_kp: p384.EcdsaP384Sha384.KeyPair,
+    /// zig-libs tlsclient: the two NIST public keys' SEC1 encodings, made
+    /// once at generation. The ClientHello (and a TLS 1.2 ClientKeyExchange)
+    /// used to re-encode them, a field inversion each -- on std's slow
+    /// P-256 `divstep` for P-256.
+    secp256r1_sec1: [65]u8,
+    secp384r1_sec1: [97]u8,
     x25519_kp: crypto.dh.X25519.KeyPair,
     sk_buf: [sk_max_len]u8,
     sk_len: std.math.IntFittingRange(0, sk_max_len),
@@ -1744,17 +1750,22 @@ const KeyShare = struct {
     );
 
     fn init(seed: *const [176]u8) error{IdentityElement}!KeyShare {
-        return .{
+        var ks: KeyShare = .{
             .ml_kem768_kp = try .generateDeterministic(seed[0..64].*),
             // zig-libs tlsclient: std's key pairs, byte for byte, with the
             // public keys from fixed-base combs (keygen.zig: p256's, p384's) —
             // std's `basePoint.mul` for these two was ~2/3 of the client's CPU.
-            .secp256r1_kp = try keygen.keyPairP256(seed[64..96].*),
+            .secp256r1_kp = undefined,
             .secp384r1_kp = try keygen.keyPairP384(seed[96..144].*),
+            .secp256r1_sec1 = undefined,
+            .secp384r1_sec1 = undefined,
             .x25519_kp = try .generateDeterministic(seed[144..176].*),
             .sk_buf = undefined,
             .sk_len = 0,
         };
+        ks.secp256r1_kp = try keygen.keyPairP256(seed[64..96].*, &ks.secp256r1_sec1);
+        ks.secp384r1_sec1 = ks.secp384r1_kp.public_key.toUncompressedSec1();
+        return ks;
     }
 
     fn exchange(
