@@ -15,6 +15,8 @@
 //!                              longest-prefix match).
 //!   * `ordinal(key)` / `keyAt(i)` — a key's rank in sorted order and the key
 //!                              at a rank (v2 buffers built with `ordinals`).
+//!   * `search(automaton)`    — every key a byte automaton matches, in order
+//!                              (fst's `Map::search`); see `automaton.zig`.
 //!
 //! Both frozen format versions are read; see `format`. Every offset followed
 //! out of the (possibly untrusted) buffer is bounds- and invariant-checked in
@@ -25,6 +27,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const format = @import("format.zig");
+const automaton = @import("automaton.zig");
 
 pub const LoadError = format.LoadError;
 pub const QueryError = format.DecodeError || error{ KeyTooLong, TooComplex };
@@ -217,6 +220,27 @@ pub const Frozen = struct {
         max_visited: usize,
     ) (QueryError || Allocator.Error)!PrefixIterator {
         return PrefixIterator.initRange(gpa, self, r, max_visited);
+    }
+
+    /// Every stored key the byte automaton `aut` matches, in ascending key
+    /// order with its value (BurntSushi/fst's `Map::search`). A subtree is
+    /// skipped as soon as `aut.canMatch` is false for the state reached by its
+    /// path — also in the middle of a v2 compressed edge — and once
+    /// `aut.willAlwaysMatch` holds no further byte is fed below that point.
+    /// `max_visited` is the node budget over the iterator's whole lifetime
+    /// (0 = unbounded, for self-built buffers only, as `prefixIteratorBounded`
+    /// warns): when it is spent `next` returns `error.TooComplex` and
+    /// `truncated()` is true. `aut` is borrowed and must outlive the iterator.
+    /// A key longer than the `key_buf` given to `next`, or than `max_depth`,
+    /// is `error.KeyTooLong`.
+    pub fn search(
+        self: Frozen,
+        gpa: Allocator,
+        comptime A: type,
+        aut: *const A,
+        max_visited: usize,
+    ) (QueryError || Allocator.Error)!SearchIterator(A) {
+        return SearchIterator(A).init(gpa, self, aut, max_visited);
     }
 
     /// Iterate the stored keys that are prefixes of `text`, shortest first
@@ -473,6 +497,10 @@ pub const PrefixIterator = struct {
     max_visited: usize = 0,
     /// Nodes decoded (edges followed) so far.
     visited: usize = 0,
+    /// Refuse every further node decode (`error.TooComplex`) regardless of
+    /// `max_visited`: how `ops.zig` expresses "shared budget spent", which
+    /// `max_visited == 0` (unbounded) cannot.
+    hard_stop: bool = false,
 
     const Frame = struct {
         node: format.NodeView,
@@ -577,18 +605,31 @@ pub const PrefixIterator = struct {
     /// the returned `key` borrows). null when exhausted. `error.KeyTooLong` if
     /// a key does not fit `key_buf`.
     pub fn next(self: *PrefixIterator, key_buf: []u8) (QueryError || Allocator.Error)!?Completion {
+        const v = (try self.nextValue()) orelse return null;
+        return try emit(self.path.items, v, key_buf);
+    }
+
+    /// The key `nextValue` last returned, borrowed from the iterator: valid
+    /// until the next call to `next` / `nextValue` / `deinit`. For walkers
+    /// that merge several iterators (`ops.zig`) and need no copy of the key.
+    pub fn currentKey(self: *const PrefixIterator) []const u8 {
+        return self.path.items;
+    }
+
+    /// `next` without the key copy: the next key's value, the key itself via
+    /// `currentKey`. Same order, budget and errors as `next` except that it
+    /// cannot report `KeyTooLong`.
+    pub fn nextValue(self: *PrefixIterator) (QueryError || Allocator.Error)!?u32 {
         while (self.stack.items.len > 0) {
             const top = &self.stack.items[self.stack.items.len - 1];
             if (!top.self_done) {
                 top.self_done = true;
-                if (top.node.terminal) {
-                    return try emit(self.path.items, top.node.value, key_buf);
-                }
+                if (top.node.terminal) return top.node.value;
             }
             if (top.edge_idx < top.node.edge_count) {
                 const e = top.node.edge(top.edge_idx);
                 top.edge_idx += 1;
-                if (self.max_visited != 0 and self.visited >= self.max_visited) return error.TooComplex;
+                if (self.hard_stop or (self.max_visited != 0 and self.visited >= self.max_visited)) return error.TooComplex;
                 self.visited += 1;
                 const child = try format.follow(top.node, e.child);
                 const mark = self.path.items.len;
@@ -616,6 +657,119 @@ pub const PrefixIterator = struct {
         return .{ .value = value, .key = key_buf[0..path.len] };
     }
 };
+
+/// Iterator over the keys a byte automaton matches; see `Frozen.search`.
+/// Same shape as `PrefixIterator`: a borrowed traversal stack from `gpa`,
+/// `next(key_buf)`, `deinit`; the frozen index is never copied. Each stack frame
+/// also holds the automaton state reached by its path.
+pub fn SearchIterator(comptime A: type) type {
+    comptime automaton.checkAutomaton(A);
+    return struct {
+        const Self = @This();
+
+        gpa: Allocator,
+        frozen: Frozen,
+        aut: *const A,
+        path: std.ArrayListUnmanaged(u8) = .empty,
+        stack: std.ArrayListUnmanaged(Frame) = .empty,
+        max_visited: usize,
+        visited: usize = 0,
+        spent: bool = false,
+
+        const Frame = struct {
+            node: format.NodeView,
+            edge_idx: u16 = 0,
+            self_done: bool = false,
+            /// path length to restore when this frame is popped.
+            mark: usize,
+            /// The automaton state after consuming `path`.
+            state: A.State,
+            /// `willAlwaysMatch(state)`: every key below matches and `state`
+            /// is no longer advanced.
+            always: bool,
+        };
+
+        fn init(gpa: Allocator, frozen: Frozen, aut: *const A, max_visited: usize) (QueryError || Allocator.Error)!Self {
+            var it = Self{ .gpa = gpa, .frozen = frozen, .aut = aut, .max_visited = max_visited };
+            errdefer it.deinit();
+            const st = aut.start();
+            if (!aut.canMatch(st)) return it;
+            const root = try frozen.rootNode();
+            try it.stack.append(gpa, .{ .node = root, .mark = 0, .state = st, .always = aut.willAlwaysMatch(st) });
+            return it;
+        }
+
+        pub fn deinit(self: *Self) void {
+            self.path.deinit(self.gpa);
+            self.stack.deinit(self.gpa);
+            self.* = undefined;
+        }
+
+        /// True once the node budget ran out (`next` has then returned
+        /// `error.TooComplex`): the keys seen so far are a prefix of the answer.
+        pub fn truncated(self: *const Self) bool {
+            return self.spent;
+        }
+
+        /// Next matching key in ascending order, reconstructed into `key_buf`
+        /// (which the returned `key` borrows); null when exhausted.
+        pub fn next(self: *Self, key_buf: []u8) (QueryError || Allocator.Error)!?Completion {
+            while (self.stack.items.len > 0) {
+                const top = &self.stack.items[self.stack.items.len - 1];
+                if (!top.self_done) {
+                    top.self_done = true;
+                    if (top.node.terminal and (top.always or self.aut.isMatch(top.state)))
+                        return try PrefixIterator.emit(self.path.items, top.node.value, key_buf);
+                }
+                if (top.edge_idx >= top.node.edge_count) {
+                    self.path.shrinkRetainingCapacity(top.mark);
+                    _ = self.stack.pop();
+                    continue;
+                }
+                const e = top.node.edge(top.edge_idx);
+                top.edge_idx += 1;
+                if (self.max_visited != 0 and self.visited >= self.max_visited) {
+                    self.spent = true;
+                    self.stack.clearRetainingCapacity();
+                    return error.TooComplex;
+                }
+                self.visited += 1;
+                const child = try format.follow(top.node, e.child);
+
+                // Feed the edge's label and (v2) tail to the automaton,
+                // dropping the child the moment the state cannot match.
+                var st = top.state;
+                var always = top.always;
+                if (!always) {
+                    st = self.aut.accept(st, e.label);
+                    if (!self.aut.canMatch(st)) continue;
+                    always = self.aut.willAlwaysMatch(st);
+                    var alive = true;
+                    for (child.tail) |b| {
+                        if (always) break;
+                        st = self.aut.accept(st, b);
+                        if (!self.aut.canMatch(st)) {
+                            alive = false;
+                            break;
+                        }
+                        always = self.aut.willAlwaysMatch(st);
+                    }
+                    if (!alive) continue;
+                }
+                try self.push(e.label, child, st, always);
+            }
+            return null;
+        }
+
+        fn push(self: *Self, label: u8, child: format.NodeView, st: A.State, always: bool) (QueryError || Allocator.Error)!void {
+            const mark = self.path.items.len;
+            if (mark + 1 + child.tail.len > max_depth) return error.KeyTooLong;
+            try self.path.append(self.gpa, label);
+            try self.path.appendSlice(self.gpa, child.tail);
+            try self.stack.append(self.gpa, .{ .node = child, .mark = mark, .state = st, .always = always });
+        }
+    };
+}
 
 /// The name for a range iterator; the same type as `PrefixIterator`.
 pub const KeyIterator = PrefixIterator;

@@ -1,0 +1,12 @@
+trie — provenance note
+
+BurntSushi/fst 0.4.7 (Rust, MIT OR Unlicense, https://github.com/BurntSushi/fst)
+was studied for behaviour on 2026-10-13: the `Automaton` contract and its
+built-ins (src/automaton/mod.rs) and the union / intersection / difference /
+symmetric-difference rules of `OpBuilder` (src/raw/ops.rs). `src/automaton.zig`
+and `src/ops.zig` cite the lines they anchor on. Nothing was copied; the
+implementation walks this module's own frozen format.
+
+`tools/rust_bench/` is the comparative benchmark's reference side: our own
+program that depends on the fst crate (fetched by cargo, pinned in
+`Cargo.lock`, which cargo generated). It is never linked into the module.

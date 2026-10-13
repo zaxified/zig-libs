@@ -5,6 +5,20 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-13** — **core → parity with BurntSushi/fst 0.4 (S2).** New
+  `automaton.zig` + `Frozen.search`: every key a byte automaton matches, in
+  order, pruned by `canMatch` (also mid-edge in v2) and cut short by
+  `willAlwaysMatch`; built-ins `Str`, `Subsequence`, `AlwaysMatch`,
+  `startsWith`, `unionOf`, `intersectionOf`, `complementOf`, and any type with
+  the five automaton functions (compile-time checked). New `ops.zig` +
+  `opIterator`: union, intersection, difference, symmetric difference over up to
+  64 indexes with a shared node budget and the contributing values per key.
+  `PrefixIterator` gained `nextValue` / `currentKey` (no key copy). Both
+  searches are in the differential oracle (naive per-key automaton evaluation,
+  naive merge of the oracles; v1, v2, v2 + ordinals), the corrupt-buffer sweep
+  and the fuzz harnesses. Comparative benchmark `tools/bench.zig` against fst
+  0.4.7 (`zig build bench-trie`); `Performance` not yet measured on the card.
+  Wider-than-`u32` values and suffix minimization stay rejected (SPEC).
 - **2026-10-04** — **mvp → core.** Frozen **format version 2** is the default:
   path-compressed (a single-child chain is one node whose `tail` holds the
   merged bytes), compact leaves (no `subtree_best`, no edge count), children

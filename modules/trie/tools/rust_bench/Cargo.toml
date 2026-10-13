@@ -1,0 +1,17 @@
+[package]
+name = "trie_bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Reference side of `zig build bench-trie` (modules/trie/tools/bench.zig):
+# BurntSushi/fst 0.4.7, pinned exactly; no other dependency.
+[dependencies]
+fst = "=0.4.7"
+
+[profile.release]
+lto = true
+codegen-units = 1
+
+# Not part of any enclosing Cargo workspace.
+[workspace]

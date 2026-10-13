@@ -15,7 +15,10 @@
 //! a ranked `topN` completions helper with an explicit visit **budget** — the
 //! DoS guard that stops a one-character prefix from walking millions of keys —
 //! and an `after` cursor for the next page, common-prefix search
-//! (`prefixesOf` / `longestPrefix`), and rank ↔ key (`ordinal` / `keyAt`).
+//! (`prefixesOf` / `longestPrefix`), rank ↔ key (`ordinal` / `keyAt`),
+//! automaton search (`Frozen.search` with the `automaton` types, fst's
+//! `Map::search`), and set operations over several indexes (`opIterator`:
+//! union, intersection, difference, symmetric difference).
 //!
 //! Keys are arbitrary bytes and are compared bytewise. Unicode normalization
 //! (NFC/case-folding/diacritic-stripping) is the CALLER's responsibility: to get
@@ -50,6 +53,8 @@ pub const meta = .{
 const builder = @import("builder.zig");
 const query = @import("query.zig");
 const stream = @import("stream.zig");
+const ops = @import("ops.zig");
+pub const automaton = @import("automaton.zig");
 pub const format = @import("format.zig");
 
 // ── public API ──────────────────────────────────────────────────────────────
@@ -80,6 +85,16 @@ pub const LoadError = query.LoadError;
 pub const QueryError = query.QueryError;
 pub const OrdinalError = query.OrdinalError;
 pub const max_depth = query.max_depth;
+pub const SearchIterator = query.SearchIterator;
+
+/// Set operations over several frozen indexes; see `ops.zig`.
+pub const SetOp = ops.SetOp;
+pub const IndexedValue = ops.IndexedValue;
+pub const OpItem = ops.OpItem;
+pub const OpIterator = ops.OpIterator;
+pub const OpError = ops.OpError;
+pub const opIterator = ops.opIterator;
+pub const max_op_indexes = ops.max_indexes;
 
 // ── dark-tests aggregator (CONVENTIONS.md §6 step 3) ─────────────────────────
 
@@ -89,6 +104,8 @@ test {
     _ = @import("builder.zig");
     _ = @import("query.zig");
     _ = @import("stream.zig");
+    _ = @import("automaton.zig");
+    _ = @import("ops.zig");
 }
 
 const testing = std.testing;
@@ -380,6 +397,375 @@ test "differential: adversarial hand-picked key sets" {
     };
 }
 
+// ── differential: automaton search and set operations ───────────────────────
+
+/// Search `f` with `aut` and compare with the naive evaluation of `aut` over
+/// every oracle key (run the automaton byte by byte; no pruning, no trie):
+/// the exact matching keys, in order, with their values. Then the same search
+/// under a small random budget must yield a PREFIX of that answer and report
+/// `TooComplex` + `truncated()` exactly when it did not finish.
+fn searchAgrees(comptime A: type, aut: A, oracle: Oracle, f: Frozen, arena: std.mem.Allocator, rnd: std.Random) !void {
+    var kb: [64]u8 = undefined;
+    {
+        var it = try f.search(arena, A, &aut, 0);
+        defer it.deinit();
+        for (oracle.keys, oracle.vals) |k, v| {
+            if (!automaton.evalKey(A, &aut, k)) continue;
+            const got = (try it.next(&kb)) orelse return error.TrieYieldedTooFew;
+            try testing.expectEqualStrings(k, got.key);
+            try testing.expectEqual(v, got.value);
+        }
+        try testing.expect((try it.next(&kb)) == null);
+        try testing.expect(!it.truncated());
+    }
+    {
+        const budget = rnd.intRangeAtMost(usize, 1, 40);
+        var it = try f.search(arena, A, &aut, budget);
+        defer it.deinit();
+        var matches: usize = 0;
+        for (oracle.keys) |k| matches += @intFromBool(automaton.evalKey(A, &aut, k));
+        var seen: usize = 0;
+        var cut = false;
+        while (true) {
+            const got = (it.next(&kb) catch |e| {
+                try testing.expectEqual(error.TooComplex, e);
+                cut = true;
+                break;
+            }) orelse break;
+            // The seen keys are the first `seen` matches of the oracle, in order.
+            var idx: usize = 0;
+            var want: ?usize = null;
+            for (oracle.keys, 0..) |k, ki| {
+                if (!automaton.evalKey(A, &aut, k)) continue;
+                if (idx == seen) {
+                    want = ki;
+                    break;
+                }
+                idx += 1;
+            }
+            try testing.expectEqualStrings(oracle.keys[want orelse return error.TrieYieldedTooMany], got.key);
+            seen += 1;
+        }
+        try testing.expectEqual(cut, it.truncated());
+        if (!cut) try testing.expectEqual(matches, seen);
+    }
+}
+
+fn searchRound(seed: u64, count: usize, fmt: FreezeOptions) !void {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var prng = std.Random.DefaultPrng.init(seed ^ 0x5eaa_c4);
+    const rnd = prng.random();
+    const pairs = try genKeys(arena, &prng, count);
+    const oracle = try Oracle.build(arena, pairs);
+    const buf = try freezeFromPairsWith(testing.allocator, testing.allocator, pairs, fmt);
+    defer testing.allocator.free(buf);
+    const f = try Frozen.loadVerified(buf);
+
+    const a = automaton;
+    var probe: usize = 0;
+    while (probe < count) : (probe += 1) {
+        // Parameters: a stored key, a prefix of one, or noise over the alphabet.
+        var noise: [5]u8 = undefined;
+        const q: []const u8 = blk: {
+            if (oracle.keys.len > 0 and rnd.boolean()) {
+                const key = oracle.keys[rnd.intRangeLessThan(usize, 0, oracle.keys.len)];
+                break :blk key[0..rnd.intRangeAtMost(usize, 0, key.len)];
+            }
+            const n = rnd.intRangeAtMost(usize, 0, noise.len);
+            for (noise[0..n]) |*c| c.* = "abcd"[rnd.intRangeLessThan(usize, 0, 4)];
+            break :blk noise[0..n];
+        };
+        const sub = q[0..@min(q.len, 3)];
+        const str = a.Str{ .string = q };
+        const sq = a.Subsequence{ .subseq = sub };
+
+        try searchAgrees(a.Str, str, oracle, f, arena, rnd);
+        try searchAgrees(a.Subsequence, sq, oracle, f, arena, rnd);
+        try searchAgrees(a.AlwaysMatch, .{}, oracle, f, arena, rnd);
+        const sw = a.startsWith(str);
+        try searchAgrees(@TypeOf(sw), sw, oracle, f, arena, rnd);
+        const sws = a.startsWith(sq);
+        try searchAgrees(@TypeOf(sws), sws, oracle, f, arena, rnd);
+        const un = a.unionOf(sw, sq);
+        try searchAgrees(@TypeOf(un), un, oracle, f, arena, rnd);
+        const inter = a.intersectionOf(sq, a.complementOf(sw));
+        try searchAgrees(@TypeOf(inter), inter, oracle, f, arena, rnd);
+        const comp = a.complementOf(a.unionOf(str, a.Str{ .string = sub }));
+        try searchAgrees(@TypeOf(comp), comp, oracle, f, arena, rnd);
+        const mix = a.unionOf(a.complementOf(sq), sw);
+        try searchAgrees(@TypeOf(mix), mix, oracle, f, arena, rnd);
+    }
+}
+
+test "differential: automaton search with every built-in and compositions vs per-key evaluation" {
+    for (all_formats) |fmt| {
+        var seed: u64 = 1;
+        while (seed <= 30) : (seed += 1) try searchRound(seed, 40, fmt);
+    }
+}
+
+/// An automaton that never prunes and counts `accept` calls: the pruning and
+/// the `willAlwaysMatch` cut-off are observable through it.
+fn Counting(comptime prune: bool, comptime always: bool) type {
+    return struct {
+        calls: *usize,
+        pub const State = u8;
+        pub fn start(_: *const @This()) State {
+            return 0;
+        }
+        pub fn isMatch(_: *const @This(), s: State) bool {
+            return s == 2;
+        }
+        pub fn canMatch(_: *const @This(), s: State) bool {
+            return if (prune) s != 3 else true;
+        }
+        pub fn willAlwaysMatch(_: *const @This(), s: State) bool {
+            return always and s == 2;
+        }
+        // 0 -'k'-> 1 -'0'-> 2 (match); anything else is dead (3)
+        pub fn accept(a: *const @This(), s: State, byte: u8) State {
+            a.calls.* += 1;
+            return switch (s) {
+                0 => if (byte == 'k') 1 else 3,
+                1 => if (byte == '0') 2 else 3,
+                2 => 2,
+                else => 3,
+            };
+        }
+    };
+}
+
+test "search prunes on canMatch and stops feeding bytes on willAlwaysMatch (budget and call counts)" {
+    var b = try Builder.init(testing.allocator);
+    defer b.deinit();
+    var kbuf: [16]u8 = undefined;
+    for (0..2000) |i| {
+        // Half the keys start with "k0", half with "x".
+        const k = try std.fmt.bufPrint(&kbuf, "{s}{d:0>6}", .{ if (i % 2 == 0) "k0" else "x", i });
+        try b.insert(k, @intCast(i));
+    }
+    for ([_]FreezeOptions{ .v1, .{ .v2 = .{} } }) |fmt| {
+        const buf = try b.freezeWith(testing.allocator, fmt);
+        defer testing.allocator.free(buf);
+        const f = try Frozen.load(buf);
+        var kb: [32]u8 = undefined;
+
+        // Pruning: the "x…" half is cut at its first byte, so a budget far
+        // below the node count still finishes.
+        var calls: usize = 0;
+        const Pruned = Counting(true, false);
+        const pruned = Pruned{ .calls = &calls };
+        var full_nodes: usize = 0;
+        {
+            var it = try f.search(testing.allocator, Pruned, &pruned, 0);
+            defer it.deinit();
+            var n: usize = 0;
+            while (try it.next(&kb)) |_| n += 1;
+            try testing.expectEqual(@as(usize, 1000), n);
+            full_nodes = it.visited;
+        }
+        {
+            var plain = try f.prefixIterator(testing.allocator, "");
+            defer plain.deinit();
+            while (try plain.next(&kb)) |_| {}
+            // The walk skipped the whole "x" subtree.
+            try testing.expect(full_nodes < plain.visited);
+        }
+
+        // No pruning (canMatch always true): same answer, strictly more nodes.
+        const Unpruned = Counting(false, false);
+        const unpruned = Unpruned{ .calls = &calls };
+        {
+            var it = try f.search(testing.allocator, Unpruned, &unpruned, 0);
+            defer it.deinit();
+            var n: usize = 0;
+            while (try it.next(&kb)) |_| n += 1;
+            try testing.expectEqual(@as(usize, 1000), n);
+            try testing.expect(it.visited > full_nodes);
+        }
+        // ... and a budget that the pruned search fits in cuts the unpruned one.
+        {
+            var it = try f.search(testing.allocator, Unpruned, &unpruned, full_nodes);
+            defer it.deinit();
+            var cut = false;
+            while (true) {
+                _ = (it.next(&kb) catch |e| {
+                    try testing.expectEqual(error.TooComplex, e);
+                    cut = true;
+                    break;
+                }) orelse break;
+            }
+            try testing.expect(cut and it.truncated());
+        }
+
+        // willAlwaysMatch: once state 2 is reached no accept is called below,
+        // yet every key under "k0" is still returned.
+        const Cut = Counting(true, true);
+        const cutaut = Cut{ .calls = &calls };
+        calls = 0;
+        {
+            var it = try f.search(testing.allocator, Cut, &cutaut, 0);
+            defer it.deinit();
+            var n: usize = 0;
+            while (try it.next(&kb)) |_| n += 1;
+            try testing.expectEqual(@as(usize, 1000), n);
+        }
+        const cut_calls = calls;
+        calls = 0;
+        {
+            var it = try f.search(testing.allocator, Pruned, &pruned, 0);
+            defer it.deinit();
+            while (try it.next(&kb)) |_| {}
+        }
+        try testing.expect(cut_calls < calls);
+    }
+}
+
+test "search: key_buf too small is KeyTooLong; AlwaysMatch equals prefixIterator" {
+    const buf = try freezeFromPairs(testing.allocator, testing.allocator, &.{
+        .{ .key = "hello", .value = 1 }, .{ .key = "help", .value = 2 },
+    });
+    defer testing.allocator.free(buf);
+    const f = try Frozen.load(buf);
+    const am = automaton.AlwaysMatch{};
+    var it = try f.search(testing.allocator, automaton.AlwaysMatch, &am, 0);
+    defer it.deinit();
+    var small: [4]u8 = undefined;
+    try testing.expectError(error.KeyTooLong, it.next(&small)); // "hello" is 5
+    var kb: [8]u8 = undefined;
+    try testing.expectEqualStrings("help", (try it.next(&kb)).?.key);
+}
+
+/// Naive set operation over the per-index oracles. `all` is every distinct key
+/// across the indexes in ascending order.
+fn opsRound(seed: u64, fmt: FreezeOptions) !void {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var prng = std.Random.DefaultPrng.init(seed ^ 0x0b5);
+    const rnd = prng.random();
+    const k = rnd.intRangeAtMost(usize, 1, 5);
+
+    var oracles: [5]Oracle = undefined;
+    var bufs: [5][]u8 = undefined;
+    var idx: [5]Frozen = undefined;
+    var made: usize = 0;
+    defer for (bufs[0..made]) |bf| testing.allocator.free(bf);
+    for (0..k) |i| {
+        const pairs = try genKeys(arena, &prng, rnd.intRangeAtMost(usize, 0, 30));
+        oracles[i] = try Oracle.build(arena, pairs);
+        bufs[i] = try freezeFromPairsWith(testing.allocator, testing.allocator, pairs, fmt);
+        made += 1;
+        idx[i] = try Frozen.load(bufs[i]);
+    }
+
+    // Every distinct key, sorted.
+    var all: std.ArrayList([]const u8) = .empty;
+    for (oracles[0..k]) |o| for (o.keys) |key| try all.append(arena, key);
+    std.mem.sort([]const u8, all.items, {}, struct {
+        fn lt(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.lessThan(u8, x, y);
+        }
+    }.lt);
+
+    var kb: [64]u8 = undefined;
+    var vb: [max_op_indexes]IndexedValue = undefined;
+    for ([_]SetOp{ .@"union", .intersection, .difference, .symmetric_difference }) |op| {
+        var it = try opIterator(arena, idx[0..k], op, 0);
+        defer it.deinit();
+        var prev: ?[]const u8 = null;
+        for (all.items) |key| {
+            if (prev) |p| if (std.mem.eql(u8, p, key)) continue;
+            prev = key;
+            var mask: u64 = 0;
+            for (oracles[0..k], 0..) |o, i| {
+                if (o.lookup(key) != null) mask |= @as(u64, 1) << @intCast(i);
+            }
+            const want = switch (op) {
+                .@"union" => mask != 0,
+                .intersection => mask == (@as(u64, 1) << @intCast(k)) - 1,
+                .difference => mask == 1,
+                .symmetric_difference => @popCount(mask) % 2 == 1,
+            };
+            if (!want) continue;
+            const got = (try it.next(&kb, &vb)) orelse return error.TrieYieldedTooFew;
+            try testing.expectEqualStrings(key, got.key);
+            var n: usize = 0;
+            for (0..k) |i| {
+                if (mask >> @intCast(i) & 1 == 0) continue;
+                try testing.expectEqual(@as(u32, @intCast(i)), got.values[n].index);
+                try testing.expectEqual(oracles[i].lookup(key).?, got.values[n].value);
+                n += 1;
+            }
+            try testing.expectEqual(n, got.values.len);
+        }
+        try testing.expect((try it.next(&kb, &vb)) == null);
+        try testing.expect(!it.truncated());
+    }
+
+    // The union feeds a SortedBuilder directly; the result holds every key
+    // with the value of the LAST index that has it.
+    {
+        var out: std.Io.Writer.Allocating = .init(arena);
+        var sb = try SortedBuilder.init(arena, &out.writer, .{});
+        defer sb.deinit();
+        var it = try opIterator(arena, idx[0..k], .@"union", 0);
+        defer it.deinit();
+        while (try it.next(&kb, &vb)) |item| try sb.insert(item.key, item.values[item.values.len - 1].value);
+        try sb.finish();
+        const merged = try Frozen.loadVerified(out.written());
+        try testing.expectEqual(@as(u64, all.items.len - dupCount(all.items)), merged.keyCount());
+        for (all.items) |key| {
+            var want: ?u32 = null;
+            for (oracles[0..k]) |o| if (o.lookup(key)) |v| {
+                want = v;
+            };
+            try testing.expectEqual(want, try merged.lookup(key));
+        }
+    }
+
+    // A random budget: whatever was yielded is a prefix, and the iterator says
+    // so when it stopped early.
+    {
+        var full: usize = 0;
+        {
+            var it = try opIterator(arena, idx[0..k], .@"union", 0);
+            defer it.deinit();
+            while (try it.next(&kb, &vb)) |_| full += 1;
+        }
+        var it = try opIterator(arena, idx[0..k], .@"union", rnd.intRangeAtMost(usize, 1, 40));
+        defer it.deinit();
+        var seen: usize = 0;
+        var cut = false;
+        while (true) {
+            _ = (it.next(&kb, &vb) catch |e| {
+                try testing.expectEqual(error.TooComplex, e);
+                cut = true;
+                break;
+            }) orelse break;
+            seen += 1;
+        }
+        try testing.expectEqual(cut, it.truncated());
+        if (!cut) try testing.expectEqual(full, seen) else try testing.expect(seen <= full);
+    }
+}
+
+fn dupCount(sorted: []const []const u8) usize {
+    if (sorted.len == 0) return 0;
+    var d: usize = 0;
+    for (sorted[1..], 0..) |key, i| d += @intFromBool(std.mem.eql(u8, key, sorted[i]));
+    return d;
+}
+
+test "differential: set operations over 1-5 random indexes vs a naive merge of the oracles" {
+    for (all_formats) |fmt| {
+        var seed: u64 = 1;
+        while (seed <= 60) : (seed += 1) try opsRound(seed, fmt);
+    }
+}
+
 test "round-trip: pre-freeze answers equal post-freeze answers" {
     var b = try Builder.init(testing.allocator);
     defer b.deinit();
@@ -513,8 +899,44 @@ fn truncatedRound(fmt: FreezeOptions) !void {
     }
 }
 
+/// Drain `search` over a (possibly damaged) buffer with a node budget; true
+/// when it ran to the end, false on any error (all of them typed).
+fn drainSearch(f: Frozen, comptime A: type, aut: *const A) bool {
+    var kb: [32]u8 = undefined;
+    var it = f.search(testing.allocator, A, aut, 1000) catch return false;
+    defer it.deinit();
+    var guard: usize = 0;
+    while (guard < 2000) : (guard += 1) {
+        const got = it.next(&kb) catch return false;
+        if (got == null) return true;
+    }
+    return false;
+}
+
+/// The same for `opIterator` over the damaged buffer, twice (a buffer against
+/// itself: every key in both, so every operation walks both inputs).
+fn drainOps(f: Frozen, op: SetOp) bool {
+    var kb: [32]u8 = undefined;
+    var vb: [2]IndexedValue = undefined;
+    var it = opIterator(testing.allocator, &.{ f, f }, op, 1000) catch return false;
+    defer it.deinit();
+    var guard: usize = 0;
+    while (guard < 2000) : (guard += 1) {
+        const got = it.next(&kb, &vb) catch return false;
+        if (got == null) return true;
+    }
+    return false;
+}
+
 fn runQueries(f: Frozen) void {
     var kb: [32]u8 = undefined;
+    _ = drainSearch(f, automaton.AlwaysMatch, &.{});
+    _ = drainSearch(f, automaton.Subsequence, &.{ .subseq = "a" });
+    const sw = automaton.startsWith(automaton.Str{ .string = "pra" });
+    _ = drainSearch(f, @TypeOf(sw), &sw);
+    const cx = automaton.complementOf(automaton.unionOf(automaton.Str{ .string = "brno" }, automaton.Subsequence{ .subseq = "z" }));
+    _ = drainSearch(f, @TypeOf(cx), &cx);
+    for ([_]SetOp{ .@"union", .intersection, .difference, .symmetric_difference }) |op| _ = drainOps(f, op);
     _ = f.lookup("a") catch {};
     _ = f.lookup("abc") catch {};
     // The 2026-10-04 queries, bounded the same way as the walks below.
@@ -783,7 +1205,18 @@ fn resealV2(buf: []u8) void {
     std.mem.writeInt(u32, foot[20..24], c.final(), .little);
 }
 
-const SweepReach = struct { loaded: usize = 0, verified: usize = 0, lookups_ok: usize = 0, corrupt: usize = 0 };
+const SweepReach = struct {
+    loaded: usize = 0,
+    verified: usize = 0,
+    lookups_ok: usize = 0,
+    corrupt: usize = 0,
+    /// `search` / `opIterator` drains over the damaged buffers that ran to the
+    /// end, and ones that stopped on a typed error.
+    search_ok: usize = 0,
+    search_err: usize = 0,
+    ops_ok: usize = 0,
+    ops_err: usize = 0,
+};
 
 fn sweepV2(base: []const u8, seeds: u64, reach: *SweepReach) !void {
     var copy: [4096]u8 = undefined;
@@ -815,6 +1248,8 @@ fn sweepV2(base: []const u8, seeds: u64, reach: *SweepReach) !void {
             if (e == error.Corrupt) reach.corrupt += 1;
         }
         runQueries(f);
+        if (drainSearch(f, automaton.AlwaysMatch, &.{})) reach.search_ok += 1 else reach.search_err += 1;
+        if (drainOps(f, .@"union")) reach.ops_ok += 1 else reach.ops_err += 1;
     }
 }
 
@@ -837,6 +1272,13 @@ test "format 2: seeded corrupt-buffer sweep never panics, and reaches the walk" 
         try testing.expect(reach.loaded > 2500);
         try testing.expect(reach.lookups_ok > 1500);
         try testing.expect(reach.corrupt > 600);
+        // Search and set operations walk the whole damaged trie, so they meet
+        // the damaged node far more often than `lookup` does. Measured
+        // 2026-10-13 (plain): search 111 answered / 2678 typed error, set
+        // operations the same. A harness whose walks never started would
+        // show both at 0; one that never met damage, err ≈ 0.
+        try testing.expect(reach.search_ok > 70 and reach.search_err > 2000);
+        try testing.expect(reach.ops_ok > 70 and reach.ops_err > 2000);
     }
 }
 

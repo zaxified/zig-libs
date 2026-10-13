@@ -33,3 +33,6 @@ __pycache__/
 # stamps_record writes through a temp file beside it; an interrupted run leaves one
 .stamps.local.tsv.*
 .ci-stamps.tsv
+
+# Cargo build trees of Rust reference sides under modules/*/tools/ (benches, vector generators)
+modules/*/tools/*/target/

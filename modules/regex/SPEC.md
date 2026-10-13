@@ -264,6 +264,13 @@ matches where `std.mem.indexOf` does), driver `REGEX_FUZZ`.
 - **An ASCII bitmap per class, a one-pass engine** *(2026-10-07)* — smaller constant factors.
 - **`RegexSet`** *(survey 2026-10-07)* — Rust's and RE2's, not Go's.
 - **Unicode 17.0** — follows Go: regenerate the tables when Go's `unicode` moves.
+- **A byte-stepping DFA state for `trie.search`** *(2026-10-13, from trie's fst parity)* — fst
+  searches its index with a `regex-automata` DFA (`start`/`accept(state, byte)`/`isMatch`/
+  `canMatch`); `trie.search` takes the same shape (`trie.automaton`), but this module exposes no
+  per-byte state, so in-index regex search is the one fst feature trie routes nowhere. The
+  `isMatch` DFA's states would serve if they were public and anchored; `canMatch` = "a match
+  state is still reachable" needs a dead-state flag. Effort small–medium once the DFA cache
+  can live in a caller-owned value.
 - **Sibling modules that can now adopt it** *(2026-10-07)* — `validate` (`Pattern.matcher` takes a
   caller-supplied matcher today; a `regex` default), `jsonshape` (RFC 9535 `match()`/`search()`
   need I-Regexp, an RE2 subset), `tsdb` (regex label matchers), `probe` (`expect` regex). Each is
