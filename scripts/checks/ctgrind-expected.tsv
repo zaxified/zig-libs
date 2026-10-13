@@ -139,7 +139,7 @@
 # key, so its zero would say nothing about constant time. See the harness.
 bolt8	ReleaseFast	dh	1	1	bd35f976b480952b	0147038b2745ef44
 bolt8	ReleaseFast	keygen	1	3	bd35f976b480952b	d7a8d7540234ad3e
-bolt8	ReleaseFast	act3	1	6	25d1bc74ca174472	f60e20889f25f0aa
+bolt8	ReleaseFast	act3	1	6	b5e60b6126d5351f	f60e20889f25f0aa
 bolt8	ReleaseFast	transport	1	3	2aa7f2da3691694c	859416d386f56f8a
 bn254	ReleaseFast	field	1	1	27af92a0c130f0a6	831aa25b5c3d2f05
 # bn254 scalarmul 5 -> 2 (re-pin 2026-09-15): `3cda42bf`/`b80e3cce` made
@@ -147,8 +147,8 @@ bn254	ReleaseFast	field	1	1	27af92a0c130f0a6	831aa25b5c3d2f05
 # of `std.crypto.ff`'s `fromMontgomery`; exactly the three contexts attributed
 # to std's ff went (9 -> 6 total), output byte-identical.
 bn254	ReleaseFast	scalarmul	1	2	2b67af362ef59b94	1bba83824af4d763
-chachapoly	ReleaseFast	poly1305	1	0	d4720b6b7c9032e8	ff3ba8f00b851bdf
-chachapoly	ReleaseSafe	poly1305	1	>=1	d4720b6b7c9032e8	ff3ba8f00b851bdf
+chachapoly	ReleaseFast	poly1305	1	0	2ceba351a31d10b9	ff3ba8f00b851bdf
+chachapoly	ReleaseSafe	poly1305	1	>=1	2ceba351a31d10b9	ff3ba8f00b851bdf
 # The AEAD's own claim (added 2026-09-02). SPEC.md and root.zig state that the
 # tag is compared in constant time, and until this row existed the module was
 # measured with the `poly1305` target ALONE -- the harness never touched
@@ -191,8 +191,8 @@ chachapoly	ReleaseSafe	poly1305	1	>=1	d4720b6b7c9032e8	ff3ba8f00b851bdf
 # is consumed in Debug, and CONVENTIONS §7.1 narrowed the Debug CI lane to
 # compile-only in 2026-08-15 on the same kind of measurement. See
 # `scripts/checks/ctgrind.sh` § MODES.
-chachapoly	ReleaseFast	aead	1	4	5081443e47964d66	870a36cbebbc4588
-chachapoly	ReleaseSafe	aead	1	>=1	5081443e47964d66	870a36cbebbc4588
+chachapoly	ReleaseFast	aead	1	4	4c9e0c94ef4199ce	870a36cbebbc4588
+chachapoly	ReleaseSafe	aead	1	>=1	4c9e0c94ef4199ce	870a36cbebbc4588
 # oscore — added 2026-09-08. SPEC.md § "Threat model / limits" claims the key
 # material is routed ONLY through std's constant-time HMAC/AES-CCM, with no
 # comparison or branch on key bytes in this module's own code; until today that
@@ -431,8 +431,8 @@ montint	ReleaseFast	ffcontrol	1	>=1	NO-OWN-SRC	e5fa1af501069bfb
 # the divsteps and the Hensel step add no context, their verdicts are witness.
 montint	ReleaseFast	dyn	1	2	f8c4a06fc45eefdf	880a04f6d911e62c
 # 2026-10-13: p256 `rejectIdentity` launders its verdict (one `je`, was two) -> every row whose count included the p256 comb/windowed identity check drops by 1 (--stacks diff vs the base: the second jump of `rejectIdentity` gone, no other context moved).
-p256	ReleaseFast	comb	1	1	78c5cb1f339fd50f	5b1d2ba63761dee8
-p256	ReleaseFast	sign	1	<=12	59ac722069fa7f47	af4baed5c5134f3f
+p256	ReleaseFast	comb	1	1	caad16ebbc3e0ff0	5b1d2ba63761dee8
+p256	ReleaseFast	sign	1	<=12	f058d5e90be97add	af4baed5c5134f3f
 # rsa 2026-10-02 — the private path moved onto montint.DynModint (reduce of c
 # mod p/q, Garner, unblinding, F3). crt 213 -> 1: the 212 were std.crypto.ff's
 # reduce (shiftIn, compare-and-subtract) and montgomeryMul over the secret
@@ -1375,11 +1375,11 @@ aes192	ReleaseFast	dec	1	0	8a27e95d551dc294	68602ef849690825
 # limbs and the product now comes back as (X·Z : Y : Z³) of the Jacobian
 # point — the same point (tests compare SEC1 bytes against the old RCB
 # ladder); `ecdh`/`keygen`/`sign` print affine bytes and did not move.
-p521	ReleaseFast	mul	1	0	4fe6fcee141114ca	7bcb91b4acac23e9
-p521	ReleaseFast	keygen	1	0	786668597aa111f5	b44de7eb8b02a855
-p521	ReleaseFast	sign	1	0	786668597aa111f5	b620c1c667ef0084
-p521	ReleaseFast	ecdh	1	0	4fe6fcee141114ca	a348bd01a2bccfcc
-p521	ReleaseFast	vartime	1	>=1	4160fbdec86bc619	11557f4b46d4c2af
+p521	ReleaseFast	mul	1	0	355a2021c33889c0	7bcb91b4acac23e9
+p521	ReleaseFast	keygen	1	0	4a9d338feaf97809	b44de7eb8b02a855
+p521	ReleaseFast	sign	1	0	4a9d338feaf97809	b620c1c667ef0084
+p521	ReleaseFast	ecdh	1	0	355a2021c33889c0	a348bd01a2bccfcc
+p521	ReleaseFast	vartime	1	>=1	4b5f833bed1febc7	11557f4b46d4c2af
 # p384 (2026-10-13) — NIST P-384, new module (p521's algorithms over a Montgomery
 # field with an amd64 MULX/ADX core, fast_core.zig — CPU skylake has ADX, so the
 # asm path is the one measured). mul / keygen / sign / ecdh: secret tainted end to
@@ -1389,11 +1389,11 @@ p521	ReleaseFast	vartime	1	>=1	4160fbdec86bc619	11557f4b46d4c2af
 # it — the comb now uses `addMixedComplete` from a valid default entry
 # (tlsclient's P-384 comb had the same finding on std's addMixed, 2026-10-11).
 # `vartime` is the POSITIVE CONTROL (11 in-file: wNAF and Jacobian branches).
-p384	ReleaseFast	mul	1	0	494f2774a90d0628	c6ed226b169947b1
-p384	ReleaseFast	keygen	1	0	d219a2b516346767	c28d014cde15df1e
-p384	ReleaseFast	sign	1	0	d219a2b516346767	d03df64890394e70
-p384	ReleaseFast	ecdh	1	0	494f2774a90d0628	cbf100ff8ddb053f
-p384	ReleaseFast	vartime	1	>=1	9a026d7fcdb488c6	38cf29c815d8f1f4
+p384	ReleaseFast	mul	1	0	c7653832a212e384	c6ed226b169947b1
+p384	ReleaseFast	keygen	1	0	9dc527b41c0ebdb0	c28d014cde15df1e
+p384	ReleaseFast	sign	1	0	9dc527b41c0ebdb0	d03df64890394e70
+p384	ReleaseFast	ecdh	1	0	c7653832a212e384	cbf100ff8ddb053f
+p384	ReleaseFast	vartime	1	>=1	5b113f602cb88152	38cf29c815d8f1f4
 # tlsresume (2026-10-13) — the STEK, the resumption secret / PSK / binder key and the
 # 0-RTT key schedule through the module's public API; SHA-256 and SHA-384 suites.
 # stek: STEK + session state tainted through seal, open, tampered open. 2 = the
@@ -1433,7 +1433,14 @@ tlsresume	ReleaseFast	early	1	0	958e96d1ea73a044	042b8c43588c7881
 # base64 character also carries key bits; p256's comb mulBase recomputing the
 # public key (2, p256's own `comb` row).
 # 2026-10-13: p256 `rejectIdentity` launders its verdict (one `je`, was two) -> every row whose count included the p256 comb/windowed identity check drops by 1 (--stacks diff vs the base: the second jump of `rejectIdentity` gone, no other context moved).
-acme	ReleaseFast	pem	1	11	ff5034cfc42531e1	e3f3e71bec825dd7
+# 2026-10-13 (acme S2, ES384 + PKCS#8): pem 11 -> 20. The key parser (`keyFromDer`, one for
+# SEC1 and PKCS#8, both curves) now also reads the `[0]` parameters element after the private
+# OCTET STRING and checks its curve OID against the key type. That element's tag and length
+# bytes share base64 characters with the key's last bits, so readElem's tag/length decisions
+# (x509.zig:472/473/486), the `priv.end < seq.end` test (983), the OID compare (eqlBytes) and
+# the raw.len check (993) see taint; every one decides on DER layout (a0, 07, the OID),
+# never on a key byte. Read in the --stacks dump of that day; no context moved into p256/p384.
+acme	ReleaseFast	pem	1	20	e8da539d8844c06f	e3f3e71bec825dd7
 # jwt (2026-10-13) — every secret the module holds: HMAC secrets (HS256/384/512,
 # sign and verify), ES256 (p256 module), ES384 (std), ES512 (p521 module), EdDSA
 # (std Ed25519; only the 32-byte seed is tainted) and RSA (RS256 + PS256 through

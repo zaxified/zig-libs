@@ -25,6 +25,28 @@ const domains: []const []const u8 = &.{ "example.com", "www.example.com" };
 const acme_id: [32]u8 = @splat(0x5a);
 const serial: [16]u8 = .{0x01} ++ @as([15]u8, @splat(0x33));
 
+// The entry points take their key as `anytype` (any curve); the probe needs
+// concrete function types, so it goes through these P-256 instances.
+fn signP256(gpa: std.mem.Allocator, kp: *const jws.KeyPair, payload: []const u8, h: jws.Header) jws.SignError![]u8 {
+    return jws.sign(gpa, kp, payload, h);
+}
+
+fn csrP256(gpa: std.mem.Allocator, kp: *const jws.KeyPair, names: []const []const u8) x509.CsrError![]u8 {
+    return x509.csrDer(gpa, kp, names);
+}
+
+fn alpnP256(
+    gpa: std.mem.Allocator,
+    kp: *const jws.KeyPair,
+    domain: []const u8,
+    id: [32]u8,
+    ser: []const u8,
+    not_before: []const u8,
+    not_after: []const u8,
+) x509.TlsAlpnError![]u8 {
+    return x509.tlsAlpnCertDer(gpa, kp, domain, id, ser, not_before, not_after);
+}
+
 test "STACKPROBE: acme signing entry points leave no account-key residue" {
     try sp.skipUnlessOptimized();
     Sha256.hash("acme probe seed", &seed, .{});
@@ -34,9 +56,9 @@ test "STACKPROBE: acme signing entry points leave no account-key residue" {
 
     heap_fba = .init(&heap_buf);
     const gpa = heap_fba.allocator();
-    _ = try P.run("jws.sign", jws.sign, .{ gpa, &pair, "{\"termsOfServiceAgreed\":true}", header }, secrets, .{});
+    _ = try P.run("jws.sign", signP256, .{ gpa, &pair, "{\"termsOfServiceAgreed\":true}", header }, secrets, .{});
     heap_fba.reset();
-    _ = try P.run("x509.csrDer", x509.csrDer, .{ gpa, &pair, domains }, secrets, .{});
+    _ = try P.run("x509.csrDer", csrP256, .{ gpa, &pair, domains }, secrets, .{});
     heap_fba.reset();
-    _ = try P.run("x509.tlsAlpnCertDer", x509.tlsAlpnCertDer, .{ gpa, &pair, "example.com", acme_id, &serial, x509.tls_alpn_not_before, x509.tls_alpn_not_after }, secrets, .{});
+    _ = try P.run("x509.tlsAlpnCertDer", alpnP256, .{ gpa, &pair, "example.com", acme_id, &serial, x509.tls_alpn_not_before, x509.tls_alpn_not_after }, secrets, .{});
 }

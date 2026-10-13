@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-07-18 · mutation 2026-10-04 (43/47, 3 eq) · src ?
 
-**Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, ACME_FUZZ) · ct 2026-10-13 (ctgrind: P-256 account / certificate scalar through jws.sign, x509.csrDer, ecPrivateKeyToPem/FromPem; 57 / 21 / 12 in-file = jws 13 delegated p256 signer + 44 base64 of the public signature, csr 13 signer + 8 Signature.toDer trimming, pem 11 (12 until 2026-10-13: p256's `rejectIdentity` now one jump) = PEM layout decisions, the b64ct validity verdict, the DER length byte sharing a base64 character with key bits, p256 comb; the first measurement found std base64 indexing its table by the key in the key PEM paths (16 + 5 contexts) — fixed the same day with `b64ct.zig` and wiped stack buffers, itemised in `scripts/checks/ctgrind-expected.tsv`)
+**Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, ACME_FUZZ) · ct 2026-10-13 (ctgrind: P-256 account / certificate scalar through jws.sign, x509.csrDer, ecPrivateKeyToPem/FromPem; 57 / 21 / 12 in-file = jws 13 delegated p256 signer + 44 base64 of the public signature, csr 13 signer + 8 Signature.toDer trimming, pem 11 (12 until 2026-10-13: p256's `rejectIdentity` now one jump) = PEM layout decisions, the b64ct validity verdict, the DER length byte sharing a base64 character with key bits, p256 comb; the first measurement found std base64 indexing its table by the key in the key PEM paths (16 + 5 contexts) — fixed the same day with `b64ct.zig` and wiped stack buffers, itemised in `scripts/checks/ctgrind-expected.tsv`; 2026-10-13 after S2: 56 / 20 / 20 — pem +9 is the `[0]` parameters element the key parser now reads after the private key, whose tag/length bytes share base64 characters with key bits, all layout decisions; the P-384 and PKCS#8 paths have no harness target yet)
 
 **Performance:** n/a — the work is bound by network and CA round trips; the CPU parts are the crypto modules', measured on their own cards, and x/crypto/acme's JWS code is unexported (2026-10-10)
 
@@ -33,7 +33,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [acmesh-official/acme.sh](https://github.com/acmesh-official/acme.sh) | Shell | GPL-3.0 (source not read) | 47.8k | 3.1.6 (2026-09-20) | The most used shell client; DNS-01 via ~150 provider scripts, so most home and small-server users get wildcards this way. |
 | [cloud-cup/acme-zig](https://github.com/cloud-cup/acme-zig) | Zig | none found (no LICENSE file, API reports none; source not read) | 1 | pushed 2024-12-16 | The only Zig ACME repository found by GitHub search (queries "acme", "letsencrypt" restricted to Zig); empty README, dormant. |
 
-**Where we are ahead:** the only maintained ACME client in Zig, pure Zig on `std.crypto`, with all three challenges (HTTP-01 and TLS-ALPN-01 served by the library itself; DNS-01 through a caller publisher, as `x/crypto/acme` leaves it); staging by default; a socket-free mock CA in the tests that verifies every JWS, injects `badNonce`, fetches HTTP-01 over real HTTP and resolves DNS-01 from the publisher's zone; `needsRenewal` errs toward renewal. **Where we are behind:** no DNS provider plugins (lego ships 200+; here the caller writes the publisher), no external account binding (ZeroSSL, Google Trust Services and other CAs require it), no revocation, no account key rollover or deactivation, no ARI (RFC 9773), ES256 keys only (no RSA or P-384 account or certificate keys), no PKCS#8 key I/O, never run against a real CA in CI (a manual recipe only), and no scheduling, storage or on-demand layer like `autocert`/CertMagic (→ Backlog).
+**Where we are ahead:** the only maintained ACME client in Zig, pure Zig on `std.crypto`, with all three challenges (HTTP-01 and TLS-ALPN-01 served by the library itself; DNS-01 through a caller publisher, as `x/crypto/acme` leaves it); staging by default; a socket-free mock CA in the tests that verifies every JWS, injects `badNonce`, fetches HTTP-01 over real HTTP and resolves DNS-01 from the publisher's zone; `needsRenewal` errs toward renewal. Since 2026-10-13 also at `x/crypto/acme` parity on the protocol surface: external account binding (RFC 8555 §7.3.4), contact update / account key rollover / deactivation, revocation by account and by certificate key, ARI (RFC 9773) with the `replaces` order member, ES256 and ES384 account and certificate keys, PKCS#8 key I/O. **Where we are behind:** no DNS provider plugins (lego ships 200+; here the caller writes the publisher), no RSA account or certificate keys (x/crypto/acme and lego have them; P-521/ES512 neither here nor there), never run against a real CA in CI beyond Pebble (Pebble covers the issuance flows; EAB, rollover, revocation and ARI are mock-CA tested only, not yet run through `zig build interop-acme`), and no scheduling, storage or on-demand layer like `autocert`/CertMagic (→ Backlog).
 
 ## Design & invariants
 - **Flow:** new-nonce → new-account → new-order → authorization → finalize with a CSR → poll →
@@ -62,11 +62,22 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
     app-side (out of scope).** No system clock: the ephemeral cert uses a fixed wide UTCTime window
     (`tls_alpn_not_before`/`tls_alpn_not_after`). Keygen takes randomness from the caller (the `io`
     in the order flow; a `std.Random` for the standalone `x509.tlsAlpnCert`) — no `std.crypto.random`.
-- **ES256 JWS** signs every ACME request (JWK for new-account, then the account `kid`); the replay
-  nonce threads from each response's `Replay-Nonce`.
-- Threadsafe; account key + order state are caller-held. All crypto is `std.crypto` — no bespoke
-  ASN.1/crypto beyond std's `Certificate`/ECDSA. Key/cert PEM I/O covers RFC 5915 `EC PRIVATE KEY`
-  (no PKCS#8).
+- **ES256 / ES384 JWS** signs every ACME request (JWK for new-account, then the account `kid`); the
+  replay nonce threads from each response's `Replay-Nonce`. The curve follows the key
+  (`jws.Alg`; `AnyKeyPair` is what `Client` holds); the entry points are generic over the key type,
+  so a P-256 caller's code is unchanged.
+- **Account lifecycle** (2026-10-13): EAB is an HS256 inner JWS over the account JWK (`jws.signEab`,
+  built per newAccount URL, no nonce). `rolloverKey` sends an outer JWS (old key, `kid`, nonce) whose
+  payload is the inner JWS (new key as `jwk`, **no nonce**, same `url`) over `{account, oldKey}`; the
+  client swaps and wipes its key only after a 200. `deactivate` clears `accountUrl`.
+- **Revocation** is `kid`-signed (`revoke`) or `jwk`-signed with the certificate's own key
+  (`revokeWithCertKey`, needs no account). **ARI** (RFC 9773) is an unauthenticated GET of
+  `<renewalInfo>/<CertID>`, CertID = base64url(AKI keyIdentifier) "." base64url(serial content
+  octets); the endpoints `keyChange`, `revokeCert`, `renewalInfo` are optional in the directory and
+  their absence is `error.NotSupported`.
+- Threadsafe; account key + order state are caller-held. All crypto is `std.crypto` plus the sibling
+  `p256`/`p384` signers — no bespoke ASN.1/crypto beyond std's `Certificate`/ECDSA. Key/cert PEM I/O
+  covers RFC 5915 `EC PRIVATE KEY` and RFC 5958 PKCS#8 `PRIVATE KEY`, P-256 and P-384.
 
 ## Threat model / out of scope
 - **Account-key custody is the security boundary** — whoever holds the ES256 account key controls
@@ -80,7 +91,10 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   (the library never sees them). Out of scope: DNS provider integrations, certificate storage/rotation
   scheduling, OCSP, and **running the TLS listener** — for TLS-ALPN-01 the caller must serve the
   validation cert from `TlsAlpnResponder` under ALPN `acme-tls/1` (BYO-TLS `http` seam or a proxy);
-  for HTTP-01 the caller runs the port-80 `http.Server`. RSA account keys not supported (ES256 only).
+  for HTTP-01 the caller runs the port-80 `http.Server`. RSA account keys not supported (ES256 / ES384 only). The EAB MAC key is a secret
+  of the same weight as the account key (it lets whoever holds it bind new accounts to the customer):
+  it stays the caller's slice in `Options.eab`; the module MACs with a wiped HMAC context and never
+  prints or stores it.
 
 ## Verification
 `zig build test-acme` — all offline + loopback, no real CA ever contacted. Offline units:
@@ -132,20 +146,34 @@ error), and `wellFormedRange`'s child-past-parent error and final `index == end`
 redundant given the other). Alive: `parseAuthz` taking the FIRST http-01 challenge when a CA
 lists two — RFC 8555 does not define duplicates, so no test pins a choice. No defect found.
 
+**Lifecycle and ES384 tests (2026-10-13).** Mock CA, same router/`http.Server` rig: EAB (the CA checks
+kid, url, no nonce, payload = account JWK and the MAC; a separate test recomputes the MAC with std's
+HMAC-SHA256 over the RFC 8555 §7.3.4 layout; a wrong key and a missing binding are refused), rollover
+ES256 → ES384 → ES384 (outer and inner JWS, `oldKey`, `account`, no inner nonce; the previous key is
+then refused — `UnsupportedJws` across curves, `BadSignature` within one; a 409 leaves the client's key
+unchanged), contact update, deactivation, revocation by account and by certificate key (the signer must
+be the certificate's key, read by std's parser), `NotSupported` without the endpoints, ARI against the
+RFC 9773 §4.1 CertID example (certificate transcribed from Appendix A; AKI 69885B6B…C8D4, serial
+00 87 65 43 21 → `aYhba4dGQEHhs3uEe6CuLN4ByNQ.AIdlQyE`), RFC 3339 parsing, and the whole issuance
+with an ES384 account and an ES384 certificate key. External oracles: openssl built the P-384 CSR
+(`openssl req -verify` ok) and the P-384/P-256 PKCS#8 keys (our PEM output is byte-identical), python
+computed the P-384 canonical JWK and thumbprint from openssl's public key.
+
 ## Backlog / deferred
 Reviewed 2026-07-10 (adversarial security pass) — clean: JWS/ES256/nonce/CSR construction and the
 ACME v2 (RFC 8555) replay/downgrade paths all confirmed correct. A manual staging/production recipe
 (real domain, port 80) is documented in README but is out of CI scope by design.
 - ~~**DNS-01 challenge (and thereby wildcard certificates)**~~ — **DONE 2026-09-30** (see "Design & invariants"). Not done with it: DNS provider publishers (by design the caller's; an RFC 2136 dynamic-update publisher would be the one generic candidate, it needs a DNS message encoder — `dnswire` is a sibling), and a propagation checker (querying the authoritative servers before returning from `present`).
-- **External account binding (RFC 8555 §7.3.4)** *(survey 2026-09-30)*: ZeroSSL and Google Trust Services (and most enterprise CAs) refuse registration without it, so the module is limited to Let's Encrypt-style open CAs. Effort: small (an HMAC-signed inner JWS in `new-account`). Fits §2.
-- **Certificate revocation, account key rollover and deactivation** *(survey 2026-09-30)*: `instant-acme`, lego and `x/crypto/acme` have them; without revocation a compromised key can only be left to expire. Effort: small–medium (three more signed POSTs, `jws.zig` already supports the `jwk`-embedded form for revoke-by-key). Fits §2.
-- **RSA and P-384 keys; PKCS#8 key I/O** *(survey 2026-09-30)*: account and certificate keys are ES256/P-256 in RFC 5915 form only; a fleet whose existing keys are RSA or PKCS#8 cannot import them, and some devices need RSA certificates. `rsa` and `p256` are siblings in this repo. Effort: medium. Fits §2.
-- **P-521 (ES512) account and certificate keys** *(2026-10-10, phase 2 of the `p521` module)*: `p521` now gives an ES512 signer with std's `Ecdsa` surface and `jwt` verifies/signs ES512, but this module's account key is the concrete type `jws.Es256` threaded through `jws.zig` (JWK `crv:"P-256"`, 43-character coordinates, RFC 7638 thumbprint, `alg:"ES256"`, `verifyFlattened`), `Client.zig` (37 sites) and `x509.zig`'s CSR (35 sites) — and acme does not go through `jwt`. A P-521 key therefore needs an account-key union (or a comptime key type) across all three files: an API change, not a wiring. Let's Encrypt's documented account-key algorithms are RS256, ES256 and ES384 *(from memory, not re-checked)*, so the ES384 half of the item above is the more useful first step; ES512 would ride on the same union. Effort: medium. Fits §2.
-- **ARI (RFC 9773) renewal timing** *(survey 2026-09-30)*: `needsRenewal` only counts days to `notAfter`; Let's Encrypt asks clients to consult renewalInfo so a mass revocation can be absorbed. Effort: small. Fits §2.
+- ~~**External account binding (RFC 8555 §7.3.4)**~~ — **DONE 2026-10-13** (`Options.eab`, `jws.signEab`; mock CA verifies the MAC, a test recomputes it with std HMAC-SHA256). Not run against a real EAB CA.
+- ~~**Certificate revocation, account key rollover and deactivation**~~ — **DONE 2026-10-13** (`revoke`, `revokeWithCertKey`, `rolloverKey`, `updateContact`, `deactivate`; the mock CA verifies both rollover JWS layers and refuses the old key afterwards).
+- **RSA account and certificate keys** *(survey 2026-09-30; PKCS#8 and P-384 DONE 2026-10-13)*: a fleet whose existing keys are RSA cannot import them, and some devices need RSA certificates (RS256 is among Let's Encrypt's account-key algorithms *(from memory, not re-checked)*). The key union (`jws.AnyKeyPair`, `Alg`) is the place to add it; `rsa` is a sibling in this repo. Effort: medium. Fits §2.
+- **P-521 (ES512) account and certificate keys** *(2026-10-10, phase 2 of the `p521` module)*: `p521` gives an ES512 signer with std's `Ecdsa` surface. Since 2026-10-13 the account key is the `Alg`/`AnyKeyPair` union (ES256, ES384), so ES512 is one more variant: JWK `crv:"P-521"` with 66-byte coordinates, `alg:"ES512"`, a 132-byte signature, `ecdsa-with-SHA512` and the secp521r1 OID in the CSR and key codecs. Effort: small. Fits §2.
+- ~~**ARI (RFC 9773) renewal timing**~~ — **DONE 2026-10-13** (`renewalInfo`, `x509.ariCertId` against the RFC's §4.1 example, `obtainWith(.{ .replaces })`). `needsRenewal` stays as the fallback for a CA without ARI. Not done with it: a scheduler that sleeps until `pickTime` and honours `Retry-After` (the `autocert` layer below).
+- **Pebble coverage of the lifecycle calls** *(2026-10-13)*: `tools/interop.zig` runs the issuance flows only; EAB (Pebble's `-externalaccountbindings`-style config), rollover, revocation and ARI (Pebble supports `renewalInfo`) are mock-CA tested. Adding them to `zig build interop-acme` turns the mock's reading of the RFC into the foreign server's. Effort: small.
 - ~~**A run against a real staging CA in CI or a scheduled job**~~ — Pebble DONE 2026-10-06 (see Anchoring; by hand through `tools/pebble.sh`, replayed in the lane). Still open: a scheduled run against Let's Encrypt STAGING itself (Boulder, a public name, port 80), out of scope for a loopback lane.
 
 ## Status
-`gap · any · client · threadsafe` + deps `http`, `router`, `p256`, `entropy`, `std.crypto` (ECDSA P-256, `Certificate`),
+`gap · any · client · threadsafe` + deps `http`, `router`, `p256`, `p384`, `entropy`, `std.crypto` (sha2, hmac, `Certificate`),
 `std.json` — canonical source is `pub const meta` in src/root.zig.
 
 ## Anchoring

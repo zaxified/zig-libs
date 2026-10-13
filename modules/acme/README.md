@@ -3,8 +3,9 @@
 ACME v2 (RFC 8555) client: automated certificate issuance + renewal with the
 **HTTP-01**, **TLS-ALPN-01** (RFC 8737) and **DNS-01** challenges, wildcard
 certificates included (Let's Encrypt et al.) —
-directory discovery, nonce management, ES256 account (JWS), order →
-authorization → challenge → CSR finalize → PEM chain download, plus the
+directory discovery, nonce management, ES256 / ES384 account (JWS), order →
+authorization → challenge → CSR finalize → PEM chain download, external
+account binding, key rollover, revocation, ARI renewal timing, plus the
 renewal predicate.
 
 - No ACME client exists in Zig std or as a maintained
@@ -15,8 +16,9 @@ renewal predicate.
   RFC 7638 JWK thumbprint, RFC 2986 PKCS#10, RFC 5915 EC keys).
 - **Deps:** `http` (all ACME requests via `http.Client`; the challenge
   server is `http.Server`), `router` (the challenge responder middleware),
-  `p256` (the ES256 account/certificate key type), `entropy` (key generation),
-  `std.crypto` (ecdsa P-256, sha2, Certificate), `std.json`, `std.base64`.
+  `p256` / `p384` (the ES256 / ES384 account and certificate key types),
+  `entropy` (key generation), `std.crypto` (sha2, hmac, Certificate),
+  `std.json`, `std.base64`.
 
 Provenance: clean-room implementation from RFC 8555 (ACME), RFC 7515 (JWS),
 RFC 7638 (JWK thumbprint), RFC 2986 (PKCS#10) and RFC 5915 (EC private keys).
@@ -44,8 +46,8 @@ domain out of production quotas. Going live is a deliberate opt-in:
 | File | Role |
 |------|------|
 | `src/Client.zig` | The RFC 8555 protocol client (`register`, `obtain`) + `Responder` (HTTP-01 middleware) + `TlsAlpnResponder` (TLS-ALPN-01 validation-cert store). Robust nonce handling (`Replay-Nonce` harvested from every response, transparent `badNonce` retry), status polling with `Retry-After`, problem-document diagnostics via `lastProblem()`. Challenge type is `Options.challenge_type`. |
-| `src/jws.zig` | JOSE layer: base64url (no pad), canonical P-256 JWK, RFC 7638 thumbprint, RFC 8555 §8.1 key authorization, RFC 8737 §3 `acmeIdentifier` (`SHA-256(keyAuthorization)`), ES256 flattened-JSON JWS sign **and verify** (the verify half powers the mock CA). |
-| `src/x509.zig` | Minimal DER encoder + PKCS#10 CSR (empty subject, SAN dNSNames — the modern Let's Encrypt shape), bounds-checked CSR parse-back, **RFC 8737 TLS-ALPN-01 self-signed validation cert** (`tlsAlpnCertDer` / `tlsAlpnCert`: dNSName SAN + critical `id-pe-acmeIdentifier` extension), PEM, RFC 5915 `EC PRIVATE KEY` read/write, certificate `notAfter` via `std.crypto.Certificate`. |
+| `src/jws.zig` | JOSE layer: base64url (no pad), canonical P-256 / P-384 JWK, RFC 7638 thumbprint, RFC 8555 §8.1 key authorization, RFC 8737 §3 `acmeIdentifier` (`SHA-256(keyAuthorization)`), ES256 / ES384 flattened-JSON JWS sign **and verify** (the verify half powers the mock CA), the HS256 external-account-binding JWS (`signEab` / `verifyEab`), `Alg` / `AnyKeyPair` / `AnyPublicKey`. |
+| `src/x509.zig` | Minimal DER encoder + PKCS#10 CSR (empty subject, SAN dNSNames — the modern Let's Encrypt shape; ecdsa-with-SHA256/384), bounds-checked CSR parse-back, **RFC 8737 TLS-ALPN-01 self-signed validation cert** (`tlsAlpnCertDer` / `tlsAlpnCert`: dNSName SAN + critical `id-pe-acmeIdentifier` extension), PEM, RFC 5915 `EC PRIVATE KEY` and RFC 5958 PKCS#8 `PRIVATE KEY` read/write (P-256, P-384), the RFC 9773 ARI CertID (`ariCertId`), certificate `notAfter` via `std.crypto.Certificate`. |
 | `src/root.zig` | Re-exports + `needsRenewal(cert_pem, now, within_days)`. |
 
 ## Usage
@@ -83,8 +85,49 @@ if (acme.needsRenewal(cert.chain_pem, now_unix, 30)) {
 ```
 
 Scope notes: HTTP-01, TLS-ALPN-01 and DNS-01 (wildcards with DNS-01 only);
-P-256/ES256 keys only (account and certificate); key/cert PEM I/O covers RFC 5915
-`EC PRIVATE KEY` (no PKCS#8); no external account binding, revocation or ARI yet.
+ES256 (P-256) and ES384 (P-384) keys, account and certificate (no RSA); key
+PEM I/O covers RFC 5915 `EC PRIVATE KEY` and RFC 5958 PKCS#8 `PRIVATE KEY`,
+both curves; external account binding, account update / key rollover /
+deactivation, revocation and ARI renewal timing (below).
+
+## Account, revocation, renewal timing
+
+```zig
+// External account binding (RFC 8555 §7.3.4) — ZeroSSL, Google Trust Services, ...
+// hmac_key is the raw MAC key: the CA hands it out base64url-encoded, decode it first.
+var client = acme.Client.init(io, gpa, &transport, &account_key, .{
+    .directory_url = ca_directory,
+    .eab = .{ .kid = "kid-from-the-ca", .hmac_key = mac_key_bytes },
+});
+
+// ES384 account key and certificate keys (any of Es256.KeyPair, Es384.KeyPair,
+// or the jws.AnyKeyPair union is accepted wherever a key pair is):
+var key: acme.jws.AnyKeyPair = undefined;
+acme.jws.generateAnyKeyPair(&key, .es384, io);
+var client384 = acme.Client.init(io, gpa, &transport, &key, .{ .cert_key_alg = .es384 });
+
+// Account lifecycle (x/crypto/acme UpdateReg, AccountKeyRollover, DeactivateReg):
+try client.updateContact(&.{"mailto:new@example.org"});
+try client.rolloverKey(&new_key);   // RFC 8555 §7.3.5; persist new_key afterwards
+try client.deactivate();            // irreversible
+
+// Revocation (RevokeCert): by the account, or by the certificate's own key.
+try client.revoke(cert_der, .key_compromise);
+try client.revokeWithCertKey(cert_der, &cert_key, null);
+
+// ARI (RFC 9773): when does the CA want this certificate renewed?
+var info = client.renewalInfoPem(cert.chain_pem) catch |err| switch (err) {
+    error.NotSupported => null, // CA without ARI: fall back to acme.needsRenewal
+    else => return err,
+};
+// info.window_start / window_end (epoch s), info.pickTime(random), info.retry_after_s
+const id = try acme.x509.ariCertIdFromPem(gpa, cert.chain_pem);
+var renewed = try client.obtainWith(&.{"example.org"}, .{ .replaces = id });
+```
+
+`error.NotSupported` means the CA's directory lacks `keyChange`, `revokeCert` or
+`renewalInfo`. `Reason` is the RFC 5280 CRLReason code (non-exhaustive: the CA
+refuses an unwanted one with `badRevocationReason`).
 
 ## DNS-01 (RFC 8555 §8.4) and wildcard certificates
 
@@ -182,6 +225,13 @@ contacted**:
   real HTTP (and probes that unknown tokens 404), and parses + verifies
   the CSR before "issuing" the fixture chain. Skipped only if the
   loopback bind itself fails.
+- **Lifecycle (same mock CA):** the external-account-binding JWS (checked
+  against std's HMAC-SHA256 and verified by the CA), a rollover ES256 → ES384
+  with both JWS layers checked and the old key refused afterwards,
+  contact update and deactivation, revocation by account and by certificate
+  key, ARI against the RFC 9773 §4.1 CertID example, an ES384 account +
+  certificate key through the whole flow. ES384 JWK / thumbprint / PKCS#8 /
+  CSR cases are checked against openssl and python.
 
 ## Manual staging/production recipe (out of CI scope)
 

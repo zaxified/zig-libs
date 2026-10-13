@@ -47,8 +47,9 @@ io: std.Io,
 gpa: Allocator,
 /// Caller-owned transport; all ACME requests go through it.
 http_client: *http.Client,
-/// The ES256 account key (see `jws.KeyPair`).
-account_key: jws.KeyPair,
+/// The account key, ES256 or ES384 (see `jws.AnyKeyPair`); replaced by
+/// `rolloverKey`.
+account_key: jws.AnyKeyPair,
 options: Options,
 /// Resolved directory endpoints (owned), null until first use.
 dir: ?Directory,
@@ -102,7 +103,44 @@ pub fn dns01RecordName(buf: *[dns01_max_name_len]u8, domain: []const u8) []const
 pub const dns01_label = "_acme-challenge.";
 pub const dns01_max_name_len = dns01_label.len + 253;
 
+/// External account binding credentials (RFC 8555 §7.3.4) a CA such as
+/// ZeroSSL or Google Trust Services hands out for a pre-existing customer
+/// account. Both slices stay caller-owned and must outlive the `Client`.
+pub const ExternalAccountBinding = struct {
+    /// The CA's key identifier (the inner JWS's `kid`).
+    kid: []const u8,
+    /// The raw MAC key. CAs publish it base64url-encoded: decode it with
+    /// `jws.base64UrlDecodeAlloc` first, and wipe the result afterwards.
+    hmac_key: []const u8,
+};
+
+/// RFC 5280 §5.3.1 CRLReason code for `revoke` (RFC 8555 §7.6). The named
+/// values are the ones a CA can honour for a certificate that cannot come
+/// back; the enum is non-exhaustive so any other code the CA accepts can
+/// be sent as `@enumFromInt(n)` (a CA refuses an unwanted one with
+/// `badRevocationReason`).
+pub const Reason = enum(u8) {
+    unspecified = 0,
+    key_compromise = 1,
+    affiliation_changed = 3,
+    superseded = 4,
+    cessation_of_operation = 5,
+    privilege_withdrawn = 9,
+    _,
+};
+
+/// Per-call knobs of `obtainWith`.
+pub const ObtainOptions = struct {
+    /// RFC 9773 §5: the ARI CertID of the certificate this order replaces
+    /// (`x509.ariCertId`); sent as the new-order `replaces` member.
+    replaces: ?[]const u8 = null,
+};
+
 pub const Options = struct {
+    /// External account binding for `register` (default none).
+    eab: ?ExternalAccountBinding = null,
+    /// Algorithm of the certificate keys `obtain` mints (default ES256).
+    cert_key_alg: jws.Alg = .es256,
     /// ACME directory URL. **Defaults to Let's Encrypt STAGING** (untrusted
     /// test certificates!) so accidental runs cannot burn production rate
     /// limits — set `letsencrypt_production` explicitly to go live.
@@ -159,17 +197,28 @@ pub const Error = error{
     InvalidDomain,
     /// A `kid`-signed request was attempted before registration.
     NotRegistered,
+    /// The CA's directory lacks the endpoint the call needs (`keyChange`,
+    /// `revokeCert`, `renewalInfo`): this CA does not offer it. For ARI the
+    /// caller falls back to `needsRenewal`.
+    NotSupported,
 };
 
 const Directory = struct {
     new_nonce: []u8,
     new_account: []u8,
     new_order: []u8,
+    /// Optional resources (RFC 8555 §7.1.1, RFC 9773 §4), owned.
+    key_change: ?[]u8 = null,
+    revoke_cert: ?[]u8 = null,
+    renewal_info: ?[]u8 = null,
 
     fn deinit(d: *Directory, gpa: Allocator) void {
         gpa.free(d.new_nonce);
         gpa.free(d.new_account);
         gpa.free(d.new_order);
+        if (d.key_change) |u| gpa.free(u);
+        if (d.revoke_cert) |u| gpa.free(u);
+        if (d.renewal_info) |u| gpa.free(u);
     }
 };
 
@@ -186,14 +235,17 @@ pub fn init(
     io: std.Io,
     gpa: Allocator,
     http_client: *http.Client,
-    account_key: *const jws.KeyPair,
+    account_key: anytype, // *const jws.KeyPair, *const jws.Es384.KeyPair or *const jws.AnyKeyPair
     options: Options,
 ) Client {
+    var key: jws.AnyKeyPair = undefined;
+    jws.copyPairInto(&key, account_key);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&key)); // runs after the result is built
     return .{
         .io = io,
         .gpa = gpa,
         .http_client = http_client,
-        .account_key = account_key.*,
+        .account_key = key,
         .options = options,
         .dir = null,
         .kid = null,
@@ -212,7 +264,7 @@ pub fn deinit(c: *Client) void {
     if (c.nonce) |n| c.gpa.free(n);
     c.responder.deinit();
     c.tls_alpn.deinit();
-    // `account_key` is the account's ES256 private key — it lives on this
+    // `account_key` is the account's private key — it lives on this
     // struct for the whole Client lifetime (every `postJws` call signs with
     // it), so this is its one wipe point. Do this BEFORE `c.* = undefined`
     // below: assigning `undefined` is not a zeroing guarantee (ReleaseFast
@@ -268,9 +320,17 @@ pub fn register(c: *Client) Error!void {
     defer arena.deinit();
     const a = arena.allocator();
 
+    // RFC 8555 §7.3.4: the inner JWS MACs the account JWK with the CA's key
+    // and names the newAccount URL, so it is built per request URL.
+    var eab_jws: ?[]u8 = null;
+    if (c.options.eab) |eab| {
+        eab_jws = jws.signEab(a, c.account_key.publicKey(), eab.kid, eab.hmac_key, c.dir.?.new_account) catch
+            return error.OutOfMemory;
+    }
+
     var out: std.Io.Writer.Allocating = .init(a);
     var js: std.json.Stringify = .{ .writer = &out.writer, .options = .{} };
-    writeRegisterPayload(&js, c.options) catch return error.OutOfMemory;
+    writeRegisterPayload(&js, c.options, eab_jws) catch return error.OutOfMemory;
 
     const pr = try c.postJws(a, c.dir.?.new_account, out.written(), .jwk);
     if (pr.status != 200 and pr.status != 201) {
@@ -281,7 +341,7 @@ pub fn register(c: *Client) Error!void {
     c.kid = try c.gpa.dupe(u8, loc);
 }
 
-fn writeRegisterPayload(js: *std.json.Stringify, options: Options) !void {
+fn writeRegisterPayload(js: *std.json.Stringify, options: Options, eab_jws: ?[]const u8) !void {
     try js.beginObject();
     if (options.terms_of_service_agreed) {
         try js.objectField("termsOfServiceAgreed");
@@ -291,7 +351,328 @@ fn writeRegisterPayload(js: *std.json.Stringify, options: Options) !void {
         try js.objectField("contact");
         try js.write(options.contact);
     }
+    if (eab_jws) |inner| {
+        try js.objectField("externalAccountBinding");
+        try js.beginWriteRaw();
+        try js.writer.writeAll(inner);
+        js.endWriteRaw();
+    }
     try js.endObject();
+}
+
+// ── account lifecycle (RFC 8555 §7.3.2, §7.3.5, §7.3.6) ─────────────────────
+
+/// Replace the account's contact URLs (`UpdateReg` in x/crypto/acme): POST
+/// `{"contact":[…]}` to the account URL. Registers first when needed. Pass an
+/// empty slice to clear them.
+pub fn updateContact(c: *Client, contacts: []const []const u8) Error!void {
+    try c.register();
+
+    var arena = std.heap.ArenaAllocator.init(c.gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var out: std.Io.Writer.Allocating = .init(a);
+    var js: std.json.Stringify = .{ .writer = &out.writer, .options = .{} };
+    writeContactPayload(&js, contacts) catch return error.OutOfMemory;
+    const pr = try c.postJws(a, c.kid.?, out.written(), .kid);
+    if (pr.status != 200) {
+        c.noteProblem(pr.body);
+        return error.AcmeProblem;
+    }
+}
+
+fn writeContactPayload(js: *std.json.Stringify, contacts: []const []const u8) !void {
+    try js.beginObject();
+    try js.objectField("contact");
+    try js.write(contacts);
+    try js.endObject();
+}
+
+/// Switch the account to `new_key` (`AccountKeyRollover`; RFC 8555 §7.3.5): a
+/// pointer to an `Es256.KeyPair`, an `Es384.KeyPair` or an `AnyKeyPair`. The
+/// outer JWS is signed with the current key (kid = account URL), the inner
+/// one with the new key (`jwk`, no nonce) over `{account, oldKey}`, both for
+/// the directory's `keyChange` URL (`error.NotSupported` without one). On
+/// success the client signs with `new_key` from then on and has wiped the old
+/// one; persist `new_key` — the old key no longer opens the account. On
+/// failure (e.g. 409, the new key already belongs to an account) nothing
+/// changes.
+pub fn rolloverKey(c: *Client, new_key: anytype) Error!void {
+    try c.register();
+    const key_change = c.dir.?.key_change orelse return error.NotSupported;
+
+    var arena = std.heap.ArenaAllocator.init(c.gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Inner payload: {"account": <account URL>, "oldKey": <old JWK>}.
+    var old_jwk_buf: [jws.max_canonical_jwk_len]u8 = undefined;
+    const old_jwk = jws.canonicalJwk(&old_jwk_buf, c.account_key.publicKey());
+    var inner_payload: std.Io.Writer.Allocating = .init(a);
+    {
+        var js: std.json.Stringify = .{ .writer = &inner_payload.writer, .options = .{} };
+        writeRolloverPayload(&js, c.kid.?, old_jwk) catch return error.OutOfMemory;
+    }
+    const inner = jws.sign(a, new_key, inner_payload.written(), .{
+        .nonce = null,
+        .url = key_change,
+        .kid = null, // embed the NEW key's jwk
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.SigningFailed => return error.SigningFailed,
+    };
+
+    const pr = try c.postJws(a, key_change, inner, .kid);
+    if (pr.status != 200) {
+        c.noteProblem(pr.body);
+        return error.AcmeProblem;
+    }
+    // The CA now knows only the new key.
+    std.crypto.secureZero(u8, std.mem.asBytes(&c.account_key));
+    jws.copyPairInto(&c.account_key, new_key);
+}
+
+fn writeRolloverPayload(js: *std.json.Stringify, account_url: []const u8, old_jwk: []const u8) !void {
+    try js.beginObject();
+    try js.objectField("account");
+    try js.write(account_url);
+    try js.objectField("oldKey");
+    try js.beginWriteRaw();
+    try js.writer.writeAll(old_jwk);
+    js.endWriteRaw();
+    try js.endObject();
+}
+
+/// Deactivate the account (`DeactivateReg`; RFC 8555 §7.3.6): POST
+/// `{"status":"deactivated"}` to the account URL. Irreversible — the CA stops
+/// accepting requests for this account and its pending orders end. On success
+/// `accountUrl` is null again, and the client must not be used for issuance.
+pub fn deactivate(c: *Client) Error!void {
+    try c.register();
+
+    var arena = std.heap.ArenaAllocator.init(c.gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const pr = try c.postJws(a, c.kid.?, "{\"status\":\"deactivated\"}", .kid);
+    if (pr.status != 200) {
+        c.noteProblem(pr.body);
+        return error.AcmeProblem;
+    }
+    c.gpa.free(c.kid.?);
+    c.kid = null;
+}
+
+// ── revocation (RFC 8555 §7.6) ──────────────────────────────────────────────
+
+/// Revoke `cert_der` (DER) as the account that holds it (`kid`-signed). The
+/// CA must list `revokeCert` in its directory (`error.NotSupported` else).
+/// `reason` null leaves the member out, which the CA reads as `unspecified`.
+pub fn revoke(c: *Client, cert_der: []const u8, reason: ?Reason) Error!void {
+    try c.register();
+    const url = c.dir.?.revoke_cert orelse return error.NotSupported;
+    var arena = std.heap.ArenaAllocator.init(c.gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const payload = try revokePayload(a, cert_der, reason);
+    const pr = try c.postSigned(a, url, payload, .kid, &c.account_key);
+    if (pr.status != 200) {
+        c.noteProblem(pr.body);
+        return error.AcmeProblem;
+    }
+}
+
+/// Revoke `cert_der` signed with the certificate's own key (`RevokeCert` with
+/// the certificate key; the `jwk` form of RFC 8555 §7.6) — for a lost or
+/// compromised account where the certificate key is still at hand. `cert_key`
+/// is a pointer to an `Es256.KeyPair`, an `Es384.KeyPair` or an `AnyKeyPair`.
+/// Needs no registered account.
+pub fn revokeWithCertKey(c: *Client, cert_der: []const u8, cert_key: anytype, reason: ?Reason) Error!void {
+    try c.ensureDirectory();
+    const url = c.dir.?.revoke_cert orelse return error.NotSupported;
+    var arena = std.heap.ArenaAllocator.init(c.gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const payload = try revokePayload(a, cert_der, reason);
+    const pr = try c.postSigned(a, url, payload, .jwk, cert_key);
+    if (pr.status != 200) {
+        c.noteProblem(pr.body);
+        return error.AcmeProblem;
+    }
+}
+
+fn revokePayload(a: Allocator, cert_der: []const u8, reason: ?Reason) Error![]const u8 {
+    const cert_b64 = try jws.base64UrlEncodeAlloc(a, cert_der);
+    var out: std.Io.Writer.Allocating = .init(a);
+    var js: std.json.Stringify = .{ .writer = &out.writer, .options = .{} };
+    writeRevokePayload(&js, cert_b64, reason) catch return error.OutOfMemory;
+    return out.written();
+}
+
+fn writeRevokePayload(js: *std.json.Stringify, cert_b64: []const u8, reason: ?Reason) !void {
+    try js.beginObject();
+    try js.objectField("certificate");
+    try js.write(cert_b64);
+    if (reason) |r| {
+        try js.objectField("reason");
+        try js.write(@intFromEnum(r));
+    }
+    try js.endObject();
+}
+
+// ── ARI (RFC 9773) ──────────────────────────────────────────────────────────
+
+/// The CA's suggested renewal window for a certificate (RFC 9773 §4.2).
+pub const RenewalInfo = struct {
+    /// Window start and end, epoch seconds. Renew at a time chosen in
+    /// `[window_start, window_end]` (`pickTime`); at or after the end, now.
+    window_start: i64,
+    window_end: i64,
+    /// A page explaining a window that was moved (incident, revocation), gpa-owned.
+    explanation_url: ?[]u8,
+    /// `Retry-After`, seconds: when to ask again (RFC 9773 §4.3), or null.
+    retry_after_s: ?u64,
+
+    pub fn deinit(r: *RenewalInfo, gpa: Allocator) void {
+        if (r.explanation_url) |u| gpa.free(u);
+        r.* = undefined;
+    }
+
+    /// A uniformly random second inside the window (RFC 9773 §4.2 asks
+    /// clients to spread over it rather than all renew at the start).
+    pub fn pickTime(r: RenewalInfo, random: std.Random) i64 {
+        if (r.window_end <= r.window_start) return r.window_start;
+        const span: u64 = @intCast(r.window_end - r.window_start);
+        return r.window_start + @as(i64, @intCast(random.uintLessThan(u64, span + 1)));
+    }
+};
+
+/// Ask the CA when `cert_der` should be renewed (RFC 9773 §4.2): an
+/// unauthenticated GET of `<renewalInfo>/<CertID>`. `error.NotSupported` when
+/// the directory has no `renewalInfo` — fall back to `needsRenewal`. The
+/// certificate must carry an authorityKeyIdentifier (`x509.ariCertId`).
+pub fn renewalInfo(c: *Client, cert_der: []const u8) Error!RenewalInfo {
+    try c.ensureDirectory();
+    const base = c.dir.?.renewal_info orelse return error.NotSupported;
+    const cert_id = x509.ariCertId(c.gpa, cert_der) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.MalformedCertificate => return error.MalformedResponse,
+        error.NoAuthorityKeyIdentifier => {
+            c.note("certificate has no authorityKeyIdentifier; no ARI CertID");
+            return error.MalformedResponse;
+        },
+    };
+    defer c.gpa.free(cert_id);
+    const url = try std.fmt.allocPrint(c.gpa, "{s}/{s}", .{ std.mem.trimEnd(u8, base, "/"), cert_id });
+    defer c.gpa.free(url);
+
+    var res = c.http_client.request(.get, url, .{}) catch |err| return mapHttpError(err);
+    defer res.deinit();
+    try c.harvestNonce(&res);
+    const body = res.readAllAlloc(c.gpa, c.options.max_response_bytes) catch |err|
+        return mapHttpError(err);
+    defer c.gpa.free(body);
+    if (res.status != 200) {
+        c.noteProblem(body);
+        return error.AcmeProblem;
+    }
+    var info = try parseRenewalInfo(c.gpa, body);
+    info.retry_after_s = parseRetryAfterSeconds(res.header("retry-after"));
+    return info;
+}
+
+/// `renewalInfo` for the first certificate of a PEM chain (`Certificate.chain_pem`).
+pub fn renewalInfoPem(c: *Client, chain_pem: []const u8) Error!RenewalInfo {
+    const der_bytes = x509.pemDecode(c.gpa, "CERTIFICATE", chain_pem) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.MalformedResponse,
+    };
+    defer c.gpa.free(der_bytes);
+    return c.renewalInfo(der_bytes);
+}
+
+fn parseRenewalInfo(gpa: Allocator, body: []const u8) Error!RenewalInfo {
+    const Json = struct {
+        suggestedWindow: struct { start: []const u8 = "", end: []const u8 = "" } = .{},
+        explanationURL: ?[]const u8 = null,
+    };
+    const parsed = std.json.parseFromSlice(Json, gpa, body, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.MalformedResponse,
+    };
+    defer parsed.deinit();
+    const start = parseRfc3339(parsed.value.suggestedWindow.start) orelse return error.MalformedResponse;
+    const end = parseRfc3339(parsed.value.suggestedWindow.end) orelse return error.MalformedResponse;
+    if (end < start) return error.MalformedResponse;
+    const url: ?[]u8 = if (parsed.value.explanationURL) |u| try gpa.dupe(u8, u) else null;
+    return .{ .window_start = start, .window_end = end, .explanation_url = url, .retry_after_s = null };
+}
+
+/// RFC 3339 `date-time` → epoch seconds: `YYYY-MM-DDThh:mm:ss[.frac](Z|±hh:mm)`
+/// (`T` may be `t`, `Z` may be `z`). Fractions are dropped; leap second 60 is
+/// read as 59. Null on anything else.
+fn parseRfc3339(s: []const u8) ?i64 {
+    if (s.len < 20) return null;
+    const year = std.fmt.parseInt(i64, s[0..4], 10) catch return null;
+    const month = std.fmt.parseInt(u8, s[5..7], 10) catch return null;
+    const day = std.fmt.parseInt(u8, s[8..10], 10) catch return null;
+    const hour = std.fmt.parseInt(u8, s[11..13], 10) catch return null;
+    const minute = std.fmt.parseInt(u8, s[14..16], 10) catch return null;
+    var second = std.fmt.parseInt(u8, s[17..19], 10) catch return null;
+    if (s[4] != '-' or s[7] != '-' or s[13] != ':' or s[16] != ':') return null;
+    if (s[10] != 'T' and s[10] != 't') return null;
+    if (month < 1 or month > 12 or day < 1 or hour > 23 or minute > 59 or second > 60) return null;
+    if (second == 60) second = 59;
+    const mdays = [_]u8{ 31, if (isLeap(year)) 29 else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+    if (day > mdays[month - 1]) return null;
+
+    var at: usize = 19;
+    if (s[at] == '.') {
+        at += 1;
+        const frac_start = at;
+        while (at < s.len and std.ascii.isDigit(s[at])) at += 1;
+        if (at == frac_start) return null;
+    }
+    if (at >= s.len) return null;
+    var offset: i64 = 0;
+    switch (s[at]) {
+        'Z', 'z' => if (at + 1 != s.len) return null,
+        '+', '-' => {
+            if (s.len != at + 6 or s[at + 3] != ':') return null;
+            const oh = std.fmt.parseInt(u8, s[at + 1 .. at + 3], 10) catch return null;
+            const om = std.fmt.parseInt(u8, s[at + 4 .. at + 6], 10) catch return null;
+            if (oh > 23 or om > 59) return null;
+            offset = (@as(i64, oh) * 60 + om) * 60;
+            if (s[at] == '-') offset = -offset;
+        },
+        else => return null,
+    }
+    const days = daysFromCivil(year, month, day);
+    return days * 86400 + @as(i64, hour) * 3600 + @as(i64, minute) * 60 + second - offset;
+}
+
+fn isLeap(y: i64) bool {
+    return (@mod(y, 4) == 0 and @mod(y, 100) != 0) or @mod(y, 400) == 0;
+}
+
+/// Days since 1970-01-01 of a proleptic Gregorian date (Hinnant's algorithm).
+fn daysFromCivil(y_in: i64, m: u8, d: u8) i64 {
+    const y = if (m <= 2) y_in - 1 else y_in;
+    const era = @divFloor(y, 400);
+    const yoe = y - era * 400;
+    const mp: i64 = if (m > 2) @as(i64, m) - 3 else @as(i64, m) + 9;
+    const doy = @divFloor(153 * mp + 2, 5) + d - 1;
+    const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
+    return era * 146097 + doe - 719468;
+}
+
+/// Integer `Retry-After` seconds, uncapped (ARI asks for hours).
+fn parseRetryAfterSeconds(value: ?[]const u8) ?u64 {
+    const v = value orelse return null;
+    return std.fmt.parseInt(u64, std.mem.trim(u8, v, " "), 10) catch null;
 }
 
 // ── the order flow ──────────────────────────────────────────────────────────
@@ -321,6 +702,13 @@ pub const Certificate = struct {
 /// TLS-ALPN-01 store wired into a listener on 443, or the DNS-01 publisher
 /// set. A wildcard (`*.example.org`) is accepted with `dns_01` only.
 pub fn obtain(c: *Client, domains: []const []const u8) Error!Certificate {
+    return c.obtainWith(domains, .{});
+}
+
+/// `obtain` with per-call options: `replaces` names the certificate this
+/// order renews (RFC 9773 §5), so the CA can tell a renewal from a new order.
+/// The certificate key follows `Options.cert_key_alg`.
+pub fn obtainWith(c: *Client, domains: []const []const u8, opts: ObtainOptions) Error!Certificate {
     if (domains.len == 0) return error.InvalidDomain;
     for (domains) |name| {
         if (x509.isValidDomain(name)) continue;
@@ -338,7 +726,7 @@ pub fn obtain(c: *Client, domains: []const []const u8) Error!Certificate {
     // newOrder (§7.4).
     var out: std.Io.Writer.Allocating = .init(a);
     var js: std.json.Stringify = .{ .writer = &out.writer, .options = .{} };
-    writeOrderPayload(&js, domains) catch return error.OutOfMemory;
+    writeOrderPayload(&js, domains, opts.replaces) catch return error.OutOfMemory;
 
     const pr = try c.postJws(a, c.dir.?.new_order, out.written(), .kid);
     if (pr.status != 201) {
@@ -370,8 +758,8 @@ pub fn obtain(c: *Client, domains: []const []const u8) Error!Certificate {
     // at scope exit rather than left resident for the rest of the request.
     // Fail-closed draw: this key is what the issued certificate will
     // attest to, and it goes on to terminate TLS for the domain.
-    var cert_key: jws.KeyPair = undefined;
-    jws.generateKeyPair(&cert_key, c.io);
+    var cert_key: jws.AnyKeyPair = undefined;
+    jws.generateAnyKeyPair(&cert_key, c.options.cert_key_alg, c.io);
     defer std.crypto.secureZero(u8, std.mem.asBytes(&cert_key));
     const csr_der = x509.csrDer(a, &cert_key, domains) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -414,7 +802,7 @@ pub fn obtain(c: *Client, domains: []const []const u8) Error!Certificate {
     return .{ .chain_pem = chain_pem, .key_pem = key_pem, .not_after = not_after };
 }
 
-fn writeOrderPayload(js: *std.json.Stringify, domains: []const []const u8) !void {
+fn writeOrderPayload(js: *std.json.Stringify, domains: []const []const u8, replaces: ?[]const u8) !void {
     try js.beginObject();
     try js.objectField("identifiers");
     try js.beginArray();
@@ -427,6 +815,10 @@ fn writeOrderPayload(js: *std.json.Stringify, domains: []const []const u8) !void
         try js.endObject();
     }
     try js.endArray();
+    if (replaces) |cert_id| {
+        try js.objectField("replaces");
+        try js.write(cert_id);
+    }
     try js.endObject();
 }
 
@@ -464,7 +856,7 @@ fn solveAuthorization(c: *Client, a: Allocator, authz_url: []const u8) Error!voi
             };
             // Publish the key authorization (§8.3), then trigger + poll.
             var ka_buf: [jws.max_key_authorization_len]u8 = undefined;
-            const key_auth = jws.keyAuthorization(&ka_buf, challenge.token, c.account_key.public_key) catch
+            const key_auth = jws.keyAuthorization(&ka_buf, challenge.token, c.account_key.publicKey()) catch
                 return error.MalformedResponse; // CA sent a non-token
             try c.responder.set(challenge.token, key_auth);
             defer c.responder.remove(challenge.token);
@@ -489,7 +881,7 @@ fn solveAuthorization(c: *Client, a: Allocator, authz_url: []const u8) Error!voi
             // (§7.1.4: `wildcard: true` rides beside it); a CA that sends
             // anything else is not following the RFC.
             if (!x509.isValidDomain(authz.identifier)) return error.MalformedResponse;
-            const value = jws.dns01TxtValue(challenge.token, c.account_key.public_key) catch
+            const value = jws.dns01TxtValue(challenge.token, c.account_key.publicKey()) catch
                 return error.MalformedResponse; // CA sent a non-token
             var name_buf: [dns01_max_name_len]u8 = undefined;
             const name = dns01RecordName(&name_buf, authz.identifier);
@@ -509,7 +901,7 @@ fn solveAuthorization(c: *Client, a: Allocator, authz_url: []const u8) Error!voi
 /// it under ALPN `acme-tls/1`). The fresh leaf key is transient scratch —
 /// only its PEM copy is stored, so the raw KeyPair is wiped at scope exit.
 fn publishTlsAlpn01(c: *Client, a: Allocator, domain: []const u8, token: []const u8) Error!void {
-    const acme_id = jws.acmeIdentifier(token, c.account_key.public_key) catch
+    const acme_id = jws.acmeIdentifier(token, c.account_key.publicKey()) catch
         return error.MalformedResponse; // CA sent a non-token
     // Short-lived and never published, but it still signs a certificate a
     // TLS client is about to accept — same draw as the issuance key above.
@@ -774,6 +1166,9 @@ fn ensureDirectory(c: *Client) Error!void {
         newNonce: []const u8 = "",
         newAccount: []const u8 = "",
         newOrder: []const u8 = "",
+        keyChange: ?[]const u8 = null,
+        revokeCert: ?[]const u8 = null,
+        renewalInfo: ?[]const u8 = null,
     };
     const parsed = std.json.parseFromSlice(DirectoryJson, c.gpa, body, .{
         .ignore_unknown_fields = true,
@@ -785,14 +1180,34 @@ fn ensureDirectory(c: *Client) Error!void {
     inline for (.{ parsed.value.newNonce, parsed.value.newAccount, parsed.value.newOrder }) |url| {
         _ = http.Url.parse(url) catch return error.MalformedResponse;
     }
+    // The optional resources: absent is fine, present must be a URL.
+    inline for (.{ parsed.value.keyChange, parsed.value.revokeCert, parsed.value.renewalInfo }) |opt| {
+        if (opt) |url| _ = http.Url.parse(url) catch return error.MalformedResponse;
+    }
 
-    var dir: Directory = undefined;
-    dir.new_nonce = try c.gpa.dupe(u8, parsed.value.newNonce);
-    errdefer c.gpa.free(dir.new_nonce);
-    dir.new_account = try c.gpa.dupe(u8, parsed.value.newAccount);
-    errdefer c.gpa.free(dir.new_account);
-    dir.new_order = try c.gpa.dupe(u8, parsed.value.newOrder);
-    c.dir = dir;
+    const new_nonce = try c.gpa.dupe(u8, parsed.value.newNonce);
+    errdefer c.gpa.free(new_nonce);
+    const new_account = try c.gpa.dupe(u8, parsed.value.newAccount);
+    errdefer c.gpa.free(new_account);
+    const new_order = try c.gpa.dupe(u8, parsed.value.newOrder);
+    errdefer c.gpa.free(new_order);
+    const key_change = try dupeOpt(c.gpa, parsed.value.keyChange);
+    errdefer if (key_change) |u| c.gpa.free(u);
+    const revoke_cert = try dupeOpt(c.gpa, parsed.value.revokeCert);
+    errdefer if (revoke_cert) |u| c.gpa.free(u);
+    const renewal_info = try dupeOpt(c.gpa, parsed.value.renewalInfo);
+    c.dir = .{
+        .new_nonce = new_nonce,
+        .new_account = new_account,
+        .new_order = new_order,
+        .key_change = key_change,
+        .revoke_cert = revoke_cert,
+        .renewal_info = renewal_info,
+    };
+}
+
+fn dupeOpt(gpa: Allocator, s: ?[]const u8) Allocator.Error!?[]u8 {
+    return if (s) |v| try gpa.dupe(u8, v) else null;
 }
 
 /// Stash the `Replay-Nonce` of any response (RFC 8555 §6.5).
@@ -843,6 +1258,13 @@ const PostResult = struct {
 /// (§6.5). Returns whatever status the CA answered — callers decide.
 /// `a` provides the result's memory (an arena in the flow).
 fn postJws(c: *Client, a: Allocator, url: []const u8, payload: []const u8, mode: KeyMode) Error!PostResult {
+    return c.postSigned(a, url, payload, mode, &c.account_key);
+}
+
+/// `postJws` signing with `key` (a pointer to any supported key pair) instead
+/// of the account key — revocation by the certificate key. `.jwk` mode embeds
+/// `key`'s public half; `.kid` mode names the account URL.
+fn postSigned(c: *Client, a: Allocator, url: []const u8, payload: []const u8, mode: KeyMode, key: anytype) Error!PostResult {
     const kid: ?[]const u8 = switch (mode) {
         .jwk => null,
         .kid => c.kid orelse return error.NotRegistered,
@@ -851,7 +1273,7 @@ fn postJws(c: *Client, a: Allocator, url: []const u8, payload: []const u8, mode:
     while (true) {
         const nonce = try c.takeNonce();
         defer c.gpa.free(nonce);
-        const body_json = jws.sign(c.gpa, &c.account_key, payload, .{
+        const body_json = jws.sign(c.gpa, key, payload, .{
             .nonce = nonce,
             .url = url,
             .kid = kid,
@@ -944,6 +1366,7 @@ pub const Responder = struct {
     /// Publish `key_auth` under `token` (both copied); replaces an
     /// existing entry. The order flow calls this — manual use is only for
     /// out-of-band setups.
+    // secret-api-ok: the key authorization is public by design — this responder serves it to anyone over plain HTTP (RFC 8555 §8.3).
     pub fn set(r: *Responder, token: []const u8, key_auth: []const u8) error{OutOfMemory}!void {
         const value = try r.gpa.dupe(u8, key_auth);
         errdefer r.gpa.free(value);
@@ -1050,6 +1473,7 @@ pub const TlsAlpnResponder = struct {
 
         pub fn deinit(self: *Material, gpa: Allocator) void {
             gpa.free(self.cert_der);
+            std.crypto.secureZero(u8, self.key_pem);
             gpa.free(self.key_pem);
             self.* = undefined;
         }
@@ -1064,6 +1488,7 @@ pub const TlsAlpnResponder = struct {
         while (it.next()) |e| {
             r.gpa.free(e.key_ptr.*);
             r.gpa.free(e.value_ptr.cert_der);
+            std.crypto.secureZero(u8, e.value_ptr.key_pem);
             r.gpa.free(e.value_ptr.key_pem);
         }
         r.map.deinit(r.gpa);
@@ -1072,16 +1497,21 @@ pub const TlsAlpnResponder = struct {
 
     /// Publish (`domain` → `cert_der` + `key_pem`); all three are copied,
     /// replacing any existing entry. The order flow calls this.
+    // secret-api-ok: `key_pem` is the throwaway TLS-ALPN-01 validation key, copied into the store on purpose so the caller's listener can serve it; the store wipes it on replace/remove/deinit (and on a failed insert), and nothing of it reaches this frame beyond the copy.
     pub fn set(r: *TlsAlpnResponder, domain: []const u8, cert_der: []const u8, key_pem: []const u8) error{OutOfMemory}!void {
         const cert_copy = try r.gpa.dupe(u8, cert_der);
         errdefer r.gpa.free(cert_copy);
         const key_copy = try r.gpa.dupe(u8, key_pem);
-        errdefer r.gpa.free(key_copy);
+        errdefer {
+            std.crypto.secureZero(u8, key_copy);
+            r.gpa.free(key_copy);
+        }
         lockSpin(&r.lock);
         defer r.lock.unlock();
         const gop = try r.map.getOrPut(r.gpa, domain);
         if (gop.found_existing) {
             r.gpa.free(gop.value_ptr.cert_der);
+            std.crypto.secureZero(u8, gop.value_ptr.key_pem);
             r.gpa.free(gop.value_ptr.key_pem);
         } else {
             gop.key_ptr.* = r.gpa.dupe(u8, domain) catch |err| {
@@ -1099,6 +1529,7 @@ pub const TlsAlpnResponder = struct {
         if (kv) |e| {
             r.gpa.free(e.key);
             r.gpa.free(e.value.cert_der);
+            std.crypto.secureZero(u8, e.value.key_pem);
             r.gpa.free(e.value.key_pem);
         }
     }
@@ -1678,7 +2109,37 @@ const MockCa = struct {
     nonce_store: [max_nonces][24]u8 = undefined,
     nonces_issued: u32 = 0,
     nonces_consumed: [max_nonces]bool = @splat(false),
-    account_key: ?jws.Es256.PublicKey = null,
+    account_key: ?jws.AnyPublicKey = null,
+    /// Lifecycle extras (EAB, rollover, revocation, ARI): the directory lists
+    /// `keyChange`, `revokeCert` and `renewalInfo` when set.
+    extras: bool = false,
+    /// newAccount must carry an external account binding MAC'd with this
+    /// (`eab_kid` / `eab_key`); `eab_seen` records that one verified.
+    eab_kid: ?[]const u8 = null,
+    eab_key: []const u8 = "",
+    eab_seen: bool = false,
+    key_change_url: []u8 = &.{},
+    revoke_url: []u8 = &.{},
+    ari_url: []u8 = &.{},
+    rollovers: u32 = 0,
+    deactivated: bool = false,
+    contact_seen: [2][64]u8 = undefined,
+    contact_seen_len: [2]usize = .{ 0, 0 },
+    contact_count: usize = 0,
+    /// Revocation: how the request was authorized and with what reason.
+    revoked_by: enum { none, account, cert_key } = .none,
+    revoke_reason: ?u8 = null,
+    /// ARI: the last CertID requested, and the `replaces` of the last newOrder.
+    ari_id: [96]u8 = undefined,
+    ari_id_len: usize = 0,
+    replaces_seen: [96]u8 = undefined,
+    replaces_len: usize = 0,
+    /// Alg a newAccount used (`jwk` header), for the ES384 tests.
+    account_alg: ?jws.Alg = null,
+    /// The certificate DER the revoke tests expect.
+    revoke_expect: []const u8 = "",
+    /// Alg of the certificate key in the finalize CSR.
+    csr_alg: ?jws.Alg = null,
     badnonce_left: u8 = 1,
     authz_polls: u32 = 0,
     challenge_ok: bool = false,
@@ -1713,14 +2174,26 @@ const MockCa = struct {
         m.finalize_url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/finalize/1", .{ca_port});
         m.cert_url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/cert/1", .{ca_port});
         m.challenge_base = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{challenge_port});
+        m.key_change_url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/key-change", .{ca_port});
+        m.revoke_url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/revoke", .{ca_port});
+        m.ari_url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/ari", .{ca_port});
     }
 
     fn deinitUrls(m: *MockCa) void {
         inline for (.{
             m.dir_url,      m.new_nonce_url, m.new_account_url, m.new_order_url,
             m.account_url,  m.order_url,     m.authz_url,       m.challenge_url,
-            m.finalize_url, m.cert_url,      m.challenge_base,
+            m.finalize_url, m.cert_url,      m.challenge_base,  m.key_change_url,
+            m.revoke_url,   m.ari_url,
         }) |s| m.gpa.free(s);
+    }
+
+    /// Forget recorded failures (a test that provokes one on purpose).
+    fn resetFails(m: *MockCa) void {
+        lockSpin(&m.lock);
+        defer m.lock.unlock();
+        m.fail_count = 0;
+        m.fail_note_len = 0;
     }
 
     fn fail(m: *MockCa, what: []const u8) void {
@@ -1772,21 +2245,28 @@ const MockCa = struct {
     /// Read the request body, verify the JWS (signature/nonce/url/key
     /// mode), return the Verified handle. Records failures; errors answer
     /// 400 so the client also notices.
-    fn readVerified(m: *MockCa, ctx: *router.Ctx, expected_url: []const u8, mode: enum { jwk, kid }) !jws.Verified {
+    fn readVerified(m: *MockCa, ctx: *router.Ctx, expected_url: []const u8, mode: JwsMode) !jws.VerifiedAny {
         const body = ctx.req.reader().allocRemaining(m.gpa, .limited(64 * 1024)) catch {
             m.fail("request body unreadable");
             return error.MockJwsRejected;
         };
         defer m.gpa.free(body);
+        return m.checkJws(body, expected_url, mode);
+    }
 
-        const expected_key: ?jws.Es256.PublicKey = switch (mode) {
+    const JwsMode = enum { jwk, kid };
+
+    /// Verify a JWS body like a CA: signature (by the embedded jwk, or by the
+    /// account key for `kid`), url, fresh nonce, header shape.
+    fn checkJws(m: *MockCa, body: []const u8, expected_url: []const u8, mode: JwsMode) !jws.VerifiedAny {
+        const expected_key: ?jws.AnyPublicKey = switch (mode) {
             .jwk => null,
             .kid => m.account_key orelse {
                 m.fail("kid-mode request before newAccount");
                 return error.MockJwsRejected;
             },
         };
-        var v = jws.verifyFlattened(m.gpa, body, expected_key) catch |err| {
+        var v = jws.verifyFlattenedAny(m.gpa, body, expected_key) catch |err| {
             m.fail(@errorName(err));
             return error.MockJwsRejected;
         };
@@ -1850,8 +2330,12 @@ fn mcDirectory(ctx: *router.Ctx) anyerror!void {
     var w: std.Io.Writer = .fixed(&buf);
     try w.print(
         \\{{"newNonce":"{s}","newAccount":"{s}","newOrder":"{s}",
-        \\ "meta":{{"termsOfService":"data:text/plain,mock-tos"}}}}
+        \\ "meta":{{"termsOfService":"data:text/plain,mock-tos"}}
     , .{ m.new_nonce_url, m.new_account_url, m.new_order_url });
+    if (m.extras) try w.print(
+        \\,"keyChange":"{s}","revokeCert":"{s}","renewalInfo":"{s}"
+    , .{ m.key_change_url, m.revoke_url, m.ari_url });
+    try w.writeAll("}");
     try m.respondJson(ctx, 200, w.buffered());
 }
 
@@ -1866,7 +2350,10 @@ fn mcNewAccount(ctx: *router.Ctx) anyerror!void {
     var v = m.readVerified(ctx, m.new_account_url, .jwk) catch return mcRejected(ctx);
     defer v.deinit();
 
-    const Payload = struct { termsOfServiceAgreed: bool = false };
+    const Payload = struct {
+        termsOfServiceAgreed: bool = false,
+        externalAccountBinding: ?std.json.Value = null,
+    };
     const payload = std.json.parseFromSlice(Payload, m.gpa, v.payload, .{
         .ignore_unknown_fields = true,
     }) catch {
@@ -1876,8 +2363,39 @@ fn mcNewAccount(ctx: *router.Ctx) anyerror!void {
     defer payload.deinit();
     if (!payload.value.termsOfServiceAgreed) m.fail("ToS not agreed");
 
+    if (m.eab_kid) |want_kid| {
+        // RFC 8555 §7.3.4: the binding is a flattened JWS, HS256, `kid` as
+        // issued, `url` the newAccount URL, no nonce, payload = the account JWK.
+        const binding = payload.value.externalAccountBinding orelse {
+            m.fail("newAccount without externalAccountBinding");
+            return mcRejected(ctx);
+        };
+        const text = std.json.Stringify.valueAlloc(m.gpa, binding, .{}) catch {
+            m.fail("binding not serialisable");
+            return mcRejected(ctx);
+        };
+        defer m.gpa.free(text);
+        var inner = jws.verifyEab(m.gpa, text, m.eab_key) catch |err| {
+            m.fail(@errorName(err));
+            return mcRejected(ctx);
+        };
+        defer inner.deinit();
+        var jwk_buf: [jws.max_canonical_jwk_len]u8 = undefined;
+        const want_jwk = jws.canonicalJwk(&jwk_buf, v.jwk_key.?);
+        if (!std.mem.eql(u8, inner.kid, want_kid)) m.fail("binding kid wrong");
+        if (!std.mem.eql(u8, inner.url, m.new_account_url)) m.fail("binding url wrong");
+        if (inner.has_nonce) m.fail("binding carries a nonce");
+        if (!std.mem.eql(u8, inner.payload, want_jwk)) m.fail("binding payload is not the account JWK");
+        lockSpin(&m.lock);
+        m.eab_seen = true;
+        m.lock.unlock();
+    } else if (payload.value.externalAccountBinding != null) {
+        m.fail("unexpected externalAccountBinding");
+    }
+
     lockSpin(&m.lock);
     m.account_key = v.jwk_key.?;
+    m.account_alg = v.alg;
     m.lock.unlock();
 
     try ctx.res.setHeader("Location", m.account_url);
@@ -1907,6 +2425,7 @@ fn mcNewOrder(ctx: *router.Ctx) anyerror!void {
 
     const Payload = struct {
         identifiers: []const struct { type: []const u8 = "", value: []const u8 = "" } = &.{},
+        replaces: ?[]const u8 = null,
     };
     const payload = std.json.parseFromSlice(Payload, m.gpa, v.payload, .{
         .ignore_unknown_fields = true,
@@ -1915,6 +2434,13 @@ fn mcNewOrder(ctx: *router.Ctx) anyerror!void {
         return mcRejected(ctx);
     };
     defer payload.deinit();
+    if (payload.value.replaces) |r| {
+        lockSpin(&m.lock);
+        const n = @min(r.len, m.replaces_seen.len);
+        @memcpy(m.replaces_seen[0..n], r[0..n]);
+        m.replaces_len = n;
+        m.lock.unlock();
+    }
     if (payload.value.identifiers.len != 1 or
         !std.mem.eql(u8, payload.value.identifiers[0].type, "dns") or
         !std.mem.eql(u8, payload.value.identifiers[0].value, m.order_domain))
@@ -2164,22 +2690,19 @@ fn mcFinalize(ctx: *router.Ctx) anyerror!void {
         return mcRejected(ctx);
     };
     defer m.gpa.free(csr_der);
-    var parsed = x509.parseCsr(m.gpa, csr_der) catch {
+    var parsed = x509.parseCsrAny(m.gpa, csr_der) catch {
         m.fail("csr does not parse/verify");
         return mcRejected(ctx);
     };
     defer parsed.deinit();
     const sans_ok = parsed.sans.len == 1 and std.mem.eql(u8, parsed.sans[0], m.order_domain);
     if (!sans_ok) m.fail("csr SAN set mismatch");
-    const fresh_key = !std.mem.eql(
-        u8,
-        &parsed.public_key.toUncompressedSec1(),
-        &m.account_key.?.toUncompressedSec1(),
-    );
+    const fresh_key = !parsed.public_key.eql(m.account_key.?);
     if (!fresh_key) m.fail("certificate key must not be the account key");
 
     lockSpin(&m.lock);
     m.csr_ok = sans_ok and fresh_key;
+    m.csr_alg = parsed.public_key.alg();
     m.finalized = true;
     m.lock.unlock();
 
@@ -2197,6 +2720,174 @@ fn mcCert(ctx: *router.Ctx) anyerror!void {
     ctx.res.setStatus(200);
     try ctx.res.setHeader("Content-Type", "application/pem-certificate-chain");
     try ctx.res.writeAll(x509.test_cert_pem ++ x509.test_root_cert_pem);
+}
+
+/// POST /acct/1 — contact update (§7.3.2) and deactivation (§7.3.6).
+fn mcAccount(ctx: *router.Ctx) anyerror!void {
+    const m = MockCa.of(ctx);
+    var v = m.readVerified(ctx, m.account_url, .kid) catch return mcRejected(ctx);
+    defer v.deinit();
+    const Payload = struct { contact: ?[]const []const u8 = null, status: ?[]const u8 = null };
+    const payload = std.json.parseFromSlice(Payload, m.gpa, v.payload, .{ .ignore_unknown_fields = true }) catch {
+        m.fail("account payload not JSON");
+        return mcRejected(ctx);
+    };
+    defer payload.deinit();
+    lockSpin(&m.lock);
+    if (payload.value.contact) |list| {
+        m.contact_count = list.len;
+        for (list, 0..) |item, i| {
+            if (i >= m.contact_seen.len) break;
+            const n = @min(item.len, m.contact_seen[i].len);
+            @memcpy(m.contact_seen[i][0..n], item[0..n]);
+            m.contact_seen_len[i] = n;
+        }
+    }
+    if (payload.value.status) |s| {
+        if (std.mem.eql(u8, s, "deactivated")) m.deactivated = true;
+    }
+    m.lock.unlock();
+    try m.respondJson(ctx, 200, if (m.deactivated) "{\"status\":\"deactivated\"}" else "{\"status\":\"valid\"}");
+}
+
+/// POST /key-change — RFC 8555 §7.3.5, both JWS layers checked.
+fn mcKeyChange(ctx: *router.Ctx) anyerror!void {
+    const m = MockCa.of(ctx);
+    var outer = m.readVerified(ctx, m.key_change_url, .kid) catch return mcRejected(ctx);
+    defer outer.deinit();
+    var inner = jws.verifyFlattenedAny(m.gpa, outer.payload, null) catch |err| {
+        m.fail(@errorName(err));
+        return mcRejected(ctx);
+    };
+    defer inner.deinit();
+    if (!std.mem.eql(u8, inner.url, m.key_change_url)) m.fail("inner url is not the outer url");
+    if (inner.nonce.len != 0) m.fail("inner JWS carries a nonce");
+    if (inner.kid != null or inner.jwk_key == null) m.fail("inner JWS must carry the new jwk");
+
+    const Payload = struct {
+        account: []const u8 = "",
+        oldKey: struct { crv: []const u8 = "", kty: []const u8 = "", x: []const u8 = "", y: []const u8 = "" } = .{},
+    };
+    const payload = std.json.parseFromSlice(Payload, m.gpa, inner.payload, .{ .ignore_unknown_fields = true }) catch {
+        m.fail("inner payload not JSON");
+        return mcRejected(ctx);
+    };
+    defer payload.deinit();
+    if (!std.mem.eql(u8, payload.value.account, m.account_url)) m.fail("inner account is not the account URL");
+    var want_buf: [jws.max_canonical_jwk_len]u8 = undefined;
+    const want = jws.canonicalJwk(&want_buf, m.account_key.?);
+    var got_buf: [jws.max_canonical_jwk_len]u8 = undefined;
+    const old = payload.value.oldKey;
+    const got = std.fmt.bufPrint(&got_buf, "{{\"crv\":\"{s}\",\"kty\":\"{s}\",\"x\":\"{s}\",\"y\":\"{s}\"}}", .{ old.crv, old.kty, old.x, old.y }) catch "";
+    if (!std.mem.eql(u8, want, got)) m.fail("oldKey is not the current account key");
+    const key_in_use = if (inner.jwk_key) |k| k.eql(m.account_key.?) else false;
+    if (key_in_use) {
+        // §7.3.5: a key that already belongs to an account is 409 Conflict.
+        m.fail("new key already in use");
+        try m.stampNonce(ctx);
+        ctx.res.setStatus(409);
+        try ctx.res.setHeader("Content-Type", "application/problem+json");
+        try ctx.res.writeAll("{\"type\":\"urn:ietf:params:acme:error:malformed\",\"detail\":\"key in use\"}");
+        return;
+    }
+
+    lockSpin(&m.lock);
+    if (inner.jwk_key) |k| m.account_key = k;
+    m.rollovers += 1;
+    m.lock.unlock();
+    try m.respondJson(ctx, 200, "{\"status\":\"valid\"}");
+}
+
+/// POST /revoke — RFC 8555 §7.6, by account (`kid`) or by certificate key (`jwk`).
+fn mcRevoke(ctx: *router.Ctx) anyerror!void {
+    const m = MockCa.of(ctx);
+    const body = ctx.req.reader().allocRemaining(m.gpa, .limited(64 * 1024)) catch {
+        m.fail("request body unreadable");
+        return mcRejected(ctx);
+    };
+    defer m.gpa.free(body);
+    const mode: MockCa.JwsMode = if (jwsHasKid(m.gpa, body)) .kid else .jwk;
+    var v = m.checkJws(body, m.revoke_url, mode) catch return mcRejected(ctx);
+    defer v.deinit();
+
+    const Payload = struct { certificate: []const u8 = "", reason: ?u8 = null };
+    const payload = std.json.parseFromSlice(Payload, m.gpa, v.payload, .{ .ignore_unknown_fields = true }) catch {
+        m.fail("revoke payload not JSON");
+        return mcRejected(ctx);
+    };
+    defer payload.deinit();
+    const cert = jws.base64UrlDecodeAlloc(m.gpa, payload.value.certificate) catch {
+        m.fail("certificate not base64url");
+        return mcRejected(ctx);
+    };
+    defer m.gpa.free(cert);
+    if (!std.mem.eql(u8, cert, m.revoke_expect)) m.fail("revoked certificate is not the expected one");
+    if (mode == .jwk) {
+        // A certificate-key revocation must be signed by the certificate's own key.
+        const parsed = (std.crypto.Certificate{ .buffer = cert, .index = 0 }).parse() catch {
+            m.fail("certificate does not parse");
+            return mcRejected(ctx);
+        };
+        var sec1_buf: [jws.AnyPublicKey.max_sec1_len]u8 = undefined;
+        const signer = v.jwk_key.?.uncompressedSec1(&sec1_buf);
+        if (!std.mem.eql(u8, parsed.pubKey(), signer)) m.fail("signer key is not the certificate key");
+    }
+    lockSpin(&m.lock);
+    m.revoked_by = if (mode == .kid) .account else .cert_key;
+    m.revoke_reason = payload.value.reason;
+    m.lock.unlock();
+    try m.respondJson(ctx, 200, "{}");
+}
+
+/// Is `kid` in the protected header of this flattened JWS?
+fn jwsHasKid(gpa: Allocator, body: []const u8) bool {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Flat = struct { protected: []const u8 = "" };
+    const flat = std.json.parseFromSliceLeaky(Flat, a, body, .{ .ignore_unknown_fields = true }) catch return false;
+    const protected = jws.base64UrlDecodeAlloc(a, flat.protected) catch return false;
+    const Head = struct { kid: ?[]const u8 = null };
+    const head = std.json.parseFromSliceLeaky(Head, a, protected, .{ .ignore_unknown_fields = true }) catch return false;
+    return head.kid != null;
+}
+
+/// GET /ari/:id — RFC 9773 §4.2, the example response of the RFC.
+fn mcRenewalInfo(ctx: *router.Ctx) anyerror!void {
+    const m = MockCa.of(ctx);
+    const id = ctx.params.get("id") orelse "";
+    lockSpin(&m.lock);
+    const n = @min(id.len, m.ari_id.len);
+    @memcpy(m.ari_id[0..n], id[0..n]);
+    m.ari_id_len = n;
+    m.lock.unlock();
+    ctx.res.setStatus(200);
+    try ctx.res.setHeader("Content-Type", "application/json");
+    try ctx.res.setHeader("Retry-After", "21600");
+    try ctx.res.writeAll(
+        \\{"suggestedWindow":{"start":"2025-01-02T04:00:00Z","end":"2025-01-03T04:00:00Z"},
+        \\ "explanationURL":"https://acme.example.com/docs/ari"}
+    );
+}
+
+/// The standard mock-CA routes (+ the lifecycle ones when `extras`).
+fn mockRoutes(r: *router.Router, extras: bool) !void {
+    try r.get("/dir", mcDirectory);
+    try r.head("/new-nonce", mcNewNonce);
+    try r.get("/new-nonce", mcNewNonce);
+    try r.post("/new-acct", mcNewAccount);
+    try r.post("/new-order", mcNewOrder);
+    try r.post("/authz/1", mcAuthz);
+    try r.post("/chall/1", mcChallenge);
+    try r.post("/order/1", mcOrder);
+    try r.post("/finalize/1", mcFinalize);
+    try r.post("/cert/1", mcCert);
+    if (extras) {
+        try r.post("/acct/1", mcAccount);
+        try r.post("/key-change", mcKeyChange);
+        try r.post("/revoke", mcRevoke);
+        try r.get("/ari/:id", mcRenewalInfo);
+    }
 }
 
 fn serveWrap(s: *http.Server) void {
@@ -2456,4 +3147,448 @@ test "Responder: a path with a '/' after the prefix is never a token, even one t
     var buf: [1024]u8 = undefined;
     const nested = runWire(&r, wire("GET", "/.well-known/acme-challenge/a/b"), &buf);
     try testing.expect(std.mem.startsWith(u8, nested, "HTTP/1.1 404"));
+}
+
+// ── lifecycle: EAB, rollover, revocation, ARI, ES384 (2026-10-13) ───────────
+
+/// A mock CA on loopback with the lifecycle routes, plus a client against it.
+/// Fields are set up by `start`; the caller defers `stop`.
+const Lab = struct {
+    threaded: std.Io.Threaded,
+    mock: MockCa,
+    ca_router: router.Router,
+    ca_server: http.Server,
+    transport: http.Client,
+    ca_thread: ?std.Thread = null,
+
+    fn start(lab: *Lab, extras: bool) !void {
+        lab.threaded = std.Io.Threaded.init(testing.allocator, .{});
+        errdefer lab.threaded.deinit();
+        const io = lab.threaded.io();
+        lab.mock = .{ .gpa = testing.allocator, .io = io, .extras = extras, .badnonce_left = 0 };
+        lab.ca_router = router.Router.init(testing.allocator);
+        errdefer lab.ca_router.deinit();
+        lab.ca_router.state = &lab.mock;
+        try mockRoutes(&lab.ca_router, extras);
+        lab.ca_server = http.Server.init(io, testing.allocator, .{
+            .handler = lab.ca_router.handler(),
+            .context = &lab.ca_router,
+        });
+        errdefer lab.ca_server.deinit();
+        lab.ca_server.bind() catch |err| {
+            return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+        };
+        const port = lab.ca_server.boundAddress().getPort();
+        try lab.mock.setUrls(port, port);
+        errdefer lab.mock.deinitUrls();
+        lab.transport = http.Client.init(io, testing.allocator, .{});
+        lab.ca_thread = try std.Thread.spawn(.{}, serveWrap, .{&lab.ca_server});
+    }
+
+    fn stop(lab: *Lab) void {
+        if (lab.ca_thread) |t| {
+            lab.ca_server.shutdown();
+            t.join();
+        }
+        lab.transport.deinit();
+        lab.mock.deinitUrls();
+        lab.ca_server.deinit();
+        lab.ca_router.deinit();
+        lab.threaded.deinit();
+    }
+
+    fn client(lab: *Lab, account_key: anytype, options: Options) Client {
+        var o = options;
+        o.directory_url = lab.mock.dir_url;
+        o.poll_interval_ms = 10;
+        o.max_polls = 50;
+        return Client.init(lab.threaded.io(), testing.allocator, &lab.transport, account_key, o);
+    }
+
+    fn expectClean(lab: *Lab) !void {
+        if (lab.mock.fail_count != 0)
+            std.debug.print("mock CA recorded failures: {d} — first: {s}\n", .{ lab.mock.fail_count, lab.mock.failNote() });
+        try testing.expectEqual(@as(u32, 0), lab.mock.fail_count);
+    }
+};
+
+fn labKey(comptime E: type, comptime seed_byte: u8) E.KeyPair {
+    var kp: E.KeyPair = undefined;
+    E.KeyPair.generateDeterministicInto(&kp, &@as([E.KeyPair.seed_length]u8, @splat(seed_byte))) catch unreachable;
+    return kp;
+}
+
+test "EAB (RFC 8555 §7.3.4): the inner HS256 JWS is the one std's HMAC computes, and the CA verifies it" {
+    var lab: Lab = undefined;
+    try lab.start(true);
+    defer lab.stop();
+    lab.mock.eab_kid = "kid-1";
+    lab.mock.eab_key = "an hmac key the CA issued";
+
+    var account_key = labKey(jws.Es256, 21);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&account_key));
+    var c = lab.client(&account_key, .{
+        .eab = .{ .kid = "kid-1", .hmac_key = "an hmac key the CA issued" },
+    });
+    defer c.deinit();
+    try c.register();
+    try testing.expect(lab.mock.eab_seen);
+    try lab.expectClean();
+
+    // Wrong MAC key: the CA refuses the registration, and says why.
+    var other = lab.client(&account_key, .{
+        .eab = .{ .kid = "kid-1", .hmac_key = "not the key" },
+    });
+    defer other.deinit();
+    lab.mock.eab_seen = false;
+    try testing.expectError(error.AcmeProblem, other.register());
+    try testing.expect(!lab.mock.eab_seen);
+    try testing.expectEqualStrings("BadSignature", lab.mock.failNote());
+    lab.mock.resetFails();
+
+    // No binding at all against a CA that wants one.
+    var none = lab.client(&account_key, .{});
+    defer none.deinit();
+    try testing.expectError(error.AcmeProblem, none.register());
+    lab.mock.resetFails();
+}
+
+test "EAB: the JWS bytes against an independent HMAC-SHA256 (std) over the RFC 8555 §7.3.4 layout" {
+    const kp = labKey(jws.Es256, 22);
+    const key = "0123456789abcdef0123456789abcdef";
+    const url = "https://ca.example/acme/new-account";
+    const out = try jws.signEab(testing.allocator, kp.public_key, "10", key, url);
+    defer testing.allocator.free(out);
+
+    const Flat = struct { protected: []const u8, payload: []const u8, signature: []const u8 };
+    const flat = try std.json.parseFromSlice(Flat, testing.allocator, out, .{});
+    defer flat.deinit();
+    // protected = {"alg":"HS256","kid":"10","url":...} — no nonce.
+    const protected = try jws.base64UrlDecodeAlloc(testing.allocator, flat.value.protected);
+    defer testing.allocator.free(protected);
+    try testing.expectEqualStrings("{\"alg\":\"HS256\",\"kid\":\"10\",\"url\":\"https://ca.example/acme/new-account\"}", protected);
+    // payload = the account's canonical JWK.
+    const payload = try jws.base64UrlDecodeAlloc(testing.allocator, flat.value.payload);
+    defer testing.allocator.free(payload);
+    var jwk_buf: [jws.max_canonical_jwk_len]u8 = undefined;
+    try testing.expectEqualStrings(jws.canonicalJwk(&jwk_buf, kp.public_key), payload);
+    // signature = HMAC-SHA256(key, protected_b64 "." payload_b64).
+    const input = try std.mem.concat(testing.allocator, u8, &.{ flat.value.protected, ".", flat.value.payload });
+    defer testing.allocator.free(input);
+    var mac: [32]u8 = undefined;
+    std.crypto.auth.hmac.sha2.HmacSha256.create(&mac, input, key);
+    var want: [43]u8 = undefined;
+    try testing.expectEqualStrings(jws.base64UrlEncode(&want, &mac), flat.value.signature);
+
+    // The verifier agrees, and a wrong key or a flipped byte does not.
+    var v = try jws.verifyEab(testing.allocator, out, key);
+    v.deinit();
+    try testing.expectError(error.BadSignature, jws.verifyEab(testing.allocator, out, "another key entirely"));
+    const bent = try testing.allocator.dupe(u8, out);
+    defer testing.allocator.free(bent);
+    const at = std.mem.indexOf(u8, bent, "\"payload\":\"").? + 11;
+    bent[at] = if (bent[at] == 'A') 'B' else 'A';
+    try testing.expectError(error.BadSignature, jws.verifyEab(testing.allocator, bent, key));
+}
+
+test "account lifecycle: contact update, rollover ES256 -> ES384 (both JWS layers), stale key refused, deactivation" {
+    var lab: Lab = undefined;
+    try lab.start(true);
+    defer lab.stop();
+
+    var old_key = labKey(jws.Es256, 31);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&old_key));
+    var c = lab.client(&old_key, .{});
+    defer c.deinit();
+
+    try c.updateContact(&.{ "mailto:a@example.org", "mailto:b@example.org" });
+    try testing.expectEqual(@as(usize, 2), lab.mock.contact_count);
+    try testing.expectEqualStrings("mailto:b@example.org", lab.mock.contact_seen[1][0..lab.mock.contact_seen_len[1]]);
+
+    // Rollover to a P-384 key. The mock checked outer (old key, kid, nonce)
+    // and inner (new jwk, no nonce, same url, account + oldKey).
+    var new_key = labKey(jws.Es384, 32);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&new_key));
+    try c.rolloverKey(&new_key);
+    try testing.expectEqual(@as(u32, 1), lab.mock.rollovers);
+    try testing.expectEqual(jws.Alg.es384, lab.mock.account_key.?.alg());
+    try lab.expectClean();
+    try testing.expectEqual(jws.Alg.es384, c.account_key.alg());
+
+    // The client now signs with the new key (the mock verifies with it only).
+    try c.updateContact(&.{});
+    try testing.expectEqual(@as(usize, 0), lab.mock.contact_count);
+    try lab.expectClean();
+
+    // A client still holding the old (P-256) key is refused: the account's key
+    // is P-384 now, which an ES256 signature cannot be checked against.
+    var stale = lab.client(&old_key, .{});
+    defer stale.deinit();
+    stale.kid = try testing.allocator.dupe(u8, lab.mock.account_url);
+    try testing.expectError(error.AcmeProblem, stale.updateContact(&.{"mailto:c@example.org"}));
+    try testing.expectEqual(@as(u32, 1), lab.mock.fail_count);
+    try testing.expectEqualStrings("UnsupportedJws", lab.mock.failNote());
+    lab.mock.resetFails();
+
+    // A rollover onto the key already in use is a 409; the client keeps its key.
+    try testing.expectError(error.AcmeProblem, c.rolloverKey(&new_key));
+    try testing.expectEqualStrings("new key already in use", lab.mock.failNote());
+    lab.mock.resetFails();
+    try testing.expectEqual(jws.Alg.es384, c.account_key.alg()); // unchanged by the failure
+    try c.updateContact(&.{}); // and it still works
+
+    // A second rollover, P-384 to P-384: now the previous key is the stale one,
+    // refused on its signature alone.
+    var third = labKey(jws.Es384, 33);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&third));
+    try c.rolloverKey(&third);
+    try testing.expectEqual(@as(u32, 2), lab.mock.rollovers);
+    var stale2 = lab.client(&new_key, .{});
+    defer stale2.deinit();
+    stale2.kid = try testing.allocator.dupe(u8, lab.mock.account_url);
+    try testing.expectError(error.AcmeProblem, stale2.updateContact(&.{"mailto:d@example.org"}));
+    try testing.expectEqualStrings("BadSignature", lab.mock.failNote());
+    lab.mock.resetFails();
+    try lab.expectClean();
+
+    try c.deactivate();
+    try testing.expect(lab.mock.deactivated);
+    try testing.expect(c.accountUrl() == null);
+}
+
+test "revocation (RFC 8555 §7.6): by account key and by certificate key; reasons; NotSupported without revokeCert" {
+    var lab: Lab = undefined;
+    try lab.start(true);
+    defer lab.stop();
+
+    // A certificate whose key we hold: the TLS-ALPN-01 shape, self-signed.
+    var cert_key = labKey(jws.Es384, 41);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&cert_key));
+    const id: [32]u8 = @splat(7);
+    const cert_der = try x509.tlsAlpnCertDer(testing.allocator, &cert_key, "example.org", id, "\x05", x509.tls_alpn_not_before, x509.tls_alpn_not_after);
+    defer testing.allocator.free(cert_der);
+    lab.mock.revoke_expect = cert_der;
+
+    var account_key = labKey(jws.Es256, 42);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&account_key));
+    var c = lab.client(&account_key, .{});
+    defer c.deinit();
+
+    try c.revoke(cert_der, .key_compromise);
+    try testing.expectEqual(.account, lab.mock.revoked_by);
+    try testing.expectEqual(@as(?u8, 1), lab.mock.revoke_reason);
+    try lab.expectClean();
+
+    // By the certificate key, no registration needed (a fresh client).
+    var anon = lab.client(&account_key, .{});
+    defer anon.deinit();
+    lab.mock.revoked_by = .none;
+    try anon.revokeWithCertKey(cert_der, &cert_key, null);
+    try testing.expectEqual(.cert_key, lab.mock.revoked_by);
+    try testing.expectEqual(@as(?u8, null), lab.mock.revoke_reason);
+    try testing.expect(anon.accountUrl() == null);
+    try lab.expectClean();
+
+    // The CA rejects a certificate-key revocation signed by some other key.
+    var stranger = labKey(jws.Es384, 43);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&stranger));
+    try anon.revokeWithCertKey(cert_der, &stranger, .superseded);
+    try testing.expectEqual(@as(?u8, 4), lab.mock.revoke_reason);
+    try testing.expectEqualStrings("signer key is not the certificate key", lab.mock.failNote());
+    lab.mock.resetFails();
+
+    // `Reason` carries the RFC 5280 codes numerically and stays open.
+    try testing.expectEqual(@as(u8, 9), @intFromEnum(Reason.privilege_withdrawn));
+    try testing.expectEqual(@as(u8, 2), @intFromEnum(@as(Reason, @enumFromInt(2))));
+}
+
+test "NotSupported: a CA without keyChange, revokeCert, renewalInfo" {
+    var lab: Lab = undefined;
+    try lab.start(false);
+    defer lab.stop();
+    var account_key = labKey(jws.Es256, 44);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&account_key));
+    var c = lab.client(&account_key, .{});
+    defer c.deinit();
+    var new_key = labKey(jws.Es256, 45);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&new_key));
+    try testing.expectError(error.NotSupported, c.rolloverKey(&new_key));
+    try testing.expectError(error.NotSupported, c.revoke("x", null));
+    try testing.expectError(error.NotSupported, c.revokeWithCertKey("x", &new_key, null));
+    try testing.expectError(error.NotSupported, c.renewalInfo("x"));
+    try lab.expectClean();
+}
+
+const rfc9773_cert_pem =
+    \\-----BEGIN CERTIFICATE-----
+    \\MIIBQzCB66ADAgECAgUAh2VDITAKBggqhkjOPQQDAjAVMRMwEQYDVQQDEwpFeGFt
+    \\cGxlIENBMCIYDzAwMDEwMTAxMDAwMDAwWhgPMDAwMTAxMDEwMDAwMDBaMBYxFDAS
+    \\BgNVBAMTC2V4YW1wbGUuY29tMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEeBZu
+    \\7cbpAYNXZLbbh8rNIzuOoqOOtmxA1v7cRm//AwyMwWxyHz4zfwmBhcSrf47NUAFf
+    \\qzLQ2PPQxdTXREYEnKMjMCEwHwYDVR0jBBgwFoAUaYhba4dGQEHhs3uEe6CuLN4B
+    \\yNQwCgYIKoZIzj0EAwIDRwAwRAIge09+S5TZAlw5tgtiVvuERV6cT4mfutXIlwTb
+    \\+FYN/8oCIClDsqBklhB9KAelFiYt9+6FDj3z4KGVelYM5MdsO3pK
+    \\-----END CERTIFICATE-----
+    \\
+;
+
+test "ARI (RFC 9773): the CertID on the wire, the window, Retry-After, explanationURL" {
+    var lab: Lab = undefined;
+    try lab.start(true);
+    defer lab.stop();
+    var account_key = labKey(jws.Es256, 51);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&account_key));
+    var c = lab.client(&account_key, .{});
+    defer c.deinit();
+
+    var info = try c.renewalInfoPem(rfc9773_cert_pem);
+    defer info.deinit(testing.allocator);
+    // GET <renewalInfo>/<CertID>, the RFC 9773 §4.1 example value.
+    try testing.expectEqualStrings("aYhba4dGQEHhs3uEe6CuLN4ByNQ.AIdlQyE", lab.mock.ari_id[0..lab.mock.ari_id_len]);
+    try testing.expectEqual(@as(i64, 1735790400), info.window_start); // 2025-01-02T04:00:00Z
+    try testing.expectEqual(@as(i64, 1735876800), info.window_end); // 2025-01-03T04:00:00Z
+    try testing.expectEqualStrings("https://acme.example.com/docs/ari", info.explanation_url.?);
+    try testing.expectEqual(@as(?u64, 21600), info.retry_after_s);
+    // No account was needed for it.
+    try testing.expect(c.accountUrl() == null);
+    try lab.expectClean();
+
+    // pickTime stays inside the window and covers both ends' neighbourhood.
+    var prng = std.Random.DefaultPrng.init(1);
+    for (0..200) |_| {
+        const t = info.pickTime(prng.random());
+        try testing.expect(t >= info.window_start and t <= info.window_end);
+    }
+    const point: RenewalInfo = .{ .window_start = 5, .window_end = 5, .explanation_url = null, .retry_after_s = null };
+    try testing.expectEqual(@as(i64, 5), point.pickTime(prng.random()));
+
+    // A certificate without an AKI cannot be asked about (the TLS-ALPN-01
+    // validation certificate is one), nor can junk.
+    var key = labKey(jws.Es256, 52);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&key));
+    const id: [32]u8 = @splat(1);
+    const no_aki = try x509.tlsAlpnCertDer(testing.allocator, &key, "example.org", id, "\x01", x509.tls_alpn_not_before, x509.tls_alpn_not_after);
+    defer testing.allocator.free(no_aki);
+    try testing.expectError(error.MalformedResponse, c.renewalInfo(no_aki));
+    try testing.expectError(error.MalformedResponse, c.renewalInfo("junk"));
+}
+
+test "parseRenewalInfo / parseRfc3339: offsets, fractions, leap days, and what is refused" {
+    try testing.expectEqual(@as(?i64, 0), parseRfc3339("1970-01-01T00:00:00Z"));
+    try testing.expectEqual(@as(?i64, -1), parseRfc3339("1969-12-31T23:59:59Z"));
+    try testing.expectEqual(@as(?i64, 1791894896), parseRfc3339("2026-10-13T12:34:56Z"));
+    try testing.expectEqual(@as(?i64, 1709251199), parseRfc3339("2024-02-29T23:59:59Z"));
+    try testing.expectEqual(@as(?i64, 1791894896), parseRfc3339("2026-10-13T12:34:56.789Z"));
+    try testing.expectEqual(@as(?i64, 1791894896), parseRfc3339("2026-10-13t12:34:56z"));
+    try testing.expectEqual(@as(?i64, 1791894896), parseRfc3339("2026-10-13T14:34:56+02:00"));
+    try testing.expectEqual(@as(?i64, 1791894896), parseRfc3339("2026-10-13T07:04:56-05:30"));
+    try testing.expectEqual(@as(?i64, null), parseRfc3339("2023-02-29T00:00:00Z")); // not a leap year
+    try testing.expectEqual(@as(?i64, null), parseRfc3339("2026-13-01T00:00:00Z"));
+    try testing.expectEqual(@as(?i64, null), parseRfc3339("2026-10-13 12:34:56Z"));
+    try testing.expectEqual(@as(?i64, null), parseRfc3339("2026-10-13T12:34:56"));
+    try testing.expectEqual(@as(?i64, null), parseRfc3339("2026-10-13T12:34:56.Z"));
+    try testing.expectEqual(@as(?i64, null), parseRfc3339("2026-10-13T12:34:56Zjunk"));
+    try testing.expectEqual(@as(?i64, null), parseRfc3339("2026-10-13T12:34:56+0200"));
+    try testing.expectEqual(@as(?i64, null), parseRfc3339(""));
+
+    const ok = try parseRenewalInfo(testing.allocator,
+        \\{"suggestedWindow":{"start":"2025-01-02T04:00:00Z","end":"2025-01-03T04:00:00Z"},"extra":1}
+    );
+    try testing.expectEqual(@as(i64, 1735790400), ok.window_start);
+    try testing.expect(ok.explanation_url == null);
+    try testing.expectError(error.MalformedResponse, parseRenewalInfo(testing.allocator, "{}"));
+    try testing.expectError(error.MalformedResponse, parseRenewalInfo(testing.allocator, "not json"));
+    // end before start is not a window.
+    try testing.expectError(error.MalformedResponse, parseRenewalInfo(testing.allocator,
+        \\{"suggestedWindow":{"start":"2025-01-03T04:00:00Z","end":"2025-01-02T04:00:00Z"}}
+    ));
+}
+
+test "new-order payload: the optional replaces member (RFC 9773 §5)" {
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    var js: std.json.Stringify = .{ .writer = &out.writer, .options = .{} };
+    try writeOrderPayload(&js, &.{"example.org"}, "aYhba4dGQEHhs3uEe6CuLN4ByNQ.AIdlQyE");
+    try testing.expectEqualStrings(
+        "{\"identifiers\":[{\"type\":\"dns\",\"value\":\"example.org\"}],\"replaces\":\"aYhba4dGQEHhs3uEe6CuLN4ByNQ.AIdlQyE\"}",
+        out.written(),
+    );
+    var plain: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer plain.deinit();
+    var js2: std.json.Stringify = .{ .writer = &plain.writer, .options = .{} };
+    try writeOrderPayload(&js2, &.{"example.org"}, null);
+    try testing.expect(std.mem.indexOf(u8, plain.written(), "replaces") == null);
+}
+
+test "integration: ES384 account key and ES384 certificate key through the whole flow, with replaces" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var mock: MockCa = .{ .gpa = testing.allocator, .io = io, .badnonce_left = 0 };
+    var ca_router = router.Router.init(testing.allocator);
+    defer ca_router.deinit();
+    ca_router.state = &mock;
+    try mockRoutes(&ca_router, false);
+    var ca_server = http.Server.init(io, testing.allocator, .{
+        .handler = ca_router.handler(),
+        .context = &ca_router,
+    });
+    defer ca_server.deinit();
+    ca_server.bind() catch |err| {
+        return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+    };
+
+    var transport = http.Client.init(io, testing.allocator, .{});
+    defer transport.deinit();
+    var account_key = labKey(jws.Es384, 61);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&account_key));
+
+    var dir_url_buf: [64]u8 = undefined;
+    const dir_url = try std.fmt.bufPrint(&dir_url_buf, "http://127.0.0.1:{d}/dir", .{ca_server.boundAddress().getPort()});
+    var client = Client.init(io, testing.allocator, &transport, &account_key, .{
+        .directory_url = dir_url,
+        .cert_key_alg = .es384,
+        .poll_interval_ms = 10,
+        .max_polls = 50,
+    });
+    defer client.deinit();
+
+    var challenge_router = router.Router.init(testing.allocator);
+    defer challenge_router.deinit();
+    try challenge_router.use(client.challengeResponder().middleware());
+    var challenge_server = http.Server.init(io, testing.allocator, .{
+        .handler = challenge_router.handler(),
+        .context = &challenge_router,
+    });
+    defer challenge_server.deinit();
+    challenge_server.bind() catch |err| {
+        return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+    };
+    try mock.setUrls(ca_server.boundAddress().getPort(), challenge_server.boundAddress().getPort());
+    defer mock.deinitUrls();
+
+    const ca_thread = try std.Thread.spawn(.{}, serveWrap, .{&ca_server});
+    defer ca_thread.join();
+    defer ca_server.shutdown();
+    const ch_thread = try std.Thread.spawn(.{}, serveWrap, .{&challenge_server});
+    defer ch_thread.join();
+    defer challenge_server.shutdown();
+
+    var cert = try client.obtainWith(&.{MockCa.domain}, .{ .replaces = "aYhba4dGQEHhs3uEe6CuLN4ByNQ.AIdlQyE" });
+    defer cert.deinit(testing.allocator);
+
+    if (mock.fail_count != 0)
+        std.debug.print("mock CA recorded failures: {d} — first: {s}\n", .{ mock.fail_count, mock.failNote() });
+    try testing.expectEqual(@as(u32, 0), mock.fail_count);
+    try testing.expect(mock.challenge_ok and mock.csr_ok and mock.finalized);
+    try testing.expectEqual(@as(?jws.Alg, .es384), mock.account_alg); // newAccount carried alg ES384 + a P-384 jwk
+    try testing.expectEqual(@as(?jws.Alg, .es384), mock.csr_alg); // the CSR key is P-384
+    try testing.expectEqualStrings("aYhba4dGQEHhs3uEe6CuLN4ByNQ.AIdlQyE", mock.replaces_seen[0..mock.replaces_len]);
+    // The key-authorization served over HTTP used the P-384 thumbprint (checked by the mock).
+    // The certificate key PEM is a P-384 SEC1 key and loads back.
+    var back: jws.AnyKeyPair = undefined;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&back));
+    try x509.privateKeyFromPem(&back, testing.allocator, cert.key_pem);
+    try testing.expectEqual(jws.Alg.es384, back.alg());
 }

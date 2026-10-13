@@ -10,7 +10,9 @@
 //! the HTTP-01 `/.well-known/acme-challenge/<token>`; `Client.TlsAlpnResponder`
 //! is the TLS-ALPN-01 validation-cert store the caller's `acme-tls/1` TLS
 //! listener consults (`Options.challenge_type` selects which); `jws` is the
-//! ES256/JWK/thumbprint layer (+ the RFC 8737 `acmeIdentifier`); `x509` covers
+//! ES256/ES384/JWK/thumbprint layer (+ the RFC 8737 `acmeIdentifier` and the
+//! external-account-binding JWS); `Client` also does account update, key
+//! rollover, deactivation, revocation and ARI (RFC 9773); `x509` covers
 //! the PKCS#10 CSR and the TLS-ALPN-01 validation certificate (minimal DER),
 //! PEM and key/cert (de)serialization; `needsRenewal` is the renewal-loop
 //! predicate.
@@ -41,7 +43,7 @@ const std = @import("std");
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "Let's Encrypt / ACME v2 (RFC 8555) — HTTP-01, TLS-ALPN-01 and DNS-01 (wildcard) issuance + renewal, ES256 JWS, CSR",
+    .doc = "Let's Encrypt / ACME v2 (RFC 8555) — HTTP-01, TLS-ALPN-01 and DNS-01 (wildcard) issuance + renewal (ARI), ES256/ES384 JWS, CSR, external account binding, key rollover, revocation",
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
@@ -56,7 +58,7 @@ pub const meta = .{
     .model_after = "golang.org/x/crypto/acme + certbot flow semantics; RFC 8555/7515/7638/8737 wire",
     // entropy: the seed behind `jws.generateKeyPair` — the account key and
     // every certificate key this client mints.
-    .deps = .{ "http", "router", "entropy", "p256" }, // p256: the burned ECDSA P-256 wrapper; also uses std.crypto.Certificate, std.json
+    .deps = .{ "http", "router", "entropy", "p256", "p384" }, // p256/p384: the burned ECDSA P-256 / P-384 signers (ES256, ES384 keys); also uses std.crypto.Certificate, std.json
 };
 
 /// The ACME protocol client — see `Client.init` / `Client.obtain`.
