@@ -15,6 +15,8 @@ const p256 = @import("p256");
 const p384 = @import("p384");
 const p521 = @import("p521");
 const hello = @import("hello.zig");
+const session = @import("session.zig");
+const tlsresume = @import("tlsresume");
 const keygen = @import("keygen.zig");
 /// The in-repo RSA module, re-exported so a caller can name `rsa.KeyPair`
 /// for `ClientAuth.PrivateKey.rsa`.
@@ -81,6 +83,14 @@ hello_retry_request: bool = false,
 cipher_suite: tls.CipherSuite = @enumFromInt(0),
 /// The keying-material exporter's secret (`exportKeyingMaterial`).
 exporter: Exporter = .none,
+/// zig-libs tlsclient: TLS 1.3 resumption -- whether this session resumed,
+/// and the cache entry its NewSessionTickets go to.
+did_resume: bool = false,
+session_cache: ?*SessionCache = null,
+session_entry: ?*ClientSession = null,
+session_generation: u64 = 0,
+/// The wall clock at `init` (ms); a ticket's age counts from it.
+handshake_time_ms: i64 = 0,
 /// zig-libs tlsclient: a KeyUpdate of ours is due before the next record --
 /// the server asked (update_requested) or `write_seq` reached
 /// `key_update_after`.
@@ -240,11 +250,23 @@ pub const Options = struct {
     /// the view). An error aborts with `error.TlsConnectionRejected`.
     /// Requires `connection_info`.
     verify_connection: ?VerifyConnection = null,
+    /// TLS 1.3 session resumption (Go `ClientSessionCache`, also opt-in
+    /// there): tickets from this server name are kept here and offered back
+    /// as a PSK (psk_dhe_ke: a fresh ECDHE still runs; no 0-RTT). Needs
+    /// `host = .explicit` (the cache key). A resumed handshake has no
+    /// Certificate message; the session view shows the chain kept with the
+    /// ticket.
+    session_cache: ?*SessionCache = null,
 
     pub const entropy_len = 240;
 };
 
 // zig-libs tlsclient: the session view and the verification hook.
+
+/// TLS 1.3 resumption (Go `ClientSessionCache`): pass a cache as
+/// `Options.session_cache`; see `session.zig`.
+pub const SessionCache = session.SessionCache;
+pub const ClientSession = session.ClientSession;
 
 /// The session as Go's `ConnectionState` shows it, filled during `init` when
 /// passed as `Options.connection_info`. Byte fields are copies in `storage`,
@@ -312,7 +334,7 @@ pub const Exporter = union(enum) {
     tls13: struct { hash: HashKind, secret: [64]u8 },
     tls12: struct { hash: HashKind, master: [48]u8, randoms: [64]u8 },
 };
-pub const HashKind = enum { sha256, sha384, sha512 };
+pub const HashKind = session.HashKind;
 
 fn hashKind(comptime digest_len: usize) HashKind {
     return switch (digest_len) {
@@ -689,6 +711,20 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
         .extended_master_secret = options.extended_master_secret and offer_12,
         .renegotiation_info = options.renegotiation_info and offer_12,
     };
+    // zig-libs tlsclient: TLS 1.3 resumption -- a fresh ticket for this
+    // host is offered as a PSK (copied out under the cache lock).
+    const now_ms: i64 = @intCast(@divFloor(options.realtime_now.nanoseconds, std.time.ns_per_ms));
+    var offer: ?ResumeOffer = null;
+    if (options.session_cache) |cache| if (host.len != 0 and options.max_version == .tls_1_3) {
+        cache.acquire();
+        defer cache.release();
+        if (cache.find(host)) |e| if (e.fresh(now_ms)) {
+            offer = .{ .entry = e, .generation = e.generation, .hash = e.hash, .psk = e.psk, .ticket_len = e.ticket_len, .age = tlsresume.replay.obfuscateAge(@intCast(now_ms - e.received_ms), e.ticket_age_add) };
+            @memcpy(offer.?.ticket_buf[0..e.ticket_len], e.ticket());
+        };
+    };
+    defer if (offer) |*o| crypto.secureZero(u8, &o.psk);
+    if (offer) |*o| hello_params.psk = .{ .identity = o.ticket(), .obfuscated_ticket_age = o.age, .binder_len = @intCast(o.hashLen()) };
     var shares_buf: [supported_groups.len]hello.Share = undefined;
     // In TLS 1.2 only, no key_share is sent (RFC 8446 §4.2.8 is TLS 1.3's).
     const share_groups = if (options.max_version == .tls_1_3) options.key_share_groups else &.{};
@@ -698,7 +734,12 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
     }
     hello_params.shares = shares_buf[0..share_groups.len];
     var hello_buf: [hello.max_len]u8 = undefined;
-    var hello_msg: []const u8 = hello.write(&hello_buf, hello_params) catch unreachable; // bounded: max_len covers every share + host + ALPN
+    var hello_msg: []const u8 = hello.write(&hello_buf, hello_params) catch unreachable; // bounded: max_len covers every share + host + ALPN + ticket
+    // RFC 8446 §4.2.11.2: the binder over the ClientHello truncated before
+    // the binders list.
+    if (offer) |*o| switch (o.hash) {
+        inline else => |k| fillBinder(HashOf(k), hello_buf[0..hello_msg.len], &o.psk, &HashOf(k).init(.{})),
+    };
     try writeHelloRecord(output, .tls_1_0, hello_msg);
     // zig-libs tlsclient: client authentication -- RSA-PSS salts and the
     // `rsa` module's blinding come from a CSPRNG keyed from the secret part
@@ -772,6 +813,13 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
     var tls12_master: [48]u8 = undefined;
     defer crypto.secureZero(u8, &tls12_master);
     var exporter: Exporter = .none;
+    var session_entry: ?*ClientSession = null;
+    var session_generation: u64 = 0;
+    // zig-libs tlsclient: resumption state.
+    var psk_accepted = false;
+    var saved_chain: [verify.max_chain_len][]const u8 = undefined;
+    var saved_chain_len: usize = 0;
+    var leaf_not_after: i64 = std.math.maxInt(i64);
     const now_sec = options.realtime_now.toSeconds();
 
     var cleartext_fragment_start: usize = 0;
@@ -948,6 +996,13 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
                                         try key_share.exchange(named_group, extd.slice(key_size));
                                         sh_group = named_group;
                                     },
+                                    .pre_shared_key => if (!is_hrr) {
+                                        // RFC 8446 §4.2.11: the one identity we offered.
+                                        if (offer == null or psk_accepted) return error.TlsIllegalParameter;
+                                        try extd.ensure(2);
+                                        if (extd.decode(u16) != 0) return error.TlsIllegalParameter;
+                                        psk_accepted = true;
+                                    } else return error.TlsIllegalParameter,
                                     .cookie => if (is_hrr) {
                                         if (hrr_cookie != null) return error.TlsIllegalParameter;
                                         try extd.ensure(2);
@@ -1001,6 +1056,7 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
                             else => return error.TlsIllegalParameter,
                         }
 
+                        if (psk_accepted and (tls_version != .tls_1_3 or hashKindOf(cipher_suite_tag) != offer.?.hash)) return error.TlsIllegalParameter;
                         if (is_hrr) {
                             // zig-libs tlsclient: RFC 8446 §4.1.4.
                             if (tls_version != .tls_1_3) return error.TlsIllegalParameter;
@@ -1035,7 +1091,17 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
                                 @memcpy(cookie_buf[0..c.len], c);
                                 hello_params.cookie = cookie_buf[0..c.len];
                             }
+                            // A PSK whose hash is not the HRR suite's is dropped
+                            // (RFC 8446 §4.1.4); one that fits is re-bound.
+                            if (offer) |*o| if (hashKindOf(cipher_suite_tag) != o.hash) {
+                                crypto.secureZero(u8, &o.psk);
+                                offer = null;
+                                hello_params.psk = null;
+                            };
                             hello_msg = hello.write(&hello_buf, hello_params) catch unreachable; // bounded as the first
+                            if (offer) |*o| switch (handshake_cipher) {
+                                inline else => |*p| fillBinder(@TypeOf(p.transcript_hash), hello_buf[0..hello_msg.len], &o.psk, &p.transcript_hash),
+                            };
                             switch (handshake_cipher) {
                                 inline else => |*p| p.transcript_hash.update(hello_msg),
                             }
@@ -1091,7 +1157,12 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
                                         const P = @TypeOf(p.*).A;
                                         const hello_hash = p.transcript_hash.peek();
                                         const zeroes = [1]u8{0} ** P.Hash.digest_length;
-                                        const early_secret = P.Hkdf.extract(&[1]u8{0}, &zeroes);
+                                        // zig-libs tlsclient: a resumption PSK keys the
+                                        // early secret (RFC 8446 §7.1).
+                                        const early_secret = if (psk_accepted)
+                                            P.Hkdf.extract(&zeroes, offer.?.psk[0..P.Hash.digest_length])
+                                        else
+                                            P.Hkdf.extract(&[1]u8{0}, &zeroes);
                                         const empty_hash = tls.emptyHash(P.Hash);
                                         p.version = .{ .tls_1_3 = undefined };
                                         const pv = &p.version.tls_1_3;
@@ -1155,6 +1226,19 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
                             alpn_selected = sel;
                         }
                         handshake_state = .certificate;
+                        // zig-libs tlsclient: a resumed handshake authenticates
+                        // by the PSK -- no Certificate, CertificateVerify or
+                        // CertificateRequest follow (RFC 8446 §2.2). The view
+                        // shows the chain kept with the ticket; the hook runs.
+                        if (psk_accepted) {
+                            handshake_state = .finished;
+                            if (info) |ci| {
+                                try copyKeptChain(ci, options.session_cache.?, offer.?.entry, offer.?.generation);
+                                fillInfo(ci, tls_version, negotiated_suite, negotiated_group, alpn_selected, hrr_seen, false);
+                                ci.did_resume = true;
+                                if (options.verify_connection) |vc| vc.verify(vc.context, ci) catch return error.TlsConnectionRejected;
+                            }
+                        }
                     },
                     .certificate => cert: {
                         if (cipher_state == .application) return error.TlsUnexpectedMessage;
@@ -1225,6 +1309,12 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
                         // An empty list: nothing to trust (std left the state
                         // at .certificate and failed on the next message).
                         if (peer_chain_len == 0) return error.TlsCertificateNotVerified;
+                        // zig-libs tlsclient: resumption keeps the chain and the
+                        // leaf's expiry; the slices stay valid until `init`
+                        // returns (the record buffers flip only per Certificate).
+                        @memcpy(saved_chain[0..peer_chain_len], peer_chain[0..peer_chain_len]);
+                        saved_chain_len = peer_chain_len;
+                        leaf_not_after = std.math.cast(i64, prev_cert.validity.not_after) orelse std.math.maxInt(i64);
                         // zig-libs tlsclient: the session view keeps the chain.
                         if (info) |ci| for (peer_chain[0..peer_chain_len]) |der| {
                             ci.peer_certificates_buf[ci.peer_certificates_len] = try ci.keep(der);
@@ -1577,6 +1667,32 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
                                         exporter = .{ .tls13 = .{ .hash = hashKind(P.Hash.digest_length), .secret = undefined } };
                                         @memcpy(exporter.tls13.secret[0..exp.len], &exp);
                                     }
+                                    // zig-libs tlsclient: the resumption master secret
+                                    // (RFC 8446 §7.1, transcript through the client
+                                    // Finished) goes into the cache entry the
+                                    // NewSessionTickets will fill.
+                                    if (options.session_cache) |cache| if (host.len != 0) {
+                                        var t = p.transcript_hash;
+                                        t.update(out_cleartext[0 .. out_cleartext.len - 1]);
+                                        var res = hkdfExpandLabel(P.Hkdf, pv.master_secret, "res master", &t.peek(), P.Hash.digest_length);
+                                        defer crypto.secureZero(u8, &res);
+                                        cache.acquire();
+                                        defer cache.release();
+                                        const reuse = if (psk_accepted and offer.?.entry.generation == offer.?.generation) offer.?.entry else null;
+                                        if (reuse orelse cache.reserve(host)) |e| {
+                                            e.hash = hashKind(P.Hash.digest_length);
+                                            @memcpy(e.resumption_secret[0..res.len], &res);
+                                            if (reuse == null) {
+                                                // A full handshake: the old ticket (another secret) is gone.
+                                                e.usable = false;
+                                                e.ticket_len = 0;
+                                                e.leaf_not_after_s = leaf_not_after;
+                                                if (!psk_accepted) _ = e.setChain(saved_chain[0..saved_chain_len]);
+                                            }
+                                            session_entry = e;
+                                            session_generation = e.generation;
+                                        }
+                                    };
                                     const client_secret = hkdfExpandLabel(P.Hkdf, pv.master_secret, "c ap traffic", &handshake_hash, P.Hash.digest_length);
                                     const server_secret = hkdfExpandLabel(P.Hkdf, pv.master_secret, "s ap traffic", &handshake_hash, P.Hash.digest_length);
                                     if (options.ssl_key_log) |key_log| logSecrets(key_log.writer, .{
@@ -1606,7 +1722,10 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
                                 else => unreachable,
                             },
                         };
-                        if (info) |ci| fillInfo(ci, tls_version, negotiated_suite, negotiated_group, alpn_selected, hrr_seen, ems_negotiated);
+                        if (info) |ci| {
+                            fillInfo(ci, tls_version, negotiated_suite, negotiated_group, alpn_selected, hrr_seen, ems_negotiated);
+                            ci.did_resume = psk_accepted;
+                        }
                         if (options.ssl_key_log) |ssl_key_log| ssl_key_log.* = .{
                             .client_key_seq = key_seq,
                             .server_key_seq = key_seq,
@@ -1652,6 +1771,11 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
                             .hello_retry_request = hrr_seen,
                             .cipher_suite = negotiated_suite,
                             .exporter = exporter,
+                            .did_resume = psk_accepted,
+                            .session_cache = options.session_cache,
+                            .session_entry = session_entry,
+                            .session_generation = session_generation,
+                            .handshake_time_ms = now_ms,
                         };
                     },
                     else => return error.TlsUnexpectedMessage,
@@ -1735,6 +1859,100 @@ fn initHandshakeCipher(hc: *tls.HandshakeCipher, suite: tls.CipherSuite) error{T
         }),
         else => return error.TlsIllegalParameter,
     }
+}
+
+// ── zig-libs tlsclient: TLS 1.3 resumption helpers ───────────────────────
+
+/// A cached ticket copied out for one handshake.
+const ResumeOffer = struct {
+    entry: *ClientSession,
+    generation: u64,
+    hash: HashKind,
+    psk: [64]u8,
+    ticket_buf: [session.max_ticket_len]u8 = undefined,
+    ticket_len: u16,
+    age: u32,
+
+    fn ticket(o: *const ResumeOffer) []const u8 {
+        return o.ticket_buf[0..o.ticket_len];
+    }
+    fn hashLen(o: *const ResumeOffer) usize {
+        return switch (o.hash) {
+            .sha256 => 32,
+            .sha384 => 48,
+            .sha512 => 64,
+        };
+    }
+};
+
+fn hashKindOf(suite: tls.CipherSuite) HashKind {
+    return switch (suite) {
+        .AES_256_GCM_SHA384 => .sha384,
+        .AEGIS_256_SHA512 => .sha512,
+        else => .sha256,
+    };
+}
+
+/// Write the PSK binder (RFC 8446 §4.2.11.2) into the last `H.digest_length`
+/// bytes of `msg`: HMAC under the "res binder" finished key over `prefix`
+/// (the transcript so far: empty, or message_hash + HelloRetryRequest)
+/// continued with `msg` minus its binders list.
+fn fillBinder(comptime H: type, msg: []u8, psk: *const [64]u8, prefix: *const H) void {
+    const Hmac = crypto.auth.hmac.Hmac(H);
+    const Hkdf = crypto.kdf.hkdf.Hkdf(Hmac);
+    const n = H.digest_length;
+    var t = prefix.*;
+    t.update(msg[0 .. msg.len - (2 + 1 + n)]);
+    const th = t.finalResult();
+    var early: [n]u8 = undefined;
+    defer crypto.secureZero(u8, &early);
+    tlsresume.psk.earlySecret(Hkdf, &early, psk[0..n]);
+    var empty: [n]u8 = undefined;
+    H.hash("", &empty, .{});
+    var bk: [n]u8 = undefined;
+    defer crypto.secureZero(u8, &bk);
+    tlsresume.psk.binderKey(Hkdf, &bk, &early, &empty);
+    tlsresume.psk.computeBinder(Hkdf, Hmac, msg[msg.len - n ..][0..n], &bk, &th);
+}
+
+/// A resumed session's view: the certificates kept with the ticket.
+fn copyKeptChain(ci: *ConnectionInfo, cache: *SessionCache, entry: *ClientSession, generation: u64) error{ConnectionInfoTooSmall}!void {
+    cache.acquire();
+    defer cache.release();
+    if (entry.generation != generation) return; // taken by another connection meanwhile
+    var buf: [session.max_chain_len][]const u8 = undefined;
+    for (entry.chain(&buf)) |der| {
+        if (ci.peer_certificates_len == verify.max_chain_len) break;
+        ci.peer_certificates_buf[ci.peer_certificates_len] = try ci.keep(der);
+        ci.peer_certificates_len += 1;
+    }
+}
+
+/// A NewSessionTicket (RFC 8446 §4.6.1) into the cache entry this
+/// connection reserved, with its PSK derived; ignored without one, or when
+/// the entry has been taken over since, or the ticket is unusable here.
+fn storeTicket(c: *Client, msg: []const u8) void {
+    const cache = c.session_cache orelse return;
+    const entry = c.session_entry orelse return;
+    var exts: [8]tlsresume.ticket.Extension = undefined;
+    const t = tlsresume.ticket.NewSessionTicket.decode(msg, &exts) catch return;
+    if (t.ticket_lifetime == 0 or t.ticket.len > session.max_ticket_len) return;
+    cache.acquire();
+    defer cache.release();
+    if (entry.generation != c.session_generation) return;
+    switch (entry.hash) {
+        inline else => |k| {
+            const H = HashOf(k);
+            const Hkdf = crypto.kdf.hkdf.Hkdf(crypto.auth.hmac.Hmac(H));
+            tlsresume.psk.derivePsk(Hkdf, H.digest_length, entry.psk[0..H.digest_length], entry.resumption_secret[0..H.digest_length], t.ticket_nonce);
+        },
+    }
+    @memcpy(entry.ticket_buf[0..t.ticket.len], t.ticket);
+    entry.ticket_len = @intCast(t.ticket.len);
+    entry.ticket_age_add = t.ticket_age_add;
+    entry.ticket_lifetime_s = @min(t.ticket_lifetime, session.max_lifetime_s);
+    entry.received_ms = c.handshake_time_ms;
+    entry.usable = true;
 }
 
 // ── zig-libs tlsclient: ALPN and client-certificate helpers ──────────────
@@ -2497,9 +2715,9 @@ fn readIndirect(c: *Client) Reader.Error!usize {
                 if (next_handshake_i > cleartext.len) return failRead(c, error.TlsBadLength);
                 const handshake = cleartext[ct_i..next_handshake_i];
                 switch (handshake_type) {
-                    .new_session_ticket => {
-                        // This client implementation ignores new session tickets.
-                    },
+                    // zig-libs tlsclient: kept for resumption when a cache is
+                    // configured (std ignored them).
+                    .new_session_ticket => c.storeTicket(handshake),
                     .key_update => {
                         switch (c.application_cipher) {
                             inline else => |*p| {

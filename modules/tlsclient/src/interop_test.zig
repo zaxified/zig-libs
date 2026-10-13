@@ -205,6 +205,7 @@ const Ext = struct {
     connection_info: ?*Client.ConnectionInfo = null,
     verify_connection: ?Client.VerifyConnection = null,
     client_auth_select: ?Client.ClientAuthSelect = null,
+    session_cache: ?*Client.SessionCache = null,
     extended_master_secret: bool = true,
     host: []const u8 = "good.example.test",
     /// Trust the server's self-signed certificate instead of the bundle.
@@ -221,6 +222,7 @@ const Session = struct {
     version: std.crypto.tls.ProtocolVersion = .tls_1_3,
     group: ?std.crypto.tls.NamedGroup = null,
     hrr: bool = false,
+    resumed: bool = false,
     exported: [64]u8 = undefined,
     /// What the server's `-rev` mode sent back for "hello\n".
     echo: [16]u8 = undefined,
@@ -262,9 +264,10 @@ fn session(io: std.Io, port: u16, bundle: *std.crypto.Certificate.Bundle, ext: E
         .connection_info = ext.connection_info,
         .verify_connection = ext.verify_connection,
         .client_auth_select = ext.client_auth_select,
+        .session_cache = ext.session_cache,
         .extended_master_secret = ext.extended_master_secret,
     });
-    var out: Session = .{ .alpn = c.alpn_protocol, .version = c.tls_version, .group = c.negotiated_group, .hrr = c.hello_retry_request };
+    var out: Session = .{ .alpn = c.alpn_protocol, .version = c.tls_version, .group = c.negotiated_group, .hrr = c.hello_retry_request, .resumed = c.did_resume };
     if (ext.export_len != 0) try c.exportKeyingMaterial(ext.export_label, null, out.exported[0..ext.export_len]);
     if (ext.no_echo) return out;
     try c.writer.writeAll("hello\n");
@@ -906,6 +909,61 @@ test "interop: client_auth_select gets the request's schemes and CA names (TLS 1
         try testing.expect(picker.ca_matches);
         try testing.expect(srv.reported(io, "Peer certificate: CN=client-p256"));
     }
+}
+
+// ── S2 (2026-10-13): TLS 1.3 session resumption ──────────────────────────
+
+test "interop: TLS 1.3 resumption -- the second connection resumes on openssl's ticket; the view keeps the chain" {
+    const io = testing.io;
+    var tmp = try setUp(io);
+    defer tmp.cleanup();
+    var bundle = try rootBundle(io, tmp.dir);
+    defer bundle.deinit(testing.allocator);
+    var entries: [2]Client.ClientSession = undefined;
+    var cache: Client.SessionCache = .init(&entries, null);
+    defer cache.deinit();
+    inline for (.{ &[_][]const u8{"-rev"}, &[_][]const u8{ "-groups", "P-256", "-rev" } }) |extra| {
+        var srv = try Server.startWith(io, tmp.dir, "leaf.pem", "leaf.key.pem", "inter.pem", extra ++ &[_][]const u8{ "-naccept", "2" });
+        defer srv.stop(io);
+        const first = try session(io, srv.port, &bundle, .{ .session_cache = &cache });
+        try testing.expect(!first.resumed);
+        try testing.expectEqualStrings("olleh", first.echo[0..first.echo_len]);
+        const e = cache.find("good.example.test").?;
+        try testing.expect(e.usable); // the ticket arrived with the echo
+        var storage: [16 * 1024]u8 = undefined;
+        var ci: Client.ConnectionInfo = .init(&storage);
+        var h: Hook = .{ .refuse = false };
+        const second = try session(io, srv.port, &bundle, .{ .session_cache = &cache, .connection_info = &ci, .verify_connection = .{ .context = &h, .verify = Hook.verify } });
+        try testing.expect(second.resumed);
+        try testing.expect(ci.did_resume);
+        try testing.expectEqualStrings("olleh", second.echo[0..second.echo_len]);
+        // No Certificate on the wire, the kept chain in the view, the hook ran.
+        try testing.expectEqual(@as(usize, 2), ci.peerCertificates().len);
+        try testing.expectEqualSlices(u8, derFromPem(@embedFile("testdata/leaf.pem")), ci.peerCertificates()[0]);
+        try testing.expectEqual(@as(usize, 1), h.calls);
+        if (extra.len == 3) try testing.expect(second.hrr); // HRR to P-256, the PSK re-bound
+    }
+}
+
+test "interop: resumption is not offered to another name, nor after the ticket's lifetime" {
+    const io = testing.io;
+    var tmp = try setUp(io);
+    defer tmp.cleanup();
+    var bundle = try rootBundle(io, tmp.dir);
+    defer bundle.deinit(testing.allocator);
+    var entries: [1]Client.ClientSession = undefined;
+    var cache: Client.SessionCache = .init(&entries, null);
+    defer cache.deinit();
+    var srv = try Server.startWith(io, tmp.dir, "leaf.pem", "leaf.key.pem", "inter.pem", &.{ "-rev", "-naccept", "2" });
+    defer srv.stop(io);
+    _ = try session(io, srv.port, &bundle, .{ .session_cache = &cache });
+    const e = cache.find("good.example.test").?;
+    try testing.expect(e.usable);
+    // Age it past its lifetime: a full handshake, which stores a new ticket.
+    e.received_ms -= @as(i64, e.ticket_lifetime_s) * 1000 + 1;
+    const again = try session(io, srv.port, &bundle, .{ .session_cache = &cache });
+    try testing.expect(!again.resumed);
+    try testing.expect(cache.find("good.example.test").?.usable);
 }
 
 // ── offline: the ClientHello, the ALPN answer, the CertificateRequest ──────

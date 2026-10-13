@@ -100,6 +100,19 @@ marked `zig-libs tlsclient` in `Client.zig`:
   over SHA-256/384/512 running hashes of the messages, kept only when client
   auth is configured). Ed25519 client keys stay TLS 1.3 only: PureEdDSA
   cannot sign the TLS 1.2 messages' hash (an empty Certificate is sent).
+- **TLS 1.3 session resumption** (Go `ClientSessionCache`, opt-in as there):
+  `Options.session_cache` → `SessionCache` over caller-owned `ClientSession`
+  entries (one per server name, oldest replaced; optional `std.Io.Mutex`).
+  A full handshake reserves the entry with the resumption master secret and
+  the server's chain; NewSessionTickets (std dropped them) fill in the
+  ticket and its PSK; the next connection offers it (psk_dhe_ke -- a fresh
+  ECDHE still runs; no 0-RTT) with the binder over the truncated hello,
+  re-bound after an HRR or dropped when the HRR's suite hash differs. A
+  resumed session skips Certificate/CertificateVerify, shows the kept chain
+  in `ConnectionInfo` (`did_resume`) and still runs `verify_connection`.
+  Not offered past the ticket lifetime (≤ 7 days) or the leaf's notAfter.
+  PSK derivation, binder and the NewSessionTicket codec are `tlsresume`'s.
+  TLS 1.2 session tickets (RFC 5077) are not resumed.
 - **KeyUpdate sent** (RFC 8446 §4.6.3): a server's update_requested is
   answered with our KeyUpdate before our next record, and the client updates
   on its own after `key_update_after` (2^23) records. std switched its write
