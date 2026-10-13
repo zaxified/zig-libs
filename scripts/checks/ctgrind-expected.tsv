@@ -1355,6 +1355,20 @@ p521	ReleaseFast	keygen	1	0	786668597aa111f5	b44de7eb8b02a855
 p521	ReleaseFast	sign	1	0	786668597aa111f5	b620c1c667ef0084
 p521	ReleaseFast	ecdh	1	0	4fe6fcee141114ca	a348bd01a2bccfcc
 p521	ReleaseFast	vartime	1	>=1	4160fbdec86bc619	11557f4b46d4c2af
+# p384 (2026-10-13) — NIST P-384, new module (p521's algorithms over a Montgomery
+# field with an amd64 MULX/ADX core, fast_core.zig — CPU skylake has ADX, so the
+# asm path is the one measured). mul / keygen / sign / ecdh: secret tainted end to
+# end, 0 in-file on all four; declassified verdicts as in modules/p384/SPEC.md
+# § Constant-time contract. The first run flagged keygen 1 / sign 2: the comb's
+# `addMixed` selected on the (secret) table point's isZero and LLVM branched on
+# it — the comb now uses `addMixedComplete` from a valid default entry
+# (tlsclient's P-384 comb had the same finding on std's addMixed, 2026-10-11).
+# `vartime` is the POSITIVE CONTROL (11 in-file: wNAF and Jacobian branches).
+p384	ReleaseFast	mul	1	0	494f2774a90d0628	c6ed226b169947b1
+p384	ReleaseFast	keygen	1	0	d219a2b516346767	c28d014cde15df1e
+p384	ReleaseFast	sign	1	0	d219a2b516346767	d03df64890394e70
+p384	ReleaseFast	ecdh	1	0	494f2774a90d0628	cbf100ff8ddb053f
+p384	ReleaseFast	vartime	1	>=1	9a026d7fcdb488c6	38cf29c815d8f1f4
 # tlsresume (2026-10-13) — the STEK, the resumption secret / PSK / binder key and the
 # 0-RTT key schedule through the module's public API; SHA-256 and SHA-384 suites.
 # stek: STEK + session state tainted through seal, open, tampered open. 2 = the

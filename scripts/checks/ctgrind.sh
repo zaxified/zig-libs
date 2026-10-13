@@ -314,6 +314,8 @@ declare -A TARGETS=(
     [aes192]="enc dec"
     # ── 2026-10-10: p521 (NIST P-521): mul/keygen/sign/ecdh claims + the vartime positive control ──
     [p521]="mul keygen sign ecdh vartime"
+    # ── 2026-10-13: p384 (NIST P-384): mul/keygen/sign/ecdh claims + the vartime positive control ──
+    [p384]="mul keygen sign ecdh vartime"
     # ── 2026-10-13: tlsresume: STEK, resumption secret/PSK/binder key, 0-RTT key schedule ──
     [tlsresume]="stek psk early"
     # ── 2026-10-13: acme: the P-256 account / certificate private key ──
@@ -399,6 +401,7 @@ declare -A MODES=(
     [snmp]="ReleaseFast"
     [aes192]="ReleaseFast"
     [p521]="ReleaseFast"
+    [p384]="ReleaseFast"
     [tlsresume]="ReleaseFast"
     [acme]="ReleaseFast"
     [jwt]="ReleaseFast"
@@ -731,10 +734,15 @@ declare -A PATTERN=(
     # RFC 6979 DRBG on the sign path -- that HMAC is this module's nonce
     # derivation, so its contexts are this module's.
     [p521/mul]='field[.]zig|scalar[.]zig|group[.]zig|ct[.]zig|burn[.]zig'
+    [p384/mul]='field[.]zig|mont[.]zig|fast_core[.]zig|scalar[.]zig|group[.]zig|ct[.]zig|burn[.]zig'
     [p521/keygen]='field[.]zig|scalar[.]zig|group[.]zig|sign[.]zig|ct[.]zig|burn[.]zig'
+    [p384/keygen]='field[.]zig|mont[.]zig|fast_core[.]zig|scalar[.]zig|group[.]zig|sign[.]zig|ct[.]zig|burn[.]zig'
     [p521/sign]='field[.]zig|scalar[.]zig|group[.]zig|sign[.]zig|ct[.]zig|burn[.]zig|hmac[.]zig|sha2[.]zig'
+    [p384/sign]='field[.]zig|mont[.]zig|fast_core[.]zig|scalar[.]zig|group[.]zig|sign[.]zig|ct[.]zig|burn[.]zig|hmac[.]zig|sha2[.]zig'
     [p521/ecdh]='field[.]zig|scalar[.]zig|group[.]zig|ct[.]zig|burn[.]zig'
+    [p384/ecdh]='field[.]zig|mont[.]zig|fast_core[.]zig|scalar[.]zig|group[.]zig|ct[.]zig|burn[.]zig'
     [p521/vartime]='field[.]zig|scalar[.]zig|group[.]zig'
+    [p384/vartime]='field[.]zig|mont[.]zig|fast_core[.]zig|scalar[.]zig|group[.]zig'
     # tlsresume (2026-10-13): the module's own files; the AES-GCM tag verdict
     # and the HKDF/HMAC are std's and show up as in-file only through the
     # module frame that consumes them.
@@ -978,10 +986,15 @@ declare -A LABEL=(
     [aes192/enc]='aes192 init/encrypt/wide/xor/modes.ctr (key+plaintext tainted)'
     [aes192/dec]='aes192 initDec/initFromEnc/decrypt/wide (key+ciphertext tainted)'
     [p521/mul]='p521 mulInto, non-base point (scalar tainted)'
+    [p384/mul]='p384 mulInto, non-base point (scalar tainted)'
     [p521/keygen]='p521 KeyPair.fromSecretKeyInto (d tainted)'
+    [p384/keygen]='p384 KeyPair.fromSecretKeyInto (d tainted)'
     [p521/sign]='p521 generateDeterministicInto+signPrehashedInto (seed tainted)'
+    [p384/sign]='p384 generateDeterministicInto+signPrehashedInto (seed tainted)'
     [p521/ecdh]='p521 ecdhInto (secret tainted)'
+    [p384/ecdh]='p384 ecdhInto (secret tainted)'
     [p521/vartime]='p521 mulPublic POSITIVE CONTROL (scalar tainted, must flag)'
+    [p384/vartime]='p384 mulPublic POSITIVE CONTROL (scalar tainted, must flag)'
     [tlsresume/stek]='tlsresume StekRing seal/open/tampered open (STEK + session state tainted)'
     [tlsresume/psk]='tlsresume derivePsk/earlySecret/binderKey/computeBinder/verifyBinder SHA-256+384 (rms tainted)'
     [tlsresume/early]='tlsresume 0-RTT key schedule SHA-256+384 (PSK tainted)'
