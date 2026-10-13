@@ -109,10 +109,13 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .poly1305
     else if (std.mem.eql(u8, target_arg, "aead"))
         .aead
+    else if (std.mem.eql(u8, target_arg, "xaead"))
+        .xaead
     else
         return error.UnknownTarget;
     const taint = try parseTaint(taint_arg);
     if (target == .aead) return aeadTarget(taint);
+    if (target == .xaead) return xaeadTarget(taint);
 
     std.debug.print("valgrind_support={} lanes={d}\n", .{ builtin.valgrind_support, poly1305.lanes });
 
@@ -149,7 +152,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
 }
 
 /// Which claim this run measures.
-const Target = enum { poly1305, aead };
+const Target = enum { poly1305, aead, xaead };
 
 /// The AEAD's own constant-time claim, which had **nothing behind it** until
 /// 2026-09-02.
@@ -205,4 +208,48 @@ fn aeadTarget(taint: Taint) !void {
         root.ChaCha20Poly1305.decrypt(back[0..n], c[0..n], bad, &ad, nonce, secret) catch {};
         std.debug.print("reject[{d}] done\n", .{n});
     }
+}
+
+/// The extended-nonce and original-layout constructions (2026-10-13): the key
+/// goes through HChaCha20 into a subkey that then drives the RFC 8439 AEAD, and
+/// the 64-bit-nonce stream carries its counter across 2^32 inside a wide group
+/// (`lastRow`'s per-lane select). Same claim as `aead`: no branch and no
+/// secret-indexed load on anything the key reaches.
+fn xaeadTarget(taint: Taint) !void {
+    std.debug.print("valgrind_support={} target=xaead\n", .{builtin.valgrind_support});
+
+    var key = secretKey();
+    if (taint == .yes) {
+        std.valgrind.memcheck.makeMemUndefined(&key);
+    }
+    const secret = reloadVolatile(&key);
+
+    const nonce: [24]u8 = .{ 0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4a, 0x4b, 0x4c, 0x4d, 0x4e, 0x4f, 0x50, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x58 };
+    var msg: [1024]u8 = undefined;
+    for (&msg, 0..) |*b, i| b.* = @truncate(i *% 31 +% 7);
+    const ad = [_]u8{ 0x50, 0x51, 0x52, 0x53, 0xc0, 0xc1, 0xc2, 0xc3 };
+
+    for ([_]usize{ 64, 1024 }) |n| {
+        var c: [1024]u8 = undefined;
+        var tag: [16]u8 = undefined;
+        root.XChaCha20Poly1305.encrypt(c[0..n], &tag, msg[0..n], &ad, nonce, secret);
+        std.debug.print("xseal[{d}]={x}\n", .{ n, tag });
+
+        var back: [1024]u8 = undefined;
+        root.XChaCha20Poly1305.decrypt(back[0..n], c[0..n], tag, &ad, nonce, secret) catch |e| {
+            std.debug.print("xopen[{d}] unexpected {t}\n", .{ n, e });
+            return e;
+        };
+        var bad = tag;
+        bad[0] ^= 1;
+        root.XChaCha20Poly1305.decrypt(back[0..n], c[0..n], bad, &ad, nonce, secret) catch {};
+        std.debug.print("xreject[{d}] done\n", .{n});
+    }
+
+    // 2^32 - 3: lanes 3..7 of the first wide group carry into word 13.
+    var ks: [1024]u8 = undefined;
+    root.ChaCha20With64BitNonce.xor(&ks, &msg, (1 << 32) - 3, secret, nonce[0..8].*);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(&ks, &digest, .{});
+    std.debug.print("ctr64={x}\n", .{digest[0..16].*});
 }

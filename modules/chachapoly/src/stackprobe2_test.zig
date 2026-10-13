@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 //! `testkit.stackprobe` probe of the pointer-keyed entry points (`xorInto`,
-//! `streamInto`, `encryptInto`, `decryptInto`), residue below the burn and the
+//! `streamInto`, `encryptInto`, `decryptInto`, and `hchacha20`), residue below the burn and the
 //! key as a needle in any frame. The older `stackprobe_test.zig` stays as it
 //! was. ReleaseFast only (`skipUnlessOptimized`, a runtime skip). Short
 //! (std-delegated) and wide messages, per-message burns (2 / 4 KiB, TIGHT).
@@ -35,4 +35,9 @@ test "STACKPROBE: no ChaCha20 key residue after the pointer-keyed entry points" 
         _ = try P.run("decryptInto " ++ l, A.decryptInto, .{ pt[0..len], ct[0..len], tag, ad, nonce, &key }, ks, .{});
         try std.testing.expectEqualSlices(u8, msg[0..len], pt[0..len]);
     }
+    // The subkey derivation on its own: the key must not survive below its burn.
+    _ = try P.run("hchacha20", root.hchacha20, .{ &subkey, &key, &hinput }, ks, .{});
 }
+
+var subkey: [32]u8 = undefined;
+const hinput: [16]u8 = @splat(0x33);

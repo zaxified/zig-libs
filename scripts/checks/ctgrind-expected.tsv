@@ -147,8 +147,8 @@ bn254	ReleaseFast	field	1	1	27af92a0c130f0a6	831aa25b5c3d2f05
 # of `std.crypto.ff`'s `fromMontgomery`; exactly the three contexts attributed
 # to std's ff went (9 -> 6 total), output byte-identical.
 bn254	ReleaseFast	scalarmul	1	2	2b67af362ef59b94	1bba83824af4d763
-chachapoly	ReleaseFast	poly1305	1	0	2ceba351a31d10b9	ff3ba8f00b851bdf
-chachapoly	ReleaseSafe	poly1305	1	>=1	2ceba351a31d10b9	ff3ba8f00b851bdf
+chachapoly	ReleaseFast	poly1305	1	0	5bd0445bbfefe3cc	ff3ba8f00b851bdf
+chachapoly	ReleaseSafe	poly1305	1	>=1	5bd0445bbfefe3cc	ff3ba8f00b851bdf
 # The AEAD's own claim (added 2026-09-02). SPEC.md and root.zig state that the
 # tag is compared in constant time, and until this row existed the module was
 # measured with the `poly1305` target ALONE -- the harness never touched
@@ -191,8 +191,10 @@ chachapoly	ReleaseSafe	poly1305	1	>=1	2ceba351a31d10b9	ff3ba8f00b851bdf
 # is consumed in Debug, and CONVENTIONS §7.1 narrowed the Debug CI lane to
 # compile-only in 2026-08-15 on the same kind of measurement. See
 # `scripts/checks/ctgrind.sh` § MODES.
-chachapoly	ReleaseFast	aead	1	4	4c9e0c94ef4199ce	870a36cbebbc4588
-chachapoly	ReleaseSafe	aead	1	>=1	4c9e0c94ef4199ce	870a36cbebbc4588
+chachapoly	ReleaseFast	aead	1	4	52794d136d2a5760	870a36cbebbc4588
+chachapoly	ReleaseFast	xaead	1	4	52794d136d2a5760	4caee5e0b86063e7
+chachapoly	ReleaseSafe	aead	1	>=1	52794d136d2a5760	870a36cbebbc4588
+chachapoly	ReleaseSafe	xaead	1	>=1	52794d136d2a5760	4caee5e0b86063e7
 # oscore — added 2026-09-08. SPEC.md § "Threat model / limits" claims the key
 # material is routed ONLY through std's constant-time HMAC/AES-CCM, with no
 # comparison or branch on key bytes in this module's own code; until today that

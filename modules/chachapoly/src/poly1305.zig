@@ -31,13 +31,15 @@
 //! as **five 26-bit limbs**: every operand then fits in 32 bits, every partial
 //! product in 64, and the reduction `2^130 ≡ 5` is a shift-and-multiply-by-5.
 //!
-//! `PMULUDQ` is reached without an intrinsic: the limbs live in
-//! `@Vector(L, u32)` and are widened with `@intCast` to `@Vector(L, u64)`
-//! before multiplying, so LLVM sees `mul (zext a), (zext b)` — the exact pattern
-//! its x86 backend folds into `vpmuludq`. Keeping the *stored* limbs `u32`
-//! (rather than `u64` masked to 26 bits) is what makes the upper half provably
-//! zero at every use, instead of hoping known-bits analysis survives the carry
-//! chain.
+//! `PMULUDQ` is reached without an intrinsic: every multiply operand is
+//! masked to its low 32 bits, `(a & 0xffffffff) * (b & 0xffffffff)` on
+//! `@Vector(L, u64)` lanes — the exact pattern LLVM's x86 backend folds into
+//! `vpmuludq`. In the lane loop the accumulator stays in u64 lanes from step to
+//! step (no widening and narrowing per step, 2026-10-13), and the mask is applied
+//! behind an empty-asm barrier (`opaque64`): IR passes otherwise prove the
+//! accumulator small, delete the mask, and leave the backend — which cannot see
+//! through the loop phi — to emulate a 64×64 multiply. The message blocks are
+//! split into limbs straight from 64-bit words (`loadBlocks64`).
 //!
 //! ## Deferred-carry bounds (the part these implementations get wrong)
 //!
@@ -200,21 +202,35 @@ fn widen(comptime W: usize, v: [5]@Vector(W, u32)) [5]@Vector(W, u64) {
     return out;
 }
 
-/// `h · r mod 2^130−5`, lane-wise, in 5×26-bit limbs. `s[i]` must be `5·r[i]`.
-/// Returns limbs satisfying the deferred-carry invariant documented above.
-fn mulRed(
+/// `h · r mod 2^130−5`, lane-wise, in 5×26-bit limbs held in u64 lanes (the
+/// value in the low 32 bits). `s[i]` must be `5·r[i]`. Returns limbs
+/// satisfying the deferred-carry invariant documented above.
+///
+/// Every multiply operand is masked to its low 32 bits: `(a & 0xffffffff) *
+/// (b & 0xffffffff)` is the pattern LLVM's x86 backend folds into
+/// `vpmuludq` unconditionally. Without the masks it had to PROVE the upper
+/// halves zero, which known-bits analysis does not do across the loop's phi
+/// (2026-10-13: the u64 accumulator then multiplied as emulated 64×64, 25 %
+/// slower). The masks cost nothing — `vpmuludq` ignores the upper halves.
+inline fn mulRed64(
     comptime W: usize,
-    h: [5]@Vector(W, u32),
-    r: [5]@Vector(W, u32),
-    s: [5]@Vector(W, u32),
-) [5]@Vector(W, u32) {
+    h: [5]@Vector(W, u64),
+    r: [5]@Vector(W, u64),
+    s: [5]@Vector(W, u64),
+) [5]@Vector(W, u64) {
     const V64 = @Vector(W, u64);
     const mask: V64 = @splat(limb_mask);
+    const lo32: V64 = @splat(0xffff_ffff);
     const sh26: @Vector(W, u6) = @splat(26);
 
-    const a = widen(W, h);
-    const b = widen(W, r);
-    const c5 = widen(W, s);
+    var a: [5]V64 = undefined;
+    var b: [5]V64 = undefined;
+    var c5: [5]V64 = undefined;
+    inline for (0..5) |i| {
+        a[i] = opaque64(W, h[i]) & lo32;
+        b[i] = r[i] & lo32;
+        c5[i] = s[i] & lo32;
+    }
 
     // Schoolbook 5×5 with the 2^130 ≡ 5 wrap already folded in via s = 5r.
     var d: [5]V64 = .{
@@ -238,7 +254,59 @@ fn mulRed(
     carry = d[0] >> sh26;
     d[0] &= mask;
     d[1] += carry; // < 2^26 + 2^9; the invariant allows < 2^27.6
+    return d;
+}
 
+/// An empty asm statement the value passes through, so LLVM knows nothing
+/// about its bits. In the loop the accumulator is provably < 2^28, so IR
+/// passes delete `h & 0xffffffff` as redundant — and the backend, which sees
+/// the accumulator only through the loop phi, can then no longer prove the
+/// upper halves zero and emulates every product as 64×64 (three `vpmuludq`,
+/// two shifts, two adds; measured 1.10 → 1.24× OpenSSL at 16 KiB,
+/// 2026-10-13). Behind the barrier the mask is not redundant, so it stays and
+/// `vpmuludq` is selected. x86 LLVM only (elsewhere a no-op), and per
+/// register: a 512-bit vector on AVX2 is passed as two 256-bit halves, since
+/// `"x"` cannot hold it whole.
+inline fn opaque64(comptime W: usize, v: @Vector(W, u64)) @Vector(W, u64) {
+    const bits = 64 * W;
+    const reg_bits: usize = if (has_avx512f) 512 else if (has_avx) 256 else 128;
+    // W = 1 (`mul1`, outside any loop) is a scalar to LLVM: no "x" register.
+    if (comptime !asm_barrier_ok or W < 2) return v;
+    if (comptime bits <= reg_bits) return asm (""
+        : [out] "=x" (-> @Vector(W, u64)),
+        : [in] "0" (v),
+    );
+    const H = W / 2;
+    const idx = comptime blk: {
+        var lo: [H]i32 = undefined;
+        var hi: [H]i32 = undefined;
+        var join: [W]i32 = undefined;
+        for (0..H) |k| {
+            lo[k] = k;
+            hi[k] = H + k;
+            join[k] = k; // from `lo`
+            join[H + k] = ~@as(i32, k); // from `hi`
+        }
+        break :blk .{ lo, hi, join };
+    };
+    const lo = opaque64(H, @shuffle(u64, v, undefined, @as(@Vector(H, i32), idx[0])));
+    const hi = opaque64(H, @shuffle(u64, v, undefined, @as(@Vector(H, i32), idx[1])));
+    return @shuffle(u64, lo, hi, @as(@Vector(W, i32), idx[2]));
+}
+
+const asm_barrier_ok = builtin.zig_backend == .stage2_llvm and builtin.cpu.arch.isX86();
+const has_avx = builtin.cpu.has(.x86, .avx);
+const has_avx512f = builtin.cpu.has(.x86, .avx512f);
+
+/// `mulRed64` on u32 limbs (the power table and the width-1 multiply): the
+/// same arithmetic, so the table cannot diverge from the loop's.
+fn mulRed(
+    comptime W: usize,
+    h: [5]@Vector(W, u32),
+    r: [5]@Vector(W, u32),
+    s: [5]@Vector(W, u32),
+) [5]@Vector(W, u32) {
+    const d = mulRed64(W, widen(W, h), widen(W, r), widen(W, s));
     var out: [5]@Vector(W, u32) = undefined;
     inline for (0..5) |i| out[i] = @truncate(d[i]);
     return out;
@@ -314,6 +382,64 @@ inline fn columns8(m: *const [128]u8) [4]@Vector(8, u32) {
 }
 
 const native_endian = builtin.cpu.arch.endian();
+
+/// Whether `loadBlocks64` takes the 64-bit-word shuffle (W = 4 or 8 on a
+/// little-endian target) — which permutes the blocks across lanes, see
+/// `laneBlock` — or widens `loadBlocks`' u32 limbs in block order.
+fn qwordLoad(comptime W: usize) bool {
+    return (W == 4 or W == 8) and native_endian == .little;
+}
+
+/// The block (within a group of `W`) that `loadBlocks64` puts in lane `j`.
+/// `vpunpck{l,h}qdq` interleave within 128-bit halves, so each 4-block run
+/// lands as blocks 0 2 1 3. The fold vectors are built from this map, so lane
+/// `j` is multiplied by `r^(W − laneBlock(W, j))` — the power its block needs.
+/// Lane 0 is always block 0, where the carried-in accumulator is seeded.
+fn laneBlock(comptime W: usize, comptime j: usize) usize {
+    if (!qwordLoad(W)) return j;
+    const quad = [4]usize{ 0, 2, 1, 3 };
+    return (j / 4) * 4 + quad[j % 4];
+}
+
+/// Split `W` consecutive 16-byte blocks into 5×26-bit limbs in u64 lanes (one
+/// block per lane, in `laneBlock` order), with the implicit 2^128 bit set. At
+/// W = 4 / 8 straight from 64-bit words: the low and high quadwords of each
+/// block come out of `vpunpck{l,h}qdq` already in 64-bit lanes, and the limbs
+/// are shifts and masks of them — no u32 → u64 widening per step.
+inline fn loadBlocks64(comptime W: usize, m: *const [16 * W]u8) [5]@Vector(W, u64) {
+    const V64 = @Vector(W, u64);
+    if (comptime !qwordLoad(W)) return widen(W, loadBlocks(W, m));
+    const q: @Vector(2 * W, u64) = @bitCast(m.*);
+    // Quadword 2b is block b's low half, 2b+1 its high half; per pair of
+    // 32-byte loads the unpack yields blocks 0 2 1 3.
+    const lo_idx = comptime blk: {
+        var a: [W]i32 = undefined;
+        for (0..W) |j| a[j] = @intCast(2 * laneBlock(W, j));
+        break :blk a;
+    };
+    const hi_idx = comptime blk: {
+        var a: [W]i32 = undefined;
+        for (0..W) |j| a[j] = @intCast(2 * laneBlock(W, j) + 1);
+        break :blk a;
+    };
+    const lo = @shuffle(u64, q, undefined, @as(@Vector(W, i32), lo_idx));
+    const hi = @shuffle(u64, q, undefined, @as(@Vector(W, i32), hi_idx));
+    const mask: V64 = @splat(limb_mask);
+    const s12: @Vector(W, u6) = @splat(12);
+    const s14: @Vector(W, u6) = @splat(14);
+    const s24: @Vector(W, u6) = @splat(24);
+    const s26: @Vector(W, u6) = @splat(26);
+    const s40: @Vector(W, u6) = @splat(40);
+    const s52: @Vector(W, u6) = @splat(52);
+    const top: V64 = @splat(1);
+    return .{
+        lo & mask,
+        (lo >> s26) & mask,
+        ((lo >> s52) | (hi << s12)) & mask,
+        (hi >> s14) & mask,
+        (hi >> s40) | (top << s24),
+    };
+}
 
 /// Carry a 5-limb value whose limbs may be up to ~2^32 back into the
 /// `< 2^26` (limb 1: `< 2^27`) invariant. Used after the lane fold and on the
@@ -473,11 +599,12 @@ pub fn Generic(comptime L: usize) type {
             st.rl = pw[L - 1];
             inline for (0..5) |i| st.sl[i] = st.rl[i] * 5;
 
-            // Lane j gets r^(L−j): lane 0 → r^L, lane L−1 → r^1.
+            // Lane j holds block laneBlock(L, j) of each group, which needs
+            // r^(L − that block): lane of block 0 → r^L, of block L−1 → r^1.
             var rp: [5][L]u32 = undefined;
             var sp: [5][L]u32 = undefined;
             inline for (0..L) |j| {
-                const p = pw[L - 1 - j];
+                const p = pw[L - 1 - laneBlock(L, j)];
                 inline for (0..5) |i| {
                     rp[i][j] = p[i];
                     sp[i][j] = p[i] * 5;
@@ -494,7 +621,7 @@ pub fn Generic(comptime L: usize) type {
                 var rph: [5][H]u32 = undefined;
                 var sph: [5][H]u32 = undefined;
                 inline for (0..H) |j| {
-                    const p = pw[H - 1 - j];
+                    const p = pw[H - 1 - laneBlock(H, j)];
                     inline for (0..5) |i| {
                         rph[i][j] = p[i];
                         sph[i][j] = p[i] * 5;
@@ -541,30 +668,33 @@ pub fn Generic(comptime L: usize) type {
 
             // Group 0: A = M₀, with the carried-in accumulator seeded into lane
             // 0 so that it ends up multiplied by r^n like every other term.
+            const V64 = @Vector(L, u64);
             const seed_limbs = importAcc(st.inner.h);
-            var acc = loadBlocks(L, m[0..][0 .. block_length * L]);
+            var acc = loadBlocks64(L, m[0..][0 .. block_length * L]);
             inline for (0..5) |k| {
-                var seed: [L]u32 = .{0} ** L;
-                seed[0] = seed_limbs[k];
-                acc[k] += @as(V, seed);
+                var seed: [L]u64 = .{0} ** L;
+                seed[0] = seed_limbs[k]; // lane 0 is block 0 (`laneBlock`)
+                acc[k] += @as(V64, seed);
             }
 
-            var rlv: [5]V = undefined;
-            var slv: [5]V = undefined;
+            var rlv: [5]V64 = undefined;
+            var slv: [5]V64 = undefined;
             inline for (0..5) |k| {
                 rlv[k] = @splat(st.rl[k]);
                 slv[k] = @splat(st.sl[k]);
             }
 
+            // The accumulator stays in u64 lanes across the loop: no
+            // u32 → u64 widening and no narrowing back per step.
             var i: usize = block_length * L;
             while (i < m.len) : (i += block_length * L) {
-                acc = mulRed(L, acc, rlv, slv);
-                const lm = loadBlocks(L, m[i..][0 .. block_length * L]);
+                acc = mulRed64(L, acc, rlv, slv);
+                const lm = loadBlocks64(L, m[i..][0 .. block_length * L]);
                 inline for (0..5) |k| acc[k] += lm[k];
             }
 
             // Fold the lanes: multiply lane j by r^(L−j), then sum lanes.
-            const folded = mulRed(L, acc, st.rp, st.sp);
+            const folded = mulRed64(L, acc, widen(L, st.rp), widen(L, st.sp));
             var sum: [5]u64 = .{ 0, 0, 0, 0, 0 };
             inline for (0..5) |k| {
                 inline for (0..L) |j| sum[k] += folded[k][j];
@@ -582,29 +712,32 @@ pub fn Generic(comptime L: usize) type {
         fn wideHalf(st: *Self, m: []const u8) void {
             std.debug.assert(H > 0 and m.len % (block_length * H) == 0 and m.len > 0);
 
+            const V64 = @Vector(H, u64);
             const seed_limbs = importAcc(st.inner.h);
-            var acc = loadBlocks(H, m[0..][0 .. block_length * H]);
+            var acc = loadBlocks64(H, m[0..][0 .. block_length * H]);
             inline for (0..5) |k| {
-                var seed: [H]u32 = .{0} ** H;
-                seed[0] = seed_limbs[k];
-                acc[k] += @as(HalfV, seed);
+                var seed: [H]u64 = .{0} ** H;
+                seed[0] = seed_limbs[k]; // lane 0 is block 0 (`laneBlock`)
+                acc[k] += @as(V64, seed);
             }
 
-            var rlv: [5]HalfV = undefined;
-            var slv: [5]HalfV = undefined;
+            var rlv: [5]V64 = undefined;
+            var slv: [5]V64 = undefined;
             inline for (0..5) |k| {
                 rlv[k] = @splat(st.rh[k]);
                 slv[k] = @splat(st.sh[k]);
             }
 
+            // The accumulator stays in u64 lanes across the loop: no
+            // u32 → u64 widening and no narrowing back per step.
             var i: usize = block_length * H;
             while (i < m.len) : (i += block_length * H) {
-                acc = mulRed(H, acc, rlv, slv);
-                const lm = loadBlocks(H, m[i..][0 .. block_length * H]);
+                acc = mulRed64(H, acc, rlv, slv);
+                const lm = loadBlocks64(H, m[i..][0 .. block_length * H]);
                 inline for (0..5) |k| acc[k] += lm[k];
             }
 
-            const folded = mulRed(H, acc, st.rph, st.sph);
+            const folded = mulRed64(H, acc, widen(H, st.rph), widen(H, st.sph));
             var sum: [5]u64 = .{ 0, 0, 0, 0, 0 };
             inline for (0..5) |k| {
                 inline for (0..H) |j| sum[k] += folded[k][j];

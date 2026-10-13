@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 
-//! chachapoly — SIMD-accelerated ChaCha20-Poly1305 AEAD (RFC 8439).
+//! chachapoly — SIMD-accelerated ChaCha20-Poly1305 AEAD (RFC 8439), with the
+//! XChaCha, reduced-round and 64-bit-nonce variants `std` has.
 //!
 //! A performance-specialised reimplementation of the ChaCha20 stream cipher and
 //! the ChaCha20-Poly1305 AEAD that `std.crypto` already ships. It exists **only**
@@ -74,7 +75,13 @@
 //! is not, and none may be added.
 //!
 //! API mirrors `std.crypto.stream.chacha.ChaCha20IETF` and
-//! `std.crypto.aead.chacha_poly.ChaCha20Poly1305` so consumers can swap it in.
+//! `std.crypto.aead.chacha_poly.ChaCha20Poly1305` so consumers can swap it in —
+//! and, since 2026-10-13, every other type of those two std files: `ChaCha12`,
+//! `ChaCha8`, `ChaCha{20,12,8}With64BitNonce`, `XChaCha{20,12,8}` and the AEADs
+//! `ChaCha{12,8}Poly1305`, `XChaCha{20,12,8}Poly1305`, plus `hchacha20`. One
+//! engine serves them all: `chachaCore` takes the round count, `lastRow` the
+//! counter/nonce row (`Layout`), and XChaCha is HChaCha in front of the IETF
+//! types with the subkey wiped after the call.
 
 const std = @import("std");
 const mem = std.mem;
@@ -97,7 +104,7 @@ const StdAead = std.crypto.aead.chacha_poly.ChaCha20Poly1305;
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "SIMD-accelerated ChaCha20-Poly1305 AEAD (RFC 8439) — a throughput-specialized, byte-exact duplicate of `std.crypto.aead.chacha_poly`.",
+    .doc = "SIMD-accelerated ChaCha20-Poly1305 and XChaCha20-Poly1305 AEAD (RFC 8439) — a throughput-specialized, byte-exact duplicate of `std.crypto.aead.chacha_poly` and `std.crypto.stream.chacha`, every variant.",
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
@@ -243,7 +250,7 @@ pub fn counterWouldWrap(len: usize, counter: u32) bool {
     return @as(u64, (len + 63) / 64) + counter > (@as(u64, 1) << 32);
 }
 
-const counter_wrap_message = "chachapoly: the ChaCha20 block counter would wrap — keystream reuse (two-time pad). Re-key or advance the nonce.";
+const counter_wrap_message = "chachapoly: the ChaCha block counter would wrap — keystream reuse (two-time pad). Re-key or advance the nonce.";
 
 const native_endian = @import("builtin").cpu.arch.endian();
 
@@ -255,30 +262,56 @@ fn keyToWords(key: [32]u8) [8]u32 {
     return k;
 }
 
-fn nonceToWords(nonce: [12]u8) [3]u32 {
-    return .{
-        mem.readInt(u32, nonce[0..4], .little),
-        mem.readInt(u32, nonce[4..8], .little),
-        mem.readInt(u32, nonce[8..12], .little),
-    };
+/// The two layouts of the state's last row (words 12..15). `.ietf`: RFC 8439 —
+/// a 32-bit block counter and a 96-bit nonce. `.nonce64`: Bernstein's original
+/// ChaCha — a 64-bit block counter (words 12, 13) and a 64-bit nonce, as
+/// `std.crypto.stream.chacha.ChaCha20With64BitNonce` and libsodium's
+/// `crypto_stream_chacha20`.
+const Layout = enum { ietf, nonce64 };
+
+/// The counter type of `layout`.
+fn CounterOf(comptime layout: Layout) type {
+    return if (layout == .ietf) u32 else u64;
 }
 
-/// Compute the ChaCha20 state for `N` consecutive blocks starting at `counter`
-/// (block j uses counter `counter +% j`), returning the 16 post-`+= s` state
-/// words in the block-parallel **transpose layout**: word i of every one of the
-/// N blocks lives in lane i..N of `x[i]`. The words are NOT yet in memory order
-/// — `blockWords` / `transpose8` do that transpose, and only they may.
-///
-/// `inline`: as a call it returned the 16 vectors through memory and the
-/// transpose reloaded them; inlined into the group loop the AEAD went
-/// 1.14 → 1.10× OpenSSL at 16 KiB (2026-10-13).
-inline fn chachaCore(comptime N: usize, k: [8]u32, counter: u32, n: [3]u32) [16]@Vector(N, u32) {
+/// Nonce bytes -> the nonce words of the last state row (3 for `.ietf`, 2 for
+/// `.nonce64`).
+fn nonceWords(comptime n: usize, nonce: [4 * n]u8) [n]u32 {
+    var w: [n]u32 = undefined;
+    inline for (0..n) |i| w[i] = mem.readInt(u32, nonce[4 * i ..][0..4], .little);
+    return w;
+}
+
+/// The last state row for `N` consecutive blocks starting at `counter` (block j
+/// uses counter `counter +% j`), in the transpose layout. For `.nonce64` the
+/// per-lane increment carries from word 12 into word 13, as the original
+/// construction's 64-bit counter does.
+inline fn lastRow(comptime N: usize, comptime layout: Layout, counter: CounterOf(layout), n: [if (layout == .ietf) 3 else 2]u32) [4]@Vector(N, u32) {
     const V = @Vector(N, u32);
     const iota: V = comptime blk: {
         var a: [N]u32 = undefined;
         for (0..N) |j| a[j] = j;
         break :blk a;
     };
+    if (layout == .ietf) return .{ @as(V, @splat(counter)) +% iota, @splat(n[0]), @splat(n[1]), @splat(n[2]) };
+    const lo0: V = @splat(@as(u32, @truncate(counter)));
+    const lo = lo0 +% iota;
+    const carry = @select(u32, lo < lo0, @as(V, @splat(1)), @as(V, @splat(0)));
+    return .{ lo, @as(V, @splat(@as(u32, @truncate(counter >> 32)))) +% carry, @splat(n[0]), @splat(n[1]) };
+}
+
+/// Compute the ChaCha state (`rounds` = 20, 12 or 8) for `N` consecutive
+/// blocks whose last row is `row3` (see `lastRow`), returning the 16
+/// post-`+= s` state words in the block-parallel **transpose layout**: word i
+/// of every one of the N blocks lives in lane i..N of `x[i]`. The words are NOT
+/// yet in memory order — `blockWords` / `transpose8` do that transpose, and
+/// only they may.
+///
+/// `inline`: as a call it returned the 16 vectors through memory and the
+/// transpose reloaded them; inlined into the group loop the AEAD went
+/// 1.14 → 1.10× OpenSSL at 16 KiB (2026-10-13).
+inline fn chachaCore(comptime N: usize, comptime rounds: comptime_int, k: [8]u32, row3: [4]@Vector(N, u32)) [16]@Vector(N, u32) {
+    const V = @Vector(N, u32);
     const splat = struct {
         inline fn f(x: u32) V {
             return @splat(x);
@@ -286,15 +319,15 @@ inline fn chachaCore(comptime N: usize, k: [8]u32, counter: u32, n: [3]u32) [16]
     }.f;
 
     const s = [16]V{
-        splat(sigma[0]),        splat(sigma[1]), splat(sigma[2]), splat(sigma[3]),
-        splat(k[0]),            splat(k[1]),     splat(k[2]),     splat(k[3]),
-        splat(k[4]),            splat(k[5]),     splat(k[6]),     splat(k[7]),
-        splat(counter) +% iota, splat(n[0]),     splat(n[1]),     splat(n[2]),
+        splat(sigma[0]), splat(sigma[1]), splat(sigma[2]), splat(sigma[3]),
+        splat(k[0]),     splat(k[1]),     splat(k[2]),     splat(k[3]),
+        splat(k[4]),     splat(k[5]),     splat(k[6]),     splat(k[7]),
+        row3[0],         row3[1],         row3[2],         row3[3],
     };
 
     var x = s;
     comptime var round: usize = 0;
-    inline while (round < 10) : (round += 1) {
+    inline while (round < rounds / 2) : (round += 1) {
         quarterRound(V, &x, 0, 4, 8, 12);
         quarterRound(V, &x, 1, 5, 9, 13);
         quarterRound(V, &x, 2, 6, 10, 14);
@@ -371,9 +404,9 @@ inline fn transpose8(x: [16]@Vector(8, u32)) [8][2]@Vector(8, u32) {
 /// target stores u32 little-endian (so a word vector IS the keystream bytes).
 const fast_transpose = wide == 8 and native_endian == .little;
 
-/// Fill `ks` with the keystream for `N` blocks starting at `counter`.
-fn keystream(comptime N: usize, ks: *[64 * N]u8, k: [8]u32, counter: u32, n: [3]u32) void {
-    const x = chachaCore(N, k, counter, n);
+/// Fill `ks` with the keystream for `N` blocks whose last row is `row3`.
+fn keystream(comptime N: usize, comptime rounds: comptime_int, ks: *[64 * N]u8, k: [8]u32, row3: [4]@Vector(N, u32)) void {
+    const x = chachaCore(N, rounds, k, row3);
     if (N == 8 and fast_transpose) {
         const t = transpose8(x);
         inline for (0..8) |j| {
@@ -438,7 +471,8 @@ inline fn xorTail(out: []u8, in: []const u8, ks: []const u8) void {
 /// 316 instead of 160 per 8 blocks, on Intel's single shuffle port
 /// (2026-10-13). LLVM backend on x86 only, and only when `V` fits one vector
 /// register (`"x"` cannot hold a 256-bit vector without AVX: the baseline
-/// build failed to allocate it); elsewhere the value passes as is.
+/// build failed to allocate it) and only for vectors (HChaCha's scalar `u32`
+/// rounds have nothing to protect); elsewhere the value passes as is.
 // Container-level, so they are comptime: `cpu.has` is an ordinary function,
 // and called inside `noReassoc` its test ran at run time, emitting the asm for
 // every target (the baseline build then failed on it).
@@ -447,7 +481,7 @@ const has_avx = builtin.cpu.has(.x86, .avx);
 const has_avx512f = builtin.cpu.has(.x86, .avx512f);
 
 inline fn noReassoc(comptime V: type, v: V) V {
-    const use = comptime asm_barrier_ok and (@bitSizeOf(V) <= 128 or
+    const use = comptime asm_barrier_ok and @typeInfo(V) == .vector and (@bitSizeOf(V) <= 128 or
         (@bitSizeOf(V) <= 256 and has_avx) or
         (@bitSizeOf(V) <= 512 and has_avx512f));
     return if (use) asm (""
@@ -467,146 +501,330 @@ inline fn quarterRound(comptime V: type, x: *[16]V, a: usize, b: usize, c: usize
     x[b] = math.rotl(V, x[b] ^ x[c], @as(u32, 7));
 }
 
+/// std's stream cipher for `rounds` and `layout` — the oracle and the short
+/// path, as `StdChaCha` is for ChaCha20.
+fn StdStream(comptime rounds: comptime_int, comptime layout: Layout) type {
+    const c = std.crypto.stream.chacha;
+    return switch (layout) {
+        .ietf => switch (rounds) {
+            20 => c.ChaCha20IETF,
+            12 => c.ChaCha12IETF,
+            8 => c.ChaCha8IETF,
+            else => @compileError("chachapoly: rounds must be 20, 12 or 8"),
+        },
+        .nonce64 => switch (rounds) {
+            20 => c.ChaCha20With64BitNonce,
+            12 => c.ChaCha12With64BitNonce,
+            8 => c.ChaCha8With64BitNonce,
+            else => @compileError("chachapoly: rounds must be 20, 12 or 8"),
+        },
+    };
+}
+
+/// True when a `.nonce64` call of `len` bytes starting at block `counter`
+/// would run past the 64-bit block counter. `counterWouldWrap` for the
+/// original construction; same rule, same `@panic`.
+pub fn counterWouldWrap64(len: usize, counter: u64) bool {
+    const blocks = len / 64 + @intFromBool(len % 64 != 0); // no `len + 63`: it overflows at the top of usize
+    return @as(u128, blocks) + counter > (@as(u128, 1) << 64);
+}
+
+/// The ChaCha stream cipher with `rounds` rounds and the `layout` counter /
+/// nonce row. API-compatible with std's `ChaCha{20,12,8}IETF` (`.ietf`) and
+/// `ChaCha{20,12,8}With64BitNonce` (`.nonce64`); byte-identical to them.
+fn ChaChaStream(comptime rounds: comptime_int, comptime layout: Layout) type {
+    return struct {
+        pub const key_length = 32;
+        pub const nonce_length = if (layout == .ietf) 12 else 8;
+        pub const block_length = 64;
+        /// The block counter: 32 bits (`.ietf`), 64 bits (`.nonce64`).
+        pub const Counter = CounterOf(layout);
+
+        const Std = StdStream(rounds, layout);
+        const nonce_words = nonce_length / 4;
+
+        fn wouldWrap(len: usize, counter: Counter) bool {
+            return if (layout == .ietf) counterWouldWrap(len, counter) else counterWouldWrap64(len, counter);
+        }
+
+        /// XOR the keystream (starting at block `counter`) into `in`,
+        /// writing to `out`. `out.len == in.len`. NOT authenticated on its own.
+        ///
+        /// `out` and `in` must be either the **same** slice (in-place, which is what
+        /// the AEAD and every network consumer does) or **disjoint**. Partially
+        /// overlapping slices are not supported — the fused path reads a whole
+        /// 64-byte block before writing it, as std's block-buffered `xor` does.
+        pub fn xor(out: []u8, in: []const u8, counter: Counter, key: [key_length]u8, nonce: [nonce_length]u8) void {
+            defer burnFor(in.len <= delegateLimit(delegate_max_bytes));
+            xorBody(out, in, counter, &key, nonce);
+        }
+
+        /// `xor` with the key by pointer: no key copy in the caller's frame (the
+        /// dead-stack-clean form; `xor` takes std's by-value shape).
+        pub fn xorInto(out: []u8, in: []const u8, counter: Counter, key: *const [key_length]u8, nonce: [nonce_length]u8) void {
+            defer burnFor(in.len <= delegateLimit(delegate_max_bytes));
+            xorBody(out, in, counter, key, nonce);
+        }
+
+        /// `xor`'s body, one frame down so `burnFor` reaches what it left (see
+        /// `burnStack`). The AEAD calls this directly and burns once itself.
+        noinline fn xorBody(out: []u8, in: []const u8, counter: Counter, key: *const [key_length]u8, nonce: [nonce_length]u8) void {
+            std.debug.assert(out.len == in.len);
+            // In EVERY build — see `counterWouldWrap`.
+            if (wouldWrap(in.len, counter)) @panic(counter_wrap_message);
+            // Short whole call -> std, before anything else happens. See
+            // `delegate_max_bytes`. This is a strict SUBSET of the tail branch at
+            // the bottom (if it fires, the group loop cannot run and `rem` would
+            // equal `in.len`), so the two comparisons cannot disagree about which
+            // engine a given length gets; it exists only to return before the
+            // function builds the wide path's 512-byte stack frame and splits the
+            // key/nonce into words. Measured worth ~6 ns of a ~108 ns call — the
+            // difference between 0.95x and 1.01x against std at 16 bytes.
+            //
+            // Branch on the message LENGTH, which is public (it is on the wire
+            // before a byte is decrypted). Never on key or plaintext.
+            if (in.len <= delegateLimit(delegate_max_bytes)) {
+                note(&chacha_path, .std_delegated);
+                return Std.xor(out, in, counter, key.*, nonce);
+            }
+            note(&chacha_path, .wide);
+            xorWide(out, in, counter, key, nonce);
+        }
+
+        /// The wide engine, a frame of its own: its ~1.9 KiB frame (the
+        /// 512-byte tail buffer and the spilled state) is then not allocated
+        /// on the short path above, which stays std's depth. With both in one
+        /// frame, the short path's dead stack reached past `short_path_burn`
+        /// (stackprobe2, 2026-10-13: 2303 B against a 2175 B burn).
+        noinline fn xorWide(out: []u8, in: []const u8, counter: Counter, key: *const [key_length]u8, nonce: [nonce_length]u8) void {
+            const k = keyToWords(key.*);
+            const n = nonceWords(nonce_words, nonce);
+            var ctr = counter;
+            var i: usize = 0;
+
+            // Whole groups: fused, no staging buffer.
+            while (i + 64 * wide <= in.len) : (i += 64 * wide) {
+                const x = chachaCore(wide, rounds, k, lastRow(wide, layout, ctr, n));
+                xorBlocks(wide, out[i..][0 .. 64 * wide], in[i..][0 .. 64 * wide], x);
+                ctr +%= wide;
+            }
+
+            // Tail: fewer than `wide` whole blocks left, so the group cannot be
+            // XORed in place and the keystream is staged (at most 512 bytes, once
+            // per call). Both branches below are on the *message length*, which is
+            // public — a ChaCha message length is visible on the wire before a
+            // byte of it is decrypted. NOTHING here may become a branch on key or
+            // plaintext; that would be a timing oracle, whereas this is not.
+            //
+            // When `in.len` is itself below the threshold the loop above never
+            // ran, so `rem == in.len` and this same branch is the whole call —
+            // which is the point. One comparison covers both "short message" and
+            // "short tail after the wide groups".
+            const rem = in.len - i;
+            if (rem > delegateLimit(delegate_max_bytes)) {
+                // A wide group costs about the same as ONE scalar block — same
+                // instruction count, `wide` times the width — so generating all
+                // `wide` blocks and discarding the unused suffix beats any
+                // narrower loop as soon as more than one block is left (measured:
+                // flat ~220 ns for every tail from 65 to 512 bytes). The discarded
+                // lanes may carry counters past the counter's end (`+% iota`);
+                // those bytes are never emitted, so the anti-wrap guarantee above
+                // is unaffected.
+                var ks: [64 * wide]u8 = undefined;
+                keystream(wide, rounds, &ks, k, lastRow(wide, layout, ctr, n));
+                xorTail(out[i..], in[i..], ks[0..rem]);
+            } else if (rem > 0) {
+                // Under one block: std wins, so std runs it. See
+                // `delegate_max_bytes` for the measurement. This is what makes a
+                // WireGuard keepalive, a 40-byte tunnelled ACK, and the AEAD's
+                // 32-byte Poly1305-key derivation (paid by EVERY AEAD call, at
+                // every length) cost what std costs instead of ~25% more.
+                note(&chacha_path, .std_delegated);
+                Std.xor(out[i..], in[i..], ctr, key.*, nonce);
+            }
+        }
+
+        /// Write the raw keystream (starting at block `counter`) into `out`.
+        pub fn stream(out: []u8, counter: Counter, key: [key_length]u8, nonce: [nonce_length]u8) void {
+            defer burnFor(out.len <= delegateLimit(delegate_max_bytes));
+            streamBody(out, counter, &key, nonce);
+        }
+
+        /// `stream` with the key by pointer (the dead-stack-clean form).
+        pub fn streamInto(out: []u8, counter: Counter, key: *const [key_length]u8, nonce: [nonce_length]u8) void {
+            defer burnFor(out.len <= delegateLimit(delegate_max_bytes));
+            streamBody(out, counter, key, nonce);
+        }
+
+        noinline fn streamBody(out: []u8, counter: Counter, key: *const [key_length]u8, nonce: [nonce_length]u8) void {
+            // See `counterWouldWrap`: in every build, not just the safe ones.
+            if (wouldWrap(out.len, counter)) @panic(counter_wrap_message);
+            // Short whole call -> std; see the matching note in `xor`.
+            if (out.len <= delegateLimit(delegate_max_bytes)) {
+                note(&chacha_path, .std_delegated);
+                return Std.stream(out, counter, key.*, nonce);
+            }
+            note(&chacha_path, .wide);
+            streamWide(out, counter, key, nonce);
+        }
+
+        /// The wide engine in its own frame — see `xorWide`.
+        noinline fn streamWide(out: []u8, counter: Counter, key: *const [key_length]u8, nonce: [nonce_length]u8) void {
+            const k = keyToWords(key.*);
+            const n = nonceWords(nonce_words, nonce);
+            var ctr = counter;
+            var i: usize = 0;
+
+            while (i + 64 * wide <= out.len) : (i += 64 * wide) {
+                keystream(wide, rounds, out[i..][0 .. 64 * wide], k, lastRow(wide, layout, ctr, n));
+                ctr +%= wide;
+            }
+            // Tail — see the matching note in `xor`, which this mirrors exactly:
+            // one wide group with the unused blocks discarded above the threshold,
+            // std below it. Branch on the output length only, which is public.
+            const rem = out.len - i;
+            if (rem > delegateLimit(delegate_max_bytes)) {
+                var ks: [64 * wide]u8 = undefined;
+                keystream(wide, rounds, &ks, k, lastRow(wide, layout, ctr, n));
+                @memcpy(out[i..], ks[0..rem]);
+            } else if (rem > 0) {
+                note(&chacha_path, .std_delegated);
+                Std.stream(out[i..], ctr, key.*, nonce);
+            }
+        }
+    };
+}
+
 /// IETF ChaCha20 stream cipher — 32-byte key, 12-byte nonce, 32-bit counter.
 /// API-compatible with `std.crypto.stream.chacha.ChaCha20IETF`.
-pub const ChaCha20 = struct {
-    pub const key_length = 32;
-    pub const nonce_length = 12;
-    pub const block_length = 64;
+pub const ChaCha20 = ChaChaStream(20, .ietf);
+/// IETF ChaCha with 12 rounds. API-compatible with `std`'s `ChaCha12IETF`.
+pub const ChaCha12 = ChaChaStream(12, .ietf);
+/// IETF ChaCha with 8 rounds. API-compatible with `std`'s `ChaCha8IETF`.
+pub const ChaCha8 = ChaChaStream(8, .ietf);
+/// Original ChaCha20 — 8-byte nonce, 64-bit counter. API-compatible with
+/// `std`'s `ChaCha20With64BitNonce` and libsodium's `crypto_stream_chacha20`.
+pub const ChaCha20With64BitNonce = ChaChaStream(20, .nonce64);
+/// Original ChaCha12 (8-byte nonce, 64-bit counter).
+pub const ChaCha12With64BitNonce = ChaChaStream(12, .nonce64);
+/// Original ChaCha8 (8-byte nonce, 64-bit counter).
+pub const ChaCha8With64BitNonce = ChaChaStream(8, .nonce64);
 
-    /// XOR the ChaCha20 keystream (starting at block `counter`) into `in`,
-    /// writing to `out`. `out.len == in.len`. NOT authenticated on its own.
-    ///
-    /// `out` and `in` must be either the **same** slice (in-place, which is what
-    /// the AEAD and every network consumer does) or **disjoint**. Partially
-    /// overlapping slices are not supported — the fused path reads a whole
-    /// 64-byte block before writing it, as std's block-buffered `xor` does.
-    pub fn xor(out: []u8, in: []const u8, counter: u32, key: [key_length]u8, nonce: [nonce_length]u8) void {
-        defer burnFor(in.len <= delegateLimit(delegate_max_bytes));
-        xorBody(out, in, counter, &key, nonce);
+// ── XChaCha (draft-irtf-cfrg-xchacha-03) ─────────────────────────────────────
+
+/// HChaCha with `rounds` rounds (draft-irtf-cfrg-xchacha-03 §2.2): the ChaCha
+/// permutation over (sigma, key, `input`) with NO feed-forward, returning
+/// words 0..3 and 12..15. The result is a key — secret; the caller wipes it.
+/// Scalar: it runs once per call, ahead of the bulk engine.
+fn hchacha(comptime rounds: comptime_int, key: *const [32]u8, input: *const [16]u8) [32]u8 {
+    var x: [16]u32 = undefined;
+    x[0..4].* = sigma;
+    inline for (0..8) |i| x[4 + i] = mem.readInt(u32, key[i * 4 ..][0..4], .little);
+    inline for (0..4) |i| x[12 + i] = mem.readInt(u32, input[i * 4 ..][0..4], .little);
+    comptime var round: usize = 0;
+    inline while (round < rounds / 2) : (round += 1) {
+        quarterRound(u32, &x, 0, 4, 8, 12);
+        quarterRound(u32, &x, 1, 5, 9, 13);
+        quarterRound(u32, &x, 2, 6, 10, 14);
+        quarterRound(u32, &x, 3, 7, 11, 15);
+        quarterRound(u32, &x, 0, 5, 10, 15);
+        quarterRound(u32, &x, 1, 6, 11, 12);
+        quarterRound(u32, &x, 2, 7, 8, 13);
+        quarterRound(u32, &x, 3, 4, 9, 14);
     }
-
-    /// `xor` with the key by pointer: no key copy in the caller's frame (the
-    /// dead-stack-clean form; `xor` takes std's by-value shape).
-    pub fn xorInto(out: []u8, in: []const u8, counter: u32, key: *const [key_length]u8, nonce: [nonce_length]u8) void {
-        defer burnFor(in.len <= delegateLimit(delegate_max_bytes));
-        xorBody(out, in, counter, key, nonce);
+    var out: [32]u8 = undefined;
+    inline for (0..4) |i| {
+        mem.writeInt(u32, out[i * 4 ..][0..4], x[i], .little);
+        mem.writeInt(u32, out[16 + i * 4 ..][0..4], x[12 + i], .little);
     }
+    std.crypto.secureZero(u32, &x);
+    return out;
+}
 
-    /// `xor`'s body, one frame down so `burnFor` reaches what it left (see
-    /// `burnStack`). The AEAD calls this directly and burns once itself.
-    noinline fn xorBody(out: []u8, in: []const u8, counter: u32, key: *const [key_length]u8, nonce: [nonce_length]u8) void {
-        std.debug.assert(out.len == in.len);
-        // In EVERY build — see `counterWouldWrap`.
-        if (counterWouldWrap(in.len, counter)) @panic(counter_wrap_message);
-        // Short whole call -> std, before anything else happens. See
-        // `delegate_max_bytes`. This is a strict SUBSET of the tail branch at
-        // the bottom (if it fires, the group loop cannot run and `rem` would
-        // equal `in.len`), so the two comparisons cannot disagree about which
-        // engine a given length gets; it exists only to return before the
-        // function builds the wide path's 512-byte stack frame and splits the
-        // key/nonce into words. Measured worth ~6 ns of a ~108 ns call — the
-        // difference between 0.95x and 1.01x against std at 16 bytes.
-        //
-        // Branch on the message LENGTH, which is public (it is on the wire
-        // before a byte is decrypted). Never on key or plaintext.
-        if (in.len <= delegateLimit(delegate_max_bytes)) {
-            note(&chacha_path, .std_delegated);
-            return StdChaCha.xor(out, in, counter, key.*, nonce);
+/// HChaCha20 (draft-irtf-cfrg-xchacha-03 §2.2): the 32-byte subkey XChaCha20
+/// derives from `key` and a 16-byte `input`, written to `out`. As Go's
+/// `chacha20.HChaCha20` and libsodium's `crypto_core_hchacha20` — for
+/// constructions that build their own extended-nonce scheme. `out` is a key:
+/// wipe it when done.
+pub fn hchacha20(out: *[32]u8, key: *const [32]u8, input: *const [16]u8) void {
+    defer burnStack(hchacha_burn);
+    hchachaBody(out, key, input);
+}
+
+/// `hchacha20`'s body, one frame down so the burn reaches its state words.
+noinline fn hchachaBody(out: *[32]u8, key: *const [32]u8, input: *const [16]u8) void {
+    out.* = hchacha(20, key, input);
+}
+
+/// HChaCha's frame is its 16 state words and a few spills (scalar, no
+/// tail buffer); 1 KiB covers it with room to spare.
+const hchacha_burn = 1024;
+
+/// The XChaCha subkey and IETF nonce for a 24-byte nonce: HChaCha over its
+/// first 16 bytes, then `0000 ‖ nonce[16..24]` (draft §2.3, std's `extend`).
+const Extended = struct { key: [32]u8, nonce: [12]u8 };
+
+fn extend(comptime rounds: comptime_int, key: *const [32]u8, nonce: [24]u8) Extended {
+    var e: Extended = .{ .key = hchacha(rounds, key, nonce[0..16]), .nonce = undefined };
+    @memset(e.nonce[0..4], 0);
+    e.nonce[4..].* = nonce[16..24].*;
+    return e;
+}
+
+/// XChaCha stream cipher (24-byte nonce, 32-bit counter) with `rounds` rounds.
+/// API-compatible with std's `XChaCha{20,12,8}IETF`.
+fn XChaChaStream(comptime rounds: comptime_int) type {
+    return struct {
+        pub const key_length = 32;
+        pub const nonce_length = 24;
+        pub const block_length = 64;
+
+        const Inner = ChaChaStream(rounds, .ietf);
+
+        /// XOR the keystream (starting at block `counter`) into `in`; see `ChaCha20.xor`.
+        pub fn xor(out: []u8, in: []const u8, counter: u32, key: [key_length]u8, nonce: [nonce_length]u8) void {
+            defer burnFor(in.len <= delegateLimit(delegate_max_bytes));
+            xorBody(out, in, counter, &key, nonce);
         }
-        note(&chacha_path, .wide);
 
-        const k = keyToWords(key.*);
-        const n = nonceToWords(nonce);
-        var ctr = counter;
-        var i: usize = 0;
-
-        // Whole groups: fused, no staging buffer.
-        while (i + 64 * wide <= in.len) : (i += 64 * wide) {
-            const x = chachaCore(wide, k, ctr, n);
-            xorBlocks(wide, out[i..][0 .. 64 * wide], in[i..][0 .. 64 * wide], x);
-            ctr +%= wide;
+        /// `xor` with the key by pointer (the dead-stack-clean form).
+        pub fn xorInto(out: []u8, in: []const u8, counter: u32, key: *const [key_length]u8, nonce: [nonce_length]u8) void {
+            defer burnFor(in.len <= delegateLimit(delegate_max_bytes));
+            xorBody(out, in, counter, key, nonce);
         }
 
-        // Tail: fewer than `wide` whole blocks left, so the group cannot be
-        // XORed in place and the keystream is staged (at most 512 bytes, once
-        // per call). Both branches below are on the *message length*, which is
-        // public — a ChaCha20 message length is visible on the wire before a
-        // byte of it is decrypted. NOTHING here may become a branch on key or
-        // plaintext; that would be a timing oracle, whereas this is not.
-        //
-        // When `in.len` is itself below the threshold the loop above never
-        // ran, so `rem == in.len` and this same branch is the whole call —
-        // which is the point. One comparison covers both "short message" and
-        // "short tail after the wide groups".
-        const rem = in.len - i;
-        if (rem > delegateLimit(delegate_max_bytes)) {
-            // A wide group costs about the same as ONE scalar block — same
-            // instruction count, `wide` times the width — so generating all
-            // `wide` blocks and discarding the unused suffix beats any
-            // narrower loop as soon as more than one block is left (measured:
-            // flat ~220 ns for every tail from 65 to 512 bytes). The discarded
-            // lanes may carry counters past 2^32-1 (`+% iota`); those bytes are
-            // never emitted, so the anti-wrap guarantee above is unaffected.
-            var ks: [64 * wide]u8 = undefined;
-            keystream(wide, &ks, k, ctr, n);
-            xorTail(out[i..], in[i..], ks[0..rem]);
-        } else if (rem > 0) {
-            // Under one block: std wins, so std runs it. See
-            // `delegate_max_bytes` for the measurement. This is what makes a
-            // WireGuard keepalive, a 40-byte tunnelled ACK, and the AEAD's
-            // 32-byte Poly1305-key derivation (paid by EVERY AEAD call, at
-            // every length) cost what std costs instead of ~25% more.
-            note(&chacha_path, .std_delegated);
-            StdChaCha.xor(out[i..], in[i..], ctr, key.*, nonce);
+        noinline fn xorBody(out: []u8, in: []const u8, counter: u32, key: *const [key_length]u8, nonce: [nonce_length]u8) void {
+            var e = extend(rounds, key, nonce);
+            defer std.crypto.secureZero(u8, &e.key);
+            Inner.xorBody(out, in, counter, &e.key, e.nonce);
         }
-    }
 
-    /// Write the raw ChaCha20 keystream (starting at block `counter`) into `out`.
-    pub fn stream(out: []u8, counter: u32, key: [key_length]u8, nonce: [nonce_length]u8) void {
-        defer burnFor(out.len <= delegateLimit(delegate_max_bytes));
-        streamBody(out, counter, &key, nonce);
-    }
-
-    /// `stream` with the key by pointer (the dead-stack-clean form).
-    pub fn streamInto(out: []u8, counter: u32, key: *const [key_length]u8, nonce: [nonce_length]u8) void {
-        defer burnFor(out.len <= delegateLimit(delegate_max_bytes));
-        streamBody(out, counter, key, nonce);
-    }
-
-    noinline fn streamBody(out: []u8, counter: u32, key: *const [key_length]u8, nonce: [nonce_length]u8) void {
-        // See `counterWouldWrap`: in every build, not just the safe ones.
-        if (counterWouldWrap(out.len, counter)) @panic(counter_wrap_message);
-        // Short whole call -> std; see the matching note in `xor`.
-        if (out.len <= delegateLimit(delegate_max_bytes)) {
-            note(&chacha_path, .std_delegated);
-            return StdChaCha.stream(out, counter, key.*, nonce);
+        /// Write the raw keystream (starting at block `counter`) into `out`.
+        pub fn stream(out: []u8, counter: u32, key: [key_length]u8, nonce: [nonce_length]u8) void {
+            defer burnFor(out.len <= delegateLimit(delegate_max_bytes));
+            streamBody(out, counter, &key, nonce);
         }
-        note(&chacha_path, .wide);
 
-        const k = keyToWords(key.*);
-        const n = nonceToWords(nonce);
-        var ctr = counter;
-        var i: usize = 0;
+        /// `stream` with the key by pointer (the dead-stack-clean form).
+        pub fn streamInto(out: []u8, counter: u32, key: *const [key_length]u8, nonce: [nonce_length]u8) void {
+            defer burnFor(out.len <= delegateLimit(delegate_max_bytes));
+            streamBody(out, counter, key, nonce);
+        }
 
-        while (i + 64 * wide <= out.len) : (i += 64 * wide) {
-            keystream(wide, out[i..][0 .. 64 * wide], k, ctr, n);
-            ctr +%= wide;
+        noinline fn streamBody(out: []u8, counter: u32, key: *const [key_length]u8, nonce: [nonce_length]u8) void {
+            var e = extend(rounds, key, nonce);
+            defer std.crypto.secureZero(u8, &e.key);
+            Inner.streamBody(out, counter, &e.key, e.nonce);
         }
-        // Tail — see the matching note in `xor`, which this mirrors exactly:
-        // one wide group with the unused blocks discarded above the threshold,
-        // std below it. Branch on the output length only, which is public.
-        const rem = out.len - i;
-        if (rem > delegateLimit(delegate_max_bytes)) {
-            var ks: [64 * wide]u8 = undefined;
-            keystream(wide, &ks, k, ctr, n);
-            @memcpy(out[i..], ks[0..rem]);
-        } else if (rem > 0) {
-            note(&chacha_path, .std_delegated);
-            StdChaCha.stream(out[i..], ctr, key.*, nonce);
-        }
-    }
-};
+    };
+}
+
+/// XChaCha20 (24-byte nonce). API-compatible with `std`'s `XChaCha20IETF`.
+pub const XChaCha20 = XChaChaStream(20);
+/// XChaCha12 (24-byte nonce, HChaCha12). API-compatible with `std`'s `XChaCha12IETF`.
+pub const XChaCha12 = XChaChaStream(12);
+/// XChaCha8 (24-byte nonce, HChaCha8). API-compatible with `std`'s `XChaCha8IETF`.
+pub const XChaCha8 = XChaChaStream(8);
 
 // ── dead-stack burn ──────────────────────────────────────────────────────────
 
@@ -692,123 +910,209 @@ const wide_path_burn = 4 * 1024;
 /// ratio is below 1.00x.
 const aead_delegate_max = 128;
 
+/// std's AEAD for `rounds` — the oracle and the short path, as `StdAead` is
+/// for ChaCha20-Poly1305.
+fn StdAeadOf(comptime rounds: comptime_int) type {
+    const c = std.crypto.aead.chacha_poly;
+    return switch (rounds) {
+        20 => c.ChaCha20Poly1305,
+        12 => c.ChaCha12Poly1305,
+        8 => c.ChaCha8Poly1305,
+        else => @compileError("chachapoly: rounds must be 20, 12 or 8"),
+    };
+}
+
+/// The RFC 8439 AEAD over ChaCha with `rounds` rounds. Byte-for-byte
+/// compatible with std's `ChaCha{20,12,8}Poly1305`.
+fn ChaChaPoly(comptime rounds: comptime_int) type {
+    return struct {
+        pub const tag_length = 16;
+        pub const nonce_length = 12;
+        pub const key_length = 32;
+
+        const Cipher = ChaChaStream(rounds, .ietf);
+        const Std = StdAeadOf(rounds);
+
+        /// Encrypt `m` into `c` (`c.len == m.len`) and write the auth tag to `tag`.
+        pub fn encrypt(c: []u8, tag: *[tag_length]u8, m: []const u8, ad: []const u8, npub: [nonce_length]u8, k: [key_length]u8) void {
+            defer burnFor(m.len + ad.len <= delegateLimit(aead_delegate_max));
+            encryptBody(c, tag, m, ad, npub, &k);
+        }
+
+        /// `encrypt` with the key by pointer (the dead-stack-clean form).
+        pub fn encryptInto(c: []u8, tag: *[tag_length]u8, m: []const u8, ad: []const u8, npub: [nonce_length]u8, k: *const [key_length]u8) void {
+            defer burnFor(m.len + ad.len <= delegateLimit(aead_delegate_max));
+            encryptBody(c, tag, m, ad, npub, k);
+        }
+
+        /// `encrypt`'s body, one frame down so `burnFor` reaches what it left.
+        noinline fn encryptBody(c: []u8, tag: *[tag_length]u8, m: []const u8, ad: []const u8, npub: [nonce_length]u8, k: *const [key_length]u8) void {
+            std.debug.assert(c.len == m.len);
+
+            // Short total -> run std's AEAD unchanged. See `aead_delegate_max`.
+            // The branch is on the two LENGTHS, both of which are public: a
+            // packet's size and its AD's size are visible to anyone on the path
+            // before any of it is authenticated. Nothing secret may ever be added
+            // to this condition — a branch on key or plaintext would be a timing
+            // oracle, a branch on a length is not.
+            if (m.len + ad.len <= delegateLimit(aead_delegate_max)) {
+                note(&aead_path, .std_delegated);
+                return Std.encrypt(c, tag, m, ad, npub, k.*);
+            }
+            note(&aead_path, .wide);
+
+            var poly_key = [_]u8{0} ** 32;
+            Cipher.xorBody(poly_key[0..], poly_key[0..], 0, k, npub);
+
+            Cipher.xorBody(c[0..m.len], m, 1, k, npub);
+
+            var mac = Poly1305.init(poly_key[0..]);
+            mac.update(ad);
+            pad16(&mac, ad.len);
+            mac.update(c[0..m.len]);
+            pad16(&mac, m.len);
+            var lens: [16]u8 = undefined;
+            mem.writeInt(u64, lens[0..8], ad.len, .little);
+            mem.writeInt(u64, lens[8..16], m.len, .little);
+            mac.update(lens[0..]);
+            mac.final(tag);
+        }
+
+        /// Verify `tag` and decrypt `c` into `m` (`c.len == m.len`).
+        /// On failure returns `error.AuthenticationFailed` and `m` is zeroed.
+        pub fn decrypt(m: []u8, c: []const u8, tag: [tag_length]u8, ad: []const u8, npub: [nonce_length]u8, k: [key_length]u8) AuthenticationError!void {
+            defer burnFor(c.len + ad.len <= delegateLimit(aead_delegate_max));
+            return decryptBody(m, c, tag, ad, npub, &k);
+        }
+
+        /// `decrypt` with the key by pointer (the dead-stack-clean form).
+        pub fn decryptInto(m: []u8, c: []const u8, tag: [tag_length]u8, ad: []const u8, npub: [nonce_length]u8, k: *const [key_length]u8) AuthenticationError!void {
+            defer burnFor(c.len + ad.len <= delegateLimit(aead_delegate_max));
+            return decryptBody(m, c, tag, ad, npub, k);
+        }
+
+        noinline fn decryptBody(m: []u8, c: []const u8, tag: [tag_length]u8, ad: []const u8, npub: [nonce_length]u8, k: *const [key_length]u8) AuthenticationError!void {
+            std.debug.assert(c.len == m.len);
+
+            // Short total -> std's AEAD. Same public-length branch as `encrypt`;
+            // see `aead_delegate_max`.
+            if (c.len + ad.len <= delegateLimit(aead_delegate_max)) {
+                note(&aead_path, .std_delegated);
+                Std.decrypt(m, c, tag, ad, npub, k.*) catch |e| {
+                    // The one place the delegation is NOT a straight hand-off.
+                    // std documents `m` as *undefined* after a rejection and
+                    // implements that as `@memset(m, undefined)`, which is a hint
+                    // ReleaseFast elides — so a caller's pre-loaded bytes survive.
+                    // This module documents `m` as ZEROED and a test asserts it
+                    // (see "decrypt zeroes the output buffer ... (audit F3)",
+                    // whose 25-byte message runs exactly this path). Carry the
+                    // stronger promise across the seam rather than quietly
+                    // weakening it for short messages.
+                    std.crypto.secureZero(u8, m);
+                    return e;
+                };
+                return;
+            }
+            note(&aead_path, .wide);
+
+            var poly_key = [_]u8{0} ** 32;
+            Cipher.xorBody(poly_key[0..], poly_key[0..], 0, k, npub);
+
+            var mac = Poly1305.init(poly_key[0..]);
+            mac.update(ad);
+            pad16(&mac, ad.len);
+            mac.update(c);
+            pad16(&mac, c.len);
+            var lens: [16]u8 = undefined;
+            mem.writeInt(u64, lens[0..8], ad.len, .little);
+            mem.writeInt(u64, lens[8..16], c.len, .little);
+            mac.update(lens[0..]);
+            var computed_tag: [16]u8 = undefined;
+            mac.final(&computed_tag);
+
+            if (!std.crypto.timing_safe.eql([tag_length]u8, computed_tag, tag)) {
+                std.crypto.secureZero(u8, &computed_tag);
+                // Honour the doc contract: actually zero `m` on auth failure. std uses
+                // `@memset(m, undefined)` (a no-op hint elided in ReleaseFast); a
+                // `secureZero` makes the "m is zeroed" promise true in every build and
+                // clears any caller-preloaded bytes without leaking plaintext (which
+                // this path never wrote — the keystream xor below is post-check).
+                std.crypto.secureZero(u8, m);
+                return error.AuthenticationFailed;
+            }
+            Cipher.xorBody(m[0..c.len], c, 1, k, npub);
+        }
+    };
+}
+
 /// ChaCha20-Poly1305 AEAD, as designed for TLS/RFC 8439. Byte-for-byte
 /// compatible with `std.crypto.aead.chacha_poly.ChaCha20Poly1305`.
-pub const ChaCha20Poly1305 = struct {
-    pub const tag_length = 16;
-    pub const nonce_length = 12;
-    pub const key_length = 32;
+pub const ChaCha20Poly1305 = ChaChaPoly(20);
+/// ChaCha12-Poly1305 (RFC 8439 construction, 12 rounds). Byte-for-byte
+/// compatible with `std`'s `ChaCha12Poly1305`.
+pub const ChaCha12Poly1305 = ChaChaPoly(12);
+/// ChaCha8-Poly1305 (RFC 8439 construction, 8 rounds). Byte-for-byte
+/// compatible with `std`'s `ChaCha8Poly1305`.
+pub const ChaCha8Poly1305 = ChaChaPoly(8);
 
-    /// Encrypt `m` into `c` (`c.len == m.len`) and write the auth tag to `tag`.
-    pub fn encrypt(c: []u8, tag: *[tag_length]u8, m: []const u8, ad: []const u8, npub: [nonce_length]u8, k: [key_length]u8) void {
-        defer burnFor(m.len + ad.len <= delegateLimit(aead_delegate_max));
-        encryptBody(c, tag, m, ad, npub, &k);
-    }
+/// XChaCha-Poly1305 (draft-irtf-cfrg-xchacha-03 §2.3): HChaCha derives a
+/// subkey from the key and the first 16 nonce bytes, then the RFC 8439 AEAD
+/// runs under it with nonce `0000 ‖ nonce[16..24]`. A 24-byte nonce is safe to
+/// draw at random. Byte-for-byte compatible with std's `XChaCha{20,12,8}Poly1305`,
+/// libsodium's `crypto_aead_xchacha20poly1305_ietf_*` and Go's `NewX`.
+fn XChaChaPoly(comptime rounds: comptime_int) type {
+    return struct {
+        pub const tag_length = 16;
+        pub const nonce_length = 24;
+        pub const key_length = 32;
 
-    /// `encrypt` with the key by pointer (the dead-stack-clean form).
-    pub fn encryptInto(c: []u8, tag: *[tag_length]u8, m: []const u8, ad: []const u8, npub: [nonce_length]u8, k: *const [key_length]u8) void {
-        defer burnFor(m.len + ad.len <= delegateLimit(aead_delegate_max));
-        encryptBody(c, tag, m, ad, npub, k);
-    }
+        const Inner = ChaChaPoly(rounds);
 
-    /// `encrypt`'s body, one frame down so `burnFor` reaches what it left.
-    noinline fn encryptBody(c: []u8, tag: *[tag_length]u8, m: []const u8, ad: []const u8, npub: [nonce_length]u8, k: *const [key_length]u8) void {
-        std.debug.assert(c.len == m.len);
-
-        // Short total -> run std's AEAD unchanged. See `aead_delegate_max`.
-        // The branch is on the two LENGTHS, both of which are public: a
-        // packet's size and its AD's size are visible to anyone on the path
-        // before any of it is authenticated. Nothing secret may ever be added
-        // to this condition — a branch on key or plaintext would be a timing
-        // oracle, a branch on a length is not.
-        if (m.len + ad.len <= delegateLimit(aead_delegate_max)) {
-            note(&aead_path, .std_delegated);
-            return StdAead.encrypt(c, tag, m, ad, npub, k.*);
+        /// Encrypt `m` into `c` (`c.len == m.len`) and write the auth tag to `tag`.
+        pub fn encrypt(c: []u8, tag: *[tag_length]u8, m: []const u8, ad: []const u8, npub: [nonce_length]u8, k: [key_length]u8) void {
+            defer burnFor(m.len + ad.len <= delegateLimit(aead_delegate_max));
+            encryptBody(c, tag, m, ad, npub, &k);
         }
-        note(&aead_path, .wide);
 
-        var poly_key = [_]u8{0} ** 32;
-        ChaCha20.xorBody(poly_key[0..], poly_key[0..], 0, k, npub);
-
-        ChaCha20.xorBody(c[0..m.len], m, 1, k, npub);
-
-        var mac = Poly1305.init(poly_key[0..]);
-        mac.update(ad);
-        pad16(&mac, ad.len);
-        mac.update(c[0..m.len]);
-        pad16(&mac, m.len);
-        var lens: [16]u8 = undefined;
-        mem.writeInt(u64, lens[0..8], ad.len, .little);
-        mem.writeInt(u64, lens[8..16], m.len, .little);
-        mac.update(lens[0..]);
-        mac.final(tag);
-    }
-
-    /// Verify `tag` and decrypt `c` into `m` (`c.len == m.len`).
-    /// On failure returns `error.AuthenticationFailed` and `m` is zeroed.
-    pub fn decrypt(m: []u8, c: []const u8, tag: [tag_length]u8, ad: []const u8, npub: [nonce_length]u8, k: [key_length]u8) AuthenticationError!void {
-        defer burnFor(c.len + ad.len <= delegateLimit(aead_delegate_max));
-        return decryptBody(m, c, tag, ad, npub, &k);
-    }
-
-    /// `decrypt` with the key by pointer (the dead-stack-clean form).
-    pub fn decryptInto(m: []u8, c: []const u8, tag: [tag_length]u8, ad: []const u8, npub: [nonce_length]u8, k: *const [key_length]u8) AuthenticationError!void {
-        defer burnFor(c.len + ad.len <= delegateLimit(aead_delegate_max));
-        return decryptBody(m, c, tag, ad, npub, k);
-    }
-
-    noinline fn decryptBody(m: []u8, c: []const u8, tag: [tag_length]u8, ad: []const u8, npub: [nonce_length]u8, k: *const [key_length]u8) AuthenticationError!void {
-        std.debug.assert(c.len == m.len);
-
-        // Short total -> std's AEAD. Same public-length branch as `encrypt`;
-        // see `aead_delegate_max`.
-        if (c.len + ad.len <= delegateLimit(aead_delegate_max)) {
-            note(&aead_path, .std_delegated);
-            StdAead.decrypt(m, c, tag, ad, npub, k.*) catch |e| {
-                // The one place the delegation is NOT a straight hand-off.
-                // std documents `m` as *undefined* after a rejection and
-                // implements that as `@memset(m, undefined)`, which is a hint
-                // ReleaseFast elides — so a caller's pre-loaded bytes survive.
-                // This module documents `m` as ZEROED and a test asserts it
-                // (see "decrypt zeroes the output buffer ... (audit F3)",
-                // whose 25-byte message runs exactly this path). Carry the
-                // stronger promise across the seam rather than quietly
-                // weakening it for short messages.
-                std.crypto.secureZero(u8, m);
-                return e;
-            };
-            return;
+        /// `encrypt` with the key by pointer (the dead-stack-clean form).
+        pub fn encryptInto(c: []u8, tag: *[tag_length]u8, m: []const u8, ad: []const u8, npub: [nonce_length]u8, k: *const [key_length]u8) void {
+            defer burnFor(m.len + ad.len <= delegateLimit(aead_delegate_max));
+            encryptBody(c, tag, m, ad, npub, k);
         }
-        note(&aead_path, .wide);
 
-        var poly_key = [_]u8{0} ** 32;
-        ChaCha20.xorBody(poly_key[0..], poly_key[0..], 0, k, npub);
-
-        var mac = Poly1305.init(poly_key[0..]);
-        mac.update(ad);
-        pad16(&mac, ad.len);
-        mac.update(c);
-        pad16(&mac, c.len);
-        var lens: [16]u8 = undefined;
-        mem.writeInt(u64, lens[0..8], ad.len, .little);
-        mem.writeInt(u64, lens[8..16], c.len, .little);
-        mac.update(lens[0..]);
-        var computed_tag: [16]u8 = undefined;
-        mac.final(&computed_tag);
-
-        if (!std.crypto.timing_safe.eql([tag_length]u8, computed_tag, tag)) {
-            std.crypto.secureZero(u8, &computed_tag);
-            // Honour the doc contract: actually zero `m` on auth failure. std uses
-            // `@memset(m, undefined)` (a no-op hint elided in ReleaseFast); a
-            // `secureZero` makes the "m is zeroed" promise true in every build and
-            // clears any caller-preloaded bytes without leaking plaintext (which
-            // this path never wrote — the keystream xor below is post-check).
-            std.crypto.secureZero(u8, m);
-            return error.AuthenticationFailed;
+        noinline fn encryptBody(c: []u8, tag: *[tag_length]u8, m: []const u8, ad: []const u8, npub: [nonce_length]u8, k: *const [key_length]u8) void {
+            var e = extend(rounds, k, npub);
+            defer std.crypto.secureZero(u8, &e.key);
+            Inner.encryptBody(c, tag, m, ad, e.nonce, &e.key);
         }
-        ChaCha20.xorBody(m[0..c.len], c, 1, k, npub);
-    }
-};
+
+        /// Verify `tag` and decrypt `c` into `m` (`c.len == m.len`).
+        /// On failure returns `error.AuthenticationFailed` and `m` is zeroed.
+        pub fn decrypt(m: []u8, c: []const u8, tag: [tag_length]u8, ad: []const u8, npub: [nonce_length]u8, k: [key_length]u8) AuthenticationError!void {
+            defer burnFor(c.len + ad.len <= delegateLimit(aead_delegate_max));
+            return decryptBody(m, c, tag, ad, npub, &k);
+        }
+
+        /// `decrypt` with the key by pointer (the dead-stack-clean form).
+        pub fn decryptInto(m: []u8, c: []const u8, tag: [tag_length]u8, ad: []const u8, npub: [nonce_length]u8, k: *const [key_length]u8) AuthenticationError!void {
+            defer burnFor(c.len + ad.len <= delegateLimit(aead_delegate_max));
+            return decryptBody(m, c, tag, ad, npub, k);
+        }
+
+        noinline fn decryptBody(m: []u8, c: []const u8, tag: [tag_length]u8, ad: []const u8, npub: [nonce_length]u8, k: *const [key_length]u8) AuthenticationError!void {
+            var e = extend(rounds, k, npub);
+            defer std.crypto.secureZero(u8, &e.key);
+            return Inner.decryptBody(m, c, tag, ad, e.nonce, &e.key);
+        }
+    };
+}
+
+/// XChaCha20-Poly1305 (24-byte nonce). See `XChaChaPoly`.
+pub const XChaCha20Poly1305 = XChaChaPoly(20);
+/// XChaCha12-Poly1305 (24-byte nonce, HChaCha12), as `std`'s `XChaCha12Poly1305`.
+pub const XChaCha12Poly1305 = XChaChaPoly(12);
+/// XChaCha8-Poly1305 (24-byte nonce, HChaCha8), as `std`'s `XChaCha8Poly1305`.
+pub const XChaCha8Poly1305 = XChaChaPoly(8);
 
 /// Poly1305 zero-padding to the next 16-byte boundary.
 fn pad16(mac: *Poly1305, len: usize) void {
@@ -1851,7 +2155,7 @@ test "the counter-space boundary runs through THIS module's engine, not std's" {
     defer force_wide = false;
 
     for ([_]u32{ std.math.maxInt(u32), std.math.maxInt(u32) - 1, std.math.maxInt(u32) - 3 }) |ctr| {
-        const room: usize = (@as(u64, std.math.maxInt(u32)) - ctr + 1) * 64;
+        const room: u64 = (@as(u64, std.math.maxInt(u32)) - ctr + 1) * 64;
         const len: usize = @intCast(@min(room, @as(u64, 256)));
         var mine: [256]u8 = undefined;
         var theirs: [256]u8 = undefined;
@@ -1962,4 +2266,242 @@ test "Wycheproof chacha20_poly1305_test.json: the RFC 8439 MAC input tags right 
     // (vector entry 96 / 192 / 192 B at L = 2 / 4 / 8 — L = 8 starts on its
     // 4-lane half engine; L = 1 is std's).
     try testing.expectEqualSlices(usize, &.{ 0, 151, 38, 38 }, &wide_runs);
+}
+
+// ── the round-count, 64-bit-nonce and XChaCha variants ───────────────────────
+
+/// Every variant this module ships, paired with std's type of the same shape.
+const stream_pairs = .{
+    .{ ChaCha20, std.crypto.stream.chacha.ChaCha20IETF },
+    .{ ChaCha12, std.crypto.stream.chacha.ChaCha12IETF },
+    .{ ChaCha8, std.crypto.stream.chacha.ChaCha8IETF },
+    .{ ChaCha20With64BitNonce, std.crypto.stream.chacha.ChaCha20With64BitNonce },
+    .{ ChaCha12With64BitNonce, std.crypto.stream.chacha.ChaCha12With64BitNonce },
+    .{ ChaCha8With64BitNonce, std.crypto.stream.chacha.ChaCha8With64BitNonce },
+    .{ XChaCha20, std.crypto.stream.chacha.XChaCha20IETF },
+    .{ XChaCha12, std.crypto.stream.chacha.XChaCha12IETF },
+    .{ XChaCha8, std.crypto.stream.chacha.XChaCha8IETF },
+};
+const aead_pairs = .{
+    .{ ChaCha20Poly1305, std.crypto.aead.chacha_poly.ChaCha20Poly1305 },
+    .{ ChaCha12Poly1305, std.crypto.aead.chacha_poly.ChaCha12Poly1305 },
+    .{ ChaCha8Poly1305, std.crypto.aead.chacha_poly.ChaCha8Poly1305 },
+    .{ XChaCha20Poly1305, std.crypto.aead.chacha_poly.XChaCha20Poly1305 },
+    .{ XChaCha12Poly1305, std.crypto.aead.chacha_poly.XChaCha12Poly1305 },
+    .{ XChaCha8Poly1305, std.crypto.aead.chacha_poly.XChaCha8Poly1305 },
+};
+
+const variant_lens = [_]usize{ 0, 1, 63, 64, 65, 127, 128, 129, 191, 192, 255, 256, 511, 512, 513, 575, 576, 1000, 1420, 4103 };
+
+test "every stream variant: xor and stream byte-exact vs std, both engines, edge lengths and counters" {
+    var rng = std.Random.DefaultPrng.init(0x5eed_c4a7);
+    const rand = rng.random();
+    var msg: [4103]u8 = undefined;
+    rand.bytes(&msg);
+    inline for (stream_pairs) |pair| {
+        const Ours = pair[0];
+        const Theirs = pair[1];
+        const Counter = @typeInfo(@TypeOf(Theirs.xor)).@"fn".params[2].type.?;
+        var key: [32]u8 = undefined;
+        var nonce: [Ours.nonce_length]u8 = undefined;
+        rand.bytes(&key);
+        rand.bytes(&nonce);
+        comptime std.debug.assert(Ours.nonce_length == Theirs.nonce_length);
+        // 2^32 - 3: the 64-bit counter carries into word 13 inside a wide group
+        // (lanes 3..7), which a 32-bit counter never does.
+        const counters = if (Counter == u64)
+            [_]u64{ 0, 1, (1 << 32) - 3, (1 << 32) - 1, 1 << 32, math.maxInt(u64) - 80 }
+        else
+            [_]u32{ 0, 1, 7, math.maxInt(u32) - 80 };
+        for (counters) |ctr| {
+            for (variant_lens) |len| {
+                for ([_]bool{ false, true }) |fw| {
+                    force_wide = fw;
+                    defer force_wide = false;
+                    var ours: [4103]u8 = undefined;
+                    var theirs: [4103]u8 = undefined;
+                    Ours.xor(ours[0..len], msg[0..len], ctr, key, nonce);
+                    Theirs.xor(theirs[0..len], msg[0..len], ctr, key, nonce);
+                    try testing.expectEqualSlices(u8, theirs[0..len], ours[0..len]);
+                    Ours.stream(ours[0..len], ctr, key, nonce);
+                    Theirs.stream(theirs[0..len], ctr, key, nonce);
+                    try testing.expectEqualSlices(u8, theirs[0..len], ours[0..len]);
+                    if (fw and len > 0) try testing.expectEqual(Path.wide, chacha_path);
+                }
+            }
+        }
+    }
+}
+
+test "every AEAD variant: seal/open/tamper byte-exact vs std, both engines" {
+    var rng = std.Random.DefaultPrng.init(0xae_ad_5eed);
+    const rand = rng.random();
+    var msg: [4103]u8 = undefined;
+    var ad: [300]u8 = undefined;
+    rand.bytes(&msg);
+    rand.bytes(&ad);
+    inline for (aead_pairs) |pair| {
+        const Ours = pair[0];
+        const Theirs = pair[1];
+        var key: [32]u8 = undefined;
+        var nonce: [Ours.nonce_length]u8 = undefined;
+        rand.bytes(&key);
+        rand.bytes(&nonce);
+        for ([_]usize{ 0, 13, 300 }) |ad_len| {
+            for (variant_lens) |len| {
+                for ([_]bool{ false, true }) |fw| {
+                    force_wide = fw;
+                    defer force_wide = false;
+                    var c: [4103]u8 = undefined;
+                    var c_std: [4103]u8 = undefined;
+                    var tag: [16]u8 = undefined;
+                    var tag_std: [16]u8 = undefined;
+                    Ours.encrypt(c[0..len], &tag, msg[0..len], ad[0..ad_len], nonce, key);
+                    Theirs.encrypt(c_std[0..len], &tag_std, msg[0..len], ad[0..ad_len], nonce, key);
+                    try testing.expectEqualSlices(u8, c_std[0..len], c[0..len]);
+                    try testing.expectEqualSlices(u8, &tag_std, &tag);
+                    if (fw and len + ad_len > 0) try testing.expectEqual(Path.wide, aead_path);
+
+                    var back: [4103]u8 = undefined;
+                    try Ours.decrypt(back[0..len], c[0..len], tag, ad[0..ad_len], nonce, key);
+                    try testing.expectEqualSlices(u8, msg[0..len], back[0..len]);
+
+                    var bad = tag;
+                    bad[len % 16] ^= 0x01;
+                    @memset(back[0..len], 0xaa);
+                    try testing.expectError(error.AuthenticationFailed, Ours.decrypt(back[0..len], c[0..len], bad, ad[0..ad_len], nonce, key));
+                    for (back[0..len]) |byte| try testing.expectEqual(@as(u8, 0), byte);
+                    var bad_nonce = nonce;
+                    bad_nonce[Ours.nonce_length - 1] ^= 0x80; // the HChaCha-free half for XChaCha
+                    try testing.expectError(error.AuthenticationFailed, Ours.decrypt(back[0..len], c[0..len], tag, ad[0..ad_len], bad_nonce, key));
+                    bad_nonce = nonce;
+                    bad_nonce[0] ^= 0x01; // the HChaCha input for XChaCha
+                    try testing.expectError(error.AuthenticationFailed, Ours.decrypt(back[0..len], c[0..len], tag, ad[0..ad_len], bad_nonce, key));
+                }
+            }
+        }
+    }
+}
+
+test "the 64-bit counter anti-wrap rule: the last block of the 2^64 space is accepted" {
+    const max = math.maxInt(u64);
+    try testing.expect(!counterWouldWrap64(0, max));
+    try testing.expect(!counterWouldWrap64(64, max));
+    try testing.expect(counterWouldWrap64(65, max));
+    try testing.expect(!counterWouldWrap64(64 * 81, max - 80));
+    try testing.expect(counterWouldWrap64(64 * 81 + 1, max - 80));
+    try testing.expect(!counterWouldWrap64(math.maxInt(usize), 0));
+    // The last block runs through this module's engine and matches std's.
+    const key: [32]u8 = @splat(0x42);
+    const nonce: [8]u8 = @splat(0x24);
+    var ours: [64 * 81]u8 = undefined;
+    var theirs: [64 * 81]u8 = undefined;
+    force_wide = true;
+    defer force_wide = false;
+    ChaCha20With64BitNonce.stream(&ours, max - 80, key, nonce);
+    try testing.expectEqual(Path.wide, chacha_path);
+    std.crypto.stream.chacha.ChaCha20With64BitNonce.stream(&theirs, max - 80, key, nonce);
+    try testing.expectEqualSlices(u8, &theirs, &ours);
+}
+
+const sodium = @import("testdata/libsodium.zig");
+
+test "HChaCha20: draft-irtf-cfrg-xchacha-03 §2.2.1 vector (libsodium's output)" {
+    var key: [32]u8 = undefined;
+    var input: [16]u8 = undefined;
+    var want: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&key, sodium.hchacha_key);
+    _ = try std.fmt.hexToBytes(&input, sodium.hchacha_in);
+    _ = try std.fmt.hexToBytes(&want, sodium.hchacha_out);
+    var got: [32]u8 = undefined;
+    hchacha20(&got, &key, &input);
+    try testing.expectEqualSlices(u8, &want, &got);
+}
+
+test "libsodium goldens: original 64-bit-nonce ChaCha20, XChaCha20 stream, XChaCha20-Poly1305" {
+    // Inputs rebuilt by `sodium.fill`; each row holds SHA-256 of libsodium
+    // 1.0.18's output (`tools/libsodium_goldens.py`). Both engines per row.
+    var counts = [_]usize{ 0, 0, 0 };
+    var buf: [sodium.max_len + 16]u8 = undefined;
+    var msg: [sodium.max_len]u8 = undefined;
+    var ad: [300]u8 = undefined;
+    for (sodium.rows) |row| {
+        counts[@intFromEnum(row.kind)] += 1;
+        var want: [32]u8 = undefined;
+        _ = try std.fmt.hexToBytes(&want, row.sha256);
+        for ([_]bool{ false, true }) |fw| {
+            force_wide = fw;
+            defer force_wide = false;
+            const out = switch (row.kind) {
+                .nonce64 => blk: {
+                    sodium.fillSlice(msg[0..row.len], 1);
+                    ChaCha20With64BitNonce.xor(buf[0..row.len], msg[0..row.len], row.arg, sodium.fill(32, 3), sodium.fill(8, 2));
+                    break :blk buf[0..row.len];
+                },
+                .xchacha20 => blk: {
+                    sodium.fillSlice(msg[0..row.len], 4);
+                    XChaCha20.xor(buf[0..row.len], msg[0..row.len], @intCast(row.arg), sodium.fill(32, 6), sodium.fill(24, 5));
+                    break :blk buf[0..row.len];
+                },
+                .xaead => blk: {
+                    sodium.fillSlice(msg[0..row.len], 7);
+                    const ad_len: usize = @intCast(row.arg);
+                    sodium.fillSlice(ad[0..ad_len], 9);
+                    XChaCha20Poly1305.encrypt(buf[0..row.len], buf[row.len..][0..16], msg[0..row.len], ad[0..ad_len], sodium.fill(24, 8), sodium.fill(32, 10));
+                    break :blk buf[0 .. row.len + 16];
+                },
+            };
+            var got: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(out, &got, .{});
+            try testing.expectEqualSlices(u8, &want, &got);
+        }
+    }
+    // Pinned so a regenerated table that silently lost a class shows here.
+    try testing.expectEqualSlices(usize, &.{ 96, 48, 48 }, &counts);
+}
+
+// Wycheproof's XChaCha20-Poly1305 vectors (C2SP/wycheproof, Apache-2.0 data --
+// see NOTICE), made by `tools/wycheproof.py … 192`: every test with a 192-bit nonce.
+const wycheproof_x = @import("testdata/wycheproof_xchacha.zig").vectors;
+
+test "Wycheproof xchacha20_poly1305_test.json: valid vectors seal and open, invalid ones are refused" {
+    var counts = [2]usize{ 0, 0 };
+    for (wycheproof_x) |v| {
+        counts[@intFromBool(v.valid)] += 1;
+        var key: [32]u8 = undefined;
+        var iv: [24]u8 = undefined;
+        var tag: [16]u8 = undefined;
+        _ = try std.fmt.hexToBytes(&key, v.key);
+        _ = try std.fmt.hexToBytes(&iv, v.iv);
+        _ = try std.fmt.hexToBytes(&tag, v.tag);
+        var ad_buf: [1024]u8 = undefined;
+        var msg_buf: [1024]u8 = undefined;
+        var ct_buf: [1024]u8 = undefined;
+        const ad = try std.fmt.hexToBytes(&ad_buf, v.aad);
+        const msg = try std.fmt.hexToBytes(&msg_buf, v.msg);
+        const ct = try std.fmt.hexToBytes(&ct_buf, v.ct);
+        var out_buf: [1024]u8 = undefined;
+        const out = out_buf[0..msg.len];
+
+        for ([_]bool{ false, true }) |fw| {
+            force_wide = fw;
+            defer force_wide = false;
+            if (v.valid) {
+                var t: [16]u8 = undefined;
+                XChaCha20Poly1305.encrypt(out, &t, msg, ad, iv, key);
+                try testing.expectEqualSlices(u8, ct, out);
+                try testing.expectEqualSlices(u8, &tag, &t);
+                try XChaCha20Poly1305.decrypt(out, ct, tag, ad, iv, key);
+                try testing.expectEqualSlices(u8, msg, out);
+            } else {
+                @memset(out, 0xaa);
+                try testing.expectError(error.AuthenticationFailed, XChaCha20Poly1305.decrypt(out, ct, tag, ad, iv, key));
+                for (out) |byte| try testing.expectEqual(@as(u8, 0), byte);
+            }
+            if (fw) try testing.expectEqual(if (msg.len + ad.len == 0) Path.std_delegated else Path.wide, aead_path);
+        }
+    }
+    // Pinned so a regenerated table that silently lost a class shows here.
+    try testing.expectEqual(@as(usize, 246), counts[1]);
+    try testing.expectEqual(@as(usize, 60), counts[0]);
 }

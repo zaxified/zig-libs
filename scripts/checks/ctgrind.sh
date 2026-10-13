@@ -159,7 +159,7 @@ declare -A TARGETS=(
     # nothing to do with constant time. A row that cannot fail is not
     # evidence; see modules/bolt8/src/ctgrind_harness.zig.
     [bolt8]="dh keygen act3 transport"
-    [chachapoly]="poly1305 aead"
+    [chachapoly]="poly1305 aead xaead"
     [hqc]="decaps keygen encaps sampler"
     [oscore]="derive protect unprotect"
     # 2026-10-02: the MODP DH exponent (dhPowModPrime, montint) + `ffpow`, the
@@ -451,6 +451,7 @@ declare -A PATTERN=(
     # pattern to make a count go away. The expected non-zero is named in
     # ctgrind-expected.tsv.
     [chachapoly/aead]='root[.]zig|chacha20[.]zig|poly1305[.]zig'
+    [chachapoly/xaead]='root[.]zig|chacha20[.]zig|poly1305[.]zig'
     # bn254's own hand-written Montgomery field (commit 1892c814 replaced the
     # `std.crypto.ff` backend with it). `fp.zig` carries montMul/montSqr,
     # condSubP, subLimbs, ctSelect and the `blackBox` barrier; `g1.zig` the
@@ -831,6 +832,7 @@ declare -A LABEL=(
     [bn254/scalarmul]='bn254 g1+fp+scalar'
     [chachapoly/poly1305]='poly1305.zig'
     [chachapoly/aead]='aead: root+std'
+    [chachapoly/xaead]='xchacha aead + ctr64: root+std'
     [ct25519/ct25519]='ct25519/root.zig'
     [ct25519/std]='std 25519'
     [ct25519/comb]='ct25519 mulBase comb'

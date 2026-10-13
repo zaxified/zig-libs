@@ -1,4 +1,4 @@
-# chachapoly — SIMD ChaCha20-Poly1305 AEAD (RFC 8439)
+# chachapoly — SIMD ChaCha20-Poly1305 and XChaCha20-Poly1305 AEAD (RFC 8439)
 
 A **throughput-specialized** reimplementation of the ChaCha20 stream cipher and
 the ChaCha20-Poly1305 AEAD that `std.crypto` already ships. It exists purely for
@@ -9,9 +9,10 @@ collapses to one 128-bit lane and runs ~3.9× slower than OpenSSL's AVX2 ChaCha
 (measured framing: std ~478 MB/s vs OpenSSL ~1852 MB/s at 8 KiB). We can't patch
 `std`, so this is our own zero-C, `@Vector`-SIMD alternative.
 
-It is **byte-exact** to `std` and to RFC 8439 — verified both against the RFC
-known-answer vectors and differentially against
-`std.crypto.aead.chacha_poly.ChaCha20Poly1305` (the oracle). See `SPEC.md` for
+It is **byte-exact** to `std` and to RFC 8439 — verified against the RFC
+known-answer vectors, Wycheproof, libsodium and differentially against
+`std.crypto.aead.chacha_poly` / `std.crypto.stream.chacha` (the oracle) for
+every variant below. See `SPEC.md` for
 the design; metadata lives in `src/root.zig`'s `pub const meta`.
 
 ## What it provides
@@ -24,6 +25,21 @@ the design; metadata lives in `src/root.zig`'s `pub const meta`.
   `decrypt(m, c, tag, ad, npub, k) AuthenticationError!void`, byte-for-byte
   compatible with `std.crypto.aead.chacha_poly.ChaCha20Poly1305` (`tag_length`
   16, `nonce_length` 12, `key_length` 32).
+- `XChaCha20Poly1305` — the same AEAD with a 24-byte nonce (HChaCha20 subkey,
+  draft-irtf-cfrg-xchacha-03), safe to draw at random. Byte-for-byte as std's
+  `XChaCha20Poly1305`, libsodium's `crypto_aead_xchacha20poly1305_ietf_*` and
+  Go's `chacha20poly1305.NewX`.
+- The reduced-round and original-layout variants std has, same API shapes:
+  `ChaCha12`, `ChaCha8`, `XChaCha20`/`12`/`8` (stream, 24-byte nonce),
+  `ChaCha20With64BitNonce`/`12`/`8` (8-byte nonce, 64-bit counter, as libsodium's
+  `crypto_stream_chacha20`), `ChaCha12Poly1305`, `ChaCha8Poly1305`,
+  `XChaCha12Poly1305`, `XChaCha8Poly1305`.
+- `hchacha20(out, key, input)` — the HChaCha20 subkey derivation on its own
+  (Go's `chacha20.HChaCha20`, libsodium's `crypto_core_hchacha20`).
+
+Every key-taking entry point also has a pointer-keyed twin (`xorInto`,
+`streamInto`, `encryptInto`, `decryptInto`) that leaves no key copy in the
+caller's frame.
 
 Because the shapes match `std`, a consumer that speaks the std AEAD API
 (`signal`, `noise`, `wireguard`, `hpke`, `quic-crypto`, `bolt8`) can swap this in
@@ -41,6 +57,11 @@ cp.ChaCha20Poly1305.encrypt(&c, &tag, msg, ad, nonce, key);
 
 var m: [msg.len]u8 = undefined;
 try cp.ChaCha20Poly1305.decrypt(&m, &c, tag, ad, nonce, key); // error.AuthenticationFailed on tamper
+
+// Random 24-byte nonces: XChaCha20-Poly1305
+var xnonce: [24]u8 = undefined;
+try io.randomSecure(&xnonce); // a nonce must never repeat under one key
+cp.XChaCha20Poly1305.encrypt(&c, &tag, msg, ad, xnonce, key);
 
 // Raw ChaCha20 keystream (NOT authenticated on its own)
 cp.ChaCha20.xor(out, in, 1, key, nonce);
@@ -113,7 +134,12 @@ ChaCha20 `xor`/`stream` differential against `std` for **every** length 0..1024
 (`out == in`) at every one of those lengths plus in-place AEAD, an
 unaligned-offset sweep over all 64×64 input/output offset pairs, and a
 length-by-length Poly1305 differential against `std` for **every** length
-0..2048 at L ∈ {1,2,4,8}.
+0..2048 at L ∈ {1,2,4,8}. The variants: Wycheproof's 306 XChaCha20-Poly1305
+vectors (both engines), libsodium 1.0.18 goldens for the 64-bit-nonce stream
+(counters carrying across 2^32 and up to the end of the 2^64 space), the
+XChaCha20 stream, XChaCha20-Poly1305 and the draft's HChaCha20 vector, and a
+differential against std for all fifteen variant types at edge lengths, both
+engines.
 
 ## Provenance
 
@@ -133,5 +159,9 @@ byte-exact black-box correctness oracles (differential tests), not as design
 references — the black-box-oracle relationship root `NOTICE` §0 describes. The
 RFC 8439 §2.3.2/§2.4.2/§2.5.2/§2.8.2 test vectors are public IETF spec
 artifacts (a test oracle under §0, needing no attribution).
-`src/testdata/wycheproof.zig` reproduces 316 Wycheproof vectors, Apache-2.0
-test data — see [NOTICE](NOTICE), which must travel with the module.
+`src/testdata/wycheproof.zig` and `src/testdata/wycheproof_xchacha.zig`
+reproduce 316 + 306 Wycheproof vectors, Apache-2.0 test data — see
+[NOTICE](NOTICE), which must travel with the module. `src/testdata/libsodium.zig`
+holds SHA-256 digests of libsodium's outputs (a black-box oracle, made by
+`tools/libsodium_goldens.py`), plus the draft-irtf-cfrg-xchacha-03 §2.2.1
+HChaCha20 input and output.

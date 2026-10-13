@@ -27,8 +27,8 @@ const builtin = @import("builtin");
 const cp = @import("root.zig");
 
 const WINDOW = 256 * 1024;
-const needle_count = 3;
-const needle_names = [needle_count][]const u8{ "key", "poly key r||s", "poly key r clamped || s" };
+const needle_count = 5;
+const needle_names = [needle_count][]const u8{ "key", "poly key r||s", "poly key r clamped || s", "XChaCha subkey", "XChaCha poly key r||s" };
 
 const PAD = 2048;
 
@@ -122,6 +122,7 @@ const key: [32]u8 = blk: {
     break :blk k;
 };
 const nonce: [12]u8 = @splat(0x24);
+const xnonce: [24]u8 = @splat(0x35);
 const ad = "probe associated data";
 
 var msg_len: usize = 0;
@@ -142,12 +143,28 @@ noinline fn callXor() void {
 noinline fn callStream() void {
     cp.ChaCha20.stream(cipher[0..msg_len], 1, key, nonce);
 }
+noinline fn callXEncrypt() void {
+    cp.XChaCha20Poly1305.encrypt(cipher[0..msg_len], &tag, plain[0..msg_len], ad, xnonce, key);
+}
+noinline fn callXDecrypt() void {
+    cp.XChaCha20Poly1305.decrypt(back[0..msg_len], cipher[0..msg_len], tag, ad, xnonce, key) catch unreachable;
+}
+noinline fn callXXor() void {
+    cp.XChaCha20.xor(cipher[0..msg_len], plain[0..msg_len], 1, key, xnonce);
+}
+noinline fn callXor64() void {
+    cp.ChaCha20With64BitNonce.xor(cipher[0..msg_len], plain[0..msg_len], 1, key, nonce[0..8].*);
+}
 
 const calls = [_]struct { name: []const u8, call: *const fn () void }{
     .{ .name = "AEAD encrypt", .call = callEncrypt },
     .{ .name = "AEAD decrypt", .call = callDecrypt },
     .{ .name = "ChaCha20.xor", .call = callXor },
     .{ .name = "ChaCha20.stream", .call = callStream },
+    .{ .name = "XAEAD encrypt", .call = callXEncrypt },
+    .{ .name = "XAEAD decrypt", .call = callXDecrypt },
+    .{ .name = "XChaCha20.xor", .call = callXXor },
+    .{ .name = "ChaCha20/64.xor", .call = callXor64 },
 };
 
 const lengths = [_]usize{ 16, 100, 200, 1024, 4096 };
@@ -160,7 +177,24 @@ test "STACKPROBE (review 2026-10-08): no key residue on the dead stack after the
     std.crypto.stream.chacha.ChaCha20IETF.xor(&poly, &poly, 0, key, nonce);
     var clamped = poly;
     for (clamped[0..16], [16]u8{ 0xff, 0xff, 0xff, 0x0f, 0xfc, 0xff, 0xff, 0x0f, 0xfc, 0xff, 0xff, 0x0f, 0xfc, 0xff, 0xff, 0x0f }) |*b, m| b.* &= m;
-    const needles = [needle_count][32]u8{ key, poly, clamped };
+    // XChaCha: the subkey is HChaCha20(key, xnonce[0..16]), cross-checked
+    // against std (its XChaCha20 keystream must equal ChaCha20 under the
+    // subkey and nonce 0000 ‖ xnonce[16..24]); its block 0 is the poly key.
+    var xsub: [32]u8 = undefined;
+    cp.hchacha20(&xsub, &key, xnonce[0..16]);
+    {
+        const z: [64]u8 = @splat(0);
+        var want: [64]u8 = undefined;
+        var got: [64]u8 = undefined;
+        var sub_nonce: [12]u8 = @splat(0);
+        sub_nonce[4..].* = xnonce[16..24].*;
+        std.crypto.stream.chacha.XChaCha20IETF.xor(&want, &z, 0, key, xnonce);
+        std.crypto.stream.chacha.ChaCha20IETF.xor(&got, &z, 0, xsub, sub_nonce);
+        try std.testing.expectEqualSlices(u8, &want, &got);
+    }
+    var xpoly: [32]u8 = @splat(0);
+    std.crypto.stream.chacha.XChaCha20IETF.xor(&xpoly, &xpoly, 0, key, xnonce);
+    const needles = [needle_count][32]u8{ key, poly, clamped, xsub, xpoly };
 
     region_lo = stackHere() - PAD - WINDOW;
 
