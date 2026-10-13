@@ -300,8 +300,8 @@ fn taintedCopy(comptime T: type, x: *T, tainted: bool) T {
 /// `DynModint` with a SECRET modulus — the way `rsa` uses it for a CRT prime
 /// and `paillier` for p²/q². Unlike caveat 4 above, the modulus here is
 /// tainted, but only after construction (key setup is untainted in the
-/// consumers' harnesses too) and without its slot `L`/`digit_bits`, which
-/// follow from the bit length (the key size). Every operation a consumer
+/// consumers' harnesses too) and without its slot `L`, which
+/// follows from the bit length (the key size). Every operation a consumer
 /// calls is driven once; the API's own verdicts (`divExact`, `eql`,
 /// `elemFromBytesBE`'s canonical check) are the only branches it has.
 fn runDyn(comptime nbits: usize, comptime tag: []const u8, tainted: bool) !void {
@@ -341,7 +341,6 @@ fn runDyn(comptime nbits: usize, comptime tag: []const u8, tainted: bool) !void 
         std.valgrind.memcheck.makeMemUndefined(std.mem.asBytes(&mod.n0inv));
         std.valgrind.memcheck.makeMemUndefined(std.mem.asBytes(&mod.r2));
         std.valgrind.memcheck.makeMemUndefined(std.mem.asBytes(&mod.one_mont));
-        std.valgrind.memcheck.makeMemUndefined(std.mem.asBytes(&mod.digit_mont));
     }
     const md = taintedCopy(D, &mod, false);
     const ar = taintedCopy(D.Elem, &a, tainted);
@@ -373,6 +372,9 @@ fn runDyn(comptime nbits: usize, comptime tag: []const u8, tainted: bool) !void 
     md.toBytesBE(&qq, &out);
     std.debug.print("divexact={} q={x}\n", .{ exact, out });
     std.debug.print("eql={}\n", .{D.eql(&ar, &br)});
+    // Element predicates: verdicts, branches expected as for `eql`.
+    std.debug.print("isodd={} isone={} iszero={}\n", .{ D.isOdd(&ar), D.isOne(&ar), D.isZero(&ar) });
+    std.debug.print("compare={}\n", .{D.compare(&ar, &br)});
     const back = md.elemFromBytesBE(&abr) catch D.zero;
     md.toBytesBE(&back, &out);
     std.debug.print("load={x}\n", .{out});

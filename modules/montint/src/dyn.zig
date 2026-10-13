@@ -88,10 +88,6 @@ pub fn DynModint(comptime max_bits: comptime_int) type {
         r2: Elem,
         /// `R mod m` (one in the Montgomery domain).
         one_mont: Elem,
-        /// Digit width of the reducers: `min(64, bits(m) − 1)`.
-        digit_bits: u7,
-        /// `2^digit_bits·R mod m` — the Horner step of the reducers.
-        digit_mont: Elem,
 
         fn Mod(comptime s: usize) type {
             return montint.Modint(s * 64);
@@ -147,7 +143,6 @@ pub fn DynModint(comptime max_bits: comptime_int) type {
         }
 
         fn build(v: *const Elem, nbits: usize, comptime public: bool) Self {
-            const d: u7 = @intCast(@min(64, nbits - 1));
             const slot = slotFor((nbits + 63) / 64);
             comptime var s: usize = min_limbs;
             inline while (s <= max_limbs) : (s += step) {
@@ -163,17 +158,10 @@ pub fn DynModint(comptime max_bits: comptime_int) type {
                         .n0inv = mm.n0inv,
                         .r2 = zero,
                         .one_mont = zero,
-                        .digit_bits = d,
-                        .digit_mont = zero,
                     };
                     self.m[0..s].* = mm.m;
                     self.r2[0..s].* = mm.r2;
                     self.one_mont[0..s].* = mm.one_mont;
-                    // 2^d < m: d ≤ bits − 1, and an odd m exceeds the even
-                    // 2^(bits − 1).
-                    var t = [_]u64{0} ** s;
-                    if (d == 64) t[1] = 1 else t[0] = @as(u64, 1) << @intCast(d);
-                    self.digit_mont[0..s].* = mm.toMontgomery(&t);
                     return self;
                 }
             }
@@ -325,9 +313,8 @@ pub fn DynModint(comptime max_bits: comptime_int) type {
         // ── reduction ───────────────────────────────────────────────────────
 
         /// `x mod m` for a little-endian value of any limb count. Horner over
-        /// `digit_bits`-bit digits (each `< m`), two Montgomery multiplies per
-        /// digit; the work depends on `x.len` and the modulus's bit length
-        /// only.
+        /// `L`-limb digits, two Montgomery multiplies per digit; the work
+        /// depends on `x.len` and the slot `L` only.
         pub fn reduceLimbs(self: *const Self, x: []const u64) Elem {
             return self.horner(LimbDigits{ .x = x }, 64 * x.len);
         }
@@ -337,21 +324,27 @@ pub fn DynModint(comptime max_bits: comptime_int) type {
             return self.horner(ByteDigits{ .be = be }, 8 * be.len);
         }
 
+        /// Horner over whole `L`-limb digits `c` (any value `< R = 2^(64·L)`,
+        /// NOT necessarily `< m`): `acc ← acc·R + c` is `montMul(acc, R²)`
+        /// plus `toMontgomery(c) = montMul(c, R²)`. Both stay inside the
+        /// Montgomery multiply's bound — `c·(R² mod m) < R·m` gives an output
+        /// below `2m`, which its final subtract reduces — so a digit needs no
+        /// pre-reduction. (Until 2026-10-14 the digits were single 64-bit
+        /// words below `m`: 64 multiplies per 2048-bit input against a
+        /// 1024-bit prime, ~6 % of an RSA-2048 private operation; now 4.)
         fn horner(self: *const Self, src: anytype, total_bits: usize) Elem {
-            const d: usize = self.digit_bits;
-            const mask: u64 = if (d == 64) ~@as(u64, 0) else (@as(u64, 1) << @intCast(d)) - 1;
             comptime var s: usize = min_limbs;
             inline while (s <= max_limbs) : (s += step) {
                 if (s == self.L) {
                     const v = self.view(s);
-                    const step_mont = self.digit_mont[0..s];
+                    const digit_bits = 64 * s;
                     var acc = [_]u64{0} ** s;
-                    var k: usize = (total_bits + d - 1) / d;
+                    var k: usize = (total_bits + digit_bits - 1) / digit_bits;
                     while (k > 0) {
                         k -= 1;
-                        var digit = [_]u64{0} ** s;
-                        digit[0] = src.at(k * d) & mask;
-                        acc = v.montMul(&acc, step_mont);
+                        var digit: [s]u64 = undefined;
+                        for (&digit, 0..) |*w, j| w.* = src.at(k * digit_bits + 64 * j);
+                        acc = v.montMul(&acc, &v.r2);
                         const digit_mont = v.toMontgomery(&digit);
                         acc = v.add(&acc, &digit_mont);
                     }
@@ -402,6 +395,41 @@ pub fn DynModint(comptime max_bits: comptime_int) type {
             var acc: u64 = 0;
             for (a, b) |x, y| acc |= x ^ y;
             return acc == 0;
+        }
+
+        /// Whether the element is odd (bit 0 of limb 0).
+        pub fn isOdd(e: *const Elem) bool {
+            return e[0] & 1 == 1;
+        }
+
+        /// Whether the element equals 1; scans every limb, like `isZero`.
+        pub fn isOne(e: *const Elem) bool {
+            var acc: u64 = e[0] ^ 1;
+            for (e[1..]) |w| acc |= w;
+            return acc == 0;
+        }
+
+        /// The element 1 (`[1, 0, …]`).
+        pub fn one() Elem {
+            var o = zero;
+            o[0] = 1;
+            return o;
+        }
+
+        /// Three-way order of two elements as integers. Constant-time over the
+        /// whole `Elem`: two borrow chains (`a − b`, `b − a`), no early exit.
+        pub fn compare(a: *const Elem, b: *const Elem) std.math.Order {
+            var lt: u1 = 0; // final borrow of a − b: 1 iff a < b
+            var gt: u1 = 0; // final borrow of b − a: 1 iff a > b
+            for (a, b) |x, y| {
+                const d1 = @subWithOverflow(x, y);
+                const d2 = @subWithOverflow(d1[0], lt);
+                lt = d1[1] | d2[1];
+                const e1 = @subWithOverflow(y, x);
+                const e2 = @subWithOverflow(e1[0], gt);
+                gt = e1[1] | e2[1];
+            }
+            return std.math.order(@as(u2, gt), @as(u2, lt));
         }
 
         /// `a` if `on`, else `b`, without a branch: the mask is laundered
@@ -576,8 +604,8 @@ pub fn DynModint(comptime max_bits: comptime_int) type {
         pub fn isProbablePrime(self: *const Self, random: std.Random, rounds: usize) bool {
             if (rounds == 0) return false; // no witness, no evidence: never "prime"
             if (self.nbits < 3) return true; // the only odd 2-bit modulus is 3
-            var one = zero;
-            one[0] = 1;
+            var one_e = zero;
+            one_e[0] = 1;
             var mm1 = self.m;
             defer std.crypto.secureZero(u64, &mm1);
             mm1[0] &= ~@as(u64, 1); // m odd: m − 1 clears bit 0
@@ -592,7 +620,7 @@ pub fn DynModint(comptime max_bits: comptime_int) type {
                 defer std.crypto.secureZero(u64, &a);
                 var x = self.pow(&a, &split.u);
                 defer std.crypto.secureZero(u64, &x);
-                var pass = @intFromBool(eql(&x, &one)) | @intFromBool(eql(&x, &mm1));
+                var pass = @intFromBool(eql(&x, &one_e)) | @intFromBool(eql(&x, &mm1));
                 var j: usize = 1;
                 while (j < split.t) : (j += 1) {
                     x = self.sq(&x);
@@ -758,9 +786,9 @@ pub fn DynModint(comptime max_bits: comptime_int) type {
             var t: Elem = undefined;
             defer std.crypto.secureZero(u64, &t);
             mulLow(max_limbs, &t, n, &z); // n·z (< n·m, ≥ 1 when ok)
-            var one = zero;
-            one[0] = 1;
-            _ = limbs.subInto(&t, &one);
+            var one_e = zero;
+            one_e[0] = 1;
+            _ = limbs.subInto(&t, &one_e);
             const minv = nt.invPow2(max_limbs, &self.m);
             var kq: Elem = undefined;
             defer std.crypto.secureZero(u64, &kq);
@@ -964,11 +992,9 @@ test "DynModint.fromLimbsPublic: the same modulus as fromLimbs, bit for bit, at 
         try std.testing.expectEqual(a.L, b.L);
         try std.testing.expectEqual(a.nbits, b.nbits);
         try std.testing.expectEqual(a.n0inv, b.n0inv);
-        try std.testing.expectEqual(a.digit_bits, b.digit_bits);
         try std.testing.expectEqualSlices(u64, &a.m, &b.m);
         try std.testing.expectEqualSlices(u64, &a.r2, &b.r2);
         try std.testing.expectEqualSlices(u64, &a.one_mont, &b.one_mont);
-        try std.testing.expectEqualSlices(u64, &a.digit_mont, &b.digit_mont);
         v[0] &= ~@as(u64, 1);
         try std.testing.expectError(error.EvenModulus, D.fromLimbsPublic(&v));
     }
@@ -1354,7 +1380,7 @@ test "DynModint fromLimbsBits: the caller's length, checked in one verdict" {
         const mv = randModulus(D, rnd, nbits);
         const a = try D.fromLimbs(&mv);
         const b = try D.fromLimbsBits(&mv, nbits);
-        try testing.expect(a.L == b.L and a.nbits == b.nbits and D.eql(&a.r2, &b.r2) and D.eql(&a.digit_mont, &b.digit_mont));
+        try testing.expect(a.L == b.L and a.nbits == b.nbits and D.eql(&a.r2, &b.r2));
         if (nbits < 1024) try testing.expectError(error.NonCanonical, D.fromLimbsBits(&mv, nbits + 1)); // top bit not set
         if (nbits > 2) try testing.expectError(error.NonCanonical, D.fromLimbsBits(&mv, nbits - 1)); // a bit above
         var even = mv;
@@ -1435,4 +1461,60 @@ test "DynModint edges: zero and m−1, pow by zero, divExact of zero" {
     try testing.expect(mod.divExact(&hi, &q) and D.eql(&q, &one));
     hi[2 * mod.L] = 1;
     try testing.expect(!mod.divExact(&hi, &q));
+}
+
+test "DynModint predicates: isOdd/isOne/one/compare/isZero/eql against big.int, edge and random elements" {
+    const gpa = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x9ED1_CA7E);
+    const rnd = prng.random();
+    inline for (.{ 128, 256, 1024, 2048 }) |bits| {
+        const D = DynModint(bits);
+        const n = D.max_limbs;
+        var pool: [12 + 24]D.Elem = undefined;
+        // edges: 0, 1, all ones (2^k − 1 shape), only the top limb set, only
+        // limb 0 set, and pairs differing in exactly the top / the lowest limb
+        pool[0] = D.zero;
+        pool[1] = D.one();
+        pool[2] = [_]u64{~@as(u64, 0)} ** n;
+        pool[3] = D.zero;
+        pool[3][n - 1] = 1;
+        pool[4] = D.zero;
+        pool[4][0] = 2;
+        pool[5] = pool[2];
+        pool[5][0] ^= 1; // all ones but bit 0
+        pool[6] = pool[2];
+        pool[6][n - 1] ^= 1 << 63; // differs from pool[2] only in the top limb
+        pool[7] = pool[1];
+        pool[7][n - 1] = 1; // 1 + 2^(64(n-1)): not one
+        pool[8] = D.zero;
+        pool[8][n - 1] = ~@as(u64, 0);
+        pool[9] = pool[2];
+        pool[9][0] = 0; // differs from pool[2] only in limb 0
+        pool[10] = D.zero;
+        pool[10][n / 2] = 1;
+        pool[11] = D.one();
+        pool[11][0] = 3;
+        for (pool[12..]) |*e| {
+            for (e) |*w| w.* = rnd.int(u64);
+            // some with equal high limbs, so the scan has to go down to the low ones
+            if (rnd.boolean()) {
+                for (e[1..]) |*w| w.* = 0;
+            }
+        }
+        for (&pool) |*a| {
+            var ba = try toBig(gpa, a);
+            defer ba.deinit();
+            try testing.expectEqual(ba.isOdd(), D.isOdd(a));
+            try testing.expectEqual(ba.toConst().eql(.{ .limbs = &.{1}, .positive = true }), D.isOne(a));
+            try testing.expectEqual(ba.eqlZero(), D.isZero(a));
+            for (&pool) |*b| {
+                var bb = try toBig(gpa, b);
+                defer bb.deinit();
+                try testing.expectEqual(ba.order(bb), D.compare(a, b));
+                try testing.expectEqual(ba.eql(bb), D.eql(a, b));
+            }
+        }
+        try testing.expect(D.isOne(&D.one()) and !D.isZero(&D.one()) and D.isOdd(&D.one()));
+        try testing.expect(!D.isOne(&D.zero) and !D.isOdd(&D.zero));
+    }
 }

@@ -592,14 +592,19 @@ fn hiReg(comptime j: usize) []const u8 {
 /// The asm text of ONE outer CIOS iteration for a fixed `L` (see above).
 /// Register plan: rdi = t (= z), rsi = a, rbx = &b[i] (advanced by the loop),
 /// rcx = m, r8 = n0inv, r9 = outer counter, rdx = MULX multiplier, rax = 0,
-/// r10 = current lo, r11/r12 = alternating hi, r13 = t[L], r14 = t[L+1].
+/// r10 = current lo, r11/r12 = alternating hi, r13 = t[L], r14 = t[L+1],
+/// r15 = t[0] (memory word t[0] is written only by the reduce row).
 fn ciosFixedBody(comptime L: usize) []const u8 {
     comptime {
         @setEvalBranchQuota(200_000);
         var s: AsmText(400 * L + 512) = .{};
         // mul row: t[j] += a[j]·b_i (+ hi of j−1), j = 0..L−1
+        // t[0] lives in r15 across rows (never reloaded from memory): the
+        // reduce row's `u = t[0]·n0inv` and the next mul row's first add
+        // would otherwise each wait on a store-to-load forward of t[0], and
+        // both sit on the row-to-row critical path.
         s.put(" movq (%%rbx), %%rdx\n xorl %%eax, %%eax\n");
-        s.put(" mulxq (%%rsi), %%r10, %%r11\n adcxq (%%rdi), %%r10\n movq %%r10, (%%rdi)\n");
+        s.put(" mulxq (%%rsi), %%r10, %%r11\n adcxq %%r15, %%r10\n movq %%r10, %%r15\n");
         for (1..L) |j| {
             const o = decStr(8 * j);
             s.put(" mulxq " ++ o ++ "(%%rsi), %%r10, " ++ hiReg(j) ++ "\n" ++
@@ -611,14 +616,15 @@ fn ciosFixedBody(comptime L: usize) []const u8 {
         s.put(" adcxq %%rax, %%r13\n adoxq " ++ hiReg(L - 1) ++ ", %%r13\n" ++
             " movl $0, %%r14d\n adcxq %%rax, %%r14\n adoxq %%rax, %%r14\n");
         // reduce row: u = t[0]·n0inv; t = (t + u·m) >> 64
-        s.put(" movq (%%rdi), %%rdx\n imulq %%r8, %%rdx\n xorl %%eax, %%eax\n");
-        s.put(" mulxq (%%rcx), %%r10, %%r11\n adcxq (%%rdi), %%r10\n");
+        s.put(" movq %%r15, %%rdx\n imulq %%r8, %%rdx\n xorl %%eax, %%eax\n");
+        s.put(" mulxq (%%rcx), %%r10, %%r11\n adcxq %%r15, %%r10\n");
         for (1..L) |j| {
             const o = decStr(8 * j);
             s.put(" mulxq " ++ o ++ "(%%rcx), %%r10, " ++ hiReg(j) ++ "\n" ++
                 " adcxq " ++ o ++ "(%%rdi), %%r10\n" ++
                 " adoxq " ++ hiReg(j - 1) ++ ", %%r10\n" ++
                 " movq %%r10, " ++ decStr(8 * (j - 1)) ++ "(%%rdi)\n");
+            if (j == 1) s.put(" movq %%r10, %%r15\n");
         }
         // t[L−1] = t[L] + hi_{L−1} + CF + OF; t[L] = t[L+1] + the two carries
         s.put(" adcxq %%rax, %%r13\n adoxq " ++ hiReg(L - 1) ++ ", %%r13\n" ++
@@ -648,7 +654,7 @@ fn montMulFixedAmd64(comptime L: usize, z: *[L]u64, a: *const [L]u64, b: *const 
     var top: u64 = undefined;
     var d_b: usize = undefined;
     var d_cnt: usize = undefined;
-    asm volatile (" xorl %%r13d, %%r13d\n" ++ "1:\n" ++ body ++ " addq $8, %%rbx\n decq %%r9\n jnz 1b\n"
+    asm volatile (" xorl %%r13d, %%r13d\n xorl %%r15d, %%r15d\n" ++ "1:\n" ++ body ++ " addq $8, %%rbx\n decq %%r9\n jnz 1b\n"
         : [top] "={r13}" (top),
           [db] "={rbx}" (d_b),
           [dc] "={r9}" (d_cnt),
@@ -658,7 +664,7 @@ fn montMulFixedAmd64(comptime L: usize, z: *[L]u64, a: *const [L]u64, b: *const 
           [mp] "{rcx}" (m),
           [n0] "{r8}" (n0inv),
           [cnt] "{r9}" (@as(usize, L)),
-        : .{ .rax = true, .rdx = true, .r10 = true, .r11 = true, .r12 = true, .r14 = true, .cc = true, .memory = true });
+        : .{ .rax = true, .rdx = true, .r10 = true, .r11 = true, .r12 = true, .r14 = true, .r15 = true, .cc = true, .memory = true });
     // t < 2m: top ∈ {0, 1}; constant-time final reduce.
     condSubFixed(L, z, top, m);
 }
@@ -667,7 +673,7 @@ fn montMulFixedAmd64(comptime L: usize, z: *[L]u64, a: *const [L]u64, b: *const 
 /// Register plan: rsi = a, rdi = A (2L-word scratch; advanced only in the
 /// final reduction loop), rcx = m, r8 = n0inv, r9 = reduction counter,
 /// rdx = MULX multiplier, rax = 0, r10 = lo, r11/r12 = alternating hi,
-/// r13 = the pending column carry `cc`, r14 = scratch.
+/// r13 = the pending column carry `cc`, r14 = scratch, r15 = A[i] (REDC).
 fn sqrFixedText(comptime L: usize) []const u8 {
     comptime {
         @setEvalBranchQuota(2_000_000);
@@ -700,15 +706,19 @@ fn sqrFixedText(comptime L: usize) []const u8 {
         // 3. word-serial REDC: L rows of A[i..i+L−1] += u·m (u = A[i]·n0inv),
         //    the row carry plus the pending cc folded into A[i+L] — the
         //    portable `montSqrCios` phase 4, one asm loop iteration per row.
-        s.put(" xorl %%r13d, %%r13d\n movl $" ++ decStr(L) ++ ", %%r9d\n2:\n");
-        s.put(" movq (%%rdi), %%rdx\n imulq %%r8, %%rdx\n xorl %%eax, %%eax\n");
-        s.put(" mulxq (%%rcx), %%r10, %%r11\n adcxq (%%rdi), %%r10\n movq %%r10, (%%rdi)\n");
+        //    A[i] rides in r15 from the previous row (its j = 1 word), so
+        //    `u` never waits on a store-to-load forward; the row's own word 0
+        //    (≡ 0 by the choice of u) is not stored — nothing reads it.
+        s.put(" xorl %%r13d, %%r13d\n movl $" ++ decStr(L) ++ ", %%r9d\n movq (%%rdi), %%r15\n2:\n");
+        s.put(" movq %%r15, %%rdx\n imulq %%r8, %%rdx\n xorl %%eax, %%eax\n");
+        s.put(" mulxq (%%rcx), %%r10, %%r11\n adcxq %%r15, %%r10\n");
         for (1..L) |j| {
             const o = decStr(8 * j);
             s.put(" mulxq " ++ o ++ "(%%rcx), %%r10, " ++ hiReg(j) ++ "\n" ++
                 " adcxq " ++ o ++ "(%%rdi), %%r10\n" ++
                 " adoxq " ++ hiReg(j - 1) ++ ", %%r10\n" ++
                 " movq %%r10, " ++ o ++ "(%%rdi)\n");
+            if (j == 1) s.put(" movq %%r10, %%r15\n");
         }
         const top = decStr(8 * L);
         s.put(" adcxq %%rax, " ++ hiReg(L - 1) ++ "\n adoxq %%rax, " ++ hiReg(L - 1) ++ "\n" ++
@@ -759,7 +769,7 @@ fn montSqrFixedAmd64(comptime L: usize, z: *[L]u64, a: *const [L]u64, m: *const 
           [Ap] "{rdi}" (&A),
           [mp] "{rcx}" (m),
           [n0] "{r8}" (n0inv),
-        : .{ .rax = true, .rdx = true, .r10 = true, .r11 = true, .r12 = true, .r14 = true, .cc = true, .memory = true });
+        : .{ .rax = true, .rdx = true, .r10 = true, .r11 = true, .r12 = true, .r14 = true, .r15 = true, .cc = true, .memory = true });
     z.* = A[L..].*;
     condSubFixed(L, z, cc, m);
 }
@@ -771,10 +781,63 @@ inline fn blackBox(x: u64) u64 {
     );
 }
 
-/// `condSub` at a comptime `L`: the loops fully unroll, which is exactly when
-/// LLVM recovers `smask ∈ {0, ~0}` and hoists pass 2 behind a branch on the
-/// secret borrow (measured on `montint.condSubTop`), so the mask is laundered.
+/// `condSub` at a comptime `L`: `z ← z − m` iff `top·B^L + z ≥ m` (the
+/// value is `< 2m`, `top ∈ {0, 1}`), in asm since 2026-10-14. The Zig form
+/// (`condSubFixedZig`, kept as the test oracle) needed a laundered mask —
+/// fully unrolled, LLVM recovers `smask ∈ {0, ~0}` and hoists pass 2 behind a
+/// branch on the secret borrow — and even laundered it compiled to ~240
+/// cycles at L = 16, a quarter of a block-kernel square (perf, bench host).
+/// Pass 1 runs the `sub/sbb` borrow chain without storing; `sbb $0, top` then
+/// `sbb rcx, rcx` turn the outcome into a keep mask; pass 2 subtracts
+/// `m << c << c` with `c = keep ? 32 : 0` — `shlx` leaves the flags alone, so
+/// the masked operand never interrupts pass 2's own borrow chain (an `and`
+/// would clear CF), and its latency does not depend on the count. (`pdep`
+/// would also mask without flags, but is microcoded with value-dependent
+/// timing on AMD Zen 1/2.)
 fn condSubFixed(comptime L: usize, z: *[L]u64, top: u64, m: *const [L]u64) void {
+    condSubInto(L, z, z, top, m);
+}
+
+/// `condSubFixed` reading the value from `src` and writing the result to
+/// `z` (either may alias) — the block kernels reduce straight out of their
+/// accumulator's high half, with no copy (an L-word copy is a
+/// `compiler_rt.memcpy` call at L = 48).
+fn condSubInto(comptime L: usize, z: *[L]u64, src: *const [L]u64, top: u64, m: *const [L]u64) void {
+    const text = comptime condSubText(L);
+    var d_top: u64 = undefined;
+    var d_cx: u64 = undefined;
+    asm volatile (text
+        : [t] "={rdx}" (d_top),
+          [c] "={rcx}" (d_cx),
+        : [z] "{rdi}" (z),
+          [src] "{r8}" (src),
+          [m] "{rsi}" (m),
+          [top] "{rdx}" (top),
+        : .{ .rax = true, .cc = true, .memory = true });
+}
+
+fn condSubText(comptime L: usize) []const u8 {
+    comptime {
+        @setEvalBranchQuota(200_000);
+        var s: AsmText(240 * L + 256) = .{};
+        s.put(" movq (%%r8), %%rax\n subq (%%rsi), %%rax\n");
+        for (1..L) |i| s.put(" movq " ++ decStr(8 * i) ++ "(%%r8), %%rax\n sbbq " ++ decStr(8 * i) ++ "(%%rsi), %%rax\n");
+        s.put(" sbbq $0, %%rdx\n sbbq %%rcx, %%rcx\n andl $32, %%ecx\n");
+        // Pass 2 loads, subtracts in a register and stores: a memory-
+        // destination `sbb` puts its load/store round trip on the CF chain
+        // (measured 3× slower at L = 48).
+        s.put(" shlxq %%rcx, (%%rsi), %%rax\n shlxq %%rcx, %%rax, %%rax\n movq (%%r8), %%rdx\n subq %%rax, %%rdx\n movq %%rdx, (%%rdi)\n");
+        for (1..L) |i| {
+            const o = decStr(8 * i);
+            s.put(" shlxq %%rcx, " ++ o ++ "(%%rsi), %%rax\n shlxq %%rcx, %%rax, %%rax\n movq " ++ o ++ "(%%r8), %%rdx\n sbbq %%rax, %%rdx\n movq %%rdx, " ++ o ++ "(%%rdi)\n");
+        }
+        const out = s.buf[0..s.len].*;
+        return &out;
+    }
+}
+
+/// The portable-Zig form of `condSubFixed` — the oracle its test compares to.
+fn condSubFixedZig(comptime L: usize, z: *[L]u64, top: u64, m: *const [L]u64) void {
     var borrow: u1 = 0;
     for (z, m) |zi, mi| {
         const s = @subWithOverflow(zi, mi);
@@ -789,6 +852,460 @@ fn condSubFixed(comptime L: usize, z: *[L]u64, top: u64, m: *const [L]u64) void 
         const s2 = @subWithOverflow(s[0], b2);
         zi.* = s2[0];
         b2 = s[1] | s2[1];
+    }
+}
+
+test "condSubFixed (asm) == condSubFixedZig at the decision edges" {
+    if (comptime !supported) return error.SkipZigTest;
+    var prng = std.Random.DefaultPrng.init(0xC0D5_0B);
+    const rand = prng.random();
+    inline for (.{ 2, 16, 17, 64 }) |L| {
+        for (0..3000) |t| {
+            var m: [L]u64 = undefined;
+            for (&m) |*w| w.* = rand.int(u64);
+            m[L - 1] |= 1 << 63;
+            var z: [L]u64 = m;
+            var top: u64 = 0;
+            switch (t % 6) {
+                0 => {}, // z == m: subtract to 0
+                1 => z[0] -%= 1, // m − 1 (or, if m[0] == 0, a value in (m, 2m))
+                2 => z[t % L] +%= 1,
+                3 => { // top = 1, z small: value = B^L + z < 2m
+                    top = 1;
+                    for (&z) |*w| w.* = rand.int(u64) >> 2;
+                },
+                else => for (&z) |*w| {
+                    w.* = rand.int(u64);
+                }, // random z < B^L ≤ 2m
+            }
+            var want = z;
+            condSubFixedZig(L, &want, top, &m);
+            var got = z;
+            condSubFixed(L, &got, top, &m);
+            try std.testing.expectEqualSlices(u64, &want, &got);
+        }
+    }
+}
+
+// ── 8-row block kernels (2026-10-14) ────────────────────────────────────────
+//
+// What `montMulFixed`/`montSqrFixed` dispatch to when `L % 8 == 0` — every
+// RSA CRT half (L = 16/24/32) and modulus (L = 32/48/64). The fixed kernels
+// above add each limb product into a MEMORY word (`adcx mem` + `mov` back),
+// so every row reads and writes all of `t` and the next row waits on those
+// stores: ~6.6 µops per product at L = 16 issued at ~3 µops/cycle (perf, the
+// bench host), and the square no better than 0.9 of a multiply.
+//
+// Here eight rows share an accumulator WINDOW of eight registers (r8–r15):
+// position `q` of the double-width accumulator always lives in
+// `r(8 + q mod 8)`, so the window slides one register per row with no moves,
+// and a chunk of eight rows × eight columns is the same instruction text at
+// every chunk offset (one public loop). One limb product is
+//   mulx Y[j], lo, hi · adcx lo → w[P+j] (CF chain) · adox hi → w[P+j+1] (OF)
+// four fused µops; memory is touched once per eight rows. Row r of a chunk
+// covers positions P..P+8 (P = chunk base + r); its last product writes the
+// high half straight into the register just vacated by position P (stored,
+// or discarded where it is zero by construction), then folds CF and OF into
+// it. That fold cannot overflow: the window P..P+7 holds a value < B^8 and
+// x·Y[chunk] < (B−1)(B^8−1), so their sum is < B^9 (B = 2^64).
+//
+// Memory words of the accumulator enter the window once per chunk (eight
+// `adcx mem` — a carry chain of its own whose carry-out is parked in a stack
+// slot and resumed at the next chunk, the position it belongs to) and leave it
+// once per row (the final word P). Three phases use the one engine:
+//   product   A = a·b: blocks of eight rows b[8t..8t+8), chunks over a
+//   cross     A = Σ_{i<j} a[i]a[j]B^(i+j): block t = rows a[8t..8t+8) over
+//             columns a[8t..L); chunk 0 is the triangle (row r starts at
+//             column r+1), the rest full chunks
+//   REDC      A ← (A + U·m)/R in place: block t computes u_r = A[8t+r]·n0inv
+//             in its chunk 0 (where that word is final), parks them in stack
+//             slots for the later chunks, and adds the high half of A at the
+//             block end with the previous block's carry-out word.
+// The product and cross phases write only fresh (zero) words at a block end,
+// so A must be zeroed first; the square adds the doubling + diagonal pass of
+// `sqrFixedText` between cross and REDC.
+//
+// Stack: each asm block moves rsp down 256 bytes (the 128-byte red zone below
+// the compiler's rsp stays untouched) and keeps 16 qword slots at 0(%rsp):
+//   0..56 u_0..u_7 · 64 s (parked chunk carry) · 72 p (REDC carry word)
+//   80 chunk counter · 88 block counter · 96 block A base · 104 chunk count
+//   112 Y base
+// and zeroes the secret-derived ones (0..72) before returning.
+//
+// Constant-time on the same terms as the kernels above: the instruction
+// stream and both loop counts are comptime functions of `L` (the cross
+// phase's chunk count per block is too: `L/8 − 1 − t`), every address is a
+// fixed offset from a pointer advanced by public amounts, and the final
+// reduction is the laundered `condSubFixed`.
+
+/// Smallest `L` the block kernels serve (one full chunk beyond a block's own
+/// columns), and the stride they need.
+pub const block_min_limbs: usize = 16;
+
+fn winReg(comptime q: usize) []const u8 {
+    return switch (q % 8) {
+        0 => "%%r8",
+        1 => "%%r9",
+        2 => "%%r10",
+        3 => "%%r11",
+        4 => "%%r12",
+        5 => "%%r13",
+        6 => "%%r14",
+        else => "%%r15",
+    };
+}
+
+fn winReg32(comptime q: usize) []const u8 {
+    return switch (q % 8) {
+        0 => "%%r8d",
+        1 => "%%r9d",
+        2 => "%%r10d",
+        3 => "%%r11d",
+        4 => "%%r12d",
+        5 => "%%r13d",
+        6 => "%%r14d",
+        else => "%%r15d",
+    };
+}
+
+/// What a row does with its multiplier and its final word.
+const RowMode = enum {
+    /// multiplier at `8r(%rcx)`; final word stored to `8r(%rdi)`
+    load_rcx_store,
+    /// multiplier at `8r(%rsp)` (a parked u); final word stored
+    load_slot_store,
+    /// REDC chunk 0: u = w[P]·n0inv (n0inv in rcx), parked at `8r(%rsp)`;
+    /// the final word is 0 by the choice of u and is dropped
+    redc_first,
+};
+
+/// One row `r` of a chunk: products `x·Y[j]` for `j` in `first..8`
+/// (`first > 0` only in the cross phase's triangle). Entry and exit: CF = OF = 0.
+fn emitRow(comptime s: anytype, comptime r: usize, comptime first: usize, comptime mode: RowMode) void {
+    const r8 = decStr(8 * r);
+    // Flags are 0 at every row boundary (the fold bound above), so the
+    // `xor` changes no value: it WRITES CF/OF without reading them, which
+    // cuts the flag dependency on the previous row's last `adcx`. Without it
+    // the eight rows of a chunk are one serial CF chain; with it a row starts
+    // as soon as its window words are in (two products into the row before).
+    switch (mode) {
+        .load_rcx_store => s.put(" movq " ++ r8 ++ "(%%rcx), %%rdx\n xorl %%eax, %%eax\n"),
+        .load_slot_store => s.put(" movq " ++ r8 ++ "(%%rsp), %%rdx\n xorl %%eax, %%eax\n"),
+        // imul leaves CF/OF undefined: the xor restores the row's entry state.
+        .redc_first => s.put(" movq " ++ winReg(r) ++ ", %%rdx\n imulq %%rcx, %%rdx\n movq %%rdx, " ++ r8 ++ "(%%rsp)\n xorl %%eax, %%eax\n"),
+    }
+    if (first > 0) {
+        // Triangle row: position P gets nothing from this row and is final.
+        s.put(" movq " ++ winReg(r) ++ ", " ++ r8 ++ "(%%rdi)\n");
+        if (first == 8) {
+            // No products at all: P+8 starts empty. (Flags are 0 already;
+            // xor keeps them 0.)
+            s.put(" xorl " ++ winReg32(r) ++ ", " ++ winReg32(r) ++ "\n");
+            return;
+        }
+    }
+    for (first..8) |j| {
+        const yo = decStr(8 * j);
+        if (j < 7) {
+            s.put(" mulxq " ++ yo ++ "(%%rsi), %%rax, %%rbx\n" ++
+                " adcxq %%rax, " ++ winReg(r + j) ++ "\n" ++
+                " adoxq %%rbx, " ++ winReg(r + j + 1) ++ "\n");
+        } else {
+            s.put(" mulxq " ++ yo ++ "(%%rsi), %%rax, " ++ winReg(r + 8) ++ "\n" ++
+                " adcxq %%rax, " ++ winReg(r + 7) ++ "\n" ++
+                " movl $0, %%eax\n" ++
+                " adoxq %%rax, " ++ winReg(r + 8) ++ "\n" ++
+                " adcxq %%rax, " ++ winReg(r + 8) ++ "\n");
+        }
+        if (j == 0 and mode != .redc_first) {
+            // P is final once its own product is in.
+            s.put(" movq " ++ winReg(r) ++ ", " ++ r8 ++ "(%%rdi)\n");
+        }
+    }
+}
+
+/// Load the window from `0..56(%rdi)` at a block's first chunk; s = 0.
+fn emitChunkLoad(comptime s: anytype) void {
+    for (0..8) |i| s.put(" movq " ++ decStr(8 * i) ++ "(%%rdi), " ++ winReg(i) ++ "\n");
+    s.put(" movq $0, 64(%%rsp)\n xorl %%eax, %%eax\n");
+}
+
+/// Add the memory words `0..56(%rdi)` into the window at a later chunk,
+/// resuming the parked carry s and parking the new one. Leaves CF = OF = 0.
+fn emitChunkAdd(comptime s: anytype) void {
+    s.put(" movq 64(%%rsp), %%rax\n negq %%rax\n"); // CF = s, OF = 0
+    for (0..8) |i| s.put(" adcxq " ++ decStr(8 * i) ++ "(%%rdi), " ++ winReg(i) ++ "\n");
+    s.put(" movl $0, %%eax\n adcxq %%rax, %%rax\n movq %%rax, 64(%%rsp)\n");
+}
+
+/// Block end over FRESH words (product, cross): window + s → `0..56(%rdi)`.
+fn emitBlockEndFresh(comptime s: anytype) void {
+    s.put(" movq 64(%%rsp), %%rax\n negq %%rax\n movl $0, %%eax\n");
+    for (0..8) |i| s.put(" adcxq %%rax, " ++ winReg(i) ++ "\n");
+    for (0..8) |i| s.put(" movq " ++ winReg(i) ++ ", " ++ decStr(8 * i) ++ "(%%rdi)\n");
+}
+
+/// REDC block end: window + A-high words + s + p (the previous block's
+/// carry-out word, which lands on this block's end position) → `0..56(%rdi)`;
+/// the carry-out (CF + OF, a small word) becomes the new p.
+fn emitBlockEndRedc(comptime s: anytype) void {
+    s.put(" movq 64(%%rsp), %%rax\n negq %%rax\n movq 72(%%rsp), %%rbx\n movl $0, %%eax\n");
+    s.put(" adcxq 0(%%rdi), " ++ winReg(0) ++ "\n adoxq %%rbx, " ++ winReg(0) ++ "\n");
+    for (1..8) |i| s.put(" adcxq " ++ decStr(8 * i) ++ "(%%rdi), " ++ winReg(i) ++ "\n adoxq %%rax, " ++ winReg(i) ++ "\n");
+    s.put(" movl $0, %%ebx\n adcxq %%rax, %%rbx\n adoxq %%rax, %%rbx\n movq %%rbx, 72(%%rsp)\n");
+    for (0..8) |i| s.put(" movq " ++ winReg(i) ++ ", " ++ decStr(8 * i) ++ "(%%rdi)\n");
+}
+
+fn emitChunk(comptime s: anytype, comptime mode: RowMode) void {
+    for (0..8) |r| emitRow(s, r, 0, mode);
+}
+
+const frame_bytes = "256";
+
+fn emitFrameEnter(comptime s: anytype) void {
+    s.put(" subq $" ++ frame_bytes ++ ", %%rsp\n");
+}
+
+fn emitFrameLeave(comptime s: anytype) void {
+    // Slots 0..72 (u_0..u_7, s, p) are secret-derived; 80..112 hold public
+    // counters and pointers.
+    for (0..10) |i| s.put(" movq $0, " ++ decStr(8 * i) ++ "(%%rsp)\n");
+    s.put(" addq $" ++ frame_bytes ++ ", %%rsp\n");
+}
+
+/// A = a·b (A: 2L words, zeroed by the caller). Registers on entry:
+/// rdi = A, rsi = a, rcx = b.
+fn productBlockText(comptime L: usize) []const u8 {
+    comptime {
+        @setEvalBranchQuota(400_000);
+        var s: AsmText(40_000) = .{};
+        const nb = L / 8;
+        emitFrameEnter(&s);
+        s.put(" movq $" ++ decStr(nb) ++ ", 88(%%rsp)\n movq %%rdi, 96(%%rsp)\n movq %%rsi, 112(%%rsp)\n");
+        s.put("3:\n");
+        emitChunkLoad(&s);
+        emitChunk(&s, .load_rcx_store);
+        s.put(" addq $64, %%rsi\n addq $64, %%rdi\n movq $" ++ decStr(nb - 1) ++ ", 80(%%rsp)\n");
+        s.put("4:\n");
+        emitChunkAdd(&s);
+        emitChunk(&s, .load_rcx_store);
+        s.put(" addq $64, %%rsi\n addq $64, %%rdi\n decq 80(%%rsp)\n jnz 4b\n");
+        emitBlockEndFresh(&s);
+        s.put(" addq $64, %%rcx\n movq 96(%%rsp), %%rdi\n addq $64, %%rdi\n movq %%rdi, 96(%%rsp)\n" ++
+            " movq 112(%%rsp), %%rsi\n decq 88(%%rsp)\n jnz 3b\n");
+        emitFrameLeave(&s);
+        const out = s.buf[0..s.len].*;
+        return &out;
+    }
+}
+
+/// A = Σ_{i<j} a[i]a[j]B^(i+j) (A: 2L words, zeroed by the caller).
+/// Registers on entry: rdi = A, rsi = rcx = a.
+fn crossBlockText(comptime L: usize) []const u8 {
+    comptime {
+        @setEvalBranchQuota(400_000);
+        var s: AsmText(40_000) = .{};
+        const nb = L / 8;
+        emitFrameEnter(&s);
+        s.put(" movq $" ++ decStr(nb) ++ ", 88(%%rsp)\n movq %%rdi, 96(%%rsp)\n movq $" ++ decStr(nb - 1) ++ ", 104(%%rsp)\n");
+        s.put("3:\n");
+        emitChunkLoad(&s);
+        for (0..8) |r| emitRow(&s, r, r + 1, .load_rcx_store);
+        s.put(" addq $64, %%rsi\n addq $64, %%rdi\n movq 104(%%rsp), %%rax\n movq %%rax, 80(%%rsp)\n testq %%rax, %%rax\n jz 5f\n");
+        s.put("4:\n");
+        emitChunkAdd(&s);
+        emitChunk(&s, .load_rcx_store);
+        s.put(" addq $64, %%rsi\n addq $64, %%rdi\n decq 80(%%rsp)\n jnz 4b\n");
+        s.put("5:\n");
+        emitBlockEndFresh(&s);
+        // next block: rows a[8t+8..], columns from a[8t+8], A base + 16 words
+        s.put(" addq $64, %%rcx\n movq %%rcx, %%rsi\n movq 96(%%rsp), %%rdi\n addq $128, %%rdi\n movq %%rdi, 96(%%rsp)\n" ++
+            " decq 104(%%rsp)\n decq 88(%%rsp)\n jnz 3b\n");
+        emitFrameLeave(&s);
+        const out = s.buf[0..s.len].*;
+        return &out;
+    }
+}
+
+/// A ← (A + U·m)/R in place over 2L words; the result is A[L..2L) with the
+/// carry word returned in rax. Registers on entry: rdi = A, rsi = m,
+/// rcx = n0inv.
+fn redcBlockText(comptime L: usize) []const u8 {
+    comptime {
+        @setEvalBranchQuota(400_000);
+        var s: AsmText(40_000) = .{};
+        const nb = L / 8;
+        emitFrameEnter(&s);
+        s.put(" movq $" ++ decStr(nb) ++ ", 88(%%rsp)\n movq %%rdi, 96(%%rsp)\n movq %%rsi, 112(%%rsp)\n movq $0, 72(%%rsp)\n");
+        s.put("3:\n");
+        emitChunkLoad(&s);
+        emitChunk(&s, .redc_first);
+        s.put(" addq $64, %%rsi\n addq $64, %%rdi\n movq $" ++ decStr(nb - 1) ++ ", 80(%%rsp)\n");
+        s.put("4:\n");
+        emitChunkAdd(&s);
+        emitChunk(&s, .load_slot_store);
+        s.put(" addq $64, %%rsi\n addq $64, %%rdi\n decq 80(%%rsp)\n jnz 4b\n");
+        emitBlockEndRedc(&s);
+        s.put(" movq 96(%%rsp), %%rdi\n addq $64, %%rdi\n movq %%rdi, 96(%%rsp)\n" ++
+            " movq 112(%%rsp), %%rsi\n decq 88(%%rsp)\n jnz 3b\n");
+        s.put(" movq 72(%%rsp), %%rax\n");
+        emitFrameLeave(&s);
+        const out = s.buf[0..s.len].*;
+        return &out;
+    }
+}
+
+/// A ← 2·A + Σ a[i]²·B^(2i) over 2L words (`sqrFixedText` phase 2 on its own).
+/// Registers on entry: rsi = a, rdi = A.
+fn doubleDiagText(comptime L: usize) []const u8 {
+    comptime {
+        @setEvalBranchQuota(400_000);
+        var s: AsmText(400 * L + 64) = .{};
+        s.put(" xorl %%eax, %%eax\n");
+        for (0..L) |i| {
+            const lo = decStr(16 * i);
+            const hi = decStr(16 * i + 8);
+            s.put(" movq " ++ decStr(8 * i) ++ "(%%rsi), %%rdx\n mulxq %%rdx, %%r11, %%r12\n" ++
+                " movq " ++ lo ++ "(%%rdi), %%r10\n adcxq %%r10, %%r10\n adoxq %%r11, %%r10\n movq %%r10, " ++ lo ++ "(%%rdi)\n" ++
+                " movq " ++ hi ++ "(%%rdi), %%r10\n adcxq %%r10, %%r10\n adoxq %%r12, %%r10\n movq %%r10, " ++ hi ++ "(%%rdi)\n");
+        }
+        const out = s.buf[0..s.len].*;
+        return &out;
+    }
+}
+
+const have_avx = builtin.cpu.arch == .x86_64 and std.Target.x86.featureSetHas(builtin.cpu.features, .avx);
+
+/// Zero `n` words with vector stores, in asm. Two reasons not to write
+/// `@memset`/`secureZero`: past a few hundred bytes LLVM lowers `@memset` to
+/// a call into Zig 0.16's byte-wise `compiler_rt.memset` (735 cycles for the
+/// 768-byte `A` of an L = 48 multiply, about a quarter of its product phase —
+/// perf on the bench host, 2026-10-14), and an asm store with a memory
+/// clobber can never be elided, so the same routine is the wipe.
+fn zeroWords(comptime n: usize, p: *[n]u64) void {
+    const text = comptime blk: {
+        @setEvalBranchQuota(100_000);
+        var s: AsmText(40 * n + 64) = .{};
+        const vw = if (have_avx) 4 else 2;
+        s.put(if (have_avx) " vpxor %%xmm0, %%xmm0, %%xmm0\n" else " pxor %%xmm0, %%xmm0\n");
+        var i: usize = 0;
+        while (i + vw <= n) : (i += vw) {
+            s.put((if (have_avx) " vmovdqu %%ymm0, " else " movdqu %%xmm0, ") ++ decStr(8 * i) ++ "(%%rdi)\n");
+        }
+        while (i < n) : (i += 1) s.put(" movq $0, " ++ decStr(8 * i) ++ "(%%rdi)\n");
+        const out = s.buf[0..s.len].*;
+        break :blk &out;
+    };
+    asm volatile (text
+        :
+        : [p] "{rdi}" (p),
+        : .{ .xmm0 = true, .ymm0 = true, .memory = true });
+}
+
+const block_clobbers: std.builtin.assembly.Clobbers = .{
+    .rax = true,
+    .rbx = true,
+    .rdx = true,
+    .r8 = true,
+    .r9 = true,
+    .r10 = true,
+    .r11 = true,
+    .r12 = true,
+    .r13 = true,
+    .r14 = true,
+    .r15 = true,
+    .cc = true,
+    .memory = true,
+};
+
+fn productBlock(comptime L: usize, A: *[2 * L]u64, a: *const [L]u64, b: *const [L]u64) void {
+    const text = comptime productBlockText(L);
+    var d_di: usize = undefined;
+    var d_si: usize = undefined;
+    var d_cx: usize = undefined;
+    asm volatile (text
+        : [di] "={rdi}" (d_di),
+          [si] "={rsi}" (d_si),
+          [cx] "={rcx}" (d_cx),
+        : [A] "{rdi}" (A),
+          [a] "{rsi}" (a),
+          [b] "{rcx}" (b),
+        : block_clobbers);
+}
+
+fn crossBlock(comptime L: usize, A: *[2 * L]u64, a: *const [L]u64) void {
+    const text = comptime crossBlockText(L);
+    var d_di: usize = undefined;
+    var d_si: usize = undefined;
+    var d_cx: usize = undefined;
+    asm volatile (text
+        : [di] "={rdi}" (d_di),
+          [si] "={rsi}" (d_si),
+          [cx] "={rcx}" (d_cx),
+        : [A] "{rdi}" (A),
+          [a] "{rsi}" (a),
+          [a2] "{rcx}" (a),
+        : block_clobbers);
+}
+
+fn doubleDiag(comptime L: usize, A: *[2 * L]u64, a: *const [L]u64) void {
+    const text = comptime doubleDiagText(L);
+    asm volatile (text
+        :
+        : [A] "{rdi}" (A),
+          [a] "{rsi}" (a),
+        : .{ .rax = true, .rdx = true, .r10 = true, .r11 = true, .r12 = true, .cc = true, .memory = true });
+}
+
+/// Returns the carry word of `(A + U·m)/R` (0 or 1 for `A < m·R`).
+fn redcBlock(comptime L: usize, A: *[2 * L]u64, m: *const [L]u64, n0inv: u64) u64 {
+    const text = comptime redcBlockText(L);
+    var d_di: usize = undefined;
+    var d_si: usize = undefined;
+    var d_cx: usize = undefined;
+    const top = asm volatile (text
+        : [ret] "={rax}" (-> u64),
+          [di] "={rdi}" (d_di),
+          [si] "={rsi}" (d_si),
+          [cx] "={rcx}" (d_cx),
+        : [A] "{rdi}" (A),
+          [m] "{rsi}" (m),
+          [n0] "{rcx}" (n0inv),
+        : block_clobbers);
+    return top;
+}
+
+/// `z = a·b·R⁻¹ mod m` through the 8-row block engine (`L % 8 == 0`,
+/// `L >= block_min_limbs`); same contract as `montMulFixed`.
+pub fn montMulBlock(comptime L: usize, z: *[L]u64, a: *const [L]u64, b: *const [L]u64, m: *const [L]u64, n0inv: u64) void {
+    if (comptime supported) {
+        comptime std.debug.assert(L % 8 == 0 and L >= block_min_limbs);
+        var A: [2 * L]u64 = undefined;
+        zeroWords(2 * L, &A);
+        defer zeroWords(2 * L, &A);
+        productBlock(L, &A, a, b);
+        const top = redcBlock(L, &A, m, n0inv);
+        condSubInto(L, z, A[L..], top, m);
+    } else {
+        unreachable; // guarded by every caller; see `mulRow`
+    }
+}
+
+/// `z = a²·R⁻¹ mod m` through the block engine: cross products, doubling +
+/// diagonal, REDC. Same contract as `montSqrFixed`, any `L % 8 == 0`,
+/// `L >= block_min_limbs` (no code-size cap: every phase loops).
+pub fn montSqrBlock(comptime L: usize, z: *[L]u64, a: *const [L]u64, m: *const [L]u64, n0inv: u64) void {
+    if (comptime supported) {
+        comptime std.debug.assert(L % 8 == 0 and L >= block_min_limbs);
+        var A: [2 * L]u64 = undefined;
+        zeroWords(2 * L, &A);
+        defer zeroWords(2 * L, &A);
+        crossBlock(L, &A, a);
+        doubleDiag(L, &A, a);
+        const top = redcBlock(L, &A, m, n0inv);
+        condSubInto(L, z, A[L..], top, m);
+    } else {
+        unreachable;
     }
 }
 

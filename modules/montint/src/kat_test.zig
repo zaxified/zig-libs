@@ -122,6 +122,10 @@ fn fixedDiff(comptime L: usize, rand: std.Random, trials: usize) !void {
         for (&mv) |*w| w.* = rand.int(u64);
         mv[0] |= 1;
         if (t % 4 == 3) mv[L - 1] = 1 + (mv[L - 1] >> 63) else mv[L - 1] |= 1 << 63;
+        // Every limb all-ones, operands m − 1: the largest products and the
+        // longest carry runs every fold sees (the block kernels' window-top
+        // folds rely on a value bound, not on a spare word).
+        if (t % 16 == 4) mv = .{~@as(u64, 0)} ** L;
         const m = try M.fromElem(mv);
         var a: M.Elem = undefined;
         var b: M.Elem = undefined;
@@ -137,10 +141,10 @@ fn fixedDiff(comptime L: usize, rand: std.Random, trials: usize) !void {
                 b = .{0} ** L;
                 b[0] = 1;
             },
-            2, 3 => {
+            2, 3, 4 => {
                 a = mv;
                 a[0] -= 1;
-                if (t % 16 == 3) b = a;
+                if (t % 16 != 2) b = a;
             },
             else => {},
         }
@@ -154,6 +158,14 @@ fn fixedDiff(comptime L: usize, rand: std.Random, trials: usize) !void {
             asm_core.montSqrFixed(L, &got, &a, &m.m, m.n0inv);
             try std.testing.expectEqualSlices(u64, &m.montMulCios(&a, &a), &got);
             asm_core.montSqrFixed(L, &got, &b, &m.m, m.n0inv);
+            try std.testing.expectEqualSlices(u64, &m.montMulCios(&b, &b), &got);
+        }
+        if (comptime L % 8 == 0 and L >= asm_core.block_min_limbs) {
+            asm_core.montMulBlock(L, &got, &a, &b, &m.m, m.n0inv);
+            try std.testing.expectEqualSlices(u64, &want, &got);
+            asm_core.montSqrBlock(L, &got, &a, &m.m, m.n0inv);
+            try std.testing.expectEqualSlices(u64, &m.montMulCios(&a, &a), &got);
+            asm_core.montSqrBlock(L, &got, &b, &m.m, m.n0inv);
             try std.testing.expectEqualSlices(u64, &m.montMulCios(&b, &b), &got);
         }
     }

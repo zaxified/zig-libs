@@ -851,29 +851,35 @@ pub const Blinding = union(enum) {
     }
 };
 
-/// F2 base-blinding factors for one CRT private op: `c_blinded = c·r^e mod n`
-/// for a fresh random unit `r`, plus `r_inv = r⁻¹ mod n` to undo it afterwards
-/// (`m·r_inv = (c·r^e)^d·r⁻¹ = c^d·r·r⁻¹ = c^d mod n`).
-const BlindingFactors = struct { c_blinded: MontElem, r_inv: MontElem };
+/// F2 base-blinding factors for one CRT private op, in the CRT domain: for a
+/// fresh random unit `r` mod n, `cp = (c mod p)·r^e mod p` and
+/// `cq = (c mod q)·r^e mod q` are the blinded halves, `rp_inv`/`rq_inv` the
+/// inverses of `r` mod p and mod q that undo them (`cp^dP = m1·r` mod p since
+/// `e·dP ≡ 1 (mod p − 1)`, likewise for q).
+const BlindingFactors = struct { cp: MontElem, cq: MontElem, rp_inv: MontElem, rq_inv: MontElem };
 
-/// Draw a fresh blinding pair. All arithmetic is on the PUBLIC modulus `n`
-/// and on `r`, a fresh secret-independent random unit; `rng` MUST be
-/// cryptographically secure — a predictable `r` voids the masking.
+/// Draw a fresh blinding pair. `r` is drawn uniformly mod the PUBLIC modulus
+/// `n` (rejection on `n` only — nothing here samples against a secret prime);
+/// `rng` MUST be cryptographically secure — a predictable `r` voids the
+/// masking.
 ///
-/// Since 2026-10-10 the whole pair is built on montint and `safegcd.zig`:
-/// `r` is drawn and range-checked as a montint element (no `std.crypto.ff`
-/// round trip), and `r⁻¹ mod n` is the constant-time batched safegcd instead
-/// of the `std.math.big` extended Euclid — that inverse was most of the
-/// blinded rows' cost in `bench-rsa` (SPEC "Performance"). The inverse is
-/// checked (`r·r⁻¹ ≡ 1`) before use, so neither a non-unit `r` (shares `p` or
-/// `q`: probability ~2^-1023) nor a divstep-bound shortfall can produce a
-/// wrong unblinding; both just redraw.
+/// Since 2026-10-14 the factors live in the CRT domain: `r mod p` and
+/// `r mod q` are inverted together by `safegcd.Inverter.invert2` (two
+/// half-size inversions, interleaved, ~½ the cost of one inverse mod n), and
+/// `r^e`, the blind and the unblind are half-size operations. Before, the
+/// 2048-bit inverse mod n alone was ~7 % of a blinded RSA-2048 op (perf on
+/// `bench-rsa`). Each inverse is checked (`r·r⁻¹ ≡ 1`) before use, so neither
+/// a non-unit `r` (shares `p` or `q`: probability ~2^-1023) nor a divstep-
+/// bound shortfall can produce a wrong unblinding; both just redraw — a
+/// decision about the random `r`, not about a secret.
 fn makeBlinding(sk: *const SecretKey, c: *const MontElem, rng: std.Random) BlindingFactors {
     const n_len = sk.n_mont.byteLen();
     var e_be: [max_modulus_len]u8 = undefined;
     sk.e.toBytes(&e_be, .big) catch unreachable;
+    const e_s = stripLeadingZeros(&e_be);
     var one: MontElem = MontParams.zero;
     one[0] = 1;
+    const half_bits = @max(sk.p_mont.nbits, sk.q_mont.nbits);
 
     while (true) {
         // Uniform r in [1, n−1] by rejection sampling (>= n and 0 redraw).
@@ -884,14 +890,29 @@ fn makeBlinding(sk: *const SecretKey, c: *const MontElem, rng: std.Random) Blind
         defer std.crypto.secureZero(u64, &r_el);
         if (MontParams.isZero(&r_el)) continue;
 
-        var r_inv: MontElem = MontParams.zero;
-        if (!BlindInverter.invert(&r_el, &sk.n_mont.m, sk.n_mont.nbits, &r_inv)) continue;
-        const chk = sk.n_mont.mul(&r_el, &r_inv);
-        if (!MontParams.eql(&chk, &one)) continue;
+        var rp = sk.p_mont.reduceLimbs(r_el[0..sk.n_mont.L]);
+        defer std.crypto.secureZero(u64, &rp);
+        var rq = sk.q_mont.reduceLimbs(r_el[0..sk.n_mont.L]);
+        defer std.crypto.secureZero(u64, &rq);
+        var out: BlindingFactors = .{ .cp = undefined, .cq = undefined, .rp_inv = MontParams.zero, .rq_inv = MontParams.zero };
+        const units = BlindInverter.invert2(&rp, &sk.p_mont.m, &rq, &sk.q_mont.m, half_bits, &out.rp_inv, &out.rq_inv);
+        // One verdict, read once: the four checks run mod the SECRET primes,
+        // so each would otherwise be its own branch on p/q (ctgrind). It is
+        // false only for r ≡ 0 mod p or q (~2^-1023) or a divstep-bound
+        // shortfall, and only ever causes a redraw.
+        const ok = @intFromBool(units[0]) & @intFromBool(units[1]) &
+            @intFromBool(MontParams.eql(&sk.p_mont.mul(&rp, &out.rp_inv), &one)) &
+            @intFromBool(MontParams.eql(&sk.q_mont.mul(&rq, &out.rq_inv), &one));
+        if (ok == 0) continue;
 
-        // re = r^e mod n (public exponent), then c_blinded = c·re mod n.
-        const re = sk.n_mont.powPublic(&r_el, stripLeadingZeros(&e_be));
-        return .{ .c_blinded = sk.n_mont.mul(c, &re), .r_inv = r_inv };
+        // cp = (c mod p)·r^e mod p, cq likewise (public exponent).
+        var rpe = sk.p_mont.powPublic(&rp, e_s);
+        defer std.crypto.secureZero(u64, &rpe);
+        var rqe = sk.q_mont.powPublic(&rq, e_s);
+        defer std.crypto.secureZero(u64, &rqe);
+        out.cp = sk.p_mont.mul(&sk.p_mont.reduceLimbs(c[0..sk.n_mont.L]), &rpe);
+        out.cq = sk.q_mont.mul(&sk.q_mont.reduceLimbs(c[0..sk.n_mont.L]), &rqe);
+        return out;
     }
 }
 
@@ -908,13 +929,21 @@ fn privateOpCrtPtr(sk: *const SecretKey, in: []const u8, out: []u8, blinding: Bl
     // dependent intermediate so any residual (compiler-defeated) timing/power
     // signal is masked. With `.none` the op runs unblinded but the F3 fault
     // check still applies.
-    var r_inv: ?MontElem = null;
-    var c_eff = c;
-    defer std.crypto.secureZero(u64, &c_eff);
+    var cp: MontElem = undefined;
+    defer std.crypto.secureZero(u64, &cp);
+    var cq: MontElem = undefined;
+    defer std.crypto.secureZero(u64, &cq);
+    var r_inv: ?struct { p: MontElem, q: MontElem } = null;
+    defer if (r_inv) |*ri| std.crypto.secureZero(u8, std.mem.asBytes(ri));
     if (blinding.rng()) |g| {
-        const b = makeBlinding(sk, &c, g);
-        c_eff = b.c_blinded;
-        r_inv = b.r_inv;
+        var b = makeBlinding(sk, &c, g);
+        defer std.crypto.secureZero(u8, std.mem.asBytes(&b));
+        cp = b.cp;
+        cq = b.cq;
+        r_inv = .{ .p = b.rp_inv, .q = b.rq_inv };
+    } else {
+        cp = sk.p_mont.reduceLimbs(c[0..sk.n_mont.L]);
+        cq = sk.q_mont.reduceLimbs(c[0..sk.n_mont.L]);
     }
 
     // The secret CRT parameters as montint elements, wiped on return.
@@ -926,11 +955,16 @@ fn privateOpCrtPtr(sk: *const SecretKey, in: []const u8, out: []u8, blinding: Bl
     defer std.crypto.secureZero(u64, &qinv);
 
     // RFC 8017 §5.1.2 form (2), two-prime case:
-    //   m1 = c^dP mod p, m2 = c^dQ mod q   (on the possibly-blinded c_eff)
-    var m1 = sk.p_mont.pow(&sk.p_mont.reduceLimbs(c_eff[0..sk.n_mont.L]), &dp);
+    //   m1 = c^dP mod p, m2 = c^dQ mod q   (on the possibly-blinded halves)
+    var m1 = sk.p_mont.pow(&cp, &dp);
     defer std.crypto.secureZero(u64, &m1);
-    var m2 = sk.q_mont.pow(&sk.q_mont.reduceLimbs(c_eff[0..sk.n_mont.L]), &dq);
+    var m2 = sk.q_mont.pow(&cq, &dq);
     defer std.crypto.secureZero(u64, &m2);
+    // F2 unblind, per half: m1·(r mod p)⁻¹, m2·(r mod q)⁻¹.
+    if (r_inv) |*ri| {
+        m1 = sk.p_mont.mul(&m1, &ri.p);
+        m2 = sk.q_mont.mul(&m2, &ri.q);
+    }
 
     //   h = (m1 - m2) * qInv mod p    (m2 reduced into the mod-p domain first)
     var h = sk.p_mont.mul(&qinv, &sk.p_mont.sub(&m1, &sk.p_mont.reduceLimbs(m2[0..sk.q_mont.L])));
@@ -940,9 +974,6 @@ fn privateOpCrtPtr(sk: *const SecretKey, in: []const u8, out: []u8, blinding: Bl
     //   already a canonical element of n.
     var m = sk.n_mont.add(&m2, &sk.n_mont.mul(&sk.q_mont.m, &h));
     defer std.crypto.secureZero(u64, &m);
-
-    // F2 unblind: m <- m·r⁻¹ mod n, recovering the true representative.
-    if (r_inv) |*ri| m = sk.n_mont.mul(&m, ri);
 
     // F3 (Bellcore / BDL fault check): re-encrypt the UNBLINDED m and compare
     // to the ORIGINAL c. A fault in either CRT half makes m ≢ c^d, so m^e ≢ c
@@ -2928,6 +2959,7 @@ test {
     _ = safegcd;
     _ = @import("stackprobe_test.zig");
     _ = @import("stackprobe2_test.zig");
+    _ = @import("wycheproof_test.zig");
 }
 
 //

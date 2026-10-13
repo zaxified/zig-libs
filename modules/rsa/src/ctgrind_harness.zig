@@ -144,7 +144,6 @@ fn taintMont(t: Taint, mp: anytype) void {
     taintBytes(t, std.mem.asBytes(&mp.n0inv));
     taintBytes(t, std.mem.asBytes(&mp.r2));
     taintBytes(t, std.mem.asBytes(&mp.one_mont));
-    taintBytes(t, std.mem.asBytes(&mp.digit_mont));
 }
 
 pub fn main(init: std.process.Init.Minimal) !void {

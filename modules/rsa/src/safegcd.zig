@@ -55,6 +55,20 @@ inline fn blackBox(x: u64) u64 {
     );
 }
 
+/// `blackBox` for a 2×64-bit mask vector: one SSE register on x86-64,
+/// lane by lane elsewhere (the vector form of the barrier needs a
+/// target-specific register class).
+inline fn blackBoxV(x: @Vector(2, u64)) @Vector(2, u64) {
+    if (@inComptime()) return x;
+    if (comptime @import("builtin").cpu.arch == .x86_64) {
+        return asm volatile (""
+            : [ret] "=x" (-> @Vector(2, u64)),
+            : [x] "0" (x),
+        );
+    }
+    return .{ blackBox(x[0]), blackBox(x[1]) };
+}
+
 inline fn blackBoxI(x: i64) i64 {
     return @bitCast(blackBox(@bitCast(x)));
 }
@@ -136,6 +150,52 @@ pub fn Inverter(comptime max_bits: usize) type {
             return .{ .zeta = zeta, .t = .{ .u = @bitCast(u), .v = @bitCast(v), .q = @bitCast(q), .r = @bitCast(r) } };
         }
 
+        /// `divsteps59` on two independent problems in lockstep, one per
+        /// lane of a 2×64-bit vector. One batch is a 59-step dependency
+        /// chain (~6 cycles a step); two chains side by side cost about one
+        /// (2026-10-14, rsa's CRT-domain blinding inverts mod p and mod q
+        /// together). The lanes are a vector, not two scalar copies: as
+        /// scalars the 14 live values plus temporaries spilled to the stack
+        /// and put a store-load round trip on the chain (~24 cycles a step,
+        /// perf on `bench-rsa`). AVX2 has no 64-bit arithmetic shift, so the
+        /// sign mask of `zeta` is a compare with zero; both masks are
+        /// laundered like the scalar ones.
+        fn divsteps59x2(zeta_in: [2]i64, f0: [2]u64, g0: [2]u64) struct { zeta: [2]i64, t: [2]Trans } {
+            const V = @Vector(2, u64);
+            const VI = @Vector(2, i64);
+            const one: V = @splat(1);
+            const zero: V = @splat(0);
+            var u: V = @splat(8);
+            var v: V = zero;
+            var q: V = zero;
+            var r: V = @splat(8);
+            var f: V = f0;
+            var g: V = g0;
+            var zeta: VI = zeta_in;
+            var i: usize = 3;
+            while (i < 62) : (i += 1) {
+                var mask1: V = blackBoxV(@select(u64, zeta < @as(VI, @splat(0)), ~zero, zero));
+                const mask2: V = blackBoxV(zero -% (g & one));
+                const x = (f ^ mask1) -% mask1;
+                const y = (u ^ mask1) -% mask1;
+                const z = (v ^ mask1) -% mask1;
+                g +%= x & mask2;
+                q +%= y & mask2;
+                r +%= z & mask2;
+                mask1 &= mask2;
+                zeta = (zeta ^ @as(VI, @bitCast(mask1))) -% @as(VI, @splat(1));
+                f +%= g & mask1;
+                u +%= q & mask1;
+                v +%= r & mask1;
+                g >>= @splat(1);
+                u <<= @splat(1);
+                v <<= @splat(1);
+            }
+            var t: [2]Trans = undefined;
+            inline for (0..2) |l| t[l] = .{ .u = @bitCast(u[l]), .v = @bitCast(v[l]), .q = @bitCast(q[l]), .r = @bitCast(r[l]) };
+            return .{ .zeta = zeta, .t = t };
+        }
+
         fn updateDE(d: *S62, e: *S62, t: Trans, m: *const S62, minv62: u64, k: usize) void {
             const sd: i64 = blackBoxI(d[k - 1] >> 63);
             const se: i64 = blackBoxI(e[k - 1] >> 63);
@@ -210,40 +270,99 @@ pub fn Inverter(comptime max_bits: usize) type {
             std.debug.assert(nbits >= 3 and nbits <= max_bits);
             std.debug.assert(m_limbs[0] & 1 == 1);
             const k: usize = @min(K, (nbits + 2 + 61) / 62 + 1);
-            // m⁻¹ mod 2^64 by Newton (m odd ⇒ m⁻¹ ≡ m mod 8; 3→6→…→96 bits).
-            var minv: u64 = m_limbs[0];
-            for (0..5) |_| minv *%= 2 -% m_limbs[0] *% minv;
-            const m = fromLimbs(m_limbs, k);
-            var d = [_]i64{0} ** K;
-            var e = [_]i64{0} ** K;
-            e[0] = 1;
-            var f = m;
-            var g = fromLimbs(x, k);
-            var zeta: i64 = -1;
+            var st = State.init(x, m_limbs, k);
+            for (0..batchCount(nbits)) |_| {
+                const ds = divsteps59(st.zeta, @bitCast(st.f[0]), @bitCast(st.g[0]));
+                st.step(ds.zeta, ds.t, k);
+            }
+            return st.finish(k, out);
+        }
+
+        /// Two inversions `out1 = x1⁻¹ mod m1`, `out2 = x2⁻¹ mod m2` at once
+        /// (`invert`'s contract for each; `nbits` bounds BOTH moduli's bit
+        /// lengths), their divstep chains interleaved (`divsteps59x2`). Each
+        /// verdict is returned separately.
+        pub fn invert2(
+            x1: *const [N]u64,
+            m1: *const [N]u64,
+            x2: *const [N]u64,
+            m2: *const [N]u64,
+            nbits: usize,
+            out1: *[N]u64,
+            out2: *[N]u64,
+        ) [2]bool {
+            std.debug.assert(nbits >= 3 and nbits <= max_bits);
+            std.debug.assert(m1[0] & 1 == 1 and m2[0] & 1 == 1);
+            const k: usize = @min(K, (nbits + 2 + 61) / 62 + 1);
+            var st1 = State.init(x1, m1, k);
+            var st2 = State.init(x2, m2, k);
+            for (0..batchCount(nbits)) |_| {
+                const ds = divsteps59x2(.{ st1.zeta, st2.zeta }, .{ @bitCast(st1.f[0]), @bitCast(st2.f[0]) }, .{ @bitCast(st1.g[0]), @bitCast(st2.g[0]) });
+                st1.step(ds.zeta[0], ds.t[0], k);
+                st2.step(ds.zeta[1], ds.t[1], k);
+            }
+            return .{ st1.finish(k, out1), st2.finish(k, out2) };
+        }
+
+        fn batchCount(nbits: usize) usize {
             const b = @max(nbits, 46);
             const steps = (49 * b + 57) / 17;
-            const batches = (steps + 58) / 59;
-            for (0..batches) |_| {
-                const st = divsteps59(zeta, @bitCast(f[0]), @bitCast(g[0]));
-                zeta = st.zeta;
-                updateDE(&d, &e, st.t, &m, minv & M62, k);
-                updateFG(&f, &g, st.t, k);
-            }
-            // Verdict: g = 0 and f = ±1 (f's limbs are normalized by updateFG
-            // except the top, which holds the sign: f = 1 ⟺ [1,0,…,0],
-            // f = −1 ⟺ [M62, …, M62, −1]).
-            var acc: u64 = 0;
-            for (0..k) |i| acc |= @bitCast(g[i]);
-            const fs: i64 = f[k - 1] >> 63; // 0 or −1
-            var fn_ = f;
-            for (0..k) |i| fn_[i] = (fn_[i] ^ fs) -% fs; // |f| if f's sign limb is the only sign
-            carryNorm(&fn_, k);
-            acc |= @as(u64, @bitCast(fn_[0])) ^ 1;
-            for (1..k) |i| acc |= @bitCast(fn_[i]);
-            normalize(&d, f[k - 1], &m, k);
-            out.* = toLimbs(&d, k);
-            return acc == 0;
+            return (steps + 58) / 59;
         }
+
+        /// One inversion's vectors between batches.
+        const State = struct {
+            m: S62,
+            minv62: u64,
+            d: S62,
+            e: S62,
+            f: S62,
+            g: S62,
+            zeta: i64,
+
+            fn init(x: *const [N]u64, m_limbs: *const [N]u64, k: usize) State {
+                // m⁻¹ mod 2^64 by Newton (m odd ⇒ m⁻¹ ≡ m mod 8; 3→6→…→96 bits).
+                var minv: u64 = m_limbs[0];
+                for (0..5) |_| minv *%= 2 -% m_limbs[0] *% minv;
+                const m = fromLimbs(m_limbs, k);
+                var st: State = .{
+                    .m = m,
+                    .minv62 = minv & M62,
+                    .d = [_]i64{0} ** K,
+                    .e = [_]i64{0} ** K,
+                    .f = m,
+                    .g = fromLimbs(x, k),
+                    .zeta = -1,
+                };
+                st.e[0] = 1;
+                return st;
+            }
+
+            fn step(st: *State, zeta: i64, t: Trans, k: usize) void {
+                st.zeta = zeta;
+                updateDE(&st.d, &st.e, t, &st.m, st.minv62, k);
+                updateFG(&st.f, &st.g, t, k);
+            }
+
+            /// Verdict: g = 0 and f = ±1 (f's limbs are normalized by
+            /// updateFG except the top, which holds the sign: f = 1 ⟺
+            /// [1,0,…,0], f = −1 ⟺ [M62, …, M62, −1]). Wipes the state.
+            fn finish(st: *State, k: usize, out: *[N]u64) bool {
+                var acc: u64 = 0;
+                for (0..k) |i| acc |= @bitCast(st.g[i]);
+                const fs: i64 = st.f[k - 1] >> 63; // 0 or −1
+                var fn_ = st.f;
+                for (0..k) |i| fn_[i] = (fn_[i] ^ fs) -% fs; // |f| if f's sign limb is the only sign
+                carryNorm(&fn_, k);
+                acc |= @as(u64, @bitCast(fn_[0])) ^ 1;
+                for (1..k) |i| acc |= @bitCast(fn_[i]);
+                normalize(&st.d, st.f[k - 1], &st.m, k);
+                out.* = toLimbs(&st.d, k);
+                std.crypto.secureZero(i64, &fn_);
+                std.crypto.secureZero(u8, std.mem.asBytes(st));
+                return acc == 0;
+            }
+        };
     };
 }
 
@@ -330,6 +449,39 @@ test "safegcd Inverter: x·x⁻¹ ≡ 1 against big-int, random odd moduli 64..4
             try checkOne(I, gpa, &x, &m, nbits);
         }
     }
+    // invert2 == invert on both lanes, including a unit beside a non-unit
+    // and moduli of different lengths under one bound.
+    for (0..40) |t| {
+        const nb1 = sizes[t % sizes.len];
+        const nb2 = sizes[(t * 7 + 3) % sizes.len];
+        var ms: [2][I.N]u64 = undefined;
+        var xs: [2][I.N]u64 = undefined;
+        for ([_]usize{ nb1, nb2 }, 0..) |nbits, l| {
+            ms[l] = [_]u64{0} ** I.N;
+            xs[l] = [_]u64{0} ** I.N;
+            const nl = (nbits + 63) / 64;
+            for (0..nl) |i| ms[l][i] = rand.int(u64);
+            const topbits: u6 = @intCast(nbits - 64 * (nl - 1) - 1);
+            ms[l][nl - 1] &= (@as(u64, 2) << topbits) -% 1;
+            ms[l][nl - 1] |= @as(u64, 1) << topbits;
+            ms[l][0] |= 1;
+            if (t % 5 != l) {
+                for (0..nl) |i| xs[l][i] = rand.int(u64);
+                xs[l][nl - 1] %= ms[l][nl - 1];
+            }
+        }
+        var o1: [I.N]u64 = undefined;
+        var o2: [I.N]u64 = undefined;
+        const v = I.invert2(&xs[0], &ms[0], &xs[1], &ms[1], @max(nb1, nb2), &o1, &o2);
+        var w1: [I.N]u64 = undefined;
+        var w2: [I.N]u64 = undefined;
+        try std.testing.expectEqual(I.invert(&xs[0], &ms[0], nb1, &w1), v[0]);
+        try std.testing.expectEqual(I.invert(&xs[1], &ms[1], nb2, &w2), v[1]);
+        if (v[0]) try std.testing.expectEqualSlices(u64, &w1, &o1);
+        if (v[1]) try std.testing.expectEqualSlices(u64, &w2, &o2);
+        try checkOne(I, gpa, &xs[0], &ms[0], nb1);
+    }
+
     // A non-unit that is not 0: m = 3·5·(odd), x = 15.
     var m = [_]u64{0} ** I.N;
     m[0] = 15 * 0x1234567;

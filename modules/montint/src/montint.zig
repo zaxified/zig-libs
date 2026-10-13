@@ -323,6 +323,33 @@ pub fn Modint(comptime max_bits: comptime_int) type {
             return out;
         }
 
+        /// `(m − a) mod m`, domain-agnostic, with `0 ↦ 0`; constant-time (`sub`'s
+        /// masked add-back).
+        pub fn neg(self: *const Self, a: *const Elem) Elem {
+            const zero_e = std.mem.zeroes(Elem);
+            return self.sub(&zero_e, a);
+        }
+
+        /// Whether two Montgomery-domain values are equal. Every value is fully
+        /// reduced (`< m`, see `montMul`), so `a·R mod m` is a unique
+        /// representative and comparing the limbs compares the values.
+        /// Constant-time; no early exit.
+        pub fn eql(self: *const Self, a: *const Elem, b: *const Elem) bool {
+            _ = self;
+            var acc: u64 = 0;
+            for (a, b) |x, y| acc |= x ^ y;
+            return acc == 0;
+        }
+
+        /// Whether a Montgomery-domain value is zero (`0·R = 0`, so the
+        /// representative is all-zero limbs). Constant-time; no early exit.
+        pub fn isZero(self: *const Self, a: *const Elem) bool {
+            _ = self;
+            var acc: u64 = 0;
+            for (a) |w| acc |= w;
+            return acc == 0;
+        }
+
         /// `(a · b) mod m` in the NORMAL domain (the user-facing modmul the KAT
         /// pins). Costs two Montgomery multiplies: `montMul(toMont(a), b)`.
         pub fn mul(self: *const Self, a: *const Elem, b: *const Elem) Elem {
@@ -338,7 +365,9 @@ pub fn Modint(comptime max_bits: comptime_int) type {
             var z: Elem = undefined;
             // Small-L cutoff: asm only pays off for large moduli (see
             // `asm_min_limbs`); pairing fields (L=4/6) stay portable.
-            if (comptime asm_active and L >= fixed_min_limbs) {
+            if (comptime asm_active and L % 8 == 0 and L >= asm_core.block_min_limbs) {
+                asm_core.montMulBlock(L, &z, a, b, &self.m, self.n0inv);
+            } else if (comptime asm_active and L >= fixed_min_limbs) {
                 asm_core.montMulFixed(L, &z, a, b, &self.m, self.n0inv);
             } else if (comptime asm_active and L >= asm_min_limbs) {
                 asm_core.montMul(&z, a, b, &self.m, self.n0inv);
@@ -373,6 +402,11 @@ pub fn Modint(comptime max_bits: comptime_int) type {
         ///   * else (tiny L, incl. the pairing-field sizes) → `montMulCios(a,a)`,
         ///     where the general multiply is as fast or faster.
         pub fn montSqr(self: *const Self, a: *const Elem) Elem {
+            if (comptime asm_active and L % 8 == 0 and L >= asm_core.block_min_limbs) {
+                var z: Elem = undefined;
+                asm_core.montSqrBlock(L, &z, a, &self.m, self.n0inv);
+                return z;
+            }
             if (comptime asm_active and L >= fixed_min_limbs) {
                 var z: Elem = undefined;
                 if (comptime L <= asm_core.sqr_fixed_max_limbs) {
@@ -567,18 +601,45 @@ pub fn Modint(comptime max_bits: comptime_int) type {
                 // recover "pick the matching entry" and lower it to a
                 // secret-indexed jump table (see `blackBox`). Every entry is
                 // read and blended unconditionally, in constant work.
-                var g = std.mem.zeroes(Elem);
-                var idx: usize = 0;
-                while (idx < table_len) : (idx += 1) {
-                    const mask = blackBox(0 -% @as(u64, @intFromBool(idx == digit)));
-                    for (&g, &table[idx]) |*gl, tl| gl.* = (tl & mask) | (gl.* & ~mask);
-                }
+                const g = gather(&table, digit);
                 acc = self.montMul(&acc, &g);
             }
             return self.fromMontgomery(&acc);
         }
 
         // ── internal CT helpers ─────────────────────────────────────────────
+
+        /// `table[digit]` by a masked scan over every entry (constant work,
+        /// no secret index; the per-entry mask laundered, see `blackBox`).
+        /// Exactly one mask is all-ones, so `g |= entry & mask` suffices.
+        /// For `L % 4 == 0` the accumulator is `L/4` explicit 256-bit lanes,
+        /// which LLVM keeps in registers across the scan (2026-10-14: the
+        /// scalar-loop form kept `g` in memory, a load and a store per word
+        /// per entry — ~6 % of a 1024-bit `powMont`).
+        fn gather(table: anytype, digit: usize) Elem {
+            const n = table.len;
+            if (comptime L % 4 == 0) {
+                const V = @Vector(4, u64);
+                const nv = L / 4;
+                var gv: [nv]V = @splat(@as(V, @splat(0)));
+                for (0..n) |idx| {
+                    const mask: V = @splat(blackBox(0 -% @as(u64, @intFromBool(idx == digit))));
+                    inline for (0..nv) |q| {
+                        const t: V = table[idx][4 * q ..][0..4].*;
+                        gv[q] |= t & mask;
+                    }
+                }
+                var g: Elem = undefined;
+                inline for (0..nv) |q| g[4 * q ..][0..4].* = gv[q];
+                return g;
+            }
+            var g = std.mem.zeroes(Elem);
+            for (0..n) |idx| {
+                const mask = blackBox(0 -% @as(u64, @intFromBool(idx == digit)));
+                for (&g, &table[idx]) |*gl, tl| gl.* |= tl & mask;
+            }
+            return g;
+        }
 
         // Optimization barrier: launder a value through an (empty) inline-asm
         // so LLVM loses all range/equality knowledge about it. No-op at runtime
@@ -1261,6 +1322,81 @@ test "R2 ladder agrees with the doubling reference, bit for bit, on every slot" 
             try std.testing.expectEqualSlices(u64, &reference, &built.r2);
             // and `one_mont` is untouched by the change, so it must still hold
             try std.testing.expect(!std.mem.eql(u8, std.mem.asBytes(&built.one_mont), std.mem.asBytes(&built.r2)));
+        }
+    }
+}
+
+fn bigOf(gpa: std.mem.Allocator, v: []const u64) !std.math.big.int.Managed {
+    var r = try std.math.big.int.Managed.init(gpa);
+    errdefer r.deinit();
+    try r.ensureCapacity(v.len + 1);
+    @memset(r.limbs, 0);
+    @memcpy(r.limbs[0..v.len], v);
+    r.normalize(v.len + 1);
+    return r;
+}
+
+test "Modint eql/isZero/neg: the represented value, against big.int, edge and random elements" {
+    const gpa = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0xE91_0E6);
+    const rnd = prng.random();
+    inline for (.{ 4, 16, 32 }) |L| {
+        const M = Modint(L * 64);
+        var trial: usize = 0;
+        while (trial < 4) : (trial += 1) {
+            var mv: [L]u64 = undefined;
+            for (&mv) |*w| w.* = rnd.int(u64);
+            mv[0] |= 1;
+            mv[L - 1] |= 1 << 63;
+            const m = try M.fromElem(mv);
+            var bm = try bigOf(gpa, &mv);
+            defer bm.deinit();
+
+            // normal-domain inputs: 0, 1, m−1, 2, m−2, differing only in the top limb / limb 0, random
+            var pool: [9 + 12]M.Elem = undefined;
+            pool[0] = std.mem.zeroes(M.Elem);
+            pool[1] = pool[0];
+            pool[1][0] = 1;
+            pool[2] = mv;
+            pool[2][0] -= 1; // m − 1 (m is odd, so limb 0 ≥ 1)
+            pool[3] = pool[0];
+            pool[3][0] = 2;
+            pool[4] = mv;
+            pool[4][0] -= 2; // m − 2 (limb 0 ≥ 1: borrow only if m[0] == 1)
+            if (mv[0] == 1) pool[4] = pool[2];
+            pool[5] = pool[2];
+            pool[5][L - 1] -= 1 << 62; // differs from m − 1 in the top limb only (still < m)
+            pool[6] = pool[2];
+            pool[6][0] = if (mv[0] > 3) mv[0] - 3 else 0; // differs from m − 1 in limb 0 only
+            pool[7] = pool[0];
+            pool[7][L - 1] = 1; // only the top limb
+            pool[8] = pool[0];
+            pool[8][0] = 5;
+            for (pool[9..]) |*e| {
+                for (e) |*w| w.* = rnd.int(u64);
+                e[L - 1] &= ~(@as(u64, 1) << 63); // < m (m has its top bit set)
+            }
+            var mont: [pool.len]M.Elem = undefined;
+            for (&mont, pool) |*o, p| o.* = m.toMontgomery(&p);
+
+            for (pool, mont) |a, am| {
+                try std.testing.expectEqual(std.mem.allEqual(u64, &a, 0), m.isZero(&am));
+                // neg: (m − a) mod m, 0 ↦ 0, stays in the Montgomery domain
+                var ba = try bigOf(gpa, &a);
+                defer ba.deinit();
+                var want = try std.math.big.int.Managed.init(gpa);
+                defer want.deinit();
+                try want.sub(&bm, &ba);
+                if (ba.eqlZero()) try want.set(0);
+                const got = m.fromMontgomery(&m.neg(&am));
+                var bg = try bigOf(gpa, &got);
+                defer bg.deinit();
+                try std.testing.expect(want.eql(bg));
+                try std.testing.expect(m.isZero(&m.add(&am, &m.neg(&am))));
+                for (pool, mont) |b, bmont| {
+                    try std.testing.expectEqual(std.mem.eql(u64, &a, &b), m.eql(&am, &bmont));
+                }
+            }
         }
     }
 }

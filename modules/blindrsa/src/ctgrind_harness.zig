@@ -266,7 +266,6 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 taintBytes(taint, std.mem.asBytes(&mp.n0inv));
                 taintBytes(taint, std.mem.asBytes(&mp.r2));
                 taintBytes(taint, std.mem.asBytes(&mp.one_mont));
-                taintBytes(taint, std.mem.asBytes(&mp.digit_mont));
             }
             const sk_reloaded = reloadVolatile(rsa.SecretKey, &sk);
 

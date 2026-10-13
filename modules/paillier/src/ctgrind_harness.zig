@@ -258,13 +258,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
             // p/q (SecretKey.deinit's own doc comment), so every field
             // derived from them is secret material too.
             taintBytes(taint, std.mem.asBytes(&sk.crt.?));
-            // …except the montint slot `L`, bit length and digit width of
-            // p²/q²: all three follow from the factors' bit LENGTH (the key
+            // …except the montint slot `L` and bit length of p²/q²: both
+            // follow from the factors' bit LENGTH (the key
             // size, public), and every montint call dispatches on `L`, so a
             // tainted slot would report one artifact context per call site.
             if (taint == .yes) inline for (.{ &sk.crt.?.p_sq_mont, &sk.crt.?.q_sq_mont }) |mp| {
                 std.valgrind.memcheck.makeMemDefined(std.mem.asBytes(&mp.L));
-                std.valgrind.memcheck.makeMemDefined(std.mem.asBytes(&mp.digit_bits));
                 std.valgrind.memcheck.makeMemDefined(std.mem.asBytes(&mp.nbits));
             };
 

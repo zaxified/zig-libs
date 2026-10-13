@@ -76,7 +76,6 @@ fn taintMont(t: Taint, mp: anytype) void {
     taint(t, std.mem.asBytes(&mp.n0inv));
     taint(t, std.mem.asBytes(&mp.r2));
     taint(t, std.mem.asBytes(&mp.one_mont));
-    taint(t, std.mem.asBytes(&mp.digit_mont));
 }
 
 /// Format a (possibly tainted) copy of `bytes` through the non-constant-time
