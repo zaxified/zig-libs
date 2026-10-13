@@ -137,8 +137,8 @@ age calculation, so they degrade to "nothing evicted" rather than UB.
 ## Verify
 
 ```
-scripts/modtest pping                          # Debug       — 80 pass
-scripts/modtest pping -Doptimize=ReleaseSafe   # ReleaseSafe — 80 pass
+scripts/modtest pping                          # Debug
+scripts/modtest pping -Doptimize=ReleaseSafe   # ReleaseSafe
 ```
 
 The option parser has a KAT corpus plus a hostile-input test proving it never

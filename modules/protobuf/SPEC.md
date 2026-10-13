@@ -96,7 +96,7 @@ Captured bytes are stored **verbatim** (tag included), not re-encoded from a par
 is what makes forwarding byte-exact for free, and it means a field this build cannot even name a
 wire type for is still carried correctly. They are re-emitted after the known fields; field order
 carries no meaning in protobuf, so that is lossless. The reference implementation judges this
-end-to-end: `reference: a message proxied through a partial schema is unchanged` decodes a full
+end-to-end: `interop replay: a message proxied through a partial schema is unchanged` decodes a full
 message through a two-field schema, re-encodes, and requires the reference to read back exactly
 what it originally wrote.
 

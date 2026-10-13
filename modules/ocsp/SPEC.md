@@ -257,7 +257,7 @@ gate under it, and it ages every time a test is added.
 
 Implemented: request build (SHA-1/SHA-256 CertID + nonce), response parse
 (allocation-free, bounds-safe), and full verification (direct + delegated
-responder, RSA + ECDSA-P256, CertID binding, freshness, nonce). `zig build
+responder, RSA + ECDSA P-256/P-384, CertID binding, freshness, nonce). `zig build
 test-ocsp` — green in Debug and ReleaseFast.
 
 ## Anchoring

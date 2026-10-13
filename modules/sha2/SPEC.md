@@ -130,7 +130,7 @@ implementation adds none: no table indexed by data, no branch on data, the
 batch size and the scalar/SIMD choice depend only on the **length** of the
 input. Lengths are public in every protocol this is used in (TLS records,
 HMAC key/message sizes). That is the whole claim; it rests on reading the
-code, not on a ctgrind harness. When the input is secret (HMAC keys, HKDF
+code and on the ctgrind harness (`src/ctgrind_harness.zig`; see the Maturity card's `ct` line). When the input is secret (HMAC keys, HKDF
 PRKs, TLS transcript secrets), the working state is Z3 storage in
 `CONVENTIONS.md` §2.1's sense — the transform's internal state, not wiped,
 exactly as std does not wipe it; the SIMD schedule table on the stack is the

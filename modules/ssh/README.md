@@ -62,8 +62,10 @@ no skips.
   single_owner — one `Transport` instance owns one connection's
   sequence-number/cipher state; no shared/global state.
 - **Deps:** `rsa` (this repo's own module) — for `rsa-sha2-256`/`rsa-sha2-512`
-  (RFC 8332) signature verify/sign, as host keys and as user keys.
-- **Crypto:** Zig `std.crypto` — X25519 + ML-KEM-768 (KEX), Ed25519/P-256
+  (RFC 8332) signature verify/sign, as host keys and as user keys; `montint`
+  (DH group exchange / group14/16 modexp); `p521` (ecdsa-sha2-nistp521 and
+  ecdh-sha2-nistp521); `aes192` (`aes192-ctr`).
+- **Crypto:** Zig `std.crypto` — X25519 + ML-KEM-768 (KEX), Ed25519/P-256/P-384
   (signatures), ChaCha20-Poly1305 / AES-CTR / AES-GCM (ciphers), SHA-2 /
   HMAC-SHA2-256.
 
@@ -73,7 +75,7 @@ Clean-room implementation from RFC 4253 (SSH Transport Layer Protocol),
 RFC 4251 (SSH Protocol Architecture — the mpint/string/name-list wire types),
 RFC 4252 (Authentication Protocol), RFC 4254 (Connection Protocol) and RFC 8731
 (curve25519-sha256 key exchange). The `chacha20-poly1305@openssh.com` cipher
-framing and (when implemented) `aes-gcm`-family framing follow the OpenSSH
+framing and `aes-gcm`-family framing follow the OpenSSH
 `PROTOCOL`/`PROTOCOL.chacha20poly1305` notes and RFC 5647 — public
 documentation of OpenSSH's own protocol extensions, not OpenSSH source.
 Design reference: ringtailsoftware/misshod (MIT) — architecture SHAPE only,

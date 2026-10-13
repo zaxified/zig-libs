@@ -137,9 +137,8 @@ readings taken from the RFC's own prose — the previous-chapter example, an ext
 expressed as a full URI, an unmodeled `anchor` param tolerated without desync, a multi-relation-type
 `rel` list, and the comma-joined-equals-two-header-lines equivalence. The RFC 8288 errata list was
 checked (2026-08-01): none of the four errata (5319, 5878, 5168, 5169) touch §3, §3.3, §3.4 or §3.5,
-so none affect these fixtures. One further §3.5 example — the `title*=UTF-8'de'...` RFC 8187
-extended-notation title — is out of scope and not used, since this module does not implement
-extended (`*`-suffixed) parameter notation (see "Threat model / out of scope" above). Public-spec test
+so none affect these fixtures. The further §3.5 example — the `title*=UTF-8'de'...` RFC 8187
+extended-notation title — is covered since 2026-10-04 by the `title*` example test (`decodeExtValue` / `preferredTitle`). Public-spec test
 data under NOTICE policy §0 — needs no attribution entry.
 
 ## Backlog / deferred
@@ -177,6 +176,6 @@ src/root.zig.
 - **Class A** — wire/interop format — other implementations must byte-agree with it.
 - **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
 
-**What the tests actually contain.** src/root.zig:541+ reconstructs RFC 8288 §3.5's own worked examples byte-for-byte from the RFC (errata list checked) and asserts the RFC's own stated reading of each; the build direction and every other parse fixture in the file are hand-authored
+**What the tests actually contain.** the "RFC 8288 §3.5" tests in src/root.zig reconstruct RFC 8288 §3.5's own worked examples byte-for-byte from the RFC (errata list checked) and asserts the RFC's own stated reading of each; the build direction and every other parse fixture in the file are hand-authored
 
 **How it got there.** The anchoring work landed. DONE 9ca8ed7: RFC 8288 3.5 worked examples transcribed, errata checked

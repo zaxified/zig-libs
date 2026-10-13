@@ -100,7 +100,7 @@ and the pace at which it sends it; each of the four is bounded by a knob on `Cli
   lines in a group was not, and 10 MB of legal lines made 2.4 GB live that stayed allocated after
   the error (A1 F3/F15). Past it, `error.ResponseTooLarge` and the buffers are freed.
   **The effective per-line ceiling is 4088 bytes, not ~4 KiB** — it comes from `http`'s own
-  `body_scratch_len = 4096` (`http/src/Client.zig:1060`), which is not configurable and which this
+  `body_scratch_len = 4096` (`body_scratch_len` in `http/src/Client.zig`), which is not configurable and which this
   module does not otherwise surface (A1 F13). A single SSE line past it is `error.LineTooLong`
   from `sse_parse`, which `EventIterator.next` maps to `error.HttpFailed` — indistinguishable from
   a dead connection (see F14 below) unless the caller already knows about this ceiling. Not a knob
@@ -144,7 +144,7 @@ data is the caller's and goes on the wire verbatim (JSON-escaped like any string
 Two places in this module's docs (this file's own Out-of-scope line and the README's DEFER list)
 used to claim "`http.Client` opens a fresh connection per request (`Connection: close`)" — that was
 never true of the code: `requestHeaders()` sends no `Connection`
-header at all, and `http.Client.Options.pool.enabled` **defaults to `true`** (`http/src/Client.zig:152`).
+header at all, and `http.Client.Options.pool.enabled` **defaults to `true`** (`Options.pool` in `http/src/Client.zig`).
 `Client.init` takes a caller-owned, caller-configured `*http.Client` ("share it with other
 subsystems freely" — see the design comment above) and has no lever of its own to force or forbid
 pooling on it — there is no per-request override in `http.RequestOptions`, only the transport-wide

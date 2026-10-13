@@ -36,8 +36,8 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 Fixed 65536-slot table indexed by a 16-bit id; ids handed out round-robin (`next` wraps at 2^16) so
 a freshly released id is not immediately reused. Exactly one allocation, at `init` (the slot table);
 `add`/`fetch`/`fetchPtr`/`release`/`clear` never allocate. A slot is freed only by the caller's
-engine (on reply/timeout/send-error) — `add` returns `error.Exhausted` when all 65536 slots are
-live, so the caller's in-flight cap must stay below 65536. `fetch` on a stale/foreign id returns
+engine (on reply/timeout/send-error) — `add` returns `error.Exhausted` when the slot under the cursor is
+still live (the cursor does not move; a retry hits the same id), so the caller's in-flight cap must stay below 65536. `fetch` on a stale/foreign id returns
 `null`, never panics; `release` is idempotent. Reentrant — no shared/global state, but one instance
 is single-owner (no cross-thread sharing without external sync). Clean-room implementation — no
 third-party source consulted; needs no NOTICE entry.

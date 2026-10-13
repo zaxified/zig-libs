@@ -114,6 +114,7 @@ const name = decoded.value.name;
 | `max_depth` | 64 | Embedded-message nesting cap. `error.DepthExceeded` past it. |
 | `copy_strings` | `true` | Copy `string`/`bytes` into the arena. Set `false` for a zero-copy decode whose slices alias `input` — then `input` must outlive the value and stay unmodified. |
 | `reject_unknown_fields` | `false` | `error.UnknownField` instead of preserving/dropping. For a receiver that must not forward what it cannot check. |
+| `max_arena_bytes` | 64 MiB | Total bytes the decode arena may be granted (`default_max_arena_bytes`); past it the decode fails with `error.OutOfMemory`. Bounds the memory a small hostile message can cost (SPEC, threat 5). |
 
 Errors: `Truncated` (a declared length or a value ran past the end of the input),
 `VarintOverflow` (a varint longer than 10 bytes, or one whose value will not fit a `u64`),
@@ -175,7 +176,7 @@ const Req = struct {
 ## Verify
 
 ```bash
-zig build test-protobuf --summary all      # 73 tests, none of them skipped
+zig build test-protobuf --summary all      # none of the tests is skipped
 ```
 
 **The suite is hermetic.** It needs no python3, no subprocess and no network, and it has no skip

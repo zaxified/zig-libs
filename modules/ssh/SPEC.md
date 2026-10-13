@@ -114,7 +114,9 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   key's type from `Transport.server_sig_algs`, falling back to the key's own name when the server
   sent no extension (§3.1: a client "MUST NOT make any assumptions" then).
 - **Host-key trust is entirely the caller's concern (client side).** `HostKeyVerifier` is a
-  caller-supplied policy — no known_hosts file, TOFU policy or pinning lives in this module.
+  caller-supplied policy; `knownhosts.zig` supplies ready-made verifiers (`KnownHosts` over
+  known_hosts text the caller read, `FixedHostKey` for pinning), but this module never reads a
+  known_hosts file and has no TOFU policy.
   Symmetrically, **user-key trust is the caller's concern on the server side**:
   `userauth.AuthorizedKeyCheck` is the one-line-of-`authorized_keys` seam, and this module never
   reads the filesystem for it. What it does give both sides is the **text formats**: `keys.zig`
@@ -149,7 +151,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   `algorithmName`/`fromOpenSSH` and `transport.verifySignature` are reused verbatim by both. Key
   algorithms wired end-to-end for userauth: **ssh-ed25519** (RFC 8709), **rsa-sha2-256** and
   **rsa-sha2-512** (RFC 8332 — the signature algorithm name differs from the `ssh-rsa` key-blob
-  type, and the module enforces that pairing), **ecdsa-sha2-nistp256** (RFC 5656). Bare `ssh-rsa`
+  type, and the module enforces that pairing), **ecdsa-sha2-nistp256/384/521** (RFC 5656). Bare `ssh-rsa`
   (SHA-1) is deliberately **not** accepted.
 - **A key is never copied (2026-10-09).** `HostKey` holds the private key by value (rsa ≈ 12 KiB),
   so it lives in the caller's storage and every API takes `*const HostKey`; `fromOpenSSH` and the
@@ -433,7 +435,7 @@ for the owner):
 
 ## Status
 
-`gap · any · both · single_owner` + deps: `rsa` — canonical source is `pub const meta` in
+`gap · any · both · single_owner` + deps: `rsa`, `montint`, `aes192`, `p521` — canonical source is `pub const meta` in
 `src/root.zig`. ("`gap`" follows this repo's catalog-maturity vocabulary for "no existing
 extraction source — built fresh to fill a catalog gap", not a completion status.)
 

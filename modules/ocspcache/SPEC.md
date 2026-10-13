@@ -248,8 +248,8 @@ verbatim. `now_unix` is pinned to a fixed instant inside the response's real
 A shared-root-cause teeth-check: re-applying the same mutation used for
 `ocsp`'s own teeth-check (dropping the SHA-1 arm of `hashAlgoFromOid` in
 `ocsp/src/root.zig`) turns exactly the real-fixture `Cache.refresh` test red
-(`VerifyFailed` ← `CertIdMismatch`) while all twelve constructed-fixture
-tests in `ocspcache_test.zig` — and the other two real-fixture tests, which
+(`VerifyFailed` ← `CertIdMismatch`) while every constructed-fixture
+test in `ocspcache_test.zig` — and the other two real-fixture tests, which
 don't touch `CertID` verification — stay green. The blind spot in `ocsp`
 propagates transitively through this module's dependency, and only the real
 captured response in `ocspcache`'s own suite catches it.

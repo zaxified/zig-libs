@@ -196,9 +196,8 @@ never regression-tested away, because it never had a test. What follows
 replaces it with what the module's tests actually do today, checked by
 reading them.
 
-**The module's own tests are self-consistency: 31 tests (`root.zig`'s 23
-plus `render.zig`'s 7 plus the test-aggregator block) including four fuzz
-harnesses, all authored alongside the code they check.** Round trips
+**The module's own tests are self-consistency: the `root.zig` and `render.zig`
+tests, including four fuzz harnesses, all authored alongside the code they check.** Round trips
 (`root.zig`'s "round trip: every mode, every level, across the version
 range", the structured-append round trip, the renderer round trips) encode
 and then decode with this module's own inverse of whatever it just did, so a
@@ -259,7 +258,7 @@ cannot silently drift apart.
 **Proven able to fail, not merely passing (2026-08-18):** two mutations were
 applied to `root.zig`, the suite run, and the source restored.
 
-| Mutation | Golden test (`golden_test.zig`) | The other 31 self-consistency tests |
+| Mutation | Golden test (`golden_test.zig`) | The other self-consistency tests |
 |---|---|---|
 | `Walk.next`: swapped which of the two columns in a pair is visited first (placement order) | **RED** — `spread_v1_l` mismatched at the very first byte the finder pattern doesn't own | all green |
 | `maskAt`: patterns 3 and 4's formula bodies swapped | **RED** — `mask_v5_q_m3` mismatched | all green |

@@ -33,8 +33,10 @@ declines.
 **Input is a matrix, not an image.** Building that matrix from a photograph —
 binarisation, locating the symbol, perspective correction, grid sampling — is
 image processing, and both mature ecosystems split it out the same way (Rust
-pairs an encoder crate with `rqrr`; Go pairs `skip2` with `gozxing`). Use
-`Matrix.setDark` to fill a grid your own scanner produced, then call `decode`.
+pairs an encoder crate with `rqrr`; Go pairs `skip2` with `gozxing`). The sibling
+[`qrscan`](../qrscan/README.md) finds a symbol in a grayscale image and samples it
+into a `Matrix`; or use `Matrix.setDark` to fill a grid your own scanner produced,
+then call `decode`.
 
 ## Rendering
 
@@ -133,7 +135,7 @@ is a separable addition rather than something this design forecloses.
 photograph is binarisation, symbol location, perspective correction and grid
 sampling. That is image processing rather than coding, it would drag a pixel
 format and a `platform` tag into a module that has neither, and every mature
-ecosystem ships it separately.
+ecosystem ships it separately: here it is the sibling module `qrscan`.
 
 Provenance: original work of the zig-libs authors (MIT), clean-room from
 ISO/IEC 18004. Verification, including the external encoder oracle, is in

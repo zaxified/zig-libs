@@ -49,7 +49,8 @@ aux-params/MtA → 2c range proofs + MtAwc → 2d signing), over secp256k1
 order). See the dedicated "Phase 2c" and "Phase 2d" sections below for
 those layers' design and status.
 
-**Trusted-dealer model ONLY.** A single dealer holds the plaintext group
+**`keygenTrustedDealer` is the trusted-dealer path** (dealer-free keygen is `dkg.EcdsaKeygen`, see
+Backlog). A single dealer holds the plaintext group
 ECDSA secret key `x`, Shamir-splits it into `n` shares (degree-`(t-1)`
 polynomial `f`, `f(0) = x`) via `splitSecretKey`, and distributes one share
 to each party out-of-band, alongside a Feldman VSS commitment so every party
@@ -58,8 +59,7 @@ could retain, the whole secret key — exactly the same scope limitation this
 repo's `bls12_381.threshold` and `frost.trustedDealerKeygen` document for
 their own trusted-dealer paths. A full Pedersen-style DKG (interactive
 complaint/justification sub-protocol, no single party ever learns `x`) is
-explicitly OUT OF SCOPE — a distinct follow-up module, not merely a
-different `splitSecretKey` signature.
+not part of `splitSecretKey`; it is the sibling `dkg` module.
 
 **What's implemented (all REAL, no panics — Phase 2c's prove/verify number
 theory AND Phase 2d's online signing are now implemented and tested, see the
@@ -858,7 +858,7 @@ see "Anchoring".
   the section above).
 - **Phase 2d (this module — `presign.zig`, driven by `signing.zig`):** GG20
   signing, one state machine per signer, Phases 1–7 with every check of the
-  paper and identifiable abort except types 5/7 — see "Signing" above.
+  paper and identifiable abort for every GG20 type — see "Signing" above.
 
 ## Auditor brief — what actually needs a human cryptographer
 
@@ -1170,8 +1170,8 @@ per-pair shares bit-identical for 1 vs 4 threads; the signature identical to
   "Πprm / Πmod" section above. The one residual item is an independent
   cryptographic review of the Fiat-Shamir instantiation before production
   MPC-custody use (question **A4** in the "Auditor brief" section).**
-- Full Pedersen-style DKG (no single dealer) — a distinct module, now `dkg` (GJKR; not yet wired here, see the
-  survey item below),
+- Full Pedersen-style DKG (no single dealer) — a distinct module, now `dkg` (GJKR; wired in as
+  `dkg.EcdsaKeygen`, see the dealer-free keygen item below),
   not a `splitSecretKey` signature change.
 - Minimum-key-size floor: NOW ENFORCED where it matters for security — every
   RECEIVED Paillier `N` and aux `Ñ` on the checked-MtA / zkproofs path must
