@@ -130,7 +130,7 @@ equal-cost tie, run once through a real `isisd` and frozen (see "Anchored"
 below). Green in Debug and ReleaseFast; `zig fmt` clean.
 
 Provenance: clean-room from ISO/IEC 10589 §7.2; the ECT tie-break lives in
-`spf-ect`. See `/NOTICE` (no entry required — public spec). License: MIT.
+`spf-ect`. No NOTICE entry is required (public spec, root `NOTICE` §0). License: MIT.
 
 ## Anchored (2026-08-02) — FRR, capture-and-freeze
 

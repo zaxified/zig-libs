@@ -242,9 +242,9 @@ change) — a hostile PDU cannot corrupt the machine. The fuzz test pins this
 
 ## 6. Deferred (with hooks)
 
-- **LAN adjacency + DIS election** — this module is P2P-only; the LAN Hello
-  (types 15/16) three-way/priority/DIS logic is a separate FSM. `isis` already
-  decodes the LAN Hello body, so it is additive.
+- **LAN adjacency** — this module is P2P-only; the LAN Hello (types 15/16)
+  adjacency logic is a separate FSM. `isis` already decodes the LAN Hello body,
+  so it is additive. The DIS election itself is the sibling `isis-dis` module.
 - **Area-address matching for `.level1_2` circuits** — implemented for pure
   `.level1` circuits (see §5); a `.level1_2` circuit still forms regardless of
   area, since this FSM has no split L1/L2 sub-state to selectively reject only
@@ -338,8 +338,8 @@ Green in Debug + ReleaseFast; `zig fmt --check` clean; `zig build check-catalog`
 green; the sibling `isis` test suite unaffected.
 
 Provenance: clean-room from ISO/IEC 10589 §8.2 and RFC 5303; no third-party
-implementation ported or studied. See `/NOTICE` (no entry required — public
-specs).
+implementation ported or studied. No NOTICE entry is required (public
+specs, root `NOTICE` §0).
 
 ## Backlog / deferred
 

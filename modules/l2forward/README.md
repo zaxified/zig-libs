@@ -142,7 +142,7 @@ order — both pinned by permanent tests.
 - `learn(isid, mac, pe, now) !LearnOutcome` — dynamic learning; the outcome
   (`.learned` / `.refreshed` / `.moved` / `.duplicate_detected` /
   `.denied_duplicate` / `.static_pinned`) is the caller's hijack notification and
-  is not optional to think about. `learnStatic(isid, mac, pe) !void` — pinned,
+  is not optional to think about. `learnStatic(isid, mac, pe, now) !void` — pinned,
   never-aged, never quarantined; `forget(isid, mac) bool` — delete.
 - `moveCount(isid, mac) u8` / `isQuarantined(isid, mac) bool` — MAC-mobility
   state.
@@ -185,5 +185,5 @@ nothing; and a leak check
 
 Provenance: clean-room from public specifications (IEEE 802.1D, IEEE 802.1ah,
 IEEE 802.1aq SPB, EVPN RFC 7432) — no third-party source or dissector consulted
-or copied. No `/NOTICE` entry needed (spec citations live in SPEC.md). License:
+or copied. No NOTICE entry needed (spec citations live in SPEC.md). License:
 MIT.

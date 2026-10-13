@@ -199,8 +199,9 @@ zig build test-enip -Doptimize=ReleaseFast
 zig fmt --check modules/enip
 ```
 
-The suite runs fully offline except for a few live tests, which skip
-gracefully (printing `SKIPPED:` and passing) when no peer is present:
+The suite runs fully offline except for a few live tests, which return
+`error.SkipZigTest` (counted as skipped; `ZIG_LIBS_VERBOSE_SKIP=1` prints a
+`SKIPPED:` line) when no peer is present:
 
 ```
 # our client -> a real EtherNet/IP target
@@ -243,5 +244,6 @@ reference for one thing: the `ConnectionParameters` reserved-bit layout in
 `src/connmgr.zig`, where the ODVA spec is paywalled and the field map in
 `epan/dissectors/packet-cip.c` was the only available statement of which
 bits are defined. Nothing was copied, and a design reference carries no
-licence condition — GPL-2.0 included. See SPEC.md and `/NOTICE`.
+licence condition — GPL-2.0 included. See SPEC.md; no NOTICE entry is
+required (root `NOTICE` §0).
  DATA: `src/goldens.zig` holds frames captured through a recording proxy from real traffic between third-party EtherNet/IP stacks acting as our peers, frozen offline. Observed behaviour, exempt per root `NOTICE` §0; no upstream corpus or fixture file is reproduced.

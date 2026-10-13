@@ -84,7 +84,7 @@ frost.h4(msg: []const u8) [32]u8   // tagged SHA-256, "msg"
 frost.h5(msg: []const u8) [32]u8   // tagged SHA-256, "com"
 frost.computeChallenge(group_commitment: Element, group_public_key: GroupPublicKey, msg: []const u8) Scalar
 frost.nonceGenerate(random_bytes: [32]u8, secret: Scalar) Scalar
-frost.generateNonces(signing_share: SigningShare, hiding_random: [32]u8, binding_random: [32]u8) SigningNonces
+frost.generateNonces(out: *SigningNonces, signing_share: *const SigningShare, hiding_random: [32]u8, binding_random: [32]u8) void
 ```
 
 **List operations (REAL)**:
@@ -103,7 +103,7 @@ frost.deriveInterpolatingValue(participant_list: []const Identifier, x_i: Identi
 frost.computeBindingFactors(allocator, group_public_key, commitment_list, msg) ![]BindingFactor
 frost.computeGroupCommitment(commitment_list, binding_factor_list) !Element
 frost.round1Commit(nonces: *const SigningNonces) !NonceCommitmentPair
-frost.round2Sign(allocator, identifier, signing_share, group_public_key, &nonces, msg, commitment_list) !SignatureShare
+frost.round2Sign(allocator, identifier, signing_share: *const SigningShare, group_public_key, nonces: *const SigningNonces, msg, commitment_list) !SignatureShare
 frost.aggregate(allocator, commitment_list, msg, group_public_key, sig_shares) !Signature
 frost.verifySignatureShare(allocator, identifier, verifying_share, comm_i, sig_share_i, commitment_list, group_public_key, msg) !bool
 frost.verify(msg, sig: Signature, group_public_key: GroupPublicKey) bool
@@ -118,12 +118,13 @@ frost.secretShareCombine(shares: []const ParticipantShare) !Scalar
 const keygen = try frost.trustedDealerKeygen(allocator, secret, &coefficients, 3, 2);
 
 // Round 1 (each of 2 chosen signers):
-const nonces = frost.generateNonces(share.signing_share, hiding_random, binding_random);
+var nonces: frost.SigningNonces = undefined;
+frost.generateNonces(&nonces, &share.signing_share, hiding_random, binding_random);
 const comm = try frost.round1Commit(&nonces);
 // ... exchange SigningCommitments{identifier, comm.hiding, comm.binding} via the Coordinator ...
 
 // Round 2 (each signer, given the full sorted commitment_list):
-const sig_share = try frost.round2Sign(allocator, identifier, share.signing_share, keygen.group_public_key, &nonces, msg, commitment_list);
+const sig_share = try frost.round2Sign(allocator, identifier, &share.signing_share, keygen.group_public_key, &nonces, msg, commitment_list);
 
 // Aggregation (the Coordinator):
 const sig = try frost.aggregate(allocator, commitment_list, msg, keygen.group_public_key, sig_shares);

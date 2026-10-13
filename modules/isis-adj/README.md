@@ -10,9 +10,9 @@ adjacency, tear it down.
 
 Status: **gap** — first increment. Implements the P2P three-way FSM + the
 hold/hello timing + TLV 240 (the RFC 5303 Three-Way Adjacency TLV, which `isis`
-does not model typed). LAN adjacency + DIS election, authentication,
-graceful-restart, and area-address matching are deliberately deferred — see
-`SPEC.md`.
+does not model typed). LAN adjacency (the DIS election is the sibling
+`isis-dis`), authentication, graceful-restart, and area-address matching on
+L1/L2 circuits are deliberately deferred — see `SPEC.md`.
 
 Model after: **ISO/IEC 10589 §8.2** (the P2P adjacency lifecycle) and
 **RFC 5303** (Three-Way Handshake for IS-IS Point-to-Point Adjacencies).
@@ -146,5 +146,5 @@ guard wrongly reaches Up on the half-open hello — proving the guard has teeth)
 Green in Debug and ReleaseFast; `zig fmt` clean.
 
 Provenance: clean-room from the public specifications above; no third-party
-IS-IS implementation (frrouting, IOS, Junos) was ported or studied. See
-`/NOTICE` (no entry required — public specs). License: MIT.
+IS-IS implementation (frrouting, IOS, Junos) was ported or studied. No NOTICE
+entry is required (public specs, root `NOTICE` §0). License: MIT.

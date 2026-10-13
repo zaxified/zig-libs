@@ -283,10 +283,11 @@ placeholders specifically:
 
 - **The flooding transmit loop** — the consumer that drains SRM (paces LSP
   transmission, honours the ISO minimumLSPTransmissionInterval), and the PSNP/CSNP
-  emission that drains SSN. This module exposes the flags + iterators + owned
-  bytes it needs; it performs no I/O.
+  emission that drains SSN. Now the sibling `isis-flood`; this module exposes the
+  flags + iterators + owned bytes it needs and performs no I/O.
 - **SPF / route computation** — reading the stored LSPs' reachability TLVs into a
-  shortest-path tree. Purely a consumer of the stored bytes.
+  shortest-path tree. Now the sibling `isis-spf`; purely a consumer of the stored
+  bytes.
 - **Generating our own LSP** — building/fragmenting the local LSP from adjacency
   + reachability state and sequence-number management; stamping the ISO Fletcher
   checksum on it is the generator's job (the receive-side check is in scope, §3/§9).
@@ -388,8 +389,9 @@ Green in Debug + ReleaseFast; `zig fmt --check` clean; `zig build check-catalog`
 green; the sibling `isis` suite unaffected.
 
 Provenance: clean-room from ISO/IEC 10589 §7.3; §7.3.16.1 cross-checked against
-FRRouting `isis_lsp.c` (behaviour reference, no source ported). See `/NOTICE` (no
-entry required — public spec + a black-box behaviour cross-check).
+FRRouting `isis_lsp.c` (behaviour reference, no source ported). No NOTICE
+entry is required (public spec + a black-box behaviour cross-check; root
+`NOTICE` §0).
 
 ## Backlog / deferred
 

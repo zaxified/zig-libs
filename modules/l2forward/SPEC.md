@@ -18,7 +18,7 @@
 
 Design + threat notes for auditors. Usage, API and the forward-decision
 contract: see [README.md](README.md) and the `src/root.zig` doc comments.
-Attribution/provenance: see `/NOTICE` — none needed here (clean-room from public
+Attribution/provenance: see the README "Provenance" note — no NOTICE entry needed (clean-room from public
 specs: IEEE 802.1D MAC learning/ageing, IEEE 802.1ah PBB I-SID service scoping,
 IEEE 802.1aq SPB, EVPN RFC 7432 ingress replication + split-horizon; a public
 spec is not a copyrightable work, and no third-party source or dissector was

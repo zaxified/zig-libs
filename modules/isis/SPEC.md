@@ -18,7 +18,7 @@
 
 Design + threat notes for auditors. Usage, API, and the module purpose: see
 [README.md](README.md) and the `src/*.zig` doc comments. Attribution/provenance:
-see `/NOTICE` — none required (clean-room from public specs: ISO/IEC 10589,
+see the README "Provenance" note — no NOTICE entry required (clean-room from public specs: ISO/IEC 10589,
 RFC 1195/5301/5305, RFC 6329/6165; a public spec is not a copyrightable work,
 and no third-party IS-IS source or dissector was ported or studied).
 

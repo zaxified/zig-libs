@@ -11,9 +11,9 @@ the `isis` codec), and reads/clears the flags to drive flooding.
 
 Status: **gap** — first increment. Implements the store + the ISO §7.3.16.1
 comparison + time-injected aging/purge + the SRM/SSN flag matrix + CSNP/PSNP
-reconcile. The flooding transmit loop (the SRM consumer), SPF/route computation,
-generating our own LSP (fragmentation), authentication, and MT/multi-level are
-deliberately deferred — see `SPEC.md`.
+reconcile. The flooding transmit loop (the SRM consumer) lives in the sibling
+`isis-flood`, SPF in `isis-spf`; generating our own LSP (fragmentation),
+authentication, and MT/multi-level are deliberately deferred — see `SPEC.md`.
 
 Model after: **ISO/IEC 10589 §7.3** (the update process). The §7.3.16.1 newer
 comparison was cross-checked against FRRouting `isis_lsp.c:lsp_compare` for the
@@ -63,7 +63,7 @@ The store *maintains* these; a flooding layer *reads and clears* them
 (`interfacesWithSrm`, `srmIterator`/`ssnIterator`, `clearSrm`/`clearSsn`). The
 outcome matrix per `insert` (arrival circuit `C`, or `null` for locally
 originated) and per SNP reconcile is in `SPEC.md`. SSN-on-receive is the
-point-to-point behaviour; circuits marked `broadcast` in `Config` are not
+point-to-point behaviour; circuits listed in `Config.broadcast_interfaces` are not
 SSN-acked (the DIS's periodic CSNP does the sync there).
 
 ## Aging / purge lifecycle (ISO §7.3.16.4)

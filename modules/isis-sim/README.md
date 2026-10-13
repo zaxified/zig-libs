@@ -42,7 +42,7 @@ pseudonode LSP of every LAN it is the DIS of.
 |------|-----------------------|
 | **onStart(node)** | Originate the node's own LSP — one Extended IS Reachability (#22) entry per currently-up neighbour, sequence 1 — and `lsdb.insert` it self-originated (`arrival_iface = null` → SRM on every circuit). Arm the first flooding poll; pre-arm one timer per scheduled link failure this node terminates. |
 | **onMessage(node, from, payload)** | `isis.decode` the PDU: an **LSP** → `lsdb.insert(bytes, arrival_iface, now)` (sets SRM to flood onward + SSN to ack); a **CSNP/PSNP** → `lsdb.reconcileCsnp`/`reconcilePsnp`. Then arm a flooding poll so the next `poll` drains the freshly-set flags. |
-| **onTimer(node, id)** | id 2 = *age now* (`Options.aging`): `Lsdb.tick(now)`, then re-originate this node's own LSP if it is due for refresh. id 0 = *poll now*: `isis-flood.poll(now, up, lsdb, …)`, `sim.send` every effect (LSP/PSNP/CSNP) to the neighbour on its circuit, re-arm while flooding work remains. id ≥ `fail_base` = *a link you terminate just failed*: mark that circuit down, then **re-originate** this node's LSP without the lost neighbour at a bumped sequence number, and flood. |
+| **onTimer(node, id)** | id 2 = *age now* (`Options.aging`): `Lsdb.tick(now)`, then re-originate this node's own LSP if it is due for refresh. id 0 = *poll now*: `isis-flood.poll(now, up, lsdb, …)`, `sim.send` every effect (LSP/PSNP/CSNP) to the neighbour on its circuit, re-arm while flooding work remains. id ≥ `fail_timer_base` = *a link you terminate just failed*: mark that circuit down, then **re-originate** this node's LSP without the lost neighbour at a bumped sequence number, and flood. |
 | **check** | Safety invariants run after every event: no node's LSDB holds more than `node_count` (+ pseudonode) LSP-IDs (a runaway/corruption tripwire), and no stored sequence goes backwards / no live LSP vanishes (router and pseudonode LSPs). |
 
 ## The three proofs
@@ -109,8 +109,8 @@ sent once (SRM cleared on transmission) and only the DIS's CSNP plus the members
 PSNP requests repair loss: 16/16 lossy seeds agree with CSNPs, 0/16 without
 (`Options.lan_csnp = false`, the negative control). `fab.disOf`, `isDis`,
 `pseudonodeSequence`, `pseudonodeMembers`, `holdsPseudonodePurge` inspect the result.
-Two harness-side workarounds for sibling gaps and one open gap (`isis-spf` does not
-route through the pseudonode) are recorded in SPEC §12.
+SPF routes through the pseudonode (`isis-spf` LAN transit). Two harness-side
+workarounds for sibling gaps are recorded in SPEC §12.
 
 ## Termination & quiescence
 

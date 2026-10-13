@@ -394,10 +394,12 @@ and the render arena are gone.
 
 ```sh
 zig build test-jinja --summary all           # unit + conformance replay
-zig build test-jinja --fuzz --release=safe   # fuzz the compiler
 zig build interop-jinja                      # re-run the live Python peer
 zig build interop-jinja -- --capture         # re-take the transcript
 ```
+
+Fuzzing the compiler and renderer is the deterministic driver `JINJA_FUZZ=<runs>[,<first seed>]`
+(header of `src/fuzz_test.zig`), not `zig build ... --fuzz`.
 
 The conformance suite replays `src/testdata/golden.json` — 351 cases, each one
 an input the reference was given and the bytes **Python Jinja2 3.1.6** returned
