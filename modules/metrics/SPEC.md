@@ -126,8 +126,8 @@ existing NOTICE for the vendored documentation excerpt is unrelated and unaffect
 
 **Differential oracle against karlseguin's library** — IDEA (2026-09-24, CML review of karlseguin's Zig libraries; not scheduled). `karlseguin/metrics.zig` renders Prometheus text. Register the same counters, gauges and histograms (including label values that need escaping) in both and diff the exposition output byte by byte. It would live in `tools/` as a differential oracle (CONVENTIONS §9); the library is MIT and targets Zig 0.16, so no copyleft or version barrier.
 
-A bounded route-pattern label for the request middleware, once `router` exposes the matched
-pattern (currently deliberately not labeled by raw path — cardinality risk). `metrics.handler(registry)
+A bounded route-pattern label for the request middleware; `router` now exposes the matched
+pattern (`Ctx.matchedPattern()`), so it can be wired in (currently deliberately not labeled by raw path — cardinality risk). `metrics.handler(registry)
 → router.Handler` from the original brief is not implementable (a stateless fn pointer cannot close
 over a `Registry`); `Endpoint` is the shipped replacement. No push-gateway/remote-write planned.
 

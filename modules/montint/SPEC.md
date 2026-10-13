@@ -711,9 +711,9 @@ differentially tested, but no `Modint` reaches it any more.
 
 Clean-room from public algorithm descriptions: Montgomery multiplication (Koç et
 al. CIOS), the `x86_64-mont5` `MULX/ADCX/ADOX` technique (OpenSSL, studied as a
-design reference — recorded in `NOTICE`), and the `std.crypto.ff` public API for
+design reference — see README Provenance), and the `std.crypto.ff` public API for
 shape. KAT vectors from an independent CPython-bignum re-derivation (no
-third-party source ported). See `NOTICE`.
+third-party source ported). See README Provenance.
 
 ## Anchoring
 

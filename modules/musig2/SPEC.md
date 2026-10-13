@@ -50,7 +50,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 
 - **Source of truth**: BIP327 ("MuSig2 for BIP340-compatible
   Multi-Signatures", `bitcoin/bips`), consumed directly as
-  `bip-0327.mediawiki`. The curve group is `std.crypto.ecc.Secp256k1`
+  `bip-0327.mediawiki`. The curve group is `k256.Secp256k1`
   (same as `bip340`); the tagged-hash construction, x-only public-key
   convention, and the BIP340 challenge tag are all reused from the
   sibling `bip340` module rather than re-derived.

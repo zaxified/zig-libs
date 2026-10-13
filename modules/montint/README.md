@@ -96,8 +96,8 @@ Comparing Montgomery Multiplication Algorithms" (IEEE Micro 1996), Fig. 6, and
 the API shape follows `std.crypto.ff` (Zig std, MIT). Design references,
 behavior/algorithm only, no source copied: OpenSSL
 `crypto/bn/asm/x86_64-mont5.pl` (**Apache-2.0**; the `MULX/ADCX/ADOX`
-dual-carry-chain amd64 Montgomery-multiply technique the gated asm core will
-mirror) and Gueron & Krasnov, "Fast Prime Field Elliptic Curve Cryptography with
+dual-carry-chain amd64 Montgomery-multiply technique the asm core
+mirrors) and Gueron & Krasnov, "Fast Prime Field Elliptic Curve Cryptography with
 256-Bit Primes" (the published description of the same two-independent-carry-chain
 method). Test-vector cross-check only, not a design reference: the modmul/modexp
 KATs at 256/512/2048/4096 bits were independently recomputed with CPython's

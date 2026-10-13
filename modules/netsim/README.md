@@ -130,12 +130,12 @@ if (failing) |f| {
 
 `run` fuzzes one seed and returns `.ok` or `.violated` with the exact
 `FaultTrace` reproducer; `replay` re-runs a concrete trace as a deterministic
-oracle; `findFailing` + `shrink` search a seed range and minimize.
+oracle; `findFailing` + `shrinkTrace` search a seed range and minimize.
 
 ## Verify
 
 ```
-scripts/modtest netsim    # Debug with LLVM; last recorded 49/49 (2026-09-11)
+scripts/modtest netsim    # Debug with LLVM
 ```
 
 The determinism property is the load-bearing one and is tested directly: the

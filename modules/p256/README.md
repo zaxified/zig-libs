@@ -101,9 +101,9 @@ const R = try Q.mulPublic(scalar_be, .big); // variable-time wNAF (public scalar
 const xy = R.affineCoordinates();
 
 // ECDSA-P256/SHA-256 (the end-to-end anchor).
-const sig = try p256.sign.ecdsaSign(secret_key, msg, nonce_k);
+const sig = try p256.sign.ecdsaSign(&secret_key, msg, &nonce_k);
 // Or let RFC 6979 derive the nonce (no RNG, reproducible, KAT'd byte-exact):
-const dsig = try p256.sign.ecdsaSignDeterministic(secret_key, msg);
+const dsig = try p256.sign.ecdsaSignDeterministic(&secret_key, msg);
 const ok  = p256.sign.ecdsaVerify(pubkey_sec1, msg, sig);
 
 // X.509/OCSP/CMS carry the signature as DER; JWS/COSE/XML-DSig use raw r||s.
@@ -112,10 +112,11 @@ var der_buf: [p256.sign.der_max_len]u8 = undefined;
 const der = p256.sign.rawToDer(raw, &der_buf);
 ```
 
-`p256.Scalar` (arithmetic mod the group order `n`) is re-exported from std on
-purpose — the scalar field is a negligible slice of a signature's cost and has no
-special form worth accelerating; p256 spends its complexity budget on the field
-and the point multiply. See `SPEC.md §Scope`.
+`p256.Scalar` (arithmetic mod the group order `n`) is a thin wrapper over std's
+fiat scalar field with the same public surface, except `invert`, which is this
+module's safegcd (`modinv.zig`) — the rest of the scalar field is a negligible
+slice of a signature's cost and has no special form worth accelerating; p256
+spends its complexity budget on the field, the inverses and the point multiply. See `SPEC.md §Scope`.
 
 ## Verify
 
@@ -148,7 +149,7 @@ field elliptic-curve cryptography with 256-bit primes" technique) — studied fo
 the technique shape only: the special-prime (Solinas) field reduction for
 p = 2^256 − 2^224 + 2^192 + 2^96 − 1 (fold the high half by
 M = 2^224 − 2^192 − 2^96 + 1 / the signed s1..s9 word-shuffle), and the amd64
-`MULX/ADX` field multiply the gated core will mirror. No source ported. The NIST
+`MULX/ADX` field multiply the amd64 core mirrors. No source ported. The NIST
 P-256 domain parameters (p, n, G, the curve constant b, a = −3) are public curve
 facts; the specific integer constants match `std.crypto.ecc.P256` (Zig std,
 MIT), which is ALSO used as the byte-exact correctness oracle (differential

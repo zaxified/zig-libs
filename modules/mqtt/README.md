@@ -154,8 +154,8 @@ transport-agnostic client and a broker, all fully offline-testable.
     ⚠ Sessions live in memory: they survive a client's reconnect, not a
     restart of the process holding the broker — unless that process keeps
     them: `sessionStates(arena)` copies out every session (subscriptions with
-    granted QoS, queued, in flight, `drops`), and `restoreSession(id, subs,
-    now)` recreates one offline before clients connect; refilling its queue
+    granted QoS, queued, in flight, `drops`), and `restoreSession(id, username,
+    subs, offline_since_ms)` recreates one offline before clients connect; refilling its queue
     is the server's own replay. `queued + inflight == 0` at an instant means
     everything published to the session before it was acknowledged.
 

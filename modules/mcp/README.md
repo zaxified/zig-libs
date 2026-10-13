@@ -39,7 +39,7 @@ in `params._meta`. This server speaks both eras at once, per request (the spec's
   `call.protocolVersion()` report the request's own `_meta`, and
   `requestSampling` / `requestElicitation` return `error.StatelessRequest`
   (that revision replaced server→client requests with the multi round-trip
-  pattern, not implemented yet).
+  pattern; see "Multi round-trip requests" below).
 - **Every other request** takes the `initialize`-session path described below,
   byte-for-byte as before.
 

@@ -72,9 +72,10 @@ via `catch null`); parameters are named `thousands_sep`/`decimal_sep` to avoid c
 Not security-sensitive — a pure text-classification/parse function with no I/O, no allocation, and
 a bounded (40-byte) working set regardless of input length (over-long input just returns `null`
 once the scan or the buffer copy fails its bound, never overflows or panics). Does not guarantee
-locale correctness beyond the two documented western conventions: no scientific notation, no
-currency symbols/percent suffixes, no non-3-digit grouping (Indian lakh/crore, CJK myriad), no
-broader ICU `NumberFormat` locale coverage. A caller passing the wrong separator pair for their
+locale correctness beyond the two documented western conventions for `parseGroupedNumber`
+(no scientific notation, no percent suffixes, no non-3-digit grouping) and, for `parse`, beyond the
+25 built-in locales: no currency symbols, no CJK myriad grouping, no broader ICU `NumberFormat`
+locale coverage. A caller passing the wrong separator pair for their
 locale gets `null` (safe failure), not a mis-parsed number silently accepted.
 
 ## Verification
@@ -104,9 +105,9 @@ cross-locale negative (comma/dot swapped). Run: `zig build test-numparse`.
   removed.
 
 ## Backlog / deferred
-Per the module README's "Deferred" section (Fable-scoped follow-on, not v1): scientific notation,
-currency symbols/percent suffixes, non-3-digit grouping (Indian lakh/crore 2-digit, CJK 4-digit
-myriad), and full ICU `NumberFormat` locale coverage.
+Per the module README's "Deferred" section: currency symbols, CJK 4-digit myriad grouping,
+non-Latin digits and full ICU `NumberFormat` locale coverage. (Scientific notation, percent
+suffixes and Indian lakh/crore grouping are handled by `parse` since 2026-10-04.)
 - ~~Multi-byte separators~~, ~~optional `+`, trailing and parenthesised negatives~~ — **done
   2026-10-04** (`parse`, `Options`, `locale`).
 - **All of CLDR, currency, non-Latin digits, myriad grouping, `minimumGroupingDigits`** *(re-check

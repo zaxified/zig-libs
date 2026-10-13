@@ -6,16 +6,15 @@ DH/cipher/hash `Suite`, reusable for any Noise-based protocol — unlike the
 `wireguard` module's `noise.zig`/`handshake.zig`, which hard-wire
 WireGuard's fixed `Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s` instantiation and
 already implement its KDF. This module has **zero dependency** on
-`wireguard` (or any other sibling module).
+`wireguard`; its only sibling dependency is `chachapoly` (the AEAD).
 
 **Status: implemented.** The `CipherState` / `SymmetricState` /
 `HandshakeState` methods (spec §5) run for real over the
 comptime-parameterized `Suite` — DH exchange, AEAD seal/open, and the
 HKDF/HMAC ratchet — and the handshake-pattern data (§7/§9 token sequences
-for `NN`/`NK`/`XX`/`IK`) is real as well. The sibling `bolt8` does NOT run on
-`HandshakeState`: the suite accepts only X25519 (`dhName` in `src/state.zig`),
-so `bolt8` drives its secp256k1 handshake with its own state
-(`bolt8/src/handshake.zig`). See `SPEC.md` for the verification detail.
+for the whole rev-34 catalog) is real as well. The sibling `bolt8` does NOT run
+on `HandshakeState`: it builds on `Suite.SymmetricState` and drives its
+secp256k1 handshake with its own state (`bolt8/src/handshake.zig`). See `SPEC.md` for the verification detail.
 
 - **Model after:** Noise Protocol Framework rev 34 (noiseprotocol.org);
   design ref cacophony (Haskell) / noise-c / snow (Rust) — shape only, no
@@ -92,7 +91,6 @@ Test vectors actually consulted: six official `cacophony`-format vectors
 from rweather/noise-c's `vectors/` directory on GitHub, transcribed into
 `state.zig` and checked byte-exact end-to-end (ciphertexts + handshake
 hash) across `NN`/`NK`/`XX`/`IK`, both hash choices (SHA-256/SHA-512), and
-a second hash function (BLAKE2s) — see `SPEC.md`'s "Verification" for the
-full list. snow's and cacophony's own vector files (same format) were not
-additionally consulted — the noise-c set already covers every pattern/
-suite this module implements.
+a second hash function (BLAKE2s), plus the 87 vectors copied verbatim from
+snow's `tests/vectors/cacophony.txt` (attributed in `NOTICE`) — see
+`SPEC.md`'s "Verification" for the full list.

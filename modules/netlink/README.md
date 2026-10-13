@@ -12,8 +12,8 @@ no `ip`/`bridge` shell-outs, no `/proc/net` parsing, no libc.
 - **Platform:** linux (raw `std.os.linux` errno-encoded syscalls — a
   conscious ceiling). **Role:** client. **Concurrency:** reentrant (no
   globals; one `Socket` per thread/loop).
-- **Deps:** none (std only) — a clean foundation for a future `wireguard`
-  (genetlink) module and for retiring `/proc/net` parsers.
+- **Deps:** none (std only) — the foundation of the sibling `genetlink`/`wireguard`
+  modules and a way to retire `/proc/net` parsers.
 - **Privileges:** RTM_GET* dumps are unprivileged; the write ops
   (`RTM_NEW*`/`RTM_DEL*`) need **CAP_NET_ADMIN**.
 
@@ -281,8 +281,8 @@ Shared with the other netlink families (see SPEC.md § "Shared codec surface"):
   carrier change is published by the kernel's `linkwatch` workqueue and lands
   later — measured here at 0.5–2.8 ms later under load. Wait for `IFF_RUNNING`
   in a link dump (that flag *is* `netif_oper_up`) before setting the state.
-- **Out of scope (deliberate extension points):** multicast event monitoring,
-  qdiscs/filters (sibling `tc` module), conntrack, policy rules, multipath
+- **Out of scope (deliberate extension points):**
+  qdiscs/filters (sibling `tc` module), conntrack, multipath
   routes, and — within the bridge surface — MDB/multicast snooping
   (`RTM_*MDB`), VXLAN link creation, VLAN tunnel mapping, MRP/CFM/MST and
   per-VLAN options. See SPEC.md.

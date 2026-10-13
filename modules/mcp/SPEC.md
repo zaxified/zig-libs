@@ -39,7 +39,7 @@ state, capability-gated sampling/elicitation with schema and URL-safety validati
 loopback-only http), never-panic error policy, newline framing fuzzed. **Where we are behind:** serves 2026-07-28 statelessly
 alongside the `initialize` revisions (since 2026-09-30), multi round-trip requests included; no pagination, `listChanged`
 notifications / `subscriptions/listen`, completions, logging, tasks; server role only (HTTP is the sibling
-`mcp-http`, still session-era; no client) (→ Backlog items).
+`mcp-http`, which serves both eras; no client) (→ Backlog items).
 
 ## Design & invariants
 

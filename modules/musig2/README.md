@@ -94,7 +94,7 @@ const ctx = musig2.SessionContext{ .aggnonce = aggnonce, .pubkeys = pubkeys, .ms
 // `sign` consumes the secnonce: it is zeroed on entry, whatever the outcome,
 // so a second `sign` with it is error.InvalidSecNonce (BIP327 / libsecp256k1).
 var secnonce = result.secnonce;
-const psig = try musig2.sign(&secnonce, sk, ctx); // musig2.PartialSignature
+const psig = try musig2.sign(&secnonce, &sk, ctx); // sk: bip340.SecretKey; -> musig2.PartialSignature
 ```
 
 **Partial signature verification** (`PartialSigVerify` — per-pubnonce/
@@ -117,7 +117,8 @@ const ok = bip340.verify(xonly_aggpk, msg, try bip340.Signature.fromBytes(sig64)
 ## Import graph
 
 ```
-musig2 → bip340 → std.crypto.ecc.Secp256k1 / std.crypto.hash.sha2.Sha256
+musig2 → bip340 → std.crypto.hash.sha2.Sha256
+musig2 → k256 (Secp256k1 points and scalars)
 ```
 
 ## Verify

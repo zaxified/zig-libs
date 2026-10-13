@@ -455,8 +455,8 @@ update and on a new topic — each caught by its own test.
 **The publish tap never sees a Will** — DONE (2026-09-29, found by energomonitor's egw-proxy). `Config.tap_wills = true` hands an ungraceful end's Will to `onPublishFn` as a publish, after the connection is out of the index (the M2 ordering), on the `remove` caller's thread with no lock held; the verdict is honoured minus the connection (`.accept` → retained + fan-out, `.consume` → neither, `.refuse` → neither, counted in `tapRefusals`). Off by default. Tests: "tap_wills: …" (both directions, clean DISCONNECT, consume/refuse).
 **Differential oracle against karlseguin's library** — IDEA (2026-09-24, CML review of karlseguin's Zig libraries; not scheduled). `karlseguin/mqttz` is a client only. Drive our broker with it (CONNECT/SUBSCRIBE/PUBLISH at QoS 0 and 1, retain, wills, keepalive) so our broker is checked by a client we did not write. It would live in `tools/` as a differential oracle (CONVENTIONS §9); the library is MIT and targets Zig 0.16, so no copyleft or version barrier.
 
-Broker: QoS 2, sessions persisted across a broker restart, DUP retransmit to clean-session subscribers,
-TLS, MQTT 5.0 (all documented deferrals, not bugs). The four architectural limitations of the first
+Broker deferrals (documented, not bugs; QoS 2 and MQTT 5.0 have since shipped, see below): sessions persisted
+across a broker restart, DUP retransmit to clean-session subscribers, TLS. The four architectural limitations of the first
 cut — O(conns×subs) fan-out under a global lock held across I/O, publisher-killing per-subscriber
 delivery failures, take-over socket leak, and missing auth/ACL — are now fixed (trie index +
 snapshot-then-write off the lock + per-connection `tx_lock` + reference-counted teardown; contained
@@ -467,7 +467,7 @@ was fixed. The concurrency hardening's recommended
 multi-threaded stress/race pass is now **COVERED** — see Verification above (16 real-socket
 OS-thread clients racing fan-out / take-over / churn, run repeatedly under Debug + ReleaseFast and
 under valgrind memcheck, all clean; TSan is a no-op stub in Zig 0.16.0, so real-thread stress is the
-fallback). Client: MQTT 5.0 out of scope.
+fallback).
 - ~~**MQTT 5.0**~~ — DONE 2026-10-01 (codec, client, broker; see *MQTT 5.0*). ~~**Broker-side inbound QoS 2**~~ — DONE 2026-10-01, both directions (see *QoS 2 in the broker*).
 - **Broker extended authentication** (2026-10-01, deferred from the 5.0 work): AUTH exchanges (4.12) need a hook shaped like `authenticateFn` but multi-step (method, data in → continue/success/deny + data out) and per-connection state between CONNECT and CONNACK, plus re-authentication. Today a CONNECT naming a method gets CONNACK 0x8C, which 4.12.0-1 allows. Effort: medium. The client side already exists (caller-driven).
 - ~~**`restoreSession` for 5.0 sessions**~~ — done 2026-10-02: `SessionSub` options, `restoreSessionWith` with `expiry_interval_s` (see § sessions above).

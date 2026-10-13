@@ -36,17 +36,17 @@ pub const Algorithm = enum { sha1, sha256, sha512 };
 
 // HOTP (RFC 4226) — counter-based
 pub fn hotp(comptime alg: Algorithm, key: []const u8, counter: u64, digits: u5) u32;
-pub fn hotpFmt(comptime alg: Algorithm, key: []const u8, counter: u64, digits: u5, out: []u8) []u8;
+pub fn hotpFmt(comptime alg: Algorithm, key: []const u8, counter: u64, digits: u5, out: []u8) FmtCodeError![]u8;
 pub fn dynamicTruncate(comptime alg: Algorithm, key: []const u8, counter: u64) u32;
 
 // TOTP (RFC 6238) — time-based (RFC defaults: period = 30, t0 = 0)
 pub fn timeStep(unix_time: u64, period: u32, t0: u64) u64;
 pub fn totp(comptime alg: Algorithm, key: []const u8, unix_time: u64, period: u32, t0: u64, digits: u5) u32;
-pub fn totpFmt(comptime alg: Algorithm, key: []const u8, unix_time: u64, period: u32, t0: u64, digits: u5, out: []u8) []u8;
+pub fn totpFmt(comptime alg: Algorithm, key: []const u8, unix_time: u64, period: u32, t0: u64, digits: u5, out: []u8) FmtCodeError![]u8;
 pub fn totpVerify(comptime alg: Algorithm, key: []const u8, unix_time: u64, period: u32, t0: u64, digits: u5, code: u32, skew_steps: u32) bool;
 
 // Zero-left-padded ASCII rendering of a code
-pub fn fmtCode(code: u32, digits: u5, out: []u8) []u8;
+pub fn fmtCode(code: u32, digits: u5, out: []u8) FmtCodeError![]u8;
 ```
 
 `digits` must be 1..9 (asserted); authenticator apps use 6..8. Codes are
@@ -60,7 +60,7 @@ zero-left-padded string an app displays (e.g. `07081804`).
 const code = otp.totp(.sha1, secret, now_unix, 30, 0, 6);
 
 var buf: [6]u8 = undefined;
-const shown = otp.totpFmt(.sha1, secret, now_unix, 30, 0, 6, &buf);
+const shown = try otp.totpFmt(.sha1, secret, now_unix, 30, 0, 6, &buf);
 
 // Server side: accept the previous/current/next step.
 const ok = otp.totpVerify(.sha1, secret, now_unix, 30, 0, 6, submitted, 1);

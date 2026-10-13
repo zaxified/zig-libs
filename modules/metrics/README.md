@@ -89,9 +89,8 @@ Prometheus's index. This is why the middleware:
   index was added this was linear in total registry size, see the module's
   audit F1/F7);
 - does **not** label by path. A route-pattern label (`/users/:id`, bounded)
-  is planned once `router` exposes the matched pattern to `Ctx` (route
-  enumeration is a tracked router follow-up); labeling by raw path would be
-  the footgun above.
+  is not wired in yet (`router` now exposes `Ctx.matchedPattern()`, so it
+  can be); labeling by raw path would be the footgun above.
 
 Instruments cap at `max_labels` (8) label pairs.
 
