@@ -13,11 +13,12 @@
 //! Run with:
 //!
 //! ```sh
-//! zig build test-rescue --fuzz --release=safe
+//! RESCUE_FUZZ=200000 zig build test-rescue --release=safe
 //! ```
 //!
-//! `--release=safe` is not optional: a plain `--fuzz` in Debug does not
-//! actually fuzz in this toolchain.
+//! The deterministic driver below (`RESCUE_FUZZ=<runs>[,<first seed>]`) runs
+//! the same harnesses from seeds and gives a verdict; `zig build --fuzz`
+//! does not.
 
 const std = @import("std");
 const gl = @import("goldilocks.zig");

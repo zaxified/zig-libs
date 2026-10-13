@@ -11,7 +11,7 @@
 //!
 //! **API shape**: this module takes `seed_kem`/`coins` as explicit byte
 //! arrays rather than owning a stateful PRNG — the caller supplies
-//! randomness (from `std.crypto.random`, a test's deterministic vector,
+//! randomness (from `io.randomSecure`, a test's deterministic vector,
 //! or anything else). This mirrors the spec's own presentation (keygen
 //! and encaps are literally functions of a random seed) and keeps this
 //! module free of hidden global state (`prng.zig`'s reference-derived

@@ -9,16 +9,15 @@
 //! .SymmetricState` (mixKey/mixHash/encryptAndHash/decryptAndHash/split) —
 //! NOT on `noise.HandshakeState`. `noise`'s `HandshakeState.initialize`
 //! derives the Noise protocol-name string via a `dhName(DH)` lookup
-//! (`noise/src/state.zig`) that only recognizes `std.crypto.dh.X25519` and
-//! `@compileError`s for any other `DH` type — so instantiating
-//! `HandshakeState` with this module's secp256k1 `dh` adapter would fail to
-//! compile the moment `.initialize` is called (it never is, here).
+//! (`noise/src/state.zig`) that knows `std.crypto.dh.X25519` and any type
+//! declaring `pub const noise_name`; this module's secp256k1 `dh` adapter
+//! declares none, and BOLT#8 drives its own Act One/Two/Three rather than a
+//! generic pattern, so `.initialize` is never called here.
 //! `SymmetricState`, by contrast, never references the `DH` type at all —
 //! it operates purely on opaque `[]const u8` key material — so it is fully
-//! reusable, DH-agnostic infrastructure. XK is not in `noise/src/
-//! patterns.zig` (only NN/NK/XX/IK) — moot for this module either way,
-//! since we never reach the code path that would consult a
-//! `HandshakePattern`.
+//! reusable, DH-agnostic infrastructure. Whether `noise/src/patterns.zig`
+//! carries XK is moot here: we never reach the code path that would
+//! consult a `HandshakePattern`.
 //!
 //! `init()` below (BOLT#8 "Handshake State Initialization") is REAL: it is
 //! pure protocol-name-hash + prologue + pre-message mixHash, structurally
@@ -680,9 +679,9 @@ test "Suite(dh, ChaChaPoly, SHA256) type-checks and its SymmetricState is DH-agn
     ss.mixHash(prologue);
     try testing.expect(!ss.cipher_state.hasKey());
     // Deliberately NOT tested: Suite.HandshakeState.initialize(...) — see
-    // the module doc comment, this would fail to COMPILE (dhName's
-    // X25519-only @compileError), which is exactly why this module drives
-    // the handshake itself instead of reusing noise.HandshakeState.
+    // the module doc comment: the secp256k1 adapter declares no
+    // `noise_name`, so dhName would @compileError; this module drives the
+    // handshake itself instead of reusing noise.HandshakeState.
 }
 
 const kv = @import("kat_vectors.zig");

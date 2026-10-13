@@ -5,8 +5,8 @@
 //!
 //! ## Why an in-memory index over `kv`
 //!
-//! `kv` is a Bitcask-style point store: `put` / `get` / `delete` by key and
-//! **nothing else** — no scan, no ordered iteration, its keydir is private.
+//! `kv` is a Bitcask-style point store: `put` / `get` / `delete` by key plus
+//! a key listing (`Db.keys`) — no record scan, no ordered iteration.
 //! A queue needs to *enumerate* ready work and pick the best candidate, so
 //! jobqueue keeps its own in-memory index (a `jobs` map, the `pending`/`parts`
 //! ready pair described at "the two ordered structures behind dispatch"
