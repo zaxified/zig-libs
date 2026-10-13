@@ -16,7 +16,7 @@
 
 **Downstream consumer:** yes
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see /NOTICE.
+Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see ./README.md "Provenance" (no NOTICE entry needed).
 
 ## Compared with
 
@@ -41,7 +41,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   timestamps. Clean-room from RFC 4330 (and RFC 5905 for the timestamp format); packet layout and
   the T1–T4 offset/delay arithmetic mirror the design of `FObersteiner/ntp_client` (Codeberg,
   `src/ntp.zig`, MIT) — a clean-room re-derivation, no code copied. Original work of the zig-libs
-  authors (MIT) — see NOTICE.
+  authors (MIT) — see README "Provenance"; no NOTICE entry needed.
 - **Epoch & fixed-point model:** NTP timestamps are 64-bit fixed-point seconds since 1900-01-01
   (`Timestamp{ seconds, fraction }`, big-endian on the wire, fraction in units of 1/2^32 s). Unix
   time is `NTP − 2_208_988_800 s` (`ntp_unix_offset_s`). `Timestamp` converts both ways

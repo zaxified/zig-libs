@@ -3,7 +3,7 @@
 BIP341 Taproot output construction: the key-path tweak that turns an
 internal BIP340 key into the key a Taproot output pays to, and script-tree
 building (Merkle root, per-leaf control blocks) for script-path spends. Depends on the sibling [`bip340`](../bip340/) module for
-`XOnlyPublicKey`/`SecretKey` and the tagged-hash machinery.
+`XOnlyPublicKey`/`SecretKey` and the tagged-hash machinery, and on `k256` for the secp256k1 point/scalar arithmetic.
 
 **Status: complete.** The `"TapTweak"` tagged hash, the `TweakedPublicKey`
 codec, AND both crypto cores — `tweakPublicKey`/`tweakSecretKey` — are real

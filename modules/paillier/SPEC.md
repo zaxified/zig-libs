@@ -243,8 +243,9 @@ the protocol. None of that is in this module:
   conversion — Phase 2, and the actual reason threshold-ECDSA wants Paillier in the first
   place.
 
-These belong in a separate, later module that depends on this one (`paillier`), not here —
-see `// TODO(phase2)` in `src/root.zig`.
+These belong in a separate module that depends on this one (`paillier`), not here — the
+sibling `threshold_ecdsa` module now provides the range proofs and MtA; see
+`// TODO(phase2)` in `src/root.zig`.
 
 ## Verification
 
@@ -284,8 +285,8 @@ The correctness anchors, in order of strength:
   `ff` `Modulus` carriers of `p²`, `q²` (`crt.p_sq`/`crt.q_sq`, used to reduce `c`
   before the montint path — replaceable by `p_sq_mont`/`q_sq_mont` alone; Effort S–M) and
   the sieve's `bytesMod` `%` plus the observable `s` (as `rsa`'s Backlog item). Fits §2.
-- Phase 2 (separate later module, depends on this one): proof of correct encryption, range
-  proofs, MtA — see "Phase-2 boundary" above.
+- Phase 2 (separate module, depends on this one): proof of correct encryption, range
+  proofs, MtA — now in the sibling `threshold_ecdsa` module; see "Phase-2 boundary" above.
 
 - **`rerandomize(pk, c, random)` helper** (survey 2026-09-30): `phe`'s `obfuscate` is the routine way to stop a re-sent or homomorphically combined ciphertext being linkable; today the caller composes `addCiphertexts(c, encryptRandom(0))`, which works but is not documented as the idiom. Effort: trivial. Fits CONVENTIONS §2.
 - **Signed-integer helper (`negate`, subtraction, decode of `n - x` as negative)** (survey 2026-09-30): `phe` accepts negative plaintexts; here `mulPlaintext` with `n - k` is the caller's job and `decrypt` returns a residue. A small `subCiphertexts`/`negate`/`toSigned` set covers the common "sum of signed values" use. Effort: small. Fits §2.

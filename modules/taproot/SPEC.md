@@ -122,8 +122,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
     scalar.
   - **Too strict or simply wrong arithmetic**: produces an output nobody —
     not even the legitimate owner — can ever spend from (funds
-    permanently lost). This is the "unspendable key" failure mode the task
-    brief calls out, and it is just as severe as the attacker-spendable
+    permanently lost). This is the "unspendable key" failure mode, and it is just as severe as the attacker-spendable
     direction: there is no silent-degradation middle ground with Taproot
     tweaking, only "exactly right" or "funds gone".
 - **Even-y interaction (`tweakSecretKey`)**: the additive tweak `+t` MUST

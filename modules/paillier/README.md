@@ -20,9 +20,8 @@ vectors plus self-checking round-trip/homomorphic-property tests and real
 Paillier is the additively-homomorphic sub-primitive the GG20/CMP
 threshold-ECDSA protocol's MtA (multiplicative-to-additive) step builds on —
 this module is Phase 1 of that arc (core PKE only). The zero-knowledge
-proofs threshold-ECDSA actually needs around it (proof of correct
-encryption, range proofs, MtA itself) are Phase 2, a separate later module —
-see SPEC.md "Phase-2 boundary".
+proofs threshold-ECDSA needs around it (range proofs, MtA itself) live in
+the sibling `threshold_ecdsa` module — see SPEC.md "Phase-2 boundary".
 
 - **Model after:** P. Paillier, "Public-Key Cryptosystems Based on Composite
   Degree Residuosity Classes", EUROCRYPT 1999 — the standard `g = n+1`
@@ -60,8 +59,9 @@ worth pinning for anyone re-deriving the vectors.
 ```zig
 const paillier = @import("paillier");
 
-const kp = try paillier.fromPrimes(p_bytes, q_bytes); // deterministic (KAT/testing); checks primality + FIPS 186-5 closeness
-// const kp = try paillier.generate(random, paillier.modulus_bits); // random
+var kp: paillier.KeyPair = undefined;
+try paillier.fromPrimes(p_bytes, q_bytes, &kp); // deterministic (KAT/testing); checks primality + FIPS 186-5 closeness
+// try paillier.generate(random, paillier.modulus_bits, &kp); // random
 
 const pk: paillier.PublicKey = kp.public;   // n, n_sq (=n²), g
 var sk: paillier.SecretKey = kp.secret;     // n, n_sq, lambda, mu
@@ -71,15 +71,16 @@ defer sk.deinit(); // zeroes lambda/mu/the CRT block when done with this key
 // construction contract" note at the top of src/root.zig.
 const m = try paillier.Fe.fromPrimitive(u32, pk.n_sq, 42);
 const r = try paillier.Fe.fromPrimitive(u32, pk.n_sq, 7);
-const c = try paillier.encrypt(pk, m, r);
-// const c = try paillier.encryptRandom(pk, m, random); // samples r itself
+const c = try paillier.encrypt(pk, &m, &r);
+// const c = try paillier.encryptRandom(pk, &m, random); // samples r itself
 
-const plaintext = try paillier.decrypt(sk, c); // rejects c=0/non-units as InvalidCiphertext
+var plaintext: paillier.Fe = undefined;
+try paillier.decrypt(&sk, c, &plaintext); // rejects c=0/non-units as InvalidCiphertext
 
 // The whole point: homomorphic ops.
 const c_sum = paillier.addCiphertexts(pk, c1, c2);       // E(m1+m2 mod n)
-const c_sum2 = try paillier.addPlaintext(pk, c1, m2);    // E(m1+m2 mod n)
-const c_scaled = try paillier.mulPlaintext(pk, c1, k);   // E(k*m1 mod n)
+const c_sum2 = try paillier.addPlaintext(pk, c1, &m2);    // E(m1+m2 mod n)
+const c_scaled = try paillier.mulPlaintext(pk, c1, &k);   // E(k*m1 mod n)
 
 // Serialization (real, mechanical — works today, no stub involved):
 var n_buf: [paillier.modulus_bytes]u8 = undefined;
@@ -97,5 +98,5 @@ all — see SPEC.md).
 
 ## Backlog
 
-- Phase 2 (separate later module): the GG20/CMP zero-knowledge proofs and
-  MtA protocol layered on top of this core PKE.
+- Phase 2 (GG20/CMP zero-knowledge proofs and MtA on top of this core PKE):
+  provided by the sibling `threshold_ecdsa` module, not here.

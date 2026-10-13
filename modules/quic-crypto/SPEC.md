@@ -33,7 +33,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [quic-go/quic-go](https://github.com/quic-go/quic-go) | Go | MIT | 11.8k | v0.63.0 (2026-09-22) | Whole QUIC + HTTP/3 stack over `crypto/tls`'s QUIC hooks. |
 | Zig `std` | Zig | MIT | — | Zig 0.16.0 | No QUIC; the primitives (AES-GCM, ChaCha20-Poly1305, HKDF) only. |
 
-**Where we are ahead:** of everything in Zig, the only RFC 9001 packet-protection code, byte-exact to RFC 9001 Appendix A (Initial, header protection, ChaCha20 set, key update), std-only with no dependencies, allocation-free, and it carries the header-protection ordering hazard in its API (`remove` returns the discovered PN length). **Where we are behind:** any handshake bridge (TLS 1.3 with QUIC transport parameters), which rustls and Go provide; that is what a transport author needs beside this. (The Retry integrity tag, RFC 9001 §5.8, and QUIC v2, RFC 9369, gaps found by the survey were closed 2026-09-30.)
+**Where we are ahead:** of everything in Zig, the only RFC 9001 packet-protection code, byte-exact to RFC 9001 Appendix A (Initial, header protection, ChaCha20 set, key update), std-only apart from the `chachapoly` sibling, allocation-free, and it carries the header-protection ordering hazard in its API (`remove` returns the discovered PN length). **Where we are behind:** any handshake bridge (TLS 1.3 with QUIC transport parameters), which rustls and Go provide; that is what a transport author needs beside this. (The Retry integrity tag, RFC 9001 §5.8, and QUIC v2, RFC 9369, gaps found by the survey were closed 2026-09-30.)
 
 ## What this module is (and is deliberately not)
 
@@ -81,7 +81,7 @@ Recorded in `src/root.zig`'s module doc. Summary of the exact std paths:
 
 ## The dtls constructions mirrored (and how QUIC differs)
 
-No `dtls` code is imported or copied (`deps = .{}`, std-only). The two shared
+No `dtls` code is imported or copied (the only dependency is the `chachapoly` sibling, for the re-exported `ChaCha20Poly1305`; everything else is std). The two shared
 CONSTRUCTIONS, re-expressed QUIC-shaped:
 
 1. **AEAD nonce** — `dtls.aead.Protection.nonce` (RFC 9147 §4.2.2,

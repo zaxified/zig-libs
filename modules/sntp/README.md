@@ -48,7 +48,7 @@ const sntp = @import("sntp");
 
 // Codec — transport-agnostic, no I/O:
 var req: [sntp.packet_len]u8 = undefined;
-sntp.encodeRequest(&req, sntp.nowTimestamp());   // client mode, VN 4, T1 set
+sntp.encodeRequest(&req, try sntp.nowTimestamp());   // client mode, VN 4, T1 set
 var kiss: sntp.KissOfDeath = undefined;
 const reply = sntp.decodeResponse(bytes, &kiss) catch |err| switch (err) {
     error.KissOfDeath => switch (kiss.code) {

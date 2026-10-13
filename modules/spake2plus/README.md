@@ -28,6 +28,7 @@ hinges on.
 | `kat_test.zig` | Byte-exact KAT assertions against that vector + a genuinely-blind end-to-end Prover<->Verifier run (no foreknowledge of either confirmation value) + mismatched-password, tamper-rejection, RFC 9383 §6 group-membership and non-canonical-scalar tests |
 | `bssl_w0w1_vectors.zig` | Frozen goldens captured from BoringSSL's `bssl::spake2plus::Register` — registration vectors plus modular-reduction boundary halves. The oracle for `computeW0W1`, which RFC 9383 Appendix C cannot reach |
 | `bssl_w0w1_test.zig` | Pins `computeW0W1` and `computeL` against those goldens byte for byte. Runs offline, with no skip path |
+| `burn.zig`, `fuzz_test.zig`, `stackprobe_test.zig` | Dead-stack burn wrappers used by the secret-touching entry points; the shared fuzz harness; the stack-residue probe test |
 | `ctgrind_harness.zig` | Instrument for SPEC.md's constant-time-discipline claims — runs the module's cores under memcheck with secret operands marked undefined, so a secret-dependent branch (in this module or in the `p256` calls it delegates to) surfaces as a reported context instead of living only in a claim |
 
 ## Import
@@ -125,8 +126,9 @@ that it cannot do so by accident, from a field it was handed.
 ## Import graph
 
 ```
-spake2plus → std.crypto.ecc.P256 / std.crypto.hash.sha2.Sha256 /
-             std.crypto.auth.hmac.sha2.HmacSha256 / std.crypto.kdf.hkdf.HkdfSha256
+spake2plus → p256 (sibling module; byte-exact to std.crypto.ecc.P256) /
+             std.crypto.hash.sha2.Sha256 / std.crypto.auth.hmac.sha2.HmacSha256 /
+             std.crypto.kdf.hkdf.HkdfSha256
 ```
 
 ## Verify

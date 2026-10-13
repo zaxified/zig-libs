@@ -108,7 +108,8 @@ module reuses TLS 1.3's HKDF-Expand-Label UNCHANGED via
 prefix as-is — the defining contrast with `dtls`, which forks it to
 `"dtls13"`). The AEAD-nonce and header-mask constructions are shared in shape
 with this repo's `dtls` module and are cited there as a design reference; no
-`dtls` code is imported or copied (`deps = .{}`, std-only). RFC 9001 Appendix
+`dtls` code is imported or copied (deps: only the `chachapoly` sibling, for
+the re-exported `ChaCha20Poly1305`; everything else is std). RFC 9001 Appendix
 A known-answer vectors were cross-checked against a from-scratch Python
 `hmac`/`hashlib` HKDF and the `cryptography` package before commit. See
 `NOTICE`.

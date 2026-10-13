@@ -16,7 +16,7 @@
 
 **Downstream consumer:** yes
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see /NOTICE.
+Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see ./README.md "Provenance" (no NOTICE entry needed).
 
 ## Compared with
 
@@ -50,7 +50,7 @@ returns `error.Timeout`. Shape mirrors `sntp.QueryOptions`/`sntp.query`'s identi
 request/response bound — same field name, unit and error name — since sntp already establishes the
 in-repo pattern for exactly this problem. Reentrant — no shared state; every call is over caller buffers.
 Clean-room from RFC 8489; attribute TLV (de)serialization structure modeled after Corendos/ztun
-(design reference only, no source copied) — see NOTICE.
+(design reference only, no source copied) — see README "Provenance"; no NOTICE entry needed.
 
 ## Server, retransmission, URIs, long-term key (2026-10-04)
 
@@ -108,16 +108,16 @@ answering (three requests seen, stray ignored), a stray-only server (reported as
 last test).
 
 ## Backlog / deferred
-Server side; long-term credential mechanism (RFC 8489 §9.2); UNKNOWN-ATTRIBUTES generation; ICE
-integration; TURN; TCP/TLS transport. (README "Deferred (not in v1)".)
+Still deferred: SASLprep, the SHA-256 password algorithm / PASSWORD-ALGORITHMS / USERHASH, the
+server-side nonce/realm flow, ICE integration, TURN, TCP/TLS transport. (README "Deferred".)
 - **2026-10-04:** retransmission, the Binding server and STUN URI parsing are **done**; the
   long-term mechanism is done as far as the key (`longTermKey`) — SASLprep (Unicode tables),
   SHA-256/PASSWORD-ALGORITHMS/USERHASH and a server-side nonce flow stay deferred until a TURN
   consumer exists (axp only asks a server for its address).
-- **UDP retransmission in `query`** (survey 2026-09-30): RFC 8489 §6.2.1 has the client resend with RTO doubling; `pion/stun`'s Client does; here one datagram is sent and a lost packet is a `Timeout` (rg `retrans|rto|retry` over `src/root.zig` finds nothing). A user on a lossy link gets false failures. Effort: small. Fits CONVENTIONS §2.
-- **Server side (Binding responder)** (survey 2026-09-30): `ztun` has one; needed for a self-hosted "what is my address" service. Effort: small for Binding only. Fits §2. (Currently listed as deferred, not as a deliberate refusal.)
-- **Long-term credential mechanism (RFC 8489 §9.2) + missing attribute types** (survey 2026-09-30): USERNAME/REALM/NONCE constants exist but no SASLprep/key derivation, PASSWORD-ALGORITHMS or USERHASH; ICE/TURN users (pion, coturn) need it. Effort: medium (SASLprep is the hard part, needs Unicode tables). Fits §2 (pure Zig).
-- **STUN URI parsing (RFC 7064)** (survey 2026-09-30): pion offers `ParseURI`; trivial convenience. Effort: small. Fits §2.
+- **DONE 2026-10-04 — UDP retransmission in `query`** (survey 2026-09-30): RFC 8489 §6.2.1 has the client resend with RTO doubling; `pion/stun`'s Client does; here one datagram is sent and a lost packet is a `Timeout` (rg `retrans|rto|retry` over `src/root.zig` finds nothing). A user on a lossy link gets false failures. Effort: small. Fits CONVENTIONS §2.
+- **DONE 2026-10-04 — Server side (Binding responder)**, `bindingResponse` (survey 2026-09-30): `ztun` has one; needed for a self-hosted "what is my address" service. Effort: small for Binding only. Fits §2. (Currently listed as deferred, not as a deliberate refusal.)
+- **PARTLY DONE 2026-10-04 (`longTermKey`; see the bullet above for what stays deferred) — Long-term credential mechanism (RFC 8489 §9.2) + missing attribute types** (survey 2026-09-30): USERNAME/REALM/NONCE constants exist but no SASLprep/key derivation, PASSWORD-ALGORITHMS or USERHASH; ICE/TURN users (pion, coturn) need it. Effort: medium (SASLprep is the hard part, needs Unicode tables). Fits §2 (pure Zig).
+- **DONE 2026-10-04 — STUN URI parsing (RFC 7064)**, `parseUri` (survey 2026-09-30): pion offers `ParseURI`; trivial convenience. Effort: small. Fits §2.
 
 ## Status
 `gap · any (core pure; optional query helper does I/O) · codec · reentrant` + deps: `netaddr` —

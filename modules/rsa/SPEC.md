@@ -17,7 +17,7 @@
 **Downstream consumer:** yes
 
 Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see
-./README.md "Provenance" + /NOTICE.
+./README.md "Provenance" + the module-local `NOTICE`.
 
 ## Compared with
 

@@ -16,7 +16,7 @@
 
 **Downstream consumer:** yes
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see /NOTICE.
+Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see ./README.md "Provenance" (no NOTICE entry needed).
 
 ## Compared with
 
@@ -48,7 +48,7 @@ network-touching code: UDP sends one datagram (truncated with a marker past ~102
 RFC 6587 octet-counted framing (`"<len> <msg>"`). Reentrant — no shared state. Clean-room from RFC
 5424, RFC 6587, RFC 3164; the `Message`/`Sender` design split (pure codec vs. network emitter,
 RFC 3339-ms timestamps, SD escaping, field-length validation, octet framing) is referenced from
-`joelreymont/pz` (MIT) — design only, no code copied — see NOTICE.
+`joelreymont/pz` (MIT) — design only, no code copied — see README "Provenance"; no NOTICE entry needed.
 
 **RFC 3164 HOSTNAME.** RFC 3164 has no NILVALUE and no delimiter but the space, so a receiver
 decides whether the first word after the timestamp is a hostname by looking at it. rsyslogd 8.2512

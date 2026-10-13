@@ -20,8 +20,8 @@ authorized to do this."
   `Decision`, so default-deny isn't just documented, it's what callers actually branch on.
 
 Provenance: clean-room implementation from the public NIST RBAC / XACML specs — no
-third-party source ported or implementation consulted; see SPEC.md and NOTICE (§5:
-public-spec implementations need no NOTICE entry).
+third-party source ported or implementation consulted; see SPEC.md (§5:
+public-spec implementations need no NOTICE entry, so the module has none).
 
 ## RBAC API
 
@@ -100,7 +100,7 @@ const detailed = abac.evaluateDetailed(policy, &attrs); // -> full XACML 4-value
 ```
 
 Operators: `eq`/`ne` (type-checked, any `Value` kind), `lt`/`le`/`gt`/`ge` (int only),
-`in` (RHS must resolve to a `.list`), `andAll`/`orAny`/`not` for composition. `Value` =
+`inList` (RHS must resolve to a `.list`), `andAll`/`orAny`/`not` for composition. `Value` =
 `string | int | bool | list(Value)`. Evaluation is depth-bounded (`error.MaxDepthExceeded`
 past `Policy.max_depth`) so an adversarially/accidentally deep tree cannot exhaust the stack.
 
@@ -111,6 +111,6 @@ zig build test-rbac
 zig build test-rbac -Doptimize=ReleaseFast
 ```
 
-Self-constructed unit tests (36) — see SPEC.md for why no external KAT applies to policy
+Self-constructed unit tests (`scripts/modtest rbac`) — see SPEC.md for why no external KAT applies to policy
 logic, and for the design rationale behind the `deny_overrides` default and the
 `evaluate`/`evaluateDetailed` split.

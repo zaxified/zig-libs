@@ -81,7 +81,7 @@ const sk: rsa.SecretKey = ...;   // n, d, p, q, dp, dq, qinv
 
 // P1 — PKCS1-v1.5 sign/verify:
 var sig_buf: [512]u8 = undefined; // >= modulus byte length
-const sig = try rsa.signPkcs1v15(sk, std.crypto.hash.sha2.Sha256, msg, &sig_buf);
+const sig = try rsa.signPkcs1v15(&sk, std.crypto.hash.sha2.Sha256, msg, &sig_buf);
 try rsa.verifyPkcs1v15(pk, std.crypto.hash.sha2.Sha256, msg, sig);
 ```
 

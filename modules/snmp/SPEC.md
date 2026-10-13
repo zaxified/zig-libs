@@ -15,7 +15,7 @@
 
 **Downstream consumer:** no
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see /NOTICE.
+Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see ./README.md "Provenance" (no NOTICE entry needed).
 
 ## Compared with
 
@@ -59,7 +59,7 @@ Two layering traps are modelled explicitly, because they are what implementation
 post-decrypt use, and the send side is `encodeScopedPdu` (the plaintext TLV to encrypt) +
 `encodeEncrypted` (envelope with msgData = encryptedPDU). Clean-room from RFC 1157 (v1), 1905/3416
 (v2c), 3412 (v3 message processing), 3414 (USM), 3826 (AES priv), 7860 (SHA-2 auth), 2578 (SMI
-types), X.690 (BER) — see NOTICE.
+types), X.690 (BER) — see README "Provenance"; no NOTICE entry needed.
 
 ## Threat model / out of scope
 USM is the security-sensitive part.

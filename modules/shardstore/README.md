@@ -149,4 +149,4 @@ store-wide lock (`"<name_prefix>.lock"`, `error.Locked`), or resharding. See `SP
 the verification argument.
 
 Provenance: original composition (plain key-sharding over single-writer stores);
-no third-party source consulted or copied. See `NOTICE`.
+no third-party source consulted or copied, so no NOTICE entry.

@@ -21,7 +21,7 @@ A key-sharding router over N independent `kvtree` stores: the multi-core
 **write-parallelism** layer for the data family. Usage: see ./README.md.
 Provenance: original composition — plain consistent-by-key sharding over N
 single-writer stores (the Redis Cluster / Dynamo partitioning idea); no source
-ported. See /NOTICE.
+ported. No NOTICE needed; see README "Provenance".
 
 ## Compared with
 

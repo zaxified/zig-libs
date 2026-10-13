@@ -22,6 +22,7 @@ delivery** (a unix-socket emitter and the systemd journal's native protocol).
   state). **Allocation:** none — fixed buffers throughout (`journal.Emitter.send`
   references a caller's field values zero-copy via `sendmsg` scatter-gather,
   rather than copying them into a buffer at all).
+- **Deps:** `datefmt` (RFC 3339 / BSD timestamp rendering).
 
 Provenance: clean-room from RFC 5424 (syslog protocol), RFC 6587 (TCP octet
 framing) and RFC 3164 (BSD legacy). The `Message`/`Sender` *design* (a pure

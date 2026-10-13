@@ -44,8 +44,9 @@ defer gpa.free(routes);
 for (routes) |r| _ = .{ r.dest, r.gateway, r.iface(), r.metric };
 
 // TCP + UDP sockets, v4 and v6 (/proc/net/{tcp,tcp6,udp,udp6})
-const socks = try procnet.readSockets(gpa, io);
-defer gpa.free(socks);
+const table = try procnet.readSockets(gpa, io);
+defer table.deinit(gpa);
+const socks = table.entries; // `table.truncated`: a table hit its read limit
 for (socks) |s| _ = .{
     s.proto,  s.local,  s.local_port, s.state,
     s.remote, s.remote_port,          // the peer, as `ss` shows it
