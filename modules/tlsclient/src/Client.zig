@@ -12,6 +12,7 @@ const native_endian = builtin.cpu.arch.endian();
 const std = @import("std");
 const verify = @import("verify.zig");
 const p256 = @import("p256");
+const p384 = @import("p384");
 const keygen = @import("keygen.zig");
 const rsa = @import("rsa");
 // zig-libs tlsclient: dead-stack burn around the client-certificate signature.
@@ -1288,7 +1289,7 @@ pub fn signCertificateVerify(out: *[160]u8, key: *const ClientAuth.PrivateKey, m
 fn signCertificateVerifyBody(out: *[160]u8, key: *const ClientAuth.PrivateKey, msg: []const u8) error{ClientKeyInvalid}![]const u8 {
     switch (key.*) {
         inline .ecdsa_secp256r1_sha256, .ecdsa_secp384r1_sha384 => |*raw, tag| {
-            const E = if (tag == .ecdsa_secp256r1_sha256) crypto.sign.ecdsa.EcdsaP256Sha256 else crypto.sign.ecdsa.EcdsaP384Sha384;
+            const E = if (tag == .ecdsa_secp256r1_sha256) crypto.sign.ecdsa.EcdsaP256Sha256 else p384.EcdsaP384Sha384;
             var sk = E.SecretKey.fromBytes(raw.*) catch return error.ClientKeyInvalid;
             defer crypto.secureZero(u8, mem.asBytes(&sk));
             var kp = E.KeyPair.fromSecretKey(sk) catch return error.ClientKeyInvalid;
@@ -1730,7 +1731,7 @@ fn big(x: anytype) @TypeOf(x) {
 const KeyShare = struct {
     ml_kem768_kp: crypto.kem.ml_kem.MLKem768.KeyPair,
     secp256r1_kp: crypto.sign.ecdsa.EcdsaP256Sha256.KeyPair,
-    secp384r1_kp: crypto.sign.ecdsa.EcdsaP384Sha384.KeyPair,
+    secp384r1_kp: p384.EcdsaP384Sha384.KeyPair,
     x25519_kp: crypto.dh.X25519.KeyPair,
     sk_buf: [sk_max_len]u8,
     sk_len: std.math.IntFittingRange(0, sk_max_len),
@@ -1746,8 +1747,8 @@ const KeyShare = struct {
         return .{
             .ml_kem768_kp = try .generateDeterministic(seed[0..64].*),
             // zig-libs tlsclient: std's key pairs, byte for byte, with the
-            // public keys from fixed-base combs (keygen.zig) — std's
-            // `basePoint.mul` for these two was ~2/3 of the client's CPU.
+            // public keys from fixed-base combs (keygen.zig: p256's, p384's) —
+            // std's `basePoint.mul` for these two was ~2/3 of the client's CPU.
             .secp256r1_kp = try keygen.keyPairP256(seed[64..96].*),
             .secp384r1_kp = try keygen.keyPairP384(seed[96..144].*),
             .x25519_kp = try .generateDeterministic(seed[144..176].*),
@@ -1788,16 +1789,13 @@ const KeyShare = struct {
                 ks.sk_len = sk.len;
             },
             .secp384r1 => {
-                const PublicKey = crypto.sign.ecdsa.EcdsaP384Sha384.PublicKey;
-                const pk = PublicKey.fromSec1(server_pub_key) catch return error.TlsDecryptFailure;
-                // zig-libs tlsclient: `mul`, not std's `mulPublic` — that one is
-                // variable-time ("for a *PUBLIC* scalar") and this scalar is our
-                // ephemeral ECDHE secret.
-                const mul = pk.p.mul(ks.secp384r1_kp.secret_key.bytes, .big) catch
+                // zig-libs tlsclient: the `p384` module's ECDH — constant time
+                // in our ephemeral secret, burned, shared x into `sk_buf`
+                // directly. Refuses what std's `fromSec1` + `mul` refused (an
+                // off-curve or identity point, an identity product).
+                p384.ecdhInto(ks.sk_buf[0..48], &ks.secp384r1_kp.secret_key.bytes, server_pub_key) catch
                     return error.TlsDecryptFailure;
-                const sk = mul.affineCoordinates().x.toBytes(.big);
-                @memcpy(ks.sk_buf[0..sk.len], &sk);
-                ks.sk_len = sk.len;
+                ks.sk_len = 48;
             },
             .x25519 => {
                 const ksl = crypto.dh.X25519.public_length;
@@ -1967,14 +1965,16 @@ const CertificatePublicKey = struct {
                 if (!p256.sign.ecdsaVerifyDigest(pub_key, &digest, sig.toBytes()))
                     return error.SignatureVerificationFailed;
             },
-            inline .ecdsa_secp384r1_sha384,
-            => |comptime_scheme| {
-                const Ecdsa = SchemeEcdsa(comptime_scheme);
+            // zig-libs tlsclient: P-384 through the `p384` module (std's
+            // generic P-384 verify, 2026-10-13). Decoding stays std's, as for
+            // P-256 above, so a malformed signature or key fails as before.
+            .ecdsa_secp384r1_sha384 => {
+                const Ecdsa = SchemeEcdsa(.ecdsa_secp384r1_sha384);
                 const sig = try Ecdsa.Signature.fromDer(encoded_sig);
-                const key = try Ecdsa.PublicKey.fromSec1(pub_key);
-                var ver = try sig.verifier(key);
-                for (msg) |part| ver.update(part);
-                try ver.verify();
+                _ = try Ecdsa.PublicKey.fromSec1(pub_key);
+                const P384Ecdsa = p384.EcdsaP384Sha384;
+                const key = try P384Ecdsa.PublicKey.fromSec1(pub_key);
+                try P384Ecdsa.Signature.fromBytes(sig.toBytes()).verify(signed, key);
             },
             inline .rsa_pkcs1_sha256,
             .rsa_pkcs1_sha384,
@@ -2182,7 +2182,7 @@ fn testServerSignature(key: *const CertificatePublicKey, scheme: tls.SignatureSc
     return key.verifySignature(&d, parts);
 }
 
-test "server signature: a genuine P-256 / RSA-PSS / PKCS#1 signature verifies, a damaged one does not" {
+test "server signature: a genuine P-256 / P-384 / RSA-PSS / PKCS#1 signature verifies, a damaged one does not" {
     // The server's CertificateVerify (TLS 1.3) and ServerKeyExchange (TLS 1.2)
     // signature is the only proof the peer holds the leaf's key; nothing
     // else in this file fed `verifySignature` a bad one (both negative
@@ -2192,20 +2192,25 @@ test "server signature: a genuine P-256 / RSA-PSS / PKCS#1 signature verifies, a
     const content = parts[0] ++ parts[1] ++ parts[2];
     const other = [_][]const u8{ " " ** 64, "TLS 1.3, client CertificateVerify\x00", &([_]u8{0x5c} ** 32) };
 
-    // ECDSA P-256, signed by std (independent of the verifier under test).
-    {
-        const E = crypto.sign.ecdsa.EcdsaP256Sha256;
+    // ECDSA P-256 and P-384, signed by std (independent of the verifiers
+    // under test: p256's and, since 2026-10-13, p384's).
+    inline for (.{
+        .{ crypto.sign.ecdsa.EcdsaP256Sha256, tls.SignatureScheme.ecdsa_secp256r1_sha256 },
+        .{ crypto.sign.ecdsa.EcdsaP384Sha384, tls.SignatureScheme.ecdsa_secp384r1_sha384 },
+    }) |case| {
+        const E = case[0];
+        const scheme = case[1];
         const kp = try E.KeyPair.generateDeterministic([_]u8{0x31} ** E.KeyPair.seed_length);
         var key: CertificatePublicKey = undefined;
         try key.init(.X9_62_id_ecPublicKey, &kp.public_key.toUncompressedSec1());
         var der_buf: [E.Signature.der_encoded_length_max]u8 = undefined;
         const sig = (try kp.sign(content, null)).toDer(&der_buf);
-        try testServerSignature(&key, .ecdsa_secp256r1_sha256, sig, &parts);
-        try std.testing.expectError(error.SignatureVerificationFailed, testServerSignature(&key, .ecdsa_secp256r1_sha256, sig, &other));
+        try testServerSignature(&key, scheme, sig, &parts);
+        try std.testing.expectError(error.SignatureVerificationFailed, testServerSignature(&key, scheme, sig, &other));
         var bad: [E.Signature.der_encoded_length_max]u8 = undefined;
         @memcpy(bad[0..sig.len], sig);
         bad[sig.len - 3] ^= 0x01; // inside s
-        try std.testing.expectError(error.SignatureVerificationFailed, testServerSignature(&key, .ecdsa_secp256r1_sha256, bad[0..sig.len], &parts));
+        try std.testing.expectError(error.SignatureVerificationFailed, testServerSignature(&key, scheme, bad[0..sig.len], &parts));
     }
 
     // RSA-1024, PSS (rsae, salt = digest length) and PKCS#1 v1.5.

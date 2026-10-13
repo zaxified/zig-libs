@@ -45,7 +45,7 @@ pub const meta = .{
     // A `Client` is one connection's state, owned by one caller, like std's.
     .concurrency = .single_owner,
     .model_after = "Zig 0.16.0 std.crypto.tls.Client (copied, MIT) + RFC 5280 §6.1 path validation via x509",
-    .deps = .{ "x509", "p256", "rsa" }, // p256 + rsa: the server CertificateVerify / ServerKeyExchange signature
+    .deps = .{ "x509", "p256", "p384", "rsa" }, // p384: the P-384 key share, ECDHE, client-cert signing and server-signature verify; p256 + rsa: the server CertificateVerify / ServerKeyExchange signature
 };
 
 // ── dark-tests aggregator (CONVENTIONS.md §6 step 3) ────────────────────

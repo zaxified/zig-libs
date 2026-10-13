@@ -8,8 +8,8 @@
 
 **Audit:** review 2026-10-04 · mutation 2026-10-04 (22/23) · src ?
 
-**Hardening:** fuzz 2026-10-10 (`tlsclient-chain` 200,000-run budget clean; `tlsclient-flight` at `.scale` 10 = 20,000 runs — a genuine TLS 1.3 flight read to close_notify across a KeyUpdate, and a plaintext TLS 1.2 flight, damaged; TLSCLIENT_FUZZ) · ct 2026-10-11 (ctgrind: key-share secrets through key generation (incl. the P-384/P-256 combs of `keygen.zig`), ECDHE + key schedule, client-auth key through signCertificateVerify; `kex` 19 / `cv` 32 in-file, all keygen/ECDSA identity and range verdicts, none a Client.zig branch; positive control: a secret-indexed comb table load adds a context; encrypted flight not measured)
-**Performance:** ref 1.27–1.37× Go 1.26.0 crypto/tls client · fastest ? (measured 2026-10-11)
+**Hardening:** fuzz 2026-10-10 (`tlsclient-chain` 200,000-run budget clean; `tlsclient-flight` at `.scale` 10 = 20,000 runs — a genuine TLS 1.3 flight read to close_notify across a KeyUpdate, and a plaintext TLS 1.2 flight, damaged; TLSCLIENT_FUZZ) · ct 2026-10-13 (ctgrind: key-share secrets through key generation (std's derivation in `keygen.zig`, public points from the `p256`/`p384` combs), ECDHE + key schedule, client-auth key through signCertificateVerify; `kex` 18 / `cv` 18 in-file, all std keygen/ECDSA identity and range verdicts (P-384 via `p384`: 0), none a Client.zig branch; 2026-10-11 positive control: a secret-indexed comb table load adds a context; encrypted flight not measured)
+**Performance:** ref 1.08–1.11× Go 1.26.0 crypto/tls client · fastest ? (measured 2026-10-13)
 
 **Known defects:** none recorded
 
@@ -123,11 +123,11 @@ the handshake, and their tests at the end of the file. The offline test
 Also re-apply the 2026-10-11 performance changes, all marked `zig-libs
 tlsclient`: `KeyShare.init` taking its P-256/P-384 pairs from `keygen.zig`,
 and `CertificatePublicKey.verifySignature` routing P-256 to `p256` and RSA to
-`rsa.VerifyKey`. `keygen.zig`'s two std copies (`deterministicSecret`,
-`addMixedComplete`) are pinned by its differential tests against the new std;
-re-copy them if those go red.
+`rsa.VerifyKey` (and, since 2026-10-13, P-384 everywhere to `p384`).
+`keygen.zig`'s std copy (`deterministicSecret`) is pinned by its differential
+tests against the new std; re-copy it if those go red.
 
-## Key shares (2026-10-11)
+## Key shares (2026-10-11; P-384 on `p384` since 2026-10-13)
 
 std's ClientHello — kept byte for byte, an offline test proves it — offers
 X25519MLKEM768, secp256r1, secp384r1 and X25519 shares, so all four key pairs
@@ -135,24 +135,22 @@ are generated per handshake. std computes the P-256 and P-384 public keys
 with `basePoint.mul` (a 4-bit window, 64 or 96 doublings), which was ~2/3 of
 the client's CPU. `keygen.zig` produces the same key pairs, byte for byte
 (differential tests against std's `generateDeterministic`): the secret scalar
-by std's own derivation (copied), the public point by a fixed-base comb —
-`p256.P256.combMulBase` for P-256, and for P-384 a comb over std's `P384`
-with a generated affine table (`tools/gen_p384_base_table.py`, plain Python
-affine arithmetic, independent of std; 78 windows × 16 entries, signed 5-bit
-digits, 78 mixed additions and no doublings, ~0.19 ms against ~1.07 ms).
+by std's own derivation (copied — `p384`'s `generateDeterministic` orders the
+HMAC-DRBG input differently and would change the ClientHello), the public
+point by a constant-time fixed-base comb: `p256.P256.combMulBase` for P-256,
+`p384`'s `KeyPair.fromSecretKey` for P-384. The ECDHE step on secp384r1 is
+`p384.ecdhInto`; the client's P-384 CertificateVerify signature is `p384`'s
+(RFC 6979 nonces, so its bytes differ from std's — openssl `-Verify` accepts
+it in the interop test); the server's P-384 signature is decoded by std and
+verified by `p384`, as P-256 is by `p256`.
 
-Constant time: digits recoded branch-free, every entry of a window read by
-masked blends, the sum always computed and kept by a mask, masks laundered
-through an empty `asm` so LLVM cannot rebuild branches. The mixed addition is
-std's RCB Algorithm 5 copied without its closing `cMov(p, q.x.isZero())`:
-with std's version, ctgrind saw that select lowered to secret-dependent loads
-(the comb's digit 0 used to pass the affine (0, 0)); digit 0 now passes the
-window's first entry, a real point, and discards the sum. ctgrind row
-`tlsclient/kex` covers `keygen.zig`; a disposable copy with a secret-indexed
-table load raised its count (positive control). Negative controls: 8 mutants
-over the comb and the derivation, all killed; one survived an earlier
-version of the tests, which compared points with `equivalent` (true for the
-degenerate (0:0:0) against anything) — they compare SEC1 bytes now.
+2026-10-11..13 history: a P-384 comb over std's field lived in this file with
+a generated table and a copy of std's `addMixed` minus its closing
+`cMov(p, q.x.isZero())` (ctgrind saw that select as secret-dependent loads);
+the `p384` module took over its numbers and its ctgrind lesson. ctgrind row
+`tlsclient/kex` covers `keygen.zig`. Negative controls: 8 mutants over the
+comb and the derivation (2026-10-11), all killed; the P-384 server-signature
+test goes red when `p384`'s verify is skipped (2026-10-13).
 
 ## Anchoring
 
@@ -198,9 +196,9 @@ degenerate (0:0:0) against anything) — they compare SEC1 bytes now.
 
 ## Backlog / deferred
 
-- **DONE 2026-10-11: speed.** Was 5.22–5.87× Go 1.26.0 crypto/tls client handshake (P4, card `not measured`); now 1.27–1.37× (three runs, the clean one 1.31–1.34×; P3). Three causes by profile, in order: x509 chain verify and the server signature on std's slow P-256/RSA (→ `p256`, `rsa.VerifyKey`), then the ClientHello's eager key shares — std's `basePoint.mul` for P-384 (~1.07 ms) and P-256 (~0.29 ms) was ~2/3 of the client CPU (→ `keygen.zig`, see § Key shares).
+- **DONE 2026-10-11: speed.** Was 5.22–5.87× Go 1.26.0 crypto/tls client handshake (P4, card `not measured`); then 1.27–1.37× (three runs, the clean one 1.31–1.34×; P3); **2026-10-13 1.08–1.11×** with P-384 on `p384` (three 7-round runs on a quiet host: ecdsa256 1.078 / 1.088 / 1.081, rsa2048 1.079 / 1.107 / 1.084; our spreads 2.6–8.5 %). Still P3 by the one rsa2048 reading over 1.1. Three causes by profile, in order: x509 chain verify and the server signature on std's slow P-256/RSA (→ `p256`, `rsa.VerifyKey`), then the ClientHello's eager key shares — std's `basePoint.mul` for P-384 (~1.07 ms) and P-256 (~0.29 ms) was ~2/3 of the client CPU (→ `keygen.zig`, see § Key shares).
 
-- **A `p384` module** (owner, 2026-10-11): `keygen.zig`'s P-384 comb is a stopgap on std's field, which is ~2–2.5× OpenSSL 3.5.5 for ECDH/verify (std `addMixed` 2.26 µs; OpenSSL ECDH 477 µs, verify 605 µs). A module of its own — Montgomery field with MULX/ADX as `p256`, the comb, constant-time variable-base multiply, ECDH, ECDSA, OpenSSL/Wycheproof anchors, ctgrind, fuzz, bench — would also speed up x509 P-384 chains and client-auth P-384 signing; the comb and its generator move there. Not started: it must arrive at grade ≤ 3, being in `http`'s dependency closure.
+- ~~**A `p384` module**~~ — DONE 2026-10-13: `modules/p384` (grade 2); the comb, its generator and the `addMixed` copy left this module, and P-384 key share, ECDHE, client-cert signing and server-signature verify run there.
 
 **2026-10-09 (resolved, ECDHE + handshake key schedule):** the ECDHE key
 shares (`KeyShare`: ML-KEM-768, X25519, P-256, P-384) and the handshake key

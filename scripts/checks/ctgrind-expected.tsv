@@ -1138,8 +1138,18 @@ noise	ReleaseFast	transport	1	6	dde901de8c90da98	b4443cf65f6c3849
 # dependent loads (cmovznzU64) for the digit-0 dummy -- replaced by a copy
 # without the select. Positive control (secret-indexed table load in a
 # disposable copy): 19 -> 20.
-tlsclient	ReleaseFast	kex	1	19	63df6afdb37ae355	73e6ffdaf71d18ad
-tlsclient	ReleaseFast	cv	1	32	1e75aaf8699c2a1a	8b11266441b54869
+# 2026-10-13 — P-384 onto the `p384` module (key-share public key, ECDHE,
+# client-cert signing, server-signature verify): kex 19 -> 18, cv 32 -> 18.
+# --stacks by call chain, zero p384/src frames (p384 declassifies its own
+# public verdicts, its row claims 0): kex 18 = ML-KEM 12 + keygen.
+# deterministicSecret range 2 (P-256, P-384; std's derivation kept so the
+# ClientHello stays std's) + p256 comb 2 + X25519 ladder 2 -- the P-384
+# comb's rejectIdentity is gone with the comb. cv 18 = std ECDSA P-256
+# (fromSecretKey, pcMul16, scalar range, r/s == 0 verdicts, toDer + trimStart)
+# and Ed25519 internals; the 14 std P-384 signer contexts are gone. The cv
+# result changed: p384's P-384 signature is RFC 6979 exact, not std's bytes.
+tlsclient	ReleaseFast	kex	1	18	ab0d39dc2251edbc	73e6ffdaf71d18ad
+tlsclient	ReleaseFast	cv	1	18	93c22b1edff08188	ec6c57e652dc770e
 # dtls (2026-10-10) — hs: in-memory PSK handshake (AES-128-GCM), the PSK
 # tainted on both sides; app: after an untainted handshake both directions'
 # record keys (key, IV, sn mask key) tainted, send/recv both ways under

@@ -194,8 +194,9 @@ was 70 ns. History, the same day: portable field first (ECDH 517 µs, 1.18×), t
   differentials.
 - **No ECDH object**: `ecdh`/`ecdhInto` next to `P384.mul`, as std has none for its NIST curves.
 - **The comb table is generated** (`tools/gen_base_table.py`), not built at comptime (1248
-  points would cost every compile minutes) — the same numbers as tlsclient's
-  `p384_base_table.zig`, which this module's table replaces once tlsclient is wired.
+  points would cost every compile minutes) — the same numbers as tlsclient's former
+  `p384_base_table.zig`, which this module's table replaced on 2026-10-13 (tlsclient's P-384
+  key share, ECDHE, client-cert signing and server-signature verify now run here).
 
 ## Backlog / deferred
 

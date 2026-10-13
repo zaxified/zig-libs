@@ -33,6 +33,9 @@ const Sha384 = std.crypto.hash.sha2.Sha384;
 const Sha512 = std.crypto.hash.sha2.Sha512;
 const Es256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
 const Es384 = std.crypto.sign.ecdsa.EcdsaP384Sha384;
+/// The P-384 signer and key share run on the `p384` module (2026-10-13): its
+/// scalars are the in-memory images worth looking for.
+const p384 = @import("p384");
 
 const WINDOW = 512 * 1024; // deeper than `burn.init_burn`
 const LEAK = 32;
@@ -363,7 +366,7 @@ test "STACKPROBE: no key or nonce residue on the dead stack after the client Cer
             leak_src = cur_key.ecdsa_secp384r1_sha384[0..LEAK].*;
             callSign();
             var n: Needles = .{};
-            try ecdsaNeedles(Es384, std.crypto.ecc.P384, Sha384, &n, &cur_key.ecdsa_secp384r1_sha384, signed_msg, sig_sink);
+            try ecdsaNeedles(Es384, p384, Sha384, &n, &cur_key.ecdsa_secp384r1_sha384, signed_msg, sig_sink);
             n.sort();
             bad += try runProbe("signCertificateVerify P-384", callSign, &n);
         }
@@ -691,6 +694,7 @@ fn keyNeedles(n: *Needles) void {
     n.addBoth("p256 seed", kex_entropy[128..160]);
     n.addScalar("p256 d", std.crypto.ecc.P256.scalar.Scalar.fromBytes(keys.p256.secret_key.bytes, .big) catch unreachable);
     n.addBoth("p384 seed", kex_entropy[160..208]);
+    n.addScalar("p384 d", p384.Scalar.fromBytes(keys.p384.secret_key.bytes, .big) catch unreachable);
     n.addScalar("p384 d", std.crypto.ecc.P384.scalar.Scalar.fromBytes(keys.p384.secret_key.bytes, .big) catch unreachable);
 
     n.addBoth("x25519 sk", &keys.x25519.secret_key);
