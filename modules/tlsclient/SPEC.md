@@ -90,6 +90,16 @@ marked `zig-libs tlsclient` in `Client.zig`:
 - **Keying-material exporter** `exportKeyingMaterial(label, context, out)`:
   RFC 8446 §7.5; TLS 1.2 RFC 5705 only with EMS and without the PRF's own
   labels (Go's rules). Equal to `openssl s_server -keymatexport` in both.
+- **Client authentication, Go's reach** (S2 R6): RSA client keys
+  (`PrivateKey.rsa`, the `rsa` module's pair; TLS 1.3 RSA-PSS, TLS 1.2
+  PKCS#1 v1.5 or PSS), the scheme chosen from the server's list in its order
+  (TLS 1.2 schemes name only the hash, so a P-256 key may sign ECDSA+SHA384
+  there), `client_auth_select` (Go `GetClientCertificate`) called with the
+  request's schemes and CA names, and **TLS 1.2 client certificates** (RFC
+  5246 §7.4.4-7.4.8: Certificate before ClientKeyExchange, CertificateVerify
+  over SHA-256/384/512 running hashes of the messages, kept only when client
+  auth is configured). Ed25519 client keys stay TLS 1.3 only: PureEdDSA
+  cannot sign the TLS 1.2 messages' hash (an empty Certificate is sent).
 - **KeyUpdate sent** (RFC 8446 §4.6.3): a server's update_requested is
   answered with our KeyUpdate before our next record, and the client updates
   on its own after `key_update_after` (2^23) records. std switched its write

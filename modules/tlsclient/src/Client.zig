@@ -16,7 +16,9 @@ const p384 = @import("p384");
 const p521 = @import("p521");
 const hello = @import("hello.zig");
 const keygen = @import("keygen.zig");
-const rsa = @import("rsa");
+/// The in-repo RSA module, re-exported so a caller can name `rsa.KeyPair`
+/// for `ClientAuth.PrivateKey.rsa`.
+pub const rsa = @import("rsa");
 // zig-libs tlsclient: dead-stack burn around the client-certificate signature.
 const burn = @import("burn.zig");
 const tls = std.crypto.tls;
@@ -193,6 +195,10 @@ pub const Options = struct {
     /// §4.4.2.3) and the server decides. TLS 1.2 client authentication is
     /// not implemented (a TLS 1.2 CertificateRequest stays an error).
     client_auth: ?ClientAuth = null,
+    /// Choose the client certificate per request (Go `GetClientCertificate`):
+    /// called with the request's signature schemes and acceptable CA names;
+    /// null means "none" (an empty Certificate). Overrides `client_auth`.
+    client_auth_select: ?ClientAuthSelect = null,
 
     // zig-libs tlsclient: Go-shaped options (S2 survey 2026-10-13). The
     // defaults are Go's `crypto/tls` client's.
@@ -489,18 +495,59 @@ pub const ClientAuth = struct {
         ecdsa_secp256r1_sha256: [32]u8,
         /// P-384 scalar, big-endian. Signs `ecdsa_secp384r1_sha384`.
         ecdsa_secp384r1_sha384: [48]u8,
-        /// Ed25519 seed (RFC 8032 private key). Signs `ed25519`.
+        /// Ed25519 seed (RFC 8032 private key). Signs `ed25519` -- TLS 1.3
+        /// only: a TLS 1.2 CertificateVerify signs a hash of the messages,
+        /// which PureEdDSA cannot.
         ed25519: [32]u8,
+        /// An RSA key pair (the `rsa` module's), borrowed. TLS 1.3 signs
+        /// RSA-PSS (rsa_pss_rsae_*); TLS 1.2 PKCS#1 v1.5 or PSS -- the first
+        /// of the server's schemes that fits.
+        rsa: *const rsa.KeyPair,
 
+        /// The TLS 1.3 scheme a key signs with by default.
         pub fn scheme(k: *const PrivateKey) tls.SignatureScheme {
             return switch (k.*) {
                 .ecdsa_secp256r1_sha256 => .ecdsa_secp256r1_sha256,
                 .ecdsa_secp384r1_sha384 => .ecdsa_secp384r1_sha384,
                 .ed25519 => .ed25519,
+                .rsa => .rsa_pss_rsae_sha256,
+            };
+        }
+
+        /// Whether this key can sign `s` in `version` (RFC 8446 §4.2.3 binds
+        /// ECDSA curves to schemes in TLS 1.3; TLS 1.2 schemes name the hash
+        /// only).
+        pub fn fits(k: *const PrivateKey, s: tls.SignatureScheme, version: tls.ProtocolVersion) bool {
+            const ecdsa_any = s == .ecdsa_secp256r1_sha256 or s == .ecdsa_secp384r1_sha384 or s == .ecdsa_secp521r1_sha512;
+            const pss = s == .rsa_pss_rsae_sha256 or s == .rsa_pss_rsae_sha384 or s == .rsa_pss_rsae_sha512;
+            const pkcs1 = s == .rsa_pkcs1_sha256 or s == .rsa_pkcs1_sha384 or s == .rsa_pkcs1_sha512;
+            return switch (k.*) {
+                .ecdsa_secp256r1_sha256 => if (version == .tls_1_3) s == .ecdsa_secp256r1_sha256 else ecdsa_any,
+                .ecdsa_secp384r1_sha384 => if (version == .tls_1_3) s == .ecdsa_secp384r1_sha384 else ecdsa_any,
+                .ed25519 => version == .tls_1_3 and s == .ed25519,
+                .rsa => pss or (version == .tls_1_2 and pkcs1),
             };
         }
     };
 };
+
+/// What a CertificateRequest asked for (Go `CertificateRequestInfo`).
+pub const CertificateRequestInfo = struct {
+    version: tls.ProtocolVersion,
+    signature_schemes: []const tls.SignatureScheme,
+    /// The DER DistinguishedNames of the CAs the server accepts (empty:
+    /// any). Valid during the callback only.
+    certificate_authorities: []const []const u8,
+};
+
+/// `Options.client_auth_select`.
+pub const ClientAuthSelect = struct {
+    context: ?*anyopaque = null,
+    select: *const fn (context: ?*anyopaque, info: *const CertificateRequestInfo) ?ClientAuth,
+};
+
+/// The longest signature `signCertificateVerify` writes (RSA-4096).
+pub const max_signature_len = 512;
 
 pub const InitError = error{
     InsufficientEntropy,
@@ -555,6 +602,9 @@ pub const InitError = error{
     ClientCertificateTooLarge,
     /// `ClientAuth.key` is not a valid key for its curve.
     ClientKeyInvalid,
+    /// A CertificateRequest listing more schemes or CA names than this
+    /// client keeps (`CertRequest.max_schemes`, `max_cas`).
+    TlsCertificateRequestTooLarge,
     /// `min_version` above `max_version`, or either not TLS 1.2 / 1.3.
     VersionsInvalid,
     /// `groups` empty, a group not in `supported_groups` or listed twice, or
@@ -650,6 +700,14 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
     var hello_buf: [hello.max_len]u8 = undefined;
     var hello_msg: []const u8 = hello.write(&hello_buf, hello_params) catch unreachable; // bounded: max_len covers every share + host + ALPN
     try writeHelloRecord(output, .tls_1_0, hello_msg);
+    // zig-libs tlsclient: client authentication -- RSA-PSS salts and the
+    // `rsa` module's blinding come from a CSPRNG keyed from the secret part
+    // of the entropy; TLS 1.2's CertificateVerify needs the messages' hashes.
+    const auth_configured = options.client_auth != null or options.client_auth_select != null;
+    var auth_csprng = std.Random.DefaultCsprng.init(crypto.kdf.hkdf.HkdfSha256.extract("zig-libs tlsclient client auth", options.entropy[64..240]));
+    defer crypto.secureZero(u8, mem.asBytes(&auth_csprng));
+    var cv12: ?Cv12Hashes = if (auth_configured and offer_12) .{} else null;
+    if (cv12) |*h| h.update(hello_msg);
     // zig-libs tlsclient: HelloRetryRequest state (RFC 8446 §4.1.4).
     var hrr_seen = false;
     var hrr_suite: tls.CipherSuite = undefined;
@@ -832,6 +890,9 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
                 const handshake_len = ctd.decode(u24);
                 var hsd = ctd.sub(handshake_len) catch continue :fragment;
                 const wrapped_handshake = ctd.buf[ctd.idx - handshake_len - 4 .. ctd.idx];
+                // zig-libs tlsclient: TLS 1.2 handshake messages are cleartext
+                // up to the server's Finished; TLS 1.3 never reads these hashes.
+                if (cv12) |*h| if (cipher_state == .cleartext) h.update(wrapped_handshake);
                 switch (handshake_type) {
                     .server_hello => {
                         if (cipher_state != .cleartext) return error.TlsUnexpectedMessage;
@@ -1207,14 +1268,24 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
                     // `client_auth`, or in TLS 1.2, this is std's
                     // TlsUnexpectedMessage.
                     .certificate_request => {
-                        const auth = if (options.client_auth) |*a| a else return error.TlsUnexpectedMessage;
-                        if (tls_version != .tls_1_3) return error.TlsUnexpectedMessage;
-                        if (cipher_state != .handshake) return error.TlsUnexpectedMessage;
-                        if (handshake_state != .certificate or cert_request != null) return error.TlsUnexpectedMessage;
+                        if (!auth_configured or cert_request != null) return error.TlsUnexpectedMessage;
+                        switch (tls_version) {
+                            .tls_1_3 => if (cipher_state != .handshake or handshake_state != .certificate) return error.TlsUnexpectedMessage,
+                            // TLS 1.2: after ServerKeyExchange, before ServerHelloDone.
+                            .tls_1_2 => if (cipher_state != .cleartext or handshake_state != .server_hello_done) return error.TlsUnexpectedMessage,
+                            else => unreachable,
+                        }
                         switch (handshake_cipher) {
                             inline else => |*p| p.transcript_hash.update(wrapped_handshake),
                         }
-                        cert_request = try parseCertRequest(&hsd, auth.key.scheme());
+                        var cas: [CertRequest.max_cas][]const u8 = undefined;
+                        var cas_len: usize = 0;
+                        var req = if (tls_version == .tls_1_3)
+                            try parseCertRequest(&hsd, &cas, &cas_len)
+                        else
+                            try parseCertRequest12(&hsd, &cas, &cas_len);
+                        req.choose(&options, tls_version, cas[0..cas_len]);
+                        cert_request = req;
                     },
                     // zig-libs tlsclient: TLS 1.2 stapled OCSP (RFC 6066 §8),
                     // only after the server promised it in ServerHello.
@@ -1304,8 +1375,19 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
                             inline else => |*p| {
                                 const P = @TypeOf(p.*).A;
                                 p.transcript_hash.update(wrapped_handshake);
+                                // zig-libs tlsclient: TLS 1.2 client authentication
+                                // (RFC 5246 §7.4.6, §7.4.8): Certificate before
+                                // ClientKeyExchange, CertificateVerify after it.
+                                var cert12_buf: [max_client_auth_len]u8 = undefined;
+                                const cert12: []const u8 = if (cert_request) |*req| try clientCertificate12(&cert12_buf, req) else "";
+                                p.transcript_hash.update(cert12);
+                                if (cv12) |*h| h.update(cert12);
                                 p.transcript_hash.update(client_key_exchange_prefix[tls.record_header_len..]);
                                 p.transcript_hash.update(public_key_bytes);
+                                if (cv12) |*h| {
+                                    h.update(client_key_exchange_prefix[tls.record_header_len..]);
+                                    h.update(public_key_bytes);
+                                }
                                 // zig-libs tlsclient: RFC 7627 §4 -- with the
                                 // extended master secret the seed is the session
                                 // hash through ClientKeyExchange.
@@ -1339,6 +1421,18 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
                                     &.{ "key expansion", &server_hello_rand, &client_hello_rand },
                                     @sizeOf(P.Tls_1_2),
                                 );
+                                var cv12_buf: [8 + max_signature_len]u8 = undefined;
+                                const cv12_msg: []const u8 = if (cert_request) |*req| cv: {
+                                    if (!req.scheme_ok) break :cv "";
+                                    var dig: [64]u8 = undefined;
+                                    const dlen = cv12.?.digest(req.scheme, &dig);
+                                    var sig_buf: [max_signature_len]u8 = undefined;
+                                    const sig = try signCertificateVerify(&sig_buf, req.auth.?.key, req.scheme, .{ .digest = dig[0..dlen] }, auth_csprng.random());
+                                    var cw: Writer = .fixed(&cv12_buf);
+                                    try writeCertificateVerify(&cw, req.scheme, sig);
+                                    break :cv cw.buffered();
+                                } else "";
+                                p.transcript_hash.update(cv12_msg);
                                 const client_verify_cleartext = .{@intFromEnum(tls.HandshakeType.finished)} ++
                                     array(u24, u8, hmacExpandLabel(
                                         P.Hmac,
@@ -1376,13 +1470,12 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
                                     nonce,
                                     pv.app_cipher.client_write_key,
                                 );
-                                var all_msgs_vec: [4][]const u8 = .{
-                                    &client_key_exchange_prefix,
-                                    public_key_bytes,
-                                    &client_change_cipher_spec_msg,
-                                    &client_verify_msg,
-                                };
-                                try output.writeVecAll(&all_msgs_vec);
+                                if (cert12.len != 0) try writePlainHandshake(output, cert12);
+                                var cke_vec = [_][]const u8{ &client_key_exchange_prefix, public_key_bytes };
+                                try output.writeVecAll(&cke_vec);
+                                if (cv12_msg.len != 0) try writePlainHandshake(output, cv12_msg);
+                                var fin_vec = [_][]const u8{ &client_change_cipher_spec_msg, &client_verify_msg };
+                                try output.writeVecAll(&fin_vec);
                                 try output.flush();
                             },
                         }
@@ -1442,7 +1535,7 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
                                     // Certificate and CertificateVerify too.
                                     var auth_buf: [max_client_auth_len]u8 = undefined;
                                     const auth_msgs: []const u8 = if (cert_request) |*req|
-                                        try clientAuthMessages(&auth_buf, req, &options.client_auth.?, &p.transcript_hash)
+                                        try clientAuthMessages(&auth_buf, req, &p.transcript_hash, auth_csprng.random())
                                     else
                                         "";
                                     const verify_data = tls.hmac(P.Hmac, &p.transcript_hash.peek(), pv.client_finished_key);
@@ -1695,17 +1788,89 @@ fn alpnSelected(offered: []const []const u8, ext: []const u8) error{TlsIllegalPa
     return error.TlsIllegalParameter;
 }
 
+/// A CertificateRequest as received (TLS 1.3 §4.3.2 or TLS 1.2 RFC 5246
+/// §7.4.4) and what this client answers with.
 const CertRequest = struct {
     context: [255]u8 = undefined,
     context_len: u8 = 0,
-    /// The request's signature_algorithms list includes our key's scheme.
+    schemes: [max_schemes]tls.SignatureScheme = undefined,
+    schemes_len: usize = 0,
+    /// TLS 1.2 certificate_types: rsa_sign(1) / ecdsa_sign(64) listed.
+    rsa_ok: bool = true,
+    ecdsa_ok: bool = true,
+    // The answer (`choose`): the credential and the scheme it signs with.
+    auth: ?ClientAuth = null,
     scheme_ok: bool = false,
+    scheme: tls.SignatureScheme = .ed25519,
+
+    const max_schemes = 64;
+    const max_cas = 64;
+
+    fn offered(req: *const CertRequest) []const tls.SignatureScheme {
+        return req.schemes[0..req.schemes_len];
+    }
+
+    /// Pick the credential (the callback's, else `client_auth`) and the
+    /// first of the server's schemes it fits; no fit: an empty Certificate.
+    fn choose(req: *CertRequest, options: *const Options, version: tls.ProtocolVersion, cas: []const []const u8) void {
+        req.auth = if (options.client_auth_select) |sel| blk: {
+            const info: CertificateRequestInfo = .{ .version = version, .signature_schemes = req.offered(), .certificate_authorities = cas };
+            break :blk sel.select(sel.context, &info);
+        } else options.client_auth;
+        const auth = req.auth orelse return;
+        if (auth.certificate_chain.len == 0) return;
+        if (version == .tls_1_2) {
+            const type_ok = switch (auth.key.*) {
+                .rsa => req.rsa_ok,
+                .ecdsa_secp256r1_sha256, .ecdsa_secp384r1_sha384 => req.ecdsa_ok,
+                .ed25519 => false,
+            };
+            if (!type_ok) return;
+        }
+        for (req.offered()) |s| if (auth.key.fits(s, version)) {
+            req.scheme = s;
+            req.scheme_ok = true;
+            return;
+        };
+    }
 };
 
-/// A TLS 1.3 CertificateRequest (RFC 8446 §4.3.2): the context, and
-/// whether `ours` is among its signature_algorithms. The extension is
-/// mandatory there; without it, or with it twice, the request is refused.
-fn parseCertRequest(hsd: *tls.Decoder, ours: tls.SignatureScheme) !CertRequest {
+fn readSchemes(req: *CertRequest, d: *tls.Decoder) !void {
+    try d.ensure(2);
+    const list_len = d.decode(u16);
+    if (list_len % 2 != 0 or list_len == 0) return error.TlsDecodeError;
+    try d.ensure(list_len);
+    var i: usize = 0;
+    while (i < list_len) : (i += 2) {
+        const sc = d.decode(tls.SignatureScheme);
+        if (req.schemes_len == CertRequest.max_schemes) return error.TlsCertificateRequestTooLarge;
+        req.schemes[req.schemes_len] = sc;
+        req.schemes_len += 1;
+    }
+}
+
+/// certificate_authorities: DistinguishedName<1..2^16-1> each, in a
+/// u16-length list (RFC 8446 §4.2.4, RFC 5246 §7.4.4).
+fn readCas(cas: *[CertRequest.max_cas][]const u8, d: *tls.Decoder) !usize {
+    try d.ensure(2);
+    const total = d.decode(u16);
+    var ld = try d.sub(total);
+    var n: usize = 0;
+    while (!ld.eof()) {
+        try ld.ensure(2);
+        const len = ld.decode(u16);
+        if (len == 0) return error.TlsDecodeError;
+        try ld.ensure(len);
+        if (n == CertRequest.max_cas) return error.TlsCertificateRequestTooLarge;
+        cas[n] = ld.slice(len);
+        n += 1;
+    }
+    return n;
+}
+
+/// A TLS 1.3 CertificateRequest (RFC 8446 §4.3.2): the context, the
+/// signature_algorithms (mandatory, once) and certificate_authorities.
+fn parseCertRequest(hsd: *tls.Decoder, cas: *[CertRequest.max_cas][]const u8, cas_len: *usize) !CertRequest {
     var req: CertRequest = .{};
     try hsd.ensure(1);
     req.context_len = hsd.decode(u8);
@@ -1714,41 +1879,60 @@ fn parseCertRequest(hsd: *tls.Decoder, ours: tls.SignatureScheme) !CertRequest {
     const ext_len = hsd.decode(u16);
     var all_extd = try hsd.sub(ext_len);
     var seen = false;
+    cas_len.* = 0;
     while (!all_extd.eof()) {
         try all_extd.ensure(4);
         const et = all_extd.decode(tls.ExtensionType);
         const size = all_extd.decode(u16);
         var extd = try all_extd.sub(size);
-        if (et != .signature_algorithms) continue;
-        if (seen) return error.TlsIllegalParameter;
-        seen = true;
-        try extd.ensure(2);
-        const list_len = extd.decode(u16);
-        if (list_len % 2 != 0) return error.TlsDecodeError;
-        try extd.ensure(list_len);
-        var i: usize = 0;
-        while (i < list_len) : (i += 2) {
-            if (extd.decode(tls.SignatureScheme) == ours) req.scheme_ok = true;
+        switch (et) {
+            .signature_algorithms => {
+                if (seen) return error.TlsIllegalParameter;
+                seen = true;
+                try readSchemes(&req, &extd);
+            },
+            .certificate_authorities => cas_len.* = try readCas(cas, &extd),
+            else => {},
         }
     }
     if (!seen) return error.TlsIllegalParameter;
     return req;
 }
 
-/// The client's Certificate (and, when the request accepts our scheme, a
-/// CertificateVerify) into `buf`, each mixed into `transcript` as written.
-/// RFC 8446 §4.4.2.3: with no acceptable certificate the client sends an
-/// empty Certificate and no CertificateVerify -- the server then decides
-/// (openssl `-verify` proceeds, `-Verify` aborts with certificate_required).
-fn clientAuthMessages(buf: *[max_client_auth_len]u8, req: *const CertRequest, auth: *const ClientAuth, transcript: anytype) ![]const u8 {
+/// A TLS 1.2 CertificateRequest (RFC 5246 §7.4.4): certificate_types,
+/// supported_signature_algorithms, certificate_authorities.
+fn parseCertRequest12(hsd: *tls.Decoder, cas: *[CertRequest.max_cas][]const u8, cas_len: *usize) !CertRequest {
+    var req: CertRequest = .{ .rsa_ok = false, .ecdsa_ok = false };
+    try hsd.ensure(1);
+    const types_len = hsd.decode(u8);
+    if (types_len == 0) return error.TlsDecodeError;
+    try hsd.ensure(types_len);
+    for (hsd.slice(types_len)) |t| switch (t) {
+        1 => req.rsa_ok = true, // rsa_sign
+        64 => req.ecdsa_ok = true, // ecdsa_sign
+        else => {},
+    };
+    try readSchemes(&req, hsd);
+    cas_len.* = try readCas(cas, hsd);
+    if (!hsd.eof()) return error.TlsDecodeError;
+    return req;
+}
+
+/// The client's Certificate (and, when a scheme fits, a CertificateVerify)
+/// into `buf`, each mixed into `transcript` as written. RFC 8446 §4.4.2.3:
+/// with no acceptable certificate the client sends an empty Certificate and
+/// no CertificateVerify -- the server then decides (openssl `-verify`
+/// proceeds, `-Verify` aborts with certificate_required).
+fn clientAuthMessages(buf: *[max_client_auth_len]u8, req: *const CertRequest, transcript: anytype, random: std.Random) ![]const u8 {
     var w: Writer = .fixed(buf);
-    const send_chain = req.scheme_ok and auth.certificate_chain.len != 0;
+    const send_chain = req.scheme_ok;
+    const chain: []const []const u8 = if (send_chain) req.auth.?.certificate_chain else &.{};
     // Certificate (§4.4.2).
     var list_len: usize = 0;
-    if (send_chain) for (auth.certificate_chain) |der| {
+    for (chain) |der| {
         if (der.len == 0) return error.ClientCertificateTooLarge;
         list_len += 3 + der.len + 2;
-    };
+    }
     const cert_body = 1 + @as(usize, req.context_len) + 3 + list_len;
     if (4 + cert_body > buf.len) return error.ClientCertificateTooLarge;
     w.writeByte(@intFromEnum(tls.HandshakeType.certificate)) catch unreachable;
@@ -1756,11 +1940,11 @@ fn clientAuthMessages(buf: *[max_client_auth_len]u8, req: *const CertRequest, au
     w.writeByte(req.context_len) catch unreachable;
     w.writeAll(req.context[0..req.context_len]) catch unreachable;
     w.writeInt(u24, @intCast(list_len), .big) catch unreachable;
-    if (send_chain) for (auth.certificate_chain) |der| {
+    for (chain) |der| {
         w.writeInt(u24, @intCast(der.len), .big) catch unreachable;
         w.writeAll(der) catch unreachable;
         w.writeInt(u16, 0, .big) catch unreachable; // no CertificateEntry extensions
-    };
+    }
     transcript.update(w.buffered());
     if (!send_chain) return w.buffered();
 
@@ -1774,49 +1958,170 @@ fn clientAuthMessages(buf: *[max_client_auth_len]u8, req: *const CertRequest, au
     @memcpy(msg[0..content.len], content);
     @memcpy(msg[content.len..][0..th.len], &th);
     const signed = msg[0 .. content.len + th.len];
-    var sig_buf: [160]u8 = undefined;
-    const sig = try signCertificateVerify(&sig_buf, auth.key, signed);
-    if (w.end + 4 + 4 + sig.len > buf.len) return error.ClientCertificateTooLarge;
-    w.writeByte(@intFromEnum(tls.HandshakeType.certificate_verify)) catch unreachable;
-    w.writeInt(u24, @intCast(4 + sig.len), .big) catch unreachable;
-    w.writeInt(u16, @intFromEnum(auth.key.scheme()), .big) catch unreachable;
-    w.writeInt(u16, @intCast(sig.len), .big) catch unreachable;
-    w.writeAll(sig) catch unreachable;
+    var sig_buf: [max_signature_len]u8 = undefined;
+    const sig = try signCertificateVerify(&sig_buf, req.auth.?.key, req.scheme, .{ .message = signed }, random);
+    try writeCertificateVerify(&w, req.scheme, sig);
     transcript.update(w.buffered()[cv_start..]);
     return w.buffered();
 }
 
-/// Sign with the client key. ECDSA is RFC 6979 deterministic (no noise),
-/// DER-encoded as TLS wants; Ed25519 is RFC 8032. The body runs one frame
-/// down and the stack it dirtied is zeroed after it: the `secureZero`s below
-/// wipe this frame's copies, but std's signers leave the key and the nonce
-/// in their own frames (2026-10-09 stack probe). `pub` for
-/// `stackprobe_test.zig`.
-pub fn signCertificateVerify(out: *[160]u8, key: *const ClientAuth.PrivateKey, msg: []const u8) error{ClientKeyInvalid}![]const u8 {
-    return burn.run(burn.sign_burn, error{ClientKeyInvalid}![]const u8, signCertificateVerifyBody, .{ out, key, msg });
+fn writeCertificateVerify(w: *Writer, scheme: tls.SignatureScheme, sig: []const u8) error{ClientCertificateTooLarge}!void {
+    if (w.buffer.len - w.end < 4 + 4 + sig.len) return error.ClientCertificateTooLarge;
+    w.writeByte(@intFromEnum(tls.HandshakeType.certificate_verify)) catch unreachable;
+    w.writeInt(u24, @intCast(4 + sig.len), .big) catch unreachable;
+    w.writeInt(u16, @intFromEnum(scheme), .big) catch unreachable;
+    w.writeInt(u16, @intCast(sig.len), .big) catch unreachable;
+    w.writeAll(sig) catch unreachable;
 }
 
-fn signCertificateVerifyBody(out: *[160]u8, key: *const ClientAuth.PrivateKey, msg: []const u8) error{ClientKeyInvalid}![]const u8 {
+/// TLS 1.2 client Certificate (RFC 5246 §7.4.6): the chain, or an empty
+/// list when nothing fits.
+fn clientCertificate12(buf: *[max_client_auth_len]u8, req: *const CertRequest) error{ClientCertificateTooLarge}![]const u8 {
+    const chain: []const []const u8 = if (req.scheme_ok) req.auth.?.certificate_chain else &.{};
+    var list_len: usize = 0;
+    for (chain) |der| {
+        if (der.len == 0) return error.ClientCertificateTooLarge;
+        list_len += 3 + der.len;
+    }
+    if (4 + 3 + list_len > buf.len) return error.ClientCertificateTooLarge;
+    var w: Writer = .fixed(buf);
+    w.writeByte(@intFromEnum(tls.HandshakeType.certificate)) catch unreachable;
+    w.writeInt(u24, @intCast(3 + list_len), .big) catch unreachable;
+    w.writeInt(u24, @intCast(list_len), .big) catch unreachable;
+    for (chain) |der| {
+        w.writeInt(u24, @intCast(der.len), .big) catch unreachable;
+        w.writeAll(der) catch unreachable;
+    }
+    return w.buffered();
+}
+
+/// Running SHA-2 hashes of the TLS 1.2 handshake messages, kept only when
+/// client authentication is configured: the TLS 1.2 CertificateVerify signs
+/// `handshake_messages` with its scheme's hash (RFC 5246 §7.4.8), which need
+/// not be the suite's.
+const Cv12Hashes = struct {
+    s256: crypto.hash.sha2.Sha256 = .init(.{}),
+    s384: crypto.hash.sha2.Sha384 = .init(.{}),
+    s512: crypto.hash.sha2.Sha512 = .init(.{}),
+
+    fn update(h: *Cv12Hashes, bytes: []const u8) void {
+        h.s256.update(bytes);
+        h.s384.update(bytes);
+        h.s512.update(bytes);
+    }
+
+    /// The digest for `scheme`'s hash into `out`; its length.
+    fn digest(h: *const Cv12Hashes, scheme: tls.SignatureScheme, out: *[64]u8) usize {
+        switch (schemeHash(scheme)) {
+            inline else => |k| {
+                var c = @field(h, switch (k) {
+                    .sha256 => "s256",
+                    .sha384 => "s384",
+                    .sha512 => "s512",
+                });
+                const d = c.finalResult();
+                @memcpy(out[0..d.len], &d);
+                return d.len;
+            },
+        }
+    }
+};
+
+fn schemeHash(s: tls.SignatureScheme) HashKind {
+    return switch (s) {
+        .ecdsa_secp384r1_sha384, .rsa_pkcs1_sha384, .rsa_pss_rsae_sha384 => .sha384,
+        .ecdsa_secp521r1_sha512, .rsa_pkcs1_sha512, .rsa_pss_rsae_sha512 => .sha512,
+        else => .sha256,
+    };
+}
+
+/// What a CertificateVerify signature covers: the TLS 1.3 content as a
+/// message, or the TLS 1.2 handshake-messages hash already taken.
+pub const SignInput = union(enum) {
+    message: []const u8,
+    digest: []const u8,
+};
+
+/// Sign with the client key in `scheme`. ECDSA is RFC 6979 deterministic (no
+/// noise), DER-encoded as TLS wants; Ed25519 is RFC 8032; RSA-PSS draws its
+/// salt (and the `rsa` module its blinding) from `random`. The body runs one
+/// frame down and the stack it dirtied is zeroed after it: the
+/// `secureZero`s below wipe this frame's copies, but std's signers leave the
+/// key and the nonce in their own frames (2026-10-09 stack probe). `pub`
+/// for `stackprobe_test.zig`.
+pub fn signCertificateVerify(out: *[max_signature_len]u8, key: *const ClientAuth.PrivateKey, scheme: tls.SignatureScheme, input: SignInput, random: std.Random) error{ClientKeyInvalid}![]const u8 {
+    return burn.run(burn.sign_burn, error{ClientKeyInvalid}![]const u8, signCertificateVerifyBody, .{ out, key, scheme, input, random });
+}
+
+fn signCertificateVerifyBody(out: *[max_signature_len]u8, key: *const ClientAuth.PrivateKey, scheme: tls.SignatureScheme, input: SignInput, random: std.Random) error{ClientKeyInvalid}![]const u8 {
     switch (key.*) {
-        inline .ecdsa_secp256r1_sha256, .ecdsa_secp384r1_sha384 => |*raw, tag| {
-            const E = if (tag == .ecdsa_secp256r1_sha256) crypto.sign.ecdsa.EcdsaP256Sha256 else p384.EcdsaP384Sha384;
-            var sk = E.SecretKey.fromBytes(raw.*) catch return error.ClientKeyInvalid;
-            defer crypto.secureZero(u8, mem.asBytes(&sk));
-            var kp = E.KeyPair.fromSecretKey(sk) catch return error.ClientKeyInvalid;
-            defer crypto.secureZero(u8, mem.asBytes(&kp));
-            const sig = kp.sign(msg, null) catch return error.ClientKeyInvalid;
-            var der: [E.Signature.der_encoded_length_max]u8 = undefined;
-            const d = sig.toDer(&der);
-            @memcpy(out[0..d.len], d);
-            return out[0..d.len];
+        inline .ecdsa_secp256r1_sha256, .ecdsa_secp384r1_sha384 => |*raw, tag| switch (schemeHash(scheme)) {
+            inline else => |hk| {
+                const H = HashOf(hk);
+                const E = if (tag == .ecdsa_secp256r1_sha256) crypto.sign.ecdsa.Ecdsa(crypto.ecc.P256, H) else p384.Ecdsa(H);
+                var sk = E.SecretKey.fromBytes(raw.*) catch return error.ClientKeyInvalid;
+                defer crypto.secureZero(u8, mem.asBytes(&sk));
+                var kp = E.KeyPair.fromSecretKey(sk) catch return error.ClientKeyInvalid;
+                defer crypto.secureZero(u8, mem.asBytes(&kp));
+                const sig = switch (input) {
+                    .message => |m| kp.sign(m, null),
+                    .digest => |d| blk: {
+                        if (d.len != H.digest_length) return error.ClientKeyInvalid;
+                        break :blk kp.signPrehashed(d[0..H.digest_length].*, null);
+                    },
+                } catch return error.ClientKeyInvalid;
+                var der: [E.Signature.der_encoded_length_max]u8 = undefined;
+                const d = sig.toDer(&der);
+                @memcpy(out[0..d.len], d);
+                return out[0..d.len];
+            },
         },
         .ed25519 => |*seed| {
+            const m = switch (input) {
+                .message => |m| m,
+                .digest => return error.ClientKeyInvalid, // PureEdDSA signs messages
+            };
             var kp = crypto.sign.Ed25519.KeyPair.generateDeterministic(seed.*) catch return error.ClientKeyInvalid;
             defer crypto.secureZero(u8, mem.asBytes(&kp));
-            const sig = (kp.sign(msg, null) catch return error.ClientKeyInvalid).toBytes();
+            const sig = (kp.sign(m, null) catch return error.ClientKeyInvalid).toBytes();
             @memcpy(out[0..64], &sig);
             return out[0..64];
         },
+        .rsa => |kp| switch (schemeHash(scheme)) {
+            inline else => |hk| {
+                const H = HashOf(hk);
+                const pss = scheme == .rsa_pss_rsae_sha256 or scheme == .rsa_pss_rsae_sha384 or scheme == .rsa_pss_rsae_sha512;
+                const r = switch (input) {
+                    .message => |m| if (pss)
+                        rsa.signPss(&kp.secret_key, H, random, m, H.digest_length, out)
+                    else
+                        rsa.signPkcs1v15(&kp.secret_key, H, m, out),
+                    .digest => |d| blk: {
+                        if (d.len != H.digest_length) return error.ClientKeyInvalid;
+                        break :blk if (pss)
+                            rsa.signPssPrehashed(&kp.secret_key, H, random, d[0..H.digest_length], H.digest_length, out)
+                        else
+                            rsa.signPkcs1v15Prehashed(&kp.secret_key, H, d[0..H.digest_length], out);
+                    },
+                };
+                return r catch error.ClientKeyInvalid;
+            },
+        },
+    }
+}
+
+/// TLS 1.2 cleartext handshake records holding `msg`, fragmented at 2^14
+/// bytes (RFC 5246 §6.2.1).
+fn writePlainHandshake(output: *Writer, msg: []const u8) Writer.Error!void {
+    var off: usize = 0;
+    while (off < msg.len) {
+        const n = @min(msg.len - off, tls.max_ciphertext_inner_record_len);
+        const header = [_]u8{@intFromEnum(tls.ContentType.handshake)} ++ int(u16, @intFromEnum(tls.ProtocolVersion.tls_1_2));
+        var len: [2]u8 = undefined;
+        mem.writeInt(u16, &len, @intCast(n), .big);
+        var vec = [_][]const u8{ &header, &len, msg[off..][0..n] };
+        try output.writeVecAll(&vec);
+        off += n;
     }
 }
 
@@ -2779,47 +3084,61 @@ test "alpnSelected: exactly one offered name, nothing else (RFC 7301 §3.1-3.2)"
     for (bad) |b| try std.testing.expectError(error.TlsIllegalParameter, alpnSelected(&offered, b));
 }
 
+/// `parseCertRequest`, then the scheme choice for `key` in TLS 1.3.
+fn pcr(d: *tls.Decoder, key: tls.SignatureScheme) !CertRequest {
+    var cas: [CertRequest.max_cas][]const u8 = undefined;
+    var n: usize = 0;
+    var req = try parseCertRequest(d, &cas, &n);
+    for (req.offered()) |s| if (s == key) {
+        req.scheme_ok = true;
+        req.scheme = s;
+    };
+    return req;
+}
+
 test "parseCertRequest: context, our scheme, mandatory signature_algorithms" {
     // context "ab"; extensions: signature_algorithms [ecdsa_secp384r1_sha384, ed25519]
     var good = "\x02ab\x00\x0a\x00\x0d\x00\x06\x00\x04\x05\x03\x08\x07".*;
     var d: tls.Decoder = .fromTheirSlice(&good);
-    const r = try parseCertRequest(&d, .ed25519);
+    const r = try pcr(&d, .ed25519);
     try std.testing.expectEqualStrings("ab", r.context[0..r.context_len]);
     try std.testing.expect(r.scheme_ok);
     var good2 = good;
     d = .fromTheirSlice(&good2);
-    try std.testing.expect(!(try parseCertRequest(&d, .ecdsa_secp256r1_sha256)).scheme_ok);
+    try std.testing.expect(!(try pcr(&d, .ecdsa_secp256r1_sha256)).scheme_ok);
     // No signature_algorithms extension at all.
-    var none = "\x00\x00\x04\x00\x2f\x00\x00".*;
+    // (oid_filters, empty: an extension this client ignores.)
+    var none = "\x00\x00\x04\x00\x30\x00\x00".*;
     d = .fromTheirSlice(&none);
-    try std.testing.expectError(error.TlsIllegalParameter, parseCertRequest(&d, .ed25519));
+    try std.testing.expectError(error.TlsIllegalParameter, pcr(&d, .ed25519));
     // The extension twice.
     var twice = "\x00\x00\x10\x00\x0d\x00\x04\x00\x02\x08\x07\x00\x0d\x00\x04\x00\x02\x08\x07".*;
     d = .fromTheirSlice(&twice);
-    try std.testing.expectError(error.TlsIllegalParameter, parseCertRequest(&d, .ed25519));
+    try std.testing.expectError(error.TlsIllegalParameter, pcr(&d, .ed25519));
     // An odd list length; a truncated context.
     var odd = "\x00\x00\x07\x00\x0d\x00\x03\x00\x01\x08".*;
     d = .fromTheirSlice(&odd);
-    try std.testing.expectError(error.TlsDecodeError, parseCertRequest(&d, .ed25519));
+    try std.testing.expectError(error.TlsDecodeError, pcr(&d, .ed25519));
     var short = "\x05ab".*;
     d = .fromTheirSlice(&short);
-    if (parseCertRequest(&d, .ed25519)) |_| return error.TestExpectedError else |_| {}
+    if (pcr(&d, .ed25519)) |_| return error.TestExpectedError else |_| {}
 }
 
 test "CertificateVerify: the RFC 8446 §4.4.3 content, verified with the public key" {
     // The signed bytes must be 64 spaces, the client context string, 0x00
     // and the transcript hash; an independent verifier over exactly that
     // content accepts the signature, one over the server string does not.
-    var req: CertRequest = .{ .scheme_ok = true };
-    req.context_len = 0;
     const seed = [_]u8{7} ** 32;
     const kp = try crypto.sign.Ed25519.KeyPair.generateDeterministic(seed);
     const key: ClientAuth.PrivateKey = .{ .ed25519 = seed };
     const auth: ClientAuth = .{ .certificate_chain = &.{"\x30\x00"}, .key = &key };
+    var req: CertRequest = .{ .scheme_ok = true, .scheme = .ed25519, .auth = auth };
+    req.context_len = 0;
     var th = crypto.hash.sha2.Sha256.init(.{});
     th.update("transcript so far");
     var buf: [max_client_auth_len]u8 = undefined;
-    const msgs = try clientAuthMessages(&buf, &req, &auth, &th);
+    var rng = std.Random.DefaultCsprng.init(@splat(1));
+    const msgs = try clientAuthMessages(&buf, &req, &th, rng.random());
     // Certificate: type 0b, length 11 = context length (1) + list length
     // (3) + one entry (3 + 2 + 2); empty context, list length 7, entry
     // length 2, the DER 30 00, no extensions.
@@ -2836,7 +3155,7 @@ test "CertificateVerify: the RFC 8446 §4.4.3 content, verified with the public 
     try std.testing.expectError(error.SignatureVerificationFailed, sig.verify(" " ** 64 ++ "TLS 1.3, server CertificateVerify\x00" ++ digest, kp.public_key));
     // Without our scheme: an empty Certificate and nothing else.
     var th2 = crypto.hash.sha2.Sha256.init(.{});
-    const empty = try clientAuthMessages(&buf, &CertRequest{ .scheme_ok = false }, &auth, &th2);
+    const empty = try clientAuthMessages(&buf, &CertRequest{ .scheme_ok = false, .auth = auth }, &th2, rng.random());
     try std.testing.expectEqualSlices(u8, "\x0b\x00\x00\x04\x00\x00\x00\x00", empty);
 }
 
@@ -2911,14 +3230,15 @@ test "server signature: a genuine P-256 / P-384 / RSA-PSS / PKCS#1 signature ver
 }
 
 test "client Certificate echoes the request context (RFC 8446 §4.4.2)" {
-    var req: CertRequest = .{ .scheme_ok = false, .context_len = 3 };
-    @memcpy(req.context[0..3], "xyz");
     const key: ClientAuth.PrivateKey = .{ .ed25519 = [_]u8{7} ** 32 };
     const auth: ClientAuth = .{ .certificate_chain = &.{"\x30\x00"}, .key = &key };
+    var req: CertRequest = .{ .scheme_ok = false, .context_len = 3, .auth = auth };
+    @memcpy(req.context[0..3], "xyz");
     var th = crypto.hash.sha2.Sha256.init(.{});
     var buf: [max_client_auth_len]u8 = undefined;
+    var rng = std.Random.DefaultCsprng.init(@splat(1));
     // Empty Certificate: type 0b, length 7 = 1 + 3 (context) + 3 (empty list).
-    try std.testing.expectEqualSlices(u8, "\x0b\x00\x00\x07\x03xyz\x00\x00\x00", try clientAuthMessages(&buf, &req, &auth, &th));
+    try std.testing.expectEqualSlices(u8, "\x0b\x00\x00\x07\x03xyz\x00\x00\x00", try clientAuthMessages(&buf, &req, &th, rng.random()));
 }
 
 test "writeHandshakeRecords: over 2^14 - 1 bytes splits into records with sequence 0, 1" {
@@ -3010,7 +3330,7 @@ test "sweep: the server-controlled ALPN and CertificateRequest parsers on damage
                 }
             } else |_| reach[1] += 1;
         } else {
-            if (parseCertRequest(&d, .ed25519)) |req| {
+            if (pcr(&d, .ed25519)) |req| {
                 try std.testing.expect(req.context_len <= 255);
                 reach[2] += 1;
             } else |_| reach[3] += 1;

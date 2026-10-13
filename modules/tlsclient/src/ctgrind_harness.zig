@@ -285,11 +285,19 @@ pub fn main(init: std.process.Init.Minimal) !void {
             for ([_]Client.ClientAuth.PrivateKey{ p256, p384, ed }) |k0| {
                 var k = k0;
                 if (taint == .yes) switch (k) {
-                    inline else => |*raw| std.valgrind.memcheck.makeMemUndefined(raw),
+                    .ecdsa_secp256r1_sha256, .ed25519 => |*raw| std.valgrind.memcheck.makeMemUndefined(raw),
+                    .ecdsa_secp384r1_sha384 => |*raw| std.valgrind.memcheck.makeMemUndefined(raw),
+                    .rsa => unreachable, // RSA's private op is claimed by the rsa module's own rows
                 };
-                var out: [160]u8 = undefined;
-                const sig = try Client.signCertificateVerify(&out, &k, msg);
+                var rng = std.Random.DefaultCsprng.init(@splat(3));
+                var out: [Client.max_signature_len]u8 = undefined;
+                const sig = try Client.signCertificateVerify(&out, &k, k.scheme(), .{ .message = msg }, rng.random());
                 std.debug.print("ctgrind_result={x}\n", .{sig});
+                // TLS 1.2: the same keys over a handshake-messages digest.
+                if (k != .ed25519) {
+                    const sig12 = try Client.signCertificateVerify(&out, &k, .ecdsa_secp384r1_sha384, .{ .digest = &derive("digest", 48) }, rng.random());
+                    std.debug.print("ctgrind_result={x}\n", .{sig12});
+                }
             }
         },
     }

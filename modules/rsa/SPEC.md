@@ -53,6 +53,8 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   `decryptOaepHBlinded`) is unchanged — additive only, per `QUESTIONS-ROUND-2.md` Q4 ("aditivní
   nová funkce v `rsa`, dnešní API se nemění").
 - **P3** `signPss`/`verifyPss` (RSASSA-PSS, RFC 8017 §8.1, branch-clean verify).
+  Since 2026-10-13 `signPkcs1v15Prehashed`/`signPssPrehashed` sign a digest the caller already holds
+  (a TLS 1.2 CertificateVerify over a running hash), byte-identical to the message entry points.
 - **The secret key crosses the API by pointer, and keys are built into the
   caller's storage (2026-10-08, BREAKING).** Every entry point that uses a
   secret key — `signPkcs1v15*`, `signPss`, `decryptOaep*`, `rsadp`,

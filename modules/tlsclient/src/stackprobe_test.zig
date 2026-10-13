@@ -329,7 +329,8 @@ fn ed25519Needles(n: *Needles, seed: [32]u8, msg: []const u8) void {
 
 /// The caller's own storage for the key, as `ClientAuth.key` points at it.
 var cur_key: PrivateKey = undefined;
-var sig_buf: [160]u8 = undefined;
+var sig_buf: [Client.max_signature_len]u8 = undefined;
+var sign_rng = std.Random.DefaultCsprng.init(@splat(5));
 var sig_sink: []const u8 = &.{};
 
 /// TLS 1.3 CertificateVerify content shape: 64 spaces, the context string, a
@@ -337,7 +338,7 @@ var sig_sink: []const u8 = &.{};
 const signed_msg = "\x20" ** 64 ++ "TLS 1.3, client CertificateVerify\x00" ++ "\x5a" ** 48;
 
 noinline fn callSign() void {
-    sig_sink = Client.signCertificateVerify(&sig_buf, &cur_key, signed_msg) catch unreachable;
+    sig_sink = Client.signCertificateVerify(&sig_buf, &cur_key, cur_key.scheme(), .{ .message = signed_msg }, sign_rng.random()) catch unreachable;
     std.mem.doNotOptimizeAway(sig_sink.ptr);
 }
 

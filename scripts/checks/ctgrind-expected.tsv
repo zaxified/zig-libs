@@ -441,8 +441,8 @@ p256	ReleaseFast	sign	1	<=12	74693e60cf1bc644	af4baed5c5134f3f
 # 2026-10-03: crt 1 -> 2, same verdict counted twice — the `try` in
 # rsadpCrtBlinded that propagates FaultDetected now has its own context (LLVM
 # stopped folding it after fromPrimesImpl changed in the same file).
-rsa	ReleaseFast	crt	1	2	5e8a6bd6f6becd90	d4057b00f9df7b56
-rsa	ReleaseFast	noncrt	1	0	5e8a6bd6f6becd90	d4057b00f9df7b56
+rsa	ReleaseFast	crt	1	2	83cf110ae4254f33	d4057b00f9df7b56
+rsa	ReleaseFast	noncrt	1	0	83cf110ae4254f33	d4057b00f9df7b56
 # rsa keygen (2026-10-03) — SecretKey.fromPrimes on the 2048-bit KAT, p and q
 # tainted. λ = montint.nt.lcm, d/dP/dQ = inverseOfModulus (even moduli), qInv by
 # Fermat on montint: 0 contexts in nt.zig and in the inversion/ladder code. Left,
@@ -454,7 +454,7 @@ rsa	ReleaseFast	noncrt	1	0	5e8a6bd6f6becd90	d4057b00f9df7b56
 # stripLeadingZeros on p, q (2, their length); fromLimbsBits/build of p_mont,
 # q_mont (length verdicts); the verdicts p == q, gcd(e, λ) = 1, d/dP/dQ ≠ 0 and
 # the qInv self-check.
-rsa	ReleaseFast	keygen	1	<=173	5e8a6bd6f6becd90	2cb28867b78d48a6
+rsa	ReleaseFast	keygen	1	<=173	83cf110ae4254f33	2cb28867b78d48a6
 slhdsa	ReleaseFast	seed	1	4	8df59dd9b6015673	e0fdde7f5c62a2d6
 slhdsa	ReleaseFast	prf	1	8	8df59dd9b6015673	e0fdde7f5c62a2d6
 falcon	ReleaseFast	sign	1	<=133	ced123e2ab52d8b3	3f5a6dbb61a76d9d
@@ -1097,8 +1097,8 @@ stun	ReleaseFast	ltkey	1	0	0db158b97faffcd3	f48e64fbf4283df1
 # (8 in-file before idhex: std.fmt.bytesToHex's table index, then 6 from
 # std.fmt.hexToBytes on the presented = secret token); newid: the session-id
 # bytes through idhex.encode (what Manager.newId runs on its draw).
-sessions	ReleaseFast	csrf	1	0	7f2d95e82878bdcf	f2cf7c06791be126
-sessions	ReleaseFast	newid	1	0	35a30a1a05a9c8b5	7a197b81f402a7ea
+sessions	ReleaseFast	csrf	1	0	334d058ea8f049bb	f2cf7c06791be126
+sessions	ReleaseFast	newid	1	0	d58029f36b123eb7	7a197b81f402a7ea
 # mqtt (2026-10-09) — CONNECT password + 5.0 authentication data tainted
 # through encodePacket (CONNECT 3.1.1/5.0, AUTH) and, as wire bytes only,
 # through decodePacket. The codec copies/slices them and nothing else.
@@ -1148,8 +1148,16 @@ noise	ReleaseFast	transport	1	6	dde901de8c90da98	b4443cf65f6c3849
 # (fromSecretKey, pcMul16, scalar range, r/s == 0 verdicts, toDer + trimStart)
 # and Ed25519 internals; the 14 std P-384 signer contexts are gone. The cv
 # result changed: p384's P-384 signature is RFC 6979 exact, not std's bytes.
-tlsclient	ReleaseFast	kex	1	18	626aa95ee0e62913	18dc5af726922286
-tlsclient	ReleaseFast	cv	1	18	20a8e0c1fbb13d94	ec6c57e652dc770e
+tlsclient	ReleaseFast	kex	1	18	95fc348e710301a0	18dc5af726922286
+# 2026-10-13 (S2 R6) — cv 18 -> 32: the harness also signs a TLS 1.2
+# handshake-messages digest (`.digest` input) with the P-256 and P-384 keys
+# under ECDSA+SHA384. The 14 new contexts are std's Ecdsa(P256, Sha384)
+# signPrehashed/fromSecretKey internals (scalar range checks, pcMul16
+# identity, r/s == 0 verdicts) plus toDer/trimStart of the public signature
+# -- the class already documented for P-256 above; P-384 via p384 adds 0.
+# Innermost frames diffed: none in Client.zig, none in p384/src. RSA keys are
+# not tainted here: their private op is the rsa module's rows.
+tlsclient	ReleaseFast	cv	1	32	1e417817428d0c7f	a92e71f50313cf2b
 # dtls (2026-10-10) — hs: in-memory PSK handshake (AES-128-GCM), the PSK
 # tainted on both sides; app: after an untainted handshake both directions'
 # record keys (key, IV, sn mask key) tainted, send/recv both ways under

@@ -204,6 +204,7 @@ const Ext = struct {
     key_share_groups: []const std.crypto.tls.NamedGroup = &Client.default_key_share_groups,
     connection_info: ?*Client.ConnectionInfo = null,
     verify_connection: ?Client.VerifyConnection = null,
+    client_auth_select: ?Client.ClientAuthSelect = null,
     extended_master_secret: bool = true,
     host: []const u8 = "good.example.test",
     /// Trust the server's self-signed certificate instead of the bundle.
@@ -260,6 +261,7 @@ fn session(io: std.Io, port: u16, bundle: *std.crypto.Certificate.Bundle, ext: E
         .key_share_groups = ext.key_share_groups,
         .connection_info = ext.connection_info,
         .verify_connection = ext.verify_connection,
+        .client_auth_select = ext.client_auth_select,
         .extended_master_secret = ext.extended_master_secret,
     });
     var out: Session = .{ .alpn = c.alpn_protocol, .version = c.tls_version, .group = c.negotiated_group, .hrr = c.hello_retry_request };
@@ -785,6 +787,124 @@ test "interop: KeyUpdate -- the server's update_requested is answered before our
         try c.end(); // close_notify: s_server ends the connection and exits (-naccept 1)
         try sw.interface.flush();
         try testing.expect(srv.reported(io, "ping-after-update"));
+    }
+}
+
+// ── S2 (2026-10-13): client authentication -- TLS 1.2, RSA keys, selection ──
+
+test "interop: TLS 1.2 client certificates -- P-256 and P-384 verified by openssl -Verify; Ed25519 sends none" {
+    const io = testing.io;
+    var tmp = try setUp(io);
+    defer tmp.cleanup();
+    var bundle = try rootBundle(io, tmp.dir);
+    defer bundle.deinit(testing.allocator);
+    const cases = .{
+        .{ derFromPem(@embedFile("testdata/client-p256.pem")), p256Key(), "Peer certificate: CN=client-p256", "ECDSA+SHA256" },
+        .{ derFromPem(@embedFile("testdata/client-p384.pem")), p384Key(), "Peer certificate: CN=client-p384", "ECDSA+SHA384" },
+        // TLS 1.2 schemes bind the hash only: a P-256 key signing ECDSA+SHA384.
+        .{ derFromPem(@embedFile("testdata/client-p256.pem")), p256Key(), "Peer certificate: CN=client-p256", "ECDSA+SHA384" },
+    };
+    inline for (cases) |c| {
+        var srv = try Server.startProto(io, tmp.dir, "-tls1_2", "leaf.pem", "leaf.key.pem", "inter.pem", &.{ "-Verify", "1", "-CAfile", "client-ca.pem", "-client_sigalgs", c[3], "-rev" });
+        defer srv.stop(io);
+        const key: Client.ClientAuth.PrivateKey = c[1];
+        const s = try session(io, srv.port, &bundle, .{ .client_auth = .{ .certificate_chain = &.{c[0]}, .key = &key } });
+        try testing.expectEqualStrings("olleh", s.echo[0..s.echo_len]);
+        try testing.expectEqual(std.crypto.tls.ProtocolVersion.tls_1_2, s.version);
+        try testing.expect(srv.reported(io, c[2]));
+    }
+    {
+        // Ed25519 cannot sign a TLS 1.2 CertificateVerify: an empty
+        // Certificate, and openssl -Verify refuses.
+        var srv = try Server.startProto(io, tmp.dir, "-tls1_2", "leaf.pem", "leaf.key.pem", "inter.pem", &.{ "-Verify", "1", "-CAfile", "client-ca.pem", "-rev" });
+        defer srv.stop(io);
+        const key = ed25519Key();
+        if (session(io, srv.port, &bundle, .{ .client_auth = .{ .certificate_chain = &.{derFromPem(@embedFile("testdata/client-ed25519.pem"))}, .key = &key } })) |_| return error.TestExpectedRefusal else |_| {}
+    }
+}
+
+/// The first PEM block's DER, decoded at run time into `out`.
+fn pemToDer(pem: []const u8, out: []u8) ![]const u8 {
+    const begin = (std.mem.indexOf(u8, pem, "-----\n") orelse return error.BadPem) + 6;
+    const end = std.mem.indexOfPos(u8, pem, begin, "\n-----END") orelse return error.BadPem;
+    var clean: [8192]u8 = undefined;
+    var n: usize = 0;
+    for (pem[begin..end]) |ch| if (ch != '\n' and ch != '\r') {
+        clean[n] = ch;
+        n += 1;
+    };
+    const len = try std.base64.standard.Decoder.calcSizeForSlice(clean[0..n]);
+    try std.base64.standard.Decoder.decode(out[0..len], clean[0..n]);
+    return out[0..len];
+}
+
+test "interop: an RSA client key -- RSA-PSS in TLS 1.3, PKCS#1 v1.5 and PSS in TLS 1.2" {
+    const io = testing.io;
+    var tmp = try setUp(io);
+    defer tmp.cleanup();
+    const gen = std.process.run(testing.allocator, io, .{
+        .argv = &.{ "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", "rsa.key", "-out", "rsa.pem", "-days", "2", "-subj", "/CN=client-rsa", "-addext", "extendedKeyUsage=clientAuth" },
+        .cwd = .{ .dir = tmp.dir },
+    }) catch return error.SkipZigTest;
+    testing.allocator.free(gen.stdout);
+    testing.allocator.free(gen.stderr);
+    var key_pem: [4096]u8 = undefined;
+    const key_text = try tmp.dir.readFile(io, "rsa.key", &key_pem);
+    var cert_pem: [4096]u8 = undefined;
+    const cert_text = try tmp.dir.readFile(io, "rsa.pem", &cert_pem);
+    var der_buf: [4096]u8 = undefined;
+    const cert_der = try pemToDer(cert_text, &der_buf);
+    var kp: Client.rsa.KeyPair = undefined;
+    try kp.secret_key.fromPem(key_text);
+    const key: Client.ClientAuth.PrivateKey = .{ .rsa = &kp };
+    var bundle = try rootBundle(io, tmp.dir);
+    defer bundle.deinit(testing.allocator);
+    inline for (.{ .{ "-tls1_3", "RSA-PSS+SHA256" }, .{ "-tls1_3", "RSA-PSS+SHA512" }, .{ "-tls1_2", "RSA+SHA256" }, .{ "-tls1_2", "RSA-PSS+SHA384" } }) |c| {
+        var srv = try Server.startProto(io, tmp.dir, c[0], "leaf.pem", "leaf.key.pem", "inter.pem", &.{ "-Verify", "1", "-CAfile", "rsa.pem", "-client_sigalgs", c[1], "-rev" });
+        defer srv.stop(io);
+        const s = try session(io, srv.port, &bundle, .{ .client_auth = .{ .certificate_chain = &.{cert_der}, .key = &key } });
+        try testing.expectEqualStrings("olleh", s.echo[0..s.echo_len]);
+        try testing.expect(srv.reported(io, "Peer certificate: CN=client-rsa"));
+    }
+}
+
+const Picker = struct {
+    calls: usize = 0,
+    schemes: usize = 0,
+    cas: usize = 0,
+    ca_matches: bool = false,
+    auth: Client.ClientAuth,
+    fn select(ctx: ?*anyopaque, info: *const Client.CertificateRequestInfo) ?Client.ClientAuth {
+        const p: *Picker = @ptrCast(@alignCast(ctx.?));
+        p.calls += 1;
+        p.schemes = info.signature_schemes.len;
+        p.cas = info.certificate_authorities.len;
+        const ca_der = derFromPem(@embedFile("testdata/client-ca.pem"));
+        for (info.certificate_authorities) |dn| {
+            if (std.mem.indexOf(u8, ca_der, dn) != null) p.ca_matches = true;
+        }
+        return if (p.ca_matches) p.auth else null;
+    }
+};
+
+test "interop: client_auth_select gets the request's schemes and CA names (TLS 1.3 and 1.2)" {
+    const io = testing.io;
+    var tmp = try setUp(io);
+    defer tmp.cleanup();
+    var bundle = try rootBundle(io, tmp.dir);
+    defer bundle.deinit(testing.allocator);
+    const key = p256Key();
+    inline for (.{ "-tls1_3", "-tls1_2" }) |proto| {
+        var srv = try Server.startProto(io, tmp.dir, proto, "leaf.pem", "leaf.key.pem", "inter.pem", &.{ "-Verify", "1", "-CAfile", "client-ca.pem", "-rev" });
+        defer srv.stop(io);
+        var picker: Picker = .{ .auth = .{ .certificate_chain = &.{derFromPem(@embedFile("testdata/client-p256.pem"))}, .key = &key } };
+        const s = try session(io, srv.port, &bundle, .{ .client_auth_select = .{ .context = &picker, .select = Picker.select } });
+        try testing.expectEqualStrings("olleh", s.echo[0..s.echo_len]);
+        try testing.expectEqual(@as(usize, 1), picker.calls);
+        try testing.expect(picker.schemes > 0);
+        try testing.expectEqual(@as(usize, 1), picker.cas);
+        try testing.expect(picker.ca_matches);
+        try testing.expect(srv.reported(io, "Peer certificate: CN=client-p256"));
     }
 }
 

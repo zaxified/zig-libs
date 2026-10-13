@@ -1073,6 +1073,13 @@ pub const EmsaEncodeError = error{EncodedMessageTooShort};
 /// EM = 0x00 || 0x01 || PS(0xff…) || 0x00 || DigestInfo(Hash, Hash(msg)),
 /// written into all of `em` (`em.len` = intended encoded message length).
 fn emsaPkcs1v15Encode(comptime Hash: type, msg: []const u8, em: []u8) EmsaEncodeError!void {
+    var digest: [Hash.digest_length]u8 = undefined;
+    Hash.hash(msg, &digest, .{});
+    return emsaPkcs1v15EncodeDigest(Hash, &digest, em);
+}
+
+/// §9.2 from step 2 on: `digest` is H = Hash(M).
+fn emsaPkcs1v15EncodeDigest(comptime Hash: type, digest: *const [Hash.digest_length]u8, em: []u8) EmsaEncodeError!void {
     const prefix = digestInfoPrefix(Hash);
     const t_len = prefix.len + Hash.digest_length;
     // §9.2 step 3: emLen >= tLen + 11 guarantees PS >= 8 octets.
@@ -1083,7 +1090,7 @@ fn emsaPkcs1v15Encode(comptime Hash: type, msg: []const u8, em: []u8) EmsaEncode
     @memset(em[2..ps_end], 0xff);
     em[ps_end] = 0x00;
     @memcpy(em[ps_end + 1 ..][0..prefix.len], prefix);
-    Hash.hash(msg, em[em.len - Hash.digest_length ..][0..Hash.digest_length], .{});
+    em[em.len - Hash.digest_length ..][0..Hash.digest_length].* = digest.*;
 }
 
 pub const SignPkcs1v15Error = EmsaEncodeError || error{ BufferTooSmall, FaultDetected };
@@ -1118,11 +1125,27 @@ pub fn signPkcs1v15Blinded(sk: *const SecretKey, comptime Hash: type, blinding: 
 }
 
 noinline fn signPkcs1v15BlindedUnburned(sk: *const SecretKey, comptime Hash: type, blinding: Blinding, msg: []const u8, out: []u8) SignPkcs1v15Error![]u8 {
+    var digest: [Hash.digest_length]u8 = undefined;
+    Hash.hash(msg, &digest, .{});
+    return signPkcs1v15DigestUnburned(sk, Hash, blinding, &digest, out);
+}
+
+/// `signPkcs1v15` over a digest the caller already has (`digest` =
+/// Hash(M)) -- for protocols that sign a running hash, such as a TLS 1.2
+/// CertificateVerify. Same signature as `signPkcs1v15(M)`; F2 blinding off,
+/// as there.
+pub fn signPkcs1v15Prehashed(sk: *const SecretKey, comptime Hash: type, digest: *const [Hash.digest_length]u8, out: []u8) SignPkcs1v15Error![]u8 {
+    const r = signPkcs1v15DigestUnburned(sk, Hash, .none, digest, out);
+    burn.stack(burn.private_op_burn);
+    return r;
+}
+
+noinline fn signPkcs1v15DigestUnburned(sk: *const SecretKey, comptime Hash: type, blinding: Blinding, digest: *const [Hash.digest_length]u8, out: []u8) SignPkcs1v15Error![]u8 {
     const k = byteLen(sk.n.bits());
     if (out.len < k) return error.BufferTooSmall;
     var em_buf: [max_modulus_len]u8 = undefined;
     const em = em_buf[0..k];
-    try emsaPkcs1v15Encode(Hash, msg, em);
+    try emsaPkcs1v15EncodeDigest(Hash, digest, em);
     // EM starts with 0x00 0x01, so its integer value is < n by construction;
     // the range check inside the primitive cannot fail. A Bellcore fault (F3)
     // is surfaced on either blinding setting, never signed over.
@@ -1565,6 +1588,13 @@ noinline fn decryptOaepHNoFailUnburned(
 /// the blinded value — it never calls `signPss` here. `blindrsa.pssEncode`
 /// is now a thin wrapper delegating straight to this function.
 pub fn emsaPssEncode(comptime Hash: type, msg: []const u8, salt: []const u8, em_bits: usize, em: []u8) EmsaEncodeError!void {
+    var m_hash: [Hash.digest_length]u8 = undefined;
+    Hash.hash(msg, &m_hash, .{});
+    return emsaPssEncodeDigest(Hash, &m_hash, salt, em_bits, em);
+}
+
+/// §9.1.1 from step 3 on: `m_hash` is mHash = Hash(M).
+fn emsaPssEncodeDigest(comptime Hash: type, m_hash: *const [Hash.digest_length]u8, salt: []const u8, em_bits: usize, em: []u8) EmsaEncodeError!void {
     const h_len = Hash.digest_length;
     const em_len = em.len;
     std.debug.assert(em_len == byteLen(em_bits));
@@ -1574,13 +1604,10 @@ pub fn emsaPssEncode(comptime Hash: type, msg: []const u8, salt: []const u8, em_
     const db = em[0 .. em_len - h_len - 1];
     const h = em[em_len - h_len - 1 ..][0..h_len];
 
-    // steps 2, 5-6: mHash = Hash(M); H = Hash(M'),
-    // M' = (0x00 × 8) || mHash || salt.
-    var m_hash: [h_len]u8 = undefined;
-    Hash.hash(msg, &m_hash, .{});
+    // steps 5-6: H = Hash(M'), M' = (0x00 × 8) || mHash || salt.
     var st = Hash.init(.{});
     st.update(&[_]u8{0} ** 8);
-    st.update(&m_hash);
+    st.update(m_hash);
     st.update(salt);
     st.final(h);
 
@@ -1620,6 +1647,21 @@ pub fn signPss(sk: *const SecretKey, comptime Hash: type, random: std.Random, ms
 }
 
 noinline fn signPssUnburned(sk: *const SecretKey, comptime Hash: type, random: std.Random, msg: []const u8, salt_len: usize, out: []u8) SignPssError![]u8 {
+    var m_hash: [Hash.digest_length]u8 = undefined;
+    Hash.hash(msg, &m_hash, .{});
+    return signPssDigestUnburned(sk, Hash, random, &m_hash, salt_len, out);
+}
+
+/// `signPss` over a digest the caller already has (`digest` = Hash(M)) --
+/// e.g. a TLS CertificateVerify over a running transcript hash. Same
+/// signature as `signPss(M)` for the same salt.
+pub fn signPssPrehashed(sk: *const SecretKey, comptime Hash: type, random: std.Random, digest: *const [Hash.digest_length]u8, salt_len: usize, out: []u8) SignPssError![]u8 {
+    const r = signPssDigestUnburned(sk, Hash, random, digest, salt_len, out);
+    burn.stack(burn.private_op_burn);
+    return r;
+}
+
+noinline fn signPssDigestUnburned(sk: *const SecretKey, comptime Hash: type, random: std.Random, digest: *const [Hash.digest_length]u8, salt_len: usize, out: []u8) SignPssError![]u8 {
     const k = byteLen(sk.n.bits());
     if (out.len < k) return error.BufferTooSmall;
     const em_bits = sk.n.bits() - 1;
@@ -1639,7 +1681,7 @@ noinline fn signPssUnburned(sk: *const SecretKey, comptime Hash: type, random: s
     var em_buf: [max_modulus_len]u8 = undefined;
     defer std.crypto.secureZero(u8, em_buf[0..k]);
     @memset(em_buf[0 .. k - em_len], 0x00);
-    try emsaPssEncode(Hash, msg, salt, em_bits, em_buf[k - em_len .. k]);
+    try emsaPssEncodeDigest(Hash, digest, salt, em_bits, em_buf[k - em_len .. k]);
 
     // §8.1.1 step 2: RSASP1. EM < 2^emBits < n by construction (step 11
     // cleared the top bits), so the primitive's range check cannot fail.
@@ -3066,6 +3108,27 @@ test "signPkcs1v15 matches OpenSSL known answers (SHA-256/384/512)" {
 
     const s512 = try signPkcs1v15(&sk, sha2.Sha512, kat2048.msg, &out);
     try testing.expectEqualSlices(u8, &kat2048.sig_sha512, s512);
+}
+
+test "signPkcs1v15Prehashed / signPssPrehashed: the OpenSSL known answers from the digest; PSS verifies" {
+    const sk = try kat2048.secretKey();
+    const sha2 = std.crypto.hash.sha2;
+    var out: [max_modulus_len]u8 = undefined;
+    inline for (.{ .{ sha2.Sha256, &kat2048.sig_sha256 }, .{ sha2.Sha384, &kat2048.sig_sha384 }, .{ sha2.Sha512, &kat2048.sig_sha512 } }) |c| {
+        var d: [c[0].digest_length]u8 = undefined;
+        c[0].hash(kat2048.msg, &d, .{});
+        try testing.expectEqualSlices(u8, c[1], try signPkcs1v15Prehashed(&sk, c[0], &d, &out));
+    }
+    // PSS: salt 0 is deterministic, so the two entry points must agree; a
+    // salted prehashed signature verifies against the message.
+    var csprng = std.Random.DefaultCsprng.init(@splat(9));
+    var d: [32]u8 = undefined;
+    sha2.Sha256.hash(kat2048.msg, &d, .{});
+    var a: [max_modulus_len]u8 = undefined;
+    const from_msg = try signPss(&sk, sha2.Sha256, csprng.random(), kat2048.msg, 0, &a);
+    try testing.expectEqualSlices(u8, from_msg, try signPssPrehashed(&sk, sha2.Sha256, csprng.random(), &d, 0, &out));
+    const salted = try signPssPrehashed(&sk, sha2.Sha256, csprng.random(), &d, 32, &out);
+    try verifyPss(try kat2048.publicKey(), sha2.Sha256, kat2048.msg, salted, 32);
 }
 
 test "verifyPkcs1v15 accepts the OpenSSL known answers" {
