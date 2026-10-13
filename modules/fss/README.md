@@ -103,17 +103,17 @@ var keys: [2]M.Key = undefined;
 try M.genWithSeeds(alphas, betas, &seeds0, &seeds1, &keys);
 
 // eval = the multi-point function itself (the k instances summed):
-const y = M.eval(0, keys[0], x) +% M.eval(1, keys[1], x); // == Σ_j β_j·1{x==α_j}
+const y = M.eval(0, &keys[0], x) +% M.eval(1, &keys[1], x); // == Σ_j β_j·1{x==α_j}
 
 // evalEach = the k components, unsummed — what a consumer wanting k SEPARATE
 // results needs (pir's k-record retrieval is exactly this):
 var each: [3]M.Elem = undefined;
-M.evalEach(0, keys[0], x, &each);
+M.evalEach(0, &keys[0], x, &each);
 
 // …and over a whole prefix, ONE interleaved walk down all k trees at once:
 // each index is visited once and yields all k components, at ~k PRG calls
 // instead of k·n. `evalFullWith`/`evalFull` are the same walk, summed.
-M.evalEachFullWith(0, keys[0], record_count, ctx, emitFn); // emit(ctx, x, &[k]Elem)
+M.evalEachFullWith(0, &keys[0], record_count, ctx, emitFn); // emit(ctx, x, &[k]Elem)
 
 // Same codec shape as Dpf: fixed length, no count field.
 var buf: [M.Key.serialized_len]u8 = undefined; // == 3 * D.Key.serialized_len
@@ -175,7 +175,7 @@ fss → std.crypto.core.aes.Aes128    (default PRG)
 ```
 zig build test-fss                          # Debug — all pass, no skips
 zig build test-fss -Doptimize=ReleaseFast   # all pass, no skips
-zig build test-fss --fuzz --release=safe    # the real fuzzer (NOT Debug — see SPEC.md)
+FSS_FUZZ=<runs>[,<first seed>] zig build test-fss   # deterministic fuzz driver (src/fuzz_test.zig)
 FSS_BENCH=1 zig build test-fss -Doptimize=ReleaseFast  # PRG A/B + evalFull vs eval-loop bench
 zig fmt --check modules/fss/
 ```

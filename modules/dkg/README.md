@@ -19,8 +19,8 @@ commit to their sharings with **Pedersen** commitments and fix the qualified set
 > `Dkg.run`, the in-process lockstep driver kept as the test oracle (both give
 > byte-identical outputs for the same randomness). `ReshareDealer`/`ReshareReceiver`
 > move a finished key to a new committee (or refresh the same one) keeping the public key.
-> Known gap: a QUAL dealer failing the Feldman check aborts the run (GJKR's public
-> reconstruction is not implemented). See `SPEC.md`.
+> A QUAL dealer failing the Feldman check does not abort the run: its polynomial is
+> rebuilt in public (GJKR's reconstruction branch). See `SPEC.md`.
 
 ## The end-to-end anchor
 
@@ -38,7 +38,9 @@ The secret-key DKG plus resharing. Output (`DkgShareOutput`) is the ECDSA key ma
 this party's Shamir share `x_j`, the group key `Q = x·G`, and its verifying share
 `X_j = x_j·G` — directly consumable by `threshold_ecdsa` signing via `assembleKeyShares`
 (which attaches each party's independently-generated Paillier keypair + ring-Pedersen aux
-params). Out of scope: CGGMP21 signing-phase **identifiable abort** and distributed
+params). `EcdsaKeygen` / `EcdsaRefresh` wrap the same machine into a full dealer-free
+`threshold_ecdsa` keygen / refresh that first exchanges the aux material with its
+correctness proofs (see `SPEC.md`). Out of scope: CGGMP21 signing-phase **identifiable abort** and distributed
 **aux-parameter** generation. See `SPEC.md`.
 
 ## One party over a real network
@@ -94,7 +96,8 @@ const rc: dkg.ReshareConfig = .{ .old = .{ .t = 2, .n = 3 }, .new = .{ .t = 3, .
 // An old party deals its share ...
 var dealer = try dkg.ReshareDealer.init(allocator, my_old_output, rc.new, random);
 try dealer.start(); // broadcast -> every new party; party(j) -> new party j
-// ... a new party collects (from = OLD id, except for complaints: from = NEW id).
+// ... a new party collects (recv.handle takes a role-tagged `dkg.ReshareSender`:
+// `.dealer = OLD id`, or `.receiver = NEW id` for complaints).
 var recv = try dkg.ReshareReceiver.init(allocator, rc, my_new_id);
 // rounds: recv.advance() [complaints out] -> dealer.advance() [defenses out] -> recv.advance()
 // recv.output() is the new DkgShareOutput; group_public_key is unchanged.
@@ -118,7 +121,7 @@ std.debug.assert(dkg.checks.allSameQ(outs));
 std.debug.assert(try dkg.checks.reconstructsToQ(allocator, outs[0..2]));
 
 // Bridge to threshold signing: attach Paillier + aux, then sign.
-const key_shares = try dkg.assembleKeyShares(allocator, outs, 2, paillier_keys, aux_params);
+const key_shares = try dkg.assembleKeyShares(allocator, outs, 2, paillier_keys, aux_params, message_seeds);
 ```
 
 ## Independent check

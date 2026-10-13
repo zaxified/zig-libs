@@ -148,7 +148,7 @@ existing per-module Miller-Rabin helpers (`rsa`/`paillier`/
 `threshold_ecdsa` each carry their own, all private/non-exported — see
 `root.zig`'s `meta.deps` note): Miller-Rabin's witnesses are drawn
 **deterministically** from a hash of the CANDIDATE, not from OS entropy
-(`std.crypto.random`, as the three sibling modules correctly use for key
+(an OS CSPRNG, as the three sibling modules correctly use for key
 generation). This matters because `hashToPrime` must be a pure function of
 its `(N, x, y, T)` binding — the prover and an independent verifier, on two
 different machines with no shared state, must derive the byte-identical

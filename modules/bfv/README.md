@@ -34,7 +34,7 @@ The whole computational backbone FHE stands on is implemented and tested:
 | RLWE ring | `ring.zig` | `RnsPoly(N,L)` — `R_q` add/negate/NTT/pointwise-multiply |
 | Plaintext | `encode.zig` | `Plaintext(N)` — `R_t` coefficient + integer encodings, `addRef`/`mulRef` references |
 | Parameters | `params.zig` | `Params` + NTT-friendly-prime validation; toy sets `test_tiny`, `bfv_toy`, `test_mul`, plus the security-grade `sec_n8192_logq218` (`N=8192`, `log2 q=218`, `t=65537`) |
-| Benchmarks | `bench.zig` | old-path-vs-new-path ns/op, opt-in: `BFV_BENCH=1 zig build test-bfv -Doptimize=ReleaseFast` |
+| Benchmarks | `bench.zig` | old-path-vs-new-path ns/op, opt-in: `BFV_BENCH=1 scripts/lib/capped zig build test-bfv -Doptimize=ReleaseFast` |
 
 ## The scheme core (Part 2) + the Fable core (Part 3)
 
@@ -99,6 +99,8 @@ corrupted-relin-key catch), a deterministic noiseless-ciphertext decrypt KAT
 with margin-boundary teeth, the enc/dec round-trip + homomorphic-add anchors
 (tiny params + N=1024), and the Part-3 mul+relin and multiply-DEPTH anchors
 over random + boundary plaintexts on `test_mul`.
+
+**Deps:** `entropy` (the `SecureSource` adapter behind `keyGen`/`encrypt`/`genRelinKey`); everything else is `std`.
 
 Provenance: clean-room from the Fan–Vercauteren paper + public NTT/RNS/BFV
 design (SEAL); no third-party source ported — see `SPEC.md`. NTT/RNS KAT vectors

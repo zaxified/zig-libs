@@ -252,7 +252,7 @@ paper/spec is not a copyrightable work; no third-party source was ported).
 - **`paillier`** is additively homomorphic only (no ciphertext multiply); BFV is
   a different scheme, not an extension of it.
 - Net: FHE is largely self-contained (RLWE over `Z_q[X]/(X^N+1)`), so this
-  module is **std-only** with its own `modarith`/`ntt`/`rns`.
+  module depends on `std` plus the sibling `entropy` (only for `SecureSource`), with its own `modarith`/`ntt`/`rns`.
 
 ## Threats / caveats (Part 1)
 
