@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-14** — Encoder: `.default` and `.best` try the last two distances before the hash bucket (a copy there costs no distance bits; from 3 bytes) — `html` −5 % at both (default 15 364 → 14 546 B, now smaller than q6), `json` −1 %; the match finder prefetches the next position's bucket; a block whose literals are ≥ 95 % ASCII clusters for the UTF8 context mode only (no stream of the interop corpus changed). Bench: the effort ↔ quality pairing is now computed each run (closest sizes), it was a fixed table. vs google/brotli 1.2.0: fast 1.24–1.40× (q4), default 1.02–1.06× (q6), best 0.75–0.91× (q9). Interop fixtures re-blessed (294 checks, 0 mismatches). No API change.
+
 - **2026-10-14** — Encoder faster (bench vs google/brotli 1.2.0 at the paired quality: fast 1.47–1.50× → 1.34–1.48×, default 1.47–1.88× → 1.07–1.17×, best 1.05–1.60× → 0.77–0.95×). The match finder is a bucketed hash (each bucket keeps its last 8/32/256 positions) instead of a hash chain, whose walk was a chain of dependent loads; its table is 2^17/2^19/2^20 slots by effort. A block with several literal codes prices its one-code alternative on exact bits instead of writing it, and length codes come from a table. Compressed sizes move by under 0.3 % (`alice29.txt` default 51 467 → 51 536 B); interop fixtures re-blessed by the reference (294 checks, 0 mismatches). No API change.
 
 - **2026-10-14** — Survey refreshed against google/brotli 1.2.0, RFC 9841 and RFC 9842: `## Compared with` updated, gaps R1–R11 filed in *Backlog* (streaming encoder, raw prefix dictionaries and `dcb`, large window, pull reader, serialized dictionaries for decoding, a q11-class `.max` effort). Docs only.

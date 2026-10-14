@@ -19,7 +19,8 @@
 //!   length: the literals covered, priced at the block's order-0 entropy,
 //!   minus the distance's cost. Up to 65 535 bytes long; the search depth is
 //!   the effort (`Effort`: 8 / 32 / 256 candidates of a bucketed hash), one
-//!   lazy step.
+//!   lazy step. At `.default`/`.best` the last two distances are tried first
+//!   (a copy at one of them needs no distance bits, from 3 bytes on).
 //! - **Distance short codes and implicit distances**: the encoder mirrors the
 //!   decoder's ring of the last four distances (`DistRing`) and names a
 //!   distance by its short code (0..15, no extra bits) when it can; a copy at
@@ -67,6 +68,9 @@ const max_store_block = 1 << 24;
 const compressed_block_size = 1 << 20;
 
 const min_match = 4;
+/// Shortest copy taken at a distance the decoder's ring already holds: it
+/// costs no distance bits, so a few covered literals pay for it.
+const min_ring_match = 3;
 /// Longest match searched for. Long runs (a file of zeros) are where a short
 /// cap hurt most: 512 left `zeros` at 651 bytes, 65 535 at 26 (the reference's
 /// q11: 14). Copy lengths themselves reach far higher (RFC 7932 copy code 23).
@@ -771,6 +775,10 @@ const Matcher = struct {
     depth_log: u5,
     hash_shift: u5,
     data: []const u8,
+    /// The decoder's last four distances as the commands so far leave them
+    /// (`buildCommands` keeps it): a copy at one of them is named by a short
+    /// code with no extra bits, so it is tried first and priced lower.
+    ring: DistRing = .{},
 
     fn init(gpa: std.mem.Allocator, data: []const u8, depth: u32, slots_log_max: u5) std.mem.Allocator.Error!Matcher {
         std.debug.assert(std.math.isPowerOfTwo(depth));
@@ -841,6 +849,16 @@ const Matcher = struct {
         return (v *% 0x1e35a7bd) >> self.hash_shift;
     }
 
+    /// Start loading the bucket `p` hashes to: positions are visited in
+    /// order, so the next lookup's bucket can be on its way while this one
+    /// is compared.
+    fn prefetch(self: *const Matcher, p: usize) void {
+        if (p + min_match > self.data.len) return;
+        const h = self.hash(p);
+        @prefetch(&self.count[h], .{});
+        @prefetch(&self.slots[h << self.depth_log], .{});
+    }
+
     fn insert(self: *Matcher, p: usize) void {
         if (p + min_match > self.data.len) return;
         const h = self.hash(p);
@@ -864,12 +882,36 @@ const Matcher = struct {
     /// The match for `p` that saves the most bits (`gain`), ending at or
     /// before `limit`, at most `max_dist` back. Null below `min_match` or
     /// when no candidate saves anything.
-    fn find(self: *const Matcher, p: usize, max_dist: usize, limit: usize) ?Match {
+    /// `ring_n`: how many of the ring's distances are tried first (`Effort`;
+    /// the other two never won on the bench payloads). Comptime, so a search
+    /// without them compiles to the loop it was before they existed.
+    fn find(self: *const Matcher, comptime ring_n: u2, p: usize, max_dist: usize, limit: usize) ?Match {
         if (p + min_match > limit) return null;
         const max_len = @min(limit - p, max_match);
         var best_len: usize = 0;
         var best_dist: usize = 0;
         var best_gain: f32 = 0;
+        if (ring_n != 0) {
+            const head3 = std.mem.readInt(u32, self.data[p..][0..4], .little) & 0xffffff;
+            for (self.ring.last[0..ring_n], 0..) |rd, i| {
+                const d: usize = rd;
+                if (d == 0 or d > max_dist) continue;
+                const c = p - d;
+                // Most fail on the first bytes: no full compare for those.
+                if (std.mem.readInt(u32, self.data[c..][0..4], .little) & 0xffffff != head3) continue;
+                const l = matchLen(self.data, c, p, max_len);
+                if (l < min_ring_match) continue;
+                // The last distance: code 0 or no distance symbol at all; the
+                // second-last: a two-bit-ish short code.
+                const g = @as(f32, @floatFromInt(l)) * self.lit_cost - @as(f32, if (i == 0) 3 else 5);
+                if (g > best_gain) {
+                    best_gain = g;
+                    best_len = l;
+                    best_dist = d;
+                }
+            }
+        }
+        if (ring_n != 0 and best_len >= max_len) return .{ .len = @intCast(best_len), .dist = @intCast(best_dist), .gain = best_gain };
         const h = self.hash(p);
         const n = self.count[h];
         // Newest first; a wrapped count still means a full bucket.
@@ -896,7 +938,7 @@ const Matcher = struct {
                 }
             }
         }
-        if (best_len < min_match) return null;
+        if (best_len == 0) return null;
         return .{ .len = @intCast(best_len), .dist = @intCast(best_dist), .gain = best_gain };
     }
 };
@@ -917,6 +959,7 @@ const Cmd = struct {
 /// before `start` (the decoder's history is the whole output) but never past
 /// `end`, so the commands consume exactly `end - start` bytes.
 fn buildCommands(
+    comptime ring_n: u2,
     gpa: std.mem.Allocator,
     matcher: *Matcher,
     start: usize,
@@ -937,7 +980,8 @@ fn buildCommands(
     matcher.lit_cost = @floatCast(@max(1.0, (nlog2n(end - start) - sum) / n));
 
     while (p < end) {
-        const m = pending orelse matcher.find(p, @min(max_dist, p), end);
+        matcher.prefetch(p + 1);
+        const m = pending orelse matcher.find(ring_n, p, @min(max_dist, p), end);
         pending = null;
         if (m == null) {
             matcher.insert(p);
@@ -946,7 +990,7 @@ fn buildCommands(
         }
         matcher.insert(p);
         if (p + 1 < end) {
-            if (matcher.find(p + 1, @min(max_dist, p + 1), end)) |b| {
+            if (matcher.find(ring_n, p + 1, @min(max_dist, p + 1), end)) |b| {
                 // One literal more is spent to take `b`, so it must save
                 // more than that literal costs on top of what `m` saves.
                 if (b.gain > m.?.gain + matcher.lit_cost) {
@@ -962,6 +1006,9 @@ fn buildCommands(
             .copy_len = len,
             .dist = m.?.dist,
         });
+        // `DistRing.update` pushes every distance but the last one (code 0).
+        if (ring_n != 0 and m.?.dist != matcher.ring.last[0]) matcher.ring.update(m.?.dist, null);
+        matcher.prefetch(p + len);
         var q = p + 1;
         while (q < p + len) : (q += 1) matcher.insert(q);
         p += len;
@@ -989,6 +1036,9 @@ const num_contexts = 1 << tables.literal_context_bits;
 /// NTREES cap for the literal map: more codes cost more headers than they save
 /// on the block sizes this encoder emits.
 const max_literal_trees = 16;
+/// Percentage of ASCII literals above which only the UTF8 context mode is
+/// tried (`chooseLiteralModel`).
+const ascii_pct = 95;
 
 /// Scratch for `clusterLiterals`, on the heap: ~100 KiB.
 const ClusterScratch = struct {
@@ -1217,7 +1267,13 @@ fn chooseLiteralModel(gpa: std.mem.Allocator, input: []const u8, start: usize, c
     const single = histogramCost(&out.counts[0]);
     var best_cost = single;
     var trial: LiteralModel = undefined;
-    for ([_]u2{ 2, 0 }) |mode| {
+    // Literals that are nearly all ASCII: UTF8 alone (it won on every such
+    // block measured — text, HTML, JSON — and clustering is a tenth of
+    // `.default`'s time per mode).
+    var ascii: u64 = 0;
+    for (out.single[0..0x80]) |c| ascii += c;
+    const modes: []const u2 = if (ascii * 100 >= n_lits * ascii_pct) &.{2} else &.{ 2, 0 };
+    for (modes) |mode| {
         const c = clusterLiterals(input, start, cmds, mode, scratch, &trial);
         if (c < best_cost) {
             best_cost = c;
@@ -1538,9 +1594,9 @@ pub const Effort = enum {
     /// log2 of all bucket slots together, the match finder's table.
     fn slotsLog(e: Effort) u5 {
         return switch (e) {
-            .fast => 17, // SL
-            .default => 19, // SL
-            .best => 20, // SL
+            .fast => 17,
+            .default => 19,
+            .best => 20,
         };
     }
 
@@ -1599,7 +1655,11 @@ pub fn compressWith(gpa: std.mem.Allocator, input: []const u8, opts: CompressOpt
         const is_last = end == input.len;
 
         cmds.clearRetainingCapacity();
-        try buildCommands(gpa, &matcher, off, end, max_dist, &cmds);
+        matcher.ring = ring;
+        switch (opts.effort) {
+            .fast => try buildCommands(0, gpa, &matcher, off, end, max_dist, &cmds),
+            .default, .best => try buildCommands(2, gpa, &matcher, off, end, max_dist, &cmds),
+        }
 
         const m = w.mark();
         const before = w.bitPos();
