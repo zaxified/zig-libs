@@ -112,6 +112,9 @@ single shared verification story. Files:
   (§4b). Independent of EBR: no slot is ever freed, so nothing needs reclaiming.
 - `deque.zig` — `Deque(T)`, the Chase-Lev work-stealing deque (§4c). Independent
   of EBR: replaced buffers are kept, not reclaimed.
+- `segqueue.zig` — `SegQueue(T, opts)`, the unbounded queue of blocks that needs
+  no participant handles (§4d). Independent of EBR: a block is recycled once a
+  scan sees all of its slots read.
 - `harness.zig` — the stress driver, the correct oracle (`RefQueue`), the broken
   control (`BrokenRing`), the deterministic multiset `verify`, and the tests.
 - `gate.zig` — the single `fable_core_implemented` switch.
@@ -358,6 +361,50 @@ it back — reads as 0.
 detect, as with `.single` in §4b. crossbeam splits the handle into `Worker` and
 `Stealer` types to enforce this; here it is documented.
 
+## 4d. The handle-free unbounded queue (`segqueue.zig`)
+
+`Queue(T)` costs a node, an EBR pin (`xchg`) and two or three CASes per item, and
+every thread must register; crossbeam's `SegQueue` needs none of that, and
+`Queue(T)` measured 2.2–4.5× it (§8). `SegQueue(T, .{ .block_slots = 63 })` is a
+design of our own (2026-10-14; crossbeam's source not read). The protocol and its
+proof are in the file comment; the decisions are these.
+
+**Positions, not pointers, are compared.** `head` and `tail` are `u64` counters;
+a block covers a lap of `block_slots + 1` positions, the last of which is a
+*closed* position with no slot ("next block being installed"). Claims are one CAS
+on a counter, so they cannot be fooled by a recycled block address, and a block
+pointer is dereferenced only after a successful claim, which proves it is the
+claimed lap's block. The last slot's producer allocates (spare, else the
+allocator) *before* its claim, so a push fails only with the queue unchanged.
+
+**Reclamation by a later scan, not a counter.** A consumer stores `read` into
+its own slot (a plain release store); the last slot's consumer retires the block
+onto a `pending` stack (CAS push, swap-all take), and every retire scans what it
+took: a block whose slots all read `read` is recycled (one spare kept, the rest
+freed), the others go back. The first version counted reads with a `fetchAdd`
+per pop on one per-block line; the four consumers contending for it doubled the
+4×4 time (measured with the counter alone, recycling disabled: 118–281 ms against
+~110 ms without it).
+
+**Emptiness without touching the producers' line.** `pop` compares its position
+with `tail`; a lower bound of `tail` remembered on the `head` line
+(`tail_seen`) answers that for every pop below it, so consumers read `tail` only
+when they catch up. 1×1 went from 1.29× to 0.68× crossbeam with it.
+
+**Waits and backoff, both measured.** Waiting on a thread that has claimed
+(installer, hand-off, item write) polls with one pause hint and yields only after
+4096 polls; `Backoff.pause`'s doubling overshot the ~300 ns hand-off by
+microseconds. A lost claim CAS spins `2^step` hints up to `2^10` (not
+`Backoff.spin`'s `2^6`): the 4×4 median went 155 → 94 ms, 8×8 230 → 131 ms,
+1×4 146 → 84 ms, the other shapes flat (i7-7920HQ, 15 runs each). The long
+spins only follow ten straight losses, i.e. only while other pops are winning.
+
+**Progress.** Lock-free except two waits on a thread that has already claimed
+and has a bounded, allocation-free rest of work: producers at the closed position
+wait for the installer, a consumer waits for its own slot's item write. A thread
+pre-empted there stalls the others behind it until it runs — the corner
+`BoundedQueue` (Vyukov) has too.
+
 ## 5. Verification strategy — the teeth
 
 Lock-free correctness is probabilistic under naive stress, so detection is
@@ -376,6 +423,9 @@ exists (the harness runs against controls, not the gated core):
 | stalled claim | a producer (consumer) claimed and not yet published (freed) — driven by hand | **deterministic** |
 | DEQUE | one owner (random push bursts + pops, every pop checked against a shadow stack: it must return the newest item the owner has not popped, or empty) vs 6 thieves (steals checked FIFO), then the multiset; 400 000 items from 64 slots, and 8 × 50 000 growing from 2 slots under theft | **probabilistic** |
 | DEQUE DRIVER TEETH | the same driver over a `pop` that skips the last-item CAS: `duplicated` in round 1, 5/5 runs | **probabilistic** (high) |
+| SEGQUEUE | driver over `SegQueue` 8×8×50 000 with 1-, 3- and 63-slot blocks (one-slot blocks put a hand-off and a retire on every item), 8×1 and 1×8 | **probabilistic** |
+| SEGQUEUE DRIVER TEETH | the same driver over a pop that skips the `written` wait (push dawdling 256 pauses between claim and write), and over a retire that poisons the block's items unscanned: both `corrupted` | **probabilistic** (high); safety-checked builds only (the poison) |
+| segqueue corners | FIFO across hand-offs and block reuse; `len` across laps and the closed position; a payload wider than a word; a push that cannot get a block fails before claiming; a steady flow stops allocating | **deterministic** |
 | deque corners | thief stalled between its reads and its CAS loses to the owner; a thief reading a retired buffer; a growth that cannot allocate; concurrent `len` while the owner pops empty | **deterministic** (the `len` one probabilistic) |
 
 **The FIFO check.** `verify` also walks each consumer's list in the order it
@@ -843,28 +893,38 @@ ours/crossbeam by wall time, 8-core x86-64, best of 3 × 5.
 | Row | Workload | Ratio |
 |---|---|---|
 | bounded_1x1 / 4x1 / 4x4 | ring of 1024, 4 Mi items (`ArrayQueue`) | 0.70 / 0.70 / 1.35 (4x4 noisy) |
-| unbounded_1x1 / 4x4 | `Queue(u64)` vs `SegQueue`, 4 Mi items | **2.2 / 4.5** |
-| deque_owner / deque_steal | 1 Mi push + pop; owner vs 3 thieves | 1.15 / 0.61 |
+| unbounded_1x1 / 4x4 | `Queue(u64)` (MS + EBR) vs `SegQueue`, 4 Mi items | 2.2 / 4.0 |
+| segqueue_1x1 / 4x4 / 8x8 | `SegQueue(u64, .{})` vs `SegQueue`, 4 Mi items | **0.52 / 0.73 / 0.78** (2026-10-14, after §4d) |
+| deque_owner / deque_steal | 1 Mi push + pop; owner vs 3 thieves | 1.07 / 0.66 (owner was 1.15 until `grow` went out of line) |
 | epoch_pin | 1 Mi pin + unpin | 1.00 |
 
-The card stays `not measured` while `Queue(T)` is over 4× (gen-catalog refuses P4 for a
-module qap reaches). Found and fixed on the way: a global spinlock per node in `NodePool`
+The card stays `not measured` while the `unbounded_*` rows (`Queue(T)`) are in the
+verdict at up to 4× (gen-catalog refuses P4 for a module qap reaches); every other row
+is at or under 1.1× (4x4 rows noisy: spreads of 15–60 % on both sides of a run). Found and fixed on the way: a global spinlock per node in `NodePool`
 (per-participant caches), a `tryAdvance` scan after every dequeue (`advance_period`), MS
 `head`/`tail` and the queue's read-only fields on one cache line, and a lost CAS in
 `BoundedQueue` retried without backoff. What is left in `Queue(T)` is its shape — per item
 a node, a pin (`xchg`, ~9 ns) on each side and two or three CASes, where `SegQueue` claims
-a slot in a block and pins nothing. Next: a segmented queue of our own design (owner,
-2026-10-14: allowed if MS + caches stays over 1.1×) — see Backlog.
+a slot in a block and pins nothing; that is what `SegQueue(T)` (§4d) does, and it is
+crossbeam's `SegQueue`'s counterpart. `Queue(T)` stays for consumers that already hold an
+EBR domain (workerpool).
 
 ## Backlog / deferred
 
 Items from §6 stay there; the survey adds what a crossbeam user hits first.
 
-- (2026-10-14) **P: segmented unbounded queue.** `Queue(T)` is 2.2–4.5× `SegQueue` after
-  the pool caches (§8); the remaining cost is per-item node + pin. A queue of fixed-size
-  blocks, a slot claimed per item and blocks reclaimed per block (through EBR — one retire
-  per block — or per-slot reader marks), designed here; crossbeam's source is not read.
-  Effort: medium-large; fits §2.
+- ~~(2026-10-14) P: segmented unbounded queue~~ — ✅ 2026-10-14, `SegQueue(T)` (§4d),
+  0.52–0.78× crossbeam's `SegQueue`.
+- (2026-10-14) `SegQueue`: a schemata mutation run over `segqueue.zig` (CONVENTIONS: every
+  new structure) and a litmus pair for the retire/scan shape (the consumer's `read` store
+  → the scanner's acquire load is message passing, already shape 2; the pending stack is
+  a Treiber push + swap-all). Effort: small-medium; fits §2.
+- (2026-10-14) `workerpool` on `SegQueue`: it shares one `MpmcQueue` + `NodePool` + `Domain`
+  and registers every worker; `SegQueue` needs none of it and measures 2–5× faster. A
+  workerpool change. Effort: small; fits §2.
+- (2026-10-14) `BoundedQueue`/`Queue(T)` lost-CAS backoff: `SegQueue` measured `2^10` against
+  `Backoff.spin`'s `2^6` as a large win under 4×4/8×8 contention (§4d); the other CAS loops
+  were not re-measured. Effort: small; fits §2.
 - (2026-10-14, survey `~/CML/20261014-lockfree-s2/`) S2 items R1–R14 with the owner's
   answers: runtime-capacity ring, `force_push`, `capacity`/push-returns-item/drain,
   handle-free unbounded queue ergonomics, FIFO deque, `stealBatch*`, `Injector`, `Steal`

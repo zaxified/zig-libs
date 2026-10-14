@@ -21,6 +21,10 @@
 //!                  CAS-free pop an MPSC user picks), crossbeam `ArrayQueue`
 //!   unbounded_1x1  ours `Queue(u64)` over EBR, crossbeam `SegQueue`
 //!   unbounded_4x4  the same, 4 producers, 4 consumers
+//!   segqueue_1x1   ours `SegQueue(u64, .{})` (blocks, no handles), crossbeam
+//!                  `SegQueue`
+//!   segqueue_4x4   the same, 4 producers, 4 consumers
+//!   segqueue_8x8   the same, 8 producers, 8 consumers
 //!   deque_owner    LIFO deque: push 1 Mi then pop all, one thread
 //!   deque_steal    push 1 Mi, then the owner pops while 3 thieves steal one at
 //!                  a time until empty
@@ -48,8 +52,9 @@ const n_pin: u64 = 1 << 20;
 const ring = 1024;
 
 const names = [_][]const u8{
-    "bounded_1x1",   "bounded_4x4", "bounded_4x1", "unbounded_1x1",
-    "unbounded_4x4", "deque_owner", "deque_steal", "epoch_pin",
+    "bounded_1x1",   "bounded_4x4",  "bounded_4x1",  "unbounded_1x1",
+    "unbounded_4x4", "segqueue_1x1", "segqueue_4x4", "segqueue_8x8",
+    "deque_owner",   "deque_steal",  "epoch_pin",
 };
 
 const Result = struct { count: u64, sum: u64 };
@@ -182,6 +187,24 @@ fn unboundedRun(gpa: std.mem.Allocator, io: std.Io, producers: u64, consumers: u
     return Mpmc(UQ, UQ.push, UQ.pop).run(io, &u, producers, consumers);
 }
 
+// ---- unbounded: SegQueue(u64), no handles ----
+
+const SQ = lockfree.SegQueue(u64, .{});
+
+fn sqPush(q: *SQ, v: u64) bool {
+    q.push(v) catch @panic("push");
+    return true;
+}
+fn sqPop(q: *SQ) ?u64 {
+    return q.pop();
+}
+
+fn segRun(gpa: std.mem.Allocator, io: std.Io, producers: u64, consumers: u64) !struct { i96, Result } {
+    var q = try SQ.init(gpa);
+    defer q.deinit();
+    return Mpmc(SQ, sqPush, sqPop).run(io, &q, producers, consumers);
+}
+
 // ---- deque ----
 
 const DQ = lockfree.Deque(u64);
@@ -268,9 +291,12 @@ fn once(gpa: std.mem.Allocator, io: std.Io, w: usize) !struct { i96, Result } {
         2 => BoundedRow(.single).run(gpa, io, 4, 1),
         3 => unboundedRun(gpa, io, 1, 1),
         4 => unboundedRun(gpa, io, 4, 4),
-        5 => dequeOwner(gpa, io),
-        6 => dequeSteal(gpa, io),
-        7 => epochPin(gpa, io),
+        5 => segRun(gpa, io, 1, 1),
+        6 => segRun(gpa, io, 4, 4),
+        7 => segRun(gpa, io, 8, 8),
+        8 => dequeOwner(gpa, io),
+        9 => dequeSteal(gpa, io),
+        10 => epochPin(gpa, io),
         else => unreachable,
     };
 }

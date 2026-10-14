@@ -2,8 +2,10 @@
 
 Lock-free concurrency primitives for shared-memory worker pools:
 **epoch-based reclamation (EBR)**, a **Michael-Scott MPMC queue** built on
-it, a **bounded, allocation-free MPMC ring** (Vyukov) for hand-offs where
-the producer must never wait, and a **Chase-Lev work-stealing deque** for
+it, an **unbounded queue of blocks that needs no handles** (`SegQueue`, any
+thread pushes and pops, no registration), a **bounded, allocation-free MPMC
+ring** (Vyukov) for hand-offs where the producer must never wait, and a
+**Chase-Lev work-stealing deque** for
 schedulers (one owner pushes and pops LIFO, any thread steals FIFO). This is the workspace's first lock-free structure; its immediate consumer
 is the in-process worker pool (P2 DL4), which needs a multi-producer /
 multi-consumer work queue whose retired nodes are freed safely — the
@@ -39,6 +41,12 @@ try q.enqueue(me, 42);          // lock-free MS-queue producer
 const v = q.dequeue(me);         // ?u64 (null when empty)
 
 // Any payload type: `lockfree.Queue(Job)`, with `Queue(Job).Pool` as its pool.
+
+// The unbounded queue without handles: any thread, no registration.
+var sq = try lockfree.SegQueue(Job, .{}).init(allocator); // thread-safe allocator
+defer sq.deinit();
+try sq.push(job);                       // fails only if a new block cannot be had
+if (sq.pop()) |j| run(j);               // null when empty
 
 // The bounded ring: no domain, no pool, no allocation after `init`.
 const Ring = lockfree.BoundedQueue(Record, 1024, .{ .consumers = .single });
@@ -79,6 +87,14 @@ switch (other.steal()) {                // any thread: oldest first
   loops) are the Fable core. Because EBR keeps a retired node physically alive
   while any thread is pinned on it, the ABA problem is dissolved — no tagged
   pointer or double-word CAS is needed.
+- `SegQueue(T, .{ .block_slots })` / `SegQueueOptions` — the **unbounded MPMC
+  queue without handles** (crossbeam's `SegQueue`): blocks of `block_slots`
+  slots (default 63), positions claimed by one CAS on a `u64` counter, a block
+  recycled once a later scan sees every slot read; one spare block kept, so a
+  steady flow allocates nothing. `push` (fails only when a new block cannot be
+  allocated, the queue unchanged), `pop`, `len`, `isEmpty`. No EBR, no pool, no
+  participants — 0.5–0.8× crossbeam's time (§8), where `Queue(T)` is 2–4×. The
+  allocator must be thread-safe (consumers free blocks). See `SPEC.md` §4d.
 - `BoundedQueue(T, capacity, .{ .consumers })` / `BoundedOptions` / `Consumers`
   — **Vyukov's bounded MPMC ring** (crossbeam's `ArrayQueue`): `capacity` slots
   inline (a power of two, ≥ 2), one CAS per operation, no allocation, no EBR.
@@ -115,7 +131,9 @@ switch (other.steal()) {                // any thread: oldest first
 
 Provenance: clean-room from published designs — Michael & Scott's non-blocking
 queue (PODC 1996) and Keir Fraser's epoch reclamation (2004) as realized in
-crossbeam-epoch. No third-party source consulted or copied; no NOTICE entry
+crossbeam-epoch; `SegQueue` is a design of this repo (2026-10-14) with
+crossbeam's `SegQueue` as the API and benchmark reference only. No third-party
+source consulted or copied; no NOTICE entry
 required (see CONVENTIONS §5). Test data: the thirteen files under `litmus/` are
 written by this repo — `.litmus` programs in herd7's input syntax, which is a
 published notation, plus a `run.sh` that drives an installed `herd7` as a
@@ -150,6 +168,11 @@ runs for real. The harness proves it bites before *and* after the core exists:
   `BoundedQueue` (8×8 and 8×1 × 50 000, the full path hit constantly), a
   drop-on-full run with an in-place consumer, a concurrent `len` check, and the
   two stalled-claim corners driven by hand.
+- **SEGQUEUE (probabilistic + deterministic):** the driver over `SegQueue`
+  (8×8 × 50 000 with 1-, 3- and 63-slot blocks; 8×1; 1×8), two positive
+  controls caught as `corrupted` (a pop that skips the `written` wait, a retire
+  that frees unscanned), and the hand-off, `len`, wide-payload, failed-allocation
+  and no-allocation-in-steady-state corners by hand.
 - **DEQUE (probabilistic + deterministic):** one owner pushing in random bursts
   and popping against 6 thieves (400 000 items from 64 slots; 8 rounds of
   50 000 growing from 2 slots while thieves steal), the owner's every pop

@@ -2,7 +2,8 @@
 
 //! lockfree — lock-free concurrency primitives for shared-memory worker
 //! pools: **epoch-based reclamation** (`ebr`), a **Michael-Scott MPMC
-//! queue** (`mpmc`, generic `Queue(T)`) built on it, a **bounded,
+//! queue** (`mpmc`, generic `Queue(T)`) built on it, an **unbounded queue of
+//! blocks without participant handles** (`segqueue`, `SegQueue(T)`), a **bounded,
 //! allocation-free MPMC ring** (`bounded`, Vyukov) that needs no reclamation,
 //! and a **Chase-Lev work-stealing deque** (`deque`). The immediate consumer is the in-process
 //! worker pool (P2 DL4); this is the workspace's first lock-free structure.
@@ -30,7 +31,7 @@ const std = @import("std");
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "Lock-free concurrency primitives for shared-memory worker pools — generic Michael & Scott MPMC queue + Fraser/crossbeam epoch-based reclamation under a strict seq_cst discipline, a bounded allocation-free Vyukov MPMC ring, and a growable Chase-Lev work-stealing deque",
+    .doc = "Lock-free concurrency primitives for shared-memory worker pools — generic Michael & Scott MPMC queue + Fraser/crossbeam epoch-based reclamation under a strict seq_cst discipline, a handle-free unbounded block queue (SegQueue), a bounded allocation-free Vyukov MPMC ring, and a growable Chase-Lev work-stealing deque",
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
@@ -79,6 +80,10 @@ pub const BoundedQueue = bounded.BoundedQueue;
 pub const BoundedOptions = bounded.Options;
 pub const Consumers = bounded.Consumers;
 
+const segqueue = @import("segqueue.zig");
+pub const SegQueue = segqueue.SegQueue;
+pub const SegQueueOptions = segqueue.Options;
+
 const deque = @import("deque.zig");
 pub const Deque = deque.Deque;
 pub const Steal = deque.Steal;
@@ -98,6 +103,7 @@ test {
     _ = ebr;
     _ = mpmc;
     _ = bounded;
+    _ = segqueue;
     _ = deque;
     _ = harness;
 }

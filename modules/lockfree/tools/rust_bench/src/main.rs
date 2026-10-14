@@ -16,6 +16,9 @@
 //	bounded_4x1     ArrayQueue(1024), 4 producers, 1 consumer, 4 Mi items
 //	unbounded_1x1   SegQueue, 1 producer, 1 consumer, 4 Mi items
 //	unbounded_4x4   SegQueue, 4 producers, 4 consumers, 4 Mi items
+//	segqueue_1x1    the same as unbounded_1x1 (ours: lockfree.SegQueue)
+//	segqueue_4x4    the same as unbounded_4x4
+//	segqueue_8x8    SegQueue, 8 producers, 8 consumers (oversubscribed on 8 hw threads)
 //	deque_owner     Worker::new_lifo: push 1 Mi then pop all, one thread
 //	deque_steal     Worker::new_lifo: push 1 Mi, then the owner pops while 3
 //	                stealers steal one at a time until all are taken
@@ -226,6 +229,10 @@ fn run(row: &str) -> Option<(u128, Res)> {
         "bounded_4x1" => bounded(4, 1),
         "unbounded_1x1" => unbounded(1, 1),
         "unbounded_4x4" => unbounded(4, 4),
+        // Ours runs `SegQueue` here, the other side the same `SegQueue`.
+        "segqueue_1x1" => unbounded(1, 1),
+        "segqueue_4x4" => unbounded(4, 4),
+        "segqueue_8x8" => unbounded(8, 8),
         "deque_owner" => deque_owner(),
         "deque_steal" => deque_steal(),
         "epoch_pin" => epoch_pin(),

@@ -175,7 +175,13 @@ pub fn Deque(comptime T: type) type {
             // slot we are about to reuse happens-before our overwrite.
             const t = d.top.load(.acquire);
             var buf = d.buffer.load(.monotonic);
-            if (b - t > @as(isize, @intCast(buf.mask))) buf = try d.grow(buf, t, b);
+            if (b - t > @as(isize, @intCast(buf.mask))) {
+                // Cold, and out of line: with growth inlined, `push` was a
+                // call with a full prologue in the owner's loop (2026-10-14,
+                // deque_owner 1.12× crossbeam).
+                @branchHint(.cold);
+                buf = try d.grow(buf, t, b);
+            }
             buf.put(b, item);
             // Release: the slot write happens-before a thief's read of it,
             // through the thief's load of `bottom`.
@@ -184,7 +190,7 @@ pub fn Deque(comptime T: type) type {
 
         /// Owner only, with `bottom - top == capacity`: a buffer twice the
         /// size holding positions `t..b`, published for thieves.
-        fn grow(d: *Self, old: *Buffer, t: isize, b: isize) error{OutOfMemory}!*Buffer {
+        noinline fn grow(d: *Self, old: *Buffer, t: isize, b: isize) error{OutOfMemory}!*Buffer {
             // Reserve the retired entry first: once the new buffer is
             // published the old one must be kept, and that must not fail.
             try d.retired.ensureUnusedCapacity(d.allocator, 1);
