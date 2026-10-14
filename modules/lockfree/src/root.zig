@@ -77,6 +77,7 @@ pub const Node = mpmc.MpmcQueue.Node;
 
 const bounded = @import("bounded.zig");
 pub const BoundedQueue = bounded.BoundedQueue;
+pub const ArrayQueue = bounded.ArrayQueue;
 pub const BoundedOptions = bounded.Options;
 pub const Consumers = bounded.Consumers;
 

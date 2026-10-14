@@ -34,7 +34,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | Go `sync/atomic`, `sync.Pool` | Go | BSD-3-Clause | — | Go stdlib | Atomics and per-P pools only; no lock-free queue or reclamation is needed under a GC. |
 | Zig `std.atomic`, `std.Io` | Zig | MIT | — | Zig 0.16.0 | Atomic primitives only; no reclamation and no lock-free container (this module's SPEC §1). |
 
-**Where we are ahead:** the only one of the Zig options with safe reclamation (EBR) under the queue *(inferred: the other README does not mention any)*, and the most rigorously checked: a poisoning node pool that detects use-after-free, a stress driver with a deliberately broken control, and weak-memory certification on aarch64/riscv64 plus herd7 litmus tests (SPEC §7). **Where we are behind:** the work-stealing deque (since 2026-10-07, §4c) takes word-sized items only and has no `steal_batch` or FIFO worker flavour (crossbeam's `deque` has both), the bounded ring's capacity is a comptime power of two (crossbeam's `ArrayQueue::new` takes any runtime capacity) and it has no `force_push`, no lock-free map, no hazard pointers, and every reclamation-relevant access — pin store, epoch loads/CAS, the `local_epoch` scan loads, the queue's `head`/`tail`/`Node.next` loads and CAS — is `seq_cst` where a tuned design would use acquire/release (correct, slower; the unpin store, registration and orphan bookkeeping already use release/acquire/monotonic, SPEC §4a) (→ Backlog).
+**Where we are ahead:** the only one of the Zig options with safe reclamation (EBR) under the queue *(inferred: the other README does not mention any)*, and the most rigorously checked: a poisoning node pool that detects use-after-free, a stress driver with a deliberately broken control, and weak-memory certification on aarch64/riscv64 plus herd7 litmus tests (SPEC §7). **Where we are behind:** the work-stealing deque (since 2026-10-07, §4c) takes word-sized items only and has no `steal_batch` or FIFO worker flavour (crossbeam's `deque` has both), no lock-free map, no hazard pointers, and every reclamation-relevant access — pin store, epoch loads/CAS, the `local_epoch` scan loads, the queue's `head`/`tail`/`Node.next` loads and CAS — is `seq_cst` where a tuned design would use acquire/release (correct, slower; the unpin store, registration and orphan bookkeeping already use release/acquire/monotonic, SPEC §4a) (→ Backlog).
 
 ## 1. Dedup / std-gap
 
@@ -289,6 +289,32 @@ slot, "free for the next lap" (`pos + capacity`) equals "holds the item"
 (`pos + 1`), and a second push would overwrite an unconsumed item. A compile
 error refuses both.
 
+**Run-time capacity (`ArrayQueue`, 2026-10-14).** Positions become stamps
+`lap · one_lap + index`, with `one_lap` the smallest power of two that is at
+least `capacity` and at least 2. The slot is `pos & (one_lap − 1)`; the step
+after a lap's last slot jumps to the next lap's index 0 (`pos − index +
+one_lap`); a consumed slot is freed for `pos + one_lap`, its own next-lap stamp.
+Every per-slot value keeps its meaning — `pos` free, `pos + 1` published,
+`pos + one_lap` consumed — and stays distinct because `one_lap ≥ 2`, which is
+why capacity 1 works here. `BoundedQueue` is the special case `one_lap ==
+capacity`, where the step is always `pos + 1`: both share one implementation
+(`Ring`), and for `BoundedQueue` the generated code is the old one. `len`
+counts slots between the stamps (`laps · capacity + index`).
+
+**`forcePush` (2026-10-14, `.multi` only).** When the slot at `tail = pos`
+still holds the previous lap's published item `old = pos − one_lap` — which is
+then the oldest item, `head == old`, since the ring holds `capacity` items —
+the producer takes `old` exactly as a consumer would (CAS `head` `old → after
+(old)`, copy the item) and, instead of freeing the slot for `pos`, claims `pos`
+itself (CAS `tail` `pos → after(pos)`), writes, and publishes. That second CAS
+cannot fail: `tail` leaves `pos` only through a thread that saw the slot free
+for `pos` — it is not freed — or that took `old` — we did, and positions never
+recur. Ordering is `pop`'s for the first half and `push`'s for the second.
+While `old` is mid-hand-off (its producer has claimed but not published, or a
+consumer has claimed but not freed), `forcePush` spins — the same stalled-thread
+corner as `push` and `pop`. On a `.single` queue it is a compile error: the
+evicting producer is a second consumer.
+
 **Not linearizable in one corner, deliberately.** A producer pre-empted between
 its claim and its publish makes `pop` report empty at that position even if
 later positions are published; a consumer pre-empted between its claim and its
@@ -536,7 +562,20 @@ iteration; 17/20 before). Not mutated: the `seq_cst`/acquire/release orderings �
 on x86-TSO no value test observes their demotion; the deque litmus pair (§7.1,
 shape 3) is their evidence.
 
-**Mutation run 2026-10-14** (schemata, ReleaseSafe, 28 mutants over
+**Mutation run 2026-10-14, `bounded.zig`** (schemata, ReleaseSafe, 16 mutants
+over `ArrayQueue`'s stamps and `forcePush`: the step past a lap's last slot
+(bound off by one, jump dropped), `one_lap` for capacity 1, `len`'s lap
+product and clamp, the capacity-0 refusal, the initial stamps, `pop`'s and
+`advance`'s free value and next position, the claim's next position, and in
+`forcePush` the published check, the `head` CAS, the `tail` CAS, the free value,
+the returned item and `old`'s distance): 15 killed (8 by the watchdog).
+Equivalent: `len`'s clamp to `capacity` — with the `tail` re-check the pair is a
+snapshot, and a producer claims a position only after its slot was freed, so
+`t − h ≤ capacity` already; kept as a defence. The "latest N" stress (6
+producers `forcePush`, 3 consumers pop, capacities 8 / 1 / 3) checks that every
+item comes out once, popped or handed back, in each producer's order.
+
+**Mutation run 2026-10-14, `segqueue.zig`** (schemata, ReleaseSafe, 28 mutants over
 `segqueue.zig`: the closed-position waits on both ends, taking the next block
 before the last claim, the install order (index before block, no `next`, index
 left closed), publishing before or without writing the item, `tail_seen` off by
@@ -955,8 +994,8 @@ Items from §6 stay there; the survey adds what a crossbeam user hits first.
 
 - ~~(survey 2026-09-30) Generic payload~~ — ✅ 2026-10-06, `Queue(T)`.
 - ~~(survey 2026-09-30) Bounded ring (`ArrayQueue` equivalent)~~ — ✅ 2026-10-06, `BoundedQueue` (§4b).
-- (2026-10-06) Runtime capacity for the bounded ring: crossbeam's `ArrayQueue::new(cap)` takes any capacity at run time; ours is a comptime power of two stored inline. A config-sized ring needs a heap-backed variant (slots slice + `init(allocator, cap)`). Effort: small; fits §2.
-- (2026-10-06) `force_push` (overwrite the oldest when full — crossbeam has it, for "latest N" buffers). With several consumers it needs the producer to claim a consumer position too. Effort: medium; fits §2.
+- ~~(2026-10-06) Runtime capacity for the bounded ring~~ — ✅ 2026-10-14, `ArrayQueue` (§4b). Was: crossbeam's `ArrayQueue::new(cap)` takes any capacity at run time; ours is a comptime power of two stored inline. A config-sized ring needs a heap-backed variant (slots slice + `init(allocator, cap)`). Effort: small; fits §2.
+- ~~(2026-10-06) `force_push`~~ — ✅ 2026-10-14, `forcePush` (§4b). Was: (overwrite the oldest when full — crossbeam has it, for "latest N" buffers). With several consumers it needs the producer to claim a consumer position too. Effort: medium; fits §2.
 - ~~(survey 2026-09-30) Work-stealing deque~~ — ✅ 2026-10-07, `Deque(T)` (§4c). ⏭ consumer: `workerpool` still shares one MPMC queue; per-worker deques + stealing is its own change there.
 - (2026-10-07) `Deque`: `stealBatch` (crossbeam's `steal_batch`/`steal_batch_and_pop`: move up to half of a victim's items in one go — fewer steals under imbalance). ⛔ NOT one CAS `top → top + k` on the LIFO deque: the §4c proof covers a claim of ONE position, where an owner reaching it must CAS too (`t == b`). With k, the owner can pop several times uncontested (each reads `top = t < b`) down into `[t, t+k)` before the thief's CAS lands — 4 items, thief takes `t, t+1`, owner pops `t+3, t+2, t+1`: `t+1` taken twice. On the LIFO flavour a batch is k single claims (one CAS each); one CAS by k is sound only for a FIFO flavour, whose owner also claims through `top`. No consumer asks for it today (workerpool's submitters are external threads, no fork-join). Effort: small (k single steals) / medium (FIFO batch); fits §2.
 - (2026-10-07) `Deque`: FIFO worker flavour (crossbeam's `Worker::new_fifo`: the owner pops from the top too). Effort: small; fits §2.

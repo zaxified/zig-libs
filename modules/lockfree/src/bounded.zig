@@ -66,26 +66,53 @@ pub const Options = struct {
 /// `capacity` slots stored inline. `capacity` must be a power of two and at
 /// least 2. Initialise in place with `init` — the slot array is part of the
 /// value, so a large queue belongs on the heap (`allocator.create`) or in a
-/// static, not on the stack.
+/// static, not on the stack. For a capacity known only at run time, or one
+/// that is not a power of two, see `ArrayQueue`.
 pub fn BoundedQueue(comptime T: type, comptime capacity_: usize, comptime opts: Options) type {
     if (capacity_ < 2 or !std.math.isPowerOfTwo(capacity_)) {
-        // Capacity 1 is not merely small, it is wrong for this protocol: a
+        // Capacity 1 is not merely small, it is wrong for this layout: a
         // slot's "free for the next lap" value `pos + capacity` would equal
         // its "holds the item" value `pos + 1`, so a second push would
-        // overwrite an unconsumed item.
+        // overwrite an unconsumed item. (`ArrayQueue` spaces laps by at
+        // least 2 and takes capacity 1.)
         @compileError("BoundedQueue capacity must be a power of two and at least 2");
     }
+    return Ring(T, capacity_, opts);
+}
+
+/// The same queue with its capacity chosen at run time — any value from 1
+/// up — and its slots on the heap: crossbeam's `ArrayQueue::new(cap)`.
+/// `init(allocator, capacity)` / `deinit(allocator)`; `capacity()` is a
+/// method here. Positions are *stamps* `lap * one_lap + index`, `one_lap`
+/// the smallest power of two at least `capacity` (and at least 2): a
+/// position's slot is a mask, and the step past a lap's last slot jumps to
+/// the next lap's index 0. Every per-slot rule is `BoundedQueue`'s, whose
+/// positions are the special case `one_lap == capacity`.
+pub fn ArrayQueue(comptime T: type, comptime opts: Options) type {
+    return Ring(T, null, opts);
+}
+
+fn Ring(comptime T: type, comptime fixed: ?usize, comptime opts: Options) type {
     return struct {
         const Self = @This();
-        pub const capacity: usize = capacity_;
-        const mask: usize = capacity - 1;
 
         const Slot = struct {
             seq: std.atomic.Value(usize),
             item: T,
         };
 
-        slots: [capacity]Slot,
+        /// `BoundedQueue`: the slot count, a comptime constant.
+        /// `ArrayQueue`: a method, `q.capacity()`.
+        pub const capacity = if (fixed) |n| n else capacityOf;
+
+        /// `BoundedQueue`: `init(q)` in place. `ArrayQueue`:
+        /// `init(allocator, capacity) !ArrayQueue`, freed by `deinit`.
+        pub const init = if (fixed == null) initHeap else initInPlace;
+
+        slots: if (fixed) |n| [n]Slot else []Slot,
+        /// `ArrayQueue` only: the distance between one slot's positions on
+        /// consecutive laps (see `ArrayQueue`). Read-only after `init`.
+        one_lap: if (fixed == null) usize else void,
         /// Next position a producer claims. On its own cache line: producers
         /// and consumers hammer different counters.
         tail: std.atomic.Value(usize) align(atomic.cache_line),
@@ -95,19 +122,83 @@ pub fn BoundedQueue(comptime T: type, comptime capacity_: usize, comptime opts: 
         refused: std.atomic.Value(u64) align(atomic.cache_line),
 
         /// Initialise in place: every slot free for lap 0, nothing refused.
-        pub fn init(q: *Self) void {
+        fn initInPlace(q: *Self) void {
             for (&q.slots, 0..) |*s, i| {
                 s.seq = .init(i);
                 s.item = undefined;
             }
+            q.one_lap = {};
             q.tail = .init(0);
             q.head = .init(0);
             q.refused = .init(0);
         }
 
+        pub const InitError = error{
+            /// `capacity` is 0, or too large to space its laps.
+            InvalidCapacity,
+        } || std.mem.Allocator.Error;
+
+        fn initHeap(allocator: std.mem.Allocator, capacity_: usize) InitError!Self {
+            if (capacity_ == 0) return error.InvalidCapacity;
+            const one_lap = std.math.ceilPowerOfTwo(usize, @max(capacity_, 2)) catch return error.InvalidCapacity;
+            const slots = try allocator.alloc(Slot, capacity_);
+            for (slots, 0..) |*s, i| {
+                s.seq = .init(i);
+                s.item = undefined;
+            }
+            return .{
+                .slots = slots,
+                .one_lap = one_lap,
+                .tail = .init(0),
+                .head = .init(0),
+                .refused = .init(0),
+            };
+        }
+
+        /// `ArrayQueue` only: free the slots. No thread may be inside an
+        /// operation; unread items are dropped (Zig has no destructors —
+        /// `pop` them first if they own memory).
+        pub fn deinit(q: *Self, allocator: std.mem.Allocator) void {
+            if (fixed != null) @compileError("BoundedQueue owns no memory: there is nothing to deinit");
+            allocator.free(q.slots);
+            q.* = undefined;
+        }
+
+        fn capacityOf(q: *const Self) usize {
+            return q.slots.len;
+        }
+
+        inline fn slotCount(q: *const Self) usize {
+            return if (fixed) |n| n else q.slots.len;
+        }
+
+        inline fn lapLen(q: *const Self) usize {
+            return if (fixed) |n| n else q.one_lap;
+        }
+
+        inline fn slotAt(q: *Self, pos: usize) *Slot {
+            return &q.slots[pos & (q.lapLen() - 1)];
+        }
+
+        /// The position after `pos`: the next index, or the next lap's index
+        /// 0 after a lap's last slot (for `BoundedQueue` both are `pos + 1`).
+        inline fn after(q: *const Self, pos: usize) usize {
+            if (fixed != null) return pos +% 1;
+            const i = pos & (q.one_lap - 1);
+            return if (i + 1 < q.slots.len) pos +% 1 else (pos - i) +% q.one_lap;
+        }
+
+        /// Positions before `pos` that hold a slot: `pos` itself for
+        /// `BoundedQueue`; whole laps of `capacity` plus the index otherwise.
+        /// The lap count wraps only after 2^64 / one_lap laps.
+        inline fn ordinal(q: *const Self, pos: usize) usize {
+            if (fixed != null) return pos;
+            return (pos >> @intCast(@ctz(q.one_lap))) *% q.slots.len +% (pos & (q.one_lap - 1));
+        }
+
         /// From any thread: append `item`. False — and counted in
         /// `refusedCount` — when the queue is full; the item is then not
-        /// stored.
+        /// stored (the caller still has it).
         pub fn push(q: *Self, item: T) bool {
             return q.pushWith(item, copyItem);
         }
@@ -126,7 +217,7 @@ pub fn BoundedQueue(comptime T: type, comptime capacity_: usize, comptime opts: 
             var pos = q.tail.load(.monotonic);
             var backoff: atomic.Backoff = .{};
             while (true) {
-                const slot = &q.slots[pos & mask];
+                const slot = q.slotAt(pos);
                 // Acquire: pairs with the consumer's release store that freed
                 // this slot, so its read of the previous item happens-before
                 // our overwrite.
@@ -138,7 +229,7 @@ pub fn BoundedQueue(comptime T: type, comptime capacity_: usize, comptime opts: 
                     // success: a `len` that reads this `tail` also sees the
                     // `head` that freed the slot (its consumer moved `head`
                     // before the slot's release store we acquired above).
-                    if (q.tail.cmpxchgWeak(pos, pos +% 1, .release, .monotonic)) |actual| {
+                    if (q.tail.cmpxchgWeak(pos, q.after(pos), .release, .monotonic)) |actual| {
                         pos = actual;
                         backoff.spin();
                         continue;
@@ -148,11 +239,67 @@ pub fn BoundedQueue(comptime T: type, comptime capacity_: usize, comptime opts: 
                     slot.seq.store(pos +% 1, .release);
                     return true;
                 } else if (diff < 0) {
-                    // The slot still holds the item of `pos - capacity`: full.
+                    // The slot still holds the item of the previous lap: full.
                     _ = q.refused.fetchAdd(1, .monotonic);
                     return false;
                 } else {
                     // Another producer claimed `pos` already; catch up.
+                    pos = q.tail.load(.monotonic);
+                }
+            }
+        }
+
+        /// From any thread, `.multi` only: append `item`, and when the queue
+        /// is full make room by taking the oldest item, which is returned
+        /// (crossbeam's `force_push`; a "latest N" buffer). Null when there
+        /// was room. Not counted in `refusedCount`.
+        ///
+        /// When full, the producer takes the oldest position `old` exactly as
+        /// a consumer would (a CAS on `head`), and then, instead of freeing
+        /// the slot for the next lap's position `pos`, claims `pos` itself
+        /// (a CAS on `tail`) and writes its item there. That CAS cannot fail:
+        /// only a thread that sees the slot free for `pos` (no one — it is
+        /// not freed) or that took `old` (we did) may move `tail` off `pos`.
+        /// Waits (spins) while the oldest position is mid-hand-off — claimed
+        /// by its producer but not published, or by a consumer but not freed
+        /// — the same stalled-thread corner as `push` and `pop`.
+        pub fn forcePush(q: *Self, item: T) ?T {
+            comptime if (opts.consumers != .multi)
+                @compileError("forcePush needs .consumers = .multi: it takes the oldest item as a second consumer would");
+            var pos = q.tail.load(.monotonic);
+            var backoff: atomic.Backoff = .{};
+            while (true) {
+                const slot = q.slotAt(pos);
+                const seq = slot.seq.load(.acquire);
+                const diff: isize = @bitCast(seq -% pos);
+                if (diff == 0) {
+                    if (q.tail.cmpxchgWeak(pos, q.after(pos), .release, .monotonic)) |actual| {
+                        pos = actual;
+                        backoff.spin();
+                        continue;
+                    }
+                    slot.item = item;
+                    slot.seq.store(pos +% 1, .release);
+                    return null;
+                } else if (diff < 0) {
+                    // Full at `pos`: the slot holds the previous lap's `old`.
+                    // Acquire above paired with its publish when `seq` says
+                    // published, so the item is ours to copy once `old` is.
+                    const old = pos -% q.lapLen();
+                    if (seq == old +% 1 and q.head.cmpxchgStrong(old, q.after(old), .release, .monotonic) == null) {
+                        const evicted = slot.item;
+                        // Release, for `len`, as in `pushWith`.
+                        const moved = q.tail.cmpxchgStrong(pos, q.after(pos), .release, .monotonic);
+                        std.debug.assert(moved == null);
+                        slot.item = item;
+                        slot.seq.store(pos +% 1, .release);
+                        return evicted;
+                    }
+                    // `old` is mid-hand-off, or a consumer took it first (the
+                    // slot is then about to be freed for `pos`): look again.
+                    backoff.spin();
+                    pos = q.tail.load(.monotonic);
+                } else {
                     pos = q.tail.load(.monotonic);
                 }
             }
@@ -170,7 +317,7 @@ pub fn BoundedQueue(comptime T: type, comptime capacity_: usize, comptime opts: 
             var pos = q.head.load(.monotonic);
             var backoff: atomic.Backoff = .{};
             while (true) {
-                const slot = &q.slots[pos & mask];
+                const slot = q.slotAt(pos);
                 // Acquire: pairs with the producer's publish, so the item
                 // write happens-before our copy.
                 const seq = slot.seq.load(.acquire);
@@ -179,14 +326,14 @@ pub fn BoundedQueue(comptime T: type, comptime capacity_: usize, comptime opts: 
                     // Release on success: pairs with `len`'s load of `head`,
                     // so a `len` that sees this `head` sees the `tail` its
                     // producer claimed before publishing (acquired above).
-                    if (q.head.cmpxchgWeak(pos, pos +% 1, .release, .monotonic)) |actual| {
+                    if (q.head.cmpxchgWeak(pos, q.after(pos), .release, .monotonic)) |actual| {
                         pos = actual;
                         backoff.spin();
                         continue;
                     }
                     const item = slot.item;
                     // Release: our copy happens-before the next lap's write.
-                    slot.seq.store(pos +% capacity, .release);
+                    slot.seq.store(pos +% q.lapLen(), .release);
                     return item;
                 } else if (diff < 0) {
                     // Not yet published for this lap: empty at `pos`.
@@ -205,7 +352,7 @@ pub fn BoundedQueue(comptime T: type, comptime capacity_: usize, comptime opts: 
             comptime requireSingle("front");
             // Only this thread writes `head`.
             const pos = q.head.load(.monotonic);
-            const slot = &q.slots[pos & mask];
+            const slot = q.slotAt(pos);
             // With one consumer `seq` is `pos` (not yet published) or
             // `pos + 1` (published); acquire pairs with the publish.
             if (slot.seq.load(.acquire) != pos +% 1) return null;
@@ -218,15 +365,15 @@ pub fn BoundedQueue(comptime T: type, comptime capacity_: usize, comptime opts: 
         pub fn advance(q: *Self) void {
             comptime requireSingle("advance");
             const pos = q.head.load(.monotonic);
-            const slot = &q.slots[pos & mask];
+            const slot = q.slotAt(pos);
             std.debug.assert(slot.seq.load(.monotonic) == pos +% 1);
             // `head` first, with release, for `len`: a reader that sees it
             // sees the `tail` that published this item, and a producer that
             // acquires the freed slot below carries it on to its own `tail`.
-            q.head.store(pos +% 1, .release);
+            q.head.store(q.after(pos), .release);
             // Release: our reads of the item happen-before the next lap's
             // producer overwrites it.
-            slot.seq.store(pos +% capacity, .release);
+            slot.seq.store(pos +% q.lapLen(), .release);
         }
 
         fn requireSingle(comptime name: []const u8) void {
@@ -253,7 +400,7 @@ pub fn BoundedQueue(comptime T: type, comptime capacity_: usize, comptime opts: 
                 // with relaxed ones an arm64 reader saw `head` past the
                 // `tail` it read and `t - h` wrapped (tag 2026-10-06 matrix;
                 // x86's ordered stores hide it).
-                if (q.tail.load(.seq_cst) == t) return @min(t -% h, capacity);
+                if (q.tail.load(.seq_cst) == t) return @min(q.ordinal(t) -% q.ordinal(h), q.slotCount());
             }
         }
 
@@ -262,7 +409,7 @@ pub fn BoundedQueue(comptime T: type, comptime capacity_: usize, comptime opts: 
         }
 
         pub fn isFull(q: *const Self) bool {
-            return q.len() == capacity;
+            return q.len() == q.slotCount();
         }
     };
 }
@@ -426,4 +573,93 @@ test "BoundedQueue: len under a concurrent push/pop never reports more than the 
     while (!done.load(.acquire)) worst = @max(worst, q.len());
     t.join();
     try testing.expect(worst <= 1);
+}
+
+fn sequentialArray(comptime consumers: Consumers, cap: usize) !void {
+    const Q = ArrayQueue(u64, .{ .consumers = consumers });
+    var q = try Q.init(testing.allocator, cap);
+    defer q.deinit(testing.allocator);
+    try testing.expectEqual(cap, q.capacity());
+    try testing.expect(q.isEmpty());
+    for (0..cap) |i| try testing.expect(q.push(i));
+    try testing.expect(q.isFull());
+    try testing.expectEqual(cap, q.len());
+    try testing.expect(!q.push(99));
+    try testing.expectEqual(@as(u64, 1), q.refusedCount());
+    for (0..cap) |i| try testing.expectEqual(@as(?u64, i), q.pop());
+    try testing.expectEqual(@as(?u64, null), q.pop());
+    // Many laps at every fill level 1..capacity: the jump from a lap's last
+    // slot to the next lap's index 0 runs on every slot, and `len` counts
+    // across it.
+    var next_in: u64 = 100;
+    var next_out: u64 = 100;
+    for (0..8 * cap + 7) |round| {
+        const fill = round % cap + 1;
+        for (0..fill) |_| {
+            try testing.expect(q.push(next_in));
+            next_in += 1;
+        }
+        try testing.expectEqual(fill, q.len());
+        for (0..fill) |_| {
+            try testing.expectEqual(@as(?u64, next_out), q.pop());
+            next_out += 1;
+        }
+        try testing.expectEqual(@as(?u64, null), q.pop());
+        try testing.expectEqual(@as(usize, 0), q.len());
+    }
+    try testing.expectEqual(@as(u64, 1), q.refusedCount());
+}
+
+test "ArrayQueue: any run-time capacity from 1 — FIFO, full refuses and counts, laps over every slot" {
+    for ([_]usize{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 100 }) |cap| {
+        try sequentialArray(.multi, cap);
+        try sequentialArray(.single, cap);
+    }
+}
+
+test "ArrayQueue: capacity 0, or too large to space its laps, is refused" {
+    const Q = ArrayQueue(u8, .{});
+    try testing.expectError(error.InvalidCapacity, Q.init(testing.allocator, 0));
+    try testing.expectError(error.InvalidCapacity, Q.init(testing.allocator, std.math.maxInt(usize)));
+}
+
+test "ArrayQueue: front/advance read in place (single)" {
+    var q = try ArrayQueue(Big, .{ .consumers = .single }).init(testing.allocator, 3);
+    defer q.deinit(testing.allocator);
+    for (0..3) |i| try testing.expect(q.pushWith(@as(u64, i), fillBig));
+    try testing.expect(!q.pushWith(@as(u64, 9), fillBig));
+    for (0..3) |i| {
+        try testing.expectEqual(@as(u64, i), q.front().?.id);
+        q.advance();
+    }
+    try testing.expectEqual(@as(?*Big, null), q.front());
+}
+
+fn latestN(q: anytype, cap: usize) !void {
+    // Below capacity forcePush is a push.
+    for (0..cap) |i| try testing.expectEqual(@as(?u64, null), q.forcePush(i));
+    try testing.expect(q.isFull());
+    // Full: each forcePush hands back the oldest item and keeps the newest.
+    for (cap..cap + 3 * cap + 1) |i| {
+        try testing.expectEqual(@as(?u64, i - cap), q.forcePush(i));
+        try testing.expectEqual(cap, q.len());
+    }
+    const last = cap + 3 * cap + 1;
+    for (last - cap..last) |i| try testing.expectEqual(@as(?u64, i), q.pop());
+    try testing.expectEqual(@as(?u64, null), q.pop());
+    try testing.expectEqual(@as(u64, 0), q.refusedCount());
+    // A plain push still refuses on full after evictions.
+    for (0..cap) |i| try testing.expect(q.push(i));
+    try testing.expect(!q.push(7));
+}
+
+test "forcePush keeps the latest N, handing back the oldest, for BoundedQueue and ArrayQueue" {
+    var b: BoundedQueue(u64, 4, .{}) = undefined;
+    b.init();
+    try latestN(&b, 4);
+    for ([_]usize{ 1, 2, 3, 5 }) |cap| {
+        var a = try ArrayQueue(u64, .{}).init(testing.allocator, cap);
+        defer a.deinit(testing.allocator);
+        try latestN(&a, cap);
+    }
 }

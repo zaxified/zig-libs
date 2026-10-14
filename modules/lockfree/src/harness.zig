@@ -636,6 +636,81 @@ test "BOUNDED drop-on-full: every accepted item arrives exactly once, in order; 
     try testing.expectEqual(@as(u64, producers * per), got + q.refusedCount());
 }
 
+fn arrayStress(comptime consumers: bounded.Consumers, capacity: usize, cfg: StressConfig) !void {
+    const alloc = testing.allocator;
+    const Q = bounded.ArrayQueue(u64, .{ .consumers = consumers });
+    var q = try Q.init(alloc, capacity);
+    defer q.deinit(alloc);
+    var adapter: BoundedAdapter(Q) = .{ .q = &q };
+    try testing.expectEqual(Verdict.clean, try runStress(BoundedAdapter(Q), &adapter, cfg, alloc));
+    try testing.expect(q.isEmpty());
+}
+
+test "ARRAYQUEUE: N×M and N×1 stress at run-time capacities 1, 3 and 48 (laps that jump)" {
+    try arrayStress(.multi, 1, .{ .producers = 4, .consumers = 4, .per_producer = 20_000 });
+    try arrayStress(.multi, 3, .{ .producers = 8, .consumers = 8, .per_producer = 50_000 });
+    try arrayStress(.multi, 48, .{ .producers = 8, .consumers = 8, .per_producer = 50_000 });
+    try arrayStress(.single, 3, .{ .producers = 8, .consumers = 1, .per_producer = 50_000 });
+}
+
+/// Producers `forcePush` into a small ring while consumers pop: every item
+/// must come out exactly once — popped by a consumer or handed back to the
+/// producer that evicted it — and each list (a consumer's pops, a producer's
+/// evictions) must hold each producer's items in order, since both take
+/// positions in increasing order.
+fn forcePushStress(q: anytype, cfg: StressConfig) !Verdict {
+    const alloc = testing.allocator;
+    const total = cfg.producers * cfg.per_producer;
+    const lists = try alloc.alloc(std.ArrayListUnmanaged(u64), cfg.consumers + cfg.producers);
+    defer alloc.free(lists);
+    for (lists) |*l| l.* = .empty;
+    defer for (lists) |*l| l.deinit(alloc);
+    for (lists) |*l| try l.ensureTotalCapacity(alloc, total);
+    const Q = @TypeOf(q.*);
+    const Shared = struct { done: std.atomic.Value(usize) = .init(0) };
+    const Worker = struct {
+        fn produce(ring: *Q, pid: usize, per: usize, evicted: *std.ArrayListUnmanaged(u64), sh: *Shared) void {
+            for (0..per) |i| {
+                if (ring.forcePush(encode(pid, i))) |old| evicted.appendAssumeCapacity(old);
+            }
+            _ = sh.done.fetchAdd(1, .release);
+        }
+        fn consume(ring: *Q, producers: usize, got: *std.ArrayListUnmanaged(u64), sh: *Shared) void {
+            var empty_run: u32 = 0;
+            while (empty_run < 2048) {
+                if (ring.pop()) |v| {
+                    got.appendAssumeCapacity(v);
+                    empty_run = 0;
+                } else if (sh.done.load(.acquire) == producers) {
+                    empty_run += 1;
+                } else std.atomic.spinLoopHint();
+            }
+        }
+    };
+    var sh: Shared = .{};
+    const threads = try alloc.alloc(std.Thread, cfg.producers + cfg.consumers);
+    defer alloc.free(threads);
+    for (0..cfg.producers) |p| threads[p] = try std.Thread.spawn(.{}, Worker.produce, .{ q, p, cfg.per_producer, &lists[cfg.consumers + p], &sh });
+    for (0..cfg.consumers) |c| threads[cfg.producers + c] = try std.Thread.spawn(.{}, Worker.consume, .{ q, cfg.producers, &lists[c], &sh });
+    for (threads) |t| t.join();
+    return verify(cfg, lists, alloc);
+}
+
+test "FORCE PUSH: producers evict while consumers pop — every item out exactly once, in each producer's order" {
+    const cfg: StressConfig = .{ .producers = 6, .consumers = 3, .per_producer = 50_000 };
+    const B = bounded.BoundedQueue(u64, 8, .{});
+    const b = try testing.allocator.create(B);
+    defer testing.allocator.destroy(b);
+    b.init();
+    try testing.expectEqual(Verdict.clean, try forcePushStress(b, cfg));
+    inline for (.{ 1, 3 }) |cap| {
+        var a = try bounded.ArrayQueue(u64, .{}).init(testing.allocator, cap);
+        defer a.deinit(testing.allocator);
+        try testing.expectEqual(Verdict.clean, try forcePushStress(&a, cfg));
+        try testing.expect(a.isEmpty());
+    }
+}
+
 // ── the work-stealing deque: one owner, many thieves ─────────────────────────
 
 /// What the deque driver needs from a deque: `push`/`pop` (owner) and `steal`

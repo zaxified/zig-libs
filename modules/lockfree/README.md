@@ -100,9 +100,16 @@ switch (other.steal()) {                // any thread: oldest first
   inline (a power of two, ≥ 2), one CAS per operation, no allocation, no EBR.
   `push`/`pushWith` (fill in place) return false and count the refusal when
   full; `pop`; with `.consumers = .single` a CAS-free `pop` and in-place
-  `front`/`advance`; `len`/`isEmpty`/`isFull` snapshots. A producer stalled
-  between claiming and publishing a slot makes the queue read empty at that
-  slot until it finishes (nothing lost or reordered) — see `SPEC.md` §4b.
+  `front`/`advance`; `len`/`isEmpty`/`isFull` snapshots; on `.multi`,
+  `forcePush` (crossbeam's `force_push`: when full, evict and return the oldest
+  item — a "latest N" buffer). A producer stalled between claiming and
+  publishing a slot makes the queue read empty at that slot until it finishes
+  (nothing lost or reordered) — see `SPEC.md` §4b.
+- `ArrayQueue(T, .{ .consumers })` — the same ring with **any run-time capacity
+  ≥ 1** and its slots on the heap (crossbeam's `ArrayQueue::new(cap)`):
+  `init(allocator, capacity)` (`error.InvalidCapacity` for 0) / `deinit`,
+  `capacity()`, and every operation of `BoundedQueue`. Same protocol over
+  "stamped" positions (`lap · one_lap + index`); see `SPEC.md` §4b.
 - `Deque(T)` / `Steal(T)` — the **Chase-Lev work-stealing deque** (crossbeam's
   `deque`, LIFO worker + stealer): `push`/`pop` from the one owner thread,
   `steal` (`.success` / `.retry` / `.empty`), `len`/`isEmpty` from any thread.
