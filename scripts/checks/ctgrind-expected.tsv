@@ -433,8 +433,9 @@ montint	ReleaseFast	ffcontrol	1	>=1	NO-OWN-SRC	e5fa1af501069bfb
 # the divsteps and the Hensel step add no context, their verdicts are witness.
 montint	ReleaseFast	dyn	1	2	5a812612855b234e	880a04f6d911e62c
 # 2026-10-13: p256 `rejectIdentity` launders its verdict (one `je`, was two) -> every row whose count included the p256 comb/windowed identity check drops by 1 (--stacks diff vs the base: the second jump of `rejectIdentity` gone, no other context moved).
-p256	ReleaseFast	comb	1	1	caad16ebbc3e0ff0	5b1d2ba63761dee8
-p256	ReleaseFast	sign	1	<=12	f058d5e90be97add	af4baed5c5134f3f
+# 2026-10-14: p256 point formulas as generated asm (point_asm.zig; pattern gains it). Counts unchanged (comb 1 = rejectIdentity group.zig:690 per --stacks, sign <=12); comb output re-pinned because the harness prints raw projective coordinates and the CT mixed addition is now madd-2004-hmv (another representative of the same point; sign pk+sig digest unchanged). ctap2 digests re-pinned too: stale since 9fc3c70d (root.zig fuzz test only), counts 0/0.
+p256	ReleaseFast	comb	1	1	a586a888406f5725	e3c458c38b8cf4a8
+p256	ReleaseFast	sign	1	<=12	59ec791d711e5e93	af4baed5c5134f3f
 # rsa 2026-10-02 — the private path moved onto montint.DynModint (reduce of c
 # mod p/q, Garner, unblinding, F3). crt 213 -> 1: the 212 were std.crypto.ff's
 # reduce (shiftIn, compare-and-subtract) and montgomeryMul over the secret
@@ -1270,8 +1271,8 @@ tenantkex	ReleaseFast	ik	1	9	23b4dcc4cfb1cd72	85fb9350a2be9ee1
 # bytes (unicode.zig:209, ASCII fast path then a decode per sequence): pin
 # 1 -> 0 with the mask-only utf8CountCt (one verdict; the harness marks that
 # returned verdict defined before its own `try`).
-ctap2	ReleaseFast	pin	1	0	7348531adad169be	01e08eb2902d2802
-ctap2	ReleaseFast	token	1	0	7348531adad169be	e927dca40cedb432
+ctap2	ReleaseFast	pin	1	0	2023f16e0a17362b	01e08eb2902d2802
+ctap2	ReleaseFast	token	1	0	2023f16e0a17362b	e927dca40cedb432
 # base32 (2026-10-10) — encode: a tainted 20-byte secret (+ 1..4-byte tails)
 # through encode, std/hex alphabets, padded/unpadded, upper/lower case: 0.
 # decode: the tainted encoded text through decode (padding required/optional,

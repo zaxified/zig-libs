@@ -34,6 +34,12 @@ const gate = @import("gate.zig");
 const field = @import("field.zig");
 const scalarmod = @import("scalar.zig");
 const burn = @import("burn.zig");
+const point_asm = @import("point_asm.zig");
+
+/// The point formulas run as one generated asm block each (`point_asm.zig`)
+/// wherever the Montgomery field core runs as asm; the Zig formulas below
+/// (`dblFormula`, `addMixedCtFormula`) are their oracle.
+const point_asm_active = field.field_asm_active;
 
 const IdentityElementError = std.crypto.errors.IdentityElementError;
 const EncodingError = std.crypto.errors.EncodingError;
@@ -459,7 +465,7 @@ pub const P256 = struct {
     ///
     /// Since 2026-10-13 the accumulator stays Jacobian throughout and the
     /// windows above the last add with the INCOMPLETE mixed addition
-    /// (`Jac.addMixedCt`, 7M + 4S, against 6 conversion multiplies + the
+    /// (`Jac.addMixedCt`, 8M + 3S, against 6 conversion multiplies + the
     /// complete RCB addition before). Its exceptional cases cannot occur
     /// there, and the two that can are masked selects, not branches:
     ///   * `P = ±Q`: before window i ≥ 1 the accumulator is `32·A·p` with
@@ -531,7 +537,7 @@ pub const P256 = struct {
         i = vb_t;
         while (i > 1) {
             i -= 1;
-            acc = acc.dbl().dbl().dbl().dbl().dbl();
+            acc = acc.dblTimes(vb_w);
             const g = gatherSigned(&aff, mags[i], negs[i]);
             const sum = acc.addMixedCt(g);
             const nonzero = blackBox(0 -% @as(u64, @intFromBool(mags[i] != 0)));
@@ -542,7 +548,7 @@ pub const P256 = struct {
         }
 
         // Last window: the complete projective addition (see the doc).
-        acc = acc.dbl().dbl().dbl().dbl().dbl();
+        acc = acc.dblTimes(vb_w);
         var res = jacToProjectiveCt(acc);
         const g0 = gatherSigned(&aff, mags[0], negs[0]);
         var q = P256{ .x = g0.x, .y = g0.y, .z = field.Fe.one };
@@ -600,7 +606,7 @@ pub const P256 = struct {
         const k = scalarValue(s_, endian);
 
         // Jacobian accumulator; windows 0 .. fb_t−2 add with the incomplete
-        // CT mixed addition (`Jac.addMixedCt`, 7M + 4S against the complete
+        // CT mixed addition (`Jac.addMixedCt`, 8M + 3S against the complete
         // RCB mixed 11M + 2·m_b), the TOP window with the complete formula.
         // Why the incomplete one is safe below the top (2026-10-13): before
         // window i the accumulator is `L·G`, `L = Σ_{j<i} d_j·2^(6j)`, and the
@@ -834,8 +840,41 @@ const Jac = struct {
         return .{ .x = p.x.mul(p.z), .y = p.y, .z = z2.mul(p.z) };
     }
 
-    /// Doubling, `a = −3` (EFD dbl-2001-b): 3M + 5S. `Z = 0` stays `Z = 0`.
+    /// Doubling, `a = −3`. `Z = 0` stays `Z = 0`. One generated asm block
+    /// (`point_asm.jac_dbl`, 4M + 4S in nistz256's order) where the field
+    /// core is asm, else `dblFormula` (dbl-2001-b, 3M + 5S) — the same
+    /// polynomials computed another way, which the differential pins the asm
+    /// to bit for bit.
     fn dbl(p: Jac) Jac {
+        if (point_asm_active and !@inComptime()) {
+            var f: [point_asm.slotCount(&point_asm.jac_dbl)][4]u64 = undefined;
+            f[0] = p.x.limbs;
+            f[1] = p.y.limbs;
+            f[2] = p.z.limbs;
+            point_asm.run(&point_asm.jac_dbl, 3, &f);
+            return .{ .x = .{ .limbs = f[0] }, .y = .{ .limbs = f[1] }, .z = .{ .limbs = f[2] } };
+        }
+        return p.dblFormula();
+    }
+
+    /// `2^n·p`: `n` doublings over one asm frame (no copy in and out per
+    /// doubling), else `n` calls of `dbl`.
+    inline fn dblTimes(p: Jac, comptime n: usize) Jac {
+        if (point_asm_active and !@inComptime()) {
+            var f: [point_asm.slotCount(&point_asm.jac_dbl)][4]u64 = undefined;
+            f[0] = p.x.limbs;
+            f[1] = p.y.limbs;
+            f[2] = p.z.limbs;
+            for (0..n) |_| point_asm.run(&point_asm.jac_dbl, 3, &f);
+            return .{ .x = .{ .limbs = f[0] }, .y = .{ .limbs = f[1] }, .z = .{ .limbs = f[2] } };
+        }
+        var q = p;
+        for (0..n) |_| q = q.dbl();
+        return q;
+    }
+
+    /// The Zig formula behind `dbl` (and its oracle).
+    fn dblFormula(p: Jac) Jac {
         const delta = p.z.sq();
         const gamma = p.y.sq();
         const beta = p.x.mul(gamma);
@@ -872,23 +911,42 @@ const Jac = struct {
         return .{ .x = x3, .y = y3, .z = z3 };
     }
 
-    /// Mixed addition, `Q` affine (EFD madd-2007-bl), WITHOUT the
-    /// exceptional cases: a fixed schedule, no branch — for the constant-time
+    /// Mixed addition, `Q` affine (EFD madd-2004-hmv, see
+    /// `addMixedCtFormula`), WITHOUT the exceptional cases: a fixed schedule, no branch — for the constant-time
     /// windowed multiply, whose caller rules out `P = O` and `P = ±Q` (see
-    /// `mulCtWindowed`). On those inputs the result is meaningless.
+    /// `mulCtWindowed`). On those inputs the result is meaningless. One
+    /// generated asm block (`point_asm.jac_add_mixed`) where the field core
+    /// is asm, else `addMixedCtFormula`, which the differential pins it to.
     fn addMixedCt(p: Jac, q: AffineCoordinates) Jac {
+        if (point_asm_active and !@inComptime()) {
+            var f: [point_asm.slotCount(&point_asm.jac_add_mixed)][4]u64 = undefined;
+            f[0] = p.x.limbs;
+            f[1] = p.y.limbs;
+            f[2] = p.z.limbs;
+            f[3] = q.x.limbs;
+            f[4] = q.y.limbs;
+            point_asm.run(&point_asm.jac_add_mixed, 3, &f);
+            return .{ .x = .{ .limbs = f[0] }, .y = .{ .limbs = f[1] }, .z = .{ .limbs = f[2] } };
+        }
+        return p.addMixedCtFormula(q);
+    }
+
+    /// The Zig formula behind `addMixedCt` (and its oracle): EFD
+    /// madd-2004-hmv, 8M + 3S with 7 add/sub (the shape of nistz256's
+    /// `point_add_affine`; madd-2007-bl's 7M + 4S needs 14 add/sub, and a
+    /// square costs a multiply in the asm core). `Z3 = Z·H`, so the output
+    /// is a different Jacobian representative of the same point than
+    /// `addMixed`'s (`Z3 = 2·Z·H`).
+    fn addMixedCtFormula(p: Jac, q: AffineCoordinates) Jac {
         const z1z1 = p.z.sq();
-        const uu2 = q.x.mul(z1z1);
-        const s2 = q.y.mul(p.z).mul(z1z1);
-        const h = uu2.sub(p.x);
-        const r = s2.sub(p.y).dbl();
+        const h = z1z1.mul(q.x).sub(p.x); // U2 − X
+        const r = z1z1.mul(p.z).mul(q.y).sub(p.y); // S2 − Y
         const hh = h.sq();
-        const i = hh.dbl().dbl(); // 4·HH
-        const j = h.mul(i);
-        const v = p.x.mul(i);
-        const x3 = r.sq().sub(j).sub(v.dbl());
-        const y3 = r.mul(v.sub(x3)).sub(p.y.mul(j).dbl());
-        const z3 = p.z.add(h).sq().sub(z1z1).sub(hh);
+        const hhh = hh.mul(h);
+        const v = hh.mul(p.x); // X·H²
+        const x3 = r.sq().sub(v.dbl()).sub(hhh);
+        const y3 = v.sub(x3).mul(r).sub(hhh.mul(p.y));
+        const z3 = p.z.mul(h);
         return .{ .x = x3, .y = y3, .z = z3 };
     }
 
@@ -1267,6 +1325,49 @@ test "wNAF: the top of the scalar range recodes without wrapping" {
         // with each other, and a shared mistake cannot hide in the pair.
         try eqAffine(got, want_std);
         try eqAffine(want_ct, want_std);
+    }
+}
+
+test "GATED differential: point_asm programs == the Zig Jacobian formulas, bit for bit" {
+    if (!point_asm_active) return error.SkipZigTest;
+    // The formulas are algebraic over the field, so arbitrary canonical
+    // coordinates (on the curve or not) exercise every op; edge values hit
+    // the carry/borrow corners of the add/sub tails and the identity's Z = 0.
+    const p_minus_1: u256 = field.field_order - 1;
+    const edges = [_]u256{ 0, 1, 2, p_minus_1, p_minus_1 - 1, 1 << 255, (1 << 224) - 1, 1 << 64 };
+    var prng = std.Random.DefaultPrng.init(0x9256_a5a5);
+    const rand = prng.random();
+    const iters: usize = if (builtin.mode == .Debug) 4000 else 40000;
+    var i: usize = 0;
+    while (i < iters) : (i += 1) {
+        var c: [5]field.Fe = undefined;
+        for (&c, 0..) |*fe, k| {
+            const v: u256 = if ((i + k) % 7 == 0)
+                edges[(i / 7 + k) % edges.len]
+            else
+                rand.int(u256) % field.field_order;
+            var b: [32]u8 = undefined;
+            std.mem.writeInt(u256, &b, v, .little);
+            fe.* = try field.Fe.fromBytes(b, .little);
+        }
+        const p = Jac{ .x = c[0], .y = c[1], .z = c[2] };
+        const q = AffineCoordinates{ .x = c[3], .y = c[4] };
+        const d_asm = p.dbl();
+        const d_ref = p.dblFormula();
+        try std.testing.expectEqualSlices(u64, &d_ref.x.limbs, &d_asm.x.limbs);
+        try std.testing.expectEqualSlices(u64, &d_ref.y.limbs, &d_asm.y.limbs);
+        try std.testing.expectEqualSlices(u64, &d_ref.z.limbs, &d_asm.z.limbs);
+        const d5_asm = p.dblTimes(5);
+        var d5_ref = p;
+        for (0..5) |_| d5_ref = d5_ref.dblFormula();
+        try std.testing.expectEqualSlices(u64, &d5_ref.x.limbs, &d5_asm.x.limbs);
+        try std.testing.expectEqualSlices(u64, &d5_ref.y.limbs, &d5_asm.y.limbs);
+        try std.testing.expectEqualSlices(u64, &d5_ref.z.limbs, &d5_asm.z.limbs);
+        const a_asm = p.addMixedCt(q);
+        const a_ref = p.addMixedCtFormula(q);
+        try std.testing.expectEqualSlices(u64, &a_ref.x.limbs, &a_asm.x.limbs);
+        try std.testing.expectEqualSlices(u64, &a_ref.y.limbs, &a_asm.y.limbs);
+        try std.testing.expectEqualSlices(u64, &a_ref.z.limbs, &a_asm.z.limbs);
     }
 }
 

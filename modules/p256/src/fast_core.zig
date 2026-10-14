@@ -463,7 +463,7 @@ fn fieldMulAmd64(z: *[4]u64, a: *const [4]u64, b: *const [4]u64) void {
 // (t7 fresh = the carry out); the diagonal a_i² terms land on one adc chain.
 // The result is exactly a² < 2^512, so every carry provably fits. (Identical
 // to the k256 square; curve-independent.)
-const sq_product =
+pub const sq_product =
     // cross row a0: t1..t4 ← a0·(a1,a2,a3)
     \\ movq (%%rsi), %%rdx
     \\ xorl %%r13d, %%r13d
@@ -556,7 +556,7 @@ fn fieldSqAmd64(z: *[4]u64, a: *const [4]u64) void {
 // Constant-time: straight-line, no branch, no secret-indexed address, only
 // DIT-set instructions; the final select is the same `sbb` mask + XOR-blend as
 // the Solinas tail. Clobbers rax, rbx, rcx, rdx, rsi, r8..r15, flags.
-const mont_reduce_core =
+pub const mont_reduce_core =
     \\ movabsq $0xFFFFFFFF00000001, %%rsi
     // round 0: m = r8; (r8,r9,r10,r11) -> (r9,r10,r11,r8)
     \\ movq %%r8, %%rdx
@@ -708,7 +708,7 @@ fn montSqAmd64(z: *[4]u64, a: *const [4]u64) void {
 // CMOV, DIT-set instructions only. Pinned to `field.montMulPortable` by the
 // gated differential. rsi = a, rbx = b (neither modified); out in r12, r13,
 // r8, r9.
-const mont_mul_cios =
+pub const mont_mul_cios =
     \\ movabsq $0xFFFFFFFF00000001, %%rdi
     // round 0: (r8..r12) = a·b0, then reduce on r8 into (r9..r12, r13)
     \\ movq (%%rbx), %%rdx

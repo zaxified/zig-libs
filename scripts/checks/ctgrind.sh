@@ -498,12 +498,12 @@ declare -A PATTERN=(
     [montint/ffcontrol]='ff[.]zig'
     [montint/dyn]='dyn[.]zig|nt[.]zig|montint[.]zig|limbs[.]zig|asm_core[.]zig'
     # ── added 2026-09-09 ───────────────────────────────────────────────────
-    [p256/comb]='group[.]zig|field[.]zig|fast_core[.]zig'
+    [p256/comb]='group[.]zig|field[.]zig|fast_core[.]zig|point_asm[.]zig'
     # `sign` names std's ecdsa/common/scalar for the same reason chachapoly's
     # pattern names std's AEAD: the shipped ES256 surface is std's generic
     # signer over THIS module's group, so attributing that arithmetic to
     # someone else would be the evasion this gate exists to refuse.
-    [p256/sign]='ecdsa[.]zig|common[.]zig|scalar[.]zig|group[.]zig|field[.]zig|fast_core[.]zig'
+    [p256/sign]='ecdsa[.]zig|common[.]zig|scalar[.]zig|group[.]zig|field[.]zig|fast_core[.]zig|point_asm[.]zig'
     [rsa/crt]='root[.]zig|ff[.]zig|dyn[.]zig|nt[.]zig|montint[.]zig|limbs[.]zig|asm_core[.]zig'
     [rsa/noncrt]='root[.]zig|ff[.]zig|dyn[.]zig|nt[.]zig|montint[.]zig|limbs[.]zig|asm_core[.]zig'
     [rsa/keygen]='root[.]zig|ff[.]zig|dyn[.]zig|nt[.]zig|montint[.]zig|limbs[.]zig|asm_core[.]zig'
