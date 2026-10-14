@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-14** — Readers no longer wait for a writer's fsync (S2 survey R5, in-process half): `Db` now serializes writers with `lock` and guards the keydir with a new read-write lock taken exclusive only for the in-memory update, never across a write or fsync. Readers run in parallel and still never see a value before it is durable under the sync policy. Tests: a reader answered while a writer is parked in fsync; concurrent readers alongside puts/deletes/compactions on the real filesystem, clean under ThreadSanitizer. No API change.
+
 - **2026-10-14** — Sync policy (S2 survey R1, Bitcask `sync_strategy`): `Options.sync: SyncPolicy` = `.always` (default, unchanged behaviour), `.none`, `.interval_ms`; `Options.sync_clock` (default new `Clock.monotonic`); `Db.sync()`. Under `.none`/`.interval_ms` a crash loses acknowledged writes back to the last barrier (`sync`, `compact`, `open`, interval sync) and recovers the state after a prefix of the writes; `close` syncs best-effort. Additive. New crash sweep over a `.none` workload in all four crash modes + unit tests; two mutants killed.
 
 - **2026-10-11** — `Storage.tryLockShared` (`flock` `LOCK_SH`, non-blocking) behind a new optional vtable slot `tryLockShared` (default null → `error.LockUnsupported`), so no implementer has to change. `FsStorage` and `SimStorage` implement it (the sim models shared holders per handle, conversion both ways as `flock` does, release on close and on crash); the VOPR `FaultStorage` forwards it. For kvtree's read-only openers. Test: `sim: shared locks coexist and exclude an exclusive holder both ways`.

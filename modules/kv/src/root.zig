@@ -34,17 +34,16 @@
 //! record — v0 trades that (rare, media-level) case for a simple, provable
 //! invariant: **everything reachable after `open` is CRC-valid**.
 //!
-//! **Concurrency (v0):** internally synchronized with one coarse lock —
-//! single writer, and reads see a consistent keydir because they take the
-//! same lock. Over a storage with an `Io` (`FsStorage`) it is a
-//! `std.Io.Mutex`, so a waiting task yields to the `Io` (required under an
-//! `Io` that runs several tasks on one thread: a spinning waiter would starve
-//! a holder suspended in `fsync` forever); over an io-less storage it is a
-//! spinlock (`std.atomic.Mutex` + `spinLoopHint`). Honest caveat: a writer
-//! holds the lock across `fsync`, so a concurrent caller waits for the
-//! duration of a disk flush (with the spinlock: spins through it); this is
-//! fine for the intended embedded/low-contention use, and lockless MVCC
-//! readers are an explicitly noted future phase.
+//! **Concurrency:** writers are serialized by one lock (`Db.lock`) held for
+//! their whole duration, fsync included; readers take a read-write lock
+//! (`Db.rw`) shared, and a writer takes it exclusive only for its in-memory
+//! keydir update — never across a write or an fsync. Readers therefore run in
+//! parallel, are never held up by a disk flush, and never see a value before
+//! the sync policy made it durable. Over a storage with an `Io` (`FsStorage`)
+//! both are `std.Io` locks, so a waiting task yields to the `Io` (required
+//! under an `Io` that runs several tasks on one thread: a spinning waiter
+//! would starve a holder suspended in `fsync` forever); over an io-less
+//! storage they spin.
 //!
 //! **Cross-process exclusion (on by default):** `open` takes an exclusive
 //! ADVISORY lock (`flock(2)`, non-blocking) on a sidecar `<path>.lock` and
@@ -88,8 +87,8 @@ pub const meta = .{
     .targets = .{.linux64},
     .platform = .any, // all I/O via std.Io through the Storage seam
     .role = .both, // embedded read+write store
-    // Internally synchronized: one coarse spinlock over all operations
-    // (writer holds it across fsync — see the module doc). MVCC = phase.
+    // Internally synchronized: writers serialized, readers shared and never
+    // blocked by a writer's fsync — see the module doc.
     .concurrency = .threadsafe,
     .model_after = "Bitcask / LMDB / xitdb; reliability = TigerBeetle VOPR",
     .deps = .{}, // std only
@@ -98,9 +97,9 @@ pub const meta = .{
 pub const SimStorage = @import("sim.zig").SimStorage;
 pub const CrashMode = @import("sim.zig").CrashMode;
 
-/// `Db`'s lock: `std.Io.Mutex` when the storage has an `Io` (see
+/// `Db`'s writer lock: `std.Io.Mutex` when the storage has an `Io` (see
 /// `Storage.io`), else a spinlock (std SmpAllocator pattern; Zig 0.16 std has
-/// no io-less blocking mutex) — see the module doc for the fsync-hold caveat.
+/// no io-less blocking mutex).
 /// Public for wrappers that hold their own lock across `Db` calls
 /// (`sessions.KvStore`): `.{ .io = db.store.io }` gives them the same choice.
 pub const Lock = struct {
@@ -115,6 +114,46 @@ pub const Lock = struct {
 
     pub fn release(l: *Lock) void {
         if (l.io) |io| l.mutex.unlock(io) else l.spin.unlock();
+    }
+};
+
+/// `Db`'s keydir lock: readers shared, the keydir update exclusive. Like
+/// `Lock`, an `std.Io.RwLock` over a storage with an `Io`, else a spin lock —
+/// writer-preferring (a waiting writer stops new readers), so a stream of
+/// readers cannot starve the writer.
+const RwLock = struct {
+    io: ?std.Io,
+    rw: std.Io.RwLock = .init,
+    /// Spin form: bit 31 = a writer holds or waits, low bits = readers.
+    state: std.atomic.Value(u32) = .init(0),
+
+    const writer_bit: u32 = 1 << 31;
+
+    fn lockShared(l: *RwLock) void {
+        if (l.io) |io| return l.rw.lockSharedUncancelable(io);
+        while (true) {
+            const s = l.state.load(.monotonic);
+            if (s & writer_bit == 0 and l.state.cmpxchgWeak(s, s + 1, .acquire, .monotonic) == null) return;
+            std.atomic.spinLoopHint();
+        }
+    }
+
+    fn unlockShared(l: *RwLock) void {
+        if (l.io) |io| return l.rw.unlockShared(io);
+        _ = l.state.fetchSub(1, .release);
+    }
+
+    fn lock(l: *RwLock) void {
+        if (l.io) |io| return l.rw.lockUncancelable(io);
+        // Claim the writer bit (one writer at a time), then wait out the
+        // readers already inside.
+        while (l.state.fetchOr(writer_bit, .acquire) & writer_bit != 0) std.atomic.spinLoopHint();
+        while (l.state.load(.acquire) != writer_bit) std.atomic.spinLoopHint();
+    }
+
+    fn unlock(l: *RwLock) void {
+        if (l.io) |io| return l.rw.unlock(io);
+        l.state.store(0, .release);
     }
 };
 
@@ -993,7 +1032,13 @@ pub const Db = struct {
     /// reclaim this much).
     dead_bytes: u64,
     poisoned: bool,
+    /// Serializes writers (`put`, `delete`, `compact`, `sync`) for their
+    /// whole duration, fsync included. Readers never take it.
     lock: Lock,
+    /// Guards the keydir, `file` and the counters readers report: shared
+    /// for reads, exclusive only for a writer's in-memory update — never
+    /// across a write or an fsync.
+    rw: RwLock,
     options: Options,
     /// On-disk format version of the open data file: `version_plain` until
     /// the first expiring put upgrades it (see the format comment).
@@ -1061,6 +1106,7 @@ pub const Db = struct {
             .dead_bytes = 0,
             .poisoned = false,
             .lock = .{ .io = store.io },
+            .rw = .{ .io = store.io },
             .options = options,
             .version = version_plain,
             .expiring = 0,
@@ -1209,6 +1255,9 @@ pub const Db = struct {
         var new_key: ?[]u8 = null;
         if (existing == null) {
             new_key = try self.gpa.dupe(u8, key);
+            // May rehash: readers must not be inside the map meanwhile.
+            self.rw.lock();
+            defer self.rw.unlock();
             self.keydir.ensureUnusedCapacity(self.gpa, 1) catch |e| {
                 self.gpa.free(new_key.?);
                 return e;
@@ -1216,8 +1265,14 @@ pub const Db = struct {
         }
         errdefer if (new_key) |k| self.gpa.free(k);
 
+        // Write (and sync) outside the keydir lock: readers go on serving
+        // the previous value meanwhile, and never see this one before the
+        // policy made it durable. `existing` stays valid — only writers,
+        // serialized by `lock`, change the map.
         try self.appendLocked(rec);
 
+        self.rw.lock();
+        defer self.rw.unlock();
         const entry = Entry{ .off = self.end, .key_len = @intCast(key.len), .val_len = @intCast(value.len), .expires_at = expires_at };
         if (existing) |e| {
             self.dead_bytes += e.recLen();
@@ -1248,6 +1303,8 @@ pub const Db = struct {
 
         try self.appendLocked(rec);
 
+        self.rw.lock();
+        defer self.rw.unlock();
         self.dead_bytes += existing.recLen() + rec_len;
         if (existing.expires()) self.expiring -= 1;
         const kv = self.keydir.fetchRemove(key).?;
@@ -1310,8 +1367,8 @@ pub const Db = struct {
     /// yields `error.Corrupt`, never bad bytes. Reads work on a poisoned
     /// store (they describe the last consistent state).
     pub fn get(self: *Db, gpa: Allocator, key: []const u8) GetError!?[]u8 {
-        self.lock.acquire();
-        defer self.lock.release();
+        self.rw.lockShared();
+        defer self.rw.unlockShared();
         const e = self.liveEntry(key) orelse return null;
 
         const value = try gpa.alloc(u8, e.val_len);
@@ -1329,8 +1386,8 @@ pub const Db = struct {
     ///
     /// Same locking, same `read_verify` CRC check as `get`.
     pub fn getBuf(self: *Db, buf: []u8, key: []const u8) (GetError || error{BufferTooSmall})!?[]u8 {
-        self.lock.acquire();
-        defer self.lock.release();
+        self.rw.lockShared();
+        defer self.rw.unlockShared();
         const e = self.liveEntry(key) orelse return null;
         if (e.val_len > buf.len) return error.BufferTooSmall;
         const value = buf[0..e.val_len];
@@ -1341,16 +1398,16 @@ pub const Db = struct {
     /// Byte length of `key`'s current value, or null if absent — for sizing a
     /// `getBuf` buffer. Pure in-memory (the keydir holds the length).
     pub fn valueLen(self: *Db, key: []const u8) ?u32 {
-        self.lock.acquire();
-        defer self.lock.release();
+        self.rw.lockShared();
+        defer self.rw.unlockShared();
         const e = self.liveEntry(key) orelse return null;
         return e.val_len;
     }
 
     /// `key`'s expiry, or null if absent or already expired. Pure in-memory.
     pub fn expiresAt(self: *Db, key: []const u8) ?Expiry {
-        self.lock.acquire();
-        defer self.lock.release();
+        self.rw.lockShared();
+        defer self.rw.unlockShared();
         const e = self.liveEntry(key) orelse return null;
         return if (e.expires()) .{ .at_ms = e.expires_at } else .never;
     }
@@ -1395,8 +1452,8 @@ pub const Db = struct {
 
     /// Whether `key` currently has a value (pure in-memory check).
     pub fn exists(self: *Db, key: []const u8) bool {
-        self.lock.acquire();
-        defer self.lock.release();
+        self.rw.lockShared();
+        defer self.rw.unlockShared();
         return self.liveEntry(key) != null;
     }
 
@@ -1404,8 +1461,8 @@ pub const Db = struct {
     /// expiry; otherwise one pass over the keydir, since a key can expire
     /// without any operation touching it.
     pub fn count(self: *Db) usize {
-        self.lock.acquire();
-        defer self.lock.release();
+        self.rw.lockShared();
+        defer self.rw.unlockShared();
         if (self.expiring == 0) return self.keydir.count();
         const now = self.options.clock.now();
         var n: usize = 0;
@@ -1425,8 +1482,8 @@ pub const Db = struct {
             out.deinit(gpa);
         }
         {
-            self.lock.acquire();
-            defer self.lock.release();
+            self.rw.lockShared();
+            defer self.rw.unlockShared();
             const now: i64 = if (self.expiring == 0) 0 else self.options.clock.now();
             var it = self.keydir.iterator();
             while (it.next()) |kv| {
@@ -1448,8 +1505,8 @@ pub const Db = struct {
     /// expired keys — the caller's signal for when `compact` is worth it (v0
     /// compaction is caller-driven; automatic thresholds are a noted phase).
     pub fn deadBytes(self: *Db) u64 {
-        self.lock.acquire();
-        defer self.lock.release();
+        self.rw.lockShared();
+        defer self.rw.unlockShared();
         if (self.expiring == 0) return self.dead_bytes;
         const now = self.options.clock.now();
         var dead = self.dead_bytes;
@@ -1531,7 +1588,10 @@ pub const Db = struct {
         };
 
         // The temp handle IS the new data file (rename moved the name, not
-        // the file). Point the keydir at the new offsets.
+        // the file). Point the keydir at the new offsets — with no reader
+        // inside, since readers pread through `self.file`.
+        self.rw.lock();
+        defer self.rw.unlock();
         self.store.close(self.file);
         self.file = tmp;
         swapped = true;
@@ -2471,6 +2531,196 @@ test "keys and values are copied; caller buffers may be reused" {
     kbuf = "XXX".*;
     vbuf = "YYYYY".*;
     try expectGet(&db, "key", "value");
+}
+
+/// A `SimStorage` front whose `sync` can be held shut: the syncing thread
+/// parks inside it until `open_gate`, so a test can act while a writer is
+/// "inside fsync".
+const GateStorage = struct {
+    inner: Storage,
+    armed: std.atomic.Value(bool) = .init(false),
+    in_sync: std.atomic.Value(bool) = .init(false),
+    open_gate: std.atomic.Value(bool) = .init(false),
+
+    fn storage(g: *GateStorage) Storage {
+        return .{ .ctx = g, .vtable = &vtable };
+    }
+
+    fn innerOf(ctx: *anyopaque) Storage {
+        return @as(*GateStorage, @ptrCast(@alignCast(ctx))).inner;
+    }
+
+    const vtable = Storage.VTable{
+        .open = struct {
+            fn f(c: *anyopaque, p: []const u8, m: Storage.OpenMode) Storage.Error!Storage.Handle {
+                return innerOf(c).open(p, m);
+            }
+        }.f,
+        .size = struct {
+            fn f(c: *anyopaque, h: Storage.Handle) Storage.Error!u64 {
+                return innerOf(c).size(h);
+            }
+        }.f,
+        .pread = struct {
+            fn f(c: *anyopaque, h: Storage.Handle, b: []u8, o: u64) Storage.Error!usize {
+                return innerOf(c).pread(h, b, o);
+            }
+        }.f,
+        .writeAll = struct {
+            fn f(c: *anyopaque, h: Storage.Handle, b: []const u8, o: u64) Storage.Error!void {
+                return innerOf(c).writeAll(h, b, o);
+            }
+        }.f,
+        .sync = struct {
+            fn f(c: *anyopaque, h: Storage.Handle) Storage.Error!void {
+                const g: *GateStorage = @ptrCast(@alignCast(c));
+                if (g.armed.load(.acquire)) {
+                    g.in_sync.store(true, .release);
+                    while (!g.open_gate.load(.acquire)) std.Thread.yield() catch {};
+                }
+                return g.inner.sync(h);
+            }
+        }.f,
+        .truncate = struct {
+            fn f(c: *anyopaque, h: Storage.Handle, l: u64) Storage.Error!void {
+                return innerOf(c).truncate(h, l);
+            }
+        }.f,
+        .close = struct {
+            fn f(c: *anyopaque, h: Storage.Handle) void {
+                innerOf(c).close(h);
+            }
+        }.f,
+        .rename = struct {
+            fn f(c: *anyopaque, a: []const u8, b: []const u8) Storage.Error!void {
+                return innerOf(c).rename(a, b);
+            }
+        }.f,
+        .delete = struct {
+            fn f(c: *anyopaque, p: []const u8) Storage.Error!void {
+                return innerOf(c).delete(p);
+            }
+        }.f,
+        .syncDir = struct {
+            fn f(c: *anyopaque) Storage.Error!void {
+                return innerOf(c).syncDir();
+            }
+        }.f,
+        .tryLockExclusive = struct {
+            fn f(c: *anyopaque, h: Storage.Handle) Storage.Error!bool {
+                return innerOf(c).tryLockExclusive(h);
+            }
+        }.f,
+    };
+};
+
+test "concurrency: readers are served while a writer is inside fsync, and never see its value early" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var gate: GateStorage = .{ .inner = sim.storage() };
+    var db = try Db.open(testing.allocator, gate.storage(), "db", .{});
+    defer db.close();
+    try db.put("k", "old");
+
+    gate.armed.store(true, .release);
+    const Writer = struct {
+        fn run(d: *Db) void {
+            d.put("k", "new") catch unreachable;
+        }
+    };
+    const writer = try std.Thread.spawn(.{}, Writer.run, .{&db});
+    defer writer.join();
+    // Released however this test ends, so `join` cannot hang.
+    defer gate.open_gate.store(true, .release);
+    while (!gate.in_sync.load(.acquire)) try std.Thread.yield();
+
+    // The writer holds its lock and sits in fsync. A reader on another
+    // thread must still be answered — from the previous value.
+    const Reader = struct {
+        got: [8]u8 = undefined,
+        len: ?usize = null,
+        exists: bool = false,
+        count: usize = 0,
+        done: std.atomic.Value(bool) = .init(false),
+        fn run(r: *@This(), d: *Db) void {
+            const v = d.getBuf(&r.got, "k") catch unreachable;
+            r.len = if (v) |s| s.len else null;
+            r.exists = d.exists("k");
+            r.count = d.count();
+            r.done.store(true, .release);
+        }
+    };
+    var reader: Reader = .{};
+    const rt = try std.Thread.spawn(.{}, Reader.run, .{ &reader, &db });
+    var spins: usize = 0;
+    while (!reader.done.load(.acquire) and spins < 50_000_000) : (spins += 1) try std.Thread.yield();
+    const served = reader.done.load(.acquire);
+    gate.open_gate.store(true, .release);
+    rt.join();
+    try testing.expect(served); // served while the writer was in fsync
+    try testing.expectEqualStrings("old", reader.got[0..reader.len.?]);
+    try testing.expect(reader.exists);
+    try testing.expectEqual(@as(usize, 1), reader.count);
+}
+
+test "concurrency: readers alongside puts, deletes and compactions (real filesystem)" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var fs_store = FsStorage.init(testing.io, tmp.dir);
+    var db = try Db.open(testing.allocator, fs_store.storage(), "db", .{ .sync = .none });
+    defer db.close();
+
+    // Every value starts with its own key, so a reader can tell a value read
+    // through a stale offset (another record's bytes) from a right one.
+    const Writer = struct {
+        fn run(d: *Db, stop: *std.atomic.Value(bool)) void {
+            defer stop.store(true, .release);
+            var val: [32]u8 = undefined;
+            for (0..400) |i| {
+                var kb: [4]u8 = undefined;
+                const k = std.fmt.bufPrint(&kb, "k{d}", .{i % 16}) catch unreachable;
+                if (i % 7 == 3) {
+                    d.delete(k) catch unreachable;
+                } else {
+                    const v = std.fmt.bufPrint(&val, "{s}={d}", .{ k, i }) catch unreachable;
+                    d.put(k, v) catch unreachable;
+                }
+                if (i % 50 == 49) d.compact() catch unreachable;
+            }
+        }
+    };
+    const Reader = struct {
+        bad: usize = 0,
+        reads: usize = 0,
+        fn run(r: *@This(), d: *Db, stop: *std.atomic.Value(bool)) void {
+            var buf: [32]u8 = undefined;
+            while (!stop.load(.acquire)) {
+                for (0..16) |i| {
+                    var kb: [4]u8 = undefined;
+                    const k = std.fmt.bufPrint(&kb, "k{d}", .{i}) catch unreachable;
+                    r.reads += 1;
+                    const v = (d.getBuf(&buf, k) catch {
+                        r.bad += 1;
+                        continue;
+                    }) orelse continue;
+                    if (!std.mem.startsWith(u8, v, k) or v.len <= k.len or v[k.len] != '=') r.bad += 1;
+                    _ = d.count();
+                }
+            }
+        }
+    };
+    var stop: std.atomic.Value(bool) = .init(false);
+    var readers: [2]Reader = .{ .{}, .{} };
+    var threads: [3]std.Thread = undefined;
+    threads[0] = try std.Thread.spawn(.{}, Writer.run, .{ &db, &stop });
+    for (&readers, 1..) |*r, i| threads[i] = try std.Thread.spawn(.{}, Reader.run, .{ r, &db, &stop });
+    for (threads) |t| t.join();
+    for (readers) |r| {
+        try testing.expectEqual(@as(usize, 0), r.bad);
+        try testing.expect(r.reads > 0);
+    }
 }
 
 test "FsStorage hands its Io to the Db, whose lock then waits through it" {

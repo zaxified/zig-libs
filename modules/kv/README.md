@@ -123,15 +123,17 @@ to rebuild the keydir; replay stops at the first torn/corrupt record and
   anywhere mid-compaction leaves the old file as the store; a stale
   `<path>.compact` temp is removed on the next `open`.
 
-## Concurrency — v0 model
+## Concurrency
 
-Internally synchronized with **one coarse spinlock** (`std.atomic.Mutex` +
-`spinLoopHint`, the repo-standard io-less lock): single writer, and readers
-see a consistent keydir because they take the same lock. Caveats, honestly:
-a writer holds the lock **across fsync**, so a concurrent thread spin-waits
-(burning CPU) for the duration of a disk flush — fine for embedded,
-low-contention use; wrong for a hot multi-threaded server. Lockless MVCC
-readers are a noted phase.
+Internally synchronized with two locks. Writers (`put`, `delete`, `compact`,
+`sync`) are serialized by one mutex held for their whole duration, fsync
+included. Readers (`get`, `getBuf`, `exists`, `count`, `keys`, …) take a
+read-write lock **shared**; a writer takes it exclusive only for its in-memory
+keydir update, never across a write or an fsync. So any number of readers run
+in parallel, a reader is never held up by a writer's disk flush, and it never
+sees a value before the sync policy has made it durable. Over `FsStorage` both
+are `std.Io` locks (they yield to the `Io`); over an io-less storage they spin
+(the read-write spin lock is writer-preferring).
 
 ## Cross-process exclusion — what it does and does not buy
 
