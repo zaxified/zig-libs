@@ -80,14 +80,23 @@ below; `.none` opts out. `clock` (default `CLOCK_REALTIME`) decides expiry;
 tests inject their own. `sync` (default `.always`) picks when writes reach the
 disk — `.always`, `.none` or `.interval_ms` (Bitcask's `o_sync`, `none`,
 `{seconds, N}`); `sync_clock` (default `CLOCK_MONOTONIC`) times the interval.
+`max_file_size` (default 2 GiB, Bitcask's) seals the active data file and
+starts a new one before an append would cross it; the first rotation turns the
+single file into a manifest + data files, and `compact` then merges files.
 
-## On-disk format (v1/v2, little-endian)
+## On-disk format (little-endian)
 
 ```
 header:  "ZKVL" | version:u32            (8 bytes; 1, or 2 once a key has expired-capable records)
 record:  crc32:u32 | op:u8 (0=put 1=del 2=put-with-expiry) | key_len:u32 | val_len:u32
          | [expires_at:i64, op 2 only] | key | value
 ```
+
+A multi-file store (after its first rotation, see `max_file_size`) keeps a
+**manifest** at `<path>` instead — same magic, version 3: the data-file ids in
+replay order and a CRC — and its data files at `<path>.<id>.data`, each in the
+format above. ⚠ A build of `kv` that knows only versions 1–2 refuses such a
+store (`error.UnsupportedVersion`); do not downgrade one.
 
 A store stays at version 1 until its first expiring put, which upgrades it by
 one compaction (atomic rewrite, never an in-place header edit). An older build

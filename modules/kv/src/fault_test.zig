@@ -184,8 +184,12 @@ fn verifyRecovery(sim: *SimStorage, outcome: RunOutcome) !void {
 }
 
 fn verifySteps(sim: *SimStorage, steps: []const Step, outcome: RunOutcome) !void {
+    return verifyStepsWith(sim, steps, outcome, test_options);
+}
+
+fn verifyStepsWith(sim: *SimStorage, steps: []const Step, outcome: RunOutcome, options: kv.Options) !void {
     sim.reboot();
-    var db = try Db.open(testing.allocator, sim.storage(), db_name, test_options);
+    var db = try Db.open(testing.allocator, sim.storage(), db_name, options);
     defer db.close();
 
     // The recovered state must be the acknowledged model, or (only if a step
@@ -359,7 +363,14 @@ fn verifyPrefix(sim: *SimStorage, steps: []const Step, outcome: RunOutcome, opti
 }
 
 test "fault-injection sweep: SyncPolicy.none recovers a prefix no older than the last barrier" {
-    const options: kv.Options = .{ .clock = test_clock, .sync = .none };
+    try sweepNoSync(.{ .clock = test_clock, .sync = .none });
+}
+
+test "fault-injection sweep: SyncPolicy.none over rotations — a sealed file is never behind a later one" {
+    try sweepNoSync(.{ .clock = test_clock, .sync = .none, .max_file_size = 64 });
+}
+
+fn sweepNoSync(options: kv.Options) !void {
     var total: usize = 0;
     {
         var sim = SimStorage.init(testing.allocator);
@@ -406,6 +417,72 @@ test "fault-injection sweep: SyncPolicy.none recovers a prefix no older than the
     try testing.expect(lost_acked > 0);
     try testing.expect(kept_unsynced > 0);
     try testing.expect(holes > 0);
+}
+
+/// Small enough that the main script rotates many times: the first rotation
+/// migrates the single-file store, later ones extend the manifest, and each
+/// `compact` is a multi-file merge.
+const multi_options: kv.Options = .{ .clock = test_clock, .max_file_size = 64 };
+
+/// Crash `steps` under `options` at every injection point in every crash
+/// mode (reorder over three seeds) and verify recovery exactly as the
+/// single-file sweeps do. Returns the holes punched (teeth for reorder).
+fn sweepAll(steps: []const Step, options: kv.Options, label: []const u8) !usize {
+    var total: usize = 0;
+    {
+        var sim = SimStorage.init(testing.allocator);
+        defer sim.deinit();
+        const out = runStepsWith(&sim, steps, options);
+        try testing.expect(!out.crashed);
+        total = sim.ops_seen;
+        try verifyStepsWith(&sim, steps, out, options);
+    }
+    var holes: usize = 0;
+    for ([_]CrashMode{ .lose_unsynced, .keep_unsynced, .torn_tail, .reorder_unsynced }) |mode| {
+        for ([_]u64{ 1, 2, 3 }) |seed| {
+            if (mode != .reorder_unsynced and seed != 1) continue;
+            var point: usize = 0;
+            while (point < total) : (point += 1) {
+                var sim = SimStorage.init(testing.allocator);
+                defer sim.deinit();
+                sim.crash_mode = mode;
+                sim.reorder_seed = seed;
+                sim.ops_until_crash = point;
+                const out = runStepsWith(&sim, steps, options);
+                // A crash in a merge's deletion of retired files comes after
+                // the merge committed: the step returns success (the files
+                // are listed obsolete and go at the next open).
+                try testing.expect(out.crashed or sim.crashed);
+                holes += sim.holes_punched;
+                verifyStepsWith(&sim, steps, out, options) catch |e| {
+                    std.debug.print(
+                        "{s} sweep FAILED: mode={t} seed={d} crash_point={d}/{d} completed_steps={d}\n",
+                        .{ label, mode, seed, point, total, out.completed },
+                    );
+                    return e;
+                };
+            }
+        }
+    }
+    return holes;
+}
+
+test "fault-injection sweep: multi-file — migration, rotations and merges" {
+    // Teeth: the uncrashed run really became a multi-file store.
+    {
+        var sim = SimStorage.init(testing.allocator);
+        defer sim.deinit();
+        _ = runStepsWith(&sim, &script, multi_options);
+        const m = sim.fileContent(db_name).?;
+        try testing.expectEqual(@as(u32, 3), std.mem.readInt(u32, m[4..8], .little));
+        // The migrated legacy file was retired by the first merge.
+        try testing.expect(sim.fileContent(db_name ++ ".0.data") == null);
+    }
+    try testing.expect(try sweepAll(&script, multi_options, "multi-file") > 0);
+}
+
+test "fault-injection sweep: multi-file expiry workload" {
+    _ = try sweepAll(&expiry_script, multi_options, "multi-file expiry");
 }
 
 test "fault-injection sweep: non-contiguous (reordered) unsynced persistence" {

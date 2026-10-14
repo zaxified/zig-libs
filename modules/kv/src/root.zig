@@ -2,9 +2,11 @@
 
 //! kv — embedded, crash-consistent key-value store (Bitcask-style log).
 //!
-//! One append-only data file of length-prefixed, CRC-checked records
-//! (`put` / `del`), plus an in-memory **keydir** mapping each live key to the
-//! offset of its latest record. `open` replays the log to rebuild the keydir;
+//! Append-only data files of length-prefixed, CRC-checked records
+//! (`put` / `del`) — one file until it reaches `Options.max_file_size`, then
+//! sealed files plus an active one listed by a manifest — and an in-memory
+//! **keydir** mapping each live key to the file and offset of its latest
+//! record. `open` replays the log to rebuild the keydir;
 //! `get` reads the value back from the file (re-verifying the record CRC by
 //! default — corrupt data is *never* served). `compact` rewrites live entries
 //! into a fresh file and swaps it in atomically (temp + fsync + rename + dir
@@ -176,7 +178,20 @@ const RwLock = struct {
 const file_magic = "ZKVL";
 const version_plain: u32 = 1;
 const version_expiry: u32 = 2;
+/// The multi-file store's manifest at `<path>` (see SPEC § "Multi-file log").
+/// Carries the data-file magic on purpose: a build that knows only versions
+/// 1–2 refuses it with `UnsupportedVersion` instead of taking it for a data
+/// file and silently missing every record in the other files.
+const version_manifest: u32 = 3;
 const header_len = 8;
+/// `DataFile.id` of a single-file (version 1/2) store's data file, which is
+/// `<path>` itself. A migrated store calls that file id 0, `<path>.0.data`.
+const legacy_id: u32 = std.math.maxInt(u32);
+/// A manifest larger than this is not one this module wrote.
+const max_manifest_len = 1 << 24;
+
+/// `Options.max_file_size`'s default — Bitcask's `max_file_size`.
+pub const default_max_file_size: u64 = 2 << 30;
 const rec_fixed = 13;
 const exp_len = 8;
 
@@ -945,6 +960,13 @@ pub const Options = struct {
     /// Monotonic ms source for `SyncPolicy.interval_ms`; read by no other
     /// policy.
     sync_clock: Clock = .monotonic,
+
+    /// An append that would take the active data file past this many bytes
+    /// first seals it and starts a new one (Bitcask's `max_file_size`); a
+    /// record larger than this gets a file of its own. The first rotation of
+    /// a single-file store turns it into a multi-file store — see SPEC
+    /// § "Multi-file log".
+    max_file_size: u64 = default_max_file_size,
 };
 
 /// A key's expiry, as `expiresAt` reports it.
@@ -1016,20 +1038,30 @@ pub const CompactError = MutateError || error{Corrupt};
 pub const Db = struct {
     gpa: Allocator,
     store: Storage,
-    file: Storage.Handle,
-    /// Owned copies of the data-file path, the compaction temp path and the
-    /// cross-process lock sidecar path.
+    /// Data files in replay order; the last is the active one, every other
+    /// is sealed (synced, never written again). Each is heap-allocated so
+    /// keydir entries can point at it.
+    files: std.ArrayListUnmanaged(*DataFile),
+    /// `<path>` holds a manifest (version 3), not a data file.
+    multi: bool,
+    /// Id the next new data file gets (multi-file stores; never reused).
+    next_file_id: u32,
+    /// Retired data-file ids whose deletion failed; the next manifest still
+    /// lists them as obsolete, so a later `open` retries.
+    obsolete: std.ArrayListUnmanaged(u32),
+    /// Owned copies of the store path (data file or manifest), the
+    /// single-file compaction temp, the manifest temp and the cross-process
+    /// lock sidecar path.
     path: []u8,
     tmp_path: []u8,
+    manifest_tmp: []u8,
     lock_path: []u8,
     /// Handle of the held `<path>.lock` sidecar, or null with
     /// `LockPolicy.none`. Closing it releases the advisory lock.
     lock_file: ?Storage.Handle,
     keydir: std.StringHashMapUnmanaged(Entry),
-    /// Append offset == length of the valid prefix of the data file.
-    end: u64,
-    /// Bytes occupied by overwritten/deleted records (compaction would
-    /// reclaim this much).
+    /// Bytes occupied by overwritten/deleted records, all files (compaction
+    /// would reclaim this much).
     dead_bytes: u64,
     poisoned: bool,
     /// Serializes writers (`put`, `delete`, `compact`, `sync`) for their
@@ -1040,9 +1072,6 @@ pub const Db = struct {
     /// across a write or an fsync.
     rw: RwLock,
     options: Options,
-    /// On-disk format version of the open data file: `version_plain` until
-    /// the first expiring put upgrades it (see the format comment).
-    version: u32,
     /// Keydir entries that carry an expiry. While it is 0 no operation reads
     /// the clock and `count` stays O(1).
     expiring: usize,
@@ -1052,8 +1081,27 @@ pub const Db = struct {
     /// `Options.sync_clock` at the last data-file sync (`.interval_ms` only).
     last_sync_ms: i64,
 
+    /// One data file. `size` is the valid prefix (= the append offset of the
+    /// active file); the counters describe the records in it, for merge
+    /// planning.
+    pub const DataFile = struct {
+        id: u32,
+        handle: Storage.Handle,
+        size: u64,
+        /// Format version in its header: `version_plain` or `version_expiry`.
+        version: u32,
+        /// Bytes / count of records the keydir points at.
+        live_bytes: u64 = 0,
+        live_keys: u64 = 0,
+        /// Bytes / count of superseded records, tombstones and expired records.
+        dead_bytes: u64 = 0,
+        dead_keys: u64 = 0,
+    };
+
     const Entry = struct {
-        /// Absolute file offset of the record.
+        /// The data file holding the record.
+        file: *DataFile,
+        /// Absolute offset of the record in `file`.
         off: u64,
         key_len: u32,
         val_len: u32,
@@ -1096,19 +1144,21 @@ pub const Db = struct {
         var self = Db{
             .gpa = gpa,
             .store = store,
-            .file = undefined,
+            .files = .empty,
+            .multi = false,
+            .next_file_id = 1,
+            .obsolete = .empty,
             .path = try gpa.dupe(u8, path),
             .tmp_path = undefined,
+            .manifest_tmp = undefined,
             .lock_path = undefined,
             .lock_file = null,
             .keydir = .empty,
-            .end = header_len,
             .dead_bytes = 0,
             .poisoned = false,
             .lock = .{ .io = store.io },
             .rw = .{ .io = store.io },
             .options = options,
-            .version = version_plain,
             .expiring = 0,
             .unsynced = false,
             .last_sync_ms = if (options.sync == .interval_ms) options.sync_clock.now() else 0,
@@ -1116,6 +1166,8 @@ pub const Db = struct {
         errdefer gpa.free(self.path);
         self.tmp_path = try std.fmt.allocPrint(gpa, "{s}.compact", .{path});
         errdefer gpa.free(self.tmp_path);
+        self.manifest_tmp = try std.fmt.allocPrint(gpa, "{s}.manifest", .{path});
+        errdefer gpa.free(self.manifest_tmp);
         self.lock_path = try std.fmt.allocPrint(gpa, "{s}.lock", .{path});
         errdefer gpa.free(self.lock_path);
 
@@ -1141,41 +1193,227 @@ pub const Db = struct {
 
         // A crash mid-compaction may leave a temp file behind; it is dead
         // weight (the swap either fully happened or the old file stands).
-        store.delete(self.tmp_path) catch |e| switch (e) {
-            error.FileNotFound => {},
-            else => return e,
-        };
+        try deleteIfPresent(store, self.tmp_path);
 
-        self.file = try store.open(path, .open_or_create);
-        errdefer store.close(self.file);
+        errdefer self.freeFiles();
         errdefer self.freeKeydir();
+        errdefer self.obsolete.deinit(gpa);
 
-        const file_size = try store.size(self.file);
+        var h = try store.open(path, .open_or_create);
+        var h_owned = true;
+        defer if (h_owned) store.close(h);
+        var file_size = try store.size(h);
+        if (file_size < header_len and try self.resumeMigration()) {
+            // A crash between the two renames of a migration (see
+            // `rotateLocked`) left no `<path>`; the manifest is now there.
+            store.close(h);
+            h = try store.open(path, .open_or_create);
+            file_size = try store.size(h);
+        }
         if (file_size < header_len) {
             // Empty file — or the torn remnant of a crashed creation. Only
             // adopt it if what IS there is a prefix of our own header.
             var have: [header_len]u8 = undefined;
-            const n = try store.pread(self.file, have[0..@intCast(file_size)], 0);
+            const n = try store.pread(h, have[0..@intCast(file_size)], 0);
             var want: [header_len]u8 = undefined;
-            want[0..4].* = file_magic.*;
-            std.mem.writeInt(u32, want[4..8], version_plain, .little);
+            writeHeader(&want, version_plain);
             if (!std.mem.eql(u8, have[0..n], want[0..n])) return error.NotAKvFile;
-            if (file_size != 0) try store.truncate(self.file, 0);
-            try store.writeAll(self.file, &want, 0);
-            try store.sync(self.file);
+            if (file_size != 0) try store.truncate(h, 0);
+            try store.writeAll(h, &want, 0);
+            try store.sync(h);
+            try self.adoptFile(legacy_id, h, version_plain);
+            h_owned = false;
+            self.active().size = header_len;
         } else {
             var hdr: [header_len]u8 = undefined;
-            try store.preadFull(self.file, &hdr, 0);
+            try store.preadFull(h, &hdr, 0);
             if (!std.mem.eql(u8, hdr[0..4], file_magic)) return error.NotAKvFile;
-            self.version = std.mem.readInt(u32, hdr[4..8], .little);
-            if (self.version != version_plain and self.version != version_expiry)
-                return error.UnsupportedVersion;
-            try self.replay(file_size);
+            const version = std.mem.readInt(u32, hdr[4..8], .little);
+            switch (version) {
+                version_plain, version_expiry => {
+                    // A migration that crashed before its first rename.
+                    try deleteIfPresent(store, self.manifest_tmp);
+                    try self.adoptFile(legacy_id, h, version);
+                    h_owned = false;
+                    try self.replay(self.active(), file_size, true);
+                },
+                version_manifest => {
+                    try self.loadManifest(h, file_size);
+                },
+                else => return error.UnsupportedVersion,
+            }
         }
-        // Make the file's very existence durable (creation + any recovery
+        // Make the files' very existence durable (creation + any recovery
         // truncation above are meaningless if the directory entry is lost).
         try store.syncDir();
         return self;
+    }
+
+    fn deleteIfPresent(store: Storage, path: []const u8) Storage.Error!void {
+        store.delete(path) catch |e| switch (e) {
+            error.FileNotFound => {},
+            else => return e,
+        };
+    }
+
+    fn writeHeader(buf: *[header_len]u8, version: u32) void {
+        buf[0..4].* = file_magic.*;
+        std.mem.writeInt(u32, buf[4..8], version, .little);
+    }
+
+    /// Append a data file to the table (it becomes the active one).
+    fn adoptFile(self: *Db, id: u32, h: Storage.Handle, version: u32) Allocator.Error!void {
+        try self.files.ensureUnusedCapacity(self.gpa, 1);
+        const df = try self.gpa.create(DataFile);
+        df.* = .{ .id = id, .handle = h, .size = header_len, .version = version };
+        self.files.appendAssumeCapacity(df);
+    }
+
+    pub fn active(self: *Db) *DataFile {
+        return self.files.items[self.files.items.len - 1];
+    }
+
+    /// Name of data file `id` (or of its hint), caller frees.
+    fn fileName(self: *Db, id: u32, comptime ext: []const u8) Allocator.Error![]u8 {
+        if (id == legacy_id) return self.gpa.dupe(u8, self.path);
+        return std.fmt.allocPrint(self.gpa, "{s}.{d}." ++ ext, .{ self.path, id });
+    }
+
+    /// `<path>` is missing but `<path>.0.data` exists: a migration crashed
+    /// between its renames. Finish it from the synced manifest temp.
+    fn resumeMigration(self: *Db) OpenError!bool {
+        const data0 = try self.fileName(0, "data");
+        defer self.gpa.free(data0);
+        const probe = self.store.open(data0, .read_only) catch |e| switch (e) {
+            error.FileNotFound => return false,
+            else => return e,
+        };
+        self.store.close(probe);
+        self.store.rename(self.manifest_tmp, self.path) catch |e| switch (e) {
+            // The temp is written and synced before the first rename, so a
+            // `.0.data` without it is not a state this module leaves.
+            error.FileNotFound => return error.Corrupt,
+            else => return e,
+        };
+        try self.store.syncDir();
+        return true;
+    }
+
+    /// Manifest layout (after the 8-byte header): next_file_id u32, n_files
+    /// u32, n_obsolete u32, file ids [n_files]u32 in replay order (active
+    /// last), obsolete ids [n_obsolete]u32, crc32 u32 over every byte before
+    /// it. Written only by `writeManifest` (temp + sync + rename + dir sync),
+    /// so it is never torn; a bad CRC is corruption.
+    fn loadManifest(self: *Db, h: Storage.Handle, size: u64) OpenError!void {
+        if (size > max_manifest_len or size < header_len + 16) return error.Corrupt;
+        const buf = try self.gpa.alloc(u8, @intCast(size));
+        defer self.gpa.free(buf);
+        try self.store.preadFull(h, buf, 0);
+        const body_end = buf.len - 4;
+        if (std.hash.Crc32.hash(buf[0..body_end]) != std.mem.readInt(u32, buf[body_end..][0..4], .little))
+            return error.Corrupt;
+        const next_id = std.mem.readInt(u32, buf[8..12], .little);
+        const n_files = std.mem.readInt(u32, buf[12..16], .little);
+        const n_obsolete = std.mem.readInt(u32, buf[16..20], .little);
+        if (n_files == 0 or (@as(u64, n_files) + n_obsolete) * 4 != body_end - 20) return error.Corrupt;
+        const ids = buf[20..][0 .. n_files * 4];
+        const obs = buf[20 + n_files * 4 ..][0 .. n_obsolete * 4];
+        self.multi = true;
+        self.next_file_id = next_id;
+
+        try deleteIfPresent(self.store, self.manifest_tmp);
+        // Files a finished merge retired, and files a crashed rotation or
+        // merge created past `next_file_id` before naming them: never part
+        // of the store, so delete them (named probes — never a listing).
+        var i: usize = 0;
+        while (i < n_obsolete) : (i += 1) _ = try self.deleteDataFile(std.mem.readInt(u32, obs[i * 4 ..][0..4], .little));
+        var stray = next_id;
+        while (try self.deleteDataFile(stray)) stray += 1;
+
+        i = 0;
+        while (i < n_files) : (i += 1) {
+            const id = std.mem.readInt(u32, ids[i * 4 ..][0..4], .little);
+            if (id >= next_id) return error.Corrupt;
+            const name = try self.fileName(id, "data");
+            defer self.gpa.free(name);
+            const last = i + 1 == n_files;
+            const fh = try self.store.open(name, .open_or_create);
+            const fsize = self.store.size(fh) catch |e| {
+                self.store.close(fh);
+                return e;
+            };
+            var hdr: [header_len]u8 = undefined;
+            const ok = fsize >= header_len and blk: {
+                self.store.preadFull(fh, &hdr, 0) catch |e| {
+                    self.store.close(fh);
+                    return e;
+                };
+                break :blk std.mem.eql(u8, hdr[0..4], file_magic);
+            };
+            const version = if (ok) std.mem.readInt(u32, hdr[4..8], .little) else 0;
+            if (!ok or (version != version_plain and version != version_expiry)) {
+                // Every listed file was created and synced, header included,
+                // before a manifest named it.
+                self.store.close(fh);
+                return error.Corrupt;
+            }
+            self.adoptFile(id, fh, version) catch |e| {
+                self.store.close(fh);
+                return e;
+            };
+            // A sealed file was synced before the next one was started, so a
+            // bad record in it is rot, refused; only the active file may have
+            // a torn tail to cut.
+            try self.replay(self.active(), fsize, last);
+        }
+    }
+
+    /// Delete data file `id` and its hint; false when the data file was not
+    /// there.
+    fn deleteDataFile(self: *Db, id: u32) (Allocator.Error || Storage.Error)!bool {
+        const hint = try self.fileName(id, "hint");
+        defer self.gpa.free(hint);
+        try deleteIfPresent(self.store, hint);
+        const data = try self.fileName(id, "data");
+        defer self.gpa.free(data);
+        self.store.delete(data) catch |e| switch (e) {
+            error.FileNotFound => return false,
+            else => return e,
+        };
+        return true;
+    }
+
+    /// Write the manifest for `ids` (replay order) atomically: temp, sync,
+    /// rename over `<path>`, directory sync. The caller poisons on error.
+    fn writeManifest(self: *Db, ids: []const u32, next_id: u32) (Allocator.Error || Storage.Error)!void {
+        try self.writeManifestTemp(ids, next_id);
+        try self.store.rename(self.manifest_tmp, self.path);
+        try self.store.syncDir();
+    }
+
+    /// The manifest for `ids` into the synced temp `<path>.manifest`.
+    fn writeManifestTemp(self: *Db, ids: []const u32, next_id: u32) (Allocator.Error || Storage.Error)!void {
+        const len = header_len + 12 + (ids.len + self.obsolete.items.len) * 4 + 4;
+        const buf = try self.gpa.alloc(u8, len);
+        defer self.gpa.free(buf);
+        writeHeader(buf[0..header_len], version_manifest);
+        std.mem.writeInt(u32, buf[8..12], next_id, .little);
+        std.mem.writeInt(u32, buf[12..16], @intCast(ids.len), .little);
+        std.mem.writeInt(u32, buf[16..20], @intCast(self.obsolete.items.len), .little);
+        var off: usize = 20;
+        for (ids) |id| {
+            std.mem.writeInt(u32, buf[off..][0..4], id, .little);
+            off += 4;
+        }
+        for (self.obsolete.items) |id| {
+            std.mem.writeInt(u32, buf[off..][0..4], id, .little);
+            off += 4;
+        }
+        std.mem.writeInt(u32, buf[off..][0..4], std.hash.Crc32.hash(buf[0..off]), .little);
+        const t = try self.store.open(self.manifest_tmp, .create_truncate);
+        defer self.store.close(t);
+        try self.store.writeAll(t, buf, 0);
+        try self.store.sync(t);
     }
 
     /// Close the store and free all memory. Under `SyncPolicy.always` there
@@ -1185,14 +1423,24 @@ pub const Db = struct {
     /// the handle that holds it, the same mechanism the kernel applies when
     /// the process dies, so there is no path where a lock outlives its `Db`.
     pub fn close(self: *Db) void {
-        if (self.unsynced and !self.poisoned) self.store.sync(self.file) catch {};
-        self.store.close(self.file);
+        if (self.unsynced and !self.poisoned) self.store.sync(self.active().handle) catch {};
+        self.freeFiles();
         if (self.lock_file) |lh| self.store.close(lh);
         self.freeKeydir();
+        self.obsolete.deinit(self.gpa);
         self.gpa.free(self.path);
         self.gpa.free(self.tmp_path);
+        self.gpa.free(self.manifest_tmp);
         self.gpa.free(self.lock_path);
         self.* = undefined;
+    }
+
+    fn freeFiles(self: *Db) void {
+        for (self.files.items) |df| {
+            self.store.close(df.handle);
+            self.gpa.destroy(df);
+        }
+        self.files.deinit(self.gpa);
     }
 
     /// Insert or overwrite `key`. Under `SyncPolicy.always` (the default)
@@ -1225,7 +1473,12 @@ pub const Db = struct {
         // `no_expiry` is the keydir's marker, not an instant; a key living to
         // the end of i64 time is a key without expiry.
         if (expires_at_ms == no_expiry) return self.putLocked(key, value, no_expiry);
-        if (self.version < version_expiry) try self.compactLocked(version_expiry);
+        if (self.active().version < version_expiry) {
+            // Only a single-file store can still be at version 1: every data
+            // file a multi-file store creates is version 2.
+            std.debug.assert(!self.multi);
+            try self.compactLocked(version_expiry);
+        }
         return self.putLocked(key, value, expires_at_ms);
     }
 
@@ -1242,7 +1495,7 @@ pub const Db = struct {
         if (key.len > std.math.maxInt(u32)) return error.KeyTooLong;
         if (value.len > std.math.maxInt(u32)) return error.ValueTooLong;
         const expires = expires_at != no_expiry;
-        std.debug.assert(!expires or self.version >= version_expiry);
+        std.debug.assert(!expires or self.active().version >= version_expiry);
 
         const rec_len: usize = @intCast(recordLenExp(expires, key.len, value.len));
         const rec = try self.gpa.alloc(u8, rec_len);
@@ -1269,20 +1522,42 @@ pub const Db = struct {
         // the previous value meanwhile, and never see this one before the
         // policy made it durable. `existing` stays valid — only writers,
         // serialized by `lock`, change the map.
-        try self.appendLocked(rec);
+        const off = try self.appendLocked(rec);
 
         self.rw.lock();
         defer self.rw.unlock();
-        const entry = Entry{ .off = self.end, .key_len = @intCast(key.len), .val_len = @intCast(value.len), .expires_at = expires_at };
+        const entry = Entry{ .file = self.active(), .off = off, .key_len = @intCast(key.len), .val_len = @intCast(value.len), .expires_at = expires_at };
         if (existing) |e| {
-            self.dead_bytes += e.recLen();
+            self.supersede(e.*);
             if (e.expires()) self.expiring -= 1;
             e.* = entry;
         } else {
             self.keydir.putAssumeCapacity(new_key.?, entry);
         }
+        self.addLive(entry);
         if (expires) self.expiring += 1;
-        self.end += rec_len;
+    }
+
+    /// Account `e` as no longer pointed at (overwritten or deleted).
+    fn supersede(self: *Db, e: Entry) void {
+        const len = e.recLen();
+        e.file.live_bytes -= len;
+        e.file.live_keys -= 1;
+        e.file.dead_bytes += len;
+        e.file.dead_keys += 1;
+        self.dead_bytes += len;
+    }
+
+    fn addLive(_: *Db, e: Entry) void {
+        e.file.live_bytes += e.recLen();
+        e.file.live_keys += 1;
+    }
+
+    /// Account a record that never was live (tombstone, expired at replay).
+    fn addDead(self: *Db, df: *DataFile, len: u64) void {
+        df.dead_bytes += len;
+        df.dead_keys += 1;
+        self.dead_bytes += len;
     }
 
     /// Delete `key` (append a durable tombstone). Deleting an absent key is
@@ -1301,25 +1576,34 @@ pub const Db = struct {
         defer self.gpa.free(rec);
         encodeRecord(rec, op_del, key, "");
 
-        try self.appendLocked(rec);
+        _ = try self.appendLocked(rec);
 
         self.rw.lock();
         defer self.rw.unlock();
-        self.dead_bytes += existing.recLen() + rec_len;
+        self.supersede(existing.*);
+        self.addDead(self.active(), rec_len);
         if (existing.expires()) self.expiring -= 1;
         const kv = self.keydir.fetchRemove(key).?;
         self.gpa.free(@constCast(kv.key));
-        self.end += rec_len;
     }
 
     /// Append `rec` at the end of the log and sync it as `Options.sync`
     /// says. Poisons the store on any storage error. Caller holds the lock
     /// and advances `end` afterwards.
-    fn appendLocked(self: *Db, rec: []const u8) MutateError!void {
-        self.store.writeAll(self.file, rec, self.end) catch |e| {
+    /// Returns the record's offset in the (possibly new) active file.
+    fn appendLocked(self: *Db, rec: []const u8) MutateError!u64 {
+        if (self.active().size > header_len and self.active().size + rec.len > self.options.max_file_size)
+            self.rotateLocked() catch |e| {
+                self.poisoned = true;
+                return e;
+            };
+        const act = self.active();
+        const off = act.size;
+        self.store.writeAll(act.handle, rec, off) catch |e| {
             self.poisoned = true;
             return e;
         };
+        act.size += rec.len;
         self.unsynced = true;
         const due = switch (self.options.sync) {
             .always => true,
@@ -1327,10 +1611,70 @@ pub const Db = struct {
             .interval_ms => |ms| self.options.sync_clock.now() -| self.last_sync_ms >= ms,
         };
         if (due) try self.syncLocked();
+        return off;
+    }
+
+    /// Seal the active file and start a new one. A single-file store becomes
+    /// a multi-file one here (migration). Caller holds the writer lock and
+    /// poisons on error: the namespace may be half-changed until reopen.
+    fn rotateLocked(self: *Db) (Allocator.Error || Storage.Error)!void {
+        // Seal: everything in the old file durable before a newer file can
+        // exist — what lets `open` treat a bad record in a sealed file as rot.
+        try self.store.sync(self.active().handle);
+        self.markSynced();
+
+        // Memory first: once the manifest names the new file, nothing may
+        // fail to reflect it.
+        try self.files.ensureUnusedCapacity(self.gpa, 1);
+        const df = try self.gpa.create(DataFile);
+        var df_owned = true;
+        defer if (df_owned) self.gpa.destroy(df);
+
+        const id = self.next_file_id;
+        const name = try self.fileName(id, "data");
+        defer self.gpa.free(name);
+        const h = try self.store.open(name, .create_truncate);
+        var h_owned = true;
+        defer if (h_owned) self.store.close(h);
+        var hdr: [header_len]u8 = undefined;
+        writeHeader(&hdr, version_expiry);
+        try self.store.writeAll(h, &hdr, 0);
+        try self.store.sync(h);
+
+        const ids = try self.gpa.alloc(u32, self.files.items.len + 1);
+        defer self.gpa.free(ids);
+        for (self.files.items, 0..) |f, i| ids[i] = if (f.id == legacy_id) 0 else f.id;
+        ids[ids.len - 1] = id;
+        if (!self.multi) {
+            // Migration: the legacy data file becomes `<path>.0.data` and a
+            // manifest takes `<path>`. The manifest temp is complete and
+            // synced before the first rename, and the directory is synced
+            // between the renames, so a crash leaves either the single-file
+            // store or a `<path>.0.data` + temp that `open` finishes.
+            try self.writeManifestTemp(ids, id + 1);
+            const data0 = try self.fileName(0, "data");
+            defer self.gpa.free(data0);
+            try self.store.rename(self.path, data0);
+            try self.store.syncDir();
+            try self.store.rename(self.manifest_tmp, self.path);
+            try self.store.syncDir();
+        } else {
+            try self.writeManifest(ids, id + 1);
+        }
+
+        self.rw.lock();
+        defer self.rw.unlock();
+        if (!self.multi) self.files.items[0].id = 0;
+        self.multi = true;
+        self.next_file_id = id + 1;
+        df.* = .{ .id = id, .handle = h, .size = header_len, .version = version_expiry };
+        self.files.appendAssumeCapacity(df);
+        df_owned = false;
+        h_owned = false;
     }
 
     fn syncLocked(self: *Db) MutateError!void {
-        self.store.sync(self.file) catch |e| {
+        self.store.sync(self.active().handle) catch |e| {
             self.poisoned = true;
             return e;
         };
@@ -1419,14 +1763,14 @@ pub const Db = struct {
         const val_off = key_off + e.key_len;
 
         if (!self.options.read_verify) {
-            return self.store.preadFull(self.file, value, val_off);
+            return self.store.preadFull(e.file.handle, value, val_off);
         }
 
         // Full-record verification: header fields must match the keydir and
         // the CRC must hold over op+lens[+expiry]+key+value.
         var hdr: [rec_fixed + exp_len]u8 = undefined;
         const hdr_len: usize = @intCast(key_off - e.off);
-        try self.store.preadFull(self.file, hdr[0..hdr_len], e.off);
+        try self.store.preadFull(e.file.handle, hdr[0..hdr_len], e.off);
         if (hdr[4] != (if (e.expires()) op_put_exp else op_put) or
             std.mem.readInt(u32, hdr[5..9], .little) != e.key_len or
             std.mem.readInt(u32, hdr[9..13], .little) != e.val_len)
@@ -1440,12 +1784,12 @@ pub const Db = struct {
         var koff: u64 = 0;
         while (koff < e.key_len) {
             const n: usize = @intCast(@min(kbuf.len, e.key_len - koff));
-            try self.store.preadFull(self.file, kbuf[0..n], key_off + koff);
+            try self.store.preadFull(e.file.handle, kbuf[0..n], key_off + koff);
             if (!std.mem.eql(u8, kbuf[0..n], key[@intCast(koff)..][0..n])) return error.Corrupt;
             crc.update(kbuf[0..n]);
             koff += n;
         }
-        try self.store.preadFull(self.file, value, val_off);
+        try self.store.preadFull(e.file.handle, value, val_off);
         crc.update(value);
         if (crc.final() != std.mem.readInt(u32, hdr[0..4], .little)) return error.Corrupt;
     }
@@ -1517,27 +1861,35 @@ pub const Db = struct {
         return dead;
     }
 
-    /// Rewrite live records into a fresh file and atomically swap it in
-    /// (temp + fsync + rename + dir fsync). A crash anywhere before the
-    /// rename leaves the old file untouched; from the rename on, either the
-    /// old or the complete new file is what `open` finds — never a mix.
-    /// Errors before the rename leave the store fully usable (the temp is
-    /// discarded); errors at/after the rename poison the store (the
-    /// namespace state is uncertain until reopen). Expired keys are left out
-    /// of the new file and dropped from memory.
+    /// Rewrite the live records into fresh files and swap them in
+    /// atomically; expired keys are left out and dropped from memory.
+    ///
+    /// Single-file store: one new file, temp + fsync + rename over `<path>`
+    /// + dir fsync. Multi-file store: new data files (split at
+    /// `max_file_size`), each synced, then one manifest naming them and
+    /// listing the old files as obsolete, then the old files are deleted.
+    /// Either way a crash before the swap leaves the old store untouched and
+    /// from the swap on `open` finds the complete new one — never a mix.
+    /// Errors before the swap leave the store fully usable (the new files
+    /// are discarded); errors at/after it poison the store (the namespace
+    /// state is uncertain until reopen).
     pub fn compact(self: *Db) CompactError!void {
         self.lock.acquire();
         defer self.lock.release();
         if (self.poisoned) return error.Poisoned;
-        return self.compactLocked(self.version);
+        if (self.multi) return self.mergeAllLocked();
+        return self.compactLocked(self.active().version);
     }
 
-    /// `compact` writing the new file at format `version`. Caller holds the
-    /// lock and has checked `poisoned`.
+    /// Single-file `compact` writing the new file at format `version`.
+    /// Caller holds the writer lock and has checked `poisoned`.
     fn compactLocked(self: *Db, version: u32) CompactError!void {
-        const NewOff = struct { e: *Entry, off: u64 };
-        var moves: std.ArrayListUnmanaged(NewOff) = .empty;
+        std.debug.assert(!self.multi);
+        const act = self.active();
+        var moves: std.ArrayListUnmanaged(*Entry) = .empty;
         defer moves.deinit(self.gpa);
+        const new_offs = try self.gpa.alloc(u64, self.keydir.count());
+        defer self.gpa.free(new_offs);
         try moves.ensureTotalCapacity(self.gpa, self.keydir.count());
         // Expired keys: left out of the new file, removed from the keydir
         // only once the new file is in place.
@@ -1553,11 +1905,11 @@ pub const Db = struct {
         };
 
         var hdr: [header_len]u8 = undefined;
-        hdr[0..4].* = file_magic.*;
-        std.mem.writeInt(u32, hdr[4..8], version, .little);
+        writeHeader(&hdr, version);
         try self.store.writeAll(tmp, &hdr, 0);
 
         var new_end: u64 = header_len;
+        var live_bytes: u64 = 0;
         var it = self.keydir.iterator();
         while (it.next()) |kv| {
             const e = kv.value_ptr;
@@ -1565,16 +1917,11 @@ pub const Db = struct {
                 try expired.append(self.gpa, kv.key_ptr.*);
                 continue;
             }
-            const rec_len: usize = @intCast(e.recLen());
-            const rec = try self.gpa.alloc(u8, rec_len);
-            defer self.gpa.free(rec);
-            try self.store.preadFull(self.file, rec, e.off);
-            // Copy records verbatim (CRC stays valid) — but never copy rot.
-            if (std.hash.Crc32.hash(rec[4..]) != std.mem.readInt(u32, rec[0..4], .little))
-                return error.Corrupt;
-            try self.store.writeAll(tmp, rec, new_end);
-            moves.appendAssumeCapacity(.{ .e = e, .off = new_end });
-            new_end += rec_len;
+            const len = try self.copyRecord(e.*, tmp, new_end);
+            new_offs[moves.items.len] = new_end;
+            moves.appendAssumeCapacity(e);
+            new_end += len;
+            live_bytes += len;
         }
         try self.store.sync(tmp);
 
@@ -1589,13 +1936,13 @@ pub const Db = struct {
 
         // The temp handle IS the new data file (rename moved the name, not
         // the file). Point the keydir at the new offsets — with no reader
-        // inside, since readers pread through `self.file`.
+        // inside, since readers pread through the entry's file.
         self.rw.lock();
         defer self.rw.unlock();
-        self.store.close(self.file);
-        self.file = tmp;
+        self.store.close(act.handle);
+        act.handle = tmp;
         swapped = true;
-        for (moves.items) |m| m.e.off = m.off;
+        for (moves.items, new_offs[0..moves.items.len]) |e, off| e.off = off;
         // Removal leaves the other entries in place (no rehash), so the
         // pointers above stayed valid; drop the expired ones only now.
         for (expired.items) |k| {
@@ -1603,11 +1950,148 @@ pub const Db = struct {
             self.gpa.free(@constCast(kv.key));
             self.expiring -= 1;
         }
-        self.end = new_end;
+        act.* = .{ .id = act.id, .handle = tmp, .size = new_end, .version = version, .live_bytes = live_bytes, .live_keys = moves.items.len };
         self.dead_bytes = 0;
-        self.version = version;
         // The new file was synced before the rename: a durability barrier.
         self.markSynced();
+    }
+
+    /// Copy `e`'s record verbatim (its CRC stays valid) to `dst` at `off`,
+    /// refusing to copy rot. Returns its length.
+    fn copyRecord(self: *Db, e: Entry, dst: Storage.Handle, off: u64) CompactError!u64 {
+        const len: usize = @intCast(e.recLen());
+        const rec = try self.gpa.alloc(u8, len);
+        defer self.gpa.free(rec);
+        try self.store.preadFull(e.file.handle, rec, e.off);
+        if (std.hash.Crc32.hash(rec[4..]) != std.mem.readInt(u32, rec[0..4], .little))
+            return error.Corrupt;
+        try self.store.writeAll(dst, rec, off);
+        return len;
+    }
+
+    /// Multi-file `compact`: every live record into new files. Caller holds
+    /// the writer lock and has checked `poisoned`.
+    fn mergeAllLocked(self: *Db) CompactError!void {
+        std.debug.assert(self.multi);
+        const Move = struct { e: *Entry, file: *DataFile, off: u64 };
+        var moves: std.ArrayListUnmanaged(Move) = .empty;
+        defer moves.deinit(self.gpa);
+        try moves.ensureTotalCapacity(self.gpa, self.keydir.count());
+        var expired: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer expired.deinit(self.gpa);
+        const now: i64 = if (self.expiring == 0) 0 else self.options.clock.now();
+
+        // New files, in order; on any error before the manifest swap they
+        // are closed and deleted, and the store is as it was.
+        var outs: std.ArrayListUnmanaged(*DataFile) = .empty;
+        defer outs.deinit(self.gpa);
+        var swapped = false;
+        // From the manifest rename on, the outputs may be what `<path>`
+        // names: an error there leaves them in place (the store is poisoned
+        // and the next `open` decides from the manifest it finds).
+        var named = false;
+        defer if (!swapped) for (outs.items) |df| {
+            self.store.close(df.handle);
+            if (!named) _ = self.deleteDataFile(df.id) catch {};
+            self.gpa.destroy(df);
+        };
+        try self.startOutput(&outs, self.next_file_id);
+
+        var it = self.keydir.iterator();
+        while (it.next()) |kv| {
+            const e = kv.value_ptr;
+            if (!e.liveAt(now)) {
+                try expired.append(self.gpa, kv.key_ptr.*);
+                continue;
+            }
+            var out = outs.items[outs.items.len - 1];
+            if (out.size > header_len and out.size + e.recLen() > self.options.max_file_size) {
+                try self.store.sync(out.handle);
+                try self.startOutput(&outs, out.id + 1);
+                out = outs.items[outs.items.len - 1];
+            }
+            const len = try self.copyRecord(e.*, out.handle, out.size);
+            moves.appendAssumeCapacity(.{ .e = e, .file = out, .off = out.size });
+            out.size += len;
+            out.live_bytes += len;
+            out.live_keys += 1;
+        }
+        const last = outs.items[outs.items.len - 1];
+        try self.store.sync(last.handle);
+
+        const ids = try self.gpa.alloc(u32, outs.items.len);
+        defer self.gpa.free(ids);
+        for (outs.items, ids) |df, *id| id.* = df.id;
+        const n_old = self.files.items.len;
+        try self.obsolete.ensureUnusedCapacity(self.gpa, n_old);
+        try self.files.ensureTotalCapacity(self.gpa, outs.items.len);
+        const old = try self.gpa.dupe(*DataFile, self.files.items);
+        defer self.gpa.free(old);
+        for (old) |df| self.obsolete.appendAssumeCapacity(df.id);
+        self.writeManifestTemp(ids, last.id + 1) catch |e| {
+            self.obsolete.shrinkRetainingCapacity(self.obsolete.items.len - old.len);
+            return e;
+        };
+        named = true;
+        self.store.rename(self.manifest_tmp, self.path) catch |e| {
+            self.poisoned = true;
+            return e;
+        };
+        self.store.syncDir() catch |e| {
+            self.poisoned = true;
+            return e;
+        };
+
+        {
+            self.rw.lock();
+            defer self.rw.unlock();
+            swapped = true;
+            for (moves.items) |m| {
+                m.e.file = m.file;
+                m.e.off = m.off;
+            }
+            for (expired.items) |k| {
+                const kv = self.keydir.fetchRemove(k).?;
+                self.gpa.free(@constCast(kv.key));
+                self.expiring -= 1;
+            }
+            self.files.clearRetainingCapacity();
+            self.files.appendSliceAssumeCapacity(outs.items);
+            self.next_file_id = last.id + 1;
+            self.dead_bytes = 0;
+            self.markSynced();
+            for (old) |df| self.store.close(df.handle);
+        }
+        // The manifest lists the old files as obsolete, so a crash or an
+        // error here only delays their deletion to the next `open`.
+        for (old) |df| {
+            const gone = if (self.deleteDataFile(df.id)) |_| true else |_| false;
+            if (gone) {
+                const at = std.mem.indexOfScalar(u32, self.obsolete.items, df.id).?;
+                _ = self.obsolete.orderedRemove(at);
+            }
+            self.gpa.destroy(df);
+        }
+    }
+
+    /// Create data file `id` (header written, not yet synced) as the next
+    /// merge output.
+    fn startOutput(self: *Db, outs: *std.ArrayListUnmanaged(*DataFile), id: u32) CompactError!void {
+        try outs.ensureUnusedCapacity(self.gpa, 1);
+        const df = try self.gpa.create(DataFile);
+        errdefer self.gpa.destroy(df);
+        const name = try self.fileName(id, "data");
+        defer self.gpa.free(name);
+        const h = try self.store.open(name, .create_truncate);
+        errdefer {
+            self.store.close(h);
+            _ = self.deleteDataFile(id) catch {};
+        }
+        var hdr: [header_len]u8 = undefined;
+        writeHeader(&hdr, version_expiry);
+        try self.store.writeAll(h, &hdr, 0);
+        df.* = .{ .id = id, .handle = h, .size = header_len, .version = version_expiry };
+        outs.appendAssumeCapacity(df);
     }
 
     // ── internals ───────────────────────────────────────────────────────────
@@ -1618,25 +2102,27 @@ pub const Db = struct {
         self.keydir.deinit(self.gpa);
     }
 
-    /// Replay the log from after the header, rebuilding the keydir. Stops at
-    /// the first torn/corrupt record and truncates the file back to the last
-    /// good one (crash recovery: committed data survives, a half-written
-    /// tail is discarded). A record that has expired by now counts as a
-    /// delete of its key: it is the key's latest word, and it says "absent".
-    fn replay(self: *Db, file_size: u64) OpenError!void {
+    /// Replay data file `df` from after its header, rebuilding the keydir.
+    /// Stops at the first torn/corrupt record; with `allow_truncate` (the
+    /// active file) truncates it back to the last good one (crash recovery:
+    /// committed data survives, a half-written tail is discarded), otherwise
+    /// (a sealed file, synced before any later file existed) refuses with
+    /// `error.Corrupt`. A record that has expired by now counts as a delete
+    /// of its key: it is the key's latest word, and it says "absent".
+    fn replay(self: *Db, df: *DataFile, file_size: u64, allow_truncate: bool) OpenError!void {
         // The clock is read once, and only for a file that can hold expiry.
-        const now: i64 = if (self.version >= version_expiry) self.options.clock.now() else 0;
+        const now: i64 = if (df.version >= version_expiry) self.options.clock.now() else 0;
         var off: u64 = header_len;
         scan: while (off < file_size) {
             const remaining = file_size - off;
             if (remaining < rec_fixed) break; // torn fixed header
             var hdr: [rec_fixed + exp_len]u8 = undefined;
-            try self.store.preadFull(self.file, hdr[0..rec_fixed], off);
+            try self.store.preadFull(df.handle, hdr[0..rec_fixed], off);
             const op = hdr[4];
             const key_len = std.mem.readInt(u32, hdr[5..9], .little);
             const val_len = std.mem.readInt(u32, hdr[9..13], .little);
             if (op != op_put and op != op_del and op != op_put_exp) break; // corrupt op byte
-            if (op == op_put_exp and self.version < version_expiry) break; // not in a v1 file
+            if (op == op_put_exp and df.version < version_expiry) break; // not in a v1 file
             if (op == op_del and val_len != 0) break;
             const expires = op == op_put_exp;
             const body: u64 = rec_fixed + @as(u64, if (expires) exp_len else 0);
@@ -1644,7 +2130,7 @@ pub const Db = struct {
             if (@as(u64, key_len) + val_len > remaining - body) break; // torn body
             var expires_at: i64 = no_expiry;
             if (expires) {
-                try self.store.preadFull(self.file, hdr[rec_fixed..][0..exp_len], off + rec_fixed);
+                try self.store.preadFull(df.handle, hdr[rec_fixed..][0..exp_len], off + rec_fixed);
                 expires_at = std.mem.readInt(i64, hdr[rec_fixed..][0..exp_len], .little);
             }
 
@@ -1655,13 +2141,13 @@ pub const Db = struct {
             const key = try self.gpa.alloc(u8, key_len);
             var key_owned = true;
             defer if (key_owned) self.gpa.free(key);
-            try self.store.preadFull(self.file, key, off + body);
+            try self.store.preadFull(df.handle, key, off + body);
             crc.update(key);
             var vbuf: [4096]u8 = undefined;
             var voff: u64 = 0;
             while (voff < val_len) {
                 const n: usize = @intCast(@min(vbuf.len, val_len - voff));
-                try self.store.preadFull(self.file, vbuf[0..n], off + body + key_len + voff);
+                try self.store.preadFull(df.handle, vbuf[0..n], off + body + key_len + voff);
                 crc.update(vbuf[0..n]);
                 voff += n;
             }
@@ -1672,31 +2158,33 @@ pub const Db = struct {
             const rec_len = body + key_len + val_len;
             if (op == op_del or (expires and expires_at <= now)) {
                 if (self.keydir.fetchRemove(key)) |kv| {
-                    self.dead_bytes += kv.value.recLen();
+                    self.supersede(kv.value);
                     if (kv.value.expires()) self.expiring -= 1;
                     self.gpa.free(@constCast(kv.key));
                 }
-                self.dead_bytes += rec_len;
+                self.addDead(df, rec_len);
             } else {
                 const gop = try self.keydir.getOrPut(self.gpa, key);
                 if (gop.found_existing) {
-                    self.dead_bytes += gop.value_ptr.recLen();
+                    self.supersede(gop.value_ptr.*);
                     if (gop.value_ptr.expires()) self.expiring -= 1;
                 } else {
                     key_owned = false; // the keydir owns it now
                 }
-                gop.value_ptr.* = .{ .off = off, .key_len = key_len, .val_len = val_len, .expires_at = expires_at };
+                gop.value_ptr.* = .{ .file = df, .off = off, .key_len = key_len, .val_len = val_len, .expires_at = expires_at };
+                self.addLive(gop.value_ptr.*);
                 if (expires) self.expiring += 1;
             }
             off += rec_len;
         }
         if (off < file_size) {
+            if (!allow_truncate) return error.Corrupt;
             // Torn/corrupt tail: discard it. Committed (fsync'd) records all
             // lie before `off` by construction.
-            try self.store.truncate(self.file, off);
-            try self.store.sync(self.file);
+            try self.store.truncate(df.handle, off);
+            try self.store.sync(df.handle);
         }
-        self.end = off;
+        df.size = off;
     }
 };
 
@@ -2186,6 +2674,162 @@ test "sync policy: close syncs what .none left un-synced; a poisoned store refus
     db.close();
 }
 
+test "multi-file: rotation migrates the single-file store, every file replays on reopen" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    const options: Options = .{ .max_file_size = 64 };
+    {
+        var db = try Db.open(testing.allocator, sim.storage(), "db", options);
+        defer db.close();
+        try db.put("a", "first value, 30 bytes long...");
+        try testing.expect(!db.multi);
+        try db.put("b", "second value, also around 30.."); // crosses 64: rotates
+        try testing.expect(db.multi);
+        try testing.expectEqual(@as(usize, 2), db.files.items.len);
+        try db.put("a", "overwritten in a later file....");
+        try db.delete("b"); // the tombstone lands in a later file than "b"
+        try db.put("c", "3");
+        try testing.expect(db.files.items.len >= 3);
+        try expectGet(&db, "a", "overwritten in a later file....");
+        try expectGet(&db, "b", null);
+    }
+    // `<path>` is now a manifest; the legacy data moved to `<path>.0.data`.
+    try testing.expectEqual(@as(u32, version_manifest), std.mem.readInt(u32, sim.fileContent("db").?[4..8], .little));
+    try testing.expect(sim.fileContent("db.0.data") != null);
+    var db = try Db.open(testing.allocator, sim.storage(), "db", options);
+    defer db.close();
+    try testing.expect(db.multi);
+    try expectGet(&db, "a", "overwritten in a later file....");
+    try expectGet(&db, "b", null);
+    try expectGet(&db, "c", "3");
+    try testing.expectEqual(@as(usize, 2), db.count());
+    // Per-file accounting adds up to the store's.
+    var dead: u64 = 0;
+    var live: u64 = 0;
+    for (db.files.items) |df| {
+        dead += df.dead_bytes;
+        live += df.live_keys;
+    }
+    try testing.expectEqual(db.deadBytes(), dead);
+    try testing.expectEqual(@as(u64, 2), live);
+}
+
+test "multi-file: compact merges into new files and deletes the old ones" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    const options: Options = .{ .max_file_size = 64 };
+    var db = try Db.open(testing.allocator, sim.storage(), "db", options);
+    defer db.close();
+    for (0..12) |i| {
+        var k: [4]u8 = undefined;
+        try db.put(try std.fmt.bufPrint(&k, "k{d}", .{i % 4}), "value-of-twenty-bytes");
+    }
+    try testing.expect(db.deadBytes() > 0);
+    const old_ids = try testing.allocator.alloc(u32, db.files.items.len);
+    defer testing.allocator.free(old_ids);
+    for (db.files.items, old_ids) |df, *id| id.* = df.id;
+    try db.compact();
+    try testing.expectEqual(@as(u64, 0), db.deadBytes());
+    for (old_ids) |id| {
+        var name: [16]u8 = undefined;
+        try testing.expect(sim.fileContent(try std.fmt.bufPrint(&name, "db.{d}.data", .{id})) == null);
+        for (db.files.items) |df| try testing.expect(df.id != id);
+    }
+    try testing.expectEqual(@as(usize, 0), db.obsolete.items.len);
+    for (0..4) |i| {
+        var k: [4]u8 = undefined;
+        try expectGet(&db, try std.fmt.bufPrint(&k, "k{d}", .{i}), "value-of-twenty-bytes");
+    }
+    // Writes go on into the merge's last file, and survive a reopen.
+    try db.put("after", "merge");
+    db.close();
+    db = try Db.open(testing.allocator, sim.storage(), "db", options);
+    try expectGet(&db, "after", "merge");
+    try testing.expectEqual(@as(usize, 5), db.count());
+}
+
+test "multi-file: rot in a sealed file is refused, a torn active tail is cut" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    const options: Options = .{ .max_file_size = 64 };
+    {
+        var db = try Db.open(testing.allocator, sim.storage(), "db", options);
+        defer db.close();
+        try db.put("a", "first value, 30 bytes long...");
+        try db.put("b", "second value, also around 30..");
+        try db.put("c", "and a third one in file 2.....");
+    }
+    // Torn tail on the active file: cut, everything before it kept.
+    const active_name = "db.2.data";
+    try testing.expect(sim.fileContent(active_name) != null);
+    try sim.appendDurable(active_name, "\x01\x02\x03");
+    {
+        var db = try Db.open(testing.allocator, sim.storage(), "db", options);
+        defer db.close();
+        try expectGet(&db, "c", "and a third one in file 2.....");
+    }
+    // A flipped byte inside a sealed file: rot, the store refuses to open.
+    sim.flipByte("db.0.data", header_len + 20);
+    try testing.expectError(error.Corrupt, Db.open(testing.allocator, sim.storage(), "db", options));
+}
+
+test "multi-file: open finishes a migration interrupted between its renames" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    const options: Options = .{ .max_file_size = 64 };
+    {
+        var db = try Db.open(testing.allocator, sim.storage(), "db", options);
+        defer db.close();
+        try db.put("a", "first value, 30 bytes long...");
+    }
+    // Count the migration's side effects, then crash right after the first
+    // rename was made durable (its syncDir) — `<path>` gone, temp there.
+    var crashed_between = false;
+    var point: usize = 0;
+    while (point < 40 and !crashed_between) : (point += 1) {
+        var s2 = SimStorage.init(testing.allocator);
+        defer s2.deinit();
+        try s2.installFile("db", sim.fileContent("db").?);
+        {
+            var db = try Db.open(testing.allocator, s2.storage(), "db", options);
+            defer db.close();
+            s2.ops_until_crash = point;
+            db.put("b", "second value, also around 30..") catch {};
+        }
+        s2.reboot();
+        if (s2.fileContent("db") == null and s2.fileContent("db.0.data") != null) {
+            crashed_between = true;
+            var db = try Db.open(testing.allocator, s2.storage(), "db", options);
+            defer db.close();
+            try testing.expect(db.multi);
+            try expectGet(&db, "a", "first value, 30 bytes long...");
+            try testing.expect(s2.fileContent("db.manifest") == null);
+        }
+    }
+    try testing.expect(crashed_between); // teeth: the state was reached
+}
+
+test "multi-file: a data file past next_file_id is a crashed creation, deleted on open" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    const options: Options = .{ .max_file_size = 64 };
+    var next: u32 = 0;
+    {
+        var db = try Db.open(testing.allocator, sim.storage(), "db", options);
+        defer db.close();
+        try db.put("a", "first value, 30 bytes long...");
+        try db.put("b", "second value, also around 30..");
+        next = db.next_file_id;
+    }
+    var name: [16]u8 = undefined;
+    const stray = try std.fmt.bufPrint(&name, "db.{d}.data", .{next});
+    try sim.installFile(stray, "ZKVL\x02\x00\x00\x00garbage");
+    var db = try Db.open(testing.allocator, sim.storage(), "db", options);
+    defer db.close();
+    try testing.expect(sim.fileContent(stray) == null);
+    try expectGet(&db, "b", "second value, also around 30..");
+}
+
 test "persistence: close and reopen recovers everything" {
     var sim = SimStorage.init(testing.allocator);
     defer sim.deinit();
@@ -2454,12 +3098,17 @@ test "foreign file is refused; newer version is refused" {
     std.mem.writeInt(u32, hdr[4..8], 999, .little);
     try sim.installFile("future", &hdr);
     try testing.expectError(error.UnsupportedVersion, Db.open(testing.allocator, sim.storage(), "future", .{}));
-    // The versions this module writes are 1 and 2; neither neighbour passes.
-    for ([_]u32{ 0, 3 }) |v| {
+    // The versions this module writes are 1, 2 (data) and 3 (manifest);
+    // neither neighbour passes.
+    for ([_]u32{ 0, 4 }) |v| {
         std.mem.writeInt(u32, hdr[4..8], v, .little);
         try sim.installFile("neighbour", &hdr);
         try testing.expectError(error.UnsupportedVersion, Db.open(testing.allocator, sim.storage(), "neighbour", .{}));
     }
+    // A bare version-3 header is a manifest with no body: corrupt, not adopted.
+    std.mem.writeInt(u32, hdr[4..8], 3, .little);
+    try sim.installFile("manifest", &hdr);
+    try testing.expectError(error.Corrupt, Db.open(testing.allocator, sim.storage(), "manifest", .{}));
 }
 
 test "torn header remnant that IS our magic prefix is adopted as fresh" {
@@ -2669,7 +3318,9 @@ test "concurrency: readers alongside puts, deletes and compactions (real filesys
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var fs_store = FsStorage.init(testing.io, tmp.dir);
-    var db = try Db.open(testing.allocator, fs_store.storage(), "db", .{ .sync = .none });
+    // Small files: the writer rotates and merges multi-file stores under
+    // the readers' feet.
+    var db = try Db.open(testing.allocator, fs_store.storage(), "db", .{ .sync = .none, .max_file_size = 512 });
     defer db.close();
 
     // Every value starts with its own key, so a reader can tell a value read
@@ -2800,9 +3451,9 @@ test "real filesystem (FsStorage): persistence + compaction round-trip" {
     try testing.expectEqual(@as(usize, 2), db.count());
 
     const st = fs_store2.storage();
-    const before = try st.size(db.file);
+    const before = try st.size(db.active().handle);
     try db.compact();
-    const after = try st.size(db.file);
+    const after = try st.size(db.active().handle);
     try testing.expect(after < before);
     try expectGet(&db, "alpha", "uno");
     try expectGet(&db, "gamma", "three");

@@ -243,6 +243,10 @@ pub const Config = struct {
     /// coverage feedback — see scheduler.zig) to bias fault selection toward
     /// under-exercised (class × timing) cells.
     scheduler: FaultScheduler = scheduler_mod.uniformScheduler(),
+    /// Options for every `Db.open` of the live runner. A small
+    /// `max_file_size` makes the runs rotate, migrate and merge
+    /// multi-file stores.
+    options: kv.Options = .{},
 };
 
 /// Aggregated across seeds by the caller; also the determinism witness.
@@ -261,6 +265,9 @@ pub const Stats = struct {
     /// B adopted) — proves the atomic-tail branch is actually exercised.
     inflight_survived: usize = 0,
     sabotages: usize = 0,
+    /// Seeds that ended as a multi-file store (rotated at least once) —
+    /// the teeth witness for runs with a small `max_file_size`.
+    multi_file_stores: usize = 0,
     /// Mix of each seed's final media CRC — byte-level determinism witness.
     fingerprint: u64 = 0,
 };
@@ -375,7 +382,7 @@ const Vopr = struct {
     /// fault fires, or run to completion and close cleanly. Acknowledged
     /// mutations update the model; gets are checked against it live.
     fn runEpoch(v: *Vopr) !Inflight {
-        var db = Db.open(v.gpa, v.st, db_name, .{}) catch |e| {
+        var db = Db.open(v.gpa, v.st, db_name, v.cfg.options) catch |e| {
             try v.event(.open_fault, -1, 0);
             if (e == error.Crashed or v.faults.fired) return .none;
             return v.fail("unscheduled open error: {t}", .{e});
@@ -458,7 +465,7 @@ const Vopr = struct {
         // which the append-only + fsync-per-ack model keeps as a prefix).
         if (v.prng.chance(1, 4)) {
             if (v.sim.fileContent(db_name)) |c| {
-                if (c.len >= 8) {
+                if (c.len >= 8 and !isManifest(c)) {
                     var g: [24]u8 = undefined;
                     const n = 1 + v.prng.below(g.len);
                     v.prng.fill(g[0..n]);
@@ -484,7 +491,7 @@ const Vopr = struct {
             }
         }
 
-        var db = Db.open(v.gpa, v.st, db_name, .{}) catch |e|
+        var db = Db.open(v.gpa, v.st, db_name, v.cfg.options) catch |e|
             return v.fail("recovery open failed: {t}", .{e});
         defer db.close();
 
@@ -525,6 +532,12 @@ const Vopr = struct {
         try v.event(.probe_ok, -1, 0);
     }
 };
+
+/// `<path>` holds a multi-file store's manifest (format version 3), which is
+/// only ever replaced whole by a rename — no torn or garbage tail to model.
+fn isManifest(c: []const u8) bool {
+    return c.len >= 8 and std.mem.readInt(u32, c[4..8], .little) == 3;
+}
 
 /// Does the store's state equal `model` exactly? Shared by the live `Vopr`
 /// (`Vopr.matches`) and the trace `Replayer` so both check invariants 1–4
@@ -907,6 +920,7 @@ pub fn runSeedTraced(gpa: Allocator, seed: u64, cfg: Config, stats: *Stats, trac
 
     // Per-seed fingerprint of the surviving media (determinism witness).
     const content = sim.fileContent(db_name) orelse "";
+    if (isManifest(content)) stats.multi_file_stores += 1;
     var fp_prng = Prng.init(seed ^ std.hash.Crc32.hash(content));
     stats.fingerprint +%= fp_prng.next();
 }
@@ -930,6 +944,19 @@ test "VOPR: randomized fault schedules across seeds, model-checked recovery" {
     // The non-contiguous durability mode must have actually punched holes in
     // an un-synced multi-write window (else out-of-order durability is untested).
     try testing.expect(stats.reorder_holes >= seed_count / 200);
+}
+
+test "VOPR: multi-file stores — rotation, migration and merges under random faults" {
+    var stats: Stats = .{};
+    const n = seed_count / 4;
+    var seed: u64 = 1;
+    while (seed <= n) : (seed += 1) {
+        try runSeed(testing.allocator, seed, .{ .options = .{ .max_file_size = 4096 } }, &stats);
+    }
+    try testing.expect(stats.crashes >= n / 2);
+    try testing.expect(stats.io_errors >= n / 10);
+    try testing.expect(stats.acked_ops >= n * 10);
+    try testing.expect(stats.multi_file_stores >= n / 2);
 }
 
 test "VOPR: identical seed reproduces the identical run" {

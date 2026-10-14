@@ -162,6 +162,47 @@ and a listing serves only recovery and tooling (rebuilding that record, finding 
   (the explicit `expires_at` compare in `read_verify`) is equivalent — the CRC over the field
   catches the same rot.
 
+## Multi-file log
+
+`Options.max_file_size` (2026-10-14, S2 survey R3; default 2 GiB, Bitcask's `max_file_size`): an
+append that would take the active data file past it first **rotates** — seals the active file
+(sync) and starts `<path>.<id>.data`. A record larger than the limit gets a file of its own.
+
+- **Layout.** A store that never rotates stays the single version-1/2 data file at `<path>`. From
+  the first rotation on, `<path>` is a **manifest** (format version 3, same magic): next file id,
+  the data-file ids in replay order (active last), ids retired but not yet deleted, CRC-32. It is
+  only ever replaced whole (temp `<path>.manifest` + sync + rename + dir sync), so never torn. A
+  build that knows only versions 1–2 refuses it (`UnsupportedVersion`) instead of opening `<path>`
+  as a data file and silently missing every other file.
+- **Migration** (first rotation): new file created and synced → manifest temp written and synced
+  → rename `<path>` → `<path>.0.data` → dir sync → rename temp → `<path>` → dir sync. A crash
+  leaves the single-file store, or `.0.data` + temp with no `<path>`, which `open` finishes (named
+  probes; `Db` still never lists). The dir sync between the renames is defensive: `SimStorage`
+  applies a directory's renames all-or-nothing per `syncDir`, so the sweep cannot see the
+  reordering it guards against (a mutant removing it is caught only by the unit test that drives
+  open into the between-renames state).
+- **Sealed vs active.** A sealed file was synced before any newer file existed, so a bad record in
+  it is rot and `open` refuses (`Corrupt`) rather than cut it and every later file; only the
+  active file's torn tail is truncated (as before). Under `SyncPolicy.none` the seal is what keeps
+  the recovered state a prefix of the writes across files.
+- **Strays.** Files a crashed rotation or merge created at ids ≥ the manifest's next id are
+  deleted by `open` (probe `next_id`, `next_id+1`, … until absent); files a merge retired are listed
+  obsolete in its manifest and deleted at the next `open` if their deletion failed.
+- **`compact` on a multi-file store** writes every live record into new files (split at
+  `max_file_size`, each synced), then one manifest naming them and listing the old as obsolete,
+  then deletes the old files. Before the rename: errors leave the store usable and delete the new
+  files. From the rename on: poisoned, new files kept — **VOPR finding 2026-10-14**: the first
+  version deleted them when the dir sync after the rename failed, leaving a manifest naming
+  deleted files (`Corrupt` on reopen, seed 312 of the multi-file run).
+- **Per-file accounting** (`Db.DataFile`): live/dead bytes and keys per file, for merge planning;
+  a unit test checks they sum to `deadBytes`/`count`.
+- **Tests:** unit tests (rotation + replay across files, merge deleting old files, sealed rot vs
+  torn active tail, migration finished from the between-renames state, stray deletion); crash
+  sweeps over the main and expiry scripts with `max_file_size = 64` in all four modes; the
+  `SyncPolicy.none` sweep over rotations; VOPR with `max_file_size = 4096` (500 seeds, ≥ half end
+  multi-file). Mutants: no seal sync (red: no-sync rotation sweep), merge output not synced (red:
+  3 sweeps), no dir sync between migration renames (red: unit test).
+
 ## Sync policy
 
 `Options.sync` (2026-10-14, S2 survey R1) is Bitcask's `sync_strategy`: `.always` (default — fsync
