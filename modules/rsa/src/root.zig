@@ -127,9 +127,15 @@ pub const meta = .{
     .deps = .{ "montint", "aescbc", "aes192" }, // std.crypto.ff carrier + montint modexp hot path; aescbc/aes192: PBES2 encrypted PKCS#8
 };
 
-/// Largest RSA modulus this module supports, in bits. Matches the ceiling
-/// std's own internal RSA verifier uses (`std.crypto.Certificate.rsa`).
-pub const max_modulus_bits = 4096;
+/// Largest RSA modulus this module supports, in bits: 8192 since 2026-10-14
+/// (was std's own verifier ceiling, 4096). 8192-bit keys exist in the wild
+/// (`ssh-keygen -b 8192`, some CA and test keys) and are the first thing an
+/// OpenSSL user would find refused; OpenSSL's own cap of 16384 is not
+/// followed (no deployed use; a key generation of minutes, and a `SecretKey`
+/// of twice today's size again). Sizes up to 4096 run exactly as before
+/// (the montint slot follows the key); the cost is stack: a `SecretKey` and
+/// every `max_modulus_len` buffer doubled.
+pub const max_modulus_bits = 8192;
 
 /// Fixed-capacity big-unsigned-integer type sized to `max_modulus_bits`.
 pub const Uint = std.crypto.ff.Uint(max_modulus_bits);
@@ -168,7 +174,7 @@ fn stripLeadingZeros(bytes: []const u8) []const u8 {
 
 // ── montint backend (every secret-touching operation) ──────────────────────
 //
-// `montint.DynModint` carries a modulus chosen at run time — a 512…4096-bit
+// `montint.DynModint` carries a modulus chosen at run time — a 512…8192-bit
 // `n`, or one of its ~half-width CRT primes — on the smallest comptime
 // `Modint` slot (a multiple of 4 limbs) that holds it, so a 2048-bit CRT sign
 // runs mod-p at L=16 with no padding. Its constants are computed once per key.
@@ -384,7 +390,7 @@ pub const max_private_pem_len = marshal.max_private_pem_len;
 /// verify path never reads — for a 2048-bit key that construction cost
 /// several times the verification itself. This type keeps only the montint
 /// modulus and the exponent, with exactly `PublicKey.fromBytes`'s checks
-/// (size 512…4096 bits, odd `n`, odd `3 ≤ e < 2^32`), and verifies
+/// (size 512…8192 bits, odd `n`, odd `3 ≤ e < 2^32`), and verifies
 /// identically. Hold a `PublicKey` when the key is kept and used for
 /// anything else; build this when it is parsed, used and dropped.
 pub const VerifyKey = struct {
@@ -529,7 +535,7 @@ pub const SecretKey = struct {
     /// modulo the even `λ`, `p−1`, `q−1`), `qInv` by Fermat on montint. The
     /// one step still variable-time on `p`, `q` is building their
     /// `std.crypto.ff` `Modulus` carriers (`sk.p`, `sk.q`); SPEC Backlog.
-    /// Cost: a few milliseconds at 4096-bit width (the gcd and lcm run at the
+    /// Cost: a few milliseconds at 8192-bit width (the gcd and lcm run at the
     /// full `max_modulus_bits` capacity, whatever the key size).
     pub fn fromPrimes(out: *SecretKey, p_bytes: []const u8, q_bytes: []const u8, e_bytes: []const u8) FromPrimesError!void {
         const r = fromPrimesUnburned(out, p_bytes, q_bytes, e_bytes);
@@ -609,6 +615,11 @@ pub const SecretKey = struct {
             return try SecretKey.fromDerValue(block.der());
         }
         return error.UnsupportedPemLabel;
+    }
+
+    /// `e` as the `u32` every constructor validated it to fit.
+    fn publicExponent(sk: *const SecretKey) u32 {
+        return sk.e.toPrimitive(u32) catch unreachable; // < 2^32 since fromPrimes
     }
 
     /// The public half (Go `PrivateKey.Public`): `n`, `e` and the public-op
@@ -1039,8 +1050,8 @@ const BlindingFactors = struct { cp: MontElem, cq: MontElem, rp_inv: MontElem, r
 /// decision about the random `r`, not about a secret.
 fn makeBlinding(sk: *const SecretKey, c: *const MontElem, rng: std.Random) BlindingFactors {
     const n_len = sk.n_mont.byteLen();
-    var e_be: [max_modulus_len]u8 = undefined;
-    sk.e.toBytes(&e_be, .big) catch unreachable;
+    var e_be: [4]u8 = undefined;
+    std.mem.writeInt(u32, &e_be, sk.publicExponent(), .big);
     const e_s = stripLeadingZeros(&e_be);
     var one: MontElem = MontParams.zero;
     one[0] = 1;
@@ -1049,7 +1060,7 @@ fn makeBlinding(sk: *const SecretKey, c: *const MontElem, rng: std.Random) Blind
     while (true) {
         // Uniform r in [1, n−1] by rejection sampling (>= n and 0 redraw).
         var r_raw: [max_modulus_len]u8 = undefined;
-        defer std.crypto.secureZero(u8, &r_raw);
+        defer std.crypto.secureZero(u8, r_raw[0..n_len]);
         rng.bytes(r_raw[0..n_len]);
         var r_el = sk.n_mont.elemFromBytesBE(r_raw[0..n_len]) catch continue;
         defer std.crypto.secureZero(u64, &r_el);
@@ -1059,7 +1070,7 @@ fn makeBlinding(sk: *const SecretKey, c: *const MontElem, rng: std.Random) Blind
         defer std.crypto.secureZero(u64, &rp);
         var rq = sk.q_mont.reduceLimbs(r_el[0..sk.n_mont.L]);
         defer std.crypto.secureZero(u64, &rq);
-        var out: BlindingFactors = .{ .cp = undefined, .cq = undefined, .rp_inv = MontParams.zero, .rq_inv = MontParams.zero };
+        var out: BlindingFactors = undefined; // invert2 writes both inverses whole
         const units = BlindInverter.invert2(&rp, &sk.p_mont.m, &rq, &sk.q_mont.m, half_bits, &out.rp_inv, &out.rq_inv);
         // One verdict, read once: the four checks run mod the SECRET primes,
         // so each would otherwise be its own branch on p/q (ctgrind). It is
@@ -1099,10 +1110,17 @@ fn privateOpCrtPtr(sk: *const SecretKey, in: []const u8, out: []u8, blinding: Bl
     var cq: MontElem = undefined;
     defer std.crypto.secureZero(u64, &cq);
     var r_inv: ?struct { p: MontElem, q: MontElem } = null;
-    defer if (r_inv) |*ri| std.crypto.secureZero(u8, std.mem.asBytes(ri));
+    defer if (r_inv) |*ri| {
+        std.crypto.secureZero(u64, ri.p[0..sk.p_mont.L]);
+        std.crypto.secureZero(u64, ri.q[0..sk.q_mont.L]);
+    };
     if (blinding.rng()) |g| {
         var b = makeBlinding(sk, &c, g);
-        defer std.crypto.secureZero(u8, std.mem.asBytes(&b));
+        // Every field is a montint result: zero above its slot, so only the
+        // slot limbs can hold a secret (wiping the 4 KiB struct byte by byte
+        // cost ~1 µs at the 8192-bit capacity).
+        defer for ([_]*MontElem{ &b.cp, &b.rp_inv }) |x| std.crypto.secureZero(u64, x[0..sk.p_mont.L]);
+        defer for ([_]*MontElem{ &b.cq, &b.rq_inv }) |x| std.crypto.secureZero(u64, x[0..sk.q_mont.L]);
         cp = b.cp;
         cq = b.cq;
         r_inv = .{ .p = b.rp_inv, .q = b.rq_inv };
@@ -1144,8 +1162,8 @@ fn privateOpCrtPtr(sk: *const SecretKey, in: []const u8, out: []u8, blinding: Bl
     // to the ORIGINAL c. A fault in either CRT half makes m ≢ c^d, so m^e ≢ c
     // and we refuse to emit m — denying the attacker the faulty value from
     // which p = gcd(c − m^e mod n, n) would otherwise factor the modulus.
-    var e_be: [max_modulus_len]u8 = undefined;
-    sk.e.toBytes(&e_be, .big) catch unreachable;
+    var e_be: [4]u8 = undefined;
+    std.mem.writeInt(u32, &e_be, sk.publicExponent(), .big);
     const chk = sk.n_mont.powPublic(&m, stripLeadingZeros(&e_be));
     if (!MontParams.eql(&chk, &c)) return error.FaultDetected;
 
@@ -1456,13 +1474,19 @@ fn verifyPkcs1v15DigestMont(mp: *const MontParams, e: u32, comptime Hash: type, 
     const k = mp.byteLen();
     // §8.2.2 step 1: the signature must be exactly k octets.
     if (sig.len != k) return error.SignatureVerificationFailed;
-    var em_dec = std.mem.zeroes([max_modulus_len]u8);
+    // Exactly k octets each (both writers fill all of it); not zeroed or
+    // compared at the 1 KiB capacity — that was ~10 % of a 2048-bit verify
+    // once the cap went to 8192 bits (2026-10-14).
+    var em_dec: [max_modulus_len]u8 = undefined;
     publicOpMont(mp, e, sig, em_dec[0..k]) catch return error.SignatureVerificationFailed;
-    var em_exp = std.mem.zeroes([max_modulus_len]u8);
+    var em_exp: [max_modulus_len]u8 = undefined;
     emsaPkcs1v15EncodeDigest(Hash, digest, em_exp[0..k]) catch return error.SignatureVerificationFailed;
-    if (!std.crypto.timing_safe.eql([max_modulus_len]u8, em_dec, em_exp)) {
-        return error.SignatureVerificationFailed;
-    }
+    // Constant-time over the k octets (a public signature, but the full
+    // comparison keeps "no Bleichenbacher'06-style laxity" independent of
+    // where the first difference is).
+    var diff: u8 = 0;
+    for (em_dec[0..k], em_exp[0..k]) |a, b| diff |= a ^ b;
+    if (diff != 0) return error.SignatureVerificationFailed;
 }
 
 /// `verifyPkcs1v15` against a digest the caller already has (`digest` =
@@ -5207,6 +5231,57 @@ test "PBES2: an iteration count over max_pbkdf2_iterations is refused before any
     const at = std.mem.indexOf(u8, der, &.{ 0x02, 0x03, 0x01, 0x00, 0x00 }).?;
     der[at + 2] = 0x11;
     try testing.expectError(error.KdfIterationsTooLarge, fromPkcs8Encrypted(&test_sk_out, der, "pw"));
+}
+
+// ── R7 (2026-10-14): 8192-bit keys ──────────────────────────────────────────
+//
+// openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:8192 (OpenSSL 3.5.5),
+// then `rsa -traditional -outform DER`, `pkey -pubout -outform DER`,
+// `dgst -sha256 -sign` over `msg`, `pkeyutl -encrypt` OAEP-SHA256 of "oaep-8192".
+const kat8192 = struct {
+    const msg = "zig-libs rsa: 8192-bit known-answer test";
+    const priv_pkcs1 = hexLit("308212280201000282040100e9e618c8364f6d569497698c1977f389dbba4f2ba08feb9854966b1c41a7b6da26e44ddac235a7b32413dc52a31d2c4f77d7df396be9b84fe056c9780b1a492d4e04962496d98fbd7bb3ca5833c0754850f4a04e702314993e587529aafa5ca5c850c2a9f692d6343033a041f93b83a436c8665cc9e93b01f7696e419156deff549f141c1296783ee846640d110f55b08f9c82c04c154dd46a95a187d9b8d0ae761166ca9db06d4d1e0cd420f59ff6d8871c3b3e389947a554046547eff5351e6f16790054acbf1f9fd302581827c0b8b1236648c75d943d15ee6eb3be7c22aee47ea32fd3008172afe6293daa31e2c6e040b5361b0c2fbc1deacd128032607e8ec7bfb8efbed08b474142a60f1d59d4dd7a27d58b2cbf9d865b27262f829b8ca608016630375f9b18816b5413432a4c785ba52bee753ab1a2b845a1b081d0ea93e467b4453fb25b1b3204912dbf937cf5bb1db6bf6ba7947989dadda9321b9ebd3bfda1b526b052e5e4690f1e1de84bd45c7dfc6e86ed60cb626f940998af74ee7e5039fc2d45ac928c1b5ec4698972d200b26269929bd0ce4870299d208242478df32486bf5a50a8b43a825befb37547c4fd4ca7cc22faeae148bf607a15ae61421beb7eee08119290502085ad6d1ce33c7c89be3c3f54a39c9ff3055132f15390972d20033fb2f00f080a952b62ca81f37cfe9de4fa515690e5cfe8918f13b59b507ed5291ec008e27c140623cce2573cbb8f238bf601c82f1e423533ef96c9ed86a9a681273b5b2f91ff9c831bf1be098e37f4e8bf3baab836f51729a82e2f115544c7a09529d46a54987ecdac0843f7195a0d03117a99624bb3d9c957690d834024778fda194e90e0e2742df82f7dd1cd377aa663b3d305ac13a5bf6df38c203670b457da43a91530958277e28fbb018601f9c891afae2ffd8887887c2d4b4c61755f0fa589426d9e0585b3fafd0d1f5268a173ecf5829fb59174547d41b63a865b7a30e233c7fe206b4f47c512038f218a228cc7ad014818d26f732a1e1db4f6eb2a00f90fd6a800675f86d15eb1260d98b4ca474bd0121df5c20cfc98659bdee1336d8c707bc436033db3e0203ff0689b7a863458669f1a310dfbd9fd8fd96579887cf056c6b6fc316adb8a01f3b729c1465f68cea05e24723cbae8f26a749194cbed436c0b3cbd757c78f17abd6b37294175859a904e60cd65f3a9e6141c208ee92c5fff76ae4065d2120f4d0dc5790b153027e1c2855eb635d29f74fadaa7911c97d8a37529311bd13cc1bb7cedc0eb1f470943d9c2c7a065437df075343c0ca2f0e872ff5197677f7614ec16c74cb2233ba654b0d39323b6b3777e77f25d6d2faf00ab9a127275a0e77fd939122a07282b770deb59910b6aa14e89788e97260672dae85ce2a7c8a70b93f4199b372122ba5cef984e8e3de9efbcbb02030100010282040019b7c925ca82f53cbddde0271d6dc903717b8cd4f93499ed07effa1b0345139fed02d164aa5207fc748d127eab9cbb908956dd1e8d3507a510bfba2b4edd370a9a377ae2cf0b60f8aeaf5822569e64c6eccfd90886dff495dcfb10f6e1ebe16001249022ec0fbd29c3db0955f7b78983f6da161741c4394ec00b81aa07f70b51fbd5f9fa14392343977a95e9b1e483c18428eb5f857e1a2eaf0180df551b3326dba8922ad927dafccdbf0f5c0865ec586692be18db544f4268788b425baa148b221fd0722edd47ae8c7e4115baa234589a718fff949c3f7e6ff8e58731fca83b9eb825ed4e4011fbb0479865455f72d5f73666366ac6ee40baf16457126d779ab2cc57d257da1d48132fa3ca6a8309ab9426a8569c94f104bb0f2ec0ce1c8849f0bf9497cdd968d3bee00c1314832015846e5f3cf35d4474dfb56f42960bd012daec1453080236f4398b4861462c78651707d9fe8c11a43d7917a54f1619825bf3e6b2bea3127bf4c17e59e6e5a2d835ee45b53c9a528fab42f1b1df0f2710b3c4bd72c8cd6794efa2b57114fc77b63b3fc7ffd53e52767b811309f2296ab7a7de0247a7ce811fc71aa5a6814ae6924ee4f34dfeadbc8e64148b6cda4e1b5e62ec22bebb281bb81b668823a74fcb7fe1db427d570fe9c3f4e480863dcc69df3615c0223f3df3dd7f29521dca3c18a726291fc2b0a45fd6fe368c7c185e34130d1bec99bd07cb0aa581a2df5590ca587494f538fccc9bef55cd845d67a7285ef7e5676948e9590709223d713134f47fd82accca4977915cbb04ecbeea9d085593ee8bfdfecfd4c85e184590d1d2ad959c0b773e3e0c63dc9385da3995d7fd11868a28ce5336054baaea994e1cdc3941e8ca5b02feaca2181d5b3d5b398f5e99f9aa33edd85fec03753a28b69f832598dabee426efa6aae6e317ec19701f498bd7fd84d4011c0589e1bc9122b5e082bab0c2d8ad73817db3c4c83c582f64bbde6373ef766f70c251f4af4cd3e56cc7eda7ff7436b0df5043a67db240845d9a30d04d1ab2d6546c2db9f3c2d7681618d8ac25ffbf266e76b499a0dd7efccec52dcb03c2f755474442c6c970662f64e4950238dc22f83fa73f1347872d95b2c0af7d5c7f87dee0274bea4970a0ddc69e6c96b89e07879101e2a12aefda1e6d0ea70e041280af3a6d3612bab6623e8cd9680784ab8219cb3e642d292c33d419041a271ff741db8fc7eaff43b0cc9bb9b930f1c51a42bf0f4ee8c640c8681cec5f0b405fbe26d474cc90fa3b19d3cc9a23342b1c0dec5e10392ba562a8160b1b9e753c696db915a410e51550dc6db9fea9c4e01d80d14d1164602ebb22e90e75fe96c0e612b5e4e8850348fa4027e9723ae017555a388cb1b2b5367c53ab071c1dd6e3fc90226868c493f3ccc770d04773b1fac335d2d9843cd4d65856edbd6eeffd910282020100f68bc4dffcd5549bbb39a783d63e20d9e1094b114958551e0958731ee2270a13c9eb46edbadc451f13e715e308b3d3ad8a7ee69e172fa79ca173d47a5313df6fb264d00369fdf1d03377ae1612039a264ace8d5abb4765eb2375b6ba655e5083c2a067c4f830d4a5ff7be2e13acb707c2bb4bfb8dcd4f8838cb7f03240f2789da05823ac161fb1f7aceba7570e605755b7e32f51adbb9d762a7054b3313d5879600b5313eacb9df25bcf817dc9a6ca1b93441e0972b1096eb51813b1e15bcf84cba229f2b6228848359382096285fe71b102056ef02d83ab3b28daab9108f999b6bc6f5e231d6663232ca0c6ef6d2bf16d0d88025f6a0962c176273f65c0a1353df5eb2cbf35811b97221c5464f2a3de4af051192762660fcf4fc2c29d49ab4004ec780bcbfbe0771f65fdbad7a95f677d00848559a67b4afce1258f39f3b6b642d399f63805eb07db5f85aed160710bd58b553b32434f7c2e9898baeff74a526bab776e0694ecfb92990ac0248eb71afc98a3d28e3aab22db4f480179d20ee854c66d61325f49c5ab934af168176d95ae075e7a37037962fa1c2a4d5fac00d798ca3eefe372ad6abd3941462ac6f94b0bba629d78bb3423a3d6b601fc6155228a1da944c5510d72a4af4e7b5716ba6828d38990c4805d5cb0a2e332ae2dbd13bfcfcf97493209a6e8974d554ae3e521a9580452557a3dd3f9b2d094341658150282020100f2de2d227325971b696d657e5940a52ddb1a01393b04f308f2462feef06df2ee58a296b0abfbd64f63f7b80e6ecd55e27b69818211a1eb334340fad66cba882601549c2d317496e285e39ea4f959de621cda0b7d57c693ec06aa73dc9f717059c1fe0a76ca501c88e633971da20a476594a006422a1e453200b7f0a3b318155ede030b705bd7d5439d4f610543ceedc36f83067a61fc6a2bc5db0986f0ea0ad9e221624b91bab0939dd459871f6e7d479812c1b00199b47916f51bbc957c03858e31f6468c258f50c6ba5e125298e7cf63f38fbd7aa99f6c845f65232b7c8191e7ae6ca81fbd331aebba1225ad86e58d24fa917252eb773cc6739c8964aed09db7abcf75b19fc74c3794669188f6e21070433def39a671c15b9c2e1e7eadfb5e4333d2fba04a597f8b1385f1de4a6c5b53a8803afb60e84a3e7cbeb78e6d865630d8dbb4a2aab862742d30361c240d4bda32344dca208a4291fa190f848b5bfb08c5dbb035ab75516256fe35430b74cb9bcbda37f4f2c8cd0ee7e657ec63c4398dc2b5ddef28821ea7b11479eb886f6ba4f14fc13ef975a3f8ae0cd557d071212684304ad1e0622ca3842c1f9c98d063a4102779403a553bf224933065f1e7431a408fcaf7b128a763c2fbd8f5bfeba90046173a8e095a9761fff4def2b38cd90025e9927697b033ffde04d7d1643d43cb8b19d22c7299ea3259df7884b3a58f0282020100ba74e223f3f6f2d2043a8a31eea975f6d17651cb7508d4f6ae62b24dbd03815f8de9ddee94cf5987336a24e75b0185294e00c330f4a019c71f6396621cca7ec4dec9d7777d858c87c524d207e6ffca6903524b1d3f5db3faad0aad73328ead9db867cf92eb91228198427d47914ba27a8623608bd2974e8b4eb51d77241f3c91195f0f3b6a4ff62c361ed2a3c83f9c4d3b91198c5033ffd60a2a8224332d0de85d76b311f114a51351d4113eac6ef392ff4118e6545307ab2e525332c818c34ccf24894d01ea03df78856266ee981fe2a3d7bf7c333078cfdb21fe9e9a458b5f710ff9b9dc1cb3fe6defa6784d42e764e2f0c4d7e6892f27fcdffab6bba17f49e0de4749c42216ce62f26d327655fb1076e460b101542d93ef598715e01682e91bd02ac9e12f508746bbbfb4babd6165c6e7c9518087a3df0678d00b0decff55c01c7fe7f25ea76d7dbf343f0e223ddc91579ad1f62569cba501cb2035b37405f95fe826d1db778e9b441b194d8c91765b6aa51aec6dfa57963cd35c2a616edccea072c07b740d3aed93abadfee718fd866c144ba1a782fa13e591288b1e6e549f3cf5743f33cf6b564822d18a308900f491b55b1a9f99c30a79ab94bce66f987b940b1bf38e64f93b0b49f385ddae846fbbebe20c7a78214d852306852c1a3f01658cbe01a1522364ec689404db6dc2936bf978bb2483f5f875ffc0d5d3c03102820200332a8999bb668cfa3270e0b408bbacd1075ae82d15790a76b50c02673572047f205f489df9edb98dca42d31cff4cf52e1ccff27fe3951847198124176e9ab1ba48077a4baf229ff3233ffc19478b1e65cf2c44c5686ba698502332fba4ffb22ac6caed8b6f3e0774f402a47092c5d59ada0008b181cc14c9df0ae180ab6784811306d32f1dba4fecc9c4826d2886fce272a8c901998923190bbb04bbd01f8e9fae9b57e911cfa209c7738855065331c3968f450cfe9952433c89f108fef93c88b397650a21d67be609a813cf8a653a591ff69d2ecf1bd3417a75da89d94c86c3a56ac2eb7c9c509af854a0241df5d080b6ecaf1dc5c863bb8317b23fe3dd4c881dbced9d1f09c9640e458e8254b7a692ce03ec956cb0db40603b7c1fe29266e5ca04ae0b630ea6e24efb92f98cda630fae854e569ec520cb1b750e7cff5da5b29ce1e30fa041954cf0aae08055d76691b76b62478d30e3cff88f171e84cf1356c4d7625c32426819f83cd99b80ff75e0bb76ec0763ec8e4f5d378ff8b00da8b6735e351087a5221cb1398655d5404e310073f258851aeb24db6c57b9cea1546426882ce0666cfe61e7251e629e8c3742f6ba8c8667f8a22259f648a826a21b15b0ff2f0c14b8d716c4d6bc564e17dbdf23f6a0482eca5bb28eebecbbd7a7ea21817d7b42e70738110c73cad36902d441672d6c0832630678279975921f6af5930282020074b83f9fe126b962683439ae02eb606e636fe25e0bf180f31fc472eeae230f2af56374b7b179455680e5dd9a0b241737120bbd86b7ca5d9c16103a921ddec7417abfb32385f88bc769e9d92bd32c711406fb2089a3b035355333e7f4bfebbfd1d50200add5f830bdab0252ee3614e47bc8867b22c3c57184ab0d6fbbf5f9b51721b68ff39eff427dbf8e7815dfbe8eb6c47912db39d6e865995214f773040b53274156e650d8e29cdda72fe8c9c5c4e82c6867272414e912caaaae34611c0ede73706540211904ffff416c726af94c7c35fcb66944c36a06d6c40bd7d9c0b96be801c4f8843cf24af2f5c2bd4744aceaecf80c30bbe1309c84cbbf7e07b40cc83e88de020d09693a340bf7d26db3cc834d7c91739a568affe87b6e71e7827882fcc3bd147f9c32a03ac7bdacd8c69029018892f6f8f1c3ed1428a9dabc7da018aa078ebf953f8fa91a34c7a8f6ecc8f8abcd750b5ccf190e405ad2a4f222efa2354e1e4034667517c8b79af958a72ce5f21020bb5af9bae4c954e128ded572756c48103d3736af1f4ff04cfe4434e5b5600b7013361aaaf1d1831d5c885a8a9b14c52885aad7144f7d8ed1dcbc8b7f6b80f38dddfc6c92de75d517e1ddee177440dba50e553d4d2165dcadf9a7c042febc494b116341164fded202e9dbe5f1638f0456f002324052e6916cf9da075deaaf59560ddc0d01ff5e2042d244f7e711");
+    const pub_spki = hexLit("30820422300d06092a864886f70d01010105000382040f003082040a0282040100e9e618c8364f6d569497698c1977f389dbba4f2ba08feb9854966b1c41a7b6da26e44ddac235a7b32413dc52a31d2c4f77d7df396be9b84fe056c9780b1a492d4e04962496d98fbd7bb3ca5833c0754850f4a04e702314993e587529aafa5ca5c850c2a9f692d6343033a041f93b83a436c8665cc9e93b01f7696e419156deff549f141c1296783ee846640d110f55b08f9c82c04c154dd46a95a187d9b8d0ae761166ca9db06d4d1e0cd420f59ff6d8871c3b3e389947a554046547eff5351e6f16790054acbf1f9fd302581827c0b8b1236648c75d943d15ee6eb3be7c22aee47ea32fd3008172afe6293daa31e2c6e040b5361b0c2fbc1deacd128032607e8ec7bfb8efbed08b474142a60f1d59d4dd7a27d58b2cbf9d865b27262f829b8ca608016630375f9b18816b5413432a4c785ba52bee753ab1a2b845a1b081d0ea93e467b4453fb25b1b3204912dbf937cf5bb1db6bf6ba7947989dadda9321b9ebd3bfda1b526b052e5e4690f1e1de84bd45c7dfc6e86ed60cb626f940998af74ee7e5039fc2d45ac928c1b5ec4698972d200b26269929bd0ce4870299d208242478df32486bf5a50a8b43a825befb37547c4fd4ca7cc22faeae148bf607a15ae61421beb7eee08119290502085ad6d1ce33c7c89be3c3f54a39c9ff3055132f15390972d20033fb2f00f080a952b62ca81f37cfe9de4fa515690e5cfe8918f13b59b507ed5291ec008e27c140623cce2573cbb8f238bf601c82f1e423533ef96c9ed86a9a681273b5b2f91ff9c831bf1be098e37f4e8bf3baab836f51729a82e2f115544c7a09529d46a54987ecdac0843f7195a0d03117a99624bb3d9c957690d834024778fda194e90e0e2742df82f7dd1cd377aa663b3d305ac13a5bf6df38c203670b457da43a91530958277e28fbb018601f9c891afae2ffd8887887c2d4b4c61755f0fa589426d9e0585b3fafd0d1f5268a173ecf5829fb59174547d41b63a865b7a30e233c7fe206b4f47c512038f218a228cc7ad014818d26f732a1e1db4f6eb2a00f90fd6a800675f86d15eb1260d98b4ca474bd0121df5c20cfc98659bdee1336d8c707bc436033db3e0203ff0689b7a863458669f1a310dfbd9fd8fd96579887cf056c6b6fc316adb8a01f3b729c1465f68cea05e24723cbae8f26a749194cbed436c0b3cbd757c78f17abd6b37294175859a904e60cd65f3a9e6141c208ee92c5fff76ae4065d2120f4d0dc5790b153027e1c2855eb635d29f74fadaa7911c97d8a37529311bd13cc1bb7cedc0eb1f470943d9c2c7a065437df075343c0ca2f0e872ff5197677f7614ec16c74cb2233ba654b0d39323b6b3777e77f25d6d2faf00ab9a127275a0e77fd939122a07282b770deb59910b6aa14e89788e97260672dae85ce2a7c8a70b93f4199b372122ba5cef984e8e3de9efbcbb0203010001");
+    const sig_sha256 = hexLit("5deb9438222fbf380e1a1747b289323f1156016977c4fbe378499add23f51f486589b3c575d1e799ca7886ad4f6a89251457fa2ba79f02f5ba3be6c1b0a77906e2b86c5fae70a6cdffc9f4c3363dd686cbd92205f835cee0ea4b180b92a7a4d89640a7ee85b485c5220c1c880c0aee686fd9b343ec97b57a79bccc2c4af1d64d1374400fe0dab49b6030a0de1f937c81e8804b2c67ac7978f78e365981ab57342a5b40ee548a7446965d3126d6d5d1eb999d8e1effcbe47b6bf8c59dddc05ffb7d04a0dd03912931ffb14e8703e8ba095f227189ee39d8d01bfb7ef717056f7a5cffb41eea3e666891ece24c7d3acaf7225a92a41066b7754e087fbc3a4709800556acd173b0f012bf10bf224980c93d60b7a789a34581c65b8bb9f6a01e1963ddd044d25f0a39d34332934d3e124a06ffe0edb42d03b171685491f96c25f7ee98db6fd5b86653764a9aafa972ebf35899cab1db0cf62a42278e904332820308e73c9e84913b22346342f72eed30c0e2cd32740b7fd2b7ad258d242188281a295ff20a1909def2e6f5c92642736c0fa9ce8c37e4a4a334d7d2bc0818a0c15a809f69e1de114cb8cffedc4b32531e6a5c73865f95b15ab517d1f1511e848e2aaf2dfa59d2cb99e633976c492d9dc0c2a894d0b71718be61066c856eeb4a6bcff6b71abab904acb0953d48d3558a58dbf95d83bb19767fe593945bd7b45a122643b7620d50dcfd835ff860075d70917851a09ff68ea1d25ee753e72c3120ff71b0d462b275a6b46cccd9b0918ee1937308e020288865ff31bcda5479bc74117680f7dcea3c2e17c544cc2d136910bd13523524fa77df02a65c3e300f8aa1ff1822d245addc00ca547d18853c69bc0eb213ba3f910e47652f3f7c13f18978a36e68aa4e0d11a9e00ab29047f9c6f875a33825c11d81029d55676f70723e46e54f96208db1f802033bf3c1607585fe3cd2ae29c87320e0242b1e561e31a69005bd86ac91aa7a83efc9061c5c4d773173cfd322eb060d938c193fd2bf08f5fa175ffe80fb7cda5663b6b2cc4b94ee30d8d22e94412447d71839141ccc017712927bcea532ac03822473477dc6693bf2203e3f1f3d6f21ca6b08d342e209de943a14505670eed6f82b39562fce8d36c487c18eccd2427c5f5cdd3aff08464f2afe1294880fe325c77eb7302fe7b7e3e298570d47f1062580cd370a594611e1da00dd96c7641dfe47ce0576f7cc9088efed8194f4a04e6d3a1e7bae2adb1d814f74f45a558108b22344ae372e61a79a86f15246810cdcb6e6dcac21ce10e7d5585e20ae7c38ae55cb93fcc87e5e4516ef1a7f35d04b70b2e4b2bcfeda85e1449ce4eb028648b9abebfe4bd7efc1920bc0099199398b9f51413d0ea0a0bf931dd3a39977ac275ede72ac810ed4c7c665670e5d4e3d16bda3d6315507d0683b7a80d202b2");
+    const oaep_sha256 = hexLit("1fce955e23cfd5d4fdac7f15d866188c2cb73244e654b44a44564a902e1a3d9c4f5724f45843bc72e90279193ac9657e75926bd43c514a0c87617dfffa1a945e6e00393c5c671bc5ba2996d162521a6191d0774b1af4b276c4643ef7829a5e5a046f541f014a263f81bdc34f2bffd7c0e26a24d79a7a1a886ce9e49e91183b13aa666e9a4abec734715d50b8219503b1b4992949097673eba28a358c72c989595d59d82d7bd22b28dfa82884d29bab5bf4ee520b3c46461a1f6ec2781057764fc151ba7ca828d0e2f26235c998f1d01a49f1225602b9ed02a964d6057965d2f83cd92d7d79b1ed1df8fb1b341e0bc07330e1cc653bead053fbf181827c22d0094a13122e20c3489fedc87aa69c31db460388a30772e5802bda8c04809b1d7019230371161677499e3afc3a309bc87b0a693ac32d946ee23ad239649a223092156923d0eef55f7b78b6723d39db992ecf1a5ebb582d5db9db07d3989bfc8a8ac20ab19b5a7767c97d5cabbf52ec9034f2602ecb48610939f0b7b8208009789d7ee60e6ddb1a55b53ede02d07040162cdd89466c835160c5e5053ad142a0dd79e1e80b60234af649655904c9f5bc96f1b647c5f0688aa8a4fa17438f814e468d6c8f4759bb8e77fe6e8fbda1f295648a88efdc0921b619d94c425eb3ee67ff75f47e07e4cae75f15632582a5f9f90400fff4d7bfbb6962e3bbf056d912484662c460952e41a3fbda63c2f1d7732a76cf4781b38b66f2981dc601108bddeda3804086793c1bb5bf98940377edcc479ff9fce978779066bb7072c66b481eaa9d09f30fecb57ccd34d682e67693dc1e1f31bcbdeed77b38cdbe5c3d27e75c0bd205e3d88447df66bce95111fa9d67b31121323e32b1861b751e9363ba14298c39cf0b0610e4cc45ed2578cbe15be110f42682cae272de82d92f4280361209f7dd6108a7be0df173165f469f716ae21646bc8671463bd50279ebcc4d05eb08f0f20e36b06b442f6be1306c1414465dacdfd3ff38f75dfa5fcd01d6586990ef7c4358506af9be98578305905d6e0a3185261819a2f1b059a8b07e8603784e7cbc7287b7783b7d5e60cb878f163ffd35c0c713d4b79a96b17fdb483c373ed82fbb13b7eb2422ce2baf7fc1083cb6e0ba828bac6b09c4fbaa9b553b2713348d00a0004ee9e56add85235b540fbcc487fa0f0d8e36a4c4c0857385300c4655b7f9c1911fd93ac93cfcde1ac46452b0dbdef4eac30f847ba5cc7a7e50b675ba451c63b1b53f81dbbf2e1be9dfad2be195c48ddd146f2d03c1b3ae65bcd7e6c8ddf1e77d8681d3c46fdef6d286ab72addd986012fade6916bb6acb8bc76bb6cff27d70ccb804ff050e4fb1ca8e05e282e0519b737b97c9754e676d5f6e278a118b4f6badf45770a2195f308cda1a48a83c50f029aa2e117d4ae96f2ae513e5e6ec6fd9b1e973");
+};
+
+test "8192-bit keys (R7): OpenSSL's key parses and round-trips; v1.5 sign byte-exact, OAEP decrypts, PSS both ways" {
+    const Sha256 = std.crypto.hash.sha2.Sha256;
+    var sk: SecretKey = undefined;
+    try SecretKey.fromDer(&sk, &kat8192.priv_pkcs1);
+    defer sk.deinit();
+    const pk = sk.publicKey();
+    try testing.expectEqual(8192, pk.bits());
+    var buf: [max_private_pem_len]u8 = undefined;
+    try testing.expectEqualSlices(u8, &kat8192.priv_pkcs1, try sk.toPkcs1Der(&buf));
+    try testing.expectEqualSlices(u8, &kat8192.pub_spki, try pk.toSpkiDer(&buf));
+    try testing.expect(pk.equal(&try PublicKey.fromDer(&kat8192.pub_spki)));
+    const vk = try VerifyKey.fromDer(&kat8192.pub_spki);
+
+    var out: [max_modulus_len]u8 = undefined;
+    try testing.expectEqualSlices(u8, &kat8192.sig_sha256, try signPkcs1v15(&sk, Sha256, kat8192.msg, &out));
+    try verifyPkcs1v15(pk, Sha256, kat8192.msg, &kat8192.sig_sha256);
+    try vk.verifyPkcs1v15(Sha256, kat8192.msg, &kat8192.sig_sha256);
+
+    var pt: [max_modulus_len]u8 = undefined;
+    try testing.expectEqualSlices(u8, "oaep-8192", try decryptOaep(&sk, Sha256, &kat8192.oaep_sha256, "", &pt));
+
+    var prng = std.Random.DefaultPrng.init(8192);
+    const sig = try signPss(&sk, Sha256, prng.random(), kat8192.msg, 32, &out);
+    try testing.expectEqual(32, try verifyPssAuto(pk, Sha256, kat8192.msg, sig));
+    try vk.verifyPss(Sha256, kat8192.msg, sig, 32);
+    // Blinded CRT and the non-CRT path agree at this size too.
+    var out2: [max_modulus_len]u8 = undefined;
+    try testing.expectEqualSlices(u8, &kat8192.sig_sha256, try signPkcs1v15Blinded(&sk, Sha256, .{ .csprng = prng.random() }, kat8192.msg, &out2));
+}
+
+test "8192-bit cap: a modulus one byte wider is refused" {
+    var n = [_]u8{0xff} ** (max_modulus_len + 1);
+    n[n.len - 1] = 0xfd; // odd
+    try testing.expectError(error.InvalidPublicKey, PublicKey.fromBytes(&n, &.{ 1, 0, 1 }));
+    try testing.expectError(error.InvalidPublicKey, VerifyKey.fromBytes(&n, &.{ 1, 0, 1 }));
+    try testing.expectEqual(1024, max_modulus_len);
 }
 
 test "generate: FIPS 186-5 d > 2^(nlen/2) bound (F2)" {

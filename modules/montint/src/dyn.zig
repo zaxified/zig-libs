@@ -55,6 +55,7 @@ const sar1 = nt.sar1;
 const halveMod = nt.halveMod;
 const divstepCount = nt.divstepCount;
 const safegcd = @import("safegcd.zig");
+const asm_core = @import("asm_core.zig");
 
 /// Slot granularity in limbs: a modulus runs on the next multiple of this.
 pub const step: usize = 4;
@@ -89,6 +90,20 @@ pub fn DynModint(comptime max_bits: comptime_int) type {
         r2: Elem,
         /// `R mod m` (one in the Montgomery domain).
         one_mont: Elem,
+
+        /// The slot-`s` result `v` as an `Elem`: `v` in the low `s` limbs,
+        /// zero above. Not `var out = zero`: past a few hundred bytes LLVM
+        /// lowers that `@memset` to Zig 0.16's byte-wise `compiler_rt.memset`,
+        /// and at rsa's 8192-bit capacity (1 KiB `Elem`) the full-width zeroing
+        /// of every result was ~3 % of a 2048-bit blinded sign (perf,
+        /// 2026-10-14). Only the limbs above the slot are zeroed, by vector
+        /// stores.
+        inline fn widen(comptime s: usize, v: *const [s]u64) Elem {
+            var out: Elem = undefined;
+            out[0..s].* = v.*;
+            if (s < max_limbs) zeroLimbs(max_limbs - s, out[s..]);
+            return out;
+        }
 
         fn Mod(comptime s: usize) type {
             return montint.Modint(s * 64);
@@ -222,7 +237,8 @@ pub fn DynModint(comptime max_bits: comptime_int) type {
         /// bytes past the capacity are OR-ed together and the single
         /// `error.Overflow` decision is taken on that sum.
         pub fn loadBE(be: []const u8) Error!Elem {
-            var v = zero;
+            var v: Elem = undefined;
+            zeroLimbs(max_limbs, &v); // not `= zero`: see `widen`
             var excess: u8 = 0;
             for (be, 0..) |b, i| {
                 const pos = be.len - 1 - i; // byte position from the LSB
@@ -240,10 +256,17 @@ pub fn DynModint(comptime max_bits: comptime_int) type {
         /// Constant-time up to the accept/reject outcome.
         pub fn elemFromBytesBE(self: *const Self, be: []const u8) Error!Elem {
             const v = try loadBE(be);
-            var t = v;
-            const borrow = limbs.subInto(&t, &self.m); // 1 ⟺ v < m
-            std.crypto.secureZero(u64, &t);
-            if (borrow == 0) return error.NonCanonical;
+            // v < m ⟺ nothing above the slot and the slot part borrows when
+            // m is subtracted; both bitwise into one verdict. Over the slot
+            // only (the modulus's limbs above it are zero), so the cost
+            // follows the key, not `max_bits`.
+            var high: u64 = 0;
+            for (v[self.L..]) |w| high |= w;
+            var t: Elem = undefined;
+            @memcpy(t[0..self.L], v[0..self.L]);
+            const borrow = limbs.subInto(t[0..self.L], self.m[0..self.L]); // 1 ⟺ v mod 2^(64L) < m
+            std.crypto.secureZero(u64, t[0..self.L]);
+            if ((borrow & (nzBit(high) ^ 1)) == 0) return error.NonCanonical;
             return v;
         }
 
@@ -349,9 +372,7 @@ pub fn DynModint(comptime max_bits: comptime_int) type {
                         const digit_mont = v.toMontgomery(&digit);
                         acc = v.add(&acc, &digit_mont);
                     }
-                    var out = zero;
-                    out[0..s].* = v.fromMontgomery(&acc);
-                    return out;
+                    return widen(s, &v.fromMontgomery(&acc));
                 }
             }
             unreachable;
@@ -450,9 +471,7 @@ pub fn DynModint(comptime max_bits: comptime_int) type {
             comptime var s: usize = min_limbs;
             inline while (s <= max_limbs) : (s += step) {
                 if (s == self.L) {
-                    var out = zero;
-                    out[0..s].* = self.view(s).add(a[0..s], b[0..s]);
-                    return out;
+                    return widen(s, &self.view(s).add(a[0..s], b[0..s]));
                 }
             }
             unreachable;
@@ -462,9 +481,7 @@ pub fn DynModint(comptime max_bits: comptime_int) type {
             comptime var s: usize = min_limbs;
             inline while (s <= max_limbs) : (s += step) {
                 if (s == self.L) {
-                    var out = zero;
-                    out[0..s].* = self.view(s).sub(a[0..s], b[0..s]);
-                    return out;
+                    return widen(s, &self.view(s).sub(a[0..s], b[0..s]));
                 }
             }
             unreachable;
@@ -479,9 +496,7 @@ pub fn DynModint(comptime max_bits: comptime_int) type {
             comptime var s: usize = min_limbs;
             inline while (s <= max_limbs) : (s += step) {
                 if (s == self.L) {
-                    var out = zero;
-                    out[0..s].* = self.view(s).mul(a[0..s], b[0..s]);
-                    return out;
+                    return widen(s, &self.view(s).mul(a[0..s], b[0..s]));
                 }
             }
             unreachable;
@@ -499,9 +514,7 @@ pub fn DynModint(comptime max_bits: comptime_int) type {
             comptime var s: usize = min_limbs;
             inline while (s <= max_limbs) : (s += step) {
                 if (s == self.L) {
-                    var out = zero;
-                    out[0..s].* = self.view(s).powMont(base[0..s], exp[0..s]);
-                    return out;
+                    return widen(s, &self.view(s).powMont(base[0..s], exp[0..s]));
                 }
             }
             unreachable;
@@ -529,9 +542,7 @@ pub fn DynModint(comptime max_bits: comptime_int) type {
                             }
                         }
                     }
-                    var out = zero;
-                    out[0..s].* = v.fromMontgomery(&acc);
-                    return out;
+                    return widen(s, &v.fromMontgomery(&acc));
                 }
             }
             unreachable;
@@ -1828,4 +1839,9 @@ test "DynModint sqrt: sqrt(x*x) squares back, every path, several slots" {
             try testing.expect(D.eql(&r, &x) or D.eql(&r, &m.neg(&x)));
         }
     }
+}
+
+/// Zero `n` words without a `compiler_rt.memset` call (see `widen`).
+fn zeroLimbs(comptime n: usize, p: *[n]u64) void {
+    if (comptime asm_core.supported) asm_core.zeroWords(n, p) else std.crypto.secureZero(u64, p);
 }

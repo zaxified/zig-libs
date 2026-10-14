@@ -95,8 +95,13 @@ pub fn Inverter(comptime max_bits: usize) type {
 
         const Trans = struct { u: i64, v: i64, q: i64, r: i64 };
 
+        // Only the first `k` (public) limbs of an `S62` are ever live — every
+        // loop runs to `k` — so nothing builds, copies or wipes all `K`: at
+        // rsa's 8192-bit capacity that full-width work (and its byte-wise
+        // `compiler_rt.memset`/volatile wipes) was ~2 % of a 2048-bit blinded
+        // sign (2026-10-14). Limbs at or above `k` stay `undefined`.
         fn fromLimbs(a: *const [N]u64, k: usize) S62 {
-            var out = [_]i64{0} ** K;
+            var out: S62 = undefined;
             for (0..k) |i| {
                 const bit = 62 * i;
                 const w = bit / 64;
@@ -110,7 +115,8 @@ pub fn Inverter(comptime max_bits: usize) type {
 
         /// Requires a normalized value: limbs in `[0, 2^62)`, value `< 2^(64·N)`.
         fn toLimbs(s: *const S62, k: usize) [N]u64 {
-            var out = [_]u64{0} ** N;
+            var out: [N]u64 = undefined;
+            zeroWords(N, &out);
             for (0..k) |i| {
                 const v: u64 = @bitCast(s[i]);
                 const bit = 62 * i;
@@ -333,12 +339,14 @@ pub fn Inverter(comptime max_bits: usize) type {
                 var st: State = .{
                     .m = m,
                     .minv62 = minv & M62,
-                    .d = [_]i64{0} ** K,
-                    .e = [_]i64{0} ** K,
+                    .d = undefined,
+                    .e = undefined,
                     .f = m,
                     .g = fromLimbs(x, k),
                     .zeta = -1,
                 };
+                @memset(st.d[0..k], 0);
+                @memset(st.e[0..k], 0);
                 st.e[0] = 1;
                 return st;
             }
@@ -356,15 +364,17 @@ pub fn Inverter(comptime max_bits: usize) type {
                 var acc: u64 = 0;
                 for (0..k) |i| acc |= @bitCast(st.g[i]);
                 const fs: i64 = st.f[k - 1] >> 63; // 0 or −1
-                var fn_ = st.f;
-                for (0..k) |i| fn_[i] = (fn_[i] ^ fs) -% fs; // |f| if f's sign limb is the only sign
+                var fn_: S62 = undefined;
+                for (0..k) |i| fn_[i] = (st.f[i] ^ fs) -% fs; // |f| if f's sign limb is the only sign
                 carryNorm(&fn_, k);
                 acc |= @as(u64, @bitCast(fn_[0])) ^ 1;
                 for (1..k) |i| acc |= @bitCast(fn_[i]);
                 normalize(&st.d, st.f[k - 1], &st.m, k);
                 out.* = toLimbs(&st.d, k);
-                std.crypto.secureZero(i64, &fn_);
-                std.crypto.secureZero(u8, std.mem.asBytes(st));
+                std.crypto.secureZero(i64, fn_[0..k]);
+                inline for (.{ &st.m, &st.d, &st.e, &st.f, &st.g }) |v| std.crypto.secureZero(i64, v[0..k]);
+                std.crypto.secureZero(u64, @as(*[1]u64, &st.minv62));
+                std.crypto.secureZero(i64, @as(*[1]i64, &st.zeta));
                 return acc == 0;
             }
         };
@@ -502,4 +512,11 @@ test "safegcd Inverter: x·x⁻¹ ≡ 1 against big-int, random odd moduli 64..4
     var x = [_]u64{0} ** I.N;
     x[0] = 15;
     try checkOne(I, gpa, &x, &m, 64 - @clz(m[0]));
+}
+
+/// Zero `n` words without a `compiler_rt.memset` call (vector stores on
+/// x86_64; see `DynModint.widen`).
+fn zeroWords(comptime n: usize, p: *[n]u64) void {
+    const asm_core = @import("asm_core.zig");
+    if (comptime asm_core.supported) asm_core.zeroWords(n, p) else std.crypto.secureZero(u64, p);
 }

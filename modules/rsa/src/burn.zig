@@ -28,12 +28,15 @@ pub noinline fn stack(comptime n: usize) void {
     for (0..buf.len) |i| p[i] = @splat(0);
 }
 
-/// Signing / decryption dirtied 187 KiB in ReleaseFast (2026-10-08): the
-/// key is carried at the 4096-bit capacity whatever its size, so the depth
-/// does not shrink with the key. ~2 µs of zeroing against a 2048-bit private
-/// operation's ~1 ms. Nested public calls (`signPkcs1v15` →
-/// `signPkcs1v15Blinded`) burn at each level.
-pub const private_op_burn = 200 * 1024;
+/// Signing / decryption dirtied 187 KiB in ReleaseFast at the 4096-bit cap
+/// (2026-10-08): the key is carried at the capacity whatever its size, so the
+/// depth does not shrink with the key. With the 8192-bit cap (2026-10-14)
+/// `fromPrimes` alone dirtied 325 KiB (STACKPROBE residue 232–277 KiB deep
+/// under the old 200 KiB burn); at 384 KiB every probed call is clean.
+/// ~8 µs of zeroing against a 2048-bit private operation's ~0.6–1 ms.
+/// Nested public calls (`signPkcs1v15` → `signPkcs1v15Blinded`) burn at
+/// each level.
+pub const private_op_burn = 384 * 1024;
 
 /// `bcryptPbkdf` and `Blowfish.init` (4 KiB Blowfish state per frame, one
 /// SHA-512 of the passphrase): one-shot slow KDF, generous size, not yet

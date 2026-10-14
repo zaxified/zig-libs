@@ -313,7 +313,7 @@ test "finalize unblinds the RFC 9474 Appendix A.1 blind_sig byte-exact (and its 
     const ctx = blindrsa.Context{
         .prepared_msg = &kat.a1.prepared_msg,
         .salt_len = kat.a1.salt.len,
-        .r_inv = kat.a1.inv,
+        .r_inv = rInv(&kat.a1.inv),
         .modulus_len = kat.a1.blind_sig.len,
     };
     var out: [blindrsa.max_modulus_len]u8 = undefined;
@@ -328,7 +328,7 @@ test "finalize unblinds the RFC 9474 Appendix A.4 blind_sig byte-exact (PSSZERO)
     const ctx = blindrsa.Context{
         .prepared_msg = &kat.a4.prepared_msg,
         .salt_len = kat.a4.salt.len,
-        .r_inv = kat.a4.inv,
+        .r_inv = rInv(&kat.a4.inv),
         .modulus_len = kat.a4.blind_sig.len,
     };
     var out: [blindrsa.max_modulus_len]u8 = undefined;
@@ -343,7 +343,7 @@ test "finalize fails closed on a tampered blind_sig (trailing verify rejects; no
     const ctx = blindrsa.Context{
         .prepared_msg = &kat.a1.prepared_msg,
         .salt_len = kat.a1.salt.len,
-        .r_inv = kat.a1.inv,
+        .r_inv = rInv(&kat.a1.inv),
         .modulus_len = kat.a1.blind_sig.len,
     };
     var out: [blindrsa.max_modulus_len]u8 = undefined;
@@ -377,7 +377,7 @@ test "B4: finalize rejects a Context whose modulus_len does not match pk, instea
     const ctx = blindrsa.Context{
         .prepared_msg = &kat.a1.prepared_msg,
         .salt_len = kat.a1.salt.len,
-        .r_inv = kat.a1.inv,
+        .r_inv = rInv(&kat.a1.inv),
         .modulus_len = 1024, // audit's own probe value: double the real length
     };
     var blind_sig_1024 = [_]u8{0} ** 1024;
@@ -402,7 +402,7 @@ test "B11: finalize rejects a blind_sig LONGER than ctx.modulus_len, not just sh
     const ctx = blindrsa.Context{
         .prepared_msg = &kat.a1.prepared_msg,
         .salt_len = kat.a1.salt.len,
-        .r_inv = kat.a1.inv,
+        .r_inv = rInv(&kat.a1.inv),
         .modulus_len = kat.a1.blind_sig.len,
     };
     var too_long = [_]u8{0} ** (blindrsa.max_modulus_len + 1);
@@ -442,7 +442,7 @@ test "finalize fails closed when the Context does not match the blind_sig (wrong
     const wrong_msg_ctx = blindrsa.Context{
         .prepared_msg = &kat.a4.prepared_msg,
         .salt_len = kat.a1.salt.len,
-        .r_inv = kat.a1.inv,
+        .r_inv = rInv(&kat.a1.inv),
         .modulus_len = kat.a1.blind_sig.len,
     };
     try testing.expectError(error.SignatureVerificationFailed, blindrsa.finalize(pk, Sha384, &kat.a1.blind_sig, &wrong_msg_ctx, &out));
@@ -451,13 +451,13 @@ test "finalize fails closed when the Context does not match the blind_sig (wrong
     const wrong_salt_ctx = blindrsa.Context{
         .prepared_msg = &kat.a1.prepared_msg,
         .salt_len = 0,
-        .r_inv = kat.a1.inv,
+        .r_inv = rInv(&kat.a1.inv),
         .modulus_len = kat.a1.blind_sig.len,
     };
     try testing.expectError(error.SignatureVerificationFailed, blindrsa.finalize(pk, Sha384, &kat.a1.blind_sig, &wrong_salt_ctx, &out));
 
     // Corrupted r_inv: unblinds to garbage, verify rejects.
-    var bad_inv = kat.a1.inv;
+    var bad_inv = rInv(&kat.a1.inv);
     bad_inv[7] ^= 0x40;
     const bad_inv_ctx = blindrsa.Context{
         .prepared_msg = &kat.a1.prepared_msg,
@@ -556,7 +556,7 @@ test "finalize: an out buffer one byte short of ctx.modulus_len is an error, not
     const ctx = blindrsa.Context{
         .prepared_msg = &kat.a1.prepared_msg,
         .salt_len = kat.a1.salt.len,
-        .r_inv = kat.a1.inv,
+        .r_inv = rInv(&kat.a1.inv),
         .modulus_len = kat.a1.blind_sig.len,
     };
     var too_small_buf: [blindrsa.max_modulus_len]u8 = undefined;
@@ -961,4 +961,13 @@ test "corpus: every damage script actually damages, and the counts are pinned" {
     try testing.expectEqual(@as(usize, 9), distinct);
     try testing.expectEqual(@as(usize, 3), lengths);
     try testing.expectEqual(@as(usize, 1), verified);
+}
+
+/// A KAT `inv` (the key's `modulus_len` bytes) as `Context.r_inv`: the
+/// meaningful bytes first, the rest of `max_modulus_len` zero (the field is
+/// sized by rsa's cap, 8192 bits since 2026-10-14; the RFC 9474 keys are 4096).
+fn rInv(inv: []const u8) [blindrsa.max_modulus_len]u8 {
+    var out = [_]u8{0} ** blindrsa.max_modulus_len;
+    @memcpy(out[0..inv.len], inv);
+    return out;
 }

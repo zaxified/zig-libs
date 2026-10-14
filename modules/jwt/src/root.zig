@@ -5477,11 +5477,12 @@ test "Key.rsaFromModExp: invalid modulus/exponent shapes → InvalidKey" {
     try testing.expectError(error.InvalidKey, Key.rsaFromModExp(n_bytes, ""));
     try testing.expectError(error.InvalidKey, Key.rsaFromModExp(n_bytes, &.{ 0, 0 }));
 
-    // Too-small (512-bit), odd-sized (800-bit) and oversized (8192-bit)
-    // moduli — only 2048/3072/4096 pass.
+    // Too-small (512-bit), odd-sized (800-bit) and oversized (one octet
+    // past rsa's cap, 8192 bits since 2026-10-14) moduli; 8192 itself passes.
     try testing.expectError(error.InvalidKey, Key.rsaFromModExp(&([_]u8{0xFF} ** 64), &e_ok));
     try testing.expectError(error.InvalidKey, Key.rsaFromModExp(&([_]u8{0xFF} ** 100), &e_ok));
-    try testing.expectError(error.InvalidKey, Key.rsaFromModExp(&([_]u8{0xFF} ** 1024), &e_ok));
+    try testing.expectError(error.InvalidKey, Key.rsaFromModExp(&([_]u8{0xFF} ** (rsa.max_modulus_len + 1)), &e_ok));
+    _ = try Key.rsaFromModExp(&([_]u8{0xFF} ** rsa.max_modulus_len), &e_ok);
 
     // Even modulus (an RSA modulus is a product of odd primes).
     var even_n: [256]u8 = undefined;

@@ -1182,7 +1182,7 @@ const have_avx = builtin.cpu.arch == .x86_64 and std.Target.x86.featureSetHas(bu
 /// 768-byte `A` of an L = 48 multiply, about a quarter of its product phase —
 /// perf on the bench host, 2026-10-14), and an asm store with a memory
 /// clobber can never be elided, so the same routine is the wipe.
-fn zeroWords(comptime n: usize, p: *[n]u64) void {
+pub fn zeroWords(comptime n: usize, p: *[n]u64) void {
     const text = comptime blk: {
         @setEvalBranchQuota(100_000);
         var s: AsmText(40 * n + 64) = .{};

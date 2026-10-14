@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-14** — follows rsa's 8192-bit cap: `max_modulus_len` (= `rsa.max_modulus_len`) 512 → 1024, so `Context.r_inv` and every `max_modulus_len` buffer doubles; behaviour unchanged. KAT tests build `r_inv` with a zero-padded helper instead of assigning the 512-byte RFC 9474 vector.
 - **2026-10-08** — **NO CONSUMER-VISIBLE CHANGE:** the dead-stack probe (`src/stackprobe_test.zig`) moved to the direct-region
   engine (p256's, 2026-10-08): the call runs under a `PAD`-deep shim, the region is painted and read
   through a pointer, callee-saved registers are scrubbed first. The old "claim an uninitialised
