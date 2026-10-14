@@ -48,6 +48,18 @@ All of the following are fully implemented:
 
 - **Stream header**: window bits (WBITS 10..24; the large-window extension is
   explicitly rejected as `InvalidWindowBits`).
+- **Raw prefix dictionary** (RFC 9841 §3.2, 2026-10-14; `Options.dictionary`, all three decoders):
+  distances `max_distance + 1 .. max_distance + D` copy from the dictionary at
+  `D + max_distance - distance`, running on into the window's oldest byte past its end; they enter
+  the distance ring like any copy; static-dictionary word ids start past them; literal contexts at
+  the stream's start see zeros, not the dictionary. The streaming decoder's ring is sized to the
+  window plus the dictionary (a copy that runs on from the dictionary reaches that far back).
+  Anchored on 20 streams libbrotli 1.2.0 made with a raw dictionary (5 cases × q2/5/9/11: long
+  dictionary copies, copies running from the dictionary into the window, inputs past a 64 KiB and a
+  1 KiB window, binary), decoded by all three decoders in the replay test; q5+ streams are checked to
+  need their dictionary. Negative control: without the ring push, 8 of them fail. Not exercised by
+  any committed stream: a dictionary copy that runs on into the window once the output has passed
+  `max_backward` (libbrotli did not emit one on the corpus).
 - **Meta-block structure**: `ISLAST`, `ISLASTEMPTY`, `MNIBBLES`/`MLEN`,
   `ISUNCOMPRESSED`, and metadata meta-blocks (`MSKIPLEN`, skipped); the
   "no leading-zero final nibble/byte" rules are enforced.
@@ -375,7 +387,7 @@ Order: P (encoder hasher) → R1 (+R3–R5) → R6/R8 → R9 (+R10/R11) → R7 �
 - **R3 Encoder parameters** — ~~`window_bits` (10..24)~~ **done 2026-10-14** (`CompressOptions.window_bits`, `StreamOptions.window_bits`); ~~`size_hint`~~ **done 2026-10-14** (`StreamOptions.size_hint`: the table sized for the expected length — a short response no longer clears a 1–2 MiB table — and, given the exact length, the stream is `compressWith`'s bytes for any input). Left, deliberately not now: `mode` (google's text/font hints steer its context-mode choice and NPOSTFIX/NDIRECT; ours picks the context mode by cost per block and has no NPOSTFIX tuning, so a mode would have nothing to steer) and literal context modelling on/off (an effort choice already: `.fast` has none) — wait for a consumer asking.
 - ~~**R4 `maxCompressedSize(n)` + `compressInto(out, …)`**~~ — **DONE 2026-10-14**: `maxCompressedSize(n, opts)` (every block stored + the final empty meta-block; reached exactly by random input, tested over windows and block sizes) and `compressInto(gpa, out, input, opts)` — the `compressWith` stream in the caller's buffer, `error.OutputTooLarge` only when that stream does not fit (tested on the whole corpus × efforts at its exact length and one byte less). A block whose attempt overruns the buffer is decided again in a scratch writer, so a tight buffer never changes the bytes.
 - ~~**R5 Metadata meta-blocks from the encoder**~~ — **DONE 2026-10-14**: `StreamWriter.writeMetadata(bytes)` (google's `EMIT_METADATA`): a flush, then metadata meta-blocks of up to 16 MiB each (shortest MSKIPBYTES); blessed by google/brotli (`stream_metadata` variant).
-- **R6 Raw prefix dictionary (RFC 9841) on both ends + RFC 9842 `dcb` framing** (`ff 44 43 42` + SHA-256 of the dictionary + Shared-Brotli stream, window ≤ 16 MiB) — delta updates of web assets; Chrome ships it.
+- **R6 Raw prefix dictionary (RFC 9841) on both ends + RFC 9842 `dcb` framing** — decoder side **done 2026-10-14** (`Options.dictionary`; § Decoder); left: the encoder, `dcb` framing. (`ff 44 43 42` + SHA-256 of the dictionary + Shared-Brotli stream, window ≤ 16 MiB) — delta updates of web assets; Chrome ships it.
 - **R7 Serialized shared dictionaries (RFC 9841 §5) — decoder only**: custom word lists, custom transforms incl. ShiftFirst/ShiftAll, context-selected dictionaries, embedded prefix. Encoder side deliberately not (owner 2026-10-14: a research tool only google ships).
 - **R8 Large window (RFC 9841)** — decoder to WBITS 62 on 64-bit targets (30 on 32-bit), encoder option to 30.
 - **R9 Pull `std.Io.Reader` decoder** — the decoder becomes a state machine that suspends mid-command; `decompressStream` becomes a loop over it (one decoding logic stays).

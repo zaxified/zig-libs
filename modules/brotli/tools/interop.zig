@@ -42,6 +42,11 @@
 //!   zig build interop-brotli -- --capture     # …and rewrite the fixtures
 //!   zig build interop-brotli -- --driver P    # non-default reference.py
 //!
+//! Raw prefix dictionaries (RFC 9841 / `dcb`) are beyond the Python binding:
+//! for those the reference is libbrotli itself, through a small C program
+//! (`tools/c_oracle/shared_oracle.c`) built with `zig cc` against the system
+//! library (`--libbrotli DIR`, default /usr/lib/x86_64-linux-gnu).
+//!
 //! Needs `python3` with `pip install brotli`. It does not skip: an absent
 //! reference is a failure here, because running this program IS the request to
 //! consult the reference.
@@ -147,6 +152,72 @@ const Ref = struct {
         const w = std.fmt.bufPrint(&wbuf, "{d}", .{lgwin}) catch unreachable;
         try self.call(&.{ "python3", self.driver, "compress", q, w, in, out }, false);
         return self.read(out_bin);
+    }
+};
+
+/// libbrotli itself (`tools/c_oracle/shared_oracle.c`, built here with
+/// `zig cc` against the system library), for what the Python binding cannot
+/// reach: raw prefix dictionaries and the large window.
+const Shared = struct {
+    ref: *Ref,
+    exe: []const u8,
+
+    const lib_dir_default = "/usr/lib/x86_64-linux-gnu";
+    const src = "modules/brotli/tools/c_oracle/shared_oracle.c";
+
+    fn build(ref: *Ref, lib_dir: []const u8) !Shared {
+        const gpa = ref.gpa;
+        const exe = try ref.path("shared_oracle");
+        errdefer gpa.free(exe);
+        var libs: [3][]u8 = undefined;
+        for (&libs, [_][]const u8{ "enc", "dec", "common" }) |*l, n| l.* = try std.fmt.allocPrint(gpa, "{s}/libbrotli{s}.so.1", .{ lib_dir, n });
+        defer for (libs) |l| gpa.free(l);
+        const r = try std.process.run(gpa, ref.io, .{ .argv = &.{ "zig", "cc", "-O2", src, libs[0], libs[1], libs[2], "-o", exe } });
+        defer gpa.free(r.stdout);
+        defer gpa.free(r.stderr);
+        if (r.term != .exited or r.term.exited != 0) {
+            std.debug.print("could not build {s} against {s} (LIBBROTLI_DIR):\n{s}\n", .{ src, lib_dir, r.stderr });
+            return error.NoReference;
+        }
+        return .{ .ref = ref, .exe = exe };
+    }
+
+    fn deinit(sh: *Shared) void {
+        sh.ref.gpa.free(sh.exe);
+    }
+
+    fn file(sh: *Shared, name: []const u8, data: ?[]const u8) ![]u8 {
+        if (data) |d| try sh.ref.dir.writeFile(sh.ref.io, .{ .sub_path = name, .data = d });
+        return sh.ref.path(name);
+    }
+
+    /// The library's stream for `plain` against `dict` (empty: none).
+    fn compress(sh: *Shared, dict: []const u8, plain: []const u8, quality: u8, lgwin: u8, large: bool) ![]u8 {
+        const gpa = sh.ref.gpa;
+        const d = if (dict.len == 0) try gpa.dupe(u8, "-") else try sh.file("dict.bin", dict);
+        defer gpa.free(d);
+        const in = try sh.file(Ref.in_bin, plain);
+        defer gpa.free(in);
+        const out = try sh.file(Ref.out_bin, null);
+        defer gpa.free(out);
+        var qb: [4]u8 = undefined;
+        var wb: [4]u8 = undefined;
+        try sh.ref.call(&.{ sh.exe, "enc", std.fmt.bufPrint(&qb, "{d}", .{quality}) catch unreachable, std.fmt.bufPrint(&wb, "{d}", .{lgwin}) catch unreachable, if (large) "1" else "0", d, in, out }, false);
+        return sh.ref.read(Ref.out_bin);
+    }
+
+    /// The library's verdict on `stream` against `dict`;
+    /// `error.ReferenceRejected` when it refuses it.
+    fn decompress(sh: *Shared, dict: []const u8, stream: []const u8, large: bool) ![]u8 {
+        const gpa = sh.ref.gpa;
+        const d = if (dict.len == 0) try gpa.dupe(u8, "-") else try sh.file("dict.bin", dict);
+        defer gpa.free(d);
+        const in = try sh.file(Ref.in_bin, stream);
+        defer gpa.free(in);
+        const out = try sh.file(Ref.out_bin, null);
+        defer gpa.free(out);
+        try sh.ref.call(&.{ sh.exe, "dec", if (large) "1" else "0", d, in, out }, true);
+        return sh.ref.read(Ref.out_bin);
     }
 };
 
@@ -270,6 +341,72 @@ fn checkDecoderDirection(ref: *Ref) !void {
     }
 }
 
+// ── raw prefix dictionaries: the library's streams, our decoders ───────────
+
+/// Every way this module decodes, against `dict`: they must all give `plain`.
+fn ourDecoders(gpa: std.mem.Allocator, dict: []const u8, stream: []const u8, plain: []const u8) !?[]const u8 {
+    const opts: brotli.Options = .{ .dictionary = dict, .max_output = 1 << 24 };
+    const a = brotli.decompress(gpa, stream, opts) catch |e| return @errorName(e);
+    defer gpa.free(a);
+    if (!std.mem.eql(u8, a, plain)) return "decompress: different bytes";
+    const buf = try gpa.alloc(u8, plain.len + 1);
+    defer gpa.free(buf);
+    const b = brotli.decompressInto(gpa, buf, stream, opts) catch |e| return @errorName(e);
+    if (!std.mem.eql(u8, b, plain)) return "decompressInto: different bytes";
+    var r: std.Io.Reader = .fixed(stream);
+    var w: std.Io.Writer.Allocating = .init(gpa);
+    defer w.deinit();
+    _ = brotli.decompressStream(gpa, &r, &w.writer, opts) catch |e| return @errorName(e);
+    if (!std.mem.eql(u8, w.written(), plain)) return "decompressStream: different bytes";
+    return null;
+}
+
+fn checkDictDecoderDirection(sh: *Shared) !void {
+    const gpa = sh.ref.gpa;
+    inline for (corpus.dict_cases) |c| {
+        const dict = try c.dict.build(gpa);
+        defer gpa.free(dict);
+        const plain = try c.input.build(gpa);
+        defer gpa.free(plain);
+        inline for (corpus.dict_qualities) |q| {
+            const stream = try sh.compress(dict, plain, q, c.lgwin, false);
+            defer gpa.free(stream);
+            if (try ourDecoders(gpa, dict, stream, plain)) |why| {
+                bad("dict {s} q{d}: we did not decode the library's stream ({s})", .{ c.name, q, why });
+            } else ok();
+            const fx = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ ref_dir, comptime corpus.dictRefFile(c, q) });
+            defer gpa.free(fx);
+            if (std.Io.Dir.cwd().readFileAlloc(sh.ref.io, fx, gpa, .unlimited)) |committed| {
+                defer gpa.free(committed);
+                if (!std.mem.eql(u8, committed, stream))
+                    note("{s}: the committed stream is not what this library emits ({d} vs {d} bytes) — --capture re-records it", .{ fx, committed.len, stream.len });
+            } else |_| note("{s}: not committed yet — run with --capture", .{fx});
+        }
+    }
+}
+
+fn captureDictRefStreams(sh: *Shared) !void {
+    const gpa = sh.ref.gpa;
+    try std.Io.Dir.cwd().createDirPath(sh.ref.io, ref_dir ++ "/dict");
+    var total: usize = 0;
+    var n: usize = 0;
+    inline for (corpus.dict_cases) |c| {
+        const dict = try c.dict.build(gpa);
+        defer gpa.free(dict);
+        const plain = try c.input.build(gpa);
+        defer gpa.free(plain);
+        inline for (corpus.dict_qualities) |q| {
+            const stream = try sh.compress(dict, plain, q, c.lgwin, false);
+            defer gpa.free(stream);
+            const out = ref_dir ++ "/" ++ comptime corpus.dictRefFile(c, q);
+            try std.Io.Dir.cwd().writeFile(sh.ref.io, .{ .sub_path = out, .data = stream });
+            total += stream.len;
+            n += 1;
+        }
+    }
+    std.debug.print("wrote {d} dictionary reference streams into {s}/dict/ ({d} bytes total)\n", .{ n, ref_dir, total });
+}
+
 // ── the capture ─────────────────────────────────────────────────────────────
 
 fn captureRefStreams(ref: *Ref) !void {
@@ -371,11 +508,14 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     defer if (da.deinit() == .leak) @panic("leak");
     const gpa = da.allocator();
 
-    var threaded: std.Io.Threaded = .init(gpa, .{});
+    // The environment, so spawned programs are found on the caller's PATH
+    // (`zig` for the libbrotli oracle).
+    var threaded: std.Io.Threaded = .init(gpa, .{ .environ = init.environ });
     defer threaded.deinit();
     const io = threaded.io();
 
     var driver: []const u8 = default_driver;
+    var lib_dir: []const u8 = Shared.lib_dir_default;
     var scratch: []const u8 = default_scratch;
     var capture = false;
 
@@ -388,6 +528,8 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
             driver = args.next() orelse return usage();
         } else if (std.mem.eql(u8, a, "--scratch")) {
             scratch = args.next() orelse return usage();
+        } else if (std.mem.eql(u8, a, "--libbrotli")) {
+            lib_dir = args.next() orelse return usage();
         } else {
             std.debug.print("unknown argument '{s}'\n", .{a});
             return usage();
@@ -413,11 +555,18 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     defer gpa.free(provenance);
     std.debug.print("reference: {s}\n", .{provenance});
 
+    var shared = Shared.build(&ref, lib_dir) catch |e| {
+        std.debug.print("could not build the libbrotli oracle: {s}\n", .{@errorName(e)});
+        return 2;
+    };
+    defer shared.deinit();
+
     if (capture) {
         // Capture and stop. The live check compares against the fixtures as
         // this binary was COMPILED with, which the writes above just made
         // stale — reporting on that would be reporting on nothing.
         try captureRefStreams(&ref);
+        try captureDictRefStreams(&shared);
         try captureBlessed(&ref, provenance);
         std.debug.print("fixtures rewritten — re-run `zig build interop-brotli` to verify them\n", .{});
         return 0;
@@ -425,13 +574,14 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
 
     try checkEncoderDirection(&ref);
     try checkDecoderDirection(&ref);
+    try checkDictDecoderDirection(&shared);
     std.debug.print("{d} checks, {d} mismatches, {d} notes\n", .{ checks, failures, notes });
     return if (failures == 0) 0 else 1;
 }
 
 fn usage() u8 {
     std.debug.print(
-        \\usage: zig build interop-brotli -- [--capture] [--driver PATH] [--scratch DIR]
+        \\usage: zig build interop-brotli -- [--capture] [--driver PATH] [--scratch DIR] [--libbrotli DIR]
         \\
     , .{});
     return 2;

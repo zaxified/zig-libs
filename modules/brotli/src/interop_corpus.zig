@@ -198,6 +198,66 @@ pub const shapes = [_]Shape{
     .{ .name = "block_plus_one", .gen = .{ .alice_cycle = block + 1 } },
 };
 
+/// The shape named `name` (a corpus typo is a build failure).
+pub fn shapeNamed(comptime name: []const u8) Shape {
+    inline for (shapes) |sh| {
+        if (comptime std.mem.eql(u8, sh.name, name)) return sh;
+    }
+    @compileError("no corpus shape '" ++ name ++ "'");
+}
+
+// ── raw prefix dictionaries (RFC 9841 §3.2, RFC 9842 `dcb`) ────────────────
+
+/// A slice of a shape's bytes.
+pub const Piece = struct {
+    shape: []const u8,
+    from: usize = 0,
+    to: ?usize = null,
+
+    pub fn build(comptime p: Piece, gpa: std.mem.Allocator) ![]u8 {
+        const all = try corpusBuild(gpa, shapeNamed(p.shape));
+        defer gpa.free(all);
+        return gpa.dupe(u8, all[p.from..(p.to orelse all.len)]);
+    }
+};
+
+/// An input compressed against a raw prefix dictionary. Python's `brotli`
+/// cannot attach one, so the reference here is libbrotli itself
+/// (`tools/c_oracle/shared_oracle.c`).
+pub const DictCase = struct {
+    name: []const u8,
+    dict: Piece,
+    input: Piece,
+    lgwin: u5,
+};
+
+pub const dict_cases = [_]DictCase{
+    // Overlapping text: long copies out of the dictionary.
+    .{ .name = "alice_head_tail", .dict = .{ .shape = "alice_full", .to = 60_000 }, .input = .{ .shape = "alice_full", .from = 52_089, .to = 100_000 }, .lgwin = 22 },
+    // The input goes on where the dictionary stops: copies that start in
+    // the dictionary and run on into the window's first bytes.
+    .{ .name = "alice_split", .dict = .{ .shape = "alice_full", .to = 1_000 }, .input = .{ .shape = "alice_full", .from = 1_000, .to = 40_000 }, .lgwin = 22 },
+    // An input past a 64 KiB window: the dictionary stays reachable beyond
+    // the window, at distances past `max_backward`.
+    .{ .name = "alice_w16", .dict = .{ .shape = "alice_full", .to = 30_000 }, .input = .{ .shape = "alice_full", .to = 80_000 }, .lgwin = 16 },
+    // Binary: the dictionary is random bytes the input repeats.
+    .{ .name = "random_w18", .dict = .{ .shape = "random_70000", .to = 40_000 }, .input = .{ .shape = "random_70000", .from = 15_000, .to = 35_000 }, .lgwin = 18 },
+    // A dictionary five times a 1 KiB window.
+    .{ .name = "alice_w10", .dict = .{ .shape = "alice_full", .to = 5_000 }, .input = .{ .shape = "alice_full", .from = 3_000, .to = 20_000 }, .lgwin = 10 },
+};
+
+/// The qualities the reference compresses each `DictCase` at: q2..4 search
+/// the dictionary with its quick hashers, q5+ with the deep ones and
+/// context modelling, q11 with the optimal parse.
+pub const dict_qualities = [_]u8{ 2, 5, 9, 11 };
+
+/// `testdata/ref/dict/<case>.q<Q>.br`.
+pub fn dictRefFile(comptime c: DictCase, comptime q: u8) []const u8 {
+    return std.fmt.comptimePrint("dict/{s}.q{d}.br", .{ c.name, q });
+}
+
+const corpusBuild = build;
+
 // ── the reference's own streams ─────────────────────────────────────────────
 
 /// One `brotli.compress(input, quality=q, lgwin=w, mode=MODE_GENERIC)` run,

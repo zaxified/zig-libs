@@ -41,6 +41,10 @@ pub const Options = struct {
     /// of ratio-based rejection for a specific trusted source must raise
     /// this floor (or `max_ratio`) explicitly, not just the absolute cap.
     min_output_floor: usize = 1024 * 1024,
+    /// A raw prefix dictionary (RFC 9841 §3.2; what RFC 9842 `dcb` uses):
+    /// bytes a copy may reach as if they came just before the window. Must
+    /// be the encoder's exactly. Not counted as output.
+    dictionary: []const u8 = &.{},
 };
 
 /// The output cap actually enforced for a stream of `input_len` bytes:
@@ -86,6 +90,8 @@ fn DecoderOf(comptime Sink: type) type {
         /// a 32-bit `usize`.
         wbits: u5 = 0,
         max_backward: usize = 0,
+        /// `Options.dictionary`.
+        prefix: []const u8 = &.{},
         dist_rb: [4]i32 = .{ 16, 15, 11, 4 },
         dist_rb_idx: u32 = 0,
 
@@ -562,13 +568,29 @@ fn DecoderOf(comptime Sink: type) type {
                 const max_distance: i64 = @min(@as(i64, @intCast(pos)), @as(i64, @intCast(self.max_backward)));
                 const copy: usize = copy_len;
 
-                if (@as(i64, distance) > max_distance) {
-                    // Static-dictionary reference.
+                if (@as(i64, distance) > max_distance and @as(i64, distance) - max_distance <= self.prefix.len) {
+                    // Into the prefix dictionary, which sits just before the
+                    // window; a copy running past its end goes on at the
+                    // window's start (RFC 9841 §3.2). A regular copy
+                    // otherwise: its distance enters the ring.
+                    const dlen = self.prefix.len;
+                    const addr: usize = dlen + @as(usize, @intCast(max_distance)) - @as(usize, @intCast(distance));
+                    const from_dict = @min(copy, dlen - addr);
+                    self.dist_rb[self.dist_rb_idx & 3] = distance;
+                    self.dist_rb_idx +%= 1;
+                    try self.ensureRoom(copy);
+                    try self.out.putSlice(self.prefix[addr..][0..from_dict]);
+                    if (copy > from_dict) try self.out.copyBack(from_dict + @as(usize, @intCast(max_distance)), copy - from_dict);
+                    mlen -= @intCast(copy);
+                    if (mlen < 0) return error.InvalidLength;
+                } else if (@as(i64, distance) > max_distance) {
+                    // Static-dictionary reference (its word ids start past
+                    // the prefix dictionary).
                     if (distance > tables.max_allowed_distance) return error.InvalidDistance;
                     if (copy < dict.min_word_length or copy > dict.max_word_length) return error.InvalidDictionary;
                     const shift = dict.size_bits_by_length[copy];
                     if (shift == 0) return error.InvalidDictionary;
-                    const address: i64 = @as(i64, distance) - max_distance - 1;
+                    const address: i64 = @as(i64, distance) - max_distance - 1 - @as(i64, @intCast(self.prefix.len));
                     const word_mask: i64 = (@as(i64, 1) << @intCast(shift)) - 1;
                     const word_idx: usize = @intCast(address & word_mask);
                     const transform_idx: i64 = address >> @intCast(shift);
@@ -846,6 +868,7 @@ pub fn decompressInto(gpa: std.mem.Allocator, out: []u8, input: []const u8, opti
         .arena = arena_state.allocator(),
         .br = &br,
         .out = &sink,
+        .prefix = options.dictionary,
     };
     try dec.run();
     return out[0..sink.len];
@@ -865,6 +888,7 @@ pub fn decompress(gpa: std.mem.Allocator, input: []const u8, options: Options) B
         .arena = arena_state.allocator(),
         .br = &br,
         .out = &sink,
+        .prefix = options.dictionary,
     };
     try dec.run();
 
@@ -961,7 +985,9 @@ const RingSink = struct {
     /// (then nothing ever wraps, and a distance past what was produced is
     /// refused before it is read). It starts small; see `makeRoom`.
     fn setWindow(s: *RingSink, wbits: u5) Error!void {
-        const window = @as(usize, 1) << wbits;
+        // A copy out of the prefix dictionary that runs on into the window
+        // reaches back up to the window plus the dictionary.
+        const window = std.math.ceilPowerOfTwo(usize, (@as(usize, 1) << wbits) + s.options.dictionary.len) catch return error.OutOfMemory;
         const cap_pow2 = std.math.ceilPowerOfTwo(usize, @max(s.options.max_output, 1)) catch window;
         s.limit = @min(window, cap_pow2);
         const len = @min(s.limit, initial_len);
@@ -1012,6 +1038,7 @@ pub fn decompressStream(gpa: std.mem.Allocator, in: *std.Io.Reader, out: *std.Io
         .arena = arena_state.allocator(),
         .br = &br,
         .out = &sink,
+        .prefix = options.dictionary,
     };
     dec.run() catch |err| {
         if (err == error.TruncatedInput and br.read_failed) return error.ReadFailed;

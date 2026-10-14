@@ -83,6 +83,40 @@ test "interop replay: our decoder reproduces the plaintext from google/brotli's 
     }
 }
 
+test "interop replay: every decoder reproduces the plaintext from libbrotli's raw-dictionary streams" {
+    const gpa = testing.allocator;
+    inline for (corpus.dict_cases) |c| {
+        const dict = try c.dict.build(gpa);
+        defer gpa.free(dict);
+        const plain = try c.input.build(gpa);
+        defer gpa.free(plain);
+        const buf = try gpa.alloc(u8, plain.len + 1);
+        defer gpa.free(buf);
+        inline for (corpus.dict_qualities) |q| {
+            const stream = @embedFile("testdata/ref/" ++ comptime corpus.dictRefFile(c, q));
+            errdefer std.debug.print("dict {s} q{d}\n", .{ c.name, q });
+            const opts: brotli.Options = .{ .dictionary = dict, .max_output = 1 << 24 };
+            const a = try brotli.decompress(gpa, stream, opts);
+            defer gpa.free(a);
+            try testing.expectEqualSlices(u8, plain, a);
+            try testing.expectEqualSlices(u8, plain, try brotli.decompressInto(gpa, buf, stream, opts));
+            var r: std.Io.Reader = .fixed(stream);
+            var w: std.Io.Writer.Allocating = .init(gpa);
+            defer w.deinit();
+            _ = try brotli.decompressStream(gpa, &r, &w.writer, opts);
+            try testing.expectEqualSlices(u8, plain, w.written());
+            // The case needs its dictionary (from q5 on; q2 may not use it):
+            // without, the stream is refused or decodes to other bytes.
+            if (q >= 5) {
+                if (brotli.decompress(gpa, stream, .{ .max_output = 1 << 24 })) |other| {
+                    defer gpa.free(other);
+                    try testing.expect(!std.mem.eql(u8, plain, other));
+                } else |_| {}
+            }
+        }
+    }
+}
+
 // ── direction 2: our streams, as the reference blessed them ─────────────────
 
 test "interop replay: the encoder still emits the exact streams google/brotli accepted" {
