@@ -50,6 +50,11 @@ _ = db.count();                    // in-memory
 if (db.deadBytes() > 1 << 20)      // caller-driven compaction (v0)
     try db.compact();              // temp + fsync + rename + dir-fsync swap
 
+// Snapshot iteration (Bitcask fold): key order, values as of the call, while writes go on.
+var it = try db.iterator(gpa, "user:");
+defer it.deinit();
+while (try it.next()) |p| _ = .{ p.key, p.value };   // slices valid until the next call
+
 // Listing: sorted copies of the live keys under a prefix ("" = all).
 const ks = try db.keys(gpa, "user:");
 defer ks.deinit(gpa);

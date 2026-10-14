@@ -728,6 +728,11 @@ pub fn FsStorageCapacity(comptime max_handles: usize) type {
         /// Opened `.read_only`: writes and truncation are refused here, not
         /// left to the OS's choice of errno.
         read_only: [max_handles]bool = @splat(false),
+        /// Guards slot claim and release, so threads opening and closing at
+        /// once (one `Db`'s merge and its writer, or several `Db`s on one
+        /// backend) never pick the same slot. Use of a held handle's slot
+        /// needs no lock: only its owner touches it.
+        table_lock: std.Io.Mutex = .init,
 
         /// How many files this backend can hold open at once. Exceeding it is
         /// `error.HandleTableFull`, never `error.Unexpected`.
@@ -781,6 +786,10 @@ pub fn FsStorageCapacity(comptime max_handles: usize) type {
 
         fn vOpen(ctx: *anyopaque, path: []const u8, mode: Storage.OpenMode) Storage.Error!Storage.Handle {
             const self = cast(ctx);
+            // Held across the open itself: the slot must stay ours until the
+            // file is in it (opens are rare next to reads and writes).
+            self.table_lock.lockUncancelable(self.io);
+            defer self.table_lock.unlock(self.io);
             // The handle table is this backend's only fixed resource. It
             // used to report exhaustion as `error.Unexpected`, so a caller
             // that simply needed one more open file could not tell a sizing
@@ -870,8 +879,14 @@ pub fn FsStorageCapacity(comptime max_handles: usize) type {
 
         fn vClose(ctx: *anyopaque, h: Storage.Handle) void {
             const self = cast(ctx);
-            if (self.files[h]) |f| f.close(self.io);
-            self.files[h] = null;
+            const f = blk: {
+                self.table_lock.lockUncancelable(self.io);
+                defer self.table_lock.unlock(self.io);
+                const f = self.files[h];
+                self.files[h] = null;
+                break :blk f;
+            };
+            if (f) |file| file.close(self.io);
         }
 
         fn vRename(ctx: *anyopaque, old_path: []const u8, new_path: []const u8) Storage.Error!void {
@@ -1061,6 +1076,10 @@ pub const Db = struct {
     /// Any manifest written meanwhile (a rotation) lists them as obsolete,
     /// so a crash leaves nothing behind. Changed under the writer lock.
     pending: std.ArrayListUnmanaged(u32),
+    /// Files no longer in the store but still pinned by an `Iterator`:
+    /// handle open, closed and freed at the last unpin. Changed under the
+    /// writer lock.
+    retired: std.ArrayListUnmanaged(*DataFile),
     /// Serializes `merge` and `compact` (lock order: `merge_lock`, then
     /// `lock`, then `rw`). A merge copies under this lock alone, so writers
     /// and readers go on meanwhile.
@@ -1115,6 +1134,10 @@ pub const Db = struct {
         /// Hint entries collected while this file is a merge output being
         /// written; empty otherwise (see `finishOutput`).
         hint: std.ArrayListUnmanaged(u8) = .empty,
+        /// Live `Iterator`s whose snapshot points into this file. A merge or
+        /// compaction that retires a pinned file deletes its name but keeps
+        /// the handle open (`Db.retired`) until the last unpin.
+        pins: std.atomic.Value(u32) = .init(0),
     };
 
     const Entry = struct {
@@ -1168,6 +1191,7 @@ pub const Db = struct {
             .next_file_id = 1,
             .obsolete = .empty,
             .pending = .empty,
+            .retired = .empty,
             .merge_lock = .{ .io = store.io },
             .path = try gpa.dupe(u8, path),
             .tmp_path = undefined,
@@ -1455,6 +1479,11 @@ pub const Db = struct {
         self.freeKeydir();
         self.obsolete.deinit(self.gpa);
         self.pending.deinit(self.gpa);
+        for (self.retired.items) |df| {
+            self.store.close(df.handle);
+            self.gpa.destroy(df);
+        }
+        self.retired.deinit(self.gpa);
         self.gpa.free(self.path);
         self.gpa.free(self.tmp_path);
         self.gpa.free(self.manifest_tmp);
@@ -1874,6 +1903,100 @@ pub const Db = struct {
         return .{ .keys = try out.toOwnedSlice(gpa) };
     }
 
+    /// A consistent snapshot of the live keys under a prefix and their
+    /// values, in key order — Bitcask's `fold` / iterator. See `iterator`.
+    pub const Iterator = struct {
+        db: *Db,
+        gpa: Allocator,
+        items: []Item,
+        pinned: []*DataFile,
+        i: usize = 0,
+        value: std.ArrayListUnmanaged(u8) = .empty,
+
+        const Item = struct { key: []u8, e: Entry };
+
+        pub const Pair = struct { key: []const u8, value: []const u8 };
+
+        /// The next key and value, or null at the end. Both slices belong to
+        /// the iterator and stay valid until the next `next` or `deinit`. The
+        /// value is read as of the snapshot — a later write, delete, merge
+        /// or compaction does not change what the iterator returns — and is
+        /// CRC-checked like `get` (`Options.read_verify`).
+        pub fn next(it: *Iterator) GetError!?Pair {
+            if (it.i == it.items.len) return null;
+            const item = it.items[it.i];
+            it.i += 1;
+            try it.value.resize(it.gpa, item.e.val_len);
+            it.db.rw.lockShared();
+            defer it.db.rw.unlockShared();
+            try it.db.readValueLocked(item.e, item.key, it.value.items);
+            return .{ .key = item.key, .value = it.value.items };
+        }
+
+        /// Pairs not yet returned.
+        pub fn remaining(it: *const Iterator) usize {
+            return it.items.len - it.i;
+        }
+
+        /// Release the snapshot. Must come before the `Db` is closed.
+        pub fn deinit(it: *Iterator) void {
+            for (it.items) |item| it.gpa.free(item.key);
+            it.gpa.free(it.items);
+            for (it.pinned) |df| it.db.unpin(df);
+            it.gpa.free(it.pinned);
+            it.value.deinit(it.gpa);
+            it.* = undefined;
+        }
+    };
+
+    /// Snapshot the live keys starting with `prefix` (`""` = all) for
+    /// iteration in bytewise key order; values are read as of this moment
+    /// by `Iterator.next`. Holds no lock between calls: writers, merges and
+    /// compactions go on, and the files the snapshot points into stay
+    /// readable (pinned) until `deinit`. Memory: a copy of every listed key.
+    pub fn iterator(self: *Db, gpa: Allocator, prefix: []const u8) Allocator.Error!Iterator {
+        var items: std.ArrayList(Iterator.Item) = .empty;
+        errdefer {
+            for (items.items) |item| gpa.free(item.key);
+            items.deinit(gpa);
+        }
+        var pinned: std.ArrayList(*DataFile) = .empty;
+        errdefer pinned.deinit(gpa);
+        {
+            self.rw.lockShared();
+            defer self.rw.unlockShared();
+            try pinned.ensureTotalCapacity(gpa, self.files.items.len);
+            const now: i64 = if (self.expiring == 0) 0 else self.options.clock.now();
+            var it = self.keydir.iterator();
+            while (it.next()) |kv| {
+                if (!std.mem.startsWith(u8, kv.key_ptr.*, prefix)) continue;
+                if (kv.value_ptr.expires() and !kv.value_ptr.liveAt(now)) continue;
+                try items.ensureUnusedCapacity(gpa, 1);
+                items.appendAssumeCapacity(.{ .key = try gpa.dupe(u8, kv.key_ptr.*), .e = kv.value_ptr.* });
+                if (std.mem.indexOfScalar(*DataFile, pinned.items, kv.value_ptr.file) == null)
+                    pinned.appendAssumeCapacity(kv.value_ptr.file);
+            }
+            // Pinned under the shared lock: no merge can swap a file out
+            // between the snapshot and the pin.
+            for (pinned.items) |df| _ = df.pins.fetchAdd(1, .acq_rel);
+        }
+        std.mem.sort(Iterator.Item, items.items, {}, struct {
+            fn lessThan(_: void, a: Iterator.Item, b: Iterator.Item) bool {
+                return std.mem.order(u8, a.key, b.key) == .lt;
+            }
+        }.lessThan);
+        const pinned_slice = pinned.toOwnedSlice(gpa) catch |e| {
+            for (pinned.items) |df| self.unpin(df);
+            return e;
+        };
+        const items_slice = items.toOwnedSlice(gpa) catch |e| {
+            for (pinned_slice) |df| self.unpin(df);
+            gpa.free(pinned_slice);
+            return e;
+        };
+        return .{ .db = self, .gpa = gpa, .items = items_slice, .pinned = pinned_slice };
+    }
+
     /// Bytes the log currently wastes on overwritten/deleted records and on
     /// expired keys — the caller's signal for when `compact` is worth it (v0
     /// compaction is caller-driven; automatic thresholds are a noted phase).
@@ -2148,6 +2271,7 @@ pub const Db = struct {
         defer self.gpa.free(new_ids);
         for (new_files.items, new_ids) |df, *id| id.* = df.id;
         try self.files.ensureTotalCapacity(self.gpa, new_files.items.len);
+        try self.retired.ensureUnusedCapacity(self.gpa, sel.items.len);
         try self.obsolete.ensureUnusedCapacity(self.gpa, sel.items.len);
         for (sel.items) |df| self.obsolete.appendAssumeCapacity(df.id);
         for (outs.items) |df| self.dropPending(df.id);
@@ -2194,7 +2318,7 @@ pub const Db = struct {
             }
             for (sel.items) |df| {
                 self.dead_bytes -= df.dead_bytes;
-                self.store.close(df.handle);
+                self.releaseLocked(df);
             }
             self.files.clearRetainingCapacity();
             self.files.appendSliceAssumeCapacity(new_files.items);
@@ -2253,8 +2377,11 @@ pub const Db = struct {
         defer expired.deinit(self.gpa);
         const now: i64 = if (self.expiring == 0) 0 else self.options.clock.now();
 
-        const tmp = try self.store.open(self.tmp_path, .create_truncate);
+        try self.retired.ensureUnusedCapacity(self.gpa, 1);
+        const ndf = try self.gpa.create(DataFile);
         var swapped = false;
+        defer if (!swapped) self.gpa.destroy(ndf);
+        const tmp = try self.store.open(self.tmp_path, .create_truncate);
         defer if (!swapped) {
             self.store.close(tmp);
             self.store.delete(self.tmp_path) catch {};
@@ -2295,10 +2422,17 @@ pub const Db = struct {
         // inside, since readers pread through the entry's file.
         self.rw.lock();
         defer self.rw.unlock();
-        self.store.close(act.handle);
-        act.handle = tmp;
         swapped = true;
-        for (moves.items, new_offs[0..moves.items.len]) |e, off| e.off = off;
+        ndf.* = .{ .id = act.id, .handle = tmp, .size = new_end, .version = version, .live_bytes = live_bytes, .live_keys = moves.items.len };
+        for (moves.items, new_offs[0..moves.items.len]) |e, off| {
+            e.file = ndf;
+            e.off = off;
+        }
+        self.files.items[0] = ndf;
+        // The old file's name now belongs to the new one; only the handle
+        // and the struct go (at once, or at its iterators' last unpin).
+        self.releaseLocked(act);
+        if (std.mem.indexOfScalar(*DataFile, self.retired.items, act) == null) self.gpa.destroy(act);
         // Removal leaves the other entries in place (no rehash), so the
         // pointers above stayed valid; drop the expired ones only now.
         for (expired.items) |k| {
@@ -2306,7 +2440,6 @@ pub const Db = struct {
             self.gpa.free(@constCast(kv.key));
             self.expiring -= 1;
         }
-        act.* = .{ .id = act.id, .handle = tmp, .size = new_end, .version = version, .live_bytes = live_bytes, .live_keys = moves.items.len };
         self.dead_bytes = 0;
         // The new file was synced before the rename: a durability barrier.
         self.markSynced();
@@ -2431,6 +2564,7 @@ pub const Db = struct {
         const n_old = self.files.items.len;
         try self.obsolete.ensureUnusedCapacity(self.gpa, n_old);
         try self.files.ensureTotalCapacity(self.gpa, outs.items.len);
+        try self.retired.ensureUnusedCapacity(self.gpa, n_old);
         const old = try self.gpa.dupe(*DataFile, self.files.items);
         defer self.gpa.free(old);
         for (old) |df| self.obsolete.appendAssumeCapacity(df.id);
@@ -2467,13 +2601,25 @@ pub const Db = struct {
             self.files.appendSliceAssumeCapacity(outs.items);
             self.dead_bytes = 0;
             self.markSynced();
-            for (old) |df| self.store.close(df.handle);
+            for (old) |df| self.releaseLocked(df);
         }
         self.retireFiles(old);
     }
 
-    /// Delete retired data files (handles already closed) and free them.
-    /// The manifest lists them as obsolete, so a crash or an error here only
+    /// A file leaves the store: close its handle now, or — while an
+    /// `Iterator` pins it — at the last unpin. Caller holds the writer lock
+    /// and the exclusive keydir lock (so no iterator can pin it meanwhile)
+    /// and has reserved a `retired` slot.
+    fn releaseLocked(self: *Db, df: *DataFile) void {
+        if (df.pins.load(.acquire) == 0) {
+            self.store.close(df.handle);
+        } else {
+            self.retired.appendAssumeCapacity(df);
+        }
+    }
+
+    /// Delete released data files by name and free the unpinned ones. The
+    /// manifest lists them as obsolete, so a crash or an error here only
     /// delays a deletion to the next `open`.
     fn retireFiles(self: *Db, old: []const *DataFile) void {
         for (old) |df| {
@@ -2482,8 +2628,20 @@ pub const Db = struct {
                 const at = std.mem.indexOfScalar(u32, self.obsolete.items, df.id).?;
                 _ = self.obsolete.orderedRemove(at);
             }
-            self.gpa.destroy(df);
+            if (std.mem.indexOfScalar(*DataFile, self.retired.items, df) == null) self.gpa.destroy(df);
         }
+    }
+
+    /// An iterator let go of `df`: at the last unpin of a retired file,
+    /// close and free it.
+    fn unpin(self: *Db, df: *DataFile) void {
+        if (df.pins.fetchSub(1, .acq_rel) != 1) return;
+        self.lock.acquire();
+        defer self.lock.release();
+        const at = std.mem.indexOfScalar(*DataFile, self.retired.items, df) orelse return;
+        _ = self.retired.swapRemove(at);
+        self.store.close(df.handle);
+        self.gpa.destroy(df);
     }
 
     fn dropPending(self: *Db, id: u32) void {
@@ -3570,6 +3728,92 @@ test "merge: writers go on during the copy; keys rewritten meanwhile keep their 
     try expectGet(&db, "d", v30);
 }
 
+fn expectPairs(it: *Db.Iterator, want: []const [2][]const u8) !void {
+    for (want) |w| {
+        const p = (try it.next()).?;
+        try testing.expectEqualStrings(w[0], p.key);
+        try testing.expectEqualStrings(w[1], p.value);
+    }
+    try testing.expect((try it.next()) == null);
+}
+
+test "iterator: a snapshot in key order, untouched by later writes" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var db = try Db.open(testing.allocator, sim.storage(), "db", .{});
+    defer db.close();
+    try db.put("c", "3");
+    try db.put("a", "1");
+    try db.put("b", "2");
+    try db.put("x:skip", "not under the prefix");
+    var it = try db.iterator(testing.allocator, "");
+    defer it.deinit();
+    try testing.expectEqual(@as(usize, 4), it.remaining());
+    try db.put("a", "rewritten");
+    try db.delete("b");
+    try db.put("d", "new");
+    try expectPairs(&it, &.{ .{ "a", "1" }, .{ "b", "2" }, .{ "c", "3" }, .{ "x:skip", "not under the prefix" } });
+
+    var pre = try db.iterator(testing.allocator, "x:");
+    defer pre.deinit();
+    try expectPairs(&pre, &.{.{ "x:skip", "not under the prefix" }});
+}
+
+test "iterator: expired keys are not listed" {
+    const Fake = struct {
+        var now: i64 = 1000;
+        fn read(_: ?*anyopaque) i64 {
+            return now;
+        }
+    };
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var db = try Db.open(testing.allocator, sim.storage(), "db", .{ .clock = .{ .nowFn = Fake.read } });
+    defer db.close();
+    try db.putExpiring("gone", "x", 1000);
+    try db.putExpiring("live", "y", 2000);
+    var it = try db.iterator(testing.allocator, "");
+    defer it.deinit();
+    try expectPairs(&it, &.{.{ "live", "y" }});
+}
+
+test "iterator: pinned files survive a merge and a compaction until deinit" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    // Multi-file: compact merges and deletes every file the snapshot uses.
+    {
+        var db = try Db.open(testing.allocator, sim.storage(), "m", .{ .max_file_size = 64 });
+        defer db.close();
+        try db.put("a", v30);
+        try db.put("b", v30);
+        try db.put("c", v30);
+        var it = try db.iterator(testing.allocator, "");
+        try db.put("a", "after the snapshot");
+        try db.compact();
+        try testing.expect(db.retired.items.len > 0);
+        try expectPairs(&it, &.{ .{ "a", v30 }, .{ "b", v30 }, .{ "c", v30 } });
+        it.deinit();
+        try testing.expectEqual(@as(usize, 0), db.retired.items.len);
+        try expectGet(&db, "a", "after the snapshot");
+    }
+    // Single-file: the compaction replaces the file under the same name.
+    {
+        var db = try Db.open(testing.allocator, sim.storage(), "s", .{});
+        defer db.close();
+        try db.put("a", "1");
+        try db.put("a", "2");
+        try db.put("b", "3");
+        var it = try db.iterator(testing.allocator, "");
+        try db.compact();
+        try db.put("b", "4");
+        try db.compact(); // a second retirement while still pinned
+        try expectPairs(&it, &.{ .{ "a", "2" }, .{ "b", "3" } });
+        it.deinit();
+        try testing.expectEqual(@as(usize, 0), db.retired.items.len);
+        try expectGet(&db, "b", "4");
+    }
+}
+
 test "persistence: close and reopen recovers everything" {
     var sim = SimStorage.init(testing.allocator);
     defer sim.deinit();
@@ -4098,6 +4342,15 @@ test "concurrency: readers alongside puts, deletes and compactions (real filesys
                     }) orelse continue;
                     if (!std.mem.startsWith(u8, v, k) or v.len <= k.len or v[k.len] != '=') r.bad += 1;
                     _ = d.count();
+                }
+                // A snapshot iteration racing the writer and the merger.
+                var it = d.iterator(testing.allocator, "") catch unreachable;
+                defer it.deinit();
+                while (it.next() catch blk: {
+                    r.bad += 1;
+                    break :blk null;
+                }) |p| {
+                    if (!std.mem.startsWith(u8, p.value, p.key) or p.value[p.key.len] != '=') r.bad += 1;
                 }
             }
         }

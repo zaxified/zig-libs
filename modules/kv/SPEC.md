@@ -258,6 +258,29 @@ like Bitcask.
   appended past the hint replayed. Crash sweeps cover torn hints (every multi-file `compact`
   writes them). Mutants: hint ignored, no CRC check, no coverage check — all red.
 
+## Iterator
+
+`Db.iterator(gpa, prefix)` → `Iterator` with `next() ?Pair` (key + value, valid until the next
+call), `remaining()`, `deinit()` (2026-10-14, S2 survey R6; Bitcask `fold`/iterator). Supersedes
+the 2026-09-30 decision "no value fold, use `keys` + `get`": that pair is not a consistent view —
+a merge or compaction between the two calls can return values from different moments.
+
+- **Snapshot.** Under the shared keydir lock: a copy of every live (unexpired) key under the
+  prefix and its entry, sorted bytewise; each referenced data file is **pinned** (atomic count)
+  before the lock is released, so no merge can swap a file out in between.
+- **Pins.** A merge or compaction that retires a pinned file deletes its name (as always) but
+  keeps its handle open in `Db.retired`; the last `deinit` closes and frees it (under the writer
+  lock, against the retirement's own check, which runs under the writer lock and the exclusive
+  keydir lock). The single-file `compact` now builds a new `DataFile` for the renamed temp instead
+  of rewriting the old one in place, so a snapshot keeps reading the old inode. `Db.close` frees
+  whatever is still retired; iterators must be released first.
+- **Reads** take the shared keydir lock per `next` and CRC-check the record (`read_verify`).
+- **Tests:** snapshot unchanged by a later overwrite/delete/put, key order, prefix; expired keys not
+  listed; reads across a multi-file `compact` (retired files pinned, freed at `deinit`) and across
+  two single-file compactions; iterating readers in the ThreadSanitizer stress test (racing a
+  writer and a merger, 20 clean runs). Mutant: retirement ignoring pins — red (reads from closed
+  handles, leaks).
+
 ## Sync policy
 
 `Options.sync` (2026-10-14, S2 survey R1) is Bitcask's `sync_strategy`: `.always` (default — fsync
@@ -410,7 +433,7 @@ self-test (≥10/12 runs catch a data-losing recovery). Run: `zig build test-kv`
 - ~~**Per-key expiry (TTL)**~~ *(survey 2026-09-30)* — **DONE 2026-09-30**, see § "Key expiry". Not built: expiry in the background (a timer thread dropping keys) — `compact` is the caller's already, and an expired key costs only memory and disk until then.
 - ~~**Sync policy**~~ *(S2 survey 2026-10-14, R1)* — **DONE 2026-10-14**, see § "Sync policy".
 - ~~**Reader concurrency without a spinlock across fsync**~~ *(survey 2026-09-30)* — **DONE 2026-10-14 (in-process, S2 R5)**: writer mutex + keydir `RwLock`, exclusive only for the in-memory update. Tests: a reader answered (with the previous value) while a writer is parked inside fsync; readers alongside puts/deletes/compactions on the real filesystem, clean under ThreadSanitizer (`-fllvm -fsanitize-thread`; the self-hosted backend silently does not instrument — negative control needed it). Mutants: reader taking the writer lock (red), compaction swap without the exclusive lock (red + TSan races). Cross-process read-only open while a writer runs is the open half (S2 R5b).
-- **FsStorage handle table is not safe for concurrent `open` from two threads** *(found 2026-10-14 while reviewing R5)* — `vOpen` scans `files` for a free slot without a lock, so two `Db`s on ONE `FsStorage` opening at once on two threads could pick the same slot. One `Db`'s own opens are writer-serialized, so kv itself is unaffected; a shared backend across threads (shardstore?) should be checked. Effort: small (a mutex around slot claim/release).
+- ~~**FsStorage handle table is not safe for concurrent `open` from two threads**~~ *(found 2026-10-14 while reviewing R5)* — **FIXED 2026-10-14**: `table_lock` (an `std.Io.Mutex`) around slot claim and release. It mattered inside one `Db` too once merges open hint files outside the writer lock: ThreadSanitizer caught a merge and a rotation claiming slots at once in the stress test (3 of 12 runs).
 
 ## Status
 
