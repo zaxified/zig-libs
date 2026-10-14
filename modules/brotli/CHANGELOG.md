@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-14** — Survey refreshed against google/brotli 1.2.0, RFC 9841 and RFC 9842: `## Compared with` updated, gaps R1–R11 filed in *Backlog* (streaming encoder, raw prefix dictionaries and `dcb`, large window, pull reader, serialized dictionaries for decoding, a q11-class `.max` effort). Docs only.
+
 - **2026-10-11** — New `decompressInto(gpa, out, input, options)`: decode into the caller's buffer
   (`OutputTooLarge` when it does not fit), no output allocation. The differential fuzz driver checks it
   against the other two decoders, with an exact-size buffer and one byte short. Bench: `d_<payload>`
