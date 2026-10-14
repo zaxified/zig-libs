@@ -238,6 +238,26 @@ files only — null when nothing triggers) and `Db.merge(ids)` (2026-10-14, S2 s
   repoint without the "rewritten meanwhile" check, no output sync, outputs at the oldest position,
   outputs dropped for a single-file merge — all red.
 
+## Hint files
+
+Every merge output (`merge`, multi-file `compact`) gets `<path>.<id>.hint` (2026-10-14, S2 survey
+R2, Bitcask hint files): per record op, key/value lengths, offset, expiry and the key — no value —
+then the data length it describes and a CRC-32. `open` applies a valid hint instead of reading the
+file's records and replays only what lies past the described length (the last `compact` output is
+the active file and keeps growing). A hint is used only if magic, version and CRC hold, its
+entries are whole with offsets that tile `[header, data length)` exactly, and that length fits in
+the file; otherwise it is ignored and the data file replayed — a hint is never needed for
+correctness. It is written after its data file is synced, without a rename (a torn one fails the
+CRC), and deleted with its data file (obsolete list, stray probe). What a hint skips is the
+replay-time CRC of each record; `read_verify` (default on) still refuses a rotten value at `get`,
+like Bitcask.
+
+- **Tests:** open over a rotten value in a hinted sealed file (succeeds, `get` → `Corrupt`; without
+  the hint the store would be refused); rotten key byte in the hint (CRC → replay); forged hint
+  with a valid CRC whose entries stop short of the claimed length (refused → replay); records
+  appended past the hint replayed. Crash sweeps cover torn hints (every multi-file `compact`
+  writes them). Mutants: hint ignored, no CRC check, no coverage check — all red.
+
 ## Sync policy
 
 `Options.sync` (2026-10-14, S2 survey R1) is Bitcask's `sync_strategy`: `.always` (default — fsync

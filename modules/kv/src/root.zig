@@ -187,6 +187,14 @@ const header_len = 8;
 /// `DataFile.id` of a single-file (version 1/2) store's data file, which is
 /// `<path>` itself. A migrated store calls that file id 0, `<path>.0.data`.
 const legacy_id: u32 = std.math.maxInt(u32);
+/// Hint file (`<path>.<id>.hint`, merge outputs only — SPEC § "Hint files"):
+/// "ZKVH" | version u32, entries, then the data-file length it describes u64
+/// and a CRC-32 over everything before it. Entry: op u8 | key_len u32 |
+/// val_len u32 | offset u64 | expires_at i64 | key.
+const hint_magic = "ZKVH";
+const hint_version: u32 = 1;
+const hint_entry_fixed = 1 + 4 + 4 + 8 + 8;
+
 /// A manifest larger than this is not one this module wrote.
 const max_manifest_len = 1 << 24;
 
@@ -1104,6 +1112,9 @@ pub const Db = struct {
         /// Bytes / count of superseded records, tombstones and expired records.
         dead_bytes: u64 = 0,
         dead_keys: u64 = 0,
+        /// Hint entries collected while this file is a merge output being
+        /// written; empty otherwise (see `finishOutput`).
+        hint: std.ArrayListUnmanaged(u8) = .empty,
     };
 
     const Entry = struct {
@@ -1245,7 +1256,7 @@ pub const Db = struct {
                     try deleteIfPresent(store, self.manifest_tmp);
                     try self.adoptFile(legacy_id, h, version);
                     h_owned = false;
-                    try self.replay(self.active(), file_size, true);
+                    try self.replay(self.active(), header_len, file_size, true);
                 },
                 version_manifest => {
                     try self.loadManifest(h, file_size);
@@ -1374,7 +1385,7 @@ pub const Db = struct {
             // A sealed file was synced before the next one was started, so a
             // bad record in it is rot, refused; only the active file may have
             // a torn tail to cut.
-            try self.replay(self.active(), fsize, last);
+            try self.replay(self.active(), try self.loadHint(self.active(), fsize), fsize, last);
         }
     }
 
@@ -2056,6 +2067,7 @@ pub const Db = struct {
                 self.store.close(df.handle);
                 if (!named) _ = self.deleteDataFile(df.id) catch {};
                 self.dropPending(df.id);
+                df.hint.deinit(self.gpa);
                 self.gpa.destroy(df);
             }
         };
@@ -2116,7 +2128,7 @@ pub const Db = struct {
                 }
             }
         }
-        if (outs.items.len > 0) try self.store.sync(outs.items[outs.items.len - 1].handle);
+        if (outs.items.len > 0) try self.finishOutput(outs.items[outs.items.len - 1]);
 
         // ── swap ──
         self.lock.acquire();
@@ -2206,13 +2218,14 @@ pub const Db = struct {
             break :blk o.size > header_len and o.size + bytes.len > self.options.max_file_size;
         };
         if (need_new) {
-            if (outs.items.len > 0) try self.store.sync(outs.items[outs.items.len - 1].handle);
+            if (outs.items.len > 0) try self.finishOutput(outs.items[outs.items.len - 1]);
             self.lock.acquire();
             defer self.lock.release();
             try self.startOutput(outs);
         }
         const out = outs.items[outs.items.len - 1];
         const off = out.size;
+        try self.hintAppend(out, bytes, off);
         try self.store.writeAll(out.handle, bytes, off);
         out.size += bytes.len;
         if (rec == null) {
@@ -2260,7 +2273,7 @@ pub const Db = struct {
                 try expired.append(self.gpa, kv.key_ptr.*);
                 continue;
             }
-            const len = try self.copyRecord(e.*, tmp, new_end);
+            const len = try self.copyRecord(e.*, tmp, new_end, null);
             new_offs[moves.items.len] = new_end;
             moves.appendAssumeCapacity(e);
             new_end += len;
@@ -2301,15 +2314,63 @@ pub const Db = struct {
 
     /// Copy `e`'s record verbatim (its CRC stays valid) to `dst` at `off`,
     /// refusing to copy rot. Returns its length.
-    fn copyRecord(self: *Db, e: Entry, dst: Storage.Handle, off: u64) CompactError!u64 {
+    fn copyRecord(self: *Db, e: Entry, dst: Storage.Handle, off: u64, hint: ?*std.ArrayListUnmanaged(u8)) CompactError!u64 {
         const len: usize = @intCast(e.recLen());
         const rec = try self.gpa.alloc(u8, len);
         defer self.gpa.free(rec);
         try self.store.preadFull(e.file.handle, rec, e.off);
         if (std.hash.Crc32.hash(rec[4..]) != std.mem.readInt(u32, rec[0..4], .little))
             return error.Corrupt;
+        if (hint) |h| try hintEncode(self.gpa, h, rec, off);
         try self.store.writeAll(dst, rec, off);
         return len;
+    }
+
+    /// Record the hint entry for `rec`, about to be written at `off` of the
+    /// merge output `df`.
+    fn hintAppend(self: *Db, df: *DataFile, rec: []const u8, off: u64) Allocator.Error!void {
+        return hintEncode(self.gpa, &df.hint, rec, off);
+    }
+
+    fn hintEncode(gpa: Allocator, h: *std.ArrayListUnmanaged(u8), rec: []const u8, off: u64) Allocator.Error!void {
+        const op = rec[4];
+        const key_len = std.mem.readInt(u32, rec[5..9], .little);
+        const body: usize = rec_fixed + @as(usize, if (op == op_put_exp) exp_len else 0);
+        const at = h.items.len;
+        try h.resize(gpa, at + hint_entry_fixed + key_len);
+        const e = h.items[at..];
+        e[0] = op;
+        @memcpy(e[1..9], rec[5..13]); // key_len, val_len
+        std.mem.writeInt(u64, e[9..17], off, .little);
+        const exp: i64 = if (op == op_put_exp) std.mem.readInt(i64, rec[rec_fixed..][0..exp_len], .little) else no_expiry;
+        std.mem.writeInt(i64, e[17..25], exp, .little);
+        @memcpy(e[hint_entry_fixed..], rec[body..][0..key_len]);
+    }
+
+    /// A merge output is complete: sync it, then write its hint (not
+    /// atomically — a torn hint fails its CRC and `open` replays the data
+    /// file instead) and sync that.
+    fn finishOutput(self: *Db, df: *DataFile) CompactError!void {
+        try self.store.sync(df.handle);
+        defer df.hint.clearAndFree(self.gpa);
+        var hdr: [header_len]u8 = undefined;
+        hdr[0..4].* = hint_magic.*;
+        std.mem.writeInt(u32, hdr[4..8], hint_version, .little);
+        var tail: [12]u8 = undefined;
+        std.mem.writeInt(u64, tail[0..8], df.size, .little);
+        var crc = std.hash.Crc32.init();
+        crc.update(&hdr);
+        crc.update(df.hint.items);
+        crc.update(tail[0..8]);
+        std.mem.writeInt(u32, tail[8..12], crc.final(), .little);
+        const name = try self.fileName(df.id, "hint");
+        defer self.gpa.free(name);
+        const h = try self.store.open(name, .create_truncate);
+        defer self.store.close(h);
+        try self.store.writeAll(h, &hdr, 0);
+        try self.store.writeAll(h, df.hint.items, header_len);
+        try self.store.writeAll(h, &tail, header_len + df.hint.items.len);
+        try self.store.sync(h);
     }
 
     /// Multi-file `compact`: every live record into new files. Caller holds
@@ -2336,6 +2397,7 @@ pub const Db = struct {
         defer if (!swapped) for (outs.items) |df| {
             self.store.close(df.handle);
             if (!named) _ = self.deleteDataFile(df.id) catch {};
+            df.hint.deinit(self.gpa);
             self.gpa.destroy(df);
         };
         defer if (!swapped) for (outs.items) |df| self.dropPending(df.id);
@@ -2350,18 +2412,18 @@ pub const Db = struct {
             }
             var out = outs.items[outs.items.len - 1];
             if (out.size > header_len and out.size + e.recLen() > self.options.max_file_size) {
-                try self.store.sync(out.handle);
+                try self.finishOutput(out);
                 try self.startOutput(&outs);
                 out = outs.items[outs.items.len - 1];
             }
-            const len = try self.copyRecord(e.*, out.handle, out.size);
+            const len = try self.copyRecord(e.*, out.handle, out.size, &out.hint);
             moves.appendAssumeCapacity(.{ .e = e, .file = out, .off = out.size });
             out.size += len;
             out.live_bytes += len;
             out.live_keys += 1;
         }
         const last = outs.items[outs.items.len - 1];
-        try self.store.sync(last.handle);
+        try self.finishOutput(last);
 
         const ids = try self.gpa.alloc(u32, outs.items.len);
         defer self.gpa.free(ids);
@@ -2462,6 +2524,99 @@ pub const Db = struct {
         self.keydir.deinit(self.gpa);
     }
 
+    /// Apply one record (from the data file or its hint) to the keydir: a
+    /// delete, or a put that has expired by `now`, removes the key; a put
+    /// sets it. True when `key` (allocated by the caller) now belongs to the
+    /// keydir.
+    fn applyRecord(self: *Db, df: *DataFile, op: u8, key: []u8, off: u64, val_len: u32, expires_at: i64, now: i64) Allocator.Error!bool {
+        const key_len: u32 = @intCast(key.len);
+        const rec_len = recordLenExp(op == op_put_exp, key_len, val_len);
+        if (op == op_del or (op == op_put_exp and expires_at <= now)) {
+            if (self.keydir.fetchRemove(key)) |kv| {
+                self.supersede(kv.value);
+                if (kv.value.expires()) self.expiring -= 1;
+                self.gpa.free(@constCast(kv.key));
+            }
+            self.addDead(df, rec_len);
+            return false;
+        }
+        const gop = try self.keydir.getOrPut(self.gpa, key);
+        const owned = !gop.found_existing;
+        if (gop.found_existing) {
+            self.supersede(gop.value_ptr.*);
+            if (gop.value_ptr.expires()) self.expiring -= 1;
+        }
+        gop.value_ptr.* = .{ .file = df, .off = off, .key_len = key_len, .val_len = val_len, .expires_at = expires_at };
+        self.addLive(gop.value_ptr.*);
+        if (op == op_put_exp) self.expiring += 1;
+        return owned;
+    }
+
+    /// Apply `df`'s hint if it has a valid one (merge outputs only). Returns
+    /// where replay continues: the data length the hint describes, or the
+    /// header when there is no usable hint — missing, torn, foreign, or
+    /// describing more data than the file holds. A hint is checked whole
+    /// before any entry is applied.
+    fn loadHint(self: *Db, df: *DataFile, file_size: u64) OpenError!u64 {
+        const name = try self.fileName(df.id, "hint");
+        defer self.gpa.free(name);
+        const h = self.store.open(name, .read_only) catch |e| switch (e) {
+            error.FileNotFound => return header_len,
+            else => return e,
+        };
+        defer self.store.close(h);
+        const size = try self.store.size(h);
+        if (size < header_len + 12 or size > std.math.maxInt(u32)) return header_len;
+        const buf = try self.gpa.alloc(u8, @intCast(size));
+        defer self.gpa.free(buf);
+        try self.store.preadFull(h, buf, 0);
+        if (!std.mem.eql(u8, buf[0..4], hint_magic) or std.mem.readInt(u32, buf[4..8], .little) != hint_version)
+            return header_len;
+        const crc_at = buf.len - 4;
+        if (std.hash.Crc32.hash(buf[0..crc_at]) != std.mem.readInt(u32, buf[crc_at..][0..4], .little))
+            return header_len;
+        const data_len = std.mem.readInt(u64, buf[crc_at - 8 ..][0..8], .little);
+        if (data_len < header_len or data_len > file_size) return header_len;
+        const entries = buf[header_len .. crc_at - 8];
+
+        // Structure first: every entry whole, offsets ascending inside the
+        // described data. Nothing is applied from a hint that fails this.
+        var i: usize = 0;
+        var next_off: u64 = header_len;
+        while (i < entries.len) {
+            if (entries.len - i < hint_entry_fixed) return header_len;
+            const e = entries[i..];
+            const op = e[0];
+            const key_len = std.mem.readInt(u32, e[1..5], .little);
+            const val_len = std.mem.readInt(u32, e[5..9], .little);
+            const off = std.mem.readInt(u64, e[9..17], .little);
+            if (op != op_put and op != op_del and op != op_put_exp) return header_len;
+            if (op == op_del and val_len != 0) return header_len;
+            if (op == op_put_exp and df.version < version_expiry) return header_len;
+            if (entries.len - i - hint_entry_fixed < key_len) return header_len;
+            if (off != next_off) return header_len;
+            next_off = off + recordLenExp(op == op_put_exp, key_len, val_len);
+            if (next_off > data_len) return header_len;
+            i += hint_entry_fixed + key_len;
+        }
+        if (next_off != data_len) return header_len;
+
+        const now: i64 = if (df.version >= version_expiry) self.options.clock.now() else 0;
+        i = 0;
+        while (i < entries.len) {
+            const e = entries[i..];
+            const key_len = std.mem.readInt(u32, e[1..5], .little);
+            const key = try self.gpa.dupe(u8, e[hint_entry_fixed..][0..key_len]);
+            const owned = self.applyRecord(df, e[0], key, std.mem.readInt(u64, e[9..17], .little), std.mem.readInt(u32, e[5..9], .little), std.mem.readInt(i64, e[17..25], .little), now) catch |err| {
+                self.gpa.free(key);
+                return err;
+            };
+            if (!owned) self.gpa.free(key);
+            i += hint_entry_fixed + key_len;
+        }
+        return data_len;
+    }
+
     /// Replay data file `df` from after its header, rebuilding the keydir.
     /// Stops at the first torn/corrupt record; with `allow_truncate` (the
     /// active file) truncates it back to the last good one (crash recovery:
@@ -2469,10 +2624,10 @@ pub const Db = struct {
     /// (a sealed file, synced before any later file existed) refuses with
     /// `error.Corrupt`. A record that has expired by now counts as a delete
     /// of its key: it is the key's latest word, and it says "absent".
-    fn replay(self: *Db, df: *DataFile, file_size: u64, allow_truncate: bool) OpenError!void {
+    fn replay(self: *Db, df: *DataFile, start: u64, file_size: u64, allow_truncate: bool) OpenError!void {
         // The clock is read once, and only for a file that can hold expiry.
         const now: i64 = if (df.version >= version_expiry) self.options.clock.now() else 0;
-        var off: u64 = header_len;
+        var off: u64 = start;
         scan: while (off < file_size) {
             const remaining = file_size - off;
             if (remaining < rec_fixed) break; // torn fixed header
@@ -2516,25 +2671,7 @@ pub const Db = struct {
             if (expires and expires_at == no_expiry) break :scan;
 
             const rec_len = body + key_len + val_len;
-            if (op == op_del or (expires and expires_at <= now)) {
-                if (self.keydir.fetchRemove(key)) |kv| {
-                    self.supersede(kv.value);
-                    if (kv.value.expires()) self.expiring -= 1;
-                    self.gpa.free(@constCast(kv.key));
-                }
-                self.addDead(df, rec_len);
-            } else {
-                const gop = try self.keydir.getOrPut(self.gpa, key);
-                if (gop.found_existing) {
-                    self.supersede(gop.value_ptr.*);
-                    if (gop.value_ptr.expires()) self.expiring -= 1;
-                } else {
-                    key_owned = false; // the keydir owns it now
-                }
-                gop.value_ptr.* = .{ .file = df, .off = off, .key_len = key_len, .val_len = val_len, .expires_at = expires_at };
-                self.addLive(gop.value_ptr.*);
-                if (expires) self.expiring += 1;
-            }
+            if (try self.applyRecord(df, op, key, off, val_len, expires_at, now)) key_owned = false;
             off += rec_len;
         }
         if (off < file_size) {
@@ -3313,6 +3450,77 @@ test "merge: outputs take the newest merged file's place, after unmerged files b
     db = try Db.open(testing.allocator, sim.storage(), "db", options);
     try expectGet(&db, "p", v30);
     try expectGet(&db, "k", "new value in the third file...");
+}
+
+test "hints: open applies a merge output's hint without reading its values" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    const options: Options = .{ .max_file_size = 100 };
+    var first_id: u32 = 0;
+    {
+        var db = try Db.open(testing.allocator, sim.storage(), "db", options);
+        defer db.close();
+        for (0..6) |i| {
+            var k: [4]u8 = undefined;
+            try db.put(try std.fmt.bufPrint(&k, "k{d}", .{i}), v30);
+        }
+        try db.compact(); // outputs: two records each, the last one active
+        try testing.expect(db.files.items.len >= 3);
+        first_id = db.files.items[0].id;
+        try db.put("after", "the merge"); // appended past the hint's coverage
+    }
+    var hb: [16]u8 = undefined;
+    var db_b: [16]u8 = undefined;
+    const hint_name = try std.fmt.bufPrint(&hb, "db.{d}.hint", .{first_id});
+    const data_name = try std.fmt.bufPrint(&db_b, "db.{d}.data", .{first_id});
+    try testing.expect(sim.fileContent(hint_name) != null);
+
+    // Rot inside a value of the first (sealed) output: replaying it would
+    // refuse the store; with its hint, open never reads the value — and the
+    // read-time CRC check still refuses to serve it.
+    const data = sim.fileContent(data_name).?;
+    const val_at = std.mem.indexOf(u8, data, v30).?;
+    sim.flipByte(data_name, val_at + 3);
+    {
+        var db = try Db.open(testing.allocator, sim.storage(), "db", options);
+        defer db.close();
+        try testing.expectEqual(@as(usize, 7), db.count());
+        try testing.expectError(error.Corrupt, db.get(testing.allocator, "k0"));
+        try expectGet(&db, "after", "the merge");
+    }
+    sim.flipByte(data_name, val_at + 3); // heal
+
+    // A rotten hint fails its CRC — here a key byte, which leaves the entry
+    // structure intact: open replays the data file instead.
+    const good_hint = try testing.allocator.dupe(u8, sim.fileContent(hint_name).?);
+    defer testing.allocator.free(good_hint);
+    const key_at = std.mem.indexOf(u8, good_hint, "k").?;
+    sim.flipByte(hint_name, key_at);
+    {
+        var db = try Db.open(testing.allocator, sim.storage(), "db", options);
+        defer db.close();
+        try testing.expectEqual(@as(usize, 7), db.count());
+        try expectGet(&db, "k0", v30);
+        try expectGet(&db, "after", "the merge");
+    }
+
+    // A hint whose CRC holds but whose entries stop short of the data length
+    // it claims (here: last entry cut, CRC recomputed) would skip records:
+    // refused, replayed instead.
+    const last_entry = hint_entry_fixed + 2; // "kN"
+    const forged = try testing.allocator.alloc(u8, good_hint.len - last_entry);
+    defer testing.allocator.free(forged);
+    const body_end = good_hint.len - 12;
+    @memcpy(forged[0 .. body_end - last_entry], good_hint[0 .. body_end - last_entry]);
+    @memcpy(forged[body_end - last_entry ..][0..8], good_hint[body_end..][0..8]);
+    std.mem.writeInt(u32, forged[forged.len - 4 ..][0..4], std.hash.Crc32.hash(forged[0 .. forged.len - 4]), .little);
+    try sim.installFile(hint_name, forged);
+    {
+        var db = try Db.open(testing.allocator, sim.storage(), "db", options);
+        defer db.close();
+        try testing.expectEqual(@as(usize, 7), db.count());
+        try expectGet(&db, "k1", v30);
+    }
 }
 
 test "merge: writers go on during the copy; keys rewritten meanwhile keep their newer value" {

@@ -446,6 +446,13 @@ const Vopr = struct {
                     try v.expectFault(e);
                     return .none;
                 };
+                // A crash while deleting the retired files comes after the
+                // commit, and `Db` deliberately swallows it (the files are
+                // listed obsolete): the machine is down all the same.
+                if (v.sim.crashed) {
+                    try v.event(.compact_fault, -1, 0);
+                    return .none;
+                }
                 try v.event(.compact_ok, -1, 0);
             } else { // keydir census
                 if (db.count() != v.liveCount())
@@ -808,6 +815,7 @@ const Replayer = struct {
                         try r.expectFault(e);
                         return .none;
                     };
+                    if (r.sim.crashed) return .none; // see `Vopr.runEpoch`
                 },
                 .census => {
                     if (db.count() != r.liveCount()) return error.InvariantViolation;
