@@ -160,6 +160,11 @@ const Fault = enum {
     /// it would also reset slot states under waiting readers and hang the
     /// run instead of failing it.)
     free_unscanned,
+    /// `pop` stores `read` before copying the item, so the block can be
+    /// recycled (and its items poisoned) under the copy. The copy is delayed,
+    /// or the window is a few instructions and the stress never hits it;
+    /// `recycle` parks a displaced spare on a graveyard instead of freeing it.
+    read_before_copy,
 };
 
 fn Impl(comptime T: type, comptime opts: Options, comptime fault: Fault) type {
@@ -235,6 +240,9 @@ fn Impl(comptime T: type, comptime opts: Options, comptime fault: Fault) type {
         /// dereferenced while shared.
         spare: std.atomic.Value(?*Block),
         allocator: std.mem.Allocator,
+        /// The `read_before_copy` control's displaced spares, freed at
+        /// `deinit` (a zero-size field otherwise).
+        graveyard: if (fault == .read_before_copy) std.atomic.Value(?*Block) else void,
 
         /// An empty queue with its first block. `allocator` must be
         /// thread-safe: blocks are allocated by producers and freed by
@@ -248,6 +256,7 @@ fn Impl(comptime T: type, comptime opts: Options, comptime fault: Fault) type {
                 .pending = .init(null),
                 .spare = .init(null),
                 .allocator = allocator,
+                .graveyard = if (fault == .read_before_copy) .init(null) else {},
             };
         }
 
@@ -266,6 +275,13 @@ fn Impl(comptime T: type, comptime opts: Options, comptime fault: Fault) type {
                 self.allocator.destroy(b);
             }
             if (self.spare.load(.monotonic)) |s| self.allocator.destroy(s);
+            if (fault == .read_before_copy) {
+                var g = self.graveyard.load(.monotonic);
+                while (g) |b| {
+                    g = b.pending_next;
+                    self.allocator.destroy(b);
+                }
+            }
             self.* = undefined;
         }
 
@@ -281,7 +297,18 @@ fn Impl(comptime T: type, comptime opts: Options, comptime fault: Fault) type {
         /// freeing whatever spare it displaces.
         fn recycle(self: *Self, b: *Block) void {
             b.poisonItems();
-            if (self.spare.swap(b, .acq_rel)) |old| self.allocator.destroy(old);
+            const old = self.spare.swap(b, .acq_rel) orelse return;
+            // The positive control recycles (poisons, resets, reuses) under a
+            // reader but never frees: a real free would crash the test run
+            // instead of failing it with a verdict.
+            if (fault == .read_before_copy) {
+                var top = self.graveyard.load(.monotonic);
+                while (true) {
+                    old.pending_next = top;
+                    top = self.graveyard.cmpxchgWeak(top, old, .release, .monotonic) orelse return;
+                }
+            }
+            self.allocator.destroy(old);
         }
 
         fn deferBlock(self: *Self, b: *Block) void {
@@ -392,8 +419,12 @@ fn Impl(comptime T: type, comptime opts: Options, comptime fault: Fault) type {
                     var w: Waiter = .{};
                     while (slot.state.load(.acquire) == empty) w.wait();
                 }
+                if (fault == .read_before_copy) {
+                    slot.state.store(read, .release);
+                    for (0..256) |_| std.atomic.spinLoopHint();
+                }
                 const value = slot.value;
-                slot.state.store(read, .release);
+                if (fault != .read_before_copy) slot.state.store(read, .release);
                 if (last) self.retire(b);
                 return value;
             }
@@ -417,9 +448,10 @@ fn Impl(comptime T: type, comptime opts: Options, comptime fault: Fault) type {
         }
 
         /// Slot positions before `pos`: whole laps of `block_slots`, plus
-        /// the offset, the closed position counting as the lap's full count.
+        /// the offset — the closed position's offset is `block_slots`, the
+        /// lap's full count, so it needs no special case.
         fn slotsBefore(pos: u64) u64 {
-            return pos / lap * closed + @min(pos % lap, closed);
+            return pos / lap * closed + pos % lap;
         }
     };
 }
@@ -502,6 +534,22 @@ test "SegQueue push that cannot get a block fails before claiming: the queue is 
     try q.push(4);
     for (1..5) |i| try testing.expectEqual(@as(?u64, i), q.pop());
     try testing.expectEqual(@as(?u64, null), q.pop());
+}
+
+test "SegQueue resets its first block: init on reused, dirty memory" {
+    // A fresh page reads as zeroes, which happen to be an empty slot and a
+    // null link; reused memory does not. Every byte 0xFF: a slot state that
+    // is not `empty` and a `next` that is not null, unless `init` resets.
+    const Q = SegQueue(u64, .{ .block_slots = 3 });
+    var buf: [@sizeOf(Q.Block) + 64]u8 align(64) = undefined;
+    @memset(&buf, 0xFF);
+    var fba: std.heap.FixedBufferAllocator = .init(&buf);
+    var q = try Q.init(fba.allocator());
+    defer q.deinit();
+    try testing.expect(q.isEmpty());
+    try testing.expectEqual(@as(?u64, null), q.pop());
+    try q.push(7);
+    try testing.expectEqual(@as(?u64, 7), q.pop());
 }
 
 test "SegQueue keeps one spare block: a steady flow stops allocating" {
@@ -588,4 +636,8 @@ test "SEGQUEUE DRIVER TEETH: a pop that skips the ready wait is caught (high pro
 
 test "SEGQUEUE DRIVER TEETH: a block freed at retire, without the scan, is caught (high probability)" {
     try expectCaught(Impl(u64, .{ .block_slots = 3 }, .free_unscanned));
+}
+
+test "SEGQUEUE DRIVER TEETH: a pop that stores read before copying is caught (high probability)" {
+    try expectCaught(Impl(u64, .{ .block_slots = 3 }, .read_before_copy));
 }
