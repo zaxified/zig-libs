@@ -898,16 +898,18 @@ ours/crossbeam by wall time, 8-core x86-64, best of 3 × 5.
 | deque_owner / deque_steal | 1 Mi push + pop; owner vs 3 thieves | 1.07 / 0.66 (owner was 1.15 until `grow` went out of line) |
 | epoch_pin | 1 Mi pin + unpin | 1.00 |
 
-The card stays `not measured` while the `unbounded_*` rows (`Queue(T)`) are in the
-verdict at up to 4× (gen-catalog refuses P4 for a module qap reaches); every other row
-is at or under 1.1× (4x4 rows noisy: spreads of 15–60 % on both sides of a run). Found and fixed on the way: a global spinlock per node in `NodePool`
+Since 2026-10-14 the `unbounded_*` rows (`Queue(T)`) are printed but left out of the
+verdict: `Queue(T)` has no crossbeam counterpart (`segqueue_*` is the like-for-like
+unbounded row) and, with workerpool on `SegQueue`, no consumer. Every verdict row is at
+or under 1.1× (4x4 rows noisy: spreads of 15–60 % on both sides of a run). Found and fixed on the way: a global spinlock per node in `NodePool`
 (per-participant caches), a `tryAdvance` scan after every dequeue (`advance_period`), MS
 `head`/`tail` and the queue's read-only fields on one cache line, and a lost CAS in
 `BoundedQueue` retried without backoff. What is left in `Queue(T)` is its shape — per item
 a node, a pin (`xchg`, ~9 ns) on each side and two or three CASes, where `SegQueue` claims
 a slot in a block and pins nothing; that is what `SegQueue(T)` (§4d) does, and it is
-crossbeam's `SegQueue`'s counterpart. `Queue(T)` stays for consumers that already hold an
-EBR domain (workerpool).
+crossbeam's `SegQueue`'s counterpart. `Queue(T)` stays as EBR's proving consumer and for a
+user that already holds a domain; workerpool, its only consumer, moved to `SegQueue`
+(2026-10-14).
 
 ## Backlog / deferred
 
@@ -919,9 +921,8 @@ Items from §6 stay there; the survey adds what a crossbeam user hits first.
   new structure) and a litmus pair for the retire/scan shape (the consumer's `read` store
   → the scanner's acquire load is message passing, already shape 2; the pending stack is
   a Treiber push + swap-all). Effort: small-medium; fits §2.
-- (2026-10-14) `workerpool` on `SegQueue`: it shares one `MpmcQueue` + `NodePool` + `Domain`
-  and registers every worker; `SegQueue` needs none of it and measures 2–5× faster. A
-  workerpool change. Effort: small; fits §2.
+- ~~(2026-10-14) `workerpool` on `SegQueue`~~ — ✅ 2026-10-14 (workerpool CHANGELOG):
+  jobs by value, no EBR, no submit lock; bench-workerpool 0.64–1.01× → 0.19–0.83× thpool.
 - (2026-10-14) `BoundedQueue`/`Queue(T)` lost-CAS backoff: `SegQueue` measured `2^10` against
   `Backoff.spin`'s `2^6` as a large win under 4×4/8×8 contention (§4d); the other CAS loops
   were not re-measured. Effort: small; fits §2.

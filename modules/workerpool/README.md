@@ -1,8 +1,9 @@
 # workerpool
 
-An in-process, fixed-width **worker pool** over `lockfree.MpmcQueue`: a closed
-roster of `std.Thread`s pulls type-erased jobs off a shared Michael-Scott
-multi-producer/multi-consumer queue and runs them. It is the execution
+An in-process, fixed-width **worker pool** over `lockfree.SegQueue`: a closed
+roster of `std.Thread`s pulls type-erased jobs off one shared unbounded
+multi-producer/multi-consumer queue and runs them. Jobs travel by value — no
+allocation per job, no lock on submit. It is the execution
 substrate for the P2 write-behind data-layer coordinator (DL5), which submits
 "flush this dirty entry to the sink" jobs to run off the request path.
 
@@ -35,16 +36,15 @@ pool.drain();              // stop accepting; run everything queued; join
 
 - `WorkerPool.init(allocator, Options) !*WorkerPool` — spawns the workers and
   returns a **heap-owned** pool (so workers can hold a stable back-pointer). A
-  failed init unwinds fully (spawned workers stopped + joined, participants
-  unregistered, storage freed) — no leak.
-- `WorkerPool.submit(Job) !void` — zero-setup, thread-safe from any thread.
-  Serialized against other `submit` callers by an internal spinlock (so its one
-  shared EBR participant is single-owner at enqueue); this is the ergonomic
-  default for a coordinator that submits from a few threads.
-- `WorkerPool.registerSubmitter() !Submitter` — a per-thread handle owning its
-  **own** EBR participant, for **lock-free concurrent** enqueue (genuinely
-  exercises the MS-queue's multi-producer side). Bounded by
-  `Options.max_submitters`; release with `Submitter.deinit`.
+  failed init unwinds fully (spawned workers stopped + joined, storage freed) —
+  no leak. The allocator must be **thread-safe**: the queue takes a block per 63
+  jobs from it on the submitting thread and workers give blocks back.
+- `WorkerPool.submit(Job) !void` — zero-setup, **lock-free** from any thread,
+  concurrently with other `submit`s.
+- `WorkerPool.registerSubmitter() !Submitter` — a counted handle whose `submit`
+  is the pool's `submit` (it once owned an EBR participant; kept for source
+  compatibility). Bounded by `Options.max_submitters`; release with
+  `Submitter.deinit`.
 - `WorkerPool.wait() bool` — block until every accepted job has run (nothing
   queued, nothing in flight) and **keep the pool running** — the
   batch-then-barrier pattern. `true` once idle, `false` if `shutdownNow` dropped
@@ -61,8 +61,8 @@ pool.drain();              // stop accepting; run everything queued; join
   and in-flight job, join all workers. After it returns the queue is empty and
   every submitted job has run.
 - `WorkerPool.shutdownNow()` — **abrupt**: stop accepting, let each worker
-  finish only its current in-flight job, join; jobs still queued are **not run**
-  but their boxes are **freed** (no leak).
+  finish only its current in-flight job, join; jobs still queued are **not run**,
+  they are taken off the queue and counted as dropped.
 - `WorkerPool.deinit()` — drains gracefully if still running, then frees
   everything. Safe after `drain`/`shutdownNow`.
 - `completedCount()` / `submittedCount()` / `workerCount()` — observability.
@@ -75,7 +75,7 @@ callable (no per-job-type instantiation, smaller binary); a comptime job type
 would force one concrete `Job`/`run` per pool. The caller owns `ctx` and keeps
 it valid until the job runs.
 
-**Backpressure — unbounded by default, never blocking.** The MS-queue grows on demand, so
+**Backpressure — unbounded by default, never blocking.** The queue grows on demand, so
 `submit` never blocks; it fails with `error.SubmitFailed` (allocator exhaustion) or
 `error.Shutdown` (pool no longer accepting). Set `Options.max_queued = N` to bound it: a submit that
 would leave more than `N` jobs queued-and-not-started returns `error.QueueFull` (nothing allocated,
@@ -104,7 +104,7 @@ handles must be `deinit`'d before the pool is torn down.
   single-owner lifecycle.
 
 Provenance: clean-room. Models the shape of `std.Thread.Pool` / a crossbeam
-worker pool, built on this workspace's own `lockfree` MS-queue + EBR. The
+worker pool, built on this workspace's own `lockfree.SegQueue`. The
 module's source copies nothing. Pithikos/C-Thread-Pool (MIT) was read for the
 behaviour of `pause`/`resume`/`num_threads_working` (2026-10-13), and an
 unmodified copy of it (plus an SPDX line) sits in `tools/c_bench/thpool/` as
@@ -127,11 +127,13 @@ silent hang. **All pass, none skipped:**
   the futex, not by spinning).
 - **shutdown while idle / while busy:** both terminate under the watchdog;
   busy-drain runs every queued spin-job before returning.
-- **shutdownNow:** in-flight completes, queued dropped, boxes freed (no leak /
-  double-free).
-- **STRESS (MP):** 8 producer threads each submit 20 000 jobs via their own
-  `Submitter` (lock-free concurrent enqueue) while 6 workers consume — all
-  160 000 accounted for exactly once.
+- **shutdownNow:** in-flight completes, the rest are dropped — ran + dropped =
+  submitted, the queue empty (no leak / double-free of its blocks).
+- **SubmitFailed:** the push that needs a new block fails its allocation; the
+  queue and every count are unchanged, and the next submit runs.
+- **STRESS (MP):** 8 producer threads each submit 20 000 jobs (via `Submitter`,
+  and again 8 × 5 000 via the shared `submit`) while 6 workers consume — all
+  accounted for exactly once.
 
 - **pause / resume:** nothing starts while paused (200 jobs held for 50 ms), a running job
   finishes, `drain` / `shutdownNow` override a pause, 2 000 racing pause/resume/submit rounds, and a
@@ -139,5 +141,5 @@ silent hang. **All pass, none skipped:**
 - **workingCount / max_queued:** N gated jobs on N workers read N; a bound of 4 refuses the 5th with
   `QueueFull` and accepts again after `resume` + `wait`; 8 producers on a bound of 3 never overshoot it.
 
-See `SPEC.md` for the drain semantics, the wakeup/no-lost-wakeup design, the
-backpressure policy, and the interaction with `lockfree`'s EBR reclamation.
+See `SPEC.md` for the drain semantics, the wakeup/no-lost-wakeup design and the
+backpressure policy.

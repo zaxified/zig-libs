@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-14** — **The queue is now `lockfree.SegQueue(Job)`** (was `lockfree.MpmcQueue` over EBR
+  with a `NodePool` box per job): jobs travel by value, no allocation per job (a block per 63), no
+  epoch domain, and `submit` from any thread takes no lock. `bench-workerpool` vs thpool
+  (7 rounds): 0.19–0.83× (was 0.64–1.01×; no-op burst 1.01 → 0.83, four producers 0.64 → 0.19).
+  **BREAKING:** `outstandingBoxes()` removed (there are no boxes); `InitError.TooManyParticipants`
+  and `InitError.CanaryTripped` removed (nothing can return them). **BEHAVIOURAL:** the allocator
+  given to `init` must be thread-safe (workers free queue blocks); `SubmitFailed` now means only
+  "the queue needed a block and could not get one". `Submitter` / `registerSubmitter` /
+  `max_submitters` keep their API and their bound, but a `Submitter` no longer differs from `submit`.
 - **2026-10-13** — **Feature (grade 2, parity with Pithikos/C-Thread-Pool):** `pause` / `resume` /
   `isPaused` (workers finish the job they have, then park on the `notify` futex; `drain` and
   `shutdownNow` override a pause; lost-wakeup argument in SPEC §4, test seam `pause_seam`),

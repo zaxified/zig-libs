@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 
 //! workerpool — an in-process, fixed-width worker pool over the lock-free
-//! `lockfree.MpmcQueue`. A closed roster of `std.Thread`s pulls type-erased
-//! jobs off a shared Michael-Scott queue and runs them; the pool owns its
+//! `lockfree.SegQueue`. A closed roster of `std.Thread`s pulls type-erased
+//! jobs off one shared unbounded queue and runs them; the pool owns its
 //! threads and offers a clean lifecycle: `init` → `submit`/`Submitter.submit`
 //! → `drain` (graceful) or `shutdownNow` (abrupt) → `deinit`. `wait` blocks
 //! until the pool is idle without shutting it down.
@@ -31,7 +31,7 @@
 //! shutdown that raced between the empty-observation and the park bumps the
 //! generation and makes the park return immediately (see `Worker.run`).
 //!
-//! **Backpressure — unbounded by default, never blocking.** The MS-queue grows
+//! **Backpressure — unbounded by default, never blocking.** The queue grows
 //! on demand, so `submit` never blocks; it fails with a typed error on
 //! allocator exhaustion (`error.SubmitFailed`), after shutdown
 //! (`error.Shutdown`) and, only when `Options.max_queued` is set, with
@@ -42,56 +42,24 @@
 //! running finish); `resume` lets them go on. Submissions are still accepted
 //! while paused. `drain`/`shutdownNow` override a pause (SPEC §4).
 //!
-//! See `SPEC.md` for the drain semantics, the wakeup correctness argument, the
-//! backpressure policy, and the interaction with `lockfree`'s EBR reclamation.
+//! **The queue.** Jobs travel by value in a `lockfree.SegQueue(Job)`: no
+//! per-job allocation, no epoch domain, no participant per thread, so
+//! `submit` from any thread takes no lock (2026-10-14; it was a Michael-Scott
+//! queue over EBR with a heap box per job and a spinlock on the shared submit
+//! path). The queue allocates a block per 63 jobs from the pool's allocator and
+//! workers free them, so that allocator must be thread-safe.
+//!
+//! See `SPEC.md` for the drain semantics, the wakeup correctness argument and
+//! the backpressure policy.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const lockfree = @import("lockfree");
 
-const QNode = lockfree.Node;
-const QNodePool = lockfree.NodePool(QNode);
-const Participant = lockfree.Participant;
-
-comptime {
-    // A job is carried through the u64 MS-queue payload as `@intFromPtr` of a
-    // heap `JobBox`. That round-trips losslessly iff a pointer fits in u64.
-    std.debug.assert(@sizeOf(usize) <= @sizeOf(u64));
-}
-
-/// Test-and-test-and-set mutual exclusion for `submit`'s shared-producer
-/// path, escalating through `lockfree.Backoff` instead of a bare
-/// `spinLoopHint()` spin — the same shape as this repo's `kv` F1 (a
-/// preempted lock holder otherwise stalls every other `submit` caller for a
-/// full scheduler quantum with no yield/backoff). Not `lockfree.SpinLock`:
-/// that type is documented "test-only... never used on a lock-free path",
-/// so a real production lock lives here instead of widening that type's
-/// contract.
-const BackoffSpinLock = struct {
-    state: std.atomic.Value(u32) = .init(unlocked),
-
-    const unlocked: u32 = 0;
-    const locked: u32 = 1;
-
-    fn lock(self: *BackoffSpinLock) void {
-        if (self.state.cmpxchgWeak(unlocked, locked, .acquire, .monotonic) == null) return;
-        var backoff: lockfree.Backoff = .{};
-        while (true) {
-            while (self.state.load(.monotonic) != unlocked) backoff.pause();
-            if (self.state.cmpxchgWeak(unlocked, locked, .acquire, .monotonic) == null) return;
-            backoff.pause();
-        }
-    }
-
-    fn unlock(self: *BackoffSpinLock) void {
-        self.state.store(unlocked, .release);
-    }
-};
-
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "In-process fixed-width worker pool over `lockfree.MpmcQueue` — type-erased closure jobs, Io-futex idle wakeup (no busy-spin, no lost-wakeup), graceful drain / abrupt shutdown",
+    .doc = "In-process fixed-width worker pool over `lockfree.SegQueue` — type-erased closure jobs carried by value, Io-futex idle wakeup (no busy-spin, no lost-wakeup), graceful drain / abrupt shutdown",
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
@@ -105,7 +73,7 @@ pub const meta = .{
     // thread. The *lifecycle* (`drain`/`shutdownNow`/`deinit`) is single-owner:
     // one thread orchestrates teardown after producers have quiesced.
     .concurrency = .threadsafe,
-    .model_after = "std.Thread.Pool / crossbeam worker pool over a Michael-Scott MPMC queue (lockfree)",
+    .model_after = "std.Thread.Pool / crossbeam worker pool over an unbounded MPMC queue (lockfree.SegQueue)",
     .deps = .{"lockfree"},
 };
 
@@ -131,9 +99,10 @@ pub const Options = struct {
     /// Number of worker threads. `null` ⇒ a cpu-count-derived default
     /// (`getCpuCount`, min 1). Caller-overridable; clamped to ≥ 1.
     n_workers: ?usize = null,
-    /// Extra EBR participant slots for `Submitter` handles beyond the built-in
-    /// shared-`submit` slot. Size this ≥ the number of threads that will hold a
-    /// `Submitter` concurrently. Default 0 ⇒ only the shared `submit` path.
+    /// How many `Submitter` handles may be held at once (`registerSubmitter`
+    /// refuses past it). Default 0 ⇒ only `submit`. A `Submitter` no longer
+    /// buys anything over `submit` — both enqueue lock-free since the queue
+    /// needs no per-thread participant — and is kept for source compatibility.
     max_submitters: usize = 0,
     /// How long a worker that found the queue empty keeps looking before it
     /// parks, in nanoseconds. 0 (the default) parks at once, as before.
@@ -159,19 +128,13 @@ pub const InitError = error{
     /// already running; the partially-built pool is torn down before this
     /// returns, so no threads leak.
     SpawnFailed,
-    /// No free EBR participant slot for a worker (should not happen — the
-    /// domain is sized to fit; kept for completeness of the propagated set).
-    TooManyParticipants,
-    /// The queue's node pool tripped its use-after-free canary while building
-    /// the dummy sentinel (propagated from `lockfree`; not expected at init).
-    CanaryTripped,
 } || std.mem.Allocator.Error;
 
 pub const SubmitError = error{
     /// The pool is no longer accepting work (`drain`/`shutdownNow` has begun).
     Shutdown,
-    /// Backing storage for the job could not be allocated (queue node or job
-    /// box). The job was NOT enqueued and no accounting changed.
+    /// The queue needed a new block (one per 63 jobs) and the allocator
+    /// refused it. The job was NOT enqueued and no accounting changed.
     SubmitFailed,
     /// `Options.max_queued` jobs are already queued and not yet started. The
     /// job was NOT enqueued and no accounting changed; retry later or shed.
@@ -180,7 +143,7 @@ pub const SubmitError = error{
 };
 
 pub const RegisterSubmitterError = error{
-    /// No free EBR participant slot — raise `Options.max_submitters`.
+    /// `Options.max_submitters` handles are already held.
     TooManySubmitters,
     /// The pool is shutting down; new submitters are refused.
     Shutdown,
@@ -193,21 +156,11 @@ const State = enum(u8) { running, draining, stopping_now, stopped };
 
 // ── internals ────────────────────────────────────────────────────────────────
 
-/// Heap box holding one job's closure while it sits in the queue. Stored in a
-/// thread-safe `NodePool` so steady-state submit/run cycles never hit the
-/// general allocator. The queue payload is `@intFromPtr(box)`; because the
-/// MS-queue delivers each value to exactly one consumer, exactly one worker
-/// owns (and releases) each box — no sharing, so no EBR is needed for the box
-/// itself (EBR governs only the queue's own nodes).
-const JobBox = struct {
-    func: *const fn (ctx: *anyopaque) void,
-    ctx: *anyopaque,
-};
-const BoxPool = lockfree.NodePool(JobBox);
+/// The job queue: `Job`s by value, any thread pushes and pops.
+const JobQueue = lockfree.SegQueue(Job, .{});
 
 const Worker = struct {
     pool: *WorkerPool,
-    participant: *Participant,
     thread: std.Thread = undefined,
 };
 
@@ -217,22 +170,13 @@ pub const WorkerPool = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
 
-    // lock-free substrate (from `lockfree`)
-    domain: lockfree.Domain,
-    qnodes: QNodePool,
-    queue: lockfree.MpmcQueue,
-    boxes: BoxPool,
+    queue: JobQueue,
 
     workers: []Worker,
 
-    /// The participant + spinlock backing the zero-setup `submit` path. The
-    /// lock serializes `submit` against itself so the single shared participant
-    /// is never used by two threads at once (EBR's single-owner rule); it does
-    /// NOT serialize against `Submitter`s, which enqueue concurrently with
-    /// their own participants. Also used single-threaded at teardown to drain
-    /// leftover boxes.
-    shared_producer: *Participant,
-    producer_lock: BackoffSpinLock = .{},
+    /// `Options.max_submitters`, and the `Submitter`s currently held.
+    max_submitters: usize = 0,
+    submitters: std.atomic.Value(usize) = .init(0),
 
     /// Idle-worker wakeup generation. Bumped (and a futex wake issued) after
     /// every publish and every state transition; workers park on a snapshot of
@@ -289,86 +233,45 @@ pub const WorkerPool = struct {
     /// snapshot of it (same compare-at-entry argument as `notify`).
     done_gen: std.atomic.Value(u32) = .init(0),
 
-    /// `JobBox`es handed out by `boxes` and not yet returned to it.
-    ///
-    /// This exists because a leaked box is **invisible to the allocator**:
-    /// `lockfree.NodePool.deinit` `destroy`s every slot it ever allocated
-    /// regardless of whether that slot was `release`d, so a `DebugAllocator`
-    /// reports a clean teardown even when `freeQueuedBoxes` never ran and tens
-    /// of thousands of boxes were abandoned. Both of this module's "no leak"
-    /// tests were anchored on nothing until this counter existed. It is the
-    /// pool's own accounting, so it holds without any change to `lockfree`
-    /// (whose `NodePool` exposes no live-slot count).
-    boxes_live: std.atomic.Value(i64) = .init(0),
-
     /// Build and start the pool. Returns a heap-owned `*WorkerPool` so worker
     /// threads can hold a stable back-pointer (a by-value pool would move on
     /// return, dangling those pointers). `deinit` frees it.
     ///
     /// On any failure the partially-constructed pool is fully unwound —
-    /// spawned workers are stopped and joined, participants unregistered, all
-    /// storage freed — so a failed `init` leaks nothing.
+    /// spawned workers are stopped and joined, all storage freed — so a
+    /// failed `init` leaks nothing. `allocator` must be thread-safe (see the
+    /// file comment).
     pub fn init(allocator: std.mem.Allocator, options: Options) InitError!*WorkerPool {
         const n_workers = blk: {
             const requested = options.n_workers orelse (std.Thread.getCpuCount() catch 4);
             break :blk @max(@as(usize, 1), requested);
         };
-        // slots: one per worker (dequeue) + the shared submit slot + submitters.
-        const max_participants = n_workers + 1 + options.max_submitters;
-
         const self = try allocator.create(WorkerPool);
         errdefer allocator.destroy(self);
 
-        // Construct directly into `self.*` fields (their addresses are final,
-        // as the queue holds `*QNodePool`/`*Domain` into them). Each substrate
-        // field gets its own errdefer against `self.*` — no locals to move in,
-        // so no double-deinit on the unwind path. Unspecified fields take their
-        // struct-declaration defaults (locks, counters, state).
+        // Construct directly into `self.*` fields (workers keep a pointer to
+        // the pool, so its address is final). Unspecified fields take their
+        // struct-declaration defaults (counters, state).
         self.* = .{
             .allocator = allocator,
             .io = options.io,
             .spin_ns = options.spin_ns,
             .max_queued = options.max_queued,
-            .domain = undefined,
-            .qnodes = undefined,
+            .max_submitters = options.max_submitters,
             .queue = undefined,
-            .boxes = undefined,
             .workers = &.{},
-            .shared_producer = undefined,
         };
 
-        self.domain = try lockfree.Domain.init(allocator, .{ .max_participants = max_participants });
-        errdefer self.domain.deinit();
-
-        self.qnodes = QNodePool.init(allocator);
-        errdefer self.qnodes.deinit();
-
-        self.boxes = BoxPool.init(allocator);
-        errdefer self.boxes.deinit();
-
-        self.queue = try lockfree.MpmcQueue.init(&self.qnodes, &self.domain);
+        self.queue = try JobQueue.init(allocator);
         errdefer self.queue.deinit();
-
-        self.shared_producer = try self.domain.register();
-        errdefer self.domain.unregister(self.shared_producer);
 
         const workers = try allocator.alloc(Worker, n_workers);
         errdefer allocator.free(workers);
         self.workers = workers;
-
-        // Register every worker's participant BEFORE spawning any thread, so a
-        // spawned worker never races a still-registering sibling.
-        var registered: usize = 0;
-        errdefer for (workers[0..registered]) |*w| self.domain.unregister(w.participant);
-        while (registered < n_workers) : (registered += 1) {
-            workers[registered] = .{
-                .pool = self,
-                .participant = try self.domain.register(),
-            };
-        }
+        for (workers) |*w| w.* = .{ .pool = self };
 
         // Spawn. On a spawn failure, stop + join the workers already running,
-        // then let the errdefers above unregister/free everything.
+        // then let the errdefers above free everything.
         var spawned: usize = 0;
         errdefer if (spawned != 0) {
             self.state.store(.stopping_now, .seq_cst);
@@ -399,13 +302,13 @@ pub const WorkerPool = struct {
 
     /// Abrupt shutdown: stop accepting new work and let each worker finish only
     /// its current in-flight job, then join. Jobs still queued are NOT run;
-    /// their boxes are freed (no leak). Use when queued work is safe to drop
+    /// they are taken off the queue and counted as dropped. Use when queued work is safe to drop
     /// (e.g. process teardown). Precondition + idempotency as `drain`.
     pub fn shutdownNow(self: *WorkerPool) void {
         if (self.state.cmpxchgStrong(.running, .stopping_now, .seq_cst, .seq_cst) != null) return;
         self.wakeAll();
         for (self.workers) |*w| w.thread.join();
-        self.freeQueuedBoxes();
+        self.dropQueued();
         self.state.store(.stopped, .seq_cst);
         // Dropped jobs will never complete: release any `wait` caller.
         self.wakeWaiters();
@@ -479,44 +382,36 @@ pub const WorkerPool = struct {
     /// call after `drain`/`shutdownNow`, or directly (then it drains first).
     pub fn deinit(self: *WorkerPool) void {
         if (self.state.load(.seq_cst) == .running) self.drain();
-        // Defensive: free any boxes still queued (none after a graceful drain;
-        // possibly some after `shutdownNow` already freed them — this is a
-        // second, now-empty pass and is safe).
-        self.freeQueuedBoxes();
+        // Defensive: drop anything still queued (nothing after a graceful
+        // drain or a `shutdownNow`; a second, empty pass is safe).
+        self.dropQueued();
 
         const allocator = self.allocator;
-        for (self.workers) |*w| self.domain.unregister(w.participant);
         allocator.free(self.workers);
-        self.domain.unregister(self.shared_producer);
         self.queue.deinit();
-        self.qnodes.deinit();
-        self.boxes.deinit();
-        self.domain.deinit();
         allocator.destroy(self);
     }
 
-    /// Submit a job from any thread (zero setup). Thread-safe: serialized
-    /// against other `submit` callers by an internal spinlock so the shared
-    /// producer participant is single-owner at the moment of enqueue. For
-    /// high-fan-in lock-free submission, use `registerSubmitter`.
+    /// Submit a job from any thread (zero setup, lock-free).
     ///
     /// Non-blocking; the queue is unbounded unless `Options.max_queued` is set.
     /// Errors: `Shutdown` (pool no longer accepting), `SubmitFailed`
     /// (allocator exhaustion) or `QueueFull` (only with `max_queued`).
     pub fn submit(self: *WorkerPool, job: Job) SubmitError!void {
-        self.producer_lock.lock();
-        defer self.producer_lock.unlock();
-        return self.enqueueJob(self.shared_producer, job);
+        return self.enqueueJob(job);
     }
 
-    /// Claim a dedicated `Submitter` bound to the calling thread for lock-free
-    /// concurrent enqueue (its own EBR participant — genuinely exercises the
-    /// MS-queue's multi-producer side). Release it with `Submitter.deinit`.
-    /// Bounded by `Options.max_submitters`.
+    /// Claim a `Submitter` handle; release it with `Submitter.deinit`.
+    /// Bounded by `Options.max_submitters`. Its `submit` is the pool's
+    /// `submit` (kept for source compatibility, see `max_submitters`).
     pub fn registerSubmitter(self: *WorkerPool) RegisterSubmitterError!Submitter {
         if (self.state.load(.seq_cst) != .running) return error.Shutdown;
-        const p = self.domain.register() catch return error.TooManySubmitters;
-        return .{ .pool = self, .participant = p };
+        var cur = self.submitters.load(.seq_cst);
+        while (true) {
+            if (cur >= self.max_submitters) return error.TooManySubmitters;
+            cur = self.submitters.cmpxchgWeak(cur, cur + 1, .seq_cst, .seq_cst) orelse break;
+        }
+        return .{ .pool = self };
     }
 
     /// Jobs run so far (monotone). For observability / test assertions.
@@ -551,12 +446,6 @@ pub const WorkerPool = struct {
         const in = self.submitted.load(.seq_cst);
         return @intCast(in -| began -| gone);
     }
-    /// `JobBox`es currently checked out of the box pool. Must be 0 once the
-    /// workers have joined and the queue has been drained (`drain`) or flushed
-    /// (`shutdownNow`); a non-zero value is a leak the allocator cannot see.
-    pub fn outstandingBoxes(self: *const WorkerPool) i64 {
-        return self.boxes_live.load(.seq_cst);
-    }
 
     /// True iff every job `submit`/`Submitter.submit` ever accepted has run
     /// (`submittedCount() == completedCount()`). Meant to be checked after
@@ -580,26 +469,19 @@ pub const WorkerPool = struct {
 
     // ── internal machinery ───────────────────────────────────────────────────
 
-    /// The shared enqueue path. `p` must be a participant this call owns
-    /// exclusively for its duration (the shared-producer spinlock, or a
-    /// `Submitter`'s own participant).
-    fn enqueueJob(self: *WorkerPool, p: *Participant, job: Job) SubmitError!void {
+    /// The one enqueue path, from any thread.
+    fn enqueueJob(self: *WorkerPool, job: Job) SubmitError!void {
         if (self.state.load(.seq_cst) != .running) return error.Shutdown;
 
-        // Admission first, before anything is allocated or counted. Released
-        // by the worker that dequeues the job, or right here on a rollback.
+        // Admission first, before anything is counted. Released by the worker
+        // that dequeues the job, or right here on a rollback.
         try self.reserveSlot();
 
-        const box = self.acquireBox() catch {
-            self.releaseSlot();
-            return error.SubmitFailed;
-        };
-        box.* = .{ .func = job.func, .ctx = job.ctx };
-
+        // Counted before the push, so `queuedCount` never sees the job taken
+        // before it was submitted; a failed push leaves the queue unchanged.
         _ = self.submitted.fetchAdd(1, .monotonic);
-        self.queue.enqueue(p, @intFromPtr(box)) catch {
+        self.queue.push(job) catch {
             _ = self.submitted.fetchSub(1, .monotonic);
-            self.releaseBox(box);
             self.releaseSlot();
             return error.SubmitFailed;
         };
@@ -635,25 +517,11 @@ pub const WorkerPool = struct {
 
     /// Worker-side dequeue: the job is counted as started before its slot is
     /// released, so `queued + working` never dips below the true count.
-    fn takeJob(self: *WorkerPool, p: *Participant) ?u64 {
-        const value = self.queue.dequeue(p) orelse return null;
+    fn takeJob(self: *WorkerPool) ?Job {
+        const job = self.queue.pop() orelse return null;
         _ = self.started.fetchAdd(1, .seq_cst);
         self.releaseSlot();
-        return value;
-    }
-
-    /// Check a box out of the pool, counting it. Every `boxes.acquire` in the
-    /// module goes through here, and every `boxes.release` through
-    /// `releaseBox`, so `boxes_live` cannot drift.
-    fn acquireBox(self: *WorkerPool) !*JobBox {
-        const box = try self.boxes.acquire();
-        _ = self.boxes_live.fetchAdd(1, .monotonic);
-        return box;
-    }
-
-    fn releaseBox(self: *WorkerPool, box: *JobBox) void {
-        self.boxes.release(box);
-        _ = self.boxes_live.fetchSub(1, .monotonic);
+        return job;
     }
 
     /// Bump the generation and wake every parked worker. Called after a state
@@ -669,48 +537,38 @@ pub const WorkerPool = struct {
         self.io.futexWake(u32, &self.done_gen.raw, std.math.maxInt(u32));
     }
 
-    /// Run one dequeued job. The box is released back to the pool BEFORE the
-    /// closure runs, so a long job does not pin box storage; `func`/`ctx` are
-    /// copied out first.
-    fn runBox(self: *WorkerPool, value: u64) void {
-        const box: *JobBox = @ptrFromInt(@as(usize, @intCast(value)));
-        const func = box.func;
-        const ctx = box.ctx;
-        self.releaseBox(box);
-        func(ctx);
+    /// Run one dequeued job.
+    fn runJob(self: *WorkerPool, job: Job) void {
+        job.func(job.ctx);
         // seq_cst, not monotonic: `wait`'s lost-wakeup argument needs this
         // increment ordered before the `waiters` load below.
         _ = self.completed.fetchAdd(1, .seq_cst);
         if (self.waiters.load(.seq_cst) > 0) self.wakeWaiters();
     }
 
-    /// Drain any jobs still in the queue without running them, freeing their
-    /// boxes. Single-threaded caller (all workers joined) — uses the shared
-    /// producer participant to dequeue.
-    fn freeQueuedBoxes(self: *WorkerPool) void {
-        while (self.queue.dequeue(self.shared_producer)) |value| {
-            const box: *JobBox = @ptrFromInt(@as(usize, @intCast(value)));
-            self.releaseBox(box);
+    /// Take any jobs still in the queue without running them, counting them
+    /// as dropped. Single-threaded caller (all workers joined).
+    fn dropQueued(self: *WorkerPool) void {
+        while (self.queue.pop()) |_| {
             _ = self.dropped.fetchAdd(1, .seq_cst);
             self.releaseSlot();
         }
     }
 };
 
-/// A per-thread handle for lock-free concurrent submission. Owns its own EBR
-/// participant; `submit` enqueues with it directly (no shared lock). Not itself
-/// thread-safe — one `Submitter` per submitting thread. Release with `deinit`
-/// before the pool is torn down.
+/// A counted submission handle (`Options.max_submitters`). `submit` is the
+/// pool's lock-free `submit`; the handle once carried its own EBR participant
+/// and is kept for source compatibility. Release with `deinit` before the pool
+/// is torn down.
 pub const Submitter = struct {
     pool: *WorkerPool,
-    participant: *Participant,
 
     pub fn submit(self: *Submitter, job: Job) SubmitError!void {
-        return self.pool.enqueueJob(self.participant, job);
+        return self.pool.enqueueJob(job);
     }
 
     pub fn deinit(self: *Submitter) void {
-        self.pool.domain.unregister(self.participant);
+        _ = self.pool.submitters.fetchSub(1, .seq_cst);
         self.* = undefined;
     }
 };
@@ -761,7 +619,6 @@ threadlocal var current_pool: ?*const WorkerPool = null;
 // can name it; takes the stable `*Worker`.
 fn workerRun(w: *Worker) void {
     const self = w.pool;
-    const p = w.participant;
     current_pool = self;
     outer: while (true) {
         const st = self.state.load(.seq_cst);
@@ -788,8 +645,8 @@ fn workerRun(w: *Worker) void {
             continue;
         }
 
-        if (self.takeJob(p)) |value| {
-            self.runBox(value);
+        if (self.takeJob()) |job| {
+            self.runJob(job);
             continue;
         }
         // Queue observed empty.
@@ -819,8 +676,8 @@ fn workerRun(w: *Worker) void {
         // then re-check the queue and state, so any submit/shutdown that raced
         // in between bumped the generation and makes the wait return at once.
         const gen = self.notify.load(.seq_cst);
-        if (self.takeJob(p)) |value| {
-            self.runBox(value);
+        if (self.takeJob()) |job| {
+            self.runJob(job);
             continue;
         }
         // Test seam — see `park_seam`. Deliberately placed at the TOP of the
@@ -839,9 +696,6 @@ fn workerRun(w: *Worker) void {
         _ = self.idle.fetchSub(1, .seq_cst);
         // Woken (real, or spurious) — loop and re-evaluate.
     }
-    // NB: the worker does NOT unregister its own participant here. `deinit`
-    // unregisters every worker participant in one place (after joining), so
-    // self-unregistering would be a double-unregister of the same slot.
 }
 
 // ── tests ────────────────────────────────────────────────────────────────────
@@ -947,10 +801,8 @@ test "graceful drain runs every queued job; no leak (DebugAllocator clean)" {
     // Submitting after drain is refused, not a panic.
     try testing.expectError(error.Shutdown, pool.submit(.{ .func = incr, .ctx = &c }));
 
-    // The allocator alone cannot see an unreturned `JobBox` (see `boxes_live`),
-    // so assert the pool's own accounting too — otherwise "no leak" in this
-    // test's name is a claim nothing checks.
-    try testing.expectEqual(@as(i64, 0), pool.outstandingBoxes());
+    // Nothing left behind in the queue.
+    try testing.expect(pool.queue.isEmpty());
 
     pool.deinit(); // frees everything; DebugAllocator verifies no leak
 }
@@ -1280,20 +1132,21 @@ test "shutdownNow: in-flight completes, queued dropped, no leak" {
 
     pool.shutdownNow(); // abrupt: not all N necessarily run
     const ran = c.n.load(.seq_cst);
-    // Some may have run, but never more than submitted; queued boxes were
-    // freed (the deferred deinit + DebugAllocator prove no leak/double-free).
+    // Some may have run, but never more than submitted; the rest were taken
+    // off the queue as dropped (the deferred deinit + DebugAllocator prove no
+    // leak/double-free of the queue's blocks).
     try testing.expect(ran <= n);
     try testing.expectEqual(ran, pool.completedCount());
-    // Same point as above: the DebugAllocator cannot see an abandoned box.
-    try testing.expectEqual(@as(i64, 0), pool.outstandingBoxes());
+    try testing.expectEqual(n, ran + pool.dropped.load(.seq_cst));
+    try testing.expect(pool.queue.isEmpty());
 }
 
 // ── F3: the error ladder (audit W2 `workerpool` F3) ─────────────────────────
 //
 // Every non-happy path below was previously unreached by any test: no
 // `FailingAllocator` anywhere in the suite (`rg 'FailingAllocator'
-// modules/workerpool/` returned nothing), so a double-decrement, a missing
-// `boxes.release`, or a broken `init` unwind could ship silently.
+// modules/workerpool/` returned nothing), so a double-decrement, a missed
+// rollback, or a broken `init` unwind could ship silently.
 
 test "F3: TooManySubmitters is refused once max_submitters is exhausted" {
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
@@ -1323,10 +1176,9 @@ test "F3: init's errdefer ladder never leaks under allocator exhaustion, at ever
     defer threaded.deinit();
     const io = threaded.io();
 
-    // Sweep every possible allocation-failure point inside `init` (domain,
-    // qnodes, boxes, queue's dummy sentinel, shared_producer registration,
-    // the workers slice, each worker's participant registration — one
-    // `errdefer` per site, per the doc comment on `init`). Deliberately on
+    // Sweep every possible allocation-failure point inside `init` (the pool,
+    // the queue's first block, the workers slice — one `errdefer` per site,
+    // per the doc comment on `init`). Deliberately on
     // `page_allocator` (not the leak-panicking `testing.allocator`): this
     // loop asserts leak-freedom ITSELF, via each `FailingAllocator`'s own
     // `allocations`/`deallocations` counters, precisely so it can also
@@ -1370,73 +1222,47 @@ test "F3: init's errdefer ladder never leaks under allocator exhaustion, at ever
     try testing.expect(false);
 }
 
-test "F3: SubmitFailed on box-acquisition failure leaves accounting untouched" {
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-
-    // Build a real, healthy pool first (real allocator) so `init`'s own
-    // allocations are not in the budget being tested below — only the
-    // allocation `submit` itself triggers (`boxes.acquire`'s fresh `JobBox`,
-    // the pool's free list starts empty) is exercised.
-    const pool = try WorkerPool.init(testing.allocator, .{ .io = io, .n_workers = 1 });
-    defer pool.deinit();
-
-    // Swap in a FailingAllocator that fails on the very first allocation —
-    // `boxes.acquire` is the first thing `enqueueJob` allocates, so this
-    // fails there, before `submitted` is touched and before the queue is
-    // touched at all. Only `boxes`' own allocator needs swapping:
-    // `acquireBox` routes through `self.boxes.acquire()`, which reads
-    // `self.boxes.allocator`, not the pool's top-level `allocator` field.
-    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
-    pool.boxes.allocator = failing.allocator();
-    defer pool.boxes.allocator = testing.allocator;
-
-    const before_submitted = pool.submittedCount();
-    const before_outstanding = pool.outstandingBoxes();
-    try testing.expectError(error.SubmitFailed, pool.submit(.{ .func = incr, .ctx = undefined }));
-    try testing.expectEqual(before_submitted, pool.submittedCount()); // never incremented
-    try testing.expectEqual(before_outstanding, pool.outstandingBoxes()); // box never counted
-
-    // The pool is otherwise still healthy: restore a real allocator and
-    // prove a normal submit still works (this was a transient allocator
-    // failure, not pool corruption).
-    pool.boxes.allocator = testing.allocator;
-    var c = Counter{};
-    try pool.submit(.{ .func = incr, .ctx = &c });
+/// Queue `JobQueue.block_slots - 1` jobs on a paused pool, so the next push
+/// claims a block's last slot and must take a new block from the allocator
+/// (the queue's spare is empty on a fresh pool).
+fn fillToBlockEdge(pool: *WorkerPool, c: *Counter) !void {
+    pool.pause();
+    for (0..JobQueue.block_slots - 1) |_| try pool.submit(.{ .func = incr, .ctx = c });
 }
 
-test "F3: SubmitFailed on enqueue failure rolls back submitted-count AND releases the box (no leak)" {
+test "F3: SubmitFailed when the queue cannot get a block leaves accounting untouched" {
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
 
+    // A real, healthy pool first, so `init`'s own allocations are not in the
+    // budget tested below; then fill the first block up to its last slot.
     const pool = try WorkerPool.init(testing.allocator, .{ .io = io, .n_workers = 1 });
     defer pool.deinit();
+    var c = Counter{};
+    try fillToBlockEdge(pool, &c);
 
-    // Let `boxes.acquire` succeed (fail_index high) but make the QUEUE's own
-    // node allocation fail — `queue.enqueue` needs a fresh `QNode` from
-    // `qnodes`, a separate pool from `boxes`, so failing only `qnodes`'
-    // allocator isolates the rollback branch specifically (`enqueueJob`'s
-    // `queue.enqueue(...) catch { submitted.fetchSub; boxes.release; ...
-    // }`) from the box-acquisition failure the previous test already covers.
+    // The next push needs a block: fail that allocation. Only the queue's
+    // allocator needs swapping (`push` reads `queue.allocator`).
     var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
-    pool.qnodes.allocator = failing.allocator();
-    defer pool.qnodes.allocator = testing.allocator;
+    pool.queue.allocator = failing.allocator();
+    defer pool.queue.allocator = testing.allocator;
 
     const before_submitted = pool.submittedCount();
-    const before_outstanding = pool.outstandingBoxes();
-    try testing.expectError(error.SubmitFailed, pool.submit(.{ .func = incr, .ctx = undefined }));
-    // Rolled back exactly: `submitted` was incremented then decremented back
-    // (not left elevated), and the acquired box was released (not leaked —
-    // `outstandingBoxes` returns to what it was before this submit).
-    try testing.expectEqual(before_submitted, pool.submittedCount());
-    try testing.expectEqual(before_outstanding, pool.outstandingBoxes());
+    const before_queued = pool.queue.len();
+    try testing.expectError(error.SubmitFailed, pool.submit(.{ .func = incr, .ctx = &c }));
+    try testing.expect(failing.has_induced_failure); // the block allocation was the one refused
+    try testing.expectEqual(before_submitted, pool.submittedCount()); // rolled back exactly
+    try testing.expectEqual(before_queued, pool.queue.len()); // nothing claimed
+    try testing.expectEqual(before_submitted, pool.queuedCount());
 
-    // Healthy afterward: restore and prove a normal submit still runs.
-    pool.qnodes.allocator = testing.allocator;
-    var c = Counter{};
+    // Healthy afterward: restore a real allocator; the same push now gets its
+    // block, and every accepted job runs.
+    pool.queue.allocator = testing.allocator;
     try pool.submit(.{ .func = incr, .ctx = &c });
+    pool.@"resume"();
+    try testing.expect(pool.wait());
+    try testing.expectEqual(@as(u64, JobQueue.block_slots), c.n.load(.seq_cst));
 }
 
 test "STRESS: many concurrent producers via Submitter + pool consuming (MP)" {
@@ -1487,17 +1313,11 @@ test "STRESS: many concurrent producers via Submitter + pool consuming (MP)" {
     try testing.expectEqual(n_producers * per_producer, pool.completedCount());
 }
 
-// W2-B/workerpool-F5: `producer_lock` (guarding the shared zero-setup
-// `submit` path) had no test exercising it under real concurrent contention
-// — every other `submit`-path test calls it sequentially from one thread;
-// only the `Submitter` stress test above spawns real threads, and each
-// `Submitter` has its own participant, entirely bypassing `producer_lock`.
-// This spawns several real OS threads all calling the SAME `WorkerPool.submit`
-// (the shared-producer path) concurrently — the shape that actually exercises
-// mutual exclusion under contention — and checks no job is lost or
-// double-counted, which a broken lock (or a bare-spin lock racing a
-// descheduled holder) could otherwise silently corrupt.
-test "STRESS: many concurrent producers via the SHARED submit path (producer_lock under real contention)" {
+// W2-B/workerpool-F5: several real OS threads all calling the SAME
+// `WorkerPool.submit` concurrently (it was a spinlock-serialized path until
+// 2026-10-14; now it is the queue's lock-free multi-producer push) — checks no
+// job is lost or double-counted under contention.
+test "STRESS: many concurrent producers via the shared submit path" {
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
@@ -1580,13 +1400,10 @@ test "STRESS: repeated idle→submit→wake hammers the park/wake boundary" {
     try testing.expectEqual(iters, pool.completedCount());
 }
 
-test "STRESS: submitter register/deinit churn (dynamic EBR slot reuse)" {
-    // Area 3: register/deinit a `Submitter` thousands of times so its EBR
-    // participant slot is reused over and over WHILE the workers consume and
-    // advance epochs. This hammers the dynamic-registration path — the `in_use`
-    // CAS + `local_epoch` reset on a recycled slot racing the workers'
-    // `tryAdvance` scans. A reclamation bug on slot reuse would surface as a
-    // poison-canary trip (propagated as an init/submit error) or a hang.
+test "STRESS: submitter register/deinit churn (the max_submitters budget is reusable)" {
+    // Register/deinit a `Submitter` thousands of times against a budget of
+    // one WHILE the workers consume: a handle whose `deinit` failed to give
+    // its place back would make the second `registerSubmitter` refuse.
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
@@ -1713,7 +1530,7 @@ test "TEETH: the notify snapshot must precede the final queue re-check" {
 
     pool.drain();
     try testing.expectEqual(@as(u64, 1), pool.completedCount());
-    try testing.expectEqual(@as(i64, 0), pool.outstandingBoxes());
+    try testing.expect(pool.queue.isEmpty());
 }
 
 // ── TEETH: the final re-check, and shutdownNow's waiter wake ────────────────
@@ -1869,16 +1686,15 @@ test "TEETH: shutdownNow releases a wait() that parked on work it then dropped" 
     defer wait_seam.store(null, .seq_cst);
     try testing.expect(!pool.wait());
     try testing.expectEqual(@as(u64, 0), c.n.load(.seq_cst)); // dropped, never run
-    try testing.expectEqual(@as(i64, 0), pool.outstandingBoxes());
+    try testing.expect(pool.queue.isEmpty());
 }
 
-// ── TEETH: box reclamation the allocator cannot see ─────────────────────────
+// ── TEETH: what shutdownNow leaves behind ───────────────────────────────────
 
-test "TEETH: shutdownNow returns every queued JobBox to the pool" {
-    // `testing.allocator` is blind here: `lockfree.NodePool.deinit` frees every
-    // slot whether or not it was released, so deleting `freeQueuedBoxes`
-    // outright leaves 50 000 abandoned boxes and still reports a clean run.
-    // `outstandingBoxes` is the anchor the allocator cannot provide.
+test "TEETH: shutdownNow takes every queued job off the queue and counts it dropped" {
+    // `queue.deinit` would free the blocks of a non-empty queue too, so the
+    // allocator cannot tell whether `dropQueued` ran; the accounting can: every
+    // submitted job either ran or was dropped, and the queue is empty.
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
@@ -1891,7 +1707,7 @@ test "TEETH: shutdownNow returns every queued JobBox to the pool" {
     defer wd.finish();
 
     // Slow jobs, so the abrupt stop is guaranteed to leave a real backlog in
-    // the queue — otherwise there would be nothing for `freeQueuedBoxes` to do
+    // the queue — otherwise there would be nothing for `dropQueued` to do
     // and the test would assert a vacuous truth.
     var c = SpinCounter{ .spins = 2_000 };
     const n: u64 = 50_000;
@@ -1900,10 +1716,12 @@ test "TEETH: shutdownNow returns every queued JobBox to the pool" {
     pool.shutdownNow();
     const ran = c.n.load(.seq_cst);
     try testing.expect(ran < n); // the backlog was real
-    try testing.expectEqual(@as(i64, 0), pool.outstandingBoxes());
+    try testing.expectEqual(n, ran + pool.dropped.load(.seq_cst));
+    try testing.expectEqual(@as(usize, 0), pool.queuedCount());
+    try testing.expect(pool.queue.isEmpty());
 }
 
-test "TEETH: graceful drain returns every JobBox to the pool" {
+test "TEETH: graceful drain leaves the queue empty" {
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
@@ -1921,7 +1739,7 @@ test "TEETH: graceful drain returns every JobBox to the pool" {
 
     pool.drain();
     try testing.expectEqual(n, pool.completedCount());
-    try testing.expectEqual(@as(i64, 0), pool.outstandingBoxes());
+    try testing.expect(pool.queue.isEmpty());
 }
 
 test "default n_workers derives from cpu count and is ≥ 1" {
@@ -2097,7 +1915,7 @@ test "pause: submitted jobs stay queued, nothing starts; resume + wait runs them
     try testing.expect(pool.wait());
     try testing.expectEqual(n, c.n.load(.seq_cst));
     try testing.expectEqual(@as(usize, 0), pool.queuedCount());
-    try testing.expectEqual(@as(i64, 0), pool.outstandingBoxes());
+    try testing.expect(pool.queue.isEmpty());
 }
 
 test "pause: a job already running when pause() is called finishes; the next one waits" {
@@ -2155,10 +1973,10 @@ test "pause: drain overrides a pause and runs everything" {
     pool.drain(); // must wake the parked workers and let them finish the queue
     try testing.expectEqual(@as(u64, 100), c.n.load(.seq_cst));
     try testing.expect(pool.drainedCleanly());
-    try testing.expectEqual(@as(i64, 0), pool.outstandingBoxes());
+    try testing.expect(pool.queue.isEmpty());
 }
 
-test "pause: shutdownNow overrides a pause and drops the queue (boxes returned)" {
+test "pause: shutdownNow overrides a pause and drops the queue" {
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
@@ -2176,8 +1994,9 @@ test "pause: shutdownNow overrides a pause and drops the queue (boxes returned)"
 
     pool.shutdownNow();
     try testing.expectEqual(@as(u64, 0), c.n.load(.seq_cst)); // never started
-    try testing.expectEqual(@as(i64, 0), pool.outstandingBoxes());
-    try testing.expectEqual(@as(usize, 0), pool.queuedCount()); // slots freed with the boxes
+    try testing.expect(pool.queue.isEmpty());
+    try testing.expectEqual(@as(usize, 0), pool.queuedCount()); // slots freed with the drop
+    try testing.expectEqual(@as(u64, 50), pool.dropped.load(.seq_cst));
 }
 
 test "pause: a pause racing resume and submit never loses a wakeup (2000 rounds)" {
@@ -2323,13 +2142,13 @@ test "max_queued: 4 accepted on a paused pool, the 5th is QueueFull and changes 
     try testing.expectEqual(@as(usize, 4), pool.queuedCount());
 
     const sub_before = pool.submittedCount();
-    const boxes_before = pool.outstandingBoxes();
+    const len_before = pool.queue.len();
     try testing.expectError(error.QueueFull, pool.submit(.{ .func = incr, .ctx = &c }));
     var s = try pool.registerSubmitter();
     defer s.deinit();
     try testing.expectError(error.QueueFull, s.submit(.{ .func = incr, .ctx = &c }));
     try testing.expectEqual(sub_before, pool.submittedCount()); // accounting untouched
-    try testing.expectEqual(boxes_before, pool.outstandingBoxes()); // no box allocated
+    try testing.expectEqual(len_before, pool.queue.len()); // nothing pushed
     try testing.expectEqual(@as(usize, 4), pool.queuedCount());
 
     pool.@"resume"();
@@ -2362,43 +2181,32 @@ test "max_queued = 0 is unbounded: a thousand queued jobs behind a pause are all
     try testing.expectEqual(@as(u64, 1000), c.n.load(.seq_cst));
 }
 
-test "max_queued: the slot is released on both SubmitFailed rollbacks" {
-    // Each rollback on a FRESH pool: after one job has run, the queue's node
-    // pool holds a recycled node and `enqueue` no longer allocates, so a
-    // failing `qnodes` allocator would never be asked (the F3 tests above
-    // start fresh for the same reason).
-    try rollbackReleasesSlot(.boxes);
-    try rollbackReleasesSlot(.qnodes);
-}
-
-fn rollbackReleasesSlot(comptime which: enum { boxes, qnodes }) !void {
+test "max_queued: the slot is released on the SubmitFailed rollback" {
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
-    // A bound of ONE: a slot leaked by the rollback makes the next submit
+    // A bound of exactly one block: after `block_slots - 1` queued jobs and a
+    // failed push, a slot leaked by the rollback makes the next submit
     // QueueFull.
-    const pool = try WorkerPool.init(testing.allocator, .{ .io = io, .n_workers = 1, .max_queued = 1 });
+    const pool = try WorkerPool.init(testing.allocator, .{ .io = io, .n_workers = 1, .max_queued = JobQueue.block_slots });
     defer pool.deinit();
     var wd = Watchdog{ .io = io, .timeout_ms = 15_000 };
     try wd.start();
     defer wd.finish();
 
     var c = Counter{};
+    try fillToBlockEdge(pool, &c);
     {
         var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
-        const target = switch (which) {
-            .boxes => &pool.boxes.allocator,
-            .qnodes => &pool.qnodes.allocator,
-        };
-        target.* = failing.allocator();
-        defer target.* = testing.allocator;
+        pool.queue.allocator = failing.allocator();
+        defer pool.queue.allocator = testing.allocator;
         try testing.expectError(error.SubmitFailed, pool.submit(.{ .func = incr, .ctx = &c }));
-        try testing.expectEqual(@as(usize, 0), pool.queuedCount());
-        try testing.expectEqual(@as(i64, 0), pool.outstandingBoxes());
+        try testing.expectEqual(JobQueue.block_slots - 1, pool.queuedCount());
     }
     try pool.submit(.{ .func = incr, .ctx = &c });
+    pool.@"resume"();
     try testing.expect(pool.wait());
-    try testing.expectEqual(@as(u64, 1), c.n.load(.seq_cst));
+    try testing.expectEqual(@as(u64, JobQueue.block_slots), c.n.load(.seq_cst));
 }
 
 const Hammer = struct {
@@ -2468,5 +2276,5 @@ test "max_queued: 8 producers hammering a bound of 3 never overshoot it; every a
     try testing.expectEqual(@as(u64, 0), h.over_after_submit.load(.seq_cst));
     try testing.expect(h.refused.load(.seq_cst) > 0); // the bound was actually hit
     try testing.expectEqual(@as(usize, 0), pool.queuedCount());
-    try testing.expectEqual(@as(i64, 0), pool.outstandingBoxes());
+    try testing.expect(pool.queue.isEmpty());
 }

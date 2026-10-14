@@ -32,7 +32,7 @@
 //!
 //! Not like-for-like, by design (neither side is tuned around it): thpool does a
 //! malloc/free per job under a mutex-protected queue and wakes workers through a
-//! binary semaphore (mutex + condvar), ours reuses boxes from a lock-free pool
+//! binary semaphore (mutex + condvar), ours carries the job by value in a lock-free queue
 //! and parks on a futex; thpool's `thpool_wait` is a condvar wait that every
 //! finishing worker signals, ours a futex wait that costs a worker one load
 //! when nobody waits.

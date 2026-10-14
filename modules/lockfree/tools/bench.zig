@@ -51,6 +51,14 @@ const n_deque: u64 = 1 << 20;
 const n_pin: u64 = 1 << 20;
 const ring = 1024;
 
+/// Rows printed for the record but left out of the verdict: `Queue(T)` (MS +
+/// EBR) has no crossbeam counterpart and, since workerpool moved to
+/// `SegQueue` (2026-10-14), no consumer; `segqueue_*` is the like-for-like
+/// unbounded comparison.
+fn infoOnly(name: []const u8) bool {
+    return std.mem.startsWith(u8, name, "unbounded_");
+}
+
 const names = [_][]const u8{
     "bounded_1x1",   "bounded_4x4",  "bounded_4x1",  "unbounded_1x1",
     "unbounded_4x4", "segqueue_1x1", "segqueue_4x4", "segqueue_8x8",
@@ -345,15 +353,19 @@ pub fn main(init: std.process.Init) !u8 {
             ours.add(try timeIt(gpa, io, wi));
         }
         const ratio = ours.best_ns / ref.best_ns;
-        worst = @max(worst, ratio);
-        best = @min(best, ratio);
+        if (!infoOnly(name)) {
+            worst = @max(worst, ratio);
+            best = @min(best, ratio);
+        }
         max_spread = @max(max_spread, @max(ours.spread(), ref.spread()));
         const same = ours.count == ref.count and ours.sum == ref.sum;
         mismatch = mismatch or !same;
-        try w.print("{s:<14} {d:>13.0} {d:>13.0} {d:>8.3} {d:>6.1}% {d:>6.1}%  {d} / {d}{s}\n", .{
-            name,       ours.best_ns,        ref.best_ns,
-            ratio,      100 * ours.spread(), 100 * ref.spread(),
-            ours.count, ours.sum,            if (same) "" else " != " ++ ref_short,
+        try w.print("{s:<14} {d:>13.0} {d:>13.0} {d:>8.3} {d:>6.1}% {d:>6.1}%  {d} / {d}{s}{s}\n", .{
+            name,                                  ours.best_ns,
+            ref.best_ns,                           ratio,
+            100 * ours.spread(),                   100 * ref.spread(),
+            ours.count,                            ours.sum,
+            if (same) "" else " != " ++ ref_short, if (infoOnly(name)) "  (info only, not in the verdict)" else "",
         });
         try w.flush();
     }
