@@ -233,7 +233,7 @@ const module_list = [_]Module{
     .{ .name = "entropy", .libs = &.{ "crypto", "web" } },
     .{ .name = "hashdigest", .libs = &.{ "crypto", "storage" } },
     .{ .name = "sealedbox", .libs = &.{"crypto"}, .deps = &.{"ct25519"}, .test_deps = &.{"testkit"} },
-    .{ .name = "rsa", .libs = &.{ "crypto", "net", "web" }, .deps = &.{"montint"}, .test_deps = &.{"testkit"}, .heavy = true },
+    .{ .name = "rsa", .libs = &.{ "crypto", "net", "web" }, .deps = &.{ "montint", "aescbc", "aes192" }, .test_deps = &.{"testkit"}, .heavy = true },
     .{ .name = "blindrsa", .libs = &.{"crypto"}, .deps = &.{"rsa"}, .test_deps = &.{"testkit"} },
     .{ .name = "ssh", .libs = &.{"net"}, .deps = &.{ "rsa", "montint", "aes192", "p521" }, .test_deps = &.{"testkit"}, .heavy = true, .live = true },
     .{ .name = "netconf", .libs = &.{"net"}, .deps = &.{ "ssh", "xml" }, .test_deps = &.{"testkit"} },

@@ -231,7 +231,8 @@ pub fn fixedDiff(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!voi
             const r = try bigMod(a, &v, &mbig);
             var limbs_buf: [M.L]u64 = @splat(0);
             const rl = r.toConst().limbs;
-            @memcpy(limbs_buf[0..@min(rl.len, M.L)], rl[0..@min(rl.len, M.L)]);
+            const nb = @min(rl.len * @sizeOf(usize), M.L * 8); // bytes: usize limbs may be 32-bit
+            @memcpy(std.mem.sliceAsBytes(limbs_buf[0..])[0..nb], std.mem.sliceAsBytes(rl)[0..nb]);
             elems[t[2]] = limbs_buf;
             bigs[t[2]] = r;
         }

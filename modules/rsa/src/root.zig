@@ -93,7 +93,9 @@ const std = @import("std");
 /// Fast constant-time Montgomery modexp backend for the RSA hot path
 /// (private CRT op, non-CRT private op, public op). See `montint`'s SPEC.md.
 const montint = @import("montint");
-const safegcd = @import("safegcd.zig");
+const aescbc = @import("aescbc");
+/// Batched constant-time inversion (moved from here into montint 2026-10-14).
+const safegcd = montint.safegcd;
 const burn = @import("burn.zig");
 
 /// Blowfish + OpenBSD bcrypt_pbkdf (P4b support primitives), re-exported
@@ -122,7 +124,7 @@ pub const meta = .{
     .role = .util, // pure computation (no I/O, no wire framing of its own) -> util, not .codec
     .concurrency = .reentrant, // no shared/global state; PublicKey/SecretKey are plain value types
     .model_after = "RFC 8017 (PKCS#1 v2.2); std.crypto internal RSA (Certificate/rsa)",
-    .deps = .{"montint"}, // std.crypto.ff carrier + montint modexp hot path
+    .deps = .{ "montint", "aescbc", "aes192" }, // std.crypto.ff carrier + montint modexp hot path; aescbc/aes192: PBES2 encrypted PKCS#8
 };
 
 /// Largest RSA modulus this module supports, in bits. Matches the ceiling
@@ -447,6 +449,26 @@ pub const VerifyKey = struct {
     pub fn verifyPss(vk: *const VerifyKey, comptime Hash: type, msg: []const u8, sig: []const u8, salt_len: usize) VerifyPssError!void {
         return verifyPssMont(&vk.mp, vk.e, Hash, msg, sig, salt_len);
     }
+
+    /// As `verifyPkcs1v15Prehashed`.
+    pub fn verifyPkcs1v15Prehashed(vk: *const VerifyKey, comptime Hash: type, digest: *const [Hash.digest_length]u8, sig: []const u8) VerifyPkcs1v15Error!void {
+        return verifyPkcs1v15DigestMont(&vk.mp, vk.e, Hash, digest, sig);
+    }
+
+    /// As `verifyPssPrehashed`.
+    pub fn verifyPssPrehashed(vk: *const VerifyKey, comptime Hash: type, digest: *const [Hash.digest_length]u8, sig: []const u8, salt_len: usize) VerifyPssError!void {
+        _ = try verifyPssDigestMont(&vk.mp, vk.e, Hash, Hash, digest, sig, salt_len);
+    }
+
+    /// As `verifyPkcs1v15Digest`.
+    pub fn verifyPkcs1v15Digest(vk: *const VerifyKey, id: HashId, digest: []const u8, sig: []const u8) (VerifyPkcs1v15Error || DigestError)!void {
+        return verifyPkcs1v15DigestAny(&vk.mp, vk.e, id, digest, sig);
+    }
+
+    /// As `verifyPssDigest`.
+    pub fn verifyPssDigest(vk: *const VerifyKey, id: HashId, digest: []const u8, sig: []const u8, salt_len: ?usize) (VerifyPssError || DigestError)!usize {
+        return verifyPssDigestAny(&vk.mp, vk.e, id, digest, sig, salt_len);
+    }
 };
 
 /// RSA private key in CRT form (RFC 8017 §3.2): the two prime factors plus
@@ -561,9 +583,9 @@ pub const SecretKey = struct {
     /// Parse a private key from a PEM text block: `PRIVATE KEY` (PKCS#8
     /// `PrivateKeyInfo`, via `fromPkcs8`) or `RSA PRIVATE KEY` (bare PKCS#1
     /// `RSAPrivateKey`, via `fromDer`). The first matching block in `text` is
-    /// used. `ENCRYPTED PRIVATE KEY` (PKCS#8 `EncryptedPrivateKeyInfo`) is
-    /// out of scope and OpenSSH (`OPENSSH PRIVATE KEY`) blocks belong to
-    /// the module-level `fromOpenSSH`; both report
+    /// used. `ENCRYPTED PRIVATE KEY` (PKCS#8 `EncryptedPrivateKeyInfo`)
+    /// needs a password and goes to `fromPemEncrypted`; OpenSSH (`OPENSSH
+    /// PRIVATE KEY`) blocks belong to the module-level `fromOpenSSH`; both report
     /// `error.UnsupportedPemLabel` here, never silently misparsed.
     pub fn fromPem(out: *SecretKey, text: []const u8) PemError!void {
         const r = fromPemUnburned(out, text);
@@ -618,12 +640,53 @@ pub const SecretKey = struct {
     pub fn toPem(sk: *const SecretKey, form: PrivateKeyForm, out: []u8) MarshalError![]u8 {
         return marshal.privatePem(sk, form, out);
     }
+
+    /// PEM `ENCRYPTED PRIVATE KEY` (PBES2, see `fromPkcs8Encrypted`) — and,
+    /// so one call serves input of unknown kind, every label `fromPem`
+    /// reads (the password is then unused).
+    pub fn fromPemEncrypted(out: *SecretKey, text: []const u8, password: []const u8) (PemError || FromEncryptedError)!void {
+        const r = fromPemEncryptedUnburned(out, text, password);
+        burn.stack(burn.private_op_burn);
+        return r;
+    }
+
+    noinline fn fromPemEncryptedUnburned(out: *SecretKey, text: []const u8, password: []const u8) (PemError || FromEncryptedError)!void {
+        out.* = fromPemEncryptedValue(text, password) catch |err| {
+            std.crypto.secureZero(u8, std.mem.asBytes(out));
+            return err;
+        };
+    }
+
+    fn fromPemEncryptedValue(text: []const u8, password: []const u8) (PemError || FromEncryptedError)!SecretKey {
+        const block = try pemDecodeBody(text);
+        if (std.mem.eql(u8, block.label, "ENCRYPTED PRIVATE KEY")) return fromPkcs8EncryptedValue(block.der(), password);
+        return fromPemValue(text);
+    }
+
+    /// DER PKCS#8 `EncryptedPrivateKeyInfo`: PBES2, PBKDF2, AES-CBC
+    /// (`openssl pkcs8 -topk8`; the default `opts` are OpenSSL 3's exact
+    /// parameter shape). Salt and IV come from `random`, which MUST be a
+    /// CSPRNG. `out.len ≥ max_encrypted_pkcs8_der_len` always suffices;
+    /// `out` is zeroed on error.
+    pub fn toPkcs8Encrypted(sk: *const SecretKey, password: []const u8, random: std.Random, opts: Pbes2Options, out: []u8) EncryptError![]u8 {
+        const r = marshal.encryptedDer(sk, password, random, opts, out);
+        burn.stack(burn.private_op_burn);
+        return r;
+    }
+
+    /// As `toPkcs8Encrypted`, PEM `ENCRYPTED PRIVATE KEY`;
+    /// `out.len ≥ max_encrypted_pem_len` always suffices.
+    pub fn toPemEncrypted(sk: *const SecretKey, password: []const u8, random: std.Random, opts: Pbes2Options, out: []u8) EncryptError![]u8 {
+        const r = marshal.encryptedPem(sk, password, random, opts, out);
+        burn.stack(burn.private_op_burn);
+        return r;
+    }
 };
 
 // ── big.int helpers (the public-operand inverse only) ───────────────────────
 //
 // `fromPrimes` stopped using these on 2026-10-03 (montint limb arithmetic,
-// constant-time) and the per-op blinding inverse on 2026-10-10 (`safegcd.zig`);
+// constant-time) and the per-op blinding inverse on 2026-10-10 (`montint.safegcd`);
 // what remains is `bigModInverse` for `blindrsa`.
 
 const BigInt = std.math.big.int.Managed;
@@ -657,7 +720,7 @@ fn bigFromBytes(gpa: std.mem.Allocator, bytes: []const u8) !BigInt {
 /// has no `invert`, and Fermat inversion needs a *prime* modulus, which a
 /// composite-modulus caller may not even know the factorization of). No
 /// longer used inside this module: per-op CRT base-blinding moved to the
-/// constant-time `safegcd.zig` on 2026-10-10, key derivation to montint's
+/// constant-time `montint.safegcd` on 2026-10-10, key derivation to montint's
 /// `inverseOfModulus` on 2026-10-03.
 ///
 /// `pub` so sibling modules needing a generic composite-modulus inverse
@@ -1196,8 +1259,89 @@ fn digestInfoPrefix(comptime Hash: type) []const u8 {
             0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03, 0x05,
             0x00, 0x04, 0x40,
         },
+        // The rest of the NIST hash arc (2.16.840.1.101.3.4.2.x, 2026-10-14):
+        // same shape, checked byte for byte against DigestInfo recovered from
+        // OpenSSL 3 signatures (test "HashId: ...").
+        hash.sha2.Sha512_224 => comptime nistDigestInfoPrefix(5, 28),
+        hash.sha2.Sha512_256 => comptime nistDigestInfoPrefix(6, 32),
+        hash.sha3.Sha3_224 => comptime nistDigestInfoPrefix(7, 28),
+        hash.sha3.Sha3_256 => comptime nistDigestInfoPrefix(8, 32),
+        hash.sha3.Sha3_384 => comptime nistDigestInfoPrefix(9, 48),
+        hash.sha3.Sha3_512 => comptime nistDigestInfoPrefix(10, 64),
         else => @compileError("unsupported hash for EMSA-PKCS1-v1_5 DigestInfo: " ++ @typeName(Hash)),
     };
+}
+
+/// `DigestInfo ::= SEQUENCE { SEQUENCE { OID 2.16.840.1.101.3.4.2.<arc>,
+/// NULL }, OCTET STRING <digest_len> }` without the digest.
+fn nistDigestInfoPrefix(comptime arc: u8, comptime digest_len: u8) []const u8 {
+    const t = [_]u8{
+        0x30, 0x11 + digest_len, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48,       0x01,
+        0x65, 0x03,              0x04, 0x02, arc,  0x05, 0x00, 0x04, digest_len,
+    };
+    return &t;
+}
+
+/// A hash chosen at run time — Go's `crypto.Hash`, OpenSSL's digest name —
+/// for the `*Digest` entry points (a caller holding a digest and an algorithm
+/// identifier, as X.509, CMS and TLS do). Every member has a PKCS#1 v1.5
+/// DigestInfo and works for PSS. MD5, RIPEMD-160 and MD5+SHA-1 are not
+/// offered: broken or without a std type.
+pub const HashId = enum {
+    sha1,
+    sha224,
+    sha256,
+    sha384,
+    sha512,
+    sha512_224,
+    sha512_256,
+    sha3_224,
+    sha3_256,
+    sha3_384,
+    sha3_512,
+
+    /// The std hash type.
+    pub fn Type(comptime id: HashId) type {
+        const h = std.crypto.hash;
+        return switch (id) {
+            .sha1 => h.Sha1,
+            .sha224 => h.sha2.Sha224,
+            .sha256 => h.sha2.Sha256,
+            .sha384 => h.sha2.Sha384,
+            .sha512 => h.sha2.Sha512,
+            .sha512_224 => h.sha2.Sha512_224,
+            .sha512_256 => h.sha2.Sha512_256,
+            .sha3_224 => h.sha3.Sha3_224,
+            .sha3_256 => h.sha3.Sha3_256,
+            .sha3_384 => h.sha3.Sha3_384,
+            .sha3_512 => h.sha3.Sha3_512,
+        };
+    }
+
+    pub fn digestLen(id: HashId) usize {
+        return switch (id) {
+            inline else => |c| c.Type().digest_length,
+        };
+    }
+};
+
+/// The longest digest a `HashId` produces.
+pub const max_digest_len = 64;
+
+pub const DigestError = error{
+    /// `digest.len` is not the selected hash's digest length.
+    InvalidDigestLength,
+};
+
+/// `id`'s digest of `msg` into `out`; returns the digest (a prefix of `out`).
+pub fn hashMessage(id: HashId, msg: []const u8, out: *[max_digest_len]u8) []u8 {
+    switch (id) {
+        inline else => |c| {
+            const H = c.Type();
+            H.hash(msg, out[0..H.digest_length], .{});
+            return out[0..H.digest_length];
+        },
+    }
 }
 
 pub const EmsaEncodeError = error{EncodedMessageTooShort};
@@ -1303,15 +1447,56 @@ pub fn verifyPkcs1v15(pk: PublicKey, comptime Hash: type, msg: []const u8, sig: 
 /// `verifyPkcs1v15` over the montint modulus and the validated exponent —
 /// the body both `PublicKey` and `VerifyKey` share.
 fn verifyPkcs1v15Mont(mp: *const MontParams, e: u32, comptime Hash: type, msg: []const u8, sig: []const u8) VerifyPkcs1v15Error!void {
+    var digest: [Hash.digest_length]u8 = undefined;
+    Hash.hash(msg, &digest, .{});
+    return verifyPkcs1v15DigestMont(mp, e, Hash, &digest, sig);
+}
+
+fn verifyPkcs1v15DigestMont(mp: *const MontParams, e: u32, comptime Hash: type, digest: *const [Hash.digest_length]u8, sig: []const u8) VerifyPkcs1v15Error!void {
     const k = mp.byteLen();
     // §8.2.2 step 1: the signature must be exactly k octets.
     if (sig.len != k) return error.SignatureVerificationFailed;
     var em_dec = std.mem.zeroes([max_modulus_len]u8);
     publicOpMont(mp, e, sig, em_dec[0..k]) catch return error.SignatureVerificationFailed;
     var em_exp = std.mem.zeroes([max_modulus_len]u8);
-    emsaPkcs1v15Encode(Hash, msg, em_exp[0..k]) catch return error.SignatureVerificationFailed;
+    emsaPkcs1v15EncodeDigest(Hash, digest, em_exp[0..k]) catch return error.SignatureVerificationFailed;
     if (!std.crypto.timing_safe.eql([max_modulus_len]u8, em_dec, em_exp)) {
         return error.SignatureVerificationFailed;
+    }
+}
+
+/// `verifyPkcs1v15` against a digest the caller already has (`digest` =
+/// Hash(M)) — the verify twin of `signPkcs1v15Prehashed`.
+pub fn verifyPkcs1v15Prehashed(pk: PublicKey, comptime Hash: type, digest: *const [Hash.digest_length]u8, sig: []const u8) VerifyPkcs1v15Error!void {
+    return verifyPkcs1v15DigestMont(&pk.n_mont, pk.publicExponent(), Hash, digest, sig);
+}
+
+/// `signPkcs1v15Prehashed` with the hash chosen at run time (Go
+/// `SignPKCS1v15(rand, priv, hash, digest)`). `digest.len` must be
+/// `id.digestLen()`.
+pub fn signPkcs1v15Digest(sk: *const SecretKey, id: HashId, digest: []const u8, out: []u8) (SignPkcs1v15Error || DigestError)![]u8 {
+    switch (id) {
+        inline else => |c| {
+            const H = c.Type();
+            if (digest.len != H.digest_length) return error.InvalidDigestLength;
+            return signPkcs1v15Prehashed(sk, H, digest[0..H.digest_length], out);
+        },
+    }
+}
+
+/// `verifyPkcs1v15Prehashed` with the hash chosen at run time (Go
+/// `VerifyPKCS1v15(pub, hash, digest, sig)`).
+pub fn verifyPkcs1v15Digest(pk: PublicKey, id: HashId, digest: []const u8, sig: []const u8) (VerifyPkcs1v15Error || DigestError)!void {
+    return verifyPkcs1v15DigestAny(&pk.n_mont, pk.publicExponent(), id, digest, sig);
+}
+
+fn verifyPkcs1v15DigestAny(mp: *const MontParams, e: u32, id: HashId, digest: []const u8, sig: []const u8) (VerifyPkcs1v15Error || DigestError)!void {
+    switch (id) {
+        inline else => |c| {
+            const H = c.Type();
+            if (digest.len != H.digest_length) return error.InvalidDigestLength;
+            return verifyPkcs1v15DigestMont(mp, e, H, digest[0..H.digest_length], sig);
+        },
     }
 }
 
@@ -1723,11 +1908,12 @@ noinline fn decryptOaepHNoFailUnburned(
 pub fn emsaPssEncode(comptime Hash: type, msg: []const u8, salt: []const u8, em_bits: usize, em: []u8) EmsaEncodeError!void {
     var m_hash: [Hash.digest_length]u8 = undefined;
     Hash.hash(msg, &m_hash, .{});
-    return emsaPssEncodeDigest(Hash, &m_hash, salt, em_bits, em);
+    return emsaPssEncodeDigest(Hash, Hash, &m_hash, salt, em_bits, em);
 }
 
-/// §9.1.1 from step 3 on: `m_hash` is mHash = Hash(M).
-fn emsaPssEncodeDigest(comptime Hash: type, m_hash: *const [Hash.digest_length]u8, salt: []const u8, em_bits: usize, em: []u8) EmsaEncodeError!void {
+/// §9.1.1 from step 3 on: `m_hash` is mHash = Hash(M); the mask is
+/// MGF1 over `MgfHash` (= `Hash` everywhere except `signPssH`).
+fn emsaPssEncodeDigest(comptime Hash: type, comptime MgfHash: type, m_hash: *const [Hash.digest_length]u8, salt: []const u8, em_bits: usize, em: []u8) EmsaEncodeError!void {
     const h_len = Hash.digest_length;
     const em_len = em.len;
     std.debug.assert(em_len == byteLen(em_bits));
@@ -1750,7 +1936,7 @@ fn emsaPssEncodeDigest(comptime Hash: type, m_hash: *const [Hash.digest_length]u
     @memcpy(db[db.len - salt.len ..], salt);
 
     // steps 9-10: maskedDB = DB ^ MGF1(H, emLen - hLen - 1).
-    mgf1Xor(Hash, h, db);
+    mgf1Xor(MgfHash, h, db);
 
     // step 11: clear the leftmost 8·emLen - emBits bits of maskedDB so that
     // OS2IP(EM) < 2^emBits.
@@ -1782,19 +1968,19 @@ pub fn signPss(sk: *const SecretKey, comptime Hash: type, random: std.Random, ms
 noinline fn signPssUnburned(sk: *const SecretKey, comptime Hash: type, random: std.Random, msg: []const u8, salt_len: usize, out: []u8) SignPssError![]u8 {
     var m_hash: [Hash.digest_length]u8 = undefined;
     Hash.hash(msg, &m_hash, .{});
-    return signPssDigestUnburned(sk, Hash, random, &m_hash, salt_len, out);
+    return signPssDigestUnburned(sk, Hash, Hash, random, &m_hash, salt_len, out);
 }
 
 /// `signPss` over a digest the caller already has (`digest` = Hash(M)) --
 /// e.g. a TLS CertificateVerify over a running transcript hash. Same
 /// signature as `signPss(M)` for the same salt.
 pub fn signPssPrehashed(sk: *const SecretKey, comptime Hash: type, random: std.Random, digest: *const [Hash.digest_length]u8, salt_len: usize, out: []u8) SignPssError![]u8 {
-    const r = signPssDigestUnburned(sk, Hash, random, digest, salt_len, out);
+    const r = signPssDigestUnburned(sk, Hash, Hash, random, digest, salt_len, out);
     burn.stack(burn.private_op_burn);
     return r;
 }
 
-noinline fn signPssDigestUnburned(sk: *const SecretKey, comptime Hash: type, random: std.Random, digest: *const [Hash.digest_length]u8, salt_len: usize, out: []u8) SignPssError![]u8 {
+noinline fn signPssDigestUnburned(sk: *const SecretKey, comptime Hash: type, comptime MgfHash: type, random: std.Random, digest: *const [Hash.digest_length]u8, salt_len: usize, out: []u8) SignPssError![]u8 {
     const k = byteLen(sk.n.bits());
     if (out.len < k) return error.BufferTooSmall;
     const em_bits = sk.n.bits() - 1;
@@ -1814,7 +2000,7 @@ noinline fn signPssDigestUnburned(sk: *const SecretKey, comptime Hash: type, ran
     var em_buf: [max_modulus_len]u8 = undefined;
     defer std.crypto.secureZero(u8, em_buf[0..k]);
     @memset(em_buf[0 .. k - em_len], 0x00);
-    try emsaPssEncodeDigest(Hash, digest, salt, em_bits, em_buf[k - em_len .. k]);
+    try emsaPssEncodeDigest(Hash, MgfHash, digest, salt, em_bits, em_buf[k - em_len .. k]);
 
     // §8.1.1 step 2: RSASP1. EM < 2^emBits < n by construction (step 11
     // cleared the top bits), so the primitive's range check cannot fail.
@@ -1827,12 +2013,52 @@ noinline fn signPssDigestUnburned(sk: *const SecretKey, comptime Hash: type, ran
     return out[0..k];
 }
 
+/// `signPss` with the MGF1 hash decoupled from the message hash (OpenSSL
+/// `rsa_mgf1_md`, X.509 `RSASSA-PSS-params` with a different
+/// `maskGenAlgorithm`) — the PSS twin of `encryptOaepH`.
+pub fn signPssH(sk: *const SecretKey, comptime Hash: type, comptime MgfHash: type, random: std.Random, msg: []const u8, salt_len: usize, out: []u8) SignPssError![]u8 {
+    const r = signPssHUnburned(sk, Hash, MgfHash, random, msg, salt_len, out);
+    burn.stack(burn.private_op_burn);
+    return r;
+}
+
+noinline fn signPssHUnburned(sk: *const SecretKey, comptime Hash: type, comptime MgfHash: type, random: std.Random, msg: []const u8, salt_len: usize, out: []u8) SignPssError![]u8 {
+    var m_hash: [Hash.digest_length]u8 = undefined;
+    Hash.hash(msg, &m_hash, .{});
+    return signPssDigestUnburned(sk, Hash, MgfHash, random, &m_hash, salt_len, out);
+}
+
+/// `signPssPrehashed` with the hash chosen at run time (Go
+/// `SignPSS(rand, priv, hash, digest, opts)`). `digest.len` must be
+/// `id.digestLen()`.
+pub fn signPssDigest(sk: *const SecretKey, id: HashId, random: std.Random, digest: []const u8, salt_len: usize, out: []u8) (SignPssError || DigestError)![]u8 {
+    switch (id) {
+        inline else => |c| {
+            const H = c.Type();
+            if (digest.len != H.digest_length) return error.InvalidDigestLength;
+            return signPssPrehashed(sk, H, random, digest[0..H.digest_length], salt_len, out);
+        },
+    }
+}
+
+/// The largest PSS salt for a `modulus_bits`-bit key and `Hash`:
+/// emLen − hLen − 2 (RFC 8017 §9.1.1 step 3) — what Go's
+/// `PSSSaltLengthAuto` signs with and OpenSSL calls `rsa_pss_saltlen:max`.
+/// `null` if the key is too small for the hash at all.
+/// (`PSSSaltLengthEqualsHash` / `saltlen:digest` is `Hash.digest_length`.)
+pub fn maxPssSaltLen(modulus_bits: usize, comptime Hash: type) ?usize {
+    if (modulus_bits < 2) return null;
+    const em_len = byteLen(modulus_bits - 1);
+    if (em_len < Hash.digest_length + 2) return null;
+    return em_len - Hash.digest_length - 2;
+}
+
 pub const VerifyPssError = error{SignatureVerificationFailed};
 
 /// Verify an RSASSA-PSS signature (RFC 8017 §8.1.2): RSAVP1 recovers the
 /// encoded message, which is checked per EMSA-PSS-VERIFY (§9.1.2) against
-/// `msg` for the given `salt_len` (must equal the signer's `sLen`; this
-/// implementation does not auto-detect salt length). All checks over the
+/// `msg` for the given `salt_len` (must equal the signer's `sLen`;
+/// `verifyPssAuto` recovers it instead). All checks over the
 /// recovered encoding are accumulated branch-free into one validity flag
 /// (H comparison via `std.crypto.timing_safe.eql`) and every failure mode
 /// reports the single generic `error.SignatureVerificationFailed`.
@@ -1843,6 +2069,19 @@ pub fn verifyPss(pk: PublicKey, comptime Hash: type, msg: []const u8, sig: []con
 /// `verifyPss` over the montint modulus and the validated exponent — the
 /// body both `PublicKey` and `VerifyKey` share.
 fn verifyPssMont(mp: *const MontParams, e: u32, comptime Hash: type, msg: []const u8, sig: []const u8, salt_len: usize) VerifyPssError!void {
+    var m_hash: [Hash.digest_length]u8 = undefined;
+    Hash.hash(msg, &m_hash, .{});
+    _ = try verifyPssDigestMont(mp, e, Hash, Hash, &m_hash, sig, salt_len);
+}
+
+/// EMSA-PSS-VERIFY from mHash on. `salt_len` null = recover it from the
+/// encoding (Go `PSSSaltLengthAuto`, OpenSSL `rsa_pss_saltlen:auto`): the
+/// first non-zero octet of the unmasked DB must be the 0x01 separator and
+/// what follows it is the salt (§9.1.2 step 10 read the other way round).
+/// Everything here is public (signature, key, message digest), so the scan
+/// may branch; the explicit-length path keeps its accumulate-then-decide
+/// shape. Returns the salt length.
+fn verifyPssDigestMont(mp: *const MontParams, e: u32, comptime Hash: type, comptime MgfHash: type, m_hash: *const [Hash.digest_length]u8, sig: []const u8, salt_len: ?usize) VerifyPssError!usize {
     const h_len = Hash.digest_length;
     const k = mp.byteLen();
     // §8.1.2 step 1: the signature must be exactly k octets.
@@ -1851,7 +2090,8 @@ fn verifyPssMont(mp: *const MontParams, e: u32, comptime Hash: type, msg: []cons
     const em_len = byteLen(em_bits);
     // §9.1.2 step 3: emLen >= hLen + sLen + 2. Public parameters only
     // (modulus size, hash, expected salt length), so branching is harmless.
-    if (em_len < h_len + 2 or salt_len > em_len - h_len - 2) return error.SignatureVerificationFailed;
+    if (em_len < h_len + 2) return error.SignatureVerificationFailed;
+    if (salt_len) |sl| if (sl > em_len - h_len - 2) return error.SignatureVerificationFailed;
 
     // §8.1.2 step 2: RSAVP1 (public-key operation; s >= n is public info).
     var em_buf: [max_modulus_len]u8 = undefined;
@@ -1873,28 +2113,77 @@ fn verifyPssMont(mp: *const MontParams, e: u32, comptime Hash: type, msg: []cons
     ok &= ctEqByte(em[0] & ~top_mask, 0x00);
 
     // steps 7-9: DB = maskedDB ^ MGF1(H), then clear the leftmost bits.
-    mgf1Xor(Hash, h, db);
+    mgf1Xor(MgfHash, h, db);
     db[0] &= top_mask;
 
     // step 10: DB = PS (zeros) || 0x01 || salt.
-    const ps_len = em_len - h_len - salt_len - 2;
+    const sl: usize = salt_len orelse blk: {
+        const sep = std.mem.indexOfNone(u8, db, &.{0}) orelse break :blk 0; // all zero: the 0x01 check fails
+        break :blk db.len - sep - 1;
+    };
+    const ps_len = em_len - h_len - sl - 2;
     for (db[0..ps_len]) |b| ok &= ctEqByte(b, 0x00);
     ok &= ctEqByte(db[ps_len], 0x01);
-    const salt = db[db.len - salt_len ..];
+    const salt = db[db.len - sl ..];
 
-    // steps 2, 12-13: H' = Hash((0x00 × 8) || Hash(msg) || salt).
-    var m_hash: [h_len]u8 = undefined;
-    Hash.hash(msg, &m_hash, .{});
+    // steps 12-13: H' = Hash((0x00 × 8) || mHash || salt).
     var h_prime: [h_len]u8 = undefined;
     var st = Hash.init(.{});
     st.update(&[_]u8{0} ** 8);
-    st.update(&m_hash);
+    st.update(m_hash);
     st.update(salt);
     st.final(&h_prime);
 
     // step 14: H == H', folded into the single decision point.
     ok &= @intFromBool(std.crypto.timing_safe.eql([h_len]u8, h.*, h_prime));
     if (ok != 1) return error.SignatureVerificationFailed;
+    return sl;
+}
+
+/// `verifyPss` against a digest the caller already has (`digest` =
+/// Hash(M)) — the verify twin of `signPssPrehashed`.
+pub fn verifyPssPrehashed(pk: PublicKey, comptime Hash: type, digest: *const [Hash.digest_length]u8, sig: []const u8, salt_len: usize) VerifyPssError!void {
+    _ = try verifyPssDigestMont(&pk.n_mont, pk.publicExponent(), Hash, Hash, digest, sig, salt_len);
+}
+
+/// `verifyPss` without knowing the salt length (Go `PSSSaltLengthAuto`,
+/// OpenSSL `rsa_pss_saltlen:auto`): any salt length the encoding carries is
+/// accepted, and returned. Prefer `verifyPss` with the expected length when
+/// the protocol fixes one (X.509 `RSASSA-PSS-params`, TLS 1.3: hLen).
+pub fn verifyPssAuto(pk: PublicKey, comptime Hash: type, msg: []const u8, sig: []const u8) VerifyPssError!usize {
+    var m_hash: [Hash.digest_length]u8 = undefined;
+    Hash.hash(msg, &m_hash, .{});
+    return verifyPssDigestMont(&pk.n_mont, pk.publicExponent(), Hash, Hash, &m_hash, sig, null);
+}
+
+/// `verifyPssAuto` against a digest the caller already has.
+pub fn verifyPssAutoPrehashed(pk: PublicKey, comptime Hash: type, digest: *const [Hash.digest_length]u8, sig: []const u8) VerifyPssError!usize {
+    return verifyPssDigestMont(&pk.n_mont, pk.publicExponent(), Hash, Hash, digest, sig, null);
+}
+
+/// `verifyPss` with the MGF1 hash decoupled from the message hash (the
+/// verify twin of `signPssH`). `salt_len` null recovers it, as `verifyPssAuto`.
+pub fn verifyPssH(pk: PublicKey, comptime Hash: type, comptime MgfHash: type, msg: []const u8, sig: []const u8, salt_len: ?usize) VerifyPssError!usize {
+    var m_hash: [Hash.digest_length]u8 = undefined;
+    Hash.hash(msg, &m_hash, .{});
+    return verifyPssDigestMont(&pk.n_mont, pk.publicExponent(), Hash, MgfHash, &m_hash, sig, salt_len);
+}
+
+/// `verifyPssPrehashed` with the hash chosen at run time (Go
+/// `VerifyPSS(pub, hash, digest, sig, opts)`); `salt_len` null recovers it.
+/// Returns the salt length.
+pub fn verifyPssDigest(pk: PublicKey, id: HashId, digest: []const u8, sig: []const u8, salt_len: ?usize) (VerifyPssError || DigestError)!usize {
+    return verifyPssDigestAny(&pk.n_mont, pk.publicExponent(), id, digest, sig, salt_len);
+}
+
+fn verifyPssDigestAny(mp: *const MontParams, e: u32, id: HashId, digest: []const u8, sig: []const u8, salt_len: ?usize) (VerifyPssError || DigestError)!usize {
+    switch (id) {
+        inline else => |c| {
+            const H = c.Type();
+            if (digest.len != H.digest_length) return error.InvalidDigestLength;
+            return verifyPssDigestMont(mp, e, H, H, digest[0..H.digest_length], sig, salt_len);
+        },
+    }
 }
 
 // ── P4a: DER/ASN.1 + PEM key parsing ─────────────────────────────────────────
@@ -2099,10 +2388,9 @@ pub const FromPkcs8Error = error{ InvalidDer, InvalidPrivateKey };
 
 /// Parse a private key from a DER-encoded PKCS#8 `PrivateKeyInfo` (RFC 5958)
 /// wrapping an RFC 8017 Appendix A.1.2 `RSAPrivateKey`. Only the plain
-/// (unencrypted) `PrivateKeyInfo` shape is handled — `EncryptedPrivateKeyInfo`
-/// (`ENCRYPTED PRIVATE KEY` in PEM) is a distinct ASN.1 structure entirely
-/// and out of scope (passphrase-protected keys are supported in the OpenSSH
-/// format instead, via `fromOpenSSH`).
+/// (unencrypted) `PrivateKeyInfo` shape is handled here; the password-
+/// protected `EncryptedPrivateKeyInfo` (`ENCRYPTED PRIVATE KEY` in PEM) is
+/// `fromPkcs8Encrypted`.
 pub fn fromPkcs8(out: *SecretKey, bytes: []const u8) FromPkcs8Error!void {
     const r = fromPkcs8Unburned(out, bytes);
     burn.stack(burn.private_op_burn);
@@ -2145,6 +2433,173 @@ fn fromPkcs8Impl(bytes: []const u8) !SecretKey {
     // `(priv_key.slice.end, top.slice.end]`, already bounds-checked above).
 
     return secretKeyFromPkcs1Impl(derView(bytes, priv_key));
+}
+
+// ── R5 (2026-10-14): encrypted PKCS#8 — PBES2 + PBKDF2 (RFC 8018, RFC 5958 §3) ─
+//
+// What `openssl genpkey -aes256` and `openssl pkcs8 -topk8` write: PBES2 with
+// PBKDF2 (HMAC-SHA-1/224/256/384/512) and AES-128/192/256-CBC. Owner decision
+// 2026-10-14: scrypt (needs an allocator; OpenSSL writes it only on `-scrypt`),
+// PBES1 and the legacy `Proc-Type: 4,ENCRYPTED` / `DEK-Info` PEM (MD5 KDF,
+// DES-EDE3, cannot detect a wrong password) are refused with
+// `error.UnsupportedEncryption`.
+
+pub const Pbes2Prf = marshal.Pbes2Prf;
+pub const Pbes2Cipher = marshal.Pbes2Cipher;
+pub const Pbes2Options = marshal.Pbes2Options;
+pub const max_pbkdf2_iterations = marshal.max_pbkdf2_iterations;
+pub const max_pbes2_salt_len = marshal.max_pbes2_salt_len;
+pub const max_encrypted_pkcs8_der_len = marshal.max_encrypted_pkcs8_der_len;
+pub const max_encrypted_pem_len = marshal.max_encrypted_pem_len;
+pub const EncryptError = marshal.EncryptError;
+
+pub const FromEncryptedError = error{
+    InvalidDer,
+    /// Not PBES2-with-PBKDF2-and-AES-CBC (scrypt, PBES1, another cipher).
+    UnsupportedEncryption,
+    /// The file names more than `max_pbkdf2_iterations` PBKDF2 iterations.
+    KdfIterationsTooLarge,
+    /// Wrong password, or a corrupted ciphertext: the two cannot be told
+    /// apart (CBC padding and the inner key's DER are the only check), so
+    /// they are one error.
+    IncorrectPasswordOrCorrupt,
+};
+
+/// Parse a DER PKCS#8 `EncryptedPrivateKeyInfo` (PBES2) holding an RSA key.
+/// `out` is zeroed on error; the derived key and the decrypted PKCS#8 are
+/// wiped before return.
+pub fn fromPkcs8Encrypted(out: *SecretKey, der: []const u8, password: []const u8) FromEncryptedError!void {
+    const r = fromPkcs8EncryptedUnburned(out, der, password);
+    burn.stack(burn.private_op_burn);
+    return r;
+}
+
+noinline fn fromPkcs8EncryptedUnburned(out: *SecretKey, der: []const u8, password: []const u8) FromEncryptedError!void {
+    out.* = fromPkcs8EncryptedValue(der, password) catch |err| {
+        std.crypto.secureZero(u8, std.mem.asBytes(out));
+        return err;
+    };
+}
+
+fn fromPkcs8EncryptedValue(der: []const u8, password: []const u8) FromEncryptedError!SecretKey {
+    const pp = try pbes2Params(der);
+    var key: [32]u8 = undefined;
+    defer std.crypto.secureZero(u8, &key);
+    switch (pp.prf) {
+        inline else => |p| std.crypto.pwhash.pbkdf2(key[0..pp.cipher.keyLen()], password, pp.salt, pp.iterations, p.Type()) catch unreachable, // rounds ≥ 1, dk ≤ 32
+    }
+    var plain: [max_pkcs8_der_len + 16]u8 = undefined;
+    const pt = plain[0..pp.data.len];
+    defer std.crypto.secureZero(u8, pt);
+    switch (pp.cipher) {
+        inline else => |c| {
+            const A = c.Aes();
+            _ = aescbc.decrypt(A, key[0 .. A.key_bits / 8], pp.iv.*, pp.data, pt) catch unreachable; // aligned, sized
+        },
+    }
+    const n = aescbc.unpadPkcs7(pt) catch return error.IncorrectPasswordOrCorrupt;
+    return fromPkcs8Value(pt[0..n]) catch error.IncorrectPasswordOrCorrupt;
+}
+
+const Pbes2Params = struct {
+    prf: Pbes2Prf,
+    cipher: Pbes2Cipher,
+    salt: []const u8,
+    iterations: u32,
+    iv: *const [16]u8,
+    data: []const u8,
+};
+
+/// The `EncryptedPrivateKeyInfo` walk (all public data):
+///   SEQUENCE { SEQUENCE { pbes2, SEQUENCE {
+///       SEQUENCE { pbkdf2, SEQUENCE { salt OCTET STRING, iterationCount,
+///                                     keyLength OPTIONAL, prf DEFAULT sha1 } },
+///       SEQUENCE { aes-CBC OID, iv OCTET STRING(16) } } },
+///     encryptedData OCTET STRING }
+fn pbes2Params(der: []const u8) FromEncryptedError!Pbes2Params {
+    const bad = error.InvalidDer;
+    const top = derTopSequence(der) catch return bad;
+    const alg = derChild(der, top.slice.start, top.slice.end, .sequence, true) catch return bad;
+    const data = derChild(der, alg.slice.end, top.slice.end, .octetstring, false) catch return bad;
+    if (data.slice.end != top.slice.end) return bad;
+    const oid = derChild(der, alg.slice.start, alg.slice.end, .oid, false) catch return bad;
+    if (!std.mem.eql(u8, derView(der, oid), &marshal.oid_pbes2)) return error.UnsupportedEncryption;
+    const params = derChild(der, oid.slice.end, alg.slice.end, .sequence, true) catch return bad;
+    if (params.slice.end != alg.slice.end) return bad;
+    const kdf = derChild(der, params.slice.start, params.slice.end, .sequence, true) catch return bad;
+    const enc = derChild(der, kdf.slice.end, params.slice.end, .sequence, true) catch return bad;
+    if (enc.slice.end != params.slice.end) return bad;
+
+    const kdf_oid = derChild(der, kdf.slice.start, kdf.slice.end, .oid, false) catch return bad;
+    if (!std.mem.eql(u8, derView(der, kdf_oid), &marshal.oid_pbkdf2)) return error.UnsupportedEncryption;
+    const kp = derChild(der, kdf_oid.slice.end, kdf.slice.end, .sequence, true) catch return bad;
+    if (kp.slice.end != kdf.slice.end) return bad;
+    const salt = derChild(der, kp.slice.start, kp.slice.end, .octetstring, false) catch return bad;
+    const iter = derChild(der, salt.slice.end, kp.slice.end, .integer, false) catch return bad;
+    var at = iter.slice.end;
+    var key_len: ?u64 = null;
+    if (at < kp.slice.end) {
+        const e = Asn1.Element.decode(der, at) catch return bad;
+        if (e.slice.end > kp.slice.end) return bad;
+        if (e.tag.class == .universal and !e.tag.constructed and e.tag.number == .integer) {
+            key_len = derUint(derView(der, e)) orelse return bad;
+            at = e.slice.end;
+        }
+    }
+    var prf: Pbes2Prf = .hmac_sha1;
+    if (at < kp.slice.end) {
+        const p = derChild(der, at, kp.slice.end, .sequence, true) catch return bad;
+        if (p.slice.end != kp.slice.end) return bad;
+        const p_oid = derChild(der, p.slice.start, p.slice.end, .oid, false) catch return bad;
+        prf = oidUnderArc(derView(der, p_oid), &marshal.oid_hmac_arc, Pbes2Prf) orelse return error.UnsupportedEncryption;
+        if (p_oid.slice.end != p.slice.end) { // parameters: absent or NULL
+            const nul = derChild(der, p_oid.slice.end, p.slice.end, .null, false) catch return bad;
+            if (nul.slice.end != p.slice.end or nul.slice.start != nul.slice.end) return bad;
+        }
+    }
+
+    const enc_oid = derChild(der, enc.slice.start, enc.slice.end, .oid, false) catch return bad;
+    const cipher = oidUnderArc(derView(der, enc_oid), &marshal.oid_aes_arc, Pbes2Cipher) orelse return error.UnsupportedEncryption;
+    const iv = derChild(der, enc_oid.slice.end, enc.slice.end, .octetstring, false) catch return bad;
+    if (iv.slice.end != enc.slice.end) return bad;
+    const iv_bytes = derView(der, iv);
+    if (iv_bytes.len != 16) return bad;
+    if (key_len) |kl| if (kl != cipher.keyLen()) return bad;
+
+    const salt_bytes = derView(der, salt);
+    if (salt_bytes.len == 0 or salt_bytes.len > max_pbes2_salt_len) return bad;
+    const iterations = derUint(derView(der, iter)) orelse return bad;
+    if (iterations == 0) return bad;
+    if (iterations > max_pbkdf2_iterations) return error.KdfIterationsTooLarge;
+    const ct = derView(der, data);
+    if (ct.len == 0 or ct.len % 16 != 0 or ct.len > max_pkcs8_der_len + 16) return bad;
+    return .{
+        .prf = prf,
+        .cipher = cipher,
+        .salt = salt_bytes,
+        .iterations = @intCast(iterations),
+        .iv = iv_bytes[0..16],
+        .data = ct,
+    };
+}
+
+/// A non-negative minimal DER INTEGER as a u64; values wider than 64 bits
+/// saturate (every caller compares against a much smaller cap).
+fn derUint(b: []const u8) ?u64 {
+    if (b.len == 0 or b[0] & 0x80 != 0) return null; // empty or negative
+    if (b.len > 1 and b[0] == 0 and b[1] & 0x80 == 0) return null; // not minimal
+    const s = stripLeadingZeros(b);
+    if (s.len > 8) return std.math.maxInt(u64);
+    var v: u64 = 0;
+    for (s) |x| v = v << 8 | x;
+    return v;
+}
+
+/// `E.fromOidLast` of the last OID component if `oid` is `arc` plus one
+/// single-byte component.
+fn oidUnderArc(oid: []const u8, arc: []const u8, comptime E: type) ?E {
+    if (oid.len != arc.len + 1 or !std.mem.eql(u8, oid[0..arc.len], arc)) return null;
+    return E.fromOidLast(oid[arc.len]);
 }
 
 // ── PEM (RFC 7468) ───────────────────────────────────────────────────────────
@@ -2634,6 +3089,17 @@ fn generatePrime(random: std.Random, prime_bits: usize, e: u64, out: []u8) void 
 /// FIPS 186-5 §A.1.3 closeness guard: reject q when the top 100 bits of p
 /// and q coincide (a sufficient condition for |p − q| <= 2^(plen − 100),
 /// which would expose n to Fermat factorization). Also subsumes p == q.
+/// `d > 2^half`, constant-time in `d` up to the verdict: `d − (2^half + 1)`
+/// does not borrow.
+fn privateExponentAboveHalf(sk: *const SecretKey, half: usize) bool {
+    var t = feToElem(&sk.d);
+    defer std.crypto.secureZero(u64, &t);
+    var bound = MontParams.zero;
+    bound[half / 64] = @as(u64, 1) << @intCast(half % 64);
+    bound[0] |= 1;
+    return montint.limbs.subInto(&t, &bound) == 0;
+}
+
 fn topBitsMatch(p: []const u8, q: []const u8) bool {
     std.debug.assert(p.len == q.len and p.len >= 13);
     if (!std.mem.eql(u8, p[0..12], q[0..12])) return false; // 96 bits
@@ -2709,6 +3175,13 @@ fn generateValue(random: std.Random, bits: usize, e: u64) GenerateError!KeyPair 
         // surfacing an error for an input the caller never chose.
         var sk: SecretKey = undefined;
         SecretKey.fromPrimes(&sk, p_bytes, q_bytes, &e_bytes) catch continue;
+        // FIPS 186-5 A.1.1 step 4.c (survey F2, 2026-10-14): d > 2^(nlen/2),
+        // else start over with fresh primes. Practically never taken for a
+        // random key; the verdict is the only branch on d.
+        if (!privateExponentAboveHalf(&sk, half)) {
+            sk.deinit();
+            continue;
+        }
 
         // Both primes have their top two bits set, so
         // n >= (3·2^(half-2))^2 = 9·2^(bits-4) > 2^(bits-1): exactly `bits`
@@ -3111,7 +3584,6 @@ pub fn selfSignedCert(
 // is referenced from a `test { _ = ...; }` block here.
 test {
     _ = openssh;
-    _ = safegcd;
     _ = @import("stackprobe_test.zig");
     _ = @import("stackprobe2_test.zig");
     _ = @import("wycheproof_test.zig");
@@ -4592,6 +5064,169 @@ test "F1: a φ-reduced (or any other valid) d is accepted and kept, so it round-
     try testing.expectEqualSlices(u8, &try rsadp(256, m, &sk), &try rsadp(256, m, &back));
 }
 
+const kat2048_pbes2 = struct {
+    const password = "zig-libs-pw";
+    // openssl pkcs8 -topk8 -in kat2048.pem -v2 aes-256-cbc -v2prf hmacWithSHA256 -iter 2048 -passout pass:zig-libs-pw -outform DER
+    const aes256_sha256 = hexLit("30820535305f06092a864886f70d01050d3052303106092a864886f70d01050c30240410015751a57cfbdf7110334c0a5e87a4c602020800300c06082a864886f70d02090500301d060960864801650304012a04103e32dee7e1f40b670ddd313123517ed7048204d02ce9ac185e8ffbf2f01aea59cbab4dbd27b525f7f85cf9f2a220cd8d6e4d4cf207ccad9b8d022b575f87187b803b6967cb0ab82595d1315ae095e2d0867347b16ea74f0c00c0532852d63facee250d523a17879072881481d83727681860743d7094f70d981c391b4bf4fa0a34e59710e87bf34325a43a8072918d45af1a0297e675820a1878a160e2614ff9db6bc1109ebbeb3a73f68407d3a5d59d80587044b4d6494bc5d3eb6132b086a6ca85ca8d6f96cdfc78e9c3df9e3d2b66febfab38f81f485abf1528b9e7f27a481a191f97c1773108f03c5792cd07d1c84a399ad1d9943e7881b24b5249575ea9d26d5e16be05a99c1ad6f418bd337d6deac9b45a5a58795974ec5c0f039bd647f75d0b197876b2cdff8191adbb496db8bec0ebfe23af4fece8ec07071fbac208eff46e0688f1491d397955b92ca247372659bdcef093e9462f2149df208a24652d274d7c35a9c3e9590dd90850ec71ecff8d884cb8896603e544e5a6b800b3897fd712a3a8bf9fc846cd9816095127c2670c07094e50366f2d702f6cd38ce6cda5425812cd3fd891b6a55454247830390c7cc8fb69677a67412a3f76d21b8b6106b1c857ffd4bbabe2530116f3d35949e04f2ba320ade576e2bd0273cca2eb109ab72a9e9a8fcfcbe81ff7dcc78de347ffd6fb1c379d2a8a7c8abad07eb2b35add731011ab3d453b350a3dc5f55442415bedd4666347a6f4438d6fc9e4b44db56c656dfb029deeb7d0b097641fd8b475f0f6051f13b310addcc2664c10c2ecd352d64a1358044297ab82306ecec7c75dc8f40025b8387b80d44aaaa502342f67fce6c0ba3ae8656178eb938e90dab64d951893afb6441eb55dcb88cd86ab7a2fa5459ae952780e0e7bd5d1ac324fba518af013e45fc4360c39fd5a8b3e9dcb11211fdad89df71174e01ccbfe8c4f64a0036ceb7c09383fac225a05e9fd95a5d34c863ed5bdc58399b8be5114915ad08414ffa2d54d9df32950463d934ed66fc4069d56a16b24916baea8d946513c650507d5f0945899f7182138e4c2e863f5b52ac41cb1acc424ffc09b41ecb266a921797039cb9180ee67485d70bfc220f60fb2ffcaeaacf4e18dca6f67aa7f2d6fe2897b3ffbe034a66420482e586d04b9bf68a3863f599c2548a73eb725253bce7f5ad4f0bff402b5579b31c5077f277f352c8ad6234615798bfd3b84d570dec16cb9dcbd563d8468fef4bea77d7762057c22b97d44348d7db09891a61414ed26b2d6eddab743051243ccb5fd39fcca7da83038a4f9eed9a31623624856933ac0261855c09d42d81094e33c124576fad874731e769b800540c6fb6a7da1557af6a6289898ed18d8c17b1bbe3b2d705266cc431bb32ef85038e5e312b77b3553b106c44fdbd18a94d1d0df7452e73fb0b3e6a5780ffa1b9e1e81c7a5b3f5a8949267301d8d72b77613e16d7d1adbed6b21e1c31134cf954126cea7c3844ab5569ac1300bb3f2eddc4dd837ac6efb60f14d8185bb30494c5fe42d97d7a26faf2b3806d66d174c1062673179320707cd8e420913757bd0953c10903d45f3faff034e5a589f2d5ed9dda03e49d7c14a48d636c293d81cbc12c2b9cc3dd406b938377c92d9ea9b86a894b8d5a4f396cdc318063e68de75e3536e355946de76efe594527e59dde98ef12560f7966fd6e95eba02565755da64c88e8a9499f5899ce3f6f77951275cfeffe699bdb250d077799138a033b296af");
+    // ... -v2 aes-128-cbc -v2prf hmacWithSHA1 -iter 1000 (PRF omitted: DER DEFAULT)
+    const aes128_sha1 = hexLit("30820527305106092a864886f70d01050d3044302306092a864886f70d01050c301604107a6f931b7eed66e632527dc88d01e965020203e8301d0609608648016503040102041047f0a15f93d380ad0568a014743ccbde048204d096d95f225d456078cb1fb48e456fa195c4453fcf6f816614302f1cf44e13d9599ab51e4ccabdcf3262458abc6b4e64ab9490cc60de2933afa3eba85f638235bbcb76dcb5c83cc95a0ab82594ae226b438e25b0b0795e98dbfd59e014eeaa08aeb061baa51a9fe3e9799b8ff914fd9d50b2085821efd63039479f5c37e2ee07b4362bb654a12a23edcf5fae74a92e9e10bf4af6f55ae71b5f440ce11113d762061c7f7acbbfcb4fcbb4abbce6d422b1dd06bc476f9065e4e043eea203e116dac60fb9aaf7305bbea592533d3c6afc49ed068ceeabe0f7e7bf4e79fdb42021abc692e112f4eb3e187ebd989f99c887d34530faee70eccddf6ecf01ebacab297f29c07f8b8ea32be3f074c62b458e2a90d1c3304af55b8091c53b67cc03735a2b0029f7c86439bdb8ceb7b3a5f9ce4422ac7453ff265cfd1152543db64da9f7e8ea4f767473628ce12d308ac336c1ab28627ff88952123392ecc632fae627c92ad805c1554f7a41b10799093373e0b1df8ee90c1a5a70f04d49a85117ba5defb392b653dfd059a6ad2f60eb5b4236f83aced6254f187259c1f5df1f3ceb7f5a436bb23ea9ecb27b8848bf14f50af5b0b1c32e865999b9a9c3a86e3ca0c21ccea72b538075f0f6465146d9bbe9838d7abfcb57be805c1f0fee0a64940199bb594ea33ae0c90b7ee4109f21c6fa608304780ff34a4aeac5fa20ca796d837c98a3efde169679f6c809b46dac7160e7771a49ebb81df0a2bd6ae868151853158e867b30083831ae479e7f0aa50093b26a265188723803a87ea3bc08a18c646f69d5a65de5af1d0dfa7d4fd0a624c93aebe15d4b427b9128f929edbb50be2c8a6001d96ad626bdafa17291c74c8cc13d50c5939525c6722a59c8d5d1895b9787fb035e8231c5555a594b18709d3520725ca890209d1505529690df80b72eef69b3b23614f1846460bda2b50716ff670a8515bf8a5c4fd5f0a90e6b34a58d0fb2259c4ded644dc8fe4fc234ab7cb84cc4f9e5fe3b00d923711823ce5c243b5309a2d24a8652ffe49334a7380ac0c84f7fe21477a6d2e47d7485c9b002f64cbeac6eb9d3bb0748e121a66c0d86c4ce1ede1943eb597e5044db3113fd6d5ee8dd4a44948f80f1cd3ed4df899fdde62b2fde2dc2bac3392f4a7f1f51e2946007de0981aadfc4919f208a7ce626a3324334f5a939624d3e38c3716074946d229498af929547008326320270d1c1fa96a6d49e613fceb1c1f18820272178f70636afaf6d751c76ac5377d96f60415d36080801f7f9991934cc5e007f2dddedf59c811d8a6edaa824d3acea6c2972ad73fe44b36bcd5efc691154fc10b277e21d70daef2e724764a080d48e26056dcc377fa75be0e9d5f654b8ec1aaee309f672e393c66607b43e5d09504893e28bf34ba86bea7880729d18f665437accc426d81eaf0435b469304b208dfc627ec40400a7ba5c0584d73947c3fc2f36f401611994946850e7159cdf2fb034ce00a5a8d7498044e6aefd963301b9d741ba72e8e9c9eb40b7f503a8d652a067d730592d7dc4c4b8d2d7362cd3d070f1319a01bb62c4c665eb245e1fd9cd1c365180e222d99614696168518a7053ea46c0cae94c3f1b2861995a4e9caa847f166f4967577a16227e6e9e07bb159c26c650708d96ab7854025a44b1f77ef02b8db2563149676e5f753bd2dc97949bd53b0dfeb5edb7b35dfb4404bc04a3dd8428fa14a8214b124415493b2658");
+    // ... -v2 aes-192-cbc -v2prf hmacWithSHA512 -iter 1000
+    const aes192_sha512 = hexLit("30820535305f06092a864886f70d01050d3052303106092a864886f70d01050c30240410f65e757964a034d94dfb9f1c15a78b36020203e8300c06082a864886f70d020b0500301d06096086480165030401160410234e08ce466704c6a9a6e7298ca2b6e4048204d02d12feede633826e3f3f88640afc6fc210b0f346f1322f8f5dc88043e9b182ade98859f25c90438c740e4410e5e910974fb910a2a263e6caf2f6dbd89db4fdea547f87d5ca487e956debc48e49bd723052aabfebfbefbd10e70c60b2003d417a941770e008105d4ca432b196538c12d74fe6735574d533510d648da6f9165bd761a7c2b7710da603122752adb2407b6346b346d20e007e24f770c0fe99a9e57d54b6859175a3d9c0f28ecd0e4c8c0bea30a029e75d0b933dc0c4243b413d1ec983371575c479495dce84941c9c9f938a739c27bb87cd89c7d5e9230898d7668ea79b1c268744e3b8685c7184930d4961b5701b27ec719ef61c5871b11362e82177fe885010c3ecfce983730a8741efa96a9ebeefdabbf5a9030498095cdd73600ab66237d5ea1fa944dc5cb5d21536343ab6c05d8e7ffbfff0fe8f76193c6d4f62b67542151330bb9f8e640e3ccf99a417b8f38a2545d05d2773628e99395ac81141abcf8ed9a5c5005cca30783c244912a6de18386ea46f1e197739d7fabaa1799a169e98197e4e22db564b9e0801878c9bf92d6a680ebfe0fd2e15711966e888cbb0719abc28598096aa468c57e06d876036bd290ce166db1a01e4495c11fafe2137c8cc996947d891751db6c332eb7eccbb80833713e3f4a907cdc0584909b6e7775ffbe91ec2038485c8b792a7db868a6d9bc01fe15e1d7615397c76143ef14f029c3d27ca09e18d3fcf14a7d9afe7cae4d874c565e65f67763d3057b988bf8346ddffbd3710f74a794b5a3e1d35213866d69059f00087e83eb3c79013e2c4399f114e9155fc6027925e090ef55861bc4b808dccbcbba22c642d516a12fd62beb87e69b683f4945e251d8014eb8aa90de15669bef7a59f94bc906440c8a3fc519e62dfcc27cb2986b3e1ed32ca4b02be4f1214c6d4cc4303cc981b154969358362dfecafdeb72646c3036990dc1077c4d958024557b660edbb100583f2faeef674f3209b36f6a45514f71f669a366b2b04b59b286e8f3c5c6f0f78109d3706a0264c3ac9ddc05607e335403cbf30db8f17fa4ae0616035a557f497b15c32cc15f0c649fb5618834f6f758e29070329aeffcfed07138c0efc69fddf70edb937771e9a3be85901ee551c6dea86fba0726c6df5f2ce068c46375c1e2b0e8cd68d7c825f49f8326009d85193bc5cac181572274a5d40244041f5f2e64d74df34a71223ceb4f0f9bfe443c1b85c2c65c1ae80337efd86392fe641c2afa9b040a1b8a3b0ffdbf38989b2d34767a81eacf9e82aba29855eba0deb82df48ae5365ebfcbb37097576e9cbec99670cbc2426d6ed6d0c7332941112cb55e910dc92a67de39e693992efbe8d8e957cab1ed9e2b42dcbbdbc0f4e61c32db47bae868610eb4adce752cf7c9c8d4daec7de831eca22cd18c6cf75167051419dad5b387e9d87202d1f99512c841b87a8ce749726f50d96fde2ec245e15db41ed2795a70ea26923973fd2790460db03ee73e150a0c1a02925f694cb6389fa1d47059c2446240147ab8f7a29592f79c2218c8fe56f7c4db39ad7669be4f6042747f0e2d072326e07eb1997fd5a3f8453a88b5d75ccc6f0572b3590d5ca792c3657d228896ed763997a2a2bc0b17ebaaa4fa899e424fded16bfc127b40629125ab75ca9f8896cb23028e2165fcebd5a45d85f7f1e8d77fb3a7ee88a8563fb98933c601b73def2a37e9821a8fffc44fe7a1ab1992de24c1b");
+    // ... -scrypt -scrypt_N 1024 -scrypt_r 8 -scrypt_p 1 (scrypt: not supported)
+    const scrypt = hexLit("3082052d305706092a864886f70d01050d304a302906092b06010401da47040b301c0410e52636f1015b2471f036d1f98e7d0cc202020400020108020101301d060960864801650304012a04106b467a0afbac6a5fa86723858d61e06b048204d021f2691a8ad740650124cf8d86e3c9f5d52083c170f0da913169ba8d77b3de10409b0f02ff72070b6f7288371887525e8a196cd04f7fb937ea9458aa37e924bb3c358804d5519f24a6c61f97f778d1bb15f6102986b15e3a112d7e8acf33f54b6fdf421ee73db174a7bb92740e763a05401b41b3cec51835c20426a4084c05bb28edaecc328f3bbe28bdf996e4ec47d937bf65ae1119ba9143c145354f141b36510dc11e786eea5860336f12974ed8ada6d0acdf61f81b4dc249aa6e8ad41b473d47c1d07298a0de3d95ac74ac0c3dfc626833a76c108b71bc3de8a85292968d50c5e0e74db62a33fe165e5c373a452b905f33b5d8c970c8a841dcfd6557ec5177604eec227ee87af4752b5258fd6c157c0b26d9b36b9f216aa89c11ddd3b5a77eefb8a13223ffa23c79375463ca5622dcb71daf8cf9fee9dddd195809c31fa0319f081b56db3d22f61b2b224c7d2916202694835f135a808d0bb20e03a6a320b2ea0741fe3039d00a4fdfdee9af172d466b5dd831a2a41280ac60c52dc34548c64b639cfdcf3253a48795650bbb786e50574dfbc6316be1bc32e648638d2e3533a7dae2cdf92dac06b133ca170459dd01fcb5ed57dfc06ea1f47d716f1dc26fbfcfb5139a2ab2b105660664c01117497695e0e515db4834c2711faecfda1600100bd9e4b9175b92ee7772687ed99e0f29178a28f6ce715800035de04ed7242df7a3236a45d256b8d4c5f5df7ca45a21b5194f79fb43ebbe0186a387f6d92948d6c6e4c8be0fe544e30443899304da0525bf48d3cbae34039b2dc5504d944d6c27eec905191062578697d01bbea41d38ec6e20939a738450edbefb8d909b0be9d04e4b950a39b2fe3af7516756aa0c15c474e59affccec43d5ceaf4aa828cfa8fb331860e3dc23c816870cb6102776df25d202af181af201879cdaa96cd47692ba4429cd59abe2ae00871d4a49d56af8275719ea14961bbdd133892d504086b93ad8e7ac3098276226a69365534565d22c63fde162b859d62fafff147036a3599c267c520433d81bc2ebe4ef35b874580c0ac75f69249102e5da6a9f13c2f73d00fd8c4ddd913eda9428bbd41494fba38b94c6e5f0ceb40a43f74a1e427f15269d9a12bfb6b11a586f47a8b0d1c2763184cc71a204570c22886d9764b57c5d904943671f13ea5c9eea5f6aa92988e50b3b41e4c4850d3e1ff16286206c50b348180b0bd7fd56c78339ae94fdec6ff22954567d5d4bfc03874a342140d221b1b6f93a79989d1551d7ea979774320f0f97fba1ada6726679db283579d331200e2c3952a3b924c19d500e04358875ccc71e10ba1684f7104298a3ed132a7fe7bc7af2916495907c5f90cb5a549e722854fb1340a749f5b94d84624604f948f3ece1eb1cb0ee4c207bef98fbde4a7b8769840e79097fb52ba6d2bcbf23a5fcdb68e4c877a87da28d55a1b7430307dfe9ca1ba8a5571dd9ee3be5d7eb2bdd6057d87fa6173ec6ebf0392852d56d274d71bad8d572a7db1a443fb14431c6ec4df71aec1e13b841bcef889026e68065cd280dca33aa1361864715b318a075b25c2176b2260477d265b4bd8253ee731704f4b789cff45a12f81f42e5d6dbb51789ab8ee54a870d982d9e4a9ce3f1fab75a9766130f13752a5ad896ab9612041e93baafe475d54b7e40456f1aeda2ce8c45b2ae9ec8c3f431e01604f2d84d6092249cf23bb0560b427b6e8ca7ebb3638313c3558b");
+    // ... -v1 PBE-SHA1-3DES (PBES1: not supported)
+    const pbes1 = hexLit("308204ea301c060a2a864886f70d010c0103300e0408de7d4b492da13a2c02020800048204c8a53465fb796af5660d43d3e6fc98428317364ab9a5c2a85d4331e384f4e77419ed72b90a1da504ef1c586714c6067a07ff66de5c9026dd666b5857dd9621dcb1ee1e974ed4af05048126cc7a7511233fb0a4ab1d42b2832693d2e889f5b455fc1929a466259d0cea81b16675c8bef1ae98f7bde8f8a971a0b53add5f58eff16fac41138fe3611bee1420c024c78f0d56ac0f72d30f10a9e7e589eddb2ff9e35ec0909a3f518ba266210b7feca64f3d633b758874476225dc4f04f4619b9a8e61be4eba06528d1f67b236c1c94539bb1e6c84f3faf5e2cd83ce8cf8e22a4e66bf701c9a5d1a42d291785d0640cbd44772d4473aa31f414dbc7cda5a20f3ddd773c5b048639efbee9610f4cf7cdfd83d1a518809a0f235a96859c5eafe43bac049a31414b90a468851ee81adef75cb5e8bf2c441d8e730f1c61852fab3ce3f44dbf5ad410cbd8f6b2f9b5f6dde36273c0c9b663863159bbd070ebe0b7e85c388ec11049f1045ded6e48b6b570da13d704914e037df6e45c6f168970416534a2b4da9a67e520ace6da4ceda97c6b0ac494b3771728156dac8513e1af732ad3b201471f8c7ed9f6fdf83f3cd3cb70e857bc3b3b45da4bdedffe09f5b8260756e316e9e06f8e61c0aa34cf7a4e8484f82c0638a82af91416e63b98ecc72a19bc98181777fb887753ff7abe377a0196a01255fb1a9d7ad6b4dba147c22b1dd0b25a88195be2e3263ab8fac45efbc1ad164944bce7162699db8db51701311abbf3c3d1f6baae9efa75cea78714c6036421a41428d0e0994522062382bdb675cace05612be07743ce0a1c803098ed82f285026112f8f654fbd7b12720bc150786a1213dd90d79c85cd08607bc796eebc79a1f0ce2b25025c681d0a227dcf4c3d4ef10a8fb85f8208cb2e2a1ed7533c326d6e39ff5e0771525f352c67dc897f843beca137e298e0d90673f58d79a80b627b3eb5f3f719fe87225c98c99dac31bc00e351a8222c87fe604d71ef41215fe628e505bebd61ca5015607eb91ce5ddccd6e82b6352b8144ad4435e468aaf71324c4db523e3ac116a3ea55cd0775da51b3e2bede6582eb07d7632d959e04a18c98a4584a262c4354b2fce8a28e5474ab09863556d5507c9121af4b8b1b94047e6def80954c73ae0c85596ae24a22189af15b6611f960db0b512ab9b33d767c8a011695d75b5e7242a2e4aa6acd953e8a88e7d36ecc2f2fbca839e77ea163b297cb2db7f31b9f4e64ca2b61024741e4579359a0dc0f68c3d1fe424de96d74c87221f0603af736c81b59bc1180b9e536369edd7a34f8634d53739fa4ef9152108deec4cae79f84bc566030464d7753ee88a9573adf9436a54b54a154a6c3ea2daa33ee13c54099076aeee8af8495ade11dfb87fab1e3379d62c4b75f4f74f29fac5c36934e411760c6e28e7ad1169819581103a0b9bcdc00c1f70711d7031c096cf22d4acb9827e44c6364f8bd26a4b99436c9952a87c199011658fc21351757e6863e9a7d8714cf64555c0f91fb1c25461626d624343ea92e1518725ea727e53b02e7662139f6e04151aa6a9e28db215b974a886d5f3d7afbe5b13ab66f0f6698dc83719fbf6281ce6f970fcaf76dc55d362e08643f02c574e39d0c674d50f36a976042c7186203aa4eefac5041a133f4b284d64b10e8e4d2c6766234ad2feafa101b7da61c77237e71d49ef3d58d4ca59cc609a39a8223432fd2af8f8");
+    // the same as aes256_sha256 key, PEM (fresh salt/IV; OpenSSL 3 default shape)
+    const pem =
+        \\-----BEGIN ENCRYPTED PRIVATE KEY-----
+        \\MIIFNTBfBgkqhkiG9w0BBQ0wUjAxBgkqhkiG9w0BBQwwJAQQy+zOX4+SbBFhR9yQ
+        \\yukJdQICCAAwDAYIKoZIhvcNAgkFADAdBglghkgBZQMEASoEEJemfRmbyIRdlQOC
+        \\rxCHT7QEggTQ+wkRWytQx1T3J8ozWbgzqSpn6U8ke6dxScB29Ko/0l2pzSZ7OK2w
+        \\N8rJxJNrLTvjbw0/0i4ti9VAG/tW1+Qygqi6m9asUixH55F57XoaQaeccAPfuEtG
+        \\dUSM2ZOQsIPQMPqPvXIwhPUnNgzjewm5fPjA/5VIUjt1bA9TR5mOaS3H6qUQaYca
+        \\BGOhknqRoi+m7ls46PxX12i1HiOc0+dYxTG8y6C9K/LO2fhI+2RJoPqWLvNWY6G/
+        \\YcvGEdcvdFBhfiNPwlqJL7BvFHJ85UTkCbc+TsytCXj4UhpRoVMT4m6IFAnWruFR
+        \\I1GaWz56m7ZFko7RYJs4zwS6VGUgMneG1hgY3pgVIm2MqjgkwPZfVjjY2v3YiFdB
+        \\4y1nHO2y8vG21Nh0qQcbTDB8DfHupse3EttcVV/bWjYqoVNUfakeLWpteQS23fXM
+        \\ct7Gi1vbVNnONWDEd58h31TcifJzyUusMgNT/g4ebtZiA05WPC14bs5qDwZdWGW8
+        \\6xXd/0Qes47kVW2fEXlW5e9fRFTMUGadUpfA3PLrRYOhHZ1Vodx7j5ZBssgkKaDv
+        \\730Kkvc1W9HZNPididdVgrLaO7KmlsaFrr767Skc6J+trKcJaAdJ+SCu6Am/y7yd
+        \\BIkCAGRjJr1pIrTKW8Tn6MCQN++X/GP31ClcZMpWUbo6JTwHzXl2QV+Zlxs/FZso
+        \\WBRepQWVEqvfGGWSc5yZqwaRO1ty8e+Q4CjgU7gThbDulCp5KGe2f0pUZPUCUR2C
+        \\0B3m7QtS4MWZFb3P5GZ01f+eJGzrrU5uEOl3iaFVHy1gdJJ+UIEBrimDGYgJ97WU
+        \\vNZMGBfj974el4N03XhYajHrVR08XamyKLvSleDzvDpgVvyyFYE4PIpIoKBDbKVt
+        \\Bpr8+QxEA3SOLlhyqZmlTwkazBsL/qI3fmJ9CANE3EMCPSrs105gH5McZcHqGwRO
+        \\NuPIe5TBcvSmginPnSWomRppAu3/DpNyNIKW6+RWBe6+xtui//kF4nglmhrayV4z
+        \\pHOgFhJeUGWvvTvS2dHQeq/VyKYrKz9HZYdKEygWYbpyaHwb0BXR8IrfnsVSx9zq
+        \\a2yPyHAYHhz1Dv1dj2w+hpTadCECxkC7JwGIAu21Y6iG91zEf4fG9tHz3iYGApPl
+        \\pZCbJQyfwWscxrREj2xZqzchlPFdwGJ6knED29kZ+c52rp67wKA94WZ1ln3faN4X
+        \\JXIivgv4V70YiSSLQbUGtgOk8NYpgCF6dXt5wkwUDrBtRv73PFR903Sv84qkEDvA
+        \\91Wg79mWp7tvgwhh/qOawvkWOxq52aqX9a7C0+wXsVkauRap3CnQsEzWhrcELn/M
+        \\5vROMbJ80k69NLZabuti6Uf6GNsujkZXasHC2EqhOigl6ORfhOjxfUqJIdn+LVBM
+        \\M6N4jiyShsGKG0HmPbslWCm3rDwWDTiAOR56GP3bwXIuFGJIEYB9tutEzV7c9EcM
+        \\BbV/oS/kSAk6+75OknpVpzu17pPK4kSqTCr1JgPaCNVZ/YkP9PgluJwESQLkToos
+        \\FH52fRV3qBxjLzTJDNrBTIHEimKL01ZKSEAKk2EdcU4EC+5tWyXANi+Su1nY76vh
+        \\7WnNOHRASpfgeXtqxbtrGplyUtu2iqvXPVGunW6i4niN9qTmLG1ltis=
+        \\-----END ENCRYPTED PRIVATE KEY-----
+        \\
+    ;
+};
+
+// ── R5 (2026-10-14): encrypted PKCS#8 against OpenSSL 3 files ───────────────
+
+test "PBES2: OpenSSL's encrypted PKCS#8 (AES-128/192/256-CBC, HMAC-SHA1/256/512) decrypts to kat2048" {
+    var buf: [max_pkcs1_private_der_len]u8 = undefined;
+    for ([_][]const u8{ &kat2048_pbes2.aes256_sha256, &kat2048_pbes2.aes128_sha1, &kat2048_pbes2.aes192_sha512 }) |der| {
+        var sk: SecretKey = undefined;
+        try fromPkcs8Encrypted(&sk, der, kat2048_pbes2.password);
+        defer sk.deinit();
+        try testing.expectEqualSlices(u8, &kat2048_der.priv_pkcs1, try sk.toPkcs1Der(&buf));
+        try testing.expectError(error.IncorrectPasswordOrCorrupt, fromPkcs8Encrypted(&test_sk_out, der, "wrong password"));
+        // A flipped ciphertext octet in the last block: padding or DER breaks.
+        var bad: [1400]u8 = undefined;
+        @memcpy(bad[0..der.len], der);
+        bad[der.len - 20] ^= 0x01;
+        try testing.expectError(error.IncorrectPasswordOrCorrupt, fromPkcs8Encrypted(&test_sk_out, bad[0..der.len], kat2048_pbes2.password));
+    }
+    var sk: SecretKey = undefined;
+    try SecretKey.fromPemEncrypted(&sk, kat2048_pbes2.pem, kat2048_pbes2.password);
+    defer sk.deinit();
+    try testing.expectEqualSlices(u8, &kat2048_der.priv_pkcs1, try sk.toPkcs1Der(&buf));
+    // The cleartext labels go through the same call.
+    var sk2: SecretKey = undefined;
+    try SecretKey.fromPemEncrypted(&sk2, kat2048_pem.priv_pkcs8, "ignored");
+    defer sk2.deinit();
+    try testing.expectEqualSlices(u8, &kat2048_der.priv_pkcs1, try sk2.toPkcs1Der(&buf));
+    // Encrypted input to the cleartext entry points is still refused by label.
+    try testing.expectError(error.UnsupportedPemLabel, SecretKey.fromPem(&test_sk_out, kat2048_pbes2.pem));
+}
+
+test "PBES2: scrypt and PBES1 are UnsupportedEncryption; truncations are InvalidDer" {
+    try testing.expectError(error.UnsupportedEncryption, fromPkcs8Encrypted(&test_sk_out, &kat2048_pbes2.scrypt, kat2048_pbes2.password));
+    try testing.expectError(error.UnsupportedEncryption, fromPkcs8Encrypted(&test_sk_out, &kat2048_pbes2.pbes1, kat2048_pbes2.password));
+    const der = &kat2048_pbes2.aes256_sha256;
+    var l: usize = 0;
+    while (l < der.len) : (l += 13) {
+        try testing.expectError(error.InvalidDer, fromPkcs8Encrypted(&test_sk_out, der[0..l], kat2048_pbes2.password));
+    }
+}
+
+/// `der` with the salt, IV and ciphertext contents zeroed — the parts that
+/// differ between two encryptions of the same key under the same options.
+fn pbes2Masked(der: []const u8, out: []u8) ![]u8 {
+    @memcpy(out[0..der.len], der);
+    const pp = try pbes2Params(der);
+    for ([_][]const u8{ pp.salt, pp.iv, pp.data }) |part| {
+        const at = @intFromPtr(part.ptr) - @intFromPtr(der.ptr);
+        @memset(out[at..][0..part.len], 0);
+    }
+    return out[0..der.len];
+}
+
+test "PBES2: our encryption has OpenSSL's exact shape (salt, IV, ciphertext aside) and decrypts back" {
+    var sk = try kat2048.secretKey();
+    defer sk.deinit();
+    var prng = std.Random.DefaultPrng.init(0x9be5_2014);
+    const Case = struct { opts: Pbes2Options, openssl: []const u8 };
+    var ours: [max_encrypted_pem_len]u8 = undefined;
+    var m1: [max_encrypted_pkcs8_der_len]u8 = undefined;
+    var m2: [max_encrypted_pkcs8_der_len]u8 = undefined;
+    var buf: [max_pkcs1_private_der_len]u8 = undefined;
+    for ([_]Case{
+        .{ .opts = .{}, .openssl = &kat2048_pbes2.aes256_sha256 }, // the defaults = OpenSSL's
+        .{ .opts = .{ .cipher = .aes128_cbc, .prf = .hmac_sha1, .iterations = 1000 }, .openssl = &kat2048_pbes2.aes128_sha1 },
+        .{ .opts = .{ .cipher = .aes192_cbc, .prf = .hmac_sha512, .iterations = 1000 }, .openssl = &kat2048_pbes2.aes192_sha512 },
+    }) |c| {
+        const der = try sk.toPkcs8Encrypted("zig-libs-pw", prng.random(), c.opts, &ours);
+        try testing.expectEqualSlices(u8, try pbes2Masked(c.openssl, &m1), try pbes2Masked(der, &m2));
+        var back: SecretKey = undefined;
+        try fromPkcs8Encrypted(&back, der, "zig-libs-pw");
+        defer back.deinit();
+        try testing.expectEqualSlices(u8, &kat2048_der.priv_pkcs1, try back.toPkcs1Der(&buf));
+    }
+    // PEM, and fresh salt + IV per call.
+    const pem = try sk.toPemEncrypted("pw", prng.random(), .{ .iterations = 16 }, &ours);
+    var back: SecretKey = undefined;
+    try SecretKey.fromPemEncrypted(&back, pem, "pw");
+    defer back.deinit();
+    var other: [max_encrypted_pem_len]u8 = undefined;
+    try testing.expect(!std.mem.eql(u8, pem, try sk.toPemEncrypted("pw", prng.random(), .{ .iterations = 16 }, &other)));
+    // Options outside the caps.
+    for ([_]Pbes2Options{ .{ .iterations = 0 }, .{ .iterations = max_pbkdf2_iterations + 1 }, .{ .salt_len = 0 }, .{ .salt_len = max_pbes2_salt_len + 1 } }) |o| {
+        try testing.expectError(error.InvalidOptions, sk.toPkcs8Encrypted("pw", prng.random(), o, &ours));
+    }
+}
+
+test "PBES2: an iteration count over max_pbkdf2_iterations is refused before any KDF work" {
+    var sk = try kat2048.secretKey();
+    defer sk.deinit();
+    var prng = std.Random.DefaultPrng.init(7);
+    var buf: [max_encrypted_pkcs8_der_len]u8 = undefined;
+    // 0x010000 iterations, then the INTEGER patched to 0x110000 (> 2^20).
+    const der = try sk.toPkcs8Encrypted("pw", prng.random(), .{ .iterations = 0x010000 }, &buf);
+    const at = std.mem.indexOf(u8, der, &.{ 0x02, 0x03, 0x01, 0x00, 0x00 }).?;
+    der[at + 2] = 0x11;
+    try testing.expectError(error.KdfIterationsTooLarge, fromPkcs8Encrypted(&test_sk_out, der, "pw"));
+}
+
+test "generate: FIPS 186-5 d > 2^(nlen/2) bound (F2)" {
+    var sk = try kat2048.secretKey();
+    defer sk.deinit();
+    try testing.expect(privateExponentAboveHalf(&sk, 1024));
+    // A d at and just above the bound (not valid keys; the check alone).
+    var d = [_]u8{0} ** 256;
+    d[256 - 129] = 1; // 2^1024
+    sk.d = try Fe.fromBytes(sk.n, &d, .big);
+    try testing.expect(!privateExponentAboveHalf(&sk, 1024));
+    d[255] = 1; // 2^1024 + 1
+    sk.d = try Fe.fromBytes(sk.n, &d, .big);
+    try testing.expect(privateExponentAboveHalf(&sk, 1024));
+    d = [_]u8{0} ** 256;
+    d[255] = 3;
+    sk.d = try Fe.fromBytes(sk.n, &d, .big);
+    try testing.expect(!privateExponentAboveHalf(&sk, 1024));
+}
+
 test "marshal: generated keys round-trip through every form" {
     var prng = std.Random.DefaultPrng.init(0x5eed_0014);
     for ([_]usize{ 512, 1024 }) |bits| {
@@ -4613,6 +5248,133 @@ test "marshal: generated keys round-trip through every form" {
             try testing.expect(back.equal(&kp.public_key));
         }
     }
+}
+
+// ── R3/R4 (2026-10-14): run-time hash, prehashed verify, PSS salt/MGF ───────
+//
+// Oracle: OpenSSL 3.5.5 over the kat2048 key and `kat2048.msg` (commands in
+// the comments); PKCS#1 v1.5 and salt-0 PSS are deterministic, so those are
+// byte-exact sign KATs too.
+
+const kat2048_hashid = struct {
+    // openssl dgst -<hash> -sign kat2048.pem msg (OpenSSL 3.5.5, PKCS#1 v1.5, deterministic)
+    const sha512_224 = hexLit("99155048b2f8c9e46f59d10c82103912bce2ba0c08564d4f8db6484b98d8ff1c9211fa771f6cff0448a247495ba97c5dbaaad0d48b98d0b69fff72f57bc63f7e85bf4bf242601f55961fcabdc773ecddf7d68a1229da97d7303095d6cd78d26266834464a8fa3bc7ba1534c8b453d424f5ec326b6d52655dc4a041cb7a07624e913fb08311947be767bf11a48f3cb50e50c763a2b51f2991ae3785e6c412d73e33d661809b90999c5bd1f9e11476d90ae55fb7eb55804045c1488f02247256b1c091f2bdb3755a95bc63ff3edcdd4bd647b8a05634e0c426333460b2bf8cf7f4e4dada1e019daae5922d87bd56545359ed01931e8ea734df89d64725ea1e44a2");
+    const sha512_256 = hexLit("0ab166545ee254efc88963f88b87d893370144210917f45a832a5d78d260f422f0fba89337e8deb0a50e61ffc1912d46481ea0a8f258942d9bb6399e4ec0b73012ff3685125ff02acff8ab2df5dac1d7a3ec300f7c2269ee7213a6c558cf2b9346272b4f315645852e30d7e8466e30e675abd389a9c02ee6f5966c767bbb41cda8ae604f472dd19071eaaa8a1519162d94cba8517ff5aaaf3b044dede4c33b9742f73a96086f6a61bca9e0c595caf808d03db6ebf747251bc6d258e31b38a3623f5fc2efa9ca593abdd1fb4930cf6fc20f9c928ae82aa3ea494a09687d8c6c109060db25bf17e94afc4445cf0eb3d925fd531efa2b8f598956519585cb5378bf");
+    const sha3_224 = hexLit("89844722208bd264f4247bfe8586de7718342d89a6807f5232765bda843c7bbf31cfd65f407f0d03bc8d05b1dcc9bea6c89da645d9f0a7b17a4c299576930d9dd161c3fcf834679955459f19ef44ae796ccf80e13c8d9a1df83cd6ff526796c8df2610346f14939edbe1fb7ce49fab639066b218db37562373981e4204bfac48071bf60ca94182706ef2b8db8321a253ee836255b614b120662e424048cda81e103599aee9e88ea9b80f5e663f605a2d5192ee399d2eb00b323f3ce855e0752ded4d97548b9806d1cd4ff5a99dcf2609a9adddc5194afe691b27a40400c6c5bce30585dfe05913ab3d38b556f8c189a2757fc5069cc0e0a6311ed4ef368137fd");
+    const sha3_256 = hexLit("4fcf92294adcf57bc9ed4b4f4d1e98613c59864cf2f6df38d7805939b68f66e6bd1e694229d25d10cfb749aa9b1b3517561eb09df32265c02bbc8fa6617f8e59f2363a64bc0de103901ddc923d2b0728996989b3d2d4b689affa37a077ed9b8f5f71089f77242b10270a1a4cc1ba9aa0a78fac2027159364ac82fc4078e1ed50f45af2b7c3819991d38b540f601271dc6de7e3648914d96c272f471863c3017e7efdf8d90f8cd996648e5a1c774e797f1bad0b46cf94b04b920c61dbcfaa0cad5431a6d7fe4fa304ac34abfcb4599b322b9322fb2b9f93e01c765c7fa4ff46861c75295becd885bdff03cbaec2241599b40f243ba2ca4a56487c070e046fbd08");
+    const sha3_384 = hexLit("994a0bb5887a0a8beacb6b0918780521da3df1db6e630215944ba30ea82ad91f2033d0bff6c6b98b97bd4b0bffd0060f206db770aadb96869d6e129cb4d4e53f12143d0bcce5b812acab0624e7721fb015b44d6b9c451940a1b5492672bb4456838e9523630db36ea51689ca877e572e430e3f20e726a89ac37100bb63ce2c5903764405a33d44c34fc6500a63a8a01274636083559c44c9af967e120ee96297f44bf62e642a10556b2ff6547a681ff51232ffb187ef11b6d32844eeee54acd3818cf172fbd7cd40d6f8bbfe023555a12e7462d4a9e9c24efb486ad853084d41c9ee625dac771e5c3d2094eb257f0e649250c8d07203dfbcd39ba4f272e89ee8");
+    const sha3_512 = hexLit("62abfde99917a476e6ff8311aba9ee433a415ab360aa925df4b8e9b9c1ae4e1b1d86ca5d46d1db077e821ad8a59a149dcc5745b665a85b89d185f53e110f218f47a7866c7bbc6e305ca6f9ee5bbe0d8267bcab734b6cefaf96fa04d23024be00e05b749eb16f31222e8a4f67eb5c3b90b21b9219d6ac051b0cab031e5b4b31c83749dd6b5003a215e960851ff59861d9675cd65d49d89ddeb3c6160a2b791b7c5ca83da61cfa46b2b4f1c5fcebe46bef92f7723cd6483f137036739a313b7aa3a0460d15f47733d516b6a09253fa1283cf4cf363c35a9bad6a164de089df1cb476b9169504e3c372efbf668cc8f5a478fa7e8f0c572ff233d8f2e4eafaa42ad8");
+    // openssl dgst -sha256 -sigopt rsa_padding_mode:pss -sigopt rsa_pss_saltlen:<n> [-sigopt rsa_mgf1_md:sha1] -sign kat2048.pem msg
+    const pss_salt_0 = hexLit("2e6f8537447e18455f1bc67a5dda7c1308a7ff36ca58b0bd016ce9a74b7bc54d7a0c269b65e8625fddc55f3dbed76b2a6d4a20b7dd532f2084a9a8ebb86c0f588b01ed0c56c8cfe15e2ed83cbb051068743b665d5935df37d95aefdf3bbcbd61e1db1d8adbc05162c9bef2672b705030194e86b2f2da64fc4948948e98c760335904bbf1501a7aa2f79a01eefdab7a53506e89f7a17904f575586cdc46ed7d8b211a80685b13eff8e5ab62c7171c094a3603d90da0d33f4aef0316af828568a9a8780e315b52fa602f4ebd134b1ed0f9218d399473c4ee4970e00429a5225de7c43096a3523e66233f9b5810b6ce8f02cabdf77d989b95ec94a38b606709dda2");
+    const pss_salt_20 = hexLit("3a8cae4e6ff61fda10ff1787fe15ddb5305f5696132404f9a0b6c7d5a1f8bd14b3c84291a29a5964970dd22e99738acc120e9a34c1017e3d47de9f8c1f068bfdd379173e5dac7040df0bc735fc2af180b8cc87d09be92d02d8a3bc23e68cb60c64d3ad42a0c37079e5429674155b3e6cc2a2f8fb17b15b9928acfae0e32bfc57f7982ddb578e214d648cd84f08a8c79e617d8bd9e3d954121eb40aca9e1a0edb1fa1f3df19e3c0c85bf0710e54e0e8a2383f5a054403558d0a2ee7d2d88c93de882edaf0c6a3cd211ab352b3a3662673ab5b5a08d61cc083d1bf8783ed2cba551fc4e50be1332f4b223ea30e32b0b13ef3f7653ca004326e7a1e9015d16a4148");
+    const pss_salt_32 = hexLit("80dd4e1c84b179db37a68e4c74c5a43528aed76d25eba959eb36d598179579435445cd7777e5572b25b4dbdb600a2bf77152871304caccbe2538141a3f702ee2bfdafe4e32078245157fa3cb05f0bb1541d2cd105da5e3e32429ec61b0739b9d008755c2d5f413a0e794da54923e20cbb17d6ad342568888d73df5911b617b6be84abdff212afcf17708f1a81160924aecc2a1fa9a0e9c11df08933237fcb4e82b880cfbe30861b654fb4f11ae44d5875a903c1b1c34f13fa135baa2c5192e0f3f0c0aec0ec49db74abe27218126e34f7ff19689c4a919d3024c281e12fe80551c12b067d80a32fd089a1abc7e18463bb5af1f858af80530552196548e5b81df");
+    const pss_salt_max = hexLit("7641d3535db9ac03705b1c812268d2857be11aa43b6255ab934713afde1c38c3f0357a2ed0bfd80f518949d29be3e6ae729bd4ac47136982fc1a6b2b3c914095258e10ea1d8c210fbfd9e058649f74a718cd6683f628f1889e6b293136fb292df1d5f1e56559f483f1c1ae58ed1bb0da74806ede009c34cc9dc27bae12ef4bf5116430689114c65db97226e7e621a9d29ff43dba8c92db95eb4fb9da655e74b20d89466efd6ee93df80452b9c053b4e4454da4f3534a649487351ca26ef94d0716d8a7b7d2a7e31a29cfd551bba50282c8580230b8152b7ebc575cc84e9fd093b9038592510e68b7df76044fc4bdaaad11d70b71fa0225f68d0c5d9a84a34929");
+    const pss_mgf1sha1_salt_32 = hexLit("48f94a67c4e70dbbe1be0abd4af8fecdd5da5c7b751f842b74a4348a9371376c3ef423e1744cdb886217097d925f1c23e9eef02ca10c76c2fb473632cee52cb521a4098156a6731ec9d20146be44826dde5ae555c4cab9a7fa6a26fc6f675ae521c643c5832770254822528ec795cdf167f67b2f65a60450c0559b8684e18da29c39bfcb1149e4d4741e9e5faccb83389c6a5d32c2bf268a7c43b0b8313f9ea2d213eb646587858be53f9c134b7c81962ad27b37f647ab6e0d4df4168cffb227a54ab1b7ad509a8c5a87e569747ad266b281e031dc97de9b84f6f544a2655f5014ece18c148a696b1c31e68fae4ae06c7d81f3f3bd2f5d8b89c7530484c5d1db");
+    const pss_mgf1sha1_salt_0 = hexLit("967955c00a6138ba3a4414990f4ef9ecbd491ff06787084c3c9eb4c1518630b21efa53b6dc06def4895e8719f0d364db7d79d3ee9f6e668b928625f3d5c41fe93f393706f872e8d2285379b8919f4013e8e7cafe61b01ad22bd32fa3ed0c3259cffb3b4cd098bfce599ff8a21e736e0874c81e05853e85667aceaee9ae0f60cb7b5c1210c707fd470169fea8ea409f2e4a0d3c2793333b251253c85afb3ccfb75e1fe96afa13d1aeadd1b59514102133a72355295ddb0497d8bfd2591e7ff0f1137ca9bb48fd77cdf63872669aadedc267e39a12a4049501928b7aa566e3f6816f3b8d6881758cb1c0f2db9fc6f6778c0515db462c0ab81f239a4e39366b691e");
+    // openssl dgst -sha3-256 -sigopt rsa_padding_mode:pss -sigopt rsa_pss_saltlen:digest -sign kat2048.pem msg
+    const pss_sha3_256_salt_32 = hexLit("394eb24c7df16c6304c361cbc095bb8bdf049bf32b3e9a33f66f7a5922ca167c301d60bd1c9cf668a53a50adb67855564b39407d5062bc68f49122a1219aa2eea84759e5d59fdf6b693fd08d6073bfdf15bbacf611e3ca7fb79a4ab39f59d51eb28ba1b90e4d1bd041d2073724d0a84d6bc310a37333de1548e82538263732063ffd1d15e770a66b35c8176b0a225e11e5df65556c03b142df633e4b43d51ab0380f491ceac0cb58e4bd5653ef2db7dec7ed618b08fe111cc34375cfccb237615c87f2cea485573b9d39d2b76528a1e63c42d6cfbb35332235a9466129acc788a60736f68fe4e04ed01506fd36f4ce08ce32b8848209709f7b82494aa01625eb");
+};
+
+test "HashId: NIST-arc DigestInfo prefixes equal the RFC literals; new hashes sign byte-exact vs OpenSSL" {
+    const h = std.crypto.hash;
+    try testing.expectEqualSlices(u8, digestInfoPrefix(h.sha2.Sha256), comptime nistDigestInfoPrefix(1, 32));
+    try testing.expectEqualSlices(u8, digestInfoPrefix(h.sha2.Sha384), comptime nistDigestInfoPrefix(2, 48));
+    try testing.expectEqualSlices(u8, digestInfoPrefix(h.sha2.Sha512), comptime nistDigestInfoPrefix(3, 64));
+    try testing.expectEqualSlices(u8, digestInfoPrefix(h.sha2.Sha224), comptime nistDigestInfoPrefix(4, 28));
+
+    const sk = try kat2048.secretKey();
+    const pk = try kat2048.publicKey();
+    const vk = pk.verifyKey();
+    const Kat = struct { id: HashId, sig: []const u8 };
+    const kats = [_]Kat{
+        .{ .id = .sha512_224, .sig = &kat2048_hashid.sha512_224 },
+        .{ .id = .sha512_256, .sig = &kat2048_hashid.sha512_256 },
+        .{ .id = .sha3_224, .sig = &kat2048_hashid.sha3_224 },
+        .{ .id = .sha3_256, .sig = &kat2048_hashid.sha3_256 },
+        .{ .id = .sha3_384, .sig = &kat2048_hashid.sha3_384 },
+        .{ .id = .sha3_512, .sig = &kat2048_hashid.sha3_512 },
+        .{ .id = .sha256, .sig = &kat2048.sig_sha256 },
+        .{ .id = .sha384, .sig = &kat2048.sig_sha384 },
+        .{ .id = .sha512, .sig = &kat2048.sig_sha512 },
+    };
+    var out: [max_modulus_len]u8 = undefined;
+    var dbuf: [max_digest_len]u8 = undefined;
+    inline for (kats) |c| {
+        const H = comptime c.id.Type();
+        try testing.expectEqualSlices(u8, c.sig, try signPkcs1v15(&sk, H, kat2048.msg, &out));
+        const digest = hashMessage(c.id, kat2048.msg, &dbuf);
+        try testing.expectEqual(c.id.digestLen(), digest.len);
+        try testing.expectEqualSlices(u8, c.sig, try signPkcs1v15Digest(&sk, c.id, digest, &out));
+        try verifyPkcs1v15(pk, H, kat2048.msg, c.sig);
+        try verifyPkcs1v15Prehashed(pk, H, digest[0..H.digest_length], c.sig);
+        try verifyPkcs1v15Digest(pk, c.id, digest, c.sig);
+        try vk.verifyPkcs1v15Prehashed(H, digest[0..H.digest_length], c.sig);
+        try vk.verifyPkcs1v15Digest(c.id, digest, c.sig);
+        // A wrong digest, a wrong hash, a wrong digest length.
+        var bad = digest[0..H.digest_length].*;
+        bad[0] ^= 1;
+        try testing.expectError(error.SignatureVerificationFailed, verifyPkcs1v15Digest(pk, c.id, &bad, c.sig));
+        try testing.expectError(error.InvalidDigestLength, verifyPkcs1v15Digest(pk, c.id, digest[1..], c.sig));
+        try testing.expectError(error.InvalidDigestLength, signPkcs1v15Digest(&sk, c.id, digest[1..], &out));
+    }
+    try testing.expectError(error.SignatureVerificationFailed, verifyPkcs1v15Digest(pk, .sha3_256, hashMessage(.sha3_256, kat2048.msg, &dbuf), &kat2048_hashid.sha512_256));
+}
+
+test "PSS: auto salt recovers OpenSSL's salt lengths (0, 20, 32, max); explicit lengths agree" {
+    const Sha256 = std.crypto.hash.sha2.Sha256;
+    const pk = try kat2048.publicKey();
+    const vk = pk.verifyKey();
+    const max = maxPssSaltLen(2048, Sha256).?;
+    try testing.expectEqual(256 - 32 - 2, max);
+    const Kat = struct { salt: usize, sig: []const u8 };
+    var dbuf: [max_digest_len]u8 = undefined;
+    const digest = hashMessage(.sha256, kat2048.msg, &dbuf);
+    for ([_]Kat{
+        .{ .salt = 0, .sig = &kat2048_hashid.pss_salt_0 },
+        .{ .salt = 20, .sig = &kat2048_hashid.pss_salt_20 },
+        .{ .salt = 32, .sig = &kat2048_hashid.pss_salt_32 },
+        .{ .salt = max, .sig = &kat2048_hashid.pss_salt_max },
+    }) |c| {
+        try testing.expectEqual(c.salt, try verifyPssAuto(pk, Sha256, kat2048.msg, c.sig));
+        try testing.expectEqual(c.salt, try verifyPssAutoPrehashed(pk, Sha256, digest[0..32], c.sig));
+        try testing.expectEqual(c.salt, try verifyPssDigest(pk, .sha256, digest, c.sig, null));
+        try testing.expectEqual(c.salt, try vk.verifyPssDigest(.sha256, digest, c.sig, null));
+        try verifyPss(pk, Sha256, kat2048.msg, c.sig, c.salt);
+        try verifyPssPrehashed(pk, Sha256, digest[0..32], c.sig, c.salt);
+        try vk.verifyPssPrehashed(Sha256, digest[0..32], c.sig, c.salt);
+        // The wrong explicit length is refused (salt 0's neighbour is 1).
+        try testing.expectError(error.SignatureVerificationFailed, verifyPss(pk, Sha256, kat2048.msg, c.sig, if (c.salt == 0) 1 else c.salt - 1));
+        // Another message is refused in auto mode too.
+        try testing.expectError(error.SignatureVerificationFailed, verifyPssAuto(pk, Sha256, "another message", c.sig));
+    }
+    // A PKCS#1 v1.5 signature is no PSS encoding under auto either.
+    try testing.expectError(error.SignatureVerificationFailed, verifyPssAuto(pk, Sha256, kat2048.msg, &kat2048.sig_sha256));
+    // SHA3-256 PSS through the run-time selector.
+    try testing.expectEqual(32, try verifyPssDigest(pk, .sha3_256, hashMessage(.sha3_256, kat2048.msg, &dbuf), &kat2048_hashid.pss_sha3_256_salt_32, null));
+}
+
+test "PSS: decoupled MGF1 hash — OpenSSL rsa_mgf1_md:sha1 verifies, salt-0 sign is byte-exact" {
+    const sha2 = std.crypto.hash.sha2;
+    const Sha1 = std.crypto.hash.Sha1;
+    const sk = try kat2048.secretKey();
+    const pk = try kat2048.publicKey();
+    try testing.expectEqual(32, try verifyPssH(pk, sha2.Sha256, Sha1, kat2048.msg, &kat2048_hashid.pss_mgf1sha1_salt_32, null));
+    try testing.expectEqual(32, try verifyPssH(pk, sha2.Sha256, Sha1, kat2048.msg, &kat2048_hashid.pss_mgf1sha1_salt_32, 32));
+    // The same signature under MGF1-SHA256 (the default pairing) is refused.
+    try testing.expectError(error.SignatureVerificationFailed, verifyPssAuto(pk, sha2.Sha256, kat2048.msg, &kat2048_hashid.pss_mgf1sha1_salt_32));
+
+    var prng = std.Random.DefaultPrng.init(0x14_10_2026);
+    var out: [max_modulus_len]u8 = undefined;
+    try testing.expectEqualSlices(u8, &kat2048_hashid.pss_mgf1sha1_salt_0, try signPssH(&sk, sha2.Sha256, Sha1, prng.random(), kat2048.msg, 0, &out));
+    try testing.expectEqualSlices(u8, &kat2048_hashid.pss_salt_0, try signPssH(&sk, sha2.Sha256, sha2.Sha256, prng.random(), kat2048.msg, 0, &out));
+    // Max salt through the run-time selector round-trips with auto recovery.
+    var dbuf: [max_digest_len]u8 = undefined;
+    const d512 = hashMessage(.sha512, kat2048.msg, &dbuf);
+    const max512 = maxPssSaltLen(2048, sha2.Sha512).?;
+    const sig = try signPssDigest(&sk, .sha512, prng.random(), d512, max512, &out);
+    try testing.expectEqual(max512, try verifyPssDigest(pk, .sha512, d512, sig, null));
+    try testing.expectError(error.EncodedMessageTooShort, signPssDigest(&sk, .sha512, prng.random(), d512, max512 + 1, &out));
+    try testing.expectEqual(null, maxPssSaltLen(512, sha2.Sha512)); // 63-byte EM < 64 + 2
 }
 
 test "PublicKey.fromDer/SecretKey.fromDer/fromPkcs8 reject truncated DER" {
@@ -6487,6 +7249,65 @@ test "corpus: fromOpenSSH seeds reach the parser, counts pinned" {
     try testing.expectEqual(@as(usize, 1), moduli.n);
 }
 
+// ── fromPkcs8Encrypted (PBES2) ───────────────────────────────────────────────
+
+fn parsePbes2(in: []const u8) ?usize {
+    var sk: SecretKey = undefined;
+    fromPkcs8Encrypted(&sk, in, kat2048_pbes2.password) catch return null;
+    defer sk.deinit();
+    secretRoundTrip(&sk);
+    return sk.n.bits();
+}
+
+const pbes2_seeds = [_][]const u8{
+    testkit.fuzz.seed(&kat2048_pbes2.aes256_sha256),
+    testkit.fuzz.seed(&kat2048_pbes2.aes128_sha1), // PRF omitted (DEFAULT)
+    testkit.fuzz.seed(&kat2048_pbes2.aes192_sha512),
+    testkit.fuzz.seed(&kat2048_pbes2.scrypt), // UnsupportedEncryption
+    testkit.fuzz.seed(&kat2048_pbes2.pbes1), // UnsupportedEncryption
+    // The iteration count's low octet changed: the KDF runs, the key is wrong.
+    testkit.fuzz.seed(perturbed(&kat2048_pbes2.aes256_sha256, 55, 0x01)),
+    // A ciphertext octet in the last block: padding or inner DER breaks.
+    testkit.fuzz.seed(perturbed(&kat2048_pbes2.aes256_sha256, kat2048_pbes2.aes256_sha256.len - 20, 0x01)),
+    // Plaintext PKCS#8 handed to the encrypted parser.
+    testkit.fuzz.seed(&kat2048_der.priv_pkcs8),
+    testkit.fuzz.seed(""),
+};
+
+fn fuzzFromPkcs8Encrypted(_: void, smith: *std.testing.Smith) !void {
+    return pbes2Harness(std.testing.Smith, smith, testing.allocator);
+}
+
+fn pbes2Harness(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    var buf: [2048]u8 = undefined; // the fixtures are 1323–1337 octets
+    const len: usize = smith.slice(&buf);
+    if (parsePbes2(buf[0..len])) |bits| {
+        std.mem.doNotOptimizeAway(bits);
+        mark(.raw_accepted);
+    } else mark(.raw_rejected);
+    try overlay(parsePbes2, &.{ &kat2048_pbes2.aes256_sha256, &kat2048_pbes2.aes128_sha1, &kat2048_pbes2.aes192_sha512 }, buf[0..len]);
+}
+
+test "fuzz: fromPkcs8Encrypted never panics" {
+    try testing.fuzz({}, fuzzFromPkcs8Encrypted, .{ .corpus = &pbes2_seeds });
+}
+
+test "corpus: fromPkcs8Encrypted seeds reach the parser, counts pinned" {
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    for (pbes2_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [2048]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        if (parsePbes2(buf[0..len]) != null) accepted += 1;
+    }
+    // The three genuine files; everything else refused (2026-10-14).
+    try testing.expectEqual(pbes2_seeds.len - 1, nonempty);
+    try testing.expectEqual(@as(usize, 3), accepted);
+}
+
 // ── deterministic driver tests ───────────────────────────────────────────────
 
 test "fuzz driver: RSA_FUZZ (rsa-pubder)" {
@@ -6503,6 +7324,9 @@ test "fuzz driver: RSA_FUZZ (rsa-pubpem)" {
 }
 test "fuzz driver: RSA_FUZZ (rsa-secpem)" {
     try fuzz_driver.run(secPemHarness, .{ .prefix = "RSA_FUZZ", .name = "rsa-secpem" });
+}
+test "fuzz driver: RSA_FUZZ (rsa-pbes2)" {
+    try fuzz_driver.run(pbes2Harness, .{ .prefix = "RSA_FUZZ", .name = "rsa-pbes2" });
 }
 test "fuzz driver: RSA_FUZZ (rsa-openssh)" {
     try fuzz_driver.run(sshHarness, .{ .prefix = "RSA_FUZZ", .name = "rsa-openssh", .scale = 10 });
@@ -6545,4 +7369,8 @@ test "fuzz harness: seeds in every test run, and they get everywhere" {
     // forms, whose seeds are too expensive to run by the thousand.
     try reachCheck(secPemHarness, "rsa-secpem", 100, .damaged_accepted);
     try reachCheck(sshHarness, "rsa-openssh", 30, .damaged_accepted);
+    // PBES2: every damaged octet lands in a checked field, the KDF input, or
+    // the ciphertext; acceptance is luck (a pad-free change in an ignored
+    // NULL), so not demanded.
+    try reachCheck(pbes2Harness, "rsa-pbes2", 60, .damaged_accepted);
 }

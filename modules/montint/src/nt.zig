@@ -30,7 +30,7 @@ pub fn oddPart(comptime n: usize, x: *const [n]u64) struct { u: [n]u64, t: usize
         var s = u;
         shr1(n, &s);
         blend(n, &u, &s, even);
-        t += even & 1;
+        t += @intCast(even & 1);
     }
     return .{ .u = u, .t = t };
 }
@@ -278,12 +278,19 @@ const testing = std.testing;
 const Managed = std.math.big.int.Managed;
 
 fn toBig(gpa: std.mem.Allocator, v: []const u64) !Managed {
+    // Limb by limb: `Managed.limbs` is `[]usize`, so a memcpy of u64 limbs
+    // would not compile on 32-bit targets.
     var r = try Managed.init(gpa);
     errdefer r.deinit();
-    try r.ensureCapacity(v.len + 1);
-    @memset(r.limbs, 0);
-    @memcpy(r.limbs[0..v.len], v);
-    r.normalize(v.len + 1);
+    var t = try Managed.init(gpa);
+    defer t.deinit();
+    var i = v.len;
+    while (i > 0) {
+        i -= 1;
+        try r.shiftLeft(&r, 64);
+        try t.set(v[i]);
+        try r.add(&r, &t);
+    }
     return r;
 }
 

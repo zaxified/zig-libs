@@ -54,6 +54,7 @@ const blend = nt.blend;
 const sar1 = nt.sar1;
 const halveMod = nt.halveMod;
 const divstepCount = nt.divstepCount;
+const safegcd = @import("safegcd.zig");
 
 /// Slot granularity in limbs: a modulus runs on the next multiple of this.
 pub const step: usize = 4;
@@ -666,6 +667,53 @@ pub fn DynModint(comptime max_bits: comptime_int) type {
         /// Constant-time in `a` and in the modulus's value up to that
         /// verdict; the work depends on the modulus's bit length only.
         ///
+        /// Runs on `safegcd.Inverter` (Bernstein–Yang divsteps, 59 per
+        /// transition matrix applied once to multi-limb signed-62 vectors, as
+        /// libsecp256k1 `modinv64`): a few tens of µs at 2048 bits. The
+        /// result is not trusted on the engine alone: `a·inv ≡ 1 (mod m)` is
+        /// checked with `mul` before `true` is returned (fail closed). An
+        /// `a ≥ m` is zeroed under a mask before the engine sees it (its
+        /// contract is `0 ≤ a < m`) and the verdict carries the refusal.
+        pub fn inverse(self: *const Self, a: *const Elem, out: *Elem) bool {
+            const Inv = safegcd.Inverter(64 * max_limbs);
+            // a < m over all of `Elem`, limbs above the slot included: folded
+            // into the verdict, not branched on.
+            var t = a.*;
+            const below: u1 = limbs.subInto(&t, &self.m); // 1 ⟺ a < m
+            std.crypto.secureZero(u64, &t);
+            const keep = blackBox(0 -% @as(u64, below)); // all ones iff a < m
+            var x = a.*;
+            defer std.crypto.secureZero(u64, &x);
+            for (&x) |*w| w.* &= keep;
+            var inv: Elem = undefined;
+            defer std.crypto.secureZero(u64, &inv);
+            // The engine's size is the SLOT width `64·L`, not `nbits`: the slot
+            // is the public quantity (`nbits` is the modulus's own bit length,
+            // which callers with a secret modulus — paillier's λ — treat as
+            // secret; sizing the trip count by it put 72 secret-length
+            // branches into ctgrind `paillier keygen`, 2026-10-14). An upper
+            // bound is all the divstep bound and the limb count need; the
+            // product check below fails closed either way.
+            const engine_ok = Inv.invert(&x, &self.m, 64 * self.L, &inv);
+            var one_e = zero;
+            one_e[0] = 1;
+            const prod = self.mul(&x, &inv);
+            const verified = eql(&prod, &one_e);
+            out.* = inv;
+            return (@as(u1, @intFromBool(engine_ok)) & @as(u1, @intFromBool(verified)) & below) == 1;
+        }
+
+        /// The PREVIOUS `inverse` (2026-10-03), kept only as the test oracle for
+        /// the batched safegcd that replaced it (2026-10-14): same contract, one
+        /// divstep at a time. `a⁻¹ mod m`: if `gcd(a, m) = 1`, writes the inverse (`< m`) to
+        /// `out` and returns `true`; else returns `false` (`out` then holds
+        /// garbage). `a ≥ m` — including any non-zero limb above the slot,
+        /// which the arithmetic would otherwise drop — is refused the same
+        /// way (`false`), never answered with the inverse of a truncated
+        /// value; reduce a wider operand with `reduceLimbs` first.
+        /// Constant-time in `a` and in the modulus's value up to that
+        /// verdict; the work depends on the modulus's bit length only.
+        ///
         /// Bernstein–Yang divsteps ("Fast constant-time gcd computation and
         /// modular inversion", 2019, §11), one step at a time: `f = m`,
         /// `g = a`, `δ = 1`, and per step
@@ -685,8 +733,8 @@ pub fn DynModint(comptime max_bits: comptime_int) type {
         /// One step at a time costs `O(b)` limb passes per step, `O(b²/64)`
         /// in all — about 6 000 steps of 33-limb passes at 2048 bits. That
         /// is for key setup and provers, not for a per-message hot path
-        /// (batched 62-step transition matrices are the Backlog item).
-        pub fn inverse(self: *const Self, a: *const Elem, out: *Elem) bool {
+        /// (which is why `inverse` now runs on `safegcd`).
+        fn inverseDivsteps(self: *const Self, a: *const Elem, out: *Elem) bool {
             // a < m over all of `Elem`, limbs above the slot included: folded
             // into the verdict, not branched on.
             var t = a.*;
@@ -937,12 +985,19 @@ const Managed = std.math.big.int.Managed;
 
 /// A big.int from an `Elem` (or any limb slice).
 fn toBig(gpa: std.mem.Allocator, v: []const u64) !Managed {
+    // Limb by limb: `Managed.limbs` is `[]usize`, so a memcpy of u64 limbs
+    // would not compile on 32-bit targets.
     var r = try Managed.init(gpa);
     errdefer r.deinit();
-    try r.ensureCapacity(v.len + 1);
-    @memset(r.limbs, 0);
-    @memcpy(r.limbs[0..v.len], v);
-    r.normalize(v.len + 1);
+    var t = try Managed.init(gpa);
+    defer t.deinit();
+    var i = v.len;
+    while (i > 0) {
+        i -= 1;
+        try r.shiftLeft(&r, 64);
+        try t.set(v[i]);
+        try r.add(&r, &t);
+    }
     return r;
 }
 
@@ -1245,6 +1300,68 @@ test "DynModint inverse edges: 1, m−1, 2 and the smallest modulus" {
     try testing.expect(m3.inverse(&two, &y) and y[0] == 2);
 }
 
+test "DynModint inverse (batched safegcd) == inverseDivsteps: verdict and value, 5 widths, edges, non-units, a ≥ m" {
+    const D = DynModint(4096);
+    var prng = std.Random.DefaultPrng.init(0x5afe_9cd1);
+    const rnd = prng.random();
+    // slots L = 4, 4 (2..256 bits), 5→8, 16, 32, 64
+    const sizes = [_]usize{ 2, 3, 64, 65, 200, 256, 1000, 2048, 4000, 4096 };
+    var pairs: usize = 0;
+    var seen_l = [_]bool{false} ** 17;
+    for (sizes) |nbits| {
+        for (0..60) |t| {
+            var mv = randModulus(D, rnd, nbits);
+            var g: u64 = 1; // a known factor of m for the non-coprime rows
+            if (nbits >= 64 and t % 6 == 5) {
+                g = 105;
+                var h = randModulus(D, rnd, nbits - 7);
+                const gv = blk: {
+                    var v = D.zero;
+                    v[0] = g;
+                    break :blk v;
+                };
+                nt.mulLow(D.max_limbs, &mv, &h, &gv);
+                std.crypto.secureZero(u64, &h);
+            }
+            const mod = try D.fromLimbs(&mv);
+            seen_l[mod.L / 4] = true;
+            var a = D.zero;
+            switch (t % 6) {
+                0 => {}, // 0
+                1 => a[0] = 1,
+                2 => { // m − 1
+                    a = mv;
+                    a[0] -= 1;
+                },
+                3 => { // a ≥ m: m itself, or m + 1 when it fits the slot
+                    a = mv;
+                    if (t % 12 == 3 and mod.L < D.max_limbs) a[mod.L] = 1; // a limb above the slot
+                },
+                4 => a = randBelow(D, rnd, &mod), // uniform below 2^(bits−1)
+                else => { // a multiple of g (non-coprime when g > 1)
+                    a[0] = g *% (rnd.int(u32) | 1);
+                    if (nbits < 64) a[0] = 1;
+                },
+            }
+            var y_new: D.Elem = undefined;
+            var y_old: D.Elem = undefined;
+            const ok_new = mod.inverse(&a, &y_new);
+            const ok_old = mod.inverseDivsteps(&a, &y_old);
+            try testing.expectEqual(ok_old, ok_new);
+            if (ok_new) {
+                try testing.expectEqualSlices(u64, &y_old, &y_new);
+                var one = D.zero;
+                one[0] = 1;
+                try testing.expect(D.eql(&mod.mul(&a, &y_new), &one));
+            }
+            if (g > 1 and t % 6 == 5) try testing.expect(!ok_new);
+            pairs += 1;
+        }
+    }
+    try testing.expect(pairs >= 500);
+    for ([_]usize{ 4, 16, 32, 64 }) |l| try testing.expect(seen_l[l / 4]);
+}
+
 test "DynModint inverseOfModulus: m⁻¹ mod n for even and odd n of any width" {
     const D = DynModint(4096);
     const gpa = testing.allocator;
@@ -1399,9 +1516,9 @@ test "DynModint Miller-Rabin witnesses cover [2, m − 2], upper half included (
             const a = mod.witness(rnd, &buf, &mm1);
             for (a[1..]) |w| try testing.expectEqual(@as(u64, 0), w);
             try testing.expect(a[0] >= 2 and a[0] <= m - 2);
-            seen[a[0]] = true;
+            seen[@intCast(a[0])] = true;
         }
-        for (2..m - 1) |v| try testing.expect(seen[v]);
+        for (2..@as(usize, @intCast(m - 1))) |v| try testing.expect(seen[v]);
     }
     // 2^127 − 1: the draws spread over the whole range, about half of them in
     // the upper half [2^126, m − 2] (the old draw never left [2, 2^126)).

@@ -66,6 +66,11 @@ pub const DynModint = @import("dyn.zig").DynModint;
 /// arithmetic no odd modulus carries (`λ = lcm(p − 1, q − 1)`), see `nt.zig`.
 pub const nt = @import("nt.zig");
 
+/// Batched constant-time safegcd (Bernstein–Yang divsteps, 59 per matrix) for
+/// an odd run-time modulus: `Inverter(max_bits).invert` and the lockstep
+/// two-problem `invert2`. `DynModint.inverse` runs on it.
+pub const safegcd = @import("safegcd.zig");
+
 pub const gate = @import("gate.zig");
 pub const asm_core = @import("asm_core.zig");
 pub const limbs = @import("limbs.zig");
@@ -81,6 +86,7 @@ test {
     _ = @import("field.zig");
     _ = @import("dyn.zig");
     _ = @import("nt.zig");
+    _ = @import("safegcd.zig");
     _ = @import("kat_test.zig");
     _ = @import("fuzz_test.zig");
     _ = @import("bench.zig");

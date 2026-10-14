@@ -14,10 +14,20 @@ vectors (see "Verification" below).
 - **P2** — `encryptOaep`/`decryptOaep`: RSAES-OAEP (RFC 8017 §7.1), plus
   the decoupled-hash `encryptOaepH`/`decryptOaepH` (label/digest hash and
   MGF1 hash may differ, e.g. XML-Enc `rsa-oaep` digest=SHA-256/MGF1=SHA-1).
-- **P3** — `signPss`/`verifyPss`: RSASSA-PSS (RFC 8017 §8.1).
+- **P3** — `signPss`/`verifyPss`: RSASSA-PSS (RFC 8017 §8.1); salt
+  recovery `verifyPssAuto`, `maxPssSaltLen`, decoupled MGF1 `signPssH`/`verifyPssH`.
+- **Digests** — `*Prehashed` (comptime hash) and `*Digest` (run-time
+  `HashId`: SHA-1, SHA-2 incl. 512/224, 512/256, SHA-3) sign and verify a
+  digest the caller already holds (Go `SignPKCS1v15(hash, digest)`).
 - **P4** — `fromDer`/`fromPem`/`fromPkcs8`/`fromOpenSSH`: key parsing
   (DER/PEM PKCS#1/PKCS#8/SPKI, and OpenSSH `PROTOCOL.key` incl. bcrypt/
-  aes256-ctr/aes256-cbc encrypted private keys).
+  aes256-ctr/aes256-cbc encrypted private keys); password-protected PKCS#8
+  (PBES2/PBKDF2/AES-CBC, what `openssl genpkey -aes256` writes) through
+  `fromPkcs8Encrypted`/`SecretKey.fromPemEncrypted`. On-disk `n`/`d`/CRT
+  fields are checked against the key derived from `p`, `q`, `e`.
+- **Writing keys** — `toPkcs1Der`/`toSpkiDer`/`toPkcs8Der`/`toPem` and
+  `toPkcs8Encrypted`/`toPemEncrypted`: byte-identical to OpenSSL 3's output
+  for the same key (encrypted: same shape, fresh salt and IV).
 - **P5** — `generate`: keypair generation (probable primes via sieve +
   Miller-Rabin, FIPS 186-5-style constraints).
 - **P6** — `selfSignedCert`: self-signed X.509 v3 certificate generation

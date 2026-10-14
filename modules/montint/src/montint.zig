@@ -1327,12 +1327,19 @@ test "R2 ladder agrees with the doubling reference, bit for bit, on every slot" 
 }
 
 fn bigOf(gpa: std.mem.Allocator, v: []const u64) !std.math.big.int.Managed {
+    // Limb by limb: `Managed.limbs` is `[]usize`, so a memcpy of u64 limbs
+    // would not compile on 32-bit targets.
     var r = try std.math.big.int.Managed.init(gpa);
     errdefer r.deinit();
-    try r.ensureCapacity(v.len + 1);
-    @memset(r.limbs, 0);
-    @memcpy(r.limbs[0..v.len], v);
-    r.normalize(v.len + 1);
+    var t = try std.math.big.int.Managed.init(gpa);
+    defer t.deinit();
+    var i = v.len;
+    while (i > 0) {
+        i -= 1;
+        try r.shiftLeft(&r, 64);
+        try t.set(v[i]);
+        try r.add(&r, &t);
+    }
     return r;
 }
 

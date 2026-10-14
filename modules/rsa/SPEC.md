@@ -373,6 +373,25 @@ version that applied it everywhere added ctgrind contexts to `rsa/keygen` (173 �
     *not now* rather than *never*: it goes into the first protocol module that must send to a
     v1.5-only receiver, not here as a general API.
 
+- **Encrypted keys other than PBES2 + PBKDF2 + AES-CBC** (owner, 2026-10-14):
+  legacy `Proc-Type: 4,ENCRYPTED` / `DEK-Info` PEM (MD5 `EVP_BytesToKey`, DES-EDE3; std has no
+  DES; the format cannot tell a wrong password from a right one — Go deprecates
+  `x509.DecryptPEMBlock` for that), PBES1, and scrypt (see Backlog) are refused with
+  `error.UnsupportedEncryption`.
+- **Multi-prime keys** (RFC 8017 `otherPrimeInfos`): both references deprecate them (Go's
+  multi-prime operations are documented as not constant-time), none are deployed, and the
+  two-prime CRT path's fault check does not extend; version-1 keys are `InvalidDer`.
+- **Changing the blinding default**: the deterministic entry points stay unblinded with
+  `...Blinded` twins (`signPss` always blinds) — Go's posture; the CT modexp and the F3 fault
+  check run either way, and flipping it would break 7+ consumers' signatures.
+- **Baillie-PSW in key generation**: random-witness Miller-Rabin (64 rounds) meets FIPS 186-5
+  B.3.1, as OpenSSL does.
+- **Odd modulus sizes in `generate`**: every deployed size is even.
+- **Hashes without a std type or broken**: MD5, MD2, RIPEMD-160, MD5+SHA-1 in DigestInfo.
+- **RSA-PSS-restricted key OIDs** (1.2.840.113549.1.1.10) in SPKI/PKCS#8: only `rsaEncryption`
+  keys are read and written (Go's PKCS#8 parser takes the same line).
+- **JWK and OpenSSH public-key text** belong to `jwt`/`jwe`/`acme` and `ssh`.
+
 ## Backlog / deferred
 
 - **Performance levers** — ✅ 2026-10-10: (a) done as montint's fixed-`L` kernels, (c) done
@@ -400,8 +419,16 @@ version that applied it everywhere added ctgrind contexts to `rsa/keygen` (173 �
   (`DynModint.isProbablePrime` on both). Also reword the "2^-128 worst case" Miller-Rabin comment
   (witnesses come from the lower half — montint backlog L2). Effort S.
 
-- The OAEP decoupled-hash (digest≠MGF1) configuration has no external KAT — see "Verification"
-  above.
+- ~~The OAEP decoupled-hash (digest≠MGF1) configuration has no external KAT~~ ✅ 2026-10-14:
+  Wycheproof `rsa_oaep_*_mgf1sha*` covers it.
+- **`rsa-pbes2` fuzz: 4 damaged inputs accepted in one 2000-run driver pass** *(2026-10-14,
+  unattributed)*: the same harness in-process (`reachCheck`, 3000 seeds) accepted 0 of 2537
+  damaged inputs; every accepted key passed the write/parse round trip and the F1 field check,
+  so no wrong key came out. Find which octets the parser tolerates (a replay with
+  `RSA_FUZZ_SEEDFILE`, then `RSA_FUZZ=1,<seed>`). Effort S.
+- **scrypt in PBES2** *(owner, 2026-10-14: not now)*: `std.crypto.pwhash.scrypt.kdf` needs an
+  allocator and this module allocates nothing; OpenSSL writes scrypt only on `-scrypt`. An
+  allocator-taking `fromPkcs8EncryptedScrypt` would close it. Effort S.
 - Anything not covered by the phase list above (there is no known scope gap versus RFC 8017 P1–P6
   today; flag here if one is found).
 - ~~**Constant-time key generation and import**~~ *(2026-10-02)*: ✅ 2026-10-03 — `fromPrimes`'s
@@ -416,10 +443,10 @@ version that applied it everywhere added ctgrind contexts to `rsa/keygen` (173 �
   division) and Miller-Rabin's squaring count `s = v2(p − 1)` stay observable for a kept
   prime. Fix: a sieve by multiplication with precomputed reciprocals over the whole table, and
   `p ≡ 3 mod 4` candidates (s = 1) if FIPS 186-5 shape allows. Effort: small–medium. Fits §2.
-- **Wycheproof RSA vectors** *(survey 2026-09-30)*: PKCS#1 v1.5 verify (`rsa_signature_*`), PSS verify and OAEP decrypt are where RSA implementations historically fail (BER-lax parsing, padding-check leaks); today's evidence is OpenSSL-generated valid signatures, not malformed ones. Effort: small–medium (test data, three runners). Fits §2.
+- ~~**Wycheproof RSA vectors**~~ ✅ 2026-10-14 (`src/wycheproof_test.zig`, 2212 vectors, no mismatch). Original text *(survey 2026-09-30)*: PKCS#1 v1.5 verify (`rsa_signature_*`), PSS verify and OAEP decrypt are where RSA implementations historically fail (BER-lax parsing, padding-check leaks); today's evidence is OpenSSL-generated valid signatures, not malformed ones. Effort: small–medium (test data, three runners). Fits §2.
 - **Moduli above 4096 bits** *(survey 2026-09-30)*: `max_modulus_bits = 4096` is a compile-time constant of `std.crypto.ff.Uint`, so an 8192-bit key (rare, but certificates and OpenSSH keys exist) is rejected at parse. Effort: medium (re-instantiate `Uint`/`Modulus`, check the `montint` limb capacity and the stack cost of a `SecretKey`). Fits §2.
-- **Prehashed-digest sign/verify (PKCS#1 v1.5 and PSS)** *(survey 2026-09-30)*: the hash is a comptime type and the message is hashed inside, so a caller that already holds a digest (TLS transcript signatures, HSM/CMS flows, hashes of huge files) cannot use it. Go and OpenSSL offer it. Effort: small. Fits §2.
-- **PSS verify with automatic salt length** *(survey 2026-09-30)*: `verifyPss` needs the salt length; JWT PS256 fixes it, but X.509/CMS signatures carry it in parameters and OpenSSL/Go can recover it. Effort: small. Fits §2.
+- ~~**Prehashed-digest sign/verify (PKCS#1 v1.5 and PSS)**~~ ✅ sign 2026-10-13, verify + run-time `HashId` forms 2026-10-14. Original text *(survey 2026-09-30)*: the hash is a comptime type and the message is hashed inside, so a caller that already holds a digest (TLS transcript signatures, HSM/CMS flows, hashes of huge files) cannot use it. Go and OpenSSL offer it. Effort: small. Fits §2.
+- ~~**PSS verify with automatic salt length**~~ ✅ 2026-10-14 `verifyPssAuto` (+ `maxPssSaltLen`, decoupled MGF1 `signPssH`/`verifyPssH`). Original text *(survey 2026-09-30)*: `verifyPss` needs the salt length; JWT PS256 fixes it, but X.509/CMS signatures carry it in parameters and OpenSSL/Go can recover it. Effort: small. Fits §2.
 
 ## Status
 

@@ -290,3 +290,202 @@ fn pemFromTail(out: []u8, der_len: usize, label: []const u8) MarshalError![]u8 {
     std.debug.assert(o == total);
     return out[0..total];
 }
+
+// ── encrypted PKCS#8: PBES2 with PBKDF2 (RFC 8018 §6.2, A.2, A.4) ───────────
+
+const aescbc = @import("aescbc");
+const Aes192 = @import("aes192").Aes192;
+
+/// 1.2.840.113549.1.5.13 / .12 (RFC 8018 Appendix A.4 / A.2).
+pub const oid_pbes2 = [_]u8{ 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x05, 0x0d };
+pub const oid_pbkdf2 = [_]u8{ 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x05, 0x0c };
+/// 1.2.840.113549.2.x — hmacWithSHA1 (7) … hmacWithSHA512 (11).
+pub const oid_hmac_arc = [_]u8{ 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x02 };
+/// 2.16.840.1.101.3.4.1.x — aes128-CBC (2), aes192-CBC (22), aes256-CBC (42).
+pub const oid_aes_arc = [_]u8{ 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x01 };
+
+/// The PBKDF2 pseudo-random function (PBKDF2-params `prf`).
+pub const Pbes2Prf = enum {
+    hmac_sha1,
+    hmac_sha224,
+    hmac_sha256,
+    hmac_sha384,
+    hmac_sha512,
+
+    pub fn Type(comptime prf: Pbes2Prf) type {
+        const h = std.crypto.auth.hmac;
+        return switch (prf) {
+            .hmac_sha1 => h.HmacSha1,
+            .hmac_sha224 => h.sha2.HmacSha224,
+            .hmac_sha256 => h.sha2.HmacSha256,
+            .hmac_sha384 => h.sha2.HmacSha384,
+            .hmac_sha512 => h.sha2.HmacSha512,
+        };
+    }
+
+    pub fn oidLast(prf: Pbes2Prf) u8 {
+        return 7 + @as(u8, @intFromEnum(prf));
+    }
+
+    pub fn fromOidLast(b: u8) ?Pbes2Prf {
+        if (b < 7 or b > 11) return null;
+        return @enumFromInt(b - 7);
+    }
+};
+
+/// The PBES2 encryption scheme: AES-CBC with PKCS#7 padding (what OpenSSL,
+/// Go's x/crypto users and every other common PBES2 writer use).
+pub const Pbes2Cipher = enum {
+    aes128_cbc,
+    aes192_cbc,
+    aes256_cbc,
+
+    pub fn Aes(comptime c: Pbes2Cipher) type {
+        const aes = std.crypto.core.aes;
+        return switch (c) {
+            .aes128_cbc => aes.Aes128,
+            .aes192_cbc => Aes192,
+            .aes256_cbc => aes.Aes256,
+        };
+    }
+
+    pub fn keyLen(c: Pbes2Cipher) usize {
+        return switch (c) {
+            .aes128_cbc => 16,
+            .aes192_cbc => 24,
+            .aes256_cbc => 32,
+        };
+    }
+
+    pub fn oidLast(c: Pbes2Cipher) u8 {
+        return switch (c) {
+            .aes128_cbc => 0x02,
+            .aes192_cbc => 0x16,
+            .aes256_cbc => 0x2a,
+        };
+    }
+
+    pub fn fromOidLast(b: u8) ?Pbes2Cipher {
+        return switch (b) {
+            0x02 => .aes128_cbc,
+            0x16 => .aes192_cbc,
+            0x2a => .aes256_cbc,
+            else => null,
+        };
+    }
+};
+
+/// The largest PBKDF2 iteration count read or written: 2^20, ~0.3 s of
+/// HMAC-SHA-256 on a desktop core (512× OpenSSL's default of 2048, above
+/// OWASP's 600 000 for SHA-256). A file may name any count up to 2^32 − 1;
+/// without a cap an untrusted key file is a CPU-burning input (the OpenSSH
+/// bcrypt-rounds HANG of 2026-10-09 is the same class).
+pub const max_pbkdf2_iterations: u32 = 1 << 20;
+/// The longest PBKDF2 salt read or written (OpenSSL writes 16).
+pub const max_pbes2_salt_len = 64;
+
+/// Parameters for `SecretKey.toPkcs8Encrypted`; the defaults are OpenSSL 3's
+/// `openssl pkcs8 -topk8` / `genpkey -aes256` output shape.
+pub const Pbes2Options = struct {
+    cipher: Pbes2Cipher = .aes256_cbc,
+    prf: Pbes2Prf = .hmac_sha256,
+    /// 1 ≤ iterations ≤ `max_pbkdf2_iterations`. OpenSSL's default is 2048;
+    /// raise it for keys at rest where the password is the only protection.
+    iterations: u32 = 2048,
+    /// 1 ≤ salt_len ≤ `max_pbes2_salt_len`.
+    salt_len: u8 = 16,
+};
+
+/// Largest `EncryptedPrivateKeyInfo` DER `toPkcs8Encrypted` writes: the
+/// padded PKCS#8 plus at most ~140 bytes of algorithm parameters.
+pub const max_encrypted_pkcs8_der_len = 4 + 4 + 160 + max_pkcs8_der_len + aescbc.block_len;
+pub const max_encrypted_pem_len = pemLen("ENCRYPTED PRIVATE KEY".len, max_encrypted_pkcs8_der_len);
+
+pub const EncryptError = MarshalError || error{InvalidOptions};
+
+fn writeEncrypted(w: *RevWriter, sk: *const SecretKey, password: []const u8, random: std.Random, opts: Pbes2Options) EncryptError!void {
+    if (opts.iterations == 0 or opts.iterations > max_pbkdf2_iterations or
+        opts.salt_len == 0 or opts.salt_len > max_pbes2_salt_len) return error.InvalidOptions;
+
+    // The plaintext PKCS#8, PKCS#7-padded (RFC 8018 §6.1.1 step 4).
+    var plain: [max_pkcs8_der_len + aescbc.block_len]u8 = undefined;
+    defer std.crypto.secureZero(u8, &plain);
+    const n = (try privateDer(sk, .pkcs8, plain[0..max_pkcs8_der_len])).len;
+    const pad = aescbc.block_len - n % aescbc.block_len;
+    @memset(plain[n..][0..pad], @intCast(pad));
+    const padded = plain[0 .. n + pad];
+
+    var salt_buf: [max_pbes2_salt_len]u8 = undefined;
+    const salt = salt_buf[0..opts.salt_len];
+    random.bytes(salt);
+    var iv: [aescbc.block_len]u8 = undefined;
+    random.bytes(&iv);
+    var key: [32]u8 = undefined;
+    defer std.crypto.secureZero(u8, &key);
+    switch (opts.prf) {
+        inline else => |p| std.crypto.pwhash.pbkdf2(key[0..opts.cipher.keyLen()], password, salt, opts.iterations, p.Type()) catch unreachable, // rounds ≥ 1, dk ≤ 32
+    }
+
+    const mark = w.len();
+    // encryptedData OCTET STRING, encrypted straight into place.
+    if (padded.len > w.pos) return error.BufferTooSmall;
+    w.pos -= padded.len;
+    switch (opts.cipher) {
+        inline else => |c| {
+            const A = c.Aes();
+            _ = aescbc.encrypt(A, key[0 .. A.key_bits / 8], iv, padded, w.buf[w.pos..][0..padded.len]) catch unreachable; // aligned, sized
+        },
+    }
+    try w.header(0x04, padded.len);
+
+    // encryptionAlgorithm { pbes2, PBES2-params { keyDerivationFunc, encryptionScheme } }
+    const alg_mark = w.len();
+    const es_mark = w.len();
+    try w.bytes(&iv);
+    try w.header(0x04, iv.len);
+    try w.byte(opts.cipher.oidLast());
+    try w.bytes(&oid_aes_arc);
+    try w.header(0x06, oid_aes_arc.len + 1);
+    try w.close(0x30, es_mark);
+
+    const kdf_mark = w.len();
+    const kp_mark = w.len();
+    if (opts.prf != .hmac_sha1) { // DER omits a DEFAULT value (hmacWithSHA1)
+        const prf_mark = w.len();
+        try w.bytes(&.{ 0x05, 0x00 });
+        try w.byte(opts.prf.oidLast());
+        try w.bytes(&oid_hmac_arc);
+        try w.header(0x06, oid_hmac_arc.len + 1);
+        try w.close(0x30, prf_mark);
+    }
+    try w.integerU32(opts.iterations);
+    try w.bytes(salt);
+    try w.header(0x04, salt.len);
+    try w.close(0x30, kp_mark);
+    try w.bytes(&oid_pbkdf2);
+    try w.header(0x06, oid_pbkdf2.len);
+    try w.close(0x30, kdf_mark);
+    try w.close(0x30, alg_mark); // PBES2-params
+    try w.bytes(&oid_pbes2);
+    try w.header(0x06, oid_pbes2.len);
+    try w.close(0x30, alg_mark); // AlgorithmIdentifier
+    try w.close(0x30, mark);
+}
+
+pub fn encryptedDer(sk: *const SecretKey, password: []const u8, random: std.Random, opts: Pbes2Options, out: []u8) EncryptError![]u8 {
+    var w = RevWriter.init(out);
+    writeEncrypted(&w, sk, password, random, opts) catch |err| {
+        std.crypto.secureZero(u8, out);
+        return err;
+    };
+    return w.finish();
+}
+
+pub fn encryptedPem(sk: *const SecretKey, password: []const u8, random: std.Random, opts: Pbes2Options, out: []u8) EncryptError![]u8 {
+    var w = RevWriter.init(out);
+    writeEncrypted(&w, sk, password, random, opts) catch |err| {
+        std.crypto.secureZero(u8, out);
+        return err;
+    };
+    return pemFromTail(out, w.len(), "ENCRYPTED PRIVATE KEY");
+}

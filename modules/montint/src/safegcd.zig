@@ -8,6 +8,9 @@
 //! `(f, g)` and `(d, e)`. It is `p256/src/modinv.zig` with the limb count
 //! made a runtime (public) value and the modulus a runtime value.
 //!
+//! Moved here from `rsa` on 2026-10-14: `DynModint.inverse` runs on it, and
+//! `rsa` imports it as `montint.safegcd`.
+//!
 //! ## Why this exists (2026-10-10)
 //!
 //! The F2 base blinding of every blinded private op needs `r⁻¹ mod n` for a
@@ -261,8 +264,10 @@ pub fn Inverter(comptime max_bits: usize) type {
             carryNorm(r, k);
         }
 
-        /// `out = x⁻¹ mod m` for an odd modulus `m` of exactly `nbits` bits
-        /// (public) and `0 ≤ x < m`. Returns `false` (and `out` is garbage)
+        /// `out = x⁻¹ mod m` for an odd modulus `m < 2^nbits` (`nbits` public:
+        /// rsa passes the key's prime size, `DynModint.inverse` its slot
+        /// width; any upper bound is correct, a tight one is cheaper) and
+        /// `0 ≤ x < m`. Returns `false` (and `out` is garbage)
         /// iff `x` is not a unit mod `m` — or if the divstep bound ever fell
         /// short, which then reads as "not a unit", never as a wrong inverse.
         /// Constant-time in `x` and in `m`'s value.
@@ -371,10 +376,19 @@ pub fn Inverter(comptime max_bits: usize) type {
 const Managed = std.math.big.int.Managed;
 
 fn bigFromLimbs(gpa: std.mem.Allocator, l: []const u64) !Managed {
-    var r = try Managed.initCapacity(gpa, l.len + 1);
-    @memcpy(r.limbs[0..l.len], l);
-    r.setMetadata(true, l.len);
-    r.normalize(l.len);
+    // Built limb by limb through `set`/`shiftLeft`/`add`: `Managed.limbs` is
+    // `[]usize`, so a `memcpy` of u64 limbs would not compile on 32-bit targets.
+    var r = try Managed.init(gpa);
+    errdefer r.deinit();
+    var t = try Managed.init(gpa);
+    defer t.deinit();
+    var i = l.len;
+    while (i > 0) {
+        i -= 1;
+        try r.shiftLeft(&r, 64);
+        try t.set(l[i]);
+        try r.add(&r, &t);
+    }
     return r;
 }
 
