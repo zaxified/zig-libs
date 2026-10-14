@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-14** — Encoder faster (bench vs google/brotli 1.2.0 at the paired quality: fast 1.47–1.50× → 1.34–1.48×, default 1.47–1.88× → 1.07–1.17×, best 1.05–1.60× → 0.77–0.95×). The match finder is a bucketed hash (each bucket keeps its last 8/32/256 positions) instead of a hash chain, whose walk was a chain of dependent loads; its table is 2^17/2^19/2^20 slots by effort. A block with several literal codes prices its one-code alternative on exact bits instead of writing it, and length codes come from a table. Compressed sizes move by under 0.3 % (`alice29.txt` default 51 467 → 51 536 B); interop fixtures re-blessed by the reference (294 checks, 0 mismatches). No API change.
+
 - **2026-10-14** — Survey refreshed against google/brotli 1.2.0, RFC 9841 and RFC 9842: `## Compared with` updated, gaps R1–R11 filed in *Backlog* (streaming encoder, raw prefix dictionaries and `dcb`, large window, pull reader, serialized dictionaries for decoding, a q11-class `.max` effort). Docs only.
 
 - **2026-10-11** — New `decompressInto(gpa, out, input, options)`: decode into the caller's buffer

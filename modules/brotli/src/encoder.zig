@@ -18,7 +18,8 @@
 //! - **Matches are chosen by the bits they save** (`Matcher.gain`), not by
 //!   length: the literals covered, priced at the block's order-0 entropy,
 //!   minus the distance's cost. Up to 65 535 bytes long; the search depth is
-//!   the effort (`Effort`: 8 / 32 / 256 candidates), one lazy step.
+//!   the effort (`Effort`: 8 / 32 / 256 candidates of a bucketed hash), one
+//!   lazy step.
 //! - **Distance short codes and implicit distances**: the encoder mirrors the
 //!   decoder's ring of the last four distances (`DistRing`) and names a
 //!   distance by its short code (0..15, no extra bits) when it can; a copy at
@@ -65,8 +66,6 @@ const max_store_block = 1 << 24;
 /// byte prefix-code header better; smaller adapts to changing statistics.
 const compressed_block_size = 1 << 20;
 
-const chain_log_max = 20;
-const hash_log_max = 17;
 const min_match = 4;
 /// Longest match searched for. Long runs (a file of zeros) are where a short
 /// cap hurt most: 512 left `zeros` at 651 bytes, 65 535 at 26 (the reference's
@@ -321,8 +320,32 @@ fn indexOf(arr: *const [24]u32, v: u32) usize {
     unreachable;
 }
 
-/// Largest length code whose range contains `len`.
-fn lengthCode(offsets: *const [24]u32, nbits: *const [24]u5, len: u32) ?struct { code: u5, extra: u32, nbits: u5 } {
+/// Largest length code whose range contains `len`. Lengths below
+/// `length_lut_len` (nearly every insert and copy) come from a table built
+/// from the same scan at compile time: the scan per command was 2-3 % of
+/// compression (perf, 2026-10-14).
+fn lengthCode(comptime offsets: *const [24]u32, comptime nbits: *const [24]u5, len: u32) ?LenCode {
+    const lut = comptime lengthLut(offsets, nbits);
+    if (len < length_lut_len) {
+        const i = lut[len];
+        if (i == 0xff) return null;
+        return .{ .code = @intCast(i), .extra = len - offsets[i], .nbits = nbits[i] };
+    }
+    return lengthCodeScan(offsets, nbits, len);
+}
+
+const LenCode = struct { code: u5, extra: u32, nbits: u5 };
+
+const length_lut_len = 1024;
+
+fn lengthLut(comptime offsets: *const [24]u32, comptime nbits: *const [24]u5) [length_lut_len]u8 {
+    @setEvalBranchQuota(100_000);
+    var t: [length_lut_len]u8 = undefined;
+    for (&t, 0..) |*e, len| e.* = if (lengthCodeScan(offsets, nbits, len)) |c| c.code else 0xff;
+    return t;
+}
+
+fn lengthCodeScan(offsets: *const [24]u32, nbits: *const [24]u5, len: u32) ?LenCode {
     var i: usize = 24;
     while (i > 0) {
         i -= 1;
@@ -721,68 +744,77 @@ fn buildAndWriteCode(
 }
 
 // ---------------------------------------------------------------------------
-// Match finding: one hash chain over 4-byte hashes, one lazy step.
+// Match finding: bucketed hash over 4-byte hashes, one lazy step.
+//
+// Each hash bucket keeps the last `depth` positions inserted under it, in a
+// ring of `depth` slots. Until 2026-10-14 this was a hash chain (`head` per
+// hash, `prev` per position), walking up to `depth` links: every link is a
+// load whose address is the previous load's value, so the walk was a chain of
+// dependent cache accesses — half of `find`'s cycles waited on `prev[c]` and
+// on the candidate byte that depends on it (perf, `.default` on text). A
+// bucket names all its candidates at once, so their loads overlap.
 
 const Match = struct { len: u32, dist: u32, gain: f32 };
 
 const Matcher = struct {
-    /// Candidates walked per lookup (`Effort.chainDepth`).
-    chain_depth: usize,
+    /// Slots per bucket = candidates walked per lookup (`Effort.depth`), a
+    /// power of two.
+    depth: u32,
     /// Estimated bits a literal costs in the current block (its order-0
     /// entropy): what a match saves per byte it covers. Set per block.
     lit_cost: f32 = 8,
-    head: []u32,
-    prev: []u32,
-    mask: usize,
+    /// `depth` slots per bucket, positions. A slot is read only when the
+    /// bucket's count says it was written.
+    slots: []u32,
+    /// Positions ever inserted per bucket (the next slot is `count % depth`).
+    count: []u32,
+    depth_log: u5,
     hash_shift: u5,
     data: []const u8,
 
-    const empty: u32 = 0xffff_ffff;
+    fn init(gpa: std.mem.Allocator, data: []const u8, depth: u32, slots_log_max: u5) std.mem.Allocator.Error!Matcher {
+        std.debug.assert(std.math.isPowerOfTwo(depth));
+        const depth_log: u5 = @intCast(std.math.log2_int(u32, depth));
+        // Buckets sized to the input — compressing a few hundred bytes must
+        // not cost a fixed table — and capped so all slots together stay at
+        // `slots_log_max` (a deeper bucket means fewer of them).
+        const bucket_log_max: u5 = slots_log_max - depth_log;
+        var bucket_log: u5 = 8;
+        while (bucket_log < bucket_log_max and (@as(usize, 1) << bucket_log) < data.len) bucket_log += 1;
 
-    fn init(gpa: std.mem.Allocator, data: []const u8, chain_depth: usize) std.mem.Allocator.Error!Matcher {
-        // Both tables are sized to the input: compressing a few hundred bytes
-        // must not cost a fixed half-megabyte of zeroed hash table.
-        var chain_log: u5 = 1;
-        while (chain_log < chain_log_max and (@as(usize, 1) << chain_log) < data.len) chain_log += 1;
-        var hash_log: u5 = 8;
-        while (hash_log < hash_log_max and (@as(usize, 1) << hash_log) < data.len) hash_log += 1;
-
-        const size = @as(usize, 1) << chain_log;
-        const head = try gpa.alloc(u32, @as(usize, 1) << hash_log);
-        errdefer gpa.free(head);
-        // `prev` is left as allocated: `find` reads `prev[c & mask]` only for
-        // a candidate `c` that came out of `head` or `prev`, and `insert(c)`
-        // wrote that slot first. Clearing it cost a byte-wise memset of up to
-        // 4 MiB per call (below).
-        const prev = try gpa.alloc(u32, size);
-        fillEmpty(head);
+        const count = try gpa.alloc(u32, @as(usize, 1) << bucket_log);
+        errdefer gpa.free(count);
+        // `slots` is left as allocated: only the slots a bucket's count
+        // covers are read, and each was written first.
+        const slots = try gpa.alloc(u32, @as(usize, 1) << (bucket_log + depth_log));
+        fillZero(count);
         return .{
-            .chain_depth = chain_depth,
-            .head = head,
-            .prev = prev,
-            .mask = size - 1,
-            .hash_shift = @intCast(32 - @as(u6, hash_log)),
+            .depth = depth,
+            .slots = slots,
+            .count = count,
+            .depth_log = depth_log,
+            .hash_shift = @intCast(32 - @as(u6, bucket_log)),
             .data = data,
         };
     }
 
-    /// `@memset(head, empty)` in 32-byte stores. Zig 0.16 without libc
-    /// lowers `@memset` to `compiler_rt.memset`, which stores one byte at a
-    /// time: 20 % of `fast` compression of 128 KiB (bench 2026-10-11). The
-    /// stores are volatile so LLVM does not turn the loop back into that
-    /// call. Same workaround as `zstd/src/fill.zig`; `fastmem` exports a
-    /// replacement for whole executables. Delete when Zig's memset is
-    /// vectorised (after 0.16) and go back to `@memset`.
-    fn fillEmpty(buf: []u32) void {
+    /// `@memset(buf, 0)` in 32-byte stores. Zig 0.16 without libc lowers
+    /// `@memset` to `compiler_rt.memset`, which stores one byte at a time:
+    /// 20 % of `fast` compression of 128 KiB (bench 2026-10-11). The stores
+    /// are volatile so LLVM does not turn the loop back into that call. Same
+    /// workaround as `zstd/src/fill.zig`; `fastmem` exports a replacement for
+    /// whole executables. Delete when Zig's memset is vectorised (after 0.16)
+    /// and go back to `@memset`.
+    fn fillZero(buf: []u32) void {
         const V = @Vector(8, u32);
-        const v: V = @splat(empty);
+        const v: V = @splat(0);
         const p: [*]volatile u32 = buf.ptr;
         var i: usize = 0;
         while (i + 8 <= buf.len) : (i += 8) {
             const w: *align(4) volatile V = @ptrCast(p + i);
             w.* = v;
         }
-        while (i < buf.len) : (i += 1) p[i] = empty;
+        while (i < buf.len) : (i += 1) p[i] = 0;
     }
 
     /// Length of the common prefix of `data[c..]` and `data[p..]`, at most
@@ -799,8 +831,8 @@ const Matcher = struct {
     }
 
     fn deinit(self: *Matcher, gpa: std.mem.Allocator) void {
-        gpa.free(self.head);
-        gpa.free(self.prev);
+        gpa.free(self.slots);
+        gpa.free(self.count);
         self.* = undefined;
     }
 
@@ -812,8 +844,9 @@ const Matcher = struct {
     fn insert(self: *Matcher, p: usize) void {
         if (p + min_match > self.data.len) return;
         const h = self.hash(p);
-        self.prev[p & self.mask] = self.head[h];
-        self.head[h] = @intCast(p);
+        const n = self.count[h];
+        self.slots[(h << self.depth_log) | (n & (self.depth - 1))] = @intCast(p);
+        self.count[h] = n +% 1;
     }
 
     /// The match's estimated saving in bits: the literals it replaces minus
@@ -837,13 +870,17 @@ const Matcher = struct {
         var best_len: usize = 0;
         var best_dist: usize = 0;
         var best_gain: f32 = 0;
-        var cand = self.head[self.hash(p)];
-        var depth: usize = 0;
-        while (cand != empty and depth < self.chain_depth) : (depth += 1) {
-            const c: usize = cand;
-            if (c >= p) break;
+        const h = self.hash(p);
+        const n = self.count[h];
+        // Newest first; a wrapped count still means a full bucket.
+        const valid = if (n < self.depth) n else self.depth;
+        const bucket = self.slots[h << self.depth_log ..][0..self.depth];
+        var k: u32 = 0;
+        while (k < valid) : (k += 1) {
+            const c: usize = bucket[(n -% 1 -% k) & (self.depth - 1)];
+            if (c >= p) continue;
             const d = p - c;
-            if (d > max_dist) break;
+            if (d > max_dist) break; // older slots are further back still
             // Cheap reject: a candidate that cannot beat `best_len` is skipped
             // before the byte-by-byte compare.
             if (best_len == 0 or self.data[c + best_len] == self.data[p + best_len]) {
@@ -858,9 +895,6 @@ const Matcher = struct {
                     }
                 }
             }
-            const next = self.prev[c & self.mask];
-            if (next != empty and next >= c) break; // stale / cyclic
-            cand = next;
         }
         if (best_len < min_match) return null;
         return .{ .len = @intCast(best_len), .dist = @intCast(best_dist), .gain = best_gain };
@@ -970,6 +1004,8 @@ const LiteralModel = struct {
     ntrees: u8 = 1,
     /// One histogram per literal code.
     counts: [max_literal_trees][tables.num_literal_symbols]u32 = @splat(@splat(0)),
+    /// Every literal of the block in one histogram (the one-code model).
+    single: [tables.num_literal_symbols]u32 = @splat(0),
 };
 
 fn contextId(mode: u2, p1: u8, p2: u8) u6 {
@@ -1162,6 +1198,7 @@ fn clusterLiterals(input: []const u8, start: usize, cmds: []const Cmd, mode: u2,
 /// reference decoder never checked from this side, for no measured gain.
 fn chooseLiteralModel(gpa: std.mem.Allocator, input: []const u8, start: usize, cmds: []const Cmd, effort: Effort, out: *LiteralModel) std.mem.Allocator.Error!void {
     out.* = .{};
+
     var n_lits: u64 = 0;
     var pos = start;
     for (cmds) |c| {
@@ -1169,6 +1206,7 @@ fn chooseLiteralModel(gpa: std.mem.Allocator, input: []const u8, start: usize, c
         n_lits += c.insert_len;
         pos += c.insert_len + c.copy_len;
     }
+    out.single = out.counts[0];
     if (effort == .fast or n_lits < 256) return;
     // Near 8 bits a literal: no context will find structure a single code
     // misses (random or already-compressed bytes).
@@ -1183,7 +1221,9 @@ fn chooseLiteralModel(gpa: std.mem.Allocator, input: []const u8, start: usize, c
         const c = clusterLiterals(input, start, cmds, mode, scratch, &trial);
         if (c < best_cost) {
             best_cost = c;
+            const all = out.single;
             out.* = trial;
+            out.single = all;
         }
     }
 }
@@ -1227,7 +1267,7 @@ fn writeCompressedBlock(
     /// Context-free literals whatever the effort (the real-bits check in
     /// `compressWith`).
     single_literal_code: bool,
-) GiveUp!u8 {
+) GiveUp!BlockResult {
     const n = end - start;
     if (n == 0 or n > max_store_block) return error.EncoderInvariant;
     if (cmds.len == 0) return error.EncoderInvariant;
@@ -1310,12 +1350,16 @@ fn writeCompressedBlock(
     defer gpa.destroy(model);
     try chooseLiteralModel(gpa, input, start, cmds, if (single_literal_code) .fast else effort, model);
     // Every code needs at least one symbol even when unused.
-    for (model.counts[0..model.ntrees]) |*h| {
+    var padded: [max_literal_trees]bool = @splat(false);
+    for (model.counts[0..model.ntrees], 0..) |*h, t| {
         var any = false;
         for (h) |c| {
             if (c != 0) any = true;
         }
-        if (!any) h[0] = 1;
+        if (!any) {
+            h[0] = 1;
+            padded[t] = true;
+        }
     }
 
     // Every alphabet needs at least one symbol even when unused.
@@ -1349,14 +1393,39 @@ fn writeCompressedBlock(
     try w.writeBits(model.mode, 2);
     // The literal context map; the distance map is a single tree (one zero
     // bit, the map implicitly all zeros).
+    const map_from = w.bitPos();
     try writeContextMap(gpa, w, &model.map, model.ntrees);
+    var lit_part = w.bitPos() - map_from;
     try w.writeBits(0, 1);
 
     var lit_codes: [max_literal_trees]Code = undefined;
     var built: usize = 0;
     defer for (lit_codes[0..built]) |*c| c.deinit(gpa);
+    const codes_from = w.bitPos();
     while (built < model.ntrees) : (built += 1) {
         lit_codes[built] = try buildAndWriteCode(gpa, w, &model.counts[built], tables.num_literal_symbols);
+    }
+    lit_part += w.bitPos() - codes_from;
+
+    // With more than one literal code, price the one-code alternative on
+    // exact bits: it differs from this block only in the context map, the
+    // literal code headers and the literal symbols, all known before a
+    // literal is written. `compressWith` writes it only when it is no
+    // longer — rather than writing every such block twice.
+    var single_no_worse = false;
+    if (model.ntrees > 1) {
+        for (model.counts[0..model.ntrees], lit_codes[0..model.ntrees], padded[0..model.ntrees]) |*h, *code, pad| {
+            if (pad) continue;
+            for (h, code.len) |c, l| lit_part += @as(usize, c) * l;
+        }
+        var scratch = BitWriter{ .gpa = gpa };
+        defer scratch.buf.deinit(gpa);
+        try writeContextMap(gpa, &scratch, &.{}, 1);
+        var single_code = try buildAndWriteCode(gpa, &scratch, &model.single, tables.num_literal_symbols);
+        defer single_code.deinit(gpa);
+        var single_part = scratch.bitPos();
+        for (model.single, single_code.len) |c, l| single_part += @as(usize, c) * l;
+        single_no_worse = single_part <= lit_part;
     }
     var cmd_code = try buildAndWriteCode(gpa, w, cmd_counts, tables.num_command_symbols);
     defer cmd_code.deinit(gpa);
@@ -1381,11 +1450,19 @@ fn writeCompressedBlock(
         }
         lit_pos += c.copy_len;
     }
-    return model.ntrees;
+    return .{ .ntrees = model.ntrees, .single_no_worse = single_no_worse };
 }
 
+const BlockResult = struct {
+    /// Literal codes the block used.
+    ntrees: u8,
+    /// With `ntrees > 1`: the same block with one literal code would be no
+    /// longer (exact bits).
+    single_no_worse: bool,
+};
+
 /// `writeCompressedBlock`, with a give-up (not OOM) as null: the caller
-/// stores the block instead. Returns the number of literal codes used.
+/// stores the block instead.
 fn tryBlock(
     gpa: std.mem.Allocator,
     w: *BitWriter,
@@ -1397,7 +1474,7 @@ fn tryBlock(
     ring: *DistRing,
     effort: Effort,
     single_literal_code: bool,
-) std.mem.Allocator.Error!?u8 {
+) std.mem.Allocator.Error!?BlockResult {
     return writeCompressedBlock(gpa, w, input, start, end, cmds, is_last, ring, effort, single_literal_code) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return null,
@@ -1458,7 +1535,16 @@ pub const Effort = enum {
     /// compressed once and served many times.
     best,
 
-    fn chainDepth(e: Effort) usize {
+    /// log2 of all bucket slots together, the match finder's table.
+    fn slotsLog(e: Effort) u5 {
+        return switch (e) {
+            .fast => 17, // SL
+            .default => 19, // SL
+            .best => 20, // SL
+        };
+    }
+
+    fn depth(e: Effort) u32 {
         return switch (e) {
             .fast => 8,
             .default => 32,
@@ -1493,9 +1579,9 @@ pub fn compressWith(gpa: std.mem.Allocator, input: []const u8, opts: CompressOpt
     }
     const max_backward = (@as(usize, 1) << wbits) - 16;
 
-    var matcher = try Matcher.init(gpa, input, opts.effort.chainDepth());
+    var matcher = try Matcher.init(gpa, input, opts.effort.depth(), opts.effort.slotsLog());
     defer matcher.deinit(gpa);
-    const max_dist = @min(max_backward, matcher.mask);
+    const max_dist = max_backward;
 
     var cmds: std.ArrayListUnmanaged(Cmd) = .empty;
     defer cmds.deinit(gpa);
@@ -1527,9 +1613,10 @@ pub fn compressWith(gpa: std.mem.Allocator, input: []const u8, opts: CompressOpt
         // keep whichever is really shorter (a flat, small alphabet is where
         // the estimate overfits: `alpha5_flat` came out 1.4 % larger with
         // contexts than without).
-        // The alternative goes to `alt`, resumed at the same bit, so the
-        // winner is spliced in instead of written a third time.
-        if (first != null and first.? > 1) {
+        // `writeCompressedBlock` prices that alternative on exact bits, so it
+        // is written only when it wins — to `alt`, resumed at the same bit,
+        // and spliced in. The real write still decides (`ctx_end` below).
+        if (first != null and first.?.ntrees > 1 and first.?.single_no_worse) {
             const ctx_end = w.bitPos();
             alt.resumeAt(m);
             var single_ring = ring;
