@@ -124,6 +124,16 @@ pub const StreamWriter = struct {
         try sw.send();
     }
 
+    /// Flush (see `flush`), then `bytes` as metadata meta-blocks (google/
+    /// brotli's `BROTLI_OPERATION_EMIT_METADATA`): carried in the stream,
+    /// skipped by decoders — at most 16 MiB per meta-block, split beyond.
+    /// The output is byte aligned after it.
+    pub fn writeMetadata(sw: *StreamWriter, bytes: []const u8) Writer.Error!void {
+        try sw.writer.flush();
+        sw.core.writeMetadata(bytes) catch |e| return sw.fail(e);
+        try sw.send();
+    }
+
     fn fail(sw: *StreamWriter, e: std.mem.Allocator.Error) Writer.Error {
         sw.err = e;
         return error.WriteFailed;
@@ -424,4 +434,32 @@ test "failures keep their cause: allocation here, or the output's" {
     failing.fail_index = failing.alloc_index;
     try testing.expectError(error.WriteFailed, sw2.writer.writeAll("x" ** 1000));
     try testing.expectEqual(error.OutOfMemory, sw2.err.?);
+}
+
+test "metadata: carried in the stream, skipped by the decoder" {
+    const gpa = testing.allocator;
+    const src = try gpa.alloc(u8, 50_000);
+    defer gpa.free(src);
+    text(src, 0x56);
+    const big = try gpa.alloc(u8, 70_000);
+    defer gpa.free(big);
+    @memset(big, 0xa5);
+    var out: Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var buf: [512]u8 = undefined;
+    var sw: StreamWriter = try .init(gpa, &out.writer, &buf, .{});
+    defer sw.deinit();
+    try sw.writeMetadata("before anything");
+    try sw.writer.writeAll(src[0..20_000]);
+    try sw.writeMetadata("");
+    try sw.writeMetadata(big[0..1]);
+    try sw.writeMetadata(big[0..256]);
+    try sw.writeMetadata(big[0..257]);
+    try sw.writeMetadata(big);
+    try sw.writer.writeAll(src[20_000..]);
+    try sw.finish();
+    try expectRoundTrip(src, out.written());
+    // Every metadata byte is in the stream as written.
+    try testing.expect(std.mem.indexOf(u8, out.written(), "before anything") != null);
+    try testing.expect(std.mem.indexOf(u8, out.written(), big) != null);
 }

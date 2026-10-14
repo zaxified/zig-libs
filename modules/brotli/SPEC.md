@@ -31,7 +31,7 @@ Surveyed 2026-10-14 per `SURVEY-PLAYBOOK.md` (first 2026-09-30); stars and activ
 | [akunaakwei/zig-brotli](https://github.com/akunaakwei/zig-brotli) / [Scythe-Technology/zbrotli](https://github.com/Scythe-Technology/zbrotli) | Zig (wrap C) | zlib / MIT | 1 / 0 | pushed 2026-04-18 / 2026-06-05 | Build-system wrappers or bindings for google/brotli's C — full features, but link C. |
 | Zig `std.compress` | Zig | MIT | — | Zig 0.16.0 | `flate`, `lzma`, `lzma2`, `xz`, `zstd`; **no brotli** (verified: `lib/std/compress/` listing, 2026-10-14). |
 
-**Where we are ahead:** pure Zig with no C, unlike the wrappers; typed errors with an output cap and a ratio bound on by default (google/brotli added an output limit to its Python binding only in 1.2.0); a decoder whose one-shot, into-buffer and streaming forms are checked against each other by a differential fuzz driver and scored by mutation; encoder streams verified by the reference decoder over 45 shapes; `.default` beats q5 on text (51 467 vs 52 809 B). **Where we are behind:** no metadata from the encoder, no `mode`/`size_hint` parameters; no dictionaries (so no `dcb`); no large window; no pull reader; `.best` 9 % behind q11 (→ Backlog R1–R11).
+**Where we are ahead:** pure Zig with no C, unlike the wrappers; typed errors with an output cap and a ratio bound on by default (google/brotli added an output limit to its Python binding only in 1.2.0); a decoder whose one-shot, into-buffer and streaming forms are checked against each other by a differential fuzz driver and scored by mutation; encoder streams verified by the reference decoder over 45 shapes; `.default` beats q5 on text (51 467 vs 52 809 B). **Where we are behind:** no `mode`/`size_hint` parameters; no dictionaries (so no `dcb`); no large window; no pull reader; `.best` 9 % behind q11 (→ Backlog R1–R11).
 
 ## Scope & honesty
 
@@ -173,7 +173,8 @@ larger than its input, and `compress` itself never fails except on allocation.
   decoder has everything written so far; `finish()` ends the stream (last meta-block ISLAST, or the
   empty final one); `reset(output, opts)` starts the next stream on the same match-finder table and
   history (made anew only when the effort or window changes); `err` holds an allocation failure
-  behind `error.WriteFailed` (null when `output` failed).
+  behind `error.WriteFailed` (null when `output` failed); `writeMetadata(bytes)` flushes, then
+  carries `bytes` in metadata meta-blocks a decoder skips (google/brotli's `EMIT_METADATA`).
 - **One encoding logic with `compressWith`** (`encoder.Core`): input is cut into `block_size`
   meta-blocks exactly as the one-shot cuts it, and a block is compressed only once 8 bytes past it
   have arrived (the match finders hash past a block's end, so it sees what the one-shot sees); the
@@ -187,7 +188,8 @@ larger than its input, and `compress` itself never fails except on allocation.
   and the table's positions shifted. Default window 22 bits, as google/brotli.
 - **Anchored externally:** the interop corpus has encoding variants beyond the efforts — windows 10,
   15, 17, 24 one-shot, and two streamed with flushes (at 0, 1, 1 000, 65 536, 100 000; at 12 345 with
-  a 16-bit window) — blessed by google/brotli and replayed like the rest (322 checks, 0 mismatches).
+  a 16-bit window; one with metadata blocks) — blessed by google/brotli and replayed like the rest
+  (326 checks, 0 mismatches).
 
 ## Streaming decoder (`decompressStream`, 2026-09-30)
 
@@ -370,7 +372,7 @@ Order: P (encoder hasher) → R1 (+R3–R5) → R6/R8 → R9 (+R10/R11) → R7 �
 - **R2 `.max` effort ≈ q10/q11** — optimal parse + block splitting (static-dictionary references last), target ≤ 2 % behind q11 on the corpus; plus `Effort.fromQuality(0..11)` for ports from quality-level APIs.
 - **R3 Encoder parameters** — ~~`window_bits` (10..24)~~ **done 2026-10-14** (`CompressOptions.window_bits`, `StreamOptions.window_bits`); left: `mode` (generic/text/font), `size_hint`, literal context modelling on/off.
 - ~~**R4 `maxCompressedSize(n)` + `compressInto(out, …)`**~~ — **DONE 2026-10-14**: `maxCompressedSize(n, opts)` (every block stored + the final empty meta-block; reached exactly by random input, tested over windows and block sizes) and `compressInto(gpa, out, input, opts)` — the `compressWith` stream in the caller's buffer, `error.OutputTooLarge` only when that stream does not fit (tested on the whole corpus × efforts at its exact length and one byte less). A block whose attempt overruns the buffer is decided again in a scratch writer, so a tight buffer never changes the bytes.
-- **R5 Metadata meta-blocks from the encoder** (google's EMIT_METADATA).
+- ~~**R5 Metadata meta-blocks from the encoder**~~ — **DONE 2026-10-14**: `StreamWriter.writeMetadata(bytes)` (google's `EMIT_METADATA`): a flush, then metadata meta-blocks of up to 16 MiB each (shortest MSKIPBYTES); blessed by google/brotli (`stream_metadata` variant).
 - **R6 Raw prefix dictionary (RFC 9841) on both ends + RFC 9842 `dcb` framing** (`ff 44 43 42` + SHA-256 of the dictionary + Shared-Brotli stream, window ≤ 16 MiB) — delta updates of web assets; Chrome ships it.
 - **R7 Serialized shared dictionaries (RFC 9841 §5) — decoder only**: custom word lists, custom transforms incl. ShiftFirst/ShiftAll, context-selected dictionaries, embedded prefix. Encoder side deliberately not (owner 2026-10-14: a research tool only google ships).
 - **R8 Large window (RFC 9841)** — decoder to WBITS 62 on 64-bit targets (30 on 32-bit), encoder option to 30.

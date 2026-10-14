@@ -1879,6 +1879,8 @@ pub const CompressOptions = struct {
 /// RFC 7932 §9.1: WBITS 10..24 (the large window of RFC 9841 is not
 /// supported).
 pub const min_window_bits = 10;
+/// MSKIPLEN's largest value (three bytes).
+const max_metadata_block = 1 << 24;
 pub const max_window_bits = 24;
 
 /// `compress` with options.
@@ -2015,6 +2017,31 @@ pub const Core = struct {
     pub fn flushToByte(c: *Core) std.mem.Allocator.Error!void {
         if (c.w.cnt % 8 != 0) try c.w.writeBits(0b000110, 6);
         try c.w.alignToByte();
+    }
+
+    /// Metadata meta-blocks carrying `bytes` (RFC 7932 §9.2: a decoder
+    /// skips them), at most 2^24 bytes each. Precondition: no meta-block
+    /// open (between `compressBlock`s).
+    pub fn writeMetadata(c: *Core, bytes: []const u8) std.mem.Allocator.Error!void {
+        var rest = bytes;
+        while (true) {
+            const n = @min(rest.len, max_metadata_block);
+            // ISLAST 0, MNIBBLES 0 (code 3), reserved 0.
+            try c.w.writeBits(0b110, 4);
+            // MSKIPBYTES: the fewest bytes MSKIPLEN - 1 fits (a top byte of
+            // zero is invalid), none for an empty block.
+            var nbytes: u6 = 0;
+            if (n != 0) {
+                const v: u32 = @intCast(n - 1);
+                nbytes = if (v < 1 << 8) 1 else if (v < 1 << 16) 2 else 3;
+                try c.w.writeBits(@intCast(nbytes), 2);
+                try c.w.writeBits(v, nbytes * 8);
+            } else try c.w.writeBits(0, 2);
+            try c.w.alignToByte();
+            try c.w.writeBytes(rest[0..n]);
+            rest = rest[n..];
+            if (rest.len == 0) return;
+        }
     }
 
     pub fn setData(c: *Core, data: []const u8) void {

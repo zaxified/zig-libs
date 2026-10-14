@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-14** — New `StreamWriter.writeMetadata(bytes)` (R5): a flush, then metadata meta-blocks (up to 16 MiB each) that decoders skip — google/brotli's `EMIT_METADATA`. Interop corpus: a `stream_metadata` variant, blessed by google/brotli 1.2.0 (326 checks, 0 mismatches). Additive API.
+
 - **2026-10-14** — New `compressInto(gpa, out, input, opts)` (no output allocation; `error.OutputTooLarge` only when the stream `compressWith` gives does not fit) and `maxCompressedSize(n, opts)` (exact: incompressible input reaches it) — R4. Streams unchanged. Additive API.
 
 - **2026-10-14** — New `StreamWriter` (R1): a `std.Io.Writer` that compresses into one stream — `flush` byte-aligns everything so far with an empty metadata meta-block (as google/brotli's flush), `finish` ends the stream, `reset` starts the next on the same table and history; without flushes the bytes `compressWith` gives with the same options. New `CompressOptions.window_bits` (10..24; null keeps the old choice, 16 or 21) and `StreamOptions.window_bits` (default 22); `min_window_bits`/`max_window_bits`. `compressWith` and the stream share one encoder core. Interop corpus: encoding variants (windows 10/15/17/24, two streamed with flushes) blessed by google/brotli 1.2.0 (322 checks, 0 mismatches); the 135 existing streams unchanged. Additive API.

@@ -135,10 +135,10 @@ test "interop replay: the encoder still emits the exact streams google/brotli ac
 // direction — a shape deleted while its blessing lingers — and a capture run
 // that silently produced fewer entries than it meant to.
 
-test "interop replay: coverage canary — 45 shapes x 3 efforts + 14 variant streams blessed, 24 reference streams" {
+test "interop replay: coverage canary — 45 shapes x 3 efforts + 16 variant streams blessed, 24 reference streams" {
     try testing.expectEqual(@as(usize, 45), corpus.shapes.len);
-    try testing.expectEqual(@as(usize, 9), corpus.encodings.len);
-    try testing.expectEqual(@as(usize, 45 * 3 + 14), blessed.entries.len);
+    try testing.expectEqual(@as(usize, 10), corpus.encodings.len);
+    try testing.expectEqual(@as(usize, 45 * 3 + 16), blessed.entries.len);
     try testing.expectEqual(@as(usize, 24), corpus.ref_streams.len);
 
     // Every blessed entry is (encoding, shape), in capture order: a renamed

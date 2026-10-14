@@ -268,6 +268,9 @@ pub const Encoding = struct {
     /// flush after each of these input offsets that the input reaches.
     /// Null: `compressWith`.
     flushes: ?[]const usize = null,
+    /// With `flushes`: metadata meta-blocks (`StreamWriter.writeMetadata`,
+    /// 300 bytes each) at these input offsets, after the flushes there.
+    metadata_at: []const usize = &.{},
     /// The shapes it is blessed on; null: all of them.
     shapes: ?[]const []const u8 = null,
 
@@ -288,6 +291,7 @@ pub const encodings = [_]Encoding{
     .{ .tag = "w24", .effort = "default", .window_bits = 24, .shapes = &.{"block_plus_one"} },
     .{ .tag = "stream", .effort = "default", .window_bits = 22, .block_size = 65_536, .flushes = &.{ 0, 1, 1_000, 65_536, 100_000 }, .shapes = &.{ "empty", "one_byte", "mixed_random_first", "alice_full" } },
     .{ .tag = "stream_fast_w16", .effort = "fast", .window_bits = 16, .block_size = 40_000, .flushes = &.{12_345}, .shapes = &.{ "random_70000", "alice_full" } },
+    .{ .tag = "stream_metadata", .effort = "default", .window_bits = 22, .flushes = &.{}, .metadata_at = &.{ 0, 5_000, 5_000 }, .shapes = &.{ "empty", "alice_full" } },
 };
 
 /// The stream `e` makes of `input`.
@@ -300,12 +304,16 @@ pub fn encode(gpa: std.mem.Allocator, input: []const u8, e: Encoding) ![]u8 {
     var buf: [4093]u8 = undefined;
     var sw: brotli.StreamWriter = try .init(gpa, &out.writer, &buf, .{ .effort = effort, .window_bits = e.window_bits.?, .block_size = e.block_size });
     defer sw.deinit();
+    const meta: [300]u8 = @splat('m');
     var i: usize = 0;
     var f: usize = 0;
+    var m: usize = 0;
     while (true) {
         while (f < flushes.len and flushes[f] == i) : (f += 1) try sw.writer.flush();
+        while (m < e.metadata_at.len and e.metadata_at[m] == i) : (m += 1) try sw.writeMetadata(&meta);
         if (i == input.len) break;
-        const next = if (f < flushes.len) @min(flushes[f], input.len) else input.len;
+        var next = if (f < flushes.len) @min(flushes[f], input.len) else input.len;
+        if (m < e.metadata_at.len) next = @min(next, e.metadata_at[m]);
         const end = @min(next, i + buf.len);
         try sw.writer.writeAll(input[i..end]);
         i = end;
