@@ -44,10 +44,15 @@ pub const StreamOptions = struct {
     /// flush is `compressWith`'s bytes for any input length. More input than
     /// hinted is fine, only searched with a smaller table.
     size_hint: ?usize = null,
+    /// A raw prefix dictionary (as `CompressOptions.dictionary`), copied at
+    /// `init`/`reset` (the caller's bytes are not kept). It stays searchable
+    /// for the whole stream; once the output has slid, a copy from it no
+    /// longer runs on into the output.
+    dictionary: []const u8 = &.{},
 
     fn tableSize(o: StreamOptions) usize {
         const window = @as(usize, 1) << o.window_bits;
-        return @min(window, o.size_hint orelse window);
+        return @min(window, o.size_hint orelse window) + o.dictionary.len;
     }
 };
 
@@ -69,6 +74,8 @@ pub const StreamWriter = struct {
     /// (`hist.items[done..]`).
     hist: std.ArrayListUnmanaged(u8) = .empty,
     done: usize = 0,
+    /// `hist.items[0..dict_len]` is the dictionary (`StreamOptions`).
+    dict_len: usize = 0,
     /// The buffer given at init, for `reset` (`finish` takes it off
     /// `writer`).
     buffer: []u8,
@@ -84,14 +91,27 @@ pub const StreamWriter = struct {
         std.debug.assert(buffer.len != 0);
         var core = try Core.init(gpa, opts.effort, opts.block_size, opts.window_bits, opts.tableSize());
         errdefer core.deinit();
-        try core.writeHeader();
-        return .{
+        var sw: StreamWriter = .{
             .writer = .{ .buffer = buffer, .vtable = &vtable },
             .output = output,
             .core = core,
             .opts = opts,
             .buffer = buffer,
         };
+        errdefer sw.hist.deinit(gpa);
+        try sw.start();
+        return sw;
+    }
+
+    /// The history holds the dictionary, the stream header is written.
+    fn start(sw: *StreamWriter) std.mem.Allocator.Error!void {
+        const d = sw.opts.dictionary;
+        try sw.hist.appendSlice(sw.core.gpa, d);
+        sw.done = d.len;
+        sw.core.setData(sw.hist.items);
+        sw.core.loadDictionary(d.len);
+        sw.dict_len = d.len;
+        try sw.core.writeHeader();
     }
 
     pub fn deinit(sw: *StreamWriter) void {
@@ -118,11 +138,10 @@ pub const StreamWriter = struct {
         }
         sw.opts = opts;
         sw.hist.clearRetainingCapacity();
-        sw.done = 0;
         sw.output = output;
         sw.err = null;
         sw.writer = .{ .buffer = sw.buffer, .vtable = &vtable };
-        try sw.core.writeHeader();
+        try sw.start();
     }
 
     /// End the stream with what is buffered (its last meta-block ISLAST)
@@ -191,14 +210,17 @@ pub const StreamWriter = struct {
         buf.clearRetainingCapacity();
     }
 
-    /// Drop history no copy can reach any more, once there is a window's
-    /// worth of it (so the bytes moved stay about the bytes written).
+    /// Drop output no copy can reach any more, once there is a window's
+    /// worth of it (so the bytes moved stay about the bytes written). A
+    /// dictionary at the history's start stays.
     fn slide(sw: *StreamWriter) void {
         const window = @as(usize, 1) << sw.opts.window_bits;
-        if (sw.done < 2 * window) return;
-        const by = std.mem.alignBackward(usize, sw.done - window, shift_align);
+        const dl = sw.dict_len;
+        const out_done = sw.done - dl;
+        if (out_done < 2 * window) return;
+        const by = std.mem.alignBackward(usize, out_done - window, shift_align);
         const items = sw.hist.items;
-        std.mem.copyForwards(u8, items[0 .. items.len - by], items[by..]);
+        std.mem.copyForwards(u8, items[dl .. items.len - by], items[dl + by ..]);
         sw.hist.items.len -= by;
         sw.done -= by;
         sw.core.shift(by);
@@ -510,5 +532,51 @@ test "size_hint: a table for the input, and compressWith's bytes for a short one
         try sw.reset(&out.writer, .{ .effort = effort, .size_hint = 10 });
         try writeStream(&sw, src, 700, &.{});
         try expectRoundTrip(src, out.written());
+    }
+}
+
+test "a raw prefix dictionary: compressWith's bytes, and every decoder's round trip" {
+    const gpa = testing.allocator;
+    const src = try gpa.alloc(u8, 200_000);
+    defer gpa.free(src);
+    text(src, 0x58);
+    const dict = src[0..30_000];
+    const input = src[20_000..];
+    inline for (.{ encoder.Effort.fast, .default, .best }) |effort| {
+        const plain_one = try encoder.compressWith(gpa, input, .{ .effort = effort, .window_bits = 16 });
+        defer gpa.free(plain_one);
+        const want = try encoder.compressWith(gpa, input, .{ .effort = effort, .window_bits = 16, .dictionary = dict });
+        defer gpa.free(want);
+        // The dictionary is used: smaller than without it.
+        try testing.expect(want.len < plain_one.len);
+        const back = try decoder.decompress(gpa, want, .{ .dictionary = dict });
+        defer gpa.free(back);
+        try testing.expectEqualSlices(u8, input, back);
+        // Without it the stream does not decode to the input.
+        if (decoder.decompress(gpa, want, .{})) |other| {
+            defer gpa.free(other);
+            try testing.expect(!std.mem.eql(u8, input, other));
+        } else |_| {}
+        // Streamed, with the slide past twice a 64 KiB window: the same bytes.
+        var out: Writer.Allocating = .init(gpa);
+        defer out.deinit();
+        var buf: [999]u8 = undefined;
+        const opts: StreamOptions = .{ .effort = effort, .window_bits = 16, .size_hint = input.len, .dictionary = dict };
+        var sw: StreamWriter = try .init(gpa, &out.writer, &buf, opts);
+        defer sw.deinit();
+        try writeStream(&sw, input, 5_000, &.{});
+        try testing.expectEqualSlices(u8, want, out.written());
+        // And after a reset, again.
+        out.clearRetainingCapacity();
+        try sw.reset(&out.writer, opts);
+        try writeStream(&sw, input, 70_000, &.{});
+        try testing.expectEqualSlices(u8, want, out.written());
+        // With flushes: still decodes.
+        out.clearRetainingCapacity();
+        try sw.reset(&out.writer, opts);
+        try writeStream(&sw, input, 3_333, &.{ 1, 10_000, 100_000 });
+        const back2 = try decoder.decompress(gpa, out.written(), .{ .dictionary = dict });
+        defer gpa.free(back2);
+        try testing.expectEqualSlices(u8, input, back2);
     }
 }

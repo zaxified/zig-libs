@@ -385,6 +385,49 @@ fn checkDictDecoderDirection(sh: *Shared) !void {
     }
 }
 
+/// Our stream for `c` at `effort`, if libbrotli decodes it to the input.
+fn blessDict(sh: *Shared, comptime c: corpus.DictCase, comptime effort: []const u8) !?[]u8 {
+    const gpa = sh.ref.gpa;
+    const dict = try c.dict.build(gpa);
+    defer gpa.free(dict);
+    const plain = try c.input.build(gpa);
+    defer gpa.free(plain);
+    const stream = try corpus.encodeDict(gpa, c, @field(brotli.Effort, effort));
+    errdefer gpa.free(stream);
+    const back = sh.decompress(dict, stream, false) catch |e| switch (e) {
+        error.ReferenceRejected => {
+            bad("dict {s} ({s}): libbrotli REFUSED our {d}-byte stream", .{ c.name, effort, stream.len });
+            gpa.free(stream);
+            return null;
+        },
+        else => return e,
+    };
+    defer gpa.free(back);
+    if (!std.mem.eql(u8, back, plain)) {
+        bad("dict {s} ({s}): libbrotli decoded our stream to different bytes", .{ c.name, effort });
+        gpa.free(stream);
+        return null;
+    }
+    ok();
+    return stream;
+}
+
+fn checkDictEncoderDirection(sh: *Shared) !void {
+    const gpa = sh.ref.gpa;
+    inline for (corpus.dict_cases) |c| inline for (corpus.dict_efforts) |effort| {
+        if (try blessDict(sh, c, effort)) |stream| {
+            defer gpa.free(stream);
+            const tag = "dict_" ++ effort;
+            if (frozenFor(c.name, tag)) |frozen| {
+                const d = digestOf(stream);
+                if (frozen.stream_len != stream.len or !std.mem.eql(u8, frozen.stream_sha256, &d)) {
+                    bad("dict {s} ({s}): the encoder no longer emits the stream the fixture pins ({d} -> {d} bytes) — run with --capture", .{ c.name, effort, frozen.stream_len, stream.len });
+                } else ok();
+            } else bad("dict {s} ({s}): no frozen entry — run with --capture", .{ c.name, effort });
+        }
+    };
+}
+
 fn captureDictRefStreams(sh: *Shared) !void {
     const gpa = sh.ref.gpa;
     try std.Io.Dir.cwd().createDirPath(sh.ref.io, ref_dir ++ "/dict");
@@ -430,7 +473,7 @@ fn captureRefStreams(ref: *Ref) !void {
     std.debug.print("wrote {d} reference streams into {s}/ ({d} bytes total)\n", .{ corpus.ref_streams.len, ref_dir, total });
 }
 
-fn captureBlessed(ref: *Ref, provenance: []const u8) !void {
+fn captureBlessed(ref: *Ref, sh: *Shared, provenance: []const u8) !void {
     const gpa = ref.gpa;
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
@@ -493,6 +536,21 @@ fn captureBlessed(ref: *Ref, provenance: []const u8) !void {
 
         try out.print(gpa, "    .{{ .name = \"{s}\", .effort = \"{s}\", .input_len = {d}, .input_sha256 = \"{s}\", .stream_len = {d}, .stream_sha256 = \"{s}\" }},\n", .{
             shape.name, effort, input.len, &digestOf(input), stream.len, &digestOf(stream),
+        });
+    };
+    // Raw-dictionary streams: libbrotli is the judge (`Shared`); the input
+    // digest is of the input alone.
+    inline for (corpus.dict_cases) |c| inline for (corpus.dict_efforts) |effort| {
+        const input = try c.input.build(gpa);
+        defer gpa.free(input);
+        const stream = (try blessDict(sh, c, effort)) orelse {
+            std.debug.print("REFUSING TO CAPTURE: dict '{s}' ({s}) was not blessed by libbrotli\n", .{ c.name, effort });
+            return error.ReferenceRejectedOurStream;
+        };
+        defer gpa.free(stream);
+        blessed_count += 1;
+        try out.print(gpa, "    .{{ .name = \"{s}\", .effort = \"dict_{s}\", .input_len = {d}, .input_sha256 = \"{s}\", .stream_len = {d}, .stream_sha256 = \"{s}\" }},\n", .{
+            c.name, effort, input.len, &digestOf(input), stream.len, &digestOf(stream),
         });
     };
     try out.appendSlice(gpa, "};\n");
@@ -567,7 +625,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         // stale — reporting on that would be reporting on nothing.
         try captureRefStreams(&ref);
         try captureDictRefStreams(&shared);
-        try captureBlessed(&ref, provenance);
+        try captureBlessed(&ref, &shared, provenance);
         std.debug.print("fixtures rewritten — re-run `zig build interop-brotli` to verify them\n", .{});
         return 0;
     }
@@ -575,6 +633,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     try checkEncoderDirection(&ref);
     try checkDecoderDirection(&ref);
     try checkDictDecoderDirection(&shared);
+    try checkDictEncoderDirection(&shared);
     std.debug.print("{d} checks, {d} mismatches, {d} notes\n", .{ checks, failures, notes });
     return if (failures == 0) 0 else 1;
 }

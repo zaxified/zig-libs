@@ -256,6 +256,18 @@ pub fn dictRefFile(comptime c: DictCase, comptime q: u8) []const u8 {
     return std.fmt.comptimePrint("dict/{s}.q{d}.br", .{ c.name, q });
 }
 
+/// Our encoder's stream for a `DictCase` at `effort` (its window, its
+/// dictionary). Blessed as `.name = case`, `.effort = "dict_" ++ effort`.
+pub fn encodeDict(gpa: std.mem.Allocator, comptime c: DictCase, effort: brotli.Effort) ![]u8 {
+    const dict = try c.dict.build(gpa);
+    defer gpa.free(dict);
+    const input = try c.input.build(gpa);
+    defer gpa.free(input);
+    return brotli.compressWith(gpa, input, .{ .effort = effort, .window_bits = c.lgwin, .dictionary = dict });
+}
+
+pub const dict_efforts = [_][]const u8{ "fast", "default", "best" };
+
 const corpusBuild = build;
 
 // ── the reference's own streams ─────────────────────────────────────────────

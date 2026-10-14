@@ -162,6 +162,22 @@ test "interop replay: the encoder still emits the exact streams google/brotli ac
     };
 }
 
+test "interop replay: the encoder still emits the raw-dictionary streams libbrotli accepted" {
+    const gpa = testing.allocator;
+    inline for (corpus.dict_cases) |c| inline for (corpus.dict_efforts) |effort| {
+        const record = comptime frozen(c.name, "dict_" ++ effort);
+        const input = try c.input.build(gpa);
+        defer gpa.free(input);
+        try testing.expectEqualStrings(record.input_sha256, &digestOf(input));
+        const stream = try corpus.encodeDict(gpa, c, @field(brotli.Effort, effort));
+        defer gpa.free(stream);
+        testing.expectEqualStrings(record.stream_sha256, &digestOf(stream)) catch |e| {
+            std.debug.print("dict {s} ({s}): the encoder's output changed; re-bless: zig build interop-brotli -- --capture\n", .{ c.name, effort });
+            return e;
+        };
+    };
+}
+
 // ── count canary ────────────────────────────────────────────────────────────
 //
 // `frozen`'s `@compileError` catches a shape with no blessed entry, but only
@@ -169,10 +185,10 @@ test "interop replay: the encoder still emits the exact streams google/brotli ac
 // direction — a shape deleted while its blessing lingers — and a capture run
 // that silently produced fewer entries than it meant to.
 
-test "interop replay: coverage canary — 45 shapes x 3 efforts + 16 variant streams blessed, 24 reference streams" {
+test "interop replay: coverage canary — 45 shapes x 3 efforts + 16 variant + 15 dictionary streams blessed, 24 reference streams" {
     try testing.expectEqual(@as(usize, 45), corpus.shapes.len);
     try testing.expectEqual(@as(usize, 10), corpus.encodings.len);
-    try testing.expectEqual(@as(usize, 45 * 3 + 16), blessed.entries.len);
+    try testing.expectEqual(@as(usize, 45 * 3 + 16 + corpus.dict_cases.len * corpus.dict_efforts.len), blessed.entries.len);
     try testing.expectEqual(@as(usize, 24), corpus.ref_streams.len);
 
     // Every blessed entry is (encoding, shape), in capture order: a renamed
@@ -190,6 +206,12 @@ test "interop replay: coverage canary — 45 shapes x 3 efforts + 16 variant str
         }
         try testing.expectEqual(if (enc.shapes) |l| l.len else corpus.shapes.len, covered);
     }
+    for (corpus.dict_cases) |c| for (corpus.dict_efforts) |effort| {
+        try testing.expectEqualStrings(c.name, blessed.entries[i].name);
+        try testing.expect(std.mem.startsWith(u8, blessed.entries[i].effort, "dict_"));
+        try testing.expectEqualStrings(effort, blessed.entries[i].effort[5..]);
+        i += 1;
+    };
     try testing.expectEqual(blessed.entries.len, i);
 
     // The multi-meta-block shapes really do straddle the boundary — the point

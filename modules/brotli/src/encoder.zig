@@ -784,6 +784,47 @@ fn buildAndWriteCode(
 
 const Match = struct { len: u32, dist: u32, gain: f32 };
 
+/// Distances an explicit distance code reaches (NPOSTFIX = NDIRECT = 0):
+/// the last code's offset plus its 24 extra bits.
+const max_code_distance = (1 << 26) - 4;
+/// A position no copy can come from (`shift` marks dropped ones with it):
+/// never below the position searched.
+const dropped_pos = std.math.maxInt(u32);
+
+/// A raw prefix dictionary (RFC 9841 §3.2) sits at `data[0..len]`, the
+/// output after it. A copy from the dictionary is named by the decoder's
+/// distance `len + out_max - c` (`out_max` = how far back the output
+/// reaches), and may run on past the dictionary's end only while the output
+/// after it in `data` is what the decoder continues with — its first byte,
+/// before anything was dropped and while all of the output is in reach.
+const Prefix = struct {
+    len: usize = 0,
+    /// Output bytes dropped from `data` (`StreamWriter`'s history slid).
+    dropped: usize = 0,
+
+    /// How far back the output reaches from `p`: the window, or what was
+    /// produced so far.
+    fn outMax(x: Prefix, p: usize, max_dist: usize) usize {
+        return @min(max_dist, p - x.len + x.dropped);
+    }
+
+    /// The decoder's distance to `c` from `p` (`c < len`), and the longest
+    /// copy from there; null beyond what a distance code can name.
+    inline fn reach(x: Prefix, p: usize, c: usize, out_max: usize, max_len: usize) ?struct { d: usize, cap: usize } {
+        const d = x.len + out_max - c;
+        if (d > max_code_distance) return null;
+        const joined = x.dropped == 0 and out_max == p - x.len;
+        return .{ .d = d, .cap = if (joined) max_len else @min(max_len, x.len - c) };
+    }
+
+    /// Positions in the dictionary stay; output ones move down by `by`, or
+    /// become `dropped_pos` when they fall off.
+    fn shiftPos(x: Prefix, s: u32, by: u32) u32 {
+        if (s < x.len or s == dropped_pos) return s;
+        return if (s - x.len < by) dropped_pos else s - by;
+    }
+};
+
 /// log2 of a match finder's buckets for an input of `size` bytes: 2^8 at
 /// least, one per byte up to 2^`max` — compressing a few hundred bytes must
 /// not cost a fixed table.
@@ -812,6 +853,7 @@ const Matcher = struct {
     /// (`buildCommands` keeps it): a copy at one of them is named by a short
     /// code with no extra bits, so it is tried first and priced lower.
     ring: DistRing = .{},
+    prefix: Prefix = .{},
 
     /// Tables for an input of about `size` bytes; `data` is set by the
     /// caller.
@@ -883,11 +925,11 @@ const Matcher = struct {
         self.ring = .{};
     }
 
-    /// `data` lost its first `by` bytes: every position moves down by `by`,
-    /// one that fell off becomes 0 — further back than any search reaches
-    /// (`StreamWriter` keeps a window of history before what it compresses).
+    /// `by` output bytes left `data` (`Prefix.shiftPos`). Only the slots a
+    /// count covers hold positions; the rest are shifted as garbage.
     fn shift(self: *Matcher, by: u32) void {
-        for (self.slots) |*s| s.* -|= by;
+        for (self.slots) |*s| s.* = self.prefix.shiftPos(s.*, by);
+        self.prefix.dropped += by;
     }
 
     fn hash(self: *const Matcher, p: usize) usize {
@@ -967,12 +1009,22 @@ const Matcher = struct {
         while (k < valid) : (k += 1) {
             const c: usize = bucket[(n -% 1 -% k) & (self.depth - 1)];
             if (c >= p) continue;
-            const d = p - c;
-            if (d > max_dist) break; // older slots are further back still
+            var d = p - c;
+            var cap: usize = max_len;
+            if (c < self.prefix.len) {
+                const r = self.prefix.reach(p, c, max_dist, max_len) orelse continue;
+                d = r.d;
+                cap = r.cap;
+            } else if (d > max_dist) {
+                // Older slots are further back still — but for the
+                // dictionary's, which are oldest of all.
+                if (self.prefix.len == 0) break;
+                continue;
+            }
             // Cheap reject: a candidate that cannot beat `best_len` is skipped
             // before the byte-by-byte compare.
             if (best_len == 0 or self.data[c + best_len] == self.data[p + best_len]) {
-                const l = matchLen(self.data, c, p, max_len);
+                const l = matchLen(self.data, c, p, cap);
                 if (l >= min_match) {
                     const g = self.gain(l, d);
                     if (g > best_gain) {
@@ -1025,6 +1077,7 @@ const fast_cost_stride = 4;
 
 const FastMatcher = struct {
     lit_cost: f32 = 8,
+    prefix: Prefix = .{},
     /// `fast_sweep` slots per bucket.
     table: []u32,
     hash_shift: u6,
@@ -1051,7 +1104,8 @@ const FastMatcher = struct {
 
     /// As `Matcher.shift`.
     fn shift(self: *FastMatcher, by: u32) void {
-        for (self.table) |*s| s.* -|= by;
+        for (self.table) |*s| s.* = self.prefix.shiftPos(s.*, by);
+        self.prefix.dropped += by;
     }
 
     /// Bucket of the five bytes at `p`; needs eight readable bytes.
@@ -1089,10 +1143,16 @@ const FastMatcher = struct {
         for (slots) |s| {
             const c: usize = s;
             if (c >= p) continue;
-            const d = p - c;
-            if (d > max_dist or d == best_dist) continue;
+            var d = p - c;
+            var cap: usize = max_len;
+            if (c < self.prefix.len) {
+                const r = self.prefix.reach(p, c, max_dist, max_len) orelse continue;
+                d = r.d;
+                cap = r.cap;
+            } else if (d > max_dist) continue;
+            if (d == best_dist) continue;
             if (self.data[c + best_len] != self.data[p + best_len]) continue;
-            const l = Matcher.matchLen(self.data, c, p, max_len);
+            const l = Matcher.matchLen(self.data, c, p, cap);
             if (l < min_match) continue;
             const dist_bits: f32 = @floatFromInt(std.math.log2_int(usize, d));
             const g = @as(f32, @floatFromInt(l)) * self.lit_cost - dist_bits - 6;
@@ -1139,7 +1199,7 @@ fn buildCommands(
 
     while (p < end) {
         matcher.prefetch(p + 1);
-        const m = pending orelse matcher.find(ring_n, p, @min(max_dist, p), end);
+        const m = pending orelse matcher.find(ring_n, p, matcher.prefix.outMax(p, max_dist), end);
         pending = null;
         if (m == null) {
             matcher.insert(p);
@@ -1148,7 +1208,7 @@ fn buildCommands(
         }
         matcher.insert(p);
         if (p + 1 < end) {
-            if (matcher.find(ring_n, p + 1, @min(max_dist, p + 1), end)) |b| {
+            if (matcher.find(ring_n, p + 1, matcher.prefix.outMax(p + 1, max_dist), end)) |b| {
                 // One literal more is spent to take `b`, so it must save
                 // more than that literal costs on top of what `m` saves.
                 if (b.gain > m.?.gain + matcher.lit_cost) {
@@ -1216,7 +1276,7 @@ fn buildCommandsFast(
 
     while (p < end) {
         matcher.prefetch(p + 1);
-        var m = matcher.find(p, &ring, @min(max_dist, p), end) orelse {
+        var m = matcher.find(p, &ring, matcher.prefix.outMax(p, max_dist), end) orelse {
             matcher.insert(p);
             const run = p - lit_start;
             p += if (run < fast_skip_after) 1 else @min(fast_skip_max, 1 + ((run - fast_skip_after) >> 5));
@@ -1225,7 +1285,7 @@ fn buildCommandsFast(
         if (m.len < fast_lazy_max_len) {
             matcher.insert(p);
             while (p + 1 < end) {
-                const b = matcher.find(p + 1, &ring, @min(max_dist, p + 1), end) orelse break;
+                const b = matcher.find(p + 1, &ring, matcher.prefix.outMax(p + 1, max_dist), end) orelse break;
                 // One literal more is spent to take `b`.
                 if (b.gain <= m.gain + matcher.lit_cost) break;
                 p += 1;
@@ -1563,6 +1623,9 @@ fn writeCompressedBlock(
     /// Context-free literals whatever the effort (the real-bits check in
     /// `compressWith`).
     single_literal_code: bool,
+    /// How much further back than `input`'s start a copy may reach: the
+    /// output dropped before it plus a prefix dictionary.
+    reach: usize,
 ) GiveUp!BlockResult {
     const n = end - start;
     if (n == 0 or n > max_store_block) return error.EncoderInvariant;
@@ -1618,7 +1681,7 @@ fn writeCompressedBlock(
             .has_dist = c.copy_len != 0 and !use_implicit,
         };
         if (c.copy_len != 0) {
-            if (c.dist == 0 or c.dist > lit_pos + c.insert_len) return error.EncoderInvariant;
+            if (c.dist == 0 or c.dist > lit_pos + c.insert_len + reach) return error.EncoderInvariant;
             ring.update(c.dist, short);
         }
         if (r.has_dist) {
@@ -1784,8 +1847,9 @@ fn tryBlock(
     ring: *DistRing,
     effort: Effort,
     single_literal_code: bool,
+    reach: usize,
 ) std.mem.Allocator.Error!?BlockResult {
-    return writeCompressedBlock(gpa, w, input, start, end, cmds, is_last, ring, effort, single_literal_code) catch |e| switch (e) {
+    return writeCompressedBlock(gpa, w, input, start, end, cmds, is_last, ring, effort, single_literal_code, reach) catch |e| switch (e) {
         error.OutOfMemory => {
             // The caller's buffer ran out (`overflowed` stays set for
             // `Core.compressBlock`).
@@ -1878,6 +1942,11 @@ pub const CompressOptions = struct {
     /// back a copy may reach, and how much history a decoder must keep. Null:
     /// 16 for an input of up to 65 520 bytes, else 21.
     window_bits: ?u5 = null,
+    /// A raw prefix dictionary (RFC 9841 §3.2; RFC 9842 `dcb`): bytes copies
+    /// may come from as if they preceded the input; the decoder needs the
+    /// same (`Options.dictionary`). Its positions are searched like the
+    /// input's (the table is sized for both).
+    dictionary: []const u8 = &.{},
 
     pub const default_block_size = compressed_block_size;
 };
@@ -1892,11 +1961,21 @@ pub const max_window_bits = 24;
 /// `compress` with options.
 pub fn compressWith(gpa: std.mem.Allocator, input: []const u8, opts: CompressOptions) std.mem.Allocator.Error![]u8 {
     const wbits: u5 = opts.window_bits orelse if (input.len > 65520) 21 else 16;
-    var core = try Core.init(gpa, opts.effort, opts.block_size, wbits, input.len);
+    var core = try Core.init(gpa, opts.effort, opts.block_size, wbits, input.len + opts.dictionary.len);
     defer core.deinit();
-    core.setData(input);
-    try oneShot(&core, input, opts.block_size);
+    const data = try withDictionary(gpa, input, opts.dictionary);
+    defer if (data.ptr != input.ptr) gpa.free(data);
+    try oneShot(&core, data, opts.dictionary.len, opts.block_size);
     return core.w.buf.toOwnedSlice(gpa);
+}
+
+/// `dict ++ input` (the match finder's one history), or `input` itself.
+fn withDictionary(gpa: std.mem.Allocator, input: []const u8, dict: []const u8) std.mem.Allocator.Error![]const u8 {
+    if (dict.len == 0) return input;
+    const data = try gpa.alloc(u8, dict.len + input.len);
+    @memcpy(data[0..dict.len], dict);
+    @memcpy(data[dict.len..], input);
+    return data;
 }
 
 pub const CompressIntoError = std.mem.Allocator.Error || error{
@@ -1911,12 +1990,13 @@ pub const CompressIntoError = std.mem.Allocator.Error || error{
 /// enough.
 pub fn compressInto(gpa: std.mem.Allocator, out: []u8, input: []const u8, opts: CompressOptions) CompressIntoError![]u8 {
     const wbits: u5 = opts.window_bits orelse if (input.len > 65520) 21 else 16;
-    var core = try Core.init(gpa, opts.effort, opts.block_size, wbits, input.len);
+    var core = try Core.init(gpa, opts.effort, opts.block_size, wbits, input.len + opts.dictionary.len);
     defer core.deinit();
     core.w.buf = .initBuffer(out);
     core.w.fixed = true;
-    core.setData(input);
-    oneShot(&core, input, opts.block_size) catch |e| return if (core.w.overflowed) error.OutputTooLarge else e;
+    const data = try withDictionary(gpa, input, opts.dictionary);
+    defer if (data.ptr != input.ptr) gpa.free(data);
+    oneShot(&core, data, opts.dictionary.len, opts.block_size) catch |e| return if (core.w.overflowed) error.OutputTooLarge else e;
     return core.w.buf.items;
 }
 
@@ -1936,13 +2016,16 @@ pub fn maxCompressedSize(n: usize, opts: CompressOptions) usize {
     return (bits + 2 + 7) / 8;
 }
 
-/// The header, every block of `input`, the end.
-fn oneShot(core: *Core, input: []const u8, block_size: usize) std.mem.Allocator.Error!void {
+/// The header, every block of `data[dict_len..]` (`data[0..dict_len]` is
+/// a raw prefix dictionary), the end.
+fn oneShot(core: *Core, data: []const u8, dict_len: usize, block_size: usize) std.mem.Allocator.Error!void {
+    core.setData(data);
+    core.loadDictionary(dict_len);
     try core.writeHeader();
-    var off: usize = 0;
-    while (off < input.len) {
-        const end = off + @min(input.len - off, block_size);
-        try core.compressBlock(off, end, end == input.len);
+    var off: usize = dict_len;
+    while (off < data.len) {
+        const end = off + @min(data.len - off, block_size);
+        try core.compressBlock(off, end, end == data.len);
         off = end;
     }
     try core.finish();
@@ -2003,6 +2086,22 @@ pub const Core = struct {
         c.* = undefined;
     }
 
+    pub fn prefix(c: *const Core) Prefix {
+        return if (c.effort == .fast) c.matcher.fast.prefix else c.matcher.deep.prefix;
+    }
+
+    /// `data[0..len]` (after `setData`) is a raw prefix dictionary: its
+    /// positions go into the match finder — those whose hashed bytes all lie
+    /// inside it, so the tables do not depend on what follows.
+    pub fn loadDictionary(c: *Core, len: usize) void {
+        const x: Prefix = .{ .len = len };
+        if (c.effort == .fast) c.matcher.fast.prefix = x else c.matcher.deep.prefix = x;
+        var p: usize = 0;
+        while (p + 8 <= len) : (p += 1) {
+            if (c.effort == .fast) c.matcher.fast.insert(p) else c.matcher.deep.insert(p);
+        }
+    }
+
     /// The `bucketLog` `init` gives an effort's tables for `size`.
     pub fn tableLog(effort: Effort, size: usize) u6 {
         return if (effort == .fast) bucketLog(size, fast_bucket_log_max) else bucketLog(size, effort.slotsLog() - std.math.log2_int(u32, effort.depth()));
@@ -2011,6 +2110,9 @@ pub const Core = struct {
     /// Ready for a new stream, as `init` leaves it (the tables kept).
     pub fn reset(c: *Core) void {
         if (c.effort == .fast) c.matcher.fast.reset() else c.matcher.deep.reset();
+        if (c.effort == .fast) {
+            c.matcher.fast.prefix = .{};
+        } else c.matcher.deep.prefix = .{};
         c.data = &.{};
         c.w.buf.clearRetainingCapacity();
         c.w.acc = 0;
@@ -2128,7 +2230,11 @@ pub const Core = struct {
     /// `overflowed`). `ring`: the decoder's ring after it.
     fn writeBest(c: *Core, dst: *BitWriter, dm: BitWriter.Mark, off: usize, end: usize, is_last: bool, ring: *DistRing) std.mem.Allocator.Error!bool {
         var trial = c.ring;
-        const first = (try tryBlock(c.gpa, dst, c.data, off, end, c.cmds.items, is_last, &trial, c.effort, false)) orelse return false;
+        // The block writer sees the output only: literal contexts at its
+        // start are zeros, as the decoder's (a dictionary is not output).
+        const x = c.prefix();
+        const out = c.data[x.len..];
+        const first = (try tryBlock(c.gpa, dst, out, off - x.len, end - x.len, c.cmds.items, is_last, &trial, c.effort, false, x.len + x.dropped)) orelse return false;
         // The context model was chosen on estimated bits. When it split the
         // literals, write the block once more with a single literal code and
         // keep whichever is really shorter (a flat, small alphabet is where
@@ -2141,7 +2247,7 @@ pub const Core = struct {
             const ctx_bits = dst.bitPos() - dm.len * 8;
             c.alt.resumeAt(dm);
             var single_ring = c.ring;
-            const single = try tryBlock(c.gpa, &c.alt, c.data, off, end, c.cmds.items, is_last, &single_ring, c.effort, true);
+            const single = try tryBlock(c.gpa, &c.alt, out, off - x.len, end - x.len, c.cmds.items, is_last, &single_ring, c.effort, true, x.len + x.dropped);
             if (single != null and ctx_bits >= c.alt.bitPos()) {
                 try dst.takeFrom(dm, &c.alt);
                 trial = single_ring;

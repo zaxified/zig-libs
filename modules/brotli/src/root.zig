@@ -92,6 +92,11 @@ pub const StreamWriter = stream_writer.StreamWriter;
 pub const StreamOptions = stream_writer.StreamOptions;
 const stream_writer = @import("stream_writer.zig");
 
+/// `Content-Encoding: dcb` (RFC 9842): the 36-byte header (magic + SHA-256
+/// of the dictionary) and a stream against that raw prefix dictionary —
+/// `dcb.compress`, `dcb.decompress`, `dcb.header`, `dcb.stream`.
+pub const dcb = @import("dcb.zig");
+
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -104,6 +109,7 @@ test {
     _ = @import("interop_replay_test.zig");
     _ = @import("stream_test.zig");
     _ = @import("stream_writer.zig");
+    _ = @import("dcb.zig");
     _ = @import("crafted_test.zig");
 }
 

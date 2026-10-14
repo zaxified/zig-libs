@@ -59,6 +59,13 @@ defer gpa.free(br);
 // for inputs up to 64 KiB, else 21).
 const br_best = try brotli.compressWith(gpa, data, .{ .effort = .best });
 
+// A raw prefix dictionary (RFC 9841), and Content-Encoding: dcb (RFC 9842):
+// the decoder needs the same bytes.
+const delta = try brotli.compressWith(gpa, app_v2_js, .{ .dictionary = app_v1_js });
+const v2 = try brotli.decompress(gpa, delta, .{ .dictionary = app_v1_js });
+const body = try brotli.dcb.compress(gpa, app_v2_js, app_v1_js, .{});  // header + stream
+const back = try brotli.dcb.decompress(gpa, body, app_v1_js, .{});     // DictionaryMismatch?
+
 // Into your own buffer: maxCompressedSize is always enough (exact for
 // incompressible input); a smaller one fails only if the stream does not fit.
 const into = try brotli.compressInto(gpa, buf, data, .{});     // a prefix of buf
