@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-14** — New `StreamOptions.size_hint` (R3): the stream's match-finder table sized for the expected length instead of the window (a short response no longer allocates and clears 1–2 MiB); with the exact length the stream equals `compressWith`'s bytes for any input. `reset` keeps the table while its size stays. Additive API.
+
 - **2026-10-14** — New `StreamWriter.writeMetadata(bytes)` (R5): a flush, then metadata meta-blocks (up to 16 MiB each) that decoders skip — google/brotli's `EMIT_METADATA`. Interop corpus: a `stream_metadata` variant, blessed by google/brotli 1.2.0 (326 checks, 0 mismatches). Additive API.
 
 - **2026-10-14** — New `compressInto(gpa, out, input, opts)` (no output allocation; `error.OutputTooLarge` only when the stream `compressWith` gives does not fit) and `maxCompressedSize(n, opts)` (exact: incompressible input reaches it) — R4. Streams unchanged. Additive API.

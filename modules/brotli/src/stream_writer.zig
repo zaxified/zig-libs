@@ -16,7 +16,8 @@
 //! `BROTLI_OPERATION_FLUSH` does.
 //!
 //! (`compressWith` sizes the match finder's table to its input, the stream
-//! to its window: the same bytes hold for an input of at least the window.)
+//! to its window or `size_hint`: the same bytes hold for an input of at least
+//! the window, or with the input's length as the hint.)
 //!
 //! Memory: the history the window needs, the block being gathered, and the
 //! match finder's table — one allocation each, kept across `reset` (a
@@ -37,6 +38,17 @@ pub const StreamOptions = struct {
     /// kept grows to about twice the window plus a block. 22 is
     /// google/brotli's default.
     window_bits: u5 = 22,
+    /// About how many bytes the stream will carry: the match finder's table
+    /// is sized for that rather than for the window (a short response costs
+    /// a small table). With the input's exact length, the stream without a
+    /// flush is `compressWith`'s bytes for any input length. More input than
+    /// hinted is fine, only searched with a smaller table.
+    size_hint: ?usize = null,
+
+    fn tableSize(o: StreamOptions) usize {
+        const window = @as(usize, 1) << o.window_bits;
+        return @min(window, o.size_hint orelse window);
+    }
 };
 
 /// Bytes past a block that must have arrived before it is compressed: what
@@ -70,7 +82,7 @@ pub const StreamWriter = struct {
     /// history and the match finder's table.
     pub fn init(gpa: std.mem.Allocator, output: *Writer, buffer: []u8, opts: StreamOptions) std.mem.Allocator.Error!StreamWriter {
         std.debug.assert(buffer.len != 0);
-        var core = try Core.init(gpa, opts.effort, opts.block_size, opts.window_bits, @as(usize, 1) << opts.window_bits);
+        var core = try Core.init(gpa, opts.effort, opts.block_size, opts.window_bits, opts.tableSize());
         errdefer core.deinit();
         try core.writeHeader();
         return .{
@@ -89,18 +101,20 @@ pub const StreamWriter = struct {
     }
 
     /// The next stream, to `output` with `opts`: the table and the history
-    /// are kept when the effort and window are the same (else the table is
-    /// made anew). A stream not yet finished
+    /// are kept when the effort and the table's size (window, `size_hint`)
+    /// are the same (else the table is made anew). A stream not yet finished
     /// is abandoned. On an error the writer is unusable until another
     /// successful `reset`.
     pub fn reset(sw: *StreamWriter, output: *Writer, opts: StreamOptions) std.mem.Allocator.Error!void {
-        if (opts.effort != sw.opts.effort or opts.window_bits != sw.opts.window_bits) {
+        std.debug.assert(opts.window_bits >= encoder.min_window_bits and opts.window_bits <= encoder.max_window_bits);
+        if (opts.effort != sw.opts.effort or Core.tableLog(opts.effort, opts.tableSize()) != sw.core.table_log) {
             const gpa = sw.core.gpa;
             sw.core.deinit();
-            sw.core = try Core.init(gpa, opts.effort, opts.block_size, opts.window_bits, @as(usize, 1) << opts.window_bits);
+            sw.core = try Core.init(gpa, opts.effort, opts.block_size, opts.window_bits, opts.tableSize());
         } else {
             sw.core.reset();
             sw.core.block_size = opts.block_size;
+            sw.core.wbits = opts.window_bits;
         }
         sw.opts = opts;
         sw.hist.clearRetainingCapacity();
@@ -462,4 +476,39 @@ test "metadata: carried in the stream, skipped by the decoder" {
     // Every metadata byte is in the stream as written.
     try testing.expect(std.mem.indexOf(u8, out.written(), "before anything") != null);
     try testing.expect(std.mem.indexOf(u8, out.written(), big) != null);
+}
+
+test "size_hint: a table for the input, and compressWith's bytes for a short one too" {
+    const gpa = testing.allocator;
+    const src = try gpa.alloc(u8, 3_000);
+    defer gpa.free(src);
+    text(src, 0x57);
+    var out: Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var buf: [512]u8 = undefined;
+    inline for (.{ encoder.Effort.fast, .default, .best }) |effort| {
+        const want = try encoder.compressWith(gpa, src, .{ .effort = effort, .window_bits = 22 });
+        defer gpa.free(want);
+        out.clearRetainingCapacity();
+        var sw: StreamWriter = try .init(gpa, &out.writer, &buf, .{ .effort = effort, .size_hint = src.len });
+        defer sw.deinit();
+        try writeStream(&sw, src, 700, &.{});
+        try testing.expectEqualSlices(u8, want, out.written());
+        const small = if (effort == .fast) sw.core.matcher.fast.table.len else sw.core.matcher.deep.count.len;
+        // The same hint keeps the table; a bigger one makes a bigger table;
+        // more input than hinted still round-trips.
+        out.clearRetainingCapacity();
+        try sw.reset(&out.writer, .{ .effort = effort, .size_hint = src.len });
+        try writeStream(&sw, src, 700, &.{});
+        try testing.expectEqualSlices(u8, want, out.written());
+        out.clearRetainingCapacity();
+        try sw.reset(&out.writer, .{ .effort = effort, .size_hint = 1 << 20 });
+        // (`.best`'s 256-deep buckets reach their cap of 2^12 at 3 000 bytes.)
+        const big = if (effort == .fast) sw.core.matcher.fast.table.len else sw.core.matcher.deep.count.len;
+        try testing.expect(if (effort == .best) small == big else small < big);
+        out.clearRetainingCapacity();
+        try sw.reset(&out.writer, .{ .effort = effort, .size_hint = 10 });
+        try writeStream(&sw, src, 700, &.{});
+        try expectRoundTrip(src, out.written());
+    }
 }

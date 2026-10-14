@@ -784,6 +784,15 @@ fn buildAndWriteCode(
 
 const Match = struct { len: u32, dist: u32, gain: f32 };
 
+/// log2 of a match finder's buckets for an input of `size` bytes: 2^8 at
+/// least, one per byte up to 2^`max` — compressing a few hundred bytes must
+/// not cost a fixed table.
+fn bucketLog(size: usize, max: u6) u6 {
+    var b: u6 = 8;
+    while (b < max and (@as(usize, 1) << b) < size) b += 1;
+    return b;
+}
+
 const Matcher = struct {
     /// Slots per bucket = candidates walked per lookup (`Effort.depth`), a
     /// power of two.
@@ -812,9 +821,7 @@ const Matcher = struct {
         // Buckets sized to the input — compressing a few hundred bytes must
         // not cost a fixed table — and capped so all slots together stay at
         // `slots_log_max` (a deeper bucket means fewer of them).
-        const bucket_log_max: u5 = slots_log_max - depth_log;
-        var bucket_log: u5 = 8;
-        while (bucket_log < bucket_log_max and (@as(usize, 1) << bucket_log) < size) bucket_log += 1;
+        const bucket_log: u5 = @intCast(bucketLog(size, slots_log_max - depth_log));
 
         const count = try gpa.alloc(u32, @as(usize, 1) << bucket_log);
         errdefer gpa.free(count);
@@ -1026,8 +1033,7 @@ const FastMatcher = struct {
     /// Tables for an input of about `size` bytes; `data` is set by the
     /// caller.
     fn init(gpa: std.mem.Allocator, size: usize, bucket_log_max: u6) std.mem.Allocator.Error!FastMatcher {
-        var bucket_log: u6 = 8;
-        while (bucket_log < bucket_log_max and (@as(usize, 1) << bucket_log) < size) bucket_log += 1;
+        const bucket_log = bucketLog(size, bucket_log_max);
         const table = try gpa.alloc(u32, @as(usize, 1) << bucket_log << std.math.log2_int(u32, fast_sweep));
         Matcher.fillZero(table);
         return .{ .table = table, .hash_shift = @intCast(64 - @as(u7, bucket_log)), .data = &.{} };
@@ -1965,6 +1971,8 @@ pub const Core = struct {
     ring: DistRing = .{},
     /// The last block written was ISLAST.
     emitted_last: bool = false,
+    /// `bucketLog` the tables were made with.
+    table_log: u6,
 
     /// `size`: how much input the match finder's tables are sized for.
     pub fn init(gpa: std.mem.Allocator, effort: Effort, block_size: usize, wbits: u5, size: usize) std.mem.Allocator.Error!Core {
@@ -1982,6 +1990,7 @@ pub const Core = struct {
             .w = .{ .gpa = gpa },
             .alt = .{ .gpa = gpa },
             .scratch = .{ .gpa = gpa },
+            .table_log = tableLog(effort, size),
         };
     }
 
@@ -1992,6 +2001,11 @@ pub const Core = struct {
         c.scratch.buf.deinit(c.gpa);
         c.cmds.deinit(c.gpa);
         c.* = undefined;
+    }
+
+    /// The `bucketLog` `init` gives an effort's tables for `size`.
+    pub fn tableLog(effort: Effort, size: usize) u6 {
+        return if (effort == .fast) bucketLog(size, fast_bucket_log_max) else bucketLog(size, effort.slotsLog() - std.math.log2_int(u32, effort.depth()));
     }
 
     /// Ready for a new stream, as `init` leaves it (the tables kept).

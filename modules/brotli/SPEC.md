@@ -183,6 +183,8 @@ larger than its input, and `compress` itself never fails except on allocation.
   `compressWith` sizes its table to a smaller input), for every write cut and buffer length
   (`stream_writer.zig` tests: three efforts × buffers 1 B–64 KiB × writes 7 B–300 KB, history slid
   under a 64 KiB window).
+- **`size_hint`:** the match finder's table sized for the expected length rather than the window
+  (`.fast` 1 MiB, `.default` 2 MiB at a 22-bit window); `reset` keeps the table while its size stays.
 - **History:** the window plus the block being gathered; once twice the window has been compressed,
   what no copy can reach is dropped (a multiple of 32 bytes, which keeps `FastMatcher`'s slot choice)
   and the table's positions shifted. Default window 22 bits, as google/brotli.
@@ -370,7 +372,7 @@ Order: P (encoder hasher) → R1 (+R3–R5) → R6/R8 → R9 (+R10/R11) → R7 �
 
 - ~~**R1 Streaming encoder**~~ — **DONE 2026-10-14** as `StreamWriter` (§ Streaming encoder): flush / finish / reset, byte-identical to `compressWith` without flushes. Unblocks dynamic `br` in qap (gzip + zstd only today). Left: a block's prefix codes still take short-lived allocations per block (also one-shot) — a warm writer is not allocation-free yet.
 - **R2 `.max` effort ≈ q10/q11** — optimal parse + block splitting (static-dictionary references last), target ≤ 2 % behind q11 on the corpus; plus `Effort.fromQuality(0..11)` for ports from quality-level APIs.
-- **R3 Encoder parameters** — ~~`window_bits` (10..24)~~ **done 2026-10-14** (`CompressOptions.window_bits`, `StreamOptions.window_bits`); left: `mode` (generic/text/font), `size_hint`, literal context modelling on/off.
+- **R3 Encoder parameters** — ~~`window_bits` (10..24)~~ **done 2026-10-14** (`CompressOptions.window_bits`, `StreamOptions.window_bits`); ~~`size_hint`~~ **done 2026-10-14** (`StreamOptions.size_hint`: the table sized for the expected length — a short response no longer clears a 1–2 MiB table — and, given the exact length, the stream is `compressWith`'s bytes for any input). Left, deliberately not now: `mode` (google's text/font hints steer its context-mode choice and NPOSTFIX/NDIRECT; ours picks the context mode by cost per block and has no NPOSTFIX tuning, so a mode would have nothing to steer) and literal context modelling on/off (an effort choice already: `.fast` has none) — wait for a consumer asking.
 - ~~**R4 `maxCompressedSize(n)` + `compressInto(out, …)`**~~ — **DONE 2026-10-14**: `maxCompressedSize(n, opts)` (every block stored + the final empty meta-block; reached exactly by random input, tested over windows and block sizes) and `compressInto(gpa, out, input, opts)` — the `compressWith` stream in the caller's buffer, `error.OutputTooLarge` only when that stream does not fit (tested on the whole corpus × efforts at its exact length and one byte less). A block whose attempt overruns the buffer is decided again in a scratch writer, so a tight buffer never changes the bytes.
 - ~~**R5 Metadata meta-blocks from the encoder**~~ — **DONE 2026-10-14**: `StreamWriter.writeMetadata(bytes)` (google's `EMIT_METADATA`): a flush, then metadata meta-blocks of up to 16 MiB each (shortest MSKIPBYTES); blessed by google/brotli (`stream_metadata` variant).
 - **R6 Raw prefix dictionary (RFC 9841) on both ends + RFC 9842 `dcb` framing** (`ff 44 43 42` + SHA-256 of the dictionary + Shared-Brotli stream, window ≤ 16 MiB) — delta updates of web assets; Chrome ships it.
