@@ -10,7 +10,8 @@
 //! into a fresh file and swaps it in atomically (temp + fsync + rename + dir
 //! fsync) — a crash at any point mid-compaction leaves the old file intact.
 //!
-//! **Durability contract (honest version):** `put`/`delete` return only after
+//! **Durability contract (honest version):** under the default
+//! `SyncPolicy.always`, `put`/`delete` return only after
 //! the record has been written *and* `fsync` has returned, so an acknowledged
 //! write survives an OS crash or power loss — to the extent the platform's
 //! `fsync` actually flushes to stable media (consumer drives with volatile
@@ -22,7 +23,10 @@
 //! mutations are refused, because a failed `fsync` leaves the page cache in
 //! an undefined state (the "fsyncgate" lesson) — reopen to recover. Reads
 //! stay available on a poisoned store (the keydir still describes the last
-//! consistent state).
+//! consistent state). Under `SyncPolicy.none` / `.interval_ms` an acknowledged
+//! write is durable from the next barrier (`sync`, `compact`, `open`, an
+//! interval sync); a crash before it recovers the state after some prefix of
+//! the writes.
 //!
 //! Corruption policy: replay stops at the FIRST bad record (torn or CRC
 //! mismatch) and truncates there. For a genuine torn tail this is exact
@@ -174,9 +178,10 @@ fn encodeRecordExp(buf: []u8, op: u8, expires_at: i64, key: []const u8, value: [
     std.mem.writeInt(u32, buf[0..4], std.hash.Crc32.hash(buf[4..]), .little);
 }
 
-// ── wall clock (expiry only) ─────────────────────────────────────────────────
+// ── clocks (expiry, sync interval) ───────────────────────────────────────────
 
-/// Wall-clock source for key expiry, in milliseconds since the Unix epoch.
+/// Millisecond clock. As `Options.clock` it is the wall clock for key expiry,
+/// in milliseconds since the Unix epoch.
 /// Wall time and not monotonic time, because an expiry is stored on disk and
 /// must still mean the same instant after a reboot, when a monotonic clock
 /// starts over. Read only for keys that carry an expiry: a store that never
@@ -189,16 +194,46 @@ pub const Clock = struct {
     /// `CLOCK_REALTIME`, the production default.
     pub const realtime: Clock = .{ .nowFn = realtimeNowMs };
 
+    /// `CLOCK_MONOTONIC` in ms — `Options.sync_clock`'s default (an
+    /// interval, not an instant: a wall-clock step must not stretch it).
+    pub const monotonic: Clock = .{ .nowFn = monotonicNowMs };
+
     pub fn now(c: Clock) i64 {
         return c.nowFn(c.ctx);
     }
 };
 
 fn realtimeNowMs(_: ?*anyopaque) i64 {
+    return clockNowMs(.REALTIME);
+}
+
+fn monotonicNowMs(_: ?*anyopaque) i64 {
+    return clockNowMs(.MONOTONIC);
+}
+
+fn clockNowMs(id: std.posix.clockid_t) i64 {
     var ts: std.posix.timespec = undefined;
-    if (std.posix.errno(std.posix.system.clock_gettime(.REALTIME, &ts)) != .SUCCESS) return 0;
+    if (std.posix.errno(std.posix.system.clock_gettime(id, &ts)) != .SUCCESS) return 0;
     return @as(i64, @intCast(ts.sec)) * std.time.ms_per_s + @divTrunc(@as(i64, @intCast(ts.nsec)), std.time.ns_per_ms);
 }
+
+/// When `put`/`delete` make their record durable — Bitcask's
+/// `sync_strategy`. See SPEC § "Sync policy".
+pub const SyncPolicy = union(enum) {
+    /// `fsync` before every `put`/`delete` returns: an acknowledged write
+    /// survives a crash. The default (Bitcask's `o_sync`).
+    always,
+    /// Never `fsync` on a write; the OS writes back when it likes. A crash
+    /// can lose acknowledged writes since the last durability barrier —
+    /// `sync`, `compact`, `open` — but never leaves anything but the state
+    /// after some prefix of the writes (Bitcask's default, `none`).
+    none,
+    /// `none`, plus an `fsync` inside the first `put`/`delete` that finds
+    /// at least this many ms (`Options.sync_clock`) gone since the last one —
+    /// no timer thread (Bitcask's `{seconds, N}`, in ms). An idle store keeps
+    /// its last writes un-synced until the next write, `sync` or `close`.
+    interval_ms: u64,
+};
 
 // ── Storage: the injectable seam ─────────────────────────────────────────────
 
@@ -864,6 +899,13 @@ pub const Options = struct {
     /// Wall clock that decides whether an expiring key is still live. Read
     /// only when the store holds expiring keys. See `Clock`.
     clock: Clock = .realtime,
+
+    /// When writes are made durable. See `SyncPolicy`.
+    sync: SyncPolicy = .always,
+
+    /// Monotonic ms source for `SyncPolicy.interval_ms`; read by no other
+    /// policy.
+    sync_clock: Clock = .monotonic,
 };
 
 /// A key's expiry, as `expiresAt` reports it.
@@ -959,6 +1001,11 @@ pub const Db = struct {
     /// Keydir entries that carry an expiry. While it is 0 no operation reads
     /// the clock and `count` stays O(1).
     expiring: usize,
+    /// Records were appended since the last `fsync` of the data file
+    /// (only ever true under `SyncPolicy.none` / `.interval_ms`).
+    unsynced: bool,
+    /// `Options.sync_clock` at the last data-file sync (`.interval_ms` only).
+    last_sync_ms: i64,
 
     const Entry = struct {
         /// Absolute file offset of the record.
@@ -1017,6 +1064,8 @@ pub const Db = struct {
             .options = options,
             .version = version_plain,
             .expiring = 0,
+            .unsynced = false,
+            .last_sync_ms = if (options.sync == .interval_ms) options.sync_clock.now() else 0,
         };
         errdefer gpa.free(self.path);
         self.tmp_path = try std.fmt.allocPrint(gpa, "{s}.compact", .{path});
@@ -1083,11 +1132,14 @@ pub const Db = struct {
         return self;
     }
 
-    /// Close the store and free all memory. Does not sync (every committed
-    /// mutation already was). Releases the cross-process lock — by closing
+    /// Close the store and free all memory. Under `SyncPolicy.always` there
+    /// is nothing to sync; under the other policies un-synced writes get one
+    /// best-effort `fsync` whose error cannot be returned — call `sync` first
+    /// to learn it. Releases the cross-process lock — by closing
     /// the handle that holds it, the same mechanism the kernel applies when
     /// the process dies, so there is no path where a lock outlives its `Db`.
     pub fn close(self: *Db) void {
+        if (self.unsynced and !self.poisoned) self.store.sync(self.file) catch {};
         self.store.close(self.file);
         if (self.lock_file) |lh| self.store.close(lh);
         self.freeKeydir();
@@ -1097,9 +1149,11 @@ pub const Db = struct {
         self.* = undefined;
     }
 
-    /// Insert or overwrite `key`. Durable when this returns: the record has
-    /// been appended AND fsync'd (see the module doc for what fsync can and
-    /// cannot promise). On a storage error the store poisons itself.
+    /// Insert or overwrite `key`. Under `SyncPolicy.always` (the default)
+    /// durable when this returns: the record has been appended AND fsync'd
+    /// (see the module doc for what fsync can and cannot promise); under the
+    /// other policies at the next sync (`SyncPolicy`, `sync`). On a storage
+    /// error the store poisons itself.
     /// Overwriting an expiring key removes its expiry.
     pub fn put(self: *Db, key: []const u8, value: []const u8) MutateError!void {
         self.lock.acquire();
@@ -1162,14 +1216,7 @@ pub const Db = struct {
         }
         errdefer if (new_key) |k| self.gpa.free(k);
 
-        self.store.writeAll(self.file, rec, self.end) catch |e| {
-            self.poisoned = true;
-            return e;
-        };
-        self.store.sync(self.file) catch |e| {
-            self.poisoned = true;
-            return e;
-        };
+        try self.appendLocked(rec);
 
         const entry = Entry{ .off = self.end, .key_len = @intCast(key.len), .val_len = @intCast(value.len), .expires_at = expires_at };
         if (existing) |e| {
@@ -1199,20 +1246,54 @@ pub const Db = struct {
         defer self.gpa.free(rec);
         encodeRecord(rec, op_del, key, "");
 
-        self.store.writeAll(self.file, rec, self.end) catch |e| {
-            self.poisoned = true;
-            return e;
-        };
-        self.store.sync(self.file) catch |e| {
-            self.poisoned = true;
-            return e;
-        };
+        try self.appendLocked(rec);
 
         self.dead_bytes += existing.recLen() + rec_len;
         if (existing.expires()) self.expiring -= 1;
         const kv = self.keydir.fetchRemove(key).?;
         self.gpa.free(@constCast(kv.key));
         self.end += rec_len;
+    }
+
+    /// Append `rec` at the end of the log and sync it as `Options.sync`
+    /// says. Poisons the store on any storage error. Caller holds the lock
+    /// and advances `end` afterwards.
+    fn appendLocked(self: *Db, rec: []const u8) MutateError!void {
+        self.store.writeAll(self.file, rec, self.end) catch |e| {
+            self.poisoned = true;
+            return e;
+        };
+        self.unsynced = true;
+        const due = switch (self.options.sync) {
+            .always => true,
+            .none => false,
+            .interval_ms => |ms| self.options.sync_clock.now() -| self.last_sync_ms >= ms,
+        };
+        if (due) try self.syncLocked();
+    }
+
+    fn syncLocked(self: *Db) MutateError!void {
+        self.store.sync(self.file) catch |e| {
+            self.poisoned = true;
+            return e;
+        };
+        self.markSynced();
+    }
+
+    fn markSynced(self: *Db) void {
+        self.unsynced = false;
+        if (self.options.sync == .interval_ms) self.last_sync_ms = self.options.sync_clock.now();
+    }
+
+    /// Make every acknowledged write durable now (`fsync`) — Bitcask's
+    /// `sync/1`. A no-op when nothing is un-synced, so under
+    /// `SyncPolicy.always` it never touches the disk. A sync error poisons
+    /// the store like a write error: what reached the media is unknown.
+    pub fn sync(self: *Db) MutateError!void {
+        self.lock.acquire();
+        defer self.lock.release();
+        if (self.poisoned) return error.Poisoned;
+        if (self.unsynced) try self.syncLocked();
     }
 
     /// The keydir entry of `key` if it is live now. Caller holds the lock.
@@ -1465,6 +1546,8 @@ pub const Db = struct {
         self.end = new_end;
         self.dead_bytes = 0;
         self.version = version;
+        // The new file was synced before the rename: a durability barrier.
+        self.markSynced();
     }
 
     // ── internals ───────────────────────────────────────────────────────────
@@ -1955,6 +2038,92 @@ test "keys: out-of-memory mid-listing frees what it copied" {
         } else |e| try testing.expectEqual(error.OutOfMemory, e);
     }
     try testing.expect(fail_index > 4);
+}
+
+/// Crash the simulated machine at the next side effect (a put that never
+/// returns), reboot and reopen.
+fn crashAndReopen(sim: *SimStorage, db: *Db, options: Options) !Db {
+    sim.ops_until_crash = 0;
+    try testing.expectError(error.Crashed, db.put("crash", "x"));
+    db.close();
+    sim.reboot();
+    return Db.open(testing.allocator, sim.storage(), "db", options);
+}
+
+test "sync policy: .none acknowledges without fsync; sync() is the barrier" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    const options: Options = .{ .sync = .none };
+    var db = try Db.open(testing.allocator, sim.storage(), "db", options);
+    try db.put("a", "1");
+    try db.sync();
+    try db.put("b", "2");
+    try db.delete("a");
+    try expectGet(&db, "b", "2"); // acknowledged and served
+    db = try crashAndReopen(&sim, &db, options);
+    // The crash took the un-synced put and delete; the synced put stayed.
+    try expectGet(&db, "a", "1");
+    try expectGet(&db, "b", null);
+    db.close();
+}
+
+test "sync policy: .always is the default and sync() then does no I/O" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var db = try Db.open(testing.allocator, sim.storage(), "db", .{});
+    try db.put("a", "1");
+    const before = sim.ops_seen;
+    try db.sync();
+    try testing.expectEqual(before, sim.ops_seen);
+    db = try crashAndReopen(&sim, &db, .{});
+    try expectGet(&db, "a", "1");
+    db.close();
+}
+
+test "sync policy: .interval_ms syncs inside the first write past the interval" {
+    const Fake = struct {
+        var now: i64 = 0;
+        fn read(_: ?*anyopaque) i64 {
+            return now;
+        }
+    };
+    Fake.now = 1000;
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    const options: Options = .{ .sync = .{ .interval_ms = 100 }, .sync_clock = .{ .nowFn = Fake.read } };
+    var db = try Db.open(testing.allocator, sim.storage(), "db", options);
+    try db.put("a", "1"); // 0 ms since open: no sync
+    Fake.now = 1099;
+    try db.put("b", "2"); // 99 ms: no sync
+    Fake.now = 1100;
+    try db.put("c", "3"); // 100 ms: syncs a, b, c
+    Fake.now = 1150;
+    try db.put("d", "4"); // 50 ms since that sync: no sync
+    db = try crashAndReopen(&sim, &db, options);
+    try expectGet(&db, "a", "1");
+    try expectGet(&db, "b", "2");
+    try expectGet(&db, "c", "3");
+    try expectGet(&db, "d", null);
+    db.close();
+}
+
+test "sync policy: close syncs what .none left un-synced; a poisoned store refuses sync" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    {
+        var db = try Db.open(testing.allocator, sim.storage(), "db", .{ .sync = .none });
+        try db.put("a", "1");
+        db.close();
+    }
+    // A crash at the next side effect (the reopen's lock) must not take "a".
+    sim.ops_until_crash = 0;
+    try testing.expectError(error.Crashed, Db.open(testing.allocator, sim.storage(), "db", .{}));
+    sim.reboot();
+    var db = try Db.open(testing.allocator, sim.storage(), "db", .{ .sync = .none });
+    try expectGet(&db, "a", "1");
+    db.poisoned = true;
+    try testing.expectError(error.Poisoned, db.sync());
+    db.close();
 }
 
 test "persistence: close and reopen recovers everything" {

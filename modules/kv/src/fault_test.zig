@@ -43,6 +43,8 @@ const Step = union(enum) {
     compact,
     /// `putExpiring` at `at` against `test_clock` (fixed at `test_now`).
     put_exp: struct { k: []const u8, v: []const u8, at: i64 },
+    /// `Db.sync` — a durability barrier under `SyncPolicy.none`.
+    sync,
 };
 
 /// The sweep's wall clock never moves: an expiry is either past or future
@@ -111,7 +113,7 @@ const Model = struct {
         for (steps) |s| switch (s) {
             .put => |p| try m.map.put(gpa, p.k, p.v),
             .del => |k| _ = m.map.swapRemove(k),
-            .compact => {},
+            .compact, .sync => {},
             .put_exp => |p| if (p.at > test_now)
                 try m.map.put(gpa, p.k, p.v)
             else {
@@ -138,8 +140,12 @@ fn runScript(sim: *SimStorage) RunOutcome {
 }
 
 fn runSteps(sim: *SimStorage, steps: []const Step) RunOutcome {
+    return runStepsWith(sim, steps, test_options);
+}
+
+fn runStepsWith(sim: *SimStorage, steps: []const Step, options: kv.Options) RunOutcome {
     const st = sim.storage();
-    var db = Db.open(testing.allocator, st, db_name, test_options) catch |e| switch (e) {
+    var db = Db.open(testing.allocator, st, db_name, options) catch |e| switch (e) {
         error.Crashed => return .{ .completed = 0, .crashed = true },
         else => std.debug.panic("workload open failed with {t}, not a crash", .{e}),
     };
@@ -150,6 +156,7 @@ fn runSteps(sim: *SimStorage, steps: []const Step) RunOutcome {
             .del => |k| db.delete(k),
             .compact => db.compact(),
             .put_exp => |p| db.putExpiring(p.k, p.v, p.at),
+            .sync => db.sync(),
         };
         result catch |e| switch (e) {
             error.Crashed => return .{ .completed = i, .crashed = true },
@@ -296,6 +303,108 @@ test "fault-injection sweep: expiring puts, the v1→v2 upgrade and expiry-dropp
             }
         }
     }
+    try testing.expect(holes > 0);
+}
+
+/// The `SyncPolicy.none` workload: un-synced runs of writes ended by the
+/// three durability barriers — `sync`, `compact`, and nothing (the tail).
+const nosync_script = [_]Step{
+    .{ .put = .{ .k = "alpha", .v = "1" } },
+    .{ .put = .{ .k = "beta", .v = "two" } },
+    .{ .put = .{ .k = "", .v = "empty-key" } },
+    .sync,
+    .{ .put = .{ .k = "alpha", .v = "1-overwritten" } },
+    .{ .del = "beta" },
+    .{ .put = .{ .k = "delta", .v = big_value } },
+    .{ .put = .{ .k = "gamma", .v = "" } },
+    .compact,
+    .{ .put = .{ .k = "epsilon", .v = "5" } },
+    .{ .del = "alpha" },
+    .{ .put = .{ .k = "beta", .v = "resurrected" } },
+    .sync,
+    .sync, // nothing un-synced: no I/O
+    .{ .put = .{ .k = "eta", .v = "7" } },
+    .{ .put = .{ .k = "theta", .v = "8888" } },
+    .{ .del = "eta" },
+    .{ .put = .{ .k = "theta", .v = "8" } },
+};
+
+/// Recovery under `SyncPolicy.none`: the state after SOME prefix of the
+/// steps, no shorter than the last completed barrier (`sync`/`compact`) and
+/// no longer than the completed steps plus the one in flight. Returns the
+/// prefix length that matched.
+fn verifyPrefix(sim: *SimStorage, steps: []const Step, outcome: RunOutcome, options: kv.Options) !usize {
+    sim.reboot();
+    var db = try Db.open(testing.allocator, sim.storage(), db_name, options);
+    defer db.close();
+
+    var barrier: usize = 0;
+    for (steps[0..outcome.completed], 0..) |s, i| switch (s) {
+        .sync, .compact => barrier = i + 1,
+        else => {},
+    };
+    const longest = if (outcome.crashed and outcome.completed < steps.len) outcome.completed + 1 else outcome.completed;
+    var n = longest + 1;
+    while (n > barrier) {
+        n -= 1;
+        var m: Model = .{};
+        defer m.deinit(testing.allocator);
+        try m.apply(testing.allocator, steps[0..n]);
+        if (try matchesModel(&db, &m)) break;
+    } else return error.TestUnexpectedResult;
+
+    try db.put("post-crash-probe", "alive");
+    try db.sync();
+    return n;
+}
+
+test "fault-injection sweep: SyncPolicy.none recovers a prefix no older than the last barrier" {
+    const options: kv.Options = .{ .clock = test_clock, .sync = .none };
+    var total: usize = 0;
+    {
+        var sim = SimStorage.init(testing.allocator);
+        defer sim.deinit();
+        const out = runStepsWith(&sim, &nosync_script, options);
+        try testing.expect(!out.crashed);
+        total = sim.ops_seen;
+        try testing.expectEqual(nosync_script.len, try verifyPrefix(&sim, &nosync_script, out, options));
+    }
+    try testing.expect(total >= 30);
+
+    // Teeth: acknowledged-but-unsynced writes must be lost at some crash
+    // point (else the policy still syncs every write), and kept at others.
+    var lost_acked: usize = 0;
+    var kept_unsynced: usize = 0;
+    var holes: usize = 0;
+    for ([_]CrashMode{ .lose_unsynced, .keep_unsynced, .torn_tail, .reorder_unsynced }) |mode| {
+        for ([_]u64{ 1, 2, 3 }) |seed| {
+            if (mode != .reorder_unsynced and seed != 1) continue;
+            var point: usize = 0;
+            while (point < total) : (point += 1) {
+                var sim = SimStorage.init(testing.allocator);
+                defer sim.deinit();
+                sim.crash_mode = mode;
+                sim.reorder_seed = seed;
+                sim.ops_until_crash = point;
+                const out = runStepsWith(&sim, &nosync_script, options);
+                // The last point is `close`'s best-effort sync: it crashes
+                // after every step has returned.
+                try testing.expect(out.crashed or sim.crashed);
+                holes += sim.holes_punched;
+                const got = verifyPrefix(&sim, &nosync_script, out, options) catch |e| {
+                    std.debug.print(
+                        "no-sync sweep FAILED: mode={t} seed={d} crash_point={d}/{d} completed_steps={d}\n",
+                        .{ mode, seed, point, total, out.completed },
+                    );
+                    return e;
+                };
+                if (got < out.completed) lost_acked += 1;
+                if (mode == .keep_unsynced and got >= out.completed) kept_unsynced += 1;
+            }
+        }
+    }
+    try testing.expect(lost_acked > 0);
+    try testing.expect(kept_unsynced > 0);
     try testing.expect(holes > 0);
 }
 

@@ -162,6 +162,33 @@ and a listing serves only recovery and tooling (rebuilding that record, finding 
   (the explicit `expires_at` compare in `read_verify`) is equivalent — the CRC over the field
   catches the same rot.
 
+## Sync policy
+
+`Options.sync` (2026-10-14, S2 survey R1) is Bitcask's `sync_strategy`: `.always` (default — fsync
+per `put`/`delete`, the contract every consumer was written against), `.none` (Bitcask's default:
+no fsync on writes) and `.interval_ms` (fsync inside the first write that finds the interval gone
+since the last sync — Bitcask's `{seconds, N}`; no timer thread, an idle store waits for the next
+write, `sync` or `close`). `Db.sync()` is `bitcask:sync/1`: a no-op with nothing un-synced, and a
+sync error poisons like a write error.
+
+- **What a crash may do under `.none`:** lose acknowledged writes back to the last durability
+  barrier — `sync`, `compact` (the new file is synced before the rename), `open`, an interval
+  sync — and nothing else: the recovered state is the state after some prefix of the writes.
+  Holds because the log is append-only over the durable prefix and replay stops at the first
+  torn record or hole (§ Backlog, out-of-order durability), so a later record that persisted past
+  a lost earlier one is truncated, never adopted.
+- **`close`** syncs un-synced writes best-effort (`close` returns `void`); `sync` first is the way
+  to learn the outcome. A poisoned store is not synced on close.
+- **Interval clock:** `Options.sync_clock`, default `CLOCK_MONOTONIC` — an interval, not an
+  instant; read only under `.interval_ms`.
+- **Tests:** `fault_test.zig` "SyncPolicy.none recovers a prefix no older than the last barrier"
+  — un-synced runs ended by `sync`, `compact` and the tail, crashed at every injection point in
+  all four modes (reorder over three seeds); recovery must equal the model after a prefix between
+  the last completed barrier and the in-flight step, with teeth: acknowledged writes lost at some
+  points, kept at others, real holes punched. Unit tests for `.always`/no-op `sync`,
+  `.interval_ms` with an injected clock, `close`'s sync and poisoned `sync`. Mutants
+  "`.none` syncs every write" and "close does not sync" each turn a test red (2026-10-14).
+
 ## Threat model / out of scope
 
 Reliability, not adversarial security:
@@ -285,6 +312,7 @@ self-test (≥10/12 runs catch a data-losing recovery). Run: `zig build test-kv`
 - **Data-file rotation / multi-file log** *(survey 2026-09-30)* — one ever-growing file means compaction rewrites everything; Bitcask merges sealed files incrementally. Effort: large (format v2, manifest). Fits §2.
 - **Atomic batch write** *(survey 2026-09-30)* — several puts/deletes that commit together with one fsync (also cuts fsync cost). Effort: medium (batch record framing, recovery all-or-nothing). Fits §2.
 - ~~**Per-key expiry (TTL)**~~ *(survey 2026-09-30)* — **DONE 2026-09-30**, see § "Key expiry". Not built: expiry in the background (a timer thread dropping keys) — `compact` is the caller's already, and an expired key costs only memory and disk until then.
+- ~~**Sync policy**~~ *(S2 survey 2026-10-14, R1)* — **DONE 2026-10-14**, see § "Sync policy".
 - **Reader concurrency without a spinlock across fsync** *(survey 2026-09-30)* — already noted under Concurrency; a hot multi-thread server burns CPU. Effort: medium (rwlock or lockless keydir reads). Fits §2.
 
 ## Status

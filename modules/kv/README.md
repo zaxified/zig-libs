@@ -37,7 +37,7 @@ var fs_store = kv.FsStorage.init(threaded.io(), dir); // dir: std.Io.Dir
 var db = try kv.Db.open(gpa, fs_store.storage(), "app.kv", .{});
 defer db.close();
 
-try db.put("key", "value");        // durable (fsync'd) when this returns
+try db.put("key", "value");        // durable (fsync'd) when this returns (default policy)
 const v = try db.get(gpa, "key");  // ?[]u8, caller frees; error.Corrupt never serves bad bytes
 
 // Allocation-free read into a reused buffer (same locking + CRC check):
@@ -59,6 +59,12 @@ for (ks.keys) |k| _ = k;
 try db.putTtl("sess:ab12", "…", 30 * 60 * 1000);      // absent 30 min from now
 try db.putExpiring("otp:42", "…", deadline_ms);        // absent from deadline_ms on
 _ = db.expiresAt("sess:ab12");                         // ?Expiry: .never / .at_ms
+
+// Bitcask-style sync policies (default .always = fsync per write):
+var fast = try kv.Db.open(gpa, fs_store.storage(), "cache.kv", .{ .sync = .none });
+try fast.put("k", "v");            // acknowledged, durable at the next barrier
+try fast.sync();                   // the barrier (also: compact, close best-effort)
+// .{ .sync = .{ .interval_ms = 1000 } }: fsync inside the first write ≥ 1 s after the last
 ```
 
 Expired keys are absent to `get`, `exists`, `count` and `keys` at once; `open`
@@ -71,7 +77,9 @@ Options: `read_verify` (default true) re-checks the whole record CRC on every
 `get`, so even post-`open` file rot is caught — corrupt data is **never**
 served. `lock` (default `.exclusive`) takes the cross-process lock described
 below; `.none` opts out. `clock` (default `CLOCK_REALTIME`) decides expiry;
-tests inject their own.
+tests inject their own. `sync` (default `.always`) picks when writes reach the
+disk — `.always`, `.none` or `.interval_ms` (Bitcask's `o_sync`, `none`,
+`{seconds, N}`); `sync_clock` (default `CLOCK_MONOTONIC`) times the interval.
 
 ## On-disk format (v1/v2, little-endian)
 
@@ -92,10 +100,15 @@ to rebuild the keydir; replay stops at the first torn/corrupt record and
 
 ## Durability — the honest version
 
-- `put`/`delete` return only after write + `fsync`. An acknowledged write
-  survives OS crash / power loss **to the extent the platform's `fsync`
-  reaches stable media** (drives with volatile write caches and lying
-  hypervisors sit below this library).
+- With the default `SyncPolicy.always`, `put`/`delete` return only after
+  write + `fsync`. An acknowledged write survives OS crash / power loss **to
+  the extent the platform's `fsync` reaches stable media** (drives with
+  volatile write caches and lying hypervisors sit below this library).
+- With `.none` / `.interval_ms` a crash may lose acknowledged writes made
+  since the last barrier (`sync`, `compact`, `open`, an interval sync), but
+  recovery still yields the state after *some prefix* of the writes, never a
+  mix — the log is append-only and replay stops at the first gap. `close`
+  syncs best-effort and cannot report the error; call `sync` first.
 - A torn trailing record (partial write at crash) is detected by
   length/CRC on `open` and discarded; committed records survive.
 - Corruption policy: replay truncates at the *first* bad record — for
