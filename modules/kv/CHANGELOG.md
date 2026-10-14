@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-14** — Replay reads each data file through a 64 KiB window (one `pread` per window instead of three or more per record): `open` of a 100 000-key store 1.78× → 0.27× rosedb. New comparative benchmark `zig build bench-kv` against github.com/rosedblabs/rosedb/v2 v2.4.0 (`tools/bench.zig`, `tools/go_bench`): ref 0.27–1.01×. Scope now parity with Bitcask → **grade 2**. Found in passing: rosedb v2.4.0's `Options.Sync = true` does not fsync a `Put`.
+
 - **2026-10-14** — Read-only open (S2 survey R5b, Bitcask `open/1`): `Options.read_only` opens a store another `Db` (any process) may be writing — no lock, nothing created, deleted, truncated or written; a mid-write tail is skipped, not cut; a file a concurrent merge deleted makes it re-read the manifest. `Db.refresh()` reloads the view. Mutations on a reader return `error.AccessDenied`. New `OpenError.Busy` (a reader that lost the race to a merging writer 16 times in a row).
 
 - **2026-10-14** — `Db.iterator(gpa, prefix)` (S2 survey R6, Bitcask fold): a consistent snapshot of the live keys and their values in key order; the data files it points into are pinned, so merges and compactions meanwhile delete their names but keep them readable until `Iterator.deinit`. The single-file `compact` no longer rewrites its `DataFile` in place. **Fix:** `FsStorage` claims and releases handle-table slots under a lock — two threads opening at once could get the same slot (several `Db`s on one backend, or since this release one `Db`'s merge and its writer; caught by ThreadSanitizer).

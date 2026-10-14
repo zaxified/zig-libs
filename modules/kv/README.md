@@ -23,7 +23,13 @@ keydir + merge/compaction; paper/design only), LMDB (OpenLDAP Public License)
 and xitdb (MIT) for embedded single-writer semantics, and TigerBeetle
 (Apache-2.0) for the VOPR deterministic fault-injection *approach* (simulate
 storage faults at every I/O step, assert recovery), not its implementation.
-Behavior and approach only; no third-party source was consulted or copied.
+Behavior and approach only; no third-party source was consulted or copied
+for the module. The comparative benchmark under `tools/` (`bench.zig` and its
+`go_bench/` reference side against github.com/rosedblabs/rosedb/v2 v2.4.0,
+2026-10-14, with its `go.mod`/`go.sum` pinning the reference) is our own
+tooling; it drives the reference only through its public API. rosedb's source
+was read only to review it before running it and to explain its sync
+behaviour (see SPEC § Compared with); none of it shaped or entered this module.
 
 ## API
 

@@ -2914,18 +2914,39 @@ pub const Db = struct {
         stop,
     };
 
+    /// A window over a data file for `replay`'s sequential scan: one pread
+    /// per `replay_window` bytes instead of three or more per record.
+    const ReplayWindow = struct {
+        buf: []u8,
+        start: u64 = 0,
+        len: usize = 0,
+
+        /// `n` bytes at `off` (`n <= buf.len`, `off + n <= file_size`).
+        fn view(w: *ReplayWindow, store: Storage, h: Storage.Handle, file_size: u64, off: u64, n: usize) ![]const u8 {
+            if (off < w.start or off + n > w.start + w.len) {
+                w.start = off;
+                w.len = @intCast(@min(w.buf.len, file_size - off));
+                try store.preadFull(h, w.buf[0..w.len], off);
+            }
+            const at: usize = @intCast(off - w.start);
+            return w.buf[at..][0..n];
+        }
+    };
+    const replay_window = 64 << 10;
+
     fn replay(self: *Db, df: *DataFile, start: u64, file_size: u64, tail: Tail) OpenError!void {
         // The clock is read once, and only for a file that can hold expiry.
         const now: i64 = if (df.version >= version_expiry) self.options.clock.now() else 0;
+        var win: ReplayWindow = .{ .buf = try self.gpa.alloc(u8, replay_window) };
+        defer self.gpa.free(win.buf);
         var off: u64 = start;
         scan: while (off < file_size) {
             const remaining = file_size - off;
             if (remaining < rec_fixed) break; // torn fixed header
-            var hdr: [rec_fixed + exp_len]u8 = undefined;
-            try self.store.preadFull(df.handle, hdr[0..rec_fixed], off);
-            const op = hdr[4];
-            const key_len = std.mem.readInt(u32, hdr[5..9], .little);
-            const val_len = std.mem.readInt(u32, hdr[9..13], .little);
+            const fixed = try win.view(self.store, df.handle, file_size, off, @intCast(@min(remaining, rec_fixed + exp_len)));
+            const op = fixed[4];
+            const key_len = std.mem.readInt(u32, fixed[5..9], .little);
+            const val_len = std.mem.readInt(u32, fixed[9..13], .little);
             if (op != op_put and op != op_del and op != op_put_exp) break; // corrupt op byte
             if (op == op_put_exp and df.version < version_expiry) break; // not in a v1 file
             if (op == op_del and val_len != 0) break;
@@ -2933,34 +2954,41 @@ pub const Db = struct {
             const body: u64 = rec_fixed + @as(u64, if (expires) exp_len else 0);
             if (body > remaining) break; // torn expiry field
             if (@as(u64, key_len) + val_len > remaining - body) break; // torn body
-            var expires_at: i64 = no_expiry;
-            if (expires) {
-                try self.store.preadFull(df.handle, hdr[rec_fixed..][0..exp_len], off + rec_fixed);
-                expires_at = std.mem.readInt(i64, hdr[rec_fixed..][0..exp_len], .little);
-            }
+            const rec_len = body + key_len + val_len;
+            const stored_crc = std.mem.readInt(u32, fixed[0..4], .little);
+            const expires_at: i64 = if (expires) std.mem.readInt(i64, fixed[rec_fixed..][0..exp_len], .little) else no_expiry;
 
-            // CRC over op+lens[+expiry]+key+value, streaming the value in bounded
-            // chunks (only the key is materialized — it may enter the keydir).
-            var crc = std.hash.Crc32.init();
-            crc.update(hdr[4..@intCast(body)]);
-            const key = try self.gpa.alloc(u8, key_len);
+            // CRC over op+lens[+expiry]+key+value; only the key is copied
+            // (it may enter the keydir).
+            var key: []u8 = undefined;
+            if (rec_len <= replay_window) {
+                const rec = try win.view(self.store, df.handle, file_size, off, @intCast(rec_len));
+                if (std.hash.Crc32.hash(rec[4..]) != stored_crc) break :scan; // torn/corrupt
+                key = try self.gpa.dupe(u8, rec[@intCast(body)..][0..key_len]);
+            } else {
+                // A record larger than the window: stream it in pieces.
+                var crc = std.hash.Crc32.init();
+                crc.update(fixed[4..@intCast(body)]);
+                key = try self.gpa.alloc(u8, key_len);
+                errdefer self.gpa.free(key);
+                try self.store.preadFull(df.handle, key, off + body);
+                crc.update(key);
+                var voff: u64 = 0;
+                while (voff < val_len) {
+                    const n: usize = @intCast(@min(replay_window, val_len - voff));
+                    crc.update(try win.view(self.store, df.handle, file_size, off + body + key_len + voff, n));
+                    voff += n;
+                }
+                if (crc.final() != stored_crc) {
+                    self.gpa.free(key);
+                    break :scan;
+                }
+            }
             var key_owned = true;
             defer if (key_owned) self.gpa.free(key);
-            try self.store.preadFull(df.handle, key, off + body);
-            crc.update(key);
-            var vbuf: [4096]u8 = undefined;
-            var voff: u64 = 0;
-            while (voff < val_len) {
-                const n: usize = @intCast(@min(vbuf.len, val_len - voff));
-                try self.store.preadFull(df.handle, vbuf[0..n], off + body + key_len + voff);
-                crc.update(vbuf[0..n]);
-                voff += n;
-            }
-            if (crc.final() != std.mem.readInt(u32, hdr[0..4], .little)) break :scan; // torn/corrupt
             // CRC-valid, but not a record this module writes.
             if (expires and expires_at == no_expiry) break :scan;
 
-            const rec_len = body + key_len + val_len;
             if (try self.applyRecord(df, op, key, off, val_len, expires_at, now)) key_owned = false;
             off += rec_len;
         }
@@ -4274,6 +4302,28 @@ test "empty and one-byte keys and values" {
     try db.delete("");
     try expectGet(&db, "", null);
     try testing.expectEqual(@as(usize, 2), db.count());
+}
+
+test "replay: rot inside a record larger than the read window cuts the log there" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    const big = try testing.allocator.alloc(u8, 200 * 1024);
+    defer testing.allocator.free(big);
+    for (big, 0..) |*b, i| b.* = @truncate(i *% 13 + 1);
+    {
+        var db = try Db.open(testing.allocator, sim.storage(), "db", .{});
+        defer db.close();
+        try db.put("before", "1");
+        try db.put("big", big);
+        try db.put("after", "2");
+    }
+    const at = std.mem.indexOf(u8, sim.fileContent("db").?, big[150 * 1024 ..][0..64]).?;
+    sim.flipByte("db", at); // past the first window's worth of the value
+    var db = try Db.open(testing.allocator, sim.storage(), "db", .{});
+    defer db.close();
+    try expectGet(&db, "before", "1");
+    try expectGet(&db, "big", null);
+    try expectGet(&db, "after", null);
 }
 
 test "large value round-trips and survives reopen + compaction" {
