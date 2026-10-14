@@ -7,7 +7,7 @@
 //! selects a harness by name, `_MS`, `_SEEDFILE`, `_INPUT` as documented
 //! there). Harness names: `montint-loader-modulus`, `montint-loader-element`
 //! `montint-fixed-diff`,
-//! `montint-dyn-diff`.
+//! `montint-dyn-diff`, `montint-dyn-sqrt` (`DynModint.sqrt` vs Euler's criterion).
 //!
 //! The oracle is `std.math.big.int.Managed`: every accept / refuse decision of
 //! the byte loaders and every result of add / sub / neg / mul / sq / pow /
@@ -416,6 +416,85 @@ test "fuzz: montint differential against std.math.big" {
             try dynDiff(std.testing.Smith, smith, testing.allocator);
         }
     }.f, .{});
+}
+
+const SqrtMark = Marker(enum { p3, p5, p1, residue, non_residue, zero, refused });
+
+/// Odd primes for the square-root harness: every path (`p mod 8` of 3/7, 5,
+/// 1), small and large `s = v2(p - 1)`, one and several limbs.
+const sqrt_primes = [_][]const u64{
+    &.{3},
+    &.{5},
+    &.{7},
+    &.{13},
+    &.{17},
+    &.{41},
+    &.{97},
+    &.{257},
+    &.{65537},
+    &.{(1 << 61) - 1},
+    &.{ 0xffffffffffffffed, 0xffffffffffffffff, 0xffffffffffffffff, 0x7fffffffffffffff }, // 2^255 - 19, 5 mod 8
+    &.{ 1, 0xffffffff00000000, 0xffffffffffffffff, 0xffffffff }, // P-224: 2^224 - 2^96 + 1, s = 96
+    &.{ 0xfffffffefffffc2f, 0xffffffffffffffff, 0xffffffffffffffff, 0xffffffffffffffff }, // secp256k1, 3 mod 4
+};
+
+/// `DynModint.sqrt` against a branching oracle: Euler's criterion through
+/// `powPublic`. Residue iff `a = 0` or `a^((p-1)/2) = 1`; then `r^2 = a`;
+/// otherwise `false` and `out` zeroed.
+pub fn dynSqrt(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
+    const D = dyn.DynModint(2048);
+    var pv = D.zero;
+    const pl = sqrt_primes[src.valueRangeAtMost(u8, 0, sqrt_primes.len - 1)];
+    @memcpy(pv[0..pl.len], pl);
+    const m = try D.fromLimbs(&pv);
+    switch (pv[0] & 7) {
+        1 => SqrtMark.mark(.p1),
+        5 => SqrtMark.mark(.p5),
+        else => SqrtMark.mark(.p3),
+    }
+
+    var buf: [40]u8 = undefined;
+    const len = drawBytes(S, src, &buf, false);
+    var x = m.reduceBytesBE(buf[0..len]);
+    switch (src.valueRangeAtMost(u8, 0, 7)) {
+        0 => x = D.zero,
+        1 => x = m.neg(&D.one()),
+        2 => x = m.sq(&x),
+        else => {},
+    }
+
+    var half = D.zero; // (p - 1) / 2 = p >> 1
+    for (0..D.max_limbs) |i| half[i] = (pv[i] >> 1) | (if (i + 1 < D.max_limbs) pv[i + 1] << 63 else 0);
+    var hb: [256]u8 = undefined;
+    m.toBytesBE(&half, hb[0..m.byteLen()]);
+    const leg = m.powPublic(&x, hb[0..m.byteLen()]);
+    const is_zero = D.isZero(&x);
+    const want = is_zero or D.isOne(&leg);
+
+    var r: D.Elem = undefined;
+    const ok = m.sqrt(&x, &r);
+    if (ok != want) return error.SqrtVerdictDiffers;
+    if (ok) {
+        if (!D.eql(&m.sq(&r), &x)) return error.SqrtNotARoot;
+        if (is_zero) SqrtMark.mark(.zero) else SqrtMark.mark(.residue);
+    } else {
+        if (!D.isZero(&r)) return error.SqrtOutNotZeroed;
+        SqrtMark.mark(.non_residue);
+    }
+
+    // a >= m is refused, whatever its residue class.
+    var big = pv;
+    big[0] +%= 1; // m + 1 (odd m: no carry out of limb 0 unless all ones; harmless either way)
+    if (m.sqrt(&big, &r) or !D.isZero(&r)) return error.SqrtAcceptedUnreduced;
+    SqrtMark.mark(.refused);
+}
+
+test "fuzz driver: MONTINT_FUZZ (dyn sqrt)" {
+    try fuzz_driver.run(dynSqrt, .{ .prefix = "MONTINT_FUZZ", .name = "montint-dyn-sqrt" });
+}
+
+test "fuzz harness: dyn sqrt, 500 seeds, reaches every outcome" {
+    try SqrtMark.reach(dynSqrt, "montint-dyn-sqrt", 500);
 }
 
 const LoaderModulusMark = Marker(enum { accepted, even, small, overflow });

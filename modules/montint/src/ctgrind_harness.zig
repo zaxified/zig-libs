@@ -401,6 +401,24 @@ fn runDyn(comptime nbits: usize, comptime tag: []const u8, tainted: bool) !void 
     const invm_ok = md.inverseOfModulus(&evr, &inv);
     md.toBytesBE(&inv, &out);
     std.debug.print("inverseofmodulus={} {x}\n", .{ invm_ok, out });
+    // Square root: a secret element modulo a PUBLIC prime (P-224's, 1 mod 8
+    // with s = 96, so the Tonelli-Shanks path runs; the random modulus above
+    // is composite and would stop at the public non-residue search). The
+    // verdict is the only branch. Python's Tonelli-Shanks on the same
+    // SHAKE-derived value gives the printed root (up to sign).
+    var p224 = D.zero;
+    p224[0] = 1;
+    p224[1] = 0xffffffff00000000;
+    p224[2] = 0xffffffffffffffff;
+    p224[3] = 0xffffffff;
+    const pmod = try D.fromLimbs(&p224);
+    const sr = secretBytes(28, "ctgrind-montint-harness-dyn-sqrt-" ++ tag ++ "-v1");
+    var sa = pmod.reduceBytesBE(&sr);
+    const sar = taintedCopy(D.Elem, &sa, tainted);
+    var root_out: D.Elem = undefined;
+    const sqrt_ok = pmod.sqrt(&sar, &root_out);
+    pmod.toBytesBE(&root_out, out[0..pmod.byteLen()]);
+    std.debug.print("sqrt={} {x}\n", .{ sqrt_ok, out[0..pmod.byteLen()] });
 }
 
 pub fn main(init: std.process.Init.Minimal) !void {

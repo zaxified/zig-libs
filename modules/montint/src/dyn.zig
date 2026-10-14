@@ -762,6 +762,132 @@ pub fn DynModint(comptime max_bits: comptime_int) type {
             return bad == 0;
         }
 
+        /// `e >> n` over the whole `Elem` (`n` public).
+        fn shrPublic(e: *const Elem, n: usize) Elem {
+            var out = zero;
+            const w = n / 64;
+            const b: u6 = @intCast(n % 64);
+            for (0..max_limbs) |i| {
+                if (i + w >= max_limbs) break;
+                var v = e[i + w] >> b;
+                if (b != 0 and i + w + 1 < max_limbs) v |= e[i + w + 1] << @intCast(64 - @as(u7, b));
+                out[i] = v;
+            }
+            return out;
+        }
+
+        /// `e + 1` for an `e` that cannot overflow (public).
+        fn incPublic(e: *const Elem) Elem {
+            var out = e.*;
+            for (&out) |*w| {
+                w.*, const c = @addWithOverflow(w.*, 1);
+                if (c == 0) break;
+            }
+            return out;
+        }
+
+        /// Square root of `a` modulo a PRIME modulus. Returns `true` and
+        /// writes a root to `out` iff `a` is a quadratic residue (`0` counts,
+        /// root `0`); otherwise returns `false` and `out` is zeroed. `a ≥ m`
+        /// (any non-zero limb above the slot included) is refused the same
+        /// way as in `inverse`. The modulus must be prime (not checked, as
+        /// for `Field`); on a composite one the answer is `false` or a
+        /// genuine root — never a wrong "root", since `out² = a` is verified
+        /// before `true` is returned. Which of the two roots comes back is
+        /// unspecified.
+        ///
+        /// The modulus is PUBLIC for the algorithm: the path (`p mod 8`) and
+        /// the trip counts (`s = v2(p − 1)`, the bit length) depend on it,
+        /// and so does the search for a non-residue (small candidates, Euler
+        /// test). `a` is SECRET: no branch or index depends on it, every
+        /// decision is a masked select, the `true`/`false` verdict is the
+        /// only output that is branched on.
+        ///
+        /// `p ≡ 3 (mod 4)`: `a^((p+1)/4)`. `p ≡ 5 (mod 8)`: Atkin,
+        /// `x = a^((p+3)/8)`, times `√−1 = 2^((p−1)/4)` iff `x² ≠ a`.
+        /// `p ≡ 1 (mod 8)`: Tonelli-Shanks with `p − 1 = q·2^s`, in the
+        /// fixed-trip form: `x = a^((q+1)/2)`, `t = a^q` (so `x² = a·t`) and
+        /// `u = z^q` for a non-residue `z`; for `k = s−1 … 1` the bit
+        /// `t^(2^(k−1))` (±1) is read by `k−1` squarings and, when it is
+        /// `−1`, `x ← x·u`, `t ← t·u²` (a masked blend); `u ← u²` every
+        /// step. `s·(s−1)/2` squarings in all — fine for field primes
+        /// (`s ≤ ~100`), quadratic in `s` for an adversarial prime like
+        /// `2^k·c + 1`.
+        pub fn sqrt(self: *const Self, a: *const Elem, out: *Elem) bool {
+            var t = a.*;
+            const below: u1 = limbs.subInto(&t, &self.m); // 1 ⟺ a < m
+            std.crypto.secureZero(u64, &t);
+
+            var x = zero;
+            defer std.crypto.secureZero(u64, &x);
+            var x2: Elem = undefined;
+            defer std.crypto.secureZero(u64, &x2);
+
+            const mod = self.m;
+            const lg2 = mod[0] & 7; // p mod 8
+            if (lg2 & 3 == 3) {
+                x = self.pow(a, &incPublic(&shrPublic(&mod, 2)));
+            } else if (lg2 == 5) {
+                const e = incPublic(&shrPublic(&mod, 3));
+                x = self.pow(a, &e);
+                var two = zero;
+                two[0] = 2;
+                const root_m1 = self.pow(&two, &shrPublic(&mod, 2)); // 2^((p-1)/4)
+                x2 = self.sq(&x);
+                const fixed = self.mul(&x, &root_m1);
+                x = select(eql(&x2, a), &x, &fixed);
+            } else if (lg2 == 1) {
+                // p − 1 = q·2^s, q odd; p ≡ 1 (mod 8) so s ≥ 3.
+                var s: usize = 0;
+                var pm1 = mod;
+                pm1[0] &= ~@as(u64, 1);
+                while (pm1[s / 64] >> @intCast(s % 64) & 1 == 0) s += 1;
+                const q = shrPublic(&pm1, s);
+                const half_q1 = incPublic(&shrPublic(&q, 1)); // (q+1)/2
+                // z: the smallest small non-residue (public search).
+                const minus_one = self.neg(&one());
+                const euler = shrPublic(&pm1, 1);
+                var z = zero;
+                var found = false;
+                var cand: u64 = 2;
+                while (cand < 4096) : (cand += 1) {
+                    z[0] = cand;
+                    if (compare(&z, &mod) != .lt) break;
+                    if (eql(&self.pow(&z, &euler), &minus_one)) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    out.* = zero;
+                    return false;
+                }
+                var u = self.pow(&z, &q);
+                var tt = self.pow(a, &q);
+                defer std.crypto.secureZero(u64, &tt);
+                defer std.crypto.secureZero(u64, &u);
+                x = self.pow(a, &half_q1);
+                var k: usize = s - 1;
+                while (k >= 1) : (k -= 1) {
+                    var d = tt;
+                    for (0..k - 1) |_| d = self.sq(&d);
+                    const flip = !isOne(&d);
+                    const xu = self.mul(&x, &u);
+                    const usq = self.sq(&u);
+                    const tu = self.mul(&tt, &usq);
+                    x = select(flip, &xu, &x);
+                    tt = select(flip, &tu, &tt);
+                    u = usq;
+                    std.crypto.secureZero(u64, &d);
+                }
+            } else unreachable; // m is odd: lg2 ∈ {1, 3, 5, 7}
+
+            x2 = self.sq(&x);
+            const ok = @as(u1, @intFromBool(eql(&x2, a))) & below == 1; // bitwise: no short circuit
+            out.* = select(ok, &x, &zero);
+            return ok;
+        }
+
         /// `m⁻¹ mod n` for any `n ≥ 2` — **even included** — where `m` is
         /// this modulus: if `gcd(m, n) = 1`, writes the inverse (`< n`) to
         /// `out` and returns `true`; else returns `false` (`out` then holds
@@ -1516,5 +1642,73 @@ test "DynModint predicates: isOdd/isOne/one/compare/isZero/eql against big.int, 
         }
         try testing.expect(D.isOne(&D.one()) and !D.isZero(&D.one()) and D.isOdd(&D.one()));
         try testing.expect(!D.isOne(&D.zero) and !D.isOdd(&D.zero));
+    }
+}
+
+test "DynModint sqrt: KATs vs CPython Tonelli-Shanks (tools/gen_sqrt_kat.py)" {
+    const D = DynModint(1024);
+    const sqrt_vectors = @import("sqrt_vectors.zig");
+    for (sqrt_vectors.cases) |c| {
+        var pv = D.zero;
+        @memcpy(pv[0..c.p.len], c.p);
+        var a = D.zero;
+        @memcpy(a[0..c.a.len], c.a);
+        var want = D.zero;
+        @memcpy(want[0..c.root.len], c.root);
+        const m = try D.fromLimbs(&pv);
+        var r: D.Elem = undefined;
+        const ok = m.sqrt(&a, &r);
+        try testing.expectEqual(c.qr, ok);
+        if (c.qr) {
+            try testing.expect(D.eql(&r, &want) or D.eql(&r, &m.neg(&want)));
+            try testing.expect(D.eql(&m.sq(&r), &a));
+        } else try testing.expect(D.isZero(&r));
+    }
+}
+
+test "DynModint sqrt: a = 0, 1, m - 1 and refusal of a >= m" {
+    const D = DynModint(256);
+    // 97 (1 mod 8), 101 (5 mod 8), 103 (3 mod 4): -1 is a residue only for the first two.
+    for ([_]u64{ 97, 101, 103 }) |p| {
+        var pv = D.zero;
+        pv[0] = p;
+        const m = try D.fromLimbs(&pv);
+        var r: D.Elem = undefined;
+        try testing.expect(m.sqrt(&D.zero, &r) and D.isZero(&r));
+        try testing.expect(m.sqrt(&D.one(), &r) and D.isOne(&m.sq(&r)));
+        const minus1 = m.neg(&D.one());
+        try testing.expectEqual(p % 4 == 1, m.sqrt(&minus1, &r));
+        if (p % 4 == 3) try testing.expect(D.isZero(&r));
+        try testing.expect(!m.sqrt(&pv, &r) and D.isZero(&r)); // a = p
+        var hi = D.zero;
+        hi[3] = 1; // far above m
+        try testing.expect(!m.sqrt(&hi, &r) and D.isZero(&r));
+    }
+}
+
+test "DynModint sqrt: sqrt(x*x) squares back, every path, several slots" {
+    var prng = std.Random.DefaultPrng.init(0x5152);
+    const rnd = prng.random();
+    const D = DynModint(1024);
+    const primes = [_][]const u64{
+        &.{ 0xffffffffffffffed, 0xffffffffffffffff, 0xffffffffffffffff, 0x7fffffffffffffff }, // 2^255 - 19
+        &.{ 1, 0xffffffff00000000, 0xffffffffffffffff, 0xffffffff }, // P-224 (s = 96)
+        &.{ 0xfffffffefffffc2f, 0xffffffffffffffff, 0xffffffffffffffff, 0xffffffffffffffff }, // secp256k1
+        &.{ 0xffffffffffffffff, 0xffffffffffffffff, 0xffffffffffffffff, 0xffffffffffffffff, 0xffffffffffffffff, 0xffffffffffffffff, 0xffffffffffffffff, 0xffffffffffffffff, 0x1ff }, // 2^521 - 1
+    };
+    for (primes) |pl| {
+        var pv = D.zero;
+        @memcpy(pv[0..pl.len], pl);
+        const m = try D.fromLimbs(&pv);
+        for (0..8) |_| {
+            var buf: [200]u8 = undefined;
+            rnd.bytes(&buf);
+            const x = m.reduceBytesBE(&buf);
+            const xx = m.sq(&x);
+            var r: D.Elem = undefined;
+            try testing.expect(m.sqrt(&xx, &r));
+            try testing.expect(D.eql(&m.sq(&r), &xx));
+            try testing.expect(D.eql(&r, &x) or D.eql(&r, &m.neg(&x)));
+        }
     }
 }

@@ -94,6 +94,24 @@ portable CIOS tolerates an operand `< R`; the narrower digit keeps the
 documented `< m` contract) and dropping the `m < 3` check (`Modint.fromElem`
 rejects it too).
 
+**Square root (2026-10-14).** `sqrt(a, out) bool` is a square root of `a`
+modulo a PRIME modulus (OpenSSL `BN_mod_sqrt`, Go `ModSqrt`): `true` and a root
+iff `a` is a residue (`0` counts), else `false` with `out` zeroed; `a ≥ m` is
+refused like `inverse`; which of `±r` comes back is unspecified. The modulus is
+public to the algorithm (path by `p mod 8`, trip counts `s = v2(p − 1)`, the
+small-candidate non-residue search by Euler's test), `a` is secret: `p ≡ 3
+mod 4` is `a^((p+1)/4)`, `p ≡ 5 mod 8` Atkin (`a^((p+3)/8)`, fixed up by
+`2^((p−1)/4)` under a masked select), `p ≡ 1 mod 8` fixed-trip Tonelli-Shanks
+(`s − 1` steps, each reading the ±1 bit of `t` by squarings and applying the
+correction as a masked blend; `O(s²)` squarings, ~4 600 for P-224). The result
+is always verified (`out² = a`), so a non-prime modulus yields `false` or a true
+root, never a wrong one. Evidence: KATs from CPython Tonelli-Shanks
+(`tools/gen_sqrt_kat.py` → `src/sqrt_vectors.zig`, 17 primes from 3 to
+2^521 − 1 covering all three paths, s up to 96, residues, non-residues, 0, 1,
+−1), a `sqrt(x²)` property test, fuzz harness `montint-dyn-sqrt` against Euler's
+criterion through `powPublic`, ctgrind `dyn` row `sqrt` (secret `a` mod the
+P-224 prime).
+
 **Inversion (2026-10-03).** `inverse(a, out) bool` is `a⁻¹ mod m` by
 Bernstein–Yang divsteps (2019, §11), one step at a time, every branch a masked
 blend, run for the paper's bound — `⌊(49b + 57)/17⌋` steps for `b ≥ 46` bits,
@@ -753,7 +771,7 @@ whole `L`-limb digits through `montMul(digit, R² mod m)` on that basis.
 - ~~**`reduce` of a wider value, plus `eql`/`isZero`/`isOdd` on elements**~~ ✅ 2026-10-14: `DynModint.isOdd`/`isOne`/`one`/`compare` (CT) and `Modint.eql`/`isZero`/`neg`; `Modint` `isOdd`/`compare` deliberately not offered (they need the normal-domain value; no consumer). Original text (survey 2026-09-30): ✅ for comptime prime moduli via `Field` and for run-time moduli via `DynModint` (2026-10-02); still open (re-survey 2026-10-05): CT `isOdd` and a CT element `compare` (ff has `compare`, bigmod `IsOdd`; today a user writes them on the limbs), and the fixed-width `Modint` has none of `eql`/`isZero`/`neg`. Effort S. Fits §2.
 - ~~**Modular inversion (constant-time, safegcd-style)**~~ ✅ 2026-10-03 `DynModint.inverse` (divsteps) and `inverseOfModulus` (any `n`, even included); `threshold_ecdsa`'s Πmod `d = Ñ⁻¹ mod φ` moved onto it (ctgrind `pimod` 540 → 4). `Field.inv` (Fermat) covers comptime primes.
 - **Batched divsteps** (62 steps per transition matrix, as crypto-bigint/libsecp256k1) — **missing and it matters** (re-survey 2026-10-05): one step at a time costs ~one modexp per inversion, fine for key setup, ~10× too slow for a per-message path; (2026-10-14: `rsa` carries its own batched constant-time safegcd, `rsa/src/safegcd.zig`, with a lockstep two-problem form; moving it here as `DynModint.inverse`'s engine is the open step.) Effort M. Fits §2.
-- **Square root modulo a prime** (Tonelli-Shanks, with the `p ≡ 3 mod 4` shortcut) — missing; crypto-bigint and OpenSSL `BN_mod_sqrt` have it. Off this module's main use case (RSA/Paillier/DH/VDF never need it); a user wants it for point decompression over a run-time curve or Rabin-style schemes. Effort S–M. Fits §2.
+- ~~**Square root modulo a prime**~~ ✅ 2026-10-14 `DynModint.sqrt(a, out) bool` (see "Square root" above). Original text: Tonelli-Shanks with the `p ≡ 3 mod 4` shortcut; crypto-bigint and OpenSSL `BN_mod_sqrt` had it; a user wants it for point decompression over a run-time curve or Rabin-style schemes.
 - **Baillie-PSW (strong Lucas) primality** — missing; `isProbablePrime` is Miller-Rabin only, which FIPS 186-5 accepts with enough rounds *(inferred, standard not re-read)*, so this strengthens rather than unblocks. Needs a CT Jacobi symbol. Effort M. Fits §2.
 - ~~**A run-time-modulus `Field` counterpart for secrets**~~ ✅ 2026-10-02 `DynModint`; `rsa`, `paillier` and `threshold_ecdsa`'s zkproofs moved onto it (their private slot copies are gone); it also carries the `std.crypto.ff` bridge (`elemFromFf`/`elemToFf`/`fromFf`) all three use.
 - ~~**Run-time-sized modulus (limb count chosen at run time)**~~ ✅ 2026-10-02 `DynModint` (slots of 4 limbs; a small modulus no longer runs at the width of the largest).
