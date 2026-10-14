@@ -178,19 +178,16 @@ fn frozenFor(name: []const u8, effort: []const u8) ?corpus.blessed.Blessed {
     return null;
 }
 
-fn effortOf(tag: []const u8) brotli.Effort {
-    return std.meta.stringToEnum(brotli.Effort, tag).?;
-}
-
 // ── direction A: the reference decodes what WE emit ─────────────────────────
 
 /// Returns our stream, blessed by the reference, or null if anything failed.
-fn blessShape(ref: *Ref, shape: corpus.Shape, effort: []const u8) !?[]u8 {
+fn blessShape(ref: *Ref, shape: corpus.Shape, enc: corpus.Encoding) !?[]u8 {
     const gpa = ref.gpa;
+    const effort = enc.tag;
     const input = try corpus.build(gpa, shape);
     defer gpa.free(input);
 
-    const stream = try brotli.compressWith(gpa, input, .{ .effort = effortOf(effort) });
+    const stream = try corpus.encode(gpa, input, enc);
     errdefer gpa.free(stream);
 
     const back = ref.decompress(stream) catch |e| switch (e) {
@@ -214,8 +211,10 @@ fn blessShape(ref: *Ref, shape: corpus.Shape, effort: []const u8) !?[]u8 {
 
 fn checkEncoderDirection(ref: *Ref) !void {
     const gpa = ref.gpa;
-    for (corpus.efforts) |effort| for (corpus.shapes) |shape| {
-        const stream = (try blessShape(ref, shape, effort)) orelse continue;
+    for (corpus.encodings) |enc| for (corpus.shapes) |shape| {
+        if (!enc.covers(shape.name)) continue;
+        const effort = enc.tag;
+        const stream = (try blessShape(ref, shape, enc)) orelse continue;
         defer gpa.free(stream);
 
         // …and is the committed record still about THESE bytes?
@@ -304,8 +303,9 @@ fn captureBlessed(ref: *Ref, provenance: []const u8) !void {
         \\
         \\//! What google/brotli said about THIS encoder's output, frozen.
         \\//!
-        \\//! For every shape in `interop_corpus.zig` and every encoder effort, the
-        \\//! reference decompressed the stream `brotli.compressWith` produced and got
+        \\//! For every shape in `interop_corpus.zig` and every encoding there (the
+        \\//! efforts, and the variants on the shapes they name), the reference
+        \\//! decompressed the stream `interop_corpus.encode` produced and got
         \\//! the input back, byte for byte. `stream_sha256` identifies the exact stream that happened to;
         \\//! `input_sha256` identifies the exact input, so a corpus generator that
         \\//! drifts is told apart from an encoder that drifts.
@@ -327,7 +327,7 @@ fn captureBlessed(ref: *Ref, provenance: []const u8) !void {
         \\
         \\pub const Blessed = struct {{
         \\    name: []const u8,
-        \\    /// `brotli.Effort` tag.
+        \\    /// `interop_corpus.Encoding.tag`: an effort's name, or a variant's.
         \\    effort: []const u8,
         \\    input_len: usize,
         \\    /// SHA-256 of the input, lowercase hex.
@@ -342,10 +342,12 @@ fn captureBlessed(ref: *Ref, provenance: []const u8) !void {
     , .{provenance});
 
     var blessed_count: usize = 0;
-    for (corpus.efforts) |effort| for (corpus.shapes) |shape| {
+    for (corpus.encodings) |enc| for (corpus.shapes) |shape| {
+        if (!enc.covers(shape.name)) continue;
+        const effort = enc.tag;
         const input = try corpus.build(gpa, shape);
         defer gpa.free(input);
-        const stream = (try blessShape(ref, shape, effort)) orelse {
+        const stream = (try blessShape(ref, shape, enc)) orelse {
             std.debug.print("REFUSING TO CAPTURE: '{s}' ({s}) was not blessed by the reference\n", .{ shape.name, effort });
             return error.ReferenceRejectedOurStream;
         };
@@ -359,7 +361,7 @@ fn captureBlessed(ref: *Ref, provenance: []const u8) !void {
     try out.appendSlice(gpa, "};\n");
 
     try std.Io.Dir.cwd().writeFile(ref.io, .{ .sub_path = blessed_path, .data = out.items });
-    std.debug.print("wrote {s} ({d} shape x effort streams)\n", .{ blessed_path, blessed_count });
+    std.debug.print("wrote {s} ({d} shape x encoding streams)\n", .{ blessed_path, blessed_count });
 }
 
 // ── entry point ─────────────────────────────────────────────────────────────

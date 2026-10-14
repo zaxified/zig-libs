@@ -69,7 +69,7 @@ const BrotliError = @import("errors.zig").BrotliError;
 const max_store_block = 1 << 24;
 /// Bytes of input per compressed meta-block. Bigger amortises the ~100-300
 /// byte prefix-code header better; smaller adapts to changing statistics.
-const compressed_block_size = 1 << 20;
+pub const compressed_block_size = 1 << 20;
 
 const min_match = 4;
 /// Shortest copy taken at a distance the decoder's ring already holds: it
@@ -784,7 +784,9 @@ const Matcher = struct {
     /// code with no extra bits, so it is tried first and priced lower.
     ring: DistRing = .{},
 
-    fn init(gpa: std.mem.Allocator, data: []const u8, depth: u32, slots_log_max: u5) std.mem.Allocator.Error!Matcher {
+    /// Tables for an input of about `size` bytes; `data` is set by the
+    /// caller.
+    fn init(gpa: std.mem.Allocator, size: usize, depth: u32, slots_log_max: u5) std.mem.Allocator.Error!Matcher {
         std.debug.assert(std.math.isPowerOfTwo(depth));
         const depth_log: u5 = @intCast(std.math.log2_int(u32, depth));
         // Buckets sized to the input — compressing a few hundred bytes must
@@ -792,7 +794,7 @@ const Matcher = struct {
         // `slots_log_max` (a deeper bucket means fewer of them).
         const bucket_log_max: u5 = slots_log_max - depth_log;
         var bucket_log: u5 = 8;
-        while (bucket_log < bucket_log_max and (@as(usize, 1) << bucket_log) < data.len) bucket_log += 1;
+        while (bucket_log < bucket_log_max and (@as(usize, 1) << bucket_log) < size) bucket_log += 1;
 
         const count = try gpa.alloc(u32, @as(usize, 1) << bucket_log);
         errdefer gpa.free(count);
@@ -806,7 +808,7 @@ const Matcher = struct {
             .count = count,
             .depth_log = depth_log,
             .hash_shift = @intCast(32 - @as(u6, bucket_log)),
-            .data = data,
+            .data = &.{},
         };
     }
 
@@ -846,6 +848,19 @@ const Matcher = struct {
         gpa.free(self.slots);
         gpa.free(self.count);
         self.* = undefined;
+    }
+
+    /// Empty, as `init` leaves it.
+    fn reset(self: *Matcher) void {
+        fillZero(self.count);
+        self.ring = .{};
+    }
+
+    /// `data` lost its first `by` bytes: every position moves down by `by`,
+    /// one that fell off becomes 0 — further back than any search reaches
+    /// (`StreamWriter` keeps a window of history before what it compresses).
+    fn shift(self: *Matcher, by: u32) void {
+        for (self.slots) |*s| s.* -|= by;
     }
 
     fn hash(self: *const Matcher, p: usize) usize {
@@ -988,17 +1003,29 @@ const FastMatcher = struct {
     hash_shift: u6,
     data: []const u8,
 
-    fn init(gpa: std.mem.Allocator, data: []const u8, bucket_log_max: u6) std.mem.Allocator.Error!FastMatcher {
+    /// Tables for an input of about `size` bytes; `data` is set by the
+    /// caller.
+    fn init(gpa: std.mem.Allocator, size: usize, bucket_log_max: u6) std.mem.Allocator.Error!FastMatcher {
         var bucket_log: u6 = 8;
-        while (bucket_log < bucket_log_max and (@as(usize, 1) << bucket_log) < data.len) bucket_log += 1;
+        while (bucket_log < bucket_log_max and (@as(usize, 1) << bucket_log) < size) bucket_log += 1;
         const table = try gpa.alloc(u32, @as(usize, 1) << bucket_log << std.math.log2_int(u32, fast_sweep));
         Matcher.fillZero(table);
-        return .{ .table = table, .hash_shift = @intCast(64 - @as(u7, bucket_log)), .data = data };
+        return .{ .table = table, .hash_shift = @intCast(64 - @as(u7, bucket_log)), .data = &.{} };
     }
 
     fn deinit(self: *FastMatcher, gpa: std.mem.Allocator) void {
         gpa.free(self.table);
         self.* = undefined;
+    }
+
+    /// Empty, as `init` leaves it.
+    fn reset(self: *FastMatcher) void {
+        Matcher.fillZero(self.table);
+    }
+
+    /// As `Matcher.shift`.
+    fn shift(self: *FastMatcher, by: u32) void {
+        for (self.table) |*s| s.* -|= by;
     }
 
     /// Bucket of the five bytes at `p`; needs eight readable bytes.
@@ -1815,69 +1842,151 @@ pub const CompressOptions = struct {
     effort: Effort = .default,
     /// Input bytes per meta-block (1..1 MiB). Each block gets its own codes:
     /// smaller blocks adapt to changing data but pay more headers.
-    block_size: usize = compressed_block_size,
+    block_size: usize = default_block_size,
+    /// log2 of the window (`min_window_bits`..`max_window_bits`): how far
+    /// back a copy may reach, and how much history a decoder must keep. Null:
+    /// 16 for an input of up to 65 520 bytes, else 21.
+    window_bits: ?u5 = null,
+
+    pub const default_block_size = compressed_block_size;
 };
+
+/// RFC 7932 §9.1: WBITS 10..24 (the large window of RFC 9841 is not
+/// supported).
+pub const min_window_bits = 10;
+pub const max_window_bits = 24;
 
 /// `compress` with options.
 pub fn compressWith(gpa: std.mem.Allocator, input: []const u8, opts: CompressOptions) std.mem.Allocator.Error![]u8 {
-    const block_size = opts.block_size;
-    std.debug.assert(block_size >= 1 and block_size <= compressed_block_size);
-    var w = BitWriter{ .gpa = gpa };
-    errdefer w.buf.deinit(gpa);
-
-    // Window bits: 16 unless the input can actually use a bigger one. Encoded
-    // as a single 0 bit for 16, otherwise 1 + (wbits - 17) in three bits.
-    const big_window = input.len > 65520;
-    const wbits: u5 = if (big_window) 21 else 16;
-    if (big_window) {
-        try w.writeBits(1, 1);
-        try w.writeBits(wbits - 17, 3);
-    } else {
-        try w.writeBits(0, 1);
-    }
-    const max_backward = (@as(usize, 1) << wbits) - 16;
-
-    var matcher: Matcher = undefined;
-    var fast: FastMatcher = undefined;
-    if (opts.effort == .fast) {
-        fast = try FastMatcher.init(gpa, input, fast_bucket_log_max);
-    } else {
-        matcher = try Matcher.init(gpa, input, opts.effort.depth(), opts.effort.slotsLog());
-    }
-    defer if (opts.effort == .fast) fast.deinit(gpa) else matcher.deinit(gpa);
-    const max_dist = max_backward;
-
-    var cmds: std.ArrayListUnmanaged(Cmd) = .empty;
-    defer cmds.deinit(gpa);
-
-    // The single-literal-code alternative of a block is written here.
-    var alt = BitWriter{ .gpa = gpa };
-    defer alt.buf.deinit(gpa);
-
-    var emitted_last = false;
-    var ring: DistRing = .{};
+    const wbits: u5 = opts.window_bits orelse if (input.len > 65520) 21 else 16;
+    var core = try Core.init(gpa, opts.effort, opts.block_size, wbits, input.len);
+    defer core.deinit();
+    core.setData(input);
+    try core.writeHeader();
     var off: usize = 0;
     while (off < input.len) {
-        const n = @min(input.len - off, block_size);
-        const end = off + n;
-        const is_last = end == input.len;
+        const end = off + @min(input.len - off, opts.block_size);
+        try core.compressBlock(off, end, end == input.len);
+        off = end;
+    }
+    try core.finish();
+    return core.w.buf.toOwnedSlice(gpa);
+}
 
-        cmds.clearRetainingCapacity();
-        switch (opts.effort) {
-            .fast => try buildCommandsFast(gpa, &fast, off, end, max_dist, ring, &cmds),
+/// The encoder's state across meta-blocks, one-shot (`compressWith`) or
+/// streamed (`StreamWriter`): one encoding logic for both, so a stream cut
+/// at the same blocks is the same bytes.
+pub const Core = struct {
+    gpa: std.mem.Allocator,
+    effort: Effort,
+    block_size: usize,
+    wbits: u5,
+    matcher: union { deep: Matcher, fast: FastMatcher },
+    /// The input so far that copies may reach (`compressBlock`'s positions
+    /// index it).
+    data: []const u8 = &.{},
+    /// Output: whole bytes in `w.buf`, up to 31 bits pending.
+    w: BitWriter,
+    /// The single-literal-code alternative of a block is written here.
+    alt: BitWriter,
+    cmds: std.ArrayListUnmanaged(Cmd) = .empty,
+    /// The decoder's last four distances after the blocks so far.
+    ring: DistRing = .{},
+    /// The last block written was ISLAST.
+    emitted_last: bool = false,
+
+    /// `size`: how much input the match finder's tables are sized for.
+    pub fn init(gpa: std.mem.Allocator, effort: Effort, block_size: usize, wbits: u5, size: usize) std.mem.Allocator.Error!Core {
+        std.debug.assert(block_size >= 1 and block_size <= compressed_block_size);
+        std.debug.assert(wbits >= min_window_bits and wbits <= max_window_bits);
+        return .{
+            .gpa = gpa,
+            .effort = effort,
+            .block_size = block_size,
+            .wbits = wbits,
+            .matcher = if (effort == .fast)
+                .{ .fast = try FastMatcher.init(gpa, size, fast_bucket_log_max) }
+            else
+                .{ .deep = try Matcher.init(gpa, size, effort.depth(), effort.slotsLog()) },
+            .w = .{ .gpa = gpa },
+            .alt = .{ .gpa = gpa },
+        };
+    }
+
+    pub fn deinit(c: *Core) void {
+        if (c.effort == .fast) c.matcher.fast.deinit(c.gpa) else c.matcher.deep.deinit(c.gpa);
+        c.w.buf.deinit(c.gpa);
+        c.alt.buf.deinit(c.gpa);
+        c.cmds.deinit(c.gpa);
+        c.* = undefined;
+    }
+
+    /// Ready for a new stream, as `init` leaves it (the tables kept).
+    pub fn reset(c: *Core) void {
+        if (c.effort == .fast) c.matcher.fast.reset() else c.matcher.deep.reset();
+        c.data = &.{};
+        c.w.buf.clearRetainingCapacity();
+        c.w.acc = 0;
+        c.w.cnt = 0;
+        c.ring = .{};
+        c.emitted_last = false;
+    }
+
+    /// `data` will lose its first `by` bytes (`setData` follows).
+    pub fn shift(c: *Core, by: usize) void {
+        if (c.effort == .fast) c.matcher.fast.shift(@intCast(by)) else c.matcher.deep.shift(@intCast(by));
+    }
+
+    /// RFC 7932 §9.2 has no flush marker; an empty metadata meta-block
+    /// (ISLAST 0, MNIBBLES 0, reserved 0, MSKIPBYTES 0 — six bits, as
+    /// google/brotli's flush writes) ends at a byte boundary, so every bit
+    /// so far can go out. Nothing when the output is already byte aligned.
+    pub fn flushToByte(c: *Core) std.mem.Allocator.Error!void {
+        if (c.w.cnt % 8 != 0) try c.w.writeBits(0b000110, 6);
+        try c.w.alignToByte();
+    }
+
+    pub fn setData(c: *Core, data: []const u8) void {
+        c.data = data;
+        if (c.effort == .fast) c.matcher.fast.data = data else c.matcher.deep.data = data;
+    }
+
+    /// WBITS (RFC 7932 §9.1): a single 0 bit for 16; 1 + (wbits - 17) in
+    /// three bits for 18..24; for 17 and 10..15, 1 + 000 + three more bits:
+    /// 000 for 17, else wbits - 8.
+    pub fn writeHeader(c: *Core) std.mem.Allocator.Error!void {
+        if (c.wbits == 16) {
+            try c.w.writeBits(0, 1);
+        } else if (c.wbits >= 18) {
+            try c.w.writeBits(1, 1);
+            try c.w.writeBits(c.wbits - 17, 3);
+        } else {
+            try c.w.writeBits(1, 1);
+            try c.w.writeBits(0, 3);
+            try c.w.writeBits(if (c.wbits == 17) 0 else c.wbits - 8, 3);
+        }
+    }
+
+    /// One meta-block for `data[off..end)`: compressed when that is shorter
+    /// than storing it, else stored.
+    pub fn compressBlock(c: *Core, off: usize, end: usize, is_last: bool) std.mem.Allocator.Error!void {
+        const gpa = c.gpa;
+        const n = end - off;
+        const max_dist = (@as(usize, 1) << c.wbits) - 16;
+        c.cmds.clearRetainingCapacity();
+        switch (c.effort) {
+            .fast => try buildCommandsFast(gpa, &c.matcher.fast, off, end, max_dist, c.ring, &c.cmds),
             .default, .best => {
-                matcher.ring = ring;
-                try buildCommands(2, gpa, &matcher, off, end, max_dist, &cmds);
+                c.matcher.deep.ring = c.ring;
+                try buildCommands(2, gpa, &c.matcher.deep, off, end, max_dist, &c.cmds);
             },
         }
 
+        const w = &c.w;
         const m = w.mark();
-        const before = w.bitPos();
-        const store_bits = storeCostBits(before, n);
-        var kept = false;
-        var trial = ring;
-        const first = try tryBlock(gpa, &w, input, off, end, cmds.items, is_last, &trial, opts.effort, false);
-        const ok = first != null;
+        const store_bits = storeCostBits(w.bitPos(), n);
+        var trial = c.ring;
+        const first = try tryBlock(gpa, w, c.data, off, end, c.cmds.items, is_last, &trial, c.effort, false);
         // The context model was chosen on estimated bits. When it split the
         // literals, write the block once more with a single literal code and
         // keep whichever is really shorter (a flat, small alphabet is where
@@ -1888,35 +1997,35 @@ pub fn compressWith(gpa: std.mem.Allocator, input: []const u8, opts: CompressOpt
         // and spliced in. The real write still decides (`ctx_end` below).
         if (first != null and first.?.ntrees > 1 and first.?.single_no_worse) {
             const ctx_end = w.bitPos();
-            alt.resumeAt(m);
-            var single_ring = ring;
-            const single = try tryBlock(gpa, &alt, input, off, end, cmds.items, is_last, &single_ring, opts.effort, true);
-            if (single != null and ctx_end >= m.len * 8 + alt.bitPos()) {
-                try w.takeFrom(m, &alt);
+            c.alt.resumeAt(m);
+            var single_ring = c.ring;
+            const single = try tryBlock(gpa, &c.alt, c.data, off, end, c.cmds.items, is_last, &single_ring, c.effort, true);
+            if (single != null and ctx_end >= m.len * 8 + c.alt.bitPos()) {
+                try w.takeFrom(m, &c.alt);
                 trial = single_ring;
             }
         }
-        kept = ok and w.bitPos() < store_bits;
-        if (kept) {
-            ring = trial; // a stored block leaves the decoder's ring alone
-            emitted_last = is_last;
+        if (first != null and w.bitPos() < store_bits) {
+            c.ring = trial; // a stored block leaves the decoder's ring alone
+            c.emitted_last = is_last;
         } else {
             w.rollback(m);
-            try writeStoreBlock(&w, input[off..end]);
-            emitted_last = false;
+            try writeStoreBlock(w, c.data[off..end]);
+            c.emitted_last = false;
         }
-        off = end;
     }
 
-    if (!emitted_last) {
-        // Final empty meta-block: ISLAST = 1, ISLASTEMPTY = 1.
-        try w.writeBits(1, 1);
-        try w.writeBits(1, 1);
+    /// End the stream: the final empty meta-block unless the last block was
+    /// ISLAST, then the last byte.
+    pub fn finish(c: *Core) std.mem.Allocator.Error!void {
+        if (!c.emitted_last) {
+            // ISLAST = 1, ISLASTEMPTY = 1.
+            try c.w.writeBits(1, 1);
+            try c.w.writeBits(1, 1);
+        }
+        try c.w.alignToByte();
     }
-    try w.alignToByte();
-
-    return w.buf.toOwnedSlice(gpa);
-}
+};
 
 // ===========================================================================
 // Tests — the writer's own invariants.

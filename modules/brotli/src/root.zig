@@ -73,6 +73,16 @@ pub const compress = encoder.compress;
 pub const compressWith = encoder.compressWith;
 pub const CompressOptions = encoder.CompressOptions;
 pub const Effort = encoder.Effort;
+pub const min_window_bits = encoder.min_window_bits;
+pub const max_window_bits = encoder.max_window_bits;
+
+/// A `std.Io.Writer` that compresses what is written to it into one stream:
+/// `flush` makes everything so far decodable, `finish` ends the stream,
+/// `reset` starts the next on the same tables. Without a flush, the bytes
+/// `compressWith` gives with the same options. See `stream_writer.zig`.
+pub const StreamWriter = stream_writer.StreamWriter;
+pub const StreamOptions = stream_writer.StreamOptions;
+const stream_writer = @import("stream_writer.zig");
 
 // ===========================================================================
 // Tests
@@ -85,6 +95,7 @@ test {
     // produced them is `tools/interop.zig`.
     _ = @import("interop_replay_test.zig");
     _ = @import("stream_test.zig");
+    _ = @import("stream_writer.zig");
     _ = @import("crafted_test.zig");
 }
 

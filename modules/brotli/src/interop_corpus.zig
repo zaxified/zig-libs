@@ -250,11 +250,71 @@ pub const ref_streams = [_]RefStream{
     .{ .input = "empty", .quality = 11, .lgwin = 22, .file = "empty.q11.w22.br" },
 };
 
-/// Every encoder effort, blessed separately: they emit different streams
-/// (match search depth, context modelling or not), so one blessing cannot
-/// stand for the others. Tag names, so the corpus needs no import of
-/// the encoder.
-pub const efforts = [_][]const u8{ "fast", "default", "best" };
+/// How a shape is encoded for the reference to judge. Every effort is
+/// blessed separately on every shape: they emit different streams (match
+/// search depth, context modelling or not), so one blessing cannot stand
+/// for the others. The variants after them cover what the defaults never
+/// emit — the window sizes `compressWith` does not pick by itself (the
+/// header's rarer WBITS codes, copies capped by a small window) and the
+/// `StreamWriter` (flushes: empty metadata meta-blocks, blocks cut where a
+/// flush falls; history slid under a small window) — on a few shapes each.
+pub const Encoding = struct {
+    /// The blessed entry's `effort` field.
+    tag: []const u8,
+    effort: []const u8,
+    window_bits: ?u5 = null,
+    block_size: usize = brotli.CompressOptions.default_block_size,
+    /// Through a `StreamWriter` (written in pieces of 4 093 bytes), with a
+    /// flush after each of these input offsets that the input reaches.
+    /// Null: `compressWith`.
+    flushes: ?[]const usize = null,
+    /// The shapes it is blessed on; null: all of them.
+    shapes: ?[]const []const u8 = null,
+
+    pub fn covers(e: Encoding, shape: []const u8) bool {
+        const list = e.shapes orelse return true;
+        for (list) |n| if (std.mem.eql(u8, n, shape)) return true;
+        return false;
+    }
+};
+
+pub const encodings = [_]Encoding{
+    .{ .tag = "fast", .effort = "fast" },
+    .{ .tag = "default", .effort = "default" },
+    .{ .tag = "best", .effort = "best" },
+    .{ .tag = "w10", .effort = "default", .window_bits = 10, .shapes = &.{ "hello_repeated", "run_1000", "alice_full" } },
+    .{ .tag = "w15_fast", .effort = "fast", .window_bits = 15, .shapes = &.{ "random_70000", "alice_full" } },
+    .{ .tag = "w17_best", .effort = "best", .window_bits = 17, .shapes = &.{ "mixed_text_first", "alice_full" } },
+    .{ .tag = "w24", .effort = "default", .window_bits = 24, .shapes = &.{"block_plus_one"} },
+    .{ .tag = "stream", .effort = "default", .window_bits = 22, .block_size = 65_536, .flushes = &.{ 0, 1, 1_000, 65_536, 100_000 }, .shapes = &.{ "empty", "one_byte", "mixed_random_first", "alice_full" } },
+    .{ .tag = "stream_fast_w16", .effort = "fast", .window_bits = 16, .block_size = 40_000, .flushes = &.{12_345}, .shapes = &.{ "random_70000", "alice_full" } },
+};
+
+/// The stream `e` makes of `input`.
+pub fn encode(gpa: std.mem.Allocator, input: []const u8, e: Encoding) ![]u8 {
+    const effort = std.meta.stringToEnum(brotli.Effort, e.effort).?;
+    const flushes = e.flushes orelse
+        return brotli.compressWith(gpa, input, .{ .effort = effort, .window_bits = e.window_bits, .block_size = e.block_size });
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    errdefer out.deinit();
+    var buf: [4093]u8 = undefined;
+    var sw: brotli.StreamWriter = try .init(gpa, &out.writer, &buf, .{ .effort = effort, .window_bits = e.window_bits.?, .block_size = e.block_size });
+    defer sw.deinit();
+    var i: usize = 0;
+    var f: usize = 0;
+    while (true) {
+        while (f < flushes.len and flushes[f] == i) : (f += 1) try sw.writer.flush();
+        if (i == input.len) break;
+        const next = if (f < flushes.len) @min(flushes[f], input.len) else input.len;
+        const end = @min(next, i + buf.len);
+        try sw.writer.writeAll(input[i..end]);
+        i = end;
+    }
+    try sw.finish();
+    return out.toOwnedSlice();
+}
+
+const brotli = @import("root.zig");
 
 /// What the reference's decoder said about our encoder's output, frozen.
 pub const blessed = @import("testdata/interop_blessed.zig");

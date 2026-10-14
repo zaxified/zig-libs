@@ -54,9 +54,19 @@ const n = try brotli.decompressStream(gpa, &body_reader, &file_writer, .{});
 // stored verbatim, so the result is always a valid `br` body.
 const br = try brotli.compress(gpa, data);                    // effort .default
 defer gpa.free(br);
-// .fast (≈ reference q1–q5, as fast as before), .default (between q5 and q9),
-// .best (for content compressed once and served many times).
+// .fast (≈ reference q4), .default (≈ q6), .best (≈ q9, for content
+// compressed once and served many times); window_bits 10..24 (default: 16
+// for inputs up to 64 KiB, else 21).
 const br_best = try brotli.compressWith(gpa, data, .{ .effort = .best });
+
+// Streaming: a std.Io.Writer. flush() makes everything so far decodable at
+// the other end; finish() ends the stream; reset() starts the next one on
+// the same table and history (a server compressing response after response).
+var sw = try brotli.StreamWriter.init(gpa, &socket_writer, &buf, .{ .effort = .fast });
+defer sw.deinit();
+try sw.writer.writeAll(chunk);
+try sw.writer.flush();
+try sw.finish();
 
 // Errors: brotli.BrotliError (TruncatedInput, InvalidHuffman, InvalidDistance,
 // InvalidDictionary, OutputTooLarge, InvalidPadding, ...).

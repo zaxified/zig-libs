@@ -2,8 +2,9 @@
 
 //! What google/brotli said about THIS encoder's output, frozen.
 //!
-//! For every shape in `interop_corpus.zig` and every encoder effort, the
-//! reference decompressed the stream `brotli.compressWith` produced and got
+//! For every shape in `interop_corpus.zig` and every encoding there (the
+//! efforts, and the variants on the shapes they name), the reference
+//! decompressed the stream `interop_corpus.encode` produced and got
 //! the input back, byte for byte. `stream_sha256` identifies the exact stream that happened to;
 //! `input_sha256` identifies the exact input, so a corpus generator that
 //! drifts is told apart from an encoder that drifts.
@@ -25,7 +26,7 @@
 
 pub const Blessed = struct {
     name: []const u8,
-    /// `brotli.Effort` tag.
+    /// `interop_corpus.Encoding.tag`: an effort's name, or a variant's.
     effort: []const u8,
     input_len: usize,
     /// SHA-256 of the input, lowercase hex.
@@ -171,4 +172,18 @@ pub const entries = [_]Blessed{
     .{ .name = "mixed_text_first", .effort = "best", .input_len = 1088576, .input_sha256 = "7d53f2169d3eecab22c199490f0d4fc9de122455d468e526b935191b0f11a592", .stream_len = 90854, .stream_sha256 = "22f93fdb84267c25fe8c801ff3508bcbb73af9bc43fa9be420003f77d72a41a0" },
     .{ .name = "block_exact", .effort = "best", .input_len = 1048576, .input_sha256 = "04b18ac774775dc12dd62bc7dc4bccad7f6d3e8a6f0dc860efc91ebc022b24e6", .stream_len = 50850, .stream_sha256 = "7022605757f6d6d18ca6baca9a6ee7d601ee742622cd5c5742e0cd73b8af7cf3" },
     .{ .name = "block_plus_one", .effort = "best", .input_len = 1048577, .input_sha256 = "b4e12997b7220bef5181116b471257115aed283ee73279411f1247eb363d4538", .stream_len = 50855, .stream_sha256 = "5d732d5a6ca44cd10016a44778f84ef7c414957f50e1fe4bf57c8b3cc2c20f4c" },
+    .{ .name = "hello_repeated", .effort = "w10", .input_len = 35, .input_sha256 = "532e12b863dbff73eceee22061e43c1dac874dbe1a46e0a5a924e72f172a73a3", .stream_len = 23, .stream_sha256 = "4b2de0aa1b4fe7ae507eaad126f30b14845c60ce9e72f92d9c6d4c97517f08cb" },
+    .{ .name = "run_1000", .effort = "w10", .input_len = 1000, .input_sha256 = "2e6bba1f3cf48fe45fa1c56e25b47fb622dde50eba1e17e0a72464e32bf4ab41", .stream_len = 11, .stream_sha256 = "0d63e9cd0317ca268626eaa02b96ea125a0aca4856eaddbfcd98e1030b504de6" },
+    .{ .name = "alice_full", .effort = "w10", .input_len = 152089, .input_sha256 = "7467306ee0feed4971260f3c87421154a05be571d944e9cb021a5713700c38f0", .stream_len = 61875, .stream_sha256 = "09486ca908f1cc0839d5e493de8b1721c5a734406f7ab3599b3a37acf019e012" },
+    .{ .name = "random_70000", .effort = "w15_fast", .input_len = 70000, .input_sha256 = "d74e11400d282829299aeca3cbddd6a56bc58f581951c5a6b0adbc430ab0cfb1", .stream_len = 70005, .stream_sha256 = "96e720e9a163085695973efa7742a44cdedc6624d14f18ef096fa44baeaff85b" },
+    .{ .name = "alice_full", .effort = "w15_fast", .input_len = 152089, .input_sha256 = "7467306ee0feed4971260f3c87421154a05be571d944e9cb021a5713700c38f0", .stream_len = 57012, .stream_sha256 = "0cbfbb38104a248b0e2eded089a3a507ff84ee2663fca044b4d7c5e4a4bb37f7" },
+    .{ .name = "alice_full", .effort = "w17_best", .input_len = 152089, .input_sha256 = "7467306ee0feed4971260f3c87421154a05be571d944e9cb021a5713700c38f0", .stream_len = 50752, .stream_sha256 = "70f9c65e6bac65aaf62fbed0fbd8efd133e888345a5cda945e90fcd0ec308aff" },
+    .{ .name = "mixed_text_first", .effort = "w17_best", .input_len = 1088576, .input_sha256 = "7d53f2169d3eecab22c199490f0d4fc9de122455d468e526b935191b0f11a592", .stream_len = 368262, .stream_sha256 = "e435534d870ce0a0aabdbc9711b6c667fc1a9c1981f9ffdbea9404fbc58b9333" },
+    .{ .name = "block_plus_one", .effort = "w24", .input_len = 1048577, .input_sha256 = "b4e12997b7220bef5181116b471257115aed283ee73279411f1247eb363d4538", .stream_len = 51625, .stream_sha256 = "f08d73e00126bd238967fecac1ae0bf4508de1eebedd3e9f46779205c20aab8e" },
+    .{ .name = "empty", .effort = "stream", .input_len = 0, .input_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", .stream_len = 3, .stream_sha256 = "953364ba17432048a9b97116a689d04da08ff77b1ead69c7fe1b51faa6542667" },
+    .{ .name = "one_byte", .effort = "stream", .input_len = 1, .input_sha256 = "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881", .stream_len = 7, .stream_sha256 = "d28a6310ab05c0d430db55c1bf56863b8acc587fb2fcdf2d0ae61fe2a32b262c" },
+    .{ .name = "alice_full", .effort = "stream", .input_len = 152089, .input_sha256 = "7467306ee0feed4971260f3c87421154a05be571d944e9cb021a5713700c38f0", .stream_len = 51797, .stream_sha256 = "d73a26af1a36ab38c2370bff87707b0ae51fff70b153191837e84e9a4df7ec53" },
+    .{ .name = "mixed_random_first", .effort = "stream", .input_len = 1088576, .input_sha256 = "5214e8d08b2c96cb0c5ee29bce17869cb9ca14d0ef9fc82939930a46939836c4", .stream_len = 1065836, .stream_sha256 = "0bedeb4ec6cf102be81b8218d8d72e6519a9dd0b4f67a2efe6d35752796da1e5" },
+    .{ .name = "random_70000", .effort = "stream_fast_w16", .input_len = 70000, .input_sha256 = "d74e11400d282829299aeca3cbddd6a56bc58f581951c5a6b0adbc430ab0cfb1", .stream_len = 70010, .stream_sha256 = "a6b3e261f0bc1a9c7a20caa43619a1536d261381fbe7803fbc7845ce5000424a" },
+    .{ .name = "alice_full", .effort = "stream_fast_w16", .input_len = 152089, .input_sha256 = "7467306ee0feed4971260f3c87421154a05be571d944e9cb021a5713700c38f0", .stream_len = 55887, .stream_sha256 = "c27e633b4c5e4e3cad8f7eefc0378b98d1a56cbf695a390b8a592e10d0900f80" },
 };

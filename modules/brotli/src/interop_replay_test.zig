@@ -53,7 +53,7 @@ fn digestOf(bytes: []const u8) [64]u8 {
 /// with no blessed entry would be a shape that silently stopped being checked
 /// — the exact failure this split has to avoid, so it is a build failure.
 fn frozen(comptime name: []const u8, comptime effort: []const u8) blessed.Blessed {
-    // 135 entries (45 shapes x 3 efforts) x two name comparisons each,
+    // ~150 entries (45 shapes x 3 efforts, the variants) x two name comparisons each,
     // resolved at comptime: the default 1000-branch budget does not cover it.
     @setEvalBranchQuota(200_000);
     inline for (blessed.entries) |e| {
@@ -87,8 +87,9 @@ test "interop replay: our decoder reproduces the plaintext from google/brotli's 
 
 test "interop replay: the encoder still emits the exact streams google/brotli accepted" {
     const gpa = testing.allocator;
-    inline for (corpus.efforts) |effort| inline for (corpus.shapes) |shape| {
-        const record = comptime frozen(shape.name, effort);
+    inline for (corpus.encodings) |enc| inline for (corpus.shapes) |shape| {
+        if (comptime !enc.covers(shape.name)) continue;
+        const record = comptime frozen(shape.name, enc.tag);
 
         const input = try corpus.build(gpa, shape);
         defer gpa.free(input);
@@ -104,7 +105,7 @@ test "interop replay: the encoder still emits the exact streams google/brotli ac
             return e;
         };
 
-        const stream = try brotli.compressWith(gpa, input, .{ .effort = @field(brotli.Effort, effort) });
+        const stream = try corpus.encode(gpa, input, enc);
         defer gpa.free(stream);
         testing.expectEqual(record.stream_len, stream.len) catch |e| {
             std.debug.print(
@@ -134,20 +135,28 @@ test "interop replay: the encoder still emits the exact streams google/brotli ac
 // direction — a shape deleted while its blessing lingers — and a capture run
 // that silently produced fewer entries than it meant to.
 
-test "interop replay: coverage canary — 45 shapes x 3 efforts blessed, 24 reference streams" {
+test "interop replay: coverage canary — 45 shapes x 3 efforts + 14 variant streams blessed, 24 reference streams" {
     try testing.expectEqual(@as(usize, 45), corpus.shapes.len);
-    try testing.expectEqual(@as(usize, 3), corpus.efforts.len);
-    try testing.expectEqual(@as(usize, 45 * 3), blessed.entries.len);
+    try testing.expectEqual(@as(usize, 9), corpus.encodings.len);
+    try testing.expectEqual(@as(usize, 45 * 3 + 14), blessed.entries.len);
     try testing.expectEqual(@as(usize, 24), corpus.ref_streams.len);
 
-    // Every blessed entry is (effort, shape), in capture order: a renamed
-    // shape must not silently pick up a neighbour's blessing.
-    for (corpus.efforts, 0..) |effort, ei| {
-        for (corpus.shapes, blessed.entries[ei * 45 ..][0..45]) |s, e| {
-            try testing.expectEqualStrings(s.name, e.name);
-            try testing.expectEqualStrings(effort, e.effort);
+    // Every blessed entry is (encoding, shape), in capture order: a renamed
+    // shape must not silently pick up a neighbour's blessing, and a variant
+    // naming a shape that does not exist covers nothing.
+    var i: usize = 0;
+    for (corpus.encodings) |enc| {
+        var covered: usize = 0;
+        for (corpus.shapes) |s| {
+            if (!enc.covers(s.name)) continue;
+            try testing.expectEqualStrings(s.name, blessed.entries[i].name);
+            try testing.expectEqualStrings(enc.tag, blessed.entries[i].effort);
+            i += 1;
+            covered += 1;
         }
+        try testing.expectEqual(if (enc.shapes) |l| l.len else corpus.shapes.len, covered);
     }
+    try testing.expectEqual(blessed.entries.len, i);
 
     // The multi-meta-block shapes really do straddle the boundary — the point
     // of `mixed_*`/`block_*` is lost if the encoder's block size ever changes
