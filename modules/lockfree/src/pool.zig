@@ -29,6 +29,13 @@
 //! The lock makes `acquire`/`release` not lock-free; node allocation never
 //! was (it can hit the general-purpose allocator). The lock-free guarantees
 //! of the queue concern its head/tail/next CAS loops, not allocation.
+//!
+//! Per-thread caches (2026-10-14): `acquireCached`/`releaseCached` keep freed
+//! nodes in a caller-owned `Cache` and take the lock once per `cache_batch`
+//! nodes. One lock per node was the unbounded queue's bottleneck (58 % of a
+//! 4×4 run in `acquire` + `release`, 10× crossbeam's `SegQueue`). The lock
+//! still carries the cross-thread node handoff: a node only changes threads
+//! through a spill and a refill, both under it.
 
 const std = @import("std");
 const atomic = @import("atomic.zig");
@@ -69,6 +76,9 @@ pub fn NodePool(comptime T: type) type {
         /// Guards `free_head`/`all` and orders node-memory handoff across
         /// threads (see the file doc comment).
         lock: atomic.SpinLock,
+        /// Per-participant caches, chunk by chunk (see `cacheAt`). A chunk
+        /// pointer is written once, under `lock`, and read without it.
+        caches: [max_cache_chunks]std.atomic.Value(?*CacheChunk),
 
         pub fn init(allocator: std.mem.Allocator) Self {
             return .{
@@ -76,10 +86,12 @@ pub fn NodePool(comptime T: type) type {
                 .free_head = null,
                 .all = .empty,
                 .lock = .{},
+                .caches = @splat(.init(null)),
             };
         }
 
         pub fn deinit(self: *Self) void {
+            for (&self.caches) |*c| if (c.load(.monotonic)) |chunk| self.allocator.destroy(chunk);
             for (self.all.items) |slot| self.allocator.destroy(slot);
             self.all.deinit(self.allocator);
             self.* = undefined;
@@ -131,16 +143,127 @@ pub fn NodePool(comptime T: type) type {
             self.free_head = slot;
         }
 
-        /// Assert every node currently on the free list still holds intact
-        /// poison. A use-after-free WRITE to a retired node flips a poison
-        /// byte and is caught here. Deterministic; the harness calls it after
-        /// a stress run drains the queue. This is the pool's canary.
+        /// A per-thread node cache (a "magazine"): freed nodes a thread can
+        /// take back without the pool's lock. The pool owns them, one per
+        /// participant index (`cacheAt`), so a cache lives exactly as long as
+        /// the nodes it holds. Owned by one thread at a time — the thread
+        /// holding that participant slot, which hands it over with the slot;
+        /// the lock is taken once per `cache_batch` nodes, to refill from or
+        /// spill into the shared free list. Cached slots are poisoned and not
+        /// `live`, exactly like free-listed ones, and `verifyQuiescent` checks
+        /// them too. On its own cache line: neighbouring caches belong to
+        /// different threads.
+        pub const Cache = struct {
+            pool: *Self align(atomic.cache_line),
+            head: ?*Slot = null,
+            len: usize = 0,
+        };
+
+        /// Nodes moved per refill/spill; a cache spills at twice this.
+        pub const cache_batch = 64;
+        /// Caches are allocated in chunks of this many, on first use, and
+        /// never move. `cache_chunk * max_cache_chunks` indices are served;
+        /// `cacheAt` returns null past that, and the caller falls back to the
+        /// locked `acquire`/`release`.
+        const cache_chunk = 64;
+        const max_cache_chunks = 64;
+        const CacheChunk = [cache_chunk]Cache;
+
+        /// The cache for participant index `index`, allocated on first use;
+        /// null when `index` is past the served range or the chunk cannot be
+        /// allocated (the caller then uses the locked path — slower, same
+        /// semantics).
+        pub fn cacheAt(self: *Self, index: usize) ?*Cache {
+            const ci = index / cache_chunk;
+            if (ci >= max_cache_chunks) return null;
+            // Acquire: pairs with the publishing release store below, so the
+            // chunk's initialization is visible.
+            const chunk = self.caches[ci].load(.acquire) orelse self.allocChunk(ci) orelse return null;
+            return &chunk[index % cache_chunk];
+        }
+
+        fn allocChunk(self: *Self, ci: usize) ?*CacheChunk {
+            self.lock.lock();
+            defer self.lock.unlock();
+            if (self.caches[ci].load(.monotonic)) |c| return c;
+            const chunk = self.allocator.create(CacheChunk) catch return null;
+            for (chunk) |*c| c.* = .{ .pool = self };
+            self.caches[ci].store(chunk, .release);
+            return chunk;
+        }
+
+        /// `acquire` through `c`: a cached node without the lock, else one
+        /// locked refill of up to `cache_batch` nodes, else a fresh slot.
+        /// The reused slot's poison is verified as in `acquire`.
+        pub fn acquireCached(self: *Self, c: *Cache) (Error || std.mem.Allocator.Error)!*T {
+            if (c.head == null) self.refill(c);
+            const slot = c.head orelse return self.acquire();
+            try checkPoison(slot);
+            c.head = slot.next_free;
+            c.len -= 1;
+            slot.next_free = null;
+            slot.live = true;
+            return &slot.node;
+        }
+
+        /// `release` into `c`: poison, then keep the slot for this thread's
+        /// next `acquireCached`; spill `cache_batch` slots to the shared free
+        /// list once `c` holds twice that.
+        pub fn releaseCached(self: *Self, c: *Cache, node: *T) void {
+            const slot = slotOf(node);
+            std.debug.assert(slot.live);
+            @memset(std.mem.asBytes(&slot.node), poison_byte);
+            slot.live = false;
+            slot.next_free = c.head;
+            c.head = slot;
+            c.len += 1;
+            if (c.len >= 2 * cache_batch) self.spill(c, cache_batch);
+        }
+
+        /// Hand every slot in `c` back to the shared free list.
+        pub fn flushCache(self: *Self, c: *Cache) void {
+            self.spill(c, c.len);
+        }
+
+        fn refill(self: *Self, c: *Cache) void {
+            self.lock.lock();
+            defer self.lock.unlock();
+            var n: usize = 0;
+            while (n < cache_batch) : (n += 1) {
+                const slot = self.free_head orelse break;
+                self.free_head = slot.next_free;
+                slot.next_free = c.head;
+                c.head = slot;
+            }
+            c.len += n;
+        }
+
+        fn spill(self: *Self, c: *Cache, n: usize) void {
+            if (n == 0) return;
+            // Cut the first `n` slots off the cache outside the lock (they are
+            // ours), then splice them in front of the free list under it.
+            const first = c.head.?;
+            var last = first;
+            for (1..n) |_| last = last.next_free.?;
+            c.head = last.next_free;
+            c.len -= n;
+            self.lock.lock();
+            defer self.lock.unlock();
+            last.next_free = self.free_head;
+            self.free_head = first;
+        }
+
+        /// Assert every node not handed out — on the free list or in any
+        /// `Cache` — still holds intact poison. A use-after-free WRITE to a
+        /// retired node flips a poison byte and is caught here.
+        /// Deterministic; the harness calls it after a stress run drains the
+        /// queue. This is the pool's canary. Quiescent only: it reads every
+        /// slot's `live` flag, which cache owners write without the lock.
         pub fn verifyQuiescent(self: *Self) Error!void {
             self.lock.lock();
             defer self.lock.unlock();
-            var cur = self.free_head;
-            while (cur) |slot| : (cur = slot.next_free) {
-                try checkPoison(slot);
+            for (self.all.items) |slot| {
+                if (!slot.live) try checkPoison(slot);
             }
         }
 
@@ -241,4 +364,72 @@ test "acquire leaks no slot when the allocator fails part-way through" {
         }
         try testing.expectEqual(failing.allocations, failing.deallocations);
     }
+}
+
+// ── per-participant caches ───────────────────────────────────────────────────
+
+test "cache: a released node comes back from the same cache without the free list" {
+    var pool = NodePool(TestNode).init(testing.allocator);
+    defer pool.deinit();
+    const c = pool.cacheAt(3).?;
+    try testing.expectEqual(&pool, c.pool);
+    try testing.expectEqual(c, pool.cacheAt(3).?); // stable
+
+    const a = try pool.acquireCached(c); // empty cache, empty free list: fresh
+    pool.releaseCached(c, a);
+    try testing.expectEqual(@as(usize, 1), c.len);
+    try testing.expectEqual(@as(?*NodePool(TestNode).Slot, null), pool.free_head);
+    try testing.expectEqual(a, try pool.acquireCached(c));
+    try testing.expectEqual(@as(usize, 0), c.len);
+}
+
+test "cache: spills a batch to the free list at twice the batch, and another cache refills from it" {
+    const P = NodePool(TestNode);
+    var pool = P.init(testing.allocator);
+    defer pool.deinit();
+    const c0 = pool.cacheAt(0).?;
+    const c1 = pool.cacheAt(1).?;
+
+    var nodes: [2 * P.cache_batch]*TestNode = undefined;
+    for (&nodes) |*n| n.* = try pool.acquireCached(c0);
+    for (nodes[0 .. nodes.len - 1]) |n| pool.releaseCached(c0, n);
+    try testing.expectEqual(nodes.len - 1, c0.len); // below the spill mark
+    pool.releaseCached(c0, nodes[nodes.len - 1]);
+    try testing.expectEqual(@as(usize, P.cache_batch), c0.len); // spilled one batch
+
+    // c1 takes the spilled batch in one refill, then its own cache serves.
+    _ = try pool.acquireCached(c1);
+    try testing.expectEqual(@as(usize, P.cache_batch - 1), c1.len);
+    try testing.expectEqual(@as(?*P.Slot, null), pool.free_head);
+    try testing.expectEqual(nodes.len, pool.all.items.len); // nothing new allocated
+
+    pool.flushCache(c0);
+    try testing.expectEqual(@as(usize, 0), c0.len);
+    try pool.verifyQuiescent();
+}
+
+test "CANARY TEETH: a use-after-free write to a node sitting in a cache is caught by the sweep and by the next acquire" {
+    var pool = NodePool(TestNode).init(testing.allocator);
+    defer pool.deinit();
+    const c = pool.cacheAt(0).?;
+    const a = try pool.acquireCached(c);
+    pool.releaseCached(c, a);
+    a.value = 0xDEADBEEF; // never reached the free list: only the cache holds it
+    try testing.expectError(error.CanaryTripped, pool.verifyQuiescent());
+    try testing.expectError(error.CanaryTripped, pool.acquireCached(c));
+}
+
+test "cacheAt past the served range is null, and the locked path still works" {
+    const P = NodePool(TestNode);
+    var pool = P.init(testing.allocator);
+    defer pool.deinit();
+    try testing.expect(pool.cacheAt(P.cache_chunk * P.max_cache_chunks) == null);
+    try testing.expect(pool.cacheAt(P.cache_chunk * P.max_cache_chunks - 1) != null);
+}
+
+test "cacheAt: a chunk that cannot be allocated is null, not an error" {
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    var pool = NodePool(TestNode).init(failing.allocator());
+    defer pool.deinit();
+    try testing.expect(pool.cacheAt(0) == null);
 }

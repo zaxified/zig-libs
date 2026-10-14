@@ -1,0 +1,19 @@
+[package]
+name = "lockfree_bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Reference side of `zig build bench-lockfree` (modules/lockfree/tools/bench.zig):
+# crossbeam-queue 0.3.14, crossbeam-deque 0.8.8, crossbeam-epoch 0.9.21, pinned exactly.
+[dependencies]
+crossbeam-queue = "=0.3.14"
+crossbeam-deque = "=0.8.8"
+crossbeam-epoch = "=0.9.21"
+
+[profile.release]
+lto = true
+codegen-units = 1
+
+# Not part of any enclosing Cargo workspace.
+[workspace]

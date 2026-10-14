@@ -124,6 +124,7 @@ pub fn BoundedQueue(comptime T: type, comptime capacity_: usize, comptime opts: 
         /// called.
         pub fn pushWith(q: *Self, source: anytype, comptime fill: fn (@TypeOf(source), *T) void) bool {
             var pos = q.tail.load(.monotonic);
+            var backoff: atomic.Backoff = .{};
             while (true) {
                 const slot = &q.slots[pos & mask];
                 // Acquire: pairs with the consumer's release store that freed
@@ -139,6 +140,7 @@ pub fn BoundedQueue(comptime T: type, comptime capacity_: usize, comptime opts: 
                     // before the slot's release store we acquired above).
                     if (q.tail.cmpxchgWeak(pos, pos +% 1, .release, .monotonic)) |actual| {
                         pos = actual;
+                        backoff.spin();
                         continue;
                     }
                     fill(source, &slot.item);
@@ -166,6 +168,7 @@ pub fn BoundedQueue(comptime T: type, comptime capacity_: usize, comptime opts: 
                 return item;
             }
             var pos = q.head.load(.monotonic);
+            var backoff: atomic.Backoff = .{};
             while (true) {
                 const slot = &q.slots[pos & mask];
                 // Acquire: pairs with the producer's publish, so the item
@@ -178,6 +181,7 @@ pub fn BoundedQueue(comptime T: type, comptime capacity_: usize, comptime opts: 
                     // producer claimed before publishing (acquired above).
                     if (q.head.cmpxchgWeak(pos, pos +% 1, .release, .monotonic)) |actual| {
                         pos = actual;
+                        backoff.spin();
                         continue;
                     }
                     const item = slot.item;

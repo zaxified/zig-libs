@@ -833,9 +833,44 @@ hardware (§7 item (a)); with the static codegen cert (§7) and this formal cert
 (§7.1) both green, that hardware run is now belt-and-suspenders corroboration
 rather than the only line of evidence.
 
+## 8. Performance against crossbeam (2026-10-14)
+
+`zig build bench-lockfree` (`tools/bench.zig` against `tools/rust_bench`: crossbeam-queue
+0.3.14, crossbeam-deque 0.8.8, crossbeam-epoch 0.9.21, LTO; the crates were read in full
+before the first build). Same workloads on both sides, checksums compared; ratio =
+ours/crossbeam by wall time, 8-core x86-64, best of 3 × 5.
+
+| Row | Workload | Ratio |
+|---|---|---|
+| bounded_1x1 / 4x1 / 4x4 | ring of 1024, 4 Mi items (`ArrayQueue`) | 0.70 / 0.70 / 1.35 (4x4 noisy) |
+| unbounded_1x1 / 4x4 | `Queue(u64)` vs `SegQueue`, 4 Mi items | **2.2 / 4.5** |
+| deque_owner / deque_steal | 1 Mi push + pop; owner vs 3 thieves | 1.15 / 0.61 |
+| epoch_pin | 1 Mi pin + unpin | 1.00 |
+
+The card stays `not measured` while `Queue(T)` is over 4× (gen-catalog refuses P4 for a
+module qap reaches). Found and fixed on the way: a global spinlock per node in `NodePool`
+(per-participant caches), a `tryAdvance` scan after every dequeue (`advance_period`), MS
+`head`/`tail` and the queue's read-only fields on one cache line, and a lost CAS in
+`BoundedQueue` retried without backoff. What is left in `Queue(T)` is its shape — per item
+a node, a pin (`xchg`, ~9 ns) on each side and two or three CASes, where `SegQueue` claims
+a slot in a block and pins nothing. Next: a segmented queue of our own design (owner,
+2026-10-14: allowed if MS + caches stays over 1.1×) — see Backlog.
+
 ## Backlog / deferred
 
 Items from §6 stay there; the survey adds what a crossbeam user hits first.
+
+- (2026-10-14) **P: segmented unbounded queue.** `Queue(T)` is 2.2–4.5× `SegQueue` after
+  the pool caches (§8); the remaining cost is per-item node + pin. A queue of fixed-size
+  blocks, a slot claimed per item and blocks reclaimed per block (through EBR — one retire
+  per block — or per-slot reader marks), designed here; crossbeam's source is not read.
+  Effort: medium-large; fits §2.
+- (2026-10-14, survey `~/CML/20261014-lockfree-s2/`) S2 items R1–R14 with the owner's
+  answers: runtime-capacity ring, `force_push`, `capacity`/push-returns-item/drain,
+  handle-free unbounded queue ergonomics, FIFO deque, `stealBatch*`, `Injector`, `Steal`
+  helpers, `Worker`/`Stealer` views, wide `T` (word-wise atomic slot copy), `repin`/
+  `flush`/`isPinned`, nested pins, unbounded participant registration + a thread-local
+  default handle, tagged atomic pointers.
 
 - ~~(survey 2026-09-30) Generic payload~~ — ✅ 2026-10-06, `Queue(T)`.
 - ~~(survey 2026-09-30) Bounded ring (`ArrayQueue` equivalent)~~ — ✅ 2026-10-06, `BoundedQueue` (§4b).

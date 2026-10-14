@@ -73,6 +73,17 @@ pub const Backoff = struct {
         }
         if (self.step < step_ceiling) self.step += 1;
     }
+
+    /// Backoff after a lost CAS: spin `2^step` pause hints, never yield. A
+    /// lost CAS means another thread made progress, so there is nothing to
+    /// wait for; the pause only spreads the retries out so the contended
+    /// cache line is not taken from its new owner at once.
+    pub fn spin(self: *Backoff) void {
+        var i: usize = 0;
+        const limit = @as(usize, 1) << @intCast(@min(self.step, spin_ceiling));
+        while (i < limit) : (i += 1) std.atomic.spinLoopHint();
+        if (self.step <= spin_ceiling) self.step += 1;
+    }
 };
 
 /// Test-and-test-and-set spinlock. **Test-only** mutual exclusion for the
@@ -172,4 +183,15 @@ test "SpinLock gives exact mutual exclusion across real threads" {
     for (&threads) |*t| t.join();
     // If the lock leaked a single increment, this would be < expected.
     try testing.expectEqual(per_thread * n_threads, c.n);
+}
+
+test "Backoff.spin widens up to the spin ceiling and never goes past it" {
+    var b: Backoff = .{};
+    for (0..Backoff.spin_ceiling + 1) |i| {
+        try std.testing.expectEqual(@as(u6, @intCast(i)), b.step);
+        b.spin();
+    }
+    try std.testing.expectEqual(Backoff.spin_ceiling + 1, b.step);
+    b.spin(); // saturated: still spins 2^spin_ceiling, step stays put
+    try std.testing.expectEqual(Backoff.spin_ceiling + 1, b.step);
 }

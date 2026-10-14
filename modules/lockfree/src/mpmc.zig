@@ -51,10 +51,14 @@ pub fn Queue(comptime T: type) type {
         };
         pub const Pool = pool.NodePool(Node);
 
-        /// Points at the dummy sentinel; the real front is `head.next`.
-        head: std.atomic.Value(*Node),
-        /// Points at (or lags just behind) the last node.
-        tail: std.atomic.Value(*Node),
+        /// Points at the dummy sentinel; the real front is `head.next`. On
+        /// its own cache line: consumers CAS `head`, producers `tail`.
+        head: atomic.CachePadded(std.atomic.Value(*Node)) align(atomic.cache_line),
+        /// Points at (or lags just behind) the last node. Padded like `head`:
+        /// a line to itself, so the read-only fields below never share it
+        /// (they did, and every consumer reload of `domain` missed on the
+        /// line producers CAS — 2026-10-14 profile).
+        tail: atomic.CachePadded(std.atomic.Value(*Node)) align(atomic.cache_line),
         node_pool: *Pool,
         domain: *ebr.Domain,
 
@@ -67,8 +71,8 @@ pub fn Queue(comptime T: type) type {
             // the node it advances head ONTO, never of the one it leaves.
             dummy.* = .{ .value = undefined, .next = .init(null) };
             return .{
-                .head = .init(dummy),
-                .tail = .init(dummy),
+                .head = .init(.init(dummy)),
+                .tail = .init(.init(dummy)),
                 .node_pool = node_pool,
                 .domain = domain,
             };
@@ -79,7 +83,7 @@ pub fn Queue(comptime T: type) type {
         /// teardown. Nodes already retired-and-reclaimed are on the pool free list
         /// and are freed by `Pool.deinit`, not here (no double free).
         pub fn deinit(self: *Self) void {
-            var cur: ?*Node = self.head.load(.monotonic);
+            var cur: ?*Node = self.head.value.load(.monotonic);
             while (cur) |node| {
                 const nxt = node.next.load(.monotonic);
                 self.node_pool.release(node);
@@ -95,6 +99,21 @@ pub fn Queue(comptime T: type) type {
             const p: *Pool = @ptrCast(@alignCast(ctx));
             const node: *Node = @ptrCast(@alignCast(ptr));
             p.release(node);
+        }
+
+        /// The same through the retiring participant's pool cache: `retire`
+        /// runs on that participant's thread, and its bags are drained by the
+        /// same thread (or, for an orphaned slot, by the one adopter that owns
+        /// the slot — and so the cache — exclusively at that time; ebr.zig
+        /// `adoptOrphans`), so the cache keeps a single owner.
+        fn reclaimNodeCached(ctx: *anyopaque, ptr: *anyopaque) void {
+            const c: *Pool.Cache = @ptrCast(@alignCast(ctx));
+            const node: *Node = @ptrCast(@alignCast(ptr));
+            c.pool.releaseCached(c, node);
+        }
+
+        fn cacheOf(self: *Self, p: *ebr.Participant) ?*Pool.Cache {
+            return self.node_pool.cacheAt(self.domain.slotIndex(p));
         }
 
         // ── THE FABLE CORE ───────────────────────────────────────────────────────
@@ -141,7 +160,9 @@ pub fn Queue(comptime T: type) type {
         ///    link CAS publishes it; the CAS (⊇ release) + the consumer's seq_cst
         ///    (⊇ acquire) read of `next` transfer that initialization. The
         ///    handoff of the node memory itself from a past incarnation is
-        ///    ordered by the pool's internal lock (release by the freeing thread,
+        ///    ordered by program order when it comes from this thread's pool
+        ///    cache, else by the pool's internal lock (a spill and a refill:
+        ///    release by the freeing thread,
         ///    acquire here) — no thread can still touch the old incarnation, per
         ///    the EBR theorem.
         ///  • `tail` load: seq_cst — may still be superseded a cycle later, which
@@ -164,7 +185,7 @@ pub fn Queue(comptime T: type) type {
             // Acquire + initialize the node BEFORE pinning: keeps critical
             // sections (which stall reclamation domain-wide) as short as
             // possible, and the pool's own lock never nests inside a pin.
-            const node = try self.node_pool.acquire();
+            const node = if (self.cacheOf(p)) |c| try self.node_pool.acquireCached(c) else try self.node_pool.acquire();
             node.* = .{ .value = value, .next = .init(null) };
 
             // Pin PER ATTEMPT, never across a backoff. A `Backoff.pause` can
@@ -178,18 +199,18 @@ pub fn Queue(comptime T: type) type {
             var backoff: atomic.Backoff = .{};
             while (true) {
                 const guard = self.domain.enterCritical(p);
-                const t = self.tail.load(.seq_cst);
+                const t = self.tail.value.load(.seq_cst);
                 if (t.next.load(.seq_cst)) |n| {
                     // Lagging tail: help swing it, then retry immediately —
                     // helping is progress (ours or another producer's).
-                    _ = self.tail.cmpxchgStrong(t, n, .seq_cst, .seq_cst);
+                    _ = self.tail.value.cmpxchgStrong(t, n, .seq_cst, .seq_cst);
                     guard.release();
                     continue;
                 }
                 if (t.next.cmpxchgStrong(null, node, .seq_cst, .seq_cst) == null) {
                     // Linked (linearized). Swing tail; a failure means someone
                     // helped us — equally done.
-                    _ = self.tail.cmpxchgStrong(t, node, .seq_cst, .seq_cst);
+                    _ = self.tail.value.cmpxchgStrong(t, node, .seq_cst, .seq_cst);
                     guard.release();
                     return;
                 }
@@ -246,7 +267,10 @@ pub fn Queue(comptime T: type) type {
         ///    it under readers or aborting — see `ebr.Domain.retire`. Either way
         ///    `h` is never handed back to the pool early, so nothing here (and
         ///    nothing in the theorem) changes.
-        ///  • `tryAdvance` runs on every call, but strictly AFTER the unpin
+        ///  • `tryAdvance` runs through `Domain.advanceAmortized`: once every
+        ///    `Config.advance_period` dequeues, and on EVERY empty one (so a
+        ///    quiescing consumer still drains its own bags) — always strictly
+        ///    AFTER the unpin
         ///    (defers run LIFO: release first, then tryAdvance). This placement
         ///    is load-bearing for liveness: the scan takes ~max_participants
         ///    loads, so a thread that scans while still pinned is a stale-pin
@@ -259,10 +283,15 @@ pub fn Queue(comptime T: type) type {
         ///    assumes the advancing/draining thread is pinned. The empty-path
         ///    calls are what let a quiescing consumer (the harness drain loop)
         ///    advance the epoch by itself and empty its own bags before
-        ///    `unregister` asserts they are empty. Amortization is a non-goal
-        ///    here; a production consumer may batch it.
+        ///    `unregister`. The amortization (2026-10-14) took the scan off the
+        ///    hot path: per dequeue it was `max_participants` seq_cst loads.
         pub fn dequeue(self: *Self, p: *ebr.Participant) ?T {
-            defer self.domain.tryAdvance(p); // runs unpinned, after every release
+            // Runs unpinned, after every release; forced on the empty path.
+            var idle = false;
+            defer self.domain.advanceAmortized(p, idle);
+            // Before the first pin: the first `cacheAt` of a slot allocates
+            // under the pool's lock, which never nests inside a pin.
+            const cache = self.cacheOf(p);
 
             // Pin PER ATTEMPT, never across a backoff — same rationale (and same
             // measured epoch-freeze) as in `enqueue`. The retire still happens
@@ -271,22 +300,27 @@ pub fn Queue(comptime T: type) type {
             var backoff: atomic.Backoff = .{};
             while (true) {
                 const guard = self.domain.enterCritical(p);
-                const h = self.head.load(.seq_cst);
-                const t = self.tail.load(.seq_cst);
+                const h = self.head.value.load(.seq_cst);
+                const t = self.tail.value.load(.seq_cst);
                 const n = h.next.load(.seq_cst) orelse {
                     guard.release();
+                    idle = true;
                     return null;
                 };
                 if (h == t) {
                     // Lagging tail (an enqueuer linked but has not swung yet):
                     // help, then retry immediately — helping is progress.
-                    _ = self.tail.cmpxchgStrong(t, n, .seq_cst, .seq_cst);
+                    _ = self.tail.value.cmpxchgStrong(t, n, .seq_cst, .seq_cst);
                     guard.release();
                     continue;
                 }
                 const value = n.value;
-                if (self.head.cmpxchgStrong(h, n, .seq_cst, .seq_cst) == null) {
-                    self.domain.retire(p, .{
+                if (self.head.value.cmpxchgStrong(h, n, .seq_cst, .seq_cst) == null) {
+                    self.domain.retire(p, if (cache) |c| .{
+                        .ptr = h,
+                        .ctx = c,
+                        .reclaim = reclaimNodeCached,
+                    } else .{
                         .ptr = h,
                         .ctx = self.node_pool,
                         .reclaim = reclaimNode,
@@ -315,8 +349,8 @@ test "init builds a non-empty (dummy-sentinel) queue; deinit drains it" {
     var q = try MpmcQueue.init(&np, &d);
     // Michael-Scott invariant: head == tail == the dummy, and the queue is
     // never physically empty even when logically empty.
-    try testing.expectEqual(q.head.load(.monotonic), q.tail.load(.monotonic));
-    try testing.expectEqual(@as(?*MpmcQueue.Node, null), q.head.load(.monotonic).next.load(.monotonic));
+    try testing.expectEqual(q.head.value.load(.monotonic), q.tail.value.load(.monotonic));
+    try testing.expectEqual(@as(?*MpmcQueue.Node, null), q.head.value.load(.monotonic).next.load(.monotonic));
     q.deinit();
 
     // The dummy went back to the pool and is intact-poisoned there.
@@ -328,7 +362,7 @@ test "init builds a non-empty (dummy-sentinel) queue; deinit drains it" {
 fn linkLagging(q: *MpmcQueue, value: u64) !void {
     const node = try q.node_pool.acquire();
     node.* = .{ .value = value, .next = .init(null) };
-    var last = q.tail.load(.monotonic);
+    var last = q.tail.value.load(.monotonic);
     while (last.next.load(.monotonic)) |n| last = n;
     last.next.store(node, .monotonic);
 }
@@ -345,7 +379,7 @@ test "dequeue over a lagging tail helps it forward, so tail never falls behind h
     try testing.expectEqual(@as(?u64, 7), q.dequeue(p));
     // The old dummy is retired; a tail still pointing at it would hand it to
     // the next enqueuer.
-    try testing.expectEqual(q.head.load(.monotonic), q.tail.load(.monotonic));
+    try testing.expectEqual(q.head.value.load(.monotonic), q.tail.value.load(.monotonic));
     try testing.expectEqual(@as(?u64, null), q.dequeue(p));
 
     d.unregister(p);

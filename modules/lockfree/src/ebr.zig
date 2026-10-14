@@ -62,6 +62,14 @@ pub const Config = struct {
     /// cannot. Costs `max_participants * num_epochs * bag_reserve *
     /// @sizeOf(Retired)` bytes at `init`; set to 0 to opt out.
     bag_reserve: usize = 16,
+    /// `advanceAmortized` runs `tryAdvance` once per this many calls (and
+    /// whenever the caller asks for it unconditionally, e.g. on an empty
+    /// dequeue). `tryAdvance` scans every slot's `local_epoch`, so calling it
+    /// after each retire costs `max_participants` seq_cst loads per operation;
+    /// this spreads the scan out. Liveness only — the reclaim predicate and
+    /// every ordering are unchanged — and the price is limbo garbage of up to
+    /// about `advance_period` nodes per participant per epoch. 0 counts as 1.
+    advance_period: u32 = 64,
 };
 
 /// Number of epoch-indexed limbo bags. Three is the minimum that lets the
@@ -77,7 +85,9 @@ pub const Participant = struct {
     /// The epoch this participant last pinned, or `unpinned` when outside any
     /// critical section. A concurrent `tryAdvance` reads this to decide
     /// whether it is safe to advance the global epoch.
-    local_epoch: std.atomic.Value(u64),
+    /// Aligned to a cache line, so each participant's struct starts a line
+    /// of its own: neighbouring threads' pins never share one.
+    local_epoch: std.atomic.Value(u64) align(std.atomic.cache_line),
     /// Registry-slot occupancy. Mechanical (register/unregister flip it).
     /// NOTE: `tryAdvance` deliberately does NOT consult this flag — it scans
     /// `local_epoch` of every slot instead. Rationale: `register`'s CAS on
@@ -124,6 +134,9 @@ pub const Participant = struct {
     /// means pool slots were permanently withheld from reuse (never freed, so
     /// never a use-after-free); see `retire`.
     dropped_retires: usize,
+    /// Calls to `Domain.advanceAmortized` since its last `tryAdvance`.
+    /// Single-owner plain counter.
+    since_advance: u32,
 
     /// Sentinel `local_epoch` value meaning "not inside a critical section".
     pub const unpinned: u64 = std.math.maxInt(u64);
@@ -135,6 +148,7 @@ pub const Participant = struct {
         for (&self.bags) |*b| b.* = .empty;
         self.bag_epoch = @splat(0);
         self.dropped_retires = 0;
+        self.since_advance = 0;
     }
 
     fn deinitBags(self: *Participant, allocator: std.mem.Allocator) void {
@@ -177,6 +191,8 @@ pub const Domain = struct {
     /// advances). Nothing about the grace-period proof depends on this
     /// counter, which is why it may be `.monotonic`.
     orphan_count: std.atomic.Value(usize),
+    /// `Config.advance_period`.
+    advance_period: u32,
 
     pub fn init(allocator: std.mem.Allocator, cfg: Config) std.mem.Allocator.Error!Domain {
         const parts = try allocator.alloc(Participant, cfg.max_participants);
@@ -197,6 +213,7 @@ pub const Domain = struct {
             .participants = parts,
             .allocator = allocator,
             .orphan_count = .init(0),
+            .advance_period = @max(cfg.advance_period, 1),
         };
     }
 
@@ -214,6 +231,15 @@ pub const Domain = struct {
         for (self.participants) |*p| p.deinitBags(self.allocator);
         self.allocator.free(self.participants);
         self.* = undefined;
+    }
+
+    /// The registry index of `p`, stable while it is registered: lets a
+    /// structure over this domain keep per-participant state in an array of
+    /// `max_participants` entries. Mechanical.
+    pub fn slotIndex(self: *const Domain, p: *const Participant) usize {
+        const i = (@intFromPtr(p) - @intFromPtr(self.participants.ptr)) / @sizeOf(Participant);
+        std.debug.assert(i < self.participants.len and &self.participants[i] == p);
+        return i;
     }
 
     /// Read the current global epoch. Mechanical accessor (tests + the core).
@@ -592,6 +618,18 @@ pub const Domain = struct {
         reclaimExpired(p, e + 1);
     }
 
+    /// `tryAdvance` once every `Config.advance_period` calls by `p`, or now
+    /// when `force` is set. Liveness only: when the scan runs moves no line of
+    /// the theorem above, so a caller may skip it as freely as `tryAdvance`
+    /// itself may lose its CAS. A caller that goes idle (an empty dequeue, a
+    /// drain loop) passes `force`, so its own bags still empty without help.
+    pub fn advanceAmortized(self: *Domain, p: *Participant, force: bool) void {
+        p.since_advance += 1;
+        if (!force and p.since_advance < self.advance_period) return;
+        p.since_advance = 0;
+        self.tryAdvance(p);
+    }
+
     /// Drain every bag of `p` whose grace period has expired at `observed`.
     /// Single-owner (only `p`'s thread calls this with its own bags). The
     /// subtraction cannot underflow: a thread's epoch reads are monotone
@@ -895,4 +933,40 @@ test "fresh participant is unpinned with empty limbo bags" {
     try testing.expectEqual(Participant.unpinned, p.local_epoch.load(.monotonic));
     for (&p.bags) |*b| try testing.expectEqual(@as(usize, 0), b.items.len);
     d.unregister(p);
+}
+
+test "advanceAmortized scans once per period, and at once when forced" {
+    var d = try Domain.init(testing.allocator, .{ .max_participants = 2, .advance_period = 4 });
+    defer d.deinit();
+    const p = try d.register();
+    defer d.unregister(p);
+    // A lone unpinned participant advances the epoch on every tryAdvance.
+    for (0..3) |_| d.advanceAmortized(p, false);
+    try testing.expectEqual(@as(u64, 0), d.epoch());
+    d.advanceAmortized(p, false); // fourth call: the scan runs
+    try testing.expectEqual(@as(u64, 1), d.epoch());
+    d.advanceAmortized(p, true); // forced, though the period restarted
+    try testing.expectEqual(@as(u64, 2), d.epoch());
+    for (0..3) |_| d.advanceAmortized(p, false);
+    try testing.expectEqual(@as(u64, 2), d.epoch());
+}
+
+test "advance_period 0 counts as 1" {
+    var d = try Domain.init(testing.allocator, .{ .max_participants = 1, .advance_period = 0 });
+    defer d.deinit();
+    const p = try d.register();
+    defer d.unregister(p);
+    d.advanceAmortized(p, false);
+    try testing.expectEqual(@as(u64, 1), d.epoch());
+}
+
+test "slotIndex is the registry position" {
+    var d = try Domain.init(testing.allocator, .{ .max_participants = 3 });
+    defer d.deinit();
+    const a = try d.register();
+    const b = try d.register();
+    try testing.expectEqual(@as(usize, 0), d.slotIndex(a));
+    try testing.expectEqual(@as(usize, 1), d.slotIndex(b));
+    d.unregister(a);
+    d.unregister(b);
 }
