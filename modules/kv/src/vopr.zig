@@ -247,6 +247,10 @@ pub const Config = struct {
     /// `max_file_size` makes the runs rotate, migrate and merge
     /// multi-file stores.
     options: kv.Options = .{},
+    /// The compaction op merges a random subset of the sealed files instead
+    /// (`Db.merge`) whenever the store is multi-file. Live runner only — the
+    /// trace capture/replay keeps `compact`.
+    partial_merges: bool = false,
 };
 
 /// Aggregated across seeds by the caller; also the determinism witness.
@@ -268,6 +272,8 @@ pub const Stats = struct {
     /// Seeds that ended as a multi-file store (rotated at least once) —
     /// the teeth witness for runs with a small `max_file_size`.
     multi_file_stores: usize = 0,
+    /// `Db.merge` calls made by `Config.partial_merges` runs.
+    partial_merges: usize = 0,
     /// Mix of each seed's final media CRC — byte-level determinism witness.
     fingerprint: u64 = 0,
 };
@@ -434,7 +440,8 @@ const Vopr = struct {
                     got == null;
                 if (!ok) return v.fail("live get(key {d}) disagrees with the model", .{k});
             } else if (roll < 97) { // compact (no logical state change)
-                db.compact() catch |e| {
+                const r = if (v.cfg.partial_merges and db.multi) v.mergeSome(&db) else db.compact();
+                r catch |e| {
                     try v.event(.compact_fault, -1, 0);
                     try v.expectFault(e);
                     return .none;
@@ -447,6 +454,21 @@ const Vopr = struct {
         }
         try v.event(.close_clean, -1, 0);
         return .none;
+    }
+
+    /// `Db.merge` of a random subset of the sealed files.
+    fn mergeSome(v: *Vopr, db: *Db) anyerror!void {
+        const stats = try db.fileStats(v.gpa);
+        defer v.gpa.free(stats);
+        const ids = try v.arena.alloc(u32, stats.len);
+        var n: usize = 0;
+        for (stats) |st| {
+            if (st.active or !v.prng.chance(1, 2)) continue;
+            ids[n] = st.id;
+            n += 1;
+        }
+        v.stats.partial_merges += 1;
+        return db.merge(ids[0..n]);
     }
 
     /// Reboot the simulated machine, optionally rough up the media tail,
@@ -951,12 +973,13 @@ test "VOPR: multi-file stores — rotation, migration and merges under random fa
     const n = seed_count / 4;
     var seed: u64 = 1;
     while (seed <= n) : (seed += 1) {
-        try runSeed(testing.allocator, seed, .{ .options = .{ .max_file_size = 4096 } }, &stats);
+        try runSeed(testing.allocator, seed, .{ .options = .{ .max_file_size = 4096 }, .partial_merges = seed % 2 == 0 }, &stats);
     }
     try testing.expect(stats.crashes >= n / 2);
     try testing.expect(stats.io_errors >= n / 10);
     try testing.expect(stats.acked_ops >= n * 10);
     try testing.expect(stats.multi_file_stores >= n / 2);
+    try testing.expect(stats.partial_merges >= n / 4);
 }
 
 test "VOPR: identical seed reproduces the identical run" {

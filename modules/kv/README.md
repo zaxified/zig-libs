@@ -60,6 +60,14 @@ try db.putTtl("sess:ab12", "…", 30 * 60 * 1000);      // absent 30 min from no
 try db.putExpiring("otp:42", "…", deadline_ms);        // absent from deadline_ms on
 _ = db.expiresAt("sess:ab12");                         // ?Expiry: .never / .at_ms
 
+// Bitcask-style merging of sealed files (multi-file stores; writes go on meanwhile):
+if (try db.mergePlan(gpa, .{})) |ids| {          // null: no trigger fired
+    defer gpa.free(ids);
+    try db.merge(ids);
+}
+const stats = try db.fileStats(gpa);            // per-file size, live/dead, fragmentation()
+defer gpa.free(stats);
+
 // Bitcask-style sync policies (default .always = fsync per write):
 var fast = try kv.Db.open(gpa, fs_store.storage(), "cache.kv", .{ .sync = .none });
 try fast.put("k", "v");            // acknowledged, durable at the next barrier

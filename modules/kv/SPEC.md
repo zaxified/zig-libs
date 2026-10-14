@@ -203,6 +203,41 @@ append that would take the active data file past it first **rotates** — seals 
   multi-file). Mutants: no seal sync (red: no-sync rotation sweep), merge output not synced (red:
   3 sweeps), no dir sync between migration renames (red: unit test).
 
+## Merge (partial, concurrent)
+
+`Db.fileStats` (Bitcask `status`: per-file size, live/dead keys and bytes, fragmentation, expired
+keys counted dead), `Db.mergePlan(gpa, MergeThresholds)` (Bitcask `needs_merge` with its trigger
+and threshold defaults: fragmentation 60/40 %, dead bytes 512/128 MiB, small file 10 MiB; sealed
+files only — null when nothing triggers) and `Db.merge(ids)` (2026-10-14, S2 survey R3/R4).
+
+- **Two phases.** Copy under `merge_lock` only — writers and readers go on — then a swap under
+  the writer lock and, for the keydir update, the exclusive keydir lock. The copy scans each
+  merged file record by record; a put is copied iff the keydir points at exactly that record
+  (rw shared per lookup). At the swap an entry is repointed only if it still points at the old
+  location; a key rewritten or deleted meanwhile keeps its newer record and the copy is counted
+  dead.
+- **Deletion markers.** A marker in a merged file guards a value only in an OLDER file; it is
+  rewritten iff some sealed file older than it stays outside the merge and the key is absent from
+  the keydir (a present key's record is newer and wins anyway). An expired record whose key the
+  keydir still points at becomes such a marker, and the key is dropped at the swap.
+- **Placement.** The outputs take the replay position of the NEWEST merged file: an unmerged
+  file between merged ones can hold an older record of a key whose live record was merged, so the
+  copy must replay after it (test "outputs take the newest merged file's place", red with outputs
+  at the oldest position).
+- **Ids.** Outputs get fresh ids under the writer lock, created in hand-out order (what keeps
+  `open`'s stray probe exact) and recorded as pending: a rotation's manifest written during the
+  copy lists them obsolete, so a crash leaves nothing behind.
+- **`compact`** takes `merge_lock` too (lock order `merge_lock` → writer lock → keydir lock).
+- **Tests:** plan + merge of only the all-dead file; markers kept across an unmerged older file
+  (incl. an expired record), then dropped when everything sealed merges; placement around an
+  unmerged file + single-file merge; writers and readers proceed while a merge is parked between
+  copy and swap; crash sweep over a partial-merge script in all four modes; VOPR multi-file run
+  with random partial merges on even seeds; readers + writer + a merger thread on the real
+  filesystem under ThreadSanitizer — **which found a race** (the active file's `size` was stored
+  without the shared lock `fileStats` reads it under; now atomic). Mutants: markers never kept,
+  repoint without the "rewritten meanwhile" check, no output sync, outputs at the oldest position,
+  outputs dropped for a single-file merge — all red.
+
 ## Sync policy
 
 `Options.sync` (2026-10-14, S2 survey R1) is Bitcask's `sync_strategy`: `.always` (default — fsync

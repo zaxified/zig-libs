@@ -1049,6 +1049,14 @@ pub const Db = struct {
     /// Retired data-file ids whose deletion failed; the next manifest still
     /// lists them as obsolete, so a later `open` retries.
     obsolete: std.ArrayListUnmanaged(u32),
+    /// Ids of files a running merge has created but no manifest names yet.
+    /// Any manifest written meanwhile (a rotation) lists them as obsolete,
+    /// so a crash leaves nothing behind. Changed under the writer lock.
+    pending: std.ArrayListUnmanaged(u32),
+    /// Serializes `merge` and `compact` (lock order: `merge_lock`, then
+    /// `lock`, then `rw`). A merge copies under this lock alone, so writers
+    /// and readers go on meanwhile.
+    merge_lock: Lock,
     /// Owned copies of the store path (data file or manifest), the
     /// single-file compaction temp, the manifest temp and the cross-process
     /// lock sidecar path.
@@ -1148,6 +1156,8 @@ pub const Db = struct {
             .multi = false,
             .next_file_id = 1,
             .obsolete = .empty,
+            .pending = .empty,
+            .merge_lock = .{ .io = store.io },
             .path = try gpa.dupe(u8, path),
             .tmp_path = undefined,
             .manifest_tmp = undefined,
@@ -1393,19 +1403,24 @@ pub const Db = struct {
 
     /// The manifest for `ids` into the synced temp `<path>.manifest`.
     fn writeManifestTemp(self: *Db, ids: []const u32, next_id: u32) (Allocator.Error || Storage.Error)!void {
-        const len = header_len + 12 + (ids.len + self.obsolete.items.len) * 4 + 4;
+        const n_obs = self.obsolete.items.len + self.pending.items.len;
+        const len = header_len + 12 + (ids.len + n_obs) * 4 + 4;
         const buf = try self.gpa.alloc(u8, len);
         defer self.gpa.free(buf);
         writeHeader(buf[0..header_len], version_manifest);
         std.mem.writeInt(u32, buf[8..12], next_id, .little);
         std.mem.writeInt(u32, buf[12..16], @intCast(ids.len), .little);
-        std.mem.writeInt(u32, buf[16..20], @intCast(self.obsolete.items.len), .little);
+        std.mem.writeInt(u32, buf[16..20], @intCast(n_obs), .little);
         var off: usize = 20;
         for (ids) |id| {
             std.mem.writeInt(u32, buf[off..][0..4], id, .little);
             off += 4;
         }
         for (self.obsolete.items) |id| {
+            std.mem.writeInt(u32, buf[off..][0..4], id, .little);
+            off += 4;
+        }
+        for (self.pending.items) |id| {
             std.mem.writeInt(u32, buf[off..][0..4], id, .little);
             off += 4;
         }
@@ -1428,6 +1443,7 @@ pub const Db = struct {
         if (self.lock_file) |lh| self.store.close(lh);
         self.freeKeydir();
         self.obsolete.deinit(self.gpa);
+        self.pending.deinit(self.gpa);
         self.gpa.free(self.path);
         self.gpa.free(self.tmp_path);
         self.gpa.free(self.manifest_tmp);
@@ -1603,7 +1619,9 @@ pub const Db = struct {
             self.poisoned = true;
             return e;
         };
-        act.size += rec.len;
+        // Atomic: `fileStats` reads it under the shared lock, which a write
+        // does not take (only writers ever store it).
+        @atomicStore(u64, &act.size, off + rec.len, .monotonic);
         self.unsynced = true;
         const due = switch (self.options.sync) {
             .always => true,
@@ -1874,11 +1892,336 @@ pub const Db = struct {
     /// are discarded); errors at/after it poison the store (the namespace
     /// state is uncertain until reopen).
     pub fn compact(self: *Db) CompactError!void {
+        self.merge_lock.acquire();
+        defer self.merge_lock.release();
         self.lock.acquire();
         defer self.lock.release();
         if (self.poisoned) return error.Poisoned;
         if (self.multi) return self.mergeAllLocked();
         return self.compactLocked(self.active().version);
+    }
+
+    /// One data file as `fileStats` reports it — Bitcask's `status`.
+    pub const FileStat = struct {
+        /// 0 for a single-file store's only file.
+        id: u32,
+        size: u64,
+        live_keys: u64,
+        live_bytes: u64,
+        /// Superseded, deleted, and (at the time of the call) expired records.
+        dead_keys: u64,
+        dead_bytes: u64,
+        /// The file writes go to; never part of a merge.
+        active: bool,
+
+        /// Bitcask's fragmentation: dead records as a percentage of all.
+        pub fn fragmentation(s: FileStat) u8 {
+            const total = s.live_keys + s.dead_keys;
+            return if (total == 0) 0 else @intCast(s.dead_keys * 100 / total);
+        }
+    };
+
+    /// Per-file statistics, in replay order (the active file last). Caller
+    /// frees.
+    pub fn fileStats(self: *Db, gpa: Allocator) Allocator.Error![]FileStat {
+        self.rw.lockShared();
+        defer self.rw.unlockShared();
+        const out = try gpa.alloc(FileStat, self.files.items.len);
+        for (self.files.items, out, 0..) |df, *st, i| st.* = .{
+            .id = if (df.id == legacy_id) 0 else df.id,
+            .size = @atomicLoad(u64, &df.size, .monotonic),
+            .live_keys = df.live_keys,
+            .live_bytes = df.live_bytes,
+            .dead_keys = df.dead_keys,
+            .dead_bytes = df.dead_bytes,
+            .active = i + 1 == self.files.items.len,
+        };
+        if (self.expiring != 0) {
+            // An expired key still in memory is dead weight in its file.
+            const now = self.options.clock.now();
+            var it = self.keydir.valueIterator();
+            while (it.next()) |e| {
+                if (e.liveAt(now)) continue;
+                const i = std.mem.indexOfScalar(*DataFile, self.files.items, e.file).?;
+                const len = e.recLen();
+                out[i].live_keys -= 1;
+                out[i].live_bytes -= len;
+                out[i].dead_keys += 1;
+                out[i].dead_bytes += len;
+            }
+        }
+        return out;
+    }
+
+    /// When a merge is due and which files join it — Bitcask's merge
+    /// triggers and thresholds, with its defaults.
+    pub const MergeThresholds = struct {
+        /// A merge is due when some sealed file has at least this
+        /// fragmentation (percent) …
+        trigger_fragmentation: u8 = 60,
+        /// … or at least this many dead bytes.
+        trigger_dead_bytes: u64 = 512 << 20,
+        /// A due merge takes every sealed file with at least this
+        /// fragmentation, …
+        threshold_fragmentation: u8 = 40,
+        /// … at least this many dead bytes, …
+        threshold_dead_bytes: u64 = 128 << 20,
+        /// … or fewer bytes than this.
+        small_file: u64 = 10 << 20,
+    };
+
+    /// The ids of the sealed files a merge should take now, or null when no
+    /// trigger fires (Bitcask's `needs_merge`). Pass the result to `merge`;
+    /// caller frees. A single-file store has no sealed file: null (use
+    /// `compact`).
+    pub fn mergePlan(self: *Db, gpa: Allocator, t: MergeThresholds) Allocator.Error!?[]u32 {
+        const stats = try self.fileStats(gpa);
+        defer gpa.free(stats);
+        const due = for (stats) |st| {
+            if (!st.active and (st.fragmentation() >= t.trigger_fragmentation or st.dead_bytes >= t.trigger_dead_bytes))
+                break true;
+        } else false;
+        if (!due) return null;
+        var ids: std.ArrayList(u32) = .empty;
+        errdefer ids.deinit(gpa);
+        for (stats) |st| {
+            if (st.active) continue;
+            if (st.fragmentation() >= t.threshold_fragmentation or st.dead_bytes >= t.threshold_dead_bytes or st.size < t.small_file)
+                try ids.append(gpa, st.id);
+        }
+        return try ids.toOwnedSlice(gpa);
+    }
+
+    /// Merge the sealed files `ids` (from `mergePlan` or `fileStats`; ids
+    /// that are not sealed files of this store are ignored): their live
+    /// records go into new files that take their place, and they are deleted.
+    /// Unlike `compact`, the active file and other sealed files are not
+    /// touched, and the copying runs without the writer lock — writers and
+    /// readers go on, and a key written meanwhile simply keeps its newer
+    /// record. Only the final swap (manifest + keydir) excludes them.
+    ///
+    /// Deletion markers in the merged files are kept while an older sealed
+    /// file outside the merge might still hold a value they hide; expired
+    /// records become such markers. Crash safety and errors as `compact`.
+    pub fn merge(self: *Db, ids: []const u32) CompactError!void {
+        self.merge_lock.acquire();
+        defer self.merge_lock.release();
+
+        // Which files, at which replay positions. Only a merge or `compact`
+        // changes the sealed part of `files` (we hold the merge lock); a
+        // rotation meanwhile only appends.
+        var sel: std.ArrayListUnmanaged(*DataFile) = .empty;
+        defer sel.deinit(self.gpa);
+        var sel_pos: std.ArrayListUnmanaged(usize) = .empty;
+        defer sel_pos.deinit(self.gpa);
+        var first_unmerged: usize = std.math.maxInt(usize);
+        {
+            self.rw.lockShared();
+            defer self.rw.unlockShared();
+            if (!self.multi) return;
+            for (self.files.items[0 .. self.files.items.len - 1], 0..) |df, pos| {
+                if (std.mem.indexOfScalar(u32, ids, df.id) != null) {
+                    try sel.append(self.gpa, df);
+                    try sel_pos.append(self.gpa, pos);
+                } else if (first_unmerged == std.math.maxInt(usize)) {
+                    first_unmerged = pos;
+                }
+            }
+        }
+        if (sel.items.len == 0) return;
+        const now = self.options.clock.now();
+
+        const Move = struct {
+            key: []u8,
+            from: *DataFile,
+            from_off: u64,
+            /// null: the record had expired — drop the key if still there.
+            to: ?*DataFile,
+            to_off: u64,
+            len: u64,
+        };
+        var moves: std.ArrayListUnmanaged(Move) = .empty;
+        defer {
+            for (moves.items) |m| self.gpa.free(m.key);
+            moves.deinit(self.gpa);
+        }
+        var outs: std.ArrayListUnmanaged(*DataFile) = .empty;
+        defer outs.deinit(self.gpa);
+        var swapped = false;
+        var named = false;
+        defer if (!swapped) {
+            self.lock.acquire();
+            defer self.lock.release();
+            for (outs.items) |df| {
+                self.store.close(df.handle);
+                if (!named) _ = self.deleteDataFile(df.id) catch {};
+                self.dropPending(df.id);
+                self.gpa.destroy(df);
+            }
+        };
+
+        var rec: std.ArrayListUnmanaged(u8) = .empty;
+        defer rec.deinit(self.gpa);
+        for (sel.items, sel_pos.items) |df, pos| {
+            // A marker here guards a value in an older file only if such a
+            // file stays outside the merge.
+            const keep_markers = first_unmerged < pos;
+            var off: u64 = header_len;
+            while (off < df.size) {
+                var hdr: [rec_fixed + exp_len]u8 = undefined;
+                try self.store.preadFull(df.handle, hdr[0..rec_fixed], off);
+                const op = hdr[4];
+                const key_len = std.mem.readInt(u32, hdr[5..9], .little);
+                const val_len = std.mem.readInt(u32, hdr[9..13], .little);
+                const body: u64 = rec_fixed + @as(u64, if (op == op_put_exp) exp_len else 0);
+                const len = body + key_len + val_len;
+                // Replay validated the sealed file at open; a mismatch now is
+                // rot since, never copied.
+                if (len > df.size - off) return error.Corrupt;
+                try rec.resize(self.gpa, @intCast(len));
+                try self.store.preadFull(df.handle, rec.items, off);
+                if (std.hash.Crc32.hash(rec.items[4..]) != std.mem.readInt(u32, rec.items[0..4], .little))
+                    return error.Corrupt;
+                const key = rec.items[@intCast(body)..][0..key_len];
+                const expires_at: i64 = if (op == op_put_exp) std.mem.readInt(i64, rec.items[rec_fixed..][0..exp_len], .little) else no_expiry;
+                const rec_off = off;
+                off += len;
+
+                var live = false;
+                var present = false;
+                {
+                    self.rw.lockShared();
+                    defer self.rw.unlockShared();
+                    if (self.keydir.get(key)) |e| {
+                        present = true;
+                        live = e.file == df and e.off == rec_off;
+                    }
+                }
+                if (op == op_del) {
+                    if (keep_markers and !present) _ = try self.mergeWrite(&outs, null, key);
+                    continue;
+                }
+                if (!live) continue;
+                try moves.ensureUnusedCapacity(self.gpa, 1);
+                const key_copy = try self.gpa.dupe(u8, key);
+                if (expires_at <= now) {
+                    moves.appendAssumeCapacity(.{ .key = key_copy, .from = df, .from_off = rec_off, .to = null, .to_off = 0, .len = 0 });
+                    if (keep_markers) _ = try self.mergeWrite(&outs, null, key);
+                } else {
+                    const at = self.mergeWrite(&outs, rec.items, key) catch |e| {
+                        self.gpa.free(key_copy);
+                        return e;
+                    };
+                    moves.appendAssumeCapacity(.{ .key = key_copy, .from = df, .from_off = rec_off, .to = at.file, .to_off = at.off, .len = len });
+                }
+            }
+        }
+        if (outs.items.len > 0) try self.store.sync(outs.items[outs.items.len - 1].handle);
+
+        // ── swap ──
+        self.lock.acquire();
+        defer self.lock.release();
+        if (self.poisoned) return error.Poisoned;
+        var new_files: std.ArrayListUnmanaged(*DataFile) = .empty;
+        defer new_files.deinit(self.gpa);
+        const last_sel = sel.items[sel.items.len - 1];
+        for (self.files.items) |df| {
+            if (df == last_sel) {
+                try new_files.appendSlice(self.gpa, outs.items);
+            } else if (std.mem.indexOfScalar(*DataFile, sel.items, df) == null) {
+                try new_files.append(self.gpa, df);
+            }
+        }
+        const new_ids = try self.gpa.alloc(u32, new_files.items.len);
+        defer self.gpa.free(new_ids);
+        for (new_files.items, new_ids) |df, *id| id.* = df.id;
+        try self.files.ensureTotalCapacity(self.gpa, new_files.items.len);
+        try self.obsolete.ensureUnusedCapacity(self.gpa, sel.items.len);
+        for (sel.items) |df| self.obsolete.appendAssumeCapacity(df.id);
+        for (outs.items) |df| self.dropPending(df.id);
+        self.writeManifestTemp(new_ids, self.next_file_id) catch |e| {
+            self.obsolete.shrinkRetainingCapacity(self.obsolete.items.len - sel.items.len);
+            return e;
+        };
+        named = true;
+        self.store.rename(self.manifest_tmp, self.path) catch |e| {
+            self.poisoned = true;
+            return e;
+        };
+        self.store.syncDir() catch |e| {
+            self.poisoned = true;
+            return e;
+        };
+
+        {
+            self.rw.lock();
+            defer self.rw.unlock();
+            swapped = true;
+            // The outputs' markers, counted dead in their file by
+            // `mergeWrite`, join the store's total now.
+            for (outs.items) |o| self.dead_bytes += o.dead_bytes;
+            for (moves.items) |m| {
+                const e = self.keydir.getPtr(m.key) orelse {
+                    if (m.to) |to| self.addDead(to, m.len);
+                    continue;
+                };
+                if (e.file != m.from or e.off != m.from_off) {
+                    // Rewritten meanwhile: the copy is dead weight.
+                    if (m.to) |to| self.addDead(to, m.len);
+                    continue;
+                }
+                if (m.to) |to| {
+                    e.file = to;
+                    e.off = m.to_off;
+                    self.addLive(e.*);
+                } else {
+                    const kv = self.keydir.fetchRemove(m.key).?;
+                    if (kv.value.expires()) self.expiring -= 1;
+                    self.gpa.free(@constCast(kv.key));
+                }
+            }
+            for (sel.items) |df| {
+                self.dead_bytes -= df.dead_bytes;
+                self.store.close(df.handle);
+            }
+            self.files.clearRetainingCapacity();
+            self.files.appendSliceAssumeCapacity(new_files.items);
+        }
+        self.retireFiles(sel.items);
+    }
+
+    /// Append `rec` (or, when null, a deletion marker for `key`) to the
+    /// current merge output, starting a new one when there is none or it
+    /// would cross `max_file_size`. A marker is accounted dead at once.
+    fn mergeWrite(self: *Db, outs: *std.ArrayListUnmanaged(*DataFile), rec: ?[]const u8, key: []const u8) CompactError!struct { file: *DataFile, off: u64 } {
+        var marker: std.ArrayListUnmanaged(u8) = .empty;
+        defer marker.deinit(self.gpa);
+        const bytes = rec orelse blk: {
+            try marker.resize(self.gpa, @intCast(recordLen(key.len, 0)));
+            encodeRecord(marker.items, op_del, key, "");
+            break :blk marker.items;
+        };
+        const need_new = outs.items.len == 0 or blk: {
+            const o = outs.items[outs.items.len - 1];
+            break :blk o.size > header_len and o.size + bytes.len > self.options.max_file_size;
+        };
+        if (need_new) {
+            if (outs.items.len > 0) try self.store.sync(outs.items[outs.items.len - 1].handle);
+            self.lock.acquire();
+            defer self.lock.release();
+            try self.startOutput(outs);
+        }
+        const out = outs.items[outs.items.len - 1];
+        const off = out.size;
+        try self.store.writeAll(out.handle, bytes, off);
+        out.size += bytes.len;
+        if (rec == null) {
+            out.dead_bytes += bytes.len;
+            out.dead_keys += 1;
+            // Joins the store's total at the swap (`addDead` there would
+            // count it twice); see `merge`.
+        }
+        return .{ .file = out, .off = off };
     }
 
     /// Single-file `compact` writing the new file at format `version`.
@@ -1995,7 +2338,8 @@ pub const Db = struct {
             if (!named) _ = self.deleteDataFile(df.id) catch {};
             self.gpa.destroy(df);
         };
-        try self.startOutput(&outs, self.next_file_id);
+        defer if (!swapped) for (outs.items) |df| self.dropPending(df.id);
+        try self.startOutput(&outs);
 
         var it = self.keydir.iterator();
         while (it.next()) |kv| {
@@ -2007,7 +2351,7 @@ pub const Db = struct {
             var out = outs.items[outs.items.len - 1];
             if (out.size > header_len and out.size + e.recLen() > self.options.max_file_size) {
                 try self.store.sync(out.handle);
-                try self.startOutput(&outs, out.id + 1);
+                try self.startOutput(&outs);
                 out = outs.items[outs.items.len - 1];
             }
             const len = try self.copyRecord(e.*, out.handle, out.size);
@@ -2028,7 +2372,9 @@ pub const Db = struct {
         const old = try self.gpa.dupe(*DataFile, self.files.items);
         defer self.gpa.free(old);
         for (old) |df| self.obsolete.appendAssumeCapacity(df.id);
-        self.writeManifestTemp(ids, last.id + 1) catch |e| {
+        // The outputs become files: no longer pending in this manifest.
+        for (outs.items) |df| self.dropPending(df.id);
+        self.writeManifestTemp(ids, self.next_file_id) catch |e| {
             self.obsolete.shrinkRetainingCapacity(self.obsolete.items.len - old.len);
             return e;
         };
@@ -2057,13 +2403,17 @@ pub const Db = struct {
             }
             self.files.clearRetainingCapacity();
             self.files.appendSliceAssumeCapacity(outs.items);
-            self.next_file_id = last.id + 1;
             self.dead_bytes = 0;
             self.markSynced();
             for (old) |df| self.store.close(df.handle);
         }
-        // The manifest lists the old files as obsolete, so a crash or an
-        // error here only delays their deletion to the next `open`.
+        self.retireFiles(old);
+    }
+
+    /// Delete retired data files (handles already closed) and free them.
+    /// The manifest lists them as obsolete, so a crash or an error here only
+    /// delays a deletion to the next `open`.
+    fn retireFiles(self: *Db, old: []const *DataFile) void {
         for (old) |df| {
             const gone = if (self.deleteDataFile(df.id)) |_| true else |_| false;
             if (gone) {
@@ -2074,12 +2424,21 @@ pub const Db = struct {
         }
     }
 
-    /// Create data file `id` (header written, not yet synced) as the next
-    /// merge output.
-    fn startOutput(self: *Db, outs: *std.ArrayListUnmanaged(*DataFile), id: u32) CompactError!void {
+    fn dropPending(self: *Db, id: u32) void {
+        if (std.mem.indexOfScalar(u32, self.pending.items, id)) |at| _ = self.pending.swapRemove(at);
+    }
+
+    /// Create the next merge output (header written, not yet synced) under
+    /// a fresh id, recorded as pending. Caller holds the writer lock, so ids
+    /// are created in the order they are handed out — what lets `open`'s
+    /// stray probe stop at the first missing id.
+    fn startOutput(self: *Db, outs: *std.ArrayListUnmanaged(*DataFile)) CompactError!void {
         try outs.ensureUnusedCapacity(self.gpa, 1);
+        try self.pending.ensureUnusedCapacity(self.gpa, 1);
         const df = try self.gpa.create(DataFile);
         errdefer self.gpa.destroy(df);
+        const id = self.next_file_id;
+        self.next_file_id += 1;
         const name = try self.fileName(id, "data");
         defer self.gpa.free(name);
         const h = try self.store.open(name, .create_truncate);
@@ -2092,6 +2451,7 @@ pub const Db = struct {
         try self.store.writeAll(h, &hdr, 0);
         df.* = .{ .id = id, .handle = h, .size = header_len, .version = version_expiry };
         outs.appendAssumeCapacity(df);
+        self.pending.appendAssumeCapacity(id);
     }
 
     // ── internals ───────────────────────────────────────────────────────────
@@ -2830,6 +3190,178 @@ test "multi-file: a data file past next_file_id is a crashed creation, deleted o
     try expectGet(&db, "b", "second value, also around 30..");
 }
 
+/// A 30-byte value: two records fill a 64-byte data file past its header.
+const v30 = "value of exactly thirty bytes.";
+
+test "merge: mergePlan picks fragmented sealed files; merge rewrites only those" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    const options: Options = .{ .max_file_size = 100 };
+    var db = try Db.open(testing.allocator, sim.storage(), "db", options);
+    defer db.close();
+    // Files 0..: each holds two records; overwriting "a" and "b" leaves the
+    // early files all dead, "keep-N" keeps later ones live.
+    try db.put("a", v30);
+    try db.put("b", v30);
+    try db.put("a", v30);
+    try db.put("b", v30);
+    for (0..4) |i| {
+        var k: [8]u8 = undefined;
+        try db.put(try std.fmt.bufPrint(&k, "keep-{d}", .{i}), v30);
+    }
+    const t: Db.MergeThresholds = .{ .trigger_fragmentation = 50, .threshold_fragmentation = 50, .small_file = 0 };
+    const stats = try db.fileStats(testing.allocator);
+    defer testing.allocator.free(stats);
+    try testing.expect(stats.len >= 4);
+    try testing.expectEqual(@as(u8, 100), stats[0].fragmentation());
+    try testing.expect(stats[stats.len - 1].active);
+
+    const plan = (try db.mergePlan(testing.allocator, t)).?;
+    defer testing.allocator.free(plan);
+    try testing.expectEqual(@as(usize, 1), plan.len); // only the all-dead first file
+    try testing.expectEqual(stats[0].id, plan[0]);
+    const dead_before = db.deadBytes();
+    const files_before = db.files.items.len;
+    try db.merge(plan);
+    try testing.expect(db.deadBytes() < dead_before);
+    try testing.expectEqual(files_before - 1, db.files.items.len); // nothing live: no output
+    try testing.expect((try db.mergePlan(testing.allocator, t)) == null);
+    try expectGet(&db, "a", v30);
+    try expectGet(&db, "keep-3", v30);
+    db.close();
+    db = try Db.open(testing.allocator, sim.storage(), "db", options);
+    try testing.expectEqual(@as(usize, 6), db.count());
+    try expectGet(&db, "b", v30);
+}
+
+test "merge: a deletion marker survives while an older unmerged file holds the value" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    const options: Options = .{ .max_file_size = 64, .clock = .{ .nowFn = struct {
+        fn f(_: ?*anyopaque) i64 {
+            return 1000;
+        }
+    }.f } };
+    var db = try Db.open(testing.allocator, sim.storage(), "db", options);
+    defer db.close();
+    try db.put("k", v30); // file 0
+    try db.put("e", v30);
+    try db.delete("k"); // marker in file 1
+    try db.putExpiring("e", v30, 999); // expired at once: an expiry marker in file 1 or 2
+    try db.put("x", v30);
+    try db.put("y", v30);
+    try db.put("z", v30);
+    const stats = try db.fileStats(testing.allocator);
+    defer testing.allocator.free(stats);
+    // Merge every sealed file except the first: its "k" and "e" values stay
+    // behind, so the markers must too.
+    var ids: std.ArrayList(u32) = .empty;
+    defer ids.deinit(testing.allocator);
+    for (stats[1..]) |st| if (!st.active) try ids.append(testing.allocator, st.id);
+    try testing.expect(ids.items.len >= 2);
+    try db.merge(ids.items);
+    try expectGet(&db, "k", null);
+    try expectGet(&db, "e", null);
+    db.close();
+    db = try Db.open(testing.allocator, sim.storage(), "db", options);
+    try expectGet(&db, "k", null); // a dropped marker would bring it back here
+    try expectGet(&db, "e", null);
+    try expectGet(&db, "z", v30);
+    // Merging everything sealed, markers have nothing left to guard.
+    const all = try db.fileStats(testing.allocator);
+    defer testing.allocator.free(all);
+    ids.clearRetainingCapacity();
+    for (all) |st| if (!st.active) try ids.append(testing.allocator, st.id);
+    try db.merge(ids.items);
+    for (db.files.items[0 .. db.files.items.len - 1]) |df| try testing.expectEqual(@as(u64, 0), df.dead_keys);
+    try expectGet(&db, "k", null);
+}
+
+test "merge: outputs take the newest merged file's place, after unmerged files between" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    const options: Options = .{ .max_file_size = 64 };
+    var db = try Db.open(testing.allocator, sim.storage(), "db", options);
+    defer db.close();
+    try db.put("p", v30); // file A
+    try db.put("k", "old value in the middle file.."); // file B
+    try db.put("k", "new value in the third file..."); // file C
+    try db.put("q", v30); // file D (active or sealed)
+    try db.put("r", v30);
+    const st = try db.fileStats(testing.allocator);
+    defer testing.allocator.free(st);
+    try testing.expect(st.len >= 4 and !st[2].active);
+    // Merge A and C around the unmerged B: C's live "k" must stay after B's
+    // dead one in replay order.
+    try db.merge(&.{ st[0].id, st[2].id });
+    try expectGet(&db, "k", "new value in the third file...");
+    db.close();
+    db = try Db.open(testing.allocator, sim.storage(), "db", options);
+    try expectGet(&db, "k", "new value in the third file...");
+    try expectGet(&db, "p", v30);
+    // A single file with live data: its output replaces it.
+    const st2 = try db.fileStats(testing.allocator);
+    defer testing.allocator.free(st2);
+    const n_files = db.files.items.len;
+    const live_one = for (st2) |f| {
+        if (!f.active and f.live_keys > 0) break f.id;
+    } else unreachable;
+    try db.merge(&.{live_one});
+    try testing.expectEqual(n_files, db.files.items.len);
+    try expectGet(&db, "p", v30);
+    db.close();
+    db = try Db.open(testing.allocator, sim.storage(), "db", options);
+    try expectGet(&db, "p", v30);
+    try expectGet(&db, "k", "new value in the third file...");
+}
+
+test "merge: writers go on during the copy; keys rewritten meanwhile keep their newer value" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var gate: GateStorage = .{ .inner = sim.storage() };
+    // `.none`: the main thread's writes never sync, so only the merge parks
+    // in the gate (on its output's sync, after the copy, before the swap).
+    var db = try Db.open(testing.allocator, gate.storage(), "db", .{ .max_file_size = 100, .sync = .none });
+    defer db.close();
+    try db.put("a", v30);
+    try db.put("b", v30);
+    try db.put("c", v30);
+    try db.put("d", v30);
+    try db.put("e", v30);
+    const stats = try db.fileStats(testing.allocator);
+    defer testing.allocator.free(stats);
+    var ids: std.ArrayList(u32) = .empty;
+    defer ids.deinit(testing.allocator);
+    for (stats) |st| if (!st.active) try ids.append(testing.allocator, st.id);
+
+    gate.armed.store(true, .release);
+    const Merger = struct {
+        fn run(d: *Db, which: []const u32) void {
+            d.merge(which) catch unreachable;
+        }
+    };
+    {
+        const t = try std.Thread.spawn(.{}, Merger.run, .{ &db, ids.items });
+        defer t.join();
+        defer gate.open_gate.store(true, .release);
+        while (!gate.in_sync.load(.acquire)) try std.Thread.yield();
+        gate.armed.store(false, .release);
+        // The merge holds only its own lock now: these must not wait for it.
+        try db.put("a", "rewritten during the merge");
+        try db.delete("b");
+        try expectGet(&db, "c", v30); // readers too
+    }
+    try expectGet(&db, "a", "rewritten during the merge");
+    try expectGet(&db, "b", null);
+    try expectGet(&db, "c", v30);
+    db.close();
+    db = try Db.open(testing.allocator, sim.storage(), "db", .{ .max_file_size = 100 });
+    try expectGet(&db, "a", "rewritten during the merge");
+    try expectGet(&db, "b", null);
+    try expectGet(&db, "d", v30);
+}
+
 test "persistence: close and reopen recovers everything" {
     var sim = SimStorage.init(testing.allocator);
     defer sim.deinit();
@@ -3362,12 +3894,35 @@ test "concurrency: readers alongside puts, deletes and compactions (real filesys
             }
         }
     };
+    // Partial merges of the sealed files, racing the writer's rotations.
+    const Merger = struct {
+        merges: usize = 0,
+        fn run(m: *@This(), d: *Db, stop: *std.atomic.Value(bool)) void {
+            var turn: usize = 0;
+            while (!stop.load(.acquire)) : (turn += 1) {
+                const st = d.fileStats(testing.allocator) catch unreachable;
+                defer testing.allocator.free(st);
+                var ids: [64]u32 = undefined;
+                var n: usize = 0;
+                for (st, 0..) |f, i| {
+                    if (f.active or n == ids.len or (i + turn) % 2 == 0) continue;
+                    ids[n] = f.id;
+                    n += 1;
+                }
+                d.merge(ids[0..n]) catch unreachable;
+                m.merges += 1;
+            }
+        }
+    };
     var stop: std.atomic.Value(bool) = .init(false);
     var readers: [2]Reader = .{ .{}, .{} };
-    var threads: [3]std.Thread = undefined;
+    var merger: Merger = .{};
+    var threads: [4]std.Thread = undefined;
     threads[0] = try std.Thread.spawn(.{}, Writer.run, .{ &db, &stop });
     for (&readers, 1..) |*r, i| threads[i] = try std.Thread.spawn(.{}, Reader.run, .{ r, &db, &stop });
+    threads[3] = try std.Thread.spawn(.{}, Merger.run, .{ &merger, &db, &stop });
     for (threads) |t| t.join();
+    try testing.expect(merger.merges > 0);
     for (readers) |r| {
         try testing.expectEqual(@as(usize, 0), r.bad);
         try testing.expect(r.reads > 0);

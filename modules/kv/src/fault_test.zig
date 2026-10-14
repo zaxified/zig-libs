@@ -45,6 +45,10 @@ const Step = union(enum) {
     put_exp: struct { k: []const u8, v: []const u8, at: i64 },
     /// `Db.sync` — a durability barrier under `SyncPolicy.none`.
     sync,
+    /// `Db.merge` of every sealed file but the oldest (markers must stay).
+    merge_newer,
+    /// `Db.merge` of every sealed file.
+    merge_sealed,
 };
 
 /// The sweep's wall clock never moves: an expiry is either past or future
@@ -113,7 +117,7 @@ const Model = struct {
         for (steps) |s| switch (s) {
             .put => |p| try m.map.put(gpa, p.k, p.v),
             .del => |k| _ = m.map.swapRemove(k),
-            .compact, .sync => {},
+            .compact, .sync, .merge_newer, .merge_sealed => {},
             .put_exp => |p| if (p.at > test_now)
                 try m.map.put(gpa, p.k, p.v)
             else {
@@ -157,6 +161,8 @@ fn runStepsWith(sim: *SimStorage, steps: []const Step, options: kv.Options) RunO
             .compact => db.compact(),
             .put_exp => |p| db.putExpiring(p.k, p.v, p.at),
             .sync => db.sync(),
+            .merge_newer => mergeSealed(&db, 1),
+            .merge_sealed => mergeSealed(&db, 0),
         };
         result catch |e| switch (e) {
             error.Crashed => return .{ .completed = i, .crashed = true },
@@ -164,6 +170,20 @@ fn runStepsWith(sim: *SimStorage, steps: []const Step, options: kv.Options) RunO
         };
     }
     return .{ .completed = steps.len, .crashed = false };
+}
+
+/// Merge the sealed files of `db` after skipping the `skip` oldest.
+fn mergeSealed(db: *Db, skip: usize) anyerror!void {
+    const stats = try db.fileStats(testing.allocator);
+    defer testing.allocator.free(stats);
+    var ids: [64]u32 = undefined;
+    var n: usize = 0;
+    for (stats, 0..) |st, i| {
+        if (st.active or i < skip) continue;
+        ids[n] = st.id;
+        n += 1;
+    }
+    return db.merge(ids[0..n]);
 }
 
 /// Does the recovered store's state equal `model` exactly?
@@ -479,6 +499,31 @@ test "fault-injection sweep: multi-file — migration, rotations and merges" {
         try testing.expect(sim.fileContent(db_name ++ ".0.data") == null);
     }
     try testing.expect(try sweepAll(&script, multi_options, "multi-file") > 0);
+}
+
+/// Partial merges between writes: markers kept for older unmerged files,
+/// expired records turned into markers, outputs between sealed files.
+const merge_script = [_]Step{
+    .{ .put = .{ .k = "alpha", .v = "1" } },
+    .{ .put = .{ .k = "beta", .v = "two" } },
+    .{ .put = .{ .k = "gamma", .v = "three-three" } },
+    .{ .put = .{ .k = "alpha", .v = "1-overwritten" } },
+    .{ .del = "beta" },
+    .{ .put_exp = .{ .k = "gamma", .v = "dies", .at = test_now - 1 } },
+    .{ .put = .{ .k = "delta", .v = "4" } },
+    .{ .put = .{ .k = "epsilon", .v = "5" } },
+    .merge_newer,
+    .{ .put = .{ .k = "beta", .v = "back" } },
+    .{ .put = .{ .k = "zeta", .v = "6" } },
+    .{ .del = "delta" },
+    .{ .put = .{ .k = "eta", .v = "7" } },
+    .merge_sealed,
+    .{ .put = .{ .k = "theta", .v = "8" } },
+    .merge_newer,
+};
+
+test "fault-injection sweep: partial merges" {
+    _ = try sweepAll(&merge_script, multi_options, "merge");
 }
 
 test "fault-injection sweep: multi-file expiry workload" {
