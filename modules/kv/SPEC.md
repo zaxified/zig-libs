@@ -281,6 +281,33 @@ a merge or compaction between the two calls can return values from different mom
   writer and a merger, 20 clean runs). Mutant: retirement ignoring pins — red (reads from closed
   handles, leaks).
 
+## Read-only open
+
+`Options.read_only` (2026-10-14, S2 survey R5b; Bitcask's read-only `open/1`) opens a store another
+`Db` — this process or another — may be writing. `Db.refresh()` reloads it.
+
+- **Changes nothing.** No lock (the writer's exclusive one would refuse it anyway), no stale temp
+  or stray deletion, no migration finishing, no truncation: the active file's end may be a record
+  mid-write, so replay just stops there (`Tail.stop`); a sealed file's bad record is still
+  `Corrupt`. Files open `.read_only`; a missing store is `FileNotFound`, nothing created.
+  `put`/`delete`/`compact`/`merge` → `error.AccessDenied` (an existing `Storage.Error`, no new
+  error); `sync` is a no-op.
+- **Races with the writer.** A merge may delete a listed file between the reader's manifest read
+  and its open: the reader starts over from the newer manifest (`error.Retry` inside `load`), up
+  to 16 times, then `error.Busy` (new `OpenError` member). Between a migration's renames (no
+  `<path>`, `.0.data` present) it reads the synced manifest temp. Once open, the reader holds its
+  files' handles, so a writer deleting them does not affect the reader's view.
+- **`refresh`** = a full load beside the current view, then a swap; the old files are released
+  pin-aware (an open `Iterator` keeps reading its snapshot). Cost: a full open — hints make merged
+  files cheap; the active file and unmerged sealed files are replayed. Incremental tail replay is
+  possible later if a caller needs it.
+- **Tests:** reader beside a live writer (view as of open, AccessDenied, refresh after rotation +
+  migration + delete, reads served after the writer compacted its files away, iterator pinned
+  across refresh); a reader changes nothing (no store created, mid-write tail and stray left
+  alone); mid-migration read from the temp; a vanished listed file → `Busy` for a reader,
+  `Corrupt` for a writer; real filesystem writer + reader; a refreshing read-only `Db` in the
+  ThreadSanitizer stress test (20 clean runs). Mutant: reader truncating the active tail — red.
+
 ## Sync policy
 
 `Options.sync` (2026-10-14, S2 survey R1) is Bitcask's `sync_strategy`: `.always` (default — fsync

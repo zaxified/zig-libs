@@ -73,6 +73,11 @@ if (try db.mergePlan(gpa, .{})) |ids| {          // null: no trigger fired
 const stats = try db.fileStats(gpa);            // per-file size, live/dead, fragmentation()
 defer gpa.free(stats);
 
+// A reader beside a live writer (any process): no lock, changes nothing, view as of open.
+var r = try kv.Db.open(gpa, fs_store.storage(), "app.kv", .{ .read_only = true });
+defer r.close();
+try r.refresh();                                // see the writer's newer state
+
 // Bitcask-style sync policies (default .always = fsync per write):
 var fast = try kv.Db.open(gpa, fs_store.storage(), "cache.kv", .{ .sync = .none });
 try fast.put("k", "v");            // acknowledged, durable at the next barrier

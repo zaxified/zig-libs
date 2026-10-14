@@ -990,6 +990,13 @@ pub const Options = struct {
     /// a single-file store turns it into a multi-file store — see SPEC
     /// § "Multi-file log".
     max_file_size: u64 = default_max_file_size,
+
+    /// Open as a reader of a store another `Db` — in this process or
+    /// another — may be writing (Bitcask's read-only `open/1`). Takes no
+    /// lock, creates, deletes, truncates and writes nothing, and sees the
+    /// store as of `open` until `refresh`; mutations return
+    /// `error.AccessDenied`. See SPEC § "Read-only open".
+    read_only: bool = false,
 };
 
 /// A key's expiry, as `expiresAt` reports it.
@@ -1039,6 +1046,9 @@ pub const OpenError = Storage.Error || error{
     /// (this is the non-blocking path, by design: a library that blocks
     /// forever inside `open` is a library that hangs your program).
     Locked,
+    /// `read_only` only: the writer kept deleting files (merges) between
+    /// reading the manifest and opening them, 16 times in a row.
+    Busy,
 };
 
 pub const MutateError = Storage.Error || error{
@@ -1228,7 +1238,9 @@ pub const Db = struct {
         // two different inodes of the same name), so it is a stable identity
         // for "this store" across compactions and restarts. It stays behind
         // as an empty file; that is the cost.
-        if (options.lock == .exclusive) self.lock_file = try store.open(self.lock_path, .open_or_create);
+        // A reader (`read_only`) takes no lock: it changes nothing, and the
+        // writer's exclusive lock would refuse it.
+        if (options.lock == .exclusive and !options.read_only) self.lock_file = try store.open(self.lock_path, .open_or_create);
         // Closing the handle is what releases the lock, so this one errdefer
         // covers every later failure path, acquired or not.
         errdefer if (self.lock_file) |lh| store.close(lh);
@@ -1236,23 +1248,59 @@ pub const Db = struct {
             if (!try store.tryLockExclusive(lh)) return error.Locked;
         }
 
-        // A crash mid-compaction may leave a temp file behind; it is dead
-        // weight (the swap either fully happened or the old file stands).
-        try deleteIfPresent(store, self.tmp_path);
-
         errdefer self.freeFiles();
         errdefer self.freeKeydir();
         errdefer self.obsolete.deinit(gpa);
+        var attempt: usize = 0;
+        while (true) : (attempt += 1) {
+            self.load() catch |e| switch (e) {
+                // A reader raced a writer's merge (a listed file deleted
+                // before we opened it): read the newer manifest.
+                error.Retry => if (attempt < 16) {
+                    self.resetState();
+                    continue;
+                } else return error.Busy,
+                else => |other| return other,
+            };
+            return self;
+        }
+    }
 
-        var h = try store.open(path, .open_or_create);
+    const LoadError = OpenError || error{Retry};
+
+    /// Everything `open` does after taking the lock: find the layout, load
+    /// every data file into the keydir. A writer also recovers (removes
+    /// temps and strays, cuts the active file's torn tail, finishes a
+    /// migration); a reader (`Options.read_only`) changes nothing.
+    fn load(self: *Db) LoadError!void {
+        const store = self.store;
+        const ro = self.options.read_only;
+        // A crash mid-compaction may leave a temp file behind; it is dead
+        // weight (the swap either fully happened or the old file stands).
+        if (!ro) try deleteIfPresent(store, self.tmp_path);
+
+        var h = store.open(self.path, if (ro) .read_only else .open_or_create) catch |e| switch (e) {
+            error.FileNotFound => {
+                // A writer between the renames of a migration: its synced
+                // manifest temp is the store.
+                if (!ro or !try self.migrationInFlight()) return e;
+                const t = store.open(self.manifest_tmp, .read_only) catch |e2| switch (e2) {
+                    error.FileNotFound => return error.Retry,
+                    else => return e2,
+                };
+                defer store.close(t);
+                return self.loadManifest(t, try store.size(t));
+            },
+            else => return e,
+        };
         var h_owned = true;
         defer if (h_owned) store.close(h);
         var file_size = try store.size(h);
-        if (file_size < header_len and try self.resumeMigration()) {
+        if (!ro and file_size < header_len and try self.resumeMigration()) {
             // A crash between the two renames of a migration (see
             // `rotateLocked`) left no `<path>`; the manifest is now there.
             store.close(h);
-            h = try store.open(path, .open_or_create);
+            h = try store.open(self.path, .open_or_create);
             file_size = try store.size(h);
         }
         if (file_size < header_len) {
@@ -1263,9 +1311,11 @@ pub const Db = struct {
             var want: [header_len]u8 = undefined;
             writeHeader(&want, version_plain);
             if (!std.mem.eql(u8, have[0..n], want[0..n])) return error.NotAKvFile;
-            if (file_size != 0) try store.truncate(h, 0);
-            try store.writeAll(h, &want, 0);
-            try store.sync(h);
+            if (!ro) {
+                if (file_size != 0) try store.truncate(h, 0);
+                try store.writeAll(h, &want, 0);
+                try store.sync(h);
+            }
             try self.adoptFile(legacy_id, h, version_plain);
             h_owned = false;
             self.active().size = header_len;
@@ -1277,10 +1327,10 @@ pub const Db = struct {
             switch (version) {
                 version_plain, version_expiry => {
                     // A migration that crashed before its first rename.
-                    try deleteIfPresent(store, self.manifest_tmp);
+                    if (!ro) try deleteIfPresent(store, self.manifest_tmp);
                     try self.adoptFile(legacy_id, h, version);
                     h_owned = false;
-                    try self.replay(self.active(), header_len, file_size, true);
+                    try self.replay(self.active(), header_len, file_size, if (ro) Tail.stop else Tail.truncate);
                 },
                 version_manifest => {
                     try self.loadManifest(h, file_size);
@@ -1290,8 +1340,31 @@ pub const Db = struct {
         }
         // Make the files' very existence durable (creation + any recovery
         // truncation above are meaningless if the directory entry is lost).
-        try store.syncDir();
-        return self;
+        if (!ro) try store.syncDir();
+    }
+
+    /// `<path>.0.data` exists: a migration is (or was) between its renames.
+    fn migrationInFlight(self: *Db) OpenError!bool {
+        const data0 = try self.fileName(0, "data");
+        defer self.gpa.free(data0);
+        const probe = self.store.open(data0, .read_only) catch |e| switch (e) {
+            error.FileNotFound => return false,
+            else => return e,
+        };
+        self.store.close(probe);
+        return true;
+    }
+
+    /// Back to the state before `load`, for a reader's retry.
+    fn resetState(self: *Db) void {
+        self.freeFiles();
+        self.freeKeydir();
+        self.files = .empty;
+        self.keydir = .empty;
+        self.multi = false;
+        self.next_file_id = 1;
+        self.dead_bytes = 0;
+        self.expiring = 0;
     }
 
     fn deleteIfPresent(store: Storage, path: []const u8) Storage.Error!void {
@@ -1327,13 +1400,7 @@ pub const Db = struct {
     /// `<path>` is missing but `<path>.0.data` exists: a migration crashed
     /// between its renames. Finish it from the synced manifest temp.
     fn resumeMigration(self: *Db) OpenError!bool {
-        const data0 = try self.fileName(0, "data");
-        defer self.gpa.free(data0);
-        const probe = self.store.open(data0, .read_only) catch |e| switch (e) {
-            error.FileNotFound => return false,
-            else => return e,
-        };
-        self.store.close(probe);
+        if (!try self.migrationInFlight()) return false;
         self.store.rename(self.manifest_tmp, self.path) catch |e| switch (e) {
             // The temp is written and synced before the first rename, so a
             // `.0.data` without it is not a state this module leaves.
@@ -1349,7 +1416,8 @@ pub const Db = struct {
     /// last), obsolete ids [n_obsolete]u32, crc32 u32 over every byte before
     /// it. Written only by `writeManifest` (temp + sync + rename + dir sync),
     /// so it is never torn; a bad CRC is corruption.
-    fn loadManifest(self: *Db, h: Storage.Handle, size: u64) OpenError!void {
+    fn loadManifest(self: *Db, h: Storage.Handle, size: u64) LoadError!void {
+        const ro = self.options.read_only;
         if (size > max_manifest_len or size < header_len + 16) return error.Corrupt;
         const buf = try self.gpa.alloc(u8, @intCast(size));
         defer self.gpa.free(buf);
@@ -1366,14 +1434,16 @@ pub const Db = struct {
         self.multi = true;
         self.next_file_id = next_id;
 
-        try deleteIfPresent(self.store, self.manifest_tmp);
-        // Files a finished merge retired, and files a crashed rotation or
-        // merge created past `next_file_id` before naming them: never part
-        // of the store, so delete them (named probes — never a listing).
         var i: usize = 0;
-        while (i < n_obsolete) : (i += 1) _ = try self.deleteDataFile(std.mem.readInt(u32, obs[i * 4 ..][0..4], .little));
-        var stray = next_id;
-        while (try self.deleteDataFile(stray)) stray += 1;
+        if (!ro) {
+            try deleteIfPresent(self.store, self.manifest_tmp);
+            // Files a finished merge retired, and files a crashed rotation or
+            // merge created past `next_file_id` before naming them: never part
+            // of the store, so delete them (named probes — never a listing).
+            while (i < n_obsolete) : (i += 1) _ = try self.deleteDataFile(std.mem.readInt(u32, obs[i * 4 ..][0..4], .little));
+            var stray = next_id;
+            while (try self.deleteDataFile(stray)) stray += 1;
+        }
 
         i = 0;
         while (i < n_files) : (i += 1) {
@@ -1382,7 +1452,11 @@ pub const Db = struct {
             const name = try self.fileName(id, "data");
             defer self.gpa.free(name);
             const last = i + 1 == n_files;
-            const fh = try self.store.open(name, .open_or_create);
+            const fh = self.store.open(name, if (ro) .read_only else .open_or_create) catch |e| switch (e) {
+                // Gone between our manifest read and now: a writer's merge.
+                error.FileNotFound => return if (ro) error.Retry else error.Corrupt,
+                else => return e,
+            };
             const fsize = self.store.size(fh) catch |e| {
                 self.store.close(fh);
                 return e;
@@ -1409,7 +1483,8 @@ pub const Db = struct {
             // A sealed file was synced before the next one was started, so a
             // bad record in it is rot, refused; only the active file may have
             // a torn tail to cut.
-            try self.replay(self.active(), try self.loadHint(self.active(), fsize), fsize, last);
+            const tail: Tail = if (!last) .refuse else if (ro) .stop else .truncate;
+            try self.replay(self.active(), try self.loadHint(self.active(), fsize), fsize, tail);
         }
     }
 
@@ -1499,6 +1574,46 @@ pub const Db = struct {
         self.files.deinit(self.gpa);
     }
 
+    /// Reader (`Options.read_only`) only: reload the store as it is now —
+    /// new writes, rotations, merges and compactions become visible. A
+    /// full load (fast where merge outputs have hints); on error the old
+    /// view stays. Live iterators keep reading their snapshot. A writer is
+    /// always current: no-op.
+    pub fn refresh(self: *Db) OpenError!void {
+        if (!self.options.read_only) return;
+        var fresh = try Db.open(self.gpa, self.store, self.path, self.options);
+        self.lock.acquire();
+        defer self.lock.release();
+        self.retired.ensureUnusedCapacity(self.gpa, self.files.items.len) catch |e| {
+            fresh.close();
+            return e;
+        };
+        {
+            self.rw.lock();
+            defer self.rw.unlock();
+            for (self.files.items) |df| {
+                self.releaseLocked(df);
+                if (std.mem.indexOfScalar(*DataFile, self.retired.items, df) == null) self.gpa.destroy(df);
+            }
+            self.files.deinit(self.gpa);
+            self.freeKeydir();
+            self.files = fresh.files;
+            self.keydir = fresh.keydir;
+            self.multi = fresh.multi;
+            self.next_file_id = fresh.next_file_id;
+            self.dead_bytes = fresh.dead_bytes;
+            self.expiring = fresh.expiring;
+        }
+        // What is left of `fresh`: its own paths and empty lists.
+        fresh.obsolete.deinit(self.gpa);
+        fresh.pending.deinit(self.gpa);
+        fresh.retired.deinit(self.gpa);
+        self.gpa.free(fresh.path);
+        self.gpa.free(fresh.tmp_path);
+        self.gpa.free(fresh.manifest_tmp);
+        self.gpa.free(fresh.lock_path);
+    }
+
     /// Insert or overwrite `key`. Under `SyncPolicy.always` (the default)
     /// durable when this returns: the record has been appended AND fsync'd
     /// (see the module doc for what fsync can and cannot promise); under the
@@ -1506,6 +1621,7 @@ pub const Db = struct {
     /// error the store poisons itself.
     /// Overwriting an expiring key removes its expiry.
     pub fn put(self: *Db, key: []const u8, value: []const u8) MutateError!void {
+        if (self.options.read_only) return error.AccessDenied;
         self.lock.acquire();
         defer self.lock.release();
         return self.putLocked(key, value, no_expiry);
@@ -1523,6 +1639,7 @@ pub const Db = struct {
     /// refuses the file instead of truncating it at the first expiring
     /// record. Compaction errors are returned as they are from `compact`.
     pub fn putExpiring(self: *Db, key: []const u8, value: []const u8, expires_at_ms: i64) CompactError!void {
+        if (self.options.read_only) return error.AccessDenied;
         self.lock.acquire();
         defer self.lock.release();
         if (self.poisoned) return error.Poisoned;
@@ -1622,6 +1739,7 @@ pub const Db = struct {
     /// anyway: without it, a wall clock stepped back before the expiry would
     /// bring the deleted key back.
     pub fn delete(self: *Db, key: []const u8) MutateError!void {
+        if (self.options.read_only) return error.AccessDenied;
         self.lock.acquire();
         defer self.lock.release();
         if (self.poisoned) return error.Poisoned;
@@ -1749,6 +1867,7 @@ pub const Db = struct {
     /// `SyncPolicy.always` it never touches the disk. A sync error poisons
     /// the store like a write error: what reached the media is unknown.
     pub fn sync(self: *Db) MutateError!void {
+        if (self.options.read_only) return; // nothing of ours to sync
         self.lock.acquire();
         defer self.lock.release();
         if (self.poisoned) return error.Poisoned;
@@ -2026,6 +2145,7 @@ pub const Db = struct {
     /// are discarded); errors at/after it poison the store (the namespace
     /// state is uncertain until reopen).
     pub fn compact(self: *Db) CompactError!void {
+        if (self.options.read_only) return error.AccessDenied;
         self.merge_lock.acquire();
         defer self.merge_lock.release();
         self.lock.acquire();
@@ -2138,6 +2258,7 @@ pub const Db = struct {
     /// file outside the merge might still hold a value they hide; expired
     /// records become such markers. Crash safety and errors as `compact`.
     pub fn merge(self: *Db, ids: []const u32) CompactError!void {
+        if (self.options.read_only) return error.AccessDenied;
         self.merge_lock.acquire();
         defer self.merge_lock.release();
 
@@ -2782,7 +2903,18 @@ pub const Db = struct {
     /// (a sealed file, synced before any later file existed) refuses with
     /// `error.Corrupt`. A record that has expired by now counts as a delete
     /// of its key: it is the key's latest word, and it says "absent".
-    fn replay(self: *Db, df: *DataFile, start: u64, file_size: u64, allow_truncate: bool) OpenError!void {
+    /// What `replay` does at the first record that does not check out.
+    const Tail = enum {
+        /// The writer's active file: cut it there (crash recovery).
+        truncate,
+        /// A sealed file: refuse, it was synced whole.
+        refuse,
+        /// A reader's view of a live writer's active file: stop there,
+        /// change nothing (the record may be mid-write).
+        stop,
+    };
+
+    fn replay(self: *Db, df: *DataFile, start: u64, file_size: u64, tail: Tail) OpenError!void {
         // The clock is read once, and only for a file that can hold expiry.
         const now: i64 = if (df.version >= version_expiry) self.options.clock.now() else 0;
         var off: u64 = start;
@@ -2832,13 +2964,16 @@ pub const Db = struct {
             if (try self.applyRecord(df, op, key, off, val_len, expires_at, now)) key_owned = false;
             off += rec_len;
         }
-        if (off < file_size) {
-            if (!allow_truncate) return error.Corrupt;
-            // Torn/corrupt tail: discard it. Committed (fsync'd) records all
-            // lie before `off` by construction.
-            try self.store.truncate(df.handle, off);
-            try self.store.sync(df.handle);
-        }
+        if (off < file_size) switch (tail) {
+            .refuse => return error.Corrupt,
+            .stop => {},
+            .truncate => {
+                // Torn/corrupt tail: discard it. Committed (fsync'd) records all
+                // lie before `off` by construction.
+                try self.store.truncate(df.handle, off);
+                try self.store.sync(df.handle);
+            },
+        };
         df.size = off;
     }
 };
@@ -3814,6 +3949,125 @@ test "iterator: pinned files survive a merge and a compaction until deinit" {
     }
 }
 
+test "read-only: a reader beside a live writer sees the store as of open, then refresh" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    const wopts: Options = .{ .max_file_size = 64 };
+    const ropts: Options = .{ .max_file_size = 64, .read_only = true };
+    var w = try Db.open(testing.allocator, sim.storage(), "db", wopts);
+    defer w.close();
+    try w.put("a", v30);
+    var r = try Db.open(testing.allocator, sim.storage(), "db", ropts); // no lock taken
+    defer r.close();
+    try expectGet(&r, "a", v30);
+    try testing.expectError(error.AccessDenied, r.put("x", "y"));
+    try testing.expectError(error.AccessDenied, r.delete("a"));
+    try testing.expectError(error.AccessDenied, r.compact());
+    try r.sync(); // nothing of a reader's to sync
+
+    try w.put("b", v30); // rotates: the store migrates under the reader
+    try w.put("c", v30);
+    try w.delete("a");
+    try expectGet(&r, "a", v30); // still the view as of open
+    try expectGet(&r, "b", null);
+    try r.refresh();
+    try expectGet(&r, "a", null);
+    try expectGet(&r, "c", v30);
+
+    // The writer compacts (deleting every file the reader has open); the
+    // reader keeps serving its view from the open handles, then refreshes.
+    try w.put("d", v30);
+    var it = try r.iterator(testing.allocator, "");
+    try w.compact();
+    try expectGet(&r, "b", v30);
+    try r.refresh(); // the iterator's files stay pinned
+    try expectPairs(&it, &.{ .{ "b", v30 }, .{ "c", v30 } });
+    it.deinit();
+    try testing.expectEqual(@as(usize, 0), r.retired.items.len);
+    try expectGet(&r, "d", v30);
+    try testing.expectEqual(@as(usize, 3), r.count());
+}
+
+test "read-only: changes nothing — no store created, no torn tail cut, no stray deleted" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    const ro: Options = .{ .read_only = true, .max_file_size = 64 };
+    try testing.expectError(error.FileNotFound, Db.open(testing.allocator, sim.storage(), "db", ro));
+    try testing.expect(sim.fileContent("db") == null);
+    {
+        var w = try Db.open(testing.allocator, sim.storage(), "db", .{ .max_file_size = 64 });
+        defer w.close();
+        try w.put("a", v30);
+        try w.put("b", v30);
+    }
+    // A record mid-write at the active file's end, and a stray file a
+    // writer's crash left: a reader leaves both alone.
+    try sim.appendDurable("db.1.data", "\x05\x06\x07");
+    try sim.installFile("db.2.data", "ZKVL\x02\x00\x00\x00");
+    const before = try testing.allocator.dupe(u8, sim.fileContent("db.1.data").?);
+    defer testing.allocator.free(before);
+    {
+        var r = try Db.open(testing.allocator, sim.storage(), "db", ro);
+        defer r.close();
+        try expectGet(&r, "b", v30);
+    }
+    try testing.expectEqualSlices(u8, before, sim.fileContent("db.1.data").?);
+    try testing.expect(sim.fileContent("db.2.data") != null);
+}
+
+test "read-only: a store mid-migration is read from the manifest temp" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    {
+        var w = try Db.open(testing.allocator, sim.storage(), "db", .{ .max_file_size = 64 });
+        defer w.close();
+        try w.put("a", v30);
+        try w.put("b", v30);
+    }
+    // The state between the migration's renames: no `<path>`, temp present.
+    try sim.installFile("db.manifest", sim.fileContent("db").?);
+    try sim.storage().delete("db");
+    var r = try Db.open(testing.allocator, sim.storage(), "db", .{ .read_only = true });
+    defer r.close();
+    try expectGet(&r, "a", v30);
+    try expectGet(&r, "b", v30);
+    try testing.expect(sim.fileContent("db") == null); // not finished by a reader
+}
+
+test "read-only: a manifest naming a file that keeps vanishing ends in Busy, not a hang" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    {
+        var w = try Db.open(testing.allocator, sim.storage(), "db", .{ .max_file_size = 64 });
+        defer w.close();
+        try w.put("a", v30);
+        try w.put("b", v30);
+    }
+    try sim.storage().delete("db.0.data");
+    try testing.expectError(error.Busy, Db.open(testing.allocator, sim.storage(), "db", .{ .read_only = true }));
+    // A writer calls the same state what it is: corruption.
+    try testing.expectError(error.Corrupt, Db.open(testing.allocator, sim.storage(), "db", .{}));
+}
+
+test "read-only: real filesystem, writer and reader in one process" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var fs_store = FsStorage.init(testing.io, tmp.dir);
+    var w = try Db.open(testing.allocator, fs_store.storage(), "db", .{ .max_file_size = 64 });
+    defer w.close();
+    try w.put("a", v30);
+    var r = try Db.open(testing.allocator, fs_store.storage(), "db", .{ .read_only = true });
+    defer r.close();
+    try w.put("b", v30);
+    try w.put("c", v30);
+    try w.compact();
+    try expectGet(&r, "a", v30);
+    try expectGet(&r, "c", null);
+    try r.refresh();
+    try expectGet(&r, "c", v30);
+    try testing.expectEqual(@as(usize, 3), r.count());
+}
+
 test "persistence: close and reopen recovers everything" {
     var sim = SimStorage.init(testing.allocator);
     defer sim.deinit();
@@ -4375,15 +4629,49 @@ test "concurrency: readers alongside puts, deletes and compactions (real filesys
             }
         }
     };
+    // A second, read-only Db on the same files, refreshing in a loop while
+    // the writer rotates, merges and compacts under it.
+    const Follower = struct {
+        bad: usize = 0,
+        refreshes: usize = 0,
+        fn run(f: *@This(), store: Storage, stop: *std.atomic.Value(bool)) void {
+            var r = Db.open(testing.allocator, store, "db", .{ .read_only = true, .max_file_size = 512 }) catch {
+                f.bad += 1;
+                return;
+            };
+            defer r.close();
+            var buf: [32]u8 = undefined;
+            while (!stop.load(.acquire)) {
+                r.refresh() catch {
+                    f.bad += 1;
+                    return;
+                };
+                f.refreshes += 1;
+                for (0..16) |i| {
+                    var kb: [4]u8 = undefined;
+                    const k = std.fmt.bufPrint(&kb, "k{d}", .{i}) catch unreachable;
+                    const v = (r.getBuf(&buf, k) catch {
+                        f.bad += 1;
+                        continue;
+                    }) orelse continue;
+                    if (!std.mem.startsWith(u8, v, k) or v[k.len] != '=') f.bad += 1;
+                }
+            }
+        }
+    };
     var stop: std.atomic.Value(bool) = .init(false);
     var readers: [2]Reader = .{ .{}, .{} };
     var merger: Merger = .{};
-    var threads: [4]std.Thread = undefined;
+    var follower: Follower = .{};
+    var threads: [5]std.Thread = undefined;
     threads[0] = try std.Thread.spawn(.{}, Writer.run, .{ &db, &stop });
     for (&readers, 1..) |*r, i| threads[i] = try std.Thread.spawn(.{}, Reader.run, .{ r, &db, &stop });
     threads[3] = try std.Thread.spawn(.{}, Merger.run, .{ &merger, &db, &stop });
+    threads[4] = try std.Thread.spawn(.{}, Follower.run, .{ &follower, fs_store.storage(), &stop });
     for (threads) |t| t.join();
     try testing.expect(merger.merges > 0);
+    try testing.expectEqual(@as(usize, 0), follower.bad);
+    try testing.expect(follower.refreshes > 0);
     for (readers) |r| {
         try testing.expectEqual(@as(usize, 0), r.bad);
         try testing.expect(r.reads > 0);

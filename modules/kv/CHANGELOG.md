@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-14** — Read-only open (S2 survey R5b, Bitcask `open/1`): `Options.read_only` opens a store another `Db` (any process) may be writing — no lock, nothing created, deleted, truncated or written; a mid-write tail is skipped, not cut; a file a concurrent merge deleted makes it re-read the manifest. `Db.refresh()` reloads the view. Mutations on a reader return `error.AccessDenied`. New `OpenError.Busy` (a reader that lost the race to a merging writer 16 times in a row).
+
 - **2026-10-14** — `Db.iterator(gpa, prefix)` (S2 survey R6, Bitcask fold): a consistent snapshot of the live keys and their values in key order; the data files it points into are pinned, so merges and compactions meanwhile delete their names but keep them readable until `Iterator.deinit`. The single-file `compact` no longer rewrites its `DataFile` in place. **Fix:** `FsStorage` claims and releases handle-table slots under a lock — two threads opening at once could get the same slot (several `Db`s on one backend, or since this release one `Db`'s merge and its writer; caught by ThreadSanitizer).
 
 - **2026-10-14** — Hint files (S2 survey R2, Bitcask): every merge output gets `<path>.<id>.hint` (keys, lengths, offsets, expiry — no values — plus the data length covered and a CRC-32); `open` applies a valid hint instead of reading the file's records and replays only what lies past it. Missing, torn or inconsistent hints are ignored (replay); `read_verify` still checks values at `get`. VOPR harness: a crash swallowed by the post-commit deletion of retired files now counts as the epoch's fault instead of failing the next read.
