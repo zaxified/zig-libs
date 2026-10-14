@@ -317,7 +317,62 @@ pub const PublicKey = struct {
     fn publicExponent(pk: PublicKey) u32 {
         return pk.e.toPrimitive(u32) catch unreachable; // < 2^32 since fromBytes
     }
+
+    /// Same modulus and exponent (Go `PublicKey.Equal`). Public values.
+    pub fn equal(a: *const PublicKey, b: *const PublicKey) bool {
+        return MontParams.eql(&a.n_mont.m, &b.n_mont.m) and a.publicExponent() == b.publicExponent();
+    }
+
+    /// Modulus length in bits.
+    pub fn bits(pk: *const PublicKey) usize {
+        return pk.n_mont.bits();
+    }
+
+    /// Modulus length in bytes — the signature and ciphertext size
+    /// (`k` in RFC 8017; Go `PublicKey.Size`).
+    pub fn size(pk: *const PublicKey) usize {
+        return pk.n_mont.byteLen();
+    }
+
+    /// DER `RSAPublicKey` (PKCS#1 A.1.1) — `i2d_RSAPublicKey`, Go
+    /// `x509.MarshalPKCS1PublicKey`. `out.len ≥ max_pkcs1_public_der_len`
+    /// always suffices; the result is a prefix of `out`.
+    pub fn toPkcs1Der(pk: *const PublicKey, out: []u8) MarshalError![]u8 {
+        return marshal.publicDer(&pk.n_mont, pk.publicExponent(), .pkcs1, out);
+    }
+
+    /// DER X.509 `SubjectPublicKeyInfo` (rsaEncryption, NULL parameters) —
+    /// `i2d_PUBKEY`, Go `x509.MarshalPKIXPublicKey`. `out.len ≥
+    /// max_spki_der_len` always suffices.
+    pub fn toSpkiDer(pk: *const PublicKey, out: []u8) MarshalError![]u8 {
+        return marshal.publicDer(&pk.n_mont, pk.publicExponent(), .spki, out);
+    }
+
+    /// PEM: `PUBLIC KEY` (SPKI, what `openssl pkey -pubout` writes) or
+    /// `RSA PUBLIC KEY` (PKCS#1). `out.len ≥ max_public_pem_len` always
+    /// suffices.
+    pub fn toPem(pk: *const PublicKey, form: PublicKeyForm, out: []u8) MarshalError![]u8 {
+        return marshal.publicPem(&pk.n_mont, pk.publicExponent(), form, out);
+    }
 };
+
+/// Key serialisation (`toPkcs1Der`, `toSpkiDer`, `toPkcs8Der`, `toPem`).
+const marshal = @import("marshal.zig");
+pub const MarshalError = marshal.MarshalError;
+/// Public-key encodings: `.spki` = X.509 `SubjectPublicKeyInfo` (PEM `PUBLIC
+/// KEY`), `.pkcs1` = bare `RSAPublicKey` (PEM `RSA PUBLIC KEY`).
+pub const PublicKeyForm = marshal.PublicDer;
+/// Private-key encodings: `.pkcs8` = `PrivateKeyInfo` (PEM `PRIVATE KEY`,
+/// the OpenSSL 3 default), `.pkcs1` = bare `RSAPrivateKey` (PEM `RSA PRIVATE
+/// KEY`, `openssl rsa -traditional`).
+pub const PrivateKeyForm = marshal.PrivateDer;
+/// Output buffer sizes that fit any key of up to `max_modulus_bits`.
+pub const max_pkcs1_public_der_len = marshal.max_pkcs1_public_der_len;
+pub const max_spki_der_len = marshal.max_spki_der_len;
+pub const max_pkcs1_private_der_len = marshal.max_pkcs1_private_der_len;
+pub const max_pkcs8_der_len = marshal.max_pkcs8_der_len;
+pub const max_public_pem_len = marshal.max_public_pem_len;
+pub const max_private_pem_len = marshal.max_private_pem_len;
 
 /// A public key that can only verify (PKCS#1 v1.5, PSS), built for a key
 /// that is used once: certificate path validation, a handshake, a token.
@@ -366,6 +421,21 @@ pub const VerifyKey = struct {
     /// Modulus length in bits.
     pub fn bits(vk: *const VerifyKey) usize {
         return vk.mp.bits();
+    }
+
+    /// As `PublicKey.toPkcs1Der`.
+    pub fn toPkcs1Der(vk: *const VerifyKey, out: []u8) MarshalError![]u8 {
+        return marshal.publicDer(&vk.mp, vk.e, .pkcs1, out);
+    }
+
+    /// As `PublicKey.toSpkiDer`.
+    pub fn toSpkiDer(vk: *const VerifyKey, out: []u8) MarshalError![]u8 {
+        return marshal.publicDer(&vk.mp, vk.e, .spki, out);
+    }
+
+    /// As `PublicKey.toPem`.
+    pub fn toPem(vk: *const VerifyKey, form: PublicKeyForm, out: []u8) MarshalError![]u8 {
+        return marshal.publicPem(&vk.mp, vk.e, form, out);
     }
 
     /// As `verifyPkcs1v15`.
@@ -462,10 +532,12 @@ pub const SecretKey = struct {
     /// (RFC 8017 Appendix A.1.2) — the format `openssl rsa -traditional`
     /// writes (as opposed to `fromPkcs8`'s `PrivateKeyInfo` wrapper). Only
     /// the two-prime form (version 0) is supported; multi-prime keys
-    /// (version 1, `otherPrimeInfos`) are rejected. `p`/`q`/`e` are extracted
-    /// and routed through `fromPrimes`, which re-derives `n`/`d`/the CRT
-    /// parameters itself rather than trusting the on-disk ones (see
-    /// `fromPrimes`'s doc comment).
+    /// (version 1, `otherPrimeInfos`) are rejected. The key is derived from
+    /// `p`/`q`/`e` by `fromPrimes`; the on-disk `n`, `dP`, `dQ`, `qInv` must
+    /// equal the derived values and `d` must be a valid private exponent
+    /// (λ- or φ-reduced, both occur in the wild; it is kept as given), else
+    /// `error.InvalidPrivateKey` — what `openssl rsa -check` and Go's
+    /// `PrivateKey.Validate` refuse.
     pub fn fromDer(out: *SecretKey, bytes: []const u8) FromDerError!void {
         const r = fromDerUnburned(out, bytes);
         burn.stack(burn.private_op_burn);
@@ -515,6 +587,36 @@ pub const SecretKey = struct {
             return try SecretKey.fromDerValue(block.der());
         }
         return error.UnsupportedPemLabel;
+    }
+
+    /// The public half (Go `PrivateKey.Public`): `n`, `e` and the public-op
+    /// constants are all stored.
+    pub fn publicKey(sk: *const SecretKey) PublicKey {
+        return .{ .n = sk.n, .e = sk.e, .n_mont = sk.n_mont };
+    }
+
+    /// DER `RSAPrivateKey`, version 0 (PKCS#1 A.1.2) — `openssl rsa
+    /// -traditional -outform DER`, Go `x509.MarshalPKCS1PrivateKey`. Written
+    /// straight into `out` (no staging copy of the secrets); `out` is zeroed
+    /// on error. `out.len ≥ max_pkcs1_private_der_len` always suffices.
+    /// The byte lengths of the secret INTEGERs are part of DER and so of the
+    /// output's timing, as they are of every encoder's and parser's.
+    pub fn toPkcs1Der(sk: *const SecretKey, out: []u8) MarshalError![]u8 {
+        return marshal.privateDer(sk, .pkcs1, out);
+    }
+
+    /// DER PKCS#8 `PrivateKeyInfo` (RFC 5958 v1) — `openssl pkey -outform
+    /// DER`, Go `x509.MarshalPKCS8PrivateKey`. As `toPkcs1Der`;
+    /// `out.len ≥ max_pkcs8_der_len` always suffices.
+    pub fn toPkcs8Der(sk: *const SecretKey, out: []u8) MarshalError![]u8 {
+        return marshal.privateDer(sk, .pkcs8, out);
+    }
+
+    /// PEM `PRIVATE KEY` (`.pkcs8`) or `RSA PRIVATE KEY` (`.pkcs1`), the
+    /// unencrypted forms `fromPem` reads. As `toPkcs1Der`;
+    /// `out.len ≥ max_private_pem_len` always suffices.
+    pub fn toPem(sk: *const SecretKey, form: PrivateKeyForm, out: []u8) MarshalError![]u8 {
+        return marshal.privatePem(sk, form, out);
     }
 };
 
@@ -1913,9 +2015,9 @@ fn publicKeyPartsFromDer(bytes: []const u8) !struct { n: []const u8, e: []const 
 }
 
 /// `RSAPrivateKey` (PKCS#1 Appendix A.1.2), two-prime form only (`version`
-/// 0): extracts `p`, `q`, `e` and routes them through `SecretKey.fromPrimes`
-/// (see that function's doc comment for why `n`/`d`/the CRT fields on the
-/// wire are not trusted). Multi-prime keys (`version` 1, `otherPrimeInfos`)
+/// 0): derives the key from `p`, `q`, `e` through `SecretKey.fromPrimes`,
+/// then checks the wire `n`/`d`/CRT fields against it (`checkWireFields`).
+/// Multi-prime keys (`version` 1, `otherPrimeInfos`)
 /// are rejected rather than silently truncated.
 fn secretKeyFromPkcs1Impl(bytes: []const u8) !SecretKey {
     const top = try derTopSequence(bytes);
@@ -1934,9 +2036,63 @@ fn secretKeyFromPkcs1Impl(bytes: []const u8) !SecretKey {
     const qinv = try derChild(bytes, dq.slice.end, top.slice.end, .integer, false);
     if (qinv.slice.end != top.slice.end) return error.InvalidDer; // no otherPrimeInfos
 
-    // n/d/dP/dQ/qInv are on-the-wire CRT bookkeeping `fromPrimes` re-derives
-    // and cross-checks itself (see its doc comment) — only p, q, e feed it.
-    return SecretKey.fromPrimesValue(derView(bytes, p), derView(bytes, q), derView(bytes, e)) catch error.InvalidPrivateKey;
+    // The key is derived from p, q, e alone; the wire n, d, dP, dQ, qInv must
+    // then agree with it (audit F1, 2026-10-14: until then they were never
+    // read, so a file with a wrong `n` or `d` loaded silently).
+    var sk = SecretKey.fromPrimesValue(derView(bytes, p), derView(bytes, q), derView(bytes, e)) catch return error.InvalidPrivateKey;
+    errdefer sk.deinit();
+    try checkWireFields(&sk, derView(bytes, n), derView(bytes, d), derView(bytes, dp), derView(bytes, dq), derView(bytes, qinv));
+    return sk;
+}
+
+/// The F1 check, and the adoption of the wire `d`. `n`, `dP`, `dQ`, `qInv`
+/// are unique given p, q, e and must equal the derived values. `d` is not:
+/// any `d ≡ e⁻¹ (mod λ(n))` below `n` is valid — OpenSSL derives it mod λ,
+/// older tools mod φ = (p−1)(q−1) — so it is accepted iff
+/// `d ≡ dP (mod p−1)` and `d ≡ dQ (mod q−1)` (with dP, dQ derived), and is
+/// then KEPT, so that parse → `toPkcs1Der` gives the input back. The secret
+/// comparisons are constant-time up to the single accept/reject verdict.
+fn checkWireFields(sk: *SecretKey, n_be: []const u8, d_be: []const u8, dp_be: []const u8, dq_be: []const u8, qinv_be: []const u8) error{InvalidPrivateKey}!void {
+    // n is public.
+    const n_wire = MontParams.loadBE(n_be) catch return error.InvalidPrivateKey;
+    if (!MontParams.eql(&n_wire, &sk.n_mont.m)) return error.InvalidPrivateKey;
+
+    var bad: u1 = 0;
+    var w: [4]MontElem = undefined; // d, dP, dQ, qInv off the wire
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&w));
+    for ([_][]const u8{ d_be, dp_be, dq_be, qinv_be }, 0..) |be, i| {
+        w[i] = MontParams.loadBE(be) catch blk: {
+            bad = 1; // longer than any key (public length)
+            break :blk MontParams.zero;
+        };
+    }
+    var t: [3]MontElem = .{ feToElem(&sk.dp), feToElem(&sk.dq), feToElem(&sk.qinv) };
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&t));
+    bad |= @intFromBool(!MontParams.eql(&w[1], &t[0]));
+    bad |= @intFromBool(!MontParams.eql(&w[2], &t[1]));
+    bad |= @intFromBool(!MontParams.eql(&w[3], &t[2]));
+
+    // 0 < d < n.
+    var s = w[0];
+    defer std.crypto.secureZero(u64, &s);
+    bad |= ~montint.limbs.subInto(&s, &sk.n_mont.m); // no borrow ⟺ d ≥ n
+    bad |= @intFromBool(MontParams.isZero(&w[0]));
+    // d − dP ≡ 0 (mod p−1) and d − dQ ≡ 0 (mod q−1); a borrow means d < dP,
+    // impossible for a valid d since dP is the least residue.
+    for ([_]*const MontParams{ &sk.p_mont, &sk.q_mont }, [_]*const MontElem{ &t[0], &t[1] }) |pm, dx| {
+        s = w[0];
+        bad |= montint.limbs.subInto(&s, dx);
+        var m1 = pm.m;
+        m1[0] &= ~@as(u64, 1);
+        defer std.crypto.secureZero(u64, &m1);
+        var quot = montint.nt.divExact(MontParams.max_limbs, &s, &m1) catch blk: {
+            bad = 1;
+            break :blk MontParams.zero;
+        };
+        std.crypto.secureZero(u64, &quot);
+    }
+    if (bad != 0) return error.InvalidPrivateKey;
+    sk.d = MontParams.elemToFf(Fe, sk.n, &w[0]);
 }
 
 pub const FromPkcs8Error = error{ InvalidDer, InvalidPrivateKey };
@@ -2484,9 +2640,8 @@ fn topBitsMatch(p: []const u8, q: []const u8) bool {
     return (p[12] ^ q[12]) & 0xf0 == 0; // + 4 more = 100 bits
 }
 
-/// A freshly generated RSA keypair (`generate`'s result). The two halves are
-/// returned together because a `SecretKey` alone cannot reproduce its
-/// `PublicKey` — it does not store `e` (see `selfSignedCert`'s doc comment).
+/// A freshly generated RSA keypair (`generate`'s result). `public_key`
+/// equals `secret_key.publicKey()`; it is returned too for convenience.
 pub const KeyPair = struct {
     public_key: PublicKey,
     secret_key: SecretKey,
@@ -2890,8 +3045,8 @@ fn buildExtensions(d: DerBuild, opts: CertOptions) DerCertError![]const u8 {
 }
 
 /// Generate a self-signed X.509 v3 certificate (RFC 5280) for `sk`/`pk`
-/// (the caller-supplied `pk` must be the public key matching `sk` — this is
-/// not re-derived from `sk`, since `SecretKey` carries no cached `e`),
+/// (the caller-supplied `pk` must be the public key matching `sk`, e.g.
+/// `sk.publicKey()`; it is not compared),
 /// signed with RSASSA-PKCS1-v1_5 over `Hash` (`signPkcs1v15`, P1). Returns
 /// `gpa`-owned DER bytes (`Certificate ::= SEQUENCE { tbsCertificate,
 /// signatureAlgorithm, signatureValue BIT STRING }`); an owned-slice return
@@ -4293,6 +4448,173 @@ test "SecretKey.fromPem parses RSA PRIVATE KEY and PRIVATE KEY PEM, matches kat2
     try verifyPkcs1v15(try PublicKey.fromPem(kat2048_pem.pub_spki), std.crypto.hash.sha2.Sha256, kat2048.msg, sig);
 }
 
+// ── R1 (2026-10-14): key serialisation, byte-exact against OpenSSL ──────────
+//
+// The kat2048 fixtures above are OpenSSL 3 output (`openssl rsa -traditional`,
+// `pkcs8 -topk8 -nocrypt`, `-pubout`, `-RSAPublicKey_out`, DER and PEM): a
+// parsed fixture written back must give exactly those bytes.
+
+test "marshal: parse -> write reproduces the OpenSSL DER and PEM fixtures byte for byte" {
+    var sk: SecretKey = undefined;
+    try SecretKey.fromDer(&sk, &kat2048_der.priv_pkcs1);
+    defer sk.deinit();
+    const pk = sk.publicKey();
+    const vk = pk.verifyKey();
+    var buf: [max_private_pem_len]u8 = undefined;
+
+    try testing.expectEqualSlices(u8, &kat2048_der.priv_pkcs1, try sk.toPkcs1Der(&buf));
+    try testing.expectEqualSlices(u8, &kat2048_der.priv_pkcs8, try sk.toPkcs8Der(&buf));
+    try testing.expectEqualSlices(u8, kat2048_pem.priv_pkcs1, try sk.toPem(.pkcs1, &buf));
+    try testing.expectEqualSlices(u8, kat2048_pem.priv_pkcs8, try sk.toPem(.pkcs8, &buf));
+    for ([_]PublicKey{ pk, try PublicKey.fromDer(&kat2048_der.pub_pkcs1) }) |p| {
+        try testing.expectEqualSlices(u8, &kat2048_der.pub_pkcs1, try p.toPkcs1Der(&buf));
+        try testing.expectEqualSlices(u8, &kat2048_der.pub_spki, try p.toSpkiDer(&buf));
+        try testing.expectEqualSlices(u8, kat2048_pem.pub_pkcs1, try p.toPem(.pkcs1, &buf));
+        try testing.expectEqualSlices(u8, kat2048_pem.pub_spki, try p.toPem(.spki, &buf));
+    }
+    try testing.expectEqualSlices(u8, &kat2048_der.pub_pkcs1, try vk.toPkcs1Der(&buf));
+    try testing.expectEqualSlices(u8, &kat2048_der.pub_spki, try vk.toSpkiDer(&buf));
+    try testing.expectEqualSlices(u8, kat2048_pem.pub_spki, try vk.toPem(.spki, &buf));
+
+    try testing.expect(pk.equal(&try PublicKey.fromPem(kat2048_pem.pub_spki)));
+    try testing.expectEqual(2048, pk.bits());
+    try testing.expectEqual(256, pk.size());
+}
+
+test "marshal: an exact-size buffer fits, one byte less is BufferTooSmall with out zeroed" {
+    var sk: SecretKey = undefined;
+    try SecretKey.fromDer(&sk, &kat2048_der.priv_pkcs1);
+    defer sk.deinit();
+    const pk = sk.publicKey();
+    var buf: [max_private_pem_len]u8 = undefined;
+    const Case = struct { want: usize, run: *const fn (*const SecretKey, *const PublicKey, []u8) MarshalError![]u8 };
+    const cases = [_]Case{
+        .{ .want = kat2048_der.priv_pkcs1.len, .run = struct {
+            fn f(s: *const SecretKey, _: *const PublicKey, o: []u8) MarshalError![]u8 {
+                return s.toPkcs1Der(o);
+            }
+        }.f },
+        .{ .want = kat2048_der.priv_pkcs8.len, .run = struct {
+            fn f(s: *const SecretKey, _: *const PublicKey, o: []u8) MarshalError![]u8 {
+                return s.toPkcs8Der(o);
+            }
+        }.f },
+        .{ .want = kat2048_pem.priv_pkcs8.len, .run = struct {
+            fn f(s: *const SecretKey, _: *const PublicKey, o: []u8) MarshalError![]u8 {
+                return s.toPem(.pkcs8, o);
+            }
+        }.f },
+        .{ .want = kat2048_der.pub_spki.len, .run = struct {
+            fn f(_: *const SecretKey, p: *const PublicKey, o: []u8) MarshalError![]u8 {
+                return p.toSpkiDer(o);
+            }
+        }.f },
+        .{ .want = kat2048_pem.pub_pkcs1.len, .run = struct {
+            fn f(_: *const SecretKey, p: *const PublicKey, o: []u8) MarshalError![]u8 {
+                return p.toPem(.pkcs1, o);
+            }
+        }.f },
+    };
+    for (cases) |c| {
+        try testing.expectEqual(c.want, (try c.run(&sk, &pk, buf[0..c.want])).len);
+        @memset(&buf, 0xaa);
+        try testing.expectError(error.BufferTooSmall, c.run(&sk, &pk, buf[0 .. c.want - 1]));
+        for (buf[0 .. c.want - 1]) |b| try testing.expectEqual(0, b);
+    }
+    // The advertised maxima hold for the largest keys the module takes.
+    try testing.expect(max_pkcs1_private_der_len >= kat2048_der.priv_pkcs1.len);
+    try testing.expect(max_public_pem_len >= kat2048_pem.pub_pkcs1.len);
+}
+
+/// The nine INTEGER fields of a PKCS#1 `RSAPrivateKey` DER (version, n, e,
+/// d, p, q, dP, dQ, qInv) as content ranges.
+fn pkcs1Fields(der: []const u8) ![9]Asn1.Element {
+    const top = try derTopSequence(der);
+    var f: [9]Asn1.Element = undefined;
+    var at = top.slice.start;
+    for (&f) |*e| {
+        e.* = try derChild(der, at, top.slice.end, .integer, false);
+        at = e.slice.end;
+    }
+    return f;
+}
+
+test "F1: a wrong on-disk n, d, dP, dQ or qInv is InvalidPrivateKey (was loaded silently)" {
+    for ([_]usize{ 1, 3, 6, 7, 8 }) |field| { // n, d, dP, dQ, qInv
+        var der = kat2048_der.priv_pkcs1;
+        const f = try pkcs1Fields(&der);
+        der[f[field].slice.end - 1] ^= 0x02; // a low bit: length and sign unchanged
+        try testing.expectError(error.InvalidPrivateKey, SecretKey.fromDer(&test_sk_out, &der));
+        var pkcs8: [kat2048_der.priv_pkcs8.len]u8 = kat2048_der.priv_pkcs8;
+        @memcpy(pkcs8[pkcs8.len - der.len ..], &der);
+        try testing.expectError(error.InvalidPrivateKey, fromPkcs8(&test_sk_out, &pkcs8));
+    }
+}
+
+test "F1: a φ-reduced (or any other valid) d is accepted and kept, so it round-trips" {
+    // d' = d + λ(n) is another valid private exponent (< 2λ ≤ φ < n); keys
+    // written by tools that reduce mod φ carry such a d.
+    var sk: SecretKey = undefined;
+    try SecretKey.fromDer(&sk, &kat2048_der.priv_pkcs1);
+    defer sk.deinit();
+    var mem: [64 * 1024]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&mem);
+    const gpa = fba.allocator();
+    var p1 = try bigFromBytes(gpa, &kat2048.p);
+    try p1.addScalar(&p1, -1);
+    var q1 = try bigFromBytes(gpa, &kat2048.q);
+    try q1.addScalar(&q1, -1);
+    var g = try newBig(gpa);
+    try g.gcd(&p1, &q1);
+    var pq1 = try newBig(gpa);
+    try pq1.mul(&p1, &q1);
+    var lam = try newBig(gpa);
+    var rem = try newBig(gpa);
+    try lam.divFloor(&rem, &pq1, &g);
+    var d2 = try bigFromBytes(gpa, &kat2048.d);
+    try d2.add(&d2, &lam);
+    var d2_bytes: [256]u8 = undefined;
+    d2.toConst().writeTwosComplement(&d2_bytes, .big);
+    sk.d = try Fe.fromBytes(sk.n, &d2_bytes, .big);
+
+    var buf: [max_pkcs1_private_der_len]u8 = undefined;
+    const der = try sk.toPkcs1Der(&buf);
+    var back: SecretKey = undefined;
+    try SecretKey.fromDer(&back, der);
+    defer back.deinit();
+    var got: [256]u8 = undefined;
+    try back.d.toBytes(&got, .big);
+    try testing.expectEqualSlices(u8, &d2_bytes, &got);
+    var buf2: [max_pkcs1_private_der_len]u8 = undefined;
+    try testing.expectEqualSlices(u8, der, try back.toPkcs1Der(&buf2));
+    // The non-CRT path uses d: still the right key.
+    const m = [_]u8{0} ** 255 ++ [_]u8{42};
+    try testing.expectEqualSlices(u8, &try rsadp(256, m, &sk), &try rsadp(256, m, &back));
+}
+
+test "marshal: generated keys round-trip through every form" {
+    var prng = std.Random.DefaultPrng.init(0x5eed_0014);
+    for ([_]usize{ 512, 1024 }) |bits| {
+        var kp: KeyPair = undefined;
+        try generate(&kp, prng.random(), bits, 65537);
+        defer kp.secret_key.deinit();
+        try testing.expect(kp.public_key.equal(&kp.secret_key.publicKey()));
+        var a: [max_private_pem_len]u8 = undefined;
+        var b: [max_private_pem_len]u8 = undefined;
+        for ([_]PrivateKeyForm{ .pkcs1, .pkcs8 }) |form| {
+            var back: SecretKey = undefined;
+            const pem = try kp.secret_key.toPem(form, &a);
+            try SecretKey.fromPem(&back, pem);
+            defer back.deinit();
+            try testing.expectEqualSlices(u8, try kp.secret_key.toPkcs8Der(&a), try back.toPkcs8Der(&b));
+        }
+        for ([_]PublicKeyForm{ .pkcs1, .spki }) |form| {
+            const back = try PublicKey.fromPem(try kp.public_key.toPem(form, &a));
+            try testing.expect(back.equal(&kp.public_key));
+        }
+    }
+}
+
 test "PublicKey.fromDer/SecretKey.fromDer/fromPkcs8 reject truncated DER" {
     inline for (.{ &kat2048_der.pub_spki, &kat2048_der.pub_pkcs1 }) |der_bytes| {
         var l: usize = 0;
@@ -5593,29 +5915,69 @@ fn mark(comptime l: FuzzLabel) void {
 
 fn parsePubDer(in: []const u8) ?usize {
     const pk = PublicKey.fromDer(in) catch return null;
+    publicRoundTrip(&pk);
     return pk.n.bits();
 }
 fn parsePubPem(in: []const u8) ?usize {
     const pk = PublicKey.fromPem(in) catch return null;
+    publicRoundTrip(&pk);
     return pk.n.bits();
 }
 fn parseSecDer(in: []const u8) ?usize {
     var sk: SecretKey = undefined;
     SecretKey.fromDer(&sk, in) catch return null;
     defer sk.deinit();
+    secretRoundTrip(&sk);
     return sk.n.bits();
 }
 fn parsePkcs8(in: []const u8) ?usize {
     var sk: SecretKey = undefined;
     fromPkcs8(&sk, in) catch return null;
     defer sk.deinit();
+    secretRoundTrip(&sk);
     return sk.n.bits();
 }
 fn parseSecPem(in: []const u8) ?usize {
     var sk: SecretKey = undefined;
     SecretKey.fromPem(&sk, in) catch return null;
     defer sk.deinit();
+    secretRoundTrip(&sk);
     return sk.n.bits();
+}
+
+/// The writer's property on every key a parser accepted (R1, 2026-10-14):
+/// each encoding parses back, and writing the re-parsed key gives the same
+/// bytes — the parser and the writer agree on every key the harnesses reach.
+fn publicRoundTrip(pk: *const PublicKey) void {
+    var a: [max_public_pem_len]u8 = undefined;
+    var b: [max_public_pem_len]u8 = undefined;
+    for ([_]PublicKeyForm{ .pkcs1, .spki }) |form| {
+        const der = (switch (form) {
+            .pkcs1 => pk.toPkcs1Der(&a),
+            .spki => pk.toSpkiDer(&a),
+        }) catch @panic("max_*_der_len too small");
+        const back = PublicKey.fromDer(der) catch @panic("written public DER does not parse");
+        if (!back.equal(pk)) @panic("public DER round trip changed the key");
+    }
+    const pem = pk.toPem(.spki, &a) catch @panic("toPem: max_public_pem_len too small");
+    const back = PublicKey.fromPem(pem) catch @panic("written public PEM does not parse");
+    const again = back.toPem(.spki, &b) catch unreachable;
+    if (!std.mem.eql(u8, pem, again)) @panic("public PEM is not a fixed point");
+}
+
+fn secretRoundTrip(sk: *const SecretKey) void {
+    var a: [max_private_pem_len]u8 = undefined;
+    defer std.crypto.secureZero(u8, &a);
+    var b: [max_private_pem_len]u8 = undefined;
+    defer std.crypto.secureZero(u8, &b);
+    for ([_]PrivateKeyForm{ .pkcs1, .pkcs8 }) |form| {
+        const pem = sk.toPem(form, &a) catch @panic("toPem: max_private_pem_len too small");
+        var back: SecretKey = undefined;
+        SecretKey.fromPem(&back, pem) catch @panic("written private PEM does not parse");
+        defer back.deinit();
+        const again = back.toPem(form, &b) catch unreachable;
+        if (!std.mem.eql(u8, pem, again)) @panic("private PEM is not a fixed point");
+    }
 }
 fn parseSsh(in: []const u8) ?usize {
     var sk: SecretKey = undefined;
@@ -5732,22 +6094,19 @@ const secder_seeds = [_][]const u8{
     // version 1 = multi-prime (`otherPrimeInfos`), which this parser refuses
     // rather than misreading as a two-prime key.
     testkit.fuzz.seed(perturbed(&kat2048_der.priv_pkcs1, 6, 0x01)),
-    // ⭐ One octet changed inside p, and one inside q. These two are not
-    // symmetric, and that asymmetry is the point:
-    //   - a corrupted **p** is REFUSED (`InvalidPrivateKey`). qInv is derived
-    //     by Fermat inversion q^(p-2) mod p, which is only an inverse when p
-    //     is prime, so the `qInv·q ≡ 1 (mod p)` self-check fails. That check
-    //     carries the comment "catches a non-prime p sneaking past" and,
-    //     before this corpus, nothing in the module ever handed it a
-    //     non-prime p — the branch was written and never executed;
-    //   - a corrupted **q** goes through, to a different modulus, because p
-    //     is still prime and the derivation is sound over a composite q.
+    // ⭐ One octet changed inside p, and one inside q. Both are refused, for
+    // different reasons:
+    //   - a corrupted **p** fails the `qInv·q ≡ 1 (mod p)` self-check: qInv
+    //     is derived by Fermat inversion q^(p-2) mod p, an inverse only when
+    //     p is prime ("catches a non-prime p sneaking past"; before this
+    //     corpus nothing ever handed that branch a non-prime p);
+    //   - a corrupted **q** derives soundly (p is still prime) to a different
+    //     modulus, which until 2026-10-14 was ACCEPTED as that other key; the
+    //     wire-`n` check (audit F1) now refuses it.
     testkit.fuzz.seed(perturbed(&kat2048_der.priv_pkcs1, 600, 0x03)),
     testkit.fuzz.seed(perturbed(&kat2048_der.priv_pkcs1, 700, 0x03)),
-    // ⭐ One octet changed inside dP. This one must come out as the SAME key:
-    // `fromDer` takes only p, q and e and re-derives n/d/dP/dQ/qInv rather
-    // than trusting the on-disk copies, so a corrupted CRT exponent is
-    // discarded, not used. Measured here rather than asserted in prose.
+    // ⭐ One octet changed inside dP. Until 2026-10-14 it came out as the SAME
+    // key (the on-disk CRT fields were never read); F1 now refuses it.
     testkit.fuzz.seed(perturbed(&kat2048_der.priv_pkcs1, 900, 0x03)),
     // Outer length one octet too long.
     testkit.fuzz.seed(perturbed(&kat2048_der.priv_pkcs1, 3, 0x01)),
@@ -5799,12 +6158,11 @@ test "corpus: SecretKey.fromDer seeds reach the parser, counts pinned" {
         try moduli.add(sk.n);
     }
     // Measured 2026-09-07: 0 non-empty / 0 accepted / 0 distinct before,
-    // 8 / 3 / 2 after. The `accepted` and `distinct` gap is the p-perturbation
-    // being refused by the non-prime-p self-check and the dP-perturbation
-    // coming back as the same key.
+    // 8 / 3 / 2 after (the q- and dP-perturbations accepted). 2026-10-14,
+    // audit F1 (wire fields checked): 8 / 1 / 1 — only the genuine key.
     try testing.expectEqual(secder_seeds.len - 1, nonempty);
-    try testing.expectEqual(@as(usize, 3), accepted);
-    try testing.expectEqual(@as(usize, 2), moduli.n);
+    try testing.expectEqual(@as(usize, 1), accepted);
+    try testing.expectEqual(@as(usize, 1), moduli.n);
 }
 
 // ── fromPkcs8 (PrivateKeyInfo wrapper) ───────────────────────────────────────
@@ -5818,7 +6176,8 @@ const pkcs8_seeds = [_][]const u8{
     // for something that is not rsaEncryption, which must be refused before
     // the inner blob is looked at.
     testkit.fuzz.seed(perturbed(&kat2048_der.priv_pkcs8, 24, 0x02)),
-    // One octet inside the wrapped p.
+    // One octet inside the wrapped q (726 − 26 = 700, `secder_seeds`' q
+    // offset): accepted as another key until audit F1 (2026-10-14).
     testkit.fuzz.seed(perturbed(&kat2048_der.priv_pkcs8, 726, 0x03)),
     // The OCTET STRING length one octet short of its content.
     testkit.fuzz.seed(perturbed(&kat2048_der.priv_pkcs8, 25, 0x01)),
@@ -5865,9 +6224,10 @@ test "corpus: fromPkcs8 seeds reach the parser, counts pinned" {
         accepted += 1;
         try moduli.add(sk.n);
     }
+    // 2 / 2 until 2026-10-14 (the q-perturbation); F1: the genuine key only.
     try testing.expectEqual(pkcs8_seeds.len - 1, nonempty);
-    try testing.expectEqual(@as(usize, 2), accepted);
-    try testing.expectEqual(@as(usize, 2), moduli.n);
+    try testing.expectEqual(@as(usize, 1), accepted);
+    try testing.expectEqual(@as(usize, 1), moduli.n);
 }
 
 // ── PublicKey.fromPem ────────────────────────────────────────────────────────
@@ -6174,8 +6534,12 @@ fn reachCheck(comptime harness: anytype, name: []const u8, seeds: usize, optiona
 test "fuzz harness: seeds in every test run, and they get everywhere" {
     try reachCheck(pubDerHarness, "rsa-pubder", 300, null);
     try reachCheck(pubPemHarness, "rsa-pubpem", 300, null);
-    try reachCheck(secDerHarness, "rsa-secder", 100, null);
-    try reachCheck(pkcs8Harness, "rsa-pkcs8", 100, null);
+    // Since audit F1 (2026-10-14) every octet of a PKCS#1 private key is bound
+    // to the derived key, so a damaged one is never accepted: not demanded.
+    // PKCS#8 adds only the 2-octet AlgorithmIdentifier parameters, which are
+    // not inspected — too small a target for 100 seeds.
+    try reachCheck(secDerHarness, "rsa-secder", 100, .damaged_accepted);
+    try reachCheck(pkcs8Harness, "rsa-pkcs8", 100, .damaged_accepted);
     // A damaged base64/armoured body is accepted only by luck (a XOR that lands
     // in padding or whitespace); not demanded for the private PEM and OpenSSH
     // forms, whose seeds are too expensive to run by the thousand.
