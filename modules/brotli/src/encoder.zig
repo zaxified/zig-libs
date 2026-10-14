@@ -18,9 +18,13 @@
 //! - **Matches are chosen by the bits they save** (`Matcher.gain`), not by
 //!   length: the literals covered, priced at the block's order-0 entropy,
 //!   minus the distance's cost. Up to 65 535 bytes long; the search depth is
-//!   the effort (`Effort`: 8 / 32 / 256 candidates of a bucketed hash), one
-//!   lazy step. At `.default`/`.best` the last two distances are tried first
-//!   (a copy at one of them needs no distance bits, from 3 bytes on).
+//!   the effort (`Effort`: 32 / 256 candidates of a bucketed hash), one lazy
+//!   step. At `.default`/`.best` the last two distances are tried first (a
+//!   copy at one of them needs no distance bits, from 3 bytes on).
+//! - **`.fast` is its own algorithm** (`FastMatcher`, `buildCommandsFast`):
+//!   4 slots of a 6-byte hash and the last distance, a lazy step only below
+//!   32 bytes, sparse inserts inside long copies, growing steps through long
+//!   literal runs. Sizes about google/brotli quality 4 (2026-10-14).
 //! - **Distance short codes and implicit distances**: the encoder mirrors the
 //!   decoder's ring of the last four distances (`DistRing`) and names a
 //!   distance by its short code (0..15, no extra bits) when it can; a copy at
@@ -943,6 +947,114 @@ const Matcher = struct {
     }
 };
 
+// `.fast` has a match finder of its own (2026-10-14). `Matcher` keeps a count
+// per bucket to know which slots are written and walks them newest first: a
+// load and a store of the count on every insert, and a walk whose length the
+// count decides. Here a bucket has a fixed `fast_sweep` slots, all valid from
+// the start (the table is zeroed, a zero slot is position 0 — a real if
+// unlikely candidate that the compare settles), and a position goes to the
+// slot its own bits pick, as google/brotli's quick hashers do — an insert is
+// one store. The values below were swept on the bench payloads (json, html,
+// alice29) for size and time together:
+// - 6 hashed bytes: smaller than 5 on all three (text −2 %), 7 lost on text;
+// - 4 slots × 2^16 buckets: 8 slots cost ~15 % time for ~1 %, 2^17 buckets
+//   ~10 % time for 0.3 % on text (a 2 MiB table to clear per call);
+// - the lazy step is worth 4-7 % of size and is skipped from 32 bytes on (16
+//   cost html 2 %); the second-last ring distance, or 3-byte copies at the
+//   ring, never won.
+
+/// Bytes `FastMatcher` hashes.
+const fast_hash_len = 6;
+/// Slots per bucket of `FastMatcher`.
+const fast_sweep = 4;
+/// log2 of `FastMatcher`'s most buckets.
+const fast_bucket_log_max = 16;
+/// Literals in a row after which `buildCommandsFast` starts to skip positions.
+const fast_skip_after = 64;
+/// Longest step through a run of literals.
+const fast_skip_max = 16;
+/// Matches shorter than this get the lazy step (try the next position).
+const fast_lazy_max_len = 32;
+/// Copies up to this long have every position inserted; longer ones their
+/// first and last `fast_dense_insert / 2` and every fourth between.
+const fast_dense_insert = 32;
+/// `literalCost` sampling at `.fast`.
+const fast_cost_stride = 4;
+
+const FastMatcher = struct {
+    lit_cost: f32 = 8,
+    /// `fast_sweep` slots per bucket.
+    table: []u32,
+    hash_shift: u6,
+    data: []const u8,
+
+    fn init(gpa: std.mem.Allocator, data: []const u8, bucket_log_max: u6) std.mem.Allocator.Error!FastMatcher {
+        var bucket_log: u6 = 8;
+        while (bucket_log < bucket_log_max and (@as(usize, 1) << bucket_log) < data.len) bucket_log += 1;
+        const table = try gpa.alloc(u32, @as(usize, 1) << bucket_log << std.math.log2_int(u32, fast_sweep));
+        Matcher.fillZero(table);
+        return .{ .table = table, .hash_shift = @intCast(64 - @as(u7, bucket_log)), .data = data };
+    }
+
+    fn deinit(self: *FastMatcher, gpa: std.mem.Allocator) void {
+        gpa.free(self.table);
+        self.* = undefined;
+    }
+
+    /// Bucket of the five bytes at `p`; needs eight readable bytes.
+    fn bucket(self: *const FastMatcher, p: usize) usize {
+        const v = std.mem.readInt(u64, self.data[p..][0..8], .little) << (64 - 8 * fast_hash_len);
+        return @intCast((v *% 0x1e35a7bd1e35a7bd) >> self.hash_shift);
+    }
+
+    fn insert(self: *FastMatcher, p: usize) void {
+        if (p + 8 > self.data.len) return;
+        self.table[self.bucket(p) * fast_sweep + ((p >> 3) & (fast_sweep - 1))] = @intCast(p);
+    }
+
+    fn prefetch(self: *const FastMatcher, p: usize) void {
+        if (p + 8 > self.data.len) return;
+        @prefetch(&self.table[self.bucket(p) * fast_sweep], .{});
+    }
+
+    /// As `Matcher.find`, over the bucket's slots and the last distance (the
+    /// second-last, or copies of three bytes at either, never won here).
+    fn find(self: *const FastMatcher, p: usize, ring: *const DistRing, max_dist: usize, limit: usize) ?Match {
+        if (p + 8 > limit) return null;
+        const max_len = @min(limit - p, max_match);
+        var best_len: usize = 0;
+        var best_dist: usize = 0;
+        var best_gain: f32 = 0;
+        const last: usize = ring.last[0];
+        if (last <= max_dist and std.mem.readInt(u32, self.data[p - last ..][0..4], .little) == std.mem.readInt(u32, self.data[p..][0..4], .little)) {
+            best_len = Matcher.matchLen(self.data, p - last, p, max_len);
+            best_dist = last;
+            best_gain = @as(f32, @floatFromInt(best_len)) * self.lit_cost - 3;
+        }
+        if (best_len == max_len) return .{ .len = @intCast(best_len), .dist = @intCast(best_dist), .gain = best_gain };
+        const slots = self.table[self.bucket(p) * fast_sweep ..][0..fast_sweep];
+        for (slots) |s| {
+            const c: usize = s;
+            if (c >= p) continue;
+            const d = p - c;
+            if (d > max_dist or d == best_dist) continue;
+            if (self.data[c + best_len] != self.data[p + best_len]) continue;
+            const l = Matcher.matchLen(self.data, c, p, max_len);
+            if (l < min_match) continue;
+            const dist_bits: f32 = @floatFromInt(std.math.log2_int(usize, d));
+            const g = @as(f32, @floatFromInt(l)) * self.lit_cost - dist_bits - 6;
+            if (g > best_gain) {
+                best_gain = g;
+                best_len = l;
+                best_dist = d;
+                if (l == max_len) break;
+            }
+        }
+        if (best_len == 0) return null;
+        return .{ .len = @intCast(best_len), .dist = @intCast(best_dist), .gain = best_gain };
+    }
+};
+
 // ---------------------------------------------------------------------------
 // Commands.
 
@@ -970,14 +1082,7 @@ fn buildCommands(
     var p = start;
     var lit_start = start;
     var pending: ?Match = null;
-
-    // The block's order-0 entropy, as the price of a literal.
-    var hist = [_]u32{0} ** 256;
-    for (matcher.data[start..end]) |b| hist[b] += 1;
-    var sum: f64 = 0;
-    for (hist) |c| sum += nlog2n(c);
-    const n: f64 = @floatFromInt(end - start);
-    matcher.lit_cost = @floatCast(@max(1.0, (nlog2n(end - start) - sum) / n));
+    matcher.lit_cost = literalCost(matcher.data[start..end], 1);
 
     while (p < end) {
         matcher.prefetch(p + 1);
@@ -1015,6 +1120,88 @@ fn buildCommands(
         lit_start = p;
     }
 
+    if (lit_start < end) {
+        try out.append(gpa, .{ .insert_len = @intCast(end - lit_start), .copy_len = 0, .dist = 0 });
+    }
+}
+
+/// The block's order-0 entropy in bits per byte (at least 1): the price of a
+/// literal, so what a match saves per byte it covers.
+/// Every `stride`-th byte is counted.
+fn literalCost(block: []const u8, comptime stride: usize) f32 {
+    var hist = [_]u32{0} ** 256;
+    var i: usize = 0;
+    while (i < block.len) : (i += stride) hist[block[i]] += 1;
+    var sum: f64 = 0;
+    for (hist) |c| sum += nlog2n(c);
+    const counted = (block.len + stride - 1) / stride;
+    const n: f64 = @floatFromInt(counted);
+    return @floatCast(@max(1.0, (nlog2n(counted) - sum) / n));
+}
+
+/// `.fast`'s parse of `input[start..end)`, same contract as `buildCommands`:
+/// greedy with a lazy step for short matches only, and through a run of
+/// literals it looks at fewer positions the longer the run (from
+/// `fast_skip_after` literals on, every second, then every third... up to
+/// `fast_skip_max`): data that found no match for a while is unlikely to find
+/// one at the next byte, and incompressible input passes at a fraction of the
+/// lookups.
+fn buildCommandsFast(
+    gpa: std.mem.Allocator,
+    matcher: *FastMatcher,
+    start: usize,
+    end: usize,
+    max_dist: usize,
+    ring_in: DistRing,
+    out: *std.ArrayListUnmanaged(Cmd),
+) std.mem.Allocator.Error!void {
+    var p = start;
+    var lit_start = start;
+    var ring = ring_in;
+    // A price, not a code: a quarter of the bytes estimate it well enough.
+    matcher.lit_cost = literalCost(matcher.data[start..end], fast_cost_stride);
+
+    while (p < end) {
+        matcher.prefetch(p + 1);
+        var m = matcher.find(p, &ring, @min(max_dist, p), end) orelse {
+            matcher.insert(p);
+            const run = p - lit_start;
+            p += if (run < fast_skip_after) 1 else @min(fast_skip_max, 1 + ((run - fast_skip_after) >> 5));
+            continue;
+        };
+        if (m.len < fast_lazy_max_len) {
+            matcher.insert(p);
+            while (p + 1 < end) {
+                const b = matcher.find(p + 1, &ring, @min(max_dist, p + 1), end) orelse break;
+                // One literal more is spent to take `b`.
+                if (b.gain <= m.gain + matcher.lit_cost) break;
+                p += 1;
+                matcher.insert(p);
+                m = b;
+            }
+        }
+        try out.append(gpa, .{
+            .insert_len = @intCast(p - lit_start),
+            .copy_len = m.len,
+            .dist = m.dist,
+        });
+        if (m.dist != ring.last[0]) ring.update(m.dist, null);
+        matcher.prefetch(p + m.len);
+        var q = p;
+        if (m.len <= fast_dense_insert) {
+            while (q < p + m.len) : (q += 1) matcher.insert(q);
+        } else {
+            // A long copy: its first and last positions in full, every
+            // fourth between.
+            while (q < p + fast_dense_insert / 2) : (q += 1) matcher.insert(q);
+            while (q < p + m.len - fast_dense_insert / 2) : (q += 4) matcher.insert(q);
+            q = p + m.len - fast_dense_insert / 2;
+            while (q < p + m.len) : (q += 1) matcher.insert(q);
+        }
+        p += m.len;
+        lit_start = p;
+    }
+    // A skip may have stepped past `end`.
     if (lit_start < end) {
         try out.append(gpa, .{ .insert_len = @intCast(end - lit_start), .copy_len = 0, .dist = 0 });
     }
@@ -1494,10 +1681,24 @@ fn writeCompressedBlock(
         try cmd_code.emit(w, r.sym);
         if (r.insert_nbits != 0) try w.writeBits(r.insert_extra, r.insert_nbits);
         if (r.copy_nbits != 0) try w.writeBits(r.copy_extra, r.copy_nbits);
-        for (lit_pos..lit_pos + c.insert_len) |q| {
-            const p1: u8 = if (q >= 1) input[q - 1] else 0;
-            const p2: u8 = if (q >= 2) input[q - 2] else 0;
-            try lit_codes[model.map[contextId(model.mode, p1, p2)]].emit(w, input[q]);
+        const lits = input[lit_pos..][0..c.insert_len];
+        if (model.ntrees == 1) {
+            // No context to look up; two codes of at most 15 bits fit one
+            // `writeBits`.
+            const code = &lit_codes[0];
+            var k: usize = 0;
+            while (k + 2 <= lits.len) : (k += 2) {
+                const l0: u5 = @intCast(code.len[lits[k]]);
+                const l1: u5 = @intCast(code.len[lits[k + 1]]);
+                try w.writeBits(@as(u32, code.bits[lits[k]]) | @as(u32, code.bits[lits[k + 1]]) << l0, @as(u6, l0) + l1);
+            }
+            if (k < lits.len) try code.emit(w, lits[k]);
+        } else {
+            for (lit_pos..lit_pos + c.insert_len) |q| {
+                const p1: u8 = if (q >= 1) input[q - 1] else 0;
+                const p2: u8 = if (q >= 2) input[q - 2] else 0;
+                try lit_codes[model.map[contextId(model.mode, p1, p2)]].emit(w, input[q]);
+            }
         }
         lit_pos += c.insert_len;
         if (r.has_dist) {
@@ -1583,7 +1784,8 @@ pub fn compress(gpa: std.mem.Allocator, input: []const u8) std.mem.Allocator.Err
 /// How hard the encoder looks. Every level emits a valid stream and falls
 /// back to storing a block that will not shrink; they differ in time spent.
 pub const Effort = enum {
-    /// Shallow match search (8 candidates), one literal code per block.
+    /// Its own match finder (4 candidates, last distance), one literal
+    /// code per block; sizes about google/brotli quality 4.
     fast,
     /// 32 candidates; literal context modelling (UTF8 / LSB6 modes).
     default,
@@ -1594,7 +1796,7 @@ pub const Effort = enum {
     /// log2 of all bucket slots together, the match finder's table.
     fn slotsLog(e: Effort) u5 {
         return switch (e) {
-            .fast => 17,
+            .fast => unreachable, // `FastMatcher`
             .default => 19,
             .best => 20,
         };
@@ -1602,7 +1804,7 @@ pub const Effort = enum {
 
     fn depth(e: Effort) u32 {
         return switch (e) {
-            .fast => 8,
+            .fast => unreachable, // `FastMatcher`
             .default => 32,
             .best => 256,
         };
@@ -1635,8 +1837,14 @@ pub fn compressWith(gpa: std.mem.Allocator, input: []const u8, opts: CompressOpt
     }
     const max_backward = (@as(usize, 1) << wbits) - 16;
 
-    var matcher = try Matcher.init(gpa, input, opts.effort.depth(), opts.effort.slotsLog());
-    defer matcher.deinit(gpa);
+    var matcher: Matcher = undefined;
+    var fast: FastMatcher = undefined;
+    if (opts.effort == .fast) {
+        fast = try FastMatcher.init(gpa, input, fast_bucket_log_max);
+    } else {
+        matcher = try Matcher.init(gpa, input, opts.effort.depth(), opts.effort.slotsLog());
+    }
+    defer if (opts.effort == .fast) fast.deinit(gpa) else matcher.deinit(gpa);
     const max_dist = max_backward;
 
     var cmds: std.ArrayListUnmanaged(Cmd) = .empty;
@@ -1655,10 +1863,12 @@ pub fn compressWith(gpa: std.mem.Allocator, input: []const u8, opts: CompressOpt
         const is_last = end == input.len;
 
         cmds.clearRetainingCapacity();
-        matcher.ring = ring;
         switch (opts.effort) {
-            .fast => try buildCommands(0, gpa, &matcher, off, end, max_dist, &cmds),
-            .default, .best => try buildCommands(2, gpa, &matcher, off, end, max_dist, &cmds),
+            .fast => try buildCommandsFast(gpa, &fast, off, end, max_dist, ring, &cmds),
+            .default, .best => {
+                matcher.ring = ring;
+                try buildCommands(2, gpa, &matcher, off, end, max_dist, &cmds);
+            },
         }
 
         const m = w.mark();
