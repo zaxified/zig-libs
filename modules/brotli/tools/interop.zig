@@ -428,6 +428,63 @@ fn checkDictEncoderDirection(sh: *Shared) !void {
     };
 }
 
+// ── the large window: the library's streams, our decoders ──────────────────
+
+fn checkLargeDecoderDirection(sh: *Shared) !void {
+    const gpa = sh.ref.gpa;
+    inline for (corpus.large_cases) |c| {
+        const plain = try c.input.build(gpa);
+        defer gpa.free(plain);
+        inline for (corpus.large_qualities) |q| {
+            const stream = try sh.compress("", plain, q, c.lgwin, true);
+            defer gpa.free(stream);
+            if (try ourLargeDecoders(gpa, stream, plain)) |why| {
+                bad("large {s} q{d}: we did not decode the library's stream ({s})", .{ c.name, q, why });
+            } else ok();
+            const fx = ref_dir ++ "/" ++ comptime corpus.largeRefFile(c, q);
+            if (std.Io.Dir.cwd().readFileAlloc(sh.ref.io, fx, gpa, .unlimited)) |committed| {
+                defer gpa.free(committed);
+                if (!std.mem.eql(u8, committed, stream))
+                    note("{s}: the committed stream is not what this library emits ({d} vs {d} bytes) — --capture re-records it", .{ fx, committed.len, stream.len });
+            } else |_| note("{s}: not committed yet — run with --capture", .{fx});
+        }
+    }
+}
+
+fn ourLargeDecoders(gpa: std.mem.Allocator, stream: []const u8, plain: []const u8) !?[]const u8 {
+    const opts: brotli.Options = .{ .large_window = true, .max_output = 1 << 26 };
+    if (brotli.decompress(gpa, stream, .{ .max_output = 1 << 26 })) |x| {
+        gpa.free(x);
+        return "accepted without large_window";
+    } else |_| {}
+    const a = brotli.decompress(gpa, stream, opts) catch |e| return @errorName(e);
+    defer gpa.free(a);
+    if (!std.mem.eql(u8, a, plain)) return "decompress: different bytes";
+    var r: std.Io.Reader = .fixed(stream);
+    var w: std.Io.Writer.Allocating = .init(gpa);
+    defer w.deinit();
+    _ = brotli.decompressStream(gpa, &r, &w.writer, opts) catch |e| return @errorName(e);
+    if (!std.mem.eql(u8, w.written(), plain)) return "decompressStream: different bytes";
+    return null;
+}
+
+fn captureLargeRefStreams(sh: *Shared) !void {
+    const gpa = sh.ref.gpa;
+    try std.Io.Dir.cwd().createDirPath(sh.ref.io, ref_dir ++ "/large");
+    var total: usize = 0;
+    inline for (corpus.large_cases) |c| {
+        const plain = try c.input.build(gpa);
+        defer gpa.free(plain);
+        inline for (corpus.large_qualities) |q| {
+            const stream = try sh.compress("", plain, q, c.lgwin, true);
+            defer gpa.free(stream);
+            try std.Io.Dir.cwd().writeFile(sh.ref.io, .{ .sub_path = ref_dir ++ "/" ++ comptime corpus.largeRefFile(c, q), .data = stream });
+            total += stream.len;
+        }
+    }
+    std.debug.print("wrote {d} large-window reference streams into {s}/large/ ({d} bytes total)\n", .{ corpus.large_cases.len * corpus.large_qualities.len, ref_dir, total });
+}
+
 fn captureDictRefStreams(sh: *Shared) !void {
     const gpa = sh.ref.gpa;
     try std.Io.Dir.cwd().createDirPath(sh.ref.io, ref_dir ++ "/dict");
@@ -625,6 +682,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         // stale — reporting on that would be reporting on nothing.
         try captureRefStreams(&ref);
         try captureDictRefStreams(&shared);
+        try captureLargeRefStreams(&shared);
         try captureBlessed(&ref, &shared, provenance);
         std.debug.print("fixtures rewritten — re-run `zig build interop-brotli` to verify them\n", .{});
         return 0;
@@ -634,6 +692,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     try checkDecoderDirection(&ref);
     try checkDictDecoderDirection(&shared);
     try checkDictEncoderDirection(&shared);
+    try checkLargeDecoderDirection(&shared);
     std.debug.print("{d} checks, {d} mismatches, {d} notes\n", .{ checks, failures, notes });
     return if (failures == 0) 0 else 1;
 }

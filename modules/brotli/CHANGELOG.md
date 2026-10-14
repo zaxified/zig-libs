@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-14** — Decoder: large-window streams (RFC 9841 §6) with `Options.large_window` (off by default, as google/brotli): WBITS up to 62 (30 on 32-bit targets), the 62-bit distance alphabet read with google/brotli's limit of distances below 2^31. Six libbrotli large-window streams (copies from 17 MiB back) committed under `testdata/ref/large/` and replayed. Additive API.
+
 - **2026-10-14** — Encoder: raw prefix dictionaries (`CompressOptions.dictionary`, `StreamOptions.dictionary`) — sizes within libbrotli's q5–q9 at `.default`, below q9 at `.best` on the interop dictionary cases; 15 of our dictionary streams blessed by libbrotli 1.2.0 and replayed. New `brotli.dcb` (RFC 9842 `Content-Encoding: dcb`: header, compress, decompress; errors `NotDcb`, `DictionaryMismatch`). Completes R6. Streams without a dictionary unchanged. Additive API.
 
 - **2026-10-14** — Decoder: raw prefix dictionaries (RFC 9841 §3.2, what RFC 9842 `dcb` uses) — `Options.dictionary`, in `decompress`, `decompressInto` and `decompressStream`. The interop program gains a second reference, libbrotli itself (`tools/c_oracle/shared_oracle.c`, built with `zig cc`; the Python binding cannot attach a dictionary): 20 of its raw-dictionary streams are committed under `testdata/ref/dict/` and decoded by all three decoders in the replay test. Additive API.

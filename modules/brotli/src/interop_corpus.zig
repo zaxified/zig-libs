@@ -268,6 +268,48 @@ pub fn encodeDict(gpa: std.mem.Allocator, comptime c: DictCase, effort: brotli.E
 
 pub const dict_efforts = [_][]const u8{ "fast", "default", "best" };
 
+// ── the large window (RFC 9841 §6) ──────────────────────────────────────────
+
+/// An input for a large-window stream.
+pub const LargeInput = union(enum) {
+    piece: Piece,
+    /// `block` random bytes, `gap` zeros, the same `block` bytes again: a
+    /// copy from `block + gap` back, past a 24-bit window when `gap` is.
+    far: struct { block: usize, gap: usize, seed: u64 },
+
+    pub fn build(comptime li: LargeInput, gpa: std.mem.Allocator) ![]u8 {
+        switch (li) {
+            .piece => |p| return p.build(gpa),
+            .far => |f| {
+                const out = try gpa.alloc(u8, 2 * f.block + f.gap);
+                var rng: Rng = .{ .s = f.seed };
+                for (out[0..f.block]) |*b| b.* = rng.byte();
+                @memset(out[f.block..][0..f.gap], 0);
+                @memcpy(out[f.block + f.gap ..], out[0..f.block]);
+                return out;
+            },
+        }
+    }
+};
+
+pub const LargeCase = struct { name: []const u8, input: LargeInput, lgwin: u6 };
+
+/// Large-window streams libbrotli makes (`BROTLI_PARAM_LARGE_WINDOW`).
+pub const large_cases = [_]LargeCase{
+    // The header and the 62-bit distance alphabet's code widths, short
+    // distances.
+    .{ .name = "alice_w25", .input = .{ .piece = .{ .shape = "alice_full", .to = 20_000 } }, .lgwin = 25 },
+    // A copy from 17 MiB back: beyond any RFC 7932 window.
+    .{ .name = "far_w25", .input = .{ .far = .{ .block = 32 * 1024, .gap = 17 << 20, .seed = 0x1a59e } }, .lgwin = 25 },
+    .{ .name = "far_w30", .input = .{ .far = .{ .block = 4 * 1024, .gap = 17 << 20, .seed = 0x1a59f } }, .lgwin = 30 },
+};
+pub const large_qualities = [_]u8{ 5, 11 };
+
+/// `testdata/ref/large/<case>.q<Q>.br`.
+pub fn largeRefFile(comptime c: LargeCase, comptime q: u8) []const u8 {
+    return std.fmt.comptimePrint("large/{s}.q{d}.br", .{ c.name, q });
+}
+
 const corpusBuild = build;
 
 // ── the reference's own streams ─────────────────────────────────────────────

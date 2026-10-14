@@ -46,8 +46,15 @@ Surveyed 2026-10-14 per `SURVEY-PLAYBOOK.md` (first 2026-09-30); stars and activ
 
 All of the following are fully implemented:
 
-- **Stream header**: window bits (WBITS 10..24; the large-window extension is
-  explicitly rejected as `InvalidWindowBits`).
+- **Stream header**: window bits (WBITS 10..24). The large window (RFC 9841 §6, 2026-10-14):
+  with `Options.large_window` the `1 000 100 0` marker and a 6-bit WBITS up to 62 (30 on a 32-bit
+  target); without it, `InvalidWindowBits`, as google/brotli without its parameter. A large-window
+  stream's distance codes are read as from the 62-bit alphabet (simple codes' symbol width) but only
+  those whose largest distance stays within 0x7FFFFFFC are valid (`tables.distanceLimit`: whole
+  groups of `1 << NPOSTFIX` codes) — google/brotli's limit, which the RFC allows a decoder.
+  Anchored on 6 libbrotli large-window streams (WBITS 25 and 30, copies from 17 MiB back), decoded
+  by `decompress` and `decompressStream` and refused without the option; negative control: read with
+  the 24-bit alphabet, the 4 far-copy streams fail.
 - **Raw prefix dictionary** (RFC 9841 §3.2, 2026-10-14; `Options.dictionary`, all three decoders):
   distances `max_distance + 1 .. max_distance + D` copy from the dictionary at
   `D + max_distance - distance`, running on into the window's oldest byte past its end; they enter
@@ -403,7 +410,7 @@ Order: P (encoder hasher) → R1 (+R3–R5) → R6/R8 → R9 (+R10/R11) → R7 �
 - ~~**R5 Metadata meta-blocks from the encoder**~~ — **DONE 2026-10-14**: `StreamWriter.writeMetadata(bytes)` (google's `EMIT_METADATA`): a flush, then metadata meta-blocks of up to 16 MiB each (shortest MSKIPBYTES); blessed by google/brotli (`stream_metadata` variant).
 - ~~**R6 Raw prefix dictionary (RFC 9841) on both ends + RFC 9842 `dcb` framing**~~ — **DONE 2026-10-14**: decoder `Options.dictionary` (§ Decoder), encoder `CompressOptions.dictionary` / `StreamOptions.dictionary` (§ Encoder), `brotli.dcb` (header, compress, decompress, `NotDcb`/`DictionaryMismatch`). Left for later: a prepared dictionary shared by many compressions (google's `PrepareDictionary`: today each compression inserts the dictionary's positions anew — O(dictionary) per response). (`ff 44 43 42` + SHA-256 of the dictionary + Shared-Brotli stream, window ≤ 16 MiB) — delta updates of web assets; Chrome ships it.
 - **R7 Serialized shared dictionaries (RFC 9841 §5) — decoder only**: custom word lists, custom transforms incl. ShiftFirst/ShiftAll, context-selected dictionaries, embedded prefix. Encoder side deliberately not (owner 2026-10-14: a research tool only google ships).
-- **R8 Large window (RFC 9841)** — decoder to WBITS 62 on 64-bit targets (30 on 32-bit), encoder option to 30.
+- **R8 Large window (RFC 9841)** — decoder **done 2026-10-14** (`Options.large_window`, § Decoder); left: the encoder option to 30.
 - **R9 Pull `std.Io.Reader` decoder** — the decoder becomes a state machine that suspends mid-command; `decompressStream` becomes a loop over it (one decoding logic stays).
 - **R10 Metadata callbacks** in the decoder.
 - **R11 Concatenated streams + returning read-ahead bytes** (`brcat`).

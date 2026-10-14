@@ -117,6 +117,28 @@ test "interop replay: every decoder reproduces the plaintext from libbrotli's ra
     }
 }
 
+test "interop replay: the decoders reproduce libbrotli's large-window streams, and refuse them unasked" {
+    const gpa = testing.allocator;
+    inline for (corpus.large_cases) |c| {
+        const plain = try c.input.build(gpa);
+        defer gpa.free(plain);
+        inline for (corpus.large_qualities) |q| {
+            const stream = @embedFile("testdata/ref/" ++ comptime corpus.largeRefFile(c, q));
+            errdefer std.debug.print("large {s} q{d}\n", .{ c.name, q });
+            try testing.expectError(error.InvalidWindowBits, brotli.decompress(gpa, stream, .{ .max_output = 1 << 26 }));
+            const opts: brotli.Options = .{ .large_window = true, .max_output = 1 << 26 };
+            const a = try brotli.decompress(gpa, stream, opts);
+            defer gpa.free(a);
+            try testing.expectEqualSlices(u8, plain, a);
+            var r: std.Io.Reader = .fixed(stream);
+            var w: std.Io.Writer.Allocating = .init(gpa);
+            defer w.deinit();
+            _ = try brotli.decompressStream(gpa, &r, &w.writer, opts);
+            try testing.expectEqualSlices(u8, plain, w.written());
+        }
+    }
+}
+
 // ── direction 2: our streams, as the reference blessed them ─────────────────
 
 test "interop replay: the encoder still emits the exact streams google/brotli accepted" {

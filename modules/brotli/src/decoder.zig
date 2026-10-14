@@ -45,6 +45,12 @@ pub const Options = struct {
     /// bytes a copy may reach as if they came just before the window. Must
     /// be the encoder's exactly. Not counted as output.
     dictionary: []const u8 = &.{},
+    /// Accept large-window streams (RFC 9841 §6: WBITS up to 62 behind a
+    /// marker a plain RFC 7932 decoder refuses; up to 30 on a 32-bit
+    /// target). Off by default, as in google/brotli, since the window is
+    /// what the streaming decoder holds. Distances stay below 2^31, as
+    /// google/brotli's (the RFC allows a decoder that limit).
+    large_window: bool = false,
 };
 
 /// The output cap actually enforced for a stream of `input_len` bytes:
@@ -86,9 +92,12 @@ fn DecoderOf(comptime Sink: type) type {
         br: *BitReader,
         out: *Sink,
 
-        /// 10..24 (no large window): a `u5`, which is also the shift type of
-        /// a 32-bit `usize`.
-        wbits: u5 = 0,
+        /// 10..24, or up to 62 for a large-window stream.
+        wbits: u6 = 0,
+        /// The stream carries the large-window marker.
+        large_window: bool = false,
+        /// `Options.large_window`.
+        allow_large_window: bool = false,
         max_backward: usize = 0,
         /// `Options.dictionary`.
         prefix: []const u8 = &.{},
@@ -179,10 +188,17 @@ fn DecoderOf(comptime Sink: type) type {
 
         // --- reading a Huffman code (simple or complex) -----------------------
         fn readHuffmanCode(self: *Self, alphabet_size: u32) Error!Table {
+            return self.readHuffmanCodeLimited(alphabet_size, alphabet_size);
+        }
+
+        /// A code over an alphabet of `alphabet_max` symbols of which only the
+        /// first `alphabet_size` may occur (a large window's distances): a
+        /// simple code's symbols are `alphabet_max` wide.
+        fn readHuffmanCodeLimited(self: *Self, alphabet_max: u32, alphabet_size: u32) Error!Table {
             const kind = try self.br.takeBits(2);
             if (kind == 1) {
                 // Simple prefix code.
-                const max_bits = huffman.symbolBits(alphabet_size - 1);
+                const max_bits = huffman.symbolBits(alphabet_max - 1);
                 const nsym_sel = try self.br.takeBits(2); // 0..3
                 const count = nsym_sel + 1;
                 var vals: [4]u16 = undefined;
@@ -278,9 +294,13 @@ fn DecoderOf(comptime Sink: type) type {
         }
 
         fn readTreeGroup(self: *Self, alphabet_size: u32, count: u32) Error![]Table {
+            return self.readTreeGroupLimited(alphabet_size, alphabet_size, count);
+        }
+
+        fn readTreeGroupLimited(self: *Self, alphabet_max: u32, alphabet_size: u32, count: u32) Error![]Table {
             const group = try self.arena.alloc(Table, count);
             var i: u32 = 0;
-            while (i < count) : (i += 1) group[i] = try self.readHuffmanCode(alphabet_size);
+            while (i < count) : (i += 1) group[i] = try self.readHuffmanCodeLimited(alphabet_max, alphabet_size);
             return group;
         }
 
@@ -487,10 +507,15 @@ fn DecoderOf(comptime Sink: type) type {
             self.dist_context_map = try self.decodeContextMap(self.num_block_types[2] << tables.distance_context_bits, &self.num_dist_htrees);
 
             // Tree groups.
-            const dist_alphabet_size = tables.distanceAlphabetSize(self.npostfix, self.ndirect, tables.max_distance_bits);
+            // A large-window stream's distance codes are read as from an
+            // alphabet for 62 extra bits (the simple codes' symbol width),
+            // but only those whose distances stay within
+            // `max_allowed_distance` are valid (`distanceLimit`).
+            const dist_alphabet_max = tables.distanceAlphabetSize(self.npostfix, self.ndirect, if (self.large_window) tables.large_max_distance_bits else tables.max_distance_bits);
+            const dist_alphabet_size = if (self.large_window) tables.distanceLimit(self.npostfix, self.ndirect) else dist_alphabet_max;
             self.literal_group = try self.readTreeGroup(tables.num_literal_symbols, self.num_literal_htrees);
             self.command_group = try self.readTreeGroup(tables.num_command_symbols, self.num_block_types[1]);
-            self.distance_group = try self.readTreeGroup(dist_alphabet_size, self.num_dist_htrees);
+            self.distance_group = try self.readTreeGroupLimited(dist_alphabet_max, dist_alphabet_size, self.num_dist_htrees);
 
             // Prepare cursors.
             self.prepareLiteralDecoding();
@@ -643,8 +668,10 @@ fn DecoderOf(comptime Sink: type) type {
 
         fn run(self: *Self) Error!void {
             // Window bits.
-            self.wbits = try decodeWindowBits(self.br);
-            self.max_backward = (@as(usize, 1) << self.wbits) - 16;
+            const wb = try decodeWindowBits(self.br, self.allow_large_window);
+            self.wbits = wb.wbits;
+            self.large_window = wb.large;
+            self.max_backward = (@as(usize, 1) << @intCast(self.wbits)) - 16;
             try self.out.setWindow(self.wbits);
 
             while (true) {
@@ -680,14 +707,24 @@ fn DecoderOf(comptime Sink: type) type {
     };
 }
 
-fn decodeWindowBits(br: *BitReader) BrotliError!u5 {
-    if ((try br.takeBits(1)) == 0) return 16;
+const WindowBits = struct { wbits: u6, large: bool = false };
+
+/// RFC 7932 §9.1, and RFC 9841 §6's large window behind `1 000 100 0`
+/// (when `allow_large`).
+fn decodeWindowBits(br: *BitReader, allow_large: bool) BrotliError!WindowBits {
+    if ((try br.takeBits(1)) == 0) return .{ .wbits = 16 };
     const n = try br.takeBits(3);
-    if (n != 0) return @intCast(17 + n);
+    if (n != 0) return .{ .wbits = @intCast(17 + n) };
     const n2 = try br.takeBits(3);
-    if (n2 == 1) return error.InvalidWindowBits; // large-window not supported
-    if (n2 != 0) return @intCast(8 + n2);
-    return 17;
+    if (n2 == 1) {
+        if (!allow_large) return error.InvalidWindowBits;
+        if ((try br.takeBits(1)) != 0) return error.InvalidWindowBits;
+        const w = try br.takeBits(6);
+        if (w < 10 or w > tables.large_max_window_bits) return error.InvalidWindowBits;
+        return .{ .wbits = @intCast(w), .large = true };
+    }
+    if (n2 != 0) return .{ .wbits = @intCast(8 + n2) };
+    return .{ .wbits = 17 };
 }
 
 fn inverseMoveToFront(v: []u8) void {
@@ -869,6 +906,7 @@ pub fn decompressInto(gpa: std.mem.Allocator, out: []u8, input: []const u8, opti
         .br = &br,
         .out = &sink,
         .prefix = options.dictionary,
+        .allow_large_window = options.large_window,
     };
     try dec.run();
     return out[0..sink.len];
@@ -889,6 +927,7 @@ pub fn decompress(gpa: std.mem.Allocator, input: []const u8, options: Options) B
         .br = &br,
         .out = &sink,
         .prefix = options.dictionary,
+        .allow_large_window = options.large_window,
     };
     try dec.run();
 
@@ -984,10 +1023,10 @@ const RingSink = struct {
     /// The ring's limit: the window, or less when the output cap is smaller
     /// (then nothing ever wraps, and a distance past what was produced is
     /// refused before it is read). It starts small; see `makeRoom`.
-    fn setWindow(s: *RingSink, wbits: u5) Error!void {
+    fn setWindow(s: *RingSink, wbits: u6) Error!void {
         // A copy out of the prefix dictionary that runs on into the window
         // reaches back up to the window plus the dictionary.
-        const window = std.math.ceilPowerOfTwo(usize, (@as(usize, 1) << wbits) + s.options.dictionary.len) catch return error.OutOfMemory;
+        const window = std.math.ceilPowerOfTwo(usize, (@as(usize, 1) << @intCast(wbits)) + s.options.dictionary.len) catch return error.OutOfMemory;
         const cap_pow2 = std.math.ceilPowerOfTwo(usize, @max(s.options.max_output, 1)) catch window;
         s.limit = @min(window, cap_pow2);
         const len = @min(s.limit, initial_len);
@@ -1039,6 +1078,7 @@ pub fn decompressStream(gpa: std.mem.Allocator, in: *std.Io.Reader, out: *std.Io
         .br = &br,
         .out = &sink,
         .prefix = options.dictionary,
+        .allow_large_window = options.large_window,
     };
     dec.run() catch |err| {
         if (err == error.TruncatedInput and br.read_failed) return error.ReadFailed;
@@ -1072,9 +1112,9 @@ test "WBITS codes (RFC 7932 section 9.1)" {
         }
         var br = BitReader.init(&byte);
         if (c.want) |w| {
-            try std.testing.expectEqual(w, try decodeWindowBits(&br));
+            try std.testing.expectEqual(w, (try decodeWindowBits(&br, false)).wbits);
         } else {
-            try std.testing.expectError(error.InvalidWindowBits, decodeWindowBits(&br));
+            try std.testing.expectError(error.InvalidWindowBits, decodeWindowBits(&br, false));
         }
     }
 }

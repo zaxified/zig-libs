@@ -4,6 +4,8 @@
 //! prefix ranges, the command (insert-and-copy) lookup table, and the code
 //! length code order + the fixed prefix code for reading code length codes.
 
+const std = @import("std");
+
 // ---------------------------------------------------------------------------
 // Constants (RFC 7932).
 pub const num_literal_symbols = 256;
@@ -19,6 +21,44 @@ pub const literal_context_bits = 6;
 pub const distance_context_bits = 2;
 pub const max_distance_bits = 24;
 pub const max_allowed_distance = 0x7FFFFFFC;
+
+/// RFC 9841 §6: a large window's distance codes have up to 62 extra bits.
+pub const large_max_distance_bits = 62;
+/// WBITS of a large window: up to 62, or 30 where `usize` has 32 bits.
+pub const large_max_window_bits = if (@bitSizeOf(usize) >= 64) 62 else 30;
+
+/// How many distance codes of a large-window stream are valid: the short
+/// codes, the direct ones, then whole groups of `1 << npostfix` codes (the
+/// RFC's (bits, half) steps) while the group's last code cannot name a
+/// distance past `max_allowed_distance` (its largest is its offset plus
+/// all-ones extra bits, shifted past the postfix).
+pub fn distanceLimit(npostfix: u32, ndirect: u32) u32 {
+    var n: u32 = num_distance_short_codes + ndirect;
+    var bits: u6 = 1;
+    var half: u64 = 0;
+    const postfix: u64 = @as(u64, 1) << @intCast(npostfix);
+    while (bits <= large_max_distance_bits) {
+        const base: u64 = ndirect + ((((2 + half) << bits) - 4) << @intCast(npostfix)) + 1;
+        const largest = base + (postfix - 1) + (((@as(u64, 1) << bits) - 1) << @intCast(npostfix));
+        if (largest > max_allowed_distance) break;
+        n += @intCast(postfix);
+        bits += @intCast(half);
+        half ^= 1;
+    }
+    return n;
+}
+
+test "distanceLimit: the 24-bit alphabet plus the groups up to 2^31" {
+    // NPOSTFIX 0, NDIRECT 0: bits 1..29, both halves; the last group's
+    // largest distance is exactly max_allowed_distance.
+    try std.testing.expectEqual(@as(u32, 16 + 58), distanceLimit(0, 0));
+    // Never beyond the large alphabet, and at least the plain one.
+    for (0..4) |np| for ([_]u32{ 0, 15, 120 }) |nd| {
+        const lim = distanceLimit(@intCast(np), nd << @intCast(np));
+        try std.testing.expect(lim >= distanceAlphabetSize(@intCast(np), nd << @intCast(np), max_distance_bits));
+        try std.testing.expect(lim <= distanceAlphabetSize(@intCast(np), nd << @intCast(np), large_max_distance_bits));
+    };
+}
 
 /// BROTLI_DISTANCE_ALPHABET_SIZE(npostfix, ndirect, maxnbits).
 pub fn distanceAlphabetSize(npostfix: u32, ndirect: u32, maxnbits: u32) u32 {
