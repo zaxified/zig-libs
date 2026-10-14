@@ -83,6 +83,7 @@ pub const CompressIntoError = encoder.CompressIntoError;
 pub const maxCompressedSize = encoder.maxCompressedSize;
 pub const min_window_bits = encoder.min_window_bits;
 pub const max_window_bits = encoder.max_window_bits;
+pub const max_large_window_bits = encoder.max_large_window_bits;
 
 /// A `std.Io.Writer` that compresses what is written to it into one stream:
 /// `flush` makes everything so far decodable, `finish` ends the stream,

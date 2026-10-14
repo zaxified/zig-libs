@@ -305,6 +305,16 @@ pub const large_cases = [_]LargeCase{
 };
 pub const large_qualities = [_]u8{ 5, 11 };
 
+/// Our encoder's large-window stream for `c` at `effort` (the case's
+/// window). Blessed as `.name = case`, `.effort = "large_" ++ effort`.
+pub fn encodeLarge(gpa: std.mem.Allocator, comptime c: LargeCase, effort: brotli.Effort) ![]u8 {
+    const input = try c.input.build(gpa);
+    defer gpa.free(input);
+    return brotli.compressWith(gpa, input, .{ .effort = effort, .window_bits = c.lgwin });
+}
+
+pub const large_efforts = [_][]const u8{ "fast", "default" };
+
 /// `testdata/ref/large/<case>.q<Q>.br`.
 pub fn largeRefFile(comptime c: LargeCase, comptime q: u8) []const u8 {
     return std.fmt.comptimePrint("large/{s}.q{d}.br", .{ c.name, q });

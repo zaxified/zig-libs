@@ -34,9 +34,10 @@ pub const StreamOptions = struct {
     /// As `CompressOptions.block_size`. Also how much input waits before
     /// anything is compressed, unless a flush comes first.
     block_size: usize = encoder.compressed_block_size,
-    /// log2 of the window (`min_window_bits`..`max_window_bits`). The history
-    /// kept grows to about twice the window plus a block. 22 is
-    /// google/brotli's default.
+    /// log2 of the window (`min_window_bits`..`max_window_bits`, or a
+    /// large-window stream up to `max_large_window_bits`, as
+    /// `CompressOptions.window_bits`). The history kept grows to about twice
+    /// the window plus a block. 22 is google/brotli's default.
     window_bits: u5 = 22,
     /// About how many bytes the stream will carry: the match finder's table
     /// is sized for that rather than for the window (a short response costs
@@ -126,7 +127,7 @@ pub const StreamWriter = struct {
     /// is abandoned. On an error the writer is unusable until another
     /// successful `reset`.
     pub fn reset(sw: *StreamWriter, output: *Writer, opts: StreamOptions) std.mem.Allocator.Error!void {
-        std.debug.assert(opts.window_bits >= encoder.min_window_bits and opts.window_bits <= encoder.max_window_bits);
+        std.debug.assert(opts.window_bits >= encoder.min_window_bits and opts.window_bits <= encoder.max_large_window_bits);
         if (opts.effort != sw.opts.effort or Core.tableLog(opts.effort, opts.tableSize()) != sw.core.table_log) {
             const gpa = sw.core.gpa;
             sw.core.deinit();

@@ -451,6 +451,46 @@ fn checkLargeDecoderDirection(sh: *Shared) !void {
     }
 }
 
+/// Our large-window stream for `c` at `effort`, if libbrotli decodes it.
+fn blessLarge(sh: *Shared, comptime c: corpus.LargeCase, comptime effort: []const u8) !?[]u8 {
+    const gpa = sh.ref.gpa;
+    const plain = try c.input.build(gpa);
+    defer gpa.free(plain);
+    const stream = try corpus.encodeLarge(gpa, c, @field(brotli.Effort, effort));
+    errdefer gpa.free(stream);
+    const back = sh.decompress("", stream, true) catch |e| switch (e) {
+        error.ReferenceRejected => {
+            bad("large {s} ({s}): libbrotli REFUSED our {d}-byte stream", .{ c.name, effort, stream.len });
+            gpa.free(stream);
+            return null;
+        },
+        else => return e,
+    };
+    defer gpa.free(back);
+    if (!std.mem.eql(u8, back, plain)) {
+        bad("large {s} ({s}): libbrotli decoded our stream to different bytes", .{ c.name, effort });
+        gpa.free(stream);
+        return null;
+    }
+    ok();
+    return stream;
+}
+
+fn checkLargeEncoderDirection(sh: *Shared) !void {
+    const gpa = sh.ref.gpa;
+    inline for (corpus.large_cases) |c| inline for (corpus.large_efforts) |effort| {
+        if (try blessLarge(sh, c, effort)) |stream| {
+            defer gpa.free(stream);
+            if (frozenFor(c.name, "large_" ++ effort)) |frozen| {
+                const d = digestOf(stream);
+                if (frozen.stream_len != stream.len or !std.mem.eql(u8, frozen.stream_sha256, &d)) {
+                    bad("large {s} ({s}): the encoder no longer emits the stream the fixture pins ({d} -> {d} bytes) — run with --capture", .{ c.name, effort, frozen.stream_len, stream.len });
+                } else ok();
+            } else bad("large {s} ({s}): no frozen entry — run with --capture", .{ c.name, effort });
+        }
+    };
+}
+
 fn ourLargeDecoders(gpa: std.mem.Allocator, stream: []const u8, plain: []const u8) !?[]const u8 {
     const opts: brotli.Options = .{ .large_window = true, .max_output = 1 << 26 };
     if (brotli.decompress(gpa, stream, .{ .max_output = 1 << 26 })) |x| {
@@ -610,6 +650,19 @@ fn captureBlessed(ref: *Ref, sh: *Shared, provenance: []const u8) !void {
             c.name, effort, input.len, &digestOf(input), stream.len, &digestOf(stream),
         });
     };
+    inline for (corpus.large_cases) |c| inline for (corpus.large_efforts) |effort| {
+        const input = try c.input.build(gpa);
+        defer gpa.free(input);
+        const stream = (try blessLarge(sh, c, effort)) orelse {
+            std.debug.print("REFUSING TO CAPTURE: large '{s}' ({s}) was not blessed by libbrotli\n", .{ c.name, effort });
+            return error.ReferenceRejectedOurStream;
+        };
+        defer gpa.free(stream);
+        blessed_count += 1;
+        try out.print(gpa, "    .{{ .name = \"{s}\", .effort = \"large_{s}\", .input_len = {d}, .input_sha256 = \"{s}\", .stream_len = {d}, .stream_sha256 = \"{s}\" }},\n", .{
+            c.name, effort, input.len, &digestOf(input), stream.len, &digestOf(stream),
+        });
+    };
     try out.appendSlice(gpa, "};\n");
 
     try std.Io.Dir.cwd().writeFile(ref.io, .{ .sub_path = blessed_path, .data = out.items });
@@ -693,6 +746,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     try checkDictDecoderDirection(&shared);
     try checkDictEncoderDirection(&shared);
     try checkLargeDecoderDirection(&shared);
+    try checkLargeEncoderDirection(&shared);
     std.debug.print("{d} checks, {d} mismatches, {d} notes\n", .{ checks, failures, notes });
     return if (failures == 0) 0 else 1;
 }

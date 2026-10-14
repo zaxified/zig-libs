@@ -31,7 +31,7 @@ Surveyed 2026-10-14 per `SURVEY-PLAYBOOK.md` (first 2026-09-30); stars and activ
 | [akunaakwei/zig-brotli](https://github.com/akunaakwei/zig-brotli) / [Scythe-Technology/zbrotli](https://github.com/Scythe-Technology/zbrotli) | Zig (wrap C) | zlib / MIT | 1 / 0 | pushed 2026-04-18 / 2026-06-05 | Build-system wrappers or bindings for google/brotli's C — full features, but link C. |
 | Zig `std.compress` | Zig | MIT | — | Zig 0.16.0 | `flate`, `lzma`, `lzma2`, `xz`, `zstd`; **no brotli** (verified: `lib/std/compress/` listing, 2026-10-14). |
 
-**Where we are ahead:** pure Zig with no C, unlike the wrappers; typed errors with an output cap and a ratio bound on by default (google/brotli added an output limit to its Python binding only in 1.2.0); a decoder whose one-shot, into-buffer and streaming forms are checked against each other by a differential fuzz driver and scored by mutation; encoder streams verified by the reference decoder over 45 shapes; `.default` beats q5 on text (51 467 vs 52 809 B). **Where we are behind:** no `mode` parameter; no serialized dictionaries (raw prefix ones and `dcb` are in); no large window; no pull reader; `.best` 9 % behind q11 (→ Backlog R1–R11).
+**Where we are ahead:** pure Zig with no C, unlike the wrappers; typed errors with an output cap and a ratio bound on by default (google/brotli added an output limit to its Python binding only in 1.2.0); a decoder whose one-shot, into-buffer and streaming forms are checked against each other by a differential fuzz driver and scored by mutation; encoder streams verified by the reference decoder over 45 shapes; `.default` beats q5 on text (51 467 vs 52 809 B). **Where we are behind:** no `mode` parameter; no serialized dictionaries (raw prefix ones and `dcb` are in); no pull reader; `.best` 9 % behind q11 (→ Backlog R1–R11).
 
 ## Scope & honesty
 
@@ -168,6 +168,11 @@ static-dictionary references, `NPOSTFIX`/`NDIRECT` tuning, an optimal (cost-mode
   its history's start through slides. Sizes on the interop `dict_*` cases: `.default` within
   q5–q9 of libbrotli, `.best` below q9 on all five (q11 3–11 % smaller). Blessed by libbrotli 1.2.0:
   15 streams (5 cases × 3 efforts), frozen and replayed.
+- **Large window** (2026-10-14): `window_bits` above 24, to 30, makes a large-window stream (RFC
+  9841 §6): the 14-bit header, distance codes up to the 74th (to 0x7FFFFFFC), simple distance codes
+  with 8-bit symbols (the 140-symbol alphabet the decoder reads them as from). Only decoders that
+  ask for it accept it — not a browser's `br`. Blessed by libbrotli 1.2.0 on three cases × fast and
+  default (a copy from 17 MiB back at WBITS 25 and 30).
 - **`dcb`** (RFC 9842 §4, `brotli.dcb`): `header(dict)` = `ff 44 43 42` + SHA-256(dict);
   `compress`/`decompress` put/check it around a dictionary stream; a streamed body is the header
   then a `StreamWriter` with the dictionary. Our windows are ≤ 16 MiB, as `dcb` requires.
@@ -410,7 +415,7 @@ Order: P (encoder hasher) → R1 (+R3–R5) → R6/R8 → R9 (+R10/R11) → R7 �
 - ~~**R5 Metadata meta-blocks from the encoder**~~ — **DONE 2026-10-14**: `StreamWriter.writeMetadata(bytes)` (google's `EMIT_METADATA`): a flush, then metadata meta-blocks of up to 16 MiB each (shortest MSKIPBYTES); blessed by google/brotli (`stream_metadata` variant).
 - ~~**R6 Raw prefix dictionary (RFC 9841) on both ends + RFC 9842 `dcb` framing**~~ — **DONE 2026-10-14**: decoder `Options.dictionary` (§ Decoder), encoder `CompressOptions.dictionary` / `StreamOptions.dictionary` (§ Encoder), `brotli.dcb` (header, compress, decompress, `NotDcb`/`DictionaryMismatch`). Left for later: a prepared dictionary shared by many compressions (google's `PrepareDictionary`: today each compression inserts the dictionary's positions anew — O(dictionary) per response). (`ff 44 43 42` + SHA-256 of the dictionary + Shared-Brotli stream, window ≤ 16 MiB) — delta updates of web assets; Chrome ships it.
 - **R7 Serialized shared dictionaries (RFC 9841 §5) — decoder only**: custom word lists, custom transforms incl. ShiftFirst/ShiftAll, context-selected dictionaries, embedded prefix. Encoder side deliberately not (owner 2026-10-14: a research tool only google ships).
-- **R8 Large window (RFC 9841)** — decoder **done 2026-10-14** (`Options.large_window`, § Decoder); left: the encoder option to 30.
+- ~~**R8 Large window (RFC 9841)**~~ — **DONE 2026-10-14**: decoder `Options.large_window` (§ Decoder); encoder `window_bits` 25..30 (`max_large_window_bits`) writes the RFC 9841 header and names distances with the large alphabet's first 74 codes (to 2^31), simple distance codes as wide as the 140-symbol alphabet; a copy from 17 MiB back found and blessed by libbrotli (`large_*` entries).
 - **R9 Pull `std.Io.Reader` decoder** — the decoder becomes a state machine that suspends mid-command; `decompressStream` becomes a loop over it (one decoding logic stays).
 - **R10 Metadata callbacks** in the decoder.
 - **R11 Concatenated streams + returning read-ahead bytes** (`brcat`).

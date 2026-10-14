@@ -213,15 +213,21 @@ const cl_prefix: [6]ClPrefix = blk: {
 // `Decoder.calculateDistanceLut` for that (only) configuration.
 
 const dist_alphabet_size = tables.distanceAlphabetSize(0, 0, tables.max_distance_bits);
+/// A large-window stream's valid distance codes (`tables.distanceLimit`):
+/// up to 0x7FFFFFFC, past any window this encoder makes (2^30).
+const dist_alphabet_large = tables.distanceLimit(0, 0);
+/// The alphabet a large-window stream's distance codes are read as from: a
+/// simple code's symbols are this wide.
+const dist_alphabet_large_max = tables.distanceAlphabetSize(0, 0, tables.large_max_distance_bits);
 
 const DistCode = struct { offset: u32, nbits: u5 };
 
-const dist_lut: [dist_alphabet_size]DistCode = blk: {
-    var out: [dist_alphabet_size]DistCode = .{DistCode{ .offset = 0, .nbits = 0 }} ** dist_alphabet_size;
+const dist_lut: [dist_alphabet_large]DistCode = blk: {
+    var out: [dist_alphabet_large]DistCode = .{DistCode{ .offset = 0, .nbits = 0 }} ** dist_alphabet_large;
     var bits: u32 = 1;
     var half: u32 = 0;
     var i: usize = tables.num_distance_short_codes;
-    while (i < dist_alphabet_size) {
+    while (i < dist_alphabet_large) {
         out[i] = .{ .offset = ((2 + half) << bits) - 4 + 1, .nbits = bits };
         i += 1;
         bits += half;
@@ -231,10 +237,11 @@ const dist_lut: [dist_alphabet_size]DistCode = blk: {
 };
 
 /// Smallest explicit distance code (>= 16) whose range contains `d`, or null
-/// when `d` is outside the whole alphabet.
-fn distanceCode(d: u32) ?struct { sym: u16, extra: u32, nbits: u5 } {
+/// when `d` is outside the first `n` codes (`dist_alphabet_size`, or
+/// `dist_alphabet_large` in a large-window stream).
+fn distanceCode(d: u32, n: usize) ?struct { sym: u16, extra: u32, nbits: u5 } {
     var c: usize = tables.num_distance_short_codes;
-    while (c < dist_alphabet_size) : (c += 1) {
+    while (c < n) : (c += 1) {
         const e = dist_lut[c];
         if (d < e.offset) continue;
         const span: u64 = @as(u64, 1) << e.nbits;
@@ -722,6 +729,19 @@ fn buildAndWriteCode(
     counts: []const u32,
     alphabet_size: u32,
 ) GiveUp!Code {
+    return buildAndWriteCodeWide(gpa, w, counts, alphabet_size, alphabet_size);
+}
+
+/// `buildAndWriteCode` where a simple code's symbols are as wide as for an
+/// alphabet of `simple_alphabet` (a large window's distances: read as from
+/// the 62-bit alphabet, only `alphabet_size` of them valid).
+fn buildAndWriteCodeWide(
+    gpa: std.mem.Allocator,
+    w: *BitWriter,
+    counts: []const u32,
+    alphabet_size: u32,
+    simple_alphabet: u32,
+) GiveUp!Code {
     var used: [4]u16 = undefined;
     var m: usize = 0;
     for (counts, 0..) |c, s| {
@@ -755,7 +775,7 @@ fn buildAndWriteCode(
             const skew = c[0] + 2 * c[1] + 3 * c[2] + 3 * c[3];
             if (skew < flat) tree_select = 1;
         }
-        try writeSimpleCode(w, alphabet_size, vals[0..m], tree_select);
+        try writeSimpleCode(w, simple_alphabet, vals[0..m], tree_select);
         const num_symbols: u8 = @intCast(m - 1 + @as(usize, if (m == 4) tree_select else 0));
         var table = try huffman.buildSimple(gpa, num_symbols, vals[0..m]);
         defer table.deinit(gpa);
@@ -1623,9 +1643,7 @@ fn writeCompressedBlock(
     /// Context-free literals whatever the effort (the real-bits check in
     /// `compressWith`).
     single_literal_code: bool,
-    /// How much further back than `input`'s start a copy may reach: the
-    /// output dropped before it plus a prefix dictionary.
-    reach: usize,
+    env: BlockEnv,
 ) GiveUp!BlockResult {
     const n = end - start;
     if (n == 0 or n > max_store_block) return error.EncoderInvariant;
@@ -1649,7 +1667,8 @@ fn writeCompressedBlock(
     const cmd_counts = try gpa.alloc(u32, tables.num_command_symbols);
     defer gpa.free(cmd_counts);
     @memset(cmd_counts, 0);
-    var dist_counts = [_]u32{0} ** dist_alphabet_size;
+    var dist_counts = [_]u32{0} ** dist_alphabet_large;
+    const n_dist: u32 = if (env.large_window) dist_alphabet_large else dist_alphabet_size;
 
     var covered: usize = 0;
     var lit_pos = start;
@@ -1681,14 +1700,14 @@ fn writeCompressedBlock(
             .has_dist = c.copy_len != 0 and !use_implicit,
         };
         if (c.copy_len != 0) {
-            if (c.dist == 0 or c.dist > lit_pos + c.insert_len + reach) return error.EncoderInvariant;
+            if (c.dist == 0 or c.dist > lit_pos + c.insert_len + env.reach) return error.EncoderInvariant;
             ring.update(c.dist, short);
         }
         if (r.has_dist) {
             if (short) |code| {
                 r.dist_sym = code;
             } else {
-                const dc = distanceCode(c.dist) orelse return error.EncoderInvariant;
+                const dc = distanceCode(c.dist, n_dist) orelse return error.EncoderInvariant;
                 r.dist_sym = dc.sym;
                 r.dist_extra = dc.extra;
                 r.dist_nbits = dc.nbits;
@@ -1788,7 +1807,7 @@ fn writeCompressedBlock(
     }
     var cmd_code = try buildAndWriteCode(gpa, w, cmd_counts, tables.num_command_symbols);
     defer cmd_code.deinit(gpa);
-    var dist_code = try buildAndWriteCode(gpa, w, &dist_counts, dist_alphabet_size);
+    var dist_code = try buildAndWriteCodeWide(gpa, w, dist_counts[0..n_dist], n_dist, if (env.large_window) dist_alphabet_large_max else dist_alphabet_size);
     defer dist_code.deinit(gpa);
 
     // --- commands -----------------------------------------------------------
@@ -1826,6 +1845,16 @@ fn writeCompressedBlock(
     return .{ .ntrees = model.ntrees, .single_no_worse = single_no_worse };
 }
 
+/// What a block's commands may name beyond its own output.
+const BlockEnv = struct {
+    /// How much further back than `input`'s start a copy may reach: the
+    /// output dropped before it plus a prefix dictionary.
+    reach: usize = 0,
+    /// The stream has a large window (RFC 9841 §6): the larger distance
+    /// alphabet.
+    large_window: bool = false,
+};
+
 const BlockResult = struct {
     /// Literal codes the block used.
     ntrees: u8,
@@ -1847,9 +1876,9 @@ fn tryBlock(
     ring: *DistRing,
     effort: Effort,
     single_literal_code: bool,
-    reach: usize,
+    env: BlockEnv,
 ) std.mem.Allocator.Error!?BlockResult {
-    return writeCompressedBlock(gpa, w, input, start, end, cmds, is_last, ring, effort, single_literal_code, reach) catch |e| switch (e) {
+    return writeCompressedBlock(gpa, w, input, start, end, cmds, is_last, ring, effort, single_literal_code, env) catch |e| switch (e) {
         error.OutOfMemory => {
             // The caller's buffer ran out (`overflowed` stays set for
             // `Core.compressBlock`).
@@ -1940,7 +1969,9 @@ pub const CompressOptions = struct {
     block_size: usize = default_block_size,
     /// log2 of the window (`min_window_bits`..`max_window_bits`): how far
     /// back a copy may reach, and how much history a decoder must keep. Null:
-    /// 16 for an input of up to 65 520 bytes, else 21.
+    /// 16 for an input of up to 65 520 bytes, else 21. Above
+    /// `max_window_bits`, to `max_large_window_bits`: a large-window stream
+    /// (RFC 9841 §6), for decoders that ask for one — not a web `br` body.
     window_bits: ?u5 = null,
     /// A raw prefix dictionary (RFC 9841 §3.2; RFC 9842 `dcb`): bytes copies
     /// may come from as if they preceded the input; the decoder needs the
@@ -1951,9 +1982,11 @@ pub const CompressOptions = struct {
     pub const default_block_size = compressed_block_size;
 };
 
-/// RFC 7932 §9.1: WBITS 10..24 (the large window of RFC 9841 is not
-/// supported).
+/// RFC 7932 §9.1: WBITS 10..24; above, to `max_large_window_bits`, a
+/// large-window stream (RFC 9841 §6) — which only a decoder asked for one
+/// accepts (ours: `Options.large_window`), not a browser's `br`.
 pub const min_window_bits = 10;
+pub const max_large_window_bits = 30;
 /// MSKIPLEN's largest value (three bytes).
 const max_metadata_block = 1 << 24;
 pub const max_window_bits = 24;
@@ -2006,7 +2039,7 @@ pub fn compressInto(gpa: std.mem.Allocator, out: []u8, input: []const u8, opts: 
 /// incompressible input reaches it.
 pub fn maxCompressedSize(n: usize, opts: CompressOptions) usize {
     const wbits: u5 = opts.window_bits orelse if (n > 65520) 21 else 16;
-    var bits: usize = if (wbits == 16) 1 else if (wbits >= 18) 4 else 7;
+    var bits: usize = if (wbits > max_window_bits) 14 else if (wbits == 16) 1 else if (wbits >= 18) 4 else 7;
     var off: usize = 0;
     while (off < n) {
         const k = @min(n - off, opts.block_size);
@@ -2060,7 +2093,7 @@ pub const Core = struct {
     /// `size`: how much input the match finder's tables are sized for.
     pub fn init(gpa: std.mem.Allocator, effort: Effort, block_size: usize, wbits: u5, size: usize) std.mem.Allocator.Error!Core {
         std.debug.assert(block_size >= 1 and block_size <= compressed_block_size);
-        std.debug.assert(wbits >= min_window_bits and wbits <= max_window_bits);
+        std.debug.assert(wbits >= min_window_bits and wbits <= max_large_window_bits);
         return .{
             .gpa = gpa,
             .effort = effort,
@@ -2169,7 +2202,11 @@ pub const Core = struct {
     /// three bits for 18..24; for 17 and 10..15, 1 + 000 + three more bits:
     /// 000 for 17, else wbits - 8.
     pub fn writeHeader(c: *Core) std.mem.Allocator.Error!void {
-        if (c.wbits == 16) {
+        if (c.wbits > max_window_bits) {
+            // RFC 9841 §6: 1, 000, 100 (n2 = 1), 0, then six bits of WBITS.
+            try c.w.writeBits(0b0010001, 8);
+            try c.w.writeBits(c.wbits, 6);
+        } else if (c.wbits == 16) {
             try c.w.writeBits(0, 1);
         } else if (c.wbits >= 18) {
             try c.w.writeBits(1, 1);
@@ -2234,7 +2271,8 @@ pub const Core = struct {
         // start are zeros, as the decoder's (a dictionary is not output).
         const x = c.prefix();
         const out = c.data[x.len..];
-        const first = (try tryBlock(c.gpa, dst, out, off - x.len, end - x.len, c.cmds.items, is_last, &trial, c.effort, false, x.len + x.dropped)) orelse return false;
+        const env: BlockEnv = .{ .reach = x.len + x.dropped, .large_window = c.wbits > max_window_bits };
+        const first = (try tryBlock(c.gpa, dst, out, off - x.len, end - x.len, c.cmds.items, is_last, &trial, c.effort, false, env)) orelse return false;
         // The context model was chosen on estimated bits. When it split the
         // literals, write the block once more with a single literal code and
         // keep whichever is really shorter (a flat, small alphabet is where
@@ -2247,7 +2285,7 @@ pub const Core = struct {
             const ctx_bits = dst.bitPos() - dm.len * 8;
             c.alt.resumeAt(dm);
             var single_ring = c.ring;
-            const single = try tryBlock(c.gpa, &c.alt, out, off - x.len, end - x.len, c.cmds.items, is_last, &single_ring, c.effort, true, x.len + x.dropped);
+            const single = try tryBlock(c.gpa, &c.alt, out, off - x.len, end - x.len, c.cmds.items, is_last, &single_ring, c.effort, true, env);
             if (single != null and ctx_bits >= c.alt.bitPos()) {
                 try dst.takeFrom(dm, &c.alt);
                 trial = single_ring;
@@ -2710,14 +2748,14 @@ test "distance codes reproduce every distance without gaps" {
     // unencodable, and any overlap-with-shift would decode to a different one.
     var d: u32 = 1;
     while (d < 200000) : (d += 1) {
-        const c = distanceCode(d) orelse return error.NoDistanceCode;
+        const c = distanceCode(d, dist_alphabet_size) orelse return error.NoDistanceCode;
         try testing.expect(c.sym >= tables.num_distance_short_codes);
         try testing.expect(c.sym < dist_alphabet_size);
         try testing.expectEqual(d, dist_lut[c.sym].offset + c.extra);
         try testing.expect(c.extra < @as(u64, 1) << c.nbits);
     }
     // Distance 0 is the "unused" slot in the alphabet, never a real distance.
-    try testing.expect(distanceCode(0) == null);
+    try testing.expect(distanceCode(0, dist_alphabet_size) == null);
 }
 
 // --- whole-code write/read round trip, every shape --------------------------
@@ -2821,4 +2859,33 @@ test "maxCompressedSize is reached by incompressible input, whatever the blocks 
             try testing.expectEqual(maxCompressedSize(n, opts), got.len);
         };
     }
+}
+
+test "large window: a copy from 17 MiB back, the RFC 9841 header, refused unasked" {
+    const gpa = testing.allocator;
+    const decoder = @import("decoder.zig");
+    const block = 8 * 1024;
+    const gap = 17 << 20;
+    const input = try gpa.alloc(u8, 2 * block + gap);
+    defer gpa.free(input);
+    var prng: std.Random.DefaultPrng = .init(0x1a5e);
+    prng.random().bytes(input[0..block]);
+    @memset(input[block..][0..gap], 0);
+    @memcpy(input[block + gap ..], input[0..block]);
+    for ([_]u5{ 25, 30 }) |wbits| {
+        const opts: CompressOptions = .{ .effort = .fast, .window_bits = wbits };
+        const out = try compressWith(gpa, input, opts);
+        defer gpa.free(out);
+        // One copy of the random block, not two.
+        try testing.expect(out.len < block + block / 2);
+        try testing.expect(out.len <= maxCompressedSize(input.len, opts));
+        try testing.expectError(error.InvalidWindowBits, decoder.decompress(gpa, out, .{ .max_output = 1 << 26 }));
+        const back = try decoder.decompress(gpa, out, .{ .large_window = true, .max_output = 1 << 26 });
+        defer gpa.free(back);
+        try testing.expectEqualSlices(u8, input, back);
+    }
+    // A 24-bit window cannot reach it: both blocks stay.
+    const near = try compressWith(gpa, input, .{ .effort = .fast, .window_bits = 24 });
+    defer gpa.free(near);
+    try testing.expect(near.len > 2 * block);
 }
