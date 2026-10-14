@@ -59,6 +59,10 @@ defer gpa.free(br);
 // for inputs up to 64 KiB, else 21).
 const br_best = try brotli.compressWith(gpa, data, .{ .effort = .best });
 
+// Into your own buffer: maxCompressedSize is always enough (exact for
+// incompressible input); a smaller one fails only if the stream does not fit.
+const into = try brotli.compressInto(gpa, buf, data, .{});     // a prefix of buf
+
 // Streaming: a std.Io.Writer. flush() makes everything so far decodable at
 // the other end; finish() ends the stream; reset() starts the next one on
 // the same table and history (a server compressing response after response).

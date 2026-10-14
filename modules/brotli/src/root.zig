@@ -73,6 +73,14 @@ pub const compress = encoder.compress;
 pub const compressWith = encoder.compressWith;
 pub const CompressOptions = encoder.CompressOptions;
 pub const Effort = encoder.Effort;
+/// `compressWith` into the caller's buffer (no output allocation);
+/// `maxCompressedSize` bytes always suffice, else `error.OutputTooLarge`
+/// only when the stream does not fit.
+pub const compressInto = encoder.compressInto;
+pub const CompressIntoError = encoder.CompressIntoError;
+/// The longest stream `compressWith` gives for `n` input bytes (exact:
+/// incompressible input reaches it).
+pub const maxCompressedSize = encoder.maxCompressedSize;
 pub const min_window_bits = encoder.min_window_bits;
 pub const max_window_bits = encoder.max_window_bits;
 

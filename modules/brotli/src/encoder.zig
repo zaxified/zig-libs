@@ -92,6 +92,22 @@ const BitWriter = struct {
     acc: u64 = 0,
     cnt: u6 = 0,
     gpa: std.mem.Allocator,
+    /// `buf` is the caller's (`compressInto`): never grown or freed. Running
+    /// out of it is `error.OutOfMemory` with `overflowed` set: mid-block,
+    /// `Core.compressBlock` decides the block in a scratch writer instead;
+    /// anywhere else the output does not fit.
+    fixed: bool = false,
+    overflowed: bool = false,
+
+    /// Room for `n` more bytes.
+    inline fn room(self: *BitWriter, n: usize) std.mem.Allocator.Error!void {
+        if (self.buf.capacity - self.buf.items.len >= n) return;
+        if (self.fixed) {
+            self.overflowed = true;
+            return error.OutOfMemory;
+        }
+        try self.buf.ensureUnusedCapacity(self.gpa, n);
+    }
 
     /// Up to 32 bits. The accumulator holds up to 31 pending bits between
     /// calls and goes out four bytes at a time (a byte per `append` was most
@@ -101,7 +117,7 @@ const BitWriter = struct {
         self.acc |= (@as(u64, val) & m) << self.cnt;
         self.cnt += n;
         if (self.cnt >= 32) {
-            try self.buf.ensureUnusedCapacity(self.gpa, 4);
+            try self.room(4);
             self.buf.appendSliceAssumeCapacity(&std.mem.toBytes(std.mem.nativeToLittle(u32, @truncate(self.acc))));
             self.acc >>= 32;
             self.cnt -= 32;
@@ -111,12 +127,14 @@ const BitWriter = struct {
     /// Write out every pending bit, the last byte zero-padded.
     fn alignToByte(self: *BitWriter) std.mem.Allocator.Error!void {
         while (self.cnt >= 8) {
-            try self.buf.append(self.gpa, @truncate(self.acc));
+            try self.room(1);
+            self.buf.appendAssumeCapacity(@truncate(self.acc));
             self.acc >>= 8;
             self.cnt -= 8;
         }
         if (self.cnt != 0) {
-            try self.buf.append(self.gpa, @truncate(self.acc & 0xff));
+            try self.room(1);
+            self.buf.appendAssumeCapacity(@truncate(self.acc & 0xff));
             self.acc = 0;
             self.cnt = 0;
         }
@@ -124,7 +142,8 @@ const BitWriter = struct {
 
     /// Precondition: byte aligned (`alignToByte`).
     fn writeBytes(self: *BitWriter, bytes: []const u8) std.mem.Allocator.Error!void {
-        try self.buf.appendSlice(self.gpa, bytes);
+        try self.room(bytes.len);
+        self.buf.appendSliceAssumeCapacity(bytes);
     }
 
     /// A writer that continues from `m` of another (same pending bits), for
@@ -139,7 +158,8 @@ const BitWriter = struct {
     /// same `m`) holds.
     fn takeFrom(self: *BitWriter, m: Mark, alt: *const BitWriter) std.mem.Allocator.Error!void {
         self.rollback(m);
-        try self.buf.appendSlice(self.gpa, alt.buf.items);
+        try self.room(alt.buf.items.len);
+        self.buf.appendSliceAssumeCapacity(alt.buf.items);
         self.acc = alt.acc;
         self.cnt = alt.cnt;
     }
@@ -1760,7 +1780,12 @@ fn tryBlock(
     single_literal_code: bool,
 ) std.mem.Allocator.Error!?BlockResult {
     return writeCompressedBlock(gpa, w, input, start, end, cmds, is_last, ring, effort, single_literal_code) catch |e| switch (e) {
-        error.OutOfMemory => return error.OutOfMemory,
+        error.OutOfMemory => {
+            // The caller's buffer ran out (`overflowed` stays set for
+            // `Core.compressBlock`).
+            if (!w.overflowed) return error.OutOfMemory;
+            return null;
+        },
         else => return null,
     };
 }
@@ -1862,15 +1887,57 @@ pub fn compressWith(gpa: std.mem.Allocator, input: []const u8, opts: CompressOpt
     var core = try Core.init(gpa, opts.effort, opts.block_size, wbits, input.len);
     defer core.deinit();
     core.setData(input);
+    try oneShot(&core, input, opts.block_size);
+    return core.w.buf.toOwnedSlice(gpa);
+}
+
+pub const CompressIntoError = std.mem.Allocator.Error || error{
+    /// The stream does not fit `out`; `out` holds a partial one.
+    OutputTooLarge,
+};
+
+/// `compressWith` into the caller's buffer: returns the stream, a prefix of
+/// `out`. No output allocation (`gpa` holds the match finder's table and a
+/// block's prefix codes). The stream is the one `compressWith` gives; it
+/// fails only when that does not fit — `maxCompressedSize` is always
+/// enough.
+pub fn compressInto(gpa: std.mem.Allocator, out: []u8, input: []const u8, opts: CompressOptions) CompressIntoError![]u8 {
+    const wbits: u5 = opts.window_bits orelse if (input.len > 65520) 21 else 16;
+    var core = try Core.init(gpa, opts.effort, opts.block_size, wbits, input.len);
+    defer core.deinit();
+    core.w.buf = .initBuffer(out);
+    core.w.fixed = true;
+    core.setData(input);
+    oneShot(&core, input, opts.block_size) catch |e| return if (core.w.overflowed) error.OutputTooLarge else e;
+    return core.w.buf.items;
+}
+
+/// The longest stream `compressWith(_, input, opts)` can give for an input
+/// of `n` bytes: every block stored, plus the final empty meta-block (a
+/// compressed block is kept only when it is shorter than stored). Exact:
+/// incompressible input reaches it.
+pub fn maxCompressedSize(n: usize, opts: CompressOptions) usize {
+    const wbits: u5 = opts.window_bits orelse if (n > 65520) 21 else 16;
+    var bits: usize = if (wbits == 16) 1 else if (wbits >= 18) 4 else 7;
+    var off: usize = 0;
+    while (off < n) {
+        const k = @min(n - off, opts.block_size);
+        bits = storeCostBits(bits, k);
+        off += k;
+    }
+    return (bits + 2 + 7) / 8;
+}
+
+/// The header, every block of `input`, the end.
+fn oneShot(core: *Core, input: []const u8, block_size: usize) std.mem.Allocator.Error!void {
     try core.writeHeader();
     var off: usize = 0;
     while (off < input.len) {
-        const end = off + @min(input.len - off, opts.block_size);
+        const end = off + @min(input.len - off, block_size);
         try core.compressBlock(off, end, end == input.len);
         off = end;
     }
     try core.finish();
-    return core.w.buf.toOwnedSlice(gpa);
 }
 
 /// The encoder's state across meta-blocks, one-shot (`compressWith`) or
@@ -1889,6 +1956,8 @@ pub const Core = struct {
     w: BitWriter,
     /// The single-literal-code alternative of a block is written here.
     alt: BitWriter,
+    /// A block that overflowed the caller's buffer is decided here.
+    scratch: BitWriter,
     cmds: std.ArrayListUnmanaged(Cmd) = .empty,
     /// The decoder's last four distances after the blocks so far.
     ring: DistRing = .{},
@@ -1910,13 +1979,15 @@ pub const Core = struct {
                 .{ .deep = try Matcher.init(gpa, size, effort.depth(), effort.slotsLog()) },
             .w = .{ .gpa = gpa },
             .alt = .{ .gpa = gpa },
+            .scratch = .{ .gpa = gpa },
         };
     }
 
     pub fn deinit(c: *Core) void {
         if (c.effort == .fast) c.matcher.fast.deinit(c.gpa) else c.matcher.deep.deinit(c.gpa);
-        c.w.buf.deinit(c.gpa);
+        if (!c.w.fixed) c.w.buf.deinit(c.gpa);
         c.alt.buf.deinit(c.gpa);
+        c.scratch.buf.deinit(c.gpa);
         c.cmds.deinit(c.gpa);
         c.* = undefined;
     }
@@ -1986,26 +2057,21 @@ pub const Core = struct {
         const m = w.mark();
         const store_bits = storeCostBits(w.bitPos(), n);
         var trial = c.ring;
-        const first = try tryBlock(gpa, w, c.data, off, end, c.cmds.items, is_last, &trial, c.effort, false);
-        // The context model was chosen on estimated bits. When it split the
-        // literals, write the block once more with a single literal code and
-        // keep whichever is really shorter (a flat, small alphabet is where
-        // the estimate overfits: `alpha5_flat` came out 1.4 % larger with
-        // contexts than without).
-        // `writeCompressedBlock` prices that alternative on exact bits, so it
-        // is written only when it wins — to `alt`, resumed at the same bit,
-        // and spliced in. The real write still decides (`ctx_end` below).
-        if (first != null and first.?.ntrees > 1 and first.?.single_no_worse) {
-            const ctx_end = w.bitPos();
-            c.alt.resumeAt(m);
-            var single_ring = c.ring;
-            const single = try tryBlock(gpa, &c.alt, c.data, off, end, c.cmds.items, is_last, &single_ring, c.effort, true);
-            if (single != null and ctx_end >= m.len * 8 + c.alt.bitPos()) {
-                try w.takeFrom(m, &c.alt);
-                trial = single_ring;
-            }
+        var ok = try c.writeBest(w, m, off, end, is_last, &trial);
+        if (!ok and w.overflowed) {
+            // The caller's buffer (`compressInto`) ran out mid-block. Decide
+            // in a scratch writer, as `compressWith` would, and copy the
+            // winner — when it is kept, it fits wherever the stored block
+            // would (it is shorter).
+            w.overflowed = false;
+            w.rollback(m);
+            c.scratch.resumeAt(m);
+            trial = c.ring;
+            ok = try c.writeBest(&c.scratch, c.scratch.mark(), off, end, is_last, &trial);
+            ok = ok and m.len * 8 + c.scratch.bitPos() < store_bits;
+            if (ok) try w.takeFrom(m, &c.scratch);
         }
-        if (first != null and w.bitPos() < store_bits) {
+        if (ok and w.bitPos() < store_bits) {
             c.ring = trial; // a stored block leaves the decoder's ring alone
             c.emitted_last = is_last;
         } else {
@@ -2013,6 +2079,35 @@ pub const Core = struct {
             try writeStoreBlock(w, c.data[off..end]);
             c.emitted_last = false;
         }
+    }
+
+    /// The block as compressed meta-block after `dm` in `dst`: the context
+    /// model's, or one literal code when that is really shorter; false when
+    /// the encoder gave up on it (or `dst`, the caller's buffer, ran out:
+    /// `overflowed`). `ring`: the decoder's ring after it.
+    fn writeBest(c: *Core, dst: *BitWriter, dm: BitWriter.Mark, off: usize, end: usize, is_last: bool, ring: *DistRing) std.mem.Allocator.Error!bool {
+        var trial = c.ring;
+        const first = (try tryBlock(c.gpa, dst, c.data, off, end, c.cmds.items, is_last, &trial, c.effort, false)) orelse return false;
+        // The context model was chosen on estimated bits. When it split the
+        // literals, write the block once more with a single literal code and
+        // keep whichever is really shorter (a flat, small alphabet is where
+        // the estimate overfits: `alpha5_flat` came out 1.4 % larger with
+        // contexts than without).
+        // `writeCompressedBlock` prices that alternative on exact bits, so it
+        // is written only when it wins — to `alt`, resumed at the same bit,
+        // and spliced in. The real write still decides (`ctx_bits` below).
+        if (first.ntrees > 1 and first.single_no_worse) {
+            const ctx_bits = dst.bitPos() - dm.len * 8;
+            c.alt.resumeAt(dm);
+            var single_ring = c.ring;
+            const single = try tryBlock(c.gpa, &c.alt, c.data, off, end, c.cmds.items, is_last, &single_ring, c.effort, true);
+            if (single != null and ctx_bits >= c.alt.bitPos()) {
+                try dst.takeFrom(dm, &c.alt);
+                trial = single_ring;
+            }
+        }
+        ring.* = trial;
+        return true;
     }
 
     /// End the stream: the final empty meta-block unless the last block was
@@ -2540,4 +2635,43 @@ test "prefix code header + symbols round trip for 1..N used symbols" {
     var dists = [_]u32{0} ** dist_alphabet_size;
     dists[16] = 7;
     try expectCodeRoundTrip(&dists, dist_alphabet_size);
+}
+
+test "compressInto: the stream compressWith gives, in exactly its length; a byte less does not fit" {
+    const corpus = @import("interop_corpus.zig");
+    const gpa = testing.allocator;
+    for (corpus.shapes) |shape| {
+        const input = try corpus.build(gpa, shape);
+        defer gpa.free(input);
+        if (input.len > 300_000) continue; // (the 1 MiB block shapes: slow, add nothing here)
+        inline for (.{ Effort.fast, .default, .best }) |effort| {
+            const opts: CompressOptions = .{ .effort = effort };
+            const want = try compressWith(gpa, input, opts);
+            defer gpa.free(want);
+            const bound = maxCompressedSize(input.len, opts);
+            try testing.expect(want.len <= bound);
+            const buf = try gpa.alloc(u8, bound);
+            defer gpa.free(buf);
+            errdefer std.debug.print("compressInto: shape {s}, effort {s}\n", .{ shape.name, @tagName(effort) });
+            try testing.expectEqualSlices(u8, want, try compressInto(gpa, buf, input, opts));
+            try testing.expectEqualSlices(u8, want, try compressInto(gpa, buf[0..want.len], input, opts));
+            try testing.expectError(error.OutputTooLarge, compressInto(gpa, buf[0 .. want.len - 1], input, opts));
+        }
+    }
+}
+
+test "maxCompressedSize is reached by incompressible input, whatever the blocks and window" {
+    const gpa = testing.allocator;
+    const input = try gpa.alloc(u8, 200_000);
+    defer gpa.free(input);
+    var prng: std.Random.DefaultPrng = .init(0x3a5);
+    prng.random().bytes(input);
+    for ([_]usize{ 0, 1, 17, 65_520, 65_521, 200_000 }) |n| {
+        for ([_]?u5{ null, 10, 16, 17, 22 }) |wbits| for ([_]usize{ 1 << 20, 4096, 65_536 }) |bs| {
+            const opts: CompressOptions = .{ .effort = .fast, .window_bits = wbits, .block_size = bs };
+            const got = try compressWith(gpa, input[0..n], opts);
+            defer gpa.free(got);
+            try testing.expectEqual(maxCompressedSize(n, opts), got.len);
+        };
+    }
 }
