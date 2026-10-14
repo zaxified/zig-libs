@@ -142,10 +142,12 @@ pub const Participant = struct {
     /// Calls to `Domain.advanceAmortized` since its last `tryAdvance`.
     /// Single-owner plain counter.
     since_advance: u32,
-    /// Open `enterCritical`s on this participant: only the outermost pins
-    /// and only its matching exit unpins (crossbeam's nested guards).
-    /// Single-owner plain counter.
-    pin_depth: u32,
+    /// Open `enterCritical`s beyond the outermost (crossbeam's nested
+    /// guards): only the outermost pins and only its exit unpins. Touched
+    /// only when nesting — whether the participant is pinned at all is its
+    /// own `local_epoch`, so the plain pin+unpin pair writes nothing else
+    /// (a depth store there cost it 25 %, 2026-10-14). Single-owner.
+    nested_pins: u32,
     /// This slot's position in the registry, chunk after chunk
     /// (`Domain.slotIndex`). Fixed at the chunk's creation.
     index: usize,
@@ -156,7 +158,7 @@ pub const Participant = struct {
     /// Whether this participant is inside a critical section. From its
     /// owner thread (the field is the owner's).
     pub fn isPinned(self: *const Participant) bool {
-        return self.pin_depth != 0;
+        return self.local_epoch.load(.monotonic) != unpinned;
     }
 
     fn initInPlace(self: *Participant, index: usize) void {
@@ -167,7 +169,7 @@ pub const Participant = struct {
         self.bag_epoch = @splat(0);
         self.dropped_retires = 0;
         self.since_advance = 0;
-        self.pin_depth = 0;
+        self.nested_pins = 0;
         self.index = index;
     }
 
@@ -203,7 +205,7 @@ pub const Guard = struct {
     /// are invalid afterwards. Under nested guards `f` runs pinned.
     pub fn repinAfter(self: Guard, context: anytype, comptime f: anytype) @typeInfo(@TypeOf(f)).@"fn".return_type.? {
         const p = self.participant;
-        if (p.pin_depth != 1) return f(context);
+        if (p.nested_pins != 0) return f(context);
         self.domain.exitCritical(p);
         defer _ = self.domain.enterCritical(p);
         return f(context);
@@ -478,7 +480,7 @@ pub const Domain = struct {
     /// draining thread, only the epoch it observed, and `adoptOrphans` re-reads
     /// the epoch after acquiring the slot (see there).
     pub fn unregister(self: *Domain, p: *Participant) void {
-        std.debug.assert(p.pin_depth == 0);
+        std.debug.assert(p.nested_pins == 0);
         std.debug.assert(p.local_epoch.load(.monotonic) == Participant.unpinned);
         var attempts: usize = 0;
         while (remainingGarbage(p) != 0 and attempts < max_unregister_advances) : (attempts += 1) {
@@ -598,18 +600,29 @@ pub const Domain = struct {
     /// proof at `tryAdvance` never assumes the pin equals the current epoch.
     /// Hence no publish-revalidate loop is needed.
     ///
-    /// **Nesting.** An `enterCritical` while already pinned only counts
-    /// (`pin_depth`): the participant stays pinned at the outer pin's epoch,
-    /// which covers every reference the inner section reads — the theorem
-    /// bounds reference-holders by their pin store, and the outer one
-    /// precedes every load of the inner section.
+    ///
+    /// The participant must be unpinned (asserted); `enterCriticalNested`
+    /// (and `pin`) also take an already pinned one. Checking here would put
+    /// a load of the `local_epoch` the previous `exitCritical` just stored —
+    /// store-forwarded, on the path to the `xchg` — into every pin: +25 %
+    /// on a pin+unpin pair (`epoch_pin` 1.00 → 1.25× crossbeam, 2026-10-14).
     pub fn enterCritical(self: *Domain, p: *Participant) Guard {
-        p.pin_depth += 1;
-        if (p.pin_depth == 1) {
-            std.debug.assert(p.local_epoch.load(.monotonic) == Participant.unpinned);
-            const e = self.global_epoch.load(.seq_cst);
-            p.local_epoch.store(e, .seq_cst);
-        }
+        std.debug.assert(p.local_epoch.load(.monotonic) == Participant.unpinned);
+        const e = self.global_epoch.load(.seq_cst);
+        p.local_epoch.store(e, .seq_cst);
+        return .{ .domain = self, .participant = p };
+    }
+
+    /// `enterCritical` that also nests (crossbeam's nested guards): on an
+    /// already pinned participant it only counts (`nested_pins`), and the
+    /// participant stays pinned at the outer pin's epoch, which covers every
+    /// reference the inner section reads — the theorem bounds
+    /// reference-holders by their pin store, and the outer one precedes
+    /// every load of the inner section. `exitCritical` undoes either.
+    pub fn enterCriticalNested(self: *Domain, p: *Participant) Guard {
+        // `.monotonic`: this thread is the only writer of its pin.
+        if (p.local_epoch.load(.monotonic) == Participant.unpinned) return self.enterCritical(p);
+        p.nested_pins += 1;
         return .{ .domain = self, .participant = p };
     }
 
@@ -620,8 +633,8 @@ pub const Domain = struct {
     /// value" case — the caller has dropped its references, as after an
     /// unpin), and as a seq_cst store it is the new section's pin.
     pub fn repin(self: *Domain, p: *Participant) void {
-        std.debug.assert(p.pin_depth != 0);
-        if (p.pin_depth != 1) return;
+        std.debug.assert(p.isPinned());
+        if (p.nested_pins != 0) return;
         const e = self.global_epoch.load(.seq_cst);
         if (p.local_epoch.load(.monotonic) == e) return;
         p.local_epoch.store(e, .seq_cst);
@@ -643,10 +656,11 @@ pub const Domain = struct {
     /// briefly), never toward freeing early. Conservative direction = safe.
     pub fn exitCritical(self: *Domain, p: *Participant) void {
         _ = self;
-        std.debug.assert(p.pin_depth != 0);
-        p.pin_depth -= 1;
-        if (p.pin_depth != 0) return;
         std.debug.assert(p.local_epoch.load(.monotonic) != Participant.unpinned);
+        if (p.nested_pins != 0) {
+            p.nested_pins -= 1;
+            return;
+        }
         p.local_epoch.store(Participant.unpinned, .release);
     }
 
@@ -656,7 +670,7 @@ pub const Domain = struct {
     /// `unregisterCurrentThread` releases the participant (Zig has no
     /// thread-exit hook, so this is explicit).
     pub fn pin(self: *Domain) PinError!Guard {
-        return self.enterCritical(try self.currentParticipant());
+        return self.enterCriticalNested(try self.currentParticipant());
     }
 
     /// This thread's default participant (see `pin`), registered on first use.
@@ -1229,7 +1243,7 @@ test "a growable registry appends chunks past max_participants, numbered on, and
     for (ps) |p| d.unregister(p);
 }
 
-test "nested pins: only the outermost pins and only its exit unpins" {
+test "nested pins (enterCriticalNested, pin): only the outermost pins and only its exit unpins" {
     var d = try Domain.init(testing.allocator, .{ .max_participants = 2 });
     defer d.deinit();
     const p = try d.register();
@@ -1239,7 +1253,7 @@ test "nested pins: only the outermost pins and only its exit unpins" {
     try testing.expect(!p.isPinned());
     const outer = d.enterCritical(p);
     const pinned_at = p.local_epoch.load(.monotonic);
-    const inner = d.enterCritical(p);
+    const inner = d.enterCriticalNested(p);
     try testing.expectEqual(pinned_at, p.local_epoch.load(.monotonic));
     d.tryAdvance(other);
     d.tryAdvance(other); // blocked by p's pin
@@ -1271,7 +1285,7 @@ test "repin moves the pin to the current epoch; repinAfter unpins around the cal
     d.tryAdvance(other);
     try testing.expectEqual(e + 1, d.epoch());
     // Nested: repin is a no-op, the pin stays.
-    const inner = d.enterCritical(p);
+    const inner = d.enterCriticalNested(p);
     inner.repin();
     try testing.expectEqual(e, p.local_epoch.load(.monotonic));
     const Probe = struct {

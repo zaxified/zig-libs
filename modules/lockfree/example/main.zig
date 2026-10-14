@@ -34,7 +34,8 @@ pub fn main() !void {
 
     // A tight domain (one slot) so the registry-exhaustion error is easy to
     // trigger and name from outside.
-    var domain = try lockfree.Domain.init(gpa, .{ .max_participants = 1 });
+    // A fixed one-slot registry (the default grows by chunks instead).
+    var domain = try lockfree.Domain.init(gpa, .{ .max_participants = 1, .growable = false });
     defer domain.deinit();
 
     const worker = try domain.register();
@@ -43,6 +44,7 @@ pub fn main() !void {
     // nameable error, not silently succeed or crash.
     _ = domain.register() catch |err| switch (err) {
         error.TooManyParticipants => std.debug.print("second worker correctly refused a slot\n", .{}),
+        error.OutOfMemory => return err,
     };
 
     const Pool = lockfree.NodePool(lockfree.Node);

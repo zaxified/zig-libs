@@ -92,6 +92,19 @@ pub fn ArrayQueue(comptime T: type, comptime opts: Options) type {
     return Ring(T, null, opts);
 }
 
+const stripe_bits = 2;
+const refused_stripes = 1 << stripe_bits;
+
+/// The refusal stripe of the calling thread, from its stack address: each
+/// thread's stack is its own mapping, and those sit at aligned distances, so
+/// the address (above the page) goes through a multiplicative hash and the
+/// stripe is its top bits. Not a thread id — no syscall, no TLS.
+inline fn refusedStripe() usize {
+    var probe: u8 = 0;
+    const a: u64 = @intFromPtr(&probe) >> 12;
+    return @intCast((a *% 0x9E3779B97F4A7C15) >> (64 - stripe_bits));
+}
+
 fn Ring(comptime T: type, comptime fixed: ?usize, comptime opts: Options) type {
     return struct {
         const Self = @This();
@@ -118,8 +131,12 @@ fn Ring(comptime T: type, comptime fixed: ?usize, comptime opts: Options) type {
         tail: std.atomic.Value(usize) align(atomic.cache_line),
         /// Next position a consumer claims.
         head: std.atomic.Value(usize) align(atomic.cache_line),
-        /// Pushes refused because the queue was full.
-        refused: std.atomic.Value(u64) align(atomic.cache_line),
+        /// Pushes refused because the queue was full, striped: producers
+        /// spinning on a full ring all refuse, and one shared counter made
+        /// their `lock xadd`s fight over a line — `bounded_4x4` 1.0 → 1.2×
+        /// crossbeam (no counter), up to 1.7× (2026-10-14). A refusal adds to
+        /// the stripe its thread's stack address picks; `refusedCount` sums.
+        refused: [refused_stripes]atomic.CachePadded(std.atomic.Value(u64)) align(atomic.cache_line),
 
         /// Initialise in place: every slot free for lap 0, nothing refused.
         fn initInPlace(q: *Self) void {
@@ -130,7 +147,7 @@ fn Ring(comptime T: type, comptime fixed: ?usize, comptime opts: Options) type {
             q.one_lap = {};
             q.tail = .init(0);
             q.head = .init(0);
-            q.refused = .init(0);
+            q.refused = @splat(.init(.init(0)));
         }
 
         pub const InitError = error{
@@ -151,7 +168,7 @@ fn Ring(comptime T: type, comptime fixed: ?usize, comptime opts: Options) type {
                 .one_lap = one_lap,
                 .tail = .init(0),
                 .head = .init(0),
-                .refused = .init(0),
+                .refused = @splat(.init(.init(0))),
             };
         }
 
@@ -240,7 +257,7 @@ fn Ring(comptime T: type, comptime fixed: ?usize, comptime opts: Options) type {
                     return true;
                 } else if (diff < 0) {
                     // The slot still holds the item of the previous lap: full.
-                    _ = q.refused.fetchAdd(1, .monotonic);
+                    _ = q.refused[refusedStripe()].value.fetchAdd(1, .monotonic);
                     return false;
                 } else {
                     // Another producer claimed `pos` already; catch up.
@@ -381,9 +398,13 @@ fn Ring(comptime T: type, comptime fixed: ?usize, comptime opts: Options) type {
                 @compileError(name ++ " needs .consumers = .single: with several consumers the slot it points at can be taken and reused by another one");
         }
 
-        /// Pushes refused because the queue was full, since `init`.
+        /// Pushes refused because the queue was full, since `init`. A sum of
+        /// stripes: exact once the producers have stopped, otherwise a
+        /// snapshot that may miss refusals still landing.
         pub fn refusedCount(q: *const Self) u64 {
-            return q.refused.load(.monotonic);
+            var n: u64 = 0;
+            for (&q.refused) |*c| n += c.value.load(.monotonic);
+            return n;
         }
 
         /// Items claimed by producers and not yet claimed by consumers, at

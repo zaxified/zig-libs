@@ -132,7 +132,8 @@ switch (other.steal()) {                // any thread: oldest first
   detector standing in for a sanitizer (see `SPEC.md`).
 - EBR, crossbeam-epoch style: `Domain.pin()` pins through the thread's default
   participant (registered on first use, `unregisterCurrentThread` to release;
-  up to `max_thread_domains` domains per thread); guards nest; `Guard.repin`/
+  up to `max_thread_domains` domains per thread); guards nest through
+  `pin`/`enterCriticalNested`; `Guard.repin`/
   `repinAfter`/`flush`/`retire`; `Participant.isPinned`. The registry grows
   past `Config.max_participants` in chunks unless `.growable = false`
   (`RegisterError` = `TooManyParticipants` or `OutOfMemory`; `PinError` adds
