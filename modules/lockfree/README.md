@@ -110,13 +110,22 @@ switch (other.steal()) {                // any thread: oldest first
   `init(allocator, capacity)` (`error.InvalidCapacity` for 0) / `deinit`,
   `capacity()`, and every operation of `BoundedQueue`. Same protocol over
   "stamped" positions (`lap · one_lap + index`); see `SPEC.md` §4b.
-- `Deque(T)` / `Steal(T)` — the **Chase-Lev work-stealing deque** (crossbeam's
-  `deque`, LIFO worker + stealer): `push`/`pop` from the one owner thread,
-  `steal` (`.success` / `.retry` / `.empty`), `len`/`isEmpty` from any thread.
-  Grows by doubling; replaced buffers are kept until `deinit` (together smaller
-  than the current one), so a thief needs no epoch pin. `T` is at most one
-  machine word (a pointer or an index): a thief reads a slot it may then lose,
-  so slots are atomic. See `SPEC.md` §4c.
+- `Deque(T)` / `FifoDeque(T)` / `Steal(T)` / `DequeFlavor` — the **Chase-Lev
+  work-stealing deque** (crossbeam's `deque`): `push`/`pop` from the one owner
+  thread — newest first for `Deque`, oldest first for `FifoDeque` — `steal`
+  (`.success` / `.retry` / `.empty`, with `isEmpty`/`isRetry`/`isSuccess`/
+  `item`/`orElse`/`first`), `len`/`isEmpty` from any thread, and
+  `stealBatch`/`stealBatchWithLimit`/`stealBatchAndPop`/
+  `stealBatchWithLimitAndPop` (about half the victim's items, at most
+  `default_batch_limit` = 32, into the caller's own deque). `worker()`/
+  `stealer()` give owner and thief views. Grows by doubling; replaced buffers
+  are kept until `deinit` (together smaller than the current one), so a thief
+  needs no epoch pin. Any `T`: word-sized types are one atomic, wider ones are
+  copied as atomic words. See `SPEC.md` §4c.
+- `Injector(T)` — the **global entry queue** of a work-stealing scheduler
+  (crossbeam's `Injector`): `push` from any thread, `steal` and the four
+  `stealBatch*` into a worker deque; a `SegQueue` underneath (allocator must be
+  thread-safe). See `SPEC.md` §4c.
 - `NodePool(T)` / `PoolError` — a **poisoning** node pool: freed nodes are
   overwritten with a `0xA5` canary and reused first, so a use-after-free is
   caught by `verifyQuiescent` (or the next `acquire`). This is the in-tree UAF

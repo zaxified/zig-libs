@@ -34,7 +34,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | Go `sync/atomic`, `sync.Pool` | Go | BSD-3-Clause | — | Go stdlib | Atomics and per-P pools only; no lock-free queue or reclamation is needed under a GC. |
 | Zig `std.atomic`, `std.Io` | Zig | MIT | — | Zig 0.16.0 | Atomic primitives only; no reclamation and no lock-free container (this module's SPEC §1). |
 
-**Where we are ahead:** the only one of the Zig options with safe reclamation (EBR) under the queue *(inferred: the other README does not mention any)*, and the most rigorously checked: a poisoning node pool that detects use-after-free, a stress driver with a deliberately broken control, and weak-memory certification on aarch64/riscv64 plus herd7 litmus tests (SPEC §7). **Where we are behind:** the work-stealing deque (since 2026-10-07, §4c) takes word-sized items only and has no `steal_batch` or FIFO worker flavour (crossbeam's `deque` has both), no lock-free map, no hazard pointers, and every reclamation-relevant access — pin store, epoch loads/CAS, the `local_epoch` scan loads, the queue's `head`/`tail`/`Node.next` loads and CAS — is `seq_cst` where a tuned design would use acquire/release (correct, slower; the unpin store, registration and orphan bookkeeping already use release/acquire/monotonic, SPEC §4a) (→ Backlog).
+**Where we are ahead:** the only one of the Zig options with safe reclamation (EBR) under the queue *(inferred: the other README does not mention any)*, and the most rigorously checked: a poisoning node pool that detects use-after-free, a stress driver with a deliberately broken control, and weak-memory certification on aarch64/riscv64 plus herd7 litmus tests (SPEC §7). **Where we are behind:** no lock-free map, no hazard pointers, and every reclamation-relevant access — pin store, epoch loads/CAS, the `local_epoch` scan loads, the queue's `head`/`tail`/`Node.next` loads and CAS — is `seq_cst` where a tuned design would use acquire/release (correct, slower; the unpin store, registration and orphan bookkeeping already use release/acquire/monotonic, SPEC §4a) (→ Backlog).
 
 ## 1. Dedup / std-gap
 
@@ -356,12 +356,55 @@ riscv64 seq_cst store `fence rw,w; sd`, load `fence rw,rw; ld; fence r,rw`, CAS
 sequence; on riscv it models the CAS as `amoswap.w.aqrl` (an RMW with the same
 aq+rl bits as the LR/SC pair).
 
-**Word-sized items, atomic slots.** A thief reads the slot at `top` before its
-claiming CAS; when the CAS loses, the owner may be overwriting that slot on its
-next lap. crossbeam reads any `T` racily and discards it; in Zig that read is a
-data race on a plain `T`. Slots are therefore `std.atomic.Value(T)` (monotonic),
-which bounds `T` to a machine word — pointers and indices, what a scheduler
-queues. A larger `T` is a compile error that says to queue a pointer.
+**Atomic slots, any `T` (wide since 2026-10-14).** A thief reads the slot at
+`top` before its claiming CAS; when the CAS loses, the owner may be overwriting
+that slot on its next lap. crossbeam reads any `T` racily and discards it; in
+Zig that read is a data race on a plain `T`. A `T` that fits one
+`std.atomic.Value` is one monotonic atomic. Any other `T` (until 2026-10-14 a
+compile error) is stored as its bytes in an array of atomic words, each copied
+with a monotonic load/store — race-free, possibly torn. A torn read needs the
+owner to have rewritten the slot, which it does only after reading `top` past
+that position (`push` grows instead while `bottom − top` fills the buffer), so
+the thief's CAS from that position fails and the value is dropped; a successful
+claim proves every word was the position's. The owner never races itself.
+
+**FIFO flavour (`FifoDeque`, 2026-10-14).** crossbeam's `Worker::new_fifo`:
+the owner pops the oldest item with the thieves' own claim — read `top`, read
+the slot, CAS `top → top + 1` — and never lowers `bottom`. Owner and thieves
+then meet only at that CAS, so there is no Dekker pair and no last-item special
+case; the owner's slot read needs no validation (only it writes slots). `len`
+can no longer see the negative transient.
+
+**Batches (`stealBatch*`, 2026-10-14).** crossbeam's four `steal_batch*`: move
+about half of the victim's items (rounded up, at most a limit, default 32) into
+the caller's own deque, optionally returning the oldest instead of moving it.
+The caller first reserves room past its own `bottom` (growing its buffer, the
+only step that can fail — before anything is taken), writes the stolen items
+into those slots — invisible to its thieves, which read below `bottom` — and
+publishes them with one release store of `bottom`. The claim depends on the
+victim. FIFO victim: one CAS `top → top + n`. Sound because `bottom` never
+falls, so the `n` positions read below it stay unclaimed unless `top` moves,
+which fails the CAS, and their slots cannot be rewritten while `top` is still
+`t` (above). LIFO victim: `n` single `steal`s, stopping at the first that does
+not succeed — one CAS by `n` is unsound there (Backlog, 2026-10-07: the owner
+pops uncontested down into the batch), and a positive control drives exactly
+that shape (`DEQUE BATCH DRIVER TEETH`, caught as duplicates). Items land in
+the destination in stolen order: a FIFO destination pops them oldest first, a
+LIFO one newest first.
+
+**`Steal` helpers and views.** `isEmpty`/`isRetry`/`isSuccess`, `item()`
+(crossbeam's `success()`; the name is taken by the union field), `orElse` and
+`first` (crossbeam's `or_else` and `collect` over victims: the first success,
+else `.retry` if any attempt said retry). `worker()`/`stealer()` return
+`Worker`/`Stealer` views carrying only the owner's or a thief's operations — the
+type-level split crossbeam has; the deque itself still exposes both.
+
+**`Injector` (2026-10-14).** crossbeam's global entry queue: an unbounded MPMC
+FIFO that any thread pushes to and any thread steals from, one item or a batch
+into its own deque. It is a `SegQueue` (§4d): handle-free and already FIFO, so
+`steal` never answers `.retry`. A batch is `n` pops written past the
+destination's `bottom` and published together — `n` claims rather than one;
+the P axis has no injector row yet (§8).
 
 **Growth without reclamation.** A full `push` allocates a buffer twice the size,
 copies the live positions, publishes it with release and keeps the old one in an
@@ -561,6 +604,16 @@ mutated too (killed 20/20 after the test drove a push + pop-the-last on every
 iteration; 17/20 before). Not mutated: the `seq_cst`/acquire/release orderings —
 on x86-TSO no value test observes their demotion; the deque litmus pair (§7.1,
 shape 3) is their evidence.
+
+**Mutation run 2026-10-14, `deque.zig`** (schemata, ReleaseSafe, 14 mutants
+over the new code: the FIFO owner's bound and CAS, the batch size, the FIFO
+batch CAS (by `n − 1`, dropped), the destination publish (dropped, short by
+one), `reserve` ignoring `n`, the wide slot's word copy, the injector batch's
+publish, `orElse`'s and `first`'s retry rule, the LIFO batch count and the
+returned oldest item): 14 killed. Stress added: a FIFO owner against six
+thieves from capacity 2, batch thieves (limits 1–9) against LIFO and FIFO
+owners, 20-byte items word by word (a torn item would decode as corrupt), and
+an injector feeding four workers that also steal from each other.
 
 **Mutation run 2026-10-14, `bounded.zig`** (schemata, ReleaseSafe, 16 mutants
 over `ArrayQueue`'s stamps and `forcePush`: the step past a lap's last slot
@@ -997,9 +1050,9 @@ Items from §6 stay there; the survey adds what a crossbeam user hits first.
 - ~~(2026-10-06) Runtime capacity for the bounded ring~~ — ✅ 2026-10-14, `ArrayQueue` (§4b). Was: crossbeam's `ArrayQueue::new(cap)` takes any capacity at run time; ours is a comptime power of two stored inline. A config-sized ring needs a heap-backed variant (slots slice + `init(allocator, cap)`). Effort: small; fits §2.
 - ~~(2026-10-06) `force_push`~~ — ✅ 2026-10-14, `forcePush` (§4b). Was: (overwrite the oldest when full — crossbeam has it, for "latest N" buffers). With several consumers it needs the producer to claim a consumer position too. Effort: medium; fits §2.
 - ~~(survey 2026-09-30) Work-stealing deque~~ — ✅ 2026-10-07, `Deque(T)` (§4c). ⏭ consumer: `workerpool` still shares one MPMC queue; per-worker deques + stealing is its own change there.
-- (2026-10-07) `Deque`: `stealBatch` (crossbeam's `steal_batch`/`steal_batch_and_pop`: move up to half of a victim's items in one go — fewer steals under imbalance). ⛔ NOT one CAS `top → top + k` on the LIFO deque: the §4c proof covers a claim of ONE position, where an owner reaching it must CAS too (`t == b`). With k, the owner can pop several times uncontested (each reads `top = t < b`) down into `[t, t+k)` before the thief's CAS lands — 4 items, thief takes `t, t+1`, owner pops `t+3, t+2, t+1`: `t+1` taken twice. On the LIFO flavour a batch is k single claims (one CAS each); one CAS by k is sound only for a FIFO flavour, whose owner also claims through `top`. No consumer asks for it today (workerpool's submitters are external threads, no fork-join). Effort: small (k single steals) / medium (FIFO batch); fits §2.
-- (2026-10-07) `Deque`: FIFO worker flavour (crossbeam's `Worker::new_fifo`: the owner pops from the top too). Effort: small; fits §2.
-- (2026-10-07) `Deque`: items wider than a word (crossbeam takes any `T` and reads it racily). Needs either a seqlock-style slot or accepting the race; effort: medium; fits §2 only if a consumer needs it.
+- ~~(2026-10-07) `Deque`: `stealBatch`~~ — ✅ 2026-10-14 (§4c). Was: (crossbeam's `steal_batch`/`steal_batch_and_pop`: move up to half of a victim's items in one go — fewer steals under imbalance). ⛔ NOT one CAS `top → top + k` on the LIFO deque: the §4c proof covers a claim of ONE position, where an owner reaching it must CAS too (`t == b`). With k, the owner can pop several times uncontested (each reads `top = t < b`) down into `[t, t+k)` before the thief's CAS lands — 4 items, thief takes `t, t+1`, owner pops `t+3, t+2, t+1`: `t+1` taken twice. On the LIFO flavour a batch is k single claims (one CAS each); one CAS by k is sound only for a FIFO flavour, whose owner also claims through `top`. No consumer asks for it today (workerpool's submitters are external threads, no fork-join). Effort: small (k single steals) / medium (FIFO batch); fits §2.
+- ~~(2026-10-07) `Deque`: FIFO worker flavour~~ — ✅ 2026-10-14, `FifoDeque` (§4c). Was: (crossbeam's `Worker::new_fifo`: the owner pops from the top too). Effort: small; fits §2.
+- ~~(2026-10-07) `Deque`: items wider than a word~~ — ✅ 2026-10-14, word-wise atomic slots (§4c). Was: (crossbeam takes any `T` and reads it racily). Needs either a seqlock-style slot or accepting the race; effort: medium; fits §2 only if a consumer needs it.
 - (survey 2026-09-30) Acquire/release tuning of the `seq_cst` discipline where the SPEC's argument allows it (throughput; correctness is unchanged). Effort: medium and needs the litmus/codegen certification redone; fits §2.
 
 ## Anchoring

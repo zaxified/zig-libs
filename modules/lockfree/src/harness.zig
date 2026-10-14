@@ -713,9 +713,23 @@ test "FORCE PUSH: producers evict while consumers pop — every item out exactly
 
 // ── the work-stealing deque: one owner, many thieves ─────────────────────────
 
+/// How the deque driver's threads use the deque.
+pub const DequeMode = struct {
+    /// The owner pops FIFO (`FifoDeque`): its pops must rise, no shadow stack.
+    fifo_owner: bool = false,
+    /// Thieves take with `stealBatchWithLimitAndPop` into a private
+    /// `FifoDeque` that they drain before the next batch, instead of `steal`.
+    batch: bool = false,
+};
+
 /// What the deque driver needs from a deque: `push`/`pop` (owner) and `steal`
-/// (thieves). The real `Deque(u64)` has them; so does `BrokenDeque`.
+/// (thieves) — plus `stealBatchWithLimitAndPop` in batch mode. The real
+/// deques have them; so do `BrokenDeque` and `WideDeque`.
 fn DequeStress(comptime D: type) type {
+    return DequeStressMode(D, .{});
+}
+
+pub fn DequeStressMode(comptime D: type, comptime mode: DequeMode) type {
     return struct {
         const drain_threshold: u32 = 2048;
 
@@ -729,8 +743,38 @@ fn DequeStress(comptime D: type) type {
         fn thiefMain(sh: *Shared, list: *std.ArrayListUnmanaged(u64)) void {
             var backoff: atomic.Backoff = .{};
             var empty_run: u32 = 0;
+            var own = deque_mod.FifoDeque(u64).init(sh.allocator, 4) catch {
+                sh.failed.store(true, .release);
+                return;
+            };
+            defer own.deinit();
+            var limit: usize = 1;
             while (!sh.failed.load(.acquire)) {
-                switch (sh.d.steal()) {
+                const got = if (mode.batch) blk: {
+                    // Limits 1..9 in turn: single-item batches, odd sizes,
+                    // and more than half of a short deque (capped by half).
+                    limit = limit % 9 + 1;
+                    const r = sh.d.stealBatchWithLimitAndPop(&own, limit) catch {
+                        sh.failed.store(true, .release);
+                        return;
+                    };
+                    if (r == .success) {
+                        // The batch's oldest item, then the rest in order.
+                        list.append(sh.allocator, r.success) catch {
+                            sh.failed.store(true, .release);
+                            return;
+                        };
+                        while (own.pop()) |v| list.append(sh.allocator, v) catch {
+                            sh.failed.store(true, .release);
+                            return;
+                        };
+                        empty_run = 0;
+                        backoff.reset();
+                        continue;
+                    }
+                    break :blk r;
+                } else sh.d.steal();
+                switch (got) {
                     .success => |v| {
                         list.append(sh.allocator, v) catch {
                             sh.failed.store(true, .release);
@@ -781,7 +825,10 @@ fn DequeStress(comptime D: type) type {
                         shadow.clearRetainingCapacity();
                         break;
                     };
+                    if (mode.fifo_owner) _ = shadow.pop();
                     try popped.append(sh.allocator, v);
+                    // FIFO owner: `verify` checks that its pops rise.
+                    if (mode.fifo_owner) continue;
                     const want = shadow.pop() orelse return .corrupted;
                     if (decodePid(v) != 0 or decodeSeq(v) != want) return .reordered;
                 }
@@ -789,7 +836,7 @@ fn DequeStress(comptime D: type) type {
             return null;
         }
 
-        fn run(d: *D, thieves: usize, n: usize, seed: u64, allocator: std.mem.Allocator) !Verdict {
+        pub fn run(d: *D, thieves: usize, n: usize, seed: u64, allocator: std.mem.Allocator) !Verdict {
             var sh: Shared = .{ .d = d, .allocator = allocator };
             // lists[0] is the owner's pops, lists[1..] one per thief.
             const lists = try allocator.alloc(std.ArrayListUnmanaged(u64), thieves + 1);
@@ -816,7 +863,7 @@ fn DequeStress(comptime D: type) type {
             // check is FIFO, so hand it the owner's pops sorted (same
             // multiset). Thieves' lists keep their order: one thief's steals
             // come off the top, oldest first, so they rise.
-            std.mem.sort(u64, lists[0].items, {}, std.sort.asc(u64));
+            if (!mode.fifo_owner) std.mem.sort(u64, lists[0].items, {}, std.sort.asc(u64));
             return verify(.{ .producers = 1, .consumers = thieves + 1, .per_producer = n }, lists, allocator);
         }
     };
@@ -846,8 +893,7 @@ const BrokenDeque = struct {
             d.bottom.store(b + 1, .monotonic);
             return null;
         }
-        const buf = d.buffer.load(.monotonic);
-        const item = buf.slots[@as(usize, @bitCast(b)) & buf.mask].load(.monotonic);
+        const item = d.buffer.load(.monotonic).get(b);
         if (t == b) {
             // BUG (deliberate): no CAS — a thief may take it too. Moving
             // `top` by hand keeps the indices consistent so the run ends.
@@ -892,4 +938,138 @@ test "DEQUE: growth under theft — from capacity 2, thieves read buffers being 
         // how many depends on how fast the thieves drain — not asserted.
         try testing.expect(d.retired.items.len >= 1);
     }
+}
+
+// ── deque flavours, batches, wide items, the injector ────────────────────────
+
+test "FIFO DEQUE: one FIFO owner (rising pops) against 6 thieves, from capacity 2 (growth under theft)" {
+    const alloc = testing.allocator;
+    for (0..4) |round| {
+        var d = try deque_mod.FifoDeque(u64).init(alloc, 2);
+        defer d.deinit();
+        try testing.expectEqual(Verdict.clean, try DequeStressMode(deque_mod.FifoDeque(u64), .{ .fifo_owner = true }).run(&d, 6, 100_000, 200 + round, alloc));
+        try testing.expect(d.isEmpty());
+    }
+}
+
+test "DEQUE BATCH: 4 thieves steal batches (limits 1..9) from a LIFO and from a FIFO owner" {
+    const alloc = testing.allocator;
+    for (0..3) |round| {
+        var l = try deque_mod.Deque(u64).init(alloc, 2);
+        defer l.deinit();
+        try testing.expectEqual(Verdict.clean, try DequeStressMode(deque_mod.Deque(u64), .{ .batch = true }).run(&l, 4, 200_000, 300 + round, alloc));
+        var f = try deque_mod.FifoDeque(u64).init(alloc, 2);
+        defer f.deinit();
+        try testing.expectEqual(Verdict.clean, try DequeStressMode(deque_mod.FifoDeque(u64), .{ .fifo_owner = true, .batch = true }).run(&f, 4, 200_000, 400 + round, alloc));
+    }
+}
+
+/// A deque of three-word items, driven as a deque of `u64`: each item carries
+/// `v`, `~v` and `v *% k`. A torn or stale slot read that got handed out
+/// decodes to a value that was never pushed — `.corrupted`.
+fn WideDeque(comptime flavor: deque_mod.Flavor) type {
+    return struct {
+        const Wide = struct { a: u64, b: u64, c: u32 };
+        const Inner = if (flavor == .lifo) deque_mod.Deque(Wide) else deque_mod.FifoDeque(Wide);
+        const bad: u64 = std.math.maxInt(u64);
+        inner: Inner,
+
+        fn wrap(v: u64) Wide {
+            return .{ .a = v, .b = ~v, .c = @truncate(v *% 2654435761) };
+        }
+        fn unwrap(w: Wide) u64 {
+            return if (w.b == ~w.a and w.c == @as(u32, @truncate(w.a *% 2654435761))) w.a else bad;
+        }
+        fn push(self: *@This(), v: u64) !void {
+            return self.inner.push(wrap(v));
+        }
+        fn pop(self: *@This()) ?u64 {
+            return if (self.inner.pop()) |w| unwrap(w) else null;
+        }
+        fn steal(self: *@This()) deque_mod.Steal(u64) {
+            return switch (self.inner.steal()) {
+                .success => |w| .{ .success = unwrap(w) },
+                .empty => .empty,
+                .retry => .retry,
+            };
+        }
+    };
+}
+
+test "WIDE DEQUE: 20-byte items copied word by word — no torn item handed out (LIFO and FIFO owner)" {
+    const alloc = testing.allocator;
+    for (0..3) |round| {
+        var l: WideDeque(.lifo) = .{ .inner = try .init(alloc, 2) };
+        defer l.inner.deinit();
+        try testing.expectEqual(Verdict.clean, try DequeStress(WideDeque(.lifo)).run(&l, 6, 100_000, 500 + round, alloc));
+        var f: WideDeque(.fifo) = .{ .inner = try .init(alloc, 2) };
+        defer f.inner.deinit();
+        try testing.expectEqual(Verdict.clean, try DequeStressMode(WideDeque(.fifo), .{ .fifo_owner = true }).run(&f, 6, 100_000, 600 + round, alloc));
+    }
+}
+
+test "INJECTOR: producers push, workers take batches into FIFO deques and steal from each other" {
+    const alloc = testing.allocator;
+    const producers = 4;
+    const workers = 4;
+    const per: usize = 100_000;
+    const W = deque_mod.FifoDeque(u64);
+    var inj = try deque_mod.Injector(u64).init(alloc);
+    defer inj.deinit();
+    var deques: [workers]W = undefined;
+    for (&deques) |*d| d.* = try W.init(alloc, 4);
+    defer for (&deques) |*d| d.deinit();
+    var lists: [workers]std.ArrayListUnmanaged(u64) = @splat(.empty);
+    defer for (&lists) |*l| l.deinit(alloc);
+    for (&lists) |*l| try l.ensureTotalCapacity(alloc, producers * per);
+    const Shared = struct {
+        done: std.atomic.Value(usize) = .init(0),
+        failed: std.atomic.Value(bool) = .init(false),
+    };
+    const T = struct {
+        fn produce(q: *deque_mod.Injector(u64), pid: usize, sh: *Shared) void {
+            for (0..per) |i| q.push(encode(pid, i)) catch sh.failed.store(true, .release);
+            _ = sh.done.fetchAdd(1, .release);
+        }
+        fn work(q: *deque_mod.Injector(u64), all: *[workers]W, me: usize, list: *std.ArrayListUnmanaged(u64), sh: *Shared) void {
+            var idle: u32 = 0;
+            var victim = me;
+            while (idle < 4096) {
+                if (all[me].pop()) |v| {
+                    list.appendAssumeCapacity(v);
+                    idle = 0;
+                    continue;
+                }
+                const r = q.stealBatchAndPop(&all[me]) catch {
+                    sh.failed.store(true, .release);
+                    return;
+                };
+                if (r.item()) |v| {
+                    list.appendAssumeCapacity(v);
+                    idle = 0;
+                    continue;
+                }
+                victim = (victim + 1) % workers;
+                if (victim != me) {
+                    if (all[victim].stealer().steal().item()) |v| {
+                        list.appendAssumeCapacity(v);
+                        idle = 0;
+                        continue;
+                    }
+                }
+                if (sh.done.load(.acquire) == producers) idle += 1;
+                std.atomic.spinLoopHint();
+            }
+        }
+    };
+    var sh: Shared = .{};
+    var threads: [producers + workers]std.Thread = undefined;
+    for (0..producers) |p| threads[p] = try std.Thread.spawn(.{}, T.produce, .{ &inj, p, &sh });
+    for (0..workers) |w| threads[producers + w] = try std.Thread.spawn(.{}, T.work, .{ &inj, &deques, w, &lists[w], &sh });
+    for (&threads) |t| t.join();
+    try testing.expect(!sh.failed.load(.acquire));
+    // Stolen items can arrive older than a worker's own: multiset only.
+    for (&lists) |*l| std.mem.sort(u64, l.items, {}, std.sort.asc(u64));
+    try testing.expectEqual(Verdict.clean, try verify(.{ .producers = producers, .consumers = workers, .per_producer = per }, &lists, alloc));
+    try testing.expect(inj.isEmpty());
 }

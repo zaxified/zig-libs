@@ -87,7 +87,11 @@ pub const SegQueueOptions = segqueue.Options;
 
 const deque = @import("deque.zig");
 pub const Deque = deque.Deque;
+pub const FifoDeque = deque.FifoDeque;
+pub const DequeFlavor = deque.Flavor;
 pub const Steal = deque.Steal;
+pub const Injector = deque.Injector;
+pub const default_batch_limit = deque.default_batch_limit;
 
 const harness = @import("harness.zig");
 pub const StressConfig = harness.StressConfig;
