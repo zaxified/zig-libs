@@ -130,6 +130,16 @@ switch (other.steal()) {                // any thread: oldest first
   overwritten with a `0xA5` canary and reused first, so a use-after-free is
   caught by `verifyQuiescent` (or the next `acquire`). This is the in-tree UAF
   detector standing in for a sanitizer (see `SPEC.md`).
+- EBR, crossbeam-epoch style: `Domain.pin()` pins through the thread's default
+  participant (registered on first use, `unregisterCurrentThread` to release;
+  up to `max_thread_domains` domains per thread); guards nest; `Guard.repin`/
+  `repinAfter`/`flush`/`retire`; `Participant.isPinned`. The registry grows
+  past `Config.max_participants` in chunks unless `.growable = false`
+  (`RegisterError` = `TooManyParticipants` or `OutOfMemory`; `PinError` adds
+  `TooManyDomainsPerThread`). See `SPEC.md` §4a.1.
+- `TaggedPtr(T)` / `TaggedAtomic(T)` — pointer + tag bits in one word (the
+  bits `T`'s alignment leaves free), loaded, stored, swapped and CASed together,
+  with `fetchOrTag`/`fetchAndTag`/`fetchXorTag` (crossbeam's tagged `Atomic`).
 - `Backoff` / `SpinLock` / `CachePadded` / `cache_line` — mechanical atomic
   helpers over `std.atomic` (0.16 has no `std.Thread.Mutex`). `SpinLock` is
   test-only, used by the harness oracle; never on a lock-free path.

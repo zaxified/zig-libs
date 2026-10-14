@@ -535,6 +535,50 @@ test "REAL CORE: MPMC + EBR survive N×M stress with no lost/dup/corrupt and no 
     try node_pool.verifyQuiescent();
 }
 
+/// `MpmcAdapter` with each thread's participant taken from the domain's
+/// per-thread default (`Domain.currentParticipant`, as `pin` does).
+const MpmcDefaultAdapter = struct {
+    q: *mpmc.MpmcQueue,
+    domain: *ebr.Domain,
+    const ThreadCtx = *ebr.Participant;
+    fn initThread(self: *MpmcDefaultAdapter) !ThreadCtx {
+        return self.domain.currentParticipant();
+    }
+    fn deinitThread(self: *MpmcDefaultAdapter, ctx: ThreadCtx) void {
+        _ = ctx;
+        self.domain.unregisterCurrentThread();
+    }
+    fn enqueue(self: *MpmcDefaultAdapter, ctx: ThreadCtx, v: u64) !void {
+        try self.q.enqueue(ctx, v);
+    }
+    fn dequeue(self: *MpmcDefaultAdapter, ctx: ThreadCtx) ?u64 {
+        return self.q.dequeue(ctx);
+    }
+};
+
+test "REAL CORE, GROWING REGISTRY: 16 threads register into a 1-slot domain (chunks appended under the scan), no UAF" {
+    if (!gate.fable_core_implemented) return error.SkipZigTest;
+    const alloc = testing.allocator;
+    for (0..3) |round| {
+        var domain = try ebr.Domain.init(alloc, .{ .max_participants = 1 });
+        defer domain.deinit();
+        var node_pool = mpmc.MpmcQueue.Pool.init(alloc);
+        defer node_pool.deinit();
+        var q = try mpmc.MpmcQueue.init(&node_pool, &domain);
+        defer q.deinit();
+        const cfg: StressConfig = .{ .producers = 8, .consumers = 8, .per_producer = 30_000 };
+        const v = if (round % 2 == 0) blk: {
+            var adapter: MpmcAdapter = .{ .q = &q, .domain = &domain };
+            break :blk try runStress(MpmcAdapter, &adapter, cfg, alloc);
+        } else blk: {
+            var adapter: MpmcDefaultAdapter = .{ .q = &q, .domain = &domain };
+            break :blk try runStress(MpmcDefaultAdapter, &adapter, cfg, alloc);
+        };
+        try testing.expectEqual(Verdict.clean, v);
+        try node_pool.verifyQuiescent();
+    }
+}
+
 // ── the bounded ring under the same driver ───────────────────────────────────
 
 /// Drives a `BoundedQueue`. The driver's producers must never lose an item,

@@ -174,6 +174,137 @@ const SpinCounter = struct {
     }
 };
 
+/// A pointer to `T` whose low bits — zero in any `*T`, by `T`'s alignment —
+/// carry a small tag (crossbeam-epoch's tagged `Shared`): a mark bit for a
+/// logically deleted node, a version to defeat ABA in a CAS, and so on.
+pub fn TaggedPtr(comptime T: type) type {
+    return struct {
+        raw: usize,
+
+        const Self = @This();
+        /// How many tag bits `T`'s alignment leaves free (0 for align 1).
+        pub const tag_bits: comptime_int = @ctz(@as(usize, @alignOf(T)));
+        pub const tag_mask: usize = (1 << tag_bits) - 1;
+        pub const null_ptr: Self = .{ .raw = 0 };
+
+        /// `tag` must fit `tag_mask` (asserted).
+        pub fn init(p: ?*T, tag_: usize) Self {
+            std.debug.assert(tag_ & ~tag_mask == 0);
+            return .{ .raw = @intFromPtr(p) | tag_ };
+        }
+
+        pub fn ptr(s: Self) ?*T {
+            return @ptrFromInt(s.raw & ~tag_mask);
+        }
+
+        pub fn tag(s: Self) usize {
+            return s.raw & tag_mask;
+        }
+
+        pub fn withTag(s: Self, tag_: usize) Self {
+            std.debug.assert(tag_ & ~tag_mask == 0);
+            return .{ .raw = (s.raw & ~tag_mask) | tag_ };
+        }
+
+        pub fn isNull(s: Self) bool {
+            return s.raw & ~tag_mask == 0;
+        }
+
+        pub fn eql(a: Self, b: Self) bool {
+            return a.raw == b.raw;
+        }
+    };
+}
+
+/// An atomic `TaggedPtr(T)` (crossbeam-epoch's `Atomic<T>`): pointer and tag
+/// change together in one word, and the tag alone can be set, cleared or
+/// flipped with one read-modify-write. Loads take no guard here — reading
+/// EBR-managed memory through the result is safe only while pinned, as
+/// with any pointer into a `Domain`'s structure.
+pub fn TaggedAtomic(comptime T: type) type {
+    return struct {
+        raw: std.atomic.Value(usize),
+
+        const Self = @This();
+        pub const Ptr = TaggedPtr(T);
+
+        pub fn init(p: Ptr) Self {
+            return .{ .raw = .init(p.raw) };
+        }
+
+        pub fn load(self: *const Self, comptime order: std.builtin.AtomicOrder) Ptr {
+            return .{ .raw = self.raw.load(order) };
+        }
+
+        pub fn store(self: *Self, p: Ptr, comptime order: std.builtin.AtomicOrder) void {
+            self.raw.store(p.raw, order);
+        }
+
+        pub fn swap(self: *Self, p: Ptr, comptime order: std.builtin.AtomicOrder) Ptr {
+            return .{ .raw = self.raw.swap(p.raw, order) };
+        }
+
+        /// Null on success, else the value found (pointer and tag compared).
+        pub fn cmpxchgWeak(self: *Self, expected: Ptr, new: Ptr, comptime success: std.builtin.AtomicOrder, comptime failure: std.builtin.AtomicOrder) ?Ptr {
+            const r = self.raw.cmpxchgWeak(expected.raw, new.raw, success, failure) orelse return null;
+            return .{ .raw = r };
+        }
+
+        pub fn cmpxchgStrong(self: *Self, expected: Ptr, new: Ptr, comptime success: std.builtin.AtomicOrder, comptime failure: std.builtin.AtomicOrder) ?Ptr {
+            const r = self.raw.cmpxchgStrong(expected.raw, new.raw, success, failure) orelse return null;
+            return .{ .raw = r };
+        }
+
+        /// Set tag bits; returns the previous value. The pointer is untouched.
+        pub fn fetchOrTag(self: *Self, tag_: usize, comptime order: std.builtin.AtomicOrder) Ptr {
+            std.debug.assert(tag_ & ~Ptr.tag_mask == 0);
+            return .{ .raw = self.raw.fetchOr(tag_, order) };
+        }
+
+        /// Keep only the tag bits set in `tag_`; returns the previous value.
+        pub fn fetchAndTag(self: *Self, tag_: usize, comptime order: std.builtin.AtomicOrder) Ptr {
+            std.debug.assert(tag_ & ~Ptr.tag_mask == 0);
+            return .{ .raw = self.raw.fetchAnd(tag_ | ~Ptr.tag_mask, order) };
+        }
+
+        /// Flip tag bits; returns the previous value.
+        pub fn fetchXorTag(self: *Self, tag_: usize, comptime order: std.builtin.AtomicOrder) Ptr {
+            std.debug.assert(tag_ & ~Ptr.tag_mask == 0);
+            return .{ .raw = self.raw.fetchXor(tag_, order) };
+        }
+    };
+}
+
+test "TaggedPtr and TaggedAtomic keep pointer and tag apart" {
+    const Node = struct { v: u64 };
+    var n1: Node = .{ .v = 1 };
+    var n2: Node = .{ .v = 2 };
+    const P = TaggedPtr(Node);
+    try std.testing.expectEqual(3, P.tag_bits);
+    const a = P.init(&n1, 5);
+    try std.testing.expectEqual(&n1, a.ptr().?);
+    try std.testing.expectEqual(@as(usize, 5), a.tag());
+    try std.testing.expectEqual(&n1, a.withTag(2).ptr().?);
+    try std.testing.expect(P.null_ptr.isNull() and P.null_ptr.withTag(1).isNull());
+    try std.testing.expectEqual(@as(?*Node, null), P.null_ptr.withTag(7).ptr());
+    var at = TaggedAtomic(Node).init(a);
+    try std.testing.expect(at.load(.acquire).eql(a));
+    try std.testing.expect(at.fetchOrTag(2, .acq_rel).eql(a));
+    try std.testing.expectEqual(@as(usize, 7), at.load(.monotonic).tag());
+    _ = at.fetchAndTag(1, .acq_rel);
+    try std.testing.expectEqual(@as(usize, 1), at.load(.monotonic).tag());
+    _ = at.fetchXorTag(3, .acq_rel);
+    try std.testing.expectEqual(@as(usize, 2), at.load(.monotonic).tag());
+    try std.testing.expectEqual(&n1, at.load(.monotonic).ptr().?);
+    // The CAS compares the tag too: a stale tag fails even with the right pointer.
+    try std.testing.expect(at.cmpxchgStrong(P.init(&n1, 0), P.init(&n2, 0), .acq_rel, .acquire) != null);
+    try std.testing.expectEqual(@as(?TaggedPtr(Node), null), at.cmpxchgStrong(P.init(&n1, 2), P.init(&n2, 4), .acq_rel, .acquire));
+    try std.testing.expectEqual(&n2, at.swap(P.null_ptr, .acq_rel).ptr().?);
+    try std.testing.expect(at.load(.monotonic).isNull());
+    // Align-1 types leave no tag bits.
+    try std.testing.expectEqual(0, TaggedPtr(u8).tag_bits);
+}
+
 test "SpinLock gives exact mutual exclusion across real threads" {
     const per_thread: u64 = 50_000;
     const n_threads = 4;

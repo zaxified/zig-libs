@@ -46,10 +46,15 @@ pub const Retired = struct {
 };
 
 pub const Config = struct {
-    /// Fixed upper bound on concurrently-registered threads. A worker pool
-    /// knows its width at construction, so a fixed registry (no growth, no
-    /// lock) is the right storage. Mechanical.
+    /// Participant slots allocated at `init` — the first chunk of the
+    /// registry. With `growable` (the default), a `register` that finds every
+    /// slot taken appends another chunk of this size (lock-free, never
+    /// removed before `deinit`); without it, it fails `TooManyParticipants`.
+    /// A worker pool that knows its width sizes this and never grows.
     max_participants: usize = 128,
+    /// Whether `register` may add chunks of slots past `max_participants`
+    /// (crossbeam's collectors register any number of threads).
+    growable: bool = true,
     /// Limbo entries pre-allocated per bag, per participant, at `init` — the
     /// "bounded reserve" that makes `retire` allocation-free. `retire` runs
     /// pinned and *after* the unlink, so it is the one place in this module
@@ -137,11 +142,24 @@ pub const Participant = struct {
     /// Calls to `Domain.advanceAmortized` since its last `tryAdvance`.
     /// Single-owner plain counter.
     since_advance: u32,
+    /// Open `enterCritical`s on this participant: only the outermost pins
+    /// and only its matching exit unpins (crossbeam's nested guards).
+    /// Single-owner plain counter.
+    pin_depth: u32,
+    /// This slot's position in the registry, chunk after chunk
+    /// (`Domain.slotIndex`). Fixed at the chunk's creation.
+    index: usize,
 
     /// Sentinel `local_epoch` value meaning "not inside a critical section".
     pub const unpinned: u64 = std.math.maxInt(u64);
 
-    fn initInPlace(self: *Participant) void {
+    /// Whether this participant is inside a critical section. From its
+    /// owner thread (the field is the owner's).
+    pub fn isPinned(self: *const Participant) bool {
+        return self.pin_depth != 0;
+    }
+
+    fn initInPlace(self: *Participant, index: usize) void {
         self.local_epoch = .init(unpinned);
         self.in_use = .init(false);
         self.orphaned = .init(false);
@@ -149,6 +167,8 @@ pub const Participant = struct {
         self.bag_epoch = @splat(0);
         self.dropped_retires = 0;
         self.since_advance = 0;
+        self.pin_depth = 0;
+        self.index = index;
     }
 
     fn deinitBags(self: *Participant, allocator: std.mem.Allocator) void {
@@ -156,9 +176,10 @@ pub const Participant = struct {
     }
 };
 
-/// A pin token. Constructed by `enterCritical`, released (unpins) by
-/// `release`. RAII-ish: hold it exactly as long as you hold references into
-/// EBR-managed memory.
+/// A pin token. Constructed by `enterCritical` (or `Domain.pin`), released
+/// (unpins) by `release`. RAII-ish: hold it exactly as long as you hold
+/// references into EBR-managed memory. Guards nest: an inner one's `release`
+/// leaves the participant pinned until the outermost is released.
 pub const Guard = struct {
     domain: *Domain,
     participant: *Participant,
@@ -167,13 +188,69 @@ pub const Guard = struct {
     pub fn release(self: Guard) void {
         self.domain.exitCritical(self.participant);
     }
+
+    /// Re-pin at the current epoch without leaving the critical section, so
+    /// a long-running pinned thread stops holding the epoch back
+    /// (crossbeam's `repin`). Every reference read under this guard is
+    /// INVALID afterwards — exactly as after `release`. Only the outermost
+    /// guard re-pins; under nested guards this does nothing.
+    pub fn repin(self: Guard) void {
+        self.domain.repin(self.participant);
+    }
+
+    /// Unpin, run `f(context)`, pin again (crossbeam's `repin_after`): for a
+    /// blocking call in the middle of a pinned loop. References read before
+    /// are invalid afterwards. Under nested guards `f` runs pinned.
+    pub fn repinAfter(self: Guard, context: anytype, comptime f: anytype) @typeInfo(@TypeOf(f)).@"fn".return_type.? {
+        const p = self.participant;
+        if (p.pin_depth != 1) return f(context);
+        self.domain.exitCritical(p);
+        defer _ = self.domain.enterCritical(p);
+        return f(context);
+    }
+
+    /// Reclaim this participant's expired garbage now and try to advance the
+    /// epoch (crossbeam's `flush`).
+    pub fn flush(self: Guard) void {
+        self.domain.tryAdvance(self.participant);
+    }
+
+    /// Stage `r` for reclamation once no thread can reach it — the caller's
+    /// unlink must come first (`Domain.retire`; crossbeam's `defer_unchecked`).
+    pub fn retire(self: Guard, r: Retired) void {
+        self.domain.retire(self.participant, r);
+    }
 };
 
 pub const RegisterError = error{
-    /// Every participant slot is occupied — `max_participants` too small for
-    /// the actual thread count. Mechanical, not a safety condition.
+    /// Every participant slot is occupied and the registry may not grow
+    /// (`Config.growable = false`) — `max_participants` too small for the
+    /// actual thread count. Mechanical, not a safety condition.
     TooManyParticipants,
+} || std.mem.Allocator.Error;
+
+pub const PinError = RegisterError || error{
+    /// This thread already holds default participants (`Domain.pin`) of
+    /// `max_thread_domains` domains; `unregisterCurrentThread` frees one.
+    TooManyDomainsPerThread,
 };
+
+/// Domains one thread can `pin` through its default participant at once.
+pub const max_thread_domains = 16;
+
+/// A registry chunk appended when the slots before it are all taken.
+const Chunk = struct {
+    slots: []Participant,
+    /// The next chunk; stored once, by the appending CAS.
+    next: std.atomic.Value(?*Chunk),
+};
+
+/// The calling thread's default participants, keyed by `Domain.id` (never
+/// by address: a later domain at a freed one's address must not inherit
+/// its entry). Id 0 is a free entry.
+const ThreadEntry = struct { id: u64 = 0, participant: ?*Participant = null };
+threadlocal var thread_entries: [max_thread_domains]ThreadEntry = @splat(.{});
+var next_domain_id: std.atomic.Value(u64) = .init(1);
 
 /// The reclamation domain: one global epoch + a fixed participant registry.
 /// One `Domain` backs one lock-free structure (or a set that share a
@@ -193,11 +270,36 @@ pub const Domain = struct {
     orphan_count: std.atomic.Value(usize),
     /// `Config.advance_period`.
     advance_period: u32,
+    /// Chunks past `participants`, appended by `register` (see `Chunk`).
+    more: std.atomic.Value(?*Chunk),
+    /// `Config.growable`, `Config.bag_reserve`.
+    growable: bool,
+    bag_reserve: usize,
+    /// Unique for the process's lifetime: keys the per-thread default
+    /// participants (`pin`).
+    id: u64,
 
     pub fn init(allocator: std.mem.Allocator, cfg: Config) std.mem.Allocator.Error!Domain {
-        const parts = try allocator.alloc(Participant, cfg.max_participants);
+        const parts = try allocSlots(allocator, cfg.max_participants, 0, cfg.bag_reserve);
+        return .{
+            .global_epoch = .init(0),
+            .participants = parts,
+            .allocator = allocator,
+            .orphan_count = .init(0),
+            .advance_period = @max(cfg.advance_period, 1),
+            .more = .init(null),
+            .growable = cfg.growable,
+            .bag_reserve = cfg.bag_reserve,
+            .id = next_domain_id.fetchAdd(1, .monotonic),
+        };
+    }
+
+    /// `n` unregistered slots numbered from `first_index`, each with its
+    /// limbo reserve.
+    fn allocSlots(allocator: std.mem.Allocator, n: usize, first_index: usize, bag_reserve: usize) std.mem.Allocator.Error![]Participant {
+        const parts = try allocator.alloc(Participant, n);
         errdefer allocator.free(parts);
-        for (parts) |*p| p.initInPlace();
+        for (parts, first_index..) |*p, i| p.initInPlace(i);
         // Pre-allocate the limbo reserve HERE, where a failure is just an
         // `error.OutOfMemory` out of `init`, so that `retire` — which runs
         // pinned, after the unlink, with no way to hand an error back — has
@@ -206,15 +308,32 @@ pub const Domain = struct {
         // safe. See `Config.bag_reserve` and `retire`.
         errdefer for (parts) |*p| p.deinitBags(allocator);
         for (parts) |*p| {
-            for (&p.bags) |*b| try b.ensureTotalCapacity(allocator, cfg.bag_reserve);
+            for (&p.bags) |*b| try b.ensureTotalCapacity(allocator, bag_reserve);
         }
-        return .{
-            .global_epoch = .init(0),
-            .participants = parts,
-            .allocator = allocator,
-            .orphan_count = .init(0),
-            .advance_period = @max(cfg.advance_period, 1),
-        };
+        return parts;
+    }
+
+    /// Every slot of the registry, chunk after chunk. The links are read
+    /// `.seq_cst`: `tryAdvance`'s scan relies on it (see `register`).
+    const SlotIter = struct {
+        slots: []Participant,
+        i: usize = 0,
+        link: *const std.atomic.Value(?*Chunk),
+
+        fn next(it: *SlotIter) ?*Participant {
+            while (it.i == it.slots.len) {
+                const c = it.link.load(.seq_cst) orelse return null;
+                it.slots = c.slots;
+                it.i = 0;
+                it.link = &c.next;
+            }
+            it.i += 1;
+            return &it.slots[it.i - 1];
+        }
+    };
+
+    fn slotIter(self: *const Domain) SlotIter {
+        return .{ .slots = self.participants, .link = &self.more };
     }
 
     /// Free the registry. Any garbage still sitting in a limbo bag — including
@@ -227,19 +346,32 @@ pub const Domain = struct {
     /// nodes are never reused, never freed twice, and the storage they occupy
     /// is released by the pool's own `deinit`. Call `orphanedSlots()` before
     /// teardown if a consumer wants to assert nothing was left behind.
+    ///
+    /// Threads that used `pin` should `unregisterCurrentThread` first; an
+    /// entry they keep is inert (it names this domain's id, never reused).
     pub fn deinit(self: *Domain) void {
+        for (&thread_entries) |*e| {
+            if (e.id == self.id) e.* = .{};
+        }
         for (self.participants) |*p| p.deinitBags(self.allocator);
         self.allocator.free(self.participants);
+        var c = self.more.load(.monotonic);
+        while (c) |chunk| {
+            c = chunk.next.load(.monotonic);
+            for (chunk.slots) |*p| p.deinitBags(self.allocator);
+            self.allocator.free(chunk.slots);
+            self.allocator.destroy(chunk);
+        }
         self.* = undefined;
     }
 
     /// The registry index of `p`, stable while it is registered: lets a
-    /// structure over this domain keep per-participant state in an array of
-    /// `max_participants` entries. Mechanical.
+    /// structure over this domain keep per-participant state in an array (the
+    /// first chunk's slots are `0..max_participants`, later chunks continue
+    /// the numbering). Mechanical.
     pub fn slotIndex(self: *const Domain, p: *const Participant) usize {
-        const i = (@intFromPtr(p) - @intFromPtr(self.participants.ptr)) / @sizeOf(Participant);
-        std.debug.assert(i < self.participants.len and &self.participants[i] == p);
-        return i;
+        _ = self;
+        return p.index;
     }
 
     /// Read the current global epoch. Mechanical accessor (tests + the core).
@@ -250,14 +382,53 @@ pub const Domain = struct {
     /// Claim a participant slot for the calling thread. Mechanical: a linear
     /// scan + CAS on `in_use`. Returns a stable pointer the caller keeps for
     /// the lifetime of its participation.
+    ///
+    /// When every slot is taken and the registry is `growable`, a chunk of
+    /// `max_participants` new slots is allocated, its first slot claimed
+    /// before anyone can see it, and the chunk appended to the end of the
+    /// chain by a `.seq_cst` CAS on the last link. **Why a scan cannot miss
+    /// a thread that registered in a chunk it did not reach** (the theorem at
+    /// `tryAdvance`, step 2, "misses the pin"): the scan reached the end of
+    /// the chain by a `.seq_cst` load of a link that read null, so that load
+    /// precedes, in S, the CAS that later stored the chunk there; every
+    /// thread registered in that chunk read the link (or is the appender)
+    /// before its pin store. So scan <S P_T — the same order the theorem
+    /// derives from a missed slot, and it reaches the same contradiction.
     pub fn register(self: *Domain) RegisterError!*Participant {
-        for (self.participants) |*p| {
+        var it = self.slotIter();
+        while (it.next()) |p| {
             if (p.in_use.cmpxchgStrong(false, true, .acquire, .monotonic) == null) {
                 p.local_epoch.store(Participant.unpinned, .release);
                 return p;
             }
         }
-        return RegisterError.TooManyParticipants;
+        if (!self.growable) return RegisterError.TooManyParticipants;
+        return self.appendChunk();
+    }
+
+    fn appendChunk(self: *Domain) RegisterError!*Participant {
+        const n = self.participants.len;
+        const chunk = try self.allocator.create(Chunk);
+        errdefer self.allocator.destroy(chunk);
+        // Index the slots after the last chunk's; fixed below once the
+        // chunk's place in the chain is known.
+        const slots = try allocSlots(self.allocator, @max(n, 1), 0, self.bag_reserve);
+        chunk.* = .{ .slots = slots, .next = .init(null) };
+        const mine = &slots[0];
+        mine.in_use = .init(true);
+        var link: *std.atomic.Value(?*Chunk) = &self.more;
+        var first_index = n;
+        while (true) {
+            if (link.load(.seq_cst)) |c| {
+                first_index += c.slots.len;
+                link = &c.next;
+                continue;
+            }
+            for (slots, first_index..) |*p, i| p.index = i;
+            // Release (⊂ seq_cst) publishes the slots' initial state to a
+            // scanner that loads this link.
+            if (link.cmpxchgStrong(null, chunk, .seq_cst, .seq_cst) == null) return mine;
+        }
     }
 
     /// Upper bound on the `tryAdvance` attempts `unregister` makes before it
@@ -307,6 +478,7 @@ pub const Domain = struct {
     /// draining thread, only the epoch it observed, and `adoptOrphans` re-reads
     /// the epoch after acquiring the slot (see there).
     pub fn unregister(self: *Domain, p: *Participant) void {
+        std.debug.assert(p.pin_depth == 0);
         std.debug.assert(p.local_epoch.load(.monotonic) == Participant.unpinned);
         var attempts: usize = 0;
         while (remainingGarbage(p) != 0 and attempts < max_unregister_advances) : (attempts += 1) {
@@ -353,7 +525,8 @@ pub const Domain = struct {
     ///     order.)
     fn adoptOrphans(self: *Domain) void {
         if (self.orphan_count.load(.monotonic) == 0) return;
-        for (self.participants) |*q| {
+        var it = self.slotIter();
+        while (it.next()) |q| {
             if (!q.orphaned.load(.monotonic)) continue;
             if (q.orphaned.cmpxchgStrong(true, false, .acquire, .monotonic) != null) continue;
             // Exclusive owner of q's bags from here.
@@ -424,12 +597,34 @@ pub const Domain = struct {
     /// makes us a straggler that conservatively blocks the next advance; the
     /// proof at `tryAdvance` never assumes the pin equals the current epoch.
     /// Hence no publish-revalidate loop is needed.
+    ///
+    /// **Nesting.** An `enterCritical` while already pinned only counts
+    /// (`pin_depth`): the participant stays pinned at the outer pin's epoch,
+    /// which covers every reference the inner section reads — the theorem
+    /// bounds reference-holders by their pin store, and the outer one
+    /// precedes every load of the inner section.
     pub fn enterCritical(self: *Domain, p: *Participant) Guard {
-        // Single-owner discipline: no nested pins on one participant.
-        std.debug.assert(p.local_epoch.load(.monotonic) == Participant.unpinned);
-        const e = self.global_epoch.load(.seq_cst);
-        p.local_epoch.store(e, .seq_cst);
+        p.pin_depth += 1;
+        if (p.pin_depth == 1) {
+            std.debug.assert(p.local_epoch.load(.monotonic) == Participant.unpinned);
+            const e = self.global_epoch.load(.seq_cst);
+            p.local_epoch.store(e, .seq_cst);
+        }
         return .{ .domain = self, .participant = p };
+    }
+
+    /// Outermost pin only: move the pin to the current epoch (`Guard.repin`).
+    /// The same seq_cst load + seq_cst store as `enterCritical`. The store
+    /// replaces the old pin in one step; as a release store it also ends the
+    /// old section for a scanner that reads it (the theorem's "post-P_T
+    /// value" case — the caller has dropped its references, as after an
+    /// unpin), and as a seq_cst store it is the new section's pin.
+    pub fn repin(self: *Domain, p: *Participant) void {
+        std.debug.assert(p.pin_depth != 0);
+        if (p.pin_depth != 1) return;
+        const e = self.global_epoch.load(.seq_cst);
+        if (p.local_epoch.load(.monotonic) == e) return;
+        p.local_epoch.store(e, .seq_cst);
     }
 
     /// Unpin: leave a critical section.
@@ -448,8 +643,45 @@ pub const Domain = struct {
     /// briefly), never toward freeing early. Conservative direction = safe.
     pub fn exitCritical(self: *Domain, p: *Participant) void {
         _ = self;
+        std.debug.assert(p.pin_depth != 0);
+        p.pin_depth -= 1;
+        if (p.pin_depth != 0) return;
         std.debug.assert(p.local_epoch.load(.monotonic) != Participant.unpinned);
         p.local_epoch.store(Participant.unpinned, .release);
+    }
+
+    /// Pin through this thread's default participant, registering one on the
+    /// thread's first call (crossbeam's `Collector::register` + `pin` behind
+    /// a thread-local handle). Up to `max_thread_domains` domains per thread;
+    /// `unregisterCurrentThread` releases the participant (Zig has no
+    /// thread-exit hook, so this is explicit).
+    pub fn pin(self: *Domain) PinError!Guard {
+        return self.enterCritical(try self.currentParticipant());
+    }
+
+    /// This thread's default participant (see `pin`), registered on first use.
+    pub fn currentParticipant(self: *Domain) PinError!*Participant {
+        for (&thread_entries) |*e| {
+            if (e.id == self.id) return e.participant.?;
+        }
+        const free = for (&thread_entries) |*e| {
+            if (e.id == 0) break e;
+        } else return error.TooManyDomainsPerThread;
+        const p = try self.register();
+        free.* = .{ .id = self.id, .participant = p };
+        return p;
+    }
+
+    /// Release the calling thread's default participant, if it has one. The
+    /// thread must not be pinned through it.
+    pub fn unregisterCurrentThread(self: *Domain) void {
+        for (&thread_entries) |*e| {
+            if (e.id == self.id) {
+                self.unregister(e.participant.?);
+                e.* = .{};
+                return;
+            }
+        }
     }
 
     /// Retire a node: stage `r` into this participant's limbo bag for the
@@ -526,7 +758,8 @@ pub const Domain = struct {
     /// `NodePool.verifyQuiescent`), not from a racing thread.
     pub fn droppedRetires(self: *const Domain) usize {
         var n: usize = 0;
-        for (self.participants) |*p| n += p.dropped_retires;
+        var it = self.slotIter();
+        while (it.next()) |p| n += p.dropped_retires;
         return n;
     }
 
@@ -608,7 +841,8 @@ pub const Domain = struct {
         // deliberately not gated on `in_use` (see the field's doc comment):
         // unregistered slots read `unpinned` and pass; a mid-registration
         // slot that has already pinned MUST be counted, and is.
-        for (self.participants) |*q| {
+        var it = self.slotIter();
+        while (it.next()) |q| {
             const le = q.local_epoch.load(.seq_cst);
             if (le != Participant.unpinned and le != e) return;
         }
@@ -665,7 +899,7 @@ test "domain init/deinit with an empty registry" {
 }
 
 test "register hands out distinct slots and unregister frees them for reuse" {
-    var d = try Domain.init(testing.allocator, .{ .max_participants = 2 });
+    var d = try Domain.init(testing.allocator, .{ .max_participants = 2, .growable = false });
     defer d.deinit();
 
     const a = try d.register();
@@ -969,4 +1203,191 @@ test "slotIndex is the registry position" {
     try testing.expectEqual(@as(usize, 1), d.slotIndex(b));
     d.unregister(a);
     d.unregister(b);
+}
+
+// ── crossbeam parity: growth, nesting, repin, the per-thread default ────────
+
+test "a growable registry appends chunks past max_participants, numbered on, and reuses freed slots first" {
+    var d = try Domain.init(testing.allocator, .{ .max_participants = 2 });
+    defer d.deinit();
+    var ps: [7]*Participant = undefined;
+    for (&ps, 0..) |*p, i| {
+        p.* = try d.register();
+        try testing.expectEqual(i, d.slotIndex(p.*));
+    }
+    // A slot in a later chunk counts in the advance predicate like any other.
+    _ = d.enterCritical(ps[6]);
+    const e = d.epoch();
+    d.tryAdvance(ps[0]); // ps[6] pinned at e: one advance is allowed
+    d.tryAdvance(ps[0]); // now ps[6] lags: blocked
+    try testing.expectEqual(e + 1, d.epoch());
+    d.exitCritical(ps[6]);
+    d.tryAdvance(ps[0]);
+    try testing.expectEqual(e + 2, d.epoch());
+    d.unregister(ps[3]);
+    try testing.expectEqual(ps[3], try d.register());
+    for (ps) |p| d.unregister(p);
+}
+
+test "nested pins: only the outermost pins and only its exit unpins" {
+    var d = try Domain.init(testing.allocator, .{ .max_participants = 2 });
+    defer d.deinit();
+    const p = try d.register();
+    defer d.unregister(p);
+    const other = try d.register();
+    defer d.unregister(other);
+    try testing.expect(!p.isPinned());
+    const outer = d.enterCritical(p);
+    const pinned_at = p.local_epoch.load(.monotonic);
+    const inner = d.enterCritical(p);
+    try testing.expectEqual(pinned_at, p.local_epoch.load(.monotonic));
+    d.tryAdvance(other);
+    d.tryAdvance(other); // blocked by p's pin
+    inner.release();
+    try testing.expect(p.isPinned());
+    try testing.expectEqual(pinned_at, p.local_epoch.load(.monotonic));
+    try testing.expectEqual(pinned_at + 1, d.epoch());
+    outer.release();
+    try testing.expect(!p.isPinned());
+    try testing.expectEqual(Participant.unpinned, p.local_epoch.load(.monotonic));
+    d.tryAdvance(other);
+    try testing.expectEqual(pinned_at + 2, d.epoch());
+}
+
+test "repin moves the pin to the current epoch; repinAfter unpins around the call; both skip nested guards" {
+    var d = try Domain.init(testing.allocator, .{ .max_participants = 2 });
+    defer d.deinit();
+    const p = try d.register();
+    defer d.unregister(p);
+    const other = try d.register();
+    defer d.unregister(other);
+    const g = d.enterCritical(p);
+    d.tryAdvance(other);
+    d.tryAdvance(other); // blocked: p lags
+    const e = d.epoch();
+    try testing.expect(p.local_epoch.load(.monotonic) < e);
+    g.repin();
+    try testing.expectEqual(e, p.local_epoch.load(.monotonic));
+    d.tryAdvance(other);
+    try testing.expectEqual(e + 1, d.epoch());
+    // Nested: repin is a no-op, the pin stays.
+    const inner = d.enterCritical(p);
+    inner.repin();
+    try testing.expectEqual(e, p.local_epoch.load(.monotonic));
+    const Probe = struct {
+        fn seen(q: *Participant) u64 {
+            return q.local_epoch.load(.monotonic);
+        }
+    };
+    try testing.expectEqual(e, inner.repinAfter(p, Probe.seen));
+    inner.release();
+    // Outermost: unpinned while the callback runs, pinned again after.
+    try testing.expectEqual(Participant.unpinned, g.repinAfter(p, Probe.seen));
+    try testing.expect(p.isPinned());
+    try testing.expectEqual(d.epoch(), p.local_epoch.load(.monotonic));
+    g.release();
+}
+
+test "flush reclaims expired garbage through the guard" {
+    var d = try Domain.init(testing.allocator, .{ .max_participants = 1 });
+    defer d.deinit();
+    const p = try d.register();
+    defer d.unregister(p);
+    var freed: usize = 0;
+    var dummy: u8 = 0;
+    {
+        const g = d.enterCritical(p);
+        g.retire(.{ .ptr = &dummy, .ctx = &freed, .reclaim = countingReclaim });
+        g.release();
+    }
+    const g = d.enterCritical(p);
+    g.flush();
+    g.repin();
+    g.flush();
+    g.repin();
+    g.flush();
+    g.release();
+    try testing.expectEqual(@as(usize, 1), freed);
+}
+
+test "pin uses one default participant per thread and domain; unregisterCurrentThread releases it" {
+    var a = try Domain.init(testing.allocator, .{ .max_participants = 1, .growable = false });
+    defer a.deinit();
+    var b = try Domain.init(testing.allocator, .{ .max_participants = 1 });
+    defer b.deinit();
+    const ga = try a.pin();
+    const gb = try b.pin();
+    try testing.expect(ga.participant != gb.participant);
+    const ga2 = try a.pin(); // same thread, same domain: the same participant, nested
+    try testing.expectEqual(ga.participant, ga2.participant);
+    ga2.release();
+    ga.release();
+    gb.release();
+    // Another thread gets its own participant: with a fixed one-slot
+    // registry it cannot, until this thread lets go.
+    const T = struct {
+        fn run(d: *Domain, out: *?PinError) void {
+            if (d.pin()) |g| {
+                g.release();
+                d.unregisterCurrentThread();
+                out.* = null;
+            } else |err| out.* = err;
+        }
+    };
+    var res: ?PinError = null;
+    var t = try std.Thread.spawn(.{}, T.run, .{ &a, &res });
+    t.join();
+    try testing.expectEqual(@as(?PinError, error.TooManyParticipants), res);
+    a.unregisterCurrentThread();
+    t = try std.Thread.spawn(.{}, T.run, .{ &a, &res });
+    t.join();
+    try testing.expectEqual(@as(?PinError, null), res);
+    b.unregisterCurrentThread();
+}
+
+test "a thread's default entries are keyed by domain id: a new domain never inherits a dead one's" {
+    var first = try Domain.init(testing.allocator, .{ .max_participants = 1 });
+    const g = try first.pin();
+    g.release();
+    const old_id = first.id;
+    first.deinit(); // clears this thread's entry
+    var second = try Domain.init(testing.allocator, .{ .max_participants = 1 });
+    defer second.deinit();
+    try testing.expect(second.id != old_id);
+    const p = try second.currentParticipant();
+    try testing.expectEqual(&second.participants[0], p);
+    second.unregisterCurrentThread();
+}
+
+test "pin refuses past max_thread_domains domains on one thread" {
+    var ds: [max_thread_domains + 1]Domain = undefined;
+    for (&ds) |*d| d.* = try Domain.init(testing.allocator, .{ .max_participants = 1, .bag_reserve = 0 });
+    defer for (&ds) |*d| d.deinit();
+    for (ds[0..max_thread_domains]) |*d| (try d.pin()).release();
+    try testing.expectError(error.TooManyDomainsPerThread, ds[max_thread_domains].pin());
+    ds[0].unregisterCurrentThread();
+    (try ds[max_thread_domains].pin()).release();
+    for (ds[1..]) |*d| d.unregisterCurrentThread();
+}
+
+test "an orphaned slot in a later chunk is adopted and drained like one in the first" {
+    var d = try Domain.init(testing.allocator, .{ .max_participants = 1 });
+    defer d.deinit();
+    const a = try d.register();
+    defer d.unregister(a);
+    const b = try d.register(); // in the appended chunk
+    try testing.expectEqual(@as(usize, 1), d.slotIndex(b));
+    var freed: usize = 0;
+    var dummy: u8 = 0;
+    const ga = d.enterCritical(a); // holds the epoch back
+    const gb = d.enterCritical(b);
+    gb.retire(.{ .ptr = &dummy, .ctx = &freed, .reclaim = countingReclaim });
+    gb.release();
+    d.unregister(b); // cannot drain past a's pin: orphaned
+    try testing.expectEqual(@as(usize, 1), d.orphanedSlots());
+    ga.release();
+    for (0..4) |_| d.tryAdvance(a);
+    try testing.expectEqual(@as(usize, 0), d.orphanedSlots());
+    try testing.expectEqual(@as(usize, 1), freed);
+    try testing.expect(!b.in_use.load(.monotonic));
 }

@@ -57,6 +57,8 @@ pub const Atomic = atomic.Atomic;
 pub const Backoff = atomic.Backoff;
 pub const SpinLock = atomic.SpinLock;
 pub const CachePadded = atomic.CachePadded;
+pub const TaggedPtr = atomic.TaggedPtr;
+pub const TaggedAtomic = atomic.TaggedAtomic;
 pub const cache_line = atomic.cache_line;
 
 const pool = @import("pool.zig");
@@ -69,6 +71,9 @@ pub const Participant = ebr.Participant;
 pub const Guard = ebr.Guard;
 pub const Retired = ebr.Retired;
 pub const Config = ebr.Config;
+pub const RegisterError = ebr.RegisterError;
+pub const PinError = ebr.PinError;
+pub const max_thread_domains = ebr.max_thread_domains;
 
 const mpmc = @import("mpmc.zig");
 pub const Queue = mpmc.Queue;
