@@ -149,9 +149,14 @@ fn DecoderOf(comptime Sink: type) type {
         // Current decoding cursors.
         context_map_slice: []u8 = &.{},
         literal_htree: *const Table = undefined,
+        /// `literal_htree.entries.ptr` (and `command_entries` below): what
+        /// `hotCommands` decodes with — one load less per symbol than through
+        /// the `Table`, every root being `root_bits` wide.
+        literal_entries: [*]const huffman.Entry = undefined,
         context_lookup: []const u8 = &.{},
         trivial_literal_context: bool = false,
         htree_command: *const Table = undefined,
+        command_entries: [*]const huffman.Entry = undefined,
         dist_context_map_slice: []u8 = &.{},
         dist_htree_index: u32 = 0,
         last_distance_context: u32 = 0,
@@ -471,6 +476,7 @@ fn DecoderOf(comptime Sink: type) type {
             self.context_map_slice = self.context_map[block_type * 64 ..][0..64];
             self.trivial_literal_context = self.trivial_literal[block_type];
             self.literal_htree = &self.literal_group[self.context_map_slice[0]];
+            self.literal_entries = self.literal_htree.entries.ptr;
             const mode = self.context_modes[block_type] & 3;
             self.context_lookup = tables.context_lookup[@as(usize, mode) * 512 ..][0..512];
         }
@@ -582,6 +588,7 @@ fn DecoderOf(comptime Sink: type) type {
             self.prepareLiteralDecoding();
             self.dist_context_map_slice = self.dist_context_map[0..];
             self.htree_command = &self.command_group[0];
+            self.command_entries = self.htree_command.entries.ptr;
             try self.calculateDistanceLut(dist_alphabet_size);
 
             self.out.hint(@intCast(mlen));
@@ -643,10 +650,11 @@ fn DecoderOf(comptime Sink: type) type {
                     try self.decodeBlockTypeAndLength(1);
                     h = HotBits.load(self.br);
                     self.htree_command = &self.command_group[self.block_type_rb[1][1]];
+                    self.command_entries = self.htree_command.entries.ptr;
                 }
                 if (!h.hasMargin()) return .slow;
                 h.top();
-                const cmd = h.symbol(self.htree_command);
+                const cmd = h.symbol(self.command_entries);
                 self.block_length[1] -= 1;
                 if (cmd >= tables.num_command_symbols) return error.InvalidHuffman;
                 const v = tables.cmd_lut[cmd];
@@ -665,19 +673,57 @@ fn DecoderOf(comptime Sink: type) type {
                             h = HotBits.load(self.br);
                             self.prepareLiteralDecoding();
                         }
+                        if ((comptime @hasDecl(Sink, "tailPtr")) and insert_len - done >= fast_literals_min) {
+                            // As google/brotli's literal loop (`decode.c`,
+                            // `BrotliCopyPreloadedSymbolsToU8`): the literals that
+                            // need no check — within the insert and the block, and
+                            // what the input holds at 15 bits each with a refill's
+                            // margin — in a loop of their own, writing through a
+                            // local pointer with the tables and the two context
+                            // bytes in locals. Through `self.out` every byte stored
+                            // made the compiler load `self`'s fields again.
+                            // At most 15 bits a literal: half a literal a byte is
+                            // below that, and a shift.
+                            const by_input = ((h.len - h.pos) -| hot_margin) / 2;
+                            const n: u32 = @intCast(@min(insert_len - done, self.block_length[0], by_input));
+                            if (n != 0) {
+                                const dst = self.out.tailPtr();
+                                if (self.trivial_literal_context) {
+                                    const t = self.literal_entries;
+                                    for (dst[0..n]) |*o| o.* = @intCast(h.symbol(t));
+                                } else {
+                                    const len = self.out.pos();
+                                    var p1: u8 = if (len >= 1) self.out.back(1) else 0;
+                                    var p2: u8 = if (len >= 2) self.out.back(2) else 0;
+                                    const lut = self.context_lookup[0..512];
+                                    const map = self.context_map_slice[0..64];
+                                    const group = self.literal_group;
+                                    for (dst[0..n]) |*o| {
+                                        const b: u8 = @intCast(h.symbol(group[map[lut[p1] | lut[256 + @as(usize, p2)]]].entries.ptr));
+                                        o.* = b;
+                                        p2 = p1;
+                                        p1 = b;
+                                    }
+                                }
+                                self.out.advance(n);
+                                self.block_length[0] -= n;
+                                done += n - 1; // the loop adds the last one
+                                continue;
+                            }
+                        }
                         if (h.cnt < 15) {
                             if (!h.canRefill()) break;
                             h.refill();
                         }
                         var lit: u16 = undefined;
                         if (self.trivial_literal_context) {
-                            lit = h.symbol(self.literal_htree);
+                            lit = h.symbol(self.literal_entries);
                         } else {
                             const len = self.out.pos();
                             const p1: u8 = if (len >= 1) self.out.back(1) else 0;
                             const p2: u8 = if (len >= 2) self.out.back(2) else 0;
                             const context = self.context_lookup[p1] | self.context_lookup[256 + @as(usize, p2)];
-                            lit = h.symbol(&self.literal_group[self.context_map_slice[context]]);
+                            lit = h.symbol(self.literal_group[self.context_map_slice[context]].entries.ptr);
                         }
                         try self.out.put(@intCast(lit));
                         self.block_length[0] -= 1;
@@ -721,7 +767,7 @@ fn DecoderOf(comptime Sink: type) type {
                         return .again;
                     }
                     h.top();
-                    const code = h.symbol(&self.distance_group[self.dist_htree_index]);
+                    const code = h.symbol(self.distance_group[self.dist_htree_index].entries.ptr);
                     self.block_length[2] -= 1;
                     self.last_distance_context = 0;
                     if ((code & ~@as(u16, 0xf)) == 0) {
@@ -778,6 +824,7 @@ fn DecoderOf(comptime Sink: type) type {
                 if (self.block_length[1] == 0) {
                     try self.decodeBlockTypeAndLength(1);
                     self.htree_command = &self.command_group[self.block_type_rb[1][1]];
+                    self.command_entries = self.htree_command.entries.ptr;
                 }
                 const cmd = try self.br.readSymbol(self.htree_command);
                 self.block_length[1] -= 1;
@@ -1216,6 +1263,11 @@ fn inverseMoveToFront(v: []u8) void {
 /// distance: two refills of up to eight bytes each.
 const hot_margin = 16;
 
+/// Literals left in an insert from which `hotCommands` takes them in a loop
+/// without checks: on text most inserts are a literal or two, where
+/// setting that loop up cost 3 % (2026-10-15).
+const fast_literals_min = 8;
+
 /// The bit reader's state in locals for `hotCommands` (same invariants as
 /// `BitReader`: bits above `cnt` are zero). It never fetches a chunk: the
 /// caller checks the margin (`hasMargin`, `canRefill`) before reads that may
@@ -1266,14 +1318,15 @@ const HotBits = struct {
 
     /// A symbol (codes are at most 15 bits). Precondition: 15 bits held,
     /// or `canRefill`.
-    inline fn symbol(h: *HotBits, table: *const huffman.Table) u16 {
+    inline fn symbol(h: *HotBits, entries: [*]const huffman.Entry) u16 {
         if (h.cnt < 15) h.refill();
-        const idx: usize = @truncate(h.acc & ((@as(u64, 1) << @intCast(table.bits)) - 1));
-        var e = table.entries[idx];
+        // Every root is `root_bits` wide: a constant mask.
+        const idx: usize = @truncate(h.acc & ((1 << huffman.root_bits) - 1));
+        var e = entries[idx];
         if (e.len & huffman.link_flag != 0) {
             const sub_bits: u6 = @intCast(e.len & ~huffman.link_flag);
-            const sub: usize = @truncate((h.acc >> @intCast(table.bits)) & ((@as(u64, 1) << sub_bits) - 1));
-            e = table.entries[@as(usize, e.sym) + sub];
+            const sub: usize = @truncate((h.acc >> huffman.root_bits) & ((@as(u64, 1) << sub_bits) - 1));
+            e = entries[@as(usize, e.sym) + sub];
         }
         h.acc >>= @intCast(e.len);
         h.cnt -= e.len;
@@ -1331,6 +1384,13 @@ const ListSink = struct {
     }
     fn reserveStored(s: *ListSink, n: usize, br: *const BitReader) BrotliError!void {
         return s.reserve(n, br);
+    }
+    /// As `SliceSink.tailPtr`: within the capacity `reserve` made.
+    inline fn tailPtr(s: *ListSink) [*]u8 {
+        return s.list.items.ptr + s.list.items.len;
+    }
+    inline fn advance(s: *ListSink, n: usize) void {
+        s.list.items.len += n;
     }
     inline fn put(s: *ListSink, b: u8) BrotliError!void {
         s.list.appendAssumeCapacity(b);
@@ -1415,6 +1475,14 @@ const SliceSink = struct {
     }
     fn reserveStored(s: *SliceSink, n: usize, br: *const BitReader) BrotliError!void {
         return s.reserve(n, br);
+    }
+    /// Where the next output byte goes: a run of literals `reserve` made
+    /// room for is written there, then `advance`d over.
+    inline fn tailPtr(s: *SliceSink) [*]u8 {
+        return s.buf.ptr + s.len;
+    }
+    inline fn advance(s: *SliceSink, n: usize) void {
+        s.len += n;
     }
     inline fn put(s: *SliceSink, b: u8) BrotliError!void {
         s.buf[s.len] = b;

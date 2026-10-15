@@ -4,9 +4,11 @@
 //! Codes are read least-significant-bit first, so the canonical (MSB-first)
 //! code assigned to each symbol is bit-reversed before being placed into a
 //! lookup table. Two levels, as in zlib and google/brotli: a root table of
-//! `1 << bits` entries (`bits` ≤ `root_bits`) holds every code up to that
-//! length; a longer code's root entry links to a subtable indexed by the bits
-//! after the root. A flat table of `1 << 15` entries (128 KiB) per literal
+//! `1 << root_bits` entries holds every code up to that length, a shorter one
+//! repeated; a longer code's root entry links to a subtable indexed by the bits
+//! after the root. The root is always `root_bits` wide (as google/brotli's), so
+//! a decoder masks with a constant (2026-10-15: `bits` was `min(max length,
+//! root_bits)`, a load and a variable mask per symbol). A flat table of `1 << 15` entries (128 KiB) per literal
 //! tree missed the cache on most lookups (bench 2026-10-11). Decoding peeks
 //! `bits` bits, indexes the root, follows a link once, and drops the entry's
 //! actual code length.
@@ -26,7 +28,7 @@ pub const root_bits = 8;
 
 pub const Table = struct {
     entries: []Entry,
-    bits: u5, // root index width: min(max code length, root_bits); 0 for a single-symbol code
+    bits: u5, // root index width: always `root_bits`
 
     pub fn deinit(self: *Table, gpa: std.mem.Allocator) void {
         gpa.free(self.entries);
@@ -48,9 +50,15 @@ pub fn symbolBits(x: u32) u5 {
 }
 
 fn singleSymbol(gpa: std.mem.Allocator, sym: u16) BrotliError!Table {
-    const entries = try gpa.alloc(Entry, 1);
-    entries[0] = .{ .sym = sym, .len = 0 };
-    return .{ .entries = entries, .bits = 0 };
+    return replicated(gpa, &.{.{ .sym = sym, .len = 0 }});
+}
+
+/// A root of `root_bits` from a full table of `small.len` (a power of two
+/// up to `1 << root_bits`) entries: each repeated.
+fn replicated(gpa: std.mem.Allocator, small: []const Entry) BrotliError!Table {
+    const entries = try gpa.alloc(Entry, 1 << root_bits);
+    for (entries, 0..) |*e, i| e.* = small[i & (small.len - 1)];
+    return .{ .entries = entries, .bits = root_bits };
 }
 
 /// Build a table from per-symbol `code_lengths` (complex prefix code, 3.5).
@@ -87,7 +95,7 @@ pub fn buildComplex(gpa: std.mem.Allocator, code_lengths: []const u8) BrotliErro
         next_code[len] = code;
     }
 
-    const root: u5 = @min(max_len, root_bits);
+    const root: u5 = root_bits;
     const root_size = @as(usize, 1) << root;
 
     // Subtables: a code longer than `root` belongs to the one of its first
@@ -150,32 +158,32 @@ pub fn buildSimple(gpa: std.mem.Allocator, num_symbols: u8, vals_in: []const u16
     switch (num_symbols) {
         0 => return singleSymbol(gpa, v[0]),
         1 => {
-            const entries = try gpa.alloc(Entry, 2);
+            var entries: [2]Entry = undefined;
             const a = @min(v[0], v[1]);
             const b = @max(v[0], v[1]);
             entries[0] = .{ .sym = a, .len = 1 };
             entries[1] = .{ .sym = b, .len = 1 };
-            return .{ .entries = entries, .bits = 1 };
+            return replicated(gpa, &entries);
         },
         2 => {
-            const entries = try gpa.alloc(Entry, 4);
+            var entries: [4]Entry = undefined;
             const lo = @min(v[1], v[2]);
             const hi = @max(v[1], v[2]);
             entries[0] = .{ .sym = v[0], .len = 1 };
             entries[2] = .{ .sym = v[0], .len = 1 };
             entries[1] = .{ .sym = lo, .len = 2 };
             entries[3] = .{ .sym = hi, .len = 2 };
-            return .{ .entries = entries, .bits = 2 };
+            return replicated(gpa, &entries);
         },
         3 => {
             // 4 symbols, all length 2. Sort ascending.
             sort4(&v);
-            const entries = try gpa.alloc(Entry, 4);
+            var entries: [4]Entry = undefined;
             entries[0] = .{ .sym = v[0], .len = 2 };
             entries[2] = .{ .sym = v[1], .len = 2 };
             entries[1] = .{ .sym = v[2], .len = 2 };
             entries[3] = .{ .sym = v[3], .len = 2 };
-            return .{ .entries = entries, .bits = 2 };
+            return replicated(gpa, &entries);
         },
         4 => {
             // 4 symbols, lengths [1,2,3,3]; swap v[2],v[3] if out of order.
@@ -184,7 +192,7 @@ pub fn buildSimple(gpa: std.mem.Allocator, num_symbols: u8, vals_in: []const u16
                 v[3] = v[2];
                 v[2] = t;
             }
-            const entries = try gpa.alloc(Entry, 8);
+            var entries: [8]Entry = undefined;
             entries[0] = .{ .sym = v[0], .len = 1 };
             entries[1] = .{ .sym = v[1], .len = 2 };
             entries[2] = .{ .sym = v[0], .len = 1 };
@@ -193,7 +201,7 @@ pub fn buildSimple(gpa: std.mem.Allocator, num_symbols: u8, vals_in: []const u16
             entries[5] = .{ .sym = v[1], .len = 2 };
             entries[6] = .{ .sym = v[0], .len = 1 };
             entries[7] = .{ .sym = v[3], .len = 3 };
-            return .{ .entries = entries, .bits = 3 };
+            return replicated(gpa, &entries);
         },
         else => return error.InvalidHuffman,
     }
