@@ -537,22 +537,26 @@ test "a history past 16 MiB: the slots lose their tags, a copy from before is st
     prng.random().bytes(input[0..block]);
     @memset(input[block..][0..gap], 0);
     @memcpy(input[block + gap ..], input[0..block]);
-    const want = try encoder.compressWith(gpa, input, .{ .effort = .q6, .window_bits = 25 });
-    defer gpa.free(want);
-    var out: Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var buf: [4096]u8 = undefined;
-    var sw: StreamWriter = try .init(gpa, &out.writer, &buf, .{ .effort = .q6, .window_bits = 25, .size_hint = input.len });
-    defer sw.deinit();
-    try testing.expect(sw.core.matcher.deep.tag_mask != 0);
-    try writeStream(&sw, input, 1 << 20, &.{});
-    try testing.expectEqual(@as(u32, 0), sw.core.matcher.deep.tag_mask);
-    try testing.expectEqualSlices(u8, want, out.written());
-    // One copy of the random block, not two.
-    try testing.expect(out.written().len < block + block / 2);
-    const back = try decoder.decompress(gpa, out.written(), .{ .large_window = true, .max_output = 1 << 26 });
-    defer gpa.free(back);
-    try testing.expectEqualSlices(u8, input, back);
+    // `.q9` keeps tags in the slots' top bits and drops them past 16 MiB;
+    // `.q6` keeps them in bytes of their own (`Matcher.tags`).
+    for ([_]encoder.Effort{ .q6, .q9 }) |effort| {
+        const want = try encoder.compressWith(gpa, input, .{ .effort = effort, .window_bits = 25 });
+        defer gpa.free(want);
+        var out: Writer.Allocating = .init(gpa);
+        defer out.deinit();
+        var buf: [4096]u8 = undefined;
+        var sw: StreamWriter = try .init(gpa, &out.writer, &buf, .{ .effort = effort, .window_bits = 25, .size_hint = input.len });
+        defer sw.deinit();
+        if (effort == .q9) try testing.expect(sw.core.matcher.deep.tag_mask != 0);
+        try writeStream(&sw, input, 1 << 20, &.{});
+        try testing.expectEqual(@as(u32, 0), sw.core.matcher.deep.tag_mask);
+        try testing.expectEqualSlices(u8, want, out.written());
+        // One copy of the random block, not two.
+        try testing.expect(out.written().len < block + block / 2);
+        const back = try decoder.decompress(gpa, out.written(), .{ .large_window = true, .max_output = 1 << 26 });
+        defer gpa.free(back);
+        try testing.expectEqualSlices(u8, input, back);
+    }
 }
 
 test "size_hint: a table for the input, and compressWith's bytes for a short one too" {

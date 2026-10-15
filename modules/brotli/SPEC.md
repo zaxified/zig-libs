@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-09-30 (230,000 runs clean, ~32% decoded reach) · ct n/a — compression only (keyword review, 2026-10-07)
 
-**Performance:** ref 0.43–1.15× google/brotli 1.2.0 (C, one-shot) · fastest ? (measured 2026-10-15)
+**Performance:** ref 0.28–1.53× google/brotli 1.2.0 (C, one-shot; over 1.1×: `.q0` text/html, decoder text 1.14×, `.q6` html 1.10×) · fastest ? (measured 2026-10-15)
 
 **Known defects:** none recorded
 
@@ -31,7 +31,7 @@ Surveyed 2026-10-14 per `SURVEY-PLAYBOOK.md` (first 2026-09-30); stars and activ
 | [akunaakwei/zig-brotli](https://github.com/akunaakwei/zig-brotli) / [Scythe-Technology/zbrotli](https://github.com/Scythe-Technology/zbrotli) | Zig (wrap C) | zlib / MIT | 1 / 0 | pushed 2026-04-18 / 2026-06-05 | Build-system wrappers or bindings for google/brotli's C — full features, but link C. |
 | Zig `std.compress` | Zig | MIT | — | Zig 0.16.0 | `flate`, `lzma`, `lzma2`, `xz`, `zstd`; **no brotli** (verified: `lib/std/compress/` listing, 2026-10-14). |
 
-**Where we are ahead:** pure Zig with no C, unlike the wrappers; typed errors with an output cap and a ratio bound on by default (google/brotli added an output limit to its Python binding only in 1.2.0); a decoder whose one-shot, into-buffer and streaming forms are checked against each other by a differential fuzz driver and scored by mutation; encoder streams verified by the reference decoder over 45 shapes; `.default` beats q5 on text (51 467 vs 52 809 B). **Where we are behind:** no `mode` parameter; no block splitting, NPOSTFIX/NDIRECT or OMIT_FIRST dictionary words; `.max` is 1 % behind q11 on text, further on very small inputs (→ Backlog).
+**Where we are ahead:** pure Zig with no C, unlike the wrappers; typed errors with an output cap and a ratio bound on by default (google/brotli added an output limit to its Python binding only in 1.2.0); a decoder whose one-shot, into-buffer and streaming forms are checked against each other by a differential fuzz driver and scored by mutation; encoder streams verified by the reference decoder over 45 shapes; `.q9` 0.72–0.95× q9's time (2026-10-15). **Where we are behind:** no `mode` parameter; no NPOSTFIX/NDIRECT or OMIT_FIRST dictionary words; static-dictionary words only at `.q11` (google from q5: small UTF-8 inputs at `.q6`/`.q9` up to 12 % larger, R15); `.q11` is 1 % behind q11 on text, further on very small inputs (→ Backlog).
 
 ## Scope & honesty
 
@@ -153,8 +153,9 @@ bytes verbatim; otherwise it is rolled back out of the bit writer and re-emitted
   `.q6`, `.best` = `.q9`, `.max` = `.q11`. `.q4` is its
   own algorithm (2026-10-14): 4 slots of a 6-byte hash plus the last distance, a lazy step only for
   matches under 32 bytes, sparse inserts inside long copies, growing steps through long literal runs,
-  one literal code per block. `.q6` walks 32 bucket candidates and
-  models literal contexts; `.q9` walks 256 and splits blocks; `.q11` (2026-10-15, R2) parses by shortest path with static-dictionary words (below). Every level is blessed by the reference separately (below).
+  one literal code per block. `.q6` walks 32 bucket candidates (on binary data their tags compared at
+  once), `.q9` 256; both build the meta-block as google/brotli's qualities 4–9 do — greedy block
+  splitting and a static literal context map (below, 2026-10-15); `.q11` (2026-10-15, R2) parses by shortest path with static-dictionary words (below). Every level is blessed by the reference separately (below).
 - **LZ77 by saved bits** (2026-09-30): a bucketed hash over 4-byte hashes (a hash chain until
   2026-10-14; `.fast` hashes 6 bytes), one lazy step, matches of 4 to
   65 535 bytes. A candidate is scored by the bits it saves — its length times the block's order-0
@@ -171,7 +172,27 @@ bytes verbatim; otherwise it is rolled back out of the bit writer and re-emitted
   (insert code < 8, copy code < 16) carries no distance symbol at all. The ring persists across
   meta-blocks as the decoder's does, and a block that is stored instead rolls it back.
   `quickfox_repeated` 606 → 58 bytes, `backward65536` 178 → 19.
-- **Literal context modelling** (2026-09-30, `.default`/`.best`): per-context literal histograms (64
+- **`.q6`/`.q9` meta-block model** (2026-10-15, `greedy_split.zig`, **ported from google/brotli
+  1.2.0** `metablock.c`/`metablock_inc.h`/`encode.c`, MIT — see NOTICE): the literal, command and
+  distance streams are each split greedily in one pass — every 512 / 1 024 / 512 symbols the block so
+  far joins the last block's type, takes the second-last type, or opens a new one, by the entropy of
+  the merged histograms against a price of 400 / 500 / 100 bits for a new type. Literals use the UTF8
+  context mode with a static map of one, two (after a continuation byte or not; `.q6` at most two) or
+  three contexts (after ASCII / lead / continuation byte), chosen from the bigram entropy of the top
+  two bits of 64-byte samples every 4 KiB; each (type, context) gets its own code, no clustering.
+  Replaced the clustered model and the iterative splitter at these levels (they are `.q11`'s now):
+  `.q9` font 1.89× → 0.72× q9's time, text 1.02× → 0.91×; `.q6` font 1.42× → 1.03× (with the in-slot
+  tag compare and context-free literal emission below). Sizes moved to the reference's: `alice29.txt`
+  `.q6` 51 327 → 52 275 (q6 51 967), `.q9` 50 536 → 51 361 (q9 51 054); font payload `.q9` 103 645 →
+  117 940 (q9 114 948). Not ported: the 13-context map google uses from 1 MiB of input (R14).
+- **Tag compare a bucket at once** (2026-10-15, `.q6`): on a binary block the 32 slots' tags (their
+  top byte) are compared in one vector operation and only matching slots visited
+  newest first, the idea of google/brotli's H58 hasher (`matching_tag_mask.h`; its tag bytes in an
+  array of their own cost us 7 % on text in the extra stores). Font `.q6` −10 % cycles; text as before.
+- **Literals without contexts** (2026-10-15): when every literal block type has one code for all its
+  contexts, the writer does not compute contexts (google's `literal_context_map_size == 0`). `.q6`
+  font −6 %.
+- **Literal context modelling** (2026-09-30, `.default`/`.best`; since 2026-10-15 `.q11` only): per-context literal histograms (64
   contexts from the two previous bytes) for the UTF8 mode, and for blocks under 95 % ASCII also LSB6
   and SIGNED, clustered greedily — merge the pair
   whose union costs the fewest extra estimated bits (entropy plus a per-code header guess), while that
@@ -247,7 +268,8 @@ bytes verbatim; otherwise it is rolled back out of the bit writer and re-emitted
   on the font-shaped payload.
 
 Deliberately *not* implemented, each costing some ratio: `NPOSTFIX`/`NDIRECT` tuning, OMIT_FIRST
-dictionary transforms, dictionary words below `.max`, block splitting at `.fast`/`.default`.
+dictionary transforms, block splitting at `.q4`; dictionary words below `.q11` (google searches them
+from q5 — R15, next).
 
 - **Raw prefix dictionary** (2026-10-14; `CompressOptions.dictionary`, `StreamOptions.dictionary`):
   the match finder's history is `dictionary ++ input`; the dictionary's positions are inserted first
@@ -274,13 +296,16 @@ Ours at each effort vs. the reference (bytes; ReleaseFast, 2026-09-30):
 
 | input | raw | fast | **default** | best | max | ref q1 | ref q5 | ref q9 | ref q11 |
 |---|---|---|---|---|---|---|---|---|---|
-| `alice29.txt` | 152 089 | 55 580 | **51 327** | 50 536 | 46 935 | 60 292 | 52 809 | 51 054 | 46 487 |
-| `monkey` | 843 | 470 | **421** | 421 | 416 | 464 | 426 | 423 | 405 |
-| `cp852-utf8` | 706 | 540 | **436** | 436 | 380 | 566 | 482 | 483 | 362 |
+| `alice29.txt` | 152 089 | 55 580 | **52 275** | 51 361 | 46 935 | 60 292 | 52 809 | 51 054 | 46 487 |
+| `monkey` | 843 | 470 | **427** | 427 | 416 | 464 | 426 | 423 | 405 |
+| `cp852-utf8` | 706 | 540 | **542** | 541 | 380 | 566 | 482 | 483 | 362 |
 | `zeros` | 262 144 | 27 | **27** | 27 | 27 | 47 | 13 | 13 | 14 |
 | `random_org_10k.bin` | 10 000 | 10 004 | **10 004** | 10 004 | 10 004 | 10 004 | 10 004 | 10 004 | 10 004 |
 
-(Table re-taken 2026-10-15; the 2026-09-30 one had `fast` before the `FastMatcher` and no `max`.)
+(Table re-taken 2026-10-15; the 2026-09-30 one had `fast` before the `FastMatcher` and no `max`.
+`default`/`best` re-taken again the same day after the greedy model: before it 51 327 / 50 536, 421,
+436 — the clustered contexts won 100 bytes on `cp852-utf8` that google gets from dictionary words,
+R15.)
 
 Before 2026-09-30 the one setting gave `alice29.txt` 54 605, `cp852-utf8` 536, `zeros` 651. Time on
 `alice29.txt`: 7 ms fast, 17 ms default, 24 ms best (was 7 ms) — since 2026-10-14 `.fast` gives
@@ -545,6 +570,5 @@ Order: P (encoder hasher) → R1 (+R3–R5) → R6/R8 → R9 (+R10/R11) → R7 �
   - *2026-10-15 time on binary* (bench `font`): **`.best` 2.61× → 1.85× q9, `.default` 1.48× → 1.36× q6**, `.max` 0.27× q11; text rows unchanged or better. (1) Tags in the deep matcher's slots (§ Encoder `Matcher.slots`): the 4096 buckets of `.best` hold mostly hash collisions on a font (66 visited, 11 real per lookup); a block that looks binary skips them by tag. Tried and dropped: tags in a byte array (text +4–7 %, extra cache line), a candidate list built from a SIMD tag compare (text +14–28 %, serialised loads), one loop with a runtime mask (text +25 %, registers), more buckets (2^22 slots: −18 % on NotoSansMono but small inputs +40 % in page faults of the bigger table), skipping long literal runs at `.best` (fonts have none). (2) Exact pruning of literal context modes by an entropy floor. Tried and dropped: clustering only the lowest-floor mode (−2.5 % time, NotoLoopedLao +1.1 % size), 16 or 8 split histograms (±0.7 % size, time not better). Left: per literal block type clustering (~27 % of `.best` on `font`), the Viterbi split (13 %), the matcher (21 %). Note on pairing: on `font` `.best` writes 103 645 B — between q9 (114 773) and q10 (99 834), 10 % smaller than the q9 it is timed against.
 - ~~**R11 Concatenated streams + returning read-ahead bytes**~~ — **DONE 2026-10-15**: the read-ahead goes back to the reader (§ Streaming decoder), so streams decode back to back. (A `brcat`-style joined single stream is google's tool, not a format feature.)
 - **R13 Qualities 0 and 1 (found 2026-10-15, owner: add them)** — **`.q1` DONE, `.q0` added but P open (2026-10-15)**. Before: `Effort.fromQuality(0..3)` gave `.q4`, which took 4.3–6.9× q0's time and 2.6–3.8× q1's (bench, user-mode cycles). Now both are levels of their own (§ Encoder `FragMatcher`/`buildFrag`/`writeFragmentBlock`, own design from RFC 7932): one slot per hash bucket, first match taken, LZ4/Snappy-style growing step, commands resolved by the parse into two-word records with their histograms, literals copied to one buffer, one code per category; the writer knows the block's exact size from the histograms before it writes, and stores a block that would not shrink without writing it. Sizes (ours vs google): q1 json 33 675 / 34 206, html 19 062 / 19 495, text 59 893 / 60 292, font 127 956 / 127 223; q0 34 429 / 41 051, 19 042 / 22 347, 63 301 / 65 795, 132 714 / 131 355. Time (bench, 2 rounds): **q1 0.84–0.97×**, **q0 0.97–1.55×** (font 0.97, json 1.17, text 1.42, html 1.55) — google q0 spends about 155–170 instructions a command, parse and write together; ours about 300 (2026-10-15, callgrind: the record write ~110, the parse ~85, the writer ~90 per command). Dead ends (measured): q0 in one pass with codes from the block's first sixteenth (every symbol floored to a count of one) — no fewer instructions, 7–19 % larger (text 73 092 B, above google's 65 795); a faster step through literal runs (q0 skip 1–2: < 5 % instructions, +2–7 % size); a 2^13/2^14 table (≤ 5 %); a one-compare fast path in `matchLen` (−2 % at q0). Kept from the work: `assignLengths` on the stack with one sort of packed keys and `canonicalCode` from the lengths (no decoder table) — every level, streams unchanged.
-
-Deliberately not: RFC 9841 §8 container format; multithreaded compression; BASE64_MODE / SIMD_HASHER / HASHER_OPT; STREAM_OFFSET stitching and catable/appendable streams; twelve bit-identical qualities.
-
+- **R14 13-context static map for large inputs (2026-10-15, open)** — google/brotli's qualities 5–9 use `kStaticContextMapComplexUTF8` (13 contexts from the UTF8 context id, `ShouldUseComplexStaticContextMap`) when the size hint is ≥ 1 MiB and the sampled entropy says it pays; `greedy_split.chooseStaticContexts` stops at three. Needs the total input length at the block writer (`compressWith` knows it; `StreamWriter` from `size_hint`). No bench payload is that large.
+- **R15 Static-dictionary words at `.q6`/`.q9` (2026-10-15, open, next)** — google/brotli searches the static dictionary from quality 5 (`SearchInStaticDictionary` when the hash found nothing, switched off while fewer than 1 in 128 lookups match). Ours only at `.q11` (`DictSearch`, built at run time). Cost of the gap after the greedy model: `cp852-utf8` 542 B at `.q6` vs q6 482 (was 436 with clustered contexts); on the bench payloads ≤ 1.5 % (font) and text +0.6 %. Needs a dictionary hash cheap enough for one small call (google's is compiled in).

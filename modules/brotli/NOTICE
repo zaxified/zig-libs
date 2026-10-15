@@ -20,6 +20,21 @@ as ported source does — the same shape as `bech32`, `csvstream`, `decimal`,
 `json5` and `xml`, and the same shape as the `bitcoinscript` defect the
 2026-07-31 sweep found.
 
+Ported source — google/brotli encoder (ADDED 2026-10-15)
+--------------------------------------------------------
+
+`src/greedy_split.zig` is a port to Zig of parts of google/brotli 1.2.0's
+encoder, under the same MIT license reproduced below: `c/enc/metablock_inc.h`
+(`BlockSplitter`), `c/enc/metablock.c` (`ContextBlockSplitter`,
+`BrotliBuildMetaBlockGreedy`), `c/enc/encode.c` (`ChooseContextMap`,
+`DecideOverLiteralContextModeling`, `EstimateEntropy`, the static context
+maps) and `c/enc/bit_cost.c` (`BrotliBitsEntropy`). Those files carry
+"Copyright 2010–2016 Google Inc. All Rights Reserved. Distributed under MIT
+license." Changes are listed in the file's header. The vector tag compare in
+`encoder.zig` (`Matcher.find`, `simd`) follows the idea of
+`c/enc/matching_tag_mask.h` / `hash_longest_match_simd_inc.h` without copying
+their code (our tags live in the slots, not in an array of their own).
+
 Required attribution — google/brotli test corpus
 ------------------------------------------------
 
@@ -32,13 +47,14 @@ attributed corpus and produced by the attributed project's own code, so they are
 covered by the same notice and listed here rather than left unmentioned. No
 google/brotli source is present in this module; these are compressed forms of
 `alice29.txt`, `quickfox_repeated`, `monkey`, `ukkonooa`, `cp852-utf8`,
-`cp1251-utf16le`, `zeros`, `random_org_10k.bin`, `x` and `empty`.
+`cp1251-utf16le`, `zeros`, `random_org_10k.bin`, `x` and `empty`. (That
+sentence held until 2026-10-15; see "Ported source" below.)
 
 Files: `src/testdata/*` (17 input/`.compressed` pairs: 10x10y, 64x, alice29.txt,
 backward65536, compressed_file, cp1251-utf16le, cp852-utf8, empty, monkey,
 quickfox, quickfox_repeated, random_org_10k.bin, ukkonooa, x, xyzzy, zeros,
 zerosukkanooa). Reproduced from github.com/google/brotli `tests/testdata/`.
-Test data only — no source code from google/brotli is present in this module.
+Test data — and, since 2026-10-15, the ported source listed below.
 
     Copyright (c) 2009, 2010, 2013-2016 by the Brotli Authors.
 

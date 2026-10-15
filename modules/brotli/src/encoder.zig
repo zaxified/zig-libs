@@ -70,6 +70,7 @@ const tables = @import("tables.zig");
 const dictionary = @import("dictionary.zig");
 const transforms = @import("transforms.zig");
 const block_split = @import("block_split.zig");
+const greedy_split = @import("greedy_split.zig");
 const BrotliError = @import("errors.zig").BrotliError;
 
 // ---------------------------------------------------------------------------
@@ -947,6 +948,9 @@ fn bucketLog(size: usize, max: u6) u6 {
     return b;
 }
 
+/// Slots per bucket of `.q6`'s `Matcher`: one vector compare of the tags.
+const simd_depth = 32;
+
 const Matcher = struct {
     /// The tag bits of a slot.
     const tagged_mask: u32 = 0xff00_0000;
@@ -1131,7 +1135,12 @@ const Matcher = struct {
     /// `tagged`: skip slots by their tag (`slots`) — comptime, as a mask
     /// test in the one loop cost text 25 % in the registers it took
     /// (2026-10-15); the caller picks per block (`tagsPay`).
-    fn find(self: *const Matcher, comptime ring_n: u3, comptime px: bool, comptime tagged: bool, p: usize, max_dist: usize, limit: usize) ?Match {
+    /// `simd` (`.q6`, 32 slots a bucket): with `tagged`, the bucket's tags
+    /// are compared at once and only the slots whose tag is the position's
+    /// own are visited, as google/brotli's H58 hasher does with tag bytes of
+    /// their own (`hash_longest_match_simd_inc.h`; a byte array here cost
+    /// text 7 % in the extra stores, 2026-10-15).
+    fn find(self: *const Matcher, comptime ring_n: u3, comptime px: bool, comptime tagged: bool, comptime simd: bool, p: usize, max_dist: usize, limit: usize) ?Match {
         if (p + min_match > limit) return null;
         const max_len = @min(limit - p, max_match);
         var best_len: usize = 0;
@@ -1165,6 +1174,44 @@ const Matcher = struct {
         const valid = if (n < self.depth) n else self.depth;
         const bucket = self.slots[h << self.depth_log ..][0..self.depth];
         const m = if (tagged) tagged_mask else self.tag_mask;
+        if (simd and tagged) {
+            // Bit k of `mask`: the k-th newest slot, `n - 1 - k`.
+            const V = @Vector(simd_depth, u32);
+            const sv: V = bucket[0..simd_depth].*;
+            const eq = (sv & @as(V, @splat(tagged_mask))) == @as(V, @splat(hv.tag));
+            const by_slot: u32 = @bitCast(eq);
+            var mask = std.math.rotr(u32, @bitReverse(by_slot), @as(u5, @truncate(0 -% n)));
+            if (n < simd_depth) mask &= (@as(u32, 1) << @intCast(n)) - 1;
+            while (mask != 0) : (mask &= mask - 1) {
+                const s = bucket[(n -% 1 -% @ctz(mask)) & (simd_depth - 1)];
+                const c: usize = s & ~tagged_mask;
+                if (c >= p) continue;
+                var d = p - c;
+                var cap: usize = max_len;
+                if (px and c < self.prefix.len) {
+                    const r = self.prefix.reach(p, c, max_dist, max_len) orelse continue;
+                    d = r.d;
+                    cap = r.cap;
+                } else if (d > max_dist) {
+                    if (px) continue;
+                    break;
+                }
+                if (worthComparing(best_len, self.data[c + best_len] == self.data[p + best_len])) {
+                    const l = matchLen(self.data, c, p, cap);
+                    if (l >= min_match) {
+                        const g = self.gain(l, d);
+                        if (g > best_gain) {
+                            best_gain = g;
+                            best_len = l;
+                            best_dist = d;
+                            if (l == max_len) break;
+                        }
+                    }
+                }
+            }
+            if (best_len == 0) return null;
+            return .{ .len = @intCast(best_len), .dist = @intCast(best_dist), .gain = best_gain };
+        }
         var k: u32 = 0;
         while (k < valid) : (k += 1) {
             const s = bucket[(n -% 1 -% k) & (self.depth - 1)];
@@ -1770,6 +1817,8 @@ fn buildCommands(
     comptime px: bool,
     /// Lookups skip slots by tag (`Matcher.tagsPay`).
     comptime tagged: bool,
+    /// Tags compared a bucket at once (`Matcher.find`).
+    comptime simd: bool,
     gpa: std.mem.Allocator,
     matcher: *Matcher,
     start: usize,
@@ -1787,7 +1836,7 @@ fn buildCommands(
 
     while (p < end) {
         matcher.prefetch(p + 1);
-        const m = pending orelse matcher.find(ring_n, px, tagged, p, x.outMax(p, max_dist), end);
+        const m = pending orelse matcher.find(ring_n, px, tagged, simd, p, x.outMax(p, max_dist), end);
         pending = null;
         if (m == null) {
             matcher.insert(p);
@@ -1799,7 +1848,7 @@ fn buildCommands(
         }
         matcher.insert(p);
         if (p + 1 < end) {
-            if (matcher.find(ring_n, px, tagged, p + 1, x.outMax(p + 1, max_dist), end)) |b| {
+            if (matcher.find(ring_n, px, tagged, simd, p + 1, x.outMax(p + 1, max_dist), end)) |b| {
                 // One literal more is spent to take `b`, so it must save
                 // more than that literal costs on top of what `m` saves.
                 if (b.gain > m.?.gain + matcher.lit_cost) {
@@ -3117,6 +3166,9 @@ const Layout = struct {
     /// 64 entries per literal block type.
     lit_map: []const u8,
     lit_modes: []const u2,
+    /// Every literal block type has one code for all its contexts: no
+    /// context is computed (google/brotli's `literal_context_map_size == 0`).
+    lit_per_type: bool = false,
     /// One per command block type.
     cmd_codes: []const Code,
     dist_codes: []const Code,
@@ -3165,6 +3217,12 @@ fn emitCommands(
                 try w.writeBits(@as(u32, code.bits[lits_here[k]]) | @as(u32, code.bits[lits_here[k + 1]]) << l0, @as(u6, l0) + l1);
             }
             if (k < lits_here.len) try code.emit(w, lits_here[k]);
+        } else if (l.lit_per_type) {
+            for (lits_here) |b| {
+                if (split) try blocks[0].step(w);
+                const t: usize = if (split) blocks[0].cur() else 0;
+                try l.lit_codes[l.lit_map[t * num_contexts]].emit(w, b);
+            }
         } else if (!split or blocks[0].split.ntypes == 1) {
             for (lit_pos..lit_pos + c.insert_len) |q| {
                 const p1: u8 = if (q >= 1) input[q - 1] else 0;
@@ -3284,145 +3342,220 @@ fn writeCompressedBlock(
     // would run past the end of the meta-block.
     if (covered != n) return error.EncoderInvariant;
 
-    // --- block splits (`.q9`, `.q11`) -------------------------------------
+    // --- block splits and the literal model ---------------------------------
     // Literals, insert-and-copy symbols and distance symbols each cut into
     // blocks of a few types, each type with codes of its own (RFC 7932 §6):
-    // a font's or a binary's sections differ. One type each elsewhere.
-    const split_on = effort == .q9 or effort == .q11;
-    const rounds: u32 = if (effort == .q11) 4 else 2;
-    var n_lits: usize = 0;
-    var n_dsyms: usize = 0;
-    var ascii_lits: usize = 0;
-    {
-        var q = start;
-        for (cmds, res) |c, r| {
-            if (split_on) {
-                for (input[q..][0..c.insert_len]) |b| ascii_lits += @intFromBool(b < 0x80);
-            }
-            n_lits += c.insert_len;
-            n_dsyms += @intFromBool(r.has_dist);
-            q += c.insert_len + c.produced();
-        }
-    }
-    // Literals are split only when not nearly all ASCII: on text, HTML and
-    // JSON literal block types won nothing measurable (−0.2 % to +0.2 %)
-    // for a tenth of `.q9`'s time; on fonts 3–6 %.
-    const split_lits = split_on and !single_literal_code and ascii_lits * 100 < n_lits * ascii_pct;
-    // The literal sequence, then the byte before each, then the one before
-    // that (the context).
-    const lits = try gpa.alloc(u8, if (split_lits) 3 * n_lits else 0);
-    defer gpa.free(lits);
-    if (split_lits) {
-        var k: usize = 0;
-        var q0 = start;
-        for (cmds) |c| {
-            for (q0..q0 + c.insert_len) |q| {
-                lits[k] = input[q];
-                lits[n_lits + k] = if (q >= 1) input[q - 1] else 0;
-                lits[2 * n_lits + k] = if (q >= 2) input[q - 2] else 0;
-                k += 1;
-            }
-            q0 += c.insert_len + c.produced();
-        }
-    }
+    // a font's or a binary's sections differ. `.q6`/`.q9`: greedy, in one
+    // pass, with static literal contexts (`greedy_split.zig`, google/brotli's
+    // model for qualities 4–9); `.q11`: the iterative splitter and clustered
+    // contexts; `.q4`: one type each and one literal code.
     var blocks: [3]BlockCodes = undefined;
     var n_blocks: usize = 0;
     defer for (blocks[0..n_blocks]) |*b| b.deinit(gpa);
-    blocks[0] = try .init(gpa, if (split_lits)
-        try block_split.split(u8, gpa, lits[0..n_lits], tables.num_literal_symbols, lit_split_params(rounds))
-    else
-        try block_split.Split.single(gpa, n_lits));
-    n_blocks = 1;
-    {
-        const syms = try gpa.alloc(u16, @max(cmds.len, n_dsyms));
-        defer gpa.free(syms);
-        for (res, syms[0..cmds.len]) |r, *s| s.* = r.sym;
-        blocks[1] = try .init(gpa, if (split_on)
-            try block_split.split(u16, gpa, syms[0..cmds.len], tables.num_command_symbols, cmd_split_params(rounds))
+    var lit_modes: []u2 = &.{};
+    defer gpa.free(lit_modes);
+    var lit_map: []u8 = &.{};
+    defer gpa.free(lit_map);
+    var lit_alloc: [][tables.num_literal_symbols]u32 = &.{};
+    defer gpa.free(lit_alloc);
+    var single_counts: [tables.num_literal_symbols]u32 = @splat(0);
+    var lit_ntrees: usize = 0;
+    if (effort == .q6 or effort == .q9) {
+        // `single_literal_code`: one literal type and code (the real-bits
+        // check in `compressWith`).
+        const split_lits = !single_literal_code;
+        const sc: greedy_split.StaticContexts = if (split_lits)
+            greedy_split.chooseStaticContexts(input[start..end], effort.quality())
         else
-            try block_split.Split.single(gpa, cmds.len));
-        n_blocks = 2;
-        var k: usize = 0;
-        for (res) |r| {
-            if (!r.has_dist) continue;
-            syms[k] = r.dist_sym;
-            k += 1;
+            .{ .n = 1, .map = &greedy_split.map_single };
+        var n_lits: usize = 0;
+        var n_dsyms: usize = 0;
+        for (cmds, res) |c, r| {
+            n_lits += c.insert_len;
+            n_dsyms += @intFromBool(r.has_dist);
         }
-        blocks[2] = try .init(gpa, if (split_on)
-            try block_split.split(u16, gpa, syms[0..n_dsyms], n_dist, dist_split_params(rounds))
-        else
-            try block_split.Split.single(gpa, n_dsyms));
+        // Minimum block sizes and new-type thresholds: google/brotli's.
+        var lsp = try greedy_split.Splitter.init(gpa, tables.num_literal_symbols, sc.n, 512, 400, if (split_lits) n_lits else 0);
+        defer lsp.deinit(gpa);
+        var csp = try greedy_split.Splitter.init(gpa, tables.num_command_symbols, 1, 1024, 500, cmds.len);
+        defer csp.deinit(gpa);
+        var dsp = try greedy_split.Splitter.init(gpa, n_dist, 1, 512, 100, n_dsyms);
+        defer dsp.deinit(gpa);
+        var q = start;
+        for (cmds, res) |c, r| {
+            csp.add(r.sym, 0);
+            if (split_lits) {
+                var p1: u8 = if (q >= 1) input[q - 1] else 0;
+                var p2: u8 = if (q >= 2) input[q - 2] else 0;
+                for (input[q..][0..c.insert_len]) |b| {
+                    lsp.add(b, sc.map[contextId(2, p1, p2)]);
+                    p2 = p1;
+                    p1 = b;
+                }
+            } else {
+                for (input[q..][0..c.insert_len]) |b| single_counts[b] += 1;
+            }
+            if (r.has_dist) dsp.add(r.dist_sym, 0);
+            q += c.insert_len + c.produced();
+        }
+        blocks[0] = try .init(gpa, if (split_lits) try lsp.finish(gpa) else try block_split.Split.single(gpa, n_lits));
+        n_blocks = 1;
+        blocks[1] = try .init(gpa, try csp.finish(gpa));
+        n_blocks = 2;
+        blocks[2] = try .init(gpa, try dsp.finish(gpa));
         n_blocks = 3;
+
+        // UTF8 mode for every type; type t's contexts are codes
+        // t * n .. t * n + n - 1, the splitter's histograms as they are.
+        const nlt: usize = blocks[0].split.ntypes;
+        lit_modes = try gpa.alloc(u2, nlt);
+        @memset(lit_modes, 2);
+        lit_map = try gpa.alloc(u8, nlt * num_contexts);
+        if (split_lits) {
+            lit_ntrees = nlt * sc.n;
+            for (0..nlt) |t| {
+                for (lit_map[t * num_contexts ..][0..num_contexts], sc.map) |*m, ctx| m.* = @intCast(t * sc.n + ctx);
+            }
+            lit_alloc = try gpa.alloc([tables.num_literal_symbols]u32, lit_ntrees);
+            const hists: [*]const [tables.num_literal_symbols]u32 = @ptrCast(lsp.hist.ptr);
+            @memcpy(lit_alloc, hists[0..lit_ntrees]);
+            for (lit_alloc) |*h| addInto(&single_counts, h);
+        } else {
+            lit_ntrees = 1;
+            @memset(lit_map, 0);
+            lit_alloc = try gpa.alloc([tables.num_literal_symbols]u32, 1);
+            lit_alloc[0] = single_counts;
+        }
+    } else {
+        const split_on = effort == .q11;
+        const rounds: u32 = 4;
+        var n_lits: usize = 0;
+        var n_dsyms: usize = 0;
+        var ascii_lits: usize = 0;
+        {
+            var q = start;
+            for (cmds, res) |c, r| {
+                if (split_on) {
+                    for (input[q..][0..c.insert_len]) |b| ascii_lits += @intFromBool(b < 0x80);
+                }
+                n_lits += c.insert_len;
+                n_dsyms += @intFromBool(r.has_dist);
+                q += c.insert_len + c.produced();
+            }
+        }
+        // Literals are split only when not nearly all ASCII: on text, HTML and
+        // JSON literal block types won nothing measurable (−0.2 % to +0.2 %)
+        // for a tenth of `.q9`'s time; on fonts 3–6 %.
+        const split_lits = split_on and !single_literal_code and ascii_lits * 100 < n_lits * ascii_pct;
+        // The literal sequence, then the byte before each, then the one before
+        // that (the context).
+        const lits = try gpa.alloc(u8, if (split_lits) 3 * n_lits else 0);
+        defer gpa.free(lits);
+        if (split_lits) {
+            var k: usize = 0;
+            var q0 = start;
+            for (cmds) |c| {
+                for (q0..q0 + c.insert_len) |q| {
+                    lits[k] = input[q];
+                    lits[n_lits + k] = if (q >= 1) input[q - 1] else 0;
+                    lits[2 * n_lits + k] = if (q >= 2) input[q - 2] else 0;
+                    k += 1;
+                }
+                q0 += c.insert_len + c.produced();
+            }
+        }
+        blocks[0] = try .init(gpa, if (split_lits)
+            try block_split.split(u8, gpa, lits[0..n_lits], tables.num_literal_symbols, lit_split_params(rounds))
+        else
+            try block_split.Split.single(gpa, n_lits));
+        n_blocks = 1;
+        {
+            const syms = try gpa.alloc(u16, @max(cmds.len, n_dsyms));
+            defer gpa.free(syms);
+            for (res, syms[0..cmds.len]) |r, *s| s.* = r.sym;
+            blocks[1] = try .init(gpa, if (split_on)
+                try block_split.split(u16, gpa, syms[0..cmds.len], tables.num_command_symbols, cmd_split_params(rounds))
+            else
+                try block_split.Split.single(gpa, cmds.len));
+            n_blocks = 2;
+            var k: usize = 0;
+            for (res) |r| {
+                if (!r.has_dist) continue;
+                syms[k] = r.dist_sym;
+                k += 1;
+            }
+            blocks[2] = try .init(gpa, if (split_on)
+                try block_split.split(u16, gpa, syms[0..n_dsyms], n_dist, dist_split_params(rounds))
+            else
+                try block_split.Split.single(gpa, n_dsyms));
+            n_blocks = 3;
+        }
+        const nlt: usize = blocks[0].split.ntypes;
+
+        // --- literal model: per literal block type a context mode and map; the
+        // codes are shared across types ------------------------------------------
+        const model = try gpa.create(LiteralModel);
+        defer gpa.destroy(model);
+        lit_modes = try gpa.alloc(u2, nlt);
+        lit_map = try gpa.alloc(u8, nlt * num_contexts);
+        lit_alloc = if (nlt == 1) blk: {
+            try chooseLiteralModel(gpa, CmdLiterals{ .input = input, .start = start, .cmds = cmds }, if (single_literal_code) .q4 else effort, model);
+            lit_modes[0] = model.mode;
+            @memcpy(lit_map, &model.map);
+            const a = try gpa.alloc([tables.num_literal_symbols]u32, model.ntrees);
+            @memcpy(a, model.counts[0..model.ntrees]);
+            single_counts = model.single;
+            lit_ntrees = model.ntrees;
+            break :blk a;
+        } else blk: {
+            // Each type's own model — its own context mode and grouping — then
+            // the codes of all types merged where one code serves several. (One
+            // mode and grouping for all types, with a code per (type, group),
+            // was 8 % faster at `.q9` but 0.2–0.5 % larger on fonts,
+            // 2026-10-15.)
+            const first_tree = try gpa.alloc(u32, nlt + 1);
+            defer gpa.free(first_tree);
+            const ranges = try gpa.alloc([2]u32, blocks[0].split.lens.len);
+            defer gpa.free(ranges);
+            const scratch = try gpa.create(ClusterScratch);
+            defer gpa.destroy(scratch);
+            var all: std.ArrayListUnmanaged([tables.num_literal_symbols]u32) = .empty;
+            errdefer all.deinit(gpa);
+            single_counts = @splat(0);
+            const src_lits = lits[0..n_lits];
+            const src_p1 = lits[n_lits..][0..n_lits];
+            const src_p2 = lits[2 * n_lits ..][0..n_lits];
+            for (0..nlt) |t| {
+                var nr: usize = 0;
+                var at: u32 = 0;
+                for (blocks[0].split.types, blocks[0].split.lens) |bt, bl| {
+                    if (bt == t) {
+                        ranges[nr] = .{ at, bl };
+                        nr += 1;
+                    }
+                    at += bl;
+                }
+                try chooseLiteralModelIn(gpa, scratch, RangeLiterals{ .lits = src_lits, .p1 = src_p1, .p2 = src_p2, .blocks = ranges[0..nr] }, effort, model);
+                lit_modes[t] = model.mode;
+                first_tree[t] = @intCast(all.items.len);
+                @memcpy(lit_map[t * num_contexts ..][0..num_contexts], &model.map);
+                try all.appendSlice(gpa, model.counts[0..model.ntrees]);
+                addInto(&single_counts, &model.single);
+            }
+            const total: u32 = @intCast(all.items.len);
+            const remap = try gpa.alloc(u32, total);
+            defer gpa.free(remap);
+            const flat = @as([*]u32, @ptrCast(all.items.ptr))[0 .. @as(usize, total) * tables.num_literal_symbols];
+            lit_ntrees = try block_split.mergeHistograms(gpa, flat, tables.num_literal_symbols, total, 256, remap);
+            for (0..nlt) |t| {
+                for (lit_map[t * num_contexts ..][0..num_contexts]) |*m| m.* = @intCast(remap[first_tree[t] + m.*]);
+            }
+            break :blk try all.toOwnedSlice(gpa);
+        };
     }
     const lt: usize = blocks[0].split.ntypes;
     const it: usize = blocks[1].split.ntypes;
     const dt: usize = blocks[2].split.ntypes;
-
-    // --- literal model: per literal block type a context mode and map; the
-    // codes are shared across types ------------------------------------------
-    const model = try gpa.create(LiteralModel);
-    defer gpa.destroy(model);
-    const lit_modes = try gpa.alloc(u2, lt);
-    defer gpa.free(lit_modes);
-    const lit_map = try gpa.alloc(u8, lt * num_contexts);
-    defer gpa.free(lit_map);
-    var single_counts: [tables.num_literal_symbols]u32 = undefined;
-    var lit_ntrees: usize = 0;
-    const lit_alloc: [][tables.num_literal_symbols]u32 = if (lt == 1) blk: {
-        try chooseLiteralModel(gpa, CmdLiterals{ .input = input, .start = start, .cmds = cmds }, if (single_literal_code) .q4 else effort, model);
-        lit_modes[0] = model.mode;
-        @memcpy(lit_map, &model.map);
-        const a = try gpa.alloc([tables.num_literal_symbols]u32, model.ntrees);
-        @memcpy(a, model.counts[0..model.ntrees]);
-        single_counts = model.single;
-        lit_ntrees = model.ntrees;
-        break :blk a;
-    } else blk: {
-        // Each type's own model — its own context mode and grouping — then
-        // the codes of all types merged where one code serves several. (One
-        // mode and grouping for all types, with a code per (type, group),
-        // was 8 % faster at `.q9` but 0.2–0.5 % larger on fonts,
-        // 2026-10-15.)
-        const first_tree = try gpa.alloc(u32, lt + 1);
-        defer gpa.free(first_tree);
-        const ranges = try gpa.alloc([2]u32, blocks[0].split.lens.len);
-        defer gpa.free(ranges);
-        const scratch = try gpa.create(ClusterScratch);
-        defer gpa.destroy(scratch);
-        var all: std.ArrayListUnmanaged([tables.num_literal_symbols]u32) = .empty;
-        errdefer all.deinit(gpa);
-        single_counts = @splat(0);
-        const src_lits = lits[0..n_lits];
-        const src_p1 = lits[n_lits..][0..n_lits];
-        const src_p2 = lits[2 * n_lits ..][0..n_lits];
-        for (0..lt) |t| {
-            var nr: usize = 0;
-            var at: u32 = 0;
-            for (blocks[0].split.types, blocks[0].split.lens) |bt, bl| {
-                if (bt == t) {
-                    ranges[nr] = .{ at, bl };
-                    nr += 1;
-                }
-                at += bl;
-            }
-            try chooseLiteralModelIn(gpa, scratch, RangeLiterals{ .lits = src_lits, .p1 = src_p1, .p2 = src_p2, .blocks = ranges[0..nr] }, effort, model);
-            lit_modes[t] = model.mode;
-            first_tree[t] = @intCast(all.items.len);
-            @memcpy(lit_map[t * num_contexts ..][0..num_contexts], &model.map);
-            try all.appendSlice(gpa, model.counts[0..model.ntrees]);
-            addInto(&single_counts, &model.single);
-        }
-        const total: u32 = @intCast(all.items.len);
-        const remap = try gpa.alloc(u32, total);
-        defer gpa.free(remap);
-        const flat = @as([*]u32, @ptrCast(all.items.ptr))[0 .. @as(usize, total) * tables.num_literal_symbols];
-        lit_ntrees = try block_split.mergeHistograms(gpa, flat, tables.num_literal_symbols, total, 256, remap);
-        for (0..lt) |t| {
-            for (lit_map[t * num_contexts ..][0..num_contexts]) |*m| m.* = @intCast(remap[first_tree[t] + m.*]);
-        }
-        break :blk try all.toOwnedSlice(gpa);
-    };
-    defer gpa.free(lit_alloc);
     const lit_counts = lit_alloc[0..lit_ntrees];
     // Every code needs at least one symbol even when unused.
     const padded = try gpa.alloc(bool, lit_ntrees);
@@ -3568,10 +3701,16 @@ fn writeCompressedBlock(
     }
 
     // --- commands -----------------------------------------------------------
+    var lit_per_type = true;
+    for (0..lt) |t| {
+        const row = lit_map[t * num_contexts ..][0..num_contexts];
+        if (!std.mem.allEqual(u8, row, row[0])) lit_per_type = false;
+    }
     const layout: Layout = .{
         .lit_codes = lit_codes,
         .lit_map = lit_map,
         .lit_modes = lit_modes,
+        .lit_per_type = lit_per_type,
         .cmd_codes = cmd_codes,
         .dist_codes = dist_codes,
         .dist_map = dist_map,
@@ -4480,11 +4619,12 @@ pub const Core = struct {
                 // position.
                 const skip: usize = if (e == .q6) 64 else std.math.maxInt(usize);
                 c.matcher.deep.ring = c.ring;
+                const simd = e == .q6;
                 switch (c.matcher.deep.tagsPay(c.data[off..end])) {
                     inline else => |tagged| if (c.prefix().len != 0)
-                        try buildCommands(4, skip, true, tagged, gpa, &c.matcher.deep, off, end, max_dist, &c.cmds)
+                        try buildCommands(4, skip, true, tagged, simd, gpa, &c.matcher.deep, off, end, max_dist, &c.cmds)
                     else
-                        try buildCommands(4, skip, false, tagged, gpa, &c.matcher.deep, off, end, max_dist, &c.cmds),
+                        try buildCommands(4, skip, false, tagged, simd, gpa, &c.matcher.deep, off, end, max_dist, &c.cmds),
                 }
             },
         }
@@ -5327,18 +5467,18 @@ fn firstLiteralBlockTypes(stream: []const u8) !u32 {
     return v + 1;
 }
 
-test "block types: .q9 and .q11 split a sectioned binary input, .q6 does not" {
+test "block types: .q6, .q9 and .q11 split a sectioned binary input, .q4 does not" {
     const gpa = testing.allocator;
     const corpus = @import("interop_corpus.zig");
     const input = try corpus.fontLike(gpa, 60_000, 7);
     defer gpa.free(input);
-    for ([_]Effort{ .q6, .q9, .q11 }) |effort| {
+    for ([_]Effort{ .q4, .q6, .q9, .q11 }) |effort| {
         const out = try compressWith(gpa, input, .{ .effort = effort });
         defer gpa.free(out);
         const back = try @import("decoder.zig").decompress(gpa, out, .{});
         defer gpa.free(back);
         try testing.expectEqualSlices(u8, input, back);
         const nbl = try firstLiteralBlockTypes(out);
-        if (effort == .q6) try testing.expectEqual(@as(u32, 1), nbl) else try testing.expect(nbl >= 2);
+        if (effort == .q4) try testing.expectEqual(@as(u32, 1), nbl) else try testing.expect(nbl >= 2);
     }
 }
