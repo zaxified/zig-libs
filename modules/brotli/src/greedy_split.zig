@@ -384,3 +384,69 @@ test "chooseStaticContexts: ASCII text one context, mixed UTF-8 more, quality 6 
     try testing.expect(chooseStaticContexts(cyr, 6).n <= 2);
     try testing.expectEqual(@as(u32, 1), chooseStaticContexts(cyr[0..63], 9).n);
 }
+
+/// 64 KiB of a 64-byte pattern of byte classes (0: ASCII 'a', 1: a UTF-8
+/// continuation byte, 2: a lead byte), so every 4 KiB sample sees it whole.
+fn classBytes(comptime pattern: []const u8) [1 << 16]u8 {
+    @setEvalBranchQuota(1 << 20);
+    var out: [1 << 16]u8 = undefined;
+    for (&out, 0..) |*b, i| b.* = switch (pattern[i % pattern.len]) {
+        '0' => 'a',
+        '1' => 0x80,
+        else => 0xc3,
+    };
+    return out;
+}
+
+test "chooseStaticContexts: the thresholds between one, two and three contexts" {
+    // (Entropies per literal from the sampled bigrams.) ASCII and lead bytes
+    // alternating: two contexts save nothing (e1 - e2 = 0), three save a
+    // whole bit — three, not one: one context needs BOTH savings small.
+    const alt = comptime classBytes("02" ** 32);
+    try testing.expectEqual(@as(u32, 3), chooseStaticContexts(&alt, 9).n);
+    // e1 1.436, e2 0.671, e3 0.556 bits: the third context saves 0.115, past
+    // the 0.02 that keeps two.
+    const near = comptime classBytes("0101010102222102222222222102222210101022222222210101010222222102");
+    try testing.expectEqual(@as(u32, 3), chooseStaticContexts(&near, 9).n);
+    // Below quality 7 three are never taken.
+    try testing.expectEqual(@as(u32, 2), chooseStaticContexts(&near, 6).n);
+}
+
+test "Splitter: at most max_block_types types, then blocks join old ones" {
+    // Three disjoint symbol ranges in turn: each block is far from the last
+    // two types, so every block opens a type until there are 256.
+    const gpa = testing.allocator;
+    const nblocks = 300;
+    var s = try Splitter.init(gpa, 256, 1, 512, 400, nblocks * 512);
+    defer s.deinit(gpa);
+    var prng = std.Random.DefaultPrng.init(3);
+    const r = prng.random();
+    for (0..nblocks) |b| {
+        for (0..512) |_| s.add(@intCast((b % 3) * 16 + r.uintLessThan(u32, 16)), 0);
+    }
+    var sp = try s.finish(gpa);
+    defer sp.deinit(gpa);
+    try testing.expectEqual(@as(u32, max_block_types), sp.ntypes);
+    var total: usize = 0;
+    for (sp.lens) |l| total += l;
+    try testing.expectEqual(@as(usize, nblocks * 512), total);
+}
+
+test "Splitter: a block about as close to both last types joins the last one" {
+    // Types A (symbols 0..15) and B (16..31), then a block of both halves,
+    // 260 from A's range and 252 from B's: merging it with A saves a few bits
+    // more than with B — under the 20 the second-last type must win by, so
+    // it joins B, the last type, as a longer block.
+    const gpa = testing.allocator;
+    var s = try Splitter.init(gpa, 64, 1, 512, 400, 3 * 512);
+    defer s.deinit(gpa);
+    for (0..512) |i| s.add(@intCast(i % 16), 0);
+    for (0..512) |i| s.add(@intCast(16 + i % 16), 0);
+    for (0..260) |i| s.add(@intCast(i % 16), 0);
+    for (0..252) |i| s.add(@intCast(16 + i % 16), 0);
+    var sp = try s.finish(gpa);
+    defer sp.deinit(gpa);
+    try testing.expectEqual(@as(u32, 2), sp.ntypes);
+    try testing.expectEqualSlices(u8, &.{ 0, 1 }, sp.types);
+    try testing.expectEqualSlices(u32, &.{ 512, 1024 }, sp.lens);
+}

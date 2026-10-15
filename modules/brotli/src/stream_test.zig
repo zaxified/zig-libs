@@ -451,13 +451,13 @@ const fuzz_driver = @import("testkit").fuzz.driver;
 /// under ReleaseSafe, and all four decoders share it, so the differential
 /// verdicts cannot see such an access either. (Linux; elsewhere a plain
 /// buffer.)
-fn Guarded(comptime cap: usize) type {
+pub fn Guarded(comptime cap: usize) type {
     return struct {
         var region: ?[]u8 = null;
         var plain: [cap]u8 = undefined;
 
         /// The last `len` bytes before the guard page.
-        fn tail(len: usize) []u8 {
+        pub fn tail(len: usize) []u8 {
             std.debug.assert(len <= cap);
             const room = room: {
                 if (builtin.os.tag != .linux) break :room plain[0..];

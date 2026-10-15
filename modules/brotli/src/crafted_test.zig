@@ -883,3 +883,96 @@ test "crafted: a complex prefix code with a single used symbol is refused" {
     try w.simple(6, &.{0});
     try expectErr(w.bytes.items, error.InvalidHuffman);
 }
+
+// --- the hot loop's input margin (mutation run 2026-10-15) ----------------------
+
+/// A command code where every one of the 704 symbols is 9 or 10 bits long
+/// (section 3.5): the code-length code has only 9 and 10, one bit each, so
+/// each symbol's length is a single bit; 320 nines and 384 tens fill the
+/// code space exactly. Symbols below 320 get 9 bits, the rest 10.
+const GuardedStream = @import("stream_test.zig").Guarded(8 << 10);
+
+fn longCommandCode(w: *W) !void {
+    try w.bits(0, 2); // HSKIP 0: complex code
+    // Order 1 2 3 4 0 5 17 6 16 7 8 9 10: 9 is the 12th, 10 the 13th; the
+    // space is used up there. Length 0 is "00", length 1 the field 7 in 4.
+    var i: u32 = 0;
+    while (i < 13) : (i += 1) {
+        if (i >= 11) try w.bits(7, 4) else try w.bits(0, 2);
+    }
+    // Canonical: 9 is "0", 10 is "1".
+    i = 0;
+    while (i < tables.num_command_symbols) : (i += 1) try w.code(if (i < 320) "0" else "1");
+}
+
+/// `sym`'s code in `longCommandCode`: nines (0..319) take 0..319, tens
+/// (320..703) follow from 640.
+fn longCommand(w: *W, c: Cmd) !void {
+    if (c.sym < 320) try w.msb(c.sym, 9) else try w.msb(640 + @as(u32, c.sym) - 320, 10);
+    try w.bits(c.ins_v, @intCast(c.ins_n));
+    try w.bits(c.cpy_v, @intCast(c.cpy_n));
+}
+
+test "crafted: a command header that needs a second refill near the end of the input" {
+    // `hotCommands` starts a command header only with `hot_margin` (16)
+    // bytes at hand: `top` may take eight, and a header can need a second
+    // refill — a 10-bit command code, then 24 + 24 extra bits (insert 22594,
+    // copy 2118) is more than the 56 bits a refill may leave. With less
+    // margin that refill reads past the input. Literals take no bits (a
+    // one-symbol code), so the long header can sit near the end: 16..23
+    // short commands of 9 bits first (the hot loop is running; every bit
+    // offset of the long header; an implicit distance, so no distance read
+    // has refilled just before it), then the long one, one whose insert has
+    // 0..7 extra bits (every offset of the end), and `t` short ones (every
+    // distance from the end). Each stream must decode in full,
+    // also from the last bytes before an unreadable page, where a byte read
+    // past the input faults (the read lands above the bits used, so nothing
+    // else shows it).
+    const big = findCmd(22594, 2118, false);
+    try testing.expect(big.sym >= 320 and big.ins_n == 24 and big.cpy_n == 24);
+    // Inserts of 1, 6, 10, 18, 34, 66, 130, 194: 0..7 extra bits.
+    const aligners = [_]u32{ 1, 6, 10, 18, 34, 66, 130, 194 };
+    for (aligners, 0..) |a, extra| for (16..24) |pre| {
+        try testing.expectEqual(@as(u8, @intCast(extra)), findCmd(a, 2, false).ins_n);
+        var t: u32 = 0;
+        while (t < 16) : (t += 1) {
+            // insert, copy, implicit distance (the last one, 4)
+            var cmds: std.ArrayList([3]u32) = .empty;
+            defer cmds.deinit(testing.allocator);
+            // The first insert gives the last distance (4) bytes to copy.
+            try cmds.append(testing.allocator, .{ 4, 2, 0 });
+            // Implicit distance: no distance read (whose `top` would have
+            // refilled) before the long header.
+            for (1..pre) |_| try cmds.append(testing.allocator, .{ 1, 2, 1 });
+            try cmds.append(testing.allocator, .{ 22594, 2118, 0 });
+            try cmds.append(testing.allocator, .{ a, 2, 0 });
+            for (0..t) |_| try cmds.append(testing.allocator, .{ 1, 2, 0 });
+            var total: u32 = 0;
+            for (cmds.items) |ic| total += ic[0] + ic[1];
+
+            var w: W = .{};
+            defer w.deinit();
+            try w.window16();
+            try w.lastCompressed(total);
+            try w.bits(0, 3); // NBLTYPESL/I/D = 1
+            try w.bits(0, 6); // NPOSTFIX, NDIRECT
+            try w.bits(0, 2); // context mode
+            try w.bits(0, 1); // NTREESL = 1
+            try w.bits(0, 1); // NTREESD = 1
+            try w.simple(8, &.{'a'}); // literals: no bits
+            try longCommandCode(&w);
+            try w.simple(6, &.{0}); // distance: the last one (4), no bits
+            for (cmds.items) |ic| try longCommand(&w, findCmd(ic[0], ic[1], ic[2] == 1));
+
+            const want = try testing.allocator.alloc(u8, total);
+            defer testing.allocator.free(want);
+            @memset(want, 'a');
+            try expectOut(w.bytes.items, want);
+            const at_edge = GuardedStream.tail(w.bytes.items.len);
+            @memcpy(at_edge, w.bytes.items);
+            const got = try brotli.decompress(testing.allocator, at_edge, .{});
+            defer testing.allocator.free(got);
+            try testing.expectEqualSlices(u8, want, got);
+        }
+    };
+}

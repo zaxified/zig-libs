@@ -5608,6 +5608,24 @@ test "q9: dictionary lookups stop on data that never finds a word" {
     try testing.expect(m.dict_lookups < data.len / 64);
 }
 
+test "q9: a dictionary word whose distance no code reaches is not taken" {
+    // A word's distance is the output so far plus its index (RFC 7932
+    // §8): past `max_code_distance` no distance code names it, whatever its
+    // gain.
+    const gpa = testing.allocator;
+    var found = false;
+    for ([_][]const u8{ "information ", "between the ", "language ", "following " }) |text| {
+        var m = try Matcher.init(gpa, simd_depth, Effort.q6.slotsLog(text.len));
+        defer m.deinit(gpa);
+        m.setData(text);
+        const near = m.findWord(0, 1000, text.len) orelse continue;
+        found = true;
+        try testing.expect(near.dist <= max_code_distance);
+        try testing.expect(m.findWord(0, max_code_distance, text.len) == null);
+    }
+    try testing.expect(found);
+}
+
 /// NBLTYPESL of the stream's first meta-block (a compressed one).
 fn firstLiteralBlockTypes(stream: []const u8) !u32 {
     var br = BitReader.init(stream);
