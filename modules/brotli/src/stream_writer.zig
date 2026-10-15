@@ -306,6 +306,9 @@ test "without a flush: the bytes compressWith gives, whatever the writes and the
         try expectRoundTrip(src, want);
         for ([_]usize{ 1, 999, 65_536 }) |blen| for ([_]usize{ 7, 5_000, 40_000, 300_000 }) |step| {
             if (step == 7 and (blen > 1 or effort != .fast)) continue; // (slow, adds nothing)
+            // `.max` shares every cut with the others; one buffer and two
+            // write sizes keep its share of the run short.
+            if (effort == .max and (blen != 999 or step == 5_000)) continue;
             var out: Writer.Allocating = .init(gpa);
             defer out.deinit();
             const buf = try gpa.alloc(u8, blen);

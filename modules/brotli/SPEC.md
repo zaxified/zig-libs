@@ -186,7 +186,7 @@ bytes verbatim; otherwise it is rolled back out of the bit writer and re-emitted
   more than one. `alice29.txt`: `.default` 51 467 → 51 327, `.best` 50 736 → 50 536. (**Streams of
   `.fast`/`.default`/`.best` changed with it**; re-blessed.)
 - **`.max`: shortest-path parse** (2026-10-15, R2). For a block: every position's candidates are
-  collected once from the bucketed hash (copies each longer than any nearer one, ≤ 48; `max_cands`)
+  collected once from the bucketed hash (copies each longer than any nearer one, ≤ 16; `max_cands` — 16, 32 and 48 gave the same sizes)
   and the static dictionary's (below); the parse is a forward shortest path over positions, where a
   node keeps its cost, the literals since the last copy (so the insert length's price is paid with
   the copy, exactly) and the ring of its own path (so a ring distance is a short code). Prices come
@@ -201,10 +201,14 @@ bytes verbatim; otherwise it is rolled back out of the bit writer and re-emitted
 - **Static-dictionary words** (2026-10-15, `.max`; RFC 7932 §8): a word of 4..24 bytes with a transform
   is named by the distance `max_distance + 1 + (transform << size_bits[len]) + index` (explicit code,
   never a short one, ring untouched), with the word's length as the copy length; the command's
-  `out_len` is what the transform produces. The search keeps an index of the 13 504 words by their
-  first four bytes folded to lower case, and for each prefix string that the position starts with
-  looks the word up and checks the suffix and the cut/upper-cased form; every candidate is confirmed
-  by the decoder's own `transformWord`. Searched: identity, OMIT_LAST_1..9, UPPERCASE_FIRST,
+  `out_len` is what the transform produces. The search (`DictSearch`, built once per encoder) keeps
+  an index of the 13 504 words by their first four bytes folded to lower case; a position is tried
+  with the empty prefix and the prefixes starting with its byte, and per word the lengths the bytes
+  match it as is / with a capital / in capitals pick the cuts that can fit (forms sorted by case and
+  cut), then the suffix is compared; upper-cased forms are confirmed by the decoder's own
+  `transformWord`. The block writer re-makes every word as the decoder will (`checkWord`) and gives
+  the parse up (the block goes out another way) if one differs — negative control: words named one
+  off made the greedy parse win, 50 523 B, still a valid stream. Searched: identity, OMIT_LAST_1..9, UPPERCASE_FIRST,
   UPPERCASE_ALL with all 50 prefix/suffix strings — 113 of 121 transforms; the 8 OMIT_FIRST ones would
   need a suffix index (not done: a few of q11's 1 837 references on `alice29.txt` are of them).
   Not with a prefix dictionary (there distances are counted from its end). Measured on
@@ -212,7 +216,13 @@ bytes verbatim; otherwise it is rolled back out of the bit writer and re-emitted
   of the 152 KB); `SPEC.md` (this file) −6.4 %.
 - **Measured vs google/brotli 1.2.0** (`alice29.txt`): `.max` 46 935 B against q10 47 477 and q11
   46 487 (**+0.96 %**; R2's target was ≤ 2 %); `monkey` 416 (q11 405), `cp852-utf8` 380 (362): small
-  inputs are where the estimate-priced parse is weakest. Time 0.5 s for 152 KB (`.best`: 20 ms).
+  inputs are where the estimate-priced parse is weakest. Time: 0.43–0.77× google/brotli q11 on the
+  bench payloads (`c_max_*`; first version 1.02–1.47×: the dictionary search was half of it — a
+  first-byte filter for prefixes, a folded-key check per word, cut ranges per form — and the
+  distance code a scan, now computed from `d + 3`'s top bits, which every effort gains from).
+  Memory: per position of a block 40 B of node, 4 + 8 of prices and offsets, and up to 16 × 8 B of
+  candidates and 24 × 6 B of words — tens of MB for a 1 MiB block of text, up to ~300 MB in the
+  worst case; `.max` is not for untrusted input on a shared server.
 
 Deliberately *not* implemented, each costing some ratio: block splitting (`NBLTYPES` is always 1),
 `NPOSTFIX`/`NDIRECT` tuning, OMIT_FIRST dictionary transforms, dictionary words below `.max`.

@@ -34,16 +34,23 @@
 //!   for the UTF8 and LSB6 modes, clustered greedily by estimated bits into
 //!   at most 16 codes, the cheaper mode kept — and then checked on real bits
 //!   against a single literal code, keeping the shorter block.
+//! - **Distance contexts** (2026-10-15): the four distance contexts (copy
+//!   length 2, 3, 4, 5+) share one to four codes, the cheapest partition.
+//! - **`.max`** (2026-10-15): a shortest-path parse priced from the block's
+//!   own statistics (`buildCommandsOptimal`) and static-dictionary words
+//!   with their transforms (`DictSearch`); three parses, the shortest as
+//!   written kept.
 //!
 //! ## What it deliberately does not do
 //!
-//! - No block splitting (`NBLTYPES` is always 1), no static-dictionary
-//!   references, no `NPOSTFIX`/`NDIRECT` tuning, no MSB6/SIGNED context modes
-//!   (never the cheaper choice on the measured corpus), no optimal parse.
+//! - No block splitting (`NBLTYPES` is always 1), no `NPOSTFIX`/`NDIRECT`
+//!   tuning, no MSB6/SIGNED context modes (never the cheaper choice on the
+//!   measured corpus), no OMIT_FIRST dictionary transforms, no dictionary
+//!   words below `.max`.
 //!
-//! The result: `alice29.txt` 51 467 bytes at `.default` (reference q5: 52 809,
-//! q9: 51 054, q11: 46 487), 50 736 at `.best`; never worse than store mode by
-//! more than the two-bit final-meta-block marker.
+//! The result: `alice29.txt` 51 327 bytes at `.default` (reference q5: 52 809,
+//! q9: 51 054, q11: 46 487), 50 536 at `.best`, 46 935 at `.max`; never worse
+//! than store mode by more than the two-bit final-meta-block marker.
 //!
 //! ## How the bit-level format is anchored
 //!
@@ -241,15 +248,18 @@ const dist_lut: [dist_alphabet_large]DistCode = blk: {
 /// Smallest explicit distance code (>= 16) whose range contains `d`, or null
 /// when `d` is outside the first `n` codes (`dist_alphabet_size`, or
 /// `dist_alphabet_large` in a large-window stream).
+/// With NPOSTFIX = NDIRECT = 0 the code follows from `d + 3`'s top bits:
+/// `nbits = log2(d + 3) - 1`, the bit below the top one picks the half
+/// (`dist_lut` is the same recurrence written out; the scan this replaced
+/// was 5-10 % of `.max`).
 fn distanceCode(d: u32, n: usize) ?struct { sym: u16, extra: u32, nbits: u5 } {
-    var c: usize = tables.num_distance_short_codes;
-    while (c < n) : (c += 1) {
-        const e = dist_lut[c];
-        if (d < e.offset) continue;
-        const span: u64 = @as(u64, 1) << e.nbits;
-        if (d - e.offset < span) return .{ .sym = @intCast(c), .extra = d - e.offset, .nbits = e.nbits };
-    }
-    return null;
+    if (d == 0) return null;
+    const x: u64 = @as(u64, d) + 3;
+    const nbits: u6 = @intCast(std.math.log2_int(u64, x) - 1);
+    const half: u64 = (x >> nbits) & 1;
+    const c: usize = tables.num_distance_short_codes + 2 * (@as(usize, nbits) - 1) + @as(usize, @intCast(half));
+    if (c >= n) return null;
+    return .{ .sym = @intCast(c), .extra = @intCast(x - ((2 + half) << nbits)), .nbits = @intCast(nbits) };
 }
 
 /// The decoder's ring of the last four distances, as RFC 7932 §4 defines it,
@@ -1108,8 +1118,10 @@ const Matcher = struct {
 
 /// A copy `Matcher.collect` found: length and the decoder's distance.
 const Cand = struct { len: u32, dist: u32 };
-/// Most candidates kept for a position.
-const max_cands = 48;
+/// Most candidates kept for a position — the parse's memory: 8 bytes each
+/// per position of the block. 16, 32 and 48 gave the same sizes on the bench
+/// payloads (2026-10-15).
+const max_cands = 16;
 
 // `.fast` has a match finder of its own (2026-10-14). `Matcher` keeps a count
 // per bucket to know which slots are written and walks them newest first: a
@@ -1467,24 +1479,90 @@ const max_dict_cands = 24;
 
 const DictCand = struct { n: u8, wl: u8, t: u8, idx: u16 };
 
-/// Transforms of each prefix id whose type the search handles (identity,
-/// OMIT_LAST_n, UPPERCASE_FIRST / ALL).
-const dict_groups: struct { ids: [50][transforms.num_transforms]u8, counts: [50]u8 } = blk: {
-    var ids: [50][transforms.num_transforms]u8 = undefined;
-    var counts: [50]u8 = @splat(0);
+/// A transform the search handles: its cut from the end (OMIT_LAST_n), its
+/// case form and its suffix (an offset into `transforms.prefix_suffix`).
+const DictForm = struct { t: u8, omit: u8, upper: Upper, suf_off: u8, suf_len: u8 };
+const Upper = enum(u2) { none, first, all };
+
+/// The searched transforms (identity, OMIT_LAST_n, UPPERCASE_FIRST / ALL) of
+/// each prefix id, and the prefix ids by their prefix's first byte: a
+/// position is tried only against the prefixes it can start with.
+const dict_tables: struct {
+    forms: [50][transforms.num_transforms]DictForm,
+    nforms: [50]u8,
+    pre_off: [50]u8,
+    pre_len: [50]u8,
+    by_first: [256][24]u8,
+    nby_first: [256]u8,
+    empties: [4]u8,
+    nempty: u8,
+    /// `forms[pid]` is sorted by case form, then cut: those of form `u`
+    /// cutting `o` bytes are `forms[pid][at[pid][u][o]..at[pid][u][o + 1]]`.
+    at: [50][3][11]u8,
+} = blk: {
+    @setEvalBranchQuota(100_000);
+    var forms: [50][transforms.num_transforms]DictForm = undefined;
+    var nforms: [50]u8 = @splat(0);
+    var pre_off: [50]u8 = undefined;
+    var pre_len: [50]u8 = undefined;
+    for (0..50) |id| {
+        const off = transforms.prefix_suffix_map[id];
+        pre_off[id] = off + 1;
+        pre_len[id] = transforms.prefix_suffix[off];
+    }
     for (0..transforms.num_transforms) |t| {
         const pid = transforms.transforms_data[t * 3];
         const ty = transforms.transforms_data[t * 3 + 1];
+        const sid = transforms.transforms_data[t * 3 + 2];
         if (ty > 11) continue;
-        ids[pid][counts[pid]] = @intCast(t);
-        counts[pid] += 1;
+        forms[pid][nforms[pid]] = .{
+            .t = t,
+            .omit = if (ty <= 9) ty else 0,
+            .upper = if (ty == 10) .first else if (ty == 11) .all else .none,
+            .suf_off = pre_off[sid],
+            .suf_len = pre_len[sid],
+        };
+        nforms[pid] += 1;
     }
-    break :blk .{ .ids = ids, .counts = counts };
+    var at: [50][3][11]u8 = undefined;
+    for (0..50) |id| {
+        // Counting sort by (form, cut).
+        var sorted: [transforms.num_transforms]DictForm = undefined;
+        var k: u8 = 0;
+        for (0..3) |u| {
+            for (0..10) |o| {
+                at[id][u][o] = k;
+                for (forms[id][0..nforms[id]]) |f| {
+                    if (@intFromEnum(f.upper) == u and f.omit == o) {
+                        sorted[k] = f;
+                        k += 1;
+                    }
+                }
+            }
+            at[id][u][10] = k;
+        }
+        forms[id] = sorted;
+    }
+    var by_first: [256][24]u8 = undefined;
+    var nby_first: [256]u8 = @splat(0);
+    var empties: [4]u8 = undefined;
+    var nempty: u8 = 0;
+    for (0..50) |id| {
+        if (nforms[id] == 0) continue;
+        if (pre_len[id] == 0) {
+            empties[nempty] = id;
+            nempty += 1;
+        } else {
+            const b = transforms.prefix_suffix[pre_off[id]];
+            by_first[b][nby_first[b]] = id;
+            nby_first[b] += 1;
+        }
+    }
+    break :blk .{ .forms = forms, .nforms = nforms, .pre_off = pre_off, .pre_len = pre_len, .by_first = by_first, .nby_first = nby_first, .empties = empties, .nempty = nempty, .at = at };
 };
 
-fn affix(id: u8) []const u8 {
-    const off = transforms.prefix_suffix_map[id];
-    return transforms.prefix_suffix[off + 1 ..][0..transforms.prefix_suffix[off]];
+fn psSlice(off: u8, len: u8) []const u8 {
+    return transforms.prefix_suffix[off..][0..len];
 }
 
 const DictSearch = struct {
@@ -1492,6 +1570,9 @@ const DictSearch = struct {
     next: []u32,
     wlen: []u8,
     widx: []u16,
+    /// Each word's first four bytes folded to lower case (`fold4`): most
+    /// of a bucket is told apart by it alone.
+    wkey: []u32,
 
     const n_words = blk: {
         var n: usize = 0;
@@ -1501,14 +1582,18 @@ const DictSearch = struct {
         break :blk n;
     };
 
-    fn foldKey(b: []const u8) u32 {
+    fn fold4(b: []const u8) u32 {
         var v: u32 = 0;
         for (0..4) |k| {
             var c = b[k];
             if (c >= 'A' and c <= 'Z') c += 32;
             v |= @as(u32, c) << @intCast(8 * k);
         }
-        return (v *% 0x9e3779b1) >> (32 - dict_hash_bits);
+        return v;
+    }
+
+    fn bucket(key: u32) u32 {
+        return (key *% 0x9e3779b1) >> (32 - dict_hash_bits);
     }
 
     fn init(gpa: std.mem.Allocator) std.mem.Allocator.Error!DictSearch {
@@ -1519,6 +1604,8 @@ const DictSearch = struct {
         const wlen = try gpa.alloc(u8, n_words);
         errdefer gpa.free(wlen);
         const widx = try gpa.alloc(u16, n_words);
+        errdefer gpa.free(widx);
+        const wkey = try gpa.alloc(u32, n_words);
         @memset(heads, 0);
         var wid: usize = 0;
         for (dictionary.min_word_length..dictionary.max_word_length + 1) |n| {
@@ -1526,7 +1613,8 @@ const DictSearch = struct {
             if (bits == 0) continue;
             for (0..@as(usize, 1) << @intCast(bits)) |idx| {
                 const word = dictionary.data[dictionary.offsets_by_length[n] + idx * n ..][0..n];
-                const k = foldKey(word);
+                wkey[wid] = fold4(word);
+                const k = bucket(wkey[wid]);
                 wlen[wid] = @intCast(n);
                 widx[wid] = @intCast(idx);
                 next[wid] = heads[k];
@@ -1534,7 +1622,7 @@ const DictSearch = struct {
                 wid += 1;
             }
         }
-        return .{ .heads = heads, .next = next, .wlen = wlen, .widx = widx };
+        return .{ .heads = heads, .next = next, .wlen = wlen, .widx = widx, .wkey = wkey };
     }
 
     fn deinit(self: *DictSearch, gpa: std.mem.Allocator) void {
@@ -1542,54 +1630,87 @@ const DictSearch = struct {
         gpa.free(self.next);
         gpa.free(self.wlen);
         gpa.free(self.widx);
+        gpa.free(self.wkey);
     }
 
     /// The (word, transform) pairs whose output is `data[p..]`'s start, the
     /// output ending at `limit` at most.
     fn find(self: *const DictSearch, data: []const u8, p: usize, limit: usize, out: *[max_dict_cands]DictCand) usize {
         var found: usize = 0;
-        for (dict_groups.counts, 0..) |cnt, pid| {
-            if (cnt == 0) continue;
-            const pre = affix(@intCast(pid));
+        for (dict_tables.empties[0..dict_tables.nempty]) |pid| {
+            found = self.findAfter(data, p, p, limit, pid, out, found);
+        }
+        if (p >= limit) return found;
+        for (dict_tables.by_first[data[p]][0..dict_tables.nby_first[data[p]]]) |pid| {
+            const pre = psSlice(dict_tables.pre_off[pid], dict_tables.pre_len[pid]);
             if (p + pre.len + 4 > limit) continue;
             if (!std.mem.eql(u8, data[p..][0..pre.len], pre)) continue;
-            const q = p + pre.len;
-            var w = self.heads[foldKey(data[q..][0..4])];
-            while (w != 0) : (w = self.next[w - 1]) {
-                const n: usize = self.wlen[w - 1];
-                const idx: usize = self.widx[w - 1];
-                const word = dictionary.data[dictionary.offsets_by_length[n] + idx * n ..][0..n];
-                for (dict_groups.ids[pid][0..cnt]) |t| {
-                    const ty = transforms.transforms_data[@as(usize, t) * 3 + 1];
-                    const omit: usize = if (ty <= 9) ty else 0;
-                    if (n < omit + 4) continue;
-                    const m = n - omit;
-                    const suf = affix(transforms.transforms_data[@as(usize, t) * 3 + 2]);
-                    const wl = pre.len + m + suf.len;
+            found = self.findAfter(data, p, p + pre.len, limit, pid, out, found);
+        }
+        return found;
+    }
+
+    /// `find` for one prefix id whose prefix `data[p..q)` is.
+    fn findAfter(self: *const DictSearch, data: []const u8, p: usize, q: usize, limit: usize, pid: u8, out: *[max_dict_cands]DictCand, found_in: usize) usize {
+        var found = found_in;
+        if (q + 4 > limit or found == max_dict_cands) return found;
+        const forms = &dict_tables.forms[pid];
+        const at = &dict_tables.at[pid];
+        const pre_len = q - p;
+        const key = fold4(data[q..][0..4]);
+        var w = self.heads[bucket(key)];
+        while (w != 0) : (w = self.next[w - 1]) {
+            if (self.wkey[w - 1] != key) continue;
+            const n: usize = self.wlen[w - 1];
+            const idx: usize = self.widx[w - 1];
+            const word = dictionary.data[dictionary.offsets_by_length[n] + idx * n ..][0..n];
+            const cmp = @min(n, limit - q);
+            // How far the bytes are the word as it is, with its first letter
+            // a capital, and in capitals (ASCII; `transformWord` confirms).
+            const same = commonLen(word[0..cmp], data[q..][0..cmp]);
+            const first_up = word[0] >= 'a' and word[0] <= 'z' and data[q] == word[0] - 32;
+            var rest_len: usize = 0;
+            var all_len: usize = 0;
+            if (first_up) {
+                rest_len = 1 + commonLen(word[1..cmp], data[q + 1 ..][0 .. cmp - 1]);
+                all_len = 1;
+                while (all_len < cmp) : (all_len += 1) {
+                    const c = word[all_len];
+                    const up = if (c >= 'a' and c <= 'z') c - 32 else c;
+                    if (data[q + all_len] != up) break;
+                }
+            } else if (same < 4) continue;
+            // A form fits when the bytes match the `m = n - cut` it keeps:
+            // only the cuts from `n - have` on, and every form keeps 4.
+            for ([3]usize{ same, rest_len, all_len }, 0..) |have, u| {
+                if (have < 4) continue;
+                const lo = n - @min(n, have);
+                const hi = @min(n - 4, 9);
+                if (lo > hi) continue;
+                for (forms[at[u][lo]..at[u][hi + 1]]) |f| {
+                    const m = n - f.omit;
+                    const wl = pre_len + m + f.suf_len;
                     if (wl < min_dict_out or p + wl > limit) continue;
-                    if (!std.mem.eql(u8, data[q + m ..][0..suf.len], suf)) continue;
-                    if (ty <= 9) {
-                        if (!std.mem.eql(u8, data[q..][0..m], word[0..m])) continue;
-                    } else {
-                        // Upper-cased: a first (or every) letter a capital.
-                        var ok = data[q] >= 'A' and data[q] <= 'Z';
-                        var j: usize = 1;
-                        while (ok and j < m) : (j += 1) {
-                            ok = if (ty == 10) data[q + j] == word[j] else data[q + j] == word[j] or (word[j] >= 'a' and word[j] <= 'z' and data[q + j] == word[j] - 32);
-                        }
-                        if (!ok) continue;
+                    if (!std.mem.eql(u8, data[q + m ..][0..f.suf_len], psSlice(f.suf_off, f.suf_len))) continue;
+                    if (f.upper != .none) {
+                        // The decoder's own transform decides (UTF-8 upper-casing).
+                        var tmp: [transforms.maxOutputLen(dictionary.max_word_length)]u8 = undefined;
+                        const got = transforms.transformWord(&tmp, word, n, f.t);
+                        if (got != wl or !std.mem.eql(u8, tmp[0..got], data[p..][0..got])) continue;
                     }
-                    // The decoder's own transform decides.
-                    var tmp: [transforms.maxOutputLen(dictionary.max_word_length)]u8 = undefined;
-                    const got = transforms.transformWord(&tmp, word, n, t);
-                    if (got != wl or !std.mem.eql(u8, tmp[0..got], data[p..][0..got])) continue;
-                    out[found] = .{ .n = @intCast(n), .wl = @intCast(wl), .t = t, .idx = @intCast(idx) };
+                    out[found] = .{ .n = @intCast(n), .wl = @intCast(wl), .t = f.t, .idx = @intCast(idx) };
                     found += 1;
                     if (found == max_dict_cands) return found;
                 }
             }
         }
         return found;
+    }
+
+    fn commonLen(a: []const u8, b: []const u8) usize {
+        var i: usize = 0;
+        while (i < a.len and a[i] == b[i]) i += 1;
+        return i;
     }
 };
 
@@ -1813,6 +1934,8 @@ fn buildCommandsOptimal(
     max_dist: usize,
     ring0: DistRing,
     n_dist: usize,
+    /// Null with a prefix dictionary: distances there count from its end.
+    dsearch: ?*const DictSearch,
     parses: *[max_parses]std.ArrayListUnmanaged(Cmd),
 ) std.mem.Allocator.Error!void {
     const n = end - start;
@@ -1826,10 +1949,6 @@ fn buildCommandsOptimal(
     var cands: std.ArrayListUnmanaged(Cand) = .empty;
     defer cands.deinit(gpa);
     var buf: [max_cands]Cand = undefined;
-    // Dictionary words (not with a prefix dictionary: the distances there
-    // are counted from its end).
-    var dsearch: ?DictSearch = if (px) null else try DictSearch.init(gpa);
-    defer if (dsearch) |*d| d.deinit(gpa);
     const doffs = try gpa.alloc(u32, n + 1);
     defer gpa.free(doffs);
     var dcands: std.ArrayListUnmanaged(DictCand) = .empty;
@@ -1844,7 +1963,7 @@ fn buildCommandsOptimal(
         var step: usize = 1;
         if (found > 0 and buf[found - 1].len >= max_take_len) {
             step = buf[found - 1].len;
-        } else if (dsearch) |*d| {
+        } else if (dsearch) |d| {
             const nd = d.find(data, p, end, &dbuf);
             try dcands.appendSlice(gpa, dbuf[0..nd]);
         }
@@ -1936,7 +2055,9 @@ fn buildCommandsOptimal(
                 const word_id: u32 = dc.idx + (@as(u32, dc.t) << @intCast(dictionary.size_bits_by_length[dc.n]));
                 relaxWord(nodes, costs, nd, ic, i, dc, @intCast(reach + 1 + word_id), n_dist);
             }
-            i += if (take != 0) take else 1;
+            // Past the inside of a copy taken whole — unless it could not be
+            // named, and the node after it was not reached.
+            i += if (take != 0 and nodes[i + take].cost != inf) take else 1;
         }
 
         // The path from the end back, copies last-to-first, then reversed.
@@ -2311,8 +2432,10 @@ fn writeCompressedBlock(
             if (c.out_len == 0) {
                 if (c.dist == 0 or c.dist > lit_pos + c.insert_len + env.reach) return error.EncoderInvariant;
                 ring.update(c.dist, short);
-            } else if (c.copy_len < dictionary.min_word_length or c.copy_len > dictionary.max_word_length) {
-                return error.EncoderInvariant;
+            } else {
+                const at = lit_pos + c.insert_len;
+                if (at + c.out_len > end) return error.EncoderInvariant;
+                try checkWord(c, at + env.dropped, env, input[at..][0..c.out_len]);
             }
         }
         if (r.has_dist) {
@@ -2555,7 +2678,33 @@ const BlockEnv = struct {
     /// The stream has a large window (RFC 9841 §6): the larger distance
     /// alphabet.
     large_window: bool = false,
+    /// Of `reach`, the output dropped (the rest is a prefix dictionary).
+    dropped: usize = 0,
+    /// The decoder's `max_backward` (window − 16): a dictionary word's
+    /// distance counts from `min(output so far, max_backward)`.
+    max_backward: usize = (1 << max_window_bits) - 16,
 };
+
+/// The bytes the dictionary word of command `c` stands for, made as the
+/// decoder makes them, are `expect` (RFC 7932 §8); `pos` is the decoder's
+/// output position before it. A word that would decode to anything else is
+/// an encoder bug: the block is stored instead of carrying it.
+fn checkWord(c: Cmd, pos: usize, env: BlockEnv, expect: []const u8) GiveUp!void {
+    const n = c.copy_len;
+    if (n < dictionary.min_word_length or n > dictionary.max_word_length) return error.EncoderInvariant;
+    if (env.reach != env.dropped) return error.EncoderInvariant; // never with a prefix dictionary
+    const max_distance = @min(pos, env.max_backward);
+    if (c.dist <= max_distance) return error.EncoderInvariant;
+    const address = c.dist - max_distance - 1;
+    const shift: u5 = @intCast(dictionary.size_bits_by_length[n]);
+    const idx = address & ((@as(usize, 1) << shift) - 1);
+    const t = address >> shift;
+    if (t >= transforms.num_transforms) return error.EncoderInvariant;
+    const word = dictionary.data[dictionary.offsets_by_length[n] + idx * n ..][0..n];
+    var tmp: [transforms.maxOutputLen(dictionary.max_word_length)]u8 = undefined;
+    const got = transforms.transformWord(&tmp, word, n, t);
+    if (got != c.out_len or !std.mem.eql(u8, tmp[0..got], expect)) return error.EncoderInvariant;
+}
 
 const BlockResult = struct {
     /// Literal codes the block used.
@@ -2795,6 +2944,8 @@ pub const Core = struct {
     /// that sizes each.
     parses: [max_parses]std.ArrayListUnmanaged(Cmd) = @splat(.empty),
     trial: BitWriter,
+    /// `.max`: the static dictionary's index (`DictSearch`), made on first use.
+    dict_search: ?DictSearch = null,
     /// The decoder's last four distances after the blocks so far.
     ring: DistRing = .{},
     /// The last block written was ISLAST.
@@ -2830,6 +2981,7 @@ pub const Core = struct {
         c.scratch.buf.deinit(c.gpa);
         c.cmds.deinit(c.gpa);
         for (&c.parses) |*l| l.deinit(c.gpa);
+        if (c.dict_search) |*d| d.deinit(c.gpa);
         c.trial.buf.deinit(c.gpa);
         c.* = undefined;
     }
@@ -2947,10 +3099,13 @@ pub const Core = struct {
                 try buildCommandsFast(false, gpa, &c.matcher.fast, off, end, max_dist, c.ring, &c.cmds),
             .max => {
                 const n_dist: usize = if (c.wbits > max_window_bits) dist_alphabet_large else dist_alphabet_size;
-                if (c.prefix().len != 0)
-                    try buildCommandsOptimal(true, gpa, &c.matcher.deep, off, end, max_dist, c.ring, n_dist, &c.parses)
-                else
-                    try buildCommandsOptimal(false, gpa, &c.matcher.deep, off, end, max_dist, c.ring, n_dist, &c.parses);
+                if (c.prefix().len != 0) {
+                    try buildCommandsOptimal(true, gpa, &c.matcher.deep, off, end, max_dist, c.ring, n_dist, null, &c.parses);
+                } else {
+                    // Built once per encoder, on its first such block.
+                    if (c.dict_search == null) c.dict_search = try DictSearch.init(gpa);
+                    try buildCommandsOptimal(false, gpa, &c.matcher.deep, off, end, max_dist, c.ring, n_dist, &c.dict_search.?, &c.parses);
+                }
                 // The shortest as written wins: the estimate the parses were
                 // priced by is not the code that comes out.
                 var best_k: usize = 0;
@@ -3016,7 +3171,7 @@ pub const Core = struct {
         // start are zeros, as the decoder's (a dictionary is not output).
         const x = c.prefix();
         const out = c.data[x.len..];
-        const env: BlockEnv = .{ .reach = x.len + x.dropped, .large_window = c.wbits > max_window_bits };
+        const env: BlockEnv = .{ .reach = x.len + x.dropped, .large_window = c.wbits > max_window_bits, .dropped = x.dropped, .max_backward = (@as(usize, 1) << c.wbits) - 16 };
         const first = (try tryBlock(c.gpa, dst, out, off - x.len, end - x.len, c.cmds.items, is_last, &trial, c.effort, false, env)) orelse return false;
         // The context model was chosen on estimated bits. When it split the
         // literals, write the block once more with a single literal code and
@@ -3706,4 +3861,28 @@ test "max: every shape the encoder is checked on" {
         const out = try expectMaxRoundTrip(d, .{}, .{});
         gpa.free(out);
     }
+}
+
+test "max: a dictionary word that would decode to other bytes is refused (block stored)" {
+    // "time" is word 1 of length 4 (RFC 7932 App. A: the list starts
+    // "timedownlifeleftback…"): identity at max_distance + 2.
+    const env: BlockEnv = .{ .max_backward = (1 << 16) - 16 };
+    const n = 4;
+    const idx = std.mem.indexOf(u8, dictionary.data[dictionary.offsets_by_length[n]..][0 .. n << 10], "time").? / n;
+    const pos = 100;
+    const good: Cmd = .{ .insert_len = 0, .copy_len = n, .dist = @intCast(pos + 1 + idx), .out_len = n };
+    try checkWord(good, pos, env, "time");
+    try testing.expectError(error.EncoderInvariant, checkWord(good, pos, env, "tame"));
+    var off = good;
+    off.dist += 1;
+    try testing.expectError(error.EncoderInvariant, checkWord(off, pos, env, "time"));
+    var short = good;
+    short.out_len = 3;
+    try testing.expectError(error.EncoderInvariant, checkWord(short, pos, env, "tim"));
+    // At or below max_distance it is a copy, not a word.
+    var near = good;
+    near.dist = pos;
+    try testing.expectError(error.EncoderInvariant, checkWord(near, pos, env, "time"));
+    // With a prefix dictionary words are never emitted.
+    try testing.expectError(error.EncoderInvariant, checkWord(good, pos, .{ .reach = 10 }, "time"));
 }
