@@ -42,6 +42,129 @@ pub const Rng = struct {
     }
 };
 
+/// Binary data shaped like a TrueType font (R12): big-endian tables whose
+/// statistics differ, one after another — a table directory, glyph outlines
+/// (flag bytes, small signed coordinate deltas; glyphs often a variation of
+/// an earlier one), offsets, metrics, a character map, kerning pairs and
+/// UTF-16BE names. Not a valid font; the same bytes for the same `n` and
+/// `seed`. What block splitting and the SIGNED context mode are for, in the
+/// interop corpus and the bench (`tools/bench.zig`).
+pub fn fontLike(gpa: std.mem.Allocator, n: usize, seed: u64) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    var rng = Rng{ .s = seed };
+    const F = struct {
+        fn be16(o: *std.ArrayList(u8), g: std.mem.Allocator, v: u16) !void {
+            try o.appendSlice(g, &.{ @intCast(v >> 8), @truncate(v) });
+        }
+        fn be32(o: *std.ArrayList(u8), g: std.mem.Allocator, v: u32) !void {
+            try be16(o, g, @intCast(v >> 16));
+            try be16(o, g, @truncate(v));
+        }
+        fn below(r: *Rng, m: u64) u64 {
+            return (r.next() >> 11) % m;
+        }
+        fn signed(r: *Rng, m: u64) i32 {
+            return @as(i32, @intCast(below(r, 2 * m + 1))) - @as(i32, @intCast(m));
+        }
+    };
+    // Table directory.
+    const tags = [_]*const [4]u8{ "cmap", "glyf", "head", "hhea", "hmtx", "kern", "loca", "maxp", "name", "post", "GDEF", "GPOS", "GSUB", "OS/2" };
+    for (tags, 0..) |t, i| {
+        try out.appendSlice(gpa, t);
+        try F.be32(&out, gpa, @truncate(rng.next()));
+        try F.be32(&out, gpa, @intCast(0x100 + i * 0x2000));
+        try F.be32(&out, gpa, @intCast(0x400 + F.below(&rng, 0x8000)));
+    }
+    // Glyph outlines, to about 55 % of `n`.
+    var glyph_starts: std.ArrayList(u32) = .empty;
+    defer glyph_starts.deinit(gpa);
+    const flag_set = [_]u8{ 0x01, 0x33, 0x37, 0x27, 0x07, 0x15, 0x35, 0x23, 0x31, 0x21 };
+    while (out.items.len < n * 55 / 100) {
+        try glyph_starts.append(gpa, @intCast(out.items.len));
+        // A variation of an earlier glyph a third of the time.
+        if (glyph_starts.items.len > 8 and F.below(&rng, 3) == 0) {
+            const k = glyph_starts.items.len - 2 - F.below(&rng, @min(glyph_starts.items.len - 2, 40));
+            const a = glyph_starts.items[k];
+            const b = glyph_starts.items[k + 1];
+            // Room first: the copy comes from the list itself.
+            try out.ensureUnusedCapacity(gpa, b - a);
+            out.appendSliceAssumeCapacity(out.items[a..b]);
+            const len = b - a;
+            for (0..F.below(&rng, 4)) |_| {
+                const at = out.items.len - len + F.below(&rng, len);
+                out.items[at] +%= @intCast(F.below(&rng, 5));
+            }
+            continue;
+        }
+        const contours = 1 + F.below(&rng, 3);
+        try F.be16(&out, gpa, @intCast(contours));
+        for (0..4) |_| try F.be16(&out, gpa, @bitCast(@as(i16, @intCast(F.signed(&rng, 1200)))));
+        var pts: u64 = 0;
+        for (0..contours) |_| {
+            pts += 4 + F.below(&rng, 24);
+            try F.be16(&out, gpa, @intCast(pts - 1));
+        }
+        try F.be16(&out, gpa, 0); // no instructions
+        var flags = try gpa.alloc(u8, pts);
+        defer gpa.free(flags);
+        var i: usize = 0;
+        while (i < pts) {
+            const f = flag_set[F.below(&rng, flag_set.len)];
+            const run = @min(pts - i, 1 + F.below(&rng, 4));
+            @memset(flags[i..][0..run], f);
+            i += run;
+        }
+        try out.appendSlice(gpa, flags);
+        // x then y deltas: a byte when the flag says short, else two.
+        for ([2]u8{ 0x02, 0x04 }) |short| {
+            for (flags) |f| {
+                if (f & short != 0) {
+                    try out.append(gpa, @intCast(F.below(&rng, 90)));
+                } else if (f & (short << 3) == 0) {
+                    try F.be16(&out, gpa, @bitCast(@as(i16, @intCast(F.signed(&rng, 400)))));
+                }
+            }
+        }
+        if (out.items.len % 2 == 1) try out.append(gpa, 0);
+    }
+    const glyphs = glyph_starts.items.len;
+    // Offsets: increasing.
+    for (glyph_starts.items) |g| try F.be32(&out, gpa, g);
+    // Metrics: advance widths around a few common values, small bearings.
+    const widths = [_]u16{ 600, 600, 600, 520, 680, 1000, 280 };
+    for (0..glyphs) |_| {
+        try F.be16(&out, gpa, widths[F.below(&rng, widths.len)] + @as(u16, @intCast(F.below(&rng, 3))));
+        try F.be16(&out, gpa, @bitCast(@as(i16, @intCast(F.signed(&rng, 80)))));
+    }
+    // Character map segments: increasing codes.
+    var code: u32 = 0x20;
+    for (0..@min(glyphs, 2000)) |_| {
+        const start = code + @as(u32, @intCast(F.below(&rng, 40)));
+        const end = start + @as(u32, @intCast(F.below(&rng, 30)));
+        try F.be16(&out, gpa, @truncate(end));
+        try F.be16(&out, gpa, @truncate(start));
+        try F.be16(&out, gpa, @truncate(F.below(&rng, glyphs)));
+        try F.be16(&out, gpa, 0);
+        code = end + 1;
+    }
+    // Kerning pairs: sorted left glyph, small negative values.
+    var left: u64 = 0;
+    while (out.items.len < n * 95 / 100) {
+        left += F.below(&rng, 3);
+        try F.be16(&out, gpa, @truncate(left));
+        try F.be16(&out, gpa, @truncate(F.below(&rng, glyphs)));
+        try F.be16(&out, gpa, @bitCast(@as(i16, @intCast(-@as(i32, @intCast(F.below(&rng, 120)))))));
+    }
+    // Names in UTF-16BE.
+    const names = [_][]const u8{ "Copyright ", "Example Sans ", "Regular ", "Version 2.004 ", "ExampleSans-Regular ", "Designed by nobody in particular ", "Licensed for testing " };
+    while (out.items.len < n) {
+        for (names[F.below(&rng, names.len)]) |ch| try F.be16(&out, gpa, ch);
+    }
+    out.shrinkRetainingCapacity(n);
+    return out.toOwnedSlice(gpa);
+}
+
 /// The encoder's meta-block size. `mixed`/`alice_cycle` shapes straddle it on
 /// purpose: a stream that ends exactly on the boundary, and one byte past it,
 /// have to terminate correctly.
@@ -69,6 +192,8 @@ pub const Gen = union(enum) {
     alice_cycle: usize,
     /// `utf8_mix[0..n]` — non-Latin UTF-8 text.
     utf8_mix: usize,
+    /// `fontLike(n, seed)` — binary data with sections.
+    font_like: struct { n: usize, seed: u64 },
     /// Random on one side of `split`, text on the other: a stored block
     /// followed by a compressed final block, and the reverse.
     mixed: struct { n: usize, split: usize, random_first: bool, seed: u64 },
@@ -119,6 +244,7 @@ pub fn build(gpa: std.mem.Allocator, shape: Shape) ![]u8 {
         },
         .alice_prefix => |n| return gpa.dupe(u8, alice[0..n]),
         .utf8_mix => |n| return gpa.dupe(u8, utf8_mix[0..n]),
+        .font_like => |f| return fontLike(gpa, f.n, f.seed),
         .alice_cycle => |n| {
             const buf = try gpa.alloc(u8, n);
             for (buf, 0..) |*b, i| b.* = alice[i % alice.len];
@@ -197,6 +323,8 @@ pub const shapes = [_]Shape{
     .{ .name = "alice_full", .gen = .{ .alice_prefix = alice.len } },
     // Non-Latin UTF-8: the UTF8 context mode's lead-byte classes.
     .{ .name = "utf8_mix", .gen = .{ .utf8_mix = utf8_mix.len } },
+    // Binary data with sections of different statistics: block types.
+    .{ .name = "font_like", .gen = .{ .font_like = .{ .n = 200_000, .seed = seed_a +% 10 } } },
 
     // Multi-meta-block: stored and compressed blocks in both orders, and the
     // block boundary itself.

@@ -69,6 +69,7 @@ const huffman = @import("huffman.zig");
 const tables = @import("tables.zig");
 const dictionary = @import("dictionary.zig");
 const transforms = @import("transforms.zig");
+const block_split = @import("block_split.zig");
 const BrotliError = @import("errors.zig").BrotliError;
 
 // ---------------------------------------------------------------------------
@@ -2006,7 +2007,7 @@ fn buildCommandsOptimal(
         const out = &parses[pass];
         out.clearRetainingCapacity();
         const prev = parses[pass - 1].items;
-        try chooseLiteralModel(gpa, data[x.len..], start - x.len, prev, .max, model);
+        try chooseLiteralModel(gpa, CmdLiterals{ .input = data[x.len..], .start = start - x.len, .cmds = prev }, .max, model);
         try fitCosts(gpa, costs, prev, ring0, n_dist, model);
         for (model.counts[0..model.ntrees], 0..) |*h, t| bitsOf(h, &costs.lit[t], 8);
         for (lit_cost, 0..) |*lc, i| {
@@ -2188,22 +2189,57 @@ fn unionCost(a: *const [tables.num_literal_symbols]u32, b: *const [tables.num_li
     return nlog2n(total) - sum + 40 + 5 * @as(f64, @floatFromInt(used));
 }
 
-/// Cluster the per-context histograms of `mode` for `input[start..end)`'s
-/// literals (`lits` marks literal positions) and return the model with its
+/// The literals of a block's commands, in order, with the two bytes before
+/// each (zeros before the output's start).
+const CmdLiterals = struct {
+    input: []const u8,
+    start: usize,
+    cmds: []const Cmd,
+
+    inline fn each(s: CmdLiterals, ctx: anytype) void {
+        var pos = s.start;
+        for (s.cmds) |c| {
+            for (0..c.insert_len) |k| {
+                const q = pos + k;
+                const p1: u8 = if (q >= 1) s.input[q - 1] else 0;
+                const p2: u8 = if (q >= 2) s.input[q - 2] else 0;
+                ctx.add(s.input[q], p1, p2);
+            }
+            pos += c.insert_len + c.produced();
+        }
+    }
+};
+
+/// The literals of one block type: the ranges `blocks` of the block's
+/// literal sequence (`lits`, with the two bytes before each in `p1`/`p2`).
+const RangeLiterals = struct {
+    lits: []const u8,
+    p1: []const u8,
+    p2: []const u8,
+    /// (first literal, count) per block of the type.
+    blocks: []const [2]u32,
+
+    inline fn each(s: RangeLiterals, ctx: anytype) void {
+        for (s.blocks) |b| {
+            for (b[0]..b[0] + b[1]) |i| ctx.add(s.lits[i], s.p1[i], s.p2[i]);
+        }
+    }
+};
+
+/// Cluster the per-context histograms of `mode` for the literals of `src`
+/// (`CmdLiterals` or `RangeLiterals`) and return the model with its
 /// estimated cost.
-fn clusterLiterals(input: []const u8, start: usize, cmds: []const Cmd, mode: u2, scratch: *ClusterScratch, out: *LiteralModel) f64 {
+fn clusterLiterals(src: anytype, mode: u2, scratch: *ClusterScratch, out: *LiteralModel) f64 {
     const hist = &scratch.hist;
     hist.* = @splat(@splat(0));
-    var pos = start;
-    for (cmds) |c| {
-        for (0..c.insert_len) |k| {
-            const q = pos + k;
-            const p1: u8 = if (q >= 1) input[q - 1] else 0;
-            const p2: u8 = if (q >= 2) input[q - 2] else 0;
-            hist[contextId(mode, p1, p2)][input[q]] += 1;
+    const Fill = struct {
+        hist: *[num_contexts][tables.num_literal_symbols]u32,
+        mode: u2,
+        inline fn add(f: @This(), b: u8, p1: u8, p2: u8) void {
+            f.hist[contextId(f.mode, p1, p2)][b] += 1;
         }
-        pos += c.insert_len + c.produced();
-    }
+    };
+    src.each(Fill{ .hist = hist, .mode = mode });
 
     // Clusters start as the non-empty contexts.
     var cluster_of: [num_contexts]u8 = @splat(0);
@@ -2299,24 +2335,32 @@ fn clusterLiterals(input: []const u8, start: usize, cmds: []const Cmd, mode: u2,
 /// cheapest clustering over the UTF8, LSB6 and SIGNED context modes. SIGNED
 /// wins on fonts (TTF: 1.2–2.2 % smaller than UTF8, 2026-10-15; google picks
 /// it there too); MSB6 never won on anything measured, so it is not tried.
-fn chooseLiteralModel(gpa: std.mem.Allocator, input: []const u8, start: usize, cmds: []const Cmd, effort: Effort, out: *LiteralModel) std.mem.Allocator.Error!void {
+fn chooseLiteralModel(gpa: std.mem.Allocator, src: anytype, effort: Effort, out: *LiteralModel) std.mem.Allocator.Error!void {
+    return chooseLiteralModelIn(gpa, null, src, effort, out);
+}
+
+/// `chooseLiteralModel` with the caller's scratch, if any (else one is
+/// allocated when clustering is tried at all).
+fn chooseLiteralModelIn(gpa: std.mem.Allocator, scratch_in: ?*ClusterScratch, src: anytype, effort: Effort, out: *LiteralModel) std.mem.Allocator.Error!void {
     out.* = .{};
 
+    const Count = struct {
+        h: *[tables.num_literal_symbols]u32,
+        inline fn add(c: @This(), b: u8, _: u8, _: u8) void {
+            c.h[b] += 1;
+        }
+    };
+    src.each(Count{ .h = &out.counts[0] });
     var n_lits: u64 = 0;
-    var pos = start;
-    for (cmds) |c| {
-        for (input[pos..][0..c.insert_len]) |b| out.counts[0][b] += 1;
-        n_lits += c.insert_len;
-        pos += c.insert_len + c.produced();
-    }
+    for (out.counts[0]) |c| n_lits += c;
     out.single = out.counts[0];
     if (effort == .fast or n_lits < 256) return;
     // Near 8 bits a literal: no context will find structure a single code
     // misses (random or already-compressed bytes).
     if (histogramCost(&out.counts[0]) > 7.9 * @as(f64, @floatFromInt(n_lits))) return;
 
-    const scratch = try gpa.create(ClusterScratch);
-    defer gpa.destroy(scratch);
+    const scratch = scratch_in orelse try gpa.create(ClusterScratch);
+    defer if (scratch_in == null) gpa.destroy(scratch);
     const single = histogramCost(&out.counts[0]);
     var best_cost = single;
     var trial: LiteralModel = undefined;
@@ -2327,7 +2371,7 @@ fn chooseLiteralModel(gpa: std.mem.Allocator, input: []const u8, start: usize, c
     for (out.single[0..0x80]) |c| ascii += c;
     const modes: []const u2 = if (ascii * 100 >= n_lits * ascii_pct) &.{2} else &.{ 2, 0, 3 };
     for (modes) |mode| {
-        const c = clusterLiterals(input, start, cmds, mode, scratch, &trial);
+        const c = clusterLiterals(src, mode, scratch, &trial);
         if (c < best_cost) {
             best_cost = c;
             const all = out.single;
@@ -2345,22 +2389,218 @@ fn writeVarLenUint8(w: *BitWriter, v: u8) std.mem.Allocator.Error!void {
     if (n != 0) try w.writeBits(v - (@as(u32, 1) << n), n);
 }
 
-/// NTREES and, above one tree, the map: no run-length codes (RLEMAX = 0), a
-/// prefix code over the tree ids, no inverse move-to-front.
-fn writeContextMap(gpa: std.mem.Allocator, w: *BitWriter, map: []const u8, ntrees: u8) GiveUp!void {
-    try writeVarLenUint8(w, ntrees - 1);
+/// NTREES and, above one tree, the map (RFC 7932 §7.3): of the two forms —
+/// tree ids as they are, or move-to-front ranks (IMTF) — and RLEMAX 0 or
+/// the longest run's code or one below (runs of zeros as one symbol),
+/// whichever writes shortest. (Every RLEMAX was no shorter on the fonts and
+/// text measured, and cost `.default` 3 %.)
+fn writeContextMap(gpa: std.mem.Allocator, w: *BitWriter, map: []const u8, ntrees: usize) GiveUp!void {
+    try writeVarLenUint8(w, @intCast(ntrees - 1));
     if (ntrees == 1) return;
-    try w.writeBits(0, 1); // RLEMAX = 0
-    var counts = [_]u32{0} ** 256;
-    for (map) |v| counts[v] += 1;
-    var code = try buildAndWriteCode(gpa, w, counts[0..ntrees], ntrees);
-    defer code.deinit(gpa);
-    for (map) |v| try code.emit(w, v);
-    try w.writeBits(0, 1); // IMTF = 0
+    const ranks = try gpa.alloc(u8, map.len);
+    defer gpa.free(ranks);
+    moveToFront(map, ranks);
+    var scratch = BitWriter{ .gpa = gpa };
+    defer scratch.buf.deinit(gpa);
+    var best_bits: usize = std.math.maxInt(usize);
+    var best_mtf = false;
+    var best_rle: u5 = 0;
+    for ([2]bool{ false, true }) |mtf| {
+        // RLEMAX above the longest run's code only adds symbols.
+        const top = longestZeroRunCode(if (mtf) ranks else map);
+        for ([3]u5{ 0, top -| 1, top }, 0..) |rle, k| {
+            if (k > 0 and rle == 0) continue;
+            scratch.resumeAt(.{ .len = 0, .acc = 0, .cnt = 0 });
+            try writeMapSymbols(gpa, &scratch, if (mtf) ranks else map, ntrees, rle, mtf);
+            if (scratch.bitPos() < best_bits) {
+                best_bits = scratch.bitPos();
+                best_mtf = mtf;
+                best_rle = rle;
+            }
+        }
+    }
+    try writeMapSymbols(gpa, w, if (best_mtf) ranks else map, ntrees, best_rle, best_mtf);
 }
+
+/// The move-to-front ranks of `map` (what the decoder's inverse transform
+/// turns back into it).
+fn moveToFront(map: []const u8, out: []u8) void {
+    var order: [256]u8 = undefined;
+    for (&order, 0..) |*o, i| o.* = @intCast(i);
+    for (map, out) |v, *r| {
+        const idx: u8 = @intCast(std.mem.indexOfScalar(u8, &order, v).?);
+        r.* = idx;
+        var j: usize = idx;
+        while (j > 0) : (j -= 1) order[j] = order[j - 1];
+        order[0] = v;
+    }
+}
+
+/// The run-length code of the longest run of zeros in `vals` (0 for none
+/// longer than one), capped at RLEMAX's 16.
+fn longestZeroRunCode(vals: []const u8) u5 {
+    var longest: usize = 0;
+    var run: usize = 0;
+    for (vals) |v| {
+        run = if (v == 0) run + 1 else 0;
+        longest = @max(longest, run);
+    }
+    if (longest < 2) return 0;
+    return @intCast(@min(std.math.log2_int(usize, longest), 16));
+}
+
+/// RLEMAX, the code over `vals` (zero runs as codes 1..`rle`, a value v as
+/// v + `rle`), the symbols, and the IMTF bit.
+fn writeMapSymbols(gpa: std.mem.Allocator, w: *BitWriter, vals: []const u8, ntrees: usize, rle: u5, mtf: bool) GiveUp!void {
+    if (rle == 0) {
+        try w.writeBits(0, 1);
+    } else {
+        try w.writeBits(1, 1);
+        try w.writeBits(rle - 1, 4);
+    }
+    const alphabet = ntrees + rle;
+    var counts: [256 + 16]u32 = @splat(0);
+    var it: ZeroRuns = .{ .vals = vals, .rle = rle };
+    while (it.next()) |sym| counts[sym.code] += 1;
+    var code = try buildAndWriteCode(gpa, w, counts[0..alphabet], @intCast(alphabet));
+    defer code.deinit(gpa);
+    it = .{ .vals = vals, .rle = rle };
+    while (it.next()) |sym| {
+        try code.emit(w, sym.code);
+        if (sym.nbits != 0) try w.writeBits(sym.extra, sym.nbits);
+    }
+    try w.writeBits(@intFromBool(mtf), 1);
+}
+
+/// The symbols of a context map with runs of zeros coded up to `rle`.
+const ZeroRuns = struct {
+    vals: []const u8,
+    rle: u5,
+    i: usize = 0,
+    /// Zeros left of the current run.
+    run: usize = 0,
+
+    fn next(z: *ZeroRuns) ?struct { code: u16, extra: u32, nbits: u5 } {
+        if (z.run == 0) {
+            if (z.i == z.vals.len) return null;
+            const v = z.vals[z.i];
+            if (v != 0 or z.rle == 0) {
+                z.i += 1;
+                return .{ .code = if (v == 0) 0 else @as(u16, v) + z.rle, .extra = 0, .nbits = 0 };
+            }
+            while (z.i < z.vals.len and z.vals[z.i] == 0) : (z.i += 1) z.run += 1;
+        }
+        if (z.run == 1) {
+            z.run = 0;
+            return .{ .code = 0, .extra = 0, .nbits = 0 };
+        }
+        // Code k covers 2^k .. 2^(k+1) - 1 zeros.
+        const k: u5 = @intCast(@min(std.math.log2_int(usize, z.run), z.rle));
+        const take = @min(z.run, (@as(usize, 2) << k) - 1);
+        z.run -= take;
+        return .{ .code = k, .extra = @intCast(take - (@as(usize, 1) << k)), .nbits = k };
+    }
+};
 
 // ---------------------------------------------------------------------------
 // Meta-block writers.
+
+/// One command resolved for writing: its symbol, extra bits and distance.
+const Resolved = struct {
+    sym: u16,
+    insert_extra: u32,
+    insert_nbits: u5,
+    copy_extra: u32,
+    copy_nbits: u5,
+    dist_sym: u16,
+    dist_extra: u32,
+    dist_nbits: u5,
+    has_dist: bool,
+    /// The distance context (`distContext`) of the command's copy.
+    dist_ctx: u2,
+};
+
+/// The codes and maps a meta-block's commands are written with.
+const Layout = struct {
+    lit_codes: []const Code,
+    /// 64 entries per literal block type.
+    lit_map: []const u8,
+    lit_modes: []const u2,
+    /// One per command block type.
+    cmd_codes: []const Code,
+    dist_codes: []const Code,
+    /// Four entries per distance block type.
+    dist_map: []const u8,
+};
+
+/// The commands of a meta-block, with block switches when `split`. Without,
+/// the codes and maps are copied into locals: behind slices, every
+/// `writeBits` (a store) made the compiler load them again per command —
+/// `.default` was 7 % slower in cycles (2026-10-15).
+fn emitCommands(
+    comptime split: bool,
+    w: *BitWriter,
+    input: []const u8,
+    start: usize,
+    cmds: []const Cmd,
+    res: []const Resolved,
+    blocks: *[3]BlockCodes,
+    l: Layout,
+) GiveUp!void {
+    const cmd_code0 = l.cmd_codes[0];
+    const lit_map0: [num_contexts]u8 = l.lit_map[0..num_contexts].*;
+    const mode0 = l.lit_modes[0];
+    const dist_map0: [dist_contexts]u8 = l.dist_map[0..dist_contexts].*;
+    const one_literal_code = !split and l.lit_codes.len == 1;
+    var lit_pos = start;
+    for (cmds, res) |c, r| {
+        if (split) {
+            try blocks[1].step(w);
+            try l.cmd_codes[blocks[1].cur()].emit(w, r.sym);
+        } else {
+            try cmd_code0.emit(w, r.sym);
+        }
+        if (r.insert_nbits != 0) try w.writeBits(r.insert_extra, r.insert_nbits);
+        if (r.copy_nbits != 0) try w.writeBits(r.copy_extra, r.copy_nbits);
+        const lits_here = input[lit_pos..][0..c.insert_len];
+        if (one_literal_code) {
+            // No context to look up; two codes of at most 15 bits fit one
+            // `writeBits`.
+            const code = l.lit_codes[0];
+            var k: usize = 0;
+            while (k + 2 <= lits_here.len) : (k += 2) {
+                const l0: u5 = @intCast(code.len[lits_here[k]]);
+                const l1: u5 = @intCast(code.len[lits_here[k + 1]]);
+                try w.writeBits(@as(u32, code.bits[lits_here[k]]) | @as(u32, code.bits[lits_here[k + 1]]) << l0, @as(u6, l0) + l1);
+            }
+            if (k < lits_here.len) try code.emit(w, lits_here[k]);
+        } else if (!split or blocks[0].split.ntypes == 1) {
+            for (lit_pos..lit_pos + c.insert_len) |q| {
+                const p1: u8 = if (q >= 1) input[q - 1] else 0;
+                const p2: u8 = if (q >= 2) input[q - 2] else 0;
+                try l.lit_codes[lit_map0[contextId(mode0, p1, p2)]].emit(w, input[q]);
+            }
+        } else {
+            for (lit_pos..lit_pos + c.insert_len) |q| {
+                try blocks[0].step(w);
+                const t: usize = blocks[0].cur();
+                const p1: u8 = if (q >= 1) input[q - 1] else 0;
+                const p2: u8 = if (q >= 2) input[q - 2] else 0;
+                try l.lit_codes[l.lit_map[t * num_contexts + contextId(l.lit_modes[t], p1, p2)]].emit(w, input[q]);
+            }
+        }
+        lit_pos += c.insert_len;
+        if (r.has_dist) {
+            const tree = if (split) blk: {
+                try blocks[2].step(w);
+                break :blk l.dist_map[@as(usize, blocks[2].cur()) * dist_contexts + r.dist_ctx];
+            } else dist_map0[r.dist_ctx];
+            try l.dist_codes[tree].emit(w, r.dist_sym);
+            if (r.dist_nbits != 0) try w.writeBits(r.dist_extra, r.dist_nbits);
+        }
+        lit_pos += c.produced();
+    }
+}
 
 /// Write one compressed meta-block for `input[start..end)`.
 fn writeCompressedBlock(
@@ -2383,19 +2623,6 @@ fn writeCompressedBlock(
     if (cmds.len == 0) return error.EncoderInvariant;
 
     // --- resolve every command and histogram the three alphabets ------------
-    const Resolved = struct {
-        sym: u16,
-        insert_extra: u32,
-        insert_nbits: u5,
-        copy_extra: u32,
-        copy_nbits: u5,
-        dist_sym: u16,
-        dist_extra: u32,
-        dist_nbits: u5,
-        has_dist: bool,
-        /// The distance context (`distContext`) of the command's copy.
-        dist_ctx: u2,
-    };
     const res = try gpa.alloc(Resolved, cmds.len);
     defer gpa.free(res);
 
@@ -2466,36 +2693,204 @@ fn writeCompressedBlock(
     // would run past the end of the meta-block.
     if (covered != n) return error.EncoderInvariant;
 
+    // --- block splits (`.best`, `.max`) -------------------------------------
+    // Literals, insert-and-copy symbols and distance symbols each cut into
+    // blocks of a few types, each type with codes of its own (RFC 7932 §6):
+    // a font's or a binary's sections differ. One type each elsewhere.
+    const split_on = effort == .best or effort == .max;
+    const rounds: u32 = if (effort == .max) 4 else 2;
+    var n_lits: usize = 0;
+    var n_dsyms: usize = 0;
+    var ascii_lits: usize = 0;
+    {
+        var q = start;
+        for (cmds, res) |c, r| {
+            if (split_on) {
+                for (input[q..][0..c.insert_len]) |b| ascii_lits += @intFromBool(b < 0x80);
+            }
+            n_lits += c.insert_len;
+            n_dsyms += @intFromBool(r.has_dist);
+            q += c.insert_len + c.produced();
+        }
+    }
+    // Literals are split only when not nearly all ASCII: on text, HTML and
+    // JSON literal block types won nothing measurable (−0.2 % to +0.2 %)
+    // for a tenth of `.best`'s time; on fonts 3–6 %.
+    const split_lits = split_on and !single_literal_code and ascii_lits * 100 < n_lits * ascii_pct;
+    // The literal sequence, then the byte before each, then the one before
+    // that (the context).
+    const lits = try gpa.alloc(u8, if (split_lits) 3 * n_lits else 0);
+    defer gpa.free(lits);
+    if (split_lits) {
+        var k: usize = 0;
+        var q0 = start;
+        for (cmds) |c| {
+            for (q0..q0 + c.insert_len) |q| {
+                lits[k] = input[q];
+                lits[n_lits + k] = if (q >= 1) input[q - 1] else 0;
+                lits[2 * n_lits + k] = if (q >= 2) input[q - 2] else 0;
+                k += 1;
+            }
+            q0 += c.insert_len + c.produced();
+        }
+    }
+    var blocks: [3]BlockCodes = undefined;
+    var n_blocks: usize = 0;
+    defer for (blocks[0..n_blocks]) |*b| b.deinit(gpa);
+    blocks[0] = try .init(gpa, if (split_lits)
+        try block_split.split(u8, gpa, lits[0..n_lits], tables.num_literal_symbols, lit_split_params(rounds))
+    else
+        try block_split.Split.single(gpa, n_lits));
+    n_blocks = 1;
+    {
+        const syms = try gpa.alloc(u16, @max(cmds.len, n_dsyms));
+        defer gpa.free(syms);
+        for (res, syms[0..cmds.len]) |r, *s| s.* = r.sym;
+        blocks[1] = try .init(gpa, if (split_on)
+            try block_split.split(u16, gpa, syms[0..cmds.len], tables.num_command_symbols, cmd_split_params(rounds))
+        else
+            try block_split.Split.single(gpa, cmds.len));
+        n_blocks = 2;
+        var k: usize = 0;
+        for (res) |r| {
+            if (!r.has_dist) continue;
+            syms[k] = r.dist_sym;
+            k += 1;
+        }
+        blocks[2] = try .init(gpa, if (split_on)
+            try block_split.split(u16, gpa, syms[0..n_dsyms], n_dist, dist_split_params(rounds))
+        else
+            try block_split.Split.single(gpa, n_dsyms));
+        n_blocks = 3;
+    }
+    const lt: usize = blocks[0].split.ntypes;
+    const it: usize = blocks[1].split.ntypes;
+    const dt: usize = blocks[2].split.ntypes;
+
+    // --- literal model: per literal block type a context mode and map; the
+    // codes are shared across types ------------------------------------------
     const model = try gpa.create(LiteralModel);
     defer gpa.destroy(model);
-    try chooseLiteralModel(gpa, input, start, cmds, if (single_literal_code) .fast else effort, model);
+    const lit_modes = try gpa.alloc(u2, lt);
+    defer gpa.free(lit_modes);
+    const lit_map = try gpa.alloc(u8, lt * num_contexts);
+    defer gpa.free(lit_map);
+    var single_counts: [tables.num_literal_symbols]u32 = undefined;
+    var lit_ntrees: usize = 0;
+    const lit_alloc: [][tables.num_literal_symbols]u32 = if (lt == 1) blk: {
+        try chooseLiteralModel(gpa, CmdLiterals{ .input = input, .start = start, .cmds = cmds }, if (single_literal_code) .fast else effort, model);
+        lit_modes[0] = model.mode;
+        @memcpy(lit_map, &model.map);
+        const a = try gpa.alloc([tables.num_literal_symbols]u32, model.ntrees);
+        @memcpy(a, model.counts[0..model.ntrees]);
+        single_counts = model.single;
+        lit_ntrees = model.ntrees;
+        break :blk a;
+    } else blk: {
+        // Each type's own model — its own context mode and grouping — then
+        // the codes of all types merged where one code serves several. (One
+        // mode and grouping for all types, with a code per (type, group),
+        // was 8 % faster at `.best` but 0.2–0.5 % larger on fonts,
+        // 2026-10-15.)
+        const first_tree = try gpa.alloc(u32, lt + 1);
+        defer gpa.free(first_tree);
+        const ranges = try gpa.alloc([2]u32, blocks[0].split.lens.len);
+        defer gpa.free(ranges);
+        const scratch = try gpa.create(ClusterScratch);
+        defer gpa.destroy(scratch);
+        var all: std.ArrayListUnmanaged([tables.num_literal_symbols]u32) = .empty;
+        errdefer all.deinit(gpa);
+        single_counts = @splat(0);
+        const src_lits = lits[0..n_lits];
+        const src_p1 = lits[n_lits..][0..n_lits];
+        const src_p2 = lits[2 * n_lits ..][0..n_lits];
+        for (0..lt) |t| {
+            var nr: usize = 0;
+            var at: u32 = 0;
+            for (blocks[0].split.types, blocks[0].split.lens) |bt, bl| {
+                if (bt == t) {
+                    ranges[nr] = .{ at, bl };
+                    nr += 1;
+                }
+                at += bl;
+            }
+            try chooseLiteralModelIn(gpa, scratch, RangeLiterals{ .lits = src_lits, .p1 = src_p1, .p2 = src_p2, .blocks = ranges[0..nr] }, effort, model);
+            lit_modes[t] = model.mode;
+            first_tree[t] = @intCast(all.items.len);
+            @memcpy(lit_map[t * num_contexts ..][0..num_contexts], &model.map);
+            try all.appendSlice(gpa, model.counts[0..model.ntrees]);
+            addInto(&single_counts, &model.single);
+        }
+        const total: u32 = @intCast(all.items.len);
+        const remap = try gpa.alloc(u32, total);
+        defer gpa.free(remap);
+        const flat = @as([*]u32, @ptrCast(all.items.ptr))[0 .. @as(usize, total) * tables.num_literal_symbols];
+        lit_ntrees = try block_split.mergeHistograms(gpa, flat, tables.num_literal_symbols, total, 256, remap);
+        for (0..lt) |t| {
+            for (lit_map[t * num_contexts ..][0..num_contexts]) |*m| m.* = @intCast(remap[first_tree[t] + m.*]);
+        }
+        break :blk try all.toOwnedSlice(gpa);
+    };
+    defer gpa.free(lit_alloc);
+    const lit_counts = lit_alloc[0..lit_ntrees];
     // Every code needs at least one symbol even when unused.
-    var padded: [max_literal_trees]bool = @splat(false);
-    for (model.counts[0..model.ntrees], 0..) |*h, t| {
+    const padded = try gpa.alloc(bool, lit_ntrees);
+    defer gpa.free(padded);
+    for (lit_counts, padded) |*h, *pad| {
         var any = false;
         for (h) |c| {
             if (c != 0) any = true;
         }
-        if (!any) {
-            h[0] = 1;
-            padded[t] = true;
-        }
+        pad.* = !any;
+        if (!any) h[0] = 1;
     }
 
-    // The distance contexts that share a code, by estimated bits.
-    var dist_map: [dist_contexts]u8 = undefined;
-    const dist_trees = clusterDistances(&dist_counts, n_dist, &dist_map);
-    var dist_tree_counts: [dist_contexts][dist_alphabet_large]u32 = @splat(@splat(0));
-    for (0..dist_contexts) |ctx| {
-        for (dist_counts[ctx][0..n_dist], dist_tree_counts[dist_map[ctx]][0..n_dist]) |c, *t| t.* += c;
+    // --- command codes: one per command block type ---------------------------
+    const cmd_type_counts = try gpa.alloc(u32, it * tables.num_command_symbols);
+    defer gpa.free(cmd_type_counts);
+    if (it == 1) {
+        @memcpy(cmd_type_counts, cmd_counts);
+    } else {
+        @memset(cmd_type_counts, 0);
+        var walk: TypeWalk = .{ .split = &blocks[1].split };
+        for (res) |r| cmd_type_counts[@as(usize, walk.next()) * tables.num_command_symbols + r.sym] += 1;
+    }
+    for (0..it) |t| {
+        const h = cmd_type_counts[t * tables.num_command_symbols ..][0..tables.num_command_symbols];
+        if (std.mem.allEqual(u32, h, 0)) h[0] = 1;
+    }
+
+    // --- distance codes: per distance block type, its four contexts grouped
+    // (`clusterDistances`); the groups of all types numbered in a row --------
+    const dist_map = try gpa.alloc(u8, dt * dist_contexts);
+    defer gpa.free(dist_map);
+    const dist_type_counts = try gpa.alloc([dist_contexts][dist_alphabet_large]u32, dt);
+    defer gpa.free(dist_type_counts);
+    if (dt == 1) {
+        dist_type_counts[0] = dist_counts;
+    } else {
+        @memset(dist_type_counts, @splat(@splat(0)));
+        var walk: TypeWalk = .{ .split = &blocks[2].split };
+        for (res) |r| {
+            if (r.has_dist) dist_type_counts[walk.next()][r.dist_ctx][r.dist_sym] += 1;
+        }
+    }
+    var dist_trees: usize = 0;
+    const dist_tree_counts = try gpa.alloc([dist_alphabet_large]u32, dt * dist_contexts);
+    defer gpa.free(dist_tree_counts);
+    @memset(dist_tree_counts, @splat(0));
+    for (0..dt) |t| {
+        var m: [dist_contexts]u8 = undefined;
+        const ntr = clusterDistances(&dist_type_counts[t], n_dist, &m);
+        for (0..dist_contexts) |ctx| {
+            dist_map[t * dist_contexts + ctx] = @intCast(dist_trees + m[ctx]);
+            for (dist_type_counts[t][ctx][0..n_dist], dist_tree_counts[dist_trees + m[ctx]][0..n_dist]) |c, *o| o.* += c;
+        }
+        dist_trees += ntr;
     }
     // Every code needs at least one symbol even when unused.
     for (dist_tree_counts[0..dist_trees]) |*h| {
-        var any = false;
-        for (h[0..n_dist]) |c| {
-            if (c != 0) any = true;
-        }
-        if (!any) h[0] = 1;
+        if (std.mem.allEqual(u32, h[0..n_dist], 0)) h[0] = 1;
     }
 
     // --- meta-block header --------------------------------------------------
@@ -2512,57 +2907,69 @@ fn writeCompressedBlock(
     try w.writeBits(mlen_minus_1, size_nibbles * 4);
     if (!is_last) try w.writeBits(0, 1); // ISUNCOMPRESSED = 0
 
-    // NBLTYPES = 1 for literals, commands and distances (varlen uint8 zero).
-    try w.writeBits(0, 1);
-    try w.writeBits(0, 1);
-    try w.writeBits(0, 1);
+    // NBLTYPES (and above one, the block type and count codes and the first
+    // block's count) for literals, commands and distances.
+    const lit_blocks_from = w.bitPos();
+    try blocks[0].writeHeader(gpa, w);
+    // The literal side's bits, to price one literal code against them.
+    var lit_part = w.bitPos() - lit_blocks_from;
+    try blocks[1].writeHeader(gpa, w);
+    try blocks[2].writeHeader(gpa, w);
     // NPOSTFIX = 0, NDIRECT = 0.
     try w.writeBits(0, 6);
-    // One literal block type => one context mode.
-    try w.writeBits(model.mode, 2);
-    // The literal context map; the distance map is a single tree (one zero
-    // bit, the map implicitly all zeros).
+    // A context mode per literal block type.
+    for (lit_modes) |m| try w.writeBits(m, 2);
+    lit_part += 2 * lt;
+    // The literal and distance context maps.
     const map_from = w.bitPos();
-    try writeContextMap(gpa, w, &model.map, model.ntrees);
-    var lit_part = w.bitPos() - map_from;
-    if (dist_trees == 1) {
-        try w.writeBits(0, 1);
-    } else {
-        try writeContextMap(gpa, w, &dist_map, @intCast(dist_trees));
-    }
+    try writeContextMap(gpa, w, lit_map, lit_ntrees);
+    lit_part += w.bitPos() - map_from;
+    try writeContextMap(gpa, w, dist_map, dist_trees);
 
-    var lit_codes: [max_literal_trees]Code = undefined;
+    const lit_codes = try gpa.alloc(Code, lit_ntrees);
+    defer gpa.free(lit_codes);
     var built: usize = 0;
     defer for (lit_codes[0..built]) |*c| c.deinit(gpa);
     const codes_from = w.bitPos();
-    while (built < model.ntrees) : (built += 1) {
-        lit_codes[built] = try buildAndWriteCode(gpa, w, &model.counts[built], tables.num_literal_symbols);
+    while (built < lit_ntrees) : (built += 1) {
+        lit_codes[built] = try buildAndWriteCode(gpa, w, &lit_counts[built], tables.num_literal_symbols);
     }
     lit_part += w.bitPos() - codes_from;
 
-    // With more than one literal code, price the one-code alternative on
-    // exact bits: it differs from this block only in the context map, the
-    // literal code headers and the literal symbols, all known before a
-    // literal is written. `compressWith` writes it only when it is no
-    // longer — rather than writing every such block twice.
+    // With more than one literal code (or literal block type), price the
+    // one-code alternative on exact bits: it differs from this block only
+    // in the literal block types, context modes and map, the literal code
+    // headers, the literal symbols and the literal block switches, all known
+    // before a literal is written. `compressWith` writes it only when it is
+    // no longer — rather than writing every such block twice.
     var single_no_worse = false;
-    if (model.ntrees > 1) {
-        for (model.counts[0..model.ntrees], lit_codes[0..model.ntrees], padded[0..model.ntrees]) |*h, *code, pad| {
+    const multi_literal = lit_ntrees > 1 or lt > 1;
+    if (multi_literal) {
+        for (lit_counts, lit_codes, padded) |*h, *code, pad| {
             if (pad) continue;
             for (h, code.len) |c, l| lit_part += @as(usize, c) * l;
         }
+        lit_part += blocks[0].switchBits();
         var scratch = BitWriter{ .gpa = gpa };
         defer scratch.buf.deinit(gpa);
+        // NBLTYPES = 1, one context mode, a one-code map.
+        try scratch.writeBits(0, 3);
         try writeContextMap(gpa, &scratch, &.{}, 1);
-        var single_code = try buildAndWriteCode(gpa, &scratch, &model.single, tables.num_literal_symbols);
+        var single_code = try buildAndWriteCode(gpa, &scratch, &single_counts, tables.num_literal_symbols);
         defer single_code.deinit(gpa);
         var single_part = scratch.bitPos();
-        for (model.single, single_code.len) |c, l| single_part += @as(usize, c) * l;
+        for (single_counts, single_code.len) |c, l| single_part += @as(usize, c) * l;
         single_no_worse = single_part <= lit_part;
     }
-    var cmd_code = try buildAndWriteCode(gpa, w, cmd_counts, tables.num_command_symbols);
-    defer cmd_code.deinit(gpa);
-    var dist_codes: [dist_contexts]Code = undefined;
+    const cmd_codes = try gpa.alloc(Code, it);
+    defer gpa.free(cmd_codes);
+    var cmd_built: usize = 0;
+    defer for (cmd_codes[0..cmd_built]) |*c| c.deinit(gpa);
+    while (cmd_built < it) : (cmd_built += 1) {
+        cmd_codes[cmd_built] = try buildAndWriteCode(gpa, w, cmd_type_counts[cmd_built * tables.num_command_symbols ..][0..tables.num_command_symbols], tables.num_command_symbols);
+    }
+    const dist_codes = try gpa.alloc(Code, dist_trees);
+    defer gpa.free(dist_codes);
     var dist_built: usize = 0;
     defer for (dist_codes[0..dist_built]) |*c| c.deinit(gpa);
     while (dist_built < dist_trees) : (dist_built += 1) {
@@ -2570,39 +2977,159 @@ fn writeCompressedBlock(
     }
 
     // --- commands -----------------------------------------------------------
-    lit_pos = start;
-    for (cmds, res) |c, r| {
-        try cmd_code.emit(w, r.sym);
-        if (r.insert_nbits != 0) try w.writeBits(r.insert_extra, r.insert_nbits);
-        if (r.copy_nbits != 0) try w.writeBits(r.copy_extra, r.copy_nbits);
-        const lits = input[lit_pos..][0..c.insert_len];
-        if (model.ntrees == 1) {
-            // No context to look up; two codes of at most 15 bits fit one
-            // `writeBits`.
-            const code = &lit_codes[0];
-            var k: usize = 0;
-            while (k + 2 <= lits.len) : (k += 2) {
-                const l0: u5 = @intCast(code.len[lits[k]]);
-                const l1: u5 = @intCast(code.len[lits[k + 1]]);
-                try w.writeBits(@as(u32, code.bits[lits[k]]) | @as(u32, code.bits[lits[k + 1]]) << l0, @as(u6, l0) + l1);
-            }
-            if (k < lits.len) try code.emit(w, lits[k]);
-        } else {
-            for (lit_pos..lit_pos + c.insert_len) |q| {
-                const p1: u8 = if (q >= 1) input[q - 1] else 0;
-                const p2: u8 = if (q >= 2) input[q - 2] else 0;
-                try lit_codes[model.map[contextId(model.mode, p1, p2)]].emit(w, input[q]);
-            }
-        }
-        lit_pos += c.insert_len;
-        if (r.has_dist) {
-            try dist_codes[dist_map[r.dist_ctx]].emit(w, r.dist_sym);
-            if (r.dist_nbits != 0) try w.writeBits(r.dist_extra, r.dist_nbits);
-        }
-        lit_pos += c.produced();
+    const layout: Layout = .{
+        .lit_codes = lit_codes,
+        .lit_map = lit_map,
+        .lit_modes = lit_modes,
+        .cmd_codes = cmd_codes,
+        .dist_codes = dist_codes,
+        .dist_map = dist_map,
+    };
+    if (lt == 1 and it == 1 and dt == 1) {
+        try emitCommands(false, w, input, start, cmds, res, &blocks, layout);
+    } else {
+        try emitCommands(true, w, input, start, cmds, res, &blocks, layout);
     }
-    return .{ .ntrees = model.ntrees, .single_no_worse = single_no_worse };
+    // Every block of every category was used up exactly.
+    for (&blocks) |*b| {
+        if (!b.done()) return error.EncoderInvariant;
+    }
+    return .{ .multi_literal = multi_literal, .single_no_worse = single_no_worse };
 }
+
+/// Block-split parameters per category: about how many symbols a starting
+/// histogram covers, the sampled window, and what a block switch is priced.
+fn lit_split_params(rounds: u32) block_split.Params {
+    return .{ .per_histogram = 544, .sample = 70, .switch_cost = 28, .rounds = rounds, .histograms = 32 };
+}
+
+fn cmd_split_params(rounds: u32) block_split.Params {
+    return .{ .per_histogram = 530, .sample = 40, .switch_cost = 13.5, .rounds = rounds, .histograms = 32 };
+}
+
+fn dist_split_params(rounds: u32) block_split.Params {
+    return .{ .per_histogram = 544, .sample = 40, .switch_cost = 14.5, .rounds = rounds, .histograms = 32 };
+}
+
+/// The block type of each symbol in turn, along a split.
+const TypeWalk = struct {
+    split: *const block_split.Split,
+    b: usize = 0,
+    left: u32 = 0,
+    started: bool = false,
+
+    fn next(w: *TypeWalk) u8 {
+        if (!w.started) {
+            w.started = true;
+            w.left = w.split.lens[0];
+        }
+        while (w.left == 0) {
+            w.b += 1;
+            w.left = w.split.lens[w.b];
+        }
+        w.left -= 1;
+        return w.split.types[w.b];
+    }
+};
+
+/// RFC 7932 §6: the block count code for a block of `len` symbols.
+fn blockLenCode(len: u32) struct { code: u5, extra: u32, nbits: u5 } {
+    var c: usize = tables.num_block_len_symbols - 1;
+    while (tables.block_length_ranges[c].offset > len) c -= 1;
+    const r = tables.block_length_ranges[c];
+    return .{ .code = @intCast(c), .extra = len - r.offset, .nbits = @intCast(r.nbits) };
+}
+
+/// One category's blocks as written: the header part (NBLTYPES, the block
+/// type and count codes, the first count) and, before each symbol, a block
+/// switch when the block before ran out — as the decoder counts them.
+const BlockCodes = struct {
+    split: block_split.Split,
+    /// Each block's type code (RFC 7932 §6: 0 = the type before the last,
+    /// 1 = the last + 1, else type + 2); the first block's is unused (type 0).
+    tcode: []u16,
+    type_code: ?Code = null,
+    len_code: ?Code = null,
+    b: usize = 0,
+    left: u32 = 0,
+
+    fn init(gpa: std.mem.Allocator, split: block_split.Split) std.mem.Allocator.Error!BlockCodes {
+        var s = split;
+        errdefer s.deinit(gpa);
+        const tcode = try gpa.alloc(u16, s.types.len);
+        // The decoder's ring of the last two types starts {1, 0}.
+        var second: u32 = 1;
+        var last: u32 = 0;
+        tcode[0] = 0;
+        for (s.types[1..], tcode[1..]) |t, *code| {
+            code.* = if (t == (last + 1) % s.ntypes) 1 else if (t == second) 0 else @as(u16, t) + 2;
+            second = last;
+            last = t;
+        }
+        return .{ .split = s, .tcode = tcode, .left = s.lens[0] };
+    }
+
+    fn deinit(bc: *BlockCodes, gpa: std.mem.Allocator) void {
+        if (bc.type_code) |*c| c.deinit(gpa);
+        if (bc.len_code) |*c| c.deinit(gpa);
+        gpa.free(bc.tcode);
+        bc.split.deinit(gpa);
+        bc.* = undefined;
+    }
+
+    fn writeHeader(bc: *BlockCodes, gpa: std.mem.Allocator, w: *BitWriter) GiveUp!void {
+        const nt = bc.split.ntypes;
+        try writeVarLenUint8(w, @intCast(nt - 1));
+        if (nt == 1) return;
+        var tc: [256 + 2]u32 = @splat(0);
+        var lc: [tables.num_block_len_symbols]u32 = @splat(0);
+        for (bc.tcode[1..]) |c| tc[c] += 1;
+        for (bc.split.lens) |l| lc[blockLenCode(l).code] += 1;
+        bc.type_code = try buildAndWriteCode(gpa, w, tc[0 .. nt + 2], nt + 2);
+        bc.len_code = try buildAndWriteCode(gpa, w, &lc, tables.num_block_len_symbols);
+        try bc.emitLen(w, bc.split.lens[0]);
+    }
+
+    fn emitLen(bc: *const BlockCodes, w: *BitWriter, len: u32) std.mem.Allocator.Error!void {
+        const lc = blockLenCode(len);
+        try bc.len_code.?.emit(w, lc.code);
+        if (lc.nbits != 0) try w.writeBits(lc.extra, lc.nbits);
+    }
+
+    /// Before each symbol of the category.
+    inline fn step(bc: *BlockCodes, w: *BitWriter) GiveUp!void {
+        if (bc.split.ntypes == 1) return;
+        if (bc.left == 0) {
+            bc.b += 1;
+            if (bc.b >= bc.split.lens.len) return error.EncoderInvariant;
+            try bc.type_code.?.emit(w, bc.tcode[bc.b]);
+            try bc.emitLen(w, bc.split.lens[bc.b]);
+            bc.left = bc.split.lens[bc.b];
+        }
+        bc.left -= 1;
+    }
+
+    inline fn cur(bc: *const BlockCodes) u8 {
+        return bc.split.types[bc.b];
+    }
+
+    /// Every block was used up.
+    fn done(bc: *const BlockCodes) bool {
+        if (bc.split.ntypes == 1) return true;
+        return bc.b + 1 == bc.split.lens.len and bc.left == 0;
+    }
+
+    /// Bits of the block switches after the first block (codes built).
+    fn switchBits(bc: *const BlockCodes) usize {
+        if (bc.split.ntypes == 1) return 0;
+        var bits: usize = 0;
+        for (bc.tcode[1..], bc.split.lens[1..]) |c, l| {
+            const lc = blockLenCode(l);
+            bits += @as(usize, bc.type_code.?.len[c]) + bc.len_code.?.len[lc.code] + lc.nbits;
+        }
+        return bits;
+    }
+};
 
 /// RFC 7932 §7.2: the distance code a copy's symbol is read with depends on
 /// its length — 2, 3, 4, or more.
@@ -2714,10 +3241,10 @@ fn checkWord(c: Cmd, pos: usize, env: BlockEnv, expect: []const u8) GiveUp!void 
 }
 
 const BlockResult = struct {
-    /// Literal codes the block used.
-    ntrees: u8,
-    /// With `ntrees > 1`: the same block with one literal code would be no
-    /// longer (exact bits).
+    /// The block used more than one literal code or literal block type.
+    multi_literal: bool,
+    /// With `multi_literal`: the same block with one literal code (and one
+    /// literal block type) would be no longer (exact bits).
     single_no_worse: bool,
 };
 
@@ -3188,7 +3715,7 @@ pub const Core = struct {
         // `writeCompressedBlock` prices that alternative on exact bits, so it
         // is written only when it wins — to `alt`, resumed at the same bit,
         // and spliced in. The real write still decides (`ctx_bits` below).
-        if (first.ntrees > 1 and first.single_no_worse) {
+        if (first.multi_literal and first.single_no_worse) {
             const ctx_bits = dst.bitPos() - dm.len * 8;
             c.alt.resumeAt(dm);
             var single_ring = c.ring;
@@ -3914,4 +4441,40 @@ test "max: a dictionary word that would decode to other bytes is refused (block 
     try testing.expectError(error.EncoderInvariant, checkWord(near, pos, env, "time"));
     // With a prefix dictionary words are never emitted.
     try testing.expectError(error.EncoderInvariant, checkWord(good, pos, .{ .reach = 10 }, "time"));
+}
+
+/// NBLTYPESL of the stream's first meta-block (a compressed one).
+fn firstLiteralBlockTypes(stream: []const u8) !u32 {
+    var br = BitReader.init(stream);
+    // WBITS (RFC 7932 §9.1), not a large window.
+    if (try br.takeBits(1) == 1) {
+        if (try br.takeBits(3) == 0) _ = try br.takeBits(3);
+    }
+    const is_last = try br.takeBits(1);
+    if (is_last == 1) try testing.expectEqual(@as(u32, 0), try br.takeBits(1));
+    const nibbles = 4 + try br.takeBits(2);
+    try testing.expect(nibbles <= 6);
+    _ = try br.takeBits(nibbles * 4);
+    if (is_last == 0) try testing.expectEqual(@as(u32, 0), try br.takeBits(1));
+    // VarLenUint8 + 1.
+    if (try br.takeBits(1) == 0) return 1;
+    const n = try br.takeBits(3);
+    const v: u32 = if (n == 0) 1 else (@as(u32, 1) << @intCast(n)) + try br.takeBits(n);
+    return v + 1;
+}
+
+test "block types: .best and .max split a sectioned binary input, .default does not" {
+    const gpa = testing.allocator;
+    const corpus = @import("interop_corpus.zig");
+    const input = try corpus.fontLike(gpa, 60_000, 7);
+    defer gpa.free(input);
+    for ([_]Effort{ .default, .best, .max }) |effort| {
+        const out = try compressWith(gpa, input, .{ .effort = effort });
+        defer gpa.free(out);
+        const back = try @import("decoder.zig").decompress(gpa, out, .{});
+        defer gpa.free(back);
+        try testing.expectEqualSlices(u8, input, back);
+        const nbl = try firstLiteralBlockTypes(out);
+        if (effort == .default) try testing.expectEqual(@as(u32, 1), nbl) else try testing.expect(nbl >= 2);
+    }
 }

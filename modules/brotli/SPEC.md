@@ -225,8 +225,21 @@ bytes verbatim; otherwise it is rolled back out of the bit writer and re-emitted
   candidates and 24 × 6 B of words — tens of MB for a 1 MiB block of text, up to ~300 MB in the
   worst case; `.max` is not for untrusted input on a shared server.
 
-Deliberately *not* implemented, each costing some ratio: block splitting (`NBLTYPES` is always 1),
-`NPOSTFIX`/`NDIRECT` tuning, OMIT_FIRST dictionary transforms, dictionary words below `.max`.
+- **Block splitting** (2026-10-15, `.best`/`.max`; `block_split.zig`): the literal, insert-and-copy
+  and distance symbol streams are each cut into blocks of up to 32 types (RFC 7932 §6). Per category:
+  up to 32 starting histograms from sampled windows, rounds (2 at `.best`, 4 at `.max`) of a
+  Viterbi assignment — each symbol priced `-log2` of its share in a histogram, a fixed price per
+  switch — and histograms rebuilt from it, then histograms merged while that saves estimated bits
+  and one last assignment. The pass runs on fixed-point integer costs, eight histograms per vector
+  step. Each literal block type gets its own context mode and grouping of the 64 contexts; the codes
+  of all types are then merged (at most 256); each distance block type groups its four contexts;
+  each command block type has its own code. Context maps are written with the run-length codes and
+  move-to-front form that come out shortest. Fonts: `.best` 4–5 % smaller than without (now below
+  google q9 on all three measured), `.max` 4–6 %; text ±0.5 %. Time: `.best` +30 % on text, +55 %
+  on the font-shaped payload.
+
+Deliberately *not* implemented, each costing some ratio: `NPOSTFIX`/`NDIRECT` tuning, OMIT_FIRST
+dictionary transforms, dictionary words below `.max`, block splitting at `.fast`/`.default`.
 
 - **Raw prefix dictionary** (2026-10-14; `CompressOptions.dictionary`, `StreamOptions.dictionary`):
   the match finder's history is `dictionary ++ input`; the dictionary's positions are inserted first
@@ -519,6 +532,7 @@ Order: P (encoder hasher) → R1 (+R3–R5) → R6/R8 → R9 (+R10/R11) → R7 �
 - ~~**R10 Metadata callbacks** in the decoder~~ — **DONE 2026-10-15** (`Options.metadata`).
 - **R12 Binary data ratio (found 2026-10-15, blocks `parity`)** — on fonts (TTF) every effort does worse work than the paired quality: NotoSansMono-Thin 500 480 B → ours 230 674 / 229 673 / 225 308 (default/best/max) vs q5 219 315 / q9 216 149 / q11 197 771; NotoSansEthiopic 301 464 B → 115 700 / 115 541 / 111 931 vs 113 799 / 112 746 / 98 632; NotoLoopedLao 43 056 B → 21 146 / 21 131 / 20 870 vs 20 969 / 20 779 / 19 817. The bench and interop payloads are all text, so this never showed. Suspects: no block splitting (google splits from q5 up; a binary file's sections differ), MSB6/SIGNED context modes judged on text only, `.max` prices tuned on text. Plan: add a binary payload to the bench (pairing + P), diagnose (smaller `block_size`, MSB6/SIGNED), then block splitting for literals/commands/distances.
   - *2026-10-15 diagnosis* (bit accounting per part by an instrumented copy of the decoder, ours vs google's streams): the gap at `.default` was all in distances (15.2 bits each vs q5's 12.9). Cause: **a bug** — the encoder's distance ring was `{d, d, d, d}` (`DistRing.update` assigned an array literal in place), so short codes 1–3/10–15 never appeared (q5 uses code 1 3 631× on NotoSansMono). Fixed, plus SIGNED tried and all four ring distances probed: NotoSansMono 222 665 / 221 779 / 216 315, NotoSansEthiopic 111 479 / 111 322 / 108 407, NotoLoopedLao 20 734 / 20 720 / 20 419. `.default`/`.best` now beat q5/q9 on two of three fonts and are within 1.5 % / 2.6 % on the third; **`.max` is still 3–10 % behind q11** — q11 splits blocks (49/17/15 literal/command/distance block types on NotoSansMono, 68 literal codes, NPOSTFIX 2) and leaves fewer literals (146 k vs our 164 k). Next: block splitting.
+  - *2026-10-15 block splitting* at `.best`/`.max` (§ Encoder), context maps with RLE/MTF, and a generated font-shaped payload (`interop_corpus.fontLike`, also an interop shape). Now (ours vs google q5 / q9 / q11): NotoSansMono 221 135 / 208 252 / 202 202 vs 219 315 / 216 149 / 197 771; NotoSansEthiopic 111 148 / 106 706 / 103 706 vs 113 799 / 112 746 / 98 632; NotoLoopedLao 20 669 / 20 423 / 20 077 vs 20 969 / 20 779 / 19 817; font_like 112 488 / 103 651 / 102 341 vs 117 627 / 114 773 / 98 615. **`.best` beats q9 everywhere; `.default` beats q5 but on NotoSansMono (+0.8 %); `.max` is 1.3–5 % behind q11; `.fast` 6–8 % behind q4** (q4 splits blocks too: 128 162 vs 119 121 on font_like). q11 on NotoSansEthiopic leaves 23 k fewer literals (twice our length-3 copies, mostly at the last distance) — the `.max` parse is what is left there; NPOSTFIX/NDIRECT (q10+ searches them) not tried yet. Time (bench, text payloads): `.default` 1.04–1.09× q6, `.best` 0.86–1.06× q9 (was 0.67–0.83×), `.max` 0.49–0.79× q11.
 - ~~**R11 Concatenated streams + returning read-ahead bytes**~~ — **DONE 2026-10-15**: the read-ahead goes back to the reader (§ Streaming decoder), so streams decode back to back. (A `brcat`-style joined single stream is google's tool, not a format feature.)
 
 Deliberately not: RFC 9841 §8 container format; multithreaded compression; BASE64_MODE / SIMD_HASHER / HASHER_OPT; STREAM_OFFSET stitching and catable/appendable streams; twelve bit-identical qualities.

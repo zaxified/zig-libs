@@ -121,6 +121,7 @@ test {
     _ = @import("dcb.zig");
     _ = @import("shared_dictionary.zig");
     _ = @import("crafted_test.zig");
+    _ = @import("block_split.zig");
 }
 
 fn expectDecodes(comptime name: []const u8) !void {

@@ -254,10 +254,10 @@ test "interop replay: the encoder still emits the large-window streams libbrotli
 // direction — a shape deleted while its blessing lingers — and a capture run
 // that silently produced fewer entries than it meant to.
 
-test "interop replay: coverage canary — 46 shapes x 4 efforts + 16 variant + 15 dictionary + 6 large-window streams blessed, 27 reference streams" {
-    try testing.expectEqual(@as(usize, 46), corpus.shapes.len);
+test "interop replay: coverage canary — 47 shapes x 4 efforts + 16 variant + 15 dictionary + 6 large-window streams blessed, 27 reference streams" {
+    try testing.expectEqual(@as(usize, 47), corpus.shapes.len);
     try testing.expectEqual(@as(usize, 11), corpus.encodings.len);
-    try testing.expectEqual(@as(usize, 46 * 4 + 16 + corpus.dict_cases.len * corpus.dict_efforts.len + corpus.large_cases.len * corpus.large_efforts.len), blessed.entries.len);
+    try testing.expectEqual(@as(usize, 47 * 4 + 16 + corpus.dict_cases.len * corpus.dict_efforts.len + corpus.large_cases.len * corpus.large_efforts.len), blessed.entries.len);
     try testing.expectEqual(@as(usize, 27), corpus.ref_streams.len);
 
     // Every blessed entry is (encoding, shape), in capture order: a renamed
