@@ -292,7 +292,11 @@ const DistRing = struct {
     /// for an explicit code).
     fn update(self: *DistRing, d: u32, code: ?u16) void {
         if (code == 0) return;
-        self.last = .{ d, self.last[0], self.last[1], self.last[2] };
+        // Through a copy: assigned in place, the literal's first element
+        // would overwrite `last[0]` before it is read for the second (the
+        // ring was `{d, d, d, d}` until 2026-10-15).
+        const l = self.last;
+        self.last = .{ d, l[0], l[1], l[2] };
     }
 };
 
@@ -1002,13 +1006,14 @@ const Matcher = struct {
     /// The match for `p` that saves the most bits (`gain`), ending at or
     /// before `limit`, at most `max_dist` back. Null below `min_match` or
     /// when no candidate saves anything.
-    /// `ring_n`: how many of the ring's distances are tried first (`Effort`;
-    /// the other two never won on the bench payloads). Comptime, so a search
+    /// `ring_n`: how many of the ring's distances are tried first (all four
+    /// since the ring was fixed, 2026-10-15: fonts −0.3 %, text even).
+    /// Comptime, so a search
     /// without them compiles to the loop it was before they existed.
     /// `px`: a prefix dictionary may be in `data` — comptime, so a search
     /// without one compiles to the loop it was before dictionaries (the
     /// per-candidate test cost `.best` 20 %, measured 2026-10-15).
-    fn find(self: *const Matcher, comptime ring_n: u2, comptime px: bool, p: usize, max_dist: usize, limit: usize) ?Match {
+    fn find(self: *const Matcher, comptime ring_n: u3, comptime px: bool, p: usize, max_dist: usize, limit: usize) ?Match {
         if (p + min_match > limit) return null;
         const max_len = @min(limit - p, max_match);
         var best_len: usize = 0;
@@ -1277,7 +1282,7 @@ const Cmd = struct {
 /// before `start` (the decoder's history is the whole output) but never past
 /// `end`, so the commands consume exactly `end - start` bytes.
 fn buildCommands(
-    comptime ring_n: u2,
+    comptime ring_n: u3,
     comptime px: bool,
     gpa: std.mem.Allocator,
     matcher: *Matcher,
@@ -2288,10 +2293,9 @@ fn clusterLiterals(input: []const u8, start: usize, cmds: []const Cmd, mode: u2,
 
 /// The literal model for a block: context-free (one code) at `.fast`, or
 /// when the literals are too few or too random for contexts to pay; else the
-/// cheapest clustering over the UTF8 and LSB6 context modes. MSB6 and SIGNED
-/// are not tried: over the whole measured corpus (text, UTF-16, small random
-/// alphabets, binary) neither ever won, so emitting them would be a path the
-/// reference decoder never checked from this side, for no measured gain.
+/// cheapest clustering over the UTF8, LSB6 and SIGNED context modes. SIGNED
+/// wins on fonts (TTF: 1.2–2.2 % smaller than UTF8, 2026-10-15; google picks
+/// it there too); MSB6 never won on anything measured, so it is not tried.
 fn chooseLiteralModel(gpa: std.mem.Allocator, input: []const u8, start: usize, cmds: []const Cmd, effort: Effort, out: *LiteralModel) std.mem.Allocator.Error!void {
     out.* = .{};
 
@@ -2318,7 +2322,7 @@ fn chooseLiteralModel(gpa: std.mem.Allocator, input: []const u8, start: usize, c
     // `.default`'s time per mode).
     var ascii: u64 = 0;
     for (out.single[0..0x80]) |c| ascii += c;
-    const modes: []const u2 = if (ascii * 100 >= n_lits * ascii_pct) &.{2} else &.{ 2, 0 };
+    const modes: []const u2 = if (ascii * 100 >= n_lits * ascii_pct) &.{2} else &.{ 2, 0, 3 };
     for (modes) |mode| {
         const c = clusterLiterals(input, start, cmds, mode, scratch, &trial);
         if (c < best_cost) {
@@ -3127,9 +3131,9 @@ pub const Core = struct {
             .default, .best => {
                 c.matcher.deep.ring = c.ring;
                 if (c.prefix().len != 0)
-                    try buildCommands(2, true, gpa, &c.matcher.deep, off, end, max_dist, &c.cmds)
+                    try buildCommands(4, true, gpa, &c.matcher.deep, off, end, max_dist, &c.cmds)
                 else
-                    try buildCommands(2, false, gpa, &c.matcher.deep, off, end, max_dist, &c.cmds);
+                    try buildCommands(4, false, gpa, &c.matcher.deep, off, end, max_dist, &c.cmds);
             },
         }
 
@@ -3387,6 +3391,28 @@ fn readAnyCode(gpa: std.mem.Allocator, br: *BitReader, alphabet_size: u32) !huff
 }
 
 // --- M1: the code-length prefix code ---------------------------------------
+
+test "DistRing keeps the decoder's last four distances in order" {
+    var ring: DistRing = .{};
+    ring.update(100, null);
+    ring.update(200, null);
+    try testing.expectEqual([4]u32{ 200, 100, 4, 11 }, ring.last);
+    // Code 0 leaves the ring as it is; any other code pushes.
+    ring.update(200, 0);
+    try testing.expectEqual([4]u32{ 200, 100, 4, 11 }, ring.last);
+    ring.update(101, 5);
+    try testing.expectEqual([4]u32{ 101, 200, 100, 4 }, ring.last);
+    // Every short code is reachable: the older three by index, and the
+    // deltas around the second-last.
+    try testing.expectEqual(@as(?u16, 0), ring.shortCode(101));
+    try testing.expectEqual(@as(?u16, 1), ring.shortCode(200));
+    try testing.expectEqual(@as(?u16, 2), ring.shortCode(100));
+    try testing.expectEqual(@as(?u16, 3), ring.shortCode(4));
+    try testing.expectEqual(@as(?u16, 5), ring.shortCode(102));
+    try testing.expectEqual(@as(?u16, 10), ring.shortCode(199));
+    try testing.expectEqual(@as(?u16, 15), ring.shortCode(203));
+    try testing.expectEqual(@as(?u16, null), ring.shortCode(150));
+}
 
 test "cl_prefix is the exact inverse of the decoder's fixed prefix code" {
     // For every value, the bits we would write must be read back as that value

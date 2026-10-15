@@ -164,14 +164,15 @@ bytes verbatim; otherwise it is rolled back out of the bit writer and re-emitted
   meta-blocks as the decoder's does, and a block that is stored instead rolls it back.
   `quickfox_repeated` 606 → 58 bytes, `backward65536` 178 → 19.
 - **Literal context modelling** (2026-09-30, `.default`/`.best`): per-context literal histograms (64
-  contexts from the two previous bytes) for the UTF8 and LSB6 modes, clustered greedily — merge the pair
+  contexts from the two previous bytes) for the UTF8 mode, and for blocks under 95 % ASCII also LSB6
+  and SIGNED, clustered greedily — merge the pair
   whose union costs the fewest extra estimated bits (entropy plus a per-code header guess), while that
   saves bits or more than 16 clusters remain — and the cheaper mode kept, written as a context map
   (no RLE, no move-to-front). Skipped below 256 literals and when the block's literals are near 8
   bits each (random or compressed data). Because the choice rests on an estimate, a block that uses
-  more than one literal code is written again with one, and the really shorter one is kept. MSB6 and
-  SIGNED are not tried: on the measured corpus neither ever won, and a mode this encoder emits but the
-  reference never decoded from it is a risk with no measured gain. `cp852-utf8` 536 → 436 bytes (q5:
+  more than one literal code is written again with one, and the really shorter one is kept. SIGNED
+  wins on fonts (1.2–2.2 % smaller, 2026-10-15; libbrotli 1.2.0 decodes those streams); MSB6 never won
+  on anything measured and is not tried. `cp852-utf8` 536 → 436 bytes (q5:
   482), `monkey` 421 → 387 (q11: 405).
 - **Prefix codes**, built from the block's own symbol frequencies: *simple* codes (3.4) for alphabets
   of 1..4 used symbols — the only legal encoding when there is exactly one — and *complex* codes (3.5)
@@ -517,6 +518,7 @@ Order: P (encoder hasher) → R1 (+R3–R5) → R6/R8 → R9 (+R10/R11) → R7 �
 - ~~**R9 Pull `std.Io.Reader` decoder**~~ — **DONE 2026-10-15** as `Decompressor` (§ Streaming decoder); `decompressStream` is a loop over it. Left: the decoder costs +4–9 % against before R6/R9 (§ Streaming decoder).
 - ~~**R10 Metadata callbacks** in the decoder~~ — **DONE 2026-10-15** (`Options.metadata`).
 - **R12 Binary data ratio (found 2026-10-15, blocks `parity`)** — on fonts (TTF) every effort does worse work than the paired quality: NotoSansMono-Thin 500 480 B → ours 230 674 / 229 673 / 225 308 (default/best/max) vs q5 219 315 / q9 216 149 / q11 197 771; NotoSansEthiopic 301 464 B → 115 700 / 115 541 / 111 931 vs 113 799 / 112 746 / 98 632; NotoLoopedLao 43 056 B → 21 146 / 21 131 / 20 870 vs 20 969 / 20 779 / 19 817. The bench and interop payloads are all text, so this never showed. Suspects: no block splitting (google splits from q5 up; a binary file's sections differ), MSB6/SIGNED context modes judged on text only, `.max` prices tuned on text. Plan: add a binary payload to the bench (pairing + P), diagnose (smaller `block_size`, MSB6/SIGNED), then block splitting for literals/commands/distances.
+  - *2026-10-15 diagnosis* (bit accounting per part by an instrumented copy of the decoder, ours vs google's streams): the gap at `.default` was all in distances (15.2 bits each vs q5's 12.9). Cause: **a bug** — the encoder's distance ring was `{d, d, d, d}` (`DistRing.update` assigned an array literal in place), so short codes 1–3/10–15 never appeared (q5 uses code 1 3 631× on NotoSansMono). Fixed, plus SIGNED tried and all four ring distances probed: NotoSansMono 222 665 / 221 779 / 216 315, NotoSansEthiopic 111 479 / 111 322 / 108 407, NotoLoopedLao 20 734 / 20 720 / 20 419. `.default`/`.best` now beat q5/q9 on two of three fonts and are within 1.5 % / 2.6 % on the third; **`.max` is still 3–10 % behind q11** — q11 splits blocks (49/17/15 literal/command/distance block types on NotoSansMono, 68 literal codes, NPOSTFIX 2) and leaves fewer literals (146 k vs our 164 k). Next: block splitting.
 - ~~**R11 Concatenated streams + returning read-ahead bytes**~~ — **DONE 2026-10-15**: the read-ahead goes back to the reader (§ Streaming decoder), so streams decode back to back. (A `brcat`-style joined single stream is google's tool, not a format feature.)
 
 Deliberately not: RFC 9841 §8 container format; multithreaded compression; BASE64_MODE / SIMD_HASHER / HASHER_OPT; STREAM_OFFSET stitching and catable/appendable streams; twelve bit-identical qualities.
