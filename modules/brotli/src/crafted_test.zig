@@ -674,10 +674,98 @@ test "crafted: stream: bytes after the stream stay in the reader (at most 8 are 
     var out: std.Io.Writer.Allocating = .init(testing.allocator);
     defer out.deinit();
     _ = try brotli.decompressStream(testing.allocator, &in, &out.writer, .{});
-    const left = in.bufferedLen();
-    try testing.expect(left <= 100);
-    try testing.expect(left >= 100 - 8);
+    // Since 2026-10-15 exactly: what the bit reader read ahead goes back.
+    try testing.expectEqual(@as(usize, 100), in.bufferedLen());
     try testing.expectEqual(@as(u8, 0xEE), try in.peekByte());
+}
+
+test "crafted: streams back to back on one reader, in any pieces: each ends exactly where it does" {
+    const gpa = testing.allocator;
+    const a = @embedFile("testdata/quickfox.compressed");
+    const b = @embedFile("testdata/alice29.txt.compressed");
+    const all = a ++ b ++ a ++ "tail";
+    for ([_]usize{ 0, 1, 5, 13, 4096 }) |piece| {
+        var calls: [1]std.testing.Reader.Call = .{.{ .buffer = all }};
+        var ibuf: [16]u8 = undefined;
+        var tr: std.testing.Reader = .init(&ibuf, &calls);
+        if (piece != 0) tr.artificial_limit = .limited(piece);
+        var fixed: std.Io.Reader = .fixed(all);
+        const in: *std.Io.Reader = if (piece == 0) &fixed else &tr.interface;
+        const plains = [_][]const u8{ @embedFile("testdata/quickfox"), @embedFile("testdata/alice29.txt"), @embedFile("testdata/quickfox") };
+        for (plains) |plain| {
+            var out: std.Io.Writer.Allocating = .init(gpa);
+            defer out.deinit();
+            _ = try brotli.decompressStream(gpa, in, &out.writer, .{});
+            try testing.expectEqualSlices(u8, plain, out.written());
+        }
+        var rest: [8]u8 = undefined;
+        try testing.expectEqualStrings("tail", rest[0..try in.readSliceShort(&rest)]);
+    }
+}
+
+test "crafted: a source buffer under 16 bytes: at most 8 bytes are read past the stream" {
+    const comp = @embedFile("testdata/alice29.txt.compressed");
+    const all = comp ++ "\xEE" ** 64;
+    var calls: [1]std.testing.Reader.Call = .{.{ .buffer = all }};
+    var ibuf: [8]u8 = undefined;
+    var tr: std.testing.Reader = .init(&ibuf, &calls);
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    _ = try brotli.decompressStream(testing.allocator, &tr.interface, &out.writer, .{});
+    var rest: [64]u8 = undefined;
+    const n = try tr.interface.readSliceShort(&rest);
+    try testing.expect(n >= 64 - 8 and n <= 64);
+}
+
+test "crafted: fill bits after the last meta-block must be zero (RFC 7932 9.2)" {
+    // WBITS 24, ISLAST, ISLASTEMPTY, then one fill bit: google/brotli takes
+    // 0x3f and refuses 0xff.
+    const out = try brotli.decompress(testing.allocator, "\x3f", .{});
+    defer testing.allocator.free(out);
+    try testing.expectEqual(@as(usize, 0), out.len);
+    try testing.expectError(error.InvalidPadding, brotli.decompress(testing.allocator, "\xff", .{}));
+}
+
+test "crafted: metadata blocks reach the callback, whole and in order" {
+    const gpa = testing.allocator;
+    const Collect = struct {
+        starts: std.ArrayList(usize) = .empty,
+        bytes: std.ArrayList(u8) = .empty,
+        fn start(ctx: *anyopaque, len: usize) void {
+            const c: *@This() = @ptrCast(@alignCast(ctx));
+            c.starts.append(testing.allocator, len) catch unreachable;
+        }
+        fn chunk(ctx: *anyopaque, b: []const u8) void {
+            const c: *@This() = @ptrCast(@alignCast(ctx));
+            c.bytes.appendSlice(testing.allocator, b) catch unreachable;
+        }
+    };
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var buf: [256]u8 = undefined;
+    var sw: brotli.StreamWriter = try .init(gpa, &out.writer, &buf, .{});
+    defer sw.deinit();
+    const big = "m" ** 2000;
+    try sw.writeMetadata("first");
+    try sw.writer.writeAll("payload one, ");
+    try sw.writeMetadata("");
+    try sw.writeMetadata(big);
+    try sw.writer.writeAll("payload two");
+    try sw.finish();
+    var c: Collect = .{};
+    defer c.starts.deinit(gpa);
+    defer c.bytes.deinit(gpa);
+    const opts: brotli.Options = .{ .metadata = .{ .context = &c, .start = Collect.start, .chunk = Collect.chunk } };
+    const plain = try brotli.decompress(gpa, out.written(), opts);
+    defer gpa.free(plain);
+    try testing.expectEqualStrings("payload one, payload two", plain);
+    // Besides the blocks written, the empty ones a flush aligns with.
+    var nonempty: std.ArrayList(usize) = .empty;
+    defer nonempty.deinit(gpa);
+    for (c.starts.items) |n| if (n != 0) try nonempty.append(gpa, n);
+    try testing.expectEqualSlices(usize, &.{ 5, 2000 }, nonempty.items);
+    try testing.expect(c.starts.items.len >= 4);
+    try testing.expectEqualStrings("first" ++ big, c.bytes.items);
 }
 
 test "crafted: commands that produce more than MLEN bytes are refused (insert, copy, dictionary word)" {

@@ -67,6 +67,9 @@ All of the following are fully implemented:
   need their dictionary. Negative control: without the ring push, 8 of them fail. Not exercised by
   any committed stream: a dictionary copy that runs on into the window once the output has passed
   `max_backward` (libbrotli did not emit one on the corpus).
+- **End of stream**: the fill bits after the last meta-block must be zero (RFC 7932 §9.2 "should be
+  rejected"; `InvalidPadding` since 2026-10-15, as google/brotli — which takes `0x3f` and refuses
+  `0xff`; before, `0xff` decoded to nothing).
 - **Meta-block structure**: `ISLAST`, `ISLASTEMPTY`, `MNIBBLES`/`MLEN`,
   `ISUNCOMPRESSED`, and metadata meta-blocks (`MSKIPLEN`, skipped); the
   "no leading-zero final nibble/byte" rules are enforced.
@@ -274,8 +277,16 @@ larger than its input, and `compress` itself never fails except on allocation.
 - **The two ends' failures are themselves:** `ReadFailed` from `in` (not the `TruncatedInput` it would
   otherwise surface as) and `WriteFailed` from `out`. `std.Io.Reader.fillMore` may add no bytes
   without it being the end of the stream (its own contract); only `EndOfStream` ends the input.
-- **Read-ahead:** the bit accumulator reads up to 8 bytes ahead, so bytes after the Brotli stream on
-  the same reader may be consumed; `in` must have a non-empty buffer.
+- **Read-ahead given back (R11, 2026-10-15):** the bit accumulator reads up to 8 bytes ahead; at the
+  end of the stream the whole bytes it read past it go back to `in`, so `in` is left exactly after
+  the stream and streams can be decoded back to back from one reader (tested over three
+  concatenated streams and a tail, in pieces of 1..4096 bytes). For that the bit reader keeps the last
+  8 bytes it took in `in`'s buffer when it fetches more, which needs a buffer of at least 16 bytes;
+  with a smaller one, up to 8 bytes past the stream may still be consumed. `in` must have a
+  non-empty buffer.
+- **Metadata (R10, 2026-10-15):** `Options.metadata` (`start(len)`, `chunk(bytes)`) receives what
+  metadata meta-blocks carry, in pieces of up to 512 bytes, in all decoders; without it they are
+  skipped.
 
 ## DoS / safety posture
 
@@ -433,8 +444,8 @@ Order: P (encoder hasher) → R1 (+R3–R5) → R6/R8 → R9 (+R10/R11) → R7 �
 - **R7 Serialized shared dictionaries (RFC 9841 §5) — decoder only**: custom word lists, custom transforms incl. ShiftFirst/ShiftAll, context-selected dictionaries, embedded prefix. Encoder side deliberately not (owner 2026-10-14: a research tool only google ships).
 - ~~**R8 Large window (RFC 9841)**~~ — **DONE 2026-10-14**: decoder `Options.large_window` (§ Decoder); encoder `window_bits` 25..30 (`max_large_window_bits`) writes the RFC 9841 header and names distances with the large alphabet's first 74 codes (to 2^31), simple distance codes as wide as the 140-symbol alphabet; a copy from 17 MiB back found and blessed by libbrotli (`large_*` entries).
 - ~~**R9 Pull `std.Io.Reader` decoder**~~ — **DONE 2026-10-15** as `Decompressor` (§ Streaming decoder); `decompressStream` is a loop over it. Left: the decoder costs +4–9 % against before R6/R9 (§ Streaming decoder).
-- **R10 Metadata callbacks** in the decoder.
-- **R11 Concatenated streams + returning read-ahead bytes** (`brcat`).
+- ~~**R10 Metadata callbacks** in the decoder~~ — **DONE 2026-10-15** (`Options.metadata`).
+- ~~**R11 Concatenated streams + returning read-ahead bytes**~~ — **DONE 2026-10-15**: the read-ahead goes back to the reader (§ Streaming decoder), so streams decode back to back. (A `brcat`-style joined single stream is google's tool, not a format feature.)
 
 Deliberately not: RFC 9841 §8 container format; multithreaded compression; BASE64_MODE / SIMD_HASHER / HASHER_OPT; STREAM_OFFSET stitching and catable/appendable streams; twelve bit-identical qualities.
 

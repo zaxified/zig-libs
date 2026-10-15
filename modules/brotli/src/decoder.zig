@@ -51,6 +51,17 @@ pub const Options = struct {
     /// what the streaming decoder holds. Distances stay below 2^31, as
     /// google/brotli's (the RFC allows a decoder that limit).
     large_window: bool = false,
+    /// Called with what metadata meta-blocks carry (google/brotli's
+    /// metadata callbacks); without it they are skipped.
+    metadata: ?Metadata = null,
+
+    pub const Metadata = struct {
+        context: *anyopaque,
+        /// A metadata meta-block of `len` bytes begins (also for 0).
+        start: ?*const fn (context: *anyopaque, len: usize) void = null,
+        /// Its bytes, in order, in pieces of up to 512.
+        chunk: *const fn (context: *anyopaque, bytes: []const u8) void,
+    };
 };
 
 /// The output cap actually enforced for a stream of `input_len` bytes:
@@ -101,6 +112,8 @@ fn DecoderOf(comptime Sink: type) type {
         max_backward: usize = 0,
         /// `Options.dictionary`.
         prefix: []const u8 = &.{},
+        /// `Options.metadata`.
+        metadata: ?Options.Metadata = null,
         dist_rb: [4]i32 = .{ 16, 15, 11, 4 },
         dist_rb_idx: u32 = 0,
 
@@ -859,12 +872,12 @@ fn DecoderOf(comptime Sink: type) type {
                     if (h.is_metadata or h.is_uncompressed) try self.br.jumpToByteBoundary();
 
                     if (h.is_metadata) {
-                        try self.br.skipAlignedBytes(@intCast(h.mlen));
-                        if (h.is_last) self.phase = .done;
+                        try self.metadataBlock(@intCast(h.mlen));
+                        if (h.is_last) try self.endStream();
                         continue;
                     }
                     if (h.mlen == 0) {
-                        if (h.is_last) self.phase = .done;
+                        if (h.is_last) try self.endStream();
                         continue;
                     }
                     if (h.mlen > block_size_cap) return error.InvalidLength;
@@ -892,11 +905,39 @@ fn DecoderOf(comptime Sink: type) type {
                 },
                 .metablock_end => {
                     try self.out.endMetablock();
-                    self.phase = if (self.is_last) .done else .metablock;
-                    if (!self.is_last) return .yield;
+                    if (self.is_last) {
+                        try self.endStream();
+                    } else {
+                        self.phase = .metablock;
+                        return .yield;
+                    }
                 },
                 .done => return .done,
             };
+        }
+
+        /// After the last meta-block: the fill bits to the byte boundary must
+        /// be zero (RFC 7932 §9.2, as google/brotli checks), and what the bit
+        /// reader read past them goes back to the input.
+        fn endStream(self: *Self) Error!void {
+            try self.br.jumpToByteBoundary();
+            self.br.unreadAhead();
+            self.phase = .done;
+        }
+
+        /// A metadata meta-block's `n` bytes: to `Options.metadata`, or
+        /// skipped.
+        fn metadataBlock(self: *Self, n: usize) Error!void {
+            const m = self.metadata orelse return self.br.skipAlignedBytes(n);
+            if (m.start) |f| f(m.context, n);
+            var buf: [512]u8 = undefined;
+            var left = n;
+            while (left != 0) {
+                const k = @min(left, buf.len);
+                try self.br.readAlignedBytes(buf[0..k]);
+                m.chunk(m.context, buf[0..k]);
+                left -= k;
+            }
         }
 
         /// The whole stream (a one-shot sink: it yields only between
@@ -1115,6 +1156,7 @@ pub fn decompressInto(gpa: std.mem.Allocator, out: []u8, input: []const u8, opti
         .out = &sink,
         .prefix = options.dictionary,
         .allow_large_window = options.large_window,
+        .metadata = options.metadata,
     };
     try dec.run();
     return out[0..sink.len];
@@ -1136,6 +1178,7 @@ pub fn decompress(gpa: std.mem.Allocator, input: []const u8, options: Options) B
         .out = &sink,
         .prefix = options.dictionary,
         .allow_large_window = options.large_window,
+        .metadata = options.metadata,
     };
     try dec.run();
 
@@ -1327,6 +1370,7 @@ pub const Decompressor = struct {
                 .out = undefined,
                 .prefix = options.dictionary,
                 .allow_large_window = options.large_window,
+                .metadata = options.metadata,
             },
         };
     }

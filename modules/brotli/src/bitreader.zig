@@ -14,8 +14,10 @@ pub const BitReader = struct {
     acc: u64 = 0,
     cnt: u32 = 0, // number of valid low bits in `acc`
     /// Streaming source; `data` is always a view of its buffer. Null for a
-    /// slice, and once the source has ended or failed.
+    /// slice.
     source: ?*std.Io.Reader = null,
+    /// The source has ended or failed: no more is fetched.
+    source_done: bool = false,
     /// The source reported `ReadFailed` (not an end of stream): the caller
     /// turns the resulting `TruncatedInput` back into that.
     read_failed: bool = false,
@@ -51,21 +53,36 @@ pub const BitReader = struct {
     /// (always, for a slice).
     fn nextChunk(self: *BitReader) bool {
         const r = self.source orelse return false;
-        r.toss(self.byte_pos);
-        self.consumed_before += self.byte_pos;
-        self.byte_pos = 0;
-        self.data = &.{};
+        if (self.source_done) return false;
+        // The last eight bytes taken stay in the source's buffer (when it
+        // has room for more besides): the accumulator may hold them unread,
+        // and `unreadAhead` gives them back at the end of the stream.
+        const keep: usize = if (r.buffer.len >= 16) @min(self.byte_pos, 8) else 0;
+        r.toss(self.byte_pos - keep);
+        self.consumed_before += self.byte_pos - keep;
+        self.byte_pos = keep;
+        self.data = r.buffered();
         // `fillMore` may add nothing without it being the end of the stream
         // (its own doc); only `EndOfStream` is.
         while (true) {
             r.fillMore() catch |err| {
                 if (err == error.ReadFailed) self.read_failed = true;
-                self.source = null;
+                self.source_done = true;
                 return false;
             };
             self.data = r.buffered();
-            if (self.data.len != 0) return true;
+            if (self.data.len > keep) return true;
         }
+    }
+
+    /// The stream ended at a byte boundary: give the whole bytes the
+    /// accumulator read past it back to `data` (and so to the source, at
+    /// `finish`), as far as `data` still holds them.
+    pub fn unreadAhead(self: *BitReader) void {
+        std.debug.assert(self.cnt % 8 == 0);
+        self.byte_pos -= @min(self.cnt / 8, self.byte_pos);
+        self.acc = 0;
+        self.cnt = 0;
     }
 
     inline fn refill(self: *BitReader) void {

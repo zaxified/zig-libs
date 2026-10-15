@@ -644,7 +644,11 @@ test "corpus: every reference stream reaches the decoder, and the output is pinn
     // Measured 2026-09-07. Before: 1 round, 0 non-empty, 0 octets out — the
     // target decompressed `buf[0..0]` and nothing else, ever.
     try testing.expectEqual(fuzz_seed_corpus.len - 1, nonempty); // the deliberate empty seed
-    try testing.expectEqual(@as(usize, 18), decoded);
-    try testing.expectEqual(@as(usize, 2), refused); // the 0xff octet and the truncated header
+    // 17 reference streams decode; refused are the empty input, the
+    // truncated header, and `0xff` — WBITS 24 and an empty last meta-block
+    // whose fill bit is set (RFC 7932 §9.2; refused since 2026-10-15, as
+    // google/brotli does, which takes `0x3f`, the same with a zero fill).
+    try testing.expectEqual(@as(usize, 17), decoded);
+    try testing.expectEqual(@as(usize, 3), refused);
     try testing.expectEqual(@as(usize, 981867), octets_out);
 }
