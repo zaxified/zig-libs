@@ -299,16 +299,16 @@ test "without a flush: the bytes compressWith gives, whatever the writes and the
     text(src, 0x51);
     // A 64 KiB window over 300 KB slides the history several times; blocks
     // of 40 000 bytes cut it into eight, the last one short.
-    inline for (.{ encoder.Effort.fast, .default, .best, .max }) |effort| {
+    inline for (.{ encoder.Effort.q4, .q6, .q9, .q11 }) |effort| {
         const opts: StreamOptions = .{ .effort = effort, .window_bits = 16, .block_size = 40_000 };
         const want = try encoder.compressWith(gpa, src, .{ .effort = effort, .window_bits = 16, .block_size = 40_000 });
         defer gpa.free(want);
         try expectRoundTrip(src, want);
         for ([_]usize{ 1, 999, 65_536 }) |blen| for ([_]usize{ 7, 5_000, 40_000, 300_000 }) |step| {
-            if (step == 7 and (blen > 1 or effort != .fast)) continue; // (slow, adds nothing)
-            // `.max` shares every cut with the others; one buffer and two
+            if (step == 7 and (blen > 1 or effort != .q4)) continue; // (slow, adds nothing)
+            // `.q11` shares every cut with the others; one buffer and two
             // write sizes keep its share of the run short.
-            if (effort == .max and (blen != 999 or step == 5_000)) continue;
+            if (effort == .q11 and (blen != 999 or step == 5_000)) continue;
             var out: Writer.Allocating = .init(gpa);
             defer out.deinit();
             const buf = try gpa.alloc(u8, blen);
@@ -329,12 +329,12 @@ test "an input of whole blocks, or a few bytes past them: cut as in one piece" {
     text(src, 0x52);
     // At least the window (16 bits), so `compressWith` sizes its tables alike.
     for ([_]usize{ 4 * bs, 5 * bs, 5 * bs - 5, 5 * bs - 8, 4 * bs + 9 }) |n| {
-        const want = try encoder.compressWith(gpa, src[0..n], .{ .effort = .fast, .window_bits = 16, .block_size = bs });
+        const want = try encoder.compressWith(gpa, src[0..n], .{ .effort = .q4, .window_bits = 16, .block_size = bs });
         defer gpa.free(want);
         var out: Writer.Allocating = .init(gpa);
         defer out.deinit();
         var buf: [100]u8 = undefined;
-        var sw: StreamWriter = try .init(gpa, &out.writer, &buf, .{ .effort = .fast, .window_bits = 16, .block_size = bs });
+        var sw: StreamWriter = try .init(gpa, &out.writer, &buf, .{ .effort = .q4, .window_bits = 16, .block_size = bs });
         defer sw.deinit();
         try writeStream(&sw, src[0..n], 1000, &.{});
         try testing.expectEqualSlices(u8, want, out.written());
@@ -407,10 +407,10 @@ test "reset: stream after stream, each the bytes a fresh writer gives" {
     try sw.writer.writeAll(src[0..90_000]); // abandoned half-way
     const streams = [_]struct { n: usize, opts: StreamOptions }{
         .{ .n = 150_000, .opts = .{} },
-        .{ .n = 5_000, .opts = .{ .effort = .fast } },
-        .{ .n = 150_000, .opts = .{ .effort = .fast, .window_bits = 16, .block_size = 30_000 } },
-        .{ .n = 0, .opts = .{ .effort = .fast, .window_bits = 16 } },
-        .{ .n = 150_000, .opts = .{ .effort = .best, .window_bits = 17 } },
+        .{ .n = 5_000, .opts = .{ .effort = .q4 } },
+        .{ .n = 150_000, .opts = .{ .effort = .q4, .window_bits = 16, .block_size = 30_000 } },
+        .{ .n = 0, .opts = .{ .effort = .q4, .window_bits = 16 } },
+        .{ .n = 150_000, .opts = .{ .effort = .q9, .window_bits = 17 } },
         .{ .n = 150_000, .opts = .{} },
     };
     for (streams) |st| {
@@ -432,13 +432,13 @@ test "a warm writer keeps its table and history from stream to stream" {
     var out: Writer.Allocating = .init(gpa);
     defer out.deinit();
     var buf: [16 * 1024]u8 = undefined;
-    inline for (.{ encoder.Effort.fast, .default }) |effort| {
+    inline for (.{ encoder.Effort.q4, .q6 }) |effort| {
         const opts: StreamOptions = .{ .effort = effort, .window_bits = 18 };
         out.clearRetainingCapacity();
         var sw: StreamWriter = try .init(gpa, &out.writer, &buf, opts);
         defer sw.deinit();
         try writeStream(&sw, src, 10_000, &.{5_000});
-        const table = if (effort == .fast) sw.core.matcher.fast.table.ptr else sw.core.matcher.deep.slots.ptr;
+        const table = if (effort == .q4) sw.core.matcher.fast.table.ptr else sw.core.matcher.deep.slots.ptr;
         const hist = sw.hist.items.ptr;
         const first = try gpa.dupe(u8, out.written());
         defer gpa.free(first);
@@ -448,7 +448,7 @@ test "a warm writer keeps its table and history from stream to stream" {
             try writeStream(&sw, src, 10_000, &.{5_000});
             try testing.expectEqualSlices(u8, first, out.written());
         }
-        try testing.expectEqual(table, if (effort == .fast) sw.core.matcher.fast.table.ptr else sw.core.matcher.deep.slots.ptr);
+        try testing.expectEqual(table, if (effort == .q4) sw.core.matcher.fast.table.ptr else sw.core.matcher.deep.slots.ptr);
         try testing.expectEqual(hist, sw.hist.items.ptr);
         try expectRoundTrip(src, out.written());
     }
@@ -469,7 +469,7 @@ test "failures keep their cause: allocation here, or the output's" {
     var failing: std.testing.FailingAllocator = .init(gpa, .{});
     var out: Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var sw2: StreamWriter = try .init(failing.allocator(), &out.writer, &buf, .{ .effort = .fast, .window_bits = 16 });
+    var sw2: StreamWriter = try .init(failing.allocator(), &out.writer, &buf, .{ .effort = .q4, .window_bits = 16 });
     defer sw2.deinit();
     failing.fail_index = failing.alloc_index;
     try testing.expectError(error.WriteFailed, sw2.writer.writeAll("x" ** 1000));
@@ -518,12 +518,12 @@ test "a history past 16 MiB: the slots lose their tags, a copy from before is st
     prng.random().bytes(input[0..block]);
     @memset(input[block..][0..gap], 0);
     @memcpy(input[block + gap ..], input[0..block]);
-    const want = try encoder.compressWith(gpa, input, .{ .effort = .default, .window_bits = 25 });
+    const want = try encoder.compressWith(gpa, input, .{ .effort = .q6, .window_bits = 25 });
     defer gpa.free(want);
     var out: Writer.Allocating = .init(gpa);
     defer out.deinit();
     var buf: [4096]u8 = undefined;
-    var sw: StreamWriter = try .init(gpa, &out.writer, &buf, .{ .effort = .default, .window_bits = 25, .size_hint = input.len });
+    var sw: StreamWriter = try .init(gpa, &out.writer, &buf, .{ .effort = .q6, .window_bits = 25, .size_hint = input.len });
     defer sw.deinit();
     try testing.expect(sw.core.matcher.deep.tag_mask != 0);
     try writeStream(&sw, input, 1 << 20, &.{});
@@ -544,7 +544,7 @@ test "size_hint: a table for the input, and compressWith's bytes for a short one
     var out: Writer.Allocating = .init(gpa);
     defer out.deinit();
     var buf: [512]u8 = undefined;
-    inline for (.{ encoder.Effort.fast, .default, .best, .max }) |effort| {
+    inline for (.{ encoder.Effort.q4, .q6, .q9, .q11 }) |effort| {
         const want = try encoder.compressWith(gpa, src, .{ .effort = effort, .window_bits = 22 });
         defer gpa.free(want);
         out.clearRetainingCapacity();
@@ -552,7 +552,7 @@ test "size_hint: a table for the input, and compressWith's bytes for a short one
         defer sw.deinit();
         try writeStream(&sw, src, 700, &.{});
         try testing.expectEqualSlices(u8, want, out.written());
-        const small = if (effort == .fast) sw.core.matcher.fast.table.len else sw.core.matcher.deep.count.len;
+        const small = if (effort == .q4) sw.core.matcher.fast.table.len else sw.core.matcher.deep.count.len;
         // The same hint keeps the table; a bigger one makes a bigger table;
         // more input than hinted still round-trips.
         out.clearRetainingCapacity();
@@ -561,9 +561,9 @@ test "size_hint: a table for the input, and compressWith's bytes for a short one
         try testing.expectEqualSlices(u8, want, out.written());
         out.clearRetainingCapacity();
         try sw.reset(&out.writer, .{ .effort = effort, .size_hint = 1 << 20 });
-        // (`.best`'s 256-deep buckets reach their cap of 2^12 at 3 000 bytes.)
-        const big = if (effort == .fast) sw.core.matcher.fast.table.len else sw.core.matcher.deep.count.len;
-        try testing.expect(if (effort == .best) small == big else small < big);
+        // (`.q9`'s 256-deep buckets reach their cap of 2^12 at 3 000 bytes.)
+        const big = if (effort == .q4) sw.core.matcher.fast.table.len else sw.core.matcher.deep.count.len;
+        try testing.expect(if (effort == .q9) small == big else small < big);
         out.clearRetainingCapacity();
         try sw.reset(&out.writer, .{ .effort = effort, .size_hint = 10 });
         try writeStream(&sw, src, 700, &.{});
@@ -578,7 +578,7 @@ test "a raw prefix dictionary: compressWith's bytes, and every decoder's round t
     text(src, 0x58);
     const dict = src[0..30_000];
     const input = src[20_000..];
-    inline for (.{ encoder.Effort.fast, .default, .best, .max }) |effort| {
+    inline for (.{ encoder.Effort.q4, .q6, .q9, .q11 }) |effort| {
         const plain_one = try encoder.compressWith(gpa, input, .{ .effort = effort, .window_bits = 16 });
         defer gpa.free(plain_one);
         const want = try encoder.compressWith(gpa, input, .{ .effort = effort, .window_bits = 16, .dictionary = dict });

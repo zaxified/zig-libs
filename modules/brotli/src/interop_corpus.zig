@@ -402,7 +402,7 @@ pub fn encodeDict(gpa: std.mem.Allocator, comptime c: DictCase, effort: brotli.E
     return brotli.compressWith(gpa, input, .{ .effort = effort, .window_bits = c.lgwin, .dictionary = dict });
 }
 
-pub const dict_efforts = [_][]const u8{ "fast", "default", "best", "max" };
+pub const dict_efforts = [_][]const u8{ "q4", "q6", "q9", "q11" };
 
 // ── the large window (RFC 9841 §6) ──────────────────────────────────────────
 
@@ -449,7 +449,7 @@ pub fn encodeLarge(gpa: std.mem.Allocator, comptime c: LargeCase, effort: brotli
     return brotli.compressWith(gpa, input, .{ .effort = effort, .window_bits = c.lgwin });
 }
 
-pub const large_efforts = [_][]const u8{ "fast", "default", "max" };
+pub const large_efforts = [_][]const u8{ "q4", "q6", "q11" };
 
 /// `testdata/ref/large/<case>.q<Q>.br`.
 pub fn largeRefFile(comptime c: LargeCase, comptime q: u8) []const u8 {
@@ -692,17 +692,17 @@ pub const Encoding = struct {
 };
 
 pub const encodings = [_]Encoding{
-    .{ .tag = "fast", .effort = "fast" },
-    .{ .tag = "default", .effort = "default" },
-    .{ .tag = "best", .effort = "best" },
-    .{ .tag = "max", .effort = "max" },
-    .{ .tag = "w10", .effort = "default", .window_bits = 10, .shapes = &.{ "hello_repeated", "run_1000", "alice_full" } },
-    .{ .tag = "w15_fast", .effort = "fast", .window_bits = 15, .shapes = &.{ "random_70000", "alice_full" } },
-    .{ .tag = "w17_best", .effort = "best", .window_bits = 17, .shapes = &.{ "mixed_text_first", "alice_full" } },
-    .{ .tag = "w24", .effort = "default", .window_bits = 24, .shapes = &.{"block_plus_one"} },
-    .{ .tag = "stream", .effort = "default", .window_bits = 22, .block_size = 65_536, .flushes = &.{ 0, 1, 1_000, 65_536, 100_000 }, .shapes = &.{ "empty", "one_byte", "mixed_random_first", "alice_full" } },
-    .{ .tag = "stream_fast_w16", .effort = "fast", .window_bits = 16, .block_size = 40_000, .flushes = &.{12_345}, .shapes = &.{ "random_70000", "alice_full" } },
-    .{ .tag = "stream_metadata", .effort = "default", .window_bits = 22, .flushes = &.{}, .metadata_at = &.{ 0, 5_000, 5_000 }, .shapes = &.{ "empty", "alice_full" } },
+    .{ .tag = "q4", .effort = "q4" },
+    .{ .tag = "q6", .effort = "q6" },
+    .{ .tag = "q9", .effort = "q9" },
+    .{ .tag = "q11", .effort = "q11" },
+    .{ .tag = "w10", .effort = "q6", .window_bits = 10, .shapes = &.{ "hello_repeated", "run_1000", "alice_full" } },
+    .{ .tag = "w15_q4", .effort = "q4", .window_bits = 15, .shapes = &.{ "random_70000", "alice_full" } },
+    .{ .tag = "w17_q9", .effort = "q9", .window_bits = 17, .shapes = &.{ "mixed_text_first", "alice_full" } },
+    .{ .tag = "w24", .effort = "q6", .window_bits = 24, .shapes = &.{"block_plus_one"} },
+    .{ .tag = "stream", .effort = "q6", .window_bits = 22, .block_size = 65_536, .flushes = &.{ 0, 1, 1_000, 65_536, 100_000 }, .shapes = &.{ "empty", "one_byte", "mixed_random_first", "alice_full" } },
+    .{ .tag = "stream_q4_w16", .effort = "q4", .window_bits = 16, .block_size = 40_000, .flushes = &.{12_345}, .shapes = &.{ "random_70000", "alice_full" } },
+    .{ .tag = "stream_metadata", .effort = "q6", .window_bits = 22, .flushes = &.{}, .metadata_at = &.{ 0, 5_000, 5_000 }, .shapes = &.{ "empty", "alice_full" } },
 };
 
 /// The stream `e` makes of `input`.

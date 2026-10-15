@@ -76,7 +76,7 @@ pub const StreamError = decoder.StreamError;
 /// verbatim, so the result is always a conformant `br` body.
 pub const compress = encoder.compress;
 
-/// `compress` with options: `effort` (`.fast`, `.default`, `.best`, `.max`) trades
+/// `compress` with options: `effort` (`.q4`, `.q6`, `.q9`, `.q11`) trades
 /// time for ratio; every level emits a valid stream.
 pub const compressWith = encoder.compressWith;
 pub const CompressOptions = encoder.CompressOptions;

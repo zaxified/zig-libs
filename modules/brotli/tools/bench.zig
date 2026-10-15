@@ -29,12 +29,15 @@
 //! reference has no such call to pair it with. The reported
 //! count is the UNCOMPRESSED bytes covered, so it agrees on both sides.
 //!
-//! ⚠ The two encoders do not reach the same compressed size. Each effort is
-//! paired with the reference quality whose sizes are closest to ours over
-//! the payloads (least sum of |ln(ours / theirs)|), computed every run from
-//! the sizes printed before timing (since 2026-10-14; it was a fixed table,
-//! which went stale whenever the encoder's ratio moved). The pairing is
-//! printed; a ratio then compares like with like.
+//! Pairing: `.qN` stands in for google/brotli quality N (`Effort`), so
+//! `c_qN_<payload>` is timed against `cN_<payload>` (since 2026-10-15; before,
+//! each effort was paired with the quality closest in size, recomputed every
+//! run, because the levels had names of their own). The streams are not
+//! byte-identical, so the sizes are printed beside the reference's and the
+//! quality closest in size is printed too: a level whose closest quality is
+//! not its own is a ratio finding, not a pairing to change. `c_q4_vs_q0_*` /
+//! `c_q4_vs_q1_*` (information): our fastest level against the reference's
+//! two fastest qualities, which have no level here yet.
 //!
 //! Method (shared driver at the bottom): each side doubles its batch until it
 //! takes over 100 ms and keeps the best of five; per workload the sides
@@ -209,6 +212,7 @@ pub fn main(init: std.process.Init) !u8 {
     var stdout = std.Io.File.stdout().writerStreaming(io, &buf);
     const w = &stdout.interface;
     try w.writeAll("our compressed sizes:\n");
+    const efforts = comptime std.enums.values(brotli.Effort);
     var our_sizes: [n_efforts][payload_names.len]usize = undefined;
     for (payload_names, 0..) |n, i| {
         const rb = try dir.readFileAlloc(io, try std.fmt.allocPrint(arena, "{s}.ref.br", .{n}), arena, .limited(1 << 24));
@@ -220,42 +224,44 @@ pub fn main(init: std.process.Init) !u8 {
             return 1;
         }
         try w.print("  {s} ({d} B):", .{ n, ctx.inputs[i].len });
-        inline for (@typeInfo(brotli.Effort).@"enum".fields) |f| {
-            const e: brotli.Effort = @enumFromInt(f.value);
+        for (efforts, 0..) |e, k| {
             const c = try brotli.compressWith(arena, ctx.inputs[i], .{ .effort = e });
             const rt = try brotli.decompress(arena, c, .{});
             if (!std.mem.eql(u8, rt, ctx.inputs[i])) return error.RoundTrip;
-            try w.print("  {s} {d}", .{ f.name, c.len });
-            our_sizes[f.value][i] = c.len;
+            try w.print("  {s} {d}", .{ @tagName(e), c.len });
+            our_sizes[k][i] = c.len;
         }
         try w.writeAll("\n");
     }
     const ref_sizes = parseRefSizes(prep.stdout);
-    var pair_q: [n_efforts]u8 = undefined;
-    try w.writeAll("pairing (closest reference quality by size):");
-    for (&pair_q, our_sizes, 0..) |*q, ours, e| {
-        q.* = closestQuality(ours, ref_sizes);
-        if (q.* == error_quality) {
+    try w.writeAll("closest reference quality by size (pairing is by name):");
+    for (our_sizes, efforts) |ours, e| {
+        const q = closestQuality(ours, ref_sizes);
+        if (q == error_quality) {
             std.debug.print("{s}: could not read the reference's sizes from prep\n", .{bench_name});
             return 1;
         }
-        try w.print("  {s}->q{d}", .{ @tagName(@as(brotli.Effort, @enumFromInt(e))), q.* });
+        try w.print("  {s}->q{d}{s}", .{ @tagName(e), q, if (q == e.quality()) "" else " (!)" });
     }
     try w.writeAll("\n");
     try w.flush();
 
     var ws: std.ArrayList(Work) = .empty;
     for (payload_names, 0..) |n, i| {
-        for (pair_q, 0..) |q, e| {
-            const effort: brotli.Effort = @enumFromInt(e);
+        for (efforts) |effort| {
             const name = try std.fmt.allocPrint(arena, "c_{s}_{s}", .{ @tagName(effort), n });
-            const ref = try std.fmt.allocPrint(arena, "c{d}_{s}", .{ q, n });
+            const ref = try std.fmt.allocPrint(arena, "c{d}_{s}", .{ effort.quality(), n });
             try ws.append(arena, .{ .name = name, .op = .{ .decompress = false, .effort = effort, .payload = i }, .ref = ref });
         }
+        for ([_]u8{ 0, 1 }) |q| {
+            const name = try std.fmt.allocPrint(arena, "c_q4_vs_q{d}_{s}", .{ q, n });
+            const ref = try std.fmt.allocPrint(arena, "c{d}_{s}", .{ q, n });
+            try ws.append(arena, .{ .name = name, .op = .{ .decompress = false, .effort = .q4, .payload = i }, .ref = ref, .info = true });
+        }
         const name = try std.fmt.allocPrint(arena, "d_{s}", .{n});
-        try ws.append(arena, .{ .name = name, .op = .{ .decompress = true, .effort = .default, .payload = i }, .ref = name });
+        try ws.append(arena, .{ .name = name, .op = .{ .decompress = true, .effort = .q6, .payload = i }, .ref = name });
         const aname = try std.fmt.allocPrint(arena, "d_{s}_alloc", .{n});
-        try ws.append(arena, .{ .name = aname, .op = .{ .decompress = true, .effort = .default, .payload = i, .alloc = true }, .ref = name, .info = true });
+        try ws.append(arena, .{ .name = aname, .op = .{ .decompress = true, .effort = .q6, .payload = i, .alloc = true }, .ref = name, .info = true });
     }
 
     const s = try drive(io, arena, &.{exe}, abs, &ctx, ws.items, filters, rounds, w);
