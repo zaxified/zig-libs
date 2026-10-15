@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-15** — New `Decompressor` (R9): a pull `std.Io.Reader` over a stream's decompressed bytes, decoding as reads need it (the decoder suspends mid-command and at meta-block ends); `err` holds the cause of a `ReadFailed`. `decompressStream` is now a loop over it (same results; output goes out as the reader hands it). The decoder is one resumable logic for all four entry points; measured cost on `d_*` against before: +4–9 %. Additive API.
+
 - **2026-10-14** — Encoder: large-window streams (RFC 9841 §6) with `window_bits` 25..30 (`max_large_window_bits`; `CompressOptions`, `StreamOptions`) — the header, the large distance alphabet; blessed by libbrotli 1.2.0 (a copy from 17 MiB back). Completes R8. Streams at 10..24 unchanged. Additive API.
 
 - **2026-10-14** — Decoder: large-window streams (RFC 9841 §6) with `Options.large_window` (off by default, as google/brotli): WBITS up to 62 (30 on 32-bit targets), the 62-bit distance alphabet read with google/brotli's limit of distances below 2^31. Six libbrotli large-window streams (copies from 17 MiB back) committed under `testdata/ref/large/` and replayed. Additive API.

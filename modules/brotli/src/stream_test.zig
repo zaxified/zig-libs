@@ -48,6 +48,32 @@ fn expectStreamsTo(plain: []const u8, stream: []const u8, options: brotli.Option
     }
 }
 
+/// Decode `stream` through the pull `Decompressor`, reading at most
+/// `out_piece` bytes per `stream` call (0 = unlimited) with `rbuf` as the
+/// reader's own buffer, the input in pieces of `in_piece` (0 = whole). A
+/// failure is the decompressor's `err`. Caller frees the result.
+fn pullDecode(gpa: std.mem.Allocator, stream: []const u8, options: brotli.Options, out_piece: usize, in_piece: usize, rbuf: []u8) (brotli.Decompressor.Error || error{ OutOfMemory, WriteFailed })![]u8 {
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var calls: [1]std.testing.Reader.Call = .{.{ .buffer = stream }};
+    var ibuf: [16]u8 = undefined;
+    var tr: std.testing.Reader = .init(&ibuf, &calls);
+    if (in_piece != 0) tr.artificial_limit = .limited(in_piece);
+    var fixed: std.Io.Reader = .fixed(stream);
+    const in: *std.Io.Reader = if (in_piece == 0) &fixed else &tr.interface;
+    var d: brotli.Decompressor = .init(gpa, in, rbuf, options);
+    defer d.deinit();
+    const limit: std.Io.Limit = if (out_piece == 0) .unlimited else .limited(out_piece);
+    while (true) {
+        _ = d.reader.stream(&out.writer, limit) catch |e| switch (e) {
+            error.EndOfStream => break,
+            error.ReadFailed => return d.err.?,
+            error.WriteFailed => return error.WriteFailed,
+        };
+    }
+    return out.toOwnedSlice();
+}
+
 const small_vectors = [_][]const u8{
     "empty",             "x",          "xyzzy",          "10x10y",             "64x",         "quickfox",
     "quickfox_repeated", "zeros",      "ukkonooa",       "zerosukkanooa",      "monkey",      "backward65536",
@@ -84,6 +110,94 @@ test "stream: google/brotli's own streams, including 1 KiB and 64 KiB windows th
             };
         }
     }
+}
+
+test "pull reader: every vector and google/brotli stream, read a byte at a time and in pieces" {
+    const gpa = testing.allocator;
+    // A byte per read stops the decoder inside every kind of command: in
+    // literals, in a long copy (zeros: one copy of 256 KiB), in a static
+    // dictionary word, in a stored block, across the ring's wrap.
+    inline for (small_vectors) |name| {
+        const plain = @embedFile("testdata/" ++ name);
+        const comp = @embedFile("testdata/" ++ name ++ ".compressed");
+        for ([_]usize{ 1, 7, 4096 }) |out_piece| {
+            const got = try pullDecode(gpa, comp, .{}, out_piece, if (out_piece == 7) 3 else 0, &.{});
+            defer gpa.free(got);
+            testing.expectEqualSlices(u8, plain, got) catch |e| {
+                std.debug.print("vector {s}, reads of {d}\n", .{ name, out_piece });
+                return e;
+            };
+        }
+    }
+    inline for (corpus.ref_streams) |r| {
+        const plain = @embedFile("testdata/" ++ r.input);
+        const stream = @embedFile("testdata/ref/" ++ r.file);
+        const got = try pullDecode(gpa, stream, .{ .max_output = 1 << 24 }, if (plain.len < 20_000) 1 else 333, 0, &.{});
+        defer gpa.free(got);
+        testing.expectEqualSlices(u8, plain, got) catch |e| {
+            std.debug.print("{s}\n", .{r.file});
+            return e;
+        };
+    }
+}
+
+test "pull reader: through the Reader interface's own buffer and helpers" {
+    const gpa = testing.allocator;
+    const plain = @embedFile("testdata/alice29.txt");
+    const comp = @embedFile("testdata/alice29.txt.compressed");
+    var in: std.Io.Reader = .fixed(comp);
+    var rbuf: [100]u8 = undefined;
+    var d: brotli.Decompressor = .init(gpa, &in, &rbuf, .{});
+    defer d.deinit();
+    // A few bytes, a line, then the rest.
+    try testing.expectEqualSlices(u8, plain[0..10], try d.reader.take(10));
+    const line = try d.reader.takeDelimiterInclusive('\n');
+    try testing.expectEqualSlices(u8, plain[10..][0..line.len], line);
+    const rest = try d.reader.allocRemaining(gpa, .unlimited);
+    defer gpa.free(rest);
+    try testing.expectEqualSlices(u8, plain[10 + line.len ..], rest);
+    try testing.expectError(error.EndOfStream, d.reader.takeByte());
+    try testing.expectEqual(@as(usize, 0), in.bufferedLen());
+}
+
+test "pull reader: dictionaries and large windows, a byte at a time" {
+    const gpa = testing.allocator;
+    inline for (corpus.dict_cases) |c| {
+        const dict = try c.dict.build(gpa);
+        defer gpa.free(dict);
+        const plain = try c.input.build(gpa);
+        defer gpa.free(plain);
+        const stream = @embedFile("testdata/ref/" ++ comptime corpus.dictRefFile(c, 11));
+        const got = try pullDecode(gpa, stream, .{ .dictionary = dict, .max_output = 1 << 24 }, 1, 0, &.{});
+        defer gpa.free(got);
+        try testing.expectEqualSlices(u8, plain, got);
+    }
+    const c = corpus.large_cases[0];
+    const plain = try c.input.build(gpa);
+    defer gpa.free(plain);
+    const stream = @embedFile("testdata/ref/" ++ comptime corpus.largeRefFile(c, 11));
+    const got = try pullDecode(gpa, stream, .{ .large_window = true }, 1, 0, &.{});
+    defer gpa.free(got);
+    try testing.expectEqualSlices(u8, plain, got);
+}
+
+test "pull reader: a bad stream fails with its cause in err, and stays failed" {
+    const gpa = testing.allocator;
+    const comp = @embedFile("testdata/alice29.txt.compressed");
+    try testing.expectError(error.TruncatedInput, pullDecode(gpa, comp[0 .. comp.len / 2], .{}, 1000, 0, &.{}));
+    var in: std.Io.Reader = .fixed(comp[0 .. comp.len / 2]);
+    var d: brotli.Decompressor = .init(gpa, &in, &.{}, .{});
+    defer d.deinit();
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    while (true) {
+        _ = d.reader.stream(&out.writer, .unlimited) catch |e| {
+            try testing.expectEqual(error.ReadFailed, e);
+            break;
+        };
+    }
+    try testing.expectEqual(error.TruncatedInput, d.err.?);
+    try testing.expectError(error.ReadFailed, d.reader.stream(&out.writer, .unlimited));
 }
 
 test "stream: our encoder's output round-trips (stored and compressed blocks, both windows, block edges)" {
@@ -414,6 +528,23 @@ fn streamDiffHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror
             return error.Disagree;
         } else |e| if (e != we) {
             std.debug.print("one-shot said {t}, into said {t}\n", .{ we, e });
+            return error.Disagree;
+        }
+    }
+
+    // The pull reader, read in random pieces: the same verdict.
+    const out_piece: usize = src.valueRangeAtMost(u16, 1, 600);
+    const pulled = pullDecode(gpa, input, opts, out_piece, 0, &.{});
+    defer if (pulled) |p| gpa.free(p) else |_| {};
+    if (want) |w| {
+        const p = pulled catch |e| {
+            std.debug.print("one-shot decoded {d} bytes, pull reader said {t}\n", .{ w.len, e });
+            return error.Disagree;
+        };
+        if (!std.mem.eql(u8, w, p)) return error.Disagree;
+    } else |we| {
+        if (pulled) |_| return error.Disagree else |pe| if (pe != we) {
+            std.debug.print("one-shot said {t}, pull reader said {t}\n", .{ we, pe });
             return error.Disagree;
         }
     }

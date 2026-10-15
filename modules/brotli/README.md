@@ -48,6 +48,11 @@ const got = try brotli.decompressInto(gpa, buf, input, .{});  // a prefix of buf
 // Streaming: reader in, writer out. Memory is the window (≤ 16 MiB, and
 // only as much as the output needs), not the output.
 const n = try brotli.decompressStream(gpa, &body_reader, &file_writer, .{});
+
+// Pull: a std.Io.Reader over the decompressed bytes, decoding as you read.
+var d = brotli.Decompressor.init(gpa, &body_reader, &buf, .{});
+defer d.deinit();
+const line = try d.reader.takeDelimiterInclusive('\n');   // ReadFailed? see d.err
 // Errors: brotli.StreamError = BrotliError + ReadFailed + WriteFailed.
 
 // Compress. Fails only on allocation — blocks that will not shrink are

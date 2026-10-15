@@ -61,6 +61,9 @@ pub const decompressInto = decoder.decompressInto;
 /// Decompress from a `std.Io.Reader` to a `std.Io.Writer`, holding only the
 /// window — never the whole output. See `decoder.decompressStream`.
 pub const decompressStream = decoder.decompressStream;
+/// A pull `std.Io.Reader` over a stream's decompressed bytes: decodes as
+/// reads need it, suspending mid-command. See `decoder.Decompressor`.
+pub const Decompressor = decoder.Decompressor;
 pub const StreamError = decoder.StreamError;
 
 /// Compress `input` into a valid Brotli stream. Caller owns the returned slice.

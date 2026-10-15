@@ -134,6 +134,43 @@ fn DecoderOf(comptime Sink: type) type {
         dist_htree_index: u32 = 0,
         last_distance_context: u32 = 0,
 
+        // Where `step` stopped when the output had no room (R9: the pull
+        // reader), so the next call goes on from there. Only producing
+        // output stops; every header and table is read in one go.
+        phase: Phase = .window,
+        /// The current meta-block: ISLAST, and what it still produces.
+        is_last: bool = false,
+        mlen: i64 = 0,
+        /// A stored meta-block's bytes not copied yet.
+        stored_left: usize = 0,
+        cmd_phase: CmdPhase = .header,
+        cmd_v: tables.CmdLutElement = undefined,
+        insert_len: u32 = 0,
+        insert_left: u32 = 0,
+        copy_len: u32 = 0,
+        /// A distance past the window (`hotCommands` read it).
+        far_distance: i32 = 0,
+        /// What the command's copy (or word) adds to the output in all.
+        pending_len: usize = 0,
+        /// A copy still to make: `copy_left` bytes from `copy_dist` back.
+        copy_left: usize = 0,
+        copy_dist: usize = 0,
+        /// A copy out of the prefix dictionary: `dict_left` bytes from
+        /// `dict_addr` before `copy_left` from the window.
+        dict_addr: usize = 0,
+        dict_left: usize = 0,
+        /// A static-dictionary word (transformed), `word_off` of it out.
+        word: [transforms.maxOutputLen(dict.max_word_length)]u8 = undefined,
+        word_len: usize = 0,
+        word_off: usize = 0,
+
+        const Phase = enum { window, metablock, stored, commands, metablock_end, done };
+        const CmdPhase = enum { header, literals, distance, far, dict_copy, copy, word };
+        /// `step` stopped: the stream ended, or output is waiting — the
+        /// window has no room left, or a meta-block ended (what it produced
+        /// goes out before the next one is read, which may fail).
+        pub const Progress = enum { done, yield };
+
         fn ensureRoom(self: *Self, n: usize) Error!void {
             try self.out.reserve(n, self.br);
         }
@@ -433,7 +470,7 @@ fn DecoderOf(comptime Sink: type) type {
         }
 
         // --- distance from the recent-distances ring buffer -------------------
-        fn takeDistanceFromRingBuffer(self: *Self, code: u32) i32 {
+        inline fn takeDistanceFromRingBuffer(self: *Self, code: u32) i32 {
             var distance_context: u32 = 0;
             var result: i32 = undefined;
             if (code <= 3) {
@@ -461,7 +498,7 @@ fn DecoderOf(comptime Sink: type) type {
             return result;
         }
 
-        fn readDistance(self: *Self) Error!i32 {
+        inline fn readDistance(self: *Self) Error!i32 {
             const dtree = &self.distance_group[self.dist_htree_index];
             const code = try self.br.readSymbol(dtree);
             self.block_length[2] -= 1;
@@ -524,11 +561,33 @@ fn DecoderOf(comptime Sink: type) type {
             try self.calculateDistanceLut(dist_alphabet_size);
 
             self.out.hint(@intCast(mlen));
-            try self.runCommands(mlen);
+            self.mlen = mlen;
+            self.cmd_phase = .header;
         }
 
-        fn runCommands(self: *Self, mlen_in: i64) Error!void {
-            var mlen = mlen_in;
+        /// The meta-block's commands, while the output has room: false when it
+        /// ran out mid-command (all that is needed to go on is in `self`).
+        /// The checks — and the `reserve`s, so the output cap — come where
+        /// they came when a command ran in one piece.
+        fn runCommands(self: *Self) Error!bool {
+            while (true) {
+                // A command the window cut short, or one the hot loop left
+                // (`hotCommands`).
+                if (self.cmd_phase != .header and !try self.resumeCommand()) return false;
+                if (try self.hotCommands()) return true;
+            }
+        }
+
+        /// Commands while each fits the output whole and copies from the
+        /// window: true at the meta-block's end; false with the command it
+        /// cannot make set up in `self` for `resumeCommand`. It calls nothing
+        /// out of line and keeps its lengths in locals — for the compiler an
+        /// output byte may land on `self`, so a field would be read back
+        /// after every byte, and a call in the loop costs registers
+        /// (measured: each worth ~10 % on `d_text`).
+        inline fn hotCommands(self: *Self) Error!bool {
+            var mlen = self.mlen;
+            defer self.mlen = mlen;
             while (mlen > 0) {
                 // Command block switch.
                 if (self.block_length[1] == 0) {
@@ -544,115 +603,226 @@ fn DecoderOf(comptime Sink: type) type {
                 self.dist_htree_index = self.dist_context_map_slice[v.context];
 
                 // Insert literals.
-                var j: u32 = 0;
                 try self.ensureRoom(insert_len);
-                while (j < insert_len) : (j += 1) {
-                    if (self.block_length[0] == 0) {
-                        try self.decodeBlockTypeAndLength(0);
-                        self.prepareLiteralDecoding();
-                    }
-                    var lit: u16 = undefined;
-                    if (self.trivial_literal_context) {
-                        lit = try self.br.readSymbol(self.literal_htree);
-                    } else {
-                        const len = self.out.pos();
-                        const p1: u8 = if (len >= 1) self.out.back(1) else 0;
-                        const p2: u8 = if (len >= 2) self.out.back(2) else 0;
-                        const context = self.context_lookup[p1] | self.context_lookup[256 + @as(usize, p2)];
-                        const hc = &self.literal_group[self.context_map_slice[context]];
-                        lit = try self.br.readSymbol(hc);
-                    }
-                    // Room for the whole insert was reserved above.
-                    try self.out.put(@intCast(lit));
-                    self.block_length[0] -= 1;
+                if (insert_len > self.out.room()) {
+                    @branchHint(.unlikely);
+                    self.cmd_v = v;
+                    self.insert_len = insert_len;
+                    self.copy_len = copy_len;
+                    self.insert_left = insert_len;
+                    self.cmd_phase = .literals;
+                    return false;
                 }
+                try self.literals(insert_len);
                 mlen -= insert_len;
                 // RFC 7932 9.2: the commands produce exactly MLEN bytes.
                 if (mlen < 0) return error.InvalidLength;
-                if (mlen <= 0) break;
+                if (mlen == 0) break;
 
-                // Distance.
-                var distance: i32 = undefined;
-                if (v.distance_code >= 0) {
-                    // Implicit (== 0): reuse last distance.
-                    self.last_distance_context = 1;
-                    self.dist_rb_idx -%= 1;
-                    distance = self.dist_rb[self.dist_rb_idx & 3];
-                } else {
-                    if (self.block_length[2] == 0) {
-                        try self.decodeBlockTypeAndLength(2);
-                        self.dist_context_map_slice = self.dist_context_map[self.block_type_rb[2][1] * 4 ..][0..4];
-                        // A distance block switch re-selects the htree for the
-                        // command's current distance context (RFC 7932 / reference).
-                        self.dist_htree_index = self.dist_context_map_slice[v.context];
-                    }
-                    distance = try self.readDistance();
-                }
-
+                const distance = try self.commandDistance(v);
                 const pos = self.out.pos();
                 const max_distance: i64 = @min(@as(i64, @intCast(pos)), @as(i64, @intCast(self.max_backward)));
-                const copy: usize = copy_len;
-
-                if (@as(i64, distance) > max_distance and @as(i64, distance) - max_distance <= self.prefix.len) {
-                    // Into the prefix dictionary, which sits just before the
-                    // window; a copy running past its end goes on at the
-                    // window's start (RFC 9841 §3.2). A regular copy
-                    // otherwise: its distance enters the ring.
-                    const dlen = self.prefix.len;
-                    const addr: usize = dlen + @as(usize, @intCast(max_distance)) - @as(usize, @intCast(distance));
-                    const from_dict = @min(copy, dlen - addr);
-                    self.dist_rb[self.dist_rb_idx & 3] = distance;
-                    self.dist_rb_idx +%= 1;
-                    try self.ensureRoom(copy);
-                    try self.out.putSlice(self.prefix[addr..][0..from_dict]);
-                    if (copy > from_dict) try self.out.copyBack(from_dict + @as(usize, @intCast(max_distance)), copy - from_dict);
-                    mlen -= @intCast(copy);
-                    if (mlen < 0) return error.InvalidLength;
-                } else if (@as(i64, distance) > max_distance) {
-                    // Static-dictionary reference (its word ids start past
-                    // the prefix dictionary).
-                    if (distance > tables.max_allowed_distance) return error.InvalidDistance;
-                    if (copy < dict.min_word_length or copy > dict.max_word_length) return error.InvalidDictionary;
-                    const shift = dict.size_bits_by_length[copy];
-                    if (shift == 0) return error.InvalidDictionary;
-                    const address: i64 = @as(i64, distance) - max_distance - 1 - @as(i64, @intCast(self.prefix.len));
-                    const word_mask: i64 = (@as(i64, 1) << @intCast(shift)) - 1;
-                    const word_idx: usize = @intCast(address & word_mask);
-                    const transform_idx: i64 = address >> @intCast(shift);
-                    self.dist_rb_idx +%= self.last_distance_context;
-                    if (transform_idx < 0 or transform_idx >= transforms.num_transforms) return error.InvalidDictionary;
-                    const woff = dict.offsets_by_length[copy] + word_idx * copy;
-                    if (woff + copy > dict.data.len) return error.InvalidDictionary;
-                    const word = dict.data[woff..][0..copy];
-                    // `copy` is bounded to `dict.max_word_length` above, so this
-                    // buffer, sized from the same tables, provably holds any
-                    // transform output even under ReleaseFast (no magic constant).
-                    var buf: [transforms.maxOutputLen(dict.max_word_length)]u8 = undefined;
-                    var wlen: usize = undefined;
-                    if (transform_idx == 0) {
-                        @memcpy(buf[0..copy], word);
-                        wlen = copy;
-                    } else {
-                        wlen = transforms.transformWord(&buf, word, copy, @intCast(transform_idx));
-                        if (wlen == 0 and distance <= 120) return error.InvalidDictionary;
-                    }
-                    try self.ensureRoom(wlen);
-                    try self.out.putSlice(buf[0..wlen]);
-                    mlen -= @intCast(wlen);
-                    if (mlen < 0) return error.InvalidLength;
-                } else {
-                    // Normal LZ77 backward copy.
-                    if (distance <= 0) return error.InvalidDistance;
-                    const d: usize = @intCast(distance);
-                    if (d > pos) return error.InvalidDistance;
-                    self.dist_rb[self.dist_rb_idx & 3] = distance;
-                    self.dist_rb_idx +%= 1;
-                    try self.ensureRoom(copy);
-                    try self.out.copyBack(d, copy);
-                    mlen -= @intCast(copy);
-                    if (mlen < 0) return error.InvalidLength;
+                if (@as(i64, distance) > max_distance) {
+                    // The prefix or the static dictionary: set up and made
+                    // as a cut-short command is.
+                    @branchHint(.unlikely);
+                    self.copy_len = copy_len;
+                    self.far_distance = distance;
+                    self.cmd_phase = .far;
+                    return false;
                 }
-                if (mlen <= 0) break;
+                // Normal LZ77 backward copy.
+                const copy: usize = copy_len;
+                if (distance <= 0) return error.InvalidDistance;
+                const d: usize = @intCast(distance);
+                if (d > pos) return error.InvalidDistance;
+                self.dist_rb[self.dist_rb_idx & 3] = distance;
+                self.dist_rb_idx +%= 1;
+                try self.ensureRoom(copy);
+                if (copy > self.out.room()) {
+                    @branchHint(.unlikely);
+                    self.copy_left = copy;
+                    self.copy_dist = d;
+                    self.pending_len = copy;
+                    self.cmd_phase = .copy;
+                    return false;
+                }
+                try self.out.copyBack(d, copy);
+                mlen -= @intCast(copy);
+                if (mlen < 0) return error.InvalidLength;
+            }
+            return true;
+        }
+
+        /// Go on with a command from `cmd_phase` (state in `self`, `mlen`
+        /// included): true when it is done, false when the window filled.
+        fn resumeCommand(self: *Self) Error!bool {
+            while (true) switch (self.cmd_phase) {
+                .header => return true,
+                .literals => {
+                    const n: u32 = @intCast(@min(self.insert_left, self.out.room()));
+                    try self.literalsCold(n);
+                    self.insert_left -= n;
+                    if (self.insert_left != 0) return false;
+                    self.mlen -= self.insert_len;
+                    if (self.mlen < 0) return error.InvalidLength;
+                    if (self.mlen == 0) {
+                        self.cmd_phase = .header;
+                        return true;
+                    }
+                    self.cmd_phase = .distance;
+                },
+                .distance => try self.startCopy(try self.commandDistance(self.cmd_v)),
+                .far => try self.startCopy(self.far_distance),
+                .dict_copy => {
+                    const n = @min(self.dict_left, self.out.room());
+                    try self.out.putSlice(self.prefix[self.dict_addr..][0..n]);
+                    self.dict_addr += n;
+                    self.dict_left -= n;
+                    if (self.dict_left != 0) return false;
+                    self.cmd_phase = .copy;
+                },
+                .copy => {
+                    const n = @min(self.copy_left, self.out.room());
+                    if (n != 0) try self.out.copyBack(self.copy_dist, n);
+                    self.copy_left -= n;
+                    if (self.copy_left != 0) return false;
+                    try self.endCopy();
+                },
+                .word => {
+                    const n = @min(self.word_len - self.word_off, self.out.room());
+                    try self.out.putSlice(self.word[self.word_off..][0..n]);
+                    self.word_off += n;
+                    if (self.word_off != self.word_len) return false;
+                    try self.endCopy();
+                },
+            };
+        }
+
+        /// `literals`, out of the hot loop.
+        noinline fn literalsCold(self: *Self, n: u32) Error!void {
+            try self.literals(n);
+        }
+
+        /// `n` of the command's literals (room reserved).
+        inline fn literals(self: *Self, n: u32) Error!void {
+            var j: u32 = 0;
+            while (j < n) : (j += 1) {
+                if (self.block_length[0] == 0) {
+                    try self.decodeBlockTypeAndLength(0);
+                    self.prepareLiteralDecoding();
+                }
+                var lit: u16 = undefined;
+                if (self.trivial_literal_context) {
+                    lit = try self.br.readSymbol(self.literal_htree);
+                } else {
+                    const len = self.out.pos();
+                    const p1: u8 = if (len >= 1) self.out.back(1) else 0;
+                    const p2: u8 = if (len >= 2) self.out.back(2) else 0;
+                    const context = self.context_lookup[p1] | self.context_lookup[256 + @as(usize, p2)];
+                    const hc = &self.literal_group[self.context_map_slice[context]];
+                    lit = try self.br.readSymbol(hc);
+                }
+                // Room for the whole insert was reserved above.
+                try self.out.put(@intCast(lit));
+                self.block_length[0] -= 1;
+            }
+        }
+
+        /// The command's copy has all gone out.
+        fn endCopy(self: *Self) Error!void {
+            self.mlen -= @intCast(self.pending_len);
+            if (self.mlen < 0) return error.InvalidLength;
+            self.cmd_phase = .header;
+        }
+
+        /// The command's distance: implicit (the last), or read — after a
+        /// distance block switch if one is due.
+        inline fn commandDistance(self: *Self, v: tables.CmdLutElement) Error!i32 {
+            if (v.distance_code >= 0) {
+                // Implicit (== 0): reuse last distance.
+                self.last_distance_context = 1;
+                self.dist_rb_idx -%= 1;
+                return self.dist_rb[self.dist_rb_idx & 3];
+            }
+            if (self.block_length[2] == 0) {
+                try self.decodeBlockTypeAndLength(2);
+                self.dist_context_map_slice = self.dist_context_map[self.block_type_rb[2][1] * 4 ..][0..4];
+                // A distance block switch re-selects the htree for the
+                // command's current distance context (RFC 7932 / reference).
+                self.dist_htree_index = self.dist_context_map_slice[v.context];
+            }
+            return self.readDistance();
+        }
+
+        /// Set the command's copy at `distance` up (`dict_copy`, `copy` or
+        /// `word`), for `resumeCommand` to make.
+        fn startCopy(self: *Self, distance: i32) Error!void {
+            const pos = self.out.pos();
+            const max_distance: i64 = @min(@as(i64, @intCast(pos)), @as(i64, @intCast(self.max_backward)));
+            const copy: usize = self.copy_len;
+
+            if (@as(i64, distance) > max_distance and @as(i64, distance) - max_distance <= self.prefix.len) {
+                // Into the prefix dictionary, which sits just before the
+                // window; a copy running past its end goes on at the
+                // window's start (RFC 9841 §3.2). A regular copy
+                // otherwise: its distance enters the ring.
+                const dlen = self.prefix.len;
+                const addr: usize = dlen + @as(usize, @intCast(max_distance)) - @as(usize, @intCast(distance));
+                const from_dict = @min(copy, dlen - addr);
+                self.dist_rb[self.dist_rb_idx & 3] = distance;
+                self.dist_rb_idx +%= 1;
+                try self.ensureRoom(copy);
+                self.dict_addr = addr;
+                self.dict_left = from_dict;
+                self.copy_left = copy - from_dict;
+                self.copy_dist = from_dict + @as(usize, @intCast(max_distance));
+                self.pending_len = copy;
+                self.cmd_phase = .dict_copy;
+            } else if (@as(i64, distance) > max_distance) {
+                // Static-dictionary reference (its word ids start past
+                // the prefix dictionary).
+                if (distance > tables.max_allowed_distance) return error.InvalidDistance;
+                if (copy < dict.min_word_length or copy > dict.max_word_length) return error.InvalidDictionary;
+                const shift = dict.size_bits_by_length[copy];
+                if (shift == 0) return error.InvalidDictionary;
+                const address: i64 = @as(i64, distance) - max_distance - 1 - @as(i64, @intCast(self.prefix.len));
+                const word_mask: i64 = (@as(i64, 1) << @intCast(shift)) - 1;
+                const word_idx: usize = @intCast(address & word_mask);
+                const transform_idx: i64 = address >> @intCast(shift);
+                self.dist_rb_idx +%= self.last_distance_context;
+                if (transform_idx < 0 or transform_idx >= transforms.num_transforms) return error.InvalidDictionary;
+                const woff = dict.offsets_by_length[copy] + word_idx * copy;
+                if (woff + copy > dict.data.len) return error.InvalidDictionary;
+                const word = dict.data[woff..][0..copy];
+                // `copy` is bounded to `dict.max_word_length` above, so
+                // `self.word`, sized from the same tables, provably holds any
+                // transform output even under ReleaseFast (no magic constant).
+                var wlen: usize = undefined;
+                if (transform_idx == 0) {
+                    @memcpy(self.word[0..copy], word);
+                    wlen = copy;
+                } else {
+                    wlen = transforms.transformWord(&self.word, word, copy, @intCast(transform_idx));
+                    if (wlen == 0 and distance <= 120) return error.InvalidDictionary;
+                }
+                try self.ensureRoom(wlen);
+                self.word_len = wlen;
+                self.word_off = 0;
+                self.pending_len = wlen;
+                self.cmd_phase = .word;
+            } else {
+                // Normal LZ77 backward copy.
+                if (distance <= 0) return error.InvalidDistance;
+                const d: usize = @intCast(distance);
+                if (d > pos) return error.InvalidDistance;
+                self.dist_rb[self.dist_rb_idx & 3] = distance;
+                self.dist_rb_idx +%= 1;
+                try self.ensureRoom(copy);
+                self.copy_left = copy;
+                self.copy_dist = d;
+                self.pending_len = copy;
+                self.cmd_phase = .copy;
             }
         }
 
@@ -666,43 +836,73 @@ fn DecoderOf(comptime Sink: type) type {
             self.num_dist_htrees = 1;
         }
 
-        fn run(self: *Self) Error!void {
-            // Window bits.
-            const wb = try decodeWindowBits(self.br, self.allow_large_window);
-            self.wbits = wb.wbits;
-            self.large_window = wb.large;
-            self.max_backward = (@as(usize, 1) << @intCast(self.wbits)) - 16;
-            try self.out.setWindow(self.wbits);
+        /// Decode until the stream ends or the output has no room
+        /// (`Sink.room`); called again, it goes on where it stopped. One-shot
+        /// sinks always have room: one call decodes everything.
+        fn step(self: *Self) Error!Progress {
+            while (true) switch (self.phase) {
+                .window => {
+                    const wb = try decodeWindowBits(self.br, self.allow_large_window);
+                    self.wbits = wb.wbits;
+                    self.large_window = wb.large;
+                    self.max_backward = (@as(usize, 1) << @intCast(self.wbits)) - 16;
+                    try self.out.setWindow(self.wbits);
+                    self.phase = .metablock;
+                },
+                .metablock => {
+                    // Nothing from the previous meta-block is read again: every
+                    // table and cursor is rebuilt before the next command.
+                    _ = self.arena_state.reset(.retain_capacity);
+                    self.resetMetablock();
+                    const h = try self.decodeMetaBlockLength();
+                    self.is_last = h.is_last;
+                    if (h.is_metadata or h.is_uncompressed) try self.br.jumpToByteBoundary();
 
-            while (true) {
-                // Nothing from the previous meta-block is read again: every
-                // table and cursor is rebuilt before the next command.
-                _ = self.arena_state.reset(.retain_capacity);
-                self.resetMetablock();
-                const h = try self.decodeMetaBlockLength();
-                if (h.is_metadata or h.is_uncompressed) try self.br.jumpToByteBoundary();
+                    if (h.is_metadata) {
+                        try self.br.skipAlignedBytes(@intCast(h.mlen));
+                        if (h.is_last) self.phase = .done;
+                        continue;
+                    }
+                    if (h.mlen == 0) {
+                        if (h.is_last) self.phase = .done;
+                        continue;
+                    }
+                    if (h.mlen > block_size_cap) return error.InvalidLength;
 
-                if (h.is_metadata) {
-                    try self.br.skipAlignedBytes(@intCast(h.mlen));
-                    if (h.is_last) break;
-                    continue;
-                }
-                if (h.mlen == 0) {
-                    if (h.is_last) break;
-                    continue;
-                }
-                if (h.mlen > block_size_cap) return error.InvalidLength;
-
-                if (h.is_uncompressed) {
-                    const n: usize = @intCast(h.mlen);
-                    try self.out.reserveStored(n, self.br);
+                    if (h.is_uncompressed) {
+                        const n: usize = @intCast(h.mlen);
+                        try self.out.reserveStored(n, self.br);
+                        self.stored_left = n;
+                        self.phase = .stored;
+                    } else {
+                        try self.decodeCompressedMetablock(h.mlen);
+                        self.phase = .commands;
+                    }
+                },
+                .stored => {
+                    const n = @min(self.stored_left, self.out.room());
                     try self.out.readAligned(self.br, n);
-                } else {
-                    try self.decodeCompressedMetablock(h.mlen);
-                }
-                try self.out.endMetablock();
-                if (h.is_last) break;
-            }
+                    self.stored_left -= n;
+                    if (self.stored_left != 0) return .yield;
+                    self.phase = .metablock_end;
+                },
+                .commands => {
+                    if (!try self.runCommands()) return .yield;
+                    self.phase = .metablock_end;
+                },
+                .metablock_end => {
+                    try self.out.endMetablock();
+                    self.phase = if (self.is_last) .done else .metablock;
+                    if (!self.is_last) return .yield;
+                },
+                .done => return .done,
+            };
+        }
+
+        /// The whole stream (a one-shot sink: it yields only between
+        /// meta-blocks).
+        fn run(self: *Self) Error!void {
+            while (try self.step() != .done) {}
         }
     };
 }
@@ -763,15 +963,19 @@ const ListSink = struct {
 
     const WriteError = error{};
 
-    fn pos(s: *const ListSink) usize {
+    inline fn pos(s: *const ListSink) usize {
         return s.list.items.len;
     }
-    fn back(s: *const ListSink, d: usize) u8 {
+    /// Unbounded: `reserve` grows the list (or refuses past the cap).
+    fn room(_: *const ListSink) usize {
+        return std.math.maxInt(usize);
+    }
+    inline fn back(s: *const ListSink, d: usize) u8 {
         return s.list.items[s.list.items.len - d];
     }
     /// Room for `n` more bytes plus `copy_slack` past them, which
     /// `copyBack`'s 16-byte stores may overrun.
-    fn reserve(s: *ListSink, n: usize, _: *const BitReader) BrotliError!void {
+    inline fn reserve(s: *ListSink, n: usize, _: *const BitReader) BrotliError!void {
         if (s.list.items.len + n > s.cap) return error.OutputTooLarge;
         if (s.list.capacity - s.list.items.len >= n + copy_slack) return; // usually: `hint` grew it
         try s.list.ensureUnusedCapacity(s.gpa, n + copy_slack);
@@ -779,7 +983,7 @@ const ListSink = struct {
     fn reserveStored(s: *ListSink, n: usize, br: *const BitReader) BrotliError!void {
         return s.reserve(n, br);
     }
-    fn put(s: *ListSink, b: u8) BrotliError!void {
+    inline fn put(s: *ListSink, b: u8) BrotliError!void {
         s.list.appendAssumeCapacity(b);
     }
     fn putSlice(s: *ListSink, bytes: []const u8) BrotliError!void {
@@ -794,7 +998,7 @@ const ListSink = struct {
     /// they go as 16- or 32-byte loads and stores, which may write up to 31
     /// bytes of garbage past the copy into the `copy_slack` room `reserve` keeps --
     /// overwritten by whatever comes next, never part of the output.
-    fn copyBack(s: *ListSink, d: usize, n: usize) BrotliError!void {
+    inline fn copyBack(s: *ListSink, d: usize, n: usize) BrotliError!void {
         copyBackSlack(s.list.allocatedSlice(), s.list.items.len, d, n);
         s.list.items.len += n;
     }
@@ -802,8 +1006,8 @@ const ListSink = struct {
     /// to the cap, instead of doubling through it. A failure here is left to
     /// `reserve`, which reports it at the byte that needs the room.
     fn hint(s: *ListSink, n: usize) void {
-        const room = @min(n, s.cap -| s.list.items.len);
-        s.list.ensureUnusedCapacity(s.gpa, room) catch {};
+        const want = @min(n, s.cap -| s.list.items.len);
+        s.list.ensureUnusedCapacity(s.gpa, want) catch {};
     }
     fn readAligned(s: *ListSink, br: *BitReader, n: usize) BrotliError!void {
         const start = s.list.items.len;
@@ -847,19 +1051,23 @@ const SliceSink = struct {
 
     const WriteError = error{};
 
-    fn pos(s: *const SliceSink) usize {
+    inline fn pos(s: *const SliceSink) usize {
         return s.len;
     }
-    fn back(s: *const SliceSink, d: usize) u8 {
+    /// Unbounded: `reserve` refuses what does not fit the buffer.
+    fn room(_: *const SliceSink) usize {
+        return std.math.maxInt(usize);
+    }
+    inline fn back(s: *const SliceSink, d: usize) u8 {
         return s.buf[s.len - d];
     }
-    fn reserve(s: *SliceSink, n: usize, _: *const BitReader) BrotliError!void {
+    inline fn reserve(s: *SliceSink, n: usize, _: *const BitReader) BrotliError!void {
         if (s.len + n > s.cap) return error.OutputTooLarge;
     }
     fn reserveStored(s: *SliceSink, n: usize, br: *const BitReader) BrotliError!void {
         return s.reserve(n, br);
     }
-    fn put(s: *SliceSink, b: u8) BrotliError!void {
+    inline fn put(s: *SliceSink, b: u8) BrotliError!void {
         s.buf[s.len] = b;
         s.len += 1;
     }
@@ -869,7 +1077,7 @@ const SliceSink = struct {
     }
     /// The fast moves of `copyBackSlack` while the caller's buffer has the
     /// slack past the copy; near its end, exact copies.
-    fn copyBack(s: *SliceSink, d: usize, n: usize) BrotliError!void {
+    inline fn copyBack(s: *SliceSink, d: usize, n: usize) BrotliError!void {
         const start = s.len;
         if (start + n + copy_slack <= s.buf.len) {
             copyBackSlack(s.buf, start, d, n);
@@ -943,7 +1151,6 @@ pub fn decompress(gpa: std.mem.Allocator, input: []const u8, options: Options) B
 /// plain copy). A 1 KiB body under a 4 MiB window costs 64 KiB, not 4 MiB.
 const RingSink = struct {
     gpa: std.mem.Allocator,
-    w: *std.Io.Writer,
     options: Options,
     buf: []u8 = &.{},
     mask: usize = 0,
@@ -954,11 +1161,28 @@ const RingSink = struct {
 
     const initial_len: usize = 1 << 16;
 
-    const WriteError = error{WriteFailed};
-    const Error = BrotliError || WriteError;
+    const WriteError = error{};
+    const Error = BrotliError;
 
     fn deinit(s: *RingSink) void {
         s.gpa.free(s.buf);
+    }
+    /// Bytes that may be produced before the oldest not handed out
+    /// (`drain`) would be overwritten.
+    fn room(s: *const RingSink) usize {
+        return s.limit - (s.total - s.flushed);
+    }
+    fn unflushed(s: *const RingSink) usize {
+        return s.total - s.flushed;
+    }
+    /// Hand out the oldest bytes not handed out yet (one contiguous piece
+    /// of the ring, at most `limit`) to `w`.
+    fn drain(s: *RingSink, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Writer.Error!usize {
+        const at = s.flushed & s.mask;
+        const k = @min(s.total - s.flushed, s.buf.len - at);
+        const n = try w.write(limit.sliceConst(s.buf[at..][0..k]));
+        s.flushed += n;
+        return n;
     }
     fn pos(s: *const RingSink) usize {
         return s.total;
@@ -981,18 +1205,14 @@ const RingSink = struct {
         const cap = effectiveCap(s.options, consumed +| n);
         if (s.total + n > cap) return error.OutputTooLarge;
     }
-    /// Room for one more byte: grow while the ring has not wrapped yet,
-    /// else write out what is still unwritten (the bytes about to be
-    /// overwritten are then only needed as history, which the ring keeps
-    /// for the whole window).
+    /// Room for one more byte: grow while the ring has not wrapped yet.
+    /// (`room` keeps the decoder from writing over bytes not handed out.)
     fn makeRoom(s: *RingSink) Error!void {
         if (s.total == s.buf.len and s.buf.len < s.limit) {
             const new_len = @min(s.buf.len * 2, s.limit);
             s.buf = try s.gpa.realloc(s.buf, new_len);
             s.mask = new_len - 1;
-        } else if (s.total - s.flushed == s.buf.len) {
-            try s.flushAll();
-        }
+        } else std.debug.assert(s.total - s.flushed < s.buf.len);
     }
     fn put(s: *RingSink, b: u8) Error!void {
         if (s.total - s.flushed == s.buf.len or s.total == s.buf.len) try s.makeRoom();
@@ -1033,17 +1253,7 @@ const RingSink = struct {
         s.buf = try s.gpa.alloc(u8, len);
         s.mask = len - 1;
     }
-    fn endMetablock(s: *RingSink) Error!void {
-        try s.flushAll();
-    }
-    fn flushAll(s: *RingSink) Error!void {
-        while (s.flushed < s.total) {
-            const at = s.flushed & s.mask;
-            const k = @min(s.total - s.flushed, s.buf.len - at);
-            try s.w.writeAll(s.buf[at..][0..k]);
-            s.flushed += k;
-        }
-    }
+    fn endMetablock(_: *RingSink) Error!void {}
 };
 
 /// Everything `decompressStream` can fail with: the format errors of
@@ -1065,30 +1275,93 @@ pub const StreamError = BrotliError || error{ ReadFailed, WriteFailed };
 /// whole body. An uncompressed meta-block counts its own bytes as input.
 /// A `ReadFailed` from `in` is reported as such, not as `TruncatedInput`.
 pub fn decompressStream(gpa: std.mem.Allocator, in: *std.Io.Reader, out: *std.Io.Writer, options: Options) StreamError!u64 {
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-
-    var br = BitReader.initStream(in);
-    var sink: RingSink = .{ .gpa = gpa, .w = out, .options = options };
-    defer sink.deinit();
-
-    var dec = DecoderOf(RingSink){
-        .arena_state = &arena_state,
-        .arena = arena_state.allocator(),
-        .br = &br,
-        .out = &sink,
-        .prefix = options.dictionary,
-        .allow_large_window = options.large_window,
-    };
-    dec.run() catch |err| {
-        if (err == error.TruncatedInput and br.read_failed) return error.ReadFailed;
-        return err;
-    };
-    br.finish();
-    try sink.flushAll();
+    var d: Decompressor = .init(gpa, in, &.{}, options);
+    defer d.deinit();
+    while (true) {
+        _ = d.reader.stream(out, .unlimited) catch |e| switch (e) {
+            error.EndOfStream => break,
+            error.ReadFailed => return d.err orelse error.ReadFailed,
+            error.WriteFailed => return error.WriteFailed,
+        };
+    }
     try out.flush();
-    return sink.total;
+    return d.sink.total;
 }
+
+/// A pull `std.Io.Reader` over the decompressed bytes of one Brotli stream
+/// read from `in` (SPEC.md backlog R9): reading from `reader` decodes as
+/// much as it needs — the decoder stops mid-command when the window holds
+/// nothing but bytes not read yet, and goes on at the next read. Memory and
+/// limits as `decompressStream` (the window, the output cap with the input
+/// consumed so far as the ratio's base), which is a loop over this.
+///
+/// A failure is `error.ReadFailed` from the reader, its cause in `err` — a
+/// format error, or `ReadFailed` when `in` failed. At the end of the stream
+/// the reader reports `EndOfStream` and `in` is left as `decompressStream`
+/// leaves it.
+pub const Decompressor = struct {
+    /// The interface. Its buffer is the one passed to `init` (it may be
+    /// empty: reads then stream straight from the window).
+    reader: std.Io.Reader,
+    /// Why the last `error.ReadFailed` came.
+    err: ?Error = null,
+    arena_state: std.heap.ArenaAllocator,
+    br: BitReader,
+    sink: RingSink,
+    dec: DecoderOf(RingSink),
+    done: bool = false,
+
+    pub const Error = BrotliError || error{ReadFailed};
+
+    /// `in` must have a non-empty buffer (as for `decompressStream`).
+    pub fn init(gpa: std.mem.Allocator, in: *std.Io.Reader, buffer: []u8, options: Options) Decompressor {
+        return .{
+            .reader = .{ .vtable = &.{ .stream = stream }, .buffer = buffer, .seek = 0, .end = 0 },
+            .arena_state = .init(gpa),
+            .br = .initStream(in),
+            .sink = .{ .gpa = gpa, .options = options },
+            .dec = .{
+                .arena_state = undefined,
+                .arena = undefined,
+                .br = undefined,
+                .out = undefined,
+                .prefix = options.dictionary,
+                .allow_large_window = options.large_window,
+            },
+        };
+    }
+
+    pub fn deinit(d: *Decompressor) void {
+        d.sink.deinit();
+        d.arena_state.deinit();
+        d.* = undefined;
+    }
+
+    fn stream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        const d: *Decompressor = @alignCast(@fieldParentPtr("reader", r));
+        // The decoder's pointers into this struct, which may have moved
+        // since `init`.
+        d.dec.arena_state = &d.arena_state;
+        d.dec.arena = d.arena_state.allocator();
+        d.dec.br = &d.br;
+        d.dec.out = &d.sink;
+        while (true) {
+            // After a failure, nothing more: not even what the failing
+            // meta-block had produced (as `decompressStream` never wrote it).
+            if (d.err != null) return error.ReadFailed;
+            if (d.sink.unflushed() != 0) return d.sink.drain(w, limit);
+            if (d.done) return error.EndOfStream;
+            const progress = d.dec.step() catch |e| {
+                d.err = if (e == error.TruncatedInput and d.br.read_failed) error.ReadFailed else e;
+                return error.ReadFailed;
+            };
+            if (progress == .done) {
+                d.done = true;
+                d.br.finish();
+            }
+        }
+    }
+};
 
 test "WBITS codes (RFC 7932 section 9.1)" {
     // The stream header: "0" is 16; "1" + 3 bits n != 0 is 17 + n; "1" + "000"

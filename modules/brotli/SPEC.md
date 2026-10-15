@@ -231,12 +231,28 @@ larger than its input, and `compress` itself never fails except on allocation.
   a 16-bit window; one with metadata blocks) — blessed by google/brotli and replayed like the rest
   (326 checks, 0 mismatches).
 
-## Streaming decoder (`decompressStream`, 2026-09-30)
+## Streaming decoder (`Decompressor`, `decompressStream`; 2026-09-30, pull reader 2026-10-15)
 
-- **Push design, one function:** `decompressStream(gpa, in: *std.Io.Reader, out: *std.Io.Writer,
-  options) StreamError!u64` pulls bits from `in` as it needs them and writes output to `out` at the
-  end of every meta-block and whenever the window fills. A pull-style `std.Io.Reader` over the
-  decompressed bytes would need the decoder to suspend mid-command; not done (Backlog).
+- **Pull reader (R9):** `Decompressor.init(gpa, in, buffer, options)` is a `std.Io.Reader` over the
+  decompressed bytes. Reading decodes as much as it needs: the decoder stops mid-command when the
+  ring holds nothing but bytes not read yet — in a run of literals, in a copy (window, prefix
+  dictionary), in a static-dictionary word, in a stored block — and goes on at the next read, and it
+  stops at every meta-block's end, so what a complete meta-block produced is readable before the
+  next one is decoded (and may fail). Input is pulled from `in` synchronously, as before. A failure
+  is `error.ReadFailed`, its cause in `err`; after one, nothing more is read (not even what the
+  failing meta-block had produced). `decompressStream(gpa, in, out, options)` is a loop over it.
+- **One decoding logic, resumable** (`DecoderOf.step`): a hot loop makes whole commands with its
+  lengths in locals and calls nothing out of line; a command that does not fit the room left, or
+  copies from past the window (prefix or static dictionary), is set up in the decoder and made by
+  `resumeCommand`, phase by phase. A one-shot sink always has room, so `decompress` and
+  `decompressInto` run the hot loop only. Cost measured against the decoder before R6/R9 (A/B, same
+  host): +4 % text, +5 % html, +9 % json on `d_*` — the first version kept the lengths in fields
+  and called out of the loop (+30 %).
+- **Tested:** every committed vector and google/brotli stream read a byte at a time and in 7- and
+  4096-byte reads (the 256 KiB copy of `zeros` stopped at every byte), through the interface's own
+  buffer and helpers (`take`, `takeDelimiterInclusive`, `allocRemaining`), raw-dictionary and
+  large-window streams a byte at a time; the differential fuzz driver reads the pull reader in random
+  pieces next to the other three decoders (60 000 runs clean).
 - **One decoder, two output stores.** The decoding logic is `DecoderOf(Sink)`; `ListSink` is the
   one-shot `decompress` (the whole output is the window, as before), `RingSink` the stream. The bit
   reader is the same too: over a slice, or over a reader's buffer, fetching the next chunk only on
@@ -416,7 +432,7 @@ Order: P (encoder hasher) → R1 (+R3–R5) → R6/R8 → R9 (+R10/R11) → R7 �
 - ~~**R6 Raw prefix dictionary (RFC 9841) on both ends + RFC 9842 `dcb` framing**~~ — **DONE 2026-10-14**: decoder `Options.dictionary` (§ Decoder), encoder `CompressOptions.dictionary` / `StreamOptions.dictionary` (§ Encoder), `brotli.dcb` (header, compress, decompress, `NotDcb`/`DictionaryMismatch`). Left for later: a prepared dictionary shared by many compressions (google's `PrepareDictionary`: today each compression inserts the dictionary's positions anew — O(dictionary) per response). (`ff 44 43 42` + SHA-256 of the dictionary + Shared-Brotli stream, window ≤ 16 MiB) — delta updates of web assets; Chrome ships it.
 - **R7 Serialized shared dictionaries (RFC 9841 §5) — decoder only**: custom word lists, custom transforms incl. ShiftFirst/ShiftAll, context-selected dictionaries, embedded prefix. Encoder side deliberately not (owner 2026-10-14: a research tool only google ships).
 - ~~**R8 Large window (RFC 9841)**~~ — **DONE 2026-10-14**: decoder `Options.large_window` (§ Decoder); encoder `window_bits` 25..30 (`max_large_window_bits`) writes the RFC 9841 header and names distances with the large alphabet's first 74 codes (to 2^31), simple distance codes as wide as the 140-symbol alphabet; a copy from 17 MiB back found and blessed by libbrotli (`large_*` entries).
-- **R9 Pull `std.Io.Reader` decoder** — the decoder becomes a state machine that suspends mid-command; `decompressStream` becomes a loop over it (one decoding logic stays).
+- ~~**R9 Pull `std.Io.Reader` decoder**~~ — **DONE 2026-10-15** as `Decompressor` (§ Streaming decoder); `decompressStream` is a loop over it. Left: the decoder costs +4–9 % against before R6/R9 (§ Streaming decoder).
 - **R10 Metadata callbacks** in the decoder.
 - **R11 Concatenated streams + returning read-ahead bytes** (`brcat`).
 
