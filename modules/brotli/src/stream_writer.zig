@@ -613,11 +613,12 @@ test "a raw prefix dictionary: compressWith's bytes, and every decoder's round t
         const back = try decoder.decompress(gpa, want, .{ .dictionary = dict });
         defer gpa.free(back);
         try testing.expectEqualSlices(u8, input, back);
-        // Without it the stream does not decode to the input.
-        if (decoder.decompress(gpa, want, .{})) |other| {
+        // Without it the stream does not decode to the input (`.q0` never
+        // copies from it: google/brotli's quality 0 does not either).
+        if (effort != .q0) if (decoder.decompress(gpa, want, .{})) |other| {
             defer gpa.free(other);
             try testing.expect(!std.mem.eql(u8, input, other));
-        } else |_| {}
+        } else |_| {};
         // Streamed, with the slide past twice a 64 KiB window: the same bytes.
         var out: Writer.Allocating = .init(gpa);
         defer out.deinit();

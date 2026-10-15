@@ -843,6 +843,18 @@ fn buildAndWriteCodeWide(
     alphabet_size: u32,
     simple_alphabet: u32,
 ) GiveUp!Code {
+    return buildAndWriteCodeLimited(gpa, w, counts, alphabet_size, simple_alphabet, tables.max_code_length);
+}
+
+/// `buildAndWriteCodeWide` with codes of at most `limit` bits.
+fn buildAndWriteCodeLimited(
+    gpa: std.mem.Allocator,
+    w: *BitWriter,
+    counts: []const u32,
+    alphabet_size: u32,
+    simple_alphabet: u32,
+    limit: u5,
+) GiveUp!Code {
     var used: [4]u16 = undefined;
     var m: usize = 0;
     for (counts, 0..) |c, s| {
@@ -885,7 +897,7 @@ fn buildAndWriteCodeWide(
 
     const lengths = try gpa.alloc(u8, alphabet_size);
     defer gpa.free(lengths);
-    _ = try assignLengths(gpa, counts, tables.max_code_length, lengths);
+    _ = try assignLengths(gpa, counts, limit, lengths);
     try writeComplexCode(gpa, w, lengths);
     return canonicalCode(gpa, lengths);
 }
@@ -1519,7 +1531,8 @@ const FastMatcher = struct {
     }
 };
 
-// `.q0` and `.q1` (2026-10-15, R13): a match finder of one slot per bucket,
+// `.q1` (2026-10-15, R13; `.q0` with it until 2026-10-16, now `writeQ0`):
+// a match finder of one slot per bucket,
 // written over at every lookup, and a parse that takes the first match it
 // finds — no gain, no lazy step — and steps faster through data that has
 // stopped matching (one more byte of step per `2^skip_log2` misses, as
@@ -1530,15 +1543,17 @@ const FastMatcher = struct {
 // (`writeFragmentBlock`). Going through `Cmd`s and a resolving pass, as the
 // other levels do, cost about 80 cycles per command, which is all a
 // command may cost here (google q0: about 70 cycles a command, parse and
-// write together; bench payloads, 2026-10-15). The two levels differ in
-// what they look at (`FragLevel`).
+// write together; bench payloads, 2026-10-15). `FragLevel` names what the
+// parse looks at.
 
 /// Bytes `FragMatcher` hashes.
 const frag_hash_len = 5;
 /// log2 of `FragMatcher`'s most buckets.
 const frag_bucket_log_max = 15;
 
-/// What `.q0` and `.q1` do differently.
+/// The parse's choices (`.q1`'s; `.q0`'s own were a step growing every 8
+/// misses, the last distance only after a copy, nothing inserted from a
+/// copy, no backward extension — 1.2–1.55× google's q0 time, 2026-10-15).
 const FragLevel = struct {
     /// Misses per extra byte of step (log2).
     skip_log2: u5,
@@ -1552,10 +1567,8 @@ const FragLevel = struct {
 };
 
 fn fragLevel(e: Effort) FragLevel {
-    return switch (e) {
-        .q0 => .{ .skip_log2 = 3, .ring_every = false, .tail_inserts = 0, .extend_back = false },
-        else => .{ .skip_log2 = 5, .ring_every = true, .tail_inserts = 2, .extend_back = true },
-    };
+    std.debug.assert(e == .q1);
+    return .{ .skip_log2 = 5, .ring_every = true, .tail_inserts = 2, .extend_back = true };
 }
 
 const FragMatcher = struct {
@@ -3984,6 +3997,622 @@ const TypeWalk = struct {
     }
 };
 
+// ---------------------------------------------------------------------------
+// `.q0` (2026-10-16): google/brotli's quality 0, ported from
+// `c/enc/compress_fragment.c` (`BrotliCompressFragmentFast`) and the default
+// command code of `c/enc/encode.c` (`InitCommandPrefixCodes`) — MIT,
+// copyright Google Inc., see this module's NOTICE. One pass: the literal
+// code is built from a meta-block's bytes before any match is looked for,
+// the command and distance codes are the previous meta-block's (google's
+// defaults for the first), and a match goes out the moment it is found, as
+// two commands — "insert N, copy 2" with its distance, then "insert 0, copy
+// the rest" at the last distance — whose symbols the codes keep in an order
+// that saves branches (`Q0Codes`). No record, no second pass: the parse
+// and writer of `.q1` cost twice the instructions a command (2026-10-15).
+// Changes: one call per `Core` block (google: per input chunk), the hash
+// table is `FragMatcher`'s, bits go through `Q0Bits` (locals, a
+// branch-free flush), a block larger than stored is stored by
+// `compressBlock` as at every level, and the meta-blocks are never ISLAST
+// (`Core.finish` adds the empty last one, as google's adds its own).
+
+/// Matches reach this far at most (google `MAX_DISTANCE`, an 18-bit window).
+const q0_max_distance = (1 << 18) - 16;
+const q0_min_match = 5;
+/// Bytes at the end of the input no match starts in: the hash loads eight
+/// (google `kInputMarginBytes`).
+const q0_input_margin = 16;
+/// A meta-block starts with this many bytes and grows by `q0_merge_block`
+/// while the next bytes suit its literal code, to 1 MiB.
+const q0_first_block = 3 << 15;
+const q0_merge_block = 1 << 16;
+/// Room for a pre-written command and distance code (`Q0Codes.code`).
+const q0_code_max = 1024;
+
+/// `kCmdHistoSeed`: where a meta-block's command and distance counts start.
+const q0_cmd_histo_seed = [128]u32{
+    0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 1, 1, 1, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    1, 1, 1, 1, 0, 0, 0, 0,
+};
+
+/// `.q0`'s command and distance codes. Entries 0..63 are the 64 command
+/// symbols it writes in its own order (`q0InsertLen` and the others index
+/// them; `q0StoreCommandCodes` has the map to the alphabet), 64..127 the
+/// distance symbols 0..63.
+const Q0Codes = struct {
+    depth: [128]u8,
+    bits: [128]u16,
+    /// Both codes as the stream carries them, for the next block's first
+    /// meta-block.
+    code: [q0_code_max]u8,
+    code_bits: usize,
+
+    const default: Q0Codes = .{
+        // (google's arrays end four short: zeros.)
+        .depth = [_]u8{
+            0,  4,  4,  5,  6,  6,  7,  7,  7,  7,  7,  8,  8,  8,  8,  8,
+            0,  0,  0,  4,  4,  4,  4,  4,  5,  5,  6,  6,  6,  6,  7,  7,
+            7,  7,  10, 10, 10, 10, 10, 10, 0,  4,  4,  5,  5,  5,  6,  6,
+            7,  8,  8,  9,  10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10,
+            5,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
+            6,  6,  6,  6,  6,  6,  5,  5,  5,  5,  5,  5,  4,  4,  4,  4,
+            4,  4,  4,  5,  5,  5,  5,  5,  5,  6,  6,  7,  7,  7,  8,  10,
+            12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12,
+        } ++ [_]u8{0} ** 4,
+        .bits = [_]u16{
+            0,    0,    8,    9,    3,   35,   7,    71,
+            39,   103,  23,   47,   175, 111,  239,  31,
+            0,    0,    0,    4,    12,  2,    10,   6,
+            13,   29,   11,   43,   27,  59,   87,   55,
+            15,   79,   319,  831,  191, 703,  447,  959,
+            0,    14,   1,    25,   5,   21,   19,   51,
+            119,  159,  95,   223,  479, 991,  63,   575,
+            127,  639,  383,  895,  255, 767,  511,  1023,
+            14,   0,    0,    0,    0,   0,    0,    0,
+            0,    0,    0,    0,    0,   0,    0,    0,
+            27,   59,   7,    39,   23,  55,   30,   1,
+            17,   9,    25,   5,    0,   8,    4,    12,
+            2,    10,   6,    21,   13,  29,   3,    19,
+            11,   15,   47,   31,   95,  63,   127,  255,
+            767,  2815, 1791, 3839, 511, 2559, 1535, 3583,
+            1023, 3071, 2047, 4095,
+        } ++ [_]u16{0} ** 4,
+        .code = [_]u8{
+            0xff, 0x77, 0xd5, 0xbf, 0xe7, 0xde, 0xea, 0x9e, 0x51, 0x5d, 0xde, 0xc6,
+            0x70, 0x57, 0xbc, 0x58, 0x58, 0x58, 0xd8, 0xd8, 0x58, 0xd5, 0xcb, 0x8c,
+            0xea, 0xe0, 0xc3, 0x87, 0x1f, 0x83, 0xc1, 0x60, 0x1c, 0x67, 0xb2, 0xaa,
+            0x06, 0x83, 0xc1, 0x60, 0x30, 0x18, 0xcc, 0xa1, 0xce, 0x88, 0x54, 0x94,
+            0x46, 0xe1, 0xb0, 0xd0, 0x4e, 0xb2, 0xf7, 0x04, 0x00,
+        } ++ [_]u8{0} ** (q0_code_max - 57),
+        .code_bits = 448,
+    };
+};
+
+/// Bits straight into a `BitWriter`'s reserved room: the pending bits in
+/// locals, eight bytes stored after every write and the whole bytes
+/// counted (at most seven bits stay pending).
+const Q0Bits = struct {
+    base: [*]u8,
+    ptr: [*]u8,
+    acc: u64,
+    cnt: u32,
+
+    /// Continue `w` (its pending bits too); room must be reserved, eight
+    /// bytes past the last one written.
+    fn open(w: *const BitWriter) Q0Bits {
+        const base = w.buf.items.ptr + w.buf.items.len;
+        var b: Q0Bits = .{ .base = base, .ptr = base, .acc = 0, .cnt = 0 };
+        b.put(w.cnt, w.acc);
+        return b;
+    }
+
+    fn close(b: *const Q0Bits, w: *BitWriter) void {
+        w.buf.items.len += @intFromPtr(b.ptr) - @intFromPtr(b.base);
+        w.acc = b.acc;
+        w.cnt = @intCast(b.cnt);
+    }
+
+    /// `n` bits (at most 56) of `v`, which has none above them.
+    inline fn put(b: *Q0Bits, n: u32, v: u64) void {
+        b.acc |= v << @intCast(b.cnt);
+        b.cnt += n;
+        std.mem.writeInt(u64, b.ptr[0..8], b.acc, .little);
+        b.ptr += b.cnt >> 3;
+        b.acc >>= @intCast(b.cnt & 56);
+        b.cnt &= 7;
+    }
+
+    inline fn sym(b: *Q0Bits, c: *const Q0Codes, h: *[128]u32, code: usize) void {
+        b.put(c.depth[code], c.bits[code]);
+        h[code] += 1;
+    }
+};
+
+inline fn log2Floor(x: usize) u32 {
+    return std.math.log2_int(usize, x);
+}
+
+/// google `EmitInsertLen`: insert < 6210, with copy 2.
+inline fn q0InsertLen(b: *Q0Bits, c: *const Q0Codes, h: *[128]u32, insert: usize) void {
+    if (insert < 6) {
+        b.sym(c, h, insert + 40);
+    } else if (insert < 130) {
+        const tail = insert - 2;
+        const nbits = log2Floor(tail) - 1;
+        const prefix = tail >> @intCast(nbits);
+        b.sym(c, h, (nbits << 1) + prefix + 42);
+        b.put(nbits, tail - (prefix << @intCast(nbits)));
+    } else if (insert < 2114) {
+        const tail = insert - 66;
+        const nbits = log2Floor(tail);
+        b.sym(c, h, nbits + 50);
+        b.put(nbits, tail - (@as(usize, 1) << @intCast(nbits)));
+    } else {
+        b.sym(c, h, 61);
+        b.put(12, insert - 2114);
+    }
+}
+
+/// google `EmitLongInsertLen`.
+inline fn q0LongInsertLen(b: *Q0Bits, c: *const Q0Codes, h: *[128]u32, insert: usize) void {
+    if (insert < 22594) {
+        b.sym(c, h, 62);
+        b.put(14, insert - 6210);
+    } else {
+        b.sym(c, h, 63);
+        b.put(24, insert - 22594);
+    }
+}
+
+/// google `EmitCopyLen`: insert 0, the distance written after.
+inline fn q0CopyLen(b: *Q0Bits, c: *const Q0Codes, h: *[128]u32, copy: usize) void {
+    if (copy < 10) {
+        b.sym(c, h, copy + 14);
+    } else if (copy < 134) {
+        const tail = copy - 6;
+        const nbits = log2Floor(tail) - 1;
+        const prefix = tail >> @intCast(nbits);
+        b.sym(c, h, (nbits << 1) + prefix + 20);
+        b.put(nbits, tail - (prefix << @intCast(nbits)));
+    } else if (copy < 2118) {
+        const tail = copy - 70;
+        const nbits = log2Floor(tail);
+        b.sym(c, h, nbits + 28);
+        b.put(nbits, tail - (@as(usize, 1) << @intCast(nbits)));
+    } else {
+        b.sym(c, h, 39);
+        b.put(24, copy - 2118);
+    }
+}
+
+/// google `EmitCopyLenLastDistance`: insert 0 at the last distance (the
+/// implicit symbols up to 71 bytes, then the code's "last distance").
+inline fn q0CopyLenLastDistance(b: *Q0Bits, c: *const Q0Codes, h: *[128]u32, copy: usize) void {
+    if (copy < 12) {
+        b.sym(c, h, copy - 4);
+    } else if (copy < 72) {
+        const tail = copy - 8;
+        const nbits = log2Floor(tail) - 1;
+        const prefix = tail >> @intCast(nbits);
+        b.sym(c, h, (nbits << 1) + prefix + 4);
+        b.put(nbits, tail - (prefix << @intCast(nbits)));
+    } else if (copy < 136) {
+        const tail = copy - 8;
+        b.sym(c, h, (tail >> 5) + 30);
+        b.put(5, tail & 31);
+        b.sym(c, h, 64);
+    } else if (copy < 2120) {
+        const tail = copy - 72;
+        const nbits = log2Floor(tail);
+        b.sym(c, h, nbits + 28);
+        b.put(nbits, tail - (@as(usize, 1) << @intCast(nbits)));
+        b.sym(c, h, 64);
+    } else {
+        b.sym(c, h, 39);
+        b.put(24, copy - 2120);
+        b.sym(c, h, 64);
+    }
+}
+
+/// google `EmitDistance`: distance codes 16 and up (NPOSTFIX = NDIRECT = 0).
+inline fn q0Distance(b: *Q0Bits, c: *const Q0Codes, h: *[128]u32, distance: usize) void {
+    const d = distance + 3;
+    const nbits = log2Floor(d) - 1;
+    const prefix = (d >> @intCast(nbits)) & 1;
+    const offset = (2 + prefix) << @intCast(nbits);
+    b.sym(c, h, 2 * (nbits - 1) + prefix + 80);
+    b.put(nbits, d - offset);
+}
+
+inline fn q0Literals(b: *Q0Bits, lit: *const Code, bytes: []const u8) void {
+    for (bytes) |x| b.put(lit.len[x], lit.bits[x]);
+}
+
+/// google `BuildAndStoreLiteralPrefixCode`: a code of at most 14 bits
+/// (`BrotliBuildAndStoreHuffmanTreeFast`; its `max_bits`, 8, is a simple
+/// code's symbol width) from the bytes before the parse (all of them under 32 KiB, every 29th
+/// above, then each symbol's first 11 counted three times — the parse
+/// takes the frequent ones into copies); also the estimated ratio, in
+/// thousandths of a byte per byte.
+fn q0LiteralCode(gpa: std.mem.Allocator, w: *BitWriter, bytes: []const u8, ratio: *usize) GiveUp!Code {
+    var h: [tables.num_literal_symbols]u32 = @splat(0);
+    var total: usize = 0;
+    if (bytes.len < (1 << 15)) {
+        for (bytes) |x| h[x] += 1;
+        total = bytes.len;
+        for (&h) |*v| {
+            const first: u32 = @min(v.*, 11); // (`@min` narrows to u4)
+            const adjust = 2 * first;
+            v.* += adjust;
+            total += adjust;
+        }
+    } else {
+        const rate = 29;
+        var i: usize = 0;
+        while (i < bytes.len) : (i += rate) h[bytes[i]] += 1;
+        total = (bytes.len + rate - 1) / rate;
+        for (&h) |*v| {
+            const first: u32 = @min(v.*, 11);
+            const adjust = 1 + 2 * first;
+            v.* += adjust;
+            total += adjust;
+        }
+    }
+    const code = try buildAndWriteCodeLimited(gpa, w, &h, tables.num_literal_symbols, tables.num_literal_symbols, 14);
+    var bits: usize = 0;
+    for (h, code.len) |k, l| bits += @as(usize, k) * l;
+    ratio.* = bits * 125 / total;
+    return code;
+}
+
+/// google `BuildAndStoreCommandPrefixCode`: the command and distance codes
+/// for counts `h` into `c` and onto `w`. The command code is built over the
+/// 64 symbols in `.q0`'s order and written over the alphabet; its canonical
+/// bits are computed in the alphabet's order (`tmp`), which is `.q0`'s
+/// order but for entry 40 — insert 0 with copy 2, the alphabet's 128, which
+/// `.q0` never writes (a match costs an insert of at least one).
+fn q0StoreCommandCodes(gpa: std.mem.Allocator, w: *BitWriter, h: *const [128]u32, c: *Q0Codes) GiveUp!void {
+    var depth: [128]u8 = undefined;
+    _ = try assignLengths(gpa, h[0..64], 15, depth[0..64]);
+    _ = try assignLengths(gpa, h[64..128], 14, depth[64..128]);
+    if (depth[40] != 0 or depth[16] != 0) return error.EncoderInvariant;
+    var tmp: [64]u8 = undefined;
+    @memcpy(tmp[0..24], depth[0..24]);
+    @memcpy(tmp[24..32], depth[40..48]);
+    @memcpy(tmp[32..40], depth[24..32]);
+    @memcpy(tmp[40..48], depth[48..56]);
+    @memcpy(tmp[48..56], depth[32..40]);
+    @memcpy(tmp[56..64], depth[56..64]);
+    var tcode = try canonicalCode(gpa, &tmp);
+    defer tcode.deinit(gpa);
+    var bits: [128]u16 = undefined;
+    @memcpy(bits[0..24], tcode.bits[0..24]);
+    @memcpy(bits[24..32], tcode.bits[32..40]);
+    @memcpy(bits[32..40], tcode.bits[48..56]);
+    @memcpy(bits[40..48], tcode.bits[24..32]);
+    @memcpy(bits[48..56], tcode.bits[40..48]);
+    @memcpy(bits[56..64], tcode.bits[56..64]);
+    var dcode = try canonicalCode(gpa, depth[64..128]);
+    defer dcode.deinit(gpa);
+    @memcpy(bits[64..128], dcode.bits);
+
+    var full: [tables.num_command_symbols]u8 = @splat(0);
+    @memcpy(full[0..8], depth[0..8]);
+    @memcpy(full[64..72], depth[8..16]);
+    @memcpy(full[128..136], depth[16..24]);
+    @memcpy(full[192..200], depth[24..32]);
+    @memcpy(full[384..392], depth[32..40]);
+    for (0..8) |i| {
+        full[128 + 8 * i] = depth[40 + i];
+        full[256 + 8 * i] = depth[48 + i];
+        full[448 + 8 * i] = depth[56 + i];
+    }
+    try writeComplexCode(gpa, w, &full);
+    try writeComplexCode(gpa, w, depth[64..128]);
+    c.depth = depth;
+    c.bits = bits;
+}
+
+/// `q0StoreCommandCodes` into `c.code`, for the next block's first
+/// meta-block (google: `s->cmd_code`).
+fn q0PrepareCommandCodes(gpa: std.mem.Allocator, h: *const [128]u32, c: *Q0Codes) GiveUp!void {
+    var tw: BitWriter = .{ .gpa = gpa };
+    defer tw.buf.deinit(gpa);
+    try q0StoreCommandCodes(gpa, &tw, h, c);
+    const whole = tw.buf.items.len;
+    const pending = (@as(usize, tw.cnt) + 7) / 8;
+    if (whole + pending > q0_code_max) return error.EncoderInvariant;
+    @memcpy(c.code[0..whole], tw.buf.items);
+    for (0..pending) |k| c.code[whole + k] = @truncate(tw.acc >> @intCast(8 * k));
+    c.code_bits = tw.bitPos();
+}
+
+fn q0WriteCommandCodes(w: *BitWriter, c: *const Q0Codes) std.mem.Allocator.Error!void {
+    var i: usize = 0;
+    while (i + 8 <= c.code_bits) : (i += 8) try w.writeBits(c.code[i / 8], 8);
+    const rest: u6 = @intCast(c.code_bits & 7);
+    if (rest != 0) try w.writeBits(c.code[i / 8] & ((@as(u8, 1) << @intCast(rest)) - 1), rest);
+}
+
+/// A compressed meta-block's header, not ISLAST, then NBLTYPES 1 for all
+/// three, NPOSTFIX = NDIRECT = 0, context mode, NTREESL and NTREESD 1.
+fn q0Header(w: *BitWriter, len: usize) std.mem.Allocator.Error!void {
+    const nibbles: u6 = if (len <= 1 << 16) 4 else if (len <= 1 << 20) 5 else 6;
+    try w.writeBits(0, 1);
+    try w.writeBits(nibbles - 4, 2);
+    try w.writeBits(@intCast(len - 1), nibbles * 4);
+    try w.writeBits(0, 1);
+    try w.writeBits(0, 13);
+}
+
+/// google `UpdateBits`: `n` bits of `v` over what is at bit `pos` (written
+/// out already).
+fn q0UpdateBits(w: *BitWriter, n_in: u32, v_in: u32, pos_in: usize) void {
+    var n = n_in;
+    var v = v_in;
+    var pos = pos_in;
+    const array = w.buf.items;
+    while (n > 0) {
+        const byte_pos = pos >> 3;
+        const unchanged: u5 = @intCast(pos & 7);
+        const changed: u5 = @intCast(@min(n, 8 - @as(u32, unchanged)));
+        const total: u5 = unchanged + changed;
+        const mask: u32 = ~((@as(u32, 1) << total) - 1) | ((@as(u32, 1) << unchanged) - 1);
+        const keep = array[byte_pos] & mask;
+        const new = v & ((@as(u32, 1) << changed) - 1);
+        array[byte_pos] = @truncate((new << unchanged) | keep);
+        n -= changed;
+        v >>= changed;
+        pos += changed;
+    }
+}
+
+/// google `ShouldMergeBlock`: whether the next bytes suit the literal code
+/// (`depth`) well enough to continue the meta-block.
+fn q0ShouldMerge(bytes: []const u8, depth: []const u8) bool {
+    const rate = 43;
+    var h: [tables.num_literal_symbols]u32 = @splat(0);
+    var i: usize = 0;
+    while (i < bytes.len) : (i += rate) h[bytes[i]] += 1;
+    const total = (bytes.len + rate - 1) / rate;
+    const t: f64 = @floatFromInt(total);
+    var r: f64 = (greedy_split.fastLog2(total) + 0.5) * t + 200;
+    for (h, depth) |k, d| {
+        if (k == 0) continue;
+        r -= @as(f64, @floatFromInt(k)) * (@as(f64, @floatFromInt(d)) + greedy_split.fastLog2(k));
+    }
+    return r >= 0;
+}
+
+inline fn q0Hash(in: []const u8, p: usize, shift: u6) u32 {
+    const v = std.mem.readInt(u64, in[p..][0..8], .little);
+    return @truncate(((v << 24) *% 0x1e35a7bd) >> shift);
+}
+
+inline fn q0HashAt(v: u64, comptime offset: u6, shift: u6) u32 {
+    return @truncate((((v >> (8 * offset)) << 24) *% 0x1e35a7bd) >> shift);
+}
+
+inline fn q0IsMatch(in: []const u8, p1: usize, p2: usize) bool {
+    return std.mem.readInt(u32, in[p1..][0..4], .little) == std.mem.readInt(u32, in[p2..][0..4], .little) and in[p1 + 4] == in[p2 + 4];
+}
+
+/// The positions inside a copy that ends at `ip` go into the table, and the
+/// candidate for `ip` comes out of it.
+inline fn q0AfterCopy(in: []const u8, table: []u32, ip: usize, shift: u6) usize {
+    const v = std.mem.readInt(u64, in[ip - 3 ..][0..8], .little);
+    const cur = q0HashAt(v, 3, shift);
+    table[q0HashAt(v, 0, shift)] = @intCast(ip - 3);
+    table[q0HashAt(v, 1, shift)] = @intCast(ip - 2);
+    table[q0HashAt(v, 2, shift)] = @intCast(ip - 1);
+    const candidate: usize = table[cur];
+    table[cur] = @intCast(ip);
+    return candidate;
+}
+
+const Q0Block = struct {
+    in: []const u8,
+    table: []u32,
+    shift: u6,
+    max_distance: usize,
+    codes: *Q0Codes,
+    histo: *[128]u32,
+    lit: *const Code,
+    literal_ratio: usize,
+    metablock_start: usize,
+    input_size: usize,
+};
+
+/// google's `emit_commands`: the commands of `in[input..][0..block_size]`,
+/// from `next_emit.*` on. Null when the rest goes out as an insert; else
+/// where the meta-block so far is to be stored instead.
+fn q0Commands(b: *Q0Bits, x: *const Q0Block, input: usize, block_size: usize, next_emit: *usize) ?usize {
+    const in = x.in;
+    const table = x.table;
+    const shift = x.shift;
+    const c = x.codes;
+    const h = x.histo;
+    if (block_size < q0_input_margin) return null;
+    const ip_end = input + block_size;
+    const len_limit = @min(block_size - q0_min_match, x.input_size - q0_input_margin);
+    const ip_limit = input + len_limit;
+    var last_distance: usize = 0; // none
+    var ip = input + 1;
+    var next_hash = q0Hash(in, ip, shift);
+    while (true) {
+        // Step 1: a 5-byte match, looking at every byte, one byte further
+        // apart every 32 misses (Snappy's skipping).
+        var skip: u32 = 32;
+        var next_ip = ip;
+        var candidate: usize = undefined;
+        while (true) {
+            while (true) {
+                const hash = next_hash;
+                const step = skip >> 5;
+                skip += 1;
+                ip = next_ip;
+                next_ip = ip + step;
+                if (next_ip > ip_limit) return null;
+                next_hash = q0Hash(in, next_ip, shift);
+                if (last_distance != 0 and q0IsMatch(in, ip, ip - last_distance)) {
+                    candidate = ip - last_distance;
+                    table[hash] = @intCast(ip);
+                    break;
+                }
+                candidate = table[hash];
+                table[hash] = @intCast(ip);
+                if (q0IsMatch(in, ip, candidate)) break;
+            }
+            if (ip - candidate <= x.max_distance) break;
+        }
+
+        // Step 2: the match and the literals before it.
+        {
+            const base = ip;
+            const matched = q0_min_match + Matcher.matchLen(in, candidate + q0_min_match, ip + q0_min_match, ip_end - ip - q0_min_match);
+            const distance = base - candidate;
+            const insert = base - next_emit.*;
+            ip += matched;
+            if (insert < 6210) {
+                q0InsertLen(b, c, h, insert);
+            } else if (next_emit.* - x.metablock_start <= insert / 50 and x.literal_ratio > 980) {
+                // google `ShouldUseUncompressedMode`: barely compressed so far
+                // and a long insert of poorly coded literals.
+                return base;
+            } else {
+                q0LongInsertLen(b, c, h, insert);
+            }
+            q0Literals(b, x.lit, in[next_emit.*..base]);
+            if (distance == last_distance) {
+                b.sym(c, h, 64);
+            } else {
+                q0Distance(b, c, h, distance);
+                last_distance = distance;
+            }
+            q0CopyLenLastDistance(b, c, h, matched);
+            next_emit.* = ip;
+            if (ip >= ip_limit) return null;
+            candidate = q0AfterCopy(in, table, ip, shift);
+        }
+        // Further matches right after, with no literals between.
+        while (q0IsMatch(in, ip, candidate)) {
+            const base = ip;
+            const matched = q0_min_match + Matcher.matchLen(in, candidate + q0_min_match, ip + q0_min_match, ip_end - ip - q0_min_match);
+            if (ip - candidate > x.max_distance) break;
+            ip += matched;
+            last_distance = base - candidate;
+            q0CopyLen(b, c, h, matched);
+            q0Distance(b, c, h, last_distance);
+            next_emit.* = ip;
+            if (ip >= ip_limit) return null;
+            candidate = q0AfterCopy(in, table, ip, shift);
+        }
+        ip += 1;
+        next_hash = q0Hash(in, ip, shift);
+    }
+}
+
+/// `.q0`'s meta-blocks for `in` (google `BrotliCompressFragmentFastImpl`)
+/// with `table` (`FragMatcher`'s), starting from the codes in `codes`,
+/// which it updates as google's does; `histo` is left with the last
+/// meta-block's command and distance counts (`q0PrepareCommandCodes`).
+fn writeQ0(gpa: std.mem.Allocator, w: *BitWriter, in: []const u8, table_all: []u32, max_distance: usize, codes: *Q0Codes, histo: *[128]u32) GiveUp!void {
+    if (in.len == 0) return error.EncoderInvariant;
+    // google `HashTableSize` for quality 0: the input's size from 2^8 to
+    // 2^15, an odd power of two.
+    var ht: usize = 256;
+    while (ht < (1 << 15) and ht < in.len) ht <<= 1;
+    if (ht & 0xAAAAA == 0) ht <<= 1;
+    ht = @min(ht, table_all.len);
+    const table = table_all[0..ht];
+    Matcher.fillZero(table);
+
+    var x: Q0Block = .{
+        .in = in,
+        .table = table,
+        .shift = @intCast(64 - log2Floor(ht)),
+        .max_distance = @min(max_distance, q0_max_distance),
+        .codes = codes,
+        .histo = histo,
+        .lit = undefined,
+        .literal_ratio = 0,
+        .metablock_start = 0,
+        .input_size = in.len,
+    };
+    var input: usize = 0;
+    var next_emit: usize = 0;
+    var block_size: usize = @min(in.len, q0_first_block);
+    var total_block_size: usize = block_size;
+    var header = w.mark();
+    var mlen_pos = w.bitPos() + 3;
+    try q0Header(w, block_size);
+    var lit = try q0LiteralCode(gpa, w, in[0..block_size], &x.literal_ratio);
+    defer lit.deinit(gpa);
+    x.lit = &lit;
+    try q0WriteCommandCodes(w, codes);
+
+    while (true) {
+        histo.* = q0_cmd_histo_seed;
+        // At most 16 bits a byte (google reserves the same).
+        try w.room(2 * block_size + 64);
+        var b = Q0Bits.open(w);
+        if (q0Commands(&b, &x, input, block_size, &next_emit)) |base| {
+            b.close(w);
+            w.rollback(header);
+            try writeStoreBlock(w, in[x.metablock_start..base]);
+            x.input_size -= base - input;
+            input = base;
+            next_emit = input;
+        } else {
+            const ip_end = input + block_size;
+            input += block_size;
+            x.input_size -= block_size;
+            block_size = @min(x.input_size, q0_merge_block);
+            // Continue the meta-block while the next bytes suit its
+            // literal code: its MLEN has five nibbles from the start.
+            if (x.input_size > 0 and total_block_size + block_size <= 1 << 20 and q0ShouldMerge(in[input..][0..block_size], lit.len)) {
+                b.close(w);
+                total_block_size += block_size;
+                q0UpdateBits(w, 20, @intCast(total_block_size - 1), mlen_pos);
+                continue;
+            }
+            var stored = false;
+            if (next_emit < ip_end) {
+                const insert = ip_end - next_emit;
+                if (insert < 6210) {
+                    q0InsertLen(&b, codes, histo, insert);
+                    q0Literals(&b, &lit, in[next_emit..ip_end]);
+                } else if (next_emit - x.metablock_start <= insert / 50 and x.literal_ratio > 980) {
+                    b.close(w);
+                    w.rollback(header);
+                    try writeStoreBlock(w, in[x.metablock_start..ip_end]);
+                    stored = true;
+                } else {
+                    q0LongInsertLen(&b, codes, histo, insert);
+                    q0Literals(&b, &lit, in[next_emit..ip_end]);
+                }
+            }
+            next_emit = ip_end;
+            if (!stored) b.close(w);
+        }
+        if (x.input_size == 0) return;
+        // The next meta-block, with codes from this one's counts.
+        x.metablock_start = input;
+        block_size = @min(x.input_size, q0_first_block);
+        total_block_size = block_size;
+        header = w.mark();
+        mlen_pos = w.bitPos() + 3;
+        try q0Header(w, block_size);
+        const next_lit = try q0LiteralCode(gpa, w, in[input..][0..block_size], &x.literal_ratio);
+        lit.deinit(gpa);
+        lit = next_lit;
+        try q0StoreCommandCodes(gpa, w, histo, codes);
+    }
+}
+
 /// RFC 7932 §6: the block count code for a block of `len` symbols.
 fn blockLenCode(len: u32) struct { code: u5, extra: u32, nbits: u5 } {
     var c: usize = tables.num_block_len_symbols - 1;
@@ -4278,12 +4907,13 @@ pub fn compress(gpa: std.mem.Allocator, input: []const u8) std.mem.Allocator.Err
 /// the Go port's `DefaultCompression`; `fromQuality` maps a quality level
 /// from code written against the C or Go API.
 pub const Effort = enum(u4) {
-    /// One candidate per lookup (`FragMatcher`), the last distance only
-    /// after a copy, a step that grows fast through data that stopped
-    /// matching; one code per category. The fastest level.
+    /// google/brotli's quality 0, ported (`writeQ0`): one pass, each match
+    /// written as found, codes from the block's bytes and the previous
+    /// block; no dictionary. The fastest level.
     q0 = 0,
-    /// As `.q0`, with the last distance tried at every position, matches
-    /// extended backwards and a slower-growing step.
+    /// One candidate per lookup (`FragMatcher`), the last distance tried at
+    /// every position, matches extended backwards, a step that grows
+    /// through data that stopped matching; one code per category.
     q1 = 1,
     /// Its own match finder (4 candidates, last distance), one literal
     /// code per block.
@@ -4371,7 +5001,8 @@ pub const CompressOptions = struct {
     /// A raw prefix dictionary (RFC 9841 §3.2; RFC 9842 `dcb`): bytes copies
     /// may come from as if they preceded the input; the decoder needs the
     /// same (`Options.dictionary`). Its positions are searched like the
-    /// input's (the table is sized for both).
+    /// input's (the table is sized for both) — but not at `.q0`, which
+    /// looks only inside each block, as google/brotli's quality 0 does.
     dictionary: []const u8 = &.{},
 
     pub const default_block_size = compressed_block_size;
@@ -4499,6 +5130,11 @@ pub const Core = struct {
     emitted_last: bool = false,
     /// `tableLog` the tables were made with.
     table_log: u6,
+    /// `.q0`'s command and distance codes for the next block, those a block
+    /// ends with (`writeQ0`), and its last meta-block's counts.
+    q0: Q0Codes = .default,
+    q0_next: Q0Codes = .default,
+    q0_histo: [128]u32 = q0_cmd_histo_seed,
 
     /// `size`: how much input the match finder's tables are sized for.
     pub fn init(gpa: std.mem.Allocator, effort: Effort, block_size: usize, wbits: u5, size: usize) std.mem.Allocator.Error!Core {
@@ -4593,6 +5229,7 @@ pub const Core = struct {
         c.w.cnt = 0;
         c.ring = .{};
         c.emitted_last = false;
+        c.q0 = .default;
     }
 
     /// `data` will lose its first `by` bytes (`setData` follows).
@@ -4675,7 +5312,9 @@ pub const Core = struct {
         const max_dist = (@as(usize, 1) << c.wbits) - 16;
         c.cmds.clearRetainingCapacity();
         switch (c.effort) {
-            inline .q0, .q1 => |e| {
+            // `.q0` parses as it writes (`writeQ0`, from `writeBest`).
+            .q0 => {},
+            inline .q1 => |e| {
                 const lv = comptime fragLevel(e);
                 if (c.prefix().len != 0)
                     try buildFrag(true, lv, gpa, &c.matcher.frag, off, end, max_dist, c.ring, &c.frag)
@@ -4752,9 +5391,20 @@ pub const Core = struct {
             ok = ok and m.len * 8 + c.scratch.bitPos() < store_bits;
             if (ok) try w.takeFrom(m, &c.scratch);
         }
+        if (c.effort == .q0 and !is_last) {
+            // google: the next block starts from this one's codes, stored or
+            // not (after the last, a stream's `reset` starts from the
+            // defaults).
+            c.q0 = c.q0_next;
+            q0PrepareCommandCodes(gpa, &c.q0_histo, &c.q0) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => c.q0 = .default,
+            };
+        }
         if (ok and w.bitPos() < store_bits) {
             c.ring = trial; // a stored block leaves the decoder's ring alone
-            c.emitted_last = is_last;
+            // `.q0`'s meta-blocks are never ISLAST: `finish` adds one.
+            c.emitted_last = is_last and c.effort != .q0;
         } else {
             w.rollback(m);
             try writeStoreBlock(w, c.data[off..end]);
@@ -4773,6 +5423,16 @@ pub const Core = struct {
         const x = c.prefix();
         const out = c.data[x.len..];
         const env: BlockEnv = .{ .reach = x.len + x.dropped, .large_window = c.wbits > max_window_bits, .dropped = x.dropped, .max_backward = (@as(usize, 1) << c.wbits) - 16 };
+        if (c.effort == .q0) {
+            var codes = c.q0;
+            writeQ0(c.gpa, dst, c.data[off..end], c.matcher.frag.table, env.max_backward, &codes, &c.q0_histo) catch |e| switch (e) {
+                error.OutOfMemory => if (dst.overflowed) return false else return error.OutOfMemory,
+                else => return false,
+            };
+            c.q0_next = codes;
+            ring.* = c.ring; // `.q0` never writes a ring distance it did not write itself
+            return true;
+        }
         if (c.effort.finder() == .frag) {
             writeFragmentBlock(c.gpa, dst, &c.frag, end - off, is_last, env.large_window, storeCostBits(dst.bitPos(), end - off)) catch |e| switch (e) {
                 error.OutOfMemory => if (dst.overflowed) return false else return error.OutOfMemory,

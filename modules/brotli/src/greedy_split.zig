@@ -30,7 +30,7 @@ const log2_table: [256]f64 = blk: {
     break :blk t;
 };
 
-inline fn fastLog2(v: usize) f64 {
+pub inline fn fastLog2(v: usize) f64 {
     if (v < log2_table.len) return log2_table[v];
     return @log2(@as(f64, @floatFromInt(v)));
 }
