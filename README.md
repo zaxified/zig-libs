@@ -369,7 +369,7 @@ way to recognise it.
 | [`acme`](modules/acme/README.md) | 3 (S) | Let's Encrypt / ACME v2 (RFC 8555) — HTTP-01, TLS-ALPN-01 and DNS-01 (wildcard) issuance + renewal (ARI), ES256/ES384 JWS, CSR, external account binding, key rollover, revocation | any | http, router, entropy, p256, p384 |
 | [`aescbc`](modules/aescbc/README.md) | 3 (S,P) | Raw AES-CBC (NIST SP800-38A) + PKCS#7/XML-Enc padding helpers, zero-alloc; padding-oracle caveat — consumers own authenticate-before-unpad | any | — |
 | [`aeskw`](modules/aeskw/README.md) | 3 (S,P) | RFC 3394 AES Key Wrap (AES-128/256 KEK) — constant-time integrity check + scratch zeroization, byte-exact vs RFC 3394 test vectors | any | aes192 |
-| [`brotli`](modules/brotli/README.md) | 3 (S,P) | Pure-Zig Brotli (RFC 7932) — byte-exact decompressor + a compressing encoder (LZ77 + Huffman, ~2.8x on text); the `Content-Encoding: br` companion to std gzip | any | — |
+| [`brotli`](modules/brotli/README.md) | 3 (S) | Pure-Zig Brotli (RFC 7932) — byte-exact decompressor + a compressing encoder (LZ77 + Huffman, ~2.8x on text); the `Content-Encoding: br` companion to std gzip | any | — |
 | [`cors`](modules/cors/README.md) | 2 (S,A,P) | CORS preflight + header injection (secure defaults) | any | router, http |
 | [`grpc`](modules/grpc/README.md) | 4 (S) | gRPC client **and** server over HTTP/2 (over `protobuf`) — no code generation; all four call shapes (unary/streaming/bidi); untrusted declared length never sizes an allocation | any | http, protobuf |
 | [`health`](modules/health/README.md) | 2 (S,A,P) | Liveness (`/healthz`) + readiness (`/readyz`) probe middleware — 200/503 from registered dependency checks (k8s probe contract) | any | router, http |

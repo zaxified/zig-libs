@@ -604,7 +604,7 @@ fn DecoderOf(comptime Sink: type) type {
             while (true) {
                 // A command the window cut short, or one a loop below left.
                 if (self.cmd_phase != .header and !try self.resumeCommand()) return false;
-                const r = if (self.hotReady()) try self.hotCommands() else try self.slowCommands();
+                const r = if (self.hotReady()) try self.hotCommands(self.out) else try self.slowCommands();
                 if (r == .done) return true;
             }
         }
@@ -633,12 +633,16 @@ fn DecoderOf(comptime Sink: type) type {
         /// (measured: each worth ~10 % on `d_text`).
         /// `ensureRoom` from `hotCommands`: a streaming sink bounds the output
         /// by the input consumed (`effectiveCap`), which is `h`'s position.
-        inline fn hotRoom(self: *Self, h: *const HotBits, n: usize) Error!void {
+        inline fn hotRoom(self: *Self, out: *Sink, h: *const HotBits, n: usize) Error!void {
             if (Sink == RingSink) self.br.byte_pos = h.pos;
-            try self.ensureRoom(n);
+            try out.reserve(n, self.br);
         }
 
-        inline fn hotCommands(self: *Self) Error!Outcome {
+        /// `noalias`: the output is written through `out`'s buffer, which is
+        /// neither `self` nor `out`, so LLVM keeps their fields in registers
+        /// across those stores instead of loading them again after each
+        /// (2–3 % of decoding, 2026-10-16).
+        fn hotCommands(noalias self: *Self, noalias out: *Sink) Error!Outcome {
             var mlen = self.mlen;
             defer self.mlen = mlen;
             var h = HotBits.load(self.br);
@@ -663,9 +667,9 @@ fn DecoderOf(comptime Sink: type) type {
                 self.dist_htree_index = self.dist_context_map_slice[v.context];
 
                 // Insert literals.
-                try self.hotRoom(&h, insert_len);
+                try self.hotRoom(out, &h, insert_len);
                 var done: u32 = 0;
-                if (insert_len <= self.out.room()) {
+                if (insert_len <= out.room()) {
                     while (done < insert_len) : (done += 1) {
                         if (self.block_length[0] == 0) {
                             h.store(self.br);
@@ -687,14 +691,14 @@ fn DecoderOf(comptime Sink: type) type {
                             const by_input = ((h.len - h.pos) -| hot_margin) / 2;
                             const n: u32 = @intCast(@min(insert_len - done, self.block_length[0], by_input));
                             if (n != 0) {
-                                const dst = self.out.tailPtr();
+                                const dst = out.tailPtr();
                                 if (self.trivial_literal_context) {
                                     const t = self.literal_entries;
                                     for (dst[0..n]) |*o| o.* = @intCast(h.symbol(t));
                                 } else {
-                                    const len = self.out.pos();
-                                    var p1: u8 = if (len >= 1) self.out.back(1) else 0;
-                                    var p2: u8 = if (len >= 2) self.out.back(2) else 0;
+                                    const len = out.pos();
+                                    var p1: u8 = if (len >= 1) out.back(1) else 0;
+                                    var p2: u8 = if (len >= 2) out.back(2) else 0;
                                     const lut = self.context_lookup[0..512];
                                     const map = self.context_map_slice[0..64];
                                     const group = self.literal_group;
@@ -705,7 +709,7 @@ fn DecoderOf(comptime Sink: type) type {
                                         p1 = b;
                                     }
                                 }
-                                self.out.advance(n);
+                                out.advance(n);
                                 self.block_length[0] -= n;
                                 done += n - 1; // the loop adds the last one
                                 continue;
@@ -719,13 +723,13 @@ fn DecoderOf(comptime Sink: type) type {
                         if (self.trivial_literal_context) {
                             lit = h.symbol(self.literal_entries);
                         } else {
-                            const len = self.out.pos();
-                            const p1: u8 = if (len >= 1) self.out.back(1) else 0;
-                            const p2: u8 = if (len >= 2) self.out.back(2) else 0;
+                            const len = out.pos();
+                            const p1: u8 = if (len >= 1) out.back(1) else 0;
+                            const p2: u8 = if (len >= 2) out.back(2) else 0;
                             const context = self.context_lookup[p1] | self.context_lookup[256 + @as(usize, p2)];
                             lit = h.symbol(self.literal_group[self.context_map_slice[context]].entries.ptr);
                         }
-                        try self.out.put(@intCast(lit));
+                        try out.put(@intCast(lit));
                         self.block_length[0] -= 1;
                     }
                 }
@@ -780,7 +784,7 @@ fn DecoderOf(comptime Sink: type) type {
                         distance = if (dv > tables.max_allowed_distance) 0x7FFFFFFF else @intCast(dv);
                     }
                 }
-                const pos = self.out.pos();
+                const pos = out.pos();
                 const max_distance: i64 = @min(@as(i64, @intCast(pos)), @as(i64, @intCast(self.max_backward)));
                 if (@as(i64, distance) > max_distance) {
                     // The prefix or the static dictionary: set up and made
@@ -798,8 +802,8 @@ fn DecoderOf(comptime Sink: type) type {
                 if (d > pos) return error.InvalidDistance;
                 self.dist_rb[self.dist_rb_idx & 3] = distance;
                 self.dist_rb_idx +%= 1;
-                try self.hotRoom(&h, copy);
-                if (copy > self.out.room()) {
+                try self.hotRoom(out, &h, copy);
+                if (copy > out.room()) {
                     @branchHint(.unlikely);
                     self.copy_left = copy;
                     self.copy_dist = d;
@@ -807,7 +811,7 @@ fn DecoderOf(comptime Sink: type) type {
                     self.cmd_phase = .copy;
                     return .again;
                 }
-                try self.out.copyBack(d, copy);
+                try out.copyBack(d, copy);
                 mlen -= @intCast(copy);
                 if (mlen < 0) return error.InvalidLength;
             }
@@ -1301,10 +1305,18 @@ const HotBits = struct {
         return h.len - h.pos >= 8;
     }
 
-    /// To 56..63 bits. Precondition: `canRefill`, `cnt < 64`.
-    /// To 57..64 bits from any count (`refill` needs one below 64).
+    /// To 56..64 bits from any count, without a branch: `refill`'s
+    /// arithmetic, which from 57..63 bits adds no byte and loads the same
+    /// bits above again, and adds nothing at 64 (only right after `load`).
+    /// Precondition: `canRefill`. (`if (cnt <= 56) refill()` was a third of
+    /// the decoder's branch misses on text, 2026-10-16: whether a command
+    /// header needs a refill is data.)
     inline fn top(h: *HotBits) void {
-        if (h.cnt <= 56) h.refill();
+        const full: u64 = @intFromBool(h.cnt >= 64);
+        const x = std.mem.readInt(u64, h.data[h.pos..][0..8], .little);
+        h.acc |= (x << @as(u6, @truncate(h.cnt))) & (full -% 1);
+        h.pos += (63 -| h.cnt) >> 3;
+        h.cnt = @min(h.cnt | 56, 64);
     }
 
     /// Branch-free: the whole next eight bytes are or-ed in above `cnt`;
