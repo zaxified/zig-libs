@@ -6321,3 +6321,17 @@ test "block types: .q6, .q9 and .q11 split a sectioned binary input, .q4 does no
         if (effort == .q4) try testing.expectEqual(@as(u32, 1), nbl) else try testing.expect(nbl >= 2);
     }
 }
+
+test "q0: whether the next bytes continue the meta-block (google ShouldMergeBlock)" {
+    // 128 samples (every 43rd byte), all one symbol of code length d: the
+    // cost bound is 128 * (7 + 0.5) + 200 against 128 * (d + 7), so
+    // 2 bits continue it (8 to spare) and 3 do not.
+    var bytes: [128 * 43]u8 = @splat('x');
+    var i: usize = 0;
+    while (i < bytes.len) : (i += 43) bytes[i] = 'a';
+    var depth: [tables.num_literal_symbols]u8 = @splat(9);
+    depth['a'] = 2;
+    try testing.expect(q0ShouldMerge(&bytes, &depth));
+    depth['a'] = 3;
+    try testing.expect(!q0ShouldMerge(&bytes, &depth));
+}

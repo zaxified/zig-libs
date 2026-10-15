@@ -165,6 +165,49 @@ pub fn fontLike(gpa: std.mem.Allocator, n: usize, seed: u64) ![]u8 {
     return out.toOwnedSlice(gpa);
 }
 
+/// Literal runs over 64 letters (6 bits a literal: coded, never stored, and
+/// no five-byte repeats by chance) alternating with copies of an earlier
+/// stretch, each cut by a byte outside the letters: the insert and copy
+/// lengths around the boundaries of `.q0`'s length codes (inserts 130,
+/// 2114, 6210; copies 10, 72, 134, 136, 2118, 2120). The boundary copies
+/// all come from the same distance after short inserts, so `.q0`, which
+/// tries the last distance at every byte there, finds each at its first.
+pub fn lengthsInput(gpa: std.mem.Allocator, seed: u64) ![]u8 {
+    const letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const inserts = [_]usize{ 1, 2, 3, 5, 6, 7 };
+    const copies = [_]usize{ 5, 6, 9, 10, 11, 12, 13, 70, 71, 72, 73, 133, 134, 135, 136, 137, 2117, 2118, 2119, 2120, 2121 };
+    const long_inserts = [_]usize{ 129, 130, 131, 2113, 2114, 2115, 4000, 6209, 6210, 7000 };
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    var rng = Rng{ .s = seed };
+    const F = struct {
+        fn run(o: *std.ArrayList(u8), g: std.mem.Allocator, r: *Rng, n: usize) !void {
+            for (0..n) |_| try o.append(g, letters[r.next() >> 58]);
+        }
+        /// From `dist` back, or (0) from anywhere before.
+        fn copy(o: *std.ArrayList(u8), g: std.mem.Allocator, r: *Rng, n: usize, dist: usize) !void {
+            const src: usize = if (dist != 0) o.items.len - dist else @intCast(r.next() % (o.items.len - n - 1) + 1);
+            // Not one byte longer at either end.
+            const last = o.items.len - 1;
+            if (o.items[last] == o.items[src - 1]) o.items[last] = if (o.items[last] == 'A') 'B' else 'A';
+            try o.ensureUnusedCapacity(g, n + 1);
+            const next = o.items[src + n];
+            o.appendSliceAssumeCapacity(o.items[src..][0..n]);
+            o.appendAssumeCapacity(if (next == '.') ',' else '.');
+        }
+    };
+    try F.run(&out, gpa, &rng, 8000);
+    for (copies, 0..) |c, k| {
+        try F.run(&out, gpa, &rng, inserts[k % inserts.len]);
+        try F.copy(&out, gpa, &rng, c, 5000);
+    }
+    for (long_inserts) |n| {
+        try F.run(&out, gpa, &rng, n);
+        try F.copy(&out, gpa, &rng, 300, 0);
+    }
+    return out.toOwnedSlice(gpa);
+}
+
 /// The encoder's meta-block size. `mixed`/`alice_cycle` shapes straddle it on
 /// purpose: a stream that ends exactly on the boundary, and one byte past it,
 /// have to terminate correctly.
@@ -197,6 +240,11 @@ pub const Gen = union(enum) {
     /// Random on one side of `split`, text on the other: a stored block
     /// followed by a compressed final block, and the reverse.
     mixed: struct { n: usize, split: usize, random_first: bool, seed: u64 },
+    /// `lengthsInput(seed)`: inserts and copies of chosen lengths.
+    lengths: u64,
+    /// `n` random bytes, then their first `copy` again: a long insert of
+    /// incompressible literals before a match.
+    random_copy: struct { n: usize, copy: usize, seed: u64 },
 };
 
 pub const Shape = struct { name: []const u8, gen: Gen };
@@ -248,6 +296,14 @@ pub fn build(gpa: std.mem.Allocator, shape: Shape) ![]u8 {
         .alice_cycle => |n| {
             const buf = try gpa.alloc(u8, n);
             for (buf, 0..) |*b, i| b.* = alice[i % alice.len];
+            return buf;
+        },
+        .lengths => |seed| return lengthsInput(gpa, seed),
+        .random_copy => |r| {
+            const buf = try gpa.alloc(u8, r.n + r.copy);
+            var rng = Rng{ .s = r.seed };
+            for (buf[0..r.n]) |*b| b.* = rng.byte();
+            @memcpy(buf[r.n..], buf[0..r.copy]);
             return buf;
         },
         .mixed => |m| {
@@ -321,6 +377,14 @@ pub const shapes = [_]Shape{
     .{ .name = "alice_65519", .gen = .{ .alice_prefix = 65519 } },
     .{ .name = "alice_65521", .gen = .{ .alice_prefix = 65521 } },
     .{ .name = "alice_full", .gen = .{ .alice_prefix = alice.len } },
+    // Sizes `.q0` treats apart: a match table of 2^13 slots (an odd power
+    // from 2^12), and a meta-block of exactly 2^16 (four MLEN nibbles).
+    .{ .name = "alice_3000", .gen = .{ .alice_prefix = 3000 } },
+    .{ .name = "alice_65536", .gen = .{ .alice_prefix = 65536 } },
+    // `.q0`'s length codes at their boundaries; a long incompressible
+    // insert before a match (`.q0` stores what came before it).
+    .{ .name = "lengths", .gen = .{ .lengths = seed_a +% 11 } },
+    .{ .name = "random_8000_copy", .gen = .{ .random_copy = .{ .n = 8000, .copy = 600, .seed = seed_b +% 5 } } },
     // Non-Latin UTF-8: the UTF8 context mode's lead-byte classes.
     .{ .name = "utf8_mix", .gen = .{ .utf8_mix = utf8_mix.len } },
     // Binary data with sections of different statistics: block types.
@@ -705,6 +769,10 @@ pub const encodings = [_]Encoding{
     .{ .tag = "stream", .effort = "q6", .window_bits = 22, .block_size = 65_536, .flushes = &.{ 0, 1, 1_000, 65_536, 100_000 }, .shapes = &.{ "empty", "one_byte", "mixed_random_first", "alice_full" } },
     .{ .tag = "stream_q4_w16", .effort = "q4", .window_bits = 16, .block_size = 40_000, .flushes = &.{12_345}, .shapes = &.{ "random_70000", "alice_full" } },
     .{ .tag = "stream_q1_w16", .effort = "q1", .window_bits = 16, .block_size = 40_000, .flushes = &.{12_345}, .shapes = &.{ "random_70000", "alice_full" } },
+    // `.q0` across flushes: each block's command code comes from the one
+    // before; a first block of 3 000 bytes in a table sized for the stream
+    // takes `.q0`'s odd-power table (2^13), as a one-shot input never does.
+    .{ .tag = "stream_q0", .effort = "q0", .window_bits = 22, .flushes = &.{ 3_000, 20_000, 120_000 }, .shapes = &.{ "alice_full", "lengths" } },
     .{ .tag = "stream_metadata", .effort = "q6", .window_bits = 22, .flushes = &.{}, .metadata_at = &.{ 0, 5_000, 5_000 }, .shapes = &.{ "empty", "alice_full" } },
 };
 

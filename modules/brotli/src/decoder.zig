@@ -1828,3 +1828,37 @@ test "WBITS codes (RFC 7932 section 9.1)" {
         }
     }
 }
+
+test "HotBits.top: 56..64 bits from every count, 64 included" {
+    // A state at bit `p` holding `c` bits (bits above zero, `pos` the byte
+    // after them) for every c in 0..64, 64 being what `BitReader.refill`
+    // leaves from a whole-byte count: after `top` the next 56 bits read are
+    // the stream's from `p`.
+    var data: [48]u8 = undefined;
+    var rng: u64 = 0x9e3779b97f4a7c15;
+    for (&data) |*b| {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        b.* = @truncate(rng >> 24);
+    }
+    const bit = struct {
+        fn at(d: []const u8, i: usize) u64 {
+            return (d[i / 8] >> @intCast(i % 8)) & 1;
+        }
+    }.at;
+    for (0..65) |c| {
+        const pos: usize = 16;
+        const p = pos * 8 - c;
+        var acc: u64 = 0;
+        for (0..c) |k| acc |= bit(&data, p + k) << @intCast(k);
+        var h: HotBits = .{ .acc = acc, .cnt = @intCast(c), .pos = pos, .data = &data, .len = data.len };
+        h.top();
+        try std.testing.expect(h.cnt >= 56 and h.cnt <= 64);
+        try std.testing.expectEqual(p + h.cnt, h.pos * 8);
+        for (0..2) |half| {
+            const v = h.bits(28);
+            for (0..28) |k| try std.testing.expectEqual(bit(&data, p + 28 * half + k), (v >> @intCast(k)) & 1);
+        }
+    }
+}
