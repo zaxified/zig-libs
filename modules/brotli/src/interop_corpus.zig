@@ -402,7 +402,7 @@ pub fn encodeDict(gpa: std.mem.Allocator, comptime c: DictCase, effort: brotli.E
     return brotli.compressWith(gpa, input, .{ .effort = effort, .window_bits = c.lgwin, .dictionary = dict });
 }
 
-pub const dict_efforts = [_][]const u8{ "q4", "q6", "q9", "q11" };
+pub const dict_efforts = [_][]const u8{ "q0", "q1", "q4", "q6", "q9", "q11" };
 
 // ── the large window (RFC 9841 §6) ──────────────────────────────────────────
 
@@ -449,7 +449,7 @@ pub fn encodeLarge(gpa: std.mem.Allocator, comptime c: LargeCase, effort: brotli
     return brotli.compressWith(gpa, input, .{ .effort = effort, .window_bits = c.lgwin });
 }
 
-pub const large_efforts = [_][]const u8{ "q4", "q6", "q11" };
+pub const large_efforts = [_][]const u8{ "q1", "q4", "q6", "q11" };
 
 /// `testdata/ref/large/<case>.q<Q>.br`.
 pub fn largeRefFile(comptime c: LargeCase, comptime q: u8) []const u8 {
@@ -692,6 +692,8 @@ pub const Encoding = struct {
 };
 
 pub const encodings = [_]Encoding{
+    .{ .tag = "q0", .effort = "q0" },
+    .{ .tag = "q1", .effort = "q1" },
     .{ .tag = "q4", .effort = "q4" },
     .{ .tag = "q6", .effort = "q6" },
     .{ .tag = "q9", .effort = "q9" },
@@ -702,6 +704,7 @@ pub const encodings = [_]Encoding{
     .{ .tag = "w24", .effort = "q6", .window_bits = 24, .shapes = &.{"block_plus_one"} },
     .{ .tag = "stream", .effort = "q6", .window_bits = 22, .block_size = 65_536, .flushes = &.{ 0, 1, 1_000, 65_536, 100_000 }, .shapes = &.{ "empty", "one_byte", "mixed_random_first", "alice_full" } },
     .{ .tag = "stream_q4_w16", .effort = "q4", .window_bits = 16, .block_size = 40_000, .flushes = &.{12_345}, .shapes = &.{ "random_70000", "alice_full" } },
+    .{ .tag = "stream_q1_w16", .effort = "q1", .window_bits = 16, .block_size = 40_000, .flushes = &.{12_345}, .shapes = &.{ "random_70000", "alice_full" } },
     .{ .tag = "stream_metadata", .effort = "q6", .window_bits = 22, .flushes = &.{}, .metadata_at = &.{ 0, 5_000, 5_000 }, .shapes = &.{ "empty", "alice_full" } },
 };
 

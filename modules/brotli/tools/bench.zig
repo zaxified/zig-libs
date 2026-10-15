@@ -35,9 +35,7 @@
 //! run, because the levels had names of their own). The streams are not
 //! byte-identical, so the sizes are printed beside the reference's and the
 //! quality closest in size is printed too: a level whose closest quality is
-//! not its own is a ratio finding, not a pairing to change. `c_q4_vs_q0_*` /
-//! `c_q4_vs_q1_*` (information): our fastest level against the reference's
-//! two fastest qualities, which have no level here yet.
+//! not its own is a ratio finding, not a pairing to change.
 //!
 //! Method (shared driver at the bottom): each side doubles its batch until it
 //! takes over 100 ms and keeps the best of five; per workload the sides
@@ -252,11 +250,6 @@ pub fn main(init: std.process.Init) !u8 {
             const name = try std.fmt.allocPrint(arena, "c_{s}_{s}", .{ @tagName(effort), n });
             const ref = try std.fmt.allocPrint(arena, "c{d}_{s}", .{ effort.quality(), n });
             try ws.append(arena, .{ .name = name, .op = .{ .decompress = false, .effort = effort, .payload = i }, .ref = ref });
-        }
-        for ([_]u8{ 0, 1 }) |q| {
-            const name = try std.fmt.allocPrint(arena, "c_q4_vs_q{d}_{s}", .{ q, n });
-            const ref = try std.fmt.allocPrint(arena, "c{d}_{s}", .{ q, n });
-            try ws.append(arena, .{ .name = name, .op = .{ .decompress = false, .effort = .q4, .payload = i }, .ref = ref, .info = true });
         }
         const name = try std.fmt.allocPrint(arena, "d_{s}", .{n});
         try ws.append(arena, .{ .name = name, .op = .{ .decompress = true, .effort = .q6, .payload = i }, .ref = name });

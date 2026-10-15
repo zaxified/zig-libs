@@ -95,7 +95,9 @@ const max_match = 65535;
 
 /// Errors that make the encoder give up on *compressing* a block. They never
 /// escape `compress`: the block is stored verbatim instead.
-const GiveUp = error{EncoderInvariant} || BrotliError;
+/// `NotSmaller`: the block would not come out shorter than stored
+/// (`writeFragmentBlock` knows before it writes the commands).
+const GiveUp = error{ EncoderInvariant, NotSmaller } || BrotliError;
 
 // ---------------------------------------------------------------------------
 // Bit writer (LSB-first, matching `BitReader`).
@@ -391,6 +393,33 @@ fn lengthCode(comptime offsets: *const [24]u32, comptime nbits: *const [24]u5, l
 
 const LenCode = struct { code: u5, extra: u32, nbits: u5 };
 
+/// `lengthCode` for `.q0`/`.q1` in one load: below `length_lut_len` an
+/// entry packs the code (5 bits), its extra bit count (5) and its offset;
+/// longer lengths take the scan. Never null for an insert or copy length
+/// the parse makes (up to `max_match`, inserts up to a block).
+inline fn packedLengthCode(comptime offsets: *const [24]u32, comptime nbits: *const [24]u5, len: u32) LenCode {
+    const lut = comptime packedLengthLut(offsets, nbits);
+    if (len < length_lut_len) {
+        const e = lut[len];
+        return .{ .code = @truncate(e), .nbits = @truncate(e >> 5), .extra = len - (e >> 10) };
+    }
+    return lengthCodeScan(offsets, nbits, len).?;
+}
+
+fn packedLengthLut(comptime offsets: *const [24]u32, comptime nbits: *const [24]u5) [length_lut_len]u32 {
+    @setEvalBranchQuota(100_000);
+    var t: [length_lut_len]u32 = undefined;
+    for (&t, 0..) |*e, len| {
+        // (Copy lengths 0 and 1 have no code; the parse never asks.)
+        const c = lengthCodeScan(offsets, nbits, len) orelse {
+            e.* = 0;
+            continue;
+        };
+        e.* = @as(u32, c.code) | @as(u32, c.nbits) << 5 | offsets[c.code] << 10;
+    }
+    return t;
+}
+
 const length_lut_len = 1024;
 
 fn lengthLut(comptime offsets: *const [24]u32, comptime nbits: *const [24]u5) [length_lut_len]u8 {
@@ -499,38 +528,43 @@ fn assignLengths(
     }
     if (m <= 1) return m;
 
-    const idx = try gpa.alloc(u32, m);
-    defer gpa.free(idx);
+    // Every alphabet but a large window's distances fits the stack.
+    var stack: [max_stack_symbols]u64 = undefined;
+    const keys = if (m <= max_stack_symbols) stack[0..m] else try gpa.alloc(u64, m);
+    defer if (m > max_stack_symbols) gpa.free(keys);
     {
         var k: usize = 0;
         for (counts, 0..) |c, s| {
             if (c != 0) {
-                idx[k] = @intCast(s);
+                keys[k] = @as(u64, c) << 32 | s;
                 k += 1;
             }
         }
     }
-    // Ascending by count. max(count, floor) is monotone in count, so this one
-    // order stays valid for every floor tried below.
-    std.mem.sort(u32, idx, counts, struct {
-        fn lt(cs: []const u32, a: u32, b: u32) bool {
-            return cs[a] < cs[b];
-        }
-    }.lt);
+    // Ascending by count, ties by symbol: the order a stable sort of the
+    // symbols by count gives (a block sort through an index array until
+    // 2026-10-15, 15 % of `.q1`'s cycles). max(count, floor) is monotone
+    // in count, so this one order stays valid for every floor tried below.
+    std.sort.pdq(u64, keys, {}, std.sort.asc(u64));
 
     const cap = 2 * m; // m leaves + (m - 1) internal nodes
-    const wt = try gpa.alloc(u64, cap);
-    defer gpa.free(wt);
-    const left = try gpa.alloc(u32, cap);
-    defer gpa.free(left);
-    const right = try gpa.alloc(u32, cap);
-    defer gpa.free(right);
-    const depth = try gpa.alloc(u8, cap);
-    defer gpa.free(depth);
+    var wt_s: [2 * max_stack_symbols]u64 = undefined;
+    var left_s: [2 * max_stack_symbols]u32 = undefined;
+    var right_s: [2 * max_stack_symbols]u32 = undefined;
+    var depth_s: [2 * max_stack_symbols]u8 = undefined;
+    const big = m > max_stack_symbols;
+    const wt = if (!big) wt_s[0..cap] else try gpa.alloc(u64, cap);
+    defer if (big) gpa.free(wt);
+    const left = if (!big) left_s[0..cap] else try gpa.alloc(u32, cap);
+    defer if (big) gpa.free(left);
+    const right = if (!big) right_s[0..cap] else try gpa.alloc(u32, cap);
+    defer if (big) gpa.free(right);
+    const depth = if (!big) depth_s[0..cap] else try gpa.alloc(u8, cap);
+    defer if (big) gpa.free(depth);
 
     var floor: u64 = 1;
     while (true) : (floor *= 2) {
-        for (idx, 0..) |s, i| wt[i] = @max(counts[s], floor);
+        for (keys, 0..) |k, i| wt[i] = @max(k >> 32, floor);
 
         // Two-queue Huffman: `a` walks the (sorted) leaves, `b` the internal
         // nodes, which are themselves produced in non-decreasing weight order.
@@ -558,10 +592,51 @@ fn assignLengths(
         var maxd: u8 = 0;
         for (0..m) |j| maxd = @max(maxd, depth[j]);
         if (maxd <= limit) {
-            for (idx, 0..) |s, j| lengths[s] = depth[j];
+            for (keys, 0..) |k, j| lengths[@as(u32, @truncate(k))] = depth[j];
             return m;
         }
     }
+}
+
+/// The largest alphabet `assignLengths` works on the stack for (the
+/// command alphabet).
+const max_stack_symbols = tables.num_command_symbols;
+
+/// The bit patterns of the canonical code with `lengths` (RFC 7932 §3.2), in
+/// stream order: what `codeFromTable` reads off the decoder's table for the
+/// same lengths (`huffman.buildComplex`), computed without it (tested to
+/// agree on random complete codes). A code that is not complete is
+/// `error.EncoderInvariant`, as the table would refuse it.
+fn canonicalCode(gpa: std.mem.Allocator, lengths: []const u8) GiveUp!Code {
+    var count = [_]u32{0} ** 16;
+    for (lengths) |l| {
+        if (l > 15) return error.EncoderInvariant;
+        count[l] += 1;
+    }
+    count[0] = 0;
+    var kraft: u32 = 0;
+    for (count[1..], 1..) |c, l| kraft += c << @intCast(15 - l);
+    if (kraft != 1 << 15) return error.EncoderInvariant;
+    var next: [16]u32 = undefined;
+    var code: u32 = 0;
+    for (1..16) |l| {
+        code = (code + count[l - 1]) << 1;
+        next[l] = code;
+    }
+    const bits = try gpa.alloc(u16, lengths.len);
+    errdefer gpa.free(bits);
+    const len = try gpa.alloc(u8, lengths.len);
+    @memcpy(len, lengths);
+    for (lengths, bits) |l, *b| {
+        if (l == 0) {
+            b.* = 0;
+            continue;
+        }
+        const c = next[l];
+        next[l] += 1;
+        b.* = @intCast(@as(u32, @bitReverse(@as(u16, @intCast(c)))) >> @intCast(16 - @as(u5, @intCast(l))));
+    }
+    return .{ .bits = bits, .len = len };
 }
 
 /// Pick the cheaper of the next unused leaf and the next unused internal node.
@@ -806,9 +881,7 @@ fn buildAndWriteCodeWide(
     defer gpa.free(lengths);
     _ = try assignLengths(gpa, counts, tables.max_code_length, lengths);
     try writeComplexCode(gpa, w, lengths);
-    var table = try huffman.buildComplex(gpa, lengths);
-    defer table.deinit(gpa);
-    return codeFromTable(gpa, &table, alphabet_size);
+    return canonicalCode(gpa, lengths);
 }
 
 // ---------------------------------------------------------------------------
@@ -1321,6 +1394,348 @@ const FastMatcher = struct {
         return .{ .len = @intCast(best_len), .dist = @intCast(best_dist), .gain = best_gain };
     }
 };
+
+// `.q0` and `.q1` (2026-10-15, R13): a match finder of one slot per bucket,
+// written over at every lookup, and a parse that takes the first match it
+// finds — no gain, no lazy step — and steps faster through data that has
+// stopped matching (one more byte of step per `2^skip_log2` misses, as
+// LZ4/Snappy do). The parse writes each command already resolved — symbol,
+// extra bits, distance code — with the block's command and distance
+// histograms, and copies the literals into one buffer (`FragBlock`); the
+// block is then written with one code per category and no literal contexts
+// (`writeFragmentBlock`). Going through `Cmd`s and a resolving pass, as the
+// other levels do, cost about 80 cycles per command, which is all a
+// command may cost here (google q0: about 70 cycles a command, parse and
+// write together; bench payloads, 2026-10-15). The two levels differ in
+// what they look at (`FragLevel`).
+
+/// Bytes `FragMatcher` hashes.
+const frag_hash_len = 5;
+/// log2 of `FragMatcher`'s most buckets.
+const frag_bucket_log_max = 15;
+
+/// What `.q0` and `.q1` do differently.
+const FragLevel = struct {
+    /// Misses per extra byte of step (log2).
+    skip_log2: u5,
+    /// Every position is checked against the last distance first, not only
+    /// the one after a copy.
+    ring_every: bool,
+    /// Positions inside a copy inserted (from its end backwards).
+    tail_inserts: u8,
+    /// A match is extended backwards over the literals before it.
+    extend_back: bool,
+};
+
+fn fragLevel(e: Effort) FragLevel {
+    return switch (e) {
+        .q0 => .{ .skip_log2 = 3, .ring_every = false, .tail_inserts = 0, .extend_back = false },
+        else => .{ .skip_log2 = 5, .ring_every = true, .tail_inserts = 2, .extend_back = true },
+    };
+}
+
+const FragMatcher = struct {
+    prefix: Prefix = .{},
+    /// One slot per bucket: the last position hashed there.
+    table: []u32,
+    hash_shift: u6,
+    data: []const u8,
+
+    fn init(gpa: std.mem.Allocator, size: usize) std.mem.Allocator.Error!FragMatcher {
+        const bucket_log = bucketLog(size, frag_bucket_log_max);
+        const table = try gpa.alloc(u32, @as(usize, 1) << bucket_log);
+        Matcher.fillZero(table);
+        return .{ .table = table, .hash_shift = @intCast(64 - @as(u7, bucket_log)), .data = &.{} };
+    }
+
+    fn deinit(self: *FragMatcher, gpa: std.mem.Allocator) void {
+        gpa.free(self.table);
+        self.* = undefined;
+    }
+
+    fn reset(self: *FragMatcher) void {
+        Matcher.fillZero(self.table);
+    }
+
+    fn shift(self: *FragMatcher, by: u32) void {
+        for (self.table) |*s| s.* = self.prefix.shiftPos(s.*, by);
+        self.prefix.dropped += by;
+    }
+
+    /// Bucket of the `frag_hash_len` bytes at `p`; needs eight readable bytes.
+    inline fn bucket(self: *const FragMatcher, p: usize) usize {
+        const v = std.mem.readInt(u64, self.data[p..][0..8], .little) << (64 - 8 * frag_hash_len);
+        return @intCast((v *% 0x1e35a7bd1e35a7bd) >> self.hash_shift);
+    }
+
+    fn insert(self: *FragMatcher, p: usize) void {
+        if (p + 8 > self.data.len) return;
+        self.table[self.bucket(p)] = @intCast(p);
+    }
+};
+
+/// A command of a `.q0`/`.q1` block, resolved: what it writes but its
+/// literals (those are `FragBlock.lits`, in order), in two words. `cmd`:
+/// the command symbol (10 bits), its extra bit count (6), then the insert's
+/// extra bits and the copy's — the stream has them right after the symbol,
+/// so the writer puts all three at once. `dst`: the distance symbol plus one
+/// (8 bits, 0: none — the last distance by an implicit-distance command, or
+/// the block's final literals), its extra bit count (5), the insert length
+/// (21), the extra bits (30).
+const FragRec = struct {
+    cmd: u64,
+    dst: u64,
+
+    fn sym(r: FragRec) usize {
+        return @intCast(r.cmd & 1023);
+    }
+    fn extraN(r: FragRec) u64 {
+        return (r.cmd >> 10) & 63;
+    }
+    fn distSym1(r: FragRec) usize {
+        return @intCast(r.dst & 255);
+    }
+    fn distN(r: FragRec) u64 {
+        return (r.dst >> 8) & 31;
+    }
+    fn insertLen(r: FragRec) usize {
+        return @intCast((r.dst >> 13) & 0x1f_ffff);
+    }
+};
+
+/// `sym[at_last][insert code * 24 + copy code]`: the command symbol of a
+/// copy, with bit 15 set when a distance symbol follows. At the last
+/// distance the implicit-distance form where there is one.
+const frag_sym: [2][24 * 24]u16 = blk: {
+    var t: [2][24 * 24]u16 = undefined;
+    for (0..24) |ic| for (0..24) |cc| {
+        const explicit = cmd_tables.sym[ic][cc] | 0x8000;
+        t[0][ic * 24 + cc] = explicit;
+        const imp = cmd_tables.implicit[ic][cc];
+        t[1][ic * 24 + cc] = if (imp != 0xffff) imp else explicit;
+    };
+    break :blk t;
+};
+
+/// A `.q0`/`.q1` block between its parse and its writer.
+const FragBlock = struct {
+    recs: std.ArrayListUnmanaged(FragRec) = .empty,
+    /// The literals, then `lit_pad` zeros (the writer reads groups of three).
+    lits: std.ArrayListUnmanaged(u8) = .empty,
+    cmd_counts: [tables.num_command_symbols]u32 = undefined,
+    /// Distance symbols plus one: `[0]` counts the commands without one.
+    dist_counts1: [dist_alphabet_large + 1]u32 = undefined,
+    /// The decoder's ring after the block.
+    ring: DistRing = .{},
+    /// Bytes the commands produce (the block's length).
+    covered: usize = 0,
+
+    const lit_pad = 16;
+
+    fn deinit(b: *FragBlock, gpa: std.mem.Allocator) void {
+        b.recs.deinit(gpa);
+        b.lits.deinit(gpa);
+    }
+};
+
+/// The command for `insert` literals and a copy of `copy_len` bytes at
+/// `dist` (`copy_len` 0: the block's final literals), resolved against the
+/// decoder's last distance `last`. Every distance the parse makes has a
+/// code: within the window, or a prefix dictionary's up to
+/// `max_code_distance` (`Prefix.reach`); a large window's alphabet reaches
+/// past any window this encoder makes.
+inline fn fragResolve(insert: usize, copy_len: usize, dist: usize, last: usize) FragRec {
+    const ie: u64 = if (insert < length_lut_len) frag_ins_lut[insert] else packLen(insert, lengthCodeScan(&cmd_tables.insert_off, &cmd_tables.insert_nbits, @intCast(insert)).?);
+    const cl = if (copy_len == 0) cmd_tables.copy_off[0] else copy_len;
+    const ce: u64 = if (cl < length_lut_len) frag_copy_lut[cl] else packLen(cl, lengthCodeScan(&cmd_tables.copy_off, &cmd_tables.copy_nbits, @intCast(cl)).?);
+    const inb = (ie >> 5) & 31;
+    const extra = (insert - (ie >> 10)) | (cl - (ce >> 10)) << @intCast(inb);
+    const extra_n = inb + ((ce >> 5) & 31);
+    const idx: usize = @intCast((ie & 31) * 24 + (ce & 31));
+    const at_last = copy_len == 0 or dist == last;
+    const e: u64 = frag_sym[@intFromBool(at_last)][idx];
+    var dst: u64 = @as(u64, insert) << 13;
+    if (e >> 15 != 0 and copy_len != 0) {
+        if (dist == last) {
+            dst |= 1; // short code 0, no extra bits
+        } else {
+            // `distanceCode` for NPOSTFIX = NDIRECT = 0.
+            const x: u64 = @as(u64, dist) + 3;
+            const nb: u64 = 63 - @clz(x) - 1;
+            const half = (x >> @intCast(nb)) & 1;
+            const dsym = tables.num_distance_short_codes + 2 * (nb - 1) + half;
+            const dext = x - ((2 + half) << @intCast(nb));
+            dst |= (dsym + 1) | nb << 8 | dext << 34;
+        }
+    }
+    return .{ .cmd = (e & 1023) | extra_n << 10 | extra << 16, .dst = dst };
+}
+
+/// `lengthCode`'s result for `len` as a `frag_*_lut` entry: code (5 bits),
+/// extra bit count (5), offset.
+fn packLen(len: usize, c: LenCode) u64 {
+    return @as(u64, c.code) | @as(u64, c.nbits) << 5 | @as(u64, len - c.extra) << 10;
+}
+
+const frag_ins_lut = packedLengthLut(&cmd_tables.insert_off, &cmd_tables.insert_nbits);
+const frag_copy_lut = packedLengthLut(&cmd_tables.copy_off, &cmd_tables.copy_nbits);
+
+/// What `fragCommand` needs between the parse's commands: in memory, so the
+/// parse loop has the registers to itself.
+const FragState = struct {
+    data: []const u8,
+    /// The next record and literal (`FragBlock.recs`/`lits`' room).
+    rec: [*]FragRec,
+    lit: [*]u8,
+    cmd_counts: *[tables.num_command_symbols]u32,
+    /// `FragBlock.dist_counts`, from "none" on (`FragRec.distSym1`).
+    dist_counts1: *[dist_alphabet_large + 1]u32,
+    ring: DistRing,
+    /// Bytes the commands so far produce.
+    covered: usize = 0,
+};
+
+/// The command for the literals `data[lit_start..p)` and a copy of `len`
+/// bytes at `dist` (`len` 0: the block's final literals) into `st`. (Not
+/// inlined it saved instructions but cost 4-5 % cycles, 2026-10-15.)
+inline fn fragCommand(st: *FragState, lit_start: usize, p: usize, len: usize, dist: usize) void {
+    const insert = p - lit_start;
+    const r = fragResolve(insert, len, dist, st.ring.last[0]);
+    st.rec[0] = r;
+    st.rec += 1;
+    st.cmd_counts[r.sym()] += 1;
+    // (Index 0 of `dist_counts1` is "none", never written out.)
+    st.dist_counts1[r.distSym1()] += 1;
+    // The literals, 16 bytes at a time while the input has them: one round
+    // for nearly every command, not a loop of unknown length.
+    const data = st.data;
+    if (lit_start + insert + 16 <= data.len) {
+        var k: usize = 0;
+        while (k < insert) : (k += 16) st.lit[k..][0..16].* = data[lit_start + k ..][0..16].*;
+    } else @memcpy(st.lit[0..insert], data[lit_start..][0..insert]);
+    st.lit += insert;
+    st.covered += insert + len;
+    if (len != 0 and dist != st.ring.last[0]) st.ring.update(@intCast(dist), null);
+}
+
+/// `.q0`/`.q1`'s parse of `data[start..end)` into `fb`; the matches as
+/// `buildCommands`'s: they may reach back before `start`, never past `end`.
+/// The loop only looks for the next match; `fragCommand` writes it.
+fn buildFrag(
+    comptime px: bool,
+    comptime lv: FragLevel,
+    gpa: std.mem.Allocator,
+    matcher: *FragMatcher,
+    start: usize,
+    end: usize,
+    max_dist: usize,
+    ring_in: DistRing,
+    fb: *FragBlock,
+) std.mem.Allocator.Error!void {
+    // Everything the loop reads is a local: a store into the table may alias
+    // any field behind a pointer, which was then loaded again after it.
+    const data = matcher.data;
+    const table = matcher.table;
+    const hshift = matcher.hash_shift;
+    const x = matcher.prefix;
+    const n = end - start;
+    // Every command but the last copies at least `min_match` bytes; the
+    // literal copy may write 15 bytes past the last literal.
+    fb.recs.clearRetainingCapacity();
+    fb.lits.clearRetainingCapacity();
+    try fb.recs.ensureTotalCapacity(gpa, n / min_match + 2);
+    try fb.lits.ensureTotalCapacity(gpa, n + 16 + FragBlock.lit_pad);
+    Matcher.fillZero(&fb.cmd_counts);
+    Matcher.fillZero(&fb.dist_counts1);
+    var st: FragState = .{
+        .data = data,
+        .rec = fb.recs.items.ptr,
+        .lit = fb.lits.items.ptr,
+        .cmd_counts = &fb.cmd_counts,
+        .dist_counts1 = &fb.dist_counts1,
+        .ring = ring_in,
+    };
+    // `Prefix.outMax` as one add: how far back the output reaches from `p`
+    // is `min(max_dist, p + out_off)`.
+    const out_off = x.dropped -% x.len;
+
+    var p = start;
+    var lit_start = start;
+    // Hashing reads eight bytes; the last ones of the block stay literals.
+    const limit = if (end >= 8 and end - 8 >= start) end - 8 + 1 else start;
+    while (true) {
+        var dist: usize = 0;
+        var len: usize = 0;
+        var misses: usize = 0;
+        const last: usize = st.ring.last[0];
+        // The last distance at the first position: no distance bits.
+        if (!lv.ring_every and p < limit and last <= @min(max_dist, p +% out_off) and
+            std.mem.readInt(u32, data[p - last ..][0..4], .little) == std.mem.readInt(u32, data[p..][0..4], .little))
+        {
+            dist = last;
+            len = Matcher.matchLen(data, p - last, p, @min(end - p, max_match));
+        }
+        if (len == 0) while (p < limit) {
+            const out_max = @min(max_dist, p +% out_off);
+            const cur4 = std.mem.readInt(u32, data[p..][0..4], .little);
+            if (lv.ring_every and last <= out_max and
+                std.mem.readInt(u32, data[p - last ..][0..4], .little) == cur4)
+            {
+                dist = last;
+                len = Matcher.matchLen(data, p - last, p, @min(end - p, max_match));
+                break;
+            }
+            const v = std.mem.readInt(u64, data[p..][0..8], .little) << (64 - 8 * frag_hash_len);
+            const h: usize = @intCast((v *% 0x1e35a7bd1e35a7bd) >> hshift);
+            const c: usize = table[h];
+            table[h] = @intCast(p);
+            if (c < p and std.mem.readInt(u32, data[c..][0..4], .little) == cur4) {
+                if (px and c < x.len) {
+                    if (x.reach(p, c, out_max, @min(end - p, max_match))) |r| {
+                        dist = r.d;
+                        len = Matcher.matchLen(data, c, p, r.cap);
+                        break;
+                    }
+                } else if (p - c <= out_max) {
+                    dist = p - c;
+                    len = Matcher.matchLen(data, c, p, @min(end - p, max_match));
+                    if (lv.extend_back) {
+                        var cc = c;
+                        while (p > lit_start and cc > x.len and data[cc - 1] == data[p - 1] and len < max_match) {
+                            p -= 1;
+                            cc -= 1;
+                            len += 1;
+                        }
+                    }
+                    break;
+                }
+            }
+            misses += 1;
+            p += 1 + (misses >> lv.skip_log2);
+        };
+        if (len == 0) {
+            // The block's final literals, if any.
+            if (lit_start < end) fragCommand(&st, lit_start, end, 0, 0);
+            break;
+        }
+        fragCommand(&st, lit_start, p, len, dist);
+        p += len;
+        lit_start = p;
+        var k: usize = 1;
+        while (k <= lv.tail_inserts and k < len) : (k += 1) {
+            const q = p - k;
+            if (q < limit) {
+                const v = std.mem.readInt(u64, data[q..][0..8], .little) << (64 - 8 * frag_hash_len);
+                table[@intCast((v *% 0x1e35a7bd1e35a7bd) >> hshift)] = @intCast(q);
+            }
+        }
+    }
+    fb.recs.items.len = st.rec - fb.recs.items.ptr;
+    fb.lits.items.len = st.lit - fb.lits.items.ptr;
+    @memset(st.lit[0..FragBlock.lit_pad], 0);
+    fb.ring = st.ring;
+    fb.covered = st.covered;
+}
 
 // ---------------------------------------------------------------------------
 // Commands.
@@ -2475,7 +2890,7 @@ fn chooseLiteralModelIn(gpa: std.mem.Allocator, scratch_in: ?*ClusterScratch, sr
     var n_lits: u64 = 0;
     for (out.counts[0]) |c| n_lits += c;
     out.single = out.counts[0];
-    if (effort == .q4 or n_lits < 256) return;
+    if (effort.finder() != .deep or n_lits < 256) return;
     // Near 8 bits a literal: no context will find structure a single code
     // misses (random or already-compressed bytes).
     if (histogramCost(&out.counts[0]) > 7.9 * @as(f64, @floatFromInt(n_lits))) return;
@@ -3173,6 +3588,142 @@ fn writeCompressedBlock(
     return .{ .multi_literal = multi_literal, .single_no_worse = single_no_worse };
 }
 
+/// `.q0`/`.q1`'s meta-block of `n` bytes from its parse (`FragBlock`): one
+/// block type and one code per category, no literal contexts. The size is
+/// known from the histograms before any command is written: from
+/// `budget_bits` (where storing the block would end) on, nothing more is
+/// written (`error.NotSmaller`), so incompressible data costs no emission.
+fn writeFragmentBlock(
+    gpa: std.mem.Allocator,
+    w: *BitWriter,
+    fb: *FragBlock,
+    n: usize,
+    is_last: bool,
+    large_window: bool,
+    budget_bits: usize,
+) GiveUp!void {
+    if (n == 0 or n > max_store_block) return error.EncoderInvariant;
+    if (fb.recs.items.len == 0 or fb.covered != n) return error.EncoderInvariant;
+    // Four histograms in turn: an increment does not wait on the one before
+    // when two literals in a row are the same byte.
+    var h4: [4][tables.num_literal_symbols]u32 = @splat(@splat(0));
+    const lits = fb.lits.items;
+    {
+        var k: usize = 0;
+        while (k + 4 <= lits.len) : (k += 4) {
+            inline for (0..4) |j| h4[j][lits[k + j]] += 1;
+        }
+        while (k < lits.len) : (k += 1) h4[0][lits[k]] += 1;
+    }
+    var lit_counts: [tables.num_literal_symbols]u32 = undefined;
+    for (&lit_counts, h4[0], h4[1], h4[2], h4[3]) |*o, a, b, c, d| o.* = a + b + c + d;
+    if (lits.len == 0) lit_counts[0] = 1;
+    const n_dist: u32 = if (large_window) dist_alphabet_large else dist_alphabet_size;
+    const dist_counts = fb.dist_counts1[1..][0..n_dist];
+    if (std.mem.allEqual(u32, dist_counts, 0)) dist_counts[0] = 1;
+
+    // --- meta-block header --------------------------------------------------
+    try w.writeBits(@intFromBool(is_last), 1);
+    if (is_last) try w.writeBits(0, 1); // ISLASTEMPTY = 0
+    const mlen_minus_1: u32 = @intCast(n - 1);
+    const size_nibbles: u6 = if (mlen_minus_1 >= (1 << 20)) 6 else if (mlen_minus_1 >= (1 << 16)) 5 else 4;
+    try w.writeBits(size_nibbles - 4, 2);
+    try w.writeBits(mlen_minus_1, size_nibbles * 4);
+    if (!is_last) try w.writeBits(0, 1); // ISUNCOMPRESSED = 0
+    // NBLTYPES 1 for all three, NPOSTFIX = NDIRECT = 0, context mode LSB6,
+    // NTREESL 1, NTREESD 1: thirteen zero bits.
+    try w.writeBits(0, 13);
+    var lit_code = try buildAndWriteCode(gpa, w, &lit_counts, tables.num_literal_symbols);
+    defer lit_code.deinit(gpa);
+    var cmd_code = try buildAndWriteCode(gpa, w, &fb.cmd_counts, tables.num_command_symbols);
+    defer cmd_code.deinit(gpa);
+    var dist_code = try buildAndWriteCodeWide(gpa, w, dist_counts, n_dist, if (large_window) dist_alphabet_large_max else dist_alphabet_size);
+    defer dist_code.deinit(gpa);
+
+    var payload: usize = 0;
+    for (fb.recs.items) |r| payload += r.extraN() + r.distN();
+    for (lit_counts, lit_code.len) |k, l| payload += @as(usize, k) * l;
+    for (fb.cmd_counts, cmd_code.len) |k, l| payload += @as(usize, k) * l;
+    for (dist_counts, dist_code.len) |k, l| payload += @as(usize, k) * l;
+    if (w.bitPos() + payload >= budget_bits) return error.NotSmaller;
+
+    // --- commands, into room reserved for exactly them ----------------------
+    // No capacity check per write: whole bytes go out eight at a time (an
+    // unaligned store; the reserve keeps the slack), at most seven bits stay
+    // pending, so up to 57 bits are added between flushes. Plain locals, not
+    // a struct behind a pointer: a store through `ptr` may alias anything
+    // in memory, and such a struct's fields were reloaded after every one
+    // (a third of `.q0`'s cycles on html, 2026-10-15).
+    try w.room((w.cnt + payload) / 8 + 16);
+    const base = w.buf.items.ptr + w.buf.items.len;
+    var ptr = base;
+    var acc: u64 = w.acc;
+    var cnt: u64 = w.cnt;
+    const flush = struct {
+        // `k` < 64: the shift is the bits of the bytes that went out.
+        inline fn f(pp: *[*]u8, a: *u64, k: *u64) void {
+            std.mem.writeInt(u64, pp.*[0..8], a.*, .little);
+            pp.* += k.* >> 3;
+            a.* >>= @as(u6, @truncate(k.* & 56));
+            k.* &= 7;
+        }
+    }.f;
+    flush(&ptr, &acc, &cnt); // `w` holds up to 31 pending bits
+    const lbits = lit_code.bits;
+    const llen = lit_code.len;
+    const cbits = cmd_code.bits;
+    const clen = cmd_code.len;
+    // The distance code from "none" on (`FragRec.distSym1`): a command
+    // without a distance writes zero bits, no branch.
+    var dbits1: [dist_alphabet_large + 1]u16 = undefined;
+    var dlen1: [dist_alphabet_large + 1]u8 = undefined;
+    dbits1[0] = 0;
+    dlen1[0] = 0;
+    @memcpy(dbits1[1..][0..n_dist], dist_code.bits);
+    @memcpy(dlen1[1..][0..n_dist], dist_code.len);
+    const padded = fb.lits.allocatedSlice();
+    var lp: usize = 0;
+    for (fb.recs.items) |r| {
+        const sym = r.sym();
+        const cl: u64 = clen[sym];
+        const en = r.extraN();
+        if (cl + en <= 56) {
+            acc |= (cbits[sym] | (r.cmd >> 16) << @intCast(cl)) << @intCast(cnt);
+            cnt += cl + en;
+        } else {
+            // Long insert and copy at once (up to 63 bits): in two.
+            acc |= @as(u64, cbits[sym]) << @intCast(cnt);
+            cnt += cl;
+            flush(&ptr, &acc, &cnt);
+            acc |= (r.cmd >> 16) << @intCast(cnt);
+            cnt += en;
+        }
+        flush(&ptr, &acc, &cnt);
+        // Literals three at a time (45 bits), the last group masked: one
+        // round for the short inserts most commands have.
+        const insert = r.insertLen();
+        var k: usize = 0;
+        while (k < insert) : (k += 3) {
+            inline for (0..3) |j| {
+                const on: u64 = @intFromBool(k + j < insert);
+                const b = padded[lp + k + j];
+                acc |= (@as(u64, lbits[b]) & (0 -% on)) << @intCast(cnt);
+                cnt += llen[b] * on;
+            }
+            flush(&ptr, &acc, &cnt);
+        }
+        lp += insert;
+        const d1 = r.distSym1();
+        const dl: u64 = dlen1[d1];
+        acc |= (dbits1[d1] | (r.dst >> 34) << @intCast(dl)) << @intCast(cnt);
+        cnt += dl + r.distN();
+        flush(&ptr, &acc, &cnt);
+    }
+    w.buf.items.len += @intCast(ptr - base);
+    w.acc = acc;
+    w.cnt = @intCast(cnt);
+}
+
 /// Block-split parameters per category: about how many symbols a starting
 /// histogram covers, the sampled window, and what a block switch is priced.
 fn lit_split_params(rounds: u32) block_split.Params {
@@ -3502,6 +4053,13 @@ pub fn compress(gpa: std.mem.Allocator, input: []const u8) std.mem.Allocator.Err
 /// the Go port's `DefaultCompression`; `fromQuality` maps a quality level
 /// from code written against the C or Go API.
 pub const Effort = enum(u4) {
+    /// One candidate per lookup (`FragMatcher`), the last distance only
+    /// after a copy, a step that grows fast through data that stopped
+    /// matching; one code per category. The fastest level.
+    q0 = 0,
+    /// As `.q0`, with the last distance tried at every position, matches
+    /// extended backwards and a slower-growing step.
+    q1 = 1,
     /// Its own match finder (4 candidates, last distance), one literal
     /// code per block.
     q4 = 4,
@@ -3519,8 +4077,10 @@ pub const Effort = enum(u4) {
 
     /// The level for a google/brotli quality: the nearest one at or above
     /// it (a caller asking for quality 7 gets at least quality 7's ratio),
-    /// `.q11` past 11. Qualities 0..3 get `.q4`, the fastest level here.
+    /// `.q11` past 11.
     pub fn fromQuality(q: u32) Effort {
+        if (q == 0) return .q0;
+        if (q == 1) return .q1;
         if (q <= 4) return .q4;
         if (q <= 6) return .q6;
         if (q <= 9) return .q9;
@@ -3532,10 +4092,21 @@ pub const Effort = enum(u4) {
         return @intFromEnum(e);
     }
 
+    const Finder = enum { frag, fast, deep };
+
+    /// The match finder an effort uses.
+    fn finder(e: Effort) Finder {
+        return switch (e) {
+            .q0, .q1 => .frag,
+            .q4 => .fast,
+            .q6, .q9, .q11 => .deep,
+        };
+    }
+
     /// log2 of all bucket slots together, the match finder's table.
     fn slotsLog(e: Effort) u5 {
         return switch (e) {
-            .q4 => unreachable, // `FastMatcher`
+            .q0, .q1, .q4 => unreachable, // `FragMatcher`, `FastMatcher`
             .q6 => 19,
             .q9 => 20,
             .q11 => 22,
@@ -3544,7 +4115,7 @@ pub const Effort = enum(u4) {
 
     fn depth(e: Effort) u32 {
         return switch (e) {
-            .q4 => unreachable, // `FastMatcher`
+            .q0, .q1, .q4 => unreachable, // `FragMatcher`, `FastMatcher`
             .q6 => 32,
             .q9 => 256,
             .q11 => 256,
@@ -3662,7 +4233,7 @@ pub const Core = struct {
     effort: Effort,
     block_size: usize,
     wbits: u5,
-    matcher: union { deep: Matcher, fast: FastMatcher },
+    matcher: union { deep: Matcher, fast: FastMatcher, frag: FragMatcher },
     /// The input so far that copies may reach (`compressBlock`'s positions
     /// index it).
     data: []const u8 = &.{},
@@ -3673,6 +4244,8 @@ pub const Core = struct {
     /// A block that overflowed the caller's buffer is decided here.
     scratch: BitWriter,
     cmds: std.ArrayListUnmanaged(Cmd) = .empty,
+    /// `.q0`/`.q1`: the block's commands, resolved (`buildFrag`).
+    frag: FragBlock = .{},
     /// `.q11`: the parses of a block (`buildCommandsOptimal`), and the writer
     /// that sizes each.
     parses: [max_parses]std.ArrayListUnmanaged(Cmd) = @splat(.empty),
@@ -3695,10 +4268,11 @@ pub const Core = struct {
             .effort = effort,
             .block_size = block_size,
             .wbits = wbits,
-            .matcher = if (effort == .q4)
-                .{ .fast = try FastMatcher.init(gpa, size, fast_bucket_log_max) }
-            else
-                .{ .deep = try Matcher.init(gpa, size, effort.depth(), effort.slotsLog()) },
+            .matcher = switch (effort.finder()) {
+                .frag => .{ .frag = try FragMatcher.init(gpa, size) },
+                .fast => .{ .fast = try FastMatcher.init(gpa, size, fast_bucket_log_max) },
+                .deep => .{ .deep = try Matcher.init(gpa, size, effort.depth(), effort.slotsLog()) },
+            },
             .w = .{ .gpa = gpa },
             .alt = .{ .gpa = gpa },
             .scratch = .{ .gpa = gpa },
@@ -3708,11 +4282,16 @@ pub const Core = struct {
     }
 
     pub fn deinit(c: *Core) void {
-        if (c.effort == .q4) c.matcher.fast.deinit(c.gpa) else c.matcher.deep.deinit(c.gpa);
+        switch (c.effort.finder()) {
+            .frag => c.matcher.frag.deinit(c.gpa),
+            .fast => c.matcher.fast.deinit(c.gpa),
+            .deep => c.matcher.deep.deinit(c.gpa),
+        }
         if (!c.w.fixed) c.w.buf.deinit(c.gpa);
         c.alt.buf.deinit(c.gpa);
         c.scratch.buf.deinit(c.gpa);
         c.cmds.deinit(c.gpa);
+        c.frag.deinit(c.gpa);
         for (&c.parses) |*l| l.deinit(c.gpa);
         if (c.dict_search) |*d| d.deinit(c.gpa);
         c.trial.buf.deinit(c.gpa);
@@ -3720,32 +4299,53 @@ pub const Core = struct {
     }
 
     pub fn prefix(c: *const Core) Prefix {
-        return if (c.effort == .q4) c.matcher.fast.prefix else c.matcher.deep.prefix;
+        return switch (c.effort.finder()) {
+            .frag => c.matcher.frag.prefix,
+            .fast => c.matcher.fast.prefix,
+            .deep => c.matcher.deep.prefix,
+        };
+    }
+
+    fn setPrefix(c: *Core, x: Prefix) void {
+        switch (c.effort.finder()) {
+            .frag => c.matcher.frag.prefix = x,
+            .fast => c.matcher.fast.prefix = x,
+            .deep => c.matcher.deep.prefix = x,
+        }
     }
 
     /// `data[0..len]` (after `setData`) is a raw prefix dictionary: its
     /// positions go into the match finder — those whose hashed bytes all lie
     /// inside it, so the tables do not depend on what follows.
     pub fn loadDictionary(c: *Core, len: usize) void {
-        const x: Prefix = .{ .len = len };
-        if (c.effort == .q4) c.matcher.fast.prefix = x else c.matcher.deep.prefix = x;
+        c.setPrefix(.{ .len = len });
         var p: usize = 0;
         while (p + 8 <= len) : (p += 1) {
-            if (c.effort == .q4) c.matcher.fast.insert(p) else c.matcher.deep.insert(p);
+            switch (c.effort.finder()) {
+                .frag => c.matcher.frag.insert(p),
+                .fast => c.matcher.fast.insert(p),
+                .deep => c.matcher.deep.insert(p),
+            }
         }
     }
 
     /// The `bucketLog` `init` gives an effort's tables for `size`.
     pub fn tableLog(effort: Effort, size: usize) u6 {
-        return if (effort == .q4) bucketLog(size, fast_bucket_log_max) else bucketLog(size, effort.slotsLog() - std.math.log2_int(u32, effort.depth()));
+        return switch (effort.finder()) {
+            .frag => bucketLog(size, frag_bucket_log_max),
+            .fast => bucketLog(size, fast_bucket_log_max),
+            .deep => bucketLog(size, effort.slotsLog() - std.math.log2_int(u32, effort.depth())),
+        };
     }
 
     /// Ready for a new stream, as `init` leaves it (the tables kept).
     pub fn reset(c: *Core) void {
-        if (c.effort == .q4) c.matcher.fast.reset() else c.matcher.deep.reset();
-        if (c.effort == .q4) {
-            c.matcher.fast.prefix = .{};
-        } else c.matcher.deep.prefix = .{};
+        switch (c.effort.finder()) {
+            .frag => c.matcher.frag.reset(),
+            .fast => c.matcher.fast.reset(),
+            .deep => c.matcher.deep.reset(),
+        }
+        c.setPrefix(.{});
         c.data = &.{};
         c.w.buf.clearRetainingCapacity();
         c.w.acc = 0;
@@ -3756,7 +4356,11 @@ pub const Core = struct {
 
     /// `data` will lose its first `by` bytes (`setData` follows).
     pub fn shift(c: *Core, by: usize) void {
-        if (c.effort == .q4) c.matcher.fast.shift(@intCast(by)) else c.matcher.deep.shift(@intCast(by));
+        switch (c.effort.finder()) {
+            .frag => c.matcher.frag.shift(@intCast(by)),
+            .fast => c.matcher.fast.shift(@intCast(by)),
+            .deep => c.matcher.deep.shift(@intCast(by)),
+        }
     }
 
     /// RFC 7932 §9.2 has no flush marker; an empty metadata meta-block
@@ -3795,7 +4399,11 @@ pub const Core = struct {
 
     pub fn setData(c: *Core, data: []const u8) void {
         c.data = data;
-        if (c.effort == .q4) c.matcher.fast.data = data else c.matcher.deep.setData(data);
+        switch (c.effort.finder()) {
+            .frag => c.matcher.frag.data = data,
+            .fast => c.matcher.fast.data = data,
+            .deep => c.matcher.deep.setData(data),
+        }
     }
 
     /// WBITS (RFC 7932 §9.1): a single 0 bit for 16; 1 + (wbits - 17) in
@@ -3826,6 +4434,13 @@ pub const Core = struct {
         const max_dist = (@as(usize, 1) << c.wbits) - 16;
         c.cmds.clearRetainingCapacity();
         switch (c.effort) {
+            inline .q0, .q1 => |e| {
+                const lv = comptime fragLevel(e);
+                if (c.prefix().len != 0)
+                    try buildFrag(true, lv, gpa, &c.matcher.frag, off, end, max_dist, c.ring, &c.frag)
+                else
+                    try buildFrag(false, lv, gpa, &c.matcher.frag, off, end, max_dist, c.ring, &c.frag);
+            },
             .q4 => if (c.prefix().len != 0)
                 try buildCommandsFast(true, gpa, &c.matcher.fast, off, end, max_dist, c.ring, &c.cmds)
             else
@@ -3913,6 +4528,14 @@ pub const Core = struct {
         const x = c.prefix();
         const out = c.data[x.len..];
         const env: BlockEnv = .{ .reach = x.len + x.dropped, .large_window = c.wbits > max_window_bits, .dropped = x.dropped, .max_backward = (@as(usize, 1) << c.wbits) - 16 };
+        if (c.effort.finder() == .frag) {
+            writeFragmentBlock(c.gpa, dst, &c.frag, end - off, is_last, env.large_window, storeCostBits(dst.bitPos(), end - off)) catch |e| switch (e) {
+                error.OutOfMemory => if (dst.overflowed) return false else return error.OutOfMemory,
+                else => return false,
+            };
+            ring.* = c.frag.ring;
+            return true;
+        }
         const first = (try tryBlock(c.gpa, dst, out, off - x.len, end - x.len, c.cmds.items, is_last, &trial, c.effort, false, env)) orelse return false;
         // The context model was chosen on estimated bits. When it split the
         // literals, write the block once more with a single literal code and
@@ -4131,12 +4754,36 @@ fn readAnyCode(gpa: std.mem.Allocator, br: *BitReader, alphabet_size: u32) !huff
 
 test "Effort: each level names its quality, fromQuality rounds up" {
     for (std.enums.values(Effort)) |e| try testing.expectEqual(e, Effort.fromQuality(e.quality()));
-    const want = [12]Effort{ .q4, .q4, .q4, .q4, .q4, .q6, .q6, .q9, .q9, .q9, .q11, .q11 };
+    const want = [12]Effort{ .q0, .q1, .q4, .q4, .q4, .q6, .q6, .q9, .q9, .q9, .q11, .q11 };
     for (want, 0..) |e, q| try testing.expectEqual(e, Effort.fromQuality(@intCast(q)));
     try testing.expectEqual(Effort.q11, Effort.fromQuality(99));
     try testing.expectEqual(Effort.q6, Effort.default);
     const opts: CompressOptions = .{};
     try testing.expectEqual(Effort.default, opts.effort);
+}
+
+test "canonicalCode: the decoder's table reads the same patterns" {
+    var prng = std.Random.DefaultPrng.init(0xc0de);
+    const r = prng.random();
+    var counts: [tables.num_command_symbols]u32 = undefined;
+    var lengths: [tables.num_command_symbols]u8 = undefined;
+    for (0..300) |round| {
+        const n: usize = 2 + r.uintLessThan(usize, counts.len - 1);
+        for (counts[0..n]) |*c| c.* = if (r.uintLessThan(u8, 4) == 0) 0 else 1 + r.uintLessThan(u32, if (round % 2 == 0) 50 else 100_000);
+        counts[0] = 1;
+        counts[n - 1] = 1;
+        _ = try assignLengths(testing.allocator, counts[0..n], tables.max_code_length, lengths[0..n]);
+        var got = try canonicalCode(testing.allocator, lengths[0..n]);
+        defer got.deinit(testing.allocator);
+        var table = try huffman.buildComplex(testing.allocator, lengths[0..n]);
+        defer table.deinit(testing.allocator);
+        var want = try codeFromTable(testing.allocator, &table, @intCast(n));
+        defer want.deinit(testing.allocator);
+        try testing.expectEqualSlices(u8, want.len, got.len);
+        try testing.expectEqualSlices(u16, want.bits, got.bits);
+    }
+    // An incomplete code is refused, as the table refuses it.
+    try testing.expectError(error.EncoderInvariant, canonicalCode(testing.allocator, &.{ 1, 2, 0, 3 }));
 }
 
 test "DistRing keeps the decoder's last four distances in order" {
@@ -4502,7 +5149,7 @@ test "compressInto: the stream compressWith gives, in exactly its length; a byte
         const input = try corpus.build(gpa, shape);
         defer gpa.free(input);
         if (input.len > 300_000) continue; // (the 1 MiB block shapes: slow, add nothing here)
-        inline for (.{ Effort.q4, .q6, .q9 }) |effort| {
+        inline for (.{ Effort.q0, Effort.q1, .q4, .q6, .q9 }) |effort| {
             const opts: CompressOptions = .{ .effort = effort };
             const want = try compressWith(gpa, input, opts);
             defer gpa.free(want);

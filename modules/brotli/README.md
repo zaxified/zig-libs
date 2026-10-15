@@ -61,8 +61,9 @@ const line = try d.reader.takeDelimiterInclusive('\n');   // ReadFailed? see d.e
 const br = try brotli.compress(gpa, data);                    // effort .default (= .q6)
 defer gpa.free(br);
 // Levels are named after the google/brotli (C, Go) quality they stand in for:
-// .q4, .q6 (= .default), .q9, .q11 (several times slower: for content compressed
-// once and served many times); Effort.fromQuality(q) maps a quality 0..11.
+// .q0, .q1 (the fastest), .q4, .q6 (= .default), .q9, .q11 (several times slower:
+// for content compressed once and served many times); Effort.fromQuality(q)
+// maps a quality 0..11.
 // Not byte-identical to the reference, about the same size in about the same time;
 // window_bits 10..24 (default: 16
 // for inputs up to 64 KiB, else 21).

@@ -292,6 +292,23 @@ fn expectRoundTrip(src: []const u8, stream: []const u8) !void {
     try testing.expectEqualSlices(u8, src, back);
 }
 
+/// The match finder's table (its address, its size), whichever the effort's.
+fn tablePtr(c: *const encoder.Core) *const anyopaque {
+    return switch (c.effort) {
+        .q0, .q1 => c.matcher.frag.table.ptr,
+        .q4 => c.matcher.fast.table.ptr,
+        else => c.matcher.deep.slots.ptr,
+    };
+}
+
+fn tableLen(c: *const encoder.Core) usize {
+    return switch (c.effort) {
+        .q0, .q1 => c.matcher.frag.table.len,
+        .q4 => c.matcher.fast.table.len,
+        else => c.matcher.deep.count.len,
+    };
+}
+
 test "without a flush: the bytes compressWith gives, whatever the writes and the buffer" {
     const gpa = testing.allocator;
     const src = try gpa.alloc(u8, 300_000);
@@ -299,13 +316,15 @@ test "without a flush: the bytes compressWith gives, whatever the writes and the
     text(src, 0x51);
     // A 64 KiB window over 300 KB slides the history several times; blocks
     // of 40 000 bytes cut it into eight, the last one short.
-    inline for (.{ encoder.Effort.q4, .q6, .q9, .q11 }) |effort| {
+    inline for (.{ encoder.Effort.q0, .q1, .q4, .q6, .q9, .q11 }) |effort| {
         const opts: StreamOptions = .{ .effort = effort, .window_bits = 16, .block_size = 40_000 };
         const want = try encoder.compressWith(gpa, src, .{ .effort = effort, .window_bits = 16, .block_size = 40_000 });
         defer gpa.free(want);
         try expectRoundTrip(src, want);
         for ([_]usize{ 1, 999, 65_536 }) |blen| for ([_]usize{ 7, 5_000, 40_000, 300_000 }) |step| {
             if (step == 7 and (blen > 1 or effort != .q4)) continue; // (slow, adds nothing)
+            // `.q0`/`.q1` share their parse; `.q1` takes the common cuts.
+            if (effort == .q1 and (blen != 999 or step == 5_000)) continue;
             // `.q11` shares every cut with the others; one buffer and two
             // write sizes keep its share of the run short.
             if (effort == .q11 and (blen != 999 or step == 5_000)) continue;
@@ -432,13 +451,13 @@ test "a warm writer keeps its table and history from stream to stream" {
     var out: Writer.Allocating = .init(gpa);
     defer out.deinit();
     var buf: [16 * 1024]u8 = undefined;
-    inline for (.{ encoder.Effort.q4, .q6 }) |effort| {
+    inline for (.{ encoder.Effort.q0, .q4, .q6 }) |effort| {
         const opts: StreamOptions = .{ .effort = effort, .window_bits = 18 };
         out.clearRetainingCapacity();
         var sw: StreamWriter = try .init(gpa, &out.writer, &buf, opts);
         defer sw.deinit();
         try writeStream(&sw, src, 10_000, &.{5_000});
-        const table = if (effort == .q4) sw.core.matcher.fast.table.ptr else sw.core.matcher.deep.slots.ptr;
+        const table = tablePtr(&sw.core);
         const hist = sw.hist.items.ptr;
         const first = try gpa.dupe(u8, out.written());
         defer gpa.free(first);
@@ -448,7 +467,7 @@ test "a warm writer keeps its table and history from stream to stream" {
             try writeStream(&sw, src, 10_000, &.{5_000});
             try testing.expectEqualSlices(u8, first, out.written());
         }
-        try testing.expectEqual(table, if (effort == .q4) sw.core.matcher.fast.table.ptr else sw.core.matcher.deep.slots.ptr);
+        try testing.expectEqual(table, tablePtr(&sw.core));
         try testing.expectEqual(hist, sw.hist.items.ptr);
         try expectRoundTrip(src, out.written());
     }
@@ -544,7 +563,7 @@ test "size_hint: a table for the input, and compressWith's bytes for a short one
     var out: Writer.Allocating = .init(gpa);
     defer out.deinit();
     var buf: [512]u8 = undefined;
-    inline for (.{ encoder.Effort.q4, .q6, .q9, .q11 }) |effort| {
+    inline for (.{ encoder.Effort.q0, .q1, .q4, .q6, .q9, .q11 }) |effort| {
         const want = try encoder.compressWith(gpa, src, .{ .effort = effort, .window_bits = 22 });
         defer gpa.free(want);
         out.clearRetainingCapacity();
@@ -552,7 +571,7 @@ test "size_hint: a table for the input, and compressWith's bytes for a short one
         defer sw.deinit();
         try writeStream(&sw, src, 700, &.{});
         try testing.expectEqualSlices(u8, want, out.written());
-        const small = if (effort == .q4) sw.core.matcher.fast.table.len else sw.core.matcher.deep.count.len;
+        const small = tableLen(&sw.core);
         // The same hint keeps the table; a bigger one makes a bigger table;
         // more input than hinted still round-trips.
         out.clearRetainingCapacity();
@@ -562,7 +581,7 @@ test "size_hint: a table for the input, and compressWith's bytes for a short one
         out.clearRetainingCapacity();
         try sw.reset(&out.writer, .{ .effort = effort, .size_hint = 1 << 20 });
         // (`.q9`'s 256-deep buckets reach their cap of 2^12 at 3 000 bytes.)
-        const big = if (effort == .q4) sw.core.matcher.fast.table.len else sw.core.matcher.deep.count.len;
+        const big = tableLen(&sw.core);
         try testing.expect(if (effort == .q9) small == big else small < big);
         out.clearRetainingCapacity();
         try sw.reset(&out.writer, .{ .effort = effort, .size_hint = 10 });
@@ -578,13 +597,16 @@ test "a raw prefix dictionary: compressWith's bytes, and every decoder's round t
     text(src, 0x58);
     const dict = src[0..30_000];
     const input = src[20_000..];
-    inline for (.{ encoder.Effort.q4, .q6, .q9, .q11 }) |effort| {
+    inline for (.{ encoder.Effort.q0, .q1, .q4, .q6, .q9, .q11 }) |effort| {
         const plain_one = try encoder.compressWith(gpa, input, .{ .effort = effort, .window_bits = 16 });
         defer gpa.free(plain_one);
         const want = try encoder.compressWith(gpa, input, .{ .effort = effort, .window_bits = 16, .dictionary = dict });
         defer gpa.free(want);
-        // The dictionary is used: smaller than without it.
-        try testing.expect(want.len < plain_one.len);
+        // The dictionary is used: smaller than without it. (`.q0`/`.q1`
+        // keep one position per hash, the last: on text of a few words
+        // that is rarely the long copy from the dictionary, so their gain
+        // is small; that the stream needs the dictionary is checked below.)
+        if (effort != .q0 and effort != .q1) try testing.expect(want.len < plain_one.len);
         const back = try decoder.decompress(gpa, want, .{ .dictionary = dict });
         defer gpa.free(back);
         try testing.expectEqualSlices(u8, input, back);
