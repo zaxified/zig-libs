@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-15** — Encoder: new `Effort.max` (R2) — a shortest-path parse of every block priced from the block's own statistics (a greedy parse and two refits; the shortest as written wins), static-dictionary words with 113 of the 121 transforms (identity, OMIT_LAST_n, UPPERCASE_FIRST/ALL, with their prefixes and suffixes), up to 48 candidate copies per position. `alice29.txt` 46 935 B: 0.96 % behind google/brotli q11 (46 487), 1.1 % below q10; several times `.best`'s time. Every effort now also picks per block how many codes the four distance contexts (copy length 2, 3, 4, 5+) share — `.default` 51 467 → 51 327 B, `.best` 50 736 → 50 536 B on `alice29.txt`: **those streams changed** (re-blessed by libbrotli 1.2.0; still valid for every decoder). Additive API.
+
 - **2026-10-15** — Decoder: serialized shared dictionaries (R7, RFC 9841 §5) — `parseSharedDictionary`, `Options.shared_dictionary`: custom word lists and transforms (incl. ShiftFirst/ShiftAll), context-chosen pairs, an LZ77 part. Transform triplets in google/brotli's byte order (prefix, operation, suffix), which differs from RFC 9841's text. Anchored on 15 streams of google/brotli 1.2.0 built with BROTLI_EXPERIMENTAL (interop `--brotli-src`), committed under `testdata/ref/serial/`. Additive API.
 
 - **2026-10-15** — Encoder speed back: the dictionary support in the match finders is a comptime switch, so a search without a dictionary is the loop it was before (the per-candidate test had cost `.best` +20–27 %, `.default` +7–12 % since the R6 encoder). vs google/brotli 1.2.0: fast 0.96–1.12× (q4), default 0.97–1.04× (q6), best 0.70–0.86× (q9), decoder 1.09–1.21×. Streams unchanged.

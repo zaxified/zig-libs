@@ -53,7 +53,7 @@ fn digestOf(bytes: []const u8) [64]u8 {
 /// with no blessed entry would be a shape that silently stopped being checked
 /// — the exact failure this split has to avoid, so it is a build failure.
 fn frozen(comptime name: []const u8, comptime effort: []const u8) blessed.Blessed {
-    // ~150 entries (45 shapes x 3 efforts, the variants) x two name comparisons each,
+    // ~150 entries (45 shapes x 4 efforts, the variants) x two name comparisons each,
     // resolved at comptime: the default 1000-branch budget does not cover it.
     @setEvalBranchQuota(200_000);
     inline for (blessed.entries) |e| {
@@ -254,10 +254,10 @@ test "interop replay: the encoder still emits the large-window streams libbrotli
 // direction — a shape deleted while its blessing lingers — and a capture run
 // that silently produced fewer entries than it meant to.
 
-test "interop replay: coverage canary — 45 shapes x 3 efforts + 16 variant + 15 dictionary + 6 large-window streams blessed, 24 reference streams" {
+test "interop replay: coverage canary — 45 shapes x 4 efforts + 16 variant + 15 dictionary + 6 large-window streams blessed, 24 reference streams" {
     try testing.expectEqual(@as(usize, 45), corpus.shapes.len);
-    try testing.expectEqual(@as(usize, 10), corpus.encodings.len);
-    try testing.expectEqual(@as(usize, 45 * 3 + 16 + corpus.dict_cases.len * corpus.dict_efforts.len + corpus.large_cases.len * corpus.large_efforts.len), blessed.entries.len);
+    try testing.expectEqual(@as(usize, 11), corpus.encodings.len);
+    try testing.expectEqual(@as(usize, 45 * 4 + 16 + corpus.dict_cases.len * corpus.dict_efforts.len + corpus.large_cases.len * corpus.large_efforts.len), blessed.entries.len);
     try testing.expectEqual(@as(usize, 24), corpus.ref_streams.len);
 
     // Every blessed entry is (encoding, shape), in capture order: a renamed

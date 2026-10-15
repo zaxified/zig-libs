@@ -266,7 +266,7 @@ pub fn encodeDict(gpa: std.mem.Allocator, comptime c: DictCase, effort: brotli.E
     return brotli.compressWith(gpa, input, .{ .effort = effort, .window_bits = c.lgwin, .dictionary = dict });
 }
 
-pub const dict_efforts = [_][]const u8{ "fast", "default", "best" };
+pub const dict_efforts = [_][]const u8{ "fast", "default", "best", "max" };
 
 // ── the large window (RFC 9841 §6) ──────────────────────────────────────────
 
@@ -313,7 +313,7 @@ pub fn encodeLarge(gpa: std.mem.Allocator, comptime c: LargeCase, effort: brotli
     return brotli.compressWith(gpa, input, .{ .effort = effort, .window_bits = c.lgwin });
 }
 
-pub const large_efforts = [_][]const u8{ "fast", "default" };
+pub const large_efforts = [_][]const u8{ "fast", "default", "max" };
 
 /// `testdata/ref/large/<case>.q<Q>.br`.
 pub fn largeRefFile(comptime c: LargeCase, comptime q: u8) []const u8 {
@@ -552,6 +552,7 @@ pub const encodings = [_]Encoding{
     .{ .tag = "fast", .effort = "fast" },
     .{ .tag = "default", .effort = "default" },
     .{ .tag = "best", .effort = "best" },
+    .{ .tag = "max", .effort = "max" },
     .{ .tag = "w10", .effort = "default", .window_bits = 10, .shapes = &.{ "hello_repeated", "run_1000", "alice_full" } },
     .{ .tag = "w15_fast", .effort = "fast", .window_bits = 15, .shapes = &.{ "random_70000", "alice_full" } },
     .{ .tag = "w17_best", .effort = "best", .window_bits = 17, .shapes = &.{ "mixed_text_first", "alice_full" } },

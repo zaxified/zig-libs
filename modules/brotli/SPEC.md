@@ -24,14 +24,14 @@ Surveyed 2026-10-14 per `SURVEY-PLAYBOOK.md` (first 2026-09-30); stars and activ
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [google/brotli](https://github.com/google/brotli) — **reference**, **fastest** | C | MIT | 14.9k | v1.2.0 (2025-10-27), pushed 2026-10-14 | Qualities 0–11 (q11 `alice29.txt` 46 487 B vs our `.best` 50 736 B); streaming encoder (process / flush / finish / metadata) and a decoder resumable on both input and output; LGWIN/mode/size-hint parameters; large window (RFC 9841); raw prefix and serialized shared dictionaries on both ends (1.1.0+) — what RFC 9842 `dcb` needs; metadata callbacks. This module: complete RFC 7932 decoder (one-shot, into a buffer, push stream), three encoder efforts, one-shot or streamed (`StreamWriter`: flush / finish / reset), window bits 10–24. The fastest implementation in the field too (rust-brotli is a port, the Go one a translation — inferred). |
+| [google/brotli](https://github.com/google/brotli) — **reference**, **fastest** | C | MIT | 14.9k | v1.2.0 (2025-10-27), pushed 2026-10-14 | Qualities 0–11 (q11 `alice29.txt` 46 487 B vs our `.max` 46 935 B, `.best` 50 536 B); streaming encoder (process / flush / finish / metadata) and a decoder resumable on both input and output; LGWIN/mode/size-hint parameters; large window (RFC 9841); raw prefix and serialized shared dictionaries on both ends (1.1.0+) — what RFC 9842 `dcb` needs; metadata callbacks. This module: complete RFC 7932 decoder (one-shot, into a buffer, push stream), four encoder efforts, one-shot or streamed (`StreamWriter`: flush / finish / reset), window bits 10–24. The fastest implementation in the field too (rust-brotli is a port, the Go one a translation — inferred). |
 | [dropbox/rust-brotli](https://github.com/dropbox/rust-brotli) | Rust | BSD-3-Clause + MIT (`LICENSE.MIT` in repo) | 945 | pushed 2026-09-02 | Port of the reference: q0–11 (q0–9 bit-identical to C), `Read`/`Write` streaming, raw prefix (≤ 15) and serialized dictionaries, multithreaded compression, catable/appendable streams, `no_std`. *(README)* |
 | [andybalholm/brotli](https://github.com/andybalholm/brotli) | Go | MIT | 740 | pushed 2026-10-12 (tags, no releases) | Translation of the reference C: qualities 0–11, `io.Reader`/`io.Writer`; experimental `matchfinder` encoders (`NewWriterV2`). The common Go choice for `Content-Encoding: br`. *(README)* |
 | [muhammad-fiaz/brotli.zig](https://github.com/muhammad-fiaz/brotli.zig) | Zig | MIT | 2 | pushed 2026-10-05 (no releases) | README *claims* q0–11 with block splitting, large window, custom/compound dictionaries, a resumable streaming decoder and `std.Io` adapters; no published test evidence *(unverified)*. |
 | [akunaakwei/zig-brotli](https://github.com/akunaakwei/zig-brotli) / [Scythe-Technology/zbrotli](https://github.com/Scythe-Technology/zbrotli) | Zig (wrap C) | zlib / MIT | 1 / 0 | pushed 2026-04-18 / 2026-06-05 | Build-system wrappers or bindings for google/brotli's C — full features, but link C. |
 | Zig `std.compress` | Zig | MIT | — | Zig 0.16.0 | `flate`, `lzma`, `lzma2`, `xz`, `zstd`; **no brotli** (verified: `lib/std/compress/` listing, 2026-10-14). |
 
-**Where we are ahead:** pure Zig with no C, unlike the wrappers; typed errors with an output cap and a ratio bound on by default (google/brotli added an output limit to its Python binding only in 1.2.0); a decoder whose one-shot, into-buffer and streaming forms are checked against each other by a differential fuzz driver and scored by mutation; encoder streams verified by the reference decoder over 45 shapes; `.default` beats q5 on text (51 467 vs 52 809 B). **Where we are behind:** no `mode` parameter; no `.max` effort (q11-class ratio); no pull reader; `.best` 9 % behind q11 (→ Backlog R1–R11).
+**Where we are ahead:** pure Zig with no C, unlike the wrappers; typed errors with an output cap and a ratio bound on by default (google/brotli added an output limit to its Python binding only in 1.2.0); a decoder whose one-shot, into-buffer and streaming forms are checked against each other by a differential fuzz driver and scored by mutation; encoder streams verified by the reference decoder over 45 shapes; `.default` beats q5 on text (51 467 vs 52 809 B). **Where we are behind:** no `mode` parameter; no block splitting, NPOSTFIX/NDIRECT or OMIT_FIRST dictionary words; `.max` is 1 % behind q11 on text, further on very small inputs (→ Backlog).
 
 ## Scope & honesty
 
@@ -146,7 +146,7 @@ bytes verbatim; otherwise it is rolled back out of the bit writer and re-emitted
   own algorithm (2026-10-14): 4 slots of a 6-byte hash plus the last distance, a lazy step only for
   matches under 32 bytes, sparse inserts inside long copies, growing steps through long literal runs,
   one literal code per block — sizes about google/brotli q4. `.default` walks 32 bucket candidates and
-  models literal contexts; `.best` walks 256. Every level is blessed by the reference separately (below).
+  models literal contexts; `.best` walks 256; `.max` (2026-10-15, R2) parses by shortest path with static-dictionary words (below). Every level is blessed by the reference separately (below).
 - **LZ77 by saved bits** (2026-09-30): a bucketed hash over 4-byte hashes (a hash chain until
   2026-10-14; `.fast` hashes 6 bytes), one lazy step, matches of 4 to
   65 535 bytes. A candidate is scored by the bits it saves — its length times the block's order-0
@@ -180,8 +180,42 @@ bytes verbatim; otherwise it is rolled back out of the bit writer and re-emitted
   code-length alphabet) by raising a floor under the symbol counts and rebuilding until the tree fits.
 - **Window bits**: 16, or 21 when the input is longer than 65 520 bytes.
 
+- **Distance contexts** (2026-10-15, all efforts): a distance's code depends on its copy's length (2,
+  3, 4, 5+; RFC 7932 §7.2). The four histograms go to one to four codes — the cheapest of the 15
+  partitions by estimated bits plus 12 for the map — and a distance context map is written when
+  more than one. `alice29.txt`: `.default` 51 467 → 51 327, `.best` 50 736 → 50 536. (**Streams of
+  `.fast`/`.default`/`.best` changed with it**; re-blessed.)
+- **`.max`: shortest-path parse** (2026-10-15, R2). For a block: every position's candidates are
+  collected once from the bucketed hash (copies each longer than any nearer one, ≤ 48; `max_cands`)
+  and the static dictionary's (below); the parse is a forward shortest path over positions, where a
+  node keeps its cost, the literals since the last copy (so the insert length's price is paid with
+  the copy, exactly) and the ring of its own path (so a ring distance is a short code). Prices come
+  from histograms of an earlier parse: parse 0 is greedy (the gain rule of `.default`, over the same
+  candidates), parse 1 is priced from it, parse 2 from parse 1; literals by the block's own context
+  model (`chooseLiteralModel` on the previous parse), command symbols and the four distance contexts
+  by their counts (a symbol the previous parse never used costs two bits more than a share of one).
+  A copy of 325 bytes or more is taken whole and its inside is not searched (a long run would cost
+  its length squared). All three parses are written and **the shortest as written wins** — the
+  estimate is not the code that comes out: on `monkey` the greedy parse beat the refits. Each block
+  costs three writes more. A fourth/fifth pass gave nothing (`alice29.txt` 48 603 vs 48 608).
+- **Static-dictionary words** (2026-10-15, `.max`; RFC 7932 §8): a word of 4..24 bytes with a transform
+  is named by the distance `max_distance + 1 + (transform << size_bits[len]) + index` (explicit code,
+  never a short one, ring untouched), with the word's length as the copy length; the command's
+  `out_len` is what the transform produces. The search keeps an index of the 13 504 words by their
+  first four bytes folded to lower case, and for each prefix string that the position starts with
+  looks the word up and checks the suffix and the cut/upper-cased form; every candidate is confirmed
+  by the decoder's own `transformWord`. Searched: identity, OMIT_LAST_1..9, UPPERCASE_FIRST,
+  UPPERCASE_ALL with all 50 prefix/suffix strings — 113 of 121 transforms; the 8 OMIT_FIRST ones would
+  need a suffix index (not done: a few of q11's 1 837 references on `alice29.txt` are of them).
+  Not with a prefix dictionary (there distances are counted from its end). Measured on
+  `alice29.txt`: 48 608 → 47 001 B, the largest single step of R2 (q11 puts 1 837 words there, ~13 KB
+  of the 152 KB); `SPEC.md` (this file) −6.4 %.
+- **Measured vs google/brotli 1.2.0** (`alice29.txt`): `.max` 46 935 B against q10 47 477 and q11
+  46 487 (**+0.96 %**; R2's target was ≤ 2 %); `monkey` 416 (q11 405), `cp852-utf8` 380 (362): small
+  inputs are where the estimate-priced parse is weakest. Time 0.5 s for 152 KB (`.best`: 20 ms).
+
 Deliberately *not* implemented, each costing some ratio: block splitting (`NBLTYPES` is always 1),
-static-dictionary references, `NPOSTFIX`/`NDIRECT` tuning, an optimal (cost-model) parse.
+`NPOSTFIX`/`NDIRECT` tuning, OMIT_FIRST dictionary transforms, dictionary words below `.max`.
 
 - **Raw prefix dictionary** (2026-10-14; `CompressOptions.dictionary`, `StreamOptions.dictionary`):
   the match finder's history is `dictionary ++ input`; the dictionary's positions are inserted first
@@ -192,12 +226,12 @@ static-dictionary references, `NPOSTFIX`/`NDIRECT` tuning, an optimal (cost-mode
   alone, so literal contexts start from zeros as the decoder's. The stream keeps the dictionary at
   its history's start through slides. Sizes on the interop `dict_*` cases: `.default` within
   q5–q9 of libbrotli, `.best` below q9 on all five (q11 3–11 % smaller). Blessed by libbrotli 1.2.0:
-  15 streams (5 cases × 3 efforts), frozen and replayed.
+  20 streams (5 cases × 4 efforts), frozen and replayed.
 - **Large window** (2026-10-14): `window_bits` above 24, to 30, makes a large-window stream (RFC
   9841 §6): the 14-bit header, distance codes up to the 74th (to 0x7FFFFFFC), simple distance codes
   with 8-bit symbols (the 140-symbol alphabet the decoder reads them as from). Only decoders that
-  ask for it accept it — not a browser's `br`. Blessed by libbrotli 1.2.0 on three cases × fast and
-  default (a copy from 17 MiB back at WBITS 25 and 30).
+  ask for it accept it — not a browser's `br`. Blessed by libbrotli 1.2.0 on three cases × fast,
+  default and max (a copy from 17 MiB back at WBITS 25 and 30).
 - **`dcb`** (RFC 9842 §4, `brotli.dcb`): `header(dict)` = `ff 44 43 42` + SHA-256(dict);
   `compress`/`decompress` put/check it around a dictionary stream; a streamed body is the header
   then a `StreamWriter` with the dictionary. Our windows are ≤ 16 MiB, as `dcb` requires.
@@ -206,13 +240,15 @@ static-dictionary references, `NPOSTFIX`/`NDIRECT` tuning, an optimal (cost-mode
 
 Ours at each effort vs. the reference (bytes; ReleaseFast, 2026-09-30):
 
-| input | raw | fast | **default** | best | ref q1 | ref q5 | ref q9 | ref q11 |
-|---|---|---|---|---|---|---|---|---|
-| `alice29.txt` | 152 089 | 54 285 | **51 467** | 50 736 | 60 292 | 52 809 | 51 054 | 46 487 |
-| `monkey` | 843 | 421 | **387** | 387 | 464 | 426 | — | 405 |
-| `cp852-utf8` | 706 | 536 | **436** | 436 | 566 | 482 | — | 362 |
-| `zeros` | 262 144 | 27 | **27** | 27 | 47 | 13 | — | 14 |
-| `random_org_10k.bin` | 10 000 | 10 004 | **10 004** | 10 004 | 10 004 | 10 004 | — | 10 004 |
+| input | raw | fast | **default** | best | max | ref q1 | ref q5 | ref q9 | ref q11 |
+|---|---|---|---|---|---|---|---|---|---|
+| `alice29.txt` | 152 089 | 55 580 | **51 327** | 50 536 | 46 935 | 60 292 | 52 809 | 51 054 | 46 487 |
+| `monkey` | 843 | 470 | **421** | 421 | 416 | 464 | 426 | 423 | 405 |
+| `cp852-utf8` | 706 | 540 | **436** | 436 | 380 | 566 | 482 | 483 | 362 |
+| `zeros` | 262 144 | 27 | **27** | 27 | 27 | 47 | 13 | 13 | 14 |
+| `random_org_10k.bin` | 10 000 | 10 004 | **10 004** | 10 004 | 10 004 | 10 004 | 10 004 | 10 004 | 10 004 |
+
+(Table re-taken 2026-10-15; the 2026-09-30 one had `fast` before the `FastMatcher` and no `max`.)
 
 Before 2026-09-30 the one setting gave `alice29.txt` 54 605, `cp852-utf8` 536, `zeros` 651. Time on
 `alice29.txt`: 7 ms fast, 17 ms default, 24 ms best (was 7 ms) — since 2026-10-14 `.fast` gives
@@ -244,7 +280,7 @@ larger than its input, and `compress` itself never fails except on allocation.
   last block waits for `finish` to be ISLAST. Without a flush the stream is byte-identical to
   `compressWith` with the same `window_bits` and `block_size` (for an input of at least the window —
   `compressWith` sizes its table to a smaller input), for every write cut and buffer length
-  (`stream_writer.zig` tests: three efforts × buffers 1 B–64 KiB × writes 7 B–300 KB, history slid
+  (`stream_writer.zig` tests: four efforts × buffers 1 B–64 KiB × writes 7 B–300 KB, history slid
   under a 64 KiB window).
 - **`size_hint`:** the match finder's table sized for the expected length rather than the window
   (`.fast` 1 MiB, `.default` 2 MiB at a 22-bit window); `reset` keeps the table while its size stays.
@@ -461,7 +497,7 @@ larger than its input, and `compress` itself never fails except on allocation.
 Order: P (encoder hasher) → R1 (+R3–R5) → R6/R8 → R9 (+R10/R11) → R7 → R2.
 
 - ~~**R1 Streaming encoder**~~ — **DONE 2026-10-14** as `StreamWriter` (§ Streaming encoder): flush / finish / reset, byte-identical to `compressWith` without flushes. Unblocks dynamic `br` in qap (gzip + zstd only today). Left: a block's prefix codes still take short-lived allocations per block (also one-shot) — a warm writer is not allocation-free yet.
-- **R2 `.max` effort ≈ q10/q11** — optimal parse + block splitting (static-dictionary references last), target ≤ 2 % behind q11 on the corpus; plus `Effort.fromQuality(0..11)` for ports from quality-level APIs.
+- ~~**R2 `.max` effort ≈ q10/q11**~~ — **DONE 2026-10-15** (§ Encoder: shortest-path parse, static-dictionary words, distance contexts): `alice29.txt` +0.96 % over q11. Left, none needed for the target: block splitting (literal/command/distance block types), NPOSTFIX/NDIRECT, OMIT_FIRST transforms, a better start for small inputs; `Effort.fromQuality(0..11)` for ports from quality-level APIs (not done: four efforts, not twelve qualities — "twelve bit-identical qualities" is deliberately not a goal).
 - **R3 Encoder parameters** — ~~`window_bits` (10..24)~~ **done 2026-10-14** (`CompressOptions.window_bits`, `StreamOptions.window_bits`); ~~`size_hint`~~ **done 2026-10-14** (`StreamOptions.size_hint`: the table sized for the expected length — a short response no longer clears a 1–2 MiB table — and, given the exact length, the stream is `compressWith`'s bytes for any input). Left, deliberately not now: `mode` (google's text/font hints steer its context-mode choice and NPOSTFIX/NDIRECT; ours picks the context mode by cost per block and has no NPOSTFIX tuning, so a mode would have nothing to steer) and literal context modelling on/off (an effort choice already: `.fast` has none) — wait for a consumer asking.
 - ~~**R4 `maxCompressedSize(n)` + `compressInto(out, …)`**~~ — **DONE 2026-10-14**: `maxCompressedSize(n, opts)` (every block stored + the final empty meta-block; reached exactly by random input, tested over windows and block sizes) and `compressInto(gpa, out, input, opts)` — the `compressWith` stream in the caller's buffer, `error.OutputTooLarge` only when that stream does not fit (tested on the whole corpus × efforts at its exact length and one byte less). A block whose attempt overruns the buffer is decided again in a scratch writer, so a tight buffer never changes the bytes.
 - ~~**R5 Metadata meta-blocks from the encoder**~~ — **DONE 2026-10-14**: `StreamWriter.writeMetadata(bytes)` (google's `EMIT_METADATA`): a flush, then metadata meta-blocks of up to 16 MiB each (shortest MSKIPBYTES); blessed by google/brotli (`stream_metadata` variant).

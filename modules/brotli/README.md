@@ -13,11 +13,12 @@ Brotli, so an HTTPS server that wants `br` needs this.
   Byte-exact against the google/brotli reference vectors.
 - **Encoder:** LZ77 backward references + a per-meta-block Huffman code for
   literals, insert-and-copy commands and distances, with literal context
-  modelling (`.default`/`.best`), distance short codes, and an automatic
-  **store-mode fallback** so the output is never meaningfully larger than the
-  input. ~3x on English text (`alice29.txt` 152 089 -> 51 467 at `.default`),
-  between reference `brotli` quality 5 and 9. No block splitting, no
-  static-dictionary references, no optimal parse — see `SPEC.md`.
+  modelling (`.default`/`.best`/`.max`), distance short codes and contexts, and
+  an automatic **store-mode fallback** so the output is never meaningfully
+  larger than the input. ~3x on English text (`alice29.txt` 152 089 -> 51 327
+  at `.default`, between reference `brotli` quality 5 and 9; 46 935 at `.max`,
+  within 1 % of quality 11: shortest-path parse + static-dictionary words).
+  No block splitting — see `SPEC.md`.
 - **Platform:** any (pure logic, no OS calls). **Role:** util.
   **Concurrency:** reentrant (no shared state). **Allocation:** explicit
   allocator; decode output is caller-owned, per-meta-block scratch is arena-freed.
@@ -59,8 +60,9 @@ const line = try d.reader.takeDelimiterInclusive('\n');   // ReadFailed? see d.e
 // stored verbatim, so the result is always a valid `br` body.
 const br = try brotli.compress(gpa, data);                    // effort .default
 defer gpa.free(br);
-// .fast (≈ reference q4), .default (≈ q6), .best (≈ q9, for content
-// compressed once and served many times); window_bits 10..24 (default: 16
+// .fast (≈ reference q4), .default (≈ q6), .best (≈ q9), .max (≈ q10–q11,
+// several times slower: for content compressed once and served many times);
+// window_bits 10..24 (default: 16
 // for inputs up to 64 KiB, else 21).
 const br_best = try brotli.compressWith(gpa, data, .{ .effort = .best });
 

@@ -299,7 +299,7 @@ test "without a flush: the bytes compressWith gives, whatever the writes and the
     text(src, 0x51);
     // A 64 KiB window over 300 KB slides the history several times; blocks
     // of 40 000 bytes cut it into eight, the last one short.
-    inline for (.{ encoder.Effort.fast, .default, .best }) |effort| {
+    inline for (.{ encoder.Effort.fast, .default, .best, .max }) |effort| {
         const opts: StreamOptions = .{ .effort = effort, .window_bits = 16, .block_size = 40_000 };
         const want = try encoder.compressWith(gpa, src, .{ .effort = effort, .window_bits = 16, .block_size = 40_000 });
         defer gpa.free(want);
@@ -509,7 +509,7 @@ test "size_hint: a table for the input, and compressWith's bytes for a short one
     var out: Writer.Allocating = .init(gpa);
     defer out.deinit();
     var buf: [512]u8 = undefined;
-    inline for (.{ encoder.Effort.fast, .default, .best }) |effort| {
+    inline for (.{ encoder.Effort.fast, .default, .best, .max }) |effort| {
         const want = try encoder.compressWith(gpa, src, .{ .effort = effort, .window_bits = 22 });
         defer gpa.free(want);
         out.clearRetainingCapacity();
@@ -543,7 +543,7 @@ test "a raw prefix dictionary: compressWith's bytes, and every decoder's round t
     text(src, 0x58);
     const dict = src[0..30_000];
     const input = src[20_000..];
-    inline for (.{ encoder.Effort.fast, .default, .best }) |effort| {
+    inline for (.{ encoder.Effort.fast, .default, .best, .max }) |effort| {
         const plain_one = try encoder.compressWith(gpa, input, .{ .effort = effort, .window_bits = 16 });
         defer gpa.free(plain_one);
         const want = try encoder.compressWith(gpa, input, .{ .effort = effort, .window_bits = 16, .dictionary = dict });

@@ -60,6 +60,8 @@
 const std = @import("std");
 const huffman = @import("huffman.zig");
 const tables = @import("tables.zig");
+const dictionary = @import("dictionary.zig");
+const transforms = @import("transforms.zig");
 const BrotliError = @import("errors.zig").BrotliError;
 
 // ---------------------------------------------------------------------------
@@ -1062,7 +1064,52 @@ const Matcher = struct {
         if (best_len == 0) return null;
         return .{ .len = @intCast(best_len), .dist = @intCast(best_dist), .gain = best_gain };
     }
+
+    /// Every copy for `p` that is longer than any nearer one (so the
+    /// candidates' lengths rise and their distances too), as `find` walks the
+    /// bucket: what a shortest-path parse chooses from (`.max`). Returns how
+    /// many of `out` are set.
+    fn collect(self: *const Matcher, comptime px: bool, p: usize, max_dist: usize, limit: usize, out: *[max_cands]Cand) usize {
+        if (p + min_match > limit) return 0;
+        const max_len = @min(limit - p, max_match);
+        const h = self.hash(p);
+        const n = self.count[h];
+        const valid = if (n < self.depth) n else self.depth;
+        const bucket = self.slots[h << self.depth_log ..][0..self.depth];
+        var found: usize = 0;
+        var best_len: usize = 0;
+        var k: u32 = 0;
+        while (k < valid) : (k += 1) {
+            const c: usize = bucket[(n -% 1 -% k) & (self.depth - 1)];
+            if (c >= p) continue;
+            var d = p - c;
+            var cap: usize = max_len;
+            if (px and c < self.prefix.len) {
+                const r = self.prefix.reach(p, c, max_dist, max_len) orelse continue;
+                d = r.d;
+                cap = r.cap;
+            } else if (d > max_dist) {
+                if (px) continue;
+                break;
+            }
+            if (best_len == 0 or self.data[c + best_len] == self.data[p + best_len]) {
+                const l = matchLen(self.data, c, p, cap);
+                if (l >= min_match and l > best_len) {
+                    out[found] = .{ .len = @intCast(l), .dist = @intCast(d) };
+                    found += 1;
+                    best_len = l;
+                    if (l == max_len or found == max_cands) break;
+                }
+            }
+        }
+        return found;
+    }
 };
+
+/// A copy `Matcher.collect` found: length and the decoder's distance.
+const Cand = struct { len: u32, dist: u32 };
+/// Most candidates kept for a position.
+const max_cands = 48;
 
 // `.fast` has a match finder of its own (2026-10-14). `Matcher` keeps a count
 // per bucket to know which slots are written and walks them newest first: a
@@ -1199,8 +1246,19 @@ const FastMatcher = struct {
 /// noticing MLEN is exhausted, so they are written, but no copy is performed.
 const Cmd = struct {
     insert_len: u32,
+    /// The length the command's symbol names: the copy's, or — for a
+    /// dictionary word (`out_len != 0`) — the word's.
     copy_len: u32,
     dist: u32,
+    /// Zero for a copy. For a static-dictionary word (RFC 7932 §8, `.max`):
+    /// the bytes its transformed form produces; `dist` then names the word
+    /// (`dictDistance`), beyond everything a copy can reach.
+    out_len: u32 = 0,
+
+    /// Bytes of output the command's copy part produces.
+    fn produced(c: Cmd) u32 {
+        return if (c.out_len != 0) c.out_len else c.copy_len;
+    }
 };
 
 /// Greedy + one-step-lazy parse of `input[start..end)`. Matches may reach back
@@ -1369,6 +1427,544 @@ const max_literal_trees = 16;
 /// tried (`chooseLiteralModel`).
 const ascii_pct = 95;
 
+// ---------------------------------------------------------------------------
+// `.max`: a shortest-path parse. Every position keeps the cheapest way to have
+// reached it (a literal from the one before, or the end of a copy), priced
+// from histograms of an earlier parse of the same block — the literal prices
+// by the block's own context model — and the path from the end back is the
+// commands. Positions are priced forward, so each node also carries the last
+// four distances of its path: a copy at one of them is named by a short code.
+// The price of a command's insert length is paid when the copy is taken (the
+// node knows how many literals precede it), not per literal.
+
+/// A copy at least this long is taken whole: its shorter forms and the
+/// positions inside it are not looked at (a long run would otherwise cost
+/// its length squared).
+const max_take_len = 325;
+/// Parses of a block: a greedy one from the candidates, then each priced
+/// from the commands of the one before; the shortest written wins.
+const max_parses = 3;
+/// What a symbol the previous parse never used costs, above its share of the
+/// block: it would be new to the code.
+const unseen_extra_bits = 2.0;
+
+// Static-dictionary words (RFC 7932 §8): a word of 4..24 bytes with one of
+// the 121 transforms — a prefix and a suffix around the word or a cut or
+// upper-cased form of it — is named by a distance past everything a copy
+// reaches: `max_distance + 1 + (transform << size_bits[len]) + word index`,
+// with the word's length as the copy length. On text a good share of the
+// words are there (q11 on alice29: 1 837 of them, ~13 KB of 152 KB). The
+// search finds, at a position, the words whose transformed form is the bytes
+// there; the transforms that cut the front of a word (OMIT_FIRST_n) are not
+// searched — they would need a suffix index.
+
+/// Bits of the hash of a word's first four bytes (case folded).
+const dict_hash_bits = 14;
+/// Shortest transformed word worth a candidate: a dictionary reference costs
+/// ~30 bits, five literals of text ~22.
+const min_dict_out = 5;
+const max_dict_cands = 24;
+
+const DictCand = struct { n: u8, wl: u8, t: u8, idx: u16 };
+
+/// Transforms of each prefix id whose type the search handles (identity,
+/// OMIT_LAST_n, UPPERCASE_FIRST / ALL).
+const dict_groups: struct { ids: [50][transforms.num_transforms]u8, counts: [50]u8 } = blk: {
+    var ids: [50][transforms.num_transforms]u8 = undefined;
+    var counts: [50]u8 = @splat(0);
+    for (0..transforms.num_transforms) |t| {
+        const pid = transforms.transforms_data[t * 3];
+        const ty = transforms.transforms_data[t * 3 + 1];
+        if (ty > 11) continue;
+        ids[pid][counts[pid]] = @intCast(t);
+        counts[pid] += 1;
+    }
+    break :blk .{ .ids = ids, .counts = counts };
+};
+
+fn affix(id: u8) []const u8 {
+    const off = transforms.prefix_suffix_map[id];
+    return transforms.prefix_suffix[off + 1 ..][0..transforms.prefix_suffix[off]];
+}
+
+const DictSearch = struct {
+    heads: []u32,
+    next: []u32,
+    wlen: []u8,
+    widx: []u16,
+
+    const n_words = blk: {
+        var n: usize = 0;
+        for (dictionary.size_bits_by_length) |b| {
+            if (b != 0) n += @as(usize, 1) << b;
+        }
+        break :blk n;
+    };
+
+    fn foldKey(b: []const u8) u32 {
+        var v: u32 = 0;
+        for (0..4) |k| {
+            var c = b[k];
+            if (c >= 'A' and c <= 'Z') c += 32;
+            v |= @as(u32, c) << @intCast(8 * k);
+        }
+        return (v *% 0x9e3779b1) >> (32 - dict_hash_bits);
+    }
+
+    fn init(gpa: std.mem.Allocator) std.mem.Allocator.Error!DictSearch {
+        const heads = try gpa.alloc(u32, 1 << dict_hash_bits);
+        errdefer gpa.free(heads);
+        const next = try gpa.alloc(u32, n_words);
+        errdefer gpa.free(next);
+        const wlen = try gpa.alloc(u8, n_words);
+        errdefer gpa.free(wlen);
+        const widx = try gpa.alloc(u16, n_words);
+        @memset(heads, 0);
+        var wid: usize = 0;
+        for (dictionary.min_word_length..dictionary.max_word_length + 1) |n| {
+            const bits = dictionary.size_bits_by_length[n];
+            if (bits == 0) continue;
+            for (0..@as(usize, 1) << @intCast(bits)) |idx| {
+                const word = dictionary.data[dictionary.offsets_by_length[n] + idx * n ..][0..n];
+                const k = foldKey(word);
+                wlen[wid] = @intCast(n);
+                widx[wid] = @intCast(idx);
+                next[wid] = heads[k];
+                heads[k] = @intCast(wid + 1);
+                wid += 1;
+            }
+        }
+        return .{ .heads = heads, .next = next, .wlen = wlen, .widx = widx };
+    }
+
+    fn deinit(self: *DictSearch, gpa: std.mem.Allocator) void {
+        gpa.free(self.heads);
+        gpa.free(self.next);
+        gpa.free(self.wlen);
+        gpa.free(self.widx);
+    }
+
+    /// The (word, transform) pairs whose output is `data[p..]`'s start, the
+    /// output ending at `limit` at most.
+    fn find(self: *const DictSearch, data: []const u8, p: usize, limit: usize, out: *[max_dict_cands]DictCand) usize {
+        var found: usize = 0;
+        for (dict_groups.counts, 0..) |cnt, pid| {
+            if (cnt == 0) continue;
+            const pre = affix(@intCast(pid));
+            if (p + pre.len + 4 > limit) continue;
+            if (!std.mem.eql(u8, data[p..][0..pre.len], pre)) continue;
+            const q = p + pre.len;
+            var w = self.heads[foldKey(data[q..][0..4])];
+            while (w != 0) : (w = self.next[w - 1]) {
+                const n: usize = self.wlen[w - 1];
+                const idx: usize = self.widx[w - 1];
+                const word = dictionary.data[dictionary.offsets_by_length[n] + idx * n ..][0..n];
+                for (dict_groups.ids[pid][0..cnt]) |t| {
+                    const ty = transforms.transforms_data[@as(usize, t) * 3 + 1];
+                    const omit: usize = if (ty <= 9) ty else 0;
+                    if (n < omit + 4) continue;
+                    const m = n - omit;
+                    const suf = affix(transforms.transforms_data[@as(usize, t) * 3 + 2]);
+                    const wl = pre.len + m + suf.len;
+                    if (wl < min_dict_out or p + wl > limit) continue;
+                    if (!std.mem.eql(u8, data[q + m ..][0..suf.len], suf)) continue;
+                    if (ty <= 9) {
+                        if (!std.mem.eql(u8, data[q..][0..m], word[0..m])) continue;
+                    } else {
+                        // Upper-cased: a first (or every) letter a capital.
+                        var ok = data[q] >= 'A' and data[q] <= 'Z';
+                        var j: usize = 1;
+                        while (ok and j < m) : (j += 1) {
+                            ok = if (ty == 10) data[q + j] == word[j] else data[q + j] == word[j] or (word[j] >= 'a' and word[j] <= 'z' and data[q + j] == word[j] - 32);
+                        }
+                        if (!ok) continue;
+                    }
+                    // The decoder's own transform decides.
+                    var tmp: [transforms.maxOutputLen(dictionary.max_word_length)]u8 = undefined;
+                    const got = transforms.transformWord(&tmp, word, n, t);
+                    if (got != wl or !std.mem.eql(u8, tmp[0..got], data[p..][0..got])) continue;
+                    out[found] = .{ .n = @intCast(n), .wl = @intCast(wl), .t = t, .idx = @intCast(idx) };
+                    found += 1;
+                    if (found == max_dict_cands) return found;
+                }
+            }
+        }
+        return found;
+    }
+};
+
+const OptNode = struct {
+    cost: f32,
+    /// Where the path came from: the start of the copy, or the position
+    /// before a literal.
+    from: u32,
+    /// Copy length; 0 for a literal.
+    len: u32,
+    dist: u32,
+    /// Literals since the last copy on this path.
+    ins: u32,
+    ring: [4]u32,
+    /// A dictionary word's length (`len` is what its transform produces);
+    /// 0 for a copy or a literal.
+    word: u8 = 0,
+};
+
+const OptCosts = struct {
+    cmd: [tables.num_command_symbols]f32,
+    dist: [dist_contexts][dist_alphabet_large]f32,
+    lit: [max_literal_trees][tables.num_literal_symbols]f32,
+};
+
+/// `-log2(share)` of each count; a count of zero costs `unseen_extra_bits`
+/// more than a share of one in the total.
+fn bitsOf(counts: []const u32, out: []f32, flat: f32) void {
+    var total: u64 = 0;
+    for (counts) |c| total += c;
+    if (total == 0) {
+        @memset(out, flat);
+        return;
+    }
+    const lt = @log2(@as(f32, @floatFromInt(total)));
+    for (counts, out) |c, *o| o.* = if (c == 0) lt + unseen_extra_bits else lt - @log2(@as(f32, @floatFromInt(c)));
+}
+
+/// Prices from `cmds`: the symbols a block of them would use, as
+/// `writeCompressedBlock` resolves them.
+fn fitCosts(gpa: std.mem.Allocator, costs: *OptCosts, cmds: []const Cmd, ring0: DistRing, n_dist: usize, model: *const LiteralModel) std.mem.Allocator.Error!void {
+    const cmd_h = try gpa.alloc(u32, tables.num_command_symbols);
+    defer gpa.free(cmd_h);
+    @memset(cmd_h, 0);
+    var dist_h: [dist_contexts][dist_alphabet_large]u32 = @splat(@splat(0));
+    var ring = ring0;
+    for (cmds) |c| {
+        const ic = lengthCode(&cmd_tables.insert_off, &cmd_tables.insert_nbits, c.insert_len) orelse continue;
+        const cl: u32 = if (c.copy_len == 0) cmd_tables.copy_off[0] else c.copy_len;
+        const cc = lengthCode(&cmd_tables.copy_off, &cmd_tables.copy_nbits, cl) orelse continue;
+        // A dictionary word is never named by a short code and leaves the
+        // ring alone.
+        const short: ?u16 = if (c.copy_len != 0 and c.out_len == 0) ring.shortCode(c.dist) else null;
+        const implicit = cmd_tables.implicit[ic.code][cc.code];
+        const use_implicit = implicit != 0xffff and (c.copy_len == 0 or short == 0);
+        cmd_h[if (use_implicit) implicit else cmd_tables.sym[ic.code][cc.code]] += 1;
+        if (c.copy_len != 0) {
+            if (!use_implicit) {
+                const s = short orelse (distanceCode(c.dist, n_dist) orelse continue).sym;
+                dist_h[distContext(c.copy_len)][s] += 1;
+            }
+            if (c.out_len == 0) ring.update(c.dist, short);
+        }
+    }
+    bitsOf(cmd_h, &costs.cmd, 8);
+    for (&dist_h, &costs.dist) |*h, *o| bitsOf(h[0..n_dist], o[0..n_dist], 6);
+    for (model.counts[0..model.ntrees], 0..) |*h, t| bitsOf(h, &costs.lit[t], 8);
+}
+
+/// Relax the copies of lengths `lo..hi` (inclusive) at distance `d` from
+/// node `i`: one command each, priced with the node's insert length `ic` and
+/// ring.
+fn relaxCopies(
+    nodes: []OptNode,
+    costs: *const OptCosts,
+    nd: OptNode,
+    ic: LenCode,
+    i: usize,
+    lo: u32,
+    hi: u32,
+    d: u32,
+    n_dist: usize,
+) void {
+    const ring: DistRing = .{ .last = nd.ring };
+    const short = ring.shortCode(d);
+    var dist_bits: [dist_contexts]f32 = undefined;
+    if (short) |s| {
+        for (&dist_bits, costs.dist) |*b, row| b.* = row[s];
+    } else {
+        const dc = distanceCode(d, n_dist) orelse return;
+        for (&dist_bits, costs.dist) |*b, row| b.* = row[dc.sym] + @as(f32, @floatFromInt(dc.nbits));
+    }
+    const new_ring: [4]u32 = if (d == nd.ring[0]) nd.ring else .{ d, nd.ring[0], nd.ring[1], nd.ring[2] };
+    var l = lo;
+    while (l <= hi) : (l += 1) {
+        const cc = lengthCode(&cmd_tables.copy_off, &cmd_tables.copy_nbits, l) orelse continue;
+        const implicit = cmd_tables.implicit[ic.code][cc.code];
+        var bits: f32 = @floatFromInt(@as(u32, ic.nbits) + cc.nbits);
+        if (implicit != 0xffff and short == 0) {
+            bits += costs.cmd[implicit];
+        } else {
+            bits += costs.cmd[cmd_tables.sym[ic.code][cc.code]] + dist_bits[distContext(l)];
+        }
+        const c = nd.cost + bits;
+        const t = &nodes[i + l];
+        if (c < t.cost) t.* = .{ .cost = c, .from = @intCast(i), .len = l, .dist = d, .ins = 0, .ring = new_ring };
+    }
+}
+
+/// Relax the dictionary word `dc` at node `i`, named by the distance `d`.
+fn relaxWord(nodes: []OptNode, costs: *const OptCosts, nd: OptNode, ic: LenCode, i: usize, dc: DictCand, d: u32, n_dist: usize) void {
+    const cc = lengthCode(&cmd_tables.copy_off, &cmd_tables.copy_nbits, dc.n) orelse return;
+    const dcode = distanceCode(d, n_dist) orelse return;
+    const bits = @as(f32, @floatFromInt(@as(u32, ic.nbits) + cc.nbits + dcode.nbits)) +
+        costs.cmd[cmd_tables.sym[ic.code][cc.code]] + costs.dist[distContext(dc.n)][dcode.sym];
+    const c = nd.cost + bits;
+    const t = &nodes[i + dc.wl];
+    if (c < t.cost) t.* = .{ .cost = c, .from = @intCast(i), .len = dc.wl, .dist = d, .ins = 0, .ring = nd.ring, .word = dc.n };
+}
+
+/// A copy `greedyParse` chose and its estimated saving in bits.
+const Pick = struct { len: u32, dist: u32, gain: f32 };
+
+/// A greedy, one-step-lazy parse over the candidates `collect` found: what
+/// `buildCommands` makes, without a match finder of its own. The first
+/// contender of `.max` (a small block is often best served by it) and the
+/// prices of the next.
+fn greedyParse(
+    gpa: std.mem.Allocator,
+    data: []const u8,
+    start: usize,
+    end: usize,
+    x: Prefix,
+    max_dist: usize,
+    offs: []const u32,
+    cands: []const Cand,
+    ring0: DistRing,
+    out: *std.ArrayListUnmanaged(Cmd),
+) std.mem.Allocator.Error!void {
+    const lit_cost = literalCost(data[start..end], 1);
+    var ring = ring0;
+    var p = start;
+    var lit_start = start;
+    var pending: ?Pick = null;
+    while (p < end) {
+        const here: ?Pick = pending orelse bestAt(data, start, end, x, max_dist, offs, cands, &ring, p, lit_cost);
+        pending = null;
+        const m = here orelse {
+            p += 1;
+            continue;
+        };
+        if (p + 1 < end) {
+            if (bestAt(data, start, end, x, max_dist, offs, cands, &ring, p + 1, lit_cost)) |b| {
+                if (b.gain > m.gain + lit_cost) {
+                    pending = b;
+                    p += 1;
+                    continue;
+                }
+            }
+        }
+        try out.append(gpa, .{ .insert_len = @intCast(p - lit_start), .copy_len = m.len, .dist = m.dist });
+        if (m.dist != ring.last[0]) ring.update(m.dist, null);
+        p += m.len;
+        lit_start = p;
+    }
+    if (lit_start < end) try out.append(gpa, .{ .insert_len = @intCast(end - lit_start), .copy_len = 0, .dist = 0 });
+}
+
+/// The candidate at `p` that saves the most bits (`Matcher.gain`'s estimate),
+/// or a copy at one of the ring's two last distances.
+fn bestAt(
+    data: []const u8,
+    start: usize,
+    end: usize,
+    x: Prefix,
+    max_dist: usize,
+    offs: []const u32,
+    cands: []const Cand,
+    ring: *const DistRing,
+    p: usize,
+    lit_cost: f32,
+) ?Pick {
+    var best: ?Pick = null;
+    var best_gain: f32 = 0;
+    const max_len = @min(end - p, max_match);
+    const reach = x.outMax(p, max_dist);
+    if (p + 4 <= end) {
+        const head: u32 = std.mem.readInt(u32, data[p..][0..4], .little) & 0xffffff;
+        for (ring.last[0..2], 0..) |d, i| {
+            if (d == 0 or d > reach) continue;
+            if (std.mem.readInt(u32, data[p - d ..][0..4], .little) & 0xffffff != head) continue;
+            const l = Matcher.matchLen(data, p - d, p, max_len);
+            if (l < min_ring_match) continue;
+            const g = @as(f32, @floatFromInt(l)) * lit_cost - @as(f32, if (i == 0) 3 else 5);
+            if (g > best_gain) {
+                best_gain = g;
+                best = .{ .len = @intCast(l), .dist = d, .gain = g };
+            }
+        }
+    }
+    for (cands[offs[p - start]..offs[p - start + 1]]) |c| {
+        const dist_bits: f32 = @floatFromInt(std.math.log2_int(u32, c.dist));
+        const g = @as(f32, @floatFromInt(c.len)) * lit_cost - dist_bits - 6;
+        if (g > best_gain) {
+            best_gain = g;
+            best = .{ .len = c.len, .dist = c.dist, .gain = g };
+        }
+    }
+    return best;
+}
+
+/// The shortest-path parse of `data[start..end)` for `.max`: `max_parses`
+/// passes, each priced from the commands of the one before. Matches may reach
+/// back before `start` but never past `end`.
+fn buildCommandsOptimal(
+    comptime px: bool,
+    gpa: std.mem.Allocator,
+    matcher: *Matcher,
+    start: usize,
+    end: usize,
+    max_dist: usize,
+    ring0: DistRing,
+    n_dist: usize,
+    parses: *[max_parses]std.ArrayListUnmanaged(Cmd),
+) std.mem.Allocator.Error!void {
+    const n = end - start;
+    const x = matcher.prefix;
+    const data = matcher.data;
+
+    // Every position's candidates, found once. A copy of `max_take_len` is
+    // taken whole, so the positions inside it get none.
+    const offs = try gpa.alloc(u32, n + 1);
+    defer gpa.free(offs);
+    var cands: std.ArrayListUnmanaged(Cand) = .empty;
+    defer cands.deinit(gpa);
+    var buf: [max_cands]Cand = undefined;
+    // Dictionary words (not with a prefix dictionary: the distances there
+    // are counted from its end).
+    var dsearch: ?DictSearch = if (px) null else try DictSearch.init(gpa);
+    defer if (dsearch) |*d| d.deinit(gpa);
+    const doffs = try gpa.alloc(u32, n + 1);
+    defer gpa.free(doffs);
+    var dcands: std.ArrayListUnmanaged(DictCand) = .empty;
+    defer dcands.deinit(gpa);
+    var dbuf: [max_dict_cands]DictCand = undefined;
+    var p = start;
+    while (p < end) {
+        offs[p - start] = @intCast(cands.items.len);
+        doffs[p - start] = @intCast(dcands.items.len);
+        const found = matcher.collect(px, p, x.outMax(p, max_dist), end, &buf);
+        try cands.appendSlice(gpa, buf[0..found]);
+        var step: usize = 1;
+        if (found > 0 and buf[found - 1].len >= max_take_len) {
+            step = buf[found - 1].len;
+        } else if (dsearch) |*d| {
+            const nd = d.find(data, p, end, &dbuf);
+            try dcands.appendSlice(gpa, dbuf[0..nd]);
+        }
+        matcher.insert(p);
+        var q = p + 1;
+        while (q < p + step) : (q += 1) {
+            offs[q - start] = @intCast(cands.items.len);
+            doffs[q - start] = @intCast(dcands.items.len);
+            matcher.insert(q);
+        }
+        p += step;
+    }
+    offs[n] = @intCast(cands.items.len);
+    doffs[n] = @intCast(dcands.items.len);
+
+    const nodes = try gpa.alloc(OptNode, n + 1);
+    defer gpa.free(nodes);
+    const lit_cost = try gpa.alloc(f32, n);
+    defer gpa.free(lit_cost);
+    const model = try gpa.create(LiteralModel);
+    defer gpa.destroy(model);
+    const costs = try gpa.create(OptCosts);
+    defer gpa.destroy(costs);
+
+    // The first parse: greedy, by the saving per candidate.
+    parses[0].clearRetainingCapacity();
+    try greedyParse(gpa, data, start, end, x, max_dist, offs, cands.items, ring0, &parses[0]);
+
+    const inf = std.math.inf(f32);
+    var pass: usize = 1;
+    while (pass < max_parses) : (pass += 1) {
+        const out = &parses[pass];
+        out.clearRetainingCapacity();
+        const prev = parses[pass - 1].items;
+        try chooseLiteralModel(gpa, data[x.len..], start - x.len, prev, .max, model);
+        try fitCosts(gpa, costs, prev, ring0, n_dist, model);
+        for (model.counts[0..model.ntrees], 0..) |*h, t| bitsOf(h, &costs.lit[t], 8);
+        for (lit_cost, 0..) |*lc, i| {
+            const q = start + i;
+            const o = q - x.len;
+            const p1: u8 = if (o >= 1) data[q - 1] else 0;
+            const p2: u8 = if (o >= 2) data[q - 2] else 0;
+            lc.* = costs.lit[model.map[contextId(model.mode, p1, p2)]][data[q]];
+        }
+
+        for (nodes) |*nd| nd.cost = inf;
+        nodes[0] = .{ .cost = 0, .from = 0, .len = 0, .dist = 0, .ins = 0, .ring = ring0.last };
+        var i: usize = 0;
+        while (i < n) {
+            const nd = nodes[i];
+            if (nd.cost == inf) {
+                i += 1;
+                continue;
+            }
+            const pos = start + i;
+            const lc = nd.cost + lit_cost[i];
+            if (lc < nodes[i + 1].cost) nodes[i + 1] = .{ .cost = lc, .from = @intCast(i), .len = 0, .dist = 0, .ins = nd.ins + 1, .ring = nd.ring };
+            const ic = lengthCode(&cmd_tables.insert_off, &cmd_tables.insert_nbits, nd.ins) orelse {
+                i += 1;
+                continue;
+            };
+            var take: u32 = 0;
+            var prev_len: u32 = min_match - 1;
+            for (cands.items[offs[i]..offs[i + 1]]) |cd| {
+                if (cd.len <= prev_len) continue;
+                const whole = cd.len >= max_take_len;
+                relaxCopies(nodes, costs, nd, ic, i, if (whole) cd.len else prev_len + 1, cd.len, cd.dist, n_dist);
+                prev_len = cd.len;
+                if (whole) take = cd.len;
+            }
+            // The ring's distances, not only those a bucket named.
+            const reach = x.outMax(pos, max_dist);
+            const max_len = @min(end - pos, max_match);
+            for (nd.ring, 0..) |d, r| {
+                if (pos + 4 > end) break;
+                if (d == 0 or d > reach) continue;
+                if (std.mem.indexOfScalar(u32, nd.ring[0..r], d) != null) continue;
+                const c = pos - d;
+                const head: u32 = std.mem.readInt(u32, data[pos..][0..4], .little) & 0xffffff;
+                if (std.mem.readInt(u32, data[c..][0..4], .little) & 0xffffff != head) continue;
+                const l: u32 = @intCast(Matcher.matchLen(data, c, pos, max_len));
+                if (l < min_ring_match) continue;
+                const whole = l >= max_take_len;
+                relaxCopies(nodes, costs, nd, ic, i, if (whole) l else min_ring_match, l, d, n_dist);
+                if (whole) take = @max(take, l);
+            }
+            for (dcands.items[doffs[i]..doffs[i + 1]]) |dc| {
+                if (i + dc.wl > n) continue;
+                const word_id: u32 = dc.idx + (@as(u32, dc.t) << @intCast(dictionary.size_bits_by_length[dc.n]));
+                relaxWord(nodes, costs, nd, ic, i, dc, @intCast(reach + 1 + word_id), n_dist);
+            }
+            i += if (take != 0) take else 1;
+        }
+
+        // The path from the end back, copies last-to-first, then reversed.
+        var at: usize = n;
+        while (at > 0) {
+            const nd = nodes[at];
+            if (nd.len == 0) {
+                at -= 1;
+                continue;
+            }
+            try out.append(gpa, if (nd.word != 0)
+                .{ .insert_len = nd.from, .copy_len = nd.word, .dist = nd.dist, .out_len = nd.len }
+            else
+                .{ .insert_len = nd.from, .copy_len = nd.len, .dist = nd.dist });
+            at = nd.from;
+        }
+        // `insert_len` holds the copy's start for now.
+        std.mem.reverse(Cmd, out.items);
+        var cur: u32 = 0;
+        for (out.items) |*c| {
+            const s = c.insert_len;
+            c.insert_len = s - cur;
+            cur = s + c.produced();
+        }
+        if (cur < n) try out.append(gpa, .{ .insert_len = @intCast(n - cur), .copy_len = 0, .dist = 0 });
+    }
+}
+
 /// Scratch for `clusterLiterals`, on the heap: ~100 KiB.
 const ClusterScratch = struct {
     hist: [num_contexts][tables.num_literal_symbols]u32,
@@ -1477,7 +2073,7 @@ fn clusterLiterals(input: []const u8, start: usize, cmds: []const Cmd, mode: u2,
             const p2: u8 = if (q >= 2) input[q - 2] else 0;
             hist[contextId(mode, p1, p2)][input[q]] += 1;
         }
-        pos += c.insert_len + c.copy_len;
+        pos += c.insert_len + c.produced();
     }
 
     // Clusters start as the non-empty contexts.
@@ -1583,7 +2179,7 @@ fn chooseLiteralModel(gpa: std.mem.Allocator, input: []const u8, start: usize, c
     for (cmds) |c| {
         for (input[pos..][0..c.insert_len]) |b| out.counts[0][b] += 1;
         n_lits += c.insert_len;
-        pos += c.insert_len + c.copy_len;
+        pos += c.insert_len + c.produced();
     }
     out.single = out.counts[0];
     if (effort == .fast or n_lits < 256) return;
@@ -1669,6 +2265,8 @@ fn writeCompressedBlock(
         dist_extra: u32,
         dist_nbits: u5,
         has_dist: bool,
+        /// The distance context (`distContext`) of the command's copy.
+        dist_ctx: u2,
     };
     const res = try gpa.alloc(Resolved, cmds.len);
     defer gpa.free(res);
@@ -1676,7 +2274,7 @@ fn writeCompressedBlock(
     const cmd_counts = try gpa.alloc(u32, tables.num_command_symbols);
     defer gpa.free(cmd_counts);
     @memset(cmd_counts, 0);
-    var dist_counts = [_]u32{0} ** dist_alphabet_large;
+    var dist_counts: [dist_contexts][dist_alphabet_large]u32 = @splat(@splat(0));
     const n_dist: u32 = if (env.large_window) dist_alphabet_large else dist_alphabet_size;
 
     var covered: usize = 0;
@@ -1692,7 +2290,7 @@ fn writeCompressedBlock(
         // A copy at the last distance needs no distance symbol at all when
         // the lengths fit an implicit-distance command; the final
         // literals-only command reads no distance either way.
-        const short: ?u16 = if (c.copy_len != 0) ring.shortCode(c.dist) else null;
+        const short: ?u16 = if (c.copy_len != 0 and c.out_len == 0) ring.shortCode(c.dist) else null;
         const implicit = cmd_tables.implicit[ic.code][cc.code];
         const use_implicit = implicit != 0xffff and (c.copy_len == 0 or short == 0);
         const sym = if (use_implicit) implicit else cmd_tables.sym[ic.code][cc.code];
@@ -1707,10 +2305,15 @@ fn writeCompressedBlock(
             .dist_extra = 0,
             .dist_nbits = 0,
             .has_dist = c.copy_len != 0 and !use_implicit,
+            .dist_ctx = distContext(c.copy_len),
         };
         if (c.copy_len != 0) {
-            if (c.dist == 0 or c.dist > lit_pos + c.insert_len + env.reach) return error.EncoderInvariant;
-            ring.update(c.dist, short);
+            if (c.out_len == 0) {
+                if (c.dist == 0 or c.dist > lit_pos + c.insert_len + env.reach) return error.EncoderInvariant;
+                ring.update(c.dist, short);
+            } else if (c.copy_len < dictionary.min_word_length or c.copy_len > dictionary.max_word_length) {
+                return error.EncoderInvariant;
+            }
         }
         if (r.has_dist) {
             if (short) |code| {
@@ -1721,13 +2324,13 @@ fn writeCompressedBlock(
                 r.dist_extra = dc.extra;
                 r.dist_nbits = dc.nbits;
             }
-            dist_counts[r.dist_sym] += 1;
+            dist_counts[r.dist_ctx][r.dist_sym] += 1;
         }
         res[i] = r;
         cmd_counts[sym] += 1;
         lit_pos += c.insert_len;
-        covered += c.insert_len + c.copy_len;
-        lit_pos += c.copy_len;
+        covered += c.insert_len + c.produced();
+        lit_pos += c.produced();
     }
     // MLEN must match the bytes the commands produce exactly, or the decoder
     // would run past the end of the meta-block.
@@ -1749,12 +2352,21 @@ fn writeCompressedBlock(
         }
     }
 
-    // Every alphabet needs at least one symbol even when unused.
-    var dist_any = false;
-    for (dist_counts) |c| {
-        if (c != 0) dist_any = true;
+    // The distance contexts that share a code, by estimated bits.
+    var dist_map: [dist_contexts]u8 = undefined;
+    const dist_trees = clusterDistances(&dist_counts, n_dist, &dist_map);
+    var dist_tree_counts: [dist_contexts][dist_alphabet_large]u32 = @splat(@splat(0));
+    for (0..dist_contexts) |ctx| {
+        for (dist_counts[ctx][0..n_dist], dist_tree_counts[dist_map[ctx]][0..n_dist]) |c, *t| t.* += c;
     }
-    if (!dist_any) dist_counts[0] = 1;
+    // Every code needs at least one symbol even when unused.
+    for (dist_tree_counts[0..dist_trees]) |*h| {
+        var any = false;
+        for (h[0..n_dist]) |c| {
+            if (c != 0) any = true;
+        }
+        if (!any) h[0] = 1;
+    }
 
     // --- meta-block header --------------------------------------------------
     try w.writeBits(@intFromBool(is_last), 1);
@@ -1783,7 +2395,11 @@ fn writeCompressedBlock(
     const map_from = w.bitPos();
     try writeContextMap(gpa, w, &model.map, model.ntrees);
     var lit_part = w.bitPos() - map_from;
-    try w.writeBits(0, 1);
+    if (dist_trees == 1) {
+        try w.writeBits(0, 1);
+    } else {
+        try writeContextMap(gpa, w, &dist_map, @intCast(dist_trees));
+    }
 
     var lit_codes: [max_literal_trees]Code = undefined;
     var built: usize = 0;
@@ -1816,8 +2432,12 @@ fn writeCompressedBlock(
     }
     var cmd_code = try buildAndWriteCode(gpa, w, cmd_counts, tables.num_command_symbols);
     defer cmd_code.deinit(gpa);
-    var dist_code = try buildAndWriteCodeWide(gpa, w, dist_counts[0..n_dist], n_dist, if (env.large_window) dist_alphabet_large_max else dist_alphabet_size);
-    defer dist_code.deinit(gpa);
+    var dist_codes: [dist_contexts]Code = undefined;
+    var dist_built: usize = 0;
+    defer for (dist_codes[0..dist_built]) |*c| c.deinit(gpa);
+    while (dist_built < dist_trees) : (dist_built += 1) {
+        dist_codes[dist_built] = try buildAndWriteCodeWide(gpa, w, dist_tree_counts[dist_built][0..n_dist], n_dist, if (env.large_window) dist_alphabet_large_max else dist_alphabet_size);
+    }
 
     // --- commands -----------------------------------------------------------
     lit_pos = start;
@@ -1846,12 +2466,85 @@ fn writeCompressedBlock(
         }
         lit_pos += c.insert_len;
         if (r.has_dist) {
-            try dist_code.emit(w, r.dist_sym);
+            try dist_codes[dist_map[r.dist_ctx]].emit(w, r.dist_sym);
             if (r.dist_nbits != 0) try w.writeBits(r.dist_extra, r.dist_nbits);
         }
-        lit_pos += c.copy_len;
+        lit_pos += c.produced();
     }
     return .{ .ntrees = model.ntrees, .single_no_worse = single_no_worse };
+}
+
+/// RFC 7932 §7.2: the distance code a copy's symbol is read with depends on
+/// its length — 2, 3, 4, or more.
+const dist_contexts = 4;
+
+fn distContext(copy_len: u32) u2 {
+    return @intCast(@min(copy_len, 5) -| 2);
+}
+
+/// Estimated bits of a histogram coded by its own prefix code: entropy plus
+/// a header guess (`histogramCost`'s, for any alphabet).
+fn sliceCost(h: []const u32) f64 {
+    var total: u64 = 0;
+    var used: u32 = 0;
+    var sum: f64 = 0;
+    for (h) |c| {
+        if (c == 0) continue;
+        total += c;
+        used += 1;
+        sum += nlog2n(c);
+    }
+    if (total == 0) return 0;
+    return nlog2n(total) - sum + 40 + 5 * @as(f64, @floatFromInt(used));
+}
+
+/// Which distance contexts share a code: the cheapest of the 15 partitions
+/// of the four, by `sliceCost` plus the context map's few bits. `map[ctx]`
+/// is the code's number (assigned in order of first use); returns how many
+/// codes.
+fn clusterDistances(counts: *const [dist_contexts][dist_alphabet_large]u32, n_dist: usize, map: *[dist_contexts]u8) usize {
+    // Restricted growth strings over four items.
+    var best: f64 = std.math.inf(f64);
+    var best_map: [dist_contexts]u8 = @splat(0);
+    var best_n: usize = 1;
+    var cand: [dist_contexts]u8 = @splat(0);
+    var code: usize = 0;
+    while (code < 4 * 4 * 4) : (code += 1) {
+        // Digits of `code` in base 4 are group ids of contexts 1..3; accept
+        // only restricted growth (each id at most one above all before it).
+        cand[0] = 0;
+        var top: u8 = 0;
+        var ok = true;
+        for (1..dist_contexts) |k| {
+            const g: u8 = @intCast((code >> @intCast(2 * (k - 1))) & 3);
+            if (g > top + 1) {
+                ok = false;
+                break;
+            }
+            cand[k] = g;
+            if (g > top) top = g;
+        }
+        if (!ok) continue;
+        const groups: usize = top + 1;
+        var cost: f64 = 0;
+        var merged: [dist_alphabet_large]u32 = undefined;
+        for (0..groups) |g| {
+            @memset(merged[0..n_dist], 0);
+            for (0..dist_contexts) |ctx| {
+                if (cand[ctx] != g) continue;
+                for (merged[0..n_dist], counts[ctx][0..n_dist]) |*m, c| m.* += c;
+            }
+            cost += sliceCost(merged[0..n_dist]);
+        }
+        if (groups > 1) cost += 12;
+        if (cost < best) {
+            best = cost;
+            best_map = cand;
+            best_n = groups;
+        }
+    }
+    map.* = best_map;
+    return best_n;
 }
 
 /// What a block's commands may name beyond its own output.
@@ -1952,6 +2645,10 @@ pub const Effort = enum {
     /// 256 candidates, context modelling as `.default`. For content
     /// compressed once and served many times.
     best,
+    /// A shortest-path parse of every block priced from the block's own
+    /// statistics, over 256 candidates. For content compressed once and
+    /// served many times; several times `.best`'s time.
+    max,
 
     /// log2 of all bucket slots together, the match finder's table.
     fn slotsLog(e: Effort) u5 {
@@ -1959,6 +2656,7 @@ pub const Effort = enum {
             .fast => unreachable, // `FastMatcher`
             .default => 19,
             .best => 20,
+            .max => 22,
         };
     }
 
@@ -1967,6 +2665,7 @@ pub const Effort = enum {
             .fast => unreachable, // `FastMatcher`
             .default => 32,
             .best => 256,
+            .max => 256,
         };
     }
 };
@@ -2092,6 +2791,10 @@ pub const Core = struct {
     /// A block that overflowed the caller's buffer is decided here.
     scratch: BitWriter,
     cmds: std.ArrayListUnmanaged(Cmd) = .empty,
+    /// `.max`: the parses of a block (`buildCommandsOptimal`), and the writer
+    /// that sizes each.
+    parses: [max_parses]std.ArrayListUnmanaged(Cmd) = @splat(.empty),
+    trial: BitWriter,
     /// The decoder's last four distances after the blocks so far.
     ring: DistRing = .{},
     /// The last block written was ISLAST.
@@ -2115,6 +2818,7 @@ pub const Core = struct {
             .w = .{ .gpa = gpa },
             .alt = .{ .gpa = gpa },
             .scratch = .{ .gpa = gpa },
+            .trial = .{ .gpa = gpa },
             .table_log = tableLog(effort, size),
         };
     }
@@ -2125,6 +2829,8 @@ pub const Core = struct {
         c.alt.buf.deinit(c.gpa);
         c.scratch.buf.deinit(c.gpa);
         c.cmds.deinit(c.gpa);
+        for (&c.parses) |*l| l.deinit(c.gpa);
+        c.trial.buf.deinit(c.gpa);
         c.* = undefined;
     }
 
@@ -2239,6 +2945,30 @@ pub const Core = struct {
                 try buildCommandsFast(true, gpa, &c.matcher.fast, off, end, max_dist, c.ring, &c.cmds)
             else
                 try buildCommandsFast(false, gpa, &c.matcher.fast, off, end, max_dist, c.ring, &c.cmds),
+            .max => {
+                const n_dist: usize = if (c.wbits > max_window_bits) dist_alphabet_large else dist_alphabet_size;
+                if (c.prefix().len != 0)
+                    try buildCommandsOptimal(true, gpa, &c.matcher.deep, off, end, max_dist, c.ring, n_dist, &c.parses)
+                else
+                    try buildCommandsOptimal(false, gpa, &c.matcher.deep, off, end, max_dist, c.ring, n_dist, &c.parses);
+                // The shortest as written wins: the estimate the parses were
+                // priced by is not the code that comes out.
+                var best_k: usize = 0;
+                var best_bits: usize = std.math.maxInt(usize);
+                const own = c.cmds;
+                for (&c.parses, 0..) |*l, k| {
+                    c.cmds = l.*;
+                    c.trial.resumeAt(c.w.mark());
+                    var ring = c.ring;
+                    const ok = try c.writeBest(&c.trial, c.trial.mark(), off, end, is_last, &ring);
+                    if (ok and c.trial.bitPos() < best_bits) {
+                        best_bits = c.trial.bitPos();
+                        best_k = k;
+                    }
+                }
+                c.cmds = own;
+                std.mem.swap(std.ArrayListUnmanaged(Cmd), &c.cmds, &c.parses[best_k]);
+            },
             .default, .best => {
                 c.matcher.deep.ring = c.ring;
                 if (c.prefix().len != 0)
@@ -2903,4 +3633,77 @@ test "large window: a copy from 17 MiB back, the RFC 9841 header, refused unaske
     const near = try compressWith(gpa, input, .{ .effort = .fast, .window_bits = 24 });
     defer gpa.free(near);
     try testing.expect(near.len > 2 * block);
+}
+
+// --- `.max`: shortest-path parse and static-dictionary words -----------------
+
+fn expectMaxRoundTrip(input: []const u8, opts: CompressOptions, dopts: @import("decoder.zig").Options) ![]u8 {
+    const gpa = testing.allocator;
+    var o = opts;
+    o.effort = .max;
+    const out = try compressWith(gpa, input, o);
+    errdefer gpa.free(out);
+    const back = try @import("decoder.zig").decompress(gpa, out, dopts);
+    defer gpa.free(back);
+    try testing.expectEqualSlices(u8, input, back);
+    return out;
+}
+
+test "max: round trip across windows and block sizes, and smaller than best" {
+    const gpa = testing.allocator;
+    const alice = @embedFile("testdata/alice29.txt")[0..60_000];
+    const best = try compressWith(gpa, alice, .{ .effort = .best });
+    defer gpa.free(best);
+    for ([_]CompressOptions{ .{}, .{ .window_bits = 16 }, .{ .window_bits = 12 }, .{ .block_size = 7_000 } }) |o| {
+        const out = try expectMaxRoundTrip(alice, o, .{});
+        defer gpa.free(out);
+        if (o.window_bits == null and o.block_size == CompressOptions.default_block_size) try testing.expect(out.len < best.len);
+    }
+}
+
+test "max: dictionary words with their transforms are used" {
+    // Words of the static dictionary, spaced, cut, capitalised and in capitals:
+    // without dictionary references this stays near its size as `.best`.
+    const text = "international organization government university information. " ++
+        "International Organization Government University Information, " ++
+        "INTERNATIONAL ORGANIZATION GOVERNMENT UNIVERSITY INFORMATION; " ++
+        "the international organization of the government of the university\n" ++
+        "tomorrow yesterday however sometimes everything something nothing";
+    const gpa = testing.allocator;
+    const out = try expectMaxRoundTrip(text, .{}, .{});
+    defer gpa.free(out);
+    const best = try compressWith(gpa, text, .{ .effort = .best });
+    defer gpa.free(best);
+    try testing.expect(out.len + 40 < best.len);
+}
+
+test "max: a prefix dictionary, a large window and a window the output has not filled" {
+    const gpa = testing.allocator;
+    const alice = @embedFile("testdata/alice29.txt");
+    const dict = alice[0..20_000];
+    const out = try expectMaxRoundTrip(alice[10_000..50_000], .{ .dictionary = dict, .window_bits = 18 }, .{ .dictionary = dict });
+    gpa.free(out);
+    const big = try expectMaxRoundTrip(alice[0..30_000], .{ .window_bits = 26 }, .{ .large_window = true });
+    gpa.free(big);
+}
+
+test "max: every shape the encoder is checked on" {
+    const gpa = testing.allocator;
+    var rng = std.Random.DefaultPrng.init(0x6d61_7831);
+    const r = rng.random();
+    for (0..40) |_| {
+        const n = r.uintLessThan(usize, 3000);
+        const alphabet = 1 + r.uintLessThan(usize, 256);
+        const data = try gpa.alloc(u8, n);
+        defer gpa.free(data);
+        for (data) |*b| b.* = @intCast(r.uintLessThan(usize, alphabet));
+        // Some repeats, some words.
+        if (n > 200) @memcpy(data[n / 2 ..][0..100], data[10..][0..100]);
+        const out = try expectMaxRoundTrip(data, .{}, .{});
+        gpa.free(out);
+    }
+    for ([_][]const u8{ "", "a", "the", " the the the ", "\x00" ** 70_000, "abc" ** 40_000 }) |d| {
+        const out = try expectMaxRoundTrip(d, .{}, .{});
+        gpa.free(out);
+    }
 }
