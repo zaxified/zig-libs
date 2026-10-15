@@ -112,7 +112,7 @@ static size_t decomp(void) {
     return n;
 }
 
-static const char *payloads[] = {"json", "html", "text"};
+static const char *payloads[] = {"json", "html", "text", "font"};
 
 int main(int argc, char **argv) {
     if (argc != 3) { fprintf(stderr, "usage: foreign_bench <work dir> <workload>\n"); return 2; }
@@ -120,7 +120,7 @@ int main(int argc, char **argv) {
     const char *w = argv[2];
     fprintf(stderr, "google/brotli encoder %08x decoder %08x\n", BrotliEncoderVersion(), BrotliDecoderVersion());
     if (strcmp(w, "prep") == 0) {
-        for (int p = 0; p < 3; p++) {
+        for (int p = 0; p < (int)(sizeof payloads / sizeof payloads[0]); p++) {
             char name[64];
             snprintf(name, sizeof name, "%s.bin", payloads[p]);
             in = slurp(name, &in_len);

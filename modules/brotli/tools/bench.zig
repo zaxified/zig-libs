@@ -15,7 +15,9 @@
 //! Payloads (what an HTTP server precompresses or inflates), written into
 //! `.zig-cache/bench-brotli/` from fixed seeds: `json` (~128 KiB array of
 //! API-style records), `html` (~128 KiB page: shell + repeated table rows and
-//! text), `text` (the 152 KB English prose `src/testdata/alice29.txt`).
+//! text), `text` (the 152 KB English prose `src/testdata/alice29.txt`),
+//! `font` (200 KB of binary data shaped like a TrueType font,
+//! `interop_corpus.fontLike` — R12: binary data with sections).
 //!
 //! Workloads: `c_<effort>_<payload>` compresses the payload (ours: `compressWith`
 //! at that effort; theirs: `BrotliEncoderCompress` at the paired quality, lgwin
@@ -49,7 +51,7 @@ const brotli = @import("brotli");
 const bench_name = "bench-brotli";
 const work_dir = ".zig-cache/bench-brotli";
 const default_lib_dir = "/usr/lib/x86_64-linux-gnu";
-const payload_names = [_][]const u8{ "json", "html", "text" };
+const payload_names = [_][]const u8{ "json", "html", "text", "font" };
 
 const n_efforts = @typeInfo(brotli.Effort).@"enum".fields.len;
 const n_qualities = 12;
@@ -184,6 +186,7 @@ pub fn main(init: std.process.Init) !u8 {
     ctx.inputs[0] = try genJson(arena, r);
     ctx.inputs[1] = try genHtml(arena, r);
     ctx.inputs[2] = try cwd.readFileAlloc(io, "modules/brotli/src/testdata/alice29.txt", arena, .limited(1 << 22));
+    ctx.inputs[3] = try brotli.interop_corpus.fontLike(arena, 200_000, 0xf0f7);
     for (payload_names, 0..) |n, i|
         try dir.writeFile(io, .{ .sub_path = try std.fmt.allocPrint(arena, "{s}.bin", .{n}), .data = ctx.inputs[i] });
 

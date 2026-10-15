@@ -1287,6 +1287,8 @@ const Cmd = struct {
 /// `end`, so the commands consume exactly `end - start` bytes.
 fn buildCommands(
     comptime ring_n: u3,
+    /// Literals in a row after which positions are skipped.
+    comptime skip_after: usize,
     comptime px: bool,
     gpa: std.mem.Allocator,
     matcher: *Matcher,
@@ -1309,7 +1311,10 @@ fn buildCommands(
         pending = null;
         if (m == null) {
             matcher.insert(p);
-            p += 1;
+            // A long run without a match (binary or compressed data):
+            // look at fewer of its positions, as `.fast` does.
+            const run = p - lit_start;
+            p += if (run < skip_after) 1 else @min(fast_skip_max, 1 + ((run - skip_after) >> 5));
             continue;
         }
         matcher.insert(p);
@@ -2226,6 +2231,36 @@ const RangeLiterals = struct {
     }
 };
 
+/// Literals from which the context mode is chosen by `contextCost` rather
+/// than by clustering every mode.
+const proxy_min_literals = 16384;
+
+/// The entropy of the literals of `src` with a code per context of `mode`,
+/// unclustered (no header costs).
+fn contextCost(src: anytype, mode: u2, scratch: *ClusterScratch) f64 {
+    const hist = &scratch.hist;
+    hist.* = @splat(@splat(0));
+    const Fill = struct {
+        hist: *[num_contexts][tables.num_literal_symbols]u32,
+        mode: u2,
+        inline fn add(f: @This(), b: u8, p1: u8, p2: u8) void {
+            f.hist[contextId(f.mode, p1, p2)][b] += 1;
+        }
+    };
+    src.each(Fill{ .hist = hist, .mode = mode });
+    var total: f64 = 0;
+    for (hist) |*h| {
+        var n: u64 = 0;
+        var sum: f64 = 0;
+        for (h) |c| {
+            n += c;
+            sum += nlog2n(c);
+        }
+        total += nlog2n(n) - sum;
+    }
+    return total;
+}
+
 /// Cluster the per-context histograms of `mode` for the literals of `src`
 /// (`CmdLiterals` or `RangeLiterals`) and return the model with its
 /// estimated cost.
@@ -2369,7 +2404,26 @@ fn chooseLiteralModelIn(gpa: std.mem.Allocator, scratch_in: ?*ClusterScratch, sr
     // `.default`'s time per mode).
     var ascii: u64 = 0;
     for (out.single[0..0x80]) |c| ascii += c;
-    const modes: []const u2 = if (ascii * 100 >= n_lits * ascii_pct) &.{2} else &.{ 2, 0, 3 };
+    var modes_buf: [1]u2 = .{2};
+    const modes: []const u2 = if (ascii * 100 >= n_lits * ascii_pct) &.{2} else if (n_lits < proxy_min_literals) &.{ 2, 0, 3 } else blk: {
+        // Of UTF8, LSB6 and SIGNED, cluster only the one whose 64 context
+        // histograms have the least entropy unclustered: clustering is most
+        // of the model's time on binary data (a third of `.default` on a
+        // font). It picked what clustering all three picks on every
+        // `.default` block measured; below `proxy_min_literals` (where
+        // clustering is cheap) it did not always.
+        var best_mode: u2 = 2;
+        var best_raw = std.math.inf(f64);
+        for ([3]u2{ 2, 0, 3 }) |mode| {
+            const raw = contextCost(src, mode, scratch);
+            if (raw < best_raw) {
+                best_raw = raw;
+                best_mode = mode;
+            }
+        }
+        modes_buf[0] = best_mode;
+        break :blk &modes_buf;
+    };
     for (modes) |mode| {
         const c = clusterLiterals(src, mode, scratch, &trial);
         if (c < best_cost) {
@@ -3658,12 +3712,16 @@ pub const Core = struct {
                 c.cmds = own;
                 std.mem.swap(std.ArrayListUnmanaged(Cmd), &c.cmds, &c.parses[best_k]);
             },
-            .default, .best => {
+            inline .default, .best => |e| {
+                // `.default` skips through long literal runs (fonts: 15 %
+                // of its time for ±0.25 % of size); `.best` looks at every
+                // position.
+                const skip: usize = if (e == .default) 64 else std.math.maxInt(usize);
                 c.matcher.deep.ring = c.ring;
                 if (c.prefix().len != 0)
-                    try buildCommands(4, true, gpa, &c.matcher.deep, off, end, max_dist, &c.cmds)
+                    try buildCommands(4, skip, true, gpa, &c.matcher.deep, off, end, max_dist, &c.cmds)
                 else
-                    try buildCommands(4, false, gpa, &c.matcher.deep, off, end, max_dist, &c.cmds);
+                    try buildCommands(4, skip, false, gpa, &c.matcher.deep, off, end, max_dist, &c.cmds);
             },
         }
 
