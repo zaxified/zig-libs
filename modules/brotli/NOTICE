@@ -28,7 +28,12 @@ encoder, under the same MIT license reproduced below: `c/enc/metablock_inc.h`
 (`BlockSplitter`), `c/enc/metablock.c` (`ContextBlockSplitter`,
 `BrotliBuildMetaBlockGreedy`), `c/enc/encode.c` (`ChooseContextMap`,
 `DecideOverLiteralContextModeling`, `EstimateEntropy`, the static context
-maps) and `c/enc/bit_cost.c` (`BrotliBitsEntropy`). Those files carry
+maps) and `c/enc/bit_cost.c` (`BrotliBitsEntropy`); `src/dictionary_hash.zig`
+(ADDED 2026-10-15, R15) ports `c/enc/dictionary_hash.c`
+(`BrotliEncoderInitDictionaryHash` and its `frozen_idx` table) and
+`c/enc/hash_base.h` (`Hash14`), and `Matcher.findWord` in `src/encoder.zig`
+ports `c/enc/hash.h` (`SearchInStaticDictionary`, `TestStaticDictionaryItem`,
+the cut-off transform list). Those files carry
 "Copyright 2010–2016 Google Inc. All Rights Reserved. Distributed under MIT
 license." Changes are listed in the file's header. The vector tag compare in
 `encoder.zig` (`Matcher.find`, `simd`) follows the idea of

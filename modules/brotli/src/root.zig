@@ -124,6 +124,7 @@ test {
     _ = @import("crafted_test.zig");
     _ = @import("block_split.zig");
     _ = @import("greedy_split.zig");
+    _ = @import("dictionary_hash.zig");
 }
 
 fn expectDecodes(comptime name: []const u8) !void {

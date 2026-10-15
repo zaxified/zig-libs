@@ -31,7 +31,7 @@ Surveyed 2026-10-14 per `SURVEY-PLAYBOOK.md` (first 2026-09-30); stars and activ
 | [akunaakwei/zig-brotli](https://github.com/akunaakwei/zig-brotli) / [Scythe-Technology/zbrotli](https://github.com/Scythe-Technology/zbrotli) | Zig (wrap C) | zlib / MIT | 1 / 0 | pushed 2026-04-18 / 2026-06-05 | Build-system wrappers or bindings for google/brotli's C — full features, but link C. |
 | Zig `std.compress` | Zig | MIT | — | Zig 0.16.0 | `flate`, `lzma`, `lzma2`, `xz`, `zstd`; **no brotli** (verified: `lib/std/compress/` listing, 2026-10-14). |
 
-**Where we are ahead:** pure Zig with no C, unlike the wrappers; typed errors with an output cap and a ratio bound on by default (google/brotli added an output limit to its Python binding only in 1.2.0); a decoder whose one-shot, into-buffer and streaming forms are checked against each other by a differential fuzz driver and scored by mutation; encoder streams verified by the reference decoder over 45 shapes; `.q9` 0.72–0.95× q9's time (2026-10-15). **Where we are behind:** no `mode` parameter; no NPOSTFIX/NDIRECT or OMIT_FIRST dictionary words; static-dictionary words only at `.q11` (google from q5: small UTF-8 inputs at `.q6`/`.q9` up to 12 % larger, R15); `.q11` is 1 % behind q11 on text, further on very small inputs (→ Backlog).
+**Where we are ahead:** pure Zig with no C, unlike the wrappers; typed errors with an output cap and a ratio bound on by default (google/brotli added an output limit to its Python binding only in 1.2.0); a decoder whose one-shot, into-buffer and streaming forms are checked against each other by a differential fuzz driver and scored by mutation; encoder streams verified by the reference decoder over 45 shapes; `.q9` 0.72–0.95× q9's time (2026-10-15). **Where we are behind:** no `mode` parameter; no NPOSTFIX/NDIRECT or OMIT_FIRST dictionary words; no static-dictionary words at `.q6` (google from q5; owner's choice for speed, small UTF-8 inputs 12 % larger); `.q6` 2.4–8× google's time on inputs of a few KiB (R16); `.q11` is 1 % behind q11 on text, further on very small inputs (→ Backlog).
 
 ## Scope & honesty
 
@@ -185,6 +185,18 @@ bytes verbatim; otherwise it is rolled back out of the bit writer and re-emitted
   tag compare and context-free literal emission below). Sizes moved to the reference's: `alice29.txt`
   `.q6` 51 327 → 52 275 (q6 51 967), `.q9` 50 536 → 51 361 (q9 51 054); font payload `.q9` 103 645 →
   117 940 (q9 114 948). Not ported: the 13-context map google uses from 1 MiB of input (R14).
+- **Static-dictionary words at `.q9`** (2026-10-15, R15; port of google/brotli `SearchInStaticDictionary`
+  / `TestStaticDictionaryItem` and the `dictionary_hash.c` table, MIT, see `NOTICE`): where the hash
+  finds no copy, the two words `dictionary_hash.zig` keeps for the position's first four bytes (one of
+  8+ bytes, one shorter; 6 031 of 32 768 buckets used) are compared, and the longer prefix taken as
+  the word itself or with its last 1–9 bytes cut (OMIT_LAST transforms), priced by `Matcher.gain`
+  at its distance beyond the window. Lookups stop while fewer than 1 in 128 found a word (binary
+  data). The table is built at comptime from the dictionary and google's 1 688-byte `frozen_idx`
+  bitmap; a test pins it to the SHA-256 of google's compiled-in table. Sizes: `alice29.txt` 51 361 →
+  50 994 (q9 51 054), html −0.6 %, json −0.26 %, `cp852-utf8` 541 → 500 (q9 483), fonts ±0.1 %.
+  Time: instructions +0–4 % before `findWord` took both buckets' lengths in one load and compared
+  eight bytes a step, ≈ 0 after; cycles 0–5 % in one binary switched at run time. Not at `.q6`:
+  there it cost 5–10 % (bench, 2026-10-15) for 0.25–0.7 % of size on the payloads — owner's choice.
 - **Tag compare a bucket at once** (2026-10-15, `.q6`): on a binary block the 32 slots' tags (their
   top byte) are compared in one vector operation and only matching slots visited
   newest first, the idea of google/brotli's H58 hasher (`matching_tag_mask.h`; its tag bytes in an
@@ -268,8 +280,8 @@ bytes verbatim; otherwise it is rolled back out of the bit writer and re-emitted
   on the font-shaped payload.
 
 Deliberately *not* implemented, each costing some ratio: `NPOSTFIX`/`NDIRECT` tuning, OMIT_FIRST
-dictionary transforms, block splitting at `.q4`; dictionary words below `.q11` (google searches them
-from q5 — R15, next).
+dictionary transforms, block splitting at `.q4`; dictionary words at `.q4`/`.q6` (google searches them
+from q4 — at `.q6` they cost 5–10 % of its time, R15).
 
 - **Raw prefix dictionary** (2026-10-14; `CompressOptions.dictionary`, `StreamOptions.dictionary`):
   the match finder's history is `dictionary ++ input`; the dictionary's positions are inserted first
@@ -296,16 +308,16 @@ Ours at each effort vs. the reference (bytes; ReleaseFast, 2026-09-30):
 
 | input | raw | fast | **default** | best | max | ref q1 | ref q5 | ref q9 | ref q11 |
 |---|---|---|---|---|---|---|---|---|---|
-| `alice29.txt` | 152 089 | 55 580 | **52 275** | 51 361 | 46 935 | 60 292 | 52 809 | 51 054 | 46 487 |
+| `alice29.txt` | 152 089 | 55 580 | **52 275** | 50 994 | 46 935 | 60 292 | 52 809 | 51 054 | 46 487 |
 | `monkey` | 843 | 470 | **427** | 427 | 416 | 464 | 426 | 423 | 405 |
-| `cp852-utf8` | 706 | 540 | **542** | 541 | 380 | 566 | 482 | 483 | 362 |
+| `cp852-utf8` | 706 | 540 | **542** | 500 | 380 | 566 | 482 | 483 | 362 |
 | `zeros` | 262 144 | 27 | **27** | 27 | 27 | 47 | 13 | 13 | 14 |
 | `random_org_10k.bin` | 10 000 | 10 004 | **10 004** | 10 004 | 10 004 | 10 004 | 10 004 | 10 004 | 10 004 |
 
 (Table re-taken 2026-10-15; the 2026-09-30 one had `fast` before the `FastMatcher` and no `max`.
 `default`/`best` re-taken again the same day after the greedy model: before it 51 327 / 50 536, 421,
 436 — the clustered contexts won 100 bytes on `cp852-utf8` that google gets from dictionary words,
-R15.)
+R15. `best` = `.q9` re-taken after R15: 51 361 and 541 before.)
 
 Before 2026-09-30 the one setting gave `alice29.txt` 54 605, `cp852-utf8` 536, `zeros` 651. Time on
 `alice29.txt`: 7 ms fast, 17 ms default, 24 ms best (was 7 ms) — since 2026-10-14 `.fast` gives
@@ -571,5 +583,7 @@ Order: P (encoder hasher) → R1 (+R3–R5) → R6/R8 → R9 (+R10/R11) → R7 �
 - ~~**R11 Concatenated streams + returning read-ahead bytes**~~ — **DONE 2026-10-15**: the read-ahead goes back to the reader (§ Streaming decoder), so streams decode back to back. (A `brcat`-style joined single stream is google's tool, not a format feature.)
 - **R13 Qualities 0 and 1 (found 2026-10-15, owner: add them)** — **`.q1` DONE, `.q0` added but P open (2026-10-15)**. Before: `Effort.fromQuality(0..3)` gave `.q4`, which took 4.3–6.9× q0's time and 2.6–3.8× q1's (bench, user-mode cycles). Now both are levels of their own (§ Encoder `FragMatcher`/`buildFrag`/`writeFragmentBlock`, own design from RFC 7932): one slot per hash bucket, first match taken, LZ4/Snappy-style growing step, commands resolved by the parse into two-word records with their histograms, literals copied to one buffer, one code per category; the writer knows the block's exact size from the histograms before it writes, and stores a block that would not shrink without writing it. Sizes (ours vs google): q1 json 33 675 / 34 206, html 19 062 / 19 495, text 59 893 / 60 292, font 127 956 / 127 223; q0 34 429 / 41 051, 19 042 / 22 347, 63 301 / 65 795, 132 714 / 131 355. Time (bench, 2 rounds): **q1 0.84–0.97×**, **q0 0.97–1.55×** (font 0.97, json 1.17, text 1.42, html 1.55) — google q0 spends about 155–170 instructions a command, parse and write together; ours about 300 (2026-10-15, callgrind: the record write ~110, the parse ~85, the writer ~90 per command). Dead ends (measured): q0 in one pass with codes from the block's first sixteenth (every symbol floored to a count of one) — no fewer instructions, 7–19 % larger (text 73 092 B, above google's 65 795); a faster step through literal runs (q0 skip 1–2: < 5 % instructions, +2–7 % size); a 2^13/2^14 table (≤ 5 %); a one-compare fast path in `matchLen` (−2 % at q0). Kept from the work: `assignLengths` on the stack with one sort of packed keys and `canonicalCode` from the lengths (no decoder table) — every level, streams unchanged.
 - **R14 13-context static map for large inputs (2026-10-15, open)** — google/brotli's qualities 5–9 use `kStaticContextMapComplexUTF8` (13 contexts from the UTF8 context id, `ShouldUseComplexStaticContextMap`) when the size hint is ≥ 1 MiB and the sampled entropy says it pays; `greedy_split.chooseStaticContexts` stops at three. Needs the total input length at the block writer (`compressWith` knows it; `StreamWriter` from `size_hint`). No bench payload is that large.
-- **R15 Static-dictionary words at `.q6`/`.q9` (2026-10-15, open, next)** — google/brotli searches the static dictionary from quality 5 (`SearchInStaticDictionary` when the hash found nothing, switched off while fewer than 1 in 128 lookups match). Ours only at `.q11` (`DictSearch`, built at run time). Cost of the gap after the greedy model: `cp852-utf8` 542 B at `.q6` vs q6 482 (was 436 with clustered contexts); on the bench payloads ≤ 1.5 % (font) and text +0.6 %. Needs a dictionary hash cheap enough for one small call (google's is compiled in).
+- **R15 Static-dictionary words at `.q6`/`.q9` (2026-10-15) — DONE at `.q9`; `.q6` left without (owner, 2026-10-15)** — see § Encoder "Static-dictionary words at `.q9`". At `.q6` the same search cost 5–10 % of its time in the bench (text 1.01 → 1.06–1.09× q6, font 1.03–1.07 → 1.14) for text −0.7 %, html −0.6 %, json −0.25 %, `cp852-utf8` 542 → 501 (q6 482). Switching it on is one comptime flag (`buildCommands(..., words, ...)` in `Core.compressBlock`). google also searches at q4 (H4 hasher, one bucket) — not tried.
+- **R16 `.q6` on small inputs: fixed cost per call (found 2026-10-15, open)** — slices of the bench payloads (min of 7, wall clock): 4 KiB `.q6` 0.32–0.40 ms vs q6 0.04–0.17 ms (2.4–8×), 16 KiB 1.35–1.76 vs 0.31–0.59 ms, 64 KiB 2.25–4.25 vs 1.2–2.6 ms; `.q9` is faster than q9 at every size (google's q9 hasher tables are large). Not profiled yet: candidates are the per-block allocations (matcher tables sized to the input, splitters, histograms), `literalCost` over the block, and the second write `writeBest` may do. The bench payloads (≥ 128 KiB) do not see it.
+- **R17 Clustered literal model for small blocks at `.q6`/`.q9` (found 2026-10-15, deferred by owner until R16)** — the model these levels had before the greedy port (`chooseLiteralModel`, still `.q11`'s with one block type) is much denser on small blocks: font tail 32 KiB 15 239 B vs greedy 18 984 (q6 18 452), 64 KiB 36 738 vs 44 039 (43 728); text 32 KiB 12 274 vs 12 663 (12 644); `cp852-utf8` 424 vs 501 (482). Cost +10–60 % of the time of such inputs. One condition in `writeCompressedBlock` (`effort == .q6 or .q9` and the block ≥ a threshold) selects it.
 - **Decoder speed (2026-10-15)** — text 1.155× → 1.13×, font 1.14× → 0.98× google's decode into a buffer: literal runs of ≥ 8 decoded checkless as `decode.c` does (bound: input for 15 bits a literal with a refill's margin — the reader's `data` is a many-pointer, so the bound is all that keeps a read inside the input; valgrind probe over damaged streams clean, a loosened bound caught), 8-bit roots everywhere, entries' pointer in the hot loop. Left on text (18 k commands in 152 KB, 95 % of copies under 16 bytes): we run 6.6 % more instructions but 16 % more cycles than google (IPC 2.06 vs 2.23), 37 % more branches; tried without effect: skipping the per-command room checks when the meta-block fits (branch count unchanged), the checkless loop for one-code literals only (text uses contexts). **Debt (H):** the module has a `testing.fuzz` harness but no deterministic driver (`~/.claude/fuzzing.md`); the decoder's hot loop now leans on an arithmetic bound — a driver with planted mutants is the right check.

@@ -40,17 +40,21 @@
 //!   own statistics (`buildCommandsOptimal`) and static-dictionary words
 //!   with their transforms (`DictSearch`); three parses, the shortest as
 //!   written kept.
+//! - **Static-dictionary words at `.q9`** (2026-10-15, R15): where the hash
+//!   finds no copy, the word google/brotli's qualities 5–9 would try
+//!   (`Matcher.findWord`, `dictionary_hash.zig`), whole or with its end cut.
 //!
 //! ## What it deliberately does not do
 //!
-//! - No block splitting (`NBLTYPES` is always 1), no `NPOSTFIX`/`NDIRECT`
-//!   tuning, no MSB6/SIGNED context modes (never the cheaper choice on the
-//!   measured corpus), no OMIT_FIRST dictionary transforms, no dictionary
-//!   words below `.q11`.
+//! - No `NPOSTFIX`/`NDIRECT` tuning, no MSB6/SIGNED context modes (never the
+//!   cheaper choice on the measured corpus), no OMIT_FIRST dictionary
+//!   transforms, no dictionary words at `.q6` (5–10 % of its time for
+//!   0.25–0.7 % of size on text, 2026-10-15).
 //!
-//! The result: `alice29.txt` 51 327 bytes at `.q6` (reference q5: 52 809,
-//! q9: 51 054, q11: 46 487), 50 536 at `.q9`, 46 935 at `.q11`; never worse
-//! than store mode by more than the two-bit final-meta-block marker.
+//! The result (2026-10-15): `alice29.txt` 52 275 bytes at `.q6` (google/brotli
+//! q6: 51 967), 50 994 at `.q9` (q9: 51 054), 46 926 at `.q11` (q11: 46 487);
+//! never worse than store mode by more than the two-bit final-meta-block
+//! marker.
 //!
 //! ## How the bit-level format is anchored
 //!
@@ -71,6 +75,7 @@ const dictionary = @import("dictionary.zig");
 const transforms = @import("transforms.zig");
 const block_split = @import("block_split.zig");
 const greedy_split = @import("greedy_split.zig");
+const dictionary_hash = @import("dictionary_hash.zig");
 const BrotliError = @import("errors.zig").BrotliError;
 
 // ---------------------------------------------------------------------------
@@ -896,7 +901,12 @@ fn buildAndWriteCodeWide(
 // on the candidate byte that depends on it (perf, `.q6` on text). A
 // bucket names all its candidates at once, so their loads overlap.
 
-const Match = struct { len: u32, dist: u32, gain: f32 };
+/// `word`: 0 for a copy; for a static-dictionary word (`Matcher.findWord`)
+/// its length, `len` then the bytes its transformed form produces. `len`
+/// and `word` share a word (`max_match` fits 16 bits): at 16 bytes a `?Match`
+/// is no longer returned in registers, and `.q9` on text was 16 % slower
+/// (2026-10-15).
+const Match = struct { len: u16, word: u8 = 0, dist: u32, gain: f32 };
 
 /// Distances an explicit distance code reaches (NPOSTFIX = NDIRECT = 0):
 /// the last code's offset plus its 24 extra bits.
@@ -948,6 +958,10 @@ fn bucketLog(size: usize, max: u6) u6 {
     return b;
 }
 
+/// The transforms that cut 0..9 bytes off a word's end and add nothing
+/// (RFC 7932 Appendix B: identity, OMIT_LAST_1..9).
+const omit_last_transforms = [10]u8{ 0, 12, 27, 23, 42, 63, 56, 48, 59, 64 };
+
 /// Slots per bucket of `.q6`'s `Matcher`: one vector compare of the tags.
 const simd_depth = 32;
 
@@ -990,6 +1004,11 @@ const Matcher = struct {
     /// code with no extra bits, so it is tried first and priced lower.
     ring: DistRing = .{},
     prefix: Prefix = .{},
+    /// `findWord`'s buckets looked at and words taken: it stops looking
+    /// while fewer than one lookup in 128 found a word (google/brotli
+    /// `SearchInStaticDictionary`) — binary data never does.
+    dict_lookups: usize = 0,
+    dict_matches: usize = 0,
 
     /// Tables for an input of about `size` bytes; `data` is set by the
     /// caller.
@@ -1059,6 +1078,8 @@ const Matcher = struct {
     fn reset(self: *Matcher) void {
         fillZero(self.count);
         self.ring = .{};
+        self.dict_lookups = 0;
+        self.dict_matches = 0;
     }
 
     /// `by` output bytes left `data` (`Prefix.shiftPos`). Only the slots a
@@ -1140,7 +1161,12 @@ const Matcher = struct {
     /// own are visited, as google/brotli's H58 hasher does with tag bytes of
     /// their own (`hash_longest_match_simd_inc.h`; a byte array here cost
     /// text 7 % in the extra stores, 2026-10-15).
-    fn find(self: *const Matcher, comptime ring_n: u3, comptime px: bool, comptime tagged: bool, comptime simd: bool, p: usize, max_dist: usize, limit: usize) ?Match {
+    /// `align(64)` (also `findWord`, `buildCommands`): where the hot loops
+    /// start otherwise moves with every unrelated change, and on the
+    /// measuring host (a Kaby Lake, which pays for jumps across 32-byte
+    /// lines) that alone moved `.q6` by 5–10 % between builds; aligned, the
+    /// bench of the unchanged encoder was 3–10 % faster (2026-10-15).
+    fn find(self: *const Matcher, comptime ring_n: u3, comptime px: bool, comptime tagged: bool, comptime simd: bool, p: usize, max_dist: usize, limit: usize) align(64) ?Match {
         if (p + min_match > limit) return null;
         const max_len = @min(limit - p, max_match);
         var best_len: usize = 0;
@@ -1245,6 +1271,55 @@ const Matcher = struct {
         }
         if (best_len == 0) return null;
         return .{ .len = @intCast(best_len), .dist = @intCast(best_dist), .gain = best_gain };
+    }
+
+    /// A static-dictionary word for `p` (RFC 7932 §8) at `.q9`, as
+    /// google/brotli's qualities 5–9 look for one when the hash found no copy
+    /// (`SearchInStaticDictionary`, `TestStaticDictionaryItem`, MIT, see
+    /// `NOTICE`): the two words `dictionary_hash` keeps for the first four
+    /// bytes, as a whole or with its last 1–9 bytes cut off (the
+    /// OMIT_LAST transforms). `out_max`: how far back the output reaches —
+    /// a word's distance lies beyond it. Never with a prefix dictionary.
+    fn findWord(self: *Matcher, p: usize, out_max: usize, limit: usize) align(64) ?Match {
+        if (self.dict_matches < self.dict_lookups >> 7) return null;
+        if (p + 4 > limit) return null;
+        const max_len = limit - p;
+        const key = dictionary_hash.hash14(self.data[p..][0..4]) << 1;
+        self.dict_lookups += 2;
+        // Both buckets' lengths at once: most are empty.
+        const lens = dictionary_hash.table.lengths[key..][0..2].*;
+        if (@as(u16, @bitCast(lens)) == 0) return null;
+        var best: ?Match = null;
+        var best_gain: f32 = 0;
+        for (lens, key..) |len8, b| {
+            const len: usize = len8;
+            if (len == 0 or len > max_len) continue;
+            const j: usize = dictionary_hash.table.words[b];
+            const word = dictionary.data[dictionary.offsets_by_length[len] + len * j ..][0..len];
+            const l = wordMatchLen(word, self.data[p..][0..len]);
+            if (l == 0 or l + omit_last_transforms.len <= len) continue;
+            const t: usize = omit_last_transforms[len - l];
+            const d = out_max + 1 + j + (t << @intCast(dictionary.size_bits_by_length[len]));
+            if (d > max_code_distance) continue;
+            const g = self.gain(l, d);
+            if (g <= best_gain) continue;
+            self.dict_matches += 1;
+            best_gain = g;
+            best = .{ .len = @intCast(l), .dist = @intCast(d), .gain = g, .word = @intCast(len) };
+        }
+        return best;
+    }
+
+    /// Length of the common prefix of `word` and `at` (as long), eight
+    /// bytes per step.
+    fn wordMatchLen(word: []const u8, at: []const u8) usize {
+        var l: usize = 0;
+        while (l + 8 <= word.len) : (l += 8) {
+            const x = std.mem.readInt(u64, word[l..][0..8], .little) ^ std.mem.readInt(u64, at[l..][0..8], .little);
+            if (x != 0) return l + @ctz(x) / 8;
+        }
+        while (l < word.len and word[l] == at[l]) l += 1;
+        return l;
     }
 
     /// Cheap reject: whether a candidate gets the byte-by-byte compare —
@@ -1819,13 +1894,16 @@ fn buildCommands(
     comptime tagged: bool,
     /// Tags compared a bucket at once (`Matcher.find`).
     comptime simd: bool,
+    /// Static-dictionary words where no copy is found (`Matcher.findWord`;
+    /// never with `px`).
+    comptime words: bool,
     gpa: std.mem.Allocator,
     matcher: *Matcher,
     start: usize,
     end: usize,
     max_dist: usize,
     out: *std.ArrayListUnmanaged(Cmd),
-) std.mem.Allocator.Error!void {
+) align(64) std.mem.Allocator.Error!void {
     var p = start;
     var lit_start = start;
     var pending: ?Match = null;
@@ -1836,7 +1914,8 @@ fn buildCommands(
 
     while (p < end) {
         matcher.prefetch(p + 1);
-        const m = pending orelse matcher.find(ring_n, px, tagged, simd, p, x.outMax(p, max_dist), end);
+        const m = pending orelse matcher.find(ring_n, px, tagged, simd, p, x.outMax(p, max_dist), end) orelse
+            if (words) matcher.findWord(p, x.outMax(p, max_dist), end) else null;
         pending = null;
         if (m == null) {
             matcher.insert(p);
@@ -1848,7 +1927,9 @@ fn buildCommands(
         }
         matcher.insert(p);
         if (p + 1 < end) {
-            if (matcher.find(ring_n, px, tagged, simd, p + 1, x.outMax(p + 1, max_dist), end)) |b| {
+            const next = matcher.find(ring_n, px, tagged, simd, p + 1, x.outMax(p + 1, max_dist), end) orelse
+                if (words) matcher.findWord(p + 1, x.outMax(p + 1, max_dist), end) else null;
+            if (next) |b| {
                 // One literal more is spent to take `b`, so it must save
                 // more than that literal costs on top of what `m` saves.
                 if (b.gain > m.?.gain + matcher.lit_cost) {
@@ -1859,13 +1940,16 @@ fn buildCommands(
             }
         }
         const len = m.?.len;
+        const word = m.?.word;
         try out.append(gpa, .{
             .insert_len = @intCast(p - lit_start),
-            .copy_len = len,
+            .copy_len = if (word != 0) word else len,
             .dist = m.?.dist,
+            .out_len = if (word != 0) len else 0,
         });
-        // `DistRing.update` pushes every distance but the last one (code 0).
-        if (ring_n != 0 and m.?.dist != matcher.ring.last[0]) matcher.ring.update(m.?.dist, null);
+        // `DistRing.update` pushes every distance but the last one (code 0);
+        // a word's distance is not pushed.
+        if (ring_n != 0 and word == 0 and m.?.dist != matcher.ring.last[0]) matcher.ring.update(m.?.dist, null);
         matcher.prefetch(p + len);
         var q = p + 1;
         while (q < p + len) : (q += 1) matcher.insert(q);
@@ -4616,15 +4700,18 @@ pub const Core = struct {
             inline .q6, .q9 => |e| {
                 // `.q6` skips through long literal runs (fonts: 15 %
                 // of its time for ±0.25 % of size); `.q9` looks at every
-                // position.
+                // position, and for a static-dictionary word where no copy
+                // is found. (Words at `.q6` too, as google/brotli from q5:
+                // text −0.7 %, small UTF-8 −7.5 %, for 5–10 % of its time —
+                // left out by the owner, 2026-10-15.)
                 const skip: usize = if (e == .q6) 64 else std.math.maxInt(usize);
                 c.matcher.deep.ring = c.ring;
                 const simd = e == .q6;
                 switch (c.matcher.deep.tagsPay(c.data[off..end])) {
                     inline else => |tagged| if (c.prefix().len != 0)
-                        try buildCommands(4, skip, true, tagged, simd, gpa, &c.matcher.deep, off, end, max_dist, &c.cmds)
+                        try buildCommands(4, skip, true, tagged, simd, false, gpa, &c.matcher.deep, off, end, max_dist, &c.cmds)
                     else
-                        try buildCommands(4, skip, false, tagged, simd, gpa, &c.matcher.deep, off, end, max_dist, &c.cmds),
+                        try buildCommands(4, skip, false, tagged, simd, e == .q9, gpa, &c.matcher.deep, off, end, max_dist, &c.cmds),
                 }
             },
         }
@@ -5445,6 +5532,62 @@ test "max: a dictionary word that would decode to other bytes is refused (block 
     try testing.expectError(error.EncoderInvariant, checkWord(near, pos, env, "time"));
     // With a prefix dictionary words are never emitted.
     try testing.expectError(error.EncoderInvariant, checkWord(good, pos, .{ .reach = 10 }, "time"));
+}
+
+test "q9: static-dictionary words where no copy is found, never with a prefix dictionary" {
+    const gpa = testing.allocator;
+    const text = "international organization government university information. " ++
+        "tomorrow yesterday however sometimes everything something nothing; " ++
+        "the development of the environment and the management of the community";
+    const max_dist = (1 << 22) - 16;
+    for ([_]bool{ true, false }) |words| {
+        var m = try Matcher.init(gpa, text.len, simd_depth, 19);
+        defer m.deinit(gpa);
+        m.setData(text);
+        var cmds: std.ArrayListUnmanaged(Cmd) = .empty;
+        defer cmds.deinit(gpa);
+        if (words)
+            try buildCommands(4, std.math.maxInt(usize), false, false, false, true, gpa, &m, 0, text.len, max_dist, &cmds)
+        else
+            try buildCommands(4, std.math.maxInt(usize), true, false, false, false, gpa, &m, 0, text.len, max_dist, &cmds);
+        var n_words: usize = 0;
+        var pos: usize = 0;
+        for (cmds.items) |c| {
+            pos += c.insert_len;
+            if (c.out_len != 0) {
+                n_words += 1;
+                // Each decodes to the bytes it stands for.
+                try checkWord(c, pos, .{ .max_backward = max_dist }, text[pos..][0..c.out_len]);
+            }
+            pos += c.produced();
+        }
+        try testing.expectEqual(text.len, pos);
+        if (words) try testing.expect(n_words >= 10) else try testing.expectEqual(0, n_words);
+    }
+    for ([_]Effort{ .q6, .q9 }) |effort| {
+        const out = try compressWith(gpa, text, .{ .effort = effort });
+        defer gpa.free(out);
+        const back = try @import("decoder.zig").decompress(gpa, out, .{});
+        defer gpa.free(back);
+        try testing.expectEqualSlices(u8, text, back);
+    }
+}
+
+test "q9: dictionary lookups stop on data that never finds a word" {
+    const gpa = testing.allocator;
+    const data = try gpa.alloc(u8, 1 << 16);
+    defer gpa.free(data);
+    var rng = std.Random.DefaultPrng.init(0x7231_3500);
+    rng.random().bytes(data);
+    var m = try Matcher.init(gpa, data.len, simd_depth, 19);
+    defer m.deinit(gpa);
+    m.setData(data);
+    var cmds: std.ArrayListUnmanaged(Cmd) = .empty;
+    defer cmds.deinit(gpa);
+    try buildCommands(4, std.math.maxInt(usize), false, false, false, true, gpa, &m, 0, data.len, (1 << 22) - 16, &cmds);
+    // Two buckets a lookup; it stops once fewer than 1 in 128 found a word.
+    try testing.expect(m.dict_lookups <= 128 * (m.dict_matches + 1) + 2);
+    try testing.expect(m.dict_lookups < data.len / 64);
 }
 
 /// NBLTYPESL of the stream's first meta-block (a compressed one).
