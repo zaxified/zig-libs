@@ -24,6 +24,9 @@
 const std = @import("std");
 
 pub const alice = @embedFile("testdata/alice29.txt");
+/// Made-up words in seven scripts (`tools/gen_utf8_mix.py`): UTF-8 lead bytes
+/// 0xC3..0xDC two positions back select the UTF8 mode's literal context.
+pub const utf8_mix = @embedFile("testdata/utf8-mix");
 
 /// Deterministic xorshift64: a failure is reproducible from the seed alone.
 pub const Rng = struct {
@@ -64,6 +67,8 @@ pub const Gen = union(enum) {
     alice_prefix: usize,
     /// `alice[i % alice.len]`, `n` bytes: text repeated past a meta-block.
     alice_cycle: usize,
+    /// `utf8_mix[0..n]` — non-Latin UTF-8 text.
+    utf8_mix: usize,
     /// Random on one side of `split`, text on the other: a stored block
     /// followed by a compressed final block, and the reverse.
     mixed: struct { n: usize, split: usize, random_first: bool, seed: u64 },
@@ -113,6 +118,7 @@ pub fn build(gpa: std.mem.Allocator, shape: Shape) ![]u8 {
             return buf;
         },
         .alice_prefix => |n| return gpa.dupe(u8, alice[0..n]),
+        .utf8_mix => |n| return gpa.dupe(u8, utf8_mix[0..n]),
         .alice_cycle => |n| {
             const buf = try gpa.alloc(u8, n);
             for (buf, 0..) |*b, i| b.* = alice[i % alice.len];
@@ -189,6 +195,8 @@ pub const shapes = [_]Shape{
     .{ .name = "alice_65519", .gen = .{ .alice_prefix = 65519 } },
     .{ .name = "alice_65521", .gen = .{ .alice_prefix = 65521 } },
     .{ .name = "alice_full", .gen = .{ .alice_prefix = alice.len } },
+    // Non-Latin UTF-8: the UTF8 context mode's lead-byte classes.
+    .{ .name = "utf8_mix", .gen = .{ .utf8_mix = utf8_mix.len } },
 
     // Multi-meta-block: stored and compressed blocks in both orders, and the
     // block boundary itself.
@@ -515,6 +523,13 @@ pub const ref_streams = [_]RefStream{
     .{ .input = "x", .quality = 11, .lgwin = 22, .file = "x.q11.w22.br" },
     .{ .input = "empty", .quality = 1, .lgwin = 22, .file = "empty.q1.w22.br" },
     .{ .input = "empty", .quality = 11, .lgwin = 22, .file = "empty.q11.w22.br" },
+
+    // UTF8-mode context modelling over every two-byte lead-byte class
+    // (`tools/gen_utf8_mix.py`): 0xD0..0xDF as `p2` was misclassed until
+    // 2026-10-15, and these streams were refused.
+    .{ .input = "utf8-mix", .quality = 5, .lgwin = 22, .file = "utf8-mix.q5.w22.br" },
+    .{ .input = "utf8-mix", .quality = 9, .lgwin = 22, .file = "utf8-mix.q9.w22.br" },
+    .{ .input = "utf8-mix", .quality = 11, .lgwin = 22, .file = "utf8-mix.q11.w22.br" },
 };
 
 /// How a shape is encoded for the reference to judge. Every effort is

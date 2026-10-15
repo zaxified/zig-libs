@@ -173,6 +173,11 @@ const utf8_last: [256]u8 = // stylua: ignore
         60, 60, 60, 60, 60, 56, 60, 60, 60, 60, 60, 24, 12, 28, 12, 0,
     } ++ (.{ 0, 1 } ** 32) ++ (.{ 2, 3 } ** 32);
 
+/// 0x80..0xDF (continuation and two-byte lead bytes) are class 0, 0xE0..0xFF
+/// (three- and four-byte lead bytes) class 2. 0xD0..0xDF were class 2 until
+/// 2026-10-15 — wrong against libbrotli's `_kBrotliContextLookupTable`, so
+/// google's UTF8-mode streams of Cyrillic, Hebrew or Arabic text were refused
+/// or misdecoded, and ours were misread by every other decoder.
 const utf8_second: [256]u8 = // stylua: ignore
     [_]u8{
         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
@@ -183,7 +188,7 @@ const utf8_second: [256]u8 = // stylua: ignore
         2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1,
         1, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
         3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 1, 1, 1, 1, 0,
-    } ++ rep(0, 64) ++ rep(0, 16) ++ rep(2, 48);
+    } ++ rep(0, 64) ++ rep(0, 32) ++ rep(2, 32);
 
 const signed_last: [256]u8 =
     [_]u8{ 0, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8 } ++
@@ -203,4 +208,16 @@ pub const context_lookup: [2048]u8 =
 
 comptime {
     if (context_lookup.len != 2048) @compileError("context_lookup must be 2048 bytes");
+}
+
+test "context_lookup is libbrotli's _kBrotliContextLookupTable" {
+    // SHA-256 of the 2048 bytes libbrotlicommon 1.2.0 exports, dumped by a
+    // five-line C program (`extern const uint8_t
+    // _kBrotliContextLookupTable[2048]`, printed byte by byte; 2026-10-15).
+    // The UTF8 mode's second-byte classes for 0xD0..0xDF once differed here
+    // and nowhere else; encoder and decoder share this table, so only the
+    // reference's streams could show it (`utf8-mix` in the interop corpus).
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(&context_lookup, &digest, .{});
+    try std.testing.expectEqualStrings("0e4abc034ef46244934d117f15876cd477d0fb2ac94a023093338e72e37f7ad9", &std.fmt.bytesToHex(digest, .lower));
 }
