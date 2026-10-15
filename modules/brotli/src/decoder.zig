@@ -595,24 +595,185 @@ fn DecoderOf(comptime Sink: type) type {
         /// they came when a command ran in one piece.
         fn runCommands(self: *Self) Error!bool {
             while (true) {
-                // A command the window cut short, or one the hot loop left
-                // (`hotCommands`).
+                // A command the window cut short, or one a loop below left.
                 if (self.cmd_phase != .header and !try self.resumeCommand()) return false;
-                if (try self.hotCommands()) return true;
+                const r = if (self.hotReady()) try self.hotCommands() else try self.slowCommands();
+                if (r == .done) return true;
             }
         }
 
-        /// Commands while each fits the output whole and copies from the
-        /// window: true at the meta-block's end; false with the command it
-        /// cannot make set up in `self` for `resumeCommand`. It calls nothing
-        /// out of line and keeps its lengths in locals — for the compiler an
-        /// output byte may land on `self`, so a field would be read back
-        /// after every byte, and a call in the loop costs registers
+        /// How `hotCommands` / `slowCommands` stopped: the meta-block is
+        /// done; a command is set up in `self` for `resumeCommand`; or the
+        /// other loop should go on.
+        const Outcome = enum { done, again, slow, fast };
+
+        /// Sixteen input bytes at hand: what a command header needs, with
+        /// its two refills, in `hotCommands`.
+        fn hotReady(self: *const Self) bool {
+            return self.br.data.len - self.br.byte_pos >= hot_margin;
+        }
+
+        /// Commands while each fits the output whole, copies from the window
+        /// and the input has `hot_margin` bytes at hand, with the bit reader
+        /// in locals (`HotBits`): behind `self.br` its state was stored and
+        /// loaded around every output byte, as an output byte may land
+        /// anywhere for the compiler (perf annotate, 2026-10-15). A read
+        /// never fetches input here: a header and a distance start only with
+        /// `hot_margin` bytes at hand, a literal only with eight; short of
+        /// them the command is handed to `resumeCommand` (literals,
+        /// distance) or the next to `slowCommands` (header). Lengths are
+        /// locals too and nothing is called out of line but block switches
         /// (measured: each worth ~10 % on `d_text`).
-        inline fn hotCommands(self: *Self) Error!bool {
+        /// `ensureRoom` from `hotCommands`: a streaming sink bounds the output
+        /// by the input consumed (`effectiveCap`), which is `h`'s position.
+        inline fn hotRoom(self: *Self, h: *const HotBits, n: usize) Error!void {
+            if (Sink == RingSink) self.br.byte_pos = h.pos;
+            try self.ensureRoom(n);
+        }
+
+        inline fn hotCommands(self: *Self) Error!Outcome {
+            var mlen = self.mlen;
+            defer self.mlen = mlen;
+            var h = HotBits.load(self.br);
+            defer h.store(self.br);
+            while (mlen > 0) {
+                // Command block switch.
+                if (self.block_length[1] == 0) {
+                    h.store(self.br);
+                    try self.decodeBlockTypeAndLength(1);
+                    h = HotBits.load(self.br);
+                    self.htree_command = &self.command_group[self.block_type_rb[1][1]];
+                }
+                if (!h.hasMargin()) return .slow;
+                h.top();
+                const cmd = h.symbol(self.htree_command);
+                self.block_length[1] -= 1;
+                if (cmd >= tables.num_command_symbols) return error.InvalidHuffman;
+                const v = tables.cmd_lut[cmd];
+                const insert_len: u32 = v.insert_len_offset + h.bits(v.insert_len_extra_bits);
+                const copy_len: u32 = v.copy_len_offset + h.bits(v.copy_len_extra_bits);
+                self.dist_htree_index = self.dist_context_map_slice[v.context];
+
+                // Insert literals.
+                try self.hotRoom(&h, insert_len);
+                var done: u32 = 0;
+                if (insert_len <= self.out.room()) {
+                    while (done < insert_len) : (done += 1) {
+                        if (self.block_length[0] == 0) {
+                            h.store(self.br);
+                            try self.decodeBlockTypeAndLength(0);
+                            h = HotBits.load(self.br);
+                            self.prepareLiteralDecoding();
+                        }
+                        if (h.cnt < 15) {
+                            if (!h.canRefill()) break;
+                            h.refill();
+                        }
+                        var lit: u16 = undefined;
+                        if (self.trivial_literal_context) {
+                            lit = h.symbol(self.literal_htree);
+                        } else {
+                            const len = self.out.pos();
+                            const p1: u8 = if (len >= 1) self.out.back(1) else 0;
+                            const p2: u8 = if (len >= 2) self.out.back(2) else 0;
+                            const context = self.context_lookup[p1] | self.context_lookup[256 + @as(usize, p2)];
+                            lit = h.symbol(&self.literal_group[self.context_map_slice[context]]);
+                        }
+                        try self.out.put(@intCast(lit));
+                        self.block_length[0] -= 1;
+                    }
+                }
+                if (done < insert_len) {
+                    // The window is short of the insert, or the input of a
+                    // literal: the rest from `resumeCommand`.
+                    @branchHint(.unlikely);
+                    self.cmd_v = v;
+                    self.insert_len = insert_len;
+                    self.copy_len = copy_len;
+                    self.insert_left = insert_len - done;
+                    self.cmd_phase = .literals;
+                    return .again;
+                }
+                mlen -= insert_len;
+                // RFC 7932 9.2: the commands produce exactly MLEN bytes.
+                if (mlen < 0) return error.InvalidLength;
+                if (mlen == 0) break;
+
+                var distance: i32 = undefined;
+                if (v.distance_code >= 0) {
+                    // Implicit (== 0): reuse last distance.
+                    self.last_distance_context = 1;
+                    self.dist_rb_idx -%= 1;
+                    distance = self.dist_rb[self.dist_rb_idx & 3];
+                } else {
+                    if (self.block_length[2] == 0) {
+                        h.store(self.br);
+                        try self.decodeBlockTypeAndLength(2);
+                        h = HotBits.load(self.br);
+                        self.dist_context_map_slice = self.dist_context_map[self.block_type_rb[2][1] * 4 ..][0..4];
+                        self.dist_htree_index = self.dist_context_map_slice[v.context];
+                    }
+                    if (!h.hasMargin()) {
+                        @branchHint(.unlikely);
+                        self.cmd_v = v;
+                        self.copy_len = copy_len;
+                        self.cmd_phase = .distance;
+                        return .again;
+                    }
+                    h.top();
+                    const code = h.symbol(&self.distance_group[self.dist_htree_index]);
+                    self.block_length[2] -= 1;
+                    self.last_distance_context = 0;
+                    if ((code & ~@as(u16, 0xf)) == 0) {
+                        distance = self.takeDistanceFromRingBuffer(code);
+                    } else {
+                        if (code >= self.dist_offset.len) return error.InvalidDistance;
+                        const nbits = self.dist_extra_bits[code];
+                        const extra = h.bits(nbits);
+                        const dv: u64 = @as(u64, self.dist_offset[code]) + (@as(u64, extra) << @intCast(self.npostfix));
+                        distance = if (dv > tables.max_allowed_distance) 0x7FFFFFFF else @intCast(dv);
+                    }
+                }
+                const pos = self.out.pos();
+                const max_distance: i64 = @min(@as(i64, @intCast(pos)), @as(i64, @intCast(self.max_backward)));
+                if (@as(i64, distance) > max_distance) {
+                    // The prefix or the static dictionary: set up and made
+                    // as a cut-short command is.
+                    @branchHint(.unlikely);
+                    self.copy_len = copy_len;
+                    self.far_distance = distance;
+                    self.cmd_phase = .far;
+                    return .again;
+                }
+                // Normal LZ77 backward copy.
+                const copy: usize = copy_len;
+                if (distance <= 0) return error.InvalidDistance;
+                const d: usize = @intCast(distance);
+                if (d > pos) return error.InvalidDistance;
+                self.dist_rb[self.dist_rb_idx & 3] = distance;
+                self.dist_rb_idx +%= 1;
+                try self.hotRoom(&h, copy);
+                if (copy > self.out.room()) {
+                    @branchHint(.unlikely);
+                    self.copy_left = copy;
+                    self.copy_dist = d;
+                    self.pending_len = copy;
+                    self.cmd_phase = .copy;
+                    return .again;
+                }
+                try self.out.copyBack(d, copy);
+                mlen -= @intCast(copy);
+                if (mlen < 0) return error.InvalidLength;
+            }
+            return .done;
+        }
+
+        fn slowCommands(self: *Self) Error!Outcome {
             var mlen = self.mlen;
             defer self.mlen = mlen;
             while (mlen > 0) {
+                // Eight bytes at hand again (a new chunk): back to the hot loop.
+                if (self.hotReady()) return .fast;
                 // Command block switch.
                 if (self.block_length[1] == 0) {
                     try self.decodeBlockTypeAndLength(1);
@@ -635,7 +796,7 @@ fn DecoderOf(comptime Sink: type) type {
                     self.copy_len = copy_len;
                     self.insert_left = insert_len;
                     self.cmd_phase = .literals;
-                    return false;
+                    return .again;
                 }
                 try self.literals(insert_len);
                 mlen -= insert_len;
@@ -653,7 +814,7 @@ fn DecoderOf(comptime Sink: type) type {
                     self.copy_len = copy_len;
                     self.far_distance = distance;
                     self.cmd_phase = .far;
-                    return false;
+                    return .again;
                 }
                 // Normal LZ77 backward copy.
                 const copy: usize = copy_len;
@@ -669,13 +830,13 @@ fn DecoderOf(comptime Sink: type) type {
                     self.copy_dist = d;
                     self.pending_len = copy;
                     self.cmd_phase = .copy;
-                    return false;
+                    return .again;
                 }
                 try self.out.copyBack(d, copy);
                 mlen -= @intCast(copy);
                 if (mlen < 0) return error.InvalidLength;
             }
-            return true;
+            return .done;
         }
 
         /// Go on with a command from `cmd_phase` (state in `self`, `mlen`
@@ -1051,6 +1212,84 @@ fn inverseMoveToFront(v: []u8) void {
 }
 
 /// Bytes `ListSink` keeps allocated past every reservation.
+/// Input bytes `hotCommands` needs at hand to start a command header or a
+/// distance: two refills of up to eight bytes each.
+const hot_margin = 16;
+
+/// The bit reader's state in locals for `hotCommands` (same invariants as
+/// `BitReader`: bits above `cnt` are zero). It never fetches a chunk: the
+/// caller checks the margin (`hasMargin`, `canRefill`) before reads that may
+/// refill, so a symbol read never runs short — no `TruncatedInput` checks.
+const HotBits = struct {
+    acc: u64,
+    cnt: u32,
+    pos: usize,
+    data: [*]const u8,
+    len: usize,
+
+    inline fn load(br: *const BitReader) HotBits {
+        return .{ .acc = br.acc, .cnt = br.cnt, .pos = br.byte_pos, .data = br.data.ptr, .len = br.data.len };
+    }
+
+    inline fn store(h: HotBits, br: *BitReader) void {
+        // `refill` leaves real stream bits above `cnt`; `BitReader` keeps
+        // them zero.
+        br.acc = if (h.cnt >= 64) h.acc else h.acc & ((@as(u64, 1) << @intCast(h.cnt)) - 1);
+        br.cnt = h.cnt;
+        br.byte_pos = h.pos;
+    }
+
+    /// Two refills' worth of input at hand.
+    inline fn hasMargin(h: HotBits) bool {
+        return h.len - h.pos >= hot_margin;
+    }
+
+    /// One refill's worth.
+    inline fn canRefill(h: HotBits) bool {
+        return h.len - h.pos >= 8;
+    }
+
+    /// To 56..63 bits. Precondition: `canRefill`, `cnt < 64`.
+    /// To 57..64 bits from any count (`refill` needs one below 64).
+    inline fn top(h: *HotBits) void {
+        if (h.cnt <= 56) h.refill();
+    }
+
+    /// Branch-free: the whole next eight bytes are or-ed in above `cnt`;
+    /// only the whole bytes counted move `pos`, so the bits of the partial
+    /// byte above are loaded again, the same, by the next refill.
+    inline fn refill(h: *HotBits) void {
+        h.acc |= std.mem.readInt(u64, h.data[h.pos..][0..8], .little) << @intCast(h.cnt);
+        h.pos += (63 - h.cnt) >> 3;
+        h.cnt |= 56;
+    }
+
+    /// A symbol (codes are at most 15 bits). Precondition: 15 bits held,
+    /// or `canRefill`.
+    inline fn symbol(h: *HotBits, table: *const huffman.Table) u16 {
+        if (h.cnt < 15) h.refill();
+        const idx: usize = @truncate(h.acc & ((@as(u64, 1) << @intCast(table.bits)) - 1));
+        var e = table.entries[idx];
+        if (e.len & huffman.link_flag != 0) {
+            const sub_bits: u6 = @intCast(e.len & ~huffman.link_flag);
+            const sub: usize = @truncate((h.acc >> @intCast(table.bits)) & ((@as(u64, 1) << sub_bits) - 1));
+            e = table.entries[@as(usize, e.sym) + sub];
+        }
+        h.acc >>= @intCast(e.len);
+        h.cnt -= e.len;
+        return e.sym;
+    }
+
+    /// `n` (0..32) bits. Precondition: `n` bits held, or `canRefill`.
+    inline fn bits(h: *HotBits, n: u32) u32 {
+        if (h.cnt < n) h.refill();
+        const v: u32 = @truncate(h.acc & ((@as(u64, 1) << @intCast(n)) - 1));
+        h.acc >>= @intCast(n);
+        h.cnt -= n;
+        return v;
+    }
+};
+
 const copy_slack = 32;
 
 /// `buf[dst..][0..16] = buf[src..][0..16]` through a register (the ranges may
