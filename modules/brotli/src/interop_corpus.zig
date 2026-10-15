@@ -320,6 +320,149 @@ pub fn largeRefFile(comptime c: LargeCase, comptime q: u8) []const u8 {
     return std.fmt.comptimePrint("large/{s}.q{d}.br", .{ c.name, q });
 }
 
+// ── serialized shared dictionaries (RFC 9841 §5) ──────────────────────────
+
+/// A serialized shared dictionary, generated: an LZ77 part, a word list
+/// harvested from text, a transform list, one or two dictionaries.
+pub const SerialSpec = struct {
+    lz77: ?Piece = null,
+    /// Words of 4..31 letters (and `'`), first occurrences in order, up to
+    /// `1 << words_bits` per length.
+    words: ?Piece = null,
+    words_bits: u4 = 8,
+    /// A custom transform list (`custom_transforms`).
+    transforms: bool = false,
+    /// Two dictionaries — the custom pair and RFC 7932's words with the same
+    /// transforms — chosen by the literal context (contexts 0..31 the first,
+    /// 32..63 the second).
+    by_context: bool = false,
+};
+
+/// The custom transform list: stringlets " ", ", ", "the ", "." and the
+/// empty one; triplets in google/brotli's order (prefix, operation,
+/// suffix); every operation kind once, the shifts with parameters.
+pub const custom_transforms = struct {
+    pub const stringlets = [_][]const u8{ " ", ", ", "the ", "." };
+    /// prefix index, operation, suffix index (4 = the empty stringlet).
+    pub const triplets = [_][3]u8{
+        .{ 4, 0, 4 },  .{ 4, 0, 0 },  .{ 0, 0, 4 },  .{ 2, 0, 0 },  .{ 4, 10, 4 }, .{ 4, 11, 0 },
+        .{ 4, 1, 4 },  .{ 4, 3, 1 },  .{ 4, 9, 4 },  .{ 4, 12, 4 }, .{ 0, 14, 3 }, .{ 4, 20, 4 },
+        .{ 4, 21, 4 }, .{ 4, 22, 4 }, .{ 0, 22, 0 },
+    };
+    pub const params = [_]u16{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0xFFFF, 0x20 };
+};
+
+/// The bytes of `spec`'s dictionary.
+pub fn serialize(gpa: std.mem.Allocator, comptime spec: SerialSpec) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    try out.appendSlice(gpa, &.{ 0x91, 0x00 });
+    // LZ77_DICTIONARY_LENGTH as a varint, then the bytes.
+    const lz = if (spec.lz77) |p| try p.build(gpa) else try gpa.alloc(u8, 0);
+    defer gpa.free(lz);
+    var n = lz.len;
+    while (true) {
+        const b: u8 = @intCast(n & 0x7f);
+        n >>= 7;
+        try out.append(gpa, if (n != 0) b | 0x80 else b);
+        if (n == 0) break;
+    }
+    try out.appendSlice(gpa, lz);
+    // NUM_CUSTOM_WORD_LISTS and the list.
+    if (spec.words) |p| {
+        try out.append(gpa, 1);
+        const text = try p.build(gpa);
+        defer gpa.free(text);
+        var by_len: [32]std.ArrayList([]const u8) = @splat(.empty);
+        defer for (&by_len) |*l| l.deinit(gpa);
+        var i: usize = 0;
+        while (i < text.len) {
+            if (!isWordByte(text[i])) {
+                i += 1;
+                continue;
+            }
+            var j = i;
+            while (j < text.len and isWordByte(text[j])) j += 1;
+            const w = text[i..j];
+            i = j;
+            if (w.len < 4 or w.len > 31) continue;
+            const list = &by_len[w.len];
+            if (list.items.len >= @as(usize, 1) << spec.words_bits) continue;
+            for (list.items) |x| {
+                if (std.mem.eql(u8, x, w)) break;
+            } else try list.append(gpa, w);
+        }
+        var bits: [32]u8 = @splat(0);
+        for (4..32) |l| {
+            const have = by_len[l].items.len;
+            if (have == 0) continue;
+            bits[l] = @intCast(std.math.log2_int(usize, have));
+        }
+        try out.appendSlice(gpa, bits[4..32]);
+        for (4..32) |l| {
+            if (bits[l] == 0) continue;
+            for (by_len[l].items[0 .. @as(usize, 1) << @intCast(bits[l])]) |w| try out.appendSlice(gpa, w);
+        }
+    } else try out.append(gpa, 0);
+    // NUM_CUSTOM_TRANSFORM_LISTS and the list.
+    if (spec.transforms) {
+        try out.append(gpa, 1);
+        const ct = custom_transforms;
+        var ps: std.ArrayList(u8) = .empty;
+        defer ps.deinit(gpa);
+        for (ct.stringlets) |x| {
+            try ps.append(gpa, @intCast(x.len));
+            try ps.appendSlice(gpa, x);
+        }
+        try ps.append(gpa, 0);
+        try out.appendSlice(gpa, &std.mem.toBytes(std.mem.nativeToLittle(u16, @intCast(ps.items.len))));
+        try out.appendSlice(gpa, ps.items);
+        try out.append(gpa, ct.triplets.len);
+        for (ct.triplets) |t| try out.appendSlice(gpa, &t);
+        for (ct.params) |x| try out.appendSlice(gpa, &std.mem.toBytes(std.mem.nativeToLittle(u16, x)));
+    } else try out.append(gpa, 0);
+    // NUM_DICTIONARIES, the map, CONTEXT_ENABLED, the context map.
+    if (spec.words != null or spec.transforms) {
+        const nw: u8 = @intFromBool(spec.words != null);
+        const nt: u8 = @intFromBool(spec.transforms);
+        const custom_pair = [2]u8{ 0, if (nt == 1) 0 else nt };
+        if (spec.by_context) {
+            try out.append(gpa, 2);
+            try out.appendSlice(gpa, &custom_pair);
+            try out.appendSlice(gpa, &.{ nw, if (nt == 1) 0 else nt }); // RFC 7932's words
+            try out.append(gpa, 1);
+            for (0..64) |c| try out.append(gpa, @intFromBool(c >= 32));
+        } else {
+            try out.append(gpa, 1);
+            try out.appendSlice(gpa, &custom_pair);
+            try out.append(gpa, 0);
+        }
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+fn isWordByte(c: u8) bool {
+    return std.ascii.isAlphabetic(c) or c == '\'';
+}
+
+pub const SerialCase = struct { name: []const u8, dict: SerialSpec, input: Piece };
+
+/// Streams libbrotli makes against a serialized dictionary — which only a
+/// build of it with BROTLI_EXPERIMENTAL can (`interop -- --brotli-src`).
+pub const serial_cases = [_]SerialCase{
+    .{ .name = "ser_lz77", .dict = .{ .lz77 = .{ .shape = "alice_full", .to = 20_000 } }, .input = .{ .shape = "alice_full", .from = 10_000, .to = 40_000 } },
+    .{ .name = "ser_words", .dict = .{ .words = .{ .shape = "alice_full" } }, .input = .{ .shape = "alice_full", .from = 100_000, .to = 130_000 } },
+    .{ .name = "ser_words_tr", .dict = .{ .words = .{ .shape = "alice_full" }, .transforms = true }, .input = .{ .shape = "alice_full", .from = 100_000, .to = 130_000 } },
+    .{ .name = "ser_tr", .dict = .{ .transforms = true }, .input = .{ .shape = "alice_full", .from = 100_000, .to = 130_000 } },
+    .{ .name = "ser_ctx", .dict = .{ .lz77 = .{ .shape = "alice_full", .to = 4_000 }, .words = .{ .shape = "alice_full" }, .transforms = true, .by_context = true }, .input = .{ .shape = "alice_full", .from = 100_000, .to = 130_000 } },
+};
+pub const serial_qualities = [_]u8{ 5, 9, 11 };
+
+/// `testdata/ref/serial/<case>.q<Q>.br`.
+pub fn serialRefFile(comptime c: SerialCase, comptime q: u8) []const u8 {
+    return std.fmt.comptimePrint("serial/{s}.q{d}.br", .{ c.name, q });
+}
+
 const corpusBuild = build;
 
 // ── the reference's own streams ─────────────────────────────────────────────

@@ -47,6 +47,13 @@
 //! (`tools/c_oracle/shared_oracle.c`) built with `zig cc` against the system
 //! library (`--libbrotli DIR`, default /usr/lib/x86_64-linux-gnu).
 //!
+//! Serialized shared dictionaries (RFC 9841 §5) need more: a packaged
+//! libbrotli refuses them unless built with BROTLI_EXPERIMENTAL. With
+//! `--brotli-src DIR` (a google/brotli checkout, security-reviewed first:
+//! this compiles its `c/`) the program builds that oracle and checks — and
+//! with `--capture` records — the serialized-dictionary streams; without
+//! it, a NOTE says they were not re-taken.
+//!
 //! Needs `python3` with `pip install brotli`. It does not skip: an absent
 //! reference is a failure here, because running this program IS the request to
 //! consult the reference.
@@ -182,6 +189,51 @@ const Shared = struct {
         return .{ .ref = ref, .exe = exe };
     }
 
+    /// The same oracle built from google/brotli's own sources with
+    /// BROTLI_EXPERIMENTAL — what serialized shared dictionaries need (a
+    /// packaged library refuses them: "DO NOT USE: methods accepting this
+    /// value will fail"). `src` is a google/brotli checkout (its `c/`
+    /// directory), reviewed before it is given here: this compiles it.
+    fn buildExperimental(ref: *Ref, checkout: []const u8) !Shared {
+        const gpa = ref.gpa;
+        const exe = try ref.path("shared_oracle_experimental");
+        errdefer gpa.free(exe);
+        var argv: std.ArrayList([]const u8) = .empty;
+        defer argv.deinit(gpa);
+        var owned: std.ArrayList([]u8) = .empty;
+        defer {
+            for (owned.items) |o| gpa.free(o);
+            owned.deinit(gpa);
+        }
+        const inc = try std.fmt.allocPrint(gpa, "-I{s}/c/include", .{checkout});
+        try owned.append(gpa, inc);
+        try argv.appendSlice(gpa, &.{ "zig", "cc", "-O2", "-DBROTLI_EXPERIMENTAL", inc, Shared.src, "-lm", "-o", exe });
+        for ([_][]const u8{ "common", "dec", "enc" }) |part| {
+            const dir_path = try std.fmt.allocPrint(gpa, "{s}/c/{s}", .{ checkout, part });
+            defer gpa.free(dir_path);
+            var dir = std.Io.Dir.cwd().openDir(ref.io, dir_path, .{ .iterate = true }) catch {
+                std.debug.print("--brotli-src {s}: no {s}\n", .{ checkout, dir_path });
+                return error.NoReference;
+            };
+            defer dir.close(ref.io);
+            var it = dir.iterate();
+            while (try it.next(ref.io)) |e| {
+                if (e.kind != .file or !std.mem.endsWith(u8, e.name, ".c")) continue;
+                const f = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ dir_path, e.name });
+                try owned.append(gpa, f);
+                try argv.append(gpa, f);
+            }
+        }
+        const r = try std.process.run(gpa, ref.io, .{ .argv = argv.items });
+        defer gpa.free(r.stdout);
+        defer gpa.free(r.stderr);
+        if (r.term != .exited or r.term.exited != 0) {
+            std.debug.print("could not build google/brotli from {s} with BROTLI_EXPERIMENTAL:\n{s}\n", .{ checkout, r.stderr });
+            return error.NoReference;
+        }
+        return .{ .ref = ref, .exe = exe };
+    }
+
     fn deinit(sh: *Shared) void {
         sh.ref.gpa.free(sh.exe);
     }
@@ -203,6 +255,22 @@ const Shared = struct {
         var qb: [4]u8 = undefined;
         var wb: [4]u8 = undefined;
         try sh.ref.call(&.{ sh.exe, "enc", std.fmt.bufPrint(&qb, "{d}", .{quality}) catch unreachable, std.fmt.bufPrint(&wb, "{d}", .{lgwin}) catch unreachable, if (large) "1" else "0", d, in, out }, false);
+        return sh.ref.read(Ref.out_bin);
+    }
+
+    /// The library's stream for `plain` against a serialized dictionary.
+    fn compressSerialized(sh: *Shared, dict: []const u8, plain: []const u8, quality: u8) ![]u8 {
+        const gpa = sh.ref.gpa;
+        const d = try sh.file("dict.bin", dict);
+        defer gpa.free(d);
+        const sd = try std.fmt.allocPrint(gpa, "s:{s}", .{d});
+        defer gpa.free(sd);
+        const in = try sh.file(Ref.in_bin, plain);
+        defer gpa.free(in);
+        const out = try sh.file(Ref.out_bin, null);
+        defer gpa.free(out);
+        var qb: [4]u8 = undefined;
+        try sh.ref.call(&.{ sh.exe, "enc", std.fmt.bufPrint(&qb, "{d}", .{quality}) catch unreachable, "22", "0", sd, in, out }, false);
         return sh.ref.read(Ref.out_bin);
     }
 
@@ -525,6 +593,70 @@ fn captureLargeRefStreams(sh: *Shared) !void {
     std.debug.print("wrote {d} large-window reference streams into {s}/large/ ({d} bytes total)\n", .{ corpus.large_cases.len * corpus.large_qualities.len, ref_dir, total });
 }
 
+// ── serialized shared dictionaries: libbrotli's streams, our decoders ───────
+
+fn checkSerialDecoderDirection(ex: *Shared) !void {
+    inline for (corpus.serial_cases) |c| try checkSerialCase(ex, c);
+}
+
+fn checkSerialCase(ex: *Shared, comptime c: corpus.SerialCase) !void {
+    const gpa = ex.ref.gpa;
+    const dict = try corpus.serialize(gpa, c.dict);
+    defer gpa.free(dict);
+    const plain = try c.input.build(gpa);
+    defer gpa.free(plain);
+    var sd = brotli.parseSharedDictionary(gpa, dict) catch |e| {
+        bad("serial {s}: we could not parse the dictionary ({s})", .{ c.name, @errorName(e) });
+        return;
+    };
+    defer sd.deinit();
+    inline for (corpus.serial_qualities) |q| {
+        const stream = try ex.compressSerialized(dict, plain, q);
+        defer gpa.free(stream);
+        if (try ourSerialDecoders(gpa, &sd, stream, plain)) |why| {
+            bad("serial {s} q{d}: we did not decode the library's stream ({s})", .{ c.name, q, why });
+        } else ok();
+        const fx = ref_dir ++ "/" ++ comptime corpus.serialRefFile(c, q);
+        if (std.Io.Dir.cwd().readFileAlloc(ex.ref.io, fx, gpa, .unlimited)) |committed| {
+            defer gpa.free(committed);
+            if (!std.mem.eql(u8, committed, stream))
+                note("{s}: the committed stream is not what this library emits ({d} vs {d} bytes) — --capture re-records it", .{ fx, committed.len, stream.len });
+        } else |_| note("{s}: not committed yet — run with --capture --brotli-src DIR", .{fx});
+    }
+}
+
+fn ourSerialDecoders(gpa: std.mem.Allocator, sd: *const brotli.SharedDictionary, stream: []const u8, plain: []const u8) !?[]const u8 {
+    const opts: brotli.Options = .{ .shared_dictionary = sd, .max_output = 1 << 24 };
+    const a = brotli.decompress(gpa, stream, opts) catch |e| return @errorName(e);
+    defer gpa.free(a);
+    if (!std.mem.eql(u8, a, plain)) return "decompress: different bytes";
+    var r: std.Io.Reader = .fixed(stream);
+    var w: std.Io.Writer.Allocating = .init(gpa);
+    defer w.deinit();
+    _ = brotli.decompressStream(gpa, &r, &w.writer, opts) catch |e| return @errorName(e);
+    if (!std.mem.eql(u8, w.written(), plain)) return "decompressStream: different bytes";
+    return null;
+}
+
+fn captureSerialRefStreams(ex: *Shared) !void {
+    const gpa = ex.ref.gpa;
+    try std.Io.Dir.cwd().createDirPath(ex.ref.io, ref_dir ++ "/serial");
+    var total: usize = 0;
+    inline for (corpus.serial_cases) |c| {
+        const dict = try corpus.serialize(gpa, c.dict);
+        defer gpa.free(dict);
+        const plain = try c.input.build(gpa);
+        defer gpa.free(plain);
+        inline for (corpus.serial_qualities) |q| {
+            const stream = try ex.compressSerialized(dict, plain, q);
+            defer gpa.free(stream);
+            try std.Io.Dir.cwd().writeFile(ex.ref.io, .{ .sub_path = ref_dir ++ "/" ++ comptime corpus.serialRefFile(c, q), .data = stream });
+            total += stream.len;
+        }
+    }
+    std.debug.print("wrote {d} serialized-dictionary reference streams into {s}/serial/ ({d} bytes total)\n", .{ corpus.serial_cases.len * corpus.serial_qualities.len, ref_dir, total });
+}
+
 fn captureDictRefStreams(sh: *Shared) !void {
     const gpa = sh.ref.gpa;
     try std.Io.Dir.cwd().createDirPath(sh.ref.io, ref_dir ++ "/dict");
@@ -684,6 +816,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
 
     var driver: []const u8 = default_driver;
     var lib_dir: []const u8 = Shared.lib_dir_default;
+    var brotli_src: ?[]const u8 = null;
     var scratch: []const u8 = default_scratch;
     var capture = false;
 
@@ -698,6 +831,8 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
             scratch = args.next() orelse return usage();
         } else if (std.mem.eql(u8, a, "--libbrotli")) {
             lib_dir = args.next() orelse return usage();
+        } else if (std.mem.eql(u8, a, "--brotli-src")) {
+            brotli_src = args.next() orelse return usage();
         } else {
             std.debug.print("unknown argument '{s}'\n", .{a});
             return usage();
@@ -728,6 +863,11 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         return 2;
     };
     defer shared.deinit();
+    var experimental: ?Shared = if (brotli_src) |src| Shared.buildExperimental(&ref, src) catch |e| {
+        std.debug.print("could not build the experimental oracle: {s}\n", .{@errorName(e)});
+        return 2;
+    } else null;
+    defer if (experimental) |*x| x.deinit();
 
     if (capture) {
         // Capture and stop. The live check compares against the fixtures as
@@ -736,6 +876,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         try captureRefStreams(&ref);
         try captureDictRefStreams(&shared);
         try captureLargeRefStreams(&shared);
+        if (experimental) |*x| try captureSerialRefStreams(x) else std.debug.print("serialized-dictionary streams kept as committed (no --brotli-src)\n", .{});
         try captureBlessed(&ref, &shared, provenance);
         std.debug.print("fixtures rewritten — re-run `zig build interop-brotli` to verify them\n", .{});
         return 0;
@@ -747,13 +888,16 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     try checkDictEncoderDirection(&shared);
     try checkLargeDecoderDirection(&shared);
     try checkLargeEncoderDirection(&shared);
+    if (experimental) |*x| {
+        try checkSerialDecoderDirection(x);
+    } else note("serialized shared dictionaries not re-taken: they need google/brotli built with BROTLI_EXPERIMENTAL (--brotli-src DIR); the replay test still checks the committed streams", .{});
     std.debug.print("{d} checks, {d} mismatches, {d} notes\n", .{ checks, failures, notes });
     return if (failures == 0) 0 else 1;
 }
 
 fn usage() u8 {
     std.debug.print(
-        \\usage: zig build interop-brotli -- [--capture] [--driver PATH] [--scratch DIR] [--libbrotli DIR]
+        \\usage: zig build interop-brotli -- [--capture] [--driver PATH] [--scratch DIR] [--libbrotli DIR] [--brotli-src DIR]
         \\
     , .{});
     return 2;

@@ -310,6 +310,106 @@ pub fn transformWord(dst: []u8, word: []const u8, len_in: usize, transform_idx: 
     return idx;
 }
 
+/// One transform in its general form (RFC 9841 §3.1.1, for custom transform
+/// lists): `prefix`, then `word` under operation `op` (0..20 as RFC 7932 §8;
+/// 21 ShiftFirst and 22 ShiftAll by `param`), then `suffix`. Returns the
+/// bytes written to `dst`, which must hold `prefix.len + word.len +
+/// suffix.len`.
+pub fn applyOp(dst: []u8, prefix: []const u8, op: u8, param: u16, suffix: []const u8, word: []const u8) usize {
+    var idx: usize = 0;
+    @memcpy(dst[idx..][0..prefix.len], prefix);
+    idx += prefix.len;
+    var w = word;
+    if (op >= 1 and op <= OMIT_LAST_9) {
+        w = w[0..w.len -| op];
+    } else if (op >= OMIT_FIRST_1 and op <= OMIT_FIRST_9) {
+        w = w[@min(w.len, op - (OMIT_FIRST_1 - 1))..];
+    }
+    const out = dst[idx..][0..w.len];
+    @memcpy(out, w);
+    idx += w.len;
+    switch (op) {
+        UPPERCASE_FIRST => if (out.len > 0) {
+            _ = toUpperCase(out);
+        },
+        UPPERCASE_ALL => {
+            var off: usize = 0;
+            while (off < out.len) off += toUpperCase(out[off..]);
+        },
+        op_shift_first, op_shift_all => {
+            // ADDEND: PARAMETER sign-extended to 24 bits.
+            const addend: u32 = if (param >= 0x8000) @as(u32, param) + 0xFF0000 else param;
+            var off: usize = 0;
+            while (off < out.len) {
+                const step = shiftScalar(out[off..], addend);
+                if (step == 0) break; // the pattern runs past the word's end
+                off += step;
+                if (op == op_shift_first) break;
+            }
+        },
+        else => {},
+    }
+    @memcpy(dst[idx..][0..suffix.len], suffix);
+    idx += suffix.len;
+    return idx;
+}
+
+pub const op_shift_first = 21;
+pub const op_shift_all = 22;
+
+/// Shift the SCALAR `p` starts with by `addend` (RFC 9841 §3.1.1): the 7-,
+/// 11-, 16- or 21-bit value in the "s" bits of 1..4 bytes gets the sum's low
+/// bits back, the pattern bits unchanged. Returns the bytes it covered — 1
+/// for a byte that starts no pattern, 0 when the pattern is longer than `p`.
+fn shiftScalar(p: []u8, addend: u32) usize {
+    const b0 = p[0];
+    if (b0 < 0x80) {
+        const v = (@as(u32, b0) +% addend) & 0x7f;
+        p[0] = @intCast(v);
+        return 1;
+    }
+    const n: usize, const lead_bits: u5 = if (b0 & 0xE0 == 0xC0) .{ 2, 5 } else if (b0 & 0xF0 == 0xE0) .{ 3, 4 } else if (b0 & 0xF8 == 0xF0) .{ 4, 3 } else return 1;
+    if (p.len < n) return 0;
+    const lead_mask: u8 = (@as(u8, 1) << @intCast(lead_bits)) - 1;
+    var v: u32 = b0 & lead_mask;
+    for (p[1..n]) |c| v = (v << 6) | (c & 0x3f);
+    v +%= addend;
+    var k = n - 1;
+    while (k > 0) : (k -= 1) {
+        p[k] = (p[k] & 0xC0) | @as(u8, @intCast(v & 0x3f));
+        v >>= 6;
+    }
+    p[0] = (b0 & ~lead_mask) | (@as(u8, @intCast(v & 0xff)) & lead_mask);
+    return n;
+}
+
+test "applyOp: the RFC 7932 operations, and the shifts of RFC 9841 3.1.1" {
+    var buf: [64]u8 = undefined;
+    const t = std.testing;
+    try t.expectEqualStrings("<abcd>", buf[0..applyOp(&buf, "<", 0, 0, ">", "abcd")]);
+    try t.expectEqualStrings("ab", buf[0..applyOp(&buf, "", 2, 0, "", "abcd")]);
+    try t.expectEqualStrings("", buf[0..applyOp(&buf, "", 9, 0, "", "abcd")]);
+    try t.expectEqualStrings("cd", buf[0..applyOp(&buf, "", 13, 0, "", "abcd")]);
+    try t.expectEqualStrings("Abcd", buf[0..applyOp(&buf, "", 10, 0, "", "abcd")]);
+    try t.expectEqualStrings("ABCD", buf[0..applyOp(&buf, "", 11, 0, "", "abcd")]);
+    // ShiftAll by 1: every 7-bit scalar + 1 (wrapping in its 7 bits).
+    try t.expectEqualStrings("bcde", buf[0..applyOp(&buf, "", 22, 1, "", "abcd")]);
+    try t.expectEqualSlices(u8, &.{0x00}, buf[0..applyOp(&buf, "", 22, 1, "", &.{0x7f})]);
+    // ShiftFirst: only the first scalar.
+    try t.expectEqualStrings("bbcd", buf[0..applyOp(&buf, "", 21, 1, "", "abcd")]);
+    // A negative addend: 0xFFFF is -1 (sign-extended to 24 bits).
+    try t.expectEqualStrings("`abc", buf[0..applyOp(&buf, "", 22, 0xFFFF, "", "abcd")]);
+    // An 11-bit scalar: U+00E9 (C3 A9) + 1 = U+00EA (C3 AA); the X bits stay.
+    try t.expectEqualSlices(u8, &.{ 0xC3, 0xAA }, buf[0..applyOp(&buf, "", 22, 1, "", &.{ 0xC3, 0xA9 })]);
+    try t.expectEqualSlices(u8, &.{ 0xC3, 0x2A }, buf[0..applyOp(&buf, "", 22, 1, "", &.{ 0xC3, 0x29 })]);
+    // A 16-bit scalar carrying across the continuation bytes: U+20AC (E2 82 AC) + 0x14 = U+20C0 (E2 83 80).
+    try t.expectEqualSlices(u8, &.{ 0xE2, 0x83, 0x80 }, buf[0..applyOp(&buf, "", 22, 0x14, "", &.{ 0xE2, 0x82, 0xAC })]);
+    // A pattern cut short by the word's end ends the transform; a byte that
+    // starts no pattern (a continuation byte) is passed over.
+    try t.expectEqualSlices(u8, &.{ 'b', 0xE2, 0x82 }, buf[0..applyOp(&buf, "", 22, 1, "", &.{ 'a', 0xE2, 0x82 })]);
+    try t.expectEqualSlices(u8, &.{ 0x80, 'b' }, buf[0..applyOp(&buf, "", 22, 1, "", &.{ 0x80, 'a' })]);
+}
+
 // --- RFC 7932 Appendix B / section 8 semantics (mutation run 2026-10-04) ------
 // Transforms with an empty prefix and suffix, so the output is the bare word
 // transform: 0 identity, 9 UPPERCASE_FIRST, 44 UPPERCASE_ALL, and the OMIT

@@ -64,6 +64,11 @@ pub const decompressStream = decoder.decompressStream;
 /// A pull `std.Io.Reader` over a stream's decompressed bytes: decodes as
 /// reads need it, suspending mid-command. See `decoder.Decompressor`.
 pub const Decompressor = decoder.Decompressor;
+
+/// Read a serialized shared dictionary (RFC 9841 §5) for
+/// `Options.shared_dictionary`; it refers to `bytes`. Decoder only.
+pub const parseSharedDictionary = @import("shared_dictionary.zig").parse;
+pub const SharedDictionary = decoder.SharedDictionary;
 pub const StreamError = decoder.StreamError;
 
 /// Compress `input` into a valid Brotli stream. Caller owns the returned slice.
@@ -114,6 +119,7 @@ test {
     _ = @import("stream_test.zig");
     _ = @import("stream_writer.zig");
     _ = @import("dcb.zig");
+    _ = @import("shared_dictionary.zig");
     _ = @import("crafted_test.zig");
 }
 

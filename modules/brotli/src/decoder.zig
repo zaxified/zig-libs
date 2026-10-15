@@ -11,6 +11,8 @@ const tables = @import("tables.zig");
 const dict = @import("dictionary.zig");
 const transforms = @import("transforms.zig");
 const errors = @import("errors.zig");
+const shared = @import("shared_dictionary.zig");
+pub const SharedDictionary = shared.SharedDictionary;
 
 pub const BrotliError = errors.BrotliError;
 
@@ -51,6 +53,11 @@ pub const Options = struct {
     /// what the streaming decoder holds. Distances stay below 2^31, as
     /// google/brotli's (the RFC allows a decoder that limit).
     large_window: bool = false,
+    /// A serialized shared dictionary (RFC 9841 §5; `parseSharedDictionary`):
+    /// its word lists and transforms stand in for (or extend) RFC 7932's
+    /// static dictionary, its LZ77 dictionary is a prefix dictionary — so
+    /// `dictionary` must then be empty if it has one.
+    shared_dictionary: ?*const SharedDictionary = null,
     /// Called with what metadata meta-blocks carry (google/brotli's
     /// metadata callbacks); without it they are skipped.
     metadata: ?Metadata = null,
@@ -114,6 +121,8 @@ fn DecoderOf(comptime Sink: type) type {
         prefix: []const u8 = &.{},
         /// `Options.metadata`.
         metadata: ?Options.Metadata = null,
+        /// `Options.shared_dictionary`.
+        shared: ?*const SharedDictionary = null,
         dist_rb: [4]i32 = .{ 16, 15, 11, 4 },
         dist_rb_idx: u32 = 0,
 
@@ -172,8 +181,10 @@ fn DecoderOf(comptime Sink: type) type {
         /// `dict_addr` before `copy_left` from the window.
         dict_addr: usize = 0,
         dict_left: usize = 0,
-        /// A static-dictionary word (transformed), `word_off` of it out.
-        word: [transforms.maxOutputLen(dict.max_word_length)]u8 = undefined,
+        /// A static-dictionary word (transformed), `word_off` of it out —
+        /// room for a custom transform's 255-byte prefix and suffix around a
+        /// 31-byte word (RFC 9841), more than RFC 7932's own need.
+        word: [@max(transforms.maxOutputLen(dict.max_word_length), 2 * shared.max_affix_len + shared.max_word_length)]u8 = undefined,
         word_len: usize = 0,
         word_off: usize = 0,
 
@@ -796,6 +807,17 @@ fn DecoderOf(comptime Sink: type) type {
                 // Static-dictionary reference (its word ids start past
                 // the prefix dictionary).
                 if (distance > tables.max_allowed_distance) return error.InvalidDistance;
+                if (self.shared) |sd| if (sd.custom()) {
+                    const address: u64 = @intCast(@as(i64, distance) - max_distance - 1 - @as(i64, @intCast(self.prefix.len)));
+                    self.dist_rb_idx +%= self.last_distance_context;
+                    const wlen = try self.customWord(sd, address, copy);
+                    try self.ensureRoom(wlen);
+                    self.word_len = wlen;
+                    self.word_off = 0;
+                    self.pending_len = wlen;
+                    self.cmd_phase = .word;
+                    return;
+                };
                 if (copy < dict.min_word_length or copy > dict.max_word_length) return error.InvalidDictionary;
                 const shift = dict.size_bits_by_length[copy];
                 if (shift == 0) return error.InvalidDictionary;
@@ -916,6 +938,45 @@ fn DecoderOf(comptime Sink: type) type {
             };
         }
 
+        /// A static-dictionary word under a serialized shared dictionary
+        /// (RFC 9841 §3.1) into `self.word`, its length returned. `address`
+        /// counts through the dictionaries in turn — the current literal
+        /// context's first when the dictionary is context dependent, then the
+        /// others in their order: past one dictionary's words × transforms
+        /// for this length, it goes on in the next.
+        fn customWord(self: *Self, sd: *const SharedDictionary, address_in: u64, len: usize) Error!usize {
+            if (len < shared.min_word_length or len > shared.max_word_length) return error.InvalidDictionary;
+            const nd = sd.dictionaries.len;
+            var first: usize = 0;
+            if (sd.context_map) |cm| {
+                const pos = self.out.pos();
+                const p1: u8 = if (pos >= 1) self.out.back(1) else 0;
+                const p2: u8 = if (pos >= 2) self.out.back(2) else 0;
+                first = cm[self.context_lookup[p1] | self.context_lookup[256 + @as(usize, p2)]];
+            }
+            var address = address_in;
+            for (0..nd) |k| {
+                const di = if (k == 0) first else if (k <= first) k - 1 else k;
+                const pair = sd.dictionaries[di];
+                const words = pair.words orelse &shared.WordList.builtin;
+                const nw = words.count(len);
+                const nt: usize = if (pair.transforms) |t| t.len() else transforms.num_transforms;
+                const span = @as(u64, nw) * nt;
+                if (address >= span) {
+                    address -= span;
+                    continue;
+                }
+                const word = words.word(len, @intCast(address & (nw - 1)));
+                const ti: usize = @intCast(address >> @intCast(words.size_bits[len]));
+                if (pair.transforms) |t| {
+                    const tri = t.triplets[3 * ti ..][0..3];
+                    return transforms.applyOp(&self.word, t.affix(tri[0]), tri[1], t.param(ti), t.affix(tri[2]), word);
+                }
+                return transforms.transformWord(&self.word, word, len, ti);
+            }
+            return error.InvalidDictionary;
+        }
+
         /// After the last meta-block: the fill bits to the byte boundary must
         /// be zero (RFC 7932 §9.2, as google/brotli checks), and what the bit
         /// reader read past them goes back to the input.
@@ -946,6 +1007,14 @@ fn DecoderOf(comptime Sink: type) type {
             while (try self.step() != .done) {}
         }
     };
+}
+
+/// The prefix dictionary `options` give: the raw one, or the shared
+/// dictionary's LZ77 one — not both.
+fn prefixOf(options: Options) BrotliError![]const u8 {
+    const lz: []const u8 = if (options.shared_dictionary) |sd| sd.prefix else &.{};
+    if (lz.len != 0 and options.dictionary.len != 0) return error.InvalidDictionary;
+    return if (lz.len != 0) lz else options.dictionary;
 }
 
 const WindowBits = struct { wbits: u6, large: bool = false };
@@ -1154,9 +1223,10 @@ pub fn decompressInto(gpa: std.mem.Allocator, out: []u8, input: []const u8, opti
         .arena = arena_state.allocator(),
         .br = &br,
         .out = &sink,
-        .prefix = options.dictionary,
+        .prefix = try prefixOf(options),
         .allow_large_window = options.large_window,
         .metadata = options.metadata,
+        .shared = options.shared_dictionary,
     };
     try dec.run();
     return out[0..sink.len];
@@ -1176,9 +1246,10 @@ pub fn decompress(gpa: std.mem.Allocator, input: []const u8, options: Options) B
         .arena = arena_state.allocator(),
         .br = &br,
         .out = &sink,
-        .prefix = options.dictionary,
+        .prefix = try prefixOf(options),
         .allow_large_window = options.large_window,
         .metadata = options.metadata,
+        .shared = options.shared_dictionary,
     };
     try dec.run();
 
@@ -1289,7 +1360,8 @@ const RingSink = struct {
     fn setWindow(s: *RingSink, wbits: u6) Error!void {
         // A copy out of the prefix dictionary that runs on into the window
         // reaches back up to the window plus the dictionary.
-        const window = std.math.ceilPowerOfTwo(usize, (@as(usize, 1) << @intCast(wbits)) + s.options.dictionary.len) catch return error.OutOfMemory;
+        const prefix_len = if (prefixOf(s.options)) |px| px.len else |_| 0;
+        const window = std.math.ceilPowerOfTwo(usize, (@as(usize, 1) << @intCast(wbits)) + prefix_len) catch return error.OutOfMemory;
         const cap_pow2 = std.math.ceilPowerOfTwo(usize, @max(s.options.max_output, 1)) catch window;
         s.limit = @min(window, cap_pow2);
         const len = @min(s.limit, initial_len);
@@ -1360,6 +1432,7 @@ pub const Decompressor = struct {
     pub fn init(gpa: std.mem.Allocator, in: *std.Io.Reader, buffer: []u8, options: Options) Decompressor {
         return .{
             .reader = .{ .vtable = &.{ .stream = stream }, .buffer = buffer, .seek = 0, .end = 0 },
+            .err = if (prefixOf(options)) |_| null else |e| e,
             .arena_state = .init(gpa),
             .br = .initStream(in),
             .sink = .{ .gpa = gpa, .options = options },
@@ -1368,9 +1441,10 @@ pub const Decompressor = struct {
                 .arena = undefined,
                 .br = undefined,
                 .out = undefined,
-                .prefix = options.dictionary,
+                .prefix = prefixOf(options) catch "", // refused through `err`, below
                 .allow_large_window = options.large_window,
                 .metadata = options.metadata,
+                .shared = options.shared_dictionary,
             },
         };
     }

@@ -31,7 +31,7 @@ Surveyed 2026-10-14 per `SURVEY-PLAYBOOK.md` (first 2026-09-30); stars and activ
 | [akunaakwei/zig-brotli](https://github.com/akunaakwei/zig-brotli) / [Scythe-Technology/zbrotli](https://github.com/Scythe-Technology/zbrotli) | Zig (wrap C) | zlib / MIT | 1 / 0 | pushed 2026-04-18 / 2026-06-05 | Build-system wrappers or bindings for google/brotli's C — full features, but link C. |
 | Zig `std.compress` | Zig | MIT | — | Zig 0.16.0 | `flate`, `lzma`, `lzma2`, `xz`, `zstd`; **no brotli** (verified: `lib/std/compress/` listing, 2026-10-14). |
 
-**Where we are ahead:** pure Zig with no C, unlike the wrappers; typed errors with an output cap and a ratio bound on by default (google/brotli added an output limit to its Python binding only in 1.2.0); a decoder whose one-shot, into-buffer and streaming forms are checked against each other by a differential fuzz driver and scored by mutation; encoder streams verified by the reference decoder over 45 shapes; `.default` beats q5 on text (51 467 vs 52 809 B). **Where we are behind:** no `mode` parameter; no serialized dictionaries (raw prefix ones and `dcb` are in); no pull reader; `.best` 9 % behind q11 (→ Backlog R1–R11).
+**Where we are ahead:** pure Zig with no C, unlike the wrappers; typed errors with an output cap and a ratio bound on by default (google/brotli added an output limit to its Python binding only in 1.2.0); a decoder whose one-shot, into-buffer and streaming forms are checked against each other by a differential fuzz driver and scored by mutation; encoder streams verified by the reference decoder over 45 shapes; `.default` beats q5 on text (51 467 vs 52 809 B). **Where we are behind:** no `mode` parameter; no `.max` effort (q11-class ratio); no pull reader; `.best` 9 % behind q11 (→ Backlog R1–R11).
 
 ## Scope & honesty
 
@@ -67,6 +67,28 @@ All of the following are fully implemented:
   need their dictionary. Negative control: without the ring push, 8 of them fail. Not exercised by
   any committed stream: a dictionary copy that runs on into the window once the output has passed
   `max_backward` (libbrotli did not emit one on the corpus).
+- **Serialized shared dictionaries** (RFC 9841 §5, 2026-10-15; `parseSharedDictionary` →
+  `Options.shared_dictionary`, all decoders): custom word lists (4–31 bytes), custom transform lists
+  (stringlets up to 255 bytes; operations 0–22, the new ShiftFirst/ShiftAll on 7/11/16/21-bit SCALARs
+  with a sign-extended ADDEND), up to 64 word/transform pairs, chosen by the literal context's map
+  when there is one — the context's pair first, then the others in order, an address past a pair's
+  words × transforms going on in the next — and an LZ77 dictionary that is a prefix dictionary (not
+  together with `Options.dictionary`). ⚠ **RFC 9841 §5 lists a transform's bytes as prefix, suffix,
+  operation; google/brotli reads prefix, operation, suffix** (`BROTLI_TRANSFORM_TYPE` is byte 1, as in
+  RFC 7932's own table). google/brotli is the only producer, so its order is the one implemented;
+  dictionaries built to the RFC's text are refused by google/brotli.
+  **Anchored** on 15 streams google/brotli 1.2.0 made against generated dictionaries — LZ77 only,
+  custom words, custom transforms (the streams use ShiftAll), RFC 7932 words with custom transforms,
+  and two context-chosen pairs with an LZ77 part — at q5/q9/q11, decoded by every decoder in the
+  replay test and refused or mis-decoded without the dictionary. The packaged libbrotli refuses
+  serialized dictionaries ("DO NOT USE … will fail"); the oracle is google/brotli built from source
+  with `BROTLI_EXPERIMENTAL` (`interop -- --brotli-src DIR`; v1.2.0 tarball sha256
+  `816c96e8…6477dfec`, security-reviewed 2026-10-15 before it was compiled: system headers, process/
+  file/network calls, asm (ARM only), constructors (table init), data headers — clean). Negative
+  controls: the RFC's triplet order crashes on the first ShiftAll reference (index 22 of 5
+  stringlets); ignoring the context map fails the 3 context streams. The parser is tested on every
+  truncation, a byte more, and single-byte changes of each dictionary (it found a `u8` overflow on a
+  255-byte stringlet); the differential fuzz driver decodes damaged dictionary streams (40 000 runs).
 - **End of stream**: the fill bits after the last meta-block must be zero (RFC 7932 §9.2 "should be
   rejected"; `InvalidPadding` since 2026-10-15, as google/brotli — which takes `0x3f` and refuses
   `0xff`; before, `0xff` decoded to nothing).
@@ -444,7 +466,7 @@ Order: P (encoder hasher) → R1 (+R3–R5) → R6/R8 → R9 (+R10/R11) → R7 �
 - ~~**R4 `maxCompressedSize(n)` + `compressInto(out, …)`**~~ — **DONE 2026-10-14**: `maxCompressedSize(n, opts)` (every block stored + the final empty meta-block; reached exactly by random input, tested over windows and block sizes) and `compressInto(gpa, out, input, opts)` — the `compressWith` stream in the caller's buffer, `error.OutputTooLarge` only when that stream does not fit (tested on the whole corpus × efforts at its exact length and one byte less). A block whose attempt overruns the buffer is decided again in a scratch writer, so a tight buffer never changes the bytes.
 - ~~**R5 Metadata meta-blocks from the encoder**~~ — **DONE 2026-10-14**: `StreamWriter.writeMetadata(bytes)` (google's `EMIT_METADATA`): a flush, then metadata meta-blocks of up to 16 MiB each (shortest MSKIPBYTES); blessed by google/brotli (`stream_metadata` variant).
 - ~~**R6 Raw prefix dictionary (RFC 9841) on both ends + RFC 9842 `dcb` framing**~~ — **DONE 2026-10-14**: decoder `Options.dictionary` (§ Decoder), encoder `CompressOptions.dictionary` / `StreamOptions.dictionary` (§ Encoder), `brotli.dcb` (header, compress, decompress, `NotDcb`/`DictionaryMismatch`). Left for later: a prepared dictionary shared by many compressions (google's `PrepareDictionary`: today each compression inserts the dictionary's positions anew — O(dictionary) per response). (`ff 44 43 42` + SHA-256 of the dictionary + Shared-Brotli stream, window ≤ 16 MiB) — delta updates of web assets; Chrome ships it.
-- **R7 Serialized shared dictionaries (RFC 9841 §5) — decoder only**: custom word lists, custom transforms incl. ShiftFirst/ShiftAll, context-selected dictionaries, embedded prefix. Encoder side deliberately not (owner 2026-10-14: a research tool only google ships).
+- ~~**R7 Serialized shared dictionaries (RFC 9841 §5) — decoder only**~~ — **DONE 2026-10-15** (§ Decoder, "Serialized shared dictionaries"). Encoder side deliberately not (owner 2026-10-14: a research tool only google ships).
 - ~~**R8 Large window (RFC 9841)**~~ — **DONE 2026-10-14**: decoder `Options.large_window` (§ Decoder); encoder `window_bits` 25..30 (`max_large_window_bits`) writes the RFC 9841 header and names distances with the large alphabet's first 74 codes (to 2^31), simple distance codes as wide as the 140-symbol alphabet; a copy from 17 MiB back found and blessed by libbrotli (`large_*` entries).
 - ~~**R9 Pull `std.Io.Reader` decoder**~~ — **DONE 2026-10-15** as `Decompressor` (§ Streaming decoder); `decompressStream` is a loop over it. Left: the decoder costs +4–9 % against before R6/R9 (§ Streaming decoder).
 - ~~**R10 Metadata callbacks** in the decoder~~ — **DONE 2026-10-15** (`Options.metadata`).

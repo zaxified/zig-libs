@@ -22,7 +22,7 @@
 //!
 //!   zig build interop-brotli -- --capture
 //!
-//! Reference: python brotli 1.2.0 (google/brotli), Python 3.14.4, 2026-10-14
+//! Reference: python brotli 1.2.0 (google/brotli), Python 3.14.4, 2026-10-15
 
 pub const Blessed = struct {
     name: []const u8,

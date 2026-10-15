@@ -8,6 +8,9 @@
 //   shared_oracle enc <quality> <lgwin> <large 0|1> <dict|-> <in> <out>
 //   shared_oracle dec <large 0|1> <dict|-> <in> <out>
 //
+// A dictionary argument `s:<path>` is a serialized shared dictionary (RFC
+// 9841 §5); any other path a raw prefix dictionary.
+//
 // Exit 0 on success; 2 when the library refuses the stream (dec) or the
 // parameters (enc); 1 on any other failure (I/O, memory).
 #include <brotli/decode.h>
@@ -16,6 +19,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* The dictionary type and path an argument names. */
+static BrotliSharedDictionaryType dict_type(const char **path) {
+    if (strncmp(*path, "s:", 2) == 0) {
+        *path += 2;
+        return BROTLI_SHARED_DICTIONARY_SERIALIZED;
+    }
+    return BROTLI_SHARED_DICTIONARY_RAW;
+}
 
 static unsigned char *slurp(const char *path, size_t *len) {
     *len = 0;
@@ -47,6 +59,7 @@ static void spill(const char *path, const unsigned char *data, size_t len) {
 
 static int enc(int quality, int lgwin, int large, const char *dict_path, const char *in_path, const char *out_path) {
     size_t dict_len, in_len;
+    BrotliSharedDictionaryType type = dict_type(&dict_path);
     unsigned char *dict = slurp(dict_path, &dict_len);
     unsigned char *in = slurp(in_path, &in_len);
     BrotliEncoderState *s = BrotliEncoderCreateInstance(NULL, NULL, NULL);
@@ -57,7 +70,7 @@ static int enc(int quality, int lgwin, int large, const char *dict_path, const c
         return 2;
     BrotliEncoderPreparedDictionary *pd = NULL;
     if (dict) {
-        pd = BrotliEncoderPrepareDictionary(BROTLI_SHARED_DICTIONARY_RAW, dict_len, dict, BROTLI_MAX_QUALITY, NULL, NULL, NULL);
+        pd = BrotliEncoderPrepareDictionary(type, dict_len, dict, BROTLI_MAX_QUALITY, NULL, NULL, NULL);
         if (!pd || !BrotliEncoderAttachPreparedDictionary(s, pd)) return 2;
     }
     size_t cap = in_len + (in_len >> 2) + 1024, out_len = 0;
@@ -86,12 +99,13 @@ static int enc(int quality, int lgwin, int large, const char *dict_path, const c
 
 static int dec(int large, const char *dict_path, const char *in_path, const char *out_path) {
     size_t dict_len, in_len;
+    BrotliSharedDictionaryType type = dict_type(&dict_path);
     unsigned char *dict = slurp(dict_path, &dict_len);
     unsigned char *in = slurp(in_path, &in_len);
     BrotliDecoderState *s = BrotliDecoderCreateInstance(NULL, NULL, NULL);
     if (!s) return 1;
     if (!BrotliDecoderSetParameter(s, BROTLI_DECODER_PARAM_LARGE_WINDOW, (uint32_t)large)) return 2;
-    if (dict && !BrotliDecoderAttachDictionary(s, BROTLI_SHARED_DICTIONARY_RAW, dict_len, dict)) return 2;
+    if (dict && !BrotliDecoderAttachDictionary(s, type, dict_len, dict)) return 2;
     size_t cap = (in_len < 1024 ? 1024 : in_len) * 4, out_len = 0;
     unsigned char *out = malloc(cap);
     if (!out) return 1;

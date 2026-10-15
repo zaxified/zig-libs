@@ -139,6 +139,40 @@ test "interop replay: the decoders reproduce libbrotli's large-window streams, a
     }
 }
 
+test "interop replay: the decoders reproduce libbrotli's serialized-dictionary streams" {
+    // Made by google/brotli built with BROTLI_EXPERIMENTAL (`interop --
+    // --brotli-src`): an LZ77 dictionary, custom words, custom transforms
+    // (google's triplet order; the streams use ShiftAll), and two pairs
+    // chosen by the literal context.
+    const gpa = testing.allocator;
+    inline for (corpus.serial_cases) |c| {
+        const dict = try corpus.serialize(gpa, c.dict);
+        defer gpa.free(dict);
+        var sd = try brotli.parseSharedDictionary(gpa, dict);
+        defer sd.deinit();
+        const plain = try c.input.build(gpa);
+        defer gpa.free(plain);
+        inline for (corpus.serial_qualities) |q| {
+            const stream = @embedFile("testdata/ref/" ++ comptime corpus.serialRefFile(c, q));
+            errdefer std.debug.print("serial {s} q{d}\n", .{ c.name, q });
+            const opts: brotli.Options = .{ .shared_dictionary = &sd, .max_output = 1 << 24 };
+            const a = try brotli.decompress(gpa, stream, opts);
+            defer gpa.free(a);
+            try testing.expectEqualSlices(u8, plain, a);
+            var r: std.Io.Reader = .fixed(stream);
+            var w: std.Io.Writer.Allocating = .init(gpa);
+            defer w.deinit();
+            _ = try brotli.decompressStream(gpa, &r, &w.writer, opts);
+            try testing.expectEqualSlices(u8, plain, w.written());
+            // Without the dictionary: refused, or other bytes.
+            if (brotli.decompress(gpa, stream, .{ .max_output = 1 << 24 })) |other| {
+                defer gpa.free(other);
+                try testing.expect(!std.mem.eql(u8, plain, other));
+            } else |_| {}
+        }
+    }
+}
+
 // ── direction 2: our streams, as the reference blessed them ─────────────────
 
 test "interop replay: the encoder still emits the exact streams google/brotli accepted" {

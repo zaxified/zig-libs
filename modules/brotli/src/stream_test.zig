@@ -455,9 +455,20 @@ const fz_bases = [_][]const u8{
     @embedFile("testdata/ref/x.q1.w22.br"),
 };
 
+/// Bases decoded against a dictionary: a serialized one (custom words,
+/// transforms, context pairs) or a raw prefix one.
+const fz_dict_bases = [_]struct { stream: []const u8, case: usize, serial: bool }{
+    .{ .stream = @embedFile("testdata/ref/" ++ corpus.serialRefFile(corpus.serial_cases[4], 11)), .case = 4, .serial = true },
+    .{ .stream = @embedFile("testdata/ref/" ++ corpus.serialRefFile(corpus.serial_cases[2], 5)), .case = 2, .serial = true },
+    .{ .stream = @embedFile("testdata/ref/" ++ corpus.dictRefFile(corpus.dict_cases[1], 11)), .case = 1, .serial = false },
+};
+
 fn streamDiffHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     var buf: [16 << 10]u8 = undefined;
-    const base = fz_bases[src.index(fz_bases.len)];
+    // A third of the runs: a stream that leans on a dictionary.
+    const with_dict = src.valueRangeAtMost(u8, 0, 2) == 0;
+    const dbase = fz_dict_bases[src.index(fz_dict_bases.len)];
+    const base = if (with_dict) dbase.stream else fz_bases[src.index(fz_bases.len)];
     var len: usize = @min(base.len, buf.len);
     @memcpy(buf[0..len], base[0..len]);
 
@@ -486,7 +497,27 @@ fn streamDiffHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror
         }
     }
     const input = buf[0..len];
-    const opts: brotli.Options = .{ .max_output = 1 << 20 };
+    var opts: brotli.Options = .{ .max_output = 1 << 20 };
+    var sd: ?brotli.SharedDictionary = null;
+    defer if (sd) |*x| x.deinit();
+    var dict_bytes: ?[]u8 = null;
+    defer if (dict_bytes) |d| gpa.free(d);
+    if (with_dict) {
+        if (dbase.serial) {
+            dict_bytes = switch (dbase.case) {
+                inline 0...corpus.serial_cases.len - 1 => |k| try corpus.serialize(gpa, corpus.serial_cases[k].dict),
+                else => unreachable,
+            };
+            sd = try brotli.parseSharedDictionary(gpa, dict_bytes.?);
+            opts.shared_dictionary = &sd.?;
+        } else {
+            dict_bytes = switch (dbase.case) {
+                inline 0...corpus.dict_cases.len - 1 => |k| try corpus.dict_cases[k].dict.build(gpa),
+                else => unreachable,
+            };
+            opts.dictionary = dict_bytes.?;
+        }
+    }
 
     const want = brotli.decompress(gpa, input, opts);
     defer if (want) |w| gpa.free(w) else |_| {};

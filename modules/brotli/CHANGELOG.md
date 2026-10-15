@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-15** — Decoder: serialized shared dictionaries (R7, RFC 9841 §5) — `parseSharedDictionary`, `Options.shared_dictionary`: custom word lists and transforms (incl. ShiftFirst/ShiftAll), context-chosen pairs, an LZ77 part. Transform triplets in google/brotli's byte order (prefix, operation, suffix), which differs from RFC 9841's text. Anchored on 15 streams of google/brotli 1.2.0 built with BROTLI_EXPERIMENTAL (interop `--brotli-src`), committed under `testdata/ref/serial/`. Additive API.
+
 - **2026-10-15** — Encoder speed back: the dictionary support in the match finders is a comptime switch, so a search without a dictionary is the loop it was before (the per-candidate test had cost `.best` +20–27 %, `.default` +7–12 % since the R6 encoder). vs google/brotli 1.2.0: fast 0.96–1.12× (q4), default 0.97–1.04× (q6), best 0.70–0.86× (q9), decoder 1.09–1.21×. Streams unchanged.
 
 - **2026-10-15** — Decoder: the fill bits after the last meta-block must be zero (RFC 7932 §9.2) — **behaviour change**: such a stream (e.g. the single byte `0xff`) is now `InvalidPadding`, as google/brotli refuses it; it used to decode. New `Options.metadata` (R10): callbacks receive metadata meta-blocks' bytes. The streaming decoders give the bit reader's read-ahead back to the source at the end of the stream (R11; source buffer ≥ 16 bytes), so `in` is left exactly after the stream and streams decode back to back.
