@@ -82,8 +82,11 @@ pub const compressed_block_size = 1 << 20;
 
 const min_match = 4;
 /// Shortest copy taken at a distance the decoder's ring already holds: it
-/// costs no distance bits, so a few covered literals pay for it.
-const min_ring_match = 3;
+/// costs no distance bits, so a few covered literals pay for it. Two bytes
+/// at the last distance are an implicit-distance command — google q5/q11
+/// leave thousands of them on fonts (2026-10-15); the greedy matcher takes
+/// two only there (three at the others: two cost text 0.1 %).
+const min_ring_match = 2;
 /// Longest match searched for. Long runs (a file of zeros) are where a short
 /// cap hurt most: 512 left `zeros` at 651 bytes, 65 535 at 26 (the reference's
 /// q11: 14). Copy lengths themselves reach far higher (RFC 7932 copy code 23).
@@ -1020,15 +1023,15 @@ const Matcher = struct {
         var best_dist: usize = 0;
         var best_gain: f32 = 0;
         if (ring_n != 0) {
-            const head3 = std.mem.readInt(u32, self.data[p..][0..4], .little) & 0xffffff;
+            const head2 = std.mem.readInt(u32, self.data[p..][0..4], .little) & 0xffff;
             for (self.ring.last[0..ring_n], 0..) |rd, i| {
                 const d: usize = rd;
                 if (d == 0 or d > max_dist) continue;
                 const c = p - d;
                 // Most fail on the first bytes: no full compare for those.
-                if (std.mem.readInt(u32, self.data[c..][0..4], .little) & 0xffffff != head3) continue;
+                if (std.mem.readInt(u32, self.data[c..][0..4], .little) & 0xffff != head2) continue;
                 const l = matchLen(self.data, c, p, max_len);
-                if (l < min_ring_match) continue;
+                if (l < @as(usize, if (i == 0) min_ring_match else 3)) continue;
                 // The last distance: code 0 or no distance symbol at all; the
                 // second-last: a two-bit-ish short code.
                 const g = @as(f32, @floatFromInt(l)) * self.lit_cost - @as(f32, if (i == 0) 3 else 5);
@@ -1903,10 +1906,10 @@ fn bestAt(
     const max_len = @min(end - p, max_match);
     const reach = x.outMax(p, max_dist);
     if (p + 4 <= end) {
-        const head: u32 = std.mem.readInt(u32, data[p..][0..4], .little) & 0xffffff;
+        const head: u32 = std.mem.readInt(u32, data[p..][0..4], .little) & 0xffff;
         for (ring.last[0..2], 0..) |d, i| {
             if (d == 0 or d > reach) continue;
-            if (std.mem.readInt(u32, data[p - d ..][0..4], .little) & 0xffffff != head) continue;
+            if (std.mem.readInt(u32, data[p - d ..][0..4], .little) & 0xffff != head) continue;
             const l = Matcher.matchLen(data, p - d, p, max_len);
             if (l < min_ring_match) continue;
             const g = @as(f32, @floatFromInt(l)) * lit_cost - @as(f32, if (i == 0) 3 else 5);
@@ -2047,8 +2050,8 @@ fn buildCommandsOptimal(
                 if (d == 0 or d > reach) continue;
                 if (std.mem.indexOfScalar(u32, nd.ring[0..r], d) != null) continue;
                 const c = pos - d;
-                const head: u32 = std.mem.readInt(u32, data[pos..][0..4], .little) & 0xffffff;
-                if (std.mem.readInt(u32, data[c..][0..4], .little) & 0xffffff != head) continue;
+                const head: u32 = std.mem.readInt(u32, data[pos..][0..4], .little) & 0xffff;
+                if (std.mem.readInt(u32, data[c..][0..4], .little) & 0xffff != head) continue;
                 const l: u32 = @intCast(Matcher.matchLen(data, c, pos, max_len));
                 if (l < min_ring_match) continue;
                 const whole = l >= max_take_len;
