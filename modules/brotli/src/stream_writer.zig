@@ -15,9 +15,10 @@
 //! the output with an empty metadata meta-block, as google/brotli's
 //! `BROTLI_OPERATION_FLUSH` does.
 //!
-//! (`compressWith` sizes the match finder's table to its input, the stream
-//! to its window or `size_hint`: the same bytes hold for an input of at least
-//! the window, or with the input's length as the hint.)
+//! (`compressWith` sizes the match finder's table to its input up to the
+//! window, the stream to its window or `size_hint` (`encoder.tableSize`): the
+//! same bytes hold for an input of at least the window, or with the input's
+//! length as the hint.)
 //!
 //! Memory: the history the window needs, the block being gathered, and the
 //! match finder's table — one allocation each, kept across `reset` (a
@@ -52,8 +53,7 @@ pub const StreamOptions = struct {
     dictionary: []const u8 = &.{},
 
     fn tableSize(o: StreamOptions) usize {
-        const window = @as(usize, 1) << o.window_bits;
-        return @min(window, o.size_hint orelse window) + o.dictionary.len;
+        return encoder.tableSize(o.size_hint orelse @as(usize, 1) << o.window_bits, o.dictionary.len, o.window_bits);
     }
 };
 
@@ -584,9 +584,8 @@ test "size_hint: a table for the input, and compressWith's bytes for a short one
         try testing.expectEqualSlices(u8, want, out.written());
         out.clearRetainingCapacity();
         try sw.reset(&out.writer, .{ .effort = effort, .size_hint = 1 << 20 });
-        // (`.q9`'s 256-deep buckets reach their cap of 2^12 at 3 000 bytes.)
         const big = tableLen(&sw.core);
-        try testing.expect(if (effort == .q9) small == big else small < big);
+        try testing.expect(small < big);
         out.clearRetainingCapacity();
         try sw.reset(&out.writer, .{ .effort = effort, .size_hint = 10 });
         try writeStream(&sw, src, 700, &.{});

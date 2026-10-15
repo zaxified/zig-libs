@@ -1010,15 +1010,12 @@ const Matcher = struct {
     dict_lookups: usize = 0,
     dict_matches: usize = 0,
 
-    /// Tables for an input of about `size` bytes; `data` is set by the
-    /// caller.
-    fn init(gpa: std.mem.Allocator, size: usize, depth: u32, slots_log_max: u5) std.mem.Allocator.Error!Matcher {
+    /// Tables of 2^`slots_log` slots in all (`Effort.slotsLog`), `depth`
+    /// per bucket; `data` is set by the caller.
+    fn init(gpa: std.mem.Allocator, depth: u32, slots_log: u5) std.mem.Allocator.Error!Matcher {
         std.debug.assert(std.math.isPowerOfTwo(depth));
         const depth_log: u5 = @intCast(std.math.log2_int(u32, depth));
-        // Buckets sized to the input — compressing a few hundred bytes must
-        // not cost a fixed table — and capped so all slots together stay at
-        // `slots_log_max` (a deeper bucket means fewer of them).
-        const bucket_log: u5 = @intCast(bucketLog(size, slots_log_max - depth_log));
+        const bucket_log: u5 = @intCast(bucketLogFor(depth, slots_log));
 
         const count = try gpa.alloc(u32, @as(usize, 1) << bucket_log);
         errdefer gpa.free(count);
@@ -1034,6 +1031,11 @@ const Matcher = struct {
             .hash_shift = @intCast(32 - @as(u6, bucket_log)),
             .data = &.{},
         };
+    }
+
+    /// log2 of the buckets `init` makes: 2^8 at least.
+    fn bucketLogFor(depth: u32, slots_log: u5) u6 {
+        return @intCast(@max(8, @as(i8, slots_log) - std.math.log2_int(u32, depth)));
     }
 
     /// `@memset(buf, 0)` in 32-byte stores. Zig 0.16 without libc lowers
@@ -4326,14 +4328,23 @@ pub const Effort = enum(u4) {
         };
     }
 
-    /// log2 of all bucket slots together, the match finder's table.
-    fn slotsLog(e: Effort) u5 {
-        return switch (e) {
+    /// log2 of all bucket slots together, the match finder's table, for an
+    /// input of `size` bytes: 2^`per_byte` slots a byte, up to a cap. Sized
+    /// to the input because every call gets a fresh table, and a fresh page
+    /// costs a fault when first touched: at one bucket per byte (the sizing
+    /// until 2026-10-15) the positions of a 16 KiB input landed on every
+    /// page of `.q6`'s 2 MiB, most of its time (R16). The fuller buckets of
+    /// a smaller table are what every input past the cap has anyway; sizes
+    /// moved by ±0.3 % on 4–64 KiB slices of text, HTML, JSON and a font.
+    fn slotsLog(e: Effort, size: usize) u5 {
+        const cap: u5, const per_byte: u5 = switch (e) {
             .q0, .q1, .q4 => unreachable, // `FragMatcher`, `FastMatcher`
-            .q6 => 19,
-            .q9 => 20,
-            .q11 => 22,
+            .q6 => .{ 19, 2 },
+            .q9 => .{ 20, 3 },
+            .q11 => .{ 22, 3 },
         };
+        const size_log = std.math.log2_int_ceil(usize, @max(size, 1));
+        return @intCast(@min(cap, size_log + per_byte));
     }
 
     fn depth(e: Effort) u32 {
@@ -4378,12 +4389,19 @@ pub const max_window_bits = 24;
 /// `compress` with options.
 pub fn compressWith(gpa: std.mem.Allocator, input: []const u8, opts: CompressOptions) std.mem.Allocator.Error![]u8 {
     const wbits: u5 = opts.window_bits orelse if (input.len > 65520) 21 else 16;
-    var core = try Core.init(gpa, opts.effort, opts.block_size, wbits, input.len + opts.dictionary.len);
+    var core = try Core.init(gpa, opts.effort, opts.block_size, wbits, tableSize(input.len, opts.dictionary.len, wbits));
     defer core.deinit();
     const data = try withDictionary(gpa, input, opts.dictionary);
     defer if (data.ptr != input.ptr) gpa.free(data);
     try oneShot(&core, data, opts.dictionary.len, opts.block_size);
     return core.w.buf.toOwnedSlice(gpa);
+}
+
+/// What the match finder's table is sized for: the input, but no more than
+/// the window, which is all of it a copy can reach — and what a stream
+/// (`StreamWriter`) sizes for, so the two give the same bytes.
+pub fn tableSize(input_len: usize, dict_len: usize, wbits: u5) usize {
+    return @min(input_len, @as(usize, 1) << wbits) + dict_len;
 }
 
 /// `dict ++ input` (the match finder's one history), or `input` itself.
@@ -4407,7 +4425,7 @@ pub const CompressIntoError = std.mem.Allocator.Error || error{
 /// enough.
 pub fn compressInto(gpa: std.mem.Allocator, out: []u8, input: []const u8, opts: CompressOptions) CompressIntoError![]u8 {
     const wbits: u5 = opts.window_bits orelse if (input.len > 65520) 21 else 16;
-    var core = try Core.init(gpa, opts.effort, opts.block_size, wbits, input.len + opts.dictionary.len);
+    var core = try Core.init(gpa, opts.effort, opts.block_size, wbits, tableSize(input.len, opts.dictionary.len, wbits));
     defer core.deinit();
     core.w.buf = .initBuffer(out);
     core.w.fixed = true;
@@ -4479,7 +4497,7 @@ pub const Core = struct {
     ring: DistRing = .{},
     /// The last block written was ISLAST.
     emitted_last: bool = false,
-    /// `bucketLog` the tables were made with.
+    /// `tableLog` the tables were made with.
     table_log: u6,
 
     /// `size`: how much input the match finder's tables are sized for.
@@ -4494,7 +4512,7 @@ pub const Core = struct {
             .matcher = switch (effort.finder()) {
                 .frag => .{ .frag = try FragMatcher.init(gpa, size) },
                 .fast => .{ .fast = try FastMatcher.init(gpa, size, fast_bucket_log_max) },
-                .deep => .{ .deep = try Matcher.init(gpa, size, effort.depth(), effort.slotsLog()) },
+                .deep => .{ .deep = try Matcher.init(gpa, effort.depth(), effort.slotsLog(size)) },
             },
             .w = .{ .gpa = gpa },
             .alt = .{ .gpa = gpa },
@@ -4557,7 +4575,7 @@ pub const Core = struct {
         return switch (effort.finder()) {
             .frag => bucketLog(size, frag_bucket_log_max),
             .fast => bucketLog(size, fast_bucket_log_max),
-            .deep => bucketLog(size, effort.slotsLog() - std.math.log2_int(u32, effort.depth())),
+            .deep => Matcher.bucketLogFor(effort.depth(), effort.slotsLog(size)),
         };
     }
 
@@ -5541,7 +5559,7 @@ test "q9: static-dictionary words where no copy is found, never with a prefix di
         "the development of the environment and the management of the community";
     const max_dist = (1 << 22) - 16;
     for ([_]bool{ true, false }) |words| {
-        var m = try Matcher.init(gpa, text.len, simd_depth, 19);
+        var m = try Matcher.init(gpa, simd_depth, Effort.q6.slotsLog(text.len));
         defer m.deinit(gpa);
         m.setData(text);
         var cmds: std.ArrayListUnmanaged(Cmd) = .empty;
@@ -5579,7 +5597,7 @@ test "q9: dictionary lookups stop on data that never finds a word" {
     defer gpa.free(data);
     var rng = std.Random.DefaultPrng.init(0x7231_3500);
     rng.random().bytes(data);
-    var m = try Matcher.init(gpa, data.len, simd_depth, 19);
+    var m = try Matcher.init(gpa, simd_depth, Effort.q6.slotsLog(data.len));
     defer m.deinit(gpa);
     m.setData(data);
     var cmds: std.ArrayListUnmanaged(Cmd) = .empty;
