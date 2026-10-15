@@ -875,6 +875,12 @@ fn bucketLog(size: usize, max: u6) u6 {
 }
 
 const Matcher = struct {
+    /// The tag bits of a slot.
+    const tagged_mask: u32 = 0xff00_0000;
+    /// Data a tagged slot can index: positions below this, which is itself
+    /// a dropped position (`dropped_pos` with its tag bits).
+    const tagged_limit: u32 = 0x00ff_ffff;
+
     /// Slots per bucket = candidates walked per lookup (`Effort.depth`), a
     /// power of two.
     depth: u32,
@@ -883,7 +889,20 @@ const Matcher = struct {
     lit_cost: f32 = 8,
     /// `depth` slots per bucket, positions. A slot is read only when the
     /// bucket's count says it was written.
+    ///
+    /// While every position fits in 24 bits (`tag_mask` set), a slot's top
+    /// eight bits are a tag: eight more bits of its position's hash
+    /// (`Hashed.tag`). A lookup in a binary block (`tagsPay`) skips a
+    /// slot whose tag is not its own without loading anything from the
+    /// data: there a bucket mostly holds positions that merely share its
+    /// hash bits, and each of those cost a load from far back — on a font,
+    /// 66 slots visited per lookup at `.best`, 11 with the same first four
+    /// bytes (2026-10-15). A different tag means different first four
+    /// bytes, so no copy is missed. (Tags in a byte array of their own cost
+    /// text 4–7 % in the extra cache line.)
     slots: []u32,
+    /// `tagged_mask` while positions are tagged, else 0 (`setData`).
+    tag_mask: u32 = tagged_mask,
     /// Positions ever inserted per bucket (the next slot is `count % depth`).
     count: []u32,
     depth_log: u5,
@@ -968,13 +987,31 @@ const Matcher = struct {
     /// `by` output bytes left `data` (`Prefix.shiftPos`). Only the slots a
     /// count covers hold positions; the rest are shifted as garbage.
     fn shift(self: *Matcher, by: u32) void {
-        for (self.slots) |*s| s.* = self.prefix.shiftPos(s.*, by);
+        const m = self.tag_mask;
+        for (self.slots) |*s| {
+            const pos = s.* & ~m;
+            const moved = self.prefix.shiftPos(if (pos == ~m) dropped_pos else pos, by);
+            s.* = if (moved == dropped_pos) dropped_pos else moved | (s.* & m);
+        }
         self.prefix.dropped += by;
     }
 
-    fn hash(self: *const Matcher, p: usize) usize {
-        const v = std.mem.readInt(u32, self.data[p..][0..4], .little);
-        return (v *% 0x1e35a7bd) >> self.hash_shift;
+    /// The data positions index. Past `tagged_limit` bytes the slots lose
+    /// their tags, once.
+    fn setData(self: *Matcher, data: []const u8) void {
+        self.data = data;
+        if (self.tag_mask == 0 or data.len < tagged_limit) return;
+        for (self.slots) |*s| s.* = if (s.* & ~tagged_mask == tagged_limit) dropped_pos else s.* & ~tagged_mask;
+        self.tag_mask = 0;
+    }
+
+    /// The four bytes at `p` hashed: the bucket from the top bits, a slot's
+    /// tag bits (`slots`) from the eight below them.
+    const Hashed = struct { bucket: usize, tag: u32 };
+
+    fn hash(self: *const Matcher, p: usize) Hashed {
+        const x = std.mem.readInt(u32, self.data[p..][0..4], .little) *% 0x1e35a7bd;
+        return .{ .bucket = x >> self.hash_shift, .tag = (x << @intCast(32 - @as(u6, self.hash_shift))) & self.tag_mask };
     }
 
     /// Start loading the bucket `p` hashes to: positions are visited in
@@ -982,16 +1019,17 @@ const Matcher = struct {
     /// is compared.
     fn prefetch(self: *const Matcher, p: usize) void {
         if (p + min_match > self.data.len) return;
-        const h = self.hash(p);
+        const h = self.hash(p).bucket;
         @prefetch(&self.count[h], .{});
         @prefetch(&self.slots[h << self.depth_log], .{});
     }
 
     fn insert(self: *Matcher, p: usize) void {
         if (p + min_match > self.data.len) return;
-        const h = self.hash(p);
+        const hv = self.hash(p);
+        const h = hv.bucket;
         const n = self.count[h];
-        self.slots[(h << self.depth_log) | (n & (self.depth - 1))] = @intCast(p);
+        self.slots[(h << self.depth_log) | (n & (self.depth - 1))] = @as(u32, @intCast(p)) | hv.tag;
         self.count[h] = n +% 1;
     }
 
@@ -1017,7 +1055,10 @@ const Matcher = struct {
     /// `px`: a prefix dictionary may be in `data` — comptime, so a search
     /// without one compiles to the loop it was before dictionaries (the
     /// per-candidate test cost `.best` 20 %, measured 2026-10-15).
-    fn find(self: *const Matcher, comptime ring_n: u3, comptime px: bool, p: usize, max_dist: usize, limit: usize) ?Match {
+    /// `tagged`: skip slots by their tag (`slots`) — comptime, as a mask
+    /// test in the one loop cost text 25 % in the registers it took
+    /// (2026-10-15); the caller picks per block (`tagsPay`).
+    fn find(self: *const Matcher, comptime ring_n: u3, comptime px: bool, comptime tagged: bool, p: usize, max_dist: usize, limit: usize) ?Match {
         if (p + min_match > limit) return null;
         const max_len = @min(limit - p, max_match);
         var best_len: usize = 0;
@@ -1044,14 +1085,18 @@ const Matcher = struct {
             }
         }
         if (ring_n != 0 and best_len >= max_len) return .{ .len = @intCast(best_len), .dist = @intCast(best_dist), .gain = best_gain };
-        const h = self.hash(p);
+        const hv = self.hash(p);
+        const h = hv.bucket;
         const n = self.count[h];
         // Newest first; a wrapped count still means a full bucket.
         const valid = if (n < self.depth) n else self.depth;
         const bucket = self.slots[h << self.depth_log ..][0..self.depth];
+        const m = if (tagged) tagged_mask else self.tag_mask;
         var k: u32 = 0;
         while (k < valid) : (k += 1) {
-            const c: usize = bucket[(n -% 1 -% k) & (self.depth - 1)];
+            const s = bucket[(n -% 1 -% k) & (self.depth - 1)];
+            if (tagged and s & tagged_mask != hv.tag) continue;
+            const c: usize = s & ~m;
             if (c >= p) continue;
             var d = p - c;
             var cap: usize = max_len;
@@ -1065,9 +1110,7 @@ const Matcher = struct {
                 if (px) continue;
                 break;
             }
-            // Cheap reject: a candidate that cannot beat `best_len` is skipped
-            // before the byte-by-byte compare.
-            if (best_len == 0 or self.data[c + best_len] == self.data[p + best_len]) {
+            if (worthComparing(best_len, self.data[c + best_len] == self.data[p + best_len])) {
                 const l = matchLen(self.data, c, p, cap);
                 if (l >= min_match) {
                     const g = self.gain(l, d);
@@ -1084,22 +1127,42 @@ const Matcher = struct {
         return .{ .len = @intCast(best_len), .dist = @intCast(best_dist), .gain = best_gain };
     }
 
+    /// Cheap reject: whether a candidate gets the byte-by-byte compare —
+    /// it can beat `best_len` (the byte there agrees, `next_eq`), or nothing
+    /// was found yet. Without the short-circuit `or` it is one branch, and
+    /// `.best` on text 5 % faster (2026-10-15).
+    inline fn worthComparing(best_len: usize, next_eq: bool) bool {
+        return (@intFromBool(best_len == 0) | @intFromBool(next_eq)) != 0;
+    }
+
+    /// Whether lookups in `block` should skip slots by their tag: when the
+    /// slots have tags and the block looks binary. On text most of a
+    /// bucket shares its first four bytes and the test only cost
+    /// mispredicted branches (`.best` +28 %, 2026-10-15).
+    fn tagsPay(self: *const Matcher, block: []const u8) bool {
+        return self.tag_mask != 0 and looksBinary(block);
+    }
+
     /// Every copy for `p` that is longer than any nearer one (so the
     /// candidates' lengths rise and their distances too), as `find` walks the
     /// bucket: what a shortest-path parse chooses from (`.max`). Returns how
     /// many of `out` are set.
-    fn collect(self: *const Matcher, comptime px: bool, p: usize, max_dist: usize, limit: usize, out: *[max_cands]Cand) usize {
+    fn collect(self: *const Matcher, comptime px: bool, comptime tagged: bool, p: usize, max_dist: usize, limit: usize, out: *[max_cands]Cand) usize {
         if (p + min_match > limit) return 0;
         const max_len = @min(limit - p, max_match);
-        const h = self.hash(p);
+        const hv = self.hash(p);
+        const h = hv.bucket;
         const n = self.count[h];
         const valid = if (n < self.depth) n else self.depth;
         const bucket = self.slots[h << self.depth_log ..][0..self.depth];
+        const m = if (tagged) tagged_mask else self.tag_mask;
         var found: usize = 0;
         var best_len: usize = 0;
         var k: u32 = 0;
         while (k < valid) : (k += 1) {
-            const c: usize = bucket[(n -% 1 -% k) & (self.depth - 1)];
+            const s = bucket[(n -% 1 -% k) & (self.depth - 1)];
+            if (tagged and s & tagged_mask != hv.tag) continue;
+            const c: usize = s & ~m;
             if (c >= p) continue;
             var d = p - c;
             var cap: usize = max_len;
@@ -1111,7 +1174,7 @@ const Matcher = struct {
                 if (px) continue;
                 break;
             }
-            if (best_len == 0 or self.data[c + best_len] == self.data[p + best_len]) {
+            if (worthComparing(best_len, self.data[c + best_len] == self.data[p + best_len])) {
                 const l = matchLen(self.data, c, p, cap);
                 if (l >= min_match and l > best_len) {
                     out[found] = .{ .len = @intCast(l), .dist = @intCast(d) };
@@ -1290,6 +1353,8 @@ fn buildCommands(
     /// Literals in a row after which positions are skipped.
     comptime skip_after: usize,
     comptime px: bool,
+    /// Lookups skip slots by tag (`Matcher.tagsPay`).
+    comptime tagged: bool,
     gpa: std.mem.Allocator,
     matcher: *Matcher,
     start: usize,
@@ -1307,7 +1372,7 @@ fn buildCommands(
 
     while (p < end) {
         matcher.prefetch(p + 1);
-        const m = pending orelse matcher.find(ring_n, px, p, x.outMax(p, max_dist), end);
+        const m = pending orelse matcher.find(ring_n, px, tagged, p, x.outMax(p, max_dist), end);
         pending = null;
         if (m == null) {
             matcher.insert(p);
@@ -1319,7 +1384,7 @@ fn buildCommands(
         }
         matcher.insert(p);
         if (p + 1 < end) {
-            if (matcher.find(ring_n, px, p + 1, x.outMax(p + 1, max_dist), end)) |b| {
+            if (matcher.find(ring_n, px, tagged, p + 1, x.outMax(p + 1, max_dist), end)) |b| {
                 // One literal more is spent to take `b`, so it must save
                 // more than that literal costs on top of what `m` saves.
                 if (b.gain > m.?.gain + matcher.lit_cost) {
@@ -1347,6 +1412,21 @@ fn buildCommands(
     if (lit_start < end) {
         try out.append(gpa, .{ .insert_len = @intCast(end - lit_start), .copy_len = 0, .dist = 0 });
     }
+}
+
+/// Whether `block` has the control bytes text never has (beyond tab, line
+/// feed, form feed and carriage return) in more than one byte of 128:
+/// fonts, executables and archives are full of zeros and small numbers.
+/// Every 16th byte is looked at: a scan of all of them was 6 % of
+/// `.default` on text (bench, 2026-10-15).
+fn looksBinary(block: []const u8) bool {
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < block.len) : (i += 16) {
+        const b = block[i];
+        n += @intFromBool(b < 0x20 and b != '\t' and b != '\n' and b != '\r' and b != 0x0c);
+    }
+    return n * 128 * 16 > block.len;
 }
 
 /// The block's order-0 entropy in bits per byte (at least 1): the price of a
@@ -1941,6 +2021,8 @@ fn bestAt(
 /// back before `start` but never past `end`.
 fn buildCommandsOptimal(
     comptime px: bool,
+    /// Lookups skip slots by tag (`Matcher.tagsPay`).
+    comptime tagged: bool,
     gpa: std.mem.Allocator,
     matcher: *Matcher,
     start: usize,
@@ -1972,7 +2054,7 @@ fn buildCommandsOptimal(
     while (p < end) {
         offs[p - start] = @intCast(cands.items.len);
         doffs[p - start] = @intCast(dcands.items.len);
-        const found = matcher.collect(px, p, x.outMax(p, max_dist), end, &buf);
+        const found = matcher.collect(px, tagged, p, x.outMax(p, max_dist), end, &buf);
         try cands.appendSlice(gpa, buf[0..found]);
         var step: usize = 1;
         if (found > 0 and buf[found - 1].len >= max_take_len) {
@@ -2239,7 +2321,9 @@ const proxy_min_literals = 16384;
 /// unclustered (no header costs).
 fn contextCost(src: anytype, mode: u2, scratch: *ClusterScratch) f64 {
     const hist = &scratch.hist;
-    hist.* = @splat(@splat(0));
+    // Not `@splat`: that is Zig 0.16's byte-wise `compiler_rt.memset`, 3 %
+    // of `.best` on a font (`Matcher.fillZero`).
+    Matcher.fillZero(@as([*]u32, @ptrCast(hist))[0 .. num_contexts * tables.num_literal_symbols]);
     const Fill = struct {
         hist: *[num_contexts][tables.num_literal_symbols]u32,
         mode: u2,
@@ -2266,7 +2350,9 @@ fn contextCost(src: anytype, mode: u2, scratch: *ClusterScratch) f64 {
 /// estimated cost.
 fn clusterLiterals(src: anytype, mode: u2, scratch: *ClusterScratch, out: *LiteralModel) f64 {
     const hist = &scratch.hist;
-    hist.* = @splat(@splat(0));
+    // Not `@splat`: that is Zig 0.16's byte-wise `compiler_rt.memset`, 3 %
+    // of `.best` on a font (`Matcher.fillZero`).
+    Matcher.fillZero(@as([*]u32, @ptrCast(hist))[0 .. num_contexts * tables.num_literal_symbols]);
     const Fill = struct {
         hist: *[num_contexts][tables.num_literal_symbols]u32,
         mode: u2,
@@ -2404,8 +2490,44 @@ fn chooseLiteralModelIn(gpa: std.mem.Allocator, scratch_in: ?*ClusterScratch, sr
     // `.default`'s time per mode).
     var ascii: u64 = 0;
     for (out.single[0..0x80]) |c| ascii += c;
+    if (ascii * 100 < n_lits * ascii_pct and n_lits < proxy_min_literals) {
+        // Every mode is clustered — but a mode's unclustered entropy plus
+        // the least any set of codes pays in headers (one code, every
+        // symbol used once) is a floor under its clustered cost: merging
+        // never lowers entropy. A mode whose floor is no better than the
+        // best so far cannot win and is skipped, cheapest floor first. Same
+        // choice as clustering all three; on fonts most modes go
+        // (2026-10-15).
+        var used: u32 = 0;
+        for (out.single) |c| used += @intFromBool(c != 0);
+        const header_floor = 40 + 5 * @as(f64, @floatFromInt(used));
+        const order = [3]u2{ 2, 0, 3 };
+        var floor: [3]f64 = undefined;
+        for (order, &floor) |mode, *f| f.* = contextCost(src, mode, scratch) + header_floor;
+        var by_floor = [3]u8{ 0, 1, 2 };
+        std.mem.sort(u8, &by_floor, &floor, struct {
+            fn lt(fl: *const [3]f64, a: u8, b: u8) bool {
+                return fl[a] < fl[b] or (fl[a] == fl[b] and a < b);
+            }
+        }.lt);
+        // Ties go to the mode listed first in `order`, as when all three
+        // were clustered in that order; the one-code model wins those.
+        var best_idx: u8 = 3;
+        for (by_floor) |idx| {
+            if (floor[idx] > best_cost or (floor[idx] == best_cost and (best_idx == 3 or idx > best_idx))) continue;
+            const c = clusterLiterals(src, order[idx], scratch, &trial);
+            if (c < best_cost or (c == best_cost and best_idx != 3 and idx < best_idx)) {
+                best_cost = c;
+                best_idx = idx;
+                const all = out.single;
+                out.* = trial;
+                out.single = all;
+            }
+        }
+        return;
+    }
     var modes_buf: [1]u2 = .{2};
-    const modes: []const u2 = if (ascii * 100 >= n_lits * ascii_pct) &.{2} else if (n_lits < proxy_min_literals) &.{ 2, 0, 3 } else blk: {
+    const modes: []const u2 = if (ascii * 100 >= n_lits * ascii_pct) &.{2} else blk: {
         // Of UTF8, LSB6 and SIGNED, cluster only the one whose 64 context
         // histograms have the least entropy unclustered: clustering is most
         // of the model's time on binary data (a third of `.default` on a
@@ -3650,7 +3772,7 @@ pub const Core = struct {
 
     pub fn setData(c: *Core, data: []const u8) void {
         c.data = data;
-        if (c.effort == .fast) c.matcher.fast.data = data else c.matcher.deep.data = data;
+        if (c.effort == .fast) c.matcher.fast.data = data else c.matcher.deep.setData(data);
     }
 
     /// WBITS (RFC 7932 §9.1): a single 0 bit for 16; 1 + (wbits - 17) in
@@ -3687,12 +3809,14 @@ pub const Core = struct {
                 try buildCommandsFast(false, gpa, &c.matcher.fast, off, end, max_dist, c.ring, &c.cmds),
             .max => {
                 const n_dist: usize = if (c.wbits > max_window_bits) dist_alphabet_large else dist_alphabet_size;
-                if (c.prefix().len != 0) {
-                    try buildCommandsOptimal(true, gpa, &c.matcher.deep, off, end, max_dist, c.ring, n_dist, null, &c.parses);
-                } else {
-                    // Built once per encoder, on its first such block.
-                    if (c.dict_search == null) c.dict_search = try DictSearch.init(gpa);
-                    try buildCommandsOptimal(false, gpa, &c.matcher.deep, off, end, max_dist, c.ring, n_dist, &c.dict_search.?, &c.parses);
+                switch (c.matcher.deep.tagsPay(c.data[off..end])) {
+                    inline else => |tagged| if (c.prefix().len != 0) {
+                        try buildCommandsOptimal(true, tagged, gpa, &c.matcher.deep, off, end, max_dist, c.ring, n_dist, null, &c.parses);
+                    } else {
+                        // Built once per encoder, on its first such block.
+                        if (c.dict_search == null) c.dict_search = try DictSearch.init(gpa);
+                        try buildCommandsOptimal(false, tagged, gpa, &c.matcher.deep, off, end, max_dist, c.ring, n_dist, &c.dict_search.?, &c.parses);
+                    },
                 }
                 // The shortest as written wins: the estimate the parses were
                 // priced by is not the code that comes out.
@@ -3718,10 +3842,12 @@ pub const Core = struct {
                 // position.
                 const skip: usize = if (e == .default) 64 else std.math.maxInt(usize);
                 c.matcher.deep.ring = c.ring;
-                if (c.prefix().len != 0)
-                    try buildCommands(4, skip, true, gpa, &c.matcher.deep, off, end, max_dist, &c.cmds)
-                else
-                    try buildCommands(4, skip, false, gpa, &c.matcher.deep, off, end, max_dist, &c.cmds);
+                switch (c.matcher.deep.tagsPay(c.data[off..end])) {
+                    inline else => |tagged| if (c.prefix().len != 0)
+                        try buildCommands(4, skip, true, tagged, gpa, &c.matcher.deep, off, end, max_dist, &c.cmds)
+                    else
+                        try buildCommands(4, skip, false, tagged, gpa, &c.matcher.deep, off, end, max_dist, &c.cmds),
+                }
             },
         }
 

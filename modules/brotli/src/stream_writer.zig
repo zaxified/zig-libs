@@ -504,6 +504,38 @@ test "metadata: carried in the stream, skipped by the decoder" {
     try testing.expect(std.mem.indexOf(u8, out.written(), big) != null);
 }
 
+test "a history past 16 MiB: the slots lose their tags, a copy from before is still found" {
+    // The match finder tags its slots while positions fit in 24 bits
+    // (`Matcher.slots`); a stream's history grows past that, and the slots
+    // written before must be found after. compressWith never tags this
+    // input (its data is that long from the start): the same bytes.
+    const gpa = testing.allocator;
+    const block = 8 * 1024;
+    const gap = 17 << 20;
+    const input = try gpa.alloc(u8, 2 * block + gap);
+    defer gpa.free(input);
+    var prng: std.Random.DefaultPrng = .init(0x7a65);
+    prng.random().bytes(input[0..block]);
+    @memset(input[block..][0..gap], 0);
+    @memcpy(input[block + gap ..], input[0..block]);
+    const want = try encoder.compressWith(gpa, input, .{ .effort = .default, .window_bits = 25 });
+    defer gpa.free(want);
+    var out: Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var buf: [4096]u8 = undefined;
+    var sw: StreamWriter = try .init(gpa, &out.writer, &buf, .{ .effort = .default, .window_bits = 25, .size_hint = input.len });
+    defer sw.deinit();
+    try testing.expect(sw.core.matcher.deep.tag_mask != 0);
+    try writeStream(&sw, input, 1 << 20, &.{});
+    try testing.expectEqual(@as(u32, 0), sw.core.matcher.deep.tag_mask);
+    try testing.expectEqualSlices(u8, want, out.written());
+    // One copy of the random block, not two.
+    try testing.expect(out.written().len < block + block / 2);
+    const back = try decoder.decompress(gpa, out.written(), .{ .large_window = true, .max_output = 1 << 26 });
+    defer gpa.free(back);
+    try testing.expectEqualSlices(u8, input, back);
+}
+
 test "size_hint: a table for the input, and compressWith's bytes for a short one too" {
     const gpa = testing.allocator;
     const src = try gpa.alloc(u8, 3_000);
