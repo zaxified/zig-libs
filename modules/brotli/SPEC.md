@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-08-06 · mutation 2026-10-04 (110/132, 22 eq) · src ?
 
-**Hardening:** fuzz 2026-09-30 (230,000 runs clean, ~32% decoded reach) · ct n/a — compression only (keyword review, 2026-10-07)
+**Hardening:** fuzz 2026-10-15 (360,000 runs clean, ~25% decoded reach; input and exact output against a guard page) · ct n/a — compression only (keyword review, 2026-10-07)
 
 **Performance:** ref 0.28–1.53× google/brotli 1.2.0 (C, one-shot; over 1.1×: `.q0` text/html, decoder text 1.13×, `.q6` html 1.10×) · fastest ? (measured 2026-10-15)
 
@@ -541,6 +541,15 @@ larger than its input, and `compress` itself never fails except on allocation.
   chunk boundary that drops a byte); the survivor — the stored copy ignoring the unwritten-bytes bound
   — is equivalent, because the ring is flushed at the end of every meta-block, so that bound never
   binds at the start of a stored block.
+  **2026-10-15:** the hot literal loop (`d9f7be28`) reads the input and writes the output through
+  many-pointers — no bounds check under ReleaseSafe — and all four decoders share it, so a read past
+  the input was invisible to the verdicts (a planted one passed seed 36 silently; the run crashed only
+  ~375 seeds later, on a knock-on overflow). The harness now puts the input, and `decompressInto`'s
+  exact-size output, flush against a `PROT_NONE` page (Linux): planted over-reads (the bound without
+  its refill margin, or without the halving) fault at seed 36, an extra literal fails the verdict at
+  seed 0. Reach of that loop: a third of the runs enter it, 13 % stop at the input bound. Dictionaries
+  are built once per process and the cap-sized buffer is static (400 → 1 260 runs/s on one core).
+  360 000 runs clean (8 jobs, 22 + 43 s).
 
 ## Anchoring
 

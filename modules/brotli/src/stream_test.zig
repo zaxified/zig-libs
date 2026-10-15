@@ -9,6 +9,7 @@
 //! output, and the two ends' own failures reported as themselves.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const testing = std.testing;
 const brotli = @import("root.zig");
 const corpus = @import("interop_corpus.zig");
@@ -441,6 +442,44 @@ test "stream: the reader is left just past what the decoder consumed" {
 
 const fuzz_driver = @import("testkit").fuzz.driver;
 
+/// Memory that ends at an unreadable page: the harness puts its input
+/// there, so a read past the input's end faults — the driver names the
+/// seed — instead of reading whatever follows, and `decompressInto`'s
+/// exact-size output, so a write past it does too. The decoder's hot loop
+/// reads the input and writes the output through many-pointers
+/// (`decoder.HotBits`, `Sink.tailPtr`), which have no bounds check even
+/// under ReleaseSafe, and all four decoders share it, so the differential
+/// verdicts cannot see such an access either. (Linux; elsewhere a plain
+/// buffer.)
+fn Guarded(comptime cap: usize) type {
+    return struct {
+        var region: ?[]u8 = null;
+        var plain: [cap]u8 = undefined;
+
+        /// The last `len` bytes before the guard page.
+        fn tail(len: usize) []u8 {
+            std.debug.assert(len <= cap);
+            const room = room: {
+                if (builtin.os.tag != .linux) break :room plain[0..];
+                if (region == null) {
+                    const page = std.heap.pageSize();
+                    const body = std.mem.alignForward(usize, cap, page);
+                    const m = std.posix.mmap(null, body + page, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0) catch
+                        @panic("Guarded: mmap");
+                    if (std.os.linux.errno(std.os.linux.mprotect(m.ptr + body, page, .{})) != .SUCCESS)
+                        @panic("Guarded: mprotect");
+                    region = m[body - cap .. body];
+                }
+                break :room region.?;
+            };
+            return room[cap - len ..];
+        }
+    };
+}
+
+const GuardedInput = Guarded(32 << 10);
+const GuardedOutput = Guarded(fz_max_output);
+
 const fz_bases = [_][]const u8{
     @embedFile("testdata/quickfox.compressed"),
     @embedFile("testdata/10x10y.compressed"),
@@ -462,6 +501,43 @@ const fz_dict_bases = [_]struct { stream: []const u8, case: usize, serial: bool 
     .{ .stream = @embedFile("testdata/ref/" ++ corpus.serialRefFile(corpus.serial_cases[2], 5)), .case = 2, .serial = true },
     .{ .stream = @embedFile("testdata/ref/" ++ corpus.dictRefFile(corpus.dict_cases[1], 11)), .case = 1, .serial = false },
 };
+
+const fz_max_output = 1 << 20;
+/// `decompressInto`'s buffer of the cap on a bad stream: one for the
+/// process, not an allocation of 1 MiB a run (with the debug allocator's
+/// fill on free, half of the driver's time).
+var fz_room: [fz_max_output]u8 = undefined;
+
+/// A dictionary base's dictionary, built (and a serialized one parsed) once
+/// per process: rebuilt every run it was a sixth of the time, and its bytes
+/// never change.
+fn fzDict(case: usize, serial: bool) struct { bytes: []const u8, sd: ?*const brotli.SharedDictionary } {
+    const Cache = struct {
+        var serial_bytes: [corpus.serial_cases.len]?[]u8 = @splat(null);
+        var serial_sd: [corpus.serial_cases.len]brotli.SharedDictionary = undefined;
+        var raw_bytes: [corpus.dict_cases.len]?[]u8 = @splat(null);
+    };
+    // Never freed: `std.heap.page_allocator`, outside the run's leak check.
+    const gpa = std.heap.page_allocator;
+    if (serial) {
+        if (Cache.serial_bytes[case] == null) {
+            const bytes = switch (case) {
+                inline 0...corpus.serial_cases.len - 1 => |k| corpus.serialize(gpa, corpus.serial_cases[k].dict),
+                else => unreachable,
+            } catch @panic("fzDict: out of memory");
+            Cache.serial_sd[case] = brotli.parseSharedDictionary(gpa, bytes) catch @panic("fzDict: parse");
+            Cache.serial_bytes[case] = bytes;
+        }
+        return .{ .bytes = Cache.serial_bytes[case].?, .sd = &Cache.serial_sd[case] };
+    }
+    if (Cache.raw_bytes[case] == null) {
+        Cache.raw_bytes[case] = switch (case) {
+            inline 0...corpus.dict_cases.len - 1 => |k| corpus.dict_cases[k].dict.build(gpa),
+            else => unreachable,
+        } catch @panic("fzDict: out of memory");
+    }
+    return .{ .bytes = Cache.raw_bytes[case].?, .sd = null };
+}
 
 fn streamDiffHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     var buf: [16 << 10]u8 = undefined;
@@ -496,27 +572,11 @@ fn streamDiffHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror
             },
         }
     }
-    const input = buf[0..len];
-    var opts: brotli.Options = .{ .max_output = 1 << 20 };
-    var sd: ?brotli.SharedDictionary = null;
-    defer if (sd) |*x| x.deinit();
-    var dict_bytes: ?[]u8 = null;
-    defer if (dict_bytes) |d| gpa.free(d);
+    const input = GuardedInput.tail(len);
+    @memcpy(input, buf[0..len]);
+    var opts: brotli.Options = .{ .max_output = fz_max_output };
     if (with_dict) {
-        if (dbase.serial) {
-            dict_bytes = switch (dbase.case) {
-                inline 0...corpus.serial_cases.len - 1 => |k| try corpus.serialize(gpa, corpus.serial_cases[k].dict),
-                else => unreachable,
-            };
-            sd = try brotli.parseSharedDictionary(gpa, dict_bytes.?);
-            opts.shared_dictionary = &sd.?;
-        } else {
-            dict_bytes = switch (dbase.case) {
-                inline 0...corpus.dict_cases.len - 1 => |k| try corpus.dict_cases[k].dict.build(gpa),
-                else => unreachable,
-            };
-            opts.dictionary = dict_bytes.?;
-        }
+        if (dbase.serial) opts.shared_dictionary = fzDict(dbase.case, true).sd else opts.dictionary = fzDict(dbase.case, false).bytes;
     }
 
     const want = brotli.decompress(gpa, input, opts);
@@ -540,22 +600,19 @@ fn streamDiffHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror
     // fast copies' slack) and one byte short; on a bad stream, a buffer of the
     // cap, for the same error.
     if (want) |w| {
-        const exact = try gpa.alloc(u8, w.len);
-        defer gpa.free(exact);
+        const exact = GuardedOutput.tail(w.len);
         const into = brotli.decompressInto(gpa, exact, input, opts) catch |e| {
             std.debug.print("one-shot decoded {d} bytes, into said {t}\n", .{ w.len, e });
             return error.Disagree;
         };
         if (!std.mem.eql(u8, w, into)) return error.Disagree;
         if (w.len > 0) {
-            if (brotli.decompressInto(gpa, exact[0 .. w.len - 1], input, opts)) |_| {
+            if (brotli.decompressInto(gpa, GuardedOutput.tail(w.len - 1), input, opts)) |_| {
                 return error.Disagree;
             } else |e| if (e != error.OutputTooLarge) return error.Disagree;
         }
     } else |we| {
-        const room = try gpa.alloc(u8, opts.max_output);
-        defer gpa.free(room);
-        if (brotli.decompressInto(gpa, room, input, opts)) |_| {
+        if (brotli.decompressInto(gpa, &fz_room, input, opts)) |_| {
             return error.Disagree;
         } else |e| if (e != we) {
             std.debug.print("one-shot said {t}, into said {t}\n", .{ we, e });
