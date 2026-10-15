@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-15** — Encoder speed back: the dictionary support in the match finders is a comptime switch, so a search without a dictionary is the loop it was before (the per-candidate test had cost `.best` +20–27 %, `.default` +7–12 % since the R6 encoder). vs google/brotli 1.2.0: fast 0.96–1.12× (q4), default 0.97–1.04× (q6), best 0.70–0.86× (q9), decoder 1.09–1.21×. Streams unchanged.
+
 - **2026-10-15** — Decoder: the fill bits after the last meta-block must be zero (RFC 7932 §9.2) — **behaviour change**: such a stream (e.g. the single byte `0xff`) is now `InvalidPadding`, as google/brotli refuses it; it used to decode. New `Options.metadata` (R10): callbacks receive metadata meta-blocks' bytes. The streaming decoders give the bit reader's read-ahead back to the source at the end of the stream (R11; source buffer ≥ 16 bytes), so `in` is left exactly after the stream and streams decode back to back.
 
 - **2026-10-15** — New `Decompressor` (R9): a pull `std.Io.Reader` over a stream's decompressed bytes, decoding as reads need it (the decoder suspends mid-command and at meta-block ends); `err` holds the cause of a `ReadFailed`. `decompressStream` is now a loop over it (same results; output goes out as the reader hands it). The decoder is one resumable logic for all four entry points; measured cost on `d_*` against before: +4–9 %. Additive API.

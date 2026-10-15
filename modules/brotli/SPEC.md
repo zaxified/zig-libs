@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-09-30 (230,000 runs clean, ~32% decoded reach) · ct n/a — compression only (keyword review, 2026-10-07)
 
-**Performance:** ref 0.74–1.19× google/brotli 1.2.0 (C, one-shot) · fastest ? (measured 2026-10-14)
+**Performance:** ref 0.70–1.21× google/brotli 1.2.0 (C, one-shot) · fastest ? (measured 2026-10-15)
 
 **Known defects:** none recorded
 
@@ -248,9 +248,12 @@ larger than its input, and `compress` itself never fails except on allocation.
   lengths in locals and calls nothing out of line; a command that does not fit the room left, or
   copies from past the window (prefix or static dictionary), is set up in the decoder and made by
   `resumeCommand`, phase by phase. A one-shot sink always has room, so `decompress` and
-  `decompressInto` run the hot loop only. Cost measured against the decoder before R6/R9 (A/B, same
-  host): +4 % text, +5 % html, +9 % json on `d_*` — the first version kept the lengths in fields
-  and called out of the loop (+30 %).
+  `decompressInto` run the hot loop only. Cost against the decoder before R6/R9, in a standalone
+  ReleaseFast program decoding alice29 q5/q9/q11 300× (min of 5): +1–3 % cycles at −3.5 %
+  instructions; the bench binary's A/B moved +4–9 % with the build's code layout. The first version
+  kept the lengths in fields and called out of the loop (+30 %): `readDistance` and the sinks'
+  `copyBack` had stopped being inlined, fields were reloaded after every output byte (for the
+  compiler a byte may land on the decoder), and calls in the loop cost registers.
 - **Tested:** every committed vector and google/brotli stream read a byte at a time and in 7- and
   4096-byte reads (the 256 KiB copy of `zeros` stopped at every byte), through the interface's own
   buffer and helpers (`take`, `takeDelimiterInclusive`, `allocRemaining`), raw-dictionary and

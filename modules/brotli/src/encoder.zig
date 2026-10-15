@@ -993,7 +993,10 @@ const Matcher = struct {
     /// `ring_n`: how many of the ring's distances are tried first (`Effort`;
     /// the other two never won on the bench payloads). Comptime, so a search
     /// without them compiles to the loop it was before they existed.
-    fn find(self: *const Matcher, comptime ring_n: u2, p: usize, max_dist: usize, limit: usize) ?Match {
+    /// `px`: a prefix dictionary may be in `data` — comptime, so a search
+    /// without one compiles to the loop it was before dictionaries (the
+    /// per-candidate test cost `.best` 20 %, measured 2026-10-15).
+    fn find(self: *const Matcher, comptime ring_n: u2, comptime px: bool, p: usize, max_dist: usize, limit: usize) ?Match {
         if (p + min_match > limit) return null;
         const max_len = @min(limit - p, max_match);
         var best_len: usize = 0;
@@ -1031,15 +1034,15 @@ const Matcher = struct {
             if (c >= p) continue;
             var d = p - c;
             var cap: usize = max_len;
-            if (c < self.prefix.len) {
+            if (px and c < self.prefix.len) {
                 const r = self.prefix.reach(p, c, max_dist, max_len) orelse continue;
                 d = r.d;
                 cap = r.cap;
             } else if (d > max_dist) {
                 // Older slots are further back still — but for the
                 // dictionary's, which are oldest of all.
-                if (self.prefix.len == 0) break;
-                continue;
+                if (px) continue;
+                break;
             }
             // Cheap reject: a candidate that cannot beat `best_len` is skipped
             // before the byte-by-byte compare.
@@ -1146,7 +1149,7 @@ const FastMatcher = struct {
 
     /// As `Matcher.find`, over the bucket's slots and the last distance (the
     /// second-last, or copies of three bytes at either, never won here).
-    fn find(self: *const FastMatcher, p: usize, ring: *const DistRing, max_dist: usize, limit: usize) ?Match {
+    fn find(self: *const FastMatcher, comptime px: bool, p: usize, ring: *const DistRing, max_dist: usize, limit: usize) ?Match {
         if (p + 8 > limit) return null;
         const max_len = @min(limit - p, max_match);
         var best_len: usize = 0;
@@ -1165,7 +1168,7 @@ const FastMatcher = struct {
             if (c >= p) continue;
             var d = p - c;
             var cap: usize = max_len;
-            if (c < self.prefix.len) {
+            if (px and c < self.prefix.len) {
                 const r = self.prefix.reach(p, c, max_dist, max_len) orelse continue;
                 d = r.d;
                 cap = r.cap;
@@ -1205,6 +1208,7 @@ const Cmd = struct {
 /// `end`, so the commands consume exactly `end - start` bytes.
 fn buildCommands(
     comptime ring_n: u2,
+    comptime px: bool,
     gpa: std.mem.Allocator,
     matcher: *Matcher,
     start: usize,
@@ -1215,11 +1219,14 @@ fn buildCommands(
     var p = start;
     var lit_start = start;
     var pending: ?Match = null;
+    // A local copy: read through `matcher` it would be loaded again at
+    // every position.
+    const x = matcher.prefix;
     matcher.lit_cost = literalCost(matcher.data[start..end], 1);
 
     while (p < end) {
         matcher.prefetch(p + 1);
-        const m = pending orelse matcher.find(ring_n, p, matcher.prefix.outMax(p, max_dist), end);
+        const m = pending orelse matcher.find(ring_n, px, p, x.outMax(p, max_dist), end);
         pending = null;
         if (m == null) {
             matcher.insert(p);
@@ -1228,7 +1235,7 @@ fn buildCommands(
         }
         matcher.insert(p);
         if (p + 1 < end) {
-            if (matcher.find(ring_n, p + 1, matcher.prefix.outMax(p + 1, max_dist), end)) |b| {
+            if (matcher.find(ring_n, px, p + 1, x.outMax(p + 1, max_dist), end)) |b| {
                 // One literal more is spent to take `b`, so it must save
                 // more than that literal costs on top of what `m` saves.
                 if (b.gain > m.?.gain + matcher.lit_cost) {
@@ -1280,6 +1287,7 @@ fn literalCost(block: []const u8, comptime stride: usize) f32 {
 /// one at the next byte, and incompressible input passes at a fraction of the
 /// lookups.
 fn buildCommandsFast(
+    comptime px: bool,
     gpa: std.mem.Allocator,
     matcher: *FastMatcher,
     start: usize,
@@ -1291,12 +1299,13 @@ fn buildCommandsFast(
     var p = start;
     var lit_start = start;
     var ring = ring_in;
+    const x = matcher.prefix; // as in `buildCommands`
     // A price, not a code: a quarter of the bytes estimate it well enough.
     matcher.lit_cost = literalCost(matcher.data[start..end], fast_cost_stride);
 
     while (p < end) {
         matcher.prefetch(p + 1);
-        var m = matcher.find(p, &ring, matcher.prefix.outMax(p, max_dist), end) orelse {
+        var m = matcher.find(px, p, &ring, x.outMax(p, max_dist), end) orelse {
             matcher.insert(p);
             const run = p - lit_start;
             p += if (run < fast_skip_after) 1 else @min(fast_skip_max, 1 + ((run - fast_skip_after) >> 5));
@@ -1305,7 +1314,7 @@ fn buildCommandsFast(
         if (m.len < fast_lazy_max_len) {
             matcher.insert(p);
             while (p + 1 < end) {
-                const b = matcher.find(p + 1, &ring, matcher.prefix.outMax(p + 1, max_dist), end) orelse break;
+                const b = matcher.find(px, p + 1, &ring, x.outMax(p + 1, max_dist), end) orelse break;
                 // One literal more is spent to take `b`.
                 if (b.gain <= m.gain + matcher.lit_cost) break;
                 p += 1;
@@ -2226,10 +2235,16 @@ pub const Core = struct {
         const max_dist = (@as(usize, 1) << c.wbits) - 16;
         c.cmds.clearRetainingCapacity();
         switch (c.effort) {
-            .fast => try buildCommandsFast(gpa, &c.matcher.fast, off, end, max_dist, c.ring, &c.cmds),
+            .fast => if (c.prefix().len != 0)
+                try buildCommandsFast(true, gpa, &c.matcher.fast, off, end, max_dist, c.ring, &c.cmds)
+            else
+                try buildCommandsFast(false, gpa, &c.matcher.fast, off, end, max_dist, c.ring, &c.cmds),
             .default, .best => {
                 c.matcher.deep.ring = c.ring;
-                try buildCommands(2, gpa, &c.matcher.deep, off, end, max_dist, &c.cmds);
+                if (c.prefix().len != 0)
+                    try buildCommands(2, true, gpa, &c.matcher.deep, off, end, max_dist, &c.cmds)
+                else
+                    try buildCommands(2, false, gpa, &c.matcher.deep, off, end, max_dist, &c.cmds);
             },
         }
 
