@@ -1420,11 +1420,23 @@ fn cleanupDns01(ctx: ?*anyopaque, req: *const ChallengeRequest) void {
 /// wiped at scope exit.
 fn presentTlsAlpn01(ctx: ?*anyopaque, req: *const ChallengeRequest) SolverError!void {
     const c = clientOf(ctx);
+    var material = try tlsAlpnValidation(c.io, c.gpa, req);
+    defer material.deinit(c.gpa);
+    var sni_buf: [max_reverse_name_len]u8 = undefined;
+    try c.tls_alpn.set(req.tlsAlpnSni(&sni_buf), material.cert_der, material.key_pem);
+}
+
+/// The RFC 8737 validation certificate for a TLS-ALPN-01 `req` (a fresh
+/// P-256 key, self-signed, the critical `acmeIdentifier` extension), for a
+/// solver of the caller's own (`Solver`) that serves it under ALPN
+/// `acme-tls/1` for `req.tlsAlpnSni`. Caller frees with `Material.deinit`
+/// (which wipes the key).
+pub fn tlsAlpnValidation(io: std.Io, gpa: Allocator, req: *const ChallengeRequest) SolverError!TlsAlpnResponder.Material {
     const acme_id = req.tlsAlpnIdentifier();
     // Short-lived and never published, but it still signs a certificate a
     // TLS client is about to accept — same draw as the issuance key.
     var cert_key: jws.KeyPair = undefined;
-    jws.generateKeyPair(&cert_key, c.io);
+    jws.generateKeyPair(&cert_key, io);
     defer std.crypto.secureZero(u8, std.mem.asBytes(&cert_key));
 
     // Deterministic positive, minimal serial derived from the identifier.
@@ -1432,7 +1444,7 @@ fn presentTlsAlpn01(ctx: ?*anyopaque, req: *const ChallengeRequest) SolverError!
     serial[0] = (serial[0] & 0x7f) | 0x01;
 
     const cert_der = x509.tlsAlpnCertDer(
-        c.gpa,
+        gpa,
         &cert_key,
         req.identifier,
         acme_id,
@@ -1445,14 +1457,9 @@ fn presentTlsAlpn01(ctx: ?*anyopaque, req: *const ChallengeRequest) SolverError!
         // astronomically rare.
         error.InvalidDomain, error.SigningFailed, error.ValueTooLarge => return error.SolverFailed,
     };
-    defer c.gpa.free(cert_der);
-    const key_pem = try x509.ecPrivateKeyToPem(c.gpa, &cert_key);
-    defer {
-        std.crypto.secureZero(u8, key_pem);
-        c.gpa.free(key_pem);
-    }
-    var sni_buf: [max_reverse_name_len]u8 = undefined;
-    try c.tls_alpn.set(req.tlsAlpnSni(&sni_buf), cert_der, key_pem);
+    errdefer gpa.free(cert_der);
+    const key_pem = try x509.ecPrivateKeyToPem(gpa, &cert_key);
+    return .{ .cert_der = cert_der, .key_pem = key_pem };
 }
 
 fn cleanupTlsAlpn01(ctx: ?*anyopaque, req: *const ChallengeRequest) void {
@@ -4853,6 +4860,104 @@ test "W3: the order flow step by step — newOrder, fetchOrder by URL, authoriza
     try testing.expect(chain.not_after > 0);
     try testing.expect(!zone.bad_cleanup);
     try lab.expectClean();
+}
+
+test "W5: AcmeIssuer through the mock CA, HTTP-01 answered by the Manager's solver and middleware" {
+    const Manager = @import("Manager.zig");
+    const storage = @import("storage.zig");
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var mock: MockCa = .{ .gpa = testing.allocator, .io = io, .badnonce_left = 0 };
+
+    var ca_router = router.Router.init(testing.allocator);
+    defer ca_router.deinit();
+    ca_router.state = &mock;
+    try mockRoutes(&ca_router, false);
+    var ca_server = http.Server.init(io, testing.allocator, .{ .handler = ca_router.handler(), .context = &ca_router });
+    defer ca_server.deinit();
+    ca_server.bind() catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+
+    var mem = storage.MemStorage.init(testing.allocator);
+    defer mem.deinit();
+    var manager = Manager.init(io, testing.allocator, .{ .storage = mem.storage(), .random_seed = 1 });
+    defer manager.deinit();
+
+    // The "domain": port 80 is the manager's middleware, nothing else.
+    var challenge_router = router.Router.init(testing.allocator);
+    defer challenge_router.deinit();
+    try challenge_router.use(manager.httpMiddleware());
+    var challenge_server = http.Server.init(io, testing.allocator, .{ .handler = challenge_router.handler(), .context = &challenge_router });
+    defer challenge_server.deinit();
+    challenge_server.bind() catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+
+    try mock.setUrls(ca_server.boundAddress().getPort(), challenge_server.boundAddress().getPort());
+    defer mock.deinitUrls();
+    const ca_thread = try std.Thread.spawn(.{}, serveWrap, .{&ca_server});
+    defer ca_thread.join();
+    defer ca_server.shutdown();
+    const ch_thread = try std.Thread.spawn(.{}, serveWrap, .{&challenge_server});
+    defer ch_thread.join();
+    defer challenge_server.shutdown();
+
+    var transport = http.Client.init(io, testing.allocator, .{});
+    defer transport.deinit();
+    var account_key: jws.KeyPair = undefined;
+    try jws.Es256.KeyPair.generateDeterministicInto(&account_key, &@as([32]u8, @splat(91)));
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&account_key));
+    var client = Client.init(io, testing.allocator, &transport, &account_key, .{
+        .directory_url = mock.dir_url,
+        .poll_interval_ms = 10,
+        .max_polls = 50,
+        .solvers = manager.challengeSolvers(),
+    });
+    defer client.deinit();
+
+    var acme_issuer: Manager.AcmeIssuer = .{ .client = &client, .name = "mock" };
+    const iss = acme_issuer.issuer();
+
+    // The issuer alone: the mock fetched the key authorization from the
+    // manager's middleware, and the tokens are gone afterwards.
+    var diag: Manager.Diagnostics = .{};
+    var issued = try iss.issue(iss.ctx, testing.allocator, &.{ .names = &.{MockCa.domain} }, &diag);
+    defer issued.deinit(testing.allocator);
+    try testing.expect(mock.challenge_ok);
+    try testing.expectEqualStrings(x509.test_cert_pem ++ x509.test_root_cert_pem, issued.chain_pem);
+    try testing.expectEqual(@as(usize, 0), manager.http_tokens.count());
+    try testing.expectEqual(@as(usize, 0), client.challengeResponder().count()); // the built-in was never used
+    // No renewalInfo in this directory: the window hook says so.
+    try testing.expectError(error.NotSupported, iss.renewal_window.?(iss.ctx, issued.chain_pem, &diag));
+
+    // Through the manager: the mock CA hands out a fixed test chain, not one
+    // for the freshly generated key — the manager refuses to store or serve
+    // it (the chain check is the first of `checkPair`'s to trip).
+    const Rec = struct {
+        failed: u32 = 0,
+        installed: u32 = 0,
+        problem: [96]u8 = @splat(0),
+        fn call(ctx: ?*anyopaque, ev: *const Manager.Event) void {
+            const r: *@This() = @ptrCast(@alignCast(ctx.?));
+            switch (ev.*) {
+                .installed => r.installed += 1,
+                .failed => |f| {
+                    r.failed += 1;
+                    @memcpy(r.problem[0..@min(f.problem.len, 96)], f.problem[0..@min(f.problem.len, 96)]);
+                },
+                .storage_failed => {},
+            }
+        }
+    };
+    var rec: Rec = .{};
+    manager.options.on_event = .{ .ctx = &rec, .call = Rec.call };
+    try manager.addIssuer(iss);
+    try manager.manage(&.{MockCa.domain});
+    _ = manager.maintain();
+    try testing.expectEqual(@as(u32, 1), rec.failed);
+    try testing.expectEqual(@as(u32, 0), rec.installed);
+    try testing.expectEqualStrings("issued chain does not verify", std.mem.sliceTo(&rec.problem, 0));
+    try testing.expectEqual(@as(usize, 0), mem.count());
+    if (mock.fail_count != 0) std.debug.print("mock CA: {s}\n", .{mock.failNote()});
+    try testing.expectEqual(@as(u32, 0), mock.fail_count);
 }
 
 test "W3: a caller's Solver replaces the built-in (no dns_publisher needed); a failing one aborts, no cleanup" {

@@ -50,17 +50,27 @@ const rsa = @import("rsa");
 const Scratch = struct { path: []const u8 };
 
 var current: ?*acme.Client = null;
+/// The `manager` scenario's manager: its solvers publish into it, not into
+/// the client's responders.
+var current_manager: ?*acme.Manager = null;
 
 fn challengeHandler(req: *http.Server.Request, res: *http.Server.ResponseWriter) anyerror!void {
     const prefix = acme.Client.Responder.path_prefix;
     var buf: [512]u8 = undefined;
-    if (current) |c| if (std.mem.startsWith(u8, req.target, prefix)) {
-        if (c.challengeResponder().lookup(req.target[prefix.len..], &buf)) |ka| {
+    if (std.mem.startsWith(u8, req.target, prefix)) {
+        const token = req.target[prefix.len..];
+        const ka: ?[]const u8 = if (current_manager) |m|
+            m.http_tokens.lookup(token, &buf)
+        else if (current) |c|
+            c.challengeResponder().lookup(token, &buf)
+        else
+            null;
+        if (ka) |v| {
             res.setStatus(200);
             try res.setHeader("Content-Type", "application/octet-stream");
-            return res.writeAll(ka);
+            return res.writeAll(v);
         }
-    };
+    }
     res.setStatus(404);
     try res.writeAll("no such token");
 }
@@ -68,8 +78,15 @@ fn challengeHandler(req: *http.Server.Request, res: *http.Server.ResponseWriter)
 fn materialHandler(req: *http.Server.Request, res: *http.Server.ResponseWriter) anyerror!void {
     const gpa = std.heap.smp_allocator;
     const prefix = "/alpn/";
-    if (current) |c| if (std.mem.startsWith(u8, req.target, prefix)) {
-        if (try c.tlsAlpnResponder().getMaterial(gpa, req.target[prefix.len..])) |m_const| {
+    if (std.mem.startsWith(u8, req.target, prefix)) {
+        const sni = req.target[prefix.len..];
+        const found = if (current_manager) |m|
+            try m.tlsAlpnMaterial(gpa, sni)
+        else if (current) |c|
+            try c.tlsAlpnResponder().getMaterial(gpa, sni)
+        else
+            null;
+        if (found) |m_const| {
             var m = m_const;
             defer m.deinit(gpa);
             res.setStatus(200);
@@ -77,7 +94,7 @@ fn materialHandler(req: *http.Server.Request, res: *http.Server.ResponseWriter) 
             try res.writeAll("\n--KEY--\n");
             return res.writeAll(m.key_pem);
         }
-    };
+    }
     res.setStatus(404);
     try res.writeAll("no material");
 }
@@ -366,6 +383,174 @@ fn orderSteps(gpa: std.mem.Allocator, io: std.Io, transport: *http.Client, eab_k
     return failures;
 }
 
+/// The real clock plus an offset the `manager` scenario moves forward.
+const ShiftedClock = struct {
+    io: std.Io,
+    offset: i64 = 0,
+    fn clock(s: *ShiftedClock) acme.Manager.Clock {
+        return .{ .ctx = s, .now = now };
+    }
+    fn now(ctx: ?*anyopaque) i64 {
+        const s: *ShiftedClock = @ptrCast(@alignCast(ctx.?));
+        return std.Io.Clock.real.now(s.io).toSeconds() + s.offset;
+    }
+};
+
+const Events = struct {
+    issued: u32 = 0,
+    from_storage: u32 = 0,
+    failed: u32 = 0,
+    fn hook(e: *Events) acme.Manager.EventHook {
+        return .{ .ctx = e, .call = call };
+    }
+    fn call(ctx: ?*anyopaque, ev: *const acme.Manager.Event) void {
+        const e: *Events = @ptrCast(@alignCast(ctx.?));
+        switch (ev.*) {
+            .installed => |i| switch (i.source) {
+                .issued => e.issued += 1,
+                .storage => e.from_storage += 1,
+            },
+            .failed => |f| {
+                e.failed += 1;
+                std.debug.print("manager: failed: {s}\n", .{f.problem});
+            },
+            .storage_failed => {
+                e.failed += 1;
+                std.debug.print("manager: storing an issued certificate failed\n", .{});
+            },
+        }
+    }
+};
+
+fn allowOdTest(ctx: ?*anyopaque, name: []const u8) bool {
+    _ = ctx;
+    return std.mem.eql(u8, name, "od.test");
+}
+
+fn mstep(failures: *usize, name: []const u8, ok: bool) void {
+    if (!ok) failures.* += 1;
+    std.debug.print("manager/{s}: {s}\n", .{ name, if (ok) "OK" else "FAIL" });
+}
+
+/// `clock` is read after the lookup: an on-demand certificate is issued by
+/// it, and Pebble does not backdate notBefore.
+fn servesVerified(gpa: std.mem.Allocator, m: *acme.Manager, sni: []const u8, root_pem: []const u8, names: []const []const u8, clock: *ShiftedClock) bool {
+    var mat = (m.certificate(gpa, sni) catch return false) orelse return false;
+    defer mat.deinit(gpa);
+    return chainOk(gpa, mat.chain_pem, root_pem, names, ShiftedClock.now(clock));
+}
+
+/// The `manager` scenario (W5, 2026-10-16): the `Manager` over a real
+/// `Client` and `DirStorage` — issue, ARI window, a renewal that names its
+/// predecessor, a restart that serves from storage, TLS-ALPN-01 answered by
+/// the manager, an on-demand issuance. Returns the number of failed steps.
+fn managerScenario(gpa: std.mem.Allocator, io: std.Io, transport: *http.Client, eab_key: []const u8, root_pem: []const u8, scratch: []const u8) !usize {
+    var failures: usize = 0;
+    // A fresh storage directory per run (the scratch dir is .zig-cache).
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path = try std.fmt.bufPrint(&dir_buf, "{s}/manager-{d}", .{ scratch, std.Io.Clock.real.now(io).toSeconds() });
+    try std.Io.Dir.cwd().createDir(io, dir_path, @enumFromInt(0o700));
+    var dir = try std.Io.Dir.cwd().openDir(io, dir_path, .{});
+    defer dir.close(io);
+    var ds = acme.DirStorage.init(io, dir);
+    const root_der = try acme.x509.pemDecode(gpa, "CERTIFICATE", root_pem);
+    defer gpa.free(root_der);
+    var clock: ShiftedClock = .{ .io = io };
+    var events: Events = .{};
+    const names: []const []const u8 = &.{ "m.test", "m2.test" };
+
+    var account_key: acme.jws.AnyKeyPair = undefined;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&account_key));
+    try acme.Manager.loadOrCreateAccountKey(&account_key, io, gpa, ds.storage(), "pebble", .es256);
+
+    {
+        var m = acme.Manager.init(io, gpa, .{
+            .storage = ds.storage(),
+            .trust_anchors = &.{root_der},
+            .on_event = events.hook(),
+            .clock = clock.clock(),
+        });
+        defer m.deinit();
+        current_manager = &m;
+        defer current_manager = null;
+        var client = acme.Client.init(io, gpa, transport, &account_key, .{
+            .directory_url = "https://localhost:14001/dir",
+            .eab = .{ .kid = eab_kid, .hmac_key = eab_key },
+            .solvers = m.challengeSolvers(),
+            .poll_interval_ms = 200,
+            .max_polls = 100,
+        });
+        defer client.deinit();
+        var issuer: acme.Manager.AcmeIssuer = .{ .client = &client, .name = "pebble" };
+        try m.addIssuer(issuer.issuer());
+        try m.manage(names);
+
+        const next = m.maintain();
+        mstep(&failures, "issued", events.issued == 1 and events.failed == 0);
+        mstep(&failures, "serves-verified", servesVerified(gpa, &m, "m2.test", root_pem, names, &clock));
+        mstep(&failures, "stored", if (dir.statFile(io, "certificates/m.test.crt", .{})) |_| true else |_| false);
+        // The ARI poll is due at once; Pebble answers with a window.
+        mstep(&failures, "ari-due", next <= ShiftedClock.now(&clock));
+        _ = m.maintain();
+        const e = m.entries.items[0];
+        mstep(&failures, "ari-window", e.ari_end > e.ari_start and e.renew_at >= e.ari_start and
+            e.renew_at <= e.ari_end and e.ari_at != null);
+
+        // Jump to the renewal time: renewed, naming its predecessor (Pebble
+        // checks `replaces` against the account's certificates).
+        const old_not_after = e.cert.?.not_after;
+        clock.offset = e.renew_at - std.Io.Clock.real.now(io).toSeconds() + 1;
+        _ = m.maintain();
+        mstep(&failures, "renewed", events.issued == 2 and events.failed == 0 and
+            m.entries.items[0].cert.?.not_after != old_not_after);
+        mstep(&failures, "renewed-verified", servesVerified(gpa, &m, "m.test", root_pem, names, &clock));
+    }
+    {
+        // A restart: the renewed certificate comes from storage, no order.
+        var m = acme.Manager.init(io, gpa, .{
+            .storage = ds.storage(),
+            .trust_anchors = &.{root_der},
+            .on_event = events.hook(),
+            .clock = clock.clock(),
+        });
+        defer m.deinit();
+        try m.manage(names);
+        _ = m.maintain();
+        mstep(&failures, "restart-from-storage", events.from_storage == 1 and events.issued == 2);
+    }
+    clock.offset = 0;
+    {
+        // TLS-ALPN-01 answered from the manager's store, and on-demand.
+        var m = acme.Manager.init(io, gpa, .{
+            .storage = ds.storage(),
+            .trust_anchors = &.{root_der},
+            .on_event = events.hook(),
+            .on_demand = .{ .allow = allowOdTest },
+        });
+        defer m.deinit();
+        current_manager = &m;
+        defer current_manager = null;
+        var client = acme.Client.init(io, gpa, transport, &account_key, .{
+            .directory_url = "https://localhost:14001/dir",
+            .eab = .{ .kid = eab_kid, .hmac_key = eab_key },
+            .challenge_type = .tls_alpn_01,
+            .solvers = m.challengeSolvers(),
+            .poll_interval_ms = 200,
+            .max_polls = 100,
+        });
+        defer client.deinit();
+        var issuer: acme.Manager.AcmeIssuer = .{ .client = &client, .name = "pebble" };
+        try m.addIssuer(issuer.issuer());
+        try m.manage(&.{"mt.test"});
+        _ = m.maintain();
+        mstep(&failures, "tlsalpn01-issued", events.issued == 3 and events.failed == 0);
+        mstep(&failures, "tlsalpn01-verified", servesVerified(gpa, &m, "mt.test", root_pem, &.{"mt.test"}, &clock));
+        mstep(&failures, "on-demand", servesVerified(gpa, &m, "od.test", root_pem, &.{"od.test"}, &clock) and events.issued == 4);
+        mstep(&failures, "on-demand-refused", (m.certificate(gpa, "other.test") catch null) == null and events.issued == 4);
+    }
+    return failures;
+}
+
 pub fn main(init: std.process.Init.Minimal) !u8 {
     var da: std.heap.DebugAllocator(.{}) = .init;
     defer if (da.deinit() == .leak) @panic("leak");
@@ -510,9 +695,14 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         std.debug.print("steps: aborted: {t}\n", .{err});
         break :blk 1;
     };
+    try mark(&transport, "manager");
+    const manager_failures = managerScenario(gpa, io, &transport, eab_key, root_pem, scratch) catch |err| blk: {
+        std.debug.print("manager: aborted: {t}\n", .{err});
+        break :blk 1;
+    };
     try mark(&transport, "");
-    std.debug.print("interop-acme: {d} of {d} scenarios as expected against Pebble, lifecycle {d} failed step(s), steps {d} failed step(s)\n", .{
-        scenarios.len - failures, scenarios.len, lifecycle_failures, steps_failures,
+    std.debug.print("interop-acme: {d} of {d} scenarios as expected against Pebble, lifecycle {d} failed step(s), steps {d} failed step(s), manager {d} failed step(s)\n", .{
+        scenarios.len - failures, scenarios.len, lifecycle_failures, steps_failures, manager_failures,
     });
-    return if (failures == 0 and lifecycle_failures == 0 and steps_failures == 0) 0 else 1;
+    return if (failures == 0 and lifecycle_failures == 0 and steps_failures == 0 and manager_failures == 0) 0 else 1;
 }

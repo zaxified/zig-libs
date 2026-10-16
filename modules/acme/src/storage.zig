@@ -1,0 +1,502 @@
+// SPDX-License-Identifier: MIT
+
+//! Where a `Manager` keeps what must outlive the process: account keys,
+//! issued certificates and their keys, and — for a fleet — challenge data
+//! and issuance locks. Modeled on CertMagic's `Storage` + `Locker` and
+//! autocert's `Cache` (design only).
+//!
+//! `Storage` is a small vtable so a deployment can put it anywhere (a
+//! database, a key-value service); `DirStorage` is the file-system one
+//! (autocert's `DirCache`), `MemStorage` the in-process one for tests and
+//! single-run tools.
+//!
+//! Keys (`path` parameters) are relative `/`-separated paths of `[A-Za-z0-9._@+-]` segments; no
+//! empty, `.` or `..` segment (`validKey`). Values are opaque bytes; the
+//! manager writes PEM.
+
+const std = @import("std");
+
+const Allocator = std.mem.Allocator;
+
+pub const Error = error{
+    OutOfMemory,
+    /// `load` of a key that is not there.
+    NotFound,
+    /// The key is not a valid storage key (see `validKey`).
+    InvalidKey,
+    /// The backend failed (I/O, permissions, a full disk, a value over the
+    /// backend's size limit).
+    StorageFailed,
+};
+
+/// Upper bound for one stored value; a bigger one is `StorageFailed`.
+pub const max_value_len = 1 << 20;
+
+/// Longest key accepted.
+pub const max_key_len = 512;
+
+/// The storage interface (CertMagic `Storage` + `Locker`).
+pub const Storage = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        /// The value under `key`, allocated with `gpa`; `NotFound` when absent.
+        load: *const fn (ptr: *anyopaque, gpa: Allocator, path: []const u8) Error![]u8,
+        /// Store `value` under `key`, replacing any old value **atomically**:
+        /// a reader sees the old value or the new one, never a mix, and a
+        /// crash leaves one of the two.
+        store: *const fn (ptr: *anyopaque, path: []const u8, value: []const u8) Error!void,
+        /// Remove `key`; absent is not an error.
+        delete: *const fn (ptr: *anyopaque, path: []const u8) Error!void,
+        /// Take the lock `name` for `owner` until `now + lease_s` (epoch
+        /// seconds). True when taken: free, expired, or already `owner`'s (the
+        /// lease is then extended). False when another owner holds an unexpired
+        /// lease. Locks coordinate the nodes of a fleet that share one storage.
+        tryLock: *const fn (ptr: *anyopaque, name: []const u8, owner: []const u8, now: i64, lease_s: u32) Error!bool,
+        /// Release `name` if `owner` holds it; anything else is a no-op.
+        unlock: *const fn (ptr: *anyopaque, name: []const u8, owner: []const u8) void,
+    };
+
+    pub fn load(s: Storage, gpa: Allocator, path: []const u8) Error![]u8 {
+        if (!validKey(path)) return error.InvalidKey;
+        return s.vtable.load(s.ptr, gpa, path);
+    }
+
+    pub fn store(s: Storage, path: []const u8, value: []const u8) Error!void {
+        if (!validKey(path)) return error.InvalidKey;
+        if (value.len > max_value_len) return error.StorageFailed;
+        return s.vtable.store(s.ptr, path, value);
+    }
+
+    pub fn delete(s: Storage, path: []const u8) Error!void {
+        if (!validKey(path)) return error.InvalidKey;
+        return s.vtable.delete(s.ptr, path);
+    }
+
+    pub fn tryLock(s: Storage, name: []const u8, owner: []const u8, now: i64, lease_s: u32) Error!bool {
+        if (!validKey(name)) return error.InvalidKey;
+        if (!validOwner(owner)) return error.InvalidKey;
+        return s.vtable.tryLock(s.ptr, name, owner, now, lease_s);
+    }
+
+    pub fn unlock(s: Storage, name: []const u8, owner: []const u8) void {
+        if (!validKey(name) or !validOwner(owner)) return;
+        s.vtable.unlock(s.ptr, name, owner);
+    }
+};
+
+/// A storage key: 1..`max_key_len` bytes, `/`-separated segments of
+/// `[A-Za-z0-9._@+-]`, none empty, `.` or `..`, no leading or trailing `/`.
+pub fn validKey(path: []const u8) bool {
+    if (path.len == 0 or path.len > max_key_len) return false;
+    var it = std.mem.splitScalar(u8, path, '/');
+    while (it.next()) |seg| {
+        if (seg.len == 0) return false;
+        if (std.mem.eql(u8, seg, ".") or std.mem.eql(u8, seg, "..")) return false;
+        for (seg) |ch| if (!keyChar(ch)) return false;
+    }
+    return true;
+}
+
+fn keyChar(ch: u8) bool {
+    return std.ascii.isAlphanumeric(ch) or ch == '.' or ch == '_' or ch == '-' or ch == '@' or ch == '+';
+}
+
+/// A lock owner: 1..64 key characters (no `/`, no newline).
+fn validOwner(owner: []const u8) bool {
+    if (owner.len == 0 or owner.len > 64) return false;
+    for (owner) |ch| if (!keyChar(ch)) return false;
+    return true;
+}
+
+// ── the file-system backend ─────────────────────────────────────────────────
+
+/// Files under one directory (autocert `DirCache`, CertMagic `FileStorage`):
+/// a key is a relative path. Directories are created `0700`, files `0600`
+/// (they hold private keys); every write is a fresh file fsynced and renamed
+/// over the old one. Locks are files under `locks/` holding the owner and the
+/// lease expiry, created with an exclusive link so two nodes never both
+/// create one.
+///
+/// Fleet caveat (shared with CertMagic's file locks): taking over an expired
+/// lock is delete-then-create, so two nodes that find the same stale lock in
+/// the same instant can both win. The consequence is one duplicate order at
+/// the CA, never a corrupted file — every value write is atomic.
+pub const DirStorage = struct {
+    io: std.Io,
+    /// Caller-owned; open it before `init` (create it `0700`).
+    dir: std.Io.Dir,
+
+    pub fn init(io: std.Io, dir: std.Io.Dir) DirStorage {
+        return .{ .io = io, .dir = dir };
+    }
+
+    pub fn storage(d: *DirStorage) Storage {
+        return .{ .ptr = d, .vtable = &vtable };
+    }
+
+    const vtable: Storage.VTable = .{
+        .load = dirLoad,
+        .store = dirStore,
+        .delete = dirDelete,
+        .tryLock = dirTryLock,
+        .unlock = dirUnlock,
+    };
+
+    const dir_permissions: std.Io.File.Permissions = @enumFromInt(0o700);
+    const file_permissions: std.Io.File.Permissions = @enumFromInt(0o600);
+
+    fn of(ptr: *anyopaque) *DirStorage {
+        return @ptrCast(@alignCast(ptr));
+    }
+
+    fn dirLoad(ptr: *anyopaque, gpa: Allocator, key: []const u8) Error![]u8 {
+        const d = of(ptr);
+        return d.dir.readFileAlloc(d.io, key, gpa, .limited(max_value_len + 1)) catch |err| switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.FileNotFound => error.NotFound,
+            else => error.StorageFailed,
+        };
+    }
+
+    /// Create every parent directory of `key`, `0700`.
+    fn makeParents(d: *DirStorage, key: []const u8) Error!void {
+        var at: usize = 0;
+        while (std.mem.indexOfScalarPos(u8, key, at, '/')) |slash| : (at = slash + 1) {
+            d.dir.createDir(d.io, key[0..slash], dir_permissions) catch |err| switch (err) {
+                error.PathAlreadyExists => {},
+                else => return error.StorageFailed,
+            };
+        }
+    }
+
+    fn dirStore(ptr: *anyopaque, key: []const u8, value: []const u8) Error!void {
+        const d = of(ptr);
+        try d.makeParents(key);
+        var atomic = d.dir.createFileAtomic(d.io, key, .{
+            .permissions = file_permissions,
+            .replace = true,
+        }) catch return error.StorageFailed;
+        defer atomic.deinit(d.io);
+        atomic.file.writeStreamingAll(d.io, value) catch return error.StorageFailed;
+        // A rename of an unsynced file can surface as an empty file after a
+        // crash; the value must be on disk before it replaces the old one.
+        atomic.file.sync(d.io) catch return error.StorageFailed;
+        atomic.replace(d.io) catch return error.StorageFailed;
+    }
+
+    fn dirDelete(ptr: *anyopaque, key: []const u8) Error!void {
+        const d = of(ptr);
+        d.dir.deleteFile(d.io, key) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return error.StorageFailed,
+        };
+    }
+
+    const lock_dir = "locks/";
+    const max_lock_path = lock_dir.len + max_key_len + ".lock".len;
+
+    fn lockPath(buf: *[max_lock_path]u8, name: []const u8) []const u8 {
+        return std.fmt.bufPrint(buf, "{s}{s}.lock", .{ lock_dir, name }) catch unreachable; // name <= max_key_len
+    }
+
+    /// Create the lock file whole and exclusively; false when one exists.
+    fn createLock(d: *DirStorage, path: []const u8, owner: []const u8, expiry: i64) Error!bool {
+        try d.makeParents(path);
+        var atomic = d.dir.createFileAtomic(d.io, path, .{ .permissions = file_permissions }) catch
+            return error.StorageFailed;
+        defer atomic.deinit(d.io);
+        var buf: [96]u8 = undefined;
+        const text = std.fmt.bufPrint(&buf, "{s}\n{d}\n", .{ owner, expiry }) catch unreachable; // owner <= 64
+        atomic.file.writeStreamingAll(d.io, text) catch return error.StorageFailed;
+        atomic.link(d.io) catch |err| switch (err) {
+            error.PathAlreadyExists => return false,
+            else => return error.StorageFailed,
+        };
+        return true;
+    }
+
+    fn dirTryLock(ptr: *anyopaque, name: []const u8, owner: []const u8, now: i64, lease_s: u32) Error!bool {
+        const d = of(ptr);
+        var path_buf: [max_lock_path]u8 = undefined;
+        const path = lockPath(&path_buf, name);
+        const expiry = now +| lease_s;
+        // Two rounds: a stale lock is removed in the first and re-created in
+        // the second; losing the second round means another node won.
+        for (0..2) |_| {
+            if (try d.createLock(path, owner, expiry)) return true;
+            var read_buf: [96]u8 = undefined;
+            const held = d.readLock(path, &read_buf) catch |err| switch (err) {
+                error.NotFound => continue, // released between our two calls
+                else => return err,
+            };
+            const mine = std.mem.eql(u8, held.owner, owner);
+            if (!mine and held.expiry > now) return false;
+            if (mine) {
+                // Extend our own lease in place (atomic replace).
+                var buf: [96]u8 = undefined;
+                const text = std.fmt.bufPrint(&buf, "{s}\n{d}\n", .{ owner, expiry }) catch unreachable;
+                try dirStore(ptr, path, text);
+                return true;
+            }
+            // Expired: remove it and race for a fresh one.
+            try dirDelete(ptr, path);
+        }
+        return false;
+    }
+
+    const Held = struct { owner: []const u8, expiry: i64 };
+
+    fn readLock(d: *DirStorage, path: []const u8, buf: *[96]u8) Error!Held {
+        const text = d.dir.readFile(d.io, path, buf) catch |err| switch (err) {
+            error.FileNotFound => return error.NotFound,
+            else => return error.StorageFailed,
+        };
+        // A lock we cannot read is treated as expired (owner "", expiry 0):
+        // it was not written by this code, or by a crashed writer of an older
+        // format, and waiting on it forever would stop renewals.
+        var lines = std.mem.splitScalar(u8, text, '\n');
+        const owner = lines.next() orelse "";
+        const expiry = std.fmt.parseInt(i64, lines.next() orelse "", 10) catch 0;
+        return .{ .owner = owner, .expiry = expiry };
+    }
+
+    fn dirUnlock(ptr: *anyopaque, name: []const u8, owner: []const u8) void {
+        const d = of(ptr);
+        var path_buf: [max_lock_path]u8 = undefined;
+        const path = lockPath(&path_buf, name);
+        var read_buf: [96]u8 = undefined;
+        const held = d.readLock(path, &read_buf) catch return;
+        if (!std.mem.eql(u8, held.owner, owner)) return;
+        dirDelete(ptr, path) catch {};
+    }
+};
+
+// ── the in-memory backend ───────────────────────────────────────────────────
+
+/// A thread-safe map in memory: tests, one-shot tools, and a process that
+/// keeps nothing across restarts (it will re-issue on every start — mind the
+/// CA's rate limits).
+pub const MemStorage = struct {
+    gpa: Allocator,
+    lock: std.atomic.Mutex = .unlocked,
+    values: std.StringHashMapUnmanaged([]u8) = .empty,
+    locks: std.StringHashMapUnmanaged(LockEntry) = .empty,
+
+    const LockEntry = struct { owner: [64]u8, owner_len: u8, expiry: i64 };
+
+    pub fn init(gpa: Allocator) MemStorage {
+        return .{ .gpa = gpa };
+    }
+
+    pub fn deinit(m: *MemStorage) void {
+        var it = m.values.iterator();
+        while (it.next()) |e| {
+            m.gpa.free(e.key_ptr.*);
+            std.crypto.secureZero(u8, e.value_ptr.*); // values include private keys
+            m.gpa.free(e.value_ptr.*);
+        }
+        m.values.deinit(m.gpa);
+        var lit = m.locks.keyIterator();
+        while (lit.next()) |k| m.gpa.free(k.*);
+        m.locks.deinit(m.gpa);
+        m.* = undefined;
+    }
+
+    pub fn storage(m: *MemStorage) Storage {
+        return .{ .ptr = m, .vtable = &vtable };
+    }
+
+    /// Number of stored values (tests).
+    pub fn count(m: *MemStorage) usize {
+        lockSpin(&m.lock);
+        defer m.lock.unlock();
+        return m.values.count();
+    }
+
+    const vtable: Storage.VTable = .{
+        .load = memLoad,
+        .store = memStore,
+        .delete = memDelete,
+        .tryLock = memTryLock,
+        .unlock = memUnlock,
+    };
+
+    fn of(ptr: *anyopaque) *MemStorage {
+        return @ptrCast(@alignCast(ptr));
+    }
+
+    fn memLoad(ptr: *anyopaque, gpa: Allocator, key: []const u8) Error![]u8 {
+        const m = of(ptr);
+        lockSpin(&m.lock);
+        defer m.lock.unlock();
+        const v = m.values.get(key) orelse return error.NotFound;
+        return gpa.dupe(u8, v);
+    }
+
+    fn memStore(ptr: *anyopaque, key: []const u8, value: []const u8) Error!void {
+        const m = of(ptr);
+        const copy = try m.gpa.dupe(u8, value);
+        errdefer m.gpa.free(copy);
+        lockSpin(&m.lock);
+        defer m.lock.unlock();
+        const gop = try m.values.getOrPut(m.gpa, key);
+        if (gop.found_existing) {
+            std.crypto.secureZero(u8, gop.value_ptr.*);
+            m.gpa.free(gop.value_ptr.*);
+        } else {
+            gop.key_ptr.* = m.gpa.dupe(u8, key) catch |err| {
+                _ = m.values.remove(key);
+                return err;
+            };
+        }
+        gop.value_ptr.* = copy;
+    }
+
+    fn memDelete(ptr: *anyopaque, key: []const u8) Error!void {
+        const m = of(ptr);
+        lockSpin(&m.lock);
+        const kv = m.values.fetchRemove(key);
+        m.lock.unlock();
+        if (kv) |e| {
+            m.gpa.free(e.key);
+            std.crypto.secureZero(u8, e.value);
+            m.gpa.free(e.value);
+        }
+    }
+
+    fn memTryLock(ptr: *anyopaque, name: []const u8, owner: []const u8, now: i64, lease_s: u32) Error!bool {
+        const m = of(ptr);
+        lockSpin(&m.lock);
+        defer m.lock.unlock();
+        const gop = try m.locks.getOrPut(m.gpa, name);
+        if (gop.found_existing) {
+            const e = gop.value_ptr;
+            const mine = std.mem.eql(u8, e.owner[0..e.owner_len], owner);
+            if (!mine and e.expiry > now) return false;
+        } else {
+            gop.key_ptr.* = m.gpa.dupe(u8, name) catch |err| {
+                _ = m.locks.remove(name);
+                return err;
+            };
+        }
+        var e: LockEntry = .{ .owner = undefined, .owner_len = @intCast(owner.len), .expiry = now +| lease_s };
+        @memcpy(e.owner[0..owner.len], owner);
+        gop.value_ptr.* = e;
+        return true;
+    }
+
+    fn memUnlock(ptr: *anyopaque, name: []const u8, owner: []const u8) void {
+        const m = of(ptr);
+        lockSpin(&m.lock);
+        defer m.lock.unlock();
+        const e = m.locks.getPtr(name) orelse return;
+        if (!std.mem.eql(u8, e.owner[0..e.owner_len], owner)) return;
+        const kv = m.locks.fetchRemove(name).?;
+        m.gpa.free(kv.key);
+    }
+};
+
+fn lockSpin(m: *std.atomic.Mutex) void {
+    while (!m.tryLock()) std.atomic.spinLoopHint();
+}
+
+// ── tests ───────────────────────────────────────────────────────────────────
+
+const testing = std.testing;
+
+test "validKey: segments, characters, traversal" {
+    try testing.expect(validKey("certificates/example.org.crt"));
+    try testing.expect(validKey("accounts/acme-v02.api.letsencrypt.org-directory/account.key"));
+    try testing.expect(validKey("a"));
+    try testing.expect(!validKey(""));
+    try testing.expect(!validKey("/abs"));
+    try testing.expect(!validKey("trailing/"));
+    try testing.expect(!validKey("a//b"));
+    try testing.expect(!validKey("../etc/passwd"));
+    try testing.expect(!validKey("a/../b"));
+    try testing.expect(!validKey("a/./b"));
+    try testing.expect(!validKey("star*"));
+    try testing.expect(!validKey("sp ace"));
+    try testing.expect(!validKey("nl\n"));
+    try testing.expect(!validKey("back\\slash"));
+    try testing.expect(!validKey("x" ** (max_key_len + 1)));
+}
+
+/// The contract every backend must keep — run against each.
+fn checkContract(s: Storage) !void {
+    const gpa = testing.allocator;
+    try testing.expectError(error.NotFound, s.load(gpa, "k/v"));
+    try s.store("k/v", "one");
+    {
+        const v = try s.load(gpa, "k/v");
+        defer gpa.free(v);
+        try testing.expectEqualStrings("one", v);
+    }
+    try s.store("k/v", "two"); // replace
+    {
+        const v = try s.load(gpa, "k/v");
+        defer gpa.free(v);
+        try testing.expectEqualStrings("two", v);
+    }
+    try s.delete("k/v");
+    try s.delete("k/v"); // absent is fine
+    try testing.expectError(error.NotFound, s.load(gpa, "k/v"));
+    try testing.expectError(error.InvalidKey, s.store("../x", "v"));
+    try testing.expectError(error.InvalidKey, s.load(gpa, "a//b"));
+
+    // Locks: exclusive per owner until expiry, re-entrant (extends), released.
+    try testing.expect(try s.tryLock("issue/example.org", "node-a", 1000, 60));
+    try testing.expect(!try s.tryLock("issue/example.org", "node-b", 1059, 60));
+    try testing.expect(try s.tryLock("issue/example.org", "node-a", 1050, 60)); // extend to 1110
+    try testing.expect(!try s.tryLock("issue/example.org", "node-b", 1100, 60));
+    try testing.expect(try s.tryLock("issue/example.org", "node-b", 1110, 60)); // expired → taken over
+    s.unlock("issue/example.org", "node-a"); // not the holder: no-op
+    try testing.expect(!try s.tryLock("issue/example.org", "node-a", 1111, 60));
+    s.unlock("issue/example.org", "node-b");
+    try testing.expect(try s.tryLock("issue/example.org", "node-a", 1112, 60));
+    s.unlock("issue/example.org", "node-a");
+    try testing.expectError(error.InvalidKey, s.tryLock("x", "bad owner", 0, 1));
+}
+
+test "MemStorage: contract" {
+    var m = MemStorage.init(testing.allocator);
+    defer m.deinit();
+    try checkContract(m.storage());
+}
+
+test "DirStorage: contract, 0600 files in 0700 directories, no temp files left" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var d = DirStorage.init(io, tmp.dir);
+    try checkContract(d.storage());
+
+    const s = d.storage();
+    try s.store("certificates/deep/example.org.key", "secret");
+    const file_stat = try tmp.dir.statFile(io, "certificates/deep/example.org.key", .{});
+    try testing.expectEqual(@as(u32, 0o600), @as(u32, @intFromEnum(file_stat.permissions)) & 0o777);
+    const dir_stat = try tmp.dir.statFile(io, "certificates/deep", .{});
+    try testing.expectEqual(@as(u32, 0o700), @as(u32, @intFromEnum(dir_stat.permissions)) & 0o777);
+
+    // Only the value file is in the directory: the atomic write left no temp.
+    var sub = try tmp.dir.openDir(io, "certificates/deep", .{ .iterate = true });
+    defer sub.close(io);
+    var it = sub.iterate();
+    var names: usize = 0;
+    while (try it.next(io)) |e| {
+        names += 1;
+        try testing.expectEqualStrings("example.org.key", e.name);
+    }
+    try testing.expectEqual(@as(usize, 1), names);
+
+    // A lock file this code did not write counts as expired.
+    tmp.dir.createDir(io, "locks", .default_dir) catch {};
+    try tmp.dir.writeFile(io, .{ .sub_path = "locks/garbled.lock", .data = "\x00\x01" });
+    try testing.expect(try s.tryLock("garbled", "node-a", 5, 10));
+    s.unlock("garbled", "node-a");
+}

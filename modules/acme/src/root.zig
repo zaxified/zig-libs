@@ -43,7 +43,7 @@ const std = @import("std");
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "Let's Encrypt / ACME v2 (RFC 8555) — HTTP-01, TLS-ALPN-01 and DNS-01 (wildcard) issuance + renewal (ARI), ES256/ES384 JWS, CSR, external account binding, key rollover, revocation",
+    .doc = "Let's Encrypt / ACME v2 (RFC 8555) client + autocert-style Manager — HTTP-01, TLS-ALPN-01, DNS-01 (wildcard), ARI renewal scheduling, storage, on-demand issuance, fleet locks, issuer fallback; EC/RSA keys, EAB, rollover, revocation",
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
@@ -78,6 +78,18 @@ pub const ChallengeType = Client.ChallengeType;
 
 /// An issued certificate (PEM chain + leaf key PEM + notAfter).
 pub const Certificate = Client.Certificate;
+
+/// Certificates that obtain and renew themselves (autocert / CertMagic):
+/// managed set, renewal scheduling (ARI), storage, on-demand issuance,
+/// fleet locks, issuer fallback — see `Manager.init`.
+pub const Manager = @import("Manager.zig");
+
+/// Persistent storage for a `Manager`: the `Storage` interface,
+/// `DirStorage` (files) and `MemStorage` (memory).
+pub const storage = @import("storage.zig");
+
+/// File-system storage for a `Manager`.
+pub const DirStorage = storage.DirStorage;
 
 /// JOSE layer: base64url, ES256 JWS, JWK thumbprint, key authorization.
 pub const jws = @import("jws.zig");
@@ -118,6 +130,9 @@ test {
     _ = jws;
     _ = x509;
     _ = Client;
+    _ = Manager;
+    _ = storage;
+    _ = @import("manager_test.zig");
     // External anchor: Pebble's answers, replayed (tools/pebble.sh).
     _ = @import("b64ct.zig");
     _ = @import("pebble_replay_test.zig");

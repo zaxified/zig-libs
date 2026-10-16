@@ -48,6 +48,8 @@ domain out of production quotas. Going live is a deliberate opt-in:
 | `src/Client.zig` | The RFC 8555 protocol client (`register`, `obtain`) + `Responder` (HTTP-01 middleware) + `TlsAlpnResponder` (TLS-ALPN-01 validation-cert store). Robust nonce handling (`Replay-Nonce` harvested from every response, transparent `badNonce` retry), status polling with `Retry-After`, problem-document diagnostics via `lastProblem()`. Challenge type is `Options.challenge_type`. |
 | `src/jws.zig` | JOSE layer: base64url (no pad), canonical P-256 / P-384 JWK, RFC 7638 thumbprint, RFC 8555 §8.1 key authorization, RFC 8737 §3 `acmeIdentifier` (`SHA-256(keyAuthorization)`), ES256 / ES384 flattened-JSON JWS sign **and verify** (the verify half powers the mock CA), the HS256 external-account-binding JWS (`signEab` / `verifyEab`), `Alg` / `AnyKeyPair` / `AnyPublicKey`. |
 | `src/x509.zig` | Minimal DER encoder + PKCS#10 CSR (empty subject, SAN dNSNames — the modern Let's Encrypt shape; ecdsa-with-SHA256/384), bounds-checked CSR parse-back, **RFC 8737 TLS-ALPN-01 self-signed validation cert** (`tlsAlpnCertDer` / `tlsAlpnCert`: dNSName SAN + critical `id-pe-acmeIdentifier` extension), PEM, RFC 5915 `EC PRIVATE KEY` and RFC 5958 PKCS#8 `PRIVATE KEY` read/write (P-256, P-384), the RFC 9773 ARI CertID (`ariCertId`), certificate `notAfter` via `std.crypto.Certificate`. |
+| `src/Manager.zig` | Certificates that renew themselves (`autocert` / CertMagic): managed set, ARI/ratio renewal with back-off, issuer fallback (`Issuer`, `AcmeIssuer`), on-demand issuance, fleet locks, HTTP-01 middleware with redirect, TLS-ALPN-01 lookup, `checkPair` (chain, names, key). |
+| `src/storage.zig` | `Storage` (load / atomic store / delete / lease locks), `DirStorage` (0700/0600, fsync + rename), `MemStorage`. |
 | `src/root.zig` | Re-exports + `needsRenewal(cert_pem, now, within_days)`. |
 
 ## Usage
@@ -85,10 +87,73 @@ if (acme.needsRenewal(cert.chain_pem, now_unix, 30)) {
 ```
 
 Scope notes: HTTP-01, TLS-ALPN-01 and DNS-01 (wildcards with DNS-01 only);
-ES256 (P-256) and ES384 (P-384) keys, account and certificate (no RSA); key
-PEM I/O covers RFC 5915 `EC PRIVATE KEY` and RFC 5958 PKCS#8 `PRIVATE KEY`,
-both curves; external account binding, account update / key rollover /
-deactivation, revocation and ARI renewal timing (below).
+ES256 / ES384 / ES512 and RS256 keys, account and certificate; key PEM I/O
+covers RFC 5915 `EC PRIVATE KEY`, RFC 5958 PKCS#8 `PRIVATE KEY` and PKCS#1;
+external account binding, account update / key rollover / deactivation,
+revocation and ARI renewal timing (below). For a server that should simply
+*have* current certificates, use the `Manager` (next section) instead of
+driving `obtain` yourself.
+
+## Certificates that renew themselves: `Manager`
+
+The `autocert` / CertMagic layer. A `Manager` keeps a set of certificates
+current: it loads them from storage, obtains what is missing, renews on the
+CA's ARI window (RFC 9773) or two thirds into the lifetime, backs off on
+failure (a valid certificate keeps serving), and checks every issued chain
+before it stores or serves it.
+
+```zig
+var dir = try std.Io.Dir.cwd().openDir(io, "/var/lib/myapp/acme", .{}); // create it 0700
+var store = acme.DirStorage.init(io, dir);
+
+var manager = acme.Manager.init(io, gpa, .{
+    .storage = store.storage(),
+    .on_event = .{ .ctx = &my_tls, .call = installIntoMyTlsStore }, // optional
+    .http_redirect = true, // port 80: challenges + redirect to https
+});
+defer manager.deinit();
+
+// One ACME account per CA, kept in the same storage.
+var account_key: acme.jws.AnyKeyPair = undefined;
+try acme.Manager.loadOrCreateAccountKey(&account_key, io, gpa, store.storage(), "letsencrypt", .es256);
+var client = acme.Client.init(io, gpa, &transport, &account_key, .{
+    .directory_url = acme.letsencrypt_production,
+    .contact = &.{"mailto:ops@example.org"},
+    .solvers = manager.challengeSolvers(), // the manager answers HTTP-01 / TLS-ALPN-01
+});
+var le: acme.Manager.AcmeIssuer = .{ .client = &client, .name = "letsencrypt" };
+try manager.addIssuer(le.issuer()); // add more for fallback (ZeroSSL, GTS, ...)
+
+try manager.manage(&.{ "example.org", "www.example.org" });
+
+try port80_router.use(manager.httpMiddleware());
+// In the TLS listener: manager.certificate(gpa, sni) per handshake, or
+// manager.tlsAlpnMaterial(gpa, sni) when the ClientHello offers acme-tls/1.
+
+// The upkeep: call maintain() from your own timer (it returns when it next
+// has work), or let run() loop on a thread of its own.
+const next_due = manager.maintain();
+```
+
+- **Your clock or ours.** `maintain` is one step and returns the epoch second
+  it next has work; `run` is the loop. A server that already has a timer
+  (qap does) calls `maintain` from it.
+- **Storage** is an interface: `DirStorage` on disk, `MemStorage` in memory,
+  or your own (a database, a key-value service). Layout:
+  `certificates/<name>.crt|.key`, `accounts/<issuer>/account.key`,
+  `locks/<name>.lock`.
+- **On-demand** (`Options.on_demand`): the first handshake for a name nobody
+  managed obtains its certificate, if `allow(name)` says yes and the rate
+  limit permits. `allow` is required — without it anyone could make the
+  server order certificates for arbitrary names.
+- **A fleet** sharing one storage: issuance runs under a storage lock, and
+  `distributed_challenges = true` puts challenge data into storage so the node
+  the CA reaches can answer for another node's order.
+- **Issued chains are checked**: verified to `trust_anchors` (default: the
+  chain's own top certificate — set the CA roots when the storage is shared),
+  every name covered, the key matching. A bad chain is a failure, never served.
+- DNS-01 stays the client's (`dns_publisher`, or `acmedns.Dns01Solver` in
+  `solvers`); a wildcard needs it.
 
 ## Account, revocation, renewal timing
 
