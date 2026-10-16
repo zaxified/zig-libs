@@ -89,6 +89,11 @@ pub const ServerLimits = client_mod.ServerLimits;
 /// Automatic-reconnect helpers: backoff schedule and subscription replay.
 pub const reconnect = @import("reconnect.zig");
 
+/// Ready-made broker authorization: `Acl` (`Config.authorizeFn`) and
+/// `Passwords` (`Config.authenticateFn`), Mosquitto acl_file / password_file
+/// semantics.
+pub const acl = @import("acl.zig");
+
 pub const Reconnect = reconnect.Reconnect;
 pub const SubscriptionSet = reconnect.SubscriptionSet;
 
@@ -136,4 +141,5 @@ test {
     _ = @import("topic_oracle_test.zig");
     _ = @import("session_replay.zig");
     _ = @import("reconnect_test.zig");
+    _ = acl;
 }

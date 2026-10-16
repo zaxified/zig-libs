@@ -319,6 +319,14 @@ pub const Connection = struct {
     problem_info: bool = true,
     /// The broker's traffic counters (`$SYS`); set by `accept`.
     stats: ?*Stats = null,
+    /// Clean-session connections only: QoS 1/2 messages that found the
+    /// client's window (`client_receive_maximum`, `max_in_flight`) full, in
+    /// arrival order, until acknowledgements free it (`pumpConnQueue`). An
+    /// unregistered `Session` used purely as a bounded queue (its caps are
+    /// `Config.max_queued_messages` / `max_queued_bytes`, overflow counts in
+    /// `queueDrops`); made at the first overflow, freed with the connection.
+    /// Guarded by `tx_lock`.
+    eq: ?*Session = null,
 
     /// Fan-out liveness (FIX A). Incremented under `Broker.mutex` by a fan-out
     /// reader that is about to write to this connection, decremented lock-free
@@ -1382,6 +1390,9 @@ pub const Broker = struct {
     /// Count of QoS 1/2 messages dropped because a clean-session subscriber's
     /// in-flight pool was full — i.e. it has stopped answering PUBACKs (or
     /// PUBRECs and PUBCOMPs).
+    /// Formerly the clean-session deliveries dropped for a full window; those
+    /// now wait in `Connection.eq` (and overflow into `queue_drops`), so this
+    /// stays 0. Kept for API compatibility.
     qos1_drops: std.atomic.Value(usize) = .init(0),
     /// Count of Wills that could not be delivered. The teardown path has no
     /// caller to return an error to, so the failure is counted instead of
@@ -1586,6 +1597,65 @@ pub const Broker = struct {
         /// null for a 3.1.1 session, which `Config.session_expiry_ms` governs.
         /// Hand it back to `restoreSessionWith`.
         expiry_interval_s: ?u32 = null,
+        /// Only filled by `sessionStatesWith(.{ .messages = true })`: the
+        /// bodies of the messages counted in `queued`, oldest first.
+        queued_messages: []const MessageState = &.{},
+        /// Likewise for `inflight`: sent, not yet acknowledged, in the order
+        /// they were first sent; `packet_id` and (QoS 2) `released` say how
+        /// far each got.
+        inflight_messages: []const MessageState = &.{},
+        /// Likewise: inbound QoS 2 ids the client published that the broker
+        /// has PUBRECed and not yet seen PUBREL for.
+        inbound_qos2: []const u16 = &.{},
+    };
+
+    /// One application message a session holds, in a form a caller can store
+    /// and hand back (`RestoreOptions.queued_messages` /
+    /// `inflight_messages`). Slices belong to the arena they were exported
+    /// into.
+    pub const MessageState = struct {
+        topic: []const u8,
+        payload: []const u8,
+        /// The QoS it is delivered at (already the minimum of the publish and
+        /// the grant).
+        qos: QoS,
+        /// The RETAIN flag it goes out with.
+        retain: bool = false,
+        /// 5.0 forwardable properties as encoded property entries
+        /// (`packet.encodePropertyEntries`, `.publish` context): opaque to
+        /// the caller, which stores and returns the bytes.
+        props: []const u8 = &.{},
+        /// The Subscription Identifiers it goes out with.
+        sub_ids: []const u32 = &.{},
+        /// Message Expiry left, ms, as of the export time; null = none.
+        expires_in_ms: ?u64 = null,
+        /// In-flight only: the packet id it was sent with (non-zero).
+        packet_id: u16 = 0,
+        /// In-flight QoS 2 only: the PUBREC arrived, so a resume resends the
+        /// PUBREL and never the PUBLISH (4.3.3-6).
+        released: bool = false,
+    };
+
+    /// One retained message, as `retainedMessages` exports it.
+    pub const RetainedState = struct {
+        topic: []const u8,
+        payload: []const u8,
+        qos: QoS,
+        /// As `MessageState.props`.
+        props: []const u8 = &.{},
+        /// Message Expiry left, ms, as of the export time; null = none.
+        expires_in_ms: ?u64 = null,
+        /// How long it had been stored, for `Config.retain_expiry_interval_ms`.
+        age_ms: u64 = 0,
+    };
+
+    /// What `sessionStatesWith` adds to `sessionStates`.
+    pub const ExportOptions = struct {
+        /// Also export the message bodies and QoS 2 state.
+        messages: bool = false,
+        /// The caller clock (ms) Message Expiry is measured against; null =
+        /// the latest time the broker has been given.
+        now: ?i64 = null,
     };
 
     /// Every persistent session, copied into `arena` (the caller frees it
@@ -1599,6 +1669,15 @@ pub const Broker = struct {
     /// before that call returns — which is what lets such a server know how
     /// far back it must go to refill the session after a restart.
     pub fn sessionStates(b: *Broker, arena: std.mem.Allocator) error{OutOfMemory}![]SessionState {
+        return b.sessionStatesWith(arena, .{});
+    }
+
+    /// `sessionStates`, optionally with the message bodies: the persistence
+    /// seam for a server that keeps sessions across its own restart *with*
+    /// what was queued for them. The broker stores nothing itself; the caller
+    /// writes these out (a log, a database) and hands them to
+    /// `restoreSessionWith` (`RestoreOptions.queued_messages` etc.).
+    pub fn sessionStatesWith(b: *Broker, arena: std.mem.Allocator, opts: ExportOptions) error{OutOfMemory}![]SessionState {
         b.mutex.lock();
         defer b.mutex.unlock();
         const out = try arena.alloc(SessionState, b.sessions.items.len);
@@ -1627,8 +1706,91 @@ pub const Broker = struct {
                 .subs = subs,
                 .expiry_interval_s = x.expiry_s,
             };
+            if (opts.messages) {
+                const now = opts.now orelse b.now_hint;
+                const live = x.queue.items[x.queue_head..];
+                const q = try arena.alloc(MessageState, live.len);
+                for (live, q) |m, *d| d.* = try exportMessage(arena, m, now);
+                o.queued_messages = q;
+                const f = try arena.alloc(MessageState, x.inflight.items.len);
+                for (x.inflight.items, f) |m, *d| d.* = try exportMessage(arena, m, now);
+                o.inflight_messages = f;
+                o.inbound_qos2 = try arena.dupe(u16, x.inbound_qos2.items);
+            }
         }
         return out;
+    }
+
+    fn exportMessage(arena: std.mem.Allocator, m: Message, now: i64) error{OutOfMemory}!MessageState {
+        return .{
+            .topic = try arena.dupe(u8, m.topicName()),
+            .payload = try arena.dupe(u8, m.payload()),
+            .qos = m.qos,
+            .retain = m.retain,
+            .props = try arena.dupe(u8, m.props()),
+            .sub_ids = try arena.dupe(u32, m.ids()),
+            .expires_in_ms = if (m.expires_at) |at| @intCast(@max(at - now, 0)) else null,
+            .packet_id = m.id,
+            .released = m.released,
+        };
+    }
+
+    /// Every retained message (except the broker's own `$SYS` topics, which
+    /// `publishSys` makes again), copied into `arena`, with the Message Expiry
+    /// each has left at `now` (the caller's clock, ms) -- those already over
+    /// are left out. The persistence seam for the retained store: the caller
+    /// stores the list and gives it to `restoreRetained` after a restart.
+    pub fn retainedMessages(b: *Broker, arena: std.mem.Allocator, now: i64) error{OutOfMemory}![]RetainedState {
+        b.mutex.lock();
+        defer b.mutex.unlock();
+        b.now_hint = @max(b.now_hint, now);
+        var out: std.ArrayListUnmanaged(RetainedState) = .empty;
+        for (b.retained.items) |r| {
+            if (std.mem.startsWith(u8, r.topic, "$SYS/") or b.retainedGone(r, now)) continue;
+            try out.append(arena, .{
+                .topic = try arena.dupe(u8, r.topic),
+                .payload = try arena.dupe(u8, r.payload),
+                .qos = r.qos,
+                .props = try arena.dupe(u8, r.props),
+                .expires_in_ms = if (r.expires_at) |at| @intCast(@max(at - now, 0)) else null,
+                .age_ms = @intCast(@max(now - r.stored_ms, 0)),
+            });
+        }
+        return out.toOwnedSlice(arena);
+    }
+
+    /// Put exported retained messages back (`retainedMessages`), as a server
+    /// does after its own restart. `now` is the caller's clock (ms), the one
+    /// the expiries are counted from again. Held to the store's limits as a
+    /// PUBLISH would be (a refusal is counted in `retainedRefusals`, not an
+    /// error); an item that is not a valid retained message -- a topic with a
+    /// wildcard, an empty payload, a QoS above `Config.maximum_qos`, property
+    /// bytes that do not decode -- fails the whole call before anything is
+    /// stored. No ACL and no tap, as for `publish`; nothing is delivered
+    /// (there is no subscriber yet).
+    pub fn restoreRetained(b: *Broker, items: []const RetainedState, now: i64) RestoreError!void {
+        for (items) |it| {
+            topic.validateName(it.topic) catch return error.InvalidMessage;
+            if (it.payload.len == 0) return error.InvalidMessage;
+            if (@intFromEnum(it.qos) > @intFromEnum(b.config.maximum_qos)) return error.InvalidMessage;
+            _ = packet.decodePropertyEntries(it.props, .publish) catch return error.InvalidMessage;
+        }
+        b.mutex.lock();
+        defer b.mutex.unlock();
+        b.now_hint = @max(b.now_hint, now);
+        for (items) |it| {
+            const props = packet.decodePropertyEntries(it.props, .publish) catch unreachable;
+            b.storeRetained(.{
+                .topic = it.topic,
+                .payload = it.payload,
+                .props = props,
+                .expires_at = if (it.expires_in_ms) |e| now + @as(i64, @intCast(@min(e, std.math.maxInt(i62)))) else null,
+                .retain = true,
+            }, it.qos) catch return error.OutOfMemory;
+            for (b.retained.items) |*r| {
+                if (std.mem.eql(u8, r.topic, it.topic)) r.stored_ms = now - @as(i64, @intCast(@min(it.age_ms, std.math.maxInt(i62))));
+            }
+        }
     }
 
     pub const RestoreError = error{
@@ -1645,6 +1807,12 @@ pub const Broker = struct {
         /// Subscription (3.8.3-4) or a Subscription Identifier above
         /// 268 435 455 — nothing a SUBSCRIBE could have granted.
         InvalidSubscription,
+        /// A message given to `restoreSessionWith` / `restoreRetained` that
+        /// no publish could have produced: a bad topic or property bytes, a
+        /// QoS above `Config.maximum_qos`, an in-flight message without a
+        /// distinct non-zero packet id or QoS 0, more in flight than
+        /// `max_in_flight`.
+        InvalidMessage,
         /// `max_subscriptions_per_conn` or `max_subscriptions_total`.
         TooManySubscriptions,
         OutOfMemory,
@@ -1683,6 +1851,20 @@ pub const Broker = struct {
         /// value as a CONNECT's would be — the config may have changed across
         /// the restart.
         expiry_interval_s: ?u32 = null,
+        /// What `sessionStatesWith(.{ .messages = true })` exported: put back
+        /// in the session, in order, ahead of anything published from now on.
+        /// A resuming client gets the in-flight ones again first (DUP set,
+        /// original ids; a released QoS 2 as PUBREL), then the queued ones.
+        /// The queue caps apply (`Config.max_queued_messages` / `_bytes`);
+        /// one over them is dropped and counted in `queueDrops`.
+        queued_messages: []const MessageState = &.{},
+        inflight_messages: []const MessageState = &.{},
+        inbound_qos2: []const u16 = &.{},
+        /// The caller clock (ms) message expiries count from; null = the
+        /// latest time the broker has been given. ⚠ A fresh broker has been
+        /// given none (0): pass the restart's own `now` when any message
+        /// carries an expiry.
+        now_ms: ?i64 = null,
     };
 
     /// `restoreSession` for a 5.0 session: the same, plus its Session Expiry
@@ -1699,6 +1881,18 @@ pub const Broker = struct {
             if (std.mem.count(u8, inner, "/") + 1 > max_filter_levels) return error.InvalidSubscription;
             if (sub.no_local and inner.len != sub.filter.len) return error.InvalidSubscription;
             if (sub.sub_id > packet.max_remaining_length) return error.InvalidSubscription;
+        }
+        if (opts.inflight_messages.len > max_in_flight or opts.inbound_qos2.len > max_in_flight) return error.InvalidMessage;
+        for (opts.inflight_messages, 0..) |m, i| {
+            if (m.packet_id == 0 or m.qos == .at_most_once) return error.InvalidMessage;
+            for (opts.inflight_messages[0..i]) |o| if (o.packet_id == m.packet_id) return error.InvalidMessage;
+        }
+        for ([_][]const MessageState{ opts.inflight_messages, opts.queued_messages }) |list| {
+            for (list) |m| {
+                topic.validateName(m.topic) catch return error.InvalidMessage;
+                if (@intFromEnum(m.qos) > @intFromEnum(b.config.maximum_qos)) return error.InvalidMessage;
+                _ = packet.decodePropertyEntries(m.props, .publish) catch return error.InvalidMessage;
+            }
         }
         b.mutex.lock();
         defer b.mutex.unlock();
@@ -1724,6 +1918,62 @@ pub const Broker = struct {
                 b.discardSession(x);
                 return error.OutOfMemory;
             };
+        }
+        const now = opts.now_ms orelse b.now_hint;
+        b.now_hint = @max(b.now_hint, now);
+        b.restoreMessages(x, opts, now) catch {
+            b.discardSession(x);
+            return error.OutOfMemory;
+        };
+    }
+
+    /// A `Message` rebuilt from its exported form (validated by the caller).
+    fn buildMessage(b: *Broker, ms: MessageState, now: i64) error{OutOfMemory}!Message {
+        const len = ms.sub_ids.len * 4 + ms.topic.len + ms.payload.len + ms.props.len;
+        const bytes = try b.allocator.alignedAlloc(u8, .@"4", len);
+        var at: usize = 0;
+        for ([_][]const u8{ std.mem.sliceAsBytes(ms.sub_ids), ms.topic, ms.payload, ms.props }) |part| {
+            @memcpy(bytes[at..][0..part.len], part);
+            at += part.len;
+        }
+        return .{
+            .bytes = bytes,
+            .topic_len = ms.topic.len,
+            .payload_len = ms.payload.len,
+            .props_len = ms.props.len,
+            .ids_len = ms.sub_ids.len,
+            .expires_at = if (ms.expires_in_ms) |e| now + @as(i64, @intCast(@min(e, std.math.maxInt(i62)))) else null,
+            .retain = ms.retain,
+            .qos = ms.qos,
+            .id = ms.packet_id,
+            .released = ms.released and ms.qos == .exactly_once,
+        };
+    }
+
+    /// Fill a fresh session with exported messages. Caller holds `mutex`.
+    fn restoreMessages(b: *Broker, x: *Session, opts: RestoreOptions, now: i64) error{OutOfMemory}!void {
+        x.lock.lock();
+        defer x.lock.unlock();
+        for (opts.inflight_messages) |ms| {
+            var m = try b.buildMessage(ms, now);
+            m.resend = true;
+            x.inflight.appendAssumeCapacity(m); // <= max_in_flight, checked
+        }
+        for (opts.inbound_qos2) |id| x.inbound_qos2.appendAssumeCapacity(id);
+        for (opts.queued_messages) |ms| {
+            const m = try b.buildMessage(ms, now);
+            if (x.queuedLen() >= b.config.max_queued_messages or
+                x.queued_bytes + m.bytes.len > b.config.max_queued_bytes)
+            {
+                b.allocator.free(m.bytes);
+                b.countDrop(x);
+                continue;
+            }
+            x.queue.append(b.allocator, m) catch {
+                b.allocator.free(m.bytes);
+                return error.OutOfMemory;
+            };
+            x.queued_bytes += m.bytes.len;
         }
     }
 
@@ -1911,6 +2161,8 @@ pub const Broker = struct {
     }
 
     fn freeConnection(b: *Broker, conn: *Connection) void {
+        if (conn.eq) |q| b.freeSession(q);
+        conn.eq = null;
         b.dropWill(conn);
         b.freeAliases(conn);
         if (conn.session) |x| b.releaseSession(x);
@@ -3628,7 +3880,10 @@ pub const Broker = struct {
             if (conn.session) |x| {
                 ackInflight(b.allocator, x, conn, id, .pubrec);
                 try b.pumpLocked(conn, x, now);
-            } else if (conn.pendingPhase(id) == .pubrec) conn.removePending(id);
+            } else if (conn.pendingPhase(id) == .pubrec) {
+                conn.removePending(id);
+                try b.pumpConnQueue(conn, now);
+            }
             return;
         }
         var known = false;
@@ -3665,7 +3920,10 @@ pub const Broker = struct {
             // message — nothing else would.
             ackInflight(b.allocator, x, conn, id, phase);
             try b.pumpLocked(conn, x, now);
-        } else if (conn.pendingPhase(id) == phase) conn.removePending(id);
+        } else if (conn.pendingPhase(id) == phase) {
+            conn.removePending(id);
+            try b.pumpConnQueue(conn, now);
+        }
     }
 
     fn fanout(b: *Broker, msg: Outgoing, qos: QoS, now: i64) Error!usize {
@@ -3909,23 +4167,81 @@ pub const Broker = struct {
         var p = deliveryPacket(sub_conn, msg, qos, retain, false, 1, ids, expiry);
         if (!b.fits(sub_conn, p)) return;
         if (qos != .at_most_once) {
-            // Pool full: this subscriber is not acknowledging, so drop for it
-            // alone rather than stalling the fan-out. Counted, because a
-            // silent drop with no signal is indistinguishable from a delivery
-            // the subscriber simply never acted on.
-            const id = if (sub_conn.pending_len >= sub_conn.client_receive_maximum)
-                null
-            else
-                sub_conn.allocPacketId(if (qos == .exactly_once) .pubrec else .puback);
-            p.packet_id = id orelse {
-                _ = b.qos1_drops.fetchAdd(1, .monotonic);
-                _ = b.stats.publish_dropped.fetchAdd(1, .monotonic);
+            // Window full, or older messages already waiting (order): wait in
+            // the connection's queue for the client's acknowledgements, as
+            // mosquitto does, bounded by `max_queued_messages` / `_bytes`.
+            const blocked = (if (sub_conn.eq) |q| q.queuedLen() > 0 else false) or
+                sub_conn.pending_len >= sub_conn.client_receive_maximum or
+                sub_conn.pending_len >= sub_conn.pending.len;
+            if (blocked) {
+                b.enqueueConn(sub_conn, msg, qos, retain, ids);
+                return;
+            }
+            p.packet_id = sub_conn.allocPacketId(if (qos == .exactly_once) .pubrec else .puback) orelse {
+                b.enqueueConn(sub_conn, msg, qos, retain, ids);
                 return;
             };
         }
         const bytes = try packet.encodePacket(sub_conn.tx_buf, sub_conn.version, .{ .publish = p });
         try sub_conn.write(bytes);
         _ = b.stats.publish_sent.fetchAdd(1, .monotonic);
+    }
+
+    /// Queue one QoS 1/2 delivery on a clean-session connection (see
+    /// `Connection.eq`). Never fails: what cannot be kept is counted in
+    /// `queueDrops`. Caller holds `conn.tx_lock`.
+    fn enqueueConn(b: *Broker, conn: *Connection, msg: Outgoing, qos: QoS, retain: bool, ids: []const u32) void {
+        const q = conn.eq orelse blk: {
+            const x = b.allocator.create(Session) catch {
+                _ = b.queue_drops.fetchAdd(1, .monotonic);
+                return;
+            };
+            x.* = .{ .registered = false };
+            conn.eq = x;
+            break :blk x;
+        };
+        const len = packet.propertyEntriesLen(msg.props, .publish) catch 0;
+        const props = b.allocator.alloc(u8, len) catch {
+            q.lock.lock();
+            defer q.lock.unlock();
+            b.countDrop(q);
+            return;
+        };
+        defer b.allocator.free(props);
+        if (len > 0) _ = packet.encodePropertyEntries(props, msg.props, .publish) catch unreachable;
+        var m = msg;
+        m.retain = retain;
+        q.lock.lock();
+        defer q.lock.unlock();
+        b.enqueueLocked(q, m, qos, ids, props);
+    }
+
+    /// Send queued messages to a clean-session connection while its window
+    /// has room, oldest first. Caller holds `conn.tx_lock`.
+    fn pumpConnQueue(b: *Broker, conn: *Connection, now: i64) Error!void {
+        const q = conn.eq orelse return;
+        while (conn.pending_len < conn.client_receive_maximum and conn.pending_len < conn.pending.len) {
+            const m = q.popQueue() orelse return;
+            defer b.allocator.free(m.bytes);
+            // Waited past its Message Expiry: deleted, not sent (3.3.2-5).
+            const expiry = remainingExpiry(m.expires_at, now) orelse {
+                _ = b.messages_expired.fetchAdd(1, .monotonic);
+                continue;
+            };
+            var p = deliveryPacket(conn, m.outgoing(), m.qos, m.retain, false, 1, m.ids(), expiry);
+            if (!b.fits(conn, p)) continue;
+            p.packet_id = conn.allocPacketId(if (m.qos == .exactly_once) .pubrec else .puback) orelse {
+                b.countDrop(q);
+                continue;
+            };
+            const bytes = packet.encodePacket(conn.tx_buf, conn.version, .{ .publish = p }) catch {
+                conn.removePending(p.packet_id);
+                b.countDrop(q);
+                continue;
+            };
+            try conn.write(bytes);
+            _ = b.stats.publish_sent.fetchAdd(1, .monotonic);
+        }
     }
 
     /// Whether `p` fits what `conn` takes and its `tx_buf`; counts a drop
@@ -4188,6 +4504,13 @@ pub const TcpServer = struct {
     broker: *Broker,
     listener: ?std.Io.net.Server = null,
     group: std.Io.Group = .init,
+    /// Set TCP_NODELAY on every accepted connection (Mosquitto's
+    /// `set_tcp_nodelay`, default false there too). Without it the kernel's
+    /// Nagle holds each small ack behind the previous one's ACK, and a peer
+    /// with delayed ACKs waits up to 40 ms for it: measured on a QoS 1
+    /// stream, ~0.5 ms a message on this broker and on Mosquitto alike.
+    /// Set it for latency; leave it for fewer, fuller segments.
+    tcp_nodelay: bool = false,
 
     /// Standard MQTT port (1883; 8883 is MQTT over TLS).
     pub const default_port = 1883;
@@ -4247,11 +4570,16 @@ pub const TcpServer = struct {
             const now = nowMs(s.io);
             _ = s.broker.expireSessions(now);
             _ = s.broker.publishDueWills(now);
+            _ = s.broker.publishSys(now); // a no-op while `Config.sys_interval_ms` is 0
         }
     }
 
     fn connMain(s: *TcpServer, stream: std.Io.net.Stream) void {
         defer stream.close(s.io);
+        if (s.tcp_nodelay) {
+            const one: c_int = 1;
+            std.posix.setsockopt(stream.socket.handle, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, std.mem.asBytes(&one)) catch {};
+        }
         var sock = SocketTransport{ .io = s.io, .stream = stream };
         const conn = s.broker.accept(sock.transport()) catch return;
         // `remove` drains in-flight fan-out references before returning, so
@@ -8136,10 +8464,12 @@ test "v5 the client's limits: Receive Maximum holds back, Maximum Packet Size dr
     _ = try send5(&b, c.conn, .{ .subscribe = .{ .packet_id = 1, .filters = &.{.{ .filter = "t", .qos = .at_least_once }} } }, 0);
     _ = (try next5(&tc)).?;
     try b.publish("t", "1", .at_least_once, false);
-    try b.publish("t", "2", .at_least_once, false); // a second unacknowledged: not sent (clean session drops it)
-    try testing.expect((try next5(&tc)).? == .publish);
+    try b.publish("t", "2", .at_least_once, false); // a second unacknowledged: waits for the first's PUBACK
+    const held = (try next5(&tc)).?.publish;
     try testing.expectEqual(@as(?packet.Packet, null), try next5(&tc));
-    try testing.expectEqual(@as(u64, 1), b.qos1Drops());
+    try testing.expectEqual(@as(u64, 0), b.qos1Drops());
+    _ = try send5(&b, c.conn, .{ .puback = .{ .packet_id = held.packet_id } }, 1);
+    try testing.expectEqualStrings("2", (try next5(&tc)).?.publish.payload);
     try b.publish("t", "x" ** 50, .at_most_once, false); // larger than the client takes
     try testing.expectEqual(@as(?packet.Packet, null), try next5(&tc));
     try testing.expectEqual(@as(u64, 1), b.oversizeDrops());
@@ -8730,4 +9060,238 @@ test "$SYS: dropped counts a persistent session's queue overflow; publishSys ign
     try feedSubscribe(&b, w, 1, &.{.{ .filter = "$SYS/broker/publish/messages/dropped" }});
     _ = (try tw.next()).?;
     try testing.expectEqualStrings("1", (try tw.next()).?.publish.payload);
+}
+
+// ── wave 2: clean-session queue, persistence seam ───────────────────────────
+
+fn fmtNum(buf: []u8, i: usize) []const u8 {
+    return std.fmt.bufPrint(buf, "{d}", .{i}) catch unreachable;
+}
+
+test "clean session: a QoS 1 subscriber slower than the publisher still gets every message, in order" {
+    var b = Broker.init(testing.allocator, .{});
+    defer b.deinit();
+    var ts = TestTransport{};
+    const s = try connectClient(&b, &ts, "S", 60, 0);
+    try feedSubscribe(&b, s, 1, &.{.{ .filter = "t", .qos = .at_least_once }});
+    _ = (try ts.next()).?;
+    const n = 500;
+    var nbuf: [8]u8 = undefined;
+    for (0..n) |i| try b.publish("t", fmtNum(&nbuf, i), .at_least_once, false);
+    try testing.expectEqual(@as(usize, max_in_flight), s.pending_len); // the window, full
+
+    var got: usize = 0;
+    var ids: [max_in_flight]u16 = undefined;
+    while (got < n) {
+        var k: usize = 0;
+        while (try ts.next()) |p| {
+            try testing.expectEqualStrings(fmtNum(&nbuf, got), p.publish.payload);
+            ids[k] = p.publish.packet_id;
+            k += 1;
+            got += 1;
+        }
+        try testing.expect(k > 0);
+        ts.len = 0;
+        ts.read_off = 0;
+        for (ids[0..k]) |id| try feedPuback(&b, s, id);
+    }
+    try testing.expectEqual(@as(usize, n), got);
+    try testing.expectEqual(@as(?packet.Packet, null), try ts.next());
+    try testing.expectEqual(@as(usize, 0), s.pending_len);
+    try testing.expectEqual(@as(u64, 0), b.qos1Drops());
+    try testing.expectEqual(@as(u64, 0), b.queueDrops());
+}
+
+test "clean session: a QoS 2 subscriber slower than the publisher still gets every message, in order" {
+    var b = Broker.init(testing.allocator, .{});
+    defer b.deinit();
+    var ts = TestTransport{};
+    const s = try connectClient(&b, &ts, "S", 60, 0);
+    try feedSubscribe(&b, s, 1, &.{.{ .filter = "t", .qos = .exactly_once }});
+    _ = (try ts.next()).?;
+    const n = 300;
+    var nbuf: [8]u8 = undefined;
+    for (0..n) |i| try b.publish("t", fmtNum(&nbuf, i), .exactly_once, false);
+
+    var got: usize = 0;
+    while (true) {
+        var recs: [max_in_flight]u16 = undefined;
+        var comps: [max_in_flight]u16 = undefined;
+        var nrec: usize = 0;
+        var ncomp: usize = 0;
+        while (try ts.next()) |p| switch (p) {
+            .publish => |m| {
+                try testing.expectEqualStrings(fmtNum(&nbuf, got), m.payload);
+                recs[nrec] = m.packet_id;
+                nrec += 1;
+                got += 1;
+            },
+            .pubrel => |r| {
+                comps[ncomp] = r.packet_id;
+                ncomp += 1;
+            },
+            else => {},
+        };
+        ts.len = 0;
+        ts.read_off = 0;
+        if (nrec == 0 and ncomp == 0) break;
+        for (recs[0..nrec]) |id| try feedAck(&b, s, .pubrec, id);
+        for (comps[0..ncomp]) |id| try feedAck(&b, s, .pubcomp, id);
+    }
+    try testing.expectEqual(@as(usize, n), got);
+    try testing.expectEqual(@as(usize, 0), s.pending_len);
+    try testing.expectEqual(@as(u64, 0), b.queueDrops());
+}
+
+test "clean session: the queue is capped by max_queued_messages, counted in queueDrops, and goes with the connection" {
+    var b = Broker.init(testing.allocator, .{ .max_queued_messages = 10 });
+    defer b.deinit();
+    var ts = TestTransport{};
+    const s = try connectClient(&b, &ts, "S", 60, 0);
+    try feedSubscribe(&b, s, 1, &.{.{ .filter = "t", .qos = .at_least_once }});
+    _ = (try ts.next()).?;
+    var nbuf: [8]u8 = undefined;
+    for (0..max_in_flight + 15) |i| try b.publish("t", fmtNum(&nbuf, i), .at_least_once, false);
+    try testing.expectEqual(@as(u64, 5), b.queueDrops()); // 64 in flight + 10 queued + 5 over
+    var first: u16 = 0;
+    var sent: usize = 0;
+    while (try ts.next()) |p| : (sent += 1) {
+        if (sent == 0) first = p.publish.packet_id;
+    }
+    try testing.expectEqual(@as(usize, max_in_flight), sent);
+    // One PUBACK, one more message (the 65th, not a later one).
+    try feedPuback(&b, s, first);
+    try testing.expectEqualStrings("64", (try ts.next()).?.publish.payload);
+    // The rest of the queue is freed with the connection (the allocator checks).
+    b.remove(s);
+}
+
+test "clean session: 5.0 Receive Maximum is still respected while messages wait" {
+    var b = Broker.init(testing.allocator, .{});
+    defer b.deinit();
+    var tc = TestTransport{};
+    const c = try connect5(&b, &tc, .{ .client_id = "C", .properties = .{ .receive_maximum = 3 } }, 0);
+    _ = try send5(&b, c.conn, .{ .subscribe = .{ .packet_id = 1, .filters = &.{.{ .filter = "t", .qos = .at_least_once }} } }, 0);
+    _ = (try next5(&tc)).?;
+    var nbuf: [8]u8 = undefined;
+    for (0..10) |i| try b.publish("t", fmtNum(&nbuf, i), .at_least_once, false);
+    var got: usize = 0;
+    while (got < 10) {
+        var id: u16 = 0;
+        var k: usize = 0;
+        while (try next5(&tc)) |p| {
+            try testing.expectEqualStrings(fmtNum(&nbuf, got), p.publish.payload);
+            if (k == 0) id = p.publish.packet_id;
+            k += 1;
+            got += 1;
+        }
+        try testing.expect(k <= 3);
+        try testing.expect(c.conn.pending_len <= 3);
+        tc.len = 0;
+        tc.read_off = 0;
+        if (got < 10) _ = try send5(&b, c.conn, .{ .puback = .{ .packet_id = id } }, 1);
+        try testing.expect(c.conn.pending_len <= 3);
+    }
+    try testing.expectEqual(@as(u64, 0), b.queueDrops());
+}
+
+test "persistence seam: retained messages and a session's queued and in-flight bodies survive an export -> fresh Broker -> restore" {
+    var b1 = Broker.init(testing.allocator, .{});
+    defer b1.deinit();
+    try b1.publishWith("r/1", "one", .{ .retain = true, .now = 0, .properties = .{ .content_type = "text/plain" }, .message_expiry_s = 100 });
+    try b1.publishWith("r/2", "two", .{ .retain = true, .now = 0, .qos = .at_least_once });
+
+    var t1 = TestTransport{};
+    const s = try connect5(&b1, &t1, .{ .client_id = "S", .clean_session = false, .properties = .{ .session_expiry_interval = 600 } }, 0);
+    _ = try send5(&b1, s.conn, .{ .subscribe = .{
+        .packet_id = 1,
+        .filters = &.{.{ .filter = "q/#", .qos = .exactly_once }},
+        .properties = .{ .subscription_ids = .{ .items = &.{7} } },
+    } }, 0);
+    _ = (try next5(&t1)).?; // SUBACK
+    // m1: QoS 2, PUBREC'd (a PUBREL is owed); m2: QoS 1, unacknowledged.
+    try b1.publish("q/a", "m1", .exactly_once, false);
+    const p1 = (try next5(&t1)).?.publish;
+    _ = try send5(&b1, s.conn, .{ .pubrec = .{ .packet_id = p1.packet_id } }, 1);
+    _ = (try next5(&t1)).?; // PUBREL
+    try b1.publish("q/b", "m2", .at_least_once, false);
+    const p2 = (try next5(&t1)).?.publish;
+    b1.remove(s.conn);
+    // m3, m4 wait in the queue.
+    try b1.publishWith("q/c", "m3", .{ .qos = .at_least_once, .properties = .{ .content_type = "application/json" }, .message_expiry_s = 100, .now = 1000 });
+    try b1.publish("q/d", "m4", .exactly_once, false);
+
+    // Export (what the caller would write to disk) ...
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const rs = try b1.retainedMessages(arena, 1000);
+    try testing.expectEqual(@as(usize, 2), rs.len);
+    const st = (try b1.sessionStatesWith(arena, .{ .messages = true, .now = 1000 }))[0];
+    try testing.expectEqual(@as(usize, 2), st.queued_messages.len);
+    try testing.expectEqual(@as(usize, 2), st.inflight_messages.len);
+    try testing.expect(st.inflight_messages[0].released);
+    // ... and the cheap form leaves the bodies out, as before.
+    try testing.expectEqual(@as(usize, 0), (try b1.sessionStates(arena))[0].queued_messages.len);
+
+    // ... then a restart.
+    var b2 = Broker.init(testing.allocator, .{});
+    defer b2.deinit();
+    try b2.restoreRetained(rs, 1000);
+    try b2.restoreSessionWith(st.client_id, st.username, st.subs, st.offline_since_ms.?, .{
+        .expiry_interval_s = st.expiry_interval_s,
+        .queued_messages = st.queued_messages,
+        .inflight_messages = st.inflight_messages,
+        .inbound_qos2 = st.inbound_qos2,
+        .now_ms = 1000,
+    });
+    try testing.expectEqual(@as(?usize, 2), b2.sessionQueued("S"));
+
+    // The client comes back: the unfinished exchanges first (PUBREL for m1,
+    // m2 again with DUP and its id), then the queue, as before.
+    var t2 = TestTransport{};
+    const back = try connect5(&b2, &t2, .{ .client_id = "S", .clean_session = false, .properties = .{ .session_expiry_interval = 600 } }, 2000);
+    try testing.expect(back.connack.session_present);
+    try testing.expectEqual(p1.packet_id, (try next5(&t2)).?.pubrel.packet_id);
+    const r2 = (try next5(&t2)).?.publish;
+    try testing.expectEqualStrings("m2", r2.payload);
+    try testing.expect(r2.dup);
+    try testing.expectEqual(p2.packet_id, r2.packet_id);
+    try testing.expectEqual(@as(?u32, 7), r2.properties.subscription_ids.first());
+    const r3 = (try next5(&t2)).?.publish;
+    try testing.expectEqualStrings("m3", r3.payload);
+    try testing.expectEqualStrings("application/json", r3.properties.content_type.?);
+    try testing.expectEqual(@as(?u32, 99), r3.properties.message_expiry_interval);
+    try testing.expectEqual(packet.QoS.at_least_once, r3.qos);
+    const r4 = (try next5(&t2)).?.publish;
+    try testing.expectEqualStrings("m4", r4.payload);
+    try testing.expectEqual(packet.QoS.exactly_once, r4.qos);
+    try testing.expectEqual(@as(?packet.Packet, null), try next5(&t2));
+
+    // The retained ones, with their properties and what is left of their expiry.
+    var t3 = TestTransport{};
+    const o = try connect5(&b2, &t3, .{ .client_id = "O" }, 2000);
+    _ = try send5(&b2, o.conn, .{ .subscribe = .{ .packet_id = 1, .filters = &.{.{ .filter = "r/#" }} } }, 2000);
+    _ = (try next5(&t3)).?;
+    const a = (try next5(&t3)).?.publish;
+    try testing.expectEqualStrings("one", a.payload);
+    try testing.expectEqualStrings("text/plain", a.properties.content_type.?);
+    try testing.expectEqual(@as(?u32, 98), a.properties.message_expiry_interval);
+    try testing.expect(a.retain);
+    try testing.expectEqualStrings("two", (try next5(&t3)).?.publish.payload);
+}
+
+test "persistence seam: restore refuses what no publish could have produced, and stores nothing" {
+    var b = Broker.init(testing.allocator, .{});
+    defer b.deinit();
+    try testing.expectError(error.InvalidMessage, b.restoreRetained(&.{.{ .topic = "a/#", .payload = "x", .qos = .at_most_once }}, 0));
+    try testing.expectError(error.InvalidMessage, b.restoreRetained(&.{.{ .topic = "a", .payload = "", .qos = .at_most_once }}, 0));
+    try testing.expectError(error.InvalidMessage, b.restoreRetained(&.{.{ .topic = "a", .payload = "x", .qos = .at_most_once, .props = "\xff" }}, 0));
+    try testing.expectEqual(@as(usize, 0), b.retained.items.len);
+    const no_id: []const Broker.MessageState = &.{.{ .topic = "a", .payload = "x", .qos = .at_least_once }};
+    try testing.expectError(error.InvalidMessage, b.restoreSessionWith("S", null, &.{}, 0, .{ .inflight_messages = no_id }));
+    try testing.expectEqual(@as(usize, 0), b.sessionCount());
+    // The old API is untouched.
+    try b.restoreSession("S", null, &.{}, 0);
+    try testing.expectEqual(@as(usize, 1), b.sessionCount());
 }
