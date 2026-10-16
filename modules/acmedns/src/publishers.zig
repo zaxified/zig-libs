@@ -174,7 +174,7 @@ pub const AcmeDns = struct {
         }
         const body = try std.json.Stringify.valueAlloc(p.gpa, .{ .subdomain = acct.subdomain, .txt = rec.value }, .{});
         defer p.gpa.free(body);
-        const url = try std.fmt.allocPrint(p.gpa, "{s}/update", .{std.mem.trimEnd(u8, p.options.server_url, "/")});
+        const url = try joinPath(p.gpa, p.options.server_url, "update");
         defer p.gpa.free(url);
         p.last_status = post(&p.client, p.gpa, url, body, &.{
             .{ .name = "X-Api-User", .value = acct.username },
@@ -209,7 +209,7 @@ pub const AcmeDns = struct {
     ) !std.json.Parsed(Registration) {
         var client: http.Client = .init(io, gpa, http_options);
         defer client.deinit();
-        const url = try std.fmt.allocPrint(gpa, "{s}/register", .{std.mem.trimEnd(u8, server_url, "/")});
+        const url = try joinPath(gpa, server_url, "register");
         defer gpa.free(url);
         const req_body = if (allow_from.len == 0) try gpa.dupe(u8, "{}") else try std.json.Stringify.valueAlloc(gpa, .{ .allowfrom = allow_from }, .{});
         defer gpa.free(req_body);
@@ -282,6 +282,10 @@ pub const HttpReq = struct {
         p.note = "";
         const status = p.call("present", rec) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
+            error.InvalidCredentials => {
+                p.note = "basic-auth credentials too long, or the username contains ':' (RFC 7617)";
+                return error.PublishFailed;
+            },
             else => {
                 p.note = "the endpoint could not be reached";
                 return error.PublishFailed;
@@ -308,10 +312,12 @@ pub const HttpReq = struct {
             .raw => try std.json.Stringify.valueAlloc(p.gpa, .{ .domain = rec.domain, .token = rec.token, .keyAuth = rec.key_authorization }, .{}),
         };
         defer p.gpa.free(body);
-        const url = try std.fmt.allocPrint(p.gpa, "{s}/{s}", .{ std.mem.trimEnd(u8, p.options.endpoint, "/"), action });
+        const url = try joinPath(p.gpa, p.options.endpoint, action);
         defer p.gpa.free(url);
 
         var auth_buf: [512]u8 = undefined;
+        // The header is the credentials, base64'd: as secret as the password.
+        defer std.crypto.secureZero(u8, &auth_buf);
         var headers_buf: [1]http.Header = undefined;
         var headers: []const http.Header = &.{};
         if (p.options.username.len != 0) {
@@ -323,16 +329,26 @@ pub const HttpReq = struct {
     }
 };
 
-/// `Basic base64(user ":" password)` (RFC 7617).
-fn basicAuth(buf: *[512]u8, user: []const u8, password: []const u8) error{NoSpaceLeft}![]const u8 {
+/// `Basic base64(user ":" password)` (RFC 7617). A user-id containing ':'
+/// cannot be represented (RFC 7617 §2) and is refused, as are credentials
+/// over 379 bytes.
+fn basicAuth(buf: *[512]u8, user: []const u8, password: []const u8) error{InvalidCredentials}![]const u8 {
+    if (std.mem.indexOfScalar(u8, user, ':') != null) return error.InvalidCredentials;
     var plain: [380]u8 = undefined;
-    const joined = std.fmt.bufPrint(&plain, "{s}:{s}", .{ user, password }) catch return error.NoSpaceLeft;
     defer std.crypto.secureZero(u8, &plain);
+    const joined = std.fmt.bufPrint(&plain, "{s}:{s}", .{ user, password }) catch return error.InvalidCredentials;
     const enc = std.base64.standard.Encoder;
     const prefix = "Basic ";
-    if (prefix.len + enc.calcSize(joined.len) > buf.len) return error.NoSpaceLeft;
+    if (prefix.len + enc.calcSize(joined.len) > buf.len) return error.InvalidCredentials;
     @memcpy(buf[0..prefix.len], prefix);
     return buf[0 .. prefix.len + enc.encode(buf[prefix.len..], joined).len];
+}
+
+/// `endpoint` + "/" + `segment`, the segment inserted before any query or
+/// fragment (lego joins with `URL.JoinPath`, which keeps them).
+fn joinPath(gpa: std.mem.Allocator, endpoint: []const u8, segment: []const u8) error{OutOfMemory}![]u8 {
+    const cut = std.mem.indexOfAny(u8, endpoint, "?#") orelse endpoint.len;
+    return std.fmt.allocPrint(gpa, "{s}/{s}{s}", .{ std.mem.trimEnd(u8, endpoint[0..cut], "/"), segment, endpoint[cut..] });
 }
 
 /// POST a JSON body; return the status (the body is drained and dropped).
@@ -451,5 +467,22 @@ test "basicAuth: RFC 7617 §2 example" {
     var buf: [512]u8 = undefined;
     try testing.expectEqualStrings("Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==", try basicAuth(&buf, "Aladdin", "open sesame"));
     const long: [400]u8 = @splat('x');
-    try testing.expectError(error.NoSpaceLeft, basicAuth(&buf, &long, "p"));
+    try testing.expectError(error.InvalidCredentials, basicAuth(&buf, &long, "p"));
+    try testing.expectError(error.InvalidCredentials, basicAuth(&buf, "us:er", "p"));
+}
+
+test "joinPath: the segment goes before a query or fragment (lego URL.JoinPath)" {
+    const gpa = testing.allocator;
+    const cases = [_][3][]const u8{
+        .{ "https://h/api", "present", "https://h/api/present" },
+        .{ "https://h/api/", "present", "https://h/api/present" },
+        .{ "https://h/api?token=x", "present", "https://h/api/present?token=x" },
+        .{ "https://h/api/?token=x#f", "cleanup", "https://h/api/cleanup?token=x#f" },
+        .{ "https://h", "update", "https://h/update" },
+    };
+    for (cases) |c| {
+        const got = try joinPath(gpa, c[0], c[1]);
+        defer gpa.free(got);
+        try testing.expectEqualStrings(c[2], got);
+    }
 }

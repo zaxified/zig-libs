@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-16** — Docs: Backlog entry — `lookupIp` reads a SERVFAIL reply as "no addresses". No code change.
+
 - **2026-10-16** — New: `tsig.decodeSecret` — a TSIG secret from the base64 BIND, `nsupdate -y` and
   `tsig-keygen` carry, decoded constant-time (`b64ct.zig`, a copy of acme's). The test server in
   `tools/update_server.py` now chases CNAME chains inside its zones (acmedns's Pebble interop needs it).

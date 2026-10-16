@@ -89,5 +89,6 @@ test {
     _ = Dns01Solver;
     _ = publishers;
     _ = @import("solver_test.zig");
+    _ = @import("zone_test.zig");
     _ = @import("fuzz_test.zig");
 }

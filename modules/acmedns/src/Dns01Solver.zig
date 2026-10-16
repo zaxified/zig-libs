@@ -152,13 +152,19 @@ pub fn present(s: *Dns01Solver, domain: []const u8, token: []const u8, key_autho
     var name_buf: [acme.Client.dns01_max_name_len]u8 = undefined;
     const name = s.options.override_name orelse acme.Client.dns01RecordName(&name_buf, domain);
     const fqdn = if (s.options.follow_cname) zone.followCname(&r, name, &p.fqdn_buf) catch |err| {
-        s.note = "following the _acme-challenge CNAME chain failed";
+        s.note = if (err == error.ResolverFailed) "the resolver failed (SERVFAIL/REFUSED) following the CNAME chain" else "following the _acme-challenge CNAME chain failed";
         return err;
     } else try copyInto(&p.fqdn_buf, name);
     const zone_name = if (s.options.zone) |z| try copyInto(&p.zone_buf, z) else zone.findZone(&r, fqdn, &p.zone_buf) catch |err| {
-        s.note = "no zone (SOA) found for the challenge name";
+        s.note = if (err == error.ResolverFailed) "the resolver failed (SERVFAIL/REFUSED) on the SOA walk" else "no zone (SOA) found for the challenge name";
         return err;
     };
+    if (!inZone(fqdn, zone_name)) {
+        // An override that does not contain the name (a CNAME target in
+        // another zone, a typo): the server would refuse with NOTZONE.
+        s.note = "the challenge name is not inside Options.zone";
+        return error.ZoneNotFound;
+    }
 
     p.record = .{
         .domain = p.domain,
@@ -173,6 +179,11 @@ pub fn present(s: *Dns01Solver, domain: []const u8, token: []const u8, key_autho
     try s.pending.ensureUnusedCapacity(s.gpa, 1);
     s.options.publisher.present(s.options.publisher.ctx, &p.record) catch |err| {
         s.note = "the publisher failed";
+        // The update may have been applied before the failure showed (a lost
+        // reply, a read error after the endpoint acted): remove it, best
+        // effort, as lego cleans up after a failed Present. Publishers treat
+        // removing an absent record as a no-op.
+        s.options.publisher.cleanup(s.options.publisher.ctx, &p.record);
         return err;
     };
     s.pending.appendAssumeCapacity(p);
@@ -235,31 +246,28 @@ fn waitPropagation(s: *Dns01Solver, r: *dns.Resolver, fqdn: []const u8, zone_nam
         for (servers.items) |ips| s.gpa.free(ips);
         servers.deinit(s.gpa);
     }
+    var names: [][]u8 = &.{};
+    defer zone.freeNames(s.gpa, names);
     if (s.options.authoritative.len != 0) {
         for (s.options.authoritative) |ip| try servers.append(s.gpa, try s.gpa.dupe(netaddr.Ip, &.{ip}));
     } else {
-        const names = zone.nameservers(r, s.gpa, zone_name) catch |err| {
+        names = zone.nameservers(r, s.gpa, zone_name) catch |err| {
             s.note = "looking up the zone's NS records failed";
             return err;
         };
-        defer zone.freeNames(s.gpa, names);
-        for (names) |ns| {
-            const ips = r.lookupIp(ns) catch continue;
-            if (ips.len == 0) {
-                s.gpa.free(ips);
-                continue;
-            }
-            try servers.append(s.gpa, ips);
-        }
-        if (servers.items.len == 0) {
-            s.note = "the zone has no reachable NS records";
+        if (names.len == 0) {
+            s.note = "the zone has no NS records";
             return error.NoNameservers;
         }
     }
 
     const start = std.Io.Clock.awake.now(s.io);
     while (true) {
-        if (try s.allServersHave(servers.items, fqdn, value) and try s.resolversHave(fqdn, value)) return;
+        const auth_ok = if (names.len != 0)
+            try s.namedServersHave(r, names, fqdn, value)
+        else
+            try s.allServersHave(servers.items, fqdn, value);
+        if (auth_ok and try s.resolversHave(fqdn, value)) return;
         const elapsed: u64 = @intCast(@max(0, start.durationTo(std.Io.Clock.awake.now(s.io)).toMilliseconds()));
         if (elapsed >= s.options.propagation_timeout_ms) {
             s.note = "the TXT record did not reach every authoritative server in time";
@@ -281,6 +289,29 @@ fn allServersHave(s: *Dns01Solver, servers: []const []netaddr.Ip, fqdn: []const 
         if (!has and s.options.require_all_authoritative) return false;
     }
     return any;
+}
+
+/// `allServersHave` over the zone's NS names, their addresses resolved on
+/// every pass: a name whose lookup fails counts as "not yet" (lego: the
+/// pre-check fails and is retried), never as absent — dropping it would let
+/// the check pass without the server the CA may ask. A name with no address
+/// at all (NODATA) cannot be asked by the CA either and is left out.
+fn namedServersHave(s: *Dns01Solver, r: *dns.Resolver, names: []const []u8, fqdn: []const u8, value: []const u8) Error!bool {
+    var any = false;
+    var asked = false;
+    for (names) |ns| {
+        const ips = (try zone.nameserverIps(r, s.gpa, ns)) orelse {
+            if (s.options.require_all_authoritative) return false;
+            continue;
+        };
+        defer s.gpa.free(ips);
+        if (ips.len == 0) continue;
+        asked = true;
+        const has = try s.anyAddressHas(ips, fqdn, value, false);
+        if (has) any = true;
+        if (!has and s.options.require_all_authoritative) return false;
+    }
+    return asked and any;
 }
 
 /// With `check_resolvers`: every configured recursive resolver (or the
@@ -316,6 +347,15 @@ fn anyAddressHas(s: *Dns01Solver, ips: []const netaddr.Ip, fqdn: []const u8, val
 fn sleepMs(io: std.Io, ms: u64) error{Canceled}!void {
     const d: std.Io.Clock.Duration = .{ .raw = .fromMilliseconds(@intCast(ms)), .clock = .awake };
     d.sleep(io) catch return error.Canceled;
+}
+
+/// `name` is `zone_name` or under it (label boundary, case-insensitive).
+fn inZone(name: []const u8, zone_name: []const u8) bool {
+    if (zone_name.len == 0) return true;
+    if (name.len == zone_name.len) return std.ascii.eqlIgnoreCase(name, zone_name);
+    if (name.len < zone_name.len + 1) return false;
+    const tail = name[name.len - zone_name.len ..];
+    return name[name.len - zone_name.len - 1] == '.' and std.ascii.eqlIgnoreCase(tail, zone_name);
 }
 
 fn copyInto(out: *[zone.max_name_len]u8, name: []const u8) error{NameTooLong}![]const u8 {

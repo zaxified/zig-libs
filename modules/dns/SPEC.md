@@ -162,6 +162,13 @@ stopping at the first candidate with addresses, and DoH non-200 on both the wire
 JSON path.
 
 ## Backlog / deferred
+
+- **`lookupIp` reads a SERVFAIL / REFUSED reply as "no addresses"** *(found 2026-10-16 by acmedns's
+  review)*: `query` returns a server-failure reply as a message once every server failed, and
+  `lookupIp` collects addresses from it — an empty list, indistinguishable from NODATA (the
+  2026-10-01 fix covered timeouts only). Go returns an error ("server misbehaving"). Fix: record a
+  failure rcode as `last_err` — needs a new `Error` member (`ServerFailed`), i.e. an API change for
+  exhaustive switches in consumers. acmedns works around it with `zone.nameserverIps`.
 - ✅ **Closed 2026-09-12 (audit F10):** resolv.conf `options timeout:`/`attempts:` are now
   honored by `Resolver.effectiveTimeoutMs`/`.effectiveAttempts` when the caller leaves
   `Options.timeout_ms`/`.attempts` at their own struct defaults (`default_timeout_ms`/

@@ -115,6 +115,8 @@ test "present: a failing publisher leaves nothing pending and says why" {
     try testing.expectError(error.PublishFailed, s.present("example.org", "t", "t.k"));
     try testing.expectEqual(@as(usize, 0), s.pendingCount());
     try testing.expectEqualStrings("the publisher failed", s.note);
+    // The update may have landed before the failure showed: cleaned up once.
+    try testing.expectEqual(@as(usize, 1), f.cleaned.items.len);
 }
 
 test "solver(): the acme.Client.Solver maps errors and cleans up through the vtable" {
@@ -145,6 +147,7 @@ test "present: override_name replaces _acme-challenge.<domain>" {
     defer f.deinit();
     var o = offline(&f);
     o.override_name = "example-org.acme.delegated.test.";
+    o.zone = "acme.delegated.test.";
     var s = Dns01Solver.init(std.testing.io, testing.allocator, o);
     defer s.deinit();
     try s.present("example.org", "t", "t.k");
@@ -162,4 +165,22 @@ test "present: an over-long zone override is refused before publishing" {
     defer s.deinit();
     try testing.expectError(error.NameTooLong, s.present("example.org", "t", "t.k"));
     try testing.expectEqual(@as(usize, 0), f.presented.items.len);
+}
+
+test "present: a name outside Options.zone is refused before publishing" {
+    var f: Fake = .{};
+    defer f.deinit();
+    var o = offline(&f);
+    o.override_name = "example-org.acme.delegated.test.";
+    var s = Dns01Solver.init(std.testing.io, testing.allocator, o);
+    defer s.deinit();
+    try testing.expectError(error.ZoneNotFound, s.present("example.org", "t", "t.k"));
+    try testing.expectEqual(@as(usize, 0), f.presented.items.len);
+    try testing.expectEqualStrings("the challenge name is not inside Options.zone", s.note);
+    // A label boundary, not a string suffix: "badexample.org" is not in "example.org".
+    o.override_name = "_acme-challenge.badexample.org";
+    var s2 = Dns01Solver.init(std.testing.io, testing.allocator, o);
+    defer s2.deinit();
+    o.zone = "example.org";
+    try testing.expectError(error.ZoneNotFound, s2.present("example.org", "t", "t.k"));
 }

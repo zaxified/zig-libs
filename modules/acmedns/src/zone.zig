@@ -27,7 +27,20 @@ pub const Error = dns.Resolver.Error || error{
     ZoneNotFound,
     /// The CNAME chain loops or is longer than `max_cname_hops`.
     CnameLoop,
+    /// The resolver answered SERVFAIL, REFUSED or another error code than
+    /// NXDOMAIN: no answer at all, which must not be read as "no CNAME" or
+    /// "no SOA here" (that would publish at the wrong name, or in a parent
+    /// zone).
+    ResolverFailed,
 };
+
+/// NOERROR and NXDOMAIN are answers; every other code is a failure.
+fn answered(msg: *const dns.Message) bool {
+    return switch (msg.rcode()) {
+        .no_error, .nx_domain => true,
+        else => false,
+    };
+}
 
 /// Where TXT records for `name` must actually be published: `name` itself,
 /// or the end of its CNAME chain — the delegation lego follows by default
@@ -42,6 +55,7 @@ pub fn followCname(r: *dns.Resolver, name: []const u8, out: *[max_name_len]u8) E
     while (true) {
         var msg = try r.query(cur, .cname);
         defer msg.deinit();
+        if (!answered(&msg)) return error.ResolverFailed;
         var target: ?[]const u8 = null;
         for (msg.answers) |rec| {
             if (rec.class == .in and rec.data == .cname and eqlName(rec.name, cur)) {
@@ -68,6 +82,7 @@ pub fn findZone(r: *dns.Resolver, fqdn: []const u8, out: *[max_name_len]u8) Erro
     while (cand.len != 0) {
         var msg = try r.query(cand, .soa);
         defer msg.deinit();
+        if (!answered(&msg)) return error.ResolverFailed;
         if (msg.rcode() == .no_error) {
             for (msg.answers) |rec| {
                 if (rec.class == .in and rec.data == .soa and eqlName(rec.name, cand)) return copyName(out, cand);
@@ -77,6 +92,40 @@ pub fn findZone(r: *dns.Resolver, fqdn: []const u8, out: *[max_name_len]u8) Erro
         cand = cand[dot + 1 ..];
     }
     return error.ZoneNotFound;
+}
+
+/// A nameserver's addresses (A + AAAA records owned by `name`), or null
+/// when the resolver failed on both queries (SERVFAIL, REFUSED, a timeout):
+/// "could not find out", which a propagation check must not read as "has no
+/// address". `dns.Resolver.lookupIp` returns an empty list for a SERVFAIL
+/// (zig-libs dns Backlog). Caller frees.
+pub fn nameserverIps(r: *dns.Resolver, gpa: std.mem.Allocator, name: []const u8) error{ OutOfMemory, Canceled }!?[]netaddr.Ip {
+    var list: std.ArrayList(netaddr.Ip) = .empty;
+    errdefer list.deinit(gpa);
+    var failed: usize = 0;
+    for ([_]dns.message.Type{ .a, .aaaa }) |ty| {
+        var msg = r.query(name, ty) catch |err| switch (err) {
+            error.OutOfMemory, error.Canceled => |e| return e,
+            else => {
+                failed += 1;
+                continue;
+            },
+        };
+        defer msg.deinit();
+        if (!answered(&msg)) {
+            failed += 1;
+            continue;
+        }
+        for (msg.answers) |rec| {
+            if (rec.class != .in or !eqlName(rec.name, name)) continue;
+            if (dns.recordIp(rec)) |ip| try list.append(gpa, ip);
+        }
+    }
+    if (list.items.len == 0 and failed != 0) {
+        list.deinit(gpa);
+        return null;
+    }
+    return try list.toOwnedSlice(gpa);
 }
 
 /// The names of `zone`'s NS records, as `r` reports them. Caller frees with
