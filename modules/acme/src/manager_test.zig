@@ -53,6 +53,9 @@ const FakeIssuer = struct {
     /// Make `issue` slow (needs `io`), for the concurrency tests.
     io: ?std.Io = null,
     delay_ms: u32 = 0,
+    /// Calls inside `issue` right now, and the most ever at once.
+    in_flight: std.atomic.Value(u32) = .init(0),
+    max_in_flight: std.atomic.Value(u32) = .init(0),
 
     const Step = union(enum) {
         ok: struct { chain: []const u8, key: []const u8 },
@@ -65,6 +68,9 @@ const FakeIssuer = struct {
 
     fn issue(ctx: *anyopaque, gpa: Allocator, req: *const Manager.IssueRequest, diag: *Manager.Diagnostics) Manager.IssueError!Manager.Issued {
         const f: *FakeIssuer = @ptrCast(@alignCast(ctx));
+        const now_in = f.in_flight.fetchAdd(1, .acq_rel) + 1;
+        defer _ = f.in_flight.fetchSub(1, .acq_rel);
+        _ = f.max_in_flight.fetchMax(now_in, .acq_rel);
         f.calls += 1;
         if (f.io) |io| if (f.delay_ms != 0) {
             const d: std.Io.Clock.Duration = .{ .raw = .fromMilliseconds(f.delay_ms), .clock = .awake };
@@ -257,7 +263,7 @@ test "manage: issue, store, serve, renew at two thirds with replaces, restart fr
         try testing.expectEqual(Manager.Event.Source.issued, f.rec.last_source.?);
         try testing.expect(f.rec.issuerIs("fake"));
         try testing.expectEqual(day0 + 60 * day, next); // 2/3 of 90 days
-        try testing.expectEqual(@as(usize, 2), f.mem.count()); // .crt + .key
+        try testing.expectEqual(@as(usize, 1), f.mem.count()); // key + chain, one value
         try expectServes(&m, "www.a.example", chainOf(fx.a1_crt));
         try expectServes(&m, "A.EXAMPLE.", chainOf(fx.a1_crt)); // case + trailing dot
         try testing.expectEqual(@as(?Manager.Material, null), try m.certificate(testing.allocator, "b.example"));
@@ -295,8 +301,7 @@ test "manage: a stored certificate past its renewal point is served and renewed"
     f.init(day0 + 70 * day); // a1 renews at day 60
     defer f.deinit();
     const s = f.mem.storage();
-    try s.store("certificates/a.example.key", fx.a1_key);
-    try s.store("certificates/a.example.crt", chainOf(fx.a1_crt));
+    try s.store("certificates/a.example.pem", comptime (fx.a1_key ++ "\n" ++ chainOf(fx.a1_crt)));
 
     var fake: FakeIssuer = .{ .script = &.{.{ .fail = .{ .problem = "CA down" } }} };
     var m = f.manager(opts());
@@ -404,7 +409,7 @@ test "issuers: random policy spreads over issuers (seeded)" {
         try m.addIssuer(x.issuer(false));
         try m.addIssuer(y.issuer(false));
         try m.manage(&.{"b.example"});
-        f.mem.storage().delete("certificates/b.example.crt") catch {};
+        f.mem.storage().delete("certificates/b.example.pem") catch {};
         _ = m.maintain();
     }
     try testing.expectEqual(@as(usize, 16), x.calls + y.calls);
@@ -503,8 +508,7 @@ test "fleet: another node's lock defers, its stored result is adopted" {
     try testing.expectEqual(@as(usize, 0), f.rec.failed); // waiting is not failing
 
     // node-b finishes: its certificate lands in storage.
-    try s.store("certificates/a.example.key", fx.a1_key);
-    try s.store("certificates/a.example.crt", chainOf(fx.a1_crt));
+    try s.store("certificates/a.example.pem", comptime (fx.a1_key ++ "\n" ++ chainOf(fx.a1_crt)));
     f.clock.t += 60;
     _ = m.maintain();
     try testing.expectEqual(@as(usize, 0), fake.calls);
@@ -732,6 +736,9 @@ test "HTTP-01: solver + middleware; redirect fallback; another node answers from
     try testing.expect(std.mem.startsWith(u8, hit, "HTTP/1.1 200 OK\r\n"));
     try testing.expect(std.mem.endsWith(u8, hit, "\r\n\r\ntok-123_ABC.THUMB"));
     const miss = runWire(&r, "GET /.well-known/acme-challenge/nope HTTP/1.1\r\nHost: a.example\r\nConnection: close\r\n\r\n", &buf);
+    // Not a base64url token: never looked up (nor read from storage).
+    const odd = runWire(&r, "GET /.well-known/acme-challenge/tok.123 HTTP/1.1\r\nHost: a.example\r\nConnection: close\r\n\r\n", &buf);
+    try testing.expect(std.mem.startsWith(u8, odd, "HTTP/1.1 404"));
     try testing.expect(std.mem.startsWith(u8, miss, "HTTP/1.1 404"));
     const redirect = runWire(&r, "GET /x?y=1 HTTP/1.1\r\nHost: a.example:80\r\nConnection: close\r\n\r\n", &buf);
     try testing.expect(std.mem.startsWith(u8, redirect, "HTTP/1.1 302"));
@@ -820,4 +827,161 @@ test "issuerName: storage-safe directory names" {
     try testing.expectEqualStrings("127.0.0.1-14000-dir", Manager.issuerName(&buf, "https://127.0.0.1:14000/dir"));
     try testing.expectEqualStrings("-", Manager.issuerName(&buf, "https://"));
     try testing.expect(storage.validKey(Manager.issuerName(&buf, "https://x.example/a b?c=d#e")));
+}
+
+// ── review findings (2026-10-16) ────────────────────────────────────────────
+
+fn askName(m: *Manager, name: []const u8, got: *std.atomic.Value(u32)) void {
+    var mat = (m.certificate(testing.allocator, name) catch return) orelse return;
+    mat.deinit(testing.allocator);
+    _ = got.fetchAdd(1, .monotonic);
+}
+
+test "review H1: one issuer is never driven by two threads at once" {
+    var f: Fixture = undefined;
+    f.init(day0 + day);
+    defer f.deinit();
+    var policy: Policy = .{};
+    var fake: FakeIssuer = .{
+        .script = &.{
+            .{ .ok = .{ .chain = chainOf(fx.od1_crt), .key = fx.od1_key } },
+            .{ .ok = .{ .chain = chainOf(fx.od2_crt), .key = fx.od2_key } },
+        },
+        .io = f.threaded.io(),
+        .delay_ms = 100,
+    };
+    var m = f.manager(.{ .storage = undefined, .on_demand = .{ .ctx = &policy, .allow = Policy.allow } });
+    defer m.deinit();
+    try m.addIssuer(fake.issuer(false));
+    var got: std.atomic.Value(u32) = .init(0);
+    // Two different names: two entries, one issuer — the calls must queue.
+    const t1 = try std.Thread.spawn(.{}, askName, .{ &m, "od.example", &got });
+    const t2 = try std.Thread.spawn(.{}, askName, .{ &m, "od2.example", &got });
+    t1.join();
+    t2.join();
+    try testing.expectEqual(@as(usize, 2), fake.calls);
+    try testing.expectEqual(@as(u32, 1), fake.max_in_flight.load(.acquire));
+    try testing.expectEqual(@as(u32, 2), got.load(.monotonic));
+}
+
+test "review M1: an ARI window in the past for a fresh certificate does not loop" {
+    var f: Fixture = undefined;
+    f.init(day0 + day);
+    defer f.deinit();
+    var fake: FakeIssuer = .{
+        .script = &.{.{ .ok = .{ .chain = chainOf(fx.a1_crt), .key = fx.a1_key } }},
+        .ari_window = .{ .start = day0 - 10 * day, .end = day0 - 9 * day },
+    };
+    var m = f.manager(opts());
+    defer m.deinit();
+    try m.addIssuer(fake.issuer(true));
+    try m.manage(a_names);
+    _ = m.maintain(); // issue
+    const next = m.maintain(); // ARI poll: the window is in the past
+    try testing.expectEqual(@as(usize, 1), fake.calls);
+    m.mutex.lockUncancelable(m.io);
+    const renew_at = m.entries.items[0].renew_at;
+    m.mutex.unlock(m.io);
+    try testing.expectEqual(day0 + 9 * day, renew_at); // the floor: a tenth of 90 days
+    try testing.expect(next > f.clock.t);
+}
+
+test "review M2/L13/N5: a failed on-demand name is forgotten after its back-off; limits" {
+    var f: Fixture = undefined;
+    f.init(day0 + day);
+    defer f.deinit();
+    var policy: Policy = .{};
+    var fake: FakeIssuer = .{ .script = &.{ .{ .fail = .{ .problem = "no" } }, .{ .fail = .{ .problem = "no" } } } };
+    var m = f.manager(.{ .storage = undefined, .on_demand = .{ .ctx = &policy, .allow = Policy.allow, .failure_backoff_s = 300 } });
+    defer m.deinit();
+    try m.addIssuer(fake.issuer(false));
+    try testing.expectEqual(@as(?Manager.Material, null), try m.certificate(testing.allocator, "od.example"));
+    try testing.expectEqual(@as(usize, 1), m.entries.items.len);
+    try testing.expectEqual(@as(usize, 1), policy.asked);
+    // Within the back-off: refused without asking anyone.
+    try testing.expectEqual(@as(?Manager.Material, null), try m.certificate(testing.allocator, "od.example"));
+    try testing.expectEqual(@as(usize, 1), policy.asked);
+    // After it: maintain forgets the name.
+    f.clock.t += 300;
+    _ = m.maintain();
+    try testing.expectEqual(@as(usize, 0), m.entries.items.len);
+    // The next handshake asks the policy again.
+    _ = try m.certificate(testing.allocator, "od.example");
+    try testing.expectEqual(@as(usize, 2), policy.asked);
+    try testing.expectEqual(@as(usize, 2), fake.calls);
+
+    // L13: at most max_issuers.
+    for (0..Manager.max_issuers - 1) |_| try m.addIssuer(fake.issuer(false));
+    try testing.expectError(error.TooManyIssuers, m.addIssuer(fake.issuer(false)));
+    // N5: a name whose storage key would be invalid is refused up front.
+    try testing.expectError(error.InvalidName, m.manage(&.{"fe80::1%eth0"}));
+}
+
+test "review L3/L8: Retry-After never parks a valid certificate past its end; malformed SNI" {
+    var f: Fixture = undefined;
+    f.init(day0 + 70 * day); // a1 (stored) is due
+    defer f.deinit();
+    try f.mem.storage().store("certificates/a.example.pem", comptime (fx.a1_key ++ "\n" ++ chainOf(fx.a1_crt)));
+    var fake: FakeIssuer = .{ .script = &.{.{ .fail = .{ .problem = "later", .retry_after_s = 365 * day } }} };
+    var m = f.manager(opts());
+    defer m.deinit();
+    try m.addIssuer(fake.issuer(false));
+    try m.manage(a_names);
+    _ = m.maintain();
+    try testing.expectEqual(day0 + 90 * day - 3600, f.rec.last_retry_at);
+    try expectServes(&m, "a.example", chainOf(fx.a1_crt));
+    try testing.expectEqual(@as(?Manager.Material, null), try m.certificate(testing.allocator, ".a.example"));
+    try testing.expectEqual(@as(?Manager.Material, null), try m.certificate(testing.allocator, "*.a.example"));
+}
+
+fn maintainThread(m: *Manager) void {
+    _ = m.maintain();
+}
+
+test "review M4: a handshake does not wait for a managed name's first issuance" {
+    var f: Fixture = undefined;
+    f.init(day0 + day);
+    defer f.deinit();
+    var policy: Policy = .{};
+    var fake: FakeIssuer = .{
+        .script = &.{.{ .ok = .{ .chain = chainOf(fx.a1_crt), .key = fx.a1_key } }},
+        .io = f.threaded.io(),
+        .delay_ms = 400,
+    };
+    var m = f.manager(.{ .storage = undefined, .on_demand = .{ .ctx = &policy, .allow = Policy.allow } });
+    defer m.deinit();
+    try m.addIssuer(fake.issuer(false));
+    try m.manage(a_names);
+    const th = try std.Thread.spawn(.{}, maintainThread, .{&m});
+    defer th.join();
+    while (fake.in_flight.load(.acquire) == 0) std.atomic.spinLoopHint();
+    const io = f.threaded.io();
+    const t0 = std.Io.Clock.awake.now(io);
+    try testing.expectEqual(@as(?Manager.Material, null), try m.certificate(testing.allocator, "a.example"));
+    const waited = t0.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds();
+    try testing.expect(waited < 200);
+    try testing.expectEqual(@as(usize, 0), policy.asked); // a managed name is never on-demand
+}
+
+test "review M3: run() serves a name managed while it sleeps within a second" {
+    var f: Fixture = undefined;
+    f.init(day0 + day);
+    defer f.deinit();
+    var fake: FakeIssuer = .{ .script = &.{.{ .ok = .{ .chain = chainOf(fx.a1_crt), .key = fx.a1_key } }} };
+    var m = f.manager(opts());
+    defer m.deinit();
+    try m.addIssuer(fake.issuer(false));
+    const io = f.threaded.io();
+    var fut = io.async(Manager.run, .{&m});
+    // Nothing managed: run sleeps "an hour". Let it get there, then manage.
+    const settle: std.Io.Clock.Duration = .{ .raw = .fromMilliseconds(200), .clock = .awake };
+    try settle.sleep(io);
+    try m.manage(a_names);
+    var waited: u32 = 0;
+    while (f.rec.installed == 0 and waited < 30) : (waited += 1) {
+        const step: std.Io.Clock.Duration = .{ .raw = .fromMilliseconds(100), .clock = .awake };
+        try step.sleep(io);
+    }
+    fut.cancel(io) catch {};
+    try testing.expectEqual(@as(usize, 1), f.rec.installed);
 }

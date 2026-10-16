@@ -488,7 +488,7 @@ fn managerScenario(gpa: std.mem.Allocator, io: std.Io, transport: *http.Client, 
         const next = m.maintain();
         mstep(&failures, "issued", events.issued == 1 and events.failed == 0);
         mstep(&failures, "serves-verified", servesVerified(gpa, &m, "m2.test", root_pem, names, &clock));
-        mstep(&failures, "stored", if (dir.statFile(io, "certificates/m.test.crt", .{})) |_| true else |_| false);
+        mstep(&failures, "stored", if (dir.statFile(io, "certificates/m.test.pem", .{})) |_| true else |_| false);
         // The ARI poll is due at once; Pebble answers with a window.
         mstep(&failures, "ari-due", next <= ShiftedClock.now(&clock));
         _ = m.maintain();

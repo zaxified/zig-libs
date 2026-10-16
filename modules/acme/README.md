@@ -140,7 +140,7 @@ const next_due = manager.maintain();
   (qap does) calls `maintain` from it.
 - **Storage** is an interface: `DirStorage` on disk, `MemStorage` in memory,
   or your own (a database, a key-value service). Layout:
-  `certificates/<name>.crt|.key`, `accounts/<issuer>/account.key`,
+  `certificates/<name>.pem` (key + chain, one atomic write), `accounts/<issuer>/account.key`,
   `locks/<name>.lock`.
 - **On-demand** (`Options.on_demand`): the first handshake for a name nobody
   managed obtains its certificate, if `allow(name)` says yes and the rate

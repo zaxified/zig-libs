@@ -102,12 +102,19 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   timer); `run()` the loop. Per due entry: adopt the stored certificate when it passes the checks and
   is newer than the current one; else take the storage lock `issue/<name>` (lease
   `lock_lease_s`; held by another node → look again in `lock_poll_s`, no failure), re-check storage,
-  ask the issuers in policy order, check the result, store key then certificate, install, emit
-  `installed`. The renewal point is a random time inside the ARI window (kept until the window
-  moves, never past `notAfter` − 1 h), else `renewal_window_pct` of the lifetime remaining
+  ask the issuers in policy order (each issuer behind its own lock: a `Client` is driven by one
+  thread at a time, whether `maintain` or an on-demand handshake calls it), check the result,
+  store key + chain as ONE value (one atomic write — never a new key beside an old certificate),
+  install, emit `installed`. A stored certificate is adopted when it was issued later (`notBefore`)
+  than the current one. The renewal point is a random time inside the ARI window (kept until the window
+  moves, never past `notAfter` − 1 h and never before a tenth of the lifetime — a CA answering a
+  past window for every fresh certificate would otherwise get an order per round), else `renewal_window_pct` of the lifetime remaining
   (default a third, half for ≤ 10-day certificates). ARI is polled at its `Retry-After` (default
   6 h) and stops for an issuer that answers `NotSupported`. Failures back off 1 min doubling to
-  `max_backoff_s`, never sooner than the CA's `Retry-After`; a valid certificate keeps serving. A
+  `max_backoff_s`, never sooner than the CA's `Retry-After` (the longest any issuer gave) but never
+  later than `notAfter` − 1 h while the certificate is valid; a valid certificate keeps serving, and
+  so does an expired one when renewal keeps failing (the client then refuses it; `failed` events
+  keep coming). A
   renewal names its predecessor (`replaces`); `AcmeIssuer` orders once more without it if the CA
   refuses. **Checks before store/serve** (`checkPair`): every PEM certificate parses; the chain
   verifies (`x509.verifyChain`, serverAuth) to `trust_anchors`, by default to its own topmost
@@ -115,17 +122,23 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   `max(now, notBefore)` (a fresh certificate may start in the future), but expired is refused;
   every managed name is in the SAN (a wildcard name only as the literal wildcard); the key PEM is
   the leaf's key (EC: SEC1 point; RSA: modulus and exponent). **Serving**: `certificate(sni)`
-  copies under the lock (exact name, then one-label wildcard; empty SNI → `default_server_name`);
+  copies under the lock (only a valid hostname is looked up: exact name, then one-label wildcard;
+  empty SNI → `default_server_name`); a handshake waits only for an on-demand name another handshake
+  is obtaining, never for a `manage`d name's first issuance;
   `tlsAlpnMaterial(sni)` for ALPN `acme-tls/1`; `httpMiddleware` serves tokens, and with
   `http_redirect` answers GET/HEAD with 302 to `https://<host without port><target>` (Host
   characters checked — no header injection) and anything else 400. The manager's
   `challengeSolvers()` replace the client's built-ins, so its own maps are what the CA reaches.
   **On-demand**: the policy (`allow`, required) runs outside the lock, then the ring-buffer rate
-  limit; the name joins the managed set; concurrent handshakes for it wait on one issuance
-  (`Io.Condition`); a failed name is refused for `failure_backoff_s` and retried only by a
-  handshake, never in the background. **Fleet**: `distributed_challenges` also writes
+  limit; the name joins the managed set (created busy, in the same lock hold); concurrent
+  handshakes for it wait on one issuance (`Io.Condition`); a failed name is refused for
+  `failure_backoff_s`, then forgotten (`maintain` drops it), so the next handshake goes through the
+  policy and the rate limit again and the set stays bounded; never retried in the background. **Fleet**: `distributed_challenges` also writes
   `challenges/http-01/<token>` and `challenges/tls-alpn-01/<sni>` (cert PEM + throwaway key PEM)
-  and falls back to storage on a local miss. Storage layout: `certificates/<name>.crt|.key`
+  and falls back to storage on a local miss (only for a base64url token / a hostname SNI — anything
+  else from the network costs no storage read). `run()` sleeps in one-second steps and starts a
+  round at once after `manage` / `addIssuer`. Storage layout: `certificates/<name>.pem` (key PEM,
+  then the chain)
   (`*` → `_`, `:` → `+`), `accounts/<issuer>/account.key` (`loadOrCreateAccountKey`),
   `locks/<name>.lock`. Events: `installed` (source storage | issued), `failed` (retry time),
   `storage_failed` (issued and served, but a restart would order again).
@@ -133,7 +146,10 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   `/`-separated `[A-Za-z0-9._@+-]` segments, no `.`/`..`/empty segment, ≤ 512 bytes; values
   ≤ 1 MiB. `DirStorage`: dirs `0700`, files `0600`, write = new file + fsync + rename; a lock is a
   file `owner\nexpiry` created whole by an exclusive link, re-entrant for its owner (extends the
-  lease), an unreadable one counts as expired. `MemStorage`: a map under a spin lock, values wiped
+  lease), an unreadable one counts as expired. Not atomic across nodes: a stale-lock takeover is
+  read → delete → create, and `unlock` is read → delete, so between a read and the delete another
+  node can create its own lock and lose it — a duplicate order at worst; a lease shorter than an
+  issuance lets a second node in (no heartbeat). `MemStorage`: a map under a spin lock, values wiped
   on replace/delete/deinit.
 - Threadsafe; account key + order state are caller-held. All crypto is `std.crypto` plus the sibling
   `p256`/`p384` signers — no bespoke ASN.1/crypto beyond std's `Certificate`/ECDSA. Key/cert PEM I/O
@@ -159,12 +175,12 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   them `0600` in `0700` directories, and anyone who can write the storage can make the manager serve
   a certificate of their choosing *within* `checkPair`'s bounds (it must chain to the anchors and
   match its key; with the default self-anchoring, any self-consistent chain for the names passes —
-  set `trust_anchors` when the storage is shared or less trusted than the process). **On-demand**
+  set `trust_anchors` when the storage is shared or less trusted than the process). A hook must not
+  call `certificate` for the names of its own event (an on-demand entry is busy then). **On-demand**
   without a strict `allow` lets a client make the server order a certificate for any name it sends
   (CA rate limits, account standing); `allow` is required and the rate limit bounds the rest. The
-  redirect reflects only the Host's hostname characters. Fleet: a stale-lock takeover is
-  delete-then-create, so two nodes can both win in the same instant — the cost is one duplicate
-  order, never a torn file.
+  redirect reflects only the Host's hostname characters. Fleet: lock takeover and release are
+  read-then-delete (see Storage) — the cost of the race is one duplicate order, never a torn file.
 
 ## Verification
 `zig build test-acme` — all offline + loopback, no real CA ever contacted. Offline units:
@@ -268,6 +284,28 @@ ACME v2 (RFC 8555) replay/downgrade paths all confirmed correct. A manual stagin
 - ~~**Pebble coverage of the lifecycle calls**~~ — **DONE 2026-10-16** (`lifecycle` scenario, EAB required for every account, 12/12; replayed offline). *(2026-10-13)*: `tools/interop.zig` runs the issuance flows only; EAB (Pebble's `-externalaccountbindings`-style config), rollover, revocation and ARI (Pebble supports `renewalInfo`) are mock-CA tested. Adding them to `zig build interop-acme` turns the mock's reading of the RFC into the foreign server's. Effort: small.
 - ~~**Read side onto the `x509` module**~~ — **DONE 2026-10-16**: `certNotAfter`, `ariCertId`, `issuerCommonName` read through `x509.chain.certValidity` / `certSerialAndIssuer` / `certAuthorityKeyId` and `x509.names.nameAttribute`; own walkers (`issuerCn`, `ariParts`, `derWellFormed`) deleted; mock CA uses `x509.spkiOf`. Kept on std on purpose: `tools/interop.zig` verifies Pebble's chain with std's `Certificate.verify` — an implementation independent of `x509`, which is what an interop oracle wants. Verifying the downloaded chain: DONE with W5 in the `Manager` (`checkPair`, `x509.verifyChain` against `trust_anchors`); `Client.obtain` itself still hands back the chain as the CA sent it. *(original, owner question 2026-10-16: "why did we write x509 again?")*: `src/x509.zig` is mostly CONSTRUCTION (CSR, TLS-ALPN-01 certificate, DER writer, key PEM codecs), which the `x509` module deliberately does not do (its S2 survey 2026-10-11, Backlog "Deliberately not doing", names this file as the owner of the CSR) — that part stays. But its READ side duplicates what `x509` does better: `certNotAfter` (std parse after an own pre-scan; `x509.safe.validateForStdParse`/`safeCertificate` close std's DER out-of-bounds for every caller), `ariCertId` (serial + AKI walk; `x509.chain.certSerialAndIssuer` + `extensions.iterate` — x509 lacks only an AKI parser next to `parseSubjectKeyIdentifier`), `issuerCommonName` (added 2026-10-16 for `preferred_chain`; an issuer-attribute getter belongs in `x509`), and the mock CA / `tools/interop.zig` verify chains with std's `Certificate.verify` instead of `x509.verifyChain`. Plan: add to `x509` `parseAuthorityKeyIdentifier` + `issuerAttribute(cert, oid)` (+ `notAfter` through `safe`), make acme depend on `x509` (new deps for acme: only `slhdsa`, `x509`; rsa/p256/p521 already in), delete the duplicates, optionally verify the downloaded chain (`verifyChain` against a caller-given root set). Also: `x509.names.parseIp4/6` duplicate `netaddr`. Effort: small–medium. Do before W3.
 - **Full-competitor scope (owner 2026-10-13; R-list 2026-10-16, `~/CML/20261016-acme-s1/survey.report.md`)** — waves still open (W1, W2, W3 DONE 2026-10-16 — W3 = the order-level API above; **W4 DONE 2026-10-16 in the sibling module `acmedns`** — CNAME delegation, SOA zone walk, propagation check, RFC 2136 + TSIG / acme-dns / httpreq / exec publishers, Pebble-verified; a sibling so that acme's consumers, qap among them, do not take `dns` and `procrun` into their closure): ~~**W5**~~ **DONE 2026-10-16**: `Manager` + `storage` (see Design). Scope → parity.
+- **Manager review 2026-10-16** (an independent reviewer, read-only; every finding re-read against
+  the code by the coordinator; report `~/CML/20261016-acme-s1/manager-review.report.md`). Fixed,
+  with tests: **H1** one `Client` was driven by several threads (on-demand handshakes + `maintain`)
+  — per-issuer locks; **M1** a past ARI window for a fresh certificate renewed every round — floor
+  at a tenth of the lifetime; **M2** failed on-demand names were retried past the policy and the
+  rate limit and never evicted — forgotten after the back-off; **M3** `run()` noticed a new
+  `manage` only at the next due time (up to an hour) — one-second steps + wake flag; **M4** a
+  handshake waited for a managed name's whole first issuance — only on-demand names are waited
+  for; **L1** an on-demand entry could be freed between creation and start — created busy;
+  **L2** key and certificate were two writes — one value; **L3** `Retry-After` could park a valid
+  certificate past its end — capped at `notAfter` − 1 h; **L4** adoption compared `notAfter` —
+  now `notBefore`; **L5** `node_id` silently truncated — validated (panics: configuration);
+  **L8** malformed SNI hit the wildcard; **L9** any token / SNI from the network cost a storage
+  read, and the SNI was not lower-cased; **L11** CTLs in the redirect target; **L12** an
+  `unmanage`d entry was still stored; **L13** issuers beyond 16 silently ignored, a first issuer's
+  `Retry-After` lost; **N2** the user clock read under the lock; **N4** an RSA key in PKCS#8
+  refused; **N5** a name whose storage key is invalid accepted. Open: **L6** the DirStorage lock
+  races (documented under Storage; a rename- or flock-based lock would close them); **L7**
+  `loadOrCreateAccountKey` on two nodes starting at once creates two accounts (last store wins) —
+  wants a create-exclusive store or the issuance lock around it; **L10** an expired certificate
+  stays served (documented; autocert drops it); test gaps: concurrent `unmanage`, the lock races,
+  an RSA PKCS#8 pair.
 - **Manager follow-ups** (2026-10-16): (a) the replay transcript does not carry the `manager`
   scenario (regenerate with `pebble.sh` once the replay test knows the scenario); (b) the mock CA
   issues a fixed chain whatever the CSR, so the Manager's full path is exercised only by Pebble —

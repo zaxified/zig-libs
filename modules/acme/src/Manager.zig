@@ -68,7 +68,11 @@ options: Options,
 mutex: std.Io.Mutex = .init,
 /// Signalled when an entry stops being busy (on-demand waiters).
 idle: std.Io.Condition = .init,
-issuers: std.ArrayList(Issuer) = .empty,
+/// Heap slots (stable addresses): each issuer's calls are serialized by its
+/// slot's lock — a `Client` must be driven by one thread at a time.
+issuers: std.ArrayList(*IssuerSlot) = .empty,
+/// Set by `manage`/`addIssuer`, so `run` stops sleeping early.
+wake: std.atomic.Value(bool) = .init(false),
 entries: std.ArrayList(*Entry) = .empty,
 /// Every managed name → its entry; keys borrow the entry's names.
 by_name: std.StringHashMapUnmanaged(*Entry) = .empty,
@@ -111,8 +115,8 @@ pub const Options = struct {
     lock_lease_s: u32 = 15 * 60,
     /// How soon to look again while another node holds the issuance lock.
     lock_poll_s: u32 = 60,
-    /// This node's lock-owner name (1..32 of `[A-Za-z0-9._@+-]`); null: a
-    /// random one per `Manager`.
+    /// This node's lock-owner name (1..32 of `[A-Za-z0-9._@+-]`, else `init`
+    /// panics); null: a random one per `Manager`.
     node_id: ?[]const u8 = null,
     /// Also write HTTP-01 / TLS-ALPN-01 challenge data to `storage`, and
     /// fall back to it when a token is not found locally: the node the CA
@@ -131,6 +135,14 @@ pub const Options = struct {
 };
 
 pub const IssuerPolicy = enum { in_order, random };
+
+const IssuerSlot = struct {
+    issuer: Issuer,
+    lock: std.Io.Mutex = .init,
+};
+
+/// Most issuers one manager tries (`addIssuer` refuses more).
+pub const max_issuers = 16;
 
 pub const Clock = struct {
     ctx: ?*anyopaque = null,
@@ -154,6 +166,7 @@ pub const OnDemand = struct {
     failure_backoff_s: u32 = 5 * 60,
 };
 
+/// `window_s` 0 means no limit; `max` 0 means no on-demand issuance at all.
 pub const RateLimit = struct { max: u16 = 10, window_s: u32 = 60 };
 
 /// Something that issues certificates: an ACME CA (`AcmeIssuer`) or
@@ -206,7 +219,9 @@ pub const Diagnostics = struct {
 pub const EventHook = struct {
     ctx: ?*anyopaque = null,
     /// Called from the thread that did the work, outside the manager's
-    /// lock. Everything in `event` is borrowed for the call.
+    /// lock. Everything in `event` is borrowed for the call. The hook must
+    /// not call `certificate` for the names of the event (an on-demand entry
+    /// is still busy then, and the call would wait for itself).
     call: *const fn (ctx: ?*anyopaque, event: *const Event) void,
 };
 
@@ -278,9 +293,12 @@ pub fn init(io: std.Io, gpa: Allocator, options: Options) Manager {
         .prng = std.Random.DefaultPrng.init(seed),
     };
     if (options.node_id) |id| {
-        const n = @min(id.len, m.node_id_buf.len);
-        @memcpy(m.node_id_buf[0..n], id[0..n]);
-        m.node_id_len = @intCast(n);
+        // A configuration error, not input: a truncated id could collide
+        // with another node's and defeat the (re-entrant) issuance lock.
+        if (id.len == 0 or id.len > m.node_id_buf.len or !storage_mod.validKey(id) or std.mem.indexOfScalar(u8, id, '/') != null)
+            @panic("acme.Manager: Options.node_id must be 1..32 of [A-Za-z0-9._@+-]");
+        @memcpy(m.node_id_buf[0..id.len], id);
+        m.node_id_len = @intCast(id.len);
     } else {
         var raw: [8]u8 = undefined;
         io.random(&raw);
@@ -296,6 +314,7 @@ pub fn deinit(m: *Manager) void {
     for (m.entries.items) |e| m.freeEntry(e);
     m.entries.deinit(m.gpa);
     m.by_name.deinit(m.gpa);
+    for (m.issuers.items) |slot| m.gpa.destroy(slot);
     m.issuers.deinit(m.gpa);
     m.http_tokens.deinit();
     m.tls_alpn.deinit();
@@ -311,11 +330,20 @@ fn now(m: *Manager) i64 {
     return std.Io.Clock.real.now(m.io).toSeconds();
 }
 
-/// Add an issuer; `Issuer.ctx` must outlive the manager.
-pub fn addIssuer(m: *Manager, issuer: Issuer) error{OutOfMemory}!void {
+/// Add an issuer (at most `max_issuers`); `Issuer.ctx` must outlive the
+/// manager. The manager calls one issuer from one thread at a time (on-demand
+/// handshakes and `maintain` take turns), so a `Client` behind an
+/// `AcmeIssuer` is never driven concurrently — do not share one `Client`
+/// between two issuers.
+pub fn addIssuer(m: *Manager, issuer: Issuer) error{ OutOfMemory, TooManyIssuers }!void {
+    const slot = try m.gpa.create(IssuerSlot);
+    errdefer m.gpa.destroy(slot);
+    slot.* = .{ .issuer = issuer };
     m.mutex.lockUncancelable(m.io);
     defer m.mutex.unlock(m.io);
-    try m.issuers.append(m.gpa, issuer);
+    if (m.issuers.items.len >= max_issuers) return error.TooManyIssuers;
+    try m.issuers.append(m.gpa, slot);
+    m.wake.store(true, .release);
 }
 
 /// The HTTP-01 and TLS-ALPN-01 solvers that publish through this manager:
@@ -379,8 +407,12 @@ const Entry = struct {
 /// (they need a DNS-01 issuer) or IP literals; they are lower-cased.
 pub fn manage(m: *Manager, names: []const []const u8) Error!void {
     _ = try m.addEntry(names, false);
+    m.wake.store(true, .release);
 }
 
+/// `on_demand` entries are created busy, in the same lock hold that makes
+/// them findable: no other thread can free or start one before its creator
+/// has it.
 fn addEntry(m: *Manager, names: []const []const u8, on_demand: bool) Error!*Entry {
     if (names.len == 0 or names.len > max_names) return error.InvalidName;
     for (names) |n| if (!validName(n)) return error.InvalidName;
@@ -400,7 +432,7 @@ fn addEntry(m: *Manager, names: []const []const u8, on_demand: bool) Error!*Entr
     var stem_buf: [storage_mod.max_key_len]u8 = undefined;
     const stem = try m.gpa.dupe(u8, certStem(&stem_buf, owned[0]));
     errdefer m.gpa.free(stem);
-    e.* = .{ .names = owned, .stem = stem, .on_demand = on_demand };
+    e.* = .{ .names = owned, .stem = stem, .on_demand = on_demand, .busy = on_demand };
 
     m.mutex.lockUncancelable(m.io);
     defer m.mutex.unlock(m.io);
@@ -431,6 +463,16 @@ pub fn unmanage(m: *Manager, name: []const u8) bool {
     return true;
 }
 
+/// Unlink `e` from the set and free it (lock held, `e` not busy).
+fn dropEntryLocked(m: *Manager, e: *Entry) void {
+    for (e.names) |n| _ = m.by_name.remove(n);
+    for (m.entries.items, 0..) |x, i| if (x == e) {
+        _ = m.entries.orderedRemove(i);
+        break;
+    };
+    m.freeEntry(e);
+}
+
 fn freeEntry(m: *Manager, e: *Entry) void {
     if (e.cert) |*ct| ct.deinit(m.gpa);
     for (e.names) |n| m.gpa.free(n);
@@ -440,8 +482,10 @@ fn freeEntry(m: *Manager, e: *Entry) void {
 }
 
 fn validName(name: []const u8) bool {
-    if (x509.isValidDomain(name) or x509.isValidWildcardDomain(name)) return true;
-    return netaddr.parseIp(name) != null;
+    const ok = x509.isValidDomain(name) or x509.isValidWildcardDomain(name) or netaddr.parseIp(name) != null;
+    if (!ok) return false;
+    var buf: [storage_mod.max_key_len]u8 = undefined;
+    return storage_mod.validKey(certStem(&buf, name));
 }
 
 /// `certificates/<name>` with `*` → `_` and `:` → `+` (storage-key safe;
@@ -498,6 +542,15 @@ fn nextDue(m: *Manager) i64 {
     const t = m.now();
     m.mutex.lockUncancelable(m.io);
     defer m.mutex.unlock(m.io);
+    // A failed on-demand name is kept only for its back-off (to refuse fast);
+    // after that it is forgotten, and the next handshake goes through the
+    // policy and the rate limit again. Keeps the set bounded.
+    var i = m.entries.items.len;
+    while (i > 0) {
+        i -= 1;
+        const e = m.entries.items[i];
+        if (!e.busy and idleOnDemand(e) and t >= e.retry_at) m.dropEntryLocked(e);
+    }
     var next: i64 = std.math.maxInt(i64);
     for (m.entries.items) |e| if (!e.busy and !idleOnDemand(e)) {
         next = @min(next, e.dueAt());
@@ -510,11 +563,15 @@ fn nextDue(m: *Manager) i64 {
 /// a wall-clock jump is noticed). Returns only when the io cancels it.
 pub fn run(m: *Manager) error{Canceled}!void {
     while (true) {
+        m.wake.store(false, .release);
         const next = m.maintain();
-        const wait_s = std.math.clamp(next - m.now(), 0, 3600);
-        if (wait_s == 0) continue;
-        const d: std.Io.Clock.Duration = .{ .raw = .fromSeconds(wait_s), .clock = .awake };
-        d.sleep(m.io) catch return error.Canceled;
+        var wait_s = std.math.clamp(next - m.now(), 0, 3600);
+        // In one-second steps, so a `manage` or `addIssuer` meanwhile is
+        // served within a second rather than at the next due time.
+        while (wait_s > 0 and !m.wake.load(.acquire)) : (wait_s -= 1) {
+            const d: std.Io.Clock.Duration = .{ .raw = .fromSeconds(1), .clock = .awake };
+            d.sleep(m.io) catch return error.Canceled;
+        }
     }
 }
 
@@ -567,19 +624,20 @@ fn obtain(m: *Manager, e: *Entry, t: i64) void {
 /// Install the stored certificate when it is usable and newer than the
 /// current one; true when nothing more is needed now.
 fn adoptStored(m: *Manager, e: *Entry, t: i64) bool {
-    const chain_pem = m.options.storage.load(m.gpa, m.keyOf(e, ".crt").slice()) catch return false;
-    var keep_chain = false;
-    defer if (!keep_chain) m.gpa.free(chain_pem);
-    const key_pem = m.options.storage.load(m.gpa, m.keyOf(e, ".key").slice()) catch return false;
-    var keep_key = false;
-    defer if (!keep_key) {
-        std.crypto.secureZero(u8, key_pem);
-        m.gpa.free(key_pem);
+    const blob = m.options.storage.load(m.gpa, m.keyOf(e, ".pem").slice()) catch return false;
+    defer {
+        std.crypto.secureZero(u8, blob);
+        m.gpa.free(blob);
+    }
+    const split = std.mem.indexOf(u8, blob, "-----BEGIN CERTIFICATE-----") orelse return false;
+    const leaf = checkPair(m.gpa, e.names, blob[split..], blob[0..split], t, m.options.trust_anchors) catch return false;
+    // Newer = issued later (a shorter-lived replacement still counts).
+    if (e.cert) |ct| if (leaf.not_before <= ct.not_before) return false;
+    const chain_pem = m.gpa.dupe(u8, blob[split..]) catch return false;
+    const key_pem = m.gpa.dupe(u8, blob[0..split]) catch {
+        m.gpa.free(chain_pem);
+        return false;
     };
-    const leaf = checkPair(m.gpa, e.names, chain_pem, key_pem, t, m.options.trust_anchors) catch return false;
-    if (e.cert) |ct| if (leaf.not_after <= ct.not_after) return false;
-    keep_chain = true;
-    keep_key = true;
     m.install(e, .{ .chain_pem = chain_pem, .key_pem = key_pem, .not_before = leaf.not_before, .not_after = leaf.not_after }, t, .storage, null);
     m.mutex.lockUncancelable(m.io);
     defer m.mutex.unlock(m.io);
@@ -603,11 +661,11 @@ fn keyOf(m: *const Manager, e: *const Entry, ext: []const u8) KeyBuf {
 
 /// Ask the issuers in policy order; the first verified result wins.
 fn issue(m: *Manager, e: *Entry, t: i64) void {
-    var order_buf: [16]usize = undefined;
+    var order_buf: [max_issuers]usize = undefined;
     m.mutex.lockUncancelable(m.io);
-    const count = @min(m.issuers.items.len, order_buf.len);
-    var issuers_buf: [16]Issuer = undefined;
-    @memcpy(issuers_buf[0..count], m.issuers.items[0..count]);
+    const count = m.issuers.items.len;
+    var issuers_buf: [max_issuers]*IssuerSlot = undefined;
+    @memcpy(issuers_buf[0..count], m.issuers.items);
     for (order_buf[0..count], 0..) |*o, i| o.* = i;
     if (m.options.issuer_policy == .random) m.prng.random().shuffle(usize, order_buf[0..count]);
     // ARI `replaces`: the certificate being renewed, if any.
@@ -617,11 +675,21 @@ fn issue(m: *Manager, e: *Entry, t: i64) void {
 
     var d: Diagnostics = .{};
     if (count == 0) d.note("no issuer configured");
+    // The longest Retry-After any issuer asked for: a rate-limited first CA
+    // must not be lost behind a second one's plain failure.
+    var retry_after: ?u64 = null;
     for (order_buf[0..count]) |idx| {
-        const iss = issuers_buf[idx];
+        const slot = issuers_buf[idx];
+        const iss = slot.issuer;
         d = .{};
         const req: IssueRequest = .{ .names = e.names, .replaces = if (m.options.use_ari) replaces else null };
-        var got = iss.issue(iss.ctx, m.gpa, &req, &d) catch continue;
+        slot.lock.lockUncancelable(m.io);
+        const result = iss.issue(iss.ctx, m.gpa, &req, &d);
+        slot.lock.unlock(m.io);
+        var got = result catch {
+            if (d.retry_after_s) |ra| retry_after = @max(retry_after orelse 0, ra);
+            continue;
+        };
         const leaf = checkPair(m.gpa, e.names, got.chain_pem, got.key_pem, t, m.options.trust_anchors) catch |err| {
             d.note(switch (err) {
                 error.KeyMismatch => "issued certificate does not match its key",
@@ -632,21 +700,35 @@ fn issue(m: *Manager, e: *Entry, t: i64) void {
             freeIssued(m.gpa, &got);
             continue;
         };
-        // Key first: a reader that finds the certificate finds its key.
-        // A storage failure does not stop serving what was just issued, but
-        // it is reported: the next start would have to order again.
-        var stored = true;
-        m.options.storage.store(m.keyOf(e, ".key").slice(), got.key_pem) catch {
-            stored = false;
-        };
-        if (stored) m.options.storage.store(m.keyOf(e, ".crt").slice(), got.chain_pem) catch {
-            stored = false;
-        };
+        m.mutex.lockUncancelable(m.io);
+        const removed = e.removed;
+        m.mutex.unlock(m.io);
+        if (removed) {
+            // `unmanage`d meanwhile: neither stored nor reported.
+            freeIssued(m.gpa, &got);
+            return;
+        }
+        // Key and chain in one value, one atomic write (autocert's layout):
+        // a crash can never leave a new key beside an old certificate. A
+        // storage failure does not stop serving what was just issued, but it
+        // is reported: the next start would have to order again.
+        const stored = m.storePair(e, got.key_pem, got.chain_pem);
         m.install(e, .{ .chain_pem = got.chain_pem, .key_pem = got.key_pem, .not_before = leaf.not_before, .not_after = leaf.not_after }, t, .issued, iss.name);
         if (!stored) m.emit(&.{ .storage_failed = .{ .names = namesView(e) } });
         return;
     }
+    if (retry_after) |ra| d.retry_after_s = @max(d.retry_after_s orelse 0, ra);
     m.failed(e, t, &d, "issuance failed");
+}
+
+fn storePair(m: *Manager, e: *const Entry, key_pem: []const u8, chain_pem: []const u8) bool {
+    const blob = std.mem.concat(m.gpa, u8, &.{ key_pem, "\n", chain_pem }) catch return false;
+    defer {
+        std.crypto.secureZero(u8, blob);
+        m.gpa.free(blob);
+    }
+    m.options.storage.store(m.keyOf(e, ".pem").slice(), blob) catch return false;
+    return true;
 }
 
 fn freeIssued(gpa: Allocator, got: *Issued) void {
@@ -658,8 +740,8 @@ fn freeIssued(gpa: Allocator, got: *Issued) void {
 fn install(m: *Manager, e: *Entry, ct: Cert, t: i64, source: Event.Source, issuer: ?[]const u8) void {
     var has_ari = false;
     m.mutex.lockUncancelable(m.io);
-    if (m.options.use_ari) for (m.issuers.items) |iss| {
-        if (iss.renewal_window != null) has_ari = true;
+    if (m.options.use_ari) for (m.issuers.items) |slot| {
+        if (slot.issuer.renewal_window != null) has_ari = true;
     };
     if (e.cert) |*old| old.deinit(m.gpa);
     e.cert = ct;
@@ -709,6 +791,9 @@ fn failed(m: *Manager, e: *Entry, t: i64, d: *const Diagnostics, fallback: []con
     };
     if (d.retry_after_s) |ra| wait = @max(wait, @as(i64, @intCast(@min(ra, 365 * std.time.s_per_day))));
     e.retry_at = t + wait;
+    // A valid certificate is retried before it expires, whatever the CA's
+    // Retry-After said.
+    if (e.cert) |ct| e.retry_at = @min(e.retry_at, @max(t + 60, ct.not_after - 3600));
     const retry_at = e.retry_at;
     m.mutex.unlock(m.io);
     m.emit(&.{ .failed = .{
@@ -721,18 +806,22 @@ fn failed(m: *Manager, e: *Entry, t: i64, d: *const Diagnostics, fallback: []con
 /// Refresh the ARI window (the entry has a certificate and is not due for
 /// renewal). The first issuer that answers decides.
 fn pollAri(m: *Manager, e: *Entry, t: i64) void {
-    var issuers_buf: [16]Issuer = undefined;
+    var issuers_buf: [max_issuers]*IssuerSlot = undefined;
     m.mutex.lockUncancelable(m.io);
-    const count = @min(m.issuers.items.len, issuers_buf.len);
-    @memcpy(issuers_buf[0..count], m.issuers.items[0..count]);
+    const count = m.issuers.items.len;
+    @memcpy(issuers_buf[0..count], m.issuers.items);
     m.mutex.unlock(m.io);
 
     const ct = e.cert.?; // busy: stable
     var unsupported = true;
-    for (issuers_buf[0..count]) |iss| {
+    for (issuers_buf[0..count]) |slot| {
+        const iss = slot.issuer;
         const window_fn = iss.renewal_window orelse continue;
         var d: Diagnostics = .{};
-        const w = window_fn(iss.ctx, ct.chain_pem, &d) catch |err| {
+        slot.lock.lockUncancelable(m.io);
+        const result = window_fn(iss.ctx, ct.chain_pem, &d);
+        slot.lock.unlock(m.io);
+        const w = result catch |err| {
             if (err != error.NotSupported) unsupported = false;
             continue;
         };
@@ -740,11 +829,16 @@ fn pollAri(m: *Manager, e: *Entry, t: i64) void {
         defer m.mutex.unlock(m.io);
         if (w.start != e.ari_start or w.end != e.ari_end) {
             // RFC 9773 §4.2: a random time inside the window, kept until the
-            // window moves. Never past the certificate's own end.
+            // window moves. Never past the certificate's own end, and never
+            // before a tenth of its lifetime: a CA answering a past window
+            // for every new certificate would otherwise get an order per
+            // `maintain` round (an incident window for an OLD certificate
+            // is past that floor and still renews at once).
             e.ari_start = w.start;
             e.ari_end = w.end;
             const info: Client.RenewalInfo = .{ .window_start = w.start, .window_end = w.end, .explanation_url = null, .retry_after_s = null };
-            e.renew_at = @min(info.pickTime(m.prng.random()), ct.not_after - 3600);
+            const floor = ct.not_before + @divFloor(@max(ct.not_after - ct.not_before, 0), 10);
+            e.renew_at = std.math.clamp(info.pickTime(m.prng.random()), floor, @max(floor, ct.not_after - 3600));
         }
         const poll: i64 = if (w.retry_after_s) |ra| @intCast(@min(ra, 7 * std.time.s_per_day)) else m.options.ari_poll_s;
         e.ari_at = t + @max(poll, 60);
@@ -775,55 +869,49 @@ pub fn certificate(m: *Manager, gpa: Allocator, sni: []const u8) error{OutOfMemo
     const want = if (sni.len == 0) m.options.default_server_name orelse return null else sni;
     if (want.len == 0 or want.len > lower_buf.len) return null;
     const name = std.ascii.lowerString(&lower_buf, std.mem.trimEnd(u8, want, "."));
+    // Only a hostname is looked up (no `.example.com`, no `*.example.com`).
+    if (!x509.isValidDomain(name)) return null;
+    const t = m.now(); // the caller's clock, read outside the lock
 
     m.mutex.lockUncancelable(m.io);
-    while (true) {
-        if (m.lookup(name)) |e| {
-            if (e.cert) |ct| {
-                defer m.mutex.unlock(m.io);
-                return try copyMaterial(gpa, ct);
-            }
-            // Being obtained (first maintain, or another handshake's
-            // on-demand): an on-demand caller waits for it.
-            if (e.busy and m.options.on_demand != null) {
-                m.idle.waitUncancelable(m.io, &m.mutex);
-                continue;
-            }
-            if (!e.on_demand or m.now() < e.retry_at or e.busy) {
-                m.mutex.unlock(m.io);
-                return null;
-            }
-            // A failed on-demand name whose back-off is over: try again.
-            e.busy = true;
-            m.mutex.unlock(m.io);
-            return m.onDemandObtain(gpa, e);
+    while (m.lookup(name)) |e| {
+        if (e.cert) |ct| {
+            defer m.mutex.unlock(m.io);
+            return try copyMaterial(gpa, ct);
         }
-        break;
+        // Another handshake is obtaining this on-demand name: wait for
+        // that result. A `manage`d name's first issuance (which may take
+        // minutes) is not waited for — the handshake gets nothing.
+        if (e.busy and e.on_demand) {
+            m.idle.waitUncancelable(m.io, &m.mutex);
+            continue;
+        }
+        if (e.on_demand and !e.busy and t >= e.retry_at) {
+            // A failed on-demand name whose back-off is over: forget it and
+            // go through the policy and the rate limit like a new name.
+            m.dropEntryLocked(e);
+            break;
+        }
+        m.mutex.unlock(m.io);
+        return null;
     }
     m.mutex.unlock(m.io);
 
     const od = m.options.on_demand orelse return null;
-    if (!x509.isValidDomain(name)) return null;
     if (!od.allow(od.ctx, name)) return null;
 
     m.mutex.lockUncancelable(m.io);
-    const allowed = m.limiter.take(m.now(), od.rate);
+    const allowed = m.limiter.take(t, od.rate);
     m.mutex.unlock(m.io);
     if (!allowed) return null;
 
+    // Created busy (see `addEntry`): ours alone until onDemandObtain ends.
     const e = m.addEntry(&.{name}, true) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         // Another handshake added it meanwhile: serve (or wait for) that.
         error.AlreadyManaged => return m.certificate(gpa, name),
         error.InvalidName => return null,
     };
-    m.mutex.lockUncancelable(m.io);
-    if (e.busy) {
-        m.mutex.unlock(m.io);
-        return m.certificate(gpa, name);
-    }
-    e.busy = true;
-    m.mutex.unlock(m.io);
     return m.onDemandObtain(gpa, e);
 }
 
@@ -859,9 +947,16 @@ fn lookup(m: *Manager, name: []const u8) ?*Entry {
 /// flight (serve it when the ClientHello offers ALPN `acme-tls/1`), else
 /// null. With `distributed_challenges`, another node's challenge is found
 /// in storage. Caller frees.
-pub fn tlsAlpnMaterial(m: *Manager, gpa: Allocator, sni: []const u8) error{OutOfMemory}!?Client.TlsAlpnResponder.Material {
+pub fn tlsAlpnMaterial(m: *Manager, gpa: Allocator, sni_in: []const u8) error{OutOfMemory}!?Client.TlsAlpnResponder.Material {
+    var lower_buf: [253]u8 = undefined;
+    const trimmed = std.mem.trimEnd(u8, sni_in, ".");
+    if (trimmed.len == 0 or trimmed.len > lower_buf.len) return null;
+    const sni = std.ascii.lowerString(&lower_buf, trimmed);
     if (try m.tls_alpn.getMaterial(gpa, sni)) |mat| return mat;
     if (!m.options.distributed_challenges) return null;
+    // Every handshake can reach this: only a hostname (reverse names for IPs
+    // are hostnames too) costs a storage read.
+    if (!x509.isValidDomain(sni)) return null;
     var key_buf: [storage_mod.max_key_len]u8 = undefined;
     const key = std.fmt.bufPrint(&key_buf, "challenges/tls-alpn-01/{s}", .{sni}) catch return null;
     const blob = m.options.storage.load(gpa, key) catch |err| switch (err) {
@@ -925,6 +1020,10 @@ fn httpRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerror!voi
     }
     var loc_buf: [2048]u8 = undefined;
     const target = if (req.target.len > 0 and req.target[0] == '/') req.target else "/";
+    for (target) |ch| if (ch < 0x21 or ch > 0x7e) {
+        ctx.res.setStatus(400);
+        return;
+    };
     const location = std.fmt.bufPrint(&loc_buf, "https://{s}{s}", .{ host, target }) catch {
         ctx.res.setStatus(414);
         return;
@@ -952,7 +1051,10 @@ fn validRedirectHost(h: []const u8) bool {
 }
 
 fn httpKeyAuthorization(m: *Manager, token: []const u8, buf: []u8) error{OutOfMemory}!?[]const u8 {
-    if (token.len == 0 or std.mem.indexOfScalar(u8, token, '/') != null) return null;
+    // RFC 8555 §8.1: a token is base64url, at least 128 bits; anything else
+    // is not looked up (and never costs a storage read).
+    if (token.len == 0 or token.len > 256) return null;
+    for (token) |ch| if (!(std.ascii.isAlphanumeric(ch) or ch == '-' or ch == '_')) return null;
     if (m.http_tokens.lookup(token, buf)) |ka| return ka;
     if (!m.options.distributed_challenges) return null;
     var key_buf: [storage_mod.max_key_len]u8 = undefined;
@@ -1120,26 +1222,29 @@ fn leafCovers(leaf: []const u8, name: []const u8) bool {
 
 fn checkKey(gpa: Allocator, leaf: []const u8, key_pem: []const u8) CheckError!void {
     const spki = pkix.spkiOf(leaf) catch return error.MalformedChain;
-    if (std.mem.indexOf(u8, key_pem, "-----BEGIN RSA PRIVATE KEY-----") != null) {
-        const kp = try gpa.create(rsa.KeyPair);
-        defer {
-            std.crypto.secureZero(u8, std.mem.asBytes(kp));
-            gpa.destroy(kp);
-        }
-        x509.rsaPrivateKeyFromPem(kp, key_pem) catch return error.KeyMismatch;
-        const cert_pub = rsa.PublicKey.fromDer(spki.der) catch return error.KeyMismatch;
-        if (!rsaPublicEql(&cert_pub, &kp.public_key)) return error.KeyMismatch;
-        return;
-    }
+    if (std.mem.indexOf(u8, key_pem, "-----BEGIN RSA PRIVATE KEY-----") != null) return checkRsaKey(gpa, spki.der, key_pem);
     var pair: jws.AnyKeyPair = undefined;
     defer std.crypto.secureZero(u8, std.mem.asBytes(&pair));
     x509.privateKeyFromPem(&pair, gpa, key_pem) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => return error.KeyMismatch,
+        // A PKCS#8 `PRIVATE KEY` may hold an RSA key.
+        else => return checkRsaKey(gpa, spki.der, key_pem),
     };
     var sec1_buf: [jws.AnyPublicKey.max_sec1_len]u8 = undefined;
     const sec1 = pair.publicKey().uncompressedSec1(&sec1_buf);
     if (!std.mem.eql(u8, sec1, spki.key_bits)) return error.KeyMismatch;
+}
+
+/// `key_pem` (PKCS#1 or PKCS#8) is the RSA key of the SPKI `spki_der`.
+fn checkRsaKey(gpa: Allocator, spki_der: []const u8, key_pem: []const u8) CheckError!void {
+    const kp = try gpa.create(rsa.KeyPair);
+    defer {
+        std.crypto.secureZero(u8, std.mem.asBytes(kp));
+        gpa.destroy(kp);
+    }
+    x509.rsaPrivateKeyFromPem(kp, key_pem) catch return error.KeyMismatch;
+    const cert_pub = rsa.PublicKey.fromDer(spki_der) catch return error.KeyMismatch;
+    if (!rsaPublicEql(&cert_pub, &kp.public_key)) return error.KeyMismatch;
 }
 
 fn rsaPublicEql(a: *const rsa.PublicKey, b: *const rsa.PublicKey) bool {
