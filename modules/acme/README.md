@@ -177,6 +177,59 @@ A `503` is resent up to `Options.max_unavailable_retries` times (default 2) when
 `notBefore`/`notAfter` (`ObtainOptions.not_before`/`not_after`, epoch seconds) go on the order
 only when set — Let's Encrypt refuses orders that carry them.
 
+## The order flow step by step, and your own challenge solver
+
+`obtain` is these calls in a row; use them directly to resume an order after a
+restart (persist `order.url`), to solve an authorization by hand, or to give up
+one (`deactivateAuthorization`):
+
+```zig
+var order = try client.newOrder(&.{"example.org"}, .{}); // .replaces, .profile, .not_before, …
+defer order.deinit();                                     // persist order.url; later: client.fetchOrder(url)
+for (order.authorizations) |url| {
+    var authz = try client.fetchAuthorization(url);       // .identifier, .wildcard, .challenges
+    defer authz.deinit();
+    const ch = authz.challenge(.dns_01) orelse return error.NoDns01;
+    var buf: [acme.jws.max_key_authorization_len]u8 = undefined;
+    const key_auth = try client.keyAuthorization(&buf, ch.token);
+    // … publish the proof for key_auth yourself …
+    try client.acceptChallenge(ch.url);
+    try client.waitAuthorization(url);                    // or: client.solveAuthorization(url)
+}
+try client.waitOrder(&order, .ready);
+try client.finalize(&order, csr_der);
+try client.waitOrder(&order, .valid);
+var chain = try client.downloadChain(&order, null);       // or a preferred issuer CN
+defer chain.deinit(gpa);
+```
+
+A `Solver` (lego's provider, certmagic's solver) puts one challenge's proof in
+place and takes it away; one in `Options.solvers` replaces the built-in of its
+type (`challengeResponder`, `tlsAlpnResponder`, `dns_publisher`), for
+`obtain` and `solveAuthorization` alike. The `ChallengeRequest` it gets
+carries the identifier, the token and the key authorization, and derives the
+rest: `dnsRecordName`, `dnsTxtValue`, `tlsAlpnIdentifier`, `tlsAlpnSni`.
+
+```zig
+const MySolver = struct {
+    fn present(ctx: ?*anyopaque, req: *const acme.Client.ChallengeRequest) acme.Client.SolverError!void {
+        var name_buf: [acme.Client.dns01_max_name_len]u8 = undefined;
+        const value = req.dnsTxtValue();
+        // add TXT `value` at `req.dnsRecordName(&name_buf)`, wait for propagation;
+        // return error.SolverFailed to abort the authorization
+        _ = .{ ctx, &value };
+    }
+    fn cleanup(ctx: ?*anyopaque, req: *const acme.Client.ChallengeRequest) void {
+        _ = .{ ctx, req };
+    }
+};
+const solvers = [_]acme.Client.Solver{.{ .type = .dns_01, .present = MySolver.present, .cleanup = MySolver.cleanup }};
+var client = acme.Client.init(io, gpa, &http_client, &account_key, .{ .challenge_type = .dns_01, .solvers = &solvers });
+```
+
+A failing solver is `error.SolverFailed` (`error.DnsPublishFailed` for DNS-01);
+`cleanup` runs once for every `present` that succeeded.
+
 ## DNS-01 (RFC 8555 §8.4) and wildcard certificates
 
 For a host with no port the CA can reach, or for a wildcard, select

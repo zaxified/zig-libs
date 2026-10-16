@@ -242,6 +242,113 @@ fn replayLifecycle() !void {
     try testing.expectEqual(@as(usize, 0), replay.misses);
 }
 
+/// HTTP-01 through a caller's `Solver` over the client's own responder.
+const ReplaySolver = struct {
+    client: *acme.Client,
+    presents: u32 = 0,
+    cleanups: u32 = 0,
+
+    fn present(ctx: ?*anyopaque, req: *const acme.Client.ChallengeRequest) acme.Client.SolverError!void {
+        const s: *ReplaySolver = @ptrCast(@alignCast(ctx.?));
+        s.presents += 1;
+        try s.client.challengeResponder().set(req.token, req.key_authorization);
+    }
+
+    fn cleanup(ctx: ?*anyopaque, req: *const acme.Client.ChallengeRequest) void {
+        const s: *ReplaySolver = @ptrCast(@alignCast(ctx.?));
+        s.cleanups += 1;
+        s.client.challengeResponder().remove(req.token);
+    }
+};
+
+/// `tools/interop.zig`'s `steps` scenario on Pebble's recorded answers: the
+/// order API one call at a time, through a caller's `Solver`, and an
+/// authorization deactivated.
+fn replaySteps() !void {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    var replay: Replay = .{ .scenario = "steps" };
+    var server = http.Server.init(io, gpa, .{ .handler = handler, .context = &replay });
+    defer server.deinit();
+    server.bind() catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+    var base_buf: [64]u8 = undefined;
+    replay.base = try std.fmt.bufPrint(&base_buf, "http://127.0.0.1:{d}", .{server.boundAddress().getPort()});
+    var dir_buf: [80]u8 = undefined;
+    const dir_url = try std.fmt.bufPrint(&dir_buf, "{s}/dir", .{replay.base});
+    const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
+    defer thread.join();
+    defer server.shutdown();
+
+    var transport = http.Client.init(io, gpa, .{});
+    defer transport.deinit();
+    var account_key: acme.jws.KeyPair = undefined;
+    try acme.jws.Es256.KeyPair.generateDeterministicInto(&account_key, &@as([32]u8, @splat(0x70)));
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&account_key));
+    var rs: ReplaySolver = .{ .client = undefined };
+    const solvers = [_]acme.Client.Solver{.{ .ctx = &rs, .type = .http_01, .present = ReplaySolver.present, .cleanup = ReplaySolver.cleanup }};
+    var client = acme.Client.init(io, gpa, &transport, &account_key, .{
+        .directory_url = dir_url,
+        .eab = .{ .kid = "kid-interop", .hmac_key = "replay: the MAC is not checked" },
+        .solvers = &solvers,
+        .poll_interval_ms = 1,
+        .max_polls = 20,
+    });
+    defer client.deinit();
+    rs.client = &client;
+
+    var order = try client.newOrder(&.{"s.test"}, .{});
+    defer order.deinit();
+    try testing.expectEqual(acme.Client.Status.pending, order.status);
+    try testing.expectEqualStrings("s.test", order.identifiers[0]);
+    try testing.expect(order.expires != null);
+    var again = try client.fetchOrder(order.url);
+    defer again.deinit();
+    try testing.expectEqualStrings(order.authorizations[0], again.authorizations[0]);
+    var authz = try client.fetchAuthorization(order.authorizations[0]);
+    defer authz.deinit();
+    // Pebble 2.10 also offers dns-account-01 and dns-persist-01 (no token):
+    // listed, with no kind.
+    try testing.expectEqual(@as(usize, 5), authz.challenges.len);
+    var unknown: usize = 0;
+    for (authz.challenges) |ch| if (ch.kind == null) {
+        unknown += 1;
+    };
+    try testing.expectEqual(@as(usize, 2), unknown);
+    try testing.expect(authz.challenge(.http_01) != null);
+    try client.solveAuthorization(order.authorizations[0]);
+    try testing.expectEqual(@as(u32, 1), rs.presents);
+    try testing.expectEqual(@as(u32, 1), rs.cleanups);
+    try client.waitOrder(&order, .ready);
+    try testing.expectEqual(acme.Client.Status.ready, order.status);
+
+    var cert_key: acme.jws.KeyPair = undefined;
+    acme.jws.generateKeyPair(&cert_key, io);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&cert_key));
+    const csr = try acme.x509.csrDer(gpa, &cert_key, &.{"s.test"});
+    defer gpa.free(csr);
+    try client.finalize(&order, csr);
+    try testing.expectEqual(acme.Client.Status.processing, order.status);
+    try client.waitOrder(&order, .valid);
+    var chain = try client.downloadChain(&order, null);
+    defer chain.deinit(gpa);
+    try testing.expectEqualStrings(try recordedBody("steps", "/certZ/"), chain.chain_pem);
+
+    var other = try client.newOrder(&.{"d.test"}, .{});
+    defer other.deinit();
+    try client.deactivateAuthorization(other.authorizations[0]);
+    var gone = try client.fetchAuthorization(other.authorizations[0]);
+    defer gone.deinit();
+    try testing.expectEqual(acme.Client.Status.deactivated, gone.status);
+    try testing.expectEqual(@as(usize, 0), replay.misses);
+}
+
+test "Pebble replay: the order API step by step (custom solver, deactivated authorization)" {
+    try replaySteps();
+}
+
 test "Pebble replay: the account lifecycle (profile, ARI, revoke, rollover, alternate chain, deactivate)" {
     try replayLifecycle();
 }

@@ -523,7 +523,14 @@ pub fn dns01TxtValue(
     token: []const u8,
     public_key: anytype,
 ) KeyAuthorizationError![dns01_txt_len]u8 {
-    const digest = try acmeIdentifier(token, public_key);
+    var buf: [max_key_authorization_len]u8 = undefined;
+    return dns01TxtValueFromKeyAuthorization(try keyAuthorization(&buf, token, public_key));
+}
+
+/// `dns01TxtValue` from an already computed key authorization.
+// secret-api-ok: the key authorization is public by design (RFC 8555 §8.1); its digest is published as the TXT value.
+pub fn dns01TxtValueFromKeyAuthorization(key_auth: []const u8) [dns01_txt_len]u8 {
+    const digest = acmeIdentifierFromKeyAuthorization(key_auth);
     var out: [dns01_txt_len]u8 = undefined;
     _ = b64.Encoder.encode(&out, &digest);
     return out;

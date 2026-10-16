@@ -115,6 +115,15 @@ fn serveWrap(s: *http.Server) void {
 
 /// Each PEM certificate of `chain` signs the one before it, the last is
 /// signed by `root`, and the leaf names every domain.
+/// `verifyChain`, its error printed.
+fn chainOk(gpa: std.mem.Allocator, chain: []const u8, root_pem: []const u8, domains: []const []const u8, now: i64) bool {
+    verifyChain(gpa, chain, root_pem, domains, now) catch |err| {
+        std.debug.print("chain does not verify: {t}\n", .{err});
+        return false;
+    };
+    return true;
+}
+
 fn verifyChain(gpa: std.mem.Allocator, chain: []const u8, root_pem: []const u8, domains: []const []const u8, now: i64) !void {
     var ders: std.ArrayList([]u8) = .empty;
     defer {
@@ -169,11 +178,12 @@ const eab_key_b64 = "6t6Lq0SIHxWzWdIjFJ2jUnAnvT4h3JBqL7eMwRRqFNE";
 /// Pebble's `shortlived` profile in `pebble.sh`: 6 days.
 const shortlived_s = 518400;
 
-fn step(failures: *usize, name: []const u8, ok: bool, c: *acme.Client) void {
+fn step(scenario: []const u8, failures: *usize, name: []const u8, ok: bool, c: *acme.Client) void {
     if (!ok) failures.* += 1;
-    std.debug.print("lifecycle/{s}: {s}{s}{s}\n", .{
-        name,                                        if (ok) "OK" else "FAIL",
-        if (c.lastProblem() != null) " -- " else "", c.lastProblem() orelse "",
+    std.debug.print("{s}/{s}: {s}{s}{s}\n", .{
+        scenario,                  name,
+        if (ok) "OK" else "FAIL",  if (c.lastProblem() != null) " -- " else "",
+        c.lastProblem() orelse "",
     });
 }
 
@@ -208,11 +218,11 @@ fn lifecycle(
     const offered = try client.profiles();
     var has_short = false;
     for (offered) |pf| has_short = has_short or std.mem.eql(u8, pf.name, "shortlived");
-    step(&failures, "profiles-advertised", has_short, &client);
+    step("lifecycle", &failures, "profiles-advertised", has_short, &client);
     var first = try client.obtainWith(names, .{ .profile = "shortlived" });
     defer first.deinit(gpa);
     const life: i64 = @as(i64, @intCast(first.not_after)) - now;
-    step(&failures, "shortlived-issued", (verifyChain(gpa, first.chain_pem, root_pem, names, now) catch null) != null and
+    step("lifecycle", &failures, "shortlived-issued", chainOk(gpa, first.chain_pem, root_pem, names, std.Io.Clock.real.now(io).toSeconds()) and
         life > 0 and life <= shortlived_s + 3600, &client);
 
     // ARI for it, then the renewal that names it.
@@ -221,37 +231,37 @@ fn lifecycle(
     if (client.renewalInfo(first_der)) |info_const| {
         var info = info_const;
         defer info.deinit(gpa);
-        step(&failures, "renewal-info", info.window_start < info.window_end and
+        step("lifecycle", &failures, "renewal-info", info.window_start < info.window_end and
             info.window_end <= @as(i64, @intCast(first.not_after)), &client);
     } else |err| {
         std.debug.print("renewalInfo: {t}\n", .{err});
-        step(&failures, "renewal-info", false, &client);
+        step("lifecycle", &failures, "renewal-info", false, &client);
     }
     const cert_id = try acme.x509.ariCertId(gpa, first_der);
     defer gpa.free(cert_id);
     var second = try client.obtainWith(names, .{ .replaces = cert_id });
     defer second.deinit(gpa);
-    step(&failures, "renewal-replaces", (verifyChain(gpa, second.chain_pem, root_pem, names, now) catch null) != null, &client);
+    step("lifecycle", &failures, "renewal-replaces", chainOk(gpa, second.chain_pem, root_pem, names, std.Io.Clock.real.now(io).toSeconds()), &client);
 
     // Revocation: the replaced one by the account, the renewal by its own key.
-    step(&failures, "revoke-by-account", if (client.revoke(first_der, .superseded)) true else |_| false, &client);
+    step("lifecycle", &failures, "revoke-by-account", if (client.revoke(first_der, .superseded)) true else |_| false, &client);
     const second_der = try acme.x509.pemDecode(gpa, "CERTIFICATE", second.chain_pem);
     defer gpa.free(second_der);
     var cert_key: acme.jws.AnyKeyPair = undefined;
     try acme.x509.privateKeyFromPem(&cert_key, gpa, second.key_pem);
     defer std.crypto.secureZero(u8, std.mem.asBytes(&cert_key));
-    step(&failures, "revoke-by-cert-key", if (client.revokeWithCertKey(second_der, &cert_key, null)) true else |_| false, &client);
+    step("lifecycle", &failures, "revoke-by-cert-key", if (client.revokeWithCertKey(second_der, &cert_key, null)) true else |_| false, &client);
 
-    step(&failures, "update-contact", if (client.updateContact(&.{"mailto:other@acme.test"})) true else |_| false, &client);
+    step("lifecycle", &failures, "update-contact", if (client.updateContact(&.{"mailto:other@acme.test"})) true else |_| false, &client);
 
     // Rollover to ES384; the next order is signed with the new key.
     var new_key: acme.jws.Es384.KeyPair = undefined;
     try acme.jws.Es384.KeyPair.generateDeterministicInto(&new_key, &@as([48]u8, @splat(0x61)));
     defer std.crypto.secureZero(u8, std.mem.asBytes(&new_key));
-    step(&failures, "rollover-es384", if (client.rolloverKey(&new_key)) true else |_| false, &client);
+    step("lifecycle", &failures, "rollover-es384", if (client.rolloverKey(&new_key)) true else |_| false, &client);
     var third = try client.obtainWith(names, .{});
     defer third.deinit(gpa);
-    step(&failures, "order-after-rollover", (verifyChain(gpa, third.chain_pem, root_pem, names, now) catch null) != null, &client);
+    step("lifecycle", &failures, "order-after-rollover", chainOk(gpa, third.chain_pem, root_pem, names, std.Io.Clock.real.now(io).toSeconds()), &client);
 
     // The alternate chain up to Pebble's second root, picked by its CN.
     const alt_root_der = try acme.x509.pemDecode(gpa, "CERTIFICATE", alt_root_pem);
@@ -259,16 +269,100 @@ fn lifecycle(
     const alt_root = try (std.crypto.Certificate{ .buffer = alt_root_der, .index = 0 }).parse();
     var alt = try client.obtainWith(names, .{ .preferred_chain = alt_root.commonName() });
     defer alt.deinit(gpa);
-    step(&failures, "preferred-chain", (verifyChain(gpa, alt.chain_pem, alt_root_pem, names, now) catch null) != null, &client);
+    step("lifecycle", &failures, "preferred-chain", chainOk(gpa, alt.chain_pem, alt_root_pem, names, std.Io.Clock.real.now(io).toSeconds()), &client);
 
     // Deactivated: the CA must refuse the account afterwards.
-    step(&failures, "deactivate", if (client.deactivate()) true else |_| false, &client);
+    step("lifecycle", &failures, "deactivate", if (client.deactivate()) true else |_| false, &client);
     const refused = if (client.obtain(names)) |cert_const| blk: {
         var cert = cert_const;
         cert.deinit(gpa);
         break :blk false;
     } else |err| err == error.AcmeProblem;
-    step(&failures, "refused-after-deactivate", refused, &client);
+    step("lifecycle", &failures, "refused-after-deactivate", refused, &client);
+    return failures;
+}
+
+/// HTTP-01 through a caller's `Solver` (serving from the client's own
+/// responder, which the :5002 listener reads), counting its calls.
+const CountingSolver = struct {
+    presents: u32 = 0,
+    cleanups: u32 = 0,
+
+    fn solver(s: *CountingSolver) acme.Client.Solver {
+        return .{ .ctx = s, .type = .http_01, .present = present, .cleanup = cleanup };
+    }
+
+    fn present(ctx: ?*anyopaque, req: *const acme.Client.ChallengeRequest) acme.Client.SolverError!void {
+        const s: *CountingSolver = @ptrCast(@alignCast(ctx.?));
+        s.presents += 1;
+        try current.?.challengeResponder().set(req.token, req.key_authorization);
+    }
+
+    fn cleanup(ctx: ?*anyopaque, req: *const acme.Client.ChallengeRequest) void {
+        const s: *CountingSolver = @ptrCast(@alignCast(ctx.?));
+        s.cleanups += 1;
+        current.?.challengeResponder().remove(req.token);
+    }
+};
+
+/// The `steps` scenario: the order API one call at a time, HTTP-01 through a
+/// caller's `Solver`, and an authorization deactivated; returns the number
+/// of failed steps.
+fn orderSteps(gpa: std.mem.Allocator, io: std.Io, transport: *http.Client, eab_key: []const u8, root_pem: []const u8) !usize {
+    var failures: usize = 0;
+    var account_key: acme.jws.KeyPair = undefined;
+    try acme.jws.Es256.KeyPair.generateDeterministicInto(&account_key, &@as([32]u8, @splat(0x70)));
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&account_key));
+    var cs: CountingSolver = .{};
+    const solvers = [_]acme.Client.Solver{cs.solver()};
+    var client = acme.Client.init(io, gpa, transport, &account_key, .{
+        .directory_url = "https://localhost:14001/dir",
+        .eab = .{ .kid = eab_kid, .hmac_key = eab_key },
+        .solvers = &solvers,
+        .poll_interval_ms = 200,
+        .max_polls = 100,
+    });
+    defer client.deinit();
+    current = &client;
+    defer current = null;
+
+    var order = try client.newOrder(&.{"s.test"}, .{});
+    defer order.deinit();
+    step("steps", &failures, "new-order", order.status == .pending and order.authorizations.len == 1 and
+        order.identifiers.len == 1 and std.mem.eql(u8, order.identifiers[0], "s.test"), &client);
+    var again = try client.fetchOrder(order.url);
+    defer again.deinit();
+    step("steps", &failures, "fetch-order", std.mem.eql(u8, again.authorizations[0], order.authorizations[0]) and
+        std.mem.eql(u8, again.finalize, order.finalize), &client);
+    var authz = try client.fetchAuthorization(order.authorizations[0]);
+    defer authz.deinit();
+    step("steps", &failures, "authorization", authz.status == .pending and !authz.ip and
+        std.mem.eql(u8, authz.identifier, "s.test") and authz.challenge(.http_01) != null and
+        authz.challenge(.dns_01) != null and authz.challenge(.tls_alpn_01) != null, &client);
+    const solved = if (client.solveAuthorization(order.authorizations[0])) true else |_| false;
+    step("steps", &failures, "custom-solver", solved and cs.presents == 1 and cs.cleanups == 1, &client);
+    try client.waitOrder(&order, .ready);
+    step("steps", &failures, "order-ready", order.status == .ready, &client);
+
+    var cert_key: acme.jws.KeyPair = undefined;
+    acme.jws.generateKeyPair(&cert_key, io);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&cert_key));
+    const csr = try acme.x509.csrDer(gpa, &cert_key, &.{"s.test"});
+    defer gpa.free(csr);
+    try client.finalize(&order, csr);
+    try client.waitOrder(&order, .valid);
+    var chain = try client.downloadChain(&order, null);
+    defer chain.deinit(gpa);
+    const now = std.Io.Clock.real.now(io).toSeconds();
+    step("steps", &failures, "download-chain", order.status == .valid and
+        chainOk(gpa, chain.chain_pem, root_pem, &.{"s.test"}, now), &client);
+
+    var other = try client.newOrder(&.{"d.test"}, .{});
+    defer other.deinit();
+    step("steps", &failures, "deactivate-authorization", if (client.deactivateAuthorization(other.authorizations[0])) true else |_| false, &client);
+    var gone = try client.fetchAuthorization(other.authorizations[0]);
+    defer gone.deinit();
+    step("steps", &failures, "deactivated", gone.status == .deactivated, &client);
     return failures;
 }
 
@@ -411,9 +505,14 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         std.debug.print("lifecycle: aborted: {t}\n", .{err});
         break :blk 1;
     };
+    try mark(&transport, "steps");
+    const steps_failures = orderSteps(gpa, io, &transport, eab_key, root_pem) catch |err| blk: {
+        std.debug.print("steps: aborted: {t}\n", .{err});
+        break :blk 1;
+    };
     try mark(&transport, "");
-    std.debug.print("interop-acme: {d} of {d} scenarios as expected against Pebble, lifecycle {d} failed step(s)\n", .{
-        scenarios.len - failures, scenarios.len, lifecycle_failures,
+    std.debug.print("interop-acme: {d} of {d} scenarios as expected against Pebble, lifecycle {d} failed step(s), steps {d} failed step(s)\n", .{
+        scenarios.len - failures, scenarios.len, lifecycle_failures, steps_failures,
     });
-    return if (failures == 0 and lifecycle_failures == 0) 0 else 1;
+    return if (failures == 0 and lifecycle_failures == 0 and steps_failures == 0) 0 else 1;
 }

@@ -199,8 +199,12 @@ pub const Options = struct {
     /// `dns_01` requires `dns_publisher`.
     challenge_type: ChallengeType = .http_01,
     /// Publishes DNS-01 TXT records. Required for `challenge_type = .dns_01`
-    /// (`obtain` refuses with `error.DnsPublisherMissing` otherwise).
+    /// unless `solvers` has a DNS-01 one (`obtain` refuses with
+    /// `error.DnsPublisherMissing` otherwise).
     dns_publisher: ?DnsPublisher = null,
+    /// Caller-supplied challenge solvers (`Solver`); the first of a type
+    /// replaces the built-in solver of that type. Caller-owned.
+    solvers: []const Solver = &.{},
     /// Optional account contact URLs, e.g. "mailto:admin@example.org".
     contact: []const []const u8 = &.{},
     /// RFC 8555 §7.3: account creation asserts agreement with the CA's
@@ -238,8 +242,10 @@ pub const Error = error{
     /// An authorization ended in an error state (or offered no challenge of
     /// the configured type).
     AuthorizationFailed,
-    /// `Options.dns_publisher.present` returned false.
+    /// `Options.dns_publisher.present` (or a DNS-01 `Solver`) failed.
     DnsPublishFailed,
+    /// A `Solver` from `Options.solvers` failed to present its proof.
+    SolverFailed,
     /// `challenge_type = .dns_01` without an `Options.dns_publisher`.
     DnsPublisherMissing,
     /// The order ended `invalid`.
@@ -789,6 +795,12 @@ pub const Certificate = struct {
 /// ready before calling this: the HTTP-01 responder reachable on port 80, the
 /// TLS-ALPN-01 store wired into a listener on 443, or the DNS-01 publisher
 /// set. A wildcard (`*.example.org`) is accepted with `dns_01` only.
+///
+/// The same steps one by one, for a caller that needs them apart (an order
+/// resumed after a restart, a challenge type per authorization, a manual
+/// DNS step): `newOrder`, `solveAuthorization` (or `fetchAuthorization` +
+/// `acceptChallenge` + `waitAuthorization`), `waitOrder`, `finalize`,
+/// `downloadChain`.
 pub fn obtain(c: *Client, domains: []const []const u8) Error!Certificate {
     return c.obtainWith(domains, .{});
 }
@@ -797,10 +809,6 @@ pub fn obtain(c: *Client, domains: []const []const u8) Error!Certificate {
 /// profile, validity, a preferred chain. The certificate key follows
 /// `Options.cert_key_alg`.
 pub fn obtainWith(c: *Client, domains: []const []const u8, opts: ObtainOptions) Error!Certificate {
-    var arena = std.heap.ArenaAllocator.init(c.gpa);
-    defer arena.deinit();
-    const a = arena.allocator();
-
     // Refused before an order is placed (keygen comes after the authorizations).
     if (c.options.cert_key_alg == .rs256) switch (c.options.cert_rsa_bits) {
         2048, 3072, 4096 => {},
@@ -809,7 +817,8 @@ pub fn obtainWith(c: *Client, domains: []const []const u8, opts: ObtainOptions) 
             return error.UnsupportedKeySize;
         },
     };
-    const order = try c.orderReady(a, domains, opts);
+    var order = try c.orderReady(domains, opts);
+    defer order.deinit();
 
     // Finalize with a CSR for a fresh certificate key (§7.4; the account
     // key MUST NOT be reused as the certificate key — §11.1). `cert_key`
@@ -836,21 +845,21 @@ pub fn obtainWith(c: *Client, domains: []const []const u8, opts: ObtainOptions) 
         else => |alg| jws.generateAnyKeyPair(&cert_key, alg, c.io),
     }
     defer std.crypto.secureZero(u8, std.mem.asBytes(&cert_key));
-    const csr_der = x509.csrDerWith(a, &cert_key, domains, opts.csr_extensions) catch |err| switch (err) {
+    const csr_der = x509.csrDerWith(c.gpa, &cert_key, domains, opts.csr_extensions) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.InvalidDomain => return error.InvalidDomain,
         error.DuplicateExtension => return error.InvalidCsr,
         error.SigningFailed, error.ValueTooLarge => return error.SigningFailed,
     };
+    defer c.gpa.free(csr_der);
 
-    const chain = try c.finalizeAndDownload(a, order, csr_der, opts.preferred_chain);
-    const chain_pem = try c.gpa.dupe(u8, chain.pem);
-    errdefer c.gpa.free(chain_pem);
+    var chain = try c.finalizeAndDownload(&order, csr_der, opts.preferred_chain);
+    errdefer chain.deinit(c.gpa);
     const key_pem = if (rsa_pair) |kp|
         try x509.rsaPrivateKeyToPem(c.gpa, kp)
     else
         try x509.ecPrivateKeyToPem(c.gpa, &cert_key);
-    return .{ .chain_pem = chain_pem, .key_pem = key_pem, .not_after = chain.not_after };
+    return .{ .chain_pem = chain.chain_pem, .key_pem = key_pem, .not_after = chain.not_after };
 }
 
 /// A chain issued for a caller's CSR (`obtainWithCsr`): no key — the caller
@@ -894,16 +903,14 @@ pub fn obtainWithCsr(c: *Client, csr_der: []const u8, opts: ObtainOptions) Error
         var buf: [netaddr.max_ip_text_len]u8 = undefined;
         slot.* = try a.dupe(u8, netaddr.formatIp(ip, &buf));
     }
-    const order = try c.orderReady(a, names, opts);
-    const chain = try c.finalizeAndDownload(a, order, csr_der, opts.preferred_chain);
-    return .{ .chain_pem = try c.gpa.dupe(u8, chain.pem), .not_after = chain.not_after };
+    var order = try c.orderReady(names, opts);
+    defer order.deinit();
+    return c.finalizeAndDownload(&order, csr_der, opts.preferred_chain);
 }
 
-const ReadyOrder = struct { url: []const u8, finalize: []const u8 };
-
-/// Validate the identifiers, register, place the order and solve every
-/// authorization; returns once the order is `ready`. Memory from `a`.
-fn orderReady(c: *Client, a: Allocator, domains: []const []const u8, opts: ObtainOptions) Error!ReadyOrder {
+/// Validate the identifiers against the configured challenge, place the
+/// order and solve every authorization; returns once the order is `ready`.
+fn orderReady(c: *Client, domains: []const []const u8, opts: ObtainOptions) Error!Order {
     if (domains.len == 0) return error.InvalidDomain;
     for (domains) |name| {
         if (try ipIdentifier(name) != null) {
@@ -915,11 +922,132 @@ fn orderReady(c: *Client, a: Allocator, domains: []const []const u8, opts: Obtai
         if (c.options.challenge_type == .dns_01 and x509.isValidWildcardDomain(name)) continue;
         return error.InvalidDomain;
     }
-    if (c.options.challenge_type == .dns_01 and c.options.dns_publisher == null)
-        return error.DnsPublisherMissing;
+    if (c.solverFor(c.options.challenge_type) == null) return error.DnsPublisherMissing;
+
+    var order = try c.newOrder(domains, .{
+        .replaces = opts.replaces,
+        .profile = opts.profile,
+        .profile_mode = opts.profile_mode,
+        .not_before = opts.not_before,
+        .not_after = opts.not_after,
+    });
+    errdefer order.deinit();
+
+    // Authorizations (§7.5) — one round per identifier.
+    if (order.authorizations.len == 0) return error.MalformedResponse;
+    for (order.authorizations) |authz_url| try c.solveAuthorization(authz_url);
+
+    // All authorizations valid → the order becomes ready (it may have been
+    // ready immediately when every authorization was already valid). A
+    // pre-finalize `valid` would be a reused order whose certificate
+    // belongs to a key we never had — refuse it rather than hand back a
+    // chain that cannot match our fresh key.
+    try c.waitOrder(&order, .ready);
+    if (order.status == .valid) {
+        c.note("order already valid before finalize (reused order, no key)");
+        return error.OrderFailed;
+    }
+    return order;
+}
+
+fn finalizeAndDownload(c: *Client, order: *Order, csr_der: []const u8, preferred_chain: ?[]const u8) Error!IssuedChain {
+    try c.finalize(order, csr_der);
+    try c.waitOrder(order, .valid);
+    return c.downloadChain(order, preferred_chain);
+}
+
+// ── the order flow, step by step (instant-acme / lego-style handles) ────────
+
+/// Per-order knobs of `newOrder` (the order half of `ObtainOptions`).
+pub const OrderOptions = struct {
+    /// RFC 9773 §5: the ARI CertID of the certificate this order replaces.
+    replaces: ?[]const u8 = null,
+    /// A profile the CA advertises (`profiles`); see `ObtainOptions.profile`.
+    profile: ?[]const u8 = null,
+    profile_mode: ProfileMode = .required,
+    /// Requested validity, epoch seconds (RFC 8555 §7.4).
+    not_before: ?u64 = null,
+    not_after: ?u64 = null,
+};
+
+/// An order (RFC 8555 §7.1.3) as the CA last described it. Owns its memory;
+/// `waitOrder` and `finalize` refresh it in place.
+pub const Order = struct {
+    arena: std.heap.ArenaAllocator,
+    /// The order URL (newOrder's `Location`) — persist it to resume the
+    /// order later with `fetchOrder`.
+    url: []const u8,
+    status: Status,
+    /// The identifier values, as the CA lists them.
+    identifiers: []const []const u8,
+    /// Authorization URLs, one per identifier (`fetchAuthorization`,
+    /// `solveAuthorization`).
+    authorizations: []const []const u8,
+    finalize: []const u8,
+    /// Present once the order is `valid` (`downloadChain`).
+    certificate: ?[]const u8,
+    /// RFC 3339, as the CA sent it.
+    expires: ?[]const u8,
+
+    pub fn deinit(o: *Order) void {
+        o.arena.deinit();
+        o.* = undefined;
+    }
+};
+
+/// One challenge of an authorization (RFC 8555 §7.1.5).
+pub const Challenge = struct {
+    /// The CA's type string ("http-01", "dns-account-01", …).
+    type: []const u8,
+    /// `type` as a challenge this client can solve, else null.
+    kind: ?ChallengeType,
+    url: []const u8,
+    token: []const u8,
+    status: Status,
+};
+
+/// An authorization (RFC 8555 §7.1.4) as the CA last described it. Owns its
+/// memory.
+pub const Authorization = struct {
+    arena: std.heap.ArenaAllocator,
+    url: []const u8,
+    status: Status,
+    /// The identifier value: a domain (the base name for a wildcard) or an IP
+    /// literal (`ip`).
+    identifier: []const u8,
+    ip: bool,
+    /// §7.1.4: the authorization is for `*.<identifier>`.
+    wildcard: bool,
+    expires: ?[]const u8,
+    challenges: []const Challenge,
+
+    /// The first challenge of `kind`, or null when the CA does not offer it.
+    pub fn challenge(az: *const Authorization, kind: ChallengeType) ?Challenge {
+        for (az.challenges) |ch| if (ch.kind == kind) return ch;
+        return null;
+    }
+
+    pub fn deinit(az: *Authorization) void {
+        az.arena.deinit();
+        az.* = undefined;
+    }
+};
+
+/// Place an order (RFC 8555 §7.4) for `identifiers`: domains, wildcards
+/// (`*.example.org`) and IP literals in canonical form (RFC 8738).
+/// Registers the account on first use. Which identifiers a challenge can
+/// validate is checked by `solveAuthorization`, not here.
+pub fn newOrder(c: *Client, identifiers: []const []const u8, opts: OrderOptions) Error!Order {
+    if (identifiers.len == 0) return error.InvalidDomain;
+    for (identifiers) |name| {
+        if (try ipIdentifier(name) != null) continue;
+        if (!x509.isValidDomain(name) and !x509.isValidWildcardDomain(name)) return error.InvalidDomain;
+    }
     try c.register();
 
-    // newOrder (§7.4).
+    var arena = std.heap.ArenaAllocator.init(c.gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
     var out: std.Io.Writer.Allocating = .init(a);
     var js: std.json.Stringify = .{ .writer = &out.writer, .options = .{} };
     const profile: ?[]const u8 = if (opts.profile) |want| blk: {
@@ -934,7 +1062,7 @@ fn orderReady(c: *Client, a: Allocator, domains: []const []const u8, opts: Obtai
             .preferred => break :blk null,
         }
     } else null;
-    writeOrderPayload(&js, domains, .{
+    writeOrderPayload(&js, identifiers, .{
         .replaces = opts.replaces,
         .profile = profile,
         .not_before = opts.not_before,
@@ -943,38 +1071,63 @@ fn orderReady(c: *Client, a: Allocator, domains: []const []const u8, opts: Obtai
 
     const pr = try c.postJws(a, c.dir.?.new_order, out.written(), .kid);
     if (pr.status != 201) return c.problemError(pr.body, pr.retry_after_s);
-    const order_url = pr.location orelse return error.MalformedResponse;
-    const order = try parseOrder(a, pr.body);
-
-    // Authorizations (§7.5) — one round per identifier.
-    if (order.authorizations.len == 0) return error.MalformedResponse;
-    for (order.authorizations) |authz_url| try c.solveAuthorization(a, authz_url);
-
-    // All authorizations valid → the order becomes ready (it may have been
-    // ready immediately when every authorization was already valid). A
-    // pre-finalize `valid` would be a reused order whose certificate
-    // belongs to a key we never had — refuse it rather than hand back a
-    // chain that cannot match our fresh key.
-    const ready = try c.awaitOrder(a, order_url, &.{ .ready, .valid });
-    if (ready.status == .valid) {
-        c.note("order already valid before finalize (reused order, no key)");
-        return error.OrderFailed;
-    }
-    return .{ .url = order_url, .finalize = ready.finalize };
+    return loadOrder(c.gpa, pr.location orelse return error.MalformedResponse, pr.body);
 }
 
-const DownloadedChain = struct { pem: []const u8, not_after: u64 };
+/// The order at `url` (POST-as-GET, RFC 8555 §7.4) — resume an order whose
+/// URL was persisted.
+pub fn fetchOrder(c: *Client, url: []const u8) Error!Order {
+    try c.register();
+    var arena = std.heap.ArenaAllocator.init(c.gpa);
+    defer arena.deinit();
+    const pr = try c.postJws(arena.allocator(), url, "", .kid);
+    if (pr.status != 200) return c.problemError(pr.body, pr.retry_after_s);
+    return loadOrder(c.gpa, url, pr.body);
+}
 
-/// Finalize `order` with `csr_der`, wait for `valid`, download the chain —
-/// or, with `preferred_chain`, the first of the default and alternate chains
-/// whose topmost certificate's issuer CN matches. Memory from `a`.
-fn finalizeAndDownload(
-    c: *Client,
-    a: Allocator,
-    order: ReadyOrder,
-    csr_der: []const u8,
-    preferred_chain: ?[]const u8,
-) Error!DownloadedChain {
+/// Which state `waitOrder` waits for.
+pub const OrderTarget = enum {
+    /// Every authorization is valid: finalize next. A CA may skip to
+    /// `valid` (an order it had already finalized); `order.status` says.
+    ready,
+    /// Finalized and issued: `order.certificate` is set.
+    valid,
+};
+
+/// Poll `order` (pacing from `Retry-After`, else `Options.poll_interval_ms`;
+/// `Options.max_polls` tries) until it reaches `target`; refreshes `order`.
+/// `invalid` → `error.OrderFailed`.
+pub fn waitOrder(c: *Client, order: *Order, target: OrderTarget) Error!void {
+    var polls: u32 = 0;
+    var wait_ms: ?u64 = null;
+    while (polls < c.options.max_polls) : (polls += 1) {
+        if (wait_ms) |ms| try c.sleepMs(ms);
+        var arena = std.heap.ArenaAllocator.init(c.gpa);
+        defer arena.deinit();
+        const pr = try c.postJws(arena.allocator(), order.url, "", .kid);
+        if (pr.status != 200) return c.problemError(pr.body, pr.retry_after_s);
+        try replaceOrder(c.gpa, order, pr.body);
+        switch (order.status) {
+            .valid => return,
+            .ready => if (target == .ready) return,
+            .invalid => {
+                c.noteProblem(pr.body);
+                return error.OrderFailed;
+            },
+            .pending, .processing => {},
+            else => return error.MalformedResponse,
+        }
+        wait_ms = pr.retry_after_ms orelse c.options.poll_interval_ms;
+    }
+    return error.PollTimeout;
+}
+
+/// Finalize a `ready` order with `csr_der` (RFC 8555 §7.4) and refresh
+/// `order` from the CA's answer; `waitOrder(.valid)` next.
+pub fn finalize(c: *Client, order: *Order, csr_der: []const u8) Error!void {
+    var arena = std.heap.ArenaAllocator.init(c.gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
     const csr_b64 = try jws.base64UrlEncodeAlloc(a, csr_der);
     var fout: std.Io.Writer.Allocating = .init(a);
     var fjs: std.json.Stringify = .{ .writer = &fout.writer, .options = .{} };
@@ -982,10 +1135,20 @@ fn finalizeAndDownload(
 
     const fpr = try c.postJws(a, order.finalize, fout.written(), .kid);
     if (fpr.status != 200) return c.problemError(fpr.body, fpr.retry_after_s);
-    const done = try c.awaitOrder(a, order.url, &.{.valid});
-    const cert_url = done.certificate orelse return error.MalformedResponse;
+    try replaceOrder(c.gpa, order, fpr.body);
+}
 
-    // Download the chain (§7.4.2) — POST-as-GET, PEM body.
+/// Download the chain of a `valid` order (RFC 8555 §7.4.2) — or, with
+/// `preferred_chain`, the first of the default and alternate chains whose
+/// topmost certificate's issuer CN matches (no match: the default).
+pub fn downloadChain(c: *Client, order: *const Order, preferred_chain: ?[]const u8) Error!IssuedChain {
+    const cert_url = order.certificate orelse {
+        c.note("the order has no certificate yet (not valid)");
+        return error.MalformedResponse;
+    };
+    var arena = std.heap.ArenaAllocator.init(c.gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
     const cpr = try c.postJws(a, cert_url, "", .kid);
     if (cpr.status != 200) return c.problemError(cpr.body, cpr.retry_after_s);
     var pem: []const u8 = cpr.body;
@@ -1010,7 +1173,7 @@ fn finalizeAndDownload(
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.MalformedResponse,
     };
-    return .{ .pem = pem, .not_after = not_after };
+    return .{ .chain_pem = try c.gpa.dupe(u8, pem), .not_after = not_after };
 }
 
 /// Whether the issuer of the LAST certificate in `chain_pem` has the common
@@ -1025,6 +1188,307 @@ fn topIssuerIs(a: Allocator, chain_pem: []const u8, cn: []const u8) Error!bool {
     };
     const issuer_cn = x509.issuerCommonName(der_bytes) orelse return false;
     return std.mem.eql(u8, issuer_cn, cn);
+}
+
+/// The authorization at `url` (POST-as-GET, RFC 8555 §7.5).
+pub fn fetchAuthorization(c: *Client, url: []const u8) Error!Authorization {
+    try c.register();
+    var arena = std.heap.ArenaAllocator.init(c.gpa);
+    errdefer arena.deinit();
+    const a = arena.allocator();
+    const pr = try c.postJws(a, url, "", .kid);
+    if (pr.status != 200) return c.problemError(pr.body, pr.retry_after_s);
+    const info = try parseAuthz(a, pr.body);
+    return .{
+        .arena = arena,
+        .url = try a.dupe(u8, url),
+        .status = info.status,
+        .identifier = info.identifier,
+        .ip = info.ip,
+        .wildcard = info.wildcard,
+        .expires = info.expires,
+        .challenges = info.challenges,
+    };
+}
+
+/// The RFC 8555 §8.1 key authorization of `token` under the account key —
+/// what an HTTP-01 response carries, and what DNS-01 and TLS-ALPN-01 hash.
+pub fn keyAuthorization(c: *const Client, buf: *[jws.max_key_authorization_len]u8, token: []const u8) Error![]const u8 {
+    return jws.keyAuthorization(buf, token, c.account_key.publicKey()) catch error.MalformedResponse; // a non-token
+}
+
+/// Tell the CA the challenge at `url` is ready to be validated (POST `{}`,
+/// RFC 8555 §7.5.1). The proof must be in place first.
+pub fn acceptChallenge(c: *Client, url: []const u8) Error!void {
+    var arena = std.heap.ArenaAllocator.init(c.gpa);
+    defer arena.deinit();
+    const pr = try c.postJws(arena.allocator(), url, "{}", .kid);
+    if (pr.status != 200) return c.problemError(pr.body, pr.retry_after_s);
+}
+
+/// Poll the authorization at `url` until it is `valid`; `invalid` (or any
+/// other final state) → `error.AuthorizationFailed` with the challenge's
+/// error in `lastProblem`.
+pub fn waitAuthorization(c: *Client, url: []const u8) Error!void {
+    var polls: u32 = 0;
+    var wait_ms: ?u64 = null; // no wait before the first re-check
+    while (polls < c.options.max_polls) : (polls += 1) {
+        if (wait_ms) |ms| try c.sleepMs(ms);
+        var arena = std.heap.ArenaAllocator.init(c.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const ppr = try c.postJws(a, url, "", .kid);
+        if (ppr.status != 200) return c.problemError(ppr.body, ppr.retry_after_s);
+        const state = try parseAuthz(a, ppr.body);
+        switch (state.status) {
+            .valid => return,
+            .pending, .processing => wait_ms = ppr.retry_after_ms orelse c.options.poll_interval_ms,
+            else => {
+                c.noteAuthzProblem(ppr.body);
+                return error.AuthorizationFailed;
+            },
+        }
+    }
+    return error.PollTimeout;
+}
+
+/// Give up an authorization (RFC 8555 §7.5.2: POST `{"status":"deactivated"}`)
+/// — e.g. one for a name the caller no longer controls, so it cannot be
+/// reused by a later order.
+pub fn deactivateAuthorization(c: *Client, url: []const u8) Error!void {
+    var arena = std.heap.ArenaAllocator.init(c.gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const pr = try c.postJws(a, url, "{\"status\":\"deactivated\"}", .kid);
+    if (pr.status != 200) return c.problemError(pr.body, pr.retry_after_s);
+    const state = try parseAuthz(a, pr.body);
+    if (state.status != .deactivated) return error.MalformedResponse;
+}
+
+/// One authorization the way `obtain` does it: fetch it, present the proof
+/// for `Options.challenge_type` through its `Solver` (`Options.solvers`, else
+/// the built-in one), accept the challenge, wait for `valid`, clean up.
+/// An already-valid authorization is accepted as-is.
+pub fn solveAuthorization(c: *Client, url: []const u8) Error!void {
+    var authz = try c.fetchAuthorization(url);
+    defer authz.deinit();
+    switch (authz.status) {
+        .valid => return,
+        .pending => {},
+        else => {
+            c.note("authorization is neither pending nor valid");
+            return error.AuthorizationFailed;
+        },
+    }
+    const kind = c.options.challenge_type;
+    const ch = authz.challenge(kind) orelse {
+        c.note(switch (kind) {
+            .http_01 => "authorization offers no http-01 challenge",
+            .tls_alpn_01 => "authorization offers no tls-alpn-01 challenge",
+            .dns_01 => "authorization offers no dns-01 challenge",
+        });
+        return error.AuthorizationFailed;
+    };
+    switch (kind) {
+        .http_01 => {},
+        // RFC 8738 §6: an IP goes under its reverse name; else a host name.
+        .tls_alpn_01 => if (!authz.ip and !x509.isValidDomain(authz.identifier)) return error.MalformedResponse,
+        // The identifier is the base name even for a wildcard order (§7.1.4:
+        // `wildcard: true` rides beside it); an IP never goes over DNS.
+        .dns_01 => if (authz.ip or !x509.isValidDomain(authz.identifier)) return error.MalformedResponse,
+    }
+    if (authz.ip and netaddr.parseIp(authz.identifier) == null) return error.MalformedResponse;
+    var ka_buf: [jws.max_key_authorization_len]u8 = undefined;
+    const req: ChallengeRequest = .{
+        .type = kind,
+        .identifier = authz.identifier,
+        .ip = authz.ip,
+        .wildcard = authz.wildcard,
+        .token = ch.token,
+        .key_authorization = try c.keyAuthorization(&ka_buf, ch.token),
+    };
+    const solver = c.solverFor(kind) orelse return error.DnsPublisherMissing;
+    solver.present(solver.ctx, &req) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.SolverFailed => {
+            c.note(if (kind == .dns_01) "DNS-01 TXT record was not published" else "the challenge solver failed to present the proof");
+            return if (kind == .dns_01) error.DnsPublishFailed else error.SolverFailed;
+        },
+    };
+    defer solver.cleanup(solver.ctx, &req);
+    try c.acceptChallenge(ch.url);
+    try c.waitAuthorization(url);
+}
+
+// ── challenge solvers ───────────────────────────────────────────────────────
+
+/// What a `Solver` must put in place for one challenge.
+pub const ChallengeRequest = struct {
+    type: ChallengeType,
+    /// The authorization's identifier: a domain (the base name for a
+    /// wildcard) or, when `ip`, an IP literal.
+    identifier: []const u8,
+    ip: bool,
+    wildcard: bool,
+    token: []const u8,
+    /// RFC 8555 §8.1 `token "." base64url(JWK thumbprint)`. HTTP-01 serves it
+    /// verbatim at `/.well-known/acme-challenge/<token>`.
+    key_authorization: []const u8,
+
+    /// DNS-01: the TXT record name, `_acme-challenge.<identifier>`.
+    pub fn dnsRecordName(r: *const ChallengeRequest, buf: *[dns01_max_name_len]u8) []const u8 {
+        return dns01RecordName(buf, r.identifier);
+    }
+
+    /// DNS-01: the TXT value, base64url(SHA-256(key authorization)).
+    pub fn dnsTxtValue(r: *const ChallengeRequest) [jws.dns01_txt_len]u8 {
+        return jws.dns01TxtValueFromKeyAuthorization(r.key_authorization);
+    }
+
+    /// TLS-ALPN-01: the acmeIdentifier extension value, SHA-256(key
+    /// authorization) (RFC 8737 §3).
+    pub fn tlsAlpnIdentifier(r: *const ChallengeRequest) [32]u8 {
+        return jws.acmeIdentifierFromKeyAuthorization(r.key_authorization);
+    }
+
+    /// TLS-ALPN-01: the SNI the CA sends — the domain, or an IP's reverse
+    /// name (RFC 8738 §6).
+    pub fn tlsAlpnSni(r: *const ChallengeRequest, buf: *[max_reverse_name_len]u8) []const u8 {
+        if (r.ip) if (netaddr.parseIp(r.identifier)) |addr| return reverseName(buf, addr);
+        return r.identifier;
+    }
+};
+
+pub const SolverError = error{ OutOfMemory, SolverFailed };
+
+/// A challenge solver (lego's provider, certmagic's `acmez.Solver`): put the
+/// proof in place, and take it away again. The three built-ins
+/// (`challengeResponder`, `tlsAlpnResponder`, `Options.dns_publisher`) are
+/// solvers too; one in `Options.solvers` replaces the built-in of its type.
+pub const Solver = struct {
+    ctx: ?*anyopaque = null,
+    type: ChallengeType,
+    /// Make the proof visible to the CA and return once it is (for DNS-01:
+    /// after propagation). `error.SolverFailed` aborts the authorization
+    /// (`error.SolverFailed`, `error.DnsPublishFailed` for DNS-01).
+    present: *const fn (ctx: ?*anyopaque, req: *const ChallengeRequest) SolverError!void,
+    /// Called once for every `present` that succeeded, whatever the outcome.
+    cleanup: *const fn (ctx: ?*anyopaque, req: *const ChallengeRequest) void,
+};
+
+/// The solver `solveAuthorization` uses for `kind`: the caller's from
+/// `Options.solvers`, else the built-in (null: DNS-01 without a publisher).
+fn solverFor(c: *Client, kind: ChallengeType) ?Solver {
+    for (c.options.solvers) |s| if (s.type == kind) return s;
+    return switch (kind) {
+        .http_01 => .{ .ctx = c, .type = .http_01, .present = presentHttp01, .cleanup = cleanupHttp01 },
+        .tls_alpn_01 => .{ .ctx = c, .type = .tls_alpn_01, .present = presentTlsAlpn01, .cleanup = cleanupTlsAlpn01 },
+        .dns_01 => if (c.options.dns_publisher == null) null else .{ .ctx = c, .type = .dns_01, .present = presentDns01, .cleanup = cleanupDns01 },
+    };
+}
+
+fn clientOf(ctx: ?*anyopaque) *Client {
+    return @ptrCast(@alignCast(ctx.?));
+}
+
+fn presentHttp01(ctx: ?*anyopaque, req: *const ChallengeRequest) SolverError!void {
+    try clientOf(ctx).responder.set(req.token, req.key_authorization);
+}
+
+fn cleanupHttp01(ctx: ?*anyopaque, req: *const ChallengeRequest) void {
+    clientOf(ctx).responder.remove(req.token);
+}
+
+fn presentDns01(ctx: ?*anyopaque, req: *const ChallengeRequest) SolverError!void {
+    const publisher = clientOf(ctx).options.dns_publisher.?;
+    var name_buf: [dns01_max_name_len]u8 = undefined;
+    const value = req.dnsTxtValue();
+    if (!publisher.present(publisher.ctx, req.dnsRecordName(&name_buf), &value)) return error.SolverFailed;
+}
+
+fn cleanupDns01(ctx: ?*anyopaque, req: *const ChallengeRequest) void {
+    const publisher = clientOf(ctx).options.dns_publisher.?;
+    var name_buf: [dns01_max_name_len]u8 = undefined;
+    const value = req.dnsTxtValue();
+    publisher.cleanup(publisher.ctx, req.dnsRecordName(&name_buf), &value);
+}
+
+/// Build the RFC 8737 validation certificate for the identifier and publish
+/// it in the TLS-ALPN store under the SNI the CA sends (the caller's TLS
+/// listener serves it under ALPN `acme-tls/1`). The fresh leaf key is
+/// transient scratch — only its PEM copy is stored, so the raw KeyPair is
+/// wiped at scope exit.
+fn presentTlsAlpn01(ctx: ?*anyopaque, req: *const ChallengeRequest) SolverError!void {
+    const c = clientOf(ctx);
+    const acme_id = req.tlsAlpnIdentifier();
+    // Short-lived and never published, but it still signs a certificate a
+    // TLS client is about to accept — same draw as the issuance key.
+    var cert_key: jws.KeyPair = undefined;
+    jws.generateKeyPair(&cert_key, c.io);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&cert_key));
+
+    // Deterministic positive, minimal serial derived from the identifier.
+    var serial: [16]u8 = acme_id[0..16].*;
+    serial[0] = (serial[0] & 0x7f) | 0x01;
+
+    const cert_der = x509.tlsAlpnCertDer(
+        c.gpa,
+        &cert_key,
+        req.identifier,
+        acme_id,
+        &serial,
+        x509.tls_alpn_not_before,
+        x509.tls_alpn_not_after,
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        // The identifier was checked before; a signing failure is
+        // astronomically rare.
+        error.InvalidDomain, error.SigningFailed, error.ValueTooLarge => return error.SolverFailed,
+    };
+    defer c.gpa.free(cert_der);
+    const key_pem = try x509.ecPrivateKeyToPem(c.gpa, &cert_key);
+    defer {
+        std.crypto.secureZero(u8, key_pem);
+        c.gpa.free(key_pem);
+    }
+    var sni_buf: [max_reverse_name_len]u8 = undefined;
+    try c.tls_alpn.set(req.tlsAlpnSni(&sni_buf), cert_der, key_pem);
+}
+
+fn cleanupTlsAlpn01(ctx: ?*anyopaque, req: *const ChallengeRequest) void {
+    var sni_buf: [max_reverse_name_len]u8 = undefined;
+    clientOf(ctx).tls_alpn.remove(req.tlsAlpnSni(&sni_buf));
+}
+
+/// Longest reverse-DNS name: 32 nibble labels of an IPv6 address + "ip6.arpa".
+pub const max_reverse_name_len = 32 * 2 + "ip6.arpa".len;
+
+/// The reverse-DNS name of `ip` (RFC 1035 §3.5 `in-addr.arpa`, RFC 3596 §2.5
+/// `ip6.arpa`) — the SNI a CA sends for an IP's TLS-ALPN-01 (RFC 8738 §6).
+fn reverseName(buf: *[max_reverse_name_len]u8, ip: netaddr.Ip) []const u8 {
+    var w: std.Io.Writer = .fixed(buf);
+    switch (ip) {
+        .v4 => |q| w.print("{d}.{d}.{d}.{d}.in-addr.arpa", .{ q[3], q[2], q[1], q[0] }) catch unreachable,
+        .v6 => |b| {
+            var i: usize = 16;
+            while (i > 0) {
+                i -= 1;
+                w.print("{x}.{x}.", .{ b[i] & 0xf, b[i] >> 4 }) catch unreachable;
+            }
+            w.writeAll("ip6.arpa") catch unreachable;
+        },
+    }
+    return w.buffered();
+}
+
+/// RFC 8738 §3: an IP identifier's value is the canonical textual form
+/// (dotted quad; RFC 5952 for IPv6). Null when `name` is not an IP literal;
+/// `error.InvalidDomain` when it is one in another spelling.
+fn ipIdentifier(name: []const u8) error{InvalidDomain}!?netaddr.Ip {
+    const ip = netaddr.parseIp(name) orelse return null;
+    var buf: [netaddr.max_ip_text_len]u8 = undefined;
+    if (!std.mem.eql(u8, netaddr.formatIp(ip, &buf), name)) return error.InvalidDomain;
+    return ip;
 }
 
 const OrderExtras = struct {
@@ -1074,203 +1538,36 @@ fn writeFinalizePayload(js: *std.json.Stringify, csr_b64: []const u8) !void {
     try js.endObject();
 }
 
-/// One authorization: fetch it, publish the proof for the configured
-/// challenge type, trigger it, and poll to `valid`. Already-valid
-/// authorizations are accepted as-is.
-fn solveAuthorization(c: *Client, a: Allocator, authz_url: []const u8) Error!void {
-    const pr = try c.postJws(a, authz_url, "", .kid);
-    if (pr.status != 200) {
-        return c.problemError(pr.body, pr.retry_after_s);
-    }
-    const authz = try parseAuthz(a, pr.body);
-    switch (authz.status) {
-        .valid => return,
-        .pending => {},
-        else => {
-            c.noteAuthzProblem(pr.body);
-            return error.AuthorizationFailed;
-        },
-    }
-
-    switch (c.options.challenge_type) {
-        .http_01 => {
-            const challenge = authz.http01 orelse {
-                c.note("authorization offers no http-01 challenge");
-                return error.AuthorizationFailed;
-            };
-            // Publish the key authorization (§8.3), then trigger + poll.
-            var ka_buf: [jws.max_key_authorization_len]u8 = undefined;
-            const key_auth = jws.keyAuthorization(&ka_buf, challenge.token, c.account_key.publicKey()) catch
-                return error.MalformedResponse; // CA sent a non-token
-            try c.responder.set(challenge.token, key_auth);
-            defer c.responder.remove(challenge.token);
-            try c.notifyAndPoll(a, challenge.url, authz_url);
-        },
-        .tls_alpn_01 => {
-            const challenge = authz.tls_alpn01 orelse {
-                c.note("authorization offers no tls-alpn-01 challenge");
-                return error.AuthorizationFailed;
-            };
-            // RFC 8738 §6: for an IP the CA sends the reverse-DNS name as
-            // SNI, and the validation certificate names the IP itself.
-            var rev_buf: [max_reverse_name_len]u8 = undefined;
-            const sni = if (netaddr.parseIp(authz.identifier)) |ip|
-                reverseName(&rev_buf, ip)
-            else if (x509.isValidDomain(authz.identifier))
-                authz.identifier
-            else
-                return error.MalformedResponse;
-            try c.publishTlsAlpn01(a, authz.identifier, sni, challenge.token);
-            defer c.tls_alpn.remove(sni);
-            try c.notifyAndPoll(a, challenge.url, authz_url);
-        },
-        .dns_01 => {
-            const challenge = authz.dns01 orelse {
-                c.note("authorization offers no dns-01 challenge");
-                return error.AuthorizationFailed;
-            };
-            // The identifier is the base name even for a wildcard order
-            // (§7.1.4: `wildcard: true` rides beside it); a CA that sends
-            // anything else is not following the RFC.
-            if (!x509.isValidDomain(authz.identifier)) return error.MalformedResponse;
-            const value = jws.dns01TxtValue(challenge.token, c.account_key.publicKey()) catch
-                return error.MalformedResponse; // CA sent a non-token
-            var name_buf: [dns01_max_name_len]u8 = undefined;
-            const name = dns01RecordName(&name_buf, authz.identifier);
-            const publisher = c.options.dns_publisher orelse return error.DnsPublisherMissing;
-            if (!publisher.present(publisher.ctx, name, &value)) {
-                c.note("DNS-01 TXT record was not published");
-                return error.DnsPublishFailed;
-            }
-            defer publisher.cleanup(publisher.ctx, name, &value);
-            try c.notifyAndPoll(a, challenge.url, authz_url);
-        },
-    }
-}
-
-/// Build the RFC 8737 validation certificate for `domain` and publish it in
-/// the TLS-ALPN store keyed by the domain (the caller's TLS listener serves
-/// it under ALPN `acme-tls/1`). The fresh leaf key is transient scratch —
-/// only its PEM copy is stored, so the raw KeyPair is wiped at scope exit.
-fn publishTlsAlpn01(c: *Client, a: Allocator, domain: []const u8, sni: []const u8, token: []const u8) Error!void {
-    const acme_id = jws.acmeIdentifier(token, c.account_key.publicKey()) catch
-        return error.MalformedResponse; // CA sent a non-token
-    // Short-lived and never published, but it still signs a certificate a
-    // TLS client is about to accept — same draw as the issuance key above.
-    var cert_key: jws.KeyPair = undefined;
-    jws.generateKeyPair(&cert_key, c.io);
-    defer std.crypto.secureZero(u8, std.mem.asBytes(&cert_key));
-
-    // Deterministic positive, minimal serial derived from the identifier.
-    var serial: [16]u8 = acme_id[0..16].*;
-    serial[0] = (serial[0] & 0x7f) | 0x01;
-
-    const cert_der = x509.tlsAlpnCertDer(
-        a,
-        &cert_key,
-        domain,
-        acme_id,
-        &serial,
-        x509.tls_alpn_not_before,
-        x509.tls_alpn_not_after,
-    ) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.InvalidDomain => return error.InvalidDomain,
-        error.SigningFailed, error.ValueTooLarge => return error.SigningFailed,
+/// An `Order` owning a parse of `body`, at `url`.
+fn loadOrder(gpa: Allocator, url: []const u8, body: []const u8) Error!Order {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    errdefer arena.deinit();
+    const a = arena.allocator();
+    // `parseOrder`'s strings may point into the body it parsed: keep a copy.
+    const info = try parseOrder(a, try a.dupe(u8, body));
+    return .{
+        .arena = arena,
+        .url = try a.dupe(u8, url),
+        .status = info.status,
+        .identifiers = info.identifiers,
+        .authorizations = info.authorizations,
+        .finalize = info.finalize,
+        .certificate = info.certificate,
+        .expires = info.expires,
     };
-    const key_pem = x509.ecPrivateKeyToPem(a, &cert_key) catch return error.OutOfMemory;
-    try c.tls_alpn.set(sni, cert_der, key_pem);
 }
 
-/// Longest reverse-DNS name: 32 nibble labels of an IPv6 address + "ip6.arpa".
-const max_reverse_name_len = 32 * 2 + "ip6.arpa".len;
-
-/// The reverse-DNS name of `ip` (RFC 1035 §3.5 `in-addr.arpa`, RFC 3596 §2.5
-/// `ip6.arpa`) — the SNI a CA sends for an IP's TLS-ALPN-01 (RFC 8738 §6).
-fn reverseName(buf: *[max_reverse_name_len]u8, ip: netaddr.Ip) []const u8 {
-    var w: std.Io.Writer = .fixed(buf);
-    switch (ip) {
-        .v4 => |q| w.print("{d}.{d}.{d}.{d}.in-addr.arpa", .{ q[3], q[2], q[1], q[0] }) catch unreachable,
-        .v6 => |b| {
-            var i: usize = 16;
-            while (i > 0) {
-                i -= 1;
-                w.print("{x}.{x}.", .{ b[i] & 0xf, b[i] >> 4 }) catch unreachable;
-            }
-            w.writeAll("ip6.arpa") catch unreachable;
-        },
-    }
-    return w.buffered();
-}
-
-/// RFC 8738 §3: an IP identifier's value is the canonical textual form
-/// (dotted quad; RFC 5952 for IPv6). Null when `name` is not an IP literal;
-/// `error.InvalidDomain` when it is one in another spelling.
-fn ipIdentifier(name: []const u8) error{InvalidDomain}!?netaddr.Ip {
-    const ip = netaddr.parseIp(name) orelse return null;
-    var buf: [netaddr.max_ip_text_len]u8 = undefined;
-    if (!std.mem.eql(u8, netaddr.formatIp(ip, &buf), name)) return error.InvalidDomain;
-    return ip;
-}
-
-/// Trigger the challenge (POST `{}` to `challenge_url`, §7.5.1) and poll the
-/// authorization to `valid` — shared by HTTP-01 and TLS-ALPN-01.
-fn notifyAndPoll(c: *Client, a: Allocator, challenge_url: []const u8, authz_url: []const u8) Error!void {
-    const tpr = try c.postJws(a, challenge_url, "{}", .kid);
-    if (tpr.status != 200) {
-        return c.problemError(tpr.body, tpr.retry_after_s);
-    }
-
-    var polls: u32 = 0;
-    var wait_ms: ?u64 = null; // no wait before the first re-check
-    while (polls < c.options.max_polls) : (polls += 1) {
-        if (wait_ms) |ms| try c.sleepMs(ms);
-        const ppr = try c.postJws(a, authz_url, "", .kid);
-        if (ppr.status != 200) {
-            return c.problemError(ppr.body, ppr.retry_after_s);
-        }
-        const state = try parseAuthz(a, ppr.body);
-        switch (state.status) {
-            .valid => return,
-            .pending, .processing => wait_ms = ppr.retry_after_ms orelse c.options.poll_interval_ms,
-            else => {
-                c.noteAuthzProblem(ppr.body);
-                return error.AuthorizationFailed;
-            },
-        }
-    }
-    return error.PollTimeout;
-}
-
-/// Poll the order URL until its status is one of `targets` (or `invalid` →
-/// `error.OrderFailed`).
-fn awaitOrder(c: *Client, a: Allocator, order_url: []const u8, targets: []const Status) Error!OrderInfo {
-    var polls: u32 = 0;
-    var wait_ms: ?u64 = null;
-    while (polls < c.options.max_polls) : (polls += 1) {
-        if (wait_ms) |ms| try c.sleepMs(ms);
-        const pr = try c.postJws(a, order_url, "", .kid);
-        if (pr.status != 200) {
-            return c.problemError(pr.body, pr.retry_after_s);
-        }
-        const order = try parseOrder(a, pr.body);
-        if (std.mem.indexOfScalar(Status, targets, order.status) != null) return order;
-        switch (order.status) {
-            .invalid => {
-                c.noteProblem(pr.body);
-                return error.OrderFailed;
-            },
-            .pending, .ready, .processing => wait_ms = pr.retry_after_ms orelse c.options.poll_interval_ms,
-            else => return error.MalformedResponse,
-        }
-    }
-    return error.PollTimeout;
+/// Refresh `order` from `body`; on error `order` is unchanged.
+fn replaceOrder(gpa: Allocator, order: *Order, body: []const u8) Error!void {
+    const fresh = try loadOrder(gpa, order.url, body);
+    order.deinit();
+    order.* = fresh;
 }
 
 // ── ACME JSON vocabulary ────────────────────────────────────────────────────
 
 /// RFC 8555 §7.1.6 resource states (orders, authorizations, challenges).
-const Status = enum { pending, processing, ready, valid, invalid, deactivated, expired, revoked, unknown };
+pub const Status = enum { pending, processing, ready, valid, invalid, deactivated, expired, revoked, unknown };
 
 fn statusFromString(s: []const u8) Status {
     return std.meta.stringToEnum(Status, s) orelse .unknown;
@@ -1281,6 +1578,8 @@ const OrderInfo = struct {
     finalize: []const u8,
     certificate: ?[]const u8,
     authorizations: []const []const u8,
+    identifiers: []const []const u8,
+    expires: ?[]const u8,
 };
 
 fn parseOrder(a: Allocator, body: []const u8) Error!OrderInfo {
@@ -1289,6 +1588,8 @@ fn parseOrder(a: Allocator, body: []const u8) Error!OrderInfo {
         authorizations: []const []const u8 = &.{},
         finalize: []const u8 = "",
         certificate: ?[]const u8 = null,
+        identifiers: []const struct { type: []const u8 = "", value: []const u8 = "" } = &.{},
+        expires: ?[]const u8 = null,
     };
     const parsed = std.json.parseFromSliceLeaky(OrderJson, a, body, .{
         .ignore_unknown_fields = true,
@@ -1301,6 +1602,12 @@ fn parseOrder(a: Allocator, body: []const u8) Error!OrderInfo {
         .finalize = parsed.finalize,
         .certificate = parsed.certificate,
         .authorizations = parsed.authorizations,
+        .identifiers = ids: {
+            const ids = try a.alloc([]const u8, parsed.identifiers.len);
+            for (ids, parsed.identifiers) |*d, id| d.* = id.value;
+            break :ids ids;
+        },
+        .expires = parsed.expires,
     };
 }
 
@@ -1309,8 +1616,13 @@ const AuthzInfo = struct {
     /// The authorization's dNS identifier value (the domain) — the SAN and
     /// SNI key for the TLS-ALPN-01 validation certificate.
     identifier: []const u8,
+    /// The identifier's type is "ip" (RFC 8738).
+    ip: bool,
     /// §7.1.4: the authorization is for `*.<identifier>`.
     wildcard: bool,
+    expires: ?[]const u8,
+    /// Every challenge offered, in the CA's order.
+    challenges: []const Challenge,
     http01: ?ChallengeInfo,
     tls_alpn01: ?ChallengeInfo,
     dns01: ?ChallengeInfo,
@@ -1326,6 +1638,7 @@ fn parseAuthz(a: Allocator, body: []const u8) Error!AuthzInfo {
         status: []const u8 = "",
         identifier: IdentifierJson = .{},
         wildcard: bool = false,
+        expires: ?[]const u8 = null,
         challenges: []const ChallengeJson = &.{},
 
         const IdentifierJson = struct {
@@ -1348,6 +1661,14 @@ fn parseAuthz(a: Allocator, body: []const u8) Error!AuthzInfo {
     var http01: ?ChallengeInfo = null;
     var tls_alpn01: ?ChallengeInfo = null;
     var dns01: ?ChallengeInfo = null;
+    const all = try a.alloc(Challenge, parsed.challenges.len);
+    for (all, parsed.challenges) |*d, ch| d.* = .{
+        .type = ch.type,
+        .kind = challengeKind(ch.type),
+        .url = ch.url,
+        .token = ch.token,
+        .status = statusFromString(ch.status),
+    };
     for (parsed.challenges) |ch| {
         if (http01 == null and std.mem.eql(u8, ch.type, "http-01")) {
             http01 = .{ .url = ch.url, .token = ch.token };
@@ -1360,11 +1681,21 @@ fn parseAuthz(a: Allocator, body: []const u8) Error!AuthzInfo {
     return .{
         .status = statusFromString(parsed.status),
         .identifier = parsed.identifier.value,
+        .ip = std.mem.eql(u8, parsed.identifier.type, "ip"),
         .wildcard = parsed.wildcard,
+        .expires = parsed.expires,
+        .challenges = all,
         .http01 = http01,
         .tls_alpn01 = tls_alpn01,
         .dns01 = dns01,
     };
+}
+
+fn challengeKind(t: []const u8) ?ChallengeType {
+    if (std.mem.eql(u8, t, "http-01")) return .http_01;
+    if (std.mem.eql(u8, t, "tls-alpn-01")) return .tls_alpn_01;
+    if (std.mem.eql(u8, t, "dns-01")) return .dns_01;
+    return null;
 }
 
 const Problem = struct {
@@ -2541,6 +2872,8 @@ const MockCa = struct {
     csr_ok: bool = false,
     finalized: bool = false,
     served_processing: bool = false,
+    /// W3: the client deactivated the authorization (RFC 8555 §7.5.2).
+    authz_deactivated: bool = false,
     /// Which challenge the mock offers and validates.
     mode: ChallengeType = .http_01,
     /// The one identifier the order carries (`*.` = a wildcard order).
@@ -2886,6 +3219,7 @@ fn mcNewOrder(ctx: *router.Ctx) anyerror!void {
     m.challenge_ok = false;
     m.finalized = false;
     m.served_processing = false;
+    m.authz_deactivated = false;
     m.lock.unlock();
 
     var buf: [1024]u8 = undefined;
@@ -2897,12 +3231,23 @@ fn mcAuthz(ctx: *router.Ctx) anyerror!void {
     const m = MockCa.of(ctx);
     var v = m.readVerified(ctx, m.authz_url, .kid) catch return mcRejected(ctx);
     defer v.deinit();
-    if (v.payload.len != 0) m.fail("authz fetch must be POST-as-GET");
+    // RFC 8555 §7.5.2: the one non-empty payload an authorization takes.
+    const deactivating = std.mem.eql(u8, v.payload, "{\"status\":\"deactivated\"}");
+    if (v.payload.len != 0 and !deactivating) m.fail("authz fetch must be POST-as-GET");
 
     lockSpin(&m.lock);
+    if (deactivating) m.authz_deactivated = true;
+    const gone = m.authz_deactivated;
     const valid = m.challenge_ok;
     m.authz_polls += 1;
     m.lock.unlock();
+    if (gone) {
+        var gbuf: [256]u8 = undefined;
+        const body = try std.fmt.bufPrint(&gbuf,
+            \\{{"status":"deactivated","identifier":{{"type":"dns","value":"{s}"}},"challenges":[]}}
+        , .{m.order_domain});
+        return m.respondJson(ctx, 200, body);
+    }
 
     var buf: [1024]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
@@ -4408,4 +4753,186 @@ test "W2: an IPv6 identifier over HTTP-01 against the mock CA, typed ip with an 
     defer cert.deinit(testing.allocator);
     try lab.expectClean();
     try testing.expect(lab.mock.challenge_ok and lab.mock.csr_ok);
+}
+
+/// A DNS-01 `Solver` over a `TestZone` (no `dns_publisher`), counting its calls.
+const ZoneSolver = struct {
+    zone: *TestZone,
+    presents: u32 = 0,
+    cleanups: u32 = 0,
+    fail: bool = false,
+    wildcard_seen: bool = false,
+
+    fn solver(z: *ZoneSolver) Solver {
+        return .{ .ctx = z, .type = .dns_01, .present = present, .cleanup = cleanup };
+    }
+
+    fn present(ctx: ?*anyopaque, req: *const ChallengeRequest) SolverError!void {
+        const z: *ZoneSolver = @ptrCast(@alignCast(ctx.?));
+        z.presents += 1;
+        z.wildcard_seen = req.wildcard;
+        if (z.fail) return error.SolverFailed;
+        var name_buf: [dns01_max_name_len]u8 = undefined;
+        const value = req.dnsTxtValue();
+        if (!TestZone.present(z.zone, req.dnsRecordName(&name_buf), &value)) return error.SolverFailed;
+    }
+
+    fn cleanup(ctx: ?*anyopaque, req: *const ChallengeRequest) void {
+        const z: *ZoneSolver = @ptrCast(@alignCast(ctx.?));
+        z.cleanups += 1;
+        var name_buf: [dns01_max_name_len]u8 = undefined;
+        const value = req.dnsTxtValue();
+        TestZone.cleanup(z.zone, req.dnsRecordName(&name_buf), &value);
+    }
+};
+
+test "W3: the order flow step by step — newOrder, fetchOrder by URL, authorization handle, finalize, download" {
+    var lab: Lab = undefined;
+    try lab.start(false);
+    defer lab.stop();
+    var zone: TestZone = .{};
+    var account_key: jws.KeyPair = undefined;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&account_key));
+    var c = try w1Client(&lab, &zone, 81, &account_key);
+    defer c.deinit();
+
+    var order = try c.newOrder(&.{MockCa.domain}, .{});
+    defer order.deinit();
+    try testing.expectEqual(Status.pending, order.status);
+    try testing.expectEqualStrings(lab.mock.order_url, order.url);
+    try testing.expectEqual(@as(usize, 1), order.identifiers.len);
+    try testing.expectEqualStrings(MockCa.domain, order.identifiers[0]);
+    try testing.expectEqual(@as(?[]const u8, null), order.certificate);
+
+    // The same order again by its URL (a resumed order).
+    var again = try c.fetchOrder(order.url);
+    defer again.deinit();
+    try testing.expectEqualStrings(order.authorizations[0], again.authorizations[0]);
+    try testing.expectEqualStrings(order.finalize, again.finalize);
+
+    var authz = try c.fetchAuthorization(order.authorizations[0]);
+    defer authz.deinit();
+    try testing.expectEqual(Status.pending, authz.status);
+    try testing.expectEqualStrings(MockCa.domain, authz.identifier);
+    try testing.expect(!authz.ip and !authz.wildcard);
+    // The mock offers an http-01 decoy and dns-01; both are listed, by kind.
+    try testing.expectEqual(@as(usize, 2), authz.challenges.len);
+    try testing.expectEqual(@as(?ChallengeType, .http_01), authz.challenges[0].kind);
+    const ch = authz.challenge(.dns_01).?;
+    try testing.expectEqualStrings(MockCa.token, ch.token);
+    try testing.expectEqual(@as(?Challenge, null), authz.challenge(.tls_alpn_01));
+
+    // The proof by hand: the record the key authorization implies.
+    var ka_buf: [jws.max_key_authorization_len]u8 = undefined;
+    const ka = try c.keyAuthorization(&ka_buf, ch.token);
+    var name_buf: [dns01_max_name_len]u8 = undefined;
+    const value = jws.dns01TxtValueFromKeyAuthorization(ka);
+    try testing.expectEqualSlices(u8, &(try jws.dns01TxtValue(ch.token, account_key.public_key)), &value);
+    try testing.expect(TestZone.present(&zone, dns01RecordName(&name_buf, authz.identifier), &value));
+    try c.acceptChallenge(ch.url);
+    try c.waitAuthorization(authz.url);
+    TestZone.cleanup(&zone, dns01RecordName(&name_buf, authz.identifier), &value);
+
+    try c.waitOrder(&order, .ready);
+    try testing.expectEqual(Status.ready, order.status);
+    // Downloading before the order is valid is refused, not attempted.
+    try testing.expectError(error.MalformedResponse, c.downloadChain(&order, null));
+
+    var cert_key: jws.KeyPair = undefined;
+    jws.generateKeyPair(&cert_key, lab.threaded.io());
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&cert_key));
+    const csr = try x509.csrDer(testing.allocator, &cert_key, &.{MockCa.domain});
+    defer testing.allocator.free(csr);
+    try c.finalize(&order, csr);
+    try c.waitOrder(&order, .valid);
+    try testing.expectEqual(Status.valid, order.status);
+    try testing.expectEqualStrings(lab.mock.cert_url, order.certificate.?);
+    var chain = try c.downloadChain(&order, null);
+    defer chain.deinit(testing.allocator);
+    try testing.expectEqualStrings(x509.test_cert_pem ++ x509.test_root_cert_pem, chain.chain_pem);
+    try testing.expect(chain.not_after > 0);
+    try testing.expect(!zone.bad_cleanup);
+    try lab.expectClean();
+}
+
+test "W3: a caller's Solver replaces the built-in (no dns_publisher needed); a failing one aborts, no cleanup" {
+    var lab: Lab = undefined;
+    try lab.start(false);
+    defer lab.stop();
+    var zone: TestZone = .{};
+    var zs: ZoneSolver = .{ .zone = &zone };
+    const solvers = [_]Solver{zs.solver()};
+    var account_key: jws.KeyPair = undefined;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&account_key));
+    try jws.Es256.KeyPair.generateDeterministicInto(&account_key, &@as([32]u8, @splat(82)));
+    lab.mock.mode = .dns_01;
+    lab.mock.zone = &zone;
+    lab.mock.order_domain = "*.acme-poc.example";
+    var c = lab.client(&account_key, .{ .challenge_type = .dns_01, .solvers = &solvers });
+    defer c.deinit();
+
+    var cert = try c.obtain(&.{"*.acme-poc.example"});
+    cert.deinit(testing.allocator);
+    try testing.expectEqual(@as(u32, 1), zs.presents);
+    try testing.expectEqual(@as(u32, 1), zs.cleanups);
+    try testing.expect(zs.wildcard_seen);
+    try testing.expect(!zone.live and !zone.bad_cleanup);
+    try lab.expectClean();
+
+    // The solver refuses: DnsPublishFailed for DNS-01, and no cleanup.
+    zs.fail = true;
+    try testing.expectError(error.DnsPublishFailed, c.obtain(&.{"*.acme-poc.example"}));
+    try testing.expectEqual(@as(u32, 2), zs.presents);
+    try testing.expectEqual(@as(u32, 1), zs.cleanups);
+
+    // Without the solver and without a publisher there is nothing to solve with.
+    var bare = lab.client(&account_key, .{ .challenge_type = .dns_01 });
+    defer bare.deinit();
+    try testing.expectError(error.DnsPublisherMissing, bare.obtain(&.{"*.acme-poc.example"}));
+}
+
+test "W3: deactivateAuthorization (RFC 8555 §7.5.2); newOrder checks identifier syntax only" {
+    var lab: Lab = undefined;
+    try lab.start(false);
+    defer lab.stop();
+    var zone: TestZone = .{};
+    var account_key: jws.KeyPair = undefined;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&account_key));
+    var c = try w1Client(&lab, &zone, 83, &account_key);
+    defer c.deinit();
+
+    try testing.expectError(error.InvalidDomain, c.newOrder(&.{}, .{}));
+    try testing.expectError(error.InvalidDomain, c.newOrder(&.{"not a name"}, .{}));
+    try testing.expectError(error.InvalidDomain, c.newOrder(&.{"2001:DB8::1"}, .{})); // not RFC 5952 text (upper case)
+
+    var order = try c.newOrder(&.{MockCa.domain}, .{});
+    defer order.deinit();
+    try c.deactivateAuthorization(order.authorizations[0]);
+    try testing.expect(lab.mock.authz_deactivated);
+    var authz = try c.fetchAuthorization(order.authorizations[0]);
+    defer authz.deinit();
+    try testing.expectEqual(Status.deactivated, authz.status);
+    // A deactivated authorization is not solved again.
+    try testing.expectError(error.AuthorizationFailed, c.solveAuthorization(order.authorizations[0]));
+    try testing.expectEqual(@as(u32, 0), zone.presents);
+    try lab.expectClean();
+}
+
+test "W3: ChallengeRequest helpers agree with the token-based ones" {
+    var kp: jws.KeyPair = undefined;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&kp));
+    try jws.Es256.KeyPair.generateDeterministicInto(&kp, &@as([32]u8, @splat(84)));
+    const token = "evaGxfADs6pSRb2LAv9IZf17Dt3juxGJ-PCt92wr-oA";
+    var ka_buf: [jws.max_key_authorization_len]u8 = undefined;
+    const ka = try jws.keyAuthorization(&ka_buf, token, kp.public_key);
+    const req: ChallengeRequest = .{ .type = .tls_alpn_01, .identifier = "2001:db8::1", .ip = true, .wildcard = false, .token = token, .key_authorization = ka };
+    try testing.expectEqualSlices(u8, &(try jws.dns01TxtValue(token, kp.public_key)), &req.dnsTxtValue());
+    try testing.expectEqualSlices(u8, &(try jws.acmeIdentifier(token, kp.public_key)), &req.tlsAlpnIdentifier());
+    var sni_buf: [max_reverse_name_len]u8 = undefined;
+    // RFC 3596 §2.5 order: nibbles reversed.
+    try testing.expectEqualStrings("1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.8.b.d.0.1.0.0.2.ip6.arpa", req.tlsAlpnSni(&sni_buf));
+    const named: ChallengeRequest = .{ .type = .dns_01, .identifier = "example.org", .ip = false, .wildcard = true, .token = token, .key_authorization = ka };
+    try testing.expectEqualStrings("example.org", named.tlsAlpnSni(&sni_buf));
+    var name_buf: [dns01_max_name_len]u8 = undefined;
+    try testing.expectEqualStrings("_acme-challenge.example.org", named.dnsRecordName(&name_buf));
 }
