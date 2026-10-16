@@ -25,7 +25,7 @@ const burn = @import("burn.zig");
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "Raw AES-CBC (NIST SP800-38A) + PKCS#7/XML-Enc padding helpers, zero-alloc; padding-oracle caveat — consumers own authenticate-before-unpad",
+    .doc = "AES-CBC (NIST SP800-38A): one-shot, incremental, streaming with six paddings, ciphertext stealing CS1-3; zero-alloc; padding-oracle caveat — consumers own authenticate-before-unpad",
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
@@ -87,20 +87,65 @@ fn encryptBody(
     plaintext: []const u8,
     out: []u8,
 ) Error!usize {
-    if (plaintext.len % block_len != 0) return error.NotBlockAligned;
-    if (out.len < plaintext.len) return error.BufferTooSmall;
-
+    try checkLens(plaintext.len, out.len);
     const ctx = Aes.initEnc(key.*);
-    var prev: [block_len]u8 = iv;
+    var chain = iv;
+    encryptChain(&ctx, &chain, plaintext, out);
+    return plaintext.len;
+}
+
+fn checkLens(in_len: usize, out_len: usize) Error!void {
+    if (in_len % block_len != 0) return error.NotBlockAligned;
+    if (out_len < in_len) return error.BufferTooSmall;
+}
+
+const V = @Vector(block_len, u8);
+
+/// The chain itself, shared by the one-shot and the stateful API: one block at
+/// a time (each input is the previous output, so nothing can run in parallel).
+/// `out` may be `in` itself: each block is read before it is written.
+fn encryptChain(ctx: anytype, chain: *[block_len]u8, in: []const u8, out: []u8) void {
+    var prev: V = chain.*;
     var i: usize = 0;
-    while (i < plaintext.len) : (i += block_len) {
-        var block: [block_len]u8 = plaintext[i..][0..block_len].*;
-        for (&block, prev) |*b, p| b.* ^= p;
+    while (i < in.len) : (i += block_len) {
+        var block: [block_len]u8 = @as(V, in[i..][0..block_len].*) ^ prev;
         ctx.encrypt(&block, &block);
-        @memcpy(out[i..][0..block_len], &block);
+        out[i..][0..block_len].* = block;
         prev = block;
     }
-    return plaintext.len;
+    chain.* = prev;
+}
+
+/// Blocks decrypted per `decryptWide` call: std's own choice for this CPU
+/// (8 on current x86-64 AES-NI cores, the depth OpenSSL's `aesni_cbc_encrypt`
+/// decrypt path pipelines too).
+const wide = std.crypto.core.aes.Block.parallel.optimal_parallel_blocks;
+
+/// Decryption has no chain through the cipher -- `P[i] = D(C[i]) ^ C[i-1]` --
+/// so `wide` blocks go through `decryptWide` at once. Every ciphertext block a
+/// group needs is read (into `tmp` and `next`) before any of the group's output
+/// is written, so `out` may be `in` itself.
+fn decryptChain(ctx: anytype, chain: *[block_len]u8, in: []const u8, out: []u8) void {
+    var prev: [block_len]u8 = chain.*;
+    var i: usize = 0;
+    while (in.len - i >= wide * block_len) : (i += wide * block_len) {
+        const src = in[i..][0 .. wide * block_len];
+        var tmp: [wide * block_len]u8 = undefined;
+        ctx.decryptWide(wide, &tmp, src);
+        const next: [block_len]u8 = src[(wide - 1) * block_len ..][0..block_len].*;
+        var x: @Vector(wide * block_len, u8) = tmp;
+        x ^= @as(@Vector(wide * block_len, u8), prev ++ src[0 .. (wide - 1) * block_len].*);
+        out[i..][0 .. wide * block_len].* = x;
+        prev = next;
+    }
+    while (i < in.len) : (i += block_len) {
+        const ct: [block_len]u8 = in[i..][0..block_len].*;
+        var pt: [block_len]u8 = undefined;
+        ctx.decrypt(&pt, &ct);
+        out[i..][0..block_len].* = @as(V, pt) ^ @as(V, prev);
+        prev = ct;
+    }
+    chain.* = prev;
 }
 
 /// Decrypt `ciphertext` (must be `block_len`-aligned) into `out` under raw
@@ -125,21 +170,386 @@ fn decryptBody(
     ciphertext: []const u8,
     out: []u8,
 ) Error!usize {
-    if (ciphertext.len % block_len != 0) return error.NotBlockAligned;
-    if (out.len < ciphertext.len) return error.BufferTooSmall;
-
+    try checkLens(ciphertext.len, out.len);
     const ctx = Aes.initDec(key.*);
-    var prev: [block_len]u8 = iv;
-    var i: usize = 0;
-    while (i < ciphertext.len) : (i += block_len) {
-        const ct_block: [block_len]u8 = ciphertext[i..][0..block_len].*;
-        var pt: [block_len]u8 = undefined;
-        ctx.decrypt(&pt, &ct_block);
-        for (&pt, prev) |*b, p| b.* ^= p;
-        @memcpy(out[i..][0..block_len], &pt);
-        prev = ct_block;
-    }
+    var chain = iv;
+    decryptChain(&ctx, &chain, ciphertext, out);
     return ciphertext.len;
+}
+
+// ── Ciphertext stealing (NIST SP800-38A Addendum, 2010) ──────────────────────
+//
+// CBC for any length >= one block, ciphertext as long as the plaintext: the
+// last, partial block P_n* (d octets, 1..16) is zero-filled to P_n, encrypted
+// on top of C_{n-1}, and only the first d octets of C_{n-1} are kept. The three
+// variants differ only in the order of the last two ciphertext pieces:
+// CS1 `.. C_{n-1}* C_n`; CS2 `.. C_n C_{n-1}*` unless d == 16 (then plain
+// CBC); CS3 `.. C_n C_{n-1}*` always (Kerberos, RFC 3962 -- it swaps even full
+// blocks). Every variant of a one-block message is plain CBC. OpenSSL 3's
+// `AES-*-CBC-CTS` (`cts_mode` CS1/CS2/CS3) and RustCrypto's `cts` crate ship
+// the same three.
+
+pub const CtsVariant = enum { cs1, cs2, cs3 };
+
+pub const CtsError = error{
+    /// Ciphertext stealing needs at least one whole block.
+    TooShort,
+    /// `out` is smaller than the input.
+    BufferTooSmall,
+};
+
+/// Encrypt `plaintext` (any length >= `block_len`) into `out` (at least as
+/// long; may be `plaintext` itself) under CBC with ciphertext stealing.
+/// Returns `plaintext.len`. Same `Aes`/`key`/`iv` contract as `encrypt`.
+pub fn encryptCts(
+    comptime Aes: type,
+    variant: CtsVariant,
+    key: *const [Aes.key_bits / 8]u8,
+    iv: [block_len]u8,
+    plaintext: []const u8,
+    out: []u8,
+) CtsError!usize {
+    return burn.run(burn.cts_burn, CtsError!usize, encryptCtsBody, .{ Aes, variant, key, iv, plaintext, out });
+}
+
+fn encryptCtsBody(
+    comptime Aes: type,
+    variant: CtsVariant,
+    key: *const [Aes.key_bits / 8]u8,
+    iv: [block_len]u8,
+    in: []const u8,
+    out: []u8,
+) CtsError!usize {
+    if (in.len < block_len) return error.TooShort;
+    if (out.len < in.len) return error.BufferTooSmall;
+    const ctx = Aes.initEnc(key.*);
+    var chain = iv;
+    if (in.len == block_len) {
+        encryptChain(&ctx, &chain, in, out);
+        return in.len;
+    }
+    // n blocks, the last one d octets long; the first n-2 are plain CBC.
+    const n = (in.len + block_len - 1) / block_len;
+    const d = in.len - (n - 1) * block_len;
+    const head = (n - 2) * block_len;
+    encryptChain(&ctx, &chain, in[0..head], out[0..head]);
+    var p_last: [block_len]u8 = @splat(0);
+    @memcpy(p_last[0..d], in[head + block_len ..][0..d]);
+    var c_prev: [block_len]u8 = @as(V, in[head..][0..block_len].*) ^ @as(V, chain);
+    ctx.encrypt(&c_prev, &c_prev);
+    var c_last: [block_len]u8 = @as(V, p_last) ^ @as(V, c_prev);
+    ctx.encrypt(&c_last, &c_last);
+    const swap = switch (variant) {
+        .cs1 => false,
+        .cs2 => d != block_len,
+        .cs3 => true,
+    };
+    if (swap) {
+        out[head..][0..block_len].* = c_last;
+        @memcpy(out[head + block_len ..][0..d], c_prev[0..d]);
+    } else {
+        @memcpy(out[head..][0..d], c_prev[0..d]);
+        out[head + d ..][0..block_len].* = c_last;
+    }
+    return in.len;
+}
+
+/// Decrypt `ciphertext` (any length >= `block_len`) produced by `encryptCts`
+/// with the same `variant` into `out` (may be `ciphertext` itself). Returns
+/// `ciphertext.len`. Unauthenticated, like all of CBC: see the padding-oracle
+/// caveat in SPEC.md (there is no padding to probe, but a flipped bit still
+/// lands where CBC puts it).
+pub fn decryptCts(
+    comptime Aes: type,
+    variant: CtsVariant,
+    key: *const [Aes.key_bits / 8]u8,
+    iv: [block_len]u8,
+    ciphertext: []const u8,
+    out: []u8,
+) CtsError!usize {
+    return burn.run(burn.cts_burn, CtsError!usize, decryptCtsBody, .{ Aes, variant, key, iv, ciphertext, out });
+}
+
+fn decryptCtsBody(
+    comptime Aes: type,
+    variant: CtsVariant,
+    key: *const [Aes.key_bits / 8]u8,
+    iv: [block_len]u8,
+    in: []const u8,
+    out: []u8,
+) CtsError!usize {
+    if (in.len < block_len) return error.TooShort;
+    if (out.len < in.len) return error.BufferTooSmall;
+    const ctx = Aes.initDec(key.*);
+    var chain = iv;
+    if (in.len == block_len) {
+        decryptChain(&ctx, &chain, in, out);
+        return in.len;
+    }
+    const n = (in.len + block_len - 1) / block_len;
+    const d = in.len - (n - 1) * block_len;
+    const head = (n - 2) * block_len;
+    const swap = switch (variant) {
+        .cs1 => false,
+        .cs2 => d != block_len,
+        .cs3 => true,
+    };
+    // Both tail pieces into locals first: `out` may alias `in`.
+    var c_prev: [block_len]u8 = undefined; // C_{n-1}, completed below
+    var c_last: [block_len]u8 = undefined; // C_n
+    if (swap) {
+        c_last = in[head..][0..block_len].*;
+        @memcpy(c_prev[0..d], in[head + block_len ..][0..d]);
+    } else {
+        @memcpy(c_prev[0..d], in[head..][0..d]);
+        c_last = in[head + d ..][0..block_len].*;
+    }
+    decryptChain(&ctx, &chain, in[0..head], out[0..head]);
+    // D(C_n) = C_{n-1} ^ (P_n* || 0...): its tail IS the stolen tail of C_{n-1}.
+    var z: [block_len]u8 = undefined;
+    ctx.decrypt(&z, &c_last);
+    @memcpy(c_prev[d..], z[d..]);
+    var p_prev: [block_len]u8 = undefined;
+    ctx.decrypt(&p_prev, &c_prev);
+    out[head..][0..block_len].* = @as(V, p_prev) ^ @as(V, chain);
+    for (out[head + block_len ..][0..d], z[0..d], c_prev[0..d]) |*o, a, b| o.* = a ^ b;
+    return in.len;
+}
+
+// ── Incremental CBC (Go `cipher.BlockMode`, RustCrypto `cbc::Encryptor`) ────
+
+/// CBC encryption under one key schedule, kept across calls: `init` expands the
+/// key once, every `update` continues the chain where the previous one ended
+/// (Go's `CryptBlocks`), and `setIv` starts a new message under the same key
+/// (Go's `SetIV`) -- so a stream can be fed in block-aligned pieces, and many
+/// messages share one key schedule. `update(a ++ b)` == `update(a); update(b)`.
+/// The struct holds the AES round keys (Z3, CONVENTIONS §2.1: not wiped by
+/// `update`); a caller that wants them gone calls `wipe()` when done.
+pub fn Encryptor(comptime Aes: type) type {
+    return struct {
+        const Self = @This();
+        ctx: @TypeOf(Aes.initEnc(undefined)),
+        chain: [block_len]u8,
+
+        /// The schedule by value. Its first round keys ARE key bytes, so the
+        /// returned copy can outlive the burn in this frame; where that
+        /// matters, `initInto` writes it straight into the caller's struct.
+        pub fn init(key: *const [Aes.key_bits / 8]u8, iv: [block_len]u8) Self {
+            var self: Self = undefined;
+            initInto(&self, key, iv);
+            return self;
+        }
+
+        pub fn initInto(out: *Self, key: *const [Aes.key_bits / 8]u8, iv: [block_len]u8) void {
+            burn.run(burn.schedule_burn, void, initBody, .{ out, key, iv });
+        }
+        fn initBody(out: *Self, key: *const [Aes.key_bits / 8]u8, iv: [block_len]u8) void {
+            out.* = .{ .ctx = Aes.initEnc(key.*), .chain = iv };
+        }
+
+        /// Start a new message under the same key.
+        pub fn setIv(self: *Self, iv: [block_len]u8) void {
+            self.chain = iv;
+        }
+
+        /// Encrypt the block-aligned `in` into `out` (`out.len >= in.len`;
+        /// `out` may be `in` itself, not a partial overlap), continuing the
+        /// chain. Returns `in.len`. On an error nothing is written and the
+        /// chain is unchanged.
+        pub fn update(self: *Self, in: []const u8, out: []u8) Error!usize {
+            try checkLens(in.len, out.len);
+            burn.run(burn.update_burn, void, encryptChain, .{ &self.ctx, &self.chain, in, out });
+            return in.len;
+        }
+
+        /// Zero the round keys and the chain (opt-in, see the type's doc).
+        pub fn wipe(self: *Self) void {
+            std.crypto.secureZero(u8, std.mem.asBytes(self));
+        }
+    };
+}
+
+/// CBC decryption under one key schedule, kept across calls; the mirror of
+/// `Encryptor` (same `init`/`setIv`/`update`/`wipe` contract). Decryption
+/// pipelines `wide` blocks per step, so long `update`s are several times
+/// faster per byte than encryption.
+pub fn Decryptor(comptime Aes: type) type {
+    return struct {
+        const Self = @This();
+        ctx: @TypeOf(Aes.initDec(undefined)),
+        chain: [block_len]u8,
+
+        /// The schedule by value. Its first round keys ARE key bytes, so the
+        /// returned copy can outlive the burn in this frame; where that
+        /// matters, `initInto` writes it straight into the caller's struct.
+        pub fn init(key: *const [Aes.key_bits / 8]u8, iv: [block_len]u8) Self {
+            var self: Self = undefined;
+            initInto(&self, key, iv);
+            return self;
+        }
+
+        pub fn initInto(out: *Self, key: *const [Aes.key_bits / 8]u8, iv: [block_len]u8) void {
+            burn.run(burn.schedule_burn, void, initBody, .{ out, key, iv });
+        }
+        fn initBody(out: *Self, key: *const [Aes.key_bits / 8]u8, iv: [block_len]u8) void {
+            out.* = .{ .ctx = Aes.initDec(key.*), .chain = iv };
+        }
+
+        pub fn setIv(self: *Self, iv: [block_len]u8) void {
+            self.chain = iv;
+        }
+
+        pub fn update(self: *Self, in: []const u8, out: []u8) Error!usize {
+            try checkLens(in.len, out.len);
+            burn.run(burn.update_burn, void, decryptChain, .{ &self.ctx, &self.chain, in, out });
+            return in.len;
+        }
+
+        pub fn wipe(self: *Self) void {
+            std.crypto.secureZero(u8, std.mem.asBytes(self));
+        }
+    };
+}
+
+// ── Streaming with padding (OpenSSL `EVP_*Update` + `EVP_*Final`) ───────────
+
+/// The padding a `StreamEncryptor`/`StreamDecryptor` applies in `finish`.
+/// `none` = the message must come out block-aligned (`NotBlockAligned`
+/// otherwise); ISO 10126 is decrypt-compatible with `unpadXmlEnc` and needs a
+/// random source to encrypt, so it is offered through the one-shot helpers only.
+pub const Padding = enum { none, pkcs7, ansi_x923, iso7816, zero };
+
+pub const StreamError = Error || PaddingError;
+
+/// CBC encryption fed in pieces of ANY length: `update` encrypts every whole
+/// block it has and keeps the rest (< 16 octets); `finish` pads that tail
+/// with `padding` and encrypts it. `update` writes at most
+/// `maxUpdateLen(in.len)` octets, `finish` at most `block_len`. `out` must
+/// not overlap `in` (a buffered tail shifts the output ahead of the input).
+/// `setIv` starts a new message. Holds the round keys like `Encryptor`.
+pub fn StreamEncryptor(comptime Aes: type, comptime padding: Padding) type {
+    return Stream(Aes, padding, .encrypt);
+}
+
+/// The mirror of `StreamEncryptor`. With a padding other than `none` it holds
+/// back the last whole block until `finish`, which decrypts it, checks and
+/// strips the padding (`InvalidPadding`, one error for every malformed shape)
+/// and writes what is left (0..16 octets). Unauthenticated: decrypt only
+/// what was authenticated first -- see the padding-oracle caveat in SPEC.md.
+pub fn StreamDecryptor(comptime Aes: type, comptime padding: Padding) type {
+    return Stream(Aes, padding, .decrypt);
+}
+
+fn Stream(comptime Aes: type, comptime padding: Padding, comptime dir: enum { encrypt, decrypt }) type {
+    return struct {
+        const Self = @This();
+        const Inner = if (dir == .encrypt) Encryptor(Aes) else Decryptor(Aes);
+        /// Decryption keeps a whole block back when `finish` must unpad it.
+        const hold = dir == .decrypt and padding != .none;
+
+        inner: Inner,
+        tail: [block_len]u8 = undefined,
+        tail_len: usize = 0,
+
+        pub fn init(key: *const [Aes.key_bits / 8]u8, iv: [block_len]u8) Self {
+            var self: Self = undefined;
+            initInto(&self, key, iv);
+            return self;
+        }
+
+        pub fn initInto(out: *Self, key: *const [Aes.key_bits / 8]u8, iv: [block_len]u8) void {
+            burn.run(burn.schedule_burn, void, initBody, .{ out, key, iv });
+        }
+        fn initBody(out: *Self, key: *const [Aes.key_bits / 8]u8, iv: [block_len]u8) void {
+            out.inner.initInto(key, iv);
+            out.tail_len = 0;
+        }
+
+        /// Start a new message under the same key (drops a buffered tail).
+        pub fn setIv(self: *Self, iv: [block_len]u8) void {
+            self.inner.setIv(iv);
+            self.tail_len = 0;
+        }
+
+        /// Octets the next `update(in)` writes for an `in` of `in_len`.
+        pub fn maxUpdateLen(self: *const Self, in_len: usize) usize {
+            const avail = self.tail_len + in_len;
+            if (!hold) return avail / block_len * block_len;
+            return if (avail == 0) 0 else (avail - 1) / block_len * block_len;
+        }
+
+        /// Process `in`, write every block that is complete (and, decrypting
+        /// with padding, not the last one seen so far) to `out`. Returns the
+        /// octets written. On `BufferTooSmall` nothing changes.
+        pub fn update(self: *Self, in: []const u8, out: []u8) Error!usize {
+            const emit = self.maxUpdateLen(in.len);
+            if (out.len < emit) return error.BufferTooSmall;
+            var at: usize = 0; // octets of `in` consumed
+            var w: usize = 0;
+            if (emit > 0 and self.tail_len > 0) {
+                const take = block_len - self.tail_len;
+                @memcpy(self.tail[self.tail_len..], in[0..take]);
+                _ = try self.inner.update(&self.tail, out[0..block_len]);
+                at = take;
+                w = block_len;
+                self.tail_len = 0;
+            }
+            if (emit > w) {
+                const mid = emit - w;
+                _ = try self.inner.update(in[at..][0..mid], out[w..][0..mid]);
+                at += mid;
+                w = emit;
+            }
+            const rest = in[at..];
+            @memcpy(self.tail[self.tail_len..][0..rest.len], rest);
+            self.tail_len += rest.len;
+            return w;
+        }
+
+        /// End the message: encrypt the padded tail, or decrypt and unpad the
+        /// held block. `out` needs `block_len` octets of room (as EVP's
+        /// `Final`); `BufferTooSmall` changes nothing, any other error ends
+        /// the message. Returns the octets written (0..`block_len`); the
+        /// stream then needs `setIv` before the next one.
+        pub fn finish(self: *Self, out: []u8) StreamError!usize {
+            if (out.len < block_len) return error.BufferTooSmall;
+            defer self.tail_len = 0;
+            const n = self.tail_len;
+            if (dir == .encrypt) {
+                var block: [block_len]u8 = undefined;
+                const len = switch (padding) {
+                    .none => if (n == 0) 0 else return error.NotBlockAligned,
+                    .pkcs7 => padPkcs7(self.tail[0..n], &block) catch unreachable,
+                    .ansi_x923 => padAnsiX923(self.tail[0..n], &block) catch unreachable,
+                    .iso7816 => padIso7816(self.tail[0..n], &block) catch unreachable,
+                    .zero => padZero(self.tail[0..n], &block) catch unreachable,
+                };
+                _ = try self.inner.update(block[0..len], out[0..len]);
+                return len;
+            }
+            if (padding == .none) {
+                if (n != 0) return error.NotBlockAligned;
+                return 0;
+            }
+            if (padding == .zero and n == 0) return 0; // an empty message
+            if (n != block_len) return error.InvalidPadding;
+            var block: [block_len]u8 = undefined;
+            _ = try self.inner.update(&self.tail, &block);
+            const len = switch (padding) {
+                .none => unreachable,
+                .pkcs7 => try unpadPkcs7(&block),
+                .ansi_x923 => try unpadAnsiX923(&block),
+                .iso7816 => try unpadIso7816(&block),
+                .zero => try unpadZero(&block),
+            };
+            @memcpy(out[0..len], block[0..len]);
+            return len;
+        }
+
+        pub fn wipe(self: *Self) void {
+            std.crypto.secureZero(u8, std.mem.asBytes(self));
+        }
+    };
 }
 
 // ── PKCS#7 padding (RFC 5652 §6.3) ──────────────────────────────────────────
@@ -234,6 +644,122 @@ pub fn unpadXmlEnc(buf: []const u8) PaddingError!usize {
     const invalid: u1 = @intFromBool(n == 0) | @intFromBool(n > block_len);
     const pad_len: usize = @min(@as(usize, n), block_len);
     if (invalid != 0) return error.InvalidPadding;
+    return buf.len - pad_len;
+}
+
+// ── The other schemes RustCrypto's `block-padding` ships ────────────────────
+//
+// Same posture as above: every unpad scans the whole last block and folds all
+// checks into one flag, branching once on accept/reject. ANSI X9.23, ISO 10126
+// and ISO/IEC 7816-4 always pad (1..16 bytes), like PKCS#7; zero padding adds
+// nothing to an aligned message and so cannot tell a message's own trailing
+// zeros from padding -- use it only where the protocol fixes the length.
+
+/// Padded length for the schemes that always pad (PKCS#7, ANSI X9.23,
+/// ISO 10126, ISO/IEC 7816-4): 1..`block_len` bytes more than `msg_len`.
+pub const paddedLen = paddedLenPkcs7;
+
+/// ANSI X9.23: zero bytes, then the pad length N as the last byte.
+pub fn padAnsiX923(msg: []const u8, out: []u8) error{BufferTooSmall}!usize {
+    const padded_len = paddedLen(msg.len);
+    if (out.len < padded_len) return error.BufferTooSmall;
+    @memcpy(out[0..msg.len], msg);
+    @memset(out[msg.len .. padded_len - 1], 0);
+    out[padded_len - 1] = @intCast(padded_len - msg.len);
+    return padded_len;
+}
+
+/// Strip ANSI X9.23 padding: `1 <= N <= block_len` and the N-1 bytes before
+/// the length byte all zero.
+pub fn unpadAnsiX923(buf: []const u8) PaddingError!usize {
+    if (buf.len == 0 or buf.len % block_len != 0) return error.InvalidPadding;
+    const n = buf[buf.len - 1];
+    var invalid: u1 = @intFromBool(n == 0) | @intFromBool(n > block_len);
+    const pad_len: usize = @min(@as(usize, n), block_len);
+    var k: usize = 1;
+    while (k < block_len) : (k += 1) {
+        const in_pad: u1 = @intFromBool(k < pad_len);
+        invalid |= in_pad & @intFromBool(buf[buf.len - 1 - k] != 0);
+    }
+    if (invalid != 0) return error.InvalidPadding;
+    return buf.len - pad_len;
+}
+
+/// ISO 10126: random bytes from `random`, then the pad length N as the last
+/// byte. (ISO withdrew the scheme in 2007; it is here for the protocols that
+/// still name it.)
+pub fn padIso10126(msg: []const u8, out: []u8, random: std.Random) error{BufferTooSmall}!usize {
+    const padded_len = paddedLen(msg.len);
+    if (out.len < padded_len) return error.BufferTooSmall;
+    @memcpy(out[0..msg.len], msg);
+    random.bytes(out[msg.len .. padded_len - 1]);
+    out[padded_len - 1] = @intCast(padded_len - msg.len);
+    return padded_len;
+}
+
+/// Strip ISO 10126 padding: only the length byte is defined, so this is the
+/// same check as `unpadXmlEnc` (XML-Encryption's padding is this scheme).
+pub const unpadIso10126 = unpadXmlEnc;
+
+/// ISO/IEC 7816-4 (also ISO/IEC 9797-1 method 2): one 0x80 byte, then zeros.
+pub fn padIso7816(msg: []const u8, out: []u8) error{BufferTooSmall}!usize {
+    const padded_len = paddedLen(msg.len);
+    if (out.len < padded_len) return error.BufferTooSmall;
+    @memcpy(out[0..msg.len], msg);
+    out[msg.len] = 0x80;
+    @memset(out[msg.len + 1 .. padded_len], 0);
+    return padded_len;
+}
+
+/// Strip ISO/IEC 7816-4 padding: the last non-zero byte of the last block must
+/// be 0x80. Scans all 16 bytes from the end: `seen` latches at the first
+/// non-zero byte, whose position and value decide the result.
+pub fn unpadIso7816(buf: []const u8) PaddingError!usize {
+    if (buf.len == 0 or buf.len % block_len != 0) return error.InvalidPadding;
+    var seen: u1 = 0;
+    var invalid: u1 = 0;
+    var pad_len: usize = 0;
+    var k: usize = 0;
+    while (k < block_len) : (k += 1) {
+        const b = buf[buf.len - 1 - k];
+        const first: u1 = ~seen & @intFromBool(b != 0);
+        invalid |= first & @intFromBool(b != 0x80);
+        // Branch-free select of k + 1 at the first non-zero byte.
+        pad_len |= (k + 1) & (@as(usize, 0) -% @as(usize, first));
+        seen |= first;
+    }
+    invalid |= ~seen;
+    if (invalid != 0) return error.InvalidPadding;
+    return buf.len - pad_len;
+}
+
+/// Zero padding: zeros up to the next block boundary, nothing when `msg` is
+/// already aligned (RustCrypto `ZeroPadding`).
+pub fn paddedLenZero(msg_len: usize) usize {
+    return std.mem.alignForward(usize, msg_len, block_len);
+}
+
+pub fn padZero(msg: []const u8, out: []u8) error{BufferTooSmall}!usize {
+    const padded_len = paddedLenZero(msg.len);
+    if (out.len < padded_len) return error.BufferTooSmall;
+    @memcpy(out[0..msg.len], msg);
+    @memset(out[msg.len..padded_len], 0);
+    return padded_len;
+}
+
+/// Strip zero padding: drops the trailing zero bytes of the last block (a
+/// message ending in zeros loses them -- the scheme cannot tell). Never fails
+/// on a block-aligned buffer; `InvalidPadding` only for an unaligned one.
+pub fn unpadZero(buf: []const u8) PaddingError!usize {
+    if (buf.len % block_len != 0) return error.InvalidPadding;
+    if (buf.len == 0) return 0;
+    var seen: u1 = 0;
+    var pad_len: usize = 0;
+    var k: usize = 0;
+    while (k < block_len) : (k += 1) {
+        seen |= @intFromBool(buf[buf.len - 1 - k] != 0);
+        pad_len += ~seen;
+    }
     return buf.len - pad_len;
 }
 
@@ -636,6 +1162,151 @@ test "raw CBC vs jwe's/xmlenc's hand-rolled shape: same output on the same input
     var out: [pt.len]u8 = undefined;
     _ = try encrypt(Aes128, &key, iv, &pt, &out);
     try testing.expectEqualSlices(u8, &expected, &out);
+}
+
+test "Encryptor/Decryptor: SP800-38A F.2.1/F.2.3/F.2.5 fed one block at a time" {
+    inline for (.{
+        .{ Aes128, &f_2_1_key, &f_2_1_ciphertext },
+        .{ Aes192, &f_2_3_key, &f_2_3_ciphertext },
+        .{ Aes256, &f_2_5_key, &f_2_5_ciphertext },
+    }) |c| {
+        var e = Encryptor(c[0]).init(c[1], f_2_1_iv);
+        var d = Decryptor(c[0]).init(c[1], f_2_1_iv);
+        var ct: [64]u8 = undefined;
+        var pt: [64]u8 = undefined;
+        var i: usize = 0;
+        while (i < 64) : (i += 16) {
+            _ = try e.update(f_2_1_plaintext[i..][0..16], ct[i..][0..16]);
+            _ = try d.update(c[2][i..][0..16], pt[i..][0..16]);
+        }
+        try testing.expectEqualSlices(u8, c[2], &ct);
+        try testing.expectEqualSlices(u8, &f_2_1_plaintext, &pt);
+        // setIv starts the next message: the same bytes again, in one call,
+        // in place.
+        e.setIv(f_2_1_iv);
+        var buf = f_2_1_plaintext;
+        _ = try e.update(&buf, &buf);
+        try testing.expectEqualSlices(u8, c[2], &buf);
+        d.setIv(f_2_1_iv);
+        _ = try d.update(&buf, &buf);
+        try testing.expectEqualSlices(u8, &f_2_1_plaintext, &buf);
+        e.wipe();
+        try testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&e), 0));
+    }
+}
+
+test "decrypt: a message longer than one decryptWide group, in place, against the encrypt" {
+    var msg: [16 * (2 * wide + 3)]u8 = undefined;
+    for (&msg, 0..) |*b, i| b.* = @truncate(i *% 7 +% 1);
+    var buf = msg;
+    _ = try encrypt(Aes256, &f_2_5_key, f_2_1_iv, &buf, &buf);
+    var d = Decryptor(Aes256).init(&f_2_5_key, f_2_1_iv);
+    // One group, then the rest: the chain crosses a group boundary between calls.
+    _ = try d.update(buf[0 .. 16 * wide], buf[0 .. 16 * wide]);
+    _ = try d.update(buf[16 * wide ..], buf[16 * wide ..]);
+    try testing.expectEqualSlices(u8, &msg, &buf);
+}
+
+// RFC 3962 Appendix B (Kerberos AES-CTS = CS3): AES-128, key "chicken
+// teriyaki", IV 0, prefixes of one sentence. CS1 is OpenSSL 3.5.5's
+// `openssl enc -aes-128-cbc-cts -nopad` (its default `cts_mode`), 2026-10-16.
+const cts_key = "chicken teriyaki".*;
+const cts_msg = "I would like the General Gau's Chicken, please, and wonton soup.";
+const cts_vectors = blk: {
+    @setEvalBranchQuota(20_000);
+    break :blk [_]struct { len: usize, cs3: []const u8, cs1: []const u8 }{
+        .{ .len = 17, .cs3 = &hex("c6353568f2bf8cb4d8a580362da7ff7f97"), .cs1 = &hex("97c6353568f2bf8cb4d8a580362da7ff7f") },
+        .{ .len = 31, .cs3 = &hex("fc00783e0efdb2c1d445d4c8eff7ed2297687268d6ecccc0c07b25e25ecfe5"), .cs1 = &hex("97687268d6ecccc0c07b25e25ecfe5fc00783e0efdb2c1d445d4c8eff7ed22") },
+        .{ .len = 32, .cs3 = &hex("39312523a78662d5be7fcbcc98ebf5a897687268d6ecccc0c07b25e25ecfe584"), .cs1 = &hex("97687268d6ecccc0c07b25e25ecfe58439312523a78662d5be7fcbcc98ebf5a8") },
+        .{ .len = 47, .cs3 = &hex("97687268d6ecccc0c07b25e25ecfe584b3fffd940c16a18c1b5549d2f838029e39312523a78662d5be7fcbcc98ebf5"), .cs1 = &hex("97687268d6ecccc0c07b25e25ecfe58439312523a78662d5be7fcbcc98ebf5b3fffd940c16a18c1b5549d2f838029e") },
+        .{ .len = 48, .cs3 = &hex("97687268d6ecccc0c07b25e25ecfe5849dad8bbb96c4cdc03bc103e1a194bbd839312523a78662d5be7fcbcc98ebf5a8"), .cs1 = &hex("97687268d6ecccc0c07b25e25ecfe58439312523a78662d5be7fcbcc98ebf5a89dad8bbb96c4cdc03bc103e1a194bbd8") },
+        .{ .len = 64, .cs3 = &hex("97687268d6ecccc0c07b25e25ecfe58439312523a78662d5be7fcbcc98ebf5a84807efe836ee89a526730dbc2f7bc8409dad8bbb96c4cdc03bc103e1a194bbd8"), .cs1 = &hex("97687268d6ecccc0c07b25e25ecfe58439312523a78662d5be7fcbcc98ebf5a89dad8bbb96c4cdc03bc103e1a194bbd84807efe836ee89a526730dbc2f7bc840") },
+    };
+};
+
+test "CTS: RFC 3962 (CS3) and OpenSSL (CS1) vectors, CS2 between them, both directions, in place" {
+    const zero_iv: [16]u8 = @splat(0);
+    for (cts_vectors) |v| {
+        const d = v.len - (v.len - 1) / 16 * 16;
+        var out: [64]u8 = undefined;
+        inline for (.{ CtsVariant.cs1, CtsVariant.cs2, CtsVariant.cs3 }) |variant| {
+            const want = switch (variant) {
+                .cs1 => v.cs1,
+                .cs2 => if (d == 16) v.cs1 else v.cs3,
+                .cs3 => v.cs3,
+            };
+            try testing.expectEqual(v.len, try encryptCts(Aes128, variant, &cts_key, zero_iv, cts_msg[0..v.len], &out));
+            try testing.expectEqualSlices(u8, want, out[0..v.len]);
+            var buf: [64]u8 = undefined;
+            @memcpy(buf[0..v.len], want);
+            _ = try decryptCts(Aes128, variant, &cts_key, zero_iv, buf[0..v.len], buf[0..v.len]);
+            try testing.expectEqualSlices(u8, cts_msg[0..v.len], buf[0..v.len]);
+            @memcpy(buf[0..v.len], cts_msg[0..v.len]);
+            _ = try encryptCts(Aes128, variant, &cts_key, zero_iv, buf[0..v.len], buf[0..v.len]);
+            try testing.expectEqualSlices(u8, want, buf[0..v.len]);
+        }
+    }
+    var out: [16]u8 = undefined;
+    try testing.expectError(error.TooShort, encryptCts(Aes128, .cs3, &cts_key, zero_iv, cts_msg[0..15], &out));
+    try testing.expectError(error.TooShort, decryptCts(Aes128, .cs1, &cts_key, zero_iv, "", &out));
+    try testing.expectError(error.BufferTooSmall, encryptCts(Aes128, .cs1, &cts_key, zero_iv, cts_msg[0..17], &out));
+    // One block: plain CBC in every variant.
+    _ = try encryptCts(Aes128, .cs3, &cts_key, zero_iv, cts_msg[0..16], &out);
+    var cbc: [16]u8 = undefined;
+    _ = try encrypt(Aes128, &cts_key, zero_iv, cts_msg[0..16], &cbc);
+    try testing.expectEqualSlices(u8, &cbc, &out);
+}
+
+test "ANSI X9.23: pad layout, round trip, refusals" {
+    var out: [32]u8 = undefined;
+    const n = try padAnsiX923("YELLOW SUBMARINE!", &out);
+    try testing.expectEqual(@as(usize, 32), n);
+    try testing.expectEqualSlices(u8, &(.{0} ** 14 ++ .{15}), out[17..32]);
+    try testing.expectEqual(@as(usize, 17), try unpadAnsiX923(out[0..n]));
+    out[20] = 1; // a non-zero filler byte
+    try testing.expectError(error.InvalidPadding, unpadAnsiX923(out[0..n]));
+    var full: [16]u8 = .{0} ** 15 ++ .{16};
+    try testing.expectEqual(@as(usize, 0), try unpadAnsiX923(&full));
+    full[15] = 17;
+    try testing.expectError(error.InvalidPadding, unpadAnsiX923(&full));
+    full[15] = 0;
+    try testing.expectError(error.InvalidPadding, unpadAnsiX923(&full));
+}
+
+test "ISO/IEC 7816-4: pad layout, round trip, refusals" {
+    var out: [32]u8 = undefined;
+    const n = try padIso7816("0123456789abcdef", &out);
+    try testing.expectEqual(@as(usize, 32), n);
+    try testing.expectEqualSlices(u8, &(.{0x80} ++ .{0} ** 15), out[16..32]);
+    try testing.expectEqual(@as(usize, 16), try unpadIso7816(out[0..n]));
+    var blk: [16]u8 = "abcdefghijklmno\x80".*;
+    try testing.expectEqual(@as(usize, 15), try unpadIso7816(&blk));
+    blk[15] = 0x81;
+    try testing.expectError(error.InvalidPadding, unpadIso7816(&blk));
+    blk = .{0} ** 16;
+    try testing.expectError(error.InvalidPadding, unpadIso7816(&blk)); // no marker
+    blk[3] = 0x80;
+    try testing.expectEqual(@as(usize, 3), try unpadIso7816(&blk));
+    blk[9] = 0x80; // the LAST non-zero byte decides
+    try testing.expectEqual(@as(usize, 9), try unpadIso7816(&blk));
+}
+
+test "ISO 10126 and zero padding" {
+    var prng = std.Random.DefaultPrng.init(1);
+    var out: [32]u8 = undefined;
+    const n = try padIso10126("abc", &out, prng.random());
+    try testing.expectEqual(@as(usize, 16), n);
+    try testing.expectEqual(@as(u8, 13), out[15]);
+    try testing.expectEqual(@as(usize, 3), try unpadIso10126(out[0..n]));
+
+    try testing.expectEqual(@as(usize, 16), try padZero("abc", &out));
+    try testing.expectEqualSlices(u8, &(.{0} ** 13), out[3..16]);
+    try testing.expectEqual(@as(usize, 3), try unpadZero(out[0..16]));
+    // Aligned: nothing added.
+    try testing.expectEqual(@as(usize, 16), try padZero("0123456789abcdef", &out));
+    try testing.expectEqual(@as(usize, 16), try unpadZero(out[0..16]));
+    try testing.expectEqual(@as(usize, 0), try unpadZero(""));
+    try testing.expectError(error.InvalidPadding, unpadZero(out[0..15]));
 }
 
 test {

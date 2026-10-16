@@ -942,8 +942,16 @@ dkg	ReleaseFast	combine	1	0	89feb80b007daf9a	6407896882d3491c
 # failure reason, and the scan loop contributes 0 contexts, so there is neither.
 # ⚠ The same `u1`-flag idiom did NOT survive the compiler in fss
 # (`dpf.zig:326`), which is why this is measured rather than reviewed.
-aescbc	ReleaseFast	pkcs7	1	1	aeee3d5799e4743f	c4046968725e140d
-aescbc	ReleaseFast	xmlenc	1	1	aeee3d5799e4743f	c4046968725e140d
+aescbc	ReleaseFast	pkcs7	1	1	1e319b3a46c755d1	c4046968725e140d
+aescbc	ReleaseFast	xmlenc	1	1	1e319b3a46c755d1	c4046968725e140d
+# 2026-10-16: the three strippers added for RustCrypto parity, same shape. x923
+# and iso7816 end in the same accept/reject branch (1); unpadZero never
+# rejects an aligned buffer, so it has no decision to disclose and measures 0
+# in-file -- its result length IS the secret trailing-zero count, which the
+# API returns by contract.
+aescbc	ReleaseFast	x923	1	1	1e319b3a46c755d1	c4046968725e140d
+aescbc	ReleaseFast	iso7816	1	1	1e319b3a46c755d1	c4046968725e140d
+aescbc	ReleaseFast	zero	1	0	1e319b3a46c755d1	c4046968725e140d
 # ── sealedbox: the secret-key text codecs ──────────────────────────────────
 # ⭐ These four were 8 / 7 / 43 / 47 until 2026-09-09, all of it std's
 # table-driven base64 and hex reached with a SECRET argument: 95 of the 105

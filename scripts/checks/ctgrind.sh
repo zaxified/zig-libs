@@ -210,7 +210,7 @@ declare -A TARGETS=(
     # ── round 3, 2026-09-09 ────────────────────────────────────────────────
     [bulletproofs]="rangeproof ipa"
     [paillier]="crt noncrt mul addm keygen"
-    [aescbc]="pkcs7 xmlenc"
+    [aescbc]="pkcs7 xmlenc x923 iso7816 zero"
     [tlock]="fp12pow decrypt"
     [ibe]="extract decrypt fp12pow"
     # ── round 4, 2026-09-09: the secp256k1 signing family ──────────────────
@@ -546,6 +546,9 @@ declare -A PATTERN=(
     # `aescbc` does its own arithmetic over a secret in exactly one file.
     [aescbc/pkcs7]='root[.]zig'
     [aescbc/xmlenc]='root[.]zig'
+    [aescbc/x923]='root[.]zig'
+    [aescbc/iso7816]='root[.]zig'
+    [aescbc/zero]='root[.]zig'
     [tlock/fp12pow]='tlock[.]zig|ciphersuite[.]zig|fp12[.]zig|fp6[.]zig|fp2[.]zig|fp[.]zig|g2[.]zig|scalar[.]zig|field[.]zig|montint[.]zig|limbs[.]zig'
     [tlock/decrypt]='tlock[.]zig|ciphersuite[.]zig|pairing[.]zig|fp12[.]zig|fp6[.]zig|fp2[.]zig|fp[.]zig|g2[.]zig|g1[.]zig|scalar[.]zig|mem[.]zig|field[.]zig|montint[.]zig|limbs[.]zig'
     [ibe/extract]='ibe[.]zig|g1[.]zig|fp[.]zig|scalar[.]zig|field[.]zig|montint[.]zig|limbs[.]zig'
@@ -785,6 +788,9 @@ declare -A LABEL=(
     [paillier/keygen]='paillier fromPrimes, p/q tainted'
     [aescbc/pkcs7]='aescbc unpadPkcs7 (N secret)'
     [aescbc/xmlenc]='aescbc unpadXmlEnc (N secret)'
+    [aescbc/x923]='aescbc unpadAnsiX923 (N secret)'
+    [aescbc/iso7816]='aescbc unpadIso7816 (marker position secret)'
+    [aescbc/zero]='aescbc unpadZero (trailing zeros secret)'
     [tlock/fp12pow]='tlock encrypt r->fp12Pow (F3)'
     [tlock/decrypt]='tlock decrypt+bls12_381 pairing'
     [ibe/extract]='ibe extract (msk -> G1)'

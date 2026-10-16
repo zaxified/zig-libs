@@ -34,5 +34,20 @@ pub inline fn run(comptime n: usize, comptime R: type, comptime f: anytype, args
 }
 
 /// Raw CBC `encrypt`/`decrypt` (key schedule + block loop) on the data path.
-/// A first guess; the coordinator measures the real depth in ReleaseFast.
-pub const cbc_burn = 4 * 1024;
+/// Measured 2026-10-16 in ReleaseFast (`stackprobe_test.zig`): the one-shot
+/// AES-256 decrypt dirties 959 B (512 left residue to 959 B); was 4 KiB, a
+/// first guess that cost ~80 ns per call.
+pub const cbc_burn = 1024;
+
+/// `Encryptor`/`Decryptor` `initInto`: the key schedule alone (measured clean
+/// at 512 B, 2026-10-16).
+pub const schedule_burn = 512;
+
+/// `Encryptor`/`Decryptor` `update`: the block loop over round keys held in
+/// the caller's struct (no key bytes in this frame, only plaintext blocks;
+/// measured clean at 512 B, 2026-10-16).
+pub const update_burn = 512;
+
+/// `encryptCts`/`decryptCts`: the one-shot body plus the stolen tail's two
+/// blocks (decryptCts measured 1359 B deep at a 1024 B burn, 2026-10-16).
+pub const cts_burn = 1536;

@@ -92,12 +92,15 @@ fn reloadVolatile(comptime n: usize, src: *const [n]u8) [n]u8 {
     return out;
 }
 
-const Target = enum { pkcs7, xmlenc };
+const Target = enum { pkcs7, xmlenc, x923, iso7816, zero };
 const Taint = enum { yes, no };
 
 fn parseTarget(s: []const u8) !Target {
     if (std.mem.eql(u8, s, "pkcs7")) return .pkcs7;
     if (std.mem.eql(u8, s, "xmlenc")) return .xmlenc;
+    if (std.mem.eql(u8, s, "x923")) return .x923;
+    if (std.mem.eql(u8, s, "iso7816")) return .iso7816;
+    if (std.mem.eql(u8, s, "zero")) return .zero;
     return error.UnknownTarget;
 }
 
@@ -120,7 +123,13 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // not a secret, so handling it here branches on nothing under test.
     const msg = secretPlaintext();
     var padded: [2 * block_len]u8 = undefined;
-    const padded_len = try root.padPkcs7(&msg, &padded);
+    // Each stripper reads the padding its own pad function writes.
+    const padded_len = switch (target) {
+        .pkcs7, .xmlenc => try root.padPkcs7(&msg, &padded),
+        .x923 => try root.padAnsiX923(&msg, &padded),
+        .iso7816 => try root.padIso7816(&msg, &padded),
+        .zero => try root.padZero(&msg, &padded),
+    };
 
     if (tainted) std.valgrind.memcheck.makeMemUndefined(padded[0..padded_len]);
     const buf = reloadVolatile(2 * block_len, &padded);
@@ -134,6 +143,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const n = switch (target) {
         .pkcs7 => root.unpadPkcs7(buf[0..padded_len]),
         .xmlenc => root.unpadXmlEnc(buf[0..padded_len]),
+        .x923 => root.unpadAnsiX923(buf[0..padded_len]),
+        .iso7816 => root.unpadIso7816(buf[0..padded_len]),
+        .zero => root.unpadZero(buf[0..padded_len]),
     } catch |err| {
         std.debug.print("rejected: {t}\n", .{err});
         return;

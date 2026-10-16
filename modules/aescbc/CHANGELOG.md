@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-16** — Scope core → parity (grade 3 → 2). New, all additive: `Encryptor`/`Decryptor` (key schedule once, chain across `update`s, `setIv`, `initInto`, `wipe`); `StreamEncryptor`/`StreamDecryptor` (any chunk length, `Padding` none/pkcs7/ansi_x923/iso7816/zero applied in `finish`); ciphertext stealing `encryptCts`/`decryptCts` (CS1/CS2/CS3); paddings `padAnsiX923`/`unpadAnsiX923`, `padIso10126`/`unpadIso10126`, `padIso7816`/`unpadIso7816`, `padZero`/`unpadZero`/`paddedLenZero`, `paddedLen`. Decryption now runs 8 blocks per `decryptWide` (16 KiB 4.7× faster). Dead-stack burns measured: one-shot 4 KiB → 1 KiB, CTS 1.5 KiB, `initInto`/`update` 512 B. Bench `zig build bench-aescbc`: 0.19–0.83× Go crypto/cipher, ≤ 1.03× OpenSSL 3.5.5. Fuzz harnesses `aescbc-cts`, `aescbc-stream`; ctgrind targets x923, iso7816, zero.
 - **2026-10-10** — AES-192: `encrypt`/`decrypt` take the new `aes192` module's `Aes192` like std's two (no code change, the API was already generic); SP800-38A F.2.3/F.2.4 KATs added and the CBC fuzz harness now draws AES-192 for a third of its inputs. `aes192` is a test-only dependency.
 - **2026-10-10** — tests: deterministic fuzz driver `AESCBC_FUZZ` (testkit) over CBC (AES-128/256 round trip, the exact effect of a flipped ciphertext bit, misaligned/short-output refused) and PKCS#7 / XML-Enc unpadding against a branching reference. No change to the library code.
 - **2026-10-09** — **BREAKING:** `encrypt` and `decrypt` take the key by pointer
