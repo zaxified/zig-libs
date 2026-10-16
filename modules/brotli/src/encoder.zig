@@ -91,7 +91,10 @@ const min_match = 4;
 /// costs no distance bits, so a few covered literals pay for it. Two bytes
 /// at the last distance are an implicit-distance command — google q5/q11
 /// leave thousands of them on fonts (2026-10-15); the greedy matcher takes
-/// two only there (three at the others: two cost text 0.1 %).
+/// two at the last two, three at the others — google q5–q9's rule
+/// (`FindLongestMatch`: `len == 2 && i < 2`). With `.q6`'s sparse search
+/// a 64 KiB font got 1 331 copies with it, 315 without (google q6: 1 298),
+/// and 1.6 % smaller; text ±0.1 % (2026-10-16).
 const min_ring_match = 2;
 /// Longest match searched for. Long runs (a file of zeros) are where a short
 /// cap hurt most: 512 left `zeros` at 651 bytes, 65 535 at 26 (the reference's
@@ -337,11 +340,14 @@ const DistRing = struct {
         for (self.last, 0..) |l, i| {
             if (l == d) return @intCast(i);
         }
-        for ([2]u16{ 4, 10 }, 0..) |first, which| {
-            for (deltas, 0..) |delta, k| {
-                if (@as(i64, self.last[which]) + delta == d) return first + @as(u16, @intCast(k));
-            }
-        }
+        // Within 3 of the last or second-last: `d + 3 - last` is 0..6 and
+        // picks the code from a nibble table (google/brotli
+        // `ComputeDistanceCode`; the `deltas` loop it replaces was a tenth
+        // of `.q4`'s block writer, 2026-10-16).
+        const o0 = @as(u64, d) +% 3 -% self.last[0];
+        if (o0 < 7) return @intCast(@as(u32, 0x9750468) >> @intCast(4 * o0) & 0xf);
+        const o1 = @as(u64, d) +% 3 -% self.last[1];
+        if (o1 < 7) return @intCast(@as(u32, 0xfdb1ace) >> @intCast(4 * o1) & 0xf);
         return null;
     }
 
@@ -596,7 +602,7 @@ fn assignLengths(
     // symbols by count gives (a block sort through an index array until
     // 2026-10-15, 15 % of `.q1`'s cycles). max(count, floor) is monotone
     // in count, so this one order stays valid for every floor tried below.
-    std.sort.pdq(u64, keys, {}, std.sort.asc(u64));
+    sortKeys(keys);
 
     const cap = 2 * m; // m leaves + (m - 1) internal nodes
     var wt_s: [2 * max_stack_symbols]u64 = undefined;
@@ -649,6 +655,25 @@ fn assignLengths(
     }
 }
 
+/// Ascending sort of `keys` (google `SortHuffmanTreeItems`: insertion below
+/// 13 items, Shell sort with gaps 132, 57, 23, 10, 4, 1 from there). Not
+/// `std.sort.pdq`: its insertion pass swaps through byte stores here, and the
+/// next 8-byte load of the same slot waits for them (store forwarding fails)
+/// — a fifth of `.q6`'s cycles on a 16 KiB font (2026-10-16).
+fn sortKeys(keys: []u64) void {
+    const gaps = [_]usize{ 132, 57, 23, 10, 4, 1 };
+    const first: usize = if (keys.len < 13) gaps.len - 1 else 0;
+    for (gaps[first..]) |gap| {
+        var i = gap;
+        while (i < keys.len) : (i += 1) {
+            const v = keys[i];
+            var j = i;
+            while (j >= gap and keys[j - gap] > v) : (j -= gap) keys[j] = keys[j - gap];
+            keys[j] = v;
+        }
+    }
+}
+
 /// The largest alphabet `assignLengths` works on the stack for (the
 /// command alphabet).
 const max_stack_symbols = tables.num_command_symbols;
@@ -659,6 +684,16 @@ const max_stack_symbols = tables.num_command_symbols;
 /// agree on random complete codes). A code that is not complete is
 /// `error.EncoderInvariant`, as the table would refuse it.
 fn canonicalCode(gpa: std.mem.Allocator, lengths: []const u8) GiveUp!Code {
+    const bits = try gpa.alloc(u16, lengths.len);
+    errdefer gpa.free(bits);
+    try canonicalBits(lengths, bits);
+    const len = try gpa.alloc(u8, lengths.len);
+    @memcpy(len, lengths);
+    return .{ .bits = bits, .len = len };
+}
+
+/// `canonicalCode`'s bit patterns into `bits` (`lengths.len` of them).
+fn canonicalBits(lengths: []const u8, bits: []u16) GiveUp!void {
     var count = [_]u32{0} ** 16;
     for (lengths) |l| {
         if (l > 15) return error.EncoderInvariant;
@@ -674,10 +709,6 @@ fn canonicalCode(gpa: std.mem.Allocator, lengths: []const u8) GiveUp!Code {
         code = (code + count[l - 1]) << 1;
         next[l] = code;
     }
-    const bits = try gpa.alloc(u16, lengths.len);
-    errdefer gpa.free(bits);
-    const len = try gpa.alloc(u8, lengths.len);
-    @memcpy(len, lengths);
     for (lengths, bits) |l, *b| {
         if (l == 0) {
             b.* = 0;
@@ -687,7 +718,6 @@ fn canonicalCode(gpa: std.mem.Allocator, lengths: []const u8) GiveUp!Code {
         next[l] += 1;
         b.* = @intCast(@as(u32, @bitReverse(@as(u16, @intCast(c)))) >> @intCast(16 - @as(u5, @intCast(l))));
     }
-    return .{ .bits = bits, .len = len };
 }
 
 /// Pick the cheaper of the next unused leaf and the next unused internal node.
@@ -795,8 +825,11 @@ fn rleCodeLengths(
 /// Write a complex prefix code for `lengths` (HSKIP = 0). `lengths` must be a
 /// complete code over at least two symbols.
 fn writeComplexCode(gpa: std.mem.Allocator, w: *BitWriter, lengths: []const u8) GiveUp!void {
-    var items: std.ArrayListUnmanaged(RleItem) = .empty;
-    defer items.deinit(gpa);
+    // A run of n lengths becomes at most n items, so they fit a buffer of
+    // the largest alphabet: `append` never allocates.
+    var item_buf: [max_rle_alphabet]RleItem = undefined;
+    if (lengths.len > item_buf.len) return error.EncoderInvariant;
+    var items: std.ArrayListUnmanaged(RleItem) = .initBuffer(&item_buf);
     try rleCodeLengths(gpa, lengths, &items);
     if (items.items.len == 0) return error.EncoderInvariant;
 
@@ -815,10 +848,16 @@ fn writeComplexCode(gpa: std.mem.Allocator, w: *BitWriter, lengths: []const u8) 
         }
     }
 
-    var cl_table = try huffman.buildComplex(gpa, &cl_lengths);
-    defer cl_table.deinit(gpa);
-    var cl_code = try codeFromTable(gpa, &cl_table, tables.code_length_codes);
-    defer cl_code.deinit(gpa);
+    // The code-length code's patterns, computed rather than read off a
+    // decoder table (`canonicalCode`; that table and the items' allocation
+    // were half of this function's time on a 16 KiB font, 2026-10-16). A
+    // one-symbol code writes no bits for its symbol.
+    var cl_bits: [tables.code_length_codes]u16 = @splat(0);
+    var cl_emit: [tables.code_length_codes]u8 = @splat(0);
+    if (m != 1) {
+        try canonicalBits(&cl_lengths, &cl_bits);
+        cl_emit = cl_lengths;
+    }
 
     // Header: HSKIP = 0, then the code-length code's own lengths in
     // `code_length_code_order`, using the fixed prefix code. The decoder stops
@@ -848,8 +887,8 @@ fn writeComplexCode(gpa: std.mem.Allocator, w: *BitWriter, lengths: []const u8) 
     }
 
     for (items.items) |it| {
-        if (cl_code.len[it.sym] == 0 and m != 1) return error.EncoderInvariant;
-        try cl_code.emit(w, it.sym);
+        if (cl_lengths[it.sym] == 0) return error.EncoderInvariant;
+        try w.writeBits(cl_bits[it.sym], @intCast(cl_emit[it.sym]));
         if (it.nextra != 0) try w.writeBits(it.extra, it.nextra);
     }
 }
@@ -889,6 +928,108 @@ fn buildAndWriteCodeWide(
     simple_alphabet: u32,
 ) GiveUp!Code {
     return buildAndWriteCodeLimited(gpa, w, counts, alphabet_size, simple_alphabet, tables.max_code_length);
+}
+
+/// `buildAndWriteCodeWide` with the code lengths taken from `counts`
+/// smoothed for a run-length coded header (`optimizeCountsForRle`): a
+/// meta-block's literal, command and distance codes, as google/brotli builds
+/// them from quality 4 on (`BrotliOptimizeHistograms`). The symbols are
+/// still priced by their real counts.
+fn buildAndWriteCodeRle(
+    gpa: std.mem.Allocator,
+    w: *BitWriter,
+    counts: []const u32,
+    alphabet_size: u32,
+    simple_alphabet: u32,
+) GiveUp!Code {
+    var buf: [max_rle_alphabet]u32 = undefined;
+    const smooth = buf[0..counts.len];
+    @memcpy(smooth, counts);
+    optimizeCountsForRle(smooth);
+    return buildAndWriteCodeWide(gpa, w, smooth, alphabet_size, simple_alphabet);
+}
+
+const max_rle_alphabet = @max(tables.num_command_symbols, dist_alphabet_max);
+
+/// Make `counts` give code lengths that run-length code shorter: runs of
+/// counts that are close are replaced by their mean, isolated zeros among
+/// small counts become ones. A port of google/brotli 1.2.0's
+/// `BrotliOptimizeHuffmanCountsForRle` (`c/enc/entropy_encode.c`, MIT, see
+/// `NOTICE`), its 24.8 fixed point included. A used symbol keeps a non-zero
+/// count. On a 64 KiB font at `.q6` the code headers were 2.4 KB without it,
+/// google's 0.7 KB (2026-10-16).
+fn optimizeCountsForRle(counts: []u32) void {
+    const streak_limit: u64 = 1240;
+    var nonzeros: usize = 0;
+    var smallest: u32 = 1 << 30;
+    for (counts) |c| {
+        if (c == 0) continue;
+        nonzeros += 1;
+        smallest = @min(smallest, c);
+    }
+    // Small histograms are modelled well as they are.
+    if (nonzeros < 16) return;
+    var length = counts.len;
+    while (counts[length - 1] == 0) length -= 1;
+    if (smallest < 4 and length - nonzeros < 6) {
+        for (1..length - 1) |i| {
+            if (counts[i - 1] != 0 and counts[i] == 0 and counts[i + 1] != 0) counts[i] = 1;
+        }
+    }
+    if (nonzeros < 28) return;
+
+    // Runs that already code well (five zeros or seven equal non-zeros on)
+    // are kept as they are.
+    var good: [max_rle_alphabet]bool = undefined;
+    @memset(good[0..length], false);
+    {
+        var symbol = counts[0];
+        var step: usize = 0;
+        for (0..length + 1) |i| {
+            if (i == length or counts[i] != symbol) {
+                if ((symbol == 0 and step >= 5) or (symbol != 0 and step >= 7)) {
+                    @memset(good[i - step .. i], true);
+                }
+                step = 1;
+                if (i != length) symbol = counts[i];
+            } else {
+                step += 1;
+            }
+        }
+    }
+
+    // A stride of counts within `streak_limit` (24.8) of its running mean
+    // becomes that mean.
+    var stride: u64 = 0;
+    var limit: u64 = 256 * (@as(u64, counts[0]) + counts[1] + counts[2]) / 3 + 420;
+    var sum: u64 = 0;
+    for (0..length + 1) |i| {
+        if (i == length or good[i] or (i != 0 and good[i - 1]) or
+            (256 * @as(u64, counts[i]) -% limit +% streak_limit) >= 2 * streak_limit)
+        {
+            if (stride >= 4 or (stride >= 3 and sum == 0)) {
+                // An all-zero stride stays zero.
+                const mean: u32 = if (sum == 0) 0 else @intCast(@max(1, (sum + stride / 2) / stride));
+                // `counts[i]` already belongs to the next stride.
+                @memset(counts[i - stride .. i], mean);
+            }
+            stride = 0;
+            sum = 0;
+            if (i + 2 < length) {
+                limit = 256 * (@as(u64, counts[i]) + counts[i + 1] + counts[i + 2]) / 3 + 420;
+            } else if (i < length) {
+                limit = 256 * @as(u64, counts[i]);
+            } else {
+                limit = 0;
+            }
+        }
+        stride += 1;
+        if (i != length) {
+            sum += counts[i];
+            if (stride >= 4) limit = (256 * sum + stride / 2) / stride;
+            if (stride == 4) limit += 120;
+        }
+    }
 }
 
 /// `buildAndWriteCodeWide` with codes of at most `limit` bits.
@@ -1240,7 +1381,7 @@ const Matcher = struct {
                 // Most fail on the first bytes: no full compare for those.
                 if (std.mem.readInt(u32, self.data[c..][0..4], .little) & 0xffff != head2) continue;
                 const l = matchLen(self.data, c, p, max_len);
-                if (l < @as(usize, if (i == 0) min_ring_match else 3)) continue;
+                if (l < @as(usize, if (i < 2) min_ring_match else 3)) continue;
                 // The last distance: code 0 or no distance symbol at all; the
                 // second-last: a two-bit-ish short code.
                 const g = @as(f32, @floatFromInt(l)) * self.lit_cost - @as(f32, if (i == 0) 3 else 5);
@@ -1964,9 +2105,14 @@ fn buildCommands(
     max_dist: usize,
     out: *std.ArrayListUnmanaged(Cmd),
 ) align(64) std.mem.Allocator.Error!void {
+    const sparse = skip_after != std.math.maxInt(usize);
     var p = start;
     var lit_start = start;
     var pending: ?Match = null;
+    // From here on, positions are skipped (google/brotli's
+    // `apply_random_heuristics`, `backward_references_inc.h`, MIT, see
+    // `NOTICE`): `skip_after` past the last copy's start plus twice its length.
+    var skip_from = start +| skip_after;
     // A local copy: read through `matcher` it would be loaded again at
     // every position.
     const x = matcher.prefix;
@@ -1979,10 +2125,18 @@ fn buildCommands(
         pending = null;
         if (m == null) {
             matcher.insert(p);
-            // A long run without a match (binary or compressed data):
-            // look at fewer of its positions, as `.q4` does.
-            const run = p - lit_start;
-            p += if (run < skip_after) 1 else @min(fast_skip_max, 1 + ((run - skip_after) >> 5));
+            p += 1;
+            // A long run without a match (binary or compressed data): the
+            // next 8 positions are only inserted, every second one, and
+            // `4 * skip_after` later the next 16, every fourth — google's
+            // steps (the gradual `.q4`-like ramp before cost fonts 1.3× of
+            // google q6's time, 2026-10-16).
+            if (sparse and p > skip_from) {
+                const far = p > skip_from + 4 * skip_after;
+                const step: usize = if (far) 4 else 2;
+                const jump = @min(p + step * 4, end);
+                while (p < jump) : (p += step) matcher.insert(p);
+            }
             continue;
         }
         matcher.insert(p);
@@ -2012,6 +2166,14 @@ fn buildCommands(
         if (ring_n != 0 and word == 0 and m.?.dist != matcher.ring.last[0]) matcher.ring.update(m.?.dist, null);
         matcher.prefetch(p + len);
         var q = p + 1;
+        if (sparse) {
+            skip_from = p + 2 * @as(usize, len) + skip_after;
+            // A run (a copy from less than a quarter of its length back):
+            // only its last `4 * dist` positions, so that it does not fill
+            // its bucket with copies of itself (google's StoreRange bounds).
+            const d: usize = m.?.dist;
+            if (word == 0 and d < len >> 2) q = @max(q, p + len - 4 * d);
+        }
         while (q < p + len) : (q += 1) matcher.insert(q);
         p += len;
         lit_start = p;
@@ -3380,26 +3542,28 @@ fn writeContextMap(gpa: std.mem.Allocator, w: *BitWriter, map: []const u8, ntree
     const ranks = try gpa.alloc(u8, map.len);
     defer gpa.free(ranks);
     moveToFront(map, ranks);
-    var scratch = BitWriter{ .gpa = gpa };
-    defer scratch.buf.deinit(gpa);
+    // Each try goes to `trial`, resumed at `w`'s bit; the shortest is kept
+    // in `best` and spliced into `w` rather than written a last time.
+    const at = w.mark();
+    var trial = BitWriter{ .gpa = gpa };
+    defer trial.buf.deinit(gpa);
+    var best = BitWriter{ .gpa = gpa };
+    defer best.buf.deinit(gpa);
     var best_bits: usize = std.math.maxInt(usize);
-    var best_mtf = false;
-    var best_rle: u5 = 0;
     for ([2]bool{ false, true }) |mtf| {
         // RLEMAX above the longest run's code only adds symbols.
         const top = longestZeroRunCode(if (mtf) ranks else map);
         for ([3]u5{ 0, top -| 1, top }, 0..) |rle, k| {
             if (k > 0 and rle == 0) continue;
-            scratch.resumeAt(.{ .len = 0, .acc = 0, .cnt = 0 });
-            try writeMapSymbols(gpa, &scratch, if (mtf) ranks else map, ntrees, rle, mtf);
-            if (scratch.bitPos() < best_bits) {
-                best_bits = scratch.bitPos();
-                best_mtf = mtf;
-                best_rle = rle;
+            trial.resumeAt(at);
+            try writeMapSymbols(gpa, &trial, if (mtf) ranks else map, ntrees, rle, mtf);
+            if (trial.bitPos() < best_bits) {
+                best_bits = trial.bitPos();
+                std.mem.swap(BitWriter, &trial, &best);
             }
         }
     }
-    try writeMapSymbols(gpa, w, if (best_mtf) ranks else map, ntrees, best_rle, best_mtf);
+    try w.takeFrom(at, &best);
 }
 
 /// The move-to-front ranks of `map` (what the decoder's inverse transform
@@ -3439,7 +3603,8 @@ fn writeMapSymbols(gpa: std.mem.Allocator, w: *BitWriter, vals: []const u8, ntre
         try w.writeBits(rle - 1, 4);
     }
     const alphabet = ntrees + rle;
-    var counts: [256 + 16]u32 = @splat(0);
+    var counts: [256 + 16]u32 = undefined;
+    Matcher.fillZero(counts[0..alphabet]);
     var it: ZeroRuns = .{ .vals = vals, .rle = rle };
     while (it.next()) |sym| counts[sym.code] += 1;
     var code = try buildAndWriteCode(gpa, w, counts[0..alphabet], @intCast(alphabet));
@@ -3617,10 +3782,15 @@ fn writeCompressedBlock(
 
     const cmd_counts = try gpa.alloc(u32, tables.num_command_symbols);
     defer gpa.free(cmd_counts);
-    @memset(cmd_counts, 0);
-    var dist_counts: [dist_contexts][dist_alphabet_max]u32 = @splat(@splat(0));
+    Matcher.fillZero(cmd_counts);
     if (env.large_window and (env.dist.npostfix != 0 or env.dist.ndirect != 0)) return error.EncoderInvariant;
     const n_dist: u32 = if (env.large_window) dist_alphabet_large else env.dist.alphabet();
+    // Only the first `n_dist` of each row are used (64 of 520 for the
+    // default parameters): zeroing whole rows here and below was most of
+    // `.q6`'s memset on a 16 KiB font, `@memset` being byte-wise
+    // (`Matcher.fillZero`).
+    var dist_counts: [dist_contexts][dist_alphabet_max]u32 = undefined;
+    for (&dist_counts) |*row| @memset(row[0..n_dist], 0);
 
     var covered: usize = 0;
     var lit_pos = start;
@@ -3699,7 +3869,8 @@ fn writeCompressedBlock(
     defer gpa.free(lit_map);
     var lit_alloc: [][tables.num_literal_symbols]u32 = &.{};
     defer gpa.free(lit_alloc);
-    var single_counts: [tables.num_literal_symbols]u32 = @splat(0);
+    var single_counts: [tables.num_literal_symbols]u32 = undefined;
+    Matcher.fillZero(&single_counts);
     var lit_ntrees: usize = 0;
     if (effort == .q6 or effort == .q9) {
         // `single_literal_code`: one literal type and code (the real-bits
@@ -3810,14 +3981,11 @@ fn writeCompressedBlock(
         else
             try block_split.Split.single(gpa, n_lits));
         n_blocks = 1;
-        {
+        if (split_on) {
             const syms = try gpa.alloc(u16, @max(cmds.len, n_dsyms));
             defer gpa.free(syms);
             for (res, syms[0..cmds.len]) |r, *s| s.* = r.sym;
-            blocks[1] = try .init(gpa, if (split_on)
-                try block_split.split(u16, gpa, syms[0..cmds.len], tables.num_command_symbols, cmd_split_params(rounds))
-            else
-                try block_split.Split.single(gpa, cmds.len));
+            blocks[1] = try .init(gpa, try block_split.split(u16, gpa, syms[0..cmds.len], tables.num_command_symbols, cmd_split_params(rounds)));
             n_blocks = 2;
             var k: usize = 0;
             for (res) |r| {
@@ -3825,10 +3993,13 @@ fn writeCompressedBlock(
                 syms[k] = r.dist_sym;
                 k += 1;
             }
-            blocks[2] = try .init(gpa, if (split_on)
-                try block_split.split(u16, gpa, syms[0..n_dsyms], n_dist, dist_split_params(rounds))
-            else
-                try block_split.Split.single(gpa, n_dsyms));
+            blocks[2] = try .init(gpa, try block_split.split(u16, gpa, syms[0..n_dsyms], n_dist, dist_split_params(rounds)));
+            n_blocks = 3;
+        } else {
+            // `.q4`: one type each, no symbols to look at.
+            blocks[1] = try .init(gpa, try block_split.Split.single(gpa, cmds.len));
+            n_blocks = 2;
+            blocks[2] = try .init(gpa, try block_split.Split.single(gpa, n_dsyms));
             n_blocks = 3;
         }
         const nlt: usize = blocks[0].split.ntypes;
@@ -3916,7 +4087,7 @@ fn writeCompressedBlock(
     if (it == 1) {
         @memcpy(cmd_type_counts, cmd_counts);
     } else {
-        @memset(cmd_type_counts, 0);
+        Matcher.fillZero(cmd_type_counts);
         var walk: TypeWalk = .{ .split = &blocks[1].split };
         for (res) |r| cmd_type_counts[@as(usize, walk.next()) * tables.num_command_symbols + r.sym] += 1;
     }
@@ -3932,9 +4103,11 @@ fn writeCompressedBlock(
     const dist_type_counts = try gpa.alloc([dist_contexts][dist_alphabet_max]u32, dt);
     defer gpa.free(dist_type_counts);
     if (dt == 1) {
-        dist_type_counts[0] = dist_counts;
+        for (&dist_type_counts[0], &dist_counts) |*o, *row| @memcpy(o[0..n_dist], row[0..n_dist]);
     } else {
-        @memset(dist_type_counts, @splat(@splat(0)));
+        for (dist_type_counts) |*t| {
+            for (t) |*row| @memset(row[0..n_dist], 0);
+        }
         var walk: TypeWalk = .{ .split = &blocks[2].split };
         for (res) |r| {
             if (r.has_dist) dist_type_counts[walk.next()][r.dist_ctx][r.dist_sym] += 1;
@@ -3943,7 +4116,7 @@ fn writeCompressedBlock(
     var dist_trees: usize = 0;
     const dist_tree_counts = try gpa.alloc([dist_alphabet_max]u32, dt * dist_contexts);
     defer gpa.free(dist_tree_counts);
-    @memset(dist_tree_counts, @splat(0));
+    for (dist_tree_counts) |*row| @memset(row[0..n_dist], 0);
     for (0..dt) |t| {
         var m: [dist_contexts]u8 = undefined;
         const ntr = clusterDistances(&dist_type_counts[t], n_dist, &m);
@@ -3997,7 +4170,7 @@ fn writeCompressedBlock(
     defer for (lit_codes[0..built]) |*c| c.deinit(gpa);
     const codes_from = w.bitPos();
     while (built < lit_ntrees) : (built += 1) {
-        lit_codes[built] = try buildAndWriteCode(gpa, w, &lit_counts[built], tables.num_literal_symbols);
+        lit_codes[built] = try buildAndWriteCodeRle(gpa, w, &lit_counts[built], tables.num_literal_symbols, tables.num_literal_symbols);
     }
     lit_part += w.bitPos() - codes_from;
 
@@ -4020,7 +4193,7 @@ fn writeCompressedBlock(
         // NBLTYPES = 1, one context mode, a one-code map.
         try scratch.writeBits(0, 3);
         try writeContextMap(gpa, &scratch, &.{}, 1);
-        var single_code = try buildAndWriteCode(gpa, &scratch, &single_counts, tables.num_literal_symbols);
+        var single_code = try buildAndWriteCodeRle(gpa, &scratch, &single_counts, tables.num_literal_symbols, tables.num_literal_symbols);
         defer single_code.deinit(gpa);
         var single_part = scratch.bitPos();
         for (single_counts, single_code.len) |c, l| single_part += @as(usize, c) * l;
@@ -4031,14 +4204,14 @@ fn writeCompressedBlock(
     var cmd_built: usize = 0;
     defer for (cmd_codes[0..cmd_built]) |*c| c.deinit(gpa);
     while (cmd_built < it) : (cmd_built += 1) {
-        cmd_codes[cmd_built] = try buildAndWriteCode(gpa, w, cmd_type_counts[cmd_built * tables.num_command_symbols ..][0..tables.num_command_symbols], tables.num_command_symbols);
+        cmd_codes[cmd_built] = try buildAndWriteCodeRle(gpa, w, cmd_type_counts[cmd_built * tables.num_command_symbols ..][0..tables.num_command_symbols], tables.num_command_symbols, tables.num_command_symbols);
     }
     const dist_codes = try gpa.alloc(Code, dist_trees);
     defer gpa.free(dist_codes);
     var dist_built: usize = 0;
     defer for (dist_codes[0..dist_built]) |*c| c.deinit(gpa);
     while (dist_built < dist_trees) : (dist_built += 1) {
-        dist_codes[dist_built] = try buildAndWriteCodeWide(gpa, w, dist_tree_counts[dist_built][0..n_dist], n_dist, if (env.large_window) dist_alphabet_large_max else n_dist);
+        dist_codes[dist_built] = try buildAndWriteCodeRle(gpa, w, dist_tree_counts[dist_built][0..n_dist], n_dist, if (env.large_window) dist_alphabet_large_max else n_dist);
     }
 
     // --- commands -----------------------------------------------------------
@@ -4983,6 +5156,21 @@ fn sliceCost(h: []const u32) f64 {
 /// is the code's number (assigned in order of first use); returns how many
 /// codes.
 fn clusterDistances(counts: *const [dist_contexts][dist_alphabet_max]u32, n_dist: usize, map: *[dist_contexts]u8) usize {
+    // The cost of each non-empty set of contexts under one code, once: a
+    // partition's groups are such sets (zeroing and summing per group of
+    // each partition was 5 % of `.q6` on a 4 KiB font, 2026-10-16).
+    var set_cost: [1 << dist_contexts]f64 = undefined;
+    {
+        var merged: [dist_alphabet_max]u32 = undefined;
+        for (1..1 << dist_contexts) |set| {
+            var rest = set & (set - 1);
+            @memcpy(merged[0..n_dist], counts[@ctz(set)][0..n_dist]);
+            while (rest != 0) : (rest &= rest - 1) {
+                for (merged[0..n_dist], counts[@ctz(rest)][0..n_dist]) |*m, c| m.* += c;
+            }
+            set_cost[set] = sliceCost(merged[0..n_dist]);
+        }
+    }
     // Restricted growth strings over four items.
     var best: f64 = std.math.inf(f64);
     var best_map: [dist_contexts]u8 = @splat(0);
@@ -5007,14 +5195,10 @@ fn clusterDistances(counts: *const [dist_contexts][dist_alphabet_max]u32, n_dist
         if (!ok) continue;
         const groups: usize = top + 1;
         var cost: f64 = 0;
-        var merged: [dist_alphabet_max]u32 = undefined;
         for (0..groups) |g| {
-            @memset(merged[0..n_dist], 0);
-            for (0..dist_contexts) |ctx| {
-                if (cand[ctx] != g) continue;
-                for (merged[0..n_dist], counts[ctx][0..n_dist]) |*m, c| m.* += c;
-            }
-            cost += sliceCost(merged[0..n_dist]);
+            var set: usize = 0;
+            for (cand, 0..) |c, ctx| set |= @as(usize, @intFromBool(c == g)) << @intCast(ctx);
+            cost += set_cost[set];
         }
         if (groups > 1) cost += 12;
         if (cost < best) {
@@ -6175,6 +6359,87 @@ test "assignLengths honours the 5-bit limit of the code-length alphabet" {
     for (lengths) |l| try testing.expect(l >= 1 and l <= 5);
     var t = try huffman.buildComplex(gpa, &lengths);
     t.deinit(gpa);
+}
+
+test "sortKeys: ascending, as a library sort, at every length up to an alphabet" {
+    var seed: u64 = 0x5eed_0016;
+    var keys: [tables.num_command_symbols + 100]u64 = undefined;
+    var want: [keys.len]u64 = undefined;
+    for (0..keys.len + 1) |n| {
+        for (keys[0..n]) |*k| {
+            seed = seed *% 6364136223846793005 +% 1442695040888963407;
+            // Few distinct counts (ties broken by the symbol bits below),
+            // as in a real histogram.
+            k.* = (seed >> 60) << 32 | (seed >> 20 & 0xffff);
+        }
+        @memcpy(want[0..n], keys[0..n]);
+        std.sort.pdq(u64, want[0..n], {}, std.sort.asc(u64));
+        sortKeys(keys[0..n]);
+        try testing.expectEqualSlices(u64, want[0..n], keys[0..n]);
+    }
+}
+
+/// `tools/c_oracle/rle_counts_kat.c`'s histogram `n`, from the same
+/// generator.
+fn rleKatCase(n: u32, buf: *[tables.num_command_symbols]u32) []u32 {
+    var state: u64 = 0x9e3779b97f4a7c15 *% @as(u64, n + 1);
+    const len: usize = if (n == 1) tables.num_command_symbols else 256;
+    for (buf[0..len], 0..) |*c, i| {
+        state = state *% 6364136223846793005 +% 1442695040888963407;
+        const r: u32 = @truncate(state >> 33);
+        const k: u32 = @intCast(i);
+        c.* = switch (n) {
+            0 => if (r % 7 == 0) 0 else (r >> 7) % (1 + k * 37 % 50),
+            1 => if (k % 24 < 8 or k >= 690) 0 else 1 + r % 3,
+            2 => 1000 / (1 + k / 8) + r % 5,
+            else => if (r % 11 == 0) 0 else 40 * (1 + k / 32) + r % 9,
+        };
+    }
+    return buf[0..len];
+}
+
+test "optimizeCountsForRle: google/brotli's smoothing, count for count" {
+    // SHA-256 of the counts (u32 little-endian) google/brotli 1.2.0's
+    // `BrotliOptimizeHuffmanCountsForRle` leaves, from
+    // `tools/c_oracle/rle_counts_kat.c` (2026-10-16). It changes 30, 291,
+    // 207 and 153 of them.
+    const want = [_]*const [64]u8{
+        "a27023958f2e960b48af7228061e217d3c098bca2366c1c743ebef6c37bde1fc",
+        "7e1c914ecb693000e644a46f35342f1a877d4c97ae141da5eb5c46f73aa9bd49",
+        "d29f0732a08c78285bf5fbf54fe280cb737d7e6d9eba587ef681a22cf8228839",
+        "aff1a49d9e14736ceb63c40eba058e9c560f1cd0f6f6d35cc2f2f3f3a6012eb2",
+    };
+    for (want, 0..) |hex, n| {
+        var buf: [tables.num_command_symbols]u32 = undefined;
+        const counts = rleKatCase(@intCast(n), &buf);
+        optimizeCountsForRle(counts);
+        var h = std.crypto.hash.sha2.Sha256.init(.{});
+        for (counts) |c| h.update(&std.mem.toBytes(std.mem.nativeToLittle(u32, c)));
+        var digest: [32]u8 = undefined;
+        _ = try std.fmt.hexToBytes(&digest, hex);
+        try testing.expectEqualSlices(u8, &digest, &h.finalResult());
+    }
+}
+
+test "optimizeCountsForRle: a used symbol stays used; under 16 used, nothing changes" {
+    var seed: u64 = 0x0071_e5;
+    for (0..300) |iter| {
+        var counts: [256]u32 = undefined;
+        // Up to 40 used symbols, so both sides of the 16 threshold.
+        const dens: u64 = 1 + iter % 40;
+        for (&counts) |*c| {
+            seed = seed *% 6364136223846793005 +% 1442695040888963407;
+            c.* = if ((seed >> 40) % 256 < dens * 6) @intCast(1 + (seed >> 20) % 300) else 0;
+        }
+        const before = counts;
+        optimizeCountsForRle(&counts);
+        var used: usize = 0;
+        for (before, counts) |b, a| {
+            used += @intFromBool(b != 0);
+            if (b != 0) try testing.expect(a != 0);
+        }
+        if (used < 16) try testing.expectEqualSlices(u32, &before, &counts);
+    }
 }
 
 test "codeFromTable patterns decode back to their own symbols" {

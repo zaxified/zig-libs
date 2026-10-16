@@ -35,17 +35,39 @@ pub inline fn fastLog2(v: usize) f64 {
     return @log2(@as(f64, @floatFromInt(v)));
 }
 
+/// p · log2(p) for p below 256, the same products `fastLog2` gives.
+const nlog2_table: [256]f64 = blk: {
+    var t: [256]f64 = undefined;
+    for (&t, log2_table, 0..) |*o, l, i| o.* = @as(f64, @floatFromInt(i)) * l;
+    break :blk t;
+};
+
+inline fn nlog2(p: u32) f64 {
+    if (p < nlog2_table.len) return nlog2_table[p];
+    return @as(f64, @floatFromInt(p)) * fastLog2(p);
+}
+
 /// `BrotliBitsEntropy`: Shannon bits of the counts, at least one bit per
-/// symbol (each is coded alone by a prefix code).
+/// symbol (each is coded alone by a prefix code). Four sums in turn: one
+/// waited on each addition before it, and the splitter's entropies took
+/// twice google's time on a font (2026-10-16).
 pub fn bitsEntropy(h: []const u32) f64 {
     var sum: usize = 0;
-    var r: f64 = 0;
-    for (h) |p| {
-        sum += p;
-        r -= @as(f64, @floatFromInt(p)) * fastLog2(p);
+    var r: [4]f64 = @splat(0);
+    var i: usize = 0;
+    while (i + 4 <= h.len) : (i += 4) {
+        inline for (0..4) |k| {
+            sum += h[i + k];
+            r[k] += nlog2(h[i + k]);
+        }
     }
-    if (sum != 0) r += @as(f64, @floatFromInt(sum)) * fastLog2(sum);
-    return @max(r, @as(f64, @floatFromInt(sum)));
+    while (i < h.len) : (i += 1) {
+        sum += h[i];
+        r[0] += nlog2(h[i]);
+    }
+    var bits = -((r[0] + r[1]) + (r[2] + r[3]));
+    if (sum != 0) bits += @as(f64, @floatFromInt(sum)) * fastLog2(sum);
+    return @max(bits, @as(f64, @floatFromInt(sum)));
 }
 
 /// `EstimateEntropy`: Shannon bits of the counts, no floor.
@@ -313,6 +335,29 @@ test "bitsEntropy: at least a bit a symbol, Shannon above" {
     try testing.expectEqual(@as(f64, 0), bitsEntropy(&.{ 0, 0, 0 }));
     try testing.expectEqual(@as(f64, 10), bitsEntropy(&.{ 10, 0 }));
     try testing.expectApproxEqAbs(@as(f64, 2000), bitsEntropy(&.{ 250, 250, 250, 250, 0, 0, 0, 0 }), 1e-9);
+}
+
+test "bitsEntropy: the four sums give google's one sum, every length and count range" {
+    var seed: u64 = 0xe17_0016;
+    var h: [300]u32 = undefined;
+    for (0..h.len + 1) |n| {
+        for (h[0..n]) |*c| {
+            seed = seed *% 6364136223846793005 +% 1442695040888963407;
+            // Below and above the 256 the table covers.
+            const range: u64 = if (n % 2 == 0) 300 else 100_000;
+            c.* = @intCast((seed >> 33) % range);
+        }
+        // `BrotliBitsEntropy` as written: one running sum.
+        var sum: usize = 0;
+        var r: f64 = 0;
+        for (h[0..n]) |p| {
+            sum += p;
+            r -= @as(f64, @floatFromInt(p)) * fastLog2(p);
+        }
+        if (sum != 0) r += @as(f64, @floatFromInt(sum)) * fastLog2(sum);
+        const want = @max(r, @as(f64, @floatFromInt(sum)));
+        try testing.expectApproxEqRel(want, bitsEntropy(h[0..n]), 1e-12);
+    }
 }
 
 test "Splitter: alternating sections get their own types, lengths add up" {

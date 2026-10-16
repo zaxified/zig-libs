@@ -518,7 +518,7 @@ fn fzDict(case: usize, serial: bool) struct { bytes: []const u8, sd: ?*const bro
         var raw_bytes: [corpus.dict_cases.len]?[]u8 = @splat(null);
     };
     // Never freed: `std.heap.page_allocator`, outside the run's leak check.
-    const gpa = std.heap.page_allocator;
+    const gpa = std.heap.page_allocator; // global-alloc-ok: fuzz-harness cache in a test file, built once per process and never freed, outside the run's leak check
     if (serial) {
         if (Cache.serial_bytes[case] == null) {
             const bytes = switch (case) {

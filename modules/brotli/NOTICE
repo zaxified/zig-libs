@@ -36,7 +36,12 @@ ports `c/enc/hash.h` (`SearchInStaticDictionary`, `TestStaticDictionaryItem`,
 the cut-off transform list); `writeQ0` and the `q0*` functions in
 `src/encoder.zig` (ADDED 2026-10-16, `.q0`) port `c/enc/compress_fragment.c`
 (`BrotliCompressFragmentFast` and its helpers, `kCmdHistoSeed`) and the
-default command code of `c/enc/encode.c` (`InitCommandPrefixCodes`). Those
+default command code of `c/enc/encode.c` (`InitCommandPrefixCodes`);
+`buildCommands`' skipping through literal runs and its run-bounded inserts
+(ADDED 2026-10-16, R16) follow `c/enc/backward_references_inc.h`
+(`CreateBackwardReferences`: `apply_random_heuristics`, the `StoreRange`
+bounds), and `sortKeys` follows `c/enc/entropy_encode.h`
+(`SortHuffmanTreeItems`, `kBrotliShellGaps`). Those
 files carry
 "Copyright 2010–2016 Google Inc. All Rights Reserved. Distributed under MIT
 license." Changes are listed in the file's header. The vector tag compare in
