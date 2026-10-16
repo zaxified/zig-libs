@@ -34,6 +34,8 @@ const http = @import("http");
 const router = @import("router");
 const jws = @import("jws.zig");
 const x509 = @import("x509.zig");
+const rsa = @import("rsa");
+const netaddr = @import("netaddr");
 
 const Allocator = std.mem.Allocator;
 const Client = @This();
@@ -181,6 +183,11 @@ pub const Options = struct {
     eab: ?ExternalAccountBinding = null,
     /// Algorithm of the certificate keys `obtain` mints (default ES256).
     cert_key_alg: jws.Alg = .es256,
+    /// Modulus size of the certificate keys `obtain` mints when
+    /// `cert_key_alg = .rs256`: 2048, 3072 or 4096 (else
+    /// `error.UnsupportedKeySize`). Generation takes a while — seconds for
+    /// 4096 bits in an optimized build.
+    cert_rsa_bits: u16 = 2048,
     /// ACME directory URL. **Defaults to Let's Encrypt STAGING** (untrusted
     /// test certificates!) so accidental runs cannot burn production rate
     /// limits — set `letsencrypt_production` explicitly to go live.
@@ -244,6 +251,8 @@ pub const Error = error{
     /// (`*.example.org`) while `challenge_type` is not `dns_01` — no other
     /// challenge can validate one (RFC 8555 §7.1.3, and CA policy).
     InvalidDomain,
+    /// `Options.cert_rsa_bits` is not 2048, 3072 or 4096.
+    UnsupportedKeySize,
     /// `obtainWithCsr`: the CSR does not parse, or its self-signature does
     /// not verify; `obtainWith`: `csr_extensions` repeats an OID or names
     /// the subjectAltName.
@@ -759,7 +768,8 @@ fn daysFromCivil(y_in: i64, m: u8, d: u8) i64 {
 pub const Certificate = struct {
     /// `application/pem-certificate-chain` body, gpa-owned.
     chain_pem: []u8,
-    /// The leaf private key as an `EC PRIVATE KEY` PEM, gpa-owned.
+    /// The leaf private key, gpa-owned: an `EC PRIVATE KEY` PEM (RFC 5915), or
+    /// an `RSA PRIVATE KEY` PEM (PKCS#1) for `cert_key_alg = .rs256`.
     key_pem: []u8,
     /// Leaf `notAfter`, epoch seconds — feed it to `needsRenewal` later.
     not_after: u64,
@@ -790,6 +800,14 @@ pub fn obtainWith(c: *Client, domains: []const []const u8, opts: ObtainOptions) 
     defer arena.deinit();
     const a = arena.allocator();
 
+    // Refused before an order is placed (keygen comes after the authorizations).
+    if (c.options.cert_key_alg == .rs256) switch (c.options.cert_rsa_bits) {
+        2048, 3072, 4096 => {},
+        else => {
+            c.note("cert_rsa_bits must be 2048, 3072 or 4096");
+            return error.UnsupportedKeySize;
+        },
+    };
     const order = try c.orderReady(a, domains, opts);
 
     // Finalize with a CSR for a fresh certificate key (§7.4; the account
@@ -800,7 +818,22 @@ pub fn obtainWith(c: *Client, domains: []const []const u8, opts: ObtainOptions) 
     // Fail-closed draw: this key is what the issued certificate will
     // attest to, and it goes on to terminate TLS for the domain.
     var cert_key: jws.AnyKeyPair = undefined;
-    jws.generateAnyKeyPair(&cert_key, c.options.cert_key_alg, c.io);
+    // An RSA pair is tens of KiB: it lives on the heap (wiped, then freed)
+    // and the union holds a pointer to it.
+    var rsa_pair: ?*rsa.KeyPair = null;
+    defer if (rsa_pair) |kp| {
+        std.crypto.secureZero(u8, std.mem.asBytes(kp));
+        c.gpa.destroy(kp);
+    };
+    switch (c.options.cert_key_alg) {
+        .rs256 => {
+            const kp = try c.gpa.create(rsa.KeyPair);
+            rsa_pair = kp;
+            jws.generateRsaKeyPair(kp, c.options.cert_rsa_bits, c.io) catch unreachable; // bits checked above
+            cert_key = .{ .rs256 = kp };
+        },
+        else => |alg| jws.generateAnyKeyPair(&cert_key, alg, c.io),
+    }
     defer std.crypto.secureZero(u8, std.mem.asBytes(&cert_key));
     const csr_der = x509.csrDerWith(a, &cert_key, domains, opts.csr_extensions) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -812,7 +845,10 @@ pub fn obtainWith(c: *Client, domains: []const []const u8, opts: ObtainOptions) 
     const chain = try c.finalizeAndDownload(a, order, csr_der, opts.preferred_chain);
     const chain_pem = try c.gpa.dupe(u8, chain.pem);
     errdefer c.gpa.free(chain_pem);
-    const key_pem = try x509.ecPrivateKeyToPem(c.gpa, &cert_key);
+    const key_pem = if (rsa_pair) |kp|
+        try x509.rsaPrivateKeyToPem(c.gpa, kp)
+    else
+        try x509.ecPrivateKeyToPem(c.gpa, &cert_key);
     return .{ .chain_pem = chain_pem, .key_pem = key_pem, .not_after = chain.not_after };
 }
 
@@ -849,7 +885,15 @@ pub fn obtainWithCsr(c: *Client, csr_der: []const u8, opts: ObtainOptions) Error
     defer arena.deinit();
     const a = arena.allocator();
 
-    const order = try c.orderReady(a, csr.sans, opts);
+    // The identifiers: the dNSName SANs, then the iPAddress ones as text.
+    const names = try a.alloc([]const u8, csr.sans.len + csr.ip_sans.len);
+    @memcpy(names[0..csr.sans.len], csr.sans);
+    for (names[csr.sans.len..], csr.ip_sans) |*slot, octets| {
+        const ip: netaddr.Ip = if (octets.len == 4) .{ .v4 = octets[0..4].* } else .{ .v6 = octets[0..16].* };
+        var buf: [netaddr.max_ip_text_len]u8 = undefined;
+        slot.* = try a.dupe(u8, netaddr.formatIp(ip, &buf));
+    }
+    const order = try c.orderReady(a, names, opts);
     const chain = try c.finalizeAndDownload(a, order, csr_der, opts.preferred_chain);
     return .{ .chain_pem = try c.gpa.dupe(u8, chain.pem), .not_after = chain.not_after };
 }
@@ -861,6 +905,11 @@ const ReadyOrder = struct { url: []const u8, finalize: []const u8 };
 fn orderReady(c: *Client, a: Allocator, domains: []const []const u8, opts: ObtainOptions) Error!ReadyOrder {
     if (domains.len == 0) return error.InvalidDomain;
     for (domains) |name| {
+        if (try ipIdentifier(name) != null) {
+            // RFC 8738 §7: an IP is never validated over DNS.
+            if (c.options.challenge_type == .dns_01) return error.InvalidDomain;
+            continue;
+        }
         if (x509.isValidDomain(name)) continue;
         if (c.options.challenge_type == .dns_01 and x509.isValidWildcardDomain(name)) continue;
         return error.InvalidDomain;
@@ -991,7 +1040,7 @@ fn writeOrderPayload(js: *std.json.Stringify, domains: []const []const u8, extra
     for (domains) |name| {
         try js.beginObject();
         try js.objectField("type");
-        try js.write("dns");
+        try js.write(if (netaddr.parseIp(name) != null) "ip" else "dns");
         try js.objectField("value");
         try js.write(name);
         try js.endObject();
@@ -1061,9 +1110,17 @@ fn solveAuthorization(c: *Client, a: Allocator, authz_url: []const u8) Error!voi
                 c.note("authorization offers no tls-alpn-01 challenge");
                 return error.AuthorizationFailed;
             };
-            if (!x509.isValidDomain(authz.identifier)) return error.MalformedResponse;
-            try c.publishTlsAlpn01(a, authz.identifier, challenge.token);
-            defer c.tls_alpn.remove(authz.identifier);
+            // RFC 8738 §6: for an IP the CA sends the reverse-DNS name as
+            // SNI, and the validation certificate names the IP itself.
+            var rev_buf: [max_reverse_name_len]u8 = undefined;
+            const sni = if (netaddr.parseIp(authz.identifier)) |ip|
+                reverseName(&rev_buf, ip)
+            else if (x509.isValidDomain(authz.identifier))
+                authz.identifier
+            else
+                return error.MalformedResponse;
+            try c.publishTlsAlpn01(a, authz.identifier, sni, challenge.token);
+            defer c.tls_alpn.remove(sni);
             try c.notifyAndPoll(a, challenge.url, authz_url);
         },
         .dns_01 => {
@@ -1094,7 +1151,7 @@ fn solveAuthorization(c: *Client, a: Allocator, authz_url: []const u8) Error!voi
 /// the TLS-ALPN store keyed by the domain (the caller's TLS listener serves
 /// it under ALPN `acme-tls/1`). The fresh leaf key is transient scratch —
 /// only its PEM copy is stored, so the raw KeyPair is wiped at scope exit.
-fn publishTlsAlpn01(c: *Client, a: Allocator, domain: []const u8, token: []const u8) Error!void {
+fn publishTlsAlpn01(c: *Client, a: Allocator, domain: []const u8, sni: []const u8, token: []const u8) Error!void {
     const acme_id = jws.acmeIdentifier(token, c.account_key.publicKey()) catch
         return error.MalformedResponse; // CA sent a non-token
     // Short-lived and never published, but it still signs a certificate a
@@ -1121,7 +1178,38 @@ fn publishTlsAlpn01(c: *Client, a: Allocator, domain: []const u8, token: []const
         error.SigningFailed, error.ValueTooLarge => return error.SigningFailed,
     };
     const key_pem = x509.ecPrivateKeyToPem(a, &cert_key) catch return error.OutOfMemory;
-    try c.tls_alpn.set(domain, cert_der, key_pem);
+    try c.tls_alpn.set(sni, cert_der, key_pem);
+}
+
+/// Longest reverse-DNS name: 32 nibble labels of an IPv6 address + "ip6.arpa".
+const max_reverse_name_len = 32 * 2 + "ip6.arpa".len;
+
+/// The reverse-DNS name of `ip` (RFC 1035 §3.5 `in-addr.arpa`, RFC 3596 §2.5
+/// `ip6.arpa`) — the SNI a CA sends for an IP's TLS-ALPN-01 (RFC 8738 §6).
+fn reverseName(buf: *[max_reverse_name_len]u8, ip: netaddr.Ip) []const u8 {
+    var w: std.Io.Writer = .fixed(buf);
+    switch (ip) {
+        .v4 => |q| w.print("{d}.{d}.{d}.{d}.in-addr.arpa", .{ q[3], q[2], q[1], q[0] }) catch unreachable,
+        .v6 => |b| {
+            var i: usize = 16;
+            while (i > 0) {
+                i -= 1;
+                w.print("{x}.{x}.", .{ b[i] & 0xf, b[i] >> 4 }) catch unreachable;
+            }
+            w.writeAll("ip6.arpa") catch unreachable;
+        },
+    }
+    return w.buffered();
+}
+
+/// RFC 8738 §3: an IP identifier's value is the canonical textual form
+/// (dotted quad; RFC 5952 for IPv6). Null when `name` is not an IP literal;
+/// `error.InvalidDomain` when it is one in another spelling.
+fn ipIdentifier(name: []const u8) error{InvalidDomain}!?netaddr.Ip {
+    const ip = netaddr.parseIp(name) orelse return null;
+    var buf: [netaddr.max_ip_text_len]u8 = undefined;
+    if (!std.mem.eql(u8, netaddr.formatIp(ip, &buf), name)) return error.InvalidDomain;
+    return ip;
 }
 
 /// Trigger the challenge (POST `{}` to `challenge_url`, §7.5.1) and poll the
@@ -2785,8 +2873,9 @@ fn mcNewOrder(ctx: *router.Ctx) anyerror!void {
         m.validity_len = w.buffered().len;
         m.lock.unlock();
     }
+    const want_type: []const u8 = if (netaddr.parseIp(m.order_domain) != null) "ip" else "dns";
     if (payload.value.identifiers.len != 1 or
-        !std.mem.eql(u8, payload.value.identifiers[0].type, "dns") or
+        !std.mem.eql(u8, payload.value.identifiers[0].type, want_type) or
         !std.mem.eql(u8, payload.value.identifiers[0].value, m.order_domain))
         m.fail("newOrder identifiers wrong");
 
@@ -2840,13 +2929,14 @@ fn mcAuthz(ctx: *router.Ctx) anyerror!void {
     }
     // A dns-01 decoy first — the client must pick the http-01 entry.
     try w.print(
-        \\{{"status":"{s}","identifier":{{"type":"dns","value":"{s}"}},
+        \\{{"status":"{s}","identifier":{{"type":"{s}","value":"{s}"}},
         \\ "challenges":[
         \\  {{"type":"dns-01","url":"{s}-nope","token":"never-this-one"}},
         \\  {{"type":"http-01","url":"{s}","token":"{s}","status":"{s}"}}]}}
     , .{
         if (valid) "valid" else @as([]const u8, "pending"),
-        MockCa.domain,
+        if (netaddr.parseIp(m.order_domain) != null) "ip" else @as([]const u8, "dns"),
+        m.order_domain,
         m.challenge_url,
         m.challenge_url,
         MockCa.token,
@@ -3047,7 +3137,11 @@ fn mcFinalize(ctx: *router.Ctx) anyerror!void {
         return mcRejected(ctx);
     };
     defer parsed.deinit();
-    const sans_ok = parsed.sans.len == 1 and std.mem.eql(u8, parsed.sans[0], m.order_domain);
+    const sans_ok = if (netaddr.parseIp(m.order_domain)) |ip| switch (ip) {
+        // RFC 8738 §3: an IP identifier is an iPAddress SAN, not a dNSName.
+        .v4 => |q| parsed.sans.len == 0 and parsed.ip_sans.len == 1 and std.mem.eql(u8, parsed.ip_sans[0], &q),
+        .v6 => |b| parsed.sans.len == 0 and parsed.ip_sans.len == 1 and std.mem.eql(u8, parsed.ip_sans[0], &b),
+    } else parsed.sans.len == 1 and parsed.ip_sans.len == 0 and std.mem.eql(u8, parsed.sans[0], m.order_domain);
     if (!sans_ok) m.fail("csr SAN set mismatch");
     const fresh_key = !parsed.public_key.eql(m.account_key.?);
     if (!fresh_key) m.fail("certificate key must not be the account key");
@@ -3205,6 +3299,10 @@ fn mcRevoke(ctx: *router.Ctx) anyerror!void {
             m.fail("certificate does not parse");
             return mcRejected(ctx);
         };
+        if (!v.jwk_key.?.alg().isEc()) {
+            m.fail("the mock models certificate-key revocation for EC keys only");
+            return mcRejected(ctx);
+        }
         var sec1_buf: [jws.AnyPublicKey.max_sec1_len]u8 = undefined;
         const signer = v.jwk_key.?.uncompressedSec1(&sec1_buf);
         if (!std.mem.eql(u8, parsed.pubKey(), signer)) m.fail("signer key is not the certificate key");
@@ -4185,4 +4283,128 @@ test "W1: ES512 account key and ES512 certificate key through the whole flow" {
     try x509.privateKeyFromPem(&back, testing.allocator, cert.key_pem);
     defer std.crypto.secureZero(u8, std.mem.asBytes(&back));
     try testing.expectEqual(jws.Alg.es512, back.alg());
+}
+
+// ── W2 (2026-10-16): IP identifiers (RFC 8738) ──────────────────────────────
+
+test "W2: reverse names for TLS-ALPN-01 SNI (RFC 8738 §6)" {
+    var buf: [max_reverse_name_len]u8 = undefined;
+    try testing.expectEqualStrings("1.2.0.192.in-addr.arpa", reverseName(&buf, netaddr.parseIp("192.0.2.1").?));
+    // RFC 3596 §2.5's own example, 4321:0:1:2:3:4:567:89ab.
+    try testing.expectEqualStrings(
+        "b.a.9.8.7.6.5.0.4.0.0.0.3.0.0.0.2.0.0.0.1.0.0.0.0.0.0.0.1.2.3.4.ip6.arpa",
+        reverseName(&buf, netaddr.parseIp("4321:0:1:2:3:4:567:89ab").?),
+    );
+    try testing.expectEqual(max_reverse_name_len, reverseName(&buf, netaddr.parseIp("::").?).len);
+}
+
+test "W2: IP identifiers — canonical text only, never over DNS-01, typed ip on the order" {
+    try testing.expect((try ipIdentifier("192.0.2.1")) != null);
+    try testing.expect((try ipIdentifier("2001:db8::1")) != null);
+    try testing.expect((try ipIdentifier("example.org")) == null);
+    try testing.expectError(error.InvalidDomain, ipIdentifier("2001:DB8::1")); // RFC 5952: lowercase
+    try testing.expectError(error.InvalidDomain, ipIdentifier("2001:db8:0:0:0:0:0:1")); // RFC 5952: compressed
+
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    var js: std.json.Stringify = .{ .writer = &out.writer, .options = .{} };
+    try writeOrderPayload(&js, &.{ "example.org", "192.0.2.1", "2001:db8::1" }, .{});
+    try testing.expectEqualStrings(
+        "{\"identifiers\":[{\"type\":\"dns\",\"value\":\"example.org\"},{\"type\":\"ip\",\"value\":\"192.0.2.1\"}," ++
+            "{\"type\":\"ip\",\"value\":\"2001:db8::1\"}]}",
+        out.written(),
+    );
+
+    // Refused before any network I/O.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    var transport = http.Client.init(threaded.io(), testing.allocator, .{});
+    defer transport.deinit();
+    var account_key: jws.KeyPair = undefined;
+    try jws.Es256.KeyPair.generateDeterministicInto(&account_key, &@as([32]u8, @splat(81)));
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&account_key));
+    var zone: TestZone = .{};
+    var c = Client.init(threaded.io(), testing.allocator, &transport, &account_key, .{
+        .directory_url = "http://127.0.0.1:1/dir",
+        .challenge_type = .dns_01,
+        .dns_publisher = zone.publisher(),
+    });
+    defer c.deinit();
+    try testing.expectError(error.InvalidDomain, c.obtain(&.{"192.0.2.1"}));
+    c.options.challenge_type = .http_01;
+    try testing.expectError(error.InvalidDomain, c.obtain(&.{"2001:DB8::1"})); // not the RFC 5952 spelling
+}
+
+test "W2: RSA account key and RSA certificate key through the whole flow" {
+    var lab: Lab = undefined;
+    try lab.start(false);
+    defer lab.stop();
+    var zone: TestZone = .{};
+    lab.mock.mode = .dns_01;
+    lab.mock.zone = &zone;
+    // The account key: openssl's 2048-bit fixture (generation is slow in Debug).
+    const account_key = try testing.allocator.create(rsa.KeyPair);
+    defer {
+        std.crypto.secureZero(u8, std.mem.asBytes(account_key));
+        testing.allocator.destroy(account_key);
+    }
+    try x509.rsaPrivateKeyFromPem(account_key, x509.test_rsa_pkcs1_pem);
+    var c = lab.client(account_key, .{
+        .challenge_type = .dns_01,
+        .dns_publisher = zone.publisher(),
+        .cert_key_alg = .rs256,
+    });
+    defer c.deinit();
+
+    var cert = try c.obtain(&.{MockCa.domain});
+    defer cert.deinit(testing.allocator);
+    try lab.expectClean();
+    try testing.expectEqual(@as(?jws.Alg, .rs256), lab.mock.account_alg); // newAccount: alg RS256 + an RSA jwk
+    try testing.expectEqual(@as(?jws.Alg, .rs256), lab.mock.csr_alg); // the CSR key is RSA
+    try testing.expect(lab.mock.csr_ok); // a fresh key, not the account's
+    try testing.expect(std.mem.startsWith(u8, cert.key_pem, "-----BEGIN RSA PRIVATE KEY-----"));
+    const back = try testing.allocator.create(rsa.KeyPair);
+    defer {
+        std.crypto.secureZero(u8, std.mem.asBytes(back));
+        testing.allocator.destroy(back);
+    }
+    try x509.rsaPrivateKeyFromPem(back, cert.key_pem);
+    try testing.expectEqual(@as(usize, 2048), back.public_key.bits());
+
+    c.options.cert_rsa_bits = 1024;
+    try testing.expectError(error.UnsupportedKeySize, c.obtain(&.{MockCa.domain}));
+}
+
+test "W2: an IPv6 identifier over HTTP-01 against the mock CA, typed ip with an iPAddress SAN" {
+    var lab: Lab = undefined;
+    try lab.start(false);
+    defer lab.stop();
+    lab.mock.order_domain = "2001:db8::7";
+    var account_key: jws.KeyPair = undefined;
+    try jws.Es256.KeyPair.generateDeterministicInto(&account_key, &@as([32]u8, @splat(82)));
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&account_key));
+    var c = lab.client(&account_key, .{});
+    defer c.deinit();
+
+    // The CA fetches the key authorization from the client's responder.
+    var challenge_router = router.Router.init(testing.allocator);
+    defer challenge_router.deinit();
+    try challenge_router.use(c.challengeResponder().middleware());
+    var challenge_server = http.Server.init(lab.threaded.io(), testing.allocator, .{
+        .handler = challenge_router.handler(),
+        .context = &challenge_router,
+    });
+    defer challenge_server.deinit();
+    challenge_server.bind() catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+    lab.mock.deinitUrls();
+    try lab.mock.setUrls(lab.ca_server.boundAddress().getPort(), challenge_server.boundAddress().getPort());
+    c.options.directory_url = lab.mock.dir_url;
+    const ch_thread = try std.Thread.spawn(.{}, serveWrap, .{&challenge_server});
+    defer ch_thread.join();
+    defer challenge_server.shutdown();
+
+    var cert = try c.obtain(&.{"2001:db8::7"});
+    defer cert.deinit(testing.allocator);
+    try lab.expectClean();
+    try testing.expect(lab.mock.challenge_ok and lab.mock.csr_ok);
 }

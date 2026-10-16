@@ -414,6 +414,12 @@ version that applied it everywhere added ctgrind contexts to `rsa/keygen` (173 �
 
 ## Backlog / deferred
 
+- **Private-key PEM base64 is not constant-time** *(2026-10-16, found while wiring RSA into `acme`)*:
+  `marshal.zig:282` encodes and `root.zig:2681` decodes the private-key DER through std's base64
+  alphabet tables — loads indexed by key bytes, the class ctgrind found in `acme`'s EC key PEM on
+  2026-10-13 (fixed there with `acme/src/b64ct.zig`). Fix: the same constant-time codec (a 4th copy, or
+  move `b64ct` into a shared module) on the private paths only; add a ctgrind target over
+  `SecretKey.toPem`/`fromPem`. Effort: small. Consumers: acme (RSA keys), jwt, ssh.
 - **Performance levers** — ✅ 2026-10-10: (a) done as montint's fixed-`L` kernels, (c) done
   differently (a constant-time safegcd inverse per op instead of a cached pair, which would
   need mutable state in a `*const SecretKey`); (b) not needed (montint's window is already

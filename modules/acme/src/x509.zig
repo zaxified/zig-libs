@@ -8,7 +8,9 @@
 //! parser from the encoder here).
 //!
 //! Scope is deliberately tiny: P-256, P-384 and P-521 keys (ES256 / ES384 /
-//! ES512 signatures), dNSName SANs, RFC 5915 and PKCS#8 key PEM, the RFC 9773 CertID.
+//! ES512 signatures) and RSA 2048..4096 keys (RS256: sha256WithRSAEncryption;
+//! keys are the `rsa` module's), dNSName SANs, RFC 5915, PKCS#1 and PKCS#8
+//! key PEM, the RFC 9773 CertID.
 //! The CSR uses an **empty subject** — RFC 8555 §7.4 requires the SAN
 //! extension to carry the identifiers and Let's Encrypt ignores (and is
 //! phasing out) the CN; skipping CN also avoids its 64-byte limit.
@@ -19,6 +21,8 @@ const std = @import("std");
 const b64ct = @import("b64ct.zig");
 const Allocator = std.mem.Allocator;
 const burn = @import("burn.zig");
+const rsa = @import("rsa");
+const Sha256 = std.crypto.hash.sha2.Sha256;
 
 /// Test-only: the corpus format `Smith.slice` actually reads. A corpus entry is
 /// not the frame — the length draw reads a little-endian `u32` first, so a raw
@@ -37,6 +41,7 @@ pub const Es384 = jws.Es384;
 pub const Es512 = jws.Es512;
 
 const jws = @import("jws.zig");
+const netaddr = @import("netaddr");
 const Alg = jws.Alg;
 
 // ── DER encoding (bottom-up, arena-backed) ──────────────────────────────────
@@ -103,22 +108,37 @@ const oid_p384 = "\x2b\x81\x04\x00\x22"; // 1.3.132.0.34 (secp384r1)
 const oid_ecdsa_sha384 = "\x2a\x86\x48\xce\x3d\x04\x03\x03"; // 1.2.840.10045.4.3.3
 const oid_p521 = "\x2b\x81\x04\x00\x23"; // 1.3.132.0.35 (secp521r1)
 const oid_ecdsa_sha512 = "\x2a\x86\x48\xce\x3d\x04\x03\x04"; // 1.2.840.10045.4.3.4
+const oid_rsa_encryption = "\x2a\x86\x48\x86\xf7\x0d\x01\x01\x01"; // 1.2.840.113549.1.1.1
+const oid_sha256_with_rsa = "\x2a\x86\x48\x86\xf7\x0d\x01\x01\x0b"; // 1.2.840.113549.1.1.11
 const oid_authority_key_identifier = "\x55\x1d\x23"; // 2.5.29.35
 
+/// The named-curve OID of an EC algorithm. An RSA key has none (`unreachable`:
+/// every caller is already on the EC side of an `alg == .rs256` branch).
 fn curveOid(alg: Alg) []const u8 {
     return switch (alg) {
         .es256 => oid_p256,
         .es384 => oid_p384,
         .es512 => oid_p521,
+        .rs256 => unreachable,
     };
 }
 
+/// The signature-algorithm OID of `alg`.
 fn sigAlgOid(alg: Alg) []const u8 {
     return switch (alg) {
         .es256 => oid_ecdsa_sha256,
         .es384 => oid_ecdsa_sha384,
         .es512 => oid_ecdsa_sha512,
+        .rs256 => oid_sha256_with_rsa,
     };
+}
+
+/// AlgorithmIdentifier of the signature algorithm. ecdsa-with-SHA2 omits the
+/// parameters (RFC 5758 §3.2); sha256WithRSAEncryption carries an explicit
+/// NULL (RFC 4055 §5).
+fn sigAlgId(d: Der, alg: Alg) DerEncodeError![]const u8 {
+    if (alg == .rs256) return d.seq(&.{ try d.oid(sigAlgOid(alg)), try d.tlv(0x05, "") });
+    return d.seq(&.{try d.oid(sigAlgOid(alg))});
 }
 
 fn algFromCurveOid(oid: []const u8) ?Alg {
@@ -178,8 +198,12 @@ pub const must_staple: Extension = .{
 };
 
 /// Build a DER-encoded PKCS#10 CSR for `domains`, signed with `key_pair` (a
-/// pointer to an `Es256.KeyPair`, an `Es384.KeyPair`, an `Es512.KeyPair` or a
-/// `jws.AnyKeyPair`; ecdsa-with-SHA256 / -SHA384 / -SHA512 by curve). Structure: version 0, empty subject,
+/// pointer to an `Es256.KeyPair`, an `Es384.KeyPair`, an `Es512.KeyPair`, an
+/// `rsa.KeyPair` or a `jws.AnyKeyPair`; ecdsa-with-SHA256 / -SHA384 / -SHA512
+/// by curve, sha256WithRSAEncryption for RSA — the SPKI is rsaEncryption with
+/// NULL parameters over the PKCS#1 `RSAPublicKey`, the signature algorithm
+/// carries a NULL parameter and the signature is the raw PKCS#1 v1.5 value).
+/// Structure: version 0, empty subject,
 /// the key's SPKI, one extensionRequest attribute carrying subjectAltName =
 /// dNSName list. A wildcard (`*.example.org`) is a valid dNSName here; whether
 /// it can be validated is the order flow's business. Caller owns the returned
@@ -194,7 +218,8 @@ pub fn csrDer(gpa: Allocator, key_pair: anytype, domains: []const []const u8) Cs
 pub fn csrDerWith(gpa: Allocator, key_pair: anytype, domains: []const []const u8, extra: []const Extension) CsrError![]u8 {
     if (comptime @TypeOf(key_pair.*) == jws.AnyKeyPair) {
         return switch (key_pair.*) {
-            inline else => |*kp| csrDerTyped(gpa, kp, domains, extra),
+            inline .es256, .es384, .es512 => |*kp| csrDerTyped(gpa, kp, domains, extra),
+            .rs256 => |kp| csrDerTyped(gpa, kp, domains, extra),
         };
     } else {
         return csrDerTyped(gpa, key_pair, domains, extra);
@@ -217,7 +242,7 @@ fn csrDerBody(comptime KP: type, gpa: Allocator, key_pair: *const KP, domains: [
     const alg = comptime jws.algOf(KP);
     if (domains.len == 0) return error.InvalidDomain;
     for (domains) |name| {
-        if (!isValidDomain(name) and !isValidWildcardDomain(name)) return error.InvalidDomain;
+        if (!isValidSanName(name)) return error.InvalidDomain;
     }
     for (extra, 0..) |ext, i| {
         if (std.mem.eql(u8, ext.oid, oid_subject_alt_name)) return error.DuplicateExtension;
@@ -228,16 +253,26 @@ fn csrDerBody(comptime KP: type, gpa: Allocator, key_pair: *const KP, domains: [
     defer arena.deinit();
     const d: Der = .{ .a = arena.allocator() };
 
-    // SubjectPublicKeyInfo: { { id-ecPublicKey, namedCurve }, BIT STRING key }.
-    const pub_sec1 = key_pair.public_key.toUncompressedSec1();
-    const spki = try d.seq(&.{
-        try d.seq(&.{ try d.oid(oid_ec_public_key), try d.oid(curveOid(alg)) }),
-        try d.bitString(&pub_sec1),
-    });
+    // SubjectPublicKeyInfo: { { id-ecPublicKey, namedCurve }, BIT STRING key },
+    // or for RSA { { rsaEncryption, NULL }, BIT STRING { RSAPublicKey } } —
+    // which `rsa` already emits as a finished DER element.
+    const spki = if (comptime alg == .rs256) blk: {
+        var spki_buf: [rsa.max_spki_der_len]u8 = undefined;
+        const spki_der = key_pair.public_key.toSpkiDer(&spki_buf) catch unreachable; // sized for the largest key
+        break :blk try d.a.dupe(u8, spki_der);
+    } else blk: {
+        const pub_sec1 = key_pair.public_key.toUncompressedSec1();
+        break :blk try d.seq(&.{
+            try d.seq(&.{ try d.oid(oid_ec_public_key), try d.oid(curveOid(alg)) }),
+            try d.bitString(&pub_sec1),
+        });
+    };
 
-    // subjectAltName GeneralNames: dNSName is [2] IMPLICIT IA5String.
+    // subjectAltName GeneralNames: dNSName is [2] IMPLICIT IA5String,
+    // iPAddress [7] IMPLICIT OCTET STRING of 4 or 16 octets (RFC 5280
+    // §4.2.1.6; an IP identifier, RFC 8738 §3).
     const names = try d.a.alloc([]const u8, domains.len);
-    for (names, domains) |*slot, name| slot.* = try d.tlv(0x82, name);
+    for (names, domains) |*slot, name| slot.* = try sanEntry(d, name);
     const san_value = try d.seq(names);
     const san_ext = try d.seq(&.{
         try d.oid(oid_subject_alt_name),
@@ -269,14 +304,21 @@ fn csrDerBody(comptime KP: type, gpa: Allocator, key_pair: *const KP, domains: [
     });
 
     // The signature covers the full DER encoding of certificationRequestInfo.
-    const sig = key_pair.sign(info, null) catch return error.SigningFailed;
-    var sig_buf: [@TypeOf(sig).der_encoded_length_max]u8 = undefined;
-    const sig_der = sig.toDer(&sig_buf);
+    const sig_bits = if (comptime alg == .rs256) blk: {
+        var rsa_sig: [rsa.max_modulus_len]u8 = undefined;
+        const raw = rsa.signPkcs1v15(&key_pair.secret_key, Sha256, info, &rsa_sig) catch return error.SigningFailed;
+        break :blk try d.bitString(raw);
+    } else blk: {
+        const sig = key_pair.sign(info, null) catch return error.SigningFailed;
+        var sig_buf: [@TypeOf(sig).der_encoded_length_max]u8 = undefined;
+        const sig_der = sig.toDer(&sig_buf);
+        break :blk try d.bitString(sig_der);
+    };
 
     const csr = try d.seq(&.{
         info,
-        try d.seq(&.{try d.oid(sigAlgOid(alg))}), // ecdsa-with-SHA256/384/512, params absent
-        try d.bitString(sig_der),
+        try sigAlgId(d, alg), // ecdsa-with-SHA256/384/512 (params absent) or sha256WithRSAEncryption (NULL)
+        sig_bits,
     });
     return gpa.dupe(u8, csr);
 }
@@ -339,7 +381,10 @@ pub fn tlsAlpnCertDer(
 ) TlsAlpnError![]u8 {
     if (comptime @TypeOf(key_pair.*) == jws.AnyKeyPair) {
         return switch (key_pair.*) {
-            inline else => |*kp| tlsAlpnCertDerTyped(gpa, kp, domain, acme_identifier, serial, not_before, not_after),
+            inline .es256, .es384, .es512 => |*kp| tlsAlpnCertDerTyped(gpa, kp, domain, acme_identifier, serial, not_before, not_after),
+            // The validation certificate's key is EC by design (it is minted
+            // fresh, `tlsAlpnCert`, and never an account key); an RSA pair is refused.
+            .rs256 => error.SigningFailed,
         };
     } else {
         return tlsAlpnCertDerTyped(gpa, key_pair, domain, acme_identifier, serial, not_before, not_after);
@@ -383,7 +428,8 @@ fn tlsAlpnCertDerBody(
     not_after: []const u8,
 ) TlsAlpnError![]u8 {
     const alg = comptime jws.algOf(KP);
-    if (!isValidDomain(domain)) return error.InvalidDomain;
+    if (comptime alg == .rs256) @compileError("the TLS-ALPN-01 validation certificate key is EC (P-256, tlsAlpnCert)");
+    if (!isValidDomain(domain) and netaddr.parseIp(domain) == null) return error.InvalidDomain;
 
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -398,7 +444,7 @@ fn tlsAlpnCertDerBody(
 
     // AlgorithmIdentifier ecdsa-with-SHA256/384/512 (params absent) — shared by
     // the inner `signature` field and the outer `signatureAlgorithm`.
-    const alg_id = try d.seq(&.{try d.oid(sigAlgOid(alg))});
+    const alg_id = try sigAlgId(d, alg);
 
     // Validity ::= SEQUENCE { notBefore UTCTime, notAfter UTCTime }.
     const validity = try d.seq(&.{
@@ -408,7 +454,7 @@ fn tlsAlpnCertDerBody(
 
     // subjectAltName: GeneralNames { [2] dNSName }, marked critical because
     // the subject is empty (RFC 5280 §4.2.1.6).
-    const san_names = try d.seq(&.{try d.tlv(0x82, domain)});
+    const san_names = try d.seq(&.{try sanEntry(d, domain)}); // RFC 8738 §6: an IP as iPAddress
     const san_ext = try d.seq(&.{
         try d.oid(oid_subject_alt_name),
         try d.tlv(0x01, "\xff"), // critical TRUE
@@ -559,6 +605,20 @@ fn wellFormedRange(bytes: []const u8, at: usize, end: usize, depth: u8) ReadErro
     return index == end;
 }
 
+/// One GeneralName for `name`: iPAddress for an IP literal, else dNSName.
+fn sanEntry(d: Der, name: []const u8) DerEncodeError![]const u8 {
+    return if (netaddr.parseIp(name)) |ip| switch (ip) {
+        .v4 => |q| try d.tlv(0x87, &q),
+        .v6 => |b| try d.tlv(0x87, &b),
+    } else try d.tlv(0x82, name);
+}
+
+/// A SAN value `csrDer` and `tlsAlpnCertDer` accept: an LDH name, a
+/// wildcard name, or an IPv4/IPv6 literal (RFC 8738).
+fn isValidSanName(name: []const u8) bool {
+    return isValidDomain(name) or isValidWildcardDomain(name) or netaddr.parseIp(name) != null;
+}
+
 // ── CSR parse-back (test / mock-CA oracle) ──────────────────────────────────
 
 pub const ParseCsrError = error{ OutOfMemory, MalformedCsr, UnsupportedCsr, BadCsrSignature };
@@ -576,14 +636,18 @@ pub const ParsedCsr = struct {
     }
 };
 
-/// `ParsedCsr` for either curve.
+/// `ParsedCsr` for any supported key.
 pub const ParsedCsrAny = struct {
     gpa: Allocator,
+    /// dNSName SAN values, slices into the DER.
     sans: []const []const u8,
+    /// iPAddress SAN values (4 or 16 octets each), slices into the DER.
+    ip_sans: []const []const u8 = &.{},
     public_key: jws.AnyPublicKey,
 
     pub fn deinit(p: *ParsedCsrAny) void {
         p.gpa.free(p.sans);
+        p.gpa.free(p.ip_sans);
         p.* = undefined;
     }
 };
@@ -596,8 +660,11 @@ pub const ParsedCsrAny = struct {
 pub fn parseCsr(gpa: Allocator, der_bytes: []const u8) ParseCsrError!ParsedCsr {
     var any = try parseCsrAny(gpa, der_bytes);
     switch (any.public_key) {
-        .es256 => |k| return .{ .gpa = gpa, .sans = any.sans, .public_key = k },
-        .es384, .es512 => {
+        .es256 => |k| {
+            gpa.free(any.ip_sans);
+            return .{ .gpa = gpa, .sans = any.sans, .public_key = k };
+        },
+        .es384, .es512, .rs256 => {
             any.deinit();
             return error.UnsupportedCsr;
         },
@@ -605,7 +672,9 @@ pub fn parseCsr(gpa: Allocator, der_bytes: []const u8) ParseCsrError!ParsedCsr {
 }
 
 /// `parseCsr` for P-256, P-384 and P-521 (ecdsa-with-SHA256 / -SHA384 / -SHA512; the
-/// signature algorithm must match the key's curve).
+/// signature algorithm must match the key's curve) and for RSA keys of
+/// `jws.rsa_min_bits` .. `jws.rsa_max_bits` bits (rsaEncryption SPKI,
+/// sha256WithRSAEncryption — any other RSA signature OID is `UnsupportedCsr`).
 pub fn parseCsrAny(gpa: Allocator, der_bytes: []const u8) ParseCsrError!ParsedCsrAny {
     return parseCsrInner(gpa, der_bytes) catch |err| switch (err) {
         error.Malformed => error.MalformedCsr,
@@ -631,32 +700,53 @@ fn parseCsrInner(
     // subject (content not interpreted)
     const subject = try expectElem(bytes, version.end, 0x30);
 
-    // SPKI: alg = { id-ecPublicKey, prime256v1 }, key = BIT STRING.
+    // SPKI: alg = { id-ecPublicKey, prime256v1 }, key = BIT STRING; or
+    // { rsaEncryption, NULL } over a PKCS#1 RSAPublicKey.
     const spki = try expectElem(bytes, subject.end, 0x30);
     const spki_alg = try expectElem(bytes, spki.start, 0x30);
     const alg_oid = try expectElem(bytes, spki_alg.start, 0x06);
-    if (!std.mem.eql(u8, alg_oid.content(bytes), oid_ec_public_key)) return error.UnsupportedCsr;
-    const curve_oid = try expectElem(bytes, alg_oid.end, 0x06);
-    const alg = algFromCurveOid(curve_oid.content(bytes)) orelse return error.UnsupportedCsr;
-    const key_bits = try expectElem(bytes, spki_alg.end, 0x03);
-    const key_content = key_bits.content(bytes);
-    if (key_content.len != 2 + 2 * alg.coordLen() or key_content[0] != 0) return error.UnsupportedCsr;
-    const public_key: jws.AnyPublicKey = switch (alg) {
-        .es256 => .{ .es256 = Es256.PublicKey.fromSec1(key_content[1..]) catch return error.UnsupportedCsr },
-        .es384 => .{ .es384 = Es384.PublicKey.fromSec1(key_content[1..]) catch return error.UnsupportedCsr },
-        .es512 => .{ .es512 = Es512.PublicKey.fromSec1(key_content[1..]) catch return error.UnsupportedCsr },
+    const public_key: jws.AnyPublicKey = if (std.mem.eql(u8, alg_oid.content(bytes), oid_rsa_encryption)) blk: {
+        const params = try expectElem(bytes, alg_oid.end, 0x05); // NULL, required (RFC 3279 §2.3.1)
+        if (params.end != params.start or params.end != spki_alg.end) return error.UnsupportedCsr;
+        const rsa_bits = try expectElem(bytes, spki_alg.end, 0x03);
+        if (rsa_bits.end != spki.end) return error.Malformed;
+        const vk = rsa.VerifyKey.fromDer(bytes[spki.hdr..spki.end]) catch return error.UnsupportedCsr;
+        if (vk.bits() < jws.rsa_min_bits or vk.bits() > jws.rsa_max_bits) return error.UnsupportedCsr;
+        break :blk .{ .rs256 = vk };
+    } else blk: {
+        if (!std.mem.eql(u8, alg_oid.content(bytes), oid_ec_public_key)) return error.UnsupportedCsr;
+        const curve_oid = try expectElem(bytes, alg_oid.end, 0x06);
+        const curve = algFromCurveOid(curve_oid.content(bytes)) orelse return error.UnsupportedCsr;
+        const key_bits = try expectElem(bytes, spki_alg.end, 0x03);
+        const key_content = key_bits.content(bytes);
+        if (key_content.len != 2 + 2 * curve.coordLen() or key_content[0] != 0) return error.UnsupportedCsr;
+        break :blk switch (curve) {
+            .es256 => .{ .es256 = Es256.PublicKey.fromSec1(key_content[1..]) catch return error.UnsupportedCsr },
+            .es384 => .{ .es384 = Es384.PublicKey.fromSec1(key_content[1..]) catch return error.UnsupportedCsr },
+            .es512 => .{ .es512 = Es512.PublicKey.fromSec1(key_content[1..]) catch return error.UnsupportedCsr },
+            .rs256 => unreachable, // `algFromCurveOid` names curves only
+        };
     };
+    const alg = public_key.alg();
 
     // Attributes [0] → extensionRequest → Extensions → subjectAltName.
     const attributes = try expectElem(bytes, spki.end, 0xa0);
-    const sans = try findSans(gpa, bytes, attributes);
-    errdefer gpa.free(sans);
+    const found = try findSans(gpa, bytes, attributes);
+    errdefer {
+        gpa.free(found.dns);
+        gpa.free(found.ip);
+    }
 
-    // signatureAlgorithm must be the ecdsa-with-SHA2 of the key's curve,
+    // signatureAlgorithm must be the ecdsa-with-SHA2 of the key's curve, or
+    // sha256WithRSAEncryption for an RSA key (parameters NULL or absent);
     // signature a BIT STRING.
     const sig_alg = try expectElem(bytes, info.end, 0x30);
     const sig_oid = try expectElem(bytes, sig_alg.start, 0x06);
     if (!std.mem.eql(u8, sig_oid.content(bytes), sigAlgOid(alg))) return error.UnsupportedCsr;
+    if (alg == .rs256 and sig_oid.end != sig_alg.end) {
+        const params = try expectElem(bytes, sig_oid.end, 0x05);
+        if (params.end != params.start or params.end != sig_alg.end) return error.Malformed;
+    }
     const sig_bits = try expectElem(bytes, sig_alg.end, 0x03);
     const sig_content = sig_bits.content(bytes);
     if (sig_content.len < 1 or sig_content[0] != 0) return error.Malformed;
@@ -674,16 +764,17 @@ fn parseCsrInner(
             const sig = Es512.Signature.fromDer(sig_content[1..]) catch return error.BadCsrSignature;
             sig.verify(info_full, k) catch return error.BadCsrSignature;
         },
+        .rs256 => |*k| k.verifyPkcs1v15(Sha256, info_full, sig_content[1..]) catch return error.BadCsrSignature,
     }
 
-    return .{ .gpa = gpa, .sans = sans, .public_key = public_key };
+    return .{ .gpa = gpa, .sans = found.dns, .ip_sans = found.ip, .public_key = public_key };
 }
 
 fn findSans(
     gpa: Allocator,
     bytes: []const u8,
     attributes: Elem,
-) (ReadError || error{ OutOfMemory, UnsupportedCsr })![]const []const u8 {
+) (ReadError || error{ OutOfMemory, UnsupportedCsr })!SanLists {
     var attr_at = attributes.start;
     while (attr_at < attributes.end) {
         const attribute = try expectElem(bytes, attr_at, 0x30);
@@ -702,27 +793,41 @@ fn findSans(
             var next = try readElem(bytes, ext_oid.end);
             if (next.tag == 0x01) next = try readElem(bytes, next.end); // optional critical BOOLEAN
             if (next.tag != 0x04) return error.Malformed; // extnValue OCTET STRING
-            return collectDnsNames(gpa, bytes, next);
+            return collectSans(gpa, bytes, next);
         }
     }
     return error.UnsupportedCsr; // no SAN — not a CSR this module produced
 }
 
-fn collectDnsNames(
+const SanLists = struct { dns: []const []const u8, ip: []const []const u8 };
+
+fn collectSans(
     gpa: Allocator,
     bytes: []const u8,
     extn_value: Elem,
-) (ReadError || error{OutOfMemory})![]const []const u8 {
+) (ReadError || error{OutOfMemory})!SanLists {
     const general_names = try expectElem(bytes, extn_value.start, 0x30);
-    var list: std.ArrayList([]const u8) = .empty;
-    errdefer list.deinit(gpa);
+    var dns: std.ArrayList([]const u8) = .empty;
+    errdefer dns.deinit(gpa);
+    var ip: std.ArrayList([]const u8) = .empty;
+    errdefer ip.deinit(gpa);
     var at = general_names.start;
     while (at < general_names.end) {
         const name = try readElem(bytes, at);
         at = name.end;
-        if (name.tag == 0x82) try list.append(gpa, name.content(bytes)); // dNSName
+        switch (name.tag) {
+            0x82 => try dns.append(gpa, name.content(bytes)), // dNSName
+            0x87 => { // iPAddress
+                const octets = name.content(bytes);
+                if (octets.len != 4 and octets.len != 16) return error.Malformed;
+                try ip.append(gpa, octets);
+            },
+            else => {},
+        }
     }
-    return list.toOwnedSlice(gpa);
+    const dns_owned = try dns.toOwnedSlice(gpa);
+    errdefer gpa.free(dns_owned);
+    return .{ .dns = dns_owned, .ip = try ip.toOwnedSlice(gpa) };
 }
 
 // ── PEM ─────────────────────────────────────────────────────────────────────
@@ -863,6 +968,8 @@ pub const KeyPemError = error{ OutOfMemory, MissingPemBlock, InvalidPem, Malform
 /// Serialize a key pair (a pointer to an `Es256.KeyPair`, an `Es384.KeyPair`,
 /// an `Es512.KeyPair` or a `jws.AnyKeyPair`) as an openssl-compatible `EC PRIVATE KEY` PEM
 /// (RFC 5915: version 1, private scalar, curve OID, public point).
+/// An `rsa.KeyPair` (or a `jws.AnyKeyPair` holding one) is written as the
+/// PKCS#1 `RSA PRIVATE KEY` PEM instead — see `rsaPrivateKeyToPem`.
 pub fn ecPrivateKeyToPem(gpa: Allocator, key_pair: anytype) error{OutOfMemory}![]u8 {
     const r = privateKeyToPemUnburned(.sec1, gpa, key_pair);
     burn.stack(burn.key_burn);
@@ -883,11 +990,71 @@ const KeyForm = enum { sec1, pkcs8 };
 noinline fn privateKeyToPemUnburned(comptime form: KeyForm, gpa: Allocator, key_pair: anytype) error{OutOfMemory}![]u8 {
     if (comptime @TypeOf(key_pair.*) == jws.AnyKeyPair) {
         return switch (key_pair.*) {
-            inline else => |*kp| privateKeyToPemTyped(form, gpa, kp),
+            inline .es256, .es384, .es512 => |*kp| privateKeyToPemTyped(form, gpa, kp),
+            .rs256 => |kp| rsaKeyToPem(form, gpa, kp),
         };
+    } else if (comptime @TypeOf(key_pair.*) == rsa.KeyPair) {
+        return rsaKeyToPem(form, gpa, key_pair);
     } else {
         return privateKeyToPemTyped(form, gpa, key_pair);
     }
+}
+
+/// An RSA pair as PKCS#1 `RSA PRIVATE KEY` (`.sec1`, what `openssl rsa
+/// -traditional` and autocert write) or PKCS#8 `PRIVATE KEY` (`.pkcs8`),
+/// through `rsa`'s own encoder. The PEM is assembled in a wiped stack buffer
+/// and only the returned allocation keeps a copy. Note `rsa`'s base64 is
+/// std's table encoder, not the constant-time one `b64ct.zig` gives the EC
+/// paths (its 48-byte staging chunks are wiped, the lookups are not
+/// constant-time).
+fn rsaKeyToPem(comptime form: KeyForm, gpa: Allocator, key_pair: *const rsa.KeyPair) error{OutOfMemory}![]u8 {
+    var buf: [rsa.max_private_pem_len]u8 = undefined;
+    defer std.crypto.secureZero(u8, &buf);
+    const pem = key_pair.secret_key.toPem(switch (form) {
+        .sec1 => .pkcs1,
+        .pkcs8 => .pkcs8,
+    }, &buf) catch unreachable; // max_private_pem_len fits any key rsa accepts
+    return gpa.dupe(u8, pem);
+}
+
+/// Serialize an RSA key pair as a PKCS#1 `RSA PRIVATE KEY` PEM (RFC 8017
+/// A.1.2 — `openssl rsa -traditional`, what autocert writes). `ecPrivateKeyToPem`
+/// and `pkcs8PrivateKeyToPem` of a `jws.AnyKeyPair` holding an RSA pair write
+/// the same PKCS#1 / the PKCS#8 form, so `Client` needs no case of its own.
+/// Caller owns (and should wipe) the returned text.
+pub fn rsaPrivateKeyToPem(gpa: Allocator, key_pair: *const rsa.KeyPair) error{OutOfMemory}![]u8 {
+    const r = privateKeyToPemUnburned(.sec1, gpa, key_pair);
+    burn.stack(burn.key_burn);
+    return r;
+}
+
+/// Load an RSA key pair from a PEM holding a PKCS#1 `RSA PRIVATE KEY` or a
+/// PKCS#8 `PRIVATE KEY` with rsaEncryption (the first such block; other blocks
+/// before it are skipped). The public half is derived from the secret key.
+/// The key must be `jws.rsa_min_bits` .. `jws.rsa_max_bits` bits, else
+/// `MalformedKey`; multi-prime keys and keys `rsa.SecretKey.fromPem` finds
+/// inconsistent (`openssl rsa -check` fails) are `MalformedKey` too. The pair
+/// goes into `out` (zeroed on error). `rsa`'s PEM decoder is std's base64
+/// (not constant-time) into a stack block that `rsa` burns afterwards.
+pub fn rsaPrivateKeyFromPem(out: *rsa.KeyPair, text: []const u8) KeyPemError!void {
+    const r = rsaKeyFromPemUnburned(out, text);
+    burn.stack(burn.key_burn);
+    return r;
+}
+
+noinline fn rsaKeyFromPemUnburned(out: *rsa.KeyPair, text: []const u8) KeyPemError!void {
+    errdefer std.crypto.secureZero(u8, std.mem.asBytes(out));
+    const pkcs1 = std.mem.indexOf(u8, text, "-----BEGIN RSA PRIVATE KEY-----");
+    const pkcs8 = std.mem.indexOf(u8, text, "-----BEGIN PRIVATE KEY-----");
+    const start = if (pkcs1 != null and pkcs8 != null) @min(pkcs1.?, pkcs8.?) else (pkcs1 orelse pkcs8 orelse return error.MissingPemBlock);
+    rsa.SecretKey.fromPem(&out.secret_key, text[start..]) catch |err| switch (err) {
+        error.MissingPemBlock => return error.MissingPemBlock,
+        error.InvalidPem => return error.InvalidPem,
+        error.UnsupportedPemLabel, error.InvalidDer, error.InvalidPrivateKey => return error.MalformedKey,
+    };
+    out.public_key = out.secret_key.publicKey();
+    const bits = out.public_key.bits();
+    if (bits < jws.rsa_min_bits or bits > jws.rsa_max_bits) return error.MalformedKey;
 }
 
 fn privateKeyToPemTyped(comptime form: KeyForm, gpa: Allocator, key_pair: anytype) error{OutOfMemory}![]u8 {
@@ -960,7 +1127,11 @@ pub fn pkcs8PrivateKeyFromPem(out: anytype, gpa: Allocator, text: []const u8) Ke
 }
 
 /// Load either PEM form into an `AnyKeyPair`: `EC PRIVATE KEY` first, else
-/// `PRIVATE KEY`.
+/// `PRIVATE KEY`. EC keys only: an `AnyKeyPair` holds an RSA pair by pointer
+/// (`jws.AnyKeyPair.rs256`) and has no storage to load one into, so an RSA
+/// PEM is refused (an error, never a key: `InvalidPem` or `MalformedKey` for PKCS#8, `MissingPemBlock` for PKCS#1) —
+/// load it with `rsaPrivateKeyFromPem` into a pair of your own and point an
+/// `AnyKeyPair` at that.
 pub fn privateKeyFromPem(out: *jws.AnyKeyPair, gpa: Allocator, text: []const u8) KeyPemError!void {
     ecPrivateKeyFromPem(out, gpa, text) catch |err| switch (err) {
         error.MissingPemBlock => return pkcs8PrivateKeyFromPem(out, gpa, text),
@@ -969,6 +1140,7 @@ pub fn privateKeyFromPem(out: *jws.AnyKeyPair, gpa: Allocator, text: []const u8)
 }
 
 fn keyFromPem(comptime label: []const u8, comptime form: KeyForm, out: anytype, text: []const u8) KeyPemError!void {
+    if (comptime @TypeOf(out.*) == rsa.KeyPair) @compileError("use rsaPrivateKeyFromPem for an RSA key");
     var der_buf: [max_secret_der]u8 = undefined;
     defer std.crypto.secureZero(u8, &der_buf);
     const der_bytes = try pemDecodeSecret(label, text, &der_buf);
@@ -1047,6 +1219,7 @@ noinline fn keyFromDer(comptime form: KeyForm, out: anytype, bytes: []const u8) 
         .es256 => try fillPair(Es256, out, raw),
         .es384 => try fillPair(Es384, out, raw),
         .es512 => try fillPair(Es512, out, raw),
+        .rs256 => unreachable, // `curve` only ever holds a curve (`algFromCurveOid`)
     }
 }
 
@@ -2428,4 +2601,284 @@ test "issuerCommonName: the fixtures' issuers, and truncations never read past t
     try testing.expectEqualStrings("acme-test-root", issuerCommonName(root).?);
     for (0..leaf.len) |n| _ = issuerCommonName(leaf[0..n]); // bounded: no panic on any prefix
     try testing.expectEqual(@as(?[]const u8, null), issuerCommonName(""));
+}
+
+// ── RSA (2026-10-16) ────────────────────────────────────────────────────────
+
+// Fixtures (OpenSSL 3.5.5), a throwaway RSA-2048 key — not a secret:
+//   openssl genrsa -out k.pkcs8.pem 2048                  (PKCS#8 "PRIVATE KEY")
+//   openssl rsa -in k.pkcs8.pem -traditional -out k.pkcs1.pem   (PKCS#1 "RSA PRIVATE KEY")
+const test_rsa_pkcs8_pem =
+    \\-----BEGIN PRIVATE KEY-----
+    \\MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCFclHEPYa49gNd
+    \\vBIPrMUfKEKaeE3xmM469V6sBhj5FHYgQcd0JgA5ZfpGMLWd8caTT8Pq/KjIS3cF
+    \\ThcTD3o0sEmGUVdIH8NiZBkZcps4VuRLjB1oi619M8TG8qqOLaTDlmt3SOaj5oRS
+    \\cRUzb2vFYAQwK6iylBY4Lg+vIL0pHb5NqzPiW4K9996mCKXP7HOD+bECsTmcDKeh
+    \\/iDxibaumlA5ojkF245wyf+yhJkB5iFIVdV97+nyTVHDvtTHGkgv463kTZ1nNrMS
+    \\YXoqO2mLK11BxT2K/JgHMsRbpQnvHKx/qZxx4Rz0edQglZkHAr6USor7Rkj/Wrlu
+    \\znvKVeqjAgMBAAECggEALP62Xj5Gmj/tM6JRzrI5Bv/qsS3mThNxWgTY5pTpv7Zr
+    \\/AVh7KJRigj+AcOzwS1AAPSwwR9vA5YabBIACr+5u2FDcUQk818uYJMSuXdgqfb2
+    \\ZBi648DQ/vnBHDm/U1BFkWM7Gg3dIp97t1aEyQKFKphs4RcfexMeiNPTGwAld+Kg
+    \\W/BdFgbQrzEKkxSzSVbZ+8hTGfd1Okfancr/tfaV4xdHFeVUVk/yWfjeKEHMmBGQ
+    \\YbXmSB2cYypcQ1LMYWoyw8uWTzEihe3rrNZt8TcAMAG6osRYrjV+cXlnqUnv87oQ
+    \\0Ei6WgAdpmKIIEtCUwfIZ0C6me4aq4sMOY7emc0igQKBgQC7amDC5++Pj92r/oFI
+    \\i/mn+0vyIkzoEVPkYo+TeImJk38owRbPZ58shX+pEL+iM40XbGa9+MrqExTmApSv
+    \\s2ugZGtxGRim7CnihMB1SzWma85lD2lshK7vJ0vGgpCQGtCShJi6+fSZE1uyQZGT
+    \\5niFOxSdmmJZA13cbHEik1zDgQKBgQC2R/k/VnFRL8kMKWk6OGQI7tZu/RfTf/hK
+    \\U9H1Ng8a8END6Pvmgj+8BcVtgU2JLDgqpbf1dztvEUywkr+fvg5zLPuGBPtmcAQX
+    \\BZ0j/h+HRjJ2YXyaS90UmSp6gxs9HzM0blqSTLBgJTZcvJYbE86HspNy87GBtenJ
+    \\FO8ww38wIwKBgQCzYH+4TNFnMKVUJ0WKMB8FfmoUGGxPebY303XkCexp9vgwA49X
+    \\d7BLpoKnSFaCYqDaGHDFxsg//X91Hmc9O5b5buO+3exQZ503JyQln5R78pca9wNK
+    \\UDw2vf+yweinZGLYuXyNCQvpLzQGiudRDbewnPmAVvFmjOhbPpeSJkUVAQKBgBHj
+    \\CCtV8TK1TLY7zg6ff/l8bmBfx5nCgfvRM9YrItpS31bnouhguZ5atp/jQ1eFllFh
+    \\B6c3twZUHUFqdRFY1hQpQtlI3d6UeWJE88GXa0Kb+dGyCUce0Kf3y7pP6TlbOWwY
+    \\tByNF/WnUSlSfCxWCjs4o81w6mc/EZzgyAPx+yYfAoGAOuKqYZUlQf6qESwycemd
+    \\vWdplgQS86KELyJe4+i1vDSc7nEV4vLfw19Fq1RnPFbQyU/VBTi0yHnZm0VIm12F
+    \\SfARyPbKN2wXy61GVGk8KjO7iKAa8ChCp9ZrtD3qErzG4ixRU/dxc5/zJgPY4HBO
+    \\nKhgr4xUe9OqdoSafb5oCtM=
+    \\-----END PRIVATE KEY-----
+    \\
+;
+pub const test_rsa_pkcs1_pem =
+    \\-----BEGIN RSA PRIVATE KEY-----
+    \\MIIEowIBAAKCAQEAhXJRxD2GuPYDXbwSD6zFHyhCmnhN8ZjOOvVerAYY+RR2IEHH
+    \\dCYAOWX6RjC1nfHGk0/D6vyoyEt3BU4XEw96NLBJhlFXSB/DYmQZGXKbOFbkS4wd
+    \\aIutfTPExvKqji2kw5Zrd0jmo+aEUnEVM29rxWAEMCuospQWOC4PryC9KR2+Tasz
+    \\4luCvffepgilz+xzg/mxArE5nAynof4g8Ym2rppQOaI5BduOcMn/soSZAeYhSFXV
+    \\fe/p8k1Rw77UxxpIL+Ot5E2dZzazEmF6KjtpiytdQcU9ivyYBzLEW6UJ7xysf6mc
+    \\ceEc9HnUIJWZBwK+lEqK+0ZI/1q5bs57ylXqowIDAQABAoIBACz+tl4+Rpo/7TOi
+    \\Uc6yOQb/6rEt5k4TcVoE2OaU6b+2a/wFYeyiUYoI/gHDs8EtQAD0sMEfbwOWGmwS
+    \\AAq/ubthQ3FEJPNfLmCTErl3YKn29mQYuuPA0P75wRw5v1NQRZFjOxoN3SKfe7dW
+    \\hMkChSqYbOEXH3sTHojT0xsAJXfioFvwXRYG0K8xCpMUs0lW2fvIUxn3dTpH2p3K
+    \\/7X2leMXRxXlVFZP8ln43ihBzJgRkGG15kgdnGMqXENSzGFqMsPLlk8xIoXt66zW
+    \\bfE3ADABuqLEWK41fnF5Z6lJ7/O6ENBIuloAHaZiiCBLQlMHyGdAupnuGquLDDmO
+    \\3pnNIoECgYEAu2pgwufvj4/dq/6BSIv5p/tL8iJM6BFT5GKPk3iJiZN/KMEWz2ef
+    \\LIV/qRC/ojONF2xmvfjK6hMU5gKUr7NroGRrcRkYpuwp4oTAdUs1pmvOZQ9pbISu
+    \\7ydLxoKQkBrQkoSYuvn0mRNbskGRk+Z4hTsUnZpiWQNd3GxxIpNcw4ECgYEAtkf5
+    \\P1ZxUS/JDClpOjhkCO7Wbv0X03/4SlPR9TYPGvBDQ+j75oI/vAXFbYFNiSw4KqW3
+    \\9Xc7bxFMsJK/n74Ocyz7hgT7ZnAEFwWdI/4fh0YydmF8mkvdFJkqeoMbPR8zNG5a
+    \\kkywYCU2XLyWGxPOh7KTcvOxgbXpyRTvMMN/MCMCgYEAs2B/uEzRZzClVCdFijAf
+    \\BX5qFBhsT3m2N9N15Ansafb4MAOPV3ewS6aCp0hWgmKg2hhwxcbIP/1/dR5nPTuW
+    \\+W7jvt3sUGedNyckJZ+Ue/KXGvcDSlA8Nr3/ssHop2Ri2Ll8jQkL6S80BornUQ23
+    \\sJz5gFbxZozoWz6XkiZFFQECgYAR4wgrVfEytUy2O84On3/5fG5gX8eZwoH70TPW
+    \\KyLaUt9W56LoYLmeWraf40NXhZZRYQenN7cGVB1BanURWNYUKULZSN3elHliRPPB
+    \\l2tCm/nRsglHHtCn98u6T+k5WzlsGLQcjRf1p1EpUnwsVgo7OKPNcOpnPxGc4MgD
+    \\8fsmHwKBgDriqmGVJUH+qhEsMnHpnb1naZYEEvOihC8iXuPotbw0nO5xFeLy38Nf
+    \\RatUZzxW0MlP1QU4tMh52ZtFSJtdhUnwEcj2yjdsF8utRlRpPCozu4igGvAoQqfW
+    \\a7Q96hK8xuIsUVP3cXOf8yYD2OBwTpyoYK+MVHvTqnaEmn2+aArT
+    \\-----END RSA PRIVATE KEY-----
+    \\
+;
+// openssl genrsa -traditional -out k1024.pkcs1.pem 1024  (below the 2048-bit floor)
+const test_rsa1024_pkcs1_pem =
+    \\-----BEGIN RSA PRIVATE KEY-----
+    \\MIICXgIBAAKBgQC3BdtOcvFZXdcEN67G+cr0x1x1EoggtxUT4PrJej4Gs7vRUT17
+    \\1RKULU+WqideA60mO4SeEKJYESk0BkN5ocJdZ69TzKyCWPND10ef5+27PnJ8vNXM
+    \\Kw0sfKrWssAKZhi3OgMxUByMdUqX9YjWgQSjQ/04pcXdAPgxkYduu147IwIDAQAB
+    \\AoGAWRBMjHx63lZAEBlYwBNGpJ9vark97U2qwCW3ZNxL2s8UEuRJ2zzw8ZKrLFJZ
+    \\HfMEC5rjClhl6B1Rw7NYmpQRFLh4Wzxqm/1w2DPD8rWbMLlKS/+mGYryhVYv6Gzv
+    \\1ex0LAZCzEDF9bmNAdWg11ol5zlQumwpBoWIPKU6H4Ndr2ECQQDYviyRgm1Aubad
+    \\XLL2f91Wdaa3IyEN9eocb4riWruj/cVbjxzsJi9pWwByIkO8wVErVT1VPWomEWwc
+    \\oPfCbox3AkEA2CwruFcQHg/UZ9TY5R3NTWTK5atGH9oGvrdwL6CGTana9Mc4WvRJ
+    \\2Yk0BTm1xdu6Y/uYD3xi8N+gMv3dpJwttQJBAMFHRWM01cxkT+6gHY8nku9o1xR1
+    \\JSLX6r8U0NrtYmrpADeXtYj4vErNNeaRm6oVEhb8WkdLDv+Hhcs51/bwsh0CQQC1
+    \\bEy9BwSV1j8zbSUjFOHqpD7MhfPyY27pvNZAgn50y6rhaBlZ7E/WbBnmkMqHZaOG
+    \\qe6ygHghI+01Hm5X6mNJAkEAlVXEfGLAuoWEct995I+GN8GChfk45FKMz31cXNQE
+    \\ejMOD3pYK2SpFW7U8Aqyu+NyGsW18BIuf/faksPY4ZRsrA==
+    \\-----END RSA PRIVATE KEY-----
+    \\
+;
+// The CSR openssl builds for that key over the same two names:
+//   openssl req -new -key k.pkcs8.pem -subj "/" -sha256 \
+//     -addext "subjectAltName=DNS:example.com,DNS:www.example.com" -out csr.pem
+//   $ openssl req -in csr.pem -verify -noout
+//   Certificate request self-signature verify OK
+// PKCS#1 v1.5 is deterministic, so `csrDer` for the same key and names must
+// produce these exact bytes (so ours verifies under `openssl req -verify` too).
+const test_rsa_openssl_csr_pem =
+    \\-----BEGIN CERTIFICATE REQUEST-----
+    \\MIICfzCCAWcCAQAwADCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBAIVy
+    \\UcQ9hrj2A128Eg+sxR8oQpp4TfGYzjr1XqwGGPkUdiBBx3QmADll+kYwtZ3xxpNP
+    \\w+r8qMhLdwVOFxMPejSwSYZRV0gfw2JkGRlymzhW5EuMHWiLrX0zxMbyqo4tpMOW
+    \\a3dI5qPmhFJxFTNva8VgBDArqLKUFjguD68gvSkdvk2rM+Jbgr333qYIpc/sc4P5
+    \\sQKxOZwMp6H+IPGJtq6aUDmiOQXbjnDJ/7KEmQHmIUhV1X3v6fJNUcO+1McaSC/j
+    \\reRNnWc2sxJheio7aYsrXUHFPYr8mAcyxFulCe8crH+pnHHhHPR51CCVmQcCvpRK
+    \\ivtGSP9auW7Oe8pV6qMCAwEAAaA6MDgGCSqGSIb3DQEJDjErMCkwJwYDVR0RBCAw
+    \\HoILZXhhbXBsZS5jb22CD3d3dy5leGFtcGxlLmNvbTANBgkqhkiG9w0BAQsFAAOC
+    \\AQEAaI/HPSAWF0mTMCcdUExhGDS02sk8GZu2tsPjguyP8Z4vhJyFkDzImGju/H6H
+    \\MwwRXjJXs9zA+gGA55UrhoqXU6dG9Pz+iNYx9ZG8sCIVH7JR/2X/zyjT9izeG3dP
+    \\n0U/2BEyEjFYhWmyg3cUPEur486ccPZoINWotnXxuuAjUpFWoZWhqfdLq86PJKRn
+    \\EEbNGqn0yywvN/gOi49ad987xJQSeBBCwDHJy8I1o4rMMQnz2dMrxK3cpYm61LOj
+    \\wq5+8TYiya3KL7SUqHhnSybZaxS3KcdnMYZQuJdtdM77wLGI6xLhQuAgB2ke7qSu
+    \\xEd1CgMqgBIVHmIK1iaSDejkrw==
+    \\-----END CERTIFICATE REQUEST-----
+    \\
+;
+
+var test_rsa_pair_storage: rsa.KeyPair = undefined;
+var test_rsa_pair_ready = false;
+
+/// The fixture key as a pair in static storage, so tests pass it by pointer like production code.
+fn testRsaPair() !*const rsa.KeyPair {
+    if (!test_rsa_pair_ready) {
+        try rsaPrivateKeyFromPem(&test_rsa_pair_storage, test_rsa_pkcs8_pem);
+        test_rsa_pair_ready = true;
+    }
+    return &test_rsa_pair_storage;
+}
+
+test "RSA CSR: byte-identical to openssl's, parses back, SANs and signature verify" {
+    const kp = try testRsaPair();
+    const domains = [_][]const u8{ "example.com", "www.example.com" };
+    const oracle = try pemDecode(testing.allocator, "CERTIFICATE REQUEST", test_rsa_openssl_csr_pem);
+    defer testing.allocator.free(oracle);
+
+    const ours = try csrDer(testing.allocator, kp, &domains);
+    defer testing.allocator.free(ours);
+    try testing.expectEqualSlices(u8, oracle, ours);
+    // Through an AnyKeyPair (a borrowed pointer), the same bytes.
+    const any: jws.AnyKeyPair = .{ .rs256 = kp };
+    const via_any = try csrDer(testing.allocator, &any, &domains);
+    defer testing.allocator.free(via_any);
+    try testing.expectEqualSlices(u8, oracle, via_any);
+
+    // openssl's own CSR parses and verifies.
+    var parsed = try parseCsrAny(testing.allocator, oracle);
+    defer parsed.deinit();
+    try testing.expectEqual(Alg.rs256, parsed.public_key.alg());
+    try testing.expectEqual(@as(usize, 2), parsed.sans.len);
+    try testing.expectEqualStrings("example.com", parsed.sans[0]);
+    try testing.expectEqualStrings("www.example.com", parsed.sans[1]);
+    try testing.expect(parsed.public_key.eql(jws.publicOfPair(kp)));
+    // The ES256-only parser names the algorithm as unsupported.
+    try testing.expectError(error.UnsupportedCsr, parseCsr(testing.allocator, oracle));
+
+    // Structure the CA sees: SPKI rsaEncryption + NULL, signatureAlgorithm sha256WithRSAEncryption + NULL.
+    try testing.expect(std.mem.indexOf(u8, ours, "\x30\x0d\x06\x09" ++ oid_rsa_encryption ++ "\x05\x00\x03") != null);
+    try testing.expect(std.mem.indexOf(u8, ours, "\x30\x0d\x06\x09" ++ oid_sha256_with_rsa ++ "\x05\x00\x03") != null);
+}
+
+test "RSA CSR: tampering, truncation and other RSA signature algorithms are refused" {
+    const kp = try testRsaPair();
+    const der_bytes = try csrDer(testing.allocator, kp, &.{"tamper.example"});
+    defer testing.allocator.free(der_bytes);
+
+    const at = std.mem.indexOf(u8, der_bytes, "tamper").?;
+    const mutated = try testing.allocator.dupe(u8, der_bytes);
+    defer testing.allocator.free(mutated);
+    mutated[at] ^= 0x01;
+    try testing.expectError(error.BadCsrSignature, parseCsrAny(testing.allocator, mutated));
+    mutated[at] ^= 0x01;
+    mutated[mutated.len - 1] ^= 0x01; // the signature's last octet
+    try testing.expectError(error.BadCsrSignature, parseCsrAny(testing.allocator, mutated));
+    mutated[mutated.len - 1] ^= 0x01;
+
+    // sha384WithRSAEncryption (…01 01 0c) is a real RSA signature OID this module does not verify.
+    const sig_oid_at = std.mem.lastIndexOf(u8, mutated, oid_sha256_with_rsa).?;
+    mutated[sig_oid_at + oid_sha256_with_rsa.len - 1] = 0x0c;
+    try testing.expectError(error.UnsupportedCsr, parseCsrAny(testing.allocator, mutated));
+
+    var l: usize = 0;
+    while (l < der_bytes.len) : (l += 13) {
+        try testing.expect(if (parseCsrAny(testing.allocator, der_bytes[0..l])) |_| false else |_| true);
+    }
+    // Wildcards and domain validation behave as for EC keys.
+    try testing.expectError(error.InvalidDomain, csrDer(testing.allocator, kp, &.{"-bad.example"}));
+}
+
+test "RSA key PEM: openssl's PKCS#1 and PKCS#8 load; ours is byte-identical to openssl" {
+    var from8: rsa.KeyPair = undefined;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&from8));
+    try rsaPrivateKeyFromPem(&from8, test_rsa_pkcs8_pem);
+    var from1: rsa.KeyPair = undefined;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&from1));
+    try rsaPrivateKeyFromPem(&from1, test_rsa_pkcs1_pem);
+    try testing.expect(from8.public_key.equal(&from1.public_key));
+    try testing.expect(from8.public_key.equal(&from8.secret_key.publicKey()));
+    try testing.expectEqual(@as(usize, 2048), from8.public_key.bits());
+
+    // `openssl rsa -traditional` / `openssl genrsa` write exactly these bytes.
+    const pem1 = try rsaPrivateKeyToPem(testing.allocator, &from8);
+    defer testing.allocator.free(pem1);
+    defer std.crypto.secureZero(u8, pem1);
+    try testing.expectEqualStrings(test_rsa_pkcs1_pem, pem1);
+    const pem8 = try pkcs8PrivateKeyToPem(testing.allocator, &from1);
+    defer testing.allocator.free(pem8);
+    defer std.crypto.secureZero(u8, pem8);
+    try testing.expectEqualStrings(test_rsa_pkcs8_pem, pem8);
+    // An AnyKeyPair holding the pair writes the same text (Client's cert-key PEM path).
+    const any: jws.AnyKeyPair = .{ .rs256 = &from8 };
+    const any1 = try ecPrivateKeyToPem(testing.allocator, &any);
+    defer testing.allocator.free(any1);
+    defer std.crypto.secureZero(u8, any1);
+    try testing.expectEqualStrings(test_rsa_pkcs1_pem, any1);
+    const any8 = try pkcs8PrivateKeyToPem(testing.allocator, &any);
+    defer testing.allocator.free(any8);
+    defer std.crypto.secureZero(u8, any8);
+    try testing.expectEqualStrings(test_rsa_pkcs8_pem, any8);
+
+    // Leading junk and other PEM blocks are skipped; a PKCS#8 block is found after a PKCS#1-less preamble.
+    var skip: rsa.KeyPair = undefined;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&skip));
+    try rsaPrivateKeyFromPem(&skip, "junk\n-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n" ++ test_rsa_pkcs8_pem);
+    try testing.expect(skip.public_key.equal(&from8.public_key));
+
+    // Refusals (and `out` zeroed): no block, a block that is not a key, a 1024-bit key.
+    var bad: rsa.KeyPair = undefined;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&bad));
+    try testing.expectError(error.MissingPemBlock, rsaPrivateKeyFromPem(&bad, "no pem here"));
+    try testing.expectError(error.MissingPemBlock, rsaPrivateKeyFromPem(&bad, "-----BEGIN EC PRIVATE KEY-----\nAAAA\n-----END EC PRIVATE KEY-----\n"));
+    @memset(std.mem.asBytes(&bad), 0xaa);
+    try testing.expectError(error.MalformedKey, rsaPrivateKeyFromPem(&bad, "-----BEGIN RSA PRIVATE KEY-----\nMAA=\n-----END RSA PRIVATE KEY-----\n"));
+    try testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&bad), 0));
+    @memset(std.mem.asBytes(&bad), 0xaa);
+    try testing.expectError(error.MalformedKey, rsaPrivateKeyFromPem(&bad, test_rsa1024_pkcs1_pem));
+    try testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&bad), 0));
+    // An EC PKCS#8 key is not an RSA key.
+    try testing.expectError(error.MalformedKey, rsaPrivateKeyFromPem(&bad, openssl_p256_pkcs8));
+
+    // The EC loaders refuse RSA PEMs (an AnyKeyPair has no storage for an RSA pair).
+    var ec: jws.AnyKeyPair = undefined;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&ec));
+    // A 2048-bit PKCS#8 body overflows the EC loaders' 1 KiB secret-DER buffer first.
+    try testing.expectError(error.InvalidPem, privateKeyFromPem(&ec, testing.allocator, test_rsa_pkcs8_pem));
+    try testing.expectError(error.MissingPemBlock, privateKeyFromPem(&ec, testing.allocator, test_rsa_pkcs1_pem));
+}
+
+test "TLS-ALPN-01 certificate: an RSA pair is refused (the validation key is EC)" {
+    const kp = try testRsaPair();
+    const any: jws.AnyKeyPair = .{ .rs256 = kp };
+    const id: [32]u8 = @splat(0xAB);
+    try testing.expectError(error.SigningFailed, tlsAlpnCertDer(testing.allocator, &any, "example.org", id, "\x01", tls_alpn_not_before, tls_alpn_not_after));
+}
+
+// `openssl req -new -key k.pem -subj / -addext
+//  "subjectAltName=IP:192.0.2.1,IP:2001:db8::1,DNS:a.example" -outform DER`
+// (OpenSSL 3.5.5, P-256 key; `openssl req -verify` OK).
+const openssl_ip_csr_hex = "3081fb3081a102010030003059301306072a8648ce3d020106082a8648ce3d03010703420004f45aeeb349ed660135e274eacec814bbd7eb0a10ae13397b6a1d1a99fa64ee8b9ddabd6aedf91d8a236927a8c0c97936275d3b418c099475f5b7f74cb71f6145a03f303d06092a864886f70d01090e3130302e302c0603551d11042530238704c0000201871020010db80000000000000000000000018209612e6578616d706c65300a06082a8648ce3d0403020349003046022100a365eb67b0eefc069f5012522ac5fc4a74b933e9ade91a70944f49459a44ec37022100ed949f0931d7d0e242daa0973ccbfd7e930a966af166668e5993b1df16f24d60";
+
+test "IP SANs (RFC 8738): csrDer writes openssl's GeneralNames; both CSRs parse back" {
+    // The GeneralNames inside openssl's CSR: [7] c0000201, [7] 2001:db8::1, [2] a.example.
+    const openssl_names = "\x30\x23\x87\x04\xc0\x00\x02\x01\x87\x10\x20\x01\x0d\xb8" ++ "\x00" ** 11 ++
+        "\x01\x82\x09a.example";
+    const ours = try csrDer(testing.allocator, testKeyPair(42), &.{ "192.0.2.1", "2001:db8::1", "a.example" });
+    defer testing.allocator.free(ours);
+    try testing.expect(std.mem.indexOf(u8, ours, openssl_names) != null);
+
+    var csr: [openssl_ip_csr_hex.len / 2]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&csr, openssl_ip_csr_hex);
+    for ([_][]const u8{ ours, &csr }) |der_bytes| {
+        var parsed = try parseCsrAny(testing.allocator, der_bytes);
+        defer parsed.deinit();
+        try testing.expectEqual(@as(usize, 1), parsed.sans.len);
+        try testing.expectEqualStrings("a.example", parsed.sans[0]);
+        try testing.expectEqual(@as(usize, 2), parsed.ip_sans.len);
+        try testing.expectEqualSlices(u8, &.{ 192, 0, 2, 1 }, parsed.ip_sans[0]);
+        try testing.expectEqualSlices(u8, &(netaddr.parseIp6("2001:db8::1").?), parsed.ip_sans[1]);
+    }
+    // A 5-octet iPAddress is malformed.
+    var bad = csr;
+    const at = std.mem.indexOf(u8, &bad, "\x87\x04").?;
+    bad[at + 1] = 5;
+    try testing.expectError(error.MalformedCsr, parseCsrAny(testing.allocator, &bad));
 }

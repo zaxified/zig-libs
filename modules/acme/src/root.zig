@@ -58,7 +58,7 @@ pub const meta = .{
     .model_after = "golang.org/x/crypto/acme + certbot flow semantics; RFC 8555/7515/7638/8737 wire",
     // entropy: the seed behind `jws.generateKeyPair` — the account key and
     // every certificate key this client mints.
-    .deps = .{ "http", "router", "entropy", "p256", "p384", "p521" }, // p256/p384/p521: the burned ECDSA signers (ES256, ES384, ES512 keys); also uses std.crypto.Certificate, std.json
+    .deps = .{ "http", "router", "entropy", "p256", "p384", "p521", "rsa", "netaddr" }, // netaddr: IP identifiers (RFC 8738); p256/p384/p521: the burned ECDSA signers (ES256, ES384, ES512 keys); rsa: RS256 keys (PKCS#1 v1.5 signer/verifier, PEM/SPKI codecs, keygen); also uses std.crypto.Certificate, std.json
 };
 
 /// The ACME protocol client — see `Client.init` / `Client.obtain`.

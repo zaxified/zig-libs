@@ -154,6 +154,22 @@ _ = client.obtain(&.{"example.org"}) catch |err| switch (err) {
 };
 ```
 
+RSA (RS256) keys are 2048–4096 bits and, being tens of KiB, are held by pointer: the
+account pair stays the caller's (it must outlive the `Client`, and the caller wipes it);
+certificate keys are minted on the heap by `obtain` with `.cert_key_alg = .rs256` (and
+`.cert_rsa_bits`, default 2048), and come back as an `RSA PRIVATE KEY` PEM.
+
+```zig
+const account = try gpa.create(acme.jws.rsa.KeyPair); // or x509.rsaPrivateKeyFromPem
+try acme.jws.generateRsaKeyPair(account, 3072, io);
+var client = acme.Client.init(io, gpa, &transport, account, .{ .cert_key_alg = .rs256 });
+```
+
+IP certificates (RFC 8738): pass the address in RFC 5952 form (`"192.0.2.1"`, `"2001:db8::1"`)
+among the names. It is validated over HTTP-01 or TLS-ALPN-01 (the TLS listener is asked for the
+reverse name, `1.2.0.192.in-addr.arpa`, which `tlsAlpnResponder().getMaterial` answers), never
+DNS-01. Let's Encrypt issues IP certificates only on the `shortlived` profile.
+
 `ES512` (P-521, via `p521`) is the third key type next to ES256 and ES384:
 `jws.generateAnyKeyPair(&key, .es512, io)`, `Options.cert_key_alg = .es512`.
 A `503` is resent up to `Options.max_unavailable_retries` times (default 2) when the CA's

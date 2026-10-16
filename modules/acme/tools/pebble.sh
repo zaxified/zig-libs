@@ -78,5 +78,7 @@ cd "$scr"
 if (( check == 0 )); then
     PEBBLE_VERSION=$(go version -m "$bin/pebble" | awk '$1 == "mod" { print $3 }') \
         "$scr/pebble_helper" gen transcript.jsonl "$root/modules/acme/src/testdata/pebble_transcript.zig"
+    # The generator's layout is not zig fmt's; the pre-commit hook refuses unformatted files.
+    zig fmt "$root/modules/acme/src/testdata/pebble_transcript.zig" > /dev/null
     echo "pebble.sh: transcript -> modules/acme/src/testdata/pebble_transcript.zig"
 fi

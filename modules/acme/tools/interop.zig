@@ -17,6 +17,11 @@
 //!                      must end `AuthorizationFailed` (negative control --
 //!                      Pebble really validates)
 //!   rejected           a name on Pebble's block list: must end `AcmeProblem`
+//!   rsa                an RS256 account key and an RSA-2048 certificate key
+//!                      (2026-10-16)
+//!   ip-http01          an IP identifier, 127.0.0.1, over HTTP-01 (RFC 8738)
+//!   ip-tlsalpn01       the same IP over TLS-ALPN-01: Pebble's SNI is the
+//!                      reverse name `1.0.0.127.in-addr.arpa` (RFC 8738 §6)
 //!   lifecycle          one account through the calls beyond issuance
 //!                      (2026-10-16): the `shortlived` profile (leaf lifetime
 //!                      checked), ARI `renewalInfo`, a renewal with
@@ -39,6 +44,8 @@ const std = @import("std");
 const acme = @import("acme");
 const http = @import("http");
 const router = @import("router");
+const netaddr = @import("netaddr");
+const rsa = @import("rsa");
 
 const Scratch = struct { path: []const u8 };
 
@@ -131,7 +138,20 @@ fn verifyChain(gpa: std.mem.Allocator, chain: []const u8, root_pem: []const u8, 
         const issuer_der = if (i + 1 < ders.items.len) ders.items[i + 1] else root_der;
         const issuer = try (Cert{ .buffer = issuer_der, .index = 0 }).parse();
         try subject.verify(issuer, now);
-        if (i == 0) for (domains) |d| try subject.verifyHostName(d);
+        if (i == 0) for (domains) |d| {
+            if (netaddr.parseIp(d)) |ip| {
+                // std checks dNSNames only: look for the iPAddress SAN bytes.
+                const want: []const u8 = switch (ip) {
+                    .v4 => |q| &q,
+                    .v6 => |b| &b,
+                };
+                var tlv: [18]u8 = undefined;
+                tlv[0] = 0x87;
+                tlv[1] = @intCast(want.len);
+                @memcpy(tlv[2..][0..want.len], want);
+                if (std.mem.indexOf(u8, der, tlv[0 .. 2 + want.len]) == null) return error.NoIpSan;
+            } else try subject.verifyHostName(d);
+        };
     }
 }
 
@@ -317,6 +337,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         domains: []const []const u8,
         challenge: acme.Client.ChallengeType,
         expect: Expect,
+        rsa: bool = false,
     };
     const scenarios = [_]Scenario{
         .{ .name = "http01", .domains = &.{"a.test"}, .challenge = .http_01, .expect = .issued },
@@ -325,15 +346,30 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         .{ .name = "tlsalpn01", .domains = &.{"t.test"}, .challenge = .tls_alpn_01, .expect = .issued },
         .{ .name = "http01-unreachable", .domains = &.{"n.test"}, .challenge = .http_01, .expect = .authorization_failed },
         .{ .name = "rejected", .domains = &.{"blocked.test"}, .challenge = .http_01, .expect = .acme_problem },
+        .{ .name = "rsa", .domains = &.{"r.test"}, .challenge = .http_01, .expect = .issued, .rsa = true },
+        .{ .name = "ip-http01", .domains = &.{"127.0.0.1"}, .challenge = .http_01, .expect = .issued },
+        .{ .name = "ip-tlsalpn01", .domains = &.{"127.0.0.1"}, .challenge = .tls_alpn_01, .expect = .issued },
     };
 
     var failures: usize = 0;
     for (scenarios, 0..) |sc, i| {
         try mark(&transport, sc.name);
-        var account_key: acme.jws.KeyPair = undefined;
-        try acme.jws.Es256.KeyPair.generateDeterministicInto(&account_key, &@as([32]u8, @splat(@intCast(0x40 + i))));
+        var ec_key: acme.jws.KeyPair = undefined;
+        try acme.jws.Es256.KeyPair.generateDeterministicInto(&ec_key, &@as([32]u8, @splat(@intCast(0x40 + i))));
+        defer std.crypto.secureZero(u8, std.mem.asBytes(&ec_key));
+        const rsa_key = try gpa.create(rsa.KeyPair);
+        defer {
+            std.crypto.secureZero(u8, std.mem.asBytes(rsa_key));
+            gpa.destroy(rsa_key);
+        }
+        var account_key: acme.jws.AnyKeyPair = undefined;
+        if (sc.rsa) {
+            try acme.jws.generateRsaKeyPair(rsa_key, 2048, io);
+            account_key = .{ .rs256 = rsa_key };
+        } else account_key = .{ .es256 = ec_key };
         defer std.crypto.secureZero(u8, std.mem.asBytes(&account_key));
         var client = acme.Client.init(io, gpa, &transport, &account_key, .{
+            .cert_key_alg = if (sc.rsa) .rs256 else .es256,
             .directory_url = "https://localhost:14001/dir",
             .challenge_type = sc.challenge,
             .dns_publisher = if (sc.challenge == .dns_01) .{ .ctx = &mgmt, .present = Mgmt.present, .cleanup = Mgmt.cleanup } else null,

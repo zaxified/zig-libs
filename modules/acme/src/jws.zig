@@ -1,18 +1,22 @@
 // SPDX-License-Identifier: MIT
 
-//! JOSE building blocks for ACME: base64url (no padding), ES256 JWS in the
-//! flattened JSON serialization (RFC 7515 §7.2.2), P-256 JWK rendering, the
-//! RFC 7638 JWK thumbprint and the RFC 8555 §8.1 key authorization.
+//! JOSE building blocks for ACME: base64url (no padding), ES256 / ES384 /
+//! ES512 / RS256 JWS in the flattened JSON serialization (RFC 7515 §7.2.2),
+//! EC and RSA JWK rendering, the RFC 7638 JWK thumbprint and the RFC 8555
+//! §8.1 key authorization.
 //!
 //! Everything here is pure and offline-testable: signing is deterministic
-//! (std's RFC 6979-style nonce derivation — `KeyPair.sign` with null noise),
-//! so the same key + header + payload always produce the same JWS.
+//! (std's RFC 6979-style nonce derivation — `KeyPair.sign` with null noise;
+//! RSASSA-PKCS1-v1_5 is deterministic by construction), so the same key +
+//! header + payload always produce the same JWS.
 //! `verifyFlattened` is the server-side half — used by the mock-ACME
 //! integration test to check every JWS the client sends.
 
 const std = @import("std");
 const entropy = @import("entropy");
 const burn = @import("burn.zig");
+/// The `rsa` module, for `rsa.KeyPair` (RS256 keys are held by pointer).
+pub const rsa = @import("rsa");
 
 /// The one JWS algorithm ACME accounts use here: ECDSA P-256 + SHA-256, over
 /// p256's burned wrapper rather than std's signer (which leaves the private
@@ -29,12 +33,14 @@ pub const Es384 = @import("p384").EcdsaP384Sha384;
 /// burned signer.
 pub const Es512 = @import("p521").EcdsaP521Sha512;
 
-/// The JWS algorithms an ACME account or certificate key can use here.
-/// RSA is not supported (see SPEC "Backlog").
+/// The JWS algorithms an ACME account or certificate key can use here:
+/// ECDSA on P-256, P-384 and P-521, and RSASSA-PKCS1-v1_5 with SHA-256
+/// (RS256, RFC 7518 §3.3) over the `rsa` module.
 pub const Alg = enum {
     es256,
     es384,
     es512,
+    rs256,
 
     /// The JOSE `alg` name (RFC 7518 §3.1).
     pub fn name(a: Alg) []const u8 {
@@ -42,28 +48,41 @@ pub const Alg = enum {
             .es256 => "ES256",
             .es384 => "ES384",
             .es512 => "ES512",
+            .rs256 => "RS256",
         };
     }
 
-    /// The JWK `crv` (RFC 7518 §6.2.1.1).
+    /// True for the ECDSA algorithms — the ones `crv`, `coordLen` and
+    /// `sigLen` are defined for.
+    pub fn isEc(a: Alg) bool {
+        return a != .rs256;
+    }
+
+    /// The JWK `crv` (RFC 7518 §6.2.1.1). EC algorithms only (`isEc`): an RSA
+    /// key has no curve, so asking is a caller bug (`unreachable`).
     pub fn crv(a: Alg) []const u8 {
         return switch (a) {
             .es256 => "P-256",
             .es384 => "P-384",
             .es512 => "P-521",
+            .rs256 => unreachable, // callers branch on `isEc` first
         };
     }
 
-    /// Octets of one affine coordinate, and of one scalar.
+    /// Octets of one affine coordinate, and of one scalar. EC algorithms only
+    /// (`isEc`).
     pub fn coordLen(a: Alg) usize {
         return switch (a) {
             .es256 => 32,
             .es384 => 48,
             .es512 => 66,
+            .rs256 => unreachable, // callers branch on `isEc` first
         };
     }
 
-    /// Octets of a JWS signature, `R ‖ S` (RFC 7518 §3.4).
+    /// Octets of an ECDSA JWS signature, `R ‖ S` (RFC 7518 §3.4). EC
+    /// algorithms only (`isEc`): an RS256 signature is as long as the key's
+    /// modulus (RFC 7518 §3.3), so it depends on the key, not on the `Alg`.
     pub fn sigLen(a: Alg) usize {
         return 2 * a.coordLen();
     }
@@ -72,6 +91,7 @@ pub const Alg = enum {
         if (std.mem.eql(u8, s, "ES256")) return .es256;
         if (std.mem.eql(u8, s, "ES384")) return .es384;
         if (std.mem.eql(u8, s, "ES512")) return .es512;
+        if (std.mem.eql(u8, s, "RS256")) return .rs256;
         return null;
     }
 };
@@ -82,15 +102,45 @@ pub fn algOf(comptime T: type) Alg {
         Es256.KeyPair, Es256.PublicKey => .es256,
         Es384.KeyPair, Es384.PublicKey => .es384,
         Es512.KeyPair, Es512.PublicKey => .es512,
+        rsa.KeyPair, rsa.PublicKey, rsa.VerifyKey => .rs256,
         else => @compileError("not an acme key type: " ++ @typeName(T)),
     };
 }
 
-/// A public key of either supported curve.
+/// The RSA key sizes an ACME account or certificate key may have here: the
+/// range public CAs accept (Let's Encrypt: 2048..4096). Enforced where a key
+/// enters — `generateRsaKeyPair`, `x509.rsaPrivateKeyFromPem`, a JWK or CSR
+/// that `verifyFlattenedAny` / `x509.parseCsrAny` parse — not by the signers,
+/// whose buffers are sized for the `rsa` module's own ceiling
+/// (`rsa.max_modulus_bits`) and so cannot overflow.
+pub const rsa_min_bits = 2048;
+pub const rsa_max_bits = 4096;
+
+/// Big-endian modulus and exponent of an RSA verify key, leading zeros
+/// stripped (RFC 7518 §6.3.1: the JWK form), into caller buffers.
+const RsaParts = struct {
+    n: []const u8,
+    e: []const u8,
+
+    fn of(vk: *const rsa.VerifyKey, n_buf: *[rsa.max_modulus_len]u8, e_buf: *[4]u8) RsaParts {
+        const len = vk.mp.byteLen(); // <= max_modulus_len: every VerifyKey constructor checks
+        vk.mp.toBytesBE(&vk.mp.m, n_buf[0..len]);
+        std.mem.writeInt(u32, e_buf, vk.e, .big);
+        return .{
+            .n = std.mem.trimStart(u8, n_buf[0..len], "\x00"),
+            .e = std.mem.trimStart(u8, e_buf, "\x00"),
+        };
+    }
+};
+
+/// A public key of any supported algorithm.
 pub const AnyPublicKey = union(Alg) {
     es256: Es256.PublicKey,
     es384: Es384.PublicKey,
     es512: Es512.PublicKey,
+    /// By value: a `rsa.VerifyKey` is the modulus and exponent only (a few KiB
+    /// at most), without the key-generation constants of `rsa.PublicKey`.
+    rs256: rsa.VerifyKey,
 
     pub fn alg(k: AnyPublicKey) Alg {
         return std.meta.activeTag(k);
@@ -99,10 +149,12 @@ pub const AnyPublicKey = union(Alg) {
     /// Longest uncompressed SEC1 point (P-521: `04 ‖ X(66) ‖ Y(66)`).
     pub const max_sec1_len = 133;
 
-    /// `04 ‖ X ‖ Y` into `buf`; the returned slice is its prefix.
+    /// `04 ‖ X ‖ Y` into `buf`; the returned slice is its prefix. EC keys only
+    /// (`alg().isEc()`): an RSA key has no point (`unreachable`).
     pub fn uncompressedSec1(k: AnyPublicKey, buf: *[max_sec1_len]u8) []const u8 {
         switch (k) {
-            inline else => |pk| {
+            .rs256 => unreachable, // callers branch on `isEc` first
+            inline .es256, .es384, .es512 => |pk| {
                 const s = pk.toUncompressedSec1();
                 @memcpy(buf[0..s.len], &s);
                 return buf[0..s.len];
@@ -110,31 +162,48 @@ pub const AnyPublicKey = union(Alg) {
         }
     }
 
-    /// Same curve and same point (public data, so a plain comparison).
+    /// Same algorithm and same key (public data, so a plain comparison).
     pub fn eql(a: AnyPublicKey, b: AnyPublicKey) bool {
         if (a.alg() != b.alg()) return false;
+        if (a.alg() == .rs256) {
+            var an: [rsa.max_modulus_len]u8 = undefined;
+            var ae: [4]u8 = undefined;
+            var bn: [rsa.max_modulus_len]u8 = undefined;
+            var be: [4]u8 = undefined;
+            const pa = RsaParts.of(&a.rs256, &an, &ae);
+            const pb = RsaParts.of(&b.rs256, &bn, &be);
+            return std.mem.eql(u8, pa.n, pb.n) and std.mem.eql(u8, pa.e, pb.e);
+        }
         var ab: [max_sec1_len]u8 = undefined;
         var bb: [max_sec1_len]u8 = undefined;
         return std.mem.eql(u8, a.uncompressedSec1(&ab), b.uncompressedSec1(&bb));
     }
 };
 
-/// A key pair of either supported curve — what `Client` holds. Holds a
-/// private key: wipe it with `std.crypto.secureZero(u8, std.mem.asBytes(&k))`.
+/// A key pair of any supported algorithm — what `Client` holds. An EC pair is
+/// held by value and holds a private key: wipe it with
+/// `std.crypto.secureZero(u8, std.mem.asBytes(&k))`. An RSA pair is tens of KiB
+/// (`rsa.SecretKey`), so `rs256` BORROWS it: the caller keeps the
+/// `rsa.KeyPair` alive for as long as this value is used, and wipes that pair
+/// (`std.crypto.secureZero(u8, std.mem.asBytes(pair))`) — wiping the
+/// `AnyKeyPair` only clears the pointer.
 pub const AnyKeyPair = union(Alg) {
     es256: Es256.KeyPair,
     es384: Es384.KeyPair,
     es512: Es512.KeyPair,
+    rs256: *const rsa.KeyPair,
 
     pub fn alg(k: *const AnyKeyPair) Alg {
         return std.meta.activeTag(k.*);
     }
 
+    // secret-api-ok: reads the public half only (for RS256 a public VerifyKey built from the pair's public key); no secret enters the frame.
     pub fn publicKey(k: *const AnyKeyPair) AnyPublicKey {
         return switch (k.*) {
             .es256 => |*kp| .{ .es256 = kp.public_key },
             .es384 => |*kp| .{ .es384 = kp.public_key },
             .es512 => |*kp| .{ .es512 = kp.public_key },
+            .rs256 => |kp| .{ .rs256 = kp.public_key.verifyKey() },
         };
     }
 };
@@ -146,6 +215,8 @@ pub fn anyPublic(pk: anytype) AnyPublicKey {
         Es256.PublicKey => .{ .es256 = pk },
         Es384.PublicKey => .{ .es384 = pk },
         Es512.PublicKey => .{ .es512 = pk },
+        rsa.VerifyKey => .{ .rs256 = pk },
+        rsa.PublicKey => .{ .rs256 = pk.verifyKey() },
         else => @compileError("not an acme public key: " ++ @typeName(@TypeOf(pk))),
     };
 }
@@ -157,19 +228,22 @@ pub fn publicOfPair(key_pair: anytype) AnyPublicKey {
         Es256.KeyPair => .{ .es256 = key_pair.public_key },
         Es384.KeyPair => .{ .es384 = key_pair.public_key },
         Es512.KeyPair => .{ .es512 = key_pair.public_key },
+        rsa.KeyPair => .{ .rs256 = key_pair.public_key.verifyKey() },
         else => @compileError("not an acme key pair: " ++ @typeName(@TypeOf(key_pair.*))),
     };
 }
 
-/// Copy the pair behind `key_pair` (a pointer to either curve's pair or to an
-/// `AnyKeyPair`) into `out`. The copy is a second resident private key: the
-/// caller wipes it.
+/// Copy the pair behind `key_pair` (a pointer to an EC pair, to an
+/// `rsa.KeyPair` or to an `AnyKeyPair`) into `out`. An EC copy is a second
+/// resident private key: the caller wipes it. An RSA pair is NOT copied: `out`
+/// stores the pointer, so the `rsa.KeyPair` must outlive `out`.
 pub fn copyPairInto(out: *AnyKeyPair, key_pair: anytype) void {
     switch (@TypeOf(key_pair.*)) {
         AnyKeyPair => out.* = key_pair.*,
         Es256.KeyPair => out.* = .{ .es256 = key_pair.* },
         Es384.KeyPair => out.* = .{ .es384 = key_pair.* },
         Es512.KeyPair => out.* = .{ .es512 = key_pair.* },
+        rsa.KeyPair => out.* = .{ .rs256 = key_pair },
         else => @compileError("not an acme key pair: " ++ @typeName(@TypeOf(key_pair.*))),
     }
 }
@@ -198,7 +272,9 @@ pub fn generateKeyPair(out: *KeyPair, io: std.Io) void {
 }
 
 /// `generateKeyPair` for a chosen curve, into an `AnyKeyPair` (ES384 / ES512
-/// account and certificate keys). Same entropy path and burn.
+/// account and certificate keys). Same entropy path and burn. EC algorithms
+/// only: `alg` must satisfy `isEc()` — an RSA key is too large to live in the
+/// union, so it is minted by `generateRsaKeyPair` into a pair the caller owns.
 pub fn generateAnyKeyPair(out: *AnyKeyPair, alg: Alg, io: std.Io) void {
     switch (alg) {
         .es256 => {
@@ -213,8 +289,37 @@ pub fn generateAnyKeyPair(out: *AnyKeyPair, alg: Alg, io: std.Io) void {
             out.* = .{ .es512 = undefined };
             generateKeyPairUnburned(Es512.KeyPair, &out.es512, io);
         },
+        .rs256 => unreachable, // documented precondition: `alg.isEc()`; see `generateRsaKeyPair`
     }
     burn.stack(burn.key_burn);
+}
+
+/// Mint an RSA account or certificate key (`bits` 2048, 3072 or 4096; anything
+/// else is `InvalidBits` and `out` is zeroed). Same entropy discipline as
+/// `generateKeyPair` — the 32-byte seed comes from the fail-closed
+/// `entropy.fill`, never from `io.random` — expanded by a ChaCha20 CSPRNG
+/// (`std.Random.DefaultCsprng`) into the `rsa.generate` prime search. The
+/// CSPRNG state and the seed are wiped and the frames burned. The pair goes
+/// into `out` (zeroed on error); the caller owns and wipes it. Key generation
+/// is slow (seconds at 4096 bits; much slower in Debug builds).
+pub fn generateRsaKeyPair(out: *rsa.KeyPair, bits: u16, io: std.Io) error{InvalidBits}!void {
+    if (bits != 2048 and bits != 3072 and bits != 4096) {
+        std.crypto.secureZero(u8, std.mem.asBytes(out));
+        return error.InvalidBits;
+    }
+    generateRsaKeyPairUnburned(out, bits, io);
+    burn.stack(burn.key_burn);
+}
+
+noinline fn generateRsaKeyPairUnburned(out: *rsa.KeyPair, bits: u16, io: std.Io) void {
+    var seed: [std.Random.DefaultCsprng.secret_seed_length]u8 = undefined;
+    defer std.crypto.secureZero(u8, &seed);
+    entropy.fill(io, &seed);
+    var csprng = std.Random.DefaultCsprng.init(seed);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&csprng));
+    // `bits` is one of the three checked above and 65537 is a valid exponent,
+    // so `rsa.generate` has no error left to report.
+    rsa.generate(out, csprng.random(), bits, 65537) catch unreachable;
 }
 
 noinline fn generateKeyPairUnburned(comptime KP: type, out: *KP, io: std.Io) void {
@@ -271,15 +376,39 @@ fn canonicalJwkLen() usize {
     return "{\"crv\":\"P-256\",\"kty\":\"EC\",\"x\":\"\",\"y\":\"\"}".len + 2 * 43;
 }
 
-/// Length of the longest canonical JWK (P-521: 88-character coordinates).
-pub const max_canonical_jwk_len = "{\"crv\":\"P-521\",\"kty\":\"EC\",\"x\":\"\",\"y\":\"\"}".len + 2 * 88;
+/// Length of the longest canonical JWK: an RSA key of the `rsa` module's
+/// ceiling (`rsa.max_modulus_bits`, 8192 bits: a 1366-character `n`), which
+/// also covers 4096-bit keys (683 characters) and P-521 (88-character
+/// coordinates).
+pub const max_canonical_jwk_len = "{\"e\":\"\",\"kty\":\"RSA\",\"n\":\"\"}".len +
+    base64UrlLen(4) + base64UrlLen(rsa.max_modulus_len);
+
+comptime {
+    const ec_max = "{\"crv\":\"P-521\",\"kty\":\"EC\",\"x\":\"\",\"y\":\"\"}".len + 2 * 88;
+    std.debug.assert(max_canonical_jwk_len >= ec_max);
+}
 
 /// The canonical JWK of a public key (`Es256.PublicKey`, `Es384.PublicKey`,
-/// `Es512.PublicKey` or `AnyPublicKey`): required members only, in lexicographic order, no
-/// whitespace — the exact byte sequence RFC 7638 hashes. `buf` must hold
+/// `Es512.PublicKey`, `rsa.VerifyKey`, `rsa.PublicKey` or `AnyPublicKey`):
+/// required members only, in lexicographic order, no whitespace — the exact
+/// byte sequence RFC 7638 hashes. EC: `{"crv","kty":"EC","x","y"}`; RSA (RFC
+/// 7518 §6.3.1): `{"e","kty":"RSA","n"}` with `e` and `n` the unsigned
+/// big-endian bytes without leading zeros. `buf` must hold
 /// `max_canonical_jwk_len` bytes (`canonical_jwk_len` suffices for P-256).
 pub fn canonicalJwk(buf: []u8, public_key: anytype) []const u8 {
     const pk = anyPublic(public_key);
+    if (pk.alg() == .rs256) {
+        var n_buf: [rsa.max_modulus_len]u8 = undefined;
+        var e_buf: [4]u8 = undefined;
+        const parts = RsaParts.of(&pk.rs256, &n_buf, &e_buf);
+        var nb: [base64UrlLen(rsa.max_modulus_len)]u8 = undefined;
+        var eb: [base64UrlLen(4)]u8 = undefined;
+        return std.fmt.bufPrint(
+            buf,
+            "{{\"e\":\"{s}\",\"kty\":\"RSA\",\"n\":\"{s}\"}}",
+            .{ b64.Encoder.encode(&eb, parts.e), b64.Encoder.encode(&nb, parts.n) },
+        ) catch unreachable; // sized by max_canonical_jwk_len for the largest key rsa accepts
+    }
     var sec1_buf: [AnyPublicKey.max_sec1_len]u8 = undefined;
     const sec1 = pk.uncompressedSec1(&sec1_buf); // 0x04 ‖ X ‖ Y
     const n = pk.alg().coordLen();
@@ -417,8 +546,10 @@ pub const SignError = error{ OutOfMemory, SigningFailed };
 
 /// Sign `payload` (raw bytes; "" for POST-as-GET) into a flattened JSON JWS
 /// (`{"protected","payload","signature"}`). `key_pair` is a pointer to an
-/// `Es256.KeyPair`, an `Es384.KeyPair`, an `Es512.KeyPair` or an `AnyKeyPair`. Caller owns the
-/// returned JSON.
+/// `Es256.KeyPair`, an `Es384.KeyPair`, an `Es512.KeyPair`, an `rsa.KeyPair`
+/// (RS256: RSASSA-PKCS1-v1_5 + SHA-256, deterministic, `rsa.signPkcs1v15` —
+/// whose private operation runs with base blinding off) or an `AnyKeyPair`.
+/// Caller owns the returned JSON.
 pub fn sign(
     gpa: std.mem.Allocator,
     key_pair: anytype,
@@ -427,7 +558,8 @@ pub fn sign(
 ) SignError![]u8 {
     if (comptime @TypeOf(key_pair.*) == AnyKeyPair) {
         return switch (key_pair.*) {
-            inline else => |*kp| signTyped(gpa, kp, payload, header),
+            inline .es256, .es384, .es512 => |*kp| signTyped(gpa, kp, payload, header),
+            .rs256 => |kp| signTyped(gpa, kp, payload, header),
         };
     } else {
         return signTyped(gpa, key_pair, payload, header);
@@ -457,7 +589,7 @@ fn SignBody(comptime KP: type) type {
             var hw: std.Io.Writer.Allocating = .init(gpa);
             defer hw.deinit();
             var js: std.json.Stringify = .{ .writer = &hw.writer, .options = .{} };
-            writeProtected(&js, anyPublic(key_pair.public_key), header) catch return error.OutOfMemory;
+            writeProtected(&js, publicOfPair(key_pair), header) catch return error.OutOfMemory;
             const protected = hw.written();
 
             var out: std.Io.Writer.Allocating = .init(gpa);
@@ -496,6 +628,24 @@ fn writeProtected(js: *std.json.Stringify, public_key: AnyPublicKey, header: Hea
     try js.endObject();
 }
 
+/// Longest JWS signature: an RSA modulus at the `rsa` module's ceiling (the
+/// EC signatures are at most 132 bytes).
+const max_sig_len = rsa.max_modulus_len;
+
+/// The JWS signature over `input` (BASE64URL(protected) ‖ "." ‖ BASE64URL(payload)),
+/// into `out`: `r ‖ s` for ECDSA (64 / 96 / 132 bytes), the PKCS#1 v1.5 value
+/// for RS256 (one modulus length).
+fn signInput(comptime KP: type, key_pair: *const KP, input: []const u8, out: *[max_sig_len]u8) SignError![]const u8 {
+    if (comptime KP == rsa.KeyPair) {
+        return rsa.signPkcs1v15(&key_pair.secret_key, Sha256, input, out) catch return error.SigningFailed;
+    } else {
+        const sig = key_pair.sign(input, null) catch return error.SigningFailed;
+        const bytes = sig.toBytes(); // r ‖ s: 64 bytes (ES256), 96 (ES384) or 132 (ES512)
+        @memcpy(out[0..bytes.len], &bytes);
+        return out[0..bytes.len];
+    }
+}
+
 fn appendJws(
     comptime KP: type,
     gpa: std.mem.Allocator,
@@ -512,10 +662,10 @@ fn appendJws(
     // Signing input = BASE64URL(protected) ‖ "." ‖ BASE64URL(payload).
     const input = try std.mem.concat(gpa, u8, &.{ protected_b64, ".", payload_b64 });
     defer gpa.free(input);
-    const sig = key_pair.sign(input, null) catch return error.SigningFailed;
-    const sig_bytes = sig.toBytes(); // r ‖ s: 64 bytes (ES256), 96 (ES384) or 132 (ES512)
-    var sig_b64_buf: [base64UrlLen(132)]u8 = undefined;
-    const sig_b64 = b64.Encoder.encode(&sig_b64_buf, &sig_bytes);
+    var sig_buf: [max_sig_len]u8 = undefined;
+    const sig_bytes = try signInput(KP, key_pair, input, &sig_buf);
+    var sig_b64_buf: [base64UrlLen(max_sig_len)]u8 = undefined;
+    const sig_b64 = b64.Encoder.encode(&sig_b64_buf, sig_bytes);
 
     try w.print(
         "{{\"protected\":\"{s}\",\"payload\":\"{s}\",\"signature\":\"{s}\"}}",
@@ -660,7 +810,7 @@ pub const VerifyError = error{
     OutOfMemory,
     /// Not a flattened JWS / protected header not JSON / bad base64.
     MalformedJws,
-    /// alg is not ES256, or jwk/kid are missing/both present.
+    /// alg is not a supported one, or jwk/kid are missing/both present.
     UnsupportedJws,
     /// Signature does not verify.
     BadSignature,
@@ -703,6 +853,8 @@ const ProtectedJson = struct {
         crv: []const u8 = "",
         x: []const u8 = "",
         y: []const u8 = "",
+        n: []const u8 = "",
+        e: []const u8 = "",
     };
 };
 
@@ -746,8 +898,12 @@ pub fn verifyFlattened(
     };
 }
 
-/// `verifyFlattened` for ES256, ES384 and ES512: the header's `alg` picks the curve,
-/// the embedded jwk must be on it, and an `expected_key` must be too.
+/// `verifyFlattened` for ES256, ES384, ES512 and RS256: the header's `alg`
+/// picks the curve (or RSA), the embedded jwk must be of that kind, and an
+/// `expected_key` must be too. An RS256 key must have `rsa_min_bits` ..
+/// `rsa_max_bits` bits, its JWK `n` and `e` must carry no leading zero octet
+/// (RFC 7518 §6.3.1.1), and its signature must be exactly one modulus long
+/// (RFC 7518 §3.3).
 pub fn verifyFlattenedAny(
     gpa: std.mem.Allocator,
     jws_json: []const u8,
@@ -777,9 +933,12 @@ pub fn verifyFlattenedAny(
         error.OutOfMemory => return error.OutOfMemory,
         error.InvalidBase64 => return error.MalformedJws,
     };
-    if (sig_bytes.len != Alg.es256.sigLen() and sig_bytes.len != Alg.es384.sigLen() and
-        sig_bytes.len != Alg.es512.sigLen())
-        return error.MalformedJws;
+    // An ECDSA signature has one of three fixed lengths; an RS256 one is as
+    // long as the key's modulus, known only once the key is. So a length that
+    // fits no ECDSA curve is refused here unless the header turns out to name
+    // RS256 (decided below, at the same point in the error order as before).
+    const ec_sig_len = sig_bytes.len == Alg.es256.sigLen() or sig_bytes.len == Alg.es384.sigLen() or
+        sig_bytes.len == Alg.es512.sigLen();
 
     const head = std.json.parseFromSliceLeaky(ProtectedJson, a, protected, .{
         .ignore_unknown_fields = true,
@@ -787,21 +946,33 @@ pub fn verifyFlattenedAny(
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.MalformedJws,
     };
-    const alg = Alg.fromName(head.alg) orelse return error.UnsupportedJws;
+    const alg = Alg.fromName(head.alg) orelse return if (ec_sig_len) error.UnsupportedJws else error.MalformedJws;
+    if (alg != .rs256 and !ec_sig_len) return error.MalformedJws;
     if ((head.kid == null) == (head.jwk == null)) return error.UnsupportedJws; // exactly one
 
     var jwk_key: ?AnyPublicKey = null;
     if (head.jwk) |jwk| {
-        if (!std.mem.eql(u8, jwk.kty, "EC") or !std.mem.eql(u8, jwk.crv, alg.crv()))
-            return error.UnsupportedJws;
-        jwk_key = publicKeyFromCoords(a, alg, jwk.x, jwk.y) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => return error.MalformedJws,
-        };
+        if (alg == .rs256) {
+            if (!std.mem.eql(u8, jwk.kty, "RSA")) return error.UnsupportedJws;
+            jwk_key = rsaPublicKeyFromJwk(a, jwk.n, jwk.e) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.MalformedJws,
+            };
+        } else {
+            if (!std.mem.eql(u8, jwk.kty, "EC") or !std.mem.eql(u8, jwk.crv, alg.crv()))
+                return error.UnsupportedJws;
+            jwk_key = publicKeyFromCoords(a, alg, jwk.x, jwk.y) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.MalformedJws,
+            };
+        }
     }
     const key = expected_key orelse (jwk_key orelse return error.UnsupportedJws);
     if (key.alg() != alg) return error.UnsupportedJws; // a key of another curve cannot verify it
-    if (sig_bytes.len != alg.sigLen()) return error.MalformedJws; // RFC 7518 §3.4: exactly R ‖ S
+    switch (key) {
+        .rs256 => |*k| if (sig_bytes.len != k.mp.byteLen()) return error.MalformedJws, // RFC 7518 §3.3: one modulus
+        else => if (sig_bytes.len != alg.sigLen()) return error.MalformedJws, // RFC 7518 §3.4: exactly R ‖ S
+    }
 
     // Verify over the exact base64url text from the wire.
     const input = std.mem.concat(a, u8, &.{ flat.protected, ".", flat.payload }) catch
@@ -810,6 +981,7 @@ pub fn verifyFlattenedAny(
         .es256 => |k| Es256.Signature.fromBytes(sig_bytes[0..64].*).verify(input, k) catch return error.BadSignature,
         .es384 => |k| Es384.Signature.fromBytes(sig_bytes[0..96].*).verify(input, k) catch return error.BadSignature,
         .es512 => |k| Es512.Signature.fromBytes(sig_bytes[0..132].*).verify(input, k) catch return error.BadSignature,
+        .rs256 => |*k| k.verifyPkcs1v15(Sha256, input, sig_bytes) catch return error.BadSignature,
     }
 
     return .{
@@ -821,6 +993,22 @@ pub fn verifyFlattenedAny(
         .kid = head.kid,
         .jwk_key = jwk_key,
     };
+}
+
+/// The RS256 public key of a JWK's `n` and `e` (RFC 7518 §6.3.1): base64url of
+/// the unsigned big-endian octets, minimal (no leading zero), a modulus of
+/// `rsa_min_bits` .. `rsa_max_bits`.
+fn rsaPublicKeyFromJwk(
+    scratch: std.mem.Allocator,
+    n_b64: []const u8,
+    e_b64: []const u8,
+) error{ OutOfMemory, InvalidBase64, InvalidKey }!AnyPublicKey {
+    const n = try base64UrlDecodeAlloc(scratch, n_b64);
+    const e = try base64UrlDecodeAlloc(scratch, e_b64);
+    if (n.len == 0 or e.len == 0 or n[0] == 0 or e[0] == 0) return error.InvalidKey;
+    const vk = rsa.VerifyKey.fromBytes(n, e) catch return error.InvalidKey;
+    if (vk.bits() < rsa_min_bits or vk.bits() > rsa_max_bits) return error.InvalidKey;
+    return .{ .rs256 = vk };
 }
 
 fn publicKeyFromCoords(
@@ -841,6 +1029,7 @@ fn publicKeyFromCoords(
         .es256 => .{ .es256 = Es256.PublicKey.fromSec1(sec1[0 .. 1 + 2 * n]) catch return error.InvalidKey },
         .es384 => .{ .es384 = Es384.PublicKey.fromSec1(sec1[0 .. 1 + 2 * n]) catch return error.InvalidKey },
         .es512 => .{ .es512 = Es512.PublicKey.fromSec1(sec1[0 .. 1 + 2 * n]) catch return error.InvalidKey },
+        .rs256 => unreachable, // callers use `rsaPublicKeyFromJwk` for RSA
     };
 }
 
@@ -1373,7 +1562,7 @@ test "ES512: JWK, RFC 7638 thumbprint and key authorization against openssl + py
     const kp = try p521KeyPair();
     var buf: [max_canonical_jwk_len]u8 = undefined;
     try testing.expectEqualStrings(p521_canonical_jwk, canonicalJwk(&buf, kp.public_key));
-    try testing.expectEqual(max_canonical_jwk_len, p521_canonical_jwk.len);
+    try testing.expect(max_canonical_jwk_len >= p521_canonical_jwk.len);
     try testing.expectEqualStrings(p521_thumbprint, &thumbprintBase64(kp.public_key));
     try testing.expectEqualStrings(p521_thumbprint, &thumbprintBase64(AnyPublicKey{ .es512 = kp.public_key }));
     var ka: [max_key_authorization_len]u8 = undefined;
@@ -1452,4 +1641,304 @@ fn craftJwsAlgAny(gpa: std.mem.Allocator, alg: []const u8, public_key: AnyPublic
     const s64 = try base64UrlEncodeAlloc(gpa, zeros);
     defer gpa.free(s64);
     return std.fmt.allocPrint(gpa, "{{\"protected\":\"{s}\",\"payload\":\"\",\"signature\":\"{s}\"}}", .{ p64, s64 });
+}
+
+// ── RS256 (2026-10-16) ──────────────────────────────────────────────────────
+
+// A throwaway RSA-2048 key (not a secret), made with
+//   openssl genrsa -out k.pkcs8.pem 2048        (OpenSSL 3.5.5: PKCS#8 "PRIVATE KEY")
+const rsa2048_pkcs8_pem =
+    \\-----BEGIN PRIVATE KEY-----
+    \\MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCFclHEPYa49gNd
+    \\vBIPrMUfKEKaeE3xmM469V6sBhj5FHYgQcd0JgA5ZfpGMLWd8caTT8Pq/KjIS3cF
+    \\ThcTD3o0sEmGUVdIH8NiZBkZcps4VuRLjB1oi619M8TG8qqOLaTDlmt3SOaj5oRS
+    \\cRUzb2vFYAQwK6iylBY4Lg+vIL0pHb5NqzPiW4K9996mCKXP7HOD+bECsTmcDKeh
+    \\/iDxibaumlA5ojkF245wyf+yhJkB5iFIVdV97+nyTVHDvtTHGkgv463kTZ1nNrMS
+    \\YXoqO2mLK11BxT2K/JgHMsRbpQnvHKx/qZxx4Rz0edQglZkHAr6USor7Rkj/Wrlu
+    \\znvKVeqjAgMBAAECggEALP62Xj5Gmj/tM6JRzrI5Bv/qsS3mThNxWgTY5pTpv7Zr
+    \\/AVh7KJRigj+AcOzwS1AAPSwwR9vA5YabBIACr+5u2FDcUQk818uYJMSuXdgqfb2
+    \\ZBi648DQ/vnBHDm/U1BFkWM7Gg3dIp97t1aEyQKFKphs4RcfexMeiNPTGwAld+Kg
+    \\W/BdFgbQrzEKkxSzSVbZ+8hTGfd1Okfancr/tfaV4xdHFeVUVk/yWfjeKEHMmBGQ
+    \\YbXmSB2cYypcQ1LMYWoyw8uWTzEihe3rrNZt8TcAMAG6osRYrjV+cXlnqUnv87oQ
+    \\0Ei6WgAdpmKIIEtCUwfIZ0C6me4aq4sMOY7emc0igQKBgQC7amDC5++Pj92r/oFI
+    \\i/mn+0vyIkzoEVPkYo+TeImJk38owRbPZ58shX+pEL+iM40XbGa9+MrqExTmApSv
+    \\s2ugZGtxGRim7CnihMB1SzWma85lD2lshK7vJ0vGgpCQGtCShJi6+fSZE1uyQZGT
+    \\5niFOxSdmmJZA13cbHEik1zDgQKBgQC2R/k/VnFRL8kMKWk6OGQI7tZu/RfTf/hK
+    \\U9H1Ng8a8END6Pvmgj+8BcVtgU2JLDgqpbf1dztvEUywkr+fvg5zLPuGBPtmcAQX
+    \\BZ0j/h+HRjJ2YXyaS90UmSp6gxs9HzM0blqSTLBgJTZcvJYbE86HspNy87GBtenJ
+    \\FO8ww38wIwKBgQCzYH+4TNFnMKVUJ0WKMB8FfmoUGGxPebY303XkCexp9vgwA49X
+    \\d7BLpoKnSFaCYqDaGHDFxsg//X91Hmc9O5b5buO+3exQZ503JyQln5R78pca9wNK
+    \\UDw2vf+yweinZGLYuXyNCQvpLzQGiudRDbewnPmAVvFmjOhbPpeSJkUVAQKBgBHj
+    \\CCtV8TK1TLY7zg6ff/l8bmBfx5nCgfvRM9YrItpS31bnouhguZ5atp/jQ1eFllFh
+    \\B6c3twZUHUFqdRFY1hQpQtlI3d6UeWJE88GXa0Kb+dGyCUce0Kf3y7pP6TlbOWwY
+    \\tByNF/WnUSlSfCxWCjs4o81w6mc/EZzgyAPx+yYfAoGAOuKqYZUlQf6qESwycemd
+    \\vWdplgQS86KELyJe4+i1vDSc7nEV4vLfw19Fq1RnPFbQyU/VBTi0yHnZm0VIm12F
+    \\SfARyPbKN2wXy61GVGk8KjO7iKAa8ChCp9ZrtD3qErzG4ixRU/dxc5/zJgPY4HBO
+    \\nKhgr4xUe9OqdoSafb5oCtM=
+    \\-----END PRIVATE KEY-----
+    \\
+;
+// Oracle: python3 -I over `openssl pkey -in k.pkcs8.pem -pubout -outform DER`
+// (SPKI -> BIT STRING -> RSAPublicKey -> n, e parsed by hand): the RFC 7518
+// §6.3.1 canonical JWK (base64url of the unsigned big-endian n, e without
+// leading zeros), then base64url(SHA-256) of its bytes (RFC 7638).
+const rsa2048_canonical_jwk = "{\"e\":\"AQAB\",\"kty\":\"RSA\",\"n\":\"" ++
+    "hXJRxD2GuPYDXbwSD6zFHyhCmnhN8ZjOOvVerAYY-RR2IEHHdCYAOWX6RjC1nfHG" ++
+    "k0_D6vyoyEt3BU4XEw96NLBJhlFXSB_DYmQZGXKbOFbkS4wdaIutfTPExvKqji2k" ++
+    "w5Zrd0jmo-aEUnEVM29rxWAEMCuospQWOC4PryC9KR2-Tasz4luCvffepgilz-xz" ++
+    "g_mxArE5nAynof4g8Ym2rppQOaI5BduOcMn_soSZAeYhSFXVfe_p8k1Rw77UxxpI" ++
+    "L-Ot5E2dZzazEmF6KjtpiytdQcU9ivyYBzLEW6UJ7xysf6mcceEc9HnUIJWZBwK-" ++
+    "lEqK-0ZI_1q5bs57ylXqow" ++
+    "\"}";
+const rsa2048_thumbprint = "vQHIXQi7n2ktWvrJlhbhcbN48NXARhKToNoXv9CAXwk";
+// `openssl dgst -sha256 -sign k.pkcs8.pem input.txt` where input.txt holds the
+// JWS signing input of the "RS256: sign" test below (no trailing newline):
+//   BASE64URL({"alg":"RS256","jwk":<canonical JWK>,"nonce":"n-rsa","url":"https://ca.example/new-acct"})
+//   ++ "." ++ BASE64URL({"a":1})
+// PKCS#1 v1.5 is deterministic, so the signature must be byte-identical.
+const rsa2048_openssl_signature = "Rsm_tEGijDzpkQhd_DWe5LsuESwJy3xnzJDL59Xtfa14Wc262KXYLF0yf6AzJbAz" ++
+    "dQEsS62m5Iyp6ccfmuAPuQasNutXbWQfi134WtW55XJ7WnEtxI9uByWm_VZLMTL7" ++
+    "9M_NDWDzb00cyMApprf_UMTkwIjkXnPR8ot4LThYLKlsdcbxYw2sltq7XYWxJPnj" ++
+    "YrLpiilr-Xq5q2Un0TLHbURl8AgxEQY6wDbMT9HUScwF8Vy6mnDReU1tQXHKEgHq" ++
+    "hcev2Zzha7eGbu1EFDqvArKrDUgGKc41aAlYNr3RsXXOu5dK3sz_pl8uO8ZzDC9b" ++
+    "LsSsOdYS55gh2PrOBJBUNA";
+
+fn rsa2048KeyPair() !*const rsa.KeyPair {
+    const S = struct {
+        var kp: rsa.KeyPair = undefined;
+        var ready = false;
+    };
+    if (!S.ready) {
+        try rsa.SecretKey.fromPem(&S.kp.secret_key, rsa2048_pkcs8_pem);
+        S.kp.public_key = S.kp.secret_key.publicKey();
+        S.ready = true;
+    }
+    return &S.kp;
+}
+
+test "RS256: JWK, RFC 7638 thumbprint and key authorization against openssl + python" {
+    const kp = try rsa2048KeyPair();
+    const vk = kp.public_key.verifyKey();
+    var buf: [max_canonical_jwk_len]u8 = undefined;
+    try testing.expectEqualStrings(rsa2048_canonical_jwk, canonicalJwk(&buf, vk));
+    try testing.expectEqualStrings(rsa2048_canonical_jwk, canonicalJwk(&buf, kp.public_key));
+    try testing.expectEqualStrings(rsa2048_canonical_jwk, canonicalJwk(&buf, AnyPublicKey{ .rs256 = vk }));
+    try testing.expectEqualStrings(rsa2048_canonical_jwk, canonicalJwk(&buf, publicOfPair(kp)));
+    try testing.expectEqualStrings(rsa2048_thumbprint, &thumbprintBase64(vk));
+    try testing.expectEqualStrings(rsa2048_thumbprint, &thumbprintBase64(kp.public_key));
+    var ka: [max_key_authorization_len]u8 = undefined;
+    try testing.expectEqualStrings(
+        "DGyRejmCefe7v4NfDGDKfA." ++ rsa2048_thumbprint,
+        try keyAuthorization(&ka, "DGyRejmCefe7v4NfDGDKfA", vk),
+    );
+    // The buffer bound covers the largest key `rsa` accepts (1024-octet modulus), 4096 bits included.
+    try testing.expect(max_canonical_jwk_len >= "{\"e\":\"\",\"kty\":\"RSA\",\"n\":\"\"}".len + 6 + base64UrlLen(512));
+    try testing.expect(max_canonical_jwk_len >= p521_canonical_jwk.len);
+}
+
+test "RS256: sign -> verifyFlattenedAny (jwk and kid); signature byte-identical to openssl" {
+    const kp = try rsa2048KeyPair();
+    const jws_json = try sign(testing.allocator, kp, "{\"a\":1}", .{ .nonce = "n-rsa", .url = "https://ca.example/new-acct" });
+    defer testing.allocator.free(jws_json);
+    var v = try verifyFlattenedAny(testing.allocator, jws_json, null);
+    defer v.deinit();
+    try testing.expectEqual(Alg.rs256, v.alg);
+    try testing.expectEqualStrings("{\"a\":1}", v.payload);
+    try testing.expectEqualStrings("n-rsa", v.nonce);
+    try testing.expect(v.jwk_key.?.eql(publicOfPair(kp)));
+    const Flat = struct { protected: []const u8, signature: []const u8 };
+    const flat = try std.json.parseFromSlice(Flat, testing.allocator, jws_json, .{ .ignore_unknown_fields = true });
+    defer flat.deinit();
+    const protected = try base64UrlDecodeAlloc(testing.allocator, flat.value.protected);
+    defer testing.allocator.free(protected);
+    try testing.expectEqualStrings(
+        "{\"alg\":\"RS256\",\"jwk\":" ++ rsa2048_canonical_jwk ++ ",\"nonce\":\"n-rsa\",\"url\":\"https://ca.example/new-acct\"}",
+        protected,
+    );
+    // PKCS#1 v1.5 is deterministic: openssl's signature over the same input.
+    try testing.expectEqualStrings(rsa2048_openssl_signature, flat.value.signature);
+    const sig = try base64UrlDecodeAlloc(testing.allocator, flat.value.signature);
+    defer testing.allocator.free(sig);
+    try testing.expectEqual(@as(usize, 256), sig.len);
+
+    // The ES256-only verifier refuses it by name; an EC key cannot stand in.
+    try testing.expectError(error.UnsupportedJws, verifyFlattened(testing.allocator, jws_json, null));
+    const k256 = try rfc7515KeyPair();
+    try testing.expectError(error.UnsupportedJws, verifyFlattenedAny(testing.allocator, jws_json, .{ .es256 = k256.public_key }));
+
+    // kid mode through an AnyKeyPair (a borrowed pointer), deterministic, no nonce member when null.
+    const any: AnyKeyPair = .{ .rs256 = kp };
+    const kid1 = try sign(testing.allocator, &any, "", .{ .nonce = null, .url = "https://ca.example/x", .kid = "https://ca.example/acct/1" });
+    defer testing.allocator.free(kid1);
+    const kid2 = try sign(testing.allocator, kp, "", .{ .nonce = null, .url = "https://ca.example/x", .kid = "https://ca.example/acct/1" });
+    defer testing.allocator.free(kid2);
+    try testing.expectEqualStrings(kid1, kid2);
+    var v2 = try verifyFlattenedAny(testing.allocator, kid1, publicOfPair(kp));
+    defer v2.deinit();
+    try testing.expectEqualStrings("", v2.nonce);
+    try testing.expectEqualStrings("https://ca.example/acct/1", v2.kid.?);
+    try testing.expect(v2.jwk_key == null);
+
+    // Another modulus (one middle byte flipped: still a well-formed odd 2048-bit n) does not verify it.
+    var n_buf: [rsa.max_modulus_len]u8 = undefined;
+    var e_buf: [4]u8 = undefined;
+    const parts = RsaParts.of(&kp.public_key.verifyKey(), &n_buf, &e_buf);
+    var other_n: [256]u8 = undefined;
+    @memcpy(&other_n, parts.n);
+    other_n[100] ^= 0x40;
+    const other = try rsa.VerifyKey.fromBytes(&other_n, parts.e);
+    try testing.expectError(error.BadSignature, verifyFlattenedAny(testing.allocator, kid1, .{ .rs256 = other }));
+
+    // A tampered payload fails the signature.
+    const tampered = try testing.allocator.dupe(u8, jws_json);
+    defer testing.allocator.free(tampered);
+    const pay_at = std.mem.indexOf(u8, tampered, "\"payload\":\"").? + "\"payload\":\"".len;
+    tampered[pay_at] = if (tampered[pay_at] == 'A') 'B' else 'A';
+    try testing.expectError(error.BadSignature, verifyFlattenedAny(testing.allocator, tampered, null));
+}
+
+test "RS256: malformed signatures and JWKs are refused at the right layer" {
+    const kp = try rsa2048KeyPair();
+    const pk = publicOfPair(kp);
+    // A signature that is not one modulus long (RFC 7518 §3.3), however plausible otherwise.
+    const short = try craftJwsAlgAny(testing.allocator, "RS256", pk, 255);
+    defer testing.allocator.free(short);
+    try testing.expectError(error.MalformedJws, verifyFlattenedAny(testing.allocator, short, null));
+    const ec_len = try craftJwsAlgAny(testing.allocator, "RS256", pk, 64); // an ECDSA length is no RS256 length
+    defer testing.allocator.free(ec_len);
+    try testing.expectError(error.MalformedJws, verifyFlattenedAny(testing.allocator, ec_len, null));
+    // Right length, wrong bytes: reaches the verifier.
+    const zeros = try craftJwsAlgAny(testing.allocator, "RS256", pk, 256);
+    defer testing.allocator.free(zeros);
+    try testing.expectError(error.BadSignature, verifyFlattenedAny(testing.allocator, zeros, null));
+    // A non-ECDSA length under an unknown alg stays MalformedJws (the order the ES paths always had).
+    const unknown_alg = try craftJwsAlgAny(testing.allocator, "RS512", pk, 256);
+    defer testing.allocator.free(unknown_alg);
+    try testing.expectError(error.MalformedJws, verifyFlattenedAny(testing.allocator, unknown_alg, null));
+    const unknown_alg_ec = try craftJwsAlgAny(testing.allocator, "RS512", pk, 64);
+    defer testing.allocator.free(unknown_alg_ec);
+    try testing.expectError(error.UnsupportedJws, verifyFlattenedAny(testing.allocator, unknown_alg_ec, null));
+
+    // kty must match the alg's family.
+    var jwk_buf: [max_canonical_jwk_len]u8 = undefined;
+    const rsa_jwk = canonicalJwk(&jwk_buf, pk);
+    const wrong_kty = try craftJwsRaw(testing.allocator, "RS256", "{\"crv\":\"P-256\",\"kty\":\"EC\",\"x\":\"AA\",\"y\":\"AA\"}", 256);
+    defer testing.allocator.free(wrong_kty);
+    try testing.expectError(error.UnsupportedJws, verifyFlattenedAny(testing.allocator, wrong_kty, null));
+    const ec_alg_rsa_jwk = try craftJwsRaw(testing.allocator, "ES256", rsa_jwk, 64);
+    defer testing.allocator.free(ec_alg_rsa_jwk);
+    try testing.expectError(error.UnsupportedJws, verifyFlattenedAny(testing.allocator, ec_alg_rsa_jwk, null));
+
+    // JWK integers must be minimal (RFC 7518 §6.3.1.1): a leading zero octet in n or e.
+    var n_buf: [rsa.max_modulus_len]u8 = undefined;
+    var e_buf: [4]u8 = undefined;
+    const parts = RsaParts.of(&pk.rs256, &n_buf, &e_buf);
+    var padded: [257]u8 = undefined;
+    padded[0] = 0;
+    @memcpy(padded[1..], parts.n);
+    const padded_b64 = try base64UrlEncodeAlloc(testing.allocator, &padded);
+    defer testing.allocator.free(padded_b64);
+    const lead_n = try std.fmt.allocPrint(testing.allocator, "{{\"e\":\"AQAB\",\"kty\":\"RSA\",\"n\":\"{s}\"}}", .{padded_b64});
+    defer testing.allocator.free(lead_n);
+    const j1 = try craftJwsRaw(testing.allocator, "RS256", lead_n, 256);
+    defer testing.allocator.free(j1);
+    try testing.expectError(error.MalformedJws, verifyFlattenedAny(testing.allocator, j1, null));
+    const n_b64 = try base64UrlEncodeAlloc(testing.allocator, parts.n);
+    defer testing.allocator.free(n_b64);
+    const lead_e = try std.fmt.allocPrint(testing.allocator, "{{\"e\":\"AAEAAQ\",\"kty\":\"RSA\",\"n\":\"{s}\"}}", .{n_b64});
+    defer testing.allocator.free(lead_e);
+    const j2 = try craftJwsRaw(testing.allocator, "RS256", lead_e, 256);
+    defer testing.allocator.free(j2);
+    try testing.expectError(error.MalformedJws, verifyFlattenedAny(testing.allocator, j2, null));
+
+    // Key sizes outside 2048..4096 are refused: 1024 bits (odd n, top bit set) ...
+    var small: [128]u8 = @splat(0xc3);
+    small[127] = 0x01;
+    const small_b64 = try base64UrlEncodeAlloc(testing.allocator, &small);
+    defer testing.allocator.free(small_b64);
+    const small_jwk = try std.fmt.allocPrint(testing.allocator, "{{\"e\":\"AQAB\",\"kty\":\"RSA\",\"n\":\"{s}\"}}", .{small_b64});
+    defer testing.allocator.free(small_jwk);
+    const j3 = try craftJwsRaw(testing.allocator, "RS256", small_jwk, 128);
+    defer testing.allocator.free(j3);
+    try testing.expectError(error.MalformedJws, verifyFlattenedAny(testing.allocator, j3, null));
+    // ... and 8192 bits, which `rsa` accepts but no ACME CA does.
+    var big: [1024]u8 = @splat(0xc3);
+    big[1023] = 0x01;
+    const big_b64 = try base64UrlEncodeAlloc(testing.allocator, &big);
+    defer testing.allocator.free(big_b64);
+    const big_jwk = try std.fmt.allocPrint(testing.allocator, "{{\"e\":\"AQAB\",\"kty\":\"RSA\",\"n\":\"{s}\"}}", .{big_b64});
+    defer testing.allocator.free(big_jwk);
+    const j4 = try craftJwsRaw(testing.allocator, "RS256", big_jwk, 1024);
+    defer testing.allocator.free(j4);
+    try testing.expectError(error.MalformedJws, verifyFlattenedAny(testing.allocator, j4, null));
+}
+
+/// A JWS with a caller-written JWK member and an all-zero signature.
+fn craftJwsRaw(gpa: std.mem.Allocator, alg: []const u8, jwk_json: []const u8, sig_len: usize) ![]u8 {
+    const protected = try std.fmt.allocPrint(gpa, "{{\"alg\":\"{s}\",\"jwk\":{s},\"nonce\":\"n\",\"url\":\"u\"}}", .{ alg, jwk_json });
+    defer gpa.free(protected);
+    const p64 = try base64UrlEncodeAlloc(gpa, protected);
+    defer gpa.free(p64);
+    const zeros = try gpa.alloc(u8, sig_len);
+    defer gpa.free(zeros);
+    @memset(zeros, 0);
+    const s64 = try base64UrlEncodeAlloc(gpa, zeros);
+    defer gpa.free(s64);
+    return std.fmt.allocPrint(gpa, "{{\"protected\":\"{s}\",\"payload\":\"\",\"signature\":\"{s}\"}}", .{ p64, s64 });
+}
+
+test "RS256: Alg and AnyPublicKey/AnyKeyPair bookkeeping" {
+    try testing.expectEqualStrings("RS256", Alg.rs256.name());
+    try testing.expectEqual(@as(?Alg, .rs256), Alg.fromName("RS256"));
+    try testing.expectEqual(@as(?Alg, null), Alg.fromName("rs256"));
+    try testing.expectEqual(@as(?Alg, null), Alg.fromName("RS384"));
+    try testing.expectEqual(@as(?Alg, null), Alg.fromName("PS256"));
+    try testing.expect(!Alg.rs256.isEc());
+    try testing.expect(Alg.es512.isEc());
+    try testing.expectEqual(Alg.rs256, algOf(rsa.KeyPair));
+    try testing.expectEqual(Alg.rs256, algOf(rsa.PublicKey));
+    try testing.expectEqual(Alg.rs256, algOf(rsa.VerifyKey));
+
+    const kp = try rsa2048KeyPair();
+    const any: AnyKeyPair = .{ .rs256 = kp };
+    try testing.expectEqual(Alg.rs256, any.alg());
+    try testing.expect(any.publicKey().eql(publicOfPair(kp)));
+    try testing.expect(any.publicKey().eql(anyPublic(kp.public_key)));
+    try testing.expect(any.publicKey().eql(anyPublic(kp.public_key.verifyKey())));
+    try testing.expect(!any.publicKey().eql(.{ .es256 = (try rfc7515KeyPair()).public_key }));
+
+    // copyPairInto stores the POINTER (the pair is not copied); from an AnyKeyPair likewise.
+    var out: AnyKeyPair = undefined;
+    copyPairInto(&out, kp);
+    try testing.expectEqual(@intFromPtr(kp), @intFromPtr(out.rs256));
+    var out2: AnyKeyPair = undefined;
+    copyPairInto(&out2, &out);
+    try testing.expectEqual(@intFromPtr(kp), @intFromPtr(out2.rs256));
+    // The union stays small: the RSA arm is a pointer.
+    try testing.expect(@sizeOf(AnyKeyPair) < 1024);
+}
+
+test "generateRsaKeyPair: refuses sizes other than 2048/3072/4096; one real 2048 key signs and verifies" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var kp: rsa.KeyPair = undefined;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&kp));
+    for ([_]u16{ 0, 512, 1024, 2047, 2049, 2560, 8192 }) |bad| {
+        @memset(std.mem.asBytes(&kp), 0xaa);
+        try testing.expectError(error.InvalidBits, generateRsaKeyPair(&kp, bad, io));
+        try testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&kp), 0)); // zeroed on error
+    }
+
+    try generateRsaKeyPair(&kp, 2048, io);
+    try testing.expectEqual(@as(usize, 2048), kp.public_key.bits());
+    try testing.expectEqual(@as(usize, 2048), kp.secret_key.publicKey().bits());
+    const out = try sign(testing.allocator, &kp, "{}", .{ .nonce = "n", .url = "https://ca.example/x" });
+    defer testing.allocator.free(out);
+    var v = try verifyFlattenedAny(testing.allocator, out, null);
+    defer v.deinit();
+    try testing.expectEqual(Alg.rs256, v.alg);
+    try testing.expect(v.jwk_key.?.eql(publicOfPair(&kp)));
+    // It is not the fixture key.
+    try testing.expect(!v.jwk_key.?.eql(publicOfPair(try rsa2048KeyPair())));
 }

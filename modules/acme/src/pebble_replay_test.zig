@@ -260,6 +260,11 @@ test "Pebble replay: the client reaches Pebble's outcome on Pebble's own answers
         .err = error.AcmeProblem,
         .problem = "urn:ietf:params:acme:error:rejectedIdentifier: ",
     } });
+    // 2026-10-16: an RS256 account (the replay signs with ES256 — Pebble's
+    // answers do not depend on it), and an IP identifier over both challenges.
+    bad_nonces += try replayScenario("rsa", &.{"r.test"}, .http_01, .{ .issued = &.{"r.test"} });
+    bad_nonces += try replayScenario("ip-http01", &.{"127.0.0.1"}, .http_01, .{ .issued = &.{"127.0.0.1"} });
+    bad_nonces += try replayScenario("ip-tlsalpn01", &.{"127.0.0.1"}, .tls_alpn_01, .{ .issued = &.{"127.0.0.1"} });
     // Pebble rejected some nonces (PEBBLE_WFE_NONCEREJECT=15 in tools/pebble.sh)
     // and the client retried through every one of them.
     try testing.expect(bad_nonces >= 1);

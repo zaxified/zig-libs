@@ -181,7 +181,7 @@ const module_list = [_]Module{
     // Importable as @import("aaa-gate") — hyphen OK, like security-headers.
     .{ .name = "aaa-gate", .libs = &.{"web"}, .deps = &.{ "router", "http" }, .test_deps = &.{"testkit"}, .loopback = true },
     .{ .name = "resilience", .libs = &.{ "web", "net" } },
-    .{ .name = "acme", .libs = &.{"web"}, .deps = &.{ "http", "router", "entropy", "p256", "p384", "p521" }, .test_deps = &.{"testkit"}, .loopback = true },
+    .{ .name = "acme", .libs = &.{"web"}, .deps = &.{ "http", "router", "entropy", "p256", "p384", "p521", "rsa", "netaddr" }, .test_deps = &.{"testkit"}, .loopback = true },
     .{ .name = "netlink", .libs = &.{"net"}, .test_deps = &.{"testkit"}, .netns = true },
     .{ .name = "genetlink", .libs = &.{"net"}, .deps = &.{"netlink"}, .test_deps = &.{"testkit"}, .netns = true },
     .{ .name = "nl80211", .libs = &.{"net"}, .deps = &.{ "genetlink", "netlink" }, .test_deps = &.{"testkit"}, .netns = true },

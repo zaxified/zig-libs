@@ -1449,7 +1449,7 @@ tlsresume	ReleaseFast	early	1	0	958e96d1ea73a044	042b8c43588c7881
 # (x509.zig:472/473/486), the `priv.end < seq.end` test (983), the OID compare (eqlBytes) and
 # the raw.len check (993) see taint; every one decides on DER layout (a0, 07, the OID),
 # never on a key byte. Read in the --stacks dump of that day; no context moved into p256/p384.
-acme	ReleaseFast	pem	1	20	5106145b8b66ec1a	e3f3e71bec825dd7
+acme	ReleaseFast	pem	1	20	e371db8eb77e6f47	e3f3e71bec825dd7
 # jwt (2026-10-13) — every secret the module holds: HMAC secrets (HS256/384/512,
 # sign and verify), ES256 (p256 module), ES384 (std), ES512 (p521 module), EdDSA
 # (std Ed25519; only the 32-byte seed is tainted) and RSA (RS256 + PS256 through
