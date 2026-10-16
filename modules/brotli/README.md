@@ -16,8 +16,8 @@ Brotli, so an HTTPS server that wants `br` needs this.
   modelling (`.q6`/`.q9`/`.q11`), block splitting (`.q9`/`.q11`), distance short codes and
   contexts, and an automatic **store-mode fallback** so the output is never meaningfully
   larger than the input. ~3x on English text (`alice29.txt` 152 089 -> 51 327
-  at `.q6`, between reference `brotli` quality 5 and 9; 46 935 at `.q11`,
-  within 1 % of quality 11: shortest-path parse + static-dictionary words).
+  at `.q6`, between reference `brotli` quality 5 and 9; 46 378 at `.q11`,
+  0.2 % below quality 11: google's zopfli parse + static-dictionary words).
   Levels are named after the google/brotli quality they stand in for — see `SPEC.md`.
 - **Platform:** any (pure logic, no OS calls). **Role:** util.
   **Concurrency:** reentrant (no shared state). **Allocation:** explicit

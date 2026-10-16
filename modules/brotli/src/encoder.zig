@@ -46,13 +46,12 @@
 //!
 //! ## What it deliberately does not do
 //!
-//! - No `NPOSTFIX`/`NDIRECT` tuning, no MSB6/SIGNED context modes (never the
-//!   cheaper choice on the measured corpus), no OMIT_FIRST dictionary
+//! - No `NPOSTFIX`/`NDIRECT` below `.q11`, no OMIT_FIRST dictionary
 //!   transforms, no dictionary words at `.q6` (5–10 % of its time for
 //!   0.25–0.7 % of size on text, 2026-10-15).
 //!
-//! The result (2026-10-15): `alice29.txt` 52 275 bytes at `.q6` (google/brotli
-//! q6: 51 967), 50 994 at `.q9` (q9: 51 054), 46 926 at `.q11` (q11: 46 487);
+//! The result (2026-10-16): `alice29.txt` 52 275 bytes at `.q6` (google/brotli
+//! q6: 51 967), 50 994 at `.q9` (q9: 51 054), 46 378 at `.q11` (q11: 46 487);
 //! never worse than store mode by more than the two-bit final-meta-block
 //! marker.
 //!
@@ -243,6 +242,52 @@ const dist_alphabet_large_max = tables.distanceAlphabetSize(0, 0, tables.large_m
 
 const DistCode = struct { offset: u32, nbits: u5 };
 
+const DistSym = struct { sym: u16, extra: u32, nbits: u5 };
+
+/// NPOSTFIX and NDIRECT (RFC 7932 §4) of a meta-block.
+const DistParams = struct {
+    npostfix: u2 = 0,
+    /// A multiple of `1 << npostfix`, below `16 << npostfix`.
+    ndirect: u8 = 0,
+
+    /// The distance alphabet of a meta-block with these parameters (not a
+    /// large window).
+    fn alphabet(p: DistParams) u32 {
+        return tables.distanceAlphabetSize(p.npostfix, p.ndirect, tables.max_distance_bits);
+    }
+};
+
+/// The largest distance alphabet a meta-block may have (NPOSTFIX 3, NDIRECT
+/// 120), or a large window's.
+const dist_alphabet_max = @max(dist_alphabet_large, (DistParams{ .npostfix = 3, .ndirect = 120 }).alphabet());
+
+/// A meta-block's distance parameters and alphabet size (`n`: the
+/// parameters' alphabet, or a large window's).
+const DistAlphabet = struct {
+    p: DistParams = .{},
+    n: usize,
+
+    fn code(a: DistAlphabet, d: u32) ?DistSym {
+        return distanceCodeWith(d, a.p, a.n);
+    }
+};
+
+/// `distanceCode` for any NPOSTFIX/NDIRECT (google `PrefixEncodeCopyDistance`).
+fn distanceCodeWith(d: u32, p: DistParams, n: usize) ?DistSym {
+    if (p.npostfix == 0 and p.ndirect == 0) return distanceCode(d, n);
+    if (d == 0) return null;
+    if (d <= p.ndirect) return .{ .sym = @intCast(tables.num_distance_short_codes + d - 1), .extra = 0, .nbits = 0 };
+    const np: u6 = p.npostfix;
+    const x: u64 = (@as(u64, 1) << (np + 2)) + d - 1 - p.ndirect;
+    const bucket: u6 = @intCast(std.math.log2_int(u64, x) - 1);
+    const postfix = x & ((@as(u64, 1) << np) - 1);
+    const half = (x >> bucket) & 1;
+    const nbits = bucket - np;
+    const c: u64 = tables.num_distance_short_codes + p.ndirect + ((2 * (@as(u64, nbits) - 1) + half) << np) + postfix;
+    if (c >= n) return null;
+    return .{ .sym = @intCast(c), .extra = @intCast((x - ((2 + half) << bucket)) >> np), .nbits = @intCast(nbits) };
+}
+
 const dist_lut: [dist_alphabet_large]DistCode = blk: {
     var out: [dist_alphabet_large]DistCode = .{DistCode{ .offset = 0, .nbits = 0 }} ** dist_alphabet_large;
     var bits: u32 = 1;
@@ -264,7 +309,7 @@ const dist_lut: [dist_alphabet_large]DistCode = blk: {
 /// `nbits = log2(d + 3) - 1`, the bit below the top one picks the half
 /// (`dist_lut` is the same recurrence written out; the scan this replaced
 /// was 5-10 % of `.q11`).
-fn distanceCode(d: u32, n: usize) ?struct { sym: u16, extra: u32, nbits: u5 } {
+fn distanceCode(d: u32, n: usize) ?DistSym {
     if (d == 0) return null;
     const x: u64 = @as(u64, d) + 3;
     const nbits: u6 = @intCast(std.math.log2_int(u64, x) - 1);
@@ -2371,25 +2416,99 @@ const DictSearch = struct {
     }
 };
 
+/// Where a copy ends on the cheapest path found to it (or the block's start,
+/// node 0): the copy, and the literals before it, which start at the node
+/// before (`from - ins`).
 const OptNode = struct {
     cost: f32,
-    /// Where the path came from: the start of the copy, or the position
-    /// before a literal.
+    /// The copy's start.
     from: u32,
-    /// Copy length; 0 for a literal.
-    len: u32,
     dist: u32,
-    /// Literals since the last copy on this path.
+    /// Literals before the copy.
     ins: u32,
-    ring: [4]u32,
-    /// A dictionary word's length (`len` is what its transform produces);
-    /// 0 for a copy or a literal.
+    /// The nearest node on the path back from here (this one included)
+    /// whose copy pushed its distance into the ring; 0 for none (google's
+    /// `shortcut`). Set when the node is final.
+    shortcut: u32 = 0,
+    /// Copy length (what a word's transform produces).
+    len: u16,
+    /// A dictionary word's length; 0 for a copy.
     word: u8 = 0,
+    /// The copy pushed its distance (not short code 0, not a word).
+    pushed: bool = false,
+};
+
+/// google `ComputeMinimumCopyLength`: no copy from position `i` costs less
+/// than a start's cost plus a bit for each length code bucket passed, so
+/// the lengths whose end is already reached for that little are not tried.
+/// The starts come cheapest first, so one walk serves them all: each goes
+/// on from where the one before stopped.
+const MinCopyLen = struct {
+    len: u32 = min_ring_match,
+    added: f32 = 0,
+    bucket: u32 = 4,
+    next_offset: u32 = 10,
+
+    fn at(w: *MinCopyLen, nodes: []const OptNode, i: usize, cost: f32) u32 {
+        while (i + w.len < nodes.len and nodes[i + w.len].cost <= cost + w.added) {
+            w.len += 1;
+            if (w.len == w.next_offset) {
+                w.added += 1;
+                w.next_offset += w.bucket;
+                w.bucket *= 2;
+            }
+        }
+        return w.len;
+    }
+};
+
+/// Where copies are relaxed from: a start node's cost with the literals
+/// since it (`ins` of them), and the ring there.
+const OptSrc = struct { cost: f32, ins: u32, ring: [4]u32 };
+
+/// google `StartPosQueue`: the eight nodes from which a copy at the
+/// current position is cheapest, literals between included (`diff`: the
+/// node's cost less the literal prices before it).
+/// Starts a position's copies are tried from: google's five at quality 11,
+/// all eight of the queue on a block that looks binary (`font_like` 1.6 %
+/// smaller, fonts 0.4–0.6 %; text, html and json the same size for 13 %
+/// more time).
+const max_starts = 5;
+const max_starts_binary = StartQueue.size;
+
+/// The copies at a ring's sixteen short-code distances from one position:
+/// each whose first two bytes match, in code order, with its length.
+const RingProbe = struct {
+    ring: [4]u32,
+    n: u8 = 0,
+    hits: [16]struct { code: u8, d: u32, l: u32 } = undefined,
+};
+
+const KnownShort = enum(u16) { none = 0xfffe, unknown = 0xffff, _ };
+
+const StartQueue = struct {
+    const size = 8;
+    items: [size]struct { at: u32, diff: f64, ring: [4]u32 } = undefined,
+    len: usize = 0,
+
+    fn takes(q: *const StartQueue, diff: f64) bool {
+        return q.len < size or diff < q.items[size - 1].diff;
+    }
+
+    fn push(q: *StartQueue, at: u32, diff: f64, ring: [4]u32) void {
+        var k = q.len;
+        if (k == size) {
+            if (diff >= q.items[size - 1].diff) return;
+            k = size - 1;
+        } else q.len += 1;
+        while (k > 0 and q.items[k - 1].diff > diff) : (k -= 1) q.items[k] = q.items[k - 1];
+        q.items[k] = .{ .at = at, .diff = diff, .ring = ring };
+    }
 };
 
 const OptCosts = struct {
     cmd: [tables.num_command_symbols]f32,
-    dist: [dist_contexts][dist_alphabet_large]f32,
+    dist: [dist_contexts][dist_alphabet_max]f32,
     lit: [max_literal_trees][tables.num_literal_symbols]f32,
 };
 
@@ -2408,11 +2527,11 @@ fn bitsOf(counts: []const u32, out: []f32, flat: f32) void {
 
 /// Prices from `cmds`: the symbols a block of them would use, as
 /// `writeCompressedBlock` resolves them.
-fn fitCosts(gpa: std.mem.Allocator, costs: *OptCosts, cmds: []const Cmd, ring0: DistRing, n_dist: usize, model: *const LiteralModel) std.mem.Allocator.Error!void {
+fn fitCosts(gpa: std.mem.Allocator, costs: *OptCosts, cmds: []const Cmd, ring0: DistRing, da: DistAlphabet, model: *const LiteralModel) std.mem.Allocator.Error!void {
     const cmd_h = try gpa.alloc(u32, tables.num_command_symbols);
     defer gpa.free(cmd_h);
     @memset(cmd_h, 0);
-    var dist_h: [dist_contexts][dist_alphabet_large]u32 = @splat(@splat(0));
+    var dist_h: [dist_contexts][dist_alphabet_max]u32 = @splat(@splat(0));
     var ring = ring0;
     for (cmds) |c| {
         const ic = lengthCode(&cmd_tables.insert_off, &cmd_tables.insert_nbits, c.insert_len) orelse continue;
@@ -2426,44 +2545,57 @@ fn fitCosts(gpa: std.mem.Allocator, costs: *OptCosts, cmds: []const Cmd, ring0: 
         cmd_h[if (use_implicit) implicit else cmd_tables.sym[ic.code][cc.code]] += 1;
         if (c.copy_len != 0) {
             if (!use_implicit) {
-                const s = short orelse (distanceCode(c.dist, n_dist) orelse continue).sym;
+                const s = short orelse (da.code(c.dist) orelse continue).sym;
                 dist_h[distContext(c.copy_len)][s] += 1;
             }
             if (c.out_len == 0) ring.update(c.dist, short);
         }
     }
     bitsOf(cmd_h, &costs.cmd, 8);
-    for (&dist_h, &costs.dist) |*h, *o| bitsOf(h[0..n_dist], o[0..n_dist], 6);
+    for (&dist_h, &costs.dist) |*h, *o| bitsOf(h[0..da.n], o[0..da.n], 6);
     for (model.counts[0..model.ntrees], 0..) |*h, t| bitsOf(h, &costs.lit[t], 8);
 }
 
 /// Relax the copies of lengths `lo..hi` (inclusive) at distance `d` from
-/// node `i`: one command each, priced with the node's insert length `ic` and
-/// ring.
+/// position `i`, reached as `nd` says: a start node's cost and ring with the
+/// `nd.ins` literals since it (their code `ic`). One command each.
 fn relaxCopies(
     nodes: []OptNode,
     costs: *const OptCosts,
-    nd: OptNode,
+    nd: OptSrc,
     ic: LenCode,
     i: usize,
     lo: u32,
     hi: u32,
     d: u32,
-    n_dist: usize,
+    da: DistAlphabet,
+    /// `d`'s short code in `nd.ring` when the caller knows it (`.unknown`:
+    /// looked up here).
+    known: KnownShort,
 ) void {
-    const ring: DistRing = .{ .last = nd.ring };
-    const short = ring.shortCode(d);
+    const short: ?u16 = switch (known) {
+        .unknown => (DistRing{ .last = nd.ring }).shortCode(d),
+        .none => null,
+        _ => @intFromEnum(known),
+    };
     var dist_bits: [dist_contexts]f32 = undefined;
     if (short) |s| {
-        for (&dist_bits, costs.dist) |*b, row| b.* = row[s];
+        for (&dist_bits, &costs.dist) |*b, *row| b.* = row[s];
     } else {
-        const dc = distanceCode(d, n_dist) orelse return;
-        for (&dist_bits, costs.dist) |*b, row| b.* = row[dc.sym] + @as(f32, @floatFromInt(dc.nbits));
+        const dc = da.code(d) orelse return;
+        for (&dist_bits, &costs.dist) |*b, *row| b.* = row[dc.sym] + @as(f32, @floatFromInt(dc.nbits));
     }
-    const new_ring: [4]u32 = if (d == nd.ring[0]) nd.ring else .{ d, nd.ring[0], nd.ring[1], nd.ring[2] };
+    const pushed = d != nd.ring[0];
+    // One price per copy length code: the lengths it covers differ only in
+    // their extra bits' value (the distance context is the same throughout:
+    // the codes below 5 cover one length each).
     var l = lo;
-    while (l <= hi) : (l += 1) {
-        const cc = lengthCode(&cmd_tables.copy_off, &cmd_tables.copy_nbits, l) orelse continue;
+    while (l <= hi) {
+        const cc = lengthCode(&cmd_tables.copy_off, &cmd_tables.copy_nbits, l) orelse {
+            l += 1;
+            continue;
+        };
+        const last = @min(hi, cmd_tables.copy_off[cc.code] + (@as(u32, 1) << cc.nbits) - 1);
         const implicit = cmd_tables.implicit[ic.code][cc.code];
         var bits: f32 = @floatFromInt(@as(u32, ic.nbits) + cc.nbits);
         if (implicit != 0xffff and short == 0) {
@@ -2472,20 +2604,22 @@ fn relaxCopies(
             bits += costs.cmd[cmd_tables.sym[ic.code][cc.code]] + dist_bits[distContext(l)];
         }
         const c = nd.cost + bits;
-        const t = &nodes[i + l];
-        if (c < t.cost) t.* = .{ .cost = c, .from = @intCast(i), .len = l, .dist = d, .ins = 0, .ring = new_ring };
+        while (l <= last) : (l += 1) {
+            const t = &nodes[i + l];
+            if (c < t.cost) t.* = .{ .cost = c, .from = @intCast(i), .len = @intCast(l), .dist = d, .ins = nd.ins, .pushed = pushed };
+        }
     }
 }
 
 /// Relax the dictionary word `dc` at node `i`, named by the distance `d`.
-fn relaxWord(nodes: []OptNode, costs: *const OptCosts, nd: OptNode, ic: LenCode, i: usize, dc: DictCand, d: u32, n_dist: usize) void {
+fn relaxWord(nodes: []OptNode, costs: *const OptCosts, nd: OptSrc, ic: LenCode, i: usize, dc: DictCand, d: u32, da: DistAlphabet) void {
     const cc = lengthCode(&cmd_tables.copy_off, &cmd_tables.copy_nbits, dc.n) orelse return;
-    const dcode = distanceCode(d, n_dist) orelse return;
+    const dcode = da.code(d) orelse return;
     const bits = @as(f32, @floatFromInt(@as(u32, ic.nbits) + cc.nbits + dcode.nbits)) +
         costs.cmd[cmd_tables.sym[ic.code][cc.code]] + costs.dist[distContext(dc.n)][dcode.sym];
     const c = nd.cost + bits;
     const t = &nodes[i + dc.wl];
-    if (c < t.cost) t.* = .{ .cost = c, .from = @intCast(i), .len = dc.wl, .dist = d, .ins = 0, .ring = nd.ring, .word = dc.n };
+    if (c < t.cost) t.* = .{ .cost = c, .from = @intCast(i), .len = dc.wl, .dist = d, .ins = nd.ins, .word = dc.n };
 }
 
 /// A copy `greedyParse` chose and its estimated saving in bits.
@@ -2613,18 +2747,60 @@ fn buildCommandsOptimal(
     var dcands: std.ArrayListUnmanaged(DictCand) = .empty;
     defer dcands.deinit(gpa);
     var dbuf: [max_dict_cands]DictCand = undefined;
+    // The nearest copies of 2 and of 3 bytes (google's H10 finds them, by
+    // a scan of the last 64 bytes and its tree): shorter than any bucket
+    // names. The last position of each 2-byte value and of each 3-byte
+    // hash (checked) in this block.
+    const near = try gpa.alloc([2]u32, n);
+    defer gpa.free(near);
+    @memset(near, .{ 0, 0 });
+    const last2 = try gpa.alloc(u32, 1 << 16);
+    defer gpa.free(last2);
+    @memset(last2, 0);
+    const last3 = try gpa.alloc(u32, 1 << 16);
+    defer gpa.free(last3);
+    @memset(last3, 0);
+    const H = struct {
+        fn k3(d: []const u8, q: usize) usize {
+            const v: u32 = @as(u32, d[q]) | @as(u32, d[q + 1]) << 8 | @as(u32, d[q + 2]) << 16;
+            return (v *% 0x9E3779B1) >> 16;
+        }
+        fn k2(d: []const u8, q: usize) usize {
+            return @as(usize, d[q]) | @as(usize, d[q + 1]) << 8;
+        }
+        fn put(d: []const u8, q: usize, e: usize, l2: []u32, l3: []u32) void {
+            if (q + 2 <= e) l2[k2(d, q)] = @intCast(q + 1);
+            if (q + 3 <= e) l3[k3(d, q)] = @intCast(q + 1);
+        }
+    };
     var p = start;
     while (p < end) {
         offs[p - start] = @intCast(cands.items.len);
         doffs[p - start] = @intCast(dcands.items.len);
+        if (p + 3 <= end) {
+            const lim = x.outMax(p, max_dist);
+            const nr = &near[p - start];
+            const a2 = last2[H.k2(data, p)];
+            if (a2 != 0 and p - (a2 - 1) <= lim) nr[0] = @intCast(p - (a2 - 1));
+            const a3 = last3[H.k3(data, p)];
+            if (a3 != 0 and p - (a3 - 1) <= lim and std.mem.eql(u8, data[a3 - 1 ..][0..3], data[p..][0..3])) nr[1] = @intCast(p - (a3 - 1));
+        }
+        H.put(data, p, end, last2, last3);
         const found = matcher.collect(px, tagged, p, x.outMax(p, max_dist), end, &buf);
         try cands.appendSlice(gpa, buf[0..found]);
         var step: usize = 1;
         if (found > 0 and buf[found - 1].len >= max_take_len) {
             step = buf[found - 1].len;
         } else if (dsearch) |d| {
-            const nd = d.find(data, p, end, &dbuf);
-            try dcands.appendSlice(gpa, dbuf[0..nd]);
+            // Only words longer than the longest copy (google's H10 asks
+            // the dictionary for those): a copy that long is the cheaper.
+            const best: usize = if (found > 0) buf[found - 1].len else 0;
+            if (best < transforms.maxOutputLen(dictionary.max_word_length)) {
+                const nd = d.find(data, p, end, &dbuf);
+                for (dbuf[0..nd]) |dc| {
+                    if (dc.wl > best) try dcands.append(gpa, dc);
+                }
+            }
         }
         matcher.insert(p);
         var q = p + 1;
@@ -2632,6 +2808,7 @@ fn buildCommandsOptimal(
             offs[q - start] = @intCast(cands.items.len);
             doffs[q - start] = @intCast(dcands.items.len);
             matcher.insert(q);
+            H.put(data, q, end, last2, last3);
         }
         p += step;
     }
@@ -2642,6 +2819,8 @@ fn buildCommandsOptimal(
     defer gpa.free(nodes);
     const lit_cost = try gpa.alloc(f32, n);
     defer gpa.free(lit_cost);
+    const lit_pre = try gpa.alloc(f64, n + 1);
+    defer gpa.free(lit_pre);
     const model = try gpa.create(LiteralModel);
     defer gpa.destroy(model);
     const costs = try gpa.create(OptCosts);
@@ -2652,13 +2831,21 @@ fn buildCommandsOptimal(
     try greedyParse(gpa, data, start, end, x, max_dist, offs, cands.items, ring0, &parses[0]);
 
     const inf = std.math.inf(f32);
+    const starts: usize = if (looksBinary(data[start..end])) max_starts_binary else max_starts;
+    var da: DistAlphabet = .{ .n = n_dist };
     var pass: usize = 1;
     while (pass < max_parses) : (pass += 1) {
         const out = &parses[pass];
         out.clearRetainingCapacity();
         const prev = parses[pass - 1].items;
         try chooseLiteralModel(gpa, CmdLiterals{ .input = data[x.len..], .start = start - x.len, .cmds = prev }, .q11, model);
-        try fitCosts(gpa, costs, prev, ring0, n_dist, model);
+        // Distances priced with the NPOSTFIX/NDIRECT the block writer would
+        // choose for the commands before (Ethiopic font −0.4 %).
+        if (n_dist == dist_alphabet_size) {
+            const dp = chooseDistParams(prev, ring0);
+            da = .{ .p = dp, .n = dp.alphabet() };
+        }
+        try fitCosts(gpa, costs, prev, ring0, da, model);
         for (model.counts[0..model.ntrees], 0..) |*h, t| bitsOf(h, &costs.lit[t], 8);
         for (lit_cost, 0..) |*lc, i| {
             const q = start + i;
@@ -2668,80 +2855,134 @@ fn buildCommandsOptimal(
             lc.* = costs.lit[model.map[contextId(model.mode, p1, p2)]][data[q]];
         }
 
+        lit_pre[0] = 0;
+        for (lit_cost, 0..) |lc, i| lit_pre[i + 1] = lit_pre[i] + lc;
+
+        // google's zopfli: a node is where a copy ends (or the block's
+        // start); the literals after it are paid by the copy that follows,
+        // from whichever of the `StartQueue`'s nodes is cheapest with them.
+        // Each start brings its own ring, so a copy at a ring distance of a
+        // path that is not the cheapest one here is still found.
         for (nodes) |*nd| nd.cost = inf;
-        nodes[0] = .{ .cost = 0, .from = 0, .len = 0, .dist = 0, .ins = 0, .ring = ring0.last };
+        nodes[0] = .{ .cost = 0, .from = 0, .len = 0, .dist = 0, .ins = 0 };
+        var queue: StartQueue = .{};
+        var best_end: usize = 0;
+        var best_end_cost: f64 = lit_pre[n];
         var i: usize = 0;
         while (i < n) {
-            const nd = nodes[i];
-            if (nd.cost == inf) {
-                i += 1;
-                continue;
+            if (nodes[i].cost != inf) {
+                const nd = &nodes[i];
+                if (i > 0) nd.shortcut = if (nd.pushed) @intCast(i) else nodes[nd.from - nd.ins].shortcut;
+                const diff = @as(f64, nd.cost) - lit_pre[i];
+                if (queue.takes(diff)) {
+                    // google `ComputeDistanceCache`: the ring from the
+                    // path's last four pushed distances.
+                    var ring = ring0.last;
+                    var got: usize = 0;
+                    var q = nd.shortcut;
+                    while (got < 4 and q > 0) : (got += 1) {
+                        ring[got] = nodes[q].dist;
+                        q = nodes[nodes[q].from - nodes[q].ins].shortcut;
+                    }
+                    if (got < 4) @memcpy(ring[got..], ring0.last[0 .. 4 - got]);
+                    queue.push(@intCast(i), diff, ring);
+                }
+                if (diff + lit_pre[n] < best_end_cost) {
+                    best_end_cost = diff + lit_pre[n];
+                    best_end = i;
+                }
             }
             const pos = start + i;
-            const lc = nd.cost + lit_cost[i];
-            if (lc < nodes[i + 1].cost) nodes[i + 1] = .{ .cost = lc, .from = @intCast(i), .len = 0, .dist = 0, .ins = nd.ins + 1, .ring = nd.ring };
-            const ic = lengthCode(&cmd_tables.insert_off, &cmd_tables.insert_nbits, nd.ins) orelse {
-                i += 1;
-                continue;
-            };
-            var take: u32 = 0;
-            var prev_len: u32 = min_match - 1;
-            for (cands.items[offs[i]..offs[i + 1]]) |cd| {
-                if (cd.len <= prev_len) continue;
-                const whole = cd.len >= max_take_len;
-                relaxCopies(nodes, costs, nd, ic, i, if (whole) cd.len else prev_len + 1, cd.len, cd.dist, n_dist);
-                prev_len = cd.len;
-                if (whole) take = cd.len;
-            }
-            // The ring's distances, not only those a bucket named.
             const reach = x.outMax(pos, max_dist);
             const max_len = @min(end - pos, max_match);
-            for (nd.ring, 0..) |d, r| {
-                if (pos + 4 > end) break;
-                if (d == 0 or d > reach) continue;
-                if (std.mem.indexOfScalar(u32, nd.ring[0..r], d) != null) continue;
-                const c = pos - d;
-                const head: u32 = std.mem.readInt(u32, data[pos..][0..4], .little) & 0xffff;
-                if (std.mem.readInt(u32, data[c..][0..4], .little) & 0xffff != head) continue;
-                const l: u32 = @intCast(Matcher.matchLen(data, c, pos, max_len));
-                if (l < min_ring_match) continue;
-                const whole = l >= max_take_len;
-                relaxCopies(nodes, costs, nd, ic, i, if (whole) l else min_ring_match, l, d, n_dist);
-                if (whole) take = @max(take, l);
-            }
-            for (dcands.items[doffs[i]..doffs[i + 1]]) |dc| {
-                if (i + dc.wl > n) continue;
-                const word_id: u32 = dc.idx + (@as(u32, dc.t) << @intCast(dictionary.size_bits_by_length[dc.n]));
-                relaxWord(nodes, costs, nd, ic, i, dc, @intCast(reach + 1 + word_id), n_dist);
+            var take: u32 = 0;
+            var walk: MinCopyLen = .{};
+            var probed: [StartQueue.size]RingProbe = undefined;
+            var n_probed: usize = 0;
+            for (queue.items[0..@min(queue.len, starts)], 0..) |st, k| {
+                const ins = i - st.at;
+                const ic = lengthCode(&cmd_tables.insert_off, &cmd_tables.insert_nbits, @intCast(ins)) orelse continue;
+                const ring = st.ring;
+                const nd: OptSrc = .{ .cost = @floatCast(st.diff + lit_pre[i]), .ins = @intCast(ins), .ring = ring };
+                const min_len = walk.at(nodes, i, nd.cost);
+                // The ring's distances and their neighbours (the sixteen
+                // short codes), from every start.
+                if (pos + 4 <= end) {
+                    // Most starts share a ring with a cheaper one (three in
+                    // four on html): its copies are found once per position.
+                    const rp = for (probed[0..n_probed]) |*pr| {
+                        if (@reduce(.And, @as(@Vector(4, u32), pr.ring) == @as(@Vector(4, u32), ring))) break pr;
+                    } else blk: {
+                        const pr = &probed[n_probed];
+                        n_probed += 1;
+                        pr.* = .{ .ring = ring };
+                        const head: u32 = std.mem.readInt(u32, data[pos..][0..4], .little) & 0xffff;
+                        inline for (0..16) |code| {
+                            const dv: i64 = if (code < 4) ring[code] else @as(i64, ring[(code - 4) / 6]) + DistRing.deltas[(code - 4) % 6];
+                            if (dv > 0 and dv <= reach) {
+                                const d: u32 = @intCast(dv);
+                                const c = pos - d;
+                                if (std.mem.readInt(u32, data[c..][0..4], .little) & 0xffff == head) {
+                                    pr.hits[pr.n] = .{ .code = code, .d = d, .l = @intCast(Matcher.matchLen(data, c, pos, max_len)) };
+                                    pr.n += 1;
+                                }
+                            }
+                        }
+                        break :blk pr;
+                    };
+                    // A length an earlier code reached is not tried again
+                    // at a later one (google's `best_len`): a distance met
+                    // twice is skipped by it, too.
+                    var best_len: u32 = min_len - 1;
+                    for (rp.hits[0..rp.n]) |h| {
+                        if (h.l <= best_len) continue;
+                        const whole = h.l >= max_take_len;
+                        relaxCopies(nodes, costs, nd, ic, i, if (whole) h.l else best_len + 1, h.l, h.d, da, @enumFromInt(h.code));
+                        best_len = h.l;
+                        if (whole) take = @max(take, h.l);
+                    }
+                }
+                // Other distances from the two cheapest starts only (google:
+                // more starts find new ring copies, not new copies).
+                if (k >= 2) continue;
+                var prev_len: u32 = @max(min_match, min_len) - 1;
+                for (cands.items[offs[i]..offs[i + 1]]) |cd| {
+                    if (cd.len <= prev_len) continue;
+                    const whole = cd.len >= max_take_len;
+                    relaxCopies(nodes, costs, nd, ic, i, if (whole) cd.len else prev_len + 1, cd.len, cd.dist, da, .unknown);
+                    prev_len = cd.len;
+                    if (whole) take = @max(take, cd.len);
+                }
+                for (near[i], 0..) |d, nk| {
+                    if (d == 0) continue;
+                    const l: u32 = @intCast(2 + nk);
+                    if (l >= min_len) relaxCopies(nodes, costs, nd, ic, i, l, l, d, da, .unknown);
+                }
+                for (dcands.items[doffs[i]..doffs[i + 1]]) |dc| {
+                    if (i + dc.wl > n) continue;
+                    const word_id: u32 = dc.idx + (@as(u32, dc.t) << @intCast(dictionary.size_bits_by_length[dc.n]));
+                    relaxWord(nodes, costs, nd, ic, i, dc, @intCast(reach + 1 + word_id), da);
+                }
             }
             // Past the inside of a copy taken whole — unless it could not be
             // named, and the node after it was not reached.
             i += if (take != 0 and nodes[i + take].cost != inf) take else 1;
         }
+        if (nodes[n].cost != inf and nodes[n].cost <= best_end_cost) best_end = n;
 
-        // The path from the end back, copies last-to-first, then reversed.
-        var at: usize = n;
+        // The path from its end back: each node names its copy and the
+        // insert before it, which starts at the node before.
+        var at: usize = best_end;
         while (at > 0) {
             const nd = nodes[at];
-            if (nd.len == 0) {
-                at -= 1;
-                continue;
-            }
             try out.append(gpa, if (nd.word != 0)
-                .{ .insert_len = nd.from, .copy_len = nd.word, .dist = nd.dist, .out_len = nd.len }
+                .{ .insert_len = nd.ins, .copy_len = nd.word, .dist = nd.dist, .out_len = nd.len }
             else
-                .{ .insert_len = nd.from, .copy_len = nd.len, .dist = nd.dist });
-            at = nd.from;
+                .{ .insert_len = nd.ins, .copy_len = nd.len, .dist = nd.dist });
+            at = nd.from - nd.ins;
         }
-        // `insert_len` holds the copy's start for now.
         std.mem.reverse(Cmd, out.items);
-        var cur: u32 = 0;
-        for (out.items) |*c| {
-            const s = c.insert_len;
-            c.insert_len = s - cur;
-            cur = s + c.produced();
-        }
-        if (cur < n) try out.append(gpa, .{ .insert_len = @intCast(n - cur), .copy_len = 0, .dist = 0 });
+        if (best_end < n) try out.append(gpa, .{ .insert_len = @intCast(n - best_end), .copy_len = 0, .dist = 0 });
     }
 }
 
@@ -3377,8 +3618,9 @@ fn writeCompressedBlock(
     const cmd_counts = try gpa.alloc(u32, tables.num_command_symbols);
     defer gpa.free(cmd_counts);
     @memset(cmd_counts, 0);
-    var dist_counts: [dist_contexts][dist_alphabet_large]u32 = @splat(@splat(0));
-    const n_dist: u32 = if (env.large_window) dist_alphabet_large else dist_alphabet_size;
+    var dist_counts: [dist_contexts][dist_alphabet_max]u32 = @splat(@splat(0));
+    if (env.large_window and (env.dist.npostfix != 0 or env.dist.ndirect != 0)) return error.EncoderInvariant;
+    const n_dist: u32 = if (env.large_window) dist_alphabet_large else env.dist.alphabet();
 
     var covered: usize = 0;
     var lit_pos = start;
@@ -3424,7 +3666,7 @@ fn writeCompressedBlock(
             if (short) |code| {
                 r.dist_sym = code;
             } else {
-                const dc = distanceCode(c.dist, n_dist) orelse return error.EncoderInvariant;
+                const dc = distanceCodeWith(c.dist, env.dist, n_dist) orelse return error.EncoderInvariant;
                 r.dist_sym = dc.sym;
                 r.dist_extra = dc.extra;
                 r.dist_nbits = dc.nbits;
@@ -3687,7 +3929,7 @@ fn writeCompressedBlock(
     // (`clusterDistances`); the groups of all types numbered in a row --------
     const dist_map = try gpa.alloc(u8, dt * dist_contexts);
     defer gpa.free(dist_map);
-    const dist_type_counts = try gpa.alloc([dist_contexts][dist_alphabet_large]u32, dt);
+    const dist_type_counts = try gpa.alloc([dist_contexts][dist_alphabet_max]u32, dt);
     defer gpa.free(dist_type_counts);
     if (dt == 1) {
         dist_type_counts[0] = dist_counts;
@@ -3699,7 +3941,7 @@ fn writeCompressedBlock(
         }
     }
     var dist_trees: usize = 0;
-    const dist_tree_counts = try gpa.alloc([dist_alphabet_large]u32, dt * dist_contexts);
+    const dist_tree_counts = try gpa.alloc([dist_alphabet_max]u32, dt * dist_contexts);
     defer gpa.free(dist_tree_counts);
     @memset(dist_tree_counts, @splat(0));
     for (0..dt) |t| {
@@ -3738,8 +3980,8 @@ fn writeCompressedBlock(
     var lit_part = w.bitPos() - lit_blocks_from;
     try blocks[1].writeHeader(gpa, w);
     try blocks[2].writeHeader(gpa, w);
-    // NPOSTFIX = 0, NDIRECT = 0.
-    try w.writeBits(0, 6);
+    try w.writeBits(env.dist.npostfix, 2);
+    try w.writeBits(env.dist.ndirect >> env.dist.npostfix, 4);
     // A context mode per literal block type.
     for (lit_modes) |m| try w.writeBits(m, 2);
     lit_part += 2 * lt;
@@ -3796,7 +4038,7 @@ fn writeCompressedBlock(
     var dist_built: usize = 0;
     defer for (dist_codes[0..dist_built]) |*c| c.deinit(gpa);
     while (dist_built < dist_trees) : (dist_built += 1) {
-        dist_codes[dist_built] = try buildAndWriteCodeWide(gpa, w, dist_tree_counts[dist_built][0..n_dist], n_dist, if (env.large_window) dist_alphabet_large_max else dist_alphabet_size);
+        dist_codes[dist_built] = try buildAndWriteCodeWide(gpa, w, dist_tree_counts[dist_built][0..n_dist], n_dist, if (env.large_window) dist_alphabet_large_max else n_dist);
     }
 
     // --- commands -----------------------------------------------------------
@@ -4740,7 +4982,7 @@ fn sliceCost(h: []const u32) f64 {
 /// of the four, by `sliceCost` plus the context map's few bits. `map[ctx]`
 /// is the code's number (assigned in order of first use); returns how many
 /// codes.
-fn clusterDistances(counts: *const [dist_contexts][dist_alphabet_large]u32, n_dist: usize, map: *[dist_contexts]u8) usize {
+fn clusterDistances(counts: *const [dist_contexts][dist_alphabet_max]u32, n_dist: usize, map: *[dist_contexts]u8) usize {
     // Restricted growth strings over four items.
     var best: f64 = std.math.inf(f64);
     var best_map: [dist_contexts]u8 = @splat(0);
@@ -4765,7 +5007,7 @@ fn clusterDistances(counts: *const [dist_contexts][dist_alphabet_large]u32, n_di
         if (!ok) continue;
         const groups: usize = top + 1;
         var cost: f64 = 0;
-        var merged: [dist_alphabet_large]u32 = undefined;
+        var merged: [dist_alphabet_max]u32 = undefined;
         for (0..groups) |g| {
             @memset(merged[0..n_dist], 0);
             for (0..dist_contexts) |ctx| {
@@ -4798,6 +5040,8 @@ const BlockEnv = struct {
     /// The decoder's `max_backward` (window − 16): a dictionary word's
     /// distance counts from `min(output so far, max_backward)`.
     max_backward: usize = (1 << max_window_bits) - 16,
+    /// NPOSTFIX/NDIRECT (never with a large window).
+    dist: DistParams = .{},
 };
 
 /// The bytes the dictionary word of command `c` stands for, made as the
@@ -4853,6 +5097,54 @@ fn tryBlock(
         },
         else => return null,
     };
+}
+
+/// The estimated bits of the distance symbols and extra bits `cmds` write
+/// with parameters `p` (google `ComputeDistanceCost`), or null when one of
+/// their distances has no code there.
+fn distParamsCost(cmds: []const Cmd, ring0: DistRing, p: DistParams) ?f64 {
+    var h: [dist_alphabet_max]u32 = @splat(0);
+    const n = p.alphabet();
+    var extra: f64 = 0;
+    var ring = ring0;
+    for (cmds) |c| {
+        if (c.copy_len == 0) continue;
+        const short: ?u16 = if (c.out_len == 0) ring.shortCode(c.dist) else null;
+        if (c.out_len == 0) ring.update(c.dist, short);
+        if (short) |code| {
+            // An implicit-distance command reads no symbol; the estimate
+            // counts code 0 anyway, as google's does not (it is the same
+            // for every `p`).
+            h[code] += 1;
+            continue;
+        }
+        const dc = distanceCodeWith(c.dist, p, n) orelse return null;
+        h[dc.sym] += 1;
+        extra += @floatFromInt(dc.nbits);
+    }
+    return sliceCost(h[0..n]) + extra;
+}
+
+/// NPOSTFIX and NDIRECT for a meta-block of `cmds` (google
+/// `BrotliBuildMetaBlock`'s search at qualities 10 and 11): for each
+/// NPOSTFIX, NDIRECT grows while the distances' estimated bits fall.
+fn chooseDistParams(cmds: []const Cmd, ring0: DistRing) DistParams {
+    var best: DistParams = .{};
+    var best_cost = distParamsCost(cmds, ring0, best) orelse return best;
+    var msb: u32 = 0;
+    var np: u32 = 0;
+    while (np <= 3) : (np += 1) {
+        while (msb < 16) : (msb += 1) {
+            const p: DistParams = .{ .npostfix = @intCast(np), .ndirect = @intCast(msb << @intCast(np)) };
+            const cost = distParamsCost(cmds, ring0, p) orelse break;
+            if (cost > best_cost) break;
+            best_cost = cost;
+            best = p;
+        }
+        if (msb > 0) msb -= 1;
+        msb /= 2;
+    }
+    return best;
 }
 
 /// Bit position after storing `n` bytes verbatim starting from bit `pos`.
@@ -5422,7 +5714,7 @@ pub const Core = struct {
         // start are zeros, as the decoder's (a dictionary is not output).
         const x = c.prefix();
         const out = c.data[x.len..];
-        const env: BlockEnv = .{ .reach = x.len + x.dropped, .large_window = c.wbits > max_window_bits, .dropped = x.dropped, .max_backward = (@as(usize, 1) << c.wbits) - 16 };
+        var env: BlockEnv = .{ .reach = x.len + x.dropped, .large_window = c.wbits > max_window_bits, .dropped = x.dropped, .max_backward = (@as(usize, 1) << c.wbits) - 16 };
         if (c.effort == .q0) {
             var codes = c.q0;
             writeQ0(c.gpa, dst, c.data[off..end], c.matcher.frag.table, env.max_backward, &codes, &c.q0_histo) catch |e| switch (e) {
@@ -5441,6 +5733,7 @@ pub const Core = struct {
             ring.* = c.frag.ring;
             return true;
         }
+        if (c.effort == .q11 and !env.large_window) env.dist = chooseDistParams(c.cmds.items, c.ring);
         const first = (try tryBlock(c.gpa, dst, out, off - x.len, end - x.len, c.cmds.items, is_last, &trial, c.effort, false, env)) orelse return false;
         // The context model was chosen on estimated bits. When it split the
         // literals, write the block once more with a single literal code and
