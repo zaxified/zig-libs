@@ -716,3 +716,31 @@ test "a raw prefix dictionary: compressWith's bytes, and every decoder's round t
         try testing.expectEqual(@as(usize, 0), sw.dict_copy.items.len);
     }
 }
+
+test "a raw dictionary is copied: the caller may reuse its bytes after init and reset" {
+    const gpa = testing.allocator;
+    const alice = @embedFile("testdata/alice29.txt");
+    const dict = try gpa.dupe(u8, alice[0..30_000]);
+    defer gpa.free(dict);
+    const input = alice[20_000..50_000];
+    for ([_]encoder.Effort{ .q1, .q4, .q6, .q11 }) |effort| {
+        @memcpy(dict, alice[0..30_000]);
+        const want = try encoder.compressWith(gpa, input, .{ .effort = effort, .dictionary = dict, .window_bits = 22 });
+        defer gpa.free(want);
+        var out: Writer.Allocating = .init(gpa);
+        defer out.deinit();
+        var buf: [4096]u8 = undefined;
+        const opts: StreamOptions = .{ .effort = effort, .size_hint = input.len, .dictionary = dict };
+        var sw: StreamWriter = try .init(gpa, &out.writer, &buf, opts);
+        defer sw.deinit();
+        @memset(dict, 'x');
+        try writeStream(&sw, input, 5_000, &.{});
+        try testing.expectEqualSlices(u8, want, out.written());
+        @memcpy(dict, alice[0..30_000]);
+        out.clearRetainingCapacity();
+        try sw.reset(&out.writer, opts);
+        @memset(dict, 'y');
+        try writeStream(&sw, input, 5_000, &.{});
+        try testing.expectEqualSlices(u8, want, out.written());
+    }
+}

@@ -1194,8 +1194,8 @@ const DictRef = struct {
         if (p + PreparedDictionary.read_len > data.len) return found_in;
         const src = r.pd.source;
         const top = out_max + src.len;
-        var found = found_in;
-        var best_len = @max(best_len_in, min_match - 1);
+        var found: usize = found_in;
+        var best_len: usize = @max(best_len_in, min_match - 1);
         var ch = r.pd.chain(data[p..][0..PreparedDictionary.read_len]);
         while (ch.next()) |o32| {
             if (found == max_cands) break;
@@ -7565,4 +7565,94 @@ test "the wide hasher where google uses H6/H68: q6/q9, a hint of 1 MiB, a window
     try testing.expect(m.hash(0).bucket != m.hash(6).bucket or m.hash(0).tag != m.hash(6).tag);
     const v: u64 = std.mem.readInt(u64, "abcdeXab", .little);
     try testing.expectEqual(@as(usize, @intCast((v *% (@as(u64, 0x1FE35A7B_D3579BD3) << 24)) >> 49)), m.hash(0).bucket);
+}
+
+test "DictRef.collect: only copies of at least min_match, longer each, past every own candidate" {
+    const gpa = testing.allocator;
+    var prng: std.Random.DefaultPrng = .init(0x9842);
+    const r = prng.random();
+    // Sixteen letters: more five-byte strings (2^20) than buckets (2^17),
+    // so a bucket holds positions that agree with a lookup on their first
+    // one to three bytes only.
+    const dict = try gpa.alloc(u8, 400_000);
+    defer gpa.free(dict);
+    for (dict) |*b| b.* = 'a' + r.uintLessThan(u8, 16);
+    var data: [3000]u8 = undefined;
+    for (&data) |*b| b.* = 'a' + r.uintLessThan(u8, 16);
+    var pd = try PreparedDictionary.init(gpa, dict);
+    defer pd.deinit(gpa);
+    const ref: DictRef = .{ .pd = &pd };
+    var out: [max_cands]Cand = undefined;
+    var seen: usize = 0;
+    for (0..data.len - 8) |p| {
+        const n = ref.collect(&data, p, p, data.len - p, 0, &out, 0);
+        var prev: u32 = 0;
+        for (out[0..n]) |c| {
+            try testing.expect(c.len >= min_match);
+            try testing.expect(c.len > prev);
+            prev = c.len;
+            // The copy is there: the dictionary's byte `top - d` on.
+            const o = p + dict.len - c.dist;
+            try testing.expectEqualSlices(u8, dict[o..][0..c.len], data[p..][0..c.len]);
+        }
+        seen += n;
+    }
+    try testing.expect(seen > 100);
+}
+
+test "History.shiftPos: a position at the cut becomes the first, one before it drops" {
+    try testing.expectEqual(@as(u32, 0), History.shiftPos(64, 64));
+    try testing.expectEqual(dropped_pos, History.shiftPos(63, 64));
+    try testing.expectEqual(@as(u32, 36), History.shiftPos(100, 64));
+    try testing.expectEqual(dropped_pos, History.shiftPos(dropped_pos, 64));
+}
+
+test "WideMatcher compares its slots' tags on text too" {
+    var m = try WideMatcher.init(testing.allocator, 32, Effort.q6.wideSlotsLog());
+    defer m.deinit(testing.allocator);
+    const text = "the text of a book, nothing binary in it\n" ** 4;
+    try testing.expect(!looksBinary(text));
+    try testing.expect(m.tagsPay(text));
+    var n = try Matcher.init(testing.allocator, 32, Effort.q6.slotsLog(text.len));
+    defer n.deinit(testing.allocator);
+    try testing.expect(!n.tagsPay(text));
+}
+
+test "Compressor: another input of the same length, on the same tables, gives compressWith's bytes" {
+    // The table is reused as it is (same length, same geometry), so what
+    // the last call left in it must not count: its positions point at other
+    // bytes now. (The same input again would not show it: a slot left over
+    // holds a position the new call inserts too.)
+    const gpa = testing.allocator;
+    const alice = @embedFile("testdata/alice29.txt");
+    var c: Compressor = .init(gpa);
+    defer c.deinit();
+    inline for (.{ Effort.q1, .q4, .q6, .q9 }) |e| {
+        gpa.free(try c.compress(alice[0..100_000], .{ .effort = e }));
+        const want = try compressWith(gpa, alice[50_000..150_000], .{ .effort = e });
+        defer gpa.free(want);
+        const got = try c.compress(alice[50_000..150_000], .{ .effort = e });
+        defer gpa.free(got);
+        try testing.expectEqualSlices(u8, want, got);
+    }
+}
+
+test "Core.reinit: the match finder's tables as init leaves them, on the kept memory" {
+    const gpa = testing.allocator;
+    const alice = @embedFile("testdata/alice29.txt");
+    inline for (.{ Effort.q1, .q4, .q6, .q9 }) |e| {
+        var c = try Core.init(gpa, e, compressed_block_size, 22, tableSize(alice.len, 22), alice.len);
+        defer c.deinit();
+        try oneShot(&c, alice, .{ .effort = e });
+        const mem = c.table_mem.ptr;
+        try c.reinit(e, compressed_block_size, 22, tableSize(alice.len, 22), alice.len);
+        try testing.expectEqual(mem, c.table_mem.ptr);
+        const counts: []const u32 = switch (c.matcher) {
+            .frag => |m| m.table,
+            .fast => |m| m.table,
+            .deep => |m| m.count,
+            .wide => |m| m.count,
+        };
+        for (counts) |n| try testing.expectEqual(@as(u32, 0), n);
+    }
 }
