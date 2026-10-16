@@ -2638,15 +2638,35 @@ const OptSrc = struct { cost: f32, ins: u32, ring: [4]u32 };
 const max_starts = 5;
 const max_starts_binary = StartQueue.size;
 
+/// A copy at a short code's distance (`code`), `l` bytes long.
+const RingHit = struct { code: u8, d: u32, l: u32 };
+
 /// The copies at a ring's sixteen short-code distances from one position:
 /// each whose first two bytes match, in code order, with its length.
 const RingProbe = struct {
     ring: [4]u32,
     n: u8 = 0,
-    hits: [16]struct { code: u8, d: u32, l: u32 } = undefined,
+    hits: [16]RingHit = undefined,
 };
 
 const KnownShort = enum(u16) { none = 0xfffe, unknown = 0xffff, _ };
+
+/// Relax one start's ring copies (`RingProbe.hits`, in code order) from
+/// node `i`: a length an earlier code reached is not tried again at a later
+/// one (google's `best_len` in `UpdateNodes`), so a distance met twice is
+/// skipped too. Returns the longest copy taken whole, or 0.
+inline fn relaxRingHits(nodes: []OptNode, costs: *const OptCosts, nd: OptSrc, ic: LenCode, i: usize, hits: []const RingHit, min_len: u32, da: DistAlphabet) u32 {
+    var take: u32 = 0;
+    var best_len: u32 = min_len - 1;
+    for (hits) |h| {
+        if (h.l <= best_len) continue;
+        const whole = h.l >= max_take_len;
+        relaxCopies(nodes, costs, nd, ic, i, if (whole) h.l else best_len + 1, h.l, h.d, da, @enumFromInt(h.code));
+        best_len = h.l;
+        if (whole) take = @max(take, h.l);
+    }
+    return take;
+}
 
 const StartQueue = struct {
     const size = 8;
@@ -3092,17 +3112,7 @@ fn buildCommandsOptimal(
                         }
                         break :blk pr;
                     };
-                    // A length an earlier code reached is not tried again
-                    // at a later one (google's `best_len`): a distance met
-                    // twice is skipped by it, too.
-                    var best_len: u32 = min_len - 1;
-                    for (rp.hits[0..rp.n]) |h| {
-                        if (h.l <= best_len) continue;
-                        const whole = h.l >= max_take_len;
-                        relaxCopies(nodes, costs, nd, ic, i, if (whole) h.l else best_len + 1, h.l, h.d, da, @enumFromInt(h.code));
-                        best_len = h.l;
-                        if (whole) take = @max(take, h.l);
-                    }
+                    take = @max(take, relaxRingHits(nodes, costs, nd, ic, i, rp.hits[0..rp.n], min_len, da));
                 }
                 // Other distances from the two cheapest starts only (google:
                 // more starts find new ring copies, not new copies).
@@ -6400,6 +6410,20 @@ test "sortKeys: ascending, as a library sort, at every length up to an alphabet"
     }
 }
 
+/// A histogram found by a search (2026-10-16) where a stride's count meets
+/// `optimizeCountsForRle`'s streak bound exactly: `>=` and `>` part there.
+const rle_kat_case4 = [256]u32{
+    4,  2,  4,  3,  3,  2,  4,   3,   2,   3,   4,   2,   0,   1,   0,   0,   4,   1,   0,   0,   1,   0,   3,   3,   58,  58,  58,  58, 58,
+    58, 58, 3,  4,  4,  4,  2,   3,   2,   4,   0,   3,   4,   1,   269, 270, 0,   0,   55,  59,  57,  53,  42,  40,  39,  40,  41,  42, 2,
+    2,  1,  2,  2,  2,  2,  3,   1,   2,   1,   3,   0,   1,   2,   1,   1,   4,   2,   5,   0,   0,   0,   0,   0,   0,   1,   3,   3,  1,
+    3,  1,  3,  3,  2,  3,  3,   1,   24,  22,  24,  22,  24,  23,  22,  3,   1,   1,   2,   2,   2,   1,   1,   3,   2,   2,   2,   0,  0,
+    0,  0,  0,  0,  0,  0,  0,   0,   3,   0,   3,   6,   2,   2,   2,   3,   7,   4,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,  0,
+    0,  0,  2,  2,  0,  1,  1,   2,   1,   2,   2,   2,   1,   1,   0,   0,   3,   0,   0,   0,   0,   0,   0,   88,  87,  88,  89,  87, 87,
+    87, 88, 88, 87, 89, 89, 331, 329, 331, 331, 330, 331, 327, 330, 329, 329, 3,   3,   2,   1,   0,   2,   0,   0,   2,   1,   3,   20, 18,
+    21, 18, 19, 20, 21, 2,  2,   2,   2,   2,   3,   370, 368, 370, 370, 366, 368, 371, 277, 277, 278, 277, 276, 278, 277, 276, 278, 1,  3,
+    2,  2,  3,  3,  3,  2,  1,   0,   1,   3,   1,   3,   4,   2,   0,   2,   5,   7,   1,   2,   0,   0,   0,   0,
+};
+
 /// `tools/c_oracle/rle_counts_kat.c`'s histogram `n`, from the same
 /// generator.
 fn rleKatCase(n: u32, buf: *[tables.num_command_symbols]u32) []u32 {
@@ -6413,6 +6437,7 @@ fn rleKatCase(n: u32, buf: *[tables.num_command_symbols]u32) []u32 {
             0 => if (r % 7 == 0) 0 else (r >> 7) % (1 + k * 37 % 50),
             1 => if (k % 24 < 8 or k >= 690) 0 else 1 + r % 3,
             2 => 1000 / (1 + k / 8) + r % 5,
+            4 => rle_kat_case4[i],
             else => if (r % 11 == 0) 0 else 40 * (1 + k / 32) + r % 9,
         };
     }
@@ -6423,12 +6448,15 @@ test "optimizeCountsForRle: google/brotli's smoothing, count for count" {
     // SHA-256 of the counts (u32 little-endian) google/brotli 1.2.0's
     // `BrotliOptimizeHuffmanCountsForRle` leaves, from
     // `tools/c_oracle/rle_counts_kat.c` (2026-10-16). It changes 30, 291,
-    // 207 and 153 of them.
+    // 207 and 153 of the first four; the fifth parts `>=` from `>` at the
+    // streak bound. (The initial `+ 420` cannot be told from `+ 400` by any
+    // input: `256·c − ⌊256·S/3⌋` is ⌈256k/3⌉, never in the 20 between.)
     const want = [_]*const [64]u8{
         "a27023958f2e960b48af7228061e217d3c098bca2366c1c743ebef6c37bde1fc",
         "7e1c914ecb693000e644a46f35342f1a877d4c97ae141da5eb5c46f73aa9bd49",
         "d29f0732a08c78285bf5fbf54fe280cb737d7e6d9eba587ef681a22cf8228839",
         "aff1a49d9e14736ceb63c40eba058e9c560f1cd0f6f6d35cc2f2f3f3a6012eb2",
+        "b17db1e052f164830654aa172ea2c5808c1d6b0dc9d965b7866c161306e9e38e",
     };
     for (want, 0..) |hex, n| {
         var buf: [tables.num_command_symbols]u32 = undefined;
@@ -6953,4 +6981,60 @@ test "a block without literals under several literal contexts is compressed, not
         defer gpa.free(back);
         try testing.expectEqualSlices(u8, input, back);
     }
+}
+
+test "chooseDistParams: NDIRECT's search halves where it starts for each NPOSTFIX (google's order)" {
+    // Distances that are multiples of eight: NPOSTFIX 3 pays, and the
+    // search for its NDIRECT starts at half the last NPOSTFIX's best (google
+    // `BrotliBuildMetaBlock`). Started from that best itself it ends at 120.
+    var cmds: [200]Cmd = undefined;
+    for (&cmds, 0..) |*c, k| c.* = .{ .insert_len = 1, .copy_len = @intCast(4 + k % 8), .dist = @intCast(8 * (1 + (k * 2654435761) % 4000)) };
+    const p = chooseDistParams(&cmds, .{});
+    try testing.expectEqual(@as(u2, 3), p.npostfix);
+    try testing.expectEqual(@as(u8, 72), p.ndirect);
+    try testing.expect(distParamsCost(&cmds, .{}, p).? < distParamsCost(&cmds, .{}, .{}).?);
+}
+
+test "MinCopyLen: past every reached end, a bit more for each copy length bucket" {
+    // All ends already reached at no cost: the walk goes one past the last
+    // node (as google's `pos + len <= num_bytes`), adding a bit at lengths
+    // 10, 14, 22 and 38 (`ComputeMinimumCopyLength`'s buckets of 4, 8, 16,
+    // 32).
+    var nodes: [41]OptNode = undefined;
+    for (&nodes) |*nd| nd.* = .{ .cost = 0, .from = 0, .len = 0, .dist = 0, .ins = 0 };
+    var w: MinCopyLen = .{};
+    try testing.expectEqual(@as(u32, 41), w.at(&nodes, 0, 0));
+    try testing.expectEqual(@as(f32, 4), w.added);
+    // An end that costs more than the start plus what was added stops it,
+    // and the walk resumes there for the next start.
+    for (nodes[12..]) |*nd| nd.cost = 2;
+    var v: MinCopyLen = .{};
+    try testing.expectEqual(@as(u32, 12), v.at(&nodes, 0, 0.5));
+    try testing.expectEqual(@as(u32, 41), v.at(&nodes, 0, 1.5));
+}
+
+test "relaxRingHits: a length an earlier short code reached is not tried at a later one (google best_len)" {
+    // Codes 0 and 1 both copy 330 bytes (taken whole, >= max_take_len);
+    // code 1 is priced far below code 0, but google tries only lengths past
+    // what an earlier code reached, so 330 is code 0's. Code 2 reaches 340.
+    const gpa = testing.allocator;
+    const costs = try gpa.create(OptCosts);
+    defer gpa.destroy(costs);
+    @memset(&costs.cmd, 1);
+    for (&costs.dist) |*row| {
+        @memset(row, 1);
+        row[0] = 20;
+        row[1] = 0;
+    }
+    var nodes: [400]OptNode = undefined;
+    for (&nodes) |*nd| nd.* = .{ .cost = std.math.inf(f32), .from = 0, .len = 0, .dist = 0, .ins = 0 };
+    nodes[0].cost = 0;
+    const ic = lengthCode(&cmd_tables.insert_off, &cmd_tables.insert_nbits, 0).?;
+    const src: OptSrc = .{ .cost = 0, .ins = 0, .ring = .{ 5, 7, 11, 13 } };
+    const hits = [_]RingHit{ .{ .code = 0, .d = 5, .l = 330 }, .{ .code = 1, .d = 7, .l = 330 }, .{ .code = 2, .d = 11, .l = 340 } };
+    try testing.expectEqual(@as(u32, 340), relaxRingHits(&nodes, costs, src, ic, 0, &hits, 2, .{ .n = dist_alphabet_size }));
+    try testing.expectEqual(@as(u32, 5), nodes[330].dist);
+    try testing.expectEqual(@as(u32, 11), nodes[340].dist);
+    // Taken whole: nothing shorter was relaxed.
+    try testing.expectEqual(std.math.inf(f32), nodes[329].cost);
 }

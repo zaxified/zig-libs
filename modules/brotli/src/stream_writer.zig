@@ -596,6 +596,26 @@ test "size_hint: a table for the input, and compressWith's bytes for a short one
     }
 }
 
+test "size_hint of 1 MiB and more: thirteen literal contexts, as compressWith" {
+    // `.q6` models a long text's literals with google's thirteen contexts
+    // when the whole input is that long: a stream knows it from the hint.
+    const gpa = testing.allocator;
+    const alice = @embedFile("testdata/alice29.txt");
+    const src = try gpa.alloc(u8, 7 * alice.len);
+    defer gpa.free(src);
+    for (0..7) |k| @memcpy(src[k * alice.len ..][0..alice.len], alice);
+    try testing.expectEqual(@as(u32, 13), @import("greedy_split.zig").chooseStaticContexts(src[0 .. 1 << 20], 6, src.len).n);
+    const want = try encoder.compressWith(gpa, src, .{ .effort = .q6, .window_bits = 22 });
+    defer gpa.free(want);
+    var out: Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var buf: [4096]u8 = undefined;
+    var sw: StreamWriter = try .init(gpa, &out.writer, &buf, .{ .effort = .q6, .size_hint = src.len });
+    defer sw.deinit();
+    try writeStream(&sw, src, 64 * 1024, &.{});
+    try testing.expectEqualSlices(u8, want, out.written());
+}
+
 test "a raw prefix dictionary: compressWith's bytes, and every decoder's round trip" {
     const gpa = testing.allocator;
     const src = try gpa.alloc(u8, 200_000);

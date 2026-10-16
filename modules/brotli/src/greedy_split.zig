@@ -514,6 +514,11 @@ test "chooseStaticContexts: thirteen contexts for a long text, never under 1 MiB
     try testing.expect(chooseStaticContexts(&rnd, 9, 1 << 20).n <= 3);
     // Below quality 5 nothing, whatever the length.
     try testing.expectEqual(@as(u32, 1), chooseStaticContexts(alice, 4, 1 << 20).n);
+    // Letters and spaces drawn at random: the contexts tell nothing about
+    // the next byte (under 0.2 bits a literal saved), so none of the 13.
+    var flat: [64 * 1024]u8 = undefined;
+    for (&flat) |*b| b.* = if (prng.random().uintLessThan(u8, 6) == 0) ' ' else 'a' + prng.random().uintLessThan(u8, 26);
+    try testing.expect(chooseStaticContexts(&flat, 9, 1 << 20).n <= 3);
 }
 
 test "chooseStaticContexts: the thresholds between one, two and three contexts" {
