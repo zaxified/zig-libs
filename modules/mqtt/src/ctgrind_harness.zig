@@ -30,8 +30,9 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const packet = @import("packet.zig");
+const acl = @import("acl.zig");
 
-const Target = enum { encode, decode };
+const Target = enum { encode, decode, pwverify };
 const Taint = enum { yes, no };
 
 const cred_len = 32;
@@ -103,6 +104,21 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 const wire = try packet.encodePacket(&buf, vp[0], vp[1]);
                 std.debug.print("ctgrind_result={x}\n", .{wire});
             }
+        },
+        .pwverify => {
+            // `acl.Passwords.verify` over a real `mosquitto_passwd` line: the
+            // password is the secret; the derived hash is compared with
+            // `timing_safe.eql`. The claim measured: no branch or index on the
+            // password inside acl.zig (the bool it returns is the verdict).
+            const line = "bob:$7$1000$AdPRuou8DmEDG7SizhAjrmHJk94sE28EL96MplcRW3GWofUi9cyHDpl20p0STCFvX+XDgUwKS0IuX5vaMU3Ckg==$jn0M3dNRPYhYpWOfsFHQVZJZc0XulVhPZD5Do8iAGJ0qH7G6wdWRd9rFb1WUbIfAD395dO/0HWm3L189aObziw==\n";
+            var entries: [1]acl.Entry = undefined;
+            const pws = try acl.Passwords.parse(line, &entries);
+            var pw: [7]u8 = "hunter2".*;
+            if (taint == .yes) std.valgrind.memcheck.makeMemUndefined(&pw);
+            const ok = pws.verify("bob", &pw);
+            // 8+ hex digits for the output pin: the verdict, twice, and its complement.
+            const v: u8 = @intFromBool(ok);
+            std.debug.print("ctgrind_result={x}\n", .{&[4]u8{ v, v, v ^ 1, v ^ 1 }});
         },
         .decode => {
             for (packets(&pw_raw, &ad_raw)) |vp| {

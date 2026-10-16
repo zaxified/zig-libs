@@ -2918,7 +2918,11 @@ pub const Broker = struct {
             return b.refuseConnect(conn, .identifier_rejected, .client_identifier_not_valid);
         }
         var assigned = false;
-        if (c.client_id.len == 0) {
+        if (c.client_id.len == 0 and conn.ext_done) {
+            // Second pass of an extended-authentication CONNECT: keep the id
+            // the first pass assigned (the hook already saw it).
+            assigned = true;
+        } else if (c.client_id.len == 0) {
             var idbuf: [max_client_id]u8 = undefined;
             b.mutex.lock();
             const gen = std.fmt.bufPrint(&idbuf, "auto-{d}", .{b.next_auto_id}) catch unreachable;
@@ -4206,7 +4210,7 @@ pub const Broker = struct {
                     capped = true;
                     break;
                 }
-                if (pickShared(g)) |m| try matches.append(b.allocator, m);
+                if (b.pickShared(g, msg.topic)) |m| try matches.append(b.allocator, m);
             }
             if (capped) _ = b.fanout_truncations.fetchAdd(1, .monotonic);
 
@@ -4228,7 +4232,7 @@ pub const Broker = struct {
                     }
                 } else try owners.append(b.allocator, ref);
             }
-            matched = owners.items.len;
+            matched = 0; // counted below: only subscribers that are delivered to
 
             // Each owner's Subscription Identifiers: one copy carries them all
             // (3.3.4-4). Gathered per owner into one list, a run per target.
@@ -4254,6 +4258,7 @@ pub const Broker = struct {
             try targets.ensureTotalCapacity(b.allocator, owners.items.len);
             for (owners.items, spans) |o, span| {
                 if (!b.deliveryAllowed(ownerClientId(o.owner), ownerUsername(o.owner), msg.topic)) continue;
+                matched += 1;
                 const q = minQos(qos, o.qos);
                 const retain = msg.retain and o.retain_as_published;
                 const run = ids.items[span[0]..span[1]];
@@ -4342,13 +4347,16 @@ pub const Broker = struct {
     /// round-robin from `next`, first among members that can take it now
     /// (connected), else a persistent session that queues it. Caller holds
     /// `mutex`.
-    fn pickShared(g: *Shared) ?SubRef {
+    /// A member the delivery ACL (`Config.acl_check_delivery`) denies `topic_name`
+    /// is passed over for the next one in rotation, in both passes.
+    fn pickShared(b: *Broker, g: *Shared, topic_name: []const u8) ?SubRef {
         const n = g.members.items.len;
         for (0..2) |pass| {
             for (0..n) |k| {
                 const i = (g.next + k) % n;
                 const m = g.members.items[i];
-                const ok = if (pass == 0) canTakeNow(m.owner) else m.owner == .session;
+                const ok = (if (pass == 0) canTakeNow(m.owner) else m.owner == .session) and
+                    b.deliveryAllowed(ownerClientId(m.owner), ownerUsername(m.owner), topic_name);
                 if (ok) {
                     g.next = (i + 1) % n;
                     return m;
@@ -9735,4 +9743,86 @@ test "acl_check_delivery: off by default -- the same subscriber gets everything"
     try b.publish("private/x", "1", .at_most_once, false);
     try testing.expectEqualStrings("private/x", (try ts.next()).?.publish.topic);
     try testing.expectEqual(@as(u64, 0), b.aclDeliveryDenials());
+}
+
+// ── wave 3b ─────────────────────────────────────────────────────────────────
+
+fn groupAcl(ctx: ?*anyopaque, req: AclRequest) bool {
+    _ = ctx;
+    if (req.operation != .subscribe) return true;
+    if (std.mem.eql(u8, req.topic, "g/none")) return false; // nobody
+    return !(std.mem.eql(u8, req.client_id, "A") and std.mem.eql(u8, req.topic, "g/x"));
+}
+
+test "acl_check_delivery: a Shared Subscription passes over a denied member to the next; 0x10 counts real deliveries" {
+    var b = Broker.init(testing.allocator, .{ .authorizeFn = groupAcl, .acl_check_delivery = true });
+    defer b.deinit();
+    var ta = TestTransport{};
+    const a = try connectClient(&b, &ta, "A", 60, 0);
+    try feedSubscribe(&b, a, 1, &.{.{ .filter = "$share/grp/g/#" }});
+    _ = (try ta.next()).?;
+    var tb = TestTransport{};
+    const bb = try connectClient(&b, &tb, "B", 60, 0);
+    try feedSubscribe(&b, bb, 1, &.{.{ .filter = "$share/grp/g/#" }});
+    _ = (try tb.next()).?;
+
+    var tp = TestTransport{};
+    const p = try connect5(&b, &tp, .{ .client_id = "P" }, 0);
+    // Rotation alone would give A every other message; A is denied "g/x", so
+    // B gets all four.
+    for (0..4) |i| {
+        _ = try send5(&b, p.conn, .{ .publish = .{ .topic = "g/x", .payload = "m", .qos = .at_least_once, .packet_id = @intCast(i + 1) } }, 1);
+        try testing.expectEqual(packet.ReasonCode.success, (try next5(&tp)).?.puback.reason_code);
+        try testing.expectEqualStrings("g/x", (try tb.next()).?.publish.topic);
+    }
+    try testing.expectEqual(@as(?packet.Packet, null), try ta.next());
+    try testing.expect(b.aclDeliveryDenials() >= 1);
+
+    // Another topic: A is served again.
+    var got_a = false;
+    for (0..2) |_| {
+        try b.publish("g/y", "m", .at_most_once, false);
+        if (try ta.next()) |_| got_a = true;
+        _ = try tb.next();
+    }
+    try testing.expect(got_a);
+
+    // Denied to every member: nothing is delivered, and the publisher is told so.
+    _ = try send5(&b, p.conn, .{ .publish = .{ .topic = "g/none", .payload = "m", .qos = .at_least_once, .packet_id = 9 } }, 1);
+    try testing.expectEqual(packet.ReasonCode.no_matching_subscribers, (try next5(&tp)).?.puback.reason_code);
+    try testing.expectEqual(@as(?packet.Packet, null), try ta.next());
+    try testing.expectEqual(@as(?packet.Packet, null), try tb.next());
+}
+
+const IdSeen = struct {
+    buf: [64]u8 = undefined,
+    len: usize = 0,
+};
+
+fn idRecordingAuth(ctx: ?*anyopaque, req: ExtAuthRequest) ExtAuthResult {
+    const seen: *IdSeen = @ptrCast(@alignCast(ctx.?));
+    if (req.phase == .connect) {
+        @memcpy(seen.buf[0..req.client_id.len], req.client_id);
+        seen.len = req.client_id.len;
+        return .{ .continue_auth = null };
+    }
+    return .{ .success = null };
+}
+
+test "extended auth with an empty client id: one id, seen by the hook and kept by the connection" {
+    var seen: IdSeen = .{};
+    var b = Broker.init(testing.allocator, .{ .extendedAuthFn = idRecordingAuth, .ext_auth_ctx = &seen });
+    defer b.deinit();
+    var tt = TestTransport{};
+    const conn = try b.accept(tt.transport());
+    var buf: [128]u8 = undefined;
+    try b.feed(conn, try packet.encodePacket(&buf, .v5, .{ .connect = .{ .client_id = "", .version = .v5, .properties = .{ .authentication_method = "M" } } }));
+    try testing.expectEqual(Disposition.keep, try b.process(conn, 0));
+    _ = (try next5(&tt)).?; // AUTH 0x18
+    try testing.expectEqual(Disposition.keep, try send5(&b, conn, authPacket(.continue_authentication, "M", null), 1));
+    const ack = (try next5(&tt)).?.connack;
+    try testing.expectEqual(packet.ReasonCode.success, ack.reason_code);
+    try testing.expectEqualStrings(seen.buf[0..seen.len], conn.clientId());
+    try testing.expectEqualStrings(conn.clientId(), ack.properties.assigned_client_identifier.?);
+    try testing.expectEqual(@as(u64, 1), b.next_auto_id); // generated once
 }

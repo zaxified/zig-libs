@@ -51,8 +51,10 @@
 //! local filter goes to the remote with `local_prefix` replaced by
 //! `remote_prefix`, and the other way round for the remote. The first rule
 //! (in order) whose direction allows it and whose filter matches decides.
-//! Forwarded messages carry min(message QoS, rule QoS); 5.0 properties are
-//! not forwarded. RETAIN is kept on the local side and, from a 5.0 remote
+//! Forwarded messages carry min(message QoS, rule QoS). With a 5.0 remote the
+//! forwardable 5.0 properties (Payload Format, Message Expiry, Content Type,
+//! Response Topic, Correlation Data, User Properties) travel both ways; a
+//! 3.1.1 remote has none. RETAIN is kept on the local side and, from a 5.0 remote
 //! (Retain As Published), on live remote messages; a 3.1.1 remote clears it on
 //! live deliveries, as it does for Mosquitto bridges (retained messages sent
 //! at subscribe time keep it).
@@ -65,8 +67,10 @@
 //! bridge remembers a hash of the last 32 messages it forwarded out on
 //! `both` rules and drops the first incoming remote message that equals one
 //! (a heuristic: two byte-identical messages from other publishers arriving
-//! at the same moment may lose one). Use distinct prefixes or a 5.0 remote
-//! where that matters.
+//! at the same moment may lose one). A `both` rule needs distinct
+//! `local_prefix` and `remote_prefix` or a 5.0 remote: `init` refuses a
+//! `both` rule with equal prefixes over 3.1.1 (`error.LoopProneRule`), the
+//! case where a forwarded message would be indistinguishable from a new one.
 //!
 //! ## Reconnect, in-flight, notifications
 //!
@@ -76,8 +80,15 @@
 //! messages not yet acknowledged by the remote are resent after a reconnect
 //! (see `Client.Buffers.outbox`); with a clean session or when the remote
 //! reports no session the remote subscriptions are re-sent (`SubscriptionSet`).
-//! Messages from the local side while the remote link is down are dropped
-//! (counted in `stats().dropped`), unlike Mosquitto which queues them.
+//! Local messages that arrive while the remote link is down are queued in
+//! `Buffers.queue` / `queue_entries` (FIFO; QoS 1/2 only unless
+//! `Config.queue_qos0`, like Mosquitto's `queue_qos0_messages`) and sent in
+//! order after the next CONNACK, once the subscriptions are replayed. When
+//! the queue is full the OLDEST entries are dropped to make room (counted in
+//! `stats().dropped`, as are messages that cannot be queued at all: QoS 0
+//! without the option, no queue storage, larger than the queue). A queue that
+//! cannot drain (remote Receive Maximum) keeps order: later messages queue
+//! behind it.
 //! `Config.notification_topic` gets a retained "1" (on the local broker and
 //! on the remote) when the link is up and a retained "0" locally when it is
 //! lost; the remote has the Will "0" on the same topic.
@@ -122,6 +133,9 @@ pub const Config = struct {
     password: ?[]const u8 = null,
     /// Mosquitto `notifications` + `notification_topic`; null = off.
     notification_topic: ?[]const u8 = null,
+    /// Also queue QoS 0 messages while the remote is down (Mosquitto
+    /// `queue_qos0_messages`, default off).
+    queue_qos0: bool = false,
     /// Mosquitto `restart_timeout` is `reconnect.initial_ms` / `max_ms`.
     reconnect: reconnect_mod.Reconnect.Options = .{},
 };
@@ -140,9 +154,21 @@ pub const Buffers = struct {
     remote_tx: []u8,
     /// Resume outbox for the remote client; empty = no in-flight resume.
     remote_outbox: []u8 = &.{},
+    /// Message queue for a down remote link (bytes; empty = no queue). Each
+    /// entry holds the encoded message (topic, payload, properties, ~10 bytes).
+    queue: []u8 = &.{},
+    /// Bound on the number of queued messages (empty = no queue).
+    queue_entries: []QueueEntry = &.{},
     /// Storage for the remote filters replayed after a reconnect.
     sub_storage: []u8,
     sub_slots: []reconnect_mod.SubscriptionSet.Entry,
+};
+
+pub const QueueEntry = struct {
+    offset: usize = 0,
+    len: usize = 0,
+    /// Sent on a `both` rule: remembered for 3.1.1 echo suppression.
+    both: bool = false,
 };
 
 pub const Status = enum {
@@ -165,6 +191,8 @@ pub const Error = client_mod.Error || broker_mod.Error || reconnect_mod.Subscrip
     NotStarted,
     /// The broker closed the bridge's local connection.
     LocalClosed,
+    /// A `both` rule over a 3.1.1 remote with equal local and remote prefix.
+    LoopProneRule,
     /// A rule prefix contains a wildcard, or a prefixed filter is too long.
     InvalidRule,
 };
@@ -207,6 +235,10 @@ pub const Bridge = struct {
     remote: enum { down, connecting, up } = .down,
     remote_failed: bool = false,
     counters: Stats = .{},
+    queue: []u8,
+    qentries: []QueueEntry,
+    qn: usize = 0,
+    qused: usize = 0,
     echo: [echo_slots]u64 = @splat(0),
     echo_next: usize = 0,
 
@@ -218,6 +250,7 @@ pub const Bridge = struct {
             if (std.mem.indexOfAny(u8, r.local_prefix, "+#") != null or std.mem.indexOfAny(u8, r.remote_prefix, "+#") != null) return error.InvalidRule;
             topic_rules.validateFilter(r.pattern) catch return error.InvalidRule;
             if (r.local_prefix.len + r.pattern.len > topic_buf_len or r.remote_prefix.len + r.pattern.len > topic_buf_len) return error.InvalidRule;
+            if (r.direction == .both and config.version == .v3_1_1 and std.mem.eql(u8, r.local_prefix, r.remote_prefix)) return error.LoopProneRule;
         }
         b.* = .{
             .local = local,
@@ -228,6 +261,8 @@ pub const Bridge = struct {
             .down = .{ .buf = buffers.pipe_down },
             .subs = reconnect_mod.SubscriptionSet.init(buffers.sub_storage, buffers.sub_slots),
             .schedule = reconnect_mod.Reconnect.init(config.reconnect),
+            .queue = buffers.queue,
+            .qentries = buffers.queue_entries,
         };
         b.local_client = Client.init(.{ .ctx = &b.up, .writeFn = Pipe.clientWrite }, .{ .rx = buffers.local_rx, .tx = buffers.local_tx });
         const v5 = config.version == .v5;
@@ -266,6 +301,11 @@ pub const Bridge = struct {
             try b.pumpLocal(now);
         }
         if (b.config.notification_topic) |t| try b.local.publishWith(t, "0", .{ .qos = .at_least_once, .retain = true });
+    }
+
+    /// Messages waiting for the remote link.
+    pub fn queued(b: *const Bridge) usize {
+        return b.qn;
     }
 
     pub fn stats(b: *const Bridge) Stats {
@@ -336,6 +376,7 @@ pub const Bridge = struct {
             b.remote_client.tick(now) catch {
                 b.remote_failed = true;
             };
+            b.drainQueue(now);
         }
         try b.pumpLocal(now);
         return if (b.remote_failed) .remote_lost else .ok;
@@ -372,6 +413,7 @@ pub const Bridge = struct {
                     _ = try b.remote_client.publish(now, t, "1", .{ .qos = .at_least_once, .retain = true });
                     b.local.publishWith(t, "1", .{ .qos = .at_least_once, .retain = true }) catch {};
                 }
+                b.drainQueue(now);
             },
             .message => |m| b.forwardIn(now, m),
             .disconnect => b.remote_failed = true,
@@ -444,23 +486,118 @@ pub const Bridge = struct {
                 b.counters.dropped += 1;
                 return;
             };
-            if (b.remote != .up) {
-                b.counters.dropped += 1;
+            const qos = minQos(m.qos, r.qos);
+            const props = if (b.config.version == .v5) forwardProps(m.properties) else packet.Properties{};
+            const both = r.direction == .both;
+            if (b.remote != .up or b.qn > 0) {
+                if (b.queue.len > 0 and (qos != .at_most_once or b.config.queue_qos0)) {
+                    b.enqueue(remote_topic, m.payload, qos, m.retain, props, both);
+                } else if (b.remote == .up) {
+                    b.sendRemote(now, remote_topic, m.payload, qos, m.retain, props, both);
+                } else {
+                    b.counters.dropped += 1;
+                }
                 return;
             }
-            _ = b.remote_client.publish(now, remote_topic, m.payload, .{
-                .qos = minQos(m.qos, r.qos),
-                .retain = m.retain,
-            }) catch {
-                b.counters.dropped += 1;
-                return;
-            };
-            if (r.direction == .both and b.config.version == .v3_1_1) {
-                b.echo[b.echo_next] = hashMessage(remote_topic, m.payload);
-                b.echo_next = (b.echo_next + 1) % echo_slots;
-            }
-            b.counters.forwarded_out += 1;
+            b.sendRemote(now, remote_topic, m.payload, qos, m.retain, props, both);
             return;
+        }
+    }
+
+    fn sendRemote(b: *Bridge, now: u64, remote_topic: []const u8, payload: []const u8, qos: packet.QoS, retain: bool, props: packet.Properties, both: bool) void {
+        _ = b.remote_client.publish(now, remote_topic, payload, .{ .qos = qos, .retain = retain, .properties = props }) catch {
+            b.counters.dropped += 1;
+            return;
+        };
+        b.noteSent(remote_topic, payload, both);
+    }
+
+    fn noteSent(b: *Bridge, remote_topic: []const u8, payload: []const u8, both: bool) void {
+        if (both and b.config.version == .v3_1_1) {
+            b.echo[b.echo_next] = hashMessage(remote_topic, payload);
+            b.echo_next = (b.echo_next + 1) % echo_slots;
+        }
+        b.counters.forwarded_out += 1;
+    }
+
+    fn forwardProps(p: packet.Properties) packet.Properties {
+        return .{
+            .payload_format = p.payload_format,
+            .message_expiry_interval = p.message_expiry_interval,
+            .content_type = p.content_type,
+            .response_topic = p.response_topic,
+            .correlation_data = p.correlation_data,
+            .user_properties = p.user_properties,
+        };
+    }
+
+    /// Queue a message (as an encoded 5.0 PUBLISH), dropping the oldest ones
+    /// until it fits.
+    fn enqueue(b: *Bridge, remote_topic: []const u8, payload: []const u8, qos: packet.QoS, retain: bool, props: packet.Properties, both: bool) void {
+        const p = packet.Publish{
+            .topic = remote_topic,
+            .payload = payload,
+            .qos = qos,
+            .retain = retain,
+            .packet_id = if (qos == .at_most_once) 0 else 1,
+            .properties = props,
+        };
+        const need = packet.packetWireLen(.v5, .{ .publish = p }) catch {
+            b.counters.dropped += 1;
+            return;
+        };
+        if (need > b.queue.len or b.qentries.len == 0) {
+            b.counters.dropped += 1;
+            return;
+        }
+        while (b.qn > 0 and (b.qn >= b.qentries.len or b.qused + need > b.queue.len)) {
+            b.queuePop();
+            b.counters.dropped += 1;
+        }
+        const bytes = packet.encodePacket(b.queue[b.qused..], .v5, .{ .publish = p }) catch {
+            b.counters.dropped += 1;
+            return;
+        };
+        b.qentries[b.qn] = .{ .offset = b.qused, .len = bytes.len, .both = both };
+        b.qn += 1;
+        b.qused += bytes.len;
+    }
+
+    fn queuePop(b: *Bridge) void {
+        const e = b.qentries[0];
+        std.mem.copyForwards(u8, b.queue[0..], b.queue[e.len..b.qused]);
+        b.qused -= e.len;
+        for (b.qentries[1..b.qn]) |*x| x.offset -= e.len;
+        std.mem.copyForwards(QueueEntry, b.qentries[0 .. b.qn - 1], b.qentries[1..b.qn]);
+        b.qn -= 1;
+    }
+
+    /// Send queued messages in order while the remote link is up; stops
+    /// (keeping the rest) when the remote's window is full.
+    fn drainQueue(b: *Bridge, now: u64) void {
+        while (b.qn > 0 and b.remote == .up) {
+            const e = b.qentries[0];
+            const dec = (packet.decodePacket(b.queue[e.offset..][0..e.len], .v5) catch null) orelse {
+                b.queuePop();
+                b.counters.dropped += 1;
+                continue;
+            };
+            const p = dec.packet.publish;
+            const props = if (b.config.version == .v5) p.properties else packet.Properties{};
+            _ = b.remote_client.publish(now, p.topic, p.payload, .{ .qos = p.qos, .retain = p.retain, .properties = props }) catch |err| switch (err) {
+                error.ReceiveMaximumReached, error.TooManyInFlight, error.OutboxFull => return,
+                error.NotConnected, error.TransportFailed => {
+                    b.remote_failed = true;
+                    return;
+                },
+                else => {
+                    b.queuePop();
+                    b.counters.dropped += 1;
+                    continue;
+                },
+            };
+            b.noteSent(p.topic, p.payload, e.both);
+            b.queuePop();
         }
     }
 
@@ -485,7 +622,7 @@ pub const Bridge = struct {
                 b.counters.dropped += 1;
                 return;
             };
-            const opts: Client.PublishOptions = .{ .qos = minQos(m.qos, r.qos), .retain = m.retain };
+            const opts: Client.PublishOptions = .{ .qos = minQos(m.qos, r.qos), .retain = m.retain, .properties = forwardProps(m.properties) };
             _ = b.local_client.publish(now, local_topic, m.payload, opts) catch |e| switch (e) {
                 // too many unacknowledged: let the broker answer, then retry once
                 error.TooManyInFlight, error.ReceiveMaximumReached => {

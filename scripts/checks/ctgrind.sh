@@ -264,7 +264,7 @@ declare -A TARGETS=(
     # long-term password, CSRF key + session id, MQTT password + auth data ──
     [stun]="mi ltkey"
     [sessions]="csrf newid"
-    [mqtt]="encode decode"
+    [mqtt]="encode decode pwverify"
     # ── 2026-10-10: ct-wave: Noise statics, ephemerals, PSK, transport keys ──
     [noise]="hs transport"
     # ── 2026-10-10: ct-wave: TLS 1.3 client ephemerals/key schedule, client-auth key ──
@@ -684,6 +684,7 @@ declare -A PATTERN=(
     [sessions/newid]='root[.]zig|idhex[.]zig'
     [mqtt/encode]='packet[.]zig'
     [mqtt/decode]='packet[.]zig'
+    [mqtt/pwverify]='acl[.]zig'
     [noise/hs]='state[.]zig|root[.]zig|patterns[.]zig|token[.]zig|burn[.]zig'
     [noise/transport]='state[.]zig|root[.]zig|burn[.]zig'
     [tlsclient/kex]='Client[.]zig|verify[.]zig|burn[.]zig|keygen[.]zig'
@@ -946,6 +947,7 @@ declare -A LABEL=(
     [sessions/newid]='sessions session-id hex (idhex, id tainted)'
     [mqtt/encode]='mqtt encode CONNECT/AUTH (password+auth data)'
     [mqtt/decode]='mqtt decode CONNECT/AUTH (credential bytes tainted)'
+    [mqtt/pwverify]='mqtt acl.Passwords.verify (password tainted)'
     [noise/hs]='noise XXpsk3 handshake (statics+ephemerals+psk tainted)'
     [noise/transport]='noise transport encrypt/decrypt+rekey (keys tainted)'
     [tlsclient/kex]='tlsclient ECDHE+key schedule on a ServerHello (ephemeral secrets tainted)'

@@ -148,4 +148,5 @@ test {
     _ = @import("ws_recipe_test.zig");
     _ = bridge;
     _ = @import("bridge_test.zig");
+    _ = @import("fuzz_session_test.zig");
 }

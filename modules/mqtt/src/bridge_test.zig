@@ -21,6 +21,7 @@ const Sink = struct {
     len: usize = 0,
     read: usize = 0,
     fed: usize = 0,
+    version: packet.Version = .v3_1_1,
 
     fn transport(s: *Sink) broker_mod.Transport {
         return .{ .ctx = s, .writeFn = writeFn };
@@ -35,7 +36,7 @@ const Sink = struct {
 
     fn next(s: *Sink) !?packet.Packet {
         if (s.read >= s.len) return null;
-        const dec = (try packet.decode(s.buf[s.read..s.len])) orelse return null;
+        const dec = (try packet.decodePacket(s.buf[s.read..s.len], s.version)) orelse return null;
         s.read += dec.consumed;
         return dec.packet;
     }
@@ -57,9 +58,14 @@ const Peer = struct {
     sink: *Sink,
 
     fn open(b: *Broker, sink: *Sink, id: []const u8) !Peer {
+        return openV(b, sink, id, .v3_1_1);
+    }
+
+    fn openV(b: *Broker, sink: *Sink, id: []const u8, version: packet.Version) !Peer {
+        sink.version = version;
         const conn = try b.accept(sink.transport());
         var buf: [128]u8 = undefined;
-        try b.feed(conn, try packet.encodeConnect(&buf, .{ .client_id = id }));
+        try b.feed(conn, try packet.encodeConnect(&buf, .{ .client_id = id, .version = version }));
         try testing.expectEqual(broker_mod.Disposition.keep, try b.process(conn, 0));
         try testing.expect((try sink.next()).? == .connack);
         return .{ .b = b, .conn = conn, .sink = sink };
@@ -67,15 +73,19 @@ const Peer = struct {
 
     fn subscribe(p: Peer, filter: []const u8, qos: packet.QoS) !void {
         var buf: [256]u8 = undefined;
-        try p.b.feed(p.conn, try packet.encodeSubscribe(&buf, 1, &.{.{ .filter = filter, .qos = qos }}));
+        try p.b.feed(p.conn, try packet.encodePacket(&buf, p.sink.version, .{ .subscribe = .{ .packet_id = 1, .filters = &.{.{ .filter = filter, .qos = qos }} } }));
         _ = try p.b.process(p.conn, 0);
         try testing.expect((try p.sink.next()).? == .suback);
     }
 
     fn publish(p: Peer, topic_name: []const u8, payload: []const u8, qos: packet.QoS, retain: bool) !void {
+        return p.publishProps(topic_name, payload, qos, retain, .{});
+    }
+
+    fn publishProps(p: Peer, topic_name: []const u8, payload: []const u8, qos: packet.QoS, retain: bool, props: packet.Properties) !void {
         var buf: [512]u8 = undefined;
         const id: u16 = if (qos == .at_most_once) 0 else 7;
-        try p.b.feed(p.conn, try packet.encodePublish(&buf, .{ .topic = topic_name, .payload = payload, .qos = qos, .retain = retain, .packet_id = id }));
+        try p.b.feed(p.conn, try packet.encodePacket(&buf, p.sink.version, .{ .publish = .{ .topic = topic_name, .payload = payload, .qos = qos, .retain = retain, .packet_id = id, .properties = props } }));
         _ = try p.b.process(p.conn, 0);
         if (qos != .at_most_once) try testing.expect((try p.sink.next()).? == .puback);
     }
@@ -112,13 +122,21 @@ const Harness = struct {
     remote_rx: [2048]u8 = undefined,
     remote_tx: [2048]u8 = undefined,
     outbox: [2048]u8 = undefined,
+    queue: [1024]u8 = undefined,
+    queue_entries: [8]bridge_mod.QueueEntry = undefined,
     sub_storage: [512]u8 = undefined,
     sub_slots: [8]reconnect_mod.SubscriptionSet.Entry = undefined,
 
     fn create(config: bridge_mod.Config) !*Harness {
+        return createQ(config, 1024, 8);
+    }
+
+    fn createQ(config: bridge_mod.Config, queue_bytes: usize, queue_max: usize) !*Harness {
         const h = try testing.allocator.create(Harness);
         h.* = .{ .local = Broker.init(testing.allocator, .{}), .remote = Broker.init(testing.allocator, .{}), .bridge = undefined };
-        try h.bridge.init(&h.local, config, .{
+        h.bridge.init(&h.local, config, .{
+            .queue = h.queue[0..queue_bytes],
+            .queue_entries = h.queue_entries[0..queue_max],
             .local_rx = &h.local_rx,
             .local_tx = &h.local_tx,
             .pipe_up = &h.pipe_up,
@@ -128,7 +146,12 @@ const Harness = struct {
             .remote_outbox = &h.outbox,
             .sub_storage = &h.sub_storage,
             .sub_slots = &h.sub_slots,
-        }, h.wire.transport());
+        }, h.wire.transport()) catch |e| {
+            h.local.deinit();
+            h.remote.deinit();
+            testing.allocator.destroy(h);
+            return e;
+        };
         try h.bridge.start(0);
         return h;
     }
@@ -397,4 +420,116 @@ test "bridge: wildcard rule patterns pick the right messages" {
         try testing.expect(std.mem.startsWith(u8, p.publish.topic, "r/dev/7"));
     }
     try testing.expectEqual(@as(usize, 2), seen); // dev/7 and dev/7/a/b
+}
+
+test "bridge: messages queue while the link is down and go out in order after the reconnect" {
+    const rules = [_]bridge_mod.Rule{.{ .pattern = "up/#", .direction = .out, .qos = .at_least_once }};
+    const h = try Harness.create(rules1(&rules));
+    defer h.destroy();
+    try h.dial(0);
+    try h.step(0);
+    var rs = Sink{};
+    const rpeer = try Peer.open(&h.remote, &rs, "r1");
+    try rpeer.subscribe("up/#", .at_least_once);
+    var ls = Sink{};
+    const lpeer = try Peer.open(&h.local, &ls, "l1");
+
+    _ = h.drop(10);
+    for ([_][]const u8{ "one", "two", "three" }, 0..) |payload, i| {
+        try lpeer.publish("up/m", payload, .at_least_once, false);
+        _ = try h.bridge.poll(20 + i);
+    }
+    try lpeer.publish("up/z", "q0", .at_most_once, false); // QoS 0 is not queued by default
+    _ = try h.bridge.poll(30);
+    try testing.expectEqual(@as(usize, 3), h.bridge.queued());
+    try testing.expectEqual(@as(u64, 1), h.bridge.stats().dropped);
+    try testing.expect((try rs.next()) == null);
+
+    try h.dial(1010);
+    try h.step(1010);
+    for ([_][]const u8{ "one", "two", "three" }) |payload| {
+        try testing.expectEqualStrings(payload, (try rs.nextPublish()).payload);
+    }
+    try testing.expect((try rs.next()) == null);
+    try testing.expectEqual(@as(usize, 0), h.bridge.queued());
+    try testing.expectEqual(@as(u64, 3), h.bridge.stats().forwarded_out);
+}
+
+test "bridge: a full queue drops the oldest; queue_qos0 queues QoS 0 too" {
+    const rules = [_]bridge_mod.Rule{.{ .pattern = "up/#", .direction = .out, .qos = .at_least_once }};
+    var cfg = rules1(&rules);
+    cfg.queue_qos0 = true;
+    const h = try Harness.createQ(cfg, 1024, 2);
+    defer h.destroy();
+    try h.dial(0);
+    try h.step(0);
+    var rs = Sink{};
+    const rpeer = try Peer.open(&h.remote, &rs, "r1");
+    try rpeer.subscribe("up/#", .at_least_once);
+    var ls = Sink{};
+    const lpeer = try Peer.open(&h.local, &ls, "l1");
+
+    _ = h.drop(10);
+    for ([_][]const u8{ "1", "2", "3", "4" }, 0..) |payload, i| {
+        try lpeer.publish("up/m", payload, if (i == 1) .at_most_once else .at_least_once, false);
+        _ = try h.bridge.poll(20 + i);
+    }
+    try testing.expectEqual(@as(usize, 2), h.bridge.queued());
+    try testing.expectEqual(@as(u64, 2), h.bridge.stats().dropped); // "1" and "2", the oldest
+    try h.dial(1010);
+    try h.step(1010);
+    try testing.expectEqualStrings("3", (try rs.nextPublish()).payload);
+    try testing.expectEqualStrings("4", (try rs.nextPublish()).payload);
+    try testing.expect((try rs.next()) == null);
+}
+
+test "bridge: a both rule with equal prefixes over 3.1.1 is refused" {
+    const rules = [_]bridge_mod.Rule{.{ .pattern = "x/#", .direction = .both }};
+    try testing.expectError(error.LoopProneRule, Harness.create(rules1(&rules)));
+    var cfg = rules1(&rules);
+    cfg.version = .v5; // No Local makes it safe
+    const h = try Harness.create(cfg);
+    h.destroy();
+}
+
+test "bridge: 5.0 properties travel both ways over a 5.0 remote" {
+    const rules = [_]bridge_mod.Rule{
+        .{ .pattern = "p/#", .direction = .out, .qos = .at_least_once },
+        .{ .pattern = "q/#", .direction = .in, .qos = .at_least_once },
+    };
+    var cfg = rules1(&rules);
+    cfg.version = .v5;
+    const h = try Harness.create(cfg);
+    defer h.destroy();
+    try h.dial(0);
+    try h.step(0);
+    var rs = Sink{};
+    const rpeer = try Peer.openV(&h.remote, &rs, "r1", .v5);
+    try rpeer.subscribe("p/#", .at_least_once);
+    var ls = Sink{};
+    const lpeer = try Peer.openV(&h.local, &ls, "l1", .v5);
+    try lpeer.subscribe("q/#", .at_least_once);
+
+    try h.local.publishWith("p/x", "body", .{
+        .qos = .at_least_once,
+        .properties = .{ .content_type = "text/plain", .user_properties = .{ .items = &.{.{ .name = "k", .value = "v" }} } },
+        .message_expiry_s = 100,
+        .now = 0,
+    });
+    try h.step(1);
+    const out = try rs.nextPublish();
+    try testing.expectEqualStrings("body", out.payload);
+    try testing.expectEqualStrings("text/plain", out.properties.content_type.?);
+    var it = out.properties.user_properties.iterator();
+    const up = it.next().?;
+    try testing.expectEqualStrings("k", up.name);
+    try testing.expectEqualStrings("v", up.value);
+    try testing.expect(out.properties.message_expiry_interval.? <= 100);
+
+    try rpeer.publishProps("q/y", "back", .at_least_once, false, .{ .response_topic = "resp/t", .correlation_data = "cd" });
+    try h.step(2);
+    const back = try ls.nextPublish();
+    try testing.expectEqualStrings("q/y", back.topic);
+    try testing.expectEqualStrings("resp/t", back.properties.response_topic.?);
+    try testing.expectEqualStrings("cd", back.properties.correlation_data.?);
 }
