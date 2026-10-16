@@ -68,12 +68,13 @@
 //! Local, Retain As Published, Retain Handling), Subscription Identifiers,
 //! Shared Subscriptions (`$share/`, for 3.1.1 clients too), Will properties
 //! and Will Delay. 3.1.1 and 5.0 clients share one broker; each gets every
-//! message in its own version. Extended authentication (AUTH) is not
-//! implemented: a CONNECT naming a method is refused with 0x8C.
+//! message in its own version. Extended authentication (AUTH, 2026-10-17)
+//! runs through `Config.extendedAuthFn`; without the hook a CONNECT naming a
+//! method is refused with 0x8C.
 //!
-//! Deliberately deferred (documented, not built): sessions
-//! that survive a restart of the broker itself (they live in memory), DUP
-//! retransmit to a clean-session subscriber, extended authentication, and TLS (terminate it in front and hand
+//! Deliberately deferred (documented, not built): a store written by the
+//! broker itself (sessions and retained messages live in memory; the server
+//! keeps them through `sessionStatesWith`/`retainedMessages`), and TLS (terminate it in front and hand
 //! `TcpServer` the plaintext, or drive the socket-free core over a TLS stream
 //! yourself). ⭐ Will / LWT was on this list until 2026-09-11 and is now built
 //! (3.1.2.5, 3.14.4), as is `publish` — a message the server itself originates
@@ -328,6 +329,8 @@ pub const Connection = struct {
     auth_connect: ?[]u8 = null,
     auth_final: ?[]u8 = null,
     ext_done: bool = false,
+    /// The username came from the hook (`ExtAuthResult.success_as`).
+    principal_set: bool = false,
     ext_state: [8]u64 = @splat(0),
     /// Clean-session connections only: QoS 1/2 messages that found the
     /// client's window (`client_receive_maximum`, `max_in_flight`) full, in
@@ -1074,8 +1077,11 @@ pub const ExtAuthRequest = struct {
     /// 64 zeroed bytes (8-aligned) that belong to the connection, for the
     /// hook's state between steps: a nonce, a counter, a stage. They live in
     /// the connection and need no cleanup -- they vanish with it. A hook that
-    /// needs more keeps its own table keyed by `client_id` and cleans it up
-    /// itself (the broker tells it nothing at connection end).
+    /// needs more keeps its own table and cleans it up itself (the broker
+    /// tells it nothing at connection end). ⚠ Do not key such a table by
+    /// `client_id`: the peer chooses it, a second connection can reuse
+    /// another's, and aborted exchanges leave entries behind. Key it by a
+    /// random token kept in `state`, and expire entries.
     state: *[8]u64,
 };
 
@@ -1084,6 +1090,17 @@ pub const ExtAuthResult = union(enum) {
     /// Authenticated. The optional data goes to the client (CONNACK
     /// Authentication Data at connect, AUTH 0x00 on re-authentication).
     success: ?[]const u8,
+    /// Authenticated *as* `principal`: the broker adopts it as the
+    /// connection's username (what `claimedByAnother`, session ownership,
+    /// `authorizeFn` and `authenticateFn` see; at most `max_username` bytes,
+    /// longer or empty is refused 0x87; a CONNECT username is then ignored).
+    /// ⚠ A hook that authenticates by token (bearer, Kerberos, JWT -- the
+    /// identity is in the Authentication Data, the CONNECT has no username)
+    /// MUST return this: with plain `.success` such clients all have no
+    /// username, and then any of them that knows another's client id resumes
+    /// or takes over that client's session. On re-authentication the
+    /// principal must equal the current one (else DISCONNECT 0x87).
+    success_as: struct { principal: []const u8, data: ?[]const u8 = null },
     /// Send AUTH 0x18 with this data and wait for the client's AUTH.
     continue_auth: ?[]const u8,
     /// Refused: CONNACK 0x87 at connect, DISCONNECT 0x87 afterwards.
@@ -1371,10 +1388,18 @@ pub const Config = struct {
     /// denial skips that delivery and counts in `aclDeliveryDenials()`. For a
     /// subscriber holding `#` against a deny rule on `private/#`. Off by
     /// default (the SUBSCRIBE-time check alone). ⚠ Cost: one hook call per
-    /// delivery, made while the broker's registry lock is held (the SUBSCRIBE
-    /// check already is), so the hook must be fast and must not call back
-    /// into the broker. A Shared Subscription that picks a denied member
-    /// loses the message rather than trying the next member.
+    /// delivery -- and one more when a persistent session's queue is pumped
+    /// (permissions revoked while it was offline are honoured).
+    /// ⚠⚠ Unlike `onPublishFn` and the PUBLISH-time `authorizeFn`, this hook
+    /// runs while the broker's registry lock is held (the SUBSCRIBE-time
+    /// check already did). It must be fast and MUST NOT call back into the
+    /// broker: `Broker.publish` from inside deadlocks. A hook that doubles as
+    /// the PUBLISH-time `authorizeFn` and calls the broker must not be used
+    /// with this flag. A Shared Subscription passes over a denied member to
+    /// the next in rotation; only when every member is denied is the message
+    /// not delivered. Retained messages sent at SUBSCRIBE are checked, but
+    /// are written straight to the connection and may overtake messages
+    /// waiting in a clean-session connection's queue.
     acl_check_delivery: bool = false,
     /// Intended `$SYS` period (ms), mosquitto.conf `sys_interval` (which is
     /// in seconds there). `publishSys` publishes only when at least this much
@@ -1516,6 +1541,9 @@ pub const Broker = struct {
     /// Highest number of simultaneously connected clients seen at a CONNECT
     /// or a `publishSys`. Guarded by `mutex`.
     clients_peak: usize = 0,
+    /// Set only while `restoreRetained` stores an item: the stored-at time to
+    /// stamp. Guarded by `mutex`.
+    restore_stored_ms: ?i64 = null,
     /// `publishSys`: the first and the latest caller time it saw (ms).
     /// Guarded by `mutex`.
     sys_first_ms: ?i64 = null,
@@ -1879,6 +1907,9 @@ pub const Broker = struct {
     /// stored. No ACL and no tap, as for `publish`; nothing is delivered
     /// (there is no subscriber yet).
     pub fn restoreRetained(b: *Broker, items: []const RetainedState, now: i64) RestoreError!void {
+        // A broker without a retained store (`retain_available = false`) has
+        // nothing to restore them into.
+        if (items.len > 0 and !b.config.retain_available) return error.InvalidMessage;
         for (items) |it| {
             topic.validateName(it.topic) catch return error.InvalidMessage;
             if (it.payload.len == 0) return error.InvalidMessage;
@@ -1890,6 +1921,12 @@ pub const Broker = struct {
         b.now_hint = @max(b.now_hint, now);
         for (items) |it| {
             const props = packet.decodePropertyEntries(it.props, .publish) catch unreachable;
+            // The age carries over through `restore_stored_ms`, which
+            // `storeRetained` stamps instead of the clock (no second scan of
+            // the store per item). The store itself is still a flat list: a
+            // restore of n items costs O(n^2), under the registry lock.
+            b.restore_stored_ms = now - @as(i64, @intCast(@min(it.age_ms, std.math.maxInt(i62))));
+            defer b.restore_stored_ms = null;
             b.storeRetained(.{
                 .topic = it.topic,
                 .payload = it.payload,
@@ -1897,9 +1934,6 @@ pub const Broker = struct {
                 .expires_at = if (it.expires_in_ms) |e| now + @as(i64, @intCast(@min(e, std.math.maxInt(i62)))) else null,
                 .retain = true,
             }, it.qos) catch return error.OutOfMemory;
-            for (b.retained.items) |*r| {
-                if (std.mem.eql(u8, r.topic, it.topic)) r.stored_ms = now - @as(i64, @intCast(@min(it.age_ms, std.math.maxInt(i62))));
-            }
         }
     }
 
@@ -1997,8 +2031,13 @@ pub const Broker = struct {
             if (m.packet_id == 0 or m.qos == .at_most_once) return error.InvalidMessage;
             for (opts.inflight_messages[0..i]) |o| if (o.packet_id == m.packet_id) return error.InvalidMessage;
         }
+        for (opts.inbound_qos2, 0..) |id, i| {
+            if (id == 0) return error.InvalidMessage;
+            for (opts.inbound_qos2[0..i]) |o| if (o == id) return error.InvalidMessage;
+        }
         for ([_][]const MessageState{ opts.inflight_messages, opts.queued_messages }) |list| {
             for (list) |m| {
+                for (m.sub_ids) |sid| if (sid == 0 or sid > packet.max_remaining_length) return error.InvalidMessage;
                 topic.validateName(m.topic) catch return error.InvalidMessage;
                 if (@intFromEnum(m.qos) > @intFromEnum(b.config.maximum_qos)) return error.InvalidMessage;
                 _ = packet.decodePropertyEntries(m.props, .publish) catch return error.InvalidMessage;
@@ -2071,7 +2110,11 @@ pub const Broker = struct {
         }
         for (opts.inbound_qos2) |id| x.inbound_qos2.appendAssumeCapacity(id);
         for (opts.queued_messages) |ms| {
-            const m = try b.buildMessage(ms, now);
+            var m = try b.buildMessage(ms, now);
+            // Never sent: no id yet, nothing acknowledged (a stored
+            // `released` would make the next resume send a PUBREL for it).
+            m.released = false;
+            m.id = 0;
             if (x.queuedLen() >= b.config.max_queued_messages or
                 x.queued_bytes + m.bytes.len > b.config.max_queued_bytes)
             {
@@ -2274,7 +2317,10 @@ pub const Broker = struct {
         if (conn.eq) |q| b.freeSession(q);
         conn.eq = null;
         if (conn.auth_method) |m| b.allocator.free(m);
-        if (conn.auth_connect) |m| b.allocator.free(m);
+        if (conn.auth_connect) |m| {
+            std.crypto.secureZero(u8, m); // a copy of the CONNECT: it holds the password
+            b.allocator.free(m);
+        }
         if (conn.auth_final) |m| b.allocator.free(m);
         conn.auth_method = null;
         conn.auth_connect = null;
@@ -2529,7 +2575,9 @@ pub const Broker = struct {
             const interval = b.config.sys_interval_ms;
             if (interval == 0) return 0;
             if (b.sys_last_ms) |last| {
-                if (now - last < @as(i64, @intCast(@min(interval, std.math.maxInt(i64))))) return 0;
+                // `now < last`: the caller's clock stepped back; publish
+                // rather than wait for it to catch up.
+                if (now >= last and now - last < @as(i64, @intCast(@min(interval, std.math.maxInt(i64))))) return 0;
             }
             b.sys_last_ms = now;
 
@@ -2960,14 +3008,14 @@ pub const Broker = struct {
         // would then admit this client as anonymous instead of rejecting a
         // credential it can't record. Refuse explicitly, same as an
         // oversized client id above.
-        if (c.username) |uname| {
+        if (c.username) |uname| if (!conn.principal_set) {
             if (uname.len > conn.username_buf.len) {
                 return b.refuseConnect(conn, .bad_username_or_password, .bad_user_name_or_password);
             }
             @memcpy(conn.username_buf[0..uname.len], uname);
             conn.username_len = uname.len;
             conn.has_username = true;
-        }
+        };
 
         // Extended authentication (4.12), before the username/password hook.
         // The exchange may take several packets, and this CONNECT's slices
@@ -2975,11 +3023,21 @@ pub const Broker = struct {
         // owned copy of its bytes and run the whole function again from them
         // once the hook says `.success` (`ext_done`).
         if (v5 and !conn.ext_done) if (c.properties.authentication_method) |method| {
+            if (method.len == 0) return error.ProtocolViolation; // 3.15.2.2.2: a method name
             const raw = try b.allocator.dupe(u8, conn.rx_buf[0..conn.rx_consumed]);
-            errdefer b.allocator.free(raw);
-            const m = try b.allocator.dupe(u8, method);
+            // ⛔ No errdefer on `raw`: once the connection owns it (below),
+            // any error out of `extAuthStep` -- which may already have freed
+            // it -- must not free it again (review H1).
+            const m = b.allocator.dupe(u8, method) catch |e| {
+                std.crypto.secureZero(u8, raw);
+                b.allocator.free(raw);
+                return e;
+            };
             if (conn.auth_method) |old| b.allocator.free(old);
-            if (conn.auth_connect) |old| b.allocator.free(old);
+            if (conn.auth_connect) |old| {
+                std.crypto.secureZero(u8, old);
+                b.allocator.free(old);
+            }
             conn.auth_method = m;
             conn.auth_connect = raw;
             conn.auth_state = .connecting;
@@ -3023,6 +3081,14 @@ pub const Broker = struct {
             // client id for a fault that is in its will topic. §3.1.4-1 wants
             // the connection closed for a CONNECT that fails validation.
             topic.validateName(w.topic) catch return error.ProtocolViolation;
+            // 3.1.2.7: a Will with RETAIN where retained messages are not
+            // available is refused (0x9A under 5.0; 3.1.1 has no better code
+            // than 'not authorized'). A Will onto `$SYS/` is refused like
+            // a client's PUBLISH there.
+            if (w.retain and !b.config.retain_available) {
+                return b.refuseConnect(conn, .not_authorized, .retain_not_supported);
+            }
+            if (isSysTopic(w.topic)) return b.refuseConnect(conn, .not_authorized, .not_authorized);
             // The Will is published for this client later, so it needs the
             // right to publish there now (see `Config.authorizeFn`).
             if (!b.aclAllows(conn, w.topic, .publish, w.retain)) {
@@ -3190,8 +3256,26 @@ pub const Broker = struct {
                 try b.writeAuth(conn, .continue_authentication, d);
                 return .keep;
             },
-            .success => |d| {
+            .success, .success_as => {
+                const d: ?[]const u8 = switch (verdict) {
+                    .success => |x| x,
+                    .success_as => |x| x.data,
+                    else => unreachable,
+                };
                 conn.auth_state = .none;
+                if (verdict == .success_as) {
+                    const pr = verdict.success_as.principal;
+                    if (connecting) {
+                        if (pr.len == 0 or pr.len > conn.username_buf.len) return b.refuseConnect(conn, .not_authorized, .not_authorized);
+                        @memcpy(conn.username_buf[0..pr.len], pr);
+                        conn.username_len = pr.len;
+                        conn.has_username = true;
+                        conn.principal_set = true;
+                    } else if (!optEql(conn.usernameOpt(), pr)) {
+                        conn.close_reason = .not_authorized; // an identity cannot change
+                        return error.ProtocolViolation;
+                    }
+                }
                 if (!connecting) {
                     try b.writeAuth(conn, .success, d);
                     return .keep;
@@ -3202,7 +3286,10 @@ pub const Broker = struct {
                 // The CONNECT again, from its owned copy.
                 const raw = conn.auth_connect.?;
                 conn.auth_connect = null;
-                defer b.allocator.free(raw);
+                defer {
+                    std.crypto.secureZero(u8, raw); // it holds the password
+                    b.allocator.free(raw);
+                }
                 const dec = (packet.decodePacket(raw, .v5) catch return error.ProtocolViolation) orelse return error.ProtocolViolation;
                 if (dec.packet != .connect) return error.ProtocolViolation;
                 return b.handleConnect(conn, dec.packet.connect, now);
@@ -3214,10 +3301,15 @@ pub const Broker = struct {
         _ = b;
         conn.tx_lock.lock();
         defer conn.tx_lock.unlock();
-        try conn.write(try packet.encodePacket(conn.tx_buf, .v5, .{ .auth = .{
+        const pk = packet.Packet{ .auth = .{
             .reason_code = code,
             .properties = .{ .authentication_method = conn.auth_method, .authentication_data = data },
-        } }));
+        } };
+        // 3.1.2-24: never a packet over the client's Maximum Packet Size; an
+        // AUTH cannot lose its data, so the exchange fails instead.
+        const wire = try packet.packetWireLen(.v5, pk);
+        if (wire > conn.client_max_packet) return error.PayloadTooLarge;
+        try conn.write(try packet.encodePacket(conn.tx_buf, .v5, pk));
     }
 
     /// A client AUTH packet (3.15): the next step of the CONNECT exchange, or
@@ -3228,7 +3320,11 @@ pub const Broker = struct {
             conn.close_reason = .protocol_error;
             return error.ProtocolViolation;
         };
-        const method = a.properties.authentication_method orelse "";
+        // 3.15.2.2.2: an AUTH names its method.
+        const method = a.properties.authentication_method orelse {
+            conn.close_reason = .protocol_error;
+            return error.ProtocolViolation;
+        };
         if (b.config.extendedAuthFn == null or !std.mem.eql(u8, method, mine)) {
             conn.close_reason = .protocol_error;
             return error.ProtocolViolation;
@@ -3380,7 +3476,7 @@ pub const Broker = struct {
     fn retainedGone(b: *const Broker, r: Retained, now: i64) bool {
         if (r.expires_at) |at| return at <= now;
         const limit = b.config.retain_expiry_interval_ms;
-        if (limit == 0) return false;
+        if (limit == 0 or isSysTopic(r.topic)) return false; // `$SYS` is refreshed by publishSys
         return now - r.stored_ms >= @as(i64, @intCast(@min(limit, std.math.maxInt(i64))));
     }
 
@@ -3526,6 +3622,13 @@ pub const Broker = struct {
                         _ = b.messages_expired.fetchAdd(1, .monotonic);
                         continue;
                     };
+                    // Read access may have been revoked while it waited
+                    // (`Config.acl_check_delivery`; the hook runs under
+                    // `x.lock` here, with the same rules as under `mutex`).
+                    if (!b.deliveryAllowed(conn.clientId(), conn.usernameOpt(), m.topicName())) {
+                        b.allocator.free(m.bytes);
+                        continue;
+                    }
                     if (m.qos == .at_most_once) {
                         // A QoS 0 message kept for the offline session
                         // (`Config.queue_qos0_messages`): sent once, with no
@@ -3980,6 +4083,11 @@ pub const Broker = struct {
         // well-behaved (under 5.0 with 0x87 Not authorized).
         if (bad_format) {
             reason = .payload_format_invalid;
+        } else if (isSysTopic(topic_name)) {
+            // `$SYS/` is the broker's own: a client cannot write there
+            // (mosquitto drops it too) -- not retained, not delivered, and
+            // under 5.0 the ack says 0x87. Only `publish`/`publishSys` may.
+            reason = .not_authorized;
         } else if (b.aclAllows(conn, topic_name, .publish, pub_pkt.retain)) routed: {
             // Tap before delivery: what the broker took is a fact even if
             // fan-out then fails, and `fanout` can return an error. A refusal
@@ -4534,7 +4642,7 @@ pub const Broker = struct {
                 r.props = new_props;
                 r.qos = qos;
                 r.expires_at = msg.expires_at;
-                r.stored_ms = b.now_hint;
+                r.stored_ms = b.restore_stored_ms orelse b.now_hint;
                 return;
             }
         }
@@ -4551,7 +4659,7 @@ pub const Broker = struct {
         errdefer b.allocator.free(owned_payload);
         const owned_props = try b.ownedForward(msg.props);
         errdefer b.allocator.free(owned_props);
-        const r = Retained{ .topic = owned_topic, .payload = owned_payload, .qos = qos, .props = owned_props, .expires_at = msg.expires_at, .stored_ms = b.now_hint };
+        const r = Retained{ .topic = owned_topic, .payload = owned_payload, .qos = qos, .props = owned_props, .expires_at = msg.expires_at, .stored_ms = b.restore_stored_ms orelse b.now_hint };
         try b.retained.append(b.allocator, r);
         b.retained_bytes += r.bytes();
     }
@@ -4728,6 +4836,11 @@ fn forwardable(p: packet.Properties) packet.Properties {
         .correlation_data = p.correlation_data,
         .user_properties = p.user_properties,
     };
+}
+
+/// A topic in the broker's own `$SYS/` tree.
+fn isSysTopic(t: []const u8) bool {
+    return std.mem.startsWith(u8, t, "$SYS/");
 }
 
 fn minQos(a: QoS, b: QoS) QoS {
@@ -5676,7 +5789,7 @@ test "FIX A: trie fan-out routes wildcards to exactly the matching subscribers" 
     try expectDelivered(&t5, "sport/tennis/score"); // #: yes (non-$ topic)
 
     // $SYS/broker/uptime → only $SYS/# (C4). Leading-wildcard filters excluded.
-    _ = try feedPublish(&b, pconn, .{ .topic = "$SYS/broker/uptime", .payload = "1" });
+    try b.publish("$SYS/broker/uptime", "1", .at_most_once, false); // (a client may not publish there)
     try expectDelivered(&t4, "$SYS/broker/uptime");
     try testing.expectEqual(@as(?packet.Packet, null), try t1.next());
     try testing.expectEqual(@as(?packet.Packet, null), try t2.next());
@@ -9825,4 +9938,188 @@ test "extended auth with an empty client id: one id, seen by the hook and kept b
     try testing.expectEqualStrings(seen.buf[0..seen.len], conn.clientId());
     try testing.expectEqualStrings(conn.clientId(), ack.properties.assigned_client_identifier.?);
     try testing.expectEqual(@as(u64, 1), b.next_auto_id); // generated once
+}
+
+// ── review fixes (H1, M1-M3, L1, L6, L7, L9) ────────────────────────────────
+
+fn instantAuth(ctx: ?*anyopaque, req: ExtAuthRequest) ExtAuthResult {
+    _ = ctx;
+    _ = req;
+    return .{ .success = null };
+}
+
+test "review H1: a failed AUTH write after the CONNECT frees the saved copy once (double free on the old code)" {
+    var b = Broker.init(testing.allocator, .{ .extendedAuthFn = dummyExtAuth });
+    defer b.deinit();
+    var tt = TestTransport{ .fail = true };
+    const conn = try b.accept(tt.transport());
+    var buf: [128]u8 = undefined;
+    try b.feed(conn, try packet.encodePacket(&buf, .v5, .{ .connect = .{ .client_id = "e", .version = .v5, .properties = .{ .authentication_method = "DUMMY" } } }));
+    try testing.expectError(error.TransportFailed, b.process(conn, 0));
+    b.remove(conn);
+}
+
+test "review H1: hook success at CONNECT, then a failing second pass (wildcard Will) frees the saved copy once" {
+    var b = Broker.init(testing.allocator, .{ .extendedAuthFn = instantAuth });
+    defer b.deinit();
+    var tt = TestTransport{};
+    const conn = try b.accept(tt.transport());
+    var buf: [128]u8 = undefined;
+    try b.feed(conn, try packet.encodePacket(&buf, .v5, .{ .connect = .{
+        .client_id = "e",
+        .version = .v5,
+        .will = .{ .topic = "a/#", .message = "x" },
+        .properties = .{ .authentication_method = "M" },
+    } }));
+    try testing.expectError(error.ProtocolViolation, b.process(conn, 0));
+    b.remove(conn);
+}
+
+fn tokenAuth(ctx: ?*anyopaque, req: ExtAuthRequest) ExtAuthResult {
+    _ = ctx;
+    const d = req.data orelse return .deny;
+    if (std.mem.eql(u8, d, "alice-token")) return .{ .success_as = .{ .principal = "alice" } };
+    if (std.mem.eql(u8, d, "bob-token")) return .{ .success_as = .{ .principal = "bob" } };
+    return .deny;
+}
+
+fn connectToken(b: *Broker, tt: *TestTransport, token: []const u8) !*Connection {
+    const conn = try b.accept(tt.transport());
+    var buf: [128]u8 = undefined;
+    try b.feed(conn, try packet.encodePacket(&buf, .v5, .{ .connect = .{
+        .client_id = "X",
+        .version = .v5,
+        .clean_session = false,
+        .properties = .{ .authentication_method = "T", .authentication_data = token, .session_expiry_interval = 60 },
+    } }));
+    _ = try b.process(conn, 0);
+    return conn;
+}
+
+test "review M1: a principal from the hook owns the session; another token holder with the same client id is refused" {
+    var b = Broker.init(testing.allocator, .{ .extendedAuthFn = tokenAuth });
+    defer b.deinit();
+    var ta = TestTransport{};
+    const alice = try connectToken(&b, &ta, "alice-token");
+    try testing.expectEqual(packet.ReasonCode.success, (try next5(&ta)).?.connack.reason_code);
+    try testing.expectEqualStrings("alice", alice.usernameOpt().?);
+    b.remove(alice);
+
+    var tb = TestTransport{};
+    _ = try connectToken(&b, &tb, "bob-token");
+    try testing.expectEqual(packet.ReasonCode.not_authorized, (try next5(&tb)).?.connack.reason_code);
+
+    var ta2 = TestTransport{};
+    _ = try connectToken(&b, &ta2, "alice-token");
+    const again = (try next5(&ta2)).?.connack;
+    try testing.expect(again.session_present); // alice resumes her own
+}
+
+test "review M2: a Will with RETAIN is refused when retain_available = false; restoreRetained too" {
+    var b = Broker.init(testing.allocator, .{ .retain_available = false });
+    defer b.deinit();
+    var t1 = TestTransport{};
+    const c = try connect5(&b, &t1, .{ .client_id = "w", .will = .{ .topic = "w", .message = "x", .retain = true } }, 0);
+    try testing.expectEqual(packet.ReasonCode.retain_not_supported, c.connack.reason_code);
+    var t2 = TestTransport{};
+    try testing.expectError(error.Refused, connectRaw(&b, &t2, .{ .client_id = "w3", .will = .{ .topic = "w", .message = "x", .retain = true } }));
+    var t3 = TestTransport{};
+    const ok = try connect5(&b, &t3, .{ .client_id = "w2", .will = .{ .topic = "w", .message = "x" } }, 0);
+    try testing.expectEqual(packet.ReasonCode.success, ok.connack.reason_code);
+    try testing.expectError(error.InvalidMessage, b.restoreRetained(&.{.{ .topic = "a", .payload = "x", .qos = .at_most_once }}, 0));
+    try b.restoreRetained(&.{}, 0);
+}
+
+test "review M3: a client cannot publish (or leave a Will) under $SYS/; the server can" {
+    var b = Broker.init(testing.allocator, .{});
+    defer b.deinit();
+    var ts = TestTransport{};
+    const s = try connectClient(&b, &ts, "S", 60, 0);
+    try feedSubscribe(&b, s, 1, &.{.{ .filter = "$SYS/#" }});
+    _ = (try ts.next()).?;
+    var tp = TestTransport{};
+    const p = try connect5(&b, &tp, .{ .client_id = "P" }, 0);
+    _ = try send5(&b, p.conn, .{ .publish = .{ .topic = "$SYS/broker/clients/connected", .payload = "99", .qos = .at_least_once, .packet_id = 1, .retain = true } }, 1);
+    try testing.expectEqual(packet.ReasonCode.not_authorized, (try next5(&tp)).?.puback.reason_code);
+    _ = try send5(&b, p.conn, .{ .publish = .{ .topic = "$SYS/broker/x", .payload = "1" } }, 1);
+    try testing.expectEqual(@as(?packet.Packet, null), try ts.next());
+    try testing.expectEqual(@as(usize, 0), b.retained.items.len);
+
+    var t3 = TestTransport{};
+    const w = try connect5(&b, &t3, .{ .client_id = "W", .will = .{ .topic = "$SYS/broker/will", .message = "x" } }, 0);
+    try testing.expectEqual(packet.ReasonCode.not_authorized, w.connack.reason_code);
+
+    try b.publish("$SYS/broker/x", "1", .at_most_once, false);
+    try testing.expectEqualStrings("$SYS/broker/x", (try ts.next()).?.publish.topic);
+}
+
+test "review L1: restored queued messages lose released/packet_id; sub ids and inbound ids are validated" {
+    var b = Broker.init(testing.allocator, .{});
+    defer b.deinit();
+    const bad_sid: []const Broker.MessageState = &.{.{ .topic = "t", .payload = "m", .qos = .at_most_once, .sub_ids = &.{0} }};
+    try testing.expectError(error.InvalidMessage, b.restoreSessionWith("S", null, &.{}, 0, .{ .queued_messages = bad_sid }));
+    try testing.expectError(error.InvalidMessage, b.restoreSessionWith("S", null, &.{}, 0, .{ .inbound_qos2 = &.{ 3, 3 } }));
+    try testing.expectError(error.InvalidMessage, b.restoreSessionWith("S", null, &.{}, 0, .{ .inbound_qos2 = &.{0} }));
+
+    const q: []const Broker.MessageState = &.{.{ .topic = "t", .payload = "m", .qos = .exactly_once, .packet_id = 5, .released = true }};
+    try b.restoreSessionWith("S", null, &.{.{ .filter = "t", .qos = .exactly_once }}, 0, .{ .queued_messages = q });
+    var t1 = TestTransport{};
+    const back = try connect5(&b, &t1, .{ .client_id = "S", .clean_session = false, .properties = .{ .session_expiry_interval = 60 } }, 1);
+    try testing.expect(back.connack.session_present);
+    const m = (try next5(&t1)).?.publish; // a PUBLISH, not a PUBREL
+    try testing.expectEqualStrings("m", m.payload);
+    try testing.expect(!back.conn.session.?.inflight.items[0].released);
+}
+
+test "review L7: an empty Authentication Method is refused; an AUTH of ours never exceeds the client's Maximum Packet Size" {
+    var b = Broker.init(testing.allocator, .{ .extendedAuthFn = dummyExtAuth });
+    defer b.deinit();
+    var t1 = TestTransport{};
+    const c1 = try b.accept(t1.transport());
+    var buf: [128]u8 = undefined;
+    try b.feed(c1, try packet.encodePacket(&buf, .v5, .{ .connect = .{ .client_id = "e", .version = .v5, .properties = .{ .authentication_method = "" } } }));
+    try testing.expectError(error.ProtocolViolation, b.process(c1, 0));
+
+    var t2 = TestTransport{};
+    const c2 = try b.accept(t2.transport());
+    try b.feed(c2, try packet.encodePacket(&buf, .v5, .{ .connect = .{ .client_id = "e2", .version = .v5, .properties = .{ .authentication_method = "DUMMY", .maximum_packet_size = 10 } } }));
+    try testing.expectError(error.PayloadTooLarge, b.process(c2, 0));
+    try testing.expectEqual(@as(usize, 0), t2.len); // nothing was written
+}
+
+const AclToggle = struct { deny: bool = false };
+
+fn toggleAcl(ctx: ?*anyopaque, req: AclRequest) bool {
+    const t: *AclToggle = @ptrCast(@alignCast(ctx.?));
+    return !(t.deny and req.operation == .subscribe and std.mem.eql(u8, req.topic, "t"));
+}
+
+test "review L9: the delivery ACL is checked again when a persistent session's queue is pumped after a resume" {
+    var toggle = AclToggle{};
+    var b = Broker.init(testing.allocator, .{ .authorizeFn = toggleAcl, .acl_ctx = &toggle, .acl_check_delivery = true });
+    defer b.deinit();
+    var t1 = TestTransport{};
+    const s = try connectSession(&b, &t1, "S", false, 0);
+    try feedSubscribe(&b, s.conn, 1, &.{.{ .filter = "t", .qos = .at_least_once }});
+    _ = (try t1.next()).?;
+    try feedDisconnect(&b, s.conn);
+    b.remove(s.conn);
+    try b.publish("t", "m", .at_least_once, false);
+    try testing.expectEqual(@as(?usize, 1), b.sessionQueued("S"));
+    toggle.deny = true; // revoked while offline
+    var t2 = TestTransport{};
+    _ = try connectSession(&b, &t2, "S", false, 10);
+    try testing.expectEqual(@as(?packet.Packet, null), try t2.next());
+    try testing.expectEqual(@as(u64, 1), b.aclDeliveryDenials());
+    try testing.expectEqual(@as(?usize, 0), b.sessionQueued("S"));
+}
+
+test "review L6: publishSys survives a clock step back, and its retained topics do not age out" {
+    var b = Broker.init(testing.allocator, .{ .sys_interval_ms = 1000, .retain_expiry_interval_ms = 100 });
+    defer b.deinit();
+    try testing.expectEqual(@as(usize, 16), b.publishSys(10_000));
+    try testing.expectEqual(@as(usize, 16), b.publishSys(5_000)); // the clock went back
+    _ = b.expireSessions(50_000);
+    try testing.expectEqual(@as(usize, 16), b.retained.items.len);
+    try testing.expectEqual(@as(u64, 0), b.messagesExpired());
 }

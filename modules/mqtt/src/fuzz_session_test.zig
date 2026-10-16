@@ -19,7 +19,9 @@
 //!   method, PUBLISH at every QoS with and without RETAIN and a Payload
 //!   Format, SUBSCRIBE, UNSUBSCRIBE, acks for ids that may not exist,
 //!   PINGREQ, DISCONNECT, raw damaged bytes), plus a second, never-acking
-//!   QoS 1 subscriber so fan-out and the per-connection queue work. Invariants:
+//!   QoS 1 subscriber so fan-out and the per-connection queue work; the
+//!   CONNECT may carry a Will (wildcard, `$SYS`, retained), and the client's
+//!   transport may start failing after a few bytes. Invariants:
 //!   no panic, every `process` ends in a value or an error, the broker tears
 //!   both connections down and `deinit` frees everything (`testing.allocator`
 //!   reports a leak as a failure).
@@ -173,11 +175,15 @@ const SessMark = Marker(enum {
 
 const Sink = struct {
     bytes: usize = 0,
+    /// Fail every write once this many bytes went out (a client that
+    /// vanishes mid-exchange); null = never.
+    fail_after: ?usize = null,
     fn transport(s: *Sink) mqtt.broker.Transport {
         return .{ .ctx = s, .writeFn = writeFn };
     }
     fn writeFn(ctx: *anyopaque, b: []const u8) mqtt.broker.TransportError!void {
         const s: *Sink = @ptrCast(@alignCast(ctx));
+        if (s.fail_after) |limit| if (s.bytes >= limit) return error.TransportFailed;
         s.bytes += b.len;
     }
 };
@@ -199,6 +205,8 @@ fn extAuth(_: ?*anyopaque, req: mqtt.broker.ExtAuthRequest) mqtt.broker.ExtAuthR
 fn denySecret(_: ?*anyopaque, req: mqtt.broker.AclRequest) bool {
     return !std.mem.startsWith(u8, req.topic, "secret/");
 }
+
+const will_topics = [_][]const u8{ "w/x", "w/#", "w/+/y", "$SYS/forged", "" };
 
 fn sessionSmith(_: void, s: *testing.Smith) !void {
     return fuzzSession(testing.Smith, s, testing.allocator);
@@ -243,7 +251,7 @@ fn fuzzSession(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void 
         _ = try broker.process(slow, 0);
     }
 
-    var sink: Sink = .{};
+    var sink: Sink = .{ .fail_after = if (k.ranged(0, 3) == 0) k.ranged(0, 64) else null };
     const conn = try broker.accept(sink.transport());
     defer broker.remove(conn);
 
@@ -262,6 +270,12 @@ fn fuzzSession(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void 
             .keep_alive_s = @intCast(k.ranged(0, 60)),
             .username = if (k.byte() & 1 == 0) "u" else null,
             .password = if (k.byte() & 1 == 0) "p" else null,
+            .will = if (k.ranged(0, 2) == 0) .{
+                .topic = will_topics[k.ranged(0, will_topics.len - 1)],
+                .message = "gone",
+                .qos = @enumFromInt(k.ranged(0, 2)),
+                .retain = k.byte() & 1 == 0,
+            } else null,
             .properties = if (k.byte() & 1 == 0) .{
                 .authentication_method = methods[k.ranged(0, 1)],
                 .authentication_data = if (k.byte() & 1 == 0) data[0..k.ranged(0, 8)] else null,

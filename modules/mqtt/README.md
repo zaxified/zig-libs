@@ -175,11 +175,14 @@ transport-agnostic client and a broker, all fully offline-testable.
     keeps the message alive instead of acknowledging one it lost. Null by
     default = accept everything.
 
-    **Deliberately deferred (documented, not built):** sessions persisted by
-    the broker itself, DUP retransmit to a clean-session subscriber, 5.0
-    extended authentication in the broker, outbound Topic Aliases from the
-    broker, `$SYS` topics, bridging, and TLS (terminate in front and hand
-    `TcpServer` plaintext, or drive the socket-free core over a TLS stream).
+    **Since 2026-10-17 (S2 parity, see SPEC.md "S2 parity"):** extended
+    authentication, `$SYS`, a persistence seam for retained messages and session
+    bodies, operator limits, Payload Format checks and Reason Strings, a
+    per-connection queue for clean-session subscribers, `acl` (Mosquitto
+    acl/password files), `bridge`, and in the client `reconnect` + an outbox
+    that resumes in-flight QoS 1/2 messages. TLS stays a transport the caller
+    supplies: a tested recipe over `tlsclient` (client) and the `websocket`
+    module (WebSocket); a TLS listener in `TcpServer` is Backlog.
 
 ```zig
 const mqtt = @import("mqtt");
