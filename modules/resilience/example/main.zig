@@ -55,7 +55,7 @@ pub fn main() !void {
     // upstream would have had a chance to recover on its own.
     var doomed: FlakyUpstream = .{ .remaining_failures = 10 };
     const result = resilience.run(&doomed, .{
-        .breaker = &breaker,
+        .breaker = breaker.handle(),
         .retry = .{ .max_attempts = 3, .base_delay_ms = 1, .jitter = .none },
         .delay = .none, // don't actually sleep in an example
     });
@@ -77,7 +77,7 @@ pub fn main() !void {
     // invoking the operation — `error.CircuitOpen` is resilience's own
     // error, distinct from the operation's error set.
     var untouched: FlakyUpstream = .{ .remaining_failures = 0 };
-    const denied = resilience.run(&untouched, .{ .breaker = &breaker, .delay = .none });
+    const denied = resilience.run(&untouched, .{ .breaker = breaker.handle(), .delay = .none });
     if (denied) |status| {
         std.debug.print("call unexpectedly succeeded, status={d}\n", .{status});
     } else |err| switch (err) {
