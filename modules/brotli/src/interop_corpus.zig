@@ -740,6 +740,7 @@ pub const Encoding = struct {
     effort: []const u8,
     window_bits: ?u5 = null,
     block_size: usize = brotli.CompressOptions.default_block_size,
+    mode: brotli.Mode = .generic,
     /// Through a `StreamWriter` (written in pieces of 4 093 bytes), with a
     /// flush after each of these input offsets that the input reaches.
     /// Null: `compressWith`.
@@ -775,6 +776,13 @@ pub const encodings = [_]Encoding{
     // before; a first block of 3 000 bytes in a table sized for the stream
     // takes `.q0`'s odd-power table (2^13), as a one-shot input never does.
     .{ .tag = "stream_q0", .effort = "q0", .window_bits = 22, .flushes = &.{ 3_000, 20_000, 120_000 }, .shapes = &.{ "alice_full", "lengths" } },
+    // `.font`: NPOSTFIX 1 / NDIRECT 12 from `.q4` (google's font mode),
+    // `.q11`'s search started there; the stream one through block cuts.
+    .{ .tag = "font_q4", .effort = "q4", .mode = .font, .shapes = &.{ "font_like", "alice_full", "random_70000" } },
+    .{ .tag = "font_q6", .effort = "q6", .mode = .font, .shapes = &.{ "font_like", "alice_full", "random_70000" } },
+    .{ .tag = "font_q9", .effort = "q9", .mode = .font, .shapes = &.{ "font_like", "alice_full" } },
+    .{ .tag = "font_q11", .effort = "q11", .mode = .font, .shapes = &.{ "font_like", "alice_full" } },
+    .{ .tag = "stream_font_q6", .effort = "q6", .mode = .font, .window_bits = 16, .block_size = 40_000, .flushes = &.{12_345}, .shapes = &.{ "font_like", "alice_full" } },
     .{ .tag = "stream_metadata", .effort = "q6", .window_bits = 22, .flushes = &.{}, .metadata_at = &.{ 0, 5_000, 5_000 }, .shapes = &.{ "empty", "alice_full" } },
 };
 
@@ -782,11 +790,11 @@ pub const encodings = [_]Encoding{
 pub fn encode(gpa: std.mem.Allocator, input: []const u8, e: Encoding) ![]u8 {
     const effort = std.meta.stringToEnum(brotli.Effort, e.effort).?;
     const flushes = e.flushes orelse
-        return brotli.compressWith(gpa, input, .{ .effort = effort, .window_bits = e.window_bits, .block_size = e.block_size });
+        return brotli.compressWith(gpa, input, .{ .effort = effort, .window_bits = e.window_bits, .block_size = e.block_size, .mode = e.mode });
     var out: std.Io.Writer.Allocating = .init(gpa);
     errdefer out.deinit();
     var buf: [4093]u8 = undefined;
-    var sw: brotli.StreamWriter = try .init(gpa, &out.writer, &buf, .{ .effort = effort, .window_bits = e.window_bits.?, .block_size = e.block_size });
+    var sw: brotli.StreamWriter = try .init(gpa, &out.writer, &buf, .{ .effort = effort, .window_bits = e.window_bits.?, .block_size = e.block_size, .mode = e.mode });
     defer sw.deinit();
     const meta: [300]u8 = @splat('m');
     var i: usize = 0;

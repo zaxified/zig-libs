@@ -56,6 +56,8 @@ pub const StreamOptions = struct {
     /// As `CompressOptions.prepared_dictionary`: not copied, it must outlive
     /// the stream. Not both.
     prepared_dictionary: ?*const PreparedDictionary = null,
+    /// As `CompressOptions.mode`.
+    mode: encoder.Mode = .generic,
 
     fn tableSize(o: StreamOptions) usize {
         return encoder.tableSize(o.size_hint orelse @as(usize, 1) << o.window_bits, o.window_bits);
@@ -146,6 +148,7 @@ pub const StreamWriter = struct {
         sw.done = 0;
         sw.core.setData(sw.hist.items);
         sw.core.size_hint = o.size_hint orelse 0;
+        sw.core.mode = o.mode;
         try sw.core.writeHeader();
     }
 

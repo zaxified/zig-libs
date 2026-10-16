@@ -46,7 +46,8 @@
 //!
 //! ## What it deliberately does not do
 //!
-//! - No `NPOSTFIX`/`NDIRECT` below `.q11`, no OMIT_FIRST dictionary
+//! - No `NPOSTFIX`/`NDIRECT` search below `.q11` (only `Mode.font`'s fixed
+//!   pair, as google/brotli), no OMIT_FIRST dictionary
 //!   transforms, no dictionary words at `.q6` (5–10 % of its time for
 //!   0.25–0.7 % of size on text, 2026-10-15).
 //!
@@ -3058,6 +3059,8 @@ fn buildCommandsOptimal(
     max_dist: usize,
     ring0: DistRing,
     n_dist: usize,
+    /// The mode's NPOSTFIX/NDIRECT (`Mode`), the block writer's other start.
+    orig_dist: DistParams,
     dsearch: *const DictSearch,
     parses: *[max_parses]std.ArrayListUnmanaged(Cmd),
 ) std.mem.Allocator.Error!void {
@@ -3173,7 +3176,7 @@ fn buildCommandsOptimal(
         // Distances priced with the NPOSTFIX/NDIRECT the block writer would
         // choose for the commands before (Ethiopic font −0.4 %).
         if (n_dist == dist_alphabet_size) {
-            const dp = chooseDistParams(prev, ring0);
+            const dp = chooseDistParams(prev, ring0, orig_dist);
             da = .{ .p = dp, .n = dp.alphabet() };
         }
         try fitCosts(tmp, costs, prev, ring0, da, model);
@@ -5480,15 +5483,19 @@ fn distParamsCost(cmds: []const Cmd, ring0: DistRing, p: DistParams) ?f64 {
 
 /// NPOSTFIX and NDIRECT for a meta-block of `cmds` (google
 /// `BrotliBuildMetaBlock`'s search at qualities 10 and 11): for each
-/// NPOSTFIX, NDIRECT grows while the distances' estimated bits fall.
-fn chooseDistParams(cmds: []const Cmd, ring0: DistRing) DistParams {
+/// NPOSTFIX, NDIRECT grows while the distances' estimated bits fall; `orig`
+/// (the mode's pair, `Mode`) is tried too when the walk did not reach it,
+/// and kept when it is cheaper.
+fn chooseDistParams(cmds: []const Cmd, ring0: DistRing, orig: DistParams) DistParams {
     var best: DistParams = .{};
     var best_cost = distParamsCost(cmds, ring0, best) orelse return best;
+    var check_orig = orig.npostfix != 0 or orig.ndirect != 0;
     var msb: u32 = 0;
     var np: u32 = 0;
     while (np <= 3) : (np += 1) {
         while (msb < 16) : (msb += 1) {
             const p: DistParams = .{ .npostfix = @intCast(np), .ndirect = @intCast(msb << @intCast(np)) };
+            if (p.npostfix == orig.npostfix and p.ndirect == orig.ndirect) check_orig = false;
             const cost = distParamsCost(cmds, ring0, p) orelse break;
             if (cost > best_cost) break;
             best_cost = cost;
@@ -5496,6 +5503,11 @@ fn chooseDistParams(cmds: []const Cmd, ring0: DistRing) DistParams {
         }
         if (msb > 0) msb -= 1;
         msb /= 2;
+    }
+    if (check_orig) {
+        if (distParamsCost(cmds, ring0, orig)) |cost| {
+            if (cost < best_cost) best = orig;
+        }
     }
     return best;
 }
@@ -5677,9 +5689,23 @@ pub const CompressOptions = struct {
     /// number of compressions: the same bytes as passing its `source` as
     /// `dictionary`. Not both.
     prepared_dictionary: ?*const PreparedDictionary = null,
+    /// What the input is (google/brotli's `BROTLI_PARAM_MODE`).
+    mode: Mode = .generic,
 
     pub const default_block_size = compressed_block_size;
 };
+
+/// google/brotli's `BrotliEncoderMode`, with its effect: `.font` (WOFF 2.0
+/// font data) writes every meta-block from `.q4` up with NPOSTFIX 1 and
+/// NDIRECT 12 (`ChooseDistanceParams`: font tables' offsets are even, and
+/// short ones repeat), and `.q11` starts its NPOSTFIX/NDIRECT search from
+/// that pair; `.text` is a declaration only, as there (the context model
+/// is chosen per block by cost either way). Below `.q4`, and with a large
+/// window, the mode changes nothing.
+pub const Mode = enum { generic, text, font };
+
+/// The NPOSTFIX/NDIRECT google/brotli's font mode writes.
+const font_dist: DistParams = .{ .npostfix = 1, .ndirect = 12 };
 
 /// RFC 7932 §9.1: WBITS 10..24; above, to `max_large_window_bits`, a
 /// large-window stream (RFC 9841 §6) — which only a decoder asked for one
@@ -5754,9 +5780,8 @@ pub const Compressor = struct {
     /// `compressWith(gpa, input, opts)`. Caller owns the result: a copy
     /// of the stream, the buffer it grew in kept for the next call (a
     /// buffer grown anew each call walks the allocator's size classes, and
-    /// Zig 0.16's `smp_allocator` leaks on that walk — std defect: about 2
-    /// KB for every `ArrayList` grown to a few KB and freed, one thread,
-    /// 2026-10-16; see `Core.temp`).
+    /// Zig 0.16's `smp_allocator` can grow without bound on such walks —
+    /// std defect, ziglang/zig #36969; see `Core.temp`).
     pub fn compress(c: *Compressor, input: []const u8, opts: CompressOptions) std.mem.Allocator.Error![]u8 {
         const core = try c.ready(input.len, opts);
         try oneShot(core, input, opts);
@@ -5826,6 +5851,7 @@ fn oneShot(core: *Core, input: []const u8, opts: CompressOptions) std.mem.Alloca
         } else core.dict_len = opts.dictionary.len;
     }
     core.size_hint = input.len;
+    core.mode = opts.mode;
     core.setData(input);
     try core.writeHeader();
     var off: usize = 0;
@@ -5880,6 +5906,8 @@ pub const Core = struct {
     /// (`greedy_split.chooseStaticContexts`). One-shot: the input; a stream:
     /// `StreamOptions.size_hint`, else 0.
     size_hint: usize = 0,
+    /// `CompressOptions.mode` / `StreamOptions.mode`.
+    mode: Mode = .generic,
     /// The prefix dictionary's length (`attachDictionary`), 0 without:
     /// static-dictionary words count past it, at every level.
     dict_len: usize = 0,
@@ -5983,6 +6011,11 @@ pub const Core = struct {
     /// three times what is needed), and the buffers a block is written
     /// with. For many small compressions, where a fresh table costs more
     /// than compressing (`Compressor`, R16).
+    /// NPOSTFIX/NDIRECT the mode asks for (`Mode`).
+    fn origDist(c: *const Core) DistParams {
+        return if (c.mode == .font) font_dist else .{};
+    }
+
     pub fn reinit(c: *Core, effort: Effort, block_size: usize, wbits: u5, size: usize, size_hint: usize) std.mem.Allocator.Error!void {
         const gpa = c.gpa;
         const need = tableLen(effort, kindFor(effort, wbits, size_hint), size);
@@ -6189,9 +6222,9 @@ pub const Core = struct {
                 if (c.dict_search == null) c.dict_search = try DictSearch.init(gpa);
                 switch (c.matcher.deep.tagsPay(c.data[off..end])) {
                     inline else => |tagged| if (c.searching())
-                        try buildCommandsOptimal(true, tagged, gpa, c.tempAlloc(), &c.matcher.deep, off, end, max_dist, c.ring, n_dist, &c.dict_search.?, &c.parses)
+                        try buildCommandsOptimal(true, tagged, gpa, c.tempAlloc(), &c.matcher.deep, off, end, max_dist, c.ring, n_dist, c.origDist(), &c.dict_search.?, &c.parses)
                     else
-                        try buildCommandsOptimal(false, tagged, gpa, c.tempAlloc(), &c.matcher.deep, off, end, max_dist, c.ring, n_dist, &c.dict_search.?, &c.parses),
+                        try buildCommandsOptimal(false, tagged, gpa, c.tempAlloc(), &c.matcher.deep, off, end, max_dist, c.ring, n_dist, c.origDist(), &c.dict_search.?, &c.parses),
                 }
                 // The shortest as written wins: the estimate the parses were
                 // priced by is not the code that comes out.
@@ -6304,7 +6337,9 @@ pub const Core = struct {
             ring.* = c.frag.ring;
             return true;
         }
-        if (c.effort == .q11 and !env.large_window) env.dist = chooseDistParams(c.cmds.items, c.ring);
+        if (!env.large_window) {
+            env.dist = if (c.effort == .q11) chooseDistParams(c.cmds.items, c.ring, c.origDist()) else c.origDist();
+        }
         const first = (try tryBlock(c.tempAlloc(), dst, out, off, end, c.cmds.items, is_last, &trial, c.effort, false, env)) orelse return false;
         // The context model was chosen on estimated bits. When it split the
         // literals, write the block once more with a single literal code and
@@ -7361,10 +7396,62 @@ test "chooseDistParams: NDIRECT's search halves where it starts for each NPOSTFI
     // `BrotliBuildMetaBlock`). Started from that best itself it ends at 120.
     var cmds: [200]Cmd = undefined;
     for (&cmds, 0..) |*c, k| c.* = .{ .insert_len = 1, .copy_len = @intCast(4 + k % 8), .dist = @intCast(8 * (1 + (k * 2654435761) % 4000)) };
-    const p = chooseDistParams(&cmds, .{});
+    const p = chooseDistParams(&cmds, .{}, .{});
     try testing.expectEqual(@as(u2, 3), p.npostfix);
     try testing.expectEqual(@as(u8, 72), p.ndirect);
     try testing.expect(distParamsCost(&cmds, .{}, p).? < distParamsCost(&cmds, .{}, .{}).?);
+}
+
+test "chooseDistParams: the mode's pair is kept when the walk did not reach it and it is cheaper" {
+    // Distances 6, 12, …, 144 (found by a search over such patterns): the
+    // walk stops at NPOSTFIX 1 / NDIRECT 8 (1 598.8 estimated bits), which
+    // 1/12 beats (1 581.3) without the walk reaching it.
+    var cmds: [240]Cmd = undefined;
+    for (&cmds, 0..) |*c, k| c.* = .{ .insert_len = 1, .copy_len = 4, .dist = @intCast(6 * (1 + k % 24)) };
+    const walk = chooseDistParams(&cmds, .{}, .{});
+    const with = chooseDistParams(&cmds, .{}, font_dist);
+    const cost_walk = distParamsCost(&cmds, .{}, walk).?;
+    const cost_font = distParamsCost(&cmds, .{}, font_dist).?;
+    try testing.expect(cost_font < cost_walk);
+    try testing.expectEqual(font_dist, with);
+    // The default pair as the start adds nothing to the walk.
+    try testing.expectEqual(walk, chooseDistParams(&cmds, .{}, .{}));
+}
+
+test "Mode: .font changes the stream from .q4 up and round-trips; .text and below .q4 change nothing" {
+    const gpa = testing.allocator;
+    const corpus = @import("interop_corpus.zig");
+    const decoder = @import("decoder.zig");
+    const input = try corpus.fontLike(gpa, 40_000, 11);
+    defer gpa.free(input);
+    inline for (.{ Effort.q0, Effort.q1, Effort.q4, Effort.q6, Effort.q9, Effort.q11 }) |e| {
+        const generic = try compressWith(gpa, input, .{ .effort = e });
+        defer gpa.free(generic);
+        const text = try compressWith(gpa, input, .{ .effort = e, .mode = .text });
+        defer gpa.free(text);
+        try testing.expectEqualSlices(u8, generic, text);
+        const font = try compressWith(gpa, input, .{ .effort = e, .mode = .font });
+        defer gpa.free(font);
+        const back = try decoder.decompress(gpa, font, .{});
+        defer gpa.free(back);
+        try testing.expectEqualSlices(u8, input, back);
+        if (comptime e.quality() >= 4 and e != .q11) {
+            try testing.expect(!std.mem.eql(u8, generic, font));
+        } else {
+            // Below `.q4` the mode has no effect. `.q11` searches
+            // NPOSTFIX/NDIRECT per block, and its walk passes 1/12 itself,
+            // so the mode's start adds nothing here (google: the same
+            // `check_orig`; the unit test above takes the other branch).
+            try testing.expectEqualSlices(u8, generic, font);
+        }
+        // A large window keeps NPOSTFIX = NDIRECT = 0 (the block writer's
+        // invariant), so the mode changes nothing there.
+        const lw_generic = try compressWith(gpa, input, .{ .effort = e, .window_bits = 25 });
+        defer gpa.free(lw_generic);
+        const lw_font = try compressWith(gpa, input, .{ .effort = e, .window_bits = 25, .mode = .font });
+        defer gpa.free(lw_font);
+        try testing.expectEqualSlices(u8, lw_generic, lw_font);
+    }
 }
 
 test "MinCopyLen: past every reached end, a bit more for each copy length bucket" {

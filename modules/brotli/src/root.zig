@@ -82,6 +82,9 @@ pub const compress = encoder.compress;
 pub const compressWith = encoder.compressWith;
 pub const CompressOptions = encoder.CompressOptions;
 pub const Effort = encoder.Effort;
+/// What the input is (google/brotli's `BROTLI_PARAM_MODE`; `.font` sets
+/// NPOSTFIX/NDIRECT from `.q4`).
+pub const Mode = encoder.Mode;
 /// `compressWith` into the caller's buffer (no output allocation);
 /// `maxCompressedSize` bytes always suffice, else `error.OutputTooLarge`
 /// only when the stream does not fit.
