@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-16** — Docs: DNS-01 helpers and the generic publishers (wave W4) live in the new sibling module
+  `acmedns` (`Dns01Solver` for `Options.solvers`); README and SPEC point there. No code change here.
+
 - **2026-10-16** — wave W3: the **order-level API** (instant-acme / lego style): `Client.newOrder` and `fetchOrder(url)` return an `Order` handle (owns its memory; `url`, `status`, `identifiers`, `authorizations`, `finalize`, `certificate`, `expires`), `waitOrder(order, .ready | .valid)`, `finalize(order, csr_der)`, `downloadChain(order, preferred_chain)`; `fetchAuthorization` returns an `Authorization` (every offered `Challenge`, `challenge(kind)`), `keyAuthorization`, `acceptChallenge`, `waitAuthorization`, `deactivateAuthorization` (RFC 8555 §7.5.2), `solveAuthorization`. **Custom challenge solvers:** `Solver` (`present` / `cleanup` over a `ChallengeRequest` with `dnsRecordName`, `dnsTxtValue`, `tlsAlpnIdentifier`, `tlsAlpnSni`), `Options.solvers` replaces the built-in of a type (HTTP-01, TLS-ALPN-01 and DNS-01 are solvers internally). `obtain*` are rebuilt on these calls. `jws.dns01TxtValueFromKeyAuthorization`.
   - **API:** `Error` gains `SolverFailed`; `Status` and `max_reverse_name_len` are public; `OrderOptions`, `OrderTarget`, `SolverError` are new. DNS-01 needs a publisher OR a DNS-01 solver (`DnsPublisherMissing` otherwise).
   - Tests: mock CA — the steps one by one, a caller's DNS-01 solver for a wildcard (no publisher), a refusing solver (no cleanup), deactivation; **Pebble:** new `steps` scenario (newOrder, fetchOrder, authorization with its five challenges, a caller's HTTP-01 solver, finalize, download, deactivation) 8/8 live and replayed offline. Interop tool: chains are checked against the time of the check, not the start of `lifecycle` (`CertificateNotYetValid` on a slow run).

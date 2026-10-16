@@ -182,6 +182,8 @@ const module_list = [_]Module{
     .{ .name = "aaa-gate", .libs = &.{"web"}, .deps = &.{ "router", "http" }, .test_deps = &.{"testkit"}, .loopback = true },
     .{ .name = "resilience", .libs = &.{ "web", "net" } },
     .{ .name = "acme", .libs = &.{"web"}, .deps = &.{ "http", "router", "entropy", "p256", "p384", "p521", "rsa", "netaddr", "x509" }, .test_deps = &.{"testkit"}, .loopback = true },
+    // DNS-01 helpers + publishers for acme; a sibling so acme's consumers do not carry dns/procrun.
+    .{ .name = "acmedns", .libs = &.{"web"}, .deps = &.{ "acme", "dns", "http", "netaddr", "procrun" }, .test_deps = &.{"testkit"} },
     .{ .name = "netlink", .libs = &.{"net"}, .test_deps = &.{"testkit"}, .netns = true },
     .{ .name = "genetlink", .libs = &.{"net"}, .deps = &.{"netlink"}, .test_deps = &.{"testkit"}, .netns = true },
     .{ .name = "nl80211", .libs = &.{"net"}, .deps = &.{ "genetlink", "netlink" }, .test_deps = &.{"testkit"}, .netns = true },

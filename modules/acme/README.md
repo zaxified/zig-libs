@@ -235,7 +235,14 @@ A failing solver is `error.SolverFailed` (`error.DnsPublishFailed` for DNS-01);
 For a host with no port the CA can reach, or for a wildcard, select
 `.challenge_type = .dns_01` and hand the client a publisher for your DNS
 provider. The library computes the record and drives the order; publishing is
-yours, because it is the provider-specific part:
+yours, because it is the provider-specific part.
+
+**Most setups want the sibling module [`acmedns`](../acmedns) instead of the
+raw publisher below:** its `Dns01Solver` (into `Options.solvers`) follows the
+`_acme-challenge` CNAME delegation, finds the zone, waits until every
+authoritative server answers, and comes with RFC 2136 + TSIG, acme-dns,
+httpreq and exec publishers. It is a separate module so that a consumer of
+`acme` that never solves DNS-01 does not carry a resolver. The raw seam:
 
 ```zig
 const Zone = struct {
