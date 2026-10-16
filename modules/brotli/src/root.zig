@@ -93,6 +93,10 @@ pub const CompressIntoError = encoder.CompressIntoError;
 /// An encoder reused from call to call: `compressWith`'s bytes, its
 /// tables and buffers kept (many small compressions; see `Compressor`).
 pub const Compressor = encoder.Compressor;
+/// Multithreaded compression of one stream: `parallel.compress(gpa, io,
+/// input, opts, .{ .threads = n })` (rust-brotli's `compress_multi`); the
+/// bytes do not depend on the worker count.
+pub const parallel = @import("parallel.zig");
 /// A raw prefix dictionary hashed once, for any number of compressions
 /// (`CompressOptions.prepared_dictionary`, `StreamOptions`, `dcb`).
 pub const PreparedDictionary = @import("prepared_dictionary.zig").PreparedDictionary;
@@ -129,6 +133,7 @@ test {
     _ = @import("stream_test.zig");
     _ = @import("stream_writer.zig");
     _ = @import("dcb.zig");
+    _ = @import("parallel.zig");
     _ = @import("prepared_dictionary.zig");
     _ = @import("shared_dictionary.zig");
     _ = @import("crafted_test.zig");

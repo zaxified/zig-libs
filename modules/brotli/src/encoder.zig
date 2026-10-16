@@ -365,6 +365,11 @@ const DistRing = struct {
     }
 };
 
+/// A ring nothing matches (`Core.startJob`): above every distance a stream
+/// can name (large window: below 2^30), and far enough from 2^32 that the
+/// short codes' ±3 neighbours of it do not wrap.
+pub const unknown_ring: DistRing = .{ .last = @splat(0xFFFF_0000) };
+
 // ---------------------------------------------------------------------------
 // Insert-and-copy command tables, derived from `tables.cmd_lut` (the authority
 // the decoder itself uses) rather than re-deriving the RFC's ranges by hand.
@@ -5725,7 +5730,7 @@ pub fn compressWith(gpa: std.mem.Allocator, input: []const u8, opts: CompressOpt
 }
 
 /// `CompressOptions.window_bits` or its default for an input of `n` bytes.
-fn windowBits(n: usize, opts: CompressOptions) u5 {
+pub fn windowBits(n: usize, opts: CompressOptions) u5 {
     return opts.window_bits orelse if (n > 65520) 21 else 16;
 }
 
@@ -6005,17 +6010,17 @@ pub const Core = struct {
         };
     }
 
+    /// NPOSTFIX/NDIRECT the mode asks for (`Mode`).
+    fn origDist(c: *const Core) DistParams {
+        return if (c.mode == .font) font_dist else .{};
+    }
+
     /// As `init` with these arguments leaves a core — the next stream's
     /// bytes are the ones a fresh core gives — but on this one's memory:
     /// its tables, while big enough (and not, 128 times in a row, more than
     /// three times what is needed), and the buffers a block is written
     /// with. For many small compressions, where a fresh table costs more
     /// than compressing (`Compressor`, R16).
-    /// NPOSTFIX/NDIRECT the mode asks for (`Mode`).
-    fn origDist(c: *const Core) DistParams {
-        return if (c.mode == .font) font_dist else .{};
-    }
-
     pub fn reinit(c: *Core, effort: Effort, block_size: usize, wbits: u5, size: usize, size_hint: usize) std.mem.Allocator.Error!void {
         const gpa = c.gpa;
         const need = tableLen(effort, kindFor(effort, wbits, size_hint), size);
@@ -6100,6 +6105,30 @@ pub const Core = struct {
             .wide => {
                 c.matcher.wide.dict = .{ .pd = d };
                 c.matcher.wide.dict_len = d.source.len;
+            },
+        }
+    }
+
+    /// A job of `parallel.compress`: `data` is the input's window before
+    /// the job (`prefix` bytes — output the decoder has by then) followed
+    /// by the job's input, `dropped` the stream's bytes before `data`.
+    /// The prefix's positions go into the match finder's tables (`.q0`
+    /// hashes as it writes and starts empty), so copies reach back across
+    /// the cut as they would in one pass. A job after the first cannot know
+    /// the decoder's distance ring there: its own starts from `unknown_ring`,
+    /// whose entries no distance equals, so no short code names an old
+    /// distance before the job has written four of its own. Before the
+    /// first block.
+    pub fn startJob(c: *Core, data: []const u8, prefix: usize, dropped: usize) void {
+        std.debug.assert(prefix <= data.len);
+        c.setData(data);
+        c.setHistory(.{ .dropped = dropped });
+        if (dropped + prefix != 0) c.ring = unknown_ring;
+        if (c.effort == .q0) return;
+        switch (c.matcher) {
+            inline else => |*m| {
+                var p: usize = 0;
+                while (p < prefix) : (p += 1) m.insert(p);
             },
         }
     }

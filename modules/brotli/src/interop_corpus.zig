@@ -741,6 +741,9 @@ pub const Encoding = struct {
     window_bits: ?u5 = null,
     block_size: usize = brotli.CompressOptions.default_block_size,
     mode: brotli.Mode = .generic,
+    /// Through `parallel.compress` with jobs of this many bytes (one
+    /// worker: the bytes do not depend on the count). Null: not.
+    parallel_job: ?usize = null,
     /// Through a `StreamWriter` (written in pieces of 4 093 bytes), with a
     /// flush after each of these input offsets that the input reaches.
     /// Null: `compressWith`.
@@ -783,12 +786,20 @@ pub const encodings = [_]Encoding{
     .{ .tag = "font_q9", .effort = "q9", .mode = .font, .shapes = &.{ "font_like", "alice_full" } },
     .{ .tag = "font_q11", .effort = "q11", .mode = .font, .shapes = &.{ "font_like", "alice_full" } },
     .{ .tag = "stream_font_q6", .effort = "q6", .mode = .font, .window_bits = 16, .block_size = 40_000, .flushes = &.{12_345}, .shapes = &.{ "font_like", "alice_full" } },
+    // Jobs of `parallel.compress` joined into one stream: cuts inside the
+    // window, a job starting from a ring the decoder's is not.
+    .{ .tag = "parallel_q1", .effort = "q1", .parallel_job = 64 << 10, .shapes = &.{ "alice_full", "font_like", "block_plus_one" } },
+    .{ .tag = "parallel_q6", .effort = "q6", .parallel_job = 64 << 10, .shapes = &.{ "alice_full", "font_like", "random_70000", "mixed_text_first" } },
+    .{ .tag = "parallel_q11", .effort = "q11", .parallel_job = 64 << 10, .shapes = &.{ "alice_full", "font_like" } },
+    .{ .tag = "parallel_q4_w16", .effort = "q4", .window_bits = 16, .parallel_job = 64 << 10, .shapes = &.{ "alice_full", "utf8_mix" } },
     .{ .tag = "stream_metadata", .effort = "q6", .window_bits = 22, .flushes = &.{}, .metadata_at = &.{ 0, 5_000, 5_000 }, .shapes = &.{ "empty", "alice_full" } },
 };
 
 /// The stream `e` makes of `input`.
 pub fn encode(gpa: std.mem.Allocator, input: []const u8, e: Encoding) ![]u8 {
     const effort = std.meta.stringToEnum(brotli.Effort, e.effort).?;
+    if (e.parallel_job) |job|
+        return brotli.parallel.compress(gpa, std.Io.Threaded.global_single_threaded.io(), input, .{ .effort = effort, .window_bits = e.window_bits, .block_size = e.block_size, .mode = e.mode }, .{ .job_size = job, .threads = 1 });
     const flushes = e.flushes orelse
         return brotli.compressWith(gpa, input, .{ .effort = effort, .window_bits = e.window_bits, .block_size = e.block_size, .mode = e.mode });
     var out: std.Io.Writer.Allocating = .init(gpa);
