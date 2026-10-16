@@ -1247,285 +1247,332 @@ const omit_last_transforms = [10]u8{ 0, 12, 27, 23, 42, 63, 56, 48, 59, 64 };
 /// Slots per bucket of `.q6`'s `Matcher`: one vector compare of the tags.
 const simd_depth = 32;
 
-const Matcher = struct {
-    /// The tag bits of a slot.
-    const tagged_mask: u32 = 0xff00_0000;
-    /// Data a tagged slot can index: positions below this, which is itself
-    /// a dropped position (`dropped_pos` with its tag bits).
-    const tagged_limit: u32 = 0x00ff_ffff;
+/// The deep match finder (`.q6`, `.q9`, `.q11`). `wide`: google/brotli's
+/// hasher for large inputs (H6, and H68 at q5–q7: `hash_longest_match64_inc.h`,
+/// MIT, see `NOTICE`) — five bytes hashed (`kHashMul64`) into 2^15 buckets, for
+/// an input known to be 1 MiB or more with a window of 19 bits or more
+/// (`Core.wideFor`); else four bytes into a table sized to the input
+/// (`Effort.slotsLog`).
+fn MatcherT(comptime wide: bool) type {
+    return struct {
+        const Self = @This();
+        /// The tag bits of a slot.
+        const tagged_mask: u32 = 0xff00_0000;
+        /// Data a tagged slot can index: positions below this, which is itself
+        /// a dropped position (`dropped_pos` with its tag bits).
+        const tagged_limit: u32 = 0x00ff_ffff;
 
-    /// Slots per bucket = candidates walked per lookup (`Effort.depth`), a
-    /// power of two.
-    depth: u32,
-    /// `count` then `slots` (`initIn`).
-    mem: []u32,
-    /// Estimated bits a literal costs in the current block (its order-0
-    /// entropy): what a match saves per byte it covers. Set per block.
-    lit_cost: f32 = 8,
-    /// `depth` slots per bucket, positions. A slot is read only when the
-    /// bucket's count says it was written.
-    ///
-    /// While every position fits in 24 bits (`tag_mask` set), a slot's top
-    /// eight bits are a tag: eight more bits of its position's hash
-    /// (`Hashed.tag`). A lookup in a binary block (`tagsPay`) skips a
-    /// slot whose tag is not its own without loading anything from the
-    /// data: there a bucket mostly holds positions that merely share its
-    /// hash bits, and each of those cost a load from far back — on a font,
-    /// 66 slots visited per lookup at `.q9`, 11 with the same first four
-    /// bytes (2026-10-15). A different tag means different first four
-    /// bytes, so no copy is missed. (Tags in a byte array of their own cost
-    /// text 4–7 % in the extra cache line.)
-    slots: []u32,
-    /// `tagged_mask` while positions are tagged, else 0 (`setData`).
-    tag_mask: u32 = tagged_mask,
-    /// Positions ever inserted per bucket (the next slot is `count % depth`).
-    count: []u32,
-    depth_log: u5,
-    hash_shift: u5,
-    data: []const u8,
-    /// The decoder's last four distances as the commands so far leave them
-    /// (`buildCommands` keeps it): a copy at one of them is named by a short
-    /// code with no extra bits, so it is tried first and priced lower.
-    ring: DistRing = .{},
-    history: History = .{},
-    /// A prefix dictionary, searched beside the slots (`DictRef`).
-    dict: ?DictRef = null,
-    /// Its length (0 without): static-dictionary words count past it.
-    dict_len: usize = 0,
-    /// `findWord`'s buckets looked at and words taken: it stops looking
-    /// while fewer than one lookup in 128 found a word (google/brotli
-    /// `SearchInStaticDictionary`) — binary data never does.
-    dict_lookups: usize = 0,
-    dict_matches: usize = 0,
+        /// Slots per bucket = candidates walked per lookup (`Effort.depth`), a
+        /// power of two.
+        depth: u32,
+        /// `count` then `slots` (`initIn`).
+        mem: []u32,
+        /// Estimated bits a literal costs in the current block (its order-0
+        /// entropy): what a match saves per byte it covers. Set per block.
+        lit_cost: f32 = 8,
+        /// `depth` slots per bucket, positions. A slot is read only when the
+        /// bucket's count says it was written.
+        ///
+        /// While every position fits in 24 bits (`tag_mask` set), a slot's top
+        /// eight bits are a tag: eight more bits of its position's hash
+        /// (`Hashed.tag`). A lookup in a binary block (`tagsPay`) skips a
+        /// slot whose tag is not its own without loading anything from the
+        /// data: there a bucket mostly holds positions that merely share its
+        /// hash bits, and each of those cost a load from far back — on a font,
+        /// 66 slots visited per lookup at `.q9`, 11 with the same first four
+        /// bytes (2026-10-15). A different tag means different first four
+        /// bytes, so no copy is missed. (Tags in a byte array of their own cost
+        /// text 4–7 % in the extra cache line.)
+        slots: []u32,
+        /// `tagged_mask` while positions are tagged, else 0 (`setData`).
+        tag_mask: u32 = tagged_mask,
+        /// Positions ever inserted per bucket (the next slot is `count % depth`).
+        count: []u32,
+        depth_log: u5,
+        hash_shift: u5,
+        data: []const u8,
+        /// The decoder's last four distances as the commands so far leave them
+        /// (`buildCommands` keeps it): a copy at one of them is named by a short
+        /// code with no extra bits, so it is tried first and priced lower.
+        ring: DistRing = .{},
+        history: History = .{},
+        /// A prefix dictionary, searched beside the slots (`DictRef`).
+        dict: ?DictRef = null,
+        /// Its length (0 without): static-dictionary words count past it.
+        dict_len: usize = 0,
+        /// `findWord`'s buckets looked at and words taken: it stops looking
+        /// while fewer than one lookup in 128 found a word (google/brotli
+        /// `SearchInStaticDictionary`) — binary data never does.
+        dict_lookups: usize = 0,
+        dict_matches: usize = 0,
 
-    /// Tables of 2^`slots_log` slots in all (`Effort.slotsLog`), `depth`
-    /// per bucket; `data` is set by the caller. Freed by `deinit`.
-    fn init(gpa: std.mem.Allocator, depth: u32, slots_log: u5) std.mem.Allocator.Error!Matcher {
-        return initIn(try gpa.alloc(u32, tableLen(depth, slots_log)), depth, slots_log);
-    }
-
-    /// The `u32`s of `init`'s tables.
-    fn tableLen(depth: u32, slots_log: u5) usize {
-        const bucket_log = bucketLogFor(depth, slots_log);
-        return (@as(usize, 1) << @intCast(bucket_log)) + (@as(usize, 1) << @intCast(bucket_log + std.math.log2_int(u32, depth)));
-    }
-
-    /// As `init`, the tables in `mem` (at least `tableLen` long, its
-    /// contents anything): what `init` makes, on memory kept between
-    /// inputs (`Core.reinit`).
-    fn initIn(mem: []u32, depth: u32, slots_log: u5) Matcher {
-        std.debug.assert(std.math.isPowerOfTwo(depth));
-        const depth_log: u5 = @intCast(std.math.log2_int(u32, depth));
-        const bucket_log: u5 = @intCast(bucketLogFor(depth, slots_log));
-        const n_count = @as(usize, 1) << bucket_log;
-        const count = mem[0..n_count];
-        // `slots` is left as it was: only the slots a bucket's count
-        // covers are read, and each was written first.
-        const slots = mem[n_count..][0 .. @as(usize, 1) << (bucket_log + depth_log)];
-        fillZero(count);
-        return .{
-            .depth = depth,
-            .mem = mem,
-            .slots = slots,
-            .count = count,
-            .depth_log = depth_log,
-            .hash_shift = @intCast(32 - @as(u6, bucket_log)),
-            .data = &.{},
-        };
-    }
-
-    /// log2 of the buckets `init` makes: 2^8 at least.
-    fn bucketLogFor(depth: u32, slots_log: u5) u6 {
-        return @intCast(@max(8, @as(i8, slots_log) - std.math.log2_int(u32, depth)));
-    }
-
-    /// `@memset(buf, 0)` in 32-byte stores. Zig 0.16 without libc lowers
-    /// `@memset` to `compiler_rt.memset`, which stores one byte at a time:
-    /// 20 % of `fast` compression of 128 KiB (bench 2026-10-11). The stores
-    /// are volatile so LLVM does not turn the loop back into that call. Same
-    /// workaround as `zstd/src/fill.zig`; `fastmem` exports a replacement for
-    /// whole executables. Delete when Zig's memset is vectorised (after 0.16)
-    /// and go back to `@memset`.
-    fn fillZero(buf: []u32) void {
-        const V = @Vector(8, u32);
-        const v: V = @splat(0);
-        const p: [*]volatile u32 = buf.ptr;
-        var i: usize = 0;
-        while (i + 8 <= buf.len) : (i += 8) {
-            const w: *align(4) volatile V = @ptrCast(p + i);
-            w.* = v;
+        /// Tables of 2^`slots_log` slots in all (`Effort.slotsLog`), `depth`
+        /// per bucket; `data` is set by the caller. Freed by `deinit`.
+        fn init(gpa: std.mem.Allocator, depth: u32, slots_log: u5) std.mem.Allocator.Error!Self {
+            return initIn(try gpa.alloc(u32, tableLen(depth, slots_log)), depth, slots_log);
         }
-        while (i < buf.len) : (i += 1) p[i] = 0;
-    }
 
-    /// Length of the common prefix of `data[c..]` and `data[p..]`, at most
-    /// `max_len` (`p + max_len <= data.len`, `c < p`): eight bytes per step,
-    /// the first differing byte from the XOR's trailing zeros.
-    fn matchLen(data: []const u8, c: usize, p: usize, max_len: usize) usize {
-        var l: usize = 0;
-        while (l + 8 <= max_len) : (l += 8) {
-            const x = std.mem.readInt(u64, data[c + l ..][0..8], .little) ^ std.mem.readInt(u64, data[p + l ..][0..8], .little);
-            if (x != 0) return l + @ctz(x) / 8;
+        /// The `u32`s of `init`'s tables.
+        fn tableLen(depth: u32, slots_log: u5) usize {
+            const bucket_log = bucketLogFor(depth, slots_log);
+            return (@as(usize, 1) << @intCast(bucket_log)) + (@as(usize, 1) << @intCast(bucket_log + std.math.log2_int(u32, depth)));
         }
-        while (l < max_len and data[c + l] == data[p + l]) l += 1;
-        return l;
-    }
 
-    /// After `init` (not `initIn`).
-    fn deinit(self: *Matcher, gpa: std.mem.Allocator) void {
-        gpa.free(self.mem);
-        self.* = undefined;
-    }
-
-    /// Empty, as `init` leaves it.
-    fn reset(self: *Matcher) void {
-        fillZero(self.count);
-        self.ring = .{};
-        self.dict_lookups = 0;
-        self.dict_matches = 0;
-    }
-
-    /// `by` output bytes left `data` (`History.shiftPos`). Only the slots a
-    /// count covers hold positions; the rest are shifted as garbage.
-    fn shift(self: *Matcher, by: u32) void {
-        const m = self.tag_mask;
-        for (self.slots) |*s| {
-            const pos = s.* & ~m;
-            const moved = History.shiftPos(if (pos == ~m) dropped_pos else pos, by);
-            s.* = if (moved == dropped_pos) dropped_pos else moved | (s.* & m);
+        /// As `init`, the tables in `mem` (at least `tableLen` long, its
+        /// contents anything): what `init` makes, on memory kept between
+        /// inputs (`Core.reinit`).
+        fn initIn(mem: []u32, depth: u32, slots_log: u5) Self {
+            std.debug.assert(std.math.isPowerOfTwo(depth));
+            const depth_log: u5 = @intCast(std.math.log2_int(u32, depth));
+            const bucket_log: u5 = @intCast(bucketLogFor(depth, slots_log));
+            const n_count = @as(usize, 1) << bucket_log;
+            const count = mem[0..n_count];
+            // `slots` is left as it was: only the slots a bucket's count
+            // covers are read, and each was written first.
+            const slots = mem[n_count..][0 .. @as(usize, 1) << (bucket_log + depth_log)];
+            fillZero(count);
+            return .{
+                .depth = depth,
+                .mem = mem,
+                .slots = slots,
+                .count = count,
+                .depth_log = depth_log,
+                .hash_shift = @intCast(32 - @as(u6, bucket_log)),
+                .data = &.{},
+            };
         }
-        self.history.dropped += by;
-    }
 
-    /// The data positions index. Past `tagged_limit` bytes the slots lose
-    /// their tags, once.
-    fn setData(self: *Matcher, data: []const u8) void {
-        self.data = data;
-        if (self.tag_mask == 0 or data.len < tagged_limit) return;
-        for (self.slots) |*s| s.* = if (s.* & ~tagged_mask == tagged_limit) dropped_pos else s.* & ~tagged_mask;
-        self.tag_mask = 0;
-    }
+        /// log2 of the buckets `init` makes: 2^8 at least.
+        fn bucketLogFor(depth: u32, slots_log: u5) u6 {
+            return @intCast(@max(8, @as(i8, slots_log) - std.math.log2_int(u32, depth)));
+        }
 
-    /// The four bytes at `p` hashed: the bucket from the top bits, a slot's
-    /// tag bits (`slots`) from the eight below them.
-    const Hashed = struct { bucket: usize, tag: u32 };
+        /// `@memset(buf, 0)` in 32-byte stores. Zig 0.16 without libc lowers
+        /// `@memset` to `compiler_rt.memset`, which stores one byte at a time:
+        /// 20 % of `fast` compression of 128 KiB (bench 2026-10-11). The stores
+        /// are volatile so LLVM does not turn the loop back into that call. Same
+        /// workaround as `zstd/src/fill.zig`; `fastmem` exports a replacement for
+        /// whole executables. Delete when Zig's memset is vectorised (after 0.16)
+        /// and go back to `@memset`.
+        fn fillZero(buf: []u32) void {
+            const V = @Vector(8, u32);
+            const v: V = @splat(0);
+            const p: [*]volatile u32 = buf.ptr;
+            var i: usize = 0;
+            while (i + 8 <= buf.len) : (i += 8) {
+                const w: *align(4) volatile V = @ptrCast(p + i);
+                w.* = v;
+            }
+            while (i < buf.len) : (i += 1) p[i] = 0;
+        }
 
-    fn hash(self: *const Matcher, p: usize) Hashed {
-        const x = std.mem.readInt(u32, self.data[p..][0..4], .little) *% 0x1e35a7bd;
-        return .{ .bucket = x >> self.hash_shift, .tag = (x << @intCast(32 - @as(u6, self.hash_shift))) & self.tag_mask };
-    }
+        /// Length of the common prefix of `data[c..]` and `data[p..]`, at most
+        /// `max_len` (`p + max_len <= data.len`, `c < p`): eight bytes per step,
+        /// the first differing byte from the XOR's trailing zeros.
+        fn matchLen(data: []const u8, c: usize, p: usize, max_len: usize) usize {
+            var l: usize = 0;
+            while (l + 8 <= max_len) : (l += 8) {
+                const x = std.mem.readInt(u64, data[c + l ..][0..8], .little) ^ std.mem.readInt(u64, data[p + l ..][0..8], .little);
+                if (x != 0) return l + @ctz(x) / 8;
+            }
+            while (l < max_len and data[c + l] == data[p + l]) l += 1;
+            return l;
+        }
 
-    /// Start loading the bucket `p` hashes to: positions are visited in
-    /// order, so the next lookup's bucket can be on its way while this one
-    /// is compared.
-    fn prefetch(self: *const Matcher, p: usize) void {
-        if (p + min_match > self.data.len) return;
-        const h = self.hash(p).bucket;
-        @prefetch(&self.count[h], .{});
-        @prefetch(&self.slots[h << self.depth_log], .{});
-    }
+        /// After `init` (not `initIn`).
+        fn deinit(self: *Self, gpa: std.mem.Allocator) void {
+            gpa.free(self.mem);
+            self.* = undefined;
+        }
 
-    fn insert(self: *Matcher, p: usize) void {
-        if (p + min_match > self.data.len) return;
-        const hv = self.hash(p);
-        const h = hv.bucket;
-        const n = self.count[h];
-        self.slots[(h << self.depth_log) | (n & (self.depth - 1))] = @as(u32, @intCast(p)) | hv.tag;
-        self.count[h] = n +% 1;
-    }
+        /// Empty, as `init` leaves it.
+        fn reset(self: *Self) void {
+            fillZero(self.count);
+            self.ring = .{};
+            self.dict_lookups = 0;
+            self.dict_matches = 0;
+        }
 
-    /// The match's estimated saving in bits: the literals it replaces minus
-    /// what naming it costs — the distance's extra bits (about log2 of it)
-    /// and a few bits of command and distance symbol. On text a literal costs
-    /// 4-5 bits and nearly every match pays; on random bytes over a small
-    /// alphabet a literal costs 2-3 and a far, short match loses (measured:
-    /// `alpha5_flat` 10 417 bytes with the longest match taken, worse the
-    /// deeper the search looked, against ~9 000 for no matches at all).
-    fn gain(self: *const Matcher, len: usize, dist: usize) f32 {
-        const dist_bits: f32 = @floatFromInt(std.math.log2_int(usize, dist));
-        return @as(f32, @floatFromInt(len)) * self.lit_cost - dist_bits - 6;
-    }
+        /// `by` output bytes left `data` (`History.shiftPos`). Only the slots a
+        /// count covers hold positions; the rest are shifted as garbage.
+        fn shift(self: *Self, by: u32) void {
+            const m = self.tag_mask;
+            for (self.slots) |*s| {
+                const pos = s.* & ~m;
+                const moved = History.shiftPos(if (pos == ~m) dropped_pos else pos, by);
+                s.* = if (moved == dropped_pos) dropped_pos else moved | (s.* & m);
+            }
+            self.history.dropped += by;
+        }
 
-    /// The match for `p` that saves the most bits (`gain`), ending at or
-    /// before `limit`, at most `max_dist` back. Null below `min_match` or
-    /// when no candidate saves anything.
-    /// `ring_n`: how many of the ring's distances are tried first (all four
-    /// since the ring was fixed, 2026-10-15: fonts −0.3 %, text even).
-    /// Comptime, so a search
-    /// without them compiles to the loop it was before they existed.
-    /// `px`: a prefix dictionary is attached (`dict`) — comptime, so a
-    /// search without one compiles to the loop it was before dictionaries
-    /// (the per-candidate test cost `.q9` 20 %, measured 2026-10-15).
-    /// `tagged`: skip slots by their tag (`slots`) — comptime, as a mask
-    /// test in the one loop cost text 25 % in the registers it took
-    /// (2026-10-15); the caller picks per block (`tagsPay`).
-    /// `simd` (`.q6`, 32 slots a bucket): with `tagged`, the bucket's tags
-    /// are compared at once and only the slots whose tag is the position's
-    /// own are visited, as google/brotli's H58 hasher does with tag bytes of
-    /// their own (`hash_longest_match_simd_inc.h`; a byte array here cost
-    /// text 7 % in the extra stores, 2026-10-15).
-    /// `align(64)` (also `findWord`, `buildCommands`): where the hot loops
-    /// start otherwise moves with every unrelated change, and on the
-    /// measuring host (a Kaby Lake, which pays for jumps across 32-byte
-    /// lines) that alone moved `.q6` by 5–10 % between builds; aligned, the
-    /// bench of the unchanged encoder was 3–10 % faster (2026-10-15).
-    fn find(self: *const Matcher, comptime ring_n: u3, comptime px: bool, comptime tagged: bool, comptime simd: bool, p: usize, max_dist: usize, limit: usize) align(64) ?Match {
-        if (p + min_match > limit) return null;
-        const max_len = @min(limit - p, max_match);
-        const own = self.findOwn(ring_n, tagged, simd, p, max_dist, max_len);
-        if (!px) return own;
-        var best: Best = if (own) |m| .{ .len = m.len, .dist = m.dist, .gain = m.gain } else .{};
-        if (best.len < max_len) self.dict.?.search(std.math.maxInt(u32), self.data, p, max_dist, max_len, self.lit_cost, self.ring.last[0..ring_n], &best);
-        if (best.len == 0) return null;
-        return .{ .len = @intCast(best.len), .dist = @intCast(best.dist), .gain = best.gain };
-    }
+        /// The data positions index. Past `tagged_limit` bytes the slots lose
+        /// their tags, once.
+        fn setData(self: *Self, data: []const u8) void {
+            self.data = data;
+            if (self.tag_mask == 0 or data.len < tagged_limit) return;
+            for (self.slots) |*s| s.* = if (s.* & ~tagged_mask == tagged_limit) dropped_pos else s.* & ~tagged_mask;
+            self.tag_mask = 0;
+        }
 
-    /// `find` in the data's own positions.
-    inline fn findOwn(self: *const Matcher, comptime ring_n: u3, comptime tagged: bool, comptime simd: bool, p: usize, max_dist: usize, max_len: usize) ?Match {
-        var best_len: usize = 0;
-        var best_dist: usize = 0;
-        var best_gain: f32 = 0;
-        if (ring_n != 0) {
-            const head2 = std.mem.readInt(u32, self.data[p..][0..4], .little) & 0xffff;
-            for (self.ring.last[0..ring_n], 0..) |rd, i| {
-                const d: usize = rd;
-                if (d == 0 or d > max_dist) continue;
-                const c = p - d;
-                // Most fail on the first bytes: no full compare for those.
-                if (std.mem.readInt(u32, self.data[c..][0..4], .little) & 0xffff != head2) continue;
-                const l = matchLen(self.data, c, p, max_len);
-                if (l < @as(usize, if (i < 2) min_ring_match else 3)) continue;
-                // The last distance: code 0 or no distance symbol at all; the
-                // second-last: a two-bit-ish short code.
-                const g = @as(f32, @floatFromInt(l)) * self.lit_cost - @as(f32, if (i == 0) 3 else 5);
-                if (g > best_gain) {
-                    best_gain = g;
-                    best_len = l;
-                    best_dist = d;
+        /// The bytes `hash` reads at a position.
+        const hash_len: usize = if (wide) 5 else min_match;
+
+        /// The `hash_len` bytes at `p` hashed: the bucket from the top bits,
+        /// a slot's tag bits (`slots`) from the eight below them.
+        const Hashed = struct { bucket: usize, tag: u32 };
+
+        fn hash(self: *const Self, p: usize) Hashed {
+            if (wide) {
+                // google `HashBytes` (H6): `load64 * (kHashMul64 << 24)`, of
+                // which only the low five bytes reach the top bits.
+                const v = @as(u64, std.mem.readInt(u32, self.data[p..][0..4], .little)) | @as(u64, self.data[p + 4]) << 32;
+                const x = (v << 24) *% 0x1FE35A7B_D3579BD3;
+                const bucket_log: u6 = 32 - @as(u6, self.hash_shift);
+                return .{
+                    .bucket = @intCast(x >> @intCast(64 - @as(u7, bucket_log))),
+                    .tag = @as(u32, @truncate((x << bucket_log) >> 32)) & self.tag_mask,
+                };
+            }
+            const x = std.mem.readInt(u32, self.data[p..][0..4], .little) *% 0x1e35a7bd;
+            return .{ .bucket = x >> self.hash_shift, .tag = (x << @intCast(32 - @as(u6, self.hash_shift))) & self.tag_mask };
+        }
+
+        /// Start loading the bucket `p` hashes to: positions are visited in
+        /// order, so the next lookup's bucket can be on its way while this one
+        /// is compared.
+        fn prefetch(self: *const Self, p: usize) void {
+            if (p + hash_len > self.data.len) return;
+            const h = self.hash(p).bucket;
+            @prefetch(&self.count[h], .{});
+            @prefetch(&self.slots[h << self.depth_log], .{});
+        }
+
+        fn insert(self: *Self, p: usize) void {
+            if (p + hash_len > self.data.len) return;
+            const hv = self.hash(p);
+            const h = hv.bucket;
+            const n = self.count[h];
+            self.slots[(h << self.depth_log) | (n & (self.depth - 1))] = @as(u32, @intCast(p)) | hv.tag;
+            self.count[h] = n +% 1;
+        }
+
+        /// The match's estimated saving in bits: the literals it replaces minus
+        /// what naming it costs — the distance's extra bits (about log2 of it)
+        /// and a few bits of command and distance symbol. On text a literal costs
+        /// 4-5 bits and nearly every match pays; on random bytes over a small
+        /// alphabet a literal costs 2-3 and a far, short match loses (measured:
+        /// `alpha5_flat` 10 417 bytes with the longest match taken, worse the
+        /// deeper the search looked, against ~9 000 for no matches at all).
+        fn gain(self: *const Self, len: usize, dist: usize) f32 {
+            const dist_bits: f32 = @floatFromInt(std.math.log2_int(usize, dist));
+            return @as(f32, @floatFromInt(len)) * self.lit_cost - dist_bits - 6;
+        }
+
+        /// The match for `p` that saves the most bits (`gain`), ending at or
+        /// before `limit`, at most `max_dist` back. Null below `min_match` or
+        /// when no candidate saves anything.
+        /// `ring_n`: how many of the ring's distances are tried first (all four
+        /// since the ring was fixed, 2026-10-15: fonts −0.3 %, text even).
+        /// Comptime, so a search
+        /// without them compiles to the loop it was before they existed.
+        /// `px`: a prefix dictionary is attached (`dict`) — comptime, so a
+        /// search without one compiles to the loop it was before dictionaries
+        /// (the per-candidate test cost `.q9` 20 %, measured 2026-10-15).
+        /// `tagged`: skip slots by their tag (`slots`) — comptime, as a mask
+        /// test in the one loop cost text 25 % in the registers it took
+        /// (2026-10-15); the caller picks per block (`tagsPay`).
+        /// `simd` (`.q6`, 32 slots a bucket): with `tagged`, the bucket's tags
+        /// are compared at once and only the slots whose tag is the position's
+        /// own are visited, as google/brotli's H58 hasher does with tag bytes of
+        /// their own (`hash_longest_match_simd_inc.h`; a byte array here cost
+        /// text 7 % in the extra stores, 2026-10-15).
+        /// `align(64)` (also `findWord`, `buildCommands`): where the hot loops
+        /// start otherwise moves with every unrelated change, and on the
+        /// measuring host (a Kaby Lake, which pays for jumps across 32-byte
+        /// lines) that alone moved `.q6` by 5–10 % between builds; aligned, the
+        /// bench of the unchanged encoder was 3–10 % faster (2026-10-15).
+        fn find(self: *const Self, comptime ring_n: u3, comptime px: bool, comptime tagged: bool, comptime simd: bool, p: usize, max_dist: usize, limit: usize) align(64) ?Match {
+            if (p + hash_len > limit) return null;
+            const max_len = @min(limit - p, max_match);
+            const own = self.findOwn(ring_n, tagged, simd, p, max_dist, max_len);
+            if (!px) return own;
+            var best: Best = if (own) |m| .{ .len = m.len, .dist = m.dist, .gain = m.gain } else .{};
+            if (best.len < max_len) self.dict.?.search(std.math.maxInt(u32), self.data, p, max_dist, max_len, self.lit_cost, self.ring.last[0..ring_n], &best);
+            if (best.len == 0) return null;
+            return .{ .len = @intCast(best.len), .dist = @intCast(best.dist), .gain = best.gain };
+        }
+
+        /// `find` in the data's own positions.
+        inline fn findOwn(self: *const Self, comptime ring_n: u3, comptime tagged: bool, comptime simd: bool, p: usize, max_dist: usize, max_len: usize) ?Match {
+            var best_len: usize = 0;
+            var best_dist: usize = 0;
+            var best_gain: f32 = 0;
+            if (ring_n != 0) {
+                const head2 = std.mem.readInt(u32, self.data[p..][0..4], .little) & 0xffff;
+                for (self.ring.last[0..ring_n], 0..) |rd, i| {
+                    const d: usize = rd;
+                    if (d == 0 or d > max_dist) continue;
+                    const c = p - d;
+                    // Most fail on the first bytes: no full compare for those.
+                    if (std.mem.readInt(u32, self.data[c..][0..4], .little) & 0xffff != head2) continue;
+                    const l = matchLen(self.data, c, p, max_len);
+                    if (l < @as(usize, if (i < 2) min_ring_match else 3)) continue;
+                    // The last distance: code 0 or no distance symbol at all; the
+                    // second-last: a two-bit-ish short code.
+                    const g = @as(f32, @floatFromInt(l)) * self.lit_cost - @as(f32, if (i == 0) 3 else 5);
+                    if (g > best_gain) {
+                        best_gain = g;
+                        best_len = l;
+                        best_dist = d;
+                    }
                 }
             }
-        }
-        if (ring_n != 0 and best_len >= max_len) return .{ .len = @intCast(best_len), .dist = @intCast(best_dist), .gain = best_gain };
-        const hv = self.hash(p);
-        const h = hv.bucket;
-        const n = self.count[h];
-        // Newest first; a wrapped count still means a full bucket.
-        const valid = if (n < self.depth) n else self.depth;
-        const bucket = self.slots[h << self.depth_log ..][0..self.depth];
-        const m = if (tagged) tagged_mask else self.tag_mask;
-        if (simd and tagged) {
-            // Bit k of `mask`: the k-th newest slot, `n - 1 - k`.
-            const V = @Vector(simd_depth, u32);
-            const sv: V = bucket[0..simd_depth].*;
-            const eq = (sv & @as(V, @splat(tagged_mask))) == @as(V, @splat(hv.tag));
-            const by_slot: u32 = @bitCast(eq);
-            var mask = std.math.rotr(u32, @bitReverse(by_slot), @as(u5, @truncate(0 -% n)));
-            if (n < simd_depth) mask &= (@as(u32, 1) << @intCast(n)) - 1;
-            while (mask != 0) : (mask &= mask - 1) {
-                const s = bucket[(n -% 1 -% @ctz(mask)) & (simd_depth - 1)];
-                const c: usize = s & ~tagged_mask;
+            if (ring_n != 0 and best_len >= max_len) return .{ .len = @intCast(best_len), .dist = @intCast(best_dist), .gain = best_gain };
+            const hv = self.hash(p);
+            const h = hv.bucket;
+            const n = self.count[h];
+            // Newest first; a wrapped count still means a full bucket.
+            const valid = if (n < self.depth) n else self.depth;
+            const bucket = self.slots[h << self.depth_log ..][0..self.depth];
+            const m = if (tagged) tagged_mask else self.tag_mask;
+            if (simd and tagged) {
+                // Bit k of `mask`: the k-th newest slot, `n - 1 - k`.
+                const V = @Vector(simd_depth, u32);
+                const sv: V = bucket[0..simd_depth].*;
+                const eq = (sv & @as(V, @splat(tagged_mask))) == @as(V, @splat(hv.tag));
+                const by_slot: u32 = @bitCast(eq);
+                var mask = std.math.rotr(u32, @bitReverse(by_slot), @as(u5, @truncate(0 -% n)));
+                if (n < simd_depth) mask &= (@as(u32, 1) << @intCast(n)) - 1;
+                while (mask != 0) : (mask &= mask - 1) {
+                    const s = bucket[(n -% 1 -% @ctz(mask)) & (simd_depth - 1)];
+                    const c: usize = s & ~tagged_mask;
+                    if (c >= p) continue;
+                    const d = p - c;
+                    if (d > max_dist) break;
+                    if (worthComparing(best_len, self.data[c + best_len] == self.data[p + best_len])) {
+                        const l = matchLen(self.data, c, p, max_len);
+                        if (l >= min_match) {
+                            const g = self.gain(l, d);
+                            if (g > best_gain) {
+                                best_gain = g;
+                                best_len = l;
+                                best_dist = d;
+                                if (l == max_len) break;
+                            }
+                        }
+                    }
+                }
+                if (best_len == 0) return null;
+                return .{ .len = @intCast(best_len), .dist = @intCast(best_dist), .gain = best_gain };
+            }
+            var k: u32 = 0;
+            while (k < valid) : (k += 1) {
+                const s = bucket[(n -% 1 -% k) & (self.depth - 1)];
+                if (tagged and s & tagged_mask != hv.tag) continue;
+                const c: usize = s & ~m;
                 if (c >= p) continue;
                 const d = p - c;
+                // Older slots are further back still.
                 if (d > max_dist) break;
                 if (worthComparing(best_len, self.data[c + best_len] == self.data[p + best_len])) {
                     const l = matchLen(self.data, c, p, max_len);
@@ -1543,136 +1590,116 @@ const Matcher = struct {
             if (best_len == 0) return null;
             return .{ .len = @intCast(best_len), .dist = @intCast(best_dist), .gain = best_gain };
         }
-        var k: u32 = 0;
-        while (k < valid) : (k += 1) {
-            const s = bucket[(n -% 1 -% k) & (self.depth - 1)];
-            if (tagged and s & tagged_mask != hv.tag) continue;
-            const c: usize = s & ~m;
-            if (c >= p) continue;
-            const d = p - c;
-            // Older slots are further back still.
-            if (d > max_dist) break;
-            if (worthComparing(best_len, self.data[c + best_len] == self.data[p + best_len])) {
-                const l = matchLen(self.data, c, p, max_len);
-                if (l >= min_match) {
-                    const g = self.gain(l, d);
-                    if (g > best_gain) {
-                        best_gain = g;
+
+        /// A static-dictionary word for `p` (RFC 7932 §8) at `.q9`, as
+        /// google/brotli's qualities 5–9 look for one when the hash found no copy
+        /// (`SearchInStaticDictionary`, `TestStaticDictionaryItem`, MIT, see
+        /// `NOTICE`): the two words `dictionary_hash` keeps for the first four
+        /// bytes, as a whole or with its last 1–9 bytes cut off (the
+        /// OMIT_LAST transforms). `out_max`: how far back the output reaches —
+        /// a word's distance lies beyond it and a prefix dictionary's.
+        fn findWord(self: *Self, p: usize, out_max: usize, limit: usize) align(64) ?Match {
+            if (self.dict_matches < self.dict_lookups >> 7) return null;
+            if (p + 4 > limit) return null;
+            const max_len = limit - p;
+            const key = dictionary_hash.hash14(self.data[p..][0..4]) << 1;
+            self.dict_lookups += 2;
+            // Both buckets' lengths at once: most are empty.
+            const lens = dictionary_hash.table.lengths[key..][0..2].*;
+            if (@as(u16, @bitCast(lens)) == 0) return null;
+            var best: ?Match = null;
+            var best_gain: f32 = 0;
+            for (lens, key..) |len8, b| {
+                const len: usize = len8;
+                if (len == 0 or len > max_len) continue;
+                const j: usize = dictionary_hash.table.words[b];
+                const word = dictionary.data[dictionary.offsets_by_length[len] + len * j ..][0..len];
+                const l = wordMatchLen(word, self.data[p..][0..len]);
+                if (l == 0 or l + omit_last_transforms.len <= len) continue;
+                const t: usize = omit_last_transforms[len - l];
+                const d = out_max + self.dict_len + 1 + j + (t << @intCast(dictionary.size_bits_by_length[len]));
+                if (d > max_code_distance) continue;
+                const g = self.gain(l, d);
+                if (g <= best_gain) continue;
+                self.dict_matches += 1;
+                best_gain = g;
+                best = .{ .len = @intCast(l), .dist = @intCast(d), .gain = g, .word = @intCast(len) };
+            }
+            return best;
+        }
+
+        /// Length of the common prefix of `word` and `at` (as long), eight
+        /// bytes per step.
+        fn wordMatchLen(word: []const u8, at: []const u8) usize {
+            var l: usize = 0;
+            while (l + 8 <= word.len) : (l += 8) {
+                const x = std.mem.readInt(u64, word[l..][0..8], .little) ^ std.mem.readInt(u64, at[l..][0..8], .little);
+                if (x != 0) return l + @ctz(x) / 8;
+            }
+            while (l < word.len and word[l] == at[l]) l += 1;
+            return l;
+        }
+
+        /// Cheap reject: whether a candidate gets the byte-by-byte compare —
+        /// it can beat `best_len` (the byte there agrees, `next_eq`), or nothing
+        /// was found yet. Without the short-circuit `or` it is one branch, and
+        /// `.q9` on text 5 % faster (2026-10-15).
+        inline fn worthComparing(best_len: usize, next_eq: bool) bool {
+            return (@intFromBool(best_len == 0) | @intFromBool(next_eq)) != 0;
+        }
+
+        /// Whether lookups in `block` should skip slots by their tag: when the
+        /// slots have tags and the block looks binary. On text most of a
+        /// bucket shares its first four bytes and the test only cost
+        /// mispredicted branches (`.q9` +28 %, 2026-10-15).
+        fn tagsPay(self: *const Self, block: []const u8) bool {
+            if (wide) return self.tag_mask != 0;
+            return self.tag_mask != 0 and looksBinary(block);
+        }
+
+        /// Every copy for `p` that is longer than any nearer one (so the
+        /// candidates' lengths rise and their distances too), as `find` walks the
+        /// bucket: what a shortest-path parse chooses from (`.q11`). Returns how
+        /// many of `out` are set.
+        fn collect(self: *const Self, comptime px: bool, comptime tagged: bool, p: usize, max_dist: usize, limit: usize, out: *[max_cands]Cand) usize {
+            if (p + hash_len > limit) return 0;
+            const max_len = @min(limit - p, max_match);
+            const hv = self.hash(p);
+            const h = hv.bucket;
+            const n = self.count[h];
+            const valid = if (n < self.depth) n else self.depth;
+            const bucket = self.slots[h << self.depth_log ..][0..self.depth];
+            const m = if (tagged) tagged_mask else self.tag_mask;
+            var found: usize = 0;
+            var best_len: usize = 0;
+            var k: u32 = 0;
+            while (k < valid) : (k += 1) {
+                const s = bucket[(n -% 1 -% k) & (self.depth - 1)];
+                if (tagged and s & tagged_mask != hv.tag) continue;
+                const c: usize = s & ~m;
+                if (c >= p) continue;
+                const d = p - c;
+                if (d > max_dist) break;
+                if (worthComparing(best_len, self.data[c + best_len] == self.data[p + best_len])) {
+                    const l = matchLen(self.data, c, p, max_len);
+                    if (l >= min_match and l > best_len) {
+                        out[found] = .{ .len = @intCast(l), .dist = @intCast(d) };
+                        found += 1;
                         best_len = l;
-                        best_dist = d;
-                        if (l == max_len) break;
+                        if (l == max_len or found == max_cands) break;
                     }
                 }
             }
+            // The dictionary's distances lie past every one above, so its
+            // copies, each longer than all before, keep the order.
+            if (px and best_len < max_len) return self.dict.?.collect(self.data, p, max_dist, max_len, best_len, out, found);
+            return found;
         }
-        if (best_len == 0) return null;
-        return .{ .len = @intCast(best_len), .dist = @intCast(best_dist), .gain = best_gain };
-    }
+    };
+}
 
-    /// A static-dictionary word for `p` (RFC 7932 §8) at `.q9`, as
-    /// google/brotli's qualities 5–9 look for one when the hash found no copy
-    /// (`SearchInStaticDictionary`, `TestStaticDictionaryItem`, MIT, see
-    /// `NOTICE`): the two words `dictionary_hash` keeps for the first four
-    /// bytes, as a whole or with its last 1–9 bytes cut off (the
-    /// OMIT_LAST transforms). `out_max`: how far back the output reaches —
-    /// a word's distance lies beyond it and a prefix dictionary's.
-    fn findWord(self: *Matcher, p: usize, out_max: usize, limit: usize) align(64) ?Match {
-        if (self.dict_matches < self.dict_lookups >> 7) return null;
-        if (p + 4 > limit) return null;
-        const max_len = limit - p;
-        const key = dictionary_hash.hash14(self.data[p..][0..4]) << 1;
-        self.dict_lookups += 2;
-        // Both buckets' lengths at once: most are empty.
-        const lens = dictionary_hash.table.lengths[key..][0..2].*;
-        if (@as(u16, @bitCast(lens)) == 0) return null;
-        var best: ?Match = null;
-        var best_gain: f32 = 0;
-        for (lens, key..) |len8, b| {
-            const len: usize = len8;
-            if (len == 0 or len > max_len) continue;
-            const j: usize = dictionary_hash.table.words[b];
-            const word = dictionary.data[dictionary.offsets_by_length[len] + len * j ..][0..len];
-            const l = wordMatchLen(word, self.data[p..][0..len]);
-            if (l == 0 or l + omit_last_transforms.len <= len) continue;
-            const t: usize = omit_last_transforms[len - l];
-            const d = out_max + self.dict_len + 1 + j + (t << @intCast(dictionary.size_bits_by_length[len]));
-            if (d > max_code_distance) continue;
-            const g = self.gain(l, d);
-            if (g <= best_gain) continue;
-            self.dict_matches += 1;
-            best_gain = g;
-            best = .{ .len = @intCast(l), .dist = @intCast(d), .gain = g, .word = @intCast(len) };
-        }
-        return best;
-    }
-
-    /// Length of the common prefix of `word` and `at` (as long), eight
-    /// bytes per step.
-    fn wordMatchLen(word: []const u8, at: []const u8) usize {
-        var l: usize = 0;
-        while (l + 8 <= word.len) : (l += 8) {
-            const x = std.mem.readInt(u64, word[l..][0..8], .little) ^ std.mem.readInt(u64, at[l..][0..8], .little);
-            if (x != 0) return l + @ctz(x) / 8;
-        }
-        while (l < word.len and word[l] == at[l]) l += 1;
-        return l;
-    }
-
-    /// Cheap reject: whether a candidate gets the byte-by-byte compare —
-    /// it can beat `best_len` (the byte there agrees, `next_eq`), or nothing
-    /// was found yet. Without the short-circuit `or` it is one branch, and
-    /// `.q9` on text 5 % faster (2026-10-15).
-    inline fn worthComparing(best_len: usize, next_eq: bool) bool {
-        return (@intFromBool(best_len == 0) | @intFromBool(next_eq)) != 0;
-    }
-
-    /// Whether lookups in `block` should skip slots by their tag: when the
-    /// slots have tags and the block looks binary. On text most of a
-    /// bucket shares its first four bytes and the test only cost
-    /// mispredicted branches (`.q9` +28 %, 2026-10-15).
-    fn tagsPay(self: *const Matcher, block: []const u8) bool {
-        return self.tag_mask != 0 and looksBinary(block);
-    }
-
-    /// Every copy for `p` that is longer than any nearer one (so the
-    /// candidates' lengths rise and their distances too), as `find` walks the
-    /// bucket: what a shortest-path parse chooses from (`.q11`). Returns how
-    /// many of `out` are set.
-    fn collect(self: *const Matcher, comptime px: bool, comptime tagged: bool, p: usize, max_dist: usize, limit: usize, out: *[max_cands]Cand) usize {
-        if (p + min_match > limit) return 0;
-        const max_len = @min(limit - p, max_match);
-        const hv = self.hash(p);
-        const h = hv.bucket;
-        const n = self.count[h];
-        const valid = if (n < self.depth) n else self.depth;
-        const bucket = self.slots[h << self.depth_log ..][0..self.depth];
-        const m = if (tagged) tagged_mask else self.tag_mask;
-        var found: usize = 0;
-        var best_len: usize = 0;
-        var k: u32 = 0;
-        while (k < valid) : (k += 1) {
-            const s = bucket[(n -% 1 -% k) & (self.depth - 1)];
-            if (tagged and s & tagged_mask != hv.tag) continue;
-            const c: usize = s & ~m;
-            if (c >= p) continue;
-            const d = p - c;
-            if (d > max_dist) break;
-            if (worthComparing(best_len, self.data[c + best_len] == self.data[p + best_len])) {
-                const l = matchLen(self.data, c, p, max_len);
-                if (l >= min_match and l > best_len) {
-                    out[found] = .{ .len = @intCast(l), .dist = @intCast(d) };
-                    found += 1;
-                    best_len = l;
-                    if (l == max_len or found == max_cands) break;
-                }
-            }
-        }
-        // The dictionary's distances lie past every one above, so its
-        // copies, each longer than all before, keep the order.
-        if (px and best_len < max_len) return self.dict.?.collect(self.data, p, max_dist, max_len, best_len, out, found);
-        return found;
-    }
-};
+const Matcher = MatcherT(false);
+const WideMatcher = MatcherT(true);
 
 /// A copy `Matcher.collect` found: length and the decoder's distance.
 const Cand = struct { len: u32, dist: u32 };
@@ -2217,7 +2244,8 @@ fn buildCommands(
     /// Static-dictionary words where no copy is found (`Matcher.findWord`).
     comptime words: bool,
     gpa: std.mem.Allocator,
-    matcher: *Matcher,
+    /// `*Matcher` or `*WideMatcher`.
+    matcher: anytype,
     start: usize,
     end: usize,
     max_dist: usize,
@@ -5605,6 +5633,16 @@ pub const Effort = enum(u4) {
         return @intCast(@min(cap, size_log + per_byte));
     }
 
+    /// log2 of `WideMatcher`'s slots: google's 2^15 buckets of
+    /// 2^(quality - 1) — `.q6` 32 a bucket (4 MiB), `.q9` 256 (32 MiB).
+    fn wideSlotsLog(e: Effort) u5 {
+        return switch (e) {
+            .q6 => 15 + 5,
+            .q9 => 15 + 8,
+            else => unreachable, // `Core.kindFor`
+        };
+    }
+
     fn depth(e: Effort) u32 {
         return switch (e) {
             .q0, .q1, .q4 => unreachable, // `FragMatcher`, `FastMatcher`
@@ -5654,7 +5692,7 @@ pub const max_window_bits = 24;
 
 /// `compress` with options.
 pub fn compressWith(gpa: std.mem.Allocator, input: []const u8, opts: CompressOptions) std.mem.Allocator.Error![]u8 {
-    var core = try Core.init(gpa, opts.effort, opts.block_size, windowBits(input.len, opts), tableSize(input.len, windowBits(input.len, opts)));
+    var core = try Core.init(gpa, opts.effort, opts.block_size, windowBits(input.len, opts), tableSize(input.len, windowBits(input.len, opts)), input.len);
     defer core.deinit();
     try oneShot(&core, input, opts);
     return core.w.buf.toOwnedSlice(gpa);
@@ -5684,7 +5722,7 @@ pub const CompressIntoError = std.mem.Allocator.Error || error{
 /// fails only when that does not fit — `maxCompressedSize` is always
 /// enough.
 pub fn compressInto(gpa: std.mem.Allocator, out: []u8, input: []const u8, opts: CompressOptions) CompressIntoError![]u8 {
-    var core = try Core.init(gpa, opts.effort, opts.block_size, windowBits(input.len, opts), tableSize(input.len, windowBits(input.len, opts)));
+    var core = try Core.init(gpa, opts.effort, opts.block_size, windowBits(input.len, opts), tableSize(input.len, windowBits(input.len, opts)), input.len);
     defer core.deinit();
     return oneShotInto(&core, out, input, opts);
 }
@@ -5741,10 +5779,10 @@ pub const Compressor = struct {
     fn ready(c: *Compressor, n: usize, opts: CompressOptions) std.mem.Allocator.Error!*Core {
         const wbits = windowBits(n, opts);
         if (c.core) |*k| {
-            try k.reinit(opts.effort, opts.block_size, wbits, tableSize(n, wbits));
+            try k.reinit(opts.effort, opts.block_size, wbits, tableSize(n, wbits), n);
             return k;
         }
-        c.core = try Core.init(c.gpa, opts.effort, opts.block_size, wbits, tableSize(n, wbits));
+        c.core = try Core.init(c.gpa, opts.effort, opts.block_size, wbits, tableSize(n, wbits), n);
         c.core.?.keep_temp = true;
         return &c.core.?;
     }
@@ -5807,7 +5845,7 @@ pub const Core = struct {
     effort: Effort,
     block_size: usize,
     wbits: u5,
-    matcher: union { deep: Matcher, fast: FastMatcher, frag: FragMatcher },
+    matcher: union(Kind) { frag: FragMatcher, fast: FastMatcher, deep: Matcher, wide: WideMatcher },
     /// The input so far that copies may reach (`compressBlock`'s positions
     /// index it).
     data: []const u8 = &.{},
@@ -5866,32 +5904,57 @@ pub const Core = struct {
     keep_temp: bool = false,
 
     /// `size`: how much input the match finder's tables are sized for.
-    pub fn init(gpa: std.mem.Allocator, effort: Effort, block_size: usize, wbits: u5, size: usize) std.mem.Allocator.Error!Core {
-        const mem = try gpa.alloc(u32, tableLen(effort, size));
-        return fresh(gpa, effort, block_size, wbits, size, mem);
+    /// `size_hint`: the whole input's length when known (`Core.size_hint`),
+    /// else 0.
+    pub fn init(gpa: std.mem.Allocator, effort: Effort, block_size: usize, wbits: u5, size: usize, size_hint: usize) std.mem.Allocator.Error!Core {
+        const k = kindFor(effort, wbits, size_hint);
+        const mem = try gpa.alloc(u32, tableLen(effort, k, size));
+        return fresh(gpa, effort, block_size, wbits, size, size_hint, mem);
+    }
+
+    /// The match finder `init` gives `effort`: google/brotli's hasher for
+    /// large inputs (`WideMatcher`: H68 at q5–q7, H6 at q8–q9) where google
+    /// picks it — a size hint of 1 MiB or more and a window of 19 bits or
+    /// more (`ChooseHasher`), not a large window (google's H65 there, not
+    /// ported) — else the effort's own (R14, 2026-10-16).
+    fn kindFor(effort: Effort, wbits: u5, size_hint: usize) Kind {
+        return switch (effort.finder()) {
+            .frag => .frag,
+            .fast => .fast,
+            .deep => if ((effort == .q6 or effort == .q9) and size_hint >= 1 << 20 and wbits >= 19 and wbits <= max_window_bits) .wide else .deep,
+        };
+    }
+
+    const Kind = enum { frag, fast, deep, wide };
+
+    fn kind(c: *const Core) Kind {
+        return std.meta.activeTag(c.matcher);
     }
 
     /// `init`'s state on `mem` (at least `tableLen` long).
-    fn fresh(gpa: std.mem.Allocator, effort: Effort, block_size: usize, wbits: u5, size: usize, mem: []u32) Core {
+    fn fresh(gpa: std.mem.Allocator, effort: Effort, block_size: usize, wbits: u5, size: usize, size_hint: usize, mem: []u32) Core {
         std.debug.assert(block_size >= 1 and block_size <= compressed_block_size);
         std.debug.assert(wbits >= min_window_bits and wbits <= max_large_window_bits);
+        const k = kindFor(effort, wbits, size_hint);
         return .{
             .gpa = gpa,
             .effort = effort,
             .block_size = block_size,
             .wbits = wbits,
-            .matcher = switch (effort.finder()) {
+            .matcher = switch (k) {
                 .frag => .{ .frag = FragMatcher.initIn(mem, size) },
                 .fast => .{ .fast = FastMatcher.initIn(mem, size) },
                 .deep => .{ .deep = Matcher.initIn(mem, effort.depth(), effort.slotsLog(size)) },
+                .wide => .{ .wide = WideMatcher.initIn(mem, effort.depth(), effort.wideSlotsLog()) },
             },
             .w = .{ .gpa = gpa },
             .alt = .{ .gpa = gpa },
             .scratch = .{ .gpa = gpa },
             .trial = .{ .gpa = gpa },
-            .table_log = tableLog(effort, size),
+            .table_log = tableLog(effort, k, size),
             .table_mem = mem,
             .temp = .init(gpa),
+            .size_hint = size_hint,
         };
     }
 
@@ -5905,11 +5968,12 @@ pub const Core = struct {
     }
 
     /// The `u32`s of the match finder's tables `init` makes.
-    fn tableLen(effort: Effort, size: usize) usize {
-        return switch (effort.finder()) {
+    fn tableLen(effort: Effort, k: Kind, size: usize) usize {
+        return switch (k) {
             .frag => FragMatcher.tableLen(size),
             .fast => FastMatcher.tableLen(size),
             .deep => Matcher.tableLen(effort.depth(), effort.slotsLog(size)),
+            .wide => WideMatcher.tableLen(effort.depth(), effort.wideSlotsLog()),
         };
     }
 
@@ -5919,9 +5983,9 @@ pub const Core = struct {
     /// three times what is needed), and the buffers a block is written
     /// with. For many small compressions, where a fresh table costs more
     /// than compressing (`Compressor`, R16).
-    pub fn reinit(c: *Core, effort: Effort, block_size: usize, wbits: u5, size: usize) std.mem.Allocator.Error!void {
+    pub fn reinit(c: *Core, effort: Effort, block_size: usize, wbits: u5, size: usize, size_hint: usize) std.mem.Allocator.Error!void {
         const gpa = c.gpa;
-        const need = tableLen(effort, size);
+        const need = tableLen(effort, kindFor(effort, wbits, size_hint), size);
         var mem = c.table_mem;
         var oversized: u8 = 0;
         if (mem.len >= need and mem.len / 3 > need) oversized = c.oversized +| 1;
@@ -5932,7 +5996,7 @@ pub const Core = struct {
             c.table_mem = mem;
             oversized = 0;
         }
-        var n = fresh(gpa, effort, block_size, wbits, size, mem);
+        var n = fresh(gpa, effort, block_size, wbits, size, size_hint, mem);
         n.oversized = oversized;
         // The block's buffers, emptied; the output's only when it is ours.
         inline for (.{ "alt", "scratch", "trial" }) |f| {
@@ -5969,18 +6033,20 @@ pub const Core = struct {
     }
 
     pub fn history(c: *const Core) History {
-        return switch (c.effort.finder()) {
+        return switch (c.kind()) {
             .frag => c.matcher.frag.history,
             .fast => c.matcher.fast.history,
             .deep => c.matcher.deep.history,
+            .wide => c.matcher.wide.history,
         };
     }
 
     fn setHistory(c: *Core, x: History) void {
-        switch (c.effort.finder()) {
+        switch (c.kind()) {
             .frag => c.matcher.frag.history = x,
             .fast => c.matcher.fast.history = x,
             .deep => c.matcher.deep.history = x,
+            .wide => c.matcher.wide.history = x,
         }
     }
 
@@ -5991,57 +6057,47 @@ pub const Core = struct {
         c.dict_len = d.source.len;
         if (d.source.len == 0) return;
         if (!c.effort.searchesDictionary()) return;
-        switch (c.effort.finder()) {
+        switch (c.kind()) {
             .frag => c.matcher.frag.dict = .{ .pd = d },
             .fast => c.matcher.fast.dict = .{ .pd = d },
             .deep => {
                 c.matcher.deep.dict = .{ .pd = d };
                 c.matcher.deep.dict_len = d.source.len;
             },
+            .wide => {
+                c.matcher.wide.dict = .{ .pd = d };
+                c.matcher.wide.dict_len = d.source.len;
+            },
         }
     }
 
     /// A dictionary is searched (`attachDictionary`).
     fn searching(c: *const Core) bool {
-        return switch (c.effort.finder()) {
+        return switch (c.kind()) {
             .frag => c.matcher.frag.dict != null,
             .fast => c.matcher.fast.dict != null,
             .deep => c.matcher.deep.dict != null,
+            .wide => c.matcher.wide.dict != null,
         };
     }
 
     /// The `bucketLog` `init` gives an effort's tables for `size`.
-    pub fn tableLog(effort: Effort, size: usize) u6 {
-        return switch (effort.finder()) {
+    fn tableLog(effort: Effort, k: Kind, size: usize) u6 {
+        return switch (k) {
             .frag => bucketLog(size, frag_bucket_log_max),
             .fast => bucketLog(size, fast_bucket_log_max),
             .deep => Matcher.bucketLogFor(effort.depth(), effort.slotsLog(size)),
+            .wide => WideMatcher.bucketLogFor(effort.depth(), effort.wideSlotsLog()),
         };
-    }
-
-    /// Ready for a new stream, as `init` leaves it (the tables kept).
-    pub fn reset(c: *Core) void {
-        switch (c.effort.finder()) {
-            .frag => c.matcher.frag.reset(),
-            .fast => c.matcher.fast.reset(),
-            .deep => c.matcher.deep.reset(),
-        }
-        c.setHistory(.{});
-        c.data = &.{};
-        c.w.buf.clearRetainingCapacity();
-        c.w.acc = 0;
-        c.w.cnt = 0;
-        c.ring = .{};
-        c.emitted_last = false;
-        c.q0 = .default;
     }
 
     /// `data` will lose its first `by` bytes (`setData` follows).
     pub fn shift(c: *Core, by: usize) void {
-        switch (c.effort.finder()) {
+        switch (c.kind()) {
             .frag => c.matcher.frag.shift(@intCast(by)),
             .fast => c.matcher.fast.shift(@intCast(by)),
             .deep => c.matcher.deep.shift(@intCast(by)),
+            .wide => c.matcher.wide.shift(@intCast(by)),
         }
     }
 
@@ -6081,10 +6137,11 @@ pub const Core = struct {
 
     pub fn setData(c: *Core, data: []const u8) void {
         c.data = data;
-        switch (c.effort.finder()) {
+        switch (c.kind()) {
             .frag => c.matcher.frag.data = data,
             .fast => c.matcher.fast.data = data,
             .deep => c.matcher.deep.setData(data),
+            .wide => c.matcher.wide.setData(data),
         }
     }
 
@@ -6162,13 +6219,19 @@ pub const Core = struct {
                 // text −0.7 %, small UTF-8 −7.5 %, for 5–10 % of its time —
                 // left out by the owner, 2026-10-15.)
                 const skip: usize = if (e == .q6) 64 else std.math.maxInt(usize);
-                c.matcher.deep.ring = c.ring;
                 const simd = e == .q6;
-                switch (c.matcher.deep.tagsPay(c.data[off..end])) {
-                    inline else => |tagged| if (c.searching())
-                        try buildCommands(4, skip, true, tagged, simd, e == .q9, gpa, &c.matcher.deep, off, end, max_dist, &c.cmds)
-                    else
-                        try buildCommands(4, skip, false, tagged, simd, e == .q9, gpa, &c.matcher.deep, off, end, max_dist, &c.cmds),
+                const px = c.searching();
+                switch (c.matcher) {
+                    inline .deep, .wide => |*mt| {
+                        mt.ring = c.ring;
+                        switch (mt.tagsPay(c.data[off..end])) {
+                            inline else => |tagged| if (px)
+                                try buildCommands(4, skip, true, tagged, simd, e == .q9, gpa, mt, off, end, max_dist, &c.cmds)
+                            else
+                                try buildCommands(4, skip, false, tagged, simd, e == .q9, gpa, mt, off, end, max_dist, &c.cmds),
+                        }
+                    },
+                    else => unreachable,
                 }
             },
         }
@@ -7391,11 +7454,11 @@ test "Compressor: tables kept while big enough, given back after long being thre
     gpa.free(try c.compress(alice[0..2000], .{}));
     const kept = c.core.?.table_mem;
     try testing.expectEqual(big, kept.len);
-    try testing.expect(Core.tableLen(.q6, 2000) * 3 < big);
+    try testing.expect(Core.tableLen(.q6, .deep, 2000) * 3 < big);
     for (0..127) |_| gpa.free(try c.compress(alice[0..2000], .{}));
     try testing.expectEqual(kept.ptr, c.core.?.table_mem.ptr);
     gpa.free(try c.compress(alice[0..2000], .{}));
-    try testing.expectEqual(Core.tableLen(.q6, 2000), c.core.?.table_mem.len);
+    try testing.expectEqual(Core.tableLen(.q6, .deep, 2000), c.core.?.table_mem.len);
     // A bigger input than the tables: made anew, the bytes as ever.
     const out = try c.compress(alice, .{ .effort = .q9 });
     defer gpa.free(out);
@@ -7481,4 +7544,25 @@ test "prefix dictionaries of every shape: raw and prepared agree, the stream dec
             try testing.expectEqualSlices(u8, input.items, back);
         }
     }
+}
+
+test "the wide hasher where google uses H6/H68: q6/q9, a hint of 1 MiB, a window of 19..24" {
+    try testing.expectEqual(Core.Kind.wide, Core.kindFor(.q6, 22, 1 << 20));
+    try testing.expectEqual(Core.Kind.wide, Core.kindFor(.q9, 19, 5 << 20));
+    try testing.expectEqual(Core.Kind.wide, Core.kindFor(.q9, 24, 1 << 20));
+    try testing.expectEqual(Core.Kind.deep, Core.kindFor(.q6, 22, (1 << 20) - 1));
+    try testing.expectEqual(Core.Kind.deep, Core.kindFor(.q9, 18, 5 << 20));
+    try testing.expectEqual(Core.Kind.deep, Core.kindFor(.q9, 25, 5 << 20)); // (google: H65)
+    try testing.expectEqual(Core.Kind.deep, Core.kindFor(.q11, 22, 5 << 20)); // (google: H10)
+    try testing.expectEqual(Core.Kind.fast, Core.kindFor(.q4, 22, 5 << 20));
+    try testing.expectEqual(Core.Kind.frag, Core.kindFor(.q1, 22, 5 << 20));
+    // google's H6 hash: the low five bytes, from `kHashMul64 << 24`.
+    var m = try WideMatcher.init(testing.allocator, 32, Effort.q6.wideSlotsLog());
+    defer m.deinit(testing.allocator);
+    m.setData("abcdeXabcdeY");
+    try testing.expectEqual(m.hash(0), m.hash(6));
+    m.setData("abcdeXabcdfY");
+    try testing.expect(m.hash(0).bucket != m.hash(6).bucket or m.hash(0).tag != m.hash(6).tag);
+    const v: u64 = std.mem.readInt(u64, "abcdeXab", .little);
+    try testing.expectEqual(@as(usize, @intCast((v *% (@as(u64, 0x1FE35A7B_D3579BD3) << 24)) >> 49)), m.hash(0).bucket);
 }

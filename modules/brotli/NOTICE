@@ -46,7 +46,11 @@ bounds), and `sortKeys` follows `c/enc/entropy_encode.h`
 (`CreatePreparedDictionaryWithParams`, `CreatePreparedDictionary`: the lean
 layout, its parameters and hash; the build passes are our own), and
 `DictRef.search`/`DictRef.collect` in `src/encoder.zig` port `c/enc/hash.h`
-(`FindCompoundDictionaryMatch`, `FindAllCompoundDictionaryMatches`). Those
+(`FindCompoundDictionaryMatch`, `FindAllCompoundDictionaryMatches`);
+`MatcherT(true)` (`WideMatcher`, ADDED 2026-10-16, R14) follows
+`c/enc/hash_longest_match64_inc.h` (H6's `HashBytes`, 2^15 buckets of
+2^(quality − 1) slots) and `c/enc/quality.h` (`ChooseHasher`: when H6/H68 are
+taken). Those
 files carry
 "Copyright 2010–2016 Google Inc. All Rights Reserved. Distributed under MIT
 license." Changes are listed in the file's header. The vector tag compare in

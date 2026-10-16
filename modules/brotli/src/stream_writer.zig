@@ -97,7 +97,7 @@ pub const StreamWriter = struct {
     /// history and the match finder's table.
     pub fn init(gpa: std.mem.Allocator, output: *Writer, buffer: []u8, opts: StreamOptions) std.mem.Allocator.Error!StreamWriter {
         std.debug.assert(buffer.len != 0);
-        var core = try Core.init(gpa, opts.effort, opts.block_size, opts.window_bits, opts.tableSize());
+        var core = try Core.init(gpa, opts.effort, opts.block_size, opts.window_bits, opts.tableSize(), opts.size_hint orelse 0);
         errdefer core.deinit();
         core.keep_temp = true;
         var sw: StreamWriter = .{
@@ -163,7 +163,7 @@ pub const StreamWriter = struct {
     /// is abandoned. On an error the writer is unusable until another
     /// successful `reset`.
     pub fn reset(sw: *StreamWriter, output: *Writer, opts: StreamOptions) std.mem.Allocator.Error!void {
-        try sw.core.reinit(opts.effort, opts.block_size, opts.window_bits, opts.tableSize());
+        try sw.core.reinit(opts.effort, opts.block_size, opts.window_bits, opts.tableSize(), opts.size_hint orelse 0);
         sw.opts = opts;
         sw.hist.clearRetainingCapacity();
         sw.output = output;
@@ -321,7 +321,10 @@ fn tablePtr(c: *const encoder.Core) *const anyopaque {
     return switch (c.effort) {
         .q0, .q1 => c.matcher.frag.table.ptr,
         .q4 => c.matcher.fast.table.ptr,
-        else => c.matcher.deep.slots.ptr,
+        else => switch (c.matcher) {
+            .wide => |*m| m.slots.ptr,
+            else => c.matcher.deep.slots.ptr,
+        },
     };
 }
 
@@ -329,7 +332,10 @@ fn tableLen(c: *const encoder.Core) usize {
     return switch (c.effort) {
         .q0, .q1 => c.matcher.frag.table.len,
         .q4 => c.matcher.fast.table.len,
-        else => c.matcher.deep.count.len,
+        else => switch (c.matcher) {
+            .wide => |*m| m.count.len,
+            else => c.matcher.deep.count.len,
+        },
     };
 }
 
@@ -617,24 +623,35 @@ test "size_hint: a table for the input, and compressWith's bytes for a short one
     }
 }
 
-test "size_hint of 1 MiB and more: thirteen literal contexts, as compressWith" {
-    // `.q6` models a long text's literals with google's thirteen contexts
-    // when the whole input is that long: a stream knows it from the hint.
+test "size_hint of 1 MiB and more: thirteen literal contexts and the wide hasher, as compressWith" {
+    // `.q6`/`.q9` model a long text's literals with google's thirteen
+    // contexts and hash five bytes into google's 2^15 buckets when the whole
+    // input is that long: a stream knows it from the hint.
     const gpa = testing.allocator;
     const alice = @embedFile("testdata/alice29.txt");
     const src = try gpa.alloc(u8, 7 * alice.len);
     defer gpa.free(src);
     for (0..7) |k| @memcpy(src[k * alice.len ..][0..alice.len], alice);
     try testing.expectEqual(@as(u32, 13), @import("greedy_split.zig").chooseStaticContexts(src[0 .. 1 << 20], 6, src.len).n);
-    const want = try encoder.compressWith(gpa, src, .{ .effort = .q6, .window_bits = 22 });
-    defer gpa.free(want);
-    var out: Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var buf: [4096]u8 = undefined;
-    var sw: StreamWriter = try .init(gpa, &out.writer, &buf, .{ .effort = .q6, .size_hint = src.len });
-    defer sw.deinit();
-    try writeStream(&sw, src, 64 * 1024, &.{});
-    try testing.expectEqualSlices(u8, want, out.written());
+    for ([_]encoder.Effort{ .q6, .q9 }) |effort| {
+        const want = try encoder.compressWith(gpa, src, .{ .effort = effort, .window_bits = 22 });
+        defer gpa.free(want);
+        try expectRoundTrip(src, want);
+        var out: Writer.Allocating = .init(gpa);
+        defer out.deinit();
+        var buf: [4096]u8 = undefined;
+        var sw: StreamWriter = try .init(gpa, &out.writer, &buf, .{ .effort = effort, .size_hint = src.len });
+        defer sw.deinit();
+        try testing.expect(sw.core.matcher == .wide);
+        try writeStream(&sw, src, 64 * 1024, &.{});
+        try testing.expectEqualSlices(u8, want, out.written());
+        // Without the hint: the input's own table, other bytes.
+        out.clearRetainingCapacity();
+        try sw.reset(&out.writer, .{ .effort = effort });
+        try testing.expect(sw.core.matcher == .deep);
+        try writeStream(&sw, src, 64 * 1024, &.{});
+        try expectRoundTrip(src, out.written());
+    }
 }
 
 test "a raw prefix dictionary: compressWith's bytes, and every decoder's round trip" {
