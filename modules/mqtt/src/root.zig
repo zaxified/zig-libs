@@ -86,6 +86,12 @@ pub const max_in_flight = client_mod.max_in_flight;
 pub const AliasSlot = client_mod.AliasSlot;
 pub const ServerLimits = client_mod.ServerLimits;
 
+/// Automatic-reconnect helpers: backoff schedule and subscription replay.
+pub const reconnect = @import("reconnect.zig");
+
+pub const Reconnect = reconnect.Reconnect;
+pub const SubscriptionSet = reconnect.SubscriptionSet;
+
 /// MQTT 3.1.1 + 5.0 broker (server): connection registry + subscription
 /// fan-out + retained store, QoS 0/1/2, clean and persistent sessions. Caller-driven and socket-free like
 /// `Client` (reversed direction); `broker.TcpServer` is an optional accept
@@ -129,4 +135,5 @@ test {
     _ = @import("stackprobe_test.zig");
     _ = @import("topic_oracle_test.zig");
     _ = @import("session_replay.zig");
+    _ = @import("reconnect_test.zig");
 }

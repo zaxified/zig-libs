@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-17** — Client: `reconnect.Reconnect` (sans-I/O backoff schedule with full jitter) and `SubscriptionSet` (re-subscribe after a reconnect, chunked); an optional outbox (`Buffers.outbox`) keeps the encoded unacknowledged QoS 1/2 PUBLISHes across `connectionLost` + `connect(clean_session = false)` and resends them after the CONNACK (DUP=1 + PUBREL on Session Present, DUP=0 without; 5.0 Receive Maximum honoured), `error.OutboxFull`, `outboxLen`/`outboxBytes`/`outboxDropped`. Broker: `max_keepalive_s` (5.0 Server Keep Alive), `retain_available`, `retain_expiry_interval_ms`, `queue_qos0_messages`, `validate_payload_format` (0x99), Reason Strings on 5.0 refusals / DISCONNECTs / failure acks, `$SYS/broker/...` statistics via `publishSys(now)` (`sys_interval_ms`, off by default). All additive; defaults keep today's behaviour.
 - **2026-10-09** — Constant time: new `src/ctgrind_harness.zig` (`scripts/checks/ctgrind.sh mqtt`, targets `encode`, `decode`). The CONNECT password and the 5.0 authentication data go through `encodePacket` (CONNECT 3.1.1/5.0, AUTH) and, as tainted wire bytes, through `decodePacket` with 0 secret-dependent contexts in ReleaseFast. The codec only copies and slices them. Pinned in `ctgrind-expected.tsv`. No code change.
 
 - **2026-10-09** — tests: deterministic fuzz driver `MQTT_FUZZ` over the existing harnesses (v3.1.1 and v5 stream decoders, each also over damaged corpus streams).

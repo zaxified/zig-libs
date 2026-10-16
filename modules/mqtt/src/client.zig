@@ -33,9 +33,14 @@
 //! as `Event.auth` and go out through `auth`. A server's DISCONNECT is
 //! `Event.disconnect`.
 //!
-//! Session state is reset on `connect`; replaying unacknowledged QoS
-//! messages into a resumed session (clean_session = false) is the caller's
-//! job — the client does not buffer payloads.
+//! Session state is reset on `connect` — unless the client was given an
+//! outbox (`Buffers.outbox`) and the CONNECT asks to resume
+//! (`clean_session = false`): then the encoded unacknowledged QoS 1/2
+//! PUBLISH packets are kept across `connectionLost` / `connect` and resent
+//! after the CONNACK (MQTT 4.4, see `Buffers.outbox`). Without an outbox the
+//! client does not buffer payloads and replaying is the caller's job
+//! (`publishDup`). Reconnect scheduling and re-subscribing are in
+//! `reconnect.zig`.
 //!
 //! Provenance: clean-room from the OASIS MQTT 3.1.1 and 5.0 specifications;
 //! mosquitto/Paho referenced for behavior only, no source consulted or
@@ -169,6 +174,9 @@ pub const Error = error{
     /// 5.0: an outbound Topic Alias above the server's maximum, or an inbound
     /// one that is 0, above ours, unset, or names a topic too long to keep.
     TopicAliasInvalid,
+    /// The outbox (`Buffers.outbox`) has no room for this QoS 1/2 publish;
+    /// nothing was sent and the packet id was released.
+    OutboxFull,
 } || packet.DecodeError || packet.EncodeError || TransportError;
 
 /// MQTT 3.1.1 / 5.0 client. Allocation-free: hand it a receive buffer (must
@@ -203,6 +211,27 @@ pub const Client = struct {
     inbound_qos2: [max_in_flight]u16 = undefined,
     inbound_len: usize = 0,
 
+    /// Outbox: encoded unacknowledged QoS 1/2 PUBLISH packets, back to back
+    /// in `outbox` in send order (`outbox_entries[i]` owns
+    /// `outbox[offset..][0..len]`). Disabled when `outbox.len == 0`.
+    outbox: []u8 = &.{},
+    outbox_used: usize = 0,
+    outbox_entries: [max_in_flight]OutboxEntry = undefined,
+    outbox_len: usize = 0,
+    /// Entries `outboxResume` dropped at the most recent CONNACK.
+    outbox_dropped_n: usize = 0,
+    /// Resend with DUP=1 (the server kept the session) or DUP=0 (it did not).
+    resend_dup: bool = true,
+
+    const OutboxEntry = struct {
+        id: u16,
+        offset: usize,
+        /// 0 once the PUBREC arrived: a PUBREL is resent, not the PUBLISH.
+        len: usize,
+        /// Already transmitted on the current connection.
+        sent: bool,
+    };
+
     const Pending = struct {
         id: u16,
         kind: Kind,
@@ -222,10 +251,30 @@ pub const Client = struct {
         /// 5.0 only: room for the Topic Aliases the server may use toward
         /// this client. Empty (default) = the client accepts none.
         topic_aliases: []AliasSlot = &.{},
+        /// Byte arena for the in-flight resume outbox. Empty (default) = no
+        /// outbox, the client behaves as before (no buffering, `connect`
+        /// resets everything). With room, the ENCODED bytes of every
+        /// unacknowledged QoS 1/2 PUBLISH are kept (at most `max_in_flight`
+        /// entries; `tx` must hold the largest one as always) until its
+        /// PUBACK / PUBCOMP, so that after `connectionLost` and a
+        /// `connect` with `clean_session = false` the client resends
+        /// them itself (4.4.0): on Session Present = 1 the same bytes with
+        /// DUP=1 and the same packet id, plus PUBREL for QoS 2 messages
+        /// already PUBRECed, in the original order; on Session Present = 0
+        /// the PUBLISHes with DUP=0 (the server holds nothing) and the QoS 2
+        /// messages already PUBRECed are DROPPED, not resent: the server
+        /// received them once and a resend could deliver twice (counted in
+        /// `outboxDropped`). Entries that no longer fit the new connection
+        /// (above its Maximum Packet Size or Maximum QoS) are dropped too.
+        /// Under 5.0 the resend honours the new Receive Maximum: the rest
+        /// waits and goes out as acknowledgements free the quota. A resent
+        /// message keeps its original Message Expiry Interval (the server
+        /// does not see the time spent offline).
+        outbox: []u8 = &.{},
     };
 
     pub fn init(transport: Transport, buffers: Buffers) Client {
-        return .{ .transport = transport, .rx_buf = buffers.rx, .tx_buf = buffers.tx, .aliases = buffers.topic_aliases };
+        return .{ .transport = transport, .rx_buf = buffers.rx, .tx_buf = buffers.tx, .aliases = buffers.topic_aliases, .outbox = buffers.outbox };
     }
 
     pub const PublishOptions = struct {
@@ -247,6 +296,11 @@ pub const Client = struct {
 
     /// Send CONNECT at `options.version` and reset all session state. The
     /// broker's answer surfaces later as an `Event.connack` from `poll`.
+    ///
+    /// With an outbox (`Buffers.outbox`) and `clean_session = false` the
+    /// unacknowledged QoS 1/2 publishes survive (and so do the QoS 2 receive
+    /// ids); they are resent while the CONNACK is processed (`poll`). In
+    /// every other case the session state is reset and the outbox emptied.
     ///
     /// Under 5.0 three properties are filled in when not given, so the server
     /// stays within what this client can hold: Receive Maximum =
@@ -275,8 +329,24 @@ pub const Client = struct {
             alias_max = p.topic_alias_maximum orelse 0;
         }
         const bytes = try packet.encodeConnect(c.tx_buf, opts);
-        c.pending_len = 0;
-        c.inbound_len = 0;
+        if (c.outbox.len > 0 and !opts.clean_session) {
+            // Resume: keep the publishes, drop subscribe / unsubscribe.
+            var keep: usize = 0;
+            for (c.pending[0..c.pending_len]) |e| switch (e.kind) {
+                .publish_qos1, .publish_await_pubrec, .publish_await_pubcomp => {
+                    c.pending[keep] = e;
+                    keep += 1;
+                },
+                .subscribe, .unsubscribe => {},
+            };
+            c.pending_len = keep;
+        } else {
+            c.pending_len = 0;
+            c.inbound_len = 0;
+            c.outbox_len = 0;
+            c.outbox_used = 0;
+        }
+        c.outbox_dropped_n = 0;
         c.awaiting_pingresp = false;
         c.rx_len = 0;
         c.rx_consumed = 0;
@@ -303,6 +373,11 @@ pub const Client = struct {
         if (options.qos != .at_most_once and c.publishesInFlight() >= c.server.receive_maximum) {
             return error.ReceiveMaximumReached;
         }
+        // Topic Aliases are per connection and reset on reconnect: a stored
+        // PUBLISH that leaves the topic out (alias set earlier) would name an
+        // alias the new connection does not know, so it cannot be resent.
+        if (c.outbox.len > 0 and options.qos != .at_most_once and
+            topic_name.len == 0 and options.properties.topic_alias != null) return error.TopicAliasInvalid;
         var id: u16 = 0;
         if (options.qos != .at_most_once) {
             id = try c.allocPacketId(switch (options.qos) {
@@ -312,6 +387,7 @@ pub const Client = struct {
             });
         }
         errdefer if (id != 0) c.removePending(id);
+        errdefer if (id != 0) c.outboxRemove(id);
         try c.sendPublish(now, .{
             .topic = topic_name,
             .payload = payload,
@@ -487,7 +563,119 @@ pub const Client = struct {
         c.rx_consumed = 0;
     }
 
+    /// The transport died (read error, EOF, write failure, keep-alive
+    /// timeout): the state becomes `.disconnected` and the receive buffer is
+    /// dropped. Unlike `connect`'s reset, the outbox and the pending publish
+    /// ids are KEPT, so a following `connect` with `clean_session = false`
+    /// resumes them. Safe to call in any state.
+    pub fn connectionLost(c: *Client) void {
+        c.state = .disconnected;
+        c.awaiting_pingresp = false;
+        c.resetRx();
+    }
+
+    /// Unacknowledged QoS 1/2 publishes held in the outbox.
+    pub fn outboxLen(c: *const Client) usize {
+        return c.outbox_len;
+    }
+
+    /// Bytes of the outbox arena in use.
+    pub fn outboxBytes(c: *const Client) usize {
+        return c.outbox_used;
+    }
+
+    /// Entries the most recent CONNACK dropped instead of resending (QoS 2
+    /// after PUBREC with Session Present = 0; over the new Maximum Packet
+    /// Size or Maximum QoS). Reset by `connect`.
+    pub fn outboxDropped(c: *const Client) usize {
+        return c.outbox_dropped_n;
+    }
+
     // ── internals ───────────────────────────────────────────────────────────
+
+    fn outboxIndex(c: *const Client, id: u16) ?usize {
+        for (c.outbox_entries[0..c.outbox_len], 0..) |e, i| if (e.id == id) return i;
+        return null;
+    }
+
+    fn outboxStore(c: *Client, id: u16, bytes: []const u8) Error!void {
+        if (c.outbox_used + bytes.len > c.outbox.len or c.outbox_len >= max_in_flight) return error.OutboxFull;
+        @memcpy(c.outbox[c.outbox_used..][0..bytes.len], bytes);
+        c.outbox_entries[c.outbox_len] = .{ .id = id, .offset = c.outbox_used, .len = bytes.len, .sent = true };
+        c.outbox_len += 1;
+        c.outbox_used += bytes.len;
+    }
+
+    /// Free the bytes of entry `i`, keeping the order of the others.
+    fn outboxShrink(c: *Client, i: usize) void {
+        const e = c.outbox_entries[i];
+        const end = e.offset + e.len;
+        std.mem.copyForwards(u8, c.outbox[e.offset..], c.outbox[end..c.outbox_used]);
+        c.outbox_used -= e.len;
+        for (c.outbox_entries[i + 1 .. c.outbox_len]) |*o| o.offset -= e.len;
+        c.outbox_entries[i].len = 0;
+    }
+
+    fn outboxRemoveAt(c: *Client, i: usize) void {
+        c.outboxShrink(i);
+        std.mem.copyForwards(OutboxEntry, c.outbox_entries[i .. c.outbox_len - 1], c.outbox_entries[i + 1 .. c.outbox_len]);
+        c.outbox_len -= 1;
+    }
+
+    fn outboxRemove(c: *Client, id: u16) void {
+        if (c.outboxIndex(id)) |i| c.outboxRemoveAt(i);
+    }
+
+    /// After a successful CONNACK with the outbox in use: drop what cannot be
+    /// resent, then start the resend.
+    fn outboxResume(c: *Client, now: u64, session_present: bool) Error!void {
+        c.resend_dup = session_present;
+        if (!session_present) c.inbound_len = 0; // the server forgot those too
+        var i: usize = 0;
+        while (i < c.outbox_len) {
+            const e = &c.outbox_entries[i];
+            e.sent = false;
+            const awaiting = c.pendingKind(e.id) == .publish_await_pubcomp;
+            const drop = if (awaiting)
+                !session_present
+            else
+                e.len > c.server.maximum_packet_size or
+                    @intFromEnum(publishQos(c.outbox[e.offset..][0..e.len])) > @intFromEnum(c.server.maximum_qos);
+            if (drop) {
+                c.removePending(e.id);
+                c.outboxRemoveAt(i);
+                c.outbox_dropped_n += 1;
+            } else i += 1;
+        }
+        try c.outboxFlush(now);
+    }
+
+    fn publishQos(bytes: []const u8) packet.QoS {
+        return @enumFromInt((bytes[0] >> 1) & 0x3);
+    }
+
+    /// Send, in order, the outbox entries not yet transmitted on this
+    /// connection, stopping at the first PUBLISH the server's Receive Maximum
+    /// has no quota for (called again whenever an acknowledgement frees some).
+    fn outboxFlush(c: *Client, now: u64) Error!void {
+        if (c.outbox_len == 0) return;
+        var sent: usize = 0;
+        for (c.outbox_entries[0..c.outbox_len]) |e| sent += @intFromBool(e.sent);
+        for (c.outbox_entries[0..c.outbox_len]) |*e| {
+            if (e.sent) continue;
+            if (c.pendingKind(e.id) == .publish_await_pubcomp) {
+                try c.sendAck(now, .pubrel, e.id, .success);
+            } else {
+                if (sent >= c.server.receive_maximum) return;
+                const out = c.tx_buf[0..e.len];
+                @memcpy(out, c.outbox[e.offset..][0..e.len]);
+                if (c.resend_dup) out[0] |= 0x08;
+                try c.send(now, out);
+            }
+            e.sent = true;
+            sent += 1;
+        }
+    }
 
     fn send(c: *Client, now: u64, bytes: []const u8) TransportError!void {
         try c.transport.write(bytes);
@@ -512,6 +700,7 @@ pub const Client = struct {
             return error.PacketTooLarge; // 3.2.2-15
         }
         const bytes = try packet.encodePacket(c.tx_buf, c.version, .{ .publish = p });
+        if (c.outbox.len > 0 and p.qos != .at_most_once and !p.dup) try c.outboxStore(p.packet_id, bytes);
         try c.send(now, bytes);
     }
 
@@ -581,6 +770,7 @@ pub const Client = struct {
                 const ok = if (c.version == .v5) ca.reason_code == .success else ca.return_code == .accepted;
                 c.state = if (ok) .connected else .disconnected;
                 if (ok and c.version == .v5) c.applyConnack(ca.properties);
+                if (ok and c.outbox_len > 0) try c.outboxResume(now, ca.session_present);
                 return .{ .connack = ca };
             },
             // AUTH comes before the CONNACK (a challenge) or after it
@@ -634,6 +824,8 @@ pub const Client = struct {
             .puback => |ack| {
                 if (c.pendingKind(ack.packet_id) != .publish_qos1) return error.ProtocolViolation;
                 c.removePending(ack.packet_id);
+                c.outboxRemove(ack.packet_id);
+                try c.outboxFlush(now);
                 return .{ .puback = ack };
             },
             .pubrec => |ack| {
@@ -641,15 +833,20 @@ pub const Client = struct {
                 // 5.0: a refusing PUBREC ends the handshake (4.3.3, 4.4.0-2).
                 if (ack.reason_code.isError()) {
                     c.removePending(ack.packet_id);
+                    c.outboxRemove(ack.packet_id);
+                    try c.outboxFlush(now);
                     return .{ .pubcomp = ack };
                 }
                 c.setPendingKind(ack.packet_id, .publish_await_pubcomp);
+                if (c.outboxIndex(ack.packet_id)) |i| c.outboxShrink(i);
                 try c.sendAck(now, .pubrel, ack.packet_id, .success);
                 return null;
             },
             .pubcomp => |ack| {
                 if (c.pendingKind(ack.packet_id) != .publish_await_pubcomp) return error.ProtocolViolation;
                 c.removePending(ack.packet_id);
+                c.outboxRemove(ack.packet_id);
+                try c.outboxFlush(now);
                 return .{ .pubcomp = ack };
             },
             .pubrel => |ack| {
