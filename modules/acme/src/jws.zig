@@ -25,17 +25,23 @@ pub const KeyPair = Es256.KeyPair;
 /// (std's leaves the key on the dead stack, same as std's P-256).
 pub const Es384 = @import("p384").EcdsaP384Sha384;
 
+/// ECDSA P-521 + SHA-512 (ES512, RFC 7518 §3.4), over the `p521` module's
+/// burned signer.
+pub const Es512 = @import("p521").EcdsaP521Sha512;
+
 /// The JWS algorithms an ACME account or certificate key can use here.
 /// RSA is not supported (see SPEC "Backlog").
 pub const Alg = enum {
     es256,
     es384,
+    es512,
 
     /// The JOSE `alg` name (RFC 7518 §3.1).
     pub fn name(a: Alg) []const u8 {
         return switch (a) {
             .es256 => "ES256",
             .es384 => "ES384",
+            .es512 => "ES512",
         };
     }
 
@@ -44,6 +50,7 @@ pub const Alg = enum {
         return switch (a) {
             .es256 => "P-256",
             .es384 => "P-384",
+            .es512 => "P-521",
         };
     }
 
@@ -52,6 +59,7 @@ pub const Alg = enum {
         return switch (a) {
             .es256 => 32,
             .es384 => 48,
+            .es512 => 66,
         };
     }
 
@@ -63,6 +71,7 @@ pub const Alg = enum {
     pub fn fromName(s: []const u8) ?Alg {
         if (std.mem.eql(u8, s, "ES256")) return .es256;
         if (std.mem.eql(u8, s, "ES384")) return .es384;
+        if (std.mem.eql(u8, s, "ES512")) return .es512;
         return null;
     }
 };
@@ -72,6 +81,7 @@ pub fn algOf(comptime T: type) Alg {
     return switch (T) {
         Es256.KeyPair, Es256.PublicKey => .es256,
         Es384.KeyPair, Es384.PublicKey => .es384,
+        Es512.KeyPair, Es512.PublicKey => .es512,
         else => @compileError("not an acme key type: " ++ @typeName(T)),
     };
 }
@@ -80,13 +90,14 @@ pub fn algOf(comptime T: type) Alg {
 pub const AnyPublicKey = union(Alg) {
     es256: Es256.PublicKey,
     es384: Es384.PublicKey,
+    es512: Es512.PublicKey,
 
     pub fn alg(k: AnyPublicKey) Alg {
         return std.meta.activeTag(k);
     }
 
-    /// Longest uncompressed SEC1 point (P-384: `04 ‖ X(48) ‖ Y(48)`).
-    pub const max_sec1_len = 97;
+    /// Longest uncompressed SEC1 point (P-521: `04 ‖ X(66) ‖ Y(66)`).
+    pub const max_sec1_len = 133;
 
     /// `04 ‖ X ‖ Y` into `buf`; the returned slice is its prefix.
     pub fn uncompressedSec1(k: AnyPublicKey, buf: *[max_sec1_len]u8) []const u8 {
@@ -113,6 +124,7 @@ pub const AnyPublicKey = union(Alg) {
 pub const AnyKeyPair = union(Alg) {
     es256: Es256.KeyPair,
     es384: Es384.KeyPair,
+    es512: Es512.KeyPair,
 
     pub fn alg(k: *const AnyKeyPair) Alg {
         return std.meta.activeTag(k.*);
@@ -122,6 +134,7 @@ pub const AnyKeyPair = union(Alg) {
         return switch (k.*) {
             .es256 => |*kp| .{ .es256 = kp.public_key },
             .es384 => |*kp| .{ .es384 = kp.public_key },
+            .es512 => |*kp| .{ .es512 = kp.public_key },
         };
     }
 };
@@ -132,6 +145,7 @@ pub fn anyPublic(pk: anytype) AnyPublicKey {
         AnyPublicKey => pk,
         Es256.PublicKey => .{ .es256 = pk },
         Es384.PublicKey => .{ .es384 = pk },
+        Es512.PublicKey => .{ .es512 = pk },
         else => @compileError("not an acme public key: " ++ @typeName(@TypeOf(pk))),
     };
 }
@@ -142,6 +156,7 @@ pub fn publicOfPair(key_pair: anytype) AnyPublicKey {
         AnyKeyPair => key_pair.publicKey(),
         Es256.KeyPair => .{ .es256 = key_pair.public_key },
         Es384.KeyPair => .{ .es384 = key_pair.public_key },
+        Es512.KeyPair => .{ .es512 = key_pair.public_key },
         else => @compileError("not an acme key pair: " ++ @typeName(@TypeOf(key_pair.*))),
     };
 }
@@ -154,6 +169,7 @@ pub fn copyPairInto(out: *AnyKeyPair, key_pair: anytype) void {
         AnyKeyPair => out.* = key_pair.*,
         Es256.KeyPair => out.* = .{ .es256 = key_pair.* },
         Es384.KeyPair => out.* = .{ .es384 = key_pair.* },
+        Es512.KeyPair => out.* = .{ .es512 = key_pair.* },
         else => @compileError("not an acme key pair: " ++ @typeName(@TypeOf(key_pair.*))),
     }
 }
@@ -181,8 +197,8 @@ pub fn generateKeyPair(out: *KeyPair, io: std.Io) void {
     burn.stack(burn.key_burn);
 }
 
-/// `generateKeyPair` for a chosen curve, into an `AnyKeyPair` (ES384 account
-/// and certificate keys). Same entropy path and burn.
+/// `generateKeyPair` for a chosen curve, into an `AnyKeyPair` (ES384 / ES512
+/// account and certificate keys). Same entropy path and burn.
 pub fn generateAnyKeyPair(out: *AnyKeyPair, alg: Alg, io: std.Io) void {
     switch (alg) {
         .es256 => {
@@ -192,6 +208,10 @@ pub fn generateAnyKeyPair(out: *AnyKeyPair, alg: Alg, io: std.Io) void {
         .es384 => {
             out.* = .{ .es384 = undefined };
             generateKeyPairUnburned(Es384.KeyPair, &out.es384, io);
+        },
+        .es512 => {
+            out.* = .{ .es512 = undefined };
+            generateKeyPairUnburned(Es512.KeyPair, &out.es512, io);
         },
     }
     burn.stack(burn.key_burn);
@@ -251,11 +271,11 @@ fn canonicalJwkLen() usize {
     return "{\"crv\":\"P-256\",\"kty\":\"EC\",\"x\":\"\",\"y\":\"\"}".len + 2 * 43;
 }
 
-/// Length of the longest canonical JWK (P-384: 64-character coordinates).
-pub const max_canonical_jwk_len = "{\"crv\":\"P-384\",\"kty\":\"EC\",\"x\":\"\",\"y\":\"\"}".len + 2 * 64;
+/// Length of the longest canonical JWK (P-521: 88-character coordinates).
+pub const max_canonical_jwk_len = "{\"crv\":\"P-521\",\"kty\":\"EC\",\"x\":\"\",\"y\":\"\"}".len + 2 * 88;
 
-/// The canonical JWK of a public key (`Es256.PublicKey`, `Es384.PublicKey` or
-/// `AnyPublicKey`): required members only, in lexicographic order, no
+/// The canonical JWK of a public key (`Es256.PublicKey`, `Es384.PublicKey`,
+/// `Es512.PublicKey` or `AnyPublicKey`): required members only, in lexicographic order, no
 /// whitespace — the exact byte sequence RFC 7638 hashes. `buf` must hold
 /// `max_canonical_jwk_len` bytes (`canonical_jwk_len` suffices for P-256).
 pub fn canonicalJwk(buf: []u8, public_key: anytype) []const u8 {
@@ -263,8 +283,8 @@ pub fn canonicalJwk(buf: []u8, public_key: anytype) []const u8 {
     var sec1_buf: [AnyPublicKey.max_sec1_len]u8 = undefined;
     const sec1 = pk.uncompressedSec1(&sec1_buf); // 0x04 ‖ X ‖ Y
     const n = pk.alg().coordLen();
-    var xb: [64]u8 = undefined;
-    var yb: [64]u8 = undefined;
+    var xb: [88]u8 = undefined;
+    var yb: [88]u8 = undefined;
     const x = b64.Encoder.encode(&xb, sec1[1 .. 1 + n]);
     const y = b64.Encoder.encode(&yb, sec1[1 + n .. 1 + 2 * n]);
     return std.fmt.bufPrint(
@@ -383,7 +403,7 @@ pub fn dns01TxtValue(
 // ── flattened-JSON JWS signing ──────────────────────────────────────────────
 
 /// The ACME protected header (RFC 8555 §6.2): `alg` follows the signing key
-/// (ES256 or ES384); `kid` null embeds the signer's `jwk` instead
+/// (ES256, ES384 or ES512); `kid` null embeds the signer's `jwk` instead
 /// (newAccount / revoke-by-key / the inner JWS of a key rollover), any other
 /// POST carries the account URL as `kid`. `nonce` null omits the member (the
 /// inner JWS of a key rollover MUST NOT carry one, RFC 8555 §7.3.5).
@@ -397,7 +417,7 @@ pub const SignError = error{ OutOfMemory, SigningFailed };
 
 /// Sign `payload` (raw bytes; "" for POST-as-GET) into a flattened JSON JWS
 /// (`{"protected","payload","signature"}`). `key_pair` is a pointer to an
-/// `Es256.KeyPair`, an `Es384.KeyPair` or an `AnyKeyPair`. Caller owns the
+/// `Es256.KeyPair`, an `Es384.KeyPair`, an `Es512.KeyPair` or an `AnyKeyPair`. Caller owns the
 /// returned JSON.
 pub fn sign(
     gpa: std.mem.Allocator,
@@ -493,8 +513,8 @@ fn appendJws(
     const input = try std.mem.concat(gpa, u8, &.{ protected_b64, ".", payload_b64 });
     defer gpa.free(input);
     const sig = key_pair.sign(input, null) catch return error.SigningFailed;
-    const sig_bytes = sig.toBytes(); // r ‖ s: 64 bytes (ES256) or 96 (ES384)
-    var sig_b64_buf: [base64UrlLen(96)]u8 = undefined;
+    const sig_bytes = sig.toBytes(); // r ‖ s: 64 bytes (ES256), 96 (ES384) or 132 (ES512)
+    var sig_b64_buf: [base64UrlLen(132)]u8 = undefined;
     const sig_b64 = b64.Encoder.encode(&sig_b64_buf, &sig_bytes);
 
     try w.print(
@@ -707,7 +727,7 @@ pub const VerifiedAny = struct {
 /// null means "use the embedded jwk" (newAccount); otherwise the signature
 /// must verify against `expected_key` (the account key a real CA has on
 /// file). This is the mock-CA / test half of the module. ES256 only: an
-/// ES384 JWS answers `UnsupportedJws` (see `verifyFlattenedAny`).
+/// ES384 or ES512 JWS answers `UnsupportedJws` (see `verifyFlattenedAny`).
 pub fn verifyFlattened(
     gpa: std.mem.Allocator,
     jws_json: []const u8,
@@ -726,7 +746,7 @@ pub fn verifyFlattened(
     };
 }
 
-/// `verifyFlattened` for ES256 and ES384: the header's `alg` picks the curve,
+/// `verifyFlattened` for ES256, ES384 and ES512: the header's `alg` picks the curve,
 /// the embedded jwk must be on it, and an `expected_key` must be too.
 pub fn verifyFlattenedAny(
     gpa: std.mem.Allocator,
@@ -757,7 +777,8 @@ pub fn verifyFlattenedAny(
         error.OutOfMemory => return error.OutOfMemory,
         error.InvalidBase64 => return error.MalformedJws,
     };
-    if (sig_bytes.len != Alg.es256.sigLen() and sig_bytes.len != Alg.es384.sigLen())
+    if (sig_bytes.len != Alg.es256.sigLen() and sig_bytes.len != Alg.es384.sigLen() and
+        sig_bytes.len != Alg.es512.sigLen())
         return error.MalformedJws;
 
     const head = std.json.parseFromSliceLeaky(ProtectedJson, a, protected, .{
@@ -788,6 +809,7 @@ pub fn verifyFlattenedAny(
     switch (key) {
         .es256 => |k| Es256.Signature.fromBytes(sig_bytes[0..64].*).verify(input, k) catch return error.BadSignature,
         .es384 => |k| Es384.Signature.fromBytes(sig_bytes[0..96].*).verify(input, k) catch return error.BadSignature,
+        .es512 => |k| Es512.Signature.fromBytes(sig_bytes[0..132].*).verify(input, k) catch return error.BadSignature,
     }
 
     return .{
@@ -818,6 +840,7 @@ fn publicKeyFromCoords(
     return switch (alg) {
         .es256 => .{ .es256 = Es256.PublicKey.fromSec1(sec1[0 .. 1 + 2 * n]) catch return error.InvalidKey },
         .es384 => .{ .es384 = Es384.PublicKey.fromSec1(sec1[0 .. 1 + 2 * n]) catch return error.InvalidKey },
+        .es512 => .{ .es512 = Es512.PublicKey.fromSec1(sec1[0 .. 1 + 2 * n]) catch return error.InvalidKey },
     };
 }
 
@@ -1280,7 +1303,7 @@ test "generateAnyKeyPair: both curves draw entropy and sign" {
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
-    inline for (.{ Alg.es256, Alg.es384 }) |alg| {
+    inline for (.{ Alg.es256, Alg.es384, Alg.es512 }) |alg| {
         var a: AnyKeyPair = undefined;
         var b: AnyKeyPair = undefined;
         generateAnyKeyPair(&a, alg, io);
@@ -1302,7 +1325,131 @@ test "Alg and AnyPublicKey bookkeeping" {
     try testing.expectEqual(@as(usize, 96), Alg.es384.sigLen());
     try testing.expectEqual(@as(usize, 64), Alg.es256.sigLen());
     try testing.expectEqual(@as(?Alg, .es256), Alg.fromName("ES256"));
-    try testing.expectEqual(@as(?Alg, null), Alg.fromName("ES512"));
+    try testing.expectEqual(@as(?Alg, null), Alg.fromName("ES256K"));
     try testing.expectEqual(@as(?Alg, null), Alg.fromName("es256"));
     try testing.expect(!(AnyPublicKey{ .es256 = (try rfc7515KeyPair()).public_key }).eql(.{ .es384 = (try p384KeyPair()).public_key }));
+    try testing.expectEqualStrings("ES512", Alg.es512.name());
+    try testing.expectEqualStrings("P-521", Alg.es512.crv());
+    try testing.expectEqual(@as(usize, 66), Alg.es512.coordLen());
+    try testing.expectEqual(@as(usize, 132), Alg.es512.sigLen());
+    try testing.expectEqual(@as(?Alg, .es512), Alg.fromName("ES512"));
+    try testing.expectEqual(@as(?Alg, null), Alg.fromName("es512"));
+    try testing.expect(!(AnyPublicKey{ .es384 = (try p384KeyPair()).public_key }).eql(.{ .es512 = (try p521KeyPair()).public_key }));
+    try testing.expectEqual(Alg.es512, algOf(Es512.KeyPair));
+    try testing.expectEqual(@as(usize, 133), (try p521KeyPair()).public_key.toUncompressedSec1().len);
+}
+
+// ── ES512 (2026-10-16) ──────────────────────────────────────────────────────
+
+// A throwaway P-521 key (the same key as x509.zig's PKCS#8 fixture), made with
+//   openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-521 -out k.pkcs8.pem
+// and its scalar read back with
+//   openssl ec -in k.pkcs8.pem -text -noout   (the `priv:` block, 66 bytes).
+const p521_d_hex = "0083913efb00f857a280618efa0ccf12f1239aa873ecd2bcd8ba0f2c1151150c556dbb9f9a5818b13dcca7aa9906d98f685d2c2162fa7780fec27ef6214395212279";
+// Oracle: python3 -I (hashlib, base64) over the last 133 bytes of
+//   openssl pkey -in k.pkcs8.pem -pubout -outform DER
+// (04 || X(66) || Y(66)): canonical JWK per RFC 7638, then
+// base64url(SHA-256) of its bytes.
+const p521_canonical_jwk = "{\"crv\":\"P-521\",\"kty\":\"EC\"," ++
+    "\"x\":\"AOnWQyNjrh6pOja0XoTQ58LC0rigU_Sbx0ylxJpPRPpn-n9xpfpBZQzmO2lZ9rOx8P55quCuziKsIQ-1rl1Mwmhy\"," ++
+    "\"y\":\"AB8t7jfRkWDJWqynLNIZ4IiK6Yp_S3TRBtff3gHQIaILzH2DnGqccTcAx9gTVQttwRtmY3fXdtNLWsvm84CsnNy9\"}";
+const p521_thumbprint = "nRl-ZR2ZBULOBkcF9B_bG2TMCNglNTXj0MVWjG-GD-o";
+
+fn p521KeyPair() !*const Es512.KeyPair {
+    const S = struct {
+        var kp: Es512.KeyPair = undefined;
+        var ready = false;
+    };
+    if (!S.ready) {
+        var sk: Es512.SecretKey = undefined;
+        _ = try std.fmt.hexToBytes(&sk.bytes, p521_d_hex);
+        try Es512.KeyPair.fromSecretKeyInto(&S.kp, &sk);
+        S.ready = true;
+    }
+    return &S.kp;
+}
+
+test "ES512: JWK, RFC 7638 thumbprint and key authorization against openssl + python" {
+    const kp = try p521KeyPair();
+    var buf: [max_canonical_jwk_len]u8 = undefined;
+    try testing.expectEqualStrings(p521_canonical_jwk, canonicalJwk(&buf, kp.public_key));
+    try testing.expectEqual(max_canonical_jwk_len, p521_canonical_jwk.len);
+    try testing.expectEqualStrings(p521_thumbprint, &thumbprintBase64(kp.public_key));
+    try testing.expectEqualStrings(p521_thumbprint, &thumbprintBase64(AnyPublicKey{ .es512 = kp.public_key }));
+    var ka: [max_key_authorization_len]u8 = undefined;
+    try testing.expectEqualStrings(
+        "DGyRejmCefe7v4NfDGDKfA." ++ p521_thumbprint,
+        try keyAuthorization(&ka, "DGyRejmCefe7v4NfDGDKfA", kp.public_key),
+    );
+}
+
+test "ES512: sign -> verifyFlattenedAny (jwk and kid), 132-byte signature, alg ES512, no nonce member when null" {
+    const kp = try p521KeyPair();
+    const jws_json = try sign(testing.allocator, kp, "{\"a\":1}", .{ .nonce = "n-521", .url = "https://ca.example/new-acct" });
+    defer testing.allocator.free(jws_json);
+    var v = try verifyFlattenedAny(testing.allocator, jws_json, null);
+    defer v.deinit();
+    try testing.expectEqual(Alg.es512, v.alg);
+    try testing.expectEqualStrings("{\"a\":1}", v.payload);
+    try testing.expectEqualStrings("n-521", v.nonce);
+    try testing.expect(v.jwk_key.?.eql(.{ .es512 = kp.public_key }));
+    const Flat = struct { protected: []const u8, signature: []const u8 };
+    const flat = try std.json.parseFromSlice(Flat, testing.allocator, jws_json, .{ .ignore_unknown_fields = true });
+    defer flat.deinit();
+    const protected = try base64UrlDecodeAlloc(testing.allocator, flat.value.protected);
+    defer testing.allocator.free(protected);
+    try testing.expectEqualStrings(
+        "{\"alg\":\"ES512\",\"jwk\":" ++ p521_canonical_jwk ++ ",\"nonce\":\"n-521\",\"url\":\"https://ca.example/new-acct\"}",
+        protected,
+    );
+    const sig = try base64UrlDecodeAlloc(testing.allocator, flat.value.signature);
+    defer testing.allocator.free(sig);
+    try testing.expectEqual(@as(usize, 132), sig.len);
+
+    // The ES256-only verifier refuses it by name; keys of the other curves cannot stand in.
+    try testing.expectError(error.UnsupportedJws, verifyFlattened(testing.allocator, jws_json, null));
+    const k256 = try rfc7515KeyPair();
+    try testing.expectError(error.UnsupportedJws, verifyFlattenedAny(testing.allocator, jws_json, .{ .es256 = k256.public_key }));
+    const k384 = try p384KeyPair();
+    try testing.expectError(error.UnsupportedJws, verifyFlattenedAny(testing.allocator, jws_json, .{ .es384 = k384.public_key }));
+
+    // kid mode through an AnyKeyPair, deterministic, and no nonce member when null.
+    const any: AnyKeyPair = .{ .es512 = kp.* };
+    const kid1 = try sign(testing.allocator, &any, "", .{ .nonce = null, .url = "https://ca.example/x", .kid = "https://ca.example/acct/1" });
+    defer testing.allocator.free(kid1);
+    const kid2 = try sign(testing.allocator, kp, "", .{ .nonce = null, .url = "https://ca.example/x", .kid = "https://ca.example/acct/1" });
+    defer testing.allocator.free(kid2);
+    try testing.expectEqualStrings(kid1, kid2);
+    var v2 = try verifyFlattenedAny(testing.allocator, kid1, .{ .es512 = kp.public_key });
+    defer v2.deinit();
+    try testing.expectEqualStrings("", v2.nonce);
+    try testing.expectEqualStrings("https://ca.example/acct/1", v2.kid.?);
+    // Another P-521 key does not verify it.
+    const other = try Es512.KeyPair.generateDeterministic(@splat(9));
+    try testing.expectError(error.BadSignature, verifyFlattenedAny(testing.allocator, kid1, .{ .es512 = other.public_key }));
+    // A 96-byte signature under alg ES512 is malformed (RFC 7518 §3.4).
+    const short = try craftJwsAlgAny(testing.allocator, "ES512", .{ .es512 = kp.public_key }, 96);
+    defer testing.allocator.free(short);
+    try testing.expectError(error.MalformedJws, verifyFlattenedAny(testing.allocator, short, null));
+    // A tampered payload fails the signature.
+    const tampered = try testing.allocator.dupe(u8, jws_json);
+    defer testing.allocator.free(tampered);
+    const pay_at = std.mem.indexOf(u8, tampered, "\"payload\":\"").? + "\"payload\":\"".len;
+    tampered[pay_at] = if (tampered[pay_at] == 'A') 'B' else 'A';
+    try testing.expectError(error.BadSignature, verifyFlattenedAny(testing.allocator, tampered, null));
+}
+
+fn craftJwsAlgAny(gpa: std.mem.Allocator, alg: []const u8, public_key: AnyPublicKey, sig_len: usize) ![]u8 {
+    var jwk_buf: [max_canonical_jwk_len]u8 = undefined;
+    const jwk = canonicalJwk(&jwk_buf, public_key);
+    const protected = try std.fmt.allocPrint(gpa, "{{\"alg\":\"{s}\",\"jwk\":{s},\"nonce\":\"n\",\"url\":\"u\"}}", .{ alg, jwk });
+    defer gpa.free(protected);
+    const p64 = try base64UrlEncodeAlloc(gpa, protected);
+    defer gpa.free(p64);
+    const zeros = try gpa.alloc(u8, sig_len);
+    defer gpa.free(zeros);
+    @memset(zeros, 0);
+    const s64 = try base64UrlEncodeAlloc(gpa, zeros);
+    defer gpa.free(s64);
+    return std.fmt.allocPrint(gpa, "{{\"protected\":\"{s}\",\"payload\":\"\",\"signature\":\"{s}\"}}", .{ p64, s64 });
 }

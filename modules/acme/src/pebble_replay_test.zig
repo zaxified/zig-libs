@@ -154,6 +154,98 @@ fn replayScenario(name: []const u8, domains: []const []const u8, challenge: acme
     return replay.bad_nonces;
 }
 
+/// The recorded body of the first exchange in `scenario` whose path contains `needle`.
+fn recordedBody(scenario: []const u8, needle: []const u8) ![]const u8 {
+    for (transcript.exchanges) |e| {
+        if (std.mem.eql(u8, e.scenario, scenario) and e.status == 200 and
+            std.mem.indexOf(u8, e.path, needle) != null) return e.body;
+    }
+    return error.NotRecorded;
+}
+
+/// `tools/interop.zig`'s `lifecycle` scenario on Pebble's recorded answers:
+/// the same calls in the same order must succeed (and the order after
+/// deactivation fail) exactly as they did against Pebble.
+fn replayLifecycle() !void {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    var replay: Replay = .{ .scenario = "lifecycle" };
+    var server = http.Server.init(io, gpa, .{ .handler = handler, .context = &replay });
+    defer server.deinit();
+    server.bind() catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+    var base_buf: [64]u8 = undefined;
+    replay.base = try std.fmt.bufPrint(&base_buf, "http://127.0.0.1:{d}", .{server.boundAddress().getPort()});
+    var dir_buf: [80]u8 = undefined;
+    const dir_url = try std.fmt.bufPrint(&dir_buf, "{s}/dir", .{replay.base});
+    const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
+    defer thread.join();
+    defer server.shutdown();
+
+    var transport = http.Client.init(io, gpa, .{});
+    defer transport.deinit();
+    var account_key: acme.jws.KeyPair = undefined;
+    try acme.jws.Es256.KeyPair.generateDeterministicInto(&account_key, &@as([32]u8, @splat(8)));
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&account_key));
+    var client = acme.Client.init(io, gpa, &transport, &account_key, .{
+        .directory_url = dir_url,
+        .eab = .{ .kid = "kid-interop", .hmac_key = "replay: the MAC is not checked" },
+        .poll_interval_ms = 1,
+        .max_polls = 20,
+    });
+    defer client.deinit();
+    const names: []const []const u8 = &.{"l.test"};
+
+    var has_short = false;
+    for (try client.profiles()) |pf| has_short = has_short or std.mem.eql(u8, pf.name, "shortlived");
+    try testing.expect(has_short);
+    var first = try client.obtainWith(names, .{ .profile = "shortlived" });
+    defer first.deinit(gpa);
+    const first_der = try acme.x509.pemDecode(gpa, "CERTIFICATE", first.chain_pem);
+    defer gpa.free(first_der);
+    var info = try client.renewalInfo(first_der);
+    defer info.deinit(gpa);
+    try testing.expect(info.window_start < info.window_end);
+    const cert_id = try acme.x509.ariCertId(gpa, first_der);
+    defer gpa.free(cert_id);
+    var second = try client.obtainWith(names, .{ .replaces = cert_id });
+    defer second.deinit(gpa);
+    try client.revoke(first_der, .superseded);
+    const second_der = try acme.x509.pemDecode(gpa, "CERTIFICATE", second.chain_pem);
+    defer gpa.free(second_der);
+    var cert_key: acme.jws.AnyKeyPair = undefined;
+    try acme.x509.privateKeyFromPem(&cert_key, gpa, second.key_pem);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&cert_key));
+    try client.revokeWithCertKey(second_der, &cert_key, null);
+    try client.updateContact(&.{"mailto:other@acme.test"});
+    var new_key: acme.jws.Es384.KeyPair = undefined;
+    try acme.jws.Es384.KeyPair.generateDeterministicInto(&new_key, &@as([48]u8, @splat(0x61)));
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&new_key));
+    try client.rolloverKey(&new_key);
+    var third = try client.obtainWith(names, .{});
+    defer third.deinit(gpa);
+
+    // The alternate chain, asked for by the CN atop Pebble's recorded alternate.
+    const alt_pem = try recordedBody("lifecycle", "/alternate/");
+    const top = std.mem.lastIndexOf(u8, alt_pem, "-----BEGIN CERTIFICATE-----").?;
+    const top_der = try acme.x509.pemDecode(gpa, "CERTIFICATE", alt_pem[top..]);
+    defer gpa.free(top_der);
+    var alt = try client.obtainWith(names, .{ .preferred_chain = acme.x509.issuerCommonName(top_der).? });
+    defer alt.deinit(gpa);
+    try testing.expectEqualStrings(alt_pem, alt.chain_pem);
+
+    try client.deactivate();
+    try testing.expectError(error.AcmeProblem, client.obtain(names));
+    try testing.expect(std.mem.startsWith(u8, client.lastProblem() orelse "", "urn:ietf:params:acme:error:unauthorized: "));
+    try testing.expectEqual(@as(usize, 0), replay.misses);
+}
+
+test "Pebble replay: the account lifecycle (profile, ARI, revoke, rollover, alternate chain, deactivate)" {
+    try replayLifecycle();
+}
+
 test "Pebble replay: the client reaches Pebble's outcome on Pebble's own answers" {
     var bad_nonces: usize = 0;
     bad_nonces += try replayScenario("http01", &.{"a.test"}, .http_01, .{ .issued = &.{"a.test"} });

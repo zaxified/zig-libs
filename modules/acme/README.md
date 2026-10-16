@@ -129,6 +129,38 @@ var renewed = try client.obtainWith(&.{"example.org"}, .{ .replaces = id });
 `renewalInfo`. `Reason` is the RFC 5280 CRLReason code (non-exhaustive: the CA
 refuses an unwanted one with `badRevocationReason`).
 
+## Order options: profiles, chains, CSR, rate limits
+
+```zig
+// Directory presets: letsencrypt_staging (default), letsencrypt_production,
+// zerossl, google_trust_services, google_trust_services_staging (the last three need EAB).
+
+// Profiles (draft-ietf-acme-profiles): what the CA offers, then order one.
+for (try client.profiles()) |p| std.log.info("{s}: {s}", .{ p.name, p.description });
+var short = try client.obtainWith(&.{"example.org"}, .{
+    .profile = "shortlived",          // .profile_mode = .preferred → order without it if absent
+    .preferred_chain = "ISRG Root X2", // issuer CN of the chain's topmost certificate; else the default chain
+    .csr_extensions = &.{acme.x509.must_staple}, // or any x509.Extension the CA honours
+});
+
+// Issue for your own CSR (HSM key, key reused across renewals, a CSR from openssl):
+var chain = try client.obtainWithCsr(csr_der, .{});
+defer chain.deinit(gpa); // chain.chain_pem, chain.not_after — no key: it is yours
+
+// Rate limits: error.RateLimited, and how long the CA asked to wait.
+_ = client.obtain(&.{"example.org"}) catch |err| switch (err) {
+    error.RateLimited => std.log.warn("retry in {?d} s", .{client.retryAfter()}),
+    else => return err,
+};
+```
+
+`ES512` (P-521, via `p521`) is the third key type next to ES256 and ES384:
+`jws.generateAnyKeyPair(&key, .es512, io)`, `Options.cert_key_alg = .es512`.
+A `503` is resent up to `Options.max_unavailable_retries` times (default 2) when the CA's
+`Retry-After` is at most 30 s; a longer one comes back as the problem, with `retryAfter()` set.
+`notBefore`/`notAfter` (`ObtainOptions.not_before`/`not_after`, epoch seconds) go on the order
+only when set — Let's Encrypt refuses orders that carry them.
+
 ## DNS-01 (RFC 8555 §8.4) and wildcard certificates
 
 For a host with no port the CA can reach, or for a wildcard, select

@@ -43,9 +43,11 @@ openssl x509 -req -in localhost.csr -CA ca.pem -CAkey ca.key -CAcreateserial -da
 cat > pebble.json <<JSON
 {"pebble": {"listenAddress": "127.0.0.1:14000", "managementListenAddress": "127.0.0.1:15000",
   "certificate": "$scr/localhost.pem", "privateKey": "$scr/localhost.key",
-  "httpPort": 5002, "tlsPort": 5001, "ocspResponderURL": "", "externalAccountBindingRequired": false,
+  "httpPort": 5002, "tlsPort": 5001, "ocspResponderURL": "", "externalAccountBindingRequired": true,
+  "externalAccountMACKeys": {"kid-interop": "6t6Lq0SIHxWzWdIjFJ2jUnAnvT4h3JBqL7eMwRRqFNE"},
   "domainBlocklist": ["blocked.test"], "retryAfter": {"authz": 1, "order": 1}, "keyAlgorithm": "ecdsa",
-  "profiles": {"default": {"description": "default", "validityPeriod": 7776000}}}}
+  "profiles": {"default": {"description": "default", "validityPeriod": 7776000},
+               "shortlived": {"description": "six days", "validityPeriod": 518400}}}}
 JSON
 
 pids=()
@@ -55,7 +57,7 @@ trap cleanup EXIT
 "$bin/pebble-challtestsrv" -defaultIPv4 127.0.0.1 -defaultIPv6 "" -dnsserver 127.0.0.1:8053 -management 127.0.0.1:8055 \
     -http01 "" -https01 "" -tlsalpn01 "" -doh "" > challtestsrv.log 2>&1 &
 pids+=($!)
-PEBBLE_VA_NOSLEEP=1 PEBBLE_WFE_NONCEREJECT=5 "$bin/pebble" -strict -config pebble.json -dnsserver 127.0.0.1:8053 \
+PEBBLE_VA_NOSLEEP=1 PEBBLE_WFE_NONCEREJECT=5 PEBBLE_ALTERNATE_ROOTS=1 "$bin/pebble" -strict -config pebble.json -dnsserver 127.0.0.1:8053 \
     > pebble.log 2>&1 &
 pids+=($!)
 (cd "$here/pebble_helper" && go build -o "$scr/pebble_helper" .)
@@ -67,6 +69,7 @@ for _ in $(seq 100); do
     sleep 0.1
 done
 curl -sf --cacert ca.pem https://localhost:15000/roots/0 > pebble-root.pem
+curl -sf --cacert ca.pem https://localhost:15000/roots/1 > pebble-root-1.pem
 
 cd "$root"
 zig build interop-acme -- --scratch "$scr"

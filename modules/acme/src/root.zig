@@ -58,7 +58,7 @@ pub const meta = .{
     .model_after = "golang.org/x/crypto/acme + certbot flow semantics; RFC 8555/7515/7638/8737 wire",
     // entropy: the seed behind `jws.generateKeyPair` — the account key and
     // every certificate key this client mints.
-    .deps = .{ "http", "router", "entropy", "p256", "p384" }, // p256/p384: the burned ECDSA P-256 / P-384 signers (ES256, ES384 keys); also uses std.crypto.Certificate, std.json
+    .deps = .{ "http", "router", "entropy", "p256", "p384", "p521" }, // p256/p384/p521: the burned ECDSA signers (ES256, ES384, ES512 keys); also uses std.crypto.Certificate, std.json
 };
 
 /// The ACME protocol client — see `Client.init` / `Client.obtain`.
@@ -89,6 +89,12 @@ pub const x509 = @import("x509.zig");
 pub const letsencrypt_staging = Client.letsencrypt_staging;
 /// Let's Encrypt production directory — explicit opt-in.
 pub const letsencrypt_production = Client.letsencrypt_production;
+/// ZeroSSL production directory (EAB required).
+pub const zerossl = Client.zerossl;
+/// Google Trust Services production directory (EAB required).
+pub const google_trust_services = Client.google_trust_services;
+/// Google Trust Services staging directory (EAB required).
+pub const google_trust_services_staging = Client.google_trust_services_staging;
 
 /// True when the first certificate of `cert_pem` expires within
 /// `within_days` of `now_unix` (or already has, or cannot be parsed —

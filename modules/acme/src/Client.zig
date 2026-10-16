@@ -42,6 +42,14 @@ const Client = @This();
 pub const letsencrypt_staging = "https://acme-staging-v02.api.letsencrypt.org/directory";
 /// Let's Encrypt production — real certs, strict rate limits. Opt-in only.
 pub const letsencrypt_production = "https://acme-v02.api.letsencrypt.org/directory";
+/// ZeroSSL production — needs external account binding (`Options.eab`,
+/// credentials from the ZeroSSL dashboard or its EAB API). No staging.
+pub const zerossl = "https://acme.zerossl.com/v2/DV90";
+/// Google Trust Services production — needs EAB (Google Cloud
+/// `publicca` external account keys).
+pub const google_trust_services = "https://dv.acme-v02.api.pki.goog/directory";
+/// Google Trust Services staging — EAB from the staging `publicca` API.
+pub const google_trust_services_staging = "https://dv.acme-v02.test-api.pki.goog/directory";
 
 io: std.Io,
 gpa: Allocator,
@@ -63,6 +71,8 @@ tls_alpn: TlsAlpnResponder,
 /// Last ACME problem document, for diagnostics (see `lastProblem`).
 problem_buf: [256]u8,
 problem_len: usize,
+/// `Retry-After` of the last refused request, seconds from then (see `retryAfter`).
+problem_retry_after_s: ?u64,
 
 /// Which RFC 8555 challenge the order flow solves for each authorization.
 /// `http_01` serves the key authorization over port 80 (via
@@ -134,6 +144,36 @@ pub const ObtainOptions = struct {
     /// RFC 9773 §5: the ARI CertID of the certificate this order replaces
     /// (`x509.ariCertId`); sent as the new-order `replaces` member.
     replaces: ?[]const u8 = null,
+    /// A certificate profile the CA advertises in its directory
+    /// (draft-ietf-acme-profiles; Let's Encrypt: "classic", "tlsserver",
+    /// "shortlived"). See `profiles`; `profile_mode` says what happens when
+    /// the CA does not offer it.
+    profile: ?[]const u8 = null,
+    profile_mode: ProfileMode = .required,
+    /// Requested validity, epoch seconds (RFC 8555 §7.4 `notBefore` /
+    /// `notAfter`). Many CAs, Let's Encrypt among them, refuse orders that
+    /// carry them; leave null unless the CA documents support.
+    not_before: ?u64 = null,
+    not_after: ?u64 = null,
+    /// Pick the chain whose topmost certificate was issued by this subject
+    /// common name, among the default chain and the CA's alternates
+    /// (RFC 8555 §7.4.2 `Link: rel="alternate"`). No match → the default
+    /// chain (the certbot and lego behaviour).
+    preferred_chain: ?[]const u8 = null,
+    /// Extra CSR extensions (`x509.must_staple`, or any other the CA
+    /// honours); not with `obtainWithCsr`, whose CSR is the caller's.
+    csr_extensions: []const x509.Extension = &.{},
+};
+
+/// What `obtainWith` does when `ObtainOptions.profile` is not in the
+/// directory: fail with `error.NotSupported`, or order without a profile.
+pub const ProfileMode = enum { required, preferred };
+
+/// A certificate profile from the directory's `meta.profiles`.
+pub const Profile = struct {
+    name: []const u8,
+    /// The CA's human-readable description (often a URL).
+    description: []const u8,
 };
 
 pub const Options = struct {
@@ -166,7 +206,13 @@ pub const Options = struct {
     max_polls: u32 = 60,
     /// Upper bound for one ACME response body.
     max_response_bytes: usize = 1 << 20,
+    /// Resends of a request the CA answered `503 Service Unavailable`
+    /// (back-off 1 s, 2 s, … or its `Retry-After` when that is at most 30 s;
+    /// a longer one returns the problem with `retryAfter` set). 0 = never.
+    max_unavailable_retries: u8 = 2,
 };
+
+const max_unavailable_wait_ms = 30_000;
 
 pub const Error = error{
     OutOfMemory,
@@ -178,6 +224,9 @@ pub const Error = error{
     MalformedResponse,
     /// The CA refused with a problem document — `lastProblem` has details.
     AcmeProblem,
+    /// The CA refused with `urn:ietf:params:acme:error:rateLimited`
+    /// (RFC 8555 §6.6). `retryAfter` says when to try again, if the CA said.
+    RateLimited,
     /// An authorization ended in an error state (or offered no challenge of
     /// the configured type).
     AuthorizationFailed,
@@ -195,6 +244,10 @@ pub const Error = error{
     /// (`*.example.org`) while `challenge_type` is not `dns_01` — no other
     /// challenge can validate one (RFC 8555 §7.1.3, and CA policy).
     InvalidDomain,
+    /// `obtainWithCsr`: the CSR does not parse, or its self-signature does
+    /// not verify; `obtainWith`: `csr_extensions` repeats an OID or names
+    /// the subjectAltName.
+    InvalidCsr,
     /// A `kid`-signed request was attempted before registration.
     NotRegistered,
     /// The CA's directory lacks the endpoint the call needs (`keyChange`,
@@ -211,8 +264,15 @@ const Directory = struct {
     key_change: ?[]u8 = null,
     revoke_cert: ?[]u8 = null,
     renewal_info: ?[]u8 = null,
+    /// `meta.profiles` (draft-ietf-acme-profiles), owned, directory order.
+    profiles: []Profile = &.{},
 
     fn deinit(d: *Directory, gpa: Allocator) void {
+        for (d.profiles) |pr| {
+            gpa.free(pr.name);
+            gpa.free(pr.description);
+        }
+        gpa.free(d.profiles);
         gpa.free(d.new_nonce);
         gpa.free(d.new_account);
         gpa.free(d.new_order);
@@ -255,6 +315,7 @@ pub fn init(
         .tls_alpn = TlsAlpnResponder.init(gpa),
         .problem_buf = undefined,
         .problem_len = 0,
+        .problem_retry_after_s = null,
     };
 }
 
@@ -277,6 +338,13 @@ pub fn deinit(c: *Client) void {
 /// The account URL (JWS `kid`) once registered, or null.
 pub fn accountUrl(c: *const Client) ?[]const u8 {
     return c.kid;
+}
+
+/// Seconds the CA asked to wait (`Retry-After`) on the last refused request,
+/// or null when it did not say. Set together with `lastProblem`; most useful
+/// after `error.RateLimited`.
+pub fn retryAfter(c: *const Client) ?u64 {
+    return c.problem_retry_after_s;
 }
 
 /// The most recent ACME problem document ("type: detail", truncated), for
@@ -334,8 +402,7 @@ pub fn register(c: *Client) Error!void {
 
     const pr = try c.postJws(a, c.dir.?.new_account, out.written(), .jwk);
     if (pr.status != 200 and pr.status != 201) {
-        c.noteProblem(pr.body);
-        return error.AcmeProblem;
+        return c.problemError(pr.body, pr.retry_after_s);
     }
     const loc = pr.location orelse return error.MalformedResponse;
     c.kid = try c.gpa.dupe(u8, loc);
@@ -377,8 +444,7 @@ pub fn updateContact(c: *Client, contacts: []const []const u8) Error!void {
     writeContactPayload(&js, contacts) catch return error.OutOfMemory;
     const pr = try c.postJws(a, c.kid.?, out.written(), .kid);
     if (pr.status != 200) {
-        c.noteProblem(pr.body);
-        return error.AcmeProblem;
+        return c.problemError(pr.body, pr.retry_after_s);
     }
 }
 
@@ -425,8 +491,7 @@ pub fn rolloverKey(c: *Client, new_key: anytype) Error!void {
 
     const pr = try c.postJws(a, key_change, inner, .kid);
     if (pr.status != 200) {
-        c.noteProblem(pr.body);
-        return error.AcmeProblem;
+        return c.problemError(pr.body, pr.retry_after_s);
     }
     // The CA now knows only the new key.
     std.crypto.secureZero(u8, std.mem.asBytes(&c.account_key));
@@ -457,8 +522,7 @@ pub fn deactivate(c: *Client) Error!void {
 
     const pr = try c.postJws(a, c.kid.?, "{\"status\":\"deactivated\"}", .kid);
     if (pr.status != 200) {
-        c.noteProblem(pr.body);
-        return error.AcmeProblem;
+        return c.problemError(pr.body, pr.retry_after_s);
     }
     c.gpa.free(c.kid.?);
     c.kid = null;
@@ -479,8 +543,7 @@ pub fn revoke(c: *Client, cert_der: []const u8, reason: ?Reason) Error!void {
     const payload = try revokePayload(a, cert_der, reason);
     const pr = try c.postSigned(a, url, payload, .kid, &c.account_key);
     if (pr.status != 200) {
-        c.noteProblem(pr.body);
-        return error.AcmeProblem;
+        return c.problemError(pr.body, pr.retry_after_s);
     }
 }
 
@@ -499,8 +562,7 @@ pub fn revokeWithCertKey(c: *Client, cert_der: []const u8, cert_key: anytype, re
     const payload = try revokePayload(a, cert_der, reason);
     const pr = try c.postSigned(a, url, payload, .jwk, cert_key);
     if (pr.status != 200) {
-        c.noteProblem(pr.body);
-        return error.AcmeProblem;
+        return c.problemError(pr.body, pr.retry_after_s);
     }
 }
 
@@ -575,13 +637,18 @@ pub fn renewalInfo(c: *Client, cert_der: []const u8) Error!RenewalInfo {
     const body = res.readAllAlloc(c.gpa, c.options.max_response_bytes) catch |err|
         return mapHttpError(err);
     defer c.gpa.free(body);
-    if (res.status != 200) {
-        c.noteProblem(body);
-        return error.AcmeProblem;
-    }
+    if (res.status != 200)
+        return c.problemError(body, c.retryAfterHeader(res.header("retry-after")));
     var info = try parseRenewalInfo(c.gpa, body);
-    info.retry_after_s = parseRetryAfterSeconds(res.header("retry-after"));
+    info.retry_after_s = c.retryAfterHeader(res.header("retry-after"));
     return info;
+}
+
+/// The certificate profiles the CA advertises (`meta.profiles`), empty when
+/// it has none. Borrowed from the client; valid until `deinit`.
+pub fn profiles(c: *Client) Error![]const Profile {
+    try c.ensureDirectory();
+    return c.dir.?.profiles;
 }
 
 /// `renewalInfo` for the first certificate of a PEM chain (`Certificate.chain_pem`).
@@ -654,6 +721,22 @@ fn parseRfc3339(s: []const u8) ?i64 {
     return days * 86400 + @as(i64, hour) * 3600 + @as(i64, minute) * 60 + second - offset;
 }
 
+const rfc3339_len = "YYYY-MM-DDThh:mm:ssZ".len;
+
+/// Epoch seconds → `YYYY-MM-DDThh:mm:ssZ` (UTC; years past 9999 are not
+/// representable in four digits and clamp there).
+fn formatRfc3339(buf: *[rfc3339_len]u8, epoch: u64) []const u8 {
+    const max: u64 = 253402300799; // 9999-12-31T23:59:59Z
+    const es: std.time.epoch.EpochSeconds = .{ .secs = @min(epoch, max) };
+    const yd = es.getEpochDay().calculateYearDay();
+    const md = yd.calculateMonthDay();
+    const ds = es.getDaySeconds();
+    return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
+        yd.year,              md.month.numeric(),      @as(u8, md.day_index) + 1,
+        ds.getHoursIntoDay(), ds.getMinutesIntoHour(), ds.getSecondsIntoMinute(),
+    }) catch unreachable; // exactly rfc3339_len
+}
+
 fn isLeap(y: i64) bool {
     return (@mod(y, 4) == 0 and @mod(y, 100) != 0) or @mod(y, 400) == 0;
 }
@@ -667,12 +750,6 @@ fn daysFromCivil(y_in: i64, m: u8, d: u8) i64 {
     const doy = @divFloor(153 * mp + 2, 5) + d - 1;
     const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
     return era * 146097 + doe - 719468;
-}
-
-/// Integer `Retry-After` seconds, uncapped (ARI asks for hours).
-fn parseRetryAfterSeconds(value: ?[]const u8) ?u64 {
-    const v = value orelse return null;
-    return std.fmt.parseInt(u64, std.mem.trim(u8, v, " "), 10) catch null;
 }
 
 // ── the order flow ──────────────────────────────────────────────────────────
@@ -705,10 +782,83 @@ pub fn obtain(c: *Client, domains: []const []const u8) Error!Certificate {
     return c.obtainWith(domains, .{});
 }
 
-/// `obtain` with per-call options: `replaces` names the certificate this
-/// order renews (RFC 9773 §5), so the CA can tell a renewal from a new order.
-/// The certificate key follows `Options.cert_key_alg`.
+/// `obtain` with per-call options (`ObtainOptions`): ARI `replaces`, a
+/// profile, validity, a preferred chain. The certificate key follows
+/// `Options.cert_key_alg`.
 pub fn obtainWith(c: *Client, domains: []const []const u8, opts: ObtainOptions) Error!Certificate {
+    var arena = std.heap.ArenaAllocator.init(c.gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const order = try c.orderReady(a, domains, opts);
+
+    // Finalize with a CSR for a fresh certificate key (§7.4; the account
+    // key MUST NOT be reused as the certificate key — §11.1). `cert_key`
+    // itself is transient scratch: the actual output is `key_pem` below
+    // (a separate PEM-encoded copy), so the raw in-memory KeyPair is wiped
+    // at scope exit rather than left resident for the rest of the request.
+    // Fail-closed draw: this key is what the issued certificate will
+    // attest to, and it goes on to terminate TLS for the domain.
+    var cert_key: jws.AnyKeyPair = undefined;
+    jws.generateAnyKeyPair(&cert_key, c.options.cert_key_alg, c.io);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&cert_key));
+    const csr_der = x509.csrDerWith(a, &cert_key, domains, opts.csr_extensions) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidDomain => return error.InvalidDomain,
+        error.DuplicateExtension => return error.InvalidCsr,
+        error.SigningFailed, error.ValueTooLarge => return error.SigningFailed,
+    };
+
+    const chain = try c.finalizeAndDownload(a, order, csr_der, opts.preferred_chain);
+    const chain_pem = try c.gpa.dupe(u8, chain.pem);
+    errdefer c.gpa.free(chain_pem);
+    const key_pem = try x509.ecPrivateKeyToPem(c.gpa, &cert_key);
+    return .{ .chain_pem = chain_pem, .key_pem = key_pem, .not_after = chain.not_after };
+}
+
+/// A chain issued for a caller's CSR (`obtainWithCsr`): no key — the caller
+/// holds it.
+pub const IssuedChain = struct {
+    /// `application/pem-certificate-chain` body, gpa-owned.
+    chain_pem: []u8,
+    /// Leaf `notAfter`, epoch seconds.
+    not_after: u64,
+
+    pub fn deinit(ch: *IssuedChain, gpa: Allocator) void {
+        gpa.free(ch.chain_pem);
+        ch.* = undefined;
+    }
+};
+
+/// Issue a certificate for an existing CSR (DER), whose key never leaves the
+/// caller (an HSM, a key reused across renewals, a CSR from another tool;
+/// lego `--csr`, certbot `certonly --csr`). The identifiers ordered are the
+/// CSR's dNSName SANs, checked like `obtain`'s domains; the self-signature
+/// must verify (`x509.parseCsrAny`).
+pub fn obtainWithCsr(c: *Client, csr_der: []const u8, opts: ObtainOptions) Error!IssuedChain {
+    var csr = x509.parseCsrAny(c.gpa, csr_der) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            c.note("the CSR does not parse or its signature does not verify");
+            return error.InvalidCsr;
+        },
+    };
+    defer csr.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(c.gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const order = try c.orderReady(a, csr.sans, opts);
+    const chain = try c.finalizeAndDownload(a, order, csr_der, opts.preferred_chain);
+    return .{ .chain_pem = try c.gpa.dupe(u8, chain.pem), .not_after = chain.not_after };
+}
+
+const ReadyOrder = struct { url: []const u8, finalize: []const u8 };
+
+/// Validate the identifiers, register, place the order and solve every
+/// authorization; returns once the order is `ready`. Memory from `a`.
+fn orderReady(c: *Client, a: Allocator, domains: []const []const u8, opts: ObtainOptions) Error!ReadyOrder {
     if (domains.len == 0) return error.InvalidDomain;
     for (domains) |name| {
         if (x509.isValidDomain(name)) continue;
@@ -719,24 +869,34 @@ pub fn obtainWith(c: *Client, domains: []const []const u8, opts: ObtainOptions) 
         return error.DnsPublisherMissing;
     try c.register();
 
-    var arena = std.heap.ArenaAllocator.init(c.gpa);
-    defer arena.deinit();
-    const a = arena.allocator();
-
     // newOrder (§7.4).
     var out: std.Io.Writer.Allocating = .init(a);
     var js: std.json.Stringify = .{ .writer = &out.writer, .options = .{} };
-    writeOrderPayload(&js, domains, opts.replaces) catch return error.OutOfMemory;
+    const profile: ?[]const u8 = if (opts.profile) |want| blk: {
+        for (c.dir.?.profiles) |offered| {
+            if (std.mem.eql(u8, offered.name, want)) break :blk want;
+        }
+        switch (opts.profile_mode) {
+            .required => {
+                c.note("the CA does not advertise the requested profile");
+                return error.NotSupported;
+            },
+            .preferred => break :blk null,
+        }
+    } else null;
+    writeOrderPayload(&js, domains, .{
+        .replaces = opts.replaces,
+        .profile = profile,
+        .not_before = opts.not_before,
+        .not_after = opts.not_after,
+    }) catch return error.OutOfMemory;
 
     const pr = try c.postJws(a, c.dir.?.new_order, out.written(), .kid);
-    if (pr.status != 201) {
-        c.noteProblem(pr.body);
-        return error.AcmeProblem;
-    }
+    if (pr.status != 201) return c.problemError(pr.body, pr.retry_after_s);
     const order_url = pr.location orelse return error.MalformedResponse;
     const order = try parseOrder(a, pr.body);
 
-    // Authorizations (§7.5) — one HTTP-01 round per identifier.
+    // Authorizations (§7.5) — one round per identifier.
     if (order.authorizations.len == 0) return error.MalformedResponse;
     for (order.authorizations) |authz_url| try c.solveAuthorization(a, authz_url);
 
@@ -750,59 +910,81 @@ pub fn obtainWith(c: *Client, domains: []const []const u8, opts: ObtainOptions) 
         c.note("order already valid before finalize (reused order, no key)");
         return error.OrderFailed;
     }
+    return .{ .url = order_url, .finalize = ready.finalize };
+}
 
-    // Finalize with a CSR for a fresh certificate key (§7.4; the account
-    // key MUST NOT be reused as the certificate key — §11.1). `cert_key`
-    // itself is transient scratch: the actual output is `key_pem` below
-    // (a separate PEM-encoded copy), so the raw in-memory KeyPair is wiped
-    // at scope exit rather than left resident for the rest of the request.
-    // Fail-closed draw: this key is what the issued certificate will
-    // attest to, and it goes on to terminate TLS for the domain.
-    var cert_key: jws.AnyKeyPair = undefined;
-    jws.generateAnyKeyPair(&cert_key, c.options.cert_key_alg, c.io);
-    defer std.crypto.secureZero(u8, std.mem.asBytes(&cert_key));
-    const csr_der = x509.csrDer(a, &cert_key, domains) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.InvalidDomain => return error.InvalidDomain,
-        error.SigningFailed, error.ValueTooLarge => return error.SigningFailed,
-    };
+const DownloadedChain = struct { pem: []const u8, not_after: u64 };
+
+/// Finalize `order` with `csr_der`, wait for `valid`, download the chain —
+/// or, with `preferred_chain`, the first of the default and alternate chains
+/// whose topmost certificate's issuer CN matches. Memory from `a`.
+fn finalizeAndDownload(
+    c: *Client,
+    a: Allocator,
+    order: ReadyOrder,
+    csr_der: []const u8,
+    preferred_chain: ?[]const u8,
+) Error!DownloadedChain {
     const csr_b64 = try jws.base64UrlEncodeAlloc(a, csr_der);
-
     var fout: std.Io.Writer.Allocating = .init(a);
     var fjs: std.json.Stringify = .{ .writer = &fout.writer, .options = .{} };
     writeFinalizePayload(&fjs, csr_b64) catch return error.OutOfMemory;
 
-    const fpr = try c.postJws(a, ready.finalize, fout.written(), .kid);
-    if (fpr.status != 200) {
-        c.noteProblem(fpr.body);
-        return error.AcmeProblem;
-    }
-    const done = try c.awaitOrder(a, order_url, &.{.valid});
+    const fpr = try c.postJws(a, order.finalize, fout.written(), .kid);
+    if (fpr.status != 200) return c.problemError(fpr.body, fpr.retry_after_s);
+    const done = try c.awaitOrder(a, order.url, &.{.valid});
     const cert_url = done.certificate orelse return error.MalformedResponse;
 
     // Download the chain (§7.4.2) — POST-as-GET, PEM body.
     const cpr = try c.postJws(a, cert_url, "", .kid);
-    if (cpr.status != 200) {
-        c.noteProblem(cpr.body);
-        return error.AcmeProblem;
+    if (cpr.status != 200) return c.problemError(cpr.body, cpr.retry_after_s);
+    var pem: []const u8 = cpr.body;
+    if (preferred_chain) |want| {
+        if (!try topIssuerIs(a, pem, want)) {
+            for (cpr.alternates) |alt_url| {
+                const apr = try c.postJws(a, alt_url, "", .kid);
+                if (apr.status != 200) continue; // an alternate is optional; keep the default
+                if (try topIssuerIs(a, apr.body, want)) {
+                    pem = apr.body;
+                    break;
+                }
+            }
+        }
     }
     // The label is a literal well under `max_pem_label_len`, so `LabelTooLong`
     // cannot occur here; mapping it to 0 keeps the branch fail-closed anyway
     // rather than widening `Error` with a variant no caller can trigger.
-    const chain_blocks = x509.pemBlockCount("CERTIFICATE", cpr.body) catch 0;
+    const chain_blocks = x509.pemBlockCount("CERTIFICATE", pem) catch 0;
     if (chain_blocks == 0) return error.MalformedResponse;
-    const not_after = x509.certNotAfter(c.gpa, cpr.body) catch |err| switch (err) {
+    const not_after = x509.certNotAfter(c.gpa, pem) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.MalformedResponse,
     };
-
-    const chain_pem = try c.gpa.dupe(u8, cpr.body);
-    errdefer c.gpa.free(chain_pem);
-    const key_pem = try x509.ecPrivateKeyToPem(c.gpa, &cert_key);
-    return .{ .chain_pem = chain_pem, .key_pem = key_pem, .not_after = not_after };
+    return .{ .pem = pem, .not_after = not_after };
 }
 
-fn writeOrderPayload(js: *std.json.Stringify, domains: []const []const u8, replaces: ?[]const u8) !void {
+/// Whether the issuer of the LAST certificate in `chain_pem` has the common
+/// name `cn` (the certbot / lego `--preferred-chain` rule). A chain that does
+/// not parse is no match.
+fn topIssuerIs(a: Allocator, chain_pem: []const u8, cn: []const u8) Error!bool {
+    const begin = "-----BEGIN CERTIFICATE-----";
+    const last = std.mem.lastIndexOf(u8, chain_pem, begin) orelse return false;
+    const der_bytes = x509.pemDecode(a, "CERTIFICATE", chain_pem[last..]) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return false,
+    };
+    const issuer_cn = x509.issuerCommonName(der_bytes) orelse return false;
+    return std.mem.eql(u8, issuer_cn, cn);
+}
+
+const OrderExtras = struct {
+    replaces: ?[]const u8 = null,
+    profile: ?[]const u8 = null,
+    not_before: ?u64 = null,
+    not_after: ?u64 = null,
+};
+
+fn writeOrderPayload(js: *std.json.Stringify, domains: []const []const u8, extras: OrderExtras) !void {
     try js.beginObject();
     try js.objectField("identifiers");
     try js.beginArray();
@@ -815,9 +997,22 @@ fn writeOrderPayload(js: *std.json.Stringify, domains: []const []const u8, repla
         try js.endObject();
     }
     try js.endArray();
-    if (replaces) |cert_id| {
+    if (extras.replaces) |cert_id| {
         try js.objectField("replaces");
         try js.write(cert_id);
+    }
+    if (extras.profile) |name| {
+        try js.objectField("profile");
+        try js.write(name);
+    }
+    var tbuf: [rfc3339_len]u8 = undefined;
+    if (extras.not_before) |t| {
+        try js.objectField("notBefore");
+        try js.write(formatRfc3339(&tbuf, t));
+    }
+    if (extras.not_after) |t| {
+        try js.objectField("notAfter");
+        try js.write(formatRfc3339(&tbuf, t));
     }
     try js.endObject();
 }
@@ -835,8 +1030,7 @@ fn writeFinalizePayload(js: *std.json.Stringify, csr_b64: []const u8) !void {
 fn solveAuthorization(c: *Client, a: Allocator, authz_url: []const u8) Error!void {
     const pr = try c.postJws(a, authz_url, "", .kid);
     if (pr.status != 200) {
-        c.noteProblem(pr.body);
-        return error.AcmeProblem;
+        return c.problemError(pr.body, pr.retry_after_s);
     }
     const authz = try parseAuthz(a, pr.body);
     switch (authz.status) {
@@ -935,8 +1129,7 @@ fn publishTlsAlpn01(c: *Client, a: Allocator, domain: []const u8, token: []const
 fn notifyAndPoll(c: *Client, a: Allocator, challenge_url: []const u8, authz_url: []const u8) Error!void {
     const tpr = try c.postJws(a, challenge_url, "{}", .kid);
     if (tpr.status != 200) {
-        c.noteProblem(tpr.body);
-        return error.AcmeProblem;
+        return c.problemError(tpr.body, tpr.retry_after_s);
     }
 
     var polls: u32 = 0;
@@ -945,8 +1138,7 @@ fn notifyAndPoll(c: *Client, a: Allocator, challenge_url: []const u8, authz_url:
         if (wait_ms) |ms| try c.sleepMs(ms);
         const ppr = try c.postJws(a, authz_url, "", .kid);
         if (ppr.status != 200) {
-            c.noteProblem(ppr.body);
-            return error.AcmeProblem;
+            return c.problemError(ppr.body, ppr.retry_after_s);
         }
         const state = try parseAuthz(a, ppr.body);
         switch (state.status) {
@@ -970,8 +1162,7 @@ fn awaitOrder(c: *Client, a: Allocator, order_url: []const u8, targets: []const 
         if (wait_ms) |ms| try c.sleepMs(ms);
         const pr = try c.postJws(a, order_url, "", .kid);
         if (pr.status != 200) {
-            c.noteProblem(pr.body);
-            return error.AcmeProblem;
+            return c.problemError(pr.body, pr.retry_after_s);
         }
         const order = try parseOrder(a, pr.body);
         if (std.mem.indexOfScalar(Status, targets, order.status) != null) return order;
@@ -1093,6 +1284,7 @@ const Problem = struct {
 };
 
 const bad_nonce_type = "urn:ietf:params:acme:error:badNonce";
+const rate_limited_type = "urn:ietf:params:acme:error:rateLimited";
 
 fn isBadNonce(gpa: Allocator, body: []const u8) bool {
     const parsed = std.json.parseFromSlice(Problem, gpa, body, .{
@@ -1142,6 +1334,28 @@ fn noteAuthzProblem(c: *Client, body: []const u8) void {
     c.noteProblem(body);
 }
 
+/// Record the refusal `body` and turn it into the matching error:
+/// `RateLimited` for RFC 8555 §6.6's `rateLimited`, else `AcmeProblem`.
+fn problemError(c: *Client, body: []const u8, retry_after_s: ?u64) Error {
+    c.noteProblem(body);
+    c.problem_retry_after_s = retry_after_s;
+    const parsed = std.json.parseFromSlice(Problem, c.gpa, body, .{
+        .ignore_unknown_fields = true,
+    }) catch return error.AcmeProblem;
+    defer parsed.deinit();
+    return if (std.mem.eql(u8, parsed.value.type, rate_limited_type)) error.RateLimited else error.AcmeProblem;
+}
+
+/// `Retry-After` (delay-seconds or an HTTP-date, RFC 9110 §10.2.3) as
+/// seconds from now; a date in the past is 0.
+fn retryAfterHeader(c: *Client, value: ?[]const u8) ?u64 {
+    const v = std.mem.trim(u8, value orelse return null, " \t");
+    if (std.fmt.parseInt(u64, v, 10)) |secs| return secs else |_| {}
+    const at = http.conditional.parseHttpDate(v) orelse return null;
+    const now: i64 = @intCast(@divTrunc(std.Io.Clock.real.now(c.io).nanoseconds, std.time.ns_per_s));
+    return if (at <= now) 0 else @intCast(at - now);
+}
+
 fn note(c: *Client, msg: []const u8) void {
     const n = @min(msg.len, c.problem_buf.len);
     @memcpy(c.problem_buf[0..n], msg[0..n]);
@@ -1169,6 +1383,9 @@ fn ensureDirectory(c: *Client) Error!void {
         keyChange: ?[]const u8 = null,
         revokeCert: ?[]const u8 = null,
         renewalInfo: ?[]const u8 = null,
+        meta: struct {
+            profiles: ?std.json.ArrayHashMap([]const u8) = null,
+        } = .{},
     };
     const parsed = std.json.parseFromSlice(DirectoryJson, c.gpa, body, .{
         .ignore_unknown_fields = true,
@@ -1196,6 +1413,8 @@ fn ensureDirectory(c: *Client) Error!void {
     const revoke_cert = try dupeOpt(c.gpa, parsed.value.revokeCert);
     errdefer if (revoke_cert) |u| c.gpa.free(u);
     const renewal_info = try dupeOpt(c.gpa, parsed.value.renewalInfo);
+    errdefer if (renewal_info) |u| c.gpa.free(u);
+    const offered = try dupeProfiles(c.gpa, parsed.value.meta.profiles);
     c.dir = .{
         .new_nonce = new_nonce,
         .new_account = new_account,
@@ -1203,7 +1422,29 @@ fn ensureDirectory(c: *Client) Error!void {
         .key_change = key_change,
         .revoke_cert = revoke_cert,
         .renewal_info = renewal_info,
+        .profiles = offered,
     };
+}
+
+fn dupeProfiles(gpa: Allocator, map: ?std.json.ArrayHashMap([]const u8)) Allocator.Error![]Profile {
+    const m = map orelse return &.{};
+    const out = try gpa.alloc(Profile, m.map.count());
+    var done: usize = 0;
+    errdefer {
+        for (out[0..done]) |pr| {
+            gpa.free(pr.name);
+            gpa.free(pr.description);
+        }
+        gpa.free(out);
+    }
+    var it = m.map.iterator();
+    while (it.next()) |e| {
+        const name = try gpa.dupe(u8, e.key_ptr.*);
+        errdefer gpa.free(name);
+        out[done] = .{ .name = name, .description = try gpa.dupe(u8, e.value_ptr.*) };
+        done += 1;
+    }
+    return out;
 }
 
 fn dupeOpt(gpa: Allocator, s: ?[]const u8) Allocator.Error!?[]u8 {
@@ -1249,8 +1490,12 @@ const PostResult = struct {
     body: []u8,
     /// `Location` header, if any (same allocator).
     location: ?[]u8,
-    /// Parsed integer `Retry-After`, capped, in milliseconds.
+    /// Parsed integer `Retry-After`, capped, in milliseconds (poll pacing).
     retry_after_ms: ?u64,
+    /// `Retry-After` in seconds from now, uncapped, either form (`problemError`).
+    retry_after_s: ?u64,
+    /// `Link: <url>;rel="alternate"` targets (RFC 8555 §7.4.2), same allocator.
+    alternates: []const []const u8 = &.{},
 };
 
 /// POST `payload` ("" = POST-as-GET, §6.3) to `url` as an ES256 JWS.
@@ -1270,6 +1515,7 @@ fn postSigned(c: *Client, a: Allocator, url: []const u8, payload: []const u8, mo
         .kid => c.kid orelse return error.NotRegistered,
     };
     var attempts_left: u8 = 3;
+    var unavailable_left: u8 = c.options.max_unavailable_retries;
     while (true) {
         const nonce = try c.takeNonce();
         defer c.gpa.free(nonce);
@@ -1297,13 +1543,64 @@ fn postSigned(c: *Client, a: Allocator, url: []const u8, payload: []const u8, mo
             a.free(body);
             continue; // fresh nonce was already harvested from this response
         }
+        // 503 = the CA is overloaded or in maintenance and did not act on the
+        // request (RFC 9110 §15.6.4), so a resend cannot double an action.
+        // A short `Retry-After` is honoured; a long one is the caller's call.
+        if (res.status == 503 and unavailable_left > 0) {
+            const wait_ms: u64 = if (c.retryAfterHeader(res.header("retry-after"))) |secs|
+                secs * 1000
+            else
+                @as(u64, 1000) << @intCast(c.options.max_unavailable_retries - unavailable_left);
+            if (wait_ms <= max_unavailable_wait_ms) {
+                unavailable_left -= 1;
+                a.free(body);
+                try c.sleepMs(wait_ms);
+                continue;
+            }
+        }
         return .{
             .status = res.status,
             .body = body,
             .location = if (res.header("location")) |l| try a.dupe(u8, l) else null,
             .retry_after_ms = parseRetryAfter(res.header("retry-after")),
+            .retry_after_s = c.retryAfterHeader(res.header("retry-after")),
+            .alternates = try alternateLinks(a, &res.head),
         };
     }
+}
+
+/// Every `Link` target with `rel="alternate"` (RFC 8288; one header may
+/// carry several comma-separated links, and the header may repeat).
+fn alternateLinks(a: Allocator, head: anytype) Allocator.Error![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    var it = head.iterate();
+    while (it.next()) |h| {
+        if (!std.ascii.eqlIgnoreCase(h.name, "link")) continue;
+        var rest = h.value;
+        while (std.mem.indexOfScalar(u8, rest, '<')) |lt| {
+            const gt = std.mem.indexOfScalarPos(u8, rest, lt, '>') orelse break;
+            const target = rest[lt + 1 .. gt];
+            const params_end = std.mem.indexOfScalarPos(u8, rest, gt, ',') orelse rest.len;
+            if (isAlternateRel(rest[gt + 1 .. params_end])) try out.append(a, try a.dupe(u8, target));
+            rest = rest[params_end..];
+        }
+    }
+    return out.toOwnedSlice(a);
+}
+
+/// `;rel="alternate"` / `;rel=alternate` among a link's parameters (the
+/// relation type is case-insensitive, and `rel` may list several).
+fn isAlternateRel(params: []const u8) bool {
+    var it = std.mem.tokenizeScalar(u8, params, ';');
+    while (it.next()) |raw| {
+        const param = std.mem.trim(u8, raw, " \t");
+        const eq = std.mem.indexOfScalar(u8, param, '=') orelse continue;
+        if (!std.ascii.eqlIgnoreCase(std.mem.trim(u8, param[0..eq], " \t"), "rel")) continue;
+        const value = std.mem.trim(u8, std.mem.trim(u8, param[eq + 1 ..], " \t"), "\"");
+        var rels = std.mem.tokenizeScalar(u8, value, ' ');
+        while (rels.next()) |r| if (std.ascii.eqlIgnoreCase(r, "alternate")) return true;
+    }
+    return false;
 }
 
 /// Integer `Retry-After` seconds → capped milliseconds (HTTP-date form is
@@ -2141,6 +2438,15 @@ const MockCa = struct {
     /// Alg of the certificate key in the finalize CSR.
     csr_alg: ?jws.Alg = null,
     badnonce_left: u8 = 1,
+    // W1 (2026-10-16): new-order members seen, injected refusals, alternates.
+    profile_seen: [32]u8 = undefined,
+    profile_len: usize = 0,
+    validity_seen: [64]u8 = undefined,
+    validity_len: usize = 0,
+    unavailable_left: u8 = 0,
+    rate_limit: bool = false,
+    alt_chain: bool = false,
+    alt_fetches: u32 = 0,
     authz_polls: u32 = 0,
     challenge_ok: bool = false,
     csr_ok: bool = false,
@@ -2330,7 +2636,8 @@ fn mcDirectory(ctx: *router.Ctx) anyerror!void {
     var w: std.Io.Writer = .fixed(&buf);
     try w.print(
         \\{{"newNonce":"{s}","newAccount":"{s}","newOrder":"{s}",
-        \\ "meta":{{"termsOfService":"data:text/plain,mock-tos"}}
+        \\ "meta":{{"termsOfService":"data:text/plain,mock-tos",
+        \\  "profiles":{{"classic":"the default","shortlived":"https://ca/docs#shortlived"}}}}
     , .{ m.new_nonce_url, m.new_account_url, m.new_order_url });
     if (m.extras) try w.print(
         \\,"keyChange":"{s}","revokeCert":"{s}","renewalInfo":"{s}"
@@ -2423,9 +2730,32 @@ fn mcNewOrder(ctx: *router.Ctx) anyerror!void {
         }
     }
 
+    // W1: a 503 (the client resends) or a rateLimited refusal (it must not).
+    {
+        lockSpin(&m.lock);
+        const unavailable = m.unavailable_left > 0;
+        if (unavailable) m.unavailable_left -= 1;
+        const limited = m.rate_limit;
+        m.lock.unlock();
+        if (unavailable or limited) {
+            try m.stampNonce(ctx);
+            ctx.res.setStatus(if (unavailable) 503 else 429);
+            try ctx.res.setHeader("Retry-After", if (unavailable) "0" else "3600");
+            try ctx.res.setHeader("Content-Type", "application/problem+json");
+            try ctx.res.writeAll(if (unavailable)
+                "{\"type\":\"urn:ietf:params:acme:error:serverInternal\",\"detail\":\"maintenance\"}"
+            else
+                "{\"type\":\"urn:ietf:params:acme:error:rateLimited\",\"detail\":\"too many orders\"}");
+            return;
+        }
+    }
+
     const Payload = struct {
         identifiers: []const struct { type: []const u8 = "", value: []const u8 = "" } = &.{},
         replaces: ?[]const u8 = null,
+        profile: ?[]const u8 = null,
+        notBefore: ?[]const u8 = null,
+        notAfter: ?[]const u8 = null,
     };
     const payload = std.json.parseFromSlice(Payload, m.gpa, v.payload, .{
         .ignore_unknown_fields = true,
@@ -2441,10 +2771,32 @@ fn mcNewOrder(ctx: *router.Ctx) anyerror!void {
         m.replaces_len = n;
         m.lock.unlock();
     }
+    if (payload.value.profile) |pf| {
+        lockSpin(&m.lock);
+        const n = @min(pf.len, m.profile_seen.len);
+        @memcpy(m.profile_seen[0..n], pf[0..n]);
+        m.profile_len = n;
+        m.lock.unlock();
+    }
+    if (payload.value.notBefore != null or payload.value.notAfter != null) {
+        lockSpin(&m.lock);
+        var w: std.Io.Writer = .fixed(&m.validity_seen);
+        w.print("{s}/{s}", .{ payload.value.notBefore orelse "-", payload.value.notAfter orelse "-" }) catch {};
+        m.validity_len = w.buffered().len;
+        m.lock.unlock();
+    }
     if (payload.value.identifiers.len != 1 or
         !std.mem.eql(u8, payload.value.identifiers[0].type, "dns") or
         !std.mem.eql(u8, payload.value.identifiers[0].value, m.order_domain))
         m.fail("newOrder identifiers wrong");
+
+    // A fresh order: its authorization starts pending again, so a client
+    // placing several orders on one mock walks the whole flow each time.
+    lockSpin(&m.lock);
+    m.challenge_ok = false;
+    m.finalized = false;
+    m.served_processing = false;
+    m.lock.unlock();
 
     var buf: [1024]u8 = undefined;
     try ctx.res.setHeader("Location", m.order_url);
@@ -2719,7 +3071,32 @@ fn mcCert(ctx: *router.Ctx) anyerror!void {
     try m.stampNonce(ctx);
     ctx.res.setStatus(200);
     try ctx.res.setHeader("Content-Type", "application/pem-certificate-chain");
+    if (m.alt_chain) {
+        // An unrelated relation first: only `rel="alternate"` is a chain.
+        var buf: [256]u8 = undefined;
+        const link = try std.fmt.bufPrint(&buf, "<{s}>;rel=\"index\", <{s}/alt>;rel=\"alternate\"", .{
+            m.dir_url, m.cert_url,
+        });
+        try ctx.res.setHeader("Link", link);
+    }
     try ctx.res.writeAll(x509.test_cert_pem ++ x509.test_root_cert_pem);
+}
+
+/// The alternate chain: the leaf alone, so its topmost certificate's issuer
+/// is `acme-test-fixture` where the default chain's is `acme-test-root`.
+fn mcCertAlt(ctx: *router.Ctx) anyerror!void {
+    const m = MockCa.of(ctx);
+    var alt_buf: [128]u8 = undefined;
+    const alt_url = try std.fmt.bufPrint(&alt_buf, "{s}/alt", .{m.cert_url});
+    var v = m.readVerified(ctx, alt_url, .kid) catch return mcRejected(ctx);
+    defer v.deinit();
+    lockSpin(&m.lock);
+    m.alt_fetches += 1;
+    m.lock.unlock();
+    try m.stampNonce(ctx);
+    ctx.res.setStatus(200);
+    try ctx.res.setHeader("Content-Type", "application/pem-certificate-chain");
+    try ctx.res.writeAll(x509.test_cert_pem);
 }
 
 /// POST /acct/1 — contact update (§7.3.2) and deactivation (§7.3.6).
@@ -2882,6 +3259,7 @@ fn mockRoutes(r: *router.Router, extras: bool) !void {
     try r.post("/order/1", mcOrder);
     try r.post("/finalize/1", mcFinalize);
     try r.post("/cert/1", mcCert);
+    try r.post("/cert/1/alt", mcCertAlt);
     if (extras) {
         try r.post("/acct/1", mcAccount);
         try r.post("/key-change", mcKeyChange);
@@ -3508,7 +3886,7 @@ test "new-order payload: the optional replaces member (RFC 9773 §5)" {
     var out: std.Io.Writer.Allocating = .init(testing.allocator);
     defer out.deinit();
     var js: std.json.Stringify = .{ .writer = &out.writer, .options = .{} };
-    try writeOrderPayload(&js, &.{"example.org"}, "aYhba4dGQEHhs3uEe6CuLN4ByNQ.AIdlQyE");
+    try writeOrderPayload(&js, &.{"example.org"}, .{ .replaces = "aYhba4dGQEHhs3uEe6CuLN4ByNQ.AIdlQyE" });
     try testing.expectEqualStrings(
         "{\"identifiers\":[{\"type\":\"dns\",\"value\":\"example.org\"}],\"replaces\":\"aYhba4dGQEHhs3uEe6CuLN4ByNQ.AIdlQyE\"}",
         out.written(),
@@ -3516,7 +3894,7 @@ test "new-order payload: the optional replaces member (RFC 9773 §5)" {
     var plain: std.Io.Writer.Allocating = .init(testing.allocator);
     defer plain.deinit();
     var js2: std.json.Stringify = .{ .writer = &plain.writer, .options = .{} };
-    try writeOrderPayload(&js2, &.{"example.org"}, null);
+    try writeOrderPayload(&js2, &.{"example.org"}, .{});
     try testing.expect(std.mem.indexOf(u8, plain.written(), "replaces") == null);
 }
 
@@ -3591,4 +3969,220 @@ test "integration: ES384 account key and ES384 certificate key through the whole
     defer std.crypto.secureZero(u8, std.mem.asBytes(&back));
     try x509.privateKeyFromPem(&back, testing.allocator, cert.key_pem);
     try testing.expectEqual(jws.Alg.es384, back.alg());
+}
+
+// ── W1 (2026-10-16): profiles, validity, alternate chains, 503, rateLimited, CSR input ──
+
+/// A Lab issuing over DNS-01 (no challenge server needed).
+fn w1Client(lab: *Lab, zone: *TestZone, key_seed: u8, account_key: *jws.KeyPair) !Client {
+    try jws.Es256.KeyPair.generateDeterministicInto(account_key, &@as([32]u8, @splat(key_seed)));
+    lab.mock.mode = .dns_01;
+    lab.mock.zone = zone;
+    return lab.client(account_key, .{ .challenge_type = .dns_01, .dns_publisher = zone.publisher() });
+}
+
+test "W1: profiles from the directory; required vs preferred; notBefore/notAfter on the order" {
+    var lab: Lab = undefined;
+    try lab.start(false);
+    defer lab.stop();
+    var zone: TestZone = .{};
+    var account_key: jws.KeyPair = undefined;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&account_key));
+    var c = try w1Client(&lab, &zone, 71, &account_key);
+    defer c.deinit();
+
+    const offered = try c.profiles();
+    try testing.expectEqual(@as(usize, 2), offered.len);
+    try testing.expectEqualStrings("classic", offered[0].name);
+    try testing.expectEqualStrings("shortlived", offered[1].name);
+    try testing.expectEqualStrings("https://ca/docs#shortlived", offered[1].description);
+
+    // Not offered + required: refused before any order is placed.
+    try testing.expectError(error.NotSupported, c.obtainWith(&.{MockCa.domain}, .{ .profile = "tlsserver" }));
+    try testing.expectEqual(@as(usize, 0), lab.mock.profile_len);
+
+    var cert = try c.obtainWith(&.{MockCa.domain}, .{
+        .profile = "shortlived",
+        .not_before = 1767225600, // 2026-01-01T00:00:00Z
+        .not_after = 1767830399, // 2026-01-07T23:59:59Z
+    });
+    cert.deinit(testing.allocator);
+    try testing.expectEqualStrings("shortlived", lab.mock.profile_seen[0..lab.mock.profile_len]);
+    try testing.expectEqualStrings("2026-01-01T00:00:00Z/2026-01-07T23:59:59Z", lab.mock.validity_seen[0..lab.mock.validity_len]);
+
+    // Not offered + preferred: the order goes out without a profile.
+    lab.mock.profile_len = 0;
+    var cert2 = try c.obtainWith(&.{MockCa.domain}, .{ .profile = "tlsserver", .profile_mode = .preferred });
+    cert2.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), lab.mock.profile_len);
+    try lab.expectClean();
+}
+
+test "W1: preferred chain picks the alternate by its topmost issuer CN, else keeps the default" {
+    var lab: Lab = undefined;
+    try lab.start(false);
+    defer lab.stop();
+    lab.mock.alt_chain = true;
+    var zone: TestZone = .{};
+    var account_key: jws.KeyPair = undefined;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&account_key));
+    var c = try w1Client(&lab, &zone, 72, &account_key);
+    defer c.deinit();
+
+    // No preference: the default chain, no alternate fetched.
+    var plain = try c.obtain(&.{MockCa.domain});
+    plain.deinit(testing.allocator);
+    try testing.expectEqual(@as(u32, 0), lab.mock.alt_fetches);
+
+    // The default already matches: no alternate fetched either.
+    var dflt = try c.obtainWith(&.{MockCa.domain}, .{ .preferred_chain = "acme-test-root" });
+    defer dflt.deinit(testing.allocator);
+    try testing.expectEqualStrings(x509.test_cert_pem ++ x509.test_root_cert_pem, dflt.chain_pem);
+    try testing.expectEqual(@as(u32, 0), lab.mock.alt_fetches);
+
+    var alt = try c.obtainWith(&.{MockCa.domain}, .{ .preferred_chain = "acme-test-fixture" });
+    defer alt.deinit(testing.allocator);
+    try testing.expectEqualStrings(x509.test_cert_pem, alt.chain_pem);
+    try testing.expectEqual(@as(u32, 1), lab.mock.alt_fetches);
+
+    // Nothing matches: the default chain, after looking at the alternate.
+    var none = try c.obtainWith(&.{MockCa.domain}, .{ .preferred_chain = "Nobody Root X9" });
+    defer none.deinit(testing.allocator);
+    try testing.expectEqualStrings(x509.test_cert_pem ++ x509.test_root_cert_pem, none.chain_pem);
+    try testing.expectEqual(@as(u32, 2), lab.mock.alt_fetches);
+    try lab.expectClean();
+}
+
+test "W1: a 503 is resent; rateLimited is error.RateLimited with retryAfter, not resent" {
+    var lab: Lab = undefined;
+    try lab.start(false);
+    defer lab.stop();
+    var zone: TestZone = .{};
+    var account_key: jws.KeyPair = undefined;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&account_key));
+    var c = try w1Client(&lab, &zone, 73, &account_key);
+    defer c.deinit();
+
+    lab.mock.unavailable_left = 2; // = max_unavailable_retries
+    var cert = try c.obtain(&.{MockCa.domain});
+    cert.deinit(testing.allocator);
+    try testing.expectEqual(@as(u8, 0), lab.mock.unavailable_left);
+
+    lab.mock.unavailable_left = 3; // one more than the client resends
+    try testing.expectError(error.AcmeProblem, c.obtain(&.{MockCa.domain}));
+    try testing.expectEqual(@as(u8, 0), lab.mock.unavailable_left);
+    try testing.expectEqual(@as(?u64, 0), c.retryAfter());
+
+    lab.mock.rate_limit = true;
+    const before = lab.mock.nonces_issued;
+    try testing.expectError(error.RateLimited, c.obtain(&.{MockCa.domain}));
+    try testing.expectEqual(@as(?u64, 3600), c.retryAfter());
+    try testing.expect(std.mem.indexOf(u8, c.lastProblem().?, "rateLimited") != null);
+    try testing.expectEqual(before + 1, lab.mock.nonces_issued); // one refusal, no resend
+    try lab.expectClean();
+}
+
+test "W1: Retry-After as delay-seconds and as an HTTP-date" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var transport = http.Client.init(io, testing.allocator, .{});
+    defer transport.deinit();
+    var account_key: jws.KeyPair = undefined;
+    try jws.Es256.KeyPair.generateDeterministicInto(&account_key, &@as([32]u8, @splat(74)));
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&account_key));
+    var c = Client.init(io, testing.allocator, &transport, &account_key, .{});
+    defer c.deinit();
+    try testing.expectEqual(@as(?u64, 120), c.retryAfterHeader(" 120 "));
+    try testing.expectEqual(@as(?u64, 0), c.retryAfterHeader("Sun, 06 Nov 1994 08:49:37 GMT")); // past
+    const future = c.retryAfterHeader("Fri, 31 Dec 9999 23:59:59 GMT").?;
+    try testing.expect(future > 200 * 365 * std.time.s_per_day);
+    try testing.expectEqual(@as(?u64, null), c.retryAfterHeader("soon"));
+    try testing.expectEqual(@as(?u64, null), c.retryAfterHeader(null));
+}
+
+test "W1: Link header parsing keeps only rel=alternate targets" {
+    const head: struct {
+        block: []const u8,
+        fn iterate(h: *const @This()) http.h1.HeaderIterator {
+            return .{ .lines = std.mem.splitScalar(u8, h.block, '\n') };
+        }
+    } = .{ .block = "Link: <https://ca/a1>;rel=\"alternate\", <https://ca/dir>;rel=\"index\"\r\n" ++
+        "Content-Type: x\r\nlink: <https://ca/a2> ; REL=\"up Alternate\"\r\nLink: <https://ca/x>\r\n" };
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const got = try alternateLinks(arena.allocator(), &head);
+    try testing.expectEqual(@as(usize, 2), got.len);
+    try testing.expectEqualStrings("https://ca/a1", got[0]);
+    try testing.expectEqualStrings("https://ca/a2", got[1]);
+}
+
+test "W1: RFC 3339 formatting of order validity" {
+    var buf: [rfc3339_len]u8 = undefined;
+    try testing.expectEqualStrings("1970-01-01T00:00:00Z", formatRfc3339(&buf, 0));
+    try testing.expectEqualStrings("2024-02-29T12:34:56Z", formatRfc3339(&buf, 1709210096));
+    try testing.expectEqual(@as(?i64, 1709210096), parseRfc3339(formatRfc3339(&buf, 1709210096)));
+    try testing.expectEqualStrings("9999-12-31T23:59:59Z", formatRfc3339(&buf, std.math.maxInt(u64)));
+}
+
+/// `openssl ecparam -name prime256v1 -genkey -noout -out k.pem;
+/// openssl req -new -key k.pem -subj "/CN=acme-poc.example/O=Some Org"
+///   -addext "subjectAltName=DNS:acme-poc.example"
+///   -addext "keyUsage=critical,digitalSignature" -outform DER -out csr.der`
+/// (OpenSSL 3.5.5; `openssl req -verify` OK). A subject and a second
+/// extension our own `csrDer` never writes.
+const openssl_csr_hex = "308201273081ce020100302e3119301706035504030c1061636d652d706f632e6578616d706c653111300f060355040a0c08536f6d65204f72673059301306072a8648ce3d020106082a8648ce3d03010703420004f45aeeb349ed660135e274eacec814bbd7eb0a10ae13397b6a1d1a99fa64ee8b9ddabd6aedf91d8a236927a8c0c97936275d3b418c099475f5b7f74cb71f6145a03e303c06092a864886f70d01090e312f302d301b0603551d1104143012821061636d652d706f632e6578616d706c65300e0603551d0f0101ff040403020780300a06082a8648ce3d04030203480030450220059138aafbecafdea2f5b7e4ad1a0965de0ece3d889f030e16e2d1ed7eb350330221009a67d5861e830daeb12d246451aeb31db28959273aece3bcd18b51d35d5f5dfb";
+
+test "W1: obtainWithCsr issues for a foreign (openssl) CSR; a broken one is InvalidCsr" {
+    var lab: Lab = undefined;
+    try lab.start(false);
+    defer lab.stop();
+    var zone: TestZone = .{};
+    var account_key: jws.KeyPair = undefined;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&account_key));
+    var c = try w1Client(&lab, &zone, 75, &account_key);
+    defer c.deinit();
+
+    var csr: [openssl_csr_hex.len / 2]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&csr, openssl_csr_hex);
+    var chain = try c.obtainWithCsr(&csr, .{});
+    defer chain.deinit(testing.allocator);
+    try testing.expectEqualStrings(x509.test_cert_pem ++ x509.test_root_cert_pem, chain.chain_pem);
+    try testing.expectEqual(x509.test_cert_not_after, chain.not_after);
+    try testing.expect(lab.mock.csr_ok);
+
+    const orders_before = lab.mock.nonces_issued;
+    csr[csr.len - 1] ^= 1; // the signature no longer verifies
+    try testing.expectError(error.InvalidCsr, c.obtainWithCsr(&csr, .{}));
+    try testing.expectEqual(orders_before, lab.mock.nonces_issued); // refused before any request
+    try lab.expectClean();
+}
+
+test "W1: ES512 account key and ES512 certificate key through the whole flow" {
+    var lab: Lab = undefined;
+    try lab.start(false);
+    defer lab.stop();
+    var zone: TestZone = .{};
+    lab.mock.mode = .dns_01;
+    lab.mock.zone = &zone;
+    var account_key: jws.Es512.KeyPair = undefined;
+    try jws.Es512.KeyPair.generateDeterministicInto(&account_key, &@as([jws.Es512.KeyPair.seed_length]u8, @splat(76)));
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&account_key));
+    var c = lab.client(&account_key, .{
+        .challenge_type = .dns_01,
+        .dns_publisher = zone.publisher(),
+        .cert_key_alg = .es512,
+    });
+    defer c.deinit();
+
+    var cert = try c.obtain(&.{MockCa.domain});
+    defer cert.deinit(testing.allocator);
+    try lab.expectClean();
+    try testing.expectEqual(@as(?jws.Alg, .es512), lab.mock.account_alg); // newAccount: alg ES512 + a P-521 jwk
+    try testing.expectEqual(@as(?jws.Alg, .es512), lab.mock.csr_alg); // the CSR key is P-521
+    try testing.expect(lab.mock.csr_ok);
+    var back: jws.AnyKeyPair = undefined;
+    try x509.privateKeyFromPem(&back, testing.allocator, cert.key_pem);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&back));
+    try testing.expectEqual(jws.Alg.es512, back.alg());
 }

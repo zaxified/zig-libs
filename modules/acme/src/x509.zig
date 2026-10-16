@@ -7,8 +7,8 @@
 //! `notAfter` extraction (via `std.crypto.Certificate`, an independent
 //! parser from the encoder here).
 //!
-//! Scope is deliberately tiny: P-256 and P-384 keys (ES256 / ES384
-//! signatures), dNSName SANs, RFC 5915 and PKCS#8 key PEM, the RFC 9773 CertID.
+//! Scope is deliberately tiny: P-256, P-384 and P-521 keys (ES256 / ES384 /
+//! ES512 signatures), dNSName SANs, RFC 5915 and PKCS#8 key PEM, the RFC 9773 CertID.
 //! The CSR uses an **empty subject** — RFC 8555 §7.4 requires the SAN
 //! extension to carry the identifiers and Let's Encrypt ignores (and is
 //! phasing out) the CN; skipping CN also avoids its 64-byte limit.
@@ -33,6 +33,8 @@ const seedHex = testkit.fuzz.seedHex;
 pub const Es256 = @import("p256").EcdsaP256Sha256;
 /// ES384 over the `p384` module (same reason).
 pub const Es384 = jws.Es384;
+/// ES512 over the `p521` module (same reason).
+pub const Es512 = jws.Es512;
 
 const jws = @import("jws.zig");
 const Alg = jws.Alg;
@@ -99,12 +101,15 @@ const oid_p256 = "\x2a\x86\x48\xce\x3d\x03\x01\x07"; // 1.2.840.10045.3.1.7
 const oid_ecdsa_sha256 = "\x2a\x86\x48\xce\x3d\x04\x03\x02"; // 1.2.840.10045.4.3.2
 const oid_p384 = "\x2b\x81\x04\x00\x22"; // 1.3.132.0.34 (secp384r1)
 const oid_ecdsa_sha384 = "\x2a\x86\x48\xce\x3d\x04\x03\x03"; // 1.2.840.10045.4.3.3
+const oid_p521 = "\x2b\x81\x04\x00\x23"; // 1.3.132.0.35 (secp521r1)
+const oid_ecdsa_sha512 = "\x2a\x86\x48\xce\x3d\x04\x03\x04"; // 1.2.840.10045.4.3.4
 const oid_authority_key_identifier = "\x55\x1d\x23"; // 2.5.29.35
 
 fn curveOid(alg: Alg) []const u8 {
     return switch (alg) {
         .es256 => oid_p256,
         .es384 => oid_p384,
+        .es512 => oid_p521,
     };
 }
 
@@ -112,12 +117,14 @@ fn sigAlgOid(alg: Alg) []const u8 {
     return switch (alg) {
         .es256 => oid_ecdsa_sha256,
         .es384 => oid_ecdsa_sha384,
+        .es512 => oid_ecdsa_sha512,
     };
 }
 
 fn algFromCurveOid(oid: []const u8) ?Alg {
     if (std.mem.eql(u8, oid, oid_p256)) return .es256;
     if (std.mem.eql(u8, oid, oid_p384)) return .es384;
+    if (std.mem.eql(u8, oid, oid_p521)) return .es512;
     return null;
 }
 const oid_extension_request = "\x2a\x86\x48\x86\xf7\x0d\x01\x09\x0e"; // 1.2.840.113549.1.9.14
@@ -151,42 +158,70 @@ pub fn isValidWildcardDomain(name: []const u8) bool {
 
 // ── PKCS#10 CSR ─────────────────────────────────────────────────────────────
 
-pub const CsrError = error{ OutOfMemory, ValueTooLarge, InvalidDomain, SigningFailed };
+pub const CsrError = error{ OutOfMemory, ValueTooLarge, InvalidDomain, SigningFailed, DuplicateExtension };
+
+/// One extra X.509 extension for the CSR's extensionRequest (`csrDerWith`),
+/// e.g. `must_staple`. The CA decides which it copies into the certificate.
+pub const Extension = struct {
+    /// The OID's content octets (no tag/length), e.g. "\x2b\x06\x01\x05\x05\x07\x01\x18".
+    oid: []const u8,
+    critical: bool = false,
+    /// The DER the extnValue OCTET STRING wraps.
+    value: []const u8,
+};
+
+/// TLS Feature `status_request` (RFC 7633, OCSP Must-Staple): OID
+/// 1.3.6.1.5.5.7.1.24, value `SEQUENCE { INTEGER 5 }`.
+pub const must_staple: Extension = .{
+    .oid = "\x2b\x06\x01\x05\x05\x07\x01\x18",
+    .value = "\x30\x03\x02\x01\x05",
+};
 
 /// Build a DER-encoded PKCS#10 CSR for `domains`, signed with `key_pair` (a
-/// pointer to an `Es256.KeyPair`, an `Es384.KeyPair` or a `jws.AnyKeyPair`;
-/// ecdsa-with-SHA256 / -SHA384 by curve). Structure: version 0, empty subject,
+/// pointer to an `Es256.KeyPair`, an `Es384.KeyPair`, an `Es512.KeyPair` or a
+/// `jws.AnyKeyPair`; ecdsa-with-SHA256 / -SHA384 / -SHA512 by curve). Structure: version 0, empty subject,
 /// the key's SPKI, one extensionRequest attribute carrying subjectAltName =
 /// dNSName list. A wildcard (`*.example.org`) is a valid dNSName here; whether
 /// it can be validated is the order flow's business. Caller owns the returned
 /// bytes.
 pub fn csrDer(gpa: Allocator, key_pair: anytype, domains: []const []const u8) CsrError![]u8 {
+    return csrDerWith(gpa, key_pair, domains, &.{});
+}
+
+/// `csrDer` with `extra` extensions after the subjectAltName in the
+/// extensionRequest (autocert `ExtraExtensions`, certbot `--must-staple`).
+/// An OID given twice, or the subjectAltName itself, is `DuplicateExtension`.
+pub fn csrDerWith(gpa: Allocator, key_pair: anytype, domains: []const []const u8, extra: []const Extension) CsrError![]u8 {
     if (comptime @TypeOf(key_pair.*) == jws.AnyKeyPair) {
         return switch (key_pair.*) {
-            inline else => |*kp| csrDerTyped(gpa, kp, domains),
+            inline else => |*kp| csrDerTyped(gpa, kp, domains, extra),
         };
     } else {
-        return csrDerTyped(gpa, key_pair, domains);
+        return csrDerTyped(gpa, key_pair, domains, extra);
     }
 }
 
-fn csrDerTyped(gpa: Allocator, key_pair: anytype, domains: []const []const u8) CsrError![]u8 {
-    return burn.run(burn.sign_burn, CsrError![]u8, CsrBody(@TypeOf(key_pair.*)).run, .{ gpa, key_pair, domains });
+fn csrDerTyped(gpa: Allocator, key_pair: anytype, domains: []const []const u8, extra: []const Extension) CsrError![]u8 {
+    return burn.run(burn.sign_burn, CsrError![]u8, CsrBody(@TypeOf(key_pair.*)).run, .{ gpa, key_pair, domains, extra });
 }
 
 fn CsrBody(comptime KP: type) type {
     return struct {
-        fn run(gpa: Allocator, key_pair: *const KP, domains: []const []const u8) CsrError![]u8 {
-            return csrDerBody(KP, gpa, key_pair, domains);
+        fn run(gpa: Allocator, key_pair: *const KP, domains: []const []const u8, extra: []const Extension) CsrError![]u8 {
+            return csrDerBody(KP, gpa, key_pair, domains, extra);
         }
     };
 }
 
-fn csrDerBody(comptime KP: type, gpa: Allocator, key_pair: *const KP, domains: []const []const u8) CsrError![]u8 {
+fn csrDerBody(comptime KP: type, gpa: Allocator, key_pair: *const KP, domains: []const []const u8, extra: []const Extension) CsrError![]u8 {
     const alg = comptime jws.algOf(KP);
     if (domains.len == 0) return error.InvalidDomain;
     for (domains) |name| {
         if (!isValidDomain(name) and !isValidWildcardDomain(name)) return error.InvalidDomain;
+    }
+    for (extra, 0..) |ext, i| {
+        if (std.mem.eql(u8, ext.oid, oid_subject_alt_name)) return error.DuplicateExtension;
+        for (extra[0..i]) |prev| if (std.mem.eql(u8, prev.oid, ext.oid)) return error.DuplicateExtension;
     }
 
     var arena = std.heap.ArenaAllocator.init(gpa);
@@ -209,7 +244,15 @@ fn csrDerBody(comptime KP: type, gpa: Allocator, key_pair: *const KP, domains: [
         // criticality omitted (DEFAULT FALSE), then extnValue OCTET STRING.
         try d.tlv(0x04, san_value),
     });
-    const extensions = try d.seq(&.{san_ext});
+    const ext_list = try d.a.alloc([]const u8, 1 + extra.len);
+    ext_list[0] = san_ext;
+    for (ext_list[1..], extra) |*slot, ext| {
+        slot.* = if (ext.critical)
+            try d.seq(&.{ try d.oid(ext.oid), try d.tlv(0x01, "\xff"), try d.tlv(0x04, ext.value) })
+        else
+            try d.seq(&.{ try d.oid(ext.oid), try d.tlv(0x04, ext.value) });
+    }
+    const extensions = try d.seq(ext_list);
 
     // Attributes [0]: one extensionRequest attribute (OID + SET { Extensions }).
     const attribute = try d.seq(&.{
@@ -232,7 +275,7 @@ fn csrDerBody(comptime KP: type, gpa: Allocator, key_pair: *const KP, domains: [
 
     const csr = try d.seq(&.{
         info,
-        try d.seq(&.{try d.oid(sigAlgOid(alg))}), // ecdsa-with-SHA256/384, params absent
+        try d.seq(&.{try d.oid(sigAlgOid(alg))}), // ecdsa-with-SHA256/384/512, params absent
         try d.bitString(sig_der),
     });
     return gpa.dupe(u8, csr);
@@ -353,7 +396,7 @@ fn tlsAlpnCertDerBody(
         try d.bitString(&pub_sec1),
     });
 
-    // AlgorithmIdentifier ecdsa-with-SHA256/384 (params absent) — shared by
+    // AlgorithmIdentifier ecdsa-with-SHA256/384/512 (params absent) — shared by
     // the inner `signature` field and the outer `signatureAlgorithm`.
     const alg_id = try d.seq(&.{try d.oid(sigAlgOid(alg))});
 
@@ -549,19 +592,19 @@ pub const ParsedCsrAny = struct {
 /// key (ES256 / SAN extension request): checks version, algorithms, extracts
 /// the dNSName SANs and verifies the self-signature. The oracle half of the
 /// encoder — also what the mock CA runs against the client's finalize. A
-/// P-384 CSR is `UnsupportedCsr` here (see `parseCsrAny`).
+/// P-384 or P-521 CSR is `UnsupportedCsr` here (see `parseCsrAny`).
 pub fn parseCsr(gpa: Allocator, der_bytes: []const u8) ParseCsrError!ParsedCsr {
     var any = try parseCsrAny(gpa, der_bytes);
     switch (any.public_key) {
         .es256 => |k| return .{ .gpa = gpa, .sans = any.sans, .public_key = k },
-        .es384 => {
+        .es384, .es512 => {
             any.deinit();
             return error.UnsupportedCsr;
         },
     }
 }
 
-/// `parseCsr` for P-256 and P-384 (ecdsa-with-SHA256 / -SHA384; the
+/// `parseCsr` for P-256, P-384 and P-521 (ecdsa-with-SHA256 / -SHA384 / -SHA512; the
 /// signature algorithm must match the key's curve).
 pub fn parseCsrAny(gpa: Allocator, der_bytes: []const u8) ParseCsrError!ParsedCsrAny {
     return parseCsrInner(gpa, der_bytes) catch |err| switch (err) {
@@ -601,6 +644,7 @@ fn parseCsrInner(
     const public_key: jws.AnyPublicKey = switch (alg) {
         .es256 => .{ .es256 = Es256.PublicKey.fromSec1(key_content[1..]) catch return error.UnsupportedCsr },
         .es384 => .{ .es384 = Es384.PublicKey.fromSec1(key_content[1..]) catch return error.UnsupportedCsr },
+        .es512 => .{ .es512 = Es512.PublicKey.fromSec1(key_content[1..]) catch return error.UnsupportedCsr },
     };
 
     // Attributes [0] → extensionRequest → Extensions → subjectAltName.
@@ -624,6 +668,10 @@ fn parseCsrInner(
         },
         .es384 => |k| {
             const sig = Es384.Signature.fromDer(sig_content[1..]) catch return error.BadCsrSignature;
+            sig.verify(info_full, k) catch return error.BadCsrSignature;
+        },
+        .es512 => |k| {
+            const sig = Es512.Signature.fromDer(sig_content[1..]) catch return error.BadCsrSignature;
             sig.verify(info_full, k) catch return error.BadCsrSignature;
         },
     }
@@ -737,7 +785,7 @@ pub fn pemDecode(gpa: Allocator, label: []const u8, text: []const u8) PemDecodeE
 }
 
 /// The longest private-key DER the secret PEM paths handle (a P-256
-/// `EC PRIVATE KEY` is 121 bytes).
+/// `EC PRIVATE KEY` is 121 bytes, a P-521 one 223).
 const max_secret_der = 1024;
 
 /// `pemEncode` for a SECRET DER: constant-time base64 (`b64ct.zig`), and the
@@ -812,8 +860,8 @@ pub fn pemBlockCount(label: []const u8, text: []const u8) error{LabelTooLong}!us
 
 pub const KeyPemError = error{ OutOfMemory, MissingPemBlock, InvalidPem, MalformedKey, LabelTooLong };
 
-/// Serialize a key pair (a pointer to an `Es256.KeyPair`, an `Es384.KeyPair`
-/// or a `jws.AnyKeyPair`) as an openssl-compatible `EC PRIVATE KEY` PEM
+/// Serialize a key pair (a pointer to an `Es256.KeyPair`, an `Es384.KeyPair`,
+/// an `Es512.KeyPair` or a `jws.AnyKeyPair`) as an openssl-compatible `EC PRIVATE KEY` PEM
 /// (RFC 5915: version 1, private scalar, curve OID, public point).
 pub fn ecPrivateKeyToPem(gpa: Allocator, key_pair: anytype) error{OutOfMemory}![]u8 {
     const r = privateKeyToPemUnburned(.sec1, gpa, key_pair);
@@ -890,8 +938,8 @@ fn pkcs8Der(d: Der, alg: Alg, sk: []const u8, pub_sec1: []const u8) DerEncodeErr
 
 /// Load a key pair from an `EC PRIVATE KEY` PEM (RFC 5915 — the format
 /// `ecPrivateKeyToPem` and `openssl ecparam -genkey` write). `out` is a
-/// pointer to an `Es256.KeyPair`, an `Es384.KeyPair` (the PEM's curve must
-/// be that one, else `MalformedKey`) or a `jws.AnyKeyPair` (the PEM's curve
+/// pointer to an `Es256.KeyPair`, an `Es384.KeyPair`, an `Es512.KeyPair` (the
+/// PEM's curve must be that one, else `MalformedKey`) or a `jws.AnyKeyPair` (the PEM's curve
 /// picks the variant; the `[0]` parameters are then required). The pair goes
 /// into `out` (zeroed on error), never through a return value: a returned
 /// pair would sit in the caller's error-union temporary. `gpa` is no longer
@@ -905,7 +953,7 @@ pub fn ecPrivateKeyFromPem(out: anytype, gpa: Allocator, text: []const u8) KeyPe
 
 /// `ecPrivateKeyFromPem` for a PKCS#8 `PRIVATE KEY` PEM (RFC 5958, what
 /// `openssl genpkey` writes and `openssl pkcs8` converts to): an EC key on
-/// P-256 or P-384, the curve taken from the AlgorithmIdentifier.
+/// P-256, P-384 or P-521, the curve taken from the AlgorithmIdentifier.
 pub fn pkcs8PrivateKeyFromPem(out: anytype, gpa: Allocator, text: []const u8) KeyPemError!void {
     _ = gpa;
     return keyFromPem("PRIVATE KEY", .pkcs8, out, text);
@@ -944,8 +992,12 @@ fn pairDest(comptime E: type, out: anytype) ?*E.KeyPair {
             out.* = .{ .es256 = undefined };
             return &out.es256;
         }
-        out.* = .{ .es384 = undefined };
-        return &out.es384;
+        if (E == Es384) {
+            out.* = .{ .es384 = undefined };
+            return &out.es384;
+        }
+        out.* = .{ .es512 = undefined };
+        return &out.es512;
     }
     return null;
 }
@@ -994,6 +1046,7 @@ noinline fn keyFromDer(comptime form: KeyForm, out: anytype, bytes: []const u8) 
     switch (alg) {
         .es256 => try fillPair(Es256, out, raw),
         .es384 => try fillPair(Es384, out, raw),
+        .es512 => try fillPair(Es512, out, raw),
     }
 }
 
@@ -1048,6 +1101,42 @@ pub fn ariCertIdFromPem(gpa: Allocator, cert_pem: []const u8) (AriCertIdError ||
     const der_bytes = try pemDecode(gpa, "CERTIFICATE", cert_pem);
     defer gpa.free(der_bytes);
     return ariCertId(gpa, der_bytes);
+}
+
+/// The first commonName (2.5.4.3) value in a certificate's issuer Name, or
+/// null (no CN, or the DER does not walk). Bounded reader over CA-supplied
+/// bytes — std's `der.Element.parse` indexes without bounds checks. Used by
+/// `Client` to pick an alternate chain by its topmost issuer.
+pub fn issuerCommonName(cert_der: []const u8) ?[]const u8 {
+    return issuerCn(cert_der) catch null;
+}
+
+fn issuerCn(der_bytes: []const u8) ReadError!?[]const u8 {
+    const cert = try expectElem(der_bytes, 0, 0x30);
+    const tbs = try expectElem(der_bytes, cert.start, 0x30);
+    var e = try readElem(der_bytes, tbs.start);
+    if (e.tag == 0xa0) e = try readElem(der_bytes, e.end); // [0] version
+    if (e.tag != 0x02) return error.Malformed; // serialNumber
+    const sig_alg = try expectElem(der_bytes, e.end, 0x30);
+    const issuer = try expectElem(der_bytes, sig_alg.end, 0x30);
+    // Name ::= SEQUENCE OF SET OF AttributeTypeAndValue { OID, value }.
+    var rdn_at = issuer.start;
+    while (rdn_at < issuer.end) {
+        const rdn = try expectElem(der_bytes, rdn_at, 0x31);
+        if (rdn.end > issuer.end) return error.Malformed;
+        rdn_at = rdn.end;
+        var atv_at = rdn.start;
+        while (atv_at < rdn.end) {
+            const atv = try expectElem(der_bytes, atv_at, 0x30);
+            if (atv.end > rdn.end) return error.Malformed;
+            atv_at = atv.end;
+            const oid = try expectElem(der_bytes, atv.start, 0x06);
+            const value = try readElem(der_bytes, oid.end);
+            if (value.end > atv.end) return error.Malformed;
+            if (std.mem.eql(u8, oid.content(der_bytes), "\x55\x04\x03")) return value.content(der_bytes);
+        }
+    }
+    return null;
 }
 
 const AriParts = struct { serial: []const u8, key_id: ?[]const u8 };
@@ -2089,7 +2178,187 @@ test "PKCS#8 and SEC1 PEM: openssl's P-384 and P-256 keys load, ours reproduce o
     const der_bytes = try pemDecode(testing.allocator, "PRIVATE KEY", openssl_p384_pkcs8);
     defer testing.allocator.free(der_bytes);
     const curve_at = std.mem.indexOf(u8, der_bytes, oid_p384).? + oid_p384.len - 1;
-    der_bytes[curve_at] = 0x23; // secp521r1 — not supported
+    der_bytes[curve_at] = 0x21; // secp224r1 — not supported
+    const bad_pem = try pemEncode(testing.allocator, "PRIVATE KEY", der_bytes);
+    defer testing.allocator.free(bad_pem);
+    try testing.expectError(error.MalformedKey, privateKeyFromPem(&any, testing.allocator, bad_pem));
+}
+
+// ── ES512 (2026-10-16) ──────────────────────────────────────────────────────
+
+fn testKeyPair521(comptime seed_byte: u8) *const Es512.KeyPair {
+    const S = struct {
+        var kp: Es512.KeyPair = undefined;
+        var ready = false;
+    };
+    if (!S.ready) {
+        const seed: [Es512.KeyPair.seed_length]u8 = @splat(seed_byte);
+        Es512.KeyPair.generateDeterministicInto(&S.kp, &seed) catch unreachable;
+        S.ready = true;
+    }
+    return &S.kp;
+}
+
+// openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-521 -out k.pkcs8.pem (a throwaway
+// key, published here as a fixture); `openssl pkcs8 -topk8 -nocrypt` of the SEC1 form below
+// gives the same bytes.
+const openssl_p521_pkcs8 =
+    \\-----BEGIN PRIVATE KEY-----
+    \\MIHuAgEAMBAGByqGSM49AgEGBSuBBAAjBIHWMIHTAgEBBEIAg5E++wD4V6KAYY76
+    \\DM8S8SOaqHPs0rzYug8sEVEVDFVtu5+aWBixPcynqpkG2Y9oXSwhYvp3gP7CfvYh
+    \\Q5UhInmhgYkDgYYABADp1kMjY64eqTo2tF6E0OfCwtK4oFP0m8dMpcSaT0T6Z/p/
+    \\caX6QWUM5jtpWfazsfD+eargrs4irCEPta5dTMJocgAfLe430ZFgyVqspyzSGeCI
+    \\iumKf0t00QbX394B0CGiC8x9g5xqnHE3AMfYE1ULbcEbZmN313bTS1rL5vOArJzc
+    \\vQ==
+    \\-----END PRIVATE KEY-----
+    \\
+;
+// openssl ec -in k.pkcs8.pem -out k.sec1.pem (the same key, RFC 5915)
+const openssl_p521_sec1 =
+    \\-----BEGIN EC PRIVATE KEY-----
+    \\MIHcAgEBBEIAg5E++wD4V6KAYY76DM8S8SOaqHPs0rzYug8sEVEVDFVtu5+aWBix
+    \\PcynqpkG2Y9oXSwhYvp3gP7CfvYhQ5UhInmgBwYFK4EEACOhgYkDgYYABADp1kMj
+    \\Y64eqTo2tF6E0OfCwtK4oFP0m8dMpcSaT0T6Z/p/caX6QWUM5jtpWfazsfD+earg
+    \\rs4irCEPta5dTMJocgAfLe430ZFgyVqspyzSGeCIiumKf0t00QbX394B0CGiC8x9
+    \\g5xqnHE3AMfYE1ULbcEbZmN313bTS1rL5vOArJzcvQ==
+    \\-----END EC PRIVATE KEY-----
+    \\
+;
+// openssl req -new -key k.pkcs8.pem -subj / -sha512 -addext subjectAltName=DNS:example.org,DNS:*.example.org -out k.csr.pem
+// openssl req -in k.csr.pem -verify -noout   ->  "Certificate request self-signature verify OK"
+const openssl_p521_csr =
+    \\-----BEGIN CERTIFICATE REQUEST-----
+    \\MIIBezCB3QIBADAAMIGbMBAGByqGSM49AgEGBSuBBAAjA4GGAAQA6dZDI2OuHqk6
+    \\NrRehNDnwsLSuKBT9JvHTKXEmk9E+mf6f3Gl+kFlDOY7aVn2s7Hw/nmq4K7OIqwh
+    \\D7WuXUzCaHIAHy3uN9GRYMlarKcs0hngiIrpin9LdNEG19/eAdAhogvMfYOcapxx
+    \\NwDH2BNVC23BG2Zjd9d200tay+bzgKyc3L2gODA2BgkqhkiG9w0BCQ4xKTAnMCUG
+    \\A1UdEQQeMByCC2V4YW1wbGUub3Jngg0qLmV4YW1wbGUub3JnMAoGCCqGSM49BAME
+    \\A4GMADCBiAJCAcRVdVAAZt5fc9bLRUJgNAatN74vlgaLE4M5EByh+cELgIvLS6Dm
+    \\XGUu9MHDwGJDkNHxEaLPgMAXUViUnPG3Yz53AkIAwsaZS3Ua07gSCIM9Ue/ns+hr
+    \\k7Lz2PEGsQrWfXrTW8sJXRFi+3sLIjW9D8JQTXhatHIQJwNHz1hD35nGJdONXUY=
+    \\-----END CERTIFICATE REQUEST-----
+    \\
+;
+
+test "ES512 CSR: openssl's CSR verifies, ours round-trips, and the P-256-only parser refuses it" {
+    // External oracle: a CSR openssl built and `openssl req -verify` accepted.
+    const ossl_der = try pemDecode(testing.allocator, "CERTIFICATE REQUEST", openssl_p521_csr);
+    defer testing.allocator.free(ossl_der);
+    var theirs = try parseCsrAny(testing.allocator, ossl_der);
+    defer theirs.deinit();
+    try testing.expectEqual(@as(usize, 2), theirs.sans.len);
+    try testing.expectEqualStrings("example.org", theirs.sans[0]);
+    try testing.expectEqualStrings("*.example.org", theirs.sans[1]);
+    try testing.expectEqual(Alg.es512, theirs.public_key.alg());
+    try testing.expectError(error.UnsupportedCsr, parseCsr(testing.allocator, ossl_der));
+    // One flipped bit in the signed part must break the signature.
+    const bad = try testing.allocator.dupe(u8, ossl_der);
+    defer testing.allocator.free(bad);
+    bad[40] ^= 1;
+    try testing.expect(std.meta.isError(parseCsrAny(testing.allocator, bad)));
+
+    // Ours: build with a P-521 key, parse back, same key and SANs.
+    const kp = testKeyPair521(46);
+    const der_bytes = try csrDer(testing.allocator, kp, &.{ "example.org", "www.example.org" });
+    defer testing.allocator.free(der_bytes);
+    try testing.expect(std.mem.indexOf(u8, der_bytes, oid_ecdsa_sha512) != null);
+    try testing.expect(std.mem.indexOf(u8, der_bytes, oid_ecdsa_sha256) == null);
+    var back = try parseCsrAny(testing.allocator, der_bytes);
+    defer back.deinit();
+    try testing.expectEqual(@as(usize, 2), back.sans.len);
+    try testing.expect(back.public_key.eql(.{ .es512 = kp.public_key }));
+    // The same bytes through an AnyKeyPair.
+    var any: jws.AnyKeyPair = .{ .es512 = kp.* };
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&any));
+    const via_any = try csrDer(testing.allocator, &any, &.{ "example.org", "www.example.org" });
+    defer testing.allocator.free(via_any);
+    try testing.expectEqualSlices(u8, der_bytes, via_any);
+
+    // A signature algorithm that disagrees with the key's curve is refused by name.
+    const mismatched = try testing.allocator.dupe(u8, der_bytes);
+    defer testing.allocator.free(mismatched);
+    const at = std.mem.lastIndexOf(u8, mismatched, oid_ecdsa_sha512).? + oid_ecdsa_sha512.len - 1;
+    mismatched[at] = 0x02; // ecdsa-with-SHA256
+    try testing.expectError(error.UnsupportedCsr, parseCsrAny(testing.allocator, mismatched));
+}
+
+test "ES512 TLS-ALPN-01 validation certificate: independent parser reads it, carries the P-521 OIDs" {
+    const kp = testKeyPair521(71);
+    const id: [32]u8 = @splat(0x5a);
+    const cert_der = try tlsAlpnCertDer(testing.allocator, kp, "example.org", id, "\x01\x02", tls_alpn_not_before, tls_alpn_not_after);
+    defer testing.allocator.free(cert_der);
+    try testing.expect(derWellFormed(cert_der));
+    const cert: std.crypto.Certificate = .{ .buffer = cert_der, .index = 0 };
+    const parsed = try cert.parse();
+    try testing.expectEqual(std.crypto.Certificate.NamedCurve.secp521r1, parsed.pub_key_algo.X9_62_id_ecPublicKey);
+    try testing.expectEqual(std.crypto.Certificate.Algorithm.ecdsa_with_SHA512, parsed.signature_algorithm);
+    try testing.expect(std.mem.indexOf(u8, cert_der, oid_p521) != null);
+    // The self-signature verifies over the TBSCertificate with the P-521 key.
+    const tbs = try expectElem(cert_der, (try expectElem(cert_der, 0, 0x30)).start, 0x30);
+    const cert_elem = try expectElem(cert_der, 0, 0x30);
+    const sig_alg = try expectElem(cert_der, tbs.end, 0x30);
+    const sig_bits = try expectElem(cert_der, sig_alg.end, 0x03);
+    try testing.expectEqual(cert_elem.end, sig_bits.end);
+    const sig = try Es512.Signature.fromDer(sig_bits.content(cert_der)[1..]);
+    try sig.verify(cert_der[tbs.hdr..tbs.end], kp.public_key);
+}
+
+test "PKCS#8 and SEC1 PEM: openssl's P-521 key loads, ours reproduce openssl's bytes" {
+    var any: jws.AnyKeyPair = undefined;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&any));
+    try privateKeyFromPem(&any, testing.allocator, openssl_p521_pkcs8);
+    try testing.expectEqual(Alg.es512, any.alg());
+    const out8 = try pkcs8PrivateKeyToPem(testing.allocator, &any);
+    defer testing.allocator.free(out8);
+    try testing.expectEqualStrings(openssl_p521_pkcs8, out8);
+    const out1 = try ecPrivateKeyToPem(testing.allocator, &any);
+    defer testing.allocator.free(out1);
+    try testing.expectEqualStrings(openssl_p521_sec1, out1);
+
+    var sec1_any: jws.AnyKeyPair = undefined;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&sec1_any));
+    try privateKeyFromPem(&sec1_any, testing.allocator, openssl_p521_sec1);
+    try testing.expectEqualSlices(u8, &any.es512.secret_key.toBytes(), &sec1_any.es512.secret_key.toBytes());
+
+    // Typed targets: the right curve loads, the wrong ones are refused.
+    var typed: Es512.KeyPair = undefined;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&typed));
+    try pkcs8PrivateKeyFromPem(&typed, testing.allocator, openssl_p521_pkcs8);
+    try testing.expectEqualSlices(u8, &any.es512.secret_key.toBytes(), &typed.secret_key.toBytes());
+    try ecPrivateKeyFromPem(&typed, testing.allocator, openssl_p521_sec1);
+    var wrong: Es256.KeyPair = undefined;
+    try testing.expectError(error.MalformedKey, pkcs8PrivateKeyFromPem(&wrong, testing.allocator, openssl_p521_pkcs8));
+    try testing.expectError(error.MalformedKey, ecPrivateKeyFromPem(&wrong, testing.allocator, openssl_p521_sec1));
+    var wrong384: Es384.KeyPair = undefined;
+    try testing.expectError(error.MalformedKey, pkcs8PrivateKeyFromPem(&wrong384, testing.allocator, openssl_p521_pkcs8));
+    var wrong521: Es512.KeyPair = undefined;
+    try testing.expectError(error.MalformedKey, pkcs8PrivateKeyFromPem(&wrong521, testing.allocator, openssl_p384_pkcs8));
+    try testing.expectError(error.MalformedKey, pkcs8PrivateKeyFromPem(&wrong521, testing.allocator, openssl_p256_pkcs8));
+    // The EC PRIVATE KEY reader does not take a PRIVATE KEY block, and vice versa.
+    try testing.expectError(error.MissingPemBlock, ecPrivateKeyFromPem(&typed, testing.allocator, openssl_p521_pkcs8));
+    try testing.expectError(error.MissingPemBlock, pkcs8PrivateKeyFromPem(&typed, testing.allocator, openssl_p521_sec1));
+
+    // Our own key round-trips through both forms.
+    const kp = testKeyPair521(47);
+    const pem = try pkcs8PrivateKeyToPem(testing.allocator, kp);
+    defer testing.allocator.free(pem);
+    var rt: Es512.KeyPair = undefined;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&rt));
+    try pkcs8PrivateKeyFromPem(&rt, testing.allocator, pem);
+    try testing.expectEqualSlices(u8, &kp.secret_key.toBytes(), &rt.secret_key.toBytes());
+    try testing.expectEqualSlices(u8, &kp.public_key.toUncompressedSec1(), &rt.public_key.toUncompressedSec1());
+    const pem1 = try ecPrivateKeyToPem(testing.allocator, kp);
+    defer testing.allocator.free(pem1);
+    var rt1: Es512.KeyPair = undefined;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&rt1));
+    try ecPrivateKeyFromPem(&rt1, testing.allocator, pem1);
+    try testing.expectEqualSlices(u8, &kp.secret_key.toBytes(), &rt1.secret_key.toBytes());
+
+    // Damage: a PKCS#8 whose curve OID names an unsupported curve (secp224r1).
+    const der_bytes = try pemDecode(testing.allocator, "PRIVATE KEY", openssl_p521_pkcs8);
+    defer testing.allocator.free(der_bytes);
+    const curve_at = std.mem.indexOf(u8, der_bytes, oid_p521).? + oid_p521.len - 1;
+    der_bytes[curve_at] = 0x21;
     const bad_pem = try pemEncode(testing.allocator, "PRIVATE KEY", der_bytes);
     defer testing.allocator.free(bad_pem);
     try testing.expectError(error.MalformedKey, privateKeyFromPem(&any, testing.allocator, bad_pem));
@@ -2123,4 +2392,40 @@ test "ariCertId: the RFC 9773 §4.1 example (AKI 69885B6B…C8D4, serial 0087654
     // Junk and a truncated certificate: a typed error, not a panic.
     try testing.expectError(error.MalformedCertificate, ariCertId(testing.allocator, "junk"));
     try testing.expectError(error.MalformedCertificate, ariCertId(testing.allocator, der_bytes[0 .. der_bytes.len - 3]));
+}
+
+test "csrDerWith: must-staple encodes as openssl writes it; duplicates refused" {
+    const kp = testKeyPair(42);
+    const der_bytes = try csrDerWith(testing.allocator, kp, &.{"a.example"}, &.{must_staple});
+    defer testing.allocator.free(der_bytes);
+    // `openssl req -new -key k.pem -subj / -addext subjectAltName=DNS:a.example
+    //  -addext tlsfeature=status_request -outform DER` (OpenSSL 3.5.5) carries
+    // exactly this Extension: OID 1.3.6.1.5.5.7.1.24, no critical flag,
+    // OCTET STRING { SEQUENCE { INTEGER 5 } }.
+    const openssl_ext = "\x30\x11\x06\x08\x2b\x06\x01\x05\x05\x07\x01\x18\x04\x05\x30\x03\x02\x01\x05";
+    try testing.expect(std.mem.indexOf(u8, der_bytes, openssl_ext) != null);
+    var parsed = try parseCsrAny(testing.allocator, der_bytes);
+    defer parsed.deinit();
+    try testing.expectEqual(@as(usize, 1), parsed.sans.len);
+    try testing.expectEqualStrings("a.example", parsed.sans[0]);
+
+    const critical: Extension = .{ .oid = must_staple.oid, .critical = true, .value = must_staple.value };
+    const crit_der = try csrDerWith(testing.allocator, kp, &.{"a.example"}, &.{critical});
+    defer testing.allocator.free(crit_der);
+    try testing.expect(std.mem.indexOf(u8, crit_der, "\x2b\x06\x01\x05\x05\x07\x01\x18\x01\x01\xff\x04\x05") != null);
+
+    try testing.expectError(error.DuplicateExtension, csrDerWith(testing.allocator, kp, &.{"a.example"}, &.{ must_staple, must_staple }));
+    const san_again: Extension = .{ .oid = oid_subject_alt_name, .value = "\x30\x00" };
+    try testing.expectError(error.DuplicateExtension, csrDerWith(testing.allocator, kp, &.{"a.example"}, &.{san_again}));
+}
+
+test "issuerCommonName: the fixtures' issuers, and truncations never read past the end" {
+    const leaf = try pemDecode(testing.allocator, "CERTIFICATE", test_cert_pem);
+    defer testing.allocator.free(leaf);
+    try testing.expectEqualStrings("acme-test-fixture", issuerCommonName(leaf).?);
+    const root = try pemDecode(testing.allocator, "CERTIFICATE", test_root_cert_pem);
+    defer testing.allocator.free(root);
+    try testing.expectEqualStrings("acme-test-root", issuerCommonName(root).?);
+    for (0..leaf.len) |n| _ = issuerCommonName(leaf[0..n]); // bounded: no panic on any prefix
+    try testing.expectEqual(@as(?[]const u8, null), issuerCommonName(""));
 }
