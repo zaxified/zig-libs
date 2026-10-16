@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-16** — New: `tsig.decodeSecret` — a TSIG secret from the base64 BIND, `nsupdate -y` and
+  `tsig-keygen` carry, decoded constant-time (`b64ct.zig`, a copy of acme's). The test server in
+  `tools/update_server.py` now chases CNAME chains inside its zones (acmedns's Pebble interop needs it).
+
 - **2026-10-16** — **New: RFC 2136 dynamic update + RFC 8945 TSIG (client side).** `dns.update.Builder`
   (every prerequisite and update form, uncompressed) + `dns.update.send` (fresh id, optional TSIG,
   signed reply required, rcode returned); `dns.tsig.sign`/`verify` (HMAC-SHA1/224/256/384/512,

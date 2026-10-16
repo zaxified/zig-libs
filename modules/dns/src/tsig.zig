@@ -32,6 +32,7 @@
 const std = @import("std");
 const message = @import("message.zig");
 const burn = @import("burn.zig");
+const b64ct = @import("b64ct.zig");
 const hmac = std.crypto.auth.hmac;
 
 /// TSIG algorithms (RFC 8945 §6). HMAC-SHA256 is the one §6 makes mandatory
@@ -91,6 +92,19 @@ pub const Key = struct {
     /// DECODED. Any length; HMAC hashes a secret longer than its block.
     secret: []const u8,
 };
+
+/// Decode a key's secret from the base64 a server configuration carries
+/// (BIND `secret "...";`, `nsupdate -y alg:name:secret`, `tsig-keygen`
+/// output) into `out` and return the written slice. Constant-time in the
+/// secret's characters (`b64ct.zig`); padded standard base64, no whitespace.
+/// `out.len` must be at least `b64.len / 4 * 3`. On error `out` is zeroed.
+pub fn decodeSecret(out: []u8, b64: []const u8) error{ InvalidSecret, BufferTooSmall }![]u8 {
+    if (out.len < b64.len / 4 * 3) return error.BufferTooSmall;
+    return b64ct.decode(out, b64) catch {
+        std.crypto.secureZero(u8, out);
+        return error.InvalidSecret;
+    };
+}
 
 /// TSIG error field (RFC 8945 §5.3, IANA "DNS RCODEs" 16–22).
 pub const TsigError = enum(u16) {
@@ -637,6 +651,19 @@ test "verify: never panics on a truncated or corrupted signed message" {
             } else |_| {}
         }
     }
+}
+
+test "decodeSecret: tsig-keygen output, and garbage refused" {
+    var out: [64]u8 = undefined;
+    // `tsig-keygen -a hmac-sha256` prints 44 base64 characters for 32 bytes.
+    const secret = try decodeSecret(&out, "qlITL/7KKX2IHxzOvaHp/EAOqNEo78ZbNtUvaEN707Q=");
+    var want: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("hmac-sha256.key.", &want, .{});
+    try testing.expectEqualSlices(u8, &want, secret);
+    try testing.expectError(error.InvalidSecret, decodeSecret(&out, "qlITL/7KKX2IHxzOvaHp/EAOqNEo78ZbNtUvaEN707Q"));
+    try testing.expectError(error.InvalidSecret, decodeSecret(&out, "qlIT*/7K"));
+    try testing.expect(std.mem.allEqual(u8, out[0..6], 0));
+    try testing.expectError(error.BufferTooSmall, decodeSecret(out[0..2], "qlITL/7K"));
 }
 
 test "Algorithm.fromName" {

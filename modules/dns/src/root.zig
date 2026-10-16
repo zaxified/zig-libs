@@ -141,6 +141,7 @@ test {
     _ = Resolver;
     _ = update;
     _ = tsig;
+    _ = @import("b64ct.zig");
     _ = @import("stackprobe_test.zig");
     _ = @import("goldens.zig");
     _ = @import("go_oracle.zig");

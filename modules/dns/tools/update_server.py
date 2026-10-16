@@ -178,13 +178,24 @@ def do_query(msg):
         resp.flags &= ~dns.flags.AA
         resp.set_rcode(dns.rcode.REFUSED)
         return resp
-    rs = records.get((q.name, q.rdtype))
-    if rs is not None and len(rs) > 0:
-        resp.answer.append(dns.rrset.from_rdata_list(q.name, rs.ttl, list(rs)))
-        return resp
-    cn = records.get((q.name, dns.rdatatype.CNAME))
-    if cn is not None and len(cn) > 0 and q.rdtype != dns.rdatatype.CNAME:
-        resp.answer.append(dns.rrset.from_rdata_list(q.name, cn.ttl, list(cn)))
+    # Answer, chasing a CNAME chain while it stays inside our zones (what an
+    # authoritative server for both zones returns, and what a stub resolver
+    # such as Go's -- Pebble's validation authority -- needs to see).
+    name = q.name
+    for _ in range(8):
+        rs = records.get((name, q.rdtype))
+        if rs is not None and len(rs) > 0:
+            resp.answer.append(dns.rrset.from_rdata_list(name, rs.ttl, list(rs)))
+            return resp
+        cn = records.get((name, dns.rdatatype.CNAME))
+        if cn is None or len(cn) == 0 or q.rdtype == dns.rdatatype.CNAME:
+            break
+        resp.answer.append(dns.rrset.from_rdata_list(name, cn.ttl, list(cn)))
+        name = list(cn)[0].target
+        if zone_of(name) is None:
+            return resp
+        zone = zone_of(name)
+    if resp.answer:
         return resp
     soa = records[(zone, dns.rdatatype.SOA)]
     resp.authority.append(dns.rrset.from_rdata_list(zone, soa.ttl, list(soa)))
