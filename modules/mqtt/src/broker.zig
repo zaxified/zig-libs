@@ -319,6 +319,16 @@ pub const Connection = struct {
     problem_info: bool = true,
     /// The broker's traffic counters (`$SYS`); set by `accept`.
     stats: ?*Stats = null,
+    /// 5.0 extended authentication: where the exchange is, the method (owned),
+    /// the CONNECT waiting for it to finish (owned raw bytes), the server's
+    /// final Authentication Data for CONNACK (owned), whether it succeeded,
+    /// and the hook's state slot (`ExtAuthRequest.state`).
+    auth_state: AuthState = .none,
+    auth_method: ?[]u8 = null,
+    auth_connect: ?[]u8 = null,
+    auth_final: ?[]u8 = null,
+    ext_done: bool = false,
+    ext_state: [8]u64 = @splat(0),
     /// Clean-session connections only: QoS 1/2 messages that found the
     /// client's window (`client_receive_maximum`, `max_in_flight`) full, in
     /// arrival order, until acknowledgements free it (`pumpConnQueue`). An
@@ -343,6 +353,7 @@ pub const Connection = struct {
     session: ?*Session = null,
 
     pub const State = enum { awaiting_connect, connected, disconnected };
+    pub const AuthState = enum { none, connecting, reauth };
 
     pub fn clientId(c: *const Connection) []const u8 {
         return c.client_id_buf[0..c.client_id_len];
@@ -1040,6 +1051,48 @@ pub const WillInfo = struct {
     payload_len: usize,
 };
 
+/// Where an extended-authentication exchange is (5.0 4.12).
+pub const ExtAuthPhase = enum {
+    /// The CONNECT named an Authentication Method.
+    connect,
+    /// The client's AUTH (0x18) answering the server's challenge.
+    continue_auth,
+    /// A connected client's AUTH (0x19): authenticate again.
+    reauth,
+};
+
+/// What `Config.extendedAuthFn` is given for each step of an extended
+/// authentication exchange. Slices are valid only for the call.
+pub const ExtAuthRequest = struct {
+    phase: ExtAuthPhase,
+    /// The Authentication Method (the same for every step of a connection).
+    method: []const u8,
+    /// The client's Authentication Data of this step, if it sent any.
+    data: ?[]const u8,
+    client_id: []const u8,
+    username: ?[]const u8,
+    /// 64 zeroed bytes (8-aligned) that belong to the connection, for the
+    /// hook's state between steps: a nonce, a counter, a stage. They live in
+    /// the connection and need no cleanup -- they vanish with it. A hook that
+    /// needs more keeps its own table keyed by `client_id` and cleans it up
+    /// itself (the broker tells it nothing at connection end).
+    state: *[8]u64,
+};
+
+/// The hook's verdict on one step.
+pub const ExtAuthResult = union(enum) {
+    /// Authenticated. The optional data goes to the client (CONNACK
+    /// Authentication Data at connect, AUTH 0x00 on re-authentication).
+    success: ?[]const u8,
+    /// Send AUTH 0x18 with this data and wait for the client's AUTH.
+    continue_auth: ?[]const u8,
+    /// Refused: CONNACK 0x87 at connect, DISCONNECT 0x87 afterwards.
+    deny,
+    /// The hook does not support this Authentication Method: CONNACK /
+    /// DISCONNECT 0x8C.
+    unsupported_method,
+};
+
 /// The operation an ACL check authorizes.
 pub const Operation = enum { publish, subscribe };
 
@@ -1291,6 +1344,38 @@ pub const Config = struct {
     /// 0x99 and the message is dropped; QoS 0 gets DISCONNECT 0x99 (3.3.2.3.2
     /// allows either). 3.1.1 has no indicator. Off: forwarded unchecked.
     validate_payload_format: bool = true,
+    /// 5.0 extended authentication (4.12; SCRAM, Kerberos, OAuth ...): called
+    /// for each step of an exchange that a CONNECT with an Authentication
+    /// Method starts, and for a connected client's re-authentication (AUTH
+    /// 0x19). Null (the default) = no method is supported: such a CONNECT is
+    /// refused with 0x8C, as before.
+    ///
+    /// Order at CONNECT: this hook first, until it says `.success`; then the
+    /// rest as for any CONNECT -- `authenticateFn` (username/password, so a
+    /// method may be combined with a password check, which then sees the
+    /// method in `AuthRequest.properties`), the Will's ACL, sessions. While
+    /// the exchange runs the connection is not yet connected: only AUTH (with
+    /// the same method, reason 0x18) is accepted, anything else is a protocol
+    /// error and closes it; the CONNECT is kept in an owned copy. A
+    /// re-authentication leaves the connection otherwise working. An AUTH
+    /// with another method than the connection's, or out of sequence, is a
+    /// protocol error (DISCONNECT 0x82).
+    ///
+    /// The hook runs on the connection's own thread with no broker lock held.
+    extendedAuthFn: ?*const fn (ctx: ?*anyopaque, req: ExtAuthRequest) ExtAuthResult = null,
+    ext_auth_ctx: ?*anyopaque = null,
+    /// Check read access per delivered message: before a message goes to a
+    /// subscriber (live fan-out, a persistent session's queue, retained
+    /// messages at SUBSCRIBE), `authorizeFn` is asked with
+    /// `.operation = .subscribe` and `.topic` = the concrete topic name; a
+    /// denial skips that delivery and counts in `aclDeliveryDenials()`. For a
+    /// subscriber holding `#` against a deny rule on `private/#`. Off by
+    /// default (the SUBSCRIBE-time check alone). ⚠ Cost: one hook call per
+    /// delivery, made while the broker's registry lock is held (the SUBSCRIBE
+    /// check already is), so the hook must be fast and must not call back
+    /// into the broker. A Shared Subscription that picks a denied member
+    /// loses the message rather than trying the next member.
+    acl_check_delivery: bool = false,
     /// Intended `$SYS` period (ms), mosquitto.conf `sys_interval` (which is
     /// in seconds there). `publishSys` publishes only when at least this much
     /// caller time has passed since its last publishing call; 0 = never.
@@ -1424,6 +1509,8 @@ pub const Broker = struct {
     /// would get exceeded its 5.0 Maximum Packet Size or `tx_buf`
     /// (3.1.2-25, `tx_headroom`).
     oversize_drops: std.atomic.Value(usize) = .init(0),
+    /// Deliveries skipped by `Config.acl_check_delivery`.
+    acl_delivery_denials: std.atomic.Value(usize) = .init(0),
     /// Traffic counters (`publishSys`).
     stats: Stats = .{},
     /// Highest number of simultaneously connected clients seen at a CONNECT
@@ -1533,6 +1620,29 @@ pub const Broker = struct {
     /// Expiry ran out before delivery.
     pub fn messagesExpired(b: *const Broker) u64 {
         return b.messages_expired.load(.monotonic);
+    }
+
+    /// Deliveries skipped because `Config.authorizeFn` denied the subscriber
+    /// read access to the message's topic (`Config.acl_check_delivery`).
+    pub fn aclDeliveryDenials(b: *const Broker) u64 {
+        return b.acl_delivery_denials.load(.monotonic);
+    }
+
+    /// May `client_id` be delivered `topic_name`? Always yes unless
+    /// `Config.acl_check_delivery` and an `authorizeFn` are set.
+    fn deliveryAllowed(b: *Broker, client_id: []const u8, username: ?[]const u8, topic_name: []const u8) bool {
+        if (!b.config.acl_check_delivery) return true;
+        const f = b.config.authorizeFn orelse return true;
+        if (f(b.config.acl_ctx, .{ .client_id = client_id, .username = username, .topic = topic_name, .operation = .subscribe })) return true;
+        _ = b.acl_delivery_denials.fetchAdd(1, .monotonic);
+        return false;
+    }
+
+    fn ownerUsername(o: Owner) ?[]const u8 {
+        return switch (o) {
+            .conn => |c| c.usernameOpt(),
+            .session => |x| x.ownerOpt(),
+        };
     }
 
     /// Deliveries dropped for a subscriber they were too large for.
@@ -2163,6 +2273,12 @@ pub const Broker = struct {
     fn freeConnection(b: *Broker, conn: *Connection) void {
         if (conn.eq) |q| b.freeSession(q);
         conn.eq = null;
+        if (conn.auth_method) |m| b.allocator.free(m);
+        if (conn.auth_connect) |m| b.allocator.free(m);
+        if (conn.auth_final) |m| b.allocator.free(m);
+        conn.auth_method = null;
+        conn.auth_connect = null;
+        conn.auth_final = null;
         b.dropWill(conn);
         b.freeAliases(conn);
         if (conn.session) |x| b.releaseSession(x);
@@ -2632,7 +2748,7 @@ pub const Broker = struct {
             // CONNECT of either level and says which. Any other first packet
             // is read as 3.1.1, to be refused as before (spec 3.1).
             const first_is_connect = conn.rx_len > 0 and conn.rx_buf[0] >> 4 == @intFromEnum(packet.PacketType.connect);
-            const version: packet.Version = if (conn.state != .awaiting_connect) conn.version else if (first_is_connect) .v5 else .v3_1_1;
+            const version: packet.Version = if (conn.state != .awaiting_connect or conn.auth_state == .connecting) conn.version else if (first_is_connect) .v5 else .v3_1_1;
             const dec = (packet.decodePacket(conn.rx_buf[0..conn.rx_len], version) catch |e| {
                 if (e == error.UnsupportedProtocol and first_is_connect and conn.state == .awaiting_connect) {
                     refuseProtocolLevel(conn);
@@ -2708,12 +2824,20 @@ pub const Broker = struct {
     fn handle(b: *Broker, conn: *Connection, p: packet.Packet, now: i64) Error!Disposition {
         switch (conn.state) {
             .awaiting_connect => {
+                // An extended-authentication exchange is under way: only AUTH
+                // (and a client giving up) fits (4.12).
+                if (conn.auth_state == .connecting) {
+                    if (p == .auth) return b.handleAuth(conn, p.auth, now);
+                    if (p == .disconnect) return .close;
+                    return error.ProtocolViolation;
+                }
                 if (p != .connect) return error.ProtocolViolation; // spec 3.1: first packet
                 return b.handleConnect(conn, p.connect, now);
             },
             .disconnected => return .close,
             .connected => switch (p) {
                 .connect => return error.ProtocolViolation, // second CONNECT (spec 3.1-2)
+                .auth => |a| return b.handleAuth(conn, a, now),
                 .publish => |pub_pkt| return b.handlePublish(conn, pub_pkt, now),
                 .subscribe => |s| {
                     try b.handleSubscribe(conn, s, now);
@@ -2822,7 +2946,7 @@ pub const Broker = struct {
         // 5.0 extended authentication (4.12): no method is implemented here,
         // so a CONNECT naming one is refused with 0x8C (4.12.0-1) rather than
         // admitted as if it had not asked.
-        if (v5 and c.properties.authentication_method != null) {
+        if (v5 and c.properties.authentication_method != null and b.config.extendedAuthFn == null) {
             return b.refuseConnect(conn, .not_authorized, .bad_authentication_method);
         }
 
@@ -2840,6 +2964,23 @@ pub const Broker = struct {
             conn.username_len = uname.len;
             conn.has_username = true;
         }
+
+        // Extended authentication (4.12), before the username/password hook.
+        // The exchange may take several packets, and this CONNECT's slices
+        // point into the receive buffer the next packet overwrites: keep an
+        // owned copy of its bytes and run the whole function again from them
+        // once the hook says `.success` (`ext_done`).
+        if (v5 and !conn.ext_done) if (c.properties.authentication_method) |method| {
+            const raw = try b.allocator.dupe(u8, conn.rx_buf[0..conn.rx_consumed]);
+            errdefer b.allocator.free(raw);
+            const m = try b.allocator.dupe(u8, method);
+            if (conn.auth_method) |old| b.allocator.free(old);
+            if (conn.auth_connect) |old| b.allocator.free(old);
+            conn.auth_method = m;
+            conn.auth_connect = raw;
+            conn.auth_state = .connecting;
+            return b.extAuthStep(conn, .connect, c.properties.authentication_data, now);
+        };
 
         // Authentication hook (FIX D). Checked BEFORE take-over so an
         // unauthorized new connection cannot disturb a live session.
@@ -3006,6 +3147,8 @@ pub const Broker = struct {
     fn connackProperties(b: *const Broker, conn: *const Connection, assigned: bool, lowered_sei: ?u32, server_keep_alive: ?u16) packet.Properties {
         return .{
             .server_keep_alive = server_keep_alive,
+            .authentication_method = if (conn.ext_done) conn.auth_method else null,
+            .authentication_data = if (conn.ext_done) conn.auth_final else null,
             .retain_available = if (b.config.retain_available) null else false,
             .session_expiry_interval = lowered_sei,
             // The inbound QoS 2 window (QoS 1 is acknowledged at once).
@@ -3016,6 +3159,102 @@ pub const Broker = struct {
             .assigned_client_identifier = if (assigned) conn.clientId() else null,
             .topic_alias_maximum = if (b.config.topic_alias_maximum > 0) b.config.topic_alias_maximum else null,
         };
+    }
+
+    /// One step of an extended-authentication exchange: ask the hook, then
+    /// act on its verdict (see `Config.extendedAuthFn`).
+    fn extAuthStep(b: *Broker, conn: *Connection, phase: ExtAuthPhase, data: ?[]const u8, now: i64) Error!Disposition {
+        const hook = b.config.extendedAuthFn orelse return error.ProtocolViolation;
+        const connecting = conn.auth_state == .connecting;
+        const verdict = hook(b.config.ext_auth_ctx, .{
+            .phase = phase,
+            .method = conn.auth_method.?,
+            .data = data,
+            .client_id = conn.clientId(),
+            .username = conn.usernameOpt(),
+            .state = &conn.ext_state,
+        });
+        switch (verdict) {
+            .unsupported_method, .deny => {
+                const code: packet.ReasonCode = if (verdict == .deny) .not_authorized else .bad_authentication_method;
+                conn.auth_state = .none;
+                if (connecting) return b.refuseConnect(conn, .not_authorized, code);
+                conn.close_reason = code; // DISCONNECT 0x87 / 0x8C
+                return error.ProtocolViolation;
+            },
+            .continue_auth => |d| {
+                try b.writeAuth(conn, .continue_authentication, d);
+                return .keep;
+            },
+            .success => |d| {
+                conn.auth_state = .none;
+                if (!connecting) {
+                    try b.writeAuth(conn, .success, d);
+                    return .keep;
+                }
+                if (conn.auth_final) |old| b.allocator.free(old);
+                conn.auth_final = if (d) |x| try b.allocator.dupe(u8, x) else null;
+                conn.ext_done = true;
+                // The CONNECT again, from its owned copy.
+                const raw = conn.auth_connect.?;
+                conn.auth_connect = null;
+                defer b.allocator.free(raw);
+                const dec = (packet.decodePacket(raw, .v5) catch return error.ProtocolViolation) orelse return error.ProtocolViolation;
+                if (dec.packet != .connect) return error.ProtocolViolation;
+                return b.handleConnect(conn, dec.packet.connect, now);
+            },
+        }
+    }
+
+    fn writeAuth(b: *Broker, conn: *Connection, code: packet.ReasonCode, data: ?[]const u8) Error!void {
+        _ = b;
+        conn.tx_lock.lock();
+        defer conn.tx_lock.unlock();
+        try conn.write(try packet.encodePacket(conn.tx_buf, .v5, .{ .auth = .{
+            .reason_code = code,
+            .properties = .{ .authentication_method = conn.auth_method, .authentication_data = data },
+        } }));
+    }
+
+    /// A client AUTH packet (3.15): the next step of the CONNECT exchange, or
+    /// of a re-authentication (4.12.1). Anything out of sequence, without the
+    /// connection's method, or when no hook is configured is a protocol error.
+    fn handleAuth(b: *Broker, conn: *Connection, a: packet.Auth, now: i64) Error!Disposition {
+        const mine = conn.auth_method orelse {
+            conn.close_reason = .protocol_error;
+            return error.ProtocolViolation;
+        };
+        const method = a.properties.authentication_method orelse "";
+        if (b.config.extendedAuthFn == null or !std.mem.eql(u8, method, mine)) {
+            conn.close_reason = .protocol_error;
+            return error.ProtocolViolation;
+        }
+        const data = a.properties.authentication_data;
+        if (conn.state == .awaiting_connect) {
+            if (conn.auth_state != .connecting or a.reason_code != .continue_authentication) return error.ProtocolViolation;
+            return b.extAuthStep(conn, .continue_auth, data, now);
+        }
+        switch (a.reason_code) {
+            .re_authenticate => {
+                if (conn.auth_state != .none) {
+                    conn.close_reason = .protocol_error;
+                    return error.ProtocolViolation;
+                }
+                conn.auth_state = .reauth;
+                return b.extAuthStep(conn, .reauth, data, now);
+            },
+            .continue_authentication => {
+                if (conn.auth_state != .reauth) {
+                    conn.close_reason = .protocol_error;
+                    return error.ProtocolViolation;
+                }
+                return b.extAuthStep(conn, .continue_auth, data, now);
+            },
+            else => {
+                conn.close_reason = .protocol_error;
+                return error.ProtocolViolation;
+            },
+        }
     }
 
     /// Refuse a CONNECT: the CONNACK in the client's version, then close.
@@ -3499,6 +3738,7 @@ pub const Broker = struct {
                     for (b.retained.items) |r| {
                         if (!topic.matches(req.filter, r.topic)) continue;
                         if (b.retainedGone(r, now)) continue; // gone (3.3.2-5, retain_expiry_interval_ms)
+                        if (!b.deliveryAllowed(conn.clientId(), conn.usernameOpt(), r.topic)) continue;
                         // The envelope is checked BEFORE the dup, so a
                         // truncated walk costs nothing rather than one more
                         // copy of the largest payload in the store.
@@ -4013,6 +4253,7 @@ pub const Broker = struct {
             // (spec 3.1.2.4 keeps QoS 0 optional; this broker does not).
             try targets.ensureTotalCapacity(b.allocator, owners.items.len);
             for (owners.items, spans) |o, span| {
+                if (!b.deliveryAllowed(ownerClientId(o.owner), ownerUsername(o.owner), msg.topic)) continue;
                 const q = minQos(qos, o.qos);
                 const retain = msg.retain and o.retain_as_published;
                 const run = ids.items[span[0]..span[1]];
@@ -9294,4 +9535,204 @@ test "persistence seam: restore refuses what no publish could have produced, and
     // The old API is untouched.
     try b.restoreSession("S", null, &.{}, 0);
     try testing.expectEqual(@as(usize, 1), b.sessionCount());
+}
+
+// ── wave 3: extended authentication, delivery-time read ACL ─────────────────
+
+/// A two-step challenge/response, SCRAM-shaped: "DUMMY". CONNECT -> challenge;
+/// the right answer -> success with server data. Re-authentication asks a
+/// second challenge, answered by "answer2".
+fn dummyExtAuth(ctx: ?*anyopaque, req: ExtAuthRequest) ExtAuthResult {
+    _ = ctx;
+    if (!std.mem.eql(u8, req.method, "DUMMY")) return .unsupported_method;
+    switch (req.phase) {
+        .connect => {
+            req.state[0] = 1;
+            return .{ .continue_auth = "challenge" };
+        },
+        .reauth => {
+            req.state[0] = 2;
+            return .{ .continue_auth = "c2" };
+        },
+        .continue_auth => {
+            const d = req.data orelse return .deny;
+            if (req.state[0] == 1 and std.mem.eql(u8, d, "answer")) return .{ .success = "server-final" };
+            if (req.state[0] == 2 and std.mem.eql(u8, d, "answer2")) return .{ .success = null };
+            return .deny;
+        },
+    }
+}
+
+fn startExt(b: *Broker, tt: *TestTransport, method: []const u8, username: ?[]const u8, password: ?[]const u8) !*Connection {
+    const conn = try b.accept(tt.transport());
+    var buf: [256]u8 = undefined;
+    try b.feed(conn, try packet.encodePacket(&buf, .v5, .{ .connect = .{
+        .client_id = "ext",
+        .version = .v5,
+        .username = username,
+        .password = password,
+        .properties = .{ .authentication_method = method },
+    } }));
+    try testing.expectEqual(Disposition.keep, try b.process(conn, 0));
+    return conn;
+}
+
+fn authPacket(code: packet.ReasonCode, method: []const u8, data: ?[]const u8) packet.Packet {
+    return .{ .auth = .{ .reason_code = code, .properties = .{ .authentication_method = method, .authentication_data = data } } };
+}
+
+test "extended auth: a two-step exchange at CONNECT succeeds; CONNACK carries the method and the server's data" {
+    var b = Broker.init(testing.allocator, .{ .extendedAuthFn = dummyExtAuth });
+    defer b.deinit();
+    var tt = TestTransport{};
+    const conn = try startExt(&b, &tt, "DUMMY", null, null);
+    const ch = (try next5(&tt)).?.auth;
+    try testing.expectEqual(packet.ReasonCode.continue_authentication, ch.reason_code);
+    try testing.expectEqualStrings("DUMMY", ch.properties.authentication_method.?);
+    try testing.expectEqualStrings("challenge", ch.properties.authentication_data.?);
+    try testing.expectEqual(Connection.State.awaiting_connect, conn.state);
+
+    try testing.expectEqual(Disposition.keep, try send5(&b, conn, authPacket(.continue_authentication, "DUMMY", "answer"), 1));
+    const ack = (try next5(&tt)).?.connack;
+    try testing.expectEqual(packet.ReasonCode.success, ack.reason_code);
+    try testing.expectEqualStrings("DUMMY", ack.properties.authentication_method.?);
+    try testing.expectEqualStrings("server-final", ack.properties.authentication_data.?);
+    try testing.expectEqual(Connection.State.connected, conn.state);
+    try testing.expectEqualStrings("ext", conn.clientId());
+
+    // Ordinary traffic works.
+    try testing.expectEqual(Disposition.keep, try send5(&b, conn, .{ .publish = .{ .topic = "x", .payload = "1", .qos = .at_least_once, .packet_id = 1 } }, 2));
+    try testing.expect((try next5(&tt)).? == .puback);
+}
+
+test "extended auth: wrong response, unsupported method, method mismatch, out-of-sequence AUTH" {
+    var b = Broker.init(testing.allocator, .{ .extendedAuthFn = dummyExtAuth });
+    defer b.deinit();
+
+    var t1 = TestTransport{};
+    const c1 = try startExt(&b, &t1, "DUMMY", null, null);
+    _ = (try next5(&t1)).?;
+    try testing.expectEqual(Disposition.close, try send5(&b, c1, authPacket(.continue_authentication, "DUMMY", "wrong"), 1));
+    try testing.expectEqual(packet.ReasonCode.not_authorized, (try next5(&t1)).?.connack.reason_code);
+
+    // A method the hook does not know.
+    var t2 = TestTransport{};
+    const accepted = try b.accept(t2.transport());
+    var buf: [128]u8 = undefined;
+    try b.feed(accepted, try packet.encodePacket(&buf, .v5, .{ .connect = .{ .client_id = "u", .version = .v5, .properties = .{ .authentication_method = "NOPE" } } }));
+    try testing.expectEqual(Disposition.close, try b.process(accepted, 0));
+    try testing.expectEqual(packet.ReasonCode.bad_authentication_method, (try next5(&t2)).?.connack.reason_code);
+
+    // Another method in the AUTH: a protocol error.
+    var t3 = TestTransport{};
+    const c3 = try startExt(&b, &t3, "DUMMY", null, null);
+    _ = (try next5(&t3)).?;
+    try testing.expectError(error.ProtocolViolation, send5(&b, c3, authPacket(.continue_authentication, "OTHER", "answer"), 1));
+
+    // AUTH 0x19 before the CONNECT is through: out of sequence.
+    var t4 = TestTransport{};
+    const c4 = try startExt(&b, &t4, "DUMMY", null, null);
+    _ = (try next5(&t4)).?;
+    try testing.expectError(error.ProtocolViolation, send5(&b, c4, authPacket(.re_authenticate, "DUMMY", null), 1));
+}
+
+test "extended auth: while it runs only AUTH is accepted -- a PUBLISH is a protocol error; the plain hook follows" {
+    var b = Broker.init(testing.allocator, .{ .extendedAuthFn = dummyExtAuth, .authenticateFn = credAuth });
+    defer b.deinit();
+    var t1 = TestTransport{};
+    const c1 = try startExt(&b, &t1, "DUMMY", "user", "pw");
+    _ = (try next5(&t1)).?;
+    try testing.expectError(error.ProtocolViolation, send5(&b, c1, .{ .publish = .{ .topic = "x", .payload = "1" } }, 1));
+
+    // Extended auth first, then username/password: both must pass.
+    var t2 = TestTransport{};
+    const c2 = try startExt(&b, &t2, "DUMMY", "user", "wrong");
+    _ = (try next5(&t2)).?;
+    try testing.expectEqual(Disposition.close, try send5(&b, c2, authPacket(.continue_authentication, "DUMMY", "answer"), 1));
+    try testing.expectEqual(packet.ReasonCode.bad_user_name_or_password, (try next5(&t2)).?.connack.reason_code);
+
+    var t3 = TestTransport{};
+    const c3 = try startExt(&b, &t3, "DUMMY", "user", "pw");
+    _ = (try next5(&t3)).?;
+    try testing.expectEqual(Disposition.keep, try send5(&b, c3, authPacket(.continue_authentication, "DUMMY", "answer"), 1));
+    try testing.expectEqual(packet.ReasonCode.success, (try next5(&t3)).?.connack.reason_code);
+}
+
+test "extended auth: re-authentication keeps the connection on success, DISCONNECT 0x87 on failure" {
+    var b = Broker.init(testing.allocator, .{ .extendedAuthFn = dummyExtAuth });
+    defer b.deinit();
+    var tt = TestTransport{};
+    const conn = try startExt(&b, &tt, "DUMMY", null, null);
+    _ = (try next5(&tt)).?;
+    _ = try send5(&b, conn, authPacket(.continue_authentication, "DUMMY", "answer"), 1);
+    _ = (try next5(&tt)).?; // CONNACK
+
+    // Success: AUTH 0x19 -> challenge -> answer -> AUTH 0x00, still connected.
+    try testing.expectEqual(Disposition.keep, try send5(&b, conn, authPacket(.re_authenticate, "DUMMY", null), 2));
+    try testing.expectEqualStrings("c2", (try next5(&tt)).?.auth.properties.authentication_data.?);
+    try testing.expectEqual(Disposition.keep, try send5(&b, conn, authPacket(.continue_authentication, "DUMMY", "answer2"), 3));
+    try testing.expectEqual(packet.ReasonCode.success, (try next5(&tt)).?.auth.reason_code);
+    try testing.expectEqual(Connection.State.connected, conn.state);
+    try testing.expectEqual(Disposition.keep, try send5(&b, conn, .{ .publish = .{ .topic = "x", .payload = "1" } }, 4));
+
+    // Failure: DISCONNECT 0x87.
+    _ = try send5(&b, conn, authPacket(.re_authenticate, "DUMMY", null), 5);
+    _ = (try next5(&tt)).?;
+    try testing.expectError(error.ProtocolViolation, send5(&b, conn, authPacket(.continue_authentication, "DUMMY", "bad"), 6));
+    try testing.expectEqual(packet.ReasonCode.not_authorized, (try next5(&tt)).?.disconnect.reason_code);
+    b.remove(conn);
+
+    // A connection that never used a method cannot re-authenticate.
+    var t2 = TestTransport{};
+    const plain = try connect5(&b, &t2, .{ .client_id = "plain" }, 0);
+    try testing.expectError(error.ProtocolViolation, send5(&b, plain.conn, authPacket(.re_authenticate, "DUMMY", null), 1));
+    try testing.expectEqual(packet.ReasonCode.protocol_error, (try next5(&t2)).?.disconnect.reason_code);
+}
+
+fn privateDenyAcl(ctx: ?*anyopaque, req: AclRequest) bool {
+    _ = ctx;
+    return !(req.operation == .subscribe and std.mem.startsWith(u8, req.topic, "private/"));
+}
+
+test "acl_check_delivery: a '#' subscriber is not delivered a denied topic, live or retained" {
+    var b = Broker.init(testing.allocator, .{ .authorizeFn = privateDenyAcl, .acl_check_delivery = true });
+    defer b.deinit();
+    try b.publish("private/r", "old", .at_most_once, true);
+    try b.publish("public/r", "old", .at_most_once, true);
+
+    var ts = TestTransport{};
+    const s = try connectClient(&b, &ts, "S", 60, 0);
+    try feedSubscribe(&b, s, 1, &.{.{ .filter = "#" }});
+    _ = (try ts.next()).?; // SUBACK
+    try testing.expectEqualStrings("public/r", (try ts.next()).?.publish.topic); // retained: only the allowed one
+    try testing.expectEqual(@as(?packet.Packet, null), try ts.next());
+    try testing.expectEqual(@as(u64, 1), b.aclDeliveryDenials());
+
+    try b.publish("private/x", "1", .at_most_once, false);
+    try b.publish("public/y", "2", .at_most_once, false);
+    try testing.expectEqualStrings("public/y", (try ts.next()).?.publish.topic);
+    try testing.expectEqual(@as(?packet.Packet, null), try ts.next());
+    try testing.expectEqual(@as(u64, 2), b.aclDeliveryDenials());
+
+    // A persistent session's queue is held to it too.
+    var tq = TestTransport{};
+    const q = try connectSession(&b, &tq, "Q", false, 0);
+    try feedSubscribe(&b, q.conn, 1, &.{.{ .filter = "#", .qos = .at_least_once }});
+    _ = (try tq.next()).?;
+    _ = (try tq.next()).?; // the retained public/r
+    b.remove(q.conn);
+    try b.publish("private/z", "1", .at_least_once, false);
+    try testing.expectEqual(@as(?usize, 0), b.sessionQueued("Q"));
+}
+
+test "acl_check_delivery: off by default -- the same subscriber gets everything" {
+    var b = Broker.init(testing.allocator, .{ .authorizeFn = privateDenyAcl });
+    defer b.deinit();
+    var ts = TestTransport{};
+    const s = try connectClient(&b, &ts, "S", 60, 0);
+    try feedSubscribe(&b, s, 1, &.{.{ .filter = "#" }});
+    _ = (try ts.next()).?;
+    try b.publish("private/x", "1", .at_most_once, false);
+    try testing.expectEqualStrings("private/x", (try ts.next()).?.publish.topic);
+    try testing.expectEqual(@as(u64, 0), b.aclDeliveryDenials());
 }

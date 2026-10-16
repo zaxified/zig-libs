@@ -94,6 +94,9 @@ pub const reconnect = @import("reconnect.zig");
 /// semantics.
 pub const acl = @import("acl.zig");
 
+/// Mosquitto-style bridge between a local `Broker` and a remote broker.
+pub const bridge = @import("bridge.zig");
+
 pub const Reconnect = reconnect.Reconnect;
 pub const SubscriptionSet = reconnect.SubscriptionSet;
 
@@ -143,4 +146,6 @@ test {
     _ = @import("reconnect_test.zig");
     _ = acl;
     _ = @import("ws_recipe_test.zig");
+    _ = bridge;
+    _ = @import("bridge_test.zig");
 }
