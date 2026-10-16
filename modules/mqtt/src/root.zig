@@ -142,4 +142,5 @@ test {
     _ = @import("session_replay.zig");
     _ = @import("reconnect_test.zig");
     _ = acl;
+    _ = @import("ws_recipe_test.zig");
 }

@@ -260,7 +260,7 @@ const module_list = [_]Module{
     .{ .name = "bacnet", .libs = &.{"net"}, .deps = &.{ "netaddr", "websocket" }, .test_deps = &.{"testkit"} },
     .{ .name = "whois", .libs = &.{"net"}, .deps = &.{"netaddr"}, .test_deps = &.{"testkit"}, .timing = true, .loopback = true },
     .{ .name = "uci", .libs = &.{"os"}, .test_deps = &.{"testkit"}, .timing = true },
-    .{ .name = "mqtt", .libs = &.{"net"}, .test_deps = &.{"testkit"}, .loopback = true },
+    .{ .name = "mqtt", .libs = &.{"net"}, .test_deps = &.{ "testkit", "websocket", "http", "tlsclient" }, .loopback = true }, // websocket/http: the MQTT-over-WebSocket recipe test; tlsclient: the TLS case of tools/interop.zig
     .{ .name = "snmp", .libs = &.{"net"}, .test_deps = &.{"testkit"}, .loopback = true },
     .{ .name = "wireguard", .libs = &.{"net"}, .deps = &.{ "netlink", "genetlink", "chachapoly", "entropy", "netaddr" }, .test_deps = &.{"testkit"}, .netns = true },
     .{ .name = "tc", .libs = &.{"net"}, .deps = &.{"netlink"}, .test_deps = &.{"testkit"}, .netns = true, .timing = true },

@@ -20,6 +20,16 @@
 //!
 //!     zig build interop-mqtt                 # run both directions, check them
 //!     zig build interop-mqtt -- --capture    # ...and rewrite the transcript
+//!     zig build interop-mqtt -- --tls        # the MQTT-over-TLS recipe only
+//!
+//! `--tls` is the tested recipe for TLS on the client side (the module is
+//! transport-agnostic and ships no TLS of its own): our `Client` over this
+//! collection's `tlsclient` against Mosquitto with a TLS listener, the
+//! certificate chain issued by a throwaway CA the program makes with the
+//! `openssl` CLI into `.zig-cache/mqtt-interop/tls/` (needs `openssl`). It
+//! checks a QoS 1 round trip and that a wrong host name is refused at the
+//! handshake (so the chain is really verified). Not part of the default run:
+//! the transcript does not depend on it.
 //!
 //! The peers (installed once, into the droppable `.zig-cache/mqtt-interop/`):
 //!
@@ -105,7 +115,7 @@ fn watchdog(io: std.Io) void {
 
 const budget_s = 180;
 var step_name: std.atomic.Value(*const []const u8) = .init(&step_names[0]);
-const step_names = [_][]const u8{ "start", "preflight", "image pull", "podman run", "mosquitto ready", "client vs mosquitto", "paho vs broker" };
+const step_names = [_][]const u8{ "start", "preflight", "image pull", "podman run", "mosquitto ready", "client vs mosquitto", "paho vs broker", "tls certificates", "tls vs mosquitto" };
 
 /// Names the step the watchdog reports, and prints it: a CI log that ends
 /// mid-run must say where.
@@ -126,16 +136,25 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     t0_ns = std.Io.Timestamp.now(io, .real).nanoseconds;
 
     var capture = false;
+    var tls_only = false;
     var args = init.args.iterate();
     _ = args.skip();
     while (args.next()) |a| {
-        if (std.mem.eql(u8, a, "--capture")) capture = true else {
-            std.debug.print("usage: interop-mqtt [--capture]\n", .{});
+        if (std.mem.eql(u8, a, "--capture")) capture = true else if (std.mem.eql(u8, a, "--tls")) tls_only = true else {
+            std.debug.print("usage: interop-mqtt [--capture | --tls]\n", .{});
             return 2;
         }
     }
     const dog = try std.Thread.spawn(.{}, watchdog, .{io});
     dog.detach();
+    if (tls_only) {
+        tlsVsMosquitto(gpa, io) catch |e| {
+            std.debug.print("tls vs mosquitto: {s}\n", .{@errorName(e)});
+            return 1;
+        };
+        std.debug.print("interop-mqtt: MQTT over TLS to mosquitto works, and a wrong host name is refused\n", .{});
+        return 0;
+    }
     step(1);
     try preflight(io);
 
@@ -738,3 +757,148 @@ fn checkPaho(gpa: std.mem.Allocator, stdout: []const u8) !void {
     try want(ua.len == 2 and ua[0].integer == 0 and ua[1].integer == 0x11, "paho: UNSUBACK codes");
     _ = try s.get("done");
 }
+
+// ── the MQTT-over-TLS recipe (`--tls`) ─────────────────────────────────────
+
+const tls = @import("tlsclient");
+const tls_dir = ".zig-cache/mqtt-interop/tls";
+
+/// A throwaway P-256 CA and a `localhost` server certificate it signs.
+/// Readable by everyone: the container's mosquitto drops to its own user.
+fn makeCertificates(gpa: std.mem.Allocator, io: std.Io) !void {
+    step(7);
+    try std.Io.Dir.cwd().createDirPath(io, tls_dir);
+    const script =
+        \\set -e
+        \\cd "$1"
+        \\openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout ca.key -out ca.pem -days 2 \
+        \\  -subj /CN=zig-libs-mqtt-interop-ca -addext basicConstraints=critical,CA:TRUE -addext keyUsage=critical,keyCertSign 2>/dev/null
+        \\openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout srv.key -out srv.csr -subj /CN=localhost 2>/dev/null
+        \\printf 'subjectAltName=DNS:localhost\nextendedKeyUsage=serverAuth\nbasicConstraints=CA:FALSE\n' > srv.ext
+        \\openssl x509 -req -in srv.csr -CA ca.pem -CAkey ca.key -CAcreateserial -out srv.pem -days 2 -extfile srv.ext 2>/dev/null
+        \\chmod 0644 ca.pem srv.pem srv.key
+    ;
+    const o = try run(gpa, io, &.{ "sh", "-c", script, "sh", tls_dir });
+    gpa.free(o);
+}
+
+fn tlsVsMosquitto(gpa: std.mem.Allocator, io: std.Io) !void {
+    try makeCertificates(gpa, io);
+    const abs = try std.Io.Dir.cwd().realPathFileAlloc(io, tls_dir, gpa);
+    defer gpa.free(abs);
+    const port = try Mosquitto.freePort(io);
+    const cmd = try std.fmt.allocPrint(gpa, "cp /usr/sbin/mosquitto /tmp/mosquitto && printf 'listener {d} 127.0.0.1\\nallow_anonymous true\\ncertfile /certs/srv.pem\\nkeyfile /certs/srv.key\\n' > /tmp/m.conf && exec timeout 300 /tmp/mosquitto -c /tmp/m.conf", .{port});
+    defer gpa.free(cmd);
+    const vol = try std.fmt.allocPrint(gpa, "{s}:/certs:ro", .{abs});
+    defer gpa.free(vol);
+    step(3);
+    const raw_id = try run(gpa, io, &.{ "podman", "run", "-d", "--rm", "--network", "host", "-v", vol, image, "sh", "-c", cmd });
+    defer gpa.free(raw_id);
+    const id = std.mem.trim(u8, raw_id, " \n");
+    if (id.len <= live_id_buf.len) {
+        @memcpy(live_id_buf[0..id.len], id);
+        live_id_len.store(id.len, .release);
+    }
+    defer Mosquitto.kill(gpa, io, id);
+    step(8);
+
+    var bundle: std.crypto.Certificate.Bundle = .empty;
+    defer bundle.deinit(gpa);
+    var dir = try std.Io.Dir.cwd().openDir(io, tls_dir, .{});
+    defer dir.close(io);
+    try bundle.addCertsFromFilePath(gpa, io, std.Io.Clock.real.now(io), dir, "ca.pem");
+
+    // A wrong name must be refused before any MQTT byte flows.
+    var ok_name = false;
+    for (0..50) |_| {
+        if (tlsSession(gpa, io, port, &bundle, "example.com")) |_| {
+            return fail("a certificate for localhost was accepted for example.com", .{});
+        } else |e| switch (e) {
+            error.ConnectionRefused => try io.sleep(.fromMilliseconds(100), .awake), // not listening yet
+            else => {
+                ok_name = true;
+                break;
+            },
+        }
+    }
+    try want(ok_name, "mosquitto's TLS listener never came up");
+    try tlsSession(gpa, io, port, &bundle, "localhost");
+}
+
+/// One TLS connection to `port`, verified against `bundle` for `host`, then a
+/// 5.0 CONNECT, a QoS 1 SUBSCRIBE and a QoS 1 PUBLISH echoed back.
+fn tlsSession(gpa: std.mem.Allocator, io: std.Io, port: u16, bundle: *std.crypto.Certificate.Bundle, host: []const u8) !void {
+    const addr = try net.IpAddress.parse("127.0.0.1", port);
+    const stream = try addr.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    var net_in: [tls.Client.min_buffer_len]u8 = undefined;
+    var net_out: [tls.Client.min_buffer_len]u8 = undefined;
+    var tls_in: [tls.Client.min_buffer_len]u8 = undefined;
+    var tls_out: [tls.Client.min_buffer_len]u8 = undefined;
+    var sr = stream.reader(io, &net_in);
+    var sw = stream.writer(io, &net_out);
+    var entropy: [tls.Client.Options.entropy_len]u8 = undefined;
+    io.random(&entropy);
+    var lock: std.Io.RwLock = .init;
+    var link: TlsLink = .{ .sw = &sw, .tc = undefined };
+    try tls.Client.initInto(&link.tc, &sr.interface, &sw.interface, .{
+        .host = .{ .explicit = host },
+        .ca = .{ .bundle = .{ .gpa = gpa, .io = io, .lock = &lock, .bundle = bundle } },
+        .read_buffer = &tls_in,
+        .write_buffer = &tls_out,
+        .entropy = &entropy,
+        .realtime_now = std.Io.Clock.real.now(io),
+    });
+
+    var rx: [4096]u8 = undefined;
+    var tx: [4096]u8 = undefined;
+    var c = mqtt.Client.init(link.transport(), .{ .rx = &rx, .tx = &tx });
+    try c.connect(0, .{ .client_id = "tls-recipe", .version = .v5 });
+    const ack = try link.next(&c);
+    try want(ack == .connack and ack.connack.reason_code == .success, "CONNACK over TLS");
+    _ = try c.subscribe(0, &.{.{ .filter = "tls/#", .qos = .at_least_once }});
+    try want((try link.next(&c)) == .suback, "SUBACK over TLS");
+    _ = try c.publish(0, "tls/recipe", "encrypted", .{ .qos = .at_least_once });
+    var got_msg = false;
+    var got_ack = false;
+    while (!(got_msg and got_ack)) switch (try link.next(&c)) {
+        .message => |m| {
+            try want(std.mem.eql(u8, m.payload, "encrypted"), "payload over TLS");
+            got_msg = true;
+        },
+        .puback => got_ack = true,
+        else => {},
+    };
+    try c.disconnect(0);
+}
+
+/// The whole recipe: `mqtt.Transport` writes plaintext into the TLS client's
+/// writer and flushes both it and the socket writer under it; reads pull
+/// decrypted bytes from its reader into `Client.feed`.
+const TlsLink = struct {
+    tc: tls.Client,
+    sw: *net.Stream.Writer,
+
+    fn transport(l: *TlsLink) mqtt.Transport {
+        return .{ .ctx = l, .writeFn = writeFn };
+    }
+
+    fn writeFn(ctx: *anyopaque, bytes: []const u8) mqtt.TransportError!void {
+        const l: *TlsLink = @ptrCast(@alignCast(ctx));
+        l.tc.writer.writeAll(bytes) catch return error.TransportFailed;
+        l.tc.writer.flush() catch return error.TransportFailed;
+        l.sw.interface.flush() catch return error.TransportFailed;
+    }
+
+    /// The next client event, reading decrypted bytes as needed.
+    fn next(l: *TlsLink, c: *mqtt.Client) !mqtt.Event {
+        while (true) {
+            if (try c.poll(0)) |ev| return ev;
+            const r = &l.tc.reader;
+            try r.fillMore();
+            const got = r.buffered();
+            try c.feed(got);
+            r.toss(got.len);
+        }
+    }
+};
