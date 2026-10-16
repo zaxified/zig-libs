@@ -6,6 +6,7 @@
 //! body is type-checked in every mode).
 
 const std = @import("std");
+const acl = @import("acl.zig");
 const packet = @import("packet.zig");
 const sp = @import("testkit").stackprobe;
 
@@ -42,4 +43,20 @@ test "STACKPROBE: no password residue after encodePacket of CONNECT / AUTH" {
         .properties = .{ .authentication_method = "SCRAM-SHA-1", .authentication_data = &auth_data },
     } };
     _ = try P.run("encodePacket AUTH", packet.encodePacket, .{ @as([]u8, &buf), packet.Version.v5, auth }, &secrets, .{});
+}
+
+fn verifyBob(pw: []const u8) bool {
+    const line = "bob:$7$1000$AdPRuou8DmEDG7SizhAjrmHJk94sE28EL96MplcRW3GWofUi9cyHDpl20p0STCFvX+XDgUwKS0IuX5vaMU3Ckg==$jn0M3dNRPYhYpWOfsFHQVZJZc0XulVhPZD5Do8iAGJ0qH7G6wdWRd9rFb1WUbIfAD395dO/0HWm3L189aObziw==\n";
+    var entries: [1]acl.Entry = undefined;
+    const pws = acl.Passwords.parse(line, &entries) catch return false;
+    return pws.verify("bob", pw);
+}
+
+var pw_buf: [7]u8 = undefined;
+
+test "STACKPROBE: no password residue after acl.Passwords.verify" {
+    try sp.skipUnlessOptimized();
+    pw_buf = "hunter2".*;
+    const Pv = sp.Probe(.{ .window = 64 * 1024 });
+    _ = try Pv.run("acl.Passwords.verify", verifyBob, .{@as([]const u8, &pw_buf)}, &.{&pw_buf}, .{});
 }

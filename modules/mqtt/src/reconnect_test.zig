@@ -512,3 +512,92 @@ test "outbox end to end: a QoS 1 publish whose PUBACK was lost is resent to a pe
     try testing.expectEqual(@as(usize, 0), c.outboxLen());
     b.remove(conn2);
 }
+
+// ── review fixes ────────────────────────────────────────────────────────────
+
+test "review M1: QoS 2 receive ids are forgotten when the server lost the session (outbox empty)" {
+    var wire = Wire{};
+    var rx: [256]u8 = undefined;
+    var tx: [256]u8 = undefined;
+    var arena: [256]u8 = undefined;
+    var c = try makeConnected(&wire, &rx, &tx, &arena, false);
+    var buf: [64]u8 = undefined;
+    const publish = try packet.encodePublish(&buf, .{ .topic = "t", .payload = "p", .qos = .exactly_once, .packet_id = 5 });
+    try c.feed(publish);
+    try testing.expect((try c.poll(1)).? == .message); // PUBREC sent, id 5 remembered
+    c.connectionLost();
+    try connectAndAck(&c, &wire, 10, false, false); // the server restarted: no session
+    try c.feed(publish); // the new session reuses id 5 for a new message
+    const ev = try c.poll(11);
+    try testing.expect(ev != null and ev.? == .message);
+}
+
+test "review M7: entries the new connection forbids are dropped, not resent in a loop" {
+    var wire = Wire{};
+    var rx: [256]u8 = undefined;
+    var tx: [256]u8 = undefined;
+    var arena: [256]u8 = undefined;
+
+    // RETAIN while the new CONNACK says Retain Available = 0
+    var c = Client.init(wire.transport(), .{ .rx = &rx, .tx = &tx, .outbox = &arena });
+    try connect5(&c, &wire, 0, false, .{});
+    _ = try c.publish(1, "t", "x", .{ .qos = .at_least_once, .retain = true });
+    c.connectionLost();
+    try connect5(&c, &wire, 10, true, .{ .retain_available = false });
+    try testing.expectEqual(@as(usize, 0), wire.n);
+    try testing.expectEqual(@as(usize, 1), c.outboxDropped());
+    try testing.expectEqual(@as(usize, 0), c.outboxLen());
+
+    // a Topic Alias above the new maximum
+    var c2 = Client.init(wire.transport(), .{ .rx = &rx, .tx = &tx, .outbox = &arena });
+    try connect5(&c2, &wire, 0, false, .{ .topic_alias_maximum = 4 });
+    _ = try c2.publish(1, "t", "x", .{ .qos = .at_least_once, .properties = .{ .topic_alias = 3 } });
+    c2.connectionLost();
+    try connect5(&c2, &wire, 10, true, .{ .topic_alias_maximum = 2 });
+    try testing.expectEqual(@as(usize, 0), wire.n);
+    try testing.expectEqual(@as(usize, 1), c2.outboxDropped());
+
+    // a 5.0 entry cannot be resent on a 3.1.1 connection
+    var c3 = Client.init(wire.transport(), .{ .rx = &rx, .tx = &tx, .outbox = &arena });
+    try connect5(&c3, &wire, 0, false, .{});
+    _ = try c3.publish(1, "t", "x", .{ .qos = .at_least_once });
+    c3.connectionLost();
+    try connectAndAck(&c3, &wire, 10, false, true);
+    try testing.expectEqual(@as(usize, 0), wire.n);
+    try testing.expectEqual(@as(usize, 1), c3.outboxDropped());
+    try testing.expectEqual(@as(usize, 0), c3.outboxLen());
+    try testing.expectEqual(@as(usize, 0), c3.pending_len);
+
+    // an entry that is fine still goes out
+    var c4 = Client.init(wire.transport(), .{ .rx = &rx, .tx = &tx, .outbox = &arena });
+    try connect5(&c4, &wire, 0, false, .{ .topic_alias_maximum = 4 });
+    _ = try c4.publish(1, "t", "x", .{ .qos = .at_least_once, .retain = true, .properties = .{ .topic_alias = 2 } });
+    c4.connectionLost();
+    try connect5(&c4, &wire, 10, true, .{ .topic_alias_maximum = 2 });
+    try testing.expectEqual(@as(usize, 1), wire.n);
+}
+
+test "review L1: a PUBREL owed to the server counts against its Receive Maximum" {
+    var wire = Wire{};
+    var rx: [256]u8 = undefined;
+    var tx: [256]u8 = undefined;
+    var arena: [256]u8 = undefined;
+    var c = Client.init(wire.transport(), .{ .rx = &rx, .tx = &tx, .outbox = &arena });
+    try connect5(&c, &wire, 0, false, .{});
+    const a = (try c.publish(1, "t/a", "A", .{ .qos = .at_least_once })).?;
+    const b = (try c.publish(1, "t/b", "B", .{ .qos = .exactly_once })).?;
+    var buf: [16]u8 = undefined;
+    try c.feed(try packet.encodePacket(&buf, .v5, .{ .pubrec = .{ .packet_id = b } }));
+    _ = try c.poll(2);
+    c.connectionLost();
+    try connect5(&c, &wire, 10, true, .{ .receive_maximum = 1 });
+    // B's PUBREL uses the only slot: A has to wait (old code sent both)
+    try testing.expectEqual(@as(usize, 1), wire.n);
+    try testing.expect((try packet.decodePacket(wire.at(0), .v5)).?.packet == .pubrel);
+    try c.feed(try packet.encodePacket(&buf, .v5, .{ .pubcomp = .{ .packet_id = b } }));
+    try testing.expect((try c.poll(11)).? == .pubcomp);
+    try testing.expectEqual(@as(usize, 2), wire.n);
+    const resent = (try packet.decodePacket(wire.at(1), .v5)).?.packet.publish;
+    try testing.expectEqual(a, resent.packet_id);
+    try testing.expect(resent.dup);
+}

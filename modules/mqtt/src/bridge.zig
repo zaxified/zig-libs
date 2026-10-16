@@ -136,6 +136,14 @@ pub const Config = struct {
     /// Also queue QoS 0 messages while the remote is down (Mosquitto
     /// `queue_qos0_messages`, default off).
     queue_qos0: bool = false,
+    /// Give up on a CONNECT that no CONNACK answers after this long: `poll`
+    /// then says `.remote_lost` (the caller closes the socket and calls
+    /// `connectionLost`, which backs off).
+    connack_timeout_ms: u64 = 30_000,
+    /// 5.0 remote with `clean_session = false`: the Session Expiry Interval
+    /// sent in CONNECT, so the remote really keeps the session (a 5.0 session
+    /// otherwise ends at disconnect). Default: never expires.
+    session_expiry_s: u32 = 0xFFFFFFFF,
     /// Mosquitto `restart_timeout` is `reconnect.initial_ms` / `max_ms`.
     reconnect: reconnect_mod.Reconnect.Options = .{},
 };
@@ -234,6 +242,12 @@ pub const Bridge = struct {
     schedule: reconnect_mod.Reconnect,
     remote: enum { down, connecting, up } = .down,
     remote_failed: bool = false,
+    connecting_since: u64 = 0,
+    /// After a CONNACK: index of the next remote filter to subscribe, and
+    /// whether the "1" notification is still owed to the remote. Both wait for
+    /// quota (acknowledgements) instead of failing the link.
+    resub_cursor: ?usize = null,
+    notify_pending: bool = false,
     counters: Stats = .{},
     queue: []u8,
     qentries: []QueueEntry,
@@ -245,6 +259,7 @@ pub const Bridge = struct {
     /// Initialize in place (the pipes hand out pointers into `b`, so it must
     /// not move afterwards). Registers the remote filters of the `in` / `both`
     /// rules for replay. `remote` is the write seam of the remote socket.
+    // secret-api-ok: `config` (with the remote password) is stored by reference -- its slices point at caller storage; no secret bytes are copied or derived here.
     pub fn init(b: *Bridge, local: *Broker, config: Config, buffers: Buffers, remote: client_mod.Transport) Error!void {
         for (config.rules) |r| {
             if (std.mem.indexOfAny(u8, r.local_prefix, "+#") != null or std.mem.indexOfAny(u8, r.remote_prefix, "+#") != null) return error.InvalidRule;
@@ -328,6 +343,7 @@ pub const Bridge = struct {
     }
 
     /// The caller's dial succeeded: send CONNECT (with the notification Will).
+    // secret-api-ok: the remote password reaches only `Client.connect`, whose `packet.encodeConnect` runs under the credential burn that covers every frame copying it (stackprobe_test.zig); nothing here holds a copy.
     pub fn remoteOpened(b: *Bridge, now: u64) Error!void {
         const will: ?packet.Will = if (b.config.notification_topic) |t|
             .{ .topic = t, .message = "0", .qos = .at_least_once, .retain = true }
@@ -342,8 +358,13 @@ pub const Bridge = struct {
             .password = b.config.password,
             .version = b.config.version,
             .will = will,
+            .properties = if (b.config.version == .v5 and !b.config.clean_session)
+                .{ .session_expiry_interval = b.config.session_expiry_s }
+            else
+                .{},
         });
         b.remote = .connecting;
+        b.connecting_since = now;
     }
 
     /// Bytes read from the remote socket. Call `poll` afterwards. Feeds at
@@ -356,11 +377,14 @@ pub const Bridge = struct {
     /// The remote link ended (dial failed, socket closed, or `poll` said
     /// `.remote_lost`). Schedules the next attempt and returns its time. The
     /// local notification becomes "0".
+    // secret-api-ok: the remote credentials in `config` are not read here; this only resets link state and schedules a retry.
     pub fn connectionLost(b: *Bridge, now: u64, random_bits: ?u64) u64 {
         const was_up = b.remote == .up;
         b.remote_client.connectionLost();
         b.remote = .down;
         b.remote_failed = false;
+        b.resub_cursor = null;
+        b.notify_pending = false;
         if (was_up) if (b.config.notification_topic) |t| {
             b.local.publishWith(t, "0", .{ .qos = .at_least_once, .retain = true }) catch {};
         };
@@ -376,7 +400,8 @@ pub const Bridge = struct {
             b.remote_client.tick(now) catch {
                 b.remote_failed = true;
             };
-            b.drainQueue(now);
+            if (b.remote == .connecting and now >= b.connecting_since +| b.config.connack_timeout_ms) b.remote_failed = true;
+            b.stepPending(now);
         }
         try b.pumpLocal(now);
         return if (b.remote_failed) .remote_lost else .ok;
@@ -408,17 +433,45 @@ pub const Bridge = struct {
                 }
                 b.remote = .up;
                 b.schedule.connected();
-                if (!ca.session_present or b.config.clean_session) _ = try b.subs.resubscribe(&b.remote_client, now);
+                b.resub_cursor = if (!ca.session_present or b.config.clean_session) 0 else null;
                 if (b.config.notification_topic) |t| {
-                    _ = try b.remote_client.publish(now, t, "1", .{ .qos = .at_least_once, .retain = true });
+                    b.notify_pending = true;
                     b.local.publishWith(t, "1", .{ .qos = .at_least_once, .retain = true }) catch {};
                 }
-                b.drainQueue(now);
+                b.stepPending(now);
             },
             .message => |m| b.forwardIn(now, m),
             .disconnect => b.remote_failed = true,
             else => {},
         }
+    }
+
+    fn isQuota(e: anyerror) bool {
+        return e == error.TooManyInFlight or e == error.ReceiveMaximumReached or e == error.OutboxFull;
+    }
+
+    /// What the remote link still owes after a CONNACK, in order: the
+    /// subscriptions, the "1" notification, the queued messages. Each step
+    /// that runs out of quota (the resumed outbox may fill the window or the
+    /// packet-id pool) waits for the next acknowledgement; only a real
+    /// failure fails the link.
+    fn stepPending(b: *Bridge, now: u64) void {
+        if (b.remote != .up) return;
+        if (b.resub_cursor) |*cur| {
+            _ = b.subs.resubscribeFrom(&b.remote_client, now, cur) catch |e| {
+                if (!isQuota(e)) b.remote_failed = true;
+                return;
+            };
+            b.resub_cursor = null;
+        }
+        if (b.notify_pending) if (b.config.notification_topic) |t| {
+            _ = b.remote_client.publish(now, t, "1", .{ .qos = .at_least_once, .retain = true }) catch |e| {
+                if (!isQuota(e)) b.remote_failed = true;
+                return;
+            };
+            b.notify_pending = false;
+        };
+        b.drainQueue(now);
     }
 
     /// Local client <-> local broker, until nothing moves.
@@ -486,8 +539,13 @@ pub const Bridge = struct {
                 b.counters.dropped += 1;
                 return;
             };
+            if (remote_topic.len > 0 and remote_topic[0] == '$' and m.topic[0] != '$') {
+                b.counters.dropped += 1; // a prefix must not turn a topic into a `$` one
+                return;
+            }
             const qos = minQos(m.qos, r.qos);
-            const props = if (b.config.version == .v5) forwardProps(m.properties) else packet.Properties{};
+            var rt_buf: [topic_buf_len]u8 = undefined;
+            const props = if (b.config.version == .v5) mapProps(m.properties, r.local_prefix, r.remote_prefix, &rt_buf) else packet.Properties{};
             const both = r.direction == .both;
             if (b.remote != .up or b.qn > 0) {
                 if (b.queue.len > 0 and (qos != .at_most_once or b.config.queue_qos0)) {
@@ -505,8 +563,16 @@ pub const Bridge = struct {
     }
 
     fn sendRemote(b: *Bridge, now: u64, remote_topic: []const u8, payload: []const u8, qos: packet.QoS, retain: bool, props: packet.Properties, both: bool) void {
-        _ = b.remote_client.publish(now, remote_topic, payload, .{ .qos = qos, .retain = retain, .properties = props }) catch {
-            b.counters.dropped += 1;
+        _ = b.remote_client.publish(now, remote_topic, payload, .{ .qos = qos, .retain = retain, .properties = props }) catch |e| {
+            // The remote's window (or our outbox / id pool) is full: wait in
+            // the queue rather than lose a message the broker already considers
+            // delivered to us.
+            if (isQuota(e) and b.queue.len > 0 and (qos != .at_most_once or b.config.queue_qos0)) {
+                b.enqueue(remote_topic, payload, qos, retain, props, both);
+            } else {
+                if (e == error.TransportFailed) b.remote_failed = true;
+                b.counters.dropped += 1;
+            }
             return;
         };
         b.noteSent(remote_topic, payload, both);
@@ -518,6 +584,21 @@ pub const Bridge = struct {
             b.echo_next = (b.echo_next + 1) % echo_slots;
         }
         b.counters.forwarded_out += 1;
+    }
+
+    /// The forwardable properties, with the Response Topic carried through the
+    /// same prefix rewrite as the topic, or dropped when it lies outside the
+    /// rule's prefix: a remote must not choose where local replies go, nor
+    /// learn local topic names. Correlation Data is opaque and passes.
+    fn mapProps(p: packet.Properties, from: []const u8, to: []const u8, buf: []u8) packet.Properties {
+        var o = forwardProps(p);
+        if (p.response_topic) |rt| {
+            o.response_topic = if (std.mem.startsWith(u8, rt, from)) (join(buf, to, rt[from.len..]) catch null) else null;
+            if (o.response_topic) |mapped| if (mapped.len == 0 or (mapped[0] == '$' and rt[0] != '$')) {
+                o.response_topic = null;
+            };
+        }
+        return o;
     }
 
     fn forwardProps(p: packet.Properties) packet.Properties {
@@ -622,7 +703,12 @@ pub const Bridge = struct {
                 b.counters.dropped += 1;
                 return;
             };
-            const opts: Client.PublishOptions = .{ .qos = minQos(m.qos, r.qos), .retain = m.retain, .properties = forwardProps(m.properties) };
+            if (local_topic.len > 0 and local_topic[0] == '$' and m.topic[0] != '$') {
+                b.counters.dropped += 1; // a prefix must not turn a topic into a `$` one
+                return;
+            }
+            var rt_buf: [topic_buf_len]u8 = undefined;
+            const opts: Client.PublishOptions = .{ .qos = minQos(m.qos, r.qos), .retain = m.retain, .properties = mapProps(m.properties, r.remote_prefix, r.local_prefix, &rt_buf) };
             _ = b.local_client.publish(now, local_topic, m.payload, opts) catch |e| switch (e) {
                 // too many unacknowledged: let the broker answer, then retry once
                 error.TooManyInFlight, error.ReceiveMaximumReached => {

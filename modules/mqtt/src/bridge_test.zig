@@ -132,6 +132,10 @@ const Harness = struct {
     }
 
     fn createQ(config: bridge_mod.Config, queue_bytes: usize, queue_max: usize) !*Harness {
+        return createO(config, queue_bytes, queue_max, 2048);
+    }
+
+    fn createO(config: bridge_mod.Config, queue_bytes: usize, queue_max: usize, outbox_bytes: usize) !*Harness {
         const h = try testing.allocator.create(Harness);
         h.* = .{ .local = Broker.init(testing.allocator, .{}), .remote = Broker.init(testing.allocator, .{}), .bridge = undefined };
         h.bridge.init(&h.local, config, .{
@@ -143,7 +147,7 @@ const Harness = struct {
             .pipe_down = &h.pipe_down,
             .remote_rx = &h.remote_rx,
             .remote_tx = &h.remote_tx,
-            .remote_outbox = &h.outbox,
+            .remote_outbox = h.outbox[0..outbox_bytes],
             .sub_storage = &h.sub_storage,
             .sub_slots = &h.sub_slots,
         }, h.wire.transport()) catch |e| {
@@ -532,4 +536,153 @@ test "bridge: 5.0 properties travel both ways over a 5.0 remote" {
     try testing.expectEqualStrings("q/y", back.topic);
     try testing.expectEqualStrings("resp/t", back.properties.response_topic.?);
     try testing.expectEqualStrings("cd", back.properties.correlation_data.?);
+}
+
+// ── review fixes ────────────────────────────────────────────────────────────
+
+test "review H1: a QoS 1 message that finds the remote window full is queued, not dropped" {
+    const rules = [_]bridge_mod.Rule{.{ .pattern = "up/#", .direction = .out, .qos = .at_least_once }};
+    // an outbox of 20 bytes holds one 11-byte message in flight
+    const h = try Harness.createO(rules1(&rules), 1024, 8, 20);
+    defer h.destroy();
+    try h.dial(0);
+    try h.step(0);
+    var rs = Sink{};
+    const rpeer = try Peer.open(&h.remote, &rs, "r1");
+    try rpeer.subscribe("up/#", .at_least_once);
+    var ls = Sink{};
+    const lpeer = try Peer.open(&h.local, &ls, "l1");
+
+    for ([_][]const u8{ "1", "2", "3" }) |payload| {
+        try lpeer.publish("up/m", payload, .at_least_once, false);
+        _ = try h.bridge.poll(5); // nothing is acknowledged in between
+    }
+    try testing.expectEqual(@as(u64, 0), h.bridge.stats().dropped);
+    try testing.expectEqual(@as(usize, 2), h.bridge.queued());
+    try h.step(6);
+    for ([_][]const u8{ "1", "2", "3" }) |payload| {
+        try testing.expectEqualStrings(payload, (try rs.nextPublish()).payload);
+    }
+    try testing.expectEqual(@as(usize, 0), h.bridge.queued());
+}
+
+test "review H2: a full window after the CONNACK delays the notification, it does not fail the link" {
+    const rules = [_]bridge_mod.Rule{.{ .pattern = "up/#", .direction = .out, .qos = .at_least_once }};
+    var cfg = rules1(&rules);
+    cfg.notification_topic = "bridges/b1/state";
+    // 30 bytes: the resumed 11-byte message and the 23-byte notification do not fit together
+    const h = try Harness.createO(cfg, 1024, 8, 30);
+    defer h.destroy();
+    try h.dial(0);
+    try h.step(0);
+    var rs = Sink{};
+    const rpeer = try Peer.open(&h.remote, &rs, "r1");
+    try rpeer.subscribe("up/#", .at_least_once);
+    try rpeer.subscribe("bridges/#", .at_least_once);
+    var ls = Sink{};
+    const lpeer = try Peer.open(&h.local, &ls, "l1");
+
+    try lpeer.publish("up/m", "x", .at_least_once, false);
+    _ = try h.bridge.poll(10); // leaves the bridge, never arrives
+    _ = h.drop(10);
+    try h.dial(1010);
+    try h.step(1010); // old code: error.RemoteLost here
+    try testing.expect(h.bridge.remoteUp());
+
+    var saw_msg = false;
+    var saw_one = false;
+    while (try rs.next()) |p| {
+        const pb = p.publish;
+        if (std.mem.eql(u8, pb.topic, "up/m") and std.mem.eql(u8, pb.payload, "x")) saw_msg = true;
+        if (std.mem.eql(u8, pb.topic, "bridges/b1/state") and std.mem.eql(u8, pb.payload, "1")) saw_one = true;
+    }
+    try testing.expect(saw_msg);
+    try testing.expect(saw_one);
+}
+
+test "review M2: a CONNECT nobody answers is given up after the CONNACK timeout" {
+    const rules = [_]bridge_mod.Rule{.{ .pattern = "up/#", .direction = .out }};
+    var cfg = rules1(&rules);
+    cfg.connack_timeout_ms = 5000;
+    const h = try Harness.create(cfg);
+    defer h.destroy();
+    try h.dial(100); // CONNECT goes out, no CONNACK ever comes
+    try testing.expectEqual(bridge_mod.Status.ok, try h.bridge.poll(5099));
+    try testing.expectEqual(bridge_mod.Status.remote_lost, try h.bridge.poll(5100));
+    try testing.expectEqual(@as(u64, 6100), h.bridge.connectionLost(5100, null));
+    try testing.expect(!h.bridge.wantConnect(6000));
+    try testing.expect(h.bridge.wantConnect(6100));
+}
+
+test "review M5: a 5.0 remote with a kept session gets a Session Expiry Interval" {
+    const rules = [_]bridge_mod.Rule{.{ .pattern = "up/#", .direction = .out }};
+    var cfg = rules1(&rules);
+    cfg.version = .v5;
+    {
+        const h = try Harness.create(cfg);
+        defer h.destroy();
+        try h.dial(0);
+        const c = (try packet.decodePacket(h.wire.buf[0..h.wire.len], .v5)).?.packet.connect;
+        try testing.expect(!c.clean_session);
+        try testing.expectEqual(@as(?u32, 0xFFFFFFFF), c.properties.session_expiry_interval);
+    }
+    cfg.clean_session = true;
+    {
+        const h = try Harness.create(cfg);
+        defer h.destroy();
+        try h.dial(0);
+        const c = (try packet.decodePacket(h.wire.buf[0..h.wire.len], .v5)).?.packet.connect;
+        try testing.expectEqual(@as(?u32, null), c.properties.session_expiry_interval);
+    }
+}
+
+test "review M6: a Response Topic follows the prefix rewrite, or is dropped when outside the rule" {
+    const rules = [_]bridge_mod.Rule{
+        .{ .pattern = "#", .direction = .in, .qos = .at_least_once, .remote_prefix = "far/", .local_prefix = "near/" },
+        .{ .pattern = "#", .direction = .out, .qos = .at_least_once, .remote_prefix = "ro/", .local_prefix = "lo/" },
+    };
+    var cfg = rules1(&rules);
+    cfg.version = .v5;
+    const h = try Harness.create(cfg);
+    defer h.destroy();
+    try h.dial(0);
+    try h.step(0);
+    var rs = Sink{};
+    const rpeer = try Peer.openV(&h.remote, &rs, "r1", .v5);
+    try rpeer.subscribe("ro/#", .at_least_once);
+    var ls = Sink{};
+    const lpeer = try Peer.openV(&h.local, &ls, "l1", .v5);
+    try lpeer.subscribe("near/#", .at_least_once);
+
+    try rpeer.publishProps("far/a", "1", .at_least_once, false, .{ .response_topic = "far/reply", .correlation_data = "cd" });
+    try rpeer.publishProps("far/b", "2", .at_least_once, false, .{ .response_topic = "private/steer" });
+    try h.step(1);
+    const a = try ls.nextPublish();
+    try testing.expectEqualStrings("near/reply", a.properties.response_topic.?);
+    try testing.expectEqualStrings("cd", a.properties.correlation_data.?);
+    const b = try ls.nextPublish();
+    try testing.expectEqual(@as(?[]const u8, null), b.properties.response_topic);
+
+    try h.local.publishWith("lo/x", "3", .{ .qos = .at_least_once, .properties = .{ .response_topic = "lo/ask" }, .now = 0 });
+    try h.local.publishWith("lo/y", "4", .{ .qos = .at_least_once, .properties = .{ .response_topic = "local/secret" }, .now = 0 });
+    try h.step(2);
+    const c = try rs.nextPublish();
+    try testing.expectEqualStrings("ro/ask", c.properties.response_topic.?);
+    const d = try rs.nextPublish();
+    try testing.expectEqual(@as(?[]const u8, null), d.properties.response_topic);
+}
+
+test "review L5: a prefix cannot turn a remote topic into a $ topic" {
+    const rules = [_]bridge_mod.Rule{.{ .pattern = "#", .direction = .in, .remote_prefix = "R/" }};
+    const h = try Harness.create(rules1(&rules));
+    defer h.destroy();
+    try h.dial(0);
+    try h.step(0);
+    var rs = Sink{};
+    const rpeer = try Peer.open(&h.remote, &rs, "r1");
+    try rpeer.publish("R/$SYS/x", "no", .at_most_once, false);
+    try rpeer.publish("R/ok", "yes", .at_most_once, false);
+    try h.step(1);
+    try testing.expectEqual(@as(u64, 1), h.bridge.stats().dropped);
+    try testing.expectEqual(@as(u64, 1), h.bridge.stats().forwarded_in);
 }

@@ -329,24 +329,34 @@ pub const Client = struct {
             alias_max = p.topic_alias_maximum orelse 0;
         }
         const bytes = try packet.encodeConnect(c.tx_buf, opts);
+        var version_dropped: usize = 0;
         if (c.outbox.len > 0 and !opts.clean_session) {
-            // Resume: keep the publishes, drop subscribe / unsubscribe.
-            var keep: usize = 0;
-            for (c.pending[0..c.pending_len]) |e| switch (e.kind) {
-                .publish_qos1, .publish_await_pubrec, .publish_await_pubcomp => {
-                    c.pending[keep] = e;
-                    keep += 1;
-                },
-                .subscribe, .unsubscribe => {},
-            };
-            c.pending_len = keep;
+            if (c.outbox_len > 0 and opts.version != c.version) {
+                // The stored packets are encoded for the old protocol version;
+                // they cannot be resent on this one. Dropped and counted.
+                version_dropped = c.outbox_len;
+                c.outbox_len = 0;
+                c.outbox_used = 0;
+                c.pending_len = 0;
+            } else {
+                // Resume: keep the publishes, drop subscribe / unsubscribe.
+                var keep: usize = 0;
+                for (c.pending[0..c.pending_len]) |e| switch (e.kind) {
+                    .publish_qos1, .publish_await_pubrec, .publish_await_pubcomp => {
+                        c.pending[keep] = e;
+                        keep += 1;
+                    },
+                    .subscribe, .unsubscribe => {},
+                };
+                c.pending_len = keep;
+            }
         } else {
             c.pending_len = 0;
             c.inbound_len = 0;
             c.outbox_len = 0;
             c.outbox_used = 0;
         }
-        c.outbox_dropped_n = 0;
+        c.outbox_dropped_n = version_dropped;
         c.awaiting_pingresp = false;
         c.rx_len = 0;
         c.rx_consumed = 0;
@@ -630,7 +640,6 @@ pub const Client = struct {
     /// resent, then start the resend.
     fn outboxResume(c: *Client, now: u64, session_present: bool) Error!void {
         c.resend_dup = session_present;
-        if (!session_present) c.inbound_len = 0; // the server forgot those too
         var i: usize = 0;
         while (i < c.outbox_len) {
             const e = &c.outbox_entries[i];
@@ -640,7 +649,8 @@ pub const Client = struct {
                 !session_present
             else
                 e.len > c.server.maximum_packet_size or
-                    @intFromEnum(publishQos(c.outbox[e.offset..][0..e.len])) > @intFromEnum(c.server.maximum_qos);
+                    @intFromEnum(publishQos(c.outbox[e.offset..][0..e.len])) > @intFromEnum(c.server.maximum_qos) or
+                    c.entryRefused(c.outbox[e.offset..][0..e.len]);
             if (drop) {
                 c.removePending(e.id);
                 c.outboxRemoveAt(i);
@@ -648,6 +658,17 @@ pub const Client = struct {
             } else i += 1;
         }
         try c.outboxFlush(now);
+    }
+
+    /// A stored PUBLISH the new connection's CONNACK forbids: RETAIN without
+    /// Retain Available, or (5.0) a Topic Alias above the new maximum. Such a
+    /// packet would make the server drop the connection on every resend.
+    fn entryRefused(c: *const Client, bytes: []const u8) bool {
+        if (c.version != .v5) return false;
+        if (bytes[0] & 1 != 0 and !c.server.retain_available) return true;
+        const dec = (packet.decodePacket(bytes, .v5) catch return true) orelse return true;
+        if (dec.packet.publish.properties.topic_alias) |a| return a > c.server.topic_alias_maximum;
+        return false;
     }
 
     fn publishQos(bytes: []const u8) packet.QoS {
@@ -659,21 +680,31 @@ pub const Client = struct {
     /// has no quota for (called again whenever an acknowledgement frees some).
     fn outboxFlush(c: *Client, now: u64) Error!void {
         if (c.outbox_len == 0) return;
-        var sent: usize = 0;
-        for (c.outbox_entries[0..c.outbox_len]) |e| sent += @intFromBool(e.sent);
+        // Quota in use: every message awaiting PUBCOMP (its PUBREL is owed
+        // either way) and every PUBLISH already sent on this connection.
+        var used: usize = 0;
+        for (c.outbox_entries[0..c.outbox_len]) |e| {
+            if (e.sent or c.pendingKind(e.id) == .publish_await_pubcomp) used += 1;
+        }
+        // A PUBLISH the quota holds back also holds back the PUBLISHes after
+        // it (their order is kept); PUBRELs still go out, they take no quota.
+        var blocked = false;
         for (c.outbox_entries[0..c.outbox_len]) |*e| {
             if (e.sent) continue;
             if (c.pendingKind(e.id) == .publish_await_pubcomp) {
                 try c.sendAck(now, .pubrel, e.id, .success);
             } else {
-                if (sent >= c.server.receive_maximum) return;
+                if (blocked or used >= c.server.receive_maximum) {
+                    blocked = true;
+                    continue;
+                }
                 const out = c.tx_buf[0..e.len];
                 @memcpy(out, c.outbox[e.offset..][0..e.len]);
                 if (c.resend_dup) out[0] |= 0x08;
                 try c.send(now, out);
+                used += 1;
             }
             e.sent = true;
-            sent += 1;
         }
     }
 
@@ -770,6 +801,8 @@ pub const Client = struct {
                 const ok = if (c.version == .v5) ca.reason_code == .success else ca.return_code == .accepted;
                 c.state = if (ok) .connected else .disconnected;
                 if (ok and c.version == .v5) c.applyConnack(ca.properties);
+                // The server forgot the session: its QoS 2 receive ids went with it.
+                if (ok and !ca.session_present) c.inbound_len = 0;
                 if (ok and c.outbox_len > 0) try c.outboxResume(now, ca.session_present);
                 return .{ .connack = ca };
             },

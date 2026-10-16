@@ -57,6 +57,7 @@
 //! client without a username never matches a `%u` pattern.
 
 const std = @import("std");
+const burn = @import("burn.zig");
 const broker = @import("broker.zig");
 const topic_rules = @import("topic.zig");
 
@@ -159,6 +160,10 @@ pub const Acl = struct {
                 .user => if (req.username == null or !std.mem.eql(u8, req.username.?, r.user)) continue,
                 .pattern => {},
             }
+            // Fail closed: a deny pattern whose `%u` / `%c` value cannot be
+            // substituted safely (it holds `/ + #`) would otherwise stop
+            // applying to exactly the identity that tries to dodge it.
+            if (r.scope == .pattern and r.access == .deny and patternRefused(r, req)) return false;
             // A deny rule that merely overlaps a requested filter denies it
             // (conservative); every other check needs full coverage.
             if (!ruleMatches(r, req, r.access == .deny and req.operation == .subscribe)) continue;
@@ -185,6 +190,16 @@ pub fn authorize(ctx: ?*anyopaque, req: broker.AclRequest) bool {
 
 fn plainName(s: []const u8) bool {
     return s.len > 0 and std.mem.indexOfAny(u8, s, "/+#") == null;
+}
+
+/// Does this pattern use a substitution whose value (present, but empty or
+/// holding `/ + #`) cannot be put into a topic safely?
+fn patternRefused(r: Rule, req: broker.AclRequest) bool {
+    if (std.mem.indexOf(u8, r.topic, "%u") != null) {
+        if (req.username) |u| if (!plainName(u)) return true;
+    }
+    if (std.mem.indexOf(u8, r.topic, "%c") != null and !plainName(req.client_id)) return true;
+    return false;
 }
 
 fn ruleMatches(r: Rule, req: broker.AclRequest, overlap: bool) bool {
@@ -308,6 +323,7 @@ fn parseHash(text: []const u8) ?Parsed {
     const salt_s = it.next() orelse return null;
     const hash_s = it.next() orelse return null;
     if (it.next() != null) return null;
+    if (iter_s.len == 0 or !std.ascii.isDigit(iter_s[0])) return null; // no sign
     const iterations = std.fmt.parseInt(u32, iter_s, 10) catch return null;
     if (iterations == 0 or iterations > max_iterations) return null;
     const dec = std.base64.standard.Decoder;
@@ -330,6 +346,10 @@ fn derive(out: *[hash_len]u8, password: []const u8, salt: []const u8, iterations
 /// password file. `error.NoSpaceLeft` when `out` is too small (~ 130 bytes
 /// are enough for a 12-byte salt).
 pub fn formatHash(out: []u8, password: []const u8, salt: []const u8, iterations: u32) error{ NoSpaceLeft, InvalidParameters }![]u8 {
+    return burn.run(burn.cred_burn, error{ NoSpaceLeft, InvalidParameters }![]u8, formatHashBody, .{ out, password, salt, iterations });
+}
+
+fn formatHashBody(out: []u8, password: []const u8, salt: []const u8, iterations: u32) error{ NoSpaceLeft, InvalidParameters }![]u8 {
     if (salt.len == 0 or salt.len > max_salt_len or iterations == 0 or iterations > max_iterations) return error.InvalidParameters;
     var dk: [hash_len]u8 = undefined;
     defer std.crypto.secureZero(u8, &dk);
@@ -374,8 +394,16 @@ pub const Passwords = struct {
     /// Check one login. The comparison of the derived hash is constant time,
     /// and an unknown user costs the same PBKDF2 run as a known one, so
     /// timing does not reveal which usernames exist.
+    ///
+    /// Runs one frame down under a dead-stack burn (`burn.cred_burn`): PBKDF2
+    /// keeps HMAC states keyed with the password on the stack.
     pub fn verify(p: Passwords, username: []const u8, password: []const u8) bool {
+        return burn.run(burn.cred_burn, bool, verifyBody, .{ &p, username, password });
+    }
+
+    fn verifyBody(p: *const Passwords, username: []const u8, password: []const u8) bool {
         var found: ?Parsed = null;
+        defer std.crypto.secureZero(u8, std.mem.asBytes(&found)); // holds the stored hash
         for (p.entries) |e| {
             if (std.mem.eql(u8, e.username, username)) {
                 found = parseHash(e.hash);
@@ -384,12 +412,24 @@ pub const Passwords = struct {
         }
         const dummy_salt = [_]u8{0} ** 12;
         const salt = if (found) |f| f.salt[0..f.salt_len] else &dummy_salt;
-        const iterations = if (found) |f| f.iterations else default_iterations;
+        const iterations = if (found) |f| f.iterations else p.dummyIterations();
         var dk: [hash_len]u8 = undefined;
         defer std.crypto.secureZero(u8, &dk);
         if (!derive(&dk, password, salt, iterations)) return false;
         const f = found orelse return false;
         return std.crypto.timing_safe.eql([hash_len]u8, dk, f.hash);
+    }
+
+    /// The PBKDF2 cost an unknown user is charged: the highest iteration
+    /// count in the table, so a login attempt costs the same whether the name
+    /// exists or not (when every account has the same count; a table with
+    /// mixed counts leaks through the difference, as any choice would).
+    pub fn dummyIterations(p: Passwords) u32 {
+        var m: u32 = 0;
+        for (p.entries) |e| if (parseHash(e.hash)) |h| {
+            m = @max(m, h.iterations);
+        };
+        return if (m == 0) default_iterations else m;
     }
 };
 
@@ -752,4 +792,47 @@ test "broker: the ACL and the password table plugged into Config deny a publish 
     // alice has no read right: her subscription is refused
     _ = try send(&b, al, try packet.encodeSubscribe(&buf, 2, &.{.{ .filter = "room/alice/temp" }}));
     try testing.expectEqual(@as(u8, 0x80), (try a_sink.next()).?.suback.codes[0]);
+}
+
+// ── review fixes ────────────────────────────────────────────────────────────
+
+test "review M3: a deny pattern fails closed for a name it cannot substitute; allow patterns stay refused" {
+    var buf: [8]Rule = undefined;
+    const a = try Acl.parse(
+        \\pattern deny %c/admin
+        \\pattern deny private/%u
+        \\pattern readwrite open/%u/#
+        \\topic readwrite #
+        \\
+    , &buf);
+    // an honest identity: the deny applies as written
+    try testing.expect(!a.check(rq(.publish, "c1/admin", null, "c1")));
+    try testing.expect(a.check(rq(.publish, "c1/other", null, "c1")));
+    // a client id / username built to dodge the substitution: denied, not "no rule matched"
+    try testing.expect(!a.check(rq(.publish, "a/b/admin", null, "a/b")));
+    try testing.expect(!a.check(rq(.publish, "anything", null, "+")));
+    try testing.expect(!a.check(rq(.subscribe, "anything", "x", "#")));
+    try testing.expect(!a.check(rq(.publish, "private/x/y", "x/y", "c1")));
+    // the allow pattern is still just refused (the grant by `topic readwrite #` is anonymous-only)
+    var b2: [4]Rule = undefined;
+    const g = try Acl.parse("pattern readwrite open/%u/#\n", &b2);
+    try testing.expect(g.check(rq(.publish, "open/bob/x", "bob", "c")));
+    try testing.expect(!g.check(rq(.publish, "open/a/b/x", "a/b", "c")));
+}
+
+test "review M4: an unknown user is charged the table's iteration count; a signed count is no count" {
+    var h: [200]u8 = undefined;
+    const slow = try formatHash(&h, "pw", "0123456789ab", 7);
+    var text: [300]u8 = undefined;
+    const line = try std.fmt.bufPrint(&text, "u:{s}\n", .{slow});
+    var e: [2]Entry = undefined;
+    const pw = try Passwords.parse(line, &e);
+    try testing.expectEqual(@as(u32, 7), pw.dummyIterations());
+    try testing.expectEqual(@as(u32, default_iterations), (Passwords{ .entries = &.{} }).dummyIterations());
+    try testing.expect(pw.verify("u", "pw"));
+    try testing.expect(!pw.verify("nobody", "pw"));
+    // "+7" parsed as 7 before
+    var signed_buf: [300]u8 = undefined;
+    const signed = try std.fmt.bufPrint(&signed_buf, "u:$7$+7${s}\n", .{slow["$7$7$".len..]});
+    try testing.expectError(error.InvalidEntry, Passwords.parse(signed, &e));
 }

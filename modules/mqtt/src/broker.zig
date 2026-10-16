@@ -1906,6 +1906,7 @@ pub const Broker = struct {
     /// bytes that do not decode -- fails the whole call before anything is
     /// stored. No ACL and no tap, as for `publish`; nothing is delivered
     /// (there is no subscriber yet).
+    // secret-api-ok: touches the retained store only; no credential or key reaches this frame
     pub fn restoreRetained(b: *Broker, items: []const RetainedState, now: i64) RestoreError!void {
         // A broker without a retained store (`retain_available = false`) has
         // nothing to restore them into.
@@ -2562,6 +2563,7 @@ pub const Broker = struct {
     /// An ordinary client's `#` or `+/...` never matches these (4.7.2); only
     /// a filter that names `$SYS` does, and a new subscriber gets the
     /// retained values at once.
+    // secret-api-ok: touches counters and $SYS topics only; no credential or key reaches this frame
     pub fn publishSys(b: *Broker, now: i64) usize {
         var values: [sys_topics.len]u64 = undefined;
         {

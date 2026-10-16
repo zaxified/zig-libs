@@ -168,15 +168,27 @@ pub const SubscriptionSet = struct {
     /// Returns the number of packets sent (0 for an empty set). The SUBACKs
     /// surface as ordinary `Event.suback`s.
     pub fn resubscribe(s: *const SubscriptionSet, client: *Client, now: u64) client_mod.Error!usize {
+        var cursor: usize = 0;
+        return s.resubscribeFrom(client, now, &cursor);
+    }
+
+    /// `resubscribe` that can be resumed: `cursor` is the index of the first
+    /// filter not yet sent (start at 0) and advances after every packet that
+    /// went out, also when a later one fails. After an error (typically
+    /// `TooManyInFlight`: the client's packet-id pool is full) call again with
+    /// the same cursor once acknowledgements have freed ids; the filters
+    /// already sent are not repeated. Done when `cursor.* == len()`.
+    pub fn resubscribeFrom(s: *const SubscriptionSet, client: *Client, now: u64, cursor: *usize) client_mod.Error!usize {
         var chunk: [max_filters_per_subscribe]packet.Subscription = undefined;
         var sent: usize = 0;
-        var i: usize = 0;
+        var i: usize = cursor.*;
         while (i < s.count) {
             const n = @min(max_filters_per_subscribe, s.count - i);
             for (chunk[0..n], s.slots[i..][0..n]) |*dst, e| dst.* = s.toSubscription(e);
             _ = try client.subscribe(now, chunk[0..n]);
             sent += 1;
             i += n;
+            cursor.* = i;
         }
         return sent;
     }
