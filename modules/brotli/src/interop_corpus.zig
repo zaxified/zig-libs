@@ -61,10 +61,10 @@ pub fn fontLike(gpa: std.mem.Allocator, n: usize, seed: u64) ![]u8 {
             try be16(o, g, @intCast(v >> 16));
             try be16(o, g, @truncate(v));
         }
-        fn below(r: *Rng, m: u64) u64 {
-            return (r.next() >> 11) % m;
+        fn below(r: *Rng, m: usize) usize {
+            return @intCast((r.next() >> 11) % m);
         }
-        fn signed(r: *Rng, m: u64) i32 {
+        fn signed(r: *Rng, m: usize) i32 {
             return @as(i32, @intCast(below(r, 2 * m + 1))) - @as(i32, @intCast(m));
         }
     };
@@ -100,7 +100,7 @@ pub fn fontLike(gpa: std.mem.Allocator, n: usize, seed: u64) ![]u8 {
         const contours = 1 + F.below(&rng, 3);
         try F.be16(&out, gpa, @intCast(contours));
         for (0..4) |_| try F.be16(&out, gpa, @bitCast(@as(i16, @intCast(F.signed(&rng, 1200)))));
-        var pts: u64 = 0;
+        var pts: usize = 0;
         for (0..contours) |_| {
             pts += 4 + F.below(&rng, 24);
             try F.be16(&out, gpa, @intCast(pts - 1));
@@ -182,7 +182,7 @@ pub fn lengthsInput(gpa: std.mem.Allocator, seed: u64) ![]u8 {
     var rng = Rng{ .s = seed };
     const F = struct {
         fn run(o: *std.ArrayList(u8), g: std.mem.Allocator, r: *Rng, n: usize) !void {
-            for (0..n) |_| try o.append(g, letters[r.next() >> 58]);
+            for (0..n) |_| try o.append(g, letters[@intCast(r.next() >> 58)]);
         }
         /// From `dist` back, or (0) from anywhere before.
         fn copy(o: *std.ArrayList(u8), g: std.mem.Allocator, r: *Rng, n: usize, dist: usize) !void {
@@ -446,9 +446,11 @@ pub const dict_cases = [_]DictCase{
     .{ .name = "alice_w10", .dict = .{ .shape = "alice_full", .to = 5_000 }, .input = .{ .shape = "alice_full", .from = 3_000, .to = 20_000 }, .lgwin = 10 },
 };
 
-/// The qualities the reference compresses each `DictCase` at: q2..4 search
-/// the dictionary with its quick hashers, q5+ with the deep ones and
-/// context modelling, q11 with the optimal parse.
+/// The qualities the reference compresses each `DictCase` at: q2 does not
+/// search the dictionary (its quick hashers have no compound-dictionary
+/// form: 18 836 vs 18 832 bytes without, alice29, 2026-10-16) but still
+/// counts static-dictionary words past it; q5+ search it with the deep
+/// hashers and context modelling, q11 with the optimal parse.
 pub const dict_qualities = [_]u8{ 2, 5, 9, 11 };
 
 /// `testdata/ref/dict/<case>.q<Q>.br`.

@@ -29,6 +29,7 @@ const std = @import("std");
 const Writer = std.Io.Writer;
 const encoder = @import("encoder.zig");
 const Core = encoder.Core;
+const PreparedDictionary = @import("prepared_dictionary.zig").PreparedDictionary;
 
 pub const StreamOptions = struct {
     effort: encoder.Effort = .default,
@@ -48,14 +49,16 @@ pub const StreamOptions = struct {
     /// `.q6`/`.q9` may model literals with thirteen contexts, as
     /// `compressWith` does for such an input (none without a hint).
     size_hint: ?usize = null,
-    /// A raw prefix dictionary (as `CompressOptions.dictionary`), copied at
-    /// `init`/`reset` (the caller's bytes are not kept). It stays searchable
-    /// for the whole stream; once the output has slid, a copy from it no
-    /// longer runs on into the output.
+    /// A raw prefix dictionary (as `CompressOptions.dictionary`), copied and
+    /// prepared at `init`/`reset` (the caller's bytes are not kept). It stays
+    /// searchable for the whole stream.
     dictionary: []const u8 = &.{},
+    /// As `CompressOptions.prepared_dictionary`: not copied, it must outlive
+    /// the stream. Not both.
+    prepared_dictionary: ?*const PreparedDictionary = null,
 
     fn tableSize(o: StreamOptions) usize {
-        return encoder.tableSize(o.size_hint orelse @as(usize, 1) << o.window_bits, o.dictionary.len, o.window_bits);
+        return encoder.tableSize(o.size_hint orelse @as(usize, 1) << o.window_bits, o.window_bits);
     }
 };
 
@@ -77,8 +80,10 @@ pub const StreamWriter = struct {
     /// (`hist.items[done..]`).
     hist: std.ArrayListUnmanaged(u8) = .empty,
     done: usize = 0,
-    /// `hist.items[0..dict_len]` is the dictionary (`StreamOptions`).
-    dict_len: usize = 0,
+    /// `StreamOptions.dictionary`'s copy and its table (on the heap: the
+    /// core points at it, and the writer moves).
+    dict_copy: std.ArrayListUnmanaged(u8) = .empty,
+    dict_own: ?*PreparedDictionary = null,
     /// The buffer given at init, for `reset` (`finish` takes it off
     /// `writer`).
     buffer: []u8,
@@ -94,6 +99,7 @@ pub const StreamWriter = struct {
         std.debug.assert(buffer.len != 0);
         var core = try Core.init(gpa, opts.effort, opts.block_size, opts.window_bits, opts.tableSize());
         errdefer core.deinit();
+        core.keep_temp = true;
         var sw: StreamWriter = .{
             .writer = .{ .buffer = buffer, .vtable = &vtable },
             .output = output,
@@ -101,45 +107,63 @@ pub const StreamWriter = struct {
             .opts = opts,
             .buffer = buffer,
         };
-        errdefer sw.hist.deinit(gpa);
+        errdefer sw.dict_copy.deinit(gpa);
+        errdefer sw.dropDictionary();
         try sw.start();
         return sw;
     }
 
-    /// The history holds the dictionary, the stream header is written.
+    fn dropDictionary(sw: *StreamWriter) void {
+        const gpa = sw.core.gpa;
+        if (sw.dict_own) |d| {
+            d.deinit(gpa);
+            gpa.destroy(d);
+        }
+        sw.dict_own = null;
+    }
+
+    /// The dictionary attached, the stream header written.
     fn start(sw: *StreamWriter) std.mem.Allocator.Error!void {
-        const d = sw.opts.dictionary;
-        try sw.hist.appendSlice(sw.core.gpa, d);
-        sw.done = d.len;
+        const gpa = sw.core.gpa;
+        const o = sw.opts;
+        std.debug.assert(o.dictionary.len == 0 or o.prepared_dictionary == null);
+        sw.dropDictionary();
+        sw.dict_copy.clearRetainingCapacity();
+        if (o.prepared_dictionary) |d| {
+            sw.core.attachDictionary(d);
+        } else if (o.dictionary.len != 0) {
+            try sw.dict_copy.appendSlice(gpa, o.dictionary);
+            // Prepared only where it is searched (`Effort.searchesDictionary`),
+            // as `compressWith`.
+            if (o.effort.searchesDictionary()) {
+                const d = try gpa.create(PreparedDictionary);
+                errdefer gpa.destroy(d);
+                d.* = try PreparedDictionary.initOptions(gpa, sw.dict_copy.items, .{ .digest = false });
+                sw.dict_own = d;
+                sw.core.attachDictionary(d);
+            } else sw.core.dict_len = o.dictionary.len;
+        }
+        sw.done = 0;
         sw.core.setData(sw.hist.items);
-        sw.core.loadDictionary(d.len);
-        sw.core.size_hint = sw.opts.size_hint orelse 0;
-        sw.dict_len = d.len;
+        sw.core.size_hint = o.size_hint orelse 0;
         try sw.core.writeHeader();
     }
 
     pub fn deinit(sw: *StreamWriter) void {
-        sw.hist.deinit(sw.core.gpa);
+        const gpa = sw.core.gpa;
+        sw.dropDictionary();
+        sw.dict_copy.deinit(gpa);
+        sw.hist.deinit(gpa);
         sw.core.deinit();
         sw.* = undefined;
     }
 
     /// The next stream, to `output` with `opts`: the table and the history
-    /// are kept when the effort and the table's size (window, `size_hint`)
-    /// are the same (else the table is made anew). A stream not yet finished
+    /// are kept while big enough (`Core.reinit`). A stream not yet finished
     /// is abandoned. On an error the writer is unusable until another
     /// successful `reset`.
     pub fn reset(sw: *StreamWriter, output: *Writer, opts: StreamOptions) std.mem.Allocator.Error!void {
-        std.debug.assert(opts.window_bits >= encoder.min_window_bits and opts.window_bits <= encoder.max_large_window_bits);
-        if (opts.effort != sw.opts.effort or Core.tableLog(opts.effort, opts.tableSize()) != sw.core.table_log) {
-            const gpa = sw.core.gpa;
-            sw.core.deinit();
-            sw.core = try Core.init(gpa, opts.effort, opts.block_size, opts.window_bits, opts.tableSize());
-        } else {
-            sw.core.reset();
-            sw.core.block_size = opts.block_size;
-            sw.core.wbits = opts.window_bits;
-        }
+        try sw.core.reinit(opts.effort, opts.block_size, opts.window_bits, opts.tableSize());
         sw.opts = opts;
         sw.hist.clearRetainingCapacity();
         sw.output = output;
@@ -215,16 +239,13 @@ pub const StreamWriter = struct {
     }
 
     /// Drop output no copy can reach any more, once there is a window's
-    /// worth of it (so the bytes moved stay about the bytes written). A
-    /// dictionary at the history's start stays.
+    /// worth of it (so the bytes moved stay about the bytes written).
     fn slide(sw: *StreamWriter) void {
         const window = @as(usize, 1) << sw.opts.window_bits;
-        const dl = sw.dict_len;
-        const out_done = sw.done - dl;
-        if (out_done < 2 * window) return;
-        const by = std.mem.alignBackward(usize, out_done - window, shift_align);
+        if (sw.done < 2 * window) return;
+        const by = std.mem.alignBackward(usize, sw.done - window, shift_align);
         const items = sw.hist.items;
-        std.mem.copyForwards(u8, items[dl .. items.len - by], items[dl + by ..]);
+        std.mem.copyForwards(u8, items[0 .. items.len - by], items[by..]);
         sw.hist.items.len -= by;
         sw.done -= by;
         sw.core.shift(by);
@@ -628,17 +649,18 @@ test "a raw prefix dictionary: compressWith's bytes, and every decoder's round t
         defer gpa.free(plain_one);
         const want = try encoder.compressWith(gpa, input, .{ .effort = effort, .window_bits = 16, .dictionary = dict });
         defer gpa.free(want);
-        // The dictionary is used: smaller than without it. (`.q0`/`.q1`
-        // keep one position per hash, the last: on text of a few words
-        // that is rarely the long copy from the dictionary, so their gain
-        // is small; that the stream needs the dictionary is checked below.)
-        if (effort != .q0 and effort != .q1) try testing.expect(want.len < plain_one.len);
+        // The dictionary is used: smaller than without it — but at `.q0`,
+        // which does not search it (google/brotli's quality 0 does not),
+        // so its stream is the one without it.
+        if (@as(encoder.Effort, effort).searchesDictionary())
+            try testing.expect(want.len < plain_one.len)
+        else
+            try testing.expectEqualSlices(u8, plain_one, want);
         const back = try decoder.decompress(gpa, want, .{ .dictionary = dict });
         defer gpa.free(back);
         try testing.expectEqualSlices(u8, input, back);
-        // Without it the stream does not decode to the input (`.q0` never
-        // copies from it: google/brotli's quality 0 does not either).
-        if (effort != .q0) if (decoder.decompress(gpa, want, .{})) |other| {
+        // Without it the stream does not decode to the input.
+        if (@as(encoder.Effort, effort).searchesDictionary()) if (decoder.decompress(gpa, want, .{})) |other| {
             defer gpa.free(other);
             try testing.expect(!std.mem.eql(u8, input, other));
         } else |_| {};
@@ -663,5 +685,17 @@ test "a raw prefix dictionary: compressWith's bytes, and every decoder's round t
         const back2 = try decoder.decompress(gpa, out.written(), .{ .dictionary = dict });
         defer gpa.free(back2);
         try testing.expectEqualSlices(u8, input, back2);
+        // Prepared once and lent: the same bytes again, the caller's
+        // dictionary not copied.
+        var pd = try PreparedDictionary.init(gpa, dict);
+        defer pd.deinit(gpa);
+        var lent = opts;
+        lent.dictionary = &.{};
+        lent.prepared_dictionary = &pd;
+        out.clearRetainingCapacity();
+        try sw.reset(&out.writer, lent);
+        try writeStream(&sw, input, 5_000, &.{});
+        try testing.expectEqualSlices(u8, want, out.written());
+        try testing.expectEqual(@as(usize, 0), sw.dict_copy.items.len);
     }
 }

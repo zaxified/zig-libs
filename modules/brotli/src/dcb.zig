@@ -8,11 +8,15 @@
 //! The dictionary itself is negotiated over HTTP (`Use-As-Dictionary`,
 //! `Available-Dictionary`), which is the caller's business; here are the
 //! body's two directions. A streamed body is `header(dict)` written first,
-//! then a `StreamWriter` with `.dictionary = dict`.
+//! then a `StreamWriter` with `.dictionary = dict`. A server answering from
+//! one dictionary prepares it once (`PreparedDictionary`, whose `digest` is
+//! the header's hash): `compressPrepared`, `headerFrom`, a `StreamWriter`
+//! with `.prepared_dictionary`.
 
 const std = @import("std");
 const encoder = @import("encoder.zig");
 const decoder = @import("decoder.zig");
+const PreparedDictionary = @import("prepared_dictionary.zig").PreparedDictionary;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
 pub const magic = [4]u8{ 0xff, 0x44, 0x43, 0x42 };
@@ -28,9 +32,17 @@ pub const Error = decoder.BrotliError || error{
 
 /// The header a body compressed against `dict` starts with.
 pub fn header(dict: []const u8) [header_len]u8 {
+    var digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(dict, &digest, .{});
+    return headerFrom(digest);
+}
+
+/// The header for a dictionary whose SHA-256 is `digest`
+/// (`PreparedDictionary.digest`).
+pub fn headerFrom(digest: [Sha256.digest_length]u8) [header_len]u8 {
     var h: [header_len]u8 = undefined;
     h[0..magic.len].* = magic;
-    Sha256.hash(dict, h[magic.len..], .{});
+    h[magic.len..].* = digest;
     return h;
 }
 
@@ -52,6 +64,21 @@ pub fn compress(gpa: std.mem.Allocator, input: []const u8, dict: []const u8, opt
     defer gpa.free(br);
     const out = try gpa.alloc(u8, header_len + br.len);
     out[0..header_len].* = header(dict);
+    @memcpy(out[header_len..], br);
+    return out;
+}
+
+/// `compress` against a prepared dictionary: neither the dictionary's
+/// positions nor its hash are worked out again (`opts.prepared_dictionary`
+/// is set to `dict`). Caller owns the result.
+pub fn compressPrepared(gpa: std.mem.Allocator, input: []const u8, dict: *const PreparedDictionary, opts: encoder.CompressOptions) std.mem.Allocator.Error![]u8 {
+    var o = opts;
+    o.dictionary = &.{};
+    o.prepared_dictionary = dict;
+    const br = try encoder.compressWith(gpa, input, o);
+    defer gpa.free(br);
+    const out = try gpa.alloc(u8, header_len + br.len);
+    out[0..header_len].* = headerFrom(dict.digest);
     @memcpy(out[header_len..], br);
     return out;
 }
@@ -83,6 +110,24 @@ test "dcb: round trip; the header names the dictionary" {
     const plain = try encoder.compress(gpa, page);
     defer gpa.free(plain);
     try testing.expect(body.len - header_len < plain.len);
+}
+
+test "dcb: a prepared dictionary gives the bytes the raw one gives" {
+    const gpa = testing.allocator;
+    const dict = "<html><head><script src=app.v1.js></script></head><body>hello, version one</body></html>";
+    const page = "<html><head><script src=app.v2.js></script></head><body>hello, version two</body></html>";
+    var pd = try PreparedDictionary.init(gpa, dict);
+    defer pd.deinit(gpa);
+    inline for (.{ encoder.Effort.q0, .q1, .q4, .q6, .q9, .q11 }) |e| {
+        const raw = try compress(gpa, page, dict, .{ .effort = e });
+        defer gpa.free(raw);
+        const prep = try compressPrepared(gpa, page, &pd, .{ .effort = e });
+        defer gpa.free(prep);
+        try testing.expectEqualSlices(u8, raw, prep);
+        const back = try decompress(gpa, prep, dict, .{});
+        defer gpa.free(back);
+        try testing.expectEqualStrings(page, back);
+    }
 }
 
 test "dcb: another dictionary, another magic, a short body" {

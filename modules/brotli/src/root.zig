@@ -87,6 +87,12 @@ pub const Effort = encoder.Effort;
 /// only when the stream does not fit.
 pub const compressInto = encoder.compressInto;
 pub const CompressIntoError = encoder.CompressIntoError;
+/// An encoder reused from call to call: `compressWith`'s bytes, its
+/// tables and buffers kept (many small compressions; see `Compressor`).
+pub const Compressor = encoder.Compressor;
+/// A raw prefix dictionary hashed once, for any number of compressions
+/// (`CompressOptions.prepared_dictionary`, `StreamOptions`, `dcb`).
+pub const PreparedDictionary = @import("prepared_dictionary.zig").PreparedDictionary;
 /// The longest stream `compressWith` gives for `n` input bytes (exact:
 /// incompressible input reaches it).
 pub const maxCompressedSize = encoder.maxCompressedSize;
@@ -120,6 +126,7 @@ test {
     _ = @import("stream_test.zig");
     _ = @import("stream_writer.zig");
     _ = @import("dcb.zig");
+    _ = @import("prepared_dictionary.zig");
     _ = @import("shared_dictionary.zig");
     _ = @import("crafted_test.zig");
     _ = @import("block_split.zig");
