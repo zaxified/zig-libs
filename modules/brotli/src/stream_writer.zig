@@ -744,3 +744,54 @@ test "a raw dictionary is copied: the caller may reuse its bytes after init and 
         try testing.expectEqualSlices(u8, want, out.written());
     }
 }
+
+test "a warm writer allocates nothing: the next stream after reset, every level" {
+    const Counting = struct {
+        back: std.mem.Allocator,
+        calls: usize = 0,
+        fn alloc(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const c: *@This() = @ptrCast(@alignCast(ctx));
+            c.calls += 1;
+            return c.back.rawAlloc(len, a, ra);
+        }
+        fn resize(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) bool {
+            const c: *@This() = @ptrCast(@alignCast(ctx));
+            if (n > m.len) c.calls += 1;
+            return c.back.rawResize(m, a, n, ra);
+        }
+        fn remap(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) ?[*]u8 {
+            const c: *@This() = @ptrCast(@alignCast(ctx));
+            if (n > m.len) c.calls += 1;
+            return c.back.rawRemap(m, a, n, ra);
+        }
+        fn free(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, ra: usize) void {
+            const c: *@This() = @ptrCast(@alignCast(ctx));
+            c.back.rawFree(m, a, ra);
+        }
+        fn allocator(c: *@This()) std.mem.Allocator {
+            return .{ .ptr = c, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+        }
+    };
+    const alice = @embedFile("testdata/alice29.txt");
+    const src = alice[0..40_000];
+    for ([_]encoder.Effort{ .q0, .q1, .q4, .q6, .q9, .q11 }) |effort| {
+        var counting: Counting = .{ .back = testing.allocator };
+        const gpa = counting.allocator();
+        var out: Writer.Allocating = .init(testing.allocator);
+        defer out.deinit();
+        var buf: [4096]u8 = undefined;
+        const opts: StreamOptions = .{ .effort = effort, .block_size = 8192, .size_hint = src.len };
+        var sw: StreamWriter = try .init(gpa, &out.writer, &buf, opts);
+        defer sw.deinit();
+        try writeStream(&sw, src, 3000, &.{20_000});
+        out.clearRetainingCapacity();
+        try sw.reset(&out.writer, opts);
+        try writeStream(&sw, src, 3000, &.{20_000});
+        out.clearRetainingCapacity();
+        try sw.reset(&out.writer, opts);
+        const before = counting.calls;
+        try writeStream(&sw, src, 3000, &.{20_000});
+        try testing.expectEqual(before, counting.calls);
+        try expectRoundTrip(src, out.written());
+    }
+}
