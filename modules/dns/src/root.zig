@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 
 //! dns — DNS resolver: RFC 1035 message codec + UDP/TCP/DoH transports +
-//! forward (A/AAAA) and reverse (PTR) lookups. The codec decodes the common
+//! forward (A/AAAA) and reverse (PTR) lookups, plus the client side of RFC 2136
+//! dynamic update (`update.zig`) under RFC 8945 TSIG (`tsig.zig`). The codec decodes the common
 //! record set — A/AAAA/PTR/CNAME/NS/MX/TXT/SOA (RFC 1035), SRV (RFC 2782),
 //! CAA (RFC 8659) — plus EDNS(0) OPT; anything else surfaces as raw rdata.
 //!
@@ -31,7 +32,7 @@ const netaddr = @import("netaddr");
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "RFC 1035 resolver — A/AAAA/PTR/CNAME/NS/MX/TXT/SOA/SRV/CAA over UDP/TCP + DoH",
+    .doc = "RFC 1035 resolver — A/AAAA/PTR/CNAME/NS/MX/TXT/SOA/SRV/CAA over UDP/TCP + DoH; RFC 2136 update + TSIG",
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
@@ -40,7 +41,7 @@ pub const meta = .{
     .platform = .any, // lookupIp's RFC 6724 ordering kicks in on Linux only
     .role = .client,
     .concurrency = .blocking, // every lookup blocks; one owner per Resolver
-    .model_after = "Go net dnsclient + miekg/dns (codec) / c-ares; RFC 1035/2782/8659 (wire), RFC 8484 (DoH)",
+    .model_after = "Go net dnsclient + miekg/dns (codec, update, TSIG) / c-ares; RFC 1035/2782/8659 (wire), RFC 8484 (DoH), RFC 2136/8945 (update, TSIG)",
     .deps = .{ "netaddr", "http" }, // also uses std.json, std.Io.net
 };
 
@@ -52,6 +53,12 @@ pub const config = @import("config.zig");
 
 /// The blocking resolver over UDP/TCP/DoH. See `Resolver.init`.
 pub const Resolver = @import("Resolver.zig");
+
+/// RFC 2136 dynamic update: `update.Builder` + `update.send`.
+pub const update = @import("update.zig");
+
+/// RFC 8945 transaction signatures (HMAC-SHA*): `tsig.sign`, `tsig.verify`.
+pub const tsig = @import("tsig.zig");
 
 // Codec vocabulary, re-exported for consumers.
 pub const Type = message.Type;
@@ -132,6 +139,9 @@ test {
     _ = message;
     _ = config;
     _ = Resolver;
+    _ = update;
+    _ = tsig;
+    _ = @import("stackprobe_test.zig");
     _ = @import("goldens.zig");
     _ = @import("go_oracle.zig");
     // External anchor for config.zig: glibc's behaviour on the same files

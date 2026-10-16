@@ -1,6 +1,6 @@
 # `dns` verification instruments
 
-Six instruments. Two are wired into `zig build`; four are run by
+Eight instruments. Two are wired into `zig build`; six are run by
 hand. They live here rather than in `src/` because each needs something
 `zig build test-dns` must not require — a foreign toolchain (dnspython), a real
 socket and a second schedulable thread, or the live internet
@@ -25,6 +25,23 @@ not tests. That argument is the reason the hostile-stub harness the 2026-09-04
 audit carried (`run.sh` + `stub.py` + `driver.zig` + its own `build.zig`) is
 **not** here: `interop.zig` covers the same ground, is in the gate, and its
 frames are committed.
+
+## RFC 2136 update + TSIG (2026-10-16)
+
+`tsig_oracle.py` regenerates `src/tsig_vectors.zig` (dnspython-signed messages and an UPDATE with
+every operation, rendered uncompressed so they are byte-comparable):
+
+    python3 -I modules/dns/tools/tsig_oracle.py > modules/dns/src/tsig_vectors.zig
+
+`update_server.py check` is the live peer: a dnspython RFC 2136 server (TSIG keys per algorithm,
+BIND-style error replies), BIND's `nsupdate` as a control, then `zig build interop-dns --
+--update-server PORT` (`update_interop.zig`), then BIND's `dig +norec` reading back what we left.
+It builds, so run it under `hw run`:
+
+    hw run -- python3 -I modules/dns/tools/update_server.py check
+
+Last run 2026-10-16: 37 checks, 0 failures (it caught the ARCOUNT-not-restored resend bug in
+`update.send` on its first run).
 
 ## Go dnsmessage oracle (frozen, replayed by `test-dns`)
 

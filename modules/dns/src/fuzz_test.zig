@@ -8,7 +8,10 @@
 //!     bytes almost never carry a header whose counts the body satisfies, so
 //!     this one is the "rejected" side;
 //!   - `decode-mutated`: one of the six live captures (`goldens.zig`), a few
-//!     octets damaged, maybe cut short -- reaches the record parsers.
+//!     octets damaged, maybe cut short -- reaches the record parsers;
+//!   - `tsig-verify` (2026-10-16): one of dnspython's TSIG-signed messages
+//!     (`tsig_vectors.zig`), damaged the same way -- `tsig.verify` walks the
+//!     whole message to its last record, and a server reply is hostile input.
 //!
 //! Driver: `DNS_FUZZ=<runs>[,<first seed>]` (testkit's fuzz driver; `_MS`,
 //! `_SEEDFILE`, `_INPUT`, `_ONLY` as documented there).
@@ -19,8 +22,10 @@ const testkit = @import("testkit");
 const fuzz_driver = testkit.fuzz.driver;
 const message = @import("message.zig");
 const goldens = @import("goldens.zig");
+const tsig = @import("tsig.zig");
+const tsig_vectors = @import("tsig_vectors.zig");
 
-pub const Label = enum { rejected, decoded, with_records };
+pub const Label = enum { rejected, decoded, with_records, tsig_rejected, tsig_verified };
 var reach: [@typeInfo(Label).@"enum".fields.len]usize = @splat(0);
 
 fn mark(comptime l: Label) void {
@@ -101,6 +106,24 @@ fn mutatedHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!vo
     try walk(gpa, packet[0..len]);
 }
 
+fn tsigHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    var packet: [512]u8 = undefined;
+    const v = tsig_vectors.signed[src.index(tsig_vectors.signed.len)];
+    @memcpy(packet[0..v.signed.len], v.signed);
+    var len: usize = v.signed.len;
+    for (0..src.valueRangeAtMost(u8, 0, 4)) |_| {
+        const at = src.index(len);
+        packet[at] = src.value(u8);
+    }
+    if (src.valueRangeAtMost(u8, 0, 3) == 0) len = src.index(len) + 1;
+    const key: tsig.Key = .{ .name = v.key_name, .algorithm = v.algorithm, .secret = v.secret };
+    var mac: tsig.Mac = undefined;
+    if (tsig.verify(packet[0..len], &key, .{ .now = v.time, .request_mac = v.request_mac }, &mac)) |_| {
+        mark(.tsig_verified);
+    } else |_| mark(.tsig_rejected);
+}
+
 fn fuzzScript(comptime harness: anytype) fn (void, *testing.Smith) anyerror!void {
     return struct {
         fn f(_: void, smith: *testing.Smith) anyerror!void {
@@ -132,9 +155,14 @@ test "fuzz: decoder never crashes or leaks on damaged captures" {
     try testing.fuzz({}, fuzzScript(mutatedHarness), .{});
 }
 
+test "fuzz: tsig.verify never crashes on damaged signed messages" {
+    try testing.fuzz({}, fuzzScript(tsigHarness), .{});
+}
+
 test "fuzz driver: DNS_FUZZ" {
     try fuzz_driver.run(decodeHarness, .{ .prefix = "DNS_FUZZ", .name = "dns-decode" });
     try fuzz_driver.run(mutatedHarness, .{ .prefix = "DNS_FUZZ", .name = "dns-decode-mutated" });
+    try fuzz_driver.run(tsigHarness, .{ .prefix = "DNS_FUZZ", .name = "dns-tsig-verify" });
 }
 
 test "fuzz harness: 500 seeds in every test run, and they get everywhere" {
@@ -148,6 +176,10 @@ test "fuzz harness: 500 seeds in every test run, and they get everywhere" {
         };
         mutatedHarness(fuzz_driver.Rng, &rng, testing.allocator) catch |err| {
             std.debug.print("dns mutated seed {d}: {t}\n", .{ seed, err });
+            return err;
+        };
+        tsigHarness(fuzz_driver.Rng, &rng, testing.allocator) catch |err| {
+            std.debug.print("dns tsig seed {d}: {t}\n", .{ seed, err });
             return err;
         };
     }

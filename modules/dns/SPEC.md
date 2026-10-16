@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-12 · mutation 2026-10-04 (54/54) · src ?
 
-**Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, DNS_FUZZ) · ct n/a — public DNS codec (keyword review, 2026-10-07)
+**Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, DNS_FUZZ) · ct n/a — public DNS codec (keyword review, 2026-10-07); TSIG (2026-10-16): std HMAC, MAC compared with `timing_safe.eql`, secret frames burned (stack probe)
 
 **Performance:** not measured
 
@@ -31,7 +31,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [lun-4/zigdig](https://github.com/lun-4/zigdig) | Zig | MIT | 44 | push 2026-02-20 | Small DNS client library; no DoH, no reverse/hosts/search-list layer *(inferred; README not read)*. |
 | Zig `std.Io.net.HostName.lookup` | Zig | MIT | — | Zig 0.16.0 | Forward lookup only, opaque: no PTR, no other RR types, no server/transport control, no DoH (as stated in this module's README/root.zig). |
 
-**Where we are ahead:** of every Zig alternative — PTR, arbitrary RR types, TCP, EDNS(0), DoH (POST/GET + JSON), RFC 5452 §9.1 reply correlation and a bailiwick rule on `lookupIp`, resolv.conf/hosts handling; against the pure-Go stub, DoH and explicit server/transport control. **Where we are behind:** DNS-over-TLS, typed rdata beyond A/AAAA/NS/CNAME/SOA/PTR/MX/TXT/SRV/CAA/OPT (TLSA, SVCB/HTTPS, NAPTR, SSHFP come back as raw `.unknown` bytes), 0x20 randomization, a per-call deadline, no answer cache (→ Backlog items). Zone files, TSIG, AXFR and the server side are miekg/dns's territory, not a stub client's.
+**Where we are ahead:** of every Zig alternative — PTR, arbitrary RR types, TCP, EDNS(0), DoH (POST/GET + JSON), RFC 5452 §9.1 reply correlation and a bailiwick rule on `lookupIp`, resolv.conf/hosts handling; against the pure-Go stub, DoH and explicit server/transport control. **Where we are behind:** DNS-over-TLS, typed rdata beyond A/AAAA/NS/CNAME/SOA/PTR/MX/TXT/SRV/CAA/OPT (TLSA, SVCB/HTTPS, NAPTR, SSHFP come back as raw `.unknown` bytes), 0x20 randomization, a per-call deadline, no answer cache (→ Backlog items). Zone files, AXFR/IXFR and the server side are miekg/dns's territory, not a stub client's. **Added 2026-10-16 (for acme's RFC 2136 DNS-01 publisher):** the client side of RFC 2136 dynamic update and RFC 8945 TSIG — what `nsupdate`, certbot's rfc2136 plugin and lego's `rfc2136` provider send; miekg/dns and dnspython offer the same. Not here: SIG(0), GSS-TSIG (Windows "secure only" zones), multi-message TSIG for zone transfers, truncated MACs, HMAC-MD5.
 
 ## Design & invariants
 Layered like `http`: `message.zig` is the pure, transport-agnostic wire codec (golden-byte
@@ -48,6 +48,21 @@ on NXDOMAIN/empty (inspect `Message.rcode()`); `lookupIp` returns an empty slice
 resolves. The `/etc/hosts` + UDP-PTR core, codec, TCP and
 EDNS(0)/DoH are clean-room from RFC 1035/2782/8659/8484 — see NOTICE.
 
+**Dynamic update (2026-10-16).** `update.zig` builds an RFC 2136 message in a caller buffer
+(ZONE = one SOA question, PREREQUISITE = answer section, UPDATE = authority; operation in class
+and TTL, §2.4/§2.5), prerequisites strictly before updates (`error.OutOfOrder`), never
+compressed. `update.send` gives it a fresh random id, signs it when a key is given, sends it
+with `Resolver.exchange` (new: a caller-built message to one server, UDP with TC→TCP, TCP from
+the start over 512 bytes) and returns the server's rcode — `no_error` = applied. A signed
+update accepts only a reply signed with the same key and the request's MAC chained in. The
+TSIG record the signature adds is written after the builder's message and the header's
+ARCOUNT is restored, so the same builder can be sent again (a bug the live oracle caught).
+`tsig.zig`: RFC 8945 §4.3 MAC input (original id, ARCOUNT without the record, canonical
+lower-case names, time, fudge, error, other data), verification in §5.2's order key → MAC →
+time; the full MAC length is required; an unsigned BADSIG/BADKEY reply (how BIND answers a
+request it cannot verify) is reported as `PeerBadSig`/`PeerBadKey`. `Options.recursion_desired`
+(new, default true) lets a caller ask an authoritative server with RD clear.
+
 ## Threat model / out of scope
 Not a validating resolver: **no DNSSEC**, so answers are trusted as far as the transport is. UDP is
 spoofable; what the resolver does demand of a reply is RFC 5452 §9.1's full set — it must come
@@ -57,6 +72,15 @@ one question, our name (ASCII case-insensitive, RFC 4343), our type, class IN. A
 `MalformedResponse`. That is robustness against an off-path guesser (~31 bits of work with the
 random source port), not authentication — use DoH (TLS to the resolver) when the path is
 untrusted. TLS/DoH transport security is the `http` client's concern, not this module's.
+
+TSIG (2026-10-16) authenticates an update and its reply with a shared secret; it does not
+encrypt them and there is no replay cache — a captured signed update can be replayed within
+its fudge (300 s), which RFC 8945 §5.2.3 accepts and which, for idempotent adds/deletes of
+DNS-01 records, re-applies the same change. The secret is touched only inside `tsig.sign` /
+`tsig.verify`, each run under a dead-stack burn (stack probe in ReleaseFast); the MAC is
+compared with `std.crypto.timing_safe.eql`; HMAC itself is std's. An off-path forger can
+produce an unsigned BADSIG/BADKEY reply (it fails the update, as dropping the reply would),
+not a false success.
 
 `lookupIp` and `reverse` apply a bailiwick rule on top: only answer records whose owner is the
 queried name, or a CNAME target reachable from it through CNAME records in the same answer
@@ -107,6 +131,19 @@ loaded gate cannot promise: as a test in `src/` it failed 10 runs in 20 under 32
 ⚠ The `live:` tests (UDP, TCP, DoH POST/GET, DoH-JSON, PTR of 8.8.8.8, lookupIp) **query
 public resolvers when the network is up** — they skip via `error.SkipZigTest` only when it is not.
 A gate run on a connected machine is therefore not offline.
+
+**Dynamic update + TSIG (2026-10-16).** `src/tsig_vectors.zig` pins messages dnspython 2.8.0
+signed (all five algorithms, a request and its chained response) and an UPDATE with every
+operation, rendered uncompressed (`tools/tsig_oracle.py` regenerates them): `sign` and
+`Builder` must be byte-identical, `verify` must accept them; every single-bit flip of a signed
+message is rejected except the two the RFC makes invisible (header id, case inside the TSIG
+names); truncations, key/algorithm/time/truncated-MAC/chaining and peer-error replies are
+tested; `DNS_FUZZ` gained a `tsig-verify` harness over damaged signed messages. Live:
+`tools/update_server.py check` runs a dnspython RFC 2136 server, feeds it BIND's `nsupdate` as
+a control, then `zig build interop-dns -- --update-server PORT` (37 checks: each algorithm,
+each prerequisite outcome, two values at one name, delete one, NOTZONE/NOTAUTH/REFUSED,
+wrong secret/unknown key/wrong algorithm, a > 512-byte update over TCP) and reads the result
+back with BIND's `dig`.
 
 **Audit 2026-10-04 (mutation).** 54 schemata mutants over the wire codec (name length and
 label caps, pointer direction and jump budget, section-count pre-checks, RDLENGTH/RDATA

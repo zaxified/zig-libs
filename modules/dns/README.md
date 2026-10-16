@@ -1,7 +1,8 @@
 # dns
 
 DNS resolver: RFC 1035 message codec + UDP/TCP/DoH transports, forward
-(A/AAAA) and reverse (PTR) lookups.
+(A/AAAA) and reverse (PTR) lookups, and the client side of RFC 2136 dynamic
+update under RFC 8945 TSIG (what `nsupdate` does).
 
 - The /etc/hosts + UDP-PTR core, the general codec, TCP, EDNS(0) and DoH fill a
   real std gap (`std.Io.net.HostName.lookup` is forward-only and opaque — no
@@ -27,6 +28,8 @@ derivation was a bookkeeping error.
 | `src/message.zig` | Pure wire codec: encode query / decode response — header, question, RR sections, **name-compression pointers** (strictly-backwards rule + jump budget: loops impossible), A/AAAA/PTR/CNAME/NS/MX/TXT/SOA/SRV/CAA, EDNS(0) OPT. No I/O; golden-byte tested; fuzzed. |
 | `src/config.zig` | `/etc/resolv.conf` + `/etc/hosts` parsing, Go-`nameList` search expansion. Pure string logic, checked against glibc's own behaviour on the same files (`tools/config_oracle.py`). |
 | `src/Resolver.zig` | Blocking client: UDP (TC bit → TCP retry), TCP (2-byte length prefix), DoH POST/GET (`application/dns-message`), DoH-JSON (`application/dns-json`). |
+| `src/update.zig` | RFC 2136 UPDATE: `Builder` (every prerequisite and update form of §2.4/§2.5, uncompressed, sections in order) + `send` (fresh id, optional TSIG, signed reply required). |
+| `src/tsig.zig` | RFC 8945 TSIG: `sign` / `verify` with HMAC-SHA1/224/256/384/512, request→response MAC chaining, BIND-style peer errors; secret handled under a dead-stack burn. |
 | `src/root.zig` | Vocabulary re-exports + netaddr bridges (`reverseName`, `recordIp`). |
 | `src/testdata/reply_*.bin` | Three replies captured off a real loopback socket by `tools/interop.zig`: one lying about the question, one with no question section, one honest. Replayed hermetically by `Resolver.zig`. |
 | `tools/interop.zig` | The live half of that anchor: a hostile UDP server on 127.0.0.1 answering a real `query()` from a real second thread. `zig build interop-dns` (no peer, no network); `-- --capture` re-takes the frames. Never compiled into `test-dns`. |
@@ -68,6 +71,18 @@ var buf: [dns.max_query_len]u8 = undefined;
 const packet = try dns.encodeQuery(&buf, "example.com", .a, .{ .id = 1 });
 var decoded = try dns.decode(gpa, response_bytes);
 defer decoded.deinit();
+
+// RFC 2136 dynamic update, TSIG-signed (BIND: `key "acme." { algorithm
+// hmac-sha256; secret "..."; };`) -- e.g. publishing an ACME DNS-01 record:
+const key: dns.tsig.Key = .{ .name = "acme.", .secret = decoded_secret };
+var ubuf: [1024]u8 = undefined;
+var b = try dns.update.Builder.init(&ubuf, "example.org");
+var rd: [256]u8 = undefined;
+try b.add("_acme-challenge.example.org", .txt, 60, try dns.update.txtRdata(&rd, txt_value));
+var primary = dns.Resolver.init(io, gpa, .{});
+defer primary.deinit();
+const rcode = try dns.update.send(&primary, primary_ip, &b, .{ .key = &key });
+if (rcode != .no_error) return error.UpdateRefused;
 ```
 
 ## Behavior notes

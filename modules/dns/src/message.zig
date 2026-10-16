@@ -50,6 +50,10 @@ pub const Type = enum(u16) {
     aaaa = 28,
     srv = 33,
     opt = 41,
+    /// Transaction signature pseudo-record (RFC 8945); see `tsig.zig`.
+    tsig = 250,
+    /// QTYPE "*" (RFC 1035 §3.2.3); in an UPDATE, "every type" (RFC 2136).
+    any = 255,
     caa = 257,
     _,
 };
@@ -60,6 +64,8 @@ pub const Class = enum(u16) {
     in = 1,
     ch = 3,
     hs = 4,
+    /// RFC 2136 §2.4/§2.5: "this RRset must not exist" / "delete this RR".
+    none = 254,
     any = 255,
     _,
 };
@@ -68,6 +74,9 @@ pub const Opcode = enum(u4) {
     query = 0,
     iquery = 1,
     status = 2,
+    notify = 4,
+    /// RFC 2136 dynamic update; see `update.zig`.
+    update = 5,
     _,
 };
 

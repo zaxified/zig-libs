@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-16** — **New: RFC 2136 dynamic update + RFC 8945 TSIG (client side).** `dns.update.Builder`
+  (every prerequisite and update form, uncompressed) + `dns.update.send` (fresh id, optional TSIG,
+  signed reply required, rcode returned); `dns.tsig.sign`/`verify` (HMAC-SHA1/224/256/384/512,
+  request→response chaining, peer BADSIG/BADKEY/BADTIME, under a dead-stack burn); new
+  `Resolver.exchange` (send a caller-built message to one server) and `Options.recursion_desired`
+  (query an authoritative server with RD clear). Vocabulary: `Opcode.update`/`.notify`,
+  `Type.tsig`/`.any`, `Class.none`. Byte-identical to dnspython 2.8.0; live against a dnspython
+  RFC 2136 server with `nsupdate`/`dig` as controls (`tools/update_server.py check`). For acme's
+  RFC 2136 DNS-01 publisher.
+
 - **2026-10-09** — tests: deterministic fuzz driver `DNS_FUZZ` over the existing harnesses (decoder on arbitrary bytes, decoder on damaged captures).
 
 - **2026-10-07** — **Fix (behaviour change), `Resolver.query` asks the next server when one fails.**

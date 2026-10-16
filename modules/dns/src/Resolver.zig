@@ -102,6 +102,10 @@ pub const Options = struct {
     use_search: bool = true,
     /// EDNS(0) advertised UDP payload size; null disables the OPT record.
     edns_udp_size: ?u16 = 1232,
+    /// The RD bit on queries. Clear it to ask an AUTHORITATIVE server about
+    /// its own zone (a DNS-01 propagation check, `dig +norec`): an
+    /// authoritative-only server may refuse a recursive query.
+    recursion_desired: bool = true,
     hosts_path: []const u8 = "/etc/hosts",
     resolv_conf_path: []const u8 = "/etc/resolv.conf",
 };
@@ -390,7 +394,7 @@ pub fn query(r: *Resolver, name: []const u8, ty: message.Type) Error!message.Mes
 
     if (r.options.doh_url != null) {
         // RFC 8484 §4.1: use id 0 so DoH caches can be effective.
-        const packet = try encodeChecked(&qbuf, name, ty, 0, r.options.edns_udp_size);
+        const packet = try r.encodeChecked(&qbuf, name, ty, 0);
         const raw = try r.dohExchange(packet);
         defer r.gpa.free(raw);
         return r.decodeResponse(raw, 0, name, ty);
@@ -398,7 +402,7 @@ pub fn query(r: *Resolver, name: []const u8, ty: message.Type) Error!message.Mes
 
     // Validate the name before touching the network (the per-attempt encode
     // below cannot fail differently).
-    _ = try encodeChecked(&qbuf, name, ty, 0, r.options.edns_udp_size);
+    _ = try r.encodeChecked(&qbuf, name, ty, 0);
 
     const servers = try r.serverList();
     const rbuf = try r.gpa.alloc(u8, @max(512, r.options.edns_udp_size orelse 0));
@@ -419,7 +423,7 @@ pub fn query(r: *Resolver, name: []const u8, ty: message.Type) Error!message.Mes
             var id_bytes: [2]u8 = undefined;
             r.io.random(&id_bytes);
             const id = std.mem.readInt(u16, &id_bytes, .big);
-            const packet = try encodeChecked(&qbuf, name, ty, id, r.options.edns_udp_size);
+            const packet = try r.encodeChecked(&qbuf, name, ty, id);
 
             if (r.options.transport == .tcp) {
                 const raw = r.tcpExchange(server, packet) catch |err| switch (err) {
@@ -469,6 +473,50 @@ pub fn query(r: *Resolver, name: []const u8, ty: message.Type) Error!message.Mes
     return last_err orelse error.Timeout;
 }
 
+/// Send a message the caller built — an RFC 2136 UPDATE (`update.send`), a
+/// NOTIFY, a TSIG-signed query — to `server` and return the raw reply
+/// (gpa-owned). UDP, retried over TCP when the reply is truncated; TCP from
+/// the start for `transport = .tcp` or a message over 512 bytes (no EDNS
+/// negotiation is assumed). `Options.port`, `timeout_ms` and `attempts`
+/// apply; `doh_url`, the search list and /etc/hosts do not. The reply must
+/// come from `server`, carry the message's id and have QR set; anything else
+/// about it — question echo, rcode, a TSIG — is the caller's to check. A
+/// `packet` shorter than a DNS header is refused with `MalformedResponse`
+/// before anything is sent.
+pub fn exchange(r: *Resolver, server: netaddr.Ip, packet: []const u8) Error![]u8 {
+    if (packet.len < message.header_len) return error.MalformedResponse;
+    const id = std.mem.readInt(u16, packet[0..2], .big);
+    const tcp_only = r.options.transport == .tcp or packet.len > 512;
+    var no_rbuf: [0]u8 = .{};
+    const rbuf: []u8 = if (tcp_only) &no_rbuf else try r.gpa.alloc(u8, 4096);
+    defer r.gpa.free(rbuf);
+
+    var last_err: Error = error.Timeout;
+    var attempt: u8 = 0;
+    while (attempt < @max(1, r.effectiveAttempts())) : (attempt += 1) {
+        const raw = r.exchangeOnce(server, packet, id, tcp_only, rbuf) catch |err| switch (err) {
+            error.Canceled, error.OutOfMemory, error.MalformedResponse => |e| return e,
+            else => {
+                last_err = err;
+                continue;
+            },
+        };
+        return raw;
+    }
+    return last_err;
+}
+
+fn exchangeOnce(r: *Resolver, server: netaddr.Ip, packet: []const u8, id: u16, tcp_only: bool, rbuf: []u8) Error![]u8 {
+    const raw = if (tcp_only) try r.tcpExchange(server, packet) else udp: {
+        const udp = try r.udpExchange(server, packet, id, rbuf);
+        if (udp.truncated or (udp.data.len >= 3 and udp.data[2] & 0x02 != 0)) break :udp try r.tcpExchange(server, packet);
+        break :udp try r.gpa.dupe(u8, udp.data);
+    };
+    errdefer r.gpa.free(raw);
+    if (raw.len < message.header_len or raw[2] & 0x80 == 0 or std.mem.readInt(u16, raw[0..2], .big) != id) return error.MalformedResponse;
+    return raw;
+}
+
 /// Does `rcode` say the server failed, rather than answer? Then the next
 /// server is asked. Observed of glibc 2.43 (`testdata/config_oracle.zig`
 /// `rcodes`): SERVFAIL, NOTIMP and REFUSED send it on through every server
@@ -492,8 +540,12 @@ fn settle(failed: *?message.Message, msg: message.Message) ?message.Message {
     return null;
 }
 
-fn encodeChecked(buf: []u8, name: []const u8, ty: message.Type, id: u16, edns: ?u16) Error![]u8 {
-    return message.encodeQuery(buf, name, ty, .{ .id = id, .edns_udp_size = edns }) catch |err| switch (err) {
+fn encodeChecked(r: *const Resolver, buf: []u8, name: []const u8, ty: message.Type, id: u16) Error![]u8 {
+    return message.encodeQuery(buf, name, ty, .{
+        .id = id,
+        .edns_udp_size = r.options.edns_udp_size,
+        .recursion_desired = r.options.recursion_desired,
+    }) catch |err| switch (err) {
         error.BufferTooSmall => unreachable, // max_query_len always fits
         error.NameTooLong => error.NameTooLong,
         error.BadName => error.BadName,

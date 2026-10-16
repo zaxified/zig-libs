@@ -20,6 +20,8 @@ modules/chachapoly/src/root.zig	1	1
 modules/cookies/src/secure.zig	1	0
 modules/ctap2pin/src/root.zig	3	7
 modules/dkg/src/core.zig	2	0
+# dns 2026-10-16: tsig.verify compares the received MAC with the computed one (zero-padded to 64 bytes).
+modules/dns/src/tsig.zig	1	0
 modules/dnssec/src/ds.zig	1	0
 modules/dtls/src/Connection.zig	4	8
 modules/dtls/src/certverify.zig	1	1

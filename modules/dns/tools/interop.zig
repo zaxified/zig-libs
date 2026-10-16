@@ -264,6 +264,9 @@ const usage =
     \\  zig build interop-dns -- --case NAME    run one case (repeatable)
     \\  zig build interop-dns -- --list         list the case names
     \\  zig build interop-dns -- --repo-root P  read/write the frames under P
+    \\  zig build interop-dns -- --update-server PORT
+    \\                                          RFC 2136 + TSIG against a live server
+    \\                                          (run by tools/update_server.py check)
     \\
     \\Needs no peer and no network: the server is this program, on 127.0.0.1.
     \\The hermetic half — replaying the frames it commits — is `zig build test-dns`.
@@ -306,6 +309,16 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
             if (selected_len == selected.len) return 2;
             selected[selected_len] = name;
             selected_len += 1;
+        } else if (std.mem.eql(u8, arg, "--update-server")) {
+            const text = args.next() orelse {
+                std.debug.print("--update-server needs a port\n{s}", .{usage});
+                return 2;
+            };
+            const port = std.fmt.parseInt(u16, text, 10) catch {
+                std.debug.print("bad port \"{s}\"\n", .{text});
+                return 2;
+            };
+            return @import("update_interop.zig").run(io, gpa, port);
         } else if (std.mem.eql(u8, arg, "--repo-root")) {
             repo_root = args.next() orelse {
                 std.debug.print("--repo-root needs a path\n{s}", .{usage});
