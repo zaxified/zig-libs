@@ -66,6 +66,42 @@ pub const GeneralNameIterator = struct {
     }
 };
 
+/// `id-at-commonName` (2.5.4.3), OID content octets, for `nameAttribute`.
+pub const oid_common_name = [_]u8{ 0x55, 0x04, 0x03 };
+
+pub const NameAttributeError = der.Element.ParseError || error{CertificateFieldHasWrongDataType};
+
+/// The first value of attribute `oid` (OID content octets) in a `Name`, as
+/// the content octets of its string, or null. `name` is RDNSequence content
+/// (no outer SEQUENCE header), as `chain.certSerialAndIssuer` returns the
+/// issuer. Every element is bounded by its parent, so any input errors
+/// rather than reads out of bounds.
+pub fn nameAttribute(name: []const u8, oid: []const u8) NameAttributeError!?[]const u8 {
+    if (name.len > std.math.maxInt(u32)) return error.CertificateFieldHasInvalidLength;
+    // RDNSequence ::= SEQUENCE OF RelativeDistinguishedName ::= SET OF
+    // AttributeTypeAndValue ::= SEQUENCE { type OID, value ANY }.
+    var rdn_at: u32 = 0;
+    while (rdn_at < name.len) {
+        const rdn = try extensions.parseElement(name, rdn_at);
+        if (@as(u8, @bitCast(rdn.identifier)) != 0x31) return error.CertificateFieldHasWrongDataType;
+        rdn_at = rdn.slice.end;
+        var atv_at = rdn.slice.start;
+        while (atv_at < rdn.slice.end) {
+            const atv = try extensions.parseElement(name, atv_at);
+            if (@as(u8, @bitCast(atv.identifier)) != 0x30) return error.CertificateFieldHasWrongDataType;
+            if (atv.slice.end > rdn.slice.end) return error.CertificateFieldHasInvalidLength;
+            atv_at = atv.slice.end;
+            const type_elem = try extensions.parseElement(name, atv.slice.start);
+            if (@as(u8, @bitCast(type_elem.identifier)) != 0x06) return error.CertificateFieldHasWrongDataType;
+            if (type_elem.slice.end >= atv.slice.end) return error.CertificateFieldHasInvalidLength;
+            const value = try extensions.parseElement(name, type_elem.slice.end);
+            if (value.slice.end != atv.slice.end) return error.CertificateFieldHasInvalidLength;
+            if (std.mem.eql(u8, name[type_elem.slice.start..type_elem.slice.end], oid)) return name[value.slice.start..value.slice.end];
+        }
+    }
+    return null;
+}
+
 pub const Match = enum { inside, outside, unsupported };
 
 fn fromBool(b: bool) Match {

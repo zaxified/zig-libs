@@ -3,9 +3,9 @@
 //! Minimal X.509/PKCS building blocks for ACME: a small DER encoder, the
 //! PKCS#10 certification request (RFC 2986) with a subjectAltName extension
 //! request — the one ASN.1 structure an ACME client must *produce* — plus
-//! PEM encode/decode, RFC 5915 EC private-key serialization and certificate
-//! `notAfter` extraction (via `std.crypto.Certificate`, an independent
-//! parser from the encoder here).
+//! PEM encode/decode and RFC 5915 EC private-key serialization. Reading a
+//! CA-supplied certificate (`notAfter`, the ARI CertID, the issuer CN) is the
+//! `x509` module's — an independent parser from the encoder here.
 //!
 //! Scope is deliberately tiny: P-256, P-384 and P-521 keys (ES256 / ES384 /
 //! ES512 signatures) and RSA 2048..4096 keys (RS256: sha256WithRSAEncryption;
@@ -22,6 +22,9 @@ const b64ct = @import("b64ct.zig");
 const Allocator = std.mem.Allocator;
 const burn = @import("burn.zig");
 const rsa = @import("rsa");
+/// The `x509` module (named apart from this file, which `root.zig` exports
+/// as `acme.x509`): every READ of a CA-supplied certificate goes through it.
+const pkix = @import("x509");
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
 /// Test-only: the corpus format `Smith.slice` actually reads. A corpus entry is
@@ -110,7 +113,6 @@ const oid_p521 = "\x2b\x81\x04\x00\x23"; // 1.3.132.0.35 (secp521r1)
 const oid_ecdsa_sha512 = "\x2a\x86\x48\xce\x3d\x04\x03\x04"; // 1.2.840.10045.4.3.4
 const oid_rsa_encryption = "\x2a\x86\x48\x86\xf7\x0d\x01\x01\x01"; // 1.2.840.113549.1.1.1
 const oid_sha256_with_rsa = "\x2a\x86\x48\x86\xf7\x0d\x01\x01\x0b"; // 1.2.840.113549.1.1.11
-const oid_authority_key_identifier = "\x55\x1d\x23"; // 2.5.29.35
 
 /// The named-curve OID of an EC algorithm. An RSA key has none (`unreachable`:
 /// every caller is already on the EC side of an `alg == .rs256` branch).
@@ -580,29 +582,6 @@ fn expectElem(bytes: []const u8, index: usize, tag: u8) ReadError!Elem {
     const e = try readElem(bytes, index);
     if (e.tag != tag) return error.Malformed;
     return e;
-}
-
-/// Structural well-formedness scan: every element reachable through
-/// constructed elements stays in bounds and tiles its parent. Run before
-/// handing untrusted DER to `std.crypto.Certificate` (whose element parser
-/// assumes well-formed lengths).
-fn derWellFormed(bytes: []const u8) bool {
-    return wellFormedRange(bytes, 0, bytes.len, 0) catch false;
-}
-
-fn wellFormedRange(bytes: []const u8, at: usize, end: usize, depth: u8) ReadError!bool {
-    if (depth > 32) return error.Malformed;
-    var index = at;
-    while (index < end) {
-        const e = try readElem(bytes, index);
-        if (e.end > end) return error.Malformed;
-        const constructed = (e.tag & 0x20) != 0;
-        if (constructed) {
-            if (!try wellFormedRange(bytes, e.start, e.end, depth + 1)) return false;
-        }
-        index = e.end;
-    }
-    return index == end;
 }
 
 /// One GeneralName for `name`: iPAddress for an IP literal, else dNSName.
@@ -1231,22 +1210,18 @@ fn fillPair(comptime E: type, out: anytype, raw: []const u8) error{MalformedKey}
     E.KeyPair.fromSecretKeyInto(dst, &sk) catch return error.MalformedKey;
 }
 
-// ── certificate notAfter ────────────────────────────────────────────────────
+// ── certificate readers (the `x509` module) ────────────────────────────────
 
 pub const CertError = error{ OutOfMemory, MissingPemBlock, InvalidPem, MalformedCertificate, LabelTooLong };
 
-/// `notAfter` (epoch seconds, UTC) of the FIRST certificate in a PEM chain.
-/// Parsing is `std.crypto.Certificate` (independent of this file's encoder),
-/// behind a bounds-checked structural pre-scan so malformed input errors
-/// instead of tripping safety checks.
+/// `notAfter` (epoch seconds, UTC) of the FIRST certificate in a PEM chain,
+/// read by the `x509` module's bounded walk (an independent parser from the
+/// encoder here; CA-supplied DER errors instead of tripping safety checks).
 pub fn certNotAfter(gpa: Allocator, cert_pem: []const u8) CertError!u64 {
     const der_bytes = try pemDecode(gpa, "CERTIFICATE", cert_pem);
     defer gpa.free(der_bytes);
-    if (der_bytes.len > std.math.maxInt(u32)) return error.MalformedCertificate;
-    if (!derWellFormed(der_bytes)) return error.MalformedCertificate;
-    const cert: std.crypto.Certificate = .{ .buffer = der_bytes, .index = 0 };
-    const parsed = cert.parse() catch return error.MalformedCertificate;
-    return parsed.validity.not_after;
+    const validity = pkix.chain.certValidity(der_bytes) catch return error.MalformedCertificate;
+    return validity.not_after;
 }
 
 // ── ARI CertID (RFC 9773 §4.1) ──────────────────────────────────────────────
@@ -1260,12 +1235,14 @@ pub const AriCertIdError = error{ OutOfMemory, MalformedCertificate, NoAuthority
 /// authorityKeyIdentifier extension with a keyIdentifier, as every publicly
 /// trusted one has. Caller owns the result.
 pub fn ariCertId(gpa: Allocator, cert_der: []const u8) AriCertIdError![]u8 {
-    const parts = ariParts(cert_der) catch return error.MalformedCertificate;
-    const key_id = parts.key_id orelse return error.NoAuthorityKeyIdentifier;
-    const out = try gpa.alloc(u8, jws.base64UrlLen(key_id.len) + 1 + jws.base64UrlLen(parts.serial.len));
+    const serial = (pkix.chain.certSerialAndIssuer(cert_der) catch return error.MalformedCertificate).serial;
+    if (serial.len == 0) return error.MalformedCertificate;
+    const key_id = (pkix.chain.certAuthorityKeyId(cert_der) catch return error.MalformedCertificate) orelse
+        return error.NoAuthorityKeyIdentifier;
+    const out = try gpa.alloc(u8, jws.base64UrlLen(key_id.len) + 1 + jws.base64UrlLen(serial.len));
     const n = jws.base64UrlEncode(out, key_id).len;
     out[n] = '.';
-    _ = jws.base64UrlEncode(out[n + 1 ..], parts.serial);
+    _ = jws.base64UrlEncode(out[n + 1 ..], serial);
     return out;
 }
 
@@ -1277,80 +1254,11 @@ pub fn ariCertIdFromPem(gpa: Allocator, cert_pem: []const u8) (AriCertIdError ||
 }
 
 /// The first commonName (2.5.4.3) value in a certificate's issuer Name, or
-/// null (no CN, or the DER does not walk). Bounded reader over CA-supplied
-/// bytes — std's `der.Element.parse` indexes without bounds checks. Used by
-/// `Client` to pick an alternate chain by its topmost issuer.
+/// null (no CN, or the DER does not walk). Used by `Client` to pick an
+/// alternate chain by its topmost issuer.
 pub fn issuerCommonName(cert_der: []const u8) ?[]const u8 {
-    return issuerCn(cert_der) catch null;
-}
-
-fn issuerCn(der_bytes: []const u8) ReadError!?[]const u8 {
-    const cert = try expectElem(der_bytes, 0, 0x30);
-    const tbs = try expectElem(der_bytes, cert.start, 0x30);
-    var e = try readElem(der_bytes, tbs.start);
-    if (e.tag == 0xa0) e = try readElem(der_bytes, e.end); // [0] version
-    if (e.tag != 0x02) return error.Malformed; // serialNumber
-    const sig_alg = try expectElem(der_bytes, e.end, 0x30);
-    const issuer = try expectElem(der_bytes, sig_alg.end, 0x30);
-    // Name ::= SEQUENCE OF SET OF AttributeTypeAndValue { OID, value }.
-    var rdn_at = issuer.start;
-    while (rdn_at < issuer.end) {
-        const rdn = try expectElem(der_bytes, rdn_at, 0x31);
-        if (rdn.end > issuer.end) return error.Malformed;
-        rdn_at = rdn.end;
-        var atv_at = rdn.start;
-        while (atv_at < rdn.end) {
-            const atv = try expectElem(der_bytes, atv_at, 0x30);
-            if (atv.end > rdn.end) return error.Malformed;
-            atv_at = atv.end;
-            const oid = try expectElem(der_bytes, atv.start, 0x06);
-            const value = try readElem(der_bytes, oid.end);
-            if (value.end > atv.end) return error.Malformed;
-            if (std.mem.eql(u8, oid.content(der_bytes), "\x55\x04\x03")) return value.content(der_bytes);
-        }
-    }
-    return null;
-}
-
-const AriParts = struct { serial: []const u8, key_id: ?[]const u8 };
-
-fn ariParts(der_bytes: []const u8) ReadError!AriParts {
-    const cert = try expectElem(der_bytes, 0, 0x30);
-    const tbs = try expectElem(der_bytes, cert.start, 0x30);
-    var e = try readElem(der_bytes, tbs.start);
-    if (e.tag == 0xa0) e = try readElem(der_bytes, e.end); // [0] version
-    if (e.tag != 0x02) return error.Malformed;
-    const serial = e.content(der_bytes);
-    if (serial.len == 0) return error.Malformed;
-    // signature, issuer, validity, subject, subjectPublicKeyInfo
-    var at = e.end;
-    for (0..5) |_| at = (try expectElem(der_bytes, at, 0x30)).end;
-
-    var key_id: ?[]const u8 = null;
-    while (at < tbs.end) {
-        const next = try readElem(der_bytes, at);
-        at = next.end;
-        if (next.tag != 0xa3) continue; // skip issuer/subject unique IDs
-        const exts = try expectElem(der_bytes, next.start, 0x30);
-        var ext_at = exts.start;
-        while (ext_at < exts.end) {
-            const ext = try expectElem(der_bytes, ext_at, 0x30);
-            ext_at = ext.end;
-            const oid = try expectElem(der_bytes, ext.start, 0x06);
-            if (!std.mem.eql(u8, oid.content(der_bytes), oid_authority_key_identifier)) continue;
-            var v = try readElem(der_bytes, oid.end);
-            if (v.tag == 0x01) v = try readElem(der_bytes, v.end); // critical BOOLEAN
-            if (v.tag != 0x04) return error.Malformed;
-            const aki = try expectElem(der_bytes, v.start, 0x30);
-            var aki_at = aki.start;
-            while (aki_at < aki.end) {
-                const f = try readElem(der_bytes, aki_at);
-                aki_at = f.end;
-                if (f.tag == 0x80) key_id = f.content(der_bytes); // [0] keyIdentifier
-            }
-        }
-    }
-    return .{ .serial = serial, .key_id = key_id };
+    const issuer = (pkix.chain.certSerialAndIssuer(cert_der) catch return null).issuer;
+    return pkix.names.nameAttribute(issuer, &pkix.names.oid_common_name) catch null;
 }
 
 // ── tests ───────────────────────────────────────────────────────────────────
@@ -2052,19 +1960,6 @@ test "readElem: indefinite length and a truncated long-form length are malformed
     try testing.expectError(error.Malformed, readElem("\x04\x82\x01", 0));
 }
 
-test "derWellFormed: nesting past the depth bound is refused, not recursed into" {
-    // `wellFormedRange` stops at depth 32 so attacker-controlled DER cannot
-    // drive unbounded recursion; 40 nested SEQUENCEs are well-formed TLVs and
-    // must still be refused.
-    var buf: [80]u8 = undefined;
-    for (0..40) |i| {
-        buf[2 * i] = 0x30;
-        buf[2 * i + 1] = @intCast(2 * (39 - i));
-    }
-    try testing.expect(!derWellFormed(&buf));
-    try testing.expect(derWellFormed(buf[2 * 20 ..])); // 20 levels: fine
-}
-
 test "parseCsr: trailing bytes, a foreign version or algorithm, and a nonzero unused-bits octet are refused by name" {
     // `parseCsr` checks version 0 and the P-256/ES256 algorithms (RFC 2986
     // §4.1, RFC 5480, RFC 5758 §3.2) before the signature and reports them
@@ -2276,7 +2171,7 @@ test "ES384 TLS-ALPN-01 validation certificate: independent parser reads it, car
     const id: [32]u8 = @splat(0x5a);
     const cert_der = try tlsAlpnCertDer(testing.allocator, kp, "example.org", id, "\x01\x02", tls_alpn_not_before, tls_alpn_not_after);
     defer testing.allocator.free(cert_der);
-    try testing.expect(derWellFormed(cert_der));
+    try pkix.safe.validateForStdParse(cert_der);
     const cert: std.crypto.Certificate = .{ .buffer = cert_der, .index = 0 };
     const parsed = try cert.parse();
     try testing.expectEqual(std.crypto.Certificate.NamedCurve.secp384r1, parsed.pub_key_algo.X9_62_id_ecPublicKey);
@@ -2460,7 +2355,7 @@ test "ES512 TLS-ALPN-01 validation certificate: independent parser reads it, car
     const id: [32]u8 = @splat(0x5a);
     const cert_der = try tlsAlpnCertDer(testing.allocator, kp, "example.org", id, "\x01\x02", tls_alpn_not_before, tls_alpn_not_after);
     defer testing.allocator.free(cert_der);
-    try testing.expect(derWellFormed(cert_der));
+    try pkix.safe.validateForStdParse(cert_der);
     const cert: std.crypto.Certificate = .{ .buffer = cert_der, .index = 0 };
     const parsed = try cert.parse();
     try testing.expectEqual(std.crypto.Certificate.NamedCurve.secp521r1, parsed.pub_key_algo.X9_62_id_ecPublicKey);
@@ -2558,9 +2453,8 @@ test "ariCertId: the RFC 9773 §4.1 example (AKI 69885B6B…C8D4, serial 0087654
     // The serial's leading 0x00 is content, not padding: the base64 starts "AI".
     const der_bytes = try pemDecode(testing.allocator, "CERTIFICATE", pem);
     defer testing.allocator.free(der_bytes);
-    const parts = try ariParts(der_bytes);
-    try testing.expectEqualSlices(u8, "\x00\x87\x65\x43\x21", parts.serial);
-    try testing.expectEqual(@as(usize, 20), parts.key_id.?.len);
+    try testing.expectEqualSlices(u8, "\x00\x87\x65\x43\x21", (try pkix.chain.certSerialAndIssuer(der_bytes)).serial);
+    try testing.expectEqual(@as(usize, 20), (try pkix.chain.certAuthorityKeyId(der_bytes)).?.len);
 
     // Junk and a truncated certificate: a typed error, not a panic.
     try testing.expectError(error.MalformedCertificate, ariCertId(testing.allocator, "junk"));

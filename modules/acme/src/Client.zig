@@ -34,6 +34,7 @@ const http = @import("http");
 const router = @import("router");
 const jws = @import("jws.zig");
 const x509 = @import("x509.zig");
+const pkix = @import("x509"); // the x509 module: reads CA-supplied certificates
 const rsa = @import("rsa");
 const netaddr = @import("netaddr");
 
@@ -3295,7 +3296,7 @@ fn mcRevoke(ctx: *router.Ctx) anyerror!void {
     if (!std.mem.eql(u8, cert, m.revoke_expect)) m.fail("revoked certificate is not the expected one");
     if (mode == .jwk) {
         // A certificate-key revocation must be signed by the certificate's own key.
-        const parsed = (std.crypto.Certificate{ .buffer = cert, .index = 0 }).parse() catch {
+        const spki = pkix.spkiOf(cert) catch {
             m.fail("certificate does not parse");
             return mcRejected(ctx);
         };
@@ -3305,7 +3306,7 @@ fn mcRevoke(ctx: *router.Ctx) anyerror!void {
         }
         var sec1_buf: [jws.AnyPublicKey.max_sec1_len]u8 = undefined;
         const signer = v.jwk_key.?.uncompressedSec1(&sec1_buf);
-        if (!std.mem.eql(u8, parsed.pubKey(), signer)) m.fail("signer key is not the certificate key");
+        if (!std.mem.eql(u8, spki.key_bits, signer)) m.fail("signer key is not the certificate key");
     }
     lockSpin(&m.lock);
     m.revoked_by = if (mode == .kid) .account else .cert_key;

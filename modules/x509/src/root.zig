@@ -233,6 +233,7 @@ test {
     _ = @import("crl_test.zig");
     _ = @import("chain_crl_test.zig");
     _ = @import("p521_test.zig");
+    _ = @import("readers_test.zig");
     _ = @import("s2_oracle_test.zig");
     _ = @import("names_fuzz_test.zig");
     _ = @import("policy_fuzz_test.zig");

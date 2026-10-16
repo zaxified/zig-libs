@@ -1091,6 +1091,19 @@ pub fn certSerialAndIssuer(cert_der: CertDer) Certificate.ParseError!struct { se
     return .{ .serial = shape.serial, .issuer = shape.issuer };
 }
 
+/// The certificate's validity window (epoch seconds, UTC), read with the
+/// same bounded walk — for renewal timing on a certificate a CA just sent.
+pub fn certValidity(cert_der: CertDer) Certificate.ParseError!struct { not_before: u64, not_after: u64 } {
+    const shape = try parseShape(.{ .buffer = cert_der, .index = 0 });
+    return .{ .not_before = shape.not_before, .not_after = shape.not_after };
+}
+
+/// The `keyIdentifier` of the certificate's authorityKeyIdentifier, or null
+/// when the extension or that field is absent (ACME ARI's CertID, RFC 9773).
+pub fn certAuthorityKeyId(cert_der: CertDer) VerifyChainError!?[]const u8 {
+    return findAki(cert_der);
+}
+
 /// The raw extnValue of the certificate's extension `id`, or null.
 pub fn certExtensionValue(cert_der: CertDer, id: Certificate.ExtensionId) VerifyChainError!?[]const u8 {
     return findExtensionValue(cert_der, id);
