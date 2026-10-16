@@ -44,7 +44,9 @@ pub const StreamOptions = struct {
     /// is sized for that rather than for the window (a short response costs
     /// a small table). With the input's exact length, the stream without a
     /// flush is `compressWith`'s bytes for any input length. More input than
-    /// hinted is fine, only searched with a smaller table.
+    /// hinted is fine, only searched with a smaller table. From 1 MiB hinted,
+    /// `.q6`/`.q9` may model literals with thirteen contexts, as
+    /// `compressWith` does for such an input (none without a hint).
     size_hint: ?usize = null,
     /// A raw prefix dictionary (as `CompressOptions.dictionary`), copied at
     /// `init`/`reset` (the caller's bytes are not kept). It stays searchable
@@ -111,6 +113,7 @@ pub const StreamWriter = struct {
         sw.done = d.len;
         sw.core.setData(sw.hist.items);
         sw.core.loadDictionary(d.len);
+        sw.core.size_hint = sw.opts.size_hint orelse 0;
         sw.dict_len = d.len;
         try sw.core.writeHeader();
     }

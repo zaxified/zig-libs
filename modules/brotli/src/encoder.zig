@@ -3877,7 +3877,7 @@ fn writeCompressedBlock(
         // check in `compressWith`).
         const split_lits = !single_literal_code;
         const sc: greedy_split.StaticContexts = if (split_lits)
-            greedy_split.chooseStaticContexts(input[start..end], effort.quality())
+            greedy_split.chooseStaticContexts(input[start..end], effort.quality(), env.size_hint)
         else
             .{ .n = 1, .map = &greedy_split.map_single };
         var n_lits: usize = 0;
@@ -4193,10 +4193,18 @@ fn writeCompressedBlock(
         // NBLTYPES = 1, one context mode, a one-code map.
         try scratch.writeBits(0, 3);
         try writeContextMap(gpa, &scratch, &.{}, 1);
+        // A block without literals still needs its one code (a one-symbol
+        // simple code, `padded` for the others): without it the whole block
+        // was refused and stored (found 2026-10-16, a 16 KiB tail of a
+        // 17 MiB input, 19 → 16 387 bytes, once thirteen contexts were on).
+        const no_lits = std.mem.allEqual(u32, &single_counts, 0);
+        if (no_lits) single_counts[0] = 1;
         var single_code = try buildAndWriteCodeRle(gpa, &scratch, &single_counts, tables.num_literal_symbols, tables.num_literal_symbols);
         defer single_code.deinit(gpa);
         var single_part = scratch.bitPos();
-        for (single_counts, single_code.len) |c, l| single_part += @as(usize, c) * l;
+        if (!no_lits) {
+            for (single_counts, single_code.len) |c, l| single_part += @as(usize, c) * l;
+        }
         single_no_worse = single_part <= lit_part;
     }
     const cmd_codes = try gpa.alloc(Code, it);
@@ -5226,6 +5234,8 @@ const BlockEnv = struct {
     max_backward: usize = (1 << max_window_bits) - 16,
     /// NPOSTFIX/NDIRECT (never with a large window).
     dist: DistParams = .{},
+    /// `Core.size_hint`.
+    size_hint: usize = 0,
 };
 
 /// The bytes the dictionary word of command `c` stands for, made as the
@@ -5442,11 +5452,15 @@ pub const Effort = enum(u4) {
     /// page of `.q6`'s 2 MiB, most of its time (R16). The fuller buckets of
     /// a smaller table are what every input past the cap has anyway; sizes
     /// moved by ±0.3 % on 4–64 KiB slices of text, HTML, JSON and a font.
+    /// `.q9`'s cap is 2^22 slots, 16 MiB (google q9: 2^15 buckets of 256,
+    /// 32 MiB): at 2^20 a 1.3–5.8 MB text walked buckets of positions that
+    /// share no more than their hash bits, at 1.2–1.6× google's time and
+    /// 0.3–1.2 % larger (2026-10-16); inputs under 512 KiB are unchanged.
     fn slotsLog(e: Effort, size: usize) u5 {
         const cap: u5, const per_byte: u5 = switch (e) {
             .q0, .q1, .q4 => unreachable, // `FragMatcher`, `FastMatcher`
             .q6 => .{ 19, 2 },
-            .q9 => .{ 20, 3 },
+            .q9 => .{ 22, 3 },
             .q11 => .{ 22, 3 },
         };
         const size_log = std.math.log2_int_ceil(usize, @max(size, 1));
@@ -5498,6 +5512,7 @@ pub fn compressWith(gpa: std.mem.Allocator, input: []const u8, opts: CompressOpt
     const wbits: u5 = opts.window_bits orelse if (input.len > 65520) 21 else 16;
     var core = try Core.init(gpa, opts.effort, opts.block_size, wbits, tableSize(input.len, opts.dictionary.len, wbits));
     defer core.deinit();
+    core.size_hint = input.len;
     const data = try withDictionary(gpa, input, opts.dictionary);
     defer if (data.ptr != input.ptr) gpa.free(data);
     try oneShot(&core, data, opts.dictionary.len, opts.block_size);
@@ -5536,6 +5551,7 @@ pub fn compressInto(gpa: std.mem.Allocator, out: []u8, input: []const u8, opts: 
     defer core.deinit();
     core.w.buf = .initBuffer(out);
     core.w.fixed = true;
+    core.size_hint = input.len;
     const data = try withDictionary(gpa, input, opts.dictionary);
     defer if (data.ptr != input.ptr) gpa.free(data);
     oneShot(&core, data, opts.dictionary.len, opts.block_size) catch |e| return if (core.w.overflowed) error.OutputTooLarge else e;
@@ -5611,6 +5627,11 @@ pub const Core = struct {
     q0: Q0Codes = .default,
     q0_next: Q0Codes = .default,
     q0_histo: [128]u32 = q0_cmd_histo_seed,
+    /// The whole input's length when known (google's `size_hint`): from
+    /// 1 MiB `.q6`/`.q9` may take thirteen literal contexts
+    /// (`greedy_split.chooseStaticContexts`). One-shot: the input; a stream:
+    /// `StreamOptions.size_hint`, else 0.
+    size_hint: usize = 0,
 
     /// `size`: how much input the match finder's tables are sized for.
     pub fn init(gpa: std.mem.Allocator, effort: Effort, block_size: usize, wbits: u5, size: usize) std.mem.Allocator.Error!Core {
@@ -5898,7 +5919,7 @@ pub const Core = struct {
         // start are zeros, as the decoder's (a dictionary is not output).
         const x = c.prefix();
         const out = c.data[x.len..];
-        var env: BlockEnv = .{ .reach = x.len + x.dropped, .large_window = c.wbits > max_window_bits, .dropped = x.dropped, .max_backward = (@as(usize, 1) << c.wbits) - 16 };
+        var env: BlockEnv = .{ .reach = x.len + x.dropped, .large_window = c.wbits > max_window_bits, .dropped = x.dropped, .max_backward = (@as(usize, 1) << c.wbits) - 16, .size_hint = c.size_hint };
         if (c.effort == .q0) {
             var codes = c.q0;
             writeQ0(c.gpa, dst, c.data[off..end], c.matcher.frag.table, env.max_backward, &codes, &c.q0_histo) catch |e| switch (e) {
@@ -6892,4 +6913,44 @@ test "q0: whether the next bytes continue the meta-block (google ShouldMergeBloc
     try testing.expect(q0ShouldMerge(&bytes, &depth));
     depth['a'] = 3;
     try testing.expect(!q0ShouldMerge(&bytes, &depth));
+}
+
+test "a block without literals under several literal contexts is compressed, not stored" {
+    // The second block copies the first whole: no literals. On Cyrillic
+    // text `.q6`/`.q9` model literals with two or three static contexts, and
+    // pricing the one-code alternative over no literals failed the block
+    // (`EncoderInvariant`), which was then stored: 8 KiB of raw bytes.
+    const gpa = testing.allocator;
+    const decoder = @import("decoder.zig");
+    const letters = "абвгдежзийклмнопрстуфхцчшщыэюя";
+    var a: [8192]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(0x0b10c);
+    var k: usize = 0;
+    while (k + 2 <= a.len) {
+        if (prng.random().uintLessThan(u8, 6) == 0) {
+            a[k] = ' ';
+            k += 1;
+        } else {
+            const i = 2 * prng.random().uintLessThan(usize, letters.len / 2);
+            @memcpy(a[k..][0..2], letters[i..][0..2]);
+            k += 2;
+        }
+    }
+    if (k < a.len) a[k] = ' ';
+    try testing.expect(greedy_split.chooseStaticContexts(&a, 9, 0).n >= 2);
+    const input = try gpa.alloc(u8, 2 * a.len);
+    defer gpa.free(input);
+    @memcpy(input[0..a.len], &a);
+    @memcpy(input[a.len..], &a);
+    for ([_]Effort{ .q6, .q9 }) |effort| {
+        const one = try compressWith(gpa, &a, .{ .effort = effort, .block_size = a.len });
+        defer gpa.free(one);
+        const two = try compressWith(gpa, input, .{ .effort = effort, .block_size = a.len });
+        defer gpa.free(two);
+        // The copy block costs a few bytes.
+        try testing.expect(two.len < one.len + 64);
+        const back = try decoder.decompress(gpa, two, .{});
+        defer gpa.free(back);
+        try testing.expectEqualSlices(u8, input, back);
+    }
 }

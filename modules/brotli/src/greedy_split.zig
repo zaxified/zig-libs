@@ -12,16 +12,17 @@
 //! and `c/enc/bit_cost.c` (`BrotliBitsEntropy`) — the reference's model for
 //! qualities 4–9. Changes: block lengths are the real symbol counts (the
 //! reference rounds a short last block up to the minimum, which a decoder
-//! never notices but `BlockCodes` checks); the 13-context map the reference
-//! uses for inputs of 1 MiB and more is not ported (SPEC Backlog R14).
+//! never notices but `BlockCodes` checks). The 13-context map for inputs of
+//! 1 MiB and more (`ShouldUseComplexStaticContextMap`) since 2026-10-16 (R14).
 
 const std = @import("std");
 const block_split = @import("block_split.zig");
+const tables = @import("tables.zig");
 
 /// RFC 7932 §6: at most 256 block types per category.
 pub const max_block_types = 256;
-/// Most literal contexts of a static map here.
-pub const max_contexts = 3;
+/// Most literal contexts of a static map here (`BROTLI_MAX_STATIC_CONTEXTS`).
+pub const max_contexts = 13;
 
 const log2_table: [256]f64 = blk: {
     var t: [256]f64 = undefined;
@@ -102,6 +103,62 @@ const map_simple_utf8: [64]u8 = .{ 0, 0, 1, 1 } ++ .{0} ** 60;
 /// continuation byte (`kStaticContextMapContinuation`).
 const map_continuation: [64]u8 = .{ 1, 1, 2, 2 } ++ .{0} ** 60;
 pub const map_single: [64]u8 = .{0} ** 64;
+/// Thirteen contexts for long inputs (`kStaticContextMapComplexUTF8`): by
+/// the class of the byte before (control, line feed, space, punctuation
+/// groups, digit, letter) and whether the byte before that was one too.
+const map_complex_utf8: [64]u8 = .{
+    11, 11, 12, 12, // 0 special
+    0, 0, 0, 0, // 4 lf
+    1, 1, 9, 9, // 8 space
+    2, 2, 2, 2, // !, first after space/lf and after something else.
+    1, 1, 1, 1, // "
+    8, 3, 3, 3, // %
+    1, 1, 1, 1, // ({[
+    2, 2, 2, 2, // }])
+    8, 4, 4, 4, // :;
+    8, 7, 4, 4, // .
+    8, 0, 0, 0, // >
+    3, 3, 3, 3, // [0..9]
+    5, 5, 10, 5, // [A-Z]
+    5, 5, 10, 5,
+    6, 6, 6, 6, // [a-z]
+    6, 6, 6, 6,
+};
+
+/// The 13-context map when the whole input (`size_hint`) is 1 MiB or more
+/// and it pays (`ShouldUseComplexStaticContextMap`): the entropy of each
+/// byte's top five bits, sampled as 64-byte strides every 4 KiB, under the
+/// map's contexts at most 3 bits and at least 0.2 bits below it without.
+fn complexContexts(data: []const u8, size_hint: usize) ?StaticContexts {
+    if (size_hint < 1 << 20) return null;
+    const lut = tables.context_lookup[2 * 512 ..][0..512]; // UTF8 mode
+    var combined: [32]u32 = @splat(0);
+    var by_ctx: [max_contexts][32]u32 = @splat(@splat(0));
+    var total: u32 = 0;
+    var at: usize = 0;
+    while (at + 64 <= data.len) : (at += 4096) {
+        var p2 = data[at];
+        var p1 = data[at + 1];
+        for (data[at + 2 .. at + 64]) |b| {
+            const ctx = map_complex_utf8[lut[p1] | lut[256 + @as(usize, p2)]];
+            total += 1;
+            combined[b >> 3] += 1;
+            by_ctx[ctx][b >> 3] += 1;
+            p2 = p1;
+            p1 = b;
+        }
+    }
+    if (total == 0) return null;
+    const per = 1.0 / @as(f64, @floatFromInt(total));
+    const flat = estimateEntropy(&combined) * per;
+    var split: f64 = 0;
+    for (&by_ctx) |*h| split += estimateEntropy(h);
+    split *= per;
+    // Tuned by google on the Silesia corpus: off for poorly compressible
+    // input or under 0.2 bits saved a literal.
+    if (split > 3.0 or flat - split < 0.2) return null;
+    return .{ .n = max_contexts, .map = &map_complex_utf8 };
+}
 
 pub const StaticContexts = struct {
     n: u32,
@@ -110,12 +167,14 @@ pub const StaticContexts = struct {
 };
 
 /// The literal contexts for a meta-block over `data` at `quality` (5..9;
-/// `DecideOverLiteralContextModeling` without the 1 MiB branch): the bigram
-/// entropy of the top two bits of each byte, sampled as 64-byte strides
-/// every 4 KiB. Three contexts only from quality 7.
-pub fn chooseStaticContexts(data: []const u8, quality: u4) StaticContexts {
+/// `DecideOverLiteralContextModeling`) of an input of `size_hint` bytes in
+/// all: thirteen for a long one where they pay (`complexContexts`), else
+/// from the bigram entropy of the top two bits of each byte, sampled as
+/// 64-byte strides every 4 KiB. Three contexts only from quality 7.
+pub fn chooseStaticContexts(data: []const u8, quality: u4, size_hint: usize) StaticContexts {
     const one: StaticContexts = .{ .n = 1, .map = &map_single };
     if (quality < 5 or data.len < 64) return one;
+    if (complexContexts(data, size_hint)) |c| return c;
     const lut = [4]u32{ 0, 0, 1, 2 };
     var bigram: [9]u32 = @splat(0);
     var at: usize = 0;
@@ -421,13 +480,13 @@ test "Splitter: a short stream is one block of its real length; none is one empt
 
 test "chooseStaticContexts: ASCII text one context, mixed UTF-8 more, quality 6 never three" {
     const ascii = "the quick brown fox jumps over the lazy dog " ** 200;
-    try testing.expectEqual(@as(u32, 1), chooseStaticContexts(ascii, 9).n);
+    try testing.expectEqual(@as(u32, 1), chooseStaticContexts(ascii, 9, 0).n);
     // Two-byte UTF-8 (Cyrillic): lead and continuation bytes alternate.
     const cyr = "привет мир, как дела? " ** 400;
-    const q9 = chooseStaticContexts(cyr, 9);
+    const q9 = chooseStaticContexts(cyr, 9, 0);
     try testing.expect(q9.n >= 2);
-    try testing.expect(chooseStaticContexts(cyr, 6).n <= 2);
-    try testing.expectEqual(@as(u32, 1), chooseStaticContexts(cyr[0..63], 9).n);
+    try testing.expect(chooseStaticContexts(cyr, 6, 0).n <= 2);
+    try testing.expectEqual(@as(u32, 1), chooseStaticContexts(cyr[0..63], 9, 0).n);
 }
 
 /// 64 KiB of a 64-byte pattern of byte classes (0: ASCII 'a', 1: a UTF-8
@@ -443,18 +502,32 @@ fn classBytes(comptime pattern: []const u8) [1 << 16]u8 {
     return out;
 }
 
+test "chooseStaticContexts: thirteen contexts for a long text, never under 1 MiB or on random bytes" {
+    const alice = @embedFile("testdata/alice29.txt");
+    try testing.expectEqual(@as(u32, 13), chooseStaticContexts(alice, 9, 1 << 20).n);
+    try testing.expectEqual(@as(u32, 13), chooseStaticContexts(alice, 6, 5 << 20).n);
+    try testing.expect(chooseStaticContexts(alice, 9, (1 << 20) - 1).n <= 3);
+    // Poorly compressible: over 3 bits a literal under the contexts.
+    var rnd: [64 * 1024]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(0x13c7);
+    prng.random().bytes(&rnd);
+    try testing.expect(chooseStaticContexts(&rnd, 9, 1 << 20).n <= 3);
+    // Below quality 5 nothing, whatever the length.
+    try testing.expectEqual(@as(u32, 1), chooseStaticContexts(alice, 4, 1 << 20).n);
+}
+
 test "chooseStaticContexts: the thresholds between one, two and three contexts" {
     // (Entropies per literal from the sampled bigrams.) ASCII and lead bytes
     // alternating: two contexts save nothing (e1 - e2 = 0), three save a
     // whole bit — three, not one: one context needs BOTH savings small.
     const alt = comptime classBytes("02" ** 32);
-    try testing.expectEqual(@as(u32, 3), chooseStaticContexts(&alt, 9).n);
+    try testing.expectEqual(@as(u32, 3), chooseStaticContexts(&alt, 9, 0).n);
     // e1 1.436, e2 0.671, e3 0.556 bits: the third context saves 0.115, past
     // the 0.02 that keeps two.
     const near = comptime classBytes("0101010102222102222222222102222210101022222222210101010222222102");
-    try testing.expectEqual(@as(u32, 3), chooseStaticContexts(&near, 9).n);
+    try testing.expectEqual(@as(u32, 3), chooseStaticContexts(&near, 9, 0).n);
     // Below quality 7 three are never taken.
-    try testing.expectEqual(@as(u32, 2), chooseStaticContexts(&near, 6).n);
+    try testing.expectEqual(@as(u32, 2), chooseStaticContexts(&near, 6, 0).n);
 }
 
 test "Splitter: at most max_block_types types, then blocks join old ones" {
