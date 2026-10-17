@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-17** — **Added: build option `ct25519-base-comb`** (CONVENTIONS §4.2; axp request): `false` (or `-Dprofile=small`) runs `mulBase`/`mulRistrettoBase`/`X25519.recoverPublicKey` on the window ladder instead of the fixed-base comb — same results, no 43 KB table (X25519 keygen probe, ReleaseSmall: 57.7 → 17.2 KB), keygen 2.4× slower. Default unchanged (comb). ctgrind under `.small` clean; SPEC § Build options.
 - **2026-10-10** — **Additive API:** `mulMulti(scalars, points)` — constant-time `Σ s_i·P_i`
   on Edwards25519 points (std's `mulMulti` is variable-time), the Straus pass of
   `mulMultiRistretto` made generic over the point type; burned like it. Bit-exact vs the

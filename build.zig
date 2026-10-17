@@ -516,6 +516,11 @@ pub fn build(b: *std.Build) void {
         "rsa-max-modulus-bits",
         "rsa: largest supported modulus, 4096..8192 (default 8192; profile=small 4096)",
     ));
+    zl_options.addOption(?bool, "ct25519_base_comb", b.option(
+        bool,
+        "ct25519-base-comb",
+        "ct25519: fixed-base comb table for mulBase/X25519 keygen (default true; profile=small false, ~3x slower keygen, -43 KB table)",
+    ));
     zl_options_mod = zl_options.createModule();
 
     // Gate for the "a body nothing references is never analysed" class — see

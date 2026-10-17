@@ -1572,6 +1572,11 @@ modes_modflags() {
     return 0
 }
 
+# Extra zig arguments for every harness build -- a consumer build option
+# (CONVENTIONS 4.2) measured once, e.g.
+#     CTGRIND_ZIG_ARGS="-Dprofile=small" scripts/checks/ctgrind.sh ct25519
+# The expected table pins the DEFAULT build; do not combine with --check.
+read -ra CTGRIND_EXTRA <<< "${CTGRIND_ZIG_ARGS:-}"
 mapfile -t BUILD_MODES < <(needed_modes)
 for mode in "${BUILD_MODES[@]}"; do
     modes_modflags "$mode"
@@ -1579,7 +1584,7 @@ for mode in "${BUILD_MODES[@]}"; do
         echo "Building ctgrind harnesses ($mode, -fvalgrind=$vg, ${#MODFLAGS[@]} module(s))..." >&2
         scripts/lib/capped zig build ctgrind \
             "-Doptimize=$mode" "-Dctgrind-valgrind=$vg" "-Dcpu=$CTGRIND_CPU" \
-            "${MODFLAGS[@]}" -p "$WORKDIR/$mode-$vg" >&2
+            "${MODFLAGS[@]}" "${CTGRIND_EXTRA[@]}" -p "$WORKDIR/$mode-$vg" >&2
     done
 done
 

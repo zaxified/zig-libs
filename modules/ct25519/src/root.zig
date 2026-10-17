@@ -325,7 +325,30 @@ fn combMulBase(s: *const [32]u8) Edwards25519 {
 pub fn mulBase(s: [32]u8) Edwards25519 {
     var sc = s;
     defer std.crypto.secureZero(u8, &sc);
-    return combMulBase(&sc);
+    return baseMul(&sc);
+}
+
+/// Whether the fixed-base scalar multiplications (`mulBase`,
+/// `mulRistrettoBase`, `X25519.recoverPublicKey`) use the comb.
+///
+/// **Consumer build option** (CONVENTIONS §4.2; axp request 2026-10-17):
+/// `-Dct25519-base-comb=false`, or `-Dprofile=small`, drops the comb — its
+/// 43 008-byte table and the select/recode code — and runs those on `mul`'s
+/// window ladder over `base_pc` instead: the same results for every 256-bit
+/// `s` (the ladder is what the comb is differentially tested against), the
+/// same constant-time shape, ~3× slower (the comb's audit-C3 speedup). For a
+/// consumer that generates one keypair per enrollment on a device with a few
+/// MB of flash, size wins. The default keeps the comb: the grade is measured
+/// on it.
+pub const base_comb: bool = zl_options.ct25519_base_comb orelse switch (zl_options.profile) {
+    .default => true,
+    .small => false,
+};
+const zl_options = @import("zl_options");
+
+/// `s·B` through the comb or the ladder, per `base_comb`.
+fn baseMul(s: *const [32]u8) Edwards25519 {
+    return if (comptime base_comb) combMulBase(s) else mul(Edwards25519.basePoint, s.*);
 }
 
 /// `s * p` over Ristretto255 — `mul` on the underlying Edwards25519 point.
@@ -460,7 +483,7 @@ pub const X25519 = struct {
         var sc = secret_key.*;
         defer std.crypto.secureZero(u8, &sc);
         Edwards25519.scalar.clamp(&sc);
-        const q = combMulBase(&sc);
+        const q = baseMul(&sc);
         // u = (1 + y) / (1 - y) with y = Y / Z, i.e. (Z + Y) / (Z - Y). No
         // identity branch: unreachable for a clamped scalar (see above).
         out.* = q.z.add(q.y).mul(q.z.sub(q.y).invert()).toBytes();
@@ -1137,7 +1160,7 @@ const fe64 = struct {
 pub fn mulRistrettoBase(s: [32]u8) Ristretto255 {
     var sc = s;
     defer std.crypto.secureZero(u8, &sc);
-    return .{ .p = combMulBase(&sc) };
+    return .{ .p = baseMul(&sc) };
 }
 
 // ── constant-time multi-scalar multiplication (audit `bulletproofs` B9) ───

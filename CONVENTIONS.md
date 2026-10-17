@@ -353,7 +353,7 @@ from, but the field is not limited to that evidence.
 
 ### 4.2 Consumer build options
 
-(2026-10-17, first knob: `rsa-max-modulus-bits`.) A consumer **application** may tune a
+(2026-10-17, knobs so far: `rsa-max-modulus-bits`, `ct25519-base-comb`.) A consumer **application** may tune a
 module for code size at build time:
 
 ```zig
@@ -399,6 +399,8 @@ includes the zig arguments, so a `-Dprofile=small` run keeps stamps of its own);
 dependents of `rsa` are not yet adapted. Candidates for further knobs,
 with measurements and notes, are in each module's SPEC § Backlog (entries titled
 "Build option: …": montint, ssh, tlsclient, x509, ed448, tz, brotli, zstd, p384, p521).
+`scripts/checks/ctgrind.sh` takes `CTGRIND_ZIG_ARGS="-Dprofile=small"` for a one-off constant-time
+run of a non-default build (the expected table pins the default only).
 
 ## 5. Doc ownership — single source of truth
 

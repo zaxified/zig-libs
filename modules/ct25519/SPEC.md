@@ -781,18 +781,30 @@ secret on the MULX/ADX ladder sits at 1.09–1.10× libsodium (2 runs; a noisy t
 1.21–1.22× OpenSSL; the Edwards/Ristretto comb is within 2–6 % of libsodium's table. Worst
 row 1.09× → P2, with a thin margin under the 1.1× tolerance -- a noisy run can read P3.
 
+## Build options
+
+Consumer build options (CONVENTIONS §4.2), added 2026-10-17 at axp's request:
+
+| option | values | default | `-Dprofile=small` |
+|---|---|---|---|
+| `ct25519-base-comb` | `true` / `false` | `true` (graded) | `false` |
+
+- **`false`:** `mulBase`, `mulRistrettoBase` and `X25519.recoverPublicKey` run on `mul`'s window ladder over `base_pc` instead
+  of the fixed-base comb (`baseMul`, src/root.zig). Same result for every 256-bit `s` — the ladder is the reference the comb is
+  differentially tested against.
+- **What it buys:** the 43 008-byte `comb_table` and its select/recode code. A probe doing one X25519 keygen (ReleaseSmall,
+  x86_64-musl, stripped): **57 696 → 17 176 B**.
+- **What it costs:** keygen/sign speed. bench (ReleaseFast, this machine): X25519 public key 22.8 → 55.7 µs (2.4×; std's is
+  ~50 µs), Edwards/ristretto base point 21.5 → 56 µs. DH (`X25519.scalarmult`) unchanged. Under `.small` the bench's `comb_*` rows
+  measure the ladder (the label names the entry point, not the algorithm).
+- **Constant time:** `CTGRIND_ZIG_ARGS="-Dprofile=small" scripts/checks/ctgrind.sh ct25519` (2026-10-17): `comb` and `x25519`
+  rows 0 in-file contexts, controls 0, traps 0. The expected table pins the default build only.
+- **Tested:** `scripts/modtest ct25519 -Dprofile=small` in Debug, ReleaseSafe and ReleaseFast (stackprobe runs in ReleaseFast:
+  the ladder's stack stays within `burn.x25519_base_burn`); `sealedbox -Dprofile=small`.
+
 ## Backlog / deferred
 
-- **Build option: `ct25519-base-comb`** (axp request 2026-10-17; mechanism CONVENTIONS §4.2 — the next knob after rsa, a
-  consumer request with a measurement). `comb_table` (32×8 Edwards25519 points, 43 008 B `.rodata`, src/root.zig:252) plus its
-  select/recode code is linked by every keypair generator (sealedbox → `X25519`). axp-agent, ReleaseSmall stripped: x86_64-musl
-  772 328 → 858 776 B (+11.2 %), mips32 BE soft-float 1 031 872 → 1 160 464 B (+12.5 %); ~59 KB of the +84.5 KB delta is
-  ct25519/sealedbox. The agent does one keygen + one open per enrollment, so the comb buys nothing there.
-  Plan: `.small` (or `-Dct25519-base-comb=false`) → `mulBase(s)` = `mul(basePoint, s)` (the existing constant-time variable-base
-  4-bit window over a 16-entry runtime table): same results (the comb test already compares the two, src/root.zig:1554),
-  slower keygen/sign. Re-run ctgrind for the `.small` build once; bench delta into SPEC § Build options.
-  Not by `builtin.mode == .ReleaseSmall` (axp's alternative): a mode must not silently change what the graded default is;
-  ReleaseSmall consumers set `.profile = .small` explicitly (CONVENTIONS §4.2 rule 1).
+- ~~**Build option: `ct25519-base-comb`**~~ ✅ DONE 2026-10-17 (axp request) — see § Build options.
 - **Performance: the X25519 shared secret, 1.09× libsodium / 1.21× OpenSSL** *(bench
   2026-10-10, `zig build bench-ct25519`)*: the only row above 1.0 by more than noise, and the
   one between P2 and P1. OpenSSL's `x25519-x86_64` runs the same 4×64 MULX/ADX radix, so the
