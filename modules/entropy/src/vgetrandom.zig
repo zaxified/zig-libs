@@ -123,6 +123,7 @@ fn vdsoLookupAt(vdso_addr: usize, version: []const u8, name: []const u8) usize {
     var strings_opt: ?[*:0]const u8 = null;
     var syms_opt: ?[*]const elf.Sym = null;
     var hash_opt: ?[*]const linux.Elf_Symndx = null;
+    var gnu_hash_opt: ?[*]const u32 = null;
     var versym: ?[*]const elf.Versym = null;
     var verdef: ?*const elf.Verdef = null;
     var i: usize = 0;
@@ -132,6 +133,7 @@ fn vdsoLookupAt(vdso_addr: usize, version: []const u8, name: []const u8) usize {
             elf.DT_STRTAB => strings_opt = @ptrFromInt(p),
             elf.DT_SYMTAB => syms_opt = @ptrFromInt(p),
             elf.DT_HASH => hash_opt = @ptrFromInt(p),
+            elf.DT_GNU_HASH => gnu_hash_opt = @ptrFromInt(p),
             elf.DT_VERSYM => versym = @ptrFromInt(p),
             elf.DT_VERDEF => verdef = @ptrFromInt(p),
             else => {},
@@ -139,11 +141,15 @@ fn vdsoLookupAt(vdso_addr: usize, version: []const u8, name: []const u8) usize {
     }
     const strings = strings_opt orelse return 0;
     const syms = syms_opt orelse return 0;
-    const hash = hash_opt orelse return 0;
+    // The symbol count: DT_HASH's nchain, else walked out of DT_GNU_HASH.
+    // std's `os/linux/vdso.zig` reads DT_HASH only, and the arm64 vDSO of
+    // the GitHub runner (2026-10-17) has only DT_GNU_HASH -- there std finds
+    // no symbol at all and silently falls back to syscalls.
+    const nsyms: usize = if (hash_opt) |hash| hash[1] else if (gnu_hash_opt) |gh| gnuHashSymCount(gh) else return 0;
 
     const ok_types: u32 = 1 << elf.STT_NOTYPE | 1 << elf.STT_OBJECT | 1 << elf.STT_FUNC | 1 << elf.STT_COMMON;
     const ok_binds: u32 = 1 << elf.STB_GLOBAL | 1 << elf.STB_WEAK | 1 << elf.STB_GNU_UNIQUE;
-    for (0..hash[1]) |k| {
+    for (0..nsyms) |k| {
         const st = syms[k];
         if ((@as(u32, 1) << @intCast(st.st_info & 0xf)) & ok_types == 0) continue;
         if ((@as(u32, 1) << @intCast(st.st_info >> 4)) & ok_binds == 0) continue;
@@ -153,6 +159,22 @@ fn vdsoLookupAt(vdso_addr: usize, version: []const u8, name: []const u8) usize {
         return b +% st.st_value;
     }
     return 0;
+}
+
+/// Symbol count of a DT_GNU_HASH table: one past the highest index any
+/// bucket's chain reaches (a chain ends at the entry whose low bit is set);
+/// symbols below `symoffset` are not hashed but still counted.
+fn gnuHashSymCount(gh: [*]const u32) usize {
+    const nbuckets = gh[0];
+    const symoffset = gh[1];
+    const bloom_words = gh[2]; // ELFCLASS words, `usize` each
+    const buckets = gh + 4 + bloom_words * (@sizeOf(usize) / 4);
+    const chains = buckets + nbuckets;
+    var last: u32 = 0;
+    for (0..nbuckets) |k| last = @max(last, buckets[k]);
+    if (last < symoffset) return symoffset;
+    while (chains[last - symoffset] & 1 == 0) last += 1;
+    return last + 1;
 }
 
 fn versionMatches(first: *const std.elf.Verdef, vsym: std.elf.Versym, version: []const u8, strings: [*:0]const u8) bool {
@@ -404,4 +426,34 @@ test "draw from more threads than slots at once: every buffer filled, no slot le
     for (threads) |t| t.join();
     try std.testing.expectEqual(@as(u32, 0), failed.load(.monotonic));
     for (&busy) |*f| try std.testing.expect(!f.load(.acquire));
+}
+
+test "gnuHashSymCount agrees with DT_HASH's nchain where the vDSO carries both" {
+    if (builtin.os.tag != .linux or @sizeOf(usize) != 8) return error.SkipZigTest;
+    const vdso_addr = linux.getauxval(std.elf.AT_SYSINFO_EHDR);
+    if (vdso_addr == 0) return error.SkipZigTest;
+    const elf = std.elf;
+    const eh: *const elf.Ehdr = @ptrFromInt(vdso_addr);
+    var dynv_opt: ?[*]const usize = null;
+    var load_base: ?usize = null;
+    for (0..eh.e_phnum) |i| {
+        const ph: *const elf.Phdr = @ptrFromInt(vdso_addr + eh.e_phoff + i * eh.e_phentsize);
+        switch (ph.p_type) {
+            elf.PT_LOAD => load_base = vdso_addr +% ph.p_offset -% ph.p_vaddr,
+            elf.PT_DYNAMIC => dynv_opt = @ptrFromInt(vdso_addr + ph.p_offset),
+            else => {},
+        }
+    }
+    const dynv = dynv_opt orelse return error.SkipZigTest;
+    const b = load_base orelse return error.SkipZigTest;
+    var hash: ?[*]const linux.Elf_Symndx = null;
+    var gnu: ?[*]const u32 = null;
+    var i: usize = 0;
+    while (dynv[i] != 0) : (i += 2) switch (dynv[i]) {
+        elf.DT_HASH => hash = @ptrFromInt(b +% dynv[i + 1]),
+        elf.DT_GNU_HASH => gnu = @ptrFromInt(b +% dynv[i + 1]),
+        else => {},
+    };
+    if (hash == null or gnu == null) return error.SkipZigTest; // arm64: GNU only, covered by the model test
+    try std.testing.expectEqual(@as(usize, hash.?[1]), gnuHashSymCount(gnu.?));
 }
