@@ -119,11 +119,12 @@ const testkit = @import("testkit");
 const builtin = @import("builtin");
 const router = @import("router");
 const http = @import("http");
+const b64ct = @import("b64ct");
 
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "Bearer + API-key auth (constant-time) + audit hook + denied-request throttle",
+    .doc = "Bearer + API-key (header/query/cookie) + HTTP Basic auth (constant-time) + audit hook + denied-request throttle",
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
@@ -135,7 +136,7 @@ pub const meta = .{
     // throttle store); safe from all connection threads at once.
     .concurrency = .threadsafe,
     .model_after = "envoy ext_authz / oauth2-proxy (bearer behavior only); RFC 6750",
-    .deps = .{ "router", "http" },
+    .deps = .{ "router", "http", "b64ct" },
 };
 
 const Allocator = std.mem.Allocator;
@@ -205,7 +206,54 @@ pub const AuthMode = enum {
     /// first and takes precedence — its `Identity.scheme` wins when both
     /// are valid.
     either,
+    /// Only `Authorization: Basic <base64(user:password)>` (RFC 7617). The
+    /// bearer and API-key options are ignored.
+    basic,
+    /// A valid bearer, API key **or** Basic credential passes (checked in
+    /// that order; the first valid scheme's `Identity.scheme` wins).
+    any,
 };
+
+/// Where an API key is looked for. `Options.api_key_sources` lists them in
+/// order; every source that carries a non-empty value is verified and the
+/// first valid one admits the request (echo's `KeyLookup`).
+pub const KeySource = struct {
+    kind: Kind,
+    /// Header name (case-insensitive), query parameter name or cookie name
+    /// (both exact).
+    name: []const u8,
+    /// `.header` only: a prefix the value must start with (matched
+    /// case-insensitively) and which is stripped before verification, e.g.
+    /// `"Token "` for `Authorization: Token <key>`. A value without the
+    /// prefix is absent. Empty = no prefix.
+    prefix: []const u8 = "",
+
+    pub const Kind = enum {
+        /// A request header. The first field line of that name is read.
+        header,
+        /// A query parameter, taken verbatim (not percent-decoded); first
+        /// occurrence wins.
+        query,
+        /// A cookie in the `Cookie` header(s) (all field lines are scanned:
+        /// HTTP/2 clients send one per cookie). Surrounding double quotes
+        /// are stripped, the value is not percent-decoded.
+        cookie,
+    };
+};
+
+/// One Basic credential for `Options.basic_users` / `Gate.addBasicUser`.
+pub const BasicUser = struct {
+    /// Must not contain `:` (RFC 7617 §2).
+    user: []const u8,
+    password: []const u8,
+};
+
+/// Default realm of the `Basic` challenge (echo's default).
+pub const default_basic_realm = "Restricted";
+
+/// Largest decoded `user:password` the gate looks at; a longer credential is
+/// treated as absent (denied).
+pub const basic_credentials_max = 512;
 
 /// Default header carrying the API key (`Options.api_key_header`).
 pub const default_api_key_header = "X-Api-Key";
@@ -232,6 +280,12 @@ pub const ApiKeyVerifyFn = *const fn (ctx: ?*anyopaque, presented_key: []const u
 /// Called on the serving thread, after the static token set misses, and
 /// outside the gate's lock — so it may take its own locks. `ctx` is
 /// `Options.token_verify_ctx` verbatim.
+/// Caller-supplied Basic verifier for a dynamic user store. Receives the
+/// presented user and password verbatim; **must** compare in constant time
+/// (see `secretEqual`), never `std.mem.eql`. Called after the static set
+/// misses, outside the gate's lock. `ctx` is `Options.basic_verify_ctx`.
+pub const BasicVerifyFn = *const fn (ctx: ?*anyopaque, user: []const u8, password: []const u8) bool;
+
 pub const TokenVerifyFn = *const fn (ctx: ?*anyopaque, presented_token: []const u8) bool;
 
 /// Constant-time equality for secret material (compares fixed-size
@@ -262,6 +316,8 @@ pub const Identity = struct {
         /// A configured API key (from the `X-Api-Key` header or the
         /// optional query-param fallback), verified in constant time.
         api_key,
+        /// A configured Basic user:password pair, verified in constant time.
+        basic,
         /// No credentials configured and `allow_when_unconfigured` set — the
         /// opt-in open plane (fails closed by default; see that option).
         open,
@@ -419,9 +475,26 @@ pub const Options = struct {
     /// (value taken verbatim — not percent-decoded); the header wins when
     /// both are present. Copied into the gate. Null ⇒ header only.
     api_key_query_param: ?[]const u8 = null,
+    /// Ordered API-key sources (`KeySource`); when non-empty they REPLACE
+    /// `api_key_header` / `api_key_query_param`. Names and prefixes are
+    /// copied into the gate. Each source with a non-empty value is
+    /// verified; the first valid one admits.
+    api_key_sources: []const KeySource = &.{},
+    /// Valid Basic user:password pairs (`.basic` / `.any`). Not retained —
+    /// only the SHA-256 of `user:password` is stored. Users must not
+    /// contain `:`; passwords must be non-empty.
+    basic_users: []const BasicUser = &.{},
+    /// Caller-supplied Basic verifier (dynamic user store); tried after the
+    /// static set. See `BasicVerifyFn`. Its presence alone closes the Basic
+    /// open plane (same rule as the other verifiers).
+    basic_verify: ?BasicVerifyFn = null,
+    /// Opaque pointer handed to every `basic_verify` call.
+    basic_verify_ctx: ?*anyopaque = null,
     /// Optional realm for the challenge: `WWW-Authenticate: Bearer
-    /// realm="<realm>"`. Must be quoted-string-safe (no `"` or `\`).
-    /// Null ⇒ plain `WWW-Authenticate: Bearer`.
+    /// realm="<realm>"` (and `Basic realm="<realm>"` for the Basic
+    /// schemes; there the default realm is `Restricted`). Must be
+    /// quoted-string-safe (no `"` or `\`). Null ⇒ plain
+    /// `WWW-Authenticate: Bearer`.
     realm: ?[]const u8 = null,
     /// Body of the 401 response. Copied into the gate (so a caller's
     /// buffer need not outlive `init`). Default `Unauthorized\n`; set it
@@ -489,7 +562,14 @@ pub const Gate = struct {
     api_key_header: []const u8 = default_api_key_header,
     /// Optional query-param fallback name — gpa-owned copy, or null.
     api_key_query_param: ?[]const u8 = null,
+    /// Resolved ordered API-key sources — gpa-owned deep copy (legacy
+    /// header/query options expand into this list).
+    key_sources: []KeySource = &.{},
+    basic_verify: ?BasicVerifyFn = null,
+    basic_verify_ctx: ?*anyopaque = null,
     lock: std.atomic.Mutex = .unlocked,
+    /// SHA-256 digests of the valid `user:password` Basic pairs.
+    basics: std.ArrayList([Sha256.digest_length]u8) = .empty,
     /// SHA-256 digests of the valid tokens (never the tokens themselves).
     tokens: std.ArrayList([Sha256.digest_length]u8) = .empty,
     /// SHA-256 digests of the valid API keys (never the keys themselves).
@@ -522,11 +602,16 @@ pub const Gate = struct {
             const fp = fingerprint(k);
             if (!containsFp(api_keys.items, fp)) try api_keys.append(gpa, fp);
         }
-        const challenge = if (options.realm) |r|
-            try std.fmt.allocPrint(gpa, "Bearer realm=\"{s}\"", .{r})
-        else
-            try gpa.dupe(u8, "Bearer");
+        var basics: std.ArrayList([Sha256.digest_length]u8) = .empty;
+        errdefer basics.deinit(gpa);
+        for (options.basic_users) |u| {
+            const fp = basicFingerprint(u.user, u.password);
+            if (!containsFp(basics.items, fp)) try basics.append(gpa, fp);
+        }
+        const challenge = try buildChallenge(gpa, options.auth_mode, options.realm);
         errdefer gpa.free(challenge);
+        const key_sources = try buildSources(gpa, &options);
+        errdefer freeSources(gpa, key_sources);
         std.debug.assert(options.api_key_header.len != 0);
         const api_key_header = try gpa.dupe(u8, options.api_key_header);
         errdefer gpa.free(api_key_header);
@@ -560,6 +645,10 @@ pub const Gate = struct {
             .api_key_verify_ctx = options.api_key_verify_ctx,
             .api_key_header = api_key_header,
             .api_key_query_param = api_key_query_param,
+            .key_sources = key_sources,
+            .basic_verify = options.basic_verify,
+            .basic_verify_ctx = options.basic_verify_ctx,
+            .basics = basics,
             .tokens = tokens,
             .api_keys = api_keys,
         };
@@ -571,6 +660,8 @@ pub const Gate = struct {
         g.gpa.free(g.deny_content_type);
         g.gpa.free(g.api_key_header);
         if (g.api_key_query_param) |q| g.gpa.free(q);
+        freeSources(g.gpa, g.key_sources);
+        g.basics.deinit(g.gpa);
         g.tokens.deinit(g.gpa);
         g.api_keys.deinit(g.gpa);
         g.throttle.deinit(g.gpa);
@@ -589,6 +680,8 @@ pub const Gate = struct {
         ok_bearer,
         /// A configured API key matched (constant-time).
         ok_api_key,
+        /// A configured Basic user:password pair matched (constant-time).
+        ok_basic,
         /// No credentials configured for the checked scheme — open plane.
         ok_open,
         denied,
@@ -649,6 +742,64 @@ pub const Gate = struct {
             }
         }
         return .denied;
+    }
+
+    /// The pure auth decision for presented Basic credentials (null = none
+    /// presented). The static set stores SHA-256(`user:password`) and is
+    /// scanned in full without early exit, so neither the user's existence,
+    /// the password's content nor any length leaks through timing. On a miss
+    /// the `basic_verify` callback is consulted outside the lock. With no
+    /// pairs and no callback: `.ok_open` only under
+    /// `allow_when_unconfigured`, else `.denied`.
+    pub fn verifyBasic(g: *Gate, presented: ?BasicCredentials) Verdict {
+        const has_verify = g.basic_verify != null;
+        const fp: ?[Sha256.digest_length]u8 = if (presented) |c| basicFingerprint(c.user, c.password) else null;
+        {
+            lockSpin(&g.lock);
+            defer g.lock.unlock();
+            if (g.basics.items.len == 0 and !has_verify)
+                return if (g.allow_when_unconfigured) .ok_open else .denied;
+            if (fp) |got| {
+                if (containsFp(g.basics.items, got)) return .ok_basic;
+            }
+        }
+        if (has_verify) {
+            if (presented) |c| {
+                if (g.basic_verify.?(g.basic_verify_ctx, c.user, c.password)) return .ok_basic;
+            }
+        }
+        return .denied;
+    }
+
+    /// Add a Basic user (rotation, mirrors `addToken`). Idempotent; hashed,
+    /// not retained. `user` must not contain `:`; `password` non-empty.
+    pub fn addBasicUser(g: *Gate, user: []const u8, password: []const u8) error{OutOfMemory}!void {
+        std.debug.assert(std.mem.indexOfScalar(u8, user, ':') == null and password.len != 0);
+        const fp = basicFingerprint(user, password);
+        lockSpin(&g.lock);
+        defer g.lock.unlock();
+        if (containsFp(g.basics.items, fp)) return;
+        try g.basics.append(g.gpa, fp);
+    }
+
+    /// Remove a Basic user:password pair (no-op when absent).
+    pub fn removeBasicUser(g: *Gate, user: []const u8, password: []const u8) void {
+        const fp = basicFingerprint(user, password);
+        lockSpin(&g.lock);
+        defer g.lock.unlock();
+        var i: usize = 0;
+        while (i < g.basics.items.len) {
+            if (std.crypto.timing_safe.eql([Sha256.digest_length]u8, g.basics.items[i], fp)) {
+                _ = g.basics.swapRemove(i);
+            } else i += 1;
+        }
+    }
+
+    /// Number of currently valid Basic pairs (diagnostics / tests).
+    pub fn basicCount(g: *Gate) usize {
+        lockSpin(&g.lock);
+        defer g.lock.unlock();
+        return g.basics.items.len;
     }
 
     /// Add an API key to the valid set (rotation, mirrors `addToken`).
@@ -752,6 +903,72 @@ pub const Gate = struct {
 fn fingerprint(token: []const u8) [Sha256.digest_length]u8 {
     var out: [Sha256.digest_length]u8 = undefined;
     Sha256.hash(token, &out, .{});
+    return out;
+}
+
+/// SHA-256 of `user ":" password` — a user holds no `:` (RFC 7617), so the
+/// pair is unambiguous. The digest hides user existence and both lengths.
+fn basicFingerprint(user: []const u8, password: []const u8) [Sha256.digest_length]u8 {
+    var h = Sha256.init(.{});
+    h.update(user);
+    h.update(":");
+    h.update(password);
+    var out: [Sha256.digest_length]u8 = undefined;
+    h.final(&out);
+    return out;
+}
+
+fn buildChallenge(gpa: Allocator, mode: AuthMode, realm: ?[]const u8) Allocator.Error![]u8 {
+    const basic_realm = realm orelse default_basic_realm;
+    return switch (mode) {
+        .bearer, .api_key, .either => if (realm) |r|
+            std.fmt.allocPrint(gpa, "Bearer realm=\"{s}\"", .{r})
+        else
+            gpa.dupe(u8, "Bearer"),
+        .basic => std.fmt.allocPrint(gpa, "Basic realm=\"{s}\"", .{basic_realm}),
+        .any => if (realm) |r|
+            std.fmt.allocPrint(gpa, "Bearer realm=\"{s}\", Basic realm=\"{s}\"", .{ r, r })
+        else
+            std.fmt.allocPrint(gpa, "Bearer, Basic realm=\"{s}\"", .{basic_realm}),
+    };
+}
+
+fn freeSources(gpa: Allocator, srcs: []KeySource) void {
+    for (srcs) |s| {
+        gpa.free(s.name);
+        gpa.free(s.prefix);
+    }
+    gpa.free(srcs);
+}
+
+/// The gate-owned source list: `api_key_sources` when given, else the legacy
+/// header (+ optional query) pair.
+fn buildSources(gpa: Allocator, options: *const Options) Allocator.Error![]KeySource {
+    const legacy: [2]KeySource = .{
+        .{ .kind = .header, .name = options.api_key_header },
+        .{ .kind = .query, .name = options.api_key_query_param orelse "" },
+    };
+    const given: []const KeySource = if (options.api_key_sources.len != 0)
+        options.api_key_sources
+    else
+        legacy[0..@as(usize, if (options.api_key_query_param != null) 2 else 1)];
+    const out = try gpa.alloc(KeySource, given.len);
+    var done: usize = 0;
+    errdefer {
+        for (out[0..done]) |s| {
+            gpa.free(s.name);
+            gpa.free(s.prefix);
+        }
+        gpa.free(out);
+    }
+    for (given) |s| {
+        std.debug.assert(s.name.len != 0);
+        const name = try gpa.dupe(u8, s.name);
+        errdefer gpa.free(name);
+        const prefix = try gpa.dupe(u8, s.prefix);
+        out[done] = .{ .kind = s.kind, .name = name, .prefix = prefix };
+        done += 1;
+    }
     return out;
 }
 
@@ -902,24 +1119,85 @@ pub fn bearerTokenOf(authorization: []const u8) ?[]const u8 {
     return tok;
 }
 
-/// The API key presented on the request: the (case-insensitive)
-/// `api_key_header` value, else the `api_key_query_param` query value when
-/// configured, else null. Both are trimmed of surrounding SP/TAB; an
-/// empty value counts as absent. The query value is taken verbatim (no
-/// percent-decoding), so the header is preferred for keys with reserved
-/// characters.
+/// The API key presented on the request: the first of the gate's ordered
+/// sources (`Options.api_key_sources`; by default the `api_key_header` and,
+/// when configured, the `api_key_query_param`) that carries a non-empty
+/// value after trimming SP/TAB, else null. **The first present source
+/// decides** -- a wrong key there is not rescued by a valid one in a later
+/// source (header wins over query, as before). An empty value (or a header
+/// lacking its `prefix`) counts as absent and falls through. Query values
+/// are taken verbatim (no percent-decoding), so prefer the header for keys
+/// with reserved characters.
 fn apiKeyPresented(g: *const Gate, req: *const http.Server.Request) ?[]const u8 {
-    if (req.header(g.api_key_header)) |v| {
-        const k = std.mem.trim(u8, v, " \t");
+    for (g.key_sources) |src| {
+        const raw: ?[]const u8 = switch (src.kind) {
+            .header => headerKey(req.header(src.name), src.prefix),
+            .query => queryValue(req.query, src.name),
+            .cookie => blk: {
+                var lines = req.headerAll("cookie");
+                while (lines.next()) |line| {
+                    if (cookieValue(line, src.name)) |v| break :blk v;
+                }
+                break :blk null;
+            },
+        };
+        const k = std.mem.trim(u8, raw orelse continue, " \t");
         if (k.len != 0) return k;
     }
-    if (g.api_key_query_param) |name| {
-        if (queryValue(req.query, name)) |v| {
-            const k = std.mem.trim(u8, v, " \t");
-            if (k.len != 0) return k;
-        }
+    return null;
+}
+
+/// A header value with the source's `prefix` (case-insensitive) stripped;
+/// null when the header is absent or lacks the prefix.
+fn headerKey(value: ?[]const u8, prefix: []const u8) ?[]const u8 {
+    const v = std.mem.trim(u8, value orelse return null, " \t");
+    if (prefix.len == 0) return v;
+    if (v.len < prefix.len or !std.ascii.eqlIgnoreCase(v[0..prefix.len], prefix)) return null;
+    return v[prefix.len..];
+}
+
+/// Value of the first cookie named `name` in one `Cookie` field value
+/// (`a=1; b=2`), or null. The name compare is exact (case-sensitive, RFC
+/// 6265 section 5.4); surrounding SP/TAB is trimmed and one pair of
+/// surrounding double quotes stripped; the value is not percent-decoded. A
+/// pair with no `=` is skipped. Pure and total -- any byte sequence maps to
+/// a value or null. Public for callers with their own request type.
+pub fn cookieValue(cookie_header: []const u8, name: []const u8) ?[]const u8 {
+    // Duplicates `cookies.find` on purpose: this change did not add `cookies`
+    // to aaa-gate's deps. Replace by it if that dependency is accepted.
+    var it = std.mem.splitScalar(u8, cookie_header, ';');
+    while (it.next()) |pair| {
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+        if (!std.mem.eql(u8, std.mem.trim(u8, pair[0..eq], " \t"), name)) continue;
+        var v = std.mem.trim(u8, pair[eq + 1 ..], " \t");
+        if (v.len >= 2 and v[0] == '"' and v[v.len - 1] == '"') v = v[1 .. v.len - 1];
+        return v;
     }
     return null;
+}
+
+pub const BasicCredentials = http.BasicCredentials;
+
+/// Basic credentials in a raw `Authorization` value (RFC 7617), or null when
+/// it uses another scheme or is malformed: scheme case-insensitive, one
+/// space, standard padded base64 (decoded by `b64ct`, constant-time in the
+/// content), split at the first `:`. `out` receives the decoded
+/// `user:password` (the returned slices point into it; wipe it after use);
+/// a credential decoding to more than `out.len` bytes is null. Outer SP/TAB
+/// is tolerated as for `bearerTokenOf`. Never panics.
+pub fn basicCredentialsOf(authorization: []const u8, out: []u8) ?BasicCredentials {
+    const value = std.mem.trim(u8, authorization, " \t");
+    if (value.len < "Basic ".len) return null;
+    if (!std.ascii.eqlIgnoreCase(value[0..5], "Basic")) return null;
+    if (value[5] != ' ') return null;
+    const enc = std.mem.trim(u8, value[6..], " \t");
+    if (enc.len == 0) return null;
+    const dec = b64ct.standard.decode(out, enc) catch return null;
+    const colon = std.mem.indexOfScalar(u8, dec, ':') orelse {
+        std.crypto.secureZero(u8, dec);
+        return null;
+    };
+    return .{ .user = dec[0..colon], .password = dec[colon + 1 ..] };
 }
 
 /// First value of query parameter `name` in a raw query string
@@ -1023,7 +1301,20 @@ fn formatV4(bytes: [4]u8, buf: *[client_key_len_max]u8) []const u8 {
 /// both credentials are valid (documented precedence); the plane is open
 /// only when no credential is configured for the active mode(s).
 fn authorize(g: *Gate, req: *const http.Server.Request) ?Identity.Scheme {
+    var cred_buf: [basic_credentials_max]u8 = undefined;
+    defer std.crypto.secureZero(u8, &cred_buf);
     switch (g.auth_mode) {
+        .basic => return schemeOf(g.verifyBasic(basicPresented(req, &cred_buf))),
+        .any => {
+            const bearer_v = g.verify(bearerToken(req));
+            const key_v = g.verifyApiKey(apiKeyPresented(g, req));
+            const basic_v = g.verifyBasic(basicPresented(req, &cred_buf));
+            if (bearer_v == .ok_open and key_v == .ok_open and basic_v == .ok_open) return .open;
+            if (bearer_v == .ok_bearer) return .bearer;
+            if (key_v == .ok_api_key) return .api_key;
+            if (basic_v == .ok_basic) return .basic;
+            return null;
+        },
         .bearer => return schemeOf(g.verify(bearerToken(req))),
         .api_key => return schemeOf(g.verifyApiKey(apiKeyPresented(g, req))),
         .either => {
@@ -1035,6 +1326,10 @@ fn authorize(g: *Gate, req: *const http.Server.Request) ?Identity.Scheme {
             return null;
         },
     }
+}
+
+fn basicPresented(req: *const http.Server.Request, buf: *[basic_credentials_max]u8) ?BasicCredentials {
+    return basicCredentialsOf(req.header("authorization") orelse return null, buf);
 }
 
 /// Whether the caller's exemption predicate takes this request out of the
@@ -1050,6 +1345,7 @@ fn schemeOf(v: Gate.Verdict) ?Identity.Scheme {
     return switch (v) {
         .ok_bearer => .bearer,
         .ok_api_key => .api_key,
+        .ok_basic => .basic,
         .ok_open => .open,
         .denied => null,
     };
@@ -3052,4 +3348,433 @@ test "middleware either: one configured scheme keeps the plane closed even with 
     try expectStatus(runWire(&r, wire("GET", "/t", ""), &buf), "401");
     try expectStatus(runWire(&r, wire("GET", "/t", "X-Api-Key: anything\r\n"), &buf), "401");
     try expectStatus(runWire(&r, wire("GET", "/t", "Authorization: Bearer b3arer\r\n"), &buf), "200");
+}
+
+// ── tests: HTTP Basic, key sources, cookies (echo parity, 2026-10-17) ───────
+
+test "basicCredentialsOf: RFC 7617 shapes, split at the FIRST colon, malformed is null" {
+    var out: [64]u8 = undefined;
+    const c = basicCredentialsOf("Basic YWxpY2U6czNjcmV0", &out).?;
+    try testing.expectEqualStrings("alice", c.user);
+    try testing.expectEqualStrings("s3cret", c.password);
+    // scheme case-insensitive, outer blanks tolerated, extra blanks before the credential too
+    try testing.expectEqualStrings("alice", basicCredentialsOf("  bAsIc   YWxpY2U6czNjcmV0 \t", &out).?.user);
+    // a password may hold colons
+    const k = basicCredentialsOf("Basic Ym9iOnB3OndpdGg6Y29sb24=", &out).?;
+    try testing.expectEqualStrings("bob", k.user);
+    try testing.expectEqualStrings("pw:with:colon", k.password);
+    // empty password is a credential (the colon is there)
+    try testing.expectEqualStrings("", basicCredentialsOf("Basic YWxpY2U6", &out).?.password);
+    // nulls: other scheme, no colon, bad base64, bad padding, no credential, tab separator, too long
+    try testing.expectEqual(@as(?BasicCredentials, null), basicCredentialsOf("Bearer YWxpY2U6czNjcmV0", &out));
+    try testing.expectEqual(@as(?BasicCredentials, null), basicCredentialsOf("Basic bm9jb2xvbg==", &out));
+    try testing.expectEqual(@as(?BasicCredentials, null), basicCredentialsOf("Basic !!!!", &out));
+    try testing.expectEqual(@as(?BasicCredentials, null), basicCredentialsOf("Basic YWxpY2U6czNjcmV0=", &out));
+    try testing.expectEqual(@as(?BasicCredentials, null), basicCredentialsOf("Basic Ym9iOnB3OndpdGg6Y29sb24", &out));
+    try testing.expectEqual(@as(?BasicCredentials, null), basicCredentialsOf("Basic ", &out));
+    try testing.expectEqual(@as(?BasicCredentials, null), basicCredentialsOf("Basic\tYWxpY2U6czNjcmV0", &out));
+    try testing.expectEqual(@as(?BasicCredentials, null), basicCredentialsOf("Basicx YWxpY2U6czNjcmV0", &out));
+    var tiny: [4]u8 = undefined;
+    try testing.expectEqual(@as(?BasicCredentials, null), basicCredentialsOf("Basic YWxpY2U6czNjcmV0", &tiny));
+}
+
+test "verifyBasic: constant-time pair compare; wrong password / wrong user / swapped / none are denied" {
+    var g = try Gate.init(testing.allocator, .{
+        .auth_mode = .basic,
+        .basic_users = &.{.{ .user = "alice", .password = "s3cret" }},
+    });
+    defer g.deinit();
+    try testing.expectEqual(Gate.Verdict.ok_basic, g.verifyBasic(.{ .user = "alice", .password = "s3cret" }));
+    try testing.expectEqual(Gate.Verdict.denied, g.verifyBasic(.{ .user = "alice", .password = "s3creT" }));
+    try testing.expectEqual(Gate.Verdict.denied, g.verifyBasic(.{ .user = "alicf", .password = "s3cret" }));
+    try testing.expectEqual(Gate.Verdict.denied, g.verifyBasic(.{ .user = "s3cret", .password = "alice" }));
+    try testing.expectEqual(Gate.Verdict.denied, g.verifyBasic(.{ .user = "", .password = "" }));
+    try testing.expectEqual(Gate.Verdict.denied, g.verifyBasic(null));
+}
+
+fn basicDyn(_: ?*anyopaque, user: []const u8, password: []const u8) bool {
+    return secretEqual(user, "dyn") and secretEqual(password, "pw");
+}
+
+test "verifyBasic: open plane only when opted in; unconfigured fails closed; a verifier closes it" {
+    var closed = try Gate.init(testing.allocator, .{ .auth_mode = .basic });
+    defer closed.deinit();
+    try testing.expectEqual(Gate.Verdict.denied, closed.verifyBasic(null));
+    var open = try Gate.init(testing.allocator, .{ .auth_mode = .basic, .allow_when_unconfigured = true });
+    defer open.deinit();
+    try testing.expectEqual(Gate.Verdict.ok_open, open.verifyBasic(null));
+    var v = try Gate.init(testing.allocator, .{
+        .auth_mode = .basic,
+        .allow_when_unconfigured = true,
+        .basic_verify = basicDyn,
+    });
+    defer v.deinit();
+    try testing.expectEqual(Gate.Verdict.denied, v.verifyBasic(.{ .user = "x", .password = "y" }));
+    try testing.expectEqual(Gate.Verdict.ok_basic, v.verifyBasic(.{ .user = "dyn", .password = "pw" }));
+}
+
+test "basic rotation: basic_users + addBasicUser/removeBasicUser, idempotent" {
+    var g = try Gate.init(testing.allocator, .{
+        .auth_mode = .basic,
+        .basic_users = &.{
+            .{ .user = "a", .password = "1" },
+            .{ .user = "a", .password = "1" },
+        },
+    });
+    defer g.deinit();
+    try testing.expectEqual(@as(usize, 1), g.basicCount());
+    try g.addBasicUser("b", "2");
+    try g.addBasicUser("b", "2");
+    try testing.expectEqual(@as(usize, 2), g.basicCount());
+    try testing.expectEqual(Gate.Verdict.ok_basic, g.verifyBasic(.{ .user = "b", .password = "2" }));
+    g.removeBasicUser("a", "1");
+    try testing.expectEqual(Gate.Verdict.denied, g.verifyBasic(.{ .user = "a", .password = "1" }));
+    try testing.expectEqual(Gate.Verdict.ok_basic, g.verifyBasic(.{ .user = "b", .password = "2" }));
+}
+
+fn hBasicIdentity(ctx: *router.Ctx) anyerror!void {
+    const id = identityOf(ctx) orelse return error.NoIdentity;
+    try testing.expectEqual(Identity.Scheme.basic, id.scheme);
+    try ctx.res.writeAll("basic-ok");
+}
+
+test "middleware basic: wire goldens — 401 + Basic challenge (default and custom realm), valid pair 200 + basic identity" {
+    var sink: Sink = .{};
+    var g = try Gate.init(testing.allocator, .{
+        .auth_mode = .basic,
+        .basic_users = &.{.{ .user = "alice", .password = "s3cret" }},
+        .on_audit = Sink.hook,
+        .on_audit_ctx = &sink,
+    });
+    defer g.deinit();
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(g.middleware());
+    try r.get("/t", hBasicIdentity);
+    var buf: [1024]u8 = undefined;
+
+    const ok = runWire(&r, wire("GET", "/t", "Authorization: Basic YWxpY2U6czNjcmV0\r\n"), &buf);
+    try expectStatus(ok, "200");
+    try testing.expectEqualStrings("basic-ok", bodyOf(ok));
+
+    const miss = runWire(&r, wire("GET", "/t", ""), &buf);
+    try expectStatus(miss, "401");
+    try expectHeaderLine(miss, "WWW-Authenticate: Basic realm=\"Restricted\"");
+    try testing.expectEqualStrings("Unauthorized\n", bodyOf(miss));
+    try testing.expectEqual(@as(usize, 1), sink.len);
+    try testing.expect(!sink.recs[0].authed);
+
+    // wrong password, a Bearer header, malformed base64: all 401
+    try expectStatus(runWire(&r, wire("GET", "/t", "Authorization: Basic YWxpY2U6czNjcmVU\r\n"), &buf), "401");
+    try expectStatus(runWire(&r, wire("GET", "/t", "Authorization: Bearer YWxpY2U6czNjcmV0\r\n"), &buf), "401");
+    try expectStatus(runWire(&r, wire("GET", "/t", "Authorization: Basic ***\r\n"), &buf), "401");
+
+    var g2 = try Gate.init(testing.allocator, .{
+        .auth_mode = .basic,
+        .realm = "ops",
+        .basic_users = &.{.{ .user = "alice", .password = "s3cret" }},
+    });
+    defer g2.deinit();
+    var r2 = router.Router.init(testing.allocator);
+    defer r2.deinit();
+    try r2.use(g2.middleware());
+    try r2.get("/t", hBasicIdentity);
+    try expectHeaderLine(runWire(&r2, wire("GET", "/t", ""), &buf), "WWW-Authenticate: Basic realm=\"ops\"");
+}
+
+test "middleware basic: protect=.mutations and the audit hook work for Basic too" {
+    var sink: Sink = .{};
+    var g = try Gate.init(testing.allocator, .{
+        .auth_mode = .basic,
+        .protect = .mutations,
+        .basic_users = &.{.{ .user = "alice", .password = "s3cret" }},
+        .on_audit = Sink.hook,
+        .on_audit_ctx = &sink,
+    });
+    defer g.deinit();
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(g.middleware());
+    try r.get("/t", hHello);
+    try r.post("/t", hHello);
+    var buf: [1024]u8 = undefined;
+    try expectStatus(runWire(&r, wire("GET", "/t", ""), &buf), "200");
+    try expectStatus(runWire(&r, wire("POST", "/t", ""), &buf), "401");
+    try expectStatus(runWire(&r, wire("POST", "/t", "Authorization: Basic YWxpY2U6czNjcmV0\r\n"), &buf), "200");
+    try testing.expectEqual(@as(usize, 2), sink.len); // denial + authed mutation
+    try testing.expect(sink.recs[1].authed);
+}
+
+test "middleware any: bearer, api key and Basic each admit; combined challenge" {
+    var g = try Gate.init(testing.allocator, .{
+        .auth_mode = .any,
+        .token = "b3arer",
+        .api_key = "ap1key",
+        .basic_users = &.{.{ .user = "alice", .password = "s3cret" }},
+    });
+    defer g.deinit();
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(g.middleware());
+    try r.get("/t", hHello);
+    var buf: [1024]u8 = undefined;
+    try expectStatus(runWire(&r, wire("GET", "/t", "Authorization: Bearer b3arer\r\n"), &buf), "200");
+    try expectStatus(runWire(&r, wire("GET", "/t", "X-Api-Key: ap1key\r\n"), &buf), "200");
+    try expectStatus(runWire(&r, wire("GET", "/t", "Authorization: Basic YWxpY2U6czNjcmV0\r\n"), &buf), "200");
+    const bad = runWire(&r, wire("GET", "/t", "Authorization: Basic YWxpY2U6czNjcmVU\r\nX-Api-Key: no\r\n"), &buf);
+    try expectStatus(bad, "401");
+    try expectHeaderLine(bad, "WWW-Authenticate: Bearer, Basic realm=\"Restricted\"");
+    // a valid key beside a wrong Basic: the key admits
+    try expectStatus(runWire(&r, wire("GET", "/t", "Authorization: Basic YWxpY2U6czNjcmVU\r\nX-Api-Key: ap1key\r\n"), &buf), "200");
+    // one configured scheme keeps the plane closed under allow_when_unconfigured
+    var g2 = try Gate.init(testing.allocator, .{
+        .auth_mode = .any,
+        .allow_when_unconfigured = true,
+        .basic_users = &.{.{ .user = "alice", .password = "s3cret" }},
+        .realm = "r",
+    });
+    defer g2.deinit();
+    var r2 = router.Router.init(testing.allocator);
+    defer r2.deinit();
+    try r2.use(g2.middleware());
+    try r2.get("/t", hHello);
+    const closed = runWire(&r2, wire("GET", "/t", ""), &buf);
+    try expectStatus(closed, "401");
+    try expectHeaderLine(closed, "WWW-Authenticate: Bearer realm=\"r\", Basic realm=\"r\"");
+}
+
+test "cookieValue: exact name, trims, strips one pair of quotes, no decoding, skips junk pairs" {
+    try testing.expectEqualStrings("abc", cookieValue("sid=abc", "sid").?);
+    try testing.expectEqualStrings("abc", cookieValue("a=1; sid=abc; b=2", "sid").?);
+    try testing.expectEqualStrings("abc", cookieValue("a=1;\tsid = \"abc\" ;b=2", "sid").?);
+    try testing.expectEqualStrings("a%20b", cookieValue("sid=a%20b", "sid").?);
+    try testing.expectEqualStrings("x=y", cookieValue("sid=x=y", "sid").?);
+    try testing.expectEqualStrings("first", cookieValue("sid=first; sid=second", "sid").?);
+    try testing.expectEqualStrings("", cookieValue("sid=", "sid").?);
+    try testing.expectEqual(@as(?[]const u8, null), cookieValue("Sid=abc", "sid")); // case-sensitive
+    try testing.expectEqual(@as(?[]const u8, null), cookieValue("xsid=abc; sidx=abc", "sid"));
+    try testing.expectEqual(@as(?[]const u8, null), cookieValue("sid", "sid")); // no '='
+    try testing.expectEqual(@as(?[]const u8, null), cookieValue(";;;=;", "sid"));
+}
+
+test "middleware key sources: header(prefix), query and cookie in order; first PRESENT source decides" {
+    var g = try Gate.init(testing.allocator, .{
+        .auth_mode = .api_key,
+        .api_key = "sekret",
+        .api_key_sources = &.{
+            .{ .kind = .header, .name = "Authorization", .prefix = "Token " },
+            .{ .kind = .query, .name = "api_key" },
+            .{ .kind = .cookie, .name = "session" },
+        },
+    });
+    defer g.deinit();
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(g.middleware());
+    try r.get("/t", hHello);
+    var buf: [1024]u8 = undefined;
+
+    try expectStatus(runWire(&r, wire("GET", "/t", "Authorization: Token sekret\r\n"), &buf), "200");
+    try expectStatus(runWire(&r, wire("GET", "/t", "Authorization: token sekret\r\n"), &buf), "200"); // prefix is case-insensitive
+    try expectStatus(runWire(&r, wire("GET", "/t?api_key=sekret", ""), &buf), "200");
+    try expectStatus(runWire(&r, wire("GET", "/t", "Cookie: a=1; session=sekret\r\n"), &buf), "200");
+    // several Cookie field lines (HTTP/2 style): the name is found on the second
+    try expectStatus(runWire(&r, wire("GET", "/t", "Cookie: a=1\r\nCookie: session=sekret\r\n"), &buf), "200");
+    // a header WITHOUT the prefix is absent, so the query is consulted
+    try expectStatus(runWire(&r, wire("GET", "/t?api_key=sekret", "Authorization: Bearer nope\r\n"), &buf), "200");
+    // a wrong value in the first present source is not rescued by a later valid one
+    try expectStatus(runWire(&r, wire("GET", "/t?api_key=sekret", "Authorization: Token wrong\r\n"), &buf), "401");
+    try expectStatus(runWire(&r, wire("GET", "/t", "Cookie: session=wrong\r\n"), &buf), "401");
+    try expectStatus(runWire(&r, wire("GET", "/t", "Cookie: session=\r\n"), &buf), "401"); // empty = absent
+    try expectStatus(runWire(&r, wire("GET", "/t", "Cookie: sessionx=sekret\r\n"), &buf), "401");
+    // X-Api-Key is not a configured source any more (sources replace the legacy options)
+    try expectStatus(runWire(&r, wire("GET", "/t", "X-Api-Key: sekret\r\n"), &buf), "401");
+}
+
+test "init: api_key_sources copied (caller buffers may die) and freed on every allocation failure" {
+    var name_buf = "session".*;
+    var g = try Gate.init(testing.allocator, .{
+        .auth_mode = .api_key,
+        .api_key = "k",
+        .api_key_sources = &.{.{ .kind = .cookie, .name = &name_buf }},
+        .basic_users = &.{.{ .user = "u", .password = "p" }},
+        .realm = "x",
+    });
+    @memset(&name_buf, 'z');
+    try testing.expectEqualStrings("session", g.key_sources[0].name);
+    g.deinit();
+
+    const opts: Options = .{
+        .auth_mode = .any,
+        .api_key_sources = &.{ .{ .kind = .cookie, .name = "s" }, .{ .kind = .query, .name = "q" } },
+        .basic_users = &.{.{ .user = "u", .password = "p" }},
+    };
+    var fa = testing.FailingAllocator.init(testing.allocator, .{});
+    var probe = try Gate.init(fa.allocator(), opts);
+    probe.deinit();
+    const n = fa.alloc_index;
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        var f = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = i });
+        try testing.expectError(error.OutOfMemory, Gate.init(f.allocator(), opts));
+    }
+}
+
+// Basic header parsing: header blocks, the same framing as `bearer_seeds`.
+const basic_seeds = [_]struct { seed: []const u8, found: bool }{
+    .{ .seed = seed("Authorization: Basic YWxpY2U6czNjcmV0\r\n"), .found = true },
+    .{ .seed = seed("authorization: bASIC YWxpY2U6czNjcmV0\r\n"), .found = true },
+    .{ .seed = seed("Authorization:  Basic   YWxpY2U6czNjcmV0  \r\n"), .found = true },
+    .{ .seed = seed("Host: h\r\nAuthorization: Basic Ym9iOnB3OndpdGg6Y29sb24=\r\n"), .found = true },
+    .{ .seed = seed("Authorization: Basic YWxpY2U6\r\n"), .found = true }, // empty password
+    .{ .seed = seed("Authorization: Basic bm9jb2xvbg==\r\n"), .found = false }, // no colon
+    .{ .seed = seed("Authorization: Basic YWxpY2U6czNjcmV0=\r\n"), .found = false }, // bad padding
+    .{ .seed = seed("Authorization: Basic Ym9iOnB3OndpdGg6Y29sb24\r\n"), .found = false }, // padding stripped
+    .{ .seed = seed("Authorization: Basic \xff\xfe\xfd\r\n"), .found = false },
+    .{ .seed = seed("Authorization: Basic\r\n"), .found = false },
+    .{ .seed = seed("Authorization: Basic\tYWxpY2U6czNjcmV0\r\n"), .found = false },
+    .{ .seed = seed("Authorization: Bearer YWxpY2U6czNjcmV0\r\n"), .found = false },
+    .{ .seed = seed("Proxy-Authorization: Basic YWxpY2U6czNjcmV0\r\n"), .found = false },
+    .{ .seed = seed("Authorization: Basic YWxpY2U6czNjcmV0"), .found = true }, // no CRLF
+    .{ .seed = seed("Host: h\r\n"), .found = false },
+    .{ .seed = seed("\r\n"), .found = false },
+};
+const basic_corpus = blk: {
+    var c: [basic_seeds.len][]const u8 = undefined;
+    for (basic_seeds, 0..) |b, i| c[i] = b.seed;
+    break :blk c;
+};
+const BasicMark = fz.Marker(enum { absent, found });
+
+test "fuzz basic credentials never panic" {
+    try testing.fuzz({}, fuzzBasicCredentialsSmith, .{ .corpus = &basic_corpus });
+}
+
+test "fuzz driver: AAA_GATE_FUZZ (basic credentials)" {
+    try fz.fuzz_driver.run(fuzzBasicCredentials, .{ .prefix = "AAA_GATE_FUZZ", .name = "aaa-gate-basic" });
+}
+
+test "fuzz harness: basic credentials, 300 seeds, reaches every outcome" {
+    try BasicMark.reach(fuzzBasicCredentials, "aaa-gate-basic", 300);
+}
+
+fn fuzzBasicCredentialsSmith(_: void, smith: *std.testing.Smith) !void {
+    var script: [fz.script_cap]u8 = undefined;
+    const n = smith.slice(&script);
+    try fz.runFrom(fuzzBasicCredentials, smith, script[0..n]);
+}
+
+fn fuzzBasicCredentials(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
+    var buf: [256]u8 = undefined;
+    const len: usize = fz.drawInput(S, smith, &buf, &basic_corpus);
+    var body: http.Server.RequestBody = .{ .none = .fixed("") };
+    const req = fuzzRequest(buf[0..len], "", &body);
+    var out: [basic_credentials_max]u8 = undefined;
+    const c = basicPresented(&req, &out) orelse {
+        BasicMark.mark(.absent);
+        return;
+    };
+    // The user never holds the separator; both halves live inside `out`.
+    try testing.expect(std.mem.indexOfScalar(u8, c.user, ':') == null);
+    try testing.expect(@intFromPtr(c.password.ptr) + c.password.len <= @intFromPtr(&out) + out.len);
+    // The decision half must also be total on whatever came out.
+    var g = try Gate.init(gpa, .{ .auth_mode = .basic, .basic_users = &.{.{ .user = "alice", .password = "s3cret" }} });
+    defer g.deinit();
+    _ = g.verifyBasic(c);
+    BasicMark.mark(.found);
+}
+
+test "corpus: every basic seed reaches basicPresented and the found/absent split is pinned" {
+    for (basic_seeds) |b| {
+        var smith: std.testing.Smith = .{ .in = b.seed };
+        var buf: [256]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        try testing.expect(len != 0);
+        var body: http.Server.RequestBody = .{ .none = .fixed("") };
+        const req = fuzzRequest(buf[0..len], "", &body);
+        var out: [basic_credentials_max]u8 = undefined;
+        try testing.expectEqual(b.found, basicPresented(&req, &out) != null);
+    }
+}
+
+// Cookie extraction through the gate's source list: header blocks with
+// `Cookie` lines, one or several.
+const cookie_seeds = [_][]const u8{
+    seed("Cookie: session=abc\r\n"),
+    seed("Cookie: a=1; session=abc; b=2\r\n"),
+    seed("cookie: session=\"abc\"\r\n"),
+    seed("Cookie: a=1\r\nCookie: session=abc\r\n"), // second field line
+    seed("Cookie: session=first; session=second\r\n"),
+    seed("Cookie: session=\r\n"), // empty: absent
+    seed("Cookie: session =  abc \r\n"),
+    seed("Cookie: sessionx=abc\r\n"),
+    seed("Cookie: Session=abc\r\n"),
+    seed("Cookie: session\r\n"), // no '='
+    seed("Cookie: ;;;===;\r\n"),
+    seed("Cookie: session=\xff\xfe;\r\n"),
+    seed("Cookie: session=abc"), // no CRLF
+    seed("Host: h\r\n"),
+    seed("\r\n"),
+};
+const CookieMark = fz.Marker(enum { absent, found });
+
+test "fuzz cookie key extraction never panics" {
+    try testing.fuzz({}, fuzzCookieKeySmith, .{ .corpus = &cookie_seeds });
+}
+
+test "fuzz driver: AAA_GATE_FUZZ (cookie key)" {
+    try fz.fuzz_driver.run(fuzzCookieKey, .{ .prefix = "AAA_GATE_FUZZ", .name = "aaa-gate-cookie" });
+}
+
+test "fuzz harness: cookie key, 300 seeds, reaches every outcome" {
+    try CookieMark.reach(fuzzCookieKey, "aaa-gate-cookie", 300);
+}
+
+fn fuzzCookieKeySmith(_: void, smith: *std.testing.Smith) !void {
+    var script: [fz.script_cap]u8 = undefined;
+    const n = smith.slice(&script);
+    try fz.runFrom(fuzzCookieKey, smith, script[0..n]);
+}
+
+fn fuzzCookieKey(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
+    var buf: [256]u8 = undefined;
+    const len: usize = fz.drawInput(S, smith, &buf, &cookie_seeds);
+    // A US octet divides the header block from the query string, as for the
+    // api-key harness, so cookie and query sources are exercised together.
+    const split: usize = fuzzSplitAt(buf[0..len]);
+    var body: http.Server.RequestBody = .{ .none = .fixed("") };
+    const req = fuzzRequest(buf[0..split], buf[@min(split + 1, len)..len], &body);
+    var g = try Gate.init(gpa, .{
+        .auth_mode = .api_key,
+        .api_key_sources = &.{
+            .{ .kind = .cookie, .name = "session" },
+            .{ .kind = .query, .name = "api_key" },
+        },
+    });
+    defer g.deinit();
+    const k = apiKeyPresented(&g, &req) orelse {
+        CookieMark.mark(.absent);
+        return;
+    };
+    try testing.expect(k.len != 0);
+    try testing.expect(k[0] != ' ' and k[0] != '\t' and k[k.len - 1] != ' ' and k[k.len - 1] != '\t');
+    CookieMark.mark(.found);
+}
+
+test "corpus: every cookie seed reaches the extractor and the found/absent split is pinned" {
+    const expect_found = [_]bool{ true, true, true, true, true, false, true, false, false, false, false, true, true, false, false };
+    var g = try Gate.init(testing.allocator, .{
+        .auth_mode = .api_key,
+        .api_key_sources = &.{.{ .kind = .cookie, .name = "session" }},
+    });
+    defer g.deinit();
+    for (cookie_seeds, expect_found) |sd, want| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [256]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        try testing.expect(len != 0);
+        var body: http.Server.RequestBody = .{ .none = .fixed("") };
+        const req = fuzzRequest(buf[0..len], "", &body);
+        try testing.expectEqual(want, apiKeyPresented(&g, &req) != null);
+    }
 }

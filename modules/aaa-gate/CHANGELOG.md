@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-17** — echo parity (KeyAuth + BasicAuth v5.4.0): HTTP Basic scheme (`AuthMode.basic` / `.any`,
+  `Options.basic_users`/`basic_verify`, `addBasicUser`/`removeBasicUser`, `verifyBasic`,
+  `basicCredentialsOf`; `WWW-Authenticate: Basic realm`, default realm `Restricted`; stored as
+  SHA-256(user:password), decoded with `b64ct`; new dependency `b64ct`), ordered API-key sources
+  (`Options.api_key_sources`: header with optional prefix, query, cookie; `cookieValue`), and
+  `Identity.Scheme.basic`. Form-field lookup is deliberately not offered (body would be consumed).
+  Fuzz harnesses for Basic header parsing and cookie extraction.
+
 - **2026-10-12** — `http.Method` grew `.connect`, `.trace`, `.other` (http R9): under
   `protect = .mutations` TRACE is a read (RFC 9110 §9.2.1), CONNECT and any extension method are
   gated and audited like writes (fail closed).

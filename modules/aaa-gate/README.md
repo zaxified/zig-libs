@@ -14,7 +14,8 @@ RFC 9110.
   (`std.atomic.Mutex`, the ratelimit pattern); token hashing outside the
   lock; no hidden globals, caller-supplied allocator.
 - **Deps:** `router` (Middleware/Ctx/Next, the reserved `Ctx.data` slot),
-  `http` (`Request.header`/`peerAddress`, `ResponseWriter`).
+  `http` (`Request.header`/`peerAddress`, `ResponseWriter`), `b64ct`
+  (constant-time Basic credential decoding).
 
 Import name: the module registers as **`aaa-gate`** —
 `@import("aaa-gate")` (a hyphen is fine in a module name, like
@@ -64,6 +65,31 @@ var gate = try aaa_gate.Gate.init(gpa, .{
 });
 ```
 
+HTTP Basic (`curl -u`, webhook senders) and other API-key sources:
+
+```zig
+var gate = try aaa_gate.Gate.init(gpa, .{
+    .auth_mode = .any,                    // bearer, API key or Basic (.basic = Basic only)
+    .basic_users = &.{.{ .user = "ops", .password = pw }}, // SHA-256(user:password) stored
+    // .basic_verify = myBasicVerify,     // dynamic store; compare with secretEqual
+    .realm = "api",                       // Basic realm (default "Restricted")
+    .api_key = key,
+    // Ordered key sources REPLACE api_key_header/api_key_query_param; the first
+    // source that carries a value decides:
+    .api_key_sources = &.{
+        .{ .kind = .header, .name = "Authorization", .prefix = "Token " },
+        .{ .kind = .query, .name = "api_key" },
+        .{ .kind = .cookie, .name = "session" }, // every Cookie field line is scanned
+    },
+});
+try gate.addBasicUser("ci", ci_pw); // rotation: gate.removeBasicUser(user, pw)
+```
+
+A form-field source is deliberately absent: the gate runs before the handler
+and reading the urlencoded body would consume it. `Identity.scheme` is
+`.basic` for a Basic login; the username is not kept (digests only) — use
+`basic_verify` if a handler needs it.
+
 A bearer store the gate cannot mirror (an operator token file another
 process rewrites), a JSON denial body, and one open endpoint:
 
@@ -111,6 +137,8 @@ request and consumes the same policy, constant-time compares included,
 without `router` anywhere. The extraction cores are public too, string-level:
 `bearerTokenOf(authorization)` (RFC 9110 scheme parse), `queryValue(query,
 name)` (verbatim, no percent-decoding) for API keys, and
+`basicCredentialsOf(authorization, &buf)` + `verifyBasic(creds)`,
+`cookieValue(cookie_header, name)`, and
 `clientKeyFrom(last_xff, x_real_ip, peer, &buf)` (the shared
 XFF-rightmost → X-Real-IP → peer trust rule, clamped). Only reading the raw
 header values out of your request type remains yours.
