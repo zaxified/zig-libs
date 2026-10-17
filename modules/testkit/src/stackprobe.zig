@@ -109,6 +109,10 @@ pub const Expect = struct {
     /// The entry point burns (a zero run must exist). `false` for a call
     /// that needs no burn and is probed for needles only.
     burn: bool = true,
+    /// No report on stderr when the probe fails: for a positive control that
+    /// is expected to fail (a lane treats stderr from a passing test as a
+    /// failure).
+    quiet: bool = false,
 };
 
 pub fn Probe(comptime cfg: Config) type {
@@ -395,7 +399,7 @@ pub fn Probe(comptime cfg: Config) type {
             }
             const no_burn = expect.burn and total.burn_top == 0;
             const bad = total.needle_hits != 0 or total.residue_bytes != 0 or no_burn;
-            if (cfg.verbose or bad) {
+            if (cfg.verbose or (bad and !expect.quiet)) {
                 std.debug.print(
                     "\n=== STACKPROBE {s} ({t}): needles {d} ({d} windows, {d}..{d} B deep), residue {d} B (to {d} B), " ++
                         "burn {d} B from {d} B, dirty {d} B ===\n",
@@ -449,7 +453,7 @@ test "stackprobe: a burned entry is clean, an unburned one is caught" {
     try skipUnlessOptimized();
     std.crypto.hash.sha2.Sha384.hash("testkit stackprobe", &t_secret, .{});
     _ = try T.run("good", goodEntry, .{ &t_secret, &t_out }, &.{ &t_secret, &t_out }, .{});
-    try std.testing.expectError(error.DeadStackResidue, T.run("unburned (expected to fail)", unburnedEntry, .{ &t_secret, &t_out }, &.{ &t_secret, &t_out }, .{}));
+    try std.testing.expectError(error.DeadStackResidue, T.run("unburned (expected to fail)", unburnedEntry, .{ &t_secret, &t_out }, &.{ &t_secret, &t_out }, .{ .quiet = true }));
 }
 
 noinline fn publicDeepBody() void {
@@ -470,7 +474,7 @@ test "stackprobe: residue under a too-short burn fails on its own (no needle, a 
     // every other test — the unburned entry above fails on "no burn" anyway.
     try skipUnlessOptimized();
     std.crypto.hash.sha2.Sha384.hash("testkit stackprobe residue", &t_secret, .{});
-    try std.testing.expectError(error.DeadStackResidue, T.run("short burn (expected to fail)", shortBurnedEntry, .{ &t_secret, &t_out }, &.{&t_secret}, .{}));
+    try std.testing.expectError(error.DeadStackResidue, T.run("short burn (expected to fail)", shortBurnedEntry, .{ &t_secret, &t_out }, &.{&t_secret}, .{ .quiet = true }));
 }
 
 test "analyse: residue counts bytes that are neither zero nor paint, below the burn" {

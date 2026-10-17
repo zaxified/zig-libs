@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-17** — Stack probe test silent on success (it printed every report; a lane treats stderr from a passing test as a failure). Test only.
+
 - **2026-10-17** — **NO CONSUMER-VISIBLE CHANGE:** `Encryptor`/`Decryptor` `update` burn 512 B → 1 KiB: at CI's `-Dcpu=x86_64_v3+aes+pclmul+adx` `Decryptor(Aes256).update` reaches 719 B (stack probe).
 
 - **2026-10-16** — Scope core → parity (grade 3 → 2). New, all additive: `Encryptor`/`Decryptor` (key schedule once, chain across `update`s, `setIv`, `initInto`, `wipe`); `StreamEncryptor`/`StreamDecryptor` (any chunk length, `Padding` none/pkcs7/ansi_x923/iso7816/zero applied in `finish`); ciphertext stealing `encryptCts`/`decryptCts` (CS1/CS2/CS3); paddings `padAnsiX923`/`unpadAnsiX923`, `padIso10126`/`unpadIso10126`, `padIso7816`/`unpadIso7816`, `padZero`/`unpadZero`/`paddedLenZero`, `paddedLen`. Decryption now runs 8 blocks per `decryptWide` (16 KiB 4.7× faster). Dead-stack burns measured: one-shot 4 KiB → 1 KiB, CTS 1.5 KiB, `initInto`/`update` 512 B. Bench `zig build bench-aescbc`: 0.19–0.83× Go crypto/cipher, ≤ 1.03× OpenSSL 3.5.5. Fuzz harnesses `aescbc-cts`, `aescbc-stream`; ctgrind targets x923, iso7816, zero.
