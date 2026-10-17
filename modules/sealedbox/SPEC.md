@@ -246,6 +246,11 @@ claimed this module "INHERITS std X25519 ... (NOT a finding)" citing a measureme
 
 ## Backlog / deferred
 
+- **Own lane-parallel Poly1305 duplicates `chachapoly`'s** (found 2026-10-17 triaging an axp size request): src/poly1305.zig
+  (306 lines, 4-way, 26-bit limbs) and chachapoly/src/poly1305.zig (1455 lines, L-lane) are two independent implementations of the
+  same thing (~9.5 KB of axp's binary is this copy). Dedupe: use chachapoly's (or one shared module), keep the differential tests
+  against std; check grade/ctgrind of both. Salsa20 (~4.6 KB) has no sibling — stays. Separately, a `.small` profile could pick a
+  scalar Poly1305 (CONVENTIONS §4.2) — measure after the dedupe.
 - **Speed to parity (P2 needs ≤ 1x on every row)** *(bench 2026-10-07)*: the bulk rows were
   fixed by the multi-block rewrite (2.3–2.4x → 1.14–1.21x); (a) X25519 was std's, ~1.25x
   libsodium on every message size — replaced by ct25519's on 2026-10-09 (seal 64 B ~0.75x,

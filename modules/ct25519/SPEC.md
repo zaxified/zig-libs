@@ -783,6 +783,16 @@ row 1.09× → P2, with a thin margin under the 1.1× tolerance -- a noisy run c
 
 ## Backlog / deferred
 
+- **Build option: `ct25519-base-comb`** (axp request 2026-10-17; mechanism CONVENTIONS §4.2 — the next knob after rsa, a
+  consumer request with a measurement). `comb_table` (32×8 Edwards25519 points, 43 008 B `.rodata`, src/root.zig:252) plus its
+  select/recode code is linked by every keypair generator (sealedbox → `X25519`). axp-agent, ReleaseSmall stripped: x86_64-musl
+  772 328 → 858 776 B (+11.2 %), mips32 BE soft-float 1 031 872 → 1 160 464 B (+12.5 %); ~59 KB of the +84.5 KB delta is
+  ct25519/sealedbox. The agent does one keygen + one open per enrollment, so the comb buys nothing there.
+  Plan: `.small` (or `-Dct25519-base-comb=false`) → `mulBase(s)` = `mul(basePoint, s)` (the existing constant-time variable-base
+  4-bit window over a 16-entry runtime table): same results (the comb test already compares the two, src/root.zig:1554),
+  slower keygen/sign. Re-run ctgrind for the `.small` build once; bench delta into SPEC § Build options.
+  Not by `builtin.mode == .ReleaseSmall` (axp's alternative): a mode must not silently change what the graded default is;
+  ReleaseSmall consumers set `.profile = .small` explicitly (CONVENTIONS §4.2 rule 1).
 - **Performance: the X25519 shared secret, 1.09× libsodium / 1.21× OpenSSL** *(bench
   2026-10-10, `zig build bench-ct25519`)*: the only row above 1.0 by more than noise, and the
   one between P2 and P1. OpenSSL's `x25519-x86_64` runs the same 4×64 MULX/ADX radix, so the

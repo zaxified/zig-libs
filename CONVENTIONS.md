@@ -394,9 +394,9 @@ Rules:
   certificate) must branch the same way before the knob is used under `.small` across the
   closure.
 
-**Known gaps** (2026-10-17): `scripts/test.sh` stamps fingerprint sources, not `-D` options,
-so a lane run with a non-default profile must not reuse default-profile stamps; no CI lane
-runs `.small` yet; the dependents of `rsa` are not yet adapted. Candidates for further knobs,
+**Known gaps** (2026-10-17): no CI lane runs `.small` yet (a stamp's lane key already
+includes the zig arguments, so a `-Dprofile=small` run keeps stamps of its own); the
+dependents of `rsa` are not yet adapted. Candidates for further knobs,
 with measurements and notes, are in each module's SPEC § Backlog (entries titled
 "Build option: …": montint, ssh, tlsclient, x509, ed448, tz, brotli, zstd, p384, p521).
 
