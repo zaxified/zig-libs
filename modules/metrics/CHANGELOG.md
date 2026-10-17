@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-17** — ADDED: `ProcessCollector` — client_golang's process collector (`process_cpu_seconds_total`,
+  `process_open_fds`, `process_max_fds`, `process_{virtual,resident}_memory_bytes`,
+  `process_virtual_memory_max_bytes`, `process_start_time_seconds`,
+  `process_network_{receive,transmit}_bytes_total`), optional namespace, any pid, read through
+  `procnet` — a NEW dependency of this module.
+
 - **2026-10-17** — **Summary** (client_golang `Summary` with `Objectives`, third wave of the S2 work).
   - ADDED: `Registry.summary` / `summaryVec`, `Summary` (`observe`, `snapshot`), `SummaryOptions`,
     `Objective`, `default_objectives`, `max_objectives`, `Registry.clock` (the window's time

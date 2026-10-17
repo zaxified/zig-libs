@@ -168,7 +168,7 @@ const module_list = [_]Module{
     // strings, the hyphen is fine (cf. the community's "known-folders").
     .{ .name = "security-headers", .libs = &.{"web"}, .deps = &.{ "router", "http" }, .test_deps = &.{"testkit"}, .loopback = true },
     .{ .name = "cors", .libs = &.{"web"}, .deps = &.{ "router", "http" }, .test_deps = &.{"testkit"}, .loopback = true },
-    .{ .name = "metrics", .libs = &.{"web"}, .deps = &.{ "router", "http" }, .test_deps = &.{"testkit"}, .loopback = true },
+    .{ .name = "metrics", .libs = &.{"web"}, .deps = &.{ "router", "http", "procnet" }, .test_deps = &.{"testkit"}, .loopback = true },
     .{ .name = "validate", .libs = &.{"web"}, .deps = &.{ "router", "http", "netaddr", "datefmt" }, .test_deps = &.{"testkit"}, .loopback = true },
     .{ .name = "openapi", .libs = &.{"web"}, .deps = &.{ "router", "http" }, .test_deps = &.{"testkit"}, .loopback = true },
     .{ .name = "health", .libs = &.{"web"}, .deps = &.{ "router", "http" } },

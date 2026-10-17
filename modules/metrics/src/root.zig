@@ -67,6 +67,7 @@ const builtin = @import("builtin");
 const testkit = @import("testkit");
 const router = @import("router");
 const http = @import("http");
+const procnet = @import("procnet");
 /// The streaming-quantile engine behind `Summary` (CKMS, perks-compatible).
 const summary_mod = @import("summary.zig");
 pub const SummaryOptions = summary_mod.Options;
@@ -88,7 +89,7 @@ pub const meta = .{
     // spinlocks for registration and histogram observe (see module doc).
     .concurrency = .threadsafe,
     .model_after = "Prometheus client_golang (registry/instrument semantics) + Prometheus text exposition format 0.0.4",
-    .deps = .{ "router", "http" },
+    .deps = .{ "router", "http", "procnet" },
 };
 
 const Allocator = std.mem.Allocator;
@@ -1217,6 +1218,89 @@ pub const Sink = struct {
             try writeHeader(s.w, fam.name, fam.help, fam.kind, s.format);
         }
         return fam;
+    }
+};
+
+/// client_golang's process collector (`NewProcessCollector`), Linux /proc
+/// through `procnet`: the nine `process_*` families Prometheus dashboards
+/// expect, same names, help, types and values (CPU and start time at
+/// USER_HZ 100, resident memory at the runtime page size, an `unlimited`
+/// limit as 2^64-1, network bytes from the process's own network namespace
+/// — `/proc/<pid>/net/netstat` `IpExt`, as procfs reads it). A file that
+/// cannot be read drops its families from that scrape, as client_golang does
+/// without `ReportErrors`.
+pub const ProcessCollector = struct {
+    gpa: Allocator,
+    io: std.Io,
+    /// Which process: this one (the usual) or another pid.
+    ref: procnet.ProcRef = .self,
+    /// Boot time (`/proc/stat` `btime`), read once by `register`.
+    btime: u64 = 0,
+
+    const base = [_]struct { []const u8, []const u8, Kind }{
+        .{ "process_cpu_seconds_total", "Total user and system CPU time spent in seconds.", .counter },
+        .{ "process_max_fds", "Maximum number of open file descriptors.", .gauge },
+        .{ "process_network_receive_bytes_total", "Number of bytes received by the process over the network.", .counter },
+        .{ "process_network_transmit_bytes_total", "Number of bytes sent by the process over the network.", .counter },
+        .{ "process_open_fds", "Number of open file descriptors.", .gauge },
+        .{ "process_resident_memory_bytes", "Resident memory size in bytes.", .gauge },
+        .{ "process_start_time_seconds", "Start time of the process since unix epoch in seconds.", .gauge },
+        .{ "process_virtual_memory_bytes", "Virtual memory size in bytes.", .gauge },
+        .{ "process_virtual_memory_max_bytes", "Maximum amount of virtual memory available in bytes.", .gauge },
+    };
+    const cpu = 0;
+    const max_fds = 1;
+    const net_rx = 2;
+    const net_tx = 3;
+    const open_fds = 4;
+    const rss = 5;
+    const start = 6;
+    const vsize = 7;
+    const vsize_max = 8;
+
+    /// Register the families on `r`, prefixed `<namespace>_` when
+    /// `namespace` is not empty (client_golang `Namespace`). `pc` must
+    /// outlive the registry.
+    pub fn register(pc: *ProcessCollector, r: *Registry, namespace: []const u8) RegisterError!void {
+        if (procnet.readStat(pc.gpa, pc.io)) |st| {
+            defer st.deinit(pc.gpa);
+            pc.btime = st.btime;
+        } else |err| return err;
+        var bufs: [base.len][128]u8 = undefined;
+        var descs: [base.len]Desc = undefined;
+        for (base, &descs, &bufs) |b, *d, *buf| {
+            const name = if (namespace.len == 0)
+                b[0]
+            else
+                std.fmt.bufPrint(buf, "{s}_{s}", .{ namespace, b[0] }) catch return error.InvalidName;
+            d.* = .{ .name = name, .help = b[1], .kind = b[2] };
+        }
+        return r.registerCollector(&descs, .{ .ctx = pc, .collect = collect });
+    }
+
+    fn collect(ctx: ?*anyopaque, sink: *Sink) anyerror!void {
+        const pc: *ProcessCollector = @ptrCast(@alignCast(ctx.?));
+        const stat = procnet.readPidStat(pc.io, pc.ref);
+        const limits = procnet.readPidLimits(pc.io, pc.ref);
+        const fds = procnet.countFds(pc.io, pc.ref);
+        const net = try procnet.readPidNetstat(pc.gpa, pc.io, pc.ref);
+        defer net.deinit(pc.gpa);
+        const octets = net.ipExtOctets();
+
+        const unlimited: f64 = @floatFromInt(std.math.maxInt(u64));
+        if (stat) |s| try sink.counter(cpu, &.{}, s.cpuSeconds());
+        if (limits) |l| try sink.gauge(max_fds, &.{}, if (l.maxOpenFiles()) |v| @floatFromInt(v) else unlimited);
+        if (net.entries.len != 0) {
+            try sink.counter(net_rx, &.{}, if (octets) |o| @floatFromInt(o.in) else 0);
+            try sink.counter(net_tx, &.{}, if (octets) |o| @floatFromInt(o.out) else 0);
+        }
+        if (fds) |n| try sink.gauge(open_fds, &.{}, @floatFromInt(n));
+        if (stat) |s| {
+            try sink.gauge(rss, &.{}, @floatFromInt(s.residentBytesNow()));
+            try sink.gauge(start, &.{}, s.startTimeSeconds(pc.btime));
+            try sink.gauge(vsize, &.{}, @floatFromInt(s.vsize));
+        }
+        if (limits) |l| try sink.gauge(vsize_max, &.{}, if (l.maxAddressSpace()) |v| @floatFromInt(v) else unlimited);
     }
 };
 
@@ -3799,6 +3883,69 @@ test "collector: Sink.summary writes quantile lines, refuses unsorted quantiles"
     defer reg2.deinit();
     try reg2.registerCollector(&.{.{ .name = "cs", .help = "h", .kind = .summary }}, .{ .collect = Coll.bad });
     try testing.expectError(error.WriteFailed, scrapeInto(&reg2, &buf));
+}
+
+test "ProcessCollector: client_golang's process_* families for this process" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var reg = Registry.init(testing.allocator);
+    defer reg.deinit();
+    var pc: ProcessCollector = .{ .gpa = testing.allocator, .io = testing.io };
+    try pc.register(&reg, "");
+    try testing.expect(pc.btime > 1_000_000_000); // a plausible Unix boot time
+
+    var buf: [8192]u8 = undefined;
+    const out = try scrapeInto(&reg, &buf);
+    try validateExpositionText(out);
+    // Families in client_golang's (sorted) order; the network pair only
+    // where /proc/self/net/netstat exists, which it does on any Linux.
+    const want = [_][]const u8{
+        "# TYPE process_cpu_seconds_total counter\nprocess_cpu_seconds_total ",
+        "# TYPE process_max_fds gauge\nprocess_max_fds ",
+        "# TYPE process_network_receive_bytes_total counter\nprocess_network_receive_bytes_total ",
+        "# TYPE process_network_transmit_bytes_total counter\nprocess_network_transmit_bytes_total ",
+        "# TYPE process_open_fds gauge\nprocess_open_fds ",
+        "# TYPE process_resident_memory_bytes gauge\nprocess_resident_memory_bytes ",
+        "# TYPE process_start_time_seconds gauge\nprocess_start_time_seconds ",
+        "# TYPE process_virtual_memory_bytes gauge\nprocess_virtual_memory_bytes ",
+        "# TYPE process_virtual_memory_max_bytes gauge\nprocess_virtual_memory_max_bytes ",
+    };
+    var at: usize = 0;
+    for (want) |w| {
+        const i = std.mem.indexOfPos(u8, out, at, w) orelse {
+            std.debug.print("missing or out of order: {s}\n---\n{s}\n", .{ w, out });
+            return error.TestUnexpectedResult;
+        };
+        at = i + w.len;
+    }
+    // max_fds is RLIMIT_NOFILE's soft limit.
+    var lim: std.posix.rlimit = undefined;
+    lim = try std.posix.getrlimit(.NOFILE);
+    var line_buf: [96]u8 = undefined;
+    var lw: std.Io.Writer = .fixed(&line_buf);
+    try lw.writeAll("\nprocess_max_fds ");
+    if (lim.cur == std.posix.RLIM.INFINITY) try writeFloat(&lw, @floatFromInt(std.math.maxInt(u64))) else try writeFloat(&lw, @floatFromInt(lim.cur));
+    try lw.writeByte('\n');
+    try testing.expect(std.mem.indexOf(u8, out, lw.buffered()) != null);
+
+    // Namespace prefix.
+    var reg2 = Registry.init(testing.allocator);
+    defer reg2.deinit();
+    var pc2: ProcessCollector = .{ .gpa = testing.allocator, .io = testing.io };
+    try pc2.register(&reg2, "app");
+    const out2 = try scrapeInto(&reg2, &buf);
+    try testing.expect(std.mem.indexOf(u8, out2, "\napp_process_open_fds ") != null);
+    // Its names are taken now.
+    try testing.expectError(error.AlreadyRegistered, pc2.register(&reg2, "app"));
+}
+
+test "ProcessCollector: a pid that does not exist yields no samples, not an error" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var reg = Registry.init(testing.allocator);
+    defer reg.deinit();
+    var pc: ProcessCollector = .{ .gpa = testing.allocator, .io = testing.io, .ref = .{ .pid = std.math.maxInt(u32) } };
+    try pc.register(&reg, "");
+    var buf: [1024]u8 = undefined;
+    try testing.expectEqualStrings("", try scrapeInto(&reg, &buf));
 }
 
 // ── external anchor: client_golang + expfmt + textparse ────────────────────
