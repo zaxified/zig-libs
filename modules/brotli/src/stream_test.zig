@@ -9,7 +9,6 @@
 //! output, and the two ends' own failures reported as themselves.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const testing = std.testing;
 const brotli = @import("root.zig");
 const corpus = @import("interop_corpus.zig");
@@ -442,40 +441,15 @@ test "stream: the reader is left just past what the decoder consumed" {
 
 const fuzz_driver = @import("testkit").fuzz.driver;
 
-/// Memory that ends at an unreadable page: the harness puts its input
-/// there, so a read past the input's end faults — the driver names the
-/// seed — instead of reading whatever follows, and `decompressInto`'s
-/// exact-size output, so a write past it does too. The decoder's hot loop
-/// reads the input and writes the output through many-pointers
-/// (`decoder.HotBits`, `Sink.tailPtr`), which have no bounds check even
-/// under ReleaseSafe, and all four decoders share it, so the differential
-/// verdicts cannot see such an access either. (Linux; elsewhere a plain
-/// buffer.)
-pub fn Guarded(comptime cap: usize) type {
-    return struct {
-        var region: ?[]u8 = null;
-        var plain: [cap]u8 = undefined;
-
-        /// The last `len` bytes before the guard page.
-        pub fn tail(len: usize) []u8 {
-            std.debug.assert(len <= cap);
-            const room = room: {
-                if (builtin.os.tag != .linux) break :room plain[0..];
-                if (region == null) {
-                    const page = std.heap.pageSize();
-                    const body = std.mem.alignForward(usize, cap, page);
-                    const m = std.posix.mmap(null, body + page, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0) catch
-                        @panic("Guarded: mmap");
-                    if (std.os.linux.errno(std.os.linux.mprotect(m.ptr + body, page, .{})) != .SUCCESS)
-                        @panic("Guarded: mprotect");
-                    region = m[body - cap .. body];
-                }
-                break :room region.?;
-            };
-            return room[cap - len ..];
-        }
-    };
-}
+/// Memory that ends at an unreadable page (`testkit.guard`): the harness
+/// puts its input there, so a read past the input's end faults — the driver
+/// names the seed — instead of reading whatever follows, and
+/// `decompressInto`'s exact-size output, so a write past it does too. The
+/// decoder's hot loop reads the input and writes the output through
+/// many-pointers (`decoder.HotBits`, `Sink.tailPtr`), which have no bounds
+/// check even under ReleaseSafe, and all four decoders share it, so the
+/// differential verdicts cannot see such an access either.
+pub const Guarded = @import("testkit").guard.Guarded;
 
 const GuardedInput = Guarded(32 << 10);
 const GuardedOutput = Guarded(fz_max_output);

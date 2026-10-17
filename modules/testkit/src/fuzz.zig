@@ -50,6 +50,13 @@ const std = @import("std");
 pub const driver = @import("fuzz_driver.zig");
 pub const Rng = driver.Rng;
 
+/// Transport and allocator faults drawn from the harness's source.
+pub const FaultPlan = fault.FaultPlan;
+pub const ChunkedReader = fault.ChunkedReader;
+pub const ChunkedWriter = fault.ChunkedWriter;
+pub const failingAllocator = fault.failingAllocator;
+const fault = @import("fault.zig");
+
 /// A corpus entry carrying `frame` verbatim.
 ///
 ///     const seeds = [_][]const u8{

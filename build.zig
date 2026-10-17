@@ -750,6 +750,9 @@ pub fn build(b: *std.Build) void {
             // not Zig 0.16's byte-wise compiler_rt memset. A bench that does
             // so says it on its card; the module itself never imports it.
             if (!std.mem.eql(u8, m.name, "fastmem")) bench_mod.addImport("fastmem", fastModuleGraph(b, target, &fast_mods, "fastmem"));
+            // `testkit` for every bench driver (2026-10-17): `testkit.bench` is
+            // the timing/ratio skeleton 38 benches had copied by hand.
+            if (!std.mem.eql(u8, m.name, "testkit")) bench_mod.addImport("testkit", fastModuleGraph(b, target, &fast_mods, "testkit"));
 
             const bench_exe = b.addExecutable(.{
                 .name = b.fmt("bench-{s}", .{m.name}),

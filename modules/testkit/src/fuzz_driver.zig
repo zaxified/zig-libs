@@ -13,11 +13,19 @@
 //!     <PREFIX>_MS=<limit per input>    default 2000
 //!     <PREFIX>_SEEDFILE=<path>         the current seed, for a crash
 //!     <PREFIX>_INPUT=<path>            replay one saved `--fuzz` input
+//!     <PREFIX>_SHRINK=<seed>           shrink that seed (see shrink.zig;
+//!                                      `_SHRINK_MS`, `_SHRINK_OUT`)
+//!     <PREFIX>_CHOICES=<path>          replay a shrunk choice tape, traced
 //!
-//! A hang is `HANG <name> seed=N` and exit 124 within the limit; a failing
-//! input is `FAIL <name> seed=N: <error>`; a panic leaves its seed in the seed
-//! file. Any seed replays with `<PREFIX>=1,N`. One job per core, each with a
-//! disjoint seed range, is the caller's runner (one process per job).
+//! A hang is `HANG <name> seed=N` and exit 124 shortly after the limit (the
+//! watchdog samples every 50 ms); a failing input is `FAIL <name> seed=N:
+//! <error>`; a panic leaves its seed in the seed file. Each is followed by
+//! the line that shrinks it. Any seed replays with `<PREFIX>=1,N`. One job
+//! per core, each with a disjoint seed range, is the caller's runner (one
+//! process per job).
+//!
+//! Cost: 1.00–1.04× a bare seed loop over the same harness, seed file
+//! included (`zig build bench-testkit`, 2026-10-17).
 //!
 //! ## The harness is generic over its source of choices
 //!
@@ -38,6 +46,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const linux = std.os.linux;
+const shrinker = @import("shrink.zig");
 
 /// Where the driver runs: Linux (it calls the kernel directly -- clock,
 /// sleep, open) with 64-bit atomics (the watchdog's nanosecond state). That
@@ -47,13 +56,77 @@ const linux = std.os.linux;
 pub const supported = builtin.os.tag == .linux and @bitSizeOf(usize) == 64;
 
 /// `std.testing.Smith`'s drawing methods, from a PRNG.
+///
+/// With a `tape` it also records every choice it makes (the shrinker's first
+/// run of a failing seed), or answers every choice from the tape instead of
+/// the PRNG (each shrink candidate, `<PREFIX>_CHOICES` replay). It stays this
+/// one type either way, because harnesses branch on it (`if (S != Rng)`, 93
+/// modules): a second source type would send the recorded run down the other
+/// branch and record a different input than the one that failed.
 pub const Rng = struct {
     r: std.Random,
+    tape: ?*Tape = null,
 
     pub fn valueRangeAtMost(self: *Rng, comptime T: type, at_least: T, at_most: T) T {
-        return self.r.intRangeAtMost(T, at_least, at_most);
+        const t = self.tape orelse return self.r.intRangeAtMost(T, at_least, at_most);
+        const U = std.meta.Int(.unsigned, @bitSizeOf(T));
+        const lo: U = @bitCast(at_least);
+        const span: U = @as(U, @bitCast(at_most)) -% lo;
+        const v: T = switch (t.mode) {
+            .record => v: {
+                const v = self.r.intRangeAtMost(T, at_least, at_most);
+                t.putWide(U, @as(U, @bitCast(v)) -% lo);
+                break :v v;
+            },
+            .replay => v: {
+                var off = t.getWide(U);
+                if (span != std.math.maxInt(U)) off %= span + 1;
+                break :v @bitCast(lo +% off);
+            },
+        };
+        if (t.trace) std.debug.print("  #{d} range {d}..{d} = {d}\n", .{ t.draws, at_least, at_most, v });
+        t.draws += 1;
+        return v;
     }
     pub fn value(self: *Rng, comptime T: type) T {
+        const t = self.tape orelse return plainValue(self, T);
+        const v: T = switch (@typeInfo(T)) {
+            .bool => switch (t.mode) {
+                .record => v: {
+                    const v = self.r.boolean();
+                    t.put(@intFromBool(v));
+                    break :v v;
+                },
+                .replay => t.get() % 2 == 1,
+            },
+            .@"enum" => v: {
+                const all = comptime std.enums.values(T);
+                switch (t.mode) {
+                    .record => {
+                        const v = self.r.enumValue(T);
+                        t.put(std.mem.indexOfScalar(T, all, v).?);
+                        break :v v;
+                    },
+                    .replay => break :v all[@intCast(t.get() % all.len)],
+                }
+            },
+            else => v: {
+                const U = std.meta.Int(.unsigned, @bitSizeOf(T));
+                switch (t.mode) {
+                    .record => {
+                        const v = self.r.int(T);
+                        t.putWide(U, @bitCast(v));
+                        break :v v;
+                    },
+                    .replay => break :v @bitCast(t.getWide(U)),
+                }
+            },
+        };
+        if (t.trace) std.debug.print("  #{d} {s} = {any}\n", .{ t.draws, @typeName(T), v });
+        t.draws += 1;
+        return v;
+    }
+    fn plainValue(self: *Rng, comptime T: type) T {
         return switch (@typeInfo(T)) {
             .bool => self.r.boolean(),
             .@"enum" => self.r.enumValue(T),
@@ -61,20 +134,133 @@ pub const Rng = struct {
         };
     }
     pub fn bytes(self: *Rng, buf: []u8) void {
-        self.r.bytes(buf);
+        const t = self.tape orelse return self.r.bytes(buf);
+        t.putOrGetBytes(self.r, buf);
+        if (t.trace) traceBytes(t, "bytes", buf);
+        t.draws += 1;
     }
     pub fn index(self: *Rng, len: usize) usize {
-        return self.r.uintLessThan(usize, len);
+        const t = self.tape orelse return self.r.uintLessThan(usize, len);
+        std.debug.assert(len > 0);
+        const v: usize = switch (t.mode) {
+            .record => v: {
+                const v = self.r.uintLessThan(usize, len);
+                t.put(v);
+                break :v v;
+            },
+            .replay => @intCast(t.get() % len),
+        };
+        if (t.trace) std.debug.print("  #{d} index <{d} = {d}\n", .{ t.draws, len, v });
+        t.draws += 1;
+        return v;
     }
     /// A length in `0..buf.len` and that many bytes; the length, as Smith
     /// returns it. Short lengths are as likely as long ones would be rare
     /// under a uniform draw over a large buffer, so half the draws are
     /// taken from the first 64.
     pub fn slice(self: *Rng, buf: []u8) u32 {
-        const cap: usize = if (buf.len > 64 and self.r.boolean()) 64 else buf.len;
-        const n = self.r.uintAtMost(usize, cap);
-        self.r.bytes(buf[0..n]);
+        const t = self.tape orelse return plainSlice(self.r, buf);
+        const at = switch (t.mode) {
+            .record => t.len,
+            .replay => t.at,
+        };
+        const n: usize = switch (t.mode) {
+            .record => n: {
+                const n = plainSlice(self.r, buf);
+                t.put(n);
+                for (buf[0..n]) |b| t.put(b);
+                break :n n;
+            },
+            .replay => n: {
+                const n: usize = @intCast(@min(t.get(), buf.len));
+                for (buf[0..n]) |*b| b.* = @truncate(t.get());
+                break :n n;
+            },
+        };
+        t.noteSpan(at, n);
+        if (t.trace) traceBytes(t, "slice", buf[0..n]);
+        t.draws += 1;
         return @intCast(n);
+    }
+    fn plainSlice(r: std.Random, buf: []u8) u32 {
+        const cap: usize = if (buf.len > 64 and r.boolean()) 64 else buf.len;
+        const n = r.uintAtMost(usize, cap);
+        r.bytes(buf[0..n]);
+        return @intCast(n);
+    }
+    fn traceBytes(t: *Tape, what: []const u8, b: []const u8) void {
+        const shown = b[0..@min(b.len, 48)];
+        std.debug.print("  #{d} {s}[{d}] = {x}{s}\n", .{ t.draws, what, b.len, shown, if (shown.len < b.len) " ..." else "" });
+    }
+};
+
+/// The choices of one run, one `u64` per choice: a ranged draw's offset from
+/// its minimum, an index, a length, a byte, a bool as 0/1, an enum's
+/// position. Smaller entries are simpler inputs — that is the whole order the
+/// shrinker minimises in. A replay that runs past the end reads zeros, and an
+/// entry too large for its draw is reduced modulo the draw's span, so every
+/// sequence of `u64` is a valid input.
+pub const Tape = struct {
+    mode: enum { record, replay },
+    buf: []u64,
+    /// Record: entries written. Replay: entries available.
+    len: usize = 0,
+    /// Replay: the next entry; past `len` once the run read beyond the tape.
+    at: usize = 0,
+    /// Record: a choice found the tape full (the run continued unrecorded).
+    overflow: bool = false,
+    /// Print every draw to stderr (`  #<n> range 0..255 = 17`).
+    trace: bool = false,
+    draws: usize = 0,
+    /// Where the slices are (a length entry and its bytes), when given room:
+    /// the shrinker cuts a slice as one piece — its length and its tail
+    /// together — which no edit of single entries can do.
+    spans: []Span = &.{},
+    n_spans: usize = 0,
+
+    pub const Span = struct { at: usize, len: usize };
+
+    fn noteSpan(t: *Tape, at: usize, len: usize) void {
+        if (t.n_spans == t.spans.len) return;
+        t.spans[t.n_spans] = .{ .at = at, .len = len };
+        t.n_spans += 1;
+    }
+
+    fn put(t: *Tape, v: u64) void {
+        if (t.len == t.buf.len) {
+            t.overflow = true;
+            return;
+        }
+        t.buf[t.len] = v;
+        t.len += 1;
+    }
+    fn get(t: *Tape) u64 {
+        defer t.at += 1;
+        return if (t.at < t.len) t.buf[t.at] else 0;
+    }
+    fn putWide(t: *Tape, comptime U: type, v: U) void {
+        if (@bitSizeOf(U) <= 64) return t.put(v);
+        if (@bitSizeOf(U) > 128) @compileError("fuzz.Rng: a draw wider than 128 bits");
+        t.put(@truncate(v));
+        t.put(@truncate(@as(u128, v) >> 64));
+    }
+    fn getWide(t: *Tape, comptime U: type) U {
+        if (@bitSizeOf(U) <= 64) return @truncate(t.get());
+        if (@bitSizeOf(U) > 128) @compileError("fuzz.Rng: a draw wider than 128 bits");
+        const lo: u128 = t.get();
+        const hi: u128 = t.get();
+        return @truncate(lo | hi << 64);
+    }
+    fn putOrGetBytes(t: *Tape, r: std.Random, buf: []u8) void {
+        switch (t.mode) {
+            .record => {
+                r.bytes(buf);
+                for (buf) |b| t.put(b);
+            },
+            .replay => for (buf) |*b| {
+                b.* = @truncate(t.get());
+            },
+        }
     }
 };
 
@@ -120,7 +306,10 @@ fn reportReach(name: []const u8) void {
     resetReach();
 }
 
-fn resetReach() void {
+/// Forget every reach count. For a test that runs a harness outside the
+/// driver (an in-suite smoke loop), so its arrivals are not reported as the
+/// next driver run's.
+pub fn resetReach() void {
     label_count = 0;
     counts = @splat(0);
 }
@@ -128,9 +317,32 @@ fn resetReach() void {
 // ── the watchdog ─────────────────────────────────────────────────────────────
 
 var current_seed = std.atomic.Value(u64).init(0);
-var current_start = std.atomic.Value(u64).init(0);
 var current_limit = std.atomic.Value(u64).init(0);
 var current_name: []const u8 = "";
+var current_prefix: []const u8 = "";
+
+/// Bumped at every harness entry; `busy` while a harness runs. The watchdog
+/// samples both every 50 ms: the same generation still busy for longer than
+/// the limit is a hang. No clock is read per input — two reads per seed
+/// were a tenth of a cheap harness's time (`zig build bench-testkit`,
+/// 2026-10-17) — at the price of a hang being reported up to one sampling
+/// period after the limit.
+var dog_gen = std.atomic.Value(u64).init(0);
+var dog_busy = std.atomic.Value(bool).init(false);
+
+fn enter(seed: u64) void {
+    current_seed.store(seed, .release);
+    dog_gen.store(dog_gen.load(.monotonic) +% 1, .release);
+    dog_busy.store(true, .release);
+}
+
+fn leave() void {
+    dog_busy.store(false, .release);
+}
+
+fn printShrinkHint(seed: u64) void {
+    std.debug.print("  smallest input: {s}_SHRINK={d} {s}_ONLY={s}\n", .{ current_prefix, seed, current_prefix, current_name });
+}
 var dog_running = false;
 
 fn nowNs() u64 {
@@ -139,14 +351,27 @@ fn nowNs() u64 {
     return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
 }
 
+/// Whether the watchdog, at `now`, holding the generation it last saw
+/// change (`seen`, at `since`), must call a hang. Pure, for the tests.
+fn hung(busy: bool, gen: u64, seen: *u64, since: *u64, now: u64, limit: u64) bool {
+    if (!busy or gen != seen.*) {
+        seen.* = gen;
+        since.* = now;
+        return false;
+    }
+    return now -| since.* > limit;
+}
+
 fn watchdog() void {
+    var seen: u64 = 0;
+    var since: u64 = nowNs();
     while (true) {
         const req: linux.timespec = .{ .sec = 0, .nsec = 50 * std.time.ns_per_ms };
         _ = linux.nanosleep(&req, null);
-        const start = current_start.load(.acquire);
         const limit = current_limit.load(.acquire);
-        if (start != 0 and nowNs() -| start > limit) {
+        if (hung(dog_busy.load(.acquire), dog_gen.load(.acquire), &seen, &since, nowNs(), limit)) {
             std.debug.print("HANG {s} seed={d} (over {d} ms)\n", .{ current_name, current_seed.load(.acquire), limit / std.time.ns_per_ms });
+            printShrinkHint(current_seed.load(.acquire));
             std.process.exit(124);
         }
     }
@@ -173,6 +398,21 @@ fn openZ(path: []const u8, flags: linux.O, mode: linux.mode_t) ?i32 {
     pb[path.len] = 0;
     const rc = linux.open(pb[0..path.len :0], flags, mode);
     return if (linux.errno(rc) == .SUCCESS) @intCast(rc) else null;
+}
+
+fn readFile(gpa: std.mem.Allocator, path: []const u8) ![]u8 {
+    const fd = openZ(path, .{ .ACCMODE = .RDONLY }, 0) orelse return error.FileNotFound;
+    defer _ = linux.close(fd);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const n = linux.read(fd, &buf, buf.len);
+        if (linux.errno(n) != .SUCCESS) return error.InputOutput;
+        if (n == 0) break;
+        try out.appendSlice(gpa, buf[0..n]);
+    }
+    return out.toOwnedSlice(gpa);
 }
 
 /// Run `harness` over seeds as the environment says, or skip.
@@ -205,11 +445,48 @@ pub fn parseSpec(spec: []const u8, scale: u64) error{ InvalidCharacter, Overflow
 fn runHere(comptime harness: anytype, opts: Options) !void {
     var kb: [96]u8 = undefined;
     if (!selected(opts.name, env(&kb, opts.prefix, "_ONLY"))) return error.SkipZigTest;
+    current_prefix = opts.prefix;
+    current_name = opts.name;
     const limit_ms = if (env(&kb, opts.prefix, "_MS")) |m| try std.fmt.parseInt(u64, m, 10) else opts.default_limit_ms;
 
     var da: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init; // global-alloc-ok: the driver's own leak detector around each harness run, called only from `test` blocks
     const gpa = da.allocator();
     defer if (da.deinit() == .leak) @panic("fuzz driver: leak");
+
+    if (env(&kb, opts.prefix, "_CHOICES")) |path| {
+        const text = try readFile(gpa, path);
+        defer gpa.free(text);
+        const tape = try shrinker.parseTape(gpa, text);
+        defer gpa.free(tape);
+        try armWatchdog(opts.name, limit_ms);
+        enter(0);
+        std.debug.print("REPLAY {s} {d} choices from {s}:\n", .{ opts.name, tape.len, path });
+        try shrinker.replayHere(harness, gpa, tape, true);
+        leave();
+        std.debug.print("REPLAY {s} ok\n", .{opts.name});
+        return;
+    }
+
+    if (env(&kb, opts.prefix, "_SHRINK")) |seed_txt| {
+        const seed = try std.fmt.parseInt(u64, seed_txt, 10);
+        const budget = if (env(&kb, opts.prefix, "_SHRINK_MS")) |m| try std.fmt.parseInt(u64, m, 10) else 60_000;
+        const r = shrinker.shrink(harness, gpa, .{
+            .name = opts.name,
+            .seed = seed,
+            .limit_ms = limit_ms,
+            .budget_ms = budget,
+            .out_path = env(&kb, opts.prefix, "_SHRINK_OUT"),
+        }) catch |e| switch (e) {
+            error.SeedPasses => {
+                std.debug.print("SHRINK {s} seed={d} passes: nothing to shrink\n", .{ opts.name, seed });
+                return error.SkipZigTest;
+            },
+            else => return e,
+        };
+        gpa.free(r.tape);
+        // The seed fails; so does this test, the way a FAIL line would.
+        return error.FuzzFailureShrunk;
+    }
 
     if (env(&kb, opts.prefix, "_INPUT")) |path| {
         const fd = openZ(path, .{ .ACCMODE = .RDONLY }, 0) orelse return error.FileNotFound;
@@ -218,17 +495,18 @@ fn runHere(comptime harness: anytype, opts: Options) !void {
         const n = linux.read(fd, &buf, buf.len);
         if (linux.errno(n) != .SUCCESS) return error.InputOutput;
         try armWatchdog(opts.name, limit_ms);
-        current_start.store(nowNs(), .release);
+        enter(0);
         var smith: std.testing.Smith = .{ .in = buf[0..n] };
         try harness(std.testing.Smith, &smith, gpa);
-        current_start.store(0, .release);
+        leave();
         std.debug.print("REPLAY {s} ok ({d} bytes)\n", .{ opts.name, n });
         return;
     }
 
     const spec = try parseSpec(env(&kb, opts.prefix, "") orelse return error.SkipZigTest, opts.scale);
     const seed_fd: ?i32 = if (env(&kb, opts.prefix, "_SEEDFILE")) |path|
-        openZ(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644)
+        // RDWR, not WRONLY: `SeedFile` maps it shared and writable.
+        openZ(path, .{ .ACCMODE = .RDWR, .CREAT = true, .TRUNC = true }, 0o644)
     else
         null;
     defer if (seed_fd) |fd| {
@@ -238,6 +516,91 @@ fn runHere(comptime harness: anytype, opts: Options) !void {
     try armWatchdog(opts.name, limit_ms);
     return runSeeds(harness, opts.name, spec, gpa, seed_fd);
 }
+
+/// The seed file, `<name> <seed>\n`, rewritten before every seed so a
+/// panic leaves the seed that caused it.
+///
+/// Written through a shared mapping of the file, not with `write`: the
+/// mapped page is the page cache, so the text is in the file the moment it
+/// is stored — a crashing process cannot lose it — and a store is a
+/// `memcpy`. The `ftruncate` + `pwrite` this replaced cost ~9 µs per seed
+/// (measured 2026-10-17, `zig build bench-testkit`: a 0.3 µs harness ran at
+/// 29× its bare-loop time), and every runner sets the seed file. The size
+/// changes only when the seed gains a digit. Falls back to a `pwrite` per
+/// seed when the mapping fails (the fd is not readable, say).
+const SeedFile = struct {
+    fd: i32,
+    map: ?[]align(std.heap.page_size_min) u8,
+    size: usize = 0,
+    /// `<name> ` once; the seed's digits are appended per seed.
+    text: [160]u8 = undefined,
+    head: usize = 0,
+    /// The seed the file holds.
+    last: u64 = 0,
+
+    const map_len = 4096;
+
+    fn open(fd: i32, name: []const u8) SeedFile {
+        _ = linux.ftruncate(fd, 0);
+        const m = std.posix.mmap(null, map_len, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, fd, 0) catch null;
+        var sf: SeedFile = .{ .fd = fd, .map = m };
+        sf.head = @min(name.len, sf.text.len - 22);
+        @memcpy(sf.text[0..sf.head], name[0..sf.head]);
+        sf.text[sf.head] = ' ';
+        sf.head += 1;
+        return sf;
+    }
+
+    fn set(sf: *SeedFile, seed: u64) void {
+        // The next seed of a run: add one to the decimal digits in place
+        // (one byte, usually) instead of converting the number again.
+        if (sf.map) |m| if (sf.size != 0 and sf.last +% 1 == seed and sf.last != std.math.maxInt(u64)) {
+            var i = sf.size - 2; // the last digit, before '\n'
+            while (m[i] == '9') : (i -= 1) {
+                m[i] = '0';
+                if (i == sf.head) break;
+            } else {
+                m[i] += 1;
+                sf.last = seed;
+                return;
+            }
+            // All nines: one digit more, the general path below.
+        };
+        sf.last = seed;
+        var digits: [21]u8 = undefined;
+        var i: usize = digits.len - 1;
+        digits[i] = '\n';
+        var v = seed;
+        while (true) {
+            i -= 1;
+            digits[i] = '0' + @as(u8, @intCast(v % 10));
+            v /= 10;
+            if (v == 0) break;
+        }
+        const tail = digits[i..];
+        const len = sf.head + tail.len;
+        const m = sf.map orelse {
+            @memcpy(sf.text[sf.head..][0..tail.len], tail);
+            _ = linux.pwrite(sf.fd, &sf.text, len, 0);
+            if (len < sf.size) _ = linux.ftruncate(sf.fd, @intCast(len));
+            sf.size = len;
+            return;
+        };
+        // The name is in the page since the first store; only the digits
+        // move. Grow before the store (a store past the end of the file's
+        // last page faults), shrink after it.
+        const first = sf.size == 0;
+        if (len > sf.size) _ = linux.ftruncate(sf.fd, @intCast(len));
+        if (first) @memcpy(m[0..sf.head], sf.text[0..sf.head]);
+        @memcpy(m[sf.head..][0..tail.len], tail);
+        if (len < sf.size) _ = linux.ftruncate(sf.fd, @intCast(len));
+        sf.size = len;
+    }
+
+    fn close(sf: *SeedFile) void {
+        if (sf.map) |m| std.posix.munmap(m);
+    }
+};
 
 /// The seed loop: every seed in `spec`, in order, each with a fresh `Rng`;
 /// the first failure is printed with its seed and RETURNED (that return is
@@ -249,35 +612,42 @@ fn runSeeds(comptime harness: anytype, name: []const u8, spec: Spec, gpa: std.me
 
 /// `runSeeds` with the progress/verdict lines optional — the self-tests
 /// run it silent, since this repo fails a passing step that writes to stderr.
-fn runSeedsReporting(comptime harness: anytype, name: []const u8, spec: Spec, gpa: std.mem.Allocator, seed_fd: ?i32, report: bool) !void {
+/// Public for `tools/bench.zig`, which times it against a bare seed loop; a
+/// harness's test calls `run`.
+pub fn runSeedsReporting(comptime harness: anytype, name: []const u8, spec: Spec, gpa: std.mem.Allocator, seed_fd: ?i32, report: bool) !void {
+    // Count this run's arrivals only, not those of a test that ran the
+    // harness before (a `testing.fuzz` smoke input, an in-suite loop).
+    resetReach();
     const runs = spec.runs;
     const first = spec.first;
     const opts: struct { name: []const u8 } = .{ .name = name };
+    var seed_file: ?SeedFile = if (seed_fd) |fd| .open(fd, opts.name) else null;
+    defer if (seed_file) |*sf| sf.close();
     const t0 = nowNs();
     var last_report = t0;
     var seed = first;
     while (seed < first + runs) : (seed += 1) {
         var prng = std.Random.DefaultPrng.init(seed);
         var rng: Rng = .{ .r = prng.random() };
-        if (seed_fd) |fd| {
-            var sb: [160]u8 = undefined;
-            const txt = std.fmt.bufPrint(&sb, "{s} {d}\n", .{ opts.name, seed }) catch unreachable;
-            _ = linux.ftruncate(fd, 0);
-            _ = linux.pwrite(fd, txt.ptr, txt.len, 0);
-        }
-        current_seed.store(seed, .release);
-        current_start.store(nowNs(), .release);
+        if (seed_file) |*sf| sf.set(seed);
+        enter(seed);
         harness(Rng, &rng, gpa) catch |e| {
-            current_start.store(0, .release);
-            if (report) std.debug.print("FAIL {s} seed={d}: {t}\n", .{ opts.name, seed, e });
+            leave();
+            if (report) {
+                std.debug.print("FAIL {s} seed={d}: {t}\n", .{ opts.name, seed, e });
+                printShrinkHint(seed);
+            }
             return e;
         };
-        current_start.store(0, .release);
-        const now = nowNs();
-        if (report and now - last_report > std.time.ns_per_s) {
-            last_report = now;
-            const done = seed + 1 - first;
-            std.debug.print("runs {s} {d} of {d} ({d}/s)\n", .{ opts.name, done, runs, done * std.time.ns_per_s / (now - t0) });
+        leave();
+        // The clock, for the progress line, every 1024 seeds only.
+        if (report and (seed - first) % 1024 == 1023) {
+            const now = nowNs();
+            if (now - last_report > std.time.ns_per_s) {
+                last_report = now;
+                const done = seed + 1 - first;
+                std.debug.print("runs {s} {d} of {d} ({d}/s)\n", .{ opts.name, done, runs, done * std.time.ns_per_s / (now - t0) });
+            }
         }
     }
     const ms = (nowNs() - t0) / std.time.ns_per_ms;
@@ -426,6 +796,80 @@ test "runSeeds: reach counters are collected and reset after the report" {
     try testing.expectEqual(@as(u64, 1), counts[0]);
     label_count = 0;
     counts = @splat(0);
+}
+
+test "SeedFile: the file holds exactly `<name> <seed>\\n`, also across a digit" {
+    if (!supported) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const f = try tmp.dir.createFile(testing.io, "seed", .{ .read = true });
+    defer f.close(testing.io);
+    var sf: SeedFile = .open(f.handle, "h");
+    defer sf.close();
+    try testing.expect(sf.map != null);
+    var buf: [64]u8 = undefined;
+    // Jumps, and consecutive runs across a new digit (the in-place
+    // increment) and across the top of u64.
+    const seeds = [_]u64{ 9, 10, 7, 0, std.math.maxInt(u64), 123 } ++
+        [_]u64{ 97, 98, 99, 100, 101, 999, 1000, 1001, 109, 110 } ++
+        [_]u64{ std.math.maxInt(u64) - 2, std.math.maxInt(u64) - 1, std.math.maxInt(u64), 0, 1 };
+    for (seeds) |seed| {
+        sf.set(seed);
+        const n = try f.readPositional(testing.io, &.{&buf}, 0);
+        var want: [64]u8 = undefined;
+        try testing.expectEqualStrings(try std.fmt.bufPrint(&want, "h {d}\n", .{seed}), buf[0..n]);
+    }
+}
+
+fn stuck(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
+    if (src.value(u8) < 64) while (true) {
+        const req: linux.timespec = .{ .sec = 1, .nsec = 0 };
+        _ = linux.nanosleep(&req, null);
+    };
+}
+
+fn runStuck() u8 {
+    armWatchdog("stuck", 100) catch return 1;
+    runSeedsReporting(stuck, "stuck", .{ .runs = 1000, .first = 0 }, std.heap.page_allocator, null, false) catch return 2;
+    return 0;
+}
+
+test "watchdog: a harness that stops is a HANG (exit 124) shortly after the limit" {
+    if (!supported) return error.SkipZigTest;
+    const child = @import("child.zig");
+    const t0 = nowNs();
+    const o = try child.run(runStuck, .{}, .{ .limit_ms = 5000 });
+    try testing.expect(o.eql(.{ .exited = 124 }));
+    const ms = (nowNs() - t0) / std.time.ns_per_ms;
+    try testing.expect(ms >= 100 and ms < 1000);
+}
+
+test "hung: a hang is the same generation, busy, past the limit" {
+    var seen: u64 = 0;
+    var since: u64 = 0;
+    // A new generation restarts the clock; idle never hangs.
+    try testing.expect(!hung(true, 1, &seen, &since, 100, 50));
+    try testing.expect(!hung(true, 1, &seen, &since, 150, 50)); // exactly at the limit
+    try testing.expect(hung(true, 1, &seen, &since, 151, 50));
+    try testing.expect(!hung(true, 2, &seen, &since, 1000, 50));
+    try testing.expect(!hung(false, 2, &seen, &since, 5000, 50));
+    try testing.expect(!hung(true, 2, &seen, &since, 5040, 50));
+    try testing.expect(hung(true, 2, &seen, &since, 5051, 50));
+}
+
+test "runSeeds: the seed file names the failing seed" {
+    if (!supported) return error.SkipZigTest;
+    defer seen_seeds.clearAndFree(testing.allocator);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const f = try tmp.dir.createFile(testing.io, "seed", .{ .read = true });
+    defer f.close(testing.io);
+    fail_at = 9;
+    defer fail_at = null;
+    try testing.expectError(error.HarnessFailed, runSeedsReporting(recorder, "rec", .{ .runs = 20, .first = 5 }, testing.allocator, f.handle, false));
+    var buf: [64]u8 = undefined;
+    const n = try f.readPositional(testing.io, &.{&buf}, 0);
+    try testing.expectEqualStrings("rec 9\n", buf[0..n]);
 }
 
 test "parseSpec: runs, first seed, scale (at least one run)" {

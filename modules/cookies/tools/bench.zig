@@ -29,6 +29,7 @@
 //! verdict is the WORST ratio. Arguments filter workloads.
 
 const std = @import("std");
+const bench = @import("testkit").bench;
 const cookies = @import("cookies");
 
 const bench_name = "bench-cookies";
@@ -140,7 +141,7 @@ pub fn main(init: std.process.Init) !u8 {
 
     var d: Data = try setup(arena, io, dir);
 
-    const exe = try goBuild(arena, io, init.environ_map, abs);
+    const exe = try bench.goBuild(arena, io, bench_name, init.environ_map, .{ .exe = "go", .dir = go_dir, .abs = abs, .toolchain = "go1.26.0" });
     var buf: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writerStreaming(io, &buf);
     const w = &stdout.interface;
@@ -158,11 +159,11 @@ pub fn main(init: std.process.Init) !u8 {
             for (filters) |f| hit = hit or std.mem.indexOf(u8, name, f) != null;
             if (!hit) continue;
         }
-        var ours: Side = .{};
-        var go: Side = .{};
+        var ours: bench.Side = .{};
+        var go: bench.Side = .{};
         for (0..rounds) |_| {
-            go.add(try goRun(arena, io, exe, abs, name));
-            ours.add(timeIt(io, &d, wi));
+            go.add(try bench.foreign(arena, io, bench_name, exe, abs, name, null));
+            ours.add(bench.timeIt(io, .{ .fd = null }, once, .{ &d, wi }, true));
         }
         const gross = ours.best_ns / go.best_ns;
         // `net_base` (a workload name): the cost of the HTTP stacks both sides
@@ -184,10 +185,10 @@ pub fn main(init: std.process.Init) !u8 {
             worst = @max(worst, ratio);
             best = @min(best, ratio);
         }
-        max_spread = @max(max_spread, @max(ours.spread(), go.spread()));
+        max_spread = @max(max_spread, @max(ours.spread(false), go.spread(false)));
         const same = ours.count == go.count;
         mismatch = mismatch or !same;
-        try w.print("{s:<22} {d:>11.0} {d:>11.0} {d:>8.3} {d:>8.3} {d:>6.1}% {d:>6.1}%  {d}{s}\n", .{ name, ours.best_ns, go.best_ns, gross, net, 100 * ours.spread(), 100 * go.spread(), ours.count, if (same and !info) "" else if (same) "  (info only, not in the verdict)" else " ≠ " ++ ref_short });
+        try w.print("{s:<22} {d:>11.0} {d:>11.0} {d:>8.3} {d:>8.3} {d:>6.1}% {d:>6.1}%  {d}{s}\n", .{ name, ours.best_ns, go.best_ns, gross, net, 100 * ours.spread(false), 100 * go.spread(false), ours.count, if (same and !info) "" else if (same) "  (info only, not in the verdict)" else " ≠ " ++ ref_short });
         try w.flush();
     }
     try w.print("rounds: {d}; ratios by wall time{s}; largest spread {d:.1}%{s}\n", .{ rounds, if (net_base != null) " (verdict = net of the " ++ net_base.? ++ " workload)" else "", 100 * max_spread, if (max_spread > 0.05) " (OVER 5 %: noisy run, repeat)" else "" });
@@ -201,78 +202,4 @@ pub fn main(init: std.process.Init) !u8 {
         try w.print("card: **Performance:** ref {d:.2}–{d:.2}× {s} · fastest ? (measured <today>)\n", .{ best, worst, ref_card });
     try w.flush();
     return 0;
-}
-
-// ---- comparison driver (the same in every stdlib-Go-referenced bench) ----
-
-const Row = struct { ns: f64, count: u64 };
-
-const Side = struct {
-    best_ns: f64 = std.math.inf(f64),
-    worst_ns: f64 = 0,
-    count: u64 = 0,
-    fn add(s: *Side, r: Row) void {
-        s.best_ns = @min(s.best_ns, r.ns);
-        s.worst_ns = @max(s.worst_ns, r.ns);
-        s.count = r.count;
-    }
-    fn spread(s: Side) f64 {
-        return s.worst_ns / s.best_ns - 1;
-    }
-};
-
-fn timeIt(io: std.Io, d: *const Data, w: usize) Row {
-    var n: usize = 1;
-    while (true) {
-        const t = std.Io.Clock.Timestamp.now(io, .awake);
-        for (0..n) |_| std.mem.doNotOptimizeAway(once(d, w));
-        if (t.durationTo(std.Io.Clock.Timestamp.now(io, .awake)).raw.nanoseconds > 100_000_000) break;
-        n *= 2;
-    }
-    var best: i96 = std.math.maxInt(i96);
-    var count: u64 = 0;
-    for (0..5) |_| {
-        const t = std.Io.Clock.Timestamp.now(io, .awake);
-        for (0..n) |_| count = once(d, w);
-        best = @min(best, t.durationTo(std.Io.Clock.Timestamp.now(io, .awake)).raw.nanoseconds);
-    }
-    return .{ .ns = @as(f64, @floatFromInt(best)) / @as(f64, @floatFromInt(n)), .count = count };
-}
-
-/// Build the Go side once (`go build`), so the timed runs do not pay for it.
-fn goBuild(arena: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, abs: []const u8) ![]const u8 {
-    var env = try environ.clone(arena);
-    try env.put("GOTOOLCHAIN", "go1.26.0");
-    try env.put("GOPROXY", "off");
-    try env.put("GOFLAGS", "-mod=readonly");
-    const exe = try std.fmt.allocPrint(arena, "{s}/go_bench", .{abs});
-    std.debug.print("{s}: building the Go side ...\n", .{bench_name});
-    const res = std.process.run(arena, io, .{
-        .argv = &.{ "go", "build", "-o", exe, "." },
-        .environ_map = &env,
-        .cwd = .{ .path = go_dir },
-    }) catch |e| {
-        std.debug.print("{s}: could not run go ({t}) -- the benchmark needs it\n", .{ bench_name, e });
-        return error.GoBuildFailed;
-    };
-    if (res.term != .exited or res.term.exited != 0) {
-        std.debug.print("{s}: go build failed:\n{s}\n", .{ bench_name, res.stderr });
-        return error.GoBuildFailed;
-    }
-    return exe;
-}
-
-/// Run the Go side for one workload: `<exe> <work dir> <name>` prints
-/// `name \t ns/op \t count`.
-fn goRun(arena: std.mem.Allocator, io: std.Io, exe: []const u8, abs: []const u8, name: []const u8) !Row {
-    const res = try std.process.run(arena, io, .{ .argv = &.{ exe, abs, name } });
-    if (res.term != .exited or res.term.exited != 0) {
-        std.debug.print("{s}: Go side failed on {s}:\n{s}\n", .{ bench_name, name, res.stderr });
-        return error.ForeignFailed;
-    }
-    var f = std.mem.tokenizeScalar(u8, std.mem.trimEnd(u8, res.stdout, "\n"), '\t');
-    if (!std.mem.eql(u8, f.next() orelse return error.BadForeignOutput, name)) return error.BadForeignOutput;
-    const ns = try std.fmt.parseFloat(f64, f.next() orelse return error.BadForeignOutput);
-    const count = try std.fmt.parseInt(u64, f.next() orelse return error.BadForeignOutput, 10);
-    return .{ .ns = ns, .count = count };
 }
