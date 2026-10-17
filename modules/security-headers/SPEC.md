@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — header policy (keyword review, 2026-10-07)
 
-**Performance:** not measured
+**Performance:** ref 0.01–0.70× unrolled/secure v1.17.0 · fastest ? (measured 2026-10-17)
 
 **Known defects:** none recorded
 
