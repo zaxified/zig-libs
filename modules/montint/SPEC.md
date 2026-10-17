@@ -754,6 +754,21 @@ whole `L`-limb digits through `montMul(digit, R² mod m)` on that basis.
 
 ## Backlog / deferred
 
+- **`DynModint` code size grows with `max_bits / (64·step)` — 32 full `Modint` slots at 8192 bits** (request from
+  wgs, 2026-10-17). Every `DynModint` operation dispatches on the slot through `inline while (s <= max_limbs) : (s += step)`
+  with `step = min_limbs = 4`, so `DynModint(8192)` instantiates `Modint(256)`, `Modint(512)`, … `Modint(8192)` — 32
+  copies of the whole element API. Measured by wgs (ReleaseSafe): `pow` alone ~2.6 MB, the `DynModint(8192)` family
+  ~5.2 MB; since `http` dials TLS through `tlsclient` → `rsa` (`max_modulus_bits = 8192`), every `http.Client`
+  consumer pays it — wgs 25.7 → 38.4 MB (`.text` 5.9 → 13.2 MB). Runtime (RSS, HTTPS latency) unaffected.
+  Options: (a) **coarser slots above a threshold** — e.g. step 4 limbs up to 1024 bits, then exactly the key sizes
+  that occur (1536, 2048, 3072, 4096, 6144, 8192): ~12 slots instead of 32, and common keys still run on an exact
+  slot, so no speed loss where it matters (an odd size pays at most one larger slot); no consumer knob needed;
+  (b) a consumer cap (`rsa`/`tlsclient` build option `max_modulus_bits`, default 8192) — a knob every layer between
+  wgs and `rsa` (`http` → `tlsclient` → `rsa`) must forward; (c) a non-unrolled generic path for the large slots
+  (one loop over a runtime limb count) — slower, and the constant-time story must be re-proved. Preferred: (a), then
+  measure with a size probe (`check-http-sizeprobe` exists) and pin the number; re-run rsa/paillier ctgrind + bench.
+  Why expected: Go `crypto/rsa`, BoringSSL and ring keep one bignum path for every size up to 8192. Effort: medium.
+  Fits §2 (a codec/crypto module must not cost a TLS client 7 MB of `.text`).
 - ~~**Review 2026-10-03 (independent, read-only) — no wrong value found; five LOW items**~~ ✅ 2026-10-06 (L1–L4 each with a test that failed on the old code; L5 by a ReleaseFast probe, a panic being untestable in-process):
   (L1) `isProbablePrime(rounds = 0)` now returns `false` (no evidence is not "prime"); (L2) witnesses are
   near-uniform over `[2, m − 2]` (`bits + 64` random bits reduced mod `m`, trivial ones masked to `2`), so

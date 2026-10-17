@@ -414,6 +414,9 @@ version that applied it everywhere added ctgrind contexts to `rsa/keygen` (173 �
 
 ## Backlog / deferred
 
+- **Code size of the 8192-bit cap** (wgs request 2026-10-17): `max_modulus_bits = 8192` makes `DynModint(8192)`
+  instantiate 32 slots (~5 MB `.text` for every `http.Client` consumer). Tracked and fixed in `montint` SPEC § Backlog
+  ("`DynModint` code size"); a consumer cap here is the fallback option (b) there.
 - **Private-key PEM: a ctgrind target** — ✅ 2026-10-17 the base64 half: `marshal.zig` encodes and
   `pemDecodeBody` decodes through the constant-time `b64ct` module (`standard.encode`,
   `decodeIgnoring` with `pem_whitespace`). Still open: a ctgrind target over
