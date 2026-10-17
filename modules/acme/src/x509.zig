@@ -49,59 +49,13 @@ const Alg = jws.Alg;
 
 // ── DER encoding (bottom-up, arena-backed) ──────────────────────────────────
 
+/// `ValueTooLarge` is kept for the public error sets' stability; the shared
+/// encoder (`rsa.der_writer`) encodes any length, so it is no longer returned.
 pub const DerEncodeError = error{ OutOfMemory, ValueTooLarge };
 
-/// Tiny DER builder: every helper returns a complete TLV slice allocated
-/// from `a` (use an arena and free everything at once).
-const Der = struct {
-    a: Allocator,
-
-    fn tlv(d: Der, tag: u8, content: []const u8) DerEncodeError![]const u8 {
-        var head: [4]u8 = undefined;
-        const head_len = try encodeHeader(&head, tag, content.len);
-        const out = try d.a.alloc(u8, head_len + content.len);
-        @memcpy(out[0..head_len], head[0..head_len]);
-        @memcpy(out[head_len..], content);
-        return out;
-    }
-
-    fn encodeHeader(buf: *[4]u8, tag: u8, len: usize) DerEncodeError!usize {
-        buf[0] = tag;
-        if (len < 0x80) {
-            buf[1] = @intCast(len);
-            return 2;
-        }
-        if (len < 0x100) {
-            buf[1] = 0x81;
-            buf[2] = @intCast(len);
-            return 3;
-        }
-        if (len < 0x10000) {
-            buf[1] = 0x82;
-            buf[2] = @intCast(len >> 8);
-            buf[3] = @intCast(len & 0xff);
-            return 4;
-        }
-        return error.ValueTooLarge; // nothing here is remotely this large
-    }
-
-    fn cat(d: Der, parts: []const []const u8) DerEncodeError![]const u8 {
-        return std.mem.concat(d.a, u8, parts);
-    }
-
-    fn seq(d: Der, parts: []const []const u8) DerEncodeError![]const u8 {
-        return d.tlv(0x30, try d.cat(parts));
-    }
-
-    fn oid(d: Der, encoded: []const u8) DerEncodeError![]const u8 {
-        return d.tlv(0x06, encoded);
-    }
-
-    /// BIT STRING with zero unused bits.
-    fn bitString(d: Der, bytes: []const u8) DerEncodeError![]const u8 {
-        return d.tlv(0x03, try d.cat(&.{ "\x00", bytes }));
-    }
-};
+/// The shared arena-backed DER builder (every helper returns a complete TLV
+/// allocated from `a`; use an arena and free everything at once).
+const Der = rsa.der_writer.Builder;
 
 // Pre-encoded OID content bytes.
 const oid_ec_public_key = "\x2a\x86\x48\xce\x3d\x02\x01"; // 1.2.840.10045.2.1

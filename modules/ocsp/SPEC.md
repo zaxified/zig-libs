@@ -170,9 +170,9 @@ Consequences:
 ## Fixture provenance (Validation)
 
 All OCSP responses in `ocsp_test.zig` are **CONSTRUCTED**, not captured from a
-public CA: a `BasicOCSPResponse` is hand-built with this module's own DER writer
-(`der_writer.zig`) and signed with the sibling `rsa` (1024-bit PKCS#1 v1.5) or
-`p256` (ECDSA) modules — the same self-signed-fixture approach the other crypto
+public CA: a `BasicOCSPResponse` is hand-built with `der_writer` (`rsa`'s
+shared DER encoder, `rsa/src/der_writer.zig`) and signed with the sibling
+`rsa` (1024-bit PKCS#1 v1.5) or `p256` (ECDSA) modules — the same self-signed-fixture approach the other crypto
 modules in this repo use — so every verification branch runs against a **real
 signature over real DER** while staying hermetic (no network, no third-party
 certs). Issuer/subject/delegate certificates come from `rsa.selfSignedCert`

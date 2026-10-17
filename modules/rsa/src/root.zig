@@ -3223,19 +3223,13 @@ fn generateValue(random: std.Random, bits: usize, e: u64) GenerateError!KeyPair 
 //
 // `selfSignedCert` builds `Certificate ::= SEQUENCE { tbsCertificate,
 // signatureAlgorithm, signatureValue BIT STRING }` and signs it with
-// `signPkcs1v15` (P1). The DER-encoding idiom below (`DerBuild`: an
-// arena-backed bottom-up TLV builder — every helper returns a complete
-// tag+length+value slice) is copied from `modules/acme/src/x509.zig`'s `Der`
-// helper (which builds a PKCS#10 CSR, a structurally similar problem), not
-// reimplemented from scratch; it is extended here with the extra primitive
-// shapes a full certificate needs beyond a bare CSR: INTEGER (serial number,
-// version), OCTET STRING + BOOLEAN (extension values), UTCTime (validity),
-// UTF8String (commonName), and the `[n] EXPLICIT`/`[n] IMPLICIT`
-// context-specific tags RFC 5280 uses for `version`/`extensions` and for
-// `GeneralName` SAN choices. `zero-dep` still holds — nothing here is `pub
-// use`d or `@import`ed from `acme`; the shape is copied by hand into this
-// module, same as this file's own provenance note requires for its
-// `std.crypto.ff`-derived shapes.
+// `signPkcs1v15` (P1). The DER is built with `der_writer.Builder` (`src/der_writer.zig`:
+// an arena-backed bottom-up TLV builder — every helper returns a complete
+// tag+length+value slice), the encoder `acme` and `ocsp` share too. Its
+// idiom started as a hand copy of `acme`'s CSR builder, extended with the
+// shapes a full certificate needs (INTEGER, OCTET STRING, BOOLEAN, UTCTime,
+// UTF8String, `[n] EXPLICIT`/`[n] IMPLICIT`); since 2026-10-17 the copy is
+// the one shared implementation and `acme` imports it from here.
 //
 // `std.crypto.Certificate` (std's independent X.509 *parser*) is the primary
 // test oracle: the tests below parse a generated certificate back with it
@@ -3250,112 +3244,12 @@ fn generateValue(random: std.Random, bits: usize, e: u64) GenerateError!KeyPair 
 // (fed back through `verifyPkcs1v15`), so both directions of this module's
 // own code are cross-checked, not only std's.
 
+/// `ValueTooLarge` stays for the public `SelfSignedCertError`'s stability; the
+/// shared `der_writer.Builder` encodes any length, so it is no longer returned.
 const DerCertError = error{ OutOfMemory, ValueTooLarge };
 
-/// Arena-backed DER TLV builder (see the section doc comment above for
-/// provenance: the idiom, not the source, is copied from
-/// `modules/acme/src/x509.zig`'s `Der`). Every helper returns a complete TLV
-/// slice allocated from `a`; use an arena and free it all at once.
-const DerBuild = struct {
-    a: std.mem.Allocator,
-
-    fn encodeHeader(buf: *[4]u8, tag: u8, len: usize) DerCertError!usize {
-        buf[0] = tag;
-        if (len < 0x80) {
-            buf[1] = @intCast(len);
-            return 2;
-        }
-        if (len < 0x100) {
-            buf[1] = 0x81;
-            buf[2] = @intCast(len);
-            return 3;
-        }
-        if (len < 0x10000) {
-            buf[1] = 0x82;
-            buf[2] = @intCast(len >> 8);
-            buf[3] = @intCast(len & 0xff);
-            return 4;
-        }
-        return error.ValueTooLarge; // nothing built in this module gets remotely this large
-    }
-
-    fn tlv(d: DerBuild, tag: u8, content: []const u8) DerCertError![]const u8 {
-        var head: [4]u8 = undefined;
-        const head_len = try encodeHeader(&head, tag, content.len);
-        const out = try d.a.alloc(u8, head_len + content.len);
-        @memcpy(out[0..head_len], head[0..head_len]);
-        @memcpy(out[head_len..], content);
-        return out;
-    }
-
-    fn cat(d: DerBuild, parts: []const []const u8) DerCertError![]const u8 {
-        return std.mem.concat(d.a, u8, parts);
-    }
-
-    fn seq(d: DerBuild, parts: []const []const u8) DerCertError![]const u8 {
-        return d.tlv(0x30, try d.cat(parts));
-    }
-
-    fn oid(d: DerBuild, encoded: []const u8) DerCertError![]const u8 {
-        return d.tlv(0x06, encoded);
-    }
-
-    /// BIT STRING with zero unused bits.
-    fn bitString(d: DerBuild, bytes: []const u8) DerCertError![]const u8 {
-        return d.tlv(0x03, try d.cat(&.{ "\x00", bytes }));
-    }
-
-    fn octetString(d: DerBuild, bytes: []const u8) DerCertError![]const u8 {
-        return d.tlv(0x04, bytes);
-    }
-
-    fn boolean(d: DerBuild, value: bool) DerCertError![]const u8 {
-        return d.tlv(0x01, if (value) "\xff" else "\x00");
-    }
-
-    /// INTEGER from a big-endian magnitude (leading zeros tolerated and
-    /// stripped first; a single 0x00 pad byte is (re)inserted whenever the
-    /// top bit is set, since DER INTEGER is signed two's-complement and
-    /// every value this module encodes — serials, version, modulus,
-    /// exponent — is non-negative).
-    fn integer(d: DerBuild, magnitude: []const u8) DerCertError![]const u8 {
-        const m = stripLeadingZeros(magnitude);
-        if (m.len == 0) return d.tlv(0x02, "\x00");
-        if (m[0] & 0x80 != 0) return d.tlv(0x02, try d.cat(&.{ "\x00", m }));
-        return d.tlv(0x02, m);
-    }
-
-    fn integerU64(d: DerBuild, value: u64) DerCertError![]const u8 {
-        var buf: [8]u8 = undefined;
-        std.mem.writeInt(u64, &buf, value, .big);
-        return d.integer(&buf);
-    }
-
-    /// UTCTime (RFC 5280 §4.1.2.5.1: two-digit year, `YYMMDDHHMMSSZ`).
-    /// `text` must be exactly 13 bytes ending in 'Z' — enforced by the only
-    /// caller (`selfSignedCert`, via `validUtcTime`) before this is reached.
-    fn utcTime(d: DerBuild, text: []const u8) DerCertError![]const u8 {
-        std.debug.assert(text.len == 13);
-        return d.tlv(0x17, text);
-    }
-
-    fn utf8String(d: DerBuild, text: []const u8) DerCertError![]const u8 {
-        return d.tlv(0x0c, text);
-    }
-
-    /// `[n] EXPLICIT ...`: a context-specific *constructed* tag wrapping a
-    /// complete inner TLV (used for `version [0]` and `extensions [3]`).
-    fn explicit(d: DerBuild, tag_num: u5, content: []const u8) DerCertError![]const u8 {
-        return d.tlv(0xa0 | @as(u8, tag_num), content);
-    }
-
-    /// `[n] IMPLICIT ...`: a context-specific *primitive* tag carrying raw
-    /// content directly (used for the `GeneralName` CHOICE alternatives:
-    /// `dNSName [2]`, `uniformResourceIdentifier [6]`).
-    fn implicitPrimitive(d: DerBuild, tag_num: u5, content: []const u8) DerCertError![]const u8 {
-        return d.tlv(0x80 | @as(u8, tag_num), content);
-    }
-};
+/// The DER encoder (`src/der_writer.zig`), public for `acme` and `ocsp`.
+pub const der_writer = @import("der_writer.zig");
 
 const der_null = "\x05\x00"; // NULL — AlgorithmIdentifier.parameters for rsaEncryption/sha*WithRSAEncryption
 
@@ -3394,7 +3288,7 @@ fn sigAlgOid(comptime Hash: type) []const u8 {
 /// (both IA5String/ASCII content) — the two alternatives `CertOptions` needs
 /// today; an OPC-UA `applicationUri` is exactly a `.uri` value. Extending to
 /// other `GeneralName` choices (`otherName`, `iPAddress`, ...) is a matter of
-/// adding more `DerBuild.implicitPrimitive` calls in `buildSanExtnValue`
+/// adding more `der_writer.Builder.implicitPrimitive` calls in `buildSanExtnValue`
 /// below — the extension hook the module-level doc asked for.
 pub const SubjectAltName = union(enum) {
     dns_name: []const u8,
@@ -3451,7 +3345,7 @@ fn validUtcTime(text: []const u8) bool {
 /// `Name ::= RDNSequence` with a single RDN carrying one
 /// `AttributeTypeAndValue { commonName, UTF8String }` — used for both
 /// `issuer` and `subject` (self-signed: identical bytes, reused verbatim).
-fn buildNameCn(d: DerBuild, common_name: []const u8) DerCertError![]const u8 {
+fn buildNameCn(d: der_writer.Builder, common_name: []const u8) DerCertError![]const u8 {
     const atv = try d.seq(&.{ try d.oid(&oid_common_name), try d.utf8String(common_name) });
     const rdn = try d.tlv(0x31, atv); // RelativeDistinguishedName ::= SET OF AttributeTypeAndValue
     return d.seq(&.{rdn}); // RDNSequence ::= SEQUENCE OF RelativeDistinguishedName
@@ -3460,7 +3354,7 @@ fn buildNameCn(d: DerBuild, common_name: []const u8) DerCertError![]const u8 {
 /// `RSAPublicKey ::= SEQUENCE { modulus INTEGER, publicExponent INTEGER }`
 /// (PKCS#1 Appendix A.1.1) — the same shape P4a's `publicKeyFromDerImpl`
 /// parses, built here instead of parsed.
-fn buildRsaPublicKeyDer(d: DerBuild, pk: PublicKey) DerCertError![]const u8 {
+fn buildRsaPublicKeyDer(d: der_writer.Builder, pk: PublicKey) DerCertError![]const u8 {
     var n_buf: [max_modulus_len]u8 = undefined;
     pk.n.toBytes(&n_buf, .big) catch unreachable; // n is its own modulus: always fits its own byte length
     var e_buf: [max_modulus_len]u8 = undefined;
@@ -3477,7 +3371,7 @@ fn buildRsaPublicKeyDer(d: DerBuild, pk: PublicKey) DerCertError![]const u8 {
 /// (RFC 8017 Appendix C) — the SPKI shape P4a's `publicKeyFromDerImpl` also
 /// parses (and what `PublicKey.fromDer` on the extracted bytes round-trips
 /// through in the tests below).
-fn buildSpki(d: DerBuild, pk: PublicKey) DerCertError![]const u8 {
+fn buildSpki(d: der_writer.Builder, pk: PublicKey) DerCertError![]const u8 {
     const rsa_pub_key_der = try buildRsaPublicKeyDer(d, pk);
     return d.seq(&.{
         try d.seq(&.{ try d.oid(&oid_rsa_encryption), der_null }),
@@ -3487,7 +3381,7 @@ fn buildSpki(d: DerBuild, pk: PublicKey) DerCertError![]const u8 {
 
 /// `GeneralNames ::= SEQUENCE OF GeneralName` — the `subjectAltName`
 /// extension's `extnValue` payload (RFC 5280 §4.2.1.6).
-fn buildSanExtnValue(d: DerBuild, sans: []const SubjectAltName) DerCertError![]const u8 {
+fn buildSanExtnValue(d: der_writer.Builder, sans: []const SubjectAltName) DerCertError![]const u8 {
     const names = try d.a.alloc([]const u8, sans.len);
     for (names, sans) |*slot, san| slot.* = switch (san) {
         .dns_name => |name| try d.implicitPrimitive(2, name),
@@ -3502,7 +3396,7 @@ fn buildSanExtnValue(d: DerBuild, sans: []const SubjectAltName) DerCertError![]c
 /// zero *bits* by recording how many of the last content byte's low bits
 /// are unused (X.690 §11.2.7); `@ctz` of the single content byte is exactly
 /// that count for a one-byte KeyUsage value.
-fn keyUsageBitString(d: DerBuild, is_ca: bool) DerCertError![]const u8 {
+fn keyUsageBitString(d: der_writer.Builder, is_ca: bool) DerCertError![]const u8 {
     const byte: u8 = if (is_ca) 0x86 else 0x80; // digitalSignature | (keyCertSign | cRLSign if CA)
     const unused: u8 = @ctz(byte);
     return d.tlv(0x03, try d.cat(&.{ &.{unused}, &.{byte} }));
@@ -3512,7 +3406,7 @@ fn keyUsageBitString(d: DerBuild, is_ca: bool) DerCertError![]const u8 {
 /// `basicConstraints` (critical, `cA` per `opts.is_ca`) and `keyUsage`
 /// (critical); `subjectAltName` (not critical) if `opts.subject_alt_names`
 /// is non-empty.
-fn buildExtensions(d: DerBuild, opts: CertOptions) DerCertError![]const u8 {
+fn buildExtensions(d: der_writer.Builder, opts: CertOptions) DerCertError![]const u8 {
     var list: std.ArrayList([]const u8) = .empty;
 
     const basic_constraints_value = if (opts.is_ca)
@@ -3563,7 +3457,7 @@ pub fn selfSignedCert(
 
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
-    const d: DerBuild = .{ .a = arena.allocator() };
+    const d: der_writer.Builder = .{ .a = arena.allocator() };
 
     const name = try buildNameCn(d, opts.common_name); // issuer == subject: built once, reused twice below
     const version = try d.explicit(0, try d.integerU64(2)); // v3
@@ -3608,6 +3502,7 @@ pub fn selfSignedCert(
 // is referenced from a `test { _ = ...; }` block here.
 test {
     _ = openssh;
+    _ = der_writer;
     _ = @import("stackprobe_test.zig");
     _ = @import("stackprobe2_test.zig");
     _ = @import("wycheproof_test.zig");

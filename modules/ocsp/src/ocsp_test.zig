@@ -14,7 +14,7 @@ const testing = std.testing;
 const ocsp = @import("root.zig");
 const rsa = @import("rsa");
 const p256 = @import("p256");
-const der_writer = @import("der_writer.zig");
+const der_writer = rsa.der_writer;
 
 const der = std.crypto.Certificate.der;
 const ext = @import("x509").extensions;
@@ -106,7 +106,7 @@ fn buildLeafCert(
     defer arena.deinit();
     const b: der_writer.Builder = .{ .a = arena.allocator() };
 
-    const version = try b.explicit(0, try b.integerU8(2)); // v3
+    const version = try b.explicit(0, try b.integerU64(2)); // v3
     const serial = try b.integerRaw(serial_raw);
     const sig_alg = try b.seq(&.{ try b.oid(&oid_sha256_rsa), try b.null() });
     const validity = try b.seq(&.{
@@ -198,8 +198,8 @@ fn certIdDer(b: der_writer.Builder, spec: RespSpec) ![]const u8 {
     const alg = try b.seq(&.{ try b.oid(&oid_sha256), try b.null() });
     return b.seq(&.{
         alg,
-        try b.octet(nb[0..32]),
-        try b.octet(kb[0..32]),
+        try b.octetString(nb[0..32]),
+        try b.octetString(kb[0..32]),
         try b.integerRaw(spec.subject_serial),
     });
 }
@@ -224,9 +224,9 @@ fn statusDer(b: der_writer.Builder, kind: StatusKind) ![]const u8 {
 fn nonceExtsDer(b: der_writer.Builder, nonce: []const u8) ![]const u8 {
     const nonce_ext = try b.seq(&.{
         try b.oid(&oid_ocsp_nonce),
-        try b.octet(try b.octet(nonce)),
+        try b.octetString(try b.octetString(nonce)),
     });
-    return b.explicit(1, try b.seqOf(&.{nonce_ext})); // responseExtensions [1]
+    return b.explicit(1, try b.seq(&.{nonce_ext})); // responseExtensions [1]
 }
 
 /// A CertID that names the same issuer as `spec` under SHA-1 (not SHA-256)
@@ -238,8 +238,8 @@ fn decoySha1CertIdDer(b: der_writer.Builder) ![]const u8 {
     const alg = try b.seq(&.{ try b.oid(&oid_sha1), try b.null() });
     return b.seq(&.{
         alg,
-        try b.octet(&zero20),
-        try b.octet(&zero20),
+        try b.octetString(&zero20),
+        try b.octetString(&zero20),
         try b.integerRaw(&[_]u8{0x01}),
     });
 }
@@ -287,14 +287,14 @@ fn buildResponseImpl(gpa: std.mem.Allocator, spec: RespSpec, with_decoy: bool) !
             try decoy_parts.append(b.a, try b.explicit(0, try b.generalizedTime(nu)));
         }
         const decoy = try b.seq(decoy_parts.items);
-        break :blk try b.seqOf(&.{ decoy, single });
-    } else try b.seqOf(&.{single});
+        break :blk try b.seq(&.{ decoy, single });
+    } else try b.seq(&.{single});
 
     // ResponseData (tbs): responderID byName [1] or byKey [2], producedAt, responses [, exts]
     const responder_id = if (spec.responder_by_name) |name|
         try b.explicit(1, name)
     else if (spec.responder_by_key) |kh|
-        try b.explicit(2, try b.octet(kh))
+        try b.explicit(2, try b.octetString(kh))
     else
         return error.NoResponderId;
     var rd_parts = std.ArrayList([]const u8).empty;
@@ -324,11 +324,11 @@ fn buildResponseImpl(gpa: std.mem.Allocator, spec: RespSpec, with_decoy: bool) !
     try bor_parts.append(b.a, sig_alg);
     try bor_parts.append(b.a, try b.bitString(signature));
     if (spec.certs) |cert_tlv| {
-        try bor_parts.append(b.a, try b.explicit(0, try b.seqOf(&.{cert_tlv})));
+        try bor_parts.append(b.a, try b.explicit(0, try b.seq(&.{cert_tlv})));
     }
     const bor = try b.seq(bor_parts.items);
 
-    const response_bytes = try b.seq(&.{ try b.oid(&oid_ocsp_basic), try b.octet(bor) });
+    const response_bytes = try b.seq(&.{ try b.oid(&oid_ocsp_basic), try b.octetString(bor) });
     const ocsp_response = try b.seq(&.{
         try b.enumerated(0), // successful
         try b.explicit(0, response_bytes),
@@ -398,8 +398,8 @@ fn buildDelegateCertValidity(
     defer arena.deinit();
     const b: der_writer.Builder = .{ .a = arena.allocator() };
 
-    const version = try b.explicit(0, try b.integerU8(2)); // v3
-    const serial = try b.integerU8(9);
+    const version = try b.explicit(0, try b.integerU64(2)); // v3
+    const serial = try b.integerU64(9);
     const sig_alg = try b.seq(&.{ try b.oid(&oid_sha256_rsa), try b.null() });
     const validity = try b.seq(&.{
         try b.tlv(0x17, not_before), // UTCTime notBefore
@@ -418,9 +418,9 @@ fn buildDelegateCertValidity(
         };
         const eku_ext = try b.seq(&.{
             try b.oid(&oid_ext_key_usage),
-            try b.octet(try b.seqOf(&.{try b.oid(purpose_oid)})),
+            try b.octetString(try b.seq(&.{try b.oid(purpose_oid)})),
         });
-        try tbs_parts.append(b.a, try b.explicit(3, try b.seqOf(&.{eku_ext})));
+        try tbs_parts.append(b.a, try b.explicit(3, try b.seq(&.{eku_ext})));
     }
     const tbs = try b.seq(tbs_parts.items);
 
@@ -440,8 +440,8 @@ fn buildEcIssuerCert(gpa: std.mem.Allocator, sec1: []const u8, name: []const u8)
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const b: der_writer.Builder = .{ .a = arena.allocator() };
-    const version = try b.explicit(0, try b.integerU8(2));
-    const serial = try b.integerU8(3);
+    const version = try b.explicit(0, try b.integerU64(2));
+    const serial = try b.integerU64(3);
     const sig_alg = try b.seq(&.{try b.oid(&oid_ecdsa_sha256)});
     const validity = try b.seq(&.{
         try b.tlv(0x17, "200101000000Z"),
@@ -463,7 +463,7 @@ fn buildEcIssuerCert(gpa: std.mem.Allocator, sec1: []const u8, name: []const u8)
 // Build a minimal Name SEQUENCE TLV (RDN with a single CN) for delegate/EC names.
 fn buildName(b: der_writer.Builder, cn: []const u8) ![]const u8 {
     const atv = try b.seq(&.{ try b.oid(&[_]u8{ 0x55, 0x04, 0x03 }), try b.utf8String(cn) });
-    return b.seq(&.{try b.setOf(&.{atv})});
+    return b.seq(&.{try b.set(&.{atv})});
 }
 
 fn defaultOpts() ocsp.VerifyOptions {
@@ -812,7 +812,7 @@ test "verify: successful status but unrecognized responseType → UnsupportedRes
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const b: der_writer.Builder = .{ .a = arena.allocator() };
-    const response_bytes = try b.seq(&.{ try b.oid(&oid_sha256), try b.octet("not-basic-ocsp") });
+    const response_bytes = try b.seq(&.{ try b.oid(&oid_sha256), try b.octetString("not-basic-ocsp") });
     const ocsp_response = try b.seq(&.{
         try b.enumerated(0), // successful
         try b.explicit(0, response_bytes),

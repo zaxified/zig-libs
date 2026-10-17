@@ -32,6 +32,8 @@ vectors (see "Verification" below).
   Miller-Rabin, FIPS 186-5-style constraints).
 - **P6** — `selfSignedCert`: self-signed X.509 v3 certificate generation
   (RFC 5280).
+- **`der_writer`** — the arena-backed DER encoder `selfSignedCert` uses,
+  shared with `acme` and `ocsp` (`Builder.seq`, `.integer`, `.explicit`, …).
 
 - **Model after:** RFC 8017 (PKCS#1 v2.2); the shape of `PublicKey`/`SecretKey`/
   the RSAEP/RSAVP1 primitive is designed with reference to Zig std's own

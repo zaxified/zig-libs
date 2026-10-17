@@ -90,7 +90,9 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const Sha384 = std.crypto.hash.sha2.Sha384;
 const Sha512 = std.crypto.hash.sha2.Sha512;
 
-pub const der_writer = @import("der_writer.zig");
+/// The DER encoder `buildRequest` and the test fixtures use — `rsa`'s shared
+/// `der_writer` (kept under this name for `ocspcache`'s fixture generators).
+pub const der_writer = rsa.der_writer;
 const Builder = der_writer.Builder;
 
 pub const meta = .{
@@ -524,12 +526,12 @@ pub fn buildRequest(
     const alg_id = try b.seq(&.{ try b.oid(opts.hash.oid()), try b.null() });
     const cert_id = try b.seq(&.{
         alg_id,
-        try b.octet(name_hash),
-        try b.octet(key_hash),
+        try b.octetString(name_hash),
+        try b.octetString(key_hash),
         try b.integerRaw(subject.serial),
     });
     const request = try b.seq(&.{cert_id});
-    const request_list = try b.seqOf(&.{request});
+    const request_list = try b.seq(&.{request});
 
     var tbs_parts: [2][]const u8 = undefined;
     var n: usize = 0;
@@ -540,9 +542,9 @@ pub fn buildRequest(
         // OCTET STRING nested inside the extnValue OCTET STRING.
         const nonce_ext = try b.seq(&.{
             try b.oid(&oid_ocsp_nonce),
-            try b.octet(try b.octet(nonce)),
+            try b.octetString(try b.octetString(nonce)),
         });
-        tbs_parts[n] = try b.explicit(2, try b.seqOf(&.{nonce_ext})); // requestExtensions [2]
+        tbs_parts[n] = try b.explicit(2, try b.seq(&.{nonce_ext})); // requestExtensions [2]
         n += 1;
     }
     const tbs_request = try b.seq(tbs_parts[0..n]);
