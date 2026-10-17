@@ -6,6 +6,7 @@ package main
 
 import (
 	"os"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/expfmt"
@@ -33,6 +34,30 @@ func main() {
 	for _, v := range []float64{0.25, 0.5, 2, 3, 7} {
 		d.Observe(v)
 	}
+	// Exemplars (OpenMetrics only); fixed timestamps through the const API.
+	xreg := prometheus.NewRegistry()
+	ts := time.Unix(1700000000, 250000000)
+	xc := prometheus.NewDesc("x_hits_total", "Hits.", nil, nil)
+	xh := prometheus.NewDesc("x_lat_seconds", "Lat.", nil, nil)
+	xreg.MustRegister(constCollector{
+		prometheus.MustNewMetricWithExemplars(prometheus.MustNewConstMetric(xc, prometheus.CounterValue, 3),
+			prometheus.Exemplar{Value: 2, Labels: prometheus.Labels{"trace_id": "4bf92f\"x"}, Timestamp: ts}),
+		prometheus.MustNewMetricWithExemplars(prometheus.MustNewConstHistogram(xh, 3, 9.5, map[float64]uint64{1: 1, 5: 2}),
+			prometheus.Exemplar{Value: 0.5, Labels: prometheus.Labels{"span": "a"}, Timestamp: ts},
+			prometheus.Exemplar{Value: 6, Labels: prometheus.Labels{"span": "b"}, Timestamp: ts}),
+	})
+	xmfs, err := xreg.Gather()
+	if err != nil {
+		panic(err)
+	}
+	os.Stdout.WriteString("=== exemplars\n")
+	xenc := expfmt.NewEncoder(os.Stdout, expfmt.NewFormat(expfmt.TypeOpenMetrics))
+	for _, mf := range xmfs {
+		if err := xenc.Encode(mf); err != nil {
+			panic(err)
+		}
+	}
+
 	mfs, err := reg.Gather()
 	if err != nil {
 		panic(err)
@@ -48,5 +73,19 @@ func main() {
 		if cl, ok := enc.(expfmt.Closer); ok {
 			cl.Close()
 		}
+	}
+}
+
+type constCollector []prometheus.Metric
+
+func (c constCollector) Describe(ch chan<- *prometheus.Desc) {
+	for _, m := range c {
+		ch <- m.Desc()
+	}
+}
+
+func (c constCollector) Collect(ch chan<- prometheus.Metric) {
+	for _, m := range c {
+		ch <- m
 	}
 }

@@ -179,10 +179,121 @@ pub const max_labels = 8;
 
 // ── instruments ─────────────────────────────────────────────────────────────
 
+// ── exemplars ───────────────────────────────────────────────────────────────
+
+/// client_golang `ExemplarMaxRunes`: names + values of one exemplar's labels.
+pub const max_exemplar_runes = 128;
+
+pub const ExemplarError = error{
+    /// A label name not matching `[a-zA-Z_][a-zA-Z0-9_]*`, repeated, a value
+    /// that is not UTF-8, or more than `max_exemplar_runes` runes in all
+    /// (client_golang panics on these).
+    InvalidExemplar,
+    OutOfMemory,
+    /// The instrument was not created by a `Registry` (a bare `Counter{}`)
+    /// and has no allocator for its exemplar storage.
+    NoExemplarStorage,
+};
+
+/// Worst case of the rendered `{name="value",...}`: 128 runes of 4 bytes,
+/// values escaped (x2), plus `="",` per pair and the braces.
+const exemplar_text_cap = 2 + max_exemplar_runes * 4 * 2 + max_exemplar_runes * 4;
+
+/// The last exemplar of one sample, its label block pre-rendered (escaped,
+/// as OpenMetrics writes it). Guarded by its own spinlock.
+const ExemplarSlot = struct {
+    lock: std.atomic.Mutex = .unlocked,
+    set: bool = false,
+    len: u16 = 0,
+    value: f64 = 0,
+    timestamp_s: ?f64 = null,
+    text: [exemplar_text_cap]u8 = undefined,
+
+    fn store(slot: *ExemplarSlot, rendered: []const u8, value: f64, timestamp_s: ?f64) void {
+        lockSpin(&slot.lock);
+        defer slot.lock.unlock();
+        @memcpy(slot.text[0..rendered.len], rendered);
+        slot.len = @intCast(rendered.len);
+        slot.value = value;
+        slot.timestamp_s = timestamp_s;
+        slot.set = true;
+    }
+};
+
+/// Lazily allocated exemplar slots of one instrument: nothing until the
+/// first `*WithExemplar` call, so instruments that never see one cost two
+/// words. Freed with the series.
+const Exemplars = struct {
+    slots: std.atomic.Value(?[*]ExemplarSlot) = .init(null),
+    gpa: ?Allocator = null,
+
+    fn get(e: *Exemplars, n: usize) ExemplarError![*]ExemplarSlot {
+        if (e.slots.load(.acquire)) |p| return p;
+        const gpa = e.gpa orelse return error.NoExemplarStorage;
+        const fresh = try gpa.alloc(ExemplarSlot, n);
+        for (fresh) |*x| x.* = .{};
+        if (e.slots.cmpxchgStrong(null, fresh.ptr, .acq_rel, .acquire)) |won| {
+            gpa.free(fresh);
+            return won.?;
+        }
+        return fresh.ptr;
+    }
+
+    fn slot(e: *const Exemplars, i: usize) ?*ExemplarSlot {
+        const p = e.slots.load(.acquire) orelse return null;
+        return &p[i];
+    }
+
+    fn free(e: *Exemplars, n: usize) void {
+        if (e.slots.load(.acquire)) |p| e.gpa.?.free(p[0..n]);
+    }
+};
+
+/// Validate and render exemplar labels as OpenMetrics writes them.
+fn renderExemplarLabels(buf: *[exemplar_text_cap]u8, labels: []const Label) ExemplarError![]const u8 {
+    var runes: usize = 0;
+    for (labels, 0..) |l, i| {
+        if (!validLabelName(l.name)) return error.InvalidExemplar;
+        for (labels[0..i]) |prev| if (std.mem.eql(u8, prev.name, l.name)) return error.InvalidExemplar;
+        if (!std.unicode.utf8ValidateSlice(l.value)) return error.InvalidExemplar;
+        runes += l.name.len; // label names are ASCII
+        runes += std.unicode.utf8CountCodepoints(l.value) catch return error.InvalidExemplar;
+    }
+    if (runes > max_exemplar_runes) return error.InvalidExemplar;
+    var w: std.Io.Writer = .fixed(buf);
+    w.writeByte('{') catch unreachable;
+    for (labels, 0..) |l, i| {
+        if (i != 0) w.writeByte(',') catch unreachable;
+        w.print("{s}=\"", .{l.name}) catch unreachable;
+        writeEscaped(&w, l.value, .label_value) catch unreachable;
+        w.writeByte('"') catch unreachable;
+    }
+    w.writeByte('}') catch unreachable;
+    return w.buffered();
+}
+
 /// Monotonic counter. Integer-valued (`u64`) — it can only go up, so
 /// "never negative" holds by construction. Lock-free.
 pub const Counter = struct {
     count: std.atomic.Value(u64) = .init(0),
+    exemplars: Exemplars = .{},
+
+    /// `add` plus an exemplar (client_golang `AddWithExemplar`): `labels`
+    /// (e.g. `trace_id`) and an optional Unix timestamp in seconds — the
+    /// module reads no clock; client_golang stamps `time.Now()`. Only the
+    /// OpenMetrics exposition shows exemplars. The counter is NOT
+    /// incremented when the exemplar is refused.
+    pub fn addWithExemplar(c: *Counter, n: u64, labels: []const Label, timestamp_s: ?f64) ExemplarError!void {
+        var buf: [exemplar_text_cap]u8 = undefined;
+        const rendered = try renderExemplarLabels(&buf, labels);
+        const slots = try c.exemplars.get(1);
+        slots[0].store(rendered, @floatFromInt(n), timestamp_s);
+        c.add(n);
+    }
+
+    pub fn incWithExemplar(c: *Counter, labels: []const Label, timestamp_s: ?f64) ExemplarError!void {
+        return c.addWithExemplar(1, labels, timestamp_s);
+    }
 
     pub fn inc(c: *Counter) void {
         _ = c.count.fetchAdd(1, .monotonic);
@@ -251,6 +362,25 @@ pub const Histogram = struct {
     bucket_counts: []u64,
     observation_count: u64 = 0,
     observation_sum: f64 = 0,
+    /// One slot per bucket plus `+Inf`, allocated on first use.
+    exemplars: Exemplars = .{},
+
+    /// `observe` plus an exemplar on the bucket `v` lands in (client_golang
+    /// `ObserveWithExemplar`); see `Counter.addWithExemplar`.
+    pub fn observeWithExemplar(h: *Histogram, v: f64, labels: []const Label, timestamp_s: ?f64) ExemplarError!void {
+        var buf: [exemplar_text_cap]u8 = undefined;
+        const rendered = try renderExemplarLabels(&buf, labels);
+        const slots = try h.exemplars.get(h.upper_bounds.len + 1);
+        var i: usize = h.upper_bounds.len;
+        for (h.upper_bounds, 0..) |bound, j| {
+            if (v <= bound) {
+                i = j;
+                break;
+            }
+        }
+        slots[i].store(rendered, v, timestamp_s);
+        h.observe(v);
+    }
 
     pub fn observe(h: *Histogram, v: f64) void {
         lockSpin(&h.lock);
@@ -426,7 +556,11 @@ const Child = struct {
         for (c.label_values) |v| gpa.free(v);
         gpa.free(c.label_values);
         switch (c.data) {
-            .histogram => |h| gpa.free(h.bucket_counts),
+            .histogram => |*h| {
+                h.exemplars.free(h.upper_bounds.len + 1);
+                gpa.free(h.bucket_counts);
+            },
+            .counter => |*ctr| ctr.exemplars.free(1),
             .summary => |*sm| sm.inner.deinit(),
             else => {},
         }
@@ -867,7 +1001,7 @@ pub const Registry = struct {
         c.* = .{
             .label_values = owned,
             .data = switch (fam.kind) {
-                .counter => .{ .counter = .{} },
+                .counter => .{ .counter = .{ .exemplars = .{ .gpa = gpa } } },
                 .gauge => .{ .gauge = .{} },
                 .summary => .{
                     .summary = .{
@@ -880,6 +1014,7 @@ pub const Registry = struct {
                     },
                 },
                 .histogram => .{ .histogram = .{
+                    .exemplars = .{ .gpa = gpa },
                     .upper_bounds = fam.buckets,
                     .bucket_counts = blk: {
                         const counts = try gpa.alloc(u64, fam.buckets.len);
@@ -1078,7 +1213,7 @@ pub const Registry = struct {
             try writeHeader(bw, fam.name, fam.help, fam.kind, format);
             for (entry.children) |c| {
                 switch (c.data) {
-                    .counter => |*ctr| try writeSample(bw, fam.name, "", fam.label_names, c.label_values, null, .{ .count = ctr.value() }, format),
+                    .counter => |*ctr| try writeSampleEx(bw, fam.name, "", fam.label_names, c.label_values, null, .{ .count = ctr.value() }, format, ctr.exemplars.slot(0)),
                     .counter_func => |f| try writeSample(bw, fam.name, "", fam.label_names, c.label_values, null, .{ .float = f.f(f.ctx) }, format),
                     .gauge => |*g| try writeSample(bw, fam.name, "", fam.label_names, c.label_values, null, .{ .float = g.value() }, format),
                     .gauge_func => |f| try writeSample(bw, fam.name, "", fam.label_names, c.label_values, null, .{ .float = f.f(f.ctx) }, format),
@@ -1452,6 +1587,13 @@ fn leLabel(bound: f64) ExtraLabel {
 
 /// One sample line: `<name><suffix>{labels[,extra]} <value>`.
 fn writeSample(w: *std.Io.Writer, name: []const u8, suffix: []const u8, label_names: []const []const u8, label_values: []const []const u8, extra: ?ExtraLabel, value: SampleValue, format: Format) std.Io.Writer.Error!void {
+    return writeSampleEx(w, name, suffix, label_names, label_values, extra, value, format, null);
+}
+
+/// `writeSample` with the sample's exemplar slot: OpenMetrics appends
+/// ` # {labels} value [timestamp]` (expfmt `writeExemplar`); the text
+/// format has no exemplars.
+fn writeSampleEx(w: *std.Io.Writer, name: []const u8, suffix: []const u8, label_names: []const []const u8, label_values: []const []const u8, extra: ?ExtraLabel, value: SampleValue, format: Format, exemplar: ?*ExemplarSlot) std.Io.Writer.Error!void {
     try w.writeAll(name);
     try w.writeAll(suffix);
     try writeLabels(w, label_names, label_values, extra, format);
@@ -1468,6 +1610,20 @@ fn writeSample(w: *std.Io.Writer, name: []const u8, suffix: []const u8, label_na
             .openmetrics => try writeOpenMetricsFloat(w, v),
         },
     }
+    if (format == .openmetrics) if (exemplar) |slot| {
+        lockSpin(&slot.lock);
+        defer slot.lock.unlock();
+        if (slot.set) {
+            try w.writeAll(" # ");
+            try w.writeAll(slot.text[0..slot.len]);
+            try w.writeByte(' ');
+            try writeOpenMetricsFloat(w, slot.value);
+            if (slot.timestamp_s) |ts| {
+                try w.writeByte(' ');
+                try writeOpenMetricsFloat(w, ts);
+            }
+        }
+    };
     try w.writeByte('\n');
 }
 
@@ -1478,11 +1634,11 @@ fn writeHistogram(w: *std.Io.Writer, fam: *const Family, c: *const Child, h: *Hi
     lockSpin(&h.lock);
     defer h.lock.unlock();
     var cumulative: u64 = 0;
-    for (h.upper_bounds, h.bucket_counts) |bound, n| {
+    for (h.upper_bounds, h.bucket_counts, 0..) |bound, n, i| {
         cumulative += n;
-        try writeSample(w, fam.name, "_bucket", fam.label_names, c.label_values, leLabel(bound), .{ .count = cumulative }, format);
+        try writeSampleEx(w, fam.name, "_bucket", fam.label_names, c.label_values, leLabel(bound), .{ .count = cumulative }, format, h.exemplars.slot(i));
     }
-    try writeSample(w, fam.name, "_bucket", fam.label_names, c.label_values, leLabel(std.math.inf(f64)), .{ .count = h.observation_count }, format);
+    try writeSampleEx(w, fam.name, "_bucket", fam.label_names, c.label_values, leLabel(std.math.inf(f64)), .{ .count = h.observation_count }, format, h.exemplars.slot(h.upper_bounds.len));
     try writeSample(w, fam.name, "_sum", fam.label_names, c.label_values, null, .{ .float = h.observation_sum }, format);
     try writeSample(w, fam.name, "_count", fam.label_names, c.label_values, null, .{ .count = h.observation_count }, format);
 }
@@ -3946,6 +4102,115 @@ test "ProcessCollector: a pid that does not exist yields no samples, not an erro
     try pc.register(&reg, "");
     var buf: [1024]u8 = undefined;
     try testing.expectEqualStrings("", try scrapeInto(&reg, &buf));
+}
+
+/// `tools/go_golden`'s "exemplars" section (client_golang const metrics with
+/// exemplars, fixed timestamp), plus the `# EOF` our whole-registry writer adds.
+const golden_go_exemplars =
+    \\# HELP x_hits Hits.
+    \\# TYPE x_hits counter
+    \\x_hits_total 3.0 # {trace_id="4bf92f\"x"} 2.0 1.7000000002499998e+09
+    \\# HELP x_lat_seconds Lat.
+    \\# TYPE x_lat_seconds histogram
+    \\x_lat_seconds_bucket{le="1.0"} 1 # {span="a"} 0.5 1.7000000002499998e+09
+    \\x_lat_seconds_bucket{le="5.0"} 2
+    \\x_lat_seconds_bucket{le="+Inf"} 3 # {span="b"} 6.0 1.7000000002499998e+09
+    \\x_lat_seconds_sum 9.5
+    \\x_lat_seconds_count 3
+    \\# EOF
+    \\
+;
+
+test "exemplars: OpenMetrics lines byte-identical to client_golang; text format has none" {
+    var reg = Registry.init(testing.allocator);
+    defer reg.deinit();
+    const ts: f64 = @as(f64, 1700000000250000000.0) / 1e9; // Go: UnixNano()/1e9
+    const c = try reg.counter("x_hits_total", "Hits.", &.{});
+    c.add(1);
+    try c.addWithExemplar(2, &.{.{ .name = "trace_id", .value = "4bf92f\"x" }}, ts);
+    const h = try reg.histogram("x_lat_seconds", "Lat.", &.{}, &.{ 1, 5 });
+    try h.observeWithExemplar(0.5, &.{.{ .name = "span", .value = "a" }}, ts);
+    h.observe(3);
+    try h.observeWithExemplar(6, &.{.{ .name = "span", .value = "b" }}, ts);
+
+    var buf: [2048]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try reg.writeOpenMetrics(&w);
+    try testing.expectEqualStrings(golden_go_exemplars, w.buffered());
+    const text = try scrapeInto(&reg, &buf);
+    try testing.expect(std.mem.indexOf(u8, text, "#  {") == null);
+    try testing.expect(std.mem.indexOf(u8, text, "span") == null);
+}
+
+test "exemplars: the last one per sample wins; no timestamp is allowed" {
+    var reg = Registry.init(testing.allocator);
+    defer reg.deinit();
+    const c = try reg.counter("y_total", "h", &.{});
+    try c.incWithExemplar(&.{.{ .name = "t", .value = "1" }}, null);
+    try c.incWithExemplar(&.{.{ .name = "t", .value = "2" }}, null);
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try reg.writeOpenMetrics(&w);
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "y_total 2.0 # {t=\"2\"} 1.0\n") != null);
+}
+
+test "exemplars: invalid labels are refused and change nothing" {
+    var reg = Registry.init(testing.allocator);
+    defer reg.deinit();
+    const c = try reg.counter("z_total", "h", &.{});
+    try testing.expectError(error.InvalidExemplar, c.incWithExemplar(&.{.{ .name = "0bad", .value = "x" }}, null));
+    try testing.expectError(error.InvalidExemplar, c.incWithExemplar(&.{ .{ .name = "a", .value = "x" }, .{ .name = "a", .value = "y" } }, null));
+    try testing.expectError(error.InvalidExemplar, c.incWithExemplar(&.{.{ .name = "a", .value = "\xff" }}, null));
+    // 128 runes is the limit: name (1) + value (127) passes, one more fails.
+    const ok_value = "é" ** 127;
+    try c.incWithExemplar(&.{.{ .name = "a", .value = ok_value }}, null);
+    try testing.expectError(error.InvalidExemplar, c.incWithExemplar(&.{.{ .name = "a", .value = ok_value ++ "x" }}, null));
+    try testing.expectEqual(@as(u64, 1), c.value());
+    var bare: Counter = .{};
+    try testing.expectError(error.NoExemplarStorage, bare.incWithExemplar(&.{}, null));
+}
+
+test "exemplars: concurrent writers and scrapers stay well-formed" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    var reg = Registry.init(testing.allocator);
+    defer reg.deinit();
+    const h = try reg.histogram("race_ex_seconds", "h", &.{}, &default_buckets);
+    var stop = std.atomic.Value(bool).init(false);
+    const W = struct {
+        fn run(hh: *Histogram, s: *std.atomic.Value(bool)) void {
+            var i: usize = 0;
+            const vals = [_][]const u8{ "a", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "\"q\"" };
+            while (!s.load(.acquire)) : (i += 1) {
+                hh.observeWithExemplar(@as(f64, @floatFromInt(i % 13)), &.{.{ .name = "trace_id", .value = vals[i % 3] }}, null) catch unreachable;
+            }
+        }
+    };
+    const S = struct {
+        fn run(r: *Registry, s: *std.atomic.Value(bool)) void {
+            var buf: [8192]u8 = undefined;
+            while (!s.load(.acquire)) {
+                var w: std.Io.Writer = .fixed(&buf);
+                r.writeOpenMetrics(&w) catch unreachable;
+                const out = w.buffered();
+                // every exemplar is one of the three whole label blocks
+                var it = std.mem.splitScalar(u8, out, '\n');
+                while (it.next()) |line| {
+                    const at = std.mem.indexOf(u8, line, " # ") orelse continue;
+                    const rest = line[at + 3 ..];
+                    std.debug.assert(std.mem.startsWith(u8, rest, "{trace_id=\"a\"} ") or
+                        std.mem.startsWith(u8, rest, "{trace_id=\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"} ") or
+                        std.mem.startsWith(u8, rest, "{trace_id=\"\\\"q\\\"\"} "));
+                }
+            }
+        }
+    };
+    var ts: [3]std.Thread = undefined;
+    ts[0] = try std.Thread.spawn(.{}, W.run, .{ h, &stop });
+    ts[1] = try std.Thread.spawn(.{}, W.run, .{ h, &stop });
+    ts[2] = try std.Thread.spawn(.{}, S.run, .{ &reg, &stop });
+    sleepMs(150);
+    stop.store(true, .release);
+    for (ts) |t| t.join();
 }
 
 // ── external anchor: client_golang + expfmt + textparse ────────────────────

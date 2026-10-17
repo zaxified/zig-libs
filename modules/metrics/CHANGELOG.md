@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-17** — ADDED: exemplars — `Counter.addWithExemplar` / `incWithExemplar`,
+  `Histogram.observeWithExemplar` (client_golang `AddWithExemplar` / `ObserveWithExemplar`: last
+  exemplar per sample / per bucket, `max_exemplar_runes` = 128, caller-supplied Unix timestamp),
+  shown by the OpenMetrics exposition byte-identically to expfmt (golden: `tools/go_golden`).
+  `ExemplarError`. Storage is allocated on first use; `Counter` grows from 8 to 32 bytes.
+
 - **2026-10-17** — ADDED: `ProcessCollector` — client_golang's process collector (`process_cpu_seconds_total`,
   `process_open_fds`, `process_max_fds`, `process_{virtual,resident}_memory_bytes`,
   `process_virtual_memory_max_bytes`, `process_start_time_seconds`,
