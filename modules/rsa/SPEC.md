@@ -476,11 +476,14 @@ Consumer build options (CONVENTIONS §4.2), first in zig-libs (2026-10-17):
 
 - ~~The OAEP decoupled-hash (digest≠MGF1) configuration has no external KAT~~ ✅ 2026-10-14:
   Wycheproof `rsa_oaep_*_mgf1sha*` covers it.
-- **`rsa-pbes2` fuzz: 4 damaged inputs accepted in one 2000-run driver pass** *(2026-10-14,
-  unattributed)*: the same harness in-process (`reachCheck`, 3000 seeds) accepted 0 of 2537
-  damaged inputs; every accepted key passed the write/parse round trip and the F1 field check,
-  so no wrong key came out. Find which octets the parser tolerates (a replay with
-  `RSA_FUZZ_SEEDFILE`, then `RSA_FUZZ=1,<seed>`). Effort S.
+- ~~**`rsa-pbes2` fuzz: 4 damaged inputs accepted in one 2000-run driver pass**~~ *(2026-10-14,
+  unattributed)* ✅ 2026-10-18 closed, not reproduced: the driver at HEAD accepted 0 of 1 685
+  damaged inputs (seeds 0–1999) and 0 of 16 788 (seeds 2000–21999), the same 2000 seeds at
+  `c8a29022` (R5, where it was seen) 0 of 1 685, and an exhaustive probe — every octet of the
+  three PBES2 fixtures XORed with 01/20/80/ff, and every truncation by 1–63 octets — 0 accepted.
+  The 10-14 pass ran on the uncommitted R7 tree with a different seed range (293 pristine vs
+  315 now), so the four inputs cannot be replayed; every one of them had passed the round trip
+  and the F1 field check, so no wrong key came out.
 - **scrypt in PBES2** *(owner, 2026-10-14: not now)*: `std.crypto.pwhash.scrypt.kdf` needs an
   allocator and this module allocates nothing; OpenSSL writes scrypt only on `-scrypt`. An
   allocator-taking `fromPkcs8EncryptedScrypt` would close it. Effort S.
