@@ -45,8 +45,10 @@ pub const schedule_burn = 512;
 
 /// `Encryptor`/`Decryptor` `update`: the block loop over round keys held in
 /// the caller's struct (no key bytes in this frame, only plaintext blocks;
-/// measured clean at 512 B, 2026-10-16).
-pub const update_burn = 512;
+/// measured clean at 512 B, 2026-10-16, on the native CPU; at CI's
+/// `-Dcpu=x86_64_v3+aes+pclmul+adx` `Decryptor(Aes256).update` reaches 719 B
+/// from a burn top of 175 B, 2026-10-17 -- hence 1 KiB).
+pub const update_burn = 1024;
 
 /// `encryptCts`/`decryptCts`: the one-shot body plus the stolen tail's two
 /// blocks (decryptCts measured 1359 B deep at a 1024 B burn, 2026-10-16).

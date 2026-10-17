@@ -95,7 +95,9 @@ fn run(comptime fam: Family, text: []const u8) !void {
             });
         }
     }
-    std.debug.print("wycheproof rsa {s}: {d} tests (valid {d}, invalid {d}, acceptable {d})\n", .{ @tagName(fam), c.tests, c.valid, c.invalid, c.acceptable });
+    // Silent on success: the lane treats stderr from a passing test as a
+    // failure. A vector file that parsed to nothing must not pass, though.
+    try std.testing.expect(c.tests != 0 and c.valid != 0 and c.invalid != 0);
 }
 
 const Hashes = .{

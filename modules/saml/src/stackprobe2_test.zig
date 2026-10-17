@@ -15,8 +15,9 @@ const encutil = @import("test_encutil.zig");
 const fx = @import("fixtures.zig");
 const sp = @import("testkit").stackprobe;
 
-// The burn is 128 KiB; the window must exceed it.
-const P = sp.Probe(.{ .window = 256 * 1024 });
+// The burn is 256 KiB; the window must exceed the body's depth (~258 KB at
+// CI's -Dcpu, 2026-10-17: the 256 KiB window was itself reached).
+const P = sp.Probe(.{ .window = 512 * 1024 });
 
 const alloc = std.heap.page_allocator; // global-alloc-ok: the probe's file-scope fixtures (keys, encoded responses) outlive the test block and must not come from testing.allocator
 

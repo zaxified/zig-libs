@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-17** — vDSO lookup test prints a diagnostic walk when the lookup disagrees with the section-table model (seen only on the arm64 CI runner; qemu-user maps its own vDSO and passes). Test only; the defect is not yet diagnosed.
+
 - **2026-10-11** — **Tests only, evidence E3 → E2 (grade 3 → 2):** the vDSO symbol lookup is
   checked against an independent section-table model on every exported vDSO symbol (`vdsoLookupAt`
   split out of `vdsoLookup` for it); every output route (`fill` via vDSO and via `randomSecure`, the

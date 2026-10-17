@@ -192,7 +192,9 @@ pub const OutboundSession = struct {
     /// `pickle`, wrapped in ChaCha20-Poly1305 under `key` with a fresh
     /// random nonce drawn through `io` (see pickle.zig).
     pub fn pickleSealed(self: *const OutboundSession, io: std.Io, key: *const pickle_mod.PickleKey, out: *[pickle_mod.sealed_outbound_len]u8) void {
-        pickle_mod.sealOutbound(io, self, key, out);
+        // The same burn as `fromSealedPickle`: the AEAD's key schedule and
+        // the plaintext pickle live in the body's frames.
+        burn.run(burn.decrypt_burn, void, pickle_mod.sealOutbound, .{ io, self, key, out });
     }
 
     /// Restore a session from `pickle`'s output. Strict: exact length, no
@@ -406,7 +408,9 @@ pub const InboundGroupSession = struct {
     /// `pickle`, wrapped in ChaCha20-Poly1305 under `key` with a fresh
     /// random nonce drawn through `io` (see pickle.zig).
     pub fn pickleSealed(self: *const InboundGroupSession, io: std.Io, key: *const pickle_mod.PickleKey, out: *[pickle_mod.sealed_inbound_len]u8) void {
-        pickle_mod.sealInbound(io, self, key, out);
+        // The same burn as `fromSealedPickle`: the AEAD's key schedule and
+        // the plaintext pickle live in the body's frames.
+        burn.run(burn.decrypt_burn, void, pickle_mod.sealInbound, .{ io, self, key, out });
     }
 
     /// Restore a session from `pickle`'s output. Strict: exact length, no

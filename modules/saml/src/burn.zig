@@ -40,4 +40,4 @@ pub inline fn run(comptime n: usize, comptime R: type, comptime f: anytype, args
 /// attribute (whose plaintext is the user's identity data). One login per
 /// call, so deep is cheap; sized generously until the ReleaseFast probe
 /// (`stackprobe2_test.zig`) reports the real depth.
-pub const consume_burn = 128 * 1024;
+pub const consume_burn = 256 * 1024;

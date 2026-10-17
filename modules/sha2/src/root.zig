@@ -507,6 +507,11 @@ fn unhex(comptime n: usize, hex: []const u8) [n]u8 {
 }
 
 /// Every backend this build can run, for the Word size of `H`.
+fn backendAvailableAnyWord(comptime b: Backend) bool {
+    return std.mem.indexOfScalar(Backend, backendsFor(u32), b) != null or
+        std.mem.indexOfScalar(Backend, backendsFor(u64), b) != null;
+}
+
 fn backendsFor(comptime Word: type) []const Backend {
     return comptime blk: {
         var buf: [3]Backend = undefined;
@@ -840,7 +845,15 @@ test "fuzz harness: sha2-agree, 300 seeds, reaches every outcome" {
         try fuzzAgree(fuzz_driver.Rng, &rng, testing.allocator);
     }
     for (agree_counts, 0..) |n, i| if (n == 0) {
-        std.debug.print("reach: sha2-agree label {t} never hit\n", .{@as(AgreeMark, @enumFromInt(i))});
+        const m: AgreeMark = @enumFromInt(i);
+        // A backend label is reachable only where that backend is compiled
+        // (`.simd` is x86-64 AVX2 only; the arm64 lane never has it).
+        const absent = switch (m) {
+            inline .stdlib, .simd, .scalar => |b| comptime !(backendAvailableAnyWord(@field(Backend, @tagName(b)))),
+            else => false,
+        };
+        if (absent) continue;
+        std.debug.print("reach: sha2-agree label {t} never hit\n", .{m});
         return error.HarnessDoesNotReach;
     };
 }

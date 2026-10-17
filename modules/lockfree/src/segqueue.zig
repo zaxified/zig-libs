@@ -177,6 +177,9 @@ fn Impl(comptime T: type, comptime opts: Options, comptime fault: Fault) type {
         const lap: u64 = opts.block_slots + 1;
         /// The offset of the closed position (also the slot count).
         const closed: u64 = opts.block_slots;
+        /// Positive controls whose bug touches a block after it is recycled:
+        /// displaced spares go to `graveyard` instead of the allocator.
+        const keeps_graveyard = fault == .read_before_copy or fault == .skip_ready_wait;
 
         const poison: u8 = 0xA5;
 
@@ -240,9 +243,9 @@ fn Impl(comptime T: type, comptime opts: Options, comptime fault: Fault) type {
         /// dereferenced while shared.
         spare: std.atomic.Value(?*Block),
         allocator: std.mem.Allocator,
-        /// The `read_before_copy` control's displaced spares, freed at
-        /// `deinit` (a zero-size field otherwise).
-        graveyard: if (fault == .read_before_copy) std.atomic.Value(?*Block) else void,
+        /// The `read_before_copy` and `skip_ready_wait` controls' displaced
+        /// spares, freed at `deinit` (a zero-size field otherwise).
+        graveyard: if (keeps_graveyard) std.atomic.Value(?*Block) else void,
 
         /// An empty queue with its first block. `allocator` must be
         /// thread-safe: blocks are allocated by producers and freed by
@@ -256,7 +259,7 @@ fn Impl(comptime T: type, comptime opts: Options, comptime fault: Fault) type {
                 .pending = .init(null),
                 .spare = .init(null),
                 .allocator = allocator,
-                .graveyard = if (fault == .read_before_copy) .init(null) else {},
+                .graveyard = if (keeps_graveyard) .init(null) else {},
             };
         }
 
@@ -275,7 +278,7 @@ fn Impl(comptime T: type, comptime opts: Options, comptime fault: Fault) type {
                 self.allocator.destroy(b);
             }
             if (self.spare.load(.monotonic)) |s| self.allocator.destroy(s);
-            if (fault == .read_before_copy) {
+            if (keeps_graveyard) {
                 var g = self.graveyard.load(.monotonic);
                 while (g) |b| {
                     g = b.pending_next;
@@ -298,10 +301,11 @@ fn Impl(comptime T: type, comptime opts: Options, comptime fault: Fault) type {
         fn recycle(self: *Self, b: *Block) void {
             b.poisonItems();
             const old = self.spare.swap(b, .acq_rel) orelse return;
-            // The positive control recycles (poisons, resets, reuses) under a
-            // reader but never frees: a real free would crash the test run
-            // instead of failing it with a verdict.
-            if (fault == .read_before_copy) {
+            // The positive controls recycle (poison, reset, reuse) under a
+            // reader (`read_before_copy`) or a writer (`skip_ready_wait`) but
+            // never free: a real free would crash the test run instead of
+            // failing it with a verdict (SIGSEGV in `push`, arm64 CI 10-17).
+            if (keeps_graveyard) {
                 var top = self.graveyard.load(.monotonic);
                 while (true) {
                     old.pending_next = top;

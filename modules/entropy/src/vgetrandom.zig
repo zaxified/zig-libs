@@ -206,6 +206,59 @@ pub fn draw(buf: []u8) bool {
     return true;
 }
 
+/// Why `vdsoLookupAt` missed a symbol the model found: replays its walk and
+/// prints the step that rejected it. Seen only on the arm64 CI runner
+/// (Neoverse-N2, 2026-10-17: lookup 0, model 0xff703f383948); qemu-user
+/// maps its own vDSO and passes, so the runner's log is the only witness.
+fn diagLookup(vdso_addr: usize, s: ModelSym) void {
+    const elf = std.elf;
+    const eh: *const elf.Ehdr = @ptrFromInt(vdso_addr);
+    std.debug.print("vdso diag: {s}@{s} model 0x{x} (vdso 0x{x}, phnum {d})\n", .{ s.name, s.version, s.addr, vdso_addr, eh.e_phnum });
+    var dynv_opt: ?[*]const usize = null;
+    var load_base: ?usize = null;
+    for (0..eh.e_phnum) |i| {
+        const ph: *const elf.Phdr = @ptrFromInt(vdso_addr + eh.e_phoff + i * eh.e_phentsize);
+        std.debug.print("vdso diag:   phdr {d} type 0x{x} off 0x{x} vaddr 0x{x}\n", .{ i, ph.p_type, ph.p_offset, ph.p_vaddr });
+        switch (ph.p_type) {
+            elf.PT_LOAD => load_base = vdso_addr +% ph.p_offset -% ph.p_vaddr,
+            elf.PT_DYNAMIC => dynv_opt = @ptrFromInt(vdso_addr + ph.p_offset),
+            else => {},
+        }
+    }
+    const dynv = dynv_opt orelse return std.debug.print("vdso diag:   no PT_DYNAMIC\n", .{});
+    const b = load_base orelse return std.debug.print("vdso diag:   no PT_LOAD\n", .{});
+    var strings_opt: ?[*:0]const u8 = null;
+    var syms_opt: ?[*]const elf.Sym = null;
+    var hash_opt: ?[*]const linux.Elf_Symndx = null;
+    var versym: ?[*]const elf.Versym = null;
+    var verdef: ?*const elf.Verdef = null;
+    var i: usize = 0;
+    while (dynv[i] != 0) : (i += 2) {
+        std.debug.print("vdso diag:   dyn tag 0x{x} val 0x{x}\n", .{ dynv[i], dynv[i + 1] });
+        const p = b +% dynv[i + 1];
+        switch (dynv[i]) {
+            elf.DT_STRTAB => strings_opt = @ptrFromInt(p),
+            elf.DT_SYMTAB => syms_opt = @ptrFromInt(p),
+            elf.DT_HASH => hash_opt = @ptrFromInt(p),
+            elf.DT_VERSYM => versym = @ptrFromInt(p),
+            elf.DT_VERDEF => verdef = @ptrFromInt(p),
+            else => {},
+        }
+    }
+    const strings = strings_opt orelse return std.debug.print("vdso diag:   no DT_STRTAB\n", .{});
+    const syms = syms_opt orelse return std.debug.print("vdso diag:   no DT_SYMTAB\n", .{});
+    const hash = hash_opt orelse return std.debug.print("vdso diag:   no DT_HASH (only a GNU hash?)\n", .{});
+    std.debug.print("vdso diag:   nchain {d}, base 0x{x}\n", .{ hash[1], b });
+    for (0..hash[1]) |k| {
+        const st = syms[k];
+        if (!std.mem.eql(u8, s.name, std.mem.sliceTo(strings + st.st_name, 0))) continue;
+        const vok = versym == null or verdef == null or versionMatches(verdef.?, versym.?[k], s.version, strings);
+        std.debug.print("vdso diag:   sym {d}: info 0x{x} shndx {d} value 0x{x} versym 0x{x} version ok {}\n", .{
+            k, st.st_info, st.st_shndx, st.st_value, if (versym) |v| @as(u16, @bitCast(v[k])) else 0, vok,
+        });
+    }
+}
+
 /// One exported symbol as the model sees it.
 const ModelSym = struct { name: []const u8, version: []const u8, addr: usize };
 
@@ -298,7 +351,9 @@ test "vdsoLookup agrees with the section-table model on every exported vDSO symb
 
     var saw_getrandom = false;
     for (syms) |s| {
-        try std.testing.expectEqual(s.addr, vdsoLookupAt(vdso_addr, s.version, s.name));
+        const got = vdsoLookupAt(vdso_addr, s.version, s.name);
+        if (got != s.addr) diagLookup(vdso_addr, s);
+        try std.testing.expectEqual(s.addr, got);
         // Right name, wrong version: never bound.
         try std.testing.expectEqual(@as(usize, 0), vdsoLookupAt(vdso_addr, "LINUX_0.0", s.name));
         if (s.version.len != 0 and sym != null and std.mem.eql(u8, s.name, sym.?.name)) saw_getrandom = true;
