@@ -12,7 +12,7 @@
 
 **Performance:** not measured
 
-**Evidence:** kat — golden header/token examples; fuzz only asserts never-panic, no reference model
+**Evidence:** model-fuzz — the decision table (`verify`/`verifyApiKey`/`verifyBasic` under add/remove rotation, verifier callbacks, open plane) against plain credential lists, and the denied-request throttle end to end on the wire against an array model of its documented rule (window, fold, idle sweep, LRU cap); 3 planted mutants all killed (2026-10-17)
 
 **Known defects:** none recorded
 

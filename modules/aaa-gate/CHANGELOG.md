@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-17** — **NO CONSUMER-VISIBLE CHANGE:** model-based fuzz harnesses `aaa-gate-verify` and `aaa-gate-throttle` (`src/model_test.zig`): the decision table under rotation (bearer, API key, Basic) and the denied-request throttle through the middleware, each against a naive model; negative control: 3 planted mutants killed; `AAA_GATE_FUZZ=200000` clean.
+
 - **2026-10-17** — echo parity (KeyAuth + BasicAuth v5.4.0): HTTP Basic scheme (`AuthMode.basic` / `.any`,
   `Options.basic_users`/`basic_verify`, `addBasicUser`/`removeBasicUser`, `verifyBasic`,
   `basicCredentialsOf`; `WWW-Authenticate: Basic realm`, default realm `Restricted`; stored as

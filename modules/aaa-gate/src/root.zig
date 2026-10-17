@@ -3778,3 +3778,7 @@ test "corpus: every cookie seed reaches the extractor and the found/absent split
         try testing.expectEqual(want, apiKeyPresented(&g, &req) != null);
     }
 }
+
+test {
+    _ = @import("model_test.zig");
+}
