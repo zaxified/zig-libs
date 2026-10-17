@@ -142,14 +142,17 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   (`*` → `_`, `:` → `+`), `accounts/<issuer>/account.key` (`loadOrCreateAccountKey`),
   `locks/<name>.lock`. Events: `installed` (source storage | issued), `failed` (retry time),
   `storage_failed` (issued and served, but a restart would order again).
-- **Storage** (`storage.zig`): a vtable (load / atomic store / delete / tryLock / unlock); keys are
+- **Storage** (`storage.zig`): a vtable (load / atomic store / delete / create-if-absent / tryLock /
+  unlock; `create` optional, a backend without it gets load-then-store); keys are
   `/`-separated `[A-Za-z0-9._@+-]` segments, no `.`/`..`/empty segment, ≤ 512 bytes; values
   ≤ 1 MiB. `DirStorage`: dirs `0700`, files `0600`, write = new file + fsync + rename; a lock is a
-  file `owner\nexpiry` created whole by an exclusive link, re-entrant for its owner (extends the
-  lease), an unreadable one counts as expired. Not atomic across nodes: a stale-lock takeover is
-  read → delete → create, and `unlock` is read → delete, so between a read and the delete another
-  node can create its own lock and lose it — a duplicate order at worst; a lease shorter than an
-  issuance lets a second node in (no heartbeat). `MemStorage`: a map under a spin lock, values wiped
+  file `owner\nexpiry`, re-entrant for its owner (extends the lease), an unreadable one counts as
+  expired; every lock operation (read → decide → create / replace / delete) runs under an exclusive
+  `flock` of `locks/.guard`, so a stale lock is taken over by exactly one node and `unlock` never
+  deletes another node's fresh lock (2026-10-18, audit L6; CertMagic's file locks are
+  read-then-delete). Where the file system refuses `flock` the operations run unguarded (create by
+  exclusive link, takeover delete-then-create: a duplicate order at worst). `create` = exclusive
+  link. A lease shorter than an issuance still lets a second node in (no heartbeat). `MemStorage`: a map under a spin lock, values wiped
   on replace/delete/deinit.
 - Threadsafe; account key + order state are caller-held. All crypto is `std.crypto` plus the sibling
   `p256`/`p384` signers — no bespoke ASN.1/crypto beyond std's `Certificate`/ECDSA. Key/cert PEM I/O
@@ -300,12 +303,16 @@ ACME v2 (RFC 8555) replay/downgrade paths all confirmed correct. A manual stagin
   read, and the SNI was not lower-cased; **L11** CTLs in the redirect target; **L12** an
   `unmanage`d entry was still stored; **L13** issuers beyond 16 silently ignored, a first issuer's
   `Retry-After` lost; **N2** the user clock read under the lock; **N4** an RSA key in PKCS#8
-  refused; **N5** a name whose storage key is invalid accepted. Open: **L6** the DirStorage lock
-  races (documented under Storage; a rename- or flock-based lock would close them); **L7**
-  `loadOrCreateAccountKey` on two nodes starting at once creates two accounts (last store wins) —
-  wants a create-exclusive store or the issuance lock around it; **L10** an expired certificate
-  stays served (documented; autocert drops it); test gaps: concurrent `unmanage`, the lock races,
-  an RSA PKCS#8 pair.
+  refused; **N5** a name whose storage key is invalid accepted. ✅ 2026-10-18: **L6** the DirStorage
+  lock races — every lock operation under a `flock` guard (tests: 8 racing nodes on one stale lock,
+  exactly one wins, 40 rounds; a held guard blocks `tryLock`; negative controls: takeover by
+  replace → 8 winners, no guard → the wait test fails); **L7** two nodes starting at once created
+  two accounts — `Storage.create` (create-if-absent) + reload of the winner's key (test: a storage
+  whose load misses the stored key; with a plain store the test fails); **L10** an expired
+  certificate stays served — kept by decision: the handshake fails either way, the expired
+  certificate gives the client the precise error, renewal keeps retrying and on-demand names are
+  re-obtained once their back-off is over. Open test gaps: concurrent `unmanage`, an RSA PKCS#8
+  pair.
 - **Manager follow-ups** (2026-10-16): (a) the replay transcript does not carry the `manager`
   scenario (regenerate with `pebble.sh` once the replay test knows the scenario); (b) the mock CA
   issues a fixed chain whatever the CSR, so the Manager's full path is exercised only by Pebble —

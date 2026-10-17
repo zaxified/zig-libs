@@ -1273,7 +1273,10 @@ pub const AccountKeyError = error{ OutOfMemory, InvalidKey, StorageFailed, Malfo
 /// The account key for `issuer_name` from `storage`, or a fresh one of `alg`
 /// (ES256/ES384/ES512) generated and stored (autocert keeps its account key
 /// in the cache the same way). The account key IS the ACME account: losing
-/// it means a new account. `out` is written in place; wipe it when done.
+/// it means a new account. The fresh key is stored with `Storage.create`, so
+/// two nodes of a fleet starting at once both end up with the one that was
+/// stored first (the other's is dropped), not one account each. `out` is
+/// written in place; wipe it when done.
 pub fn loadOrCreateAccountKey(
     out: *jws.AnyKeyPair,
     io: std.Io,
@@ -1285,6 +1288,25 @@ pub fn loadOrCreateAccountKey(
     if (alg == .rs256) return error.UnsupportedKeyType;
     var path_buf: [storage_mod.max_key_len]u8 = undefined;
     const path = accountKeyPath(&path_buf, issuer_name);
+    if (try loadAccountKey(out, gpa, store, path)) return;
+    jws.generateAnyKeyPair(out, alg, io);
+    const pem = try x509.ecPrivateKeyToPem(gpa, out);
+    defer {
+        std.crypto.secureZero(u8, pem);
+        gpa.free(pem);
+    }
+    const created = store.create(gpa, path, pem) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.InvalidKey => error.InvalidKey,
+        else => error.StorageFailed,
+    };
+    if (created) return;
+    // Another node stored its key between our load and our create: use that.
+    if (!try loadAccountKey(out, gpa, store, path)) return error.StorageFailed;
+}
+
+/// True with `out` filled when `path` holds a key; false when absent.
+fn loadAccountKey(out: *jws.AnyKeyPair, gpa: Allocator, store: Storage, path: []const u8) AccountKeyError!bool {
     if (store.load(gpa, path)) |pem| {
         defer {
             std.crypto.secureZero(u8, pem);
@@ -1294,24 +1316,13 @@ pub fn loadOrCreateAccountKey(
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.MalformedKey,
         };
-        return;
+        return true;
     } else |err| switch (err) {
-        error.NotFound => {},
+        error.NotFound => return false,
         error.OutOfMemory => return error.OutOfMemory,
         error.InvalidKey => return error.InvalidKey,
         error.StorageFailed => return error.StorageFailed,
     }
-    jws.generateAnyKeyPair(out, alg, io);
-    const pem = try x509.ecPrivateKeyToPem(gpa, out);
-    defer {
-        std.crypto.secureZero(u8, pem);
-        gpa.free(pem);
-    }
-    store.store(path, pem) catch |err| return switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
-        error.InvalidKey => error.InvalidKey,
-        else => error.StorageFailed,
-    };
 }
 
 /// A storage-safe issuer name from a directory URL: the host and path with

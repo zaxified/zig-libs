@@ -821,6 +821,82 @@ test "loadOrCreateAccountKey: generated once, then loaded" {
     try testing.expectError(error.InvalidKey, Manager.loadOrCreateAccountKey(&k3, io, testing.allocator, s, "../x", .es256));
 }
 
+/// A storage whose first `load` misses what is there: the window between
+/// `loadOrCreateAccountKey`'s load and its create, in which another node
+/// stored its key (audit L7, 2026-10-18).
+const RacedStorage = struct {
+    inner: storage.Storage,
+    missed: bool = false,
+    vt: storage.Storage.VTable = undefined,
+
+    fn of(ptr: *anyopaque) *RacedStorage {
+        return @ptrCast(@alignCast(ptr));
+    }
+    fn load(ptr: *anyopaque, gpa: Allocator, path: []const u8) storage.Error![]u8 {
+        const r = of(ptr);
+        if (!r.missed) {
+            r.missed = true;
+            return error.NotFound;
+        }
+        return r.inner.vtable.load(r.inner.ptr, gpa, path);
+    }
+    fn store(ptr: *anyopaque, path: []const u8, value: []const u8) storage.Error!void {
+        return of(ptr).inner.vtable.store(of(ptr).inner.ptr, path, value);
+    }
+    fn delete(ptr: *anyopaque, path: []const u8) storage.Error!void {
+        return of(ptr).inner.vtable.delete(of(ptr).inner.ptr, path);
+    }
+    fn create(ptr: *anyopaque, path: []const u8, value: []const u8) storage.Error!bool {
+        return of(ptr).inner.vtable.create.?(of(ptr).inner.ptr, path, value);
+    }
+    fn tryLock(ptr: *anyopaque, name: []const u8, owner: []const u8, now: i64, lease_s: u32) storage.Error!bool {
+        return of(ptr).inner.vtable.tryLock(of(ptr).inner.ptr, name, owner, now, lease_s);
+    }
+    fn unlock(ptr: *anyopaque, name: []const u8, owner: []const u8) void {
+        of(ptr).inner.vtable.unlock(of(ptr).inner.ptr, name, owner);
+    }
+    /// Every call forwarded to `inner`; `create` only if `inner` has one.
+    fn storage_(r: *RacedStorage) storage.Storage {
+        r.vt = .{
+            .load = load,
+            .store = store,
+            .delete = delete,
+            .create = if (r.inner.vtable.create != null) create else null,
+            .tryLock = tryLock,
+            .unlock = unlock,
+        };
+        return .{ .ptr = r, .vtable = &r.vt };
+    }
+};
+
+test "loadOrCreateAccountKey: a key stored meanwhile by another node wins (L7)" {
+    var f: Fixture = undefined;
+    f.init(day0);
+    defer f.deinit();
+    const io = f.threaded.io();
+    var first: jws.AnyKeyPair = undefined;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&first));
+    try Manager.loadOrCreateAccountKey(&first, io, testing.allocator, f.mem.storage(), "ca-one", .es256);
+    // The second node's load misses that key; its create must then refuse
+    // to replace it and hand back the stored one, not its own fresh key.
+    var raced: RacedStorage = .{ .inner = f.mem.storage() };
+    var second: jws.AnyKeyPair = undefined;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&second));
+    try Manager.loadOrCreateAccountKey(&second, io, testing.allocator, raced.storage_(), "ca-one", .es256);
+    try testing.expect(raced.missed);
+    var b1: [jws.AnyPublicKey.max_sec1_len]u8 = undefined;
+    var b2: [jws.AnyPublicKey.max_sec1_len]u8 = undefined;
+    try testing.expectEqualSlices(u8, first.publicKey().uncompressedSec1(&b1), second.publicKey().uncompressedSec1(&b2));
+    // A backend without `create` (load-then-store) takes the same path.
+    var legacy_vt = f.mem.storage().vtable.*;
+    legacy_vt.create = null;
+    var raced2: RacedStorage = .{ .inner = .{ .ptr = f.mem.storage().ptr, .vtable = &legacy_vt } };
+    var third: jws.AnyKeyPair = undefined;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&third));
+    try Manager.loadOrCreateAccountKey(&third, io, testing.allocator, raced2.storage_(), "ca-one", .es256);
+    try testing.expectEqualSlices(u8, first.publicKey().uncompressedSec1(&b1), third.publicKey().uncompressedSec1(&b2));
+}
+
 test "issuerName: storage-safe directory names" {
     var buf: [128]u8 = undefined;
     try testing.expectEqualStrings("acme-v02.api.letsencrypt.org-directory", Manager.issuerName(&buf, Client.letsencrypt_production));

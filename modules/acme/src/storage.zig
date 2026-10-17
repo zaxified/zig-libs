@@ -49,6 +49,12 @@ pub const Storage = struct {
         store: *const fn (ptr: *anyopaque, path: []const u8, value: []const u8) Error!void,
         /// Remove `key`; absent is not an error.
         delete: *const fn (ptr: *anyopaque, path: []const u8) Error!void,
+        /// Store `value` under `key` only if `key` is absent, as one atomic
+        /// step: false (nothing written) when a value is there. Two nodes
+        /// creating the same key at once: exactly one gets true. Optional
+        /// for a backend written before 2026-10-18: without it `Storage.create`
+        /// is load-then-store, which two nodes can both win.
+        create: ?*const fn (ptr: *anyopaque, path: []const u8, value: []const u8) Error!bool = null,
         /// Take the lock `name` for `owner` until `now + lease_s` (epoch
         /// seconds). True when taken: free, expired, or already `owner`'s (the
         /// lease is then extended). False when another owner holds an unexpired
@@ -72,6 +78,26 @@ pub const Storage = struct {
     pub fn delete(s: Storage, path: []const u8) Error!void {
         if (!validKey(path)) return error.InvalidKey;
         return s.vtable.delete(s.ptr, path);
+    }
+
+    /// `value` under `path` only if nothing is there yet; false when a value
+    /// is (see `VTable.create`). `loadOrCreateAccountKey` creates through it,
+    /// so two nodes starting at once end up with one account key.
+    /// `gpa` serves only a backend without `VTable.create` (its load).
+    pub fn create(s: Storage, gpa: Allocator, path: []const u8, value: []const u8) Error!bool {
+        if (!validKey(path)) return error.InvalidKey;
+        if (value.len > max_value_len) return error.StorageFailed;
+        if (s.vtable.create) |f| return f(s.ptr, path, value);
+        if (s.vtable.load(s.ptr, gpa, path)) |old| {
+            std.crypto.secureZero(u8, old);
+            gpa.free(old);
+            return false;
+        } else |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        }
+        try s.vtable.store(s.ptr, path, value);
+        return true;
     }
 
     pub fn tryLock(s: Storage, name: []const u8, owner: []const u8, now: i64, lease_s: u32) Error!bool {
@@ -116,13 +142,16 @@ fn validOwner(owner: []const u8) bool {
 /// a key is a relative path. Directories are created `0700`, files `0600`
 /// (they hold private keys); every write is a fresh file fsynced and renamed
 /// over the old one. Locks are files under `locks/` holding the owner and the
-/// lease expiry, created with an exclusive link so two nodes never both
-/// create one.
-///
-/// Fleet caveat (shared with CertMagic's file locks): taking over an expired
-/// lock is delete-then-create, so two nodes that find the same stale lock in
-/// the same instant can both win. The consequence is one duplicate order at
-/// the CA, never a corrupted file — every value write is atomic.
+/// lease expiry. Every lock operation — read, decide, create, extend, take
+/// over, release — runs under an exclusive `flock` of `locks/.guard`, so it is
+/// one step for every process and thread using the directory: a stale lock is
+/// taken over by exactly one node, and `unlock` never deletes a lock another
+/// node has just taken (CertMagic's file locks, read-then-delete, can do both).
+/// `flock` reaches across hosts only where the file system carries it (local
+/// disks; NFS through the kernel's lock manager). Where it is refused
+/// (`FileLocksUnsupported`) the operations run unguarded: a lock is still
+/// created by an exclusive link, but a takeover can then be won twice — one
+/// duplicate order at the CA, never a corrupted file.
 pub const DirStorage = struct {
     io: std.Io,
     /// Caller-owned; open it before `init` (create it `0700`).
@@ -140,6 +169,7 @@ pub const DirStorage = struct {
         .load = dirLoad,
         .store = dirStore,
         .delete = dirDelete,
+        .create = dirCreate,
         .tryLock = dirTryLock,
         .unlock = dirUnlock,
     };
@@ -201,15 +231,15 @@ pub const DirStorage = struct {
         return std.fmt.bufPrint(buf, "{s}{s}.lock", .{ lock_dir, name }) catch unreachable; // name <= max_key_len
     }
 
-    /// Create the lock file whole and exclusively; false when one exists.
-    fn createLock(d: *DirStorage, path: []const u8, owner: []const u8, expiry: i64) Error!bool {
+    /// Write `value` to `path` whole, fsynced, linked in only if `path` is
+    /// absent; false when it exists.
+    fn createExclusive(d: *DirStorage, path: []const u8, value: []const u8) Error!bool {
         try d.makeParents(path);
         var atomic = d.dir.createFileAtomic(d.io, path, .{ .permissions = file_permissions }) catch
             return error.StorageFailed;
         defer atomic.deinit(d.io);
-        var buf: [96]u8 = undefined;
-        const text = std.fmt.bufPrint(&buf, "{s}\n{d}\n", .{ owner, expiry }) catch unreachable; // owner <= 64
-        atomic.file.writeStreamingAll(d.io, text) catch return error.StorageFailed;
+        atomic.file.writeStreamingAll(d.io, value) catch return error.StorageFailed;
+        atomic.file.sync(d.io) catch return error.StorageFailed;
         atomic.link(d.io) catch |err| switch (err) {
             error.PathAlreadyExists => return false,
             else => return error.StorageFailed,
@@ -217,33 +247,55 @@ pub const DirStorage = struct {
         return true;
     }
 
+    fn dirCreate(ptr: *anyopaque, key: []const u8, value: []const u8) Error!bool {
+        return of(ptr).createExclusive(key, value);
+    }
+
+    const guard_path = lock_dir ++ ".guard";
+
+    /// The guard file, open and exclusively `flock`ed (blocks while another
+    /// process or thread holds it); null where the file system has no
+    /// `flock`. Close it to release.
+    fn guard(d: *DirStorage) Error!?std.Io.File {
+        try d.makeParents(guard_path);
+        return d.dir.createFile(d.io, guard_path, .{
+            .truncate = false,
+            .lock = .exclusive,
+            .permissions = file_permissions,
+        }) catch |err| switch (err) {
+            error.FileLocksUnsupported => null,
+            else => error.StorageFailed,
+        };
+    }
+
     fn dirTryLock(ptr: *anyopaque, name: []const u8, owner: []const u8, now: i64, lease_s: u32) Error!bool {
         const d = of(ptr);
         var path_buf: [max_lock_path]u8 = undefined;
         const path = lockPath(&path_buf, name);
-        const expiry = now +| lease_s;
-        // Two rounds: a stale lock is removed in the first and re-created in
-        // the second; losing the second round means another node won.
-        for (0..2) |_| {
-            if (try d.createLock(path, owner, expiry)) return true;
-            var read_buf: [96]u8 = undefined;
-            const held = d.readLock(path, &read_buf) catch |err| switch (err) {
-                error.NotFound => continue, // released between our two calls
-                else => return err,
-            };
-            const mine = std.mem.eql(u8, held.owner, owner);
-            if (!mine and held.expiry > now) return false;
-            if (mine) {
-                // Extend our own lease in place (atomic replace).
-                var buf: [96]u8 = undefined;
-                const text = std.fmt.bufPrint(&buf, "{s}\n{d}\n", .{ owner, expiry }) catch unreachable;
-                try dirStore(ptr, path, text);
-                return true;
-            }
-            // Expired: remove it and race for a fresh one.
-            try dirDelete(ptr, path);
+        var buf: [96]u8 = undefined;
+        const text = std.fmt.bufPrint(&buf, "{s}\n{d}\n", .{ owner, now +| lease_s }) catch unreachable; // owner <= 64
+        const g = try d.guard();
+        defer if (g) |f| f.close(d.io);
+        var read_buf: [96]u8 = undefined;
+        const held = d.readLock(path, &read_buf) catch |err| switch (err) {
+            // Free. Created by an exclusive link, so even unguarded only one
+            // of two creators wins.
+            error.NotFound => return d.createExclusive(path, text),
+            else => return err,
+        };
+        const mine = std.mem.eql(u8, held.owner, owner);
+        if (!mine and held.expiry > now) return false;
+        if (mine or g != null) {
+            // Ours (extend the lease), or expired under the guard (take it
+            // over): an atomic replace.
+            try dirStore(ptr, path, text);
+            return true;
         }
-        return false;
+        // Expired, unguarded: delete, then race the others for an exclusive
+        // create — usually one winner, two when one deletes the other's
+        // fresh lock (the caveat above).
+        try dirDelete(ptr, path);
+        return d.createExclusive(path, text);
     }
 
     const Held = struct { owner: []const u8, expiry: i64 };
@@ -266,6 +318,8 @@ pub const DirStorage = struct {
         const d = of(ptr);
         var path_buf: [max_lock_path]u8 = undefined;
         const path = lockPath(&path_buf, name);
+        const g = d.guard() catch return;
+        defer if (g) |f| f.close(d.io);
         var read_buf: [96]u8 = undefined;
         const held = d.readLock(path, &read_buf) catch return;
         if (!std.mem.eql(u8, held.owner, owner)) return;
@@ -319,6 +373,7 @@ pub const MemStorage = struct {
         .load = memLoad,
         .store = memStore,
         .delete = memDelete,
+        .create = memCreate,
         .tryLock = memTryLock,
         .unlock = memUnlock,
     };
@@ -352,6 +407,22 @@ pub const MemStorage = struct {
             };
         }
         gop.value_ptr.* = copy;
+    }
+
+    fn memCreate(ptr: *anyopaque, key: []const u8, value: []const u8) Error!bool {
+        const m = of(ptr);
+        lockSpin(&m.lock);
+        defer m.lock.unlock();
+        if (m.values.contains(key)) return false;
+        const copy = try m.gpa.dupe(u8, value);
+        errdefer {
+            std.crypto.secureZero(u8, copy);
+            m.gpa.free(copy);
+        }
+        const owned_key = try m.gpa.dupe(u8, key);
+        errdefer m.gpa.free(owned_key);
+        try m.values.put(m.gpa, owned_key, copy);
+        return true;
     }
 
     fn memDelete(ptr: *anyopaque, key: []const u8) Error!void {
@@ -446,6 +517,19 @@ fn checkContract(s: Storage) !void {
     try testing.expectError(error.InvalidKey, s.store("../x", "v"));
     try testing.expectError(error.InvalidKey, s.load(gpa, "a//b"));
 
+    // create: only when absent, never replaces.
+    try testing.expect(try s.create(gpa, "k/new", "first"));
+    try testing.expect(!try s.create(gpa, "k/new", "second"));
+    {
+        const v = try s.load(gpa, "k/new");
+        defer gpa.free(v);
+        try testing.expectEqualStrings("first", v);
+    }
+    try s.delete("k/new");
+    try testing.expect(try s.create(gpa, "k/new", "third"));
+    try s.delete("k/new");
+    try testing.expectError(error.InvalidKey, s.create(gpa, "../x", "v"));
+
     // Locks: exclusive per owner until expiry, re-entrant (extends), released.
     try testing.expect(try s.tryLock("issue/example.org", "node-a", 1000, 60));
     try testing.expect(!try s.tryLock("issue/example.org", "node-b", 1059, 60));
@@ -499,4 +583,95 @@ test "DirStorage: contract, 0600 files in 0700 directories, no temp files left" 
     try tmp.dir.writeFile(io, .{ .sub_path = "locks/garbled.lock", .data = "\x00\x01" });
     try testing.expect(try s.tryLock("garbled", "node-a", 5, 10));
     s.unlock("garbled", "node-a");
+}
+
+// Eight threads, each with its own open of the directory as a node of a
+// fleet would have, race for the same expired lock at the same instant:
+// exactly one may win each round (audit L6, 2026-10-18 — before the guard a
+// takeover was read → delete → create, and two nodes could both delete the
+// stale lock, the second deleting the first's fresh one, and both win).
+test "DirStorage: a stale lock is taken over by exactly one of racing nodes" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const nodes = 8;
+    const Node = struct {
+        d: DirStorage,
+        name: [16]u8 = undefined,
+        won: bool = false,
+        failed: bool = false,
+        go: *std.atomic.Value(bool),
+
+        fn run(n: *@This()) void {
+            while (!n.go.load(.acquire)) std.atomic.spinLoopHint();
+            const owner = std.fmt.bufPrint(&n.name, "node-{x}", .{@intFromPtr(n) & 0xffff}) catch unreachable;
+            n.won = n.d.storage().tryLock("issue/race", owner, 2000, 60) catch {
+                n.failed = true;
+                return;
+            };
+        }
+    };
+    var dirs: [nodes]std.Io.Dir = undefined;
+    for (&dirs) |*dd| dd.* = try tmp.dir.openDir(io, ".", .{});
+    defer for (dirs) |dd| dd.close(io);
+
+    var wins_total: usize = 0;
+    for (0..40) |round| {
+        // A lock of a crashed node, long expired.
+        var planter = DirStorage.init(io, tmp.dir);
+        try planter.storage().store("locks/issue/race.lock", "node-dead\n1000\n");
+        var go: std.atomic.Value(bool) = .init(false);
+        var ns: [nodes]Node = undefined;
+        var ts: [nodes]std.Thread = undefined;
+        for (&ns, &ts, dirs) |*n, *t, dd| {
+            n.* = .{ .d = DirStorage.init(io, dd), .go = &go };
+            t.* = try std.Thread.spawn(.{}, Node.run, .{n});
+        }
+        go.store(true, .release);
+        for (ts) |t| t.join();
+        var wins: usize = 0;
+        for (ns) |n| {
+            try testing.expect(!n.failed);
+            if (n.won) wins += 1;
+        }
+        if (wins != 1) std.debug.print("round {d}: {d} winners\n", .{ round, wins });
+        try testing.expectEqual(@as(usize, 1), wins);
+        wins_total += wins;
+    }
+    try testing.expectEqual(@as(usize, 40), wins_total);
+}
+
+// The guard is what makes a lock operation one step (L6): while another
+// open of `locks/.guard` holds its `flock`, `tryLock` and `unlock` wait.
+// The race test above cannot show this — its window is too narrow to be hit
+// without the guard — so this one holds the guard by hand.
+test "DirStorage: lock operations wait for the guard" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    tmp.dir.createDir(io, "locks", .default_dir) catch {};
+    const held = try tmp.dir.createFile(io, DirStorage.guard_path, .{ .truncate = false, .lock = .exclusive });
+    const Locker = struct {
+        d: DirStorage,
+        done: std.atomic.Value(bool) = .init(false),
+        won: bool = false,
+        fn run(l: *@This()) void {
+            l.won = l.d.storage().tryLock("issue/g", "node-a", 10, 60) catch false;
+            l.done.store(true, .release);
+        }
+    };
+    var l: Locker = .{ .d = DirStorage.init(io, tmp.dir) };
+    const t = try std.Thread.spawn(.{}, Locker.run, .{&l});
+    try io.sleep(.fromMilliseconds(100), .awake);
+    const finished_while_held = l.done.load(.acquire);
+    held.close(io); // releases the flock
+    t.join();
+    try testing.expect(!finished_while_held);
+    try testing.expect(l.won);
 }
