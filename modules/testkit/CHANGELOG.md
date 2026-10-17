@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-17** — Mutation run (schemata, 26 mutants over `fuzz_driver`, `golden`, `hex`, `stackprobe`): 25 killed, 1 equivalent (`hex.into` decoding into the whole buffer — `hexToBytes` returns the prefix anyway). The 6 survivors became tests: the driver's seed loop and failure return (`runSeeds`, now separable from the environment: `parseSpec`, `selected`), `Rng` drawing both ends of a range and its short-length bias, `hit` counting, stackprobe residue under a too-short burn, `analyse` not counting paint as residue. **NO CONSUMER-VISIBLE CHANGE** to `run`'s behaviour; `parseSpec`, `Spec`, `selected` are new public helpers.
+
 - **2026-10-10** — **Added:** `fuzz.ScriptSource` — the driver `Rng`'s method set (plus `boolWeighted`) over
   one `smith.slice` script, so a harness generic over its source runs from a reviewable script under
   `testing.fuzz` instead of collapsing every ranged Smith draw to its minimum (`check-fuzz-reach`).

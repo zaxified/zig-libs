@@ -451,3 +451,44 @@ test "stackprobe: a burned entry is clean, an unburned one is caught" {
     _ = try T.run("good", goodEntry, .{ &t_secret, &t_out }, &.{ &t_secret, &t_out }, .{});
     try std.testing.expectError(error.DeadStackResidue, T.run("unburned (expected to fail)", unburnedEntry, .{ &t_secret, &t_out }, &.{ &t_secret, &t_out }, .{}));
 }
+
+noinline fn publicDeepBody() void {
+    var local: [4096]u8 = undefined;
+    for (&local, 0..) |*b, j| b.* = @truncate(j *% 151 +% 3);
+    std.mem.doNotOptimizeAway(&local);
+}
+
+fn shortBurnedEntry(secret: *const [48]u8, out: *[32]u8) void {
+    _ = secret;
+    _ = out;
+    publicDeepBody();
+    burnStack(512);
+}
+
+test "stackprobe: residue under a too-short burn fails on its own (no needle, a burn present)" {
+    // Mutation 2026-10-17: dropping the residue term from the verdict passed
+    // every other test — the unburned entry above fails on "no burn" anyway.
+    try skipUnlessOptimized();
+    std.crypto.hash.sha2.Sha384.hash("testkit stackprobe residue", &t_secret, .{});
+    try std.testing.expectError(error.DeadStackResidue, T.run("short burn (expected to fail)", shortBurnedEntry, .{ &t_secret, &t_out }, &.{&t_secret}, .{}));
+}
+
+test "analyse: residue counts bytes that are neither zero nor paint, below the burn" {
+    // Mutation 2026-10-17: counting leftover PAINT as residue passed every
+    // other test. Synthetic snapshot: paint, then 3 dirty bytes and 2 paint
+    // bytes, then a zero run long enough to be the burn, then dirty above it.
+    const P = Probe(.{ .window = 4096, .min_burn = 64 });
+    @memset(&P.snap, P.PAINT);
+    const base = 1000;
+    P.snap[base] = 0x11;
+    P.snap[base + 1] = 0x22;
+    P.snap[base + 3] = 0x33;
+    // base+2 and base+4 stay PAINT: not residue
+    @memset(P.snap[base + 5 .. base + 5 + 128], 0);
+    P.snap[base + 200] = 0x44; // above the burn: not residue
+    P.resetNeedles();
+    P.sortNeedles();
+    const r = P.analyse();
+    try std.testing.expectEqual(@as(usize, 128), r.burn_len);
+    try std.testing.expectEqual(@as(usize, 3), r.residue_bytes);
+}

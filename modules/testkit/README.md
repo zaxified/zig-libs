@@ -6,7 +6,7 @@
 
 **Scope:** core — Zig 0.16 `std.testing` (extended), against Rust `proptest`/`insta` for the fuzz and golden halves (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-04 · mutation none · src ?
+**Audit:** review 2026-09-04 · mutation 2026-10-17 (25/26, 1 eq) · src ?
 
 **Hardening:** fuzz ? · ct n/a — test helpers (keyword review, 2026-10-07)
 

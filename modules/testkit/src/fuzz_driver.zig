@@ -117,6 +117,10 @@ pub fn hit(comptime label: []const u8) void {
 fn reportReach(name: []const u8) void {
     for (labels[0..label_count], counts[0..label_count]) |l, c|
         std.debug.print("REACH {s} {s}={d}\n", .{ name, l, c });
+    resetReach();
+}
+
+fn resetReach() void {
     label_count = 0;
     counts = @splat(0);
 }
@@ -181,11 +185,26 @@ pub fn run(comptime harness: anytype, opts: Options) !void {
     if (comptime supported) return runHere(harness, opts) else return error.SkipZigTest;
 }
 
+/// Whether a harness named `name` runs under `<PREFIX>_ONLY=only`.
+pub fn selected(name: []const u8, only: ?[]const u8) bool {
+    const o = only orelse return true;
+    return std.mem.indexOf(u8, name, o) != null;
+}
+
+/// `<PREFIX>=<runs>[,<first seed>]` for a harness of `scale`: how many seeds
+/// (at least one) and the first.
+pub const Spec = struct { runs: u64, first: u64 };
+
+pub fn parseSpec(spec: []const u8, scale: u64) error{ InvalidCharacter, Overflow }!Spec {
+    var parts = std.mem.splitScalar(u8, spec, ',');
+    const runs = @max(1, try std.fmt.parseInt(u64, parts.next().?, 10) / @max(1, scale));
+    const first = if (parts.next()) |f| try std.fmt.parseInt(u64, f, 10) else 0;
+    return .{ .runs = runs, .first = first };
+}
+
 fn runHere(comptime harness: anytype, opts: Options) !void {
     var kb: [96]u8 = undefined;
-    if (env(&kb, opts.prefix, "_ONLY")) |only| {
-        if (std.mem.indexOf(u8, opts.name, only) == null) return error.SkipZigTest;
-    }
+    if (!selected(opts.name, env(&kb, opts.prefix, "_ONLY"))) return error.SkipZigTest;
     const limit_ms = if (env(&kb, opts.prefix, "_MS")) |m| try std.fmt.parseInt(u64, m, 10) else opts.default_limit_ms;
 
     var da: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init; // global-alloc-ok: the driver's own leak detector around each harness run, called only from `test` blocks
@@ -207,10 +226,7 @@ fn runHere(comptime harness: anytype, opts: Options) !void {
         return;
     }
 
-    const spec = env(&kb, opts.prefix, "") orelse return error.SkipZigTest;
-    var parts = std.mem.splitScalar(u8, spec, ',');
-    const runs = @max(1, try std.fmt.parseInt(u64, parts.next().?, 10) / @max(1, opts.scale));
-    const first = if (parts.next()) |f| try std.fmt.parseInt(u64, f, 10) else 0;
+    const spec = try parseSpec(env(&kb, opts.prefix, "") orelse return error.SkipZigTest, opts.scale);
     const seed_fd: ?i32 = if (env(&kb, opts.prefix, "_SEEDFILE")) |path|
         openZ(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644)
     else
@@ -220,6 +236,23 @@ fn runHere(comptime harness: anytype, opts: Options) !void {
     };
 
     try armWatchdog(opts.name, limit_ms);
+    return runSeeds(harness, opts.name, spec, gpa, seed_fd);
+}
+
+/// The seed loop: every seed in `spec`, in order, each with a fresh `Rng`;
+/// the first failure is printed with its seed and RETURNED (that return is
+/// every fuzz verdict in the collection — a swallowed error would make all
+/// of them green). Prints `DONE` and the reach counters at the end.
+fn runSeeds(comptime harness: anytype, name: []const u8, spec: Spec, gpa: std.mem.Allocator, seed_fd: ?i32) !void {
+    return runSeedsReporting(harness, name, spec, gpa, seed_fd, true);
+}
+
+/// `runSeeds` with the progress/verdict lines optional — the self-tests
+/// run it silent, since this repo fails a passing step that writes to stderr.
+fn runSeedsReporting(comptime harness: anytype, name: []const u8, spec: Spec, gpa: std.mem.Allocator, seed_fd: ?i32, report: bool) !void {
+    const runs = spec.runs;
+    const first = spec.first;
+    const opts: struct { name: []const u8 } = .{ .name = name };
     const t0 = nowNs();
     var last_report = t0;
     var seed = first;
@@ -236,20 +269,22 @@ fn runHere(comptime harness: anytype, opts: Options) !void {
         current_start.store(nowNs(), .release);
         harness(Rng, &rng, gpa) catch |e| {
             current_start.store(0, .release);
-            std.debug.print("FAIL {s} seed={d}: {t}\n", .{ opts.name, seed, e });
+            if (report) std.debug.print("FAIL {s} seed={d}: {t}\n", .{ opts.name, seed, e });
             return e;
         };
         current_start.store(0, .release);
         const now = nowNs();
-        if (now - last_report > std.time.ns_per_s) {
+        if (report and now - last_report > std.time.ns_per_s) {
             last_report = now;
             const done = seed + 1 - first;
             std.debug.print("runs {s} {d} of {d} ({d}/s)\n", .{ opts.name, done, runs, done * std.time.ns_per_s / (now - t0) });
         }
     }
     const ms = (nowNs() - t0) / std.time.ns_per_ms;
-    std.debug.print("DONE {s} runs={d} in {d} ms ({d}/s)\n", .{ opts.name, runs, ms, if (ms == 0) runs * 1000 else runs * 1000 / ms });
-    reportReach(opts.name);
+    if (report) {
+        std.debug.print("DONE {s} runs={d} in {d} ms ({d}/s)\n", .{ opts.name, runs, ms, if (ms == 0) runs * 1000 else runs * 1000 / ms });
+        reportReach(opts.name);
+    } else resetReach();
 }
 
 // ── tests ────────────────────────────────────────────────────────────────────
@@ -302,6 +337,112 @@ test "run: skipped unless the environment asks (TESTKIT_FUZZ)" {
         error.SkipZigTest => return,
         else => return e,
     };
+}
+
+test "Rng: both ends of a range are drawn (a harness must reach its boundaries)" {
+    // Mutation 2026-10-17: an exclusive upper bound passed every other test.
+    var prng = std.Random.DefaultPrng.init(1);
+    var rng: Rng = .{ .r = prng.random() };
+    var lo = false;
+    var hi = false;
+    for (0..500) |_| {
+        const v = rng.valueRangeAtMost(u8, 3, 6);
+        lo = lo or v == 3;
+        hi = hi or v == 6;
+    }
+    try testing.expect(lo and hi);
+}
+
+test "Rng.slice: about half the draws on a big buffer are short (<= 64)" {
+    // Mutation 2026-10-17: dropping the short-length bias passed every other
+    // test (a uniform draw over 1000 bytes is <= 64 about 6% of the time).
+    var prng = std.Random.DefaultPrng.init(3);
+    var rng: Rng = .{ .r = prng.random() };
+    var buf: [1000]u8 = undefined;
+    var short: usize = 0;
+    for (0..2000) |_| {
+        if (rng.slice(&buf) <= 64) short += 1;
+    }
+    try testing.expect(short > 800 and short < 1300);
+}
+
+test "hit: counts every arrival per label" {
+    // Mutation 2026-10-17: a `hit` that registered labels but never counted
+    // passed every other test — and would print REACH lines that lie.
+    resetReach();
+    defer resetReach();
+    hit("a");
+    hit("b");
+    hit("a");
+    hit("a");
+    try testing.expectEqual(@as(usize, 2), label_count);
+    try testing.expectEqual(@as(u64, 3), counts[0]);
+    try testing.expectEqual(@as(u64, 1), counts[1]);
+}
+
+var seen_seeds: std.ArrayList(u64) = .empty;
+var fail_at: ?u64 = null;
+
+/// Records which seed each run got (the first draw of a fresh
+/// `DefaultPrng.init(seed)` identifies it) and fails at `fail_at`.
+fn recorder(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
+    const first_draw = src.value(u64);
+    for (0..1000) |seed| {
+        var p = std.Random.DefaultPrng.init(seed);
+        if (p.random().int(u64) == first_draw) {
+            seen_seeds.append(testing.allocator, seed) catch unreachable;
+            if (fail_at) |f| if (f == seed) return error.HarnessFailed;
+            if (seed % 3 == 0) hit("third");
+            return;
+        }
+    }
+    return error.UnknownSeed;
+}
+
+test "runSeeds: runs exactly the seeds of the spec, in order" {
+    defer seen_seeds.clearAndFree(testing.allocator);
+    fail_at = null;
+    try runSeedsReporting(recorder, "rec", .{ .runs = 5, .first = 7 }, testing.allocator, null, false);
+    try testing.expectEqualSlices(u64, &.{ 7, 8, 9, 10, 11 }, seen_seeds.items);
+}
+
+test "runSeeds: a failing seed stops the run and its error comes back" {
+    defer seen_seeds.clearAndFree(testing.allocator);
+    fail_at = 4;
+    defer fail_at = null;
+    try testing.expectError(error.HarnessFailed, runSeedsReporting(recorder, "rec", .{ .runs = 10, .first = 2 }, testing.allocator, null, false));
+    try testing.expectEqualSlices(u64, &.{ 2, 3, 4 }, seen_seeds.items);
+}
+
+test "runSeeds: reach counters are collected and reset after the report" {
+    defer seen_seeds.clearAndFree(testing.allocator);
+    fail_at = null;
+    try runSeedsReporting(recorder, "rec", .{ .runs = 6, .first = 0 }, testing.allocator, null, false);
+    // Collected during the run (seeds 0 and 3 are multiples of 3) and
+    // cleared at its end: a fresh run starts from zero.
+    try testing.expectEqual(@as(usize, 0), label_count);
+    hit("x");
+    try testing.expectEqual(@as(usize, 1), label_count);
+    try testing.expectEqual(@as(u64, 1), counts[0]);
+    label_count = 0;
+    counts = @splat(0);
+}
+
+test "parseSpec: runs, first seed, scale (at least one run)" {
+    try testing.expectEqual(Spec{ .runs = 100, .first = 0 }, try parseSpec("100", 1));
+    try testing.expectEqual(Spec{ .runs = 100, .first = 42 }, try parseSpec("100,42", 1));
+    try testing.expectEqual(Spec{ .runs = 25, .first = 0 }, try parseSpec("100", 4));
+    try testing.expectEqual(Spec{ .runs = 1, .first = 0 }, try parseSpec("3", 8));
+    try testing.expectEqual(Spec{ .runs = 7, .first = 0 }, try parseSpec("7", 0));
+    try testing.expectError(error.InvalidCharacter, parseSpec("x", 1));
+    try testing.expectError(error.InvalidCharacter, parseSpec("5,y", 1));
+}
+
+test "selected: _ONLY picks harnesses by substring" {
+    try testing.expect(selected("aaa-gate-verify", null));
+    try testing.expect(selected("aaa-gate-verify", "verify"));
+    try testing.expect(selected("aaa-gate-verify", "aaa-gate-verify"));
+    try testing.expect(!selected("aaa-gate-verify", "throttle"));
 }
 
 test "a generic harness runs under Smith too" {
