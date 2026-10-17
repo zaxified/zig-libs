@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-17** — Example: the `addToken` OOM step finds `Gate.init`'s allocation budget by probing instead of a literal 4 (init gained a fifth allocation, key sources, and the example's run failed in CI). Example only.
+
 - **2026-10-17** — `global-alloc-ok` marker on the ctgrind harness's `page_allocator` (`check-global-alloc`). Tooling only.
 
 - **2026-10-17** — **NO CONSUMER-VISIBLE CHANGE:** `addToken`, `removeToken`, `addBasicUser` and `removeBasicUser` run their body under a dead-stack burn (`src/burn.zig`, 2 KiB), so the SHA-256 state that absorbed the credential does not survive in a dead frame (`check-secret-api`). The model-fuzz scripts draw every choice as a reduced `u64` (`check-fuzz-reach` R1: ranged `Smith` draws collapsed `--fuzz` to op 0). `ct-compare` pin 5/4 (the new compares: the Basic removal scan, constant-time; a cookie-name match, public); ctgrind source digests re-pinned, contexts unchanged.

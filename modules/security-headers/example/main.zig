@@ -70,7 +70,7 @@ fn checkHeaderBudgetExceeded(gpa: std.mem.Allocator) !void {
             "SecurityHeaders.init with an 8192-byte CSP: HeaderBudgetExceeded (expected)\n",
             .{},
         ),
-        error.InvalidExtraHeaderName => return error.UnexpectedError,
+        error.InvalidExtraHeaderName, error.InvalidHstsPreload => return error.UnexpectedError,
     }
 
     // The other config-time rejection, for the same reason: a header name
@@ -87,7 +87,7 @@ fn checkHeaderBudgetExceeded(gpa: std.mem.Allocator) !void {
             "SecurityHeaders.init with a spaced extra header name: InvalidExtraHeaderName (expected)\n",
             .{},
         ),
-        error.HeaderBudgetExceeded => return error.UnexpectedError,
+        error.HeaderBudgetExceeded, error.InvalidHstsPreload => return error.UnexpectedError,
     }
 }
 

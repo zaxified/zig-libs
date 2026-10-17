@@ -360,15 +360,25 @@ pub fn main() !void {
 
     // 11. Allocator failure, error return partway through `addToken` (an
     // allocating call on an otherwise-live gate, mid-rotation): `init` with
-    // no static credentials still performs its 4 fixed allocations
-    // (challenge, api_key_header, deny_body, deny_content_type) -- give it
-    // exactly that budget so it succeeds, leaving `tokens` still empty.
+    // no static credentials still performs its fixed allocations (challenge,
+    // key sources, api_key_header, deny_body, deny_content_type) -- find the
+    // smallest budget it succeeds with (counted, not hard-coded: a fifth
+    // allocation once broke a literal 4), leaving `tokens` still empty.
     // `addToken`'s very first call is then a genuinely fresh allocation
     // (growing from an empty list), landing exactly where the budget runs
     // out. Must surface `error.OutOfMemory` by name, and the gate must
     // still be usable/leak-free afterward.
     {
-        var failing = std.testing.FailingAllocator.init(gpa, .{ .fail_index = 4 });
+        var budget: usize = 0;
+        while (true) : (budget += 1) {
+            var probe = std.testing.FailingAllocator.init(gpa, .{ .fail_index = budget });
+            var g_probe = aaa_gate.Gate.init(probe.allocator(), .{ .allow_when_unconfigured = true }) catch |err| switch (err) {
+                error.OutOfMemory => continue,
+            };
+            g_probe.deinit();
+            break;
+        }
+        var failing = std.testing.FailingAllocator.init(gpa, .{ .fail_index = budget });
         var g3 = try aaa_gate.Gate.init(failing.allocator(), .{ .allow_when_unconfigured = true });
         defer g3.deinit();
         if (g3.addToken("first-rotated-token")) |_| {
