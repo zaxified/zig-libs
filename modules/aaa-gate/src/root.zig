@@ -120,6 +120,7 @@ const builtin = @import("builtin");
 const router = @import("router");
 const http = @import("http");
 const b64ct = @import("b64ct");
+const burn = @import("burn.zig");
 
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
@@ -774,6 +775,10 @@ pub const Gate = struct {
     /// Add a Basic user (rotation, mirrors `addToken`). Idempotent; hashed,
     /// not retained. `user` must not contain `:`; `password` non-empty.
     pub fn addBasicUser(g: *Gate, user: []const u8, password: []const u8) error{OutOfMemory}!void {
+        return burn.run(burn.hash_burn, error{OutOfMemory}!void, addBasicUserBody, .{ g, user, password });
+    }
+
+    fn addBasicUserBody(g: *Gate, user: []const u8, password: []const u8) error{OutOfMemory}!void {
         std.debug.assert(std.mem.indexOfScalar(u8, user, ':') == null and password.len != 0);
         const fp = basicFingerprint(user, password);
         lockSpin(&g.lock);
@@ -784,6 +789,10 @@ pub const Gate = struct {
 
     /// Remove a Basic user:password pair (no-op when absent).
     pub fn removeBasicUser(g: *Gate, user: []const u8, password: []const u8) void {
+        burn.run(burn.hash_burn, void, removeBasicUserBody, .{ g, user, password });
+    }
+
+    fn removeBasicUserBody(g: *Gate, user: []const u8, password: []const u8) void {
         const fp = basicFingerprint(user, password);
         lockSpin(&g.lock);
         defer g.lock.unlock();
@@ -839,6 +848,10 @@ pub const Gate = struct {
     /// a token that is already valid is a no-op. `token` is hashed, not
     /// retained; must be non-empty.
     pub fn addToken(g: *Gate, token: []const u8) error{OutOfMemory}!void {
+        return burn.run(burn.hash_burn, error{OutOfMemory}!void, addTokenBody, .{ g, token });
+    }
+
+    fn addTokenBody(g: *Gate, token: []const u8) error{OutOfMemory}!void {
         std.debug.assert(token.len != 0);
         const fp = fingerprint(token);
         lockSpin(&g.lock);
@@ -851,6 +864,10 @@ pub const Gate = struct {
     /// the last token reopens the plane — see the open-plane note (unless
     /// a `token_verify` callback is configured, which keeps it closed).
     pub fn removeToken(g: *Gate, token: []const u8) void {
+        burn.run(burn.hash_burn, void, removeTokenBody, .{ g, token });
+    }
+
+    fn removeTokenBody(g: *Gate, token: []const u8) void {
         const fp = fingerprint(token);
         lockSpin(&g.lock);
         defer g.lock.unlock();

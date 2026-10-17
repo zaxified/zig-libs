@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-17** — **NO CONSUMER-VISIBLE CHANGE:** `addToken`, `removeToken`, `addBasicUser` and `removeBasicUser` run their body under a dead-stack burn (`src/burn.zig`, 2 KiB), so the SHA-256 state that absorbed the credential does not survive in a dead frame (`check-secret-api`). The model-fuzz scripts draw every choice as a reduced `u64` (`check-fuzz-reach` R1: ranged `Smith` draws collapsed `--fuzz` to op 0). `ct-compare` pin 5/4 (the new compares: the Basic removal scan, constant-time; a cookie-name match, public); ctgrind source digests re-pinned, contexts unchanged.
+
 - **2026-10-17** — **NO CONSUMER-VISIBLE CHANGE:** constant-time evidence — `src/ctgrind_harness.zig` (`scripts/checks/ctgrind.sh aaa-gate`): the stored token / API-key / Basic digests tainted in place, `verify*` with a good and a bad credential; in-file 2 per target = the two verdicts, controls and traps 0; pinned in `ctgrind-expected.tsv`.
 
 - **2026-10-17** — Benchmark: verdict now like for like (owner decision) — echo with a validator giving the same guarantee (SHA-256 digests, compare every one) → 0.11–0.87×; echo's raw-key validator printed as `_raw` information (header success rows ~2x: one software SHA-256 per request on a CPU without SHA-NI). Basic rows added. Tooling only, no code change.

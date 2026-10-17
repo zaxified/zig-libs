@@ -68,8 +68,11 @@ fn Marker(comptime Label: type) type {
 }
 
 /// A draw in `lo..hi` as `usize` (Smith has no `usize` ranges).
+/// Every draw reduces a full `u64` (`check-fuzz-reach` option 2): a `Smith`
+/// ranged draw returns the range minimum unless the input word already lies
+/// in range, so under `zig build --fuzz` the script would collapse to op 0.
 fn pick(comptime S: type, src: *S, lo: usize, hi: usize) usize {
-    return src.valueRangeAtMost(u32, @intCast(lo), @intCast(hi));
+    return lo + @as(usize, @intCast(src.value(u64) % (hi - lo + 1)));
 }
 
 // ── harness 1: the decision table under rotation ───────────────────────────
@@ -117,18 +120,18 @@ fn expectedVerdict(set: *const Model, callback: ?*const Callback, allow_open: bo
 }
 
 fn pickCredential(comptime S: type, src: *S, buf: *[24]u8) []const u8 {
-    if (src.valueRangeAtMost(u8, 0, 4) != 0) return alphabet[pick(S, src, 0, alphabet.len - 1)];
+    if (pick(S, src, 0, 4) != 0) return alphabet[pick(S, src, 0, alphabet.len - 1)];
     const n = src.slice(buf);
     if (n == 0) return alphabet[0]; // a credential is never empty
     return buf[0..n];
 }
 
 fn fuzzVerify(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
-    const allow_open = src.value(bool);
+    const allow_open = (pick(S, src, 0, 1) == 1);
     var tok_cb: Callback = .{ .accept = &.{ "beta", "zeta" } };
     var key_cb: Callback = .{ .accept = &.{"gamma"} };
-    const use_tok_cb = src.valueRangeAtMost(u8, 0, 3) == 0;
-    const use_key_cb = src.valueRangeAtMost(u8, 0, 3) == 0;
+    const use_tok_cb = pick(S, src, 0, 3) == 0;
+    const use_key_cb = pick(S, src, 0, 3) == 0;
 
     var tokens: Model = .{};
     defer tokens.items.deinit(gpa);
@@ -168,7 +171,7 @@ fn fuzzVerify(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     for (0..steps) |_| {
         var buf: [24]u8 = undefined;
         const cred = pickCredential(S, src, &buf);
-        const op = src.valueRangeAtMost(u8, 0, 8);
+        const op = pick(S, src, 0, 8);
         switch (op) {
             0, 1 => {
                 const stored = try gpa.dupe(u8, cred);
@@ -191,7 +194,7 @@ fn fuzzVerify(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
                 keys.remove(cred);
             },
             4, 5 => {
-                const presented: ?[]const u8 = if (src.valueRangeAtMost(u8, 0, 5) == 0) null else cred;
+                const presented: ?[]const u8 = if (pick(S, src, 0, 5) == 0) null else cred;
                 const bearer = op == 4;
                 const got = if (bearer) g.verify(presented) else g.verifyApiKey(presented);
                 const want = if (bearer)
@@ -226,7 +229,7 @@ fn fuzzVerify(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
                     g.removeBasicUser(user, pw);
                     basics.remove(joined);
                 } else {
-                    const presented: ?http.BasicCredentials = if (src.valueRangeAtMost(u8, 0, 5) == 0) null else .{ .user = user, .password = pw };
+                    const presented: ?http.BasicCredentials = if (pick(S, src, 0, 5) == 0) null else .{ .user = user, .password = pw };
                     const got = g.verifyBasic(presented);
                     const want: Verdict = if (basics.items.items.len == 0)
                         (if (allow_open) .ok_open else .denied)
@@ -391,14 +394,14 @@ fn fuzzThrottle(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void
     var model: ThrottleModel = .{};
     const steps = pick(S, src, 1, 60);
     for (0..steps) |_| {
-        clock.ns += switch (src.valueRangeAtMost(u8, 0, 3)) {
+        clock.ns += switch (pick(S, src, 0, 3)) {
             0 => 0,
-            1 => src.valueRangeAtMost(u64, 0, 12) * std.time.ns_per_ms,
-            2 => src.valueRangeAtMost(u64, 0, 150) * std.time.ns_per_ms,
+            1 => @as(u64, pick(S, src, 0, 12)) * std.time.ns_per_ms,
+            2 => @as(u64, pick(S, src, 0, 150)) * std.time.ns_per_ms,
             else => std.time.ns_per_s,
         };
-        const key: u8 = 'a' + src.valueRangeAtMost(u8, 0, 5);
-        const authed = src.valueRangeAtMost(u8, 0, 5) == 0;
+        const key: u8 = 'a' + @as(u8, @intCast(pick(S, src, 0, 5)));
+        const authed = pick(S, src, 0, 5) == 0;
         var req_buf: [160]u8 = undefined;
         const req = try std.fmt.bufPrint(&req_buf, "GET /x HTTP/1.1\r\nHost: t\r\nX-K: {c}\r\n{s}Connection: close\r\n\r\n", .{
             key, if (authed) "Authorization: Bearer good\r\n" else "",
