@@ -145,8 +145,8 @@ transport-agnostic client and a broker, all fully offline-testable.
     queue in order. A clean-session-1 CONNECT discards whatever the client left
     (3.1.2-6). QoS 0 is not queued. Every QoS 1 delivery to a session goes
     through its queue even while online, so a subscriber slower than its
-    64-message window waits instead of losing messages (`qos1Drops` counts
-    only clean sessions). Bounds: `Config.max_sessions` (a new session past it
+    64-message window waits instead of losing messages (a clean-session
+    subscriber gets the same bounded queue per connection). Bounds: `Config.max_sessions` (a new session past it
     gets `server_unavailable`, a resume never does), `max_queued_messages` /
     `max_queued_bytes` per session (overflow drops the newest, counted by
     `queueDrops()`), and `session_expiry_ms`, applied when the caller runs

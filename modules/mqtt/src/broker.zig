@@ -503,8 +503,8 @@ const Stats = struct {
     messages_sent: std.atomic.Value(usize) = .init(0),
     publish_received: std.atomic.Value(usize) = .init(0),
     publish_sent: std.atomic.Value(usize) = .init(0),
-    /// PUBLISHes dropped for a subscriber for want of room: the in-flight
-    /// pool (`qos1_drops`) or a session queue (`queue_drops`).
+    /// PUBLISHes dropped for a subscriber for want of room — the same count as
+    /// `Broker.queueDrops` (every drop goes through `countQueueDrop`).
     publish_dropped: std.atomic.Value(usize) = .init(0),
 };
 
@@ -1497,13 +1497,6 @@ pub const Broker = struct {
     retained_refusals: std.atomic.Value(usize) = .init(0),
     /// Bytes (topic + payload) held by `retained`. Guarded by `mutex`.
     retained_bytes: usize = 0,
-    /// Count of QoS 1/2 messages dropped because a clean-session subscriber's
-    /// in-flight pool was full — i.e. it has stopped answering PUBACKs (or
-    /// PUBRECs and PUBCOMPs).
-    /// Formerly the clean-session deliveries dropped for a full window; those
-    /// now wait in `Connection.eq` (and overflow into `queue_drops`), so this
-    /// stays 0. Kept for API compatibility.
-    qos1_drops: std.atomic.Value(usize) = .init(0),
     /// Count of Wills that could not be delivered. The teardown path has no
     /// caller to return an error to, so the failure is counted instead of
     /// disappearing: a non-zero value means subscribers were not told about a
@@ -1512,8 +1505,10 @@ pub const Broker = struct {
     /// Count of PUBLISHes `Config.onPublishFn` refused — each one closed its
     /// connection unacknowledged.
     tap_refusals: std.atomic.Value(usize) = .init(0),
-    /// Count of QoS 1 messages a persistent session could not queue
-    /// (`max_queued_messages` / `max_queued_bytes`, or out of memory).
+    /// Count of QoS 1/2 deliveries dropped because a queue was full — a
+    /// persistent session's, or a clean-session connection's window queue
+    /// (`Connection.eq`) — or could not be made (`max_queued_messages` /
+    /// `max_queued_bytes`, or out of memory). Only `countQueueDrop` moves it.
     queue_drops: std.atomic.Value(usize) = .init(0),
 
     /// Persistent sessions, online and offline. Guarded by `mutex`.
@@ -1619,13 +1614,6 @@ pub const Broker = struct {
         return b.retained_bytes;
     }
 
-    /// How many QoS 1/2 deliveries have been dropped for a clean-session
-    /// subscriber whose in-flight pool was full. Non-zero means a subscriber
-    /// has stopped acknowledging and is silently losing messages.
-    pub fn qos1Drops(b: *const Broker) u64 {
-        return b.qos1_drops.load(.monotonic);
-    }
-
     /// How many Wills failed to be delivered on an ungraceful disconnect.
     /// Non-zero means a client vanished and its subscribers were not told.
     pub fn willFailures(b: *const Broker) u64 {
@@ -1638,8 +1626,12 @@ pub const Broker = struct {
         return b.tap_refusals.load(.monotonic);
     }
 
-    /// How many QoS 1 messages a persistent session could not queue. Non-zero
-    /// means a client came back to a session with a gap in it.
+    /// How many QoS 1/2 deliveries were dropped for want of queue room — a
+    /// persistent session's queue (the client comes back to a session with a
+    /// gap in it) or a clean-session subscriber's window queue (it stopped
+    /// acknowledging, or acknowledges slower than `max_queued_messages` /
+    /// `max_queued_bytes` absorb). Non-zero means a subscriber lost messages.
+    /// Equal to `$SYS/broker/publish/messages/dropped`.
     pub fn queueDrops(b: *const Broker) u64 {
         return b.queue_drops.load(.monotonic);
     }
@@ -2552,8 +2544,8 @@ pub const Broker = struct {
     /// `store/messages/count`. `disconnected` = persistent sessions without a
     /// connection, `total` = connected + disconnected, `maximum` = the most
     /// clients seen connected at a CONNECT or at a call of this method,
-    /// `dropped` = QoS 1/2 messages lost to an in-flight pool or a session
-    /// queue (`qos1Drops` + `queueDrops`), `store/messages/count` = retained
+    /// `dropped` = QoS 1/2 deliveries lost for want of queue room
+    /// (`queueDrops`), `store/messages/count` = retained
     /// messages plus those queued or in flight for sessions. The two retained
     /// counts leave out the `$SYS` topics themselves (mosquitto(8) is silent;
     /// they would otherwise count themselves).
@@ -3565,6 +3557,14 @@ pub const Broker = struct {
     /// Caller holds `x.lock`.
     fn countDrop(b: *Broker, x: *Session) void {
         x.drops += 1;
+        b.countQueueDrop();
+    }
+
+    /// The one place a dropped delivery is counted: `queueDrops` and `$SYS`
+    /// `publish/messages/dropped` move together. (Until 2026-10-17 the
+    /// clean-session path that could not even make its queue bumped only
+    /// `queue_drops`, so `$SYS` under-reported it.)
+    fn countQueueDrop(b: *Broker) void {
         _ = b.queue_drops.fetchAdd(1, .monotonic);
         _ = b.stats.publish_dropped.fetchAdd(1, .monotonic);
     }
@@ -4552,7 +4552,7 @@ pub const Broker = struct {
     fn enqueueConn(b: *Broker, conn: *Connection, msg: Outgoing, qos: QoS, retain: bool, ids: []const u32) void {
         const q = conn.eq orelse blk: {
             const x = b.allocator.create(Session) catch {
-                _ = b.queue_drops.fetchAdd(1, .monotonic);
+                b.countQueueDrop();
                 return;
             };
             x.* = .{ .registered = false };
@@ -6004,7 +6004,6 @@ test "past the in-flight window messages wait, and a PUBACK sends the next" {
     try testing.expectEqual(@as(usize, max_in_flight), sent);
     try testing.expectEqual(@as(?usize, 2), b.sessionQueued("web"));
     // Nothing is dropped, unlike a clean session's full pool.
-    try testing.expectEqual(@as(u64, 0), b.qos1Drops());
     try feedPuback(&b, s1.conn, first_id);
     try testing.expect((try t1.next()).? == .publish);
     try testing.expect((try t1.next()) == null);
@@ -8831,7 +8830,6 @@ test "v5 the client's limits: Receive Maximum holds back, Maximum Packet Size dr
     try b.publish("t", "2", .at_least_once, false); // a second unacknowledged: waits for the first's PUBACK
     const held = (try next5(&tc)).?.publish;
     try testing.expectEqual(@as(?packet.Packet, null), try next5(&tc));
-    try testing.expectEqual(@as(u64, 0), b.qos1Drops());
     _ = try send5(&b, c.conn, .{ .puback = .{ .packet_id = held.packet_id } }, 1);
     try testing.expectEqualStrings("2", (try next5(&tc)).?.publish.payload);
     try b.publish("t", "x" ** 50, .at_most_once, false); // larger than the client takes
@@ -9462,7 +9460,6 @@ test "clean session: a QoS 1 subscriber slower than the publisher still gets eve
     try testing.expectEqual(@as(usize, n), got);
     try testing.expectEqual(@as(?packet.Packet, null), try ts.next());
     try testing.expectEqual(@as(usize, 0), s.pending_len);
-    try testing.expectEqual(@as(u64, 0), b.qos1Drops());
     try testing.expectEqual(@as(u64, 0), b.queueDrops());
 }
 
@@ -9507,6 +9504,60 @@ test "clean session: a QoS 2 subscriber slower than the publisher still gets eve
     try testing.expectEqual(@as(u64, 0), b.queueDrops());
 }
 
+test "clean session: a delivery lost because its queue cannot be made counts in queueDrops and in $SYS dropped alike" {
+    // The OOM path of `enqueueConn` once bumped `queue_drops` only, so
+    // `$SYS/broker/publish/messages/dropped` missed it (found 2026-10-17).
+    // Fails exactly the allocation `enqueueConn` makes for the queue (a
+    // `Session`), once armed: a FailingAllocator would fail the fan-out's
+    // subscriber list first, and `publish` would return OutOfMemory instead.
+    const FailSession = struct {
+        child: std.mem.Allocator,
+        armed: bool = false,
+        failed: usize = 0,
+        fn alloc(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (self.armed and len == @sizeOf(Session) and a.toByteUnits() == @alignOf(Session)) {
+                self.failed += 1;
+                return null;
+            }
+            return self.child.rawAlloc(len, a, ra);
+        }
+        fn resize(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.child.rawResize(m, a, n, ra);
+        }
+        fn remap(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.child.rawRemap(m, a, n, ra);
+        }
+        fn free(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, ra: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.child.rawFree(m, a, ra);
+        }
+        fn allocator(self: *@This()) std.mem.Allocator {
+            return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+        }
+    };
+    var fa: FailSession = .{ .child = testing.allocator };
+    var b = Broker.init(fa.allocator(), .{});
+    defer b.deinit();
+    var ts = TestTransport{};
+    const s = try connectClient(&b, &ts, "S", 60, 0);
+    try feedSubscribe(&b, s, 1, &.{.{ .filter = "t", .qos = .at_least_once }});
+    _ = (try ts.next()).?;
+    var nbuf: [8]u8 = undefined;
+    for (0..max_in_flight) |i| try b.publish("t", fmtNum(&nbuf, i), .at_least_once, false);
+    try testing.expectEqual(@as(usize, max_in_flight), s.pending_len); // the window, full
+    try testing.expect(s.eq == null); // no queue yet: the next delivery must make one
+    fa.armed = true;
+    try b.publish("t", "lost", .at_least_once, false);
+    fa.armed = false;
+    try testing.expectEqual(@as(usize, 1), fa.failed);
+    try testing.expect(s.eq == null);
+    try testing.expectEqual(@as(u64, 1), b.queueDrops());
+    try testing.expectEqual(b.queueDrops(), @as(u64, b.stats.publish_dropped.load(.monotonic)));
+}
+
 test "clean session: the queue is capped by max_queued_messages, counted in queueDrops, and goes with the connection" {
     var b = Broker.init(testing.allocator, .{ .max_queued_messages = 10 });
     defer b.deinit();
@@ -9517,6 +9568,7 @@ test "clean session: the queue is capped by max_queued_messages, counted in queu
     var nbuf: [8]u8 = undefined;
     for (0..max_in_flight + 15) |i| try b.publish("t", fmtNum(&nbuf, i), .at_least_once, false);
     try testing.expectEqual(@as(u64, 5), b.queueDrops()); // 64 in flight + 10 queued + 5 over
+    try testing.expectEqual(b.queueDrops(), @as(u64, b.stats.publish_dropped.load(.monotonic)));
     var first: u16 = 0;
     var sent: usize = 0;
     while (try ts.next()) |p| : (sent += 1) {
