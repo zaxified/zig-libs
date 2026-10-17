@@ -36,14 +36,16 @@ pub const Compression = struct {
     content_types: []const []const u8 = &default_content_types,
 };
 
-/// Default compressible types: all of `text/*`, JSON/JavaScript/XML, and
-/// any structured-syntax `+json` / `+xml` subtype (covers
-/// `image/svg+xml`, `application/problem+json`, Atom/RSS, …).
+/// Default compressible types: all of `text/*`, JSON/JavaScript/XML,
+/// OpenMetrics text (a Prometheus scrape; promhttp gzips it), and any
+/// structured-syntax `+json` / `+xml` subtype (covers `image/svg+xml`,
+/// `application/problem+json`, Atom/RSS, …).
 pub const default_content_types = [_][]const u8{
     "text/",
     "application/json",
     "application/javascript",
     "application/xml",
+    "application/openmetrics-text",
     "+json",
     "+xml",
 };
@@ -551,6 +553,7 @@ test "contentTypeCompressible: default allowlist" {
     try testing.expect(contentTypeCompressible("application/xml", list));
     try testing.expect(contentTypeCompressible("image/svg+xml", list)); // +xml suffix
     try testing.expect(contentTypeCompressible("application/problem+json", list));
+    try testing.expect(contentTypeCompressible("application/openmetrics-text; version=1.0.0; charset=utf-8", list));
 
     try testing.expect(!contentTypeCompressible("image/png", list));
     try testing.expect(!contentTypeCompressible("application/octet-stream", list));

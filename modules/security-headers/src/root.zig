@@ -438,23 +438,38 @@ pub const SecurityHeaders = struct {
     /// call it before anything else touches the response so short-circuit
     /// replies carry the headers too.
     pub fn applyStatic(comptime options: Options, res: *http.Server.ResponseWriter) error{ HeadersSent, TooManyHeaders }!void {
-        if (comptime options.hsts) |h| try res.setHeaderStatic("Strict-Transport-Security", comptime hstsStaticValue(h));
-        if (comptime options.content_security_policy) |v| try res.setHeaderStatic("Content-Security-Policy", v);
-        if (comptime options.content_security_policy_report_only) |v| try res.setHeaderStatic("Content-Security-Policy-Report-Only", v);
-        if (comptime options.x_content_type_options) try res.setHeaderStatic("X-Content-Type-Options", "nosniff");
-        if (comptime options.x_frame_options) |v| try res.setHeaderStatic("X-Frame-Options", v);
-        if (comptime options.referrer_policy) |v| try res.setHeaderStatic("Referrer-Policy", v);
-        if (comptime options.permissions_policy) |v| try res.setHeaderStatic("Permissions-Policy", v);
-        if (comptime options.cross_origin_opener_policy) |v| try res.setHeaderStatic("Cross-Origin-Opener-Policy", v);
-        if (comptime options.cross_origin_resource_policy) |v| try res.setHeaderStatic("Cross-Origin-Resource-Policy", v);
-        if (comptime options.cross_origin_embedder_policy) |v| try res.setHeaderStatic("Cross-Origin-Embedder-Policy", v);
-        if (comptime options.origin_agent_cluster) try res.setHeaderStatic("Origin-Agent-Cluster", "?1");
-        if (comptime options.x_dns_prefetch_control) |v| try res.setHeaderStatic("X-DNS-Prefetch-Control", v);
-        if (comptime options.x_download_options) try res.setHeaderStatic("X-Download-Options", "noopen");
-        if (comptime options.x_permitted_cross_domain_policies) |v| try res.setHeaderStatic("X-Permitted-Cross-Domain-Policies", v);
-        if (comptime options.x_xss_protection) try res.setHeaderStatic("X-XSS-Protection", "0");
-        if (comptime options.server) |v| try res.setHeaderStatic("Server", v);
-        inline for (comptime options.extra) |h| try res.setHeaderStatic(h.name, h.value);
+        inline for (comptime staticHeaders(options)) |h| try res.setHeaderStatic(h.name, h.value);
+    }
+
+    /// The header set `applyStatic` sets for `options`, in its order, as
+    /// compile-time data. Hand it to `http.Server.Options.error_headers` so
+    /// the answers the server writes itself (its 4xx/5xx, the 500 replacing
+    /// a failed handler) carry the same headers as every routed response —
+    /// middleware never sees those (`Server` is skipped there: the server
+    /// manages it).
+    pub fn staticHeaders(comptime options: Options) []const http.Header {
+        comptime {
+            var list: []const http.Header = &.{};
+            if (options.hsts) |h| list = list ++ [_]http.Header{.{ .name = "Strict-Transport-Security", .value = hstsStaticValue(h) }};
+            if (options.content_security_policy) |v| list = list ++ [_]http.Header{.{ .name = "Content-Security-Policy", .value = v }};
+            if (options.content_security_policy_report_only) |v| list = list ++ [_]http.Header{.{ .name = "Content-Security-Policy-Report-Only", .value = v }};
+            if (options.x_content_type_options) list = list ++ [_]http.Header{.{ .name = "X-Content-Type-Options", .value = "nosniff" }};
+            if (options.x_frame_options) |v| list = list ++ [_]http.Header{.{ .name = "X-Frame-Options", .value = v }};
+            if (options.referrer_policy) |v| list = list ++ [_]http.Header{.{ .name = "Referrer-Policy", .value = v }};
+            if (options.permissions_policy) |v| list = list ++ [_]http.Header{.{ .name = "Permissions-Policy", .value = v }};
+            if (options.cross_origin_opener_policy) |v| list = list ++ [_]http.Header{.{ .name = "Cross-Origin-Opener-Policy", .value = v }};
+            if (options.cross_origin_resource_policy) |v| list = list ++ [_]http.Header{.{ .name = "Cross-Origin-Resource-Policy", .value = v }};
+            if (options.cross_origin_embedder_policy) |v| list = list ++ [_]http.Header{.{ .name = "Cross-Origin-Embedder-Policy", .value = v }};
+            if (options.origin_agent_cluster) list = list ++ [_]http.Header{.{ .name = "Origin-Agent-Cluster", .value = "?1" }};
+            if (options.x_dns_prefetch_control) |v| list = list ++ [_]http.Header{.{ .name = "X-DNS-Prefetch-Control", .value = v }};
+            if (options.x_download_options) list = list ++ [_]http.Header{.{ .name = "X-Download-Options", .value = "noopen" }};
+            if (options.x_permitted_cross_domain_policies) |v| list = list ++ [_]http.Header{.{ .name = "X-Permitted-Cross-Domain-Policies", .value = v }};
+            if (options.x_xss_protection) list = list ++ [_]http.Header{.{ .name = "X-XSS-Protection", .value = "0" }};
+            if (options.server) |v| list = list ++ [_]http.Header{.{ .name = "Server", .value = v }};
+            for (options.extra) |h| list = list ++ [_]http.Header{.{ .name = h.name, .value = h.value }};
+            const final = list[0..list.len].*;
+            return &final;
+        }
     }
 
     /// The exact bytes `init` would format into `hsts_buf` for `h`, built
@@ -990,6 +1005,38 @@ test "applyStatic: handler's later setHeader still wins" {
     const got = out.buffered();
     try expectHeaderLine(got, "X-Frame-Options: SAMEORIGIN");
     try testing.expect(std.mem.indexOf(u8, got, "DENY") == null);
+}
+
+test "staticHeaders: the applyStatic set reaches http.Server's own error answers" {
+    const hs = comptime SecurityHeaders.staticHeaders(.{});
+    try testing.expectEqualStrings("Strict-Transport-Security", hs[0].name);
+    try testing.expectEqualStrings("max-age=31536000; includeSubDomains", hs[0].value);
+    // A request http refuses itself (400: no Host) never meets middleware.
+    var in: std.Io.Reader = .fixed("GET / HTTP/1.1\r\n\r\n");
+    var out_buf: [2048]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var head_buf: [512]u8 = undefined;
+    var req_body: [64]u8 = undefined;
+    var res_body: [64]u8 = undefined;
+    var chunk: [64]u8 = undefined;
+    var trailers: [64]u8 = undefined;
+    const H = struct {
+        fn handle(_: *http.Server.Request, _: *http.Server.ResponseWriter) anyerror!void {}
+    };
+    http.Server.serveStream(.{ .handler = H.handle, .error_headers = hs }, &in, &out, .{
+        .head = &head_buf,
+        .request_body = &req_body,
+        .response_body = &res_body,
+        .chunk = &chunk,
+        .trailers = &trailers,
+    });
+    const got = out.buffered();
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 400 "));
+    for (hs) |h| {
+        var line_buf: [512]u8 = undefined;
+        const line = try std.fmt.bufPrint(&line_buf, "\r\n{s}: {s}\r\n", .{ h.name, h.value });
+        try testing.expect(std.mem.indexOf(u8, got, line) != null);
+    }
 }
 
 test "legacy defaults: helmet 8.3.0 values, each knob alone disables its header, values overridable" {

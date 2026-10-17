@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-17** — ADDED: `Options.error_headers` (and `StreamOptions` / `h2_server.Options`): headers on every response the server writes itself — its 4xx/5xx answers and the 500 that replaces a failed handler's response, h1 and h2 — so security headers reach them too (`security-headers` `SecurityHeaders.staticHeaders`). Managed/invalid entries are skipped; `max_error_headers` = 16; `errorHeaderUsable`.
+- **2026-10-17** — **BEHAVIOURAL, not breaking:** `application/openmetrics-text` is on the default gzip allowlist (`Compression.content_types`), so a `metrics` OpenMetrics scrape is compressed like a text-format one (promhttp gzips both).
 - **2026-10-17** — New public `writeHtmlEscaped` (re-export of the helper `http.Redirect` already used), so `staticfiles` stops carrying its own copy.
 - **2026-10-17** — `If-Modified-Since`/`If-Unmodified-Since` date parsing (`conditional.zig`) uses `datefmt.daysInMonth`/`ymdToEpochDay` instead of its own copies of the civil-calendar helpers. No behaviour change (same Hinnant algorithm; the HTTP-date grammar stays here).
 - **2026-10-12** — **Go's `ServeContent`, `DetectContentType`, `CrossOriginProtection` and

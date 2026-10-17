@@ -603,6 +603,16 @@ pub const Options = struct {
     /// null-means-omit shape — see `emit_date` for why the socket path
     /// needed this and did not have it).
     server_name: ?[]const u8 = "zig-libs-http/0.1",
+    /// Extra headers on every response the server writes ITSELF — the
+    /// 4xx/5xx answers no handler saw (431/414/413/400/503, a 500 for broken
+    /// framing) and the 500 that replaces a failed handler's response (its
+    /// own headers, a middleware's security headers included, are discarded
+    /// with it). E.g. `security-headers`' `SecurityHeaders.staticHeaders`.
+    /// An entry whose name is not a token or is managed by the server
+    /// (`Content-Length`, `Content-Type`, `Connection`, `Transfer-Encoding`,
+    /// `Date`, `Server`), or whose value cannot go on the wire, is skipped;
+    /// at most `max_error_headers` are used.
+    error_headers: []const http.Header = &.{},
     /// Auto `Date` header (IMF-fixdate) on every response. true (default)
     /// installs the server's own wall clock, exactly as before this field
     /// existed; false omits the header. This mirrors
@@ -1336,6 +1346,7 @@ fn connMain(s: *Server, stream: net.Stream) void {
                 .handler = o.handler,
                 .context = o.context,
                 .server_name = o.server_name,
+                .error_headers = o.error_headers,
                 .now = if (o.emit_date) .{ .ctx = @ptrCast(&s.io), .epochSeconds = ioEpochSeconds } else null,
                 .peer = stream.socket.address,
                 .max_header_bytes = o.max_header_bytes,
@@ -1369,6 +1380,7 @@ fn connMain(s: *Server, stream: net.Stream) void {
         .handler = o.handler,
         .context = o.context,
         .server_name = o.server_name,
+        .error_headers = o.error_headers,
         .now = if (o.emit_date) .{ .ctx = @ptrCast(&s.io), .epochSeconds = ioEpochSeconds } else null,
         .peer = stream.socket.address,
         .max_request_line_bytes = o.max_request_line_bytes,
@@ -1884,6 +1896,8 @@ pub const StreamOptions = struct {
     context: ?*anyopaque = null,
     /// Auto `Server` response header; null = omit.
     server_name: ?[]const u8 = "zig-libs-http/0.1",
+    /// See `Options.error_headers`.
+    error_headers: []const http.Header = &.{},
     /// Wall-clock source for the auto `Date` header; null = omit Date.
     now: ?Now = null,
     /// The socket peer address, surfaced on every `Request` of this
@@ -2401,6 +2415,9 @@ fn serveOne(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers,
         rw.reset() catch return .close;
         rw.setStatus(500);
         rw.setHeader("Content-Type", "text/plain") catch return .close;
+        for (usableErrorHeaders(opts.error_headers)) |h| {
+            if (errorHeaderUsable(h)) rw.setHeader(h.name, h.value) catch {};
+        }
         rw.writeAll("Internal Server Error\n") catch return .close;
     };
     // A detached response stays OPEN: no `end`, no chunked terminator, no
@@ -2453,11 +2470,29 @@ fn respondError(opts: StreamOptions, out: *Writer, date: ?[]const u8, status: u1
     return .close;
 }
 
+/// Upper bound on `Options.error_headers` used (the rest are ignored).
+pub const max_error_headers = 16;
+
+pub fn usableErrorHeaders(hs: []const http.Header) []const http.Header {
+    return hs[0..@min(hs.len, max_error_headers)];
+}
+
+/// Whether one `error_headers` entry may go on the wire (see the option).
+pub fn errorHeaderUsable(h: http.Header) bool {
+    if (!h1.isToken(h.name) or !h1.isValidFieldValue(h.value)) return false;
+    const managed = [_][]const u8{ "content-length", "content-type", "connection", "transfer-encoding", "date", "server" };
+    for (managed) |m| if (std.ascii.eqlIgnoreCase(m, h.name)) return false;
+    return true;
+}
+
 fn writeErrorResponse(opts: StreamOptions, out: *Writer, date: ?[]const u8, status: u16) Writer.Error!void {
     const reason = reasonPhrase(status);
     try out.print("HTTP/1.1 {d} {s}\r\n", .{ status, reason });
     if (date) |d| try out.print("Date: {s}\r\n", .{d});
     if (opts.server_name) |sn| try out.print("Server: {s}\r\n", .{sn});
+    for (usableErrorHeaders(opts.error_headers)) |h| {
+        if (errorHeaderUsable(h)) try out.print("{s}: {s}\r\n", .{ h.name, h.value });
+    }
     try out.print("Content-Type: text/plain\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{reason.len + 1});
     try out.print("{s}\n", .{reason});
 }
@@ -5000,6 +5035,7 @@ const test_date = "Sun, 06 Nov 1994 08:49:37 GMT";
 /// `StreamOptions` defaults, so `runStream` behaves as before).
 const StreamTweaks = struct {
     peer: ?net.IpAddress = null,
+    error_headers: []const http.Header = &.{},
     max_request_line_bytes: ?usize = null,
     max_body_bytes: ?u64 = null,
     on_conn_state: ?ConnStateFn = null,
@@ -5042,6 +5078,7 @@ fn runStreamWith(tweaks: StreamTweaks, ctx: ?*anyopaque, wire: []const u8, out_b
         .handler = testHandler,
         .context = ctx,
         .server_name = tweaks.server_name,
+        .error_headers = tweaks.error_headers,
         .now = tweaks.now,
         .peer = tweaks.peer,
         .max_request_line_bytes = tweaks.max_request_line_bytes,
@@ -5382,6 +5419,36 @@ test "serveStream: handler error → clean 500, keep-alive survives" {
     // The connection stayed usable for the next request.
     try testing.expectEqual(@as(u32, 2), hits.load(.monotonic));
     try testing.expect(std.mem.endsWith(u8, got, "\r\n\r\nhello"));
+}
+
+test "serveStream: error_headers go on the server's own 4xx/5xx answers, not on handler responses" {
+    const extra = [_]http.Header{
+        .{ .name = "X-Content-Type-Options", .value = "nosniff" },
+        .{ .name = "Content-Security-Policy", .value = "default-src 'none'" },
+        .{ .name = "Content-Type", .value = "text/html" }, // managed: skipped
+        .{ .name = "Bad Name", .value = "x" }, // not a token: skipped
+        .{ .name = "X-Bad-Value", .value = "a\r\nInjected: 1" }, // not a field value: skipped
+    };
+    var out_buf: [4096]u8 = undefined;
+    // A request-refused answer (400: no Host).
+    const refused = runStreamWith(.{ .error_headers = &extra }, null, "GET / HTTP/1.1\r\n\r\n", &out_buf);
+    try testing.expectEqualStrings("HTTP/1.1 400 Bad Request\r\n" ++
+        "Date: " ++ test_date ++ "\r\n" ++
+        "Server: test\r\n" ++
+        "X-Content-Type-Options: nosniff\r\n" ++
+        "Content-Security-Policy: default-src 'none'\r\n" ++
+        "Content-Type: text/plain\r\nContent-Length: 12\r\nConnection: close\r\n\r\n" ++
+        "Bad Request\n", refused);
+    // The 500 that replaces a failed handler's response.
+    const failed = runStreamWith(.{ .error_headers = &extra }, null, "GET /fail HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &out_buf);
+    try testing.expect(std.mem.startsWith(u8, failed, "HTTP/1.1 500 Internal Server Error\r\n"));
+    try testing.expect(std.mem.indexOf(u8, failed, "\r\nX-Content-Type-Options: nosniff\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, failed, "\r\nContent-Security-Policy: default-src 'none'\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, failed, "text/html") == null);
+    try testing.expect(std.mem.indexOf(u8, failed, "Injected") == null);
+    // A handler's own response is the handler's (and its middleware's).
+    const ok = runStreamWith(.{ .error_headers = &extra }, null, "GET /hello HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &out_buf);
+    try testing.expect(std.mem.indexOf(u8, ok, "nosniff") == null);
 }
 
 test "serveStream: explicit Content-Length responses" {

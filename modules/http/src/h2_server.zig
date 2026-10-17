@@ -204,6 +204,8 @@ pub const Options = struct {
     context: ?*anyopaque = null,
     /// Auto `server` response header; null = omit.
     server_name: ?[]const u8 = null,
+    /// See `Server.Options.error_headers` (names sent lowercased).
+    error_headers: []const http.Header = &.{},
     /// Wall-clock source for the auto `date` header; null = omit.
     now: ?Server.StreamOptions.Now = null,
     /// Socket peer address, surfaced on every `Request` (`peerAddress`).
@@ -2123,7 +2125,8 @@ const Session = struct {
         // a server with a clock, and these are the answers no handler ever
         // saw to add one.
         var date_buf: [Server.http_date_len]u8 = undefined;
-        var fields: [5]hpack.Field = undefined;
+        var fields: [5 + Server.max_error_headers]hpack.Field = undefined;
+        var lower_names: [Server.max_error_headers][64]u8 = undefined;
         var n: usize = 0;
         fields[n] = .{ .name = ":status", .value = status_str };
         n += 1;
@@ -2139,6 +2142,11 @@ const Session = struct {
         n += 1;
         fields[n] = .{ .name = "content-length", .value = len_str };
         n += 1;
+        for (Server.usableErrorHeaders(s.opts.error_headers), 0..) |h, i| {
+            if (!Server.errorHeaderUsable(h) or h.name.len > lower_names[i].len) continue;
+            fields[n] = .{ .name = std.ascii.lowerString(&lower_names[i], h.name), .value = h.value };
+            n += 1;
+        }
         s.conn.sendHeaders(&s.wire, id, fields[0..n], false) catch return .keep; // stream gone (reset) or overloaded
         s.conn.sendData(&s.wire, id, body_text, true) catch {
             // No window even for the reason text: abort the stream instead.
@@ -3422,6 +3430,26 @@ const ErrorLog = struct {
         log.n += 1;
     }
 };
+
+test "h2c serve: error_headers ride the server's own 500, lowercased" {
+    const gpa = testing.allocator;
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    const sid_fail = try peer.conn.startStream(&peer.wire, &fieldsFor("GET", "/fail"), true);
+    const sid_ok = try peer.conn.startStream(&peer.wire, &fieldsFor("GET", "/hello"), true);
+    const extra = [_]http.Header{
+        .{ .name = "X-Content-Type-Options", .value = "nosniff" },
+        .{ .name = "Server", .value = "spoof" }, // managed: skipped
+    };
+    var out_buf: [8192]u8 = undefined;
+    try runOffline(&peer, .{ .handler = testHandler, .error_headers = &extra }, &out_buf);
+    const fail = peer.resp(sid_fail);
+    try testing.expectEqual(@as(u16, 500), fail.status);
+    try testing.expectEqualStrings("nosniff", fail.header("x-content-type-options").?);
+    try testing.expect(fail.header("server") == null);
+    try testing.expect(peer.resp(sid_ok).header("x-content-type-options") == null);
+}
 
 test "h2c serve: handler error → 500; 404 and HEAD framing (offline)" {
     const gpa = testing.allocator;
