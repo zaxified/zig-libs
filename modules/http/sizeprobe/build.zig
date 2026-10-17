@@ -37,22 +37,33 @@ pub fn build(b: *std.Build) void {
             });
         }
     };
+    // ⚠ Mirror the root build.zig's `.deps` by hand: a dep added there and
+    // not here only shows when `test.sh checks` runs this probe.
+    const entropy_mod = dep.mod(b, target, optimize, "entropy");
     const montint_mod = dep.mod(b, target, optimize, "montint");
     const rsa_mod = dep.mod(b, target, optimize, "rsa");
     rsa_mod.addImport("montint", montint_mod);
+    rsa_mod.addImport("aescbc", dep.mod(b, target, optimize, "aescbc"));
+    rsa_mod.addImport("aes192", dep.mod(b, target, optimize, "aes192"));
     const slhdsa_mod = dep.mod(b, target, optimize, "slhdsa");
     const x509_mod = dep.mod(b, target, optimize, "x509");
     x509_mod.addImport("rsa", rsa_mod);
     x509_mod.addImport("slhdsa", slhdsa_mod);
+    x509_mod.addImport("netaddr", netaddr_mod);
     const p521_mod = dep.mod(b, target, optimize, "p521");
-    p521_mod.addImport("entropy", dep.mod(b, target, optimize, "entropy"));
+    p521_mod.addImport("entropy", entropy_mod);
     x509_mod.addImport("p521", p521_mod);
     const p256_mod = dep.mod(b, target, optimize, "p256");
     x509_mod.addImport("p256", p256_mod);
+    const p384_mod = dep.mod(b, target, optimize, "p384");
+    p384_mod.addImport("entropy", entropy_mod);
     const tlsclient_mod = dep.mod(b, target, optimize, "tlsclient");
     tlsclient_mod.addImport("x509", x509_mod);
     tlsclient_mod.addImport("p256", p256_mod);
+    tlsclient_mod.addImport("p384", p384_mod);
+    tlsclient_mod.addImport("p521", p521_mod);
     tlsclient_mod.addImport("rsa", rsa_mod);
+    tlsclient_mod.addImport("tlsresume", dep.mod(b, target, optimize, "tlsresume"));
     http_mod.addImport("tlsclient", tlsclient_mod);
     http_mod.addImport("datefmt", dep.mod(b, target, optimize, "datefmt"));
     http_mod.addImport("crc32", dep.mod(b, target, optimize, "crc32"));
