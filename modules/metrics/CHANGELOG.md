@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-17** — ADDED: client_golang parity helpers. `Gauge.setToCurrentTime(g, io)` (Unix seconds from `io`'s wall clock); `linearBuckets`/`exponentialBuckets`/`exponentialBucketsRange` (comptime, return `[count]f64`, bad arguments are compile errors; values bit-identical to client_golang v1.24.1 for linear/exponential) and runtime `fillLinearBuckets`/`fillExponentialBuckets`/`fillExponentialBucketsRange` (`error.InvalidBuckets`); `Timer.start(clock)` + `observeDuration(h: *Histogram)` / `observeDurationSummary(s: *Summary)`; `Endpoint.max_in_flight` (promhttp `MaxRequestsInFlight`: extra concurrent scrapes get `503` + text body); `RequestMetrics.Options.request_size_buckets` / `response_size_buckets` (off by default, output unchanged; `http_request_size_bytes` / `http_response_size_bytes`, label `method`) and `approxRequestSize`. Not added: `Timeout`, TimeToWriteHeader (no header-write hook in `http`).
+
 - **2026-10-17** — ADDED: exemplars — `Counter.addWithExemplar` / `incWithExemplar`,
   `Histogram.observeWithExemplar` (client_golang `AddWithExemplar` / `ObserveWithExemplar`: last
   exemplar per sample / per bucket, `max_exemplar_runes` = 128, caller-supplied Unix timestamp),

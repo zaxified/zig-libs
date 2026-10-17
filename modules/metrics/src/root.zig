@@ -343,6 +343,17 @@ pub const Gauge = struct {
     pub fn value(g: *const Gauge) f64 {
         return @bitCast(g.bits.load(.monotonic));
     }
+
+    /// Set the gauge to the current Unix time in seconds (client_golang
+    /// `SetToCurrentTime`), read from the wall clock of `io` — the module
+    /// keeps no hidden clock. Nanosecond resolution is kept in the fraction
+    /// as far as an `f64` carries it (~microseconds at today's epoch).
+    pub fn setToCurrentTime(g: *Gauge, io: std.Io) void {
+        const ns: i96 = std.Io.Clock.real.now(io).nanoseconds;
+        const s: i96 = @divFloor(ns, std.time.ns_per_s);
+        const frac: i96 = ns - s * std.time.ns_per_s;
+        g.set(@as(f64, @floatFromInt(s)) + @as(f64, @floatFromInt(frac)) / std.time.ns_per_s);
+    }
 };
 
 /// Histogram with fixed `le` upper bounds (shared by the whole family).
@@ -456,6 +467,127 @@ pub const max_objectives = 16;
 
 /// client_golang `DefBuckets` — latency-in-seconds defaults.
 pub const default_buckets = [_]f64{ 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10 };
+
+// ── bucket helpers (client_golang LinearBuckets / ExponentialBuckets) ───────
+//
+// Shape: the comptime functions take comptime arguments and return a
+// `[count]f64` array (pass `&arr` as `buckets`); client_golang panics on bad
+// arguments, these are compile errors. The `fill*` functions are the
+// runtime variants: they write into a caller-provided slice and return
+// `error.InvalidBuckets` on the same bad arguments. Values are identical to
+// Go's (the same repeated add / repeated multiply / `pow` formulas).
+
+/// `count` buckets `start, start+width, ...` (client_golang `LinearBuckets`).
+pub fn linearBuckets(comptime start: f64, comptime width: f64, comptime count: usize) [count]f64 {
+    return comptime blk: {
+        var out: [count]f64 = undefined;
+        fillLinearBuckets(&out, start, width) catch @compileError("linearBuckets needs a positive count");
+        break :blk out;
+    };
+}
+
+/// Runtime `linearBuckets`: fills `out` (`out.len` = count);
+/// `error.InvalidBuckets` when `out` is empty.
+pub fn fillLinearBuckets(out: []f64, start: f64, width: f64) error{InvalidBuckets}!void {
+    if (out.len < 1) return error.InvalidBuckets;
+    var v = start;
+    for (out) |*b| {
+        b.* = v;
+        v += width;
+    }
+}
+
+/// `count` buckets `start, start*factor, ...` (client_golang
+/// `ExponentialBuckets`). Compile error for `count < 1`, `start <= 0` or
+/// `factor <= 1`.
+pub fn exponentialBuckets(comptime start: f64, comptime factor: f64, comptime count: usize) [count]f64 {
+    return comptime blk: {
+        var out: [count]f64 = undefined;
+        fillExponentialBuckets(&out, start, factor) catch
+            @compileError("exponentialBuckets needs count >= 1, start > 0 and factor > 1");
+        break :blk out;
+    };
+}
+
+/// Runtime `exponentialBuckets`: fills `out`; `error.InvalidBuckets` for an
+/// empty `out`, `start <= 0` or `factor <= 1` (also NaN).
+pub fn fillExponentialBuckets(out: []f64, start: f64, factor: f64) error{InvalidBuckets}!void {
+    if (out.len < 1 or !(start > 0) or !(factor > 1)) return error.InvalidBuckets;
+    var v = start;
+    for (out) |*b| {
+        b.* = v;
+        v *= factor;
+    }
+}
+
+/// `count` buckets from `min` to `max` growing by a constant factor
+/// (client_golang `ExponentialBucketsRange`). Compile error for
+/// `count < 1`, `min <= 0` or `max < min`.
+pub fn exponentialBucketsRange(comptime min: f64, comptime max: f64, comptime count: usize) [count]f64 {
+    return comptime blk: {
+        @setEvalBranchQuota(100_000);
+        var out: [count]f64 = undefined;
+        fillExponentialBucketsRange(&out, min, max) catch
+            @compileError("exponentialBucketsRange needs count >= 1, min > 0 and max >= min");
+        break :blk out;
+    };
+}
+
+/// Runtime `exponentialBucketsRange`: fills `out`; `error.InvalidBuckets`
+/// for an empty `out`, `min <= 0` or `max < min` (Go only rejects the first
+/// two; `max < min` would give a descending, unregisterable list).
+pub fn fillExponentialBucketsRange(out: []f64, min: f64, max: f64) error{InvalidBuckets}!void {
+    if (out.len < 1 or !(min > 0) or !(max >= min)) return error.InvalidBuckets;
+    if (out.len == 1) {
+        out[0] = min;
+        return;
+    }
+    const growth = std.math.pow(f64, max / min, 1.0 / @as(f64, @floatFromInt(out.len - 1)));
+    for (out, 0..) |*b, i| {
+        b.* = min * std.math.pow(f64, growth, @floatFromInt(i));
+    }
+}
+
+// ── Timer (client_golang timer.go) ──────────────────────────────────────────
+
+/// Measures a duration on an injected `Clock` and records it in seconds into
+/// a `Histogram` (client_golang `NewTimer` + `ObserveDuration`).
+///
+/// ```zig
+/// const t = metrics.Timer.start(.monotonic);
+/// defer _ = t.observeDuration(hist);
+/// ```
+///
+/// There is no `Summary` instrument in this module, so only `*Histogram` is
+/// accepted; `elapsedNs` serves anything else.
+pub const Timer = struct {
+    clock: Clock,
+    begin_ns: u64,
+
+    pub fn start(clock: Clock) Timer {
+        return .{ .clock = clock, .begin_ns = clock.now() };
+    }
+
+    /// Nanoseconds since `start` (saturating at 0 if the clock went back).
+    pub fn elapsedNs(t: Timer) u64 {
+        return t.clock.now() -| t.begin_ns;
+    }
+
+    /// Observe the elapsed time in seconds into `h`; returns the duration in
+    /// nanoseconds. May be called repeatedly (each call observes again).
+    pub fn observeDuration(t: Timer, h: *Histogram) u64 {
+        const ns = t.elapsedNs();
+        h.observe(@as(f64, @floatFromInt(ns)) / std.time.ns_per_s);
+        return ns;
+    }
+
+    /// `observeDuration` into a `Summary`.
+    pub fn observeDurationSummary(t: Timer, s: *Summary) u64 {
+        const ns = t.elapsedNs();
+        s.observe(@as(f64, @floatFromInt(ns)) / std.time.ns_per_s);
+        return ns;
+    }
+};
 
 // ── the registry ────────────────────────────────────────────────────────────
 
@@ -1819,6 +1951,14 @@ pub const Endpoint = struct {
     /// (`Format.negotiate`); off = always the text format. client_golang
     /// promhttp `HandlerOpts.EnableOpenMetrics`, same default.
     open_metrics: bool = false,
+    /// Cap on concurrently served scrapes (promhttp `MaxRequestsInFlight`):
+    /// a scrape arriving while this many are already being answered gets
+    /// `503` with a short text body and never touches the registry. `null`
+    /// = unlimited (default). `0` rejects every GET/HEAD scrape.
+    max_in_flight: ?u32 = null,
+    /// Scrapes being answered right now (one atomic; only counted while
+    /// `max_in_flight` is set).
+    in_flight: std.atomic.Value(u32) = .init(0),
 
     pub fn middleware(e: *Endpoint) router.Middleware {
         return .{ .state = e, .run = endpointRun };
@@ -1829,10 +1969,22 @@ fn endpointRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerror
     const e: *Endpoint = @ptrCast(@alignCast(state.?));
     if (!std.mem.eql(u8, ctx.req.path, e.path)) return next.run(ctx);
     switch (ctx.req.method) {
-        .get, .head => try e.registry.respondFormat(
-            ctx.res,
-            if (e.open_metrics) Format.negotiate(ctx.req.header("accept") orelse "") else .text,
-        ),
+        .get, .head => {
+            const format: Format = if (e.open_metrics) Format.negotiate(ctx.req.header("accept") orelse "") else .text;
+            if (e.max_in_flight) |max| {
+                const before = e.in_flight.fetchAdd(1, .acq_rel);
+                defer _ = e.in_flight.fetchSub(1, .acq_rel);
+                if (before >= max) {
+                    ctx.res.setStatus(503);
+                    try ctx.res.setHeader("Content-Type", "text/plain; charset=utf-8");
+                    var msg_buf: [96]u8 = undefined;
+                    const msg = std.fmt.bufPrint(&msg_buf, "Limit of concurrent requests reached ({d}), try again later.\n", .{max}) catch unreachable;
+                    try ctx.res.writeAll(msg);
+                    return;
+                }
+                try e.registry.respondFormat(ctx.res, format);
+            } else try e.registry.respondFormat(ctx.res, format);
+        },
         else => {
             ctx.res.setStatus(405);
             try ctx.res.setHeader("Allow", "GET, HEAD");
@@ -1920,6 +2072,8 @@ pub const RequestMetrics = struct {
     counters: [method_count][class_count]std.atomic.Value(?*Counter) =
         @splat(@splat(.init(null))),
     histograms: [method_count]std.atomic.Value(?*Histogram) = @splat(.init(null)),
+    request_size_histograms: [method_count]std.atomic.Value(?*Histogram) = @splat(.init(null)),
+    response_size_histograms: [method_count]std.atomic.Value(?*Histogram) = @splat(.init(null)),
 
     pub const StatusGranularity = enum {
         /// `code="2xx"` … — bounded cardinality (default).
@@ -1939,6 +2093,20 @@ pub const RequestMetrics = struct {
         buckets: []const f64 = &default_buckets,
         /// `code` label granularity — classes by default (cardinality).
         status: StatusGranularity = .class,
+        /// Request-size histogram bucket bounds in bytes (promhttp
+        /// `InstrumentHandlerRequestSize`); `null` = not recorded, nothing
+        /// is registered and the exposition is unchanged (default). The
+        /// size is promhttp's approximation (see `approxRequestSize`).
+        request_size_buckets: ?[]const f64 = null,
+        request_size_name: []const u8 = "http_request_size_bytes",
+        request_size_help: []const u8 = "Approximate HTTP request size in bytes, by method.",
+        /// Response-size histogram bucket bounds in bytes (promhttp
+        /// `InstrumentHandlerResponseSize`); `null` = not recorded (default).
+        /// Body bytes as `AccessEntry.bytes`; a response whose size is not
+        /// knowable is skipped, not recorded as 0.
+        response_size_buckets: ?[]const f64 = null,
+        response_size_name: []const u8 = "http_response_size_bytes",
+        response_size_help: []const u8 = "HTTP response body size in bytes, by method.",
         /// Time source for the latency histogram — inject a fake in tests.
         clock: Clock = .monotonic,
         /// Optional structured access-log hook (see `AccessEntry`).
@@ -1968,6 +2136,14 @@ pub const RequestMetrics = struct {
             if (!std.math.isFinite(b)) return error.InvalidBuckets;
             if (i > 0 and b <= options.buckets[i - 1]) return error.InvalidBuckets;
         }
+        inline for (.{ options.request_size_buckets, options.response_size_buckets }) |ob| {
+            if (ob) |bs| for (bs, 0..) |b, i| {
+                if (!std.math.isFinite(b)) return error.InvalidBuckets;
+                if (i > 0 and b <= bs[i - 1]) return error.InvalidBuckets;
+            };
+        }
+        if (options.request_size_buckets != null and !validMetricName(options.request_size_name)) return error.InvalidName;
+        if (options.response_size_buckets != null and !validMetricName(options.response_size_name)) return error.InvalidName;
         const in_flight = try registry.gauge(options.in_flight_name, options.in_flight_help, &.{});
         _ = try registry.counter(options.counter_name, options.counter_help, &.{
             .{ .name = "method", .value = @tagName(http.Method.get) },
@@ -1976,6 +2152,12 @@ pub const RequestMetrics = struct {
         _ = try registry.histogram(options.histogram_name, options.histogram_help, &.{
             .{ .name = "method", .value = @tagName(http.Method.get) },
         }, options.buckets);
+        if (options.request_size_buckets) |bs| _ = try registry.histogram(options.request_size_name, options.request_size_help, &.{
+            .{ .name = "method", .value = @tagName(http.Method.get) },
+        }, bs);
+        if (options.response_size_buckets) |bs| _ = try registry.histogram(options.response_size_name, options.response_size_help, &.{
+            .{ .name = "method", .value = @tagName(http.Method.get) },
+        }, bs);
         return .{
             .registry = registry,
             .options = options,
@@ -2024,7 +2206,36 @@ pub const RequestMetrics = struct {
         m.histograms[mi].store(h, .release);
         return h;
     }
+
+    fn sizeHistogramFor(m: *RequestMetrics, method: http.Method, response: bool) RegisterError!?*Histogram {
+        const buckets = (if (response) m.options.response_size_buckets else m.options.request_size_buckets) orelse return null;
+        const cache = if (response) &m.response_size_histograms else &m.request_size_histograms;
+        const mi = @intFromEnum(method);
+        if (cache[mi].load(.acquire)) |h| return h;
+        const h = try m.registry.histogram(
+            if (response) m.options.response_size_name else m.options.request_size_name,
+            if (response) m.options.response_size_help else m.options.request_size_help,
+            &.{.{ .name = "method", .value = @tagName(method) }},
+            buckets,
+        );
+        cache[mi].store(h, .release);
+        return h;
+    }
 };
+
+/// promhttp's `computeApproximateRequestSize`, on our request: request-target
+/// + method + protocol + header names and values + declared `Content-Length`
+/// (0 when absent or chunked — the number of body bytes the handler read is
+/// not exposed by `http.Server.Request`). The `Host` header is counted as a
+/// header (Go counts `r.Host` separately, same bytes); the protocol counts as
+/// the 8 bytes of `HTTP/1.1` (`HTTP/2.0` is 8 as well).
+pub fn approxRequestSize(req: *const http.Server.Request) u64 {
+    var n: u64 = req.target.len + req.methodName().len + "HTTP/1.1".len;
+    var it = req.iterateHeaders();
+    while (it.next()) |h| n += h.name.len + h.value.len;
+    n += req.head.content_length orelse 0;
+    return n;
+}
 
 fn classLabel(class_index: usize) []const u8 {
     return switch (class_index) {
@@ -2055,6 +2266,13 @@ fn requestRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerror!
     if (m.counterFor(ctx.req.method, status)) |c| c.inc() else |_| {}
     if (m.histogramFor(ctx.req.method)) |h| {
         h.observe(@as(f64, @floatFromInt(duration_ns)) / std.time.ns_per_s);
+    } else |_| {}
+
+    if (m.sizeHistogramFor(ctx.req.method, false)) |mh| {
+        if (mh) |h| h.observe(@floatFromInt(approxRequestSize(ctx.req)));
+    } else |_| {}
+    if (m.sizeHistogramFor(ctx.req.method, true)) |mh| {
+        if (mh) |h| if (responseBytes(ctx.res)) |b| h.observe(@floatFromInt(b));
     } else |_| {}
 
     if (m.options.on_request) |hook| hook(m.options.on_request_ctx, .{
@@ -3281,6 +3499,180 @@ test "endpoint: golden exposition response, HEAD framing, 405, pass-through" {
     try expectStatus(runWire(&r2, wire("GET", "/metrics"), &buf), "404");
 }
 
+// ── tests: client_golang parity helpers ─────────────────────────────────────
+
+test "gauge: setToCurrentTime stores Unix seconds from the wall clock of io" {
+    var g: Gauge = .{};
+    const before = std.Io.Clock.real.now(testing.io).nanoseconds;
+    g.setToCurrentTime(testing.io);
+    const after = std.Io.Clock.real.now(testing.io).nanoseconds;
+    const v = g.value();
+    const lo: f64 = @floatFromInt(@divFloor(before, std.time.ns_per_s));
+    const hi: f64 = @floatFromInt(@divFloor(after, std.time.ns_per_s) + 1);
+    try testing.expect(v >= lo and v <= hi);
+    try testing.expect(v > 1.7e9); // fractional seconds, not millis or nanos
+}
+
+fn expectBits(comptime want: []const u64, got: []const f64) !void {
+    try testing.expectEqual(want.len, got.len);
+    inline for (want, 0..) |w, i| try testing.expectEqual(w, @as(u64, @bitCast(got[i])));
+}
+
+// Expected bit patterns are printed by client_golang v1.24.1 itself
+// (Go program importing prometheus.LinearBuckets etc., 2026-10-17).
+test "buckets: linearBuckets matches client_golang bit for bit" {
+    try expectBits(&.{ 0x0000000000000000, 0x4024000000000000, 0x4034000000000000, 0x403e000000000000, 0x4044000000000000 }, &linearBuckets(0, 10, 5));
+    try expectBits(&.{ 0x3fb999999999999a, 0x3fc999999999999a, 0x3fd3333333333334, 0x3fd999999999999a, 0x3fe0000000000000, 0x3fe3333333333333, 0x3fe6666666666666 }, &linearBuckets(0.1, 0.1, 7));
+    try expectBits(&.{ 0xc014000000000000, 0xc004000000000000, 0x0000000000000000, 0x4004000000000000 }, &linearBuckets(-5, 2.5, 4));
+    // runtime variant, same values; empty output is the error
+    var buf: [4]f64 = undefined;
+    try fillLinearBuckets(&buf, -5, 2.5);
+    try expectBits(&.{ 0xc014000000000000, 0xc004000000000000, 0x0000000000000000, 0x4004000000000000 }, &buf);
+    try testing.expectError(error.InvalidBuckets, fillLinearBuckets(buf[0..0], 0, 1));
+}
+
+test "buckets: exponentialBuckets matches client_golang bit for bit" {
+    try expectBits(&.{ 0x3ff0000000000000, 0x4000000000000000, 0x4010000000000000, 0x4020000000000000, 0x4030000000000000, 0x4040000000000000, 0x4050000000000000, 0x4060000000000000 }, &exponentialBuckets(1, 2, 8));
+    try expectBits(&.{ 0x3f50624dd2f1a9fc, 0x3f847ae147ae147b, 0x3fb999999999999a, 0x3ff0000000000000, 0x4024000000000000 }, &exponentialBuckets(0.001, 10, 5));
+    try expectBits(&.{ 0x4059000000000000, 0x4062c00000000000, 0x406c200000000000, 0x4075180000000000, 0x407fa40000000000, 0x4087bb0000000000 }, &exponentialBuckets(100, 1.5, 6));
+    var buf: [3]f64 = undefined;
+    try fillExponentialBuckets(&buf, 1, 2);
+    try testing.expectEqualSlices(f64, &.{ 1, 2, 4 }, &buf);
+    try testing.expectError(error.InvalidBuckets, fillExponentialBuckets(&buf, 0, 2));
+    try testing.expectError(error.InvalidBuckets, fillExponentialBuckets(&buf, 1, 1));
+    try testing.expectError(error.InvalidBuckets, fillExponentialBuckets(buf[0..0], 1, 2));
+    try testing.expectError(error.InvalidBuckets, fillExponentialBuckets(&buf, 1, std.math.nan(f64)));
+}
+
+// ExponentialBucketsRange goes through pow(): Go's and Zig's pow may differ
+// in the last bits, so compare with a few ulps of slack (values still
+// printed by client_golang), exactly for the endpoints that Go computes
+// exactly.
+fn expectNear(want: []const f64, got: []const f64) !void {
+    try testing.expectEqual(want.len, got.len);
+    for (want, got) |w, g| try testing.expect(@abs(w - g) <= @abs(w) * 4e-16);
+}
+
+test "buckets: exponentialBucketsRange matches client_golang (to 4e-16 relative)" {
+    try expectNear(&.{ 1, 9.999999999999998, 99.99999999999997, 999.9999999999995 }, &exponentialBucketsRange(1, 1000, 4));
+    try expectNear(&.{ 0.005, 0.017747683298777853, 0.06299605249474366, 0.223606797749979, 0.7937005259840999, 2.817269113847841, 10.000000000000002 }, &exponentialBucketsRange(0.005, 10, 7));
+    try expectNear(&.{1}, &exponentialBucketsRange(1, 1, 1));
+    try expectNear(&.{ 2, 2, 2 }, &exponentialBucketsRange(2, 2, 3));
+    var buf: [4]f64 = undefined;
+    try fillExponentialBucketsRange(&buf, 1, 1000);
+    try expectNear(&.{ 1, 9.999999999999998, 99.99999999999997, 999.9999999999995 }, &buf);
+    try testing.expectError(error.InvalidBuckets, fillExponentialBucketsRange(&buf, 0, 10));
+    try testing.expectError(error.InvalidBuckets, fillExponentialBucketsRange(&buf, 10, 1));
+    try testing.expectError(error.InvalidBuckets, fillExponentialBucketsRange(buf[0..0], 1, 10));
+    // the generated lists are valid bucket bounds for a histogram
+    var reg = Registry.init(testing.allocator);
+    defer reg.deinit();
+    _ = try reg.histogram("lin", "L.", &.{}, &linearBuckets(1, 1, 3));
+    _ = try reg.histogram("exp", "E.", &.{}, &exponentialBuckets(1, 2, 3));
+}
+
+test "Timer: observes elapsed seconds on the injected clock and returns ns" {
+    var reg = Registry.init(testing.allocator);
+    defer reg.deinit();
+    const h = try reg.histogram("t_seconds", "T.", &.{}, &.{ 0.001, 0.01 });
+    var fake: FakeClock = .{ .step_ns = 5 * std.time.ns_per_ms };
+    const t = Timer.start(fake.clock()); // reads 5 ms
+    try testing.expectEqual(@as(u64, 5_000_000), t.observeDuration(h)); // reads 10 ms
+    try testing.expectEqual(@as(u64, 1), h.count());
+    try testing.expectEqual(@as(f64, 0.005), h.sum());
+    try testing.expectEqual(@as(u64, 0), h.cumulativeBucket(0)); // 5 ms > 1 ms
+    try testing.expectEqual(@as(u64, 1), h.cumulativeBucket(1));
+    // a clock going backwards saturates to 0
+    var back: BackwardClock = .{ .readings = .{ 10, 3 } };
+    const t2 = Timer.start(back.clock());
+    try testing.expectEqual(@as(u64, 0), t2.elapsedNs());
+}
+
+test "endpoint: max_in_flight answers 503 beyond the limit and always releases its slot" {
+    var reg = Registry.init(testing.allocator);
+    defer reg.deinit();
+    _ = try reg.counter("t_total", "T.", &.{});
+    var ep: Endpoint = .{ .registry = &reg, .max_in_flight = 1 };
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(ep.middleware());
+
+    var buf: [4096]u8 = undefined;
+    // free slot: served, counter back to 0 afterwards
+    try expectStatus(runWire(&r, wire("GET", "/metrics"), &buf), "200");
+    try testing.expectEqual(@as(u32, 0), ep.in_flight.load(.acquire));
+
+    // one scrape "in progress" (simulated): the next one is rejected, text body
+    ep.in_flight.store(1, .release);
+    const rej = runWire(&r, wire("GET", "/metrics"), &buf);
+    try expectStatus(rej, "503");
+    try expectHeaderLine(rej, "Content-Type: text/plain; charset=utf-8");
+    try testing.expectEqualStrings("Limit of concurrent requests reached (1), try again later.\n", bodyOf(rej));
+    try expectStatus(runWire(&r, wire("HEAD", "/metrics"), &buf), "503");
+    // the rejected attempts did not leak a slot
+    try testing.expectEqual(@as(u32, 1), ep.in_flight.load(.acquire));
+    ep.in_flight.store(0, .release);
+    try expectStatus(runWire(&r, wire("GET", "/metrics"), &buf), "200");
+
+    // 405 is not a scrape and ignores the limit; unlimited by default
+    ep.in_flight.store(1, .release);
+    try expectStatus(runWire(&r, wire("POST", "/metrics"), &buf), "405");
+    ep.in_flight.store(0, .release);
+    ep.max_in_flight = 0; // rejects every scrape
+    try expectStatus(runWire(&r, wire("GET", "/metrics"), &buf), "503");
+    try testing.expectEqual(@as(u32, 0), ep.in_flight.load(.acquire));
+    ep.max_in_flight = null;
+    try expectStatus(runWire(&r, wire("GET", "/metrics"), &buf), "200");
+}
+
+test "middleware: request/response size histograms are off by default and unchanged output" {
+    var reg = Registry.init(testing.allocator);
+    defer reg.deinit();
+    var rm = try RequestMetrics.init(&reg, .{});
+    var ep: Endpoint = .{ .registry = &reg };
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(rm.middleware());
+    try r.use(ep.middleware());
+    try r.get("/ok", hOk);
+    var buf: [8192]u8 = undefined;
+    _ = runWire(&r, wire("GET", "/ok"), &buf);
+    const got = runWire(&r, wire("GET", "/metrics"), &buf);
+    try testing.expect(std.mem.indexOf(u8, got, "size_bytes") == null);
+}
+
+test "middleware: request/response size histograms (opt-in, per method)" {
+    var reg = Registry.init(testing.allocator);
+    defer reg.deinit();
+    var rm = try RequestMetrics.init(&reg, .{
+        .request_size_buckets = &.{ 10, 50, 100 },
+        .response_size_buckets = &.{ 1, 2, 3 },
+    });
+    var ep: Endpoint = .{ .registry = &reg };
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(rm.middleware());
+    try r.use(ep.middleware());
+    try r.get("/ok", hOk);
+    var buf: [8192]u8 = undefined;
+    // "/ok" 3 + "GET" 3 + "HTTP/1.1" 8 + "Host"+"t" 5 + "Connection"+"close" 15 = 34 bytes
+    // request; response body "ok" = 2 bytes.
+    _ = runWire(&r, wire("GET", "/ok"), &buf);
+    const got = runWire(&r, wire("GET", "/metrics"), &buf);
+    try expectBodyLine(got, "http_request_size_bytes_bucket{method=\"get\",le=\"10\"} 0");
+    try expectBodyLine(got, "http_request_size_bytes_bucket{method=\"get\",le=\"50\"} 1");
+    try expectBodyLine(got, "http_request_size_bytes_sum{method=\"get\"} 34");
+    try expectBodyLine(got, "http_response_size_bytes_bucket{method=\"get\",le=\"1\"} 0");
+    try expectBodyLine(got, "http_response_size_bytes_bucket{method=\"get\",le=\"2\"} 1");
+    try expectBodyLine(got, "http_response_size_bytes_sum{method=\"get\"} 2");
+    try expectBodyLine(got, "http_response_size_bytes_count{method=\"get\"} 1");
+
+    // misconfiguration fails at init
+    try testing.expectError(error.InvalidBuckets, RequestMetrics.init(&reg, .{ .request_size_buckets = &.{ 5, 5 } }));
+    try testing.expectError(error.InvalidBuckets, RequestMetrics.init(&reg, .{ .response_size_buckets = &.{std.math.inf(f64)} }));
+    try testing.expectError(error.InvalidName, RequestMetrics.init(&reg, .{ .request_size_buckets = &.{1}, .request_size_name = "no way" }));
+}
+
 // ── tests: in-process integration (router + http.Server + http.Client) ──────
 
 fn serveWrap(s: *http.Server) void {
@@ -4211,6 +4603,20 @@ test "exemplars: concurrent writers and scrapers stay well-formed" {
     sleepMs(150);
     stop.store(true, .release);
     for (ts) |t| t.join();
+}
+
+test "Timer: observeDurationSummary records seconds into a Summary" {
+    var reg = Registry.init(testing.allocator);
+    defer reg.deinit();
+    var clock: FakeClock = .{ .step_ns = 250_000_000 };
+    reg.clock = clock.clock();
+    const sm = try reg.summary("t_seconds", "h", &.{}, .{});
+    const t = Timer.start(clock.clock());
+    try testing.expectEqual(@as(u64, 250_000_000), t.observeDurationSummary(sm));
+    var none: [0]f64 = .{};
+    const snap = sm.snapshot(&none);
+    try testing.expectEqual(@as(u64, 1), snap.count);
+    try testing.expectEqual(@as(f64, 0.25), snap.sum);
 }
 
 // ── external anchor: client_golang + expfmt + textparse ────────────────────

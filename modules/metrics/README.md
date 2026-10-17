@@ -68,6 +68,21 @@ try r.use(ep.middleware()); // swap the two lines to opt out and keep scrapes un
 try r.get("/api/thing", handler);
 ```
 
+Helpers modelled on client_golang:
+
+```zig
+const buckets = metrics.exponentialBuckets(0.001, 2, 12); // also linearBuckets, exponentialBucketsRange
+const h = try reg.histogram("job_seconds", "Job time.", &.{}, &buckets);
+const t = metrics.Timer.start(.monotonic);
+defer _ = t.observeDuration(h);            // seconds into the histogram, returns ns
+last_ok.setToCurrentTime(io);               // Gauge: Unix seconds from io's wall clock
+var ep = metrics.Endpoint{ .registry = &reg, .max_in_flight = 4 }; // 5th concurrent scrape: 503
+var rm2 = try metrics.RequestMetrics.init(&reg, .{
+    .request_size_buckets = &metrics.exponentialBuckets(256, 4, 6),  // http_request_size_bytes
+    .response_size_buckets = &metrics.exponentialBuckets(256, 4, 6), // http_response_size_bytes
+});
+```
+
 `Registry`, `RequestMetrics` and `Endpoint` must outlive the Router, at
 stable addresses (middleware `state` points at them). Everything passed to
 `counter`/`gauge`/`histogram` (names, help, labels, buckets) is copied into
