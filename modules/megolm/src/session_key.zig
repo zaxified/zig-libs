@@ -31,7 +31,7 @@ const std = @import("std");
 /// Test-only (`build.zig`'s `test_deps`, never `deps`): fuzz corpus framing.
 const testkit = @import("testkit");
 const ratchet_mod = @import("ratchet.zig");
-const b64ct = @import("b64ct.zig");
+const b64ct = @import("b64ct").standard_no_pad;
 const burn = @import("burn.zig");
 
 const Ed25519 = std.crypto.sign.Ed25519;
@@ -199,18 +199,18 @@ fn decodeSignedPartUnchecked(bytes: *const [signed_part_len]u8, out: *ExportedSe
 // same alphabet and accept set, computed without branches or indexes.
 fn base64Encode(allocator: std.mem.Allocator, bytes: []const u8) std.mem.Allocator.Error![]u8 {
     const out = try allocator.alloc(u8, b64ct.encodedLen(bytes.len));
-    b64ct.encode(out, bytes);
+    _ = b64ct.encode(out, bytes);
     return out;
 }
 
 fn base64Decode(allocator: std.mem.Allocator, s: []const u8) (std.mem.Allocator.Error || std.base64.Error)![]u8 {
-    const size = try b64ct.decodedLen(s.len);
+    const size = try b64ct.decodedLen(s);
     const out = try allocator.alloc(u8, size);
     errdefer {
         std.crypto.secureZero(u8, out);
         allocator.free(out);
     }
-    try b64ct.decode(out, s);
+    _ = try b64ct.decode(out, s);
     return out;
 }
 

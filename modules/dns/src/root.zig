@@ -42,7 +42,7 @@ pub const meta = .{
     .role = .client,
     .concurrency = .blocking, // every lookup blocks; one owner per Resolver
     .model_after = "Go net dnsclient + miekg/dns (codec, update, TSIG) / c-ares; RFC 1035/2782/8659 (wire), RFC 8484 (DoH), RFC 2136/8945 (update, TSIG)",
-    .deps = .{ "netaddr", "http" }, // also uses std.json, std.Io.net
+    .deps = .{ "netaddr", "http", "b64ct" }, // b64ct: TSIG secrets (constant time); also uses std.json, std.Io.net
 };
 
 /// Pure wire codec (encode query / decode response) — no I/O.
@@ -141,7 +141,6 @@ test {
     _ = Resolver;
     _ = update;
     _ = tsig;
-    _ = @import("b64ct.zig");
     _ = @import("stackprobe_test.zig");
     _ = @import("goldens.zig");
     _ = @import("go_oracle.zig");

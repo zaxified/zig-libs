@@ -18,7 +18,7 @@
 //! parser used by tests and by the mock CA to validate what we emit.
 
 const std = @import("std");
-const b64ct = @import("b64ct.zig");
+const b64ct = @import("b64ct").standard;
 const Allocator = std.mem.Allocator;
 const burn = @import("burn.zig");
 const rsa = @import("rsa");
@@ -826,7 +826,7 @@ pub fn pemDecode(gpa: Allocator, label: []const u8, text: []const u8) PemDecodeE
 /// `EC PRIVATE KEY` is 121 bytes, a P-521 one 223).
 const max_secret_der = 1024;
 
-/// `pemEncode` for a SECRET DER: constant-time base64 (`b64ct.zig`), and the
+/// `pemEncode` for a SECRET DER: constant-time base64 (the `b64ct` module), and the
 /// base64 text exists only in a wiped stack buffer and in the one returned
 /// allocation — `pemEncode` leaves it in a freed heap block and in the
 /// `Allocating` writer's discarded growth buffers.
@@ -847,12 +847,11 @@ fn pemEncodeSecret(gpa: Allocator, label: []const u8, der_bytes: []const u8) err
 }
 
 /// `pemDecode` for a SECRET DER, into `out` (no allocation): the base64 body
-/// is stripped of whitespace into a wiped stack buffer and decoded in
-/// constant time (`b64ct.zig`). Locating the BEGIN/END lines and dropping the
-/// line breaks still branch on the text: those decisions come out the same
-/// for every key character (a base64 character is never `-` or whitespace),
-/// so they reveal the PEM's layout, not the key — the `pem` row of
-/// `scripts/checks/ctgrind-expected.tsv` itemises them.
+/// is decoded in constant time by `b64ct.decodeIgnoring`, which skips the
+/// whitespace itself. Locating the BEGIN/END lines still branches on the
+/// text: that decision comes out the same for every key character (a base64
+/// character is never `-`), so it reveals the PEM's layout, not the key — the
+/// `pem` row of `scripts/checks/ctgrind-expected.tsv` itemises it.
 fn pemDecodeSecret(label: []const u8, text: []const u8, out: []u8) PemDecodeError![]u8 {
     if (label.len > max_pem_label_len) return error.LabelTooLong;
     var begin_buf: [max_pem_label_len + 16]u8 = undefined;
@@ -865,20 +864,7 @@ fn pemDecodeSecret(label: []const u8, text: []const u8, out: []u8) PemDecodeErro
     const ei = std.mem.indexOfPos(u8, text, body_start, end) orelse return error.InvalidPem;
     const body = text[body_start..ei];
 
-    var b64_buf: [b64ct.encodedLen(max_secret_der)]u8 = undefined;
-    defer std.crypto.secureZero(u8, &b64_buf);
-    var n: usize = 0;
-    for (body) |c| switch (c) {
-        ' ', '\t', '\r', '\n' => {},
-        else => {
-            if (n == b64_buf.len) return error.InvalidPem;
-            b64_buf[n] = c;
-            n += 1;
-        },
-    };
-    if (n == 0) return error.InvalidPem;
-    if (out.len < n / 4 * 3) return error.InvalidPem;
-    const der_bytes = b64ct.decode(out, b64_buf[0..n]) catch {
+    const der_bytes = b64ct.decodeIgnoring(out, body, @import("b64ct").pem_whitespace) catch {
         std.crypto.secureZero(u8, out);
         return error.InvalidPem;
     };
@@ -936,10 +922,8 @@ noinline fn privateKeyToPemUnburned(comptime form: KeyForm, gpa: Allocator, key_
 /// An RSA pair as PKCS#1 `RSA PRIVATE KEY` (`.sec1`, what `openssl rsa
 /// -traditional` and autocert write) or PKCS#8 `PRIVATE KEY` (`.pkcs8`),
 /// through `rsa`'s own encoder. The PEM is assembled in a wiped stack buffer
-/// and only the returned allocation keeps a copy. Note `rsa`'s base64 is
-/// std's table encoder, not the constant-time one `b64ct.zig` gives the EC
-/// paths (its 48-byte staging chunks are wiped, the lookups are not
-/// constant-time).
+/// and only the returned allocation keeps a copy. `rsa`'s base64 is the
+/// same constant-time `b64ct` the EC paths use (since 2026-10-17).
 fn rsaKeyToPem(comptime form: KeyForm, gpa: Allocator, key_pair: *const rsa.KeyPair) error{OutOfMemory}![]u8 {
     var buf: [rsa.max_private_pem_len]u8 = undefined;
     defer std.crypto.secureZero(u8, &buf);

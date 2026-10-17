@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-17** — The private `src/b64ct.zig` is gone: `tsig.decodeSecret` uses the new `b64ct` module (`standard.decode`), same accept set. No API change.
 - **2026-10-16** — Docs: Backlog entry — `lookupIp` reads a SERVFAIL reply as "no addresses". No code change.
 
 - **2026-10-16** — New: `tsig.decodeSecret` — a TSIG secret from the base64 BIND, `nsupdate -y` and

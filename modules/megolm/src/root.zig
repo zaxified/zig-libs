@@ -61,7 +61,7 @@ pub const meta = .{
     .role = .util, // pure computation over caller-supplied bytes/keys -- no owned socket/transport
     .concurrency = .reentrant, // no globals; every type here is a plain caller-owned value
     .model_after = "Matrix Megolm (gitlab.matrix.org/matrix-org/olm/-/blob/master/docs/megolm.md); libolm (megolm.c) and vodozemac (megolm/ratchet.rs) as design references + test-vector source -- see NOTICE",
-    .deps = .{ "aescbc", "entropy", "chachapoly" }, // entropy: the R0 draw in `Ratchet.generate`; chachapoly: sealed pickles
+    .deps = .{ "aescbc", "entropy", "chachapoly", "b64ct" }, // b64ct: the session-sharing key (constant time); entropy: the R0 draw in `Ratchet.generate`; chachapoly: sealed pickles
 };
 
 pub const ratchet = @import("ratchet.zig");
@@ -96,18 +96,18 @@ test {
     _ = session_key;
     _ = session;
     _ = pickle;
-    _ = @import("b64ct.zig");
     _ = @import("kat_test.zig");
     _ = @import("fuzz_test.zig");
     _ = @import("stackprobe_test.zig");
     _ = @import("stackprobe2_test.zig");
 }
 
-test "meta.deps names aescbc (the AES-CBC/PKCS7 primitive), entropy (R0) and chachapoly (sealed pickles)" {
+test "meta.deps names aescbc (the AES-CBC/PKCS7 primitive), entropy (R0), chachapoly (sealed pickles) and b64ct (session keys)" {
     try std.testing.expectEqualStrings("aescbc", meta.deps[0]);
     try std.testing.expectEqualStrings("entropy", meta.deps[1]);
     try std.testing.expectEqualStrings("chachapoly", meta.deps[2]);
-    try std.testing.expectEqual(@as(usize, 3), meta.deps.len);
+    try std.testing.expectEqualStrings("b64ct", meta.deps[3]);
+    try std.testing.expectEqual(@as(usize, 4), meta.deps.len);
 }
 
 test "meta.role is .util (no owned transport/socket)" {

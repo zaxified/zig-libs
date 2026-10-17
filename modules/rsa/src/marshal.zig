@@ -19,6 +19,7 @@
 const std = @import("std");
 const root = @import("root.zig");
 const montint = @import("montint");
+const b64ct = @import("b64ct");
 
 const MontParams = montint.DynModint(root.max_modulus_bits);
 const MontElem = MontParams.Elem;
@@ -279,7 +280,7 @@ fn pemFromTail(out: []u8, der_len: usize, label: []const u8) MarshalError![]u8 {
         const n = @min(48, der_len - i);
         @memcpy(chunk[0..n], out[der_at + i ..][0..n]);
         std.debug.assert(o + 65 <= der_at + i + n or i + n == der_len); // never overwrites unread DER
-        o += std.base64.standard.Encoder.encode(out[o..], chunk[0..n]).len;
+        o += b64ct.standard.encode(out[o..], chunk[0..n]).len; // constant time: the DER may be a private key
         out[o] = '\n';
         o += 1;
     }

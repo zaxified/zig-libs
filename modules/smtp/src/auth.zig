@@ -48,7 +48,7 @@ const b64 = std.base64.standard;
 // Not std's encoder for the credential: it indexes its alphabet by the secret
 // (with the old per-byte `checkCredential`: 312 memcheck contexts, ctgrind
 // `smtp/auth`, 2026-10-10; 6 after, the single validity verdict per call).
-const b64ct = @import("b64ct.zig");
+const b64ct = @import("b64ct").standard;
 
 /// The two challenges LOGIN uses, base64 as they appear on the wire.
 pub const login_username_challenge = "VXNlcm5hbWU6"; // "Username:"

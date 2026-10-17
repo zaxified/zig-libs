@@ -58,7 +58,7 @@ pub const meta = .{
     .model_after = "golang.org/x/crypto/acme + certbot flow semantics; RFC 8555/7515/7638/8737 wire",
     // entropy: the seed behind `jws.generateKeyPair` — the account key and
     // every certificate key this client mints.
-    .deps = .{ "http", "router", "entropy", "p256", "p384", "p521", "rsa", "netaddr", "x509", "datefmt" }, // datefmt: RFC 3339 times in ARI responses; x509: every read of a CA-supplied certificate (notAfter, ARI CertID, issuer CN); netaddr: IP identifiers (RFC 8738); p256/p384/p521: the burned ECDSA signers (ES256, ES384, ES512 keys); rsa: RS256 keys (PKCS#1 v1.5 signer/verifier, PEM/SPKI codecs, keygen); also uses std.json
+    .deps = .{ "http", "router", "entropy", "p256", "p384", "p521", "rsa", "netaddr", "x509", "datefmt", "b64ct" }, // b64ct: the account/certificate private-key PEM (constant time); datefmt: RFC 3339 times in ARI responses; x509: every read of a CA-supplied certificate (notAfter, ARI CertID, issuer CN); netaddr: IP identifiers (RFC 8738); p256/p384/p521: the burned ECDSA signers (ES256, ES384, ES512 keys); rsa: RS256 keys (PKCS#1 v1.5 signer/verifier, PEM/SPKI codecs, keygen); also uses std.json
 };
 
 /// The ACME protocol client — see `Client.init` / `Client.obtain`.
@@ -134,7 +134,6 @@ test {
     _ = storage;
     _ = @import("manager_test.zig");
     // External anchor: Pebble's answers, replayed (tools/pebble.sh).
-    _ = @import("b64ct.zig");
     _ = @import("pebble_replay_test.zig");
     _ = @import("stackprobe_test.zig");
     _ = @import("stackprobe2_test.zig");

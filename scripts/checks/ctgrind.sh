@@ -260,6 +260,8 @@ declare -A TARGETS=(
     [aesgcm]="ctx stateless generic"
     # ── 2026-10-09: ripemd160 (unkeyed; the MESSAGE is the secret) ─────────
     [ripemd160]="hash hash160"
+    # ── 2026-10-17: b64ct (secret octets in, secret text out, and back) ────
+    [b64ct]="encode decode ignore"
     # ── 2026-10-09: consumed modules (ct-wave): MESSAGE-INTEGRITY key /
     # long-term password, CSRF key + session id, MQTT password + auth data ──
     [stun]="mi ltkey"
@@ -373,6 +375,7 @@ declare -A MODES=(
     [bip32]="ReleaseFast"
     [aesgcm]="ReleaseFast"
     [ripemd160]="ReleaseFast"
+    [b64ct]="ReleaseFast"
     [stun]="ReleaseFast"
     [sessions]="ReleaseFast"
     [mqtt]="ReleaseFast"
@@ -678,6 +681,9 @@ declare -A PATTERN=(
     [threshold_ecdsa/betaprime]='signing[.]zig|presign[.]zig|ecproofs[.]zig|root[.]zig|mta[.]zig|zkproofs[.]zig|montint[.]zig|asm_core[.]zig|limbs[.]zig|ff[.]zig|secp256k1[.]zig|secp256k1_64[.]zig|secp256k1_scalar_64[.]zig|common[.]zig|ecdsa[.]zig|scalar[.]zig|mem[.]zig|int[.]zig|math[.]zig|memcpy[.]zig|memmove[.]zig|compiler_rt[.]zig'
     [ripemd160/hash]='root[.]zig'
     [ripemd160/hash160]='root[.]zig|sha2[.]zig'
+    [b64ct/encode]='root[.]zig'
+    [b64ct/decode]='root[.]zig'
+    [b64ct/ignore]='root[.]zig'
     [stun/mi]='root[.]zig|hmac[.]zig|Sha1[.]zig|timing_safe[.]zig'
     [stun/ltkey]='root[.]zig|md5[.]zig'
     [sessions/csrf]='root[.]zig|csrf[.]zig|idhex[.]zig|hmac[.]zig|sha2[.]zig|timing_safe[.]zig'
@@ -941,6 +947,9 @@ declare -A LABEL=(
     [aesgcm/generic]='aesgcm Context generic+std (key+pt)'
     [ripemd160/hash]='ripemd160 hash+stream (message tainted)'
     [ripemd160/hash160]='ripemd160 hash160 = std sha256+ours'
+    [b64ct/encode]='b64ct encode, 4 variants + wrapped (octets tainted)'
+    [b64ct/decode]='b64ct decode, 4 variants (text tainted)'
+    [b64ct/ignore]='b64ct decodeIgnoring + decodePrefix on a PEM body'
     [stun/mi]='stun MESSAGE-INTEGRITY add+verify (key tainted)'
     [stun/ltkey]='stun longTermKey MD5 (password tainted)'
     [sessions/csrf]='sessions Csrf.token+verify (key tainted)'

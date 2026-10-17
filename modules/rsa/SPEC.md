@@ -414,6 +414,10 @@ version that applied it everywhere added ctgrind contexts to `rsa/keygen` (173 �
 
 ## Backlog / deferred
 
+- **Private-key PEM: a ctgrind target** — ✅ 2026-10-17 the base64 half: `marshal.zig` encodes and
+  `pemDecodeBody` decodes through the constant-time `b64ct` module (`standard.encode`,
+  `decodeIgnoring` with `pem_whitespace`). Still open: a ctgrind target over
+  `SecretKey.toPem`/`fromPem`, which would also measure the DER marshalling around it. Original text:
 - **Private-key PEM base64 is not constant-time** *(2026-10-16, found while wiring RSA into `acme`)*:
   `marshal.zig:282` encodes and `root.zig:2681` decodes the private-key DER through std's base64
   alphabet tables — loads indexed by key bytes, the class ctgrind found in `acme`'s EC key PEM on

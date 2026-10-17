@@ -89,6 +89,7 @@
 //! `NOTICE` for the design-reference entry.
 
 const std = @import("std");
+const b64ct = @import("b64ct");
 
 /// Fast constant-time Montgomery modexp backend for the RSA hot path
 /// (private CRT op, non-CRT private op, public op). See `montint`'s SPEC.md.
@@ -124,7 +125,7 @@ pub const meta = .{
     .role = .util, // pure computation (no I/O, no wire framing of its own) -> util, not .codec
     .concurrency = .reentrant, // no shared/global state; PublicKey/SecretKey are plain value types
     .model_after = "RFC 8017 (PKCS#1 v2.2); std.crypto internal RSA (Certificate/rsa)",
-    .deps = .{ "montint", "aescbc", "aes192" }, // std.crypto.ff carrier + montint modexp hot path; aescbc/aes192: PBES2 encrypted PKCS#8
+    .deps = .{ "montint", "aescbc", "aes192", "b64ct" }, // b64ct: PEM base64 of private keys, constant time; std.crypto.ff carrier + montint modexp hot path; aescbc/aes192: PBES2 encrypted PKCS#8
 };
 
 /// Largest RSA modulus this module supports, in bits: 8192 since 2026-10-14
@@ -2678,9 +2679,10 @@ fn pemDecodeBody(text: []const u8) PemError!PemBlock {
     const ei = std.mem.indexOfPos(u8, text, body_start, end_marker) orelse return error.InvalidPem;
     const body = text[body_start..ei];
 
-    const dec = std.base64.standard.decoderWithIgnore(" \t\r\n");
+    // Constant time in the body's characters (a private key's DER), not
+    // std's table decoder: the alphabet lookup is indexed by the key.
     var block: PemBlock = .{ .label = label, .der_buf = undefined, .der_len = 0 };
-    const n = dec.decode(&block.der_buf, body) catch return error.InvalidPem;
+    const n = (b64ct.standard.decodeIgnoring(&block.der_buf, body, b64ct.pem_whitespace) catch return error.InvalidPem).len;
     if (n == 0) return error.InvalidPem;
     block.der_len = n;
     return block;

@@ -32,7 +32,7 @@
 const std = @import("std");
 const message = @import("message.zig");
 const burn = @import("burn.zig");
-const b64ct = @import("b64ct.zig");
+const b64ct = @import("b64ct").standard;
 const hmac = std.crypto.auth.hmac;
 
 /// TSIG algorithms (RFC 8945 §6). HMAC-SHA256 is the one §6 makes mandatory
@@ -96,7 +96,7 @@ pub const Key = struct {
 /// Decode a key's secret from the base64 a server configuration carries
 /// (BIND `secret "...";`, `nsupdate -y alg:name:secret`, `tsig-keygen`
 /// output) into `out` and return the written slice. Constant-time in the
-/// secret's characters (`b64ct.zig`); padded standard base64, no whitespace.
+/// secret's characters (the `b64ct` module); padded standard base64, no whitespace.
 /// `out.len` must be at least `b64.len / 4 * 3`. On error `out` is zeroed.
 pub fn decodeSecret(out: []u8, b64: []const u8) error{ InvalidSecret, BufferTooSmall }![]u8 {
     if (out.len < b64.len / 4 * 3) return error.BufferTooSmall;

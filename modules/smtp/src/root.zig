@@ -79,7 +79,7 @@ pub const meta = .{
     // belongs to the caller's Transport implementation.
     .concurrency = .single_owner,
     .model_after = "RFC 5321 (SMTP) + RFC 1869/2920/3207/4954/1870/6152/6531 (ESMTP) + RFC 5322/2045/2046/2047 (message format); behaviour cross-checked against a live aiosmtpd server and Python's email parser",
-    .deps = .{"netaddr"},
+    .deps = .{ "netaddr", "b64ct" }, // b64ct: the AUTH credential (constant time)
 };
 
 // ── top-level names (the ones a consumer actually types) ───────────────────
@@ -150,7 +150,6 @@ test {
     _ = command;
     _ = data;
     _ = auth;
-    _ = @import("b64ct.zig");
     _ = mime;
     _ = message;
     _ = session;

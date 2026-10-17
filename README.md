@@ -14,7 +14,7 @@ cross-project-reusable capability — a production-grade implementation of a pro
 or a fill for a genuine gap in the Zig ecosystem. zig-libs is the canonical home for these; the
 authors' other projects depend on it, not the reverse.
 
-**Status:** 248 modules (Zig 0.16, tests green in `ReleaseSafe` and `ReleaseFast`)
+**Status:** 249 modules (Zig 0.16, tests green in `ReleaseSafe` and `ReleaseFast`)
 · **MIT** (see `LICENSE`). `NOTICE` answers one question —
 whether consuming zig-libs obliges you to anything beyond MIT — and lists the modules that
 carry their own attribution; it does not catalogue provenance.
@@ -280,7 +280,7 @@ those crypto and format modules are yours too without going looking.
 | `web` | 36 | [`netaddr`](modules/netaddr/README.md) (net) · [`zstd`](modules/zstd/README.md) (format) · [`entropy`](modules/entropy/README.md) (crypto) · [`rsa`](modules/rsa/README.md) (crypto) · [`regex`](modules/regex/README.md) (format) · [`protobuf`](modules/protobuf/README.md) (format) · [`p256`](modules/p256/README.md) (crypto) |
 | `net` | 75 | [`http`](modules/http/README.md) (web) · [`ramcache`](modules/ramcache/README.md) (storage) · [`resilience`](modules/resilience/README.md) (web) · [`kvtree`](modules/kvtree/README.md) (storage) · [`rsa`](modules/rsa/README.md) (crypto) · [`xml`](modules/xml/README.md) (web) · [`x509`](modules/x509/README.md) (crypto) · [`tlsclient`](modules/tlsclient/README.md) (crypto) · [`sphinx`](modules/sphinx/README.md) (crypto) · [`aesgcm`](modules/aesgcm/README.md) (crypto) |
 | `storage` | 15 | [`zstd`](modules/zstd/README.md) (format) · [`crc32`](modules/crc32/README.md) (format) · [`crc32c`](modules/crc32c/README.md) (format) · [`hashdigest`](modules/hashdigest/README.md) (crypto) |
-| `crypto` | 84 | [`http`](modules/http/README.md) (web) · [`aescbc`](modules/aescbc/README.md) (web) |
+| `crypto` | 85 | [`http`](modules/http/README.md) (web) · [`aescbc`](modules/aescbc/README.md) (web) |
 | `format` | 25 | [`http`](modules/http/README.md) (web) · [`decimal`](modules/decimal/README.md) (storage) |
 | `os` | 13 | [`framing`](modules/framing/README.md) (format) |
 <!-- END GENERATED: check-libs-table -->
@@ -292,7 +292,7 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 <!-- BEGIN GENERATED: check-portable-table (source: build.zig; regenerate with `zig build gen-portable-table`; do not hand-edit) -->
 ### Portability — claimed vs. verified
 
-Every one of the 248 modules above claims `.linux64` (Linux, amd64 or arm64) — the collection's mandatory baseline (CONVENTIONS.md §4), and the one target actually **run**, not merely compiled: the CI full lane (a tag or `workflow_dispatch`) executes every module's tests in `ReleaseSafe` and `ReleaseFast`, plus a separate arm64 lane. That claim is not repeated below for all 248 modules — a linux64-only module has nothing further to show here.
+Every one of the 249 modules above claims `.linux64` (Linux, amd64 or arm64) — the collection's mandatory baseline (CONVENTIONS.md §4), and the one target actually **run**, not merely compiled: the CI full lane (a tag or `workflow_dispatch`) executes every module's tests in `ReleaseSafe` and `ReleaseFast`, plus a separate arm64 lane. That claim is not repeated below for all 249 modules — a linux64-only module has nothing further to show here.
 
 40 of them additionally claim a cross-compile target in `meta.targets` (CONVENTIONS.md §4). `zig build check-portable` *compiles* (never runs — none of these targets has a host to run on here) each declared pair TWICE — the test binary, and a second root that takes a reference to every non-generic public declaration, because Zig analyses a body only when something references it and a `pub fn` no test reaches would otherwise never meet this target at all — and checks the result against [`scripts/checks/portable-known-failures.tsv`](scripts/checks/portable-known-failures.tsv): of 43 declared pairs, 42 currently compile clean and 1 are known-failing, tracked there with the real compiler error rather than silently dropped.
 
@@ -366,7 +366,7 @@ way to recognise it.
 | [`aaa-gate`](modules/aaa-gate/README.md) | 3 (S,E,H,P) | Bearer + API-key auth (constant-time) + audit hook + denied-request throttle | any | router, http |
 | [`abuseguard`](modules/abuseguard/README.md) | 2 (S,A) | Per-IP + global connection caps, ban/greylist, strike→ban (accept-time) | posix | http, netaddr, router |
 | [`accesslog`](modules/accesslog/README.md) | 2 (S,A,P) | Structured HTTP access-log formatter — JSON Lines/logfmt/Apache Combined with log-injection escaping (untrusted UA/path/referer can't forge a line); http-request→Entry bridge; thread-safe group-commit `Sink` for one shared log file | any | http, router |
-| [`acme`](modules/acme/README.md) | 2 (S,A) | Let's Encrypt / ACME v2 (RFC 8555) client + autocert-style Manager — HTTP-01, TLS-ALPN-01, DNS-01 (wildcard), ARI renewal scheduling, storage, on-demand issuance, fleet locks, issuer fallback; EC/RSA keys, EAB, rollover, revocation | any | http, router, entropy, p256, p384, p521, rsa, netaddr, x509, datefmt |
+| [`acme`](modules/acme/README.md) | 2 (S,A) | Let's Encrypt / ACME v2 (RFC 8555) client + autocert-style Manager — HTTP-01, TLS-ALPN-01, DNS-01 (wildcard), ARI renewal scheduling, storage, on-demand issuance, fleet locks, issuer fallback; EC/RSA keys, EAB, rollover, revocation | any | http, router, entropy, p256, p384, p521, rsa, netaddr, x509, datefmt, b64ct |
 | [`acmedns`](modules/acmedns/README.md) | 3 (A) | ACME DNS-01: CNAME delegation, SOA zone walk, propagation check; RFC 2136+TSIG, acme-dns, httpreq, exec publishers | linux (exec publisher: posix process spawn) | acme, dns, http, netaddr, procrun |
 | [`aescbc`](modules/aescbc/README.md) | 2 (S,E,A) | AES-CBC (NIST SP800-38A): one-shot, incremental, streaming with six paddings, ciphertext stealing CS1-3; zero-alloc; padding-oracle caveat — consumers own authenticate-before-unpad | any | — |
 | [`aeskw`](modules/aeskw/README.md) | 3 (S,P) | RFC 3394 AES Key Wrap (AES-128/256 KEK) — constant-time integrity check + scratch zeroization, byte-exact vs RFC 3394 test vectors | any | aes192 |
@@ -409,7 +409,7 @@ way to recognise it.
 | [`p256`](modules/p256/README.md) *(crypto)* | 2 (S,E,A,P) | asm-accelerated NIST P-256 — Solinas field, constant-time comb sign, vartime wNAF verify; bit-exact vs `std.crypto.ecc.P256` and RFC 6979. | amd64 asm + portable fallback | — |
 | [`protobuf`](modules/protobuf/README.md) *(format)* | 3 (S,E,P) | Protocol Buffers wire format (proto3) codec — schema derived at comptime from Zig structs (oneof, map, well-known types incl. Any/Struct), no `.proto` compiler; untrusted-input hardened. | any | — |
 | [`regex`](modules/regex/README.md) *(format)* | 2 (S,A,P) | RE2-syntax regular expressions at parity with Go regexp — linear time, comptime compile, alloc-free match | any | — |
-| [`rsa`](modules/rsa/README.md) *(crypto)* | 2 (S,E,A,P) | Pure-Zig RSA (PKCS#1 v2.2, RFC 8017) — keygen, PKCS1-v1.5/PSS sign+verify, OAEP/PKCS1 encrypt+decrypt, DER/PEM/OpenSSH key parsing. | any | montint, aescbc, aes192 |
+| [`rsa`](modules/rsa/README.md) *(crypto)* | 2 (S,E,A,P) | Pure-Zig RSA (PKCS#1 v2.2, RFC 8017) — keygen, PKCS1-v1.5/PSS sign+verify, OAEP/PKCS1 encrypt+decrypt, DER/PEM/OpenSSH key parsing. | any | montint, aescbc, aes192, b64ct |
 | [`zstd`](modules/zstd/README.md) *(format)* | 2 (S,E,A,P) | Zstandard (RFC 8878) compressor, levels 1-22 and negative levels — byte-identical to libzstd 1.5.7 `ZSTD_compress2` and `ZSTD_compressStream2`, with libzstd's advanced parameters (magicless frames, explicit window/strategy, splitters, block size, long-distance matching as `--long`, targetCBlockSize superblocks), the sequence-level API (compressSequences, generateSequences, a block-level sequence producer) and reusable contexts in one workspace of exactly estimated size, caller-provided if wanted — and a decoder ported from libzstd's, one-shot and streaming (`ZSTD_decompressStream`, a `std.Io.Reader`), checksums, concatenated and skippable frames, frame queries | any | — |
 
 ### Networking
@@ -423,7 +423,7 @@ way to recognise it.
 | [`devlink`](modules/devlink/README.md) | 4 (S) | Linux devlink over genetlink — device/port enumeration, port split/unsplit, parameter/resource inspection, region snapshots, health reporters, eswitch mode | **linux** | genetlink, netlink |
 | [`df-elect`](modules/df-elect/README.md) | 4 (S) | EVPN-style Designated-Forwarder election for N-member segments (RFC 7432 mod-N, RFC 8584 HRW) with DF-wait failover + split-horizon, from a link-state flood; model-checked in netsim | any | netsim |
 | [`dnp3`](modules/dnp3/README.md) | 4 (S) | DNP3 (IEEE 1815) base protocol — data-link framing + CRC-16/DNP, application layer, core object library; master + outstation; Secure Authentication v2 symmetric core (g120), no SAv5/6 asymmetric key change | any | aeskw |
-| [`dns`](modules/dns/README.md) | 3 (S,P) | RFC 1035 resolver — A/AAAA/PTR/CNAME/NS/MX/TXT/SOA/SRV/CAA over UDP/TCP + DoH; RFC 2136 update + TSIG | any | netaddr, http |
+| [`dns`](modules/dns/README.md) | 3 (S,P) | RFC 1035 resolver — A/AAAA/PTR/CNAME/NS/MX/TXT/SOA/SRV/CAA over UDP/TCP + DoH; RFC 2136 update + TSIG | any | netaddr, http, b64ct |
 | [`dnssec`](modules/dnssec/README.md) | 3 (S,P) | Resolver-side DNSSEC validation (RFC 4033/4034/4035 + NSEC3) — DNSKEY/RRSIG/DS parsing, signature verify (ECDSA/Ed25519/RSA), NSEC/NSEC3 denial-of-existence | any | dns, rsa, base32 |
 | [`ebpf`](modules/ebpf/README.md) | 4 (S) | eBPF program generation over `std.os.linux.bpf` — bytecode builders (kprobe counter, XDP filter, ring-buffer emitter); real-kernel verifier acceptance unverified in CI | **linux** | netlink |
 | [`enip`](modules/enip/README.md) | 4 (S) | EtherNet/IP + CIP — encapsulation layer (register/SendRRData/SendUnitData), CIP messaging, connection manager, tag/symbolic path client for Logix controllers | any | netaddr |
@@ -475,7 +475,7 @@ way to recognise it.
 | [`seqmap`](modules/seqmap/README.md) | 3 (S,E,P) | Fixed 65,536-slot 16-bit request/reply correlation map, O(1) | any | — |
 | [`shardstore`](modules/shardstore/README.md) | 3 (S,P) | Key-sharding router over N independent `kvtree` stores — multi-core write parallelism (per-shard single-writer, cross-shard parallel) | any | kvtree |
 | [`simio`](modules/simio/README.md) | 3 (S,P) | Deterministic std.Io for simulation testing — real std.Io code runs unchanged on fibers in virtual time, over simulated streams, datagrams and ICMP on routed faulty links, a crash-consistent disk, host crashes and a shrinking fault search | linux (x86_64, aarch64, riscv64: std.Io.fiber) | netsim |
-| [`smtp`](modules/smtp/README.md) | 3 (S,A,P) | SMTP client (RFC 5321) — ESMTP EHLO negotiation, STARTTLS seam, AUTH PLAIN/LOGIN, pipelining, MIME message composition (RFC 5322/2045) | any | netaddr |
+| [`smtp`](modules/smtp/README.md) | 3 (S,A,P) | SMTP client (RFC 5321) — ESMTP EHLO negotiation, STARTTLS seam, AUTH PLAIN/LOGIN, pipelining, MIME message composition (RFC 5322/2045) | any | netaddr, b64ct |
 | [`snmp`](modules/snmp/README.md) | 3 (S,P) | SNMP v1/v2c/v3 — BER/ASN.1 codec, manager client (get/next/bulk/set/walk) + trap/notification receiver + USM auth (HMAC-MD5/SHA-1 and RFC 7860 SHA-224/256/384/512, constant-time) and privacy (DES-CBC, AES-128-CFB), KAT- and net-snmp-anchored | any | — |
 | [`sntp`](modules/sntp/README.md) | 3 (S,P) | SNTP client (RFC 4330) — NTP packet codec + UDP query, clock offset / round-trip delay | any | — |
 | [`spbfib`](modules/spbfib/README.md) | 4 (S) | SPB (802.1aq) forwarding addressing — unicast B-MAC FIB from an `isis-spf` route table + SPBM multicast-DA construction; one congruent ECT path per dest, no per-flow ECMP | any | isis-spf |
@@ -501,7 +501,7 @@ way to recognise it.
 | [`kvtree`](modules/kvtree/README.md) *(storage)* | 2 (S,A,P) | Ordered transactional KV store — copy-on-write B-tree (LMDB/BoltDB lineage), MVCC snapshots, crash-safe range scans. | any | kv, crc32 |
 | [`ramcache`](modules/ramcache/README.md) *(storage)* | 2 (S,E,A,P) | Bounded in-memory cache — W-TinyLFU admission/eviction, TTL, generation invalidation; sharded thread-safe wrapper. | any | — |
 | [`resilience`](modules/resilience/README.md) *(web)* | 2 (S,A,P) | Circuit breaker (consecutive or failure-rate window) + retry/backoff + timeout + bulkhead for calling upstreams (generic, zero-alloc) | posix | — |
-| [`rsa`](modules/rsa/README.md) *(crypto)* | 2 (S,E,A,P) | Pure-Zig RSA (PKCS#1 v2.2, RFC 8017) — keygen, PKCS1-v1.5/PSS sign+verify, OAEP/PKCS1 encrypt+decrypt, DER/PEM/OpenSSH key parsing. | any | montint, aescbc, aes192 |
+| [`rsa`](modules/rsa/README.md) *(crypto)* | 2 (S,E,A,P) | Pure-Zig RSA (PKCS#1 v2.2, RFC 8017) — keygen, PKCS1-v1.5/PSS sign+verify, OAEP/PKCS1 encrypt+decrypt, DER/PEM/OpenSSH key parsing. | any | montint, aescbc, aes192, b64ct |
 | [`sphinx`](modules/sphinx/README.md) *(crypto)* | 4 (S) | Lightning BOLT#4 Sphinx onion routing — forward ECDH blinding chain, layered packet construction, constant-time layer peeling. | any | k256 |
 | [`tlsclient`](modules/tlsclient/README.md) *(crypto)* | 2 (S,E,A,P) | std's TLS 1.3/1.2 client with the server chain verified by RFC 5280 (x509.verifyChain) — closes ziglang/zig #35877 — grown to Go crypto/tls client parity: Go's defaults (2 key shares + HelloRetryRequest, OCSP/SCT, EMS), client certificates incl. RSA and TLS 1.2, session view + verification hook, exporter, TLS 1.3 resumption. | any | x509, p256, p384, p521, rsa, tlsresume |
 | [`x509`](modules/x509/README.md) *(crypto)* | 2 (S,E,A,P) | X.509 certificate-chain / path validation (RFC 5280 §6) — trust-store chain building, extension, name, and signature checks, including post-quantum ML-DSA (RFC 9881) and SLH-DSA (RFC 9882) certificates, plus CRL revocation checking (RFC 5280 §6.3). | any | rsa, slhdsa, p521, p256, netaddr |
@@ -544,6 +544,7 @@ way to recognise it.
 | [`aeadframe`](modules/aeadframe/README.md) | 3 (S,P) | Per-key AEAD record layer — seal/open with a monotonic nonce (never reused), epoch rekey, anti-replay window, AAD binding. | any | chachapoly |
 | [`aes192`](modules/aes192/README.md) | 2 (S,E,A,P) | AES-192 block cipher (FIPS-197 Nk=6/Nr=12) on std's AES-NI / ARMv8 / software round primitive, shaped like std's Aes128/Aes256 so modes can be generic over it | any (AES-NI / ARMv8 Crypto via std, software fallback) | — |
 | [`aesgcm`](modules/aesgcm/README.md) | 2 (S,E,A,P) | AES-GCM (AES-128/192/256; any nonce length, SP 800-38D tag lengths) — stateful context caching the key schedule and GHASH powers, x86-64 AES-NI+PCLMULQDQ stitched one-pass kernel picked at run time, std fallback; std-shaped stateless API. | any (x86-64 AES-NI/PCLMULQDQ asm, run-time detected + std fallback) | aes192 |
+| [`b64ct`](modules/b64ct/README.md) | 2 (S,P) | Constant-time base64 (RFC 4648 standard and URL alphabets, padded and unpadded) for secrets: no secret-indexed table or branch; libsodium's strictness, ignore set, prefix decode, PEM line wrapping. | any | — |
 | [`bbs`](modules/bbs/README.md) | 3 (S,P) | BBS selective-disclosure signatures over `bls12_381` (draft-irtf-cfrg-bbs-signatures-12) — sign many messages, later reveal a chosen subset in zero knowledge. | any | bls12_381, entropy |
 | [`bech32`](modules/bech32/README.md) | 3 (S,P) | Bitcoin address encodings — bech32 (BIP173) / bech32m (BIP350) codec, segwit address encode/decode, base58check, P2PKH/P2WPKH. | any | ripemd160 |
 | [`bfv`](modules/bfv/README.md) | 4 (S,E) | BFV leveled homomorphic encryption (Fan-Vercauteren) over `Z_q[X]/(X^N+1)`, RNS — exact-integer keygen/encrypt/decrypt/multiply/relinearize. **No security level claimed.** | any | entropy |
@@ -583,7 +584,7 @@ way to recognise it.
 | [`lms`](modules/lms/README.md) | 3 (S,E,P) | LMS / HSS (RFC 8554), SHA-256 — **stateful** hash-based signatures (SP 800-208, CNSA 2.0). A leaf signs once; `sign` advances the position first. | any | — |
 | [`lninvoice`](modules/lninvoice/README.md) | 3 (S,P) | Lightning BOLT#11 payment requests (+ BOLT#12 offer decode) — decode/verify and encode/sign, with node-pubkey signature recovery. | any | bech32, k256, lnwire, bip340 |
 | [`lnwire`](modules/lnwire/README.md) | 3 (S,P) | Lightning BOLT#1/2/7 wire messages — base frame, BigSize/TLV codec, channel-management (incl. reestablish) and gossip messages, address descriptors and feature bits, over `bolt8`. | any | — |
-| [`megolm`](modules/megolm/README.md) | 3 (S,E,P) | Megolm — Matrix's group-messaging ratchet: a one-way HMAC hash ratchet (fast-forward only, never rewinds) plus Ed25519-signed message frames. | any | aescbc, entropy, chachapoly |
+| [`megolm`](modules/megolm/README.md) | 3 (S,E,P) | Megolm — Matrix's group-messaging ratchet: a one-way HMAC hash ratchet (fast-forward only, never rewinds) plus Ed25519-signed message frames. | any | aescbc, entropy, chachapoly, b64ct |
 | [`minisign`](modules/minisign/README.md) | 3 (H,P) | minisign file format (jedisct1/minisign) — Ed25519 sign/verify for signed files/releases, including scrypt-encrypted secret keys. | any | entropy |
 | [`mls`](modules/mls/README.md) | 4 (S) | MLS — Messaging Layer Security (RFC 9420): cipher-suite/codec foundation plus TreeKEM (ratchet tree), for scalable group messaging. | any | hpke |
 | [`montint`](modules/montint/README.md) | 2 (S,A,P) | Constant-time Montgomery modular arithmetic over arbitrary odd moduli — faster native-Zig alternative to `std.crypto.ff`, x86-64 asm + portable fallback. | x86-64 asm + portable fallback | — |
@@ -604,7 +605,7 @@ way to recognise it.
 | [`quic-crypto`](modules/quic-crypto/README.md) | 3 (S,P) | RFC 9001 (TLS for QUIC) crypto seam — secret derivation, AEAD packet protection, header protection, key update, Retry integrity tag, QUIC v1 + v2 (RFC 9369); engine-agnostic. | any | chachapoly |
 | [`rescue`](modules/rescue/README.md) | 3 (S,A,P) | Rescue-Prime Optimized (RPO) — arithmetization-oriented hash over the Goldilocks field, the alternative to `poseidon` for STARK circuits. | any | — |
 | [`ripemd160`](modules/ripemd160/README.md) | 2 (S,E,A,P) | RIPEMD-160 (ISO/IEC 10118-3) streaming hash, plus `hash160` (`RIPEMD160(SHA256(x))`), the Bitcoin pubkey-hash primitive. | any | — |
-| [`rsa`](modules/rsa/README.md) | 2 (S,E,A,P) | Pure-Zig RSA (PKCS#1 v2.2, RFC 8017) — keygen, PKCS1-v1.5/PSS sign+verify, OAEP/PKCS1 encrypt+decrypt, DER/PEM/OpenSSH key parsing. | any | montint, aescbc, aes192 |
+| [`rsa`](modules/rsa/README.md) | 2 (S,E,A,P) | Pure-Zig RSA (PKCS#1 v2.2, RFC 8017) — keygen, PKCS1-v1.5/PSS sign+verify, OAEP/PKCS1 encrypt+decrypt, DER/PEM/OpenSSH key parsing. | any | montint, aescbc, aes192, b64ct |
 | [`sealedbox`](modules/sealedbox/README.md) | 3 (P) | NaCl `crypto_box_seal` — anonymous-sender X25519 public-key encryption, plus base64/hex key serialization. | any | ct25519 |
 | [`sha2`](modules/sha2/README.md) | 3 (S,E,P) | SHA-224/256/384/512 (FIPS 180-4) — drop-in for std.crypto.hash.sha2 (also under std's Hmac/Hkdf); an AVX2 multi-block message schedule makes runs of 2+ blocks 1.24–1.40× std on x86-64 without SHA-NI, std's own SHA-NI/ARMv8 path where the target has it. | any (AVX2 SIMD schedule on x86-64 + portable scalar fallback) | — |
 | [`signal`](modules/signal/README.md) | 4 (S) | Signal Protocol — X3DH and PQXDH key agreement, XEdDSA signing, and the Double Ratchet: E2EE sessions with forward secrecy, post-compromise security and a post-quantum initial handshake. | any | chachapoly, ct25519, entropy |

@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-08-06 · mutation 2026-08-13 · src ?
 
-**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, MEGOLM_FUZZ) · ct 2026-10-10 (ctgrind: ratchet + signing key through encrypt/decrypt, session-key base64, sealed pickles; `msg` 16 / `skey` 26 / `pickle` 26 in-file, none a megolm branch on a key, after the b64ct fix — `skey` was 40)
+**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, MEGOLM_FUZZ) · ct 2026-10-17 (ctgrind: ratchet + signing key through encrypt/decrypt, session-key base64, sealed pickles; `msg` 16 / `skey` 23 / `pickle` 26 in-file, none a megolm branch on a key; `skey` was 40 before the private b64ct copy (2026-10-10), 26 with it, 23 with the `b64ct` module)
 **Performance:** not measured
 
 **Known defects:** none recorded
