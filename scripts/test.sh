@@ -2165,6 +2165,13 @@ cmd_interop() {
             ZL_STEP_STDERR_IS_OUTPUT=1 step "interop-$m" timeout -k 10 900 modules/acme/tools/pebble.sh --check
             continue
         fi
+        # acmedns likewise: tools/interop.sh starts its DNS/API peer and Pebble
+        # (resolving through that peer), then runs `zig build interop-acmedns`
+        # with the ports. Called bare, the program only prints its usage.
+        if [[ "$m" == acmedns ]]; then
+            ZL_STEP_STDERR_IS_OUTPUT=1 step "interop-$m" timeout -k 10 900 modules/acmedns/tools/interop.sh
+            continue
+        fi
         # `timeout`: a program whose peer never answers must fail by name, not
         # hold the lane until the job is cancelled (interop-mqtt, 2026-10-07:
         # 22 minutes, and every program after it never ran).

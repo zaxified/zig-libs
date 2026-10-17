@@ -93,7 +93,11 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         check(if (z) |v| std.mem.eql(u8, v, "example.org") else |_| false, "findZone(_acme-challenge.www.example.org) = example.org", .{});
         const z2 = acmedns.zone.findZone(&r, "x.y.auth.delegated.test.", &buf);
         check(if (z2) |v| std.mem.eql(u8, v, "delegated.test") else |_| false, "findZone(x.y.auth.delegated.test.) = delegated.test", .{});
-        check(acmedns.zone.findZone(&r, "nothing.invalid", &buf) == error.ZoneNotFound, "findZone(nothing.invalid) = ZoneNotFound", .{});
+        // The peer is authoritative only and REFUSEs a name outside its zones;
+        // since the 2026-10-16 review findZone reads that as "could not find
+        // out" (ResolverFailed), never as "no zone" -- a recursive resolver's
+        // NXDOMAIN is what yields ZoneNotFound (the solver path: src/solver_test.zig).
+        check(acmedns.zone.findZone(&r, "nothing.invalid", &buf) == error.ResolverFailed, "findZone(nothing.invalid) under a REFUSED = ResolverFailed", .{});
         const c = acmedns.zone.followCname(&r, "_acme-challenge.cname.example.org", &buf);
         check(if (c) |v| std.mem.eql(u8, v, "_acme-challenge.target.delegated.test") else |_| false, "followCname across zones", .{});
         const p = acmedns.zone.followCname(&r, "plain.example.org", &buf);

@@ -343,6 +343,23 @@ sudo apt-get install "${APT_QUIET[@]}" rsyslog >/dev/null 2>&1 \
     && echo "rsyslogd: $(/usr/sbin/rsyslogd -v 2>/dev/null | head -1)" || echo "rsyslog: install failed"
 echo "::endgroup::"
 
+echo "::group::interop: acmedns, brotli, b64ct peers"
+# acmedns: tools/peer.py (system python3 -I) needs dnspython, the Exec
+# publisher needs BIND's nsupdate; Pebble comes from the acme group above.
+sudo apt-get install "${APT_QUIET[@]}" bind9-dnsutils libbrotli-dev >/dev/null 2>&1 \
+    && echo "nsupdate, libbrotli-dev: OK" || echo "nsupdate/libbrotli-dev: install failed"
+sudo pip3 install --break-system-packages -q --root-user-action=ignore "dnspython==2.8.0" >/dev/null 2>&1 \
+    && echo "dnspython: 2.8.0" || echo "dnspython: install failed"
+# b64ct: libsodium's codecs.c at the path tools/interop.zig reads, pinned by
+# hash (the program compiles it; the pin is the review).
+SODIUM_DIR=.zig-cache/foreign/libsodium-1.0.22
+mkdir -p "$SODIUM_DIR" \
+    && curl -fsSL -o "$SODIUM_DIR/codecs.c" \
+        https://raw.githubusercontent.com/jedisct1/libsodium/1.0.22-RELEASE/src/libsodium/sodium/codecs.c \
+    && echo "77e675be30ecd8776e0924596bbf305cbc44f41d8df3238fd65c03aa99091b3e  $SODIUM_DIR/codecs.c" | sha256sum -c --quiet \
+    && echo "libsodium codecs.c: 1.0.22" || { rm -f "$SODIUM_DIR/codecs.c"; echo "libsodium codecs.c: fetch or hash check failed"; }
+echo "::endgroup::"
+
 echo "::group::interop: browser oracles (cors security-headers: bun + Chrome)"
 # bun lands in ~/.bun/bin, where tools/interop.zig looks after PATH. Chrome is
 # found on PATH; the hosted image ships google-chrome.

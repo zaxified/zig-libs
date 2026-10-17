@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-17** — Browser oracle (`tools/browser_oracle.js`) sees an out-of-process iframe: with the default `Origin-Agent-Cluster: ?1` Chrome isolates the origin and the framed page left the parent's frame tree, so `relaxed` read as not framed; the oracle now asks the iframe target its own location (a refused frame is chrome-error://). Tooling only.
+
 - **2026-10-17** — Example: the `init` error switches name `InvalidHstsPreload` (the example no longer compiled). Example only.
 
 - **2026-10-17** — `csp.renderNonce`/`applyCspNonce`: `error.NonceDirectiveInvalid` for a nonce on a `'none'` source list (it silently turned "nothing" into "this nonce") or on a non-source-list directive; documented that a nonce disables `'unsafe-inline'` in the same directive (CSP semantics).

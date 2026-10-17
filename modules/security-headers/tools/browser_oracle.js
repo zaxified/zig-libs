@@ -245,9 +245,23 @@ async function main() {
         try { w && w.close(); } catch (_) {}
         return { corpImg: img, severed };
       })()`);
+      // An in-process child is in the parent's frame tree; an out-of-process
+      // one (site isolation -- the module's default Origin-Agent-Cluster: ?1,
+      // since 2026-10-17, gives each origin its own process) only shows up as
+      // an "iframe" target, whose url is the REQUESTED one even when the frame
+      // was refused. So ask the frame itself: a refused frame commits to
+      // chrome-error://, a framed page reports A/page.
       const tree = await c.send("Page.getFrameTree", {}, otherTab.sessionId);
       const kids = tree.frameTree.childFrames || [];
-      const framed = kids.some((f) => f.frame.url === A + "/page");
+      let framed = kids.some((f) => f.frame.url === A + "/page");
+      const iframes = (await c.send("Target.getTargets", { filter: [{ type: "iframe" }] })).targetInfos || [];
+      for (const t of iframes) {
+        if (framed || t.url !== A + "/page") continue;
+        const { sessionId: fs } = await c.send("Target.attachToTarget", { targetId: t.targetId, flatten: true });
+        const r = await c.send("Runtime.evaluate", { expression: "location.href", returnByValue: true }, fs);
+        framed = r.result.value === A + "/page";
+        await c.send("Target.detachFromTarget", { sessionId: fs });
+      }
       await evaluate(c, otherTab.sessionId, `document.querySelectorAll("iframe").forEach((f) => f.remove()); 1`);
       const got = { ...page, framed, ...cross, complaints: [...new Set(complaints.get(sessionId).filter(isComplaint))].sort() };
       results.push({ k, got });
