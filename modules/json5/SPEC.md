@@ -213,6 +213,16 @@ Full JSON5 spec gaps — **all struck through 2026-09-30, see the two DONE items
   (the reference refuses e.g. an emoji key; this module quotes it). Exact classes need Unicode
   general-category tables (Lu Ll Lt Lm Lo Nl / Mn Mc Nd Pc) — none in this module or a sibling.
   Effort: medium (a generated range table, pinned to one Unicode version). Fits §2.
+- **`Diagnostic` column + user-facing message** (request from bxp, 2026-10-17): `Diagnostic`
+  carries only `line` and a static message for `NonFiniteNumber` / `HexLiteralTooLarge`, so a
+  consumer cannot put a caret under the literal; the message also names a library option
+  (`Options{ .non_finite = .quoted }`), advice for the integrator, not for whoever wrote the
+  JSON5. Wanted: `col` (1-based, unit documented — bytes) plus `offset`/`len` of the literal,
+  and the API hint split into a separate `hint` field so `message` stays end-user text.
+  Expected because std.json's `Diagnostics` gives line + column and the reference `JSON5.parse`
+  reports `lineNumber` + `columnNumber`; the scanner already knows the literal's byte offset.
+  Consumer workaround to delete afterwards: bxp `bxp-core/src/config.zig` `diagPreprocessError`
+  (marked `zig-libs request: json5 — Diagnostic ... no column`). Effort: small. Fits §2.
 - Formalizing `AnnotatedResult` against a future `diagnostics` module (currently a raw
   `{ out, next_id }` pair; no structured line/col/severity type yet).
 - **DONE 2026-09-30 — JSON5 numeric literals** *(survey 2026-09-30)*: rewrite hex (`0x1A`), leading/trailing-dot (`.5`, `5.`) and `+`-signed numbers to JSON numbers; `Infinity`/`NaN` decided 2026-09-30: **an error by default** (`+Infinity`, `-Infinity`, `NaN` refused with a
