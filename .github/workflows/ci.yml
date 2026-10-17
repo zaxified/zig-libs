@@ -532,7 +532,9 @@ jobs:
           # Everything mode- and arch-independent, once for the whole matrix:
           # the tables, the catalog, `check-portable` (which cross-compiles from
           # wherever it runs), the ctgrind harnesses, the sizeprobe.
-          lanes+=('{"name":"checks","args":"","cmd":"checks","cachekey":"checks","cache":false,"runner":"ubuntu-26.04","peers":"","tc":false,"timeout":15,"skip_live":""}')
+          # Timeout 60 (was 15): on run 39006420736 (2026-10-17) the cold
+          # `check-testonly` alone ran past 14 min, so no other check ran.
+          lanes+=('{"name":"checks","args":"","cmd":"checks","cachekey":"checks","cache":false,"runner":"ubuntu-26.04","peers":"","tc":false,"timeout":60,"skip_live":""}')
           # ⭐ A PINNED CPU ON EVERY amd64 LANE THAT STAMPS (2026-09-18), for
           # the push lane's reason: GitHub's amd64 pool mixes CPU models, and
           # with `native` a stamp holds only on the model that earned it. On
@@ -682,7 +684,9 @@ jobs:
           # ⚠ amd64 ONLY. Interop asks whether our bytes and a third party's
           # agree, which is not an architecture-dependent claim — the same
           # reasoning `skip_live` uses for opcua's emulated container.
-          lanes+=('{"name":"interop ReleaseSafe amd64","args":"-Doptimize=ReleaseSafe","cmd":"interop","cachekey":"interop","cache":false,"runner":"ubuntu-26.04","peers":"interop","tc":false,"timeout":30,"skip_live":""}')
+          # Timeout 90 (was 30): on run 39006420736 (2026-10-17) the lane was
+          # still compiling `check-interop` (98 steps) when 30 min ran out.
+          lanes+=('{"name":"interop ReleaseSafe amd64","args":"-Doptimize=ReleaseSafe","cmd":"interop","cachekey":"interop","cache":false,"runner":"ubuntu-26.04","peers":"interop","tc":false,"timeout":90,"skip_live":""}')
 
           # ⭐ THE CONSTANT-TIME MEASUREMENT, added 2026-09-08 (audit R14/1).
           # `check-ctgrind` in the `checks` lane only COMPILES the harnesses --
