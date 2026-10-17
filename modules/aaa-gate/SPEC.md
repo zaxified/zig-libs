@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, AAA_GATE_FUZZ) · ct none
 
-**Performance:** not measured
+**Performance:** ref 0.10–2.37× labstack/echo v5.4.0 · fastest ? (measured 2026-10-17)
 
 **Evidence:** model-fuzz — the decision table (`verify`/`verifyApiKey`/`verifyBasic` under add/remove rotation, verifier callbacks, open plane) against plain credential lists, and the denied-request throttle end to end on the wire against an array model of its documented rule (window, fold, idle sweep, LRU cap); 3 planted mutants all killed (2026-10-17)
 
