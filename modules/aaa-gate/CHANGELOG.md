@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-17** — **NO CONSUMER-VISIBLE CHANGE:** constant-time evidence — `src/ctgrind_harness.zig` (`scripts/checks/ctgrind.sh aaa-gate`): the stored token / API-key / Basic digests tainted in place, `verify*` with a good and a bad credential; in-file 2 per target = the two verdicts, controls and traps 0; pinned in `ctgrind-expected.tsv`.
+
 - **2026-10-17** — Benchmark: verdict now like for like (owner decision) — echo with a validator giving the same guarantee (SHA-256 digests, compare every one) → 0.11–0.87×; echo's raw-key validator printed as `_raw` information (header success rows ~2x: one software SHA-256 per request on a CPU without SHA-NI). Basic rows added. Tooling only, no code change.
 
 - **2026-10-17** — Comparative benchmark against labstack/echo v5.4.0 `middleware.KeyAuth` (`tools/bench.zig`, `tools/go_bench/`, `zig build bench-aaa-gate`): bearer, API key in header and in query, denied and no credential, router + middleware + response over pre-parsed requests, net of a no-middleware twin; ours/echo 0.10–2.37 (x86-64; the two header-lookup success rows are over 1.1×, see `tools/README.md`). Tooling only, no code change.

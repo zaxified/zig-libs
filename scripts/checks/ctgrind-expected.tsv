@@ -1516,3 +1516,14 @@ jwt	ReleaseFast	ec	1	9	09a37a7fa79b4936	6c14c21a4454880c
 # r⁻¹ checks run mod the secret p, q, folded into ONE branch-once verdict that
 # is false only for r ≡ 0 mod p or q (~2^-1023) and only causes a redraw.
 jwt	ReleaseFast	rsa	1	3	09a37a7fa79b4936	f2bee89c3c58cdaf
+# aaa-gate (2026-10-17) — the secrets are the gate's stored SHA-256 fingerprints
+# (tokens, API keys, Basic user:password), tainted in place; the presented value
+# is the client's own and the verdict is public. Each target verifies a good and
+# a bad credential: exact 2 = the `if` on the digest scan's single bool in
+# `verify`/`verifyApiKey`/`verifyBasic`, once per call (the verdict). The scan
+# (`containsFp`, timing_safe.eql folded without early exit) adds none. No
+# witness: the verdict leaves the module as a constant enum chosen by that one
+# branch, so total = in-file.
+aaa-gate	ReleaseFast	bearer	2	2	9b22b74f33087e9b	b0e8295638441324
+aaa-gate	ReleaseFast	api_key	2	2	9b22b74f33087e9b	964c6a19647f3cd3
+aaa-gate	ReleaseFast	basic	2	2	9b22b74f33087e9b	3e1202ab86ba6261

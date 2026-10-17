@@ -246,6 +246,7 @@ declare -A TARGETS=(
     # deliberately not targets. The codecs are the module's own choice.
     [sealedbox]="hexenc hexdec b64enc b64dec seal open"
     [cookies]="derive sign verify seal open tsign tverify tseal topen"
+    [aaa-gate]="bearer api_key basic"
     # A1 `pir.md` M2: the module's central claim was never machine-checked, and
     # its sibling `fss` exposed a real defect the day IT entered the gate.
     [pir]="query reconstruct"
@@ -370,6 +371,7 @@ declare -A MODES=(
     [dkg]="ReleaseFast"
     [sealedbox]="ReleaseFast"
     [cookies]="ReleaseFast"
+    [aaa-gate]="ReleaseFast"
     [pir]="ReleaseFast"
     [opaque]="ReleaseFast"
     [bip32]="ReleaseFast"
@@ -640,6 +642,11 @@ declare -A PATTERN=(
     # aesgcm module, so both are named: their constant-time property IS this
     # code's property (2026-10-12). The base64 of the outputs runs after an
     # explicit declassification (the bytes go to the client) and is not here.
+    # aaa-gate's own code is `root.zig`; the digest compare is std's
+    # `timing_safe` and is named so its property counts as the module's.
+    [aaa-gate/bearer]='root[.]zig:[1-9]|timing_safe[.]zig|sha2[.]zig'
+    [aaa-gate/api_key]='root[.]zig:[1-9]|timing_safe[.]zig|sha2[.]zig'
+    [aaa-gate/basic]='root[.]zig:[1-9]|timing_safe[.]zig|sha2[.]zig'
     [cookies/derive]='secure[.]zig:[1-9]|root[.]zig:[1-9]|hmac[.]zig|sha2[.]zig|aes[a-z_]*[.]zig|ghash'
     [cookies/sign]='secure[.]zig:[1-9]|root[.]zig:[1-9]|hmac[.]zig|sha2[.]zig|aes[a-z_]*[.]zig|ghash'
     [cookies/verify]='secure[.]zig:[1-9]|root[.]zig:[1-9]|hmac[.]zig|sha2[.]zig|aes[a-z_]*[.]zig|ghash'
@@ -779,6 +786,9 @@ WITNESS='Writer[.]zig|Format[.]zig|fmt[.]zig'
 # log, the same rule WITNESS carries above.
 WITNESS_CHAIN='^(Writer[.]zig|Format[.]zig|fmt[.]zig|debug[.]zig|memcpy[.]zig|Threaded[.]zig|Io[.]zig|File[.]zig|linux[.]zig)$'
 declare -A LABEL=(
+    [aaa-gate/bearer]='aaa-gate verify (token digests)'
+    [aaa-gate/api_key]='aaa-gate verifyApiKey (key digests)'
+    [aaa-gate/basic]='aaa-gate verifyBasic (user:password digests)'
     [frost/commit]='frost round1Commit+k256'
     [frost/sign]='frost round2Sign+k256'
     [musig2/sign]='musig2 sign (d,k1,k2)+bip340+k256'
