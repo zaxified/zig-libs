@@ -67,6 +67,11 @@ const builtin = @import("builtin");
 const testkit = @import("testkit");
 const router = @import("router");
 const http = @import("http");
+/// The streaming-quantile engine behind `Summary` (CKMS, perks-compatible).
+const summary_mod = @import("summary.zig");
+pub const SummaryOptions = summary_mod.Options;
+pub const Objective = summary_mod.Objective;
+pub const SummarySnapshot = summary_mod.Snapshot;
 
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
@@ -284,6 +289,40 @@ pub const Histogram = struct {
     }
 };
 
+/// Summary: `_sum`/`_count` plus quantiles over a sliding time window
+/// (client_golang `Summary` with `Objectives`; the engine is
+/// `summary_mod.Summary`). Time comes from the registry's `clock`, captured
+/// when the series is created. Quantiles are NaN while the window is
+/// empty. Prefer a `Histogram` when series must be aggregated across
+/// instances — summaries' quantiles cannot be.
+pub const Summary = struct {
+    inner: summary_mod.Summary,
+    clock: Clock,
+
+    pub fn observe(s: *Summary, v: f64) void {
+        s.inner.observe(v, s.clock.now());
+    }
+
+    /// Cumulative count / sum and the window's quantiles, in the family's
+    /// objective order (ascending quantile).
+    pub fn snapshot(s: *Summary, out_quantiles: []f64) SummarySnapshot {
+        return s.inner.snapshot(s.clock.now(), out_quantiles);
+    }
+};
+
+/// client_golang's objectives are what the caller passes; it has no
+/// default (an empty map = only `_sum`/`_count`). This is the set its docs
+/// suggest, for convenience.
+pub const default_objectives = [_]Objective{
+    .{ .quantile = 0.5, .epsilon = 0.05 },
+    .{ .quantile = 0.9, .epsilon = 0.01 },
+    .{ .quantile = 0.99, .epsilon = 0.001 },
+};
+
+/// Upper bound on a summary's objectives (each is a sample line per series
+/// and a query per scrape).
+pub const max_objectives = 16;
+
 /// client_golang `DefBuckets` — latency-in-seconds defaults.
 pub const default_buckets = [_]f64{ 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10 };
 
@@ -336,6 +375,13 @@ pub const RegisterError = error{
     BucketsMismatch,
     /// More than `max_labels` labels.
     TooManyLabels,
+    /// Summary options out of range: a quantile outside [0, 1], an epsilon
+    /// outside [0, 1), a repeated quantile, more than `max_objectives`,
+    /// `age_buckets`/`buf_cap` 0, or a `max_age_ns` shorter than
+    /// `age_buckets` ns.
+    InvalidObjectives,
+    /// The summary name is already registered with other options.
+    ObjectivesMismatch,
     /// The name (or, for a callback, the exact series) is already taken in
     /// a way that cannot be shared: a `counterFunc`/`gaugeFunc` series
     /// registered twice, a callback family asked for an ordinary series
@@ -345,7 +391,7 @@ pub const RegisterError = error{
 };
 
 /// An instrument kind — what a family's `# TYPE` line says.
-pub const Kind = enum { counter, gauge, histogram };
+pub const Kind = enum { counter, gauge, histogram, summary };
 
 /// A value read at scrape time (client_golang `CounterFunc`/`GaugeFunc`):
 /// `f(ctx)` is called by every scrape, from the scraping thread — it must
@@ -361,6 +407,7 @@ const Instrument = union(enum) {
     counter: Counter,
     gauge: Gauge,
     histogram: Histogram,
+    summary: Summary,
     counter_func: Func,
     gauge_func: Func,
 };
@@ -377,7 +424,11 @@ const Child = struct {
     fn destroy(c: *Child, gpa: Allocator) void {
         for (c.label_values) |v| gpa.free(v);
         gpa.free(c.label_values);
-        if (c.data == .histogram) gpa.free(c.data.histogram.bucket_counts);
+        switch (c.data) {
+            .histogram => |h| gpa.free(h.bucket_counts),
+            .summary => |*sm| sm.inner.deinit(),
+            else => {},
+        }
         gpa.destroy(c);
     }
 };
@@ -430,6 +481,9 @@ const Family = struct {
     label_names: []const []const u8,
     /// Histogram families only, else empty.
     buckets: []const f64,
+    /// Summary families only: options with objectives sorted by quantile
+    /// (arena copy) — every series of the family shares them.
+    summary_options: SummaryOptions = .{},
     /// Registration order (exposition order).
     children: std.ArrayList(*Child) = .empty,
     /// Every series is a `counterFunc`/`gaugeFunc` callback.
@@ -477,6 +531,9 @@ pub const Registry = struct {
     /// falls back to `Allocating`'s normal grow-as-needed behavior — this
     /// changes only how much is pre-reserved, never what gets emitted.
     exposition_size_hint: std.atomic.Value(usize) = .init(0),
+    /// Time source for summaries' sliding windows, captured by each summary
+    /// series when it is created — set it before registering summaries.
+    clock: Clock = .monotonic,
 
     pub fn init(gpa: Allocator) Registry {
         return .{ .arena = std.heap.ArenaAllocator.init(gpa) };
@@ -504,13 +561,13 @@ pub const Registry = struct {
     /// `counterVec` once and call `with` instead: this validates the whole
     /// descriptor on every call.
     pub fn counter(r: *Registry, name: []const u8, help: []const u8, labels: []const Label) RegisterError!*Counter {
-        const child = try r.getOrRegister(name, help, .counter, labels, &.{});
+        const child = try r.getOrRegister(name, help, .counter, labels, &.{}, .{});
         return &child.data.counter;
     }
 
     /// Get-or-register a gauge time series (see `counter`).
     pub fn gauge(r: *Registry, name: []const u8, help: []const u8, labels: []const Label) RegisterError!*Gauge {
-        const child = try r.getOrRegister(name, help, .gauge, labels, &.{});
+        const child = try r.getOrRegister(name, help, .gauge, labels, &.{}, .{});
         return &child.data.gauge;
     }
 
@@ -519,7 +576,7 @@ pub const Registry = struct {
     /// implicit (may be empty = only `+Inf`); the whole family shares the
     /// first registration's buckets.
     pub fn histogram(r: *Registry, name: []const u8, help: []const u8, labels: []const Label, buckets: []const f64) RegisterError!*Histogram {
-        const child = try r.getOrRegister(name, help, .histogram, labels, buckets);
+        const child = try r.getOrRegister(name, help, .histogram, labels, buckets, .{});
         return &child.data.histogram;
     }
 
@@ -528,17 +585,31 @@ pub const Registry = struct {
     /// with no series is not exposed. Registering the same descriptor again
     /// returns a handle to the same family.
     pub fn counterVec(r: *Registry, name: []const u8, help: []const u8, label_names: []const []const u8) RegisterError!CounterVec {
-        return .{ .registry = r, .family = try r.getOrRegisterFamily(name, help, .counter, label_names, &.{}) };
+        return .{ .registry = r, .family = try r.getOrRegisterFamily(name, help, .counter, label_names, &.{}, .{}) };
     }
 
     /// Get-or-register a gauge family (see `counterVec`).
     pub fn gaugeVec(r: *Registry, name: []const u8, help: []const u8, label_names: []const []const u8) RegisterError!GaugeVec {
-        return .{ .registry = r, .family = try r.getOrRegisterFamily(name, help, .gauge, label_names, &.{}) };
+        return .{ .registry = r, .family = try r.getOrRegisterFamily(name, help, .gauge, label_names, &.{}, .{}) };
     }
 
     /// Get-or-register a histogram family (see `counterVec`, `histogram`).
     pub fn histogramVec(r: *Registry, name: []const u8, help: []const u8, label_names: []const []const u8, buckets: []const f64) RegisterError!HistogramVec {
-        return .{ .registry = r, .family = try r.getOrRegisterFamily(name, help, .histogram, label_names, buckets) };
+        return .{ .registry = r, .family = try r.getOrRegisterFamily(name, help, .histogram, label_names, buckets, .{}) };
+    }
+
+    /// Get-or-register a summary series (client_golang `Summary`). The whole
+    /// family shares the first registration's `options` (objectives are
+    /// kept sorted by quantile); a later call with other options is
+    /// `ObjectivesMismatch`. `quantile` is a reserved label name here.
+    pub fn summary(r: *Registry, name: []const u8, help: []const u8, labels: []const Label, options: SummaryOptions) RegisterError!*Summary {
+        const child = try r.getOrRegister(name, help, .summary, labels, &.{}, options);
+        return &child.data.summary;
+    }
+
+    /// Get-or-register a summary family (see `counterVec`, `summary`).
+    pub fn summaryVec(r: *Registry, name: []const u8, help: []const u8, label_names: []const []const u8, options: SummaryOptions) RegisterError!SummaryVec {
+        return .{ .registry = r, .family = try r.getOrRegisterFamily(name, help, .summary, label_names, &.{}, options) };
     }
 
     /// Remove the family `name` and every series in it (client_golang
@@ -587,11 +658,11 @@ pub const Registry = struct {
             names[i] = l.name;
             values[i] = l.value;
         }
-        try validateDescriptor(name, help, kind, names[0..labels.len], &.{});
+        try validateDescriptor(name, help, kind, names[0..labels.len], &.{}, .{});
         for (values[0..labels.len]) |v| if (!std.unicode.utf8ValidateSlice(v)) return error.InvalidUtf8;
         lockSpin(&r.lock);
         defer r.lock.unlock();
-        const fam = try r.familyLocked(name, help, kind, names[0..labels.len], &.{});
+        const fam = try r.familyLocked(name, help, kind, names[0..labels.len], &.{}, .{});
         if (fam.collector != null) return error.AlreadyRegistered;
         if (!fam.funcs and fam.children.items.len != 0) return error.AlreadyRegistered;
         if (fam.index.getKeyAdapted(@as([]const []const u8, values[0..labels.len]), ValuesAdapter{}) != null) return error.AlreadyRegistered;
@@ -622,7 +693,7 @@ pub const Registry = struct {
     /// order. `collector.ctx` must outlive the registry.
     pub fn registerCollector(r: *Registry, descs: []const Desc, collector: Collector) RegisterError!void {
         for (descs, 0..) |d, i| {
-            try validateDescriptor(d.name, d.help, d.kind, d.label_names, &.{});
+            try validateDescriptor(d.name, d.help, d.kind, d.label_names, &.{}, .{});
             for (descs[0..i]) |prev| if (std.mem.eql(u8, prev.name, d.name)) return error.AlreadyRegistered;
         }
         lockSpin(&r.lock);
@@ -659,7 +730,7 @@ pub const Registry = struct {
         }
     }
 
-    fn validateDescriptor(name: []const u8, help: []const u8, kind: Kind, label_names: []const []const u8, buckets: []const f64) RegisterError!void {
+    fn validateDescriptor(name: []const u8, help: []const u8, kind: Kind, label_names: []const []const u8, buckets: []const f64, sopts: SummaryOptions) RegisterError!void {
         if (!validMetricName(name)) return error.InvalidName;
         if (!std.unicode.utf8ValidateSlice(help)) return error.InvalidUtf8;
         if (label_names.len > max_labels) return error.TooManyLabels;
@@ -673,6 +744,18 @@ pub const Registry = struct {
             // `le` is reserved on every kind (F13) — see
             // `RegisterError.ReservedLabelName`.
             if (std.mem.eql(u8, ln, "le")) return error.ReservedLabelName;
+            // client_golang reserves `quantile` on summaries only.
+            if (kind == .summary and std.mem.eql(u8, ln, "quantile")) return error.ReservedLabelName;
+        }
+        if (kind == .summary) {
+            if (sopts.objectives.len > max_objectives) return error.InvalidObjectives;
+            if (sopts.age_buckets == 0 or sopts.buf_cap == 0) return error.InvalidObjectives;
+            if (sopts.max_age_ns / sopts.age_buckets == 0) return error.InvalidObjectives;
+            for (sopts.objectives, 0..) |o, i| {
+                if (!(o.quantile >= 0 and o.quantile <= 1)) return error.InvalidObjectives;
+                if (!(o.epsilon >= 0 and o.epsilon < 1)) return error.InvalidObjectives;
+                for (sopts.objectives[0..i]) |prev| if (prev.quantile == o.quantile) return error.InvalidObjectives;
+            }
         }
         if (kind == .histogram) {
             for (buckets, 0..) |b, i| {
@@ -684,7 +767,7 @@ pub const Registry = struct {
 
     /// The family for this descriptor, registered if new. Caller holds
     /// `r.lock`; the descriptor is already validated.
-    fn familyLocked(r: *Registry, name: []const u8, help: []const u8, kind: Kind, label_names: []const []const u8, buckets: []const f64) RegisterError!*Family {
+    fn familyLocked(r: *Registry, name: []const u8, help: []const u8, kind: Kind, label_names: []const []const u8, buckets: []const f64, sopts: SummaryOptions) RegisterError!*Family {
         const a = r.arena.allocator();
         const fam = if (r.family_index.get(name)) |f| f else blk: {
             try r.checkSuffixCollisionLocked(name, kind);
@@ -699,6 +782,17 @@ pub const Registry = struct {
                     break :blk2 out;
                 },
                 .buckets = if (kind == .histogram) try a.dupe(f64, buckets) else &.{},
+                .summary_options = if (kind == .summary) blk2: {
+                    var o = sopts;
+                    const objs = try a.dupe(Objective, sopts.objectives);
+                    std.mem.sort(Objective, objs, {}, struct {
+                        fn lt(_: void, x: Objective, y: Objective) bool {
+                            return x.quantile < y.quantile;
+                        }
+                    }.lt);
+                    o.objectives = objs;
+                    break :blk2 o;
+                } else .{},
             };
             try r.families.append(a, f);
             try r.family_index.put(a, f.name, f);
@@ -717,17 +811,18 @@ pub const Registry = struct {
                 if (fb != b) return error.BucketsMismatch;
             }
         }
+        if (kind == .summary and !sameSummaryOptions(fam.summary_options, sopts)) return error.ObjectivesMismatch;
         return fam;
     }
 
-    fn getOrRegisterFamily(r: *Registry, name: []const u8, help: []const u8, kind: Kind, label_names: []const []const u8, buckets: []const f64) RegisterError!*Family {
-        try validateDescriptor(name, help, kind, label_names, buckets);
+    fn getOrRegisterFamily(r: *Registry, name: []const u8, help: []const u8, kind: Kind, label_names: []const []const u8, buckets: []const f64, sopts: SummaryOptions) RegisterError!*Family {
+        try validateDescriptor(name, help, kind, label_names, buckets, sopts);
         lockSpin(&r.lock);
         defer r.lock.unlock();
-        return r.familyLocked(name, help, kind, label_names, buckets);
+        return r.familyLocked(name, help, kind, label_names, buckets, sopts);
     }
 
-    fn getOrRegister(r: *Registry, name: []const u8, help: []const u8, kind: Kind, labels: []const Label, buckets: []const f64) RegisterError!*Child {
+    fn getOrRegister(r: *Registry, name: []const u8, help: []const u8, kind: Kind, labels: []const Label, buckets: []const f64, sopts: SummaryOptions) RegisterError!*Child {
         if (labels.len > max_labels) return error.TooManyLabels;
         var names: [max_labels][]const u8 = undefined;
         var values: [max_labels][]const u8 = undefined;
@@ -735,13 +830,13 @@ pub const Registry = struct {
             names[i] = l.name;
             values[i] = l.value;
         }
-        try validateDescriptor(name, help, kind, names[0..labels.len], buckets);
+        try validateDescriptor(name, help, kind, names[0..labels.len], buckets, sopts);
         // Checked before the family is touched, so a bad value never leaves
         // a new, empty family registered behind its error.
         for (values[0..labels.len]) |v| if (!std.unicode.utf8ValidateSlice(v)) return error.InvalidUtf8;
         lockSpin(&r.lock);
         defer r.lock.unlock();
-        const fam = try r.familyLocked(name, help, kind, names[0..labels.len], buckets);
+        const fam = try r.familyLocked(name, help, kind, names[0..labels.len], buckets, sopts);
         return r.childLocked(fam, values[0..labels.len]);
     }
 
@@ -773,6 +868,16 @@ pub const Registry = struct {
             .data = switch (fam.kind) {
                 .counter => .{ .counter = .{} },
                 .gauge => .{ .gauge = .{} },
+                .summary => .{
+                    .summary = .{
+                        .inner = summary_mod.Summary.init(gpa, fam.summary_options) catch |e| switch (e) {
+                            error.OutOfMemory => return error.OutOfMemory,
+                            // validated at registration
+                            else => return error.InvalidObjectives,
+                        },
+                        .clock = r.clock,
+                    },
+                },
                 .histogram => .{ .histogram = .{
                     .upper_bounds = fam.buckets,
                     .bucket_counts = blk: {
@@ -977,6 +1082,7 @@ pub const Registry = struct {
                     .gauge => |*g| try writeSample(bw, fam.name, "", fam.label_names, c.label_values, null, .{ .float = g.value() }, format),
                     .gauge_func => |f| try writeSample(bw, fam.name, "", fam.label_names, c.label_values, null, .{ .float = f.f(f.ctx) }, format),
                     .histogram => |*h| try writeHistogram(bw, fam, c, h, format),
+                    .summary => |*sm| try writeSummary(bw, fam, c, sm, format),
                 }
             }
         }
@@ -1074,10 +1180,22 @@ pub const Sink = struct {
             if (c > count) return error.InvalidBuckets;
         }
         const fam = try s.begin(desc, .histogram, values) orelse return;
-        for (upper_bounds, cumulative) |b, c| try writeSample(s.w, fam.name, "_bucket", fam.label_names, values, b, .{ .count = c }, s.format);
-        try writeSample(s.w, fam.name, "_bucket", fam.label_names, values, std.math.inf(f64), .{ .count = count }, s.format);
+        for (upper_bounds, cumulative) |b, c| try writeSample(s.w, fam.name, "_bucket", fam.label_names, values, leLabel(b), .{ .count = c }, s.format);
+        try writeSample(s.w, fam.name, "_bucket", fam.label_names, values, leLabel(std.math.inf(f64)), .{ .count = count }, s.format);
         try writeSample(s.w, fam.name, "_sum", fam.label_names, values, null, .{ .float = sum }, s.format);
         try writeSample(s.w, fam.name, "_count", fam.label_names, values, null, .{ .count = count }, s.format);
+    }
+
+    /// A summary sample (client_golang `MustNewConstSummary`): quantiles as
+    /// (quantile, value) pairs in ascending quantile order.
+    pub fn summary(s: *Sink, desc: usize, values: []const []const u8, quantiles: []const Objective, quantile_values: []const f64, sum: f64, count: u64) Error!void {
+        if (quantiles.len != quantile_values.len) return error.InvalidBuckets;
+        for (quantiles, 0..) |q, i| {
+            if (!(q.quantile >= 0 and q.quantile <= 1)) return error.InvalidBuckets;
+            if (i > 0 and q.quantile <= quantiles[i - 1].quantile) return error.InvalidBuckets;
+        }
+        const fam = try s.begin(desc, .summary, values) orelse return;
+        try writeSummaryLines(s.w, fam.name, fam.label_names, values, quantiles, quantile_values, sum, count, s.format);
     }
 
     /// Validate one sample and write its family's header on first use;
@@ -1113,6 +1231,7 @@ pub fn Vec(comptime kind: Kind) type {
             .counter => Counter,
             .gauge => Gauge,
             .histogram => Histogram,
+            .summary => Summary,
         };
 
         registry: *Registry,
@@ -1161,6 +1280,19 @@ pub fn Vec(comptime kind: Kind) type {
 pub const CounterVec = Vec(.counter);
 pub const GaugeVec = Vec(.gauge);
 pub const HistogramVec = Vec(.histogram);
+pub const SummaryVec = Vec(.summary);
+
+/// Same summary options, objectives compared as a set (`have` is sorted).
+fn sameSummaryOptions(have: SummaryOptions, want: SummaryOptions) bool {
+    if (have.max_age_ns != want.max_age_ns or have.age_buckets != want.age_buckets or have.buf_cap != want.buf_cap) return false;
+    if (have.objectives.len != want.objectives.len) return false;
+    for (want.objectives) |w| {
+        for (have.objectives) |h| {
+            if (h.quantile == w.quantile and h.epsilon == w.epsilon) break;
+        } else return false;
+    }
+    return true;
+}
 
 /// The scrape Content-Type for text format 0.0.4 (what promhttp sends).
 pub const content_type = "text/plain; version=0.0.4; charset=utf-8";
@@ -1215,6 +1347,7 @@ fn writeHeader(w: *std.Io.Writer, name: []const u8, help: []const u8, kind: Kind
         .counter => if (format == .openmetrics and !std.mem.endsWith(u8, name, "_total")) "unknown" else "counter",
         .gauge => "gauge",
         .histogram => "histogram",
+        .summary => "summary",
     };
     try w.print("\n# TYPE {s} {s}\n", .{ announced, type_word });
 }
@@ -1225,11 +1358,19 @@ const SampleValue = union(enum) {
     float: f64,
 };
 
-/// One sample line: `<name><suffix>{labels[,le]} <value>`.
-fn writeSample(w: *std.Io.Writer, name: []const u8, suffix: []const u8, label_names: []const []const u8, label_values: []const []const u8, le: ?f64, value: SampleValue, format: Format) std.Io.Writer.Error!void {
+/// A label with a float value appended after the series' own labels:
+/// a histogram's `le`, a summary's `quantile`.
+const ExtraLabel = struct { name: []const u8, value: f64 };
+
+fn leLabel(bound: f64) ExtraLabel {
+    return .{ .name = "le", .value = bound };
+}
+
+/// One sample line: `<name><suffix>{labels[,extra]} <value>`.
+fn writeSample(w: *std.Io.Writer, name: []const u8, suffix: []const u8, label_names: []const []const u8, label_values: []const []const u8, extra: ?ExtraLabel, value: SampleValue, format: Format) std.Io.Writer.Error!void {
     try w.writeAll(name);
     try w.writeAll(suffix);
-    try writeLabels(w, label_names, label_values, le, format);
+    try writeLabels(w, label_names, label_values, extra, format);
     try w.writeByte(' ');
     switch (value) {
         // expfmt writes a counter's value as a float in OpenMetrics, and
@@ -1253,18 +1394,31 @@ fn writeHistogram(w: *std.Io.Writer, fam: *const Family, c: *const Child, h: *Hi
     lockSpin(&h.lock);
     defer h.lock.unlock();
     var cumulative: u64 = 0;
-    for (h.upper_bounds, h.bucket_counts) |le, n| {
+    for (h.upper_bounds, h.bucket_counts) |bound, n| {
         cumulative += n;
-        try writeSample(w, fam.name, "_bucket", fam.label_names, c.label_values, le, .{ .count = cumulative }, format);
+        try writeSample(w, fam.name, "_bucket", fam.label_names, c.label_values, leLabel(bound), .{ .count = cumulative }, format);
     }
-    try writeSample(w, fam.name, "_bucket", fam.label_names, c.label_values, std.math.inf(f64), .{ .count = h.observation_count }, format);
+    try writeSample(w, fam.name, "_bucket", fam.label_names, c.label_values, leLabel(std.math.inf(f64)), .{ .count = h.observation_count }, format);
     try writeSample(w, fam.name, "_sum", fam.label_names, c.label_values, null, .{ .float = h.observation_sum }, format);
     try writeSample(w, fam.name, "_count", fam.label_names, c.label_values, null, .{ .count = h.observation_count }, format);
 }
 
-/// Emit `{name="value",...}` (nothing when empty), appending `le` when given.
-fn writeLabels(w: *std.Io.Writer, names: []const []const u8, values: []const []const u8, le: ?f64, format: Format) std.Io.Writer.Error!void {
-    if (names.len == 0 and le == null) return;
+fn writeSummary(w: *std.Io.Writer, fam: *const Family, c: *const Child, sm: *Summary, format: Format) std.Io.Writer.Error!void {
+    var qs: [max_objectives]f64 = undefined;
+    const objs = fam.summary_options.objectives;
+    const snap = sm.snapshot(qs[0..objs.len]);
+    try writeSummaryLines(w, fam.name, fam.label_names, c.label_values, objs, qs[0..objs.len], snap.sum, snap.count, format);
+}
+
+fn writeSummaryLines(w: *std.Io.Writer, name: []const u8, label_names: []const []const u8, values: []const []const u8, objs: []const Objective, qs: []const f64, sum: f64, count: u64, format: Format) std.Io.Writer.Error!void {
+    for (objs, qs) |o, v| try writeSample(w, name, "", label_names, values, .{ .name = "quantile", .value = o.quantile }, .{ .float = v }, format);
+    try writeSample(w, name, "_sum", label_names, values, null, .{ .float = sum }, format);
+    try writeSample(w, name, "_count", label_names, values, null, .{ .count = count }, format);
+}
+
+/// Emit `{name="value",...}` (nothing when empty), appending `extra`.
+fn writeLabels(w: *std.Io.Writer, names: []const []const u8, values: []const []const u8, extra: ?ExtraLabel, format: Format) std.Io.Writer.Error!void {
+    if (names.len == 0 and extra == null) return;
     try w.writeByte('{');
     for (names, values, 0..) |n, v, i| {
         if (i != 0) try w.writeByte(',');
@@ -1272,12 +1426,12 @@ fn writeLabels(w: *std.Io.Writer, names: []const []const u8, values: []const []c
         try writeEscaped(w, v, .label_value);
         try w.writeByte('"');
     }
-    if (le) |bound| {
+    if (extra) |x| {
         if (names.len != 0) try w.writeByte(',');
-        try w.writeAll("le=\"");
+        try w.print("{s}=\"", .{x.name});
         switch (format) {
-            .text => try writeFloat(w, bound),
-            .openmetrics => try writeOpenMetricsFloat(w, bound),
+            .text => try writeFloat(w, x.value),
+            .openmetrics => try writeOpenMetricsFloat(w, x.value),
         }
         try w.writeByte('"');
     }
@@ -3298,6 +3452,13 @@ const golden_go_text =
     \\# HELP f_cpu_seconds_total CPU.
     \\# TYPE f_cpu_seconds_total counter
     \\f_cpu_seconds_total 12.25
+    \\# HELP g_lat_seconds Summary.
+    \\# TYPE g_lat_seconds summary
+    \\g_lat_seconds{op="read",quantile="0.5"} 5
+    \\g_lat_seconds{op="read",quantile="0.9"} 9
+    \\g_lat_seconds{op="read",quantile="0.99"} 9.9
+    \\g_lat_seconds_sum{op="read"} 505
+    \\g_lat_seconds_count{op="read"} 100
     \\
 ;
 
@@ -3328,6 +3489,13 @@ const golden_go_openmetrics =
     \\# HELP f_cpu_seconds CPU.
     \\# TYPE f_cpu_seconds counter
     \\f_cpu_seconds_total 12.25
+    \\# HELP g_lat_seconds Summary.
+    \\# TYPE g_lat_seconds summary
+    \\g_lat_seconds{op="read",quantile="0.5"} 5.0
+    \\g_lat_seconds{op="read",quantile="0.9"} 9.0
+    \\g_lat_seconds{op="read",quantile="0.99"} 9.9
+    \\g_lat_seconds_sum{op="read"} 505.0
+    \\g_lat_seconds_count{op="read"} 100
     \\# EOF
     \\
 ;
@@ -3352,6 +3520,13 @@ fn goldenRegistry(reg: *Registry) !void {
     for ([_]f64{ 0.25, 0.5, 2, 3, 7 }) |v| d.observe(v);
     try reg.gaugeFunc("e_func", "Func.", &.{}, &golden_e, constValue);
     try reg.counterFunc("f_cpu_seconds_total", "CPU.", &.{}, &golden_f, constValue);
+    // Objectives in another order than Go's map: the family sorts them.
+    const g = try reg.summaryVec("g_lat_seconds", "Summary.", &.{"op"}, .{ .objectives = &.{
+        .{ .quantile = 0.99, .epsilon = 0.001 },
+        .{ .quantile = 0.5, .epsilon = 0.05 },
+        .{ .quantile = 0.9, .epsilon = 0.01 },
+    } });
+    for (1..101) |i| (try g.with(&.{"read"})).observe(@as(f64, @floatFromInt(i)) / 10);
 }
 
 test "text format: byte-identical to client_golang/expfmt (golden from Go)" {
@@ -3548,9 +3723,88 @@ test "Endpoint: open_metrics negotiates, default stays text" {
     }
 }
 
+test "summary: registration rules (reserved quantile, objectives checked and shared)" {
+    var reg = Registry.init(testing.allocator);
+    defer reg.deinit();
+    const objs = default_objectives;
+    _ = try reg.summary("s_seconds", "h", &.{}, .{ .objectives = &objs });
+    try testing.expectError(error.ObjectivesMismatch, reg.summary("s_seconds", "h", &.{}, .{}));
+    try testing.expectError(error.ObjectivesMismatch, reg.summary("s_seconds", "h", &.{}, .{ .objectives = &objs, .max_age_ns = 1000 }));
+    // Same set, another order: the same family.
+    _ = try reg.summary("s_seconds", "h", &.{}, .{ .objectives = &.{ objs[2], objs[0], objs[1] } });
+    try testing.expectError(error.ReservedLabelName, reg.summaryVec("t", "h", &.{"quantile"}, .{}));
+    _ = try reg.gauge("g_with_quantile", "h", &.{.{ .name = "quantile", .value = "x" }}); // only summaries reserve it
+    try testing.expectError(error.InvalidObjectives, reg.summary("bad1", "h", &.{}, .{ .objectives = &.{.{ .quantile = 1.5, .epsilon = 0.1 }} }));
+    try testing.expectError(error.InvalidObjectives, reg.summary("bad2", "h", &.{}, .{ .objectives = &.{.{ .quantile = 0.5, .epsilon = 1 }} }));
+    try testing.expectError(error.InvalidObjectives, reg.summary("bad3", "h", &.{}, .{ .objectives = &.{ objs[0], objs[0] } }));
+    try testing.expectError(error.InvalidObjectives, reg.summary("bad4", "h", &.{}, .{ .age_buckets = 0 }));
+    try testing.expectError(error.InvalidObjectives, reg.summary("bad5", "h", &.{}, .{ .max_age_ns = 3, .age_buckets = 5 }));
+    try testing.expectError(error.WrongType, reg.counter("s_seconds", "h", &.{}));
+}
+
+test "summary: quantiles follow the registry clock's window; sum/count stay cumulative" {
+    var reg = Registry.init(testing.allocator);
+    defer reg.deinit();
+    var clock: FakeClock = .{ .step_ns = 0 };
+    reg.clock = clock.clock();
+    const s = try reg.summary("w_seconds", "h", &.{}, .{
+        .objectives = &.{.{ .quantile = 0.5, .epsilon = 0.01 }},
+        .max_age_ns = 1000,
+        .age_buckets = 2,
+    });
+    for (0..10) |i| s.observe(@floatFromInt(i));
+    var buf: [512]u8 = undefined;
+    try testing.expectEqualStrings(
+        \\# HELP w_seconds h
+        \\# TYPE w_seconds summary
+        \\w_seconds{quantile="0.5"} 4
+        \\w_seconds_sum 45
+        \\w_seconds_count 10
+        \\
+    , try scrapeInto(&reg, &buf));
+    clock.now_ns += 5000; // the whole window passes
+    try testing.expectEqualStrings(
+        \\# HELP w_seconds h
+        \\# TYPE w_seconds summary
+        \\w_seconds{quantile="0.5"} NaN
+        \\w_seconds_sum 45
+        \\w_seconds_count 10
+        \\
+    , try scrapeInto(&reg, &buf));
+}
+
+test "collector: Sink.summary writes quantile lines, refuses unsorted quantiles" {
+    const Coll = struct {
+        fn collect(_: ?*anyopaque, sink: *Sink) anyerror!void {
+            try sink.summary(0, &.{}, &.{ .{ .quantile = 0.5, .epsilon = 0 }, .{ .quantile = 0.99, .epsilon = 0 } }, &.{ 1.5, 7 }, 20, 9);
+        }
+        fn bad(_: ?*anyopaque, sink: *Sink) anyerror!void {
+            try sink.summary(0, &.{}, &.{ .{ .quantile = 0.9, .epsilon = 0 }, .{ .quantile = 0.5, .epsilon = 0 } }, &.{ 1, 2 }, 0, 0);
+        }
+    };
+    var reg = Registry.init(testing.allocator);
+    defer reg.deinit();
+    try reg.registerCollector(&.{.{ .name = "cs", .help = "h", .kind = .summary }}, .{ .collect = Coll.collect });
+    var buf: [512]u8 = undefined;
+    try testing.expectEqualStrings(
+        \\# HELP cs h
+        \\# TYPE cs summary
+        \\cs{quantile="0.5"} 1.5
+        \\cs{quantile="0.99"} 7
+        \\cs_sum 20
+        \\cs_count 9
+        \\
+    , try scrapeInto(&reg, &buf));
+    var reg2 = Registry.init(testing.allocator);
+    defer reg2.deinit();
+    try reg2.registerCollector(&.{.{ .name = "cs", .help = "h", .kind = .summary }}, .{ .collect = Coll.bad });
+    try testing.expectError(error.WriteFailed, scrapeInto(&reg2, &buf));
+}
+
 // ── external anchor: client_golang + expfmt + textparse ────────────────────
 // See go_oracle_test.zig / tools/interop.zig / tools/go_oracle.
 test {
+    _ = summary_mod;
     _ = @import("go_oracle_test.zig");
     _ = @import("go_register_test.zig");
 }

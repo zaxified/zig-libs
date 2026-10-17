@@ -20,7 +20,11 @@ func main() {
 	d := prometheus.NewHistogram(prometheus.HistogramOpts{Name: "d_seconds", Help: "Hist.", Buckets: []float64{0.5, 1, 2.5, 1e6}})
 	e := prometheus.NewGaugeFunc(prometheus.GaugeOpts{Name: "e_func", Help: "Func."}, func() float64 { return 0.000012 })
 	f := prometheus.NewCounterFunc(prometheus.CounterOpts{Name: "f_cpu_seconds_total", Help: "CPU."}, func() float64 { return 12.25 })
-	reg.MustRegister(a, b, c, d, e, f)
+	g := prometheus.NewSummaryVec(prometheus.SummaryOpts{Name: "g_lat_seconds", Help: "Summary.", Objectives: map[float64]float64{0.5: 0.05, 0.9: 0.01, 0.99: 0.001}}, []string{"op"})
+	reg.MustRegister(a, b, c, d, e, f, g)
+	for i := 1; i <= 100; i++ {
+		g.WithLabelValues("read").Observe(float64(i) / 10)
+	}
 	a.WithLabelValues("GET").Add(3)
 	a.WithLabelValues("POST").Add(1)
 	b.Add(0)

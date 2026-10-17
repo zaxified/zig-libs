@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-17** — **Summary** (client_golang `Summary` with `Objectives`, third wave of the S2 work).
+  - ADDED: `Registry.summary` / `summaryVec`, `Summary` (`observe`, `snapshot`), `SummaryOptions`,
+    `Objective`, `default_objectives`, `max_objectives`, `Registry.clock` (the window's time
+    source), `Sink.summary`, `Kind.summary`; new `RegisterError.InvalidObjectives` /
+    `ObjectivesMismatch`. `quantile` is a reserved label name on summaries (only).
+  - Engine `src/summary.zig`: CKMS targeted quantiles over `age_buckets` rotating streams, bit-exact
+    with beorn7/perks v1.0.1 on 40 generated scripts (`tools/go_summary_oracle`); exposition
+    byte-identical to client_golang in both formats (`tools/go_golden`).
+
 - **2026-10-17** — **OpenMetrics, callback series, collectors** (second wave of the S2 work).
   - ADDED: `Registry.writeOpenMetrics` / `write(w, Format)` / `respondFormat`; `Format.negotiate`
     (client_golang `NegotiateIncludingOpenMetrics`); `Endpoint.open_metrics` (default off, as
