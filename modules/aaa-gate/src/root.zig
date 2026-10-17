@@ -120,6 +120,7 @@ const builtin = @import("builtin");
 const router = @import("router");
 const http = @import("http");
 const b64ct = @import("b64ct");
+const cookies = @import("cookies");
 const burn = @import("burn.zig");
 
 pub const meta = .{
@@ -137,7 +138,7 @@ pub const meta = .{
     // throttle store); safe from all connection threads at once.
     .concurrency = .threadsafe,
     .model_after = "envoy ext_authz / oauth2-proxy (bearer behavior only); RFC 6750",
-    .deps = .{ "router", "http", "b64ct" },
+    .deps = .{ "router", "http", "b64ct", "cookies" },
 };
 
 const Allocator = std.mem.Allocator;
@@ -1174,24 +1175,14 @@ fn headerKey(value: ?[]const u8, prefix: []const u8) ?[]const u8 {
 }
 
 /// Value of the first cookie named `name` in one `Cookie` field value
-/// (`a=1; b=2`), or null. The name compare is exact (case-sensitive, RFC
-/// 6265 section 5.4); surrounding SP/TAB is trimmed and one pair of
-/// surrounding double quotes stripped; the value is not percent-decoded. A
-/// pair with no `=` is skipped. Pure and total -- any byte sequence maps to
-/// a value or null. Public for callers with their own request type.
-pub fn cookieValue(cookie_header: []const u8, name: []const u8) ?[]const u8 {
-    // Duplicates `cookies.find` on purpose: this change did not add `cookies`
-    // to aaa-gate's deps. Replace by it if that dependency is accepted.
-    var it = std.mem.splitScalar(u8, cookie_header, ';');
-    while (it.next()) |pair| {
-        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
-        if (!std.mem.eql(u8, std.mem.trim(u8, pair[0..eq], " \t"), name)) continue;
-        var v = std.mem.trim(u8, pair[eq + 1 ..], " \t");
-        if (v.len >= 2 and v[0] == '"' and v[v.len - 1] == '"') v = v[1 .. v.len - 1];
-        return v;
-    }
-    return null;
-}
+/// (`a=1; b=2`), or null: `cookies.find` (2026-10-18; was a private copy).
+/// The name compare is exact (case-sensitive, RFC 6265 section 5.4);
+/// surrounding SP/TAB is trimmed and one pair of surrounding double quotes
+/// stripped; a `;` inside quotes does not end the value; the value is not
+/// percent-decoded; a pair with no `=` is a cookie with an empty value
+/// (which the key sources treat as absent). Pure and total. Public for
+/// callers with their own request type.
+pub const cookieValue = cookies.find;
 
 pub const BasicCredentials = http.BasicCredentials;
 
@@ -3561,6 +3552,8 @@ test "middleware any: bearer, api key and Basic each admit; combined challenge" 
 }
 
 test "cookieValue: exact name, trims, strips one pair of quotes, no decoding, skips junk pairs" {
+    // `cookies.find` since 2026-10-18: a quoted `;` stays in the value.
+    try testing.expectEqualStrings("x;y", cookieValue("a=1; sid=\"x;y\"; b=2", "sid").?);
     try testing.expectEqualStrings("abc", cookieValue("sid=abc", "sid").?);
     try testing.expectEqualStrings("abc", cookieValue("a=1; sid=abc; b=2", "sid").?);
     try testing.expectEqualStrings("abc", cookieValue("a=1;\tsid = \"abc\" ;b=2", "sid").?);
@@ -3570,7 +3563,7 @@ test "cookieValue: exact name, trims, strips one pair of quotes, no decoding, sk
     try testing.expectEqualStrings("", cookieValue("sid=", "sid").?);
     try testing.expectEqual(@as(?[]const u8, null), cookieValue("Sid=abc", "sid")); // case-sensitive
     try testing.expectEqual(@as(?[]const u8, null), cookieValue("xsid=abc; sidx=abc", "sid"));
-    try testing.expectEqual(@as(?[]const u8, null), cookieValue("sid", "sid")); // no '='
+    try testing.expectEqualStrings("", cookieValue("sid", "sid").?); // no '=': empty value (cookies.find)
     try testing.expectEqual(@as(?[]const u8, null), cookieValue(";;;=;", "sid"));
 }
 

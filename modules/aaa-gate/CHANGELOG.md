@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — `cookieValue` is now `cookies.find` (new dep `cookies`; the private copy is gone). Differences: a `;` inside a quoted value no longer ends it (`sid="x;y"` → `x;y`), and a pair without `=` reads as an empty value instead of null — an empty value already counted as an absent key source, so no gate verdict changes. ctgrind counts unchanged (2/2/2), digests re-pinned.
 - **2026-10-17** — Example: the `addToken` OOM step finds `Gate.init`'s allocation budget by probing instead of a literal 4 (init gained a fifth allocation, key sources, and the example's run failed in CI). Example only.
 
 - **2026-10-17** — `global-alloc-ok` marker on the ctgrind harness's `page_allocator` (`check-global-alloc`). Tooling only.

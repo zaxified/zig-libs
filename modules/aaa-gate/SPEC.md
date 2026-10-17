@@ -154,7 +154,7 @@ amplification issue (HIGH) found in the pass was fixed.
 - ~~Cookie / multi-source key lookup~~ — done 2026-10-17 (`Options.api_key_sources`).
 - **Form-field key lookup** *(DN, 2026-10-17)* — echo's `form:` source. Needs a rewindable / buffered request body in `http`; revisit if `Request` grows one.
 - **Username on `Identity` for Basic** *(ND, 2026-10-17)* — the static set keeps `SHA-256(user:password)` only, so the gate cannot name the user; `basic_verify` sees it.
-- **Use `cookies.find` instead of the local `cookieValue`** — needs `cookies` in aaa-gate's deps.
+- ~~**Use `cookies.find` instead of the local `cookieValue`**~~ — ✅ 2026-10-18: `cookies` is a dep, `cookieValue` = `cookies.find` (a quoted `;` now stays in the value; a pair without `=` is an empty value, which the key sources already treated as absent).
 
 ## Status
 `extract · any · server · threadsafe` + deps `router`, `http` — canonical source is `pub const meta`
