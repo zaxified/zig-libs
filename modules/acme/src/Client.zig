@@ -31,6 +31,7 @@
 const std = @import("std");
 const testkit = @import("testkit");
 const http = @import("http");
+const datefmt = @import("datefmt");
 const router = @import("router");
 const jws = @import("jws.zig");
 const x509 = @import("x509.zig");
@@ -695,46 +696,13 @@ fn parseRenewalInfo(gpa: Allocator, body: []const u8) Error!RenewalInfo {
 }
 
 /// RFC 3339 `date-time` → epoch seconds: `YYYY-MM-DDThh:mm:ss[.frac](Z|±hh:mm)`
-/// (`T` may be `t`, `Z` may be `z`). Fractions are dropped; leap second 60 is
-/// read as 59. Null on anything else.
+/// (`T` may be `t`, `Z` may be `z`), parsed by `datefmt`. Fractions are
+/// dropped; a leap second (`:60`) is refused, as in Go's `time.Parse`. Null on
+/// anything else.
 fn parseRfc3339(s: []const u8) ?i64 {
-    if (s.len < 20) return null;
-    const year = std.fmt.parseInt(i64, s[0..4], 10) catch return null;
-    const month = std.fmt.parseInt(u8, s[5..7], 10) catch return null;
-    const day = std.fmt.parseInt(u8, s[8..10], 10) catch return null;
-    const hour = std.fmt.parseInt(u8, s[11..13], 10) catch return null;
-    const minute = std.fmt.parseInt(u8, s[14..16], 10) catch return null;
-    var second = std.fmt.parseInt(u8, s[17..19], 10) catch return null;
-    if (s[4] != '-' or s[7] != '-' or s[13] != ':' or s[16] != ':') return null;
-    if (s[10] != 'T' and s[10] != 't') return null;
-    if (month < 1 or month > 12 or day < 1 or hour > 23 or minute > 59 or second > 60) return null;
-    if (second == 60) second = 59;
-    const mdays = [_]u8{ 31, if (isLeap(year)) 29 else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
-    if (day > mdays[month - 1]) return null;
-
-    var at: usize = 19;
-    if (s[at] == '.') {
-        at += 1;
-        const frac_start = at;
-        while (at < s.len and std.ascii.isDigit(s[at])) at += 1;
-        if (at == frac_start) return null;
-    }
-    if (at >= s.len) return null;
-    var offset: i64 = 0;
-    switch (s[at]) {
-        'Z', 'z' => if (at + 1 != s.len) return null,
-        '+', '-' => {
-            if (s.len != at + 6 or s[at + 3] != ':') return null;
-            const oh = std.fmt.parseInt(u8, s[at + 1 .. at + 3], 10) catch return null;
-            const om = std.fmt.parseInt(u8, s[at + 4 .. at + 6], 10) catch return null;
-            if (oh > 23 or om > 59) return null;
-            offset = (@as(i64, oh) * 60 + om) * 60;
-            if (s[at] == '-') offset = -offset;
-        },
-        else => return null,
-    }
-    const days = daysFromCivil(year, month, day);
-    return days * 86400 + @as(i64, hour) * 3600 + @as(i64, minute) * 60 + second - offset;
+    const p = datefmt.parseRfc3339(s) catch return null;
+    const off_min = p.off_min orelse return null; // always set: the offset is required
+    return datefmt.partsToUnix(p) - @as(i64, off_min) * 60;
 }
 
 const rfc3339_len = "YYYY-MM-DDThh:mm:ssZ".len;
@@ -751,21 +719,6 @@ fn formatRfc3339(buf: *[rfc3339_len]u8, epoch: u64) []const u8 {
         yd.year,              md.month.numeric(),      @as(u8, md.day_index) + 1,
         ds.getHoursIntoDay(), ds.getMinutesIntoHour(), ds.getSecondsIntoMinute(),
     }) catch unreachable; // exactly rfc3339_len
-}
-
-fn isLeap(y: i64) bool {
-    return (@mod(y, 4) == 0 and @mod(y, 100) != 0) or @mod(y, 400) == 0;
-}
-
-/// Days since 1970-01-01 of a proleptic Gregorian date (Hinnant's algorithm).
-fn daysFromCivil(y_in: i64, m: u8, d: u8) i64 {
-    const y = if (m <= 2) y_in - 1 else y_in;
-    const era = @divFloor(y, 400);
-    const yoe = y - era * 400;
-    const mp: i64 = if (m > 2) @as(i64, m) - 3 else @as(i64, m) + 9;
-    const doy = @divFloor(153 * mp + 2, 5) + d - 1;
-    const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
-    return era * 146097 + doe - 719468;
 }
 
 // ── the order flow ──────────────────────────────────────────────────────────
@@ -4311,6 +4264,7 @@ test "parseRenewalInfo / parseRfc3339: offsets, fractions, leap days, and what i
     try testing.expectEqual(@as(?i64, 1791894896), parseRfc3339("2026-10-13t12:34:56z"));
     try testing.expectEqual(@as(?i64, 1791894896), parseRfc3339("2026-10-13T14:34:56+02:00"));
     try testing.expectEqual(@as(?i64, 1791894896), parseRfc3339("2026-10-13T07:04:56-05:30"));
+    try testing.expectEqual(@as(?i64, null), parseRfc3339("2016-12-31T23:59:60Z")); // leap second: refused (was read as :59 before datefmt)
     try testing.expectEqual(@as(?i64, null), parseRfc3339("2023-02-29T00:00:00Z")); // not a leap year
     try testing.expectEqual(@as(?i64, null), parseRfc3339("2026-13-01T00:00:00Z"));
     try testing.expectEqual(@as(?i64, null), parseRfc3339("2026-10-13 12:34:56Z"));

@@ -17,6 +17,7 @@
 
 const std = @import("std");
 const http = @import("http");
+const datefmt = @import("datefmt");
 const PublicSuffixList = @import("psl.zig").PublicSuffixList;
 
 pub const Options = struct {
@@ -178,8 +179,10 @@ pub fn parseCookieDate(s: []const u8) ?i64 {
     const d = day orelse return null;
     const m = month orelse return null;
     if (d < 1 or d > 31 or y < 1601 or t[0] > 23 or t[1] > 59 or t[2] > 59) return null;
-    if (d > daysInMonth(y, m)) return null;
-    return daysFromCivil(y, m, d) * std.time.s_per_day + @as(i64, t[0]) * 3600 + @as(i64, t[1]) * 60 + t[2];
+    if (y > 9999) return null; // `leadingDigits(tok, 2, 4)`: never, but keep the cast honest
+    const yi: i32 = @intCast(y);
+    if (d > datefmt.daysInMonth(yi, m)) return null;
+    return datefmt.ymdToEpochDay(yi, m, d) * std.time.s_per_day + @as(i64, t[0]) * 3600 + @as(i64, t[1]) * 60 + t[2];
 }
 
 /// `1*2DIGIT ":" 1*2DIGIT ":" 1*2DIGIT ( non-digit *OCTET )`.
@@ -209,23 +212,6 @@ fn monthOf(tok: []const u8) ?u32 {
     const names = [_][]const u8{ "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec" };
     for (names, 1..) |n, m| if (std.ascii.eqlIgnoreCase(tok[0..3], n)) return @intCast(m);
     return null;
-}
-
-fn daysInMonth(y: u32, m: u32) u32 {
-    return switch (m) {
-        2 => if (y % 4 == 0 and (y % 100 != 0 or y % 400 == 0)) 29 else 28,
-        4, 6, 9, 11 => 30,
-        else => 31,
-    };
-}
-
-fn daysFromCivil(year: u32, month: u32, day: u32) i64 {
-    const y: i64 = @as(i64, year) - @intFromBool(month <= 2);
-    const era = @divFloor(y, 400);
-    const yoe = y - era * 400;
-    const doy: i64 = @divTrunc(153 * @as(i64, (month + 9) % 12) + 2, 5) + day - 1;
-    const doe = yoe * 365 + @divTrunc(yoe, 4) - @divTrunc(yoe, 100) + doy;
-    return era * 146097 + doe - 719468;
 }
 
 // ── the jar ──────────────────────────────────────────────────────────────

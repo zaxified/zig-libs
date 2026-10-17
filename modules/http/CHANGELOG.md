@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-17** — New public `writeHtmlEscaped` (re-export of the helper `http.Redirect` already used), so `staticfiles` stops carrying its own copy.
+- **2026-10-17** — `If-Modified-Since`/`If-Unmodified-Since` date parsing (`conditional.zig`) uses `datefmt.daysInMonth`/`ymdToEpochDay` instead of its own copies of the civil-calendar helpers. No behaviour change (same Hinnant algorithm; the HTTP-date grammar stays here).
 - **2026-10-12** — **Go's `ServeContent`, `DetectContentType`, `CrossOriginProtection` and
   `ServeTLS`'s protocol choice, additive.** `http.serveContent(req, rw, bytes, opts)` answers an
   in-memory representation the way `ServeContent` does (preconditions, `If-Range`, single and

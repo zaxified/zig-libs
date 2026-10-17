@@ -206,6 +206,10 @@ pub const basicAuth = helpers.basicAuth;
 /// The `Authorization: Basic …` value for a client request (Go's `SetBasicAuth`).
 pub const basicAuthHeader = helpers.basicAuthHeader;
 pub const BasicCredentials = helpers.BasicCredentials;
+/// HTML text escaping as Go's `html.EscapeString` / `http.Redirect`
+/// (`&` `<` `>` `"` `'` → `&amp;` `&lt;` `&gt;` `&#34;` `&#39;`); `staticfiles`
+/// uses it for directory-listing names.
+pub const writeHtmlEscaped = helpers.writeHtmlEscaped;
 
 // ── request vocabulary ──────────────────────────────────────────────────────
 

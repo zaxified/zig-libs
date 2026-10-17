@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-17** — `date`/`date-time` checks and instant comparison use `datefmt.daysInMonth`/`ymdToEpochDay` (new direct dep `datefmt`, already in the closure via `http`) instead of this module's own civil-calendar helpers. No behaviour change.
 - **2026-10-11** — **Scope parity with go-playground/validator v10.30.5 (S3 -> S2)**, no breaking
   change: every addition is a new decl or a field with a default that keeps the old behaviour.
   - **Cross-field rules**: `Rule.cross: []const Cross` (`CrossOp`: `eq_field`, `ne_field`, `gt_field`,

@@ -76,6 +76,7 @@ const testkit = @import("testkit");
 const router = @import("router");
 const http = @import("http");
 const netaddr = @import("netaddr");
+const datefmt = @import("datefmt");
 
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
@@ -93,7 +94,7 @@ pub const meta = .{
     // all of http.Server's connection threads.
     .concurrency = .reentrant,
     .model_after = "pydantic v2 (error shape + codes) + JSON Schema 2020-12 (keyword semantics + format vocabulary) + go-playground/validator (middleware ergonomics)",
-    .deps = .{ "router", "http", "netaddr" },
+    .deps = .{ "router", "http", "netaddr", "datefmt" }, // datefmt: the civil calendar under date / date-time
 };
 
 const Allocator = std.mem.Allocator;
@@ -868,18 +869,6 @@ fn numberOrder(x: Value, y: Value) ?std.math.Order {
     return std.math.order(fx, fy);
 }
 
-/// Days since 1970-01-01 of a proleptic Gregorian date (Hinnant's civil
-/// algorithm); the caller has range-checked the date.
-fn daysFromCivil(y_in: u32, m: u32, d: u32) i64 {
-    const y: i64 = @as(i64, y_in) - @as(i64, if (m <= 2) 1 else 0);
-    const era = @divFloor(y, 400);
-    const yoe = y - era * 400;
-    const mp: i64 = @as(i64, if (m > 2) m - 3 else m + 9);
-    const doy = @divFloor(153 * mp + 2, 5) + @as(i64, d) - 1;
-    const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
-    return era * 146097 + doe - 719468;
-}
-
 /// An instant: whole seconds since the epoch plus the fraction digits as
 /// text (compared digit by digit, so no precision is lost).
 const Instant = struct { secs: i64, frac: []const u8 };
@@ -909,7 +898,7 @@ fn instantOf(s: []const u8) Instant {
         offset = (@as(i64, oh) * 60 + @as(i64, om)) * 60;
         if (t[i] == '-') offset = -offset;
     }
-    const secs = daysFromCivil(y, mo, d) * 86400 + @as(i64, h) * 3600 + @as(i64, mi) * 60 + @as(i64, sec) - offset;
+    const secs = datefmt.ymdToEpochDay(@intCast(y), mo, d) * 86400 + @as(i64, h) * 3600 + @as(i64, mi) * 60 + @as(i64, sec) - offset;
     return .{ .secs = secs, .frac = frac };
 }
 
@@ -1511,7 +1500,7 @@ fn isDate(s: []const u8) bool {
     const m = parseDigits(s[5..7]) orelse return false;
     const d = parseDigits(s[8..10]) orelse return false;
     if (m < 1 or m > 12) return false;
-    return d >= 1 and d <= daysInMonth(y, m);
+    return d >= 1 and d <= datefmt.daysInMonth(@intCast(y), m);
 }
 
 /// `HH:MM:SS[.frac][Z|±HH:MM]` with ranges: hour ≤ 23, minute ≤ 59,
@@ -1628,19 +1617,6 @@ fn allDigits(s: []const u8) bool {
         if (!std.ascii.isDigit(c)) return false;
     }
     return true;
-}
-
-fn daysInMonth(y: u32, m: u32) u32 {
-    return switch (m) {
-        1, 3, 5, 7, 8, 10, 12 => 31,
-        4, 6, 9, 11 => 30,
-        2 => if (isLeapYear(y)) @as(u32, 29) else 28,
-        else => unreachable, // caller checked 1–12
-    };
-}
-
-fn isLeapYear(y: u32) bool {
-    return (y % 4 == 0 and y % 100 != 0) or y % 400 == 0;
 }
 
 // ── go-playground formats (2026-10-11) ──────────────────────────────────────

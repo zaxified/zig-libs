@@ -980,7 +980,9 @@ pub const Handler = struct {
         while (it.next(h.io) catch null) |entry| {
             if (!h.options.serve_dotfiles and entry.name.len != 0 and entry.name[0] == '.') continue;
             try w.writeAll("<li>");
-            try writeHtmlEscaped(w, entry.name);
+            // Defense against markup / log injection via crafted filenames;
+            // `"` becomes `&#34;`, as in Go's FileServer listing.
+            try http.writeHtmlEscaped(w, entry.name);
             if (entry.kind == .directory) try w.writeAll("/");
             try w.writeAll("</li>\n");
         }
@@ -1257,19 +1259,6 @@ fn streamRange(io: Io, file: File, rw: *http.Server.ResponseWriter, start: u64, 
         off += n;
         remaining -= n;
     }
-}
-
-/// Minimal HTML text escaping for directory-listing entry names (defense
-/// against markup / log injection via crafted filenames).
-fn writeHtmlEscaped(w: *Writer, s: []const u8) Writer.Error!void {
-    for (s) |c| switch (c) {
-        '&' => try w.writeAll("&amp;"),
-        '<' => try w.writeAll("&lt;"),
-        '>' => try w.writeAll("&gt;"),
-        '"' => try w.writeAll("&quot;"),
-        '\'' => try w.writeAll("&#39;"),
-        else => try w.writeByte(c),
-    };
 }
 
 // ── precompressed variants (shared by `Handler` and `Snapshot`) ─────────────

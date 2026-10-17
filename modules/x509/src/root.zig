@@ -213,7 +213,7 @@ pub const meta = .{
     .role = .util, // pure verification logic; no I/O, no wire framing of its own
     .concurrency = .reentrant, // no shared/global state; every function is a pure value-in/value-out check
     .model_after = "RFC 5280 (X.509 v3 / PKIX) + RFC 9881 (ML-DSA in X.509); built on std.crypto.Certificate (MIT) for DER + single-link verify",
-    .deps = .{ "rsa", "slhdsa", "p521", "p256" }, // p256 + rsa.VerifyKey: the P-256 and PKCS#1 v1.5 signature math (std's is 6–7× slower); p521: ECDSA under P-521 issuer keys (std refuses the curve); rsa.verifyPss for the RSASSA-PSS gap; slhdsa for RFC 9882 certificates (std has no SLH-DSA)
+    .deps = .{ "rsa", "slhdsa", "p521", "p256", "netaddr" }, // netaddr: the IP-literal parsers (one implementation, not a copy); p256 + rsa.VerifyKey: the P-256 and PKCS#1 v1.5 signature math (std's is 6–7× slower); p521: ECDSA under P-521 issuer keys (std refuses the curve); rsa.verifyPss for the RSASSA-PSS gap; slhdsa for RFC 9882 certificates (std has no SLH-DSA)
 };
 
 // ── dark-tests aggregator (CONVENTIONS.md §6 step 3) ────────────────────────

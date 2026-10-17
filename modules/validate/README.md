@@ -29,7 +29,7 @@ source or test corpus of either is reproduced.
   owned by the returned `Report`).
 - **Deps:** `router` (Middleware/Ctx/Next/ctx.data/Params), `http`
   (`Request` body/query, `ResponseWriter`), `netaddr` (the `ipv4`/`ipv6`
-  format validators), `std.json` (Value + parseFromSlice/parseFromValue).
+  format validators), `datefmt` (the civil calendar under `date`/`date-time`), `std.json` (Value + parseFromSlice/parseFromValue).
 
 ## Usage
 

@@ -45,6 +45,7 @@
 const std = @import("std");
 const http = @import("root.zig");
 const Server = @import("Server.zig");
+const datefmt = @import("datefmt");
 
 /// A parsed entity-tag (RFC 9110 §8.8.3). `value` is the opaque-tag text
 /// **including** its surrounding double quotes (as it travels on the wire);
@@ -412,33 +413,16 @@ fn parseAsctime(s: []const u8) ?i64 {
 fn epochFrom(year: i64, month: u32, day: u32, tod: []const u8) ?i64 {
     // The month's own length, not 31: `31 Feb` used to parse as 2 March
     // (Go oracle, 2026-10-05) -- an invalid date must be ignored.
-    if (day < 1 or day > daysInMonth(year, month)) return null;
+    if (year > std.math.maxInt(i32)) return null;
+    const y: i32 = @intCast(year);
+    if (day < 1 or day > datefmt.daysInMonth(y, month)) return null;
     if (tod.len != 8 or tod[2] != ':' or tod[5] != ':') return null;
     const hour = parseDigits(tod[0..2]) orelse return null;
     const min = parseDigits(tod[3..5]) orelse return null;
     const sec = parseDigits(tod[6..8]) orelse return null;
     if (hour > 23 or min > 59 or sec > 60) return null;
-    return daysFromCivil(year, month, day) * std.time.s_per_day +
+    return datefmt.ymdToEpochDay(y, month, day) * std.time.s_per_day +
         @as(i64, hour) * 3600 + @as(i64, min) * 60 + sec;
-}
-
-fn daysInMonth(year: i64, month: u32) u32 {
-    return switch (month) {
-        2 => if (@mod(year, 4) == 0 and (@mod(year, 100) != 0 or @mod(year, 400) == 0)) 29 else 28,
-        4, 6, 9, 11 => 30,
-        else => 31,
-    };
-}
-
-/// Days since 1970-01-01 for a proleptic-Gregorian civil date (Howard
-/// Hinnant's days-from-civil algorithm). `month` is 1-based.
-fn daysFromCivil(year: i64, month: u32, day: u32) i64 {
-    const y = if (month <= 2) year - 1 else year;
-    const era = @divFloor(y, 400);
-    const yoe = y - era * 400; // [0, 399]
-    const doy = @as(i64, (153 * ((month + 9) % 12) + 2) / 5 + day - 1); // [0, 365]
-    const doe = yoe * 365 + @divTrunc(yoe, 4) - @divTrunc(yoe, 100) + doy; // [0, 146096]
-    return era * 146097 + doe - 719468;
 }
 
 /// Strictly numeric, no sign, no whitespace.

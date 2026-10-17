@@ -97,11 +97,12 @@ null exactly for a leaf std cannot parse (RSASSA-PSS, ML-DSA, SLH-DSA). Use
 verification changes — `expected_host` included, which is checked against the
 certificate's real names on every path.
 
-- **Deps:** `rsa`, `slhdsa`, `p521`, `p256`. `rsa` for `rsa.PublicKey`/
+- **Deps:** `rsa`, `slhdsa`, `p521`, `p256`, `netaddr`. `rsa` for `rsa.PublicKey`/
   `rsa.verifyPss` (RSASSA-PSS, which `std.crypto.Certificate` cannot even
   parse) and `rsa.VerifyKey` (PKCS#1 v1.5, faster than std's); `slhdsa` for
   SLH-DSA, which std does not have at all; `p521` for ECDSA under P-521 keys
-  (std refuses the curve); `p256` for P-256 ECDSA (std's is 6–7× slower).
+  (std refuses the curve); `p256` for P-256 ECDSA (std's is 6–7× slower);
+  `netaddr` for the IP-literal parsers (`names.parseIp4/6` are its functions).
   ML-DSA needs no dep: std has the primitives, only the X.509 name was missing.
 
 ## Recon: what `std.crypto.Certificate` already gives us

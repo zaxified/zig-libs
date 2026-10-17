@@ -17,7 +17,8 @@ renewal predicate.
 - **Deps:** `http` (all ACME requests via `http.Client`; the challenge
   server is `http.Server`), `router` (the challenge responder middleware),
   `p256` / `p384` (the ES256 / ES384 account and certificate key types),
-  `entropy` (key generation), `std.crypto` (sha2, hmac, Certificate),
+  `entropy` (key generation), `datefmt` (RFC 3339 times in ARI responses),
+  `std.crypto` (sha2, hmac, Certificate),
   `std.json`, `std.base64`.
 
 Provenance: clean-room implementation from RFC 8555 (ACME), RFC 7515 (JWS),
