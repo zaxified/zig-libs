@@ -132,6 +132,11 @@ pub const Error = error{
     /// lone `script-src 'nonce-..'` would silently drop what `default-src`
     /// allowed).
     NonceDirectiveMissing,
+    /// `nonce_in` names a directive that is not a source list (`sandbox`,
+    /// `report-to`, …) or whose source list is `'none'` — a nonce next to
+    /// `'none'` silently turns "nothing" into "this nonce" (review
+    /// 2026-10-17).
+    NonceDirectiveInvalid,
     NoSpaceLeft,
 };
 
@@ -225,7 +230,11 @@ fn renderImpl(spec: Spec, nonce: ?[]const u8, nonce_in: []const Name, buf: ?[]u8
         vals[i] = d.values;
     }
     if (count == 0) return error.NoDirectives;
-    for (nonce_in) |n| if (!present[@intFromEnum(n)]) return error.NonceDirectiveMissing;
+    for (nonce_in) |n| {
+        if (!present[@intFromEnum(n)]) return error.NonceDirectiveMissing;
+        if (!n.isSourceList()) return error.NonceDirectiveInvalid;
+        for (vals[@intFromEnum(n)]) |v| if (std.ascii.eqlIgnoreCase(v, "'none'")) return error.NonceDirectiveInvalid;
+    }
 
     var out: Out = .{ .buf = buf };
     for (order[0..count], 0..) |name, idx| {
@@ -277,6 +286,11 @@ pub fn render(spec: Spec, out: []u8) Error![]const u8 {
 
 /// Render `spec` with `'nonce-<nonce>'` appended to each directive in
 /// `nonce_in` (typically `&.{ .script_src, .style_src }`), into `out`.
+/// ⚠ CSP semantics, not a bug: a browser that understands nonces IGNORES
+/// `'unsafe-inline'` in a directive that also carries one — helmet's default
+/// `style-src ... 'unsafe-inline'` plus a nonce means un-nonced inline styles
+/// stop working (the `'unsafe-inline'` stays only as the fallback for
+/// pre-CSP2 browsers, the strict-CSP recommendation).
 pub fn renderNonce(spec: Spec, nonce: *const Nonce, nonce_in: []const Name, out: []u8) Error![]const u8 {
     const n = try renderImpl(spec, nonce.slice(), nonce_in, out);
     return out[0..n];
@@ -323,6 +337,15 @@ const helmet_default_csp = "default-src 'self';base-uri 'self';font-src 'self' h
     "form-action 'self';frame-ancestors 'self';img-src 'self' data:;" ++
     "object-src 'none';script-src 'self';script-src-attr 'none';" ++
     "style-src 'self' https: 'unsafe-inline';upgrade-insecure-requests";
+
+test "renderNonce: a nonce on 'none' or on a non-source-list directive is refused" {
+    var buf: [1024]u8 = undefined;
+    const nonce = Nonce.fromBytes(&@splat(7));
+    // helmet's defaults have script-src-attr 'none'.
+    try testing.expectError(error.NonceDirectiveInvalid, renderNonce(.{}, &nonce, &.{.script_src_attr}, &buf));
+    try testing.expectError(error.NonceDirectiveInvalid, renderNonce(.{ .directives = &.{.{ .name = .sandbox }} }, &nonce, &.{.sandbox}, &buf));
+    _ = try renderNonce(.{}, &nonce, &.{ .script_src, .style_src }, &buf);
+}
 
 test "build: helmet useDefaults output, comptime" {
     try testing.expectEqualStrings(helmet_default_csp, comptime build(.{}));

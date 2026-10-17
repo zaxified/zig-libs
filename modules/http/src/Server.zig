@@ -610,8 +610,9 @@ pub const Options = struct {
     /// with it). E.g. `security-headers`' `SecurityHeaders.staticHeaders`.
     /// An entry whose name is not a token or is managed by the server
     /// (`Content-Length`, `Content-Type`, `Connection`, `Transfer-Encoding`,
-    /// `Date`, `Server`), or whose value cannot go on the wire, is skipped;
-    /// at most `max_error_headers` are used.
+    /// `Date`, `Server`, or a connection-specific one HTTP/2 forbids), or whose
+    /// value cannot go on the wire, is skipped; the first `max_error_headers`
+    /// usable ones are used.
     error_headers: []const http.Header = &.{},
     /// Auto `Date` header (IMF-fixdate) on every response. true (default)
     /// installs the server's own wall clock, exactly as before this field
@@ -2415,9 +2416,8 @@ fn serveOne(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers,
         rw.reset() catch return .close;
         rw.setStatus(500);
         rw.setHeader("Content-Type", "text/plain") catch return .close;
-        for (usableErrorHeaders(opts.error_headers)) |h| {
-            if (errorHeaderUsable(h)) rw.setHeader(h.name, h.value) catch {};
-        }
+        var it = usableErrorHeaders(opts.error_headers);
+        while (it.next()) |h| rw.setHeader(h.name, h.value) catch {};
         rw.writeAll("Internal Server Error\n") catch return .close;
     };
     // A detached response stays OPEN: no `end`, no chunked terminator, no
@@ -2470,17 +2470,39 @@ fn respondError(opts: StreamOptions, out: *Writer, date: ?[]const u8, status: u1
     return .close;
 }
 
-/// Upper bound on `Options.error_headers` used (the rest are ignored).
-pub const max_error_headers = 16;
+/// Upper bound on the `Options.error_headers` entries used: the first this
+/// many USABLE ones (skipped entries do not count); the rest are ignored.
+pub const max_error_headers = 32;
 
-pub fn usableErrorHeaders(hs: []const http.Header) []const http.Header {
-    return hs[0..@min(hs.len, max_error_headers)];
+/// Iterates the usable `error_headers` entries, at most `max_error_headers`.
+pub const ErrorHeaderIterator = struct {
+    hs: []const http.Header,
+    i: usize = 0,
+    used: usize = 0,
+
+    pub fn next(it: *ErrorHeaderIterator) ?http.Header {
+        while (it.i < it.hs.len and it.used < max_error_headers) {
+            const h = it.hs[it.i];
+            it.i += 1;
+            if (errorHeaderUsable(h)) {
+                it.used += 1;
+                return h;
+            }
+        }
+        return null;
+    }
+};
+
+pub fn usableErrorHeaders(hs: []const http.Header) ErrorHeaderIterator {
+    return .{ .hs = hs };
 }
 
-/// Whether one `error_headers` entry may go on the wire (see the option).
+/// Whether one `error_headers` entry may go on the wire (see the option):
+/// a token name, a valid value, and not a header the server manages or one
+/// HTTP/2 forbids (connection-specific: RFC 9113 §8.2.2).
 pub fn errorHeaderUsable(h: http.Header) bool {
     if (!h1.isToken(h.name) or !h1.isValidFieldValue(h.value)) return false;
-    const managed = [_][]const u8{ "content-length", "content-type", "connection", "transfer-encoding", "date", "server" };
+    const managed = [_][]const u8{ "content-length", "content-type", "connection", "transfer-encoding", "date", "server", "keep-alive", "upgrade", "proxy-connection", "te" };
     for (managed) |m| if (std.ascii.eqlIgnoreCase(m, h.name)) return false;
     return true;
 }
@@ -2490,9 +2512,8 @@ fn writeErrorResponse(opts: StreamOptions, out: *Writer, date: ?[]const u8, stat
     try out.print("HTTP/1.1 {d} {s}\r\n", .{ status, reason });
     if (date) |d| try out.print("Date: {s}\r\n", .{d});
     if (opts.server_name) |sn| try out.print("Server: {s}\r\n", .{sn});
-    for (usableErrorHeaders(opts.error_headers)) |h| {
-        if (errorHeaderUsable(h)) try out.print("{s}: {s}\r\n", .{ h.name, h.value });
-    }
+    var it = usableErrorHeaders(opts.error_headers);
+    while (it.next()) |h| try out.print("{s}: {s}\r\n", .{ h.name, h.value });
     try out.print("Content-Type: text/plain\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{reason.len + 1});
     try out.print("{s}\n", .{reason});
 }
@@ -5449,6 +5470,18 @@ test "serveStream: error_headers go on the server's own 4xx/5xx answers, not on 
     // A handler's own response is the handler's (and its middleware's).
     const ok = runStreamWith(.{ .error_headers = &extra }, null, "GET /hello HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &out_buf);
     try testing.expect(std.mem.indexOf(u8, ok, "nosniff") == null);
+}
+
+test "serveStream: error_headers cap counts usable entries only" {
+    var extra: [40]http.Header = undefined;
+    var names: [40][8]u8 = undefined;
+    extra[0] = .{ .name = "Server", .value = "x" }; // skipped, not counted
+    for (extra[1..], names[1..], 1..) |*h, *nb, i| h.* = .{ .name = std.fmt.bufPrint(nb, "X-H{d}", .{i}) catch unreachable, .value = "1" };
+    var out_buf: [4096]u8 = undefined;
+    const got = runStreamWith(.{ .error_headers = &extra }, null, "GET / HTTP/1.1\r\n\r\n", &out_buf);
+    try testing.expect(std.mem.indexOf(u8, got, "\r\nX-H32: 1\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, got, "\r\nX-H33: 1\r\n") == null);
+    try testing.expect(std.mem.indexOf(u8, got, "Server: x") == null);
 }
 
 test "serveStream: explicit Content-Length responses" {

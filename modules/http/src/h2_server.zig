@@ -2142,10 +2142,13 @@ const Session = struct {
         n += 1;
         fields[n] = .{ .name = "content-length", .value = len_str };
         n += 1;
-        for (Server.usableErrorHeaders(s.opts.error_headers), 0..) |h, i| {
-            if (!Server.errorHeaderUsable(h) or h.name.len > lower_names[i].len) continue;
-            fields[n] = .{ .name = std.ascii.lowerString(&lower_names[i], h.name), .value = h.value };
+        var it = Server.usableErrorHeaders(s.opts.error_headers);
+        var used: usize = 0;
+        while (it.next()) |h| {
+            if (h.name.len > lower_names[used].len) continue; // a name over 64 bytes is not a security header
+            fields[n] = .{ .name = std.ascii.lowerString(&lower_names[used], h.name), .value = h.value };
             n += 1;
+            used += 1;
         }
         s.conn.sendHeaders(&s.wire, id, fields[0..n], false) catch return .keep; // stream gone (reset) or overloaded
         s.conn.sendData(&s.wire, id, body_text, true) catch {

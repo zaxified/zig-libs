@@ -658,7 +658,9 @@ pub const Kind = enum { counter, gauge, histogram, summary };
 
 /// A value read at scrape time (client_golang `CounterFunc`/`GaugeFunc`):
 /// `f(ctx)` is called by every scrape, from the scraping thread — it must
-/// be thread-safe and fast.
+/// be thread-safe and fast. `ctx` must stay valid until the registry's
+/// `deinit`: a scrape that started before an `unregister`/`delete`/`reset`
+/// of the series may still call `f(ctx)` after that returned.
 pub const ValueFn = *const fn (ctx: ?*anyopaque) f64;
 
 const Func = struct {
@@ -761,6 +763,10 @@ const Family = struct {
     desc_index: usize = 0,
     /// Removed by `unregister`: a collector's samples for it are dropped.
     removed: bool = false,
+    /// Series pointers into this family are held by a component that never
+    /// lets go of them (`RequestMetrics`): `delete`/`reset`/`unregister`
+    /// refuse it, as freeing those series would be a use-after-free.
+    pinned: bool = false,
     /// Label values -> child: O(1) get on the request path (a linear scan
     /// with string compares was the whole 1.66x of the `counter_vec` bench
     /// row against client_golang's hashed `WithLabelValues`, 2026-10-17).
@@ -880,13 +886,15 @@ pub const Registry = struct {
     }
 
     /// Remove the family `name` and every series in it (client_golang
-    /// `Unregister`). Returns whether it existed. Pointers into it must not
+    /// `Unregister`). Returns whether it was removed — false when it does
+    /// not exist or is pinned (a family `RequestMetrics` records into). Pointers into it must not
     /// be used afterwards; the name may be registered again, with any
     /// descriptor. The family's own strings stay in the arena until `deinit`
     /// (a few bytes per unregister).
     pub fn unregister(r: *Registry, name: []const u8) bool {
         lockSpin(&r.lock);
         defer r.lock.unlock();
+        if (r.family_index.get(name)) |f| if (f.pinned) return false;
         const kv = r.family_index.fetchRemove(name) orelse return false;
         const fam = kv.value;
         @atomicStore(bool, &fam.removed, true, .monotonic);
@@ -961,7 +969,10 @@ pub const Registry = struct {
     pub fn registerCollector(r: *Registry, descs: []const Desc, collector: Collector) RegisterError!void {
         for (descs, 0..) |d, i| {
             try validateDescriptor(d.name, d.help, d.kind, d.label_names, &.{}, .{});
-            for (descs[0..i]) |prev| if (std.mem.eql(u8, prev.name, d.name)) return error.AlreadyRegistered;
+            for (descs[0..i]) |prev| {
+                if (std.mem.eql(u8, prev.name, d.name)) return error.AlreadyRegistered;
+                if (derivedCollision(prev, d) or derivedCollision(d, prev)) return error.NameCollision;
+            }
         }
         lockSpin(&r.lock);
         defer r.lock.unlock();
@@ -995,6 +1006,13 @@ pub const Registry = struct {
             r.families.appendAssumeCapacity(f);
             r.family_index.putAssumeCapacity(f.name, f);
         }
+    }
+
+    /// Mark a family as pinned (see `Family.pinned`).
+    fn pin(r: *Registry, name: []const u8) void {
+        lockSpin(&r.lock);
+        defer r.lock.unlock();
+        if (r.family_index.get(name)) |f| f.pinned = true;
     }
 
     fn validateDescriptor(name: []const u8, help: []const u8, kind: Kind, label_names: []const []const u8, buckets: []const f64, sopts: SummaryOptions) RegisterError!void {
@@ -1178,6 +1196,7 @@ pub const Registry = struct {
     }
 
     fn deleteLocked(r: *Registry, fam: *Family, values: []const []const u8) bool {
+        if (fam.pinned) return false;
         const kv = fam.index.fetchRemoveAdapted(values, ValuesAdapter{}) orelse return false;
         const c = kv.key;
         for (fam.children.items, 0..) |x, i| if (x == c) {
@@ -1531,7 +1550,7 @@ pub const ProcessCollector = struct {
     pub fn register(pc: *ProcessCollector, r: *Registry, namespace: []const u8) RegisterError!void {
         if (procnet.readStat(pc.gpa, pc.io)) |st| {
             defer st.deinit(pc.gpa);
-            pc.btime = st.btime;
+            pc.btime = st.btime; // 0 when /proc/stat is unreadable: no start-time sample then
         } else |err| return err;
         var bufs: [base.len][128]u8 = undefined;
         var descs: [base.len]Desc = undefined;
@@ -1564,7 +1583,8 @@ pub const ProcessCollector = struct {
         if (fds) |n| try sink.gauge(open_fds, &.{}, @floatFromInt(n));
         if (stat) |s| {
             try sink.gauge(rss, &.{}, @floatFromInt(s.residentBytesNow()));
-            try sink.gauge(start, &.{}, s.startTimeSeconds(pc.btime));
+            // Without a boot time the value would be ~1970, not a start time.
+            if (pc.btime != 0) try sink.gauge(start, &.{}, s.startTimeSeconds(pc.btime));
             try sink.gauge(vsize, &.{}, @floatFromInt(s.vsize));
         }
         if (limits) |l| try sink.gauge(vsize_max, &.{}, if (l.maxAddressSpace()) |v| @floatFromInt(v) else unlimited);
@@ -1599,8 +1619,9 @@ pub fn Vec(comptime kind: Kind) type {
             return &@field(c.data, @tagName(kind));
         }
 
-        /// Remove the series for `values`; returns whether it existed
-        /// (client_golang `DeleteLabelValues`). ⚠ Unlike Go, the series'
+        /// Remove the series for `values`; returns whether it was removed
+        /// (client_golang `DeleteLabelValues`) — false when absent or the
+        /// family is pinned (see `Registry.unregister`). ⚠ Unlike Go, the series'
         /// memory is given back: a pointer from `with` for these values must
         /// not be used after this returns (a later `with` creates a fresh,
         /// zeroed series). A scrape running concurrently is safe — the
@@ -1612,11 +1633,14 @@ pub fn Vec(comptime kind: Kind) type {
         }
 
         /// Remove every series of the family (client_golang `Reset`); the
-        /// family stays registered. Same pointer rule as `delete`.
-        pub fn reset(v: Self) void {
+        /// family stays registered. Same pointer rule as `delete`. Returns
+        /// false (and removes nothing) for a pinned family.
+        pub fn reset(v: Self) bool {
             lockSpin(&v.registry.lock);
             defer v.registry.lock.unlock();
+            if (v.family.pinned) return false;
             v.registry.retireAllLocked(v.family);
+            return true;
         }
 
         /// Number of series currently in the family.
@@ -1632,6 +1656,16 @@ pub const CounterVec = Vec(.counter);
 pub const GaugeVec = Vec(.gauge);
 pub const HistogramVec = Vec(.histogram);
 pub const SummaryVec = Vec(.summary);
+
+/// Whether `h` (a histogram or summary) would emit a sample named like `x`.
+fn derivedCollision(h: Desc, x: Desc) bool {
+    if (h.kind != .histogram and h.kind != .summary) return false;
+    const suffixes = [_][]const u8{ "_bucket", "_sum", "_count" };
+    for (suffixes) |suf| {
+        if (x.name.len == h.name.len + suf.len and std.mem.startsWith(u8, x.name, h.name) and std.mem.endsWith(u8, x.name, suf)) return true;
+    }
+    return false;
+}
 
 /// Same summary options, objectives compared as a set (`have` is sorted).
 fn sameSummaryOptions(have: SummaryOptions, want: SummaryOptions) bool {
@@ -1663,15 +1697,43 @@ pub const Format = enum {
         };
     }
 
-    /// The format to answer a request with: OpenMetrics only when the
-    /// client prefers it in `Accept` (RFC 9110 weights; Prometheus sends
-    /// `application/openmetrics-text;version=1.0.0;q=0.5,…,text/plain;
-    /// version=0.0.4;q=0.3,*/*;q=0.2`), else the text format — also for a
-    /// missing `Accept` or `*/*` (client_golang `NegotiateIncludingOpenMetrics`).
+    /// The format to answer a request with, as prometheus/common `expfmt`
+    /// `NegotiateIncludingOpenMetrics` decides it among the formats this
+    /// module writes: `Accept` clauses by descending `q` (ties: a concrete
+    /// type before `*`), the first that matches OpenMetrics 1.0.0, OpenMetrics
+    /// 0.0.1 (written as 1.0.0) or text 0.0.4 wins; nothing → text. Only the
+    /// `version` parameter is compared (a missing one defaults to 0.0.1 for
+    /// OpenMetrics, 0.0.4 for text); others — Prometheus 3's `escaping=` —
+    /// are ignored, as expfmt does. Deviation: a `q=0` clause is skipped
+    /// (RFC 9110 "not acceptable"; expfmt still matches it, last).
     pub fn negotiate(accept: []const u8) Format {
-        const offers = [_][]const u8{ "text/plain;version=0.0.4", "application/openmetrics-text;version=1.0.0", "application/openmetrics-text;version=0.0.1" };
-        const got = http.conneg.negotiate(accept, &offers) orelse return .text;
-        return if (got.index == 0) .text else .openmetrics;
+        var buf: [32]http.conneg.MediaRange = undefined;
+        const ranges = http.conneg.parse(accept, &buf);
+        std.sort.insertion(http.conneg.MediaRange, ranges, {}, struct {
+            fn lt(_: void, a: http.conneg.MediaRange, b: http.conneg.MediaRange) bool {
+                if (a.weight != b.weight) return a.weight > b.weight;
+                const a_rank = @as(u2, @intFromBool(!std.mem.eql(u8, a.type, "*"))) + @intFromBool(!std.mem.eql(u8, a.subtype, "*"));
+                const b_rank = @as(u2, @intFromBool(!std.mem.eql(u8, b.type, "*"))) + @intFromBool(!std.mem.eql(u8, b.subtype, "*"));
+                return a_rank > b_rank;
+            }
+        }.lt);
+        for (ranges) |r| {
+            if (r.weight == 0) continue;
+            if (acceptMatches(r, "application", "openmetrics-text", "1.0.0")) return .openmetrics;
+            if (acceptMatches(r, "application", "openmetrics-text", "0.0.1")) return .openmetrics;
+            if (acceptMatches(r, "text", "plain", "0.0.4")) return .text;
+        }
+        return .text;
+    }
+
+    /// expfmt `matchFormat` for one offer.
+    fn acceptMatches(r: http.conneg.MediaRange, type_: []const u8, subtype: []const u8, version: []const u8) bool {
+        if (!r.matches(type_, subtype)) return false;
+        const exact_om = std.ascii.eqlIgnoreCase(r.type, "application") and std.ascii.eqlIgnoreCase(r.subtype, "openmetrics-text");
+        const exact_text = std.ascii.eqlIgnoreCase(r.type, "text") and std.ascii.eqlIgnoreCase(r.subtype, "plain");
+        const have = r.param("version") orelse
+            (if (exact_om) "0.0.1" else if (exact_text) "0.0.4" else "");
+        return std.mem.eql(u8, have, version);
     }
 };
 
@@ -2158,6 +2220,13 @@ pub const RequestMetrics = struct {
         if (options.response_size_buckets) |bs| _ = try registry.histogram(options.response_size_name, options.response_size_help, &.{
             .{ .name = "method", .value = @tagName(http.Method.get) },
         }, bs);
+        // This middleware keeps series pointers for its whole life: its
+        // families must never be freed under it (review 2026-10-17, M1).
+        registry.pin(options.in_flight_name);
+        registry.pin(options.counter_name);
+        registry.pin(options.histogram_name);
+        if (options.request_size_buckets != null) registry.pin(options.request_size_name);
+        if (options.response_size_buckets != null) registry.pin(options.response_size_name);
         return .{
             .registry = registry,
             .options = options,
@@ -3946,7 +4015,7 @@ test "Vec: a family with no series is not exposed; delete and reset remove serie
         \\
     , try scrapeInto(&reg, &buf));
 
-    v.reset();
+    try testing.expect(v.reset());
     try testing.expectEqual(@as(usize, 0), v.len());
     try testing.expectEqualStrings("", try scrapeInto(&reg, &buf));
     (try v.with(&.{"a"})).inc();
@@ -3960,7 +4029,7 @@ test "Vec: histogram series are freed with their buckets (testing.allocator leak
     (try v.with(&.{"read"})).observe(0.02);
     (try v.with(&.{"write"})).observe(3);
     try testing.expect(v.delete(&.{"read"}));
-    v.reset();
+    try testing.expect(v.reset());
     (try v.with(&.{"read"})).observe(1);
     try testing.expectEqual(@as(u64, 1), (try v.with(&.{"read"})).count());
 }
@@ -4005,7 +4074,7 @@ test "delete during a scrape: the series is parked until the last scrape ends" {
     // Stand in for a scrape between its snapshot and its end.
     reg.active_scrapes = 1;
     try testing.expect(v.delete(&.{"a"}));
-    v.reset();
+    try testing.expect(v.reset());
     try testing.expectEqual(@as(usize, 2), reg.retired.items.len);
     reg.active_scrapes = 0;
     // A real scrape ends with active_scrapes back at 0 and drains the park.
@@ -4027,7 +4096,7 @@ test "delete/with racing concurrent scrapes stays consistent (no UAF, no leak)" 
             while (!s.load(.acquire)) : (i += 1) {
                 const k = keys[i % keys.len];
                 if (i % 3 == 0) _ = vec.delete(&.{k}) else (vec.with(&.{k}) catch unreachable).inc();
-                if (i % 997 == 0) vec.reset();
+                if (i % 997 == 0) _ = vec.reset();
             }
         }
     };
@@ -4332,6 +4401,15 @@ test "Format.negotiate: OpenMetrics only when preferred (Prometheus's Accept)" {
     ));
     try testing.expectEqual(Format.text, Format.negotiate("application/openmetrics-text;q=0.2,text/plain;q=0.9"));
     try testing.expectEqual(Format.text, Format.negotiate("application/json"));
+    // Prometheus 3.x: `escaping=` parameters are not a reason to fall back.
+    try testing.expectEqual(Format.openmetrics, Format.negotiate(
+        "application/openmetrics-text;version=1.0.0;escaping=allow-utf-8;q=0.6,application/openmetrics-text;version=0.0.1;q=0.5,text/plain;version=1.0.0;escaping=allow-utf-8;q=0.4,text/plain;version=0.0.4;q=0.3,*/*;q=0.2",
+    ));
+    // A bare OpenMetrics range is 0.0.1 (served as 1.0.0); another version is not ours.
+    try testing.expectEqual(Format.openmetrics, Format.negotiate("application/openmetrics-text"));
+    try testing.expectEqual(Format.text, Format.negotiate("application/openmetrics-text;version=2.0.0"));
+    // `q=0` is "not acceptable".
+    try testing.expectEqual(Format.text, Format.negotiate("application/openmetrics-text;version=1.0.0;q=0"));
 }
 
 test "Endpoint: open_metrics negotiates, default stays text" {
@@ -4617,6 +4695,40 @@ test "Timer: observeDurationSummary records seconds into a Summary" {
     const snap = sm.snapshot(&none);
     try testing.expectEqual(@as(u64, 1), snap.count);
     try testing.expectEqual(@as(f64, 0.25), snap.sum);
+}
+
+test "pinned: RequestMetrics' families cannot be deleted, reset or unregistered under it" {
+    var reg = Registry.init(testing.allocator);
+    defer reg.deinit();
+    var rm = try RequestMetrics.init(&reg, .{ .request_size_buckets = &.{ 100, 1000 } });
+    _ = &rm;
+    const opts: RequestMetrics.Options = .{};
+    try testing.expect(!reg.unregister(opts.counter_name));
+    try testing.expect(!reg.unregister(opts.in_flight_name));
+    try testing.expect(!reg.unregister(opts.request_size_name));
+    const v = try reg.counterVec(opts.counter_name, opts.counter_help, &.{ "method", "code" });
+    try testing.expect(!v.reset());
+    try testing.expect(!v.delete(&.{ "get", "2xx" }));
+    try testing.expectEqual(@as(usize, 1), v.len());
+    // An unpinned family still can.
+    _ = try reg.counter("free_total", "h", &.{});
+    try testing.expect(reg.unregister("free_total"));
+}
+
+test "registerCollector: a sibling desc colliding with a histogram's derived names is refused" {
+    var reg = Registry.init(testing.allocator);
+    defer reg.deinit();
+    const Noop = struct {
+        fn collect(_: ?*anyopaque, _: *Sink) anyerror!void {}
+    };
+    try testing.expectError(error.NameCollision, reg.registerCollector(&.{
+        .{ .name = "lat", .help = "h", .kind = .histogram },
+        .{ .name = "lat_count", .help = "h", .kind = .gauge },
+    }, .{ .collect = Noop.collect }));
+    try testing.expectError(error.NameCollision, reg.registerCollector(&.{
+        .{ .name = "q_sum", .help = "h", .kind = .gauge },
+        .{ .name = "q", .help = "h", .kind = .summary },
+    }, .{ .collect = Noop.collect }));
 }
 
 // ── external anchor: client_golang + expfmt + textparse ────────────────────

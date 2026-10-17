@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-17** — `csp.renderNonce`/`applyCspNonce`: `error.NonceDirectiveInvalid` for a nonce on a `'none'` source list (it silently turned "nothing" into "this nonce") or on a non-source-list directive; documented that a nonce disables `'unsafe-inline'` in the same directive (CSP semantics).
+
 - **2026-10-17** — Comparative benchmark against unrolled/secure v1.17.0 (`tools/bench.zig`, `tools/go_bench/`, `zig build bench-security-headers`): default set (`apply`, `applyStatic`) and CSP with a per-response nonce (`applyCspNonce`), header work only, no HTTP stack; ours/Go 0.03, 0.01, 0.70 (x86-64). Tooling only, no code change.
 - **2026-10-17** — ADDED: `SecurityHeaders.staticHeaders(comptime options)` — the `applyStatic` header set as data, for `http.Server.Options.error_headers`, so the server's own 4xx/5xx answers (which no middleware sees) carry the same headers. `applyStatic` is now built on it (same bytes, same order).
 
