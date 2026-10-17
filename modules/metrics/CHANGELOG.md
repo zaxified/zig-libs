@@ -5,6 +5,19 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-17** — **OpenMetrics, callback series, collectors** (second wave of the S2 work).
+  - ADDED: `Registry.writeOpenMetrics` / `write(w, Format)` / `respondFormat`; `Format.negotiate`
+    (client_golang `NegotiateIncludingOpenMetrics`); `Endpoint.open_metrics` (default off, as
+    promhttp's `EnableOpenMetrics`); `content_type_openmetrics`. Output is byte-identical to
+    prometheus/common v0.71.0 `expfmt` (golden from `tools/go_golden`): `x_total` counters announced
+    as `x`, suffix-less counters `unknown`, OpenMetrics floats, `# EOF`. No `_created`, no exemplars.
+  - ADDED: `Registry.counterFunc` / `gaugeFunc` (client_golang `CounterFunc`/`GaugeFunc`) and
+    `Registry.registerCollector(descs, Collector)` with `Sink` (client_golang `Collector` +
+    `MustNewConst*`); `Kind` and `Desc` are public. New `RegisterError.AlreadyRegistered`.
+  - **BEHAVIOURAL:** text-format floats are now Go's shortest `%g`, as expfmt writes them
+    (`1.2345675e+06`, `1e-05`; was always-decimal `{d}`). Same values, client_golang's bytes;
+    `go_oracle_vectors.zig` re-taken (163 scripts, 0 mismatches).
+
 - **2026-10-17** — **`*Vec` handles + series removal** (client_golang `CounterVec`/`GaugeVec`/`HistogramVec`).
   - ADDED: `Registry.counterVec`/`gaugeVec`/`histogramVec` (descriptor validated once) and
     `Vec.with(values)` — one hashed lookup per call; `Vec.delete`, `Vec.reset`, `Vec.len`,

@@ -336,14 +336,33 @@ pub const RegisterError = error{
     BucketsMismatch,
     /// More than `max_labels` labels.
     TooManyLabels,
+    /// The name (or, for a callback, the exact series) is already taken in
+    /// a way that cannot be shared: a `counterFunc`/`gaugeFunc` series
+    /// registered twice, a callback family asked for an ordinary series
+    /// (or the reverse), or a `registerCollector` name that already exists
+    /// (client_golang `AlreadyRegisteredError`).
+    AlreadyRegistered,
 };
 
-const Kind = enum { counter, gauge, histogram };
+/// An instrument kind — what a family's `# TYPE` line says.
+pub const Kind = enum { counter, gauge, histogram };
 
-const Instrument = union(Kind) {
+/// A value read at scrape time (client_golang `CounterFunc`/`GaugeFunc`):
+/// `f(ctx)` is called by every scrape, from the scraping thread — it must
+/// be thread-safe and fast.
+pub const ValueFn = *const fn (ctx: ?*anyopaque) f64;
+
+const Func = struct {
+    ctx: ?*anyopaque,
+    f: ValueFn,
+};
+
+const Instrument = union(enum) {
     counter: Counter,
     gauge: Gauge,
     histogram: Histogram,
+    counter_func: Func,
+    gauge_func: Func,
 };
 
 /// One time series: a fixed label-value tuple + its instrument. Owned by the
@@ -413,6 +432,14 @@ const Family = struct {
     buckets: []const f64,
     /// Registration order (exposition order).
     children: std.ArrayList(*Child) = .empty,
+    /// Every series is a `counterFunc`/`gaugeFunc` callback.
+    funcs: bool = false,
+    /// Set for a family a `Collector` emits (it then has no children).
+    collector: ?*CollectorEntry = null,
+    /// This family's position in its collector's `descs`.
+    desc_index: usize = 0,
+    /// Removed by `unregister`: a collector's samples for it are dropped.
+    removed: bool = false,
     /// Label values -> child: O(1) get on the request path (a linear scan
     /// with string compares was the whole 1.66x of the `counter_vec` bench
     /// row against client_golang's hashed `WithLabelValues`, 2026-10-17).
@@ -524,6 +551,7 @@ pub const Registry = struct {
         defer r.lock.unlock();
         const kv = r.family_index.fetchRemove(name) orelse return false;
         const fam = kv.value;
+        @atomicStore(bool, &fam.removed, true, .monotonic);
         for (r.families.items, 0..) |f, i| if (f == fam) {
             _ = r.families.orderedRemove(i);
             break;
@@ -535,6 +563,100 @@ pub const Registry = struct {
         // and `deinit` still frees what it accumulates.
         r.orphaned.append(r.arena.allocator(), fam) catch {};
         return true;
+    }
+
+    /// Register a counter series whose value `f(ctx)` reads at scrape time
+    /// (client_golang `CounterFunc`) — e.g. a total kept by another
+    /// component. The value must not decrease. The family may hold several
+    /// callback series (one per label-value tuple) but no ordinary ones.
+    pub fn counterFunc(r: *Registry, name: []const u8, help: []const u8, labels: []const Label, ctx: ?*anyopaque, f: ValueFn) RegisterError!void {
+        return r.registerFunc(name, help, .counter, labels, .{ .counter_func = .{ .ctx = ctx, .f = f } });
+    }
+
+    /// Register a gauge series read at scrape time (client_golang
+    /// `GaugeFunc`); see `counterFunc`.
+    pub fn gaugeFunc(r: *Registry, name: []const u8, help: []const u8, labels: []const Label, ctx: ?*anyopaque, f: ValueFn) RegisterError!void {
+        return r.registerFunc(name, help, .gauge, labels, .{ .gauge_func = .{ .ctx = ctx, .f = f } });
+    }
+
+    fn registerFunc(r: *Registry, name: []const u8, help: []const u8, kind: Kind, labels: []const Label, data: Instrument) RegisterError!void {
+        if (labels.len > max_labels) return error.TooManyLabels;
+        var names: [max_labels][]const u8 = undefined;
+        var values: [max_labels][]const u8 = undefined;
+        for (labels, 0..) |l, i| {
+            names[i] = l.name;
+            values[i] = l.value;
+        }
+        try validateDescriptor(name, help, kind, names[0..labels.len], &.{});
+        for (values[0..labels.len]) |v| if (!std.unicode.utf8ValidateSlice(v)) return error.InvalidUtf8;
+        lockSpin(&r.lock);
+        defer r.lock.unlock();
+        const fam = try r.familyLocked(name, help, kind, names[0..labels.len], &.{});
+        if (fam.collector != null) return error.AlreadyRegistered;
+        if (!fam.funcs and fam.children.items.len != 0) return error.AlreadyRegistered;
+        if (fam.index.getKeyAdapted(@as([]const []const u8, values[0..labels.len]), ValuesAdapter{}) != null) return error.AlreadyRegistered;
+        const gpa = r.arena.child_allocator;
+        try fam.children.ensureUnusedCapacity(gpa, 1);
+        try fam.index.ensureUnusedCapacityContext(gpa, 1, ChildContext{});
+        const c = try gpa.create(Child);
+        errdefer gpa.destroy(c);
+        const owned = try gpa.alloc([]const u8, labels.len);
+        errdefer gpa.free(owned);
+        var done: usize = 0;
+        errdefer for (owned[0..done]) |v| gpa.free(v);
+        for (owned, values[0..labels.len]) |*slot, v| {
+            slot.* = try gpa.dupe(u8, v);
+            done += 1;
+        }
+        c.* = .{ .label_values = owned, .data = data };
+        fam.funcs = true;
+        fam.children.appendAssumeCapacity(c);
+        fam.index.putAssumeCapacityNoClobberContext(c, {}, ChildContext{});
+    }
+
+    /// Register a `Collector`: the families it emits, described up front
+    /// (client_golang `Collector.Describe`), and the callback that emits
+    /// their samples on every scrape (`Collect`). Every name must be new
+    /// (`AlreadyRegistered` otherwise) — a collector owns its families.
+    /// They are exposed in `descs` order, at this point of the registration
+    /// order. `collector.ctx` must outlive the registry.
+    pub fn registerCollector(r: *Registry, descs: []const Desc, collector: Collector) RegisterError!void {
+        for (descs, 0..) |d, i| {
+            try validateDescriptor(d.name, d.help, d.kind, d.label_names, &.{});
+            for (descs[0..i]) |prev| if (std.mem.eql(u8, prev.name, d.name)) return error.AlreadyRegistered;
+        }
+        lockSpin(&r.lock);
+        defer r.lock.unlock();
+        for (descs) |d| {
+            if (r.family_index.contains(d.name)) return error.AlreadyRegistered;
+            try r.checkSuffixCollisionLocked(d.name, d.kind);
+        }
+        const a = r.arena.allocator();
+        const entry = try a.create(CollectorEntry);
+        entry.* = .{ .collector = collector, .families = try a.alloc(*Family, descs.len) };
+        try r.families.ensureUnusedCapacity(a, descs.len);
+        try r.family_index.ensureUnusedCapacity(a, @intCast(descs.len));
+        for (descs, entry.families, 0..) |d, *slot, i| {
+            const f = try a.create(Family);
+            f.* = .{
+                .name = try a.dupe(u8, d.name),
+                .help = try a.dupe(u8, d.help),
+                .kind = d.kind,
+                .label_names = blk: {
+                    const out = try a.alloc([]const u8, d.label_names.len);
+                    for (out, d.label_names) |*o, ln| o.* = try a.dupe(u8, ln);
+                    break :blk out;
+                },
+                .buckets = &.{},
+                .collector = entry,
+                .desc_index = i,
+            };
+            slot.* = f;
+        }
+        for (entry.families) |f| {
+            r.families.appendAssumeCapacity(f);
+            r.family_index.putAssumeCapacity(f.name, f);
+        }
     }
 
     fn validateDescriptor(name: []const u8, help: []const u8, kind: Kind, label_names: []const []const u8, buckets: []const f64) RegisterError!void {
@@ -627,6 +749,7 @@ pub const Registry = struct {
     /// `r.lock`. Values are UTF-8-checked only on creation: a lookup hit
     /// matched a value that was checked when it was stored.
     fn childLocked(r: *Registry, fam: *Family, values: []const []const u8) RegisterError!*Child {
+        if (fam.funcs or fam.collector != null) return error.AlreadyRegistered;
         if (values.len != fam.label_names.len) return error.LabelMismatch;
         const gpa = r.arena.child_allocator;
         if (fam.index.getKeyAdapted(values, ValuesAdapter{})) |c| return c;
@@ -745,6 +868,24 @@ pub const Registry = struct {
     /// only to snapshot family/children pointers, not for the formatting
     /// itself (see the F2 comment inside).
     pub fn writeText(r: *Registry, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        return r.write(w, .text);
+    }
+
+    /// Write the whole registry as OpenMetrics 1.0 text (client_golang's
+    /// output with `EnableOpenMetrics`, byte for byte as prometheus/common
+    /// `expfmt` writes it): a counter family named `x_total` is announced
+    /// as `x` and its sample keeps `x_total` (one without the suffix is
+    /// `unknown`), HELP escapes `"` too, values are OpenMetrics floats
+    /// (`1.0`, `1e+06`), and the output ends in `# EOF`. No `_created`
+    /// samples (client_golang's default) and no exemplars.
+    pub fn writeOpenMetrics(r: *Registry, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        return r.write(w, .openmetrics);
+    }
+
+    /// `writeText` or `writeOpenMetrics`. A collector that fails, or emits
+    /// samples its descriptions do not allow, fails the whole scrape with
+    /// `error.WriteFailed` (promhttp's default `HTTPErrorOnError`).
+    pub fn write(r: *Registry, w: *std.Io.Writer, format: Format) std.Io.Writer.Error!void {
         // Format the whole exposition into memory (no socket I/O), then
         // flush to the caller's writer OUTSIDE the lock, so a
         // slow/stalling scraper cannot stall first-touch series registration on
@@ -812,32 +953,34 @@ pub const Registry = struct {
             gpa.free(fams);
         }
 
+        var last_collector: ?*CollectorEntry = null;
         for (fams) |entry| {
             const fam = entry.fam;
+            if (fam.collector) |ce| {
+                // A collector's families are contiguous (registered in one
+                // call); run it once, at its first family still registered.
+                if (ce != last_collector) {
+                    last_collector = ce;
+                    var sink: Sink = .{ .w = bw, .entry = ce, .format = format };
+                    ce.collector.collect(ce.collector.ctx, &sink) catch return error.WriteFailed;
+                }
+                continue;
+            }
             // client_golang does not expose a family with no series (a
             // fresh `*Vec`, or one emptied by `delete`/`reset`).
             if (entry.children.len == 0) continue;
-            try bw.print("# HELP {s} ", .{fam.name});
-            try writeEscaped(bw, fam.help, .help);
-            try bw.print("\n# TYPE {s} {t}\n", .{ fam.name, fam.kind });
+            try writeHeader(bw, fam.name, fam.help, fam.kind, format);
             for (entry.children) |c| {
                 switch (c.data) {
-                    .counter => |*ctr| {
-                        try bw.writeAll(fam.name);
-                        try writeLabels(bw, fam.label_names, c.label_values, null);
-                        try bw.print(" {d}\n", .{ctr.value()});
-                    },
-                    .gauge => |*g| {
-                        try bw.writeAll(fam.name);
-                        try writeLabels(bw, fam.label_names, c.label_values, null);
-                        try bw.writeByte(' ');
-                        try writeFloat(bw, g.value());
-                        try bw.writeByte('\n');
-                    },
-                    .histogram => |*h| try writeHistogram(bw, fam, c, h),
+                    .counter => |*ctr| try writeSample(bw, fam.name, "", fam.label_names, c.label_values, null, .{ .count = ctr.value() }, format),
+                    .counter_func => |f| try writeSample(bw, fam.name, "", fam.label_names, c.label_values, null, .{ .float = f.f(f.ctx) }, format),
+                    .gauge => |*g| try writeSample(bw, fam.name, "", fam.label_names, c.label_values, null, .{ .float = g.value() }, format),
+                    .gauge_func => |f| try writeSample(bw, fam.name, "", fam.label_names, c.label_values, null, .{ .float = f.f(f.ctx) }, format),
+                    .histogram => |*h| try writeHistogram(bw, fam, c, h, format),
                 }
             }
         }
+        if (format == .openmetrics) try bw.writeAll("# EOF\n");
         r.exposition_size_hint.store(buf.written().len, .monotonic);
         try w.writeAll(buf.written());
     }
@@ -847,9 +990,115 @@ pub const Registry = struct {
     /// `/metrics` handler (fish the Registry out of your app state in
     /// `ctx.state`); `Endpoint` is the ready-made variant.
     pub fn respond(r: *Registry, res: *http.Server.ResponseWriter) anyerror!void {
+        return r.respondFormat(res, .text);
+    }
+
+    /// `respond` in the given format, with its content type.
+    pub fn respondFormat(r: *Registry, res: *http.Server.ResponseWriter, format: Format) anyerror!void {
         res.setStatus(200);
-        try res.setHeader("Content-Type", content_type);
-        try r.writeText(res.writer());
+        try res.setHeader("Content-Type", format.contentType());
+        try r.write(res.writer(), format);
+    }
+};
+
+/// One family a `Collector` emits (client_golang `Desc`).
+pub const Desc = struct {
+    name: []const u8,
+    help: []const u8,
+    kind: Kind,
+    label_names: []const []const u8 = &.{},
+};
+
+/// Samples computed at scrape time for families described up front — the
+/// client_golang `Collector` (what its process and Go-runtime collectors
+/// are). `collect` is called once per scrape from the scraping thread, with
+/// the registry lock NOT held, and may run concurrently with itself on
+/// concurrent scrapes: it must be thread-safe. It emits through `Sink`, in
+/// `descs` order (a family's samples together; families may be skipped).
+pub const Collector = struct {
+    ctx: ?*anyopaque = null,
+    collect: *const fn (ctx: ?*anyopaque, sink: *Sink) anyerror!void,
+};
+
+const CollectorEntry = struct {
+    collector: Collector,
+    /// One per `Desc`, in order.
+    families: []*Family,
+};
+
+/// Where a `Collector` writes its samples during a scrape. `desc` is the
+/// index into the `descs` given to `registerCollector`; `values` are in that
+/// desc's label-name order. Each call checks what the registry checks at
+/// registration (value count, UTF-8, kind, order) — a violation is an error
+/// the collector should return, failing the scrape.
+pub const Sink = struct {
+    w: *std.Io.Writer,
+    entry: *CollectorEntry,
+    format: Format,
+    /// The desc whose header was written last.
+    current: ?usize = null,
+
+    pub const Error = std.Io.Writer.Error || error{
+        /// `desc` is out of range, or of another kind than the call.
+        InvalidDesc,
+        /// `desc` is before one already emitted (samples must come in
+        /// `descs` order so each family's lines stay together).
+        OutOfOrder,
+        LabelMismatch,
+        InvalidUtf8,
+        /// Histogram bounds not finite and strictly increasing, counts not
+        /// one per bound, or not cumulative.
+        InvalidBuckets,
+    };
+
+    /// A counter sample (float, like client_golang's `MustNewConstMetric`
+    /// with `CounterValue` — e.g. CPU seconds).
+    pub fn counter(s: *Sink, desc: usize, values: []const []const u8, v: f64) Error!void {
+        const fam = try s.begin(desc, .counter, values) orelse return;
+        try writeSample(s.w, fam.name, "", fam.label_names, values, null, .{ .float = v }, s.format);
+    }
+
+    pub fn gauge(s: *Sink, desc: usize, values: []const []const u8, v: f64) Error!void {
+        const fam = try s.begin(desc, .gauge, values) orelse return;
+        try writeSample(s.w, fam.name, "", fam.label_names, values, null, .{ .float = v }, s.format);
+    }
+
+    /// A histogram sample from CUMULATIVE bucket counts (client_golang
+    /// `MustNewConstHistogram`): `cumulative[i]` observations ≤
+    /// `upper_bounds[i]`; `+Inf` is `count`.
+    pub fn histogram(s: *Sink, desc: usize, values: []const []const u8, upper_bounds: []const f64, cumulative: []const u64, sum: f64, count: u64) Error!void {
+        if (upper_bounds.len != cumulative.len) return error.InvalidBuckets;
+        for (upper_bounds, cumulative, 0..) |b, c, i| {
+            if (!std.math.isFinite(b)) return error.InvalidBuckets;
+            if (i > 0 and (b <= upper_bounds[i - 1] or c < cumulative[i - 1])) return error.InvalidBuckets;
+            if (c > count) return error.InvalidBuckets;
+        }
+        const fam = try s.begin(desc, .histogram, values) orelse return;
+        for (upper_bounds, cumulative) |b, c| try writeSample(s.w, fam.name, "_bucket", fam.label_names, values, b, .{ .count = c }, s.format);
+        try writeSample(s.w, fam.name, "_bucket", fam.label_names, values, std.math.inf(f64), .{ .count = count }, s.format);
+        try writeSample(s.w, fam.name, "_sum", fam.label_names, values, null, .{ .float = sum }, s.format);
+        try writeSample(s.w, fam.name, "_count", fam.label_names, values, null, .{ .count = count }, s.format);
+    }
+
+    /// Validate one sample and write its family's header on first use;
+    /// null = the family was unregistered, drop the sample.
+    fn begin(s: *Sink, desc: usize, kind: Kind, values: []const []const u8) Error!?*Family {
+        if (desc >= s.entry.families.len) return error.InvalidDesc;
+        const fam = s.entry.families[desc];
+        if (fam.kind != kind) return error.InvalidDesc;
+        if (values.len != fam.label_names.len) return error.LabelMismatch;
+        for (values) |v| if (!std.unicode.utf8ValidateSlice(v)) return error.InvalidUtf8;
+        if (s.current) |cur| {
+            if (desc < cur) return error.OutOfOrder;
+        }
+        // `removed` is written under the registry lock; a racing unregister
+        // at worst lets this scrape include the family one last time.
+        if (@atomicLoad(bool, &fam.removed, .monotonic)) return null;
+        if (s.current != desc) {
+            s.current = desc;
+            try writeHeader(s.w, fam.name, fam.help, fam.kind, s.format);
+        }
+        return fam;
     }
 };
 
@@ -916,7 +1165,88 @@ pub const HistogramVec = Vec(.histogram);
 /// The scrape Content-Type for text format 0.0.4 (what promhttp sends).
 pub const content_type = "text/plain; version=0.0.4; charset=utf-8";
 
-fn writeHistogram(w: *std.Io.Writer, fam: *const Family, c: *const Child, h: *Histogram) std.Io.Writer.Error!void {
+/// Exposition format (client_golang promhttp's two text formats).
+pub const Format = enum {
+    /// Prometheus text format 0.0.4 — what promhttp serves by default.
+    text,
+    /// OpenMetrics 1.0 text — what promhttp serves with `EnableOpenMetrics`
+    /// to a scraper that asks for it (`Accept`), as Prometheus does.
+    openmetrics,
+
+    pub fn contentType(f: Format) []const u8 {
+        return switch (f) {
+            .text => content_type,
+            .openmetrics => content_type_openmetrics,
+        };
+    }
+
+    /// The format to answer a request with: OpenMetrics only when the
+    /// client prefers it in `Accept` (RFC 9110 weights; Prometheus sends
+    /// `application/openmetrics-text;version=1.0.0;q=0.5,…,text/plain;
+    /// version=0.0.4;q=0.3,*/*;q=0.2`), else the text format — also for a
+    /// missing `Accept` or `*/*` (client_golang `NegotiateIncludingOpenMetrics`).
+    pub fn negotiate(accept: []const u8) Format {
+        const offers = [_][]const u8{ "text/plain;version=0.0.4", "application/openmetrics-text;version=1.0.0", "application/openmetrics-text;version=0.0.1" };
+        const got = http.conneg.negotiate(accept, &offers) orelse return .text;
+        return if (got.index == 0) .text else .openmetrics;
+    }
+};
+
+/// The scrape Content-Type for OpenMetrics 1.0 (what promhttp sends).
+pub const content_type_openmetrics = "application/openmetrics-text; version=1.0.0; charset=utf-8";
+
+/// The family name `# HELP`/`# TYPE` announce: OpenMetrics drops a
+/// counter's `_total` (expfmt).
+fn announcedName(name: []const u8, kind: Kind, format: Format) []const u8 {
+    if (format == .openmetrics and kind == .counter and std.mem.endsWith(u8, name, "_total"))
+        return name[0 .. name.len - "_total".len];
+    return name;
+}
+
+fn writeHeader(w: *std.Io.Writer, name: []const u8, help: []const u8, kind: Kind, format: Format) std.Io.Writer.Error!void {
+    const announced = announcedName(name, kind, format);
+    try w.print("# HELP {s} ", .{announced});
+    switch (format) {
+        .text => try writeEscaped(w, help, .help),
+        .openmetrics => try writeEscaped(w, help, .label_value),
+    }
+    const type_word: []const u8 = switch (kind) {
+        // expfmt: a counter without the `_total` suffix is `unknown`.
+        .counter => if (format == .openmetrics and !std.mem.endsWith(u8, name, "_total")) "unknown" else "counter",
+        .gauge => "gauge",
+        .histogram => "histogram",
+    };
+    try w.print("\n# TYPE {s} {s}\n", .{ announced, type_word });
+}
+
+const SampleValue = union(enum) {
+    /// An integer count (`_count`, `_bucket`, a `Counter`).
+    count: u64,
+    float: f64,
+};
+
+/// One sample line: `<name><suffix>{labels[,le]} <value>`.
+fn writeSample(w: *std.Io.Writer, name: []const u8, suffix: []const u8, label_names: []const []const u8, label_values: []const []const u8, le: ?f64, value: SampleValue, format: Format) std.Io.Writer.Error!void {
+    try w.writeAll(name);
+    try w.writeAll(suffix);
+    try writeLabels(w, label_names, label_values, le, format);
+    try w.writeByte(' ');
+    switch (value) {
+        // expfmt writes a counter's value as a float in OpenMetrics, and
+        // `_count`/`_bucket` as integers in both formats.
+        .count => |n| if (format == .openmetrics and suffix.len == 0)
+            try writeOpenMetricsFloat(w, @floatFromInt(n))
+        else
+            try w.print("{d}", .{n}),
+        .float => |v| switch (format) {
+            .text => try writeFloat(w, v),
+            .openmetrics => try writeOpenMetricsFloat(w, v),
+        },
+    }
+    try w.writeByte('\n');
+}
+
+fn writeHistogram(w: *std.Io.Writer, fam: *const Family, c: *const Child, h: *Histogram, format: Format) std.Io.Writer.Error!void {
     // Snapshot + emit under the instrument lock: buckets/count/sum must be
     // one consistent observation set (the writer usually buffers, so the
     // critical section is memory-speed formatting).
@@ -925,24 +1255,15 @@ fn writeHistogram(w: *std.Io.Writer, fam: *const Family, c: *const Child, h: *Hi
     var cumulative: u64 = 0;
     for (h.upper_bounds, h.bucket_counts) |le, n| {
         cumulative += n;
-        try w.print("{s}_bucket", .{fam.name});
-        try writeLabels(w, fam.label_names, c.label_values, le);
-        try w.print(" {d}\n", .{cumulative});
+        try writeSample(w, fam.name, "_bucket", fam.label_names, c.label_values, le, .{ .count = cumulative }, format);
     }
-    try w.print("{s}_bucket", .{fam.name});
-    try writeLabels(w, fam.label_names, c.label_values, std.math.inf(f64));
-    try w.print(" {d}\n", .{h.observation_count});
-    try w.print("{s}_sum", .{fam.name});
-    try writeLabels(w, fam.label_names, c.label_values, null);
-    try w.writeByte(' ');
-    try writeFloat(w, h.observation_sum);
-    try w.print("\n{s}_count", .{fam.name});
-    try writeLabels(w, fam.label_names, c.label_values, null);
-    try w.print(" {d}\n", .{h.observation_count});
+    try writeSample(w, fam.name, "_bucket", fam.label_names, c.label_values, std.math.inf(f64), .{ .count = h.observation_count }, format);
+    try writeSample(w, fam.name, "_sum", fam.label_names, c.label_values, null, .{ .float = h.observation_sum }, format);
+    try writeSample(w, fam.name, "_count", fam.label_names, c.label_values, null, .{ .count = h.observation_count }, format);
 }
 
 /// Emit `{name="value",...}` (nothing when empty), appending `le` when given.
-fn writeLabels(w: *std.Io.Writer, names: []const []const u8, values: []const []const u8, le: ?f64) std.Io.Writer.Error!void {
+fn writeLabels(w: *std.Io.Writer, names: []const []const u8, values: []const []const u8, le: ?f64, format: Format) std.Io.Writer.Error!void {
     if (names.len == 0 and le == null) return;
     try w.writeByte('{');
     for (names, values, 0..) |n, v, i| {
@@ -954,14 +1275,17 @@ fn writeLabels(w: *std.Io.Writer, names: []const []const u8, values: []const []c
     if (le) |bound| {
         if (names.len != 0) try w.writeByte(',');
         try w.writeAll("le=\"");
-        try writeFloat(w, bound);
+        switch (format) {
+            .text => try writeFloat(w, bound),
+            .openmetrics => try writeOpenMetricsFloat(w, bound),
+        }
         try w.writeByte('"');
     }
     try w.writeByte('}');
 }
 
 /// Text-format escaping: HELP text escapes `\` and newline; label values
-/// additionally escape `"` (both per the exposition-format spec).
+/// (and OpenMetrics HELP) additionally escape `"` (both per the spec).
 fn writeEscaped(w: *std.Io.Writer, s: []const u8, comptime mode: enum { help, label_value }) std.Io.Writer.Error!void {
     var start: usize = 0;
     for (s, 0..) |ch, i| {
@@ -978,15 +1302,80 @@ fn writeEscaped(w: *std.Io.Writer, s: []const u8, comptime mode: enum { help, la
     try w.writeAll(s[start..]);
 }
 
-/// Sample/bound rendering: decimal shortest round-trip (`{d}`), with the
-/// spec's spellings for the specials (`+Inf` / `-Inf` / `NaN`). Deviation
-/// from client_golang: Go's `%g` switches to exponent notation for extreme
-/// magnitudes, `{d}` stays decimal — both parse identically on the
-/// Prometheus side.
+/// Sample/bound rendering in the text format, as expfmt writes it: the
+/// spec's spellings for the specials (`+Inf` / `-Inf` / `NaN`), otherwise
+/// Go's shortest `%g` (`goShortestG`: `1.2345675e+06`, `1e-05`, `0.5`).
+/// (Before 2026-10-17 this was Zig's `{d}`, always decimal — it parsed the
+/// same, but the bytes differed from client_golang's.)
 fn writeFloat(w: *std.Io.Writer, v: f64) std.Io.Writer.Error!void {
     if (std.math.isNan(v)) return w.writeAll("NaN");
     if (std.math.isInf(v)) return w.writeAll(if (v > 0) "+Inf" else "-Inf");
-    try w.print("{d}", .{v});
+    if (v == 0) return w.writeAll("0"); // -0 too, as expfmt (`f == 0`)
+    var buf: [64]u8 = undefined;
+    try w.writeAll(goShortestG(&buf, v));
+}
+
+/// expfmt's `writeOpenMetricsFloat`, byte for byte: `1.0`/`0.0`/`-1.0`,
+/// the specials, otherwise Go's `strconv.FormatFloat(f, 'g', -1, 64)`
+/// (`goShortestG`) with `.0` appended when that has neither `.` nor `e`.
+fn writeOpenMetricsFloat(w: *std.Io.Writer, v: f64) std.Io.Writer.Error!void {
+    if (v == 1) return w.writeAll("1.0");
+    if (v == 0) return w.writeAll("0.0");
+    if (v == -1) return w.writeAll("-1.0");
+    if (std.math.isNan(v)) return w.writeAll("NaN");
+    if (std.math.isInf(v)) return w.writeAll(if (v > 0) "+Inf" else "-Inf");
+    var buf: [64]u8 = undefined;
+    const g = goShortestG(&buf, v);
+    try w.writeAll(g);
+    if (std.mem.indexOfAny(u8, g, ".e") == null) try w.writeAll(".0");
+}
+
+/// Go `strconv.FormatFloat(v, 'g', -1, 64)` for a finite, non-zero `v`:
+/// the shortest round-trip digits, printed as `%e` (`d.ddde±XX`, at least
+/// two exponent digits) when the decimal exponent is < -4 or ≥ 6 (Go's
+/// shortest `%g` fixes `eprec` at 6: `1234567` is `1.234567e+06`, `123456`
+/// stays), else as `%f`. Boundary rows checked against Go 1.26 in the tests.
+fn goShortestG(buf: []u8, v: f64) []const u8 {
+    // Shortest digits and exponent from Zig's scientific rendering
+    // ("d.ddde[-]X").
+    var sci_buf: [64]u8 = undefined;
+    const sci = std.fmt.bufPrint(&sci_buf, "{e}", .{v}) catch unreachable;
+    const e_at = std.mem.indexOfScalar(u8, sci, 'e').?;
+    const exp = std.fmt.parseInt(i32, sci[e_at + 1 ..], 10) catch unreachable;
+    const neg = sci[0] == '-';
+    const mant = sci[@intFromBool(neg)..e_at];
+    var digits_buf: [32]u8 = undefined;
+    var nd: usize = 0;
+    for (mant) |ch| if (ch != '.') {
+        digits_buf[nd] = ch;
+        nd += 1;
+    };
+    const digits = digits_buf[0..nd];
+    var out: std.Io.Writer = .fixed(buf);
+    if (neg) out.writeByte('-') catch unreachable;
+    if (exp < -4 or exp >= 6) {
+        out.writeByte(digits[0]) catch unreachable;
+        if (nd > 1) {
+            out.writeByte('.') catch unreachable;
+            out.writeAll(digits[1..]) catch unreachable;
+        }
+        out.print("e{c}{d:0>2}", .{ @as(u8, if (exp < 0) '-' else '+'), @abs(exp) }) catch unreachable;
+    } else if (exp < 0) {
+        out.writeAll("0.") catch unreachable;
+        for (0..@intCast(-exp - 1)) |_| out.writeByte('0') catch unreachable;
+        out.writeAll(digits) catch unreachable;
+    } else {
+        const int_len: usize = @intCast(exp + 1);
+        if (nd <= int_len) {
+            out.writeAll(digits) catch unreachable;
+            for (0..int_len - nd) |_| out.writeByte('0') catch unreachable;
+        } else {
+            out.writeAll(digits[0..int_len]) catch unreachable;
+            out.writeByte('.') catch unreachable;
+            out.writeAll(digits[int_len..]) catch unreachable;
+        }
+    }
+    return out.buffered();
 }
 
 fn validMetricName(s: []const u8) bool {
@@ -1032,6 +1421,10 @@ pub const Endpoint = struct {
     registry: *Registry,
     /// Byte-exact request path to intercept (router raw-matching rules).
     path: []const u8 = "/metrics",
+    /// Answer OpenMetrics to a scraper that prefers it in `Accept`
+    /// (`Format.negotiate`); off = always the text format. client_golang
+    /// promhttp `HandlerOpts.EnableOpenMetrics`, same default.
+    open_metrics: bool = false,
 
     pub fn middleware(e: *Endpoint) router.Middleware {
         return .{ .state = e, .run = endpointRun };
@@ -1042,7 +1435,10 @@ fn endpointRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerror
     const e: *Endpoint = @ptrCast(@alignCast(state.?));
     if (!std.mem.eql(u8, ctx.req.path, e.path)) return next.run(ctx);
     switch (ctx.req.method) {
-        .get, .head => try e.registry.respond(ctx.res),
+        .get, .head => try e.registry.respondFormat(
+            ctx.res,
+            if (e.open_metrics) Format.negotiate(ctx.req.header("accept") orelse "") else .text,
+        ),
         else => {
             ctx.res.setStatus(405);
             try ctx.res.setHeader("Allow", "GET, HEAD");
@@ -2868,6 +3264,288 @@ test "delete/with racing concurrent scrapes stays consistent (no UAF, no leak)" 
     stop.store(true, .release);
     for (ts) |t| t.join();
     try testing.expectEqual(@as(usize, 0), reg.retired.items.len);
+}
+
+// ── OpenMetrics, callbacks, collectors (S2, 2026-10-17) ────────────────────
+
+/// client_golang v1.24.1 + prometheus/common v0.71.0 `expfmt` output for the
+/// registry `goldenRegistry` builds, printed by `tools/go_golden` (families
+/// named so Go's name sort = our registration order).
+const golden_go_text =
+    \\# HELP a_requests_total Requests "served" \\ by\nmethod.
+    \\# TYPE a_requests_total counter
+    \\a_requests_total{method="GET"} 3
+    \\a_requests_total{method="POST"} 1
+    \\# HELP b_events No _total suffix.
+    \\# TYPE b_events counter
+    \\b_events 0
+    \\# HELP c_temp Gauge.
+    \\# TYPE c_temp gauge
+    \\c_temp{room="hall"} 1.2345675e+06
+    \\c_temp{room="lab"} -1
+    \\# HELP d_seconds Hist.
+    \\# TYPE d_seconds histogram
+    \\d_seconds_bucket{le="0.5"} 2
+    \\d_seconds_bucket{le="1"} 2
+    \\d_seconds_bucket{le="2.5"} 3
+    \\d_seconds_bucket{le="1e+06"} 5
+    \\d_seconds_bucket{le="+Inf"} 5
+    \\d_seconds_sum 12.75
+    \\d_seconds_count 5
+    \\# HELP e_func Func.
+    \\# TYPE e_func gauge
+    \\e_func 1.2e-05
+    \\# HELP f_cpu_seconds_total CPU.
+    \\# TYPE f_cpu_seconds_total counter
+    \\f_cpu_seconds_total 12.25
+    \\
+;
+
+const golden_go_openmetrics =
+    \\# HELP a_requests Requests \"served\" \\ by\nmethod.
+    \\# TYPE a_requests counter
+    \\a_requests_total{method="GET"} 3.0
+    \\a_requests_total{method="POST"} 1.0
+    \\# HELP b_events No _total suffix.
+    \\# TYPE b_events unknown
+    \\b_events 0.0
+    \\# HELP c_temp Gauge.
+    \\# TYPE c_temp gauge
+    \\c_temp{room="hall"} 1.2345675e+06
+    \\c_temp{room="lab"} -1.0
+    \\# HELP d_seconds Hist.
+    \\# TYPE d_seconds histogram
+    \\d_seconds_bucket{le="0.5"} 2
+    \\d_seconds_bucket{le="1.0"} 2
+    \\d_seconds_bucket{le="2.5"} 3
+    \\d_seconds_bucket{le="1e+06"} 5
+    \\d_seconds_bucket{le="+Inf"} 5
+    \\d_seconds_sum 12.75
+    \\d_seconds_count 5
+    \\# HELP e_func Func.
+    \\# TYPE e_func gauge
+    \\e_func 1.2e-05
+    \\# HELP f_cpu_seconds CPU.
+    \\# TYPE f_cpu_seconds counter
+    \\f_cpu_seconds_total 12.25
+    \\# EOF
+    \\
+;
+
+fn constValue(ctx: ?*anyopaque) f64 {
+    const v: *const f64 = @ptrCast(@alignCast(ctx.?));
+    return v.*;
+}
+
+var golden_e: f64 = 0.000012;
+var golden_f: f64 = 12.25;
+
+fn goldenRegistry(reg: *Registry) !void {
+    const a = try reg.counterVec("a_requests_total", "Requests \"served\" \\ by\nmethod.", &.{"method"});
+    (try a.with(&.{"GET"})).add(3);
+    (try a.with(&.{"POST"})).add(1);
+    _ = try reg.counter("b_events", "No _total suffix.", &.{});
+    const c = try reg.gaugeVec("c_temp", "Gauge.", &.{"room"});
+    (try c.with(&.{"hall"})).set(1234567.5);
+    (try c.with(&.{"lab"})).set(-1);
+    const d = try reg.histogram("d_seconds", "Hist.", &.{}, &.{ 0.5, 1, 2.5, 1e6 });
+    for ([_]f64{ 0.25, 0.5, 2, 3, 7 }) |v| d.observe(v);
+    try reg.gaugeFunc("e_func", "Func.", &.{}, &golden_e, constValue);
+    try reg.counterFunc("f_cpu_seconds_total", "CPU.", &.{}, &golden_f, constValue);
+}
+
+test "text format: byte-identical to client_golang/expfmt (golden from Go)" {
+    var reg = Registry.init(testing.allocator);
+    defer reg.deinit();
+    try goldenRegistry(&reg);
+    var buf: [4096]u8 = undefined;
+    try testing.expectEqualStrings(golden_go_text, try scrapeInto(&reg, &buf));
+}
+
+test "OpenMetrics: byte-identical to client_golang/expfmt (golden from Go)" {
+    var reg = Registry.init(testing.allocator);
+    defer reg.deinit();
+    try goldenRegistry(&reg);
+    var buf: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try reg.writeOpenMetrics(&w);
+    try testing.expectEqualStrings(golden_go_openmetrics, w.buffered());
+}
+
+test "goShortestG: Go strconv.FormatFloat(v, 'g', -1, 64) boundary rows (Go 1.26)" {
+    const rows = [_]struct { f64, []const u8 }{
+        .{ 1e5, "100000" },           .{ 123456, "123456" },
+        .{ 1234567, "1.234567e+06" }, .{ 1e6, "1e+06" },
+        .{ 1.5e6, "1.5e+06" },        .{ 1e20, "1e+20" },
+        .{ 1e21, "1e+21" },           .{ 123456789012345678901.0, "1.2345678901234568e+20" },
+        .{ 0.0001, "0.0001" },        .{ 0.00001, "1e-05" },
+        .{ 0.000123, "0.000123" },    .{ 12345.678, "12345.678" },
+        .{ 3.14, "3.14" },            .{ 100, "100" },
+        .{ 0.5, "0.5" },              .{ -2.5e-7, "-2.5e-07" },
+        .{ 5e-324, "5e-324" },        .{ 1.7976931348623157e308, "1.7976931348623157e+308" },
+    };
+    for (rows) |row| {
+        var buf: [64]u8 = undefined;
+        try testing.expectEqualStrings(row[1], goShortestG(&buf, row[0]));
+    }
+}
+
+test "callbacks: one family may hold several, never mixed with ordinary series" {
+    var reg = Registry.init(testing.allocator);
+    defer reg.deinit();
+    var x: f64 = 1;
+    try reg.gaugeFunc("cb", "h", &.{.{ .name = "k", .value = "a" }}, &x, constValue);
+    try reg.gaugeFunc("cb", "h", &.{.{ .name = "k", .value = "b" }}, &x, constValue);
+    try testing.expectError(error.AlreadyRegistered, reg.gaugeFunc("cb", "h", &.{.{ .name = "k", .value = "a" }}, &x, constValue));
+    try testing.expectError(error.AlreadyRegistered, reg.gauge("cb", "h", &.{.{ .name = "k", .value = "c" }}));
+    const v = try reg.gaugeVec("cb", "h", &.{"k"});
+    try testing.expectError(error.AlreadyRegistered, v.with(&.{"a"}));
+    _ = try reg.counter("plain_total", "h", &.{});
+    try testing.expectError(error.AlreadyRegistered, reg.counterFunc("plain_total", "h", &.{}, &x, constValue));
+    x = 7.5;
+    var buf: [512]u8 = undefined;
+    try testing.expectEqualStrings(
+        \\# HELP cb h
+        \\# TYPE cb gauge
+        \\cb{k="a"} 7.5
+        \\cb{k="b"} 7.5
+        \\# HELP plain_total h
+        \\# TYPE plain_total counter
+        \\plain_total 0
+        \\
+    , try scrapeInto(&reg, &buf));
+}
+
+const TestCollector = struct {
+    calls: std.atomic.Value(u32) = .init(0),
+    fail: bool = false,
+    out_of_order: bool = false,
+
+    fn collect(ctx: ?*anyopaque, sink: *Sink) anyerror!void {
+        const self: *TestCollector = @ptrCast(@alignCast(ctx.?));
+        _ = self.calls.fetchAdd(1, .monotonic);
+        if (self.fail) return error.ProcUnreadable;
+        if (self.out_of_order) {
+            try sink.gauge(1, &.{}, 1);
+            try sink.counter(0, &.{"x"}, 1);
+            return;
+        }
+        try sink.counter(0, &.{"user"}, 1.5);
+        try sink.counter(0, &.{"system"}, 0.25);
+        // desc 1 skipped this scrape: no header, no samples.
+        try sink.histogram(2, &.{}, &.{ 1, 2 }, &.{ 3, 4 }, 9.5, 6);
+    }
+};
+
+const test_descs = [_]Desc{
+    .{ .name = "proc_cpu_seconds_total", .help = "CPU.", .kind = .counter, .label_names = &.{"mode"} },
+    .{ .name = "proc_fds", .help = "FDs.", .kind = .gauge },
+    .{ .name = "proc_lat", .help = "Lat.", .kind = .histogram },
+};
+
+test "collector: emits its described families once per scrape, in place" {
+    var reg = Registry.init(testing.allocator);
+    defer reg.deinit();
+    _ = try reg.counter("before_total", "h", &.{});
+    var tc: TestCollector = .{};
+    try reg.registerCollector(&test_descs, .{ .ctx = &tc, .collect = TestCollector.collect });
+    _ = try reg.gauge("after", "h", &.{});
+    var buf: [2048]u8 = undefined;
+    try testing.expectEqualStrings(
+        \\# HELP before_total h
+        \\# TYPE before_total counter
+        \\before_total 0
+        \\# HELP proc_cpu_seconds_total CPU.
+        \\# TYPE proc_cpu_seconds_total counter
+        \\proc_cpu_seconds_total{mode="user"} 1.5
+        \\proc_cpu_seconds_total{mode="system"} 0.25
+        \\# HELP proc_lat Lat.
+        \\# TYPE proc_lat histogram
+        \\proc_lat_bucket{le="1"} 3
+        \\proc_lat_bucket{le="2"} 4
+        \\proc_lat_bucket{le="+Inf"} 6
+        \\proc_lat_sum 9.5
+        \\proc_lat_count 6
+        \\# HELP after h
+        \\# TYPE after gauge
+        \\after 0
+        \\
+    , try scrapeInto(&reg, &buf));
+    try testing.expectEqual(@as(u32, 1), tc.calls.load(.monotonic));
+
+    // Names are owned by the collector.
+    try testing.expectError(error.AlreadyRegistered, reg.counter("proc_cpu_seconds_total", "CPU.", &.{.{ .name = "mode", .value = "u" }}));
+    try testing.expectError(error.AlreadyRegistered, reg.registerCollector(&.{.{ .name = "after", .help = "h", .kind = .gauge }}, .{ .ctx = &tc, .collect = TestCollector.collect }));
+    try testing.expectError(error.NameCollision, reg.registerCollector(&.{.{ .name = "proc_lat_count", .help = "h", .kind = .gauge }}, .{ .ctx = &tc, .collect = TestCollector.collect }));
+
+    // Unregistering one of its families drops just that family.
+    try testing.expect(reg.unregister("proc_lat"));
+    const out = try scrapeInto(&reg, &buf);
+    try testing.expect(std.mem.indexOf(u8, out, "proc_lat") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "proc_cpu_seconds_total{mode=\"user\"} 1.5") != null);
+}
+
+test "collector: a failing or misbehaving collector fails the scrape" {
+    var reg = Registry.init(testing.allocator);
+    defer reg.deinit();
+    var tc: TestCollector = .{ .fail = true };
+    try reg.registerCollector(&test_descs, .{ .ctx = &tc, .collect = TestCollector.collect });
+    var buf: [2048]u8 = undefined;
+    try testing.expectError(error.WriteFailed, scrapeInto(&reg, &buf));
+    tc.fail = false;
+    tc.out_of_order = true;
+    try testing.expectError(error.WriteFailed, scrapeInto(&reg, &buf));
+}
+
+test "collector: Sink refuses wrong kind, value count, UTF-8 and buckets" {
+    var reg = Registry.init(testing.allocator);
+    defer reg.deinit();
+    var tc: TestCollector = .{};
+    try reg.registerCollector(&test_descs, .{ .ctx = &tc, .collect = TestCollector.collect });
+    var buf: [1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var sink: Sink = .{ .w = &w, .entry = reg.families.items[0].collector.?, .format = .text };
+    try testing.expectError(error.InvalidDesc, sink.gauge(0, &.{"x"}, 1));
+    try testing.expectError(error.InvalidDesc, sink.gauge(9, &.{}, 1));
+    try testing.expectError(error.LabelMismatch, sink.counter(0, &.{}, 1));
+    try testing.expectError(error.InvalidUtf8, sink.counter(0, &.{"\xff"}, 1));
+    try testing.expectError(error.InvalidBuckets, sink.histogram(2, &.{}, &.{ 2, 1 }, &.{ 1, 2 }, 0, 2));
+    try testing.expectError(error.InvalidBuckets, sink.histogram(2, &.{}, &.{ 1, 2 }, &.{ 2, 1 }, 0, 2));
+    try testing.expectError(error.InvalidBuckets, sink.histogram(2, &.{}, &.{1}, &.{ 1, 2 }, 0, 2));
+    try testing.expectError(error.InvalidBuckets, sink.histogram(2, &.{}, &.{1}, &.{5}, 0, 2));
+    try testing.expectEqualStrings("", w.buffered());
+}
+
+test "Format.negotiate: OpenMetrics only when preferred (Prometheus's Accept)" {
+    try testing.expectEqual(Format.text, Format.negotiate(""));
+    try testing.expectEqual(Format.text, Format.negotiate("*/*"));
+    try testing.expectEqual(Format.text, Format.negotiate("text/plain"));
+    try testing.expectEqual(Format.openmetrics, Format.negotiate(
+        "application/openmetrics-text;version=1.0.0;q=0.5,application/openmetrics-text;version=0.0.1;q=0.4,text/plain;version=0.0.4;q=0.3,*/*;q=0.2",
+    ));
+    try testing.expectEqual(Format.text, Format.negotiate("application/openmetrics-text;q=0.2,text/plain;q=0.9"));
+    try testing.expectEqual(Format.text, Format.negotiate("application/json"));
+}
+
+test "Endpoint: open_metrics negotiates, default stays text" {
+    var reg = Registry.init(testing.allocator);
+    defer reg.deinit();
+    _ = try reg.counter("hits_total", "h", &.{});
+    inline for (.{ false, true }) |om| {
+        var ep: Endpoint = .{ .registry = &reg, .open_metrics = om };
+        var r = router.Router.init(testing.allocator);
+        defer r.deinit();
+        try r.use(ep.middleware());
+        var out_buf: [2048]u8 = undefined;
+        const got = runWire(&r, "GET /metrics HTTP/1.1\r\nHost: x\r\nAccept: application/openmetrics-text;version=1.0.0;q=0.5,text/plain;version=0.0.4;q=0.3\r\nConnection: close\r\n\r\n", &out_buf);
+        if (om) {
+            try expectHeaderLine(got, "Content-Type: " ++ content_type_openmetrics);
+            try testing.expect(std.mem.endsWith(u8, got, "# EOF\n"));
+        } else {
+            try expectHeaderLine(got, "Content-Type: " ++ content_type);
+            try testing.expect(std.mem.indexOf(u8, got, "# EOF") == null);
+        }
+    }
 }
 
 // ── external anchor: client_golang + expfmt + textparse ────────────────────
