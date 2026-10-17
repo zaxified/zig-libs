@@ -20,26 +20,28 @@ Both sides, same policy: three configured 26-byte keys (the same strings as bear
 | `api_key_query_ok` | `GET /?api_key=<valid>` | `.api_key` + `api_key_query_param` | `query:api_key` |
 | `no_credential` | none -> 401 | `.bearer` | `header:Authorization:Bearer ` |
 
-echo leaves the comparison to the caller's `Validator`; the Go side uses the one its own documentation shows as secure: `subtle.ConstantTimeCompare` against each of the three keys, returning on the first match. Ours hashes the presented value (SHA-256) and compares digests against all three without early exit, so neither length nor content leaks (`ConstantTimeCompare` leaks the length). That is the module's design and it is in the number.
+echo leaves the comparison to the caller's `Validator`. **The verdict compares like for like** (owner decision 2026-10-17): the Go validator gives aaa-gate's guarantee — only SHA-256 digests of the configured credentials kept, the presented value hashed and compared against every digest with `subtle.ConstantTimeCompare`, no early exit, so neither length nor content leaks. Every row also prints `<row>_raw`: echo with the validator its documentation shows as secure (`ConstantTimeCompare` against the raw keys, first match returns — leaks the key length and keeps the secrets in memory). That row is information only. This machine (i7-7920HQ) has no SHA-NI, so the software SHA-256 is most of either side's gate cost; with the raw validator echo skips it, which is the whole of the `_raw` gap.
 
 The 401 answers differ and are in the number: ours `Unauthorized\n` text/plain with `WWW-Authenticate: Bearer`; echo's default error handler builds a `map`, wraps the error and encodes `{"message":"Unauthorized"}` with `encoding/json` (no challenge header for KeyAuth). The denied rows therefore flatter ours (the Go cost is mostly the error path, not the key check).
 
-TODO `basic_ok` / `basic_denied` (HTTP Basic against `middleware.BasicAuth`, validator with `subtle.ConstantTimeCompare` on user and password): `aaa-gate` has no HTTP Basic in this tree yet. Add a wire builder in `bench.zig`, a `lookup`/validator case in `go_bench/main.go`.
+`basic_ok` / `basic_denied`: HTTP Basic (`.basic`, three users) against `middleware.BasicAuthWithConfig` with the same two validators (hashed `user:password` digests for the verdict, raw `ConstantTimeCompare` of user and password for `_raw`).
 
 ## Benchmark result
 
-2026-10-17, x86-64, `BENCH_ROUNDS=7`, ReleaseFast, a shared and noisy machine; wall time per op of 64 requests, ours/echo. `gross` = router + middleware + response; `net` = (with - without middleware) per side, the verdict.
+2026-10-17, x86-64 (i7-7920HQ, no SHA-NI), `BENCH_ROUNDS=5`, ReleaseFast, a shared and noisy machine; wall time per op of 64 requests, ours/echo. `gross` = router + middleware + response; `net` = (with - without middleware) per side, the verdict.
 
-| row | ours ns | echo ns | gross | net | ours without / echo without |
-|---|---:|---:|---:|---:|---|
-| `bearer_ok` | 31995 | 71660 | 0.446 | **1.569** | 8711 / 56823 |
-| `bearer_denied` | 39284 | 147259 | 0.267 | 0.325 | 8935 / 53772 |
-| `api_key_header_ok` | 32406 | 64448 | 0.503 | **2.370** | 9021 / 54580 |
-| `api_key_query_ok` | 31332 | 85575 | 0.366 | 0.706 | 9425 / 54534 |
-| `no_credential` | 17763 | 140510 | 0.126 | 0.101 | 9171 / 55111 |
+| row | ours ns | echo ns | gross | net | echo raw-key: net (info) |
+|---|---:|---:|---:|---:|---:|
+| `bearer_ok` | 33642 | 83500 | 0.403 | 0.834 | 1.928 |
+| `bearer_denied` | 39530 | 156400 | 0.253 | 0.299 | 0.325 |
+| `api_key_header_ok` | 32248 | 80039 | 0.403 | 0.865 | 2.128 |
+| `api_key_query_ok` | 30805 | 97330 | 0.317 | 0.488 | 0.745 |
+| `no_credential` | 18137 | 137120 | 0.132 | 0.111 | 0.111 |
+| `basic_ok` | 40317 | 91717 | 0.440 | 0.804 | 1.005 |
+| `basic_denied` | 46550 | 201829 | 0.231 | 0.254 | 0.259 |
 
-Status sums agree on both sides (12800 = 64 x 200 for the success rows and every `_plain` twin, 25664 = 64 x 401 for the two denied rows); ours is also checked against the expected status before any timing. Largest spread 40.9% on a `_plain` twin (OVER 5%: the net of the success rows moves by +-50% between runs; two earlier runs at the head-parsing layer, 3 and 7 rounds, gave 1.43 / 1.52 / 0.66 and 4.39 / 2.36 / 0.81 for `bearer_ok`/`api_key_header_ok`/`api_key_query_ok`, so the direction is stable and the size is not).
+Without middleware: ours ~8.8 µs, echo ~53 µs per op. Status sums agree on both sides; ours is also checked against the expected status before any timing. Largest spread 16.8% (noisy machine; the verdict rows sit well under 1.1x).
 
-card: **Performance:** ref 0.10–2.37× labstack/echo v5.4.0 · fastest ? (measured 2026-10-17)
+card: **Performance:** ref 0.11–0.87× labstack/echo v5.4.0 · fastest ? (measured 2026-10-17)
 
-**Reading.** Two rows are over the 1.1x line: the success rows with a header lookup (`bearer_ok`, `api_key_header_ok`). The gate's own cost there is about 360 ns per request against about 100 to 250 ns for echo's raw compare. Hypothesis from reading the path (not profiled): every call hashes the presented value with SHA-256 (`src/root.zig:752`, one block compress), takes and releases the gate lock with two atomic operations (`:764`, used in `verify` `:603` and `verifyApiKey` `:632`), and compares all three digests without early exit (`:758`) -- a fixed price for not leaking length or content, which echo's validator does not pay (it returns on the first match; 26-byte `ConstantTimeCompare` is a few ns). The denied and no-credential rows pay the same hash but sit far below echo because echo's 401 goes through its JSON error handler. The query row is under 1.1x because echo's `QueryParams` allocates and parses a `url.Values` per request, which ours does not.
+**Reading.** At equal guarantees the gate costs ~0.8x echo's. Against echo's raw-key validator the header success rows are ~2x: the gap is one software SHA-256 per request (~300 ns without SHA-NI) — the price of keeping no secret in memory and leaking no length, which the raw validator does not pay. The denied rows sit far below echo because echo's 401 goes through its JSON error handler; the query row because echo parses a `url.Values` per request.

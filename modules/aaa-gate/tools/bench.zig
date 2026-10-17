@@ -39,19 +39,17 @@
 //!   api_key_query_ok   `GET /?api_key=<valid>` (ours `api_key_query_param`,
 //!                      echo `query:api_key`)
 //!   no_credential      no credential at all, bearer policy -> 401
-//! TODO basic_ok / basic_denied: add when `aaa-gate` has HTTP Basic (not in this
-//! tree when this bench was written). Go side: `middleware.BasicAuthWithConfig`
-//! with a `subtle.ConstantTimeCompare` validator over user and password; the
-//! wire builder here and the `lookup` switch in `go_bench/main.go` are where it
-//! goes.
+//!   basic_ok           HTTP Basic, a valid user:password (echo `BasicAuthWithConfig`)
+//!   basic_denied       same, a wrong password -> 401
 //!
-//! THE COMPARE. echo leaves the comparison to the caller's `Validator`, so the Go
-//! side uses the documented constant-time one (the "SECURE" example of
-//! `KeyAuthValidator`: `subtle.ConstantTimeCompare` against each key, return on
-//! the first match). Ours compares SHA-256 digests of the presented value against
-//! all configured digests without early exit (so neither length nor content
-//! leaks; `ConstantTimeCompare` leaks the length). That difference is the
-//! module's design and is in the number.
+//! THE COMPARE (owner decision 2026-10-17: like for like). echo leaves the
+//! comparison to the caller's `Validator`; the verdict one gives aaa-gate's
+//! guarantee — SHA-256 digests only, the presented value hashed and compared
+//! against every digest without early exit (no length or content leak). Each
+//! row also prints `<row>_raw`: echo with its documented "SECURE" raw-key
+//! validator (`ConstantTimeCompare`, first match returns; leaks the length and
+//! keeps the secrets) — information only, not in the verdict. On a CPU without
+//! SHA-NI the hash is most of either side's gate cost.
 //! The 401 answers differ the same way: ours `Unauthorized\n` text/plain plus a
 //! `WWW-Authenticate: Bearer` challenge, echo's default error handler (a JSON
 //! `{"message":"Unauthorized"}` via `encoding/json`, no challenge for KeyAuth).
@@ -73,7 +71,7 @@ const go_dir = "modules/aaa-gate/tools/go_bench";
 const ref_short = "echo";
 const ref_card = "labstack/echo v5.4.0";
 
-const names = [_][]const u8{ "bearer_ok", "bearer_denied", "api_key_header_ok", "api_key_query_ok", "no_credential" };
+const names = [_][]const u8{ "bearer_ok", "bearer_denied", "api_key_header_ok", "api_key_query_ok", "no_credential", "basic_ok", "basic_denied" };
 const n_req = 64;
 
 const keys = [_][]const u8{
@@ -83,14 +81,14 @@ const keys = [_][]const u8{
 };
 
 /// Which gate (router) a row goes through; the same split as the Go `lookup`.
-const Which = enum { bearer, api_header, api_query };
-const which = [_]Which{ .bearer, .bearer, .api_header, .api_query, .bearer };
+const Which = enum { bearer, api_header, api_query, basic };
+const which = [_]Which{ .bearer, .bearer, .api_header, .api_query, .bearer, .basic, .basic };
 /// Expected status per row (a hard check on top of the count comparison).
-const expect_status = [_]u16{ 200, 401, 200, 200, 401 };
+const expect_status = [_]u16{ 200, 401, 200, 200, 401, 200, 401 };
 
 const Data = struct {
     plain: *router.Router,
-    gated: [3]*router.Router,
+    gated: [4]*router.Router,
     pre: [names.len][]Pre,
 };
 
@@ -98,7 +96,7 @@ fn hOk(ctx: *router.Ctx) anyerror!void {
     try ctx.res.writeAll("ok");
 }
 
-var gates: [3]aaa.Gate = undefined;
+var gates: [4]aaa.Gate = undefined;
 
 fn once(d: *const Data, w: usize, plain: bool) u64 {
     const r = if (plain) d.plain else d.gated[@intFromEnum(which[w])];
@@ -157,6 +155,11 @@ fn setup(arena: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) !Data {
     gates[0] = try aaa.Gate.init(gpa, .{ .token = keys[0], .extra_tokens = keys[1..] });
     gates[1] = try aaa.Gate.init(gpa, .{ .auth_mode = .api_key, .api_key = keys[0], .extra_api_keys = keys[1..] });
     gates[2] = try aaa.Gate.init(gpa, .{ .auth_mode = .api_key, .api_key = keys[0], .extra_api_keys = keys[1..], .api_key_query_param = "api_key" });
+    gates[3] = try aaa.Gate.init(gpa, .{ .auth_mode = .basic, .basic_users = &.{
+        .{ .user = "user-0", .password = keys[0] },
+        .{ .user = "user-1", .password = keys[1] },
+        .{ .user = "user-2", .password = keys[2] },
+    } });
     for (&d.gated, 0..) |*slot, i| {
         slot.* = try newRouter(arena);
         try slot.*.use(gates[i].middleware());
@@ -175,7 +178,13 @@ fn setup(arena: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) !Data {
                 try std.fmt.allocPrint(arena, "GET / HTTP/1.1\r\nHost: t\r\nX-Api-Key: {s}\r\nConnection: close\r\n\r\n", .{valid})
             else if (std.mem.eql(u8, name, "api_key_query_ok"))
                 try std.fmt.allocPrint(arena, "GET /?api_key={s} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", .{valid})
-            else // no_credential
+            else if (std.mem.startsWith(u8, name, "basic_")) blk: {
+                const pw = if (std.mem.eql(u8, name, "basic_ok")) valid else "wrong-password-000000000";
+                const cred = try std.fmt.allocPrint(arena, "user-{d}:{s}", .{ i % keys.len, pw });
+                const enc = try arena.alloc(u8, std.base64.standard.Encoder.calcSize(cred.len));
+                _ = std.base64.standard.Encoder.encode(enc, cred);
+                break :blk try std.fmt.allocPrint(arena, "GET / HTTP/1.1\r\nHost: t\r\nAuthorization: Basic {s}\r\nConnection: close\r\n\r\n", .{enc});
+            } else // no_credential
                 try std.fmt.allocPrint(arena, "GET / HTTP/1.1\r\nHost: t\r\nAccept: */*\r\nConnection: close\r\n\r\n", .{});
             try d.pre[wi][i].build(wire);
             if (i != 0) try all.writer.writeByte(0);
@@ -184,6 +193,7 @@ fn setup(arena: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) !Data {
         const bytes = all.written();
         try dir.writeFile(io, .{ .sub_path = try std.fmt.allocPrint(arena, "{s}.wire", .{name}), .data = bytes });
         try dir.writeFile(io, .{ .sub_path = try std.fmt.allocPrint(arena, "{s}_plain.wire", .{name}), .data = bytes });
+        try dir.writeFile(io, .{ .sub_path = try std.fmt.allocPrint(arena, "{s}_raw.wire", .{name}), .data = bytes });
     }
     return d;
 }
@@ -233,10 +243,13 @@ pub fn main(init: std.process.Init) !u8 {
         var go: Side = .{};
         var ours_p: Side = .{};
         var go_p: Side = .{};
+        var go_raw: Side = .{};
+        const raw_name = try std.fmt.allocPrint(arena, "{s}_raw", .{name});
         for (0..rounds) |_| {
             go_p.add(try goRun(arena, io, exe, abs, plain_name));
             ours_p.add(timeIt(io, &d, wi, true));
             go.add(try goRun(arena, io, exe, abs, name));
+            go_raw.add(try goRun(arena, io, exe, abs, raw_name));
             ours.add(timeIt(io, &d, wi, false));
         }
         const rows = [2]struct { []const u8, Side, Side }{ .{ plain_name, ours_p, go_p }, .{ name, ours, go } };
@@ -253,6 +266,10 @@ pub fn main(init: std.process.Init) !u8 {
                 best = @min(best, ratio);
             }
             try w.print("{s:<22} {d:>11.0} {d:>11.0} {d:>8.3} {d:>8.3} {d:>6.1}% {d:>6.1}%  {d}{s}\n", .{ row[0], row[1].best_ns, row[2].best_ns, gross, net, 100 * row[1].spread(), 100 * row[2].spread(), row[1].count, if (!same) " ≠ " ++ ref_short else if (k == 0) "  (info only, not in the verdict)" else "" });
+        }
+        {
+            const net_raw = if (go_raw.best_ns > go_p.best_ns) (ours.best_ns - ours_p.best_ns) / (go_raw.best_ns - go_p.best_ns) else std.math.nan(f64);
+            try w.print("{s:<22} {d:>11.0} {d:>11.0} {d:>8.3} {d:>8.3} {d:>6.1}% {d:>6.1}%  {d}  (echo raw-key validator, info only)\n", .{ raw_name, ours.best_ns, go_raw.best_ns, ours.best_ns / go_raw.best_ns, net_raw, 100 * ours.spread(), 100 * go_raw.spread(), go_raw.count });
         }
         try w.flush();
     }
