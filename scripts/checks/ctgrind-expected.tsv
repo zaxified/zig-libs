@@ -1346,8 +1346,8 @@ iec62351	ReleaseFast	mac	1	0	baa343dce2c14435	760ede68c6c5b472
 # what follows it on the AUTHENTICATED plaintext: the padding-byte checks
 # (834-840) and the dupe/alloc/free of the unpadded body (its length). The
 # padding is checked only after the MAC, so it is no padding oracle.
-opcua	ReleaseFast	kdf	1	0	1eca3e15a3507385	29be2a7621f75ceb
-opcua	ReleaseFast	chunk	1	14	1eca3e15a3507385	17e08703a66ffe0f
+opcua	ReleaseFast	kdf	1	0	554dc002dc1fc260	29be2a7621f75ceb
+opcua	ReleaseFast	chunk	1	14	554dc002dc1fc260	17e08703a66ffe0f
 # sha2 (2026-10-10) — hash: the message tainted through hash/update/peek for
 # SHA-224/256/384/512 at 0..1000 bytes; hmac: std Hmac over sha2.Sha256/512
 # with key + message tainted. Both 0.
