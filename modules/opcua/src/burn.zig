@@ -46,8 +46,10 @@ pub const chunk_burn = 8 * 1024;
 /// RSA-backed one-shot or per-OPN calls (`sealAsymmetricMessage`,
 /// `openAsymmetricMessage`, `encryptUserTokenSecret`, `decryptUserTokenSecret`,
 /// `ClientCredentials.generateSelfSigned`): the `rsa` module burns its own
-/// frames; this covers the wrapper's (generous; not yet measured).
-pub const rsa_burn = 64 * 1024;
+/// frames; this covers the wrapper's. 64 KiB until 2026-10-17, when the
+/// ReleaseFast probe at CI's `-Dcpu` found `encryptUserTokenSecret` reaching
+/// 186 KB (rsa's 8192-bit capacity) -- hence 256 KiB.
+pub const rsa_burn = 256 * 1024;
 
 /// Client request methods (`Session.*`, `Subscription.*`, `SecureChannel.close`):
 /// one service round trip through `services.Channel` — encode, seal (copies of

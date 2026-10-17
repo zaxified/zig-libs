@@ -13,7 +13,7 @@ const security = @import("security.zig");
 const encoding = @import("encoding.zig");
 const sp = @import("testkit").stackprobe;
 
-const P = sp.Probe(.{ .window = 256 * 1024 });
+const P = sp.Probe(.{ .window = 512 * 1024 }); // must exceed rsa_burn (256 KiB) plus the burn top
 const gpa = std.heap.page_allocator; // global-alloc-ok: leaks the probed calls' result slices on purpose; file-scope fixtures outlive the test block
 
 var prng: std.Random.DefaultCsprng = undefined;
