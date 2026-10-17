@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-17** — Interop (`tools/interop.zig`, manager scenario) made deterministic: the issuer asks for Pebble's `default` profile (Pebble picks a random profile for an order naming none, so the renewal was a six-day certificate half the time, expired at the shifted clock); the renewal is detected by a changed chain, not `not_after` (same-second issuance repeats it); the restart runs at the real clock (the fresh renewal could already be due there, and the issuer-less manager's failure leaked into later steps). 6/6 runs green. Tooling only.
+
 - **2026-10-17** — The private `src/b64ct.zig` is gone: the EC key PEM uses the new `b64ct` module (`standard.encode`; `decodeIgnoring` with `pem_whitespace` on the raw body, so the branching whitespace strip and its stack copy are gone too). ctgrind `pem` 20 -> 18 in-file. No API change.
 - **2026-10-17** — internal: the CSR / TLS-ALPN certificate / key PEM DER is built with `rsa.der_writer` (already a dependency) instead of this module's own copy; output byte-identical. `DerEncodeError`, `CsrError` and `TlsAlpnError` keep `ValueTooLarge`, but it is no longer returned (the shared encoder takes any length; a CSR over 64 KiB is now built).
 - **2026-10-17** — ARI `suggestedWindow` times are parsed by `datefmt.parseRfc3339` (new dep `datefmt`, already in the closure via `http`) instead of this module's own RFC 3339 parser and civil-date helpers. **Behaviour change:** a leap second (`23:59:60`) is now refused as `MalformedResponse` (it was read as `:59`), as Go's `time.Parse` does; every other accepted and refused form is unchanged (the existing `parseRfc3339` test table passes as is, plus a `:60` row).

@@ -481,7 +481,10 @@ fn managerScenario(gpa: std.mem.Allocator, io: std.Io, transport: *http.Client, 
             .max_polls = 100,
         });
         defer client.deinit();
-        var issuer: acme.Manager.AcmeIssuer = .{ .client = &client, .name = "pebble" };
+        // Explicit profile: Pebble picks a RANDOM one for an order that names
+        // none ("in true pebble chaos fashion", wfe.go), and a six-day
+        // `shortlived` renewal is expired at the shifted clock (2026-10-17).
+        var issuer: acme.Manager.AcmeIssuer = .{ .client = &client, .name = "pebble", .obtain = .{ .profile = "default" } };
         try m.addIssuer(issuer.issuer());
         try m.manage(names);
 
@@ -498,13 +501,22 @@ fn managerScenario(gpa: std.mem.Allocator, io: std.Io, transport: *http.Client, 
 
         // Jump to the renewal time: renewed, naming its predecessor (Pebble
         // checks `replaces` against the account's certificates).
-        const old_not_after = e.cert.?.not_after;
+        // Compared by the chain itself: Pebble sets notAfter = notBefore +
+        // validity in whole seconds, so a renewal within the same second as
+        // the first issuance has the same not_after.
+        const old_chain = try gpa.dupe(u8, e.cert.?.chain_pem);
+        defer gpa.free(old_chain);
         clock.offset = e.renew_at - std.Io.Clock.real.now(io).toSeconds() + 1;
         _ = m.maintain();
         mstep(&failures, "renewed", events.issued == 2 and events.failed == 0 and
-            m.entries.items[0].cert.?.not_after != old_not_after);
+            !std.mem.eql(u8, m.entries.items[0].cert.?.chain_pem, old_chain));
         mstep(&failures, "renewed-verified", servesVerified(gpa, &m, "m.test", root_pem, names, &clock));
     }
+    // Back to the real clock first: at the shifted one the fresh renewal can
+    // already sit past its own (randomized) renewal point, and the restarted
+    // manager, which has no issuer, then reports a failure that leaks into
+    // the steps below (1 run in 3, 2026-10-17).
+    clock.offset = 0;
     {
         // A restart: the renewed certificate comes from storage, no order.
         var m = acme.Manager.init(io, gpa, .{
@@ -518,7 +530,6 @@ fn managerScenario(gpa: std.mem.Allocator, io: std.Io, transport: *http.Client, 
         _ = m.maintain();
         mstep(&failures, "restart-from-storage", events.from_storage == 1 and events.issued == 2);
     }
-    clock.offset = 0;
     {
         // TLS-ALPN-01 answered from the manager's store, and on-demand.
         var m = acme.Manager.init(io, gpa, .{
@@ -539,7 +550,10 @@ fn managerScenario(gpa: std.mem.Allocator, io: std.Io, transport: *http.Client, 
             .max_polls = 100,
         });
         defer client.deinit();
-        var issuer: acme.Manager.AcmeIssuer = .{ .client = &client, .name = "pebble" };
+        // Explicit profile: Pebble picks a RANDOM one for an order that names
+        // none ("in true pebble chaos fashion", wfe.go), and a six-day
+        // `shortlived` renewal is expired at the shifted clock (2026-10-17).
+        var issuer: acme.Manager.AcmeIssuer = .{ .client = &client, .name = "pebble", .obtain = .{ .profile = "default" } };
         try m.addIssuer(issuer.issuer());
         try m.manage(&.{"mt.test"});
         _ = m.maintain();
