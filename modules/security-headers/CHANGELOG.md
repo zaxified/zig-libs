@@ -5,6 +5,20 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-17** — **helmet 8.3.0 parity (scope core -> parity).** **BEHAVIOUR CHANGE:** `Options{}` now also
+  emits `Origin-Agent-Cluster: ?1`, `X-DNS-Prefetch-Control: off`, `X-Download-Options: noopen`,
+  `X-Permitted-Cross-Domain-Policies: none`, `X-XSS-Protection: 0` (helmet's defaults, each with a knob:
+  `origin_agent_cluster`, `x_dns_prefetch_control`, `x_download_options`, `x_permitted_cross_domain_policies`,
+  `x_xss_protection`), after COEP; 5 more header slots and 125 bytes of the `apply` budget. HSTS `preload` is
+  validated like helmet (max-age >= 31536000 and includeSubDomains): `InitError.InvalidHstsPreload`,
+  `@compileError` in `applyStatic`; `Hsts.preloadValid`, `hsts_preload_min_age_s`. New `csp` namespace
+  (`src/csp.zig`): typed `Name`/`Directive`/`Spec`, `build` (comptime) and `render` (runtime) with helmet's
+  `useDefaults` merge and validation (unquoted keywords, quotes, `;` `,` whitespace, control, non-ASCII, empty,
+  duplicate), `Nonce` (`fromBytes`, `secure(io)`), `renderNonce`; `applyCspNonce` / `applyCspWithNonce` put a
+  per-response `'nonce-…'` into named directives. `csp.build(.{})` == `csp_helmet_default`. Docs: stale "helmet
+  v7" and `Clear-Site-Data` claims fixed, comparison table gains unrolled/secure (fastest candidate) and
+  gin-contrib/secure. Mutation not rerun on the new code.
+
 - **2026-10-05** — **Anchoring: headless Chrome** (`tools/interop.zig`, `tools/browser_oracle.js`,
   `src/browser_oracle_test.zig`): seven configurations, a page with every kind of subresource, framed,
   embedded and opened from another origin; Chrome's behaviour equals each header's specified effect and it

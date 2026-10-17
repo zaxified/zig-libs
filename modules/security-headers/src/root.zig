@@ -15,7 +15,7 @@
 //! Default header set (see `Options` for the knobs):
 //!
 //! - `Strict-Transport-Security: max-age=31536000; includeSubDomains` —
-//!   helmet.js v7 default (365 days, no `preload`). **Only meaningful over
+//!   helmet.js 8.3.0 default (365 days, no `preload`). **Only meaningful over
 //!   HTTPS**: browsers ignore HSTS received over plain HTTP, so the header
 //!   is harmless there, but only ever deploy it on a host actually served
 //!   via TLS — once cached, browsers refuse plain-HTTP for `max-age`
@@ -30,6 +30,10 @@
 //! - `Referrer-Policy: no-referrer` (helmet default).
 //! - `Cross-Origin-Opener-Policy: same-origin`,
 //!   `Cross-Origin-Resource-Policy: same-origin` (helmet defaults).
+//! - helmet 8.3.0's legacy/cluster defaults, each with its own knob and
+//!   on by default: `Origin-Agent-Cluster: ?1`, `X-DNS-Prefetch-Control: off`,
+//!   `X-Download-Options: noopen`, `X-Permitted-Cross-Domain-Policies: none`,
+//!   `X-XSS-Protection: 0`.
 //!
 //! Off by default (opt-in):
 //!
@@ -40,7 +44,10 @@
 //!   from helmet (which defaults CSP on) — deliberate, and required by this
 //!   module's spec ("CSP present only when configured"). Ready-made
 //!   postures: `csp_api` (deny-everything, for pure JSON/binary APIs) and
-//!   `csp_helmet_default` (helmet's browser-app default). An optional
+//!   `csp_helmet_default` (helmet's browser-app default); the `csp` builder
+//!   (`csp.build` at comptime, `csp.render` at run time) assembles and
+//!   validates a policy from typed directives and `csp.Nonce` / `applyCspNonce`
+//!   put a fresh per-response nonce into it. An optional
 //!   `Content-Security-Policy-Report-Only` mirror is independent, for
 //!   trialing a policy without enforcing it.
 //! - `Permissions-Policy` — caller-supplied feature-policy string
@@ -55,7 +62,7 @@
 //!   `.server_name = null` (a header, once set, can only be replaced).
 //! - `extra` — additional static headers emitted verbatim after the set
 //!   above: the escape hatch for the curation's long tail (`X-Robots-Tag`,
-//!   `X-Permitted-Cross-Domain-Policies`, ...) without a knob each.
+//!   ...) without a knob each.
 //!
 //! Stateless and reentrant: the middleware `state` is a pointer to the
 //! immutable `SecurityHeaders` (precomputed config) — no clock, no
@@ -94,6 +101,9 @@ const testkit = @import("testkit");
 const router = @import("router");
 const http = @import("http");
 
+/// Content-Security-Policy builder and nonce (see `csp.zig`).
+pub const csp = @import("csp.zig");
+
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
@@ -118,15 +128,27 @@ pub const meta = .{
 /// `SecurityHeaders.init`. HTTPS-only in effect (browsers ignore HSTS over
 /// plain HTTP) — see the module doc before enabling `preload`.
 pub const Hsts = struct {
-    /// `max-age` in seconds. Default 31536000 (365 days — helmet v7 default).
+    /// `max-age` in seconds. Default 31536000 (365 days — helmet default).
     max_age_s: u64 = 31_536_000,
     /// Apply to all subdomains too (helmet default: on).
     include_subdomains: bool = true,
-    /// Chrome preload-list marker — requires `max_age_s` ≥ 1 year,
-    /// `include_subdomains`, and registration at hstspreload.org. Off by
-    /// default (helmet default).
+    /// Chrome preload-list marker — requires `max_age_s` ≥ 1 year
+    /// (`hsts_preload_min_age_s`), `include_subdomains`, and registration at
+    /// hstspreload.org. Off by default (helmet default). Like helmet, a
+    /// `preload` without the other two is refused: `init` returns
+    /// `error.InvalidHstsPreload`, `applyStatic` is a compile error.
     preload: bool = false,
+
+    /// Whether this value satisfies the preload requirements (always true
+    /// when `preload` is off).
+    pub fn preloadValid(h: Hsts) bool {
+        return !h.preload or (h.max_age_s >= hsts_preload_min_age_s and h.include_subdomains);
+    }
 };
+
+/// Minimum `max-age` for HSTS preload (one year), per hstspreload.org and
+/// helmet's check.
+pub const hsts_preload_min_age_s: u64 = 31_536_000;
 
 /// One optional per header: `null` (or `false`) disables the header, a
 /// string replaces the default value. Defaults = the secure baseline
@@ -164,13 +186,27 @@ pub const Options = struct {
     /// it breaks cross-origin embeds). Opt in with "require-corp" (or
     /// "credentialless") only when you need cross-origin isolation.
     cross_origin_embedder_policy: ?[]const u8 = null,
+    /// `Origin-Agent-Cluster: ?1` (the only meaningful value, hence a bool).
+    /// Default on (helmet default).
+    origin_agent_cluster: bool = true,
+    /// `X-DNS-Prefetch-Control`; default `off` (helmet default; `"on"` is
+    /// the other defined value). Legacy.
+    x_dns_prefetch_control: ?[]const u8 = "off",
+    /// `X-Download-Options: noopen` (IE-only, legacy; the only value, hence a
+    /// bool). Default on (helmet default).
+    x_download_options: bool = true,
+    /// `X-Permitted-Cross-Domain-Policies`; default `none` (helmet default;
+    /// also `master-only`, `by-content-type`, `all`). Legacy (Flash/PDF).
+    x_permitted_cross_domain_policies: ?[]const u8 = "none",
+    /// `X-XSS-Protection: 0` — disables the buggy legacy XSS auditor, which
+    /// is what OWASP and helmet recommend. Default on (helmet default).
+    x_xss_protection: bool = true,
     /// Replacement `Server` header value (fingerprint reduction); null =
     /// leave the server's own behavior. Removal is not possible from
     /// middleware — configure `http.Server` with `.server_name = null`.
     server: ?[]const u8 = null,
     /// Additional static headers, emitted verbatim after everything above —
-    /// the escape hatch for the curation's long tail (`X-Robots-Tag`,
-    /// `X-Permitted-Cross-Domain-Policies`, `X-DNS-Prefetch-Control`, ...)
+    /// the escape hatch for the curation's long tail (`X-Robots-Tag`, ...)
     /// without a dedicated knob each. Same default-in-effect semantics: a
     /// handler's later `setHeader` wins. Names must be ordinary headers —
     /// the managed ones (`Content-Length`, `Connection`, ...) do not belong
@@ -183,9 +219,9 @@ pub const Options = struct {
 pub const csp_api: []const u8 =
     "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'";
 
-/// helmet.js v7's default browser-app policy, reproduced as configuration
-/// data (helmet is MIT; see NOTICE). A reasonable starting point when the
-/// server also serves HTML.
+/// helmet.js 8.3.0's default browser-app policy, reproduced as configuration
+/// data (helmet is MIT; see NOTICE); byte-identical to `csp.build(.{})`. A
+/// reasonable starting point when the server also serves HTML.
 pub const csp_helmet_default: []const u8 =
     "default-src 'self';base-uri 'self';font-src 'self' https: data:;" ++
     "form-action 'self';frame-ancestors 'self';img-src 'self' data:;" ++
@@ -258,6 +294,10 @@ pub const SecurityHeaders = struct {
         /// comptime sibling `applyStatic` already rejects the same input
         /// with a `@compileError`.
         InvalidExtraHeaderName,
+        /// `hsts.preload` is set but `max_age_s` < `hsts_preload_min_age_s` or
+        /// `include_subdomains` is off — hstspreload.org would reject the
+        /// site and helmet throws. (`applyStatic` reports it at compile time.)
+        InvalidHstsPreload,
     };
 
     /// RFC 9110 §5.1 field-name token. `http`'s own validator is private to
@@ -290,11 +330,16 @@ pub const SecurityHeaders = struct {
             if (options.cross_origin_opener_policy) |v| assertValueClean(v);
             if (options.cross_origin_resource_policy) |v| assertValueClean(v);
             if (options.cross_origin_embedder_policy) |v| assertValueClean(v);
+            if (options.x_dns_prefetch_control) |v| assertValueClean(v);
+            if (options.x_permitted_cross_domain_policies) |v| assertValueClean(v);
             if (options.server) |v| assertValueClean(v);
             for (options.extra) |h| assertValueClean(h.value);
         }
         for (options.extra) |h| {
             if (!validFieldName(h.name)) return error.InvalidExtraHeaderName;
+        }
+        if (options.hsts) |h| {
+            if (!h.preloadValid()) return error.InvalidHstsPreload;
         }
         var sh: SecurityHeaders = .{ .options = options };
         if (options.hsts) |h| {
@@ -327,6 +372,11 @@ pub const SecurityHeaders = struct {
         if (o.cross_origin_opener_policy) |v| total += "Cross-Origin-Opener-Policy".len + v.len;
         if (o.cross_origin_resource_policy) |v| total += "Cross-Origin-Resource-Policy".len + v.len;
         if (o.cross_origin_embedder_policy) |v| total += "Cross-Origin-Embedder-Policy".len + v.len;
+        if (o.origin_agent_cluster) total += "Origin-Agent-Cluster".len + "?1".len;
+        if (o.x_dns_prefetch_control) |v| total += "X-DNS-Prefetch-Control".len + v.len;
+        if (o.x_download_options) total += "X-Download-Options".len + "noopen".len;
+        if (o.x_permitted_cross_domain_policies) |v| total += "X-Permitted-Cross-Domain-Policies".len + v.len;
+        if (o.x_xss_protection) total += "X-XSS-Protection".len + "0".len;
         if (o.server) |v| total += "Server".len + v.len;
         for (o.extra) |h| total += h.name.len + h.value.len;
         return total;
@@ -362,6 +412,11 @@ pub const SecurityHeaders = struct {
         if (o.cross_origin_opener_policy) |v| try res.setHeader("Cross-Origin-Opener-Policy", v);
         if (o.cross_origin_resource_policy) |v| try res.setHeader("Cross-Origin-Resource-Policy", v);
         if (o.cross_origin_embedder_policy) |v| try res.setHeader("Cross-Origin-Embedder-Policy", v);
+        if (o.origin_agent_cluster) try res.setHeader("Origin-Agent-Cluster", "?1");
+        if (o.x_dns_prefetch_control) |v| try res.setHeader("X-DNS-Prefetch-Control", v);
+        if (o.x_download_options) try res.setHeader("X-Download-Options", "noopen");
+        if (o.x_permitted_cross_domain_policies) |v| try res.setHeader("X-Permitted-Cross-Domain-Policies", v);
+        if (o.x_xss_protection) try res.setHeader("X-XSS-Protection", "0");
         if (o.server) |v| try res.setHeader("Server", v);
         for (o.extra) |h| try res.setHeader(h.name, h.value);
     }
@@ -393,6 +448,11 @@ pub const SecurityHeaders = struct {
         if (comptime options.cross_origin_opener_policy) |v| try res.setHeaderStatic("Cross-Origin-Opener-Policy", v);
         if (comptime options.cross_origin_resource_policy) |v| try res.setHeaderStatic("Cross-Origin-Resource-Policy", v);
         if (comptime options.cross_origin_embedder_policy) |v| try res.setHeaderStatic("Cross-Origin-Embedder-Policy", v);
+        if (comptime options.origin_agent_cluster) try res.setHeaderStatic("Origin-Agent-Cluster", "?1");
+        if (comptime options.x_dns_prefetch_control) |v| try res.setHeaderStatic("X-DNS-Prefetch-Control", v);
+        if (comptime options.x_download_options) try res.setHeaderStatic("X-Download-Options", "noopen");
+        if (comptime options.x_permitted_cross_domain_policies) |v| try res.setHeaderStatic("X-Permitted-Cross-Domain-Policies", v);
+        if (comptime options.x_xss_protection) try res.setHeaderStatic("X-XSS-Protection", "0");
         if (comptime options.server) |v| try res.setHeaderStatic("Server", v);
         inline for (comptime options.extra) |h| try res.setHeaderStatic(h.name, h.value);
     }
@@ -402,6 +462,7 @@ pub const SecurityHeaders = struct {
     /// the "applyStatic: default set is byte-for-byte apply's" test.
     fn hstsStaticValue(comptime h: Hsts) []const u8 {
         comptime {
+            if (!h.preloadValid()) @compileError("security-headers: hsts.preload requires max_age_s >= 31536000 and include_subdomains");
             var v: []const u8 = std.fmt.comptimePrint("max-age={d}", .{h.max_age_s});
             if (h.include_subdomains) v = v ++ "; includeSubDomains";
             if (h.preload) v = v ++ "; preload";
@@ -420,6 +481,44 @@ pub const SecurityHeaders = struct {
         return .{ .state = @constCast(sh), .run = middlewareRun };
     }
 };
+
+/// Everything `applyCspNonce` / `applyCspWithNonce` can fail with: building
+/// the policy, or writing it onto the response.
+pub const CspNonceError = csp.Error || http.Server.ResponseWriter.SetHeaderError;
+
+/// Set `Content-Security-Policy` (or `-Report-Only`) on `res` for this one
+/// response, with `'nonce-<nonce>'` appended to each directive in `nonce_in`
+/// (typically `&.{ .script_src, .style_src }`; each must exist in `spec`).
+/// `scratch` holds the rendered policy only for the duration of the call
+/// (`setHeader` copies it) -- a stack buffer is fine; nothing allocates.
+/// Replaces a policy of the same name set earlier (e.g. by `apply`).
+/// The caller keeps `nonce` for the HTML (`nonce.slice()`).
+pub fn applyCspWithNonce(
+    res: *http.Server.ResponseWriter,
+    spec: csp.Spec,
+    nonce: *const csp.Nonce,
+    nonce_in: []const csp.Name,
+    report_only: bool,
+    scratch: []u8,
+) CspNonceError!void {
+    const value = try csp.renderNonce(spec, nonce, nonce_in, scratch);
+    try res.setHeader(if (report_only) "Content-Security-Policy-Report-Only" else "Content-Security-Policy", value);
+}
+
+/// `applyCspWithNonce` with a FRESH nonce drawn from `io.randomSecure`
+/// (no hidden RNG); returns the nonce for the HTML. Call once per response.
+pub fn applyCspNonce(
+    res: *http.Server.ResponseWriter,
+    io: std.Io,
+    spec: csp.Spec,
+    nonce_in: []const csp.Name,
+    report_only: bool,
+    scratch: []u8,
+) (CspNonceError || std.Io.RandomSecureError)!csp.Nonce {
+    const nonce = try csp.Nonce.secure(io);
+    try applyCspWithNonce(res, spec, &nonce, nonce_in, report_only, scratch);
+    return nonce;
+}
 
 fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerror!void {
     const sh: *const SecurityHeaders = @ptrCast(@alignCast(state.?));
@@ -508,6 +607,11 @@ test "defaults: exactly the expected header set with expected values (golden wir
         "Referrer-Policy: no-referrer\r\n" ++
         "Cross-Origin-Opener-Policy: same-origin\r\n" ++
         "Cross-Origin-Resource-Policy: same-origin\r\n" ++
+        "Origin-Agent-Cluster: ?1\r\n" ++
+        "X-DNS-Prefetch-Control: off\r\n" ++
+        "X-Download-Options: noopen\r\n" ++
+        "X-Permitted-Cross-Domain-Policies: none\r\n" ++
+        "X-XSS-Protection: 0\r\n" ++
         "Connection: close\r\n" ++
         "Content-Length: 2\r\n" ++
         "\r\n" ++
@@ -539,6 +643,11 @@ test "disabling: each header omittable; everything off = a bare response" {
             .referrer_policy = null,
             .cross_origin_opener_policy = null,
             .cross_origin_resource_policy = null,
+            .origin_agent_cluster = false,
+            .x_dns_prefetch_control = null,
+            .x_download_options = false,
+            .x_permitted_cross_domain_policies = null,
+            .x_xss_protection = false,
         });
         var r = router.Router.init(testing.allocator);
         defer r.deinit();
@@ -606,7 +715,12 @@ test "init: a CSP that alone would exceed http's real response header-byte budge
         "X-Frame-Options".len + "DENY".len +
         "Referrer-Policy".len + "no-referrer".len +
         "Cross-Origin-Opener-Policy".len + "same-origin".len +
-        "Cross-Origin-Resource-Policy".len + "same-origin".len;
+        "Cross-Origin-Resource-Policy".len + "same-origin".len +
+        "Origin-Agent-Cluster".len + "?1".len +
+        "X-DNS-Prefetch-Control".len + "off".len +
+        "X-Download-Options".len + "noopen".len +
+        "X-Permitted-Cross-Domain-Policies".len + "none".len +
+        "X-XSS-Protection".len + "0".len;
     const csp_name_bytes = "Content-Security-Policy".len;
     // Exactly how much CSP value this configuration has left before it, on
     // its own — before any other middleware, handler, or trailer touches
@@ -651,7 +765,12 @@ test "end-to-end anchor: a config sized to exactly fill http's real header budge
         "X-Frame-Options".len + "DENY".len +
         "Referrer-Policy".len + "no-referrer".len +
         "Cross-Origin-Opener-Policy".len + "same-origin".len +
-        "Cross-Origin-Resource-Policy".len + "same-origin".len;
+        "Cross-Origin-Resource-Policy".len + "same-origin".len +
+        "Origin-Agent-Cluster".len + "?1".len +
+        "X-DNS-Prefetch-Control".len + "off".len +
+        "X-Download-Options".len + "noopen".len +
+        "X-Permitted-Cross-Domain-Policies".len + "none".len +
+        "X-XSS-Protection".len + "0".len;
     const csp_name_bytes = "Content-Security-Policy".len;
     const room = http_header_budget_bytes - defaults_bytes - csp_name_bytes;
 
@@ -724,8 +843,8 @@ test "HSTS: value format for every flag combination" {
     const c: SecurityHeaders = try .init(.{ .hsts = .{ .max_age_s = 0, .include_subdomains = false } });
     try testing.expectEqualStrings("max-age=0", c.hstsValue());
 
-    const d: SecurityHeaders = try .init(.{ .hsts = .{ .include_subdomains = false, .preload = true } });
-    try testing.expectEqualStrings("max-age=31536000; preload", d.hstsValue());
+    // preload without includeSubDomains / with a short max-age is refused
+    try testing.expectError(error.InvalidHstsPreload, SecurityHeaders.init(.{ .hsts = .{ .include_subdomains = false, .preload = true } }));
 
     // The longest possible value exactly fills the precomputed buffer.
     const e: SecurityHeaders = try .init(.{ .hsts = .{ .max_age_s = std.math.maxInt(u64), .preload = true } });
@@ -871,6 +990,161 @@ test "applyStatic: handler's later setHeader still wins" {
     const got = out.buffered();
     try expectHeaderLine(got, "X-Frame-Options: SAMEORIGIN");
     try testing.expect(std.mem.indexOf(u8, got, "DENY") == null);
+}
+
+test "legacy defaults: helmet 8.3.0 values, each knob alone disables its header, values overridable" {
+    // KAT: helmet 8.3.0 README default set (value part of each line).
+    const sh: SecurityHeaders = try .init(.{});
+    var out_buf: [1024]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var body_buf: [64]u8 = undefined;
+    var chunk_buf: [64]u8 = undefined;
+    var rw: http.Server.ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+    try sh.apply(&rw);
+    try rw.end();
+    const got = out.buffered();
+    try expectHeaderLine(got, "Origin-Agent-Cluster: ?1");
+    try expectHeaderLine(got, "X-DNS-Prefetch-Control: off");
+    try expectHeaderLine(got, "X-Download-Options: noopen");
+    try expectHeaderLine(got, "X-Permitted-Cross-Domain-Policies: none");
+    try expectHeaderLine(got, "X-XSS-Protection: 0");
+
+    inline for (.{
+        .{ "origin_agent_cluster", false, "Origin-Agent-Cluster" },
+        .{ "x_dns_prefetch_control", null, "X-DNS-Prefetch-Control" },
+        .{ "x_download_options", false, "X-Download-Options" },
+        .{ "x_permitted_cross_domain_policies", null, "X-Permitted-Cross-Domain-Policies" },
+        .{ "x_xss_protection", false, "X-XSS-Protection" },
+    }) |c| {
+        var o: Options = .{};
+        @field(o, c[0]) = c[1];
+        const s1: SecurityHeaders = try .init(o);
+        var ob: [1024]u8 = undefined;
+        var w: Writer = .fixed(&ob);
+        var rw1: http.Server.ResponseWriter = .init(&w, &body_buf, &chunk_buf, .{});
+        try s1.apply(&rw1);
+        try rw1.end();
+        try expectNoHeader(w.buffered(), c[2]);
+        // the other four are untouched: 16 default lines minus this one
+        try testing.expectEqual(@as(usize, 4), blk: {
+            var n: usize = 0;
+            for ([_][]const u8{ "Origin-Agent-Cluster:", "X-DNS-Prefetch-Control:", "X-Download-Options:", "X-Permitted-Cross-Domain-Policies:", "X-XSS-Protection:" }) |nm| {
+                if (std.mem.indexOf(u8, w.buffered(), nm) != null) n += 1;
+            }
+            break :blk n;
+        });
+    }
+
+    const custom: SecurityHeaders = try .init(.{ .x_dns_prefetch_control = "on", .x_permitted_cross_domain_policies = "by-content-type" });
+    var ob2: [1024]u8 = undefined;
+    var w2: Writer = .fixed(&ob2);
+    var rw2: http.Server.ResponseWriter = .init(&w2, &body_buf, &chunk_buf, .{});
+    try custom.apply(&rw2);
+    try rw2.end();
+    try expectHeaderLine(w2.buffered(), "X-DNS-Prefetch-Control: on");
+    try expectHeaderLine(w2.buffered(), "X-Permitted-Cross-Domain-Policies: by-content-type");
+}
+
+test "HSTS preload: refused unless max-age >= 1 year and includeSubDomains (init error)" {
+    try testing.expectError(error.InvalidHstsPreload, SecurityHeaders.init(.{ .hsts = .{ .max_age_s = 31_535_999, .preload = true } }));
+    try testing.expectError(error.InvalidHstsPreload, SecurityHeaders.init(.{ .hsts = .{ .include_subdomains = false, .preload = true } }));
+    try testing.expectError(error.InvalidHstsPreload, SecurityHeaders.init(.{ .hsts = .{ .max_age_s = 0, .include_subdomains = false, .preload = true } }));
+    // boundary accepted; non-preload values are never judged
+    const ok: SecurityHeaders = try .init(.{ .hsts = .{ .max_age_s = 31_536_000, .preload = true } });
+    try testing.expectEqualStrings("max-age=31536000; includeSubDomains; preload", ok.hstsValue());
+    _ = try SecurityHeaders.init(.{ .hsts = .{ .max_age_s = 1, .include_subdomains = false } });
+    try testing.expect((Hsts{ .max_age_s = 5 }).preloadValid());
+    try testing.expect(!(Hsts{ .max_age_s = 5, .preload = true }).preloadValid());
+    // comptime twin: the compile error is reachable only for invalid values;
+    // a valid preload value renders at comptime.
+    try testing.expectEqualStrings("max-age=63072000; includeSubDomains; preload", comptime SecurityHeaders.hstsStaticValue(.{ .max_age_s = 63_072_000, .preload = true }));
+}
+
+test "csp builder: csp_helmet_default is byte-identical to the comptime defaults; applyStatic accepts a built policy" {
+    try testing.expectEqualStrings(csp_helmet_default, comptime csp.build(.{}));
+
+    var out_buf: [2048]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var body_buf: [64]u8 = undefined;
+    var chunk_buf: [64]u8 = undefined;
+    var rw: http.Server.ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+    try SecurityHeaders.applyStatic(.{
+        .content_security_policy = comptime csp.build(.{
+            .directives = &.{.{ .name = .script_src, .values = &.{ "'self'", "https://cdn.example" } }},
+            .remove = &.{.upgrade_insecure_requests},
+        }),
+    }, &rw);
+    try testing.expectEqual(@as(usize, 0), rw.header_buf_len);
+    try rw.end();
+    try expectHeaderLine(out.buffered(), "Content-Security-Policy: default-src 'self';base-uri 'self';" ++
+        "font-src 'self' https: data:;form-action 'self';frame-ancestors 'self';img-src 'self' data:;" ++
+        "object-src 'none';script-src 'self' https://cdn.example;script-src-attr 'none';" ++
+        "style-src 'self' https: 'unsafe-inline'");
+}
+
+test "csp builder: runtime policy through init/apply" {
+    var buf: [512]u8 = undefined;
+    const policy = try csp.render(.{ .use_defaults = false, .directives = &.{
+        .{ .name = .default_src, .values = &.{"'none'"} },
+        .{ .name = .frame_ancestors, .values = &.{"'none'"} },
+    } }, &buf);
+    const sh: SecurityHeaders = try .init(.{ .content_security_policy = policy });
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(sh.middleware());
+    try r.get("/t", hOk);
+    var wbuf: [2048]u8 = undefined;
+    try expectHeaderLine(runWire(&r, wire("/t"), &wbuf), "Content-Security-Policy: default-src 'none';frame-ancestors 'none'");
+}
+
+fn hNonce(ctx: *router.Ctx) anyerror!void {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    var scratch: [1024]u8 = undefined;
+    const nonce = try applyCspNonce(ctx.res, threaded.io(), .{}, &.{ .script_src, .style_src }, false, &scratch);
+    try ctx.res.writeAll(nonce.slice());
+}
+
+test "applyCspNonce: fresh nonce per response, rendered into script-src/style-src, handed back (body echoes it)" {
+    const sh: SecurityHeaders = try .init(.{});
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(sh.middleware());
+    try r.get("/n", hNonce);
+
+    var nonces: [2][csp.Nonce.text_len]u8 = undefined;
+    for (&nonces) |*slot| {
+        var buf: [4096]u8 = undefined;
+        const got = runWire(&r, wire("/n"), &buf);
+        const body = got[std.mem.indexOf(u8, got, "\r\n\r\n").? + 4 ..];
+        try testing.expectEqual(@as(usize, csp.Nonce.text_len), body.len);
+        @memcpy(slot, body);
+        const want = try std.fmt.allocPrint(testing.allocator, "Content-Security-Policy: default-src 'self';base-uri 'self';" ++
+            "font-src 'self' https: data:;form-action 'self';frame-ancestors 'self';img-src 'self' data:;" ++
+            "object-src 'none';script-src 'self' 'nonce-{s}';script-src-attr 'none';" ++
+            "style-src 'self' https: 'unsafe-inline' 'nonce-{s}';upgrade-insecure-requests", .{ body, body });
+        defer testing.allocator.free(want);
+        try testing.expect(std.mem.indexOf(u8, got, want) != null);
+        try testing.expectEqual(@as(usize, 1), std.mem.count(u8, got, "Content-Security-Policy:"));
+    }
+    try testing.expect(!std.mem.eql(u8, &nonces[0], &nonces[1]));
+}
+
+test "applyCspWithNonce: report-only name, deterministic bytes, errors surface" {
+    var out_buf: [2048]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var body_buf: [64]u8 = undefined;
+    var chunk_buf: [64]u8 = undefined;
+    var rw: http.Server.ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+    const nonce = csp.Nonce.fromBytes(&([_]u8{0} ** 16));
+    var scratch: [1024]u8 = undefined;
+    try applyCspWithNonce(&rw, .{ .use_defaults = false, .directives = &.{.{ .name = .script_src, .values = &.{"'strict-dynamic'"} }} }, &nonce, &.{.script_src}, true, &scratch);
+    try testing.expectError(error.NonceDirectiveMissing, applyCspWithNonce(&rw, .{ .use_defaults = false, .directives = &.{.{ .name = .img_src, .values = &.{"'self'"} }} }, &nonce, &.{.script_src}, false, &scratch));
+    var tiny: [8]u8 = undefined;
+    try testing.expectError(error.NoSpaceLeft, applyCspWithNonce(&rw, .{}, &nonce, &.{.script_src}, false, &tiny));
+    try rw.end();
+    try expectHeaderLine(out.buffered(), "Content-Security-Policy-Report-Only: script-src 'strict-dynamic' 'nonce-AAAAAAAAAAAAAAAAAAAAAA'");
+    try expectNoHeader(out.buffered(), "Content-Security-Policy");
 }
 
 // ── tests (in-process integration — http.Server + http.Client) ──────────────
@@ -1109,7 +1383,7 @@ test "the init-time budget sum counts exactly the bytes apply puts on the wire" 
         wire_bytes += name.len + line.len - colon - 2;
         lines += 1;
     }
-    try testing.expectEqual(@as(usize, 12), lines); // all eleven named headers + one extra
+    try testing.expectEqual(@as(usize, 17), lines); // all sixteen named headers + one extra
     try testing.expectEqual(wire_bytes, sh.appliedHeaderBytes());
 }
 
@@ -1117,4 +1391,5 @@ test "the init-time budget sum counts exactly the bytes apply puts on the wire" 
 // See browser_oracle_test.zig / tools/interop.zig / tools/browser_oracle.js.
 test {
     _ = @import("browser_oracle_test.zig");
+    _ = @import("csp.zig");
 }

@@ -48,17 +48,22 @@ names are plain strings; the hyphen imports fine, same as the community's
 | `Cross-Origin-Opener-Policy` | `same-origin` | `cross_origin_opener_policy` |
 | `Cross-Origin-Resource-Policy` | `same-origin` | `cross_origin_resource_policy` |
 | `Cross-Origin-Embedder-Policy` | *(off — opt-in, breaks embeds)* | `cross_origin_embedder_policy` |
+| `Origin-Agent-Cluster` | `?1` | `origin_agent_cluster` (bool) |
+| `X-DNS-Prefetch-Control` | `off` | `x_dns_prefetch_control` |
+| `X-Download-Options` | `noopen` | `x_download_options` (bool) |
+| `X-Permitted-Cross-Domain-Policies` | `none` | `x_permitted_cross_domain_policies` |
+| `X-XSS-Protection` | `0` | `x_xss_protection` (bool) |
 | `Server` | *(off — replacement value)* | `server` |
 | *(anything else, verbatim)* | *(off)* | `extra` |
 
-Defaults match helmet.js v7 except: `X-Frame-Options` is `DENY` (spec
+Defaults match helmet.js 8.3.0 except: `X-Frame-Options` is `DENY` (spec
 mandate; helmet uses SAMEORIGIN) and CSP is **off by default** (helmet ships
-a default policy; there is no universally-safe one — see below). helmet's
-legacy extras (`X-DNS-Prefetch-Control`, `X-Download-Options`,
-`X-Permitted-Cross-Domain-Policies`, `X-XSS-Protection: 0`,
-`Origin-Agent-Cluster`) consciously get no knob of their own — a consumer
-that wants one names it in `extra` (emitted last, verbatim, same
-handler-wins semantics).
+a default policy; there is no universally-safe one — see below). The five
+legacy/cluster headers (`Origin-Agent-Cluster`, `X-DNS-Prefetch-Control`,
+`X-Download-Options`, `X-Permitted-Cross-Domain-Policies`, `X-XSS-Protection`)
+are on by default exactly as in helmet; set the knob to `false` / `null` to
+drop one. Anything else goes in `extra` (emitted after the set, verbatim,
+same handler-wins semantics).
 
 ## Usage
 
@@ -123,6 +128,8 @@ TLS: once cached, browsers refuse plain-HTTP access for `max-age` seconds
 (and with `include_subdomains`, for every subdomain). `preload` is off by
 default; opt in only with `max_age_s` ≥ 1 year, `include_subdomains = true`,
 and registration at <https://hstspreload.org> (it is effectively permanent).
+Like helmet, a `preload` without those two is refused: `init` returns
+`error.InvalidHstsPreload`, and `applyStatic` fails to compile.
 
 ## CSP posture (off by default — deliberate)
 
@@ -133,14 +140,65 @@ configured"). Two ready-made postures ship as constants:
 
 - `csp_api` — `default-src 'none'; frame-ancestors 'none'; base-uri 'none';
   form-action 'none'` — deny-everything, for pure JSON/binary APIs.
-- `csp_helmet_default` — helmet.js v7's browser-app default, when the server
-  also serves HTML.
+- `csp_helmet_default` — helmet.js 8.3.0's browser-app default, when the server
+  also serves HTML (byte-identical to `csp.build(.{})`).
 
 `content_security_policy_report_only` is independent — use it to trial a
 stricter policy without enforcing it. Note `X-Frame-Options` is the legacy
 anti-clickjacking header; the modern form is CSP `frame-ancestors`, which
 overrides `X-Frame-Options` in supporting browsers — keep the two consistent
 when you configure a CSP.
+
+## CSP builder (`csp`)
+
+Typed directives, helmet's `useDefaults` merge, validation. At compile time
+(works in `applyStatic`):
+
+```zig
+const csp = security_headers.csp;
+try security_headers.SecurityHeaders.applyStatic(.{
+    .content_security_policy = comptime csp.build(.{
+        // use_defaults = true: helmet 8.3.0's directives are the starting point.
+        .directives = &.{
+            // replaces the default script-src in place
+            .{ .name = .script_src, .values = &.{ "'self'", "https://cdn.example" } },
+            // appended
+            .{ .name = .connect_src, .values = &.{"'self'"} },
+        },
+        .remove = &.{.upgrade_insecure_requests}, // helmet's `name: null`
+    }),
+}, res);
+```
+
+At run time the same core renders into a buffer: `csp.render(spec, &buf)`
+returns the policy for `Options.content_security_policy`. Keywords must be
+quoted (`"'self'"`; `"self"` is a host named self, so it is refused:
+`error.UnquotedKeyword`, a `@compileError` in `build`); values containing
+`;`, `,`, whitespace, control or non-ASCII characters, empty values and
+duplicate directives are refused too.
+
+### Per-response nonce
+
+```zig
+fn page(ctx: *router.Ctx) anyerror!void {
+    var scratch: [1024]u8 = undefined; // holds the rendered policy for the call
+    const nonce = try security_headers.applyCspNonce(
+        ctx.res, io, .{}, // io: std.Io; spec: helmet defaults
+        &.{ .script_src, .style_src }, // directives that get 'nonce-…'
+        false, // true = Content-Security-Policy-Report-Only
+        &scratch,
+    );
+    // nonce.slice() is 22 base64 characters for <script nonce="…">
+    try ctx.res.print("<script nonce=\"{s}\">…</script>", .{nonce.slice()});
+}
+```
+
+`applyCspNonce` draws 128 bits from `io.randomSecure` per call (no hidden
+global RNG); `applyCspWithNonce` takes a `csp.Nonce` you made yourself
+(`csp.Nonce.fromBytes`). It replaces a CSP set earlier by the middleware.
+Run time only: a nonce cannot go through `applyStatic`. Every named
+directive must exist in the spec (`error.NonceDirectiveMissing`). A nonce is
+only secret if the response is not cached and shared between users.
 
 ## COEP breaks embeds (opt-in)
 
