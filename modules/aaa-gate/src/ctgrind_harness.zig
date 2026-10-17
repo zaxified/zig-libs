@@ -53,7 +53,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const taint = if (std.mem.eql(u8, taint_arg, "yes")) true else if (std.mem.eql(u8, taint_arg, "no")) false else return error.UnknownTaint;
     std.debug.print("valgrind_support={} target={t}\n", .{ builtin.valgrind_support, target });
 
-    const gpa = std.heap.page_allocator;
+    const gpa = std.heap.page_allocator; // global-alloc-ok: one-shot ctgrind diagnostic binary, no caller to take one from
     var g = try aaa.Gate.init(gpa, .{
         .token = tokens[0],
         .extra_tokens = tokens[1..],

@@ -830,7 +830,7 @@ fn stuck(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
 
 fn runStuck() u8 {
     armWatchdog("stuck", 100) catch return 1;
-    runSeedsReporting(stuck, "stuck", .{ .runs = 1000, .first = 0 }, std.heap.page_allocator, null, false) catch return 2;
+    runSeedsReporting(stuck, "stuck", .{ .runs = 1000, .first = 0 }, std.heap.page_allocator, null, false) catch return 2; // global-alloc-ok: the body of a forked child that is killed by its watchdog, no caller to take one from
     return 0;
 }
 
