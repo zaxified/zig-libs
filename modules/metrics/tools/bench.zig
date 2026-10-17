@@ -5,7 +5,7 @@
 //! maturity card (CONVENTIONS.md §9, kept instrument kind 3).
 //!
 //! THIS IS A PROGRAM, NOT A TEST. `zig build bench-metrics` runs it (always
-//! ReleaseFast); `zig build check-interop` compiles it. Needs go 1.26.0 and
+//! ReleaseFast); `zig build check-interop` compiles it. Needs a local go ≥ 1.26.0 (`GOTOOLCHAIN=local`) and
 //! client_golang v1.24.1 in the module cache (pinned by `tools/go_bench/go.mod`
 //! / `go.sum`, the same set the metrics oracle pins; `GOPROXY=off`). Run from
 //! the repository root.
@@ -15,9 +15,11 @@
 //!   observe        4096 x histogram observation (default buckets, values
 //!                  0..10.9 s) on a held histogram
 //!   counter_vec    4096 x "find the series for (method, code) and increment
-//!                  it": ours `Registry.counter(name, help, labels).inc()`
-//!                  (get-or-register, validating every call), Go
-//!                  `CounterVec.WithLabelValues(m, c).Inc()`
+//!                  it": ours `CounterVec.with(.{m, c}).inc()`, Go
+//!                  `CounterVec.WithLabelValues(m, c).Inc()` -- like for like
+//!                  since 2026-10-17 (before: `Registry.counter(name, help,
+//!                  labels)`, which validates the whole descriptor per call
+//!                  and has no Go counterpart: 1.66x)
 //!   scrape         one `GET /metrics`: ours `Registry.writeText`, Go
 //!                  `promhttp.HandlerFor` into a `httptest.ResponseRecorder`;
 //!                  5 families, 20 request counters, 1+6 gauges, 12 histograms
@@ -71,6 +73,7 @@ const Data = struct {
     hist: *metrics.Histogram,
     vals: [n_obs]f64,
     vec_reg: *metrics.Registry,
+    vec: metrics.CounterVec,
     scrape_reg: *metrics.Registry,
     scrape_buf: []u8,
     plain: *router.Router,
@@ -101,10 +104,7 @@ fn once(d_const: *const Data, w: usize) u64 {
         },
         2 => {
             for (0..n_obs) |i| {
-                const c = d.vec_reg.counter("bench_total", "bench", &.{
-                    .{ .name = "method", .value = methods[i & 3] },
-                    .{ .name = "code", .value = codes[(i >> 2) % 5] },
-                }) catch unreachable;
+                const c = d.vec.with(&.{ methods[i & 3], codes[(i >> 2) % 5] }) catch unreachable;
                 c.inc();
             }
             return n_obs;
@@ -149,6 +149,7 @@ fn setup(arena: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) !Data {
     for (&d.vals, 0..) |*v, i| v.* = obsValue(i);
     d.vec_reg = try arena.create(metrics.Registry);
     d.vec_reg.* = metrics.Registry.init(gpa);
+    d.vec = try d.vec_reg.counterVec("bench_total", "bench", &.{ "method", "code" });
 
     // scrape: the same registry the Go side builds.
     d.scrape_reg = try arena.create(metrics.Registry);
@@ -323,7 +324,7 @@ fn timeIt(io: std.Io, d: *const Data, w: usize) Row {
 /// Build the Go side once (`go build`), so the timed runs do not pay for it.
 fn goBuild(arena: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, abs: []const u8) ![]const u8 {
     var env = try environ.clone(arena);
-    try env.put("GOTOOLCHAIN", "go1.26.0");
+    try env.put("GOTOOLCHAIN", "local");
     try env.put("GOPROXY", "off");
     try env.put("GOFLAGS", "-mod=readonly");
     const exe = try std.fmt.allocPrint(arena, "{s}/go_bench", .{abs});

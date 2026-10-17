@@ -5,6 +5,20 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-17** — **`*Vec` handles + series removal** (client_golang `CounterVec`/`GaugeVec`/`HistogramVec`).
+  - ADDED: `Registry.counterVec`/`gaugeVec`/`histogramVec` (descriptor validated once) and
+    `Vec.with(values)` — one hashed lookup per call; `Vec.delete`, `Vec.reset`, `Vec.len`,
+    `Registry.unregister`. A family with no series is no longer exposed (client_golang).
+  - CHANGED: series are found through a per-family hash index (was a linear scan with string
+    compares), and series memory comes from the registry's allocator so removal gives it back; a
+    series removed during a scrape is freed by the last scrape out. `writeText`'s snapshot copies
+    series pointers (O(series) words) instead of list headers.
+  - **BEHAVIOURAL:** `Registry.counter`/`gauge`/`histogram` check label values for UTF-8 before the
+    family is touched, so an `InvalidUtf8` no longer leaves a new family registered.
+  - Bench: `counter_vec` now compares `CounterVec.with` with `WithLabelValues` (like for like):
+    1.66× → 0.87×; worst row 0.87×. The Go side builds with `GOTOOLCHAIN=local` (the pinned
+    `go1.26.0` download is blocked by `GOPROXY=off`).
+
 - **2026-10-10** — Comparative benchmark `tools/bench.zig` (`zig build bench-metrics`, kept instrument kind 3): card Performance 0.08–1.72× prometheus/client_golang (counter_vec 1.72×: `Registry.counter` validates on every call, no cached handle), measured on a quiet host. Tooling only, no code change.
 
 - **2026-10-06** — **BREAKING:** `AccessLog` (with `AccessLog.Format`, `.Options`, `onRequest`) is

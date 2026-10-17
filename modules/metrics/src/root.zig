@@ -15,8 +15,11 @@
 //!   *get-or-register*: the first call with a given (name, label values)
 //!   creates the instrument, later calls return the same stable pointer
 //!   (client_golang `GetMetricWithLabelValues`). All strings and bucket
-//!   slices are copied into the registry's arena — callers may pass stack
-//!   temporaries. `deinit` frees everything at once.
+//!   slices are copied — callers may pass stack temporaries. `deinit` frees
+//!   everything at once. On a request path with labels, register a family
+//!   once with `counterVec`/`gaugeVec`/`histogramVec` and call `with(values)`
+//!   (client_golang `WithLabelValues`): one hash lookup, no re-validation.
+//!   `Vec.delete`/`reset` and `Registry.unregister` remove series.
 //! - **Instruments** — `Counter` is a monotonic `u64` (never negative by
 //!   construction; deviation: client_golang counters accept float `Add`,
 //!   ours are integer-valued — sufficient for event counts). `Gauge` is an
@@ -60,6 +63,7 @@
 //! lock-free caches and never register.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const testkit = @import("testkit");
 const router = @import("router");
 const http = @import("http");
@@ -342,15 +346,63 @@ const Instrument = union(Kind) {
     histogram: Histogram,
 };
 
-/// One time series: a fixed label-value tuple + its instrument. Arena-owned,
-/// stable address for the registry's lifetime.
+/// One time series: a fixed label-value tuple + its instrument. Owned by the
+/// registry's general-purpose allocator (not the arena) so `delete`/`reset`/
+/// `unregister` can give it back; a removed child is freed only once no
+/// scrape can still be formatting it (`Registry.retired`).
 const Child = struct {
     /// Values in the family's label-name order.
     label_values: []const []const u8,
     data: Instrument,
+
+    fn destroy(c: *Child, gpa: Allocator) void {
+        for (c.label_values) |v| gpa.free(v);
+        gpa.free(c.label_values);
+        if (c.data == .histogram) gpa.free(c.data.histogram.bucket_counts);
+        gpa.destroy(c);
+    }
+};
+
+/// Hash of a label-value tuple: each value length-prefixed, so ("ab","c")
+/// and ("a","bc") differ.
+fn hashValues(values: []const []const u8) u64 {
+    var h = std.hash.Wyhash.init(0);
+    for (values) |v| {
+        h.update(std.mem.asBytes(&v.len));
+        h.update(v);
+    }
+    return h.final();
+}
+
+fn eqlValues(a: []const []const u8, b: []const []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| if (!std.mem.eql(u8, x, y)) return false;
+    return true;
+}
+
+/// `Family.index` context: children keyed by their own label values.
+const ChildContext = struct {
+    pub fn hash(_: ChildContext, c: *Child) u64 {
+        return hashValues(c.label_values);
+    }
+    pub fn eql(_: ChildContext, a: *Child, b: *Child) bool {
+        return eqlValues(a.label_values, b.label_values);
+    }
+};
+
+/// Adapter: look a child up by a caller's value tuple without building one.
+const ValuesAdapter = struct {
+    pub fn hash(_: ValuesAdapter, values: []const []const u8) u64 {
+        return hashValues(values);
+    }
+    pub fn eql(_: ValuesAdapter, values: []const []const u8, c: *Child) bool {
+        return eqlValues(values, c.label_values);
+    }
 };
 
 /// One metric family: `# HELP`/`# TYPE` emitted once, then every child.
+/// The family itself and its strings live in the arena; its child list and
+/// index use the general-purpose allocator (they shrink).
 const Family = struct {
     name: []const u8,
     help: []const u8,
@@ -359,17 +411,24 @@ const Family = struct {
     label_names: []const []const u8,
     /// Histogram families only, else empty.
     buckets: []const f64,
+    /// Registration order (exposition order).
     children: std.ArrayList(*Child) = .empty,
+    /// Label values -> child: O(1) get on the request path (a linear scan
+    /// with string compares was the whole 1.66x of the `counter_vec` bench
+    /// row against client_golang's hashed `WithLabelValues`, 2026-10-17).
+    index: std.HashMapUnmanaged(*Child, void, ChildContext, std.hash_map.default_max_load_percentage) = .empty,
 };
 
 /// Thread-safe metric registry — see the module doc. Instruments returned
-/// by `counter`/`gauge`/`histogram` are arena-owned stable pointers, valid
-/// until `deinit`. The Registry must outlive any Router its middleware /
-/// endpoint is registered on, at a stable address.
+/// by `counter`/`gauge`/`histogram` and the `*Vec.with` handles are stable
+/// pointers, valid until `deinit` — or until their series is removed with
+/// `delete`/`reset`/`unregister`, after which the pointer must not be used
+/// (see `CounterVec.delete`). The Registry must outlive any Router its
+/// middleware / endpoint is registered on, at a stable address.
 pub const Registry = struct {
     arena: std.heap.ArenaAllocator,
-    /// Guards `families`/`family_index` (lookup + registration) and
-    /// `writeText` iteration.
+    /// Guards `families`/`family_index`, every family's `children`/`index`,
+    /// `active_scrapes` and `retired`.
     lock: std.atomic.Mutex = .unlocked,
     /// Registration order — `writeText` iterates this so exposition order
     /// stays deterministic (registration order, not sorted; see `writeText`).
@@ -377,6 +436,13 @@ pub const Registry = struct {
     /// Name -> family, O(1) get-or-register lookup. `families` stays the
     /// source of iteration order; this is purely an index into it.
     family_index: std.StringHashMapUnmanaged(*Family) = .empty,
+    /// Scrapes between their snapshot and the end of formatting. A child
+    /// removed meanwhile may still be in a snapshot, so it is parked in
+    /// `retired` and freed by the last scrape out instead of at once.
+    active_scrapes: usize = 0,
+    retired: std.ArrayList(*Child) = .empty,
+    /// Families removed by `unregister` (arena list; see there).
+    orphaned: std.ArrayList(*Family) = .empty,
     /// Advisory size of the last `writeText` output, used to pre-size the
     /// next scrape's transient buffer so a steady-state registry (typical:
     /// scrape interval far exceeds registration churn) does not repeatedly
@@ -390,13 +456,26 @@ pub const Registry = struct {
     }
 
     pub fn deinit(r: *Registry) void {
+        const gpa = r.arena.child_allocator;
+        for (r.families.items) |fam| freeFamilyChildren(gpa, fam);
+        for (r.orphaned.items) |fam| freeFamilyChildren(gpa, fam);
+        for (r.retired.items) |c| c.destroy(gpa);
+        r.retired.deinit(gpa);
         r.arena.deinit();
         r.* = undefined;
     }
 
+    fn freeFamilyChildren(gpa: Allocator, fam: *Family) void {
+        for (fam.children.items) |c| c.destroy(gpa);
+        fam.children.deinit(gpa);
+        fam.index.deinit(gpa);
+    }
+
     /// Get-or-register a counter time series. `name`/`help`/`labels` are
     /// copied — pass anything. Same (name, label values) → the same
-    /// `*Counter` every time.
+    /// `*Counter` every time. On a hot path with labels, register a
+    /// `counterVec` once and call `with` instead: this validates the whole
+    /// descriptor on every call.
     pub fn counter(r: *Registry, name: []const u8, help: []const u8, labels: []const Label) RegisterError!*Counter {
         const child = try r.getOrRegister(name, help, .counter, labels, &.{});
         return &child.data.counter;
@@ -417,21 +496,61 @@ pub const Registry = struct {
         return &child.data.histogram;
     }
 
-    fn getOrRegister(r: *Registry, name: []const u8, help: []const u8, kind: Kind, labels: []const Label, buckets: []const f64) RegisterError!*Child {
+    /// Get-or-register a counter FAMILY with label names `label_names` and
+    /// no series yet (client_golang `NewCounterVec` + `Register`). A family
+    /// with no series is not exposed. Registering the same descriptor again
+    /// returns a handle to the same family.
+    pub fn counterVec(r: *Registry, name: []const u8, help: []const u8, label_names: []const []const u8) RegisterError!CounterVec {
+        return .{ .registry = r, .family = try r.getOrRegisterFamily(name, help, .counter, label_names, &.{}) };
+    }
+
+    /// Get-or-register a gauge family (see `counterVec`).
+    pub fn gaugeVec(r: *Registry, name: []const u8, help: []const u8, label_names: []const []const u8) RegisterError!GaugeVec {
+        return .{ .registry = r, .family = try r.getOrRegisterFamily(name, help, .gauge, label_names, &.{}) };
+    }
+
+    /// Get-or-register a histogram family (see `counterVec`, `histogram`).
+    pub fn histogramVec(r: *Registry, name: []const u8, help: []const u8, label_names: []const []const u8, buckets: []const f64) RegisterError!HistogramVec {
+        return .{ .registry = r, .family = try r.getOrRegisterFamily(name, help, .histogram, label_names, buckets) };
+    }
+
+    /// Remove the family `name` and every series in it (client_golang
+    /// `Unregister`). Returns whether it existed. Pointers into it must not
+    /// be used afterwards; the name may be registered again, with any
+    /// descriptor. The family's own strings stay in the arena until `deinit`
+    /// (a few bytes per unregister).
+    pub fn unregister(r: *Registry, name: []const u8) bool {
+        lockSpin(&r.lock);
+        defer r.lock.unlock();
+        const kv = r.family_index.fetchRemove(name) orelse return false;
+        const fam = kv.value;
+        for (r.families.items, 0..) |f, i| if (f == fam) {
+            _ = r.families.orderedRemove(i);
+            break;
+        };
+        r.retireAllLocked(fam);
+        // A `*Vec` handle may outlive this and keep adding series, as a
+        // client_golang vec keeps working after `Unregister` (just never
+        // collected again): the family stays allocated, off the exposition,
+        // and `deinit` still frees what it accumulates.
+        r.orphaned.append(r.arena.allocator(), fam) catch {};
+        return true;
+    }
+
+    fn validateDescriptor(name: []const u8, help: []const u8, kind: Kind, label_names: []const []const u8, buckets: []const f64) RegisterError!void {
         if (!validMetricName(name)) return error.InvalidName;
         if (!std.unicode.utf8ValidateSlice(help)) return error.InvalidUtf8;
-        if (labels.len > max_labels) return error.TooManyLabels;
-        for (labels, 0..) |l, i| {
-            if (!validLabelName(l.name)) return error.InvalidLabelName;
+        if (label_names.len > max_labels) return error.TooManyLabels;
+        for (label_names, 0..) |ln, i| {
+            if (!validLabelName(ln)) return error.InvalidLabelName;
             // ⛔ A repeated label name was accepted and written as
             // `m{a="1",a="2"}`, which Prometheus refuses -- the whole scrape
             // with it. client_golang refuses the descriptor
             // (`go_register_test.zig`, 2026-10-06).
-            for (labels[0..i]) |prev| if (std.mem.eql(u8, prev.name, l.name)) return error.InvalidLabelName;
+            for (label_names[0..i]) |prev| if (std.mem.eql(u8, prev, ln)) return error.InvalidLabelName;
             // `le` is reserved on every kind (F13) — see
             // `RegisterError.ReservedLabelName`.
-            if (std.mem.eql(u8, l.name, "le")) return error.ReservedLabelName;
-            if (!std.unicode.utf8ValidateSlice(l.value)) return error.InvalidUtf8;
+            if (std.mem.eql(u8, ln, "le")) return error.ReservedLabelName;
         }
         if (kind == .histogram) {
             for (buckets, 0..) |b, i| {
@@ -439,11 +558,12 @@ pub const Registry = struct {
                 if (i > 0 and b <= buckets[i - 1]) return error.InvalidBuckets;
             }
         }
+    }
 
+    /// The family for this descriptor, registered if new. Caller holds
+    /// `r.lock`; the descriptor is already validated.
+    fn familyLocked(r: *Registry, name: []const u8, help: []const u8, kind: Kind, label_names: []const []const u8, buckets: []const f64) RegisterError!*Family {
         const a = r.arena.allocator();
-        lockSpin(&r.lock);
-        defer r.lock.unlock();
-
         const fam = if (r.family_index.get(name)) |f| f else blk: {
             try r.checkSuffixCollisionLocked(name, kind);
             const f = try a.create(Family);
@@ -451,7 +571,11 @@ pub const Registry = struct {
                 .name = try a.dupe(u8, name),
                 .help = try a.dupe(u8, help),
                 .kind = kind,
-                .label_names = try dupeStrings(a, labels, .name),
+                .label_names = blk2: {
+                    const out = try a.alloc([]const u8, label_names.len);
+                    for (out, label_names) |*slot, ln| slot.* = try a.dupe(u8, ln);
+                    break :blk2 out;
+                },
                 .buckets = if (kind == .histogram) try a.dupe(f64, buckets) else &.{},
             };
             try r.families.append(a, f);
@@ -461,9 +585,9 @@ pub const Registry = struct {
 
         if (fam.kind != kind) return error.WrongType;
         if (!std.mem.eql(u8, fam.help, help)) return error.HelpMismatch;
-        if (fam.label_names.len != labels.len) return error.LabelMismatch;
-        for (fam.label_names, labels) |ln, l| {
-            if (!std.mem.eql(u8, ln, l.name)) return error.LabelMismatch;
+        if (fam.label_names.len != label_names.len) return error.LabelMismatch;
+        for (fam.label_names, label_names) |have, want| {
+            if (!std.mem.eql(u8, have, want)) return error.LabelMismatch;
         }
         if (kind == .histogram) {
             if (fam.buckets.len != buckets.len) return error.BucketsMismatch;
@@ -471,33 +595,101 @@ pub const Registry = struct {
                 if (fb != b) return error.BucketsMismatch;
             }
         }
+        return fam;
+    }
 
-        child: for (fam.children.items) |c| {
-            for (c.label_values, labels) |cv, l| {
-                if (!std.mem.eql(u8, cv, l.value)) continue :child;
-            }
-            return c; // get: existing series
+    fn getOrRegisterFamily(r: *Registry, name: []const u8, help: []const u8, kind: Kind, label_names: []const []const u8, buckets: []const f64) RegisterError!*Family {
+        try validateDescriptor(name, help, kind, label_names, buckets);
+        lockSpin(&r.lock);
+        defer r.lock.unlock();
+        return r.familyLocked(name, help, kind, label_names, buckets);
+    }
+
+    fn getOrRegister(r: *Registry, name: []const u8, help: []const u8, kind: Kind, labels: []const Label, buckets: []const f64) RegisterError!*Child {
+        if (labels.len > max_labels) return error.TooManyLabels;
+        var names: [max_labels][]const u8 = undefined;
+        var values: [max_labels][]const u8 = undefined;
+        for (labels, 0..) |l, i| {
+            names[i] = l.name;
+            values[i] = l.value;
         }
+        try validateDescriptor(name, help, kind, names[0..labels.len], buckets);
+        // Checked before the family is touched, so a bad value never leaves
+        // a new, empty family registered behind its error.
+        for (values[0..labels.len]) |v| if (!std.unicode.utf8ValidateSlice(v)) return error.InvalidUtf8;
+        lockSpin(&r.lock);
+        defer r.lock.unlock();
+        const fam = try r.familyLocked(name, help, kind, names[0..labels.len], buckets);
+        return r.childLocked(fam, values[0..labels.len]);
+    }
 
-        // Register: a new series in this family.
-        const c = try a.create(Child);
+    /// The series for `values` in `fam`, created if new. Caller holds
+    /// `r.lock`. Values are UTF-8-checked only on creation: a lookup hit
+    /// matched a value that was checked when it was stored.
+    fn childLocked(r: *Registry, fam: *Family, values: []const []const u8) RegisterError!*Child {
+        if (values.len != fam.label_names.len) return error.LabelMismatch;
+        const gpa = r.arena.child_allocator;
+        if (fam.index.getKeyAdapted(values, ValuesAdapter{})) |c| return c;
+
+        for (values) |v| if (!std.unicode.utf8ValidateSlice(v)) return error.InvalidUtf8;
+        try fam.children.ensureUnusedCapacity(gpa, 1);
+        try fam.index.ensureUnusedCapacityContext(gpa, 1, ChildContext{});
+
+        const c = try gpa.create(Child);
+        errdefer gpa.destroy(c);
+        const owned = try gpa.alloc([]const u8, values.len);
+        errdefer gpa.free(owned);
+        var done: usize = 0;
+        errdefer for (owned[0..done]) |v| gpa.free(v);
+        for (owned, values) |*slot, v| {
+            slot.* = try gpa.dupe(u8, v);
+            done += 1;
+        }
         c.* = .{
-            .label_values = try dupeStrings(a, labels, .value),
-            .data = switch (kind) {
+            .label_values = owned,
+            .data = switch (fam.kind) {
                 .counter => .{ .counter = .{} },
                 .gauge => .{ .gauge = .{} },
                 .histogram => .{ .histogram = .{
                     .upper_bounds = fam.buckets,
                     .bucket_counts = blk: {
-                        const counts = try a.alloc(u64, fam.buckets.len);
+                        const counts = try gpa.alloc(u64, fam.buckets.len);
                         @memset(counts, 0);
                         break :blk counts;
                     },
                 } },
             },
         };
-        try fam.children.append(a, c);
+        fam.children.appendAssumeCapacity(c);
+        fam.index.putAssumeCapacityNoClobberContext(c, {}, ChildContext{});
         return c;
+    }
+
+    /// Give a removed child back — now, or after the scrapes that may still
+    /// hold it in their snapshot. Caller holds `r.lock`.
+    fn retireLocked(r: *Registry, c: *Child) void {
+        const gpa = r.arena.child_allocator;
+        if (r.active_scrapes == 0) return c.destroy(gpa);
+        // Out of memory for the parking list: leak the series rather than
+        // free memory a scrape may be reading.
+        r.retired.append(gpa, c) catch {};
+    }
+
+    fn retireAllLocked(r: *Registry, fam: *Family) void {
+        for (fam.children.items) |c| r.retireLocked(c);
+        fam.children.clearRetainingCapacity();
+        fam.index.clearRetainingCapacity();
+    }
+
+    fn deleteLocked(r: *Registry, fam: *Family, values: []const []const u8) bool {
+        const kv = fam.index.fetchRemoveAdapted(values, ValuesAdapter{}) orelse return false;
+        const c = kv.key;
+        for (fam.children.items, 0..) |x, i| if (x == c) {
+            _ = fam.children.orderedRemove(i);
+            break;
+        };
+        r.retireLocked(c);
+        return true;
     }
 
     /// F5: reject a family whose derived sample names would collide with an
@@ -572,37 +764,59 @@ pub const Registry = struct {
         defer buf.deinit();
         const bw = &buf.writer;
 
-        // F2: hold `r.lock` only long enough to copy the family/children
-        // SLICE HEADERS (pointer + length; O(number of families) word
-        // copies), then format from that snapshot with the lock released.
-        // `families`/`family_index`/each family's `children` are
-        // append-only over the arena (registration never removes or frees
-        // a Child/Family, and `ArenaAllocator` never frees on grow
-        // either), so a snapshot taken here just may miss a series
-        // registered after this instant -- the same race a scrape already
-        // has against registration, lock or no lock. What the lock
-        // protects is the pair of memory words `ArrayList.append` writes
-        // (`items.ptr`, `items.len`) from being read torn while another
-        // thread is mid-append; it is not needed to read a Counter/Gauge
-        // (lock-free/atomic, see their doc comments) or a Histogram
-        // (guarded by its OWN per-instrument `h.lock` in `writeHistogram`,
-        // independent of `r.lock`) once the pointer is in hand. Formatting
-        // used to run inside this same critical section: measured at 3.7x
-        // the CPU under 8 concurrent scrapers, and the registry's own wall
-        // clock got worse under load because `lockSpin` never yields
-        // (audit F2; re-measured in this A/B, see commit message).
-        const snapshot: []const FamilySnapshot = blk: {
+        // F2: hold `r.lock` only long enough to copy the family and series
+        // POINTERS (one flat array, O(series) word copies), then format from
+        // that copy with the lock released. Formatting used to run inside
+        // this same critical section: measured at 3.7x the CPU under 8
+        // concurrent scrapers, and the registry's own wall clock got worse
+        // under load because `lockSpin` never yields (audit F2).
+        //
+        // The copy is of pointers, not of the lists' slice headers: since
+        // `delete`/`reset`/`unregister` (2026-10-17) the child lists shrink
+        // and reallocate. A series removed while this scrape formats is
+        // parked in `retired` (`active_scrapes` > 0) and freed by the last
+        // scrape out, so every pointer in the copy stays valid until then.
+        // Reading a Counter/Gauge needs no lock (atomics) and a Histogram
+        // takes its OWN `h.lock` in `writeHistogram`.
+        const gpa = r.arena.child_allocator;
+        var fams: []FamilySnapshot = &.{};
+        var kids: []*Child = &.{};
+        {
             lockSpin(&r.lock);
             defer r.lock.unlock();
-            const out = r.arena.child_allocator.alloc(FamilySnapshot, r.families.items.len) catch
+            var n_kids: usize = 0;
+            for (r.families.items) |fam| n_kids += fam.children.items.len;
+            fams = gpa.alloc(FamilySnapshot, r.families.items.len) catch return error.WriteFailed;
+            kids = gpa.alloc(*Child, n_kids) catch {
+                gpa.free(fams);
                 return error.WriteFailed;
-            for (r.families.items, out) |fam, *slot| slot.* = .{ .fam = fam, .children = fam.children.items };
-            break :blk out;
-        };
-        defer r.arena.child_allocator.free(snapshot);
+            };
+            var at: usize = 0;
+            for (r.families.items, fams) |fam, *slot| {
+                const n = fam.children.items.len;
+                @memcpy(kids[at..][0..n], fam.children.items);
+                slot.* = .{ .fam = fam, .children = kids[at..][0..n] };
+                at += n;
+            }
+            r.active_scrapes += 1;
+        }
+        defer {
+            lockSpin(&r.lock);
+            r.active_scrapes -= 1;
+            if (r.active_scrapes == 0) {
+                for (r.retired.items) |c| c.destroy(gpa);
+                r.retired.clearRetainingCapacity();
+            }
+            r.lock.unlock();
+            gpa.free(kids);
+            gpa.free(fams);
+        }
 
-        for (snapshot) |entry| {
+        for (fams) |entry| {
             const fam = entry.fam;
+            // client_golang does not expose a family with no series (a
+            // fresh `*Vec`, or one emptied by `delete`/`reset`).
+            if (entry.children.len == 0) continue;
             try bw.print("# HELP {s} ", .{fam.name});
             try writeEscaped(bw, fam.help, .help);
             try bw.print("\n# TYPE {s} {t}\n", .{ fam.name, fam.kind });
@@ -639,16 +853,65 @@ pub const Registry = struct {
     }
 };
 
-fn dupeStrings(a: Allocator, labels: []const Label, comptime field: enum { name, value }) Allocator.Error![]const []const u8 {
-    const out = try a.alloc([]const u8, labels.len);
-    for (out, labels) |*slot, l| {
-        slot.* = try a.dupe(u8, switch (field) {
-            .name => l.name,
-            .value => l.value,
-        });
-    }
-    return out;
+/// A handle to one registered family, for the request path: `with` finds
+/// (or creates) the series for a label-value tuple with one hash lookup
+/// under the registry lock — the descriptor was validated once, at
+/// `counterVec`/`gaugeVec`/`histogramVec`. client_golang `*Vec`.
+pub fn Vec(comptime kind: Kind) type {
+    return struct {
+        const Self = @This();
+        pub const Metric = switch (kind) {
+            .counter => Counter,
+            .gauge => Gauge,
+            .histogram => Histogram,
+        };
+
+        registry: *Registry,
+        family: *Family,
+
+        /// The series for `values` (in the family's label-name order),
+        /// created on first use (client_golang `GetMetricWithLabelValues`).
+        /// `error.LabelMismatch` for a wrong value count,
+        /// `error.InvalidUtf8` for a value that is not UTF-8.
+        pub fn with(v: Self, values: []const []const u8) RegisterError!*Metric {
+            lockSpin(&v.registry.lock);
+            defer v.registry.lock.unlock();
+            const c = try v.registry.childLocked(v.family, values);
+            return &@field(c.data, @tagName(kind));
+        }
+
+        /// Remove the series for `values`; returns whether it existed
+        /// (client_golang `DeleteLabelValues`). ⚠ Unlike Go, the series'
+        /// memory is given back: a pointer from `with` for these values must
+        /// not be used after this returns (a later `with` creates a fresh,
+        /// zeroed series). A scrape running concurrently is safe — the
+        /// series is freed once it has finished.
+        pub fn delete(v: Self, values: []const []const u8) bool {
+            lockSpin(&v.registry.lock);
+            defer v.registry.lock.unlock();
+            return v.registry.deleteLocked(v.family, values);
+        }
+
+        /// Remove every series of the family (client_golang `Reset`); the
+        /// family stays registered. Same pointer rule as `delete`.
+        pub fn reset(v: Self) void {
+            lockSpin(&v.registry.lock);
+            defer v.registry.lock.unlock();
+            v.registry.retireAllLocked(v.family);
+        }
+
+        /// Number of series currently in the family.
+        pub fn len(v: Self) usize {
+            lockSpin(&v.registry.lock);
+            defer v.registry.lock.unlock();
+            return v.family.children.items.len;
+        }
+    };
 }
+
+pub const CounterVec = Vec(.counter);
+pub const GaugeVec = Vec(.gauge);
+pub const HistogramVec = Vec(.histogram);
 
 /// The scrape Content-Type for text format 0.0.4 (what promhttp sends).
 pub const content_type = "text/plain; version=0.0.4; charset=utf-8";
@@ -2418,6 +2681,193 @@ test "F15/M31: getOrRegister actually takes the registry lock" {
     t.join();
     try testing.expect(done.load(.seq_cst));
     _ = try reg.counter("m31_probe_total", "probe", &.{}); // registered, not lost
+}
+
+// ── *Vec handles, delete / reset / unregister (S2, 2026-10-17) ─────────────
+
+fn scrapeInto(reg: *Registry, buf: []u8) ![]const u8 {
+    var w: std.Io.Writer = .fixed(buf);
+    try reg.writeText(&w);
+    return w.buffered();
+}
+
+test "Vec: with returns the same series as the get-or-register path" {
+    var reg = Registry.init(testing.allocator);
+    defer reg.deinit();
+    const v = try reg.counterVec("vec_total", "h", &.{ "method", "code" });
+    const a = try v.with(&.{ "GET", "200" });
+    a.inc();
+    const b = try reg.counter("vec_total", "h", &.{ .{ .name = "method", .value = "GET" }, .{ .name = "code", .value = "200" } });
+    try testing.expectEqual(a, b);
+    try testing.expectEqual(a, try v.with(&.{ "GET", "200" }));
+    try testing.expect(a != try v.with(&.{ "GET", "500" }));
+    // Length-prefixed hashing: ("ab","c") and ("a","bc") are two series.
+    try testing.expect(try v.with(&.{ "ab", "c" }) != try v.with(&.{ "a", "bc" }));
+    try testing.expectEqual(@as(usize, 4), v.len());
+    // Same descriptor = same family; a different one is refused.
+    const again = try reg.counterVec("vec_total", "h", &.{ "method", "code" });
+    try testing.expectEqual(v.family, again.family);
+    try testing.expectError(error.LabelMismatch, reg.counterVec("vec_total", "h", &.{"method"}));
+    try testing.expectError(error.WrongType, reg.gaugeVec("vec_total", "h", &.{ "method", "code" }));
+}
+
+test "Vec: with refuses a wrong value count and invalid UTF-8, registering nothing" {
+    var reg = Registry.init(testing.allocator);
+    defer reg.deinit();
+    const v = try reg.gaugeVec("vec_g", "h", &.{"room"});
+    try testing.expectError(error.LabelMismatch, v.with(&.{}));
+    try testing.expectError(error.LabelMismatch, v.with(&.{ "a", "b" }));
+    try testing.expectError(error.InvalidUtf8, v.with(&.{"\xff"}));
+    try testing.expectEqual(@as(usize, 0), v.len());
+    // The get-or-register path checks values before touching the family.
+    try testing.expectError(error.InvalidUtf8, reg.counter("fresh_total", "h", &.{.{ .name = "a", .value = "\xc3" }}));
+    try testing.expect(reg.family_index.get("fresh_total") == null);
+}
+
+test "Vec: a family with no series is not exposed; delete and reset remove series" {
+    var reg = Registry.init(testing.allocator);
+    defer reg.deinit();
+    var buf: [1024]u8 = undefined;
+    const v = try reg.counterVec("del_total", "h", &.{"k"});
+    try testing.expectEqualStrings("", try scrapeInto(&reg, &buf));
+
+    (try v.with(&.{"a"})).add(3);
+    (try v.with(&.{"b"})).add(5);
+    (try v.with(&.{"c"})).add(7);
+    try testing.expectEqualStrings(
+        \\# HELP del_total h
+        \\# TYPE del_total counter
+        \\del_total{k="a"} 3
+        \\del_total{k="b"} 5
+        \\del_total{k="c"} 7
+        \\
+    , try scrapeInto(&reg, &buf));
+
+    try testing.expect(v.delete(&.{"b"}));
+    try testing.expect(!v.delete(&.{"b"}));
+    try testing.expect(!v.delete(&.{"zz"}));
+    try testing.expectEqualStrings(
+        \\# HELP del_total h
+        \\# TYPE del_total counter
+        \\del_total{k="a"} 3
+        \\del_total{k="c"} 7
+        \\
+    , try scrapeInto(&reg, &buf));
+    // Re-created after delete: a fresh, zeroed series, appended last.
+    (try v.with(&.{"b"})).inc();
+    try testing.expectEqualStrings(
+        \\# HELP del_total h
+        \\# TYPE del_total counter
+        \\del_total{k="a"} 3
+        \\del_total{k="c"} 7
+        \\del_total{k="b"} 1
+        \\
+    , try scrapeInto(&reg, &buf));
+
+    v.reset();
+    try testing.expectEqual(@as(usize, 0), v.len());
+    try testing.expectEqualStrings("", try scrapeInto(&reg, &buf));
+    (try v.with(&.{"a"})).inc();
+    try testing.expectEqual(@as(u64, 1), (try v.with(&.{"a"})).value());
+}
+
+test "Vec: histogram series are freed with their buckets (testing.allocator leak check)" {
+    var reg = Registry.init(testing.allocator);
+    defer reg.deinit();
+    const v = try reg.histogramVec("del_seconds", "h", &.{"op"}, &default_buckets);
+    (try v.with(&.{"read"})).observe(0.02);
+    (try v.with(&.{"write"})).observe(3);
+    try testing.expect(v.delete(&.{"read"}));
+    v.reset();
+    (try v.with(&.{"read"})).observe(1);
+    try testing.expectEqual(@as(u64, 1), (try v.with(&.{"read"})).count());
+}
+
+test "unregister: removes the family, frees its series, allows a new descriptor" {
+    var reg = Registry.init(testing.allocator);
+    defer reg.deinit();
+    var buf: [1024]u8 = undefined;
+    const v = try reg.counterVec("gone_total", "h", &.{"k"});
+    (try v.with(&.{"a"})).inc();
+    _ = try reg.gauge("kept", "h", &.{});
+    try testing.expect(reg.unregister("gone_total"));
+    try testing.expect(!reg.unregister("gone_total"));
+    try testing.expectEqualStrings(
+        \\# HELP kept h
+        \\# TYPE kept gauge
+        \\kept 0
+        \\
+    , try scrapeInto(&reg, &buf));
+    // The name is free for any descriptor now.
+    (try reg.gauge("gone_total", "other", &.{})).set(2);
+    // A stale handle keeps working (client_golang: an unregistered vec is
+    // simply never collected) and its series are still freed at deinit.
+    (try v.with(&.{"b"})).inc();
+    try testing.expectEqualStrings(
+        \\# HELP kept h
+        \\# TYPE kept gauge
+        \\kept 0
+        \\# HELP gone_total other
+        \\# TYPE gone_total gauge
+        \\gone_total 2
+        \\
+    , try scrapeInto(&reg, &buf));
+}
+
+test "delete during a scrape: the series is parked until the last scrape ends" {
+    var reg = Registry.init(testing.allocator);
+    defer reg.deinit();
+    const v = try reg.counterVec("park_total", "h", &.{"k"});
+    _ = try v.with(&.{"a"});
+    _ = try v.with(&.{"b"});
+    // Stand in for a scrape between its snapshot and its end.
+    reg.active_scrapes = 1;
+    try testing.expect(v.delete(&.{"a"}));
+    v.reset();
+    try testing.expectEqual(@as(usize, 2), reg.retired.items.len);
+    reg.active_scrapes = 0;
+    // A real scrape ends with active_scrapes back at 0 and drains the park.
+    var buf: [256]u8 = undefined;
+    _ = try scrapeInto(&reg, &buf);
+    try testing.expectEqual(@as(usize, 0), reg.retired.items.len);
+}
+
+test "delete/with racing concurrent scrapes stays consistent (no UAF, no leak)" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    var reg = Registry.init(testing.allocator);
+    defer reg.deinit();
+    const v = try reg.counterVec("race_total", "h", &.{"k"});
+    const keys = [_][]const u8{ "a", "b", "c", "d", "e", "f", "g", "h" };
+    var stop = std.atomic.Value(bool).init(false);
+    const Churn = struct {
+        fn run(vec: CounterVec, s: *std.atomic.Value(bool)) void {
+            var i: usize = 0;
+            while (!s.load(.acquire)) : (i += 1) {
+                const k = keys[i % keys.len];
+                if (i % 3 == 0) _ = vec.delete(&.{k}) else (vec.with(&.{k}) catch unreachable).inc();
+                if (i % 997 == 0) vec.reset();
+            }
+        }
+    };
+    const Scrape = struct {
+        fn run(r: *Registry, s: *std.atomic.Value(bool)) void {
+            var buf: [4096]u8 = undefined;
+            while (!s.load(.acquire)) {
+                var w: std.Io.Writer = .fixed(&buf);
+                r.writeText(&w) catch unreachable;
+                validateExpositionText(w.buffered()) catch unreachable;
+            }
+        }
+    };
+    var ts: [4]std.Thread = undefined;
+    ts[0] = try std.Thread.spawn(.{}, Churn.run, .{ v, &stop });
+    ts[1] = try std.Thread.spawn(.{}, Churn.run, .{ v, &stop });
+    ts[2] = try std.Thread.spawn(.{}, Scrape.run, .{ &reg, &stop });
+    ts[3] = try std.Thread.spawn(.{}, Scrape.run, .{ &reg, &stop });
+    sleepMs(200);
+    stop.store(true, .release);
+    for (ts) |t| t.join();
+    try testing.expectEqual(@as(usize, 0), reg.retired.items.len);
 }
 
 // ── external anchor: client_golang + expfmt + textparse ────────────────────
