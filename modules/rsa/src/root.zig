@@ -136,7 +136,29 @@ pub const meta = .{
 /// of twice today's size again). Sizes up to 4096 run exactly as before
 /// (the montint slot follows the key); the cost is stack: a `SecretKey` and
 /// every `max_modulus_len` buffer doubled.
-pub const max_modulus_bits = 8192;
+///
+/// **Consumer build option** (the first one in zig-libs, 2026-10-17): the
+/// application may lower the cap with `-Drsa-max-modulus-bits=N` (4096..8192,
+/// a multiple of 64), or get 4096 from `-Dprofile=small`. Not below 4096:
+/// public CA roots with 4096-bit keys are common, so a lower cap would make an
+/// HTTPS client refuse ordinary chains. Code size is what it
+/// buys: montint instantiates one slot per 256 bits up to the cap, and on an
+/// ADX/BMI2 CPU each slot is straight-line asm — the HTTPS sizeprobe measured
+/// `DynModint(8192)` at 5.4 MB of `.text` there (0.27 MB on baseline x86_64).
+/// A key above the cap is refused the way any oversized key is
+/// (`error.InvalidPublicKey` / `InvalidPrivateKey` / `InvalidBits`, or
+/// `InvalidDer` when the DER wrapper alone is already too long), never
+/// truncated. The default stays 8192: the grade is measured on it.
+pub const max_modulus_bits: comptime_int = blk: {
+    const bits: comptime_int = zl_options.rsa_max_modulus_bits orelse switch (zl_options.profile) {
+        .default => 8192,
+        .small => 4096,
+    };
+    if (bits < 4096 or bits > 8192 or bits % 64 != 0)
+        @compileError(std.fmt.comptimePrint("rsa-max-modulus-bits={d}: must be 4096..8192 and a multiple of 64", .{bits}));
+    break :blk bits;
+};
+const zl_options = @import("zl_options");
 
 /// Fixed-capacity big-unsigned-integer type sized to `max_modulus_bits`.
 pub const Uint = std.crypto.ff.Uint(max_modulus_bits);
@@ -5146,6 +5168,19 @@ const kat8192 = struct {
 test "8192-bit keys (R7): OpenSSL's key parses and round-trips; v1.5 sign byte-exact, OAEP decrypts, PSS both ways" {
     const Sha256 = std.crypto.hash.sha2.Sha256;
     var sk: SecretKey = undefined;
+    if (max_modulus_bits < 8192) {
+        // A consumer lowered the cap (`-Drsa-max-modulus-bits`, `-Dprofile=small`):
+        // the same key must be REFUSED by every entry point, never truncated.
+        // (Which error depends on where the size first shows -- the DER
+        // wrapper or the modulus -- so only "refused" is asserted.)
+        if (SecretKey.fromDer(&sk, &kat8192.priv_pkcs1)) |_| {
+            sk.deinit();
+            return error.TestUnexpectedResult;
+        } else |_| {}
+        if (PublicKey.fromDer(&kat8192.pub_spki)) |_| return error.TestUnexpectedResult else |_| {}
+        if (VerifyKey.fromDer(&kat8192.pub_spki)) |_| return error.TestUnexpectedResult else |_| {}
+        return;
+    }
     try SecretKey.fromDer(&sk, &kat8192.priv_pkcs1);
     defer sk.deinit();
     const pk = sk.publicKey();
@@ -5173,12 +5208,19 @@ test "8192-bit keys (R7): OpenSSL's key parses and round-trips; v1.5 sign byte-e
     try testing.expectEqualSlices(u8, &kat8192.sig_sha256, try signPkcs1v15Blinded(&sk, Sha256, .{ .csprng = prng.random() }, kat8192.msg, &out2));
 }
 
-test "8192-bit cap: a modulus one byte wider is refused" {
+test "modulus cap: a modulus one byte wider is refused, one at the cap is not" {
     var n = [_]u8{0xff} ** (max_modulus_len + 1);
     n[n.len - 1] = 0xfd; // odd
     try testing.expectError(error.InvalidPublicKey, PublicKey.fromBytes(&n, &.{ 1, 0, 1 }));
     try testing.expectError(error.InvalidPublicKey, VerifyKey.fromBytes(&n, &.{ 1, 0, 1 }));
-    try testing.expectEqual(1024, max_modulus_len);
+    _ = try PublicKey.fromBytes(n[1..], &.{ 1, 0, 1 });
+    _ = try VerifyKey.fromBytes(n[1..], &.{ 1, 0, 1 });
+    // The cap the build asked for (`zl_options`), and the grade's default.
+    try testing.expectEqual(max_modulus_bits / 8, max_modulus_len);
+    if (zl_options.rsa_max_modulus_bits == null and zl_options.profile == .default)
+        try testing.expectEqual(1024, max_modulus_len);
+    if (zl_options.rsa_max_modulus_bits == null and zl_options.profile == .small)
+        try testing.expectEqual(512, max_modulus_len);
 }
 
 test "generate: FIPS 186-5 d > 2^(nlen/2) bound (F2)" {

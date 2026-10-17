@@ -412,11 +412,32 @@ version that applied it everywhere added ctgrind contexts to `rsa/keygen` (173 �
   keys are read and written (Go's PKCS#8 parser takes the same line).
 - **JWK and OpenSSH public-key text** belong to `jwt`/`jwe`/`acme` and `ssh`.
 
+## Build options
+
+Consumer build options (CONVENTIONS §4.2), first in zig-libs (2026-10-17):
+
+| option | range | default | `-Dprofile=small` |
+|---|---|---|---|
+| `rsa-max-modulus-bits` | 4096..8192, multiple of 64 (`@compileError` otherwise) | 8192 (graded) | 4096 |
+
+- **What it buys:** code size. montint instantiates one slot per 256 bits up to the cap (and per-slot straight-line asm on an
+  ADX/BMI2 CPU). HTTPS sizeprobe, native CPU, ReleaseSafe: `.text` 8.27 → **4.63 MB**, `DynModint` 5.37 → 1.77 MB, binary
+  19.0 → 14.7 MB. Baseline x86_64 gains much less (DynModint 0.27 MB at 8192).
+- **What the consumer loses:** keys above the cap. They are refused (`InvalidPublicKey` / `InvalidPrivateKey` / `InvalidBits`,
+  or `InvalidDer` when the DER wrapper alone is already too long), never truncated. Not below 4096: public CA roots with
+  4096-bit keys are common.
+- **Speed and constant time:** unchanged for keys within the cap (the slot follows the key, not the cap). The grade (P axis,
+  anchors, ctgrind pins) is measured on the default only.
+- **Tested:** `scripts/modtest rsa -Dprofile=small` and `-Drsa-max-modulus-bits=6144` (all tests; the 8192-bit KAT asserts the
+  refusal under a lower cap, the cap test checks one byte over / at the cap); `-Drsa-max-modulus-bits=2048` is a compile error.
+  No CI lane runs a non-default profile yet.
+
 ## Backlog / deferred
 
-- **Code size of the 8192-bit cap** (wgs request 2026-10-17): `max_modulus_bits = 8192` makes `DynModint(8192)`
-  instantiate 32 slots (~5 MB `.text` for every `http.Client` consumer). Tracked and fixed in `montint` SPEC § Backlog
-  ("`DynModint` code size"); a consumer cap here is the fallback option (b) there.
+- **Build option across the closure** (2026-10-17): `rsa-max-modulus-bits` / `.small` is tested in this module only. Before a
+  consumer uses `.small` with dependents (`tlsclient`, `x509`, `ssh`, `blindrsa`, `jwt`, `acme`, …), their tests with keys above
+  4096 bits must branch on `rsa.max_modulus_bits` (CONVENTIONS §4.2 checklist), and ssh's `gex_max_bits` must drop with it (same
+  `DynModint(8192)` type — see ssh Backlog).
 - **Private-key PEM: a ctgrind target** — ✅ 2026-10-17 the base64 half: `marshal.zig` encodes and
   `pemDecodeBody` decodes through the constant-time `b64ct` module (`standard.encode`,
   `decodeIgnoring` with `pem_whitespace`). Still open: a ctgrind target over

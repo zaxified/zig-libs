@@ -79,6 +79,9 @@ IANA release, not hand-authored, so wrong-by-construction errors are ruled out b
 than by these tests alone).
 
 ## Backlog / deferred
+- **Build option: zone data subset** (design 2026-10-17, mechanism and checklist in CONVENTIONS §4.2; measure first — HTTPS sizeprobe or `nm -S --size-sort` on a consumer binary — and add a knob only for a measured gain of roughly ≥ 100 KB or a consumer request). src/tz_data.zig is 1 MB of source (~0.45 MB in a binary, estimate).
+  `.small` options: a zone allow-list (`tz-zones=Europe/*,UTC`) or system zoneinfo only — a capability cut, so an unknown zone must
+  return an error, never fall back to UTC silently. Unmeasured.
 - **Local → UTC — DONE 2026-09-30** (survey 2026-09-30 item). Oracle: `tools/gen_local_kat.py`
   runs Python `zoneinfo` (black box) over the SAME pinned release, built by
   `scripts/gen/tz-gen/fetch-and-build.sh --check` into `.zig-cache/tz-gen/<release>/zoneinfo`

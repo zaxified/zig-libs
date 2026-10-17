@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-17** — **Added: first consumer build option** (CONVENTIONS §4.2): `-Drsa-max-modulus-bits=4096..8192` or `-Dprofile=small` (→ 4096) lowers `max_modulus_bits`; default stays 8192 (graded). Buys code size: HTTPS sizeprobe on a native (ADX/BMI2) CPU `.text` 8.27 → 4.63 MB. Keys above the cap are refused, never truncated; an out-of-range value is a `@compileError`. Tests: the 8192-bit KAT asserts the refusal under a lower cap; the cap test checks one byte over and exactly at the cap. SPEC § Build options.
 - **2026-10-17** — Wycheproof test silent on success (the lane treats stderr from a passing test as a failure); it now asserts the vector file yielded valid and invalid cases instead of printing the counts. Test only.
 
 - **2026-10-17** — Constant time: PEM base64 of keys (`marshal.zig` encoding, `pemDecodeBody` decoding) goes through the new `b64ct` module instead of std's alphabet tables, which a private key's DER indexed (SPEC backlog item, base64 half). Decoding follows libsodium's ignore rules with `pem_whitespace`; same accepted PEM. New dep `b64ct`.

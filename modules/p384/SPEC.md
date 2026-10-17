@@ -200,6 +200,9 @@ was 70 ns. History, the same day: portable field first (ECDH 517 µs, 1.18×), t
 
 ## Backlog / deferred
 
+- **Build option: fixed-base table size** (design 2026-10-17, mechanism and checklist in CONVENTIONS §4.2; measure first — HTTPS sizeprobe or `nm -S --size-sort` on a consumer binary — and add a knob only for a measured gain of roughly ≥ 100 KB or a consumer request). Base-point table ~120 KB (estimate); `tlsclient` and `x509` import
+  this module unconditionally, so every HTTPS consumer links it. `.small` → a smaller window (slower keygen/sign, verification unaffected
+  in kind; keep the masked lookup, re-run ctgrind). Unmeasured.
 - **Dedicated asm square** — `sq` is `mul(a, a)` on amd64 (~15 of 72 `mulx` to save).
 - **Faster scalar inversion** — Fermat costs ~480 Montgomery products per signature; safegcd or
   blinding.

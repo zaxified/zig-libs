@@ -371,6 +371,9 @@ final swap, `z = 0`, top bit); field canonical check, the fold rounds,
 
 ## Backlog / deferred
 
+- **Build option: fixed-base comb size** (design 2026-10-17, mechanism and checklist in CONVENTIONS §4.2; measure first — HTTPS sizeprobe or `nm -S --size-sort` on a consumer binary — and add a knob only for a measured gain of roughly ≥ 100 KB or a consumer request). `baseComb: [112][16]Point` (src/ed448.zig:257) ≈ 1792 points ×
+  ~224 B ≈ 400 KB of table (estimate). `.small` → a smaller comb (fewer teeth or w=4 windowed) — slower keygen/sign, same constant-time
+  guarantees (table lookups stay masked; re-run ctgrind). Unmeasured.
 - **RFC 9380 hash-to-curve for edwards448** (`edwards448_XOF:SHAKE256_ELL2_RO_`/`_NU_`) *(survey 2026-09-30)*. Needed by VOPRF/VRF/BLS-style protocols on the 448 curve; `ed448-goldilocks` ships it. Searched `rg -i 'hash_to|hashToCurve|elligator|fromUniform' modules/ed448/src` — nothing. Effort: medium (Elligator 2 + isogeny + `expand_message_xof`, RFC 9380 has vectors). Fits CONVENTIONS §2.
 - **`X448.KeyPair.fromEd448` / Ed448 to X448 key mapping** *(survey 2026-09-30)*. Std's `X25519.KeyPair.fromEd25519` has the 25519 analogue; SPEC's "Out of scope" lists it only as "not in this scaffold", not as a refusal. Effort: small (birational map over `Fp448`). Fits §2.
 - **Speed: verify 4.0× and X448 1.9× OpenSSL's time** *(bench 2026-10-07, `zig build bench-ed448` against OpenSSL 3.5.5; sign 0.99×)*. Caps the grade at 4 (performance axis). Verify already runs one vartime Straus pass; X448, a bare Montgomery ladder, is 1.9× too, so the field arithmetic in `field.zig` is the common cause — OpenSSL's p448 uses 56-bit limbs with Karatsuba-style multiplication. Then verify's remaining gap: two point decompressions (square roots) and a 4-bit window with no precomputed table for `B`. Effort: medium–large; anchored by the RFC KATs and the ctgrind harness (the ladder must stay constant-time).

@@ -502,6 +502,22 @@ pub fn build(b: *std.Build) void {
     }
     selected_modules = only_modules;
 
+    // Consumer build options — see `Profile` and CONVENTIONS.md § "Consumer
+    // build options". Per-module knobs are `<module>-<knob>`; `null` = the
+    // module derives the value from `profile`.
+    const zl_options = b.addOptions();
+    zl_options.addOption(Profile, "profile", b.option(
+        Profile,
+        "profile",
+        "Consumer build profile: default (speed+security, as graded) | small (code size)",
+    ) orelse .default);
+    zl_options.addOption(?u32, "rsa_max_modulus_bits", b.option(
+        u32,
+        "rsa-max-modulus-bits",
+        "rsa: largest supported modulus, 4096..8192 (default 8192; profile=small 4096)",
+    ));
+    zl_options_mod = zl_options.createModule();
+
     // Gate for the "a body nothing references is never analysed" class — see
     // the `force_mod` block in pass 2 for what it compiles and why.
     const check_pubfn_reach = b.step("check-pubfn-reach", "Analyse every non-generic public declaration, including the ones no test reaches");
@@ -556,6 +572,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = if (m.heavy) heavy_optimize else optimize,
         });
+        mod.addImport("zl_options", zl_options_mod);
         mods.put(m.name, mod) catch @panic("OOM");
     }
 
@@ -591,6 +608,7 @@ pub fn build(b: *std.Build) void {
                 .target = target,
                 .optimize = if (m.heavy) heavy_optimize else optimize,
             });
+            t.addImport("zl_options", zl_options_mod);
             for (m.deps) |dep| t.addImport(dep, mods.get(dep).?);
             for (m.test_deps) |dep| t.addImport(dep, mods.get(dep).?);
             break :blk t;
@@ -1038,6 +1056,7 @@ pub fn build(b: *std.Build) void {
     for (cross_compile_targets, 0..) |_, ti| {
         for (module_list) |m| {
             const mod = cross_mods[ti].get(m.name).?;
+            mod.addImport("zl_options", zl_options_mod);
             for (m.deps) |dep| mod.addImport(dep, cross_mods[ti].get(dep).?);
         }
     }
@@ -1074,6 +1093,7 @@ pub fn build(b: *std.Build) void {
                     .target = cross_resolved[ti],
                     .optimize = .ReleaseSmall,
                 });
+                t.addImport("zl_options", zl_options_mod);
                 for (m.deps) |dep| t.addImport(dep, cross_mods[ti].get(dep).?);
                 for (m.test_deps) |dep| t.addImport(dep, cross_mods[ti].get(dep).?);
                 break :blk t;
@@ -1648,6 +1668,7 @@ pub fn build(b: *std.Build) void {
                 // `???` and the whole table becomes unreadable.
                 .strip = false,
             });
+            hmod.addImport("zl_options", zl_options_mod);
             for (deps) |dep| hmod.addImport(dep, mods.get(dep).?);
             const exe = b.addExecutable(.{ .name = b.fmt("ctgrind-{s}", .{name}), .root_module = hmod, .use_llvm = use_llvm });
             const inst = b.addInstallArtifact(exe, .{
@@ -1703,6 +1724,7 @@ pub fn build(b: *std.Build) void {
             .optimize = .Debug,
             .valgrind = true,
         });
+        cmod.addImport("zl_options", zl_options_mod);
         for (deps) |dep| cmod.addImport(dep, mods.get(dep).?);
         const cexe = b.addExecutable(.{ .name = b.fmt("check-ctgrind-{s}", .{name}), .root_module = cmod, .use_llvm = use_llvm });
         check_ctgrind.dependOn(&cexe.step);
@@ -2345,6 +2367,20 @@ const fingerprint_exempt = [_][]const u8{
 /// cannot see `build()`'s locals. Empty = every module.
 var selected_modules: []const []const u8 = &.{};
 
+/// Consumer build profile (`-Dprofile`, or `.profile` in a consumer's
+/// `b.dependency("zig_libs", .{ ... })`). `.default` is what every grade is
+/// measured on — speed and security; `.small` trades speed or capability for
+/// code size, never safety. Each module decides what `.small` means for itself
+/// and documents it in its SPEC § "Build options"; a module without such a
+/// trade-off ignores it. See CONVENTIONS.md § "Consumer build options".
+pub const Profile = enum { default, small };
+
+/// The `zl_options` module: the consumer's build options as comptime values.
+/// Imported by every compilation of a module's OWN sources (published module,
+/// test root, cross-compiles, bench graph, ctgrind harnesses) — a module that
+/// reads an option must see the same value in every one of them.
+var zl_options_mod: *std.Build.Module = undefined;
+
 /// `-Dmodule` membership: every module when the list is empty.
 fn inList(name: []const u8, list: []const []const u8) bool {
     if (list.len == 0) return true;
@@ -2498,6 +2534,7 @@ fn fastModuleGraph(b: *std.Build, target: std.Build.ResolvedTarget, fast: *std.S
         .optimize = .ReleaseFast,
     });
     fast.put(name, mod) catch @panic("OOM");
+    mod.addImport("zl_options", zl_options_mod);
     for (entry.deps) |dep| mod.addImport(dep, fastModuleGraph(b, target, fast, dep));
     return mod;
 }

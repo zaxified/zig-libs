@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-17** — sizeprobe: wires the root build's `zl_options` into its by-path `rsa` (`-Dprofile`, `-Drsa-max-modulus-bits`), so the probe measures a consumer's size profile too. Tool only.
 - **2026-10-17** — `error_headers`: the cap (`max_error_headers`, now 32) counts usable entries only — skipped ones no longer use slots; connection-specific headers HTTP/2 forbids (`keep-alive`, `upgrade`, `proxy-connection`, `te`) are skipped; `usableErrorHeaders` is an iterator.
 
 - **2026-10-17** — ADDED: `Options.error_headers` (and `StreamOptions` / `h2_server.Options`): headers on every response the server writes itself — its 4xx/5xx answers and the 500 that replaces a failed handler's response, h1 and h2 — so security headers reach them too (`security-headers` `SecurityHeaders.staticHeaders`). Managed/invalid entries are skipped; `max_error_headers` = 16; `errorHeaderUsable`.

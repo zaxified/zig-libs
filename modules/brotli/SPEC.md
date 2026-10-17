@@ -715,6 +715,10 @@ ordinary stream.
 
 ## Backlog / deferred
 
+- **Build option: encoder quality cap** (design 2026-10-17, mechanism and checklist in CONVENTIONS §4.2; measure first — HTTPS sizeprobe or `nm -S --size-sort` on a consumer binary — and add a knob only for a measured gain of roughly ≥ 100 KB or a consumer request). The 122,784-byte RFC 7932 dictionary (src/dictionary.zig:13) is
+  needed by the DECODER, so it is not a knob. The encoder carries six effort pipelines (q0..q11, zopfli at the top, src/encoder.zig).
+  `.small` → cap quality (e.g. ≤ 9), refusing a higher one with an error. First verify that a decoder-only consumer does not already
+  avoid the encoder (Sema is lazy) — then the knob only helps encoding consumers. Unmeasured.
 - **R18 Parallel compression on a quiet host (2026-10-16, open)** — `parallel.compress`'s wall time with 1–8 workers on 5–8 MB inputs, measured so far only under load (1.3–2.4× one pass with 8). Expected near the job count, less the cuts' 0–9 % CPU.
 - **R19 Speed rows outside the bench (owner 2026-10-16: S2 = parity of features + the bench within 1.1×; these rows are Backlog, not a condition)** — `.q0`/`.q1` on 4 KiB inputs 1.08–1.62× (R16's fixed cost); one-shot `compressWith` `.q6` on 4–64 KiB under `smp_allocator` 1.10–1.83× (the allocator: `Compressor` 0.89–1.11×, glibc 0.87–1.10×); `Compressor` `.q4` up to 1.23×; a raw dictionary prepared per call up to 1.22× (prepared once: in the band); `.q6`/`.q9` on inputs of 1 MiB and more up to 1.11×/1.12× (`langtag`, R14); `.q1` with a dictionary 1.17–1.44× (exempt: google's q1 ignores the dictionary, ours is 14–21 % smaller).
 - **R20 Niche features of the field, not implemented (2026-10-16, owner: Backlog)** — concatenable/appendable streams and `STREAM_OFFSET` stitching (rust-brotli, google), NPOSTFIX/NDIRECT as parameters, a serialized shared dictionary or several raw ones on the encoder (google: experimental), google 1.2.0's tuning switches (base64 detection, SIMD hasher, H59), a peak-memory estimate, the decoder's no-ring-reallocation switch. A command-line tool: out of scope (owner).

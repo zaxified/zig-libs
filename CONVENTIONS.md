@@ -351,6 +351,55 @@ already in `deps` while pretending to verify the judgement. Sixteen modules had 
 dependency edge crossing a lib boundary and that is where the initial extra tags came
 from, but the field is not limited to that evidence.
 
+### 4.2 Consumer build options
+
+(2026-10-17, first knob: `rsa-max-modulus-bits`.) A consumer **application** may tune a
+module for code size at build time:
+
+```zig
+const libs = b.dependency("zig_libs", .{ .target = target, .optimize = optimize, .profile = .small });
+// or one knob:                        .{ ..., .@"rsa-max-modulus-bits" = 4096 }
+```
+
+Rules:
+
+1. **The default is what the grade is measured on** — speed and security. A consumer who
+   sets nothing gets exactly what the catalog claims; adding a knob never changes the default.
+2. **A knob trades speed or capability for size — never safety.** Constant time,
+   zeroization, input limits and verification are not knobs. A capability cut fails
+   loudly (an error, or a `@compileError` for an invalid value), never silently.
+3. **Two levels.** `-Dprofile=default|small` is global; `-D<module>-<knob>=…` overrides
+   what the profile derives. Each module decides what `.small` means for itself; a module
+   without a trade-off ignores the profile.
+4. **Only the application sets them.** A library depending on zig-libs passes none: a
+   different argument set creates a second zig-libs instance in the build, i.e. two copies
+   of every shared module.
+
+**How to add a knob** (checklist):
+
+- `build.zig`: one `zl_options.addOption(?T, "<module>_<knob>", b.option(T, "<module>-<knob>", "…"))`
+  next to the existing ones. `zl_options` is already imported by every compilation of a
+  module's own sources (published module, test root, cross-compiles, bench graph, ctgrind
+  harnesses); a standalone build that compiles module sources by path
+  (`modules/http/sizeprobe/build.zig`) mirrors it by hand.
+- The module: `const zl_options = @import("zl_options");` and ONE `pub const` resolving
+  `zl_options.<module>_<knob> orelse switch (zl_options.profile) { … }`, with a
+  `@compileError` for values outside the supported range (see `rsa.max_modulus_bits`).
+- Tests that pin the default value branch on the resolved constant: under a lowered value
+  they assert the refusal instead (rsa's 8192-bit KAT). Test the extremes once:
+  `scripts/modtest <m> -Dprofile=small` and `-D<module>-<knob>=<min>` before committing.
+- SPEC § "Build options": the knob, its range, what `.small` picks, the measured gain
+  (sizeprobe or `nm --size-sort`), what the consumer loses. CHANGELOG entry.
+- Dependents: a module whose tests use the capability (e.g. `tlsclient` with an 8192-bit
+  certificate) must branch the same way before the knob is used under `.small` across the
+  closure.
+
+**Known gaps** (2026-10-17): `scripts/test.sh` stamps fingerprint sources, not `-D` options,
+so a lane run with a non-default profile must not reuse default-profile stamps; no CI lane
+runs `.small` yet; the dependents of `rsa` are not yet adapted. Candidates for further knobs,
+with measurements and notes, are in each module's SPEC § Backlog (entries titled
+"Build option: …": montint, ssh, tlsclient, x509, ed448, tz, brotli, zstd, p384, p521).
+
 ## 5. Doc ownership — single source of truth
 
 One fact lives in exactly one place; everywhere else links to it, never restates it.

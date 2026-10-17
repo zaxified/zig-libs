@@ -520,6 +520,10 @@ matching rule fail closed (§ Threat model).
 
 ## Backlog / deferred
 
+- **Build option: post-quantum signature verifiers in chain building** (design 2026-10-17, mechanism and checklist in CONVENTIONS §4.2; measure first — HTTPS sizeprobe or `nm -S --size-sort` on a consumer binary — and add a knob only for a measured gain of roughly ≥ 100 KB or a consumer request). src/chain.zig:681-686 dispatches
+  ML-DSA (3 sets) and SLH-DSA (12 sets, `inline else` over algorithm.zig:37-113) for every chain verifier. Measured (HTTPS sizeprobe,
+  baseline x86_64 ReleaseSafe): SLH-DSA engine ~62 KB + ML-DSA ~56 KB. `.small` could drop SLH-DSA (no Web PKI issuer uses it) →
+  such a chain is refused with `error.UnsupportedAlgorithm`. Small gain; do it only together with tlsclient's algorithm set.
 - **DONE 2026-10-11: speed.** Was 6.46–7.54× Go 1.26.0 crypto/x509 (P4, card `not measured`); now 0.81–0.92× (P2) — see § Performance.
 
 - **DONE 2026-10-10 (decided by the coordinator, delegated by the owner): `parse_slack` in

@@ -235,6 +235,9 @@ each product chain waited on the call; ECDH 403 → 358 µs, verify 529 → 507
 
 ## Backlog / deferred
 
+- **Build option: fixed-base table size** (design 2026-10-17, mechanism and checklist in CONVENTIONS §4.2; measure first — HTTPS sizeprobe or `nm -S --size-sort` on a consumer binary — and add a knob only for a measured gain of roughly ≥ 100 KB or a consumer request). Base-point table ~230 KB (estimate); linked by every HTTPS consumer
+  via `tlsclient`/`x509`. `.small` → a smaller window, as p384. Pairs with tlsclient's algorithm-set knob (dropping P-521 entirely would
+  make this moot for TLS-only consumers). Unmeasured.
 - ~~**Fixed-base comb for k·G / d·G**~~ — done 2026-10-10 (see *Performance*).
 - ~~**ECDH 1.70× OpenSSL**~~ — done 2026-10-11 (0.97×, see *Performance*).
 - **Faster scalar inversion** — Fermat costs ~650 Montgomery products per

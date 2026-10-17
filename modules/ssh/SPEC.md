@@ -344,6 +344,11 @@ environment with OpenSSH installed.
 
 ## Backlog / deferred
 
+- **Build option: `ssh-gex-max-bits`** (design 2026-10-17, mechanism and checklist in CONVENTIONS §4.2; measure first — HTTPS sizeprobe or `nm -S --size-sort` on a consumer binary — and add a knob only for a measured gain of roughly ≥ 100 KB or a consumer request). `gex_max_bits = 8192` (src/transport.zig `GexMod = montint.DynModint(gex_max_bits)`)
+  is the SAME type as rsa's `DynModint(8192)`, so lowering rsa alone saves nothing for an ssh consumer: both must drop together.
+  `.small` → 4096 (RFC 8270 floor is 2048; a server offering a bigger group than the cap fails the kex loudly — check it does, with a
+  test). Measured on the HTTPS sizeprobe (native CPU, ADX/BMI2): `DynModint(8192)` 5.37 MB vs 1.77 MB at 4096. Note for montint's
+  slot-policy change (montint Backlog): GEX primes are 2048/3072/4096/6144/8192 — the key-size slot list must include 6144.
 - ~~**Dead stack of the key exchange**~~ — **fixed 2026-10-09**: per-method KEX entry points take
   `out: *KexResult` and burn their bodies (std's X25519 / ML-KEM / modexp frames included), the
   KEX rounds, `installCipher`, `deriveKeys` and `writePacket`/`readPacket` burn theirs; probed per

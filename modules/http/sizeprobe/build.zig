@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: MIT
 const std = @import("std");
 
+/// Mirror of the root build.zig's `Profile` (a separate build script cannot import it).
+const Profile = enum { default, small };
+
 // Standalone build for the plaintext-only http.Client size probe (see
 // ./README.md). Deliberately its own tiny project rather than a step bolted
 // onto the repo-root build.zig: this task's brief is scoped to modules/http/
@@ -43,6 +46,12 @@ pub fn build(b: *std.Build) void {
     const montint_mod = dep.mod(b, target, optimize, "montint");
     const rsa_mod = dep.mod(b, target, optimize, "rsa");
     rsa_mod.addImport("montint", montint_mod);
+    // The root build.zig's consumer options (`zl_options`), at their defaults
+    // unless `-Dprofile` / `-Drsa-max-modulus-bits` say otherwise.
+    const zl_options = b.addOptions();
+    zl_options.addOption(Profile, "profile", b.option(Profile, "profile", "default | small") orelse .default);
+    zl_options.addOption(?u32, "rsa_max_modulus_bits", b.option(u32, "rsa-max-modulus-bits", "rsa cap (4096..8192)"));
+    rsa_mod.addImport("zl_options", zl_options.createModule());
     rsa_mod.addImport("aescbc", dep.mod(b, target, optimize, "aescbc"));
     rsa_mod.addImport("aes192", dep.mod(b, target, optimize, "aes192"));
     const slhdsa_mod = dep.mod(b, target, optimize, "slhdsa");
