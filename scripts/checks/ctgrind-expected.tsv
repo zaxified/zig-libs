@@ -1242,12 +1242,12 @@ quic-crypto	ReleaseFast	chacha	1	4	807dcd889a53e75b	d1cf9a5cadb2a284
 # (b64ct.zig:141/142, one branch at the end). pickle 26 = the AEAD verdict 2, std Ed25519 keygen/sign on
 # the decrypted seed, and parsing of the decrypted pickle (checkFrame,
 # counters, Ratchet.advanceTo to the stored index, the public-key compare).
-megolm	ReleaseFast	msg	1	16	34e8159ec7f53f6e	505eb3dc7b45f5cd
+megolm	ReleaseFast	msg	1	16	0ff715052883dcef	505eb3dc7b45f5cd
 # 2026-10-17 (dedupe wave 3): skey 26 -> 23 — the private b64ct.zig became the b64ct
 # module, whose verdict is declassified by contract (`public`); the 3 verdict contexts
 # (b64ct.zig:141/142) are gone, nothing else moved.
-megolm	ReleaseFast	skey	1	23	34e8159ec7f53f6e	a22db1b8b5220a74
-megolm	ReleaseFast	pickle	1	26	34e8159ec7f53f6e	f06f4b1b938d2036
+megolm	ReleaseFast	skey	1	23	0ff715052883dcef	a22db1b8b5220a74
+megolm	ReleaseFast	pickle	1	26	0ff715052883dcef	f06f4b1b938d2036
 # mls (2026-10-10, suite 0x0001) — ks: deriveEpoch with init/commit/PSK
 # secrets tainted; tree: every node secret, ratchet base, Ratchet and Window
 # under a tainted encryption secret; priv: protectPrivate with the content
