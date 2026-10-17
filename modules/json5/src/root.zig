@@ -41,10 +41,21 @@ pub const NonFinite = enum {
 /// Where and why `preprocess` refused a document. Filled only on an error the
 /// module itself raises (`NonFiniteNumber`, `HexLiteralTooLarge`).
 pub const Diagnostic = struct {
-    /// 1-based source line of the offending literal.
+    /// 1-based source line of the offending literal (lines end at `\n`).
     line: usize = 0,
-    /// A static, human-readable message; empty until an error sets it.
+    /// 1-based column of the literal's first byte, counted in BYTES from the
+    /// start of its line (a multi-byte UTF-8 character before it counts as
+    /// several columns; a caret printer working on the raw line lines up).
+    col: usize = 0,
+    /// Byte offset of the literal in the input, sign included.
+    offset: usize = 0,
+    /// Byte length of the literal, sign included.
+    len: usize = 0,
+    /// A static message for whoever wrote the JSON5; empty until an error sets it.
     message: []const u8 = "",
+    /// A static note for the integrator (which `Options` would accept the
+    /// input); empty when there is none. Not meant for the end user.
+    hint: []const u8 = "",
 };
 
 pub const Options = struct {
@@ -600,11 +611,14 @@ fn emitNumber(
                 },
                 .reject => {
                     if (strict) {
-                        if (options.diagnostic) |d| d.* = .{
-                            .line = lines.at(input, start),
-                            .message = "non-finite number (Infinity/NaN) has no JSON form; " ++
-                                "pass Options{ .non_finite = .quoted } to accept it as a string",
-                        };
+                        if (options.diagnostic) |d| d.* = literalDiagnostic(
+                            input,
+                            lines,
+                            start,
+                            end,
+                            "non-finite number (Infinity/NaN) is not allowed here",
+                            "pass Options{ .non_finite = .quoted } to accept it as a string",
+                        );
                         return error.NonFiniteNumber;
                     }
                     try out.appendSlice(alloc, input[start..end]);
@@ -634,10 +648,14 @@ fn emitNumber(
                 try out.appendSlice(alloc, input[start..j]);
                 return j;
             }
-            if (options.diagnostic) |d| d.* = .{
-                .line = lines.at(input, start),
-                .message = "hexadecimal literal has more than 256 significant digits (beyond any finite f64)",
-            };
+            if (options.diagnostic) |d| d.* = literalDiagnostic(
+                input,
+                lines,
+                start,
+                j,
+                "hexadecimal literal has more than 256 significant digits (beyond any finite f64)",
+                "",
+            );
             return error.HexLiteralTooLarge;
         }
         if (negative) try out.append(alloc, '-');
@@ -909,6 +927,26 @@ fn lineOf(input: []const u8, pos: usize) usize {
         if (ch == '\n') line += 1;
     }
     return line;
+}
+
+/// The `Diagnostic` for a refused literal at `input[start..end]`.
+fn literalDiagnostic(
+    input: []const u8,
+    lines: *LineCounter,
+    start: usize,
+    end: usize,
+    message: []const u8,
+    hint: []const u8,
+) Diagnostic {
+    const line_start = if (std.mem.lastIndexOfScalar(u8, input[0..start], '\n')) |nl| nl + 1 else 0;
+    return .{
+        .line = lines.at(input, start),
+        .col = start - line_start + 1,
+        .offset = start,
+        .len = end - start,
+        .message = message,
+        .hint = hint,
+    };
 }
 
 /// A forward-only line counter for the recovery paths.
@@ -2456,7 +2494,11 @@ test "numeric literals: a hex value beyond 256 significant digits is an error, n
     var diag: Diagnostic = .{};
     try std.testing.expectError(error.HexLiteralTooLarge, preprocessWithOptions(alloc, src, .{ .diagnostic = &diag }));
     try std.testing.expectEqual(@as(usize, 1), diag.line);
+    try std.testing.expectEqual(@as(usize, 2), diag.col);
+    try std.testing.expectEqual(@as(usize, 1), diag.offset);
+    try std.testing.expectEqual(src.len - 2, diag.len); // `0x1000…`, no brackets
     try std.testing.expect(diag.message.len > 0);
+    try std.testing.expectEqualStrings("", diag.hint);
     // The annotated entry never fails: verbatim, and `std.json` refuses it.
     const r = try preprocessAnnotated(alloc, src);
     defer alloc.free(r.out);
@@ -2522,12 +2564,27 @@ test "non-finite numbers: an error by default, with a line and a message" {
         var diag: Diagnostic = .{};
         try std.testing.expectError(error.NonFiniteNumber, preprocessWithOptions(alloc, src, .{ .diagnostic = &diag }));
         try std.testing.expectEqual(@as(usize, 1), diag.line);
-        try std.testing.expect(std.mem.indexOf(u8, diag.message, ".quoted") != null);
+        // The literal, sign included, is exactly what offset/len cover.
+        const lit = src[diag.offset..][0..diag.len];
+        try std.testing.expect(std.mem.endsWith(u8, lit, "Infinity") or std.mem.endsWith(u8, lit, "NaN"));
+        try std.testing.expect(lit.len <= "+Infinity".len);
+        try std.testing.expectEqual(diag.offset + 1, diag.col); // single line: col = offset + 1
+        // The integrator's advice lives in `hint`, the end user's text in `message`.
+        try std.testing.expect(std.mem.indexOf(u8, diag.message, ".quoted") == null);
+        try std.testing.expect(std.mem.indexOf(u8, diag.hint, ".quoted") != null);
         try std.testing.expectError(error.NonFiniteNumber, preprocess(alloc, src)); // no diagnostic asked for
     }
     var diag: Diagnostic = .{};
     try std.testing.expectError(error.NonFiniteNumber, preprocessWithOptions(alloc, "{\n  a: 1,\n  b: NaN,\n}", .{ .diagnostic = &diag }));
     try std.testing.expectEqual(@as(usize, 3), diag.line);
+    try std.testing.expectEqual(@as(usize, 6), diag.col);
+    try std.testing.expectEqual(@as(usize, 3), diag.len);
+    // The column counts bytes: `é` (2 bytes) before the literal moves it by two.
+    const multibyte = "{\n  'é': -Infinity}";
+    try std.testing.expectError(error.NonFiniteNumber, preprocessWithOptions(alloc, multibyte, .{ .diagnostic = &diag }));
+    try std.testing.expectEqual(@as(usize, 2), diag.line);
+    try std.testing.expectEqual(@as(usize, 9), diag.col);
+    try std.testing.expectEqualStrings("-Infinity", multibyte[diag.offset..][0..diag.len]);
 }
 
 test "non-finite numbers: the annotated entry passes them through, so recovery never changes the verdict" {
@@ -2754,6 +2811,8 @@ test "std.json reads the rewritten output of a combined document into a typed st
     var diag: Diagnostic = .{};
     try std.testing.expectError(error.NonFiniteNumber, preprocessWithOptions(alloc, src, .{ .diagnostic = &diag }));
     try std.testing.expectEqual(@as(usize, 9), diag.line);
+    try std.testing.expectEqual(@as(usize, 8), diag.col);
+    try std.testing.expectEqualStrings("Infinity", src[diag.offset..][0..diag.len]);
 
     inline for (.{ false, true }) |annotated| {
         const options: Options = .{ .non_finite = .quoted };

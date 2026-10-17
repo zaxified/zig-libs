@@ -37,7 +37,8 @@ defer alloc.free(r.out);
 //   -> {"timeout": 0.5, "mask": 3735928559, "retries": 3, "half": 5}
 
 // Infinity / -Infinity / +Infinity / NaN are an ERROR by default
-// (error.NonFiniteNumber; the optional Diagnostic gives line + message):
+// (error.NonFiniteNumber; the optional Diagnostic gives line, byte column,
+// offset/len of the literal, a message for the author and a hint for you):
 var diag: json5.Diagnostic = .{};
 _ = json5.preprocessWithOptions(alloc, "{t: Infinity}", .{ .diagnostic = &diag }) catch {};
 // opt in to strings, which std.json reads into an f64 field as inf / nan:

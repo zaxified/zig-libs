@@ -62,7 +62,8 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   JSON5 and stays invalid.
 - **`Infinity`, `-Infinity`, `+Infinity`, `NaN` (and `±NaN`) — decided 2026-09-30.** Default
   `Options.non_finite = .reject`: `preprocess` returns `error.NonFiniteNumber` and fills
-  `Options.diagnostic` (`line`, a static `message`) — JSON has no such numbers and the main
+  `Options.diagnostic` (`line`, `col` in bytes, `offset`/`len` of the literal, a static end-user
+  `message` and a separate integrator `hint`) — JSON has no such numbers and the main
   consumer (bxp) rejects non-finite values everywhere else; `preprocessAnnotated` never fails, so it
   passes the token through and `std.json` rejects it (the two entry points still agree on the
   verdict). Opt-in `.quoted` rewrites them to the JSON **strings** `"Infinity"`, `"-Infinity"`,
@@ -213,16 +214,10 @@ Full JSON5 spec gaps — **all struck through 2026-09-30, see the two DONE items
   (the reference refuses e.g. an emoji key; this module quotes it). Exact classes need Unicode
   general-category tables (Lu Ll Lt Lm Lo Nl / Mn Mc Nd Pc) — none in this module or a sibling.
   Effort: medium (a generated range table, pinned to one Unicode version). Fits §2.
-- **`Diagnostic` column + user-facing message** (request from bxp, 2026-10-17): `Diagnostic`
-  carries only `line` and a static message for `NonFiniteNumber` / `HexLiteralTooLarge`, so a
-  consumer cannot put a caret under the literal; the message also names a library option
-  (`Options{ .non_finite = .quoted }`), advice for the integrator, not for whoever wrote the
-  JSON5. Wanted: `col` (1-based, unit documented — bytes) plus `offset`/`len` of the literal,
-  and the API hint split into a separate `hint` field so `message` stays end-user text.
-  Expected because std.json's `Diagnostics` gives line + column and the reference `JSON5.parse`
-  reports `lineNumber` + `columnNumber`; the scanner already knows the literal's byte offset.
-  Consumer workaround to delete afterwards: bxp `bxp-core/src/config.zig` `diagPreprocessError`
-  (marked `zig-libs request: json5 — Diagnostic ... no column`). Effort: small. Fits §2.
+- **DONE 2026-10-17 — `Diagnostic` column + user-facing message** (request from bxp): `col`
+  (1-based, bytes from the line start), `offset`/`len` of the literal (sign included), and the
+  `Options` advice moved out of `message` into `hint`. Consumer workaround to delete: bxp
+  `bxp-core/src/config.zig` `diagPreprocessError` (`zig-libs request: json5 — Diagnostic ... no column`).
 - Formalizing `AnnotatedResult` against a future `diagnostics` module (currently a raw
   `{ out, next_id }` pair; no structured line/col/severity type yet).
 - **DONE 2026-09-30 — JSON5 numeric literals** *(survey 2026-09-30)*: rewrite hex (`0x1A`), leading/trailing-dot (`.5`, `5.`) and `+`-signed numbers to JSON numbers; `Infinity`/`NaN` decided 2026-09-30: **an error by default** (`+Infinity`, `-Infinity`, `NaN` refused with a

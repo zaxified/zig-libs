@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-17** — **BEHAVIOURAL:** `Diagnostic` gains `col` (1-based, bytes), `offset` and `len`
+  of the refused literal, and `hint`; the `Options{ .non_finite = .quoted }` advice moved from
+  `message` (now end-user text only) into `hint`. Request from bxp (caret under the literal).
 - **2026-10-09** — tests: deterministic fuzz driver `JSON5_FUZZ` over the existing harnesses.
 - **2026-10-06** — **BEHAVIOURAL:** `preprocessAnnotated` no longer recovers a bad bare word (`nul`,
   `tru`) or a single-quoted string broken by a newline OUTSIDE an object (top level, or inside an
