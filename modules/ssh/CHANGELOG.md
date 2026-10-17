@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — Backlog: the OpenSSH host-key PEM is decoded with std's table base64 and a forward Boyer-Moore-Horspool END search over the key (found from acme's ctgrind; fix plan in SPEC). No code change.
 - **2026-10-10** — **Added:** `knownhosts` — OpenSSH `known_hosts` as a host-key policy (Go's `knownhosts`):
   `check(text, host, port, blob)` gives `accept` / `revoked` / `key_mismatch` / `unknown_host` in OpenSSH's
   order (a host known only under other key types is unknown, not mismatched); wildcards, `!` negation,

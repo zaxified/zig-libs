@@ -24,6 +24,11 @@
 //!    through DER and base64), then `x509.ecPrivateKeyFromPem` on the PEM of
 //!    that key with its bytes tainted (base64 decode, DER walk, scalar
 //!    load).
+//!  * `pem384` — the same round trip for a P-384 key (ES384 account and
+//!    certificate keys, 2026-10-13); the public point is recomputed by
+//!    `p384`.
+//!  * `pkcs8` — `x509.pkcs8PrivateKeyToPem` + `pkcs8PrivateKeyFromPem` (RFC
+//!    5958, `openssl genpkey`'s shape) for a P-256 and a P-384 key.
 //!
 //! The ECDSA signer is `p256`'s and is claimed there; what is measured here
 //! is the module's own files (and that nothing in them branches on, or
@@ -42,7 +47,8 @@ const acme = @import("root.zig");
 const jws = acme.jws;
 const x509 = acme.x509;
 
-const Target = enum { jws, csr, pem };
+const Target = enum { jws, csr, pem, pem384, pkcs8 };
+const Es384 = jws.Es384;
 const Taint = enum { yes, no };
 
 fn makeKey(t: Taint) jws.KeyPair {
@@ -52,6 +58,32 @@ fn makeKey(t: Taint) jws.KeyPair {
     jws.KeyPair.generateDeterministicInto(&kp, &seed) catch unreachable;
     if (t == .yes) std.valgrind.memcheck.makeMemUndefined(std.mem.asBytes(&kp.secret_key));
     return kp;
+}
+
+fn makeKey384(t: Taint) Es384.KeyPair {
+    var seed: [Es384.KeyPair.seed_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha384.hash("ctgrind-acme-key384-v1", &seed, .{});
+    var kp: Es384.KeyPair = undefined;
+    Es384.KeyPair.generateDeterministicInto(&kp, &seed) catch unreachable;
+    if (t == .yes) std.valgrind.memcheck.makeMemUndefined(std.mem.asBytes(&kp.secret_key));
+    return kp;
+}
+
+/// Write `kp` in `form`, show the text, load it back, show the scalar (see
+/// `.pem` for why the round trip, not a tainted whole text).
+fn roundTrip(comptime form: enum { sec1, pkcs8 }, gpa: std.mem.Allocator, kp: anytype) !void {
+    const pem = switch (form) {
+        .sec1 => try x509.ecPrivateKeyToPem(gpa, kp),
+        .pkcs8 => try x509.pkcs8PrivateKeyToPem(gpa, kp),
+    };
+    defer gpa.free(pem);
+    show(pem);
+    var back: @TypeOf(kp.*) = undefined;
+    switch (form) {
+        .sec1 => try x509.ecPrivateKeyFromPem(&back, gpa, pem),
+        .pkcs8 => try x509.pkcs8PrivateKeyFromPem(&back, gpa, pem),
+    }
+    show(&back.secret_key.bytes);
 }
 
 fn show(bytes: []const u8) void {
@@ -109,6 +141,15 @@ pub fn main(init: std.process.Init.Minimal) !void {
             var back: jws.KeyPair = undefined;
             try x509.ecPrivateKeyFromPem(&back, gpa, pem);
             show(&back.secret_key.bytes);
+        },
+        .pem384 => {
+            var k384 = makeKey384(taint);
+            try roundTrip(.sec1, gpa, &k384);
+        },
+        .pkcs8 => {
+            try roundTrip(.pkcs8, gpa, &kp);
+            var k384 = makeKey384(taint);
+            try roundTrip(.pkcs8, gpa, &k384);
         },
     }
 }

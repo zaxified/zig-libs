@@ -2698,7 +2698,13 @@ fn pemDecodeBody(text: []const u8) PemError!PemBlock {
     const body_start = label_end + dashes.len;
     var end_marker_buf: [max_end_marker_len]u8 = undefined;
     const end_marker = std.fmt.bufPrint(&end_marker_buf, "-----END {s}-----", .{label}) catch unreachable;
-    const ei = std.mem.indexOfPos(u8, text, body_start, end_marker) orelse return error.InvalidPem;
+    // Searched from the text's end: std's forward search (Boyer-Moore-
+    // Horspool) indexes its skip table by, and skips by an amount that
+    // depends on, the key's base64 characters (acme ctgrind 2026-10-18).
+    // Backward it reads only the END line and what follows. One block of
+    // this label per text; a second would land in `body` and fail decoding.
+    const ei = std.mem.lastIndexOf(u8, text, end_marker) orelse return error.InvalidPem;
+    if (ei < body_start) return error.InvalidPem;
     const body = text[body_start..ei];
 
     // Constant time in the body's characters (a private key's DER), not

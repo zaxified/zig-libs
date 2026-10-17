@@ -344,6 +344,15 @@ environment with OpenSSH installed.
 
 ## Backlog / deferred
 
+- **Constant time: the OpenSSH host-key PEM is decoded with std's table base64** *(found 2026-10-18
+  from acme's ctgrind, not measured here)*: `pemDecodeOpensshBlock` (`server.zig:366`) finds the END
+  line with `std.mem.indexOfPos` (Boyer-Moore-Horspool over the key's base64: a skip-table index
+  by, and a skip length that depends on, each character), strips whitespace with a branch per
+  character, then decodes with `std.base64.standard.Decoder`, whose alphabet table is indexed by the
+  key's characters — the class acme and rsa fixed with `b64ct` (2026-10-13/17). Fix as rsa did:
+  `std.mem.lastIndexOf` for the END line, `b64ct.standard.decodeIgnoring(out, body,
+  b64ct.pem_whitespace)` (new dep `b64ct`), and a ctgrind target for `HostKey.fromOpenSSH`. Effort S;
+  the host key is read once at start, so the exposure is a local observer of that moment.
 - **Build option: `ssh-gex-max-bits`** (design 2026-10-17, mechanism and checklist in CONVENTIONS §4.2; measure first — HTTPS sizeprobe or `nm -S --size-sort` on a consumer binary — and add a knob only for a measured gain of roughly ≥ 100 KB or a consumer request). `gex_max_bits = 8192` (src/transport.zig `GexMod = montint.DynModint(gex_max_bits)`)
   is the SAME type as rsa's `DynModint(8192)`, so lowering rsa alone saves nothing for an ssh consumer: both must drop together.
   `.small` → 4096 (RFC 8270 floor is 2048; a server offering a bigger group than the cap fails the kex loudly — check it does, with a

@@ -322,7 +322,7 @@ declare -A TARGETS=(
     # ── 2026-10-13: tlsresume: STEK, resumption secret/PSK/binder key, 0-RTT key schedule ──
     [tlsresume]="stek psk early"
     # ── 2026-10-13: acme: the P-256 account / certificate private key ──
-    [acme]="jws csr pem"
+    [acme]="jws csr pem pem384 pkcs8"
     # ── 2026-10-13: jwt: HMAC secrets (sign + verify), ES/EdDSA/RS/PS signing keys ──
     [jwt]="hmac ec rsa"
 )
@@ -771,6 +771,8 @@ declare -A PATTERN=(
     [acme/jws]='jws[.]zig|burn[.]zig'
     [acme/csr]='x509[.]zig|burn[.]zig'
     [acme/pem]='x509[.]zig|burn[.]zig'
+    [acme/pem384]='x509[.]zig|burn[.]zig'
+    [acme/pkcs8]='x509[.]zig|burn[.]zig'
     # jwt (2026-10-13): the module's own files. `root.zig` also matches the
     # delegated rsa/p521/p256 root.zig frames; the tsv comment itemises them.
     [jwt/hmac]='root[.]zig|encode[.]zig|burn[.]zig'
@@ -1030,6 +1032,8 @@ declare -A LABEL=(
     [acme/jws]='acme jws.sign jwk+kid headers (account key tainted)'
     [acme/csr]='acme x509.csrDer 1+2 names (certificate key tainted)'
     [acme/pem]='acme ecPrivateKeyToPem + ecPrivateKeyFromPem (key / PEM tainted)'
+    [acme/pem384]='acme ecPrivateKeyToPem + ecPrivateKeyFromPem, P-384 (key / PEM tainted)'
+    [acme/pkcs8]='acme pkcs8PrivateKeyToPem + pkcs8PrivateKeyFromPem, P-256 + P-384 (key / PEM tainted)'
     [jwt/hmac]='jwt HS256/384/512 sign + verify accept + reject (secret tainted)'
     [jwt/ec]='jwt ES256/ES384/ES512/EdDSA sign (signing key tainted)'
     [jwt/rsa]='jwt RS256 + PS256 sign (rsa secret members tainted)'

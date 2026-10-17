@@ -861,7 +861,16 @@ fn pemDecodeSecret(label: []const u8, text: []const u8, out: []u8) PemDecodeErro
 
     const bi = std.mem.indexOf(u8, text, begin) orelse return error.MissingPemBlock;
     const body_start = bi + begin.len;
-    const ei = std.mem.indexOfPos(u8, text, body_start, end) orelse return error.InvalidPem;
+    // The END line is searched from the text's end, not forward from the
+    // body: std's search is Boyer-Moore-Horspool, whose skip table is
+    // indexed by the haystack byte and whose skip length differs for the
+    // letters of the END line — forward, both run over the key's base64
+    // (ctgrind 2026-10-18, mem.zig findPos). Backward it stops at the END
+    // line, reading only it and what follows (public: a chain, whitespace).
+    // One key block per text: a second one would land in `body` and fail
+    // the decoder.
+    const ei = std.mem.lastIndexOf(u8, text, end) orelse return error.InvalidPem;
+    if (ei < body_start) return error.InvalidPem;
     const body = text[body_start..ei];
 
     const der_bytes = b64ct.decodeIgnoring(out, body, @import("b64ct").pem_whitespace) catch {
@@ -1974,6 +1983,32 @@ test "parseCsr: a critical SAN extension is read, and only dNSName entries are r
     defer p2.deinit();
     try testing.expectEqual(@as(usize, 1), p2.sans.len);
     try testing.expectEqualStrings("example.org", p2.sans[0]);
+}
+
+test "EC private key PEM: found among other blocks; the END line is searched from the end" {
+    // pemDecodeSecret searches the END line backward (2026-10-18: forward,
+    // std's Boyer-Moore-Horspool ran over the key's base64). A key between
+    // certificate blocks — the Manager stores key, then chain — still loads;
+    // a second key block lands in the body and is refused, never half-read.
+    const kp = testKeyPair(46);
+    const key_pem = try ecPrivateKeyToPem(testing.allocator, kp);
+    defer testing.allocator.free(key_pem);
+    const cert = "-----BEGIN CERTIFICATE-----\nMAA=\n-----END CERTIFICATE-----\n";
+    const text = try std.mem.concat(testing.allocator, u8, &.{ cert, key_pem, cert, cert });
+    defer testing.allocator.free(text);
+    var back: Es256.KeyPair = undefined;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&back));
+    try ecPrivateKeyFromPem(&back, testing.allocator, text);
+    try testing.expectEqualSlices(u8, &kp.secret_key.toBytes(), &back.secret_key.toBytes());
+    const two = try std.mem.concat(testing.allocator, u8, &.{ key_pem, key_pem });
+    defer testing.allocator.free(two);
+    try testing.expectError(error.InvalidPem, ecPrivateKeyFromPem(&back, testing.allocator, two));
+    // The END line before the BEGIN line is no block.
+    try testing.expectError(error.InvalidPem, ecPrivateKeyFromPem(
+        &back,
+        testing.allocator,
+        "-----END EC PRIVATE KEY-----\n-----BEGIN EC PRIVATE KEY-----\nMAA=\n",
+    ));
 }
 
 test "pemDecode: an over-long label and an empty body are typed errors" {
