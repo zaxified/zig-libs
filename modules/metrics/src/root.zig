@@ -782,7 +782,7 @@ const Family = struct {
 pub const Registry = struct {
     arena: std.heap.ArenaAllocator,
     /// Guards `families`/`family_index`, every family's `children`/`index`,
-    /// `active_scrapes` and `retired`.
+    /// `scrape_seq`, `scrapes` and `retired`.
     lock: std.atomic.Mutex = .unlocked,
     /// Registration order — `writeText` iterates this so exposition order
     /// stays deterministic (registration order, not sorted; see `writeText`).
@@ -790,11 +790,17 @@ pub const Registry = struct {
     /// Name -> family, O(1) get-or-register lookup. `families` stays the
     /// source of iteration order; this is purely an index into it.
     family_index: std.StringHashMapUnmanaged(*Family) = .empty,
-    /// Scrapes between their snapshot and the end of formatting. A child
-    /// removed meanwhile may still be in a snapshot, so it is parked in
-    /// `retired` and freed by the last scrape out instead of at once.
-    active_scrapes: usize = 0,
-    retired: std.ArrayList(*Child) = .empty,
+    /// Ticket of the next scrape; every running scrape holds a smaller one.
+    scrape_seq: u64 = 0,
+    /// Tickets of the scrapes between their snapshot and the end of
+    /// formatting (a handful: one per concurrent scraper).
+    scrapes: std.ArrayList(u64) = .empty,
+    /// Children removed while a scrape ran, oldest first, each with the
+    /// `scrape_seq` of its removal: only scrapes with a smaller ticket can
+    /// hold it in their snapshot, so it is freed as soon as the last of
+    /// THOSE ends — not when every scrape has ended, which scrapers that
+    /// overlap without a gap would never let happen (review L5, 2026-10-18).
+    retired: std.ArrayList(Retired) = .empty,
     /// Families removed by `unregister` (arena list; see there).
     orphaned: std.ArrayList(*Family) = .empty,
     /// Advisory size of the last `writeText` output, used to pre-size the
@@ -804,6 +810,9 @@ pub const Registry = struct {
     /// falls back to `Allocating`'s normal grow-as-needed behavior — this
     /// changes only how much is pre-reserved, never what gets emitted.
     exposition_size_hint: std.atomic.Value(usize) = .init(0),
+    /// The error of the last collector that failed a scrape (`@intFromError`,
+    /// 0 = none yet); see `lastCollectorError`.
+    collector_error: std.atomic.Value(u16) = .init(0),
     /// Time source for summaries' sliding windows, captured by each summary
     /// series when it is created — set it before registering summaries.
     clock: Clock = .monotonic,
@@ -812,12 +821,15 @@ pub const Registry = struct {
         return .{ .arena = std.heap.ArenaAllocator.init(gpa) };
     }
 
+    const Retired = struct { child: *Child, at: u64 };
+
     pub fn deinit(r: *Registry) void {
         const gpa = r.arena.child_allocator;
         for (r.families.items) |fam| freeFamilyChildren(gpa, fam);
         for (r.orphaned.items) |fam| freeFamilyChildren(gpa, fam);
-        for (r.retired.items) |c| c.destroy(gpa);
+        for (r.retired.items) |e| e.child.destroy(gpa);
         r.retired.deinit(gpa);
+        r.scrapes.deinit(gpa);
         r.arena.deinit();
         r.* = undefined;
     }
@@ -1008,6 +1020,17 @@ pub const Registry = struct {
         }
     }
 
+    /// Why the last failed scrape failed in a collector: its own error, or a
+    /// `Sink` error for samples the descriptions do not allow (`OutOfOrder`,
+    /// `InvalidDesc`, ...), where `write` returns only `error.WriteFailed`
+    /// (promhttp logs the cause through `ErrorLog`; this is the hook for a
+    /// caller's log). Null until a collector has failed; not cleared by a
+    /// later good scrape.
+    pub fn lastCollectorError(r: *const Registry) ?anyerror {
+        const v = r.collector_error.load(.monotonic);
+        return if (v == 0) null else @errorFromInt(v);
+    }
+
     /// Mark a family as pinned (see `Family.pinned`).
     fn pin(r: *Registry, name: []const u8) void {
         lockSpin(&r.lock);
@@ -1183,10 +1206,22 @@ pub const Registry = struct {
     /// hold it in their snapshot. Caller holds `r.lock`.
     fn retireLocked(r: *Registry, c: *Child) void {
         const gpa = r.arena.child_allocator;
-        if (r.active_scrapes == 0) return c.destroy(gpa);
+        if (r.scrapes.items.len == 0) return c.destroy(gpa);
         // Out of memory for the parking list: leak the series rather than
         // free memory a scrape may be reading.
-        r.retired.append(gpa, c) catch {};
+        r.retired.append(gpa, .{ .child = c, .at = r.scrape_seq }) catch {};
+    }
+
+    /// Free every parked child no running scrape can hold: those removed
+    /// at or before the oldest running scrape's start. Caller holds `r.lock`.
+    fn reapLocked(r: *Registry) void {
+        const gpa = r.arena.child_allocator;
+        var oldest: u64 = std.math.maxInt(u64);
+        for (r.scrapes.items) |t| oldest = @min(oldest, t);
+        var n: usize = 0;
+        while (n < r.retired.items.len and r.retired.items[n].at <= oldest) : (n += 1)
+            r.retired.items[n].child.destroy(gpa);
+        r.retired.replaceRangeAssumeCapacity(0, n, &.{});
     }
 
     fn retireAllLocked(r: *Registry, fam: *Family) void {
@@ -1276,7 +1311,8 @@ pub const Registry = struct {
 
     /// `writeText` or `writeOpenMetrics`. A collector that fails, or emits
     /// samples its descriptions do not allow, fails the whole scrape with
-    /// `error.WriteFailed` (promhttp's default `HTTPErrorOnError`).
+    /// `error.WriteFailed` (promhttp's default `HTTPErrorOnError`); the
+    /// collector's own error is kept for `lastCollectorError`.
     pub fn write(r: *Registry, w: *std.Io.Writer, format: Format) std.Io.Writer.Error!void {
         // Format the whole exposition into memory (no socket I/O), then
         // flush to the caller's writer OUTSIDE the lock, so a
@@ -1307,16 +1343,18 @@ pub const Registry = struct {
         // The copy is of pointers, not of the lists' slice headers: since
         // `delete`/`reset`/`unregister` (2026-10-17) the child lists shrink
         // and reallocate. A series removed while this scrape formats is
-        // parked in `retired` (`active_scrapes` > 0) and freed by the last
-        // scrape out, so every pointer in the copy stays valid until then.
+        // parked in `retired` and freed once every scrape that started before
+        // its removal has ended, so every pointer in the copy stays valid.
         // Reading a Counter/Gauge needs no lock (atomics) and a Histogram
         // takes its OWN `h.lock` in `writeHistogram`.
         const gpa = r.arena.child_allocator;
         var fams: []FamilySnapshot = &.{};
         var kids: []*Child = &.{};
+        var ticket: u64 = undefined;
         {
             lockSpin(&r.lock);
             defer r.lock.unlock();
+            r.scrapes.ensureUnusedCapacity(gpa, 1) catch return error.WriteFailed;
             var n_kids: usize = 0;
             for (r.families.items) |fam| n_kids += fam.children.items.len;
             fams = gpa.alloc(FamilySnapshot, r.families.items.len) catch return error.WriteFailed;
@@ -1331,15 +1369,15 @@ pub const Registry = struct {
                 slot.* = .{ .fam = fam, .children = kids[at..][0..n] };
                 at += n;
             }
-            r.active_scrapes += 1;
+            ticket = r.scrape_seq;
+            r.scrape_seq += 1;
+            r.scrapes.appendAssumeCapacity(ticket);
         }
         defer {
             lockSpin(&r.lock);
-            r.active_scrapes -= 1;
-            if (r.active_scrapes == 0) {
-                for (r.retired.items) |c| c.destroy(gpa);
-                r.retired.clearRetainingCapacity();
-            }
+            const i = std.mem.indexOfScalar(u64, r.scrapes.items, ticket).?;
+            _ = r.scrapes.swapRemove(i);
+            r.reapLocked();
             r.lock.unlock();
             gpa.free(kids);
             gpa.free(fams);
@@ -1354,7 +1392,10 @@ pub const Registry = struct {
                 if (ce != last_collector) {
                     last_collector = ce;
                     var sink: Sink = .{ .w = bw, .entry = ce, .format = format };
-                    ce.collector.collect(ce.collector.ctx, &sink) catch return error.WriteFailed;
+                    ce.collector.collect(ce.collector.ctx, &sink) catch |e| {
+                        r.collector_error.store(@intFromError(e), .monotonic);
+                        return error.WriteFailed;
+                    };
                 }
                 continue;
             }
@@ -4065,21 +4106,57 @@ test "unregister: removes the family, frees its series, allows a new descriptor"
     , try scrapeInto(&reg, &buf));
 }
 
-test "delete during a scrape: the series is parked until the last scrape ends" {
+test "delete during a scrape: the series is parked until the scrapes that may hold it end" {
     var reg = Registry.init(testing.allocator);
     defer reg.deinit();
     const v = try reg.counterVec("park_total", "h", &.{"k"});
     _ = try v.with(&.{"a"});
     _ = try v.with(&.{"b"});
-    // Stand in for a scrape between its snapshot and its end.
-    reg.active_scrapes = 1;
+    // Stand in for a scrape between its snapshot and its end (ticket 0).
+    try reg.scrapes.append(testing.allocator, 0);
+    reg.scrape_seq = 1;
     try testing.expect(v.delete(&.{"a"}));
     try testing.expect(v.reset());
     try testing.expectEqual(@as(usize, 2), reg.retired.items.len);
-    reg.active_scrapes = 0;
-    // A real scrape ends with active_scrapes back at 0 and drains the park.
+    // A scrape that starts and ends meanwhile cannot free them: ticket 0
+    // may still be formatting both.
     var buf: [256]u8 = undefined;
     _ = try scrapeInto(&reg, &buf);
+    try testing.expectEqual(@as(usize, 2), reg.retired.items.len);
+    // Ticket 0 ends: drained.
+    reg.scrapes.clearRetainingCapacity();
+    reg.reapLocked();
+    try testing.expectEqual(@as(usize, 0), reg.retired.items.len);
+}
+
+test "overlapping scrapes do not keep removed series parked forever (review L5)" {
+    var reg = Registry.init(testing.allocator);
+    defer reg.deinit();
+    const v = try reg.counterVec("overlap_total", "h", &.{"k"});
+    // Scrapes that overlap with no gap: A runs, B starts, A ends, C starts,
+    // B ends, ... — the running count never reaches 0. Each removal must be
+    // freed once the scrapes older than it are gone.
+    var running: u64 = 0;
+    try reg.scrapes.append(testing.allocator, running);
+    reg.scrape_seq = 1;
+    for (0..50) |i| {
+        var key: [8]u8 = undefined;
+        const k = std.fmt.bufPrint(&key, "k{d}", .{i}) catch unreachable;
+        _ = try v.with(&.{k});
+        try testing.expect(v.delete(&.{k})); // parked behind `running`
+        // The next scrape starts before the previous one ends.
+        const next = reg.scrape_seq;
+        reg.scrape_seq += 1;
+        try reg.scrapes.append(testing.allocator, next);
+        _ = reg.scrapes.swapRemove(std.mem.indexOfScalar(u64, reg.scrapes.items, running).?);
+        reg.reapLocked();
+        running = next;
+        // Only the removal made while `next` was not yet running survives
+        // `running`'s predecessor; at most one series is ever parked.
+        try testing.expect(reg.retired.items.len <= 1);
+    }
+    reg.scrapes.clearRetainingCapacity();
+    reg.reapLocked();
     try testing.expectEqual(@as(usize, 0), reg.retired.items.len);
 }
 
@@ -4367,10 +4444,14 @@ test "collector: a failing or misbehaving collector fails the scrape" {
     var tc: TestCollector = .{ .fail = true };
     try reg.registerCollector(&test_descs, .{ .ctx = &tc, .collect = TestCollector.collect });
     var buf: [2048]u8 = undefined;
+    try testing.expectEqual(@as(?anyerror, null), reg.lastCollectorError());
     try testing.expectError(error.WriteFailed, scrapeInto(&reg, &buf));
+    // The cause is kept (review L9, 2026-10-18).
+    try testing.expectEqual(@as(?anyerror, error.ProcUnreadable), reg.lastCollectorError());
     tc.fail = false;
     tc.out_of_order = true;
     try testing.expectError(error.WriteFailed, scrapeInto(&reg, &buf));
+    try testing.expectEqual(@as(?anyerror, error.OutOfOrder), reg.lastCollectorError());
 }
 
 test "collector: Sink refuses wrong kind, value count, UTF-8 and buckets" {

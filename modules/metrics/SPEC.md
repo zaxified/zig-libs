@@ -124,6 +124,22 @@ existing NOTICE for the vendored documentation excerpt is unrelated and unaffect
 
 ## Backlog / deferred
 
+- **Review LOWs of the 2026-10-17 wave (metrics part, L4–L9)** — closed 2026-10-18:
+  **L4** (`process_start_time_seconds` from `btime = 0`) and **L6** (suffix collision between two
+  descs of one collector) were already fixed by 9cf15487; **L5** (a) `retired` grew without bound
+  while scrapes overlapped with no gap — fixed: each scrape takes a ticket and each removed series
+  the ticket counter of its removal, and a series is freed once the scrapes older than its removal
+  have ended (test with overlapping scrapes, negative control = the old "last scrape out" rule),
+  (b) `delete` is O(n) in the family's series (find + ordered remove) — kept: it keeps registration
+  order, and client_golang sorts every family's series on every scrape; **L7** (an exemplar on a
+  counter without `_total`, typed `unknown` in OpenMetrics) — kept: prometheus/common v0.71 expfmt
+  writes the exemplar the same way (measured 2026-10-18 with `tools/go_golden` plus such a
+  counter); **L8** (`droppedInserts` under-reporting) — no longer true, it counts every value a
+  stream lost; **L9** (a collector's error collapsed into `WriteFailed`) — `Registry.lastCollectorError()`.
+- **Still open from that review's follow-ups:** `_created` samples (client_golang's default is
+  none, so not a parity gap), VictoriaMetrics/metrics as the bench's `fastest`, a Go differential of
+  the process collector's values.
+
 - ~~**`AccessLog` `.combined` is not CLF any tool reads**~~ *(found 2026-10-06)* — RESOLVED
   2026-10-06 by removing `AccessLog`: access logging is the `accesslog` module's (`Sink`,
   goaccess-anchored Combined), fed from the `on_request` hook (`AccessEntry.req`/`.res`).
