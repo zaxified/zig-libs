@@ -79,6 +79,12 @@ const Peer = struct {
         try io.sleep(.fromMilliseconds(@intCast(delay)), .awake);
         try sw.interface.writeAll(p.reply);
         try sw.interface.flush();
+        // The read above took whatever one (possibly short) read returned;
+        // closing over unread request bytes is a reset, as on Linux, and the
+        // client would see it instead of EOF -- under some seeds only. End
+        // our side, drain theirs until they close, then close.
+        s.shutdown(io, .send) catch return;
+        _ = sr.interface.discardRemaining() catch {};
     }
 };
 

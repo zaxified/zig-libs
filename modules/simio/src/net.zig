@@ -657,7 +657,7 @@ pub const Net = struct {
         const s = while (it.next()) |c| {
             const cand = c.*;
             if (cand.kind != .udp or cand.local.getPort() != p.dst.getPort()) continue;
-            if (!isUnspecified(cand.local) and !sameIp(cand.local, p.dst)) continue;
+            if (!boundMatches(cand.local, p.dst)) continue;
             if (cand.peer) |peer| if (!peer.eql(&p.src)) continue;
             break cand;
         } else return; // nobody listening: dropped (no ICMP port-unreachable yet)
@@ -720,7 +720,7 @@ pub const Net = struct {
         const listener = while (it.next()) |c| {
             const cand = c.*;
             if (cand.kind != .listener or cand.shut or cand.local.getPort() != p.dst.getPort()) continue;
-            if (!isUnspecified(cand.local) and !sameIp(cand.local, p.dst)) continue;
+            if (!boundMatches(cand.local, p.dst)) continue;
             break cand;
         } else {
             n.control(.rst, p.dst_host, p.src_host, p.dst, p.src, 0, p.from_sid);
@@ -1356,6 +1356,19 @@ const Gather = struct {
         g.part += 1;
     }
 };
+
+/// Whether a socket bound to `local` receives traffic addressed to `dst`
+/// (ports compared by the caller). A wildcard is per family, as on Linux:
+/// `0.0.0.0` is an AF_INET socket and never sees IPv6, while `::` (with
+/// IPV6_V6ONLY off, the Linux default std leaves alone) also takes IPv4.
+/// Before 2026-10-17 `0.0.0.0` took IPv6 too, so std's `HostName.connect`,
+/// which connects to every resolved address at once, got two accepted-or-
+/// queued connections from one lookup; which one it kept depended on the
+/// schedule (the `timeouts` pilot went red on an unrelated http change).
+fn boundMatches(local: net.IpAddress, dst: net.IpAddress) bool {
+    if (!isUnspecified(local)) return sameIp(local, dst);
+    return local == .ip6 or dst == .ip4;
+}
 
 fn isUnspecified(a: net.IpAddress) bool {
     return switch (a) {
