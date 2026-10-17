@@ -1,0 +1,5 @@
+# Floors for scripts/checks/small-sizes.sh (CONVENTIONS.md §4.2): module TAB min_gain_bytes TAB note.
+# min_gain = the least a ReleaseSmall size probe must shrink under -Dprofile=small, about half
+# the gain measured when the knob landed (so toolchain drift does not trip it, a dead knob does).
+rsa	200000	2026-10-17: 863144 -> 436768 B (gain 426376), native ADX/BMI2 x86_64
+ct25519	18000	2026-10-17: 54064 -> 17200 B (gain 36864)

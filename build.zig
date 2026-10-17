@@ -595,6 +595,10 @@ pub fn build(b: *std.Build) void {
     // them everywhere. Both are compiled by `check-interop`; only `interop` is
     // run by a lane.
     const live_all = b.step("live", "Run every module's live-network program (NEEDS the internet)");
+    // `sizeprobes` — every `modules/<m>/tools/sizeprobe.zig` as an installed
+    // executable (zig-out/sizeprobe/). `scripts/checks/small-sizes.sh` builds
+    // it at ReleaseSmall under each profile and compares (CONVENTIONS §4.2).
+    const sizeprobes = b.step("sizeprobes", "Build every module's size probe (consumer build options, CONVENTIONS 4.2)");
 
     // Pass 2: wire deps + register a test build per module.
     for (module_list) |m| {
@@ -790,6 +794,30 @@ pub fn build(b: *std.Build) void {
                 b.fmt("Benchmark {s} against the foreign implementations its maturity card compares with (needs them)", .{m.name}),
             ).dependOn(&bench_run.step);
             check_interop.dependOn(&bench_exe.step);
+        }
+
+        // The size probe (CONVENTIONS §4.2, 2026-10-17): a minimal consumer of a
+        // module that has consumer build options, over the PUBLISHED module, so
+        // `-Dprofile` / `-D<module>-<knob>` reach it exactly as they reach an
+        // application. Discovered by existence; `check-build-options` requires
+        // one for every module that reads `zl_options`. Compiled by
+        // `check-interop` too, so it cannot rot between `small` lane runs.
+        if (moduleHasSizeprobe(b, m.name)) {
+            const sp_mod = b.createModule(.{
+                .root_source_file = b.path(b.fmt("modules/{s}/tools/sizeprobe.zig", .{m.name})),
+                .target = target,
+                .optimize = optimize,
+            });
+            sp_mod.addImport(m.name, mod);
+            const sp_exe = b.addExecutable(.{
+                .name = b.fmt("sizeprobe-{s}", .{m.name}),
+                .root_module = sp_mod,
+                .use_llvm = true,
+            });
+            sizeprobes.dependOn(&b.addInstallArtifact(sp_exe, .{
+                .dest_dir = .{ .override = .{ .custom = "sizeprobe" } },
+            }).step);
+            check_interop.dependOn(&sp_exe.step);
         }
 
         // `check-pubfn-reach`: compile a second root over the SAME module graph
@@ -2545,6 +2573,12 @@ fn fastModuleGraph(b: *std.Build, target: std.Build.ResolvedTarget, fast: *std.S
 }
 
 /// Whether a module carries a comparative BENCHMARK — `modules/<name>/tools/bench.zig`.
+/// Whether a module carries a SIZE PROBE — `modules/<name>/tools/sizeprobe.zig`.
+fn moduleHasSizeprobe(b: *std.Build, name: []const u8) bool {
+    const path = b.fmt("modules/{s}/tools/sizeprobe.zig", .{name});
+    return if (b.build_root.handle.access(b.graph.io, path, .{})) |_| true else |_| false;
+}
+
 fn moduleHasBench(b: *std.Build, name: []const u8) bool {
     const path = b.fmt("modules/{s}/tools/bench.zig", .{name});
     return if (b.build_root.handle.access(b.graph.io, path, .{})) |_| true else |_| false;

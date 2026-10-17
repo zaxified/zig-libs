@@ -390,13 +390,19 @@ Rules:
   `scripts/modtest <m> -Dprofile=small` and `-D<module>-<knob>=<min>` before committing.
 - SPEC § "Build options": the knob, its range, what `.small` picks, the measured gain
   (sizeprobe or `nm --size-sort`), what the consumer loses. CHANGELOG entry.
+- A size probe `modules/<m>/tools/sizeprobe.zig` (a minimal consumer of the published module)
+  and a floor row in `scripts/checks/small-size-expected.tsv` (about half the measured gain,
+  `scripts/checks/small-sizes.sh --measure`). `check-build-options` (in `checks-fast`) refuses a
+  module that reads `zl_options` without SPEC section, probe or floor.
 - Dependents: a module whose tests use the capability (e.g. `tlsclient` with an 8192-bit
   certificate) must branch the same way before the knob is used under `.small` across the
   closure.
 
-**Known gaps** (2026-10-17): no CI lane runs `.small` yet (a stamp's lane key already
-includes the zig arguments, so a `-Dprofile=small` run keeps stamps of its own); the
-dependents of `rsa` are not yet adapted. Candidates for further knobs,
+**The `small` lane** (CI full/tag/dispatch, `small amd64`; `scripts/test.sh small`): runs
+`-Dprofile=small` at ReleaseSafe over every module that reads `zl_options` and every module
+depending on one (computed from `module-graph`), then `small-sizes.sh` holds each probe's
+ReleaseSmall gain to its floor. Every other lane stays on the default. A stamp's lane key
+includes the zig arguments, so the lane keeps stamps of its own. Candidates for further knobs,
 with measurements and notes, are in each module's SPEC § Backlog (entries titled
 "Build option: …": montint, ssh, tlsclient, x509, ed448, tz, brotli, zstd, p384, p521).
 `scripts/checks/ctgrind.sh` takes `CTGRIND_ZIG_ARGS="-Dprofile=small"` for a one-off constant-time

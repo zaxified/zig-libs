@@ -63,6 +63,7 @@ on:
           - interop ReleaseSafe amd64
           - ctgrind amd64
           - count amd64
+          - small amd64
 
 # Least privilege. The gate reads the repository and nothing else — it opens no
 # issue, pushes no tag, publishes no package — so saying so here means a
@@ -728,6 +729,19 @@ jobs:
           # (3.26.0) the baselines name. amd64 only: the counts are a property
           # of x86_64 code.
           lanes+=('{"name":"count amd64","args":"","cmd":"count","cachekey":"count","cache":false,"runner":"ubuntu-26.04","peers":"ctgrind","tc":false,"timeout":30,"skip_live":""}')
+
+          # ⭐ THE CONSUMER BUILD PROFILE `small`, added 2026-10-17 (CONVENTIONS.md
+          # §4.2). Every other lane tests the graded default; this one tests
+          # `-Dprofile=small` over the modules that read `zl_options` and every
+          # module depending on them (`test.sh small` computes the set from
+          # module-graph), at ReleaseSafe -- a lowered cap changes buffer sizes,
+          # and an overflow there panics in ReleaseSafe but corrupts silently in
+          # ReleaseSmall. ReleaseSmall measures instead: `small-sizes.sh` holds
+          # each size probe's gain to its floor. `-Dcpu` pinned like the other
+          # amd64 module lanes (x86_64_v3 has BMI2, +adx: montint's asm path,
+          # where rsa's knob saves most, is the one tested). Its own cache key;
+          # 50 modules at the first count (rsa's closure), 90 min like a shard.
+          lanes+=('{"name":"small amd64","args":"-Dcpu=x86_64_v3+aes+pclmul+adx","cmd":"small","cachekey":"small","cache":true,"runner":"ubuntu-26.04","peers":"tests","tc":false,"timeout":90,"skip_live":""}')
 
           # Every shard set must cover the whole collection: per `base`, the
           # union of its `-Dgroup=` values must equal every primary lib in

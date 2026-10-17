@@ -430,14 +430,15 @@ Consumer build options (CONVENTIONS §4.2), first in zig-libs (2026-10-17):
   anchors, ctgrind pins) is measured on the default only.
 - **Tested:** `scripts/modtest rsa -Dprofile=small` and `-Drsa-max-modulus-bits=6144` (all tests; the 8192-bit KAT asserts the
   refusal under a lower cap, the cap test checks one byte over / at the cap); `-Drsa-max-modulus-bits=2048` is a compile error.
-  No CI lane runs a non-default profile yet.
+  CI: the `small` lane (CONVENTIONS §4.2) runs rsa and its 56 dependents under `-Dprofile=small`; size floor in
+  `scripts/checks/small-size-expected.tsv` (ReleaseSmall probe 863 → 437 KB).
 
 ## Backlog / deferred
 
-- **Build option across the closure** (2026-10-17): `rsa-max-modulus-bits` / `.small` is tested in this module only. Before a
-  consumer uses `.small` with dependents (`tlsclient`, `x509`, `ssh`, `blindrsa`, `jwt`, `acme`, …), their tests with keys above
-  4096 bits must branch on `rsa.max_modulus_bits` (CONVENTIONS §4.2 checklist), and ssh's `gex_max_bits` must drop with it (same
-  `DynModint(8192)` type — see ssh Backlog).
+- ~~**Build option across the closure**~~ ✅ 2026-10-17: `modtest <m> -Dprofile=small` green for blindrsa, jwt, jwe, webauthn,
+  xmlenc, xmldsig, saml, x509, tlsclient, acme, dtls, iec62351, opcua, ssh — none needed a change (no test of theirs uses a key
+  above 4096 bits). The `small` CI lane now runs the whole closure. ssh's `gex_max_bits` still keeps its own `DynModint(8192)`
+  (ssh Backlog).
 - **Private-key PEM: a ctgrind target** — ✅ 2026-10-17 the base64 half: `marshal.zig` encodes and
   `pemDecodeBody` decodes through the constant-time `b64ct` module (`standard.encode`,
   `decodeIgnoring` with `pem_whitespace`). Still open: a ctgrind target over

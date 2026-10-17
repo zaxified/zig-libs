@@ -1820,6 +1820,7 @@ phase_checks_fast_tail() {
     step "check-scripts-doc" zig build check-scripts-doc
     step "check-package" zig build check-package
     step "check-catalog" zig build check-catalog
+    step "check-build-options" ./scripts/checks/check-build-options.py
 
     # The root NOTICE stopped listing modules on 2026-09-06: a module's
     # third-party obligation is discharged in the module's own NOTICE, and the
@@ -1964,6 +1965,53 @@ cmd_checks() {
 # is `zig build interop-<m> -- --capture`, which a human runs after reading the
 # mismatch. So this leaves a clean tree and goes red on divergence -- a lane
 # that silently rewrote its own anchor would be a lane that can never fail.
+# ⭐ THE `small` LANE (CONVENTIONS.md §4.2, user 2026-10-17): the consumer
+# build profile `-Dprofile=small`, tested in a lane of its own so every other
+# lane stays on the graded default.
+#
+# Module set: every module whose sources import `zl_options`, plus every module
+# that depends on one of them (from `module-graph`, never hand-listed) -- a
+# knob changes what dependents see (rsa's cap refuses an 8192-bit key a
+# tlsclient test might use). ReleaseSafe, not ReleaseSmall: a lowered cap
+# changes buffer sizes, and an overflow there panics in ReleaseSafe but
+# corrupts silently in ReleaseSmall, whose own defect class (unchecked UB) is
+# the ReleaseFast lane's already. ReleaseSmall gets the role it has for the
+# consumers that ask for size: `scripts/checks/small-sizes.sh` measures the
+# size probes under both profiles and holds the gain to its floor.
+# Stamps: the lane key includes `-Dprofile=small`, so it never shares stamps
+# with a default-profile run.
+small_closure() {
+    local tsv readers m changed name deps _rest
+    readers="$(rg -l '@import\("zl_options"\)' modules/*/src 2>/dev/null | cut -d/ -f2 | sort -u | paste -sd' ')"
+    if [[ -z "$readers" ]]; then
+        echo "test.sh small: no module imports zl_options -- refusing to pass vacuously" >&2
+        exit 1
+    fi
+    tsv="$(zig build module-graph 2>&1)" || { echo "$tsv" >&2; exit 1; }
+    local set=" $readers "
+    changed=1
+    while (( changed )); do
+        changed=0
+        while IFS='|' read -r name _ deps _rest; do
+            [[ -z "$name" || "$set" == *" $name "* ]] && continue
+            for m in ${deps//,/ }; do
+                if [[ "$set" == *" $m "* ]]; then set="$set$name "; changed=1; break; fi
+            done
+        done <<< "${tsv//$'\t'/|}"
+    done
+    printf '%s' "$set"
+}
+
+cmd_small() {
+    local closure m
+    local -a args=(-Doptimize=ReleaseSafe -Dprofile=small)
+    closure="$(small_closure)"
+    for m in $closure; do args+=("-Dmodule=$m"); done
+    echo "small: $(wc -w <<< "$closure") module(s) -- the zl_options readers and their dependents"
+    step "small-sizes" ./scripts/checks/small-sizes.sh
+    cmd_modules "${args[@]}" "$@"
+}
+
 cmd_count() {
     # PRE-RELEASE ONLY, like `ctgrind`: hold every module's instruction counts
     # per operation to its committed baseline (`modules/<m>/tools/count.tsv`,
@@ -2583,6 +2631,7 @@ main() {
         interop) cmd_interop "${rest[@]:-}" ;;
         ctgrind) cmd_ctgrind "${rest[@]:-}" ;;
         count) cmd_count "${rest[@]:-}" ;;
+        small) cmd_small "${rest[@]:-}" ;;
         time) cmd_time "${rest[@]:-}" ;;
         vm) cmd_vm "${rest[@]:-}" ;;
         -h|--help|help) usage ;;
