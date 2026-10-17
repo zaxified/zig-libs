@@ -132,6 +132,16 @@ pub const Db = struct {
     /// call (and across calls) instead of a fresh `alloc`/`free` every
     /// chunk of a long retention sweep.
     sweep_scratch: std.ArrayList([codec.point_key_len]u8) = .empty,
+    /// `range`'s block-cursor shortcut (ttydesk repin A/B, 2026-10-17): the
+    /// kvtree version (`Snapshot.txn_id`) at which the store was seen to hold
+    /// NO compacted block at all. A snapshot at that same version skips the
+    /// second cursor and its root-to-leaf seek; any commit, by this `Db` or
+    /// another over the same tree, moves the version and so re-checks — the
+    /// fact cannot go stale, unlike a flag set once at `init`.
+    no_blocks_at: ?u64 = null,
+    /// Blocks were seen once: stop re-checking (a store that compacts keeps
+    /// blocks; if a sweep removed them all, `range` only pays the seek).
+    blocks_seen: bool = false,
 
     pub fn init(gpa: Allocator, tree: *kvtree.Db) Db {
         return .{ .gpa = gpa, .tree = tree };
@@ -636,11 +646,29 @@ pub const Db = struct {
         errdefer cur.deinit();
         try cur.seek(&codec.pointKey(series, from));
         // Blocks are keyed by their LAST timestamp, so this lands on the
-        // first block that can hold a sample at or after `from`.
-        var bcur = try snap.cursor();
-        errdefer bcur.deinit();
-        try bcur.seek(&codec.blockKey(series, from));
-        return .{ .snap = snap, .cur = cur, .bcur = bcur, .series = series, .from = from, .to = to };
+        // first block that can hold a sample at or after `from`. A store with
+        // no block at all (never compacted) skips the cursor: `mayHaveBlocks`.
+        var bcur: ?kvtree.Cursor = null;
+        errdefer if (bcur) |*c| c.deinit();
+        if (try self.mayHaveBlocks(&snap)) {
+            bcur = try snap.cursor();
+            try bcur.?.seek(&codec.blockKey(series, from));
+        }
+        return .{ .snap = snap, .cur = cur, .bcur = bcur, .blk_done = bcur == null, .series = series, .from = from, .to = to };
+    }
+
+    /// Whether `snap`'s version may hold a compacted block. False only when
+    /// this exact version was checked and had none (`no_blocks_at`); the check
+    /// is one seek to the start of the block keyspace, paid once per version.
+    fn mayHaveBlocks(self: *Db, snap: *kvtree.Snapshot) Error!bool {
+        if (self.blocks_seen) return true;
+        if (self.no_blocks_at) |v| if (v == snap.txn_id) return false;
+        var c = try snap.cursor();
+        defer c.deinit();
+        try c.seek(&[_]u8{codec.tag_block});
+        const any = if (try c.next()) |e| e.key.len > 0 and e.key[0] == codec.tag_block else false;
+        if (any) self.blocks_seen = true else self.no_blocks_at = snap.txn_id;
+        return any;
     }
 
     // ── retention ────────────────────────────────────────────────────────────
@@ -1302,7 +1330,8 @@ fn labelsMatch(have: []const Label, filter: []const Label) bool {
 pub const Range = struct {
     snap: kvtree.Snapshot,
     cur: kvtree.Cursor,
-    bcur: kvtree.Cursor,
+    /// Null when the store held no block at this version (`Db.mayHaveBlocks`).
+    bcur: ?kvtree.Cursor,
     series: SeriesId,
     from: Timestamp,
     to: Timestamp,
@@ -1375,7 +1404,7 @@ pub const Range = struct {
                 self.blk_peek = .{ .ts = s.ts, .value = s.value };
                 return;
             }
-            const e = (try self.bcur.next()) orelse {
+            const e = (try self.bcur.?.next()) orelse {
                 self.blk_done = true;
                 return;
             };
@@ -1395,7 +1424,7 @@ pub const Range = struct {
     }
 
     pub fn deinit(self: *Range) void {
-        self.bcur.deinit();
+        if (self.bcur) |*c| c.deinit();
         self.cur.deinit();
         self.snap.release();
         self.* = undefined;
@@ -2661,6 +2690,50 @@ test "compact: a regular series packs into blocks, reads back bit-exact, and liv
     const again = try collect(gpa, &fx.db, s, std.math.minInt(i64), std.math.maxInt(i64));
     defer gpa.free(again);
     try testing.expectEqual(got.len, again.len);
+}
+
+test "range: no block cursor while the store has no block; a compact through another Db is seen at once" {
+    // ttydesk repin A/B (2026-10-17): every `range` used to seek a second
+    // cursor into the block keyspace, 1.37x task-clock on small scans of a
+    // store never compacted. The shortcut is keyed on the kvtree version, so a
+    // second `Db` over the same tree compacting must not make the first miss
+    // blocks.
+    const gpa = testing.allocator;
+    var fx = try Fixture.init(gpa);
+    defer fx.deinit();
+    const s = try fx.db.seriesId("m", &.{});
+    for (0..100) |i| try fx.db.append(s, @intCast(i), @floatFromInt(i));
+
+    var r1 = try fx.db.range(s, 0, 1000);
+    try testing.expect(r1.bcur == null);
+    r1.deinit();
+    const v = fx.db.no_blocks_at.?;
+    var r2 = try fx.db.range(s, 0, 1000); // same version: no re-check either
+    try testing.expect(r2.bcur == null);
+    try testing.expectEqual(v, fx.db.no_blocks_at.?);
+    var n: usize = 0;
+    while (try r2.next()) |_| n += 1;
+    r2.deinit();
+    try testing.expectEqual(@as(usize, 100), n);
+
+    // Another Db over the same tree compacts; ours still holds `no_blocks_at`.
+    var other = Db.init(gpa, fx.tree);
+    defer other.deinit();
+    const res = try other.compact(64, .{ .min_run = 64 });
+    try testing.expectEqual(@as(usize, 64), res.compacted);
+    try testing.expect(fx.db.no_blocks_at != null and !fx.db.blocks_seen);
+
+    var r3 = try fx.db.range(s, 0, 1000);
+    defer r3.deinit();
+    try testing.expect(r3.bcur != null);
+    n = 0;
+    var want: Timestamp = 0;
+    while (try r3.next()) |p| : (n += 1) {
+        try testing.expectEqual(want, p.ts);
+        want += 1;
+    }
+    try testing.expectEqual(@as(usize, 100), n); // 64 from the block, 36 raw
+    try testing.expect(fx.db.blocks_seen);
 }
 
 test "compact: a short tail after the last block stays raw until min_run samples are below the horizon" {

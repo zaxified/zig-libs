@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-17** — Perf: `range` on a store that holds no compacted block opens no block cursor (it seeked one per call: 1.37× task-clock on small scans of a never-compacted ttydesk store). Keyed on the kvtree version, so a compact by any `Db` over the same tree is seen at the next `range`. `Range.bcur` is now optional (`?kvtree.Cursor`) — only code reaching into that field notices.
 - **2026-10-09** — tests: deterministic fuzz driver `TSDB_FUZZ` over the existing harnesses.
 
 - **2026-10-04** — ADDED, no format break: sample compression and series deletion (survey

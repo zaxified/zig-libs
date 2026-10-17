@@ -482,14 +482,7 @@ Named as scope decisions, not omissions.
   and wgs look series up by exact labels).
 - **Downsampling / rollups, per-series retention** — §9; no consumer asks.
 - **A resume record for `sweepToBudget`** — §5a; would make an interrupted budget sweep linear.
-- **`range` pays for blocks a store never had** *(ttydesk repin A/B, 2026-10-17)*: since §5b every
-  `range` opens a second cursor and seeks `blockKey(series, from)` — one extra root-to-leaf descent
-  (2 `preadv` at depth 2 on `FsStorage`) per call, even in a store `compact` never ran on. Measured
-  on a real ttydesk `history.kvt` (17 series, ~210 samples each, 200 full scans in one process):
-  25.3 → 34.6 ms task-clock (1.37×), preadv 17 509 → 24 311. For ttydesk itself it is a few tens of
-  µs at startup, so not urgent. Fix idea: a `Db`-level "has blocks" flag (set by `compact`, found
-  once at `init` by one seek over the block prefix), or seek `bcur` lazily only when a block can
-  precede the next raw point. Effort S.
+- ~~**`range` pays for blocks a store never had**~~ ✅ DONE 2026-10-17 *(ttydesk repin A/B)*: measured 25.3 → 34.6 ms task-clock (1.37×) on a never-compacted `history.kvt` because every `range` seeked a second cursor into the block keyspace. The proposed fix — a flag found once at `init` — was rejected: a second `Db` over the same tree compacting would leave it stale and `range` would silently skip blocks. Done instead: `Db.no_blocks_at` remembers the kvtree version (`Snapshot.txn_id`) at which the store held no block, so a `range` at that same version opens no block cursor; any commit re-checks (one seek per version), and once blocks are seen (`blocks_seen`) `range` behaves as before. Test: a second `Db` compacting is seen at once (a version-blind mutant fails it).
 
 ## Anchoring
 
