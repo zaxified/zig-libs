@@ -93,6 +93,10 @@ pub const sockets = @import("sockets.zig");
 pub const conntrack = @import("conntrack.zig");
 pub const process = @import("process.zig");
 pub const counters = @import("counters.zig");
+pub const pidstat = @import("pidstat.zig");
+pub const pidfiles = @import("pidfiles.zig");
+pub const pairs = @import("pairs.zig");
+pub const unix = @import("unix.zig");
 
 // Flattened re-exports — the primary type + functions of each submodule, so
 // `procnet.parseArp(...)` works without reaching through the namespace.
@@ -138,6 +142,44 @@ pub const SocketOwnerIndex = process.SocketOwnerIndex;
 pub const SocketOwnerOptions = process.SocketOwnerOptions;
 pub const parseSocketInode = process.parseSocketInode;
 pub const indexSocketOwners = process.indexSocketOwners;
+
+// ── prometheus/procfs parity: per-process readers (all take a `ProcRef`) ──
+pub const PidStat = pidstat.PidStat;
+pub const parsePidStat = pidstat.parsePidStat;
+pub const readPidStat = pidstat.readPidStat;
+pub const user_hz = pidstat.user_hz;
+pub const parseProcStatWithPage = process.parseProcStatWithPage;
+
+pub const Resource = pidfiles.Resource;
+pub const Limit = pidfiles.Limit;
+pub const Limits = pidfiles.Limits;
+pub const parseLimits = pidfiles.parseLimits;
+pub const readPidLimits = pidfiles.readPidLimits;
+pub const PidIo = pidfiles.PidIo;
+pub const parsePidIo = pidfiles.parsePidIo;
+pub const readPidIo = pidfiles.readPidIo;
+pub const PidStatus = pidfiles.PidStatus;
+pub const parsePidStatus = pidfiles.parsePidStatus;
+pub const readPidStatus = pidfiles.readPidStatus;
+pub const Cmdline = pidfiles.Cmdline;
+pub const readPidCmdline = pidfiles.readPidCmdline;
+pub const CgroupEntry = pidfiles.CgroupEntry;
+pub const CgroupList = pidfiles.CgroupList;
+pub const parseCgroups = pidfiles.parseCgroups;
+pub const readPidCgroups = pidfiles.readPidCgroups;
+pub const countFds = pidfiles.countFds;
+
+pub const PairTable = pairs.PairTable;
+pub const parsePairs = pairs.parsePairs;
+pub const readNetstat = pairs.readNetstat;
+pub const readSnmp = pairs.readSnmp;
+pub const readPidNetstat = pairs.readPidNetstat;
+pub const readPidSnmp = pairs.readPidSnmp;
+
+pub const UnixEntry = unix.UnixEntry;
+pub const UnixTable = unix.UnixTable;
+pub const parseUnix = unix.parseUnix;
+pub const readUnix = unix.readUnix;
 
 pub const NetDevEntry = counters.NetDevEntry;
 pub const parseNetDev = counters.parseNetDev;
@@ -229,6 +271,38 @@ pub fn readVirtualFileReporting(
         return null;
     };
     return .{ .bytes = bytes, .truncated = truncated };
+}
+
+/// Which process a per-process reader looks at: the calling process through
+/// the `/proc/self` link, or an explicit pid. `.self` needs no `getpid(2)` and
+/// is immune to pid reuse and to a PID namespace that renumbers the caller, so
+/// it is what a collector reading its own process wants; `.{ .pid = n }` is
+/// what `listProcesses` / `indexSocketOwners` yield.
+pub const ProcRef = union(enum) {
+    self,
+    pid: u32,
+
+    /// `/proc/self/<rest>` or `/proc/<pid>/<rest>` written into `buf`, or null
+    /// if it does not fit (a 64-byte buffer holds every path this module uses).
+    pub fn path(r: ProcRef, buf: []u8, rest: []const u8) ?[]const u8 {
+        return switch (r) {
+            .self => std.fmt.bufPrint(buf, "/proc/self/{s}", .{rest}),
+            .pid => |p| std.fmt.bufPrint(buf, "/proc/{d}/{s}", .{ p, rest }),
+        } catch null;
+    }
+};
+
+/// Read a `/proc` file into a caller buffer — no allocation. Returns the bytes
+/// read (a prefix of the file if it is longer than `buf`: `result.len ==
+/// buf.len` is the truncation signal), or null if the file cannot be opened or
+/// read. Same streaming rule as `readVirtualFile`: `/proc` files report size 0.
+pub fn readVirtualFileInto(io: std.Io, path: []const u8, buf: []u8) ?[]u8 {
+    var file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return null;
+    defer file.close(io);
+    var tmp: [64]u8 = undefined;
+    var fr = std.Io.File.Reader.initStreaming(file, io, &tmp);
+    const n = fr.interface.readSliceShort(buf) catch return null;
+    return buf[0..n];
 }
 
 /// Copy as much of `s` as fits into `buf`, truncating rather than failing —
@@ -438,6 +512,11 @@ test {
     _ = sockets;
     _ = conntrack;
     _ = process;
+    _ = pidstat;
+    _ = pidfiles;
+    _ = pairs;
+    _ = unix;
+    _ = @import("fuzz_proc.zig");
 }
 
 const testing = std.testing;

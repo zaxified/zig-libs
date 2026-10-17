@@ -42,7 +42,20 @@ pub const ProcessEntry = struct {
 /// 0-indexed from `state`; `rss` (in pages, converted to kB) is field 24 of
 /// the `proc(5)` table, i.e. token index 21 counting from `state` = 0.
 /// Returns null if the line has no balanced `(...)` or too few fields.
+///
+/// `rss` is in pages, and a page is not always 4 KiB: arm64 and ppc64 kernels
+/// run 16 KiB or 64 KiB pages. The conversion uses the RUNNING machine's page
+/// size (`std.heap.pageSize()`, from the auxiliary vector); a line captured on
+/// a machine with another page size goes through `parseProcStatWithPage`.
 pub fn parseProcStat(line: []const u8) ?ProcessEntry {
+    return parseProcStatWithPage(line, std.heap.pageSize());
+}
+
+/// `parseProcStat` for a stat line written by a kernel whose page size is
+/// `page_size` bytes (a capture from another machine, or a test). A
+/// `page_size` below 1 KiB counts as 1 KiB (`rss_kb` is a whole-kB figure).
+pub fn parseProcStatWithPage(line: []const u8, page_size: usize) ?ProcessEntry {
+    const kb_per_page: u64 = @max(page_size / 1024, 1);
     const lp = std.mem.indexOfScalar(u8, line, '(') orelse return null;
     const rp = std.mem.lastIndexOfScalar(u8, line, ')') orelse return null;
     if (rp <= lp) return null;
@@ -71,7 +84,7 @@ pub fn parseProcStat(line: []const u8) ?ProcessEntry {
         // maxInt(u64) must not panic (checked `*` overflows) or wrap
         // (ReleaseFast UB) — it saturates to maxInt(u64) instead, matching
         // this parser's "malformed input degrades gracefully" contract.
-        .rss_kb = (std.fmt.parseInt(u64, rss_s, 10) catch 0) *| 4, // 4 KB pages
+        .rss_kb = (std.fmt.parseInt(u64, rss_s, 10) catch 0) *| kb_per_page,
     };
     e.name_len = @intCast(procnet.copyClamped(&e.name_buf, name));
     return e;
@@ -382,9 +395,22 @@ pub fn indexSocketOwners(
 
 const testing = std.testing;
 
+test "parseProcStat: rss follows the page size, not a hard-coded 4 KiB" {
+    // The bug this pins: `rss * 4` was baked in, right only on 4 KiB kernels.
+    // On a 16 KiB-page (Asahi, many arm64 distros) or 64 KiB-page (RHEL
+    // arm64, ppc64le) kernel it under-reported by 4x / 16x.
+    const line = "1 (systemd) S 0 1 1 0 -1 4194560 55321 3271011 40 4482 106 88 1058 621 20 0 1 0 3 170939904 2237 18446744073709551615 0 0 0 0 0 0 671173123 4096 1260 1 0 0 17 3 0 0 0 0 0 0 0 0 0 0";
+    try testing.expectEqual(@as(u64, 2237 * 4), parseProcStatWithPage(line, 4096).?.rss_kb);
+    try testing.expectEqual(@as(u64, 2237 * 16), parseProcStatWithPage(line, 16384).?.rss_kb);
+    try testing.expectEqual(@as(u64, 2237 * 64), parseProcStatWithPage(line, 65536).?.rss_kb);
+    try testing.expectEqual(@as(u64, 2237), parseProcStatWithPage(line, 0).?.rss_kb); // clamped to 1 KiB
+    // The plain entry point uses this machine's own page size.
+    try testing.expectEqual(@as(u64, 2237 * (std.heap.pageSize() / 1024)), parseProcStat(line).?.rss_kb);
+}
+
 test "parseProcStat: real /proc/1/stat-shaped line (systemd)" {
     const line = "1 (systemd) S 0 1 1 0 -1 4194560 55321 3271011 40 4482 106 88 1058 621 20 0 1 0 3 170939904 2237 18446744073709551615 0 0 0 0 0 0 671173123 4096 1260 1 0 0 17 3 0 0 0 0 0 0 0 0 0 0";
-    const e = parseProcStat(line).?;
+    const e = parseProcStatWithPage(line, 4096).?;
     try testing.expectEqual(@as(u32, 1), e.pid);
     try testing.expectEqualStrings("systemd", e.name());
     try testing.expectEqual(@as(u8, 'S'), e.state);
@@ -402,7 +428,7 @@ test "parseProcStat: name containing its own parens (sd-pam-style)" {
 
 test "parseProcStat: name containing spaces and a lone close-paren" {
     const line = "42 (my weird) name) R 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 1 0 300 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0";
-    const e = parseProcStat(line).?;
+    const e = parseProcStatWithPage(line, 4096).?;
     try testing.expectEqualStrings("my weird) name", e.name());
     try testing.expectEqual(@as(u8, 'R'), e.state);
     try testing.expectEqual(@as(u64, 300 * 4), e.rss_kb);

@@ -1,8 +1,9 @@
 # procnet
 
 Linux `/proc` + `/sys` parsers — ARP neighbor table, IPv4 routes, TCP/UDP
-socket tables (v4 + v6), conntrack flows, per-process `stat`, and a device
-health snapshot (uptime/load/memory/thermal/conntrack pressure) — all
+socket tables (v4 + v6), AF_UNIX sockets, conntrack flows, per-process
+`stat`/`status`/`limits`/`io`/`cmdline`/`cgroup`/fd count, the `snmp`/`netstat`
+counters, and a device health snapshot (uptime/load/memory/thermal/conntrack pressure) — all
 returning typed values (`netaddr.Ip`/`Prefix`, not allocated dotted-string
 IPs).
 
@@ -16,7 +17,9 @@ decode are verified against real kernel snapshots (see the test fixtures
 under `src/testdata/`, which now include a big-endian kernel's capture),
 extending IPv4-only reads to full dual-stack coverage.
 
-- **Model after:** gopsutil (Go) / procps-ng.
+- **Model after:** gopsutil (Go) / procps-ng. **Reference for scope and
+  performance:** prometheus/procfs v0.21.1 (the library behind the Prometheus
+  `process_*` collector).
 - **Platform:** linux (raw `/proc`+`/sys` reads). **Role:** util.
   **Concurrency:** reentrant (no shared state).
 - **Deps:** `netaddr` (`Ip`/`Prefix` — typed addresses instead of allocated
@@ -94,6 +97,47 @@ Formats are the kernel's documented ones (proc(5), `iostats.rst`); fixtures
 are real captures; each parser also runs under the shared fuzz harness and a
 3000-script deterministic driver that feeds every parser every damaged sample.
 
+### Per-process readers and network counters (2026-10-17, prometheus/procfs parity)
+
+Every per-process reader takes a `procnet.ProcRef` — `.self` (the calling
+process, via `/proc/self`) or `.{ .pid = n }` — and every parser underneath is
+pure, taking bytes.
+
+```zig
+const st = procnet.readPidStat(io, .self).?;       // PidStat: every field procfs's ProcStat has; no allocation
+_ = .{ st.cpuSeconds(), st.startTimeSeconds(btime), st.residentBytesNow(), st.vsize, st.num_threads };
+//   cpuSeconds = (utime + stime) / USER_HZ;  startTimeSeconds = btime + starttime / USER_HZ
+//   (USER_HZ = 100, `procnet.user_hz`, the kernel ABI constant -- procfs uses it too)
+const lim = procnet.readPidLimits(io, .self).?;    // Limits: all 16 rows, soft/hard, `unlimited` = null
+_ = .{ lim.maxOpenFiles(), lim.maxAddressSpace(), lim.get(.stack_size) };
+const nfds = procnet.countFds(io, .self).?;        // fstat size of /proc/<pid>/fd (Linux >= 6.2), else a directory count
+const sts = procnet.readPidStatus(io, .self).?;    // PidStatus: uids/gids, Vm*/Rss* in bytes, ctxt switches, caps, cpus_allowed ranges
+const pio = procnet.readPidIo(io, .self);          // ?PidIo: null for another user's process (the file is 0400)
+const cl = procnet.readPidCmdline(gpa, io, .self).?; // NUL-separated; `cl.args()` iterates; cl.deinit(gpa)
+const cg = (try procnet.readPidCgroups(gpa, io, .self)).?; // entries: hierarchy_id, controllers, path
+// Network counters: one header/value-pair parser for all four files.
+const ns = try procnet.readPidNetstat(gpa, io, .self);   // /proc/<pid>/net/netstat; readNetstat = /proc/net/netstat
+defer ns.deinit(gpa);                                    // readSnmp / readPidSnmp for net/snmp
+_ = ns.get("IpExt", "InOctets");                          // ?u64 by (section, name); every counter the kernel prints is kept
+const unix = try procnet.readUnix(gpa, io);              // /proc/net/unix: []UnixEntry (path inline, abstract names start with '@')
+defer unix.deinit(gpa);
+```
+
+`parsePidStat`, `parseLimits`, `parsePidStatus`, `parsePidIo`, `parseCgroups`,
+`cmdlineArgs`, `parsePairs` and `parseUnix` are the pure halves. Page size comes
+from the running kernel (`std.heap.pageSize()`; `parseProcStatWithPage` for a
+capture from another machine) — `rss_kb` used to assume 4 KiB pages, which is
+wrong on 16 KiB / 64 KiB arm64 and ppc64 kernels.
+
+⚠ `process_network_receive_bytes_total` / `..._transmit_...` in a Prometheus
+process collector come from `/proc/<pid>/net/netstat` `IpExt InOctets` /
+`OutOctets`. That file shows the process's NETWORK NAMESPACE, not the
+process: every process in one namespace reads the same numbers, and `/proc/net`
+is `/proc/self/net`. procfs has the same quirk; this module reproduces it.
+
+A process that exited, or whose file this uid may not read, yields null (or
+an empty table) from a `ProcRef` reader, never an error.
+
 Every table follows the same split: `parseX(gpa, text) → []Entry` is pure
 and offline-testable (golden-text fixtures in `src/testdata/`); `readX(gpa,
 io)` reads the live file and calls the pure parser. A missing or unreadable
@@ -155,13 +199,7 @@ routes, `-N` neighbours and `-s` snapshot.
 
 ## DEFER (beyond this module's current scope)
 
-- `/proc/net/unix` — the AF_UNIX socket table (`ss -x`). Not parsed, and
-  until now not even listed here, which is the worst kind of omission: a
-  reader checking this list would have concluded it was covered. It is a
-  genuinely different row shape — a filesystem path or an abstract
-  (`@`-prefixed, NUL-containing) name instead of an address/port pair, and
-  no `netaddr.Ip` anywhere in it — so it wants its own parser and its own
-  entry type, not a widened `SocketEntry`.
+- ~~`/proc/net/unix`~~ — done 2026-10-17 (`readUnix`, own `UnixEntry` type).
 - Per-socket columns past `inode` in `/proc/net/{tcp,udp}`: the
   `tr:tm->when` timer, `retrnsmt`, `timeout`, and the TCP diagnostics tail
   (`rto`, `ato`, `snd_cwnd`, `ssthresh`). These are `ss -o` and `ss -i`
@@ -172,9 +210,7 @@ routes, `-N` neighbours and `-s` snapshot.
   `ConntrackFlow` decodes the original-direction tuple only, which the type
   says; the reply tuple is where NAT translation is visible and deserves
   explicit modelling rather than four more fields.
-- `/proc/<pid>/status` — richer per-process fields (VmRSS breakdown, uid/gid,
-  cgroup) beyond `stat`'s scalars; a `status.zig` sibling to `process.zig`.
-- `/proc/net/snmp` / `/proc/net/netstat` protocol counters — two-line
-  header/value pairs per protocol; no consumer reads them yet.
+- ~~`/proc/<pid>/status`~~ — done 2026-10-17 (`readPidStatus`).
+- ~~`/proc/net/snmp` / `/proc/net/netstat`~~ — done 2026-10-17 (`readSnmp`/`readNetstat`, per-pid variants).
 - `statvfs`/`/proc/mounts` disk usage — filesystem space, not a `/proc/net`
   or per-process concern; a different module axis entirely.

@@ -5,6 +5,25 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-17** — ADDED, prometheus/procfs v0.21.1 parity (survey `procnet` S2; the metrics
+  module's Prometheus `process_*` collector builds on it). New files `pidstat.zig`, `pidfiles.zig`,
+  `pairs.zig`, `unix.zig`, test-only `fuzz_proc.zig`; `root.zig` gains `ProcRef` (`.self` or
+  `.{ .pid = n }`) and `readVirtualFileInto` (caller-buffer read, no allocation). R1/R2 full
+  `/proc/<pid>/stat` (`PidStat`, `parsePidStat`/`readPidStat`, `cpuSeconds`, `startTimeSeconds`,
+  `residentBytes`, `user_hz` = 100); R4 `limits` (`Limits`, all 16 rows, `unlimited` = null); R5
+  `countFds` (procfs's rule: fstat size on Linux >= 6.2, else a directory count); R6/R7
+  `/proc/net/{snmp,netstat}` and `/proc/<pid>/net/{snmp,netstat}` through one header/value-pair parser
+  (`PairTable`, `get(section, name)`, `ipExtOctets`; documented: per network namespace, not per process);
+  R8 `status` (`PidStatus`); R9 `io` (`PidIo`); R10 `cmdline` (`Cmdline`, arg iterator) and `cgroup`
+  (`CgroupList`); R11 `/proc/net/unix` (`UnixEntry`, paths with spaces and `@` abstract names kept);
+  R17 every per-process reader addressable by `ProcRef`. FIXED: `parseProcStat` / `ProcessEntry.rss_kb`
+  multiplied `rss` by a hard-coded 4 (4 KiB pages), under-reporting 4x / 16x on 16 KiB / 64 KiB-page
+  kernels; it now uses `std.heap.pageSize()` (new `parseProcStatWithPage` for foreign captures; a test
+  at 4/16/64 KiB fails against the old code). Fixtures copied from this machine's `/proc/self/*`, edge
+  cases per parser, a live test per reader against this process, eight driver harnesses
+  (`PROCNET_FUZZ`) plus a 400-seed always-on run. SPEC: scope `core` -> `parity`, procfs as reference,
+  stale "57 tests" corrected. Not done: mutation run, fuzz campaign, bench vs procfs.
+
 - **2026-10-04** — ADDED (survey 2026-09-30 ranks 1–4), `src/counters.zig`: `/proc/net/dev`
   (`parseNetDev`/`readNetDev`, `NetDevEntry`), `/proc/stat` (`parseStat`/`readStat`, `Stat`,
   `CpuTimes` with `total`/`busy`/`busyFraction`), `/proc/meminfo` typed (`parseMeminfo`/
