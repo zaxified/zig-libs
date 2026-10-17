@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-10-04 (3000-script deterministic driver) · ct n/a — /proc parsers (keyword review, 2026-10-07)
 
-**Performance:** not measured
+**Performance:** ref 0.17–0.94× prometheus/procfs v0.21.1 · fastest ? (measured 2026-10-17)
 
 **Known defects:** none recorded
 

@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-17** — Comparative benchmark `tools/bench.zig` + `tools/go_bench/` (`zig build bench-procnet`)
+  against prometheus/procfs v0.21.1: nine read-and-parse rows (pid stat/limits/status/io/netstat,
+  fd count, net/unix, net/dev, /proc/stat) over this process's own files; result `ref 0.17–0.94×`
+  (worst `net_unix`), recorded in SPEC `Performance:` and `tools/README.md`. Tooling only, no code change.
 - **2026-10-17** — ADDED, prometheus/procfs v0.21.1 parity (survey `procnet` S2; the metrics
   module's Prometheus `process_*` collector builds on it). New files `pidstat.zig`, `pidfiles.zig`,
   `pairs.zig`, `unix.zig`, test-only `fuzz_proc.zig`; `root.zig` gains `ProcRef` (`.self` or
