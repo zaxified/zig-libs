@@ -71,7 +71,8 @@ Surveyed 2026-09-30, refreshed 2026-10-17 per `SURVEY-PLAYBOOK.md`; stars and ac
   is off by default, matching helmet — it blocks every embedded cross-origin resource that doesn't
   opt in via CORP/CORS. The five legacy/cluster defaults are ON, as in helmet; this changes the
   emitted bytes of `.{}` relative to earlier versions (5 more header lines, 125 bytes of the
-  response header budget with `apply`, none with `applyStatic`).
+  response header budget with `apply`, none with `applyStatic`). `api_options` (2026-10-18) is the posture for a pure API: the same defaults without those
+  five browser-document headers (six headers, the pre-parity set); the default itself stays helmet's.
 
 ## Threat model / out of scope
 

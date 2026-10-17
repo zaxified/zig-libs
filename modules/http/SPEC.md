@@ -391,6 +391,19 @@ extra — the perf gap being traded away is small next to what a missed bounds c
 directly-exposed parser.
 
 ## Backlog / deferred
+
+- **HPACK encoder: fast path for a field repeated from the previous block** *(2026-10-18, qap repin A/B)* —
+  static response headers (comptime slices in rodata: `setHeaderStatic`, `security-headers` `applyStatic`,
+  `error_headers`) are the same `(name.ptr, value.ptr)` on every response of a connection, yet `Encoder.findField`
+  re-derives the index each time: `static_names` lookup, `hashName` + `hashPair` over the bytes, then `mem.eql`
+  verification. Measured in qap over h2/TLS (perf, security layer armed with 11 headers vs bare): `findField` +
+  `mem.eql` ≈ +4000 cycles/request, ~450 per header that ends up as a ONE-byte §6.1 index. Idea: remember per
+  encoder the last block's field `i` -> table seq and, when field `i` of the next block matches it and the seq is
+  still in the table (eviction check is O(1) on `seq`), emit the index without the map probes. ⚠ Pointer identity
+  alone is NOT proof for a runtime buffer (same address, new bytes): trust it only for fields the writer knows are
+  immutable (`setHeaderStatic`'s rodata -- a `static` flag on `hpack.Field`), verify anything else with one
+  `mem.eql` against the cached entry (still no hashing). Misses take today's path, so the output is
+  byte-identical (RFC 7541 vectors + h2spec stay the anchors). Measure with instruction counts (callgrind or qap's h2sat `instructions/req`), not req/s. Effort: small.
 **`interop-http` on CI: Go oracle verdicts differ from the committed vectors** — DONE 2026-10-07 (`GOTOOLCHAIN=go1.26.0` in the environment `tools/interop.zig` hands the Go oracle; h2spec v2.2.1 and the SSE venv installed by ci-environment's interop role; the CI interop lane re-took all three phases green, probe run 37556035597). Was: OPEN (2026-10-07, CI interop lane). The runner's `go` produced a different `go_oracle_vectors.zig` than the committed one, which a local go1.26.0 reproduces byte for byte — the oracle moved, not our parser. Before http leaves the lane's local-only list: pin the toolchain (`toolchain go1.26.0` in the oracle's go.mod, so `go` fetches that one), install h2spec and the oracle venv in ci-environment's interop role, then diff the verdicts once more.
 
 - **From the Go oracle (2026-10-05), judged** — each was a recorded divergence in

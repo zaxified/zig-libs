@@ -44,7 +44,9 @@
 //!   from helmet (which defaults CSP on) — deliberate, and required by this
 //!   module's spec ("CSP present only when configured"). Ready-made
 //!   postures: `csp_api` (deny-everything, for pure JSON/binary APIs) and
-//!   `csp_helmet_default` (helmet's browser-app default); the `csp` builder
+//!   `csp_helmet_default` (helmet's browser-app default); `api_options` is
+//!   the whole-set posture for an API (the defaults without the five
+//!   browser-document headers above); the `csp` builder
 //!   (`csp.build` at comptime, `csp.render` at run time) assembles and
 //!   validates a policy from typed directives and `csp.Nonce` / `applyCspNonce`
 //!   put a fresh per-response nonce into it. An optional
@@ -218,6 +220,25 @@ pub const Options = struct {
 /// rendered from these responses): nothing loads, nothing embeds it.
 pub const csp_api: []const u8 =
     "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'";
+
+/// The header posture for a pure JSON/binary API: the defaults without
+/// helmet 8.3.0's five legacy/cluster headers (`Origin-Agent-Cluster`,
+/// `X-DNS-Prefetch-Control`, `X-Download-Options`,
+/// `X-Permitted-Cross-Domain-Policies`, `X-XSS-Protection`), which act only
+/// on a document a browser renders (or on IE/Flash/Acrobat). Six headers:
+/// HSTS, nosniff, X-Frame-Options, Referrer-Policy, COOP, CORP -- the
+/// defaults as they were before helmet parity. Each dropped header costs
+/// every response bytes on the wire and, over h2, an HPACK lookup; an API pays for
+/// them and gets nothing back. CSP stays off, as in `Options{}`: add
+/// `csp_api` for a deny-everything policy. Override a field by copying:
+/// `comptime blk: { var o = api_options; o.content_security_policy = csp_api; break :blk o; }`.
+pub const api_options: Options = .{
+    .origin_agent_cluster = false,
+    .x_dns_prefetch_control = null,
+    .x_download_options = false,
+    .x_permitted_cross_domain_policies = null,
+    .x_xss_protection = false,
+};
 
 /// helmet.js 8.3.0's default browser-app policy, reproduced as configuration
 /// data (helmet is MIT; see NOTICE); byte-identical to `csp.build(.{})`. A
@@ -676,6 +697,42 @@ test "disabling: each header omittable; everything off = a bare response" {
             "\r\n" ++
             "ok", runWire(&r, wire("/t"), &buf));
     }
+}
+
+test "api_options: the six-header API posture, byte-exact on both paths" {
+    // The static set, in wire order.
+    const hs = comptime SecurityHeaders.staticHeaders(api_options);
+    const want = [_]http.Header{
+        .{ .name = "Strict-Transport-Security", .value = "max-age=31536000; includeSubDomains" },
+        .{ .name = "X-Content-Type-Options", .value = "nosniff" },
+        .{ .name = "X-Frame-Options", .value = "DENY" },
+        .{ .name = "Referrer-Policy", .value = "no-referrer" },
+        .{ .name = "Cross-Origin-Opener-Policy", .value = "same-origin" },
+        .{ .name = "Cross-Origin-Resource-Policy", .value = "same-origin" },
+    };
+    try testing.expectEqual(want.len, hs.len);
+    for (want, hs) |w, h| {
+        try testing.expectEqualStrings(w.name, h.name);
+        try testing.expectEqualStrings(w.value, h.value);
+    }
+    // The runtime middleware emits the same set and nothing else.
+    const sh: SecurityHeaders = try .init(api_options);
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(sh.middleware());
+    try r.get("/t", hOk);
+    var buf: [2048]u8 = undefined;
+    try testing.expectEqualStrings("HTTP/1.1 200 OK\r\n" ++
+        "Strict-Transport-Security: max-age=31536000; includeSubDomains\r\n" ++
+        "X-Content-Type-Options: nosniff\r\n" ++
+        "X-Frame-Options: DENY\r\n" ++
+        "Referrer-Policy: no-referrer\r\n" ++
+        "Cross-Origin-Opener-Policy: same-origin\r\n" ++
+        "Cross-Origin-Resource-Policy: same-origin\r\n" ++
+        "Connection: close\r\n" ++
+        "Content-Length: 2\r\n" ++
+        "\r\n" ++
+        "ok", runWire(&r, wire("/t"), &buf));
 }
 
 test "overriding: custom values replace the defaults" {

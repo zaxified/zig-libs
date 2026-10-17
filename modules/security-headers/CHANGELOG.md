@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — ADDED: `api_options`, the whole-set posture for a pure JSON/binary API (next to `csp_api`): `Options{}` without helmet 8.3.0's five legacy/cluster headers (`Origin-Agent-Cluster`, `X-DNS-Prefetch-Control`, `X-Download-Options`, `X-Permitted-Cross-Domain-Policies`, `X-XSS-Protection`), i.e. the six-header set of before helmet parity. The default is unchanged. Measured in qap (h1/h2 over TLS, the security layer armed): the five headers cost +2300 instructions/request on h1 (bytes sealed and copied) and +3900 on h2 (HPACK lookups) -- what an API pays for nothing.
+
 - **2026-10-17** — Browser oracle (`tools/browser_oracle.js`) sees an out-of-process iframe: with the default `Origin-Agent-Cluster: ?1` Chrome isolates the origin and the framed page left the parent's frame tree, so `relaxed` read as not framed; the oracle now asks the iframe target its own location (a refused frame is chrome-error://). Tooling only.
 
 - **2026-10-17** — Example: the `init` error switches name `InvalidHstsPreload` (the example no longer compiled). Example only.
