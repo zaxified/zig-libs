@@ -900,7 +900,13 @@ pub const ArchiveWriter = struct {
         // UT as unsigned seconds, as the reader takes it (`parseExtra`): up
         // to 2106, not 2038. Before 1970 there is no UT; the DOS fields
         // clamp to 1980.
-        const ut: ?u32 = if (options.mtime) |t| std.math.cast(u32, t) else null;
+        // zig 0.17.0 miscompile: not `std.math.cast(u32, t)` with t: i64 --
+        // it lowers to `trunc nsw`, making mtimes 2038..2106 (2^31..2^32-1)
+        // poison; narrow non-negative i64 → u64 → u32 (`trunc nuw`).
+        const ut: ?u32 = if (options.mtime) |t|
+            (if (t < 0) null else std.math.cast(u32, @as(u64, @bitCast(t))))
+        else
+            null;
         const extra_len: u16 = if (ut != null) ut_extra_len else 0;
 
         const local_header_offset = self.offset;

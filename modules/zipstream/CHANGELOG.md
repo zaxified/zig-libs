@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-19** — **Fix (Zig 0.17.0 optimized builds only):** the UT extra field's mtime (`std.math.cast(u32, i64)`) was poison for 2038..2106 (2^31..2^32-1) because zig 0.17.0 lowers that cast to `trunc nsw`. Now narrowed non-negative i64 → u64 → u32. Same output as the Debug build.
 - **2026-10-11** — **BEHAVIOURAL (fails where it delivered corrupted data):** a deflate entry whose
   stream ends inside a block at end of file aborted the process (std 0.16 `flate.Decompress` reaches
   `unreachable`); the decoder now reads exactly `compressed_size` bytes, then zeros (`PaddedInput`),

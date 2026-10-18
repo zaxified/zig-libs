@@ -155,6 +155,35 @@ pub fn parseInteger(content: []const u8) DecodeError!i64 {
     return @bitCast(acc);
 }
 
+/// Narrow a decoded INTEGER (`parseInteger`'s i64) to the unsigned type `T`,
+/// or null when it is negative or above `maxInt(T)`. Use this in place of
+/// `std.math.cast(T, v)` / `@intCast(v)` for every signed → narrower-unsigned
+/// conversion in this module.
+///
+/// zig 0.17.0 miscompile: `@intCast` from a signed integer to a NARROWER
+/// unsigned one (i64 → u32, i64 → u8, …; `std.math.cast` lowers to the same
+/// `@intCast`) is emitted as LLVM `trunc nsw` -- the no-signed-wrap flag is
+/// picked from the SOURCE signedness, where an unsigned destination needs
+/// `nuw` (0.16 emitted a plain `trunc`). `nsw` asserts the value fits the
+/// destination width as a SIGNED number, so every value in
+/// [2^(N-1), 2^N) -- e.g. 0xFFFFFFFF for u32 -- becomes poison, and LLVM then
+/// folds a following `v > maxInt(i32)` to false: USM accepted
+/// engineBoots = 0xFFFFFFFF in ReleaseSafe/ReleaseFast on amd64 and arm64.
+/// The workaround keeps the narrowing unsigned → unsigned (`trunc nuw`,
+/// correct): reinterpret the non-negative i64 as u64 first.
+///
+/// `inline` on purpose: whether LLVM exploits the poison depends on the
+/// surrounding code, and with the narrowing inlined into `usm.parse` (the
+/// original shape) the usm range tests DO fail when this body is reverted to
+/// `std.math.cast(T, v)` (measured 2026-10-19); as a separate call they did
+/// not, which would leave a regression silently latent.
+pub inline fn toUnsigned(comptime T: type, v: i64) ?T {
+    comptime std.debug.assert(@typeInfo(T).int.signedness == .unsigned);
+    if (v < 0) return null;
+    const u: u64 = @bitCast(v);
+    return std.math.cast(T, u);
+}
+
 /// Non-negative INTEGER content → u64 (Counter64 & friends: up to 9 content
 /// bytes when the leading octet is a 0x00 sign pad).
 pub fn parseUnsigned(content: []const u8) DecodeError!u64 {
@@ -664,4 +693,47 @@ test "encode into too-small buffer -> BufferTooSmall" {
     var none: [0]u8 = undefined;
     e = Encoder.init(&none);
     try testing.expectError(error.BufferTooSmall, e.prependNull(tag.null));
+}
+
+test "toUnsigned: the upper half of the destination range survives a following range compare (zig 0.17.0 trunc nsw)" {
+    // zig 0.17.0 miscompile regression: `std.math.cast(u32, @as(i64, v))`
+    // lowered to `trunc nsw`, so v in [2^31, 2^32) was poison and a following
+    // `> maxInt(i32)` folded to false in ReleaseSafe/ReleaseFast. The inputs
+    // go through a runtime-opaque slice and the result through the very
+    // compare that was folded, so this fails in any optimized mode if the
+    // narrowing ever regresses to a signed-source `@intCast` again.
+    const Row32 = struct { in: i64, out: ?u32, upper: bool };
+    var rows32 = [_]Row32{
+        .{ .in = 0, .out = 0, .upper = false },
+        .{ .in = 0x7FFF_FFFF, .out = 0x7FFF_FFFF, .upper = false },
+        .{ .in = 0x8000_0000, .out = 0x8000_0000, .upper = true },
+        .{ .in = 0xFFFF_FFFF, .out = 0xFFFF_FFFF, .upper = true },
+        .{ .in = 0x1_0000_0000, .out = null, .upper = false },
+        .{ .in = -1, .out = null, .upper = false },
+        .{ .in = std.math.minInt(i64), .out = null, .upper = false },
+        .{ .in = std.math.maxInt(i64), .out = null, .upper = false },
+    };
+    std.mem.doNotOptimizeAway(&rows32);
+    for (&rows32) |r| {
+        errdefer std.debug.print("toUnsigned(u32, {d})\n", .{r.in});
+        const got = toUnsigned(u32, r.in);
+        try testing.expectEqual(r.out, got);
+        if (got) |v| try testing.expectEqual(r.upper, v > std.math.maxInt(i32));
+    }
+
+    const Row8 = struct { in: i64, out: ?u8, upper: bool };
+    var rows8 = [_]Row8{
+        .{ .in = 127, .out = 127, .upper = false },
+        .{ .in = 128, .out = 128, .upper = true },
+        .{ .in = 255, .out = 255, .upper = true },
+        .{ .in = 256, .out = null, .upper = false },
+        .{ .in = -128, .out = null, .upper = false },
+    };
+    std.mem.doNotOptimizeAway(&rows8);
+    for (&rows8) |r| {
+        errdefer std.debug.print("toUnsigned(u8, {d})\n", .{r.in});
+        const got = toUnsigned(u8, r.in);
+        try testing.expectEqual(r.out, got);
+        if (got) |v| try testing.expectEqual(r.upper, v > std.math.maxInt(i8));
+    }
 }

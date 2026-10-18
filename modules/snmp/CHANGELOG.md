@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-19** — **Fix (security, Zig 0.17.0 optimized builds only):** `usm.parse` accepted msgAuthoritativeEngineBoots/Time above 2147483647 (e.g. `0xFFFFFFFF`, the anti-replay escape value) in ReleaseSafe/ReleaseFast. Cause is a zig 0.17.0 miscompile: `@intCast`/`std.math.cast` from a signed integer to a narrower unsigned one is emitted as LLVM `trunc nsw`, so values in the upper half of the unsigned range become poison and the range check after them was folded away. Every signed → narrower-unsigned narrowing of decoded INTEGERs now goes through the new `ber.toUnsigned` (non-negative i64 → u64 → T): `usm.parse` boots/time, `v3` msgSecurityModel, PDU error-status/error-index, GetBulk non-repeaters/max-repetitions, v1 generic-trap. Same accepted/refused values and same errors as the Debug build always had. Regression tests cover the upper-half band through a following compare.
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC statements that `std.crypto.random` is gone / std has no ambient entropy re-checked against the 0.17.0 std (still true).
 
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** `zig fmt` (0.17) rewrote `@intFromEnum`/`@enumFromInt` to `@backingInt`/`@fromBackingInt` in sources and tests; same values, same behaviour.

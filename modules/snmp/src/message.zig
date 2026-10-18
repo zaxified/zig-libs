@@ -249,11 +249,14 @@ fn parseFields(content: []const u8) DecodeError!PduFields {
 
 fn parseBasic(content: []const u8) DecodeError!BasicPdu {
     const f = try parseFields(content);
-    if (f.f1 < 0 or f.f1 > 255) return error.InvalidValue;
+    // zig 0.17.0 miscompile: signed → narrower unsigned goes through
+    // `ber.toUnsigned`, never `@intCast`/`std.math.cast` (`trunc nsw` makes
+    // 128..255 / 2^31..2^32-1 poison) -- see ber.toUnsigned.
+    const status = ber.toUnsigned(u8, f.f1) orelse return error.InvalidValue;
     return .{
         .request_id = f.request_id,
-        .error_status = @fromBackingInt(@intCast(@as(u8, @intCast(f.f1)))),
-        .error_index = std.math.cast(u32, f.f2) orelse return error.InvalidValue,
+        .error_status = @fromBackingInt(status),
+        .error_index = ber.toUnsigned(u32, f.f2) orelse return error.InvalidValue,
         .varbinds = f.varbinds,
     };
 }
@@ -270,7 +273,8 @@ fn parseBulk(content: []const u8) DecodeError!BulkPdu {
 
 fn clampToU32(v: i64) u32 {
     if (v < 0) return 0;
-    return std.math.cast(u32, v) orelse std.math.maxInt(u32);
+    // zig 0.17.0 miscompile: not std.math.cast(u32, i64) -- see ber.toUnsigned.
+    return ber.toUnsigned(u32, v) orelse std.math.maxInt(u32);
 }
 
 fn parseTrapV1(content: []const u8) DecodeError!TrapV1Pdu {
@@ -278,8 +282,9 @@ fn parseTrapV1(content: []const u8) DecodeError!TrapV1Pdu {
     const enterprise = try ber.parseOid(try d.expect(ber.tag.object_identifier));
     const addr = try d.expect(ber.tag.ip_address);
     if (addr.len != 4) return error.InvalidValue;
-    const generic = try ber.parseInteger(try d.expect(ber.tag.integer));
-    if (generic < 0 or generic > 255) return error.InvalidValue;
+    // zig 0.17.0 miscompile: not @intCast(i64 → u8) -- see ber.toUnsigned.
+    const generic = ber.toUnsigned(u8, try ber.parseInteger(try d.expect(ber.tag.integer))) orelse
+        return error.InvalidValue;
     const specific = try ber.parseInteger(try d.expect(ber.tag.integer));
     // Lenient on the time-stamp tag: RFC 1157 says TimeTicks, but plain
     // INTEGER is seen in the wild (net-snmp tolerates it too).
@@ -293,7 +298,7 @@ fn parseTrapV1(content: []const u8) DecodeError!TrapV1Pdu {
     return .{
         .enterprise = enterprise,
         .agent_addr = addr[0..4].*,
-        .generic_trap = @fromBackingInt(@intCast(@as(u8, @intCast(generic)))),
+        .generic_trap = @fromBackingInt(generic),
         .specific_trap = std.math.cast(i32, specific) orelse return error.IntegerTooLarge,
         .time_stamp = time_stamp,
         .varbinds = .{ .bytes = vbs },
@@ -596,6 +601,42 @@ test "error-status responses and v2c exception varbinds surface" {
     });
     const msg3 = try decode(custom);
     try testing.expectEqual(@as(u8, 200), @backingInt(msg3.pdu.response.error_status));
+}
+
+test "PDU integers in the upper half of their unsigned field decode exactly (zig 0.17.0 trunc nsw)" {
+    // zig 0.17.0 miscompile regression: signed → narrower-unsigned narrowing
+    // of decoded INTEGERs (`@intCast`/`std.math.cast` from i64) was lowered
+    // to `trunc nsw`, making 2^31..2^32-1 (u32) and 128..255 (u8) poison in
+    // optimized builds. Hand-built wire values sit exactly in that band and
+    // each result is pushed through a compare LLVM was free to fold.
+    const Pdu4 = struct {
+        fn build(buf: []u8, pdu_tag: u8, f1: i64, f2: i64) ![]const u8 {
+            var e = ber.Encoder.init(buf);
+            try e.prependTlv(ber.tag.sequence, ""); // empty VarBindList
+            try e.prependInteger(ber.tag.integer, f2);
+            try e.prependInteger(ber.tag.integer, f1);
+            try e.prependInteger(ber.tag.integer, 7); // request-id
+            try e.wrap(pdu_tag, 0);
+            return e.encoded();
+        }
+    };
+    var buf: [64]u8 = undefined;
+    var t: ber.Decoder = .init(try Pdu4.build(&buf, @backingInt(PduType.response), 200, 0xFFFF_FFFF));
+    const resp = (try decodePdu(try t.any())).response;
+    try testing.expectEqual(@as(u8, 200), @backingInt(resp.error_status));
+    try testing.expect(@backingInt(resp.error_status) > std.math.maxInt(i8));
+    try testing.expectEqual(@as(u32, 0xFFFF_FFFF), resp.error_index);
+    try testing.expect(resp.error_index > std.math.maxInt(i32));
+
+    t = .init(try Pdu4.build(&buf, @backingInt(PduType.get_bulk_request), 0x8000_0000, 0x1_0000_0000));
+    const bulk = (try decodePdu(try t.any())).get_bulk_request;
+    try testing.expectEqual(@as(u32, 0x8000_0000), bulk.non_repeaters);
+    try testing.expect(bulk.non_repeaters > std.math.maxInt(i32));
+    try testing.expectEqual(@as(u32, std.math.maxInt(u32)), bulk.max_repetitions); // clamped
+
+    // A response error-status of 256 is out of the u8 field, not wrapped.
+    t = .init(try Pdu4.build(&buf, @backingInt(PduType.response), 256, 0));
+    try testing.expectError(error.InvalidValue, decodePdu(try t.any()));
 }
 
 test "set request round-trips typed values" {

@@ -1326,7 +1326,10 @@ fn solveNtruIntermediate(comptime logn_top: u5, f: []const i8, g: []const i8, de
         }
 
         const sch: u32 = @intCast(@divTrunc(scale_k, 31));
-        const scl: u5 = @intCast(@rem(scale_k, 31));
+        // zig 0.17.0 miscompile: `@intCast(i32 → u5)` lowers to `trunc nsw`,
+        // which makes 16..30 poison (nsw admits only -16..15); go through the
+        // same-width u32 so the narrowing is unsigned → unsigned (`trunc nuw`).
+        const scl: u5 = @intCast(@as(u32, @intCast(@rem(scale_k, 31))));
         if (depth <= DEPTH_INT_FG) {
             polySubScaledNtt(tmp[0..], FGlen, llen, tmp[ft_off..], slen, slen, k[0..n], sch, scl, logn, tmp[t1_off..], primes);
             polySubScaledNtt(tmp[gt_glob_off..], FGlen, llen, tmp[gt_off..], slen, slen, k[0..n], sch, scl, logn, tmp[t1_off..], primes);

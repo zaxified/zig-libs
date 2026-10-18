@@ -174,7 +174,14 @@ fn optionalString(obj: std.json.ObjectMap, name: []const u8) error{InvalidHeader
 fn optionalUint(obj: std.json.ObjectMap, name: []const u8) error{InvalidHeaderField}!?u32 {
     const v = obj.get(name) orelse return null;
     return switch (v) {
-        .integer => |i| std.math.cast(u32, i) orelse error.InvalidHeaderField,
+        // zig 0.17.0 miscompile: `std.math.cast(u32, i64)` lowers to `trunc
+        // nsw`, so 2^31..2^32-1 (p2c up to the u32 ceiling) would be poison
+        // and a consumer's iteration bound could fold away; narrow
+        // non-negative i64 → u64 → u32 instead (`trunc nuw`, correct).
+        .integer => |i| if (i < 0)
+            error.InvalidHeaderField
+        else
+            std.math.cast(u32, @as(u64, @bitCast(i))) orelse error.InvalidHeaderField,
         else => error.InvalidHeaderField,
     };
 }

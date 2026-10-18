@@ -434,7 +434,11 @@ fn valueOf(io: std.Io, started: std.Io.Clock.Timestamp, e: MibEntry) snmp.Value 
     // TimeTicks is hundredths of a second since the entity was initialised.
     const ns = started.untilNow(io).raw.nanoseconds;
     const hundredths = @divTrunc(ns, 10_000_000);
-    return .{ .time_ticks = @intCast(@mod(hundredths, std.math.maxInt(u32))) };
+    // zig 0.17.0 miscompile: a signed (i96) → u32 `@intCast` lowers to `trunc
+    // nsw` (poison for 2^31..2^32-1, i.e. after ~248 days of uptime); go
+    // through the same-width-or-wider unsigned u96 first (`trunc nuw`).
+    const ticks: u96 = @intCast(@mod(hundredths, std.math.maxInt(u32)));
+    return .{ .time_ticks = @intCast(ticks) };
 }
 
 /// Exact-instance read: an absent instance is `noSuchInstance`, not an error —

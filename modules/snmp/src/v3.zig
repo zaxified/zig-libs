@@ -194,7 +194,8 @@ fn decodeHeader(content: []const u8) DecodeError!HeaderData {
         .msg_id = std.math.cast(i32, msg_id) orelse return error.IntegerTooLarge,
         .msg_max_size = std.math.cast(i32, max_size) orelse return error.IntegerTooLarge,
         .flags = MsgFlags.fromByte(flags_os[0]),
-        .security_model = std.math.cast(u32, security_model) orelse return error.IntegerTooLarge,
+        // zig 0.17.0 miscompile: not std.math.cast(u32, i64) -- see ber.toUnsigned.
+        .security_model = ber.toUnsigned(u32, security_model) orelse return error.IntegerTooLarge,
     };
 }
 
@@ -746,7 +747,9 @@ test "RFC 3411: a message naming a security model other than USM is refused" {
     // 2 = SNMPv2c, 3 = USM). Written as a literal here so this pins the
     // value and not the symbol.
     try testing.expectEqual(@as(u32, 3), security_model_usm);
-    for ([_]u32{ 0, 1, 2, 4, 256 }) |model| {
+    // 0x80000003 / 0xFFFFFFFF: the upper u32 half, which zig 0.17.0's
+    // signed-source `trunc nsw` made poison (see ber.toUnsigned).
+    for ([_]u32{ 0, 1, 2, 4, 256, 0x8000_0003, 0xFFFF_FFFF }) |model| {
         errdefer std.debug.print("security model {d}\n", .{model});
         var b: [256]u8 = undefined;
         var p = params;

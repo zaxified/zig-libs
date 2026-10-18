@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-19** — **Fix (Zig 0.17.0 optimized builds only):** a JSON-integer header field (`p2c`) in 2147483648..4294967295 was narrowed with `std.math.cast(u32, i64)`, which zig 0.17.0 lowers to `trunc nsw` (poison for the upper half of u32), so a consumer's iteration bound on it could be folded away. Now narrowed non-negative i64 → u64 → u32. Same accepted values as before.
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC statements that `std.crypto.random` is gone / std has no ambient entropy re-checked against the 0.17.0 std (still true).
 
 - **2026-10-18** — Ported to Zig 0.17.0. `X25519.recoverPublicKey` no longer returns an error (ecdhes.zig `generateEphemeral`: the resample-on-error `catch continue` is gone); test reflection on `Entropy` uses `field_names`.
