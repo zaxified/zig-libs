@@ -40,8 +40,8 @@ const Target = enum { wif };
 const Taint = enum { yes, no };
 
 fn parseTarget(s: []const u8) !Target {
-    inline for (@typeInfo(Target).@"enum".fields) |f| {
-        if (std.mem.eql(u8, s, f.name)) return @field(Target, f.name);
+    inline for (@typeInfo(Target).@"enum".field_names) |name| {
+        if (std.mem.eql(u8, s, name)) return @field(Target, name);
     }
     return error.UnknownTarget;
 }
