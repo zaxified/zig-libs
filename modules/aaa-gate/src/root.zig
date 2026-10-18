@@ -3789,6 +3789,154 @@ test "corpus: every cookie seed reaches the extractor and the found/absent split
     }
 }
 
+// ── audit 2026-10-18: tests asked for by mutation survivors ──────────────────
+
+test "basicFingerprint: the user/password boundary is part of the digest" {
+    // Without the ':' separator ("a","bc") and ("ab","c") hash the same bytes.
+    var g = try Gate.init(testing.allocator, .{ .auth_mode = .basic, .basic_users = &.{.{ .user = "a", .password = "bc" }} });
+    defer g.deinit();
+    try testing.expectEqual(Gate.Verdict.ok_basic, g.verifyBasic(.{ .user = "a", .password = "bc" }));
+    try testing.expectEqual(Gate.Verdict.denied, g.verifyBasic(.{ .user = "ab", .password = "c" }));
+    try testing.expect(!std.mem.eql(u8, &basicFingerprint("a", "bc"), &basicFingerprint("ab", "c")));
+}
+
+test "challenge: the exact WWW-Authenticate value for every mode, with and without a realm" {
+    const Case = struct { mode: AuthMode, realm: ?[]const u8, want: []const u8 };
+    const cases = [_]Case{
+        .{ .mode = .bearer, .realm = null, .want = "Bearer" },
+        .{ .mode = .bearer, .realm = "r", .want = "Bearer realm=\"r\"" },
+        .{ .mode = .api_key, .realm = "r", .want = "Bearer realm=\"r\"" },
+        .{ .mode = .either, .realm = null, .want = "Bearer" },
+        .{ .mode = .basic, .realm = null, .want = "Basic realm=\"Restricted\"" },
+        .{ .mode = .basic, .realm = "r", .want = "Basic realm=\"r\"" },
+        .{ .mode = .any, .realm = null, .want = "Bearer, Basic realm=\"Restricted\"" },
+        .{ .mode = .any, .realm = "r", .want = "Bearer realm=\"r\", Basic realm=\"r\"" },
+    };
+    for (cases) |c| {
+        var g = try Gate.init(testing.allocator, .{ .auth_mode = c.mode, .realm = c.realm });
+        defer g.deinit();
+        try testing.expectEqualStrings(c.want, g.challenge);
+    }
+}
+
+test "bearerTokenOf: a TAB around the whole value is trimmed like a space" {
+    try testing.expectEqualStrings("x", bearerTokenOf("\tBearer x\t").?);
+    try testing.expectEqualStrings("x", bearerTokenOf(" \t Bearer \t x \t ").?);
+    var out: [32]u8 = undefined;
+    const c = basicCredentialsOf("\tBasic \tYWxpY2U6czNjcmV0\t", &out).?;
+    try testing.expectEqualStrings("alice", c.user);
+}
+
+test "key sources: blanks around the value and after the prefix are trimmed" {
+    var g = try Gate.init(testing.allocator, .{
+        .auth_mode = .api_key,
+        .api_key = "sekret",
+        .api_key_sources = &.{
+            .{ .kind = .header, .name = "Authorization", .prefix = "Token " },
+            .{ .kind = .header, .name = "X-Api-Key" },
+        },
+    });
+    defer g.deinit();
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(g.middleware());
+    try r.get("/t", hHello);
+    var buf: [1024]u8 = undefined;
+    // two blanks after the prefix: the second one is not part of the key
+    try expectStatus(runWire(&r, wire("GET", "/t", "Authorization: Token  \t sekret\r\n"), &buf), "200");
+    try expectStatus(runWire(&r, wire("GET", "/t", "X-Api-Key: \t sekret \t\r\n"), &buf), "200");
+    // a prefix and nothing after it is an absent key, not a wrong one: the next source decides
+    try expectStatus(runWire(&r, wire("GET", "/t", "Authorization: Token \r\nX-Api-Key: sekret\r\n"), &buf), "200");
+    try expectStatus(runWire(&r, wire("GET", "/t", "Authorization: Token\r\nX-Api-Key: sekret\r\n"), &buf), "200");
+}
+
+test "clientKeyFrom: a blank X-Real-IP (or XFF) falls through to the socket peer" {
+    var buf: [client_key_len_max]u8 = undefined;
+    const peer = std.Io.net.IpAddress.parseIp4("192.0.2.9", 1) catch unreachable;
+    try testing.expectEqualStrings("192.0.2.9", clientKeyFrom(null, "  \t", peer, &buf));
+    try testing.expectEqualStrings("192.0.2.9", clientKeyFrom(" , ", "", peer, &buf));
+    try testing.expectEqualStrings("198.51.100.2", clientKeyFrom(null, "\t198.51.100.2", peer, &buf));
+}
+
+test "formatPeerKey: IPv6 keys are full zero-padded groups; only ::ffff:a.b.c.d is unmapped" {
+    var buf: [client_key_len_max]u8 = undefined;
+    const ip = std.Io.net.IpAddress;
+    try testing.expectEqualStrings("2001:0db8:0000:0000:0000:0000:0000:0001", formatPeerKey(ip.parseIp6("2001:db8::1", 1) catch unreachable, &buf));
+    try testing.expectEqualStrings("192.0.2.9", formatPeerKey(ip.parseIp6("::ffff:192.0.2.9", 1) catch unreachable, &buf));
+    // bytes 10..11 = ff 00: not the mapped prefix
+    try testing.expectEqualStrings("0000:0000:0000:0000:0000:ff00:0102:0304", formatPeerKey(ip.parseIp6("::ff00:102:304", 1) catch unreachable, &buf));
+    // a non-zero byte just below the mapped marker (index 9)
+    try testing.expectEqualStrings("0000:0000:0000:0000:0001:ffff:0102:0304", formatPeerKey(ip.parseIp6("0:0:0:0:1:ffff:102:304", 1) catch unreachable, &buf));
+}
+
+test "authorize: in .any / .either one configured scheme keeps the plane closed, whichever it is" {
+    var r_buf: [1024]u8 = undefined;
+    const Case = struct { mode: AuthMode, token: ?[]const u8 = null, key: ?[]const u8 = null, basic: bool = false, hdr: []const u8 };
+    inline for (.{
+        Case{ .mode = .any, .token = "tok", .hdr = "Authorization: Bearer tok\r\n" },
+        Case{ .mode = .any, .key = "key", .hdr = "X-Api-Key: key\r\n" },
+        Case{ .mode = .any, .basic = true, .hdr = "Authorization: Basic YWxpY2U6czNjcmV0\r\n" },
+        Case{ .mode = .either, .key = "key", .hdr = "X-Api-Key: key\r\n" },
+        Case{ .mode = .either, .token = "tok", .hdr = "Authorization: Bearer tok\r\n" },
+    }) |c| {
+        var g = try Gate.init(testing.allocator, .{
+            .auth_mode = c.mode,
+            .token = c.token,
+            .api_key = c.key,
+            .basic_users = @as([]const BasicUser, if (c.basic) &.{.{ .user = "alice", .password = "s3cret" }} else &.{}),
+            .allow_when_unconfigured = true,
+        });
+        defer g.deinit();
+        var r = router.Router.init(testing.allocator);
+        defer r.deinit();
+        try r.use(g.middleware());
+        try r.get("/t", hHello);
+        try expectStatus(runWire(&r, wire("GET", "/t", ""), &r_buf), "401");
+        try expectStatus(runWire(&r, wire("GET", "/t", c.hdr), &r_buf), "200");
+    }
+}
+
+fn hFlushThenBoom(ctx: *router.Ctx) anyerror!void {
+    ctx.res.setStatus(201);
+    try ctx.res.writeAll("partial");
+    try ctx.res.flush();
+    return error.Boom;
+}
+
+test "audit: a handler error AFTER the head went out is audited with the status that was sent" {
+    var sink: Sink = .{};
+    var g = try Gate.init(testing.allocator, .{ .token = "s3cr3t", .on_audit = Sink.hook, .on_audit_ctx = &sink });
+    defer g.deinit();
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(g.middleware());
+    try r.post("/late", hFlushThenBoom);
+    var buf: [1024]u8 = undefined;
+    try expectStatus(runWire(&r, wire("POST", "/late", "Authorization: Bearer s3cr3t\r\n"), &buf), "201");
+    try testing.expectEqual(@as(usize, 1), sink.len);
+    try testing.expectEqual(@as(u16, 201), sink.recs[0].status);
+}
+
+fn outerSeesNoIdentity(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerror!void {
+    const flag: *bool = @ptrCast(@alignCast(state.?));
+    try next.run(ctx);
+    flag.* = identityOf(ctx) == null;
+}
+
+test "middleware: ctx.data is restored when the gate returns (an outer middleware sees no identity)" {
+    var g = try Gate.init(testing.allocator, .{ .token = "s3cr3t" });
+    defer g.deinit();
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    var seen_none = false;
+    try r.use(.{ .state = &seen_none, .run = outerSeesNoIdentity });
+    try r.use(g.middleware());
+    try r.get("/t", hHello);
+    var buf: [1024]u8 = undefined;
+    try expectStatus(runWire(&r, wire("GET", "/t", "Authorization: Bearer s3cr3t\r\n"), &buf), "200");
+    try testing.expect(seen_none);
+}
+
 test {
     _ = @import("model_test.zig");
 }
