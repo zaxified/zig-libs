@@ -431,7 +431,7 @@ montint	ReleaseFast	ffcontrol	1	>=1	NO-OWN-SRC	e5fa1af501069bfb
 # against a secret EVEN value, both widths, operands coprime to the modulus so
 # the success path runs (results = Python pow(x, -1, m)); still 2 in-file —
 # the divsteps and the Hensel step add no context, their verdicts are witness.
-montint	ReleaseFast	dyn	1	2	5a812612855b234e	880a04f6d911e62c
+montint	ReleaseFast	dyn	1	2	7e01d1d40c260b18	880a04f6d911e62c
 # 2026-10-13: p256 `rejectIdentity` launders its verdict (one `je`, was two) -> every row whose count included the p256 comb/windowed identity check drops by 1 (--stacks diff vs the base: the second jump of `rejectIdentity` gone, no other context moved).
 # 2026-10-14: p256 point formulas as generated asm (point_asm.zig; pattern gains it). Counts unchanged (comb 1 = rejectIdentity group.zig:690 per --stacks, sign <=12); comb output re-pinned because the harness prints raw projective coordinates and the CT mixed addition is now madd-2004-hmv (another representative of the same point; sign pk+sig digest unchanged). ctap2 digests re-pinned too: stale since 9fc3c70d (root.zig fuzz test only), counts 0/0.
 p256	ReleaseFast	comb	1	1	a586a888406f5725	e3c458c38b8cf4a8
@@ -448,8 +448,8 @@ p256	ReleaseFast	sign	1	<=12	59ec791d711e5e93	af4baed5c5134f3f
 # 2026-10-14: crt 2 -> 1: the doubled FaultDetected verdict context is gone
 # (privateOpCrtPtr restructured for CRT-domain blinding); the 1 left is the
 # F3 verdict, root.zig:985 (--stacks).
-rsa	ReleaseFast	crt	1	1	074404865842bf6f	d4057b00f9df7b56
-rsa	ReleaseFast	noncrt	1	0	074404865842bf6f	d4057b00f9df7b56
+rsa	ReleaseFast	crt	1	1	a9c6efd266f3c82b	d4057b00f9df7b56
+rsa	ReleaseFast	noncrt	1	0	a9c6efd266f3c82b	d4057b00f9df7b56
 # rsa keygen (2026-10-03) — SecretKey.fromPrimes on the 2048-bit KAT, p and q
 # tainted. λ = montint.nt.lcm, d/dP/dQ = inverseOfModulus (even moduli), qInv by
 # Fermat on montint: 0 contexts in nt.zig and in the inversion/ladder code. Left,
@@ -461,7 +461,7 @@ rsa	ReleaseFast	noncrt	1	0	074404865842bf6f	d4057b00f9df7b56
 # stripLeadingZeros on p, q (2, their length); fromLimbsBits/build of p_mont,
 # q_mont (length verdicts); the verdicts p == q, gcd(e, λ) = 1, d/dP/dQ ≠ 0 and
 # the qInv self-check.
-rsa	ReleaseFast	keygen	1	<=173	074404865842bf6f	2cb28867b78d48a6
+rsa	ReleaseFast	keygen	1	<=173	a9c6efd266f3c82b	2cb28867b78d48a6
 slhdsa	ReleaseFast	seed	1	4	26bc77070b29ba18	e0fdde7f5c62a2d6
 slhdsa	ReleaseFast	prf	1	8	26bc77070b29ba18	e0fdde7f5c62a2d6
 falcon	ReleaseFast	sign	1	<=133	ced123e2ab52d8b3	3f5a6dbb61a76d9d
@@ -772,7 +772,14 @@ paillier	ReleaseFast	addm	1	0	e0a597df13aa8f65	526f0de009c0cbfb
 # derives the bit length from the secret factor (the class "public n tainted by
 # derivation" above); +2 are nt.divExact's new `q·b = a` verdict, which every
 # valid key passes. No context reads a limb value.
-paillier	ReleaseFast	keygen	1	<=314	e0a597df13aa8f65	61a35e2d95a376cf
+# paillier keygen 314 -> 317 (2026-10-18, montint key-size slot list): read as a --stacks diff
+# against the base, line numbers normalised: every moved context is the Miller-Rabin witness's
+# digit reader (`ByteDigits.at`, `horner`'s loop bounds, `pos < be.len`) and its ChaCha draw,
+# now inlined into `isProbablePrime` as TWO code copies where there was one (15 -> 30 and
+# 8 -> 16 contexts of the same lines) — the same class as the 2026-10-06 note above, positions
+# and lengths only. `slotFor` was made branchless first (an early-return chain over the new slot
+# list had added 16 here and 4 to threshold_ecdsa auxgen).
+paillier	ReleaseFast	keygen	1	<=317	e0a597df13aa8f65	61a35e2d95a376cf
 # tlock/ibe re-pinned 2026-09-16, after 32e751ad (inversion-free Miller loop):
 # tlock fp12pow 8 -> 2, tlock decrypt 11 -> 3, ibe decrypt 14 -> 7. The counts
 # FELL because the Miller loop stopped inverting -- 32e751ad dropped
@@ -1483,19 +1490,24 @@ tlsresume	ReleaseFast	early	1	0	958e96d1ea73a044	042b8c43588c7881
 # differs for the letters of the END line (E, N, D, C, P, R, I, V, A, T, K, Y occur in base64), so
 # the forward search over the key body was a secret-dependent table index and loop count (the
 # loop-count branch, mem.zig:1555, showed on the P-384 key). pemDecodeSecret now finds the END
-# line from the text's end (lastIndexOf: reads only the END line and what follows). rsa's
-# pemDecodeBody had the same search and got the same fix. pem 18 -> 17.
+# line as the first '-' after the body (std.mem.indexOfScalarPos: a vector compare, no table;
+# base64 has no '-', so the compare is false on every key character and the scan stops at the
+# body's public length) and checks the END line starts there. That scan is ONE context per key
+# read (mem.zig:1298 findScalarPos, its early-exit branch on the compare mask), whose outcome is
+# public by the alphabet. rsa's pemDecodeBody had the same search and got the same fix (a first
+# lastIndexOf version refused two same-label blocks: rsa mutation run 2026-10-18). pem 18 -> 18
+# (findPos out, findScalarPos in).
 # New targets (2026-10-18; SPEC had 'the P-384 and PKCS#8 paths have no harness target yet'):
-# pem384 17 = the SEC1 P-384 round trip; the same construct classes as pem (readElem tag/length
+# pem384 18 = the SEC1 P-384 round trip (+1 the findScalarPos above); the same construct classes as pem (readElem tag/length
 # decisions on the elements whose bytes share base64 characters with key bits, keyFromDer's
 # priv.end < seq.end / [0] tag / raw.len checks, the curve OID compare, fillPair's memcpy sized by
 # the public 48-octet length) minus p256's comb (p384 recomputes the public point with no flagged
-# context). Writer side 0. pkcs8 15 = PKCS#8 round trips of the P-256 key (2: keyFromDer's [0]
+# context). Writer side 0. pkcs8 17 (2 of them the findScalarPos above, one per read) = PKCS#8 round trips of the P-256 key (2: keyFromDer's [0]
 # test on the inner ECPrivateKey, p256 comb) and of the P-384 key (13: the pem384 classes); the
 # writer side 0. Read in the --stacks dump of the day; nothing in jws/burn, nothing new in kind.
-acme	ReleaseFast	pem	1	17	d1d4c8a3a945e4a7	e3f3e71bec825dd7
-acme	ReleaseFast	pem384	1	17	d1d4c8a3a945e4a7	5eb84a3bc4959381
-acme	ReleaseFast	pkcs8	1	15	d1d4c8a3a945e4a7	b26448f1c577ca4e
+acme	ReleaseFast	pem	1	18	7be747ba59558923	e3f3e71bec825dd7
+acme	ReleaseFast	pem384	1	18	7be747ba59558923	5eb84a3bc4959381
+acme	ReleaseFast	pkcs8	1	17	7be747ba59558923	b26448f1c577ca4e
 # jwt (2026-10-13) — every secret the module holds: HMAC secrets (HS256/384/512,
 # sign and verify), ES256 (p256 module), ES384 (std), ES512 (p521 module), EdDSA
 # (std Ed25519; only the 32-byte seed is tainted) and RSA (RS256 + PS256 through
@@ -1542,6 +1554,6 @@ jwt	ReleaseFast	rsa	1	3	09a37a7fa79b4936	f2bee89c3c58cdaf
 # (`containsFp`, timing_safe.eql folded without early exit) adds none. No
 # witness: the verdict leaves the module as a constant enum chosen by that one
 # branch, so total = in-file.
-aaa-gate	ReleaseFast	bearer	2	2	9141e031e3db1d7d	b0e8295638441324
-aaa-gate	ReleaseFast	api_key	2	2	9141e031e3db1d7d	964c6a19647f3cd3
-aaa-gate	ReleaseFast	basic	2	2	9141e031e3db1d7d	3e1202ab86ba6261
+aaa-gate	ReleaseFast	bearer	2	2	0562ac89385bbaec	b0e8295638441324
+aaa-gate	ReleaseFast	api_key	2	2	0562ac89385bbaec	964c6a19647f3cd3
+aaa-gate	ReleaseFast	basic	2	2	0562ac89385bbaec	3e1202ab86ba6261

@@ -861,16 +861,14 @@ fn pemDecodeSecret(label: []const u8, text: []const u8, out: []u8) PemDecodeErro
 
     const bi = std.mem.indexOf(u8, text, begin) orelse return error.MissingPemBlock;
     const body_start = bi + begin.len;
-    // The END line is searched from the text's end, not forward from the
-    // body: std's search is Boyer-Moore-Horspool, whose skip table is
-    // indexed by the haystack byte and whose skip length differs for the
-    // letters of the END line — forward, both run over the key's base64
-    // (ctgrind 2026-10-18, mem.zig findPos). Backward it stops at the END
-    // line, reading only it and what follows (public: a chain, whitespace).
-    // One key block per text: a second one would land in `body` and fail
-    // the decoder.
-    const ei = std.mem.lastIndexOf(u8, text, end) orelse return error.InvalidPem;
-    if (ei < body_start) return error.InvalidPem;
+    // The END line starts at the first '-' after the body: base64 has none,
+    // so this scan's compare is false on every key character and it stops at
+    // the body's (public) length. Not std.mem.indexOfPos: Boyer-Moore-Horspool
+    // indexes its skip table by, and skips by an amount that depends on, the
+    // key's base64 characters (ctgrind 2026-10-18, mem.zig findPos). The
+    // first block of the label is used.
+    const ei = std.mem.indexOfScalarPos(u8, text, body_start, '-') orelse return error.InvalidPem;
+    if (!std.mem.startsWith(u8, text[ei..], end)) return error.InvalidPem;
     const body = text[body_start..ei];
 
     const der_bytes = b64ct.decodeIgnoring(out, body, @import("b64ct").pem_whitespace) catch {
@@ -1985,11 +1983,12 @@ test "parseCsr: a critical SAN extension is read, and only dNSName entries are r
     try testing.expectEqualStrings("example.org", p2.sans[0]);
 }
 
-test "EC private key PEM: found among other blocks; the END line is searched from the end" {
-    // pemDecodeSecret searches the END line backward (2026-10-18: forward,
-    // std's Boyer-Moore-Horspool ran over the key's base64). A key between
-    // certificate blocks — the Manager stores key, then chain — still loads;
-    // a second key block lands in the body and is refused, never half-read.
+test "EC private key PEM: found among other blocks; the first key block is used" {
+    // pemDecodeSecret finds the END line by the first '-' after the body
+    // (2026-10-18: std's Boyer-Moore-Horspool ran over the key's base64). A
+    // key between certificate blocks — the Manager stores key, then chain —
+    // loads; of two key blocks the first is used; a '-' in the body that does
+    // not start the END line is refused.
     const kp = testKeyPair(46);
     const key_pem = try ecPrivateKeyToPem(testing.allocator, kp);
     defer testing.allocator.free(key_pem);
@@ -2000,9 +1999,17 @@ test "EC private key PEM: found among other blocks; the END line is searched fro
     defer std.crypto.secureZero(u8, std.mem.asBytes(&back));
     try ecPrivateKeyFromPem(&back, testing.allocator, text);
     try testing.expectEqualSlices(u8, &kp.secret_key.toBytes(), &back.secret_key.toBytes());
-    const two = try std.mem.concat(testing.allocator, u8, &.{ key_pem, key_pem });
+    const other = try ecPrivateKeyToPem(testing.allocator, testKeyPair(47));
+    defer testing.allocator.free(other);
+    const two = try std.mem.concat(testing.allocator, u8, &.{ key_pem, other });
     defer testing.allocator.free(two);
-    try testing.expectError(error.InvalidPem, ecPrivateKeyFromPem(&back, testing.allocator, two));
+    try ecPrivateKeyFromPem(&back, testing.allocator, two);
+    try testing.expectEqualSlices(u8, &kp.secret_key.toBytes(), &back.secret_key.toBytes());
+    try testing.expectError(error.InvalidPem, ecPrivateKeyFromPem(
+        &back,
+        testing.allocator,
+        "-----BEGIN EC PRIVATE KEY-----\nMAA-=\n-----END EC PRIVATE KEY-----\n",
+    ));
     // The END line before the BEGIN line is no block.
     try testing.expectError(error.InvalidPem, ecPrivateKeyFromPem(
         &back,
@@ -2555,6 +2562,61 @@ const test_rsa1024_pkcs1_pem =
     \\-----END RSA PRIVATE KEY-----
     \\
 ;
+// openssl genrsa -traditional -out k4096.pkcs1.pem 4096  (exactly `jws.rsa_max_bits`; throwaway test key)
+const test_rsa4096_pkcs1_pem =
+    \\-----BEGIN RSA PRIVATE KEY-----
+    \\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
+    \\-----END RSA PRIVATE KEY-----
+    \\
+;
 // The CSR openssl builds for that key over the same two names:
 //   openssl req -new -key k.pkcs8.pem -subj "/" -sha256 \
 //     -addext "subjectAltName=DNS:example.com,DNS:www.example.com" -out csr.pem
@@ -2712,6 +2774,19 @@ test "RSA key PEM: openssl's PKCS#1 and PKCS#8 load; ours is byte-identical to o
     try testing.expectError(error.MissingPemBlock, privateKeyFromPem(&ec, testing.allocator, test_rsa_pkcs1_pem));
 }
 
+test "RSA key PEM: the 4096-bit ceiling is inclusive; with both labels present the first block wins" {
+    var kp: rsa.KeyPair = undefined;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&kp));
+    try rsaPrivateKeyFromPem(&kp, test_rsa4096_pkcs1_pem);
+    try testing.expectEqual(@as(usize, jws.rsa_max_bits), kp.public_key.bits());
+
+    // PKCS#1 before PKCS#8 and the other way round: the earlier block is
+    // read. The 1024-bit key is the marker (refused), the 2048-bit one good.
+    try testing.expectError(error.MalformedKey, rsaPrivateKeyFromPem(&kp, test_rsa1024_pkcs1_pem ++ test_rsa_pkcs8_pem));
+    try rsaPrivateKeyFromPem(&kp, test_rsa_pkcs8_pem ++ test_rsa1024_pkcs1_pem);
+    try testing.expectEqual(@as(usize, 2048), kp.public_key.bits());
+}
+
 test "TLS-ALPN-01 certificate: an RSA pair is refused (the validation key is EC)" {
     const kp = try testRsaPair();
     const any: jws.AnyKeyPair = .{ .rs256 = kp };
@@ -2748,4 +2823,90 @@ test "IP SANs (RFC 8738): csrDer writes openssl's GeneralNames; both CSRs parse 
     const at = std.mem.indexOf(u8, &bad, "\x87\x04").?;
     bad[at + 1] = 5;
     try testing.expectError(error.MalformedCsr, parseCsrAny(testing.allocator, &bad));
+}
+
+// ── audit 2026-10-18: tests asked for by mutation survivors ─────────────────
+
+test "isValidDomain: upper-case letters are hostname characters" {
+    try testing.expect(isValidDomain("ZZ.Example"));
+    try testing.expect(isValidDomain("Zed"));
+}
+
+test "pemDecode: an END line before the BEGIN line is not the end of the block" {
+    const gpa = testing.allocator;
+    const pem = try pemEncode(gpa, "CERTIFICATE", "abc-der");
+    defer gpa.free(pem);
+    const text = try std.fmt.allocPrint(gpa, "-----END CERTIFICATE-----\n{s}", .{pem});
+    defer gpa.free(text);
+    const der_bytes = try pemDecode(gpa, "CERTIFICATE", text);
+    defer gpa.free(der_bytes);
+    try testing.expectEqualStrings("abc-der", der_bytes);
+}
+
+test "EC private key PEM: an empty block body is InvalidPem" {
+    var kp: Es256.KeyPair = undefined;
+    try testing.expectError(error.InvalidPem, ecPrivateKeyFromPem(&kp, testing.allocator, "-----BEGIN EC PRIVATE KEY-----\n-----END EC PRIVATE KEY-----\n"));
+}
+
+test "PKCS#8 PEM: a version other than 0 or 1, or another key algorithm, is MalformedKey" {
+    const gpa = testing.allocator;
+    const pem = try pkcs8PrivateKeyToPem(gpa, testKeyPair(7));
+    defer gpa.free(pem);
+    const good = try pemDecode(gpa, "PRIVATE KEY", pem);
+    defer gpa.free(good);
+    var out: Es256.KeyPair = undefined;
+    try pkcs8PrivateKeyFromPem(&out, gpa, pem);
+
+    const off: usize = if (good[1] == 0x81) 3 else if (good[1] == 0x82) 4 else 2; // after SEQUENCE's header
+    try testing.expectEqual(@as(u8, 0x02), good[off]);
+    try testing.expectEqual(@as(u8, 0x00), good[off + 2]);
+    const bad_version = try gpa.dupe(u8, good);
+    defer gpa.free(bad_version);
+    bad_version[off + 2] = 2;
+    const bad_version_pem = try pemEncode(gpa, "PRIVATE KEY", bad_version);
+    defer gpa.free(bad_version_pem);
+    try testing.expectError(error.MalformedKey, pkcs8PrivateKeyFromPem(&out, gpa, bad_version_pem));
+
+    const bad_alg = try gpa.dupe(u8, good);
+    defer gpa.free(bad_alg);
+    const at = std.mem.indexOf(u8, bad_alg, oid_ec_public_key).?;
+    bad_alg[at + oid_ec_public_key.len - 1] ^= 1;
+    const bad_alg_pem = try pemEncode(gpa, "PRIVATE KEY", bad_alg);
+    defer gpa.free(bad_alg_pem);
+    try testing.expectError(error.MalformedKey, pkcs8PrivateKeyFromPem(&out, gpa, bad_alg_pem));
+}
+
+test "EC private key PEM: a bare ECPrivateKey with only version and scalar loads into a typed pair" {
+    const gpa = testing.allocator;
+    const der_bytes = [_]u8{ 0x30, 0x25, 0x02, 0x01, 0x01, 0x04, 0x20 } ++ [_]u8{0x01} ** 32;
+    const pem = try pemEncode(gpa, "EC PRIVATE KEY", &der_bytes);
+    defer gpa.free(pem);
+    var out: Es256.KeyPair = undefined;
+    try ecPrivateKeyFromPem(&out, gpa, pem);
+    try testing.expectEqualSlices(u8, &([_]u8{0x01} ** 32), &out.secret_key.toBytes());
+}
+
+test "EC private key PEM: a dash inside the body is not the END line" {
+    var kp: Es256.KeyPair = undefined;
+    try testing.expectError(error.InvalidPem, ecPrivateKeyFromPem(&kp, testing.allocator, "-----BEGIN EC PRIVATE KEY-----\nAAAA-XYZ\n-----END EC PRIVATE KEY-----\n"));
+}
+
+test "pemBlockCount counts every block; PKCS#8 version 1 is accepted" {
+    const gpa = testing.allocator;
+    const pem = try pkcs8PrivateKeyToPem(gpa, testKeyPair(7));
+    defer gpa.free(pem);
+    const two = try std.fmt.allocPrint(gpa, "{s}{s}", .{ pem, pem });
+    defer gpa.free(two);
+    try testing.expectEqual(@as(usize, 2), try pemBlockCount("PRIVATE KEY", two));
+
+    const good = try pemDecode(gpa, "PRIVATE KEY", pem);
+    defer gpa.free(good);
+    const off: usize = if (good[1] == 0x81) 3 else if (good[1] == 0x82) 4 else 2;
+    const v1 = try gpa.dupe(u8, good);
+    defer gpa.free(v1);
+    v1[off + 2] = 1; // RFC 5958 version 2 (v2) writes 1
+    const v1_pem = try pemEncode(gpa, "PRIVATE KEY", v1);
+    defer gpa.free(v1_pem);
+    var out: Es256.KeyPair = undefined;
+    try pkcs8PrivateKeyFromPem(&out, gpa, v1_pem);
 }

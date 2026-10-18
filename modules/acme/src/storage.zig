@@ -495,6 +495,32 @@ test "validKey: segments, characters, traversal" {
     try testing.expect(!validKey("x" ** (max_key_len + 1)));
 }
 
+// ── audit 2026-10-18: tests asked for by mutation survivors ─────────────────
+
+test "validKey: the length limit is inclusive; '@' and '+' are key characters" {
+    try testing.expect(validKey("x" ** max_key_len));
+    try testing.expect(!validKey("x" ** (max_key_len + 1)));
+    try testing.expect(validKey("a@b+c/d_e"));
+}
+
+test "Storage: lock owners are 1..64 key characters; the value limit is inclusive" {
+    var mem = MemStorage.init(testing.allocator);
+    defer mem.deinit();
+    const s = mem.storage();
+    try testing.expectError(error.InvalidKey, s.tryLock("k", "", 0, 10));
+    try testing.expect(try s.tryLock("k", "o" ** 64, 0, 10));
+    try testing.expectError(error.InvalidKey, s.tryLock("k2", "o" ** 65, 0, 10));
+    try testing.expectError(error.InvalidKey, s.tryLock("k3", "bad owner", 0, 10));
+
+    const big = try testing.allocator.alloc(u8, max_value_len + 1);
+    defer testing.allocator.free(big);
+    @memset(big, 'v');
+    try s.store("big", big[0..max_value_len]); // exactly the limit
+    try testing.expectError(error.StorageFailed, s.store("big2", big));
+    try testing.expectError(error.StorageFailed, s.create(testing.allocator, "big3", big));
+    try testing.expect(try s.create(testing.allocator, "big4", big[0..max_value_len]));
+}
+
 /// The contract every backend must keep — run against each.
 fn checkContract(s: Storage) !void {
     const gpa = testing.allocator;
@@ -561,6 +587,7 @@ test "DirStorage: contract, 0600 files in 0700 directories, no temp files left" 
     try checkContract(d.storage());
 
     const s = d.storage();
+    s.unlock("x" ** 600, "owner"); // an invalid name is a no-op, not a path buffer overflow
     try s.store("certificates/deep/example.org.key", "secret");
     const file_stat = try tmp.dir.statFile(io, "certificates/deep/example.org.key", .{});
     try testing.expectEqual(@as(u32, 0o600), @as(u32, @intFromEnum(file_stat.permissions)) & 0o777);

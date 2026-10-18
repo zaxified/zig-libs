@@ -2824,7 +2824,24 @@ const MockCa = struct {
     validity_seen: [64]u8 = undefined,
     validity_len: usize = 0,
     unavailable_left: u8 = 0,
+    /// `Retry-After` of the injected 503 (null = no such header).
+    unavailable_retry_after: ?[]const u8 = "0",
     rate_limit: bool = false,
+    /// newOrder with `replaces`: refuse it once (409 alreadyReplaced), and count the refusals.
+    refuse_replaces: bool = false,
+    replaces_refused: u32 = 0,
+    /// newAccount: the `contact` member (null = absent) and its first entry.
+    register_contact_count: ?usize = null,
+    register_contact0: [64]u8 = undefined,
+    register_contact0_len: usize = 0,
+    /// The account endpoint answers this status (a problem document) to a deactivation.
+    deactivate_status: ?u16 = null,
+    /// The directory's `renewalInfo` ends in a slash; the endpoint answers `ari_status`.
+    ari_trailing_slash: bool = false,
+    ari_status: u16 = 200,
+    /// Order polls served, and the `Retry-After` they carry (null = none).
+    order_polls: u32 = 0,
+    poll_retry_after: ?[]const u8 = null,
     alt_chain: bool = false,
     alt_fetches: u32 = 0,
     authz_polls: u32 = 0,
@@ -3022,8 +3039,8 @@ fn mcDirectory(ctx: *router.Ctx) anyerror!void {
         \\  "profiles":{{"classic":"the default","shortlived":"https://ca/docs#shortlived"}}}}
     , .{ m.new_nonce_url, m.new_account_url, m.new_order_url });
     if (m.extras) try w.print(
-        \\,"keyChange":"{s}","revokeCert":"{s}","renewalInfo":"{s}"
-    , .{ m.key_change_url, m.revoke_url, m.ari_url });
+        \\,"keyChange":"{s}","revokeCert":"{s}","renewalInfo":"{s}{s}"
+    , .{ m.key_change_url, m.revoke_url, m.ari_url, if (m.ari_trailing_slash) "/" else "" });
     try w.writeAll("}");
     try m.respondJson(ctx, 200, w.buffered());
 }
@@ -3042,6 +3059,7 @@ fn mcNewAccount(ctx: *router.Ctx) anyerror!void {
     const Payload = struct {
         termsOfServiceAgreed: bool = false,
         externalAccountBinding: ?std.json.Value = null,
+        contact: ?[]const []const u8 = null,
     };
     const payload = std.json.parseFromSlice(Payload, m.gpa, v.payload, .{
         .ignore_unknown_fields = true,
@@ -3051,6 +3069,16 @@ fn mcNewAccount(ctx: *router.Ctx) anyerror!void {
     };
     defer payload.deinit();
     if (!payload.value.termsOfServiceAgreed) m.fail("ToS not agreed");
+    if (payload.value.contact) |list| {
+        lockSpin(&m.lock);
+        m.register_contact_count = list.len;
+        if (list.len > 0) {
+            const n = @min(list[0].len, m.register_contact0.len);
+            @memcpy(m.register_contact0[0..n], list[0][0..n]);
+            m.register_contact0_len = n;
+        }
+        m.lock.unlock();
+    }
 
     if (m.eab_kid) |want_kid| {
         // RFC 8555 §7.3.4: the binding is a flattened JWS, HS256, `kid` as
@@ -3122,7 +3150,9 @@ fn mcNewOrder(ctx: *router.Ctx) anyerror!void {
         if (unavailable or limited) {
             try m.stampNonce(ctx);
             ctx.res.setStatus(if (unavailable) 503 else 429);
-            try ctx.res.setHeader("Retry-After", if (unavailable) "0" else "3600");
+            if (!unavailable) {
+                try ctx.res.setHeader("Retry-After", "3600");
+            } else if (m.unavailable_retry_after) |ra| try ctx.res.setHeader("Retry-After", ra);
             try ctx.res.setHeader("Content-Type", "application/problem+json");
             try ctx.res.writeAll(if (unavailable)
                 "{\"type\":\"urn:ietf:params:acme:error:serverInternal\",\"detail\":\"maintenance\"}"
@@ -3152,6 +3182,22 @@ fn mcNewOrder(ctx: *router.Ctx) anyerror!void {
         @memcpy(m.replaces_seen[0..n], r[0..n]);
         m.replaces_len = n;
         m.lock.unlock();
+    }
+    if (payload.value.replaces != null) {
+        lockSpin(&m.lock);
+        const refuse = m.refuse_replaces;
+        if (refuse) {
+            m.refuse_replaces = false;
+            m.replaces_refused += 1;
+        }
+        m.lock.unlock();
+        if (refuse) {
+            try m.stampNonce(ctx);
+            ctx.res.setStatus(409);
+            try ctx.res.setHeader("Content-Type", "application/problem+json");
+            try ctx.res.writeAll("{\"type\":\"urn:ietf:params:acme:error:alreadyReplaced\",\"detail\":\"replaced already\"}");
+            return;
+        }
     }
     if (payload.value.profile) |pf| {
         lockSpin(&m.lock);
@@ -3401,7 +3447,9 @@ fn mcOrder(ctx: *router.Ctx) anyerror!void {
     // Serve one interim "processing" after finalize to exercise polling.
     const processing = finalized and !m.served_processing;
     if (processing) m.served_processing = true;
+    m.order_polls += 1;
     m.lock.unlock();
+    if (m.poll_retry_after) |ra| try ctx.res.setHeader("Retry-After", ra);
 
     var buf: [1024]u8 = undefined;
     const body = if (!challenge_ok)
@@ -3521,7 +3569,17 @@ fn mcAccount(ctx: *router.Ctx) anyerror!void {
         }
     }
     if (payload.value.status) |s| {
-        if (std.mem.eql(u8, s, "deactivated")) m.deactivated = true;
+        if (std.mem.eql(u8, s, "deactivated")) {
+            if (m.deactivate_status != null) {
+                m.lock.unlock();
+                try m.stampNonce(ctx);
+                ctx.res.setStatus(m.deactivate_status.?);
+                try ctx.res.setHeader("Content-Type", "application/problem+json");
+                try ctx.res.writeAll("{\"type\":\"urn:ietf:params:acme:error:unauthorized\",\"detail\":\"not now\"}");
+                return;
+            }
+            m.deactivated = true;
+        }
     }
     m.lock.unlock();
     try m.respondJson(ctx, 200, if (m.deactivated) "{\"status\":\"deactivated\"}" else "{\"status\":\"valid\"}");
@@ -3642,6 +3700,12 @@ fn mcRenewalInfo(ctx: *router.Ctx) anyerror!void {
     @memcpy(m.ari_id[0..n], id[0..n]);
     m.ari_id_len = n;
     m.lock.unlock();
+    if (m.ari_status != 200) {
+        ctx.res.setStatus(m.ari_status);
+        try ctx.res.setHeader("Content-Type", "application/problem+json");
+        try ctx.res.writeAll("{\"type\":\"urn:ietf:params:acme:error:serverInternal\",\"detail\":\"ari down\"}");
+        return;
+    }
     ctx.res.setStatus(200);
     try ctx.res.setHeader("Content-Type", "application/json");
     try ctx.res.setHeader("Retry-After", "21600");
@@ -3968,11 +4032,13 @@ const Lab = struct {
     }
 
     fn stop(lab: *Lab) void {
+        // The client's keep-alive connections go first: the server drains
+        // idle connections on shutdown, and would otherwise take ~10 s per test.
+        lab.transport.deinit();
         if (lab.ca_thread) |t| {
             lab.ca_server.shutdown();
             t.join();
         }
-        lab.transport.deinit();
         lab.mock.deinitUrls();
         lab.ca_server.deinit();
         lab.ca_router.deinit();
@@ -4994,4 +5060,269 @@ test "W3: ChallengeRequest helpers agree with the token-based ones" {
     try testing.expectEqualStrings("example.org", named.tlsAlpnSni(&sni_buf));
     var name_buf: [dns01_max_name_len]u8 = undefined;
     try testing.expectEqualStrings("_acme-challenge.example.org", named.dnsRecordName(&name_buf));
+}
+
+// ── audit 2026-10-18: tests asked for by mutation survivors ─────────────────
+
+test "RenewalInfo.pickTime reaches the window's last second and never leaves it" {
+    var prng = std.Random.DefaultPrng.init(1);
+    const info: RenewalInfo = .{ .window_start = 1000, .window_end = 1001, .explanation_url = null, .retry_after_s = null };
+    var hit_end = false;
+    for (0..64) |_| {
+        const t = info.pickTime(prng.random());
+        try testing.expect(t >= 1000 and t <= 1001);
+        if (t == 1001) hit_end = true;
+    }
+    try testing.expect(hit_end);
+}
+
+test "parseRenewalInfo: an empty window is fine, an inverted one is not" {
+    var ri = try parseRenewalInfo(testing.allocator, "{\"suggestedWindow\":{\"start\":\"2026-01-01T00:00:00Z\",\"end\":\"2026-01-01T00:00:00Z\"}}");
+    ri.deinit(testing.allocator);
+    try testing.expectError(error.MalformedResponse, parseRenewalInfo(testing.allocator, "{\"suggestedWindow\":{\"start\":\"2026-01-01T00:00:01Z\",\"end\":\"2026-01-01T00:00:00Z\"}}"));
+}
+
+test "bad nonce: three resends are served, a fourth refusal is the answer" {
+    var lab: Lab = undefined;
+    try lab.start(false);
+    defer lab.stop();
+    var zone: TestZone = .{};
+    var account_key: jws.KeyPair = undefined;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&account_key));
+    var c = try w1Client(&lab, &zone, 95, &account_key);
+    defer c.deinit();
+
+    lab.mock.badnonce_left = 3;
+    var cert = try c.obtain(&.{MockCa.domain});
+    cert.deinit(testing.allocator);
+    try testing.expectEqual(@as(u8, 0), lab.mock.badnonce_left);
+
+    lab.mock.badnonce_left = 4;
+    try testing.expectError(error.AcmeProblem, c.obtain(&.{MockCa.domain}));
+    try testing.expectEqual(@as(u8, 0), lab.mock.badnonce_left);
+}
+
+test "AcmeIssuer: a rate-limited CA is IssueError.RateLimited with its Retry-After in the diagnostics" {
+    const Manager = @import("Manager.zig");
+    var lab: Lab = undefined;
+    try lab.start(false);
+    defer lab.stop();
+    var zone: TestZone = .{};
+    var account_key: jws.KeyPair = undefined;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&account_key));
+    var c = try w1Client(&lab, &zone, 96, &account_key);
+    defer c.deinit();
+    var warm = try c.obtain(&.{MockCa.domain}); // registers the account
+    warm.deinit(testing.allocator);
+
+    var ai: Manager.AcmeIssuer = .{ .client = &c, .name = "mock" };
+    const iss = ai.issuer();
+    const req: Manager.IssueRequest = .{ .names = &.{MockCa.domain} };
+    var diag: Manager.Diagnostics = .{};
+    lab.mock.rate_limit = true;
+    try testing.expectError(error.RateLimited, iss.issue(iss.ctx, testing.allocator, &req, &diag));
+    try testing.expectEqual(@as(?u64, 3600), diag.retry_after_s);
+    try testing.expect(std.mem.indexOf(u8, diag.problem(), "rateLimited") != null);
+}
+
+// ── mutation follow-up (2026-10-18): the mock CA's knobs for the rest ───────
+
+/// Sleep `ms` on `io` (a test thread waiting for the client to get somewhere).
+fn napMs(io: std.Io, ms: i64) void {
+    const d: std.Io.Clock.Duration = .{ .raw = .fromMilliseconds(ms), .clock = .awake };
+    d.sleep(io) catch {};
+}
+
+/// A client call running beside the test, to see that it is *waiting*: `done`
+/// is set when the call returned, `err` is what it returned.
+const Bg = struct {
+    done: std.atomic.Value(bool) = .init(false),
+    err: ?Error = null,
+};
+
+fn bgNewOrder(c: *Client, bg: *Bg) void {
+    if (c.newOrder(&.{MockCa.domain}, .{})) |o| {
+        var order = o;
+        order.deinit();
+    } else |e| bg.err = e;
+    bg.done.store(true, .release);
+}
+
+fn bgWaitOrder(c: *Client, order: *Order, bg: *Bg) void {
+    c.waitOrder(order, .ready) catch |e| {
+        bg.err = e;
+    };
+    bg.done.store(true, .release);
+}
+
+test "503: Retry-After is read as seconds; a wait of exactly 30 s is honoured, 31 s is the caller's call" {
+    var lab: Lab = undefined;
+    try lab.start(false);
+    defer lab.stop();
+    const io = lab.threaded.io();
+    var account_key = labKey(jws.Es256, 61);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&account_key));
+    var c = lab.client(&account_key, .{});
+    defer c.deinit();
+    try c.register();
+
+    // 31 s is over the cap: no wait, no resend, the 503 is the answer.
+    lab.mock.unavailable_retry_after = "31";
+    lab.mock.unavailable_left = 1;
+    try testing.expectError(error.AcmeProblem, c.newOrder(&.{MockCa.domain}, .{}));
+    try testing.expectEqual(@as(u8, 0), lab.mock.unavailable_left);
+    try testing.expectEqual(@as(?u64, 31), c.retryAfter());
+
+    // Exactly 30 s is within the cap: the client waits (we do not wait it
+    // out: the call is cancelled while it sleeps).
+    lab.mock.unavailable_retry_after = "30";
+    lab.mock.unavailable_left = 1;
+    var bg: Bg = .{};
+    var fut = try io.concurrent(bgNewOrder, .{ &c, &bg });
+    var spins: u32 = 0;
+    while (spins < 250) : (spins += 1) {
+        lockSpin(&lab.mock.lock);
+        const served = lab.mock.unavailable_left == 0;
+        lab.mock.lock.unlock();
+        if (served) break;
+        napMs(io, 20);
+    }
+    napMs(io, 300);
+    const returned = bg.done.load(.acquire);
+    fut.cancel(io);
+    try testing.expect(!returned);
+    try testing.expectEqual(@as(?Error, error.Canceled), bg.err);
+}
+
+test "503: without Retry-After the wait doubles from one second (the step counts resends, not what is left)" {
+    var lab: Lab = undefined;
+    try lab.start(false);
+    defer lab.stop();
+    var account_key = labKey(jws.Es256, 62);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&account_key));
+    // 5 resends allowed: counting down from 5 would make the first wait 32 s
+    // (over the cap, no resend); the first wait is 1 s.
+    var c = lab.client(&account_key, .{ .max_unavailable_retries = 5 });
+    defer c.deinit();
+    try c.register();
+    lab.mock.unavailable_retry_after = null;
+    lab.mock.unavailable_left = 1;
+    var order = try c.newOrder(&.{MockCa.domain}, .{});
+    order.deinit();
+    try testing.expectEqual(@as(u8, 0), lab.mock.unavailable_left);
+}
+
+test "polling: the Retry-After of a pending order paces the next poll" {
+    var lab: Lab = undefined;
+    try lab.start(false);
+    defer lab.stop();
+    const io = lab.threaded.io();
+    var account_key = labKey(jws.Es256, 63);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&account_key));
+    var c = lab.client(&account_key, .{}); // poll_interval_ms is 10 here
+    defer c.deinit();
+    var order = try c.newOrder(&.{MockCa.domain}, .{});
+    defer order.deinit();
+
+    lab.mock.poll_retry_after = "20"; // capped to 15 s by the client
+    var bg: Bg = .{};
+    var fut = try io.concurrent(bgWaitOrder, .{ &c, &order, &bg });
+    var spins: u32 = 0;
+    while (spins < 250) : (spins += 1) {
+        lockSpin(&lab.mock.lock);
+        const polled = lab.mock.order_polls >= 1;
+        lab.mock.lock.unlock();
+        if (polled) break;
+        napMs(io, 20);
+    }
+    napMs(io, 300);
+    lockSpin(&lab.mock.lock);
+    const polls = lab.mock.order_polls;
+    lab.mock.lock.unlock();
+    fut.cancel(io);
+    // Paced by the header it waits; at the 10 ms default it would have asked ~30 times.
+    try testing.expectEqual(@as(u32, 1), polls);
+}
+
+test "register: the contact members are sent, and left out when there are none" {
+    var lab: Lab = undefined;
+    try lab.start(false);
+    defer lab.stop();
+    var key_a = labKey(jws.Es256, 64);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&key_a));
+    var with = lab.client(&key_a, .{ .contact = &.{ "mailto:ops@example.org", "mailto:b@example.org" } });
+    defer with.deinit();
+    try with.register();
+    try testing.expectEqual(@as(?usize, 2), lab.mock.register_contact_count);
+    try testing.expectEqualStrings("mailto:ops@example.org", lab.mock.register_contact0[0..lab.mock.register_contact0_len]);
+
+    lab.mock.register_contact_count = null;
+    var key_b = labKey(jws.Es256, 65);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&key_b));
+    var without = lab.client(&key_b, .{});
+    defer without.deinit();
+    try without.register();
+    try testing.expectEqual(@as(?usize, null), lab.mock.register_contact_count);
+    try lab.expectClean();
+}
+
+test "deactivate: a refusal is an error and the account stays; then it works" {
+    var lab: Lab = undefined;
+    try lab.start(true);
+    defer lab.stop();
+    var account_key = labKey(jws.Es256, 66);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&account_key));
+    var c = lab.client(&account_key, .{});
+    defer c.deinit();
+
+    lab.mock.deactivate_status = 403;
+    try testing.expectError(error.AcmeProblem, c.deactivate());
+    try testing.expect(c.accountUrl() != null);
+    try testing.expect(!lab.mock.deactivated);
+
+    lab.mock.deactivate_status = null;
+    try c.deactivate();
+    try testing.expect(lab.mock.deactivated);
+    try testing.expect(c.accountUrl() == null);
+}
+
+test "renewalInfo: a trailing slash of the directory's URL is not doubled; a non-200 is the CA's problem" {
+    var lab: Lab = undefined;
+    try lab.start(true);
+    defer lab.stop();
+    var account_key = labKey(jws.Es256, 67);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&account_key));
+    var c = lab.client(&account_key, .{});
+    defer c.deinit();
+
+    lab.mock.ari_trailing_slash = true;
+    var info = try c.renewalInfoPem(rfc9773_cert_pem);
+    info.deinit(testing.allocator);
+    try testing.expectEqualStrings("aYhba4dGQEHhs3uEe6CuLN4ByNQ.AIdlQyE", lab.mock.ari_id[0..lab.mock.ari_id_len]);
+
+    lab.mock.ari_status = 500;
+    try testing.expectError(error.AcmeProblem, c.renewalInfoPem(rfc9773_cert_pem));
+    try testing.expect(std.mem.indexOf(u8, c.lastProblem().?, "ari down") != null);
+}
+
+test "AcmeIssuer: a CA that refuses `replaces` gets the order once more without it" {
+    const Manager = @import("Manager.zig");
+    var lab: Lab = undefined;
+    try lab.start(false);
+    defer lab.stop();
+    var zone: TestZone = .{};
+    var account_key: jws.KeyPair = undefined;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&account_key));
+    var c = try w1Client(&lab, &zone, 97, &account_key);
+    defer c.deinit();
+
+    var ai: Manager.AcmeIssuer = .{ .client = &c, .name = "mock" };
+    const iss = ai.issuer();
+    var diag: Manager.Diagnostics = .{};
+    lab.mock.refuse_replaces = true;
+    const req: Manager.IssueRequest = .{ .names = &.{MockCa.domain}, .replaces = "aYhba4dGQEHhs3uEe6CuLN4ByNQ.AIdlQyE" };
+    var issued = try iss.issue(iss.ctx, testing.allocator, &req, &diag);
+    defer issued.deinit(testing.allocator);
+    try testing.expectEqual(@as(u32, 1), lab.mock.replaces_refused);
+    try testing.expectEqualStrings(x509.test_cert_pem ++ x509.test_root_cert_pem, issued.chain_pem);
 }

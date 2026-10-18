@@ -1423,3 +1423,32 @@ const RateLimiter = struct {
         return true;
     }
 };
+
+// ── tests of private helpers (the rest are in manager_test.zig) ─────────────
+
+test "ratioRenewAt: exactly ten days renews at half, one second more at two thirds" {
+    const day = std.time.s_per_day;
+    try std.testing.expectEqual(@as(i64, 5 * day), ratioRenewAt(0, 10 * day, 0));
+    try std.testing.expectEqual(@as(i64, 1000 + 5 * day), ratioRenewAt(1000, 1000 + 10 * day, 0));
+    try std.testing.expectEqual(@as(i64, @divFloor((10 * day + 1) * 2, 3)), ratioRenewAt(0, 10 * day + 1, 0));
+    // A percentage in 1..99 overrides both rules.
+    try std.testing.expectEqual(@as(i64, 10 * day - day), ratioRenewAt(0, 10 * day, 10));
+}
+
+test "rsaPublicEql: modulus bytes and exponent both count, a different bit length is never equal" {
+    const t = std.testing;
+    var n1: [256]u8 = @splat(0xff); // 2048 bits, odd
+    var n2 = n1;
+    n2[255] = 0xfd; // same length, another odd modulus
+    var n3: [255]u8 = @splat(0xff); // 2040 bits
+    const a = try rsa.PublicKey.fromBytes(&n1, &.{ 0x01, 0x00, 0x01 });
+    const same = try rsa.PublicKey.fromBytes(&n1, &.{ 0x01, 0x00, 0x01 });
+    const other_n = try rsa.PublicKey.fromBytes(&n2, &.{ 0x01, 0x00, 0x01 });
+    const other_e = try rsa.PublicKey.fromBytes(&n1, &.{0x03});
+    const shorter = try rsa.PublicKey.fromBytes(&n3, &.{ 0x01, 0x00, 0x01 });
+    try t.expect(rsaPublicEql(&a, &same));
+    try t.expect(!rsaPublicEql(&a, &other_n));
+    try t.expect(!rsaPublicEql(&a, &other_e));
+    try t.expect(!rsaPublicEql(&a, &shorter));
+    try t.expect(!rsaPublicEql(&shorter, &a));
+}
