@@ -160,6 +160,11 @@ const Outcome = struct {
 /// `Client.initInto` over `input` with the fixed entropy; on success the
 /// application stream is read to its end (`close_notify`).
 fn runClient(input: []const u8, out_copy: ?*Writer) Outcome {
+    return runClientHook(input, out_copy, null);
+}
+
+/// `runClient`, with `hook` run on the established `sink` before the read.
+fn runClientHook(input: []const u8, out_copy: ?*Writer, hook: ?*const fn () void) Outcome {
     @memcpy(in_buf[0..input.len], input);
     var reader = Reader.fixed(&in_buf);
     reader.end = input.len;
@@ -182,6 +187,7 @@ fn runClient(input: []const u8, out_copy: ?*Writer) Outcome {
     };
     var o: Outcome = .{};
     if (Client.initInto(&sink, &reader, w, opts)) |_| {
+        if (hook) |h| h();
         if (sink.reader.discardRemaining()) |n| o.app_octets = n else |e| o.read_err = e;
     } else |e| o.init_err = e;
     o.written = if (out_copy != null) fw.end else dw.fullCount();
@@ -604,6 +610,104 @@ test "a short or all-zero application record ends the read with an error, not an
     try testing.expectEqual(@as(?anyerror, null), o2.init_err);
     try testing.expectEqual(@as(?anyerror, error.ReadFailed), o2.read_err);
     try testing.expectEqual(@as(?Client.ReadError, error.TlsUnexpectedMessage), sink.read_err);
+}
+
+/// The inner plaintext of a crafted post-handshake record: `msg` then the
+/// handshake content type; returns the client's read error after it.
+fn postHandshakeRecordError(msg: []const u8) !?Client.ReadError {
+    try ensureTemplates();
+    const hs_end = tm.f13_records[6];
+    var input: [4096]u8 = undefined;
+    @memcpy(input[0..hs_end], tm.f13[0..hs_end]);
+    var inner: [64]u8 = undefined;
+    @memcpy(inner[0..msg.len], msg);
+    inner[msg.len] = @backingInt(tls.ContentType.handshake);
+    var w = Writer.fixed(input[hs_end..]);
+    var rec_store: [12]usize = undefined;
+    var nrec: usize = 0;
+    cur_records = &rec_store;
+    cur_nrecords = &nrec;
+    defer {
+        cur_records = &tm.f13_records;
+        cur_nrecords = &tm.f13_nrecords;
+    }
+    putEncryptedRaw(&w, tm.akey, tm.aiv, 0, inner[0 .. msg.len + 1]);
+    const o = runClient(input[0 .. hs_end + w.end], null);
+    try testing.expectEqual(@as(?anyerror, null), o.init_err);
+    try testing.expectEqual(@as(?anyerror, error.ReadFailed), o.read_err);
+    return sink.read_err;
+}
+
+test "a KeyUpdate with an empty or oversized body is a decode_error before any key is switched (std 0.17 check, ours missed it)" {
+    // Negative control (fix reverted): body-less KeyUpdate read handshake[0]
+    // out of bounds -- a panic in safe builds, UB in ReleaseFast.
+    try testing.expectEqual(@as(?Client.ReadError, error.TlsDecodeError), try postHandshakeRecordError(&.{ 0x18, 0, 0, 0 }));
+    try testing.expectEqual(@as(?Client.ReadError, error.TlsDecodeError), try postHandshakeRecordError(&.{ 0x18, 0, 0, 2, 0, 0 }));
+    // Keys untouched: the failing record did not advance the read key.
+    try testing.expectEqual(@as(u64, 1), sink.read_seq);
+}
+
+test "a handshake record shorter than a message header or empty is a decode_error, not an out-of-bounds read" {
+    // Negative control (fix reverted): empty fragment indexed cleartext[0]
+    // beyond the (zero-length) slice; 3 octets read cleartext[1..][0..3].
+    try testing.expectEqual(@as(?Client.ReadError, error.TlsDecodeError), try postHandshakeRecordError(&.{}));
+    try testing.expectEqual(@as(?Client.ReadError, error.TlsDecodeError), try postHandshakeRecordError(&.{ 0x18, 0, 0 }));
+    // A second message with a truncated header after a valid KeyUpdate.
+    try testing.expectEqual(@as(?Client.ReadError, error.TlsDecodeError), try postHandshakeRecordError(&.{ 0x18, 0, 0, 1, 0, 0x18, 0 }));
+}
+
+fn makeTls12() void {
+    // The 1.3 session `sink` becomes a TLS 1.2 AES-128-GCM one with known keys.
+    const Cipher = @FieldType(tls.ApplicationCipher, "AES_128_GCM_SHA256");
+    sink.application_cipher = .{ .AES_128_GCM_SHA256 = @unionInit(Cipher, "tls_1_2", .{
+        .client_write_MAC_key = @splat(0),
+        .server_write_MAC_key = @splat(0),
+        .client_write_key = @splat(0x11),
+        .server_write_key = @splat(0x22),
+        .client_write_IV = @splat(0x33),
+        .server_write_IV = @splat(0x44),
+        .client_salt = @splat(0),
+    }) };
+    sink.tls_version = .tls_1_2;
+    sink.read_seq = 0;
+}
+
+test "a KeyUpdate on a TLS 1.2 connection is an unexpected_message, not a read of the inactive tls_1_3 union field" {
+    // Negative control (fix reverted): `p.tls_1_3` while `tls_1_2` is active --
+    // a panic in safe builds (and the decrypt of the cipher below would work).
+    try ensureTemplates();
+    const hs_end = tm.f13_records[6];
+    var input: [4096]u8 = undefined;
+    @memcpy(input[0..hs_end], tm.f13[0..hs_end]);
+    // One TLS 1.2 AES-128-GCM handshake record: explicit nonce, ciphertext, tag.
+    const key: [16]u8 = @splat(0x22);
+    const explicit: [8]u8 = @splat(0x55);
+    const plain = [_]u8{ 0x18, 0, 0, 1, 0 };
+    var nonce: [12]u8 = undefined;
+    nonce[0..4].* = @as([4]u8, @splat(0x44));
+    nonce[4..].* = explicit;
+    var ad: [13]u8 = undefined;
+    std.mem.writeInt(u64, ad[0..8], 0, .big);
+    ad[8..11].* = .{ @backingInt(tls.ContentType.handshake), 3, 3 };
+    std.mem.writeInt(u16, ad[11..13], plain.len, .big);
+    var ct: [plain.len]u8 = undefined;
+    var tag: [16]u8 = undefined;
+    Aead.encrypt(&ct, &tag, &plain, &ad, nonce, key);
+    var w = Writer.fixed(input[hs_end..]);
+    var body: [8 + plain.len + 16]u8 = undefined;
+    body[0..8].* = explicit;
+    body[8..][0..plain.len].* = ct;
+    body[8 + plain.len ..][0..16].* = tag;
+    w.writeAll(&.{ @backingInt(tls.ContentType.handshake), 3, 3 }) catch unreachable;
+    w.writeInt(u16, body.len, .big) catch unreachable;
+    w.writeAll(&body) catch unreachable;
+    const o = runClientHook(input[0 .. hs_end + w.end], null, makeTls12);
+    try testing.expectEqual(@as(?anyerror, null), o.init_err);
+    try testing.expectEqual(@as(?anyerror, error.ReadFailed), o.read_err);
+    try testing.expectEqual(@as(?Client.ReadError, error.TlsUnexpectedMessage), sink.read_err);
+    // Control: the same record is authentic -- a plain TLS 1.2 KeyUpdate dies on
+    // the type, not on a MAC failure (read_seq advanced past it).
+    try testing.expectEqual(@as(u64, 1), sink.read_seq);
 }
 
 /// One TLS 1.3 record over the raw inner plaintext `inner` (content type and

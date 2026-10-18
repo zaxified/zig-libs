@@ -2739,6 +2739,10 @@ fn readIndirect(c: *Client) Reader.Error!usize {
         .handshake => {
             var ct_i: usize = 0;
             while (true) {
+                // zig-libs tlsclient: a handshake message needs its 4-octet
+                // header; std indexed an empty or short fragment unchecked
+                // (RFC 8446 §6.2: decode_error).
+                if (cleartext.len - ct_i < 4) return failRead(c, error.TlsDecodeError);
                 const handshake_type: tls.HandshakeType = @fromBackingInt(@intCast(cleartext[ct_i]));
                 ct_i += 1;
                 const handshake_len = mem.readInt(u24, cleartext[ct_i..][0..3], .big);
@@ -2751,6 +2755,13 @@ fn readIndirect(c: *Client) Reader.Error!usize {
                     // configured (std ignored them).
                     .new_session_ticket => c.storeTicket(handshake),
                     .key_update => {
+                        // zig-libs tlsclient: RFC 8446 §4.6.3 -- KeyUpdate exists in
+                        // TLS 1.3 only (std touched the inactive `tls_1_3` union field
+                        // on a 1.2 connection: unexpected_message) and its body is
+                        // exactly one octet (decode_error; std 0.17 has this check).
+                        // Both before any key or sequence number is switched.
+                        if (c.tls_version != .tls_1_3) return failRead(c, error.TlsUnexpectedMessage);
+                        if (handshake.len != 1) return failRead(c, error.TlsDecodeError);
                         switch (c.application_cipher) {
                             inline else => |*p| {
                                 const pv = &p.tls_1_3;
