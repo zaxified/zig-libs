@@ -78,7 +78,7 @@ fn begin(c: *zstd.Compressor, r: goldens.Row, src: []const u8, dict: []const u8,
         'L' => try c.begin(.{ .level = .{ .level = r.level, .dict = dict } }),
         'A' => {
             var cp = zstd.getCParams(r.level, r.pledged, dict.len);
-            if (r.cparams) |v| cp = .{ .window_log = v[0], .chain_log = v[1], .hash_log = v[2], .search_log = v[3], .min_match = v[4], .target_length = v[5], .strategy = @enumFromInt(v[6]) };
+            if (r.cparams) |v| cp = .{ .window_log = v[0], .chain_log = v[1], .hash_log = v[2], .search_log = v[3], .min_match = v[4], .target_length = v[5], .strategy = @fromBackingInt(@intCast(v[6])) };
             try c.begin(.{ .advanced = .{ .cparams = cp, .frame = fp, .dict = dict, .pledged_size = r.pledged } });
         },
         'C' => try c.begin(.{ .cdict = .{ .cdict = cdict.?, .frame = fp, .pledged_size = r.pledged } }),

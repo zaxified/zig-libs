@@ -143,7 +143,7 @@ pub const Wiphy = struct {
     }
 
     pub fn supportsIftype(w: *const Wiphy, t: uapi.Iftype) bool {
-        const n = @intFromEnum(t);
+        const n = @backingInt(t);
         if (n >= 32) return false;
         return w.iftypes & (@as(u32, 1) << @intCast(n)) != 0;
     }
@@ -469,8 +469,8 @@ test "split dump: one radio spread over several messages is merged into one" {
             0x04, 0xac, 0x0f, 0x00, // CCMP
         });
         const off = try openNest(gpa, &m, uapi.ATTR.SUPPORTED_IFTYPES);
-        try codec.appendAttr(gpa, &m, @intFromEnum(uapi.Iftype.station), &.{});
-        try codec.appendAttr(gpa, &m, @intFromEnum(uapi.Iftype.ap), &.{});
+        try codec.appendAttr(gpa, &m, @backingInt(uapi.Iftype.station), &.{});
+        try codec.appendAttr(gpa, &m, @backingInt(uapi.Iftype.ap), &.{});
         codec.nestEnd(&m, off) catch return error.InvalidRequest;
         try p.feed(m.items);
     }
@@ -642,8 +642,8 @@ const Corpus = struct {
         });
         {
             const off = try codec.nestBegin(gpa, &caps, uapi.ATTR.SUPPORTED_IFTYPES);
-            try codec.appendAttr(gpa, &caps, @intFromEnum(uapi.Iftype.station), &.{});
-            try codec.appendAttr(gpa, &caps, @intFromEnum(uapi.Iftype.ap), &.{});
+            try codec.appendAttr(gpa, &caps, @backingInt(uapi.Iftype.station), &.{});
+            try codec.appendAttr(gpa, &caps, @backingInt(uapi.Iftype.ap), &.{});
             try codec.nestEnd(&caps, off);
         }
         self.push(caps.items);

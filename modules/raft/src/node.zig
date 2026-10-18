@@ -163,7 +163,7 @@ pub fn fingerprint(e: Entry) u64 {
     var hdr: [17]u8 = undefined;
     std.mem.writeInt(u64, hdr[0..8], e.index, .little);
     std.mem.writeInt(u64, hdr[8..16], e.term, .little);
-    hdr[16] = @intFromEnum(e.kind);
+    hdr[16] = @backingInt(e.kind);
     h.update(&hdr);
     h.update(e.data);
     return h.final();

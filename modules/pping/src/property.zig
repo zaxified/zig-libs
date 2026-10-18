@@ -87,7 +87,7 @@ test "property (ungated): monotonic-time robustness — a regressing/repeating c
     // Fable-stub call happens and this test needs no gate.
     var est = try Estimator.init(testing.allocator, .{ .capacity = 16, .max_age = 50 });
     defer est.deinit(testing.allocator);
-    const tbl = &est.tables[@intFromEnum(Direction.a_to_b)];
+    const tbl = &est.tables[@backingInt(Direction.a_to_b)];
 
     var state: u64 = 0x1BD11BDAA9FC1A22;
     var now: u64 = 1_000_000; // start large so a naive unsaturated subtraction could underflow

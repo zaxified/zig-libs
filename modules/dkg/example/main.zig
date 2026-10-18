@@ -180,7 +180,7 @@ pub fn main() !void {
     if (!try dkg.checks.reconstructsToQ(gpa, node_outputs[1..3])) return error.SharesDoNotReconstructGroupKey;
     // A node refuses what it should not accept: a frame for the wrong round
     // is an error value, not a corrupted run.
-    if (nodes[0].handle(2, &.{@intFromEnum(dkg.wire.Kind.complaint)})) |_| {
+    if (nodes[0].handle(2, &.{@backingInt(dkg.wire.Kind.complaint)})) |_| {
         return error.FinishedNodeAcceptedAFrame;
     } else |err| switch (err) {
         error.Finished => {},

@@ -140,7 +140,7 @@ pub fn decode(bytes: []const u8) DecodeError!CommonHeader {
     if (bytes[2] != version) return error.BadVersion;
     const raw_id_len = bytes[3];
     // Bits 6-8 of byte 4 are Reserved: ignored on receipt, so masked away.
-    const pdu_type: PduType = @enumFromInt(@as(u5, @intCast(bytes[4] & 0x1F)));
+    const pdu_type: PduType = @fromBackingInt(@intCast(@as(u5, @intCast(bytes[4] & 0x1F))));
     if (bytes[5] != version) return error.BadVersion;
     const length_indicator = bytes[1];
     // The fixed header must be at least the common part. Its upper bound (the
@@ -167,7 +167,7 @@ pub fn encode(hdr: CommonHeader, out: []u8) error{BufferTooSmall}!void {
     out[1] = hdr.length_indicator;
     out[2] = version;
     out[3] = hdr.id_length;
-    out[4] = @as(u8, @intFromEnum(hdr.pdu_type)); // top 3 bits already zero (u5)
+    out[4] = @as(u8, @backingInt(hdr.pdu_type)); // top 3 bits already zero (u5)
     out[5] = version;
     out[6] = hdr.reserved;
     out[7] = hdr.max_area_addresses;
@@ -281,6 +281,6 @@ test "isLsp / isCsnp / isPsnp classify each PDU type, no other type" {
 test "unknown PDU type stays representable, never panics" {
     const wire = [_]u8{ 0x83, 0x14, 0x01, 0x06, 0x01, 0x01, 0x00, 0x03 }; // type 1
     const h = try decode(&wire);
-    try testing.expectEqual(@as(u5, 1), @intFromEnum(h.pdu_type));
+    try testing.expectEqual(@as(u5, 1), @backingInt(h.pdu_type));
     try testing.expect(!h.pdu_type.isHello());
 }

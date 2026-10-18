@@ -500,7 +500,7 @@ pub const NodeSpec = struct {
 const NodeIdContext = struct {
     pub fn hash(_: NodeIdContext, key: encoding.NodeId) u64 {
         var h = std.hash.Wyhash.init(0);
-        h.update(&.{@intFromEnum(std.meta.activeTag(key))});
+        h.update(&.{@backingInt(std.meta.activeTag(key))});
         switch (key) {
             .numeric => |v| {
                 h.update(std.mem.asBytes(&v.namespace));
@@ -814,7 +814,7 @@ pub const NodeStore = struct {
         const a = services.attribute_id;
         switch (attribute) {
             a.node_id => return scalarValue(.{ .node_id = node.node_id }),
-            a.node_class => return scalarValue(.{ .int32 = @intCast(@intFromEnum(node.nodeClass())) }),
+            a.node_class => return scalarValue(.{ .int32 = @intCast(@backingInt(node.nodeClass())) }),
             a.browse_name => return scalarValue(.{ .qualified_name = node.browse_name }),
             a.display_name => return scalarValue(.{ .localized_text = node.display_name }),
             a.description => return scalarValue(.{ .localized_text = node.description }),
@@ -1595,7 +1595,7 @@ test "readAttribute: node/class/browse-name/value + BadNodeIdUnknown / BadAttrib
     try testing.expectEqual(@as(encoding.DateTime, 132_223_104_000_000_000), dv.value.?.scalar.date_time);
 
     const cls = s.readAttribute(n0(id.server), services.attribute_id.node_class);
-    try testing.expectEqual(@as(i32, @intFromEnum(services.NodeClass.object)), cls.value.?.scalar.int32);
+    try testing.expectEqual(@as(i32, @backingInt(services.NodeClass.object)), cls.value.?.scalar.int32);
 
     const missing = s.readAttribute(n0(999_999), services.attribute_id.value);
     try testing.expectEqual(status.bad_node_id_unknown, missing.status.?);

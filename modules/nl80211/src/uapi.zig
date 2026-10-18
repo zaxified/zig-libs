@@ -604,7 +604,7 @@ test "channel width to MHz" {
     try testing.expectEqual(@as(?u16, 80), ChanWidth.@"80".megahertz());
     try testing.expectEqual(@as(?u16, 320), ChanWidth.@"320".megahertz());
     try testing.expectEqual(@as(?u16, null), ChanWidth.@"80p80".megahertz());
-    try testing.expectEqual(@as(?u16, null), @as(ChanWidth, @enumFromInt(999)).megahertz());
+    try testing.expectEqual(@as(?u16, null), @as(ChanWidth, @fromBackingInt(@intCast(999))).megahertz());
 }
 
 test "formatMac" {

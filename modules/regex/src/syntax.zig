@@ -391,11 +391,11 @@ pub fn BuilderOf(comptime cap: Capacity) type {
                 },
                 '^' => {
                     b.pos += 1;
-                    return try b.node(.{ .kind = .assert, .a = @intFromEnum(if (flags.multi_line or b.posix) Assert.begin_line else Assert.begin_text) });
+                    return try b.node(.{ .kind = .assert, .a = @backingInt(if (flags.multi_line or b.posix) Assert.begin_line else Assert.begin_text) });
                 },
                 '$' => {
                     b.pos += 1;
-                    return try b.node(.{ .kind = .assert, .a = @intFromEnum(if (flags.multi_line or b.posix) Assert.end_line else Assert.end_text) });
+                    return try b.node(.{ .kind = .assert, .a = @backingInt(if (flags.multi_line or b.posix) Assert.end_line else Assert.end_text) });
                 },
                 '\\' => return try b.parseEscape(flags.*),
                 else => return try b.literal(b.nextRune(), flags.*),
@@ -481,7 +481,7 @@ pub fn BuilderOf(comptime cap: Capacity) type {
             switch (try b.escape(false, flags.fold)) {
                 .rune => |cp| return b.literal(cp, flags),
                 .class => |cl| return b.classNode(cl.start),
-                .assert => |a| return b.node(.{ .kind = .assert, .a = @intFromEnum(a) }),
+                .assert => |a| return b.node(.{ .kind = .assert, .a = @backingInt(a) }),
                 .quoted => |text| {
                     // A concat of literals (the enclosing concat takes it as one operand).
                     const cat = try b.node(.{ .kind = .concat, .flag = true }); // flag: spliced by parseConcat
@@ -847,7 +847,7 @@ pub fn BuilderOf(comptime cap: Capacity) type {
                 .class => try b.emit(.{ .rune = .{ .start = @intCast(nd.a), .len = @intCast(nd.b) } }),
                 .any => try b.emit(.any),
                 .any_not_nl => try b.emit(.any_not_nl),
-                .assert => try b.emit(.{ .assert = @enumFromInt(nd.a) }),
+                .assert => try b.emit(.{ .assert = @fromBackingInt(@intCast(nd.a)) }),
                 .capture => {
                     try b.emit(.{ .save = @intCast(nd.a * 2) });
                     try b.emitNode(nd.child);

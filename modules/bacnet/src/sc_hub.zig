@@ -292,7 +292,7 @@ pub fn HubWith(
             self.slots[conn].last_rx_ms = now_ms;
 
             if (try msg.header.unsupportedOption()) |bad| {
-                var marker: u8 = @intFromEnum(bad.type);
+                var marker: u8 = @backingInt(bad.type);
                 if (bad.must_understand) marker |= sc.option_flags.must_understand;
                 if (bad.data != null) marker |= sc.option_flags.header_data;
                 self.rejected += 1;
@@ -898,7 +898,7 @@ test "a must-understand option we do not know is NAKed by the hub too" {
 
     var opts: [4]u8 = undefined;
     const list = try sc.encodeOptions(&.{
-        .{ .type = @enumFromInt(11), .must_understand = true },
+        .{ .type = @fromBackingInt(@intCast(11)), .must_understand = true },
     }, &opts);
     var buf: [64]u8 = undefined;
     const msg = sc.encode(.{

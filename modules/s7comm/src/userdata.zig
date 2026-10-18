@@ -120,8 +120,8 @@ pub const Param = struct {
         out[2] = 0x12;
         out[3] = 0x04; // length of what follows
         out[4] = 0x11; // request method
-        out[5] = (@as(u8, @intFromEnum(self.message_type)) << 4) |
-            @as(u8, @intFromEnum(self.function_group));
+        out[5] = (@as(u8, @backingInt(self.message_type)) << 4) |
+            @as(u8, @backingInt(self.function_group));
         out[6] = self.subfunction;
         out[7] = self.sequence;
         return out[0..request_len];
@@ -134,12 +134,12 @@ pub const Param = struct {
         out[2] = 0x12;
         out[3] = 0x08;
         out[4] = 0x12; // response method
-        out[5] = (@as(u8, @intFromEnum(self.message_type)) << 4) |
-            @as(u8, @intFromEnum(self.function_group));
+        out[5] = (@as(u8, @backingInt(self.message_type)) << 4) |
+            @as(u8, @backingInt(self.function_group));
         out[6] = self.subfunction;
         out[7] = self.sequence;
         out[8] = self.data_unit_ref;
-        out[9] = @intFromEnum(self.last_data_unit);
+        out[9] = @backingInt(self.last_data_unit);
         out[10] = @intCast(self.error_code >> 8);
         out[11] = @intCast(self.error_code & 0xFF);
         return out[0..response_len];
@@ -152,15 +152,15 @@ pub const Param = struct {
         // The length octet counts from octet 4 onwards.
         if (4 + follows != bytes.len) return error.BadParameterLength;
         var p: Param = .{
-            .message_type = @enumFromInt(@as(u4, @intCast(bytes[5] >> 4))),
-            .function_group = @enumFromInt(@as(u4, @intCast(bytes[5] & 0x0F))),
+            .message_type = @fromBackingInt(@intCast(@as(u4, @intCast(bytes[5] >> 4)))),
+            .function_group = @fromBackingInt(@intCast(@as(u4, @intCast(bytes[5] & 0x0F)))),
             .subfunction = bytes[6],
             .sequence = bytes[7],
         };
         if (follows >= 8) {
             if (bytes.len < response_len) return error.ShortParameters;
             p.data_unit_ref = bytes[8];
-            p.last_data_unit = @enumFromInt(bytes[9]);
+            p.last_data_unit = @fromBackingInt(@intCast(bytes[9]));
             p.error_code = (@as(u16, bytes[10]) << 8) | bytes[11];
         }
         return p;
@@ -176,8 +176,8 @@ pub const DataBlock = struct {
 
     pub fn decode(bytes: []const u8) Error!DataBlock {
         if (bytes.len < 4) return error.ShortData;
-        const rc: items.ReturnCode = @enumFromInt(bytes[0]);
-        const ts: items.DataTransportSize = @enumFromInt(bytes[1]);
+        const rc: items.ReturnCode = @fromBackingInt(@intCast(bytes[0]));
+        const ts: items.DataTransportSize = @fromBackingInt(@intCast(bytes[1]));
         const raw: u16 = (@as(u16, bytes[2]) << 8) | bytes[3];
         // F9: this used to compute `raw / 8` by hand for a bit-counted
         // length, silently floor-dividing a length that is not a whole
@@ -197,8 +197,8 @@ pub const DataBlock = struct {
             @intCast(payload.len * 8)
         else
             @intCast(payload.len);
-        out[0] = @intFromEnum(rc);
-        out[1] = @intFromEnum(ts);
+        out[0] = @backingInt(rc);
+        out[1] = @backingInt(ts);
         out[2] = @intCast(raw >> 8);
         out[3] = @intCast(raw & 0xFF);
         @memcpy(out[4..][0..payload.len], payload);
@@ -324,7 +324,7 @@ pub const cpu_status_offset: usize = 3;
 pub fn cpuStatusFrom(resp: SzlResponse) ?CpuStatus {
     const rec = resp.record(0) orelse return null;
     if (rec.len <= cpu_status_offset) return null;
-    return @enumFromInt(rec[cpu_status_offset]);
+    return @fromBackingInt(@intCast(rec[cpu_status_offset]));
 }
 
 // ── tests ───────────────────────────────────────────────────────────────────
@@ -336,7 +336,7 @@ test "request sub-header round trip" {
     const p: Param = .{
         .message_type = .request,
         .function_group = .cpu_functions,
-        .subfunction = @intFromEnum(CpuSubfunction.read_szl),
+        .subfunction = @backingInt(CpuSubfunction.read_szl),
         .sequence = 0,
     };
     const enc = try p.encodeRequest(&buf);
@@ -430,8 +430,8 @@ test "F9: a bit-counted length that is not a whole octet is refused, not floor-d
     // does not describe a whole number of octets.
     for ([_]u16{ 1, 4, 12, 15, 17 }) |raw| {
         var buf: [8]u8 = undefined;
-        buf[0] = @intFromEnum(items.ReturnCode.success);
-        buf[1] = @intFromEnum(items.DataTransportSize.byte_word_dword);
+        buf[0] = @backingInt(items.ReturnCode.success);
+        buf[1] = @backingInt(items.DataTransportSize.byte_word_dword);
         buf[2] = @intCast(raw >> 8);
         buf[3] = @intCast(raw & 0xFF);
         try testing.expectError(error.LengthTransportMismatch, DataBlock.decode(buf[0..8]));
@@ -439,8 +439,8 @@ test "F9: a bit-counted length that is not a whole octet is refused, not floor-d
     // Positive control: a multiple of 8 still decodes, at the octet count
     // `items.decodeLength` (and the old `raw / 8`) both agree on.
     var ok: [8]u8 = undefined;
-    ok[0] = @intFromEnum(items.ReturnCode.success);
-    ok[1] = @intFromEnum(items.DataTransportSize.byte_word_dword);
+    ok[0] = @backingInt(items.ReturnCode.success);
+    ok[1] = @backingInt(items.DataTransportSize.byte_word_dword);
     ok[2] = 0;
     ok[3] = 16; // 16 bits = 2 octets
     const dec = try DataBlock.decode(&ok);

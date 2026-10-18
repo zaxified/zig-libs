@@ -107,7 +107,7 @@ fn json(r: *Rng, out: []u8) void {
 
 /// Generate `set` (the caller frees with `deinit`).
 pub fn generate(gpa: std.mem.Allocator, set: Set) !Generated {
-    var r: Rng = .{ .s = @as(u64, set.nb) *% 131 +% @intFromEnum(set.kind) +% set.seed *% 0xD1B54A32D192ED03 };
+    var r: Rng = .{ .s = @as(u64, set.nb) *% 131 +% @backingInt(set.kind) +% set.seed *% 0xD1B54A32D192ED03 };
     const sizes = try gpa.alloc(usize, set.nb);
     errdefer gpa.free(sizes);
     var total: usize = 0;

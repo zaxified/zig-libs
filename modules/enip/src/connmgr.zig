@@ -263,8 +263,8 @@ pub const ConnectionParameters = struct {
         if (self.size > max_small_size) return null;
         var v: u16 = self.size & 0x01FF;
         if (self.variable) v |= 1 << 9;
-        v |= @as(u16, @intFromEnum(self.priority)) << 10;
-        v |= @as(u16, @intFromEnum(self.connection_type)) << 13;
+        v |= @as(u16, @backingInt(self.priority)) << 10;
+        v |= @as(u16, @backingInt(self.connection_type)) << 13;
         if (self.redundant_owner) v |= 1 << 15;
         v |= @as(u16, @truncate(self.reserved)) & reserved_mask_16;
         return v;
@@ -274,8 +274,8 @@ pub const ConnectionParameters = struct {
         return .{
             .size = v & 0x01FF,
             .variable = v & (1 << 9) != 0,
-            .priority = @enumFromInt(@as(u2, @truncate(v >> 10))),
-            .connection_type = @enumFromInt(@as(u2, @truncate(v >> 13))),
+            .priority = @fromBackingInt(@intCast(@as(u2, @truncate(v >> 10)))),
+            .connection_type = @fromBackingInt(@intCast(@as(u2, @truncate(v >> 13)))),
             .redundant_owner = v & (1 << 15) != 0,
             .reserved = v & reserved_mask_16,
         };
@@ -284,8 +284,8 @@ pub const ConnectionParameters = struct {
     pub fn toU32(self: ConnectionParameters) u32 {
         var v: u32 = self.size;
         if (self.variable) v |= 1 << 25;
-        v |= @as(u32, @intFromEnum(self.priority)) << 26;
-        v |= @as(u32, @intFromEnum(self.connection_type)) << 29;
+        v |= @as(u32, @backingInt(self.priority)) << 26;
+        v |= @as(u32, @backingInt(self.connection_type)) << 29;
         if (self.redundant_owner) v |= @as(u32, 1) << 31;
         v |= self.reserved & reserved_mask_32;
         return v;
@@ -295,8 +295,8 @@ pub const ConnectionParameters = struct {
         return .{
             .size = @truncate(v),
             .variable = v & (1 << 25) != 0,
-            .priority = @enumFromInt(@as(u2, @truncate(v >> 26))),
-            .connection_type = @enumFromInt(@as(u2, @truncate(v >> 29))),
+            .priority = @fromBackingInt(@intCast(@as(u2, @truncate(v >> 26)))),
+            .connection_type = @fromBackingInt(@intCast(@as(u2, @truncate(v >> 29)))),
             .redundant_owner = v & (@as(u32, 1) << 31) != 0,
             .reserved = v & reserved_mask_32,
         };

@@ -183,7 +183,7 @@ test "full stack round-trip: link -> transport -> app, single frame" {
     var app_out: [16]u8 = undefined;
     const app_fragment = try application.buildRequest(3, .read, objects.g60.readClassHeader(.class0), &app_out);
 
-    const control = link.Control{ .dir = true, .prm = true, .fcv_or_dfc = true, .function = @intFromEnum(link.PrimaryFunction.unconfirmed_user_data) };
+    const control = link.Control{ .dir = true, .prm = true, .fcv_or_dfc = true, .function = @backingInt(link.PrimaryFunction.unconfirmed_user_data) };
     var wire: [64]u8 = undefined;
     const wire_bytes = try sendFragment(control, 1024, 1, app_fragment, &wire);
 
@@ -211,7 +211,7 @@ test "full stack round-trip: multi-frame application fragment (>250 bytes)" {
     var app_fragment: [600]u8 = undefined;
     for (&app_fragment, 0..) |*b, i| b.* = @intCast((i * 7 + 3) % 256);
 
-    const control = link.Control{ .dir = false, .prm = true, .function = @intFromEnum(link.PrimaryFunction.unconfirmed_user_data) };
+    const control = link.Control{ .dir = false, .prm = true, .function = @backingInt(link.PrimaryFunction.unconfirmed_user_data) };
     var wire: [link.maxFrameLen(transport.max_segment_payload + 1) * 4]u8 = undefined;
     const wire_bytes = try sendFragment(control, 2, 3, &app_fragment, &wire);
 
@@ -252,7 +252,7 @@ test "master builds READ, outstation parses it; outstation builds RESPONSE, mast
     }, &req_out);
 
     var frame_out: [64]u8 = undefined;
-    const req_control = link.Control{ .dir = true, .prm = true, .fcv_or_dfc = true, .function = @intFromEnum(link.PrimaryFunction.unconfirmed_user_data) };
+    const req_control = link.Control{ .dir = true, .prm = true, .fcv_or_dfc = true, .function = @backingInt(link.PrimaryFunction.unconfirmed_user_data) };
     const req_frame = try link.encodeFrame(req_control, 1024, 1, req, &frame_out);
 
     // Outstation side: decode the frame, then the application request.

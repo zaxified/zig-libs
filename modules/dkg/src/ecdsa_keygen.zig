@@ -424,7 +424,7 @@ pub const Protocol = enum(u8) { keygen = 1, refresh = 2 };
 pub fn runTag(protocol: Protocol, session_id: []const u8, cfg: types.Config) RunTag {
     var h = std.crypto.hash.sha2.Sha256.init(.{});
     h.update("dkg/ecdsa/run-tag/v1");
-    h.update(&.{@intFromEnum(protocol)});
+    h.update(&.{@backingInt(protocol)});
     var u: [4]u8 = undefined;
     std.mem.writeInt(u32, &u, @intCast(session_id.len), .big);
     h.update(&u);
@@ -452,7 +452,7 @@ pub fn pushTagged(list: *std.ArrayList(Outgoing), allocator: std.mem.Allocator, 
         allocator.free(bytes);
     }
     bytes[0..run_tag_len].* = tag;
-    bytes[run_tag_len] = @intFromEnum(kind);
+    bytes[run_tag_len] = @backingInt(kind);
     @memcpy(bytes[run_tag_len + 1 ..], body);
     try list.append(allocator, .{ .to = to, .bytes = bytes });
 }
@@ -597,7 +597,7 @@ test "dealer-free keygen: a tampered Πfac aborts the receiver and names the pro
     // the one to party 1 is lost.
     try rig.deliver(allocator, struct {
         fn f(from: u32, to: u32, bytes: []u8) bool {
-            if (from != 2 or bytes[run_tag_len] != @intFromEnum(wire.Kind.ecdsa_fac_proof)) return true;
+            if (from != 2 or bytes[run_tag_len] != @backingInt(wire.Kind.ecdsa_fac_proof)) return true;
             if (to == 1) return false;
             bytes[bytes.len - 1] ^= 1;
             return true;
@@ -635,7 +635,7 @@ test "dealer-free keygen: a second Πfac frame from one prover is refused (mutat
     const msgs = try parties[0].takeOutgoing();
     defer wire.freeOutgoing(allocator, msgs);
     for (msgs) |m| {
-        if (m.bytes[run_tag_len] != @intFromEnum(wire.Kind.ecdsa_fac_proof)) continue;
+        if (m.bytes[run_tag_len] != @backingInt(wire.Kind.ecdsa_fac_proof)) continue;
         switch (m.to) {
             .party => |p| if (p != 2) continue,
             .broadcast => continue,

@@ -421,7 +421,7 @@ test "client: an unmodelled type id is reported, not fatal" {
     // element layout here.
     loop.deliver(&hex("680e00000000c80106002f0000000000"));
     const r = try c.poll(0);
-    try testing.expectEqual(@as(u8, 200), @intFromEnum(r.unsupported_asdu.type_id));
+    try testing.expectEqual(@as(u8, 200), @backingInt(r.unsupported_asdu.type_id));
     try testing.expectEqual(asdu_mod.Cot.activation, r.unsupported_asdu.cause.cot);
     // The connection survives it.
     try testing.expect(c.isStarted());

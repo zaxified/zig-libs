@@ -161,7 +161,7 @@ fn highbit32(v: u32) u32 {
 
 /// `ZSTD_rowMatchFinderSupported`.
 pub fn rowMatchFinderSupported(strategy: Strategy) bool {
-    return @intFromEnum(strategy) >= @intFromEnum(Strategy.greedy) and @intFromEnum(strategy) <= @intFromEnum(Strategy.lazy2);
+    return @backingInt(strategy) >= @backingInt(Strategy.greedy) and @backingInt(strategy) <= @backingInt(Strategy.lazy2);
 }
 
 /// `ZSTD_resolveRowMatchFinderMode(ZSTD_ps_auto, cParams)`: whether the
@@ -177,7 +177,7 @@ pub fn rowLog(cp: CParams) u32 {
 
 /// `ZSTD_cycleLog`: the binary-tree strategies keep two entries per position.
 pub fn cycleLog(cp: CParams) u32 {
-    return cp.chain_log - @intFromBool(@intFromEnum(cp.strategy) >= @intFromEnum(Strategy.btlazy2));
+    return cp.chain_log - @intFromBool(@backingInt(cp.strategy) >= @backingInt(Strategy.btlazy2));
 }
 
 /// `ZSTD_CONTENTSIZE_UNKNOWN`: a stream whose length is not pledged. It
@@ -663,7 +663,7 @@ pub fn resolveSplitAfterSequences(mode: Switch, cp: CParams) bool {
     return switch (mode) {
         .enable => true,
         .disable => false,
-        .auto => @intFromEnum(cp.strategy) >= @intFromEnum(Strategy.btopt) and cp.window_log >= 17,
+        .auto => @backingInt(cp.strategy) >= @backingInt(Strategy.btopt) and cp.window_log >= 17,
     };
 }
 
@@ -701,7 +701,7 @@ test "only level 22 above 64 MB reaches long-distance matching" {
     // ZSTD_resolveEnableLdm: btopt and up with windowLog >= 27
     const ldm_on = struct {
         fn f(cp: CParams) bool {
-            return @intFromEnum(cp.strategy) >= @intFromEnum(Strategy.btopt) and cp.window_log >= 27;
+            return @backingInt(cp.strategy) >= @backingInt(Strategy.btopt) and cp.window_log >= 27;
         }
     }.f;
     for ([_]u64{ 1000, 16 * 1024, 100_000, 200_000, 10 << 20, 1 << 26, (1 << 26) + 1, 1 << 30 }) |size| {

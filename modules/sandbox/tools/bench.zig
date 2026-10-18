@@ -89,7 +89,7 @@ pub fn main(init: std.process.Init) !u8 {
     var ctx: Ctx = .{ .gpa = std.heap.smp_allocator };
     const list = sandbox.seccomp.default_allowlist;
     var txt: std.Io.Writer.Allocating = .init(arena);
-    for (list) |s| try txt.writer.print("{d}\n", .{@intFromEnum(s)});
+    for (list) |s| try txt.writer.print("{d}\n", .{@backingInt(s)});
     try dir.writeFile(io, .{ .sub_path = "allow.txt", .data = txt.written() });
     const prog = try sandbox.seccomp.buildDefault(arena, .kill_process);
     try dir.writeFile(io, .{ .sub_path = "ours.bpf", .data = std.mem.sliceAsBytes(prog) });

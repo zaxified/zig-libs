@@ -1706,7 +1706,7 @@ test "golden reply: STRSET of ETH_SS_STATS_STD pins the group-name table" {
         try testing.expectEqualStrings(name, std_set.get(@intCast(i)).?);
     }
     try testing.expectEqual(@as(?u32, 1), std_set.indexOf("eth-mac"));
-    try testing.expectEqual(uapi.StatsGroup.eth_mac, @as(uapi.StatsGroup, @enumFromInt(1)));
+    try testing.expectEqual(uapi.StatsGroup.eth_mac, @as(uapi.StatsGroup, @fromBackingInt(@intCast(1))));
 }
 
 test "golden reply: an EOPNOTSUPP carrying the kernel's own explanation" {

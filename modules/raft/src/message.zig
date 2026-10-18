@@ -125,7 +125,7 @@ pub const Message = struct {
     /// transport's business.
     pub fn encode(self: Message, buf: []u8) usize {
         std.debug.assert(buf.len >= self.encodedLen());
-        buf[0] = @intFromEnum(std.meta.activeTag(self.body));
+        buf[0] = @backingInt(std.meta.activeTag(self.body));
         switch (self.body) {
             .vote_req => |v| {
                 std.mem.writeInt(u64, buf[1..9], v.term, .little);
@@ -153,7 +153,7 @@ pub const Message = struct {
                 var off: usize = append_header_len;
                 for (a.entries) |e| {
                     std.mem.writeInt(u64, buf[off..][0..8], e.term, .little);
-                    buf[off + 8] = @intFromEnum(e.kind);
+                    buf[off + 8] = @backingInt(e.kind);
                     std.mem.writeInt(u32, buf[off + 9 ..][0..4], @intCast(e.data.len), .little);
                     off += entry_header_len;
                     @memcpy(buf[off..][0..e.data.len], e.data);

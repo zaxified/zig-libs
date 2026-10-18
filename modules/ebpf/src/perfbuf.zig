@@ -90,13 +90,13 @@ pub const DATA_HEAD_OFF: usize = 1024;
 pub const DATA_TAIL_OFF: usize = 1032;
 
 /// `PERF_RECORD_SAMPLE` — the record `bpf_perf_event_output` produces.
-pub const PERF_RECORD_SAMPLE: u32 = @intFromEnum(linux.PERF.RECORD.SAMPLE);
+pub const PERF_RECORD_SAMPLE: u32 = @backingInt(linux.PERF.RECORD.SAMPLE);
 /// `PERF_RECORD_LOST` — samples the kernel had to drop.
-pub const PERF_RECORD_LOST: u32 = @intFromEnum(linux.PERF.RECORD.LOST);
+pub const PERF_RECORD_LOST: u32 = @backingInt(linux.PERF.RECORD.LOST);
 
 /// `PERF_COUNT_SW_BPF_OUTPUT` — the software event
 /// `bpf_perf_event_output` writes into.
-pub const PERF_COUNT_SW_BPF_OUTPUT: u64 = @intFromEnum(linux.PERF.COUNT.SW.BPF_OUTPUT);
+pub const PERF_COUNT_SW_BPF_OUTPUT: u64 = @backingInt(linux.PERF.COUNT.SW.BPF_OUTPUT);
 
 // ── errors ──────────────────────────────────────────────────────────────────
 
@@ -1037,9 +1037,9 @@ test "fake perf ring: unknown record types are skipped but counted" {
     var ring = try FakePerfRing.init(testing.allocator, 4096);
     defer ring.deinit();
 
-    ring.appendOther(@intFromEnum(linux.PERF.RECORD.THROTTLE), 24);
+    ring.appendOther(@backingInt(linux.PERF.RECORD.THROTTLE), 24);
     ring.appendSample("real");
-    ring.appendOther(@intFromEnum(linux.PERF.RECORD.COMM), 16);
+    ring.appendOther(@backingInt(linux.PERF.RECORD.COMM), 16);
     ring.appendSample("also-real");
 
     var rb = ring.reader();

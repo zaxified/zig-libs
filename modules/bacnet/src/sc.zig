@@ -355,7 +355,7 @@ pub const OptionIter = struct {
         if (marker & option_flags.more == 0) self.finished = true;
         self.rest = self.rest[consumed..];
         return .{
-            .type = @enumFromInt(@as(u5, @truncate(marker & option_flags.type_mask))),
+            .type = @fromBackingInt(@intCast(@as(u5, @truncate(marker & option_flags.type_mask)))),
             .must_understand = marker & option_flags.must_understand != 0,
             .data = data,
         };
@@ -395,7 +395,7 @@ pub fn encodeOptions(options: []const Option, out: []u8) Error![]u8 {
     for (options, 0..) |opt, i| {
         const need = opt.wireLen();
         if (out.len < at + need) return error.NoSpace;
-        var marker: u8 = @intFromEnum(opt.type);
+        var marker: u8 = @backingInt(opt.type);
         if (i + 1 != options.len) marker |= option_flags.more;
         if (opt.must_understand) marker |= option_flags.must_understand;
         if (opt.data) |d| {
@@ -606,7 +606,7 @@ pub const Message = struct {
 /// the payload.
 pub fn decode(frame: []const u8) Error!Message {
     if (frame.len < header_len) return error.Truncated;
-    const func: Function = @enumFromInt(frame[0]);
+    const func: Function = @fromBackingInt(@intCast(frame[0]));
     const ctrl = frame[1];
     if (ctrl & control.reserved != 0) return error.ReservedControlBits;
 
@@ -646,8 +646,8 @@ pub fn decode(frame: []const u8) Error!Message {
         .advertisement => blk: {
             if (body.len != Advertisement.wire_len) return error.InvalidBody;
             break :blk .{ .advertisement = .{
-                .hub_status = @enumFromInt(body[0]),
-                .direct_connections = @enumFromInt(body[1]),
+                .hub_status = @fromBackingInt(@intCast(body[0])),
+                .direct_connections = @fromBackingInt(@intCast(body[1])),
                 .max_bvlc_length = std.mem.readInt(u16, body[2..4], .big),
                 .max_npdu_length = std.mem.readInt(u16, body[4..6], .big),
             } };
@@ -690,8 +690,8 @@ pub fn decode(frame: []const u8) Error!Message {
 
 fn decodeResult(body: []const u8) Error!Result {
     if (body.len < 2) return error.Truncated;
-    const func: Function = @enumFromInt(body[0]);
-    const code: ResultCode = @enumFromInt(body[1]);
+    const func: Function = @fromBackingInt(@intCast(body[0]));
+    const code: ResultCode = @fromBackingInt(@intCast(body[1]));
     switch (code) {
         .ack => {
             // An ACK carries no error block. Trailing octets would mean the
@@ -704,8 +704,8 @@ fn decodeResult(body: []const u8) Error!Result {
             if (body.len < 7) return error.Truncated;
             return .{ .function = func, .code = code, .err = .{
                 .header_marker = body[2],
-                .class = @enumFromInt(std.mem.readInt(u16, body[3..5], .big)),
-                .code = @enumFromInt(std.mem.readInt(u16, body[5..7], .big)),
+                .class = @fromBackingInt(@intCast(std.mem.readInt(u16, body[3..5], .big))),
+                .code = @fromBackingInt(@intCast(std.mem.readInt(u16, body[5..7], .big))),
                 .details = body[7..],
             } };
         },
@@ -752,7 +752,7 @@ pub fn encode(msg: Message, out: []u8) Error![]u8 {
     const total = encodedLen(msg);
     if (out.len < total) return error.NoSpace;
 
-    out[0] = @intFromEnum(msg.function());
+    out[0] = @backingInt(msg.function());
     out[1] = msg.header.controlOctet();
     std.mem.writeInt(u16, out[2..4], msg.header.message_id, .big);
 
@@ -773,12 +773,12 @@ pub fn encode(msg: Message, out: []u8) Error![]u8 {
     const body = out[at..total];
     switch (msg.payload) {
         .result => |r| {
-            body[0] = @intFromEnum(r.function);
-            body[1] = @intFromEnum(r.code);
+            body[0] = @backingInt(r.function);
+            body[1] = @backingInt(r.code);
             if (r.err) |e| {
                 body[2] = e.header_marker;
-                std.mem.writeInt(u16, body[3..5], @intFromEnum(e.class), .big);
-                std.mem.writeInt(u16, body[5..7], @intFromEnum(e.code), .big);
+                std.mem.writeInt(u16, body[3..5], @backingInt(e.class), .big);
+                std.mem.writeInt(u16, body[5..7], @backingInt(e.code), .big);
                 @memcpy(body[7..], e.details);
             }
         },
@@ -791,8 +791,8 @@ pub fn encode(msg: Message, out: []u8) Error![]u8 {
         .heartbeat_ack,
         => {},
         .advertisement => |a| {
-            body[0] = @intFromEnum(a.hub_status);
-            body[1] = @intFromEnum(a.direct_connections);
+            body[0] = @backingInt(a.hub_status);
+            body[1] = @backingInt(a.direct_connections);
             std.mem.writeInt(u16, body[2..4], a.max_bvlc_length, .big);
             std.mem.writeInt(u16, body[4..6], a.max_npdu_length, .big);
         },
@@ -956,7 +956,7 @@ test "a must-understand option we do not know is reported, not skipped" {
     // Option type 7 with the must-understand bit set: 0x40 | 7 = 0x47.
     const m = try decode(hex("0102000a470100", &buf));
     const bad = (try m.header.unsupportedOption()).?;
-    try testing.expectEqual(@as(u5, 7), @intFromEnum(bad.type));
+    try testing.expectEqual(@as(u5, 7), @backingInt(bad.type));
     try testing.expect(bad.must_understand);
 
     // The same option without the bit is skipped silently, which is the whole
@@ -1061,7 +1061,7 @@ test "BVLC-Result: a NAK carries marker, class, code and optional details" {
     const e = m.payload.result.err.?;
     try testing.expectEqual(@as(u8, 0), e.header_marker);
     try testing.expectEqual(types.ErrorClass.communication, e.class);
-    try testing.expectEqual(@as(u16, 151), @intFromEnum(e.code));
+    try testing.expectEqual(@as(u16, 151), @backingInt(e.code));
     try testing.expectEqualStrings("duplicate", e.details);
 
     // Seven octets is the minimum: the details string may be empty.
@@ -1140,7 +1140,7 @@ test "the empty-body functions refuse a body" {
         frame[3] = 1;
         frame[4] = 0xAA;
         try testing.expectError(error.InvalidBody, decode(&frame));
-        try testing.expect((try decode(frame[0..4])).function() == @as(Function, @enumFromInt(frame[0])));
+        try testing.expect((try decode(frame[0..4])).function() == @as(Function, @fromBackingInt(@intCast(frame[0]))));
     }
     _ = &buf;
 }
@@ -1233,7 +1233,7 @@ test "builders: ack and nak round-trip" {
     const n = nak(.encapsulated_npdu, 9, Vmac.broadcast, null, .{
         .header_marker = 0x41,
         .class = .communication,
-        .code = @enumFromInt(146),
+        .code = @fromBackingInt(@intCast(146)),
         .details = "no",
     });
     const back2 = try decode(try encode(n, &out));

@@ -274,13 +274,13 @@ fn parseType(text: []const u8) ?message.Type {
         .{ .name = "ANY", .code = 255 },
     };
     for (table) |t| {
-        if (std.ascii.eqlIgnoreCase(text, t.name)) return @enumFromInt(t.code);
+        if (std.ascii.eqlIgnoreCase(text, t.name)) return @fromBackingInt(@intCast(t.code));
     }
     if (text.len > 4 and std.ascii.startsWithIgnoreCase(text, "TYPE")) {
         const n = std.fmt.parseInt(u16, text[4..], 10) catch return null;
-        return @enumFromInt(n);
+        return @fromBackingInt(@intCast(n));
     }
-    if (std.fmt.parseInt(u16, text, 10) catch null) |n| return @enumFromInt(n);
+    if (std.fmt.parseInt(u16, text, 10) catch null) |n| return @fromBackingInt(@intCast(n));
     return null;
 }
 
@@ -760,7 +760,7 @@ fn typeTag(ty: message.Type) []const u8 {
 fn typeTagBuf(buf: []u8, ty: message.Type) []const u8 {
     const known = typeTag(ty);
     if (!std.mem.eql(u8, known, "TYPE?")) return known;
-    return std.fmt.bufPrint(buf, "TYPE{d}", .{@intFromEnum(ty)}) catch "TYPE?";
+    return std.fmt.bufPrint(buf, "TYPE{d}", .{@backingInt(ty)}) catch "TYPE?";
 }
 
 /// `message.Header.opcode` is a non-exhaustive `enum(u4)`; `@tagName`
@@ -771,7 +771,7 @@ fn opcodeTag(buf: []u8, op: message.Opcode) []const u8 {
         .query => "QUERY",
         .iquery => "IQUERY",
         .status => "STATUS",
-        else => std.fmt.bufPrint(buf, "OPCODE{d}", .{@intFromEnum(op)}) catch "OPCODE?",
+        else => std.fmt.bufPrint(buf, "OPCODE{d}", .{@backingInt(op)}) catch "OPCODE?",
     };
 }
 
@@ -792,7 +792,7 @@ fn rcodeTag(buf: []u8, rc: message.Rcode) []const u8 {
         .not_auth => "NOTAUTH",
         .not_zone => "NOTZONE",
         .bad_vers => "BADVERS",
-        else => std.fmt.bufPrint(buf, "RCODE{d}", .{@intFromEnum(rc)}) catch "RCODE?",
+        else => std.fmt.bufPrint(buf, "RCODE{d}", .{@backingInt(rc)}) catch "RCODE?",
     };
 }
 

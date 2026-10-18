@@ -95,7 +95,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // Output pin: the two verdicts and the set sizes, as hex (the driver
     // pins `ctgrind_result=<hex>`; a harness that never reached the gate
     // could not print these values).
-    const pin: u32 = (@as(u32, @intFromEnum(good)) << 24) | (@as(u32, @intFromEnum(bad)) << 16) |
+    const pin: u32 = (@as(u32, @backingInt(good)) << 24) | (@as(u32, @backingInt(bad)) << 16) |
         (@as(u32, @intCast(g.tokenCount())) << 8) | @as(u32, @intCast(g.basicCount()));
     std.debug.print("ctgrind_result={x:0>8}\n", .{pin});
 }

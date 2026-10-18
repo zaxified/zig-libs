@@ -119,7 +119,7 @@ fn lpmTrieCreateAttr(max_entries: u32) BPF.MapCreateAttr {
 
 fn lpmTrieCreateAttrSized(key_size: u32, max_entries: u32) BPF.MapCreateAttr {
     var attr = std.mem.zeroes(BPF.MapCreateAttr);
-    attr.map_type = @intFromEnum(BPF.MapType.lpm_trie);
+    attr.map_type = @backingInt(BPF.MapType.lpm_trie);
     attr.key_size = key_size;
     attr.value_size = lpm_value_size;
     attr.max_entries = max_entries;
@@ -386,7 +386,7 @@ test "F5: createLpmTrieMap's attr carries BPF_F_NO_PREALLOC and the LPM_TRIE map
     // doc comment) -- a mutation dropping it would only be caught by a real
     // kernel map_create call, which needs CAP_BPF.
     const attr = lpmTrieCreateAttr(64);
-    try testing.expectEqual(@intFromEnum(BPF.MapType.lpm_trie), attr.map_type);
+    try testing.expectEqual(@backingInt(BPF.MapType.lpm_trie), attr.map_type);
     try testing.expectEqual(BPF.BPF_F_NO_PREALLOC, attr.map_flags);
     try testing.expectEqual(lpm_key_size, attr.key_size);
     try testing.expectEqual(lpm_value_size, attr.value_size);
@@ -394,7 +394,7 @@ test "F5: createLpmTrieMap's attr carries BPF_F_NO_PREALLOC and the LPM_TRIE map
 
     // The IPv6 map: same type and flag, 20-byte key (=> max prefixlen 128).
     const attr6 = lpmTrieCreateAttrSized(lpm6_key_size, 32);
-    try testing.expectEqual(@intFromEnum(BPF.MapType.lpm_trie), attr6.map_type);
+    try testing.expectEqual(@backingInt(BPF.MapType.lpm_trie), attr6.map_type);
     try testing.expectEqual(BPF.BPF_F_NO_PREALLOC, attr6.map_flags);
     try testing.expectEqual(@as(u32, 20), attr6.key_size);
     try testing.expectEqual(@as(u32, @sizeOf(@TypeOf(rules.LpmKey6.exact(@splat(0)).toBytes()))), attr6.key_size);

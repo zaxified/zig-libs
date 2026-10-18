@@ -149,7 +149,7 @@ fn dumpValue(comptime kind: pb.Kind, comptime E: type, v: E, w: *std.ArrayList(u
             try w.append(gpa, 'h');
             for (v) |b| try w.print(gpa, "{x:0>2}", .{b});
         },
-        .@"enum" => try w.print(gpa, "{d}", .{@intFromEnum(v)}),
+        .@"enum" => try w.print(gpa, "{d}", .{@backingInt(v)}),
         .message => {
             try w.append(gpa, '{');
             try dumpMessage(E, v, w, gpa);

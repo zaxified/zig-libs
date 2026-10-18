@@ -76,7 +76,7 @@ pub const PduKind = enum(u32) {
     _,
 
     pub fn tag(self: PduKind) ber.Tag {
-        return ber.Tag.ctxc(@intFromEnum(self));
+        return ber.Tag.ctxc(@backingInt(self));
     }
 };
 
@@ -106,7 +106,7 @@ pub const Service = enum(u32) {
     _,
 
     pub fn tag(self: Service) ber.Tag {
-        return ber.Tag.ctxc(@intFromEnum(self));
+        return ber.Tag.ctxc(@backingInt(self));
     }
 };
 
@@ -370,7 +370,7 @@ pub const Pdu = union(enum) {
 pub fn decode(bytes: []const u8) Error!Pdu {
     const e = try ber.decode(bytes);
     if (e.tag.class != .context) return error.UnknownPdu;
-    const kind: PduKind = @enumFromInt(e.tag.number);
+    const kind: PduKind = @fromBackingInt(@intCast(e.tag.number));
     return switch (kind) {
         .confirmed_request => .{ .confirmed_request = try decodeConfirmed(e.content) },
         .confirmed_response => .{ .confirmed_response = try decodeConfirmed(e.content) },
@@ -381,7 +381,7 @@ pub fn decode(bytes: []const u8) Error!Pdu {
             const inner = try ber.decode(e.content);
             if (inner.tag.class != .context) return error.UnknownPdu;
             break :blk .{ .unconfirmed = .{
-                .service = @enumFromInt(inner.tag.number),
+                .service = @fromBackingInt(@intCast(inner.tag.number)),
                 .body = inner.content,
             } };
         },
@@ -404,7 +404,7 @@ fn decodeConfirmed(content: []const u8) Error!ConfirmedRequest {
     if (svc.tag.class != .context) return error.UnsupportedService;
     return .{
         .invoke_id = invoke_id,
-        .service = @enumFromInt(svc.tag.number),
+        .service = @fromBackingInt(@intCast(svc.tag.number)),
         .body = svc.content,
     };
 }
@@ -424,7 +424,7 @@ fn decodeConfirmedError(content: []const u8) Error!ConfirmedErrorPdu {
                 if (f.tag.eql(ber.Tag.ctxc(0))) {
                     // errorClass [0] CHOICE — the alternative *is* the class.
                     const c = try ber.decode(f.content);
-                    error_class = @enumFromInt(c.tag.number);
+                    error_class = @fromBackingInt(@intCast(c.tag.number));
                     code = ber.decodeInt(i32, c.content) catch 0;
                 }
             }
@@ -571,7 +571,7 @@ pub fn encodeConfirmedError(invoke_id: u32, class: ErrorClass, code: i32, out: [
     const outer = w.mark();
     const se = w.mark();
     const ec = w.mark();
-    try w.integer(ber.Tag.ctx(@intFromEnum(class)), code);
+    try w.integer(ber.Tag.ctx(@backingInt(class)), code);
     try w.header(ber.Tag.ctxc(0), ec);
     try w.header(ber.Tag.ctxc(2), se);
     try w.unsigned(ber.Tag.ctx(0), invoke_id);
@@ -622,7 +622,7 @@ pub const AccessResult = union(enum) {
     pub fn decode(bytes: []const u8) Error!AccessResult {
         const e = try ber.decode(bytes);
         if (e.tag.eql(ber.Tag.ctx(0))) {
-            return .{ .failure = @enumFromInt(try ber.decodeUint(u8, e.content)) };
+            return .{ .failure = @fromBackingInt(@intCast(try ber.decodeUint(u8, e.content))) };
         }
         return .{ .success = try Data.decode(bytes) };
     }
@@ -635,7 +635,7 @@ pub const AccessResultIterator = struct {
     pub fn next(self: *AccessResultIterator) Error!?AccessResult {
         const e = (try self.inner.next()) orelse return null;
         if (e.tag.eql(ber.Tag.ctx(0))) {
-            return .{ .failure = @enumFromInt(try ber.decodeUint(u8, e.content)) };
+            return .{ .failure = @fromBackingInt(@intCast(try ber.decodeUint(u8, e.content))) };
         }
         const kind = try mmsdata.Kind.fromTag(e.tag);
         if (kind.isConstructed() != e.tag.constructed) return error.WrongDataType;
@@ -671,7 +671,7 @@ pub fn closeReadResponse(w: *ber.Writer, results_mark: usize, invoke_id: u32) Er
 
 /// Writes one failed `AccessResult`.
 pub fn emitAccessFailure(w: *ber.Writer, e: DataAccessError) Error!void {
-    try w.integer(ber.Tag.ctx(0), @intFromEnum(e));
+    try w.integer(ber.Tag.ctx(0), @backingInt(e));
 }
 
 // ── Write ───────────────────────────────────────────────────────────────────
@@ -727,7 +727,7 @@ pub const WriteResultIterator = struct {
 
     pub fn next(self: *WriteResultIterator) Error!?WriteResult {
         const e = (try self.inner.next()) orelse return null;
-        if (e.tag.eql(ber.Tag.ctx(0))) return .{ .failure = @enumFromInt(try ber.decodeUint(u8, e.content)) };
+        if (e.tag.eql(ber.Tag.ctx(0))) return .{ .failure = @fromBackingInt(@intCast(try ber.decodeUint(u8, e.content))) };
         if (e.tag.eqlLoose(ber.Tag.ctx(1))) return .success;
         return error.UnexpectedTag;
     }
@@ -744,7 +744,7 @@ pub fn encodeWriteResponse(invoke_id: u32, results: []const WriteResult, out: []
     while (i > 0) {
         i -= 1;
         switch (results[i]) {
-            .failure => |e| try w.integer(ber.Tag.ctx(0), @intFromEnum(e)),
+            .failure => |e| try w.integer(ber.Tag.ctx(0), @backingInt(e)),
             .success => try w.null_(ber.Tag.ctx(1)),
         }
     }
@@ -778,7 +778,7 @@ pub fn encodeGetNameList(
     }
     try w.header(ber.Tag.ctxc(1), s);
     const c = w.mark();
-    try w.integer(ber.Tag.ctx(0), @intFromEnum(class));
+    try w.integer(ber.Tag.ctx(0), @backingInt(class));
     try w.header(ber.Tag.ctxc(0), c);
     try closeConfirmedRequest(&w, m, .get_name_list, invoke_id);
     return w.done();
@@ -798,7 +798,7 @@ pub fn decodeGetNameListRequest(body: []const u8) Error!GetNameListRequest {
     while (try it.next()) |e| {
         if (e.tag.eql(ber.Tag.ctxc(0))) {
             const c = try ber.expect(e.content, ber.Tag.ctx(0));
-            class = @enumFromInt(try ber.decodeUint(u8, c.content));
+            class = @fromBackingInt(@intCast(try ber.decodeUint(u8, c.content)));
         } else if (e.tag.eql(ber.Tag.ctxc(1))) {
             const s = try ber.decode(e.content);
             scope = switch (s.tag.number) {
@@ -1374,7 +1374,7 @@ pub fn decodeFileDirectoryResponse(body: []const u8) Error!FileDirectoryResponse
 
 // A `[N] IMPLICIT Integer32` service body is primitive, not constructed.
 fn closeConfirmedRequestPrimitive(w: *ber.Writer, mark: usize, service: Service, invoke_id: u32) Error!void {
-    try w.header(ber.Tag.ctx(@intFromEnum(service)), mark);
+    try w.header(ber.Tag.ctx(@backingInt(service)), mark);
     try w.unsigned(ber.Tag.uni(ber.Universal.integer), invoke_id);
     try w.header(PduKind.confirmed_request.tag(), mark);
 }

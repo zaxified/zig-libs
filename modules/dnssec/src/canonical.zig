@@ -98,7 +98,7 @@ pub fn buildSignedData(gpa: std.mem.Allocator, rrset: []const dns.Record, rrsig:
         var rr: std.ArrayList(u8) = .empty;
         try rr.appendSlice(arena, owner_wire);
         try appendInt(&rr, arena, u16, rrsig.type_covered);
-        try appendInt(&rr, arena, u16, @intFromEnum(class));
+        try appendInt(&rr, arena, u16, @backingInt(class));
         try appendInt(&rr, arena, u32, rrsig.original_ttl);
         try appendInt(&rr, arena, u16, @intCast(canon_rdata.len));
         const rdata_off = rr.items.len;

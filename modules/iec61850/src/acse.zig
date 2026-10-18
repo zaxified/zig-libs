@@ -149,7 +149,7 @@ pub fn decodeAare(bytes: []const u8) Error!Aare {
         if (e.tag.eql(tag_application_context_name)) {
             a.application_context = .{ .bytes = (try ber.expect(e.content, ber.Tag.uni(ber.Universal.object_identifier))).content };
         } else if (e.tag.eql(tag_result)) {
-            a.result = @enumFromInt(try ber.decodeUint(u8, (try ber.expect(e.content, ber.Tag.uni(ber.Universal.integer))).content));
+            a.result = @fromBackingInt(@intCast(try ber.decodeUint(u8, (try ber.expect(e.content, ber.Tag.uni(ber.Universal.integer))).content)));
         } else if (e.tag.eql(tag_result_source_diagnostic)) {
             var d = ber.Iterator.init(e.content);
             if (try d.next()) |src| {
@@ -242,7 +242,7 @@ pub fn encodeAare(user_information: []const u8, opts: AareOptions, out: []u8) Er
     try w.header(tag_result_source_diagnostic, diag);
 
     const res = w.mark();
-    try w.integer(ber.Tag.uni(ber.Universal.integer), @intFromEnum(opts.result));
+    try w.integer(ber.Tag.uni(ber.Universal.integer), @backingInt(opts.result));
     try w.header(tag_result, res);
 
     const acn = w.mark();

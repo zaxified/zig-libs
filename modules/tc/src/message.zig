@@ -37,18 +37,18 @@ pub const tcamsg_len = action.tcamsg_len;
 
 // ── rtnetlink message types ─────────────────────────────────────────────────
 
-pub const RTM_NEWQDISC: u16 = @intFromEnum(linux.NetlinkMessageType.RTM_NEWQDISC);
-pub const RTM_DELQDISC: u16 = @intFromEnum(linux.NetlinkMessageType.RTM_DELQDISC);
-pub const RTM_GETQDISC: u16 = @intFromEnum(linux.NetlinkMessageType.RTM_GETQDISC);
-pub const RTM_NEWTCLASS: u16 = @intFromEnum(linux.NetlinkMessageType.RTM_NEWTCLASS);
-pub const RTM_DELTCLASS: u16 = @intFromEnum(linux.NetlinkMessageType.RTM_DELTCLASS);
-pub const RTM_GETTCLASS: u16 = @intFromEnum(linux.NetlinkMessageType.RTM_GETTCLASS);
-pub const RTM_NEWTFILTER: u16 = @intFromEnum(linux.NetlinkMessageType.RTM_NEWTFILTER);
-pub const RTM_DELTFILTER: u16 = @intFromEnum(linux.NetlinkMessageType.RTM_DELTFILTER);
-pub const RTM_GETTFILTER: u16 = @intFromEnum(linux.NetlinkMessageType.RTM_GETTFILTER);
-pub const RTM_NEWACTION: u16 = @intFromEnum(linux.NetlinkMessageType.RTM_NEWACTION);
-pub const RTM_DELACTION: u16 = @intFromEnum(linux.NetlinkMessageType.RTM_DELACTION);
-pub const RTM_GETACTION: u16 = @intFromEnum(linux.NetlinkMessageType.RTM_GETACTION);
+pub const RTM_NEWQDISC: u16 = @backingInt(linux.NetlinkMessageType.RTM_NEWQDISC);
+pub const RTM_DELQDISC: u16 = @backingInt(linux.NetlinkMessageType.RTM_DELQDISC);
+pub const RTM_GETQDISC: u16 = @backingInt(linux.NetlinkMessageType.RTM_GETQDISC);
+pub const RTM_NEWTCLASS: u16 = @backingInt(linux.NetlinkMessageType.RTM_NEWTCLASS);
+pub const RTM_DELTCLASS: u16 = @backingInt(linux.NetlinkMessageType.RTM_DELTCLASS);
+pub const RTM_GETTCLASS: u16 = @backingInt(linux.NetlinkMessageType.RTM_GETTCLASS);
+pub const RTM_NEWTFILTER: u16 = @backingInt(linux.NetlinkMessageType.RTM_NEWTFILTER);
+pub const RTM_DELTFILTER: u16 = @backingInt(linux.NetlinkMessageType.RTM_DELTFILTER);
+pub const RTM_GETTFILTER: u16 = @backingInt(linux.NetlinkMessageType.RTM_GETTFILTER);
+pub const RTM_NEWACTION: u16 = @backingInt(linux.NetlinkMessageType.RTM_NEWACTION);
+pub const RTM_DELACTION: u16 = @backingInt(linux.NetlinkMessageType.RTM_DELACTION);
+pub const RTM_GETACTION: u16 = @backingInt(linux.NetlinkMessageType.RTM_GETACTION);
 
 /// How a create-style request behaves when the object already exists.
 /// Mirrors `netlink.Create` for the tc families.

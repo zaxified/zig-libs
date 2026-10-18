@@ -97,12 +97,12 @@ pub fn parse(attr_bytes: []const u8) Error!Interface {
     while (try it.next()) |a| switch (a.type) {
         uapi.ATTR.IFINDEX => out.ifindex = try a.asU32(),
         uapi.ATTR.WIPHY => out.wiphy = try a.asU32(),
-        uapi.ATTR.IFTYPE => out.iftype = @enumFromInt(try a.asU32()),
+        uapi.ATTR.IFTYPE => out.iftype = @fromBackingInt(@intCast(try a.asU32())),
         uapi.ATTR.GENERATION => out.generation = try a.asU32(),
         uapi.ATTR.WIPHY_FREQ => out.freq_mhz = try a.asU32(),
         uapi.ATTR.CENTER_FREQ1 => out.center_freq1_mhz = try a.asU32(),
         uapi.ATTR.CENTER_FREQ2 => out.center_freq2_mhz = try a.asU32(),
-        uapi.ATTR.CHANNEL_WIDTH => out.chan_width = @enumFromInt(try a.asU32()),
+        uapi.ATTR.CHANNEL_WIDTH => out.chan_width = @fromBackingInt(@intCast(try a.asU32())),
         uapi.ATTR.WIPHY_TX_POWER_LEVEL => out.tx_power_mbm = try a.asI32(),
         uapi.ATTR.WDEV => {
             if (a.data.len != 8) return error.BadLength;

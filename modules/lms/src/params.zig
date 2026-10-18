@@ -28,7 +28,7 @@ pub const OtsParamSet = enum(u32) {
     }
 
     pub fn typecode(self: OtsParamSet) u32 {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
 
     /// Winternitz width in bits.
@@ -81,7 +81,7 @@ pub const ParamSet = enum(u32) {
     }
 
     pub fn typecode(self: ParamSet) u32 {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
 
     /// Tree height `h`; the tree has `2^h` leaves.

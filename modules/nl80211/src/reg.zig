@@ -127,8 +127,8 @@ pub fn parse(gpa: std.mem.Allocator, attr_bytes: []const u8) ParseError!RegDomai
             d.alpha2 = s[0..2].*;
         },
         uapi.ATTR.WIPHY => d.wiphy = try a.asU32(),
-        uapi.ATTR.DFS_REGION => d.dfs_region = @enumFromInt(@as(u32, try a.asU8())),
-        uapi.ATTR.REG_TYPE => d.reg_type = @enumFromInt(@as(u32, try a.asU8())),
+        uapi.ATTR.DFS_REGION => d.dfs_region = @fromBackingInt(@intCast(@as(u32, try a.asU8()))),
+        uapi.ATTR.REG_TYPE => d.reg_type = @fromBackingInt(@intCast(@as(u32, try a.asU8()))),
         uapi.ATTR.REG_INITIATOR => d.initiator = try a.asU8(),
         uapi.ATTR.REG_RULES => {
             if (d.rules.len != 0) return error.BadLength; // repeated attribute

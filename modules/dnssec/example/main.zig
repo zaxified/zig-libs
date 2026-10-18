@@ -55,7 +55,7 @@ pub fn main() !void {
     const owner = "example.com";
     const rrset = [_]dns.Record{.{
         .name = owner,
-        .ty = @enumFromInt(dnssec.rdata.rr_type.dnskey),
+        .ty = @fromBackingInt(@intCast(dnssec.rdata.rr_type.dnskey)),
         .class = .in,
         .ttl = 3600,
         .data = .{ .unknown = &raw_dnskey },

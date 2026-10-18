@@ -946,7 +946,7 @@ test "per-participant run reproduces the lockstep driver for the same randomness
 }
 
 fn tamperShare1to2(from: u32, to: u32, bytes: []u8) Action {
-    if (from == 1 and to == 2 and bytes[0] == @intFromEnum(wire.Kind.share)) bytes[1 + 8 + Ns - 1] ^= 1;
+    if (from == 1 and to == 2 and bytes[0] == @backingInt(wire.Kind.share)) bytes[1 + 8 + Ns - 1] ^= 1;
     return .deliver;
 }
 
@@ -973,8 +973,8 @@ test "a bad share is complained about and DEFENDED by an honest dealer: same key
 }
 
 fn tamperShareAndDropDefense(from: u32, to: u32, bytes: []u8) Action {
-    if (from == 3 and to == 1 and bytes[0] == @intFromEnum(wire.Kind.share)) bytes[1 + 8 + Ns - 1] ^= 1;
-    if (from == 3 and bytes[0] == @intFromEnum(wire.Kind.defense)) return .drop;
+    if (from == 3 and to == 1 and bytes[0] == @backingInt(wire.Kind.share)) bytes[1 + 8 + Ns - 1] ^= 1;
+    if (from == 3 and bytes[0] == @backingInt(wire.Kind.defense)) return .drop;
     return .deliver;
 }
 
@@ -1027,7 +1027,7 @@ test "a crashed party (never broadcasts) is treated as absent and excluded" {
 /// valid points, the wrong ones, and the SAME bytes for every receiver (the
 /// reliable broadcast GJKR assumes; a cheating dealer cannot do better).
 fn tamperFeldmanOf2(from: u32, _: u32, bytes: []u8) Action {
-    if (from == 2 and bytes[0] == @intFromEnum(wire.Kind.feldman_broadcast)) {
+    if (from == 2 and bytes[0] == @backingInt(wire.Kind.feldman_broadcast)) {
         @memcpy(bytes[1 + 8 + Ne ..][0..Ne], bytes[1 + 8 ..][0..Ne]);
     }
     return .deliver;
@@ -1084,7 +1084,7 @@ test "a QUAL dealer that withholds its Feldman commitments is reconstructed, not
     defer net.deinit();
     net.filter = struct {
         fn f(from: u32, _: u32, bytes: []u8) Action {
-            return if (from == 3 and bytes[0] == @intFromEnum(wire.Kind.feldman_broadcast)) .drop else .deliver;
+            return if (from == 3 and bytes[0] == @backingInt(wire.Kind.feldman_broadcast)) .drop else .deliver;
         }
     }.f;
     try net.startAll();
@@ -1104,7 +1104,7 @@ test "a QUAL dealer that withholds its Feldman commitments is reconstructed, not
 }
 
 fn dropFeldmanOf3(from: u32, _: u32, bytes: []u8) Action {
-    return if (from == 3 and bytes[0] == @intFromEnum(wire.Kind.feldman_broadcast)) .drop else .deliver;
+    return if (from == 3 and bytes[0] == @backingInt(wire.Kind.feldman_broadcast)) .drop else .deliver;
 }
 
 test "reveals that do not verify, or come twice, are refused; too few verified shares abort the party" {
@@ -1129,7 +1129,7 @@ test "reveals that do not verify, or come twice, are refused; too few verified s
     // committed one, then the real one, then again.
     var m: types.ShareMsg = .{ .dealer = 3, .receiver = 2, .s = p2.accepted[2].?.add(Scalar.one), .s_prime = p2.accepted_sp[2].? };
     var fr: [1 + types.ShareMsg.encoded_length]u8 = undefined;
-    fr[0] = @intFromEnum(wire.Kind.reveal);
+    fr[0] = @backingInt(wire.Kind.reveal);
     @memcpy(fr[1..], &m.toBytes());
     try testing.expectError(error.Unverified, p1.handle(2, &fr));
     try testing.expectError(error.SenderMismatch, p1.handle(3, &fr));
@@ -1192,7 +1192,7 @@ test "a Feldman complaint about a dealer outside QUAL is refused (it would have 
     // would look valid, but dealer 3 is not in QUAL.
     const m: types.ShareMsg = .{ .dealer = 3, .receiver = 2, .s = p2.wire_s[2].?, .s_prime = p2.wire_sp[2].? };
     var fr: [1 + types.ShareMsg.encoded_length]u8 = undefined;
-    fr[0] = @intFromEnum(wire.Kind.feldman_complaint);
+    fr[0] = @backingInt(wire.Kind.feldman_complaint);
     @memcpy(fr[1..], &m.toBytes());
     try testing.expectError(error.Unsolicited, p1.handle(2, &fr));
     try net.finish();
@@ -1250,12 +1250,12 @@ test "a dealer cannot make some honest parties finish with a wrong key while the
         defer allocator.free(vec);
         const body = try (types.FeldmanBroadcast{ .dealer = 5, .commitments = vec }).toBytesAlloc(allocator);
         defer allocator.free(body);
-        bent_feldman[0] = @intFromEnum(wire.Kind.feldman_broadcast);
+        bent_feldman[0] = @backingInt(wire.Kind.feldman_broadcast);
         @memcpy(bent_feldman[1..], body);
     }
     net.filter = struct {
         fn f(from: u32, _: u32, bytes: []u8) Action {
-            if (from == 5 and bytes[0] == @intFromEnum(wire.Kind.feldman_broadcast)) @memcpy(bytes, &bent_feldman);
+            if (from == 5 and bytes[0] == @backingInt(wire.Kind.feldman_broadcast)) @memcpy(bytes, &bent_feldman);
             return .deliver;
         }
     }.f;
@@ -1288,7 +1288,7 @@ test "Feldman complaints and reveals that do not verify are refused" {
     // Feldman check passes, so the complaint is refused and exposes nobody.
     var m: types.ShareMsg = .{ .dealer = 3, .receiver = 2, .s = p2.accepted[2].?, .s_prime = p2.accepted_sp[2].? };
     var fr: [1 + types.ShareMsg.encoded_length]u8 = undefined;
-    fr[0] = @intFromEnum(wire.Kind.feldman_complaint);
+    fr[0] = @backingInt(wire.Kind.feldman_complaint);
     @memcpy(fr[1..], &m.toBytes());
     try testing.expectError(error.Unverified, p1.handle(2, &fr));
     // ... and with a share that is not the committed one: Pedersen fails.
@@ -1304,7 +1304,7 @@ test "Feldman complaints and reveals that do not verify are refused" {
     try testing.expectError(error.Malformed, p1.handle(2, &fr));
     try testing.expectError(error.Malformed, p1.handle(2, fr[0 .. fr.len - 1]));
     // A reveal belongs to the next round.
-    fr[0] = @intFromEnum(wire.Kind.reveal);
+    fr[0] = @backingInt(wire.Kind.reveal);
     try testing.expectError(error.WrongRound, p1.handle(2, &fr));
 
     // Nobody was exposed: the run finishes without a reveal round.
@@ -1358,7 +1358,7 @@ const Pair = struct {
     /// The frame party 2 sent to party 1 of the given kind.
     fn frameOf(self: *const Pair, kind: wire.Kind) []const u8 {
         for (self.msgs2) |m| {
-            if (m.bytes[0] != @intFromEnum(kind)) continue;
+            if (m.bytes[0] != @backingInt(kind)) continue;
             switch (m.to) {
                 .party => |j| if (j != 1) continue,
                 .broadcast => {},
@@ -1381,7 +1381,7 @@ test "refusals: malformed, wrong sender, replay, wrong round, unknown kind, afte
     try testing.expectError(error.Malformed, p1.handle(2, &.{}));
     try testing.expectError(error.UnknownKind, p1.handle(2, &.{ 0, 1, 2 }));
     try testing.expectError(error.UnknownKind, p1.handle(2, &.{ 255, 1, 2 }));
-    try testing.expectError(error.UnknownKind, p1.handle(2, &.{@intFromEnum(wire.Kind.reshare_share)}));
+    try testing.expectError(error.UnknownKind, p1.handle(2, &.{@backingInt(wire.Kind.reshare_share)}));
     try testing.expectError(error.UnknownSender, p1.handle(0, ped));
     try testing.expectError(error.UnknownSender, p1.handle(4, ped));
     try testing.expectError(error.UnknownSender, p1.handle(1, ped)); // ourselves
@@ -1422,11 +1422,11 @@ test "refusals: malformed, wrong sender, replay, wrong round, unknown kind, afte
     // Wrong round: a complaint / defense / Feldman frame while collecting shares.
     const c: Complaint = .{ .complainant = 2, .accused = 3 };
     var cf: [1 + Complaint.encoded_length]u8 = undefined;
-    cf[0] = @intFromEnum(wire.Kind.complaint);
+    cf[0] = @backingInt(wire.Kind.complaint);
     @memcpy(cf[1..], &c.toBytes());
     try testing.expectError(error.WrongRound, p1.handle(2, &cf));
-    try testing.expectError(error.WrongRound, p1.handle(2, &.{@intFromEnum(wire.Kind.defense)}));
-    try testing.expectError(error.WrongRound, p1.handle(2, &.{@intFromEnum(wire.Kind.feldman_broadcast)}));
+    try testing.expectError(error.WrongRound, p1.handle(2, &.{@backingInt(wire.Kind.defense)}));
+    try testing.expectError(error.WrongRound, p1.handle(2, &.{@backingInt(wire.Kind.feldman_broadcast)}));
 
     // Move on: now the shares frame is the wrong round.
     try p1.advance(); // party 3 never spoke -> absent, no complaint about 2
@@ -1443,7 +1443,7 @@ test "refusals: malformed, wrong sender, replay, wrong round, unknown kind, afte
     try testing.expectError(error.Malformed, p1.handle(2, cf[0 .. cf.len - 1]));
     // A defense nobody asked for.
     var df: [1 + types.ShareMsg.encoded_length]u8 = undefined;
-    df[0] = @intFromEnum(wire.Kind.defense);
+    df[0] = @backingInt(wire.Kind.defense);
     @memcpy(df[1..], share[1..]);
     try testing.expectError(error.WrongRound, p1.handle(2, &df));
     try p1.advance();
@@ -1457,7 +1457,7 @@ test "start and advance are ordered" {
     var p = try Participant.init(allocator, .{ .t = 1, .n = 2 }, 1, prng.random());
     defer p.deinit();
     try testing.expectError(error.WrongRound, p.advance());
-    try testing.expectError(error.WrongRound, p.handle(2, &.{@intFromEnum(wire.Kind.share)}));
+    try testing.expectError(error.WrongRound, p.handle(2, &.{@backingInt(wire.Kind.share)}));
     try testing.expectEqual(Phase.new, p.phase());
     try p.start();
     try testing.expectError(error.WrongRound, p.start());
@@ -1473,7 +1473,7 @@ test "finished run: handle and advance refuse; init validates its arguments" {
     try net.run();
     const p = &net.parties[0];
     try testing.expectEqual(Phase.done, p.phase());
-    try testing.expectError(error.Finished, p.handle(2, &.{@intFromEnum(wire.Kind.share)}));
+    try testing.expectError(error.Finished, p.handle(2, &.{@backingInt(wire.Kind.share)}));
     try testing.expectError(error.Finished, p.advance());
     try testing.expectError(error.InvalidConfig, Participant.init(allocator, .{ .t = 4, .n = 3 }, 1, prng.random()));
     try testing.expectError(error.InvalidConfig, Participant.init(allocator, .{ .t = 0, .n = 3 }, 1, prng.random()));
@@ -1491,7 +1491,7 @@ test "more than t distinct complaints evict a dealer even when every one is defe
     defer net.deinit();
     net.filter = struct {
         fn f(from: u32, to: u32, bytes: []u8) Action {
-            if (from == 4 and to <= 3 and bytes[0] == @intFromEnum(wire.Kind.share)) bytes[1 + 8 + Ns - 1] ^= 1;
+            if (from == 4 and to <= 3 and bytes[0] == @backingInt(wire.Kind.share)) bytes[1 + 8 + Ns - 1] ^= 1;
             return .deliver;
         }
     }.f;
@@ -1535,7 +1535,7 @@ test "replaying the recorded transcript (secrets revealed) reproduces the oracle
     // Round-1 broadcasts on the wire carry the oracle's Pedersen commitments.
     for (parties, tr.dealers) |*p, d| {
         for (p.outbox.items) |m| {
-            if (m.bytes[0] == @intFromEnum(wire.Kind.pedersen_broadcast)) {
+            if (m.bytes[0] == @backingInt(wire.Kind.pedersen_broadcast)) {
                 for (d.pedersen, 0..) |hx, k| try tn.expectHex(hx, m.bytes[1 + 8 + k * Ne ..][0..Ne]);
             } else {
                 // The share frame for party j carries the oracle's (s, s').
@@ -1576,7 +1576,7 @@ test "replaying the recorded transcript (secrets revealed) reproduces the oracle
 // ── fuzz: the frame handler never panics, in any round ───────────────────
 
 fn tamperShare2to3(from: u32, to: u32, bytes: []u8) Action {
-    if (from == 2 and to == 3 and bytes[0] == @intFromEnum(wire.Kind.share)) bytes[1 + 8 + Ns - 1] ^= 1;
+    if (from == 2 and to == 3 and bytes[0] == @backingInt(wire.Kind.share)) bytes[1 + 8 + Ns - 1] ^= 1;
     return .deliver;
 }
 

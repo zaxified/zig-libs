@@ -406,7 +406,7 @@ pub const Client = struct {
             return error.BufferTooSmall;
         var req: [32]u8 = undefined;
         const wire = (cip.Request{
-            .service = @intFromEnum(cip.Service.reset),
+            .service = @backingInt(cip.Service.reset),
             .path = path,
             .data = &.{},
         }).encode(&req) catch return error.BufferTooSmall;
@@ -562,14 +562,14 @@ pub const Client = struct {
             return error.BufferTooSmall;
         var path_buf: [8]u8 = undefined;
         const path = epath.logicalPath(
-            @intFromEnum(cip.ClassCode.message_router),
+            @backingInt(cip.ClassCode.message_router),
             1,
             null,
             &path_buf,
         ) catch return error.BufferTooSmall;
         var req_buf: [1200]u8 = undefined;
         const wire = (cip.Request{
-            .service = @intFromEnum(cip.Service.multiple_service_packet),
+            .service = @backingInt(cip.Service.multiple_service_packet),
             .path = path,
             .data = payload,
         }).encode(&req_buf) catch return error.BufferTooSmall;
@@ -651,7 +651,7 @@ pub const Client = struct {
                     b.segment(seg) catch return error.BufferTooSmall;
                 }
             }
-            b.class(@intFromEnum(cip.ClassCode.message_router)) catch return error.BufferTooSmall;
+            b.class(@backingInt(cip.ClassCode.message_router)) catch return error.BufferTooSmall;
             b.instance(1) catch return error.BufferTooSmall;
         }
 
@@ -706,7 +706,7 @@ pub const Client = struct {
                 b.segment(seg) catch return error.BufferTooSmall;
             }
         }
-        b.class(@intFromEnum(cip.ClassCode.message_router)) catch return error.BufferTooSmall;
+        b.class(@backingInt(cip.ClassCode.message_router)) catch return error.BufferTooSmall;
         b.instance(1) catch return error.BufferTooSmall;
 
         const fc = connmgr.ForwardClose{

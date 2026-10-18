@@ -236,7 +236,7 @@ pub const Outstation = struct {
         try self.echoDecoded(a, con_cause, false, sink);
         if (a.header.cause.cot == .deactivation) return;
 
-        const qoi_value = @intFromEnum(qoi);
+        const qoi_value = @backingInt(qoi);
         const group: u8 = if (qoi_value >= 21 and qoi_value <= 36) qoi_value - 20 else 0;
         // `group` is already constrained to 1..16 by the range test above, so
         // the `orelse` never fires; it is spelled as a fallback rather than

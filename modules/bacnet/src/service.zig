@@ -110,7 +110,7 @@ pub const IAm = struct {
     pub fn encode(self: IAm, w: *tag.Writer) Error!void {
         try w.appObjectId(self.device);
         try w.appUnsigned(self.max_apdu_accepted);
-        try w.appEnumerated(@intFromEnum(self.segmentation));
+        try w.appEnumerated(@backingInt(self.segmentation));
         try w.appUnsigned(self.vendor_id);
     }
 
@@ -126,7 +126,7 @@ pub const IAm = struct {
         return .{
             .device = oid,
             .max_apdu_accepted = @intCast(max_apdu),
-            .segmentation = @enumFromInt(@as(u8, @intCast(seg))),
+            .segmentation = @fromBackingInt(@intCast(@as(u8, @intCast(seg)))),
             .vendor_id = @intCast(vendor),
         };
     }
@@ -211,14 +211,14 @@ pub const ReadProperty = struct {
 
     pub fn encode(self: ReadProperty, w: *tag.Writer) Error!void {
         try w.ctxObjectId(0, self.object);
-        try w.ctxEnumerated(1, @intFromEnum(self.property));
+        try w.ctxEnumerated(1, @backingInt(self.property));
         if (self.array_index) |i| try w.ctxUnsigned(2, i);
     }
 
     pub fn decode(data: []const u8) Error!ReadProperty {
         var r = tag.Reader.init(data);
         const obj = try r.ctxObjectId(0);
-        const prop: PropertyIdentifier = @enumFromInt(try r.ctxEnumerated(1));
+        const prop: PropertyIdentifier = @fromBackingInt(@intCast(try r.ctxEnumerated(1)));
         var idx: ?u32 = null;
         if (!r.atEnd()) {
             const t = try r.peek();
@@ -238,7 +238,7 @@ pub const ReadPropertyAck = struct {
 
     pub fn encode(self: ReadPropertyAck, w: *tag.Writer) Error!void {
         try w.ctxObjectId(0, self.object);
-        try w.ctxEnumerated(1, @intFromEnum(self.property));
+        try w.ctxEnumerated(1, @backingInt(self.property));
         if (self.array_index) |i| try w.ctxUnsigned(2, i);
         try w.open(3);
         try w.raw(self.value);
@@ -248,7 +248,7 @@ pub const ReadPropertyAck = struct {
     pub fn decode(data: []const u8) Error!ReadPropertyAck {
         var r = tag.Reader.init(data);
         const obj = try r.ctxObjectId(0);
-        const prop: PropertyIdentifier = @enumFromInt(try r.ctxEnumerated(1));
+        const prop: PropertyIdentifier = @fromBackingInt(@intCast(try r.ctxEnumerated(1)));
         var idx: ?u32 = null;
         var t = try r.peek();
         if (t.isContext(2)) {
@@ -313,7 +313,7 @@ pub const WriteProperty = struct {
             if (p < 1 or p > 16) return error.InvalidParameter;
         }
         try w.ctxObjectId(0, self.object);
-        try w.ctxEnumerated(1, @intFromEnum(self.property));
+        try w.ctxEnumerated(1, @backingInt(self.property));
         if (self.array_index) |i| try w.ctxUnsigned(2, i);
         try w.open(3);
         try w.raw(self.value);
@@ -324,7 +324,7 @@ pub const WriteProperty = struct {
     pub fn decode(data: []const u8) Error!WriteProperty {
         var r = tag.Reader.init(data);
         const obj = try r.ctxObjectId(0);
-        const prop: PropertyIdentifier = @enumFromInt(try r.ctxEnumerated(1));
+        const prop: PropertyIdentifier = @fromBackingInt(@intCast(try r.ctxEnumerated(1)));
         var idx: ?u32 = null;
         var t = try r.peek();
         if (t.isContext(2)) {
@@ -392,7 +392,7 @@ pub const RpmRequestBuilder = struct {
     /// Adds a property reference to the current specification.
     pub fn property(self: *RpmRequestBuilder, ref: PropertyReference) Error!void {
         if (!self.open_spec) return error.MissingParameter;
-        try self.w.ctxEnumerated(0, @intFromEnum(ref.property));
+        try self.w.ctxEnumerated(0, @backingInt(ref.property));
         if (ref.array_index) |i| try self.w.ctxUnsigned(1, i);
     }
 
@@ -439,7 +439,7 @@ pub const PropertyReferenceIterator = struct {
 
     pub fn next(self: *PropertyReferenceIterator) Error!?PropertyReference {
         if (self.r.atEnd()) return null;
-        const prop: PropertyIdentifier = @enumFromInt(try self.r.ctxEnumerated(0));
+        const prop: PropertyIdentifier = @fromBackingInt(@intCast(try self.r.ctxEnumerated(0)));
         var idx: ?u32 = null;
         if (!self.r.atEnd()) {
             const t = try self.r.peek();
@@ -473,7 +473,7 @@ pub const RpmAckBuilder = struct {
         bytes: []const u8,
     ) Error!void {
         if (!self.open_result) return error.MissingParameter;
-        try self.w.ctxEnumerated(2, @intFromEnum(prop));
+        try self.w.ctxEnumerated(2, @backingInt(prop));
         if (array_index) |i| try self.w.ctxUnsigned(3, i);
         try self.w.open(4);
         try self.w.raw(bytes);
@@ -490,11 +490,11 @@ pub const RpmAckBuilder = struct {
         code: types.ErrorCode,
     ) Error!void {
         if (!self.open_result) return error.MissingParameter;
-        try self.w.ctxEnumerated(2, @intFromEnum(prop));
+        try self.w.ctxEnumerated(2, @backingInt(prop));
         if (array_index) |i| try self.w.ctxUnsigned(3, i);
         try self.w.open(5);
-        try self.w.appEnumerated(@intFromEnum(class));
-        try self.w.appEnumerated(@intFromEnum(code));
+        try self.w.appEnumerated(@backingInt(class));
+        try self.w.appEnumerated(@backingInt(code));
         try self.w.close(5);
     }
 
@@ -551,7 +551,7 @@ pub const ResultElementIterator = struct {
 
     pub fn next(self: *ResultElementIterator) Error!?ResultElement {
         if (self.r.atEnd()) return null;
-        const prop: PropertyIdentifier = @enumFromInt(try self.r.ctxEnumerated(2));
+        const prop: PropertyIdentifier = @fromBackingInt(@intCast(try self.r.ctxEnumerated(2)));
         var idx: ?u32 = null;
         var t = try self.r.peek();
         if (t.isContext(3)) {
@@ -577,8 +577,8 @@ pub const ResultElementIterator = struct {
                 .property = prop,
                 .array_index = idx,
                 .outcome = .{ .access_error = .{
-                    .class = @enumFromInt(@as(u16, @intCast(class))),
-                    .code = @enumFromInt(@as(u16, @intCast(code))),
+                    .class = @fromBackingInt(@intCast(@as(u16, @intCast(class)))),
+                    .code = @fromBackingInt(@intCast(@as(u16, @intCast(code)))),
                 } },
             };
         }
@@ -690,7 +690,7 @@ pub const CovValueIterator = struct {
 
     pub fn next(self: *CovValueIterator) Error!?CovValue {
         if (self.r.atEnd()) return null;
-        const prop: PropertyIdentifier = @enumFromInt(try self.r.ctxEnumerated(0));
+        const prop: PropertyIdentifier = @fromBackingInt(@intCast(try self.r.ctxEnumerated(0)));
         var idx: ?u32 = null;
         var t = try self.r.peek();
         if (t.isContext(1)) {
@@ -709,7 +709,7 @@ pub const CovValueIterator = struct {
 
 /// Writes one `(property, value)` pair into a COV notification's list block.
 pub fn writeCovValue(w: *tag.Writer, v: CovValue) Error!void {
-    try w.ctxEnumerated(0, @intFromEnum(v.property));
+    try w.ctxEnumerated(0, @backingInt(v.property));
     if (v.array_index) |i| try w.ctxUnsigned(1, i);
     try w.open(2);
     try w.raw(v.value);
@@ -740,7 +740,7 @@ pub const ReadRange = struct {
 
     pub fn encode(self: ReadRange, w: *tag.Writer) Error!void {
         try w.ctxObjectId(0, self.object);
-        try w.ctxEnumerated(1, @intFromEnum(self.property));
+        try w.ctxEnumerated(1, @backingInt(self.property));
         if (self.array_index) |i| try w.ctxUnsigned(2, i);
         const range = self.range orelse return;
         switch (range) {
@@ -768,7 +768,7 @@ pub const ReadRange = struct {
     pub fn decode(data: []const u8) Error!ReadRange {
         var r = tag.Reader.init(data);
         const obj = try r.ctxObjectId(0);
-        const prop: PropertyIdentifier = @enumFromInt(try r.ctxEnumerated(1));
+        const prop: PropertyIdentifier = @fromBackingInt(@intCast(try r.ctxEnumerated(1)));
         var idx: ?u32 = null;
         var out: ReadRange = .{ .object = obj, .property = prop };
         if (r.atEnd()) return out;
@@ -960,7 +960,7 @@ test "ReadProperty request and ACK, with and without an array index" {
 
     // A proprietary property identifier (>= 512) is carried, not rejected.
     const prop = try ReadProperty.decode(&hex("0c008000011a0200"));
-    try testing.expectEqual(@as(u32, 512), @intFromEnum(prop.property));
+    try testing.expectEqual(@as(u32, 512), @backingInt(prop.property));
     try testing.expect(prop.property.isProprietary());
 
     // ACK: value block is handed back raw.

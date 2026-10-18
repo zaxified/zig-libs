@@ -75,7 +75,7 @@ pub const VlanDepth = enum(u2) {
     }
 
     pub fn tags(self: VlanDepth) u2 {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
 };
 
@@ -995,7 +995,7 @@ test "load: buildClassifierProgram passes the in-kernel verifier (needs CAP_BPF/
 
 // ── CPUMAP steering tests ───────────────────────────────────────────────────
 
-const redirect_map_helper_id: i32 = @intFromEnum(std.os.linux.BPF.Helper.redirect_map);
+const redirect_map_helper_id: i32 = @backingInt(std.os.linux.BPF.Helper.redirect_map);
 
 // Golden vector for buildCpumapSteerProgram. Instructions 0-24 are the SAME
 // ctx-decode / bounds-check / EtherType+IHL / key-copy / LPM-lookup sequence

@@ -449,7 +449,7 @@ fn managerScenario(gpa: std.mem.Allocator, io: std.Io, transport: *http.Client, 
     // A fresh storage directory per run (the scratch dir is .zig-cache).
     var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
     const dir_path = try std.fmt.bufPrint(&dir_buf, "{s}/manager-{d}", .{ scratch, std.Io.Clock.real.now(io).toSeconds() });
-    try std.Io.Dir.cwd().createDir(io, dir_path, @enumFromInt(0o700));
+    try std.Io.Dir.cwd().createDir(io, dir_path, @fromBackingInt(@intCast(0o700)));
     var dir = try std.Io.Dir.cwd().openDir(io, dir_path, .{});
     defer dir.close(io);
     var ds = acme.DirStorage.init(io, dir);

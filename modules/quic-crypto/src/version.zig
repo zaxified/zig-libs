@@ -35,7 +35,7 @@ pub const Version = enum(u32) {
 
     /// The on-wire Version field value.
     pub fn wire(self: Version) u32 {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
 
     /// HKDF-Extract salt for the Initial secret (RFC 9001 §5.2 / RFC 9369 §3.3.1).

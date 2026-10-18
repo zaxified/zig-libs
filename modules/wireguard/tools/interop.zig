@@ -157,7 +157,7 @@ fn kernelInitiates(gpa: std.mem.Allocator, io: std.Io, out: *std.ArrayList(u8)) 
 
     var buf: [2048]u8 = undefined;
     var from: linux.sockaddr.in = undefined;
-    const init_bytes = try udp.recvType(&buf, @intFromEnum(hs.MessageType.handshake_initiation), 10_000, &from);
+    const init_bytes = try udp.recvType(&buf, @backingInt(hs.MessageType.handshake_initiation), 10_000, &from);
     if (init_bytes.len != @sizeOf(hs.MessageInitiation)) return fail("A: initiation of {d} bytes", .{init_bytes.len});
     try appendHex(gpa, out, "a_initiation", init_bytes);
 
@@ -177,7 +177,7 @@ fn kernelInitiates(gpa: std.mem.Allocator, io: std.Io, out: *std.ArrayList(u8)) 
     h.transportSession(false, now_s, &session);
     try udp.sendTo(std.mem.asBytes(&msg2), &from);
 
-    const ka = try udp.recvType(&buf, @intFromEnum(hs.MessageType.transport_data), 10_000, &from);
+    const ka = try udp.recvType(&buf, @backingInt(hs.MessageType.transport_data), 10_000, &from);
     var empty: [0]u8 = .{};
     const r = try session.recv.open(&empty, ka, now_s);
     if (r.len != 0) return fail("A: keepalive opened to {d} bytes", .{r.len});
@@ -248,7 +248,7 @@ fn weInitiate(gpa: std.mem.Allocator, io: std.Io, out: *std.ArrayList(u8)) !void
 
     var buf: [2048]u8 = undefined;
     var from: linux.sockaddr.in = undefined;
-    const resp = try udp.recvType(&buf, @intFromEnum(hs.MessageType.handshake_response), 10_000, &from);
+    const resp = try udp.recvType(&buf, @backingInt(hs.MessageType.handshake_response), 10_000, &from);
     if (resp.len != @sizeOf(hs.MessageResponse)) return fail("B: response of {d} bytes", .{resp.len});
     try appendHex(gpa, out, "b_response", resp);
     var msg2: hs.MessageResponse = undefined;
@@ -263,7 +263,7 @@ fn weInitiate(gpa: std.mem.Allocator, io: std.Io, out: *std.ArrayList(u8)) !void
     try appendHex(gpa, out, "b_ping", &sealed);
     try udp.sendTo(&sealed, &kernel);
 
-    const reply = try udp.recvType(&buf, @intFromEnum(hs.MessageType.transport_data), 10_000, &from);
+    const reply = try udp.recvType(&buf, @backingInt(hs.MessageType.transport_data), 10_000, &from);
     var plain: [256]u8 = undefined;
     const r = try session.recv.open(&plain, reply, now_s);
     const ip = plain[0..r.len];

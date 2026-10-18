@@ -49,7 +49,7 @@ fn hex(w: *std.Io.Writer, bytes: []const u8) !void {
 fn renderRecord(a: std.mem.Allocator, r: msg.Record) ![]const u8 {
     var out: std.Io.Writer.Allocating = .init(a);
     const w = &out.writer;
-    try w.print("{s} {d} {d} {d} ", .{ r.name, @intFromEnum(r.ty), @intFromEnum(r.class), r.ttl });
+    try w.print("{s} {d} {d} {d} ", .{ r.name, @backingInt(r.ty), @backingInt(r.class), r.ttl });
     switch (r.data) {
         .a => |v| try w.print("A {d}.{d}.{d}.{d}", .{ v[0], v[1], v[2], v[3] }),
         .aaaa => |v| {
@@ -98,7 +98,7 @@ fn compare(a: std.mem.Allocator, c: vectors.Case, why: *std.Io.Writer) !void {
 
     const h = m.header;
     const hdr = try std.fmt.allocPrint(a, "id={d} qr={d} op={d} aa={d} tc={d} rd={d} ra={d} rcode={d}", .{
-        h.id,                                @intFromBool(h.response),  @intFromEnum(h.opcode),
+        h.id,                                @intFromBool(h.response),  @backingInt(h.opcode),
         @intFromBool(h.authoritative),       @intFromBool(h.truncated), @intFromBool(h.recursion_desired),
         @intFromBool(h.recursion_available), h.rcode,
     });
@@ -106,7 +106,7 @@ fn compare(a: std.mem.Allocator, c: vectors.Case, why: *std.Io.Writer) !void {
 
     if (m.questions.len != c.questions.len) return why.print("questions: ours {d}, go {d}", .{ m.questions.len, c.questions.len });
     for (m.questions, c.questions, 0..) |q, want, i| {
-        const got = try std.fmt.allocPrint(a, "{s} {d} {d}", .{ q.name, @intFromEnum(q.ty), @intFromEnum(q.class) });
+        const got = try std.fmt.allocPrint(a, "{s} {d} {d}", .{ q.name, @backingInt(q.ty), @backingInt(q.class) });
         if (!std.mem.eql(u8, got, want)) return why.print("question {d}: ours \"{s}\", go \"{s}\"", .{ i, got, want });
     }
     const sections = [_]struct { name: []const u8, ours: []const msg.Record, go: []const []const u8 }{
@@ -164,7 +164,7 @@ test "go oracle: encodeQuery writes dnsmessage's Builder bytes, and refuses what
     var failed: usize = 0;
     for (vectors.queries) |q| {
         var buf: [msg.max_query_len]u8 = undefined;
-        const got = msg.encodeQuery(&buf, q.name, @enumFromInt(q.ty), .{ .id = q.id, .recursion_desired = q.rd, .edns_udp_size = q.edns });
+        const got = msg.encodeQuery(&buf, q.name, @fromBackingInt(@intCast(q.ty)), .{ .id = q.id, .recursion_desired = q.rd, .edns_udp_size = q.edns });
         const id = find(q.name) != null;
         if (q.bytes) |want| {
             const ours = got catch |err| {

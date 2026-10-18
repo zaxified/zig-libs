@@ -108,15 +108,15 @@ pub const SubscribeError = RequestError || error{GroupNotFound};
 pub fn errnoToError(code: i32) RequestError {
     if (code >= 0 or code == std.math.minInt(i32)) return error.Unexpected;
     return switch (@as(u32, @intCast(-code))) {
-        @intFromEnum(linux.E.PERM), @intFromEnum(linux.E.ACCES) => error.AccessDenied,
-        @intFromEnum(linux.E.NODEV), @intFromEnum(linux.E.NXIO) => error.NoSuchDevice,
+        @backingInt(linux.E.PERM), @backingInt(linux.E.ACCES) => error.AccessDenied,
+        @backingInt(linux.E.NODEV), @backingInt(linux.E.NXIO) => error.NoSuchDevice,
         // ENOENT from an ethtool command means "no such interface"; from
         // nlctrl it means "no such family", which `genl.resolveFamily` handles.
-        @intFromEnum(linux.E.NOENT) => error.NoSuchDevice,
-        @intFromEnum(linux.E.OPNOTSUPP) => error.NotSupported,
-        @intFromEnum(linux.E.INVAL), @intFromEnum(linux.E.MSGSIZE) => error.InvalidRequest,
-        @intFromEnum(linux.E.BUSY), @intFromEnum(linux.E.AGAIN) => error.Busy,
-        @intFromEnum(linux.E.NOBUFS), @intFromEnum(linux.E.NOMEM) => error.SystemResources,
+        @backingInt(linux.E.NOENT) => error.NoSuchDevice,
+        @backingInt(linux.E.OPNOTSUPP) => error.NotSupported,
+        @backingInt(linux.E.INVAL), @backingInt(linux.E.MSGSIZE) => error.InvalidRequest,
+        @backingInt(linux.E.BUSY), @backingInt(linux.E.AGAIN) => error.Busy,
+        @backingInt(linux.E.NOBUFS), @backingInt(linux.E.NOMEM) => error.SystemResources,
         else => error.Unexpected,
     };
 }
@@ -1019,15 +1019,15 @@ test "the client holds no second copy of the request frame" {
 }
 
 test "errnoToError maps the errnos ethtool actually returns" {
-    try testing.expectEqual(error.AccessDenied, errnoToError(-@as(i32, @intFromEnum(linux.E.PERM))));
-    try testing.expectEqual(error.NoSuchDevice, errnoToError(-@as(i32, @intFromEnum(linux.E.NODEV))));
-    try testing.expectEqual(error.NoSuchDevice, errnoToError(-@as(i32, @intFromEnum(linux.E.NOENT))));
+    try testing.expectEqual(error.AccessDenied, errnoToError(-@as(i32, @backingInt(linux.E.PERM))));
+    try testing.expectEqual(error.NoSuchDevice, errnoToError(-@as(i32, @backingInt(linux.E.NODEV))));
+    try testing.expectEqual(error.NoSuchDevice, errnoToError(-@as(i32, @backingInt(linux.E.NOENT))));
     // The single most common ethtool outcome: a valid request the driver has
     // no implementation for.
-    try testing.expectEqual(error.NotSupported, errnoToError(-@as(i32, @intFromEnum(linux.E.OPNOTSUPP))));
-    try testing.expectEqual(error.InvalidRequest, errnoToError(-@as(i32, @intFromEnum(linux.E.INVAL))));
-    try testing.expectEqual(error.Busy, errnoToError(-@as(i32, @intFromEnum(linux.E.BUSY))));
-    try testing.expectEqual(error.SystemResources, errnoToError(-@as(i32, @intFromEnum(linux.E.NOMEM))));
+    try testing.expectEqual(error.NotSupported, errnoToError(-@as(i32, @backingInt(linux.E.OPNOTSUPP))));
+    try testing.expectEqual(error.InvalidRequest, errnoToError(-@as(i32, @backingInt(linux.E.INVAL))));
+    try testing.expectEqual(error.Busy, errnoToError(-@as(i32, @backingInt(linux.E.BUSY))));
+    try testing.expectEqual(error.SystemResources, errnoToError(-@as(i32, @backingInt(linux.E.NOMEM))));
     try testing.expectEqual(error.Unexpected, errnoToError(0));
     try testing.expectEqual(error.Unexpected, errnoToError(7));
     try testing.expectEqual(error.Unexpected, errnoToError(std.math.minInt(i32)));

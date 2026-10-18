@@ -87,7 +87,7 @@ pub const ObjectType = enum(u10) {
     /// 0..127 for itself, so an unnamed value below 128 is a *future* standard
     /// type, not a vendor one.
     pub fn isProprietary(self: ObjectType) bool {
-        return @intFromEnum(self) >= 128;
+        return @backingInt(self) >= 128;
     }
 };
 
@@ -321,7 +321,7 @@ pub const PropertyIdentifier = enum(u32) {
     }
 
     pub fn isProprietary(self: PropertyIdentifier) bool {
-        return @intFromEnum(self) >= 512;
+        return @backingInt(self) >= 512;
     }
 };
 
@@ -725,16 +725,16 @@ const testing = std.testing;
 
 test "enums are non-exhaustive: an unnamed value round-trips" {
     // A vendor object type nobody has heard of must survive decode/encode.
-    const vendor: ObjectType = @enumFromInt(600);
-    try testing.expectEqual(@as(u10, 600), @intFromEnum(vendor));
+    const vendor: ObjectType = @fromBackingInt(@intCast(600));
+    try testing.expectEqual(@as(u10, 600), @backingInt(vendor));
     try testing.expect(vendor.isProprietary());
 
-    const vendor_prop: PropertyIdentifier = @enumFromInt(4194000);
+    const vendor_prop: PropertyIdentifier = @fromBackingInt(@intCast(4194000));
     try testing.expect(vendor_prop.isProprietary());
 
     // ... but an unnamed value below the vendor line is a *future standard*
     // one, not a proprietary one.
-    const future: ObjectType = @enumFromInt(100);
+    const future: ObjectType = @fromBackingInt(@intCast(100));
     try testing.expect(!future.isProprietary());
 }
 
@@ -743,9 +743,9 @@ test "ReadPropertyMultiple wildcards" {
     try testing.expect(PropertyIdentifier.required.isSpecial());
     try testing.expect(PropertyIdentifier.optional.isSpecial());
     try testing.expect(!PropertyIdentifier.present_value.isSpecial());
-    try testing.expectEqual(@as(u32, 8), @intFromEnum(PropertyIdentifier.all));
-    try testing.expectEqual(@as(u32, 80), @intFromEnum(PropertyIdentifier.optional));
-    try testing.expectEqual(@as(u32, 105), @intFromEnum(PropertyIdentifier.required));
+    try testing.expectEqual(@as(u32, 8), @backingInt(PropertyIdentifier.all));
+    try testing.expectEqual(@as(u32, 80), @backingInt(PropertyIdentifier.optional));
+    try testing.expectEqual(@as(u32, 105), @backingInt(PropertyIdentifier.required));
 }
 
 test "status flags pack MSB-first" {
@@ -763,16 +763,16 @@ test "status flags pack MSB-first" {
 }
 
 test "well-known numeric values match the standard's tables" {
-    try testing.expectEqual(@as(u10, 8), @intFromEnum(ObjectType.device));
-    try testing.expectEqual(@as(u10, 0), @intFromEnum(ObjectType.analog_input));
-    try testing.expectEqual(@as(u10, 20), @intFromEnum(ObjectType.trend_log));
-    try testing.expectEqual(@as(u32, 85), @intFromEnum(PropertyIdentifier.present_value));
-    try testing.expectEqual(@as(u32, 87), @intFromEnum(PropertyIdentifier.priority_array));
-    try testing.expectEqual(@as(u32, 77), @intFromEnum(PropertyIdentifier.object_name));
-    try testing.expectEqual(@as(u8, 12), @intFromEnum(ConfirmedService.read_property));
-    try testing.expectEqual(@as(u8, 14), @intFromEnum(ConfirmedService.read_property_multiple));
-    try testing.expectEqual(@as(u8, 15), @intFromEnum(ConfirmedService.write_property));
-    try testing.expectEqual(@as(u8, 8), @intFromEnum(UnconfirmedService.who_is));
-    try testing.expectEqual(@as(u8, 0), @intFromEnum(UnconfirmedService.i_am));
-    try testing.expectEqual(@as(u8, 4), @intFromEnum(AbortReason.segmentation_not_supported));
+    try testing.expectEqual(@as(u10, 8), @backingInt(ObjectType.device));
+    try testing.expectEqual(@as(u10, 0), @backingInt(ObjectType.analog_input));
+    try testing.expectEqual(@as(u10, 20), @backingInt(ObjectType.trend_log));
+    try testing.expectEqual(@as(u32, 85), @backingInt(PropertyIdentifier.present_value));
+    try testing.expectEqual(@as(u32, 87), @backingInt(PropertyIdentifier.priority_array));
+    try testing.expectEqual(@as(u32, 77), @backingInt(PropertyIdentifier.object_name));
+    try testing.expectEqual(@as(u8, 12), @backingInt(ConfirmedService.read_property));
+    try testing.expectEqual(@as(u8, 14), @backingInt(ConfirmedService.read_property_multiple));
+    try testing.expectEqual(@as(u8, 15), @backingInt(ConfirmedService.write_property));
+    try testing.expectEqual(@as(u8, 8), @backingInt(UnconfirmedService.who_is));
+    try testing.expectEqual(@as(u8, 0), @backingInt(UnconfirmedService.i_am));
+    try testing.expectEqual(@as(u8, 4), @backingInt(AbortReason.segmentation_not_supported));
 }

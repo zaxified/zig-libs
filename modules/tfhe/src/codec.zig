@@ -91,7 +91,7 @@ pub fn Codec(comptime F: type) type {
 
         fn writeHeader(w: *std.Io.Writer, kind: Kind) std.Io.Writer.Error!void {
             try w.writeAll(magic);
-            try w.writeAll(&.{ version, @intFromEnum(kind), 0, 0 });
+            try w.writeAll(&.{ version, @backingInt(kind), 0, 0 });
             try w.writeInt(u32, @intCast(n), .little);
             try w.writeInt(u32, @intCast(k), .little);
             try w.writeInt(u32, @intCast(N), .little);
@@ -106,7 +106,7 @@ pub fn Codec(comptime F: type) type {
             const h = &hb;
             if (!std.mem.eql(u8, h[0..4], magic)) return error.BadMagic;
             if (h[4] != version) return error.UnsupportedVersion;
-            if (h[5] != @intFromEnum(kind) or h[6] != 0 or h[7] != 0) return error.WrongKind;
+            if (h[5] != @backingInt(kind) or h[6] != 0 or h[7] != 0) return error.WrongKind;
             const ok = std.mem.readInt(u32, h[8..12], .little) == n and
                 std.mem.readInt(u32, h[12..16], .little) == k and
                 std.mem.readInt(u32, h[16..20], .little) == N and
@@ -350,7 +350,7 @@ test "the header: layout pinned, and every field is checked" {
     const cases = [_]struct { usize, u8, DecodeError }{
         .{ 0, 'X', error.BadMagic },
         .{ 4, 2, error.UnsupportedVersion },
-        .{ 5, @intFromEnum(Kind.lwe_big), error.WrongKind },
+        .{ 5, @backingInt(Kind.lwe_big), error.WrongKind },
         .{ 6, 1, error.WrongKind },
         .{ 8, 17, error.ParameterMismatch },
         .{ 12, 3, error.ParameterMismatch },

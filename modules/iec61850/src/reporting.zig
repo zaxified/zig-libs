@@ -132,7 +132,7 @@ pub const Trigger = enum {
     }
 
     fn bit(self: Trigger) u8 {
-        return @as(u8, 1) << @intCast(@intFromEnum(self));
+        return @as(u8, 1) << @intCast(@backingInt(self));
     }
 };
 

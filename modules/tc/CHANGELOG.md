@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** `zig fmt` (0.17) rewrote `@intFromEnum`/`@enumFromInt` to `@backingInt`/`@fromBackingInt` in sources and tests; same values, same behaviour.
 - **2026-10-18** — Ported to Zig 0.17.0. `optionalsSet` iterates `field_names`/`field_types`. Also: comptime `strRepeat` helper quota raised.
 - **2026-10-10** — tests: deterministic fuzz driver `TC_FUZZ` over the existing harnesses (action, options, filter, dump); reach labels count real outcomes. No code or API change.
 - **2026-10-10** — Fixed: `parseAction` panicked (invalid enum value) on an unknown gact probability type from the kernel/peer (`GactProb.decode` did `@enumFromInt` on the exhaustive `ProbType`; found by the new `TC_FUZZ` driver, seed 202). `ProbType` is now non-exhaustive (`_`), like `Verdict`; the raw value is carried through. Also: deterministic fuzz driver `TC_FUZZ` over the existing harnesses (action, options, filter, dump); reach labels count real outcomes.

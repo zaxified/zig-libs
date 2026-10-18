@@ -87,7 +87,7 @@ pub fn main() !void {
     if (insns[insns.len - 1].code != 0x95) return error.LastInsnNotExit; // BPF exit
     var lpm_lookups: usize = 0;
     for (insns) |ins| {
-        if (ins.code == 0x85 and ins.imm == @intFromEnum(linux.BPF.Helper.map_lookup_elem)) lpm_lookups += 1;
+        if (ins.code == 0x85 and ins.imm == @backingInt(linux.BPF.Helper.map_lookup_elem)) lpm_lookups += 1;
     }
     if (lpm_lookups != 2) return error.WrongLookupCallCount; // LPM lookup + scratch-map lookup
     std.debug.print("buildClassifierProgram: {d} instructions, ends in exit, 2 map lookups\n", .{insns.len});
@@ -97,7 +97,7 @@ pub fn main() !void {
     const insns6 = xdp.buildClassifierProgram(.{ .lpm_map_fd = 10, .scratch_map_fd = 11, .lpm6_map_fd = 12, .vlan_depth = .double });
     var lookups6: usize = 0;
     for (insns6) |ins| {
-        if (ins.code == 0x85 and ins.imm == @intFromEnum(linux.BPF.Helper.map_lookup_elem)) lookups6 += 1;
+        if (ins.code == 0x85 and ins.imm == @backingInt(linux.BPF.Helper.map_lookup_elem)) lookups6 += 1;
     }
     if (lookups6 != 3) return error.WrongLookupCallCount;
     std.debug.print("buildClassifierProgram(IPv6 + 2 VLAN tags): {d} instructions, 3 map lookups\n", .{insns6.len});

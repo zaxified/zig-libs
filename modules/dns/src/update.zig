@@ -52,14 +52,14 @@ pub const Builder = struct {
 
     fn writeInit(w: *std.Io.Writer, zone: []const u8) (message.EncodeError || error{WriteFailed})!void {
         try w.writeInt(u16, 0, .big); // id: `send` assigns one
-        try w.writeInt(u16, @as(u16, @intFromEnum(message.Opcode.update)) << 11, .big);
+        try w.writeInt(u16, @as(u16, @backingInt(message.Opcode.update)) << 11, .big);
         try w.writeInt(u16, 1, .big); // ZOCOUNT
         try w.writeInt(u16, 0, .big); // PRCOUNT
         try w.writeInt(u16, 0, .big); // UPCOUNT
         try w.writeInt(u16, 0, .big); // ADCOUNT
         try message.writeName(w, zone);
-        try w.writeInt(u16, @intFromEnum(message.Type.soa), .big);
-        try w.writeInt(u16, @intFromEnum(message.Class.in), .big);
+        try w.writeInt(u16, @backingInt(message.Type.soa), .big);
+        try w.writeInt(u16, @backingInt(message.Class.in), .big);
     }
 
     /// The message so far (unsigned; id 0 until `send` or `setId`).
@@ -156,8 +156,8 @@ fn writeRecord(
     rdata: []const u8,
 ) (message.EncodeError || error{WriteFailed})!void {
     try message.writeName(w, name);
-    try w.writeInt(u16, @intFromEnum(ty), .big);
-    try w.writeInt(u16, @intFromEnum(class), .big);
+    try w.writeInt(u16, @backingInt(ty), .big);
+    try w.writeInt(u16, @backingInt(class), .big);
     try w.writeInt(u32, ttl, .big);
     try w.writeInt(u16, @intCast(rdata.len), .big);
     try w.writeAll(rdata);

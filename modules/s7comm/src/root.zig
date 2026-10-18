@@ -533,7 +533,7 @@ fn classify(frame: []const u8, reads: *usize, writes: *usize, userdata_requests:
     const pdu = s7.decode(dt.payload) catch return;
     if (pdu.header.rosctr == .userdata) userdata_requests.* += 1;
     if (pdu.header.rosctr != .job or pdu.parameters.len == 0) return;
-    switch (@as(Function, @enumFromInt(pdu.parameters[0]))) {
+    switch (@as(Function, @fromBackingInt(@intCast(pdu.parameters[0])))) {
         .read_var => reads.* += 1,
         .write_var => writes.* += 1,
         else => {},

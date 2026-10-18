@@ -158,7 +158,7 @@ pub const Timeout = struct {
     pub fn write(t: Timeout, out: []u8) []const u8 {
         std.debug.assert(t.value <= max_value);
         const digits = std.fmt.bufPrint(out, "{d}", .{t.value}) catch unreachable;
-        out[digits.len] = @intFromEnum(t.unit);
+        out[digits.len] = @backingInt(t.unit);
         return out[0 .. digits.len + 1];
     }
 

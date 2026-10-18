@@ -100,7 +100,7 @@ fn hOk(ctx: *router.Ctx) anyerror!void {
 var gates: [4]aaa.Gate = undefined;
 
 fn once(d: *const Data, w: usize, plain: bool) u64 {
-    const r = if (plain) d.plain else d.gated[@intFromEnum(which[w])];
+    const r = if (plain) d.plain else d.gated[@backingInt(which[w])];
     var sum: u64 = 0;
     var out_buf: [1024]u8 = undefined;
     var response_body_buf: [1024]u8 = undefined;

@@ -35,7 +35,7 @@ fn writeReply(s: *std.json.Stringify, r: sntp.Reply) !void {
     try s.objectField("stratum");
     try s.write(r.stratum);
     try s.objectField("leap");
-    try s.write(@intFromEnum(r.leap));
+    try s.write(@backingInt(r.leap));
     try s.objectField("version");
     try s.write(r.version);
     try s.objectField("refid");

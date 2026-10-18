@@ -191,7 +191,7 @@ fn compressLiterals(table: *const huf.CTable, meta: *const Metadata, lits: []con
     const header: usize = if (write_entropy) 200 else 0;
     const lh_size: usize = 3 + @as(usize, @intFromBool(lits.len >= 1024 -| header)) + @intFromBool(lits.len >= 16 * 1024 -| header);
     const single_stream = lh_size == 3;
-    const h_type: u32 = if (write_entropy) @intFromEnum(meta.huf.h_type) else set_repeat;
+    const h_type: u32 = if (write_entropy) @backingInt(meta.huf.h_type) else set_repeat;
     entropy_written.* = false;
     if (lits.len == 0 or meta.huf.h_type == .basic) {
         return literals.noCompress(dst, lits) catch error.DstSizeTooSmall;
@@ -272,7 +272,7 @@ fn compressSequences(fse_tables: *const sequences.FseTables, meta: *const Metada
     if (write_entropy) {
         // (unchecked in libzstd: undefined past the end, refused here)
         if (dst.len - op < meta.fse_tables_size) return error.DstSizeTooSmall;
-        dst[seq_head] = (@as(u8, @intFromEnum(meta.ll_type)) << 6) + (@as(u8, @intFromEnum(meta.of_type)) << 4) + (@as(u8, @intFromEnum(meta.ml_type)) << 2);
+        dst[seq_head] = (@as(u8, @backingInt(meta.ll_type)) << 6) + (@as(u8, @backingInt(meta.of_type)) << 4) + (@as(u8, @backingInt(meta.ml_type)) << 2);
         @memcpy(dst[op..][0..meta.fse_tables_size], meta.fse_tables[0..meta.fse_tables_size]);
         op += meta.fse_tables_size;
     } else {

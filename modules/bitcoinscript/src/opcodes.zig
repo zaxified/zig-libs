@@ -205,14 +205,14 @@ pub fn isOpSuccess(op: u8) bool {
 const testing = std.testing;
 
 test "opcode values match Bitcoin Core's opcodetype enum at a few checked points" {
-    try testing.expectEqual(@as(u8, 0xac), @intFromEnum(Opcode.OP_CHECKSIG));
-    try testing.expectEqual(@as(u8, 0xae), @intFromEnum(Opcode.OP_CHECKMULTISIG));
-    try testing.expectEqual(@as(u8, 0xa9), @intFromEnum(Opcode.OP_HASH160));
-    try testing.expectEqual(@as(u8, 0xb1), @intFromEnum(Opcode.OP_CHECKLOCKTIMEVERIFY));
-    try testing.expectEqual(@as(u8, 0xb2), @intFromEnum(Opcode.OP_CHECKSEQUENCEVERIFY));
-    try testing.expectEqual(@as(u8, 0x51), @intFromEnum(Opcode.OP_1));
-    try testing.expectEqual(@as(u8, 0x60), @intFromEnum(Opcode.OP_16));
-    try testing.expectEqual(@as(u8, 0xff), @intFromEnum(Opcode.OP_INVALIDOPCODE));
+    try testing.expectEqual(@as(u8, 0xac), @backingInt(Opcode.OP_CHECKSIG));
+    try testing.expectEqual(@as(u8, 0xae), @backingInt(Opcode.OP_CHECKMULTISIG));
+    try testing.expectEqual(@as(u8, 0xa9), @backingInt(Opcode.OP_HASH160));
+    try testing.expectEqual(@as(u8, 0xb1), @backingInt(Opcode.OP_CHECKLOCKTIMEVERIFY));
+    try testing.expectEqual(@as(u8, 0xb2), @backingInt(Opcode.OP_CHECKSEQUENCEVERIFY));
+    try testing.expectEqual(@as(u8, 0x51), @backingInt(Opcode.OP_1));
+    try testing.expectEqual(@as(u8, 0x60), @backingInt(Opcode.OP_16));
+    try testing.expectEqual(@as(u8, 0xff), @backingInt(Opcode.OP_INVALIDOPCODE));
 }
 
 test "isDisabled covers exactly the splice/bitwise/wide-arithmetic set" {

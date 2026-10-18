@@ -234,10 +234,10 @@ test "kemSuiteId: KEM || kem_id, 5 bytes" {
 }
 
 test "meta smoke: Mode ordinals match RFC 9180 Table 1" {
-    try testing.expectEqual(@as(u8, 0x00), @intFromEnum(Mode.base));
-    try testing.expectEqual(@as(u8, 0x01), @intFromEnum(Mode.psk));
-    try testing.expectEqual(@as(u8, 0x02), @intFromEnum(Mode.auth));
-    try testing.expectEqual(@as(u8, 0x03), @intFromEnum(Mode.auth_psk));
+    try testing.expectEqual(@as(u8, 0x00), @backingInt(Mode.base));
+    try testing.expectEqual(@as(u8, 0x01), @backingInt(Mode.psk));
+    try testing.expectEqual(@as(u8, 0x02), @backingInt(Mode.auth));
+    try testing.expectEqual(@as(u8, 0x03), @backingInt(Mode.auth_psk));
 }
 
 test "labeledExtract/labeledExpand: RFC 9180 A.1.1 key_schedule_context + secret, byte-exact" {
@@ -260,7 +260,7 @@ test "labeledExtract/labeledExpand: RFC 9180 A.1.1 key_schedule_context + secret
 
     // key_schedule_context = mode(1) || psk_id_hash(32) || info_hash(32)
     var ksc: [65]u8 = undefined;
-    ksc[0] = @intFromEnum(Mode.base);
+    ksc[0] = @backingInt(Mode.base);
     ksc[1..33].* = psk_id_hash;
     ksc[33..65].* = info_hash;
 

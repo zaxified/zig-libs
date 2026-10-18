@@ -325,12 +325,12 @@ pub const Pbes2Prf = enum {
     }
 
     pub fn oidLast(prf: Pbes2Prf) u8 {
-        return 7 + @as(u8, @intFromEnum(prf));
+        return 7 + @as(u8, @backingInt(prf));
     }
 
     pub fn fromOidLast(b: u8) ?Pbes2Prf {
         if (b < 7 or b > 11) return null;
-        return @enumFromInt(b - 7);
+        return @fromBackingInt(@intCast(b - 7));
     }
 };
 

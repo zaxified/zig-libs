@@ -238,7 +238,7 @@ fn entropyCompressLits(c: *Ctx, ss: *sequences.SeqStore, lits: []const u8, dst: 
     const seq_head = op;
     op += 1;
     const stats = try sequences.buildStatistics(ss, &c.prev.fse, &c.next.fse, dst[op..], c.strategy);
-    dst[seq_head] = (@as(u8, @intFromEnum(stats.ll_type)) << 6) + (@as(u8, @intFromEnum(stats.of_type)) << 4) + (@as(u8, @intFromEnum(stats.ml_type)) << 2);
+    dst[seq_head] = (@as(u8, @backingInt(stats.ll_type)) << 6) + (@as(u8, @backingInt(stats.of_type)) << 4) + (@as(u8, @backingInt(stats.ml_type)) << 2);
     op += stats.size;
 
     const bitstream_size = try sequences.encode(dst[op..], ss, &c.next.fse.ml, &c.next.fse.of, &c.next.fse.ll);
@@ -271,7 +271,7 @@ fn entropyCompress(c: *Ctx, ss: *sequences.SeqStore, dst: []u8, block_size: usiz
 fn buildSeqStore(c: *Ctx, block: []const u8) BlockError!bool {
     // don't even attempt compression below a certain srcSize
     if (block.len < min_cblock_size + block_header_size + 1 + 1) {
-        if (c.strategy >= @intFromEnum(params.Strategy.btopt))
+        if (c.strategy >= @backingInt(params.Strategy.btopt))
             c.extern_seqs.skipBytes(block.len)
         else
             c.extern_seqs.skipSequences(block.len, c.ms.cp.min_match);
@@ -566,7 +566,7 @@ const attach_dict_size_cutoffs = [10]u64{
 /// table layout is for searching in place only), even with `.copy` or
 /// `force_max_window`.
 pub fn shouldAttachDict(cdict: *const CDict, adv: params.Advanced, pledged: u64) bool {
-    const cutoff = attach_dict_size_cutoffs[@intFromEnum(cdict.ms.cp.strategy)];
+    const cutoff = attach_dict_size_cutoffs[@backingInt(cdict.ms.cp.strategy)];
     if (cdict.dedicated_dict_search) return true;
     return (pledged <= cutoff or pledged == params.unknown_size or adv.force_attach_dict == .attach) and
         adv.force_attach_dict != .copy and
@@ -661,7 +661,7 @@ const Layout = struct {
         l.tag = place(&off, u8, if (row) hash_len else 0, workspace_alignment);
         l.states = place(&off, BlockState, 2, @alignOf(BlockState));
         l.split_ws = place(&off, presplit.Workspace, 1, @alignOf(presplit.Workspace));
-        if (@intFromEnum(cp.strategy) >= @intFromEnum(params.Strategy.btopt))
+        if (@backingInt(cp.strategy) >= @backingInt(params.Strategy.btopt))
             l.opt_state = place(&off, opt.State, 1, @alignOf(opt.State));
         if (ldm_params) |lp| {
             l.ldm_state = place(&off, ldm.State, 1, @alignOf(ldm.State));
@@ -1313,7 +1313,7 @@ pub const Compressor = struct {
         const adv = opts.advanced;
         const states = &slice(BlockState, ws, l.states, 2)[0..2].*;
         states.* = .{ .{}, .{} };
-        const opt_state: ?*opt.State = if (@intFromEnum(cp.strategy) >= @intFromEnum(params.Strategy.btopt)) &slice(opt.State, ws, l.opt_state, 1)[0] else null;
+        const opt_state: ?*opt.State = if (@backingInt(cp.strategy) >= @backingInt(params.Strategy.btopt)) &slice(opt.State, ws, l.opt_state, 1)[0] else null;
         // ZSTD_invalidateMatchState: `litLengthSum` 0 forces a reset of the
         // statistics. The frequency tables are left as they are (libzstd's
         // too): the first block's `rescaleFreqs` writes all four whenever
@@ -1398,7 +1398,7 @@ pub const Compressor = struct {
             },
             .prev = &states[0],
             .next = &states[1],
-            .strategy = @intFromEnum(cp.strategy),
+            .strategy = @backingInt(cp.strategy),
             .disable_literal_compression = params.literalCompressionDisabled(adv.literal_compression, cp),
             .pre_split_level = adv.block_splitter_level,
             .split_blocks = params.resolveSplitAfterSequences(adv.split_after_sequences, cp),

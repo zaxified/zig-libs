@@ -78,7 +78,7 @@ pub fn main() !void {
     // Both sides derive the same exporter secret from the same Context
     // parameters without ever sealing/opening a message through it — the
     // path an MLS-style external-init would use (RFC 9420 §8.3/§12.4).
-    const suite_id = hpke.suite.suiteId(Kem.kem_id, @intFromEnum(hpke.KdfId.hkdf_sha256), @intFromEnum(hpke.AeadId.chacha20poly1305));
+    const suite_id = hpke.suite.suiteId(Kem.kem_id, @backingInt(hpke.KdfId.hkdf_sha256), @backingInt(hpke.AeadId.chacha20poly1305));
     var sender_export: [32]u8 = undefined;
     try sender_ctx.exportSecret(&suite_id, "session-key", &sender_export);
     var receiver_export: [32]u8 = undefined;

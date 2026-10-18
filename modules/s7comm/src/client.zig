@@ -248,7 +248,7 @@ pub const Client = struct {
         @memcpy(self.tx[tpkt.header_len..][0..3], &dh);
         const body = self.tx[frame_overhead..];
         body[0] = s7.protocol_id;
-        body[1] = @intFromEnum(rosctr);
+        body[1] = @backingInt(rosctr);
         body[2] = 0;
         body[3] = 0;
         body[4] = @intCast(self.pdu_ref >> 8);
@@ -396,8 +396,8 @@ pub const Client = struct {
         var head: [4]u8 = undefined;
         // In a request this octet is reserved and zero; `0xFF` belongs only in
         // a reply.
-        head[0] = @intFromEnum(items.ReturnCode.reserved);
-        head[1] = @intFromEnum(ts);
+        head[0] = @backingInt(items.ReturnCode.reserved);
+        head[1] = @backingInt(ts);
         const raw: u16 = if (ts == .bit)
             // A bit transfer's length counts bits, and one bit is 1 — not 8.
             item.count
@@ -467,7 +467,7 @@ pub const Client = struct {
         // A Write Var reply's data block is one bare return code per item.
         if (pdu.data.len < count) return error.ShortReply;
         for (pdu.data[0..count]) |rc| {
-            if (@as(items.ReturnCode, @enumFromInt(rc)) != .success) return error.ItemError;
+            if (@as(items.ReturnCode, @fromBackingInt(@intCast(rc))) != .success) return error.ItemError;
         }
     }
 
@@ -489,7 +489,7 @@ pub const Client = struct {
         _ = try (userdata.Param{
             .message_type = .request,
             .function_group = .cpu_functions,
-            .subfunction = @intFromEnum(userdata.CpuSubfunction.read_szl),
+            .subfunction = @backingInt(userdata.CpuSubfunction.read_szl),
             .sequence = 0,
         }).encodeRequest(&params);
         var req: [8]u8 = undefined;
@@ -532,12 +532,12 @@ pub const Client = struct {
     pub fn plcStop(self: *Client) Error!void {
         if (!self.connected) return error.NotConnected;
         var params: [16]u8 = undefined;
-        params[0] = @intFromEnum(s7.Function.plc_stop);
+        params[0] = @backingInt(s7.Function.plc_stop);
         @memset(params[1..6], 0);
         params[6] = p_program.len;
         @memcpy(params[7..][0..p_program.len], p_program);
         const pdu = try self.exchange(.job, params[0 .. 7 + p_program.len], &.{});
-        try expectControlAck(pdu, @intFromEnum(s7.Function.plc_stop));
+        try expectControlAck(pdu, @backingInt(s7.Function.plc_stop));
     }
 
     /// **Warm restart.** The CPU resumes; retentive data is preserved.
@@ -554,7 +554,7 @@ pub const Client = struct {
     fn piService(self: *Client, argument: []const u8) Error!void {
         if (!self.connected) return error.NotConnected;
         var params: [32]u8 = undefined;
-        params[0] = @intFromEnum(s7.Function.pi_service);
+        params[0] = @backingInt(s7.Function.pi_service);
         @memset(params[1..7], 0);
         params[7] = 0xFD;
         params[8] = @intCast(argument.len >> 8);
@@ -566,7 +566,7 @@ pub const Client = struct {
         @memcpy(params[pos..][0..p_program.len], p_program);
         pos += p_program.len;
         const pdu = try self.exchange(.job, params[0..pos], &.{});
-        try expectControlAck(pdu, @intFromEnum(s7.Function.pi_service));
+        try expectControlAck(pdu, @backingInt(s7.Function.pi_service));
     }
 
     fn expectControlAck(pdu: s7.Pdu, function: u8) Error!void {

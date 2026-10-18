@@ -942,8 +942,8 @@ test "golden reply: GET_WIPHY — one radio reassembled from 75 split messages" 
     try testing.expect(!w.supportsIftype(.mesh_point));
     // AP_VLAN and monitor are the software-only ones on this radio.
     try testing.expectEqual(
-        (@as(u32, 1) << @intFromEnum(uapi.Iftype.ap_vlan)) |
-            (@as(u32, 1) << @intFromEnum(uapi.Iftype.monitor)),
+        (@as(u32, 1) << @backingInt(uapi.Iftype.ap_vlan)) |
+            (@as(u32, 1) << @backingInt(uapi.Iftype.monitor)),
         w.software_iftypes,
     );
 

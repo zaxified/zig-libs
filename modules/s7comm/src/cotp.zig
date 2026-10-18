@@ -102,8 +102,8 @@ pub const TpduSize = enum(u8) {
     _,
 
     pub fn bytes(self: TpduSize) ?u32 {
-        return switch (@intFromEnum(self)) {
-            0x07...0x0D => @as(u32, 1) << @intCast(@intFromEnum(self)),
+        return switch (@backingInt(self)) {
+            0x07...0x0D => @as(u32, 1) << @intCast(@backingInt(self)),
             else => null,
         };
     }
@@ -132,7 +132,7 @@ pub const Tsap = struct {
     /// Rack is 3 bits (0..7), slot is 5 bits (0..31).
     pub fn rackSlot(conn: ConnectionType, rack_no: u3, slot_no: u5) Tsap {
         const low: u16 = (@as(u16, rack_no) * 0x20) + @as(u16, slot_no);
-        return .{ .value = (@as(u16, @intFromEnum(conn)) << 8) | low };
+        return .{ .value = (@as(u16, @backingInt(conn)) << 8) | low };
     }
 
     /// Any two-octet value, for CPUs configured with a non-rack/slot TSAP.
@@ -141,7 +141,7 @@ pub const Tsap = struct {
     }
 
     pub fn connectionType(self: Tsap) ConnectionType {
-        return @enumFromInt(@as(u8, @intCast(self.value >> 8)));
+        return @fromBackingInt(@intCast(@as(u8, @intCast(self.value >> 8))));
     }
 
     pub fn rack(self: Tsap) u3 {
@@ -260,12 +260,12 @@ pub fn decode(bytes: []const u8) Error!Tpdu {
     // nothing while this stack processes `02 F7 80` as a data TPDU. The credit
     // nibble is read below for CR/CC, and only there.
     switch (raw_code & 0xF0) {
-        @intFromEnum(Code.cr), @intFromEnum(Code.cc) => {},
+        @backingInt(Code.cr), @backingInt(Code.cc) => {},
         else => if (raw_code & 0x0F != 0) return error.UnknownTpduCode,
     }
 
     switch (raw_code & 0xF0) {
-        @intFromEnum(Code.cr), @intFromEnum(Code.cc) => {
+        @backingInt(Code.cr), @backingInt(Code.cc) => {
             if (header.len < 6) return error.ShortTpdu;
             const class_octet = header[5];
             const class: u4 = @intCast(class_octet >> 4);
@@ -281,7 +281,7 @@ pub fn decode(bytes: []const u8) Error!Tpdu {
             // still accepted — the decoder is now a bijection on this octet.
             if (class_octet & 0x0C != 0) return error.UnsupportedClass;
             var t: ConnectTpdu = .{
-                .code = @enumFromInt(raw_code & 0xF0),
+                .code = @fromBackingInt(@intCast(raw_code & 0xF0)),
                 .credit = @intCast(raw_code & 0x0F),
                 .dst_ref = be16(header[1..3]),
                 .src_ref = be16(header[3..5]),
@@ -292,26 +292,26 @@ pub fn decode(bytes: []const u8) Error!Tpdu {
             };
             var it = ParameterIterator{ .bytes = t.variable_part };
             while (try it.next()) |p| switch (p.code) {
-                @intFromEnum(ParamCode.src_tsap) => {
+                @backingInt(ParamCode.src_tsap) => {
                     if (p.value.len != 2) return error.BadTsapLength;
                     t.src_tsap = Tsap.raw(be16(p.value));
                 },
-                @intFromEnum(ParamCode.dst_tsap) => {
+                @backingInt(ParamCode.dst_tsap) => {
                     if (p.value.len != 2) return error.BadTsapLength;
                     t.dst_tsap = Tsap.raw(be16(p.value));
                 },
-                @intFromEnum(ParamCode.tpdu_size) => {
+                @backingInt(ParamCode.tpdu_size) => {
                     if (p.value.len != 1) return error.BadTpduSizeLength;
-                    t.tpdu_size = @enumFromInt(p.value[0]);
+                    t.tpdu_size = @fromBackingInt(@intCast(p.value[0]));
                 },
                 else => {},
             };
-            return if ((raw_code & 0xF0) == @intFromEnum(Code.cr))
+            return if ((raw_code & 0xF0) == @backingInt(Code.cr))
                 .{ .cr = t }
             else
                 .{ .cc = t };
         },
-        @intFromEnum(Code.dt) => {
+        @backingInt(Code.dt) => {
             // Class 0 fixes LI at 2: the code octet and the TPDU-NR octet.
             if (li != 2) return error.BadDataTpdu;
             const nr = header[1];
@@ -321,7 +321,7 @@ pub fn decode(bytes: []const u8) Error!Tpdu {
                 .payload = bytes[1 + li ..],
             } };
         },
-        @intFromEnum(Code.dr) => {
+        @backingInt(Code.dr) => {
             if (header.len < 6) return error.ShortTpdu;
             return .{ .dr = .{
                 .dst_ref = be16(header[1..3]),
@@ -329,7 +329,7 @@ pub fn decode(bytes: []const u8) Error!Tpdu {
                 .reason = header[5],
             } };
         },
-        @intFromEnum(Code.dc) => {
+        @backingInt(Code.dc) => {
             if (header.len < 5) return error.ShortTpdu;
             return .{ .dc = .{
                 .dst_ref = be16(header[1..3]),
@@ -337,7 +337,7 @@ pub fn decode(bytes: []const u8) Error!Tpdu {
                 .reason = 0,
             } };
         },
-        @intFromEnum(Code.er) => {
+        @backingInt(Code.er) => {
             if (header.len < 4) return error.ShortTpdu;
             return .{ .er = .{
                 .dst_ref = be16(header[1..3]),
@@ -363,19 +363,19 @@ pub fn encodeConnect(t: ConnectTpdu, out: []u8) Error![]u8 {
     var var_part: [16]u8 = undefined;
     var vlen: usize = 0;
     if (t.tpdu_size) |sz| {
-        var_part[vlen] = @intFromEnum(ParamCode.tpdu_size);
+        var_part[vlen] = @backingInt(ParamCode.tpdu_size);
         var_part[vlen + 1] = 1;
-        var_part[vlen + 2] = @intFromEnum(sz);
+        var_part[vlen + 2] = @backingInt(sz);
         vlen += 3;
     }
-    if (t.src_tsap) |s| vlen += putTsap(var_part[vlen..], @intFromEnum(ParamCode.src_tsap), s);
-    if (t.dst_tsap) |d| vlen += putTsap(var_part[vlen..], @intFromEnum(ParamCode.dst_tsap), d);
+    if (t.src_tsap) |s| vlen += putTsap(var_part[vlen..], @backingInt(ParamCode.src_tsap), s);
+    if (t.dst_tsap) |d| vlen += putTsap(var_part[vlen..], @backingInt(ParamCode.dst_tsap), d);
 
     const li = 6 + vlen;
     if (li > 254) return error.VariablePartTooLong;
     if (out.len < 1 + li) return error.BufferTooSmall;
     out[0] = @intCast(li);
-    out[1] = @intFromEnum(t.code) | @as(u8, t.credit);
+    out[1] = @backingInt(t.code) | @as(u8, t.credit);
     out[2] = @intCast(t.dst_ref >> 8);
     out[3] = @intCast(t.dst_ref & 0xFF);
     out[4] = @intCast(t.src_ref >> 8);
@@ -394,7 +394,7 @@ pub fn encodeConnectVerbatim(t: ConnectTpdu, out: []u8) Error![]u8 {
     if (li > 254) return error.VariablePartTooLong;
     if (out.len < 1 + li) return error.BufferTooSmall;
     out[0] = @intCast(li);
-    out[1] = @intFromEnum(t.code) | @as(u8, t.credit);
+    out[1] = @backingInt(t.code) | @as(u8, t.credit);
     out[2] = @intCast(t.dst_ref >> 8);
     out[3] = @intCast(t.dst_ref & 0xFF);
     out[4] = @intCast(t.src_ref >> 8);
@@ -408,7 +408,7 @@ pub fn encodeConnectVerbatim(t: ConnectTpdu, out: []u8) Error![]u8 {
 
 /// The three-octet DT header that prefixes every S7 PDU.
 pub fn dataHeader(number: u7, eot: bool) [3]u8 {
-    return .{ 0x02, @intFromEnum(Code.dt), (@as(u8, @intFromBool(eot)) << 7) | @as(u8, number) };
+    return .{ 0x02, @backingInt(Code.dt), (@as(u8, @intFromBool(eot)) << 7) | @as(u8, number) };
 }
 
 /// Encodes a DT carrying `payload`.
@@ -423,7 +423,7 @@ pub fn encodeData(t: DataTpdu, out: []u8) Error![]u8 {
 pub fn encodeDisconnect(t: DisconnectTpdu, out: []u8) Error![]u8 {
     if (out.len < 7) return error.BufferTooSmall;
     out[0] = 6;
-    out[1] = @intFromEnum(Code.dr);
+    out[1] = @backingInt(Code.dr);
     out[2] = @intCast(t.dst_ref >> 8);
     out[3] = @intCast(t.dst_ref & 0xFF);
     out[4] = @intCast(t.src_ref >> 8);
@@ -638,8 +638,8 @@ test "verbatim re-encode preserves an unusual parameter order" {
 test "TpduSize.bytes maps only the defined codes" {
     try testing.expectEqual(@as(u32, 128), TpduSize.size_128.bytes().?);
     try testing.expectEqual(@as(u32, 2048), TpduSize.size_2048.bytes().?);
-    try testing.expect(@as(TpduSize, @enumFromInt(0x00)).bytes() == null);
-    try testing.expect(@as(TpduSize, @enumFromInt(0xFF)).bytes() == null);
+    try testing.expect(@as(TpduSize, @fromBackingInt(@intCast(0x00))).bytes() == null);
+    try testing.expect(@as(TpduSize, @fromBackingInt(@intCast(0xFF))).bytes() == null);
 }
 
 /// The corpus-entry format `Smith.slice` reads: a little-endian u32 length,

@@ -44,14 +44,14 @@ pub fn resolve(mode: params.Switch, cp: params.CParams) bool {
     return switch (mode) {
         .enable => true,
         .disable => false,
-        .auto => @intFromEnum(cp.strategy) >= @intFromEnum(params.Strategy.btopt) and cp.window_log >= 27,
+        .auto => @backingInt(cp.strategy) >= @backingInt(params.Strategy.btopt) and cp.window_log >= 27,
     };
 }
 
 /// `ZSTD_ldm_adjustParameters`: the LDM parameters `adv` leaves unset
 /// (null or 0), derived from the frame's parameters and the others.
 pub fn adjustParameters(cp: params.CParams, adv: params.Advanced) Params {
-    const strategy = @intFromEnum(cp.strategy);
+    const strategy = @backingInt(cp.strategy);
     const window_log = cp.window_log;
     var hash_rate_log = params.nonZero(adv.ldm_hash_rate_log) orelse 0;
     var hash_log = params.nonZero(adv.ldm_hash_log) orelse 0;
@@ -68,7 +68,7 @@ pub fn adjustParameters(cp: params.CParams, adv: params.Advanced) Params {
     // table takes the largest size)
     if (hash_log == 0) hash_log = std.math.clamp(window_log -% hash_rate_log, params.hash_log_min, params.hash_log_max);
     const min_match_length = params.nonZero(adv.ldm_min_match) orelse
-        if (strategy >= @intFromEnum(params.Strategy.btultra)) min_match_length_default / 2 else min_match_length_default;
+        if (strategy >= @backingInt(params.Strategy.btultra)) min_match_length_default / 2 else min_match_length_default;
     const bucket_size_log = params.nonZero(adv.ldm_bucket_size_log) orelse
         std.math.clamp(strategy, bucket_size_log_default, params.ldm_bucket_size_log_max);
     return .{
@@ -181,7 +181,7 @@ pub const RawSeqStore = struct {
 pub fn blockCompress(store: *RawSeqStore, ms: *match.MatchState, ss: *sequences.SeqStore, rep: *[3]u32, istart: u32, src_size: u32) usize {
     // If using opt parser, use LDMs only as candidates rather than always
     // accepting them
-    if (@intFromEnum(ms.cp.strategy) >= @intFromEnum(params.Strategy.btopt)) {
+    if (@backingInt(ms.cp.strategy) >= @backingInt(params.Strategy.btopt)) {
         ms.ldm_seq_store = store;
         defer ms.ldm_seq_store = null;
         const last_ll = match.compressBlock(ms, ss, rep, istart, src_size);

@@ -125,7 +125,7 @@ pub fn parse(gpa: std.mem.Allocator, attr_bytes: []const u8) Error!Stats {
     var it: codec.AttrIterator = .{ .buf = attr_bytes };
     while (try it.next()) |a| switch (a.type) {
         uapi.STATS.HEADER => out.device = try header.parse(a.data),
-        uapi.STATS.SRC => out.src = @enumFromInt(try a.asU32()),
+        uapi.STATS.SRC => out.src = @fromBackingInt(@intCast(try a.asU32())),
         uapi.STATS.GRP => {
             if (groups.items.len >= max_groups) return error.BadLength;
             var g = try parseGroup(gpa, a.data);
@@ -151,8 +151,8 @@ fn parseGroup(gpa: std.mem.Allocator, nest_bytes: []const u8) Error!Group {
 
     var it: codec.AttrIterator = .{ .buf = nest_bytes };
     while (try it.next()) |a| switch (a.type) {
-        uapi.STATS_GRP.ID => g.id = @enumFromInt(try a.asU32()),
-        uapi.STATS_GRP.SS_ID => g.ss_id = @enumFromInt(try a.asU32()),
+        uapi.STATS_GRP.ID => g.id = @fromBackingInt(@intCast(try a.asU32())),
+        uapi.STATS_GRP.SS_ID => g.ss_id = @fromBackingInt(@intCast(try a.asU32())),
         uapi.STATS_GRP.PAD => {},
         uapi.STATS_GRP.STAT => {
             // The nest holds exactly one u64 whose attribute type is the
@@ -236,7 +236,7 @@ pub fn buildStats(
 pub const group_names = [_][]const u8{ "eth-phy", "eth-mac", "eth-ctrl", "rmon" };
 
 pub fn groupName(g: uapi.StatsGroup) ?[]const u8 {
-    const i = @intFromEnum(g);
+    const i = @backingInt(g);
     return if (i < group_names.len) group_names[i] else null;
 }
 
@@ -336,7 +336,7 @@ fn parseStringSet(gpa: std.mem.Allocator, nest_bytes: []const u8) Error!StringSe
 
     var it: codec.AttrIterator = .{ .buf = nest_bytes };
     while (try it.next()) |a| switch (a.type) {
-        uapi.STRINGSET.ID => out.id = @enumFromInt(try a.asU32()),
+        uapi.STRINGSET.ID => out.id = @fromBackingInt(@intCast(try a.asU32())),
         uapi.STRINGSET.COUNT => {
             const n = try a.asU32();
             if (n > max_strings) return error.BadLength;
@@ -385,7 +385,7 @@ pub fn appendStringSetSelector(
     const sets = try codec.nestBegin(gpa, list, uapi.STRSET.STRINGSETS | codec.NLA_F_NESTED);
     for (ids) |id| {
         const one = try codec.nestBegin(gpa, list, uapi.STRINGSETS.STRINGSET | codec.NLA_F_NESTED);
-        try codec.appendAttrU32(gpa, list, uapi.STRINGSET.ID, @intFromEnum(id));
+        try codec.appendAttrU32(gpa, list, uapi.STRINGSET.ID, @backingInt(id));
         codec.nestEnd(list, one) catch return error.InvalidRequest;
     }
     codec.nestEnd(list, sets) catch return error.InvalidRequest;
@@ -439,10 +439,10 @@ test "STATS: a group's counters are keyed by attribute type, not by a value attr
     var list: std.ArrayList(u8) = .empty;
     defer list.deinit(gpa);
     try header.append(gpa, &list, uapi.STATS.HEADER, .{ .target = .byIndex(2) });
-    try codec.appendAttrU32(gpa, &list, uapi.STATS.SRC, @intFromEnum(uapi.StatsSrc.aggregate));
+    try codec.appendAttrU32(gpa, &list, uapi.STATS.SRC, @backingInt(uapi.StatsSrc.aggregate));
     const grp = try codec.nestBegin(gpa, &list, uapi.STATS.GRP);
-    try codec.appendAttrU32(gpa, &list, uapi.STATS_GRP.ID, @intFromEnum(uapi.StatsGroup.eth_mac));
-    try codec.appendAttrU32(gpa, &list, uapi.STATS_GRP.SS_ID, @intFromEnum(uapi.StringSetId.stats_eth_mac));
+    try codec.appendAttrU32(gpa, &list, uapi.STATS_GRP.ID, @backingInt(uapi.StatsGroup.eth_mac));
+    try codec.appendAttrU32(gpa, &list, uapi.STATS_GRP.SS_ID, @backingInt(uapi.StringSetId.stats_eth_mac));
     for ([_]struct { id: u16, v: u64 }{
         .{ .id = 0, .v = 1234 }, // FramesTransmittedOK
         .{ .id = 3, .v = 5678 }, // FramesReceivedOK
@@ -470,7 +470,7 @@ test "STATS: rmon histograms decode into rx/tx buckets" {
     var list: std.ArrayList(u8) = .empty;
     defer list.deinit(gpa);
     const grp = try codec.nestBegin(gpa, &list, uapi.STATS.GRP);
-    try codec.appendAttrU32(gpa, &list, uapi.STATS_GRP.ID, @intFromEnum(uapi.StatsGroup.rmon));
+    try codec.appendAttrU32(gpa, &list, uapi.STATS_GRP.ID, @backingInt(uapi.StatsGroup.rmon));
     for ([_]HistBucket{
         .{ .low = 64, .hi = 64, .value = 10 },
         .{ .low = 65, .hi = 127, .value = 20 },
@@ -506,7 +506,7 @@ test "STATS: an empty group is a normal reply, not an error" {
     var list: std.ArrayList(u8) = .empty;
     defer list.deinit(gpa);
     const grp = try codec.nestBegin(gpa, &list, uapi.STATS.GRP);
-    try codec.appendAttrU32(gpa, &list, uapi.STATS_GRP.ID, @intFromEnum(uapi.StatsGroup.eth_ctrl));
+    try codec.appendAttrU32(gpa, &list, uapi.STATS_GRP.ID, @backingInt(uapi.StatsGroup.eth_ctrl));
     try codec.appendAttrU32(gpa, &list, uapi.STATS_GRP.SS_ID, 19);
     codec.nestEnd(&list, grp) catch return error.InvalidRequest;
 
@@ -532,7 +532,7 @@ test "STATS: a counter that is not 8 bytes is a malformed reply" {
 test "group_names matches the StatsGroup enum ordering" {
     try testing.expectEqualStrings("eth-mac", groupName(.eth_mac).?);
     try testing.expectEqualStrings("rmon", groupName(.rmon).?);
-    try testing.expect(groupName(@enumFromInt(99)) == null);
+    try testing.expect(groupName(@fromBackingInt(@intCast(99))) == null);
 }
 
 test "STRSET: strings decode with their kernel indices" {
@@ -541,7 +541,7 @@ test "STRSET: strings decode with their kernel indices" {
     defer list.deinit(gpa);
     const sets = try codec.nestBegin(gpa, &list, uapi.STRSET.STRINGSETS);
     const one = try codec.nestBegin(gpa, &list, uapi.STRINGSETS.STRINGSET);
-    try codec.appendAttrU32(gpa, &list, uapi.STRINGSET.ID, @intFromEnum(uapi.StringSetId.stats_std));
+    try codec.appendAttrU32(gpa, &list, uapi.STRINGSET.ID, @backingInt(uapi.StringSetId.stats_std));
     try codec.appendAttrU32(gpa, &list, uapi.STRINGSET.COUNT, 2);
     const strings = try codec.nestBegin(gpa, &list, uapi.STRINGSET.STRINGS);
     for ([_][]const u8{ "eth-phy", "eth-mac" }, 0..) |s, i| {
@@ -641,8 +641,8 @@ const Corpus = struct {
         var eth_mac: std.ArrayList(u8) = .empty;
         {
             const grp = try codec.nestBegin(gpa, &eth_mac, uapi.STATS.GRP);
-            try codec.appendAttrU32(gpa, &eth_mac, uapi.STATS_GRP.ID, @intFromEnum(uapi.StatsGroup.eth_mac));
-            try codec.appendAttrU32(gpa, &eth_mac, uapi.STATS_GRP.SS_ID, @intFromEnum(uapi.StringSetId.stats_eth_mac));
+            try codec.appendAttrU32(gpa, &eth_mac, uapi.STATS_GRP.ID, @backingInt(uapi.StatsGroup.eth_mac));
+            try codec.appendAttrU32(gpa, &eth_mac, uapi.STATS_GRP.SS_ID, @backingInt(uapi.StringSetId.stats_eth_mac));
             for ([_]struct { id: u16, v: u64 }{ .{ .id = 0, .v = 1234 }, .{ .id = 3, .v = 5678 } }) |s| {
                 const one = try codec.nestBegin(gpa, &eth_mac, uapi.STATS_GRP.STAT);
                 try appendU64(gpa, &eth_mac, s.id, s.v);
@@ -656,7 +656,7 @@ const Corpus = struct {
         var rmon: std.ArrayList(u8) = .empty;
         {
             const grp = try codec.nestBegin(gpa, &rmon, uapi.STATS.GRP);
-            try codec.appendAttrU32(gpa, &rmon, uapi.STATS_GRP.ID, @intFromEnum(uapi.StatsGroup.rmon));
+            try codec.appendAttrU32(gpa, &rmon, uapi.STATS_GRP.ID, @backingInt(uapi.StatsGroup.rmon));
             for ([_]HistBucket{
                 .{ .low = 64, .hi = 64, .value = 10 },
                 .{ .low = 65, .hi = 127, .value = 20 },
@@ -682,7 +682,7 @@ const Corpus = struct {
         var empty_group: std.ArrayList(u8) = .empty;
         {
             const grp = try codec.nestBegin(gpa, &empty_group, uapi.STATS.GRP);
-            try codec.appendAttrU32(gpa, &empty_group, uapi.STATS_GRP.ID, @intFromEnum(uapi.StatsGroup.eth_ctrl));
+            try codec.appendAttrU32(gpa, &empty_group, uapi.STATS_GRP.ID, @backingInt(uapi.StatsGroup.eth_ctrl));
             try codec.appendAttrU32(gpa, &empty_group, uapi.STATS_GRP.SS_ID, 19);
             try codec.nestEnd(&empty_group, grp);
         }
@@ -693,7 +693,7 @@ const Corpus = struct {
         {
             const sets = try codec.nestBegin(gpa, &strset, uapi.STRSET.STRINGSETS);
             const one = try codec.nestBegin(gpa, &strset, uapi.STRINGSETS.STRINGSET);
-            try codec.appendAttrU32(gpa, &strset, uapi.STRINGSET.ID, @intFromEnum(uapi.StringSetId.stats_std));
+            try codec.appendAttrU32(gpa, &strset, uapi.STRINGSET.ID, @backingInt(uapi.StringSetId.stats_std));
             try codec.appendAttrU32(gpa, &strset, uapi.STRINGSET.COUNT, 2);
             const strings = try codec.nestBegin(gpa, &strset, uapi.STRINGSET.STRINGS);
             for ([_][]const u8{ "eth-phy", "eth-mac" }, 0..) |s, i| {
@@ -739,7 +739,7 @@ const Corpus = struct {
         var narrow: std.ArrayList(u8) = .empty;
         {
             const grp = try codec.nestBegin(gpa, &narrow, uapi.STATS.GRP);
-            try codec.appendAttrU32(gpa, &narrow, uapi.STATS_GRP.ID, @intFromEnum(uapi.StatsGroup.eth_mac));
+            try codec.appendAttrU32(gpa, &narrow, uapi.STATS_GRP.ID, @backingInt(uapi.StatsGroup.eth_mac));
             const one = try codec.nestBegin(gpa, &narrow, uapi.STATS_GRP.STAT);
             try codec.appendAttrU32(gpa, &narrow, 0, 1234);
             try codec.nestEnd(&narrow, one);

@@ -218,13 +218,13 @@ pub fn decode(datagram: []const u8) Error!Message {
     const declared = std.mem.readInt(u16, datagram[2..4], .big);
     if (declared != datagram.len) return error.LengthMismatch;
 
-    const func: Function = @enumFromInt(datagram[1]);
+    const func: Function = @fromBackingInt(@intCast(datagram[1]));
     const body = datagram[header_len..];
 
     switch (func) {
         .result => {
             if (body.len != 2) return error.Truncated;
-            return .{ .result = @enumFromInt(std.mem.readInt(u16, body[0..2], .big)) };
+            return .{ .result = @fromBackingInt(@intCast(std.mem.readInt(u16, body[0..2], .big))) };
         },
         .write_broadcast_distribution_table => {
             if (body.len % BdtEntry.wire_len != 0) return error.InvalidBody;
@@ -294,12 +294,12 @@ pub fn encode(msg: Message, out: []u8) Error![]u8 {
     if (out.len < total) return error.NoSpace;
 
     out[0] = bvlc_type;
-    out[1] = @intFromEnum(msg.function());
+    out[1] = @backingInt(msg.function());
     std.mem.writeInt(u16, out[2..4], @intCast(total), .big);
     const body = out[header_len..total];
 
     switch (msg) {
-        .result => |c| std.mem.writeInt(u16, body[0..2], @intFromEnum(c), .big),
+        .result => |c| std.mem.writeInt(u16, body[0..2], @backingInt(c), .big),
         .write_broadcast_distribution_table,
         .read_broadcast_distribution_table_ack,
         .read_foreign_device_table_ack,

@@ -183,11 +183,11 @@ pub fn ackInform(event: TrapEvent, buf: []u8) AckError![]const u8 {
     try e.prependInteger(ber.tag.integer, 0);
     try e.prependInteger(ber.tag.integer, 0);
     try e.prependInteger(ber.tag.integer, request_id);
-    try e.wrap(@intFromEnum(message.PduType.response), 0);
+    try e.wrap(@backingInt(message.PduType.response), 0);
 
     // community + version, then the outer message SEQUENCE.
     try e.prependTlv(ber.tag.octet_string, event.community);
-    try e.prependInteger(ber.tag.integer, @intFromEnum(event.version));
+    try e.prependInteger(ber.tag.integer, @backingInt(event.version));
     try e.wrap(ber.tag.sequence, 0);
     return e.encoded();
 }

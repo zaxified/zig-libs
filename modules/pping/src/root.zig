@@ -309,8 +309,8 @@ pub const Estimator = struct {
     pub fn observe(self: *Estimator, obs: Observation) ?RttSample {
         self.observations_total += 1;
         if (!self.admit(.tcp_timestamps)) return null;
-        const same = &self.tables[@intFromEnum(obs.dir)];
-        const opp = &self.tables[@intFromEnum(obs.dir.opposite())];
+        const same = &self.tables[@backingInt(obs.dir)];
+        const opp = &self.tables[@backingInt(obs.dir.opposite())];
         const sample = match.matchEcho(same, opp, self.cfg, obs);
         if (sample != null) self.samples_emitted += 1;
         return sample;
@@ -325,8 +325,8 @@ pub const Estimator = struct {
     pub fn observeEcho(self: *Estimator, obs: EchoObservation) ?RttSample {
         self.observations_total += 1;
         if (!self.admit(.icmp_echo)) return null;
-        const same = &self.tables[@intFromEnum(obs.dir)];
-        const opp = &self.tables[@intFromEnum(obs.dir.opposite())];
+        const same = &self.tables[@backingInt(obs.dir)];
+        const opp = &self.tables[@backingInt(obs.dir.opposite())];
         const sample = match.matchEchoReply(same, opp, self.cfg, obs);
         if (sample != null) self.samples_emitted += 1;
         return sample;
@@ -335,7 +335,7 @@ pub const Estimator = struct {
     /// Current occupancy of the table for direction `dir` (`<= cfg.capacity`,
     /// always — see `TsTable.insert`'s `error.Full` guarantee).
     pub fn tableCount(self: *const Estimator, dir: Direction) usize {
-        return self.tables[@intFromEnum(dir)].count();
+        return self.tables[@backingInt(dir)].count();
     }
 };
 
@@ -370,7 +370,7 @@ test "smoke: Estimator.reset empties tables and zeroes counters without touching
     // Poke the tables directly (mechanical TsTable API — no Fable stub
     // involved) to prove reset genuinely clears state, without needing
     // `observe`/`matchEcho`.
-    try est.tables[@intFromEnum(Direction.a_to_b)].insert(1, 100);
+    try est.tables[@backingInt(Direction.a_to_b)].insert(1, 100);
     est.samples_emitted = 3;
     est.observations_total = 5;
     est.reset();
@@ -485,8 +485,8 @@ fn fuzzStream(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
             StreamMark.mark(.backwards_clock);
         } else now += adv;
         const dir: Direction = if (src.value(bool)) .a_to_b else .b_to_a;
-        const di = @intFromEnum(dir);
-        const oi = @intFromEnum(dir.opposite());
+        const di = @backingInt(dir);
+        const oi = @backingInt(dir.opposite());
         const tsval = src.valueRangeAtMost(u8, 0, 15);
         const tsecr = src.valueRangeAtMost(u8, 0, 15);
         if (src.valueRangeAtMost(u8, 0, 9) == 0) {

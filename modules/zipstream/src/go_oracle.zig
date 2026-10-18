@@ -95,7 +95,7 @@ fn compare(gpa: std.mem.Allocator, data: []const u8, c: vectors.Case, why: *std.
         const g = c.entries[gi];
         const o = &archive.entries.items[oi];
         if (!std.mem.eql(u8, o.name, g.name)) return why.print("entry {d} name: ours \"{s}\", go \"{s}\"", .{ oi, o.name, g.name });
-        if (@intFromEnum(o.compression) != g.method) return why.print("entry {d} method: ours {d}, go {d}", .{ oi, @intFromEnum(o.compression), g.method });
+        if (@backingInt(o.compression) != g.method) return why.print("entry {d} method: ours {d}, go {d}", .{ oi, @backingInt(o.compression), g.method });
         if (o.crc32 != g.crc32) return why.print("entry {d} crc32: ours {x:0>8}, go {x:0>8}", .{ oi, o.crc32, g.crc32 });
         if (o.compressed_size != g.compressed_size or o.uncompressed_size != g.uncompressed_size)
             return why.print("entry {d} sizes: ours {d}/{d}, go {d}/{d}", .{ oi, o.compressed_size, o.uncompressed_size, g.compressed_size, g.uncompressed_size });

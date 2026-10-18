@@ -61,9 +61,9 @@ pub const GeneralNameIterator = struct {
         // GeneralName is a CHOICE of context-specific [0]..[8]; anything else
         // is not a GeneralName at all.
         if (elem.identifier.class != .context_specific) return error.CertificateFieldHasWrongDataType;
-        const n = @intFromEnum(elem.identifier.tag);
+        const n = @backingInt(elem.identifier.tag);
         if (n > 8) return error.CertificateFieldHasWrongDataType;
-        return .{ .tag = @enumFromInt(n), .value = it.bytes[elem.slice.start..elem.slice.end] };
+        return .{ .tag = @fromBackingInt(@intCast(n)), .value = it.bytes[elem.slice.start..elem.slice.end] };
     }
 };
 

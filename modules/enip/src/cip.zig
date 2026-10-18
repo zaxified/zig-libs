@@ -286,7 +286,7 @@ pub const Reply = struct {
         return .{
             .service = bytes[0] & ~reply_bit,
             .reserved = bytes[1],
-            .general_status = @enumFromInt(bytes[2]),
+            .general_status = @fromBackingInt(@intCast(bytes[2])),
             .additional_status = bytes[4 .. 4 + extra_len],
             .data = bytes[4 + extra_len ..],
         };
@@ -299,7 +299,7 @@ pub const Reply = struct {
         if (out.len < total) return error.BufferTooSmall;
         out[0] = self.service | reply_bit;
         out[1] = self.reserved;
-        out[2] = @intFromEnum(self.general_status);
+        out[2] = @backingInt(self.general_status);
         out[3] = @intCast(self.additional_status.len / 2);
         @memcpy(out[4..][0..self.additional_status.len], self.additional_status);
         @memcpy(out[4 + self.additional_status.len ..][0..self.data.len], self.data);
@@ -387,7 +387,7 @@ pub fn getAttributeSingle(class_id: u32, instance: u32, attribute: u32, out: []u
     var path_buf: [16]u8 = undefined;
     const path = epath.logicalPath(class_id, instance, attribute, &path_buf) catch return error.BadPath;
     return (Request{
-        .service = @intFromEnum(Service.get_attribute_single),
+        .service = @backingInt(Service.get_attribute_single),
         .path = path,
         .data = &.{},
     }).encode(out);
@@ -398,7 +398,7 @@ pub fn getAttributesAll(class_id: u32, instance: u32, out: []u8) EncodeError![]u
     var path_buf: [16]u8 = undefined;
     const path = epath.logicalPath(class_id, instance, null, &path_buf) catch return error.BadPath;
     return (Request{
-        .service = @intFromEnum(Service.get_attributes_all),
+        .service = @backingInt(Service.get_attributes_all),
         .path = path,
         .data = &.{},
     }).encode(out);
@@ -415,7 +415,7 @@ pub fn setAttributeSingle(
     var path_buf: [16]u8 = undefined;
     const path = epath.logicalPath(class_id, instance, attribute, &path_buf) catch return error.BadPath;
     return (Request{
-        .service = @intFromEnum(Service.set_attribute_single),
+        .service = @backingInt(Service.set_attribute_single),
         .path = path,
         .data = value,
     }).encode(out);
@@ -437,7 +437,7 @@ pub fn getAttributeList(
     std.mem.writeInt(u16, data_buf[0..2], @intCast(attributes.len), .little);
     for (attributes, 0..) |a, i| std.mem.writeInt(u16, data_buf[2 + i * 2 ..][0..2], a, .little);
     return (Request{
-        .service = @intFromEnum(Service.get_attribute_list),
+        .service = @backingInt(Service.get_attribute_list),
         .path = path,
         .data = data_buf[0 .. 2 + attributes.len * 2],
     }).encode(out);
@@ -470,7 +470,7 @@ pub const AttributeListIterator = struct {
         if (self.remaining == 0) return null;
         if (self.off + 4 + value_len > self.data.len) return error.Truncated;
         const id = std.mem.readInt(u16, self.data[self.off..][0..2], .little);
-        const st: GeneralStatus = @enumFromInt(self.data[self.off + 2]);
+        const st: GeneralStatus = @fromBackingInt(@intCast(self.data[self.off + 2]));
         self.off += 4 + value_len;
         self.remaining -= 1;
         return .{ .id = id, .status = st };

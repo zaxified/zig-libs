@@ -891,12 +891,12 @@ test "refresh (same committee, all old parties deal): Q unchanged, every share c
 }
 
 fn badShare1to2(from: u32, to: u32, bytes: []u8) Action {
-    if (from == 1 and to == 2 and bytes[0] == @intFromEnum(wire.Kind.reshare_share)) bytes[1 + 8 + Ns - 1] ^= 1;
+    if (from == 1 and to == 2 and bytes[0] == @backingInt(wire.Kind.reshare_share)) bytes[1 + 8 + Ns - 1] ^= 1;
     return .deliver;
 }
 
 fn badShare1to2DropDefense(from: u32, to: u32, bytes: []u8) Action {
-    if (bytes[0] == @intFromEnum(wire.Kind.reshare_defense) and from == 1) return .drop;
+    if (bytes[0] == @backingInt(wire.Kind.reshare_defense) and from == 1) return .drop;
     return badShare1to2(from, to, bytes);
 }
 
@@ -1054,7 +1054,7 @@ test "receiver and dealer refuse malformed, misrouted, replayed and out-of-round
 
     try testing.expectError(error.Malformed, r1.handle(.{ .dealer = 1 }, &.{}));
     try testing.expectError(error.UnknownKind, r1.handle(.{ .dealer = 1 }, &.{0}));
-    try testing.expectError(error.UnknownKind, r1.handle(.{ .dealer = 1 }, &.{@intFromEnum(wire.Kind.share)}));
+    try testing.expectError(error.UnknownKind, r1.handle(.{ .dealer = 1 }, &.{@backingInt(wire.Kind.share)}));
     try testing.expectError(error.UnknownSender, r1.handle(.{ .dealer = 3 }, bc)); // 3 is not a dealer
     try testing.expectError(error.UnknownSender, r1.handle(.{ .dealer = 0 }, share));
     try testing.expectError(error.SenderMismatch, r1.handle(.{ .dealer = 2 }, bc)); // says dealer 1
@@ -1089,14 +1089,14 @@ test "receiver and dealer refuse malformed, misrouted, replayed and out-of-round
     try testing.expectError(error.DuplicateMessage, r1.handle(.{ .dealer = 1 }, bc));
     try testing.expectError(error.DuplicateMessage, r1.handle(.{ .dealer = 1 }, share));
     // Wrong round while collecting shares.
-    try testing.expectError(error.WrongRound, r1.handle(.{ .receiver = 2 }, &.{@intFromEnum(wire.Kind.reshare_complaint)}));
-    try testing.expectError(error.WrongRound, r1.handle(.{ .dealer = 1 }, &.{@intFromEnum(wire.Kind.reshare_defense)}));
+    try testing.expectError(error.WrongRound, r1.handle(.{ .receiver = 2 }, &.{@backingInt(wire.Kind.reshare_complaint)}));
+    try testing.expectError(error.WrongRound, r1.handle(.{ .dealer = 1 }, &.{@backingInt(wire.Kind.reshare_defense)}));
 
     // Dealer 2 never came: r1 excludes it later, and complains about nobody.
     try r1.advance();
     try testing.expectError(error.WrongRound, r1.handle(.{ .dealer = 1 }, bc));
     var cf: [1 + Complaint.encoded_length]u8 = undefined;
-    cf[0] = @intFromEnum(wire.Kind.reshare_complaint);
+    cf[0] = @backingInt(wire.Kind.reshare_complaint);
     @memcpy(cf[1..], &(Complaint{ .complainant = 2, .accused = 1 }).toBytes());
     try testing.expectError(error.UnknownSender, r1.handle(.{ .receiver = 1 }, &cf)); // ourselves
     try testing.expectError(error.UnknownSender, r1.handle(.{ .receiver = 9 }, &cf));
@@ -1111,7 +1111,7 @@ test "receiver and dealer refuse malformed, misrouted, replayed and out-of-round
     // A defense for a complaint that exists, from the right dealer, but that
     // dealer's broadcast was accepted above: it verifies and is recorded.
     var df: [1 + types.ScalarShareMsg.encoded_length]u8 = undefined;
-    df[0] = @intFromEnum(wire.Kind.reshare_defense);
+    df[0] = @backingInt(wire.Kind.reshare_defense);
     var sm: types.ScalarShareMsg = .{ .dealer = 1, .receiver = 2, .s = Scalar.zero };
     commit.evalPoly(d1.g, commit.scalarFromIndex(2), &sm.s);
     @memcpy(df[1..], &sm.toBytes());
@@ -1140,7 +1140,7 @@ test "receiver and dealer refuse malformed, misrouted, replayed and out-of-round
     const defs = try d2.takeOutgoing();
     defer wire.freeOutgoing(allocator, defs);
     try testing.expectEqual(@as(usize, 1), defs.len);
-    try testing.expectEqual(@as(u8, @intFromEnum(wire.Kind.reshare_defense)), defs[0].bytes[0]);
+    try testing.expectEqual(@as(u8, @backingInt(wire.Kind.reshare_defense)), defs[0].bytes[0]);
     try testing.expectError(error.Finished, d2.handle(2, &about_2));
     try testing.expectError(error.Finished, d2.advance());
 }
@@ -1201,7 +1201,7 @@ test "replaying the recorded resharing transcript reproduces the oracle's commit
     for (dealers) |*d| try d.start();
     for (dealers, rs.dealer_polys) |*d, dp| {
         for (d.outbox.items) |m| {
-            if (m.bytes[0] == @intFromEnum(wire.Kind.reshare_broadcast)) {
+            if (m.bytes[0] == @backingInt(wire.Kind.reshare_broadcast)) {
                 for (dp.commitments, 0..) |hx, k| try tn.expectHex(hx, m.bytes[1 + 8 + k * Ne ..][0..Ne]);
             } else {
                 try tn.expectHex(dp.shares[m.to.party - 1], m.bytes[1 + 8 ..][0..Ns]);
@@ -1405,7 +1405,7 @@ test "fuzz: ReshareReceiver.handle never panics, in any round" {
 }
 
 fn badShare1toBoth(from: u32, to: u32, bytes: []u8) Action {
-    if (from == 1 and to <= 2 and bytes[0] == @intFromEnum(wire.Kind.reshare_share)) bytes[1 + 8 + Ns - 1] ^= 1;
+    if (from == 1 and to <= 2 and bytes[0] == @backingInt(wire.Kind.reshare_share)) bytes[1 + 8 + Ns - 1] ^= 1;
     return .deliver;
 }
 

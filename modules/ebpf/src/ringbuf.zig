@@ -202,7 +202,7 @@ pub const Reader = struct {
     /// what it created itself.
     pub fn open(map_fd: linux.fd_t) OpenError!Reader {
         const info = try mapInfo(map_fd);
-        if (info.type != @intFromEnum(BPF.MapType.ringbuf)) return error.NotARingbufMap;
+        if (info.type != @backingInt(BPF.MapType.ringbuf)) return error.NotARingbufMap;
         return openWithRingSize(map_fd, info.max_entries);
     }
 

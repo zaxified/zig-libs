@@ -137,7 +137,7 @@ pub const Responder = struct {
 
     fn handleJob(self: *Responder, pdu: s7.Pdu, out: []u8) Error!?[]u8 {
         if (pdu.parameters.len == 0) return error.Unsupported;
-        const function: s7.Function = @enumFromInt(pdu.parameters[0]);
+        const function: s7.Function = @fromBackingInt(@intCast(pdu.parameters[0]));
         return switch (function) {
             .setup_communication => try self.doSetup(pdu, out),
             .read_var => try self.doRead(pdu, out),
@@ -244,7 +244,7 @@ pub const Responder = struct {
         while (try it.next()) |item| {
             const value = (try di.next()) orelse return error.ShortItem;
             const rc = self.applyWrite(item, value);
-            codes[count] = @intFromEnum(rc);
+            codes[count] = @backingInt(rc);
             count += 1;
         }
         var params: [2]u8 = undefined;
@@ -283,7 +283,7 @@ pub const Responder = struct {
     fn handleUserdata(self: *Responder, pdu: s7.Pdu, out: []u8) Error![]u8 {
         const p = try userdata.Param.decode(pdu.parameters);
         if (p.function_group != .cpu_functions or
-            p.subfunction != @intFromEnum(userdata.CpuSubfunction.read_szl))
+            p.subfunction != @backingInt(userdata.CpuSubfunction.read_szl))
         {
             return error.Unsupported;
         }
@@ -308,7 +308,7 @@ pub const Responder = struct {
                 rec[1] = 0x44;
                 rec[2] = 0xFF;
                 rec[userdata.cpu_status_offset] =
-                    @intFromEnum(if (self.stopped) userdata.CpuStatus.stop else self.config.cpu_status);
+                    @backingInt(if (self.stopped) userdata.CpuStatus.stop else self.config.cpu_status);
                 break :blk try userdata.SzlResponse.encode(
                     .{ .id = req.id, .index = req.index, .record_length = 20, .record_count = 1 },
                     &rec,
@@ -491,20 +491,20 @@ test "a write past the end of the area, or shorter than its item, is refused and
     const past = hex("0300002702f080320100000200000e00080501120a100200040001840001e8" ++
         "0004002012345678", &in);
     var rep = (try r.handle(past, &out)).?;
-    try testing.expectEqual(@intFromEnum(items.ReturnCode.invalid_address), rep[rep.len - 1]);
+    try testing.expectEqual(@backingInt(items.ReturnCode.invalid_address), rep[rep.len - 1]);
     try testing.expectEqualSlices(u8, &[_]u8{ 0, 0, 0 }, db[61..64]);
 
     // A four-octet item carrying two octets of data.
     const short = hex("0300002502f080320100000300000e00060501120a100200040001840000a0" ++
         "000400101234", &in);
     rep = (try r.handle(short, &out)).?;
-    try testing.expectEqual(@intFromEnum(items.ReturnCode.data_type_inconsistent), rep[rep.len - 1]);
+    try testing.expectEqual(@backingInt(items.ReturnCode.data_type_inconsistent), rep[rep.len - 1]);
     try testing.expectEqualSlices(u8, &[_]u8{ 0, 0 }, db[20..22]);
 
     // M16.0 in a 16-octet flag area.
     const bit = hex("0300002402f080320100000400000e00050501120a100100010000830000800003000101", &in);
     rep = (try r.handle(bit, &out)).?;
-    try testing.expectEqual(@intFromEnum(items.ReturnCode.invalid_address), rep[rep.len - 1]);
+    try testing.expectEqual(@backingInt(items.ReturnCode.invalid_address), rep[rep.len - 1]);
 }
 
 test "PLC control is refused unless explicitly enabled" {
@@ -605,7 +605,7 @@ test "a Read Var item with count 0 on the bit path does not index past the area"
     // that was never inside the area.
     try testing.expectEqualSlices(
         u8,
-        &[_]u8{ @intFromEnum(items.ReturnCode.invalid_address), 0x00, 0x00, 0x04 },
+        &[_]u8{ @backingInt(items.ReturnCode.invalid_address), 0x00, 0x00, 0x04 },
         rep[21..],
     );
 }
@@ -622,7 +622,7 @@ test "F7(a): a read that lands exactly on the end of the area succeeds (positive
     const req = hex("0300001f" ++ "02f080" ++ "320100000001000e0000" ++ "0401" ++
         "120a1002" ++ "0040" ++ "0001" ++ "84" ++ "000000", &in);
     const rep = (try r.handle(req, &out)).?;
-    try testing.expectEqual(@intFromEnum(items.ReturnCode.success), rep[21]);
+    try testing.expectEqual(@backingInt(items.ReturnCode.success), rep[21]);
 }
 
 test "F7(a): a read that lands one octet past the end of the area is refused, not a stray byte" {
@@ -644,7 +644,7 @@ test "F7(a): a read that lands one octet past the end of the area is refused, no
     const rep = (try r.handle(req, &out)).?;
     try testing.expectEqualSlices(
         u8,
-        &[_]u8{ @intFromEnum(items.ReturnCode.invalid_address), 0x00, 0x00, 0x04 },
+        &[_]u8{ @backingInt(items.ReturnCode.invalid_address), 0x00, 0x00, 0x04 },
         rep[21..],
     );
 }
@@ -855,13 +855,13 @@ fn fuzzItemBytes(smith: anytype, out: *[12]u8) void {
 /// whole request is wasted — but sometimes a lie, which is the case
 /// `applyWrite`'s own `value.payload.len < want` guard exists for.
 fn fuzzWriteValue(smith: anytype, data: []u8, pos: usize, last: bool) ?usize {
-    const ts: items.DataTransportSize = @enumFromInt(fuzz_data_sizes[@intCast(drawBelow(smith, fuzz_data_sizes.len))]);
+    const ts: items.DataTransportSize = @fromBackingInt(@intCast(fuzz_data_sizes[@intCast(drawBelow(smith, fuzz_data_sizes.len))]));
     const n: usize = @intCast(drawBelow(smith, 33));
     const honest = items.encodeLength(ts, n) catch return null;
     const raw: u16 = if (drawOdds(smith, 7, 8)) honest else drawWide(smith, u16);
     if (pos + 4 + n > data.len) return null;
     data[pos] = 0x00; // a request item's return-code octet is `reserved`
-    data[pos + 1] = @intFromEnum(ts);
+    data[pos + 1] = @backingInt(ts);
     data[pos + 2] = @intCast(raw >> 8);
     data[pos + 3] = @truncate(raw);
     smith.bytes(data[pos + 4 ..][0..n]);
@@ -965,8 +965,8 @@ fn fuzzRequest(smith: anytype, out: []u8) ?[]const u8 {
         else => {
             rosctr = 0x07;
             const p = (userdata.Param{
-                .message_type = @enumFromInt(@as(u4, @truncate(if (drawOdds(smith, 7, 8)) @as(u8, 0) else drawWide(smith, u8)))),
-                .function_group = @enumFromInt(@as(u4, @truncate(if (drawOdds(smith, 7, 8)) @as(u8, 4) else drawWide(smith, u8)))),
+                .message_type = @fromBackingInt(@intCast(@as(u4, @truncate(if (drawOdds(smith, 7, 8)) @as(u8, 0) else drawWide(smith, u8))))),
+                .function_group = @fromBackingInt(@intCast(@as(u4, @truncate(if (drawOdds(smith, 7, 8)) @as(u8, 4) else drawWide(smith, u8))))),
                 .subfunction = if (drawOdds(smith, 7, 8)) 0x01 else drawWide(smith, u8),
             }).encodeRequest(&params) catch return null;
             plen = p.len;
@@ -981,8 +981,8 @@ fn fuzzRequest(smith: anytype, out: []u8) ?[]const u8 {
                 payload[1] = @truncate(id);
             }
             const db = userdata.DataBlock.encode(
-                @enumFromInt(0xFF),
-                @enumFromInt(0x09),
+                @fromBackingInt(@intCast(0xFF)),
+                @fromBackingInt(@intCast(0x09)),
                 payload[0..n],
                 &data,
             ) catch return null;

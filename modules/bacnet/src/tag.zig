@@ -109,7 +109,7 @@ pub const Tag = struct {
 
     pub fn isApplication(self: Tag, n: ApplicationTag) bool {
         return self.class == .application and self.form == .primitive and
-            self.number == @intFromEnum(n);
+            self.number == @backingInt(n);
     }
 
     pub fn isContext(self: Tag, n: u32) bool {
@@ -171,7 +171,7 @@ pub fn decodeHeader(buf: []const u8) Error!Tag {
     }
 
     // Application Boolean: the LVT field *is* the value; no data follows.
-    if (class == .application and number == @intFromEnum(ApplicationTag.boolean)) {
+    if (class == .application and number == @backingInt(ApplicationTag.boolean)) {
         if (lvt > 1) return error.InvalidTag;
         return .{
             .class = .application,
@@ -239,7 +239,7 @@ pub fn encodeHeader(tag: Tag, out: []u8) Error!usize {
             break :blk 7;
         },
         .primitive => blk: {
-            if (tag.class == .application and tag.number == @intFromEnum(ApplicationTag.boolean)) {
+            if (tag.class == .application and tag.number == @backingInt(ApplicationTag.boolean)) {
                 if (tag.len != 0) return error.InvalidLength;
                 break :blk @as(u8, if (tag.bool_value) 1 else 0);
             }
@@ -432,12 +432,12 @@ pub const ObjectId = struct {
     pub const unconfigured_instance: u22 = 0x3FFFFF;
 
     pub fn pack(self: ObjectId) u32 {
-        return (@as(u32, @intFromEnum(self.type)) << 22) | @as(u32, self.instance);
+        return (@as(u32, @backingInt(self.type)) << 22) | @as(u32, self.instance);
     }
 
     pub fn unpack(word: u32) ObjectId {
         return .{
-            .type = @enumFromInt(@as(u10, @truncate(word >> 22))),
+            .type = @fromBackingInt(@intCast(@as(u10, @truncate(word >> 22)))),
             .instance = @truncate(word & 0x3FFFFF),
         };
     }
@@ -537,7 +537,7 @@ pub const Writer = struct {
     pub fn appBool(self: *Writer, v: bool) Error!void {
         try self.header(.{
             .class = .application,
-            .number = @intFromEnum(ApplicationTag.boolean),
+            .number = @backingInt(ApplicationTag.boolean),
             .form = .primitive,
             .len = 0,
             .bool_value = v,
@@ -547,39 +547,39 @@ pub const Writer = struct {
     pub fn appUnsigned(self: *Writer, v: u64) Error!void {
         var tmp: [8]u8 = undefined;
         const n = packUnsigned(v, &tmp);
-        try self.tagged(.application, @intFromEnum(ApplicationTag.unsigned), tmp[0..n]);
+        try self.tagged(.application, @backingInt(ApplicationTag.unsigned), tmp[0..n]);
     }
 
     pub fn appSigned(self: *Writer, v: i64) Error!void {
         var tmp: [8]u8 = undefined;
         const n = packSigned(v, &tmp);
-        try self.tagged(.application, @intFromEnum(ApplicationTag.signed), tmp[0..n]);
+        try self.tagged(.application, @backingInt(ApplicationTag.signed), tmp[0..n]);
     }
 
     pub fn appReal(self: *Writer, v: f32) Error!void {
         var tmp: [4]u8 = undefined;
         std.mem.writeInt(u32, &tmp, @bitCast(v), .big);
-        try self.tagged(.application, @intFromEnum(ApplicationTag.real), &tmp);
+        try self.tagged(.application, @backingInt(ApplicationTag.real), &tmp);
     }
 
     pub fn appDouble(self: *Writer, v: f64) Error!void {
         var tmp: [8]u8 = undefined;
         std.mem.writeInt(u64, &tmp, @bitCast(v), .big);
-        try self.tagged(.application, @intFromEnum(ApplicationTag.double), &tmp);
+        try self.tagged(.application, @backingInt(ApplicationTag.double), &tmp);
     }
 
     pub fn appOctetString(self: *Writer, v: []const u8) Error!void {
-        try self.tagged(.application, @intFromEnum(ApplicationTag.octet_string), v);
+        try self.tagged(.application, @backingInt(ApplicationTag.octet_string), v);
     }
 
     pub fn appCharacterString(self: *Writer, s: CharacterString) Error!void {
         try self.header(.{
             .class = .application,
-            .number = @intFromEnum(ApplicationTag.character_string),
+            .number = @backingInt(ApplicationTag.character_string),
             .form = .primitive,
             .len = @intCast(s.bytes.len + 1),
         });
-        try self.byte(@intFromEnum(s.encoding));
+        try self.byte(@backingInt(s.encoding));
         try self.raw(s.bytes);
     }
 
@@ -592,7 +592,7 @@ pub const Writer = struct {
         if (bs.bytes.len == 0 and bs.unused_bits != 0) return error.InvalidValue;
         try self.header(.{
             .class = .application,
-            .number = @intFromEnum(ApplicationTag.bit_string),
+            .number = @backingInt(ApplicationTag.bit_string),
             .form = .primitive,
             .len = @intCast(bs.bytes.len + 1),
         });
@@ -603,19 +603,19 @@ pub const Writer = struct {
     pub fn appEnumerated(self: *Writer, v: u32) Error!void {
         var tmp: [8]u8 = undefined;
         const n = packUnsigned(v, &tmp);
-        try self.tagged(.application, @intFromEnum(ApplicationTag.enumerated), tmp[0..n]);
+        try self.tagged(.application, @backingInt(ApplicationTag.enumerated), tmp[0..n]);
     }
 
     pub fn appDate(self: *Writer, d: Date) Error!void {
         try d.validate();
-        try self.tagged(.application, @intFromEnum(ApplicationTag.date), &.{
+        try self.tagged(.application, @backingInt(ApplicationTag.date), &.{
             d.year, d.month, d.day, d.weekday,
         });
     }
 
     pub fn appTime(self: *Writer, t: Time) Error!void {
         try t.validate();
-        try self.tagged(.application, @intFromEnum(ApplicationTag.time), &.{
+        try self.tagged(.application, @backingInt(ApplicationTag.time), &.{
             t.hour, t.minute, t.second, t.hundredths,
         });
     }
@@ -623,7 +623,7 @@ pub const Writer = struct {
     pub fn appObjectId(self: *Writer, oid: ObjectId) Error!void {
         var tmp: [4]u8 = undefined;
         std.mem.writeInt(u32, &tmp, oid.pack(), .big);
-        try self.tagged(.application, @intFromEnum(ApplicationTag.object_identifier), &tmp);
+        try self.tagged(.application, @backingInt(ApplicationTag.object_identifier), &tmp);
     }
 
     /// Writes any `Value` with its application tag.
@@ -703,7 +703,7 @@ pub const Writer = struct {
             .form = .primitive,
             .len = @intCast(s.len + 1),
         });
-        try self.byte(@intFromEnum(StringEncoding.utf8));
+        try self.byte(@backingInt(StringEncoding.utf8));
         try self.raw(s);
     }
 
@@ -908,7 +908,7 @@ pub const Reader = struct {
         if (!t.isContext(n)) return error.UnexpectedTag;
         if (t.len < 1) return error.InvalidLength;
         const d = try self.take(t.len);
-        return .{ .encoding = @enumFromInt(d[0]), .bytes = d[1..] };
+        return .{ .encoding = @fromBackingInt(@intCast(d[0])), .bytes = d[1..] };
     }
 
     /// Reads whatever application-tagged datum comes next.
@@ -926,7 +926,7 @@ pub const Reader = struct {
     }
 
     fn decodeAppData(self: *Reader, t: Tag) Error!Value {
-        const app: ApplicationTag = @enumFromInt(@as(u8, @intCast(@min(t.number, 255))));
+        const app: ApplicationTag = @fromBackingInt(@intCast(@as(u8, @intCast(@min(t.number, 255)))));
         switch (app) {
             .null => {
                 if (t.len != 0) return error.InvalidLength;
@@ -952,7 +952,7 @@ pub const Reader = struct {
                 if (t.len < 1) return error.InvalidLength;
                 const d = try self.take(t.len);
                 return .{ .character_string = .{
-                    .encoding = @enumFromInt(d[0]),
+                    .encoding = @fromBackingInt(@intCast(d[0])),
                     .bytes = d[1..],
                 } };
             },
@@ -1317,7 +1317,7 @@ test "object identifier packs type and instance into 22 bits" {
 
     // A reserved/vendor object type still round-trips numerically.
     const weird = ObjectId.unpack(0xFFC00001);
-    try testing.expectEqual(@as(u10, 1023), @intFromEnum(weird.type));
+    try testing.expectEqual(@as(u10, 1023), @backingInt(weird.type));
     try testing.expectEqual(@as(u22, 1), weird.instance);
     try testing.expectEqual(@as(u32, 0xFFC00001), weird.pack());
 }
@@ -1572,7 +1572,7 @@ test "writer: application primitives match the standard's encodings" {
         }.f },
         .{ .hex = "c4023fffff", .fill = struct {
             fn f(w: *Writer) Error!void {
-                try w.appObjectId(.{ .type = @enumFromInt(8), .instance = 4194303 });
+                try w.appObjectId(.{ .type = @fromBackingInt(@intCast(8)), .instance = 4194303 });
             }
         }.f },
         .{ .hex = "c40080000c", .fill = struct {
@@ -1690,7 +1690,7 @@ test "decoder: hostile primitive payloads" {
     {
         var r = Reader.init(&.{ 0x74, 0x63, 0x61, 0x62, 0x63 });
         const v = try r.appValue();
-        try testing.expectEqual(@as(u8, 0x63), @intFromEnum(v.character_string.encoding));
+        try testing.expectEqual(@as(u8, 0x63), @backingInt(v.character_string.encoding));
         try testing.expectEqual(@as(?[]const u8, null), v.character_string.asUtf8());
     }
     // Character string claiming UTF-8 but carrying invalid UTF-8.

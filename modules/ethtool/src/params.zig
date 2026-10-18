@@ -63,7 +63,7 @@ pub fn parseRings(attr_bytes: []const u8) codec.Error!Rings {
         uapi.RINGS.RX_JUMBO => out.rx_jumbo = try a.asU32(),
         uapi.RINGS.TX => out.tx = try a.asU32(),
         uapi.RINGS.RX_BUF_LEN => out.rx_buf_len = try a.asU32(),
-        uapi.RINGS.TCP_DATA_SPLIT => out.tcp_data_split = @enumFromInt(try a.asU8()),
+        uapi.RINGS.TCP_DATA_SPLIT => out.tcp_data_split = @fromBackingInt(@intCast(try a.asU8())),
         uapi.RINGS.CQE_SIZE => out.cqe_size = try a.asU32(),
         uapi.RINGS.TX_PUSH => out.tx_push = (try a.asU8()) != 0,
         uapi.RINGS.RX_PUSH => out.rx_push = (try a.asU8()) != 0,
@@ -106,7 +106,7 @@ pub fn appendRingsSet(
     if (set.tx) |v| try codec.appendAttrU32(gpa, list, uapi.RINGS.TX, v);
     if (set.rx_buf_len) |v| try codec.appendAttrU32(gpa, list, uapi.RINGS.RX_BUF_LEN, v);
     if (set.tcp_data_split) |v|
-        try codec.appendAttrU8(gpa, list, uapi.RINGS.TCP_DATA_SPLIT, @intFromEnum(v));
+        try codec.appendAttrU8(gpa, list, uapi.RINGS.TCP_DATA_SPLIT, @backingInt(v));
     if (set.cqe_size) |v| try codec.appendAttrU32(gpa, list, uapi.RINGS.CQE_SIZE, v);
     if (set.tx_push) |v| try codec.appendAttrU8(gpa, list, uapi.RINGS.TX_PUSH, @intFromBool(v));
     if (set.rx_push) |v| try codec.appendAttrU8(gpa, list, uapi.RINGS.RX_PUSH, @intFromBool(v));
@@ -436,7 +436,7 @@ pub fn parsePause(attr_bytes: []const u8) codec.Error!Pause {
         uapi.PAUSE.AUTONEG => out.autoneg = (try a.asU8()) != 0,
         uapi.PAUSE.RX => out.rx = (try a.asU8()) != 0,
         uapi.PAUSE.TX => out.tx = (try a.asU8()) != 0,
-        uapi.PAUSE.STATS_SRC => out.stats_src = @enumFromInt(try a.asU32()),
+        uapi.PAUSE.STATS_SRC => out.stats_src = @fromBackingInt(@intCast(try a.asU32())),
         uapi.PAUSE.STATS => {
             var s: PauseStats = .{};
             var inner: codec.AttrIterator = .{ .buf = a.data };
@@ -601,7 +601,7 @@ test "PAUSE decodes the optional statistics nest" {
     var list: std.ArrayList(u8) = .empty;
     defer list.deinit(gpa);
     try appendPauseSet(gpa, &list, .{ .autoneg = true, .rx = true, .tx = false });
-    try codec.appendAttrU32(gpa, &list, uapi.PAUSE.STATS_SRC, @intFromEnum(uapi.StatsSrc.pmac));
+    try codec.appendAttrU32(gpa, &list, uapi.PAUSE.STATS_SRC, @backingInt(uapi.StatsSrc.pmac));
     const nest = try codec.nestBegin(gpa, &list, uapi.PAUSE.STATS);
     var raw: [8]u8 = undefined;
     std.mem.writeInt(u64, &raw, 42, native_endian);
@@ -692,7 +692,7 @@ const Corpus = struct {
         // PAUSE with the optional statistics nest, and without it.
         var pause_stats: std.ArrayList(u8) = .empty;
         try appendPauseSet(gpa, &pause_stats, .{ .autoneg = true, .rx = true, .tx = false });
-        try codec.appendAttrU32(gpa, &pause_stats, uapi.PAUSE.STATS_SRC, @intFromEnum(uapi.StatsSrc.pmac));
+        try codec.appendAttrU32(gpa, &pause_stats, uapi.PAUSE.STATS_SRC, @backingInt(uapi.StatsSrc.pmac));
         {
             const nest = try codec.nestBegin(gpa, &pause_stats, uapi.PAUSE.STATS);
             var v: [8]u8 = undefined;

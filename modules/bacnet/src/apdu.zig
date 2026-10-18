@@ -248,7 +248,7 @@ pub const Apdu = union(PduType) {
 pub fn decode(buf: []const u8) Error!Apdu {
     if (buf.len < 1) return error.Truncated;
     const b0 = buf[0];
-    const kind: PduType = @enumFromInt(@as(u4, @truncate(b0 >> 4)));
+    const kind: PduType = @fromBackingInt(@intCast(@as(u4, @truncate(b0 >> 4))));
 
     switch (kind) {
         .confirmed_request => {
@@ -276,11 +276,11 @@ pub fn decode(buf: []const u8) Error!Apdu {
                 return error.InvalidPduType;
             }
             if (buf.len < pos + 1) return error.Truncated;
-            const svc: types.ConfirmedService = @enumFromInt(buf[pos]);
+            const svc: types.ConfirmedService = @fromBackingInt(@intCast(buf[pos]));
             return .{ .confirmed_request = .{
                 .segmented_response_accepted = sa,
-                .max_segments = @enumFromInt(@as(u3, @truncate((b1 >> 4) & 0x07))),
-                .max_apdu = @enumFromInt(@as(u4, @truncate(b1 & 0x0F))),
+                .max_segments = @fromBackingInt(@intCast(@as(u3, @truncate((b1 >> 4) & 0x07)))),
+                .max_apdu = @fromBackingInt(@intCast(@as(u4, @truncate(b1 & 0x0F)))),
                 .invoke_id = buf[2],
                 .service = svc,
                 .segment = segment,
@@ -291,7 +291,7 @@ pub fn decode(buf: []const u8) Error!Apdu {
             if (b0 & 0x0F != 0) return error.InvalidPduType;
             if (buf.len < 2) return error.Truncated;
             return .{ .unconfirmed_request = .{
-                .service = @enumFromInt(buf[1]),
+                .service = @fromBackingInt(@intCast(buf[1])),
                 .data = buf[2..],
             } };
         },
@@ -303,7 +303,7 @@ pub fn decode(buf: []const u8) Error!Apdu {
             if (buf.len != 3) return error.InvalidValue;
             return .{ .simple_ack = .{
                 .invoke_id = buf[1],
-                .service = @enumFromInt(buf[2]),
+                .service = @fromBackingInt(@intCast(buf[2])),
             } };
         },
         .complex_ack => {
@@ -328,7 +328,7 @@ pub fn decode(buf: []const u8) Error!Apdu {
             if (buf.len < pos + 1) return error.Truncated;
             return .{ .complex_ack = .{
                 .invoke_id = buf[1],
-                .service = @enumFromInt(buf[pos]),
+                .service = @fromBackingInt(@intCast(buf[pos])),
                 .segment = segment,
                 .data = buf[pos + 1 ..],
             } };
@@ -354,9 +354,9 @@ pub fn decode(buf: []const u8) Error!Apdu {
             if (code_v.enumerated > std.math.maxInt(u16)) return error.InvalidValue;
             return .{ .err = .{
                 .invoke_id = buf[1],
-                .service = @enumFromInt(buf[2]),
-                .class = @enumFromInt(@as(u16, @intCast(class_v.enumerated))),
-                .code = @enumFromInt(@as(u16, @intCast(code_v.enumerated))),
+                .service = @fromBackingInt(@intCast(buf[2])),
+                .class = @fromBackingInt(@intCast(@as(u16, @intCast(class_v.enumerated)))),
+                .code = @fromBackingInt(@intCast(@as(u16, @intCast(code_v.enumerated)))),
                 .extra = r.rest(),
             } };
         },
@@ -365,7 +365,7 @@ pub fn decode(buf: []const u8) Error!Apdu {
             if (buf.len != 3) return error.Truncated;
             return .{ .reject = .{
                 .invoke_id = buf[1],
-                .reason = @enumFromInt(buf[2]),
+                .reason = @fromBackingInt(@intCast(buf[2])),
             } };
         },
         .abort => {
@@ -374,7 +374,7 @@ pub fn decode(buf: []const u8) Error!Apdu {
             return .{ .abort = .{
                 .server = b0 & 0x01 != 0,
                 .invoke_id = buf[1],
-                .reason = @enumFromInt(buf[2]),
+                .reason = @fromBackingInt(@intCast(buf[2])),
             } };
         },
         _ => return error.InvalidPduType,
@@ -388,35 +388,35 @@ pub fn encode(a: Apdu, out: []u8) Error![]u8 {
     var w = Buf{ .out = out };
     switch (a) {
         .confirmed_request => |r| {
-            var b0: u8 = @as(u8, @intFromEnum(PduType.confirmed_request)) << 4;
+            var b0: u8 = @as(u8, @backingInt(PduType.confirmed_request)) << 4;
             if (r.segment) |s| {
                 b0 |= 0x08;
                 if (s.more_follows) b0 |= 0x04;
             }
             if (r.segmented_response_accepted) b0 |= 0x02;
             try w.byte(b0);
-            try w.byte((@as(u8, @intFromEnum(r.max_segments)) << 4) |
-                @as(u8, @intFromEnum(r.max_apdu)));
+            try w.byte((@as(u8, @backingInt(r.max_segments)) << 4) |
+                @as(u8, @backingInt(r.max_apdu)));
             try w.byte(r.invoke_id);
             if (r.segment) |s| {
                 try w.byte(s.sequence_number);
                 try w.byte(s.window_size);
             }
-            try w.byte(@intFromEnum(r.service));
+            try w.byte(@backingInt(r.service));
             try w.raw(r.data);
         },
         .unconfirmed_request => |r| {
-            try w.byte(@as(u8, @intFromEnum(PduType.unconfirmed_request)) << 4);
-            try w.byte(@intFromEnum(r.service));
+            try w.byte(@as(u8, @backingInt(PduType.unconfirmed_request)) << 4);
+            try w.byte(@backingInt(r.service));
             try w.raw(r.data);
         },
         .simple_ack => |s| {
-            try w.byte(@as(u8, @intFromEnum(PduType.simple_ack)) << 4);
+            try w.byte(@as(u8, @backingInt(PduType.simple_ack)) << 4);
             try w.byte(s.invoke_id);
-            try w.byte(@intFromEnum(s.service));
+            try w.byte(@backingInt(s.service));
         },
         .complex_ack => |c| {
-            var b0: u8 = @as(u8, @intFromEnum(PduType.complex_ack)) << 4;
+            var b0: u8 = @as(u8, @backingInt(PduType.complex_ack)) << 4;
             if (c.segment) |s| {
                 b0 |= 0x08;
                 if (s.more_follows) b0 |= 0x04;
@@ -427,11 +427,11 @@ pub fn encode(a: Apdu, out: []u8) Error![]u8 {
                 try w.byte(s.sequence_number);
                 try w.byte(s.window_size);
             }
-            try w.byte(@intFromEnum(c.service));
+            try w.byte(@backingInt(c.service));
             try w.raw(c.data);
         },
         .segment_ack => |s| {
-            var b0: u8 = @as(u8, @intFromEnum(PduType.segment_ack)) << 4;
+            var b0: u8 = @as(u8, @backingInt(PduType.segment_ack)) << 4;
             if (s.negative) b0 |= 0x02;
             if (s.server) b0 |= 0x01;
             try w.byte(b0);
@@ -440,26 +440,26 @@ pub fn encode(a: Apdu, out: []u8) Error![]u8 {
             try w.byte(s.actual_window_size);
         },
         .err => |e| {
-            try w.byte(@as(u8, @intFromEnum(PduType.err)) << 4);
+            try w.byte(@as(u8, @backingInt(PduType.err)) << 4);
             try w.byte(e.invoke_id);
-            try w.byte(@intFromEnum(e.service));
+            try w.byte(@backingInt(e.service));
             var tw = tag.Writer.init(out[w.pos..]);
-            tw.appEnumerated(@intFromEnum(e.class)) catch return error.NoSpace;
-            tw.appEnumerated(@intFromEnum(e.code)) catch return error.NoSpace;
+            tw.appEnumerated(@backingInt(e.class)) catch return error.NoSpace;
+            tw.appEnumerated(@backingInt(e.code)) catch return error.NoSpace;
             w.pos += tw.pos;
             try w.raw(e.extra);
         },
         .reject => |r| {
-            try w.byte(@as(u8, @intFromEnum(PduType.reject)) << 4);
+            try w.byte(@as(u8, @backingInt(PduType.reject)) << 4);
             try w.byte(r.invoke_id);
-            try w.byte(@intFromEnum(r.reason));
+            try w.byte(@backingInt(r.reason));
         },
         .abort => |ab| {
-            var b0: u8 = @as(u8, @intFromEnum(PduType.abort)) << 4;
+            var b0: u8 = @as(u8, @backingInt(PduType.abort)) << 4;
             if (ab.server) b0 |= 0x01;
             try w.byte(b0);
             try w.byte(ab.invoke_id);
-            try w.byte(@intFromEnum(ab.reason));
+            try w.byte(@backingInt(ab.reason));
         },
     }
     return out[0..w.pos];
@@ -675,7 +675,7 @@ test "max-APDU codes: reserved values are refused, not guessed" {
     try testing.expectEqual(@as(u16, 50), try MaxApdu.up_to_50.octets());
     try testing.expectEqual(@as(u16, 1476), try MaxApdu.up_to_1476.octets());
     for (6..16) |c| {
-        const m: MaxApdu = @enumFromInt(@as(u4, @intCast(c)));
+        const m: MaxApdu = @fromBackingInt(@intCast(@as(u4, @intCast(c))));
         try testing.expectError(error.InvalidValue, m.octets());
     }
     try testing.expectEqual(MaxApdu.up_to_1476, MaxApdu.forOctets(1500));

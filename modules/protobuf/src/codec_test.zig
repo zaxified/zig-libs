@@ -180,8 +180,8 @@ test "round trip: every scalar kind at its extremes" {
         .{ .s32 = std.math.minInt(i32), .s64 = std.math.minInt(i64) },
         .{ .s32 = std.math.maxInt(i32), .s64 = std.math.maxInt(i64) },
         .{ .b = true, .color = .green },
-        .{ .color = @enumFromInt(9999) }, // open enum: a value we never declared
-        .{ .color = @enumFromInt(-3) },
+        .{ .color = @fromBackingInt(@intCast(9999)) }, // open enum: a value we never declared
+        .{ .color = @fromBackingInt(@intCast(-3)) },
         .{ .f64_ = std.math.maxInt(u64), .sf64 = std.math.minInt(i64) },
         .{ .f32_ = std.math.maxInt(u32), .sf32 = std.math.minInt(i32) },
         .{ .d = -1.5e300, .f = 3.5 },
@@ -272,7 +272,7 @@ test "round trip: repeated fields of every shape" {
         .zz = &.{ -1, 1, std.math.minInt(i64) },
         .fixed = &.{ 0, 0xdeadbeef },
         .flags = &.{ true, false, true },
-        .colors = &.{ .red, .green, @enumFromInt(77) },
+        .colors = &.{ .red, .green, @fromBackingInt(@intCast(77)) },
         .names = &.{ "", "a", "long-ish string" },
         .inners = &.{ .{ .v = 1 }, .{ .v = 2, .note = "x" } },
     };
@@ -674,7 +674,7 @@ fn fuzzEncodeIntoAgreesWithEncodeAlloc(_: void, smith: *std.testing.Smith) !void
         .zz = &.{smith.value(i64)},
         .fixed = &.{smith.value(u32)},
         .flags = &.{ smith.value(bool), smith.value(bool) },
-        .colors = &.{@enumFromInt(smith.valueRangeAtMost(u2, 0, 2))},
+        .colors = &.{@fromBackingInt(@intCast(smith.valueRangeAtMost(u2, 0, 2)))},
         .names = &.{if (smith.value(bool)) "abc" else ""},
         .inners = inners_buf[0..n_inners],
     };

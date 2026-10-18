@@ -268,7 +268,7 @@ pub const Connection = struct {
     /// SequenceHeader bytes the message type requires.
     pub fn sendChunk(c: *Connection, header: MessageHeader, body: []const u8) TransportError!void {
         try c.writer.writeAll(header.message_type.code());
-        try c.writer.writeByte(@intFromEnum(header.chunk_type));
+        try c.writer.writeByte(@backingInt(header.chunk_type));
         try c.writer.writeInt(u32, header.message_size, .little);
         try c.writer.writeAll(body);
     }

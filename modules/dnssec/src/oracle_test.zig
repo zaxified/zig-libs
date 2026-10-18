@@ -35,7 +35,7 @@ fn recordsFrom(a: std.mem.Allocator, v: vectors.Vec) ![]dns.Record {
     const recs = try a.alloc(dns.Record, v.records.len);
     for (v.records, 0..) |raw, i| recs[i] = .{
         .name = v.name,
-        .ty = @enumFromInt(v.ty),
+        .ty = @fromBackingInt(@intCast(v.ty)),
         .class = .in,
         .ttl = 999, // deliberately NOT the signed original_ttl — must be ignored
         .data = .{ .unknown = raw },
@@ -134,7 +134,7 @@ test "oracle: typed SOA/MX/NS/A records canonicalize byte-exact (alg 13)" {
     // SOA: two embedded names + five u32s (from the zone's SOA).
     const soa = [_]dns.Record{.{
         .name = "example",
-        .ty = @enumFromInt(ty_soa),
+        .ty = @fromBackingInt(@intCast(ty_soa)),
         .class = .in,
         .ttl = 1,
         .data = .{ .soa = .{
@@ -152,7 +152,7 @@ test "oracle: typed SOA/MX/NS/A records canonicalize byte-exact (alg 13)" {
     // MX: preference + embedded exchange name.
     const mx = [_]dns.Record{.{
         .name = "example",
-        .ty = @enumFromInt(ty_mx),
+        .ty = @fromBackingInt(@intCast(ty_mx)),
         .class = .in,
         .ttl = 1,
         .data = .{ .mx = .{ .preference = 10, .exchange = "mail.example" } },
@@ -161,15 +161,15 @@ test "oracle: typed SOA/MX/NS/A records canonicalize byte-exact (alg 13)" {
 
     // NS: two records — exercises canonical RR ordering of embedded names.
     const ns = [_]dns.Record{
-        .{ .name = "example", .ty = @enumFromInt(ty_ns), .class = .in, .ttl = 1, .data = .{ .ns = "ns2.example" } },
-        .{ .name = "example", .ty = @enumFromInt(ty_ns), .class = .in, .ttl = 1, .data = .{ .ns = "ns1.example" } },
+        .{ .name = "example", .ty = @fromBackingInt(@intCast(ty_ns)), .class = .in, .ttl = 1, .data = .{ .ns = "ns2.example" } },
+        .{ .name = "example", .ty = @fromBackingInt(@intCast(ty_ns)), .class = .in, .ttl = 1, .data = .{ .ns = "ns1.example" } },
     };
     try expectTypedSecure(&ns, ty_ns, 13);
 
     // A: www 192.0.2.80.
     const a4 = [_]dns.Record{.{
         .name = "www.example",
-        .ty = @enumFromInt(ty_a),
+        .ty = @fromBackingInt(@intCast(ty_a)),
         .class = .in,
         .ttl = 1,
         .data = .{ .a = .{ 192, 0, 2, 80 } },

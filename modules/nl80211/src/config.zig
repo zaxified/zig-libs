@@ -143,7 +143,7 @@ pub fn buildSetChannel(gpa: std.mem.Allocator, family_id: u16, seq: u32, target:
     try appendTarget(gpa, &list, target);
     try codec.appendAttrU32(gpa, &list, uapi.ATTR.WIPHY_FREQ, ch.freq_mhz);
     try codec.appendAttrU32(gpa, &list, uapi.ATTR.WIPHY_FREQ_OFFSET, 0);
-    try codec.appendAttrU32(gpa, &list, uapi.ATTR.CHANNEL_WIDTH, @intFromEnum(ch.width));
+    try codec.appendAttrU32(gpa, &list, uapi.ATTR.CHANNEL_WIDTH, @backingInt(ch.width));
     if (ch.channelType(cf1)) |t| try codec.appendAttrU32(gpa, &list, uapi.ATTR.WIPHY_CHANNEL_TYPE, t);
     try codec.appendAttrU32(gpa, &list, uapi.ATTR.CENTER_FREQ1, cf1);
     if (ch.center2_mhz) |c2| try codec.appendAttrU32(gpa, &list, uapi.ATTR.CENTER_FREQ2, c2);
@@ -164,7 +164,7 @@ pub fn buildNewInterface(gpa: std.mem.Allocator, family_id: u16, seq: u32, wiphy
         error.OutOfMemory => error.OutOfMemory,
         error.AttrTooLong => error.InvalidRequest,
     };
-    try codec.appendAttrU32(gpa, &list, uapi.ATTR.IFTYPE, @intFromEnum(iftype));
+    try codec.appendAttrU32(gpa, &list, uapi.ATTR.IFTYPE, @backingInt(iftype));
     codec.finishHeader(&list, hdr);
     return list.toOwnedSlice(gpa);
 }
@@ -180,7 +180,7 @@ pub fn buildSetInterfaceType(gpa: std.mem.Allocator, family_id: u16, seq: u32, i
     errdefer list.deinit(gpa);
     const hdr = try begin(gpa, &list, family_id, seq, uapi.CMD.SET_INTERFACE, false);
     try codec.appendAttrU32(gpa, &list, uapi.ATTR.IFINDEX, ifindex);
-    try codec.appendAttrU32(gpa, &list, uapi.ATTR.IFTYPE, @intFromEnum(iftype));
+    try codec.appendAttrU32(gpa, &list, uapi.ATTR.IFTYPE, @backingInt(iftype));
     codec.finishHeader(&list, hdr);
     return list.toOwnedSlice(gpa);
 }

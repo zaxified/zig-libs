@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** `zig fmt` (0.17) rewrote `@intFromEnum`/`@enumFromInt` to `@backingInt`/`@fromBackingInt` in sources and tests; same values, same behaviour.
 - **2026-10-18** — Ported to Zig 0.17.0 (`EnumSet.initEmpty()` -> `.empty` in `goldens.zig`).
 - **2026-10-11** — build fix for websocket's grown `frame.WriteError` (`CompressedNonDataFrame`, permessage-deflate): `sc_ws.writeMessage`'s exhaustive switch names it as unreachable (always one uncompressed binary frame). No behaviour change.
 - **2026-10-10** — tests: deterministic fuzz driver `BACNET_FUZZ` over the existing harnesses (now generic over their choice source; the driver draws a corpus entry with 0-3 octets damaged, maybe truncated) with an in-suite reach test per harness. Fourteen harnesses (apdu, bvll, device, npdu, sc decode/options, sc hub, sc node, service, service integers, tag skip/appValue/openedBlock/headerRoundTrip). Verdict: 200,000 runs each, ReleaseSafe, clean.

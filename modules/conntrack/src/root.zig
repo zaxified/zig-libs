@@ -469,7 +469,7 @@ pub const Socket = struct {
 /// `code` is checked here — before that fold — for the exact errno that means
 /// "subsystem not registered".
 fn dumpFailure(code: i32) DumpError {
-    if (code == -@as(i32, @intFromEnum(linux.E.INVAL))) return error.SubsystemUnavailable;
+    if (code == -@as(i32, @backingInt(linux.E.INVAL))) return error.SubsystemUnavailable;
     return netlink.errorFromCode(code);
 }
 
@@ -682,8 +682,8 @@ test "re-exports keep the wire layer reachable from the module root" {
     try testing.expectEqual(@as(u16, 0x0100), msg_ct_new);
     try testing.expectEqual(@as(u16, 0x0101), msg_ct_get);
     try testing.expectEqual(@as(u16, 0x0102), msg_ct_delete);
-    try testing.expectEqual(@as(u8, 2), @intFromEnum(Family.ipv4));
-    try testing.expectEqual(@as(u8, 10), @intFromEnum(Family.ipv6));
+    try testing.expectEqual(@as(u8, 2), @backingInt(Family.ipv4));
+    try testing.expectEqual(@as(u8, 10), @backingInt(Family.ipv6));
 }
 
 test "event classification follows ctnetlink_conntrack_event" {
@@ -1098,7 +1098,7 @@ fn einvalErrorDatagram(pid: u32, seq: u32) [codec.header_len + 4]u8 {
     std.mem.writeInt(u16, d[4..6], codec.NLMSG_ERROR, native_endian);
     std.mem.writeInt(u32, d[8..12], seq, native_endian);
     std.mem.writeInt(u32, d[12..16], pid, native_endian);
-    std.mem.writeInt(i32, d[16..20], -@as(i32, @intFromEnum(linux.E.INVAL)), native_endian);
+    std.mem.writeInt(i32, d[16..20], -@as(i32, @backingInt(linux.E.INVAL)), native_endian);
     return d;
 }
 

@@ -284,7 +284,7 @@ const Fixture = struct {
             .event_variation = 2,
         };
         for (&self.dbits, 0..) |*p, i| p.* = .{
-            .value = @enumFromInt(@as(u2, @intCast(i % 4))),
+            .value = @fromBackingInt(@intCast(@as(u2, @intCast(i % 4)))),
             .class = .class1,
             .static_variation = 2,
             .event_variation = 2,
@@ -556,7 +556,7 @@ test "SELF-DERIVED: our own master-side codecs drive our own outstation" {
     );
     var wire: [512]u8 = undefined;
     const frames = try dnp3.sendFragment(
-        .{ .dir = true, .prm = true, .function = @intFromEnum(dnp3.link.PrimaryFunction.unconfirmed_user_data) },
+        .{ .dir = true, .prm = true, .function = @backingInt(dnp3.link.PrimaryFunction.unconfirmed_user_data) },
         10,
         1,
         fragment,

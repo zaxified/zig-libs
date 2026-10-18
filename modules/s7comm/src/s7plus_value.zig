@@ -366,7 +366,7 @@ fn skipOneBody(cur: *Cursor, dt: Datatype, depth: u8, budget: *u32) Error!void {
 pub fn skipValue(cur: *Cursor, depth: u8, budget: *u32) Error!void {
     if (depth == 0) return error.DepthExceeded;
     const flags = try Flags.decode(try cur.byte());
-    const dt: Datatype = @enumFromInt(try cur.byte());
+    const dt: Datatype = @fromBackingInt(@intCast(try cur.byte()));
     try skipBody(cur, flags, dt, depth, budget);
 }
 
@@ -394,7 +394,7 @@ pub fn valueLen(bytes: []const u8) Error!usize {
 pub fn encodeScalar(dt: Datatype, comptime T: type, v: T, out: []u8) Error![]u8 {
     if (out.len < 2) return error.BufferTooSmall;
     out[0] = 0; // scalar flags
-    out[1] = @intFromEnum(dt);
+    out[1] = @backingInt(dt);
     const body = try encodeScalarBody(dt, T, v, out[2..]);
     return out[0 .. 2 + body.len];
 }
@@ -435,7 +435,7 @@ fn encodeScalarBody(dt: Datatype, comptime T: type, v: T, out: []u8) Error![]u8 
 pub fn encodeReal(v: f32, out: []u8) Error![]u8 {
     if (out.len < 6) return error.BufferTooSmall;
     out[0] = 0;
-    out[1] = @intFromEnum(Datatype.real);
+    out[1] = @backingInt(Datatype.real);
     std.mem.writeInt(u32, out[2..6], @bitCast(v), .big);
     return out[0..6];
 }
@@ -444,7 +444,7 @@ pub fn encodeReal(v: f32, out: []u8) Error![]u8 {
 pub fn encodeLReal(v: f64, out: []u8) Error![]u8 {
     if (out.len < 10) return error.BufferTooSmall;
     out[0] = 0;
-    out[1] = @intFromEnum(Datatype.lreal);
+    out[1] = @backingInt(Datatype.lreal);
     std.mem.writeInt(u64, out[2..10], @bitCast(v), .big);
     return out[0..10];
 }
@@ -453,7 +453,7 @@ pub fn encodeLReal(v: f64, out: []u8) Error![]u8 {
 pub fn encodeBytes(dt: Datatype, data: []const u8, out: []u8) Error![]u8 {
     if (out.len < 2) return error.BufferTooSmall;
     out[0] = 0;
-    out[1] = @intFromEnum(dt);
+    out[1] = @backingInt(dt);
     const lenbytes = try putVarUint(data.len, out[2..]);
     const start = 2 + lenbytes.len;
     if (out.len < start + data.len) return error.BufferTooSmall;
@@ -478,7 +478,7 @@ pub fn decodeScalar(bytes: []const u8) Error!struct { value: Scalar, dt: Datatyp
     var cur = Cursor{ .bytes = bytes };
     const flags = try Flags.decode(try cur.byte());
     if (flags.raw != 0) return error.UnsupportedDatatype;
-    const dt: Datatype = @enumFromInt(try cur.byte());
+    const dt: Datatype = @fromBackingInt(@intCast(try cur.byte()));
     const val: Scalar = switch (dt) {
         .bool => .{ .boolean = (try cur.byte()) != 0 },
         .usint, .byte => .{ .unsigned = try cur.byte() },
@@ -640,7 +640,7 @@ test "valueLen walks a nested struct exactly" {
     var w: usize = 0;
     buf[w] = 0;
     w += 1; // outer flags
-    buf[w] = @intFromEnum(Datatype.s7struct);
+    buf[w] = @backingInt(Datatype.s7struct);
     w += 1;
     // element 1
     w += (try putVarUint(1, buf[w..])).len;
@@ -649,7 +649,7 @@ test "valueLen walks a nested struct exactly" {
     w += (try putVarUint(2, buf[w..])).len;
     buf[w] = 0;
     w += 1;
-    buf[w] = @intFromEnum(Datatype.s7struct);
+    buf[w] = @backingInt(Datatype.s7struct);
     w += 1;
     w += (try putVarUint(1, buf[w..])).len;
     w += (try encodeScalar(.uint, i64, 0x0102, buf[w..])).len;
@@ -669,7 +669,7 @@ test "a deeply nested struct is DepthExceeded, never a stack overflow" {
     while (i < max_depth + 5) : (i += 1) {
         buf[w] = 0;
         w += 1;
-        buf[w] = @intFromEnum(Datatype.s7struct);
+        buf[w] = @backingInt(Datatype.s7struct);
         w += 1;
         w += (try putVarUint(1, buf[w..])).len; // element id 1 opens the next
     }
@@ -680,7 +680,7 @@ test "an array count that overruns the buffer is Truncated" {
     // flags=array, datatype=uint(2 bytes), count=100, but only 4 bytes follow.
     var buf: [8]u8 = undefined;
     buf[0] = flag_array;
-    buf[1] = @intFromEnum(Datatype.uint);
+    buf[1] = @backingInt(Datatype.uint);
     const c = try putVarUint(100, buf[2..]);
     // Provide only two elements' worth.
     try testing.expectError(error.Truncated, valueLen(buf[0 .. 2 + c.len + 4]));
@@ -689,7 +689,7 @@ test "an array count that overruns the buffer is Truncated" {
 test "an absurd array count is TooLong, not a long loop" {
     var buf: [16]u8 = undefined;
     buf[0] = flag_array;
-    buf[1] = @intFromEnum(Datatype.byte);
+    buf[1] = @backingInt(Datatype.byte);
     const c = try putVarUint(max_elements + 1, buf[2..]);
     try testing.expectError(error.TooLong, valueLen(buf[0 .. 2 + c.len]));
 }
@@ -697,7 +697,7 @@ test "an absurd array count is TooLong, not a long loop" {
 test "a valid small array round trips through skipValue" {
     var buf: [16]u8 = undefined;
     buf[0] = flag_array;
-    buf[1] = @intFromEnum(Datatype.byte);
+    buf[1] = @backingInt(Datatype.byte);
     var w: usize = 2;
     w += (try putVarUint(3, buf[w..])).len;
     buf[w] = 0xAA;
@@ -732,7 +732,7 @@ const ValueCorpus = struct {
         w = 0;
         self.raw[2][w] = 0;
         w += 1;
-        self.raw[2][w] = @intFromEnum(Datatype.s7struct);
+        self.raw[2][w] = @backingInt(Datatype.s7struct);
         w += 1;
         w += (try putVarUint(1, self.raw[2][w..])).len;
         w += (try encodeScalar(.uint, i64, 0x0102, self.raw[2][w..])).len;
@@ -741,7 +741,7 @@ const ValueCorpus = struct {
 
         // A small array that is entirely present.
         self.raw[3][0] = flag_array;
-        self.raw[3][1] = @intFromEnum(Datatype.byte);
+        self.raw[3][1] = @backingInt(Datatype.byte);
         w = 2;
         w += (try putVarUint(3, self.raw[3][w..])).len;
         self.raw[3][w] = 0xAA;
@@ -752,7 +752,7 @@ const ValueCorpus = struct {
 
         // An array count that overruns what follows.
         self.raw[4][0] = flag_array;
-        self.raw[4][1] = @intFromEnum(Datatype.uint);
+        self.raw[4][1] = @backingInt(Datatype.uint);
         w = 2 + (try putVarUint(100, self.raw[4][2..])).len + 4;
         self.seeds[4] = fuzzSeedInto(&self.pre[4], self.raw[4][0..w]);
 
@@ -762,7 +762,7 @@ const ValueCorpus = struct {
         while (i < max_depth + 5) : (i += 1) {
             self.raw[5][w] = 0;
             w += 1;
-            self.raw[5][w] = @intFromEnum(Datatype.s7struct);
+            self.raw[5][w] = @backingInt(Datatype.s7struct);
             w += 1;
             w += (try putVarUint(1, self.raw[5][w..])).len;
         }

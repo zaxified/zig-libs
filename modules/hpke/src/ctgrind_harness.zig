@@ -281,9 +281,9 @@ fn openTarget(taint: bool) !void {
     // construction is public plumbing (suite.zig), not part of this
     // target's claim, which is entirely about Context.open below.
     const suite_id = comptime suite.suiteId(
-        @intFromEnum(hpke.KemId.dhkem_x25519_hkdf_sha256),
-        @intFromEnum(hpke.KdfId.hkdf_sha256),
-        @intFromEnum(hpke.AeadId.chacha20poly1305),
+        @backingInt(hpke.KemId.dhkem_x25519_hkdf_sha256),
+        @backingInt(hpke.KdfId.hkdf_sha256),
+        @backingInt(hpke.AeadId.chacha20poly1305),
     );
     // PUBLIC placeholder: this target's claim is about `ctx.key`/
     // `ctx.base_nonce` (KeySchedule's OUTPUT), not this input -- the DHKEM

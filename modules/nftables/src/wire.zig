@@ -891,7 +891,7 @@ pub const Batch = struct {
         const h = try b.beginCommand(NFT_MSG.NEWOBJ, nl.NLM_F_CREATE, spec.family.nfproto());
         try nl.appendAttrString(b.gpa, &b.buf, NFTA_OBJ.TABLE, spec.table);
         try nl.appendAttrString(b.gpa, &b.buf, NFTA_OBJ.NAME, spec.name);
-        try nl.appendAttrBe32(b.gpa, &b.buf, NFTA_OBJ.TYPE, @intFromEnum(spec.obj.objType()));
+        try nl.appendAttrBe32(b.gpa, &b.buf, NFTA_OBJ.TYPE, @backingInt(spec.obj.objType()));
         const off = try nl.nestBegin(b.gpa, &b.buf, nl.NLA_F_NESTED | NFTA_OBJ.DATA);
         switch (spec.obj) {
             // Unlike the `counter` expression, the object always carries
@@ -928,7 +928,7 @@ pub const Batch = struct {
         const h = try b.beginCommand(NFT_MSG.DELOBJ, 0, family.nfproto());
         try nl.appendAttrString(b.gpa, &b.buf, NFTA_OBJ.TABLE, table);
         try nl.appendAttrString(b.gpa, &b.buf, NFTA_OBJ.NAME, name);
-        try nl.appendAttrBe32(b.gpa, &b.buf, NFTA_OBJ.TYPE, @intFromEnum(obj_type));
+        try nl.appendAttrBe32(b.gpa, &b.buf, NFTA_OBJ.TYPE, @backingInt(obj_type));
         const off = try nl.nestBegin(b.gpa, &b.buf, nl.NLA_F_NESTED | NFTA_OBJ.DATA);
         try nl.nestEnd(&b.buf, off);
         b.endCommand(h);
@@ -1262,7 +1262,7 @@ pub fn decodeObject(payload: []const u8) DecodeError!ObjectInfo {
     // TYPE may arrive after DATA, so the state is decoded once both are in.
     var d: nl.AttrIterator = .{ .buf = out.data };
     switch (out.obj_type) {
-        @intFromEnum(expr.ObjectType.counter) => {
+        @backingInt(expr.ObjectType.counter) => {
             out.counter = .{};
             while (try d.next()) |da| switch (da.type) {
                 expr.NFTA_COUNTER.PACKETS => out.counter.?.packets = try da.asBe64(),
@@ -1270,7 +1270,7 @@ pub fn decodeObject(payload: []const u8) DecodeError!ObjectInfo {
                 else => {},
             };
         },
-        @intFromEnum(expr.ObjectType.quota) => {
+        @backingInt(expr.ObjectType.quota) => {
             out.quota = .{};
             while (try d.next()) |da| switch (da.type) {
                 expr.NFTA_QUOTA.BYTES => out.quota.?.bytes = try da.asBe64(),

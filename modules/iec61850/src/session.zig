@@ -129,7 +129,7 @@ pub const Connect = struct {
 /// octets the whole SPDU occupies.
 pub fn decodeHeader(bytes: []const u8) Error!struct { spdu: Spdu, params: []const u8, total_len: usize } {
     if (bytes.len < 2) return error.ShortSpdu;
-    const si: Spdu = @enumFromInt(bytes[0]);
+    const si: Spdu = @fromBackingInt(@intCast(bytes[0]));
     var len: usize = bytes[1];
     var off: usize = 2;
     if (len == 255) {
@@ -239,7 +239,7 @@ fn assemble(spdu: Spdu, params: []const u8, user_data: []const u8, out: []u8) Er
     const head: usize = if (total_params > 254) 4 else 2;
     if (out.len < head + total_params) return error.BufferTooSmall;
     var w: usize = 0;
-    out[w] = @intFromEnum(spdu);
+    out[w] = @backingInt(spdu);
     w += 1;
     if (head == 2) {
         out[w] = @intCast(total_params);

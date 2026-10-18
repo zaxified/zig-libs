@@ -65,13 +65,13 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
             var mm = m;
             defer mm.deinit();
             try w.print("OK id={d} rc={d} qd={d} an={d} ns={d} ar={d}", .{
-                mm.header.id,   @intFromEnum(mm.rcode()), mm.questions.len,
-                mm.answers.len, mm.authorities.len,       mm.additionals.len,
+                mm.header.id,   @backingInt(mm.rcode()), mm.questions.len,
+                mm.answers.len, mm.authorities.len,      mm.additionals.len,
             });
-            for (mm.questions) |q| try w.print(" |Q<{x}>{d}/{d}", .{ q.name, @intFromEnum(q.ty), @intFromEnum(q.class) });
+            for (mm.questions) |q| try w.print(" |Q<{x}>{d}/{d}", .{ q.name, @backingInt(q.ty), @backingInt(q.class) });
             for ([_][]const msg.Record{ mm.answers, mm.authorities, mm.additionals }) |sec| {
                 for (sec) |r| {
-                    try w.print(" |R<{x}>{d}/{d}/{d}", .{ r.name, @intFromEnum(r.ty), @intFromEnum(r.class), r.ttl });
+                    try w.print(" |R<{x}>{d}/{d}/{d}", .{ r.name, @backingInt(r.ty), @backingInt(r.class), r.ttl });
                     switch (r.data) {
                         .a => |b| try w.print("=A{d}.{d}.{d}.{d}", .{ b[0], b[1], b[2], b[3] }),
                         .aaaa => |b| try w.print("=AAAA{x}", .{b}),

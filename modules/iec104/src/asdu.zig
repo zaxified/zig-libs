@@ -164,13 +164,13 @@ pub const TypeId = enum(u8) {
 
     /// True for the monitor-direction process-information types (1..40).
     pub fn isMonitoring(self: TypeId) bool {
-        const v = @intFromEnum(self);
+        const v = @backingInt(self);
         return v >= 1 and v <= 40;
     }
 
     /// True for the control-direction process-information types (45..69).
     pub fn isCommand(self: TypeId) bool {
-        const v = @intFromEnum(self);
+        const v = @backingInt(self);
         return v >= 45 and v <= 69;
     }
 };
@@ -213,7 +213,7 @@ pub const Cot = enum(u6) {
     /// non-exhaustive tag for every other out-of-range `n`.
     pub fn interrogatedByGroup(n: u8) ?Cot {
         if (n < 1 or n > 16) return null;
-        return @enumFromInt(20 + @as(u8, n));
+        return @fromBackingInt(@intCast(20 + @as(u8, n)));
     }
 };
 
@@ -230,14 +230,14 @@ pub const Cause = struct {
     originator: u8 = 0,
 
     pub fn causeByte(self: Cause) u8 {
-        return @as(u8, @intFromEnum(self.cot)) |
+        return @as(u8, @backingInt(self.cot)) |
             (if (self.negative) @as(u8, 0x40) else 0) |
             (if (self.is_test) @as(u8, 0x80) else 0);
     }
 
     pub fn fromByte(b: u8, originator: u8) Cause {
         return .{
-            .cot = @enumFromInt(@as(u6, @truncate(b))),
+            .cot = @fromBackingInt(@intCast(@as(u6, @truncate(b)))),
             .negative = b & 0x40 != 0,
             .is_test = b & 0x80 != 0,
             .originator = originator,
@@ -523,7 +523,7 @@ pub fn encodeHeader(header: Header, params: Params, out: []u8) Error![]u8 {
     if (header.common_address > params.maxCa()) return error.AddressOutOfRange;
     if (!params.hasOriginator() and header.cause.originator != 0) return error.OriginatorNotAllowed;
 
-    out[0] = @intFromEnum(header.type_id);
+    out[0] = @backingInt(header.type_id);
     out[1] = header.vsq.toByte();
     out[2] = header.cause.causeByte();
     var i: usize = 3;
@@ -559,7 +559,7 @@ pub fn decodeHeader(bytes: []const u8, params: Params) Error!Header {
         i += 1;
     }
     return .{
-        .type_id = @enumFromInt(bytes[0]),
+        .type_id = @fromBackingInt(@intCast(bytes[0])),
         .vsq = Vsq.fromByte(bytes[1]),
         .cause = Cause.fromByte(bytes[2], originator),
         .common_address = ca,
@@ -701,9 +701,9 @@ pub fn decodeElement(kind: ElementKind, bytes: []const u8) Error!Element {
         .setpoint_scaled => .{ .setpoint_scaled = .{ .value = info.readI16(bytes[0..2]), .qos = info.Qos.fromByte(bytes[2]) } },
         .setpoint_float => .{ .setpoint_float = .{ .value = info.readF32(bytes[0..4]), .qos = info.Qos.fromByte(bytes[4]) } },
         .bitstring_command => .{ .bitstring_command = info.readU32(bytes[0..4]) },
-        .qoi => .{ .qoi = @enumFromInt(bytes[0]) },
+        .qoi => .{ .qoi = @fromBackingInt(@intCast(bytes[0])) },
         .qcc => .{ .qcc = info.Qcc.fromByte(bytes[0]) },
-        .qrp => .{ .qrp = @enumFromInt(bytes[0]) },
+        .qrp => .{ .qrp = @fromBackingInt(@intCast(bytes[0])) },
         .coi => .{ .coi = info.Coi.fromByte(bytes[0]) },
         .fbp => .{ .fbp = info.readU16(bytes[0..2]) },
         .parameter => .{ .parameter = .{ .raw = .{ bytes[0], bytes[1] }, .qpm = bytes[2] } },
@@ -761,9 +761,9 @@ pub fn encodeElement(element: Element, out: []u8) Error!usize {
             out[4] = v.qos.toByte();
         },
         .bitstring_command => |v| info.writeU32(out[0..4], v),
-        .qoi => |v| out[0] = @intFromEnum(v),
+        .qoi => |v| out[0] = @backingInt(v),
         .qcc => |v| out[0] = v.toByte(),
-        .qrp => |v| out[0] = @intFromEnum(v),
+        .qrp => |v| out[0] = @backingInt(v),
         .coi => |v| out[0] = v.toByte(),
         .fbp => |v| info.writeU16(out[0..2], v),
         .parameter => |v| {
@@ -1084,8 +1084,8 @@ test "decode rejects a short ASDU and an unmodelled type id" {
     try testing.expectError(error.ShortAsdu, decode(&[_]u8{}, default_params));
     // Type 200 has no element layout here.
     try testing.expectError(error.UnsupportedTypeId, decode(&[_]u8{ 200, 0x01, 0x06, 0x00, 0x2F, 0x00, 0, 0, 0, 0 }, default_params));
-    try testing.expect(shapeOf(@enumFromInt(200)) == null);
-    try testing.expect(elementSize(@enumFromInt(126)) == null); // F_SC_NB_1, file transfer
+    try testing.expect(shapeOf(@fromBackingInt(@intCast(200))) == null);
+    try testing.expect(elementSize(@fromBackingInt(@intCast(126))) == null); // F_SC_NB_1, file transfer
 }
 
 test "element sizes match the standard for every modelled type" {
@@ -1291,7 +1291,7 @@ test "builder refuses an element or time tag that does not match the type" {
     // ... and one too small even for the header.
     var tinier: [4]u8 = undefined;
     try testing.expectError(error.BufferTooSmall, Builder.init(&tinier, default_params, .m_sp_na_1, .{}, 1, false));
-    try testing.expectError(error.UnsupportedTypeId, Builder.init(&buf, default_params, @enumFromInt(200), .{}, 1, false));
+    try testing.expectError(error.UnsupportedTypeId, Builder.init(&buf, default_params, @fromBackingInt(@intCast(200)), .{}, 1, false));
 }
 
 test "a CP56Time2a with impossible fields fails the ASDU decode, not just the tag" {

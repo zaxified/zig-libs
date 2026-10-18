@@ -703,7 +703,7 @@ pub const Call = struct {
     /// failures the client heard about depended only on whether the head had
     /// been committed yet. Derived from the enum rather than written as "13"
     /// so a renumbering cannot desync it.
-    const md_lost_code = std.fmt.comptimePrint("{d}", .{@intFromEnum(status_mod.Status.internal)});
+    const md_lost_code = std.fmt.comptimePrint("{d}", .{@backingInt(status_mod.Status.internal)});
     /// Pure ASCII in 0x20-0x7E with no `%`, so `encodeMessage` is the
     /// identity on it and it needs no arena allocation to emit.
     const md_lost_message = "response metadata could not be written";
@@ -712,7 +712,7 @@ pub const Call = struct {
     /// successful or not, leaves this module.
     fn finish(c: *Call) void {
         if (c.write_failed) return; // the stream is gone; nothing can be said
-        const code = std.fmt.allocPrint(c.arena, "{d}", .{@intFromEnum(c.status)}) catch return;
+        const code = std.fmt.allocPrint(c.arena, "{d}", .{@backingInt(c.status)}) catch return;
         const message: ?[]const u8 = if (c.status_message.len == 0) null else blk: {
             const buf = c.arena.alloc(u8, status_mod.encodedMessageLen(c.status_message)) catch
                 break :blk null;

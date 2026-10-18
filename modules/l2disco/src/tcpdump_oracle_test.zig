@@ -51,8 +51,8 @@ fn idText(a: std.mem.Allocator, id: anytype) ![]const u8 {
 fn lldpFacts(a: std.mem.Allocator, frame: []const u8) !Facts {
     var out: Facts = .empty;
     const du = try lldp.Lldpdu.parse(frame[14..], .{});
-    try add(a, &out, "chassis={d}:{s}", .{ @intFromEnum(du.chassis_id.subtype), try idText(a, du.chassis_id) });
-    try add(a, &out, "port={d}:{s}", .{ @intFromEnum(du.port_id.subtype), try idText(a, du.port_id) });
+    try add(a, &out, "chassis={d}:{s}", .{ @backingInt(du.chassis_id.subtype), try idText(a, du.chassis_id) });
+    try add(a, &out, "port={d}:{s}", .{ @backingInt(du.port_id.subtype), try idText(a, du.port_id) });
     try add(a, &out, "ttl={d}", .{du.ttl_s});
     if (du.port_description) |s| try add(a, &out, "port_desc={s}", .{s});
     if (du.system_name) |s| try add(a, &out, "sys_name={s}", .{s});
@@ -60,7 +60,7 @@ fn lldpFacts(a: std.mem.Allocator, frame: []const u8) !Facts {
     if (du.capabilities) |c| try add(a, &out, "caps=0x{x:0>4}/0x{x:0>4}", .{ c.capabilities.toWire(), c.enabled.toWire() });
     var mi = du.managementAddressIterator();
     while (try mi.next()) |m| {
-        try add(a, &out, "mgmt={s}/{d}/{d}", .{ try ipText(a, m.ip().?), @intFromEnum(m.interface_subtype), m.interface_number });
+        try add(a, &out, "mgmt={s}/{d}/{d}", .{ try ipText(a, m.ip().?), @backingInt(m.interface_subtype), m.interface_number });
     }
     var oi = du.orgIterator();
     while (try oi.next()) |o| switch (o.decode() orelse return error.TestUnexpectedResult) {
@@ -70,11 +70,11 @@ fn lldpFacts(a: std.mem.Allocator, frame: []const u8) !Facts {
         .mac_phy => |v| try add(a, &out, "mac_phy=0x{x:0>2}/0x{x:0>4}/{d}", .{ v.autoneg, v.pmd_advertised, v.operational_mau }),
         .max_frame_size => |v| try add(a, &out, "max_frame={d}", .{v}),
         .power_via_mdi => |v| try add(a, &out, "power=0x{x:0>2}/{d}/{d}", .{ v.mdi_support, v.pse_power_pair, v.power_class }),
-        .med_capabilities => |v| try add(a, &out, "med_caps=0x{x:0>4}/{d}", .{ v.capabilities, @intFromEnum(v.device_type) }),
+        .med_capabilities => |v| try add(a, &out, "med_caps=0x{x:0>4}/{d}", .{ v.capabilities, @backingInt(v.device_type) }),
         .med_network_policy => |v| try add(a, &out, "policy={d}/{d}/{d}/{d}/{d}/{d}", .{ v.application, @intFromBool(v.unknown_policy), @intFromBool(v.tagged), v.vlan_id, v.l2_priority, v.dscp }),
         .med_location => |v| try add(a, &out, "location={d}", .{v.format}),
         .med_ext_power => |v| try add(a, &out, "ext_power={d}/{d}/{d}/{d}", .{ v.power_type, v.power_source, v.priority, v.power_dw }),
-        .med_inventory => |v| try add(a, &out, "inventory={d}:{s}", .{ @intFromEnum(v.field), v.text }),
+        .med_inventory => |v| try add(a, &out, "inventory={d}:{s}", .{ @backingInt(v.field), v.text }),
     };
     return out;
 }
@@ -118,7 +118,7 @@ fn dhcpFacts(a: std.mem.Allocator, frame: []const u8) !Facts {
     var out: Facts = .empty;
     // Ethernet (14) + IPv4 (20) + UDP (8), then BOOTP.
     const m = try dhcp.Message.parse(frame[42..]);
-    try add(a, &out, "dhcp_op={d}", .{@intFromEnum(m.op)});
+    try add(a, &out, "dhcp_op={d}", .{@backingInt(m.op)});
     try add(a, &out, "xid=0x{x:0>8}", .{m.xid});
     if (m.secs != 0) try add(a, &out, "secs={d}", .{m.secs}); // tcpdump prints secs only when set
     try add(a, &out, "flags=0x{x:0>4}", .{m.flags});
@@ -129,7 +129,7 @@ fn dhcpFacts(a: std.mem.Allocator, frame: []const u8) !Facts {
     if (!std.mem.eql(u8, &m.siaddr, &zero)) try add(a, &out, "siaddr={s}", .{try dotted(a, m.siaddr)});
     if (!std.mem.eql(u8, &m.giaddr, &zero)) try add(a, &out, "giaddr={s}", .{try dotted(a, m.giaddr)});
     try add(a, &out, "chaddr={s}", .{try macText(a, m.clientMac().?.octets)});
-    if (m.message_type) |t| try add(a, &out, "msg_type={d}", .{@intFromEnum(t)});
+    if (m.message_type) |t| try add(a, &out, "msg_type={d}", .{@backingInt(t)});
     if (m.server_id) |q| try add(a, &out, "server_id={s}", .{try dotted(a, q)});
     if (m.requested_ip) |q| try add(a, &out, "requested_ip={s}", .{try dotted(a, q)});
     if (m.lease_time_s) |v| try add(a, &out, "lease={d}", .{v});
@@ -248,7 +248,7 @@ test "tcpdump oracle: the Builders emit the very frames tcpdump read" {
         try b.addChassisIdMac(mac);
         try b.addPortId(.mac_address, &mac.octets);
         try b.addTtl(180);
-        try b.addMedCapabilities(0x0033, @enumFromInt(3));
+        try b.addMedCapabilities(0x0033, @fromBackingInt(@intCast(3)));
         try b.addMedNetworkPolicy(.{ .application = 1, .unknown_policy = false, .tagged = true, .vlan_id = 100, .l2_priority = 5, .dscp = 46 });
         try b.addMedNetworkPolicy(.{ .application = 2, .unknown_policy = true, .tagged = false, .vlan_id = 0, .l2_priority = 0, .dscp = 0 });
         try b.addOrgSpecific(.{ 0x00, 0x12, 0xbb }, 4, &.{ 0x52, 0x00, 65 });

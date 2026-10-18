@@ -190,7 +190,7 @@ pub const RateSpec = struct {
     /// Packet sizes are looked up in the rate table in `1 << cell_log` byte
     /// cells; `calcRateTable` fills this in.
     cell_log: u8 = 0,
-    linklayer: u8 = @intFromEnum(LinkLayer.ethernet),
+    linklayer: u8 = @backingInt(LinkLayer.ethernet),
     /// Per-packet link overhead in bytes (`tc … overhead N`).
     overhead: u16 = 0,
     /// Always -1 after a table computation (iproute2 sets it unconditionally).
@@ -310,7 +310,7 @@ pub fn calcRateTable(
     }
     spec.cell_align = -1;
     spec.cell_log = cell_log;
-    spec.linklayer = @intFromEnum(linklayer) & LinkLayer.mask;
+    spec.linklayer = @backingInt(linklayer) & LinkLayer.mask;
 }
 
 /// Serialize a rate table into its 1024-byte wire form (host byte order).

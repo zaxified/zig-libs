@@ -212,15 +212,15 @@ pub fn decode(bytes: []const u8) DecodeError!Message {
 /// for an unrecognized context tag.
 pub fn decodePdu(pdu_tlv: ber.Tlv) DecodeError!Pdu {
     return switch (pdu_tlv.tag) {
-        @intFromEnum(PduType.get_request) => .{ .get_request = try parseBasic(pdu_tlv.content) },
-        @intFromEnum(PduType.get_next_request) => .{ .get_next_request = try parseBasic(pdu_tlv.content) },
-        @intFromEnum(PduType.response) => .{ .response = try parseBasic(pdu_tlv.content) },
-        @intFromEnum(PduType.set_request) => .{ .set_request = try parseBasic(pdu_tlv.content) },
-        @intFromEnum(PduType.trap_v1) => .{ .trap_v1 = try parseTrapV1(pdu_tlv.content) },
-        @intFromEnum(PduType.get_bulk_request) => .{ .get_bulk_request = try parseBulk(pdu_tlv.content) },
-        @intFromEnum(PduType.inform_request) => .{ .inform_request = try parseBasic(pdu_tlv.content) },
-        @intFromEnum(PduType.trap_v2) => .{ .trap_v2 = try parseBasic(pdu_tlv.content) },
-        @intFromEnum(PduType.report) => .{ .report = try parseBasic(pdu_tlv.content) },
+        @backingInt(PduType.get_request) => .{ .get_request = try parseBasic(pdu_tlv.content) },
+        @backingInt(PduType.get_next_request) => .{ .get_next_request = try parseBasic(pdu_tlv.content) },
+        @backingInt(PduType.response) => .{ .response = try parseBasic(pdu_tlv.content) },
+        @backingInt(PduType.set_request) => .{ .set_request = try parseBasic(pdu_tlv.content) },
+        @backingInt(PduType.trap_v1) => .{ .trap_v1 = try parseTrapV1(pdu_tlv.content) },
+        @backingInt(PduType.get_bulk_request) => .{ .get_bulk_request = try parseBulk(pdu_tlv.content) },
+        @backingInt(PduType.inform_request) => .{ .inform_request = try parseBasic(pdu_tlv.content) },
+        @backingInt(PduType.trap_v2) => .{ .trap_v2 = try parseBasic(pdu_tlv.content) },
+        @backingInt(PduType.report) => .{ .report = try parseBasic(pdu_tlv.content) },
         else => return error.UnknownPduType,
     };
 }
@@ -252,7 +252,7 @@ fn parseBasic(content: []const u8) DecodeError!BasicPdu {
     if (f.f1 < 0 or f.f1 > 255) return error.InvalidValue;
     return .{
         .request_id = f.request_id,
-        .error_status = @enumFromInt(@as(u8, @intCast(f.f1))),
+        .error_status = @fromBackingInt(@intCast(@as(u8, @intCast(f.f1)))),
         .error_index = std.math.cast(u32, f.f2) orelse return error.InvalidValue,
         .varbinds = f.varbinds,
     };
@@ -293,7 +293,7 @@ fn parseTrapV1(content: []const u8) DecodeError!TrapV1Pdu {
     return .{
         .enterprise = enterprise,
         .agent_addr = addr[0..4].*,
-        .generic_trap = @enumFromInt(@as(u8, @intCast(generic))),
+        .generic_trap = @fromBackingInt(@intCast(@as(u8, @intCast(generic)))),
         .specific_trap = std.math.cast(i32, specific) orelse return error.IntegerTooLarge,
         .time_stamp = time_stamp,
         .varbinds = .{ .bytes = vbs },
@@ -325,7 +325,7 @@ pub fn encode(
     var e = ber.Encoder.init(buf);
     try encodePdu(&e, pdu);
     try e.prependTlv(ber.tag.octet_string, community);
-    try e.prependInteger(ber.tag.integer, @intFromEnum(version));
+    try e.prependInteger(ber.tag.integer, @backingInt(version));
     try e.wrap(ber.tag.sequence, 0);
     return e.encoded();
 }
@@ -352,7 +352,7 @@ pub fn encodePdu(e: *ber.Encoder, pdu: EncodePdu) EncodeError!void {
     try e.prependInteger(ber.tag.integer, pdu.error_index);
     try e.prependInteger(ber.tag.integer, pdu.error_status);
     try e.prependInteger(ber.tag.integer, pdu.request_id);
-    try e.wrap(@intFromEnum(pdu.type), 0);
+    try e.wrap(@backingInt(pdu.type), 0);
 }
 
 // ── tests ───────────────────────────────────────────────────────────────────
@@ -595,7 +595,7 @@ test "error-status responses and v2c exception varbinds surface" {
         .error_status = 200,
     });
     const msg3 = try decode(custom);
-    try testing.expectEqual(@as(u8, 200), @intFromEnum(msg3.pdu.response.error_status));
+    try testing.expectEqual(@as(u8, 200), @backingInt(msg3.pdu.response.error_status));
 }
 
 test "set request round-trips typed values" {

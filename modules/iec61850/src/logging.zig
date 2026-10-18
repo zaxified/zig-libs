@@ -372,8 +372,8 @@ fn emitEntryId(w: *ber.Writer, id: u64) Error!void {
 // ── the MMS journal services ────────────────────────────────────────────────
 
 /// `ReadJournal` is MMS confirmed service `[65]`; `GetJournalStatus` is `[68]`.
-pub const read_journal_service: mms.Service = @enumFromInt(65);
-pub const get_journal_status_service: mms.Service = @enumFromInt(68);
+pub const read_journal_service: mms.Service = @fromBackingInt(@intCast(65));
+pub const get_journal_status_service: mms.Service = @fromBackingInt(@intCast(68));
 
 /// Where a `ReadJournal` starts and stops. Both halves are optional and a
 /// request with neither means "everything".
@@ -842,8 +842,8 @@ pub fn answerReadJournal(
 /// `[70]`. Both are **self-derived** from the published ISO 9506-2 layout: no
 /// reference client offers either, so neither was observed on a wire. They are
 /// round-tripped against this module's own decoders and dissected by Wireshark.
-pub const initialize_journal_service: mms.Service = @enumFromInt(67);
-pub const delete_journal_service: mms.Service = @enumFromInt(70);
+pub const initialize_journal_service: mms.Service = @fromBackingInt(@intCast(67));
+pub const delete_journal_service: mms.Service = @fromBackingInt(@intCast(70));
 
 /// How far an `InitializeJournal` deletes. Absent halves mean "no bound", so a
 /// request with neither empties the journal.

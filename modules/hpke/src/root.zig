@@ -197,13 +197,13 @@ test "meta.role is .util (no owned transport/socket, unlike a .client/.server mo
 }
 
 test "KemId/KdfId/AeadId ordinals match RFC 9180 Tables 2/3/5" {
-    try std.testing.expectEqual(@as(u16, 0x0020), @intFromEnum(KemId.dhkem_x25519_hkdf_sha256));
-    try std.testing.expectEqual(@as(u16, 0x0010), @intFromEnum(KemId.dhkem_p256_hkdf_sha256));
-    try std.testing.expectEqual(@as(u16, 0x0011), @intFromEnum(KemId.dhkem_p384_hkdf_sha384));
-    try std.testing.expectEqual(@as(u16, 0x0012), @intFromEnum(KemId.dhkem_p521_hkdf_sha512));
-    try std.testing.expectEqual(@as(u16, 0x0001), @intFromEnum(KdfId.hkdf_sha256));
-    try std.testing.expectEqual(@as(u16, 0x0001), @intFromEnum(AeadId.aes128gcm));
-    try std.testing.expectEqual(@as(u16, 0x0002), @intFromEnum(AeadId.aes256gcm));
-    try std.testing.expectEqual(@as(u16, 0x0003), @intFromEnum(AeadId.chacha20poly1305));
-    try std.testing.expectEqual(@as(u16, 0xffff), @intFromEnum(AeadId.export_only));
+    try std.testing.expectEqual(@as(u16, 0x0020), @backingInt(KemId.dhkem_x25519_hkdf_sha256));
+    try std.testing.expectEqual(@as(u16, 0x0010), @backingInt(KemId.dhkem_p256_hkdf_sha256));
+    try std.testing.expectEqual(@as(u16, 0x0011), @backingInt(KemId.dhkem_p384_hkdf_sha384));
+    try std.testing.expectEqual(@as(u16, 0x0012), @backingInt(KemId.dhkem_p521_hkdf_sha512));
+    try std.testing.expectEqual(@as(u16, 0x0001), @backingInt(KdfId.hkdf_sha256));
+    try std.testing.expectEqual(@as(u16, 0x0001), @backingInt(AeadId.aes128gcm));
+    try std.testing.expectEqual(@as(u16, 0x0002), @backingInt(AeadId.aes256gcm));
+    try std.testing.expectEqual(@as(u16, 0x0003), @backingInt(AeadId.chacha20poly1305));
+    try std.testing.expectEqual(@as(u16, 0xffff), @backingInt(AeadId.export_only));
 }

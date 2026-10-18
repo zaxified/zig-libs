@@ -48,11 +48,11 @@ pub fn parseLinkInfo(attr_bytes: []const u8) codec.Error!LinkInfo {
     var it: codec.AttrIterator = .{ .buf = attr_bytes };
     while (try it.next()) |a| switch (a.type) {
         uapi.LINKINFO.HEADER => out.device = try header.parse(a.data),
-        uapi.LINKINFO.PORT => out.port = @enumFromInt(try a.asU8()),
+        uapi.LINKINFO.PORT => out.port = @fromBackingInt(@intCast(try a.asU8())),
         uapi.LINKINFO.PHYADDR => out.phyaddr = try a.asU8(),
-        uapi.LINKINFO.TP_MDIX => out.tp_mdix = @enumFromInt(try a.asU8()),
-        uapi.LINKINFO.TP_MDIX_CTRL => out.tp_mdix_ctrl = @enumFromInt(try a.asU8()),
-        uapi.LINKINFO.TRANSCEIVER => out.transceiver = @enumFromInt(try a.asU8()),
+        uapi.LINKINFO.TP_MDIX => out.tp_mdix = @fromBackingInt(@intCast(try a.asU8())),
+        uapi.LINKINFO.TP_MDIX_CTRL => out.tp_mdix_ctrl = @fromBackingInt(@intCast(try a.asU8())),
+        uapi.LINKINFO.TRANSCEIVER => out.transceiver = @fromBackingInt(@intCast(try a.asU8())),
         else => {},
     };
     return out;
@@ -70,8 +70,8 @@ pub fn appendLinkInfoSet(
     list: *std.ArrayList(u8),
     set: LinkInfoSet,
 ) std.mem.Allocator.Error!void {
-    if (set.port) |p| try codec.appendAttrU8(gpa, list, uapi.LINKINFO.PORT, @intFromEnum(p));
-    if (set.tp_mdix_ctrl) |m| try codec.appendAttrU8(gpa, list, uapi.LINKINFO.TP_MDIX_CTRL, @intFromEnum(m));
+    if (set.port) |p| try codec.appendAttrU8(gpa, list, uapi.LINKINFO.PORT, @backingInt(p));
+    if (set.tp_mdix_ctrl) |m| try codec.appendAttrU8(gpa, list, uapi.LINKINFO.TP_MDIX_CTRL, @backingInt(m));
 }
 
 /// Encode a complete `ETHTOOL_MSG_LINKINFO_GET` request. The result is the
@@ -170,9 +170,9 @@ pub fn parseLinkModes(gpa: std.mem.Allocator, attr_bytes: []const u8) Error!Link
         uapi.LINKMODES.HEADER => out.device = try header.parse(a.data),
         uapi.LINKMODES.AUTONEG => out.autoneg = (try a.asU8()) != 0,
         uapi.LINKMODES.SPEED => out.speed = try a.asU32(),
-        uapi.LINKMODES.DUPLEX => out.duplex = @enumFromInt(try a.asU8()),
-        uapi.LINKMODES.MASTER_SLAVE_CFG => out.master_slave_cfg = @enumFromInt(try a.asU8()),
-        uapi.LINKMODES.MASTER_SLAVE_STATE => out.master_slave_state = @enumFromInt(try a.asU8()),
+        uapi.LINKMODES.DUPLEX => out.duplex = @fromBackingInt(@intCast(try a.asU8())),
+        uapi.LINKMODES.MASTER_SLAVE_CFG => out.master_slave_cfg = @fromBackingInt(@intCast(try a.asU8())),
+        uapi.LINKMODES.MASTER_SLAVE_STATE => out.master_slave_state = @fromBackingInt(@intCast(try a.asU8())),
         uapi.LINKMODES.LANES => out.lanes = try a.asU32(),
         uapi.LINKMODES.RATE_MATCHING => out.rate_matching = try a.asU8(),
         uapi.LINKMODES.OURS => {
@@ -216,10 +216,10 @@ pub fn appendLinkModesSet(
     // what `ethtool -s <dev> speed … duplex … autoneg …` emits, so the golden
     // comparison is a plain byte compare instead of a set comparison.
     if (set.speed_mbps) |s| try codec.appendAttrU32(gpa, list, uapi.LINKMODES.SPEED, s);
-    if (set.duplex) |d| try codec.appendAttrU8(gpa, list, uapi.LINKMODES.DUPLEX, @intFromEnum(d));
+    if (set.duplex) |d| try codec.appendAttrU8(gpa, list, uapi.LINKMODES.DUPLEX, @backingInt(d));
     if (set.autoneg) |v| try codec.appendAttrU8(gpa, list, uapi.LINKMODES.AUTONEG, @intFromBool(v));
     if (set.master_slave_cfg) |m|
-        try codec.appendAttrU8(gpa, list, uapi.LINKMODES.MASTER_SLAVE_CFG, @intFromEnum(m));
+        try codec.appendAttrU8(gpa, list, uapi.LINKMODES.MASTER_SLAVE_CFG, @backingInt(m));
     if (set.lanes) |l| try codec.appendAttrU32(gpa, list, uapi.LINKMODES.LANES, l);
     if (set.advertise.len != 0)
         try bitset.appendIndexedValues(gpa, list, uapi.LINKMODES.OURS, set.advertise);
@@ -300,7 +300,7 @@ pub fn parseLinkState(attr_bytes: []const u8) codec.Error!LinkState {
         uapi.LINKSTATE.LINK => out.link = (try a.asU8()) != 0,
         uapi.LINKSTATE.SQI => out.sqi = try a.asU32(),
         uapi.LINKSTATE.SQI_MAX => out.sqi_max = try a.asU32(),
-        uapi.LINKSTATE.EXT_STATE => out.ext_state = @enumFromInt(try a.asU8()),
+        uapi.LINKSTATE.EXT_STATE => out.ext_state = @fromBackingInt(@intCast(try a.asU8())),
         uapi.LINKSTATE.EXT_SUBSTATE => out.ext_substate = try a.asU8(),
         uapi.LINKSTATE.EXT_DOWN_CNT => out.ext_down_cnt = try a.asU32(),
         else => {},
@@ -336,9 +336,9 @@ test "LINKINFO decodes the five u8 fields and tolerates a partial reply" {
     var list: std.ArrayList(u8) = .empty;
     defer list.deinit(gpa);
     try header.append(gpa, &list, uapi.LINKINFO.HEADER, .{ .target = .byIndex(2) });
-    try codec.appendAttrU8(gpa, &list, uapi.LINKINFO.PORT, @intFromEnum(uapi.Port.fibre));
+    try codec.appendAttrU8(gpa, &list, uapi.LINKINFO.PORT, @backingInt(uapi.Port.fibre));
     try codec.appendAttrU8(gpa, &list, uapi.LINKINFO.PHYADDR, 2);
-    try codec.appendAttrU8(gpa, &list, uapi.LINKINFO.TP_MDIX, @intFromEnum(uapi.MdiX.mdi_x));
+    try codec.appendAttrU8(gpa, &list, uapi.LINKINFO.TP_MDIX, @backingInt(uapi.MdiX.mdi_x));
 
     const li = try parseLinkInfo(list.items);
     try testing.expectEqual(@as(?u32, 2), li.device.index);
@@ -365,7 +365,7 @@ test "LINKMODES: supports vs advertises come from the two halves of one bitset" 
     defer list.deinit(gpa);
     try codec.appendAttrU8(gpa, &list, uapi.LINKMODES.AUTONEG, 1);
     try codec.appendAttrU32(gpa, &list, uapi.LINKMODES.SPEED, 1000);
-    try codec.appendAttrU8(gpa, &list, uapi.LINKMODES.DUPLEX, @intFromEnum(uapi.Duplex.full));
+    try codec.appendAttrU8(gpa, &list, uapi.LINKMODES.DUPLEX, @backingInt(uapi.Duplex.full));
     // Supported = bits 0..5 (10/100/1000, half+full); advertised = only 5.
     const value = [_]u32{1 << 5};
     const mask = [_]u32{0b11_1111};
@@ -400,7 +400,7 @@ test "LINKSTATE decodes link/SQI/ext-state, and leaves substate raw" {
     try codec.appendAttrU8(gpa, &list, uapi.LINKSTATE.LINK, 0);
     try codec.appendAttrU32(gpa, &list, uapi.LINKSTATE.SQI, 3);
     try codec.appendAttrU32(gpa, &list, uapi.LINKSTATE.SQI_MAX, 7);
-    try codec.appendAttrU8(gpa, &list, uapi.LINKSTATE.EXT_STATE, @intFromEnum(uapi.LinkExtState.cable_issue));
+    try codec.appendAttrU8(gpa, &list, uapi.LINKSTATE.EXT_STATE, @backingInt(uapi.LinkExtState.cable_issue));
     try codec.appendAttrU8(gpa, &list, uapi.LINKSTATE.EXT_SUBSTATE, 2);
     try codec.appendAttrU32(gpa, &list, uapi.LINKSTATE.EXT_DOWN_CNT, 11);
 

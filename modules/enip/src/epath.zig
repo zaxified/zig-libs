@@ -297,8 +297,8 @@ pub const Iterator = struct {
     }
 
     fn decodeLogical(self: *Iterator, b: u8) DecodeError!Segment {
-        const what: LogicalType = @enumFromInt(@as(u3, @truncate(b >> 2)));
-        const format: LogicalFormat = @enumFromInt(@as(u2, @truncate(b)));
+        const what: LogicalType = @fromBackingInt(@intCast(@as(u3, @truncate(b >> 2))));
+        const format: LogicalFormat = @fromBackingInt(@intCast(@as(u2, @truncate(b))));
         if (what == .reserved) return error.ReservedFormat;
         if (format == .reserved) return error.ReservedFormat;
         // The electronic key rides in the "special" logical type, and is a
@@ -434,7 +434,7 @@ pub const Builder = struct {
     }
 
     pub fn logical(self: *Builder, l: Logical) EncodeError!void {
-        const type_bits: u8 = @as(u8, @intFromEnum(l.what)) << 2;
+        const type_bits: u8 = @as(u8, @backingInt(l.what)) << 2;
         switch (l.format) {
             .bits_8 => try self.put(&[_]u8{ seg_type_logical | type_bits, @truncate(l.value) }),
             .bits_16 => {

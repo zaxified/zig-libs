@@ -299,7 +299,7 @@ test "hostile: an exhaustive enum rejects a value it cannot represent" {
         pub const pb_fields = .{ .e = Field{ .number = 1, .kind = .@"enum" } };
     }, gpa, &.{ 0x08, 0x7b }, .{});
     defer d.deinit();
-    try testing.expectEqual(@as(i32, 123), @intFromEnum(d.value.e));
+    try testing.expectEqual(@as(i32, 123), @backingInt(d.value.e));
 }
 
 // ── field hiding via the message merge rule ─────────────────────────────────

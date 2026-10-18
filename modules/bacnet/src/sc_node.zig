@@ -452,7 +452,7 @@ pub fn NodeWith(comptime outbox_len: usize, comptime frame_cap: usize) type {
             // carrying an option we are obliged to understand and do not is
             // refused whole, whatever its function.
             if (try msg.header.unsupportedOption()) |bad| {
-                var marker: u8 = @intFromEnum(bad.type);
+                var marker: u8 = @backingInt(bad.type);
                 if (bad.must_understand) marker |= sc.option_flags.must_understand;
                 if (bad.data != null) marker |= sc.option_flags.header_data;
                 try self.queue(sc.nak(
@@ -1056,7 +1056,7 @@ test "a must-understand option we do not know is NAKed, whatever the function" {
     // Option type 7, must-understand set, on a Heartbeat-Request.
     var opts: [4]u8 = undefined;
     const list = try sc.encodeOptions(&.{
-        .{ .type = @enumFromInt(7), .must_understand = true },
+        .{ .type = @fromBackingInt(@intCast(7)), .must_understand = true },
     }, &opts);
     var fbuf: [32]u8 = undefined;
     const frame = hubFrame(.{

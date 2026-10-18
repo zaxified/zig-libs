@@ -883,7 +883,7 @@ test "refresh: a lost or tampered Πfac proof aborts the round, naming the culpr
         for (&parties) |*p| try p.advance();
         try deliverAll(allocator, &parties, struct {
             fn f(from: u32, to: u32, bytes: []u8) bool {
-                if (from != 2 or bytes[ecdsa_keygen.run_tag_len] != @intFromEnum(wire.Kind.ecdsa_fac_proof)) return true;
+                if (from != 2 or bytes[ecdsa_keygen.run_tag_len] != @backingInt(wire.Kind.ecdsa_fac_proof)) return true;
                 if (to == 1) return false;
                 bytes[bytes.len - 1] ^= 1;
                 return true;
@@ -981,7 +981,7 @@ test "refresh: parties that end with different key tables abort in the confirmat
     const hide = struct {
         fn f(from: u32, to: u32, bytes: []u8) bool {
             const kind = bytes[ecdsa_keygen.run_tag_len];
-            const dealing = kind == @intFromEnum(wire.Kind.reshare_broadcast) or kind == @intFromEnum(wire.Kind.reshare_share);
+            const dealing = kind == @backingInt(wire.Kind.reshare_broadcast) or kind == @backingInt(wire.Kind.reshare_share);
             return !(from == 2 and to == 3 and dealing);
         }
     }.f;

@@ -55,9 +55,9 @@ pub fn parse(attr_bytes: []const u8) codec.Error!Eswitch {
     while (try it.next()) |a| switch (a.type) {
         uapi.ATTR.BUS_NAME => try uapi.copyName(&e.handle.bus_buf, &e.handle.bus_len, a),
         uapi.ATTR.DEV_NAME => try uapi.copyName(&e.handle.dev_buf, &e.handle.dev_len, a),
-        uapi.ATTR.ESWITCH_MODE => e.mode = @enumFromInt(try a.asU16()),
-        uapi.ATTR.ESWITCH_INLINE_MODE => e.inline_mode = @enumFromInt(try a.asU8()),
-        uapi.ATTR.ESWITCH_ENCAP_MODE => e.encap_mode = @enumFromInt(try a.asU8()),
+        uapi.ATTR.ESWITCH_MODE => e.mode = @fromBackingInt(@intCast(try a.asU16())),
+        uapi.ATTR.ESWITCH_INLINE_MODE => e.inline_mode = @fromBackingInt(@intCast(try a.asU8())),
+        uapi.ATTR.ESWITCH_ENCAP_MODE => e.encap_mode = @fromBackingInt(@intCast(try a.asU8())),
         else => {},
     };
     return e;
@@ -82,9 +82,9 @@ pub fn appendSet(
     if (set.mode == null and set.inline_mode == null and set.encap_mode == null)
         return error.InvalidRequest;
     try handle.append(gpa, list, h);
-    if (set.mode) |m| try codec.appendAttrU16(gpa, list, uapi.ATTR.ESWITCH_MODE, @intFromEnum(m));
-    if (set.inline_mode) |m| try codec.appendAttrU8(gpa, list, uapi.ATTR.ESWITCH_INLINE_MODE, @intFromEnum(m));
-    if (set.encap_mode) |m| try codec.appendAttrU8(gpa, list, uapi.ATTR.ESWITCH_ENCAP_MODE, @intFromEnum(m));
+    if (set.mode) |m| try codec.appendAttrU16(gpa, list, uapi.ATTR.ESWITCH_MODE, @backingInt(m));
+    if (set.inline_mode) |m| try codec.appendAttrU8(gpa, list, uapi.ATTR.ESWITCH_INLINE_MODE, @backingInt(m));
+    if (set.encap_mode) |m| try codec.appendAttrU8(gpa, list, uapi.ATTR.ESWITCH_ENCAP_MODE, @backingInt(m));
 }
 
 /// Attributes of a `DEVLINK_CMD_ESWITCH_GET` — the handle alone.

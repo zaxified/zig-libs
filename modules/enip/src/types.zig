@@ -263,7 +263,7 @@ pub const TagData = struct {
     /// Decodes the reply payload of `Read Tag` / `Read Tag Fragmented`.
     pub fn decode(payload: []const u8) DecodeError!TagData {
         if (payload.len < 2) return error.Truncated;
-        const t: DataType = @enumFromInt(std.mem.readInt(u16, payload[0..2], .little));
+        const t: DataType = @fromBackingInt(@intCast(std.mem.readInt(u16, payload[0..2], .little)));
         if (t.hasStructureHandle()) {
             if (payload.len < 4) return error.MissingStructureHandle;
             return .{
@@ -282,7 +282,7 @@ pub const TagData = struct {
     pub fn encode(self: TagData, out: []u8) EncodeError![]u8 {
         const total = self.encodedLen();
         if (out.len < total) return error.BufferTooSmall;
-        std.mem.writeInt(u16, out[0..2], @intFromEnum(self.type), .little);
+        std.mem.writeInt(u16, out[0..2], @backingInt(self.type), .little);
         var off: usize = 2;
         if (self.structure_handle) |h| {
             std.mem.writeInt(u16, out[2..4], h, .little);
@@ -399,7 +399,7 @@ pub const WriteTagRequest = struct {
 
     pub fn decode(bytes: []const u8) DecodeError!WriteTagRequest {
         if (bytes.len < 4) return error.Truncated;
-        const t: DataType = @enumFromInt(std.mem.readInt(u16, bytes[0..2], .little));
+        const t: DataType = @fromBackingInt(@intCast(std.mem.readInt(u16, bytes[0..2], .little)));
         var off: usize = 2;
         var handle: ?u16 = null;
         if (t.hasStructureHandle()) {
@@ -420,7 +420,7 @@ pub const WriteTagRequest = struct {
     pub fn encode(self: WriteTagRequest, out: []u8) EncodeError![]u8 {
         const total = self.encodedLen();
         if (out.len < total) return error.BufferTooSmall;
-        std.mem.writeInt(u16, out[0..2], @intFromEnum(self.type), .little);
+        std.mem.writeInt(u16, out[0..2], @backingInt(self.type), .little);
         var off: usize = 2;
         if (self.structure_handle) |h| {
             std.mem.writeInt(u16, out[2..4], h, .little);
@@ -449,7 +449,7 @@ pub const WriteTagFragmentedRequest = struct {
 
     pub fn decode(bytes: []const u8) DecodeError!WriteTagFragmentedRequest {
         if (bytes.len < 8) return error.Truncated;
-        const t: DataType = @enumFromInt(std.mem.readInt(u16, bytes[0..2], .little));
+        const t: DataType = @fromBackingInt(@intCast(std.mem.readInt(u16, bytes[0..2], .little)));
         var off: usize = 2;
         var handle: ?u16 = null;
         if (t.hasStructureHandle()) {
@@ -472,7 +472,7 @@ pub const WriteTagFragmentedRequest = struct {
     pub fn encode(self: WriteTagFragmentedRequest, out: []u8) EncodeError![]u8 {
         const total = self.encodedLen();
         if (out.len < total) return error.BufferTooSmall;
-        std.mem.writeInt(u16, out[0..2], @intFromEnum(self.type), .little);
+        std.mem.writeInt(u16, out[0..2], @backingInt(self.type), .little);
         var off: usize = 2;
         if (self.structure_handle) |h| {
             std.mem.writeInt(u16, out[2..4], h, .little);
@@ -706,7 +706,7 @@ fn fuzzTypes(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     // whenever that word happens to be below 65536, so this one was not
     // hopeless — but `bytes` had already emptied the seed, so it was 0 anyway.
     const code: u16 = @truncate(src.value(u64));
-    const t: DataType = @enumFromInt(code);
+    const t: DataType = @fromBackingInt(@intCast(code));
     _ = decodeValue(t, buf[0..len]) catch {};
 
     if (TagData.decode(buf[0..len])) |td| {

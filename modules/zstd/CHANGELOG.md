@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** `zig fmt` (0.17) rewrote `@intFromEnum`/`@enumFromInt` to `@backingInt`/`@fromBackingInt` in sources and tests; same values, same behaviour.
 - **2026-10-18** — Ported to Zig 0.17.0: `std.meta.Int` -> `@Int`; lazy.zig `matchMask`: removed the big-endian `@bitReverse` (0.17 vector-of-bool `@bitCast` puts lane 0 in bit 0 on every target, checked for mips); test `parts` comptime; `strRepeat` branch quota scaled with length.
 - **2026-10-09** — Faster decoding on x86-64 with BMI2 (Z35, the same output
   and errors): the sequence loop and libzstd's four-stream Huffman loops

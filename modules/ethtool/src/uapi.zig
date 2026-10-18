@@ -629,11 +629,11 @@ test "isNotification separates NTF from GET replies" {
 }
 
 test "open enums tolerate values this kernel does not know" {
-    try testing.expectEqual(Port.fibre, @as(Port, @enumFromInt(3)));
-    try testing.expectEqual(@as(u8, 0xef), @intFromEnum(Port.none));
+    try testing.expectEqual(Port.fibre, @as(Port, @fromBackingInt(@intCast(3))));
+    try testing.expectEqual(@as(u8, 0xef), @backingInt(Port.none));
     // An unknown value stays representable rather than being illegal.
-    const future: Duplex = @enumFromInt(7);
-    try testing.expectEqual(@as(u8, 7), @intFromEnum(future));
-    const grp: StatsGroup = @enumFromInt(99);
-    try testing.expectEqual(@as(u32, 99), @intFromEnum(grp));
+    const future: Duplex = @fromBackingInt(@intCast(7));
+    try testing.expectEqual(@as(u8, 7), @backingInt(future));
+    const grp: StatsGroup = @fromBackingInt(@intCast(99));
+    try testing.expectEqual(@as(u32, 99), @backingInt(grp));
 }

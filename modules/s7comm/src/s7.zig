@@ -161,7 +161,7 @@ fn putBe16(out: []u8, v: u16) void {
 pub fn decodeHeader(bytes: []const u8) Error!Header {
     if (bytes.len < 10) return error.ShortPdu;
     if (bytes[0] != protocol_id) return error.BadProtocolId;
-    const rosctr: Rosctr = @enumFromInt(bytes[1]);
+    const rosctr: Rosctr = @fromBackingInt(@intCast(bytes[1]));
     switch (rosctr) {
         .job, .ack, .ack_data, .userdata => {},
         _ => return error.UnknownRosctr,
@@ -175,7 +175,7 @@ pub fn decodeHeader(bytes: []const u8) Error!Header {
     };
     if (rosctr.hasErrorField()) {
         if (bytes.len < 12) return error.ShortPdu;
-        h.error_class = @enumFromInt(bytes[10]);
+        h.error_class = @fromBackingInt(@intCast(bytes[10]));
         h.error_code = bytes[11];
     }
     return h;
@@ -223,13 +223,13 @@ pub fn encode(h: Header, parameters: []const u8, data: []const u8, out: []u8) Er
     const total = hl + parameters.len + data.len;
     if (out.len < total) return error.BufferTooSmall;
     out[0] = protocol_id;
-    out[1] = @intFromEnum(h.rosctr);
+    out[1] = @backingInt(h.rosctr);
     putBe16(out[2..4], h.redundancy_id);
     putBe16(out[4..6], h.pdu_reference);
     putBe16(out[6..8], @intCast(parameters.len));
     putBe16(out[8..10], @intCast(data.len));
     if (h.rosctr.hasErrorField()) {
-        out[10] = @intFromEnum(h.error_class);
+        out[10] = @backingInt(h.error_class);
         out[11] = h.error_code;
     }
     @memcpy(out[hl..][0..parameters.len], parameters);
@@ -263,7 +263,7 @@ pub const Setup = struct {
     pub fn encode(self: Setup, out: []u8) Error![]u8 {
         if (out.len < wire_len) return error.BufferTooSmall;
         if (self.pdu_length < min_pdu_length) return error.BadPduLength;
-        out[0] = @intFromEnum(Function.setup_communication);
+        out[0] = @backingInt(Function.setup_communication);
         out[1] = 0; // reserved
         putBe16(out[2..4], self.max_amq_calling);
         putBe16(out[4..6], self.max_amq_called);
@@ -273,7 +273,7 @@ pub const Setup = struct {
 
     pub fn decode(bytes: []const u8) Error!Setup {
         if (bytes.len < wire_len) return error.BadSetup;
-        if (bytes[0] != @intFromEnum(Function.setup_communication)) return error.BadSetup;
+        if (bytes[0] != @backingInt(Function.setup_communication)) return error.BadSetup;
         const s: Setup = .{
             .max_amq_calling = be16(bytes[2..4]),
             .max_amq_called = be16(bytes[4..6]),

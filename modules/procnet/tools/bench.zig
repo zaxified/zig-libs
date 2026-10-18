@@ -74,7 +74,7 @@ fn once(io: std.Io, w: usize, pid: u64) u64 {
             const l = procnet.readPidLimits(io, .self) orelse return 0;
             var sum: u64 = 0;
             for (l.rows, 0..) |row, i| {
-                if (i == @intFromEnum(procnet.Resource.open_files)) continue;
+                if (i == @backingInt(procnet.Resource.open_files)) continue;
                 const r = row orelse continue;
                 sum +%= r.soft orelse std.math.maxInt(u64);
             }

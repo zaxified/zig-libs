@@ -540,7 +540,7 @@ pub const SubtreeIterator = struct {
         it.pos = subtree.slice.end;
         const base = try parseElement(it.bytes, subtree.slice.start); // base GeneralName
         return .{
-            .tag = @enumFromInt(@intFromEnum(base.identifier.tag)),
+            .tag = @fromBackingInt(@intCast(@backingInt(base.identifier.tag))),
             .value = it.bytes[base.slice.start..base.slice.end],
         };
     }

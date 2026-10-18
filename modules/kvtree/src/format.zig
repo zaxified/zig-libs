@@ -258,7 +258,7 @@ const hdr_len = 8;
 const slot_len = 2;
 
 fn nodeKind(page: *const [page_size]u8) NodeKind {
-    return @enumFromInt(page[0]);
+    return @fromBackingInt(@intCast(page[0]));
 }
 fn nodeCount(page: *const [page_size]u8) u16 {
     return std.mem.readInt(u16, page[2..4], .little);
@@ -282,8 +282,8 @@ fn slotOffset(page: *const [page_size]u8, i: usize) usize {
 /// every caller of THOSE has already gone through here first.
 pub fn kindOf(page: *const [page_size]u8) ?NodeKind {
     return switch (page[0]) {
-        @intFromEnum(NodeKind.leaf) => .leaf,
-        @intFromEnum(NodeKind.branch) => .branch,
+        @backingInt(NodeKind.leaf) => .leaf,
+        @backingInt(NodeKind.branch) => .branch,
         else => null,
     };
 }
@@ -440,7 +440,7 @@ pub const Branch = struct {
 /// regular views assert well-formedness instead (their pages come from a
 /// validated committed tree); recovery must reject, never crash.
 pub fn branchViewSafe(page: *const [page_size]u8) ?Branch {
-    if (page[0] != @intFromEnum(NodeKind.branch)) return null;
+    if (page[0] != @backingInt(NodeKind.branch)) return null;
     const count: usize = nodeCount(page);
     const dir_end = hdr_len + count * slot_len;
     if (dir_end > page_size) return null;
@@ -483,7 +483,7 @@ pub fn branchViewSafe(page: *const [page_size]u8) ?Branch {
 /// `branchViewSafe`'s plus the value bytes. Lengths are widened to `usize`
 /// before they are added, so the bound cannot be defeated by wrapping.
 pub fn leafViewSafe(page: *const [page_size]u8) ?Leaf {
-    if (page[0] != @intFromEnum(NodeKind.leaf)) return null;
+    if (page[0] != @backingInt(NodeKind.leaf)) return null;
     const count: usize = nodeCount(page);
     const dir_end = hdr_len + count * slot_len;
     if (dir_end > page_size) return null;
@@ -834,7 +834,7 @@ fn branchCellBytes(klen: usize) usize {
 
 fn writeHeader(page: *[page_size]u8, kind: NodeKind, count: u16, leftmost: PageId) void {
     zeroPage(page);
-    page[0] = @intFromEnum(kind);
+    page[0] = @backingInt(kind);
     page[1] = 0;
     std.mem.writeInt(u16, page[2..4], count, .little);
     std.mem.writeInt(u32, page[4..8], leftmost, .little);
@@ -1059,9 +1059,9 @@ test "oversize entry is rejected" {
 
 test "kindOf rejects any byte that is not a valid NodeKind tag" {
     var page: [page_size]u8 = @splat(0);
-    page[0] = @intFromEnum(NodeKind.leaf);
+    page[0] = @backingInt(NodeKind.leaf);
     try testing.expectEqual(NodeKind.leaf, kindOf(&page).?);
-    page[0] = @intFromEnum(NodeKind.branch);
+    page[0] = @backingInt(NodeKind.branch);
     try testing.expectEqual(NodeKind.branch, kindOf(&page).?);
 
     // Every byte a freelist chain page's header (a `u16` entry count, low

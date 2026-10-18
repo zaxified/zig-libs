@@ -64,7 +64,7 @@ test "KAT (b): TSval flood — memory stays bounded, no crash, no spurious sampl
         try testing.expectEqual(@as(?root.RttSample, null), sample);
         try testing.expect(est.tableCount(.a_to_b) <= 16);
     }
-    try testing.expectEqual(@as(usize, 16), est.tables[@intFromEnum(Direction.a_to_b)].capacity());
+    try testing.expectEqual(@as(usize, 16), est.tables[@backingInt(Direction.a_to_b)].capacity());
 }
 
 test "KAT (c): out-of-order arrivals still match correctly" {

@@ -59,7 +59,7 @@ fn compressCase(gpa: std.mem.Allocator, ctx: *zstd.Compressor, strm: *zstd.Strea
 /// `compressCase` on `pool` (null: the contexts' own); a stream takes the
 /// pool it was made with.
 fn compressCaseOn(gpa: std.mem.Allocator, ctx: *zstd.Compressor, strm: *zstd.Stream, pool: ?*zstd.ThreadPool, mc: corpus.MtCase, level: i32, ck: bool, workers: u32, dict: []const u8, src: []const u8, out: []u8) ![]const u8 {
-    const ctype: zstd.DictContentType = @enumFromInt(mc.content_type);
+    const ctype: zstd.DictContentType = @fromBackingInt(@intCast(mc.content_type));
     var cdict: ?zstd.CDict = null;
     defer if (cdict) |*c| c.deinit();
     const d: zstd.Dictionary = if (mc.dict == null) .none else switch (mc.path) {
@@ -85,7 +85,7 @@ fn compressCaseOn(gpa: std.mem.Allocator, ctx: *zstd.Compressor, strm: *zstd.Str
 
 fn decodeBack(gpa: std.mem.Allocator, mc: corpus.MtCase, dict: []const u8, frames: []const u8, src: []const u8) !void {
     // (a full dictionary as a prefix made the frame name its ID)
-    var dd: ?zstd.DDict = if (mc.dict != null and !(mc.path == .prefix and mc.content_type == 1)) try zstd.DDict.init(gpa, dict, @enumFromInt(mc.content_type)) else null;
+    var dd: ?zstd.DDict = if (mc.dict != null and !(mc.path == .prefix and mc.content_type == 1)) try zstd.DDict.init(gpa, dict, @fromBackingInt(@intCast(mc.content_type))) else null;
     defer if (dd) |*x| x.deinit(gpa);
     var d = try zstd.Decompressor.init(gpa, if (dd) |*x| .{ .ddict = x } else if (mc.dict != null) .{ .prefix_once = dict } else .{});
     defer d.deinit();

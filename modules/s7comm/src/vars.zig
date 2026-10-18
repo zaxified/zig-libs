@@ -70,7 +70,7 @@ pub const ItemIterator = struct {
 /// a request that does not is malformed rather than merely odd.
 pub fn decodeRequest(bytes: []const u8) Error!Request {
     if (bytes.len < 2) return error.ShortParameters;
-    const function: s7.Function = @enumFromInt(bytes[0]);
+    const function: s7.Function = @fromBackingInt(@intCast(bytes[0]));
     switch (function) {
         .read_var, .write_var => {},
         else => return error.UnexpectedFunction,
@@ -85,7 +85,7 @@ pub fn decodeRequest(bytes: []const u8) Error!Request {
 /// exactly the function octet and the item count.
 pub fn decodeReply(bytes: []const u8) Error!struct { function: s7.Function, count: u8 } {
     if (bytes.len < 2) return error.ShortParameters;
-    const function: s7.Function = @enumFromInt(bytes[0]);
+    const function: s7.Function = @fromBackingInt(@intCast(bytes[0]));
     switch (function) {
         .read_var, .write_var => {},
         else => return error.UnexpectedFunction,
@@ -98,7 +98,7 @@ pub fn encodeRequest(function: s7.Function, list: []const items.Item, out: []u8)
     if (list.len > max_items) return error.TooManyItems;
     const total = 2 + list.len * items.item_len;
     if (out.len < total) return error.BufferTooSmall;
-    out[0] = @intFromEnum(function);
+    out[0] = @backingInt(function);
     out[1] = @intCast(list.len);
     for (list, 0..) |it, i| _ = try it.encode(out[2 + i * items.item_len ..]);
     return out[0..total];
@@ -107,7 +107,7 @@ pub fn encodeRequest(function: s7.Function, list: []const items.Item, out: []u8)
 /// Writes the two-octet reply parameter block.
 pub fn encodeReply(function: s7.Function, count: u8, out: []u8) Error![]u8 {
     if (out.len < 2) return error.BufferTooSmall;
-    out[0] = @intFromEnum(function);
+    out[0] = @backingInt(function);
     out[1] = count;
     return out[0..2];
 }

@@ -197,7 +197,7 @@ pub const wide_cases = [_]Case(Wide){
     .{ .name = "varint_edges", .value = .{ .u64_ = 127 } },
     .{ .name = "varint_128", .value = .{ .u64_ = 128 } },
     .{ .name = "bool_enum", .value = .{ .b = true, .color = .green } },
-    .{ .name = "enum_open", .value = .{ .color = @enumFromInt(9999) } },
+    .{ .name = "enum_open", .value = .{ .color = @fromBackingInt(@intCast(9999)) } },
     .{ .name = "fixed_all", .value = .{
         .f64_ = std.math.maxInt(u64),
         .sf64 = MIN64,
@@ -221,7 +221,7 @@ pub const repeated_cases = [_]Case(Repeated){
     .{ .name = "rep_zigzag", .value = .{ .zz = &.{ -1, 1, MIN64 } } },
     .{ .name = "rep_fixed", .value = .{ .fixed = &.{ 0, 0xdeadbeef } } },
     .{ .name = "rep_bool", .value = .{ .flags = &.{ true, false, true } } },
-    .{ .name = "rep_enum", .value = .{ .colors = &.{ .red, .green, @enumFromInt(77) } } },
+    .{ .name = "rep_enum", .value = .{ .colors = &.{ .red, .green, @fromBackingInt(@intCast(77)) } } },
     .{ .name = "rep_string", .value = .{ .names = &.{ "", "a", "long-ish string" } } },
     .{ .name = "rep_message", .value = .{ .inners = &.{ .{ .v = 1 }, .{ .v = 2, .note = "x" } } } },
     .{ .name = "rep_empty", .value = .{} },

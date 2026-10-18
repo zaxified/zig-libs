@@ -105,10 +105,10 @@ pub const DataHeader = struct {
 
     pub fn encode(self: DataHeader, out: []u8) Error![]u8 {
         if (out.len < data_header_len) return error.BufferTooSmall;
-        out[0] = @intFromEnum(self.opcode);
+        out[0] = @backingInt(self.opcode);
         out[1] = 0;
         out[2] = 0;
-        std.mem.writeInt(u16, out[3..5], @intFromEnum(self.function), .big);
+        std.mem.writeInt(u16, out[3..5], @backingInt(self.function), .big);
         out[5] = 0;
         out[6] = 0;
         std.mem.writeInt(u16, out[7..9], self.seqnum, .big);
@@ -117,7 +117,7 @@ pub const DataHeader = struct {
 
     pub fn decode(bytes: []const u8) Error!DataHeader {
         if (bytes.len < data_header_len) return error.ShortHeader;
-        const op: Opcode = @enumFromInt(bytes[0]);
+        const op: Opcode = @fromBackingInt(@intCast(bytes[0]));
         switch (op) {
             .request, .response, .notification => {},
             _ => return error.BadOpcode,
@@ -126,7 +126,7 @@ pub const DataHeader = struct {
             return error.ReservedNotZero;
         return .{
             .opcode = op,
-            .function = @enumFromInt(std.mem.readInt(u16, bytes[3..5], .big)),
+            .function = @fromBackingInt(@intCast(std.mem.readInt(u16, bytes[3..5], .big))),
             .seqnum = std.mem.readInt(u16, bytes[7..9], .big),
         };
     }
@@ -369,7 +369,7 @@ test "an attribute value inherits the object walk's remaining depth budget, not 
     while (d < 4) : (d += 1) {
         buf[w] = 0; // flags
         w += 1;
-        buf[w] = @intFromEnum(value.Datatype.s7struct);
+        buf[w] = @backingInt(value.Datatype.s7struct);
         w += 1;
         w += (try value.putVarUint(1, buf[w..])).len; // element id 1
     }
@@ -396,7 +396,7 @@ fn buildTwoNullArrayAttrs(out: []u8, count1: u32, count2: u32, nest_second: bool
         w += (try beginAttribute(@intCast(attr_id), out[w..])).len;
         out[w] = value.flag_array;
         w += 1;
-        out[w] = @intFromEnum(value.Datatype.null);
+        out[w] = @backingInt(value.Datatype.null);
         w += 1;
         w += (try value.putVarUint(count, out[w..])).len;
     }

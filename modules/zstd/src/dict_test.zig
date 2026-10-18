@@ -91,7 +91,7 @@ const Out = struct { bytes: []u8, owned: bool };
 /// One dictionary golden's output: `buf` holds the dictionary and then the
 /// input (so a prefix can be adjacent).
 fn compressCase(gpa: std.mem.Allocator, ctx: *zstd.Compressor, strm: *zstd.Stream, dc: corpus.DictCase, level: i32, ck: bool, dict: []const u8, src: []const u8, dst: []u8) ![]const u8 {
-    const ctype: zstd.DictContentType = @enumFromInt(dc.content_type);
+    const ctype: zstd.DictContentType = @fromBackingInt(@intCast(dc.content_type));
     if (dc.schedule) |sch| {
         // streaming: the advanced parameters are the schedule's
         var cdict: ?zstd.CDict = null;
@@ -169,7 +169,7 @@ fn compressCase(gpa: std.mem.Allocator, ctx: *zstd.Compressor, strm: *zstd.Strea
 /// `prefix_once`, anything else as a `DDict` of the case's content type --
 /// and compare with `src`.
 fn decodeBack(gpa: std.mem.Allocator, dc: corpus.DictCase, dict: []const u8, frames: []const u8, src: []const u8) !void {
-    const ctype: zstd.DictContentType = @enumFromInt(dc.content_type);
+    const ctype: zstd.DictContentType = @fromBackingInt(@intCast(dc.content_type));
     var dd = try zstd.DDict.init(gpa, dict, ctype);
     defer dd.deinit(gpa);
     const prefix = dc.path == .prefix or dc.path == .prefixadj;

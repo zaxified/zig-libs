@@ -183,8 +183,8 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
                 el.* = .{ .id = try unhex(arena, in.id), .params = params };
             }
             const m: syslog.Message = .{
-                .facility = @enumFromInt(c.facility),
-                .severity = @enumFromInt(c.severity),
+                .facility = @fromBackingInt(@intCast(c.facility)),
+                .severity = @fromBackingInt(@intCast(c.severity)),
                 .timestamp = timestamp(c.ts),
                 .hostname = try unhexOpt(arena, c.hostname),
                 .app_name = try unhexOpt(arena, c.app_name),
@@ -208,7 +208,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
             } else {
                 try emitter.sendMessage(.{
                     .message = try unhex(arena, c.message),
-                    .priority = if (c.priority) |p| @enumFromInt(p) else null,
+                    .priority = if (c.priority) |p| @fromBackingInt(@intCast(p)) else null,
                     .identifier = try unhexOpt(arena, c.identifier),
                     .fields = try journalFields(arena, c.fields),
                 });
@@ -226,8 +226,8 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
             try s.write("");
         } else {
             const m: syslog.bsd.Message = .{
-                .facility = @enumFromInt(c.facility),
-                .severity = @enumFromInt(c.severity),
+                .facility = @fromBackingInt(@intCast(c.facility)),
+                .severity = @fromBackingInt(@intCast(c.severity)),
                 .timestamp = timestamp(c.ts),
                 .hostname = try unhexOpt(arena, c.hostname),
                 .tag = try unhex(arena, c.tag),

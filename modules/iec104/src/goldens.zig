@@ -549,7 +549,7 @@ test "goldens: the error causes of transmission the peer generated" {
         try testing.expectError(error.UnsupportedTypeId, asdu.decode(f.asdu, asdu.default_params));
         // The data unit identifier itself is still readable.
         const h = try asdu.decodeHeader(f.asdu, asdu.default_params);
-        try testing.expectEqual(@as(u8, 200), @intFromEnum(h.type_id));
+        try testing.expectEqual(@as(u8, 200), @backingInt(h.type_id));
         try testing.expectEqual(asdu.Cot.activation, h.cause.cot);
     }
 }
@@ -563,7 +563,7 @@ test "goldens: the capture covers the type ids this module claims to support" {
         const f = try apci.decode(raw);
         if (f.control != .i) continue;
         const h = try asdu.decodeHeader(f.asdu, asdu.default_params);
-        try seen.put(@intFromEnum(h.type_id), {});
+        try seen.put(@backingInt(h.type_id), {});
     }
     // Monitoring, control and system types all appear in the capture.
     const must = [_]asdu.TypeId{
@@ -574,8 +574,8 @@ test "goldens: the capture covers the type ids this module claims to support" {
         .c_rd_na_1, .c_cs_na_1, .c_ts_ta_1,
     };
     for (must) |t| {
-        if (!seen.contains(@intFromEnum(t))) {
-            std.debug.print("type id {d} missing from the capture\n", .{@intFromEnum(t)});
+        if (!seen.contains(@backingInt(t))) {
+            std.debug.print("type id {d} missing from the capture\n", .{@backingInt(t)});
             return error.TestUnexpectedResult;
         }
     }
@@ -923,7 +923,7 @@ test "live-derived: the frames a real controlling station sent before its t1 fir
     const obj = (try it.next()).?;
     try testing.expectEqual(@as(u32, 0), obj.ioa);
     // QOI 20 = station interrogation (global).
-    try testing.expectEqual(@as(u8, 20), @intFromEnum(obj.element.qoi));
+    try testing.expectEqual(@as(u8, 20), @backingInt(obj.element.qoi));
 }
 
 // ── the global (broadcast) common address 0xFFFF, captured live ─────────────

@@ -837,7 +837,7 @@ const ClientMark = fz.Marker(enum {
 });
 
 pub fn fuzzClient(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
-    const conf: FuzzConf = if (S == fz.fuzz_driver.Rng) @enumFromInt(src.valueRangeAtMost(u8, 0, 3)) else .plain;
+    const conf: FuzzConf = if (S == fz.fuzz_driver.Rng) @fromBackingInt(@intCast(src.valueRangeAtMost(u8, 0, 3))) else .plain;
     const script: []const []const u8 = switch (conf) {
         .plain => &fuzz_replies.plain,
         .tls_auth => &fuzz_replies.tls_auth,

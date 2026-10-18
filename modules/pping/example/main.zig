@@ -62,7 +62,7 @@ pub fn main() !void {
     // so a caller can drive `TsTable` below the `observe` seam. Filling a
     // direction's table past `capacity` names its own error rather than
     // silently growing or overwriting.
-    const dir_table = &est.tables[@intFromEnum(pping.Direction.a_to_b)];
+    const dir_table = &est.tables[@backingInt(pping.Direction.a_to_b)];
     var filled: usize = 0;
     var tsval: u32 = 1000;
     while (true) : (tsval += 1) {

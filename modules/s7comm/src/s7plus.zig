@@ -128,7 +128,7 @@ pub const Frame = struct {
 pub fn decode(bytes: []const u8) Error!Frame {
     if (bytes.len < header_len) return error.ShortFrame;
     if (bytes[0] != protocol_id) return error.BadProtocolId;
-    const pt: PduType = @enumFromInt(bytes[1]);
+    const pt: PduType = @fromBackingInt(@intCast(bytes[1]));
     switch (pt) {
         .connect, .data, .data_fw3, .keepalive => {},
         _ => return error.UnknownPduType,
@@ -145,7 +145,7 @@ pub fn decode(bytes: []const u8) Error!Frame {
         // The trailer is the last four octets; anything between the data and it
         // is the integrity part.
         const trailer = rest[rest.len - trailer_len ..];
-        if (trailer[0] != protocol_id or trailer[1] != @intFromEnum(pt) or
+        if (trailer[0] != protocol_id or trailer[1] != @backingInt(pt) or
             trailer[2] != 0 or trailer[3] != 0) return error.BadTrailer;
         integrity = rest[0 .. rest.len - trailer_len];
         if (pt.hasIntegrity()) {
@@ -182,7 +182,7 @@ pub fn encode(pdu_type: PduType, data: []const u8, integrity: []const u8, out: [
     if (out.len < need) return error.BufferTooSmall;
 
     out[0] = protocol_id;
-    out[1] = @intFromEnum(pdu_type);
+    out[1] = @backingInt(pdu_type);
     out[2] = @intCast((data.len >> 8) & 0xff);
     out[3] = @intCast(data.len & 0xff);
     var w: usize = header_len;
@@ -192,7 +192,7 @@ pub fn encode(pdu_type: PduType, data: []const u8, integrity: []const u8, out: [
         @memcpy(out[w..][0..integrity.len], integrity);
         w += integrity.len;
         out[w] = protocol_id;
-        out[w + 1] = @intFromEnum(pdu_type);
+        out[w + 1] = @backingInt(pdu_type);
         out[w + 2] = 0;
         out[w + 3] = 0;
         w += trailer_len;

@@ -474,9 +474,9 @@ test "the multiple service packet's offsets are relative to the count field" {
     const outer = try cip.Request.decode(env.list.dataItem().?.data);
     const us = try connmgr.UnconnectedSend.decode(outer.data);
     const inner = try cip.Request.decode(us.embedded);
-    try testing.expectEqual(@intFromEnum(cip.Service.multiple_service_packet), inner.service);
+    try testing.expectEqual(@backingInt(cip.Service.multiple_service_packet), inner.service);
     try testing.expectEqual(
-        @as(?u32, @intFromEnum(cip.ClassCode.message_router)),
+        @as(?u32, @backingInt(cip.ClassCode.message_router)),
         try inner.classCode(),
     );
     const ms = try cip.MultipleService.decode(inner.data);
@@ -495,7 +495,7 @@ test "the multiple service packet's offsets are relative to the count field" {
     var storage2: [4]cpf.Item = undefined;
     const rep_env = try cpf.decodeEnvelope(rep_msg.data, &storage2);
     const rep = try cip.Reply.decode(rep_env.list.dataItem().?.data);
-    try testing.expectEqual(@intFromEnum(cip.Service.multiple_service_packet), rep.service);
+    try testing.expectEqual(@backingInt(cip.Service.multiple_service_packet), rep.service);
     const rms = try cip.MultipleService.decode(rep.data);
     try testing.expectEqual(@as(usize, 3), rms.count);
     const want_types = [_]types.DataType{ .int, .dint, .real };
@@ -595,7 +595,7 @@ test "the forward open handshake and the connection it opens" {
     // Route, then the message router at the far end.
     try testing.expectEqual(@as(usize, 3), try epath.countSegments(fo.connection_path));
     try testing.expectEqual(
-        @as(?u32, @intFromEnum(cip.ClassCode.message_router)),
+        @as(?u32, @backingInt(cip.ClassCode.message_router)),
         try epath.findLogical(fo.connection_path, .class),
     );
 
@@ -677,8 +677,8 @@ test "the identity object answers Get_Attributes_All and Get_Attribute_Single" {
     const env = try cpf.decodeEnvelope(msg.data, &storage);
     // This stack sends no Unconnected_Send at all — the CIP message is bare.
     const req = try cip.Request.decode(env.list.dataItem().?.data);
-    try testing.expectEqual(@intFromEnum(cip.Service.get_attributes_all), req.service);
-    try testing.expectEqual(@as(?u32, @intFromEnum(cip.ClassCode.identity)), try req.classCode());
+    try testing.expectEqual(@backingInt(cip.Service.get_attributes_all), req.service);
+    try testing.expectEqual(@as(?u32, @backingInt(cip.ClassCode.identity)), try req.classCode());
     // …and it asks for a ten-second encapsulation timeout where cpppo asks 0.
     try testing.expectEqual(@as(u16, 10), env.timeout);
 
@@ -720,7 +720,7 @@ test "error replies arrive at two different layers" {
     var storage: [4]cpf.Item = undefined;
     const env = try cpf.decodeEnvelope(cip_err.data, &storage);
     const rep = try cip.Reply.decode(env.list.dataItem().?.data);
-    try testing.expectEqual(@intFromEnum(cip.Service.get_attribute_single), rep.service);
+    try testing.expectEqual(@backingInt(cip.Service.get_attribute_single), rep.service);
     try testing.expectEqual(cip.GeneralStatus.service_not_supported, rep.general_status);
     try testing.expectEqual(@as(usize, 0), rep.additional_status.len);
     try testing.expectEqual(@as(usize, 0), rep.data.len);
@@ -762,7 +762,7 @@ test "a legacy command survives a decode without being understood" {
     var buf: [max_frame_len]u8 = undefined;
     const msg = try decodeNamed("legacy command 0x0001 request", &buf);
     try testing.expect(!msg.command.isKnown());
-    try testing.expectEqual(@as(u16, 1), @intFromEnum(msg.command));
+    try testing.expectEqual(@as(u16, 1), @backingInt(msg.command));
     var buf2: [max_frame_len]u8 = undefined;
     const rep = try decodeNamed("legacy command 0x0001 reply", &buf2);
     try testing.expect(rep.status.isSuccess());
@@ -770,7 +770,7 @@ test "a legacy command survives a decode without being understood" {
     var storage: [4]cpf.Item = undefined;
     const list = try cpf.decode(rep.data, &storage);
     try testing.expectEqual(@as(usize, 1), list.items.len);
-    try testing.expectEqual(@as(u16, 1), @intFromEnum(list.items[0].type_id));
+    try testing.expectEqual(@as(u16, 1), @backingInt(list.items[0].type_id));
 }
 
 // ── coverage: the table must not silently rot ──────────────────────────────
@@ -824,7 +824,7 @@ test "the golden table covers every shape this module claims to handle" {
     var saw_sstring = false;
 
     for (table) |g| {
-        saw_both_sources[@intFromEnum(g.source)] = true;
+        saw_both_sources[@backingInt(g.source)] = true;
         if (g.link == .udp) saw_udp = true;
         const wire = try bytesOf(g, &buf);
         const msg = try encap.decode(wire);
@@ -874,9 +874,9 @@ test "the golden table covers every shape this module claims to handle" {
                 }
             }
             switch (req.service) {
-                @intFromEnum(cip.Service.multiple_service_packet) => saw_multiple = true,
-                @intFromEnum(cip.Service.get_attributes_all) => saw_get_all = true,
-                @intFromEnum(cip.Service.get_attribute_single) => saw_get_single = true,
+                @backingInt(cip.Service.multiple_service_packet) => saw_multiple = true,
+                @backingInt(cip.Service.get_attributes_all) => saw_get_all = true,
+                @backingInt(cip.Service.get_attribute_single) => saw_get_single = true,
                 cip.LogixService.read_tag => saw_read_tag = true,
                 cip.LogixService.write_tag => saw_write_tag = true,
                 cip.LogixService.read_tag_fragmented => saw_read_frag = true,
@@ -887,7 +887,7 @@ test "the golden table covers every shape this module claims to handle" {
             const rep = cip.Reply.decode(body) catch continue;
             if (!rep.general_status.isSuccess()) saw_cip_error = true;
             if (rep.general_status.hasData() and rep.data.len >= 2) {
-                if (rep.service == @intFromEnum(cip.Service.multiple_service_packet)) {
+                if (rep.service == @backingInt(cip.Service.multiple_service_packet)) {
                     // The batched replies are where the type variety lives.
                     const ms = cip.MultipleService.decode(rep.data) catch continue;
                     var i: usize = 0;

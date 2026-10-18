@@ -140,7 +140,7 @@ const Chunked = struct {
     fn streamFn(r: *Reader, w: *Writer, limit: std.Io.Limit) Reader.StreamError!usize {
         const c: *Chunked = @alignCast(@fieldParentPtr("reader", r));
         if (c.pos == c.src.len) return error.EndOfStream;
-        const want = @min(@min(chunk_len, c.src.len - c.pos), @intFromEnum(limit));
+        const want = @min(@min(chunk_len, c.src.len - c.pos), @backingInt(limit));
         const dest = limit.slice(try w.writableSliceGreedy(1));
         const n = @min(want, dest.len);
         @memcpy(dest[0..n], c.src[c.pos..][0..n]);
@@ -293,7 +293,7 @@ test "replay grpcio: a failing call arrives as a real Trailers-Only response" {
     defer failure.deinit(gpa);
     const err = grpc.unary(EchoRequest, EchoReply, &fx.ch, "/echo.Echo/Fail", .{
         .text = detail,
-        .count = @intFromEnum(grpc.Status.permission_denied),
+        .count = @backingInt(grpc.Status.permission_denied),
     }, .{ .failure = &failure });
 
     try testing.expectError(error.PermissionDenied, err);
@@ -310,7 +310,7 @@ test "replay grpcio: a Trailers-Only response has no trailer section at all" {
     defer call.deinit();
     const req = try pb.encodeAlloc(gpa, EchoRequest{
         .text = "nope",
-        .count = @intFromEnum(grpc.Status.not_found),
+        .count = @backingInt(grpc.Status.not_found),
     }, .{});
     defer gpa.free(req);
     try call.sendMessage(req, true);
@@ -622,7 +622,7 @@ fn srvBidi(s: *M.Stream) anyerror!void {
 
 fn srvFail(c: *server.Call, req: EchoRequest) anyerror!EchoReply {
     try c.setTrailingMetadata(.{ .name = "x-why", .value = "because" });
-    return c.fail(@enumFromInt(@as(u32, @intCast(req.count))), req.text);
+    return c.fail(@fromBackingInt(@intCast(@as(u32, @intCast(req.count)))), req.text);
 }
 
 fn srvStreamFail(s: *M.Stream, req: EchoRequest) anyerror!void {

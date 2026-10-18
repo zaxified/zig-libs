@@ -276,12 +276,12 @@ pub const Diq = struct {
     quality: Quality = .{},
 
     pub fn toByte(self: Diq) u8 {
-        return @as(u8, @intFromEnum(self.state)) | (self.quality.toByte() & ~Quality.ov_bit);
+        return @as(u8, @backingInt(self.state)) | (self.quality.toByte() & ~Quality.ov_bit);
     }
 
     pub fn fromByte(b: u8) Diq {
         return .{
-            .state = @enumFromInt(@as(u2, @truncate(b))),
+            .state = @fromBackingInt(@intCast(@as(u2, @truncate(b)))),
             .quality = Quality.fromByte(b & ~@as(u8, 0x03)),
         };
     }
@@ -384,15 +384,15 @@ pub const Sco = struct {
 
     pub fn toByte(self: Sco) u8 {
         return (if (self.on) @as(u8, 0x01) else 0) |
-            (@as(u8, @intFromEnum(self.qualifier)) << 2) |
-            (@as(u8, @intFromEnum(self.select)) << 7);
+            (@as(u8, @backingInt(self.qualifier)) << 2) |
+            (@as(u8, @backingInt(self.select)) << 7);
     }
 
     pub fn fromByte(b: u8) Sco {
         return .{
             .on = b & 0x01 != 0,
-            .qualifier = @enumFromInt(@as(u5, @truncate(b >> 2))),
-            .select = @enumFromInt(@as(u1, @truncate(b >> 7))),
+            .qualifier = @fromBackingInt(@intCast(@as(u5, @truncate(b >> 2)))),
+            .select = @fromBackingInt(@intCast(@as(u1, @truncate(b >> 7)))),
         };
     }
 };
@@ -404,16 +404,16 @@ pub const Dco = struct {
     select: SelectExecute = .execute,
 
     pub fn toByte(self: Dco) u8 {
-        return @as(u8, @intFromEnum(self.state)) |
-            (@as(u8, @intFromEnum(self.qualifier)) << 2) |
-            (@as(u8, @intFromEnum(self.select)) << 7);
+        return @as(u8, @backingInt(self.state)) |
+            (@as(u8, @backingInt(self.qualifier)) << 2) |
+            (@as(u8, @backingInt(self.select)) << 7);
     }
 
     pub fn fromByte(b: u8) Dco {
         return .{
-            .state = @enumFromInt(@as(u2, @truncate(b))),
-            .qualifier = @enumFromInt(@as(u5, @truncate(b >> 2))),
-            .select = @enumFromInt(@as(u1, @truncate(b >> 7))),
+            .state = @fromBackingInt(@intCast(@as(u2, @truncate(b)))),
+            .qualifier = @fromBackingInt(@intCast(@as(u5, @truncate(b >> 2)))),
+            .select = @fromBackingInt(@intCast(@as(u1, @truncate(b >> 7)))),
         };
     }
 };
@@ -433,16 +433,16 @@ pub const Rco = struct {
     select: SelectExecute = .execute,
 
     pub fn toByte(self: Rco) u8 {
-        return @as(u8, @intFromEnum(self.step)) |
-            (@as(u8, @intFromEnum(self.qualifier)) << 2) |
-            (@as(u8, @intFromEnum(self.select)) << 7);
+        return @as(u8, @backingInt(self.step)) |
+            (@as(u8, @backingInt(self.qualifier)) << 2) |
+            (@as(u8, @backingInt(self.select)) << 7);
     }
 
     pub fn fromByte(b: u8) Rco {
         return .{
-            .step = @enumFromInt(@as(u2, @truncate(b))),
-            .qualifier = @enumFromInt(@as(u5, @truncate(b >> 2))),
-            .select = @enumFromInt(@as(u1, @truncate(b >> 7))),
+            .step = @fromBackingInt(@intCast(@as(u2, @truncate(b)))),
+            .qualifier = @fromBackingInt(@intCast(@as(u5, @truncate(b >> 2)))),
+            .select = @fromBackingInt(@intCast(@as(u1, @truncate(b >> 7)))),
         };
     }
 };
@@ -454,11 +454,11 @@ pub const Qos = struct {
     select: SelectExecute = .execute,
 
     pub fn toByte(self: Qos) u8 {
-        return @as(u8, self.ql) | (@as(u8, @intFromEnum(self.select)) << 7);
+        return @as(u8, self.ql) | (@as(u8, @backingInt(self.select)) << 7);
     }
 
     pub fn fromByte(b: u8) Qos {
-        return .{ .ql = @truncate(b), .select = @enumFromInt(@as(u1, @truncate(b >> 7))) };
+        return .{ .ql = @truncate(b), .select = @fromBackingInt(@intCast(@as(u1, @truncate(b >> 7)))) };
     }
 };
 
@@ -476,7 +476,7 @@ pub const Qoi = enum(u8) {
     /// `asdu.Cot.interrogatedByGroup` for why.
     pub fn group(n: u8) ?Qoi {
         if (n < 1 or n > 16) return null;
-        return @enumFromInt(20 + @as(u8, n));
+        return @fromBackingInt(@intCast(20 + @as(u8, n)));
     }
 };
 
@@ -509,13 +509,13 @@ pub const Qcc = struct {
     freeze: CounterFreeze = .read,
 
     pub fn toByte(self: Qcc) u8 {
-        return @as(u8, @intFromEnum(self.request)) | (@as(u8, @intFromEnum(self.freeze)) << 6);
+        return @as(u8, @backingInt(self.request)) | (@as(u8, @backingInt(self.freeze)) << 6);
     }
 
     pub fn fromByte(b: u8) Qcc {
         return .{
-            .request = @enumFromInt(@as(u6, @truncate(b))),
-            .freeze = @enumFromInt(@as(u2, @truncate(b >> 6))),
+            .request = @fromBackingInt(@intCast(@as(u6, @truncate(b)))),
+            .freeze = @fromBackingInt(@intCast(@as(u2, @truncate(b >> 6)))),
         };
     }
 };
@@ -754,7 +754,7 @@ test "QCC packs the request in the low six bits and the freeze above" {
     const q = Qcc.fromByte(0x85);
     try testing.expectEqual(CounterRequest.general, q.request);
     try testing.expectEqual(CounterFreeze.freeze_reset, q.freeze);
-    try testing.expectEqual(Qoi.station, @as(Qoi, @enumFromInt(20)));
+    try testing.expectEqual(Qoi.station, @as(Qoi, @fromBackingInt(@intCast(20))));
     try testing.expectEqual(Qoi.group_1, Qoi.group(1).?);
     try testing.expectEqual(Qoi.group_16, Qoi.group(16).?);
 }

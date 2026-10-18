@@ -130,14 +130,14 @@ pub const TagBinding = struct {
     /// 13-14. Bit 15 (structure) and bit 12 (system tag) are always clear
     /// here — see `isEnumerable` for why there is no structure case.
     pub fn symbolType(self: TagBinding) u16 {
-        const code: u16 = @truncate(@intFromEnum(self.type));
+        const code: u16 = @truncate(@backingInt(self.type));
         return (code & 0x00FF) | (@as(u16, self.dimensionCount()) << 13);
     }
 };
 
 pub const Config = struct {
     vendor_id: u16 = 0x1234,
-    device_type: u16 = @intFromEnum(encap.DeviceType.programmable_logic_controller),
+    device_type: u16 = @backingInt(encap.DeviceType.programmable_logic_controller),
     product_code: u16 = 1,
     revision_major: u8 = 1,
     revision_minor: u8 = 0,
@@ -371,10 +371,10 @@ pub const Adapter = struct {
             return self.connectionManager(req, out, depth);
         }
         switch (req.service) {
-            @intFromEnum(cip.Service.multiple_service_packet) => return self.multipleService(req, out, depth),
-            @intFromEnum(cip.Service.get_attributes_all) => return self.getAttributesAll(req, class, out),
-            @intFromEnum(cip.Service.get_attribute_single) => return self.getAttributeSingle(req, class, out),
-            @intFromEnum(cip.Service.reset) => {
+            @backingInt(cip.Service.multiple_service_packet) => return self.multipleService(req, out, depth),
+            @backingInt(cip.Service.get_attributes_all) => return self.getAttributesAll(req, class, out),
+            @backingInt(cip.Service.get_attribute_single) => return self.getAttributeSingle(req, class, out),
+            @backingInt(cip.Service.reset) => {
                 if (!self.cfg.allow_reset) return errorReply(req.service, .privilege_violation, out);
                 if (out.len < 4) return error.BufferTooSmall;
                 self.reset_requested = true;
@@ -389,7 +389,7 @@ pub const Adapter = struct {
             // are: 0x55 means `Get_Instance_Attribute_List` only because the
             // path said Symbol Object. On any other class it is unclaimed.
             cip.LogixService.get_instance_attribute_list => {
-                if (class != null and class.? == @intFromEnum(cip.ClassCode.symbol)) {
+                if (class != null and class.? == @backingInt(cip.ClassCode.symbol)) {
                     return self.symbolInstanceList(req, out);
                 }
                 return errorReply(req.service, .service_not_supported, out);
@@ -428,7 +428,7 @@ pub const Adapter = struct {
                     return extendedErrorReply(
                         req.service,
                         .connection_failure,
-                        @intFromEnum(connmgr.ExtendedStatus.connection_limit_reached),
+                        @backingInt(connmgr.ExtendedStatus.connection_limit_reached),
                         out,
                     );
                 const o_t = self.next_connection_id;
@@ -482,7 +482,7 @@ pub const Adapter = struct {
                     return extendedErrorReply(
                         req.service,
                         .connection_failure,
-                        @intFromEnum(connmgr.ExtendedStatus.connection_not_found),
+                        @backingInt(connmgr.ExtendedStatus.connection_not_found),
                         out,
                     );
                 }
@@ -591,10 +591,10 @@ pub const Adapter = struct {
         class: ?u32,
         out: []u8,
     ) Error![]const u8 {
-        if (class != null and class.? == @intFromEnum(cip.ClassCode.program_name)) {
+        if (class != null and class.? == @backingInt(cip.ClassCode.program_name)) {
             return self.programName(req, out);
         }
-        if (class == null or class.? != @intFromEnum(cip.ClassCode.identity)) {
+        if (class == null or class.? != @backingInt(cip.ClassCode.identity)) {
             return errorReply(req.service, .path_destination_unknown, out);
         }
         self.identity_requests += 1;
@@ -625,7 +625,7 @@ pub const Adapter = struct {
         class: ?u32,
         out: []u8,
     ) Error![]const u8 {
-        if (class == null or class.? != @intFromEnum(cip.ClassCode.identity)) {
+        if (class == null or class.? != @backingInt(cip.ClassCode.identity)) {
             return errorReply(req.service, .path_destination_unknown, out);
         }
         const attr = (epath.findLogical(req.path, .attribute) catch null) orelse
@@ -664,7 +664,7 @@ pub const Adapter = struct {
                 break :blk body[0 .. 1 + self.cfg.product_name.len];
             },
             8 => blk: {
-                body[0] = @intFromEnum(self.cfg.state);
+                body[0] = @backingInt(self.cfg.state);
                 break :blk body[0..1];
             },
             else => return errorReply(req.service, .attribute_not_supported, out),
@@ -870,7 +870,7 @@ pub const Adapter = struct {
             return null;
         }
         const class = (epath.findLogical(path, .class) catch null) orelse return null;
-        if (class != @intFromEnum(cip.ClassCode.symbol)) return null;
+        if (class != @backingInt(cip.ClassCode.symbol)) return null;
         const id = (epath.findLogical(path, .instance) catch null) orelse return null;
         return self.tagByInstance(id);
     }

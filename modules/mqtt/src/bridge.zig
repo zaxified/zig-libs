@@ -507,7 +507,7 @@ pub const Bridge = struct {
     }
 
     fn minQos(a: packet.QoS, c: packet.QoS) packet.QoS {
-        return if (@intFromEnum(a) < @intFromEnum(c)) a else c;
+        return if (@backingInt(a) < @backingInt(c)) a else c;
     }
 
     fn join(buf: []u8, a: []const u8, c: []const u8) Error![]const u8 {

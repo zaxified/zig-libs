@@ -88,7 +88,7 @@ fn lookupOpcode(name: []const u8) ?u8 {
         @memcpy(buf[3 .. 3 + name.len], name);
         canonical = buf[0 .. 3 + name.len];
     }
-    if (std.meta.stringToEnum(Opcode, canonical)) |e| return @intFromEnum(e);
+    if (std.meta.stringToEnum(Opcode, canonical)) |e| return @backingInt(e);
     return null;
 }
 

@@ -867,13 +867,13 @@ test "netem input validation happens before any allocation" {
 test "errno mapping is netlink's (the tc-local copy is gone)" {
     // The v1 module carried its own errnoToError; the shared one must keep
     // the exact same mappings for every code tc can provoke.
-    try testing.expectEqual(error.AccessDenied, netlink.writeErrorFromCode(-@as(i32, @intFromEnum(linux.E.PERM))));
-    try testing.expectEqual(error.Exists, netlink.writeErrorFromCode(-@as(i32, @intFromEnum(linux.E.EXIST))));
-    try testing.expectEqual(error.NotFound, netlink.writeErrorFromCode(-@as(i32, @intFromEnum(linux.E.NOENT))));
-    try testing.expectEqual(error.NoSuchDevice, netlink.writeErrorFromCode(-@as(i32, @intFromEnum(linux.E.NODEV))));
-    try testing.expectEqual(error.InvalidRequest, netlink.writeErrorFromCode(-@as(i32, @intFromEnum(linux.E.INVAL))));
-    try testing.expectEqual(error.NotSupported, netlink.writeErrorFromCode(-@as(i32, @intFromEnum(linux.E.OPNOTSUPP))));
-    try testing.expectEqual(error.SystemResources, netlink.writeErrorFromCode(-@as(i32, @intFromEnum(linux.E.NOBUFS))));
+    try testing.expectEqual(error.AccessDenied, netlink.writeErrorFromCode(-@as(i32, @backingInt(linux.E.PERM))));
+    try testing.expectEqual(error.Exists, netlink.writeErrorFromCode(-@as(i32, @backingInt(linux.E.EXIST))));
+    try testing.expectEqual(error.NotFound, netlink.writeErrorFromCode(-@as(i32, @backingInt(linux.E.NOENT))));
+    try testing.expectEqual(error.NoSuchDevice, netlink.writeErrorFromCode(-@as(i32, @backingInt(linux.E.NODEV))));
+    try testing.expectEqual(error.InvalidRequest, netlink.writeErrorFromCode(-@as(i32, @backingInt(linux.E.INVAL))));
+    try testing.expectEqual(error.NotSupported, netlink.writeErrorFromCode(-@as(i32, @backingInt(linux.E.OPNOTSUPP))));
+    try testing.expectEqual(error.SystemResources, netlink.writeErrorFromCode(-@as(i32, @backingInt(linux.E.NOBUFS))));
     try testing.expectEqual(error.Unexpected, netlink.writeErrorFromCode(-9999));
     try testing.expectEqual(error.Unexpected, netlink.writeErrorFromCode(0));
     try testing.expectEqual(error.Unexpected, netlink.writeErrorFromCode(std.math.minInt(i32)));
@@ -985,7 +985,7 @@ const DumpCorpus = struct {
         var err: std.ArrayList(u8) = .empty;
         {
             var body: [4]u8 = undefined;
-            std.mem.writeInt(i32, &body, -@as(i32, @intFromEnum(linux.E.PERM)), native_endian);
+            std.mem.writeInt(i32, &body, -@as(i32, @backingInt(linux.E.PERM)), native_endian);
             try appendControl(gpa, &err, codec.NLMSG_ERROR, &body);
         }
         self.push(err.items);

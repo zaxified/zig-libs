@@ -424,7 +424,7 @@ test "live: LINKINFO_GET (unprivileged)" {
     if (li.port) |p| {
         // Every value the kernel can send is representable, including the two
         // sentinels at the top of the range.
-        const raw: u8 = @intFromEnum(p);
+        const raw: u8 = @backingInt(p);
         try testing.expect(raw <= 5 or raw == 0xef or raw == 0xff);
     }
 }
@@ -643,7 +643,7 @@ test "live: MODULE_GET / MODULE_EEPROM_GET (skips without a pluggable module)" {
         => return skip("MODULE_GET (no pluggable transceiver on this device)"),
         else => return e,
     };
-    if (info.power_mode_policy) |p| try testing.expect(@intFromEnum(p) != 0);
+    if (info.power_mode_policy) |p| try testing.expect(@backingInt(p) != 0);
 
     var eeprom = et.moduleEeprom(dev, .{ .length = 1, .offset = 0 }) catch |e| switch (e) {
         error.NotSupported, error.AccessDenied, error.InvalidRequest => return skip("MODULE_EEPROM_GET"),

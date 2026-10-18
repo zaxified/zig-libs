@@ -722,7 +722,7 @@ fn serverOnlyFunctions(client: *modbus.Client, unit: u8) bool {
     // the single function-code byte, and the reply is byte count, id bytes,
     // run indicator, then device-specific data.
     {
-        const request = [_]u8{@intFromEnum(modbus.FunctionCode.report_slave_id)};
+        const request = [_]u8{@backingInt(modbus.FunctionCode.report_slave_id)};
         const reply = rawExchange(client, unit, &request, &reply_buf) catch |err|
             return stepFailed("FC 11 report slave id", err);
         // `pdu.checkFunction` IS reusable here: `FunctionCode` names 0x11, so
@@ -743,7 +743,7 @@ fn serverOnlyFunctions(client: *modbus.Client, unit: u8) bool {
     // one-byte answer. Eight vendor-defined bits, historically the coils a
     // device wanted a master to see without a full poll.
     {
-        const request = [_]u8{@intFromEnum(modbus.FunctionCode.read_exception_status)};
+        const request = [_]u8{@backingInt(modbus.FunctionCode.read_exception_status)};
         const reply = rawExchange(client, unit, &request, &reply_buf) catch |err|
             return stepFailed("FC 07 read exception status", err);
         const body = modbus.pdu.checkFunction(reply, .read_exception_status) catch |err|
@@ -756,7 +756,7 @@ fn serverOnlyFunctions(client: *modbus.Client, unit: u8) bool {
     // the master can use to prove the link without touching any point.
     {
         var request: [5]u8 = undefined;
-        request[0] = @intFromEnum(modbus.FunctionCode.diagnostics);
+        request[0] = @backingInt(modbus.FunctionCode.diagnostics);
         std.mem.writeInt(u16, request[1..3], 0x0000, .big); // return query data
         std.mem.writeInt(u16, request[3..5], 0xA537, .big); // the echoed payload
         const reply = rawExchange(client, unit, &request, &reply_buf) catch |err|

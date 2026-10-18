@@ -179,7 +179,7 @@ fn parseList(ctx: *Ctx, nest_bytes: []const u8, depth: usize) ParseError![]Resou
             uapi.ATTR.RESOURCE_SIZE_MIN => r.size_min = try uapi.asU64(a),
             uapi.ATTR.RESOURCE_SIZE_MAX => r.size_max = try uapi.asU64(a),
             uapi.ATTR.RESOURCE_SIZE_GRAN => r.size_gran = try uapi.asU64(a),
-            uapi.ATTR.RESOURCE_UNIT => r.unit = @enumFromInt(try a.asU8()),
+            uapi.ATTR.RESOURCE_UNIT => r.unit = @fromBackingInt(@intCast(try a.asU8())),
             uapi.ATTR.RESOURCE_OCC => r.occ = try uapi.asU64(a),
             uapi.ATTR.RESOURCE_LIST => child_bytes = a.data,
             else => {},

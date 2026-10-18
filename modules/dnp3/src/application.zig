@@ -189,14 +189,14 @@ pub const response_header_len = 4;
 pub fn encodeRequestHeader(header: RequestHeader, out: []u8) EncodeError![]u8 {
     if (out.len < request_header_len) return error.BufferTooSmall;
     out[0] = header.control.toByte();
-    out[1] = @intFromEnum(header.function);
+    out[1] = @backingInt(header.function);
     return out[0..request_header_len];
 }
 
 pub fn decodeRequestHeader(bytes: []const u8) DecodeError!struct { header: RequestHeader, rest: []const u8 } {
     if (bytes.len < request_header_len) return error.ShortFragment;
     return .{
-        .header = .{ .control = AppControl.fromByte(bytes[0]), .function = @enumFromInt(bytes[1]) },
+        .header = .{ .control = AppControl.fromByte(bytes[0]), .function = @fromBackingInt(@intCast(bytes[1])) },
         .rest = bytes[request_header_len..],
     };
 }
@@ -204,7 +204,7 @@ pub fn decodeRequestHeader(bytes: []const u8) DecodeError!struct { header: Reque
 pub fn encodeResponseHeader(header: ResponseHeader, out: []u8) EncodeError![]u8 {
     if (out.len < response_header_len) return error.BufferTooSmall;
     out[0] = header.control.toByte();
-    out[1] = @intFromEnum(header.function);
+    out[1] = @backingInt(header.function);
     const iin_bytes = header.iin.toBytes();
     out[2] = iin_bytes[0];
     out[3] = iin_bytes[1];
@@ -216,7 +216,7 @@ pub fn decodeResponseHeader(bytes: []const u8) DecodeError!struct { header: Resp
     return .{
         .header = .{
             .control = AppControl.fromByte(bytes[0]),
-            .function = @enumFromInt(bytes[1]),
+            .function = @fromBackingInt(@intCast(bytes[1])),
             .iin = Iin.fromBytes(.{ bytes[2], bytes[3] }),
         },
         .rest = bytes[response_header_len..],
@@ -308,5 +308,5 @@ test "decode: short fragment is a typed error" {
 test "non-exhaustive FunctionCode decodes unknown wire bytes without erroring" {
     const decoded = try decodeRequestHeader(&.{ 0xC0, 0x77 });
     // 0x77 is not a named function code; the non-exhaustive enum still holds it.
-    try testing.expectEqual(@as(u8, 0x77), @intFromEnum(decoded.header.function));
+    try testing.expectEqual(@as(u8, 0x77), @backingInt(decoded.header.function));
 }

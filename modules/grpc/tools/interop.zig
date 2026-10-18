@@ -566,7 +566,7 @@ fn forward(cfg: Config) !void {
         defer failure.deinit(gpa);
         const err = grpc.unary(EchoRequest, EchoReply, &s.ch, "/echo.Echo/Fail", .{
             .text = detail,
-            .count = @intFromEnum(grpc.Status.permission_denied),
+            .count = @backingInt(grpc.Status.permission_denied),
         }, .{ .failure = &failure });
         expectTrue("fail", "error", err == error.PermissionDenied);
         expectTrue("fail", "status", failure.status == .permission_denied);
@@ -582,7 +582,7 @@ fn forward(cfg: Config) !void {
         defer call.deinit();
         const req = try pb.encodeAlloc(gpa, EchoRequest{
             .text = "nope",
-            .count = @intFromEnum(grpc.Status.not_found),
+            .count = @backingInt(grpc.Status.not_found),
         }, .{});
         defer gpa.free(req);
         try call.sendMessage(req, true);
@@ -831,7 +831,7 @@ fn srvBidi(s: *M.Stream) anyerror!void {
 /// that in the same field block.
 fn srvFail(c: *grpc.ServerCall, req: EchoRequest) anyerror!EchoReply {
     try c.setTrailingMetadata(.{ .name = "x-why", .value = "because" });
-    return c.fail(@enumFromInt(@as(u32, @intCast(req.count))), req.text);
+    return c.fail(@fromBackingInt(@intCast(@as(u32, @intCast(req.count)))), req.text);
 }
 
 fn srvStreamFail(s: *M.Stream, req: EchoRequest) anyerror!void {

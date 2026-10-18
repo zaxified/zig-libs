@@ -255,12 +255,12 @@ pub const Item = struct {
         out[0] = var_spec;
         out[1] = s7any_spec_len;
         out[2] = syntax_s7any;
-        out[3] = @intFromEnum(self.transport_size);
+        out[3] = @backingInt(self.transport_size);
         out[4] = @intCast(self.count >> 8);
         out[5] = @intCast(self.count & 0xFF);
         out[6] = @intCast(self.db_number >> 8);
         out[7] = @intCast(self.db_number & 0xFF);
-        out[8] = @intFromEnum(self.area);
+        out[8] = @backingInt(self.area);
         out[9] = @intCast((self.address >> 16) & 0xFF);
         out[10] = @intCast((self.address >> 8) & 0xFF);
         out[11] = @intCast(self.address & 0xFF);
@@ -274,10 +274,10 @@ pub const Item = struct {
         if (bytes.len < item_len) return error.ShortItem;
         if (bytes[2] != syntax_s7any) return error.UnsupportedSyntaxId;
         return .{
-            .transport_size = @enumFromInt(bytes[3]),
+            .transport_size = @fromBackingInt(@intCast(bytes[3])),
             .count = (@as(u16, bytes[4]) << 8) | bytes[5],
             .db_number = (@as(u16, bytes[6]) << 8) | bytes[7],
-            .area = @enumFromInt(bytes[8]),
+            .area = @fromBackingInt(@intCast(bytes[8])),
             .address = (@as(u24, bytes[9]) << 16) | (@as(u24, bytes[10]) << 8) | bytes[11],
         };
     }
@@ -355,8 +355,8 @@ pub const DataItemIterator = struct {
         if (self.remaining == 0) return null;
         if (self.pos >= self.bytes.len) return error.ShortItem;
         if (self.pos + 4 > self.bytes.len) return error.ShortItem;
-        const rc: ReturnCode = @enumFromInt(self.bytes[self.pos]);
-        const ts: DataTransportSize = @enumFromInt(self.bytes[self.pos + 1]);
+        const rc: ReturnCode = @fromBackingInt(@intCast(self.bytes[self.pos]));
+        const ts: DataTransportSize = @fromBackingInt(@intCast(self.bytes[self.pos + 1]));
         const raw: u16 = (@as(u16, self.bytes[self.pos + 2]) << 8) | self.bytes[self.pos + 3];
         self.remaining -= 1;
         if (!self.request_mode and !rc.isSuccess()) {
@@ -406,8 +406,8 @@ pub const DataBlockWriter = struct {
         try self.padIfNeeded();
         const raw = try encodeLength(ts, payload.len);
         if (self.pos + 4 + payload.len > self.out.len) return error.BufferTooSmall;
-        self.out[self.pos] = @intFromEnum(rc);
-        self.out[self.pos + 1] = @intFromEnum(ts);
+        self.out[self.pos] = @backingInt(rc);
+        self.out[self.pos + 1] = @backingInt(ts);
         self.out[self.pos + 2] = @intCast(raw >> 8);
         self.out[self.pos + 3] = @intCast(raw & 0xFF);
         @memcpy(self.out[self.pos + 4 ..][0..payload.len], payload);
@@ -426,8 +426,8 @@ pub const DataBlockWriter = struct {
     pub fn addBit(self: *DataBlockWriter, value: bool) Error!void {
         try self.padIfNeeded();
         if (self.pos + 5 > self.out.len) return error.BufferTooSmall;
-        self.out[self.pos] = @intFromEnum(ReturnCode.success);
-        self.out[self.pos + 1] = @intFromEnum(DataTransportSize.bit);
+        self.out[self.pos] = @backingInt(ReturnCode.success);
+        self.out[self.pos + 1] = @backingInt(DataTransportSize.bit);
         self.out[self.pos + 2] = 0;
         self.out[self.pos + 3] = 1;
         self.out[self.pos + 4] = @intFromBool(value);
@@ -439,8 +439,8 @@ pub const DataBlockWriter = struct {
     pub fn addError(self: *DataBlockWriter, rc: ReturnCode, raw_length: u16) Error!void {
         try self.padIfNeeded();
         if (self.pos + 4 > self.out.len) return error.BufferTooSmall;
-        self.out[self.pos] = @intFromEnum(rc);
-        self.out[self.pos + 1] = @intFromEnum(DataTransportSize.null_size);
+        self.out[self.pos] = @backingInt(rc);
+        self.out[self.pos + 1] = @backingInt(DataTransportSize.null_size);
         self.out[self.pos + 2] = @intCast(raw_length >> 8);
         self.out[self.pos + 3] = @intCast(raw_length & 0xFF);
         self.pos += 4;
@@ -451,7 +451,7 @@ pub const DataBlockWriter = struct {
     /// is made of.
     pub fn addReturnCode(self: *DataBlockWriter, rc: ReturnCode) Error!void {
         if (self.pos + 1 > self.out.len) return error.BufferTooSmall;
-        self.out[self.pos] = @intFromEnum(rc);
+        self.out[self.pos] = @backingInt(rc);
         self.pos += 1;
         self.pending_pad = false;
     }
@@ -689,7 +689,7 @@ test "payloadBytes covers the element widths" {
     try testing.expectEqual(@as(u32, 1), (try Item.at(.db, 1, 0, 0, .bit, 1)).payloadBytes().?);
     try testing.expectEqual(@as(u32, 2), (try Item.at(.db, 1, 0, 0, .bit, 9)).payloadBytes().?);
     try testing.expectEqual(@as(u32, 4), (try Item.at(.counter, 0, 0, 0, .counter, 2)).payloadBytes().?);
-    try testing.expect((try Item.at(.db, 1, 0, 0, @enumFromInt(0x77), 1)).payloadBytes() == null);
+    try testing.expect((try Item.at(.db, 1, 0, 0, @fromBackingInt(@intCast(0x77)), 1)).payloadBytes() == null);
 }
 
 /// The corpus-entry format `Smith.slice` reads: a little-endian u32 length,

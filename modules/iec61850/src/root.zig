@@ -886,7 +886,7 @@ test "live: a real IEC 61850 client operating our control objects" {
 
         var cw = ber.Writer.init(&cf_storage[i]);
         // `ctlModel` is an enumerated integer on the wire.
-        try Emit.integer(&cw, @intFromEnum(models[i]));
+        try Emit.integer(&cw, @backingInt(models[i]));
         const cd = cw.done();
         std.mem.copyForwards(u8, cf_storage[i][0..cd.len], cd);
         vars[4 + i] = .{ .domain = ld, .item = cf_items[i], .storage = &cf_storage[i], .len = cd.len };
