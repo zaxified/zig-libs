@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-19** — **NO CONSUMER-VISIBLE CHANGE:** `tools/interop.zig`: `arena.dupeZ` (removed in Zig 0.17) -> `dupeSentinel(u8, raw, 0)`.
 - **2026-10-05** — **Anchoring: a real rsyslogd and a real systemd-journald judge every encoder and emitter**
   (`tools/rsyslog_oracle.py`, `tools/interop.zig`, `src/rsyslog_oracle_test.zig`, replay in `unix.zig`): 617 cases.
   rsyslogd 8.2512 (unconfined copy, `unshare -rn`) parses each RFC 5424 message from `buildDatagram` (UDP) and the

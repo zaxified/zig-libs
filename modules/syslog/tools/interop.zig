@@ -249,7 +249,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     try cwd.writeFile(io, .{ .sub_path = fresh_path, .data = "" });
     const rc = try python(io, arena, &env, &.{ "python3", script, "judge", cases_path, ours_path, fresh_path }, null);
     const raw = try cwd.readFileAlloc(io, fresh_path, arena, .limited(64 << 20));
-    var ast = try std.zig.Ast.parse(arena, try arena.dupeZ(u8, raw), .zig);
+    var ast = try std.zig.Ast.parse(arena, try arena.dupeSentinel(u8, raw, 0), .zig);
     if (ast.errors.len != 0) {
         std.debug.print("interop-syslog: the generated vectors do not parse as Zig\n", .{});
         return 1;

@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-19** — **NO CONSUMER-VISIBLE CHANGE:** `tools/interop.zig`: `arena.dupeZ` (removed in Zig 0.17) -> `dupeSentinel(u8, raw, 0)`.
 - **2026-10-09** — tests: deterministic fuzz driver `SNTP_FUZZ` over the existing harnesses.
 
 - **2026-10-05** — **Anchoring: a real chronyd, beevik/ntp and ntplib judge `query` and the codec**

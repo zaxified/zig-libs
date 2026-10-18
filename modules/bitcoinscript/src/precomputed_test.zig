@@ -154,7 +154,13 @@ fn verifyOneInputCost(gpa: std.mem.Allocator, n: usize, kind: Kind, use_pre: boo
     // so nothing has to be freed by hand.
     var run_arena = std.heap.ArenaAllocator.init(gpa);
     defer run_arena.deinit();
-    var fa: std.testing.FailingAllocator = .init(run_arena.allocator(), .{});
+    // `allocated_bytes` counts a request in full but an in-place grow only by
+    // its delta, so the total depends on whether the arena underneath happens
+    // to extend a buffer in place (zig 0.17: it does in some builds and not in
+    // others -- 1080 vs 1255 for the same script). `resize_fail_index = 0`
+    // refuses every resize/remap, so each growth is a fresh allocation and the
+    // count no longer depends on that implementation detail.
+    var fa: std.testing.FailingAllocator = .init(run_arena.allocator(), .{ .resize_fail_index = 0 });
 
     // The spend is expected to FAIL (bogus signature) — the sighash is
     // computed first, which is the cost under test.

@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-19** — **NO CONSUMER-VISIBLE CHANGE:** the ARMv8 run-time detection reads `std.elf.AT.HWCAP` (Zig 0.17 made `std.elf.AT` a per-OS namespace; `AT_HWCAP` is gone). Cross-built and run for aarch64-linux-musl under qemu.
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC/comments: std's `Crc32Iscsi` is `@"CRC-32/ISCSI"` in 0.17 with a hardware path on x86-64 `crc32` targets; the speed table is labelled as 0.16 std.
 
 - **2026-10-18** — Ported to Zig 0.17.0: tests: std oracle renamed `Crc32Iscsi` -> `@"CRC-32/ISCSI"`.

@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-19** — **NO CONSUMER-VISIBLE CHANGE:** the ARMv8 run-time detection reads `std.elf.AT.HWCAP` (Zig 0.17 made `std.elf.AT` a per-OS namespace; `AT_HWCAP` is gone). Cross-built and run for aarch64-linux-musl under qemu.
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC: 'no per-function target features' and codegen notes labelled as 0.16 measurements, not re-checked on 0.17; std CRC/memset facts updated for 0.17.0.
 - **2026-10-07** — **NO CONSUMER-VISIBLE CHANGE:** the test-only `ScriptSource` (the fuzz harness's cursor source) drops `pub` from its two methods; it was never reachable from outside, and the textual consumer-example trigger (CONVENTIONS.md §7.2) counted them as state methods.
 - **2026-10-07** — **NO CONSUMER-VISIBLE CHANGE:** the `testing.fuzz` harness

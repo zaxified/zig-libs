@@ -176,7 +176,7 @@ fn cpuidPclmul() bool {
 fn hwcapCrc32() bool {
     if (builtin.cpu.arch != .aarch64 or builtin.os.tag != .linux) return false;
     const hwcap_crc32: usize = 1 << 7; // arch/arm64/include/uapi/asm/hwcap.h
-    return std.os.linux.getauxval(std.elf.AT_HWCAP) & hwcap_crc32 != 0;
+    return std.os.linux.getauxval(std.elf.AT.HWCAP) & hwcap_crc32 != 0;
 }
 
 /// The CRC register after `bytes`, from register value `reg` — no pre- or

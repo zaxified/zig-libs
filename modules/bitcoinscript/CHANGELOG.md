@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-19** — **NO CONSUMER-VISIBLE CHANGE:** test only: the precomputed-cost test counts allocations through a `FailingAllocator` with `resize_fail_index = 0`, so `allocated_bytes` no longer depends on whether the arena below grows a buffer in place (it differed between Debug and ReleaseSafe on Zig 0.17: 1080 vs 1255 for the same taproot script-path spend).
 - **2026-10-18** — Ported to Zig 0.17.0. `ScriptFlags` reflection (`std.meta.fields` / `.fields`) moved to `@typeInfo(..).field_names` / `field_types` in flags.zig, verify.zig and four test files. No behaviour change.
 - **2026-10-10** — tests: deterministic fuzz driver `BITCOINSCRIPT_FUZZ` over the `verifyScript` and tapscript-leaf harnesses (generic over their choice source; the driver draws fresh or damaged-corpus octet scripts). The tapscript harness now also requires that a damaged control block is always refused. No code change.
 - **2026-10-08** — **NO CONSUMER-VISIBLE CHANGE:** tests follow bip340's out-param

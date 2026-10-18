@@ -187,7 +187,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         else => 1,
     };
     const raw = try cwd.readFileAlloc(io, fresh_path, arena, .limited(16 << 20));
-    var ast = try std.zig.Ast.parse(arena, try arena.dupeZ(u8, raw), .zig);
+    var ast = try std.zig.Ast.parse(arena, try arena.dupeSentinel(u8, raw, 0), .zig);
     if (ast.errors.len != 0) {
         std.debug.print("interop-sntp: the generated vectors do not parse as Zig\n", .{});
         return 1;
