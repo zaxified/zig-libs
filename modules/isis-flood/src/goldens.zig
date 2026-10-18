@@ -80,7 +80,7 @@ const testing = std.testing;
 const sys_local: [6]u8 = .{ 0, 0, 0, 0, 0, 0xA };
 
 fn up0() scheduler.InterfaceSet {
-    var s = scheduler.InterfaceSet.initEmpty();
+    var s = scheduler.InterfaceSet.empty;
     s.set(0);
     return s;
 }

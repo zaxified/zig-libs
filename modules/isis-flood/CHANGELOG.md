@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — Ported to Zig 0.17.0 (`IntegerBitSet.initEmpty()` -> `.empty`).
+
 - **2026-09-03** — Drift re-audit. **`emitCsnp` no longer binary-searches its
   window.** `isis-lsdb.summarise` was given an ascending, tail-truncating
   contract, together with the pagination protocol a caller should use; this

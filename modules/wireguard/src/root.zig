@@ -465,7 +465,8 @@ pub const DeviceParser = struct {
             const old = p.peers.allocatedSlice();
             std.crypto.secureZero(u8, std.mem.sliceAsBytes(old));
             p.gpa.free(old);
-            p.peers = .{ .items = fresh[0..p.peers.items.len], .capacity = cap };
+            p.peers.items = fresh[0..p.peers.items.len];
+            p.peers.capacity = cap;
         }
         p.peers.appendAssumeCapacity(peer);
     }

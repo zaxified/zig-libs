@@ -107,7 +107,7 @@ fn buildLsp(buf: []u8, sys: [6]u8, seq: u32) []const u8 {
 }
 
 fn up0() InterfaceSet {
-    var s = InterfaceSet.initEmpty();
+    var s = InterfaceSet.empty;
     s.set(0);
     return s;
 }

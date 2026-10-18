@@ -3106,9 +3106,9 @@ test "model-fuzz: PageCache over SimStorage == naive per-file byte model (300 se
     while (seed < 300) : (seed += 1) try mfCase(gpa, 0x9A6E_CAC0_0000 + seed, &reach);
     errdefer std.debug.print("pagecache model-fuzz reach: {any}\n", .{reach});
     // Every outcome class must have happened, or the run proved less than it claims.
-    inline for (std.meta.fields(MfReach)) |f| {
-        if (@field(reach, f.name) == 0) {
-            std.debug.print("pagecache model-fuzz: reach class never hit: {s}\n", .{f.name});
+    inline for (@typeInfo(MfReach).@"struct".field_names) |name| {
+        if (@field(reach, name) == 0) {
+            std.debug.print("pagecache model-fuzz: reach class never hit: {s}\n", .{name});
             return error.ReachClassMissed;
         }
     }

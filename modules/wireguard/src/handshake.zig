@@ -119,15 +119,10 @@ pub const Keypair = struct {
     fn generateBody(io: std.Io, out: *Keypair) void {
         var seed: [noise.X25519.seed_length]u8 = undefined;
         defer std.crypto.secureZero(u8, &seed);
-        while (true) {
-            entropy.fill(io, &seed);
-            const kp = noise.X25519.KeyPair.generateDeterministic(seed) catch {
-                @branchHint(.unlikely);
-                continue;
-            };
-            out.* = .{ .private = kp.secret_key, .public = kp.public_key };
-            return;
-        }
+        // 0.17: generateDeterministic cannot fail any more, so the retry loop is gone.
+        entropy.fill(io, &seed);
+        const kp = noise.X25519.KeyPair.generateDeterministic(seed);
+        out.* = .{ .private = kp.secret_key, .public = kp.public_key };
     }
 
     /// Rebuild a keypair from a stored private key (recomputes the public
@@ -138,7 +133,7 @@ pub const Keypair = struct {
     }
 
     fn fromPrivateKeyBody(private: *const PrivateKey, out: *Keypair) error{IdentityElement}!void {
-        const public = try noise.X25519.recoverPublicKey(private.*);
+        const public = noise.X25519.recoverPublicKey(private.*);
         out.* = .{ .private = private.*, .public = public };
     }
 };
@@ -397,7 +392,7 @@ pub const Handshake = struct {
 
         var st = initialState(self.remote_static_public);
         var msg: MessageInitiation = undefined;
-        msg.type = @intFromEnum(MessageType.handshake_initiation);
+        msg.type = @backingInt(MessageType.handshake_initiation);
         msg.sender_index = self.local_index;
 
         // e: ephemeral in the clear, mixed into ck and h.
@@ -554,7 +549,7 @@ pub const Handshake = struct {
         const eph = self.local_ephemeral.?;
 
         var msg: MessageResponse = undefined;
-        msg.type = @intFromEnum(MessageType.handshake_response);
+        msg.type = @backingInt(MessageType.handshake_response);
         msg.sender_index = self.local_index;
         msg.receiver_index = self.remote_index;
 
@@ -830,9 +825,9 @@ comptime {
 /// or oversized datagram is dropped before any MAC is computed over it.
 pub fn macFields(msg_bytes: []const u8) MacFieldsError!MacFields {
     if (msg_bytes.len < 8) return error.NotAHandshakeMessage;
-    const wire_len: usize = switch (@as(MessageType, @enumFromInt(
+    const wire_len: usize = switch (@as(MessageType, @fromBackingInt(@intCast(
         std.mem.readInt(u32, msg_bytes[0..4], .little),
-    ))) {
+    )))) {
         .handshake_initiation => @sizeOf(MessageInitiation),
         .handshake_response => @sizeOf(MessageResponse),
         else => return error.NotAHandshakeMessage,
@@ -1051,7 +1046,7 @@ pub const CookieChecker = struct {
         var cookie: noise.Mac = undefined;
         self.cookieForBody(io, now_s, source_address, &cookie);
         var reply: CookieReply = .{
-            .type = @intFromEnum(MessageType.cookie_reply),
+            .type = @backingInt(MessageType.cookie_reply),
             .receiver_index = f.sender_index,
             .nonce = nonce,
             .encrypted_cookie = undefined,
@@ -1214,14 +1209,14 @@ fn tsess(h: *Handshake, is_initiator: bool, now_s: u64) transport.Session {
 }
 
 test "message type wire values" {
-    try testing.expectEqual(@as(u32, 1), @intFromEnum(MessageType.handshake_initiation));
-    try testing.expectEqual(@as(u32, 2), @intFromEnum(MessageType.handshake_response));
-    try testing.expectEqual(@as(u32, 3), @intFromEnum(MessageType.cookie_reply));
-    try testing.expectEqual(@as(u32, 4), @intFromEnum(MessageType.transport_data));
+    try testing.expectEqual(@as(u32, 1), @backingInt(MessageType.handshake_initiation));
+    try testing.expectEqual(@as(u32, 2), @backingInt(MessageType.handshake_response));
+    try testing.expectEqual(@as(u32, 3), @backingInt(MessageType.cookie_reply));
+    try testing.expectEqual(@as(u32, 4), @backingInt(MessageType.transport_data));
     // `transport.zig` carries its own copy of the type tag (it deliberately
     // does not import this file, so the dependency runs one way only). Pin
     // the two together here rather than trusting they stay equal.
-    try testing.expectEqual(@intFromEnum(MessageType.transport_data), transport.message_type);
+    try testing.expectEqual(@backingInt(MessageType.transport_data), transport.message_type);
     try testing.expectEqual(@sizeOf(MessageTransportHeader), transport.header_len);
     try testing.expectEqual(noise.tag_len, transport.tag_len);
 }
@@ -1749,7 +1744,7 @@ test "KAT: cookie reply and mac2 byte-exact against the independent reference" {
 test "cookie reply: our decryptor opens the independent reference's bytes, and is AAD-bound" {
     var reply: CookieReply = undefined;
     @memcpy(std.mem.asBytes(&reply), &cookie_kat.reply);
-    try testing.expectEqual(@intFromEnum(MessageType.cookie_reply), reply.type);
+    try testing.expectEqual(@backingInt(MessageType.cookie_reply), reply.type);
     try testing.expectEqual(kat.idx_i, reply.receiver_index);
 
     var peer = PeerCookie.init(cookie_kat.responder_pub);
@@ -1795,7 +1790,7 @@ test "admit: a mac1-only flood is shed under load until the cookie round trip co
         .cookie_reply => |r| r,
         else => return error.TestUnexpectedResult,
     };
-    try testing.expectEqual(@intFromEnum(MessageType.cookie_reply), reply.type);
+    try testing.expectEqual(@backingInt(MessageType.cookie_reply), reply.type);
     try testing.expectEqual(kat.idx_i, reply.receiver_index);
 
     // The genuine initiator — which, unlike a spoofed source, actually
@@ -2032,7 +2027,7 @@ test "macFields admits exactly the two handshake message shapes" {
     // A response's bytes are 92, not 148: mislabeling either way is rejected.
     @memcpy(buf[0..92], &kat.msg2);
     _ = try macFields(buf[0..92]);
-    std.mem.writeInt(u32, buf[0..4], @intFromEnum(MessageType.handshake_initiation), .little);
+    std.mem.writeInt(u32, buf[0..4], @backingInt(MessageType.handshake_initiation), .little);
     try testing.expectError(error.NotAHandshakeMessage, macFields(buf[0..92]));
     // Types the cookie layer does not MAC.
     for ([_]u32{ 0, 3, 4, 5, 0xFFFF_FFFF }) |t| {
@@ -2211,7 +2206,7 @@ test "integration (root): live handshake with kernel WireGuard, keepalive decryp
         if (n < 4) continue;
 
         switch (std.mem.readInt(u32, buf[0..4], .little)) {
-            @intFromEnum(MessageType.handshake_initiation) => {
+            @backingInt(MessageType.handshake_initiation) => {
                 if (n != @sizeOf(MessageInitiation)) continue;
                 // A retry is a NEW handshake, not a duplicate of the one we
                 // already answered: the kernel picks fresh ephemerals, so the
@@ -2287,7 +2282,7 @@ test "integration (root): live handshake with kernel WireGuard, keepalive decryp
                 try testing.expectEqual(.SUCCESS, linux.errno(wrc));
                 try testing.expectEqual(@sizeOf(MessageResponse), wrc);
             },
-            @intFromEnum(MessageType.transport_data) => {
+            @backingInt(MessageType.transport_data) => {
                 // Keepalive: 16-byte header + empty plaintext + 16-byte tag —
                 // i.e. `transport.sealedLen(0)`, which is what the protocol's
                 // "pad to a multiple of 16" rule yields for an EMPTY payload

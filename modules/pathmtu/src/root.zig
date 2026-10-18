@@ -289,7 +289,7 @@ pub fn query(dest: netaddr.Ip, opts: Options) QueryError!Result {
 
     switch (dest) {
         .v4 => |q| {
-            const sa: linux.sockaddr.in = .{ .port = std.mem.nativeToBig(u16, control_port), .addr = @bitCast(q) };
+            const sa: linux.sockaddr.in = .{ .port = std.mem.nativeToBig(u16, control_port), .addr = std.mem.bytesToValue(u32, &q) };
             if (linux.errno(linux.connect(fd, @ptrCast(&sa), @sizeOf(linux.sockaddr.in))) != .SUCCESS)
                 return error.ConnectFailed;
         },
@@ -799,7 +799,7 @@ pub fn probe(dest: netaddr.Ip, opts: Options) ProbeError!Result {
         .ip_header_len = ip_header_len,
         .strip_ip_header = sock.kind == .raw and family == .v4,
         .dest = switch (dest) {
-            .v4 => |q| .{ .v4 = .{ .port = 0, .addr = @bitCast(q) } },
+            .v4 => |q| .{ .v4 = .{ .port = 0, .addr = std.mem.bytesToValue(u32, &q) } },
             .v6 => |b| .{ .v6 = .{ .port = 0, .flowinfo = 0, .addr = b, .scope_id = 0 } },
         },
         .retries = opts.retries,
@@ -864,7 +864,7 @@ pub fn ifaceMtu(name: []const u8) IfaceError!u32 {
     @memcpy(req.name[0..name.len], name);
     if (linux.errno(linux.ioctl(fd, linux.SIOCGIFMTU, @intFromPtr(&req))) != .SUCCESS)
         return error.NoSuchInterface;
-    return @bitCast(req.un[0..4].*);
+    return std.mem.bytesToValue(u32, req.un[0..4]);
 }
 
 /// `struct ifreq`: 16-byte name + 24-byte union. `SIOCGIFMTU` writes
@@ -1653,7 +1653,7 @@ test "live: LiveProber.attempt returns send_failed, not no_reply, when every sen
         .family = .v4,
         .ip_header_len = ipv4_header_len,
         .strip_ip_header = false,
-        .dest = .{ .v4 = .{ .port = 0, .addr = @bitCast(netaddr.parseIp("127.0.0.1").?.v4) } },
+        .dest = .{ .v4 = .{ .port = 0, .addr = std.mem.bytesToValue(u32, &netaddr.parseIp("127.0.0.1").?.v4) } },
         .retries = 2,
         .timeout_ms = 20,
         .seq = 1,

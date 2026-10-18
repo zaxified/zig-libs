@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — Ported to Zig 0.17.0. `sockaddr.in.addr` <-> `[4]u8` use `std.mem.bytesToValue`/`toBytes` (memory order; an array `@bitCast` is little-endian-logical in 0.17).
+
 - **2026-10-09** — tests: deterministic fuzz driver `TRACEROUTE_FUZZ` over the existing harness (the hop state machine on arbitrary and on damaged ICMP packet streams); `testkit` added to its test deps.
 
 - **2026-10-05** — **Anchoring: real routers judge `trace`, and `traceWith` replays their packets**

@@ -174,7 +174,7 @@ pub const Scheduler = struct {
     /// `csnp_cursor` parked, so the new neighbour's first CSNP started
     /// somewhere in the middle of the ID space and the bottom of it went
     /// unadvertised for a full `complete_snp_interval`.
-    prev_up: InterfaceSet = InterfaceSet.initEmpty(),
+    prev_up: InterfaceSet = InterfaceSet.empty,
 
     pub fn init(alloc: std.mem.Allocator, cfg: Config) Scheduler {
         std.debug.assert(cfg.lsp_entries_per_pdu >= 1 and cfg.lsp_entries_per_pdu <= snp.max_entries_per_pdu);
@@ -594,7 +594,7 @@ fn idNth(sys: [6]u8, n: u16) LspId {
 }
 
 fn oneUp(iface: u8) InterfaceSet {
-    var s = InterfaceSet.initEmpty();
+    var s = InterfaceSet.empty;
     s.set(iface);
     return s;
 }
@@ -906,7 +906,7 @@ test "next-wakeup is the min of the next paced retransmit and the next CSNP" {
     try testing.expectEqual(@as(?Time, 10), r1.next_wakeup); // min(0+100 LSP, 10 CSNP)
 
     // No Up interface → nothing pending.
-    try testing.expectEqual(@as(?Time, null), s2.poll(0, InterfaceSet.initEmpty(), &db, &out, &scratch).next_wakeup);
+    try testing.expectEqual(@as(?Time, null), s2.poll(0, InterfaceSet.empty, &db, &out, &scratch).next_wakeup);
 }
 
 /// A full ordered snapshot of one `poll`'s effects — (iface, kind, bytes) per
@@ -1306,7 +1306,7 @@ test "a circuit that flaps is re-primed and re-synchronised from the bottom of t
     try testing.expect(!std.mem.eql(u8, &sched.csnp_cursor[0], &snp.min_lsp_id));
 
     // The circuit goes Down mid-series...
-    _ = sched.poll(1, InterfaceSet.initEmpty(), &db, &out, &scratch);
+    _ = sched.poll(1, InterfaceSet.empty, &db, &out, &scratch);
     try testing.expectEqual(snp.min_lsp_id, sched.csnp_cursor[0]);
 
     // ...and comes back. A CSNP must fire at once, from the bottom.

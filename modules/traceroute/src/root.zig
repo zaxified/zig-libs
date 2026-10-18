@@ -815,7 +815,7 @@ pub const LinuxTransport = struct {
         var lt: LinuxTransport = .{
             .sock = sock,
             .dest = switch (dest_ip) {
-                .v4 => |q| .{ .v4 = .{ .port = 0, .addr = @bitCast(q) } },
+                .v4 => |q| .{ .v4 = .{ .port = 0, .addr = std.mem.bytesToValue(u32, &q) } },
                 .v6 => |b| .{ .v6 = .{ .port = 0, .flowinfo = 0, .addr = b, .scope_id = 0 } },
             },
         };
@@ -834,7 +834,7 @@ pub const LinuxTransport = struct {
 
     fn sockAddr(ip: netaddr.Ip, port: u16) SockAddr {
         return switch (ip) {
-            .v4 => |q| .{ .v4 = .{ .port = std.mem.nativeToBig(u16, port), .addr = @bitCast(q) } },
+            .v4 => |q| .{ .v4 = .{ .port = std.mem.nativeToBig(u16, port), .addr = std.mem.bytesToValue(u32, &q) } },
             .v6 => |b| .{ .v6 = .{ .port = std.mem.nativeToBig(u16, port), .flowinfo = 0, .addr = b, .scope_id = 0 } },
         };
     }
@@ -988,7 +988,7 @@ pub const LinuxTransport = struct {
                     .len = info.packet.len,
                     .from = switch (info.src) {
                         .none => null,
-                        .v4 => |sa| .{ .v4 = @bitCast(sa.addr) },
+                        .v4 => |sa| .{ .v4 = std.mem.toBytes(sa.addr) },
                         .v6 => |sa| .{ .v6 = sa.addr },
                     },
                 };
