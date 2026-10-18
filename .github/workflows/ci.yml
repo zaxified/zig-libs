@@ -334,7 +334,8 @@ jobs:
       # it reads build.zig -- ~110 s measured locally -- into the GLOBAL cache,
       # which none of the entries above keep. One entry per OS/arch/zig version,
       # saved once on the first miss and never again (the key has no source
-      # hash and no week): it holds compiled-once toolchain artefacts, not
+      # hash and no week; a bad first entry is retired by bumping the `-gN`
+      # epoch at the end of the key): it holds compiled-once toolchain artefacts, not
       # anything this repository's sources decide. `--global-cache-dir` is gone
       # from `zig build` in 0.17, so the location is set by environment.
       - name: Point the Zig global cache at a cacheable path
@@ -344,7 +345,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ${{ runner.temp }}/zig-global
-          key: zig-global-${{ runner.os }}-${{ runner.arch }}-0.17.0
+          key: zig-global-${{ runner.os }}-${{ runner.arch }}-0.17.0-g1
       # ⭐ A WEEK IN EVERY BUILD-CACHE KEY (2026-09-18). An entry restores the
       # previous tree, adds to it and saves the whole, and nothing ever
       # deletes: the scoped entry grew 589 -> 646 -> 1156 -> 1364 MB over four
@@ -520,7 +521,8 @@ jobs:
       # it reads build.zig -- ~110 s measured locally -- into the GLOBAL cache,
       # which none of the entries above keep. One entry per OS/arch/zig version,
       # saved once on the first miss and never again (the key has no source
-      # hash and no week): it holds compiled-once toolchain artefacts, not
+      # hash and no week; a bad first entry is retired by bumping the `-gN`
+      # epoch at the end of the key): it holds compiled-once toolchain artefacts, not
       # anything this repository's sources decide. `--global-cache-dir` is gone
       # from `zig build` in 0.17, so the location is set by environment.
       - name: Point the Zig global cache at a cacheable path
@@ -530,7 +532,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ${{ runner.temp }}/zig-global
-          key: zig-global-${{ runner.os }}-${{ runner.arch }}-0.17.0
+          key: zig-global-${{ runner.os }}-${{ runner.arch }}-0.17.0-g1
       - name: The sub-second gates, before anything expensive starts
         run: bash scripts/test.sh checks-fast
       - name: Choose the lanes
@@ -855,7 +857,8 @@ jobs:
       # it reads build.zig -- ~110 s measured locally -- into the GLOBAL cache,
       # which none of the entries above keep. One entry per OS/arch/zig version,
       # saved once on the first miss and never again (the key has no source
-      # hash and no week): it holds compiled-once toolchain artefacts, not
+      # hash and no week; a bad first entry is retired by bumping the `-gN`
+      # epoch at the end of the key): it holds compiled-once toolchain artefacts, not
       # anything this repository's sources decide. `--global-cache-dir` is gone
       # from `zig build` in 0.17, so the location is set by environment.
       - name: Point the Zig global cache at a cacheable path
@@ -865,7 +868,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ${{ runner.temp }}/zig-global
-          key: zig-global-${{ runner.os }}-${{ runner.arch }}-0.17.0
+          key: zig-global-${{ runner.os }}-${{ runner.arch }}-0.17.0-g1
       # Weekly cache generation, as in the scoped job -- see there.
       - name: Cache generation
         id: gen
