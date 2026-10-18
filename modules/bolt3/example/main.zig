@@ -193,7 +193,7 @@ pub fn main() !void {
 
 /// Comptime array repetition; replaces the `**` operator removed in Zig 0.17.
 fn arrRepeat(comptime T: type, comptime unit: []const T, comptime n: usize) [unit.len * n]T {
-    @setEvalBranchQuota(n * unit.len * 2 + 1000);
+    @setEvalBranchQuota(n * (unit.len + 4) + 1000);
     var buf: [unit.len * n]T = undefined;
     for (0..n) |i| @memcpy(buf[i * unit.len ..][0..unit.len], unit);
     return buf;

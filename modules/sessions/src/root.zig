@@ -3098,7 +3098,7 @@ fn sessionModelRun(comptime kv_backed: bool, case_seed: u64, reach: *[@typeInfo(
 }
 
 test "model: Manager over RamcacheStore and KvStore agrees with a naive session model on random operation sequences" {
-    var reach = @as([@typeInfo(ModelReach)]usize, @splat(0)).@"enum".field_names.len;
+    var reach = @as([@typeInfo(ModelReach).@"enum".field_names.len]usize, @splat(0));
     const seeds = if (@import("builtin").mode == .debug) 60 else 200;
     for (0..seeds) |case_seed| {
         try sessionModelRun(false, case_seed, &reach);
@@ -3173,7 +3173,7 @@ test "Session values: raw setData on the same session is Malformed, never a valu
 
 test "model: the key/value layer agrees with an ordered map on random operations" {
     const Reach = enum { put_new, put_replace, overflow, invalid_key, removed, remove_absent, popped, too_small, cleared, malformed };
-    var reach = @as([@typeInfo(Reach)]usize, @splat(0)).@"enum".field_names.len;
+    var reach = @as([@typeInfo(Reach).@"enum".field_names.len]usize, @splat(0));
     const key_pool = [_][]const u8{ "uid", "a", "flash", "csrf", "theme", strRepeat("k", 255), strRepeat("x", 40), "lang" };
     for (0..(if (@import("builtin").mode == .debug) 100 else 400)) |case_seed| {
         var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
@@ -3683,7 +3683,7 @@ test "hash_id_in_store: KvStore keys are prefix ++ SHA-256(id); iterate shows th
 /// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
 fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     const rep_result = comptime blk: {
-        @setEvalBranchQuota(n * 2 + 1000);
+        @setEvalBranchQuota(n * (s.len + 4) + 1000);
         var buf: [s.len * n:0]u8 = undefined;
         for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
         const rep_final = buf;
