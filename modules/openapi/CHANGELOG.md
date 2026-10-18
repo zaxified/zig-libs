@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — Ported to Zig 0.17.0. method loop uses `@typeInfo(http.Method).@"enum".field_values` (`.fields` is gone). No behaviour change.
+
 - **2026-10-12** — CONNECT and extension-method (`.other`) routes (http R9) stay out of the
   document: an OpenAPI 3.1 Path Item has no field for them. TRACE routes are operations.
 

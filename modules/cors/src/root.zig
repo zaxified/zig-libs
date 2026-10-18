@@ -900,7 +900,7 @@ fn expectHeaderLine(got: []const u8, comptime line: []const u8) !void {
 }
 
 fn expectNoHeader(got: []const u8, comptime name: []const u8) !void {
-    try testing.expect(std.ascii.indexOfIgnoreCase(got, "\r\n" ++ name ++ ":") == null);
+    try testing.expect(std.ascii.findIgnoreCase(got, "\r\n" ++ name ++ ":") == null);
 }
 
 fn expectNoCorsHeaders(got: []const u8) !void {

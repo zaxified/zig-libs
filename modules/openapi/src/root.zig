@@ -467,8 +467,8 @@ pub const Generator = struct {
             // "first wins" is correct because there is only ONE underlying
             // route/value); here it is `error.PathCollision`, not a silent
             // merge.
-            inline for (@typeInfo(http.Method).@"enum".fields) |f| {
-                const method: http.Method = @fromBackingInt(@intCast(f.value));
+            inline for (@typeInfo(http.Method).@"enum".field_values) |fv| {
+                const method: http.Method = @fromBackingInt(@intCast(fv));
                 // An OpenAPI 3.1 Path Item names eight methods; CONNECT and
                 // an extension method (`.other`) are not among them, so
                 // their routes stay out of the document.

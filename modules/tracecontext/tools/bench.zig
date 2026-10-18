@@ -69,7 +69,7 @@ fn sumBytes(s: []const u8) u64 {
 
 /// The value of response header `name` (case-insensitive), or null.
 fn headerValue(resp: []const u8, comptime name: []const u8) ?[]const u8 {
-    const at = std.ascii.indexOfIgnoreCase(resp, "\r\n" ++ name ++ ":") orelse return null;
+    const at = std.ascii.findIgnoreCase(resp, "\r\n" ++ name ++ ":") orelse return null;
     const rest = resp[at + 2 + name.len + 1 ..];
     const end = std.mem.indexOf(u8, rest, "\r\n") orelse rest.len;
     return std.mem.trim(u8, rest[0..end], " ");

@@ -86,7 +86,7 @@ fn once(d: *const Data, w: usize) u64 {
         });
         const resp = out.buffered();
         sum += std.fmt.parseInt(u16, resp[9..12], 10) catch 0;
-        if (std.ascii.indexOfIgnoreCase(resp, "\r\naccess-control-allow-origin:") != null) sum += 1;
+        if (std.ascii.findIgnoreCase(resp, "\r\naccess-control-allow-origin:") != null) sum += 1;
     }
     return sum;
 }

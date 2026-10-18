@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — Ported to Zig 0.17.0. model-fuzz reach loop uses `@typeInfo(..).field_names` (`std.meta.fields` is gone). No behaviour change.
+
 - **2026-10-11** — Added (scope core → parity; fail2ban / nginx `limit_conn` parity pass): `Options.greylist_ttl_growth` / `greylist_ttl_max_ms` (fail2ban `bantime.increment` / `bantime.maxtime`: the n-th offense greylists for `ttl * growth^(n-1)`, capped; default 1 = unchanged); `Options.on_event` + `Event` / `EventHook` (fail2ban actions: `banned`, `greylisted`, `unbanned`, `evicted`, `prefix_banned`, `prefix_unbanned`, `all_cleared`, `dry_run_reject`, delivered after the lock is released); `Guard.unbanAll` (`fail2ban-client unban --all`); `Options.dry_run` (nginx `limit_conn_dry_run`: admit and count what would be refused, report it as an event). `AdmitVerdict` unchanged. The model-fuzz now also checks the exact event stream, growth, dry run and `unbanAll`.
 
 - **2026-10-11** — Fix (stricter): `record` restarts the strike-drain interval at the strike when the previous balance had drained out completely. It used to keep the idle time's sub-interval remainder, so a strike after a long idle could drain up to one `strike_decay_ms` early and an offense could be missed (the code comment already said it should not). Two regression tests; the model-fuzz reference updated to match.

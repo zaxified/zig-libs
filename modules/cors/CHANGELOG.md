@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — Ported to Zig 0.17.0. `std.ascii.indexOfIgnoreCase` -> `findIgnoreCase` (test and bench tool). No behaviour change.
+
 - **2026-10-12** — The actual-request gate checks the method as sent (`Request.methodName()`,
   http R9: extension methods now reach handlers). `.other` in `allowed_methods` is the new
   `InitError.UnnamedAllowedMethod`: a preflight can only grant named methods.

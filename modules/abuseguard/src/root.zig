@@ -3805,9 +3805,9 @@ test "model-fuzz: Guard == naive per-key reference model (300 seeds, injected cl
     var seed: u64 = 0;
     while (seed < 300) : (seed += 1) try agCase(gpa, 0xAB05_E6A2_D000 + seed, &reach);
     errdefer std.debug.print("abuseguard model-fuzz reach: {any}\n", .{reach});
-    inline for (std.meta.fields(AgReach)) |f| {
-        if (@field(reach, f.name) == 0) {
-            std.debug.print("abuseguard model-fuzz: reach class never hit: {s}\n", .{f.name});
+    inline for (@typeInfo(AgReach).@"struct".field_names) |fname| {
+        if (@field(reach, fname) == 0) {
+            std.debug.print("abuseguard model-fuzz: reach class never hit: {s}\n", .{fname});
             return error.ReachClassMissed;
         }
     }
