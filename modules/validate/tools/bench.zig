@@ -107,13 +107,13 @@ var sink: usize = 0;
 fn one(comptime T: type, a: std.mem.Allocator, body: []const u8, decode_only: bool) u64 {
     if (decode_only) {
         const v = std.json.parseFromSliceLeaky(T, a, body, .{ .ignore_unknown_fields = true }) catch return 0;
-        sink +%= @field(v, @typeInfo(T).@"struct".fields[0].name).len;
+        sink +%= @field(v, @typeInfo(T).@"struct".field_names[0]).len;
         return 1;
     }
     const r = validate.parseIntoLeaky(T, a, body, .{}) catch return 0;
     switch (r) {
         .ok => |v| {
-            sink +%= @field(v, @typeInfo(T).@"struct".fields[0].name).len;
+            sink +%= @field(v, @typeInfo(T).@"struct".field_names[0]).len;
             return 1;
         },
         .invalid => |rep| return rep.errors.len,

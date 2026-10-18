@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** tools ported to Zig 0.17.0 (compile only): `tools/bench.zig`: `std.ascii.indexOfIgnoreCase` -> `findIgnoreCase`.
 - **2026-10-11** — Generated IDs are now unique within the process across threads: 16 hex of a per-process prefix + 16 hex of a process-wide atomic sequence (was monotonic ns · thread-address nonce · per-thread counter, which could repeat across connection threads). The ID is still 32 lowercase hex; its fields changed. New `Options.generator` (`Generator`: context + function) for a caller's ID scheme; an output that fails `isAdoptable` or lies outside the buffer falls back to the built-in ID. README charset and test count corrected.
 
 - **2026-10-11** — tests: seeded model-fuzz against a naive adopt-or-generate reference model (`isAdoptable` on random bytes; the middleware over random options, headers and lengths). No API or behaviour change.
