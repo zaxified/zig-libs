@@ -363,7 +363,7 @@ fn keep() std.mem.Allocator {
 }
 
 fn kpFrom(label: []const u8, i: u8) X25519.KeyPair {
-    return X25519.KeyPair.generateDeterministic(seedBytes(32, label, i)) catch unreachable;
+    return X25519.KeyPair.generateDeterministic(seedBytes(32, label, i));
 }
 
 var alice_ik: x3dh.IdentityKey = undefined;
@@ -642,7 +642,7 @@ test "STACKPROBE: no key, DH or ratchet residue on the dead stack (signal)" {
         bad += try runProbe("xeddsa.libsignal.sign", callSignLibsignal, &n);
 
         // x3dh.initiate: Alice's key, EK (draw 0), four DHs, KDF chain.
-        const ek = X25519.KeyPair.generateDeterministic(rec_log[0][0..32].*) catch unreachable;
+        const ek = X25519.KeyPair.generateDeterministic(rec_log[0][0..32].*);
         const xs = x3dhSecrets(
             dhOut(alice_ik.secret_key, bob_spk.key_pair.public_key),
             dhOut(ek.secret_key, bob_ik.public_key),
@@ -671,7 +671,7 @@ test "STACKPROBE: no key, DH or ratchet residue on the dead stack (signal)" {
         // The pre-run draws: 0 = EK, 1 = encaps seed.
         rewind();
         const pq0 = try compat.pqxdh.initiate(keep(), alice_ik, pq_bundle, initial_pt, rec_io);
-        const ek2 = X25519.KeyPair.generateDeterministic(rec_log[0][0..32].*) catch unreachable;
+        const ek2 = X25519.KeyPair.generateDeterministic(rec_log[0][0..32].*);
         const dk1 = dhOut(alice_ik.secret_key, bob_spk.key_pair.public_key);
         const dk2 = dhOut(ek2.secret_key, bob_ik.public_key);
         const dk3 = dhOut(ek2.secret_key, bob_spk.key_pair.public_key);
@@ -744,7 +744,7 @@ test "STACKPROBE: no key, DH or ratchet residue on the dead stack (signal)" {
         const pt0 = try b2.decrypt(alloc(), hdr, first_msg.ciphertext, rec_io);
         _ = pt0;
         const new_seed: [32]u8 = rec_log[0][0..32].*;
-        const new_dhs = X25519.KeyPair.generateDeterministic(new_seed) catch unreachable;
+        const new_dhs = X25519.KeyPair.generateDeterministic(new_seed);
         const dh_send = dhOut(new_dhs.secret_key, hdr.dh);
         const send = kdfRk(recv.rk, dh_send);
         n = .{};

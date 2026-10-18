@@ -516,7 +516,7 @@ test "sign-0 convention agrees end-to-end: verify's recovered A == sign's forced
         try std.testing.expectEqual(@as(u8, 0), kp.public[31] >> 7);
 
         // And the verifier reconstructs the same A from u alone.
-        const mont_pub = try std.crypto.dh.X25519.recoverPublicKey(seed);
+        const mont_pub = std.crypto.dh.X25519.recoverPublicKey(seed);
         const recovered = try edwardsFromMontgomery(mont_pub);
         try std.testing.expectEqualSlices(u8, &kp.public, &recovered.toBytes());
     }
@@ -546,14 +546,14 @@ test "libsignal variant round-trips (self-consistency, both sign-bit branches) a
         const msg = "libsignal-variant self round-trip";
         const sig = shim.xeddsa.libsignal.sign(seed, msg, z);
         try std.testing.expectEqual(natural_sign, sig[63] >> 7);
-        try std.testing.expect(libsignal.verify((try std.crypto.dh.X25519.recoverPublicKey(seed)), msg, sig));
+        try std.testing.expect(libsignal.verify((std.crypto.dh.X25519.recoverPublicKey(seed)), msg, sig));
 
         // Tampering the smuggled sign bit alone (holding every other bit
         // of s fixed) must flip verification to false: it changes WHICH
         // A the equation checks against, not a harmless spare bit.
         var flipped = sig;
         flipped[63] ^= 0x80;
-        try std.testing.expect(!libsignal.verify((try std.crypto.dh.X25519.recoverPublicKey(seed)), msg, flipped));
+        try std.testing.expect(!libsignal.verify((std.crypto.dh.X25519.recoverPublicKey(seed)), msg, flipped));
     }
     try std.testing.expect(seen_sign_bit[0]);
     try std.testing.expect(seen_sign_bit[1]);
@@ -561,7 +561,7 @@ test "libsignal variant round-trips (self-consistency, both sign-bit branches) a
 
 test "verify refuses s + L, an order-2 key that satisfies the equation, and a partly matching R" {
     const priv = @as([32]u8, @splat(0x42));
-    const public = try std.crypto.dh.X25519.recoverPublicKey(priv);
+    const public = std.crypto.dh.X25519.recoverPublicKey(priv);
     const sig = shim.xeddsa.sign(priv, "msg", @as([64]u8, @splat(7)));
     try std.testing.expect(verify(public, "msg", sig));
 

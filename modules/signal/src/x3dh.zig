@@ -160,10 +160,8 @@ fn generateKeyPairBody(io: std.Io, out: *X25519.KeyPair) void {
     defer std.crypto.secureZero(u8, &seed);
     while (true) {
         entropy.fill(io, &seed);
-        out.* = X25519.KeyPair.generateDeterministic(seed) catch {
-            @branchHint(.unlikely);
-            continue;
-        };
+        // zig 0.17: std's generateDeterministic is infallible (no IdentityElementError).
+        out.* = X25519.KeyPair.generateDeterministic(seed);
         return;
     }
 }

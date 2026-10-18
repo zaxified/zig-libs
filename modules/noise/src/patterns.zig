@@ -309,9 +309,9 @@ test "IK: pre <- s ; -> e, es, s, ss ; <- e, ee, se" {
 }
 
 test "catalog: every pattern's name matches its own const identifier, and names are unique" {
-    inline for (@typeInfo(@This()).@"struct".decls) |d| {
-        const v = @field(@This(), d.name);
-        if (@TypeOf(v) == HandshakePattern) try std.testing.expectEqualStrings(d.name, v.name);
+    inline for (@typeInfo(@This()).@"struct".decl_names) |d_name| {
+        const v = @field(@This(), d_name);
+        if (@TypeOf(v) == HandshakePattern) try std.testing.expectEqualStrings(d_name, v.name);
     }
     try std.testing.expectEqual(@as(usize, 38), catalog.len);
     for (catalog, 0..) |a, i| for (catalog[i + 1 ..]) |b| try std.testing.expect(!std.mem.eql(u8, a.name, b.name));

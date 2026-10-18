@@ -122,8 +122,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
             // private halves are then tainted: a static PUBLIC key is public
             // (it goes on the wire), and tainting the seed would make the
             // harness's own keygen report std's identity check.
-            var is = try S.KeyPair.generateDeterministic(secretBytes(32, "ctgrind-noise-static-i-v1"));
-            var rs = try S.KeyPair.generateDeterministic(secretBytes(32, "ctgrind-noise-static-r-v1"));
+            var is = try @as(anyerror!S.KeyPair, S.KeyPair.generateDeterministic(secretBytes(32, "ctgrind-noise-static-i-v1")));
+            var rs = try @as(anyerror!S.KeyPair, S.KeyPair.generateDeterministic(secretBytes(32, "ctgrind-noise-static-r-v1")));
             var psk = secretBytes(32, "ctgrind-noise-psk-v1");
             if (taint_on) {
                 std.valgrind.memcheck.makeMemUndefined(&is.secret_key);
@@ -138,8 +138,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
             std.debug.print("ctgrind_result={x}\n", .{ti[0].k ++ tr[1].k});
         },
         .transport => {
-            const is = try S.KeyPair.generateDeterministic(secretBytes(32, "ctgrind-noise-static-i-v1"));
-            const rs = try S.KeyPair.generateDeterministic(secretBytes(32, "ctgrind-noise-static-r-v1"));
+            const is = try @as(anyerror!S.KeyPair, S.KeyPair.generateDeterministic(secretBytes(32, "ctgrind-noise-static-i-v1")));
+            const rs = try @as(anyerror!S.KeyPair, S.KeyPair.generateDeterministic(secretBytes(32, "ctgrind-noise-static-r-v1")));
             const p = secretBytes(32, "ctgrind-noise-psk-v1");
             _ = try handshake(trng.random(), &is, &rs, &p, &ti, &tr);
             if (taint == .yes) for ([_]*[2]S.CipherState{ &ti, &tr }) |pair| for (pair) |*cs| {

@@ -186,7 +186,7 @@ pub const X25519Kem = struct {
         // A clamped X25519 scalar (high bit pattern forced by RFC 7748
         // clamping) times the basepoint can never land on the identity, so
         // generateDeterministic's IdentityElementError is unreachable.
-        out.* = KeyPair.generateDeterministic(sk) catch unreachable;
+        out.* = KeyPair.generateDeterministic(sk);
     }
 
     /// RFC 9180 §4.1 `Encap(pkR)`, real-randomness entry point: draw a

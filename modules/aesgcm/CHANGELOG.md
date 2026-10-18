@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — Ported to Zig 0.17.0. No source change beyond the repo-wide codemod (all `@bitCast` sites audited; aesgcm's are x86-64-only, so LE memory order is unchanged).
 - **2026-10-10** — Nonce and tag lengths: `pub fn AesGcm(key_bits, Options)` with
   `Options{ .nonce_length = 12, .tag_length = 16 }` — any nonce of 1 byte or more (J0 by
   GHASH, SP 800-38D §7.1) and tags of 16/15/14/13/12, or 8/4 under Appendix C; other

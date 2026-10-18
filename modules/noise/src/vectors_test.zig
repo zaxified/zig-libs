@@ -60,7 +60,7 @@ fn hexAlloc(a: std.mem.Allocator, v: ?std.json.Value) !?[]u8 {
 
 fn keyPair(comptime S: type, a: std.mem.Allocator, v: ?std.json.Value) !?S.KeyPair {
     const b = (try hexAlloc(a, v)) orelse return null;
-    return try S.KeyPair.generateDeterministic(b[0..32].*);
+    return try @as(anyerror!S.KeyPair, S.KeyPair.generateDeterministic(b[0..32].*));
 }
 
 fn pub32(comptime S: type, a: std.mem.Allocator, v: ?std.json.Value) !?[S.DHLEN]u8 {
@@ -209,7 +209,7 @@ const S0 = state.Suite(X25519, chachapoly.ChaCha20Poly1305, sha2.Sha256);
 const Token = @import("token.zig").Token;
 
 fn kp(b: u8) S0.KeyPair {
-    return S0.KeyPair.generateDeterministic(@as([32]u8, @splat(b))) catch unreachable;
+    return @as(anyerror!S0.KeyPair, S0.KeyPair.generateDeterministic(@as([32]u8, @splat(b)))) catch unreachable;
 }
 
 test "init: missing keys, PSK count and invalid patterns are refused before anything runs" {

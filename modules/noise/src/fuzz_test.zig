@@ -96,8 +96,8 @@ pub fn fuzzHandshake(comptime S2: type, src: *S2, gpa: std.mem.Allocator) anyerr
     const pattern = patterns[src.index(patterns.len)];
     var seed_bytes: [64]u8 = undefined;
     src.bytes(&seed_bytes);
-    const ini_kp = try S.KeyPair.generateDeterministic(seed_bytes[0..32].*);
-    const rsp_kp = try S.KeyPair.generateDeterministic(seed_bytes[32..64].*);
+    const ini_kp = try @as(anyerror!S.KeyPair, S.KeyPair.generateDeterministic(seed_bytes[0..32].*));
+    const rsp_kp = try @as(anyerror!S.KeyPair, S.KeyPair.generateDeterministic(seed_bytes[32..64].*));
     var psk: [1][32]u8 = undefined;
     src.bytes(&psk[0]);
     var prng = std.Random.DefaultPrng.init(src.value(u64));

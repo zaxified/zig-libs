@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — Ported to Zig 0.17.0. std `X25519.KeyPair.generateDeterministic` is infallible in 0.17, so `catch unreachable` dropped in `dhkem.zig`.
 - **2026-10-10** — New: DHKEM(P-521, HKDF-SHA512), kem_id 0x0012 (`P521Kem`: Encap/Decap/AuthEncap/AuthDecap, DeriveKeyPair with RFC 9180 §7.1.3's 0x01 bitmask), on the new `p521` module (new dep). Anchored byte-exact to RFC 9180 A.6.1–A.6.4 (all four modes, every field; `src/kat_rfc9180_a6.zig` from `tools/gen_rfc9180_a6.py`). ctgrind targets `p521_decap`/`p521_authdecap` added.
 - **2026-10-10** — Changed: PSKs of 32..Nh-1 bytes are now accepted for SHA-384/512 suites (the RFC's own floor; the old Nh floor refused RFC 9180 A.6 vectors). 31 bytes is still `PskTooShort` at every Nh (test in `schedule.zig`).
 - **2026-10-09** — tests: deterministic fuzz driver `HPKE_FUZZ` over the existing harnesses (P-256 and P-384 `decap`/`authDecap` (genuine `enc` agrees with the sender, a damaged one diverges), plus single-shot seal/open over X25519, P-256 and P-384 in base and auth mode (genuine opens, damaged ciphertext, `enc`, aad, info and keys refused)).

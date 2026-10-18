@@ -663,7 +663,7 @@ test "round-trip: buffer API, various sizes including empty" {
     const io = std.testing.io;
     const kp = KeyPair.generate(io);
 
-    const msgs = [_][]const u8{ "", "x", "hello sealed box", strRepeat("a", 100) };
+    const msgs = comptime [_][]const u8{ "", "x", "hello sealed box", strRepeat("a", 100) };
     inline for (msgs) |msg| {
         var boxed: [msg.len + overhead]u8 = undefined;
         try seal(io, &boxed, msg, kp.public_key);

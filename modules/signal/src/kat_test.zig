@@ -480,7 +480,7 @@ const ls_signature: [64]u8 = .{
 };
 
 test "XEdDSA KAT: the libsignal vector's keypair is a genuine X25519 pair (vector transcription sanity)" {
-    const derived = try X25519.recoverPublicKey(ls_alice_priv);
+    const derived = X25519.recoverPublicKey(ls_alice_priv);
     try std.testing.expectEqualSlices(u8, &ls_alice_pub, &derived);
 }
 
@@ -580,7 +580,7 @@ test "XEdDSA cross-check: signatures verify under std.crypto.sign.Ed25519 with t
     for (seeds) |seed| {
         const msg = "cross-checked against std's own Ed25519 verifier";
         const sig = shim.xeddsa.sign(seed, msg, z);
-        const mont_pub = try X25519.recoverPublicKey(seed);
+        const mont_pub = X25519.recoverPublicKey(seed);
         try std.testing.expect(xeddsa.verify(mont_pub, msg, sig));
 
         const a = try xeddsa.edwardsFromMontgomery(mont_pub);

@@ -314,8 +314,8 @@ fn buildNeedles(n: *Needles) !void {
     n.addKey("static key I", s_i.secret_key);
     n.addKey("static key R", s_r.secret_key);
     n.add("psk", psk_list[0]);
-    const e_i = try Suite.KeyPair.generateDeterministic(seedOf(prng_i));
-    const e_r = try Suite.KeyPair.generateDeterministic(seedOf(prng_r));
+    const e_i = try @as(anyerror!Suite.KeyPair, Suite.KeyPair.generateDeterministic(seedOf(prng_i)));
+    const e_r = try @as(anyerror!Suite.KeyPair, Suite.KeyPair.generateDeterministic(seedOf(prng_r)));
     n.addKey("ephemeral key I", e_i.secret_key);
     n.addKey("ephemeral key R", e_r.secret_key);
     const ee = try X25519.scalarmult(e_r.secret_key, e_i.public_key);
@@ -400,8 +400,8 @@ fn skipUnlessOptimized() !void {
 test "STACKPROBE noise (wave 9): no key, DH or HKDF residue on the dead stack after any entry point" {
     try skipUnlessOptimized();
 
-    s_i = try Suite.KeyPair.generateDeterministic(hash("static I"));
-    s_r = try Suite.KeyPair.generateDeterministic(hash("static R"));
+    s_i = try @as(anyerror!Suite.KeyPair, Suite.KeyPair.generateDeterministic(hash("static I")));
+    s_r = try @as(anyerror!Suite.KeyPair, Suite.KeyPair.generateDeterministic(hash("static R")));
     psk_list[0] = hash("psk");
     ikm_x = hash("direct ikm");
     key_x = hash("direct key");
@@ -629,8 +629,8 @@ fn Coverage(comptime S: type) type {
 
         /// Returns the number of steps whose body outgrew its burn.
         fn check() !usize {
-            si = try S.KeyPair.generateDeterministic(seed("static I"));
-            sr = try S.KeyPair.generateDeterministic(seed("static R"));
+            si = try @as(anyerror!S.KeyPair, S.KeyPair.generateDeterministic(seed("static I")));
+            sr = try @as(anyerror!S.KeyPair, S.KeyPair.generateDeterministic(seed("static R")));
             psks[0] = hash("psk");
             ri = .init(0x7015_0011);
             rr = .init(0x7015_0012);
@@ -664,7 +664,7 @@ fn DhDepth(comptime D: type) type {
         var kp: D.KeyPair = undefined;
         var out: [D.public_length]u8 = undefined;
         noinline fn gen() void {
-            kp = D.KeyPair.generateDeterministic(@splat(0x42)) catch unreachable;
+            kp = @as(anyerror!D.KeyPair, D.KeyPair.generateDeterministic(@splat(0x42))) catch unreachable;
         }
         noinline fn mul() void {
             out = D.scalarmult(kp.secret_key, kp.public_key) catch unreachable;

@@ -107,14 +107,15 @@ inline fn xorBlocks(comptime n: comptime_int, out: []u8, in: []const u8, base: *
         transpose(n, &t);
         inline for (0..n) |b| {
             const off = 64 * b + 4 * n * q;
-            const ks = if (native_le) t[b] else @byteSwap(t[b]);
+            // zig 0.17: an array <-> vector `@bitCast` is little-endian on every
+            // target, so `iv` already holds LE words and `ks` needs no byte swap
+            // (0.16 read native-order words and swapped `ks` on big-endian).
+            const ks = t[b];
             const iv: V = @bitCast(in[off..][0 .. 4 * n].*);
             out[off..][0 .. 4 * n].* = @bitCast(iv ^ ks);
         }
     }
 }
-
-const native_le = @import("builtin").cpu.arch.endian() == .little;
 
 /// In-place transpose of an n x n matrix held as n row vectors: stage `d`
 /// swaps bit `d` of the row and the lane index, so after all log2(n) stages

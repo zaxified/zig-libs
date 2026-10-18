@@ -809,7 +809,7 @@ pub fn Suite(comptime DH: type, comptime Cipher: type, comptime Hash: type) type
                                 defer std.crypto.secureZero(u8, &seed);
                                 self.e = while (true) {
                                     random.bytes(&seed);
-                                    break KeyPair.generateDeterministic(seed) catch continue;
+                                    break @as(anyerror!KeyPair, KeyPair.generateDeterministic(seed)) catch continue;
                                 };
                             }
                             const pk = self.e.?.public_key;
@@ -1213,7 +1213,7 @@ const Kat = struct {
 
 fn katKeyPair(comptime S: type, priv: ?[]const u8) ?S.KeyPair {
     const p = priv orelse return null;
-    return S.KeyPair.generateDeterministic(p[0..32].*) catch unreachable;
+    return @as(anyerror!S.KeyPair, S.KeyPair.generateDeterministic(p[0..32].*)) catch unreachable;
 }
 
 fn katPub(comptime S: type, pubkey: ?[]const u8) ?[S.DHLEN]u8 {
@@ -1459,9 +1459,9 @@ fn selfConsistency(
     var seed: [32]u8 = undefined;
 
     random.bytes(&seed);
-    const init_s = try S.KeyPair.generateDeterministic(seed);
+    const init_s = try @as(anyerror!S.KeyPair, S.KeyPair.generateDeterministic(seed));
     random.bytes(&seed);
-    const resp_s = try S.KeyPair.generateDeterministic(seed);
+    const resp_s = try @as(anyerror!S.KeyPair, S.KeyPair.generateDeterministic(seed));
 
     var ini: S.HandshakeState = .{};
     var rsp: S.HandshakeState = .{};
