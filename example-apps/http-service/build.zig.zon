@@ -9,8 +9,8 @@
         // cleared every lane at that commit. Bumped by `scripts/tag.sh` when a
         // new tag is cut, so a copy taken from tag T is built against T.
         .zig_libs = .{
-            .url = "git+https://github.com/zaxified/zig-libs#2026-10-07",
-            .hash = "zig_libs-0.0.0-WiQ0Gl1dMAU6pyTI-eL40pFMZMNUzaEbp8lRnsOIwfnI",
+            .url = "git+https://github.com/zaxified/zig-libs#2026-10-18",
+            .hash = "zig_libs-0.0.0-WiQ0GhSb6gYTsronuZW_4cdNjQ8154NCdQJjMixzmJKG",
         },
         // To follow the development branch instead, or to pin one commit,
         // replace the two lines above with one of these and run
