@@ -754,6 +754,26 @@ whole `L`-limb digits through `montMul(digit, R² mod m)` on that basis.
   verified 2026-10-05) — an earlier version of this bullet said it still
   called `std.crypto.ff`, which is no longer true.
 
+## Build options
+
+Consumer build options (CONVENTIONS §4.2), added 2026-10-18 at wgs's request:
+
+| option | values | default | `-Dprofile=small` |
+|---|---|---|---|
+| `montint-asm-unroll` | `true` / `false` | `true` (graded) | `false` |
+
+- **`false`:** on an asm-capable target (amd64 with ADX/BMI2), `Modint.montMul`/`montSqr` at `L >= fixed_min_limbs` (16 limbs,
+  1024 bits) run the one looped asm kernel (`asm_core.montMul`/`montSqr`, runtime `n`) instead of the per-`L` straight-line
+  kernels (`montMulFixed`/`montMulBlock`/`montSqrFixed`/`montSqrBlock`). Same results; same constant-time shape (the looped kernel
+  is the ctgrind `asmcore` row and is differentially tested against the portable CIOS). Below 1024 bits and on other targets
+  nothing changes.
+- **What it buys:** the per-slot unrolled kernels. Size probe `tools/sizeprobe.zig` (`DynModint(8192)`, one secret `pow`;
+  ReleaseSmall, native ADX/BMI2 x86_64, stripped): **319 288 → 173 104 B**; rsa's probe under `.small` (with its 4096-bit cap)
+  319 128 → 233 400 B.
+- **What it costs** (`MONTINT_BENCH=1`, ReleaseFast, `powMont`, this host 2026-10-18): modexp 1024-bit 291 → 592 µs (2.0×),
+  2048-bit 1.98 → 3.54 ms (1.8×), 4096-bit 14.9 → 23.5 ms (1.6×). An RSA-2048 signature (two 1024-bit CRT halves) is ~2× slower.
+  Still 3.9–5.4× faster than `std.crypto.ff`.
+
 ## Backlog / deferred
 
 - **`DynModint` code size — slot policy (DEFAULT) + build option `montint-asm-unroll`** (wgs request 2026-10-17; decisions
@@ -768,7 +788,7 @@ whole `L`-limb digits through `montMul(digit, R² mod m)` on that basis.
      keys keep an exact slot (the same `Modint(64·L)` instantiation as before, so the same code); an odd size runs one slot up
      (e.g. a 1100-bit modulus at 1536 bits). **Measured** (rsa sizeprobe, ReleaseSmall, native ADX/BMI2 x86_64, stripped):
      default 863 144 → 427 536 B, `-Dprofile=small` 436 768 → 319 128 B — the new DEFAULT is smaller than the old `.small`.
-  2. **Knob `montint-asm-unroll`** (CONVENTIONS §4.2): default = straight-line asm (as graded); `.small` = the looped engine above
+  2. ✅ 2026-10-18 — see § Build options. Was: **Knob `montint-asm-unroll`** (CONVENTIONS §4.2): default = straight-line asm (as graded); `.small` = the looped engine above
      N limbs. Expected to remove most of what is left on ADX CPUs; costs speed — measure the bench delta and state it.
   Rejected: a non-unrolled generic path for all large slots by default (re-proving constant time for no default gain).
 - ~~**Review 2026-10-03 (independent, read-only) — no wrong value found; five LOW items**~~ ✅ 2026-10-06 (L1–L4 each with a test that failed on the old code; L5 by a ReleaseFast probe, a panic being untestable in-process):

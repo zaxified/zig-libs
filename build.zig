@@ -521,6 +521,11 @@ pub fn build(b: *std.Build) void {
         "ct25519-base-comb",
         "ct25519: fixed-base comb table for mulBase/X25519 keygen (default true; profile=small false, ~3x slower keygen, -43 KB table)",
     ));
+    zl_options.addOption(?bool, "montint_asm_unroll", b.option(
+        bool,
+        "montint-asm-unroll",
+        "montint: straight-line asm per limb count from 1024 bits up (default true; profile=small false = one looped asm kernel, slower modexp, much less code on ADX/BMI2 CPUs)",
+    ));
     zl_options_mod = zl_options.createModule();
 
     // Gate for the "a body nothing references is never analysed" class — see

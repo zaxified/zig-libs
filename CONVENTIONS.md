@@ -353,7 +353,7 @@ from, but the field is not limited to that evidence.
 
 ### 4.2 Consumer build options
 
-(2026-10-17, knobs so far: `rsa-max-modulus-bits`, `ct25519-base-comb`.) A consumer **application** may tune a
+(2026-10-17, knobs so far: `rsa-max-modulus-bits`, `ct25519-base-comb`, `montint-asm-unroll`.) A consumer **application** may tune a
 module for code size at build time:
 
 ```zig

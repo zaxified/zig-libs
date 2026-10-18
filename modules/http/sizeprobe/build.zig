@@ -51,6 +51,8 @@ pub fn build(b: *std.Build) void {
     const zl_options = b.addOptions();
     zl_options.addOption(Profile, "profile", b.option(Profile, "profile", "default | small") orelse .default);
     zl_options.addOption(?u32, "rsa_max_modulus_bits", b.option(u32, "rsa-max-modulus-bits", "rsa cap (4096..8192)"));
+    zl_options.addOption(?bool, "ct25519_base_comb", b.option(bool, "ct25519-base-comb", "ct25519 fixed-base comb"));
+    zl_options.addOption(?bool, "montint_asm_unroll", b.option(bool, "montint-asm-unroll", "montint per-L straight-line asm"));
     rsa_mod.addImport("zl_options", zl_options.createModule());
     rsa_mod.addImport("aescbc", dep.mod(b, target, optimize, "aescbc"));
     rsa_mod.addImport("aes192", dep.mod(b, target, optimize, "aes192"));

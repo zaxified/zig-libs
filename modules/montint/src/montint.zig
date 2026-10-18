@@ -80,6 +80,25 @@ pub const sqr_min_limbs: usize = 8;
 /// benched and differentially tested, but no `Modint` reaches it).
 pub const fixed_min_limbs: usize = 16;
 
+/// Whether `Modint` emits straight-line asm per limb count (`montMulFixed`,
+/// `montMulBlock`, `montSqrFixed`, `montSqrBlock`: rows unrolled at comptime
+/// for each `L`) from `fixed_min_limbs` up.
+///
+/// **Consumer build option** (CONVENTIONS §4.2; wgs request 2026-10-17):
+/// `-Dmontint-asm-unroll=false`, or `-Dprofile=small`, routes every
+/// `L >= fixed_min_limbs` on an asm-capable target to the ONE looped asm
+/// kernel instead (`asm_core.montMul`/`montSqr`, runtime `n`: the same MULX/
+/// ADCX/ADOX rows in 4-limb-unrolled loops, the same constant-time shape,
+/// differentially tested and ctgrind-checked as `asmcore`). Same results;
+/// slower modexp (see SPEC "Build options"); far less code, since every
+/// `DynModint` slot otherwise carries its own unrolled kernels. The default
+/// keeps the unrolled kernels: the grade is measured on them.
+pub const asm_unroll: bool = zl_options.montint_asm_unroll orelse switch (zl_options.profile) {
+    .default => true,
+    .small => false,
+};
+const zl_options = @import("zl_options");
+
 /// A modulus + its Montgomery constants, parameterized by an upper bound on the
 /// modulus bit-width. `L = ceil(max_bits/64)` full 2^64 limbs; the modulus
 /// occupies exactly `L` limbs (leading zero limbs are allowed as long as the
@@ -365,7 +384,9 @@ pub fn Modint(comptime max_bits: comptime_int) type {
             var z: Elem = undefined;
             // Small-L cutoff: asm only pays off for large moduli (see
             // `asm_min_limbs`); pairing fields (L=4/6) stay portable.
-            if (comptime asm_active and L % 8 == 0 and L >= asm_core.block_min_limbs) {
+            if (comptime asm_active and !asm_unroll and L >= fixed_min_limbs) {
+                asm_core.montMul(&z, a, b, &self.m, self.n0inv);
+            } else if (comptime asm_active and L % 8 == 0 and L >= asm_core.block_min_limbs) {
                 asm_core.montMulBlock(L, &z, a, b, &self.m, self.n0inv);
             } else if (comptime asm_active and L >= fixed_min_limbs) {
                 asm_core.montMulFixed(L, &z, a, b, &self.m, self.n0inv);
@@ -402,6 +423,12 @@ pub fn Modint(comptime max_bits: comptime_int) type {
         ///   * else (tiny L, incl. the pairing-field sizes) → `montMulCios(a,a)`,
         ///     where the general multiply is as fast or faster.
         pub fn montSqr(self: *const Self, a: *const Elem) Elem {
+            if (comptime asm_active and !asm_unroll and L >= fixed_min_limbs) {
+                var z: Elem = undefined;
+                var scratch: [2 * L]u64 = undefined;
+                asm_core.montSqr(&z, a, &self.m, self.n0inv, &scratch);
+                return z;
+            }
             if (comptime asm_active and L % 8 == 0 and L >= asm_core.block_min_limbs) {
                 var z: Elem = undefined;
                 asm_core.montSqrBlock(L, &z, a, &self.m, self.n0inv);
