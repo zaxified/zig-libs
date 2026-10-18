@@ -1982,7 +1982,10 @@ cmd_checks() {
 # with a default-profile run.
 small_closure() {
     local tsv readers m changed name deps _rest
-    readers="$(rg -l '@import\("zl_options"\)' modules/*/src 2>/dev/null | cut -d/ -f2 | sort -u | paste -sd' ')"
+    # git grep, not rg: the CI runners have no ripgrep, and with its stderr
+    # discarded the first `small` lane (run 39109334266) read that as "no
+    # module reads zl_options".
+    readers="$(git grep -l -F '@import("zl_options")' -- 'modules/*/src/*.zig' | cut -d/ -f2 | sort -u | paste -sd' ')"
     if [[ -z "$readers" ]]; then
         echo "test.sh small: no module imports zl_options -- refusing to pass vacuously" >&2
         exit 1
