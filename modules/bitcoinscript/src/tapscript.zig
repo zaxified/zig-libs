@@ -423,13 +423,13 @@ test "BIP341 KAT: control-block commitment verifies for single-leaf script paths
 }
 
 test "controlBlockValid: length must be 33 + 32m, m <= 128" {
-    try testing.expect(controlBlockValid(&([_]u8{0} ** 33)));
-    try testing.expect(controlBlockValid(&([_]u8{0} ** 65)));
-    try testing.expect(!controlBlockValid(&([_]u8{0} ** 32)));
-    try testing.expect(!controlBlockValid(&([_]u8{0} ** 34)));
-    try testing.expect(!controlBlockValid(&([_]u8{0} ** 64)));
+    try testing.expect(controlBlockValid(&(@as([33]u8, @splat(0)))));
+    try testing.expect(controlBlockValid(&(@as([65]u8, @splat(0)))));
+    try testing.expect(!controlBlockValid(&(@as([32]u8, @splat(0)))));
+    try testing.expect(!controlBlockValid(&(@as([34]u8, @splat(0)))));
+    try testing.expect(!controlBlockValid(&(@as([64]u8, @splat(0)))));
     // 33 + 32*129 = 4161 -> too many nodes.
-    try testing.expect(!controlBlockValid(&([_]u8{0} ** (33 + 32 * 129))));
+    try testing.expect(!controlBlockValid(&(@as([33 + 32 * 129]u8, @splat(0)))));
 }
 
 test "sigMsg ext_flag=0 prefix matches bitcointx key-path sigMsg byte-for-byte" {
@@ -439,20 +439,20 @@ test "sigMsg ext_flag=0 prefix matches bitcointx key-path sigMsg byte-for-byte" 
     // ext_flag=1 extension. We assert the full common prefix is identical.
     const a = testing.allocator;
     var vin = [_]bitcointx.TxIn{
-        .{ .prevout = .{ .txid = [_]u8{0xaa} ** 32, .vout = 1 }, .script_sig = &.{}, .sequence = 0xfffffffd },
-        .{ .prevout = .{ .txid = [_]u8{0xbb} ** 32, .vout = 7 }, .script_sig = &.{}, .sequence = 0xffffffff },
+        .{ .prevout = .{ .txid = @as([32]u8, @splat(0xaa)), .vout = 1 }, .script_sig = &.{}, .sequence = 0xfffffffd },
+        .{ .prevout = .{ .txid = @as([32]u8, @splat(0xbb)), .vout = 7 }, .script_sig = &.{}, .sequence = 0xffffffff },
     };
     var vout = [_]bitcointx.TxOut{
-        .{ .value = 1234, .script_pubkey = &[_]u8{ 0x51, 0x20 } ++ [_]u8{0xcc} ** 32 },
+        .{ .value = 1234, .script_pubkey = &[_]u8{ 0x51, 0x20 } ++ @as([32]u8, @splat(0xcc)) },
         .{ .value = 5678, .script_pubkey = &[_]u8{0x6a} },
     };
     const t: bitcointx.Transaction = .{ .version = 2, .vin = &vin, .vout = &vout, .witness = &.{}, .locktime = 500000, .has_witness = true };
     const spent = [_]bitcointx.TxOut{
-        .{ .value = 9000, .script_pubkey = &[_]u8{ 0x51, 0x20 } ++ [_]u8{0x11} ** 32 },
-        .{ .value = 8000, .script_pubkey = &[_]u8{ 0x51, 0x20 } ++ [_]u8{0x22} ** 32 },
+        .{ .value = 9000, .script_pubkey = &[_]u8{ 0x51, 0x20 } ++ @as([32]u8, @splat(0x11)) },
+        .{ .value = 8000, .script_pubkey = &[_]u8{ 0x51, 0x20 } ++ @as([32]u8, @splat(0x22)) },
     };
 
-    const exec: ExecData = .{ .tapleaf_hash = [_]u8{0x33} ** 32, .codesep_pos = 0xffffffff };
+    const exec: ExecData = .{ .tapleaf_hash = @as([32]u8, @splat(0x33)), .codesep_pos = 0xffffffff };
     const hash_types = [_]u8{ 0x00, 0x01, 0x02, 0x03, 0x81, 0x82, 0x83 };
     for (hash_types) |ht| {
         // SINGLE-family needs a corresponding output for input 1 (present).

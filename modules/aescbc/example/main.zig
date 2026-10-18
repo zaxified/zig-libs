@@ -102,7 +102,7 @@ pub fn main() !void {
     // distinction a caller porting between `jwe` (PKCS#7) and `xmlenc`
     // (XML-Enc) has to get right, and the reason picking the wrong unpad
     // helper for the wire format you actually have is a real defect class.
-    var xmlenc_block = [_]u8{0} ** aescbc.block_len;
+    var xmlenc_block = @as([aescbc.block_len]u8, @splat(0));
     xmlenc_block[aescbc.block_len - 1] = 4; // length byte: valid for both schemes
     xmlenc_block[aescbc.block_len - 2] = 0xAA; // arbitrary — legal under XML-Enc only
     xmlenc_block[aescbc.block_len - 3] = 0x00;

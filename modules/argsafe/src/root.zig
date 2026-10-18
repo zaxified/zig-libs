@@ -628,13 +628,13 @@ test "documented edges of every predicate (mutation 2026-10-04)" {
     // isSafeIdentifier: `[A-Za-z0-9_-]` -- no `.`.
     try testing.expect(!isSafeIdentifier("a.b"));
     // isSafePath: "≤ 4096 bytes", "no control bytes" (DEL included).
-    const p4096 = "/" ++ "a" ** 4095;
+    const p4096 = "/" ++ strRepeat("a", 4095);
     try testing.expect(isSafePath(p4096));
     try testing.expect(!isSafePath(p4096 ++ "a"));
     try testing.expect(!isSafePath("/a\x7f"));
     // isSafeBase64 without exact_len: "1..512 bytes".
-    try testing.expect(isSafeBase64("A" ** 512, null));
-    try testing.expect(!isSafeBase64("A" ** 513, null));
+    try testing.expect(isSafeBase64(strRepeat("A", 512), null));
+    try testing.expect(!isSafeBase64(strRepeat("A", 513), null));
     // isSafeCidrList: hex digits only -- `G`..`Z` are not.
     try testing.expect(isSafeCidrList("fe80::/10,10.0.0.0/8", ','));
     try testing.expect(!isSafeCidrList("Z", ','));
@@ -925,7 +925,7 @@ test "CharClass.explain(s) == null iff check(s), over a representative sweep" {
 test "CharClass.explain: each Reason is reachable and matches its condition" {
     const default: CharClass = .{};
     try testing.expectEqual(CharClass.Reason.too_short, default.explain("").?);
-    try testing.expectEqual(CharClass.Reason.too_long, default.explain("a" ** 129).?);
+    try testing.expectEqual(CharClass.Reason.too_long, default.explain(strRepeat("a", 129)).?);
     try testing.expectEqual(CharClass.Reason.nul_byte, default.explain("a\x00b").?);
     try testing.expectEqual(CharClass.Reason.leading_dash, default.explain("-x").?);
     try testing.expectEqual(CharClass.Reason.forbidden_substring, default.explain("a..b").?);
@@ -1081,4 +1081,16 @@ test "Template.fill: a wrong number of values is an error, not an out-of-bounds 
     const t = try Template.parse(&.{ "systemctl", "restart", "{unit}" }, &.{.{ .name = "unit", .class = .{} }});
     try testing.expectError(error.ValueCountMismatch, t.fill(testing.allocator, &.{}));
     try testing.expectError(error.ValueCountMismatch, t.fill(testing.allocator, &.{ "a", "b" }));
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

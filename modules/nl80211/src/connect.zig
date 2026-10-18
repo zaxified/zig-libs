@@ -172,7 +172,7 @@ pub fn buildConnect(
     if (opts.prev_bssid) |m| try appendRaw(gpa, &list, uapi.ATTR.PREV_BSSID, &m);
     if (opts.freq_mhz) |f| try codec.appendAttrU32(gpa, &list, uapi.ATTR.WIPHY_FREQ, f);
     if (opts.auth_type) |a|
-        try codec.appendAttrU32(gpa, &list, uapi.ATTR.AUTH_TYPE, @intFromEnum(a));
+        try codec.appendAttrU32(gpa, &list, uapi.ATTR.AUTH_TYPE, @backingInt(a));
     if (opts.ie_bytes.len != 0) try appendRaw(gpa, &list, uapi.ATTR.IE, opts.ie_bytes);
     if (opts.privacy) try appendRaw(gpa, &list, uapi.ATTR.PRIVACY, &.{});
 
@@ -203,7 +203,7 @@ pub fn buildConnect(
     if (opts.akm_suites.len != 0)
         try appendU32Array(gpa, &list, uapi.ATTR.AKM_SUITES, opts.akm_suites);
     if (opts.use_mfp) |m|
-        try codec.appendAttrU32(gpa, &list, uapi.ATTR.USE_MFP, @intFromEnum(m));
+        try codec.appendAttrU32(gpa, &list, uapi.ATTR.USE_MFP, @backingInt(m));
     if (opts.pmk) |p| try appendRaw(gpa, &list, uapi.ATTR.PMK, p);
     if (opts.want_1x_4way_hs) try appendRaw(gpa, &list, uapi.ATTR.WANT_1X_4WAY_HS, &.{});
     if (opts.socket_owner) try appendRaw(gpa, &list, uapi.ATTR.SOCKET_OWNER, &.{});
@@ -303,7 +303,7 @@ test "buildConnect rejects malformed parameters" {
     try testing.expectError(error.InvalidRequest, buildConnect(gpa, 41, 1, .{
         .ifindex = 3,
         .ssid = "net",
-        .pmk = &[_]u8{0} ** 16,
+        .pmk = &@as([16]u8, @splat(0)),
     }));
     // A WEP key that is neither 5 nor 13 bytes.
     try testing.expectError(error.InvalidRequest, buildConnect(gpa, 41, 1, .{

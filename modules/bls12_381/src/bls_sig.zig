@@ -241,11 +241,11 @@ fn hexBytes(comptime n: usize, comptime hex: *const [2 * n:0]u8) [n]u8 {
 // ── tests: REAL, PASS today ──────────────────────────────────────────
 
 test "SecretKey.deinit zeroizes the secret scalar (regression: fails if secureZero is removed)" {
-    var sk_bytes = [_]u8{0} ** 32;
+    var sk_bytes = @as([32]u8, @splat(0));
     sk_bytes[31] = 7;
     var sk: SecretKey = undefined;
     try SecretKey.fromBytes(&sk, &sk_bytes);
-    const zero_bytes = [_]u8{0} ** 32;
+    const zero_bytes = @as([32]u8, @splat(0));
     try std.testing.expect(!std.mem.eql(u8, &testSkBytes(&sk), &zero_bytes));
     sk.deinit();
     // `Fr`'s in-memory (Montgomery) size may exceed its 32-byte canonical
@@ -255,7 +255,7 @@ test "SecretKey.deinit zeroizes the secret scalar (regression: fails if secureZe
 }
 
 test "SecretKey/PublicKey/Signature byte codecs round-trip through Part-1-3 machinery" {
-    var sk_bytes = [_]u8{0} ** 32;
+    var sk_bytes = @as([32]u8, @splat(0));
     sk_bytes[31] = 7;
     var sk: SecretKey = undefined;
     try SecretKey.fromBytes(&sk, &sk_bytes);
@@ -276,12 +276,12 @@ test "SecretKey/PublicKey/Signature byte codecs round-trip through Part-1-3 mach
 
 test "keyGen rejects IKM shorter than 32 bytes" {
     var short: SecretKey = undefined;
-    try std.testing.expectError(error.IkmTooShort, keyGen(&short, &[_]u8{0} ** 31, ""));
-    try keyGen(&short, &[_]u8{0x42} ** 32, ""); // 32 bytes: must not error
+    try std.testing.expectError(error.IkmTooShort, keyGen(&short, &@as([31]u8, @splat(0)), ""));
+    try keyGen(&short, &@as([32]u8, @splat(0x42)), ""); // 32 bytes: must not error
 }
 
 test "keyGen is deterministic (same IKM/key_info -> same SK) and produces a nonzero scalar" {
-    const ikm = [_]u8{0xab} ** 32;
+    const ikm = @as([32]u8, @splat(0xab));
     var a: SecretKey = undefined;
     try keyGen(&a, &ikm, "");
     var b: SecretKey = undefined;
@@ -305,7 +305,7 @@ test "keyGen matches an independent Python recomputation of the -05 construction
     // mutation run of that date dropped the I2OSP(0, 1) octet and nothing
     // failed.
     var a: SecretKey = undefined;
-    try keyGen(&a, &([_]u8{0xab} ** 32), "");
+    try keyGen(&a, &(@as([32]u8, @splat(0xab))), "");
     try std.testing.expectEqualSlices(u8, &hexBytes(32, "5122c7e03ead241c21b84fe0afce6ce677f68bb82fb5ca6253b3c7e862a61905"), &a.scalar.toBytes());
     var ikm: [32]u8 = undefined;
     for (&ikm, 0..) |*b, i| b.* = @intCast(i);
@@ -316,7 +316,7 @@ test "keyGen matches an independent Python recomputation of the -05 construction
 
 test "skToPk produces a subgroup-valid, non-identity public key; keyValidate accepts it" {
     var sk: SecretKey = undefined;
-    try keyGen(&sk, &([_]u8{0x11} ** 32), "");
+    try keyGen(&sk, &(@as([32]u8, @splat(0x11))), "");
     const pk = skToPk(&sk);
     try std.testing.expect(!pk.point.infinity);
     try std.testing.expect(keyValidate(pk));
@@ -331,7 +331,7 @@ test "keyValidate rejects a non-subgroup G1 point" {
     // Same x=4 non-subgroup construction g1.zig's own subgroupCheck
     // test uses (independently verified there: on-curve, NOT in the
     // order-r subgroup).
-    var comp = [_]u8{0} ** g1.compressed_bytes;
+    var comp = @as([g1.compressed_bytes]u8, @splat(0));
     comp[0] = 0x80;
     comp[g1.compressed_bytes - 1] = 4;
     // The decoder refuses it; a `PublicKey` built around it some other way
@@ -463,23 +463,23 @@ test "fastAggregateVerify KAT: three pubkeys + the aggregate signature over thei
 
 test "PopProve/PopVerify round-trip (self-consistent — no external vector needed)" {
     var sk: SecretKey = undefined;
-    try keyGen(&sk, &([_]u8{0x22} ** 32), "");
+    try keyGen(&sk, &(@as([32]u8, @splat(0x22))), "");
     const pk = skToPk(&sk);
     const proof = popProve(&sk);
     try std.testing.expect(popVerify(pk, proof));
 
     // A proof for a DIFFERENT key must not verify.
     var other_sk: SecretKey = undefined;
-    try keyGen(&other_sk, &([_]u8{0x33} ** 32), "");
+    try keyGen(&other_sk, &(@as([32]u8, @splat(0x33))), "");
     const other_pk = skToPk(&other_sk);
     try std.testing.expect(!popVerify(other_pk, proof));
 }
 
 test "end-to-end round trip: keyGen -> skToPk -> sign -> verify -> aggregate -> aggregateVerify (fresh key material, no external constant needed)" {
     var sk1: SecretKey = undefined;
-    try keyGen(&sk1, &([_]u8{0x01} ** 32), "");
+    try keyGen(&sk1, &(@as([32]u8, @splat(0x01))), "");
     var sk2: SecretKey = undefined;
-    try keyGen(&sk2, &([_]u8{0x02} ** 32), "");
+    try keyGen(&sk2, &(@as([32]u8, @splat(0x02))), "");
     const pk1 = skToPk(&sk1);
     const pk2 = skToPk(&sk2);
 
@@ -508,7 +508,7 @@ test "verify rejects the identity public key (KeyValidate fires, fail-closed, no
     // only invalid ingredient is the identity pubkey, so a `true` or a
     // panic here would mean the mandatory KeyValidate step is missing.
     var sk: SecretKey = undefined;
-    try keyGen(&sk, &([_]u8{0x55} ** 32), "");
+    try keyGen(&sk, &(@as([32]u8, @splat(0x55))), "");
     const msg = "identity pk must never verify";
     const sig = sign(&sk, msg);
 
@@ -537,7 +537,7 @@ test "fastAggregateVerify rejects a ROGUE-KEY pair (cancels to identity) + the t
     // aggregated key stands between an attacker who controls no secret
     // key at all and a signature that "verifies" for any message.
     var sk: SecretKey = undefined;
-    try keyGen(&sk, &([_]u8{0x77} ** 32), "");
+    try keyGen(&sk, &(@as([32]u8, @splat(0x77))), "");
     const pk1 = skToPk(&sk);
     try std.testing.expect(keyValidate(pk1)); // precondition: pk1 alone is fine
     const pk2: PublicKey = .{ .point = g1.Jacobian.fromAffine(pk1.point).negate().toAffine() };
@@ -560,7 +560,7 @@ test "verify rejects a non-subgroup G2 signature (signature_subgroup_check fires
 
     var sk: SecretKey = undefined;
 
-    try keyGen(&sk, &([_]u8{0x66} ** 32), "");
+    try keyGen(&sk, &(@as([32]u8, @splat(0x66))), "");
     const pk = skToPk(&sk);
     const bad_sig: Signature = .{ .point = raw };
     const msg = "non-subgroup sig must never verify";
@@ -594,7 +594,7 @@ test "aggregateVerify with more signers than one Miller chunk (exercises the chu
     };
     var sigs: [n]Signature = undefined;
     for (0..n) |i| {
-        var ikm = [_]u8{0x70} ** 32;
+        var ikm = @as([32]u8, @splat(0x70));
         ikm[31] = @intCast(i);
         try keyGen(&sks[i], &ikm, "");
         pks[i] = skToPk(&sks[i]);

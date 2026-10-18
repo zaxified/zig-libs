@@ -49,10 +49,10 @@ pub fn damage(src: anytype, buf: []u8, frame: []const u8) usize {
 /// Reach counters for one harness file's labels (see jwt's fuzz_test.zig).
 pub fn Marker(comptime Label: type) type {
     return struct {
-        var counts: [@typeInfo(Label).@"enum".fields.len]usize = @splat(0);
+        var counts: [@typeInfo(Label).@"enum".field_names.len]usize = @splat(0);
 
         pub fn mark(comptime l: Label) void {
-            counts[@intFromEnum(l)] += 1;
+            counts[@backingInt(l)] += 1;
             fuzz_driver.hit(@tagName(l));
         }
 
@@ -67,7 +67,7 @@ pub fn Marker(comptime Label: type) type {
                 };
             }
             for (counts, 0..) |n, i| if (n == 0) {
-                std.debug.print("reach: " ++ name ++ " label {t} never hit in {d} seeds\n", .{ @as(Label, @enumFromInt(i)), seeds });
+                std.debug.print("reach: " ++ name ++ " label {t} never hit in {d} seeds\n", .{ @as(Label, @fromBackingInt(@intCast(i))), seeds });
                 return error.HarnessDoesNotReach;
             };
         }
@@ -113,7 +113,7 @@ pub fn fuzzGoose(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!voi
     var kp = try keyPair(0x44);
     defer std.crypto.secureZero(u8, std.mem.asBytes(&kp));
     const Which = enum { hmac80, hmac128, hmac256, gmac64, gmac128, ecdsa };
-    const which: Which = @enumFromInt(src.index(6));
+    const which: Which = @fromBackingInt(@intCast(src.index(6)));
     var iv_counter = goose.IvCounter.init(appid);
     var frame_buf: [512]u8 = undefined;
     var sealer: goose.Sealer = undefined;

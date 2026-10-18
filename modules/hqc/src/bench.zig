@@ -54,8 +54,8 @@ test "bench (opt-in via HQC_BENCH)" {
         std.testing.environ.getPosix("HQC_BENCH") == null) return error.SkipZigTest;
 
     const Kem = root.Hqc128;
-    const seed = [_]u8{0x5a} ** 32;
-    const coins = [_]u8{0xa5} ** Kem.coins_bytes;
+    const seed = @as([32]u8, @splat(0x5a));
+    const coins = @as([Kem.coins_bytes]u8, @splat(0xa5));
 
     const kp = keypairV(Kem, &seed);
     const enc = encapsV(Kem, kp.ek, &coins);
@@ -128,8 +128,8 @@ test "profile workload for perf (opt-in via HQC_PROFILE)" {
         var ek: Kem.EncapsKey = undefined;
         var dk: Kem.DecapsKey = undefined;
         var ct: Kem.Ciphertext = undefined;
-        var sd: [32]u8 = [_]u8{0x5a} ** 32;
-        var cn: [Kem.coins_bytes]u8 = [_]u8{0xa5} ** Kem.coins_bytes;
+        var sd: [32]u8 = @as([32]u8, @splat(0x5a));
+        var cn: [Kem.coins_bytes]u8 = @as([Kem.coins_bytes]u8, @splat(0xa5));
 
         noinline fn profKeypair(n: usize) void {
             for (0..n) |_| std.mem.doNotOptimizeAway(keypairV(Kem, &sd).ek[0]);

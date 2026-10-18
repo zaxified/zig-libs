@@ -168,7 +168,7 @@ test "KAT: signWithKeyPair gives sign's bytes; forged key pairs never sign" {
         other_parity.secret = (try Scalar.fromBytes(kp.secret, .big)).neg().toBytes(.big);
         try std.testing.expectError(error.SignatureVerificationFailed, bip340.signWithKeyPair(&other_parity, msg, aux, io));
         var zero = kp;
-        zero.secret = [_]u8{0} ** 32;
+        zero.secret = @as([32]u8, @splat(0));
         try std.testing.expectError(error.SignatureVerificationFailed, bip340.signWithKeyPair(&zero, msg, aux, io));
         var order = kp;
         std.mem.writeInt(u256, &order.secret, k256.Secp256k1.scalar.field_order, .big);
@@ -387,7 +387,7 @@ pub fn verifyHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror
     const n: usize = src.slice(&buf);
     // `fromBytes` takes exactly 64 octets, so a short draw is zero-padded the
     // way a short wire read would have to be.
-    var bytes: [64]u8 = [_]u8{0} ** 64;
+    var bytes: [64]u8 = @as([64]u8, @splat(0));
     @memcpy(bytes[0..n], buf[0..n]);
 
     // Overlays steer random bytes to the places the range checks and the
@@ -449,7 +449,7 @@ test "corpus: every signature seed reaches fromBytes, and the outcomes are pinne
         var buf: [64]u8 = undefined;
         const n: usize = smith.slice(&buf);
         if (n != 0) nonempty += 1;
-        var bytes: [64]u8 = [_]u8{0} ** 64;
+        var bytes: [64]u8 = @as([64]u8, @splat(0));
         @memcpy(bytes[0..n], buf[0..n]);
         const sig = bip340.Signature.fromBytes(bytes) catch {
             refused += 1;
@@ -493,14 +493,14 @@ test "batch: sizes across verifyBatch's chunks (1..25) accept; a bad item in any
     var msgs: [total][32]u8 = undefined;
     var items: [total]bip340.BatchItem = undefined;
     for (0..total) |i| {
-        var skb = [_]u8{0} ** 32;
+        var skb = @as([32]u8, @splat(0));
         skb[31] = @intCast(i + 1);
         skb[0] = 0x5A;
         const sk = try bip340.SecretKey.fromBytes(skb);
         var kp: bip340.KeyPair = undefined;
         try bip340.KeyPair.fromSecretKey(&kp, &sk);
-        msgs[i] = [_]u8{@intCast(i)} ** 32;
-        const sig = try bip340.sign(&sk, &msgs[i], [_]u8{0xA5} ** 32, io);
+        msgs[i] = @as([32]u8, @splat(@intCast(i)));
+        const sig = try bip340.sign(&sk, &msgs[i], @as([32]u8, @splat(0xA5)), io);
         items[i] = .{ .pubkey = kp.public, .msg = &msgs[i], .sig = try bip340.Signature.fromBytes(sig) };
     }
     for ([_]usize{ 1, 2, 7, 8, 9, 16, 17, 25 }) |n| {
@@ -524,17 +524,17 @@ test "batch: a random-linear-combination forgery (cancelling +d/-d pair) is REJE
     defer threaded.deinit();
     const io = threaded.io();
 
-    const sk1 = try bip340.SecretKey.fromBytes([_]u8{0xa1} ** 32);
-    const sk2 = try bip340.SecretKey.fromBytes([_]u8{0xb2} ** 32);
+    const sk1 = try bip340.SecretKey.fromBytes(@as([32]u8, @splat(0xa1)));
+    const sk2 = try bip340.SecretKey.fromBytes(@as([32]u8, @splat(0xb2)));
     var kp1: bip340.KeyPair = undefined;
     try bip340.KeyPair.fromSecretKey(&kp1, &sk1);
     defer kp1.deinit();
     var kp2: bip340.KeyPair = undefined;
     try bip340.KeyPair.fromSecretKey(&kp2, &sk2);
     defer kp2.deinit();
-    const m1 = [_]u8{0x11} ** 32;
-    const m2 = [_]u8{0x22} ** 32;
-    const aux = [_]u8{0} ** 32;
+    const m1 = @as([32]u8, @splat(0x11));
+    const m2 = @as([32]u8, @splat(0x22));
+    const aux = @as([32]u8, @splat(0));
 
     const sig1 = try bip340.sign(&sk1, &m1, aux, io);
     const sig2 = try bip340.sign(&sk2, &m2, aux, io);
@@ -546,7 +546,7 @@ test "batch: a random-linear-combination forgery (cancelling +d/-d pair) is REJE
     try std.testing.expect(bip340.verify(kp2.public, &m2, p2));
 
     // Craft the cancelling pair: s1 += delta, s2 -= delta.
-    const delta = Scalar.fromBytes([_]u8{0xde} ** 32, .big) catch unreachable;
+    const delta = Scalar.fromBytes(@as([32]u8, @splat(0xde)), .big) catch unreachable;
     const s1 = Scalar.fromBytes(p1.s, .big) catch unreachable;
     const s2 = Scalar.fromBytes(p2.s, .big) catch unreachable;
     const forged1 = bip340.Signature{ .r = p1.r, .s = s1.add(delta).toBytes(.big) };
@@ -594,7 +594,7 @@ test "F4: verify() re-checks r < p on a hand-constructed Signature (bypassing fr
 
 test "F4: verify() re-checks s < n on a hand-constructed Signature (bypassing fromBytes)" {
     const pk = try bip340.XOnlyPublicKey.fromBytes(try hex32(v.vectors[0].public_key));
-    const hand_built = bip340.Signature{ .r = [_]u8{0} ** 32, .s = try hex32(n_hex) };
+    const hand_built = bip340.Signature{ .r = @as([32]u8, @splat(0)), .s = try hex32(n_hex) };
     try std.testing.expect(!bip340.verify(pk, "msg", hand_built));
 }
 
@@ -610,9 +610,9 @@ test "F4: verify() re-checks the pubkey lifts on a hand-constructed XOnlyPublicK
     var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
-    const sk_one = try bip340.SecretKey.fromBytes([_]u8{0} ** 31 ++ [_]u8{1});
+    const sk_one = try bip340.SecretKey.fromBytes(@as([31]u8, @splat(0)) ++ [_]u8{1});
     const msg = "F4 lift-check witness";
-    const sig_bytes = try bip340.sign(&sk_one, msg, [_]u8{0} ** 32, io);
+    const sig_bytes = try bip340.sign(&sk_one, msg, @as([32]u8, @splat(0)), io);
     const sig = try bip340.Signature.fromBytes(sig_bytes);
 
     try std.testing.expect(!bip340.verify(hand_built_pk, msg, sig));
@@ -624,7 +624,7 @@ test "F4: verifyBatch() re-checks s < n on a hand-constructed BatchItem (bypassi
     const io = threaded.io();
 
     const pk = try bip340.XOnlyPublicKey.fromBytes(try hex32(v.vectors[0].public_key));
-    const hand_built = bip340.Signature{ .r = [_]u8{0} ** 32, .s = try hex32(n_hex) };
+    const hand_built = bip340.Signature{ .r = @as([32]u8, @splat(0)), .s = try hex32(n_hex) };
     const items = [_]bip340.BatchItem{.{ .pubkey = pk, .msg = "msg", .sig = hand_built }};
     try std.testing.expect(!bip340.verifyBatch(&items, io));
 }

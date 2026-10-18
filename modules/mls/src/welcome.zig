@@ -924,8 +924,8 @@ fn sampleGroupContext() keyschedule.GroupContext {
         .cipher_suite = TestSuite.id,
         .group_id = "welcome-test",
         .epoch = 3,
-        .tree_hash = &[_]u8{0x11} ** 32,
-        .confirmed_transcript_hash = &[_]u8{0x22} ** 32,
+        .tree_hash = &@as([32]u8, @splat(0x11)),
+        .confirmed_transcript_hash = &@as([32]u8, @splat(0x22)),
         .extensions = &.{},
     };
 }
@@ -941,9 +941,9 @@ test "GroupInfo: encodedLen matches what encode writes, and decode round-trips b
     const gi: GroupInfo = .{
         .group_context = sampleGroupContext(),
         .extensions = &.{},
-        .confirmation_tag = &[_]u8{0x33} ** 32,
+        .confirmation_tag = &@as([32]u8, @splat(0x33)),
         .signer = 2,
-        .signature = &[_]u8{0x44} ** 64,
+        .signature = &@as([64]u8, @splat(0x44)),
     };
     const bytes = try gi.encodeAlloc(testing.allocator);
     defer testing.allocator.free(bytes);
@@ -975,7 +975,7 @@ test "GroupInfo: sign then verify, and a flipped TBS byte is rejected" {
 
     var gi: GroupInfo = .{
         .group_context = sampleGroupContext(),
-        .confirmation_tag = &[_]u8{0x33} ** 32,
+        .confirmation_tag = &@as([32]u8, @splat(0x33)),
         .signer = 1,
         .signature = &.{},
     };
@@ -1003,12 +1003,12 @@ test "GroupInfo: sign then verify, and a flipped TBS byte is rejected" {
 
 test "GroupSecrets: both optional<PathSecret> arms round-trip, with and without PSKs" {
     const psks = [_]keyschedule.PreSharedKeyId{
-        .{ .id = .{ .external = "psk-id" }, .psk_nonce = &[_]u8{0x55} ** 32 },
+        .{ .id = .{ .external = "psk-id" }, .psk_nonce = &@as([32]u8, @splat(0x55)) },
     };
     const cases = [_]GroupSecrets{
-        .{ .joiner_secret = &[_]u8{0x66} ** 32 },
-        .{ .joiner_secret = &[_]u8{0x66} ** 32, .path_secret = &[_]u8{0x77} ** 32 },
-        .{ .joiner_secret = &[_]u8{0x66} ** 32, .path_secret = &[_]u8{0x77} ** 32, .psks = &psks },
+        .{ .joiner_secret = &@as([32]u8, @splat(0x66)) },
+        .{ .joiner_secret = &@as([32]u8, @splat(0x66)), .path_secret = &@as([32]u8, @splat(0x77)) },
+        .{ .joiner_secret = &@as([32]u8, @splat(0x66)), .path_secret = &@as([32]u8, @splat(0x77)), .psks = &psks },
     };
     for (cases) |gs| {
         const bytes = try gs.encodeAlloc(testing.allocator);
@@ -1030,13 +1030,13 @@ test "GroupSecrets: both optional<PathSecret> arms round-trip, with and without 
 
 test "Welcome: round-trips, and findSecret matches on the KeyPackageRef only" {
     const secrets = [_]EncryptedGroupSecrets{
-        .{ .new_member = &[_]u8{0xa1} ** 32, .encrypted_group_secrets = .{ .kem_output = &[_]u8{0xb1} ** 32, .ciphertext = &[_]u8{0xc1} ** 48 } },
-        .{ .new_member = &[_]u8{0xa2} ** 32, .encrypted_group_secrets = .{ .kem_output = &[_]u8{0xb2} ** 32, .ciphertext = &[_]u8{0xc2} ** 48 } },
+        .{ .new_member = &@as([32]u8, @splat(0xa1)), .encrypted_group_secrets = .{ .kem_output = &@as([32]u8, @splat(0xb1)), .ciphertext = &@as([48]u8, @splat(0xc1)) } },
+        .{ .new_member = &@as([32]u8, @splat(0xa2)), .encrypted_group_secrets = .{ .kem_output = &@as([32]u8, @splat(0xb2)), .ciphertext = &@as([48]u8, @splat(0xc2)) } },
     };
     const w: Welcome = .{
         .cipher_suite = TestSuite.id,
         .secrets = &secrets,
-        .encrypted_group_info = &[_]u8{0xd0} ** 64,
+        .encrypted_group_info = &@as([64]u8, @splat(0xd0)),
     };
     const bytes = try w.encodeAlloc(testing.allocator);
     defer testing.allocator.free(bytes);
@@ -1052,8 +1052,8 @@ test "Welcome: round-trips, and findSecret matches on the KeyPackageRef only" {
     defer testing.allocator.free(re);
     try testing.expectEqualSlices(u8, bytes, re);
 
-    try testing.expect(back.findSecret(&[_]u8{0xa2} ** 32) != null);
-    try testing.expect(back.findSecret(&[_]u8{0xa3} ** 32) == null);
+    try testing.expect(back.findSecret(&@as([32]u8, @splat(0xa2))) != null);
+    try testing.expect(back.findSecret(&@as([32]u8, @splat(0xa3))) == null);
 }
 
 test "welcomeKeyNonce: key and nonce are independent derivations of the same secret" {
@@ -1097,8 +1097,8 @@ test "encryptGroupSecrets/decryptGroupSecrets: round trip, and the encrypted_gro
     const kp = try TestSuite.Kem.KeyPair.generateDeterministic(seed);
     seed = @splat(0);
 
-    const egi = [_]u8{0x9e} ** 96;
-    const gs: GroupSecrets = .{ .joiner_secret = &[_]u8{0x42} ** 32, .path_secret = &[_]u8{0x43} ** 32 };
+    const egi = @as([96]u8, @splat(0x9e));
+    const gs: GroupSecrets = .{ .joiner_secret = &@as([32]u8, @splat(0x42)), .path_secret = &@as([32]u8, @splat(0x43)) };
     const gs_bytes = try gs.encodeAlloc(testing.allocator);
     defer testing.allocator.free(gs_bytes);
 
@@ -1133,7 +1133,7 @@ test "join: end-to-end against a Welcome this file also produced" {
     const sig_kp = try TestSuite.Sig.KeyPair.generateDeterministic(seed);
     seed = @splat(0);
 
-    const joiner_secret = [_]u8{0x31} ** TestSuite.Nh;
+    const joiner_secret = @as([TestSuite.Nh]u8, @splat(0x31));
     const psk_secret = keyschedule.zeroSecret(TestSuite);
     var welcome_secret: [TestSuite.Nh]u8 = undefined;
     try keyschedule.welcomeSecret(TestSuite, &joiner_secret, &psk_secret, &welcome_secret);
@@ -1167,7 +1167,7 @@ test "join: end-to-end against a Welcome this file also produced" {
     defer alloc.free(hpke_ct.kem_output);
     defer alloc.free(hpke_ct.ciphertext);
 
-    const kp_ref = [_]u8{0x77} ** 32;
+    const kp_ref = @as([32]u8, @splat(0x77));
     const slots = [_]EncryptedGroupSecrets{.{ .new_member = &kp_ref, .encrypted_group_secrets = hpke_ct }};
     const w: Welcome = .{ .cipher_suite = TestSuite.id, .secrets = &slots, .encrypted_group_info = egi };
 
@@ -1187,7 +1187,7 @@ test "join: end-to-end against a Welcome this file also produced" {
     // An unknown KeyPackageRef is a named refusal, not a decrypt attempt.
     try testing.expectError(error.NoMatchingKeyPackage, tJoin(alloc, .{
         .welcome = w,
-        .key_package_ref = &[_]u8{0x78} ** 32,
+        .key_package_ref = &@as([32]u8, @splat(0x78)),
         .init_key_pair = &init_kp,
         .signer_key = sig_kp.public_key,
     }));
@@ -1205,7 +1205,7 @@ test "join: end-to-end against a Welcome this file also produced" {
 
     // A caller that resolved no PSKs cannot join a Welcome that names one.
     const psk_ids = [_]keyschedule.PreSharedKeyId{
-        .{ .id = .{ .external = "some-psk" }, .psk_nonce = &[_]u8{0x11} ** 32 },
+        .{ .id = .{ .external = "some-psk" }, .psk_nonce = &@as([32]u8, @splat(0x11)) },
     };
     const gs_psk: GroupSecrets = .{ .joiner_secret = &joiner_secret, .psks = &psk_ids };
     const gs_psk_bytes = try gs_psk.encodeAlloc(alloc);
@@ -1224,7 +1224,7 @@ test "join: end-to-end against a Welcome this file also produced" {
     // the list is compared by identity, not only by count and length
     // (mutation 2026-10-06: no test reached the byte comparison).
     const other_psk = [_]keyschedule.PreSharedKey(TestSuite){.{
-        .id = .{ .id = .{ .external = "some-PSK" }, .psk_nonce = &[_]u8{0x11} ** 32 },
+        .id = .{ .id = .{ .external = "some-PSK" }, .psk_nonce = &@as([32]u8, @splat(0x11)) },
         .secret = "k",
     }};
     try testing.expectError(error.PskMismatch, tJoin(alloc, .{
@@ -1252,13 +1252,13 @@ test "join: a confirmation_tag that does not match the derived confirmation_key 
     const sig_kp = try TestSuite.Sig.KeyPair.generateDeterministic(seed);
     seed = @splat(0);
 
-    const joiner_secret = [_]u8{0x31} ** TestSuite.Nh;
+    const joiner_secret = @as([TestSuite.Nh]u8, @splat(0x31));
     const zero_psk = keyschedule.zeroSecret(TestSuite);
     var welcome_secret: [TestSuite.Nh]u8 = undefined;
     try keyschedule.welcomeSecret(TestSuite, &joiner_secret, &zero_psk, &welcome_secret);
 
     const gc = sampleGroupContext();
-    const bad_tag = [_]u8{0xee} ** TestSuite.Nm;
+    const bad_tag = @as([TestSuite.Nm]u8, @splat(0xee));
     var gi: GroupInfo = .{ .group_context = gc, .confirmation_tag = &bad_tag, .signer = 0, .signature = &.{} };
     const sig = try gi.sign(TestSuite, alloc, &sig_kp);
     const sig_bytes = sig.toBytes();
@@ -1276,7 +1276,7 @@ test "join: a confirmation_tag that does not match the derived confirmation_key 
     defer alloc.free(hpke_ct.kem_output);
     defer alloc.free(hpke_ct.ciphertext);
 
-    const kp_ref = [_]u8{0x77} ** 32;
+    const kp_ref = @as([32]u8, @splat(0x77));
     const slots = [_]EncryptedGroupSecrets{.{ .new_member = &kp_ref, .encrypted_group_secrets = hpke_ct }};
 
     try testing.expectError(error.MacMismatch, tJoin(alloc, .{
@@ -1294,8 +1294,8 @@ test "verifyTreeHash / ratchetTree / externalPub: the three GroupInfo-extension 
     // test is the COMPARISON against the signed GroupContext, and
     // `treehash.zig` is already vector-pinned for the hash itself.
     const leaf: tree.LeafNode = .{
-        .encryption_key = &[_]u8{0xaa} ** 32,
-        .signature_key = &[_]u8{0xbb} ** 32,
+        .encryption_key = &@as([32]u8, @splat(0xaa)),
+        .signature_key = &@as([32]u8, @splat(0xbb)),
         .credential = .{ .basic = "solo" },
         .capabilities = .{
             .versions = &[_]u16{1},
@@ -1307,7 +1307,7 @@ test "verifyTreeHash / ratchetTree / externalPub: the three GroupInfo-extension 
         .leaf_node_source = .key_package,
         .lifetime = .{ .not_before = 0, .not_after = 1 },
         .extensions = &.{},
-        .signature = &[_]u8{0xcc} ** 64,
+        .signature = &@as([64]u8, @splat(0xcc)),
     };
     var nodes = [_]?tree.Node{.{ .leaf = leaf }};
     const t: tree.RatchetTree = .{ .allocator = alloc, .nodes = &nodes };
@@ -1315,7 +1315,7 @@ test "verifyTreeHash / ratchetTree / externalPub: the three GroupInfo-extension 
     defer alloc.free(encoded);
     const root = try treehash.rootHash(TestSuite, alloc, &t);
 
-    const ext_pub_body = [_]u8{0x20} ++ [_]u8{0x5e} ** 32; // opaque<V> of 32 bytes
+    const ext_pub_body = [_]u8{0x20} ++ @as([32]u8, @splat(0x5e)); // opaque<V> of 32 bytes
     const exts = [_]tree.Extension{
         .{ .extension_type = extension_type_ratchet_tree, .extension_data = encoded },
         .{ .extension_type = extension_type_external_pub, .extension_data = &ext_pub_body },
@@ -1325,9 +1325,9 @@ test "verifyTreeHash / ratchetTree / externalPub: the three GroupInfo-extension 
     const gi: GroupInfo = .{
         .group_context = gc,
         .extensions = &exts,
-        .confirmation_tag = &[_]u8{0x33} ** 32,
+        .confirmation_tag = &@as([32]u8, @splat(0x33)),
         .signer = 0,
-        .signature = &[_]u8{0x44} ** 64,
+        .signature = &@as([64]u8, @splat(0x44)),
     };
 
     var decoded_tree = try gi.ratchetTree(alloc);
@@ -1339,17 +1339,17 @@ test "verifyTreeHash / ratchetTree / externalPub: the three GroupInfo-extension 
     // is the only thing standing between a joiner and an out-of-band tree
     // supplied by whoever felt like it.
     var bad_gc = gc;
-    const wrong_hash = [_]u8{0x00} ** 32;
+    const wrong_hash = @as([32]u8, @splat(0x00));
     bad_gc.tree_hash = &wrong_hash;
     try testing.expectError(error.TreeHashMismatch, verifyTreeHash(TestSuite, alloc, &decoded_tree, bad_gc));
 
-    try testing.expectEqualSlices(u8, &[_]u8{0x5e} ** 32, (try gi.externalPub()).?);
+    try testing.expectEqualSlices(u8, &@as([32]u8, @splat(0x5e)), (try gi.externalPub()).?);
 
     const no_ext: GroupInfo = .{
         .group_context = gc,
-        .confirmation_tag = &[_]u8{0x33} ** 32,
+        .confirmation_tag = &@as([32]u8, @splat(0x33)),
         .signer = 0,
-        .signature = &[_]u8{0x44} ** 64,
+        .signature = &@as([64]u8, @splat(0x44)),
     };
     try testing.expectError(error.ExtensionNotFound, no_ext.ratchetTree(alloc));
     try testing.expectEqual(@as(?[]const u8, null), try no_ext.externalPub());

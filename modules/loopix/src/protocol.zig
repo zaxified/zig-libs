@@ -1137,7 +1137,7 @@ test "n−1: blocking a mix makes clients' loops go missing, and they raise the 
         try testing.expect(mix.alarms.items.len > 0);
         // Every alarm is a reaction to the attack: none before it started,
         // and each client raises its alarm once.
-        var seen = [_]bool{false} ** P.clients;
+        var seen = @as([P.clients]bool, @splat(false));
         for (mix.alarms.items) |a| {
             try testing.expect(a.at > ATTACK.start);
             try testing.expect(!seen[a.client]);

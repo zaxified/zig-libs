@@ -65,7 +65,7 @@ pub fn Field(comptime p: comptime_int) type {
         /// The value, Montgomery form (`x·2^(64L) mod p`), always `< p`.
         mont: Elem,
 
-        pub const zero: Self = .{ .mont = [_]u64{0} ** L };
+        pub const zero: Self = .{ .mont = @as([L]u64, @splat(0)) };
         pub const one: Self = .{ .mont = modulus.one_mont };
 
         fn limbsOf(comptime x: comptime_int) Elem {
@@ -83,7 +83,7 @@ pub fn Field(comptime p: comptime_int) type {
         /// only). `be.len <= 8·L`.
         fn loadBE(be: []const u8) Elem {
             std.debug.assert(be.len <= 8 * L);
-            var v = [_]u64{0} ** L;
+            var v = @as([L]u64, @splat(0));
             for (be, 0..) |b, i| {
                 const pos = be.len - 1 - i; // byte position from the LSB
                 v[pos / 8] |= @as(u64, b) << @intCast(8 * (pos % 8));
@@ -114,7 +114,7 @@ pub fn Field(comptime p: comptime_int) type {
         /// `< p`, so `Modint`'s operand contract holds throughout; the work
         /// depends on `bytes.len` only.
         pub fn reduceBytesBE(bytes: []const u8) Self {
-            var acc: Elem = [_]u64{0} ** L;
+            var acc: Elem = @as([L]u64, @splat(0));
             const n_limbs = (bytes.len + 7) / 8;
             var k: usize = n_limbs;
             while (k > 0) {
@@ -123,7 +123,7 @@ pub fn Field(comptime p: comptime_int) type {
                 // zero-extended.
                 const lo = bytes.len -| 8 * (k + 1);
                 const hi = bytes.len - 8 * k;
-                var limb = [_]u64{0} ** L;
+                var limb = @as([L]u64, @splat(0));
                 for (bytes[lo..hi]) |b| limb[0] = (limb[0] << 8) | b;
                 acc = modulus.montMul(&acc, &two64_mont);
                 const limb_mont = modulus.toMontgomery(&limb);
@@ -244,7 +244,7 @@ fn diffAgainstFf(comptime p: comptime_int) !void {
         // …and over a length that is not a multiple of 8 (ff sees it
         // zero-extended to the same wide width).
         const odd = wide[0 .. F.encoded_bytes + 3];
-        var padded = [_]u8{0} ** (2 * F.encoded_bytes);
+        var padded = @as([2 * F.encoded_bytes]u8, @splat(0));
         @memcpy(padded[padded.len - odd.len ..], odd);
         try ff.reduce(try Wide.fromBytes(&padded, .big)).toBytes(&want, .big);
         try testing.expectEqualSlices(u8, &want, &F.reduceBytesBE(odd).toBytesBE());
@@ -279,7 +279,7 @@ test "Field edges: canonical check, zero/one, pow 0, inv 0, reduce of p and shor
     try testing.expect(F.reduceBytesBE(&p_be).isZero());
     try testing.expect(F.reduceBytesBE(&[_]u8{7}).eql(F.one.add(F.one).add(F.one).add(F.one).add(F.one).add(F.one).add(F.one)));
     try testing.expect(F.reduceBytesBE(&[_]u8{}).isZero());
-    try testing.expect(m1.pow(&[_]u8{0} ** 32).eql(F.one));
+    try testing.expect(m1.pow(&@as([32]u8, @splat(0))).eql(F.one));
     try testing.expect(m1.pow(&[_]u8{}).eql(F.one));
     try testing.expectError(error.NotInvertible, F.zero.inv());
     try testing.expect(F.zero.toBytesBE()[31] == 0 and F.one.toBytesBE()[31] == 1);

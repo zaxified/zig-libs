@@ -123,7 +123,7 @@ test "STACKPROBE: STEK ring and PSK selection leave no key residue" {
         .ticket_age_add = 7,
     };
     const wire = try state.serialize(&plain);
-    const n12 = [_]u8{0x01} ** stek.nonce_length;
+    const n12 = @as([stek.nonce_length]u8, @splat(0x01));
     _ = try P.run("StekRing.seal", sealWrap, .{ &ring, wire, n12, &blob }, &.{&stek_key}, .{});
     const ticket = try ring.seal(wire, n12, &blob);
     ticket_len = ticket.len;

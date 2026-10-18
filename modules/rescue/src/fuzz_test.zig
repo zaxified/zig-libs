@@ -235,13 +235,13 @@ const seed = @import("testkit").fuzz.seed;
 const framing_seeds = [_][]const u8{
     seed(""), // the empty sequence: the single input `spec128.hash` refuses, and the ONLY one this target ever ran
     seed(&[_]u8{ 0, 0, 0, 0, 0, 0, 0, 1 }), // one element
-    seed(&[_]u8{0} ** 16), // two zero elements: distinct from one, and from none
-    seed(&[_]u8{0xFF} ** 16), // two elements above the Goldilocks modulus, so `fromU64` reduces
-    seed(&[_]u8{ 0, 0, 0, 0, 0, 0, 0, 1 } ** 7), // seven: one short of the rate
-    seed(&[_]u8{ 0, 0, 0, 0, 0, 0, 0, 1 } ** 8), // eight: the rate exactly, where the padding rules diverge
-    seed(&[_]u8{ 0, 0, 0, 0, 0, 0, 0, 1 } ** 9), // nine: one past the rate, a second absorb
-    seed(&[_]u8{0xAB} ** 128), // sixteen elements: two full rates
-    seed(&[_]u8{0xCD} ** 192), // twenty-four: the buffer exactly
+    seed(&@as([16]u8, @splat(0))), // two zero elements: distinct from one, and from none
+    seed(&@as([16]u8, @splat(0xFF))), // two elements above the Goldilocks modulus, so `fromU64` reduces
+    seed(&arrRepeat(u8, &.{ 0, 0, 0, 0, 0, 0, 0, 1 }, 7)), // seven: one short of the rate
+    seed(&arrRepeat(u8, &.{ 0, 0, 0, 0, 0, 0, 0, 1 }, 8)), // eight: the rate exactly, where the padding rules diverge
+    seed(&arrRepeat(u8, &.{ 0, 0, 0, 0, 0, 0, 0, 1 }, 9)), // nine: one past the rate, a second absorb
+    seed(&@as([128]u8, @splat(0xAB))), // sixteen elements: two full rates
+    seed(&@as([192]u8, @splat(0xCD))), // twenty-four: the buffer exactly
     seed(&[_]u8{ 0, 0, 0, 0, 0, 0, 0, 1, 2 }), // a trailing partial element: nine octets, so the last is dropped
 };
 
@@ -371,10 +371,10 @@ test "fuzz harness: rescue, 300 seeds each, reaches every outcome" {
 /// binary and fails with `error.HarnessDoesNotReach` if a label never fired.
 fn Marker_(comptime Label: type) type {
     return struct {
-        var counts: [@typeInfo(Label).@"enum".fields.len]usize = @splat(0);
+        var counts: [@typeInfo(Label).@"enum".field_names.len]usize = @splat(0);
 
         pub fn mark(comptime l: Label) void {
-            counts[@intFromEnum(l)] += 1;
+            counts[@backingInt(l)] += 1;
             fz.driver.hit(@tagName(l));
         }
 
@@ -389,9 +389,17 @@ fn Marker_(comptime Label: type) type {
                 };
             }
             for (counts, 0..) |n, i| if (n == 0) {
-                std.debug.print("reach: " ++ name ++ " label {t} never hit in {d} seeds\n", .{ @as(Label, @enumFromInt(i)), seeds });
+                std.debug.print("reach: " ++ name ++ " label {t} never hit in {d} seeds\n", .{ @as(Label, @fromBackingInt(@intCast(i))), seeds });
                 return error.HarnessDoesNotReach;
             };
         }
     };
+}
+
+/// Comptime array repetition; replaces the `**` operator removed in Zig 0.17.
+fn arrRepeat(comptime T: type, comptime unit: []const T, comptime n: usize) [unit.len * n]T {
+    @setEvalBranchQuota(n * unit.len * 2 + 1000);
+    var buf: [unit.len * n]T = undefined;
+    for (0..n) |i| @memcpy(buf[i * unit.len ..][0..unit.len], unit);
+    return buf;
 }

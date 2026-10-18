@@ -300,7 +300,7 @@ fn runProbe(label: []const u8, call: *const fn () void, n: *const Needles) !usiz
 }
 
 fn skipUnlessOptimized() !void {
-    if (builtin.mode == .Debug or builtin.mode == .ReleaseSafe) return error.SkipZigTest;
+    if (builtin.mode == .debug or builtin.mode == .safe) return error.SkipZigTest;
 }
 
 // ── keys and the probed calls (all `noinline`, secrets read from static memory) ──
@@ -646,12 +646,12 @@ fn connOf(st: Step) *Connection {
 }
 
 fn stepIn(st: Step) []const u8 {
-    return in_store[@intFromEnum(st)][0..in_len[@intFromEnum(st)]];
+    return in_store[@backingInt(st)][0..in_len[@backingInt(st)]];
 }
 
 fn setIn(st: Step) void {
-    @memcpy(in_store[@intFromEnum(st)][0..out_len], out_buf[0..out_len]);
-    in_len[@intFromEnum(st)] = out_len;
+    @memcpy(in_store[@backingInt(st)][0..out_len], out_buf[0..out_len]);
+    in_len[@backingInt(st)] = out_len;
 }
 
 /// API adapter: the one place that names how a step calls the module.
@@ -702,8 +702,8 @@ noinline fn callStep() void {
 }
 
 fn prepStep() void {
-    @memcpy(std.mem.asBytes(connOf(cur_step)), std.mem.asBytes(&pre[@intFromEnum(cur_step)]));
-    rec.reset(cur_seed +% @intFromEnum(cur_step));
+    @memcpy(std.mem.asBytes(connOf(cur_step)), std.mem.asBytes(&pre[@backingInt(cur_step)]));
+    rec.reset(cur_seed +% @backingInt(cur_step));
 }
 
 /// Walk the handshake once; fill `pre`, the inputs and `step_rec`.
@@ -712,14 +712,14 @@ fn reference(cfg_c: dtls.Config, cfg_s: dtls.Config) !void {
     live_server = try Connection.serverInit(cfg_s);
     in_len = @splat(0);
     for (0..n_steps) |i| {
-        const st: Step = @enumFromInt(i);
+        const st: Step = @fromBackingInt(@intCast(i));
         cur_step = st;
         @memcpy(std.mem.asBytes(&pre[i]), std.mem.asBytes(connOf(st)));
         prepStep();
         step_failed = false;
         if (st == .c_install) {
-            inst_c = pre[@intFromEnum(Step.s_fin)].pending_ap_client;
-            inst_s = pre[@intFromEnum(Step.s_fin)].pending_ap_server;
+            inst_c = pre[@backingInt(Step.s_fin)].pending_ap_client;
+            inst_s = pre[@backingInt(Step.s_fin)].pending_ap_server;
         }
         doStep(st);
         try std.testing.expect(!step_failed);
@@ -860,10 +860,10 @@ fn buildNeedles(n: *Needles, comptime set: Set) ![LEAK]u8 {
         keyschedule.deriveFinishedKey(HkdfSha256, 32, &bk_fin, &bk);
         n.addBig("binder key", &bk_fin);
     } else {
-        const cl = &pre[@intFromEnum(Step.c_flight2)];
-        const sv = &pre[@intFromEnum(Step.s_fin)];
+        const cl = &pre[@backingInt(Step.c_flight2)];
+        const sv = &pre[@backingInt(Step.s_fin)];
         const grp = cl.ecdhe_group;
-        try std.testing.expectEqual(@intFromEnum(set.group), grp);
+        try std.testing.expectEqual(@backingInt(set.group), grp);
         const sec_len: usize = if (set.group == .x25519_ml_kem768) 96 else 32;
         n.addBig("ecdhe secret", cl.ecdhe_secret[0..sec_len]);
         const sp = sv.ecdhe_public[0..sv.ecdhe_public_len];
@@ -915,7 +915,7 @@ fn buildNeedles(n: *Needles, comptime set: Set) ![LEAK]u8 {
     n.addBig("master secret", &ms);
 
     // Traffic secrets from the live server, after ServerHello..Finished.
-    const sv = &pre[@intFromEnum(Step.s_fin)];
+    const sv = &pre[@backingInt(Step.s_fin)];
     n.addBig("hs traffic c", &sv.hs_traffic_client);
     n.addBig("hs traffic s", &sv.hs_traffic_server);
     n.addBig("ap traffic c", &sv.pending_ap_client);

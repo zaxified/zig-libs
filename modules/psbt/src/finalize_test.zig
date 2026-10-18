@@ -86,7 +86,7 @@ fn derSigWithHashtype(allocator: Allocator, sig: EcdsaSecp256k1Sha256.Signature,
 
 fn dummyTxCtx() bitcoinscript.TxContext {
     return .{
-        .tx = .{ .version = 1, .vin = @constCast(&[_]bitcointx.TxIn{.{ .prevout = .{ .txid = [_]u8{0} ** 32, .vout = 0 }, .script_sig = &.{}, .sequence = 0xffffffff }}), .vout = &.{}, .witness = &.{}, .locktime = 0, .has_witness = false },
+        .tx = .{ .version = 1, .vin = @constCast(&[_]bitcointx.TxIn{.{ .prevout = .{ .txid = @as([32]u8, @splat(0)), .vout = 0 }, .script_sig = &.{}, .sequence = 0xffffffff }}), .vout = &.{}, .witness = &.{}, .locktime = 0, .has_witness = false },
         .input_index = 0,
         .spent_outputs = &[_]bitcointx.TxOut{.{ .value = 0, .script_pubkey = &.{} }},
     };
@@ -111,7 +111,7 @@ fn hash160Of(allocator: Allocator, data: []const u8) ![20]u8 {
 
 fn buildUnsignedTx(allocator: Allocator, out_value: i64) !bitcointx.Transaction {
     const vin = try allocator.alloc(bitcointx.TxIn, 1);
-    vin[0] = .{ .prevout = .{ .txid = [_]u8{0xee} ** 32, .vout = 0 }, .script_sig = &.{}, .sequence = 0xffffffff };
+    vin[0] = .{ .prevout = .{ .txid = @as([32]u8, @splat(0xee)), .vout = 0 }, .script_sig = &.{}, .sequence = 0xffffffff };
     const vout = try allocator.alloc(bitcointx.TxOut, 1);
     vout[0] = .{ .value = out_value, .script_pubkey = &.{} };
     return .{ .version = 2, .vin = vin, .vout = vout, .witness = &.{}, .locktime = 0, .has_witness = false };
@@ -224,7 +224,7 @@ test "finalize+extract: real P2WPKH spend, byte-exact FINAL_SCRIPTWITNESS; a tam
     defer arena.deinit();
     const a = arena.allocator();
 
-    const seed: [32]u8 = [_]u8{0x55} ** 32;
+    const seed: [32]u8 = @as([32]u8, @splat(0x55));
     const kp = try EcdsaSecp256k1Sha256.KeyPair.generateDeterministic(seed);
     const pubkey = kp.public_key.toCompressedSec1();
     const pkh = try hash160Of(a, &pubkey);
@@ -300,7 +300,7 @@ test "finalize: SIGHASH_TYPE mismatch is rejected (BIP174's own sighash-type enf
     defer arena.deinit();
     const a = arena.allocator();
 
-    const seed: [32]u8 = [_]u8{0x55} ** 32;
+    const seed: [32]u8 = @as([32]u8, @splat(0x55));
     const kp = try EcdsaSecp256k1Sha256.KeyPair.generateDeterministic(seed);
     const pubkey = kp.public_key.toCompressedSec1();
     const pkh = try hash160Of(a, &pubkey);
@@ -354,9 +354,9 @@ test "finalize: a PARTIAL_SIG under some other key, ordered first, no longer sha
     defer arena.deinit();
     const a = arena.allocator();
 
-    const kp = try EcdsaSecp256k1Sha256.KeyPair.generateDeterministic([_]u8{0x55} ** 32);
+    const kp = try EcdsaSecp256k1Sha256.KeyPair.generateDeterministic(@as([32]u8, @splat(0x55)));
     const pubkey = kp.public_key.toCompressedSec1();
-    const decoy_kp = try EcdsaSecp256k1Sha256.KeyPair.generateDeterministic([_]u8{0x56} ** 32);
+    const decoy_kp = try EcdsaSecp256k1Sha256.KeyPair.generateDeterministic(@as([32]u8, @splat(0x56)));
     const decoy_pub = decoy_kp.public_key.toCompressedSec1();
     const pkh = try hash160Of(a, &pubkey);
 
@@ -400,9 +400,9 @@ test "finalize: an invalid signature for an earlier multisig key no longer block
     defer arena.deinit();
     const a = arena.allocator();
 
-    const kp1 = try EcdsaSecp256k1Sha256.KeyPair.generateDeterministic([_]u8{0x71} ** 32);
-    const kp2 = try EcdsaSecp256k1Sha256.KeyPair.generateDeterministic([_]u8{0x72} ** 32);
-    const kp3 = try EcdsaSecp256k1Sha256.KeyPair.generateDeterministic([_]u8{0x73} ** 32);
+    const kp1 = try EcdsaSecp256k1Sha256.KeyPair.generateDeterministic(@as([32]u8, @splat(0x71)));
+    const kp2 = try EcdsaSecp256k1Sha256.KeyPair.generateDeterministic(@as([32]u8, @splat(0x72)));
+    const kp3 = try EcdsaSecp256k1Sha256.KeyPair.generateDeterministic(@as([32]u8, @splat(0x73)));
     const pub1 = kp1.public_key.toCompressedSec1();
     const pub2 = kp2.public_key.toCompressedSec1();
     const pub3 = kp3.public_key.toCompressedSec1();
@@ -431,7 +431,7 @@ test "finalize: an invalid signature for an earlier multisig key no longer block
     const unsigned = try buildUnsignedTx(a, 900);
     const sighash = try bitcointx.legacy.sighash(a, unsigned, 0, redeem, SIGHASH_ALL);
     // Key 1's signature is well-formed but over some other digest.
-    const bad1 = try derSigWithHashtype(a, normalizeLowS(try kp1.signPrehashed([_]u8{0x42} ** 32, null)), 0x01);
+    const bad1 = try derSigWithHashtype(a, normalizeLowS(try kp1.signPrehashed(@as([32]u8, @splat(0x42)), null)), 0x01);
     const sig2 = try derSigWithHashtype(a, normalizeLowS(try kp2.signPrehashed(sighash, null)), 0x01);
     const sig3 = try derSigWithHashtype(a, normalizeLowS(try kp3.signPrehashed(sighash, null)), 0x01);
     const witness_utxo_value = try buildWitnessUtxoValue(a, 100_000, &script_pubkey);
@@ -466,7 +466,7 @@ test "finalize: a legacy SIGHASH_SINGLE signature with no output at its index is
     defer arena.deinit();
     const a = arena.allocator();
 
-    const kp = try EcdsaSecp256k1Sha256.KeyPair.generateDeterministic([_]u8{0x81} ** 32);
+    const kp = try EcdsaSecp256k1Sha256.KeyPair.generateDeterministic(@as([32]u8, @splat(0x81)));
     const pubkey = kp.public_key.toCompressedSec1();
     const pkh = try hash160Of(a, &pubkey);
     var script_pubkey: [25]u8 = undefined;
@@ -479,8 +479,8 @@ test "finalize: a legacy SIGHASH_SINGLE signature with no output at its index is
 
     // Two inputs, ONE output: input 1 has no output at its index.
     const vin = try a.alloc(bitcointx.TxIn, 2);
-    vin[0] = .{ .prevout = .{ .txid = [_]u8{0xee} ** 32, .vout = 0 }, .script_sig = &.{}, .sequence = 0xffffffff };
-    vin[1] = .{ .prevout = .{ .txid = [_]u8{0xee} ** 32, .vout = 1 }, .script_sig = &.{}, .sequence = 0xffffffff };
+    vin[0] = .{ .prevout = .{ .txid = @as([32]u8, @splat(0xee)), .vout = 0 }, .script_sig = &.{}, .sequence = 0xffffffff };
+    vin[1] = .{ .prevout = .{ .txid = @as([32]u8, @splat(0xee)), .vout = 1 }, .script_sig = &.{}, .sequence = 0xffffffff };
     const vout = try a.alloc(bitcointx.TxOut, 1);
     vout[0] = .{ .value = 900, .script_pubkey = &.{} };
     const unsigned: bitcointx.Transaction = .{ .version = 2, .vin = vin, .vout = vout, .witness = &.{}, .locktime = 0, .has_witness = false };
@@ -534,8 +534,8 @@ test "finalize+extract: real P2SH 2-of-2 multisig, byte-exact FINAL_SCRIPTSIG; i
     defer arena.deinit();
     const a = arena.allocator();
 
-    const kp1 = try EcdsaSecp256k1Sha256.KeyPair.generateDeterministic([_]u8{0x61} ** 32);
-    const kp2 = try EcdsaSecp256k1Sha256.KeyPair.generateDeterministic([_]u8{0x62} ** 32);
+    const kp1 = try EcdsaSecp256k1Sha256.KeyPair.generateDeterministic(@as([32]u8, @splat(0x61)));
+    const kp2 = try EcdsaSecp256k1Sha256.KeyPair.generateDeterministic(@as([32]u8, @splat(0x62)));
     const pub1 = kp1.public_key.toCompressedSec1();
     const pub2 = kp2.public_key.toCompressedSec1();
 
@@ -610,8 +610,8 @@ test "finalize+extract: real native P2WSH 2-of-2 multisig, byte-exact FINAL_SCRI
     defer arena.deinit();
     const a = arena.allocator();
 
-    const kp1 = try EcdsaSecp256k1Sha256.KeyPair.generateDeterministic([_]u8{0x71} ** 32);
-    const kp2 = try EcdsaSecp256k1Sha256.KeyPair.generateDeterministic([_]u8{0x72} ** 32);
+    const kp1 = try EcdsaSecp256k1Sha256.KeyPair.generateDeterministic(@as([32]u8, @splat(0x71)));
+    const kp2 = try EcdsaSecp256k1Sha256.KeyPair.generateDeterministic(@as([32]u8, @splat(0x72)));
     const pub1 = kp1.public_key.toCompressedSec1();
     const pub2 = kp2.public_key.toCompressedSec1();
     const witness_script = try buildMultisig2of2(a, &pub1, &pub2);
@@ -660,7 +660,7 @@ test "finalize: P2TR key-path with no TAP_KEY_SIG present fails closed with Miss
     defer arena.deinit();
     const a = arena.allocator();
 
-    const script_pubkey = [_]u8{ 0x51, 0x20 } ++ [_]u8{0xcc} ** 32;
+    const script_pubkey = [_]u8{ 0x51, 0x20 } ++ @as([32]u8, @splat(0xcc));
     const unsigned = try buildUnsignedTx(a, 900);
     const witness_utxo_value = try buildWitnessUtxoValue(a, 7000, &script_pubkey);
 
@@ -679,12 +679,12 @@ test "finalize: P2TR key-path fails closed with TaprootMissingAllUtxos when a SI
     defer arena.deinit();
     const a = arena.allocator();
 
-    const taproot_script_pubkey = [_]u8{ 0x51, 0x20 } ++ [_]u8{0xdd} ** 32;
-    const dummy_sig = [_]u8{0xab} ** 64;
+    const taproot_script_pubkey = [_]u8{ 0x51, 0x20 } ++ @as([32]u8, @splat(0xdd));
+    const dummy_sig = @as([64]u8, @splat(0xab));
 
     const vin = try a.alloc(bitcointx.TxIn, 2);
-    vin[0] = .{ .prevout = .{ .txid = [_]u8{0x01} ** 32, .vout = 0 }, .script_sig = &.{}, .sequence = 0xffffffff };
-    vin[1] = .{ .prevout = .{ .txid = [_]u8{0x02} ** 32, .vout = 0 }, .script_sig = &.{}, .sequence = 0xffffffff };
+    vin[0] = .{ .prevout = .{ .txid = @as([32]u8, @splat(0x01)), .vout = 0 }, .script_sig = &.{}, .sequence = 0xffffffff };
+    vin[1] = .{ .prevout = .{ .txid = @as([32]u8, @splat(0x02)), .vout = 0 }, .script_sig = &.{}, .sequence = 0xffffffff };
     const vout = try a.alloc(bitcointx.TxOut, 1);
     vout[0] = .{ .value = 900, .script_pubkey = &.{} };
     const unsigned: bitcointx.Transaction = .{ .version = 2, .vin = vin, .vout = vout, .witness = &.{}, .locktime = 0, .has_witness = false };
@@ -806,7 +806,7 @@ test "BIP174 official Finalizer/Extractor worked example: extract (from the BIP'
 /// A minimal, well-formed funding transaction paying `outs`.
 fn buildPrevTx(a: Allocator, version: i32, outs: []const bitcointx.TxOut) !bitcointx.Transaction {
     const vin = try a.alloc(bitcointx.TxIn, 1);
-    vin[0] = .{ .prevout = .{ .txid = [_]u8{0xa1} ** 32, .vout = 7 }, .script_sig = &.{}, .sequence = 0xffffffff };
+    vin[0] = .{ .prevout = .{ .txid = @as([32]u8, @splat(0xa1)), .vout = 7 }, .script_sig = &.{}, .sequence = 0xffffffff };
     const vout = try a.dupe(bitcointx.TxOut, outs);
     return .{ .version = version, .vin = vin, .vout = vout, .witness = &.{}, .locktime = 0, .has_witness = false };
 }
@@ -824,7 +824,7 @@ test "finalize: a NON_WITNESS_UTXO whose txid is not the input's prevout is refu
     defer arena.deinit();
     const a = arena.allocator();
 
-    const seed: [32]u8 = [_]u8{0x71} ** 32;
+    const seed: [32]u8 = @as([32]u8, @splat(0x71));
     const kp = try EcdsaSecp256k1Sha256.KeyPair.generateDeterministic(seed);
     const pubkey = kp.public_key.toCompressedSec1();
     const pkh = try hash160Of(a, &pubkey);
@@ -896,7 +896,7 @@ test "finalize: a WITNESS_UTXO contradicting the input's real NON_WITNESS_UTXO c
     defer arena.deinit();
     const a = arena.allocator();
 
-    const seed: [32]u8 = [_]u8{0x72} ** 32;
+    const seed: [32]u8 = @as([32]u8, @splat(0x72));
     const kp = try EcdsaSecp256k1Sha256.KeyPair.generateDeterministic(seed);
     const pubkey = kp.public_key.toCompressedSec1();
     const pkh = try hash160Of(a, &pubkey);
@@ -953,8 +953,8 @@ test "finalize: spent-output amount outside 0..MAX_MONEY is rejected uncondition
     // `AmountOutOfRange` for a boundary value, or something OTHER than
     // `AmountOutOfRange` for an out-of-range one, the amount check itself is
     // what broke, not script dispatch.
-    const dummy_script = [_]u8{0xff} ** 4;
-    const unsigned = try buildUnsignedTxSpending(a, [_]u8{0xaa} ** 32, 0, 900);
+    const dummy_script = @as([4]u8, @splat(0xff));
+    const unsigned = try buildUnsignedTxSpending(a, @as([32]u8, @splat(0xaa)), 0, 900);
 
     const out_of_range = [_]i64{ -1, psbt.MAX_MONEY + 1, std.math.minInt(i64), std.math.maxInt(i64) };
     for (out_of_range) |amount| {
@@ -982,7 +982,7 @@ test "finalize: FinalizeOptions.require_non_witness_utxo rejects a witness-utxo-
     defer arena.deinit();
     const a = arena.allocator();
 
-    const seed: [32]u8 = [_]u8{0x94} ** 32;
+    const seed: [32]u8 = @as([32]u8, @splat(0x94));
     const kp = try EcdsaSecp256k1Sha256.KeyPair.generateDeterministic(seed);
     const pubkey = kp.public_key.toCompressedSec1();
     const pkh = try hash160Of(a, &pubkey);
@@ -1041,7 +1041,7 @@ test "finalize: attacker-supplied FINAL_SCRIPTSIG/FINAL_SCRIPTWITNESS is verifie
     defer arena.deinit();
     const a = arena.allocator();
 
-    const seed: [32]u8 = [_]u8{0x91} ** 32;
+    const seed: [32]u8 = @as([32]u8, @splat(0x91));
     const kp = try EcdsaSecp256k1Sha256.KeyPair.generateDeterministic(seed);
     const pubkey = kp.public_key.toCompressedSec1();
     const pkh = try hash160Of(a, &pubkey);
@@ -1093,7 +1093,7 @@ test "finalize: a genuinely-finalized input re-finalizes idempotently (positive 
     defer arena.deinit();
     const a = arena.allocator();
 
-    const seed: [32]u8 = [_]u8{0x93} ** 32;
+    const seed: [32]u8 = @as([32]u8, @splat(0x93));
     const kp = try EcdsaSecp256k1Sha256.KeyPair.generateDeterministic(seed);
     const pubkey = kp.public_key.toCompressedSec1();
     const pkh = try hash160Of(a, &pubkey);
@@ -1143,12 +1143,12 @@ test "finalize: a signature whose sighash byte is ABOVE the declared SIGHASH_TYP
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const kp = try EcdsaSecp256k1Sha256.KeyPair.generateDeterministic([_]u8{0x56} ** 32);
+    const kp = try EcdsaSecp256k1Sha256.KeyPair.generateDeterministic(@as([32]u8, @splat(0x56)));
     const pubkey = kp.public_key.toCompressedSec1();
     const pkh = try hash160Of(a, &pubkey);
     const script_pubkey = [_]u8{ 0x00, 0x14 } ++ pkh;
     const unsigned = try buildUnsignedTx(a, 900);
-    const sig_ht = try derSigWithHashtype(a, normalizeLowS(try kp.signPrehashed([_]u8{0x11} ** 32, null)), 0x03);
+    const sig_ht = try derSigWithHashtype(a, normalizeLowS(try kp.signPrehashed(@as([32]u8, @splat(0x11)), null)), 0x03);
     var sighash_type_value: [4]u8 = undefined;
     std.mem.writeInt(u32, &sighash_type_value, SIGHASH_ALL, .little);
     var recs = [_]psbt.Record{
@@ -1165,8 +1165,8 @@ test "finalize: a signature whose sighash byte is ABOVE the declared SIGHASH_TYP
 /// SIGHASH_SINGLE bug's precondition).
 fn twoInOneOut(a: Allocator) !bitcointx.Transaction {
     const vin = try a.alloc(bitcointx.TxIn, 2);
-    vin[0] = .{ .prevout = .{ .txid = [_]u8{0xee} ** 32, .vout = 0 }, .script_sig = &.{}, .sequence = 0xffffffff };
-    vin[1] = .{ .prevout = .{ .txid = [_]u8{0xee} ** 32, .vout = 1 }, .script_sig = &.{}, .sequence = 0xffffffff };
+    vin[0] = .{ .prevout = .{ .txid = @as([32]u8, @splat(0xee)), .vout = 0 }, .script_sig = &.{}, .sequence = 0xffffffff };
+    vin[1] = .{ .prevout = .{ .txid = @as([32]u8, @splat(0xee)), .vout = 1 }, .script_sig = &.{}, .sequence = 0xffffffff };
     const vout = try a.alloc(bitcointx.TxOut, 1);
     vout[0] = .{ .value = 900, .script_pubkey = &.{} };
     return .{ .version = 2, .vin = vin, .vout = vout, .witness = &.{}, .locktime = 0, .has_witness = false };
@@ -1176,7 +1176,7 @@ test "finalize: SIGHASH_SINGLE|ANYONECANPAY (0x83) hits the SINGLE bug too" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const kp = try EcdsaSecp256k1Sha256.KeyPair.generateDeterministic([_]u8{0x83} ** 32);
+    const kp = try EcdsaSecp256k1Sha256.KeyPair.generateDeterministic(@as([32]u8, @splat(0x83)));
     const pubkey = kp.public_key.toCompressedSec1();
     const script_pubkey = [_]u8{ 0x76, 0xa9, 0x14 } ++ try hash160Of(a, &pubkey) ++ [_]u8{ 0x88, 0xac };
     const unsigned = try twoInOneOut(a);
@@ -1196,8 +1196,8 @@ test "finalize: bare multisig refuses a SINGLE-bug signature, but never looks pa
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const kp_a = try EcdsaSecp256k1Sha256.KeyPair.generateDeterministic([_]u8{0xa1} ** 32);
-    const kp_b = try EcdsaSecp256k1Sha256.KeyPair.generateDeterministic([_]u8{0xb2} ** 32);
+    const kp_a = try EcdsaSecp256k1Sha256.KeyPair.generateDeterministic(@as([32]u8, @splat(0xa1)));
+    const kp_b = try EcdsaSecp256k1Sha256.KeyPair.generateDeterministic(@as([32]u8, @splat(0xb2)));
     const pk_a = kp_a.public_key.toCompressedSec1();
     const pk_b = kp_b.public_key.toCompressedSec1();
     // OP_1 <pk_a> <pk_b> OP_2 OP_CHECKMULTISIG
@@ -1248,7 +1248,7 @@ test "finalize: a version-1 20-octet witness program is not finalized as P2WPKH"
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const pubkey = [_]u8{0x02} ++ [_]u8{0x5a} ** 32;
+    const pubkey = [_]u8{0x02} ++ @as([32]u8, @splat(0x5a));
     const script_pubkey = [_]u8{ 0x51, 0x14 } ++ try hash160Of(a, &pubkey);
     const unsigned = try buildUnsignedTx(a, 900);
     var recs = [_]psbt.Record{
@@ -1264,7 +1264,7 @@ test "finalize: multisig skips a valid signature whose sighash type is not the d
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const kp = try EcdsaSecp256k1Sha256.KeyPair.generateDeterministic([_]u8{0xc3} ** 32);
+    const kp = try EcdsaSecp256k1Sha256.KeyPair.generateDeterministic(@as([32]u8, @splat(0xc3)));
     const pk = kp.public_key.toCompressedSec1();
     // OP_1 <pk> OP_1 OP_CHECKMULTISIG
     const script_pubkey = [_]u8{ 0x51, 33 } ++ pk ++ [_]u8{ 0x51, 0xae };

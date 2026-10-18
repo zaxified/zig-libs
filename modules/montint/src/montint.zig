@@ -477,7 +477,7 @@ pub fn Modint(comptime max_bits: comptime_int) type {
         pub fn montSqrCios(self: *const Self, a: *const Elem) Elem {
             const m = &self.m;
             // A holds the full 2L-word square across all four phases.
-            var A = [_]u64{0} ** (2 * L);
+            var A = @as([2 * L]u64, @splat(0));
 
             // ── 1. cross products: A = Σ_{i<j} a[i]·a[j]·B^(i+j) ──
             var i: usize = 0;
@@ -551,7 +551,7 @@ pub fn Modint(comptime max_bits: comptime_int) type {
         pub fn montMulCios(self: *const Self, a: *const Elem, b: *const Elem) Elem {
             const m = &self.m;
             // t holds L+2 words across the interleaved multiply/reduce passes.
-            var t = [_]u64{0} ** (L + 2);
+            var t = @as([L + 2]u64, @splat(0));
             var i: usize = 0;
             while (i < L) : (i += 1) {
                 // t += a * b[i]
@@ -1195,9 +1195,9 @@ const loader_seeds = [_][]const u8{
     fuzzseed.seedHex("01000000000000000000000000000001"), // 2^120+1, the modulus the value tests use
     fuzzseed.seedHex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"), // 2^256-1: the widest odd value that still fits L limbs
     fuzzseed.seedHex("8000000000000000000000000000000000000000000000000000000000000000"), // 2^255: even, and its only set bit is in the top limb
-    fuzzseed.seedHex("01" ++ "00" ** 31 ++ "01"), // 33 significant octets → Overflow
-    fuzzseed.seedHex("ff" ++ "00" ** 32), // ⭐ Overflow from the FIRST byte, with the rest zero: the `limb >= M.L` guard, not the carry one
-    fuzzseed.seedHex("0180" ++ "00" ** 30), // a byte straddling the limb boundary (`sh != 0` carry into limb+1)
+    fuzzseed.seedHex("01" ++ strRepeat("00", 31) ++ "01"), // 33 significant octets → Overflow
+    fuzzseed.seedHex("ff" ++ strRepeat("00", 32)), // ⭐ Overflow from the FIRST byte, with the rest zero: the `limb >= M.L` guard, not the carry one
+    fuzzseed.seedHex("0180" ++ strRepeat("00", 30)), // a byte straddling the limb boundary (`sh != 0` carry into limb+1)
     fuzzseed.seedHex("dEadBeef00112233"), // the 8-octet operand the round-trip test loads
 };
 
@@ -1433,4 +1433,16 @@ test "Modint eql/isZero/neg: the represented value, against big.int, edge and ra
             }
         }
     }
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

@@ -88,7 +88,7 @@ pub const Message = struct {
         if (icmp.len < 4) return ParseError.Truncated;
         if (icmp[1] != 0) return ParseError.NotNeighborDiscovery;
         if (icmp[0] < 133 or icmp[0] > 137) return ParseError.NotNeighborDiscovery;
-        const t: Type = @enumFromInt(icmp[0]);
+        const t: Type = @fromBackingInt(@intCast(icmp[0]));
         const fixed: usize = switch (t) {
             .router_solicitation => 8,
             .router_advertisement => 16,
@@ -257,7 +257,7 @@ pub fn multicastMac(group: [16]u8) Mac {
 pub fn buildNeighborSolicitation(out: []u8, src: [16]u8, dst: [16]u8, target: [16]u8, src_mac: Mac) BuildError![]const u8 {
     if (out.len < 32) return BuildError.BufferTooSmall;
     @memset(out[0..8], 0);
-    out[0] = @intFromEnum(Type.neighbor_solicitation);
+    out[0] = @backingInt(Type.neighbor_solicitation);
     out[8..24].* = target;
     out[24] = OptionType.source_link_addr;
     out[25] = 1;
@@ -271,7 +271,7 @@ pub fn buildNeighborSolicitation(out: []u8, src: [16]u8, dst: [16]u8, target: [1
 pub fn buildRouterSolicitation(out: []u8, src: [16]u8, dst: [16]u8, src_mac: Mac) BuildError![]const u8 {
     if (out.len < 16) return BuildError.BufferTooSmall;
     @memset(out[0..8], 0);
-    out[0] = @intFromEnum(Type.router_solicitation);
+    out[0] = @backingInt(Type.router_solicitation);
     out[8] = OptionType.source_link_addr;
     out[9] = 1;
     out[10..16].* = src_mac.octets;
@@ -414,9 +414,9 @@ test "malformed ND messages are refused" {
     try testing.expect(m.linkAddr(OptionType.target_link_addr) == null);
     try testing.expect(m.mtu() == null);
     // Short prefix / RDNSS options are not decoded.
-    try testing.expect(PrefixInfo.parse(.{ .type = 3, .data = &([_]u8{0} ** 29) }) == null);
-    try testing.expect(Rdnss.parse(.{ .type = 25, .data = &([_]u8{0} ** 21) }) == null);
-    try testing.expect(Rdnss.parse(.{ .type = 3, .data = &([_]u8{0} ** 22) }) == null);
+    try testing.expect(PrefixInfo.parse(.{ .type = 3, .data = &(@as([29]u8, @splat(0))) }) == null);
+    try testing.expect(Rdnss.parse(.{ .type = 25, .data = &(@as([21]u8, @splat(0))) }) == null);
+    try testing.expect(Rdnss.parse(.{ .type = 3, .data = &(@as([22]u8, @splat(0))) }) == null);
 }
 
 test "checksum: odd-length input pads the last byte, as RFC 1071 sums" {

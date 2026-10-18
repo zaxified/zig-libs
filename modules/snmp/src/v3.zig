@@ -546,7 +546,7 @@ const V3Corpus = struct {
             .msg_id = 3,
             .flags = .{ .auth = true, .priv = true },
             .security_parameters = "usm-blob",
-            .encrypted_pdu = "\xDE\xAD\xBE\xEF" ** 8,
+            .encrypted_pdu = strRepeat("\xDE\xAD\xBE\xEF", 8),
         }));
 
         // ── refusals, each named by the error it raises ─────────────────────
@@ -755,4 +755,16 @@ test "RFC 3411: a message naming a security model other than USM is refused" {
     }
     var b3: [256]u8 = undefined;
     _ = try decode(try encode(&b3, params)); // model 3: fine
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

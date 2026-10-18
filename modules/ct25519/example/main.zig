@@ -85,7 +85,7 @@ pub fn main() !void {
     // std raises error.IdentityElement for s=0; ct25519 returns the neutral
     // element as an ordinary value, so no caller branches on the scalar.
     {
-        const zero = [_]u8{0} ** 32;
+        const zero = @as([32]u8, @splat(0));
         std.testing.expectError(error.IdentityElement, Edwards25519.basePoint.mul(zero)) catch return error.StdShapeChanged;
         const got = ct25519.mulBase(zero);
         if (!std.mem.eql(u8, &got.toBytes(), &Edwards25519.identityElement.toBytes())) return error.ZeroScalarMismatch;
@@ -123,7 +123,7 @@ pub fn main() !void {
     // element — exactly the RFC 8032 §5.1.3 "reduce mod p" edge case a
     // wire-format decoder must reject rather than silently accept.
     {
-        var non_canonical = [_]u8{0xff} ** 32;
+        var non_canonical = @as([32]u8, @splat(0xff));
         non_canonical[31] = 0x7f;
         if (Edwards25519.rejectNonCanonical(non_canonical)) |_| {
             return error.ExpectedRejection;

@@ -221,8 +221,8 @@ const BitWriter = struct {
 const ClPrefix = struct { bits: u4, len: u3 };
 
 const cl_prefix: [6]ClPrefix = blk: {
-    var out: [6]ClPrefix = .{ClPrefix{ .bits = 0, .len = 0 }} ** 6;
-    var found = [_]bool{false} ** 6;
+    var out: [6]ClPrefix = @splat(ClPrefix{ .bits = 0, .len = 0 });
+    var found = @as([6]bool, @splat(false));
     for (tables.code_length_prefix_length, tables.code_length_prefix_value, 0..) |len, val, b4| {
         if (b4 >> @as(u3, @intCast(len)) != 0) continue; // a longer alias of the same code
         if (found[val]) @compileError("code-length prefix code is ambiguous");
@@ -294,7 +294,7 @@ fn distanceCodeWith(d: u32, p: DistParams, n: usize) ?DistSym {
 }
 
 const dist_lut: [dist_alphabet_large]DistCode = blk: {
-    var out: [dist_alphabet_large]DistCode = .{DistCode{ .offset = 0, .nbits = 0 }} ** dist_alphabet_large;
+    var out: [dist_alphabet_large]DistCode = @splat(DistCode{ .offset = 0, .nbits = 0 });
     var bits: u32 = 1;
     var half: u32 = 0;
     var i: usize = tables.num_distance_short_codes;
@@ -392,8 +392,8 @@ const cmd_tables: CmdTables = blk: {
 
     // The 24 distinct insert/copy length offsets, ascending. Offsets are
     // strictly increasing with the code index, so sorted-unique == code order.
-    var ins: [24]u32 = .{0} ** 24;
-    var cpy: [24]u32 = .{0} ** 24;
+    var ins: [24]u32 = @splat(0);
+    var cpy: [24]u32 = @splat(0);
     var n_ins: usize = 0;
     var n_cpy: usize = 0;
     for (tables.cmd_lut) |e| {
@@ -404,11 +404,11 @@ const cmd_tables: CmdTables = blk: {
 
     var t: CmdTables = .{
         .insert_off = ins,
-        .insert_nbits = .{0} ** 24,
+        .insert_nbits = @splat(0),
         .copy_off = cpy,
-        .copy_nbits = .{0} ** 24,
-        .sym = .{.{0xffff} ** 24} ** 24,
-        .implicit = .{.{0xffff} ** 24} ** 24,
+        .copy_nbits = @splat(0),
+        .sym = @splat(@splat(0xffff)),
+        .implicit = @splat(@splat(0xffff)),
     };
     for (tables.cmd_lut, 0..) |e, s| {
         const ic = indexOf(&ins, e.insert_len_offset);
@@ -701,7 +701,7 @@ fn canonicalCode(gpa: std.mem.Allocator, lengths: []const u8) GiveUp!Code {
 
 /// `canonicalCode`'s bit patterns into `bits` (`lengths.len` of them).
 fn canonicalBits(lengths: []const u8, bits: []u16) GiveUp!void {
-    var count = [_]u32{0} ** 16;
+    var count = @as([16]u32, @splat(0));
     for (lengths) |l| {
         if (l > 15) return error.EncoderInvariant;
         count[l] += 1;
@@ -840,10 +840,10 @@ fn writeComplexCode(gpa: std.mem.Allocator, w: *BitWriter, lengths: []const u8) 
     try rleCodeLengths(gpa, lengths, &items);
     if (items.items.len == 0) return error.EncoderInvariant;
 
-    var counts = [_]u32{0} ** tables.code_length_codes;
+    var counts = @as([tables.code_length_codes]u32, @splat(0));
     for (items.items) |it| counts[it.sym] += 1;
 
-    var cl_lengths = [_]u8{0} ** tables.code_length_codes;
+    var cl_lengths = @as([tables.code_length_codes]u8, @splat(0));
     const m = try assignLengths(gpa, &counts, 5, &cl_lengths);
     if (m == 0) return error.EncoderInvariant;
     if (m == 1) {
@@ -2355,7 +2355,7 @@ fn looksBinary(block: []const u8) bool {
 /// literal, so what a match saves per byte it covers.
 /// Every `stride`-th byte is counted.
 fn literalCost(block: []const u8, comptime stride: usize) f32 {
-    var hist = [_]u32{0} ** 256;
+    var hist = @as([256]u32, @splat(0));
     var i: usize = 0;
     while (i < block.len) : (i += stride) hist[block[i]] += 1;
     var sum: f64 = 0;
@@ -2549,7 +2549,7 @@ const dict_tables: struct {
             for (0..10) |o| {
                 at[id][u][o] = k;
                 for (forms[id][0..nforms[id]]) |f| {
-                    if (@intFromEnum(f.upper) == u and f.omit == o) {
+                    if (@backingInt(f.upper) == u and f.omit == o) {
                         sorted[k] = f;
                         k += 1;
                     }
@@ -2813,7 +2813,7 @@ inline fn relaxRingHits(nodes: []OptNode, costs: *const OptCosts, nd: OptSrc, ic
     for (hits) |h| {
         if (h.l <= best_len) continue;
         const whole = h.l >= max_take_len;
-        relaxCopies(nodes, costs, nd, ic, i, if (whole) h.l else best_len + 1, h.l, h.d, da, @enumFromInt(h.code));
+        relaxCopies(nodes, costs, nd, ic, i, if (whole) h.l else best_len + 1, h.l, h.d, da, @fromBackingInt(@intCast(h.code)));
         best_len = h.l;
         if (whole) take = @max(take, h.l);
     }
@@ -2910,7 +2910,7 @@ fn relaxCopies(
     const short: ?u16 = switch (known) {
         .unknown => (DistRing{ .last = nd.ring }).shortCode(d),
         .none => null,
-        _ => @intFromEnum(known),
+        _ => @backingInt(known),
     };
     var dist_bits: [dist_contexts]f32 = undefined;
     if (short) |s| {
@@ -4650,7 +4650,7 @@ const Q0Codes = struct {
             6,  6,  6,  6,  6,  6,  5,  5,  5,  5,  5,  5,  4,  4,  4,  4,
             4,  4,  4,  5,  5,  5,  5,  5,  5,  6,  6,  7,  7,  7,  8,  10,
             12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12,
-        } ++ [_]u8{0} ** 4,
+        } ++ @as([4]u8, @splat(0)),
         .bits = [_]u16{
             0,    0,    8,    9,    3,   35,   7,    71,
             39,   103,  23,   47,   175, 111,  239,  31,
@@ -4668,14 +4668,14 @@ const Q0Codes = struct {
             11,   15,   47,   31,   95,  63,   127,  255,
             767,  2815, 1791, 3839, 511, 2559, 1535, 3583,
             1023, 3071, 2047, 4095,
-        } ++ [_]u16{0} ** 4,
+        } ++ @as([4]u16, @splat(0)),
         .code = [_]u8{
             0xff, 0x77, 0xd5, 0xbf, 0xe7, 0xde, 0xea, 0x9e, 0x51, 0x5d, 0xde, 0xc6,
             0x70, 0x57, 0xbc, 0x58, 0x58, 0x58, 0xd8, 0xd8, 0x58, 0xd5, 0xcb, 0x8c,
             0xea, 0xe0, 0xc3, 0x87, 0x1f, 0x83, 0xc1, 0x60, 0x1c, 0x67, 0xb2, 0xaa,
             0x06, 0x83, 0xc1, 0x60, 0x30, 0x18, 0xcc, 0xa1, 0xce, 0x88, 0x54, 0x94,
             0x46, 0xe1, 0xb0, 0xd0, 0x4e, 0xb2, 0xf7, 0x04, 0x00,
-        } ++ [_]u8{0} ** (q0_code_max - 57),
+        } ++ @as([q0_code_max - 57]u8, @splat(0)),
         .code_bits = 448,
     };
 };
@@ -5606,7 +5606,7 @@ pub const Effort = enum(u4) {
 
     /// The google/brotli quality this level stands in for.
     pub fn quality(e: Effort) u4 {
-        return @intFromEnum(e);
+        return @backingInt(e);
     }
 
     const Finder = enum { frag, fast, deep };
@@ -6499,7 +6499,7 @@ fn readComplexCode(
 ) !void {
     if (try br.takeBits(2) != 0) return error.BadHskip;
 
-    var cl_lengths = [_]u8{0} ** tables.code_length_codes;
+    var cl_lengths = @as([tables.code_length_codes]u8, @splat(0));
     var space: i32 = 32;
     var num_codes: u32 = 0;
     for (tables.code_length_code_order) |idx| {
@@ -6699,16 +6699,16 @@ test "rle of code lengths replays to the same lengths" {
     // A run short enough to stay literal (< 3 after the leading literal).
     try expectRleRoundTrip(&[_]u8{ 2, 2, 2, 2 });
     // A long run of one length: REPEAT_PREVIOUS chain.
-    try expectRleRoundTrip(&([_]u8{3} ** 8));
+    try expectRleRoundTrip(&(@as([8]u8, @splat(3))));
     // Zeros between codes: REPEAT_ZERO chain, then a REPEAT_PREVIOUS chain.
-    try expectRleRoundTrip(&([_]u8{ 1, 2 } ++ [_]u8{0} ** 30 ++ [_]u8{5} ** 8));
+    try expectRleRoundTrip(&([_]u8{ 1, 2 } ++ @as([30]u8, @splat(0)) ++ @as([8]u8, @splat(5))));
     // Two separate REPEAT_PREVIOUS chains for the same length, so the decoder's
     // `repeat_code_len` is already equal to the new one when the second starts.
-    try expectRleRoundTrip(&([_]u8{1} ++ [_]u8{0} ** 30 ++ [_]u8{4} ** 4 ++ [_]u8{0} ** 20 ++ [_]u8{4} ** 4));
+    try expectRleRoundTrip(&([_]u8{1} ++ @as([30]u8, @splat(0)) ++ @as([4]u8, @splat(4)) ++ @as([20]u8, @splat(0)) ++ @as([4]u8, @splat(4))));
     // Trailing zeros must not be emitted at all.
-    try expectRleRoundTrip(&([_]u8{ 1, 2, 2 } ++ [_]u8{0} ** 200));
+    try expectRleRoundTrip(&([_]u8{ 1, 2, 2 } ++ @as([200]u8, @splat(0))));
     // A chain long enough to need several REPEAT codes.
-    try expectRleRoundTrip(&([_]u8{1} ++ [_]u8{0} ** 700 ++ [_]u8{1}));
+    try expectRleRoundTrip(&([_]u8{1} ++ @as([700]u8, @splat(0)) ++ [_]u8{1}));
 }
 
 test "rle of code lengths replays to the same lengths (random complete codes)" {
@@ -6741,10 +6741,10 @@ test "complex prefix code survives a bit-level write/read round trip" {
     const cases = [_][]const u8{
         &[_]u8{ 1, 1 },
         &[_]u8{ 1, 2, 2 },
-        &([_]u8{3} ** 8),
+        &(@as([8]u8, @splat(3))),
         &([_]u8{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 15 }),
-        &([_]u8{ 1, 2 } ++ [_]u8{0} ** 60 ++ [_]u8{5} ** 8),
-        &([_]u8{1} ++ [_]u8{0} ** 60 ++ [_]u8{4} ** 4 ++ [_]u8{0} ** 20 ++ [_]u8{4} ** 4),
+        &([_]u8{ 1, 2 } ++ @as([60]u8, @splat(0)) ++ @as([8]u8, @splat(5))),
+        &([_]u8{1} ++ @as([60]u8, @splat(0)) ++ @as([4]u8, @splat(4)) ++ @as([20]u8, @splat(0)) ++ @as([4]u8, @splat(4))),
     };
     for (cases) |lengths| {
         var w = BitWriter{ .gpa = gpa };
@@ -6805,7 +6805,7 @@ test "assignLengths honours the 5-bit limit of the code-length alphabet" {
     // Counts spread over powers of two: unlimited Huffman would go 17 deep.
     var counts: [tables.code_length_codes]u32 = undefined;
     for (&counts, 0..) |*c, i| c.* = @as(u32, 1) << @intCast(i);
-    var lengths = [_]u8{0} ** tables.code_length_codes;
+    var lengths = @as([tables.code_length_codes]u8, @splat(0));
     _ = try assignLengths(gpa, &counts, 5, &lengths);
     for (lengths) |l| try testing.expect(l >= 1 and l <= 5);
     var t = try huffman.buildComplex(gpa, &lengths);
@@ -7036,7 +7036,7 @@ fn expectCodeRoundTrip(counts: []const u32, alphabet_size: u32) !void {
 }
 
 test "prefix code header + symbols round trip for 1..N used symbols" {
-    var counts = [_]u32{0} ** tables.num_literal_symbols;
+    var counts = @as([tables.num_literal_symbols]u32, @splat(0));
 
     // One symbol: only a simple code can express this at all.
     counts[65] = 100;
@@ -7059,17 +7059,17 @@ test "prefix code header + symbols round trip for 1..N used symbols" {
     try expectCodeRoundTrip(&counts, tables.num_literal_symbols);
 
     // Dense and skewed.
-    var dense = [_]u32{0} ** tables.num_literal_symbols;
+    var dense = @as([tables.num_literal_symbols]u32, @splat(0));
     for (&dense, 0..) |*c, i| c.* = @intCast(1 + (i * i) % 997);
     try expectCodeRoundTrip(&dense, tables.num_literal_symbols);
 
     // The command and distance alphabets, whose symbol widths differ.
-    var cmds = [_]u32{0} ** tables.num_command_symbols;
+    var cmds = @as([tables.num_command_symbols]u32, @splat(0));
     cmds[0] = 1;
     cmds[703] = 5;
     cmds[128] = 9;
     try expectCodeRoundTrip(&cmds, tables.num_command_symbols);
-    var dists = [_]u32{0} ** dist_alphabet_size;
+    var dists = @as([dist_alphabet_size]u32, @splat(0));
     dists[16] = 7;
     try expectCodeRoundTrip(&dists, dist_alphabet_size);
 }
@@ -7209,7 +7209,7 @@ test "max: every shape the encoder is checked on" {
         const out = try expectMaxRoundTrip(data, .{}, .{});
         gpa.free(out);
     }
-    for ([_][]const u8{ "", "a", "the", " the the the ", "\x00" ** 70_000, "abc" ** 40_000 }) |d| {
+    for ([_][]const u8{ "", "a", "the", " the the the ", strRepeat("\x00", 70_000), strRepeat("abc", 40_000) }) |d| {
         const out = try expectMaxRoundTrip(d, .{}, .{});
         gpa.free(out);
     }
@@ -7252,7 +7252,7 @@ test "q9: static-dictionary words where no copy is found, past a prefix dictiona
     const max_dist = (1 << 22) - 16;
     // A dictionary that shares no five bytes with the text: the words stay,
     // counted past it.
-    const dict = "0123456789" ** 7;
+    const dict = strRepeat("0123456789", 7);
     var pd = try PreparedDictionary.init(gpa, dict);
     defer pd.deinit(gpa);
     for ([_]u2{ 0, 1, 2 }) |case| {
@@ -7726,7 +7726,7 @@ test "History.shiftPos: a position at the cut becomes the first, one before it d
 test "WideMatcher compares its slots' tags on text too" {
     var m = try WideMatcher.init(testing.allocator, 32, Effort.q6.wideSlotsLog());
     defer m.deinit(testing.allocator);
-    const text = "the text of a book, nothing binary in it\n" ** 4;
+    const text = strRepeat("the text of a book, nothing binary in it\n", 4);
     try testing.expect(!looksBinary(text));
     try testing.expect(m.tagsPay(text));
     var n = try Matcher.init(testing.allocator, 32, Effort.q6.slotsLog(text.len));
@@ -7771,4 +7771,16 @@ test "Core.reinit: the match finder's tables as init leaves them, on the kept me
         };
         for (counts) |n| try testing.expectEqual(@as(u32, 0), n);
     }
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

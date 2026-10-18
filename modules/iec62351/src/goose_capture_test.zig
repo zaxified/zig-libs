@@ -273,7 +273,7 @@ test "real capture: a genuine APDU wrapped in this module's own HMAC extension r
     // The real captured APDU is opaque to this module either way -- `build`
     // never inspects it, exactly as it never would a synthetic one.
     const parsed = try goose.parse(&frame_aa1_gcb_a, .ed2020);
-    const key = [_]u8{0x77} ** 20;
+    const key = @as([20]u8, @splat(0x77));
     const verifier: goose.Verifier = .{ .mac = .{ .algorithm = .hmac_sha256_128, .key = &key } };
 
     var out: [512]u8 = undefined;

@@ -1581,8 +1581,8 @@ const reassembler_seeds = [_][]const u8{
     // Raw bytes: a buffer shorter than the 8-octet header, then a full one.
     seed("02" ++ "0000" ++ "00" ++ "03" ++ "EE" ++ "0000" ++ "00" ++ "28" ++ "FF"),
     // The maximum step count, alternating structured and raw.
-    seed("40" ++ ("0001" ++ "01" ++ "00" ++ "0000" ++ "08" ++ "01" ++ "77" ++
-        "0001" ++ "00" ++ "20" ++ "88") ** 8),
+    seed("40" ++ strRepeat(("0001" ++ "01" ++ "00" ++ "0000" ++ "08" ++ "01" ++ "77" ++
+        "0001" ++ "00" ++ "20" ++ "88"), 8)),
     // ⭐ A burst of 17 fragments of one id, 1 ns apart, on slots 0..16 of the
     // 8-octet grid: 16 are accepted disjoint, the 17th trips
     // `max_fragments_per_datagram`. The only seed that reaches that guard.
@@ -1792,4 +1792,16 @@ test {
     // External anchor: real Linux kernel IPv4/IPv6 fragment reassembly,
     // captured once and frozen (see kernel_oracle.zig's module doc-comment).
     _ = @import("kernel_oracle.zig");
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

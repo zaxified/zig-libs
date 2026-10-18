@@ -116,7 +116,7 @@ pub fn earlySecret(comptime Hkdf: type, out: *[Hkdf.prk_length]u8, psk: []const 
 }
 
 fn earlySecretBody(comptime Hkdf: type, out: *[Hkdf.prk_length]u8, psk: []const u8) void {
-    const zero_salt = [_]u8{0} ** Hkdf.prk_length;
+    const zero_salt = @as([Hkdf.prk_length]u8, @splat(0));
     out.* = Hkdf.extract(&zero_salt, psk);
 }
 
@@ -189,7 +189,7 @@ fn deriveHandshakeSecretBody(
 ) void {
     var salt: [Hkdf.prk_length]u8 = undefined;
     deriveSecret(Hkdf, &salt, early_secret, "derived", empty_transcript_hash);
-    const zero_ikm = [_]u8{0} ** Hkdf.prk_length;
+    const zero_ikm = @as([Hkdf.prk_length]u8, @splat(0));
     const ikm: []const u8 = dhe_shared_secret orelse &zero_ikm;
     out.* = Hkdf.extract(&salt, ikm);
 }
@@ -229,7 +229,7 @@ fn deriveMasterSecretBody(
 ) void {
     var salt: [Hkdf.prk_length]u8 = undefined;
     deriveSecret(Hkdf, &salt, handshake_secret, "derived", empty_transcript_hash);
-    const zero_ikm = [_]u8{0} ** Hkdf.prk_length;
+    const zero_ikm = @as([Hkdf.prk_length]u8, @splat(0));
     out.* = Hkdf.extract(&salt, &zero_ikm);
 }
 
@@ -428,7 +428,7 @@ fn v_deriveSequenceNumberKey(comptime Hkdf: type, comptime key_len: usize, ts: [
 }
 
 test "RFC 8448 §3: early secret (all-zero PSK, all-zero salt)" {
-    const psk = [_]u8{0} ** 32;
+    const psk = @as([32]u8, @splat(0));
     const es = v_earlySecret(HkdfSha256, &psk);
     try testing.expectEqualSlices(u8, &hexTo(32, "33ad0a1c607ec03b09e6cd9893680ce210adf300aa1f2660e1b22e10f170f92a"), &es);
 }
@@ -454,7 +454,7 @@ test "RFC 8448 §3: c/s handshake traffic secrets (same transcript, diff label)"
 test "RFC 8448 §3: master secret (zero IKM)" {
     const hs = hexTo(32, "1dc826e93606aa6fdc0aadc12f741b01046aa6b99f691ed221a9f0ca043fbeac");
     const salt = deriveSecretTls13(hs, "derived", &emptyHash());
-    const zero = [_]u8{0} ** 32;
+    const zero = @as([32]u8, @splat(0));
     const ms = HkdfSha256.extract(&salt, &zero);
     try testing.expectEqualSlices(u8, &hexTo(32, "18df06843d13a08bf2a449844c5f8a478001bc4d4c627984d5a41da8d0402919"), &ms);
 }
@@ -566,7 +566,7 @@ test "DTLS13 prefix: full psk_ke schedule matches independent oracle" {
 }
 
 test "DTLS13 vs TLS13 prefix: same inputs, DIFFERENT output (prefix separation)" {
-    const secret = [_]u8{0x42} ** 32;
+    const secret = @as([32]u8, @splat(0x42));
     const d = v_hkdfExpandLabel(HkdfSha256, secret, "key", "", 16); // dtls13
     const t = v_expandLabel(HkdfSha256, tls13_prefix, secret, "key", "", 16);
     try testing.expect(!std.mem.eql(u8, &d, &t));
@@ -576,7 +576,7 @@ test "DTLS13 vs TLS13 prefix: same inputs, DIFFERENT output (prefix separation)"
 }
 
 test "finished verify data: constant-time compare accepts/rejects correctly" {
-    const fk = [_]u8{0xAB} ** 32;
+    const fk = @as([32]u8, @splat(0xAB));
     const th = sha256Of("transcript");
     const vd = v_computeFinishedVerifyData(HmacSha256, fk, &th);
     try testing.expect(std.crypto.timing_safe.eql([32]u8, vd, vd));
@@ -589,7 +589,7 @@ test "psk_dhe_ke: non-null DHE secret feeds handshake_secret, changes it" {
     var psk: [32]u8 = undefined;
     for (&psk, 0..) |*b, i| b.* = @intCast(i + 1);
     const es = v_earlySecret(HkdfSha256, &psk);
-    const dhe = [_]u8{0x11} ** 32;
+    const dhe = @as([32]u8, @splat(0x11));
     const hs_psk = v_deriveHandshakeSecret(HkdfSha256, es, &emptyHash(), null);
     const hs_dhe = v_deriveHandshakeSecret(HkdfSha256, es, &emptyHash(), &dhe);
     try testing.expect(!std.mem.eql(u8, &hs_psk, &hs_dhe));
@@ -597,7 +597,7 @@ test "psk_dhe_ke: non-null DHE secret feeds handshake_secret, changes it" {
 
 test "SHA-384 suite: schedule runs at the larger digest length" {
     const Hkdf384 = std.crypto.kdf.hkdf.Hkdf(std.crypto.auth.hmac.sha2.HmacSha384);
-    const psk = [_]u8{0x07} ** 48;
+    const psk = @as([48]u8, @splat(0x07));
     const es = v_earlySecret(Hkdf384, &psk);
     try testing.expectEqual(@as(usize, 48), es.len);
     var eh: [48]u8 = undefined;

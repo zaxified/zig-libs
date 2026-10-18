@@ -51,10 +51,10 @@ pub fn damage(src: anytype, buf: []u8, frame: []const u8) usize {
 /// binary and fails with `error.HarnessDoesNotReach` if a label never fired.
 pub fn Marker(comptime Label: type) type {
     return struct {
-        var counts: [@typeInfo(Label).@"enum".fields.len]usize = @splat(0);
+        var counts: [@typeInfo(Label).@"enum".field_names.len]usize = @splat(0);
 
         pub fn mark(comptime l: Label) void {
-            counts[@intFromEnum(l)] += 1;
+            counts[@backingInt(l)] += 1;
             fuzz_driver.hit(@tagName(l));
         }
 
@@ -69,7 +69,7 @@ pub fn Marker(comptime Label: type) type {
                 };
             }
             for (counts, 0..) |n, i| if (n == 0) {
-                std.debug.print("reach: " ++ name ++ " label {t} never hit in {d} seeds\n", .{ @as(Label, @enumFromInt(i)), seeds });
+                std.debug.print("reach: " ++ name ++ " label {t} never hit in {d} seeds\n", .{ @as(Label, @fromBackingInt(@intCast(i))), seeds });
                 return error.HarnessDoesNotReach;
             };
         }
@@ -101,8 +101,8 @@ const Genuine = struct {
         const a = std.heap.page_allocator; // global-alloc-ok: process-lifetime fuzz/test fixture cached across driver runs, outlives testing.allocator's per-test teardown
         gens = try bp.Generators.init(a, n_bits);
         const v: u64 = 200;
-        const gamma = [_]u8{5} ++ [_]u8{0} ** 31;
-        commitment = bp.commit(gens, [_]u8{@truncate(v)} ++ [_]u8{0} ** 31, gamma);
+        const gamma = [_]u8{5} ++ @as([31]u8, @splat(0));
+        commitment = bp.commit(gens, [_]u8{@truncate(v)} ++ @as([31]u8, @splat(0)), gamma);
         var t = bp.Transcript.init(bp.rangeproof_domain);
         const proof = try bp.prove(a, testing.io, gens, &t, &v, gamma);
         defer proof.deinit(a);
@@ -242,7 +242,7 @@ fn fuzzProveVerify(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!v
     var gamma: [32]u8 = undefined;
     for (&gamma) |*x| x.* = k.byte();
     gamma[31] &= 0x0f; // canonical scalar
-    const v_bytes = [_]u8{@truncate(v)} ++ [_]u8{0} ** 31;
+    const v_bytes = [_]u8{@truncate(v)} ++ @as([31]u8, @splat(0));
     const commitment = bp.commit(gens, v_bytes, gamma);
     var pt = bp.Transcript.init(bp.rangeproof_domain);
     const proof = try bp.prove(gpa, testing.io, gens, &pt, &v, gamma);
@@ -251,7 +251,7 @@ fn fuzzProveVerify(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!v
     if (!bp.verify(gens, &vt, commitment, proof)) return error.GenuineProofRefused;
     PvMark.mark(.genuine_accepted);
     // Another value's commitment.
-    const other = bp.commit(gens, [_]u8{@truncate(v +% 1)} ++ [_]u8{0} ** 31, gamma);
+    const other = bp.commit(gens, [_]u8{@truncate(v +% 1)} ++ @as([31]u8, @splat(0)), gamma);
     var t2 = bp.Transcript.init(bp.rangeproof_domain);
     if (bp.verify(gens, &t2, other, proof)) return error.WrongCommitmentVerifies;
     PvMark.mark(.wrong_commitment_refused);

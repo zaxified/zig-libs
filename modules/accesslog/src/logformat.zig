@@ -297,9 +297,9 @@ test "LogFormat: parse errors are typed, one per class" {
     try testing.expectError(E.BadExtraKey, LogFormat.parse("%{a\"b}x"));
     try testing.expectError(E.ControlByteInLiteral, LogFormat.parse("a\nb"));
     try testing.expectError(E.ControlByteInLiteral, LogFormat.parse("a\x7fb"));
-    try testing.expectError(E.TooManyItems, LogFormat.parse("%h" ** (LogFormat.max_items + 1)));
+    try testing.expectError(E.TooManyItems, LogFormat.parse(strRepeat("%h", LogFormat.max_items + 1)));
     // Exactly max_items is fine (positive control for the bound).
-    _ = try LogFormat.parse("%h" ** LogFormat.max_items);
+    _ = try LogFormat.parse(strRepeat("%h", LogFormat.max_items));
 }
 
 test "LogFormat: a crafted value cannot add a line or leave its quotes" {
@@ -312,4 +312,16 @@ test "LogFormat: a crafted value cannot add a line or leave its quotes" {
     const out = try render(&f, e, &buf);
     try testing.expectEqualStrings("\"r\\\" 200\\x0d\\x0aforged\" \"v\\\"\\x00\" \"/p\\x0a\"\n", out);
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "\n"));
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

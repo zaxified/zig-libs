@@ -475,7 +475,7 @@ fn afterHrr(out: []u8, exts: []const u8, second: bool) !struct { written: []cons
     try m.writeInt(u16, 0x0303, .big);
     try m.writeAll(&std.crypto.tls.hello_retry_request_sequence);
     try m.writeByte(32);
-    try m.writeAll(&([_]u8{0x5a} ** 32)); // the session id clientHelloWith's entropy gives
+    try m.writeAll(&(@as([32]u8, @splat(0x5a)))); // the session id clientHelloWith's entropy gives
     try m.writeInt(u16, 0x1301, .big);
     try m.writeByte(0);
     try m.writeInt(u16, @intCast(exts.len), .big);
@@ -493,7 +493,7 @@ fn afterHrr(out: []u8, exts: []const u8, second: bool) !struct { written: []cons
     var w: std.Io.Writer = .fixed(out);
     var tls_in: [Client.min_buffer_len]u8 = undefined;
     var tls_out: [Client.min_buffer_len]u8 = undefined;
-    const entropy = [_]u8{0x5a} ** Client.Options.entropy_len;
+    const entropy = @as([Client.Options.entropy_len]u8, @splat(0x5a));
     if (Client.init(&in, &w, .{
         .host = .{ .explicit = "good.example.test" },
         .ca = .no_verification,
@@ -550,7 +550,7 @@ test "ServerHello with a 253..255-byte session id echo is refused, not a u8 over
         var w: std.Io.Writer = .fixed(&out);
         var tls_in: [Client.min_buffer_len]u8 = undefined;
         var tls_out: [Client.min_buffer_len]u8 = undefined;
-        const entropy = [_]u8{0x5a} ** Client.Options.entropy_len;
+        const entropy = @as([Client.Options.entropy_len]u8, @splat(0x5a));
         try testing.expectError(error.TlsDecodeError, Client.init(&in, &w, .{
             .host = .no_verification,
             .ca = .no_verification,
@@ -1059,7 +1059,7 @@ fn clientHelloWith(out: []u8, o: HelloOpts) ![]const u8 {
     var w: std.Io.Writer = .fixed(out);
     var tls_in: [Client.min_buffer_len]u8 = undefined;
     var tls_out: [Client.min_buffer_len]u8 = undefined;
-    const entropy = [_]u8{0x5a} ** Client.Options.entropy_len;
+    const entropy = @as([Client.Options.entropy_len]u8, @splat(0x5a));
     if (Client.init(&in, &w, .{
         .host = .{ .explicit = o.host },
         .ca = .no_verification,
@@ -1088,7 +1088,7 @@ fn clientHello(comptime C: type, out: []u8, alpn: []const []const u8) ![]const u
     var w: std.Io.Writer = .fixed(out);
     var tls_in: [C.min_buffer_len]u8 = undefined;
     var tls_out: [C.min_buffer_len]u8 = undefined;
-    const entropy = [_]u8{0x5a} ** C.Options.entropy_len;
+    const entropy = @as([C.Options.entropy_len]u8, @splat(0x5a));
     var opts: C.Options = .{
         .host = .{ .explicit = "good.example.test" },
         .ca = .no_verification,
@@ -1191,5 +1191,17 @@ test "ALPN offer: std's ClientHello plus the RFC 7301 extension, lengths grown b
     try testing.expect(diff >= 3 and diff <= 6); // only the three length fields
     var c: [4096]u8 = undefined;
     try testing.expectError(error.AlpnProtocolsInvalid, clientHello(Client, &c, &.{""}));
-    try testing.expectError(error.AlpnProtocolsInvalid, clientHello(Client, &c, &.{"x" ** 256}));
+    try testing.expectError(error.AlpnProtocolsInvalid, clientHello(Client, &c, &.{strRepeat("x", 256)}));
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

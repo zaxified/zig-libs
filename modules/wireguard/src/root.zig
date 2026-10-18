@@ -982,11 +982,11 @@ pub const SetError = RequestError || BuildError;
 fn errnoToError(code: i32) RequestError {
     if (code >= 0 or code == std.math.minInt(i32)) return error.Unexpected;
     return switch (@as(u32, @intCast(-code))) {
-        @intFromEnum(linux.E.PERM), @intFromEnum(linux.E.ACCES) => error.AccessDenied,
-        @intFromEnum(linux.E.NODEV), @intFromEnum(linux.E.NOENT) => error.NoSuchDevice,
-        @intFromEnum(linux.E.INVAL) => error.InvalidRequest,
-        @intFromEnum(linux.E.OPNOTSUPP) => error.NotSupported,
-        @intFromEnum(linux.E.NOBUFS), @intFromEnum(linux.E.NOMEM) => error.SystemResources,
+        @backingInt(linux.E.PERM), @backingInt(linux.E.ACCES) => error.AccessDenied,
+        @backingInt(linux.E.NODEV), @backingInt(linux.E.NOENT) => error.NoSuchDevice,
+        @backingInt(linux.E.INVAL) => error.InvalidRequest,
+        @backingInt(linux.E.OPNOTSUPP) => error.NotSupported,
+        @backingInt(linux.E.NOBUFS), @backingInt(linux.E.NOMEM) => error.SystemResources,
         else => error.Unexpected,
     };
 }
@@ -1148,7 +1148,7 @@ test "key base64: zero-key vector, round-trip, malformed inputs" {
     try testing.expectError(error.InvalidKey, keyFromBase64(zero_b64[0..43]));
     // Regression 2026-10-09: the right length without the `=` decodes to 33
     // octets and used to be decoded into the 32-octet key.
-    try testing.expectError(error.InvalidKey, keyFromBase64("A" ** 44));
+    try testing.expectError(error.InvalidKey, keyFromBase64(strRepeat("A", 44)));
     var bad_char = text;
     bad_char[10] = '!';
     try testing.expectError(error.InvalidKey, keyFromBase64(&bad_char));
@@ -1170,7 +1170,7 @@ test "AllowedIp.parse: CIDR notation, bare-address /32 and /128 expansion, malfo
     try testing.expectEqual(AF.INET6, v6_cidr.family);
     try testing.expectEqual(@as(u8, 16), v6_cidr.addr_len);
     try testing.expectEqual(@as(u8, 32), v6_cidr.cidr);
-    const want_v6 = [_]u8{ 0x20, 0x01, 0x0d, 0xb8 } ++ [_]u8{0} ** 12;
+    const want_v6 = [_]u8{ 0x20, 0x01, 0x0d, 0xb8 } ++ @as([12]u8, @splat(0));
     try testing.expectEqualSlices(u8, &want_v6, v6_cidr.bytes());
 
     // Host bits are tolerated and kept (netaddr.parsePrefix's own contract;
@@ -1498,7 +1498,7 @@ test "get parse: multipart device with peer continuation across messages" {
         try attrRaw(gpa, &msg1, WGPEER_A.PUBLIC_KEY, &peer_a);
         try attrRaw(gpa, &msg1, WGPEER_A.PRESHARED_KEY, &psk);
         try appendEndpoint(gpa, &msg1, .{ .v6 = .{
-            .addr = [_]u8{0xfd} ++ [_]u8{0} ** 14 ++ [_]u8{1},
+            .addr = [_]u8{0xfd} ++ @as([14]u8, @splat(0)) ++ [_]u8{1},
             .port = 1234,
             .scope_id = 3,
         } });
@@ -1524,7 +1524,7 @@ test "get parse: multipart device with peer continuation across messages" {
         var entry = try nestBegin(gpa, &msg2, 0);
         try attrRaw(gpa, &msg2, WGPEER_A.PUBLIC_KEY, &peer_a);
         const ips = try nestBegin(gpa, &msg2, WGPEER_A.ALLOWEDIPS);
-        try appendAllowedIp(gpa, &msg2, AllowedIp.v6([_]u8{0xfd} ++ [_]u8{0} ** 15, 64));
+        try appendAllowedIp(gpa, &msg2, AllowedIp.v6([_]u8{0xfd} ++ @as([15]u8, @splat(0)), 64));
         try nestEnd(&msg2, ips);
         try nestEnd(&msg2, entry);
         entry = try nestBegin(gpa, &msg2, 0);
@@ -1615,7 +1615,7 @@ test "get parse: malformed replies yield typed errors, never a panic" {
         const ips = try nestBegin(gpa, &list, WGPEER_A.ALLOWEDIPS);
         const ip_entry = try nestBegin(gpa, &list, 0);
         try attrU16(gpa, &list, WGALLOWEDIP_A.FAMILY, AF.INET);
-        try attrRaw(gpa, &list, WGALLOWEDIP_A.IPADDR, &([_]u8{0} ** 16)); // 16B for AF_INET
+        try attrRaw(gpa, &list, WGALLOWEDIP_A.IPADDR, &(@as([16]u8, @splat(0)))); // 16B for AF_INET
         try attrU8(gpa, &list, WGALLOWEDIP_A.CIDR_MASK, 24);
         try nestEnd(&list, ip_entry);
         try nestEnd(&list, ips);
@@ -1626,18 +1626,18 @@ test "get parse: malformed replies yield typed errors, never a panic" {
         try testing.expectError(error.BadLength, parser.feed(list.items));
     }
     // Endpoint that is neither sockaddr_in nor sockaddr_in6.
-    try testing.expectError(error.BadLength, parseEndpoint(&([_]u8{0} ** 12)));
+    try testing.expectError(error.BadLength, parseEndpoint(&(@as([12]u8, @splat(0)))));
     var bogus: [16]u8 = @splat(0);
     bogus[0] = 99; // unknown family
     try testing.expectError(error.BadLength, parseEndpoint(&bogus));
 }
 
 test "errnoToError maps kernel NLMSG_ERROR codes" {
-    try testing.expectEqual(error.AccessDenied, errnoToError(-@as(i32, @intFromEnum(linux.E.PERM))));
-    try testing.expectEqual(error.NoSuchDevice, errnoToError(-@as(i32, @intFromEnum(linux.E.NODEV))));
-    try testing.expectEqual(error.InvalidRequest, errnoToError(-@as(i32, @intFromEnum(linux.E.INVAL))));
-    try testing.expectEqual(error.NotSupported, errnoToError(-@as(i32, @intFromEnum(linux.E.OPNOTSUPP))));
-    try testing.expectEqual(error.SystemResources, errnoToError(-@as(i32, @intFromEnum(linux.E.NOBUFS))));
+    try testing.expectEqual(error.AccessDenied, errnoToError(-@as(i32, @backingInt(linux.E.PERM))));
+    try testing.expectEqual(error.NoSuchDevice, errnoToError(-@as(i32, @backingInt(linux.E.NODEV))));
+    try testing.expectEqual(error.InvalidRequest, errnoToError(-@as(i32, @backingInt(linux.E.INVAL))));
+    try testing.expectEqual(error.NotSupported, errnoToError(-@as(i32, @backingInt(linux.E.OPNOTSUPP))));
+    try testing.expectEqual(error.SystemResources, errnoToError(-@as(i32, @backingInt(linux.E.NOBUFS))));
     try testing.expectEqual(error.Unexpected, errnoToError(0));
     try testing.expectEqual(error.Unexpected, errnoToError(17));
     try testing.expectEqual(error.Unexpected, errnoToError(std.math.minInt(i32)));
@@ -1691,7 +1691,7 @@ const ParserCorpus = struct {
             var raw: [28]u8 = @splat(0);
             std.mem.writeInt(u16, raw[0..2], AF.INET6, native_endian);
             std.mem.writeInt(u16, raw[2..4], 51820, .big);
-            raw[8..24].* = [_]u8{0xfd} ++ [_]u8{0} ** 14 ++ [_]u8{1};
+            raw[8..24].* = [_]u8{0xfd} ++ @as([14]u8, @splat(0)) ++ [_]u8{1};
             std.mem.writeInt(u32, raw[24..28], 3, native_endian);
             break :blk raw;
         };
@@ -1717,7 +1717,7 @@ const ParserCorpus = struct {
             try codec.appendAttrU32(gpa, &full, WGPEER_A.PROTOCOL_VERSION, 1);
             const ips = try nestBegin(gpa, &full, WGPEER_A.ALLOWEDIPS);
             try appendAllowedIp(gpa, &full, AllowedIp.v4(.{ 10, 0, 0, 0 }, 24));
-            try appendAllowedIp(gpa, &full, AllowedIp.v6([_]u8{0xfd} ++ [_]u8{0} ** 15, 64));
+            try appendAllowedIp(gpa, &full, AllowedIp.v6([_]u8{0xfd} ++ @as([15]u8, @splat(0)), 64));
             try nestEnd(&full, ips);
             try nestEnd(&full, entry);
             try nestEnd(&full, peers);
@@ -1734,7 +1734,7 @@ const ParserCorpus = struct {
             const entry = try nestBegin(gpa, &v6, 0);
             try attrRaw(gpa, &v6, WGPEER_A.PUBLIC_KEY, &patternKey(0x80));
             try appendEndpoint(gpa, &v6, .{ .v6 = .{
-                .addr = [_]u8{0xfd} ++ [_]u8{0} ** 14 ++ [_]u8{1},
+                .addr = [_]u8{0xfd} ++ @as([14]u8, @splat(0)) ++ [_]u8{1},
                 .port = 1234,
                 .scope_id = 3,
             } });
@@ -1759,7 +1759,7 @@ const ParserCorpus = struct {
         // An interface name at exactly `ifnamsiz`, which is one too many.
         var long_name: std.ArrayList(u8) = .empty;
         try genl.appendHeader(gpa, &long_name, WG_CMD.GET_DEVICE, WG_GENL_VERSION);
-        try codec.appendAttrString(gpa, &long_name, WGDEVICE_A.IFNAME, "n" ** ifnamsiz);
+        try codec.appendAttrString(gpa, &long_name, WGDEVICE_A.IFNAME, strRepeat("n", ifnamsiz));
         self.push(long_name.items, &.{});
 
         // An attribute declaring 200 octets over a four-octet payload.
@@ -1781,7 +1781,7 @@ const ParserCorpus = struct {
             const ips = try nestBegin(gpa, &bad_ip, WGPEER_A.ALLOWEDIPS);
             const ip_entry = try nestBegin(gpa, &bad_ip, 0);
             try attrU16(gpa, &bad_ip, WGALLOWEDIP_A.FAMILY, AF.INET);
-            try attrRaw(gpa, &bad_ip, WGALLOWEDIP_A.IPADDR, &([_]u8{0} ** 16));
+            try attrRaw(gpa, &bad_ip, WGALLOWEDIP_A.IPADDR, &(@as([16]u8, @splat(0))));
             try attrU8(gpa, &bad_ip, WGALLOWEDIP_A.CIDR_MASK, 24);
             try nestEnd(&bad_ip, ip_entry);
             try nestEnd(&bad_ip, ips);
@@ -1862,10 +1862,10 @@ fn fuzzParser(_: void, smith: *std.testing.Smith) !void {
 
 const fuzz_driver = testkit.fuzz.driver;
 const WgLabel = enum { raw_fed, raw_refused, device_roundtrip, damaged, key_roundtrip, key_unpadded33_rejected, key_flipped };
-var wg_reach: [@typeInfo(WgLabel).@"enum".fields.len]usize = @splat(0);
+var wg_reach: [@typeInfo(WgLabel).@"enum".field_names.len]usize = @splat(0);
 
 fn markWg(comptime l: WgLabel) void {
-    wg_reach[@intFromEnum(l)] += 1;
+    wg_reach[@backingInt(l)] += 1;
     fuzz_driver.hit(@tagName(l));
 }
 
@@ -2051,7 +2051,7 @@ fn wgReachCheck(comptime harness: anytype, name: []const u8, seeds: usize, compt
             return err;
         };
     }
-    inline for (required) |l| if (wg_reach[@intFromEnum(l)] == 0) {
+    inline for (required) |l| if (wg_reach[@backingInt(l)] == 0) {
         std.debug.print("reach: {s}: label {t} never hit in {d} seeds\n", .{ name, l, seeds });
         return error.HarnessDoesNotReach;
     };
@@ -2185,7 +2185,7 @@ test "integration (root): set + get round-trip on a real wg interface" {
             .replace_allowed_ips = true,
             .allowed_ips = &.{
                 AllowedIp.v4(.{ 10, 20, 30, 0 }, 24),
-                AllowedIp.v6([_]u8{0xfd} ++ [_]u8{0} ** 15, 64),
+                AllowedIp.v6([_]u8{0xfd} ++ @as([15]u8, @splat(0)), 64),
             },
         }},
     });
@@ -2248,4 +2248,16 @@ test {
     _ = @import("kernel_handshake_replay.zig");
     _ = @import("stackprobe_test.zig");
     _ = @import("stackprobe2_test.zig");
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

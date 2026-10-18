@@ -1167,11 +1167,11 @@ test "an item larger than the PER-SHARD byte cap is not stored" {
     // Documented tightening vs `Cache`: the ceiling is max_bytes / shards.
     var sc = try testSharded(1024, 256, 8); // 128 bytes per shard
     defer sc.deinit();
-    const big = [_]u8{'x'} ** 200;
+    const big = @as([200]u8, @splat('x'));
     sc.put("k", &big, 0, 0, 0);
     var buf: [256]u8 = undefined;
     try testing.expect(sc.getBuf("k", 1, 0, &buf) == .miss);
-    const ok = [_]u8{'x'} ** 100;
+    const ok = @as([100]u8, @splat('x'));
     sc.put("k2", &ok, 0, 0, 0);
     try testing.expect(sc.getBuf("k2", 1, 0, &buf) == .ok);
 }
@@ -1185,10 +1185,10 @@ test "the per-shard ceiling and the aggregate cap hold on the REPLACE path, unde
     defer sc.deinit();
     var buf: [256]u8 = undefined;
 
-    const fits = [_]u8{'x'} ** 100;
+    const fits = @as([100]u8, @splat('x'));
     sc.put("k", &fits, 0, 0, 0);
     try testing.expect(sc.getBuf("k", 1, 0, &buf) == .ok);
-    const over = [_]u8{'y'} ** 200; // 200 > 128 — over the per-shard ceiling
+    const over = @as([200]u8, @splat('y')); // 200 > 128 — over the per-shard ceiling
     sc.put("k", &over, 2, 0, 0);
     try testing.expect(sc.getBuf("k", 3, 0, &buf) == .miss);
     try testing.expectEqual(@as(usize, 0), sc.stats().bytes);

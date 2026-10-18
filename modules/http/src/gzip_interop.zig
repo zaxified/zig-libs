@@ -49,8 +49,8 @@ const routes = [_]Route{
     .{ .path = "/gz-noise", .kind = .noise },
 };
 
-const whole_body = "The quick brown fox jumps over the lazy dog. " ** 64; // ~2.8 KiB
-const stream_piece = "abcdefgh0123456789" ** 228; // ~4 KiB, not a power of two
+const whole_body = strRepeat("The quick brown fox jumps over the lazy dog. ", 64); // ~2.8 KiB
+const stream_piece = strRepeat("abcdefgh0123456789", 228); // ~4 KiB, not a power of two
 const stream_pieces = 64;
 const noise_len = 192 * 1024;
 
@@ -231,4 +231,16 @@ test "LIVE gzip: curl and gzip(1) decode our level-6 members on HTTP/1.1 and h2c
 test "LIVE gzip: levels 1 and 9 decode the same way" {
     try checkAll(1, &.{"--http1.1"});
     try checkAll(9, &.{"--http1.1"});
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

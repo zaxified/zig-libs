@@ -52,7 +52,7 @@ const Data = struct {
 
 var total: u64 = 0;
 const json_body = "{\"id\":42,\"name\":\"example\",\"tags\":[\"a\",\"b\",\"c\"],\"active\":true,\"score\":3.14159,\"description\":\"A short JSON document returned by the benchmark handler so that the response has a body of a realistic size.\",\"n\":1}                    ";
-const block = [_]u8{'x'} ** 4096;
+const block = @as([4096]u8, @splat('x'));
 
 fn hGet(req: *http.Server.Request, rw: *http.Server.ResponseWriter) anyerror!void {
     const ua: []const u8 = req.header("User-Agent") orelse "";

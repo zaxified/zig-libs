@@ -174,8 +174,8 @@ pub const DirStorage = struct {
         .unlock = dirUnlock,
     };
 
-    const dir_permissions: std.Io.File.Permissions = @enumFromInt(0o700);
-    const file_permissions: std.Io.File.Permissions = @enumFromInt(0o600);
+    const dir_permissions: std.Io.File.Permissions = @fromBackingInt(@intCast(0o700));
+    const file_permissions: std.Io.File.Permissions = @fromBackingInt(@intCast(0o600));
 
     fn of(ptr: *anyopaque) *DirStorage {
         return @ptrCast(@alignCast(ptr));
@@ -492,14 +492,14 @@ test "validKey: segments, characters, traversal" {
     try testing.expect(!validKey("sp ace"));
     try testing.expect(!validKey("nl\n"));
     try testing.expect(!validKey("back\\slash"));
-    try testing.expect(!validKey("x" ** (max_key_len + 1)));
+    try testing.expect(!validKey(strRepeat("x", max_key_len + 1)));
 }
 
 // ── audit 2026-10-18: tests asked for by mutation survivors ─────────────────
 
 test "validKey: the length limit is inclusive; '@' and '+' are key characters" {
-    try testing.expect(validKey("x" ** max_key_len));
-    try testing.expect(!validKey("x" ** (max_key_len + 1)));
+    try testing.expect(validKey(strRepeat("x", max_key_len)));
+    try testing.expect(!validKey(strRepeat("x", max_key_len + 1)));
     try testing.expect(validKey("a@b+c/d_e"));
 }
 
@@ -508,8 +508,8 @@ test "Storage: lock owners are 1..64 key characters; the value limit is inclusiv
     defer mem.deinit();
     const s = mem.storage();
     try testing.expectError(error.InvalidKey, s.tryLock("k", "", 0, 10));
-    try testing.expect(try s.tryLock("k", "o" ** 64, 0, 10));
-    try testing.expectError(error.InvalidKey, s.tryLock("k2", "o" ** 65, 0, 10));
+    try testing.expect(try s.tryLock("k", strRepeat("o", 64), 0, 10));
+    try testing.expectError(error.InvalidKey, s.tryLock("k2", strRepeat("o", 65), 0, 10));
     try testing.expectError(error.InvalidKey, s.tryLock("k3", "bad owner", 0, 10));
 
     const big = try testing.allocator.alloc(u8, max_value_len + 1);
@@ -587,12 +587,12 @@ test "DirStorage: contract, 0600 files in 0700 directories, no temp files left" 
     try checkContract(d.storage());
 
     const s = d.storage();
-    s.unlock("x" ** 600, "owner"); // an invalid name is a no-op, not a path buffer overflow
+    s.unlock(strRepeat("x", 600), "owner"); // an invalid name is a no-op, not a path buffer overflow
     try s.store("certificates/deep/example.org.key", "secret");
     const file_stat = try tmp.dir.statFile(io, "certificates/deep/example.org.key", .{});
-    try testing.expectEqual(@as(u32, 0o600), @as(u32, @intFromEnum(file_stat.permissions)) & 0o777);
+    try testing.expectEqual(@as(u32, 0o600), @as(u32, @backingInt(file_stat.permissions)) & 0o777);
     const dir_stat = try tmp.dir.statFile(io, "certificates/deep", .{});
-    try testing.expectEqual(@as(u32, 0o700), @as(u32, @intFromEnum(dir_stat.permissions)) & 0o777);
+    try testing.expectEqual(@as(u32, 0o700), @as(u32, @backingInt(dir_stat.permissions)) & 0o777);
 
     // Only the value file is in the directory: the atomic write left no temp.
     var sub = try tmp.dir.openDir(io, "certificates/deep", .{ .iterate = true });
@@ -701,4 +701,16 @@ test "DirStorage: lock operations wait for the guard" {
     t.join();
     try testing.expect(!finished_while_held);
     try testing.expect(l.won);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

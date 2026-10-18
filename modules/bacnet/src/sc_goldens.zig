@@ -174,11 +174,11 @@ test "every third-party frame re-encodes to the identical octets" {
 }
 
 test "the golden table covers all thirteen BVLC functions" {
-    var seen = [_]bool{false} ** 13;
+    var seen = @as([13]bool, @splat(false));
     var buf: [256]u8 = undefined;
     for (wire) |g| {
         const msg = try sc.decode(bytes(g, &buf));
-        seen[@intFromEnum(msg.function())] = true;
+        seen[@backingInt(msg.function())] = true;
     }
     for (seen, 0..) |ok, i| {
         if (!ok) {

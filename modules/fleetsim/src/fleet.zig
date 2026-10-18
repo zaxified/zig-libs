@@ -817,7 +817,7 @@ pub const Fleet = struct {
         // never fit in memory.
         self.mix(t);
         self.mix(node);
-        self.mix(@intFromEnum(kind));
+        self.mix(@backingInt(kind));
         self.mix(bytes.len);
         for (bytes) |b| self.mix(b);
 
@@ -1135,7 +1135,7 @@ test "hostile: a responder that errors is counted, not propagated" {
 }
 
 test "hostile: a tick that overflows the frame buffer is logged, not a stomp" {
-    const big = [_]u8{0xAA} ** 64;
+    const big = @as([64]u8, @splat(0xAA));
     var echo = Echo{ .tick_payload = &big };
     var fleet = try Fleet.init(testing.allocator, .{ .max_frame_len = 16 });
     defer fleet.deinit();

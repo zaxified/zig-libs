@@ -73,7 +73,7 @@ const T: u64 = 2000;
 pub fn main() !void {
     const m = vdf.group.rsa2048ChallengeModulus();
 
-    var x_canon: [modulus_bytes]u8 = [_]u8{0} ** modulus_bytes;
+    var x_canon: [modulus_bytes]u8 = @as([modulus_bytes]u8, @splat(0));
     x_canon[modulus_bytes - 1] = 5;
     const x = try vdf.group.elementFromBytes(m, &x_canon);
 
@@ -111,7 +111,7 @@ pub fn main() !void {
     // out-of-range/zero element -- see `ProveError`. A zero `x` is never a
     // member of Z_N* and `group.elementFromBytes` rejects it outright.
     {
-        const zero_x: [modulus_bytes]u8 = [_]u8{0} ** modulus_bytes;
+        const zero_x: [modulus_bytes]u8 = @as([modulus_bytes]u8, @splat(0));
         if (vdf.prove(m, &zero_x, &y_canon, T)) |_| {
             return error.UnexpectedProveSuccess;
         } else |err| switch (err) {

@@ -271,7 +271,7 @@ fn runProbe(label: []const u8, call: *const fn () void, n: *const Needles) !usiz
 }
 
 fn skipUnlessOptimized() !void {
-    if (builtin.mode == .Debug or builtin.mode == .ReleaseSafe) return error.SkipZigTest;
+    if (builtin.mode == .debug or builtin.mode == .safe) return error.SkipZigTest;
 }
 
 /// Audit-local deterministic byte strings: hashes of a label, so no 16-byte
@@ -503,7 +503,7 @@ fn x3dhSecrets(dh1: [32]u8, dh2: [32]u8, dh3: [32]u8, dh4: [32]u8) Xdh {
     r.dh3 = dh3;
     r.dh4 = dh4;
     r.km = x3dh.f_constant ++ dh1 ++ dh2 ++ dh3 ++ dh4;
-    r.prk = HkdfSha256.extract(&([_]u8{0} ** 32), &r.km);
+    r.prk = HkdfSha256.extract(&(@as([32]u8, @splat(0))), &r.km);
     HkdfSha256.expand(&r.sk, x3dh.x3dh_info, r.prk);
     return r;
 }
@@ -529,7 +529,7 @@ fn addPqSecrets(n: *Needles, dh1: [32]u8, dh2: [32]u8, dh3: [32]u8, dh4: [32]u8,
     n.addBytes("dh4", &dh4);
     n.addBytes("kem ss", &ss);
     n.addBytes("km", &km);
-    const prk = HkdfSha256.extract(&([_]u8{0} ** 32), &km);
+    const prk = HkdfSha256.extract(&(@as([32]u8, @splat(0))), &km);
     n.addBytes("prk", &prk);
     var sk: [32]u8 = undefined;
     HkdfSha256.expand(&sk, pqxdh.pqxdh_info, prk);
@@ -558,7 +558,7 @@ fn xeddsaSecrets(n: *Needles, priv: [32]u8, with_sign_bit: bool) void {
     if (!with_sign_bit and (pub_a.toBytes()[31] >> 7) == 1) a = sc.neg(a);
     n.addBytes("xeddsa a", &a);
     var s = Sha512.init(.{});
-    s.update(&([_]u8{0xFE} ++ [_]u8{0xFF} ** 31));
+    s.update(&([_]u8{0xFE} ++ @as([31]u8, @splat(0xFF))));
     s.update(&a);
     s.update(msg);
     s.update(&z);

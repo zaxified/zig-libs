@@ -516,7 +516,7 @@ test "lower-case encoding folds every letter, including A, and no digit" {
     var buf: [32]u8 = undefined;
     try testing.expectEqualStrings("aaaa====", try encode(&buf, "\x00\x00", .{ .lowercase = true }));
     try testing.expectEqualStrings("a0======", try encode(&buf, "\x50", .{ .alphabet = .hex, .lowercase = true }));
-    try testing.expectEqualStrings("7777777777777777", try encode(&buf, "\xff" ** 10, .{ .lowercase = true }));
+    try testing.expectEqualStrings("7777777777777777", try encode(&buf, strRepeat("\xff", 10), .{ .lowercase = true }));
 }
 
 test "skip_whitespace skips exactly space, tab, CR and LF" {
@@ -774,4 +774,16 @@ fn compareDecodes(got: []u8, want: []u8, text: []const u8, opts: DecodeOptions) 
 test {
     _ = @import("kat_vectors.zig");
     _ = @import("fuzz_test.zig");
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

@@ -300,7 +300,7 @@ test "add rejects NaN/inf and out-of-range coordinates" {
 test "hilbert mapping is a bijection over a small grid" {
     // 4×4 grid (use the top bits): every distinct cell yields a distinct index,
     // and indices cover [0, 15]. Verifies the mapping is a permutation.
-    var seen = [_]bool{false} ** 16;
+    var seen = @as([16]bool, @splat(false));
     const step: u32 = hilbert_side / 4;
     var yi: u32 = 0;
     while (yi < 4) : (yi += 1) {

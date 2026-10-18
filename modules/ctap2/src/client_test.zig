@@ -132,7 +132,7 @@ test "PIN errors after a good key agreement: invalid, blocked, auth blocked, pol
         try testing.expectEqual(@as(usize, 2), h.tr.requests.items.len);
     }
     // ... and for changePIN / setPIN / the UV token (protocol Two draws an IV).
-    const iv_script = platform_scalar ++ [_]u8{9} ** 32;
+    const iv_script = platform_scalar ++ @as([32]u8, @splat(9));
     {
         const resp = [_]u8{0x33};
         var h = harness(&.{ kr, &resp }, &iv_script);
@@ -160,11 +160,11 @@ test "PIN and permission validation fail before anything is sent" {
     defer h.deinit();
     const c = h.client(.two);
     try testing.expectError(error.PinTooShort, c.setPin("abc"));
-    try testing.expectError(error.PinTooLong, c.setPin("a" ** 64));
+    try testing.expectError(error.PinTooLong, c.setPin(strRepeat("a", 64)));
     try testing.expectError(error.PinNotUtf8, c.setPin("ab\xffcd"));
     try testing.expectError(error.PinTooShort, c.changePin("1234", "\u{20ac}\u{20ac}\u{20ac}"));
-    try testing.expectError(error.PinTooLong, c.changePin("a" ** 64, "5678"));
-    try testing.expectError(error.PinTooLong, c.getPinToken("a" ** 64));
+    try testing.expectError(error.PinTooLong, c.changePin(strRepeat("a", 64), "5678"));
+    try testing.expectError(error.PinTooLong, c.getPinToken(strRepeat("a", 64)));
     try testing.expectError(error.InvalidPermissions, c.getPinUvAuthTokenUsingPin("1234", .{}, null));
     try testing.expectError(error.InvalidPermissions, c.getPinUvAuthTokenUsingUv(.{}, null));
     try testing.expectEqual(@as(usize, 0), h.tr.requests.items.len);
@@ -295,16 +295,16 @@ fn getToken(protocol: ctap2pin.Protocol, token_resp: []const u8) clientpin.Clien
     const ke = goodKeyEntries(&pk);
     const kr = keyResp(&ke) catch return error.OutOfMemory;
     defer a.free(kr);
-    const script = platform_scalar ++ [_]u8{5} ** 16;
+    const script = platform_scalar ++ @as([16]u8, @splat(5));
     var h = harness(&.{ kr, token_resp }, &script);
     defer h.deinit();
     return h.client(protocol).getPinUvAuthTokenUsingPin("1234", .{ .mc = true }, "example.org");
 }
 
 test "token lengths: One takes 16 or 32, Two exactly 32" {
-    const t16 = [_]u8{0xA1} ** 16;
-    const t32 = [_]u8{0xB2} ** 32;
-    const t48 = [_]u8{0xC3} ** 48;
+    const t16 = @as([16]u8, @splat(0xA1));
+    const t32 = @as([32]u8, @splat(0xB2));
+    const t48 = @as([48]u8, @splat(0xC3));
     {
         const r = try tokenResp(.one, &t16);
         defer a.free(r);
@@ -342,7 +342,7 @@ test "token lengths: One takes 16 or 32, Two exactly 32" {
         try testing.expectError(error.BadTokenLength, getToken(.two, r));
     }
     // Ciphertext of a length no protocol can decrypt (not whole blocks / too short).
-    const odd = [_]u8{0x00} ++ [_]u8{ 0xa1, 0x02, 0x58, 0x1f } ++ [_]u8{0} ** 31;
+    const odd = [_]u8{0x00} ++ [_]u8{ 0xa1, 0x02, 0x58, 0x1f } ++ @as([31]u8, @splat(0));
     try testing.expectError(error.BadTokenLength, getToken(.one, &odd));
     try testing.expectError(error.BadTokenLength, getToken(.two, &odd));
     const empty_bytes = [_]u8{ 0x00, 0xa1, 0x02, 0x40 };
@@ -432,8 +432,8 @@ test "SharedSecret encrypt/decryptToken round trip and wipe" {
     var s: clientpin.SharedSecret = .{ .protocol = .two, .platform_key = pk };
     @memset(&s.bytes, 0x5a);
     var ct: [48]u8 = undefined;
-    var rnd: testutil.ScriptRandom = .{ .bytes = &([_]u8{3} ** 16) };
-    const token = [_]u8{0x77} ** 32;
+    var rnd: testutil.ScriptRandom = .{ .bytes = &(@as([16]u8, @splat(3))) };
+    const token = @as([32]u8, @splat(0x77));
     try s.encrypt(rnd.random(), &ct, &token);
     var t = try s.decryptToken(&ct);
     defer t.deinit();
@@ -520,4 +520,16 @@ test "fromInfo: maxMsgSize is clamped from below as well as above" {
     try testing.expectEqual(@as(usize, 4000), clientpin.Client.fromInfo(a, h.tr.transport(), h.rnd.random(), info).?.max_response);
     info.max_msg_size = null;
     try testing.expectEqual(@as(usize, 2048), clientpin.Client.fromInfo(a, h.tr.transport(), h.rnd.random(), info).?.max_response);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

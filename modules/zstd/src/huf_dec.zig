@@ -492,8 +492,8 @@ fn fillLevel2(cells: []u32, target_log: u32, consumed_bits: u32, rank_val: *cons
 pub fn readDTableX2(dt: *DTable, src: []const u8) Error!usize {
     var max_table_log: u32 = dt.max_table_log;
     var rank_val: [tablelog_max]RankValCol = undefined;
-    var rank_stats = [_]u32{0} ** (tablelog_max + 1);
-    var rank_start0 = [_]u32{0} ** (tablelog_max + 3);
+    var rank_stats = @as([tablelog_max + 1]u32, @splat(0));
+    var rank_start0 = @as([tablelog_max + 3]u32, @splat(0));
     var sorted: [symbol_value_max + 1]u8 = undefined;
     var weights: [symbol_value_max + 1]u8 = undefined;
     var table_log: u32 = undefined;

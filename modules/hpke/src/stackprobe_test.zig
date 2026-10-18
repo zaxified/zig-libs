@@ -281,7 +281,7 @@ fn runProbe(label: []const u8, call: *const fn () void, n: *const Needles) !usiz
 }
 
 fn skipUnlessOptimized() !void {
-    if (builtin.mode == .Debug or builtin.mode == .ReleaseSafe) return error.SkipZigTest;
+    if (builtin.mode == .debug or builtin.mode == .safe) return error.SkipZigTest;
 }
 
 // ── needle helpers ──────────────────────────────────────────────────────────
@@ -291,7 +291,7 @@ const aad = "hpke probe aad";
 const pt = "hpke dead-stack probe plaintext, two AES blocks+";
 
 fn suiteId(comptime Kem: type, aead_id: suite.AeadId) [10]u8 {
-    return suite.suiteId(Kem.kem_id, @intFromEnum(suite.KdfId.hkdf_sha256), @intFromEnum(aead_id));
+    return suite.suiteId(Kem.kem_id, @backingInt(suite.KdfId.hkdf_sha256), @backingInt(aead_id));
 }
 
 /// `eae_prk` and the shared secret are recomputed from `dh` with the KEM's

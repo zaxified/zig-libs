@@ -524,7 +524,7 @@ test "failures keep their cause: allocation here, or the output's" {
     var sw2: StreamWriter = try .init(failing.allocator(), &out.writer, &buf, .{ .effort = .q4, .window_bits = 16 });
     defer sw2.deinit();
     failing.fail_index = failing.alloc_index;
-    try testing.expectError(error.WriteFailed, sw2.writer.writeAll("x" ** 1000));
+    try testing.expectError(error.WriteFailed, sw2.writer.writeAll(strRepeat("x", 1000)));
     try testing.expectEqual(error.OutOfMemory, sw2.err.?);
 }
 
@@ -797,4 +797,16 @@ test "a warm writer allocates nothing: the next stream after reset, every level"
         try testing.expectEqual(before, counting.calls);
         try expectRoundTrip(src, out.written());
     }
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

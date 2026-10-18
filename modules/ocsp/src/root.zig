@@ -614,7 +614,7 @@ pub fn parseResponse(bytes: []const u8) ParseError!Response {
     if (rawTag(status_elem) != 0x0a) return error.Malformed; // ENUMERATED
     const status_bytes = contentOf(bytes, status_elem);
     if (status_bytes.len != 1) return error.Malformed;
-    const status: ResponseStatus = @enumFromInt(status_bytes[0]);
+    const status: ResponseStatus = @fromBackingInt(@intCast(status_bytes[0]));
 
     if (status != .successful) return .{ .status = status, .basic = null };
 
@@ -1059,7 +1059,7 @@ const DigestCache = struct {
     slots: [std.enums.values(HashAlgo).len]?IssuerDigests = @splat(null),
 
     fn get(self: *DigestCache, algo: HashAlgo, issuer: CertView) *const IssuerDigests {
-        const i = @intFromEnum(algo);
+        const i = @backingInt(algo);
         if (self.slots[i] == null) {
             var d: IssuerDigests = .{};
             const n = digest(algo, issuer.subject_name, &d.name_buf);
@@ -1256,7 +1256,7 @@ fn derToRawStrict(comptime n: usize, sig_der: []const u8) ?[2 * n]u8 {
     const body = derLen(sig_der[1..]) orelse return null;
     if (body.len_bytes + 1 + body.len != sig_der.len) return null;
     var rest = sig_der[1 + body.len_bytes ..][0..body.len];
-    var out = [_]u8{0} ** (2 * n);
+    var out = @as([2 * n]u8, @splat(0));
     inline for (.{ 0, n }) |off| {
         if (rest.len < 2 or rest[0] != 0x02) return null;
         const int = derLen(rest[1..]) orelse return null;
@@ -1364,13 +1364,13 @@ test {
 
 test "derToRawStrict: P-384-sized encodings DER forbids are refused" {
     // Built around one valid 48-byte (r, s): r = 0x01 ‖ 0x00*47, s = 0x7f*48.
-    const r = [_]u8{0x01} ++ [_]u8{0} ** 47;
-    const s = [_]u8{0x7f} ** 48;
+    const r = [_]u8{0x01} ++ @as([47]u8, @splat(0));
+    const s = @as([48]u8, @splat(0x7f));
     const good = [_]u8{ 0x30, 2 + 48 + 2 + 48, 0x02, 48 } ++ r ++ [_]u8{ 0x02, 48 } ++ s;
     const raw = derToRawStrict(48, &good).?;
     try std.testing.expectEqualSlices(u8, &(r ++ s), &raw);
     // A high-bit r needs its sign octet: with it, accepted; without, negative.
-    const hi = [_]u8{0x80} ++ [_]u8{0} ** 47;
+    const hi = [_]u8{0x80} ++ @as([47]u8, @splat(0));
     const with_pad = [_]u8{ 0x30, 2 + 49 + 2 + 48, 0x02, 49, 0x00 } ++ hi ++ [_]u8{ 0x02, 48 } ++ s;
     try std.testing.expect(derToRawStrict(48, &with_pad) != null);
     const negative = [_]u8{ 0x30, 2 + 48 + 2 + 48, 0x02, 48 } ++ hi ++ [_]u8{ 0x02, 48 } ++ s;

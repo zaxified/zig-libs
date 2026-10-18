@@ -569,7 +569,7 @@ test "OID decode rejects hostile content" {
         parseOid(&.{ 0x2b, 0x90, 0x80, 0x80, 0x80, 0x80, 0x00 }),
     );
     // Arc-count bound: max_arcs+ single-byte arcs.
-    const many = [_]u8{0x01} ** (oid_mod.max_arcs + 1);
+    const many = @as([oid_mod.max_arcs + 1]u8, @splat(0x01));
     try testing.expectError(error.OidTooLong, parseOid(&many));
     // Encoding a non-encodable Oid is a typed error.
     var buf: [16]u8 = undefined;

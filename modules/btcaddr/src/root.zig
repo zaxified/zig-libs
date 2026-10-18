@@ -589,7 +589,7 @@ test "keyInRange (constant-time) agrees with the byte-order comparison it replac
         }
     }.f;
     var edges: [7][32]u8 = undefined;
-    edges[0] = [_]u8{0} ** 32;
+    edges[0] = @as([32]u8, @splat(0));
     edges[1] = edges[0];
     edges[1][31] = 1;
     edges[2] = secp256k1_order;
@@ -597,7 +597,7 @@ test "keyInRange (constant-time) agrees with the byte-order comparison it replac
     edges[3] = secp256k1_order; // n
     edges[4] = secp256k1_order;
     edges[4][31] += 1; // n + 1
-    edges[5] = [_]u8{0xff} ** 32;
+    edges[5] = @as([32]u8, @splat(0xff));
     edges[6] = edges[0];
     edges[6][0] = 1; // high byte only
     for (&edges) |*e| try t.expectEqual(oracle(e), keyInRange(e));

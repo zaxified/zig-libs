@@ -398,7 +398,7 @@ const TicketCorpus = struct {
 
         // 3: eight extensions — `ext_buf` is `[8]Extension`, so this is the
         //    boundary at which the caller's buffer is exactly full.
-        const many = [_]Extension{.{ .ext_type = 1, .data = "z" }} ** 8;
+        const many = @as([8]Extension, @splat(.{ .ext_type = 1, .data = "z" }));
         {
             const e = try (NewSessionTicket{
                 .ticket_lifetime = 1,
@@ -412,7 +412,7 @@ const TicketCorpus = struct {
         }
 
         // 4: nine — one past it.
-        const too_many = [_]Extension{.{ .ext_type = 1, .data = "z" }} ** 9;
+        const too_many = @as([9]Extension, @splat(.{ .ext_type = 1, .data = "z" }));
         {
             const e = try (NewSessionTicket{
                 .ticket_lifetime = 1,
@@ -508,10 +508,10 @@ fn fuzzTicketDecode(_: void, smith: *std.testing.Smith) !void {
 
 const fuzz_driver = @import("testkit").fuzz.driver;
 const TicketLabel = enum { raw_rejected, raw_accepted, roundtrip, truncated_rejected, trailing_rejected, flipped };
-var ticket_reach: [@typeInfo(TicketLabel).@"enum".fields.len]usize = @splat(0);
+var ticket_reach: [@typeInfo(TicketLabel).@"enum".field_names.len]usize = @splat(0);
 
 fn markTicket(comptime l: TicketLabel) void {
-    ticket_reach[@intFromEnum(l)] += 1;
+    ticket_reach[@backingInt(l)] += 1;
     fuzz_driver.hit(@tagName(l));
 }
 
@@ -582,7 +582,7 @@ test "fuzz harness: 300 ticket seeds in every test run, and they get everywhere"
         };
     }
     for (ticket_reach, 0..) |n, i| {
-        const l: TicketLabel = @enumFromInt(i);
+        const l: TicketLabel = @fromBackingInt(@intCast(i));
         // Random octets are not a well-formed ticket (the lengths must add up
         // exactly): `raw_accepted` is reached through the corpus only.
         if (l == .raw_accepted) continue;

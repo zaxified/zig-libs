@@ -71,7 +71,7 @@ pub fn main() !void {
 
     var cw2_buf: [256]u8 = undefined;
     var cw2 = ipcbus.FdWriter.init(client_fd2, &cw2_buf);
-    try framing.writeFrame(&cw2.interface, "x" ** 50, .{}); // fine under the default 1 MiB cap
+    try framing.writeFrame(&cw2.interface, strRepeat("x", 50), .{}); // fine under the default 1 MiB cap
     try cw2.interface.flush();
 
     const conn_fd2 = try server.acceptOne();
@@ -87,4 +87,16 @@ pub fn main() !void {
         else => return err,
     };
     return error.ExpectedFrameTooLarge;
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

@@ -468,8 +468,8 @@ test "readiness detail: lines that exactly fill the budget are all kept; one mor
     // the 200 (a cached "not ready" would outlive the outage). Mutation
     // 2026-10-04: an off-by-one budget, a dropped marker and a dropped
     // Cache-Control on /readyz all survived.
-    const n200 = "a" ** 200;
-    const n288 = "b" ** 288;
+    const n200 = strRepeat("a", 200);
+    const n288 = strRepeat("b", 288);
     var exact = [_]Check{
         .{ .name = n200, .checkFn = alwaysDown },
         .{ .name = n288, .checkFn = alwaysDown },
@@ -981,4 +981,16 @@ test "model-fuzz: probes, pass-through, detail budget and call counts vs. a naiv
     try testing.expect(reach_custom_paths > 0 and reach_exact_fill > 0);
     try testing.expect(reach_json_ready > 0 and reach_json_escape > 0);
     try testing.expect(reach_startup_up > 0 and reach_startup_down > 0 and reach_startup_off > 0);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

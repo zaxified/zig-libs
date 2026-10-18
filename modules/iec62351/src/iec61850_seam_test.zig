@@ -33,7 +33,7 @@ test "iec61850's GOOSE decoder refuses a frame this module secured, and decodeSe
     var pbuf: [256]u8 = undefined;
     const apdu = try p.encode(&[_][]const u8{&[_]u8{ 0x83, 0x01, 0x01 }}, &pbuf); // boolean TRUE
 
-    const key = [_]u8{0x42} ** 32;
+    const key = @as([32]u8, @splat(0x42));
     var out: [512]u8 = undefined;
     const secured = try goose.build(&out, .{
         .appid = 0x3001,

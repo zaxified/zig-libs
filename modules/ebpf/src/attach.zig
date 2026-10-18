@@ -492,7 +492,7 @@ pub fn buildKprobeAttr(
     var attr: linux.perf_event_attr = .{
         // The kprobe PMU's dynamic id, NOT a static PERF.TYPE value; the enum
         // is non-exhaustive precisely so dynamic PMUs fit.
-        .type = @enumFromInt(pmu_type),
+        .type = @fromBackingInt(@intCast(pmu_type)),
         .size = @sizeOf(linux.perf_event_attr),
         .config = 0,
     };
@@ -751,7 +751,7 @@ pub fn buildUprobeAttr(
     ref_ctr_shift: u6,
 ) linux.perf_event_attr {
     var attr: linux.perf_event_attr = .{
-        .type = @enumFromInt(pmu_type),
+        .type = @fromBackingInt(@intCast(pmu_type)),
         .size = @sizeOf(linux.perf_event_attr),
         .config = 0,
     };
@@ -1434,12 +1434,12 @@ const NetlinkConn = struct {
 pub fn errnoToXdpError(code: i32) XdpAttachError {
     if (code >= 0 or code == std.math.minInt(i32)) return error.Unexpected;
     return switch (@as(u32, @intCast(-code))) {
-        @intFromEnum(linux.E.PERM), @intFromEnum(linux.E.ACCES) => error.PermissionDenied,
-        @intFromEnum(linux.E.NODEV), @intFromEnum(linux.E.NXIO) => error.NoSuchInterface,
-        @intFromEnum(linux.E.BUSY), @intFromEnum(linux.E.EXIST) => error.AlreadyAttached,
-        @intFromEnum(linux.E.OPNOTSUPP) => error.ModeNotSupported,
-        @intFromEnum(linux.E.INVAL) => error.InvalidFlags,
-        @intFromEnum(linux.E.NOMEM), @intFromEnum(linux.E.NOBUFS) => error.OutOfMemory,
+        @backingInt(linux.E.PERM), @backingInt(linux.E.ACCES) => error.PermissionDenied,
+        @backingInt(linux.E.NODEV), @backingInt(linux.E.NXIO) => error.NoSuchInterface,
+        @backingInt(linux.E.BUSY), @backingInt(linux.E.EXIST) => error.AlreadyAttached,
+        @backingInt(linux.E.OPNOTSUPP) => error.ModeNotSupported,
+        @backingInt(linux.E.INVAL) => error.InvalidFlags,
+        @backingInt(linux.E.NOMEM), @backingInt(linux.E.NOBUFS) => error.OutOfMemory,
         else => error.Unexpected,
     };
 }
@@ -1627,7 +1627,7 @@ pub fn buildProgAttachAttr(
     attr.prog_attach = .{
         .target_fd = cgroup_fd,
         .attach_bpf_fd = prog_fd,
-        .attach_type = @intFromEnum(attach_type),
+        .attach_type = @backingInt(attach_type),
         .attach_flags = flags.bits(),
         // The kernel reads replace_bpf_fd only when BPF_F_REPLACE is set; 0
         // (not -1) keeps the unused case a plain zeroed field, matching what
@@ -1706,7 +1706,7 @@ test "perf_event_attr layout: the kprobe attr names the probe via config1/config
 
     // Entry probe: config carries NO retprobe bit.
     const entry = buildKprobeAttr(7, 0, false, sym.ptr, 0);
-    try testing.expectEqual(@as(u32, 7), @intFromEnum(entry.type));
+    try testing.expectEqual(@as(u32, 7), @backingInt(entry.type));
     try testing.expectEqual(@as(u32, @sizeOf(linux.perf_event_attr)), entry.size);
     try testing.expectEqual(@as(u64, 0), entry.config);
     try testing.expectEqual(@intFromPtr(sym.ptr), entry.config1);
@@ -1829,17 +1829,17 @@ test "netlink errno mapping covers the XDP-specific failures" {
             return errnoToXdpError(code);
         }
     }.f;
-    try testing.expectError(error.PermissionDenied, asUnion(-@as(i32, @intFromEnum(linux.E.PERM))));
-    try testing.expectError(error.PermissionDenied, asUnion(-@as(i32, @intFromEnum(linux.E.ACCES))));
-    try testing.expectError(error.NoSuchInterface, asUnion(-@as(i32, @intFromEnum(linux.E.NODEV))));
-    try testing.expectError(error.NoSuchInterface, asUnion(-@as(i32, @intFromEnum(linux.E.NXIO))));
-    try testing.expectError(error.AlreadyAttached, asUnion(-@as(i32, @intFromEnum(linux.E.BUSY))));
-    try testing.expectError(error.AlreadyAttached, asUnion(-@as(i32, @intFromEnum(linux.E.EXIST))));
-    try testing.expectError(error.ModeNotSupported, asUnion(-@as(i32, @intFromEnum(linux.E.OPNOTSUPP))));
-    try testing.expectError(error.InvalidFlags, asUnion(-@as(i32, @intFromEnum(linux.E.INVAL))));
+    try testing.expectError(error.PermissionDenied, asUnion(-@as(i32, @backingInt(linux.E.PERM))));
+    try testing.expectError(error.PermissionDenied, asUnion(-@as(i32, @backingInt(linux.E.ACCES))));
+    try testing.expectError(error.NoSuchInterface, asUnion(-@as(i32, @backingInt(linux.E.NODEV))));
+    try testing.expectError(error.NoSuchInterface, asUnion(-@as(i32, @backingInt(linux.E.NXIO))));
+    try testing.expectError(error.AlreadyAttached, asUnion(-@as(i32, @backingInt(linux.E.BUSY))));
+    try testing.expectError(error.AlreadyAttached, asUnion(-@as(i32, @backingInt(linux.E.EXIST))));
+    try testing.expectError(error.ModeNotSupported, asUnion(-@as(i32, @backingInt(linux.E.OPNOTSUPP))));
+    try testing.expectError(error.InvalidFlags, asUnion(-@as(i32, @backingInt(linux.E.INVAL))));
     // Previously untested arm: NOMEM/NOBUFS both map to OutOfMemory.
-    try testing.expectError(error.OutOfMemory, asUnion(-@as(i32, @intFromEnum(linux.E.NOMEM))));
-    try testing.expectError(error.OutOfMemory, asUnion(-@as(i32, @intFromEnum(linux.E.NOBUFS))));
+    try testing.expectError(error.OutOfMemory, asUnion(-@as(i32, @backingInt(linux.E.NOMEM))));
+    try testing.expectError(error.OutOfMemory, asUnion(-@as(i32, @backingInt(linux.E.NOBUFS))));
     // A non-negative code is not an errno at all.
     try testing.expectError(error.Unexpected, asUnion(0));
     try testing.expectError(error.Unexpected, asUnion(5));
@@ -1860,7 +1860,7 @@ test "BPF_PROG_ATTACH attr union layout and BPF_F_ALLOW_* encoding" {
     try testing.expectEqual(@as(linux.fd_t, 4), plain.prog_attach.target_fd);
     try testing.expectEqual(@as(linux.fd_t, 5), plain.prog_attach.attach_bpf_fd);
     try testing.expectEqual(
-        @as(u32, @intFromEnum(BPF.AttachType.cgroup_inet_egress)),
+        @as(u32, @backingInt(BPF.AttachType.cgroup_inet_egress)),
         plain.prog_attach.attach_type,
     );
     try testing.expectEqual(@as(u32, 0), plain.prog_attach.attach_flags);
@@ -1989,7 +1989,7 @@ test "perf_event_attr layout: the uprobe attr names a PATH and a FILE OFFSET" {
     const path: [:0]const u8 = "/usr/lib/x86_64-linux-gnu/libc.so.6";
 
     const entry = buildUprobeAttr(9, 0, false, path.ptr, 0xb5110, 0, 32);
-    try testing.expectEqual(@as(u32, 9), @intFromEnum(entry.type));
+    try testing.expectEqual(@as(u32, 9), @backingInt(entry.type));
     try testing.expectEqual(@as(u32, @sizeOf(linux.perf_event_attr)), entry.size);
     try testing.expectEqual(@as(u64, 0), entry.config);
     try testing.expectEqual(@intFromPtr(path.ptr), entry.config1);
@@ -2045,7 +2045,7 @@ test "attachUprobe rejects inputs it can never encode" {
 test "perf_event_attr layout: the tracepoint attr uses a STATIC perf type" {
     const attr = buildTracepointAttr(742);
     try testing.expectEqual(linux.PERF.TYPE.TRACEPOINT, attr.type);
-    try testing.expectEqual(@as(u32, 2), @intFromEnum(attr.type)); // PERF_TYPE_TRACEPOINT
+    try testing.expectEqual(@as(u32, 2), @backingInt(attr.type)); // PERF_TYPE_TRACEPOINT
     try testing.expectEqual(@as(u64, 742), attr.config);
     try testing.expectEqual(@as(u64, 1), attr.sample_period_or_freq);
     try testing.expectEqual(@as(u32, 1), attr.wakeup_events_or_watermark);
@@ -2065,7 +2065,7 @@ test "tracepoint names are validated before they reach a path" {
     try testing.expectError(error.InvalidName, tracepointId("syscalls", ""));
     try testing.expectError(error.InvalidName, tracepointId("syscalls", "sys\x00enter"));
     try testing.expectError(error.InvalidName, tracepointId("sys calls", "x"));
-    try testing.expectError(error.InvalidName, tracepointId("syscalls", "a" ** 129));
+    try testing.expectError(error.InvalidName, tracepointId("syscalls", strRepeat("a", 129)));
 }
 
 test "tracepointId reads a real id, or explains why it cannot" {
@@ -2100,7 +2100,7 @@ test "BPF_RAW_TRACEPOINT_OPEN attr layout and validation" {
     if (builtin.os.tag != .linux) return;
     try testing.expectError(error.InvalidName, attachRawTracepoint(testing.allocator, "", 3));
     try testing.expectError(error.InvalidName, attachRawTracepoint(testing.allocator, "a\x00b", 3));
-    try testing.expectError(error.InvalidName, attachRawTracepoint(testing.allocator, "n" ** 200, 3));
+    try testing.expectError(error.InvalidName, attachRawTracepoint(testing.allocator, strRepeat("n", 200), 3));
 }
 
 test "bindPerfEvent: a cookie cannot survive the legacy fallback" {
@@ -2518,7 +2518,7 @@ const config_shift_seeds = [_][]const u8{
     testkit.fuzz.seed("config:\xff\xfe\xfd"),
     // Longer than any real value, and longer than the 64-octet buffer
     // `configShift` reads sysfs into — so it must still only fall back.
-    testkit.fuzz.seed("config:" ++ "9" ** 40),
+    testkit.fuzz.seed("config:" ++ strRepeat("9", 40)),
 };
 
 const fz = @import("fuzz_test.zig");
@@ -2600,4 +2600,16 @@ fn fuzzParseConfigShift(comptime S: type, src: *S, gpa: std.mem.Allocator) anyer
     const got = parseConfigShift(buf[0..len], default);
     const other = parseConfigShift(buf[0..len], default +% 1);
     if (got != default or other != default +% 1) ConfigShiftMark.mark(.parsed) else ConfigShiftMark.mark(.defaulted);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

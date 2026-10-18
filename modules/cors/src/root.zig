@@ -2125,7 +2125,7 @@ const gate_seeds = [_][]const u8{
     fuzzseed.seed("Content-Type,\tAuthorization ,, "), // OWS, a tab, and the empty items the split has to skip
     fuzzseed.seed("Content-Type, X-Not-Allowed"), // ⭐ one allowed, one not: the refusal must win
     fuzzseed.seed(",,,   ,\t,"), // separators only — every item empty, so nothing is refused
-    fuzzseed.seed("\x00\xff\r\n:\x7f " ++ "A" ** 80), // non-token bytes and a value filling the buffer
+    fuzzseed.seed("\x00\xff\r\n:\x7f " ++ strRepeat("A", 80)), // non-token bytes and a value filling the buffer
 };
 
 test "fuzz: allowOriginValue/methodTokenAllowed/requestedHeadersAllowed never panic" {
@@ -2701,4 +2701,16 @@ test "preflight_passthrough: a failed preflight also reaches the handler, header
 test {
     _ = @import("browser_oracle_test.zig");
     _ = @import("fuzz_test.zig");
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

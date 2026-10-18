@@ -511,8 +511,8 @@ const seed = testkit.fuzz.seed;
 const frame_seeds = [_][]const u8{
     seed("\x04\x00\x00\x00abcd"), // a truthful 4-octet frame
     seed("\x00\x00\x00\x00"), // the zero-length frame: legal, empty payload
-    seed("\x80\x00\x00\x00" ++ "x" ** 128), // exactly `out.len`: the boundary that must pass
-    seed("\x81\x00\x00\x00" ++ "x" ** 129), // ⭐ one past `out.len`: FrameTooLarge
+    seed("\x80\x00\x00\x00" ++ strRepeat("x", 128)), // exactly `out.len`: the boundary that must pass
+    seed("\x81\x00\x00\x00" ++ strRepeat("x", 129)), // ⭐ one past `out.len`: FrameTooLarge
     seed("\xff\xff\xff\xff" ++ "abcd"), // 4 GiB announced, 4 octets present: refused before allocating
     seed("\x00\x00\x10\x00"), // exactly `default_max_frame`, no payload: too large for `out`, allocatable
     seed("\x01\x00\x10\x00"), // one past `default_max_frame`: refused by the cap itself
@@ -699,7 +699,7 @@ test "envelope writeFramed rejects oversize payload" {
     var w: std.Io.Writer = .fixed(&out);
 
     // a data field long enough that the encoded JSON exceeds a tiny cap
-    const msg: TestEnvelope = .{ .blob = .{ .id = 1, .data = "0123456789" ** 4 } };
+    const msg: TestEnvelope = .{ .blob = .{ .id = 1, .data = strRepeat("0123456789", 4) } };
     try t.expectError(error.FrameTooLarge, TestCodec.writeFramed(msg, gpa, &w, .{ .max_frame = 8 }));
 }
 
@@ -817,13 +817,13 @@ test "depth scan counts structure, not text: brackets inside strings are payload
 
     // …and an escaped quote does not end the string early, so the brackets
     // after it are still text. `\"` then 200 '[' then the real closing quote.
-    try t.expect(jsonDepthWithin("{\"a\":\"\\\"" ++ ("[" ** 200) ++ "\"}", 8));
+    try t.expect(jsonDepthWithin("{\"a\":\"\\\"" ++ (strRepeat("[", 200)) ++ "\"}", 8));
     // The same brackets OUTSIDE a string are structure, and are counted.
-    try t.expect(!jsonDepthWithin("{\"a\":" ++ ("[" ** 200), 8));
+    try t.expect(!jsonDepthWithin("{\"a\":" ++ (strRepeat("[", 200)), 8));
     // A closing bracket pops, so a long flat sequence never accumulates.
-    try t.expect(jsonDepthWithin("[]" ** 1000, 2));
+    try t.expect(jsonDepthWithin(strRepeat("[]", 1000), 2));
     // Unbalanced closers saturate at zero instead of wrapping around.
-    try t.expect(jsonDepthWithin("]" ** 100 ++ "[", 1));
+    try t.expect(jsonDepthWithin(strRepeat("]", 100) ++ "[", 1));
 }
 
 // ── tests: prefix formats and the incremental decoder (2026-10-04) ──────────
@@ -853,20 +853,20 @@ test "prefix formats: exact wire bytes, derived by hand" {
 test "varint prefix: protobuf's 300 = ac 02, and the includes_prefix fixpoint" {
     const t = std.testing;
     var b: [400]u8 = undefined;
-    const p300 = [_]u8{'z'} ** 300;
+    const p300 = @as([300]u8, @splat('z'));
     const f = try framed(&b, &p300, .{ .prefix = .{ .width = .varint } });
     // protobuf encoding guide: 300 → 0xAC 0x02.
     try t.expectEqualSlices(u8, &.{ 0xac, 0x02 }, f[0..2]);
     try t.expectEqual(@as(usize, 302), f.len);
     // 127 is the largest one-byte varint, 128 the smallest two-byte one.
-    const p127 = [_]u8{'a'} ** 127;
+    const p127 = @as([127]u8, @splat('a'));
     try t.expectEqualSlices(u8, &.{0x7f}, (try framed(&b, &p127, .{ .prefix = .{ .width = .varint } }))[0..1]);
-    const p128 = [_]u8{'a'} ** 128;
+    const p128 = @as([128]u8, @splat('a'));
     try t.expectEqualSlices(u8, &.{ 0x80, 0x01 }, (try framed(&b, &p128, .{ .prefix = .{ .width = .varint } }))[0..2]);
     // includes_prefix: 126 + 1 = 127 fits one byte; 127 + 1 = 128 does not,
     // so it takes two: 127 + 2 = 129 = 0x81 0x01.
     const ip = Prefix{ .width = .varint, .includes_prefix = true };
-    const p126 = [_]u8{'a'} ** 126;
+    const p126 = @as([126]u8, @splat('a'));
     try t.expectEqualSlices(u8, &.{0x7f}, (try framed(&b, &p126, .{ .prefix = ip }))[0..1]);
     try t.expectEqualSlices(u8, &.{ 0x81, 0x01 }, (try framed(&b, &p127, .{ .prefix = ip }))[0..2]);
 }
@@ -874,7 +874,7 @@ test "varint prefix: protobuf's 300 = ac 02, and the includes_prefix fixpoint" {
 test "every format round-trips through readFrame, readFrameAlloc and the Decoder" {
     const t = std.testing;
     const widths = [_]Width{ .u8, .u16, .u32, .u64, .varint };
-    const payloads = [_][]const u8{ "", "a", "hello world", &([_]u8{0xff} ** 200) };
+    const payloads = [_][]const u8{ "", "a", "hello world", &(@as([200]u8, @splat(0xff))) };
     for (widths) |wd| for ([_]std.builtin.Endian{ .little, .big }) |en| for ([_]bool{ false, true }) |inc| {
         const limits: Limits = .{ .prefix = .{ .width = wd, .endian = en, .includes_prefix = inc } };
         var out: [2048]u8 = undefined;
@@ -905,9 +905,9 @@ test "every format round-trips through readFrame, readFrameAlloc and the Decoder
 test "prefix limits: width capacity, malformed lengths" {
     const t = std.testing;
     var b: [600]u8 = undefined;
-    const p256 = [_]u8{0} ** 256;
+    const p256 = @as([256]u8, @splat(0));
     try t.expectError(error.FrameTooLarge, framed(&b, &p256, .{ .prefix = .{ .width = .u8 } }));
-    const p254 = [_]u8{0} ** 254;
+    const p254 = @as([254]u8, @splat(0));
     // 254 + 1 prefix byte = 255 still fits; 255 + 1 does not.
     _ = try framed(&b, &p254, .{ .prefix = .{ .width = .u8, .includes_prefix = true } });
     try t.expectError(error.FrameTooLarge, framed(&b, p256[0..255], .{ .prefix = .{ .width = .u8, .includes_prefix = true } }));
@@ -917,8 +917,8 @@ test "prefix limits: width capacity, malformed lengths" {
     const bad = [_]Bad{
         .{ "\x80\x00", .{ .width = .varint } }, // overlong zero
         .{ "\xff\x80\x00", .{ .width = .varint } }, // overlong
-        .{ "\xff" ** 10 ++ "\x01", .{ .width = .varint } }, // 11 bytes
-        .{ "\xff" ** 9 ++ "\x02", .{ .width = .varint } }, // past 64 bits
+        .{ strRepeat("\xff", 10) ++ "\x01", .{ .width = .varint } }, // 11 bytes
+        .{ strRepeat("\xff", 9) ++ "\x02", .{ .width = .varint } }, // past 64 bits
         .{ "\x00", .{ .width = .u8, .includes_prefix = true } }, // smaller than its own prefix (1)
         .{ "\x00", .{ .width = .varint, .includes_prefix = true } },
     };
@@ -943,7 +943,7 @@ test "prefix limits: width capacity, malformed lengths" {
     var r1: std.Io.Reader = .fixed("\x01");
     try t.expectEqualStrings("", try readFrame(&r1, &rb, .{ .prefix = .{ .width = .u8, .includes_prefix = true } }));
     // The largest legal varint: 2^64 − 1 in ten bytes — legal encoding, too big a frame.
-    var r9: std.Io.Reader = .fixed("\xff" ** 9 ++ "\x01");
+    var r9: std.Io.Reader = .fixed(strRepeat("\xff", 9) ++ "\x01");
     try t.expectError(error.FrameTooLarge, readFrame(&r9, &rb, .{ .prefix = .{ .width = .varint } }));
     // A u64 prefix announcing more than max_frame.
     var r8: std.Io.Reader = .fixed("\x00\x00\x00\x01\x00\x00\x00\x00");
@@ -974,7 +974,7 @@ test "Decoder: oversize refused at the prefix, not after buffering the body; Not
     // already buffered, refused past it.
     var f: Decoder = .init(.{ .max_frame = 8 });
     defer f.deinit(t.allocator);
-    try f.feed(t.allocator, "\x01\x00\x00\x00x" ** 3); // 15 buffered
+    try f.feed(t.allocator, strRepeat("\x01\x00\x00\x00x", 3)); // 15 buffered
     try f.feed(t.allocator, "\x01\x00\x00\x00x"); // 15 ≤ 18 before this feed: ok → 20
     try t.expectError(error.NotDrained, f.feed(t.allocator, "y"));
     var n: usize = 0;
@@ -1056,8 +1056,8 @@ test "edges the mutation run asked for (framing)" {
     const t = std.testing;
     // A 10th varint byte that still says "more follows" is refused at ten
     // bytes — an 11th is never read (it would be shifted past bit 63).
-    const eleven = "\xff" ** 9 ++ "\x81" ++ "\x01";
-    var r: std.Io.Reader = .fixed(eleven ++ "\x00" ** 4);
+    const eleven = strRepeat("\xff", 9) ++ "\x81" ++ "\x01";
+    var r: std.Io.Reader = .fixed(eleven ++ strRepeat("\x00", 4));
     var rb: [8]u8 = undefined;
     try t.expectError(error.BadLength, readFrame(&r, &rb, .{ .prefix = .{ .width = .varint } }));
     var d: Decoder = .init(.{ .prefix = .{ .width = .varint } });
@@ -1068,7 +1068,19 @@ test "edges the mutation run asked for (framing)" {
     // buffered may still be fed; one byte more may not.
     var e: Decoder = .init(.{ .max_frame = 8 });
     defer e.deinit(t.allocator);
-    try e.feed(t.allocator, "\x00\x00\x00\x00" ** 4 ++ "\x00\x00"); // 18 bytes buffered
+    try e.feed(t.allocator, strRepeat("\x00\x00\x00\x00", 4) ++ "\x00\x00"); // 18 bytes buffered
     try e.feed(t.allocator, "\x00"); // allowed: 18 ≤ 18 before this feed
     try t.expectError(error.NotDrained, e.feed(t.allocator, "\x00")); // 19 > 18
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

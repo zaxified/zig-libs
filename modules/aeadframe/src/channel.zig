@@ -743,7 +743,7 @@ test "positive control: dropping epoch from the nonce WOULD collide across epoch
     // uniqueness test above would go RED if the real code regressed to this.
     const broken = struct {
         fn f(_: u32, seq: u64) [12]u8 {
-            var n = [_]u8{0} ** 12;
+            var n = @as([12]u8, @splat(0));
             std.mem.writeInt(u64, n[4..12], seq, .big);
             return n;
         }
@@ -790,7 +790,7 @@ test "positive control: an always-accept replay filter WOULD admit a replay" {
 /// Key, epoch and caller-aad the corpus is sealed under. The harness and the
 /// guard both open with exactly these, so "accepted" means the seed's own
 /// octets authenticated — not that some other input happened to be legal.
-const fuzz_key = [_]u8{0x5A} ** 32;
+const fuzz_key = @as([32]u8, @splat(0x5A));
 const fuzz_epoch: u32 = 0;
 const fuzz_aad = "aad";
 
@@ -833,7 +833,7 @@ const OpenCorpus = struct {
         self.set(1, rec[0..n1]);
 
         // seq 2, the longest record the harness's buffer can carry.
-        const big = [_]u8{0xA5} ** (128 - record.overhead);
+        const big = @as([128 - record.overhead]u8, @splat(0xA5));
         const n2 = s.seal(&rec, &big, fuzz_aad) catch unreachable;
         self.set(2, rec[0..n2]);
 
@@ -918,7 +918,7 @@ test "wipe destroys the key in both halves and leaves the non-secret state alone
     s.wipe();
     o.wipe();
 
-    const zero = [_]u8{0} ** 32;
+    const zero = @as([32]u8, @splat(0));
     try testing.expectEqualSlices(u8, &zero, &s.key);
     try testing.expectEqualSlices(u8, &zero, &o.key);
     // Not secret — wipe must not touch these.
@@ -934,7 +934,7 @@ test "AAD of exactly max_caller_aad seals and opens; one octet more is refused" 
         const key = testKey(31);
         var s = Ch.Sealer.init(key, 0);
         var o = Ch.Opener.init(key, 0);
-        const aad = [_]u8{0x61} ** (max_caller_aad + 1);
+        const aad = @as([max_caller_aad + 1]u8, @splat(0x61));
         var rec: [record.overhead + 2]u8 = undefined;
         _ = try s.seal(&rec, "ok", aad[0..max_caller_aad]);
         var pt: [2]u8 = undefined;

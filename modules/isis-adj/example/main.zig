@@ -40,7 +40,7 @@ pub fn main() !void {
     // A malformed PDU must fail with a nameable decode error and leave the
     // FSM untouched — a real router sees garbage on the wire routinely
     // (corruption, a mid-negotiation link flap) and must not crash on it.
-    const garbage = [_]u8{0xFF} ** 24;
+    const garbage = @as([24]u8, @splat(0xFF));
     if (a.rxHelloBytes(&garbage, 1)) |_| {
         return error.GarbagePduUnexpectedlyAccepted;
     } else |err| switch (err) {

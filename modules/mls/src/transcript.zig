@@ -187,8 +187,8 @@ fn commitAc(sig: []const u8, tag: []const u8) framing.AuthenticatedContent {
 }
 
 test "ConfirmedTranscriptHashInput: it is AuthenticatedContent minus the confirmation_tag" {
-    const sig = [_]u8{0xaa} ** 64;
-    const tag = [_]u8{0xbb} ** 32;
+    const sig = @as([64]u8, @splat(0xaa));
+    const tag = @as([32]u8, @splat(0xbb));
     const ac = commitAc(&sig, &tag);
 
     const full = try ac.encodeAlloc(testing.allocator);
@@ -206,7 +206,7 @@ test "ConfirmedTranscriptHashInput: it is AuthenticatedContent minus the confirm
 }
 
 test "confirmedTranscriptHash: a non-Commit is refused rather than hashed" {
-    var ac = commitAc(&[_]u8{0xaa} ** 64, &[_]u8{0xbb} ** 32);
+    var ac = commitAc(&@as([64]u8, @splat(0xaa)), &@as([32]u8, @splat(0xbb)));
     ac.content.body = .{ .proposal = .{ .remove = 1 } };
     ac.auth.confirmation_tag = null;
     try testing.expectError(
@@ -216,8 +216,8 @@ test "confirmedTranscriptHash: a non-Commit is refused rather than hashed" {
 }
 
 test "interimTranscriptHash: the confirmation_tag is length-prefixed, not appended raw" {
-    const confirmed = [_]u8{0x01} ** 32;
-    const tag = [_]u8{0x02} ** 32;
+    const confirmed = @as([32]u8, @splat(0x01));
+    const tag = @as([32]u8, @splat(0x02));
     const got = try interimTranscriptHash(TestSuite, &confirmed, &tag);
 
     // The naive "just concatenate" version must NOT match — that is the
@@ -236,8 +236,8 @@ test "interimTranscriptHash: the confirmation_tag is length-prefixed, not append
 }
 
 test "advance: chains, and the epoch-0 seed is the empty string not a zero digest" {
-    const sig = [_]u8{0xaa} ** 64;
-    const tag = [_]u8{0xbb} ** 32;
+    const sig = @as([64]u8, @splat(0xaa));
+    const tag = @as([32]u8, @splat(0xbb));
     const ac = commitAc(&sig, &tag);
 
     const first = try advance(TestSuite, testing.allocator, empty_transcript_hash, ac);
@@ -251,7 +251,7 @@ test "advance: chains, and the epoch-0 seed is the empty string not a zero diges
 }
 
 test "advance: a Commit whose auth has no confirmation_tag cannot advance the interim hash" {
-    var ac = commitAc(&[_]u8{0xaa} ** 64, &[_]u8{0xbb} ** 32);
+    var ac = commitAc(&@as([64]u8, @splat(0xaa)), &@as([32]u8, @splat(0xbb)));
     ac.auth.confirmation_tag = null;
     try testing.expectError(
         error.MissingConfirmationTag,
@@ -263,13 +263,13 @@ test "keyschedule's §8.1 GroupContext consumes exactly what §8.2 produces" {
     // Guards the seam Part 4 documented as blocked: the confirmed hash is a
     // `[TestSuite.Hash.digest_length]u8`, and `GroupContext.confirmed_transcript_hash`
     // is the `opaque<V>` that carries it into the epoch derivation.
-    const ac = commitAc(&[_]u8{0xaa} ** 64, &[_]u8{0xbb} ** 32);
+    const ac = commitAc(&@as([64]u8, @splat(0xaa)), &@as([32]u8, @splat(0xbb)));
     const th = try advance(TestSuite, testing.allocator, empty_transcript_hash, ac);
     const gc: keyschedule.GroupContext = .{
         .cipher_suite = TestSuite.id,
         .group_id = "group",
         .epoch = 4,
-        .tree_hash = &[_]u8{0x11} ** 32,
+        .tree_hash = &@as([32]u8, @splat(0x11)),
         .confirmed_transcript_hash = &th.confirmed,
     };
     const bytes = try gc.encodeAlloc(testing.allocator);

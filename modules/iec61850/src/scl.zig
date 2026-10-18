@@ -126,7 +126,7 @@ pub const Fc = enum {
 
     pub fn parse(s: []const u8) Error!Fc {
         inline for (@typeInfo(Fc).@"enum".fields) |f| {
-            if (std.mem.eql(u8, s, f.name)) return @enumFromInt(f.value);
+            if (std.mem.eql(u8, s, f.name)) return @fromBackingInt(@intCast(f.value));
         }
         return error.UnknownFunctionalConstraint;
     }
@@ -185,7 +185,7 @@ pub const BType = enum {
 
     pub fn parse(s: []const u8) Error!BType {
         inline for (@typeInfo(BType).@"enum".fields) |f| {
-            if (std.mem.eql(u8, s, f.name)) return @enumFromInt(f.value);
+            if (std.mem.eql(u8, s, f.name)) return @fromBackingInt(@intCast(f.value));
         }
         return error.UnknownBasicType;
     }
@@ -2079,7 +2079,7 @@ test "the SCL functional constraints are a superset of the ACSI ones" {
     inline for (@typeInfo(acsi.FunctionalConstraint).@"enum".fields) |f| {
         const fc = try Fc.parse(f.name);
         try testing.expectEqual(
-            @as(?acsi.FunctionalConstraint, @enumFromInt(f.value)),
+            @as(?acsi.FunctionalConstraint, @fromBackingInt(@intCast(f.value))),
             fc.toAcsi(),
         );
     }
@@ -2088,7 +2088,7 @@ test "the SCL functional constraints are a superset of the ACSI ones" {
     try testing.expect(Fc.OR.toAcsi() == null);
     try testing.expect(Fc.BL.toAcsi() == null);
     try testing.expect(Fc.SR.toAcsi() == null);
-    try testing.expectEqual(@as(usize, 20), @typeInfo(Fc).@"enum".fields.len);
+    try testing.expectEqual(@as(usize, 20), @typeInfo(Fc).@"enum".field_names.len);
     try testing.expectError(error.UnknownFunctionalConstraint, Fc.parse("XX"));
     try testing.expectError(error.UnknownFunctionalConstraint, Fc.parse("st"));
 }
@@ -2347,9 +2347,9 @@ const fragment_seeds = [_][]const u8{
     seed("a"), // one character
     seed(""), // the empty id: four empty `id=""` attributes
     seed("GGIO1_stVal_type"), // an ordinary-looking type id
-    seed("." ** 200), // 200 octets, all mapping to the same class of character
-    seed("\x00\x01\x02\x03" ** 50), // 200 octets cycling all four character classes
-    seed("\xff" ** 256), // the whole buffer: 256 octets, the longest a seed can be
+    seed(strRepeat(".", 200)), // 200 octets, all mapping to the same class of character
+    seed(strRepeat("\x00\x01\x02\x03", 50)), // 200 octets cycling all four character classes
+    seed(strRepeat("\xff", 256)), // the whole buffer: 256 octets, the longest a seed can be
 };
 
 test "fuzz: a hostile SCL fragment glued into a valid skeleton never panics" {
@@ -2475,4 +2475,16 @@ test "corpus: every SCL seed reaches the parser, and the accepted counts are pin
     // One seed is the empty id on purpose, and it reads back as the empty slice.
     try testing.expectEqual(fragment_seeds.len - 1, frag_nonempty);
     try testing.expectEqual(@as(usize, 7), rendered_ok);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

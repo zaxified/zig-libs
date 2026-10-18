@@ -132,12 +132,12 @@ test "parseIpZoned: Go netip zone rules" {
     try testing.expect(na.parseIpZoned("1.2.3.4").?.zone.isNone());
     try testing.expect(na.parseIpZoned("fe80::1%") == null);
     try testing.expect(na.parseIpZoned("1.2.3.4%eth0") == null);
-    try testing.expect(na.parseIpZoned("fe80::1%" ++ "z" ** na.max_zone_len) != null);
-    try testing.expect(na.parseIpZoned("fe80::1%" ++ "z" ** (na.max_zone_len + 1)) == null);
+    try testing.expect(na.parseIpZoned("fe80::1%" ++ strRepeat("z", na.max_zone_len)) != null);
+    try testing.expect(na.parseIpZoned("fe80::1%" ++ strRepeat("z", na.max_zone_len + 1)) == null);
 
     var buf: [na.max_zoned_ip_text_len]u8 = undefined;
     try testing.expectEqualStrings("fe80::1%eth0", na.formatIpZoned(z, &buf));
-    const longest = na.parseIpZoned("ffff:ffff:ffff:ffff:ffff:ffff:255.255.255.255%" ++ "z" ** na.max_zone_len).?;
+    const longest = na.parseIpZoned("ffff:ffff:ffff:ffff:ffff:ffff:255.255.255.255%" ++ strRepeat("z", na.max_zone_len)).?;
     try testing.expectEqual(@as(usize, 39 + 1 + na.max_zone_len), na.formatIpZoned(longest, &buf).len);
 }
 
@@ -150,7 +150,7 @@ test "ZonedIp: init drops a v4 zone, compare orders by zone last" {
     try testing.expectEqual(std.math.Order.gt, b.compare(a));
     try testing.expect(!a.eql(b));
     try testing.expect(b.eql(na.parseIpZoned("fe80::1%a").?));
-    try testing.expect(na.ZonedIp.init(ip("fe80::1"), "z" ** (na.max_zone_len + 1)) == null);
+    try testing.expect(na.ZonedIp.init(ip("fe80::1"), strRepeat("z", na.max_zone_len + 1)) == null);
     try testing.expect(na.Zone.fromSlice("eth0").?.eql(na.parseIpZoned("::1%eth0").?.zone));
     try testing.expectEqual(std.math.Order.lt, na.Zone.none.order(na.Zone.fromSlice("0").?));
 }
@@ -541,4 +541,16 @@ test "IpSet algebra against a brute-force model over a 6-bit space" {
         }
         try testing.expectEqual(@as(u128, @popCount(model)), total);
     }
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

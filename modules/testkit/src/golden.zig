@@ -189,7 +189,7 @@ test "hexVerdict refuses a malformed or oversized golden instead of comparing so
     try testing.expectError(error.InvalidLength, hexVerdict("abc", &.{ 0xab, 0xc0 }));
 
     // Oversized: one byte of golden past the scratch buffer.
-    const too_long = "ab" ** (scratch_len + 1);
+    const too_long = strRepeat("ab", scratch_len + 1);
     try testing.expectError(error.GoldenTooLarge, hexVerdict(too_long, &.{}));
 
     // And the honest cases still work.
@@ -278,4 +278,16 @@ test "hex-decoding the golden is checked before comparing" {
     var buf: [8]u8 = undefined;
     try testing.expectError(error.InvalidLength, hex.into(&buf, "abc"));
     try testing.expectError(error.InvalidCharacter, hex.into(&buf, "zzzz"));
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

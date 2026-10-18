@@ -70,7 +70,7 @@ pub fn main() !void {
     // rather than hand back a partially-recovered key.
     var corrupt = wrapped;
     corrupt[20] ^= 0x01;
-    var out_on_failure: [40]u8 = [_]u8{0xAA} ** 40; // pre-poisoned, to prove it gets wiped
+    var out_on_failure: [40]u8 = @as([40]u8, @splat(0xAA)); // pre-poisoned, to prove it gets wiped
     if (aeskw.unwrap(&kek, &corrupt, &out_on_failure)) |_| {
         unreachable; // a single flipped byte cannot survive the integrity check
     } else |err| switch (err) {

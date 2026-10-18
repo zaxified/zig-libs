@@ -107,7 +107,7 @@ pub fn DynModint(comptime max_bits: comptime_int) type {
         pub const slots: []const usize = slotSizes(top_slot);
         /// A normal-domain element, see the file doc.
         pub const Elem = [max_limbs]u64;
-        pub const zero: Elem = [_]u64{0} ** max_limbs;
+        pub const zero: Elem = @as([max_limbs]u64, @splat(0));
 
         /// The active slot (limb count the arithmetic runs at).
         L: usize,
@@ -406,7 +406,7 @@ pub fn DynModint(comptime max_bits: comptime_int) type {
                 if (s == self.L) {
                     const v = self.view(s);
                     const digit_bits = 64 * s;
-                    var acc = [_]u64{0} ** s;
+                    var acc = @as([s]u64, @splat(0));
                     var k: usize = (total_bits + digit_bits - 1) / digit_bits;
                     while (k > 0) {
                         k -= 1;
@@ -603,7 +603,7 @@ pub fn DynModint(comptime max_bits: comptime_int) type {
                 if (s == self.L) {
                     const m = self.m[0..s];
                     const inv = nt.invPow2(s, m);
-                    var xl = [_]u64{0} ** s;
+                    var xl = @as([s]u64, @splat(0));
                     for (0..s) |i| xl[i] = if (i < x.len) x[i] else 0;
                     var qq: [s]u64 = undefined;
                     mulLow(s, &qq, &xl, &inv);
@@ -801,14 +801,14 @@ pub fn DynModint(comptime max_bits: comptime_int) type {
         fn inverseSlot(self: *const Self, comptime s: usize, a: *const Elem, out: *Elem) bool {
             const v = self.view(s);
             const W = s + 1; // f, g: two's complement, one sign limb on top
-            var f = [_]u64{0} ** W;
+            var f = @as([W]u64, @splat(0));
             f[0..s].* = self.m[0..s].*;
-            var g = [_]u64{0} ** W;
+            var g = @as([W]u64, @splat(0));
             g[0..s].* = a[0..s].*;
-            var d = [_]u64{0} ** s;
-            var e = [_]u64{0} ** s;
+            var d = @as([s]u64, @splat(0));
+            var e = @as([s]u64, @splat(0));
             e[0] = 1;
-            const zero_s = [_]u64{0} ** s;
+            const zero_s = @as([s]u64, @splat(0));
             defer std.crypto.secureZero(u64, &f);
             defer std.crypto.secureZero(u64, &g);
             defer std.crypto.secureZero(u64, &d);
@@ -1170,7 +1170,7 @@ fn diffAgainstBigInt(comptime max_bits: comptime_int, sizes: []const usize, seed
             try expectElemEqBig(gpa, &want, &mod.reduceLimbs(&wide));
             var wb: [8 * D.max_limbs + 5]u8 = undefined;
             rnd.bytes(&wb);
-            var wl: [D.max_limbs + 1]u64 = .{0} ** (D.max_limbs + 1);
+            var wl: [D.max_limbs + 1]u64 = @splat(0);
             for (wb, 0..) |byte, i| {
                 const pos = wb.len - 1 - i;
                 wl[pos / 8] |= @as(u64, byte) << @intCast(8 * (pos % 8));
@@ -1191,7 +1191,7 @@ fn diffAgainstBigInt(comptime max_bits: comptime_int, sizes: []const usize, seed
 
             // divExact: x = q·m divides; x + 1 does not.
             const qv = randBelow(D, rnd, &mod);
-            var x: [2 * D.max_limbs]u64 = .{0} ** (2 * D.max_limbs);
+            var x: [2 * D.max_limbs]u64 = @splat(0);
             limbs.mulSchoolbook(&x, &qv, &mv);
             var q: D.Elem = undefined;
             try testing.expect(mod.divExact(&x, &q));
@@ -1355,7 +1355,7 @@ test "DynModint inverse (batched safegcd) == inverseDivsteps: verdict and value,
     // slots L = 4, 4 (2..256 bits), 5→8, 16, 32, 64
     const sizes = [_]usize{ 2, 3, 64, 65, 200, 256, 1000, 2048, 4000, 4096 };
     var pairs: usize = 0;
-    var seen_l = [_]bool{false} ** 17;
+    var seen_l = @as([17]bool, @splat(false));
     for (sizes) |nbits| {
         for (0..60) |t| {
             var mv = randModulus(D, rnd, nbits);
@@ -1511,7 +1511,7 @@ test "DynModint isProbablePrime: every odd m < 3000, Carmichael numbers, a 2048-
     pm2[0] -= 2;
     try testing.expect(!(try D.fromLimbsBits(&pm2, 2048)).isProbablePrime(rnd, 24));
     const D2 = DynModint(2048 + 64);
-    var prod: [2 * D2.max_limbs]u64 = .{0} ** (2 * D2.max_limbs);
+    var prod: [2 * D2.max_limbs]u64 = @splat(0);
     var pw = D2.zero;
     @memcpy(pw[0..D.max_limbs], &pv);
     var small = D2.zero;
@@ -1559,7 +1559,7 @@ test "DynModint Miller-Rabin witnesses cover [2, m − 2], upper half included (
         const mod = try D.fromLimbsBits(&mv, 64 - @clz(m));
         var mm1 = mv;
         mm1[0] -= 1;
-        var seen = [_]bool{false} ** 128;
+        var seen = @as([128]bool, @splat(false));
         for (0..4000) |_| {
             const a = mod.witness(rnd, &buf, &mm1);
             for (a[1..]) |w| try testing.expectEqual(@as(u64, 0), w);
@@ -1623,10 +1623,10 @@ test "DynModint toBytesBE: the modulus's width or wider, zero-padded (review L5)
     try testing.expectEqual(@as(usize, 16), p.byteLen());
     var exact: [16]u8 = undefined;
     p.toBytesBE(&p.m, &exact);
-    try testing.expectEqualSlices(u8, &([_]u8{0x7f} ++ [_]u8{0xff} ** 15), &exact);
+    try testing.expectEqualSlices(u8, &([_]u8{0x7f} ++ @as([15]u8, @splat(0xff))), &exact);
     var wide: [20]u8 = undefined;
     p.toBytesBE(&p.m, &wide);
-    try testing.expectEqualSlices(u8, &([_]u8{0} ** 4 ++ [_]u8{0x7f} ++ [_]u8{0xff} ** 15), &wide);
+    try testing.expectEqualSlices(u8, &(@as([4]u8, @splat(0)) ++ [_]u8{0x7f} ++ @as([15]u8, @splat(0xff))), &wide);
     // A shorter buffer is refused by a panic in every optimize mode (no
     // in-process test can catch one; the ReleaseFast probe in the 2026-10-06
     // CHANGELOG entry shows the old code truncating silently instead).
@@ -1728,9 +1728,9 @@ test "DynModint rejects even, small and oversized moduli" {
     v[1] = 1;
     v[0] = 2;
     try testing.expectError(error.EvenModulus, D.fromLimbs(&v));
-    try testing.expectError(error.Overflow, D.fromBytesBE(&([_]u8{1} ++ [_]u8{0} ** 31 ++ [_]u8{1})));
+    try testing.expectError(error.Overflow, D.fromBytesBE(&([_]u8{1} ++ @as([31]u8, @splat(0)) ++ [_]u8{1})));
     // leading zero bytes past the capacity are fine
-    const ok = try D.fromBytesBE(&([_]u8{0} ** 40 ++ [_]u8{ 1, 0, 0, 0, 0, 0, 0, 0, 3 }));
+    const ok = try D.fromBytesBE(&(@as([40]u8, @splat(0)) ++ [_]u8{ 1, 0, 0, 0, 0, 0, 0, 0, 3 }));
     try testing.expectEqual(@as(usize, 65), ok.bits());
 }
 
@@ -1754,11 +1754,11 @@ test "DynModint edges: zero and m−1, pow by zero, divExact of zero" {
     try testing.expect(mod.divExact(&.{}, &q) and D.isZero(&q));
     try testing.expect(mod.divExact(&mv, &q) and D.eql(&q, &one));
     // a quotient of 2^(64·L) does not fit: refused, not truncated
-    var big: [2 * D.max_limbs + 1]u64 = .{0} ** (2 * D.max_limbs + 1);
+    var big: [2 * D.max_limbs + 1]u64 = @splat(0);
     @memcpy(big[mod.L .. mod.L + D.max_limbs], &mv);
     try testing.expect(!mod.divExact(&big, &q));
     // an exact low half with a non-zero limb above 2·L is still inexact
-    var hi: [2 * D.max_limbs + 1]u64 = .{0} ** (2 * D.max_limbs + 1);
+    var hi: [2 * D.max_limbs + 1]u64 = @splat(0);
     limbs.mulSchoolbook(hi[0 .. 2 * D.max_limbs], &mv, &one);
     try testing.expect(mod.divExact(&hi, &q) and D.eql(&q, &one));
     hi[2 * mod.L] = 1;
@@ -1777,7 +1777,7 @@ test "DynModint predicates: isOdd/isOne/one/compare/isZero/eql against big.int, 
         // limb 0 set, and pairs differing in exactly the top / the lowest limb
         pool[0] = D.zero;
         pool[1] = D.one();
-        pool[2] = [_]u64{~@as(u64, 0)} ** n;
+        pool[2] = @as([n]u64, @splat(~@as(u64, 0)));
         pool[3] = D.zero;
         pool[3][n - 1] = 1;
         pool[4] = D.zero;

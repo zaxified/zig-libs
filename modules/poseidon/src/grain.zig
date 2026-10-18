@@ -322,7 +322,7 @@ test "Lfsr seeding packs the parameter description MSB-first" {
     // warm-up clocks: field=1, sbox=0, n=254, t=3, R_F=8, R_P=57, then 1^30.
     const expect =
         "01" ++ "0000" ++ "000011111110" ++ "000000000011" ++
-        "0000001000" ++ "0000111001" ++ ("1" ** 30);
+        "0000001000" ++ "0000111001" ++ (strRepeat("1", 30));
     var packed_bits: u128 = 0;
     for (expect) |ch| packed_bits = (packed_bits << 1) | @as(u128, ch - '0');
 
@@ -353,4 +353,16 @@ test "the output filter is not a plain LFSR tap" {
     for (0..64) |_| raw = (raw << 1) | b.clock();
 
     try std.testing.expect(filtered != raw);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

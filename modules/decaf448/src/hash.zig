@@ -101,7 +101,7 @@ const testing = std.testing;
 test "DST bounds: empty and 256-byte DSTs are refused, 1- and 255-byte accepted" {
     var out: [32]u8 = undefined;
     try testing.expectError(error.DstEmpty, expandMessageXof(&out, "abc", ""));
-    const long = [_]u8{'D'} ** 256;
+    const long = @as([256]u8, @splat('D'));
     try testing.expectError(error.DstTooLong, expandMessageXof(&out, "abc", &long));
     try testing.expectError(error.DstTooLong, hashToElement("abc", &long));
     try testing.expectError(error.DstEmpty, hashToScalar("abc", ""));
@@ -143,7 +143,7 @@ test "fuzz: hashToElement/hashToScalar never crash; errors only on DST bounds" {
 }
 
 fn fuzzHash(_: void, smith: *std.testing.Smith) !void {
-    var buf = [_]u8{0} ** 512; // a short input fills only a prefix
+    var buf = @as([512]u8, @splat(0)); // a short input fills only a prefix
     smith.bytes(&buf);
     // The first two bytes split the rest into DST and message: 0..256 bytes
     // of DST, so the empty, accepted and too-long cases all occur.

@@ -297,7 +297,7 @@ fn probeParty(label: []const u8, comptime call: fn () void) usize {
 }
 
 test "STACKPROBE: no secret on the dead stack after any GJKR participant call" {
-    if (builtin.mode == .Debug or builtin.mode == .ReleaseSafe) return error.SkipZigTest;
+    if (builtin.mode == .debug or builtin.mode == .safe) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     recorder = .{ .csprng = .init(@splat(0x3d)) };
     defer {
@@ -526,7 +526,7 @@ fn deliverReshare(allocator: std.mem.Allocator, total: *usize, from_dealers: boo
 }
 
 test "STACKPROBE: no secret on the dead stack after any reshare dealer or receiver call" {
-    if (builtin.mode == .Debug or builtin.mode == .ReleaseSafe) return error.SkipZigTest;
+    if (builtin.mode == .debug or builtin.mode == .safe) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     recorder = .{ .csprng = .init(@splat(0x4a)) };
     defer {
@@ -695,7 +695,7 @@ fn runProbed(comptime P: type, allocator: std.mem.Allocator, group: []P, name: [
 }
 
 test "STACKPROBE: no secret on the dead stack after any ECDSA keygen or refresh call" {
-    if (builtin.mode == .Debug or builtin.mode == .ReleaseSafe) return error.SkipZigTest;
+    if (builtin.mode == .debug or builtin.mode == .safe) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     {
         var prng = std.Random.DefaultPrng.init(0x6563_6b67);
@@ -817,7 +817,7 @@ const Free = struct {
 };
 
 test "STACKPROBE: no secret on the dead stack after the commitment, share-check and driver functions" {
-    if (builtin.mode == .Debug or builtin.mode == .ReleaseSafe) return error.SkipZigTest;
+    if (builtin.mode == .debug or builtin.mode == .safe) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     recorder = .{ .csprng = .init(@splat(0x6c)) };
     defer {

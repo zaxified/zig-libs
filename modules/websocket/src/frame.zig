@@ -392,7 +392,7 @@ pub fn writeFrame(w: *std.Io.Writer, opts: WriteOptions) WriteError!void {
 
     if (opts.compressed and opts.opcode != .text and opts.opcode != .binary) return error.CompressedNonDataFrame;
 
-    var b0: u8 = @intFromEnum(opts.opcode);
+    var b0: u8 = @backingInt(opts.opcode);
     if (opts.fin) b0 |= 0x80;
     if (opts.compressed) b0 |= 0x40;
     try w.writeByte(b0);
@@ -773,7 +773,7 @@ test "applyMask: vectorized/word/tail paths agree with a byte-at-a-time referenc
 
 test "write: a control frame RFC 6455 §5.5 forbids is refused before any byte is written (A1 F6)" {
     var buf: [512]u8 = undefined;
-    var big = [_]u8{0xAA} ** 200;
+    var big = @as([200]u8, @splat(0xAA));
 
     // The audit's 200-byte ping (went out as `89 7e 00 c8` in ReleaseFast).
     var out: std.Io.Writer = .fixed(&buf);
@@ -894,9 +894,9 @@ const fuzz_driver = @import("testkit").fuzz.driver;
 const frame_seeds = [_][]const u8{
     seed("818537FA213D7F9F4D5158"), // RFC §5.7 masked text "Hello"
     seed("818537FA213D7F9F4D5158" ++ "818537FA213D7F9F4D5158"), // two frames: the loop's second pass
-    seed("89FD01020304" ++ ("797A7B7C" ** 31) ++ "79"), // masked ping, the 125-octet control ceiling
+    seed("89FD01020304" ++ (strRepeat("797A7B7C", 31)) ++ "79"), // masked ping, the 125-octet control ceiling
     seed("888500000000" ++ "03E8627965"), // masked close, code 1000 + "bye"
-    seed("82FE00C800000000" ++ ("AA" ** 200)), // masked binary, 200 octets via the 16-bit form
+    seed("82FE00C800000000" ++ (strRepeat("AA", 200))), // masked binary, 200 octets via the 16-bit form
     seed("818537FA213D7F9F4D5158" ++ "8185"), // one whole frame, then a truncated header
     seed("81"), // need_more: one octet
     seed("81850102"), // need_more: two of the four mask octets
@@ -909,7 +909,7 @@ const frame_seeds = [_][]const u8{
     seed("82FF000000000000000500000000"), // InvalidPayloadLength: non-minimal 64-bit form
     seed("82FF800000000000000000000000"), // InvalidPayloadLength: the §5.2 MSB set
     seed("82FF000000000002000000000000"), // FrameTooLarge: 131072 against the harness's 65536
-    seed("00" ** 256), // a full buffer of zeroes: continuation, unmasked
+    seed(strRepeat("00", 256)), // a full buffer of zeroes: continuation, unmasked
 };
 
 test "fuzz: parseFrame never panics on arbitrary bytes, server role" {
@@ -1004,7 +1004,7 @@ const close_seeds = [_][]const u8{
     seed("03F6"), // 1014 — the one two of three foreign peers accept
     seed("0BB8"), // 3000, the library range
     seed("1387"), // 4999, the private-use ceiling
-    seed("03E8" ++ ("61" ** 123)), // 125 octets: the control-frame payload ceiling
+    seed("03E8" ++ (strRepeat("61", 123))), // 125 octets: the control-frame payload ceiling
     seed("03E8" ++ "C3A9E282AC"), // a multi-byte UTF-8 reason
     seed(""), // the empty body: LEGAL, and the reason `accepted` is not a guard
     seed("03"), // InvalidPayloadLength: one octet
@@ -1128,8 +1128,20 @@ test "encodeCloseBody: a reason needs a code, and code + reason fit in 125 bytes
     // at most 125 bytes, so the reason is at most 123.
     var out: [200]u8 = undefined;
     try testing.expectError(error.ReasonTooLong, encodeCloseBody(&out, null, "x"));
-    const ok_reason = [_]u8{'r'} ** 123;
+    const ok_reason = @as([123]u8, @splat('r'));
     try testing.expectEqual(@as(usize, 125), (try encodeCloseBody(&out, 1000, &ok_reason)).len);
-    const long_reason = [_]u8{'r'} ** 124;
+    const long_reason = @as([124]u8, @splat('r'));
     try testing.expectError(error.ReasonTooLong, encodeCloseBody(&out, 1000, &long_reason));
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

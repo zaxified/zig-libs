@@ -341,7 +341,7 @@ pub fn Tfhe(comptime P: params.Params) type {
                 }
                 var out: Glwe = undefined;
                 for (0..k + 1) |c| {
-                    var acc = [_]u64{0} ** N;
+                    var acc = @as([N]u64, @splat(0));
                     for (0..rows) |r| {
                         const g = self.poly(i, r, c);
                         for (&acc, dt[r], g) |*a, x, y| a.* = ntt.addMod(a.*, ntt.mulMod(x, y));
@@ -619,7 +619,7 @@ pub fn Tfhe(comptime P: params.Params) type {
 
         /// Trivial (noiseless, key-independent) LWE of `μ`: `(0, μ)`.
         pub fn lweTrivial(comptime dim: usize, mu: T) Lwe(dim) {
-            return .{ .a = [_]T{0} ** dim, .b = mu };
+            return .{ .a = @as([dim]T, @splat(0)), .b = mu };
         }
         pub fn lweAdd(comptime dim: usize, x: *const Lwe(dim), y: *const Lwe(dim)) Lwe(dim) {
             var out: Lwe(dim) = undefined;
@@ -720,7 +720,7 @@ pub fn Tfhe(comptime P: params.Params) type {
         /// Trivial (noiseless, key-independent) GLWE of `μ`: `(0, μ)`. Used to
         /// initialise the blind-rotation accumulator.
         pub fn glweTrivial(msg: *const Poly) Glwe {
-            return .{ .mask = [_]Poly{Poly.zero()} ** k, .body = msg.* };
+            return .{ .mask = @as([k]Poly, @splat(Poly.zero())), .body = msg.* };
         }
 
         pub fn glweAdd(x: *const Glwe, y: *const Glwe) Glwe {
@@ -867,7 +867,7 @@ pub fn Tfhe(comptime P: params.Params) type {
         /// Byte-identical to tfhe-rs's `keyswitch_lwe_ciphertext` on the same
         /// key and input (`gadget.decompose` makes its digit choices).
         pub fn keySwitch(ksk: *const KeySwitchKey, ct: *const LweBig) LweN {
-            var out: LweN = .{ .a = [_]T{0} ** n, .b = ct.b };
+            var out: LweN = .{ .a = @as([n]T, @splat(0)), .b = ct.b };
             for (0..big_dim) |j| {
                 const digits = gadget.decompose(bks_bits, ell_ks, ct.a[j]);
                 for (0..ell_ks) |lvl| {

@@ -127,12 +127,12 @@ test "blindWithFactor reproduces RFC 9474 Appendix A.4 blinded_msg + inv byte-ex
 test "blindSign reproduces RFC 9474 Appendix A.1 blind_sig byte-exact (SS7.2 internal blinding is output-invariant)" {
     const sk = try kat.secretKey();
     const pk = try kat.publicKey();
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x11} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x11)));
     var out: [blindrsa.max_modulus_len]u8 = undefined;
     const got = try blindrsa.blindSign(&sk, pk, csprng.random(), &kat.a1.blinded_msg, &out);
     try testing.expectEqualSlices(u8, &kat.a1.blind_sig, got);
     // Different internal blinding randomness, identical output.
-    var csprng2 = std.Random.DefaultCsprng.init([_]u8{0x55} ** 32);
+    var csprng2 = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x55)));
     var out2: [blindrsa.max_modulus_len]u8 = undefined;
     const got2 = try blindrsa.blindSign(&sk, pk, csprng2.random(), &kat.a1.blinded_msg, &out2);
     try testing.expectEqualSlices(u8, &kat.a1.blind_sig, got2);
@@ -141,7 +141,7 @@ test "blindSign reproduces RFC 9474 Appendix A.1 blind_sig byte-exact (SS7.2 int
 test "blindSign reproduces RFC 9474 Appendix A.4 blind_sig byte-exact" {
     const sk = try kat.secretKey();
     const pk = try kat.publicKey();
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x12} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x12)));
     var out: [blindrsa.max_modulus_len]u8 = undefined;
     const got = try blindrsa.blindSign(&sk, pk, csprng.random(), &kat.a4.blinded_msg, &out);
     try testing.expectEqualSlices(u8, &kat.a4.blind_sig, got);
@@ -172,7 +172,7 @@ test "B14: RFC 9474 Appendix A.2 (PSSZERO-Randomized) reproduces every published
     try testing.expectEqualSlices(u8, &kat.a2.blinded_msg, blinded);
     try testing.expectEqualSlices(u8, &kat.a2.inv, ctx.r_inv[0..kat.a2.inv.len]);
 
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x23} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x23)));
     var blind_sig_buf: [blindrsa.max_modulus_len]u8 = undefined;
     const blind_sig = try blindrsa.blindSign(&sk, pk, csprng.random(), blinded, &blind_sig_buf);
     try testing.expectEqualSlices(u8, &kat.a2.blind_sig, blind_sig);
@@ -197,7 +197,7 @@ test "B14: RFC 9474 Appendix A.3 (PSS-Deterministic) reproduces every published 
     try testing.expectEqualSlices(u8, &kat.a3.blinded_msg, blinded);
     try testing.expectEqualSlices(u8, &kat.a3.inv, ctx.r_inv[0..kat.a3.inv.len]);
 
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x24} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x24)));
     var blind_sig_buf: [blindrsa.max_modulus_len]u8 = undefined;
     const blind_sig = try blindrsa.blindSign(&sk, pk, csprng.random(), blinded, &blind_sig_buf);
     try testing.expectEqualSlices(u8, &kat.a3.blind_sig, blind_sig);
@@ -223,7 +223,7 @@ test "B1: blindSign surfaces a CRT fault (Bellcore/BDL) as SigningFailure instea
     const pk = try kat.publicKey();
     sk.dp = sk.p.add(sk.dp, sk.p.one()); // persistent single-half fault
 
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x14} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x14)));
     var out: [blindrsa.max_modulus_len]u8 = undefined;
     try testing.expectError(
         error.SigningFailure,
@@ -248,7 +248,7 @@ test "B3: blindSign's own mandatory self-check rejects a pk with the wrong e, in
     // different e: not sk's real public half.
     const wrong_pk = try rsa.PublicKey.fromBytes(&kat.n, &[_]u8{5});
 
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x15} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x15)));
     var out: [blindrsa.max_modulus_len]u8 = undefined;
     try testing.expectError(
         error.SigningFailure,
@@ -268,7 +268,7 @@ test "B3: blindSign's own mandatory self-check rejects a pk with the wrong e, in
 // If the self-check did not independently reject this, blindSign would need
 // to fall back to the assert for safety and B18 would be a live gap.
 test "B18: even with the pk.n == sk.n assert compiled away (ReleaseFast), a pk with a different modulus is still rejected by the self-check (audit finding B18)" {
-    if (@import("builtin").mode != .ReleaseFast) return error.SkipZigTest;
+    if (@import("builtin").mode != .fast) return error.SkipZigTest;
     const sk = try kat.secretKey();
 
     // Same byte length as kat.n, same (odd) parity, one bit flipped deep in
@@ -278,7 +278,7 @@ test "B18: even with the pk.n == sk.n assert compiled away (ReleaseFast), a pk w
     const wrong_pk = try rsa.PublicKey.fromBytes(&wrong_n, &kat.e);
     try testing.expect(!wrong_pk.n.v.eql((try kat.publicKey()).n.v));
 
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x18} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x18)));
     var out: [blindrsa.max_modulus_len]u8 = undefined;
     try testing.expectError(
         error.SigningFailure,
@@ -289,7 +289,7 @@ test "B18: even with the pk.n == sk.n assert compiled away (ReleaseFast), a pk w
 test "blindSign rejects a wrong-length or out-of-range blinded_msg (RFC 9474 SS4 BlindSign range check)" {
     const sk = try kat.secretKey();
     const pk = try kat.publicKey();
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x13} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x13)));
     var out: [blindrsa.max_modulus_len]u8 = undefined;
     // Wrong length (one byte short).
     try testing.expectError(
@@ -301,7 +301,7 @@ test "blindSign rejects a wrong-length or out-of-range blinded_msg (RFC 9474 SS4
         error.InvalidBlindedMessage,
         blindrsa.blindSign(&sk, pk, csprng.random(), &kat.n, &out),
     );
-    const too_big = [_]u8{0xff} ** kat.n.len;
+    const too_big = @as([kat.n.len]u8, @splat(0xff));
     try testing.expectError(
         error.InvalidBlindedMessage,
         blindrsa.blindSign(&sk, pk, csprng.random(), &too_big, &out),
@@ -380,7 +380,7 @@ test "B4: finalize rejects a Context whose modulus_len does not match pk, instea
         .r_inv = rInv(&kat.a1.inv),
         .modulus_len = 1024, // audit's own probe value: double the real length
     };
-    var blind_sig_1024 = [_]u8{0} ** 1024;
+    var blind_sig_1024 = @as([1024]u8, @splat(0));
     @memcpy(blind_sig_1024[0..kat.a1.blind_sig.len], &kat.a1.blind_sig);
     var out: [1024]u8 = undefined;
     try testing.expectError(
@@ -405,7 +405,7 @@ test "B11: finalize rejects a blind_sig LONGER than ctx.modulus_len, not just sh
         .r_inv = rInv(&kat.a1.inv),
         .modulus_len = kat.a1.blind_sig.len,
     };
-    var too_long = [_]u8{0} ** (blindrsa.max_modulus_len + 1);
+    var too_long = @as([blindrsa.max_modulus_len + 1]u8, @splat(0));
     @memcpy(too_long[0..kat.a1.blind_sig.len], &kat.a1.blind_sig);
     var out: [blindrsa.max_modulus_len + 1]u8 = undefined;
     try testing.expectError(
@@ -473,7 +473,7 @@ test "blindWithFactor rejects a bad blinding factor: zero, >= n, and gcd(r, n) !
     var ctx: blindrsa.Context = undefined;
     var blinded_msg: [blindrsa.max_modulus_len]u8 = undefined;
 
-    const zero = [_]u8{0} ** kat.n.len;
+    const zero = @as([kat.n.len]u8, @splat(0));
     try testing.expectError(
         error.InvalidBlindingFactor,
         blindrsa.blindWithFactor(pk, Sha384, &kat.a1.prepared_msg, &kat.a1.salt, &zero, &ctx, &blinded_msg),
@@ -484,7 +484,7 @@ test "blindWithFactor rejects a bad blinding factor: zero, >= n, and gcd(r, n) !
         blindrsa.blindWithFactor(pk, Sha384, &kat.a1.prepared_msg, &kat.a1.salt, &kat.n, &ctx, &blinded_msg),
     );
     // gcd(r, n) != 1: r = p, a prime factor of n — not invertible mod n.
-    var r_is_p = [_]u8{0} ** kat.n.len;
+    var r_is_p = @as([kat.n.len]u8, @splat(0));
     @memcpy(r_is_p[kat.n.len - kat.p.len ..], &kat.p);
     try testing.expectError(
         error.InvalidBlindingFactor,
@@ -504,7 +504,7 @@ test "blindWithFactor rejects a bad blinding factor: zero, >= n, and gcd(r, n) !
 // rather than a literal, so it keeps measuring the mechanism if those move.
 
 test "prepareRandomize: an out buffer one byte short of randomizer_len + msg.len is an error, not an assert" {
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x50} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x50)));
     var out: [blindrsa.randomizer_len + 5 - 1]u8 = undefined;
     try testing.expectError(error.OutputTooSmall, blindrsa.prepareRandomize("hello", csprng.random(), &out));
 
@@ -524,7 +524,7 @@ test "blind/blindWithFactor: a blinded_msg_out one byte short of the modulus len
         blindrsa.blindWithFactor(pk, Sha384, &kat.a1.prepared_msg, &kat.a1.salt, &kat.r, &ctx, too_small),
     );
 
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x51} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x51)));
     try testing.expectError(
         error.OutputTooSmall,
         blindrsa.blind(pk, Sha384, &kat.a1.prepared_msg, Sha384.digest_length, csprng.random(), &ctx, too_small),
@@ -538,7 +538,7 @@ test "blind/blindWithFactor: a blinded_msg_out one byte short of the modulus len
 test "blindSign: an out buffer one byte short of the modulus length is an error, not an assert" {
     const sk = try kat.secretKey();
     const pk = try kat.publicKey();
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x52} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x52)));
     const modulus_len = kat.a1.blind_sig.len;
 
     var too_small_buf: [blindrsa.max_modulus_len]u8 = undefined;
@@ -600,7 +600,7 @@ const FixedHeadRandom = struct {
 
 test "blind: two calls with the same input but different RNG state draw different salts (audit finding B16)" {
     const pk = try kat.publicKey();
-    const shared_seed = [_]u8{0x77} ** 32; // SAME seed both times: r, u, and any redraw are identical across the two calls below.
+    const shared_seed = @as([32]u8, @splat(0x77)); // SAME seed both times: r, u, and any redraw are identical across the two calls below.
 
     // Control: SAME head (salt) + SAME seed => byte-identical blinded_msg.
     // Establishes that this harness's only source of difference between
@@ -650,7 +650,7 @@ test "blind: two calls with the same input but different RNG state draw differen
 // ── random-path round-trips ─────────────────────────────────────────────
 
 test "random-r blind -> blindSign -> finalize -> verify round-trip over the RFC 4096-bit key (both PSS and PSSZERO)" {
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x22} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x22)));
     const random = csprng.random();
     const sk = try kat.secretKey();
     const pk = try kat.publicKey();
@@ -673,7 +673,7 @@ test "random-r blind -> blindSign -> finalize -> verify round-trip over the RFC 
 }
 
 test "full round-trip: fresh rsa.generate() keypair, blind -> blindSign -> finalize -> verify true" {
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x99} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x99)));
     const random = csprng.random();
     // Smallest modulus that actually fits a full SHA-384 PSS encoding
     // (em_len >= hLen + sLen + 2 = 48 + 48 + 2 = 98 bytes => >= 784 bits);
@@ -720,7 +720,7 @@ test "full round-trip: fresh rsa.generate() keypair, blind -> blindSign -> final
 // library behavior. This is the pattern verified here BEFORE it was applied
 // to the example, which this test suite's gate does not build.
 test "B8: separate keys per encoding option round-trip independently (RFC 9474 SS6.2, audit finding B8)" {
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x25} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x25)));
     const random = csprng.random();
     var kp_pss: rsa.KeyPair = undefined;
     try rsa.generate(&kp_pss, random, 1024, 65537);
@@ -967,7 +967,7 @@ test "corpus: every damage script actually damages, and the counts are pinned" {
 /// meaningful bytes first, the rest of `max_modulus_len` zero (the field is
 /// sized by rsa's cap, 8192 bits since 2026-10-14; the RFC 9474 keys are 4096).
 fn rInv(inv: []const u8) [blindrsa.max_modulus_len]u8 {
-    var out = [_]u8{0} ** blindrsa.max_modulus_len;
+    var out = @as([blindrsa.max_modulus_len]u8, @splat(0));
     @memcpy(out[0..inv.len], inv);
     return out;
 }

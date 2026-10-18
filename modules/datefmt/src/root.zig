@@ -2177,10 +2177,10 @@ test "format: max_field_len bounds every field, extreme values included" {
 
 test "format: a bound past the stack buffer takes a heap scratch buffer, same text" {
     const parts = DateParts{ .year = 2024, .month = 3, .day = 7, .hour = 14, .minute = 5, .second = 9 };
-    const lit = "[" ++ "x" ** 150 ++ "]";
+    const lit = "[" ++ strRepeat("x", 150) ++ "]";
     const s = try format(testing.allocator, parts, "YYYY" ++ lit ++ "MM-DD");
     defer testing.allocator.free(s);
-    try testing.expectEqualStrings("2024" ++ "x" ** 150 ++ "03-07", s);
+    try testing.expectEqualStrings("2024" ++ strRepeat("x", 150) ++ "03-07", s);
     // "[q…]DD" bounds to n + 10: just under, at and past the 256-byte stack buffer.
     for ([_]usize{ 245, 246, 247, 260 }) |n| {
         var fmt_buf: [270]u8 = undefined;
@@ -2197,7 +2197,7 @@ test "format: a bound past the stack buffer takes a heap scratch buffer, same te
     try testing.checkAllAllocationFailures(testing.allocator, struct {
         fn f(a: std.mem.Allocator, p: DateParts) !void {
             a.free(try format(a, p, "YYYY-MM-DD"));
-            a.free(try format(a, p, "YYYY" ++ ("[" ++ "y" ** 300 ++ "]")));
+            a.free(try format(a, p, "YYYY" ++ ("[" ++ strRepeat("y", 300) ++ "]")));
         }
     }.f, .{parts});
 }
@@ -2222,7 +2222,7 @@ test "Layout: same result as format/parse with the format string, also compiled 
         try expectLayoutMatches(&rfc, "YYYY-MM-DD[T]hh:mm:ss.SSSZZ", p);
         try expectLayoutMatches(&imf, "EEE, DD MMM YYYY hh:mm:ss [GMT]", p);
     }
-    try testing.expectError(ParseError.TooManyTokens, Layout.compile("YYYY-" ** 40));
+    try testing.expectError(ParseError.TooManyTokens, Layout.compile(strRepeat("YYYY-", 40)));
 }
 
 test "canned: RFC 9110 and RFC 3339 examples" {
@@ -2371,7 +2371,7 @@ test "tokenize: more than MAX_TOKENS tokens is TooManyTokens, not an overrun" {
     // `MAX_TOKENS` (64) sizes the on-stack token array; a longer format is
     // refused (`ParseError.TooManyTokens`). Mutation 2026-10-04: dropping the
     // check survived -- nothing fed a format that long. `M-` is two tokens.
-    const long = "M-" ** 33;
+    const long = strRepeat("M-", 33);
     try testing.expectError(ParseError.TooManyTokens, parse("1-", long));
     try testing.expectError(error.TooManyTokens, format(testing.allocator, .{ .year = 2024, .month = 1, .day = 1 }, long));
 }
@@ -2892,4 +2892,16 @@ test "new tokens are in the vocabulary (firstInvalidFormatChar) and doc table" {
 
 test {
     _ = @import("go_oracle_test.zig");
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

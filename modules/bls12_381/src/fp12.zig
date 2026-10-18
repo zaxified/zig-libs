@@ -310,13 +310,13 @@ test "Fp12.zero / Fp12.one round-trip through bytes" {
     try std.testing.expect(std.mem.allEqual(u8, &z, 0));
 
     const o = Fp12.one.toBytes();
-    var expected = [_]u8{0} ** Fp12.encoded_bytes;
+    var expected = @as([Fp12.encoded_bytes]u8, @splat(0));
     expected[Fp12.encoded_bytes - 1] = 1; // c0's innermost Fp low byte
     try std.testing.expectEqualSlices(u8, &expected, &o);
 }
 
 test "Fp12.fromBytes / toBytes round-trip" {
-    var bytes = [_]u8{0} ** Fp12.encoded_bytes;
+    var bytes = @as([Fp12.encoded_bytes]u8, @splat(0));
     // NOTE: byte 0 is the top byte of the innermost Fp element (c1's
     // Fp6.c2's Fp2.c1), which must stay < p's own top byte (0x1a) to be
     // guaranteed canonical regardless of the remaining 47 bytes — 0x11

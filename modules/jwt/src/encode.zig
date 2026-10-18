@@ -374,17 +374,17 @@ fn roundTrip(key: SigningKey, opts: EncodeOptions) !void {
 }
 
 test "encode: every algorithm round-trips through parseAndVerify, alg from the key" {
-    const secret64 = [_]u8{0x5a} ** 64;
+    const secret64 = @as([64]u8, @splat(0x5a));
     try roundTrip(.{ .hs256 = secret64[0..32] }, .{});
     try roundTrip(.{ .hs384 = secret64[0..48] }, .{ .kid = "k\"1" }); // kid is JSON-escaped
     try roundTrip(.{ .hs512 = &secret64 }, .{ .typ = null });
-    const seed32 = [_]u8{7} ** 32;
+    const seed32 = @as([32]u8, @splat(7));
     const es256 = try root.EcdsaP256Sha256.KeyPair.generateDeterministic(seed32);
     try roundTrip(.{ .es256 = &es256 }, .{ .kid = "ec" });
-    const es384 = try root.EcdsaP384Sha384.KeyPair.generateDeterministic([_]u8{7} ** root.EcdsaP384Sha384.KeyPair.seed_length);
+    const es384 = try root.EcdsaP384Sha384.KeyPair.generateDeterministic(@as([root.EcdsaP384Sha384.KeyPair.seed_length]u8, @splat(7)));
     try roundTrip(.{ .es384 = &es384 }, .{});
     var es512: root.EcdsaP521Sha512.KeyPair = undefined;
-    try root.EcdsaP521Sha512.KeyPair.generateDeterministicInto(&es512, &([_]u8{7} ** root.EcdsaP521Sha512.KeyPair.seed_length));
+    try root.EcdsaP521Sha512.KeyPair.generateDeterministicInto(&es512, &(@as([root.EcdsaP521Sha512.KeyPair.seed_length]u8, @splat(7))));
     try roundTrip(.{ .es512 = &es512 }, .{ .kid = "p521" });
     const ed = try root.Ed25519.KeyPair.generateDeterministic(seed32);
     try roundTrip(.{ .ed25519 = &ed }, .{});
@@ -401,7 +401,7 @@ test "encode: ES384 (p384 module) interoperates with std's EcdsaP384Sha384 both 
     // so the signature bytes differ from std's; what must not change is that
     // either side accepts the other's tokens for the same key.
     const Std = std.crypto.sign.ecdsa.EcdsaP384Sha384;
-    const d = [_]u8{0x11} ** 48;
+    const d = @as([48]u8, @splat(0x11));
     const ours = try root.EcdsaP384Sha384.KeyPair.fromSecretKey(try root.EcdsaP384Sha384.SecretKey.fromBytes(d));
     const theirs = try Std.KeyPair.fromSecretKey(try Std.SecretKey.fromBytes(d));
     try testing.expectEqualSlices(u8, &theirs.public_key.toUncompressedSec1(), &ours.public_key.toUncompressedSec1());
@@ -428,8 +428,8 @@ test "encode: ES384 (p384 module) interoperates with std's EcdsaP384Sha384 both 
 }
 
 test "encode: a token signed with one key does not verify with another" {
-    const a = [_]u8{1} ** 32;
-    const b = [_]u8{2} ** 32;
+    const a = @as([32]u8, @splat(1));
+    const b = @as([32]u8, @splat(2));
     const token = try encode(testing.allocator, TestClaims{}, .{ .hs256 = &a }, .{});
     defer testing.allocator.free(token);
     try testing.expectError(error.BadSignature, root.parseAndVerify(testing.allocator, token, .{ .hmac = &b }, test_opts));
@@ -439,11 +439,11 @@ test "encode: a token signed with one key does not verify with another" {
 }
 
 test "encode: a short HMAC secret and non-object claims are refused" {
-    const short = [_]u8{1} ** 31;
+    const short = @as([31]u8, @splat(1));
     try testing.expectError(error.InvalidKey, encode(testing.allocator, TestClaims{}, .{ .hs256 = &short }, .{}));
-    try testing.expectError(error.InvalidKey, encode(testing.allocator, TestClaims{}, .{ .hs512 = &([_]u8{1} ** 63) }, .{}));
+    try testing.expectError(error.InvalidKey, encode(testing.allocator, TestClaims{}, .{ .hs512 = &(@as([63]u8, @splat(1))) }, .{}));
     try testing.expectError(error.InvalidKey, encode(testing.allocator, TestClaims{}, .{ .hs256 = "" }, .{}));
-    const k = [_]u8{1} ** 32;
+    const k = @as([32]u8, @splat(1));
     for ([_][]const u8{ "[1,2]", "\"x\"", "", "{\"a\":1", "{\"a\":1}{}", "  " }) |bad| {
         try testing.expectError(error.InvalidClaims, encodeJson(testing.allocator, bad, .{ .hs256 = &k }, .{}));
     }
@@ -453,7 +453,7 @@ test "encodeJson: verbatim payload, deterministic output, known HS256 bytes" {
     // RFC 7515 Appendix A.1's header and payload are not byte-reproducible
     // here (its header has a line break); pin our own form instead: same
     // input, same token, and the header is exactly what we wrote.
-    const k = [_]u8{0x42} ** 32;
+    const k = @as([32]u8, @splat(0x42));
     const claims = "{\"sub\":\"x\"}";
     const t1 = try encodeJson(testing.allocator, claims, .{ .hs256 = &k }, .{});
     defer testing.allocator.free(t1);

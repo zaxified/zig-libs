@@ -388,10 +388,10 @@ const SighashCorpus = struct {
     fn build(self: *SighashCorpus) []const []const u8 {
         // `1` repeated: idx = 1, amount = 1, structured hash types, and every
         // `value(bool)` true, so the precomputed-mismatch branches all run.
-        const ones = [_]u64{1} ** 24;
+        const ones = @as([24]u64, @splat(1));
         // idx = 0 with a SIGHASH_SINGLE base (2) and no ANYONECANPAY —
         // the legacy SIGHASH_SINGLE bug path.
-        const single = [_]u64{ 0, 1, 1, 2, 0 } ++ [_]u64{1} ** 19;
+        const single = [_]u64{ 0, 1, 1, 2, 0 } ++ @as([19]u64, @splat(1));
         // ⛔ The two `value(bool)` knobs that choose between a WELL-FORMED and
         // an ARBITRARY hash type were `true` on 4 of 4 decoded seeds when this
         // was measured on 2026-09-08 — every tail in the corpus was built out
@@ -400,14 +400,14 @@ const SighashCorpus = struct {
         // "half the draws". `0` selects the arbitrary arm; the trailing zeroes
         // keep every later knob in range whatever the transaction's `vin.len`
         // turns out to be, so this tail is valid for both KATs.
-        const arbitrary = [_]u64{ 0, 1, 0, 0xdeadbeef } ++ [_]u64{0} ** 20;
+        const arbitrary = [_]u64{ 0, 1, 0, 0xdeadbeef } ++ @as([20]u64, @splat(0));
         // ⛔ 3 = "leave the frame's own version byte alone". The other values
         // are the arbitrary-bytes bias, which would corrupt a real fixture.
         self.push(&tx.fuzz_kat_legacy, 3, null, &p2pkh_script, &ones);
         self.push(&tx.fuzz_kat_legacy, 3, null, &p2pkh_script, &single);
         self.push(&tx.fuzz_kat_segwit, 3, null, &p2pkh_script, &ones);
         self.push(&tx.fuzz_kat_segwit, 3, null, &[_]u8{}, &ones); // empty script
-        const rewritten = [_]u64{2} ++ [_]u64{1} ** 23;
+        const rewritten = [_]u64{2} ++ @as([23]u64, @splat(1));
         self.push(&tx.fuzz_kat_legacy, 0, 2, &p2pkh_script, &rewritten); // vin count rewritten
         // ⛔ Arms 1 and 2 of the same switch had never been selected either:
         // the `which` histogram was 1 / 0 / 0 / 5. Arm 1 writes `0x00`, which
@@ -425,7 +425,7 @@ const SighashCorpus = struct {
 
 /// A standard 25-octet P2PKH `scriptPubKey`, the `scriptCode` a real signer
 /// hands these functions. The old harness's script was always empty.
-const p2pkh_script = [_]u8{ 0x76, 0xa9, 0x14 } ++ [_]u8{0x42} ** 20 ++ [_]u8{ 0x88, 0xac };
+const p2pkh_script = [_]u8{ 0x76, 0xa9, 0x14 } ++ @as([20]u8, @splat(0x42)) ++ [_]u8{ 0x88, 0xac };
 
 test "corpus: sighash seeds reach the decoder, and the counts are pinned" {
     const a = std.testing.allocator;
@@ -448,7 +448,7 @@ test "corpus: sighash seeds reach the decoder, and the counts are pinned" {
     // `smith.value(u8)` arbitrary arms had never run. `which_hist` was
     // 1 / 0 / 0 / 5 for the same reason. Pinned as histograms rather than
     // totals: a total cannot tell "both arms ran" from "one arm ran twice".
-    var which_hist = [_]usize{0} ** 4;
+    var which_hist = @as([4]usize, @splat(0));
     var structured_ht32: usize = 0;
     var anyonecanpay: usize = 0;
     var structured_ht8: usize = 0;

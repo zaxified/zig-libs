@@ -2145,7 +2145,7 @@ pub const AccessEntry = struct {
     res: *const http.Server.ResponseWriter,
 };
 
-const method_count = @typeInfo(http.Method).@"enum".fields.len;
+const method_count = @typeInfo(http.Method).@"enum".field_names.len;
 /// Status-class cache slots: index 1–5 = `1xx`–`5xx`, 0 = `other`.
 const class_count = 6;
 
@@ -2287,7 +2287,7 @@ pub const RequestMetrics = struct {
     }
 
     fn counterFor(m: *RequestMetrics, method: http.Method, status: u16) RegisterError!*Counter {
-        const mi = @intFromEnum(method);
+        const mi = @backingInt(method);
         const ci: usize = if (status >= 100 and status <= 599) status / 100 else 0;
         if (m.options.status == .class) {
             if (m.counters[mi][ci].load(.acquire)) |c| return c;
@@ -2308,7 +2308,7 @@ pub const RequestMetrics = struct {
     }
 
     fn histogramFor(m: *RequestMetrics, method: http.Method) RegisterError!*Histogram {
-        const mi = @intFromEnum(method);
+        const mi = @backingInt(method);
         if (m.histograms[mi].load(.acquire)) |h| return h;
         const h = try m.registry.histogram(m.options.histogram_name, m.options.histogram_help, &.{
             .{ .name = "method", .value = @tagName(method) },
@@ -2320,7 +2320,7 @@ pub const RequestMetrics = struct {
     fn sizeHistogramFor(m: *RequestMetrics, method: http.Method, response: bool) RegisterError!?*Histogram {
         const buckets = (if (response) m.options.response_size_buckets else m.options.request_size_buckets) orelse return null;
         const cache = if (response) &m.response_size_histograms else &m.request_size_histograms;
-        const mi = @intFromEnum(method);
+        const mi = @backingInt(method);
         if (cache[mi].load(.acquire)) |h| return h;
         const h = try m.registry.histogram(
             if (response) m.options.response_size_name else m.options.request_size_name,
@@ -4713,7 +4713,7 @@ test "exemplars: invalid labels are refused and change nothing" {
     try testing.expectError(error.InvalidExemplar, c.incWithExemplar(&.{ .{ .name = "a", .value = "x" }, .{ .name = "a", .value = "y" } }, null));
     try testing.expectError(error.InvalidExemplar, c.incWithExemplar(&.{.{ .name = "a", .value = "\xff" }}, null));
     // 128 runes is the limit: name (1) + value (127) passes, one more fails.
-    const ok_value = "é" ** 127;
+    const ok_value = strRepeat("é", 127);
     try c.incWithExemplar(&.{.{ .name = "a", .value = ok_value }}, null);
     try testing.expectError(error.InvalidExemplar, c.incWithExemplar(&.{.{ .name = "a", .value = ok_value ++ "x" }}, null));
     try testing.expectEqual(@as(u64, 1), c.value());
@@ -5044,4 +5044,16 @@ test {
     _ = summary_mod;
     _ = @import("go_oracle_test.zig");
     _ = @import("go_register_test.zig");
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

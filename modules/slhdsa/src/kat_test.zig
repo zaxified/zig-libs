@@ -324,7 +324,7 @@ test "NIST ACVP sigGen pre-hash: all twelve PH functions are covered" {
     var covered = std.EnumSet(v.PrehashAlg).initEmpty();
     for (v.prehash_sha2_128f_gen) |c| covered.insert(c.ph);
     for (v.prehash_shake_128f_gen) |c| covered.insert(c.ph);
-    try std.testing.expectEqual(@typeInfo(v.PrehashAlg).@"enum".fields.len, covered.count());
+    try std.testing.expectEqual(@typeInfo(v.PrehashAlg).@"enum".field_names.len, covered.count());
 }
 
 fn prehashVer(comptime P: params.Params, comptime cases: []const v.PrehashSigVer) !void {

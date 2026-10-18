@@ -275,7 +275,7 @@ pub const AddressIterator = struct {
         if (self.stopped or self.pos >= self.bytes.len) return null;
         errdefer self.stopped = true;
         var r: Reader = .{ .bytes = self.bytes, .pos = self.pos };
-        const t: AddressType = @enumFromInt(r.byte() catch unreachable);
+        const t: AddressType = @fromBackingInt(@intCast(r.byte() catch unreachable));
         const a: Address = switch (t) {
             .ipv4 => .{ .ipv4 = .{ .addr = try r.takeArray(4), .port = try r.u16be() } },
             .ipv6 => .{ .ipv6 = .{ .addr = try r.takeArray(16), .port = try r.u16be() } },
@@ -330,7 +330,7 @@ pub fn encodeAddresses(allocator: Allocator, addrs: []const Address) (Allocator.
     var dns_seen = false;
     for (addrs) |a| {
         if (a.port() == 0) return error.ZeroPort;
-        const t = @intFromEnum(a.addressType());
+        const t = @backingInt(a.addressType());
         if (t < last) return error.AddressesNotAscending;
         last = t;
         if (a == .dns) {
@@ -343,7 +343,7 @@ pub fn encodeAddresses(allocator: Allocator, addrs: []const Address) (Allocator.
     var w: Writer = .{};
     defer w.deinit(allocator);
     for (addrs) |a| {
-        try w.putU8(allocator, @intFromEnum(a.addressType()));
+        try w.putU8(allocator, @backingInt(a.addressType()));
         switch (a) {
             .ipv4 => |v| try w.putBytes(allocator, &v.addr),
             .ipv6 => |v| try w.putBytes(allocator, &v.addr),
@@ -1268,12 +1268,12 @@ test "channel_announcement: round-trip + digest matches an independent sha256d o
 }
 
 test "hostile: channelAnnouncementDigest on a too-short payload fails closed" {
-    try testing.expectError(error.Truncated, channelAnnouncementDigest(&([_]u8{0} ** 100)));
+    try testing.expectError(error.Truncated, channelAnnouncementDigest(&(@as([100]u8, @splat(0)))));
 }
 
 test "digests: one octet short of the signature block is Truncated, exactly the block hashes nothing" {
     // Mutation run 2026-10-05: the too-short test above is far below the edge.
-    const zeros = [_]u8{0} ** CHANNEL_ANNOUNCEMENT_SIG_BYTES;
+    const zeros = @as([CHANNEL_ANNOUNCEMENT_SIG_BYTES]u8, @splat(0));
     const empty_sha256d = sha256d(&.{});
     try testing.expectError(error.Truncated, channelAnnouncementDigest(zeros[0 .. CHANNEL_ANNOUNCEMENT_SIG_BYTES - 1]));
     try testing.expectEqual(empty_sha256d, try channelAnnouncementDigest(&zeros));
@@ -1551,7 +1551,7 @@ test "hostile: channel_announcement/node_announcement/channel_update truncated f
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(testing.allocator);
     try buf.appendSlice(testing.allocator, &frameTypeBytes(CHANNEL_ANNOUNCEMENT_TYPE));
-    try buf.appendSlice(testing.allocator, &([_]u8{0xaa} ** 200)); // only 200 of 256 signature bytes
+    try buf.appendSlice(testing.allocator, &(@as([200]u8, @splat(0xaa)))); // only 200 of 256 signature bytes
     try testing.expectError(error.Truncated, decodeChannelAnnouncement(buf.items));
 }
 
@@ -1614,7 +1614,7 @@ test "hostile: query_channel_range with an unknown-even extension TLV is rejecte
     defer buf.deinit(allocator);
     try buf.appendSlice(allocator, &frameTypeBytes(QUERY_CHANNEL_RANGE_TYPE));
     try buf.appendSlice(allocator, &fillPattern(32, 1));
-    try buf.appendSlice(allocator, &([_]u8{0} ** 8)); // first_blocknum + number_of_blocks
+    try buf.appendSlice(allocator, &(@as([8]u8, @splat(0)))); // first_blocknum + number_of_blocks
     try message.tlv.appendStream(&buf, allocator, &.{.{ .type = 2, .value = &.{} }}); // even, unknown
     try testing.expectError(error.UnknownEvenType, decodeQueryChannelRange(allocator, buf.items));
 }
@@ -1624,7 +1624,7 @@ test "hostile: reply_channel_range with an encoded_short_ids length prefix excee
     defer buf.deinit(testing.allocator);
     try buf.appendSlice(testing.allocator, &frameTypeBytes(REPLY_CHANNEL_RANGE_TYPE));
     try buf.appendSlice(testing.allocator, &fillPattern(32, 1));
-    try buf.appendSlice(testing.allocator, &([_]u8{0} ** 8)); // first_blocknum, number_of_blocks
+    try buf.appendSlice(testing.allocator, &(@as([8]u8, @splat(0)))); // first_blocknum, number_of_blocks
     try buf.appendSlice(testing.allocator, &.{1}); // sync_complete
     try buf.appendSlice(testing.allocator, &.{ 0xff, 0xff }); // len=65535, nothing follows
     try testing.expectError(error.Truncated, decodeReplyChannelRange(testing.allocator, buf.items));
@@ -1667,7 +1667,7 @@ const QueryCorpus = struct {
 
     fn build(self: *QueryCorpus, allocator: Allocator) ![]const []const u8 {
         // encoding_type 0 (uncompressed) plus three 8-octet short channel ids.
-        const ids = [_]u8{0} ++ ([_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 } ** 3);
+        const ids = [_]u8{0} ++ (arrRepeat(u8, &.{ 1, 2, 3, 4, 5, 6, 7, 8 }, 3));
         const full = try serializeQueryShortChannelIds(allocator, .{
             .chain_hash = fillPattern(32, 1),
             .encoded_short_ids = &ids,
@@ -1697,7 +1697,7 @@ const QueryCorpus = struct {
         // The largest blob this harness's 256-octet buffer can carry: 218
         // octets of ids, so the seed is 256 exactly. ⚠ One more and
         // `Smith.slice` reads the whole seed back as EMPTY.
-        const big_ids = [_]u8{0} ++ ([_]u8{0xAB} ** 217);
+        const big_ids = [_]u8{0} ++ (@as([217]u8, @splat(0xAB)));
         const big = try serializeQueryShortChannelIds(allocator, .{
             .chain_hash = fillPattern(32, 1),
             .encoded_short_ids = &big_ids,
@@ -2016,7 +2016,7 @@ test "hostile: address descriptors truncated mid-field or non-ASCII fail closed"
         &.{ 1, 1, 2, 3, 4, 0x26 },
         &.{ 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x26 },
         &.{ 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x26 },
-        &([_]u8{4} ++ [_]u8{0} ** 36),
+        &([_]u8{4} ++ @as([36]u8, @splat(0))),
         &.{ 5, 4, 'h', 'o', 's', 't', 0x26 },
         &.{ 5, 200, 'h' }, // hostname length past the field
         &.{5}, // no length octet
@@ -2161,4 +2161,12 @@ test "corpus: every gossip-extra seed reaches the decoders, and the counts are p
     // the four message seeds (types 0x0103/0x0109 open with octet 1); the
     // dns seed is one octet short of its port and refused.
     try testing.expectEqual(@as(usize, 10), addresses);
+}
+
+/// Comptime array repetition; replaces the `**` operator removed in Zig 0.17.
+fn arrRepeat(comptime T: type, comptime unit: []const T, comptime n: usize) [unit.len * n]T {
+    @setEvalBranchQuota(n * unit.len * 2 + 1000);
+    var buf: [unit.len * n]T = undefined;
+    for (0..n) |i| @memcpy(buf[i * unit.len ..][0..unit.len], unit);
+    return buf;
 }

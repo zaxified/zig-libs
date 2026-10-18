@@ -71,9 +71,9 @@ fn printHex(label: []const u8, bytes: []const u8) void {
 pub fn main() !void {
     // ── Setup: fixed, throwaway, non-vector key material for this
     // scenario — never a real channel's actual seed/basepoints ──────────
-    const peer_seed = [16]u8{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00 } ** 2;
-    const local_delayed_basepoint_secret = [16]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10 } ** 2;
-    const local_revocation_basepoint_secret = [16]u8{ 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f, 0x30 } ** 2;
+    const peer_seed = arrRepeat(u8, &.{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00 }, 2);
+    const local_delayed_basepoint_secret = arrRepeat(u8, &.{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10 }, 2);
+    const local_revocation_basepoint_secret = arrRepeat(u8, &.{ 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f, 0x30 }, 2);
 
     const local_delayed_basepoint = pointOf(local_delayed_basepoint_secret);
     const local_revocation_basepoint = pointOf(local_revocation_basepoint_secret);
@@ -147,7 +147,7 @@ pub fn main() !void {
 
     // A corrupted / all-zero 33-byte "point" from a buggy or hostile peer
     // must be rejected by name, not accepted as some nonsense key.
-    const bad_point = [_]u8{0} ** 33;
+    const bad_point = @as([33]u8, @splat(0));
     if (bolt3.derivePublicKey(local_delayed_basepoint, bad_point)) |_| {
         return error.UnexpectedAccept;
     } else |err| switch (err) {
@@ -157,7 +157,7 @@ pub fn main() !void {
 
     // Likewise a corrupted secret (all-zero is non-canonical: not a valid
     // scalar) on the revocation-privkey path.
-    const bad_secret = [_]u8{0} ** 32;
+    const bad_secret = @as([32]u8, @splat(0));
     var last_pcs: [32]u8 = undefined;
     bolt3.perCommitmentSecret(&last_pcs, &peer_seed, bolt3.max_index);
     var unused_key: [32]u8 = undefined;
@@ -174,7 +174,7 @@ pub fn main() !void {
     // no way to know the caller's basepoint is "wrong"), but the
     // consequence a wrong key has to produce for the scheme to hold at
     // all: silent, byte-level disagreement, never an accidental match.
-    const wrong_revocation_basepoint_secret = [_]u8{0xEE} ** 32;
+    const wrong_revocation_basepoint_secret = @as([32]u8, @splat(0xEE));
     const wrong_revocation_basepoint = pointOf(wrong_revocation_basepoint_secret);
     const wrong_revocationpubkey = try bolt3.deriveRevocationPublicKey(wrong_revocation_basepoint, prev_pcp.?);
     must(!std.mem.eql(u8, &wrong_revocationpubkey, &prev_revocation_pubkey.?), @src());
@@ -189,4 +189,12 @@ pub fn main() !void {
     must(std.mem.eql(u8, &recomputed, &first), @src());
 
     std.debug.print("bolt3 example: OK\n", .{});
+}
+
+/// Comptime array repetition; replaces the `**` operator removed in Zig 0.17.
+fn arrRepeat(comptime T: type, comptime unit: []const T, comptime n: usize) [unit.len * n]T {
+    @setEvalBranchQuota(n * unit.len * 2 + 1000);
+    var buf: [unit.len * n]T = undefined;
+    for (0..n) |i| @memcpy(buf[i * unit.len ..][0..unit.len], unit);
+    return buf;
 }

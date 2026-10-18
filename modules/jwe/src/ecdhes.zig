@@ -401,7 +401,7 @@ test "Concat KDF counter loop — 64-byte output is round-1 digest ‖ round-2 d
 }
 
 test "ephemeral generation + agreement — both curves, both directions agree" {
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x37} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x37)));
     inline for (.{ Curve.p256, Curve.x25519 }) |curve| {
         var a: EphemeralKeyPair = undefined;
         generateEphemeral(&a, curve, .{ .fixed_for_test = csprng.random() });
@@ -424,7 +424,7 @@ test "ephemeral generation + agreement — both curves, both directions agree" {
 }
 
 test "cross-curve agreement is a typed CurveMismatch, never a wrong-key derivation" {
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x38} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x38)));
     var p: EphemeralKeyPair = undefined;
     generateEphemeral(&p, .p256, .{ .fixed_for_test = csprng.random() });
     var x: EphemeralKeyPair = undefined;
@@ -441,31 +441,31 @@ test "invalid peer material is rejected: off-curve point, bad lengths, missing y
     try testing.expectError(error.InvalidKey, PublicKey.fromCoordinates(.p256, &bad_x, &b64dFixed(32, appc_bob_y)));
     // P-256 without y, or with short coordinates.
     try testing.expectError(error.InvalidKey, PublicKey.fromCoordinates(.p256, &b64dFixed(32, appc_bob_x), null));
-    try testing.expectError(error.InvalidKey, PublicKey.fromCoordinates(.p256, &[_]u8{1} ** 31, &b64dFixed(32, appc_bob_y)));
+    try testing.expectError(error.InvalidKey, PublicKey.fromCoordinates(.p256, &@as([31]u8, @splat(1)), &b64dFixed(32, appc_bob_y)));
     // X25519 with a stray y, or a short x.
-    try testing.expectError(error.InvalidKey, PublicKey.fromCoordinates(.x25519, &[_]u8{1} ** 32, &[_]u8{2} ** 32));
-    try testing.expectError(error.InvalidKey, PublicKey.fromCoordinates(.x25519, &[_]u8{1} ** 16, null));
+    try testing.expectError(error.InvalidKey, PublicKey.fromCoordinates(.x25519, &@as([32]u8, @splat(1)), &@as([32]u8, @splat(2))));
+    try testing.expectError(error.InvalidKey, PublicKey.fromCoordinates(.x25519, &@as([16]u8, @splat(1)), null));
 }
 
 test "invalid private scalars: zero / non-canonical P-256 d, low-order X25519 peer" {
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x39} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x39)));
     var peer: EphemeralKeyPair = undefined;
     generateEphemeral(&peer, .p256, .{ .fixed_for_test = csprng.random() });
     var z_buf: [max_z_len]u8 = undefined;
-    try testing.expectError(error.InvalidKey, deriveZ(&.{ .p256 = [_]u8{0} ** 32 }, peer.public, &z_buf));
-    try testing.expectError(error.InvalidKey, deriveZ(&.{ .p256 = [_]u8{0xff} ** 32 }, peer.public, &z_buf));
+    try testing.expectError(error.InvalidKey, deriveZ(&.{ .p256 = @as([32]u8, @splat(0)) }, peer.public, &z_buf));
+    try testing.expectError(error.InvalidKey, deriveZ(&.{ .p256 = @as([32]u8, @splat(0xff)) }, peer.public, &z_buf));
 
     // X25519 low-order peer (the all-zero point) must fail, not yield Z=0.
     var xkp: EphemeralKeyPair = undefined;
     generateEphemeral(&xkp, .x25519, .{ .fixed_for_test = csprng.random() });
-    try testing.expectError(error.InvalidKey, deriveZ(&xkp.private, .{ .x25519 = [_]u8{0} ** 32 }, &z_buf));
+    try testing.expectError(error.InvalidKey, deriveZ(&xkp.private, .{ .x25519 = @as([32]u8, @splat(0)) }, &z_buf));
 }
 
 test "PrivateKey.wipe zeroes the scalar" {
     var kp: EphemeralKeyPair = undefined;
     generateEphemeral(&kp, .p256, blk: {
         const S = struct {
-            var csprng = std.Random.DefaultCsprng.init([_]u8{0x3a} ** 32);
+            var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x3a)));
         };
         break :blk Entropy{ .fixed_for_test = S.csprng.random() };
     });

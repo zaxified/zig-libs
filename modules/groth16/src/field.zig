@@ -16,7 +16,7 @@ pub const Fr = bn254.Fr;
 /// multiplicative generator `5`, and small test constants — none of which
 /// approach `r`, so the `fromBytes` canonical-range check never trips.
 pub fn frFromU64(v: u64) Fr {
-    var b = [_]u8{0} ** 32;
+    var b = @as([32]u8, @splat(0));
     std.mem.writeInt(u64, b[24..32], v, .big);
     return Fr.fromBytes(b) catch unreachable;
 }
@@ -24,7 +24,7 @@ pub fn frFromU64(v: u64) Fr {
 /// `a^e (mod r)` for a small `u64` exponent — thin wrapper over
 /// `Fr.pow`, which takes a 32-byte big-endian exponent.
 pub fn frPowU64(a: Fr, e: u64) Fr {
-    var b = [_]u8{0} ** 32;
+    var b = @as([32]u8, @splat(0));
     std.mem.writeInt(u64, b[24..32], e, .big);
     return a.pow(b);
 }

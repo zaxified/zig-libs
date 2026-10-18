@@ -190,7 +190,7 @@ pub fn parseRound(gpa: std.mem.Allocator, bytes: []const u8) RoundParseError!Rou
         else => return error.MalformedJson,
     };
 
-    var sig_bytes: [96]u8 = [_]u8{0} ** 96; // zeroed: Round is a plain value callers copy/compare
+    var sig_bytes: [96]u8 = @as([96]u8, @splat(0)); // zeroed: Round is a plain value callers copy/compare
     const sig_len = try decodeHexVar(&sig_bytes, raw.signature);
 
     var sig_g1: ?g1.Affine = null;
@@ -231,7 +231,7 @@ pub fn parseRound(gpa: std.mem.Allocator, bytes: []const u8) RoundParseError!Rou
 
     var previous_signature: ?Round.PreviousSignature = null;
     if (raw.previous_signature) |p| {
-        var pbuf: [96]u8 = [_]u8{0} ** 96;
+        var pbuf: [96]u8 = @as([96]u8, @splat(0));
         const plen = try decodeHexVar(&pbuf, p);
         previous_signature = .{ .bytes = pbuf, .len = plen };
     }
@@ -332,7 +332,7 @@ test "parseRound: an on-curve signature OUTSIDE G1 → SignatureNotInSubgroup (W
     // fires; the decoder's subgroup check (mapped to SignatureNotInSubgroup)
     // is the ONLY guard between such a point and the pairing equation,
     // which cannot see it.
-    var comp = [_]u8{0} ** sig_g1_bytes;
+    var comp = @as([sig_g1_bytes]u8, @splat(0));
     comp[0] = 0x80;
     comp[sig_g1_bytes - 1] = 4;
     const pt = try g1.fromBytesCompressedUnchecked(comp);
@@ -423,10 +423,10 @@ test "parseRound: genuine chained round decodes a G2 signature and keeps previou
 }
 
 test "parseRound: a 96-byte signature that is not a G2 point → InvalidPoint (was retained undecoded)" {
-    const junk = "{\"round\":2,\"signature\":\"" ++ ("ab" ** 96) ++
-        "\",\"previous_signature\":\"" ++ ("cd" ** 96) ++ "\"}";
+    const junk = "{\"round\":2,\"signature\":\"" ++ (strRepeat("ab", 96)) ++
+        "\",\"previous_signature\":\"" ++ (strRepeat("cd", 96)) ++ "\"}";
     try testing.expectError(error.InvalidPoint, parseRound(testing.allocator, junk));
-    const identity = "{\"round\":2,\"signature\":\"c0" ++ ("00" ** 95) ++ "\"}";
+    const identity = "{\"round\":2,\"signature\":\"c0" ++ (strRepeat("00", 95)) ++ "\"}";
     try testing.expectError(error.InvalidPoint, parseRound(testing.allocator, identity));
 }
 
@@ -434,7 +434,7 @@ test "parseRound: a 96-byte signature that is not a G2 point → InvalidPoint (w
 fn nonSubgroupG2Compressed() ![g2.compressed_bytes]u8 {
     var x: u8 = 1;
     while (x < 255) : (x += 1) {
-        var comp = [_]u8{0} ** g2.compressed_bytes;
+        var comp = @as([g2.compressed_bytes]u8, @splat(0));
         comp[0] = 0x80;
         comp[g2.compressed_bytes - 1] = x;
         const pt = g2.fromBytesCompressedUnchecked(comp) catch continue;
@@ -466,7 +466,7 @@ test "parseRound: previousSignatureBytes is empty when the field is absent; roun
 }
 
 test "parseRound: previous_signature longer than 96 bytes → InvalidLength" {
-    const bad = "{\"round\":2,\"signature\":\"b44679b9a59af2ec876b1a6b1ad52ea9b1615fc3982b19576350f93447cb1125e342b73a8dd2bacbe47e4b6b63ed5e39\",\"previous_signature\":\"" ++ ("cd" ** 97) ++ "\"}";
+    const bad = "{\"round\":2,\"signature\":\"b44679b9a59af2ec876b1a6b1ad52ea9b1615fc3982b19576350f93447cb1125e342b73a8dd2bacbe47e4b6b63ed5e39\",\"previous_signature\":\"" ++ (strRepeat("cd", 97)) ++ "\"}";
     try testing.expectError(error.InvalidLength, parseRound(testing.allocator, bad));
 }
 
@@ -479,7 +479,7 @@ test "roundPath / latestPath build the drand request path" {
 }
 
 test "parseRound: identity (infinity) signature → InvalidPoint, not a 'successful' parse (audit F10)" {
-    const doc = "{\"round\":1000,\"signature\":\"c0" ++ ("00" ** 47) ++ "\"}";
+    const doc = "{\"round\":1000,\"signature\":\"c0" ++ (strRepeat("00", 47)) ++ "\"}";
     try testing.expectError(error.InvalidPoint, parseRound(testing.allocator, doc));
 }
 
@@ -494,4 +494,16 @@ test "roundPath/latestPath refuse a chain hash that is not hex (audit F17)" {
 test "roundPath: too-small buffer → NoSpaceLeft" {
     var buf: [4]u8 = undefined;
     try testing.expectError(error.NoSpaceLeft, roundPath(&buf, "52db9ba70e0cc0f6", 1000));
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

@@ -84,7 +84,7 @@ const seedHex = testkit.fuzz.seedHex;
 /// than a re-transcription of them.
 const genesis_header = [_]u8{
     0x01, 0x00, 0x00, 0x00, // version
-} ++ ([_]u8{0} ** 32) // prev_block: all zero
+} ++ (@as([32]u8, @splat(0))) // prev_block: all zero
 ++ [_]u8{
     0x3b, 0xa3, 0xed, 0xfd, 0x7a, 0x7b, 0x12, 0xb2, 0x7a, 0xc7, 0x2c, 0x3e,
     0x67, 0x76, 0x8f, 0x61, 0x7f, 0xc8, 0x1b, 0xc3, 0x88, 0x8a, 0x51, 0x32,
@@ -144,7 +144,7 @@ test "BlockHeader: encode -> decode round-trip is byte-exact" {
 }
 
 test "hostile: BlockHeader.decode on a truncated (79-byte) buffer fails closed" {
-    const bytes = [_]u8{0} ** 79;
+    const bytes = @as([79]u8, @splat(0));
     var r: Reader = .{ .bytes = &bytes };
     try testing.expectError(error.Truncated, BlockHeader.decode(&r));
 }
@@ -158,10 +158,10 @@ test "hostile: BlockHeader.decode on a truncated (79-byte) buffer fails closed" 
 /// once reached.
 const decode_seeds = [_][]const u8{
     seed(&genesis_header), // the genesis header, whose hash is public
-    seedHex("ff" ** 80), // every field at its maximum, including a negative version
-    seedHex("00" ** 80), // every field zero
-    seedHex("00" ** 96), // a full buffer: 16 octets of trailing junk
-    seedHex("00" ** 79), // Truncated: one octet short, the hostile test's case
+    seedHex(strRepeat("ff", 80)), // every field at its maximum, including a negative version
+    seedHex(strRepeat("00", 80)), // every field zero
+    seedHex(strRepeat("00", 96)), // a full buffer: 16 octets of trailing junk
+    seedHex(strRepeat("00", 79)), // Truncated: one octet short, the hostile test's case
     seedHex("01000000"), // Truncated: a version field and nothing else
 };
 
@@ -227,4 +227,16 @@ test "corpus: every header seed reaches the decoder, and the accepted count is p
     // Measured 2026-09-07: 0 of 6 seeds non-empty and 0 accepted before the
     // draw was fixed, 6 of 6 non-empty and 4 accepted after.
     try testing.expectEqual(@as(usize, 4), accepted);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

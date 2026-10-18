@@ -38,10 +38,10 @@ fn fuzzInjective(P: bn.Perm(3), smith: *std.testing.Smith) !void {
 const fuzz_driver = @import("testkit").fuzz.driver;
 
 const Reach = enum { bn_slot0, bn_slot1, bn_slot2, bls_slot0, bls_slot1, bls_slot2, framing };
-var reach: [@typeInfo(Reach).@"enum".fields.len]usize = @splat(0);
+var reach: [@typeInfo(Reach).@"enum".field_names.len]usize = @splat(0);
 
 fn mark(r: Reach) void {
-    reach[@intFromEnum(r)] += 1;
+    reach[@backingInt(r)] += 1;
     switch (r) {
         inline else => |l| fuzz_driver.hit(@tagName(l)),
     }
@@ -87,7 +87,7 @@ fn injectiveBn(comptime S: type, P: bn.Perm(3), smith: *S) !void {
     // Perturb exactly one slot by a non-zero delta, so the two inputs are
     // guaranteed distinct and the outputs therefore must be too.
     const slot = smith.value(u8) % 3;
-    mark(@enumFromInt(@intFromEnum(Reach.bn_slot0) + slot));
+    mark(@fromBackingInt(@intCast(@backingInt(Reach.bn_slot0) + slot)));
     var delta = arbitraryFr(bn.Fr, smith);
     if (delta.isZero()) delta = bn.fromU64(1);
 
@@ -268,7 +268,7 @@ fn injectiveBls(comptime S: type, P: bls.Perm(3), smith: *S) !void {
     var a: [3]bls.Fr = undefined;
     for (&a) |*x| x.* = arbitraryFr(bls.Fr, smith);
     const slot = smith.value(u8) % 3;
-    mark(@enumFromInt(@intFromEnum(Reach.bls_slot0) + slot));
+    mark(@fromBackingInt(@intCast(@backingInt(Reach.bls_slot0) + slot)));
     var delta = arbitraryFr(bls.Fr, smith);
     if (delta.isZero()) delta = bls.fromU64(1);
     var b = a;
@@ -319,7 +319,7 @@ test "fuzz harness: seeds in every test run, and it gets everywhere" {
         }
     }
     for (reach, 0..) |n, i| if (n == 0) {
-        std.debug.print("reach: label {t} never hit\n", .{@as(Reach, @enumFromInt(i))});
+        std.debug.print("reach: label {t} never hit\n", .{@as(Reach, @fromBackingInt(@intCast(i)))});
         return error.HarnessDoesNotReach;
     };
 }

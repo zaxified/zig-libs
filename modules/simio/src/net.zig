@@ -1393,7 +1393,7 @@ fn withPort(a: net.IpAddress, port: u16) net.IpAddress {
 /// Where Unix-domain sockets live: an address private to each host (every
 /// host routes it to itself), with one port per bound path. A Unix stream is
 /// then a loopback stream, with the same close, reset and short-read rules.
-pub const unix_ip: [16]u8 = .{ 0xfd, 0x75, 0x6e, 0x69, 0x78, 0x00 } ++ .{0} ** 9 ++ .{1};
+pub const unix_ip: [16]u8 = [_]u8{ 0xfd, 0x75, 0x6e, 0x69, 0x78, 0x00 } ++ @as([9]u8, @splat(0)) ++ [_]u8{1};
 
 fn isLoopback(a: net.IpAddress) bool {
     return switch (a) {

@@ -490,7 +490,7 @@ pub fn encodeInfo(
     } else {
         try cborNull(&list, allocator);
     }
-    try cborUint(&list, allocator, @intCast(@intFromEnum(algorithm)));
+    try cborUint(&list, allocator, @intCast(@backingInt(algorithm)));
     try cborTextString(&list, allocator, label.text());
     try cborUint(&list, allocator, length);
     return list.toOwnedSlice(allocator);
@@ -539,7 +539,7 @@ pub fn encodeAadArray(allocator: std.mem.Allocator, params: AadParams) std.mem.A
     try cborArrayHeader(&list, allocator, 5);
     try cborUint(&list, allocator, params.oscore_version);
     try cborArrayHeader(&list, allocator, 1);
-    try cborUint(&list, allocator, @intCast(@intFromEnum(params.algorithm)));
+    try cborUint(&list, allocator, @intCast(@backingInt(params.algorithm)));
     try cborBstr(&list, allocator, params.request_kid);
     try cborBstr(&list, allocator, params.request_piv);
     try cborBstr(&list, allocator, params.options);
@@ -637,7 +637,7 @@ fn cborBstrInto(dst: []u8, i: *usize, bytes: []const u8) BuildAadError!void {
 fn aadArrayLen(params: AadParams) usize {
     return 1 // array header, 5 elements
     + cborHeadLen(params.oscore_version) + 1 // algorithms array header (1 element)
-    + cborHeadLen(@as(u64, @intCast(@intFromEnum(params.algorithm)))) + cborHeadLen(params.request_kid.len) + params.request_kid.len + cborHeadLen(params.request_piv.len) + params.request_piv.len + cborHeadLen(params.options.len) + params.options.len;
+    + cborHeadLen(@as(u64, @intCast(@backingInt(params.algorithm)))) + cborHeadLen(params.request_kid.len) + params.request_kid.len + cborHeadLen(params.request_piv.len) + params.request_piv.len + cborHeadLen(params.options.len) + params.options.len;
 }
 
 /// The exact number of bytes `buildAad(dst, params)` writes — size a
@@ -682,7 +682,7 @@ pub fn buildAad(dst: []u8, params: AadParams) BuildAadError![]u8 {
     try cborHeadInto(dst, &i, 4, 5); // array of 5
     try cborHeadInto(dst, &i, 0, params.oscore_version);
     try cborHeadInto(dst, &i, 4, 1); // algorithms: array of 1
-    try cborHeadInto(dst, &i, 0, @as(u64, @intCast(@intFromEnum(params.algorithm))));
+    try cborHeadInto(dst, &i, 0, @as(u64, @intCast(@backingInt(params.algorithm))));
     try cborBstrInto(dst, &i, params.request_kid);
     try cborBstrInto(dst, &i, params.request_piv);
     try cborBstrInto(dst, &i, params.options);
@@ -1086,7 +1086,7 @@ pub fn computeNonce(common_iv: [nonce_length]u8, id_piv: []const u8, partial_iv:
     if (id_piv.len > id_piv_field_width) return error.IdTooLong;
     if (partial_iv > max_partial_iv) return error.PartialIvTooLarge;
 
-    var block = [_]u8{0} ** nonce_length;
+    var block = @as([nonce_length]u8, @splat(0));
     // Step 1: S, a single byte.
     block[0] = @intCast(id_piv.len);
     // Step 2: id_piv right-aligned (LEFT-zero-padded) into the
@@ -1425,7 +1425,7 @@ test "meta.deps is empty (coap-agnostic — see module doc comment)" {
 }
 
 test "algorithm/wire size constants match AES-CCM-16-64-128" {
-    try std.testing.expectEqual(@as(i16, 10), @intFromEnum(Algorithm.aes_ccm_16_64_128));
+    try std.testing.expectEqual(@as(i16, 10), @backingInt(Algorithm.aes_ccm_16_64_128));
     try std.testing.expectEqual(@as(usize, 16), key_length);
     try std.testing.expectEqual(@as(usize, 13), nonce_length);
     try std.testing.expectEqual(@as(usize, 8), tag_length);

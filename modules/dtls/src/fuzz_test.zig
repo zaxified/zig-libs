@@ -50,10 +50,10 @@ pub fn damage(src: anytype, buf: []u8, frame: []const u8) usize {
 /// Reach counters for one harness file's labels (see jwt's fuzz_test.zig).
 pub fn Marker(comptime Label: type) type {
     return struct {
-        var counts: [@typeInfo(Label).@"enum".fields.len]usize = @splat(0);
+        var counts: [@typeInfo(Label).@"enum".field_names.len]usize = @splat(0);
 
         pub fn mark(comptime l: Label) void {
-            counts[@intFromEnum(l)] += 1;
+            counts[@backingInt(l)] += 1;
             fuzz_driver.hit(@tagName(l));
         }
 
@@ -68,7 +68,7 @@ pub fn Marker(comptime Label: type) type {
                 };
             }
             for (counts, 0..) |n, i| if (n == 0) {
-                std.debug.print("reach: " ++ name ++ " label {t} never hit in {d} seeds\n", .{ @as(Label, @enumFromInt(i)), seeds });
+                std.debug.print("reach: " ++ name ++ " label {t} never hit in {d} seeds\n", .{ @as(Label, @fromBackingInt(@intCast(i))), seeds });
                 return error.HarnessDoesNotReach;
             };
         }
@@ -144,7 +144,7 @@ const HsMark = Marker(enum {
 
 pub fn fuzzHandshake(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     _ = gpa;
-    const mode: Mode = if (S == fuzz_driver.Rng) @enumFromInt(src.valueRangeAtMost(u8, 0, 3)) else .psk_gcm;
+    const mode: Mode = if (S == fuzz_driver.Rng) @fromBackingInt(@intCast(src.valueRangeAtMost(u8, 0, 3))) else .psk_gcm;
     const cfg = configs(mode);
     var client = try Connection.clientInit(cfg[0]);
     var server = try Connection.serverInit(cfg[1]);
@@ -266,7 +266,7 @@ fn ensurePair(mode: Mode) !void {
     const cfg = configs(.psk_gcm);
     pair[0] = try Connection.clientInit(cfg[0]);
     pair[1] = try Connection.serverInit(cfg[1]);
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x31} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x31)));
     var b1: [4096]u8 = undefined;
     var b2: [4096]u8 = undefined;
     const rnd: conn_mod.Entropy = .{ .seeded_for_test = csprng.random() };
@@ -301,7 +301,7 @@ pub fn fuzzRecord(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!vo
         src.bytes(msgs[i][0..mlens[i]]);
         lens[i] = (try tx.send(msgs[i][0..mlens[i]], &wires[i])).len;
     }
-    var delivered = [_]bool{false} ** count;
+    var delivered = @as([count]bool, @splat(false));
     const deliveries = if (S == fuzz_driver.Rng) src.valueRangeAtMost(u8, 1, 6) else 1;
     var last: ?usize = null;
     for (0..deliveries) |_| {
@@ -377,7 +377,7 @@ var seed_ack_len: usize = 0;
 
 fn ensureSeeds() !void {
     if (seeds_ready) return;
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x44} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x44)));
     const rnd: conn_mod.Entropy = .{ .seeded_for_test = csprng.random() };
     for ([_]Mode{ .psk_gcm, .dhe }, 0..) |mode, i| {
         const cfg = configs(mode);

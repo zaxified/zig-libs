@@ -314,7 +314,7 @@ fn scriptCodeFor(
             try out.appendSlice(allocator, sub[i..undecodableStop(sub, i)]);
             break;
         };
-        if (instr.opcode != @intFromEnum(Opcode.OP_CODESEPARATOR)) {
+        if (instr.opcode != @backingInt(Opcode.OP_CODESEPARATOR)) {
             try out.appendSlice(allocator, sub[i..instr.next]);
         }
         i = instr.next;
@@ -512,47 +512,47 @@ fn execOpcode(state: *State, opcode: u8, instr_next: usize) EvalError!void {
         0x4f => try state.pushOwned(&[_]u8{0x81}), // OP_1NEGATE
         0x51...0x60 => try state.pushOwned(&[_]u8{opcode - 0x50}), // OP_1..OP_16
 
-        @intFromEnum(Opcode.OP_NOP) => {},
+        @backingInt(Opcode.OP_NOP) => {},
 
-        @intFromEnum(Opcode.OP_VERIFY) => {
+        @backingInt(Opcode.OP_VERIFY) => {
             if (stack.items.len < 1) return error.InvalidStackOperation;
             const top = stack.pop().?;
             if (!number.castToBool(top)) return error.Verify;
         },
-        @intFromEnum(Opcode.OP_RETURN) => return error.OpReturn,
+        @backingInt(Opcode.OP_RETURN) => return error.OpReturn,
 
-        @intFromEnum(Opcode.OP_TOALTSTACK) => {
+        @backingInt(Opcode.OP_TOALTSTACK) => {
             if (stack.items.len < 1) return error.InvalidStackOperation;
             try altstack.append(allocator, stack.pop().?);
         },
-        @intFromEnum(Opcode.OP_FROMALTSTACK) => {
+        @backingInt(Opcode.OP_FROMALTSTACK) => {
             if (altstack.items.len < 1) return error.InvalidAltstackOperation;
             try stack.append(allocator, altstack.pop().?);
         },
-        @intFromEnum(Opcode.OP_2DROP) => {
+        @backingInt(Opcode.OP_2DROP) => {
             if (stack.items.len < 2) return error.InvalidStackOperation;
             stack.shrinkRetainingCapacity(stack.items.len - 2);
         },
-        @intFromEnum(Opcode.OP_2DUP) => {
+        @backingInt(Opcode.OP_2DUP) => {
             const n = stack.items.len;
             if (n < 2) return error.InvalidStackOperation;
             try state.pushExisting(stack.items[n - 2]);
             try state.pushExisting(stack.items[n - 1]);
         },
-        @intFromEnum(Opcode.OP_3DUP) => {
+        @backingInt(Opcode.OP_3DUP) => {
             const n = stack.items.len;
             if (n < 3) return error.InvalidStackOperation;
             try state.pushExisting(stack.items[n - 3]);
             try state.pushExisting(stack.items[n - 2]);
             try state.pushExisting(stack.items[n - 1]);
         },
-        @intFromEnum(Opcode.OP_2OVER) => {
+        @backingInt(Opcode.OP_2OVER) => {
             const n = stack.items.len;
             if (n < 4) return error.InvalidStackOperation;
             try state.pushExisting(stack.items[n - 4]);
             try state.pushExisting(stack.items[n - 3]);
         },
-        @intFromEnum(Opcode.OP_2ROT) => {
+        @backingInt(Opcode.OP_2ROT) => {
             const n = stack.items.len;
             if (n < 6) return error.InvalidStackOperation;
             const a = stack.orderedRemove(n - 6);
@@ -560,7 +560,7 @@ fn execOpcode(state: *State, opcode: u8, instr_next: usize) EvalError!void {
             try state.pushExisting(a);
             try state.pushExisting(b);
         },
-        @intFromEnum(Opcode.OP_2SWAP) => {
+        @backingInt(Opcode.OP_2SWAP) => {
             const n = stack.items.len;
             if (n < 4) return error.InvalidStackOperation;
             const a = stack.items[n - 4];
@@ -572,195 +572,195 @@ fn execOpcode(state: *State, opcode: u8, instr_next: usize) EvalError!void {
             stack.items[n - 2] = a;
             stack.items[n - 1] = b;
         },
-        @intFromEnum(Opcode.OP_IFDUP) => {
+        @backingInt(Opcode.OP_IFDUP) => {
             if (stack.items.len < 1) return error.InvalidStackOperation;
             const top = stack.items[stack.items.len - 1];
             if (number.castToBool(top)) try state.pushExisting(top);
         },
-        @intFromEnum(Opcode.OP_DEPTH) => try state.pushNum(@intCast(stack.items.len)),
-        @intFromEnum(Opcode.OP_DROP) => {
+        @backingInt(Opcode.OP_DEPTH) => try state.pushNum(@intCast(stack.items.len)),
+        @backingInt(Opcode.OP_DROP) => {
             if (stack.items.len < 1) return error.InvalidStackOperation;
             _ = stack.pop();
         },
-        @intFromEnum(Opcode.OP_DUP) => {
+        @backingInt(Opcode.OP_DUP) => {
             if (stack.items.len < 1) return error.InvalidStackOperation;
             try state.pushExisting(stack.items[stack.items.len - 1]);
         },
-        @intFromEnum(Opcode.OP_NIP) => {
+        @backingInt(Opcode.OP_NIP) => {
             if (stack.items.len < 2) return error.InvalidStackOperation;
             _ = stack.orderedRemove(stack.items.len - 2);
         },
-        @intFromEnum(Opcode.OP_OVER) => {
+        @backingInt(Opcode.OP_OVER) => {
             if (stack.items.len < 2) return error.InvalidStackOperation;
             try state.pushExisting(stack.items[stack.items.len - 2]);
         },
-        @intFromEnum(Opcode.OP_PICK), @intFromEnum(Opcode.OP_ROLL) => {
+        @backingInt(Opcode.OP_PICK), @backingInt(Opcode.OP_ROLL) => {
             const n = try state.popNum();
             if (n < 0 or @as(u64, @intCast(n)) >= stack.items.len) return error.InvalidStackOperation;
             const idx = stack.items.len - 1 - @as(usize, @intCast(n));
             const v = stack.items[idx];
-            if (opcode == @intFromEnum(Opcode.OP_ROLL)) {
+            if (opcode == @backingInt(Opcode.OP_ROLL)) {
                 _ = stack.orderedRemove(idx);
             }
             try state.pushExisting(v);
         },
-        @intFromEnum(Opcode.OP_ROT) => {
+        @backingInt(Opcode.OP_ROT) => {
             if (stack.items.len < 3) return error.InvalidStackOperation;
             const v = stack.orderedRemove(stack.items.len - 3);
             try state.pushExisting(v);
         },
-        @intFromEnum(Opcode.OP_SWAP) => {
+        @backingInt(Opcode.OP_SWAP) => {
             const n = stack.items.len;
             if (n < 2) return error.InvalidStackOperation;
             const tmp = stack.items[n - 2];
             stack.items[n - 2] = stack.items[n - 1];
             stack.items[n - 1] = tmp;
         },
-        @intFromEnum(Opcode.OP_TUCK) => {
+        @backingInt(Opcode.OP_TUCK) => {
             const n = stack.items.len;
             if (n < 2) return error.InvalidStackOperation;
             try stack.insert(allocator, n - 2, stack.items[n - 1]);
         },
 
-        @intFromEnum(Opcode.OP_SIZE) => {
+        @backingInt(Opcode.OP_SIZE) => {
             if (stack.items.len < 1) return error.InvalidStackOperation;
             try state.pushNum(@intCast(stack.items[stack.items.len - 1].len));
         },
 
-        @intFromEnum(Opcode.OP_EQUAL), @intFromEnum(Opcode.OP_EQUALVERIFY) => {
+        @backingInt(Opcode.OP_EQUAL), @backingInt(Opcode.OP_EQUALVERIFY) => {
             if (stack.items.len < 2) return error.InvalidStackOperation;
             const b = stack.pop().?;
             const a = stack.pop().?;
             const eq = std.mem.eql(u8, a, b);
-            if (opcode == @intFromEnum(Opcode.OP_EQUALVERIFY)) {
+            if (opcode == @backingInt(Opcode.OP_EQUALVERIFY)) {
                 if (!eq) return error.Equalverify;
             } else {
                 try state.pushBool(eq);
             }
         },
 
-        @intFromEnum(Opcode.OP_1ADD) => try state.pushNum((try state.popNum()) + 1),
-        @intFromEnum(Opcode.OP_1SUB) => try state.pushNum((try state.popNum()) - 1),
-        @intFromEnum(Opcode.OP_NEGATE) => try state.pushNum(-(try state.popNum())),
-        @intFromEnum(Opcode.OP_ABS) => {
+        @backingInt(Opcode.OP_1ADD) => try state.pushNum((try state.popNum()) + 1),
+        @backingInt(Opcode.OP_1SUB) => try state.pushNum((try state.popNum()) - 1),
+        @backingInt(Opcode.OP_NEGATE) => try state.pushNum(-(try state.popNum())),
+        @backingInt(Opcode.OP_ABS) => {
             const a = try state.popNum();
             try state.pushNum(if (a < 0) -a else a);
         },
-        @intFromEnum(Opcode.OP_NOT) => try state.pushBool((try state.popNum()) == 0),
-        @intFromEnum(Opcode.OP_0NOTEQUAL) => try state.pushBool((try state.popNum()) != 0),
-        @intFromEnum(Opcode.OP_ADD) => {
+        @backingInt(Opcode.OP_NOT) => try state.pushBool((try state.popNum()) == 0),
+        @backingInt(Opcode.OP_0NOTEQUAL) => try state.pushBool((try state.popNum()) != 0),
+        @backingInt(Opcode.OP_ADD) => {
             const b = try state.popNum();
             const a = try state.popNum();
             try state.pushNum(a + b);
         },
-        @intFromEnum(Opcode.OP_SUB) => {
+        @backingInt(Opcode.OP_SUB) => {
             const b = try state.popNum();
             const a = try state.popNum();
             try state.pushNum(a - b);
         },
-        @intFromEnum(Opcode.OP_BOOLAND) => {
+        @backingInt(Opcode.OP_BOOLAND) => {
             const b = try state.popNum();
             const a = try state.popNum();
             try state.pushBool(a != 0 and b != 0);
         },
-        @intFromEnum(Opcode.OP_BOOLOR) => {
+        @backingInt(Opcode.OP_BOOLOR) => {
             const b = try state.popNum();
             const a = try state.popNum();
             try state.pushBool(a != 0 or b != 0);
         },
-        @intFromEnum(Opcode.OP_NUMEQUAL), @intFromEnum(Opcode.OP_NUMEQUALVERIFY) => {
+        @backingInt(Opcode.OP_NUMEQUAL), @backingInt(Opcode.OP_NUMEQUALVERIFY) => {
             const b = try state.popNum();
             const a = try state.popNum();
-            if (opcode == @intFromEnum(Opcode.OP_NUMEQUALVERIFY)) {
+            if (opcode == @backingInt(Opcode.OP_NUMEQUALVERIFY)) {
                 if (a != b) return error.Numequalverify;
             } else {
                 try state.pushBool(a == b);
             }
         },
-        @intFromEnum(Opcode.OP_NUMNOTEQUAL) => {
+        @backingInt(Opcode.OP_NUMNOTEQUAL) => {
             const b = try state.popNum();
             const a = try state.popNum();
             try state.pushBool(a != b);
         },
-        @intFromEnum(Opcode.OP_LESSTHAN) => {
+        @backingInt(Opcode.OP_LESSTHAN) => {
             const b = try state.popNum();
             const a = try state.popNum();
             try state.pushBool(a < b);
         },
-        @intFromEnum(Opcode.OP_GREATERTHAN) => {
+        @backingInt(Opcode.OP_GREATERTHAN) => {
             const b = try state.popNum();
             const a = try state.popNum();
             try state.pushBool(a > b);
         },
-        @intFromEnum(Opcode.OP_LESSTHANOREQUAL) => {
+        @backingInt(Opcode.OP_LESSTHANOREQUAL) => {
             const b = try state.popNum();
             const a = try state.popNum();
             try state.pushBool(a <= b);
         },
-        @intFromEnum(Opcode.OP_GREATERTHANOREQUAL) => {
+        @backingInt(Opcode.OP_GREATERTHANOREQUAL) => {
             const b = try state.popNum();
             const a = try state.popNum();
             try state.pushBool(a >= b);
         },
-        @intFromEnum(Opcode.OP_MIN) => {
+        @backingInt(Opcode.OP_MIN) => {
             const b = try state.popNum();
             const a = try state.popNum();
             try state.pushNum(@min(a, b));
         },
-        @intFromEnum(Opcode.OP_MAX) => {
+        @backingInt(Opcode.OP_MAX) => {
             const b = try state.popNum();
             const a = try state.popNum();
             try state.pushNum(@max(a, b));
         },
-        @intFromEnum(Opcode.OP_WITHIN) => {
+        @backingInt(Opcode.OP_WITHIN) => {
             const max_v = try state.popNum();
             const min_v = try state.popNum();
             const x = try state.popNum();
             try state.pushBool(min_v <= x and x < max_v);
         },
 
-        @intFromEnum(Opcode.OP_RIPEMD160) => {
+        @backingInt(Opcode.OP_RIPEMD160) => {
             if (stack.items.len < 1) return error.InvalidStackOperation;
             const data = stack.pop().?;
             var out: [20]u8 = undefined;
             ripemd160.Ripemd160.hash(data, &out, .{});
             try state.pushOwned(&out);
         },
-        @intFromEnum(Opcode.OP_SHA1) => {
+        @backingInt(Opcode.OP_SHA1) => {
             if (stack.items.len < 1) return error.InvalidStackOperation;
             const data = stack.pop().?;
             var out: [std.crypto.hash.Sha1.digest_length]u8 = undefined;
             std.crypto.hash.Sha1.hash(data, &out, .{});
             try state.pushOwned(&out);
         },
-        @intFromEnum(Opcode.OP_SHA256) => {
+        @backingInt(Opcode.OP_SHA256) => {
             if (stack.items.len < 1) return error.InvalidStackOperation;
             const data = stack.pop().?;
             var out: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
             std.crypto.hash.sha2.Sha256.hash(data, &out, .{});
             try state.pushOwned(&out);
         },
-        @intFromEnum(Opcode.OP_HASH160) => {
+        @backingInt(Opcode.OP_HASH160) => {
             if (stack.items.len < 1) return error.InvalidStackOperation;
             const data = stack.pop().?;
             var out: [20]u8 = undefined;
             ripemd160.hash160(data, &out);
             try state.pushOwned(&out);
         },
-        @intFromEnum(Opcode.OP_HASH256) => {
+        @backingInt(Opcode.OP_HASH256) => {
             if (stack.items.len < 1) return error.InvalidStackOperation;
             const data = stack.pop().?;
             const out = bitcointx.hash256.sha256d(data);
             try state.pushOwned(&out);
         },
-        @intFromEnum(Opcode.OP_CODESEPARATOR) => {
+        @backingInt(Opcode.OP_CODESEPARATOR) => {
             state.last_codesep = instr_next;
             // BIP342: a tapscript signature commits to the opcode position of
             // the last executed OP_CODESEPARATOR.
             if (state.sig_version == .tapscript) state.exec_data.?.codesep_pos = state.opcode_pos;
         },
 
-        @intFromEnum(Opcode.OP_CHECKSIG), @intFromEnum(Opcode.OP_CHECKSIGVERIFY) => {
+        @backingInt(Opcode.OP_CHECKSIG), @backingInt(Opcode.OP_CHECKSIGVERIFY) => {
             if (stack.items.len < 2) return error.InvalidStackOperation;
             const pubkey = stack.pop().?;
             const sig = stack.pop().?;
@@ -771,14 +771,14 @@ fn execOpcode(state: *State, opcode: u8, instr_next: usize) EvalError!void {
                 if (!r and state.flags.nullfail and sig.len != 0) return error.SigNullfail;
                 break :blk r;
             };
-            if (opcode == @intFromEnum(Opcode.OP_CHECKSIGVERIFY)) {
+            if (opcode == @backingInt(Opcode.OP_CHECKSIGVERIFY)) {
                 if (!ok) return error.Checksigverify;
             } else {
                 try state.pushBool(ok);
             }
         },
 
-        @intFromEnum(Opcode.OP_CHECKSIGADD) => {
+        @backingInt(Opcode.OP_CHECKSIGADD) => {
             // BIP342: tapscript-only. Pops pubkey (top), a CScriptNum n
             // (4-byte max), and a signature (third). Pushes n or n+1.
             if (state.sig_version != .tapscript) return error.BadOpcode;
@@ -790,7 +790,7 @@ fn execOpcode(state: *State, opcode: u8, instr_next: usize) EvalError!void {
             try state.pushNum(n + @as(i64, if (ok) 1 else 0));
         },
 
-        @intFromEnum(Opcode.OP_CHECKMULTISIG), @intFromEnum(Opcode.OP_CHECKMULTISIGVERIFY) => {
+        @backingInt(Opcode.OP_CHECKMULTISIG), @backingInt(Opcode.OP_CHECKMULTISIGVERIFY) => {
             // BIP342: OP_CHECKMULTISIG(VERIFY) are disabled in tapscript and
             // fail immediately when executed (ignored in an unexecuted branch
             // — this arm only runs when the branch is executing).
@@ -900,14 +900,14 @@ fn execOpcode(state: *State, opcode: u8, instr_next: usize) EvalError!void {
             const dummy = stack.pop().?;
             if (state.flags.nulldummy and dummy.len != 0) return error.SigNulldummy;
 
-            if (opcode == @intFromEnum(Opcode.OP_CHECKMULTISIGVERIFY)) {
+            if (opcode == @backingInt(Opcode.OP_CHECKMULTISIGVERIFY)) {
                 if (!success) return error.Checkmultisigverify;
             } else {
                 try state.pushBool(success);
             }
         },
 
-        @intFromEnum(Opcode.OP_CHECKLOCKTIMEVERIFY) => {
+        @backingInt(Opcode.OP_CHECKLOCKTIMEVERIFY) => {
             if (!state.flags.checklocktimeverify) {
                 if (state.flags.discourage_upgradable_nops) return error.DiscourageUpgradableNops;
                 return; // acts as OP_NOP2
@@ -924,7 +924,7 @@ fn execOpcode(state: *State, opcode: u8, instr_next: usize) EvalError!void {
             if (state.ctx.tx.vin[state.ctx.input_index].sequence == 0xffffffff) return error.UnsatisfiedLocktime;
         },
 
-        @intFromEnum(Opcode.OP_CHECKSEQUENCEVERIFY) => {
+        @backingInt(Opcode.OP_CHECKSEQUENCEVERIFY) => {
             if (!state.flags.checksequenceverify) {
                 if (state.flags.discourage_upgradable_nops) return error.DiscourageUpgradableNops;
                 return; // acts as OP_NOP3
@@ -948,14 +948,14 @@ fn execOpcode(state: *State, opcode: u8, instr_next: usize) EvalError!void {
             if ((seq_num & mask) > (tx_seq_i64 & mask)) return error.UnsatisfiedLocktime;
         },
 
-        @intFromEnum(Opcode.OP_NOP1),
-        @intFromEnum(Opcode.OP_NOP4),
-        @intFromEnum(Opcode.OP_NOP5),
-        @intFromEnum(Opcode.OP_NOP6),
-        @intFromEnum(Opcode.OP_NOP7),
-        @intFromEnum(Opcode.OP_NOP8),
-        @intFromEnum(Opcode.OP_NOP9),
-        @intFromEnum(Opcode.OP_NOP10),
+        @backingInt(Opcode.OP_NOP1),
+        @backingInt(Opcode.OP_NOP4),
+        @backingInt(Opcode.OP_NOP5),
+        @backingInt(Opcode.OP_NOP6),
+        @backingInt(Opcode.OP_NOP7),
+        @backingInt(Opcode.OP_NOP8),
+        @backingInt(Opcode.OP_NOP9),
+        @backingInt(Opcode.OP_NOP10),
         => {
             if (state.flags.discourage_upgradable_nops) return error.DiscourageUpgradableNops;
         },
@@ -1055,7 +1055,7 @@ fn evalCore(
         // error-class ordering, not the pass/fail verdict: both orders
         // reject the same script; checking the opcode class first, as this
         // module did until 2026-09-10, has it backwards).
-        if (!is_tapscript and instr.data == null and instr.opcode > @intFromEnum(Opcode.OP_16)) {
+        if (!is_tapscript and instr.data == null and instr.opcode > @backingInt(Opcode.OP_16)) {
             state.op_count += 1;
             if (state.op_count > limits.max_ops_per_script) return error.OpCount;
         }
@@ -1074,7 +1074,7 @@ fn evalCore(
         // consulted, so an unexecuted `IF OP_CODESEPARATOR ENDIF` is just as
         // fatal as an executed one (`tx_invalid.json` pins both).
         if (sig_version == .base and flags.const_scriptcode and
-            instr.opcode == @intFromEnum(Opcode.OP_CODESEPARATOR)) return error.OpCodeseparator;
+            instr.opcode == @backingInt(Opcode.OP_CODESEPARATOR)) return error.OpCodeseparator;
 
         const exec = cond_stack.allTrue();
 
@@ -1084,7 +1084,7 @@ fn evalCore(
                 if (flags.minimaldata and !checkMinimalPush(instr.opcode, data)) return error.MinimalData;
                 try state.pushOwned(data);
             }
-        } else if (instr.opcode == @intFromEnum(Opcode.OP_IF) or instr.opcode == @intFromEnum(Opcode.OP_NOTIF)) {
+        } else if (instr.opcode == @backingInt(Opcode.OP_IF) or instr.opcode == @backingInt(Opcode.OP_NOTIF)) {
             var value = false;
             if (exec) {
                 // Core spells this one UNBALANCED_CONDITIONAL, not
@@ -1110,12 +1110,12 @@ fn evalCore(
                 value = number.castToBool(top);
                 stack.shrinkRetainingCapacity(stack.items.len - 1);
             }
-            const is_notif = instr.opcode == @intFromEnum(Opcode.OP_NOTIF);
+            const is_notif = instr.opcode == @backingInt(Opcode.OP_NOTIF);
             cond_stack.push(value != is_notif);
-        } else if (instr.opcode == @intFromEnum(Opcode.OP_ELSE)) {
+        } else if (instr.opcode == @backingInt(Opcode.OP_ELSE)) {
             if (cond_stack.empty()) return error.UnbalancedConditional;
             cond_stack.toggleTop();
-        } else if (instr.opcode == @intFromEnum(Opcode.OP_ENDIF)) {
+        } else if (instr.opcode == @backingInt(Opcode.OP_ENDIF)) {
             if (cond_stack.empty()) return error.UnbalancedConditional;
             cond_stack.pop();
         } else if (exec) {
@@ -1173,7 +1173,7 @@ test "OP_VERIF at the op-count boundary reports OpCount, not BadOpcode (Core che
     // runs -- so a script over budget AT an OP_VERIF position reports
     // OP_COUNT. Before 2026-09-10 this module checked the opcode class
     // first and always reported BadOpcode here, regardless of op_count.
-    const script = ([_]u8{0x61} ** limits.max_ops_per_script) ++ [_]u8{0x65};
+    const script = (@as([limits.max_ops_per_script]u8, @splat(0x61))) ++ [_]u8{0x65};
     try testing.expectError(error.OpCount, run(&script));
 }
 
@@ -1407,7 +1407,7 @@ test "OP_CHECKLOCKTIMEVERIFY: locktime <= tx.locktime passes, > fails (BIP65 bou
                 .tx = .{
                     .version = 2,
                     .vin = @constCast(&[_]bitcointx.TxIn{.{
-                        .prevout = .{ .txid = [_]u8{0} ** 32, .vout = 0 },
+                        .prevout = .{ .txid = @as([32]u8, @splat(0)), .vout = 0 },
                         .script_sig = &.{},
                         .sequence = 0, // not 0xffffffff: CLTV's final-input check must not fire here
                     }}),
@@ -1519,14 +1519,14 @@ test "a deeply nested tapscript leaf is linear, not quadratic, in its own length
     try script.ensureTotalCapacity(testing.allocator, levels * 2 + levels);
     var i: usize = 0;
     while (i < levels) : (i += 1) {
-        script.appendAssumeCapacity(@intFromEnum(Opcode.OP_1));
-        script.appendAssumeCapacity(@intFromEnum(Opcode.OP_IF));
+        script.appendAssumeCapacity(@backingInt(Opcode.OP_1));
+        script.appendAssumeCapacity(@backingInt(Opcode.OP_IF));
     }
     i = 0;
-    while (i < levels) : (i += 1) script.appendAssumeCapacity(@intFromEnum(Opcode.OP_ENDIF));
+    while (i < levels) : (i += 1) script.appendAssumeCapacity(@backingInt(Opcode.OP_ENDIF));
 
     var exec_data: ExecData = .{
-        .tapleaf_hash = [_]u8{0} ** 32,
+        .tapleaf_hash = @as([32]u8, @splat(0)),
         .validation_weight = std.math.maxInt(i64),
     };
     var arena = std.heap.ArenaAllocator.init(testing.allocator);

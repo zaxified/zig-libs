@@ -685,7 +685,7 @@ test "corpus: every stat script reaches the parser, and the samples selected are
     var nonempty: usize = 0;
     var parsed: usize = 0;
     var mutations: usize = 0;
-    var samples_seen = [_]bool{false} ** proc_stat_corpus.len;
+    var samples_seen = @as([proc_stat_corpus.len]bool, @splat(false));
     for (proc_stat_seeds) |sd| {
         var smith: std.testing.Smith = .{ .in = sd };
         var script: [512]u8 = undefined;

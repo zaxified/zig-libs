@@ -303,7 +303,7 @@ fn probeCall(label: []const u8, comptime call: fn () void, comptime fill: fn (*N
 }
 
 test "STACKPROBE: no Paillier secret on the dead stack after any entry point" {
-    if (builtin.mode == .Debug or builtin.mode == .ReleaseSafe) return error.SkipZigTest;
+    if (builtin.mode == .debug or builtin.mode == .safe) return error.SkipZigTest;
     recorder = .{ .csprng = .init(@splat(0x2f)) };
     defer {
         recorder.log.deinit(std.heap.page_allocator);

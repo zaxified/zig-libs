@@ -780,9 +780,9 @@ test "fuzz: Proof.fromBytes never panics on arbitrary bytes" {
     // input on the default lane — `check-fuzz-reach` measured that across
     // the repository on 2026-09-06.
     try testing.fuzz({}, fuzzProofFromBytes, .{ .corpus = &.{
-        &([_]u8{0xab} ** group.modulus_bytes),
-        &([_]u8{0xab} ** (group.modulus_bytes - 1)),
-        &([_]u8{0xab} ** (group.modulus_bytes + 1)),
+        &(@as([group.modulus_bytes]u8, @splat(0xab))),
+        &(@as([group.modulus_bytes - 1]u8, @splat(0xab))),
+        &(@as([group.modulus_bytes + 1]u8, @splat(0xab))),
     } });
 }
 
@@ -896,7 +896,7 @@ test "prove core: streaming quotient matches naive big.int division (incl. q=0 a
     const m = group.rsa2048ChallengeModulus();
     var n_canon: [group.modulus_bytes]u8 = undefined;
     try m.toBytes(&n_canon, .big);
-    var x_canon: [group.modulus_bytes]u8 = [_]u8{0} ** group.modulus_bytes;
+    var x_canon: [group.modulus_bytes]u8 = @as([group.modulus_bytes]u8, @splat(0));
     x_canon[group.modulus_bytes - 1] = 5;
     const x = try group.elementFromBytes(m, &x_canon);
 
@@ -919,7 +919,7 @@ test "prove core: streaming quotient matches naive big.int division (incl. q=0 a
 
 /// `x` as a canonical fixed-width element, for the RSA-2048 tests below.
 fn smallElement(v: u8) [group.modulus_bytes]u8 {
-    var buf: [group.modulus_bytes]u8 = [_]u8{0} ** group.modulus_bytes;
+    var buf: [group.modulus_bytes]u8 = @as([group.modulus_bytes]u8, @splat(0));
     buf[group.modulus_bytes - 1] = v;
     return buf;
 }

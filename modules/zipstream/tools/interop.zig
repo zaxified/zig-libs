@@ -34,7 +34,7 @@ const WriteCase = struct { id: []const u8, items: []const Item };
 
 const t0: i64 = 1_727_700_007;
 
-const big = "the quick brown fox jumps over the lazy dog 0123456789\n" ** 1300;
+const big = strRepeat("the quick brown fox jumps over the lazy dog 0123456789\n", 1300);
 
 const basic = [_]Item{
     .{ .name = "a.txt", .data = "hello\n", .opts = .{ .mtime = t0 } },
@@ -65,7 +65,7 @@ const times = [_]Item{
 const names = [_]Item{
     .{ .name = "\xc4\x8d.txt", .data = "c", .opts = .{ .method = .store, .mtime = t0 } },
     .{ .name = "a b.txt", .data = "s", .opts = .{ .method = .store, .mtime = t0 } },
-    .{ .name = "n" ** 300, .data = "l", .opts = .{ .method = .store, .mtime = t0 } },
+    .{ .name = strRepeat("n", 300), .data = "l", .opts = .{ .method = .store, .mtime = t0 } },
 };
 
 const write_cases = [_]WriteCase{
@@ -223,4 +223,16 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     }
     std.debug.print("interop-zipstream: {s}\n", .{if (ok) "OK" else "NOT OK"});
     return if (ok) 0 else 1;
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

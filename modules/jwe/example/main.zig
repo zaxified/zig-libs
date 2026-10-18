@@ -31,7 +31,7 @@ pub fn main() !void {
 
     // A long-lived shared key a service uses to seal data for itself (e.g.
     // an opaque refresh token it will decrypt on the next request).
-    const shared_key = [_]u8{0x2b} ** 32;
+    const shared_key = @as([32]u8, @splat(0x2b));
 
     // ── encrypt ──────────────────────────────────────────────────────────
     const token = try jwe.encryptCompact(

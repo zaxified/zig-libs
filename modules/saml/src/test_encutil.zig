@@ -32,7 +32,7 @@ fn b64(alloc: std.mem.Allocator, data: []const u8) ![]u8 {
 }
 
 fn gcmEncrypt256(alloc: std.mem.Allocator, key: [32]u8, msg: []const u8) ![]u8 {
-    const iv = [_]u8{0x33} ** 12;
+    const iv = @as([12]u8, @splat(0x33));
     const total = 12 + msg.len + 16;
     const out = try alloc.alloc(u8, total);
     @memcpy(out[0..12], &iv);
@@ -62,7 +62,7 @@ pub fn encryptedWrapper(
     wrapper_local: []const u8,
     plaintext: []const u8,
 ) ![]u8 {
-    const cek = [_]u8{0xB7} ** 32;
+    const cek = @as([32]u8, @splat(0xB7));
     const wrapped = try oaepWrapCek(alloc, pk, &cek);
     defer alloc.free(wrapped);
     const content = try gcmEncrypt256(alloc, cek, plaintext);

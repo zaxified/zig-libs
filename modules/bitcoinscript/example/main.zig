@@ -28,7 +28,7 @@ const SIGHASH_ALL: u32 = 1;
 /// The coinbase-like transaction that creates the output being spent.
 fn creditingTx(allocator: std.mem.Allocator, script_pubkey: []const u8, value: i64) !bitcointx.Transaction {
     const vin = try allocator.alloc(bitcointx.TxIn, 1);
-    vin[0] = .{ .prevout = .{ .txid = [_]u8{0} ** 32, .vout = 0xffffffff }, .script_sig = &.{}, .sequence = 0xffffffff };
+    vin[0] = .{ .prevout = .{ .txid = @as([32]u8, @splat(0)), .vout = 0xffffffff }, .script_sig = &.{}, .sequence = 0xffffffff };
     const vout = try allocator.alloc(bitcointx.TxOut, 1);
     vout[0] = .{ .value = value, .script_pubkey = script_pubkey };
     return .{ .version = 1, .vin = vin, .vout = vout, .witness = &.{}, .locktime = 0, .has_witness = false };
@@ -50,7 +50,7 @@ pub fn main() !void {
 
     // A deterministic key for a self-contained example — a real wallet
     // draws this from a proper CSPRNG/seed.
-    const seed: [32]u8 = [_]u8{0x11} ** 32;
+    const seed: [32]u8 = @as([32]u8, @splat(0x11));
     const kp = try EcdsaSecp256k1Sha256.KeyPair.generateDeterministic(seed);
     const pubkey = kp.public_key.toCompressedSec1();
 

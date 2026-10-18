@@ -52,7 +52,7 @@ pub fn main() !void {
     // in `update` (not just `compress` itself, already pinned by the KATs)
     // gets exercised.
     const one_unit = "zig-libs ripemd160 example: streaming a fresh payload across multiple 64-byte compression blocks, ";
-    const msg = one_unit ** 3;
+    const msg = strRepeat(one_unit, 3);
     // `openssl dgst -rmd160` on the exact same bytes — the external oracle
     // this example checks against, not a value this module computed for
     // itself.
@@ -106,4 +106,16 @@ fn hex20(comptime s: []const u8) [20]u8 {
     var out: [20]u8 = undefined;
     _ = std.fmt.hexToBytes(&out, s) catch unreachable;
     return out;
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

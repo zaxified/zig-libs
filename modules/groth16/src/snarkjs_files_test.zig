@@ -565,7 +565,7 @@ test "phase2.verify: tampered coefficients, B₂, α, a zero δ, an off-subgroup
     z.delta_g1 = d1;
 
     // On the twist, outside the order-r subgroup (bn254's own test point).
-    var c1_bytes = [_]u8{0} ** 32;
+    var c1_bytes = @as([32]u8, @splat(0));
     c1_bytes[31] = 1;
     var y0: [32]u8 = undefined;
     _ = try std.fmt.hexToBytes(&y0, "0cf32d3c49a2cb8a092f24ec3201e68dc299b6216e6321ee60573e3a7f596ea8");

@@ -320,7 +320,7 @@ pub const SshClient = struct {
         const auth_opts = if (opts.askpass_script) |script| blk: {
             const ap = try std.fmt.allocPrint(gpa, "{s}/askpass", .{dir_path});
             defer gpa.free(ap);
-            var f = try cwd.createFile(io, ap, .{ .permissions = @enumFromInt(0o755) });
+            var f = try cwd.createFile(io, ap, .{ .permissions = @fromBackingInt(@intCast(0o755)) });
             defer f.close(io);
             var fbuf: [1024]u8 = undefined;
             var fw = f.writer(io, &fbuf);
@@ -434,7 +434,7 @@ pub const SshClient = struct {
 };
 
 fn testHostKey(seed_byte: u8) server.HostKey {
-    const seed: [32]u8 = [_]u8{seed_byte} ** 32;
+    const seed: [32]u8 = @as([32]u8, @splat(seed_byte));
     return .{ .ed25519 = Ed25519.KeyPair.generateDeterministic(seed) catch unreachable };
 }
 

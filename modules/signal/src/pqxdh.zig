@@ -216,7 +216,7 @@ fn deriveSharedSecret(
     km_buf[len..][0..kem_shared_length].* = ss;
     len += kem_shared_length;
 
-    const salt = [_]u8{0} ** HkdfSha256.prk_length;
+    const salt = @as([HkdfSha256.prk_length]u8, @splat(0));
     const prk = HkdfSha256.extract(&salt, km_buf[0..len]);
     var sk: [shared_secret_length]u8 = undefined;
     HkdfSha256.expand(&sk, pqxdh_info, prk);

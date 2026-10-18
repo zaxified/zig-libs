@@ -273,7 +273,7 @@ pub const Element = struct {
 /// `frost.Identifier`/`bls12_381.threshold.frFromIndex`'s identical
 /// "small integer index" convention.
 fn scalarFromIndex(index: u32) Scalar {
-    var buf = [_]u8{0} ** Ns;
+    var buf = @as([Ns]u8, @splat(0));
     std.mem.writeInt(u32, buf[Ns - 4 .. Ns], index, .big);
     return Scalar.fromBytes(buf, .big) catch unreachable; // u32 << q: always canonical
 }
@@ -774,7 +774,7 @@ fn bigFromBytes(gpa: std.mem.Allocator, bytes: []const u8) !BigInt {
 const sieve_primes = blk: {
     @setEvalBranchQuota(20_000);
     const limit = 1024;
-    var composite = [_]bool{false} ** limit;
+    var composite = @as([limit]bool, @splat(false));
     var count: usize = 0;
     var i: usize = 3;
     while (i < limit) : (i += 2) {
@@ -2060,7 +2060,7 @@ const test_message_seeds = blk: {
 };
 
 fn testScalar(seed: u8) Scalar {
-    var buf = [_]u8{0} ** 48;
+    var buf = @as([48]u8, @splat(0));
     buf[47] = seed;
     return Scalar.fromBytes48(buf, .big);
 }
@@ -2906,7 +2906,7 @@ const Corpus = struct {
         a += 1;
         self.aux_entries[a] = fuzzSeedIntoLocal(&self.aux_store[a], real_aux[0 .. real_aux.len - 1]);
         a += 1; // truncated: h2 runs off the end
-        self.aux_entries[a] = fuzzSeedIntoLocal(&self.aux_store[a], &[_]u8{0} ** 12);
+        self.aux_entries[a] = fuzzSeedIntoLocal(&self.aux_store[a], &@as([12]u8, @splat(0)));
         a += 1; // three empty fields -- the one input this target ran
         self.aux_entries[a] = fuzzSeedIntoLocal(&self.aux_store[a], "");
         a += 1;

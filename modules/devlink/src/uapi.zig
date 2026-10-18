@@ -517,7 +517,7 @@ test "asU64 / appendAttrU64 round-trip and reject a wrong width" {
     try testing.expectError(error.BadLength, asU64((try it2.next()).?));
     // ... and so is one octet too wide.
     list.clearRetainingCapacity();
-    try codec.appendAttr(gpa, &list, ATTR.REGION_SIZE, &([_]u8{0} ** 9));
+    try codec.appendAttr(gpa, &list, ATTR.REGION_SIZE, &(@as([9]u8, @splat(0))));
     var it3: codec.AttrIterator = .{ .buf = list.items };
     try testing.expectError(error.BadLength, asU64((try it3.next()).?));
 }
@@ -526,14 +526,14 @@ test "copyName bounds the destination instead of truncating" {
     const gpa = testing.allocator;
     var list: std.ArrayList(u8) = .empty;
     defer list.deinit(gpa);
-    try codec.appendAttrString(gpa, &list, ATTR.PARAM_NAME, "a" ** 8);
+    try codec.appendAttrString(gpa, &list, ATTR.PARAM_NAME, strRepeat("a", 8));
     var it: codec.AttrIterator = .{ .buf = list.items };
     const a = (try it.next()).?;
 
     var buf: [8]u8 = undefined;
     var len: u8 = 0;
     try copyName(&buf, &len, a);
-    try testing.expectEqualStrings("a" ** 8, buf[0..len]);
+    try testing.expectEqualStrings(strRepeat("a", 8), buf[0..len]);
 
     var small: [7]u8 = undefined;
     try testing.expectError(error.BadLength, copyName(&small, &len, a));
@@ -554,10 +554,22 @@ test "isNotifyCommand separates multicast commands from request-only ones" {
 test "enums represent every value the kernel can send, including unknown ones" {
     // The `_` tag means a future kernel value round-trips instead of being
     // illegal behaviour.
-    try testing.expectEqual(PortType.eth, @as(PortType, @enumFromInt(2)));
-    try testing.expectEqual(@as(u16, 99), @intFromEnum(@as(PortFlavour, @enumFromInt(99))));
-    try testing.expectEqual(ParamCmode.driverinit, @as(ParamCmode, @enumFromInt(1)));
-    try testing.expectEqual(ParamType.u64_, @as(ParamType, @enumFromInt(4)));
-    try testing.expectEqual(HealthState.@"error", @as(HealthState, @enumFromInt(1)));
-    try testing.expectEqual(EswitchMode.switchdev, @as(EswitchMode, @enumFromInt(1)));
+    try testing.expectEqual(PortType.eth, @as(PortType, @fromBackingInt(@intCast(2))));
+    try testing.expectEqual(@as(u16, 99), @backingInt(@as(PortFlavour, @fromBackingInt(@intCast(99)))));
+    try testing.expectEqual(ParamCmode.driverinit, @as(ParamCmode, @fromBackingInt(@intCast(1))));
+    try testing.expectEqual(ParamType.u64_, @as(ParamType, @fromBackingInt(@intCast(4))));
+    try testing.expectEqual(HealthState.@"error", @as(HealthState, @fromBackingInt(@intCast(1))));
+    try testing.expectEqual(EswitchMode.switchdev, @as(EswitchMode, @fromBackingInt(@intCast(1))));
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

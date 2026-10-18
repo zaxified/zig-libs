@@ -61,10 +61,10 @@ pub fn damage(src: anytype, buf: []u8, frame: []const u8) usize {
 /// binary and fails with `error.HarnessDoesNotReach` if a label never fired.
 pub fn Marker(comptime Label: type) type {
     return struct {
-        var counts: [@typeInfo(Label).@"enum".fields.len]usize = @splat(0);
+        var counts: [@typeInfo(Label).@"enum".field_names.len]usize = @splat(0);
 
         pub fn mark(comptime l: Label) void {
-            counts[@intFromEnum(l)] += 1;
+            counts[@backingInt(l)] += 1;
             fuzz_driver.hit(@tagName(l));
         }
 
@@ -79,7 +79,7 @@ pub fn Marker(comptime Label: type) type {
                 };
             }
             for (counts, 0..) |n, i| if (n == 0) {
-                std.debug.print("reach: " ++ name ++ " label {t} never hit in {d} seeds\n", .{ @as(Label, @enumFromInt(i)), seeds });
+                std.debug.print("reach: " ++ name ++ " label {t} never hit in {d} seeds\n", .{ @as(Label, @fromBackingInt(@intCast(i))), seeds });
                 return error.HarnessDoesNotReach;
             };
         }
@@ -495,7 +495,7 @@ const escape_seeds = [_][]const u8{
     seed("\xff\xfe<"), // invalid UTF-8 before the markup
     seed("]]>"),
     seed("--><"),
-    seed("<" ** 64), // enough markup to walk any escaper's buffer growth
+    seed(strRepeat("<", 64)), // enough markup to walk any escaper's buffer growth
 };
 
 const EscMark = Marker(enum { rendered, refused, markup_in_datum });
@@ -749,8 +749,8 @@ const template_seeds = [_][]const u8{
     seedPair("{% if x is nosuchtest %}{% endif %}", ""), // and so is an unknown test
     seedPair("{% include 'x' %}", ""), // a composition tag with no loader
     seedPair("{% trans %}hi{% endtrans %}", ""), // a tag that is deliberately not implemented
-    seedPair("{{" ** 200, ""), // deep unbalanced nesting, well past the 1024 the buffer used to hold
-    seedPair("(" ** 4000, ""), // 4000 octets of one byte: past F4's expression-depth cliff
+    seedPair(strRepeat("{{", 200), ""), // deep unbalanced nesting, well past the 1024 the buffer used to hold
+    seedPair(strRepeat("(", 4000), ""), // 4000 octets of one byte: past F4's expression-depth cliff
 };
 
 test "fuzz: arbitrary bytes as a template never panic" {
@@ -778,7 +778,7 @@ const whitespace_seeds = [_][]const u8{
     seed("hello world"),
     seed("a{# one\ntwo #}b"),
     seed("{% for i in range(100000) %}xxxxxxxxxx{% endfor %}"),
-    seed("(" ** 2000), // half the whitespace buffer, all one byte
+    seed(strRepeat("(", 2000)), // half the whitespace buffer, all one byte
 };
 
 test "fuzz: arbitrary bytes with whitespace options never panic" {
@@ -1129,4 +1129,16 @@ test "fuzz harness: every harness, a few hundred seeds, reaches every outcome" {
 
 test "fuzz: arithmetic agrees with the closed form" {
     try std.testing.fuzz({}, smithOf(fuzzArith), .{});
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

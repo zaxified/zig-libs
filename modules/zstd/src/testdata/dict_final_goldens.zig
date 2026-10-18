@@ -7,7 +7,7 @@
 //! selection's total compressed size (a) -- or the error (`ZSTD_ErrorCode`;
 //! 1000: COVER_selectDict gave no selection).
 
-pub const Golden = struct { err: u32 = 0, len: usize = 0, hdr: i64 = 0, a: u64 = 0, b: u64 = 0, sha256: *const [64]u8 = "-" ** 64 };
+pub const Golden = struct { err: u32 = 0, len: usize = 0, hdr: i64 = 0, a: u64 = 0, b: u64 = 0, sha256: *const [64]u8 = strRepeat("-", 64) };
 
 pub const rows = [_]Golden{
     .{ .len = 1123, .hdr = 123, .a = 0, .b = 0, .sha256 = "18622a7d95015c70e68b4082001dafecb47798ca12f9671dece23d63dfa24318" }, // finalize json-200 2048 off=0 len=1000 fin=200 train=0 k=0 d=0 f=0 accel=0 steps=0 split=0 level=0 id=0 shrink=0/0
@@ -77,3 +77,15 @@ pub const rows = [_]Golden{
     .{ .len = 2615, .hdr = 115, .a = 16123, .b = 0, .sha256 = "2c702890f6e1975a484fb58aa6927101473355da9792a04f64776126bc7f84a0" }, // select csv-100 3000 off=0 len=2500 fin=75 train=75 k=0 d=0 f=0 accel=0 steps=0 split=0.75 level=19 id=1234 shrink=0/0
     .{ .len = 424, .hdr = 168, .a = 54933, .b = 0, .sha256 = "594f5ba79c94970bf3cfdfc34d324441c5b7ab8a92d888bdd27f2b93edca4848" }, // select mix-400 1500 off=77 len=1000 fin=300 train=200 k=0 d=0 f=0 accel=0 steps=0 split=0.5 level=0 id=0 shrink=1/50
 };
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
+}

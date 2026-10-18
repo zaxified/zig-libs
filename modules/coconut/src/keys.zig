@@ -406,7 +406,7 @@ test "keygen: any t shares Lagrange-reconstruct the master secret key vector" {
     const subset = [_]usize{ 1, 2 }; // 0-based into sk_shares → indices 2,3
     const idxs = [_]u64{ keys.sk_shares[subset[0]].index, keys.sk_shares[subset[1]].index };
     var x_rec = Fr.zero;
-    var y_rec = [_]Fr{Fr.zero} ** 3;
+    var y_rec = @as([3]Fr, @splat(Fr.zero));
     for (subset) |si| {
         const share = keys.sk_shares[si];
         const l = try lagrange.coefficientAtZero(&idxs, share.index);
@@ -456,7 +456,7 @@ test "SecretKey/SecretKeyShare.deinit zeroes the secret Fr material" {
 }
 
 fn commitFr(v: u32) Fr {
-    var buf: [32]u8 = [_]u8{0} ** 32;
+    var buf: [32]u8 = @as([32]u8, @splat(0));
     std.mem.writeInt(u32, buf[28..32], v, .big);
     return Fr.fromBytes(buf) catch unreachable;
 }

@@ -84,7 +84,7 @@ const message = hexBytes("da9b9399d45edcc8e52a1901c6b756d2171b024663ac6ea49d7098
 // Fixed (not random) so the signature below is reproducible byte-for-byte
 // for the offline `embit` cross-check documented above — a real signer
 // must use actual randomness here, not a hardcoded constant.
-const aux_rand = [_]u8{0x24} ** 32;
+const aux_rand = @as([32]u8, @splat(0x24));
 
 pub fn main() !void {
     var threaded: std.Io.Threaded = .init_single_threaded;

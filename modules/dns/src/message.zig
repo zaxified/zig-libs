@@ -263,7 +263,7 @@ pub const Message = struct {
         for (m.additionals) |r| {
             if (r.data == .opt) v |= @as(u12, r.data.opt.extended_rcode) << 4;
         }
-        return @enumFromInt(v);
+        return @fromBackingInt(@intCast(v));
     }
 };
 
@@ -313,11 +313,11 @@ fn writeQuery(
     try w.writeInt(u16, 0, .big); // NSCOUNT
     try w.writeInt(u16, @intFromBool(options.edns_udp_size != null), .big); // ARCOUNT
     try writeName(w, name);
-    try w.writeInt(u16, @intFromEnum(ty), .big);
-    try w.writeInt(u16, @intFromEnum(Class.in), .big);
+    try w.writeInt(u16, @backingInt(ty), .big);
+    try w.writeInt(u16, @backingInt(Class.in), .big);
     if (options.edns_udp_size) |size| {
         try w.writeByte(0); // root name
-        try w.writeInt(u16, @intFromEnum(Type.opt), .big);
+        try w.writeInt(u16, @backingInt(Type.opt), .big);
         try w.writeInt(u16, size, .big); // class = payload size
         try w.writeInt(u32, 0, .big); // ttl = extended RCODE + flags
         try w.writeInt(u16, 0, .big); // RDLENGTH
@@ -380,7 +380,7 @@ pub fn decode(gpa: std.mem.Allocator, bytes: []const u8) DecodeError!Message {
     const header: Header = .{
         .id = id,
         .response = flags & 0x8000 != 0,
-        .opcode = @enumFromInt(@as(u4, @truncate(flags >> 11))),
+        .opcode = @fromBackingInt(@intCast(@as(u4, @truncate(flags >> 11)))),
         .authoritative = flags & 0x0400 != 0,
         .truncated = flags & 0x0200 != 0,
         .recursion_desired = flags & 0x0100 != 0,
@@ -523,8 +523,8 @@ fn takeQuestions(d: *Decoder, arena: std.mem.Allocator, count: u16) DecodeError!
     const questions = try arena.alloc(Question, count);
     for (questions) |*q| {
         const name = try d.takeName(arena);
-        const ty: Type = @enumFromInt(try d.takeInt(u16));
-        const class: Class = @enumFromInt(try d.takeInt(u16));
+        const ty: Type = @fromBackingInt(@intCast(try d.takeInt(u16)));
+        const class: Class = @fromBackingInt(@intCast(try d.takeInt(u16)));
         q.* = .{ .name = name, .ty = ty, .class = class };
     }
     return questions;
@@ -540,7 +540,7 @@ fn takeRecords(d: *Decoder, arena: std.mem.Allocator, count: u16) DecodeError![]
 fn takeRecord(d: *Decoder, arena: std.mem.Allocator) DecodeError!Record {
     const owner = try d.takeOwnerName(arena);
     const name = owner.name;
-    const ty: Type = @enumFromInt(try d.takeInt(u16));
+    const ty: Type = @fromBackingInt(@intCast(try d.takeInt(u16)));
     const class_raw = try d.takeInt(u16);
     const ttl = try d.takeInt(u32);
     const rdlength = try d.takeInt(u16);
@@ -644,7 +644,7 @@ fn takeRecord(d: *Decoder, arena: std.mem.Allocator) DecodeError!Record {
     return .{
         .name = name,
         .ty = ty,
-        .class = @enumFromInt(class_raw),
+        .class = @fromBackingInt(@intCast(class_raw)),
         .ttl = ttl,
         .data = data,
         .labels = owner.labels,
@@ -710,11 +710,11 @@ test "encodeQuery: root name" {
 
 test "encodeQuery: name validation errors" {
     var buf: [max_query_len]u8 = undefined;
-    const long_label = "a" ** 64 ++ ".com";
+    const long_label = strRepeat("a", 64) ++ ".com";
     try testing.expectError(error.BadName, encodeQuery(&buf, long_label, .a, .{}));
     try testing.expectError(error.BadName, encodeQuery(&buf, "a..b", .a, .{}));
     try testing.expectError(error.BadName, encodeQuery(&buf, "..", .a, .{}));
-    const too_long = ("abcdefg." ** 32) ++ "x"; // 257 chars
+    const too_long = (strRepeat("abcdefg.", 32)) ++ "x"; // 257 chars
     try testing.expectError(error.NameTooLong, encodeQuery(&buf, too_long, .a, .{}));
 
     var tiny: [10]u8 = undefined;
@@ -723,13 +723,13 @@ test "encodeQuery: name validation errors" {
 
 test "encodeQuery: 63-byte label and 253-char name are accepted" {
     var buf: [max_query_len]u8 = undefined;
-    const label63 = "a" ** 63;
+    const label63 = strRepeat("a", 63);
     _ = try encodeQuery(&buf, label63 ++ ".com", .a, .{});
     // 4×63 + 3 dots = 255 → too long; 3×63+61+3 = 253 → ok.
-    const name253 = label63 ++ "." ++ label63 ++ "." ++ label63 ++ "." ++ "b" ** 61;
+    const name253 = label63 ++ "." ++ label63 ++ "." ++ label63 ++ "." ++ strRepeat("b", 61);
     comptime std.debug.assert(name253.len == 253);
     _ = try encodeQuery(&buf, name253, .a, .{});
-    const name254 = label63 ++ "." ++ label63 ++ "." ++ label63 ++ "." ++ "b" ** 62;
+    const name254 = label63 ++ "." ++ label63 ++ "." ++ label63 ++ "." ++ strRepeat("b", 62);
     try testing.expectError(error.NameTooLong, encodeQuery(&buf, name254, .a, .{}));
 }
 
@@ -876,7 +876,7 @@ test "decode: MX/TXT/NS/unknown answers, SOA authority, OPT additional" {
 
     try testing.expectEqualStrings("ns.test.zone", msg.answers[2].data.ns);
 
-    try testing.expectEqual(@as(u16, 99), @intFromEnum(msg.answers[3].ty));
+    try testing.expectEqual(@as(u16, 99), @backingInt(msg.answers[3].ty));
     try testing.expectEqualSlices(u8, "\xde\xad", msg.answers[3].data.unknown);
 
     try testing.expectEqual(@as(usize, 1), msg.authorities.len);
@@ -1152,10 +1152,10 @@ test "decode: hostile ANCOUNT/QDCOUNT are refused BEFORE the section is allocate
     // claimed over 1000 bytes. WHY refused: the smallest record is 11 bytes
     // (`min_record_wire`: root name, type, class, ttl, rdlength), so 1000 of
     // them cannot fit in 1000 bytes.
-    const thousand = "\x00\x00\x00\x00\x00\x00\x03\xe8\x00\x00\x00\x00" ++ "\x00" ** 1000;
+    const thousand = "\x00\x00\x00\x00\x00\x00\x03\xe8\x00\x00\x00\x00" ++ strRepeat("\x00", 1000);
     try testing.expectError(error.Truncated, decode(gpa, thousand));
     // And a legitimate small packet still decodes under the same limit.
-    var ok = try decode(gpa, "\x00\x01\x80\x00" ++ "\x00\x00" ** 4);
+    var ok = try decode(gpa, "\x00\x01\x80\x00" ++ strRepeat("\x00\x00", 4));
     ok.deinit();
 }
 
@@ -1199,10 +1199,10 @@ test "decode: bad rdata lengths are rejected" {
     // RDATA. Without the `d.pos > rdata_end` guard this decoded, with
     // `serial = 0x11223344` taken from the next record's bytes.
     try expectDecodeError(error.BadRecord, head ++ "\x01a\x00" ++ "\x00\x06\x00\x01" ++
-        "\x00\x00\x00\x00" ++ "\x00\x04" ++ "\x00\x00\x11\x22" ++ "\x33\x44" ++ "\x00" ** 20);
+        "\x00\x00\x00\x00" ++ "\x00\x04" ++ "\x00\x00\x11\x22" ++ "\x33\x44" ++ strRepeat("\x00", 20));
     // MX with RDLENGTH 2: the exchange name would come from past the RDATA.
     try expectDecodeError(error.BadRecord, head ++ "\x01a\x00" ++ "\x00\x0f\x00\x01" ++
-        "\x00\x00\x00\x00" ++ "\x00\x02" ++ "\x00\x0a" ++ "\x02mx\x00" ++ "\x00" ** 4);
+        "\x00\x00\x00\x00" ++ "\x00\x02" ++ "\x00\x0a" ++ "\x02mx\x00" ++ strRepeat("\x00", 4));
     // SOA whose MNAME alone runs past RDLENGTH 1 at the packet end. WHY
     // BadRecord, not Truncated: `DecodeError.BadRecord` is "an rdata name
     // running past RDLENGTH", and that is the first thing wrong here. Without
@@ -1217,8 +1217,8 @@ test "decode: a 253-char name decodes (the RFC 1035 limit is inclusive)" {
     // text. The encoder's edge is pinned above; the decoder's own cap was
     // not (mutation 2026-10-04: a 252-char cap survived).
     var buf: [max_query_len]u8 = undefined;
-    const label63 = "a" ** 63;
-    const name253 = label63 ++ "." ++ label63 ++ "." ++ label63 ++ "." ++ "b" ** 61;
+    const label63 = strRepeat("a", 63);
+    const name253 = label63 ++ "." ++ label63 ++ "." ++ label63 ++ "." ++ strRepeat("b", 61);
     const q = try encodeQuery(&buf, name253, .a, .{});
     var msg = try decode(testing.allocator, q);
     defer msg.deinit();
@@ -1232,7 +1232,7 @@ fn pointerChain(buf: []u8, jumps: usize) []const u8 {
     var w: std.Io.Writer = .fixed(buf);
     w.writeAll("\x00\x00\x80\x00") catch unreachable;
     w.writeInt(u16, @intCast(jumps + 1), .big) catch unreachable;
-    w.writeAll("\x00\x00" ** 3) catch unreachable;
+    w.writeAll(strRepeat("\x00\x00", 3)) catch unreachable;
     var prev: usize = header_len;
     w.writeAll("\x01a\x00\x00\x01\x00\x01") catch unreachable;
     for (0..jumps) |_| {
@@ -1278,7 +1278,19 @@ test "decode: empty and header-only packets" {
     try expectDecodeError(error.Truncated, "");
     try expectDecodeError(error.Truncated, "\x00\x01\x80");
     // A bare header with zero counts is a valid (empty) message.
-    var msg = try decode(testing.allocator, "\x00\x01\x80\x00" ++ "\x00\x00" ** 4);
+    var msg = try decode(testing.allocator, "\x00\x01\x80\x00" ++ strRepeat("\x00\x00", 4));
     defer msg.deinit();
     try testing.expectEqual(@as(usize, 0), msg.questions.len);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

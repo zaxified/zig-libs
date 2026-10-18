@@ -130,7 +130,7 @@ test "fromBytes/toBytes round-trip on a synthetic packet" {
     const pkt = OnionPacket{
         .public_key = hexBytes(pubkey_len, "02eec7245d6b7d2ccb30380bfbe2a3648cd7a942653f5aa340edcea1f283686619"),
         .hop_payloads = hop_payloads,
-        .hmac = [_]u8{0xab} ** hmac_len,
+        .hmac = @as([hmac_len]u8, @splat(0xab)),
     };
     const bytes = pkt.toBytes();
     const parsed = try OnionPacket.fromBytes(bytes);
@@ -142,7 +142,7 @@ test "fromBytes/toBytes round-trip on a synthetic packet" {
 }
 
 test "fromBytes rejects a non-zero version byte" {
-    var bytes = [_]u8{0} ** packet_len;
+    var bytes = @as([packet_len]u8, @splat(0));
     bytes[0] = 1;
     // Fill in a valid pubkey so UnsupportedVersion is the only possible failure.
     bytes[1..][0..pubkey_len].* = hexBytes(pubkey_len, "02eec7245d6b7d2ccb30380bfbe2a3648cd7a942653f5aa340edcea1f283686619");
@@ -150,7 +150,7 @@ test "fromBytes rejects a non-zero version byte" {
 }
 
 test "fromBytes rejects an invalid public_key encoding" {
-    var bytes = [_]u8{0} ** packet_len;
+    var bytes = @as([packet_len]u8, @splat(0));
     bytes[0] = version_byte;
     // 0x01 is not one of SEC1's defined encoding-type bytes (0 = identity,
     // 2/3 = compressed, 4 = uncompressed) — `Secp256k1.fromSec1` rejects it
@@ -211,10 +211,10 @@ const decode_seeds = [_][]const u8{
     fuzzseed.seed(&wire(version_byte, "03eec7245d6b7d2ccb30380bfbe2a3648cd7a942653f5aa340edcea1f283686619", 0x5a, 0xa5, 0)), // the odd-y sign byte for the same x
     fuzzseed.seed(&wire(1, good_pubkey_hex, 0x00, 0x00, 0)), // UnsupportedVersion, with a valid key so nothing else can fail first
     fuzzseed.seed(&wire(0xff, good_pubkey_hex, 0x00, 0x00, 0)), // the same at the far end of the version octet
-    fuzzseed.seed(&wire(version_byte, "01" ++ "00" ** 32, 0x00, 0x00, 0)), // 0x01 is not a SEC1 encoding type: InvalidPublicKey
-    fuzzseed.seed(&wire(version_byte, "00" ** 33, 0x00, 0x00, 0)), // 33 zero octets: the identity encoding padded out
-    fuzzseed.seed(&wire(version_byte, "02" ++ "00" ** 32, 0x00, 0x00, 0)), // ⭐ a well-formed prefix over x = 0, which is not on the curve
-    fuzzseed.seed(&wire(version_byte, "02" ++ "ff" ** 32, 0x00, 0x00, 0)), // x above the field prime: the non-canonical branch
+    fuzzseed.seed(&wire(version_byte, "01" ++ strRepeat("00", 32), 0x00, 0x00, 0)), // 0x01 is not a SEC1 encoding type: InvalidPublicKey
+    fuzzseed.seed(&wire(version_byte, strRepeat("00", 33), 0x00, 0x00, 0)), // 33 zero octets: the identity encoding padded out
+    fuzzseed.seed(&wire(version_byte, "02" ++ strRepeat("00", 32), 0x00, 0x00, 0)), // ⭐ a well-formed prefix over x = 0, which is not on the curve
+    fuzzseed.seed(&wire(version_byte, "02" ++ strRepeat("ff", 32), 0x00, 0x00, 0)), // x above the field prime: the non-canonical branch
     fuzzseed.seed(good_packet[0 .. packet_len - 1]), // ⭐ one octet short of the exact length
     fuzzseed.seed(&wire(version_byte, good_pubkey_hex, 0x00, 0x00, 1)), // ⭐ one octet over
     fuzzseed.seed(&wire(version_byte, good_pubkey_hex, 0x00, 0x00, 8)), // eight over, still inside the buffer
@@ -270,4 +270,16 @@ test "corpus: every seed reaches fromSlice, and which of them get past the lengt
     try testing.expectEqual(@as(usize, 9), past_length);
     try testing.expectEqual(@as(usize, 3), accepted);
     try testing.expectEqual(accepted, round_tripped);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

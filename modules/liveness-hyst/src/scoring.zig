@@ -137,7 +137,7 @@ test "scoring: a continuously-degraded-but-usable link stays within the spurious
 // to 2 simulated days for Debug (still several duty-cycle periods per run);
 // the 30%-down and continuously-degraded tests above, whose assertions ARE
 // stated in per-WEEK units, are untouched in every mode.
-const sweep_until: Time = if (builtin.mode == .Debug) 2 * 24 * 60 * 60 * SEC else WEEK;
+const sweep_until: Time = if (builtin.mode == .debug) 2 * 24 * 60 * 60 * SEC else WEEK;
 
 test "scoring: the flapping corpus generator covers a duty-cycle sweep" {
     const gpa = testing.allocator;

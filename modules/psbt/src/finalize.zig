@@ -856,9 +856,9 @@ pub fn extract(allocator: Allocator, ps: psbt.Psbt) ExtractError!bitcointx.Trans
 const testing = std.testing;
 
 test "parseMultisig recognizes a 2-of-3 OP_CHECKMULTISIG script" {
-    const pk1 = [_]u8{0x02} ++ [_]u8{0xaa} ** 32;
-    const pk2 = [_]u8{0x03} ++ [_]u8{0xbb} ** 32;
-    const pk3 = [_]u8{0x02} ++ [_]u8{0xcc} ** 32;
+    const pk1 = [_]u8{0x02} ++ @as([32]u8, @splat(0xaa));
+    const pk2 = [_]u8{0x03} ++ @as([32]u8, @splat(0xbb));
+    const pk3 = [_]u8{0x02} ++ @as([32]u8, @splat(0xcc));
     var script: std.ArrayList(u8) = .empty;
     defer script.deinit(testing.allocator);
     try script.append(testing.allocator, 0x52); // OP_2
@@ -882,12 +882,12 @@ test "parseMultisig rejects a non-multisig script" {
 }
 
 test "parseWitnessProgram: P2WPKH and P2WSH shapes" {
-    var p2wpkh = [_]u8{ 0x00, 0x14 } ++ [_]u8{0xaa} ** 20;
+    var p2wpkh = [_]u8{ 0x00, 0x14 } ++ @as([20]u8, @splat(0xaa));
     const wp1 = parseWitnessProgram(&p2wpkh) orelse return error.TestUnexpectedResult;
     try testing.expectEqual(@as(u8, 0), wp1.version);
     try testing.expectEqual(@as(usize, 20), wp1.program.len);
 
-    var p2wsh = [_]u8{ 0x00, 0x20 } ++ [_]u8{0xbb} ** 32;
+    var p2wsh = [_]u8{ 0x00, 0x20 } ++ @as([32]u8, @splat(0xbb));
     const wp2 = parseWitnessProgram(&p2wsh) orelse return error.TestUnexpectedResult;
     try testing.expectEqual(@as(u8, 0), wp2.version);
     try testing.expectEqual(@as(usize, 32), wp2.program.len);
@@ -903,16 +903,16 @@ test "parseWitnessProgram: BIP141's extremes (2- and 40-octet programs, version 
     const wp = parseWitnessProgram(&v16_min) orelse return error.TestUnexpectedResult;
     try testing.expectEqual(@as(u8, 16), wp.version);
     try testing.expectEqual(@as(usize, 2), wp.program.len);
-    var v1_max = [_]u8{ 0x51, 40 } ++ [_]u8{0xcc} ** 40;
+    var v1_max = [_]u8{ 0x51, 40 } ++ @as([40]u8, @splat(0xcc));
     try testing.expectEqual(@as(usize, 40), (parseWitnessProgram(&v1_max) orelse return error.TestUnexpectedResult).program.len);
-    try testing.expect(parseWitnessProgram(&([_]u8{ 0x51, 41 } ++ [_]u8{0xcc} ** 41)) == null);
+    try testing.expect(parseWitnessProgram(&([_]u8{ 0x51, 41 } ++ @as([41]u8, @splat(0xcc)))) == null);
     _ = &v16_min;
     _ = &v1_max;
 }
 
 test "parseMultisig refuses m > n, bytes after OP_CHECKMULTISIG, and a 17th key" {
     // Mutation run 2026-10-05: none of the three refusals had a test.
-    const pk = [_]u8{0x02} ++ [_]u8{0xaa} ** 32;
+    const pk = [_]u8{0x02} ++ @as([32]u8, @splat(0xaa));
     const a = testing.allocator;
     var s: std.ArrayList(u8) = .empty;
     defer s.deinit(a);
@@ -962,7 +962,7 @@ test "appendPush: minimal-push encoding, including the empty (OP_0) dummy" {
     {
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(allocator);
-        const data = [_]u8{0xab} ** 33;
+        const data = @as([33]u8, @splat(0xab));
         try appendPush(&buf, allocator, &data);
         try testing.expectEqual(@as(u8, 33), buf.items[0]);
         try testing.expectEqual(@as(usize, 34), buf.items.len);
@@ -984,7 +984,7 @@ test "encodeWitnessStack / decodeWitnessStack round-trip" {
 
 test "hostile: decodeWitnessStack rejects a count exceeding remaining bytes, no over-allocation" {
     // CompactSize count = 0xff-class claiming ~2^64 items, nothing follows.
-    const bytes = [_]u8{0xff} ++ [_]u8{0xff} ** 8;
+    const bytes = [_]u8{0xff} ++ @as([8]u8, @splat(0xff));
     try testing.expectError(error.Truncated, decodeWitnessStack(testing.allocator, &bytes));
 }
 

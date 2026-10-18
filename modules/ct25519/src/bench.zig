@@ -117,7 +117,7 @@ test "bench (opt-in via CT25519_BENCH)" {
     var scalars: [nscalars][32]u8 = undefined;
     for (&scalars) |*s| random.bytes(s);
     for (&scalars) |*s| s.* = Edwards25519.scalar.reduce(s.*); // std refuses nothing reduced and nonzero
-    const pv = try Ristretto255.fromBytes((try Ristretto255.basePoint.mul([_]u8{7} ++ [_]u8{0} ** 31)).toBytes());
+    const pv = try Ristretto255.fromBytes((try Ristretto255.basePoint.mul([_]u8{7} ++ @as([31]u8, @splat(0)))).toBytes());
 
     const iters = 2000;
     var chk: u8 = 0;

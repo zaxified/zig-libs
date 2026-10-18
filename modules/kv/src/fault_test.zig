@@ -60,7 +60,7 @@ fn fixedNow(_: ?*anyopaque) i64 {
 const test_clock: kv.Clock = .{ .nowFn = fixedNow };
 const test_options: kv.Options = .{ .clock = test_clock };
 
-const big_value = "B" ** 3000; // multi-chunk on the replay CRC path
+const big_value = strRepeat("B", 3000); // multi-chunk on the replay CRC path
 
 const script = [_]Step{
     .{ .put = .{ .k = "alpha", .v = "1" } },
@@ -647,4 +647,16 @@ test "fault sweep is deterministic across repeats" {
         defer for (contents) |c| testing.allocator.free(c);
         try testing.expectEqualSlices(u8, contents[0], contents[1]);
     }
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

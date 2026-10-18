@@ -327,7 +327,7 @@ pub const NodeClass = enum(u32) { unspecified = 0, object = 1, variable = 2, met
 pub const MonitoringMode = enum(u32) { disabled = 0, sampling = 1, reporting = 2 };
 
 fn encodeEnum(e: *encoding.Encoder, comptime T: type, v: T) encoding.EncodeError!void {
-    try e.writer.writeInt(u32, @intFromEnum(v), .little);
+    try e.writer.writeInt(u32, @backingInt(v), .little);
 }
 
 fn decodeEnum(d: *encoding.Decoder, comptime T: type) encoding.DecodeError!T {
@@ -3246,7 +3246,7 @@ pub const Channel = struct {
             if (ch.security) |sec| if (sec.mode != .none) {
                 var header_bytes: [8]u8 = undefined;
                 header_bytes[0..3].* = chunk.header.message_type.code().*;
-                header_bytes[3] = @intFromEnum(chunk.header.chunk_type);
+                header_bytes[3] = @backingInt(chunk.header.chunk_type);
                 std.mem.writeInt(u32, header_bytes[4..8], chunk.header.message_size, .little);
                 opened = switch (message_type) {
                     .open_secure_channel => blk: {
@@ -3623,7 +3623,7 @@ test "CreateSessionRequest/Response round-trip (incl. nested EndpointDescription
             .additional_header = no_additional_header,
         },
         .session_id = .{ .numeric = .{ .namespace = 1, .id = 100 } },
-        .authentication_token = .{ .guid = .{ .namespace = 0, .id = .{ .data1 = 1, .data2 = 2, .data3 = 3, .data4 = .{0} ** 8 } } },
+        .authentication_token = .{ .guid = .{ .namespace = 0, .id = .{ .data1 = 1, .data2 = 2, .data3 = 3, .data4 = @splat(0) } } },
         .revised_session_timeout = 1_200_000.0,
         .server_nonce = &.{ 1, 2, 3 },
         .server_certificate = null,
@@ -3931,11 +3931,11 @@ test "AttributeId/TimestampsToReturn/BrowseDirection/NodeClass: ground-truthed c
     try testing.expectEqual(@as(u32, 13), attribute_id.value);
     try testing.expectEqual(@as(u32, 1), attribute_id.node_id);
     try testing.expectEqual(@as(u32, 27), attribute_id.access_level_ex);
-    try testing.expectEqual(@as(u32, 0), @intFromEnum(TimestampsToReturn.source));
-    try testing.expectEqual(@as(u32, 2), @intFromEnum(TimestampsToReturn.both));
-    try testing.expectEqual(@as(u32, 0), @intFromEnum(BrowseDirection.forward));
-    try testing.expectEqual(@as(u32, 1), @intFromEnum(NodeClass.object));
-    try testing.expectEqual(@as(u32, 2), @intFromEnum(NodeClass.variable));
+    try testing.expectEqual(@as(u32, 0), @backingInt(TimestampsToReturn.source));
+    try testing.expectEqual(@as(u32, 2), @backingInt(TimestampsToReturn.both));
+    try testing.expectEqual(@as(u32, 0), @backingInt(BrowseDirection.forward));
+    try testing.expectEqual(@as(u32, 1), @backingInt(NodeClass.object));
+    try testing.expectEqual(@as(u32, 2), @backingInt(NodeClass.variable));
 }
 
 test "ReadValueId/ReadRequest/ReadResponse round-trip (incl. Variant-array DataValue)" {
@@ -4199,9 +4199,9 @@ test "ServiceFault-shaped ReadResponse: BadServiceResult surfaces via isBad" {
 test "MonitoringMode: ground-truthed constant values" {
     // OPC Foundation UA-Nodeset Schema/Opc.Ua.Types.bsd `MonitoringMode`
     // EnumeratedType, fetched directly during implementation.
-    try testing.expectEqual(@as(u32, 0), @intFromEnum(MonitoringMode.disabled));
-    try testing.expectEqual(@as(u32, 1), @intFromEnum(MonitoringMode.sampling));
-    try testing.expectEqual(@as(u32, 2), @intFromEnum(MonitoringMode.reporting));
+    try testing.expectEqual(@as(u32, 0), @backingInt(MonitoringMode.disabled));
+    try testing.expectEqual(@as(u32, 1), @backingInt(MonitoringMode.sampling));
+    try testing.expectEqual(@as(u32, 2), @backingInt(MonitoringMode.reporting));
 }
 
 test "well-known Encoding_DefaultBinary NodeIds: Part 5 constants" {

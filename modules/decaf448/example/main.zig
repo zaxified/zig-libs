@@ -183,7 +183,7 @@ pub fn main() !void {
     // (1) `s >= p`: RFC 9496 explicitly rejects non-canonical field
     // encodings (unlike RFC 7748's field decode). All-0xff bytes encode a
     // value far above p (p == 2^448 - 2^224 - 1).
-    if (Element.decode([_]u8{0xff} ** 56)) |_| {
+    if (Element.decode(@as([56]u8, @splat(0xff)))) |_| {
         return error.UnexpectedAccept;
     } else |err| switch (err) {
         error.NonCanonical => std.debug.print("all-0xff encoding: NonCanonical (expected)\n", .{}),
@@ -192,7 +192,7 @@ pub fn main() !void {
 
     // (2) `IS_NEGATIVE(s)`: s = 1 is canonical (trivially < p) but odd, so
     // step 2 of decode rejects it before any curve math runs at all.
-    var negative_bytes = [_]u8{0} ** 56;
+    var negative_bytes = @as([56]u8, @splat(0));
     negative_bytes[0] = 1;
     if (Element.decode(negative_bytes)) |_| {
         return error.UnexpectedAccept;

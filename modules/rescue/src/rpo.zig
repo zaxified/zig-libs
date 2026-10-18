@@ -286,7 +286,7 @@ test "Rpo256: domain separation actually separates" {
     try std.testing.expectEqual(Rpo256.merge(a, b), Rpo256.mergeInDomain(a, b, 0));
     try std.testing.expect(!std.meta.eql(Rpo256.merge(a, b), Rpo256.mergeInDomain(a, b, 1)));
     // Byte hashing is separated from element hashing by the +8 capacity flag.
-    const eight_zero_bytes = [_]u8{0} ** 8;
+    const eight_zero_bytes = @as([8]u8, @splat(0));
     try std.testing.expect(!std.meta.eql(
         Rpo256.hash(&eight_zero_bytes),
         Rpo256.hashElements(&.{ 0, 0 }),

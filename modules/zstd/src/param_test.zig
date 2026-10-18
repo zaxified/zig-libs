@@ -265,7 +265,7 @@ test "switching the row match finder off lifts its cap on the hash log" {
 
 test "a magicless frame is the frame without its magic number, and needs a decoder told so" {
     const gpa = std.testing.allocator;
-    const src = "magicless, magicless, magicless frames" ** 20;
+    const src = strRepeat("magicless, magicless, magicless frames", 20);
     for ([_]bool{ false, true }) |ck| {
         const plain = try zstd.compressAlloc(gpa, src, .{ .checksum = ck });
         defer gpa.free(plain);
@@ -316,7 +316,7 @@ test "a magicless frame is the frame without its magic number, and needs a decod
 
 test "without the content size flag the header records no size" {
     const gpa = std.testing.allocator;
-    for ([_][]const u8{ "", "x", "abcabcabcabc" ** 100 }) |src| {
+    for ([_][]const u8{ "", "x", strRepeat("abcabcabcabc", 100) }) |src| {
         const z = try zstd.compressAlloc(gpa, src, .{ .advanced = .{ .content_size = false } });
         defer gpa.free(z);
         try std.testing.expectEqual(@as(?u64, null), try zstd.getFrameContentSize(z));
@@ -328,7 +328,7 @@ test "without the content size flag the header records no size" {
 
 test "FrameWriter frames carry the advanced parameters" {
     const gpa = std.testing.allocator;
-    const src = "frame writer, frame writer, frame writer" ** 30;
+    const src = strRepeat("frame writer, frame writer, frame writer", 30);
     const adv: zstd.Advanced = .{ .format = .magicless, .content_size = false, .strategy = .btopt };
     const one = try zstd.compressAlloc(gpa, src, .{ .level = 3, .advanced = adv });
     defer gpa.free(one);
@@ -416,7 +416,7 @@ test "getCParams gives ZSTD_getCParams' parameters" {
     };
     for (cases) |c| {
         const cp = zstd.getCParams(c.level, c.size, c.dict);
-        const got = [7]u32{ cp.window_log, cp.chain_log, cp.hash_log, cp.search_log, cp.min_match, cp.target_length, @intFromEnum(cp.strategy) };
+        const got = [7]u32{ cp.window_log, cp.chain_log, cp.hash_log, cp.search_log, cp.min_match, cp.target_length, @backingInt(cp.strategy) };
         try std.testing.expectEqualSlices(u32, &c.want, &got);
     }
 }
@@ -440,9 +440,9 @@ fn answerQuery(line: []const u8) ![7]u32 {
             .search_log = @truncate(v[3]),
             .min_match = @truncate(v[4]),
             .target_length = @truncate(v[5]),
-            .strategy = @enumFromInt(v[6]),
+            .strategy = @fromBackingInt(@intCast(v[6])),
         }, v[7], v[8]);
-    return .{ cp.window_log, cp.chain_log, cp.hash_log, cp.search_log, cp.min_match, cp.target_length, @intFromEnum(cp.strategy) };
+    return .{ cp.window_log, cp.chain_log, cp.hash_log, cp.search_log, cp.min_match, cp.target_length, @backingInt(cp.strategy) };
 }
 
 test "adjustCParams and getCParams answer as ZSTD_adjustCParams and ZSTD_getCParams" {
@@ -488,4 +488,16 @@ test "adjustCParams clamps as libzstd does, then shrinks to the sizes" {
     try std.testing.expectEqual(@as(u32, 28), zstd.adjustCParams(lazy, null, 0).hash_log);
     // a dictionary with an unknown size keeps the window, not the tables
     try std.testing.expectEqual(@as(u32, 27), zstd.adjustCParams(lazy, null, 1 << 20).window_log);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

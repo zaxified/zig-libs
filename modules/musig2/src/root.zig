@@ -98,7 +98,7 @@ pub const nonce_tag = "MuSig/nonce";
 /// locally rather than imported: `bip340` does not export its private
 /// `reduceToScalar`.
 fn reduceToScalar(bytes32: [32]u8) Scalar {
-    var wide = [_]u8{0} ** 48;
+    var wide = @as([48]u8, @splat(0));
     wide[16..48].* = bytes32;
     return Scalar.fromBytes48(wide, .big);
 }
@@ -160,7 +160,7 @@ const cbytes = Secp256k1.toCompressedSec1;
 /// BIP327 `cbytes_ext(P)`: `bytes(33, 0)` if `P` is `null` (infinity), else
 /// `cbytes(P)`.
 fn cbytesExt(p: ?Secp256k1) [33]u8 {
-    return if (p) |point| cbytes(point) else [_]u8{0} ** 33;
+    return if (p) |point| cbytes(point) else @as([33]u8, @splat(0));
 }
 
 // ── PlainPublicKey (33-byte compressed individual public key) ─────────────
@@ -457,11 +457,11 @@ fn hashKeys(pks: []const PlainPublicKey) [32]u8 {
 /// coefficient-1 shortcut — every `a_i` is computed via the hash formula,
 /// since the marker can never equal a real parsed pubkey). REAL.
 fn getSecondKey(pks: []const PlainPublicKey) [33]u8 {
-    if (pks.len == 0) return [_]u8{0} ** 33;
+    if (pks.len == 0) return @as([33]u8, @splat(0));
     for (pks[1..]) |pk| {
         if (!std.mem.eql(u8, &pk.bytes, &pks[0].bytes)) return pk.bytes;
     }
-    return [_]u8{0} ** 33;
+    return @as([33]u8, @splat(0));
 }
 
 /// Internal Algorithm `KeyAggCoeffInternal(pk_1..u, pk', pk2)` (BIP327),
@@ -1122,10 +1122,10 @@ test "encoded_length constants match BIP327's wire sizes" {
 }
 
 test "SecNonce.deinit zeroes all 97 secret bytes" {
-    var sn = SecNonce.fromBytes([_]u8{0xAB} ** 97);
+    var sn = SecNonce.fromBytes(@as([97]u8, @splat(0xAB)));
     sn.deinit();
-    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 97), &sn.bytes);
+    try std.testing.expectEqualSlices(u8, &(@as([97]u8, @splat(0))), &sn.bytes);
     // Idempotent.
     sn.deinit();
-    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 97), &sn.bytes);
+    try std.testing.expectEqualSlices(u8, &(@as([97]u8, @splat(0))), &sn.bytes);
 }

@@ -1240,7 +1240,7 @@ test "applyCspWithNonce: report-only name, deterministic bytes, errors surface" 
     var body_buf: [64]u8 = undefined;
     var chunk_buf: [64]u8 = undefined;
     var rw: http.Server.ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
-    const nonce = csp.Nonce.fromBytes(&([_]u8{0} ** 16));
+    const nonce = csp.Nonce.fromBytes(&(@as([16]u8, @splat(0))));
     var scratch: [1024]u8 = undefined;
     try applyCspWithNonce(&rw, .{ .use_defaults = false, .directives = &.{.{ .name = .script_src, .values = &.{"'strict-dynamic'"} }} }, &nonce, &.{.script_src}, true, &scratch);
     try testing.expectError(error.NonceDirectiveMissing, applyCspWithNonce(&rw, .{ .use_defaults = false, .directives = &.{.{ .name = .img_src, .values = &.{"'self'"} }} }, &nonce, &.{.script_src}, false, &scratch));
@@ -1423,7 +1423,7 @@ test "extra: emitted by the runtime path and counted against the budget" {
 
     // An extra pair big enough to blow the whole header-byte budget on its
     // own must be caught at init, exactly like an oversized CSP.
-    const huge = "v" ** (http_header_budget_bytes + 1);
+    const huge = strRepeat("v", http_header_budget_bytes + 1);
     try testing.expectError(error.HeaderBudgetExceeded, SecurityHeaders.init(.{
         .extra = &.{.{ .name = "X-Big", .value = huge }},
     }));
@@ -1570,4 +1570,16 @@ fn staticHeaders17() []const http.Header {
 test {
     _ = @import("browser_oracle_test.zig");
     _ = @import("csp.zig");
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

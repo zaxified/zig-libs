@@ -60,7 +60,7 @@ pub fn Poly(comptime N: usize) type {
         c: [N]T,
 
         pub fn zero() Self {
-            return .{ .c = [_]T{0} ** N };
+            return .{ .c = @as([N]T, @splat(0)) };
         }
 
         pub fn fromCoeffs(raw: [N]T) Self {
@@ -121,7 +121,7 @@ pub fn Poly(comptime N: usize) type {
         /// Retained as the differential oracle for `mul`'s NTT path (and used
         /// directly for degrees below `ntt_min_degree`).
         pub fn mulSchoolbook(a: *const Self, b: *const Self) Self {
-            var acc = [_]T{0} ** N;
+            var acc = @as([N]T, @splat(0));
             for (0..N) |i| {
                 for (0..N) |j| {
                     const p = a.c[i] *% b.c[j];

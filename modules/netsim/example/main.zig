@@ -25,7 +25,7 @@ const dest: netsim.NodeId = node_count - 1;
 /// receipt instead of dropping the duplicate — a single duplicated packet
 /// makes two adjacent nodes ping-pong forever.
 const Relay = struct {
-    visits: [node_count]u32 = .{0} ** node_count,
+    visits: [node_count]u32 = @splat(0),
     threshold: u32 = 3,
 
     fn protocol(self: *Relay) netsim.Protocol {

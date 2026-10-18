@@ -461,18 +461,18 @@ test "address grammar: what is a Mailbox and what is not" {
 
 test "RFC 5321 §4.5.3.1 size ceilings" {
     var buf: [1024]u8 = undefined;
-    const long_local = "a" ** 65 ++ "@example.com";
+    const long_local = strRepeat("a", 65) ++ "@example.com";
     try testing.expectError(error.PathTooLong, validateMailbox(long_local, .{}, false));
-    const long_domain = "a@" ++ ("b" ** 60 ++ ".") ** 5 ++ "example.com";
+    const long_domain = "a@" ++ strRepeat((strRepeat("b", 60) ++ "."), 5) ++ "example.com";
     try testing.expectError(error.PathTooLong, validateMailbox(long_domain, .{}, false));
     // A path just over 256 octets.
-    const long_path = "a" ** 60 ++ "@" ++ ("x" ** 30 ++ ".") ** 6 ++ "example.com";
+    const long_path = strRepeat("a", 60) ++ "@" ++ strRepeat((strRepeat("x", 30) ++ "."), 6) ++ "example.com";
     try testing.expect(long_path.len + 2 > 256);
     try testing.expectError(error.PathTooLong, validateMailbox(long_path, .{}, false));
     // The line ceiling bites even when every component is legal.
-    try testing.expectError(error.CommandTooLong, noop(&buf, "x" ** 600, .{}));
+    try testing.expectError(error.CommandTooLong, noop(&buf, strRepeat("x", 600), .{}));
     // ...and a caller may raise it deliberately.
-    const long_noop = try noop(&buf, "x" ** 600, .{ .max_command_line = 1024 });
+    const long_noop = try noop(&buf, strRepeat("x", 600), .{ .max_command_line = 1024 });
     try testing.expectEqual(@as(usize, 607), long_noop.len);
     // A buffer smaller than the command is an error, not a truncation.
     var tiny: [4]u8 = undefined;
@@ -505,8 +505,8 @@ test "EHLO argument must be a domain or an address literal" {
     // character passed with `label_len == 63` and rejection only happened
     // on the 65th -- a stated ceiling that was one off (wave-2 audit
     // finding `smtp` F3).
-    const label63 = "a" ** 63 ++ ".example";
-    const label64 = "a" ** 64 ++ ".example";
+    const label63 = strRepeat("a", 63) ++ ".example";
+    const label64 = strRepeat("a", 64) ++ ".example";
     try testing.expect(validDomain(label63, false)); // exactly at the limit: legal
     try testing.expect(!validDomain(label64, false)); // one over: must be refused
 }
@@ -557,9 +557,9 @@ const command_seeds = [_][]const u8{
     seed("-leading-hyphen.example"), // InvalidDomain: a label may not start with '-'
     seed("[300.1.1.1]"), // InvalidDomain: not a valid address literal
     seed("double..dot@example.com"), // InvalidAddress: an empty dot-atom component
-    seed("a" ** 65 ++ "@example.com"), // PathTooLong: a 65-octet local part
-    seed("a" ** 64 ++ ".example"), // InvalidDomain: a 64-octet label, one past RFC 1035's cap
-    seed("x" ** 300), // exactly the harness buffer, and past the command-line ceiling
+    seed(strRepeat("a", 65) ++ "@example.com"), // PathTooLong: a 65-octet local part
+    seed(strRepeat("a", 64) ++ ".example"), // InvalidDomain: a 64-octet label, one past RFC 1035's cap
+    seed(strRepeat("x", 300)), // exactly the harness buffer, and past the command-line ceiling
 };
 
 test "fuzz: no argument makes a builder emit a control character or overrun" {
@@ -642,4 +642,16 @@ test "corpus: every command seed reaches the builders, and the counts are pinned
     // with SMTPUTF8 on -- and unreachable at all until the `smtputf8` draw
     // above stopped collapsing to `false`.
     try testing.expectEqual(@as(usize, 5), rcpt_utf8_ok);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

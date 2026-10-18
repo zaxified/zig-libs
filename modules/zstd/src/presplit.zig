@@ -24,7 +24,7 @@ const segment_size = 512;
 pub const full_block = 128 * 1024;
 
 const Fingerprint = struct {
-    events: [hashtable_size]u32 = [_]u32{0} ** hashtable_size,
+    events: [hashtable_size]u32 = @as([hashtable_size]u32, @splat(0)),
     nb_events: usize = 0,
 };
 

@@ -37,10 +37,10 @@ const Generator = oa.Generator;
 // ── reach labels and the source adapter ─────────────────────────────────────
 
 pub const Label = enum { build_ok, build_rejected, build_utf8, spec_json_invalid, spec_rejected, spec_accepted };
-var reach: [@typeInfo(Label).@"enum".fields.len]usize = @splat(0);
+var reach: [@typeInfo(Label).@"enum".field_names.len]usize = @splat(0);
 
 pub fn mark(l: Label) void {
-    reach[@intFromEnum(l)] += 1;
+    reach[@backingInt(l)] += 1;
     switch (l) {
         inline else => |c| fuzz_driver.hit(@tagName(c)),
     }
@@ -51,13 +51,13 @@ pub fn resetReach() void {
 }
 
 pub fn count(l: Label) usize {
-    return reach[@intFromEnum(l)];
+    return reach[@backingInt(l)];
 }
 
 /// Reach before verdict: every label was seen since `resetReach`.
 pub fn expectAllReached() !void {
     for (reach, 0..) |n, i| if (n == 0) {
-        std.debug.print("reach: label {t} never hit\n", .{@as(Label, @enumFromInt(i))});
+        std.debug.print("reach: label {t} never hit\n", .{@as(Label, @fromBackingInt(@intCast(i)))});
         return error.HarnessDoesNotReach;
     };
 }
@@ -225,7 +225,7 @@ const Gen = struct {
     fn scheme(g: *Gen) oa.SecurityScheme {
         const name = g.pick(&scheme_name_pool);
         const kind: oa.SecurityScheme.Kind = switch (g.cur.ranged(0, 4)) {
-            0 => .{ .api_key = .{ .in = @enumFromInt(g.cur.ranged(0, 2)), .name = "X-Key" } },
+            0 => .{ .api_key = .{ .in = @fromBackingInt(@intCast(g.cur.ranged(0, 2))), .name = "X-Key" } },
             1 => .http_basic,
             2 => .{ .http_bearer = .{ .format = "JWT" } },
             3 => if (g.chance(5)) .{ .oauth2 = .{} } else .{ .oauth2 = .{ .implicit = .{

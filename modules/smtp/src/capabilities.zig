@@ -347,7 +347,7 @@ test "capability count and line length are bounded" {
     for (0..40) |i| try text.print(gpa, "\nX-CAP-{d}", .{i});
     try testing.expectError(error.TooManyCapabilities, parse(gpa, text.items, .{ .max_lines = 8 }));
 
-    var c = try parse(gpa, "srv\nX-LONG " ++ "A" ** 100, .{ .max_line = 16 });
+    var c = try parse(gpa, "srv\nX-LONG " ++ strRepeat("A", 100), .{ .max_line = 16 });
     defer c.deinit();
     try testing.expectEqual(@as(usize, 16), c.lines[0].len);
 }
@@ -377,8 +377,8 @@ const caps_seeds = [_][]const u8{
     seed("srv\nAUTH=LOGIN PLAIN"), // the legacy AUTH= form
     seed("srv\nAUTH GSSAPI CRAM-MD5 XOAUTH2"), // only mechanisms this module cannot perform
     seed("mail.example.com at your service"), // a greeting and no capabilities at all
-    seed("srv\nX-LONG " ++ "A" ** 100), // a line past max_line: truncated, not refused
-    seed("srv" ++ "\nX-CAP" ** 40), // TooManyCapabilities: 40 lines past max_lines of 32
+    seed("srv\nX-LONG " ++ strRepeat("A", 100)), // a line past max_line: truncated, not refused
+    seed("srv" ++ strRepeat("\nX-CAP", 40)), // TooManyCapabilities: 40 lines past max_lines of 32
     seed("srv\n\n\n\n"), // empty capability lines
     seed("\n\n"), // nothing but separators: the domain is empty
 };
@@ -435,4 +435,16 @@ test "corpus: every EHLO seed reaches the parser, and what it parsed is pinned" 
     // lines before the draw was fixed; 13 of 13 non-empty after.
     try testing.expectEqual(@as(usize, 12), accepted);
     try testing.expectEqual(@as(usize, 20), total_lines);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

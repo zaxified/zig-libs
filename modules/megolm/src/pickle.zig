@@ -158,7 +158,7 @@ pub const PickleError = error{
 fn writeHeader(out: *[header_len]u8, kind: Kind) void {
     out[0..magic.len].* = magic;
     out[magic.len] = version;
-    out[magic.len + 1] = @intFromEnum(kind);
+    out[magic.len + 1] = @backingInt(kind);
 }
 
 /// Header + exact-length gate shared by all four decoders.
@@ -166,7 +166,7 @@ fn checkFrame(bytes: []const u8, kind: Kind, exact_len: usize) PickleError!void 
     if (bytes.len < header_len) return error.Truncated;
     if (!std.mem.eql(u8, bytes[0..magic.len], &magic)) return error.BadMagic;
     if (bytes[magic.len] != version) return error.UnsupportedVersion;
-    if (bytes[magic.len + 1] != @intFromEnum(kind)) return error.WrongKind;
+    if (bytes[magic.len + 1] != @backingInt(kind)) return error.WrongKind;
     if (bytes.len < exact_len) return error.Truncated;
     if (bytes.len > exact_len) return error.TrailingBytes;
 }
@@ -337,7 +337,7 @@ fn testIo() std.Io.Threaded {
     return std.Io.Threaded.init(testing.allocator, .{});
 }
 
-const test_key: PickleKey = [_]u8{0x42} ** key_length;
+const test_key: PickleKey = @as([key_length]u8, @splat(0x42));
 
 fn expectSameMessage(a: anytype, b: anytype) !void {
     try testing.expectEqual(a.message_index, b.message_index);
@@ -546,7 +546,7 @@ test "plain decoders: field refusals" {
     u[flags_at] = 0x02;
     try testing.expectError(error.InvalidFlags, shim.inboundFromPickle(&u));
     u = ib;
-    u[pk_at..][0..pk_len].* = [_]u8{0xff} ** pk_len; // non-canonical point
+    u[pk_at..][0..pk_len].* = @as([pk_len]u8, @splat(0xff)); // non-canonical point
     try testing.expectError(error.InvalidSigningKey, shim.inboundFromPickle(&u));
     u = ib;
     u[latest_data_at + 5] ^= 1; // cache bytes not derivable from initial
@@ -660,8 +660,8 @@ const PickleCorpus = struct {
     fn build(self: *PickleCorpus, io: std.Io) []const []const u8 {
         // Fixed state so the guard below can pin what decodes.
         var out = OutboundSession{
-            .ratchet = shim.ratchetInit(&([_]u8{0x33} ** ratchet_len), 0x1ff),
-            .signing_key = Ed25519.KeyPair.generateDeterministic([_]u8{0x11} ** seed_len) catch unreachable,
+            .ratchet = shim.ratchetInit(&(@as([ratchet_len]u8, @splat(0x33))), 0x1ff),
+            .signing_key = Ed25519.KeyPair.generateDeterministic(@as([seed_len]u8, @splat(0x11))) catch unreachable,
         };
         defer out.deinit();
         var in = InboundGroupSession{
@@ -701,12 +701,12 @@ const PickleCorpus = struct {
     }
 };
 
-const fuzz_key: PickleKey = [_]u8{0x5a} ** key_length;
+const fuzz_key: PickleKey = @as([key_length]u8, @splat(0x5a));
 
 const FuzzOutcome = struct { len: usize, decoded: usize };
 
 fn pickleRound(smith: *std.testing.Smith) FuzzOutcome {
-    var buf = [_]u8{0} ** fuzz_buf_len;
+    var buf = @as([fuzz_buf_len]u8, @splat(0));
     _ = smith.slice(&buf);
     const mode = smith.value(u64) % 6;
     const len: usize = switch (mode) {

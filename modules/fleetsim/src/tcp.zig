@@ -1238,7 +1238,7 @@ test "serveTcpOn: a canceled idle-read wait surfaces Canceled, not an idle round
     defer f.deinit();
 
     const adapters = @import("adapters.zig");
-    var holdings = [_]u16{0} ** 4;
+    var holdings = @as([4]u16, @splat(0));
     var slave = adapters.Modbus.init(
         .{ .unit_id = 1, .framing = .tcp },
         .{ .holding_registers = .{ .base = 0, .values = &holdings } },

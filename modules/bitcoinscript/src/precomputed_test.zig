@@ -58,15 +58,15 @@ const SIGHASH_ALL: u32 = 1;
 /// A signature that parses as DER and a 33-byte "pubkey" whose SEC1 prefix is
 /// invalid. The sighash is computed BEFORE the curve check rejects the key, so
 /// this exercises the full sighash path at negligible curve cost.
-const parseable_sig = [_]u8{ 0x30, 0x44, 0x02, 0x20 } ++ [_]u8{0x11} ** 32 ++ [_]u8{ 0x02, 0x20 } ++ [_]u8{0x22} ** 32 ++ [_]u8{0x01};
-const unparseable_pk = [_]u8{0x09} ++ [_]u8{0x07} ** 32;
+const parseable_sig = [_]u8{ 0x30, 0x44, 0x02, 0x20 } ++ @as([32]u8, @splat(0x11)) ++ [_]u8{ 0x02, 0x20 } ++ @as([32]u8, @splat(0x22)) ++ [_]u8{0x01};
+const unparseable_pk = [_]u8{0x09} ++ @as([32]u8, @splat(0x07));
 
 const Kind = enum { segwit_v0, taproot_keypath, taproot_scriptpath };
 
 fn buildWideTx(a: std.mem.Allocator, n: usize, spk: []const u8) !struct { tx: bitcointx.Transaction, spent: []bitcointx.TxOut } {
     const vin = try a.alloc(bitcointx.TxIn, n);
     for (vin, 0..) |*v, i| v.* = .{
-        .prevout = .{ .txid = [_]u8{@truncate(i)} ** 32, .vout = @intCast(i) },
+        .prevout = .{ .txid = @as([32]u8, @splat(@truncate(i))), .vout = @intCast(i) },
         .script_sig = &.{},
         .sequence = 0xfffffffe,
     };
@@ -115,7 +115,7 @@ fn verifyOneInputCost(gpa: std.mem.Allocator, n: usize, kind: Kind, use_pre: boo
             spk[0] = 0x51;
             spk[1] = 0x20;
             @memset(spk[2..], 0xbb);
-            witness_buf[0] = try a.dupe(u8, &([_]u8{0x33} ** 64));
+            witness_buf[0] = try a.dupe(u8, &(@as([64]u8, @splat(0x33))));
             witness = witness_buf[0..1];
             flags.taproot = true;
         },
@@ -125,20 +125,20 @@ fn verifyOneInputCost(gpa: std.mem.Allocator, n: usize, kind: Kind, use_pre: boo
             // no BIP341/342 sighash is ever computed). The leaf signature is
             // bogus — again, the sighash is computed before it fails.
             var internal: bip340.KeyPair = undefined;
-            try bip340.KeyPair.fromSecretKey(&internal, &(try bip340.SecretKey.fromBytes([_]u8{0x66} ** 32)));
+            try bip340.KeyPair.fromSecretKey(&internal, &(try bip340.SecretKey.fromBytes(@as([32]u8, @splat(0x66)))));
             var leaf_key: bip340.KeyPair = undefined;
-            try bip340.KeyPair.fromSecretKey(&leaf_key, &(try bip340.SecretKey.fromBytes([_]u8{0x55} ** 32)));
-            const leaf_script = try a.dupe(u8, &([_]u8{0x20} ++ [_]u8{0} ** 32 ++ [_]u8{0xac}));
+            try bip340.KeyPair.fromSecretKey(&leaf_key, &(try bip340.SecretKey.fromBytes(@as([32]u8, @splat(0x55)))));
+            const leaf_script = try a.dupe(u8, &([_]u8{0x20} ++ @as([32]u8, @splat(0)) ++ [_]u8{0xac}));
             @memcpy(leaf_script[1..33], &leaf_key.public.x);
             const out = taprootOutput(internal.public.x, tapscript.tapleafHash(0xc0, leaf_script));
             spk = try a.alloc(u8, 34);
             spk[0] = 0x51;
             spk[1] = 0x20;
             @memcpy(spk[2..], &out.q);
-            const control_block = try a.dupe(u8, &([_]u8{0} ** 33));
+            const control_block = try a.dupe(u8, &(@as([33]u8, @splat(0))));
             control_block[0] = 0xc0 | out.parity;
             @memcpy(control_block[1..], &internal.public.x);
-            witness_buf[0] = try a.dupe(u8, &([_]u8{0x33} ** 64));
+            witness_buf[0] = try a.dupe(u8, &(@as([64]u8, @splat(0x33))));
             witness_buf[1] = leaf_script;
             witness_buf[2] = control_block;
             witness = witness_buf[0..3];
@@ -247,35 +247,35 @@ test "bytes: one cache, three inputs, three sighash algorithms — every real si
     const a = arena.allocator();
 
     // --- input 0: P2WPKH
-    const ec_kp = try EcdsaSecp256k1Sha256.KeyPair.generateDeterministic([_]u8{0x22} ** 32);
+    const ec_kp = try EcdsaSecp256k1Sha256.KeyPair.generateDeterministic(@as([32]u8, @splat(0x22)));
     const ec_pub = ec_kp.public_key.toCompressedSec1();
     var pkh: [20]u8 = undefined;
     ripemd160.hash160(&ec_pub, &pkh);
-    const p2wpkh_spk = try a.dupe(u8, &([_]u8{ 0x00, 0x14 } ++ [_]u8{0} ** 20));
+    const p2wpkh_spk = try a.dupe(u8, &([_]u8{ 0x00, 0x14 } ++ @as([20]u8, @splat(0))));
     @memcpy(p2wpkh_spk[2..], &pkh);
-    const script_code = try a.dupe(u8, &([_]u8{ 0x76, 0xa9, 0x14 } ++ [_]u8{0} ** 20 ++ [_]u8{ 0x88, 0xac }));
+    const script_code = try a.dupe(u8, &([_]u8{ 0x76, 0xa9, 0x14 } ++ @as([20]u8, @splat(0)) ++ [_]u8{ 0x88, 0xac }));
     @memcpy(script_code[3..23], &pkh);
 
     // --- input 1: P2TR key-path (internal key used directly as output key)
-    const key_sk = try bip340.SecretKey.fromBytes([_]u8{0x33} ** 32);
+    const key_sk = try bip340.SecretKey.fromBytes(@as([32]u8, @splat(0x33)));
     var key_kp: bip340.KeyPair = undefined;
     try bip340.KeyPair.fromSecretKey(&key_kp, &key_sk);
-    const p2tr_key_spk = try a.dupe(u8, &([_]u8{ 0x51, 0x20 } ++ [_]u8{0} ** 32));
+    const p2tr_key_spk = try a.dupe(u8, &([_]u8{ 0x51, 0x20 } ++ @as([32]u8, @splat(0))));
     @memcpy(p2tr_key_spk[2..], &key_kp.public.x);
 
     // --- input 2: P2TR script-path, single leaf `<pk> OP_CHECKSIG`
-    const leaf_sk = try bip340.SecretKey.fromBytes([_]u8{0x55} ** 32);
+    const leaf_sk = try bip340.SecretKey.fromBytes(@as([32]u8, @splat(0x55)));
     var leaf_kp: bip340.KeyPair = undefined;
     try bip340.KeyPair.fromSecretKey(&leaf_kp, &leaf_sk);
     var internal_kp: bip340.KeyPair = undefined;
-    try bip340.KeyPair.fromSecretKey(&internal_kp, &(try bip340.SecretKey.fromBytes([_]u8{0x66} ** 32)));
-    const leaf_script = try a.dupe(u8, &([_]u8{0x20} ++ [_]u8{0} ** 32 ++ [_]u8{0xac}));
+    try bip340.KeyPair.fromSecretKey(&internal_kp, &(try bip340.SecretKey.fromBytes(@as([32]u8, @splat(0x66)))));
+    const leaf_script = try a.dupe(u8, &([_]u8{0x20} ++ @as([32]u8, @splat(0)) ++ [_]u8{0xac}));
     @memcpy(leaf_script[1..33], &leaf_kp.public.x);
     const leaf_hash = tapscript.tapleafHash(0xc0, leaf_script);
     const out = taprootOutput(internal_kp.public.x, leaf_hash);
-    const p2tr_script_spk = try a.dupe(u8, &([_]u8{ 0x51, 0x20 } ++ [_]u8{0} ** 32));
+    const p2tr_script_spk = try a.dupe(u8, &([_]u8{ 0x51, 0x20 } ++ @as([32]u8, @splat(0))));
     @memcpy(p2tr_script_spk[2..], &out.q);
-    const control_block = try a.dupe(u8, &([_]u8{0} ** 33));
+    const control_block = try a.dupe(u8, &(@as([33]u8, @splat(0))));
     control_block[0] = 0xc0 | out.parity;
     @memcpy(control_block[1..], &internal_kp.public.x);
 
@@ -284,7 +284,7 @@ test "bytes: one cache, three inputs, three sighash algorithms — every real si
 
     const vin = try a.alloc(bitcointx.TxIn, 3);
     for (vin, 0..) |*v, i| v.* = .{
-        .prevout = .{ .txid = [_]u8{@truncate(0xA0 + i)} ** 32, .vout = @intCast(i) },
+        .prevout = .{ .txid = @as([32]u8, @splat(@truncate(0xA0 + i))), .vout = @intCast(i) },
         .script_sig = &.{},
         .sequence = 0xffffffff,
     };
@@ -307,11 +307,11 @@ test "bytes: one cache, three inputs, three sighash algorithms — every real si
 
     const io: std.Io = undefined;
     const sh1 = try bitcointx.bip341.sighash(a, tx, 1, bitcointx.bip341.SIGHASH_DEFAULT, spent);
-    const sig1 = try bip340.sign(&key_sk, &sh1, [_]u8{0x44} ** 32, io);
+    const sig1 = try bip340.sign(&key_sk, &sh1, @as([32]u8, @splat(0x44)), io);
 
     var exec: tapscript.ExecData = .{ .tapleaf_hash = leaf_hash, .codesep_pos = 0xffffffff };
     const sh2 = try tapscript.sighash(a, tx, 2, tapscript.SIGHASH_DEFAULT, spent, &exec);
-    const sig2 = try bip340.sign(&leaf_sk, &sh2, [_]u8{0x77} ** 32, io);
+    const sig2 = try bip340.sign(&leaf_sk, &sh2, @as([32]u8, @splat(0x77)), io);
 
     const w0 = [_][]const u8{ sig0, &ec_pub };
     const w1 = [_][]const u8{&sig1};
@@ -352,7 +352,7 @@ test "cache is optional and its absence is the old behaviour" {
 
     const vin = try a.alloc(bitcointx.TxIn, 2);
     for (vin, 0..) |*v, i| v.* = .{
-        .prevout = .{ .txid = [_]u8{@truncate(i)} ** 32, .vout = @intCast(i) },
+        .prevout = .{ .txid = @as([32]u8, @splat(@truncate(i))), .vout = @intCast(i) },
         .script_sig = &.{},
         .sequence = 0xffffffff,
     };

@@ -280,14 +280,14 @@ test "sign consumes the caller's secnonce: zeroed after a success AND after a fa
     // survived every call and a retry with a different message signed again
     // over the same nonce -- the two-equations key leak.
     const io = std.testing.io;
-    const sk_bytes = [_]u8{0x5A} ** 32;
+    const sk_bytes = @as([32]u8, @splat(0x5A));
     const sk = try bip340.SecretKey.fromBytes(sk_bytes);
     const pk = musig2.PlainPublicKey{ .bytes = (try k256.Secp256k1.combMulBase(sk_bytes, .big)).toCompressedSec1() };
     const pks = [_]musig2.PlainPublicKey{pk};
-    const zero = [_]u8{0} ** 64;
+    const zero = @as([64]u8, @splat(0));
 
     var ng: musig2.NonceGenResult = undefined;
-    try musig2.nonceGen(&ng, &sk_bytes, pk.bytes, null, "msg", null, &@as([32]u8, [_]u8{0x31} ** 32), io);
+    try musig2.nonceGen(&ng, &sk_bytes, pk.bytes, null, "msg", null, &@as([32]u8, @as([32]u8, @splat(0x31))), io);
     const ctx = musig2.SessionContext{ .aggnonce = try musig2.nonceAgg(&.{ng.pubnonce}), .pubkeys = &pks, .msg = "msg" };
     _ = try musig2.sign(&ng.secnonce, &sk, ctx);
     try std.testing.expectEqualSlices(u8, &zero, ng.secnonce.bytes[0..64]);
@@ -296,8 +296,8 @@ test "sign consumes the caller's secnonce: zeroed after a success AND after a fa
 
     // A FAILED attempt consumes it too: the signer is not in this session.
     var ng2: musig2.NonceGenResult = undefined;
-    try musig2.nonceGen(&ng2, &sk_bytes, pk.bytes, null, "msg", null, &@as([32]u8, [_]u8{0x32} ** 32), io);
-    const stranger = musig2.PlainPublicKey{ .bytes = (try k256.Secp256k1.combMulBase([_]u8{0x6B} ** 32, .big)).toCompressedSec1() };
+    try musig2.nonceGen(&ng2, &sk_bytes, pk.bytes, null, "msg", null, &@as([32]u8, @as([32]u8, @splat(0x32))), io);
+    const stranger = musig2.PlainPublicKey{ .bytes = (try k256.Secp256k1.combMulBase(@as([32]u8, @splat(0x6B)), .big)).toCompressedSec1() };
     const wrong = musig2.SessionContext{ .aggnonce = ctx.aggnonce, .pubkeys = &.{stranger}, .msg = "msg" };
     try std.testing.expectError(error.PubkeyNotInSession, musig2.sign(&ng2.secnonce, &sk, wrong));
     try std.testing.expectEqualSlices(u8, &zero, ng2.secnonce.bytes[0..64]);
@@ -305,13 +305,13 @@ test "sign consumes the caller's secnonce: zeroed after a success AND after a fa
 }
 
 test "partialSigVerify: a signer index outside either list is an error, not a panic" {
-    const pk = musig2.PlainPublicKey{ .bytes = (try k256.Secp256k1.combMulBase([_]u8{0x5A} ** 32, .big)).toCompressedSec1() };
+    const pk = musig2.PlainPublicKey{ .bytes = (try k256.Secp256k1.combMulBase(@as([32]u8, @splat(0x5A)), .big)).toCompressedSec1() };
     var ng: musig2.NonceGenResult = undefined;
-    try musig2.nonceGen(&ng, null, pk.bytes, null, "m", null, &@as([32]u8, [_]u8{0x33} ** 32), std.testing.io);
-    const psig = try musig2.PartialSignature.fromBytes([_]u8{1} ** 32);
+    try musig2.nonceGen(&ng, null, pk.bytes, null, "m", null, &@as([32]u8, @as([32]u8, @splat(0x33))), std.testing.io);
+    const psig = try musig2.PartialSignature.fromBytes(@as([32]u8, @splat(1)));
     try std.testing.expectError(error.InvalidPublicKey, musig2.partialSigVerify(psig, &.{ng.pubnonce}, &.{pk}, &.{}, "m", 1));
     // Two keys, one nonce: index 1 is inside `pubkeys` and outside `pubnonces`.
-    const pk2 = musig2.PlainPublicKey{ .bytes = (try k256.Secp256k1.combMulBase([_]u8{0x5B} ** 32, .big)).toCompressedSec1() };
+    const pk2 = musig2.PlainPublicKey{ .bytes = (try k256.Secp256k1.combMulBase(@as([32]u8, @splat(0x5B)), .big)).toCompressedSec1() };
     try std.testing.expectError(error.InvalidPubNonce, musig2.partialSigVerify(psig, &.{ng.pubnonce}, &.{ pk, pk2 }, &.{}, "m", 1));
 }
 
@@ -328,18 +328,18 @@ test "sign REJECTS a secnonce bound to a DIFFERENT signer's pubkey (SecretKeyMis
     defer threaded.deinit();
     const io = threaded.io();
 
-    const sk_a_bytes = [_]u8{0x11} ** 32;
+    const sk_a_bytes = @as([32]u8, @splat(0x11));
     const pk_a_point = try std_ecc.basePoint.mul(sk_a_bytes, .big);
     const pk_a = try musig2.PlainPublicKey.fromBytes(pk_a_point.toCompressedSec1());
 
-    const sk_b_bytes = [_]u8{0x22} ** 32;
+    const sk_b_bytes = @as([32]u8, @splat(0x22));
     const sk_b = try bip340.SecretKey.fromBytes(sk_b_bytes);
     const pk_b_point = try std_ecc.basePoint.mul(sk_b_bytes, .big);
     const pk_b = try musig2.PlainPublicKey.fromBytes(pk_b_point.toCompressedSec1());
     try std.testing.expect(!std.mem.eql(u8, &pk_a.bytes, &pk_b.bytes));
 
     // secnonce is bound to pk_a (via nonceGen's `pk` argument)...
-    const rand_prime = [_]u8{0xCC} ** 32;
+    const rand_prime = @as([32]u8, @splat(0xCC));
     var ng: musig2.NonceGenResult = undefined;
     try musig2.nonceGen(&ng, &sk_a_bytes, pk_a.bytes, null, "msg", null, &@as([32]u8, rand_prime), io);
 
@@ -361,15 +361,15 @@ test "sign refuses when the session lists the signer's x with the other parity" 
     defer threaded.deinit();
     const io = threaded.io();
 
-    const sk_bytes = [_]u8{0x11} ** 32;
+    const sk_bytes = @as([32]u8, @splat(0x11));
     const sk = try bip340.SecretKey.fromBytes(sk_bytes);
     const own = (try std_ecc.basePoint.mul(sk_bytes, .big)).toCompressedSec1();
     var flipped = own;
     flipped[0] ^= 1; // 02 <-> 03: the same x, the negated point
-    const other = (try std_ecc.basePoint.mul([_]u8{0x22} ** 32, .big)).toCompressedSec1();
+    const other = (try std_ecc.basePoint.mul(@as([32]u8, @splat(0x22)), .big)).toCompressedSec1();
 
     var ng: musig2.NonceGenResult = undefined;
-    try musig2.nonceGen(&ng, &sk_bytes, own, null, "msg", null, &@as([32]u8, [_]u8{0xCC} ** 32), io);
+    try musig2.nonceGen(&ng, &sk_bytes, own, null, "msg", null, &@as([32]u8, @as([32]u8, @splat(0xCC))), io);
     const aggnonce = try musig2.nonceAgg(&.{ng.pubnonce});
     const pks = [_]musig2.PlainPublicKey{ try .fromBytes(flipped), try .fromBytes(other) };
     const ctx = musig2.SessionContext{ .aggnonce = aggnonce, .pubkeys = &pks, .msg = "msg" };
@@ -385,8 +385,8 @@ test "SecNonce refuses k1 or k2 of n or n + 1, not only 0" {
     for ([_]u256{ n, n + 1 }) |k| {
         var kb: [32]u8 = undefined;
         std.mem.writeInt(u256, &kb, k, .big);
-        const one = [_]u8{0} ** 31 ++ [_]u8{1};
-        const pk = [_]u8{0x02} ++ [_]u8{0} ** 32;
+        const one = @as([31]u8, @splat(0)) ++ [_]u8{1};
+        const pk = [_]u8{0x02} ++ @as([32]u8, @splat(0));
         const bad_k1 = musig2.SecNonce.fromBytes(kb ++ one ++ pk);
         const bad_k2 = musig2.SecNonce.fromBytes(one ++ kb ++ pk);
         try std.testing.expectError(error.InvalidSecNonce, bad_k1.k1Scalar());
@@ -400,10 +400,10 @@ test "SecNonce refuses k1 or k2 of n or n + 1, not only 0" {
 // secp256k1 point (7 is not a square mod p), so the aggnonce is invalid.
 test "AggNonce: infinity is 33 zero bytes exactly; 02/03 followed by 32 zeros is invalid" {
     const g = std.crypto.ecc.Secp256k1.basePoint.toCompressedSec1();
-    _ = try musig2.AggNonce.fromBytes(([_]u8{0} ** 33) ++ g);
-    _ = try musig2.AggNonce.fromBytes(g ++ ([_]u8{0} ** 33));
+    _ = try musig2.AggNonce.fromBytes((@as([33]u8, @splat(0))) ++ g);
+    _ = try musig2.AggNonce.fromBytes(g ++ (@as([33]u8, @splat(0))));
     for ([_]u8{ 0x02, 0x03 }) |prefix| {
-        const bad = [_]u8{prefix} ++ [_]u8{0} ** 32;
+        const bad = [_]u8{prefix} ++ @as([32]u8, @splat(0));
         try std.testing.expectError(error.InvalidAggNonce, musig2.AggNonce.fromBytes(bad ++ g));
         try std.testing.expectError(error.InvalidAggNonce, musig2.AggNonce.fromBytes(g ++ bad));
     }
@@ -687,13 +687,13 @@ test "end-to-end: 3 signers, nonceGen→nonceAgg→sign→partialSigVerify→par
     var secnonces: [3]musig2.SecNonce = undefined;
     var pubnonces: [3]musig2.PubNonce = undefined;
     for (0..3) |i| {
-        var sk_bytes = [_]u8{0x42} ** 32; // arbitrary fixed test keys, well in range
+        var sk_bytes = @as([32]u8, @splat(0x42)); // arbitrary fixed test keys, well in range
         sk_bytes[31] = @intCast(i + 1);
         sks[i] = try bip340.SecretKey.fromBytes(sk_bytes);
         const p = try Secp256k1.basePoint.mul(sk_bytes, .big);
         pks[i] = try musig2.PlainPublicKey.fromBytes(p.toCompressedSec1());
 
-        var rand_prime = [_]u8{0xA7} ** 32; // per-signer distinct nonce randomness
+        var rand_prime = @as([32]u8, @splat(0xA7)); // per-signer distinct nonce randomness
         rand_prime[0] = @intCast(i);
         var ng: musig2.NonceGenResult = undefined;
         try musig2.nonceGen(&ng, &sk_bytes, pks[i].bytes, null, msg, null, &@as([32]u8, rand_prime), io);
@@ -733,13 +733,13 @@ test "end-to-end: 3 signers with an x-only (Taproot-style) tweak — aggregate v
     var secnonces: [3]musig2.SecNonce = undefined;
     var pubnonces: [3]musig2.PubNonce = undefined;
     for (0..3) |i| {
-        var sk_bytes = [_]u8{0x51} ** 32; // arbitrary fixed test keys, well in range
+        var sk_bytes = @as([32]u8, @splat(0x51)); // arbitrary fixed test keys, well in range
         sk_bytes[31] = @intCast(i + 1);
         sks[i] = try bip340.SecretKey.fromBytes(sk_bytes);
         const p = try Secp256k1.basePoint.mul(sk_bytes, .big);
         pks[i] = try musig2.PlainPublicKey.fromBytes(p.toCompressedSec1());
 
-        var rand_prime = [_]u8{0xC3} ** 32; // per-signer distinct nonce randomness
+        var rand_prime = @as([32]u8, @splat(0xC3)); // per-signer distinct nonce randomness
         rand_prime[0] = @intCast(i);
         var ng: musig2.NonceGenResult = undefined;
         try musig2.nonceGen(&ng, &sk_bytes, pks[i].bytes, null, msg, null, &@as([32]u8, rand_prime), io);

@@ -19,7 +19,7 @@ const k256 = @import("k256");
 pub fn main() !void {
     // A fixed, valid (0 < d < n) private key — deterministic example, not
     // real key material.
-    const privkey = [_]u8{0x01} ** 31 ++ [_]u8{0x23};
+    const privkey = @as([31]u8, @splat(0x01)) ++ [_]u8{0x23};
 
     const pubkey_point = try k256.Secp256k1.combMulBase(privkey, .big);
     const pubkey_sec1 = k256.Secp256k1.toCompressedSec1(pubkey_point);
@@ -28,7 +28,7 @@ pub fn main() !void {
     const msg = "spend txid=9f2c...:0 amount=42000sat";
 
     // ── BIP340 Schnorr: sign, verify, then show a tampered message fails ──
-    const aux_rand = [_]u8{0xAB} ** 32;
+    const aux_rand = @as([32]u8, @splat(0xAB));
     const schnorr_sig = try k256.sign.bip340Sign(&privkey, msg, aux_rand);
     const schnorr_ok = k256.sign.bip340Verify(pubkey_xonly, msg, schnorr_sig);
     std.debug.print("bip340 verify (genuine msg): {}\n", .{schnorr_ok});
@@ -39,7 +39,7 @@ pub fn main() !void {
     if (tampered_ok) return error.ShouldHaveFailed;
 
     // `bip340Sign` names its precondition failure: an all-zero secret key.
-    _ = k256.sign.bip340Sign(&([_]u8{0} ** 32), msg, aux_rand) catch |err| switch (err) {
+    _ = k256.sign.bip340Sign(&(@as([32]u8, @splat(0))), msg, aux_rand) catch |err| switch (err) {
         error.InvalidSecretKey => std.debug.print("zero secret key correctly rejected\n", .{}),
         error.InvalidNonce => return err,
     };
@@ -67,7 +67,7 @@ pub fn main() !void {
     // `recoverPubkey` names a garbage-input failure by kind: an `r` of zero
     // is rejected as a malformed scalar rather than silently recovering a
     // bogus key.
-    _ = k256.ecdsa_recover.recoverPubkey(hash32, [_]u8{0} ** 32, compact_sig.s, compact_sig.recid) catch |err| switch (err) {
+    _ = k256.ecdsa_recover.recoverPubkey(hash32, @as([32]u8, @splat(0)), compact_sig.s, compact_sig.recid) catch |err| switch (err) {
         error.InvalidScalar => std.debug.print("zero r correctly rejected\n", .{}),
         error.NotSquare, error.InvalidPoint, error.IdentityElement => return err,
     };

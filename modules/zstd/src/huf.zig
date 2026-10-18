@@ -34,7 +34,7 @@ pub const CElt = struct {
 pub const CTable = struct {
     table_log: u32 = 0,
     max_symbol: u32 = 0,
-    elt: [symbol_value_max + 1]CElt = [_]CElt{.{}} ** (symbol_value_max + 1),
+    elt: [symbol_value_max + 1]CElt = @as([symbol_value_max + 1]CElt, @splat(.{})),
 
     /// `ct.* = .{}` without the memset call (`fill.zig`).
     pub fn clear(ct: *CTable) void {
@@ -229,7 +229,7 @@ fn setMaxHeight(hn: []Node, last_non_null: u32, target_nb_bits: u32) u32 {
     total_cost >>= @intCast(largest_bits - target_nb_bits);
 
     const no_symbol: u32 = 0xF0F0F0F0;
-    var rank_last = [_]u32{no_symbol} ** (table_log_max + 2);
+    var rank_last = @as([table_log_max + 2]u32, @splat(no_symbol));
     {
         var current_nb_bits = target_nb_bits;
         var pos = n;
@@ -282,8 +282,8 @@ fn setMaxHeight(hn: []Node, last_non_null: u32, target_nb_bits: u32) u32 {
 }
 
 fn buildCTableFromTree(ct: *CTable, hn: []const Node, non_null_rank: i32, max_symbol: u32, max_nb_bits: u32) void {
-    var nb_per_rank = [_]u16{0} ** (table_log_max + 1);
-    var val_per_rank = [_]u16{0} ** (table_log_max + 1);
+    var nb_per_rank = @as([table_log_max + 1]u16, @splat(0));
+    var val_per_rank = @as([table_log_max + 1]u16, @splat(0));
     const alphabet_size = max_symbol + 1;
     var n: i32 = 0;
     while (n <= non_null_rank) : (n += 1) nb_per_rank[hn[@intCast(n)].nb_bits] += 1;
@@ -393,8 +393,8 @@ pub fn readCTable(ct: *CTable, src: []const u8, has_zero_weights: *bool) Error!u
     for (huff_weight[0..nb_symbols], ct.elt[0..nb_symbols]) |w, *e|
         e.nb_bits = if (w != 0) @intCast(table_log + 1 - w) else 0;
     // fill val
-    var nb_per_rank = [_]u16{0} ** (table_log_max + 2); // support w=0=>n=tableLog+1
-    var val_per_rank = [_]u16{0} ** (table_log_max + 2);
+    var nb_per_rank = @as([table_log_max + 2]u16, @splat(0)); // support w=0=>n=tableLog+1
+    var val_per_rank = @as([table_log_max + 2]u16, @splat(0));
     for (ct.elt[0..nb_symbols]) |e| nb_per_rank[e.nb_bits] += 1;
     // determine starting value per rank
     val_per_rank[table_log + 1] = 0; // for w==0
@@ -788,7 +788,7 @@ test "the unrolled encoder writes compress1X's bytes at every table log and room
 }
 
 test "two-symbol alphabet codes each symbol in one bit" {
-    var counts = [_]u32{0} ** 256;
+    var counts = @as([256]u32, @splat(0));
     counts['a'] = 10;
     counts['b'] = 5;
     var ct: CTable = .{};
@@ -800,7 +800,7 @@ test "two-symbol alphabet codes each symbol in one bit" {
 
 test "setMaxHeight keeps the Kraft sum at one" {
     // Fibonacci counts force a deep tree that must be flattened to 11 bits.
-    var counts = [_]u32{0} ** 256;
+    var counts = @as([256]u32, @splat(0));
     var a: u32 = 1;
     var b: u32 = 1;
     for (0..20) |i| {

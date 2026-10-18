@@ -374,11 +374,11 @@ test "streaming in arbitrary pieces gives the same bytes as one shot" {
 
 test "the 998-octet line limit is enforced on send and on receive" {
     const gpa = testing.allocator;
-    const long = "A" ** 999 ++ "\r\n";
+    const long = strRepeat("A", 999) ++ "\r\n";
     try testing.expectError(error.LineTooLong, stuffAlloc(gpa, long, .{}));
-    const ok = try stuffAlloc(gpa, "A" ** 998 ++ "\r\n", .{});
+    const ok = try stuffAlloc(gpa, strRepeat("A", 998) ++ "\r\n", .{});
     defer gpa.free(ok);
-    try testing.expectError(error.LineTooLong, unstuffAlloc(gpa, "A" ** 999 ++ "\r\n.\r\n", .{}));
+    try testing.expectError(error.LineTooLong, unstuffAlloc(gpa, strRepeat("A", 999) ++ "\r\n.\r\n", .{}));
     // A caller may raise the ceiling knowingly.
     const raised = try stuffAlloc(gpa, long, .{ .max_line = 2000 });
     defer gpa.free(raised);
@@ -403,7 +403,7 @@ test "F2: a line-start dot counts against the line limit on both send and receiv
     // applying the same 998-octet cap must accept it, and stuffing then
     // unstuffing it must round-trip.
     {
-        const body = "." ++ "A" ** 996 ++ "\r\n";
+        const body = "." ++ strRepeat("A", 996) ++ "\r\n";
         const wire = try stuffAlloc(gpa, body, .{});
         defer gpa.free(wire);
         const back = try unstuffAlloc(gpa, wire, .{});
@@ -419,7 +419,7 @@ test "F2: a line-start dot counts against the line limit on both send and receiv
     // must refuse it too, at the point of writing, not silently emit a
     // non-compliant line for its own receiver to reject.
     {
-        const body = "." ++ "A" ** 997 ++ "\r\n";
+        const body = "." ++ strRepeat("A", 997) ++ "\r\n";
         try testing.expectError(error.LineTooLong, stuffAlloc(gpa, body, .{}));
     }
 }
@@ -505,7 +505,7 @@ test "round-trip property: unstuff(stuff(x)) == x for CRLF-canonical x" {
         ".\r\n.\r\n.\r\n",
         "\r\n\r\n\r\n",
         "Subject: x\r\n\r\n.\r\nbody\r\n",
-        "." ** 50 ++ "\r\n",
+        strRepeat(".", 50) ++ "\r\n",
     };
     for (bodies) |b| {
         const wire = try stuffed(gpa, b);
@@ -535,17 +535,17 @@ const dot_seeds = [_][]const u8{
     seed(".\r\n.\r\n.\r\n"), // three of them
     seed("\r\n\r\n\r\n"), // empty lines only
     seed("Subject: x\r\n\r\n.\r\nbody\r\n"), // a header block with a dot line inside the body
-    seed("." ** 50 ++ "\r\n"), // 50 dots: only the leading one doubles
+    seed(strRepeat(".", 50) ++ "\r\n"), // 50 dots: only the leading one doubles
     seed("..\r\n.\r\n"), // wire form: "..\r\n" decodes to ".\r\n", then the terminator
     seed(".\r\n" ++ "more"), // DataAfterTerminator on the receive side
     seed("body\n.\n"), // BareLineFeed unless allow_bare_lf
     seed("a\rb\r\n.\r\n"), // BareCarriageReturn: a framing lie in either mode
     seed("AAAA\r\nBBBB\r\n.\r\n"), // two short lines and a terminator
     seed("no trailing newline"), // the stuffer must add the final CRLF itself
-    seed("A" ** 1000 ++ "\r\n"), // exactly max_line on the wire: accepted
-    seed("A" ** 1001 ++ "\r\n"), // LineTooLong: one octet over
-    seed("." ++ "A" ** 998 ++ "\r\n"), // 999 source octets doubling to exactly max_line
-    seed("." ++ "A" ** 999 ++ "\r\n"), // LineTooLong: the doubled dot is what puts it over
+    seed(strRepeat("A", 1000) ++ "\r\n"), // exactly max_line on the wire: accepted
+    seed(strRepeat("A", 1001) ++ "\r\n"), // LineTooLong: one octet over
+    seed("." ++ strRepeat("A", 998) ++ "\r\n"), // 999 source octets doubling to exactly max_line
+    seed("." ++ strRepeat("A", 999) ++ "\r\n"), // LineTooLong: the doubled dot is what puts it over
 };
 
 test "fuzz: stuffing then un-stuffing is the identity, and neither crashes" {
@@ -655,4 +655,16 @@ fn canonicalise(gpa: std.mem.Allocator, input: []const u8) ![]u8 {
     }
     if (out.items.len != 0 and !std.mem.endsWith(u8, out.items, "\r\n")) try out.appendSlice(gpa, "\r\n");
     return out.toOwnedSlice(gpa);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

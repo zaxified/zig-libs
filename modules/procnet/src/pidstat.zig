@@ -298,7 +298,7 @@ test "parsePidStat: malformed lines" {
     const s = parsePidStat("1 (a) S x y z").?;
     try testing.expectEqual(@as(i64, 0), s.ppid);
     // Overlong comm is clamped, not dropped.
-    const long = "1 (" ++ "n" ** 200 ++ ") S 1 1";
+    const long = "1 (" ++ strRepeat("n", 200) ++ ") S 1 1";
     try testing.expectEqual(@as(usize, procnet.comm_max), parsePidStat(long).?.comm().len);
     // A 20-digit number past u64 reads 0.
     try testing.expectEqual(@as(u64, 0), parsePidStat("1 (a) S 1 1 1 1 1 1 1 1 1 1 1 99999999999999999999999").?.stime);
@@ -363,4 +363,16 @@ test "PidStat.residentBytes: a negative rss reads as zero at any magnitude" {
 test "parsePidStat: a close-paren before the open-paren is no comm" {
     try testing.expect(parsePidStat("12 ) (x S 1") == null);
     try testing.expect(parsePidStat("12 )( S 1") == null);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

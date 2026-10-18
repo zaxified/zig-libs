@@ -1069,7 +1069,7 @@ test "OOM on the leader's result copy surfaces as an error, not as an empty valu
     // failure self-healed on the next get and was never reportable.
     // `SPEC.md` §6 promises `error.OutOfMemory`.
     const value_len = 4093; // a size ramcache/the key path never asks for
-    const big = "x" ** value_len;
+    const big = strRepeat("x", value_len);
 
     // (a) a genuinely empty backend value is a value, and stays one.
     {
@@ -1284,4 +1284,16 @@ test "meta is well-formed" {
     try testing.expect(meta.platform == .any);
     try testing.expect(meta.concurrency == .threadsafe);
     try testing.expect(meta.deps.len == 1);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

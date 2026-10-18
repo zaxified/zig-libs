@@ -1138,7 +1138,7 @@ pub const Cache = struct {
             self.syncStats();
             return;
         }
-        if (builtin.mode == .Debug) std.debug.assert(self.entryOf(n.key).?.node == n);
+        if (builtin.mode == .debug) std.debug.assert(self.entryOf(n.key).?.node == n);
         // Back in at the tail: the borrow was a use, so the entry is the
         // region's most recent one (Caffeine has no borrows; this is the
         // order its read of the same entry would leave).
@@ -1420,7 +1420,7 @@ pub const Cache = struct {
     /// Append `n` at `region`'s tail as its most recent entry.
     fn lruPush(self: *Cache, region: Region, n: *Node) void {
         std.debug.assert(!n.queued);
-        const q = &self.lru[@intFromEnum(region)];
+        const q = &self.lru[@backingInt(region)];
         self.tick += 1;
         n.tick = self.tick;
         n.prev = q.tail;
@@ -1433,7 +1433,7 @@ pub const Cache = struct {
 
     fn lruRemove(self: *Cache, region: Region, n: *Node) void {
         if (!n.queued) return; // borrowed/doomed: not indexed
-        const q = &self.lru[@intFromEnum(region)];
+        const q = &self.lru[@backingInt(region)];
         if (n.prev) |p| p.next = n.next else q.head = n.next;
         if (n.next) |x| x.prev = n.prev else q.tail = n.prev;
         n.prev = null;
@@ -1570,7 +1570,7 @@ pub const Cache = struct {
 
     /// The node behind `regionLruKey`, for moves that need no map entry.
     fn regionLru(self: *Cache, region: Region) ?*Node {
-        const head = self.lru[@intFromEnum(region)].head orelse return null;
+        const head = self.lru[@backingInt(region)].head orelse return null;
         self.maintenance_visits += 1;
         return head;
     }
@@ -1897,7 +1897,7 @@ test "replace refuses a value larger than the whole cache, and drops the entry r
     c.put("a", "aaaaaaaaaa", 0, 0, 0); // 10 bytes
     c.put("b", "bbbbbbbbbb", 1, 0, 0); // 10 bytes
     c.put("k", "small", 2, 0, 0); // 5 bytes — 25 total, well under the cap
-    const big = [_]u8{'x'} ** 200; // 200 > 64 — unstorable however it arrives
+    const big = @as([200]u8, @splat('x')); // 200 > 64 — unstorable however it arrives
     c.put("k", &big, 3, 0, 0);
     // Not the new bytes (3x the whole cache) and not the old ones either: a
     // refused write that keeps the previous value serves pre-write data
@@ -2234,10 +2234,10 @@ const testkit = @import("testkit");
 const fuzz_driver = testkit.fuzz.driver;
 
 const SeamLabel = enum { pinned, committed, released, parked, idled };
-var seam_reach: [@typeInfo(SeamLabel).@"enum".fields.len]usize = @splat(0);
+var seam_reach: [@typeInfo(SeamLabel).@"enum".field_names.len]usize = @splat(0);
 
 fn mark(comptime l: SeamLabel) void {
-    seam_reach[@intFromEnum(l)] += 1;
+    seam_reach[@backingInt(l)] += 1;
     fuzz_driver.hit(@tagName(l));
 }
 
@@ -2529,7 +2529,7 @@ test "fuzz harness: 400 seeds in every test run, and they get everywhere" {
         };
     }
     for (seam_reach, 0..) |n, i| if (n == 0) {
-        std.debug.print("reach: label {t} never hit in 400 seeds\n", .{@as(SeamLabel, @enumFromInt(i))});
+        std.debug.print("reach: label {t} never hit in 400 seeds\n", .{@as(SeamLabel, @fromBackingInt(@intCast(i)))});
         return error.HarnessDoesNotReach;
     };
 }
@@ -2781,16 +2781,16 @@ test "borrow: parking a doomed value returns its bytes to the accounting" {
     // to 120 and the cache evicts to get back under the cap.
     var c = testCache(100, 16);
     defer c.deinit();
-    c.put("a", "A" ** 40, 0, 0, 0);
+    c.put("a", strRepeat("A", 40), 0, 0, 0);
     const b = c.pin("a", 0, 0).?;
-    c.put("a", "B" ** 40, 0, 0, 0); // dooms the borrowed 40 bytes
+    c.put("a", strRepeat("B", 40), 0, 0, 0); // dooms the borrowed 40 bytes
     try testing.expectEqual(@as(usize, 40), c.bytes);
 
-    c.put("bystander", "C" ** 40, 0, 0, 0);
+    c.put("bystander", strRepeat("C", 40), 0, 0, 0);
     try testing.expectEqual(@as(usize, 80), c.bytes);
-    try testing.expectEqualStrings("C" ** 40, c.get("bystander", 0, 0).?);
-    try testing.expectEqualStrings("B" ** 40, c.get("a", 0, 0).?);
-    try testing.expectEqualStrings("A" ** 40, b.bytes);
+    try testing.expectEqualStrings(strRepeat("C", 40), c.get("bystander", 0, 0).?);
+    try testing.expectEqualStrings(strRepeat("B", 40), c.get("a", 0, 0).?);
+    try testing.expectEqualStrings(strRepeat("A", 40), b.bytes);
     c.release(b);
     try testing.expectEqual(@as(usize, 80), c.bytes); // release frees, it does not un-count
 }
@@ -2818,7 +2818,7 @@ test "borrow: parking a doomed value returns its region slot to the accounting" 
 test "borrow: a discarded reservation returns its bytes to the accounting" {
     var c = testCache(100, 16);
     defer c.deinit();
-    c.put("keep", "K" ** 40, 0, 0, 0);
+    c.put("keep", strRepeat("K", 40), 0, 0, 0);
     const f = c.reserve("tmp", 40, 0, 0, 0).?;
     try testing.expectEqual(@as(usize, 80), c.bytes);
     c.discard(f);
@@ -2826,9 +2826,9 @@ test "borrow: a discarded reservation returns its bytes to the accounting" {
     try testing.expectEqual(@as(usize, c.map.count()), c.window_count + c.probation_count + c.protected_count);
 
     // Bystander: a phantom 40 would put this insert at 120 and evict "keep".
-    c.put("other", "O" ** 40, 0, 0, 0);
-    try testing.expectEqualStrings("K" ** 40, c.get("keep", 0, 0).?);
-    try testing.expectEqualStrings("O" ** 40, c.get("other", 0, 0).?);
+    c.put("other", strRepeat("O", 40), 0, 0, 0);
+    try testing.expectEqualStrings(strRepeat("K", 40), c.get("keep", 0, 0).?);
+    try testing.expectEqualStrings(strRepeat("O", 40), c.get("other", 0, 0).?);
 }
 
 test "borrow: deinit frees values still parked for an outstanding borrow" {
@@ -2891,7 +2891,7 @@ fn expectRegionQueuesAgree(c: *Cache) !void {
     var indexed = [_]usize{ 0, 0, 0 }; // ...of those, the ones a heap must hold
     var it = c.map.keyIterator();
     while (it.next()) |kv| {
-        const r = @intFromEnum(kv.*.entry.node.region);
+        const r = @backingInt(kv.*.entry.node.region);
         live[r] += 1;
         // A borrowed node is deliberately out of both heaps (see `Node.pins`).
         if (kv.*.entry.node.pins == 0) indexed[r] += 1;
@@ -2906,7 +2906,7 @@ fn expectRegionQueuesAgree(c: *Cache) !void {
         while (it_n) |n| : (it_n = n.next) {
             try testing.expect(n.queued);
             const e = c.entryOf(n.key) orelse return error.QueueHoldsAnUnmappedNode;
-            try testing.expectEqual(@as(usize, r), @intFromEnum(e.node.region));
+            try testing.expectEqual(@as(usize, r), @backingInt(e.node.region));
             walked += 1;
         }
         try testing.expectEqual(q.len, walked);
@@ -3010,7 +3010,7 @@ test "borrow: a released probation entry is still the region's eviction candidat
     // `evictOne` goes straight to the main region's LRU root, so the victim is
     // decided by heap membership alone and nothing here depends on frequency.
     const wb = c.pin("win", 0, 0).?;
-    try testing.expectEqual(@as(usize, 0), c.lru[@intFromEnum(Cache.Region.window)].len);
+    try testing.expectEqual(@as(usize, 0), c.lru[@backingInt(Cache.Region.window)].len);
 
     // A reservation is pinned from birth, so it adds pressure without adding a
     // window candidate: one entry over the cap, one eviction.
@@ -3483,7 +3483,7 @@ test "victim selection is O(1): eviction bookkeeping does not scan the map" {
     // Judged by a counter rather than a clock: `maintenance_visits` counts the
     // entries those two functions examine. Flat per insert = O(1) selection;
     // growing with capacity = the scan is back.
-    const val = [_]u8{0xcd} ** 64;
+    const val = @as([64]u8, @splat(0xcd));
     const rounds: usize = 8; // 8x capacity of distinct keys → steady-state eviction
 
     var per_put: [2]f64 = undefined;
@@ -4224,4 +4224,16 @@ test "adaptive window: on a frequency-skewed (zipf) trace it is no worse than th
         );
         return err;
     };
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

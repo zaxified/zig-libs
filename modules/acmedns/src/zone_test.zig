@@ -45,7 +45,7 @@ fn wire(comptime name: []const u8) []const u8 {
     }
 }
 
-const soa_rdata = wire("ns1.a.test") ++ wire("hostmaster.a.test") ++ ("\x00\x00\x00\x01" ++ "\x00\x00\x0e\x10" ** 4);
+const soa_rdata = wire("ns1.a.test") ++ wire("hostmaster.a.test") ++ ("\x00\x00\x00\x01" ++ strRepeat("\x00\x00\x0e\x10", 4));
 
 /// Answers every datagram by the first matching rules (all rules for the
 /// same name and type contribute one record each), else `fallback`.
@@ -259,4 +259,16 @@ test "propagation: a nameserver whose address does not resolve holds the check (
     try testing.expectError(error.PropagationTimeout, propagationRun(servfail, true));
     // Unless one server is enough by configuration.
     try propagationRun(servfail, false);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

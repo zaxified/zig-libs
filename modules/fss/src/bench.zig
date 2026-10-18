@@ -33,8 +33,8 @@ fn benchCase(
     naive: []D.Elem,
     fast: []D.Elem,
 ) !void {
-    const s0 = [_]u8{0x3C} ** 16;
-    const s1 = [_]u8{0xC3} ** 16;
+    const s0 = @as([16]u8, @splat(0x3C));
+    const s1 = @as([16]u8, @splat(0xC3));
     var keys: [2]D.Key = undefined;
     D.genWithSeeds(alpha, 1, &s0, &s1, &keys);
 
@@ -154,8 +154,8 @@ fn benchPrgPair(comptime n_bits: usize) !void {
 
     inline for (.{ fss.prg.Sha256Prg, fss.prg.Aes128Mmo }) |P| {
         const D = fss.DpfWith(P, n_bits, 8);
-        const s0 = [_]u8{0x3C} ** 16;
-        const s1 = [_]u8{0xC3} ** 16;
+        const s0 = @as([16]u8, @splat(0x3C));
+        const s1 = @as([16]u8, @splat(0xC3));
 
         // (a) raw PRG expansions
         const expansions = 1 << 20;

@@ -1272,7 +1272,7 @@ noinline fn f5DriveSessionAuth(gpa: std.mem.Allocator) void {
 }
 
 test "F5 (ReleaseFast only): plaintext password does not survive on the dead stack after AUTH" {
-    if (@import("builtin").mode != .ReleaseFast) return error.SkipZigTest;
+    if (@import("builtin").mode != .fast) return error.SkipZigTest;
     const gpa = testing.allocator;
 
     f5Scrub();

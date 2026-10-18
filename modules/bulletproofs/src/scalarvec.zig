@@ -33,10 +33,10 @@ const scalar = Ristretto255.scalar;
 pub const zero: [32]u8 = scalar.zero;
 
 /// The scalar `1` (32-byte little-endian: `[1, 0, 0, ..., 0]`).
-pub const one: [32]u8 = [_]u8{1} ++ [_]u8{0} ** 31;
+pub const one: [32]u8 = [_]u8{1} ++ @as([31]u8, @splat(0));
 
 /// The scalar `2` (32-byte little-endian: `[2, 0, 0, ..., 0]`).
-pub const two: [32]u8 = [_]u8{2} ++ [_]u8{0} ** 31;
+pub const two: [32]u8 = [_]u8{2} ++ @as([31]u8, @splat(0));
 
 /// The Ristretto255 identity (neutral) element — `Ristretto255` exposes no
 /// direct constant for it (only `basePoint`), so it is built once here from
@@ -277,10 +277,10 @@ pub fn multiScalarMulVartime(scalars: []const [32]u8, points: []const Ristretto2
 
 test "innerProduct: hand-computed small vectors" {
     // a = [2, 3], b = [5, 7] -> <a,b> = 10 + 21 = 31.
-    const a = [_][32]u8{ two, [_]u8{3} ++ [_]u8{0} ** 31 };
-    const b = [_][32]u8{ [_]u8{5} ++ [_]u8{0} ** 31, [_]u8{7} ++ [_]u8{0} ** 31 };
+    const a = [_][32]u8{ two, [_]u8{3} ++ @as([31]u8, @splat(0)) };
+    const b = [_][32]u8{ [_]u8{5} ++ @as([31]u8, @splat(0)), [_]u8{7} ++ @as([31]u8, @splat(0)) };
     const got = try innerProduct(&a, &b);
-    const want = [_]u8{31} ++ [_]u8{0} ** 31;
+    const want = [_]u8{31} ++ @as([31]u8, @splat(0));
     try std.testing.expectEqualSlices(u8, &want, &got);
 }
 
@@ -296,18 +296,18 @@ test "innerProduct: empty vectors give zero" {
 }
 
 test "hadamard/addVec/subVec/scaleVec: hand-computed" {
-    const a = [_][32]u8{ two, [_]u8{4} ++ [_]u8{0} ** 31 };
-    const b = [_][32]u8{ [_]u8{3} ++ [_]u8{0} ** 31, [_]u8{5} ++ [_]u8{0} ** 31 };
+    const a = [_][32]u8{ two, [_]u8{4} ++ @as([31]u8, @splat(0)) };
+    const b = [_][32]u8{ [_]u8{3} ++ @as([31]u8, @splat(0)), [_]u8{5} ++ @as([31]u8, @splat(0)) };
 
     var had: [2][32]u8 = undefined;
     try hadamard(&had, &a, &b);
-    try std.testing.expectEqualSlices(u8, &([_]u8{6} ++ [_]u8{0} ** 31), &had[0]); // 2*3
-    try std.testing.expectEqualSlices(u8, &([_]u8{20} ++ [_]u8{0} ** 31), &had[1]); // 4*5
+    try std.testing.expectEqualSlices(u8, &([_]u8{6} ++ @as([31]u8, @splat(0))), &had[0]); // 2*3
+    try std.testing.expectEqualSlices(u8, &([_]u8{20} ++ @as([31]u8, @splat(0))), &had[1]); // 4*5
 
     var sum: [2][32]u8 = undefined;
     try addVec(&sum, &a, &b);
-    try std.testing.expectEqualSlices(u8, &([_]u8{5} ++ [_]u8{0} ** 31), &sum[0]); // 2+3
-    try std.testing.expectEqualSlices(u8, &([_]u8{9} ++ [_]u8{0} ** 31), &sum[1]); // 4+5
+    try std.testing.expectEqualSlices(u8, &([_]u8{5} ++ @as([31]u8, @splat(0))), &sum[0]); // 2+3
+    try std.testing.expectEqualSlices(u8, &([_]u8{9} ++ @as([31]u8, @splat(0))), &sum[1]); // 4+5
 
     var diff: [2][32]u8 = undefined;
     try subVec(&diff, &b, &a);
@@ -315,9 +315,9 @@ test "hadamard/addVec/subVec/scaleVec: hand-computed" {
     try std.testing.expectEqualSlices(u8, &one, &diff[1]); // 5-4 = 1
 
     var scaled: [2][32]u8 = undefined;
-    try scaleVec(&scaled, &a, [_]u8{10} ++ [_]u8{0} ** 31);
-    try std.testing.expectEqualSlices(u8, &([_]u8{20} ++ [_]u8{0} ** 31), &scaled[0]); // 2*10
-    try std.testing.expectEqualSlices(u8, &([_]u8{40} ++ [_]u8{0} ** 31), &scaled[1]); // 4*10
+    try scaleVec(&scaled, &a, [_]u8{10} ++ @as([31]u8, @splat(0)));
+    try std.testing.expectEqualSlices(u8, &([_]u8{20} ++ @as([31]u8, @splat(0))), &scaled[0]); // 2*10
+    try std.testing.expectEqualSlices(u8, &([_]u8{40} ++ @as([31]u8, @splat(0))), &scaled[1]); // 4*10
 }
 
 test "hadamard/addVec/subVec/scaleVec: length mismatch rejected" {
@@ -331,12 +331,12 @@ test "hadamard/addVec/subVec/scaleVec: length mismatch rejected" {
 }
 
 test "powers: x^0..x^(n-1), x=3, n=5" {
-    const three = [_]u8{3} ++ [_]u8{0} ** 31;
+    const three = [_]u8{3} ++ @as([31]u8, @splat(0));
     const got = try powers(std.testing.allocator, three, 5);
     defer std.testing.allocator.free(got);
     const want = [_]u32{ 1, 3, 9, 27, 81 };
     for (got, want) |g, w| {
-        var wb = [_]u8{0} ** 32;
+        var wb = @as([32]u8, @splat(0));
         std.mem.writeInt(u32, wb[0..4], w, .little);
         try std.testing.expectEqualSlices(u8, &wb, &g);
     }
@@ -409,7 +409,7 @@ fn multiScalarMulPreB9(scalars: []const [32]u8, points: []const Ristretto255) Mu
 }
 
 test "B9 diff: multiScalarMul is bit-exact to the pre-B9 per-term loop" {
-    const debug = @import("builtin").mode == .Debug;
+    const debug = @import("builtin").mode == .debug;
     var prng = std.Random.DefaultPrng.init(0xB9_D1FF);
     const random = prng.random();
     const sizes = [_]usize{ 0, 1, 2, 3, 4, 7, 8, 9, 16, 17, 32, 33, 64, 65 };
@@ -446,21 +446,21 @@ test "B9 diff: multiScalarMul is bit-exact to the pre-B9 per-term loop" {
 test "multiScalarMul: 2*G + 3*basePoint.dbl() matches direct computation" {
     const g = Ristretto255.basePoint;
     const h = g.dbl();
-    const scalars = [_][32]u8{ two, [_]u8{3} ++ [_]u8{0} ** 31 };
+    const scalars = [_][32]u8{ two, [_]u8{3} ++ @as([31]u8, @splat(0)) };
     const points = [_]Ristretto255{ g, h };
     const got = try multiScalarMul(&scalars, &points);
 
-    const want = (try g.mul(two)).add(try h.mul([_]u8{3} ++ [_]u8{0} ** 31));
+    const want = (try g.mul(two)).add(try h.mul([_]u8{3} ++ @as([31]u8, @splat(0))));
     try std.testing.expect(got.equivalent(want));
 }
 
 test "multiScalarMul: a zero scalar contributes nothing" {
     const g = Ristretto255.basePoint;
     const h = g.dbl();
-    const scalars = [_][32]u8{ zero, [_]u8{3} ++ [_]u8{0} ** 31 };
+    const scalars = [_][32]u8{ zero, [_]u8{3} ++ @as([31]u8, @splat(0)) };
     const points = [_]Ristretto255{ g, h };
     const got = try multiScalarMul(&scalars, &points);
-    const want = try h.mul([_]u8{3} ++ [_]u8{0} ** 31);
+    const want = try h.mul([_]u8{3} ++ @as([31]u8, @splat(0)));
     try std.testing.expect(got.equivalent(want));
 }
 
@@ -532,7 +532,7 @@ test "multiScalarMulVartime: edge cases (empty, all-zero, zero points)" {
     try std.testing.expect((try multiScalarMulVartime(&scalars, &points)).equivalent(identity_point));
 
     // One nonzero term amid zeros -> that single scaled point.
-    scalars[7] = [_]u8{5} ++ [_]u8{0} ** 31;
+    scalars[7] = [_]u8{5} ++ @as([31]u8, @splat(0));
     const want = try points[7].mul(scalars[7]);
     try std.testing.expect((try multiScalarMulVartime(&scalars, &points)).equivalent(want));
 }

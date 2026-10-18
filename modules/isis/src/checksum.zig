@@ -227,13 +227,13 @@ test "a computed checksum is never zero and has no zero octet (RFC 3719 §7)" {
 }
 
 test "the offset is load-bearing: computing at the wrong offset does not verify" {
-    var buf: [32]u8 = .{0x5A} ** 32;
+    var buf: [32]u8 = @splat(0x5A);
     const c = try compute(&buf, 10);
     buf[10] = @intCast(c >> 8);
     buf[11] = @intCast(c & 0xFF);
     try testing.expect(verify(&buf));
     // Same bytes, checksum placed two octets over → the congruence fails.
-    var other: [32]u8 = .{0x5A} ** 32;
+    var other: [32]u8 = @splat(0x5A);
     other[12] = @intCast(c >> 8);
     other[13] = @intCast(c & 0xFF);
     try testing.expect(!verify(&other));

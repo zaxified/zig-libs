@@ -122,16 +122,16 @@ fn buildServerHello(share: []const u8) void {
     in_buf[p] = 32;
     p += 1;
     putBytes(&p, entropy[32..64]); // legacy_session_id echo
-    putInt(u16, &p, @intFromEnum(tls.CipherSuite.AES_128_GCM_SHA256));
+    putInt(u16, &p, @backingInt(tls.CipherSuite.AES_128_GCM_SHA256));
     in_buf[p] = 0;
     p += 1;
     putInt(u16, &p, @intCast(6 + 4 + 4 + share.len));
-    putInt(u16, &p, @intFromEnum(tls.ExtensionType.supported_versions));
+    putInt(u16, &p, @backingInt(tls.ExtensionType.supported_versions));
     putInt(u16, &p, 2);
     putInt(u16, &p, 0x0304);
-    putInt(u16, &p, @intFromEnum(tls.ExtensionType.key_share));
+    putInt(u16, &p, @backingInt(tls.ExtensionType.key_share));
     putInt(u16, &p, @intCast(4 + share.len));
-    putInt(u16, &p, @intFromEnum(tls.NamedGroup.x25519));
+    putInt(u16, &p, @backingInt(tls.NamedGroup.x25519));
     putInt(u16, &p, @intCast(share.len));
     putBytes(&p, share);
     std.mem.writeInt(u24, in_buf[6..9], @intCast(p - 9), .big);
@@ -164,7 +164,7 @@ fn derFromPem(comptime pem: []const u8) []const u8 {
 }
 
 fn hsMsg(buf: []u8, typ: tls.HandshakeType, body: []const u8) []const u8 {
-    buf[0] = @intFromEnum(typ);
+    buf[0] = @backingInt(typ);
     std.mem.writeInt(u24, buf[1..4], @intCast(body.len), .big);
     @memcpy(buf[4..][0..body.len], body);
     return buf[0 .. 4 + body.len];
@@ -173,10 +173,10 @@ fn hsMsg(buf: []u8, typ: tls.HandshakeType, body: []const u8) []const u8 {
 fn appendRecord(key: [Aead.key_length]u8, iv: [Aead.nonce_length]u8, seq: u64, msg: []const u8) void {
     var pt: [2048]u8 = undefined;
     @memcpy(pt[0..msg.len], msg);
-    pt[msg.len] = @intFromEnum(tls.ContentType.handshake);
+    pt[msg.len] = @backingInt(tls.ContentType.handshake);
     const inner = pt[0 .. msg.len + 1];
     const rec = in_buf[in_len..];
-    rec[0..3].* = .{ @intFromEnum(tls.ContentType.application_data), 3, 3 };
+    rec[0..3].* = .{ @backingInt(tls.ContentType.application_data), 3, 3 };
     std.mem.writeInt(u16, rec[3..5], @intCast(inner.len + Aead.tag_length), .big);
     var nonce = iv;
     var seq_be: [8]u8 = undefined;
@@ -202,7 +202,7 @@ fn buildFlight() !void {
     th.update(in_buf[tls.record_header_len..in_len]);
 
     const dl = Sha256.digest_length;
-    const zeroes = [1]u8{0} ** dl;
+    const zeroes = @as([dl]u8, @splat(0));
     const early = K.extract(&[1]u8{0}, &zeroes);
     const empty = tls.emptyHash(Sha256);
     const hs_derived = tls.hkdfExpandLabel(K, early, "derived", &empty, dl);
@@ -214,7 +214,7 @@ fn buildFlight() !void {
 
     var buf: [2048]u8 = undefined;
     var body: [2048]u8 = undefined;
-    putBytes(&in_len, &.{ @intFromEnum(tls.ContentType.change_cipher_spec), 3, 3, 0, 1, 1 });
+    putBytes(&in_len, &.{ @backingInt(tls.ContentType.change_cipher_spec), 3, 3, 0, 1, 1 });
 
     const ee = hsMsg(&buf, .encrypted_extensions, &.{ 0, 0 });
     th.update(ee);
@@ -231,13 +231,13 @@ fn buildFlight() !void {
     appendRecord(key, iv, 1, cert);
 
     const kp = try Es256.KeyPair.fromSecretKey(try Es256.SecretKey.fromBytes(server_key_der[7..39].*));
-    const signed = " " ** 64 ++ "TLS 1.3, server CertificateVerify\x00";
+    const signed = strRepeat(" ", 64) ++ "TLS 1.3, server CertificateVerify\x00";
     var cv_msg: [signed.len + dl]u8 = undefined;
     cv_msg[0..signed.len].* = signed.*;
     cv_msg[signed.len..].* = th.peek();
     var sig_der: [Es256.Signature.der_encoded_length_max]u8 = undefined;
     const sig = (try kp.sign(&cv_msg, null)).toDer(&sig_der);
-    std.mem.writeInt(u16, body[0..2], @intFromEnum(tls.SignatureScheme.ecdsa_secp256r1_sha256), .big);
+    std.mem.writeInt(u16, body[0..2], @backingInt(tls.SignatureScheme.ecdsa_secp256r1_sha256), .big);
     std.mem.writeInt(u16, body[2..4], @intCast(sig.len), .big);
     @memcpy(body[4..][0..sig.len], sig);
     const cv = hsMsg(&buf, .certificate_verify, body[0 .. 4 + sig.len]);
@@ -278,7 +278,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             std.debug.print("ctgrind_result={x}\n", .{out_writer.buffered()});
         },
         .cv => {
-            const msg = " " ** 64 ++ "TLS 1.3, client CertificateVerify\x00" ++ derive("transcript", 32);
+            const msg = strRepeat(" ", 64) ++ "TLS 1.3, client CertificateVerify\x00" ++ derive("transcript", 32);
             const p256 = Client.ClientAuth.PrivateKey{ .ecdsa_secp256r1_sha256 = (try Es256.KeyPair.generateDeterministic(derive("p256", 32))).secret_key.bytes };
             const p384 = Client.ClientAuth.PrivateKey{ .ecdsa_secp384r1_sha384 = (try std.crypto.sign.ecdsa.EcdsaP384Sha384.KeyPair.generateDeterministic(derive("p384", 48))).secret_key.bytes };
             const ed = Client.ClientAuth.PrivateKey{ .ed25519 = derive("ed25519", 32) };
@@ -301,4 +301,16 @@ pub fn main(init: std.process.Init.Minimal) !void {
             }
         },
     }
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

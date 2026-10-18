@@ -420,7 +420,7 @@ fn fromJoinerBody(
 /// chain.
 // secret-api-ok: returns the all-zero constant of RFC 9420 section 8, not a secret.
 pub fn zeroSecret(comptime S: type) [S.Nh]u8 {
-    return [_]u8{0} ** S.Nh;
+    return @as([S.Nh]u8, @splat(0));
 }
 
 /// `ExpandWithLabel` with an EXACTLY-sized heap scratch — the two
@@ -476,16 +476,16 @@ pub const label_external_init = "MLS 1.0 external init secret";
 /// `hpke`, which this batch was scoped out of.
 fn hpkeSuiteId(comptime S: type) [10]u8 {
     const aead_id: u16 = if (S.Aead == std.crypto.aead.aes_gcm.Aes128Gcm)
-        @intFromEnum(hpke.AeadId.aes128gcm)
+        @backingInt(hpke.AeadId.aes128gcm)
     else if (S.Aead == std.crypto.aead.aes_gcm.Aes256Gcm)
-        @intFromEnum(hpke.AeadId.aes256gcm)
+        @backingInt(hpke.AeadId.aes256gcm)
     else if (S.Aead == std.crypto.aead.chacha_poly.ChaCha20Poly1305)
-        @intFromEnum(hpke.AeadId.chacha20poly1305)
+        @backingInt(hpke.AeadId.chacha20poly1305)
     else
         @compileError("mls: no RFC 9180 aead_id registered for " ++ @typeName(S.Aead));
     return hpke.suite.suiteId(
         S.Kem.kem_id,
-        @intFromEnum(hpke.KdfId.hkdf_sha256),
+        @backingInt(hpke.KdfId.hkdf_sha256),
         aead_id,
     );
 }
@@ -868,9 +868,9 @@ const testing = std.testing;
 const TestSuite = suite.default;
 
 test "GroupContext: encodes RFC 9420 §8.1's field order, and round-trips" {
-    const gid = [_]u8{0xaa} ** 4;
-    const th = [_]u8{0xbb} ** 32;
-    const cth = [_]u8{0xcc} ** 32;
+    const gid = @as([4]u8, @splat(0xaa));
+    const th = @as([32]u8, @splat(0xbb));
+    const cth = @as([32]u8, @splat(0xcc));
     const gc: GroupContext = .{
         .cipher_suite = TestSuite.id,
         .group_id = &gid,
@@ -902,9 +902,9 @@ test "GroupContext: encodes RFC 9420 §8.1's field order, and round-trips" {
 }
 
 test "GroupContext: a multi-kilobyte extension list still derives (the fixed 512-byte scratch cannot)" {
-    const big = [_]u8{0x5a} ** 3000;
+    const big = @as([3000]u8, @splat(0x5a));
     const exts = [_]tree.Extension{.{ .extension_type = 0xf00d, .extension_data = &big }};
-    const th = [_]u8{0xbb} ** 32;
+    const th = @as([32]u8, @splat(0xbb));
     const gc: GroupContext = .{
         .cipher_suite = TestSuite.id,
         .group_id = "g",
@@ -931,10 +931,10 @@ test "GroupContext: a multi-kilobyte extension list still derives (the fixed 512
 }
 
 test "deriveEpoch: matches the step-by-step derivation, and every secret is distinct" {
-    const init_prev = [_]u8{0x01} ** TestSuite.Nh;
-    const commit = [_]u8{0x02} ** TestSuite.Nh;
-    const psk = [_]u8{0x03} ** TestSuite.Nh;
-    const th = [_]u8{0x04} ** 32;
+    const init_prev = @as([TestSuite.Nh]u8, @splat(0x01));
+    const commit = @as([TestSuite.Nh]u8, @splat(0x02));
+    const psk = @as([TestSuite.Nh]u8, @splat(0x03));
+    const th = @as([32]u8, @splat(0x04));
     const gc: GroupContext = .{
         .cipher_suite = TestSuite.id,
         .group_id = "group",
@@ -979,8 +979,8 @@ test "deriveEpoch: matches the step-by-step derivation, and every secret is dist
 }
 
 test "extractInitCommit/memberSecret: salt and IKM are not interchangeable" {
-    const a = [_]u8{0x11} ** TestSuite.Nh;
-    const b = [_]u8{0x22} ** TestSuite.Nh;
+    const a = @as([TestSuite.Nh]u8, @splat(0x11));
+    const b = @as([TestSuite.Nh]u8, @splat(0x22));
     // If these were equal, Figure 22's salt/IKM convention would be
     // unfalsifiable and the KAT could not catch an inverted Extract.
     var ab: [TestSuite.Nh]u8 = undefined;
@@ -1001,15 +1001,15 @@ test "pskSecret: empty list is psk_secret_[0], and order/count/nonce all change 
     const zero = zeroSecret(TestSuite);
     try testing.expectEqualSlices(u8, &zero, &empty);
 
-    const nonce_a = [_]u8{0xa0} ** TestSuite.Nh;
-    const nonce_b = [_]u8{0xb0} ** TestSuite.Nh;
+    const nonce_a = @as([TestSuite.Nh]u8, @splat(0xa0));
+    const nonce_b = @as([TestSuite.Nh]u8, @splat(0xb0));
     const k0: PreSharedKey(TestSuite) = .{
         .id = .{ .id = .{ .external = "id-0" }, .psk_nonce = &nonce_a },
-        .secret = &[_]u8{0x10} ** TestSuite.Nh,
+        .secret = &@as([TestSuite.Nh]u8, @splat(0x10)),
     };
     const k1: PreSharedKey(TestSuite) = .{
         .id = .{ .id = .{ .external = "id-1" }, .psk_nonce = &nonce_b },
-        .secret = &[_]u8{0x20} ** TestSuite.Nh,
+        .secret = &@as([TestSuite.Nh]u8, @splat(0x20)),
     };
 
     var forward: [TestSuite.Nh]u8 = undefined;
@@ -1033,7 +1033,7 @@ test "pskSecret: empty list is psk_secret_[0], and order/count/nonce all change 
 }
 
 test "PreSharedKeyId: both select arms round-trip; an unknown psktype is rejected" {
-    const nonce = [_]u8{0x77} ** TestSuite.Nh;
+    const nonce = @as([TestSuite.Nh]u8, @splat(0x77));
     const ext: PreSharedKeyId = .{ .id = .{ .external = "app-psk" }, .psk_nonce = &nonce };
     const res: PreSharedKeyId = .{
         .id = .{ .resumption = .{ .usage = .branch, .psk_group_id = "other-group", .psk_epoch = 42 } },
@@ -1061,8 +1061,8 @@ test "PreSharedKeyId: both select arms round-trip; an unknown psktype is rejecte
 }
 
 test "confirmation/membership tags: verify accepts, one flipped bit and a short tag are rejected" {
-    const key = [_]u8{0x5c} ** TestSuite.Nh;
-    const cth = [_]u8{0x99} ** 32;
+    const key = @as([TestSuite.Nh]u8, @splat(0x5c));
+    const cth = @as([32]u8, @splat(0x99));
 
     var tag = confirmationTag(TestSuite, &key, &cth);
     try verifyConfirmationTag(TestSuite, &key, &cth, &tag);
@@ -1085,7 +1085,7 @@ test "confirmation/membership tags: verify accepts, one flipped bit and a short 
 }
 
 test "mlsExporter: label and context are both bound, and the length is honoured" {
-    const es = [_]u8{0x6e} ** TestSuite.Nh;
+    const es = @as([TestSuite.Nh]u8, @splat(0x6e));
     var out_a: [48]u8 = undefined;
     var out_b: [48]u8 = undefined;
     try mlsExporter(TestSuite, &es, "label", "context", &out_a);
@@ -1100,8 +1100,8 @@ test "mlsExporter: label and context are both bound, and the length is honoured"
 }
 
 test "externalKeyPair: deterministic in external_secret, and a distinct secret gives a distinct key" {
-    const a = [_]u8{0x31} ** TestSuite.Nh;
-    const b = [_]u8{0x32} ** TestSuite.Nh;
+    const a = @as([TestSuite.Nh]u8, @splat(0x31));
+    const b = @as([TestSuite.Nh]u8, @splat(0x32));
     var ka1: TestSuite.Kem.KeyPair = undefined;
     var ka2: TestSuite.Kem.KeyPair = undefined;
     var kb: TestSuite.Kem.KeyPair = undefined;
@@ -1136,7 +1136,7 @@ test "§8.3: hpkeSuiteId reproduces RFC 9180 §7.2.1's suite_id for suite 0x0001
 }
 
 test "§8.3: sender and receiver derive the same init_secret, and it is bound to both inputs" {
-    const external_secret = [_]u8{0x5a} ** TestSuite.Nh;
+    const external_secret = @as([TestSuite.Nh]u8, @splat(0x5a));
     var group_key: TestSuite.Kem.KeyPair = undefined;
     externalKeyPair(TestSuite, &external_secret, &group_key);
 
@@ -1152,7 +1152,7 @@ test "§8.3: sender and receiver derive the same init_secret, and it is bound to
 
     // An `init_secret` that ignored the group's external key would let any
     // non-member drive the group into an epoch of their choosing.
-    const other_secret = [_]u8{0x5b} ** TestSuite.Nh;
+    const other_secret = @as([TestSuite.Nh]u8, @splat(0x5b));
     var other_group: TestSuite.Kem.KeyPair = undefined;
     externalKeyPair(TestSuite, &other_secret, &other_group);
     var other_sent: ExternalInit(TestSuite) = undefined;

@@ -47,7 +47,7 @@ const Scalar = scalarmod.Scalar;
 /// reduction (a 32-byte hash can exceed the group order `n`, so a plain
 /// `Scalar.fromBytes` would wrongly reject the rare oversized hash).
 fn reduceToScalar(bytes32: [32]u8) Scalar {
-    var wide: [48]u8 = [_]u8{0} ** 48;
+    var wide: [48]u8 = @as([48]u8, @splat(0));
     wide[16..48].* = bytes32;
     return Scalar.fromBytes48(wide, .big);
 }
@@ -59,8 +59,8 @@ fn rfc6979Nonce(privkey: [32]u8, hash32: [32]u8) Scalar {
     // byte length) this is exactly `H(m) mod n`, re-encoded big-endian.
     const h1 = reduceToScalar(hash32).toBytes(.big);
 
-    var v: [32]u8 = [_]u8{0x01} ** 32;
-    var k: [32]u8 = [_]u8{0x00} ** 32;
+    var v: [32]u8 = @as([32]u8, @splat(0x01));
+    var k: [32]u8 = @as([32]u8, @splat(0x00));
     // A1/k256.md G2: `v`/`k` (the DRBG state) and `buf`/`buf2` (which carry
     // `privkey` and, once the loop finds a candidate, the nonce material
     // itself) used to survive unzeroed on the dead stack after this function
@@ -371,7 +371,7 @@ test "recoverPubkey: r=0 and s=0 are rejected (error.InvalidScalar), not silentl
     hash[31] = 0x99;
     const sig = try sign(&privkey, hash);
 
-    const zero = [_]u8{0} ** 32;
+    const zero = @as([32]u8, @splat(0));
     try testing.expectError(error.InvalidScalar, recoverPubkey(hash, zero, sig.s, sig.recid));
     try testing.expectError(error.InvalidScalar, recoverPubkey(hash, sig.r, zero, sig.recid));
 }
@@ -608,7 +608,7 @@ test "sign refuses a private key of 0, n, or above n" {
 test "recoverPubkey: recid bit 1 with r + n >= p is InvalidScalar" {
     var hash: [32]u8 = undefined;
     Sha256.hash("recid bit 1", &hash, .{});
-    const s = [_]u8{0} ** 31 ++ [_]u8{1};
+    const s = @as([31]u8, @splat(0)) ++ [_]u8{1};
     var r_p: [32]u8 = undefined;
     std.mem.writeInt(u256, &r_p, fieldmod.field_order - scalarmod.field_order, .big);
     var r_top: [32]u8 = undefined;

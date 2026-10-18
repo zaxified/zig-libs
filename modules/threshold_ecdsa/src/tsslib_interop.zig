@@ -136,7 +136,7 @@ fn verifyCommittedSignatures(set: vectors.KeySet, public_key: root.Element) !voi
 }
 
 test "tss-lib keygen output: this module signs with it; tss-lib's ring-Pedersen tuples pass Πprm/Πmod" {
-    if (builtin.mode == .Debug) return error.SkipZigTest;
+    if (builtin.mode == .debug) return error.SkipZigTest;
     const allocator = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x7473_736c_6962_41); // "tsslibA"
     const random = prng.random();
@@ -165,7 +165,7 @@ test "tss-lib keygen output: this module signs with it; tss-lib's ring-Pedersen 
 }
 
 test "this module's key material: tss-lib signed with it (committed signatures verify), and so does this module" {
-    if (builtin.mode == .Debug) return error.SkipZigTest;
+    if (builtin.mode == .debug) return error.SkipZigTest;
     const allocator = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x7473_736c_6962_42); // "tsslibB"
     const random = prng.random();
@@ -181,7 +181,7 @@ test "this module's key material: tss-lib signed with it (committed signatures v
 }
 
 test "auxParamsWithTrapdoorFromSafePrimes: tss-lib's safe primes give tss-lib's Ñ, and our Πprm/Πmod over it verify" {
-    if (builtin.mode == .Debug) return error.SkipZigTest;
+    if (builtin.mode == .debug) return error.SkipZigTest;
     const allocator = testing.allocator;
     const pp = vectors.tsslib_keygen.parties[0];
     var p: [128]u8 = undefined;

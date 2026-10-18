@@ -1249,7 +1249,7 @@ test "parse + format roundtrip" {
 test "arbitrary precision exceeds the fixed-scale Decimal's i128 range" {
     // 40 nines followed by 40 more digits — far beyond i128's ~1.7e38
     // ceiling that bounds the fixed-scale Decimal.
-    const huge = "9" ** 40 ++ "." ++ "1" ** 40;
+    const huge = strRepeat("9", 40) ++ "." ++ strRepeat("1", 40);
     var d = dec(huge);
     defer d.deinit();
     try expectStr(d, huge);
@@ -1566,8 +1566,8 @@ test "precision — significant digits, exactly at the powers of ten" {
         .{ .s = "-0.00123", .want = 3 },
         .{ .s = "1.2300", .want = 5 },
         .{ .s = "1e100", .want = 1 },
-        .{ .s = "9" ** 100, .want = 100 },
-        .{ .s = "1" ++ "0" ** 200, .want = 201 },
+        .{ .s = strRepeat("9", 100), .want = 100 },
+        .{ .s = "1" ++ strRepeat("0", 200), .want = 201 },
     };
     for (cases) |c| {
         var d = dec(c.s);
@@ -1651,7 +1651,7 @@ test "remainder — sign follows the dividend, exponent is min(ea, eb)" {
     try testing.expectError(error.DivisionByZero, BigDecimal.remainder(talloc, one, zero));
 
     // Beyond any fixed-width type: an exact remainder of 200-digit operands.
-    var big_a = dec("1" ++ "0" ** 200);
+    var big_a = dec("1" ++ strRepeat("0", 200));
     defer big_a.deinit();
     var big_b = dec("7");
     defer big_b.deinit();
@@ -2220,8 +2220,8 @@ const parse_seeds = [_][]const u8{
     seed("2.08e9"),
     seed("1.23e-4"),
     seed("1E1000000"), // an exponent a fixed-scale decimal cannot hold
-    seed("9" ** 40 ++ "." ++ "1" ** 40), // 81 characters, far past i128
-    seed("9" ** 200), // a hostile digit run, which is what this parser is for
+    seed(strRepeat("9", 40) ++ "." ++ strRepeat("1", 40)), // 81 characters, far past i128
+    seed(strRepeat("9", 200)), // a hostile digit run, which is what this parser is for
     seed(""), // InvalidCharacter — and the ONE input the collapsed harness ran
     seed("abc"), // InvalidCharacter
     seed("1.2.3"), // InvalidCharacter
@@ -2458,13 +2458,13 @@ test "sqrt: the digit budgets are inclusive and -0 is not a negative operand" {
 
     // A radicand of exactly `lim` digits is allowed. Python, prec=5:
     // sqrt(Decimal(10)**99999) = 3.1623E+49999 -> coefficient 31623, exponent 49995.
-    var wide = dec("1" ++ "0" ** 99999);
+    var wide = dec("1" ++ strRepeat("0", 99999));
     defer wide.deinit();
     var r = try BigDecimal.sqrt(talloc, wide, 5, .half_even);
     defer r.deinit();
     try testing.expectEqual(@as(i32, 49995), r.exponent);
     try testing.expectEqual(@as(i64, 31623), try r.coeff.toConst().toInt(i64));
-    var too_wide = dec("1" ++ "0" ** 100000);
+    var too_wide = dec("1" ++ strRepeat("0", 100000));
     defer too_wide.deinit();
     try testing.expectError(error.PrecisionTooLarge, BigDecimal.sqrt(talloc, too_wide, 5, .half_even));
 
@@ -2507,12 +2507,24 @@ test "parse: long exponent literals are read by value, never truncated" {
     var a = dec("1e0000000000000012");
     defer a.deinit();
     try testing.expectEqual(@as(i32, 12), a.exponent);
-    var b = dec("1e-" ++ "0" ** 40 ++ "12");
+    var b = dec("1e-" ++ strRepeat("0", 40) ++ "12");
     defer b.deinit();
     try testing.expectEqual(@as(i32, -12), b.exponent);
     // 16 significant digits is far past i32: the module's out-of-range error, not a wrong value.
     try testing.expectError(error.Overflow, BigDecimal.parse(talloc, "1e1000000000000000"));
-    try testing.expectError(error.Overflow, BigDecimal.parse(talloc, "1e-" ++ "9" ** 40));
+    try testing.expectError(error.Overflow, BigDecimal.parse(talloc, "1e-" ++ strRepeat("9", 40)));
     // Junk after a long literal is still malformed.
-    try testing.expectError(error.InvalidCharacter, BigDecimal.parse(talloc, "1e" ++ "9" ** 40 ++ "x"));
+    try testing.expectError(error.InvalidCharacter, BigDecimal.parse(talloc, "1e" ++ strRepeat("9", 40) ++ "x"));
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

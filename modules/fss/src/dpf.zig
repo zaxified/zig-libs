@@ -620,8 +620,8 @@ test "the PRG is part of the key format, and the tag names it" {
 test "a key from the OTHER PRG is different bytes, and the tagged codec rejects it" {
     const A = DpfWith(prg_mod.Aes128Mmo, 6, 4);
     const S = DpfWith(prg_mod.Sha256Prg, 6, 4);
-    const s0: Seed = [_]u8{0x11} ** 16;
-    const s1: Seed = [_]u8{0x22} ** 16;
+    const s0: Seed = @as([16]u8, @splat(0x11));
+    const s1: Seed = @as([16]u8, @splat(0x22));
 
     var pa: [2]A.Key = undefined;
     var ps: [2]S.Key = undefined;
@@ -666,8 +666,8 @@ test "both PRG instantiations are correct DPFs over the full domain" {
     // under it did not break the invariant it maintains, for BOTH.
     inline for (.{ prg_mod.Aes128Mmo, prg_mod.Sha256Prg }) |P| {
         const D = DpfWith(P, 7, 4);
-        const s0: Seed = [_]u8{0xA5} ** 16;
-        const s1: Seed = [_]u8{0x5A} ** 16;
+        const s0: Seed = @as([16]u8, @splat(0xA5));
+        const s1: Seed = @as([16]u8, @splat(0x5A));
         for ([_]D.Index{ 0, 1, 63, 100, 127 }) |alpha| {
             const beta: D.Elem = 0x01020304;
             var keys: [2]D.Key = undefined;

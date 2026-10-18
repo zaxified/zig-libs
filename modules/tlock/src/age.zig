@@ -295,7 +295,7 @@ fn payloadKey(file_key: [file_key_bytes]u8, nonce: [nonce_bytes]u8) [Aead.key_le
 }
 
 fn chunkNonce(counter: u64, last: bool) [Aead.nonce_length]u8 {
-    var n = [_]u8{0} ** Aead.nonce_length;
+    var n = @as([Aead.nonce_length]u8, @splat(0));
     std.mem.writeInt(u64, n[3..11], counter, .big);
     n[11] = @intFromBool(last);
     return n;
@@ -732,9 +732,9 @@ fn sig1000() g1.Affine {
 }
 
 const fixed_rnd: Randomness = .{
-    .file_key = [_]u8{0x42} ** 16,
-    .sigma = [_]u8{0x11} ** 16,
-    .nonce = [_]u8{0x99} ** 16,
+    .file_key = @as([16]u8, @splat(0x42)),
+    .sigma = @as([16]u8, @splat(0x11)),
+    .nonce = @as([16]u8, @splat(0x99)),
 };
 
 /// One file per length class, all opened under the real round-1000 signature.
@@ -755,7 +755,7 @@ fn roundTrip(len: usize, armored: bool) !void {
 
 test "age: tlock stanza body is the genuine tle fixture's 128 bytes (EXTERNAL), and the header parses back" {
     const p_pub = try g2.fromBytesCompressed(hexBytes(96, qt_pub));
-    const rnd: Randomness = .{ .file_key = hexBytes(16, qt_file_key), .sigma = hexBytes(16, qt_sigma), .nonce = [_]u8{0} ** 16 };
+    const rnd: Randomness = .{ .file_key = hexBytes(16, qt_file_key), .sigma = hexBytes(16, qt_sigma), .nonce = @as([16]u8, @splat(0)) };
     var buf: [1024]u8 = undefined;
     const file = try encrypt(&buf, "lorem", p_pub, qt_round, hexBytes(32, qt_chain_hex), &rnd);
 
@@ -810,7 +810,7 @@ test "age: STREAM nonce layout — 11-byte big-endian counter, then the last-chu
 
 test "age: payload tampering, truncation and extension are all refused, and nothing leaks" {
     const gpa = testing.allocator;
-    const pt = [_]u8{0xab} ** (chunk_bytes + 100);
+    const pt = @as([chunk_bytes + 100]u8, @splat(0xab));
     const file = try encryptAlloc(gpa, &pt, pub1000(), 1000, quicknet_chain, &fixed_rnd, .{});
     defer gpa.free(file);
     const out = try gpa.alloc(u8, file.len);
@@ -872,7 +872,7 @@ test "age: header MAC binds every header byte; wrong signature and wrong chain a
 
 /// Build a header by hand around a known body, for the parser's refusals.
 fn headerText(comptime stanzas: []const u8) []const u8 {
-    return version_line ++ "\n" ++ stanzas ++ "--- " ++ "A" ** 42 ++ "A\n";
+    return version_line ++ "\n" ++ stanzas ++ "--- " ++ strRepeat("A", 42) ++ "A\n";
 }
 
 const good_body_b64 = blk: {
@@ -890,7 +890,7 @@ test "age: Header.parse accepts the minimal shape and other recipients beside tl
     const h = try Header.parse(headerText("-> X25519 abc\nAAAA\n" ++ good_tlock ++ "-> some-grease !#$\n\n"));
     try testing.expectEqual(qt_round, h.recipient.round);
     // A body that is an exact multiple of 48 bytes ends with an empty line.
-    _ = try Header.parse(headerText("-> other\n" ++ "A" ** 64 ++ "\n\n" ++ good_tlock));
+    _ = try Header.parse(headerText("-> other\n" ++ strRepeat("A", 64) ++ "\n\n" ++ good_tlock));
 }
 
 test "age: Header.parse refuses malformed headers with typed errors" {
@@ -903,12 +903,12 @@ test "age: Header.parse refuses malformed headers with typed errors" {
         .{ E.MultipleTlockStanzas, headerText(good_tlock ++ good_tlock) },
         .{ E.MalformedHeader, headerText("->  tlock\n\n") }, // empty argument
         .{ E.MalformedHeader, headerText("-> tl\x7fck\n\n") }, // non-VCHAR
-        .{ E.MalformedHeader, headerText("-> x\n" ++ "A" ** 65 ++ "\n") }, // over-long body line
+        .{ E.MalformedHeader, headerText("-> x\n" ++ strRepeat("A", 65) ++ "\n") }, // over-long body line
         .{ E.MalformedHeader, headerText("-> x\nAB\n") }, // non-canonical trailing bits
         .{ E.MalformedHeader, headerText("-> x\nAA==\n") }, // padding is not allowed
         .{ E.MalformedHeader, headerText("-> x\nA\n") }, // impossible length
         .{ E.MalformedHeader, version_line ++ "\n" ++ good_tlock ++ "---\n" }, // MAC missing
-        .{ E.MalformedHeader, version_line ++ "\n" ++ good_tlock ++ "--- " ++ "A" ** 42 ++ "B\n" }, // non-canonical MAC
+        .{ E.MalformedHeader, version_line ++ "\n" ++ good_tlock ++ "--- " ++ strRepeat("A", 42) ++ "B\n" }, // non-canonical MAC
         .{ E.MalformedHeader, version_line ++ "\n" ++ good_tlock ++ "garbage\n" },
         .{ E.MalformedHeader, headerText("-> scrypt a b\nAAAA\n" ++ good_tlock) },
         .{ E.MalformedTlockStanza, headerText("-> tlock 5423142\n" ++ good_body_b64) },
@@ -917,8 +917,8 @@ test "age: Header.parse refuses malformed headers with typed errors" {
         .{ E.MalformedTlockStanza, headerText("-> tlock 18446744073709551616 " ++ qt_chain_hex ++ "\n" ++ good_body_b64) },
         .{ E.MalformedTlockStanza, headerText("-> tlock 1 CC9C398442737CBD141526600919EDD69F1D6F9B4ADB67E4D912FBC64341A9A5\n" ++ good_body_b64) },
         .{ E.MalformedTlockStanza, headerText("-> tlock 1 " ++ qt_chain_hex ++ "\nAAAA\n") }, // body too short
-        .{ E.MalformedTlockStanza, headerText("-> tlock 1 " ++ qt_chain_hex ++ "\n" ++ "A" ** 64 ++ "\n" ++ "A" ** 64 ++ "\n" ++ "A" ** 64 ++ "\n\n") }, // too long
-        .{ E.InvalidCiphertext, headerText("-> tlock 1 " ++ qt_chain_hex ++ "\n" ++ "A" ** 64 ++ "\n" ++ "A" ** 64 ++ "\n" ++ "A" ** 43 ++ "\n") }, // U all-zero, no flag bits
+        .{ E.MalformedTlockStanza, headerText("-> tlock 1 " ++ qt_chain_hex ++ "\n" ++ strRepeat("A", 64) ++ "\n" ++ strRepeat("A", 64) ++ "\n" ++ strRepeat("A", 64) ++ "\n\n") }, // too long
+        .{ E.InvalidCiphertext, headerText("-> tlock 1 " ++ qt_chain_hex ++ "\n" ++ strRepeat("A", 64) ++ "\n" ++ strRepeat("A", 64) ++ "\n" ++ strRepeat("A", 43) ++ "\n") }, // U all-zero, no flag bits
     };
     inline for (cases) |c| {
         try testing.expectError(c[0], Header.parse(c[1]));
@@ -931,30 +931,30 @@ test "age: Header.parse caps stanzas and header size" {
     defer many.deinit(gpa);
     try many.appendSlice(gpa, version_line ++ "\n");
     for (0..max_stanzas + 1) |_| try many.appendSlice(gpa, "-> x\n\n");
-    try many.appendSlice(gpa, good_tlock ++ "--- " ++ "A" ** 43 ++ "\n");
+    try many.appendSlice(gpa, good_tlock ++ "--- " ++ strRepeat("A", 43) ++ "\n");
     try testing.expectError(error.TooManyStanzas, Header.parse(many.items));
 
     var big: std.ArrayList(u8) = .empty;
     defer big.deinit(gpa);
     try big.appendSlice(gpa, version_line ++ "\n-> x\n");
-    while (big.items.len < max_header_bytes + 100) try big.appendSlice(gpa, "A" ** 64 ++ "\n");
+    while (big.items.len < max_header_bytes + 100) try big.appendSlice(gpa, strRepeat("A", 64) ++ "\n");
     try testing.expectError(error.HeaderTooLarge, Header.parse(big.items));
 }
 
 test "age: armor layout — 64 columns, padded, no blank line at an exact multiple" {
     var out: [512]u8 = undefined;
-    const a = try armor(&out, &([_]u8{0} ** 48));
-    try testing.expectEqualStrings(armor_begin ++ "\n" ++ "A" ** 64 ++ "\n" ++ armor_end ++ "\n", a);
-    const b = try armor(&out, &([_]u8{0xff} ** 49));
-    try testing.expectEqualStrings(armor_begin ++ "\n" ++ "/" ** 64 ++ "\n/w==\n" ++ armor_end ++ "\n", b);
+    const a = try armor(&out, &(@as([48]u8, @splat(0))));
+    try testing.expectEqualStrings(armor_begin ++ "\n" ++ strRepeat("A", 64) ++ "\n" ++ armor_end ++ "\n", a);
+    const b = try armor(&out, &(@as([49]u8, @splat(0xff))));
+    try testing.expectEqualStrings(armor_begin ++ "\n" ++ strRepeat("/", 64) ++ "\n/w==\n" ++ armor_end ++ "\n", b);
     try testing.expectEqual(b.len, armoredLen(49));
     var back: [64]u8 = undefined;
-    try testing.expectEqualSlices(u8, &([_]u8{0xff} ** 49), try dearmor(&back, b));
+    try testing.expectEqualSlices(u8, &(@as([49]u8, @splat(0xff))), try dearmor(&back, b));
 }
 
 test "age: dearmor accepts surrounding whitespace and CRLF, refuses everything else" {
     var back: [128]u8 = undefined;
-    const ok = " \r\n" ++ armor_begin ++ "\r\n" ++ "/" ** 64 ++ "\r\n/w==\r\n" ++ armor_end ++ "\r\n\n ";
+    const ok = " \r\n" ++ armor_begin ++ "\r\n" ++ strRepeat("/", 64) ++ "\r\n/w==\r\n" ++ armor_end ++ "\r\n\n ";
     try testing.expectEqual(@as(usize, 49), (try dearmor(&back, ok)).len);
     try testing.expect(isArmored(ok));
 
@@ -963,12 +963,12 @@ test "age: dearmor accepts surrounding whitespace and CRLF, refuses everything e
         armor_begin ++ "\n/w==\n", // no END
         armor_begin ++ "\n/w==\n" ++ armor_end ++ "\nX", // trailing junk
         "x" ++ armor_begin ++ "\n/w==\n" ++ armor_end, // leading junk
-        armor_begin ++ "\n" ++ "/" ** 60 ++ "\n/w==\n" ++ armor_end, // short non-final line
-        armor_begin ++ "\n" ++ "/" ** 65 ++ "\n" ++ armor_end, // long line
-        armor_begin ++ "\n" ++ "/" ** 60 ++ "/w==\n/w==\n" ++ armor_end, // padding mid-stream
+        armor_begin ++ "\n" ++ strRepeat("/", 60) ++ "\n/w==\n" ++ armor_end, // short non-final line
+        armor_begin ++ "\n" ++ strRepeat("/", 65) ++ "\n" ++ armor_end, // long line
+        armor_begin ++ "\n" ++ strRepeat("/", 60) ++ "/w==\n/w==\n" ++ armor_end, // padding mid-stream
         armor_begin ++ "\n/x==\n" ++ armor_end, // non-canonical
         armor_begin ++ "\n/w=\n" ++ armor_end, // unpadded
-        armor_begin ++ "\n" ++ "/" ** 64 ++ "\n\n/w==\n" ++ armor_end, // blank line
+        armor_begin ++ "\n" ++ strRepeat("/", 64) ++ "\n\n/w==\n" ++ armor_end, // blank line
         armor_begin ++ "/w==\n" ++ armor_end, // no newline after BEGIN
     };
     for (bad) |b| try testing.expectError(error.MalformedArmor, dearmor(&back, b));
@@ -1019,9 +1019,9 @@ const fuzz_seeds = [_][]const u8{
     tkfuzz.seed(""),
     tkfuzz.seed(headerText(good_tlock)),
     tkfuzz.seed(headerText("-> X25519 abc\nAAAA\n" ++ good_tlock)),
-    tkfuzz.seed(armor_begin ++ "\n" ++ "/" ** 64 ++ "\n/w==\n" ++ armor_end ++ "\n"),
-    tkfuzz.seed(version_line ++ "\n-> x\n" ++ "A" ** 64 ++ "\n"),
-    tkfuzz.seed("\x00" ** 40),
+    tkfuzz.seed(armor_begin ++ "\n" ++ strRepeat("/", 64) ++ "\n/w==\n" ++ armor_end ++ "\n"),
+    tkfuzz.seed(version_line ++ "\n-> x\n" ++ strRepeat("A", 64) ++ "\n"),
+    tkfuzz.seed(strRepeat("\x00", 40)),
 };
 
 const fz = @import("fuzz_test.zig");
@@ -1043,7 +1043,7 @@ fn fuzzDecoders(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
     if (Header.parse(input)) |_| DecodersMark.mark(.header_ok) else |_| DecodersMark.mark(.header_refused);
     var out: [2048]u8 = undefined;
     if (dearmor(&out, input)) |_| DecodersMark.mark(.dearmor_ok) else |_| DecodersMark.mark(.dearmor_refused);
-    const key = [_]u8{7} ** 32;
+    const key = @as([32]u8, @splat(7));
     if (openedLen(input.len)) |m| {
         if (openPayload(out[0..m], &key, input)) |_| {} else |_| DecodersMark.mark(.payload_refused);
     } else |_| {}
@@ -1158,11 +1158,11 @@ test "corpus: the age fuzz seeds reach past the first check" {
 }
 
 test "PayloadStream.openChunk refuses every chunk-shape violation before touching the AEAD" {
-    const key = [_]u8{0x42} ** Aead.key_length;
+    const key = @as([Aead.key_length]u8, @splat(0x42));
     var sealer: PayloadStream = undefined;
     sealer.init(&key);
     var full: [sealed_chunk_bytes]u8 = undefined;
-    const pt = [_]u8{0x07} ** chunk_bytes;
+    const pt = @as([chunk_bytes]u8, @splat(0x07));
     sealer.sealChunk(&full, &pt, false);
     var tail: [tag_bytes]u8 = undefined; // a genuine empty LAST chunk at counter 1
     Aead.encrypt(tail[0..0], tail[0..tag_bytes], "", "", chunkNonce(1, true), key);
@@ -1194,4 +1194,16 @@ test "PayloadStream.openChunk refuses every chunk-shape violation before touchin
     var t: PayloadStream = undefined;
     t.init(&key);
     try std.testing.expectError(error.PayloadAuthenticationFailed, t.openChunk(&out, &full, true));
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

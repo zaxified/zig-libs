@@ -27,10 +27,10 @@ const fuzz_driver = fuzzseed.driver;
 const max_script = 200;
 
 const Reach = enum { accept, reject_char, reject_pad, ignored, prefix_short, wrapped, url };
-var reach: [@typeInfo(Reach).@"enum".fields.len]usize = @splat(0);
+var reach: [@typeInfo(Reach).@"enum".field_names.len]usize = @splat(0);
 
 fn mark(comptime l: Reach) void {
-    reach[@intFromEnum(l)] += 1;
+    reach[@backingInt(l)] += 1;
     fuzz_driver.hit(@tagName(l));
 }
 
@@ -40,8 +40,8 @@ const seeds = [_][]const u8{
     fuzzseed.seed("\x01\x01Zm9vYmE="), // no-pad, decode of a text
     fuzzseed.seed("\x02\x02QUJD\nQUI=\n"), // url, ignoring
     fuzzseed.seed("\x03\x03QQ==;rest"), // url no-pad, prefix
-    fuzzseed.seed("\x00\x04" ++ "\xfb\xff\x00" ** 30), // wrapped encode
-    fuzzseed.seed("\x00\x01" ++ "\x10\x20\x30\x40\xc8\xd0\xe0\xf0" ** 8),
+    fuzzseed.seed("\x00\x04" ++ strRepeat("\xfb\xff\x00", 30)), // wrapped encode
+    fuzzseed.seed("\x00\x01" ++ strRepeat("\x10\x20\x30\x40\xc8\xd0\xe0\xf0", 8)),
 };
 
 test "fuzz: b64ct against std.base64" {
@@ -265,7 +265,7 @@ test "fuzz harness: 2000 seeds in every test run, and it gets everywhere" {
         };
     }
     for (reach, 0..) |n, i| if (n == 0) {
-        std.debug.print("reach: label {t} never hit in 2000 seeds\n", .{@as(Reach, @enumFromInt(i))});
+        std.debug.print("reach: label {t} never hit in 2000 seeds\n", .{@as(Reach, @fromBackingInt(@intCast(i)))});
         return error.HarnessDoesNotReach;
     };
 }
@@ -278,4 +278,16 @@ test "corpus: every seed runs the harness clean" {
         var r: Replay = .{ .data = buf[0..n] };
         try harness(Replay, &r, testing.allocator);
     }
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

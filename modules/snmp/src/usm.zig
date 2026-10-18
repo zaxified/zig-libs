@@ -376,7 +376,7 @@ fn digestT(
     // truncated to the protocol's first `trunc` bytes.
     var m = Hmac.init(key);
     m.update(message[0..auth_offset]);
-    const zeros = [_]u8{0} ** max_digest_len;
+    const zeros = @as([max_digest_len]u8, @splat(0));
     m.update(zeros[0..trunc]);
     m.update(message[auth_offset + trunc ..]);
     var full: [Hmac.mac_length]u8 = undefined;
@@ -528,7 +528,7 @@ test "encode/parse round-trip: authPriv" {
         .engine_boots = 3,
         .engine_time = 900,
         .user_name = "admin",
-        .auth_params = &(.{0} ** 12),
+        .auth_params = &@as([12]u8, @splat(0)),
         .priv_params = &.{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08 },
     });
 }
@@ -609,7 +609,7 @@ test "parse of truncated / empty input is a typed error, never a panic" {
         .engine_boots = 3,
         .engine_time = 900,
         .user_name = "admin",
-        .auth_params = &(.{0} ** 12),
+        .auth_params = &@as([12]u8, @splat(0)),
         .priv_params = &.{ 1, 2, 3, 4, 5, 6, 7, 8 },
     });
     try testing.expectError(error.Truncated, parse(wire[0 .. wire.len - 1]));
@@ -674,7 +674,7 @@ test "RFC 7860 §4.2.1: key and digest lengths per protocol" {
         try testing.expect(row[2] <= max_digest_len);
     }
     // The snmpAuthProtocols arcs are distinct and match RFC 3414 §6/§7 + 7860 §8.
-    var seen = [_]bool{false} ** 8;
+    var seen = @as([8]bool, @splat(false));
     for (table) |row| {
         const arc = row[0].oidArc();
         try testing.expect(!seen[arc]);
@@ -747,7 +747,7 @@ fn expectSignVerifyRoundTrip(proto: AuthProtocol) !void {
 
     // USM blob carrying a zero-filled msgAuthenticationParameters placeholder
     // of exactly the protocol's truncation length.
-    const zeros = [_]u8{0} ** max_digest_len;
+    const zeros = @as([max_digest_len]u8, @splat(0));
     const dlen = proto.digestLen();
     var usm_buf: [160]u8 = undefined;
     const usm_wire = try encode(&usm_buf, .{
@@ -878,8 +878,8 @@ test "cross-implementation KAT: localized keys match net-snmp for all six protoc
 test "verify: an auth field of the WRONG protocol length -> BadAuthParams" {
     // A 12-byte HMAC-*-96 field presented to an RFC 7860 protocol (and vice
     // versa) must be rejected, not silently truncated-compared.
-    const msg = [_]u8{0xab} ** 96;
-    const key = [_]u8{0x11} ** max_key_len;
+    const msg = @as([96]u8, @splat(0xab));
+    const key = @as([max_key_len]u8, @splat(0x11));
     inline for (.{
         .{ AuthProtocol.hmac_sha256, 12 },
         .{ AuthProtocol.hmac_sha256, 32 },
@@ -903,7 +903,7 @@ test "computeDigestInto: truncation length is the protocol's, and is a real pref
     // Zero-length auth region at offset 0 over a message that is all zeros in
     // that region: the streamed digest must equal a plain HMAC of the message,
     // truncated to digestLen().
-    const key = [_]u8{0x5a} ** 32;
+    const key = @as([32]u8, @splat(0x5a));
     var msg: [64]u8 = undefined;
     for (&msg, 0..) |*b, i| b.* = @intCast(i);
     @memset(msg[8..][0..24], 0); // sha256's 24-byte auth region, already zero
@@ -918,7 +918,7 @@ test "computeDigestInto: truncation length is the protocol's, and is a real pref
 }
 
 test "verify: non-12-byte auth_params -> BadAuthParams" {
-    const msg = [_]u8{0} ** 32;
+    const msg = @as([32]u8, @splat(0));
     const params: UsmSecurityParameters = .{
         .engine_id = "",
         .engine_boots = 0,
@@ -927,7 +927,7 @@ test "verify: non-12-byte auth_params -> BadAuthParams" {
         .auth_params = msg[0..8], // wrong length
         .priv_params = "",
     };
-    const key = [_]u8{0} ** 16;
+    const key = @as([16]u8, @splat(0));
     try testing.expectError(error.BadAuthParams, verify(.hmac_md5, &key, &msg, params));
 }
 
@@ -941,7 +941,7 @@ test "authOffsetFor: a pointer landing INSIDE the message but not on the field i
     // different, overlapping allocation would have.
     const proto: AuthProtocol = .hmac_sha1;
     const dlen = proto.digestLen();
-    const zeros = [_]u8{0} ** max_digest_len;
+    const zeros = @as([max_digest_len]u8, @splat(0));
 
     var usm_buf: [160]u8 = undefined;
     const usm_wire = try encode(&usm_buf, .{
@@ -977,7 +977,7 @@ test "authOffsetFor: a pointer landing INSIDE the message but not on the field i
         var impostor = params;
         impostor.auth_params = msg[off + shift ..][0..dlen];
         try testing.expectEqual(@as(?usize, null), authOffsetFor(proto, msg, impostor));
-        const key = [_]u8{0} ** 20;
+        const key = @as([20]u8, @splat(0));
         try testing.expectError(error.BadAuthParams, verify(proto, &key, msg, impostor));
     }
     // Including one that lands before the field, where `off < 2` is not the
@@ -994,8 +994,8 @@ test "authOffsetFor: a pointer landing INSIDE the message but not on the field i
 }
 
 test "authOffset: 12-byte auth_params from a DIFFERENT buffer -> null / BadAuthParams" {
-    const msg = [_]u8{0xaa} ** 32;
-    const elsewhere = [_]u8{0} ** digest_len;
+    const msg = @as([32]u8, @splat(0xaa));
+    const elsewhere = @as([digest_len]u8, @splat(0));
     const params: UsmSecurityParameters = .{
         .engine_id = "",
         .engine_boots = 0,
@@ -1005,12 +1005,12 @@ test "authOffset: 12-byte auth_params from a DIFFERENT buffer -> null / BadAuthP
         .priv_params = "",
     };
     try testing.expectEqual(@as(?usize, null), authOffset(&msg, params));
-    const key = [_]u8{0} ** 16;
+    const key = @as([16]u8, @splat(0));
     try testing.expectError(error.BadAuthParams, verify(.hmac_md5, &key, &msg, params));
 }
 
 test "computeDigest: deterministic; equals plain HMAC when the region is already zero" {
-    const key = [_]u8{0xaa} ** 16;
+    const key = @as([16]u8, @splat(0xaa));
     var msg: [40]u8 = undefined;
     for (&msg, 0..) |*b, i| b.* = @intCast(i);
     @memset(msg[10 .. 10 + digest_len], 0); // auth region already zero
@@ -1073,7 +1073,7 @@ const UsmCorpus = struct {
             .engine_boots = 3,
             .engine_time = 12345,
             .user_name = "authPrivUser",
-            .auth_params = "\x00" ** 12,
+            .auth_params = strRepeat("\x00", 12),
             .priv_params = "\x01\x02\x03\x04\x05\x06\x07\x08",
         }));
         // engineBoots exactly at the RFC 3414 §2.2 ceiling — the value the
@@ -1100,12 +1100,12 @@ const UsmCorpus = struct {
         // A 32-octet engine id and a long user name: the maximum lengths a
         // real agent produces.
         self.push(try encode(&self.scratch, .{
-            .engine_id = "\xAA" ** 32,
+            .engine_id = strRepeat("\xAA", 32),
             .engine_boots = 1,
             .engine_time = 1,
-            .user_name = "a" ** 32,
-            .auth_params = "\xFF" ** 24,
-            .priv_params = "\x00" ** 8,
+            .user_name = strRepeat("a", 32),
+            .auth_params = strRepeat("\xFF", 24),
+            .priv_params = strRepeat("\x00", 8),
         }));
 
         // ── refusals ───────────────────────────────────────────────────────
@@ -1207,17 +1207,29 @@ test "an empty localized key is not a key: sign and verify both refuse it" {
     // against `""` and the pair failed OPEN together — while the privacy
     // layer beside them has always returned `KeyTooShort` for the same thing.
     // Audit 2026-09-02.
-    var msg = [_]u8{0} ** 64;
+    var msg = @as([64]u8, @splat(0));
     try testing.expectError(error.KeyTooShort, sign(.hmac_sha1, "", &msg, 8));
     try testing.expectError(error.KeyTooShort, sign(.hmac_sha1, "too short", &msg, 8));
 
     // A real key still signs, and its digest still verifies — the guard did
     // not become a refusal of everything.
-    const key = [_]u8{0xAB} ** 20;
+    const key = @as([20]u8, @splat(0xAB));
     try sign(.hmac_sha1, &key, &msg, 8);
     var short: [4]u8 = undefined;
     try testing.expectError(
         error.BufferTooSmall,
         computeDigestInto(.hmac_sha1, &key, &msg, 8, &short),
     );
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

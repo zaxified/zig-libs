@@ -73,7 +73,7 @@ pub fn SessionCache(comptime max_id_len: usize, comptime max_state_len: usize) t
         }
 
         fn padded(id: []const u8) [max_id_len]u8 {
-            var p = [_]u8{0} ** max_id_len;
+            var p = @as([max_id_len]u8, @splat(0));
             @memcpy(p[0..id.len], id);
             return p;
         }

@@ -185,7 +185,7 @@ test "golden: writer reproduces real GNU tar hard-link header byte-for-byte" {
 // fields on an 'L'/'K' record, only its typeflag and size). Every field
 // this module's writer DOES own is compared.
 
-const long_path = "nested/" ** 16 ++ "deep-file.txt"; // 125 bytes, matches the fixture
+const long_path = strRepeat("nested/", 16) ++ "deep-file.txt"; // 125 bytes, matches the fixture
 
 test "golden: GNU long-name 'L' record — name, typeflag, size, payload bytes match real GNU tar" {
     // writeHeader for a >100-byte path emits three blocks: the 'L' header,
@@ -319,4 +319,16 @@ test "golden: fixture count + size canary — 5 real GNU tar captures, all 10240
     try testing.expectEqual(@as(usize, 10240), golden_symlink.len);
     try testing.expectEqual(@as(usize, 10240), golden_hardlink_pair.len);
     try testing.expectEqual(@as(usize, 10240), golden_longname.len);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

@@ -574,7 +574,7 @@ fn buildMinimalLegacyTx(allocator: Allocator) Allocator.Error![]u8 {
     errdefer buf.deinit(allocator);
     try appendI32LE(&buf, allocator, 1);
     try appendCompactSize(&buf, allocator, 1);
-    try buf.appendSlice(allocator, &([_]u8{0} ** 32));
+    try buf.appendSlice(allocator, &(@as([32]u8, @splat(0))));
     try appendU32LE(&buf, allocator, 0);
     try appendCompactSize(&buf, allocator, 0);
     try appendU32LE(&buf, allocator, 0xffffffff);
@@ -616,7 +616,7 @@ fn buildMinimalSegwitTx(allocator: Allocator) Allocator.Error![]u8 {
     try buf.append(allocator, 0x00);
     try buf.append(allocator, 0x01);
     try appendCompactSize(&buf, allocator, 1);
-    try buf.appendSlice(allocator, &([_]u8{0xaa} ** 32));
+    try buf.appendSlice(allocator, &(@as([32]u8, @splat(0xaa))));
     try appendU32LE(&buf, allocator, 1);
     try appendCompactSize(&buf, allocator, 0);
     try appendU32LE(&buf, allocator, 0xffffffff);
@@ -627,9 +627,9 @@ fn buildMinimalSegwitTx(allocator: Allocator) Allocator.Error![]u8 {
     // compressed pubkey, the shapes a real P2WPKH witness carries.
     try appendCompactSize(&buf, allocator, 2);
     try appendCompactSize(&buf, allocator, 71);
-    try buf.appendSlice(allocator, &([_]u8{0xab} ** 71));
+    try buf.appendSlice(allocator, &(@as([71]u8, @splat(0xab))));
     try appendCompactSize(&buf, allocator, 33);
-    try buf.appendSlice(allocator, &([_]u8{0xcd} ** 33));
+    try buf.appendSlice(allocator, &(@as([33]u8, @splat(0xcd))));
     try appendU32LE(&buf, allocator, 0);
     return buf.toOwnedSlice(allocator);
 }
@@ -644,7 +644,7 @@ fn buildSuperfluousWitnessTx(allocator: Allocator) Allocator.Error![]u8 {
     try buf.append(allocator, 0x00);
     try buf.append(allocator, 0x01);
     try appendCompactSize(&buf, allocator, 1);
-    try buf.appendSlice(allocator, &([_]u8{0xaa} ** 32));
+    try buf.appendSlice(allocator, &(@as([32]u8, @splat(0xaa))));
     try appendU32LE(&buf, allocator, 1);
     try appendCompactSize(&buf, allocator, 0);
     try appendU32LE(&buf, allocator, 0xffffffff);
@@ -677,7 +677,7 @@ test "F3 regression: wtxid() honors actual witness content, not just the has_wit
     // witness stack must still satisfy `wtxid() == txid()`.
     const allocator = testing.allocator;
     var vin = [_]TxIn{.{
-        .prevout = .{ .txid = [_]u8{0xaa} ** 32, .vout = 1 },
+        .prevout = .{ .txid = @as([32]u8, @splat(0xaa)), .vout = 1 },
         .script_sig = &.{},
         .sequence = 0xffffffff,
     }};
@@ -704,7 +704,7 @@ test "F3 regression: wtxid() honors actual witness content, not just the has_wit
 test "serializeSegwit refuses a witness count that does not match the inputs (M3)" {
     const allocator = testing.allocator;
     var vin1 = [_]TxIn{.{
-        .prevout = .{ .txid = [_]u8{0xaa} ** 32, .vout = 0 },
+        .prevout = .{ .txid = @as([32]u8, @splat(0xaa)), .vout = 0 },
         .script_sig = &.{},
         .sequence = 0xffffffff,
     }};
@@ -778,10 +778,10 @@ test "hostile: truncated tx cut mid-scriptSig fails closed with Truncated (not T
     defer buf.deinit(allocator);
     try appendI32LE(&buf, allocator, 1);
     try appendCompactSize(&buf, allocator, 1); // vin count = 1
-    try buf.appendSlice(allocator, &([_]u8{0} ** 32));
+    try buf.appendSlice(allocator, &(@as([32]u8, @splat(0))));
     try appendU32LE(&buf, allocator, 0);
     try appendCompactSize(&buf, allocator, 20); // scriptSig declared as 20 bytes...
-    try buf.appendSlice(allocator, &([_]u8{0xab} ** 10)); // ...but only 10 are actually present
+    try buf.appendSlice(allocator, &(@as([10]u8, @splat(0xab)))); // ...but only 10 are actually present
     try testing.expectError(error.Truncated, deserialize(allocator, buf.items));
 }
 
@@ -805,7 +805,7 @@ test "hostile: vout count claiming more outputs than remain fails closed with To
     defer buf.deinit(allocator);
     try appendI32LE(&buf, allocator, 1);
     try appendCompactSize(&buf, allocator, 1); // vin count = 1
-    try buf.appendSlice(allocator, &([_]u8{0} ** 32));
+    try buf.appendSlice(allocator, &(@as([32]u8, @splat(0))));
     try appendU32LE(&buf, allocator, 0);
     try appendCompactSize(&buf, allocator, 0); // empty scriptSig
     try appendU32LE(&buf, allocator, 0xffffffff);
@@ -830,7 +830,7 @@ test "hostile: witness item count amplifying wire bytes into live memory 16x fai
     try buf.append(allocator, 0x00);
     try buf.append(allocator, 0x01);
     try appendCompactSize(&buf, allocator, 1); // vin count = 1
-    try buf.appendSlice(allocator, &([_]u8{0xaa} ** 32));
+    try buf.appendSlice(allocator, &(@as([32]u8, @splat(0xaa))));
     try appendU32LE(&buf, allocator, 0);
     try appendCompactSize(&buf, allocator, 0); // empty scriptSig
     try appendU32LE(&buf, allocator, 0xffffffff);
@@ -1048,7 +1048,7 @@ test "corpus: deserializePartial seeds reach the decoder, and the counts are pin
     // transactions. It only moves when a seed's own octets reach the vin loop.
     var vin_total: usize = 0;
     var witness_seen: usize = 0;
-    var which_hist = [_]usize{0} ** 4;
+    var which_hist = @as([4]usize, @splat(0));
     for (buildDeserCorpus(&corpus)) |sd| {
         var smith: std.testing.Smith = .{ .in = sd };
         var buf: [fuzz_tx_buf_len]u8 = undefined;

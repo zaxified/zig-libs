@@ -155,8 +155,8 @@ test "anchor: Wireshark reads the DNP3 adapter's link ACK, and verifies its CRC"
     // header CRC is a bespoke polynomial with a reflected/little-endian
     // placement that a round trip against our own encoder would agree with
     // however we got it wrong. Wireshark recomputes it and says "Good".
-    var binaries = [_]dnp3.outstation.BinaryInput{.{ .value = true, .class = .class1 }} ** 4;
-    var analogs = [_]dnp3.outstation.AnalogInput{.{ .value = 7, .class = .class2 }} ** 2;
+    var binaries = @as([4]dnp3.outstation.BinaryInput, @splat(.{ .value = true, .class = .class1 }));
+    var analogs = @as([2]dnp3.outstation.AnalogInput, @splat(.{ .value = 7, .class = .class2 }));
     var event_storage: [16]dnp3.outstation.Event = undefined;
     var rx_buf: [512]u8 = undefined;
     var scratch: [512]u8 = undefined;
@@ -174,7 +174,7 @@ test "anchor: Wireshark reads the DNP3 adapter's link ACK, and verifies its CRC"
 
     var frame_buf: [64]u8 = undefined;
     const reset = try dnp3.link.encodeFrame(
-        .{ .dir = true, .prm = true, .function = @intFromEnum(dnp3.link.PrimaryFunction.reset_link_states) },
+        .{ .dir = true, .prm = true, .function = @backingInt(dnp3.link.PrimaryFunction.reset_link_states) },
         1024,
         1,
         &.{},
@@ -230,7 +230,7 @@ test "anchor: Wireshark reads the S7comm adapter's TPKT/COTP Connect Confirm" {
     // The TSAP swap on a Connect Confirm (the CR's dst becomes the CC's src in
     // some stacks and not others) and the TPKT length counting its own 4-byte
     // header are both places a same-author round trip agrees with itself.
-    var db1 = [_]u8{0} ** 32;
+    var db1 = @as([32]u8, @splat(0));
     const areas = [_]s7comm.AreaBinding{.{ .area = .db, .db_number = 1, .bytes = &db1 }};
     var plc = adapters.S7comm.init(.{}, &areas);
     const n = plc.node();
@@ -271,14 +271,14 @@ test "anchor: Wireshark reads the EtherNet/IP adapter's RegisterSession reply" {
     // Every field of the 24-byte encapsulation header is little-endian while
     // the CIP payload above it is not; an independent reader placing the
     // session handle and length correctly is the check that matters.
-    var tag_bytes = [_]u8{0} ** 8;
+    var tag_bytes = @as([8]u8, @splat(0));
     const tags = [_]enip.TagBinding{.{ .name = "Speed", .type = .dint, .bytes = &tag_bytes }};
     var dev = adapters.Enip.init(.{}, &tags);
     const n = dev.node();
 
     var out: [512]u8 = undefined;
     var req: [28]u8 = @splat(0);
-    std.mem.writeInt(u16, req[0..2], @intFromEnum(enip.Command.register_session), .little);
+    std.mem.writeInt(u16, req[0..2], @backingInt(enip.Command.register_session), .little);
     std.mem.writeInt(u16, req[2..4], 4, .little);
     // Non-zero on purpose: the encapsulation header's sender context is echoed
     // verbatim, and an all-zero one cannot tell an echo from a device that

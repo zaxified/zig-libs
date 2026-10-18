@@ -220,7 +220,7 @@ test "X3DH: a low-order (identity-inducing) bob signed-prekey makes initiateUnve
 
     const alice_ik = X25519.KeyPair.generate(io);
     const bob_ik = X25519.KeyPair.generate(io);
-    const low_order_pub = [_]u8{0} ** 32;
+    const low_order_pub = @as([32]u8, @splat(0));
 
     const bob_spk = x3dh.SignedPreKey{
         .key_pair = .{ .secret_key = X25519.KeyPair.generate(io).secret_key, .public_key = low_order_pub },
@@ -366,7 +366,7 @@ test "codec: InitialMessage round-trips through toBytes/fromBytes, WITHOUT a one
 }
 
 test "codec: InitialMessage.fromBytes rejects a truncated header" {
-    const short = [_]u8{0} ** 10;
+    const short = @as([10]u8, @splat(0));
     try std.testing.expectError(error.InvalidInitialMessage, x3dh.InitialMessage.fromBytes(std.testing.allocator, &short));
 }
 
@@ -605,13 +605,13 @@ test "XEdDSA: verify fails closed (false, no panic) on malformed keys and signat
     try std.testing.expect(xeddsa.verify(kp.public_key, msg, good));
 
     // All-zero public key: maps to the order-2 point (0, -1) -> rejected.
-    try std.testing.expect(!xeddsa.verify([_]u8{0} ** 32, msg, good));
+    try std.testing.expect(!xeddsa.verify(@as([32]u8, @splat(0)), msg, good));
     // Non-canonical public key (top bit set).
     var noncanon_pub = kp.public_key;
     noncanon_pub[31] |= 0x80;
     try std.testing.expect(!xeddsa.verify(noncanon_pub, msg, good));
     // u = p - 1 (the birational map's pole).
-    var pole = [_]u8{0xFF} ** 32;
+    var pole = @as([32]u8, @splat(0xFF));
     pole[0] = 0xEC;
     pole[31] = 0x7F;
     try std.testing.expect(!xeddsa.verify(pole, msg, good));
@@ -620,9 +620,9 @@ test "XEdDSA: verify fails closed (false, no panic) on malformed keys and signat
     bad_s[63] |= 0x20; // pushes s >= 2^253 > L
     try std.testing.expect(!xeddsa.verify(kp.public_key, msg, bad_s));
     // All-zero signature.
-    try std.testing.expect(!xeddsa.verify(kp.public_key, msg, [_]u8{0} ** 64));
+    try std.testing.expect(!xeddsa.verify(kp.public_key, msg, @as([64]u8, @splat(0))));
     // All-0xFF signature (non-canonical everything).
-    try std.testing.expect(!xeddsa.verify(kp.public_key, msg, [_]u8{0xFF} ** 64));
+    try std.testing.expect(!xeddsa.verify(kp.public_key, msg, @as([64]u8, @splat(0xFF))));
 }
 
 // ── the fail-closed X3DH entry points, end-to-end ───────────────────────

@@ -228,20 +228,20 @@ pub fn publicJson(allocator: std.mem.Allocator, public_inputs: []const Fr) ![]u8
 
 test "decimalBytes: zero encodes as \"0\"" {
     var buf: [max_decimal_digits]u8 = undefined;
-    const zero = [_]u8{0} ** 32;
+    const zero = @as([32]u8, @splat(0));
     try std.testing.expectEqualStrings("0", try decimalBytes(&zero, &buf));
 }
 
 test "decimalBytes: one encodes as \"1\"" {
     var buf: [max_decimal_digits]u8 = undefined;
-    var one = [_]u8{0} ** 32;
+    var one = @as([32]u8, @splat(0));
     one[31] = 1;
     try std.testing.expectEqualStrings("1", try decimalBytes(&one, &buf));
 }
 
 test "decimalBytes: 256 encodes as \"256\" (multi-digit, byte boundary)" {
     var buf: [max_decimal_digits]u8 = undefined;
-    var v = [_]u8{0} ** 32;
+    var v = @as([32]u8, @splat(0));
     v[30] = 1;
     v[31] = 0;
     try std.testing.expectEqualStrings("256", try decimalBytes(&v, &buf));
@@ -288,16 +288,16 @@ test "TEETH: decimalBytes refuses an over-long value and a too-small buffer" {
     // Measured in ReleaseFast before the fix: a 48-byte input SIGSEGV'd, because
     // the assert vanished and `@memcpy` ran past a private 32-byte array.
     var buf: [max_decimal_digits]u8 = undefined;
-    const too_long = [_]u8{0xAB} ** 48;
+    const too_long = @as([48]u8, @splat(0xAB));
     try std.testing.expectError(error.ValueTooLarge, decimalBytes(&too_long, &buf));
 
     var small: [max_decimal_digits - 1]u8 = undefined;
-    const ok_value = [_]u8{1} ** 32;
+    const ok_value = @as([32]u8, @splat(1));
     try std.testing.expectError(error.BufferTooSmall, decimalBytes(&ok_value, &small));
 
     // The boundary itself is legal in both directions — the refusals are where
     // they claim to be, not one step either side.
-    const at_cap = [_]u8{0} ** 31 ++ [_]u8{7};
+    const at_cap = @as([31]u8, @splat(0)) ++ [_]u8{7};
     try std.testing.expectEqualStrings("7", try decimalBytes(&at_cap, &buf));
 }
 

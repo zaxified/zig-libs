@@ -52,13 +52,13 @@ pub const Qualifier = struct {
     range_code: RangeCode,
 
     pub fn toByte(self: Qualifier) u8 {
-        return (@as(u8, @intFromEnum(self.prefix_code)) << 4) | @as(u8, @intFromEnum(self.range_code));
+        return (@as(u8, @backingInt(self.prefix_code)) << 4) | @as(u8, @backingInt(self.range_code));
     }
 
     pub fn fromByte(b: u8) Qualifier {
         return .{
-            .prefix_code = @enumFromInt(@as(u4, @truncate(b >> 4))),
-            .range_code = @enumFromInt(@as(u4, @truncate(b & 0x0F))),
+            .prefix_code = @fromBackingInt(@intCast(@as(u4, @truncate(b >> 4)))),
+            .range_code = @fromBackingInt(@intCast(@as(u4, @truncate(b & 0x0F)))),
         };
     }
 };
@@ -366,17 +366,17 @@ pub const g12 = struct {
         tcc: TripCloseCode = .nul,
 
         pub fn toByte(self: ControlCode) u8 {
-            var b: u8 = @as(u8, @intFromEnum(self.op_type));
+            var b: u8 = @as(u8, @backingInt(self.op_type));
             if (self.clear) b |= 0x10;
-            b |= @as(u8, @intFromEnum(self.tcc)) << 6;
+            b |= @as(u8, @backingInt(self.tcc)) << 6;
             return b;
         }
 
         pub fn fromByte(b: u8) ControlCode {
             return .{
-                .op_type = @enumFromInt(@as(u4, @truncate(b & 0x0F))),
+                .op_type = @fromBackingInt(@intCast(@as(u4, @truncate(b & 0x0F)))),
                 .clear = (b & 0x10) != 0,
-                .tcc = @enumFromInt(@as(u2, @truncate(b >> 6))),
+                .tcc = @fromBackingInt(@intCast(@as(u2, @truncate(b >> 6)))),
             };
         }
     };
@@ -426,7 +426,7 @@ pub const g12 = struct {
             out[1] = self.count;
             std.mem.writeInt(u32, out[2..6], self.on_time_ms, .little);
             std.mem.writeInt(u32, out[6..10], self.off_time_ms, .little);
-            out[10] = @intFromEnum(self.status);
+            out[10] = @backingInt(self.status);
             return out[0..wire_len];
         }
 
@@ -437,7 +437,7 @@ pub const g12 = struct {
                 .count = bytes[1],
                 .on_time_ms = std.mem.readInt(u32, bytes[2..6], .little),
                 .off_time_ms = std.mem.readInt(u32, bytes[6..10], .little),
-                .status = @enumFromInt(bytes[10]),
+                .status = @fromBackingInt(@intCast(bytes[10])),
             };
         }
     };
@@ -559,13 +559,13 @@ pub const g41 = struct {
         pub fn encode(self: V1, out: []u8) error{BufferTooSmall}![]u8 {
             if (out.len < wire_len) return error.BufferTooSmall;
             std.mem.writeInt(i32, out[0..4], self.value, .little);
-            out[4] = @intFromEnum(self.status);
+            out[4] = @backingInt(self.status);
             return out[0..wire_len];
         }
 
         pub fn decode(bytes: []const u8) error{ShortRecord}!V1 {
             if (bytes.len < wire_len) return error.ShortRecord;
-            return .{ .value = std.mem.readInt(i32, bytes[0..4], .little), .status = @enumFromInt(bytes[4]) };
+            return .{ .value = std.mem.readInt(i32, bytes[0..4], .little), .status = @fromBackingInt(@intCast(bytes[4])) };
         }
     };
 
@@ -579,13 +579,13 @@ pub const g41 = struct {
         pub fn encode(self: V2, out: []u8) error{BufferTooSmall}![]u8 {
             if (out.len < wire_len) return error.BufferTooSmall;
             std.mem.writeInt(i16, out[0..2], self.value, .little);
-            out[2] = @intFromEnum(self.status);
+            out[2] = @backingInt(self.status);
             return out[0..wire_len];
         }
 
         pub fn decode(bytes: []const u8) error{ShortRecord}!V2 {
             if (bytes.len < wire_len) return error.ShortRecord;
-            return .{ .value = std.mem.readInt(i16, bytes[0..2], .little), .status = @enumFromInt(bytes[2]) };
+            return .{ .value = std.mem.readInt(i16, bytes[0..2], .little), .status = @fromBackingInt(@intCast(bytes[2])) };
         }
     };
 
@@ -599,13 +599,13 @@ pub const g41 = struct {
         pub fn encode(self: V3, out: []u8) error{BufferTooSmall}![]u8 {
             if (out.len < wire_len) return error.BufferTooSmall;
             std.mem.writeInt(u32, out[0..4], @bitCast(self.value), .little);
-            out[4] = @intFromEnum(self.status);
+            out[4] = @backingInt(self.status);
             return out[0..wire_len];
         }
 
         pub fn decode(bytes: []const u8) error{ShortRecord}!V3 {
             if (bytes.len < wire_len) return error.ShortRecord;
-            return .{ .value = @bitCast(std.mem.readInt(u32, bytes[0..4], .little)), .status = @enumFromInt(bytes[4]) };
+            return .{ .value = @bitCast(std.mem.readInt(u32, bytes[0..4], .little)), .status = @fromBackingInt(@intCast(bytes[4])) };
         }
     };
 };
@@ -649,7 +649,7 @@ pub const g60 = struct {
     pub fn readClassHeader(class: Class) ObjectHeader {
         return .{
             .group = 60,
-            .variation = @intFromEnum(class),
+            .variation = @backingInt(class),
             .qualifier = .{ .prefix_code = .none, .range_code = .all_values },
             .range = .{ .all_values = {} },
         };
@@ -777,7 +777,7 @@ test "object header: decode never panics on short/garbage input" {
     try testing.expectError(error.ShortHeader, decodeObjectHeader(&.{ 1, 2 }));
     var i: usize = 0;
     while (i < 8) : (i += 1) {
-        const garbage: [8]u8 = .{0xFF} ** 8;
+        const garbage: [8]u8 = @splat(0xFF);
         _ = decodeObjectHeader(garbage[0..i]) catch {};
     }
 }

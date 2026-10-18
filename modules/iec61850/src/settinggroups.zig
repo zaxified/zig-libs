@@ -611,7 +611,7 @@ test "a value larger than the slot is refused rather than overrunning it" {
     var fx: Fixture = .{};
     var cb = try fx.init();
     try cb.selectEditSG(1, 1);
-    const big = [_]u8{0x8A} ++ [_]u8{0x20} ++ ("x" ** 32).*;
+    const big = [_]u8{0x8A} ++ [_]u8{0x20} ++ (strRepeat("x", 32)).*;
     try testing.expectError(error.ValueTooLarge, cb.setEditValue(0, 1, &big));
     try testing.expectError(error.BadGroup, cb.setEditValue(9, 1, &big));
 }
@@ -881,4 +881,16 @@ fn setEdit(cb: *ControlBlock, index: usize, peer: u32, v: f32) !void {
     var w = ber.Writer.init(&tmp);
     try mmsdata.Emit.float(&w, v);
     try cb.setEditValue(index, peer, w.done());
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

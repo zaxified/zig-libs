@@ -589,24 +589,24 @@ const snp_seeds = [_][]const u8{
     // bounds.
     seed("04" ++ "0101000064" ++ "0202000064" ++ "0303000064" ++ "0404000064" ++
         "04" ++ "0064AABBCC010001" ++ "0064DDEEFF020002" ++ "0064112233030003" ++ "0064445566040004" ++
-        ("00" ** 48) ++ "00" ++ "EE" ++ "000000" ++ "FFFFFF" ++ "00" ++ "0032" ++ "01" ++ "0A" ++ "00" ++ "06"),
+        (strRepeat("00", 48)) ++ "00" ++ "EE" ++ "000000" ++ "FFFFFF" ++ "00" ++ "0032" ++ "01" ++ "0A" ++ "00" ++ "06"),
     // The same store and the same entries, but a PSNP — the other arm of a
     // branch that used to hang on a `smith.value(bool)` drawn after the input
     // was spent, i.e. that was always false.
     seed("04" ++ "0101000064" ++ "0202000064" ++ "0303000064" ++ "0404000064" ++
         "04" ++ "0064AABBCC010001" ++ "0064DDEEFF020002" ++ "0064112233030003" ++ "0064445566040004" ++
-        ("00" ** 48) ++ "00" ++ "EE" ++ "000000" ++ "FFFFFF" ++ "01" ++ "0032" ++ "02" ++ "0B" ++ "00" ++ "06"),
+        (strRepeat("00", 48)) ++ "00" ++ "EE" ++ "000000" ++ "FFFFFF" ++ "01" ++ "0032" ++ "02" ++ "0B" ++ "00" ++ "06"),
     // A CSNP summarising exactly the two LSPs the store already holds (entry
     // ids are `sys, 0, lsp_num`), so the completeness sweep runs with every
     // entry in range and nothing to request.
     seed("02" ++ "0100010064" ++ "0200010064" ++
         "02" ++ "0064010001" ++ "0001FFFF" ++ "0064020001" ++ "0001FFFF" ++
-        ("00" ** 48) ++ "00" ++ "00" ++ "000000" ++ "FFFFFF" ++ "00" ++ "0032" ++ "01" ++ "0A" ++ "00" ++ "06"),
+        (strRepeat("00", 48)) ++ "00" ++ "00" ++ "000000" ++ "FFFFFF" ++ "00" ++ "0032" ++ "01" ++ "0A" ++ "00" ++ "06"),
     // An empty store meeting a CSNP with a 40-octet unmodelled trailing TLV and
     // three byte flips inside the TLV region: the malformed-walk branch, where
     // `reconcileCsnp` skips its completeness sweep.
     seed("00" ++ "03" ++ "0064010203010001" ++ "0064040506020002" ++ "0064070809030003" ++
-        ("5A" ** 48) ++ "28" ++ "7F" ++ "000000" ++ "FFFFFF" ++ "00" ++ "0032" ++ "01" ++ "0C" ++ "03" ++ "06"),
+        (strRepeat("5A", 48)) ++ "28" ++ "7F" ++ "000000" ++ "FFFFFF" ++ "00" ++ "0032" ++ "01" ++ "0C" ++ "03" ++ "06"),
     // The degenerate script: every choice is its cursor minimum, which is
     // exactly the collapsed harness — kept as the "before" measurement.
     seed(""),
@@ -661,4 +661,16 @@ test {
     _ = @import("goldens.zig");
     _ = @import("bench.zig");
     _ = @import("fuzz_test.zig");
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

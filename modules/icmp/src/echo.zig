@@ -401,7 +401,7 @@ test "icmp v4 dest unreachable quoting our echo" {
     try std.testing.expectEqual(@as(u8, 1), parsed.icmp_error.quoted_proto);
     try std.testing.expectEqualSlices(u8, &quoted_src, parsed.icmp_error.quoted_src[0..4]);
     try std.testing.expectEqualSlices(u8, &quoted_dst, parsed.icmp_error.quoted_dst[0..4]);
-    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 12), parsed.icmp_error.quoted_src[4..16]);
+    try std.testing.expectEqualSlices(u8, &(@as([12]u8, @splat(0))), parsed.icmp_error.quoted_src[4..16]);
 }
 
 test "icmp v4 error kinds map correctly for every quoted-error type" {
@@ -943,16 +943,16 @@ const parser_seeds = [_][]const u8{
     // an all-zero field -- the receive-side checksum gate added for F7
     // would otherwise reject them before they ever reach the quoted-header
     // logic they exist to exercise.
-    seed("03019D7D00000000" ++ "45" ++ ("00" ** 19) ++ "080000001234004D"), // v4 host-unreachable quoting OUR echo request
-    seed("0B00A26800000000" ++ "45" ++ ("00" ** 19) ++ "0D00000000550042"), // v4 time-exceeded quoting our TIMESTAMP request, the other accepted quote
+    seed("03019D7D00000000" ++ "45" ++ (strRepeat("00", 19)) ++ "080000001234004D"), // v4 host-unreachable quoting OUR echo request
+    seed("0B00A26800000000" ++ "45" ++ (strRepeat("00", 19)) ++ "0D00000000550042"), // v4 time-exceeded quoting our TIMESTAMP request, the other accepted quote
     seed("0D00AF6E13570001000030390000000000000000"), // v4 timestamp request: ignored
     seed("0E0046471357000100003039028FB184028FB184"), // v4 timestamp reply: carries TsData
-    seed("0B" ++ ("00" ** 7) ++ "45" ++ ("00" ** 19) ++ "08" ++ ("00" ** 6)), // 27 octets of quote: one short of qihl+8, rejected
-    seed("0B00A7FF00000000" ++ "45" ++ ("00" ** 19) ++ "08" ++ ("00" ** 7)), // 28 octets of quote: the exact accepting edge (A1 F7: real checksum)
+    seed("0B" ++ (strRepeat("00", 7)) ++ "45" ++ (strRepeat("00", 19)) ++ "08" ++ (strRepeat("00", 6))), // 27 octets of quote: one short of qihl+8, rejected
+    seed("0B00A7FF00000000" ++ "45" ++ (strRepeat("00", 19)) ++ "08" ++ (strRepeat("00", 7))), // 28 octets of quote: the exact accepting edge (A1 F7: real checksum)
     seed("81004D52955A0001DBDE6D6A0000000087B90C0000000000101112131415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F3031323334353637"), // v6 echo reply, real loopback capture
     seed("80004E52955A0001DBDE6D6A0000000087B90C0000000000101112131415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F3031323334353637"), // v6 echo request: ignored
     seed("0104FF6E000000006002D283000E11400000000000000000000000000000000100000000000000000000000000000001DAC59C3F000E002168656C6C6F36"), // v6 port-unreachable quoting UDP: next header 17, not 58
-    seed("01" ++ ("00" ** 13) ++ "3A" ++ ("00" ** 33) ++ "8000" ++ "0000" ++ "BEEF" ++ "0009"), // v6 dest-unreachable quoting OUR echo request
+    seed("01" ++ (strRepeat("00", 13)) ++ "3A" ++ (strRepeat("00", 33)) ++ "8000" ++ "0000" ++ "BEEF" ++ "0009"), // v6 dest-unreachable quoting OUR echo request
     seed("010203"), // three octets: shorter than any header
     seed("6300000000000000"), // a header-length packet of a type nobody handles
     seed(""), // the empty datagram
@@ -980,10 +980,10 @@ fn fuzzParsers(_: void, smith: *std.testing.Smith) !void {
 const fuzz_driver = @import("testkit").fuzz.driver;
 
 const Reach = enum { raw_nonempty, v4_reply, v4_error, v6_reply, v6_error, strip_checked, mutated };
-var reach: [@typeInfo(Reach).@"enum".fields.len]usize = @splat(0);
+var reach: [@typeInfo(Reach).@"enum".field_names.len]usize = @splat(0);
 
 fn mark(comptime l: Reach) void {
-    reach[@intFromEnum(l)] += 1;
+    reach[@backingInt(l)] += 1;
     fuzz_driver.hit(@tagName(l));
 }
 
@@ -1088,7 +1088,7 @@ test "fuzz harness: 500 seeds in every test run, and it gets everywhere" {
         };
     }
     for (reach, 0..) |n, i| if (n == 0) {
-        std.debug.print("reach: label {t} never hit in 500 seeds\n", .{@as(Reach, @enumFromInt(i))});
+        std.debug.print("reach: label {t} never hit in 500 seeds\n", .{@as(Reach, @fromBackingInt(@intCast(i)))});
         return error.HarnessDoesNotReach;
     };
 }
@@ -1126,4 +1126,16 @@ test "corpus: every parser seed reaches the parsers, and the counts are pinned" 
     try std.testing.expectEqual(@as(usize, 3), v4_errors);
     try std.testing.expectEqual(@as(usize, 1), v6_replies);
     try std.testing.expectEqual(@as(usize, 1), v6_errors);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

@@ -196,7 +196,7 @@ test "SVG path reproduces the grid, module for module" {
     var m: Matrix = undefined;
     // Three versions and two quiet zones: run-length packing has to survive both
     // a run that ends at the right edge and one that starts at the left.
-    for ([_][]const u8{ "1", "HTTPS://EXAMPLE.COM/A", "x" ** 400 }) |text| {
+    for ([_][]const u8{ "1", "HTTPS://EXAMPLE.COM/A", strRepeat("x", 400) }) |text| {
         for ([_]u8{ 4, 0 }) |quiet| {
             try root.encode(&m, text, .{});
             var aw: std.Io.Writer.Allocating = .init(testing.allocator);
@@ -334,4 +334,16 @@ test "terminal output round-trips through the decoder as well" {
 
     var out: [64]u8 = undefined;
     try testing.expectEqualStrings("https://example.com/x", try root.decode(&m, &out));
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

@@ -85,7 +85,7 @@ pub const signature_length: usize = 64; // xeddsa.Signature
 /// Spec § "KDF": the fixed 32-byte `0xFF` domain-separation prefix for
 /// X25519 (a 57-byte `0xFF` prefix is specified for X448 — not implemented
 /// here).
-pub const f_constant = [_]u8{0xFF} ** 32;
+pub const f_constant = @as([32]u8, @splat(0xFF));
 
 /// This module's own `info` constant for the final HKDF-Expand step
 /// (spec § "KDF": "An application-specific byte sequence" — the spec
@@ -210,7 +210,7 @@ pub const PreKeyBundle = struct {
         off += 1;
         std.mem.writeInt(u32, out[off..][0..4], b.one_time_prekey_id orelse 0, .little);
         off += 4;
-        out[off..][0..key_length].* = b.one_time_prekey orelse [_]u8{0} ** key_length;
+        out[off..][0..key_length].* = b.one_time_prekey orelse @as([key_length]u8, @splat(0));
         off += key_length;
         std.debug.assert(off == encoded_length);
         return out;
@@ -367,7 +367,7 @@ fn deriveSharedSecret(dh1: [key_length]u8, dh2: [key_length]u8, dh3: [key_length
     }
     const km = km_buf[0..len];
 
-    const salt = [_]u8{0} ** HkdfSha256.prk_length;
+    const salt = @as([HkdfSha256.prk_length]u8, @splat(0));
     const prk = HkdfSha256.extract(&salt, km);
     var sk: [shared_secret_length]u8 = undefined;
     HkdfSha256.expand(&sk, x3dh_info, prk);

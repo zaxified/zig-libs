@@ -25,7 +25,7 @@ fn must(ok: bool, src: std.builtin.SourceLocation) void {
     if (!ok) std.debug.panic("example check failed at {s}:{d}", .{ src.file, src.line });
 }
 
-const body = "The quick brown fox jumps over the lazy dog. " ** 40;
+const body = strRepeat("The quick brown fox jumps over the lazy dog. ", 40);
 
 pub fn main() !void {
     var da: std.heap.DebugAllocator(.{}) = .init;
@@ -75,4 +75,16 @@ pub fn main() !void {
         error.TruncatedInput => std.debug.print("empty input correctly rejected\n", .{}),
         else => return err,
     }
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

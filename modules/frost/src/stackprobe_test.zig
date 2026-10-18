@@ -208,10 +208,10 @@ noinline fn callGenerate() void {
 }
 
 fn expectNoResidue(label: []const u8, call: *const fn () void) !void {
-    if (builtin.mode == .Debug or builtin.mode == .ReleaseSafe) return error.SkipZigTest;
+    if (builtin.mode == .debug or builtin.mode == .safe) return error.SkipZigTest;
     const gpa = std.testing.allocator;
-    const coeffs = [_]Scalar{Scalar.fromBytes48([_]u8{0x31} ** 48, .big)};
-    const dealt = try frost.trustedDealerKeygen(gpa, Scalar.fromBytes48([_]u8{0x29} ** 48, .big), &coeffs, 3, 2);
+    const coeffs = [_]Scalar{Scalar.fromBytes48(@as([48]u8, @splat(0x31)), .big)};
+    const dealt = try frost.trustedDealerKeygen(gpa, Scalar.fromBytes48(@as([48]u8, @splat(0x29)), .big), &coeffs, 3, 2);
     defer gpa.free(dealt.shares);
     defer gpa.free(dealt.vss_commitment);
     p_gpk = dealt.group_public_key;

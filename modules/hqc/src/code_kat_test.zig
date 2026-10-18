@@ -28,11 +28,11 @@ const Code192 = code.Code(params.hqc192, reedsolomon.generator_hqc192);
 const Code256 = code.Code(params.hqc256, reedsolomon.generator_hqc256);
 
 fn zeroMsg(comptime n: usize) [n]u8 {
-    return [_]u8{0} ** n;
+    return @as([n]u8, @splat(0));
 }
 
 fn ffMsg(comptime n: usize) [n]u8 {
-    return [_]u8{0xff} ** n;
+    return @as([n]u8, @splat(0xff));
 }
 
 fn incrMsg(comptime n: usize) [n]u8 {
@@ -48,7 +48,7 @@ test "RS128.encode byte-exact vs reference (zero/ff/incr/msg0=0x01)" {
     try testing.expectEqualSlices(u8, &kat.hqc128_rs_ff, &RS128.encode(ffMsg(RS128.k)));
     try testing.expectEqualSlices(u8, &kat.hqc128_rs_incr, &RS128.encode(incrMsg(RS128.k)));
 
-    var msg0_01: RS128.Message = [_]u8{0} ** RS128.k;
+    var msg0_01: RS128.Message = @as([RS128.k]u8, @splat(0));
     msg0_01[0] = 0x01;
     try testing.expectEqualSlices(u8, &kat.hqc128_rs_msg0_01, &RS128.encode(msg0_01));
 }
@@ -58,7 +58,7 @@ test "RS192.encode byte-exact vs reference (zero/ff/incr/msg0=0x01)" {
     try testing.expectEqualSlices(u8, &kat.hqc192_rs_ff, &RS192.encode(ffMsg(RS192.k)));
     try testing.expectEqualSlices(u8, &kat.hqc192_rs_incr, &RS192.encode(incrMsg(RS192.k)));
 
-    var msg0_01: RS192.Message = [_]u8{0} ** RS192.k;
+    var msg0_01: RS192.Message = @as([RS192.k]u8, @splat(0));
     msg0_01[0] = 0x01;
     try testing.expectEqualSlices(u8, &kat.hqc192_rs_msg0_01, &RS192.encode(msg0_01));
 }
@@ -68,7 +68,7 @@ test "RS256.encode byte-exact vs reference (zero/ff/incr/msg0=0x01)" {
     try testing.expectEqualSlices(u8, &kat.hqc256_rs_ff, &RS256.encode(ffMsg(RS256.k)));
     try testing.expectEqualSlices(u8, &kat.hqc256_rs_incr, &RS256.encode(incrMsg(RS256.k)));
 
-    var msg0_01: RS256.Message = [_]u8{0} ** RS256.k;
+    var msg0_01: RS256.Message = @as([RS256.k]u8, @splat(0));
     msg0_01[0] = 0x01;
     try testing.expectEqualSlices(u8, &kat.hqc256_rs_msg0_01, &RS256.encode(msg0_01));
 }
@@ -421,7 +421,7 @@ test "gated: RS256.decode corrects exactly delta random symbol errors (param_fft
 /// `computeSyndromes`. Self-validated by the all-zero-on-a-valid-codeword
 /// test below (which cross-checks it against the byte-exact-pinned encoder).
 fn independentSyndromes(comptime RSt: type, cdw: *const RSt.Codeword) [2 * RSt.delta]u8 {
-    var s: [2 * RSt.delta]u8 = [_]u8{0} ** (2 * RSt.delta);
+    var s: [2 * RSt.delta]u8 = @as([2 * RSt.delta]u8, @splat(0));
     for (0..2 * RSt.delta) |i| {
         var acc: u8 = 0;
         for (0..RSt.n1) |j| {

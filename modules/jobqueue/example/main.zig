@@ -202,14 +202,14 @@ pub fn main() !void {
     // name, and a rejected enqueue leaves no partial job behind.
     {
         const before_total = q.totalCount();
-        const oversized_payload = "x" ** 100; // > Options.max_payload (64)
+        const oversized_payload = strRepeat("x", 100); // > Options.max_payload (64)
         if (q.enqueue("t", oversized_payload, .{})) |_| {
             unreachable;
         } else |err| switch (err) {
             error.PayloadTooLarge => std.debug.print("oversized payload correctly rejected: PayloadTooLarge\n", .{}),
             else => return err,
         }
-        const oversized_type = "x" ** (jobqueue.max_field_len + 1);
+        const oversized_type = strRepeat("x", jobqueue.max_field_len + 1);
         if (q.enqueue(oversized_type, "ok", .{})) |_| {
             unreachable;
         } else |err| switch (err) {
@@ -280,4 +280,16 @@ pub fn main() !void {
         try q.ack(lease);
         std.debug.print("dead job retried, duplicate refused, scheduled job cancelled, heartbeat kept the lease\n", .{});
     }
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime text: []const u8, comptime n: usize) *const [text.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [text.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * text.len ..][0..text.len], text);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

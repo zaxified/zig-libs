@@ -250,8 +250,8 @@ test "ShareMsg / Complaint / DkgShareOutput codecs round-trip" {
     const testing = std.testing;
     const Secp256k1 = tecdsa.Secp256k1;
 
-    const s = Scalar.fromBytes([_]u8{0} ** 31 ++ [_]u8{7}, .big) catch unreachable;
-    const sp = Scalar.fromBytes([_]u8{0} ** 31 ++ [_]u8{9}, .big) catch unreachable;
+    const s = Scalar.fromBytes(@as([31]u8, @splat(0)) ++ [_]u8{7}, .big) catch unreachable;
+    const sp = Scalar.fromBytes(@as([31]u8, @splat(0)) ++ [_]u8{9}, .big) catch unreachable;
     const m: ShareMsg = .{ .dealer = 2, .receiver = 5, .s = s, .s_prime = sp };
     const back = try ShareMsg.fromBytes(m.toBytes());
     try testing.expectEqual(m.dealer, back.dealer);
@@ -275,19 +275,19 @@ test "DkgShareOutput.deinit zeroes the secret share, leaves public fields intact
     const testing = std.testing;
     const Secp256k1 = tecdsa.Secp256k1;
 
-    const s = Scalar.fromBytes([_]u8{0} ** 31 ++ [_]u8{7}, .big) catch unreachable;
+    const s = Scalar.fromBytes(@as([31]u8, @splat(0)) ++ [_]u8{7}, .big) catch unreachable;
     const g = try Element.fromPoint(Secp256k1.basePoint);
     var out: DkgShareOutput = .{ .index = 4, .secret_share = s, .group_public_key = g, .verifying_share = g };
 
     out.deinit();
-    try testing.expectEqualSlices(u8, &([_]u8{0} ** Ns), &out.secret_share.toBytes(.big));
+    try testing.expectEqualSlices(u8, &(@as([Ns]u8, @splat(0))), &out.secret_share.toBytes(.big));
     // Public fields survive deinit.
     try testing.expectEqual(@as(u32, 4), out.index);
     try testing.expectEqualSlices(u8, &g.toBytes(), &out.group_public_key.toBytes());
 
     // Idempotent: calling again on already-zeroed state is a no-op, not UB.
     out.deinit();
-    try testing.expectEqualSlices(u8, &([_]u8{0} ** Ns), &out.secret_share.toBytes(.big));
+    try testing.expectEqualSlices(u8, &(@as([Ns]u8, @splat(0))), &out.secret_share.toBytes(.big));
 }
 
 test "PedersenBroadcast / FeldmanBroadcast codecs round-trip" {

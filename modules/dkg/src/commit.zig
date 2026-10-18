@@ -38,7 +38,7 @@ pub const CommitError = error{IdentityElement} || tecdsa.ElementError;
 /// 32-byte big-endian; a `u32` is always `< q`, so canonicality never
 /// fires (mirrors `threshold_ecdsa`'s own `scalarFromIndex`).
 pub fn scalarFromIndex(index: u32) Scalar {
-    var buf: [32]u8 = [_]u8{0} ** 32;
+    var buf: [32]u8 = @as([32]u8, @splat(0));
     std.mem.writeInt(u32, buf[28..32], index, .big);
     return Scalar.fromBytes(buf, .big) catch unreachable;
 }

@@ -120,7 +120,7 @@ fn extractAndExpand(
 /// to also be 32 here — coincidence of both being SHA-256-sized, not a
 /// spec requirement that Nsecret == Npk).
 pub const X25519Kem = struct {
-    pub const kem_id: u16 = @intFromEnum(suite.KemId.dhkem_x25519_hkdf_sha256);
+    pub const kem_id: u16 = @backingInt(suite.KemId.dhkem_x25519_hkdf_sha256);
     /// KEM shared-secret width (RFC 9180 Table 2's `Nsecret`) — HKDF-SHA256's
     /// `Nh`.
     pub const Nsecret: usize = 32;
@@ -326,7 +326,7 @@ pub const X25519Kem = struct {
 /// KEM defines its own `KeyPair` shape directly over
 /// `std.crypto.ecc.P256`.
 pub const P256Kem = struct {
-    pub const kem_id: u16 = @intFromEnum(suite.KemId.dhkem_p256_hkdf_sha256);
+    pub const kem_id: u16 = @backingInt(suite.KemId.dhkem_p256_hkdf_sha256);
     pub const Nsecret: usize = 32;
     pub const Npk: usize = 65; // SEC1 uncompressed: 0x04 || X(32) || Y(32)
     pub const Nsk: usize = 32;
@@ -527,7 +527,7 @@ pub const P256Kem = struct {
 /// the same class of test `P256Kem`'s own non-KAT-covered surfaces, e.g.
 /// its `basePoint.mul + toUncompressedSec1` smoke test, already rely on).
 pub const P384Kem = struct {
-    pub const kem_id: u16 = @intFromEnum(suite.KemId.dhkem_p384_hkdf_sha384);
+    pub const kem_id: u16 = @backingInt(suite.KemId.dhkem_p384_hkdf_sha384);
     pub const Nsecret: usize = 48;
     pub const Npk: usize = 97; // SEC1 uncompressed: 0x04 || X(48) || Y(48)
     pub const Nsk: usize = 48;
@@ -682,7 +682,7 @@ pub const P384Kem = struct {
 /// 521). Anchored byte-exact to RFC 9180 A.6 (all four modes,
 /// `kat_rfc9180_a6.zig`).
 pub const P521Kem = struct {
-    pub const kem_id: u16 = @intFromEnum(suite.KemId.dhkem_p521_hkdf_sha512);
+    pub const kem_id: u16 = @backingInt(suite.KemId.dhkem_p521_hkdf_sha512);
     pub const Nsecret: usize = 64;
     pub const Npk: usize = 133; // SEC1 uncompressed: 0x04 || X(66) || Y(66)
     pub const Nsk: usize = 66;
@@ -845,7 +845,7 @@ test "P256Kem: basePoint.mul + toUncompressedSec1 wiring produces a well-formed 
     // keypair to check against — `std.Io`-backed randomness needs a real
     // event-loop instance this pure-math test doesn't stand up). scalar =
     // 1 -> pk == the curve's own basePoint, uncompressed-encoded.
-    const one = [_]u8{0} ** 31 ++ [_]u8{1};
+    const one = @as([31]u8, @splat(0)) ++ [_]u8{1};
     const pk_point = P256.basePoint.mul(one, .big) catch unreachable;
     const pk = pk_point.toUncompressedSec1();
     try testing.expectEqual(@as(u8, 0x04), pk[0]); // SEC1 uncompressed tag
@@ -885,7 +885,7 @@ test "DHKEM X25519 Encap: low-order pkR (all-zero DH output) fails closed with e
     // §6.1): scalarmult lands on the identity, which RFC 9180 §7.1.1
     // requires rejecting rather than deriving a predictable shared secret.
     const a1 = @import("kat_rfc9180.zig").a1;
-    const low_order_pk = [_]u8{0} ** 32;
+    const low_order_pk = @as([32]u8, @splat(0));
     const eph = X25519Kem.KeyPair{ .secret_key = a1.skEm, .public_key = a1.pkEm };
     try testing.expectError(error.DhFailed, blk: {
         var o: X25519Kem.Encapped = undefined;
@@ -1014,7 +1014,7 @@ test "P384Kem: type widths match RFC 9180 Table 2 (SEC1 uncompressed Npk=97)" {
 test "P384Kem: basePoint.mul + toUncompressedSec1 wiring produces a well-formed SEC1 point" {
     // Mirrors P256Kem's analogous smoke test: scalar = 1 -> pk == the
     // curve's own basePoint, uncompressed-encoded.
-    const one = [_]u8{0} ** 47 ++ [_]u8{1};
+    const one = @as([47]u8, @splat(0)) ++ [_]u8{1};
     const pk_point = P384.basePoint.mul(one, .big) catch unreachable;
     const pk = pk_point.toUncompressedSec1();
     try testing.expectEqual(@as(u8, 0x04), pk[0]); // SEC1 uncompressed tag

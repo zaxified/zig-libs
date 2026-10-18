@@ -37,7 +37,7 @@ pub fn main() !void {
     const manifest = [_]ManifestEntry{
         .{ .ns = "reports", .key = "2026-08-quarterly.pdf", .content = "quarterly numbers", .claimed_digest_hex = &hashdigest.sha256HexBuf("quarterly numbers") },
         .{ .ns = "reports", .key = "../escape", .content = "x", .claimed_digest_hex = &hashdigest.sha256HexBuf("x") }, // path traversal
-        .{ .ns = "reports", .key = "tampered.bin", .content = "real bytes", .claimed_digest_hex = "0" ** 64 }, // wrong digest
+        .{ .ns = "reports", .key = "tampered.bin", .content = "real bytes", .claimed_digest_hex = strRepeat("0", 64) }, // wrong digest
     };
 
     var accepted: usize = 0;
@@ -86,3 +86,15 @@ pub fn main() !void {
 // real directory, which is out of scope here (see the task's I/O rule) --
 // so the CAS/raw/named store, `gc`, and the cross-process ingest lock are
 // untested by any example, only by the module's own on-disk test suite.
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
+}

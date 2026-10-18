@@ -233,7 +233,7 @@ fn parseTable(
             .local_port = local.port,
             .remote = remote.ip,
             .remote_port = remote.port,
-            .state = @enumFromInt(state_raw),
+            .state = @fromBackingInt(@intCast(state_raw)),
             .uid = uid,
             .inode = inode,
             .tx_queue = queues.tx,
@@ -738,7 +738,7 @@ test "corpus: every socket script reaches both parsers, and the sockets decoded 
     var tcp: usize = 0;
     var udp: usize = 0;
     var mutations: usize = 0;
-    var samples_seen = [_]bool{false} ** socket_corpus.len;
+    var samples_seen = @as([socket_corpus.len]bool, @splat(false));
     for (socket_seeds) |sd| {
         var smith: std.testing.Smith = .{ .in = sd };
         var script: [512]u8 = undefined;

@@ -63,7 +63,7 @@ const Strobe128 = struct {
     cur_flags: u8,
 
     fn init(protocol_label: []const u8) Strobe128 {
-        var st = [_]u8{0} ** 200;
+        var st = @as([200]u8, @splat(0));
         st[0..6].* = .{ 1, strobe_r + 2, 1, 0, 1, 96 };
         st[6..18].* = "STROBEv1.0.2".*;
         permute(&st);
@@ -278,7 +278,7 @@ test "challengeScalar is canonical and a second draw under the same label differ
 }
 
 test "a long message crosses the 166-byte rate boundary deterministically" {
-    const msg = [_]u8{99} ** 1024;
+    const msg = @as([1024]u8, @splat(99));
     var t1 = Transcript.init("x");
     var t2 = Transcript.init("x");
     t1.appendMessage("m", &msg);

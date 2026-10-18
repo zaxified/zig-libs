@@ -170,8 +170,8 @@ test "SELF: the README's end-to-end example compiles and retrieves" {
     const want_index = 3;
 
     // Client: two fresh seeds (production: a CSPRNG, one pair per query).
-    const s0: fss.prg.Seed = [_]u8{0x11} ** 16;
-    const s1: fss.prg.Seed = [_]u8{0x22} ** 16;
+    const s0: fss.prg.Seed = @as([16]u8, @splat(0x11));
+    const s1: fss.prg.Seed = @as([16]u8, @splat(0x22));
     var shares: [2]P.Share = undefined;
     try P.query(want_index, &s0, &s1, &shares);
 

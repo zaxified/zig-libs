@@ -795,7 +795,7 @@ test "canonicalName: round-trips through parse for every Encoding (audit F2)" {
     // canonicalName() had zero test coverage — a wrong string for one arm
     // (e.g. windows_1250 mislabeled as "windows-1252") stayed green.
     inline for (@typeInfo(Encoding).@"enum".fields) |f| {
-        const e: Encoding = @enumFromInt(f.value);
+        const e: Encoding = @fromBackingInt(@intCast(f.value));
         try testing.expectEqual(e, Encoding.parse(e.canonicalName()).?);
     }
     try testing.expectEqualStrings("windows-1250", Encoding.windows_1250.canonicalName());
@@ -1044,7 +1044,7 @@ test "UTF-8 replacement is per maximal subpart (WHATWG), and delimiters survive"
     try expectDecode(.utf8, "\xf0\x80\x80", "\u{FFFD}\u{FFFD}\u{FFFD}");
     try expectDecode(.utf8, "\xed\xa0\x80", "\u{FFFD}\u{FFFD}\u{FFFD}");
     try expectDecode(.utf8, "\xf0\x9f\x98", "\u{FFFD}");
-    try expectDecode(.utf8, "\xf4\x90\x80\x80", "\u{FFFD}" ** 4);
+    try expectDecode(.utf8, "\xf4\x90\x80\x80", strRepeat("\u{FFFD}", 4));
     try expectDecode(.utf8, "\xe2\x82\xac\xe2\x82", "\u{20AC}\u{FFFD}");
 }
 
@@ -1151,11 +1151,23 @@ test "Encoding stays ASCII-compatible: UTF-16 is not one of its members" {
     // bxp transcodes CSV cell by cell and writes delimiters as raw bytes, which
     // is only sound because every `Encoding` maps bytes < 0x80 to ASCII.
     inline for (@typeInfo(Encoding).@"enum".fields) |f| {
-        const e: Encoding = @enumFromInt(f.value);
+        const e: Encoding = @fromBackingInt(@intCast(f.value));
         const got = try decodeToUtf8(testing.allocator, ",;\"\r\n", e);
         defer testing.allocator.free(got);
         try testing.expectEqualStrings(",;\"\r\n", got);
     }
     try testing.expect(Encoding.parse("utf-16le") == null);
     try testing.expect(Encoding.parse("utf-16") == null);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

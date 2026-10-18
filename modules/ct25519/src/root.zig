@@ -627,11 +627,11 @@ fn sharedSecret(comptime adx: bool, secret_key: [32]u8, public_key: [32]u8) std.
 fn ladder(comptime adx: bool, k: *const [32]u8, u: *const [32]u8) [32]u8 {
     const F = fe64.Ops(adx);
     var st: fe64.State = undefined;
-    st[@intFromEnum(fe64.Slot.x1)] = fe64.fromBytes(u);
-    st[@intFromEnum(fe64.Slot.x2)] = .{ 1, 0, 0, 0 };
-    st[@intFromEnum(fe64.Slot.z2)] = .{ 0, 0, 0, 0 };
-    st[@intFromEnum(fe64.Slot.x3)] = st[@intFromEnum(fe64.Slot.x1)];
-    st[@intFromEnum(fe64.Slot.z3)] = .{ 1, 0, 0, 0 };
+    st[@backingInt(fe64.Slot.x1)] = fe64.fromBytes(u);
+    st[@backingInt(fe64.Slot.x2)] = .{ 1, 0, 0, 0 };
+    st[@backingInt(fe64.Slot.z2)] = .{ 0, 0, 0, 0 };
+    st[@backingInt(fe64.Slot.x3)] = st[@backingInt(fe64.Slot.x1)];
+    st[@backingInt(fe64.Slot.z3)] = .{ 1, 0, 0, 0 };
     var swap: u64 = 0;
     var t: usize = 255;
     while (t > 0) {
@@ -664,7 +664,7 @@ fn ladder(comptime adx: bool, k: *const [32]u8, u: *const [32]u8) [32]u8 {
     fe64.cswap(swap, &st, .z2, .z3);
     F.invert(&st, .zi, .z2);
     F.fmul(&st, .r, .x2, .zi);
-    return fe64.toBytes(&st[@intFromEnum(fe64.Slot.r)]);
+    return fe64.toBytes(&st[@backingInt(fe64.Slot.r)]);
 }
 
 /// GF(2^255 − 19) on four 64-bit limbs; see the section comment above.
@@ -715,7 +715,7 @@ const fe64 = struct {
         p,
         q, // tests only
     };
-    const State = [@typeInfo(Slot).@"enum".fields.len]Limbs;
+    const State = [@typeInfo(Slot).@"enum".field_names.len]Limbs;
 
     /// RFC 7748 §5 decodeUCoordinate: little-endian, top bit masked. A value
     /// in `[p, 2^255)` is kept as is — it is congruent, which is all the
@@ -749,7 +749,7 @@ const fe64 = struct {
     /// cswap).
     fn cswap(swap: u64, st: *State, comptime a: Slot, comptime b: Slot) void {
         const m = 0 -% swap;
-        for (&st[@intFromEnum(a)], &st[@intFromEnum(b)]) |*x, *y| {
+        for (&st[@backingInt(a)], &st[@backingInt(b)]) |*x, *y| {
             const t = m & (x.* ^ y.*);
             x.* ^= t;
             y.* ^= t;
@@ -780,7 +780,7 @@ const fe64 = struct {
             @setEvalBranchQuota(10_000_000);
             var s = src;
             for (.{ .{ "(%[o])", o }, .{ "(%[a])", a }, .{ "(%[b])", b } }) |r| {
-                s = replace(s, r[0], std.fmt.comptimePrint("+{d}(%[p])", .{@as(usize, @intFromEnum(r[1])) * @sizeOf(Limbs)}));
+                s = replace(s, r[0], std.fmt.comptimePrint("+{d}(%[p])", .{@as(usize, @backingInt(r[1])) * @sizeOf(Limbs)}));
             }
             return s;
         }
@@ -1311,7 +1311,7 @@ test "mul: the neutral element is a VALUE, where std raises an error" {
     // This is the entire reason the module exists. std refuses both of
     // these; the whole point is that we do not, because refusing means
     // branching on a secret-derived value.
-    const zero = [_]u8{0} ** 32;
+    const zero = @as([32]u8, @splat(0));
     try testing.expectError(error.IdentityElement, Edwards25519.basePoint.mul(zero));
     try testing.expectError(error.IdentityElement, Ristretto255.basePoint.mul(zero));
 
@@ -1382,7 +1382,7 @@ test "mul: reads ALL 256 scalar bits (no silent truncation of the top window)" {
     // the value and not merely std's agreement with us.
     var bit: u16 = 250;
     while (bit < 256) : (bit += 1) {
-        var s = [_]u8{0} ** 32;
+        var s = @as([32]u8, @splat(0));
         s[bit >> 3] = @as(u8, 1) << @as(u3, @truncate(bit));
         const ours = mulBase(s).toBytes();
         const want = try Edwards25519.basePoint.mul(s);
@@ -1394,7 +1394,7 @@ test "mul: reads ALL 256 scalar bits (no silent truncation of the top window)" {
     }
     // 2^256 - 1: an unreduced scalar far above `L`, to pin that nothing
     // silently reduces or rejects it.
-    const ones = [_]u8{0xff} ** 32;
+    const ones = @as([32]u8, @splat(0xff));
     const want_ones = try Edwards25519.basePoint.mul(ones);
     try testing.expectEqualSlices(u8, &want_ones.toBytes(), &mulBase(ones).toBytes());
 }
@@ -1426,7 +1426,7 @@ test "mul: degenerate INPUT points, where std refuses to answer at all" {
     var acc = Edwards25519.identityElement; // acc == k*t8
     var k: u8 = 0;
     while (k < 10) : (k += 1) {
-        var sk = [_]u8{0} ** 32;
+        var sk = @as([32]u8, @splat(0));
         sk[0] = k;
         try testing.expectEqualSlices(u8, &acc.toBytes(), &mul(t8, sk).toBytes());
         // order exactly 8: identity at k = 0 and k = 8, nowhere between.
@@ -1486,7 +1486,7 @@ test "C3 comb: every nibble value at every position vs the ladder (all 256 table
     var n: usize = 0;
     for (0..64) |pos| {
         for (0..16) |v| {
-            var s = [_]u8{0} ** 32;
+            var s = @as([32]u8, @splat(0));
             s[pos >> 1] = @as(u8, @intCast(v)) << @as(u3, @intCast(4 * (pos & 1)));
             try expectCombMatchesLadder(s);
             n += 1;
@@ -1532,7 +1532,7 @@ test "C3 comb: carry-chain and boundary scalars vs the ladder" {
 
 test "C3 comb: randomized differential vs the ladder (full 256-bit and reduced scalars)" {
     // Debug is ~50x slower per multiply; the ReleaseFast lane carries the volume.
-    const count: usize = if (@import("builtin").mode == .Debug) 200 else 20_000;
+    const count: usize = if (@import("builtin").mode == .debug) 200 else 20_000;
     var prng = std.Random.DefaultPrng.init(0xC3_C0_4B_25_51_9E);
     const random = prng.random();
     for (0..count) |i| {
@@ -1572,12 +1572,12 @@ test "C3 comb: the table holds (k+1)·16^(2j)·B and the carry point is 2^256·B
     // it is checked as 16·(2^252·B), i.e. four doublings of a ladder result.
     for (0..comb_rows) |j| {
         for (0..comb_teeth) |k| {
-            var s = [_]u8{0} ** 32;
+            var s = @as([32]u8, @splat(0));
             s[j] = @intCast(k + 1); // byte j = 16^(2j)
             try testing.expectEqualSlices(u8, &mul(Edwards25519.basePoint, s).toBytes(), &comb_table[j][k].toBytes());
         }
     }
-    var s252 = [_]u8{0} ** 32;
+    var s252 = @as([32]u8, @splat(0));
     s252[31] = 0x10;
     const want = mul(Edwards25519.basePoint, s252).dbl().dbl().dbl().dbl();
     try testing.expectEqualSlices(u8, &want.toBytes(), &comb_carry.toBytes());
@@ -1612,7 +1612,7 @@ fn edgeScalar(i: usize) [32]u8 {
 }
 
 test "B9 mulMultiRistretto: bit-exact vs the per-term ladder sum across every chunk boundary" {
-    const debug = @import("builtin").mode == .Debug;
+    const debug = @import("builtin").mode == .debug;
     const sizes = [_]usize{ 0, 1, 2, 7, 8, 9, 15, 16, 17, 24, 33, 64 };
     const trials: usize = if (debug) 2 else 40;
     var prng = std.Random.DefaultPrng.init(0xB9_5_7A_05);
@@ -1651,7 +1651,7 @@ test "B9 mulMultiRistretto: bit-exact vs the per-term ladder sum across every ch
 }
 
 test "B9 mulMultiRistretto: one term equals mulRistretto; zero terms are the identity; no error set" {
-    const zero = [_]u8{0} ** 32;
+    const zero = @as([32]u8, @splat(0));
     try testing.expectEqualSlices(u8, &zero, &mulMultiRistretto(&.{}, &.{}).toBytes());
     const p = try Ristretto255.fromBytes(Ristretto255.basePoint.toBytes());
     for (0..6) |i| {
@@ -1663,7 +1663,7 @@ test "B9 mulMultiRistretto: one term equals mulRistretto; zero terms are the ide
 }
 
 test "mulMulti (Edwards): bit-exact vs the per-term mul sum, torsion points included, across every chunk boundary" {
-    const debug = @import("builtin").mode == .Debug;
+    const debug = @import("builtin").mode == .debug;
     const sizes = [_]usize{ 0, 1, 2, 7, 8, 9, 16, 17, 33 };
     const trials: usize = if (debug) 2 else 30;
     var prng = std.Random.DefaultPrng.init(0xED_5_7A_05);
@@ -1786,7 +1786,7 @@ test "X25519: recoverPublicKey is bit-exact with std over random and edge seeds"
         seed = wide[0..32].*;
         try testing.expectEqualSlices(u8, &(try std.crypto.dh.X25519.recoverPublicKey(seed)), &(try X25519.recoverPublicKey(seed)));
     }
-    for ([_][32]u8{ @splat(0), @splat(0xff), [_]u8{1} ++ [_]u8{0} ** 31, [_]u8{0} ** 31 ++ [_]u8{0x80}, [_]u8{7} ++ [_]u8{0} ** 30 ++ [_]u8{0x40} }) |s| {
+    for ([_][32]u8{ @splat(0), @splat(0xff), [_]u8{1} ++ @as([31]u8, @splat(0)), @as([31]u8, @splat(0)) ++ [_]u8{0x80}, [_]u8{7} ++ @as([30]u8, @splat(0)) ++ [_]u8{0x40} }) |s| {
         try testing.expectEqualSlices(u8, &(try std.crypto.dh.X25519.recoverPublicKey(s)), &(try X25519.recoverPublicKey(s)));
     }
 }
@@ -1853,7 +1853,7 @@ test "P6 X25519: RFC 7748 §5.2 vectors and the 1 / 1,000 iteration chains, ever
         if (!test_hooks.available(b)) continue;
         test_hooks.forced = b;
         for (vectors) |v| try testing.expectEqualSlices(u8, &v.out, &(try x25519Value(&v.k, v.u)));
-        var k: [32]u8 = [_]u8{9} ++ [_]u8{0} ** 31;
+        var k: [32]u8 = [_]u8{9} ++ @as([31]u8, @splat(0));
         var u = k;
         for (1..1001) |i| {
             const out = try x25519Value(&k, u);
@@ -1872,7 +1872,7 @@ test "P6 X25519: RFC 7748 §5.2 1,000,000 iterations (opt-in: CT25519_RFC7748_MI
     if (std.testing.environ.getPosix("CT25519_RFC7748_MILLION") == null) return error.SkipZigTest;
     // Only the build's own backend: ~35-50 s per backend at ReleaseFast.
     const million = hex32("7c3911e0ab2586fd864497297e575e6f3bc601c0883c30df5f4dd2d24f665424");
-    var k: [32]u8 = [_]u8{9} ++ [_]u8{0} ** 31;
+    var k: [32]u8 = [_]u8{9} ++ @as([31]u8, @splat(0));
     var u = k;
     for (0..1_000_000) |_| {
         const out = try x25519Value(&k, u);
@@ -1889,7 +1889,7 @@ test "P6 X25519: RFC 7748 §6.1 Diffie-Hellman, every backend" {
     const bob_sk = hex32("5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb");
     const bob_pk = hex32("de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f");
     const shared = hex32("4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742");
-    const nine = [_]u8{9} ++ [_]u8{0} ** 31;
+    const nine = [_]u8{9} ++ @as([31]u8, @splat(0));
     for (all_x25519_backends) |b| {
         if (!test_hooks.available(b)) continue;
         test_hooks.forced = b;
@@ -1996,7 +1996,7 @@ test "P6 X25519: edge u-coordinates and low-order points agree with std, every b
 
 test "P6 X25519: randomized differential vs std over raw scalars and raw u (thousands, every backend)" {
     defer test_hooks.forced = null;
-    const trials: usize = if (builtin.mode == .Debug) 300 else 5000;
+    const trials: usize = if (builtin.mode == .debug) 300 else 5000;
     var prng = std.Random.DefaultPrng.init(0x7748_0006);
     const random = prng.random();
     for (all_x25519_backends) |b| {
@@ -2043,8 +2043,8 @@ fn fieldOp(comptime adx: bool, comptime op: enum { mul, sq, add, sub, mul121665,
     const F = fe64.Ops(adx);
     var st: fe64.State = undefined;
     for (&st) |*l| l.* = .{ 0xdead, 0xbeef, 0xdead, 0xbeef }; // no stale answer to find
-    st[@intFromEnum(fe64.Slot.p)] = limbsOf(x);
-    st[@intFromEnum(fe64.Slot.q)] = limbsOf(y);
+    st[@backingInt(fe64.Slot.p)] = limbsOf(x);
+    st[@backingInt(fe64.Slot.q)] = limbsOf(y);
     switch (op) {
         .mul => F.fmul(&st, o, .p, .q),
         .sq => F.sq(&st, o, .p),
@@ -2053,7 +2053,7 @@ fn fieldOp(comptime adx: bool, comptime op: enum { mul, sq, add, sub, mul121665,
         .mul121665 => F.mul121665(&st, o, .p),
         .invert => F.invert(&st, o, .p),
     }
-    return canonical(st[@intFromEnum(o)]);
+    return canonical(st[@backingInt(o)]);
 }
 
 fn checkFieldPair(comptime adx: bool, x: u256, y: u256) !void {
@@ -2092,7 +2092,7 @@ test "P6 fe64: mul/sq/add/sub/mul121665/toBytes vs u512 mod p, edges × edges an
     if (!fe64.bmi2) return error.SkipZigTest;
     var prng = std.Random.DefaultPrng.init(0xfe64_2559);
     const random = prng.random();
-    const trials: usize = if (builtin.mode == .Debug) 3000 else 100_000;
+    const trials: usize = if (builtin.mode == .debug) 3000 else 100_000;
     inline for (.{ false, true }) |adx| {
         if (comptime (if (adx) fe64.adx else fe64.bmi2)) {
             for (field_edges) |x| for (field_edges) |y| try checkFieldPair(adx, x, y);

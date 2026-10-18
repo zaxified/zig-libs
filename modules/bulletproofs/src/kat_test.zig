@@ -41,8 +41,8 @@ test "completeness: prove/verify accepts several in-range values, n=8" {
 
     const values = [_]u64{ 0, 1, 42, 100, 254, 255 }; // 255 = 2^8 - 1, the max in-range value
     for (values) |v| {
-        const gamma = [_]u8{@truncate(v + 1)} ++ [_]u8{0} ** 31;
-        const v_bytes = [_]u8{@truncate(v)} ++ [_]u8{0} ** 31;
+        const gamma = [_]u8{@truncate(v + 1)} ++ @as([31]u8, @splat(0));
+        const v_bytes = [_]u8{@truncate(v)} ++ @as([31]u8, @splat(0));
         const commitment = bulletproofs.commit(gens, v_bytes, gamma);
 
         var prove_t = Transcript.init(bulletproofs.rangeproof_domain);
@@ -66,8 +66,8 @@ test "completeness: IPA standalone accepts an honestly-built P, n=8" {
     var a: [n][32]u8 = undefined;
     var b: [n][32]u8 = undefined;
     for (&a, &b, 0..) |*ai, *bi, i| {
-        ai.* = [_]u8{@truncate(i + 1)} ++ [_]u8{0} ** 31;
-        bi.* = [_]u8{@truncate(2 * i + 1)} ++ [_]u8{0} ** 31;
+        ai.* = [_]u8{@truncate(i + 1)} ++ @as([31]u8, @splat(0));
+        bi.* = [_]u8{@truncate(2 * i + 1)} ++ @as([31]u8, @splat(0));
     }
     const q = gens.g; // any fixed generator works for a standalone IPA test
 
@@ -112,8 +112,8 @@ test "soundness: tampering any proof field is rejected" {
     const gens = try Generators.init(std.testing.allocator, n);
     defer gens.deinit(std.testing.allocator);
     const v: u64 = 200;
-    const gamma = [_]u8{5} ++ [_]u8{0} ** 31;
-    const v_bytes = [_]u8{@truncate(v)} ++ [_]u8{0} ** 31;
+    const gamma = [_]u8{5} ++ @as([31]u8, @splat(0));
+    const v_bytes = [_]u8{@truncate(v)} ++ @as([31]u8, @splat(0));
     const commitment = bulletproofs.commit(gens, v_bytes, gamma);
 
     var prove_t = Transcript.init(bulletproofs.rangeproof_domain);
@@ -237,7 +237,7 @@ test "zero-knowledge: two proofs of the identical witness are not bit-identical"
     const gens = try Generators.init(std.testing.allocator, n);
     defer gens.deinit(std.testing.allocator);
     const v: u64 = 137;
-    const gamma = [_]u8{42} ++ [_]u8{0} ** 31;
+    const gamma = [_]u8{42} ++ @as([31]u8, @splat(0));
 
     var t1 = Transcript.init(bulletproofs.rangeproof_domain);
     const p1 = try bulletproofs.prove(std.testing.allocator, std.testing.io, gens, &t1, &v, gamma);
@@ -250,7 +250,7 @@ test "zero-knowledge: two proofs of the identical witness are not bit-identical"
     // Both must independently verify (positive control: a broken runner
     // that always returns unequal would pass the checks below vacuously).
     {
-        const commitment = bulletproofs.commit(gens, [_]u8{@truncate(v)} ++ [_]u8{0} ** 31, gamma);
+        const commitment = bulletproofs.commit(gens, [_]u8{@truncate(v)} ++ @as([31]u8, @splat(0)), gamma);
         var vt1 = Transcript.init(bulletproofs.rangeproof_domain);
         try std.testing.expect(bulletproofs.verify(gens, &vt1, commitment, p1));
         var vt2 = Transcript.init(bulletproofs.rangeproof_domain);
@@ -278,13 +278,13 @@ test "soundness: a proof for V is rejected against a different commitment V'" {
     const gens = try Generators.init(std.testing.allocator, n);
     defer gens.deinit(std.testing.allocator);
 
-    const gamma1 = [_]u8{5} ++ [_]u8{0} ** 31;
+    const gamma1 = [_]u8{5} ++ @as([31]u8, @splat(0));
     var prove_t = Transcript.init(bulletproofs.rangeproof_domain);
     const proof = try bulletproofs.prove(std.testing.allocator, std.testing.io, gens, &prove_t, &@as(u64, 50), gamma1);
     defer proof.deinit(std.testing.allocator);
 
-    const gamma2 = [_]u8{6} ++ [_]u8{0} ** 31;
-    const other_commitment = bulletproofs.commit(gens, [_]u8{51} ++ [_]u8{0} ** 31, gamma2);
+    const gamma2 = [_]u8{6} ++ @as([31]u8, @splat(0));
+    const other_commitment = bulletproofs.commit(gens, [_]u8{51} ++ @as([31]u8, @splat(0)), gamma2);
 
     var vt = Transcript.init(bulletproofs.rangeproof_domain);
     try std.testing.expect(!bulletproofs.verify(gens, &vt, other_commitment, proof));
@@ -300,8 +300,8 @@ test "soundness: verifying with a differently-sized Generators set is rejected" 
     const gens16 = try Generators.init(std.testing.allocator, 16);
     defer gens16.deinit(std.testing.allocator);
 
-    const gamma = [_]u8{5} ++ [_]u8{0} ** 31;
-    const v_bytes = [_]u8{50} ++ [_]u8{0} ** 31;
+    const gamma = [_]u8{5} ++ @as([31]u8, @splat(0));
+    const v_bytes = [_]u8{50} ++ @as([31]u8, @splat(0));
     const commitment = bulletproofs.commit(gens8, v_bytes, gamma);
 
     var prove_t = Transcript.init(bulletproofs.rangeproof_domain);
@@ -333,8 +333,8 @@ test "soundness: random forgeries of L_0 are never accepted (discriminating powe
     const gens = try Generators.init(std.testing.allocator, n);
     defer gens.deinit(std.testing.allocator);
     const v: u64 = 200;
-    const gamma = [_]u8{5} ++ [_]u8{0} ** 31;
-    const commitment = bulletproofs.commit(gens, [_]u8{@truncate(v)} ++ [_]u8{0} ** 31, gamma);
+    const gamma = [_]u8{5} ++ @as([31]u8, @splat(0));
+    const commitment = bulletproofs.commit(gens, [_]u8{@truncate(v)} ++ @as([31]u8, @splat(0)), gamma);
 
     var prove_t = Transcript.init(bulletproofs.rangeproof_domain);
     const proof = try bulletproofs.prove(std.testing.allocator, std.testing.io, gens, &prove_t, &v, gamma);
@@ -366,7 +366,7 @@ test "soundness: random forgeries of L_0 are never accepted (discriminating powe
     // 80 trials still gives P(0 hits at p=1/256) ~= 73% -- a materially
     // weaker Debug smoke check, but the discriminating-power claim this test
     // makes is carried by the non-Debug lanes at full strength.
-    const trials: usize = if (builtin.mode == .Debug) 80 else 500;
+    const trials: usize = if (builtin.mode == .debug) 80 else 500;
     var accepted: usize = 0;
     for (0..trials) |_| {
         var tampered = proof;

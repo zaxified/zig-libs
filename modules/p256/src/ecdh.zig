@@ -129,7 +129,7 @@ test "ecdh: a refused call zeroes out" {
     try testing.expectEqualSlices(u8, &zero, &out);
 
     out = @splat(0xaa);
-    const one = [_]u8{0} ** 31 ++ [_]u8{1};
+    const one = @as([31]u8, @splat(0)) ++ [_]u8{1};
     try testing.expectError(error.InvalidEncoding, ecdhInto(&out, &one, g[0..64]));
     try testing.expectEqualSlices(u8, &zero, &out);
 }

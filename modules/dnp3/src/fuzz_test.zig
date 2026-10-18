@@ -38,10 +38,10 @@ pub fn damage(src: anytype, buf: []u8, frame: []const u8) usize {
 /// Reach counters for one harness file's labels (see jwt's fuzz_test.zig).
 pub fn Marker(comptime Label: type) type {
     return struct {
-        var counts: [@typeInfo(Label).@"enum".fields.len]usize = @splat(0);
+        var counts: [@typeInfo(Label).@"enum".field_names.len]usize = @splat(0);
 
         pub fn mark(comptime l: Label) void {
-            counts[@intFromEnum(l)] += 1;
+            counts[@backingInt(l)] += 1;
             fuzz_driver.hit(@tagName(l));
         }
 
@@ -56,7 +56,7 @@ pub fn Marker(comptime Label: type) type {
                 };
             }
             for (counts, 0..) |n, i| if (n == 0) {
-                std.debug.print("reach: " ++ name ++ " label {t} never hit in {d} seeds\n", .{ @as(Label, @enumFromInt(i)), seeds });
+                std.debug.print("reach: " ++ name ++ " label {t} never hit in {d} seeds\n", .{ @as(Label, @fromBackingInt(@intCast(i))), seeds });
                 return error.HarnessDoesNotReach;
             };
         }
@@ -158,7 +158,7 @@ pub fn fuzzSa(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
         .challenge_seq_num = src.value(u32),
         .user_number = src.value(u16),
         .mac_algorithm = alg,
-        .reason = @enumFromInt(src.value(u8)),
+        .reason = @fromBackingInt(@intCast(src.value(u8))),
         .challenge_data = data[0..dl],
     };
     const enc = try chal.encode(&obj);

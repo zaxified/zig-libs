@@ -3033,7 +3033,7 @@ test "middleware: a 500 response is the server's fault and never strikes" {
 
 const AgAddr = struct {
     fam: u8, // 4 or 6
-    b: [16]u8 = .{0} ** 16,
+    b: [16]u8 = @splat(0),
 
     fn eql(x: AgAddr, y: AgAddr) bool {
         return x.fam == y.fam and std.mem.eql(u8, &x.b, &y.b);
@@ -3655,7 +3655,7 @@ fn agCase(gpa: Allocator, seed: u64, reach: *AgReach) !void {
     var g = Guard.init(gpa, opts);
     defer g.deinit();
     var m = AgModel{ .cfg = cfg, .reach = reach };
-    var owed: [ag_ips.len]u32 = .{0} ** ag_ips.len;
+    var owed: [ag_ips.len]u32 = @splat(0);
     var owed_untracked: u32 = 0;
 
     const steps = 100 + rnd.uintLessThan(usize, 250);

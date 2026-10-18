@@ -90,7 +90,7 @@ pub const Kind = enum(u32) {
     pub fn fromTag(t: ber.Tag) Error!Kind {
         if (t.class != .context) return error.UnknownDataType;
         return switch (t.number) {
-            1...17 => @enumFromInt(t.number),
+            1...17 => @fromBackingInt(@intCast(t.number)),
             else => error.UnknownDataType,
         };
     }
@@ -101,9 +101,9 @@ pub const Kind = enum(u32) {
 
     pub fn tag(self: Kind) ber.Tag {
         return if (self.isConstructed())
-            ber.Tag.ctxc(@intFromEnum(self))
+            ber.Tag.ctxc(@backingInt(self))
         else
-            ber.Tag.ctx(@intFromEnum(self));
+            ber.Tag.ctx(@backingInt(self));
     }
 };
 
@@ -629,8 +629,8 @@ test "UtcTime round trips and refuses impossible quality" {
     bad[7] = 30;
     try testing.expectError(error.BadTime, UtcTime.parse(&bad));
     // Wrong width.
-    try testing.expectError(error.BadTime, UtcTime.parse(&[_]u8{0} ** 7));
-    try testing.expectError(error.BadTime, UtcTime.parse(&[_]u8{0} ** 9));
+    try testing.expectError(error.BadTime, UtcTime.parse(&@as([7]u8, @splat(0))));
+    try testing.expectError(error.BadTime, UtcTime.parse(&@as([9]u8, @splat(0))));
 
     // The failure flags survive.
     var suspicious = captured;

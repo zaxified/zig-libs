@@ -1256,7 +1256,7 @@ test "integration: reverse proxy forwards, injects headers, strips hop-by-hop, 5
 
     { // Streaming request + response body (large, outgrows every buffer).
         const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/echo", .{proxy_port});
-        const payload = "STREAM" ** 20_000; // 120 KB
+        const payload = strRepeat("STREAM", 20_000); // 120 KB
         var res = try client.request(.post, url, .{ .body = payload });
         defer res.deinit();
         try testing.expectEqual(@as(u16, 200), res.status);
@@ -1818,7 +1818,7 @@ test "integration: reverse proxy forwards over h2c to an HTTP/2 backend (multipl
 
     { // POST /echo, large body → exercises h2 send-side flow control.
         const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/echo", .{proxy_port});
-        const payload = "H2PROXY" ** 20_000; // ~140 KB, past the 64 KiB window
+        const payload = strRepeat("H2PROXY", 20_000); // ~140 KB, past the 64 KiB window
         var res = try client.request(.post, url, .{ .body = payload });
         defer res.deinit();
         try testing.expectEqual(@as(u16, 200), res.status);
@@ -2259,4 +2259,16 @@ fn fuzzRelay(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
         if (count > 1 and rw.getHeader(e.name) != null) repeated = true;
     }
     if (repeated) RelayMark.mark(.joined);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

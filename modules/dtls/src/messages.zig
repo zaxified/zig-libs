@@ -247,7 +247,7 @@ pub fn encodePskKeyExchangeModes(modes: []const PskKeyExchangeMode, out: []u8) M
     if (modes.len == 0 or modes.len > 255) return error.Malformed;
     if (out.len < 1 + modes.len) return error.BufferTooShort;
     out[0] = @intCast(modes.len);
-    for (modes, 0..) |m, i| out[1 + i] = @intFromEnum(m);
+    for (modes, 0..) |m, i| out[1 + i] = @backingInt(m);
     return out[0 .. 1 + modes.len];
 }
 
@@ -256,7 +256,7 @@ pub fn decodePskKeyExchangeModes(data: []const u8, out: []PskKeyExchangeMode) Me
     const n = data[0];
     if (data.len < 1 + @as(usize, n)) return error.Malformed;
     if (n > out.len) return error.TooManyExtensions;
-    for (0..n) |i| out[i] = @enumFromInt(data[1 + i]);
+    for (0..n) |i| out[i] = @fromBackingInt(@intCast(data[1 + i]));
     return out[0..n];
 }
 
@@ -1017,7 +1017,7 @@ test "hello_retry_request_random matches std's TLS 1.3 constant, 32 bytes" {
 
 test "isHelloRetryRequest: true for the magic value, false otherwise" {
     try testing.expect(isHelloRetryRequest(hello_retry_request_random));
-    try testing.expect(!isHelloRetryRequest([_]u8{0} ** 32));
+    try testing.expect(!isHelloRetryRequest(@as([32]u8, @splat(0))));
 }
 
 test "extension list round-trip" {
@@ -1090,12 +1090,12 @@ test "ClientHello with a duplicated extension is rejected by the decoder the han
     // `decodeClientHello`, the first thing a server does with an
     // unauthenticated datagram.
     const dup = [_]Extension{
-        .{ .ext_type = @intFromEnum(ExtensionType.supported_versions), .data = &.{ 2, 0xFE, 0xFC } },
-        .{ .ext_type = @intFromEnum(ExtensionType.supported_versions), .data = &.{ 2, 0xFE, 0xFD } },
+        .{ .ext_type = @backingInt(ExtensionType.supported_versions), .data = &.{ 2, 0xFE, 0xFC } },
+        .{ .ext_type = @backingInt(ExtensionType.supported_versions), .data = &.{ 2, 0xFE, 0xFD } },
     };
     var ch_buf: [256]u8 = undefined;
     const ch = try encodeClientHello(.{
-        .random = [_]u8{0x11} ** 32,
+        .random = @as([32]u8, @splat(0x11)),
         .legacy_session_id = &.{},
         .cipher_suites = &.{0x1301},
         .extensions = &dup,
@@ -1127,7 +1127,7 @@ test "OfferedPsks round-trip with opaque binders" {
     const identities = [_]PskIdentity{
         .{ .identity = "device-042", .obfuscated_ticket_age = 0 },
     };
-    const binder = [_]u8{0xAB} ** 32; // opaque; real value is crypto-core
+    const binder = @as([32]u8, @splat(0xAB)); // opaque; real value is crypto-core
     const binders = [_][]const u8{&binder};
     const psks = OfferedPsks{ .identities = &identities, .binders = &binders };
 
@@ -1153,7 +1153,7 @@ test "selected identity round-trip" {
 test "ClientHello round-trip incl. cipher-suite iteration" {
     const exts = [_]Extension{.{ .ext_type = 45, .data = &.{0} }};
     const ch = ClientHello{
-        .random = [_]u8{0x11} ** 32,
+        .random = @as([32]u8, @splat(0x11)),
         .legacy_session_id = &.{},
         .cipher_suites = &.{ 0x1304, 0x1305 }, // AES_128_CCM_SHA256, AES_128_CCM_8_SHA256
         .extensions = &exts,
@@ -1178,7 +1178,7 @@ test "ClientHello round-trip incl. cipher-suite iteration" {
 
 test "ServerHello round-trip and HelloRetryRequest detection" {
     const sh = ServerHello{
-        .random = [_]u8{0x22} ** 32,
+        .random = @as([32]u8, @splat(0x22)),
         .legacy_session_id_echo = &.{ 1, 2, 3 },
         .cipher_suite = 0x1305,
         .extensions = &.{},
@@ -1217,7 +1217,7 @@ test "EncryptedExtensions round-trip" {
 }
 
 test "Finished round-trip (opaque verify_data)" {
-    const verify_data = [_]u8{0xEE} ** 32; // opaque; real value is crypto-core
+    const verify_data = @as([32]u8, @splat(0xEE)); // opaque; real value is crypto-core
     var buf: [32]u8 = undefined;
     const enc = try encodeFinished(.{ .verify_data = &verify_data }, &buf);
     const dec = decodeFinished(enc);
@@ -1320,7 +1320,7 @@ test "Certificate decode: a 255-octet certificate_request_context is legal, not 
 }
 
 test "CertificateVerify round-trip (opaque algorithm + signature)" {
-    const sig = [_]u8{0x77} ** 64; // opaque; real value is certverify.sign's output
+    const sig = @as([64]u8, @splat(0x77)); // opaque; real value is certverify.sign's output
     var buf: [128]u8 = undefined;
     const enc = try encodeCertificateVerify(.{ .algorithm = 0x0403, .signature = &sig }, &buf);
     const dec = try decodeCertificateVerify(enc);
@@ -1362,7 +1362,7 @@ test "CertificateRequest round-trip: empty context and extensions" {
 // ── key_share / supported_groups / signature_algorithms (cert-DHE mode) ──
 
 test "supported_groups / signature_algorithms u16-list round-trip" {
-    const groups = [_]u16{ @intFromEnum(NamedGroup.x25519), @intFromEnum(NamedGroup.secp256r1) };
+    const groups = [_]u16{ @backingInt(NamedGroup.x25519), @backingInt(NamedGroup.secp256r1) };
     var buf: [16]u8 = undefined;
     const enc = try encodeSupportedGroups(&groups, &buf);
     // 2-byte outer length (4) + two u16s.
@@ -1379,8 +1379,8 @@ test "signature_algorithms odd-length body is a typed error" {
 }
 
 test "key_share ClientHello round-trip (x25519 32-byte share)" {
-    const share = [_]u8{0xAB} ** 32;
-    const entries = [_]KeyShareEntry{.{ .group = @intFromEnum(NamedGroup.x25519), .key_exchange = &share }};
+    const share = @as([32]u8, @splat(0xAB));
+    const entries = [_]KeyShareEntry{.{ .group = @backingInt(NamedGroup.x25519), .key_exchange = &share }};
     var buf: [64]u8 = undefined;
     const enc = try encodeKeyShareClientHello(&entries, &buf);
 
@@ -1392,8 +1392,8 @@ test "key_share ClientHello round-trip (x25519 32-byte share)" {
 }
 
 test "key_share ClientHello: multiple entries decode independently" {
-    const s1 = [_]u8{0x11} ** 32;
-    const s2 = [_]u8{0x22} ** 65; // secp256r1 uncompressed point size
+    const s1 = @as([32]u8, @splat(0x11));
+    const s2 = @as([65]u8, @splat(0x22)); // secp256r1 uncompressed point size
     const entries = [_]KeyShareEntry{
         .{ .group = 0x001d, .key_exchange = &s1 },
         .{ .group = 0x0017, .key_exchange = &s2 },
@@ -1408,7 +1408,7 @@ test "key_share ClientHello: multiple entries decode independently" {
 }
 
 test "key_share ServerHello round-trip (single bare entry, no list prefix)" {
-    const share = [_]u8{0xCD} ** 32;
+    const share = @as([32]u8, @splat(0xCD));
     var buf: [64]u8 = undefined;
     const enc = try encodeKeyShareServerHello(.{ .group = 0x001d, .key_exchange = &share }, &buf);
     // group(2) + len(2) + 32 = 36 bytes, no outer list length.
@@ -1420,7 +1420,7 @@ test "key_share ServerHello round-trip (single bare entry, no list prefix)" {
 
 test "key_share HelloRetryRequest form: exactly two bytes, and NOT interchangeable with the ServerHello form" {
     var buf: [8]u8 = undefined;
-    const enc = try encodeKeyShareHelloRetryRequest(@intFromEnum(NamedGroup.secp256r1), &buf);
+    const enc = try encodeKeyShareHelloRetryRequest(@backingInt(NamedGroup.secp256r1), &buf);
     try testing.expectEqual(@as(usize, 2), enc.len);
     try testing.expectEqualSlices(u8, &.{ 0x00, 0x17 }, enc);
     try testing.expectEqual(@as(u16, 0x0017), try decodeKeyShareHelloRetryRequest(enc));
@@ -1431,7 +1431,7 @@ test "key_share HelloRetryRequest form: exactly two bytes, and NOT interchangeab
     // took only the first two bytes would turn a server's real share into a
     // group name and the client would retry against a group the server never
     // asked for.
-    const share = [_]u8{0xCD} ** 32;
+    const share = @as([32]u8, @splat(0xCD));
     var sh_buf: [64]u8 = undefined;
     const sh_form = try encodeKeyShareServerHello(.{ .group = 0x001d, .key_exchange = &share }, &sh_buf);
     try testing.expectError(error.Malformed, decodeKeyShareHelloRetryRequest(sh_form));
@@ -1440,7 +1440,7 @@ test "key_share HelloRetryRequest form: exactly two bytes, and NOT interchangeab
 }
 
 test "key_share ClientHello: inner length overrunning the list is a typed error, never a panic" {
-    const share = [_]u8{0xAB} ** 32;
+    const share = @as([32]u8, @splat(0xAB));
     const entries = [_]KeyShareEntry{.{ .group = 0x001d, .key_exchange = &share }};
     var buf: [64]u8 = undefined;
     const enc = try encodeKeyShareClientHello(&entries, &buf);
@@ -1454,9 +1454,9 @@ test "key_share ClientHello: inner length overrunning the list is a typed error,
 }
 
 test "HandshakeType: RFC 8446 §4 wire code points for the cert-mode types" {
-    try testing.expectEqual(@as(u8, 11), @intFromEnum(HandshakeType.certificate));
-    try testing.expectEqual(@as(u8, 13), @intFromEnum(HandshakeType.certificate_request));
-    try testing.expectEqual(@as(u8, 15), @intFromEnum(HandshakeType.certificate_verify));
+    try testing.expectEqual(@as(u8, 11), @backingInt(HandshakeType.certificate));
+    try testing.expectEqual(@as(u8, 13), @backingInt(HandshakeType.certificate_request));
+    try testing.expectEqual(@as(u8, 15), @backingInt(HandshakeType.certificate_verify));
 }
 
 // ── fuzz: handshake message bodies off the wire, never panic ───────────────
@@ -1539,7 +1539,7 @@ fn flipAt(at: u64) u64 {
 // ── ClientHello ────────────────────────────────────────────────────────────
 
 fn buildClientHelloCorpus(s: *Corpus) []const []const u8 {
-    fuzz_corpus.collectHandshakeBodies(s, @intFromEnum(HandshakeType.client_hello), null);
+    fuzz_corpus.collectHandshakeBodies(s, @backingInt(HandshakeType.client_hello), null);
     // The same recorded body with one octet flipped, at the three offsets that
     // decide how the rest is read: the session-id length, the legacy cookie
     // length, and the first octet of the cipher-suite list length.
@@ -1560,7 +1560,7 @@ fn buildClientHelloCorpus(s: *Corpus) []const []const u8 {
         .extensions = &.{},
     }, &wire)) |enc| s.push(enc, null) else |_| {}
     s.push(&.{}, null);
-    s.push(&([_]u8{ 0xFE, 0xFD } ++ [_]u8{0} ** 33), null); // one octet short of a session id
+    s.push(&([_]u8{ 0xFE, 0xFD } ++ @as([33]u8, @splat(0))), null); // one octet short of a session id
     return s.corpus();
 }
 
@@ -1586,7 +1586,7 @@ fn fuzzDecodeClientHello(_: void, smith: *std.testing.Smith) !void {
 // ── ServerHello ────────────────────────────────────────────────────────────
 
 fn buildServerHelloCorpus(s: *Corpus) []const []const u8 {
-    fuzz_corpus.collectHandshakeBodies(s, @intFromEnum(HandshakeType.server_hello), null);
+    fuzz_corpus.collectHandshakeBodies(s, @backingInt(HandshakeType.server_hello), null);
     std.debug.assert(s.n != 0);
     const first = s.frames[0];
     for ([_]u64{ 34, 35, 37 }) |at| s.push(first, flipAt(at)); // sid len, cipher suite, compression
@@ -1598,7 +1598,7 @@ fn buildServerHelloCorpus(s: *Corpus) []const []const u8 {
         .extensions = &.{},
     }, &wire)) |enc| s.push(enc, null) else |_| {}
     s.push(&.{}, null);
-    s.push(&([_]u8{ 0xFE, 0xFD } ++ [_]u8{0} ** 33), null);
+    s.push(&([_]u8{ 0xFE, 0xFD } ++ @as([33]u8, @splat(0))), null);
     return s.corpus();
 }
 
@@ -1669,8 +1669,8 @@ fn fuzzDecodeCertificate(_: void, smith: *std.testing.Smith) !void {
 // sent, pulled out of the recording by extension type.
 
 fn buildExtensionsCorpus(s: *Corpus) []const []const u8 {
-    fuzz_corpus.collectExtensionBlocks(s, @intFromEnum(HandshakeType.client_hello), null);
-    fuzz_corpus.collectExtensionBlocks(s, @intFromEnum(HandshakeType.server_hello), null);
+    fuzz_corpus.collectExtensionBlocks(s, @backingInt(HandshakeType.client_hello), null);
+    fuzz_corpus.collectExtensionBlocks(s, @backingInt(HandshakeType.server_hello), null);
     // The refusals this file's own tests name.
     s.push(&.{ 0x00, 0x08, 0x00, 0x2A, 0x00, 0x00, 0x00, 0x2A, 0x00, 0x00 }, null); // duplicate type
     s.push(&.{ 0x00, 0x05, 0x00, 0x2A, 0x00, 0x0F, 0x01 }, null); // inner length over the block
@@ -1693,7 +1693,7 @@ fn fuzzDecodeExtensions(_: void, smith: *std.testing.Smith) !void {
 }
 
 fn buildCookieCorpus(s: *Corpus) []const []const u8 {
-    for ([_]u8{ 1, 2 }) |mt| fuzz_corpus.collectExtensionData(s, mt, @intFromEnum(ExtensionType.cookie), null);
+    for ([_]u8{ 1, 2 }) |mt| fuzz_corpus.collectExtensionData(s, mt, @backingInt(ExtensionType.cookie), null);
     var wire: [64]u8 = undefined;
     if (encodeCookieExtension("", &wire)) |enc| s.push(enc, null) else |_| {}
     s.push(&.{ 0x00, 0x10, 0x01 }, null); // declares 16, carries 1
@@ -1714,7 +1714,7 @@ fn fuzzDecodeCookieExtension(_: void, smith: *std.testing.Smith) !void {
 }
 
 fn buildPskModesCorpus(s: *Corpus) []const []const u8 {
-    fuzz_corpus.collectExtensionData(s, 1, @intFromEnum(ExtensionType.psk_key_exchange_modes), null);
+    fuzz_corpus.collectExtensionData(s, 1, @backingInt(ExtensionType.psk_key_exchange_modes), null);
     var wire: [8]u8 = undefined;
     if (encodePskKeyExchangeModes(&.{ .psk_ke, .psk_dhe_ke }, &wire)) |enc| s.push(enc, null) else |_| {}
     s.push(&.{ 0x02, 0x01 }, null); // declares 2, carries 1
@@ -1736,13 +1736,13 @@ fn fuzzDecodePskModes(_: void, smith: *std.testing.Smith) !void {
 }
 
 fn buildOfferedPsksCorpus(s: *Corpus) []const []const u8 {
-    fuzz_corpus.collectExtensionData(s, 1, @intFromEnum(ExtensionType.pre_shared_key), null);
+    fuzz_corpus.collectExtensionData(s, 1, @backingInt(ExtensionType.pre_shared_key), null);
     // ...and the ServerHello form, which is a 2-octet selected_identity and
     // must be refused rather than read as an identity list.
-    fuzz_corpus.collectExtensionData(s, 2, @intFromEnum(ExtensionType.pre_shared_key), null);
+    fuzz_corpus.collectExtensionData(s, 2, @backingInt(ExtensionType.pre_shared_key), null);
     var wire: [128]u8 = undefined;
     const ids = [_]PskIdentity{.{ .identity = "device-042", .obfuscated_ticket_age = 7 }};
-    const binders = [_][]const u8{&([_]u8{0xAB} ** 32)};
+    const binders = [_][]const u8{&(@as([32]u8, @splat(0xAB)))};
     if (encodeOfferedPsks(.{ .identities = &ids, .binders = &binders }, &wire)) |enc| s.push(enc, null) else |_| {}
     // ⭐ Two identities, one binder — the parallel-list violation the decoder's
     // own doc comment says nothing else in the module can produce.
@@ -1769,7 +1769,7 @@ fn fuzzDecodeOfferedPsks(_: void, smith: *std.testing.Smith) !void {
 
 fn buildU16ListCorpus(s: *Corpus) []const []const u8 {
     for ([_]ExtensionType{ .supported_groups, .signature_algorithms }) |t|
-        fuzz_corpus.collectExtensionData(s, 1, @intFromEnum(t), null);
+        fuzz_corpus.collectExtensionData(s, 1, @backingInt(t), null);
     var wire: [64]u8 = undefined;
     if (encodeU16ListExtension(&.{}, &wire)) |enc| s.push(enc, null) else |_| {}
     s.push(&.{ 0x00, 0x03, 0x00, 0x1D, 0x00 }, null); // odd body length
@@ -1791,12 +1791,12 @@ fn fuzzDecodeU16List(_: void, smith: *std.testing.Smith) !void {
 }
 
 fn buildKeyShareClientHelloCorpus(s: *Corpus) []const []const u8 {
-    fuzz_corpus.collectExtensionData(s, 1, @intFromEnum(ExtensionType.key_share), null);
+    fuzz_corpus.collectExtensionData(s, 1, @backingInt(ExtensionType.key_share), null);
     var wire: [128]u8 = undefined;
-    const share = [_]u8{0xAB} ** 32;
+    const share = @as([32]u8, @splat(0xAB));
     const entries = [_]KeyShareEntry{.{ .group = 0x001d, .key_exchange = &share }};
     if (encodeKeyShareClientHello(&entries, &wire)) |enc| s.push(enc, null) else |_| {}
-    s.push(&([_]u8{ 0x00, 0x24, 0x00, 0x1D, 0xFF, 0x20 } ++ [_]u8{0xAB} ** 32), null); // key len over the list
+    s.push(&([_]u8{ 0x00, 0x24, 0x00, 0x1D, 0xFF, 0x20 } ++ @as([32]u8, @splat(0xAB))), null); // key len over the list
     s.push(&.{ 0x00, 0x00 }, null); // an empty client_shares list is legal
     s.push(&.{}, null);
     return s.corpus();
@@ -1820,9 +1820,9 @@ fn buildKeyShareServerHelloCorpus(s: *Corpus) []const []const u8 {
     // The ServerHello `key_share` bodies include the two-octet
     // HelloRetryRequest form, which this decoder must refuse rather than read
     // the group's neighbours as a length.
-    fuzz_corpus.collectExtensionData(s, 2, @intFromEnum(ExtensionType.key_share), null);
+    fuzz_corpus.collectExtensionData(s, 2, @backingInt(ExtensionType.key_share), null);
     var wire: [128]u8 = undefined;
-    const share = [_]u8{0xCD} ** 32;
+    const share = @as([32]u8, @splat(0xCD));
     if (encodeKeyShareServerHello(.{ .group = 0x001d, .key_exchange = &share }, &wire)) |enc|
         s.push(enc, null)
     else |_| {}
@@ -1886,7 +1886,7 @@ fn buildCertificateRequestCorpus(s: *Corpus) []const []const u8 {
     var ext_data: [64]u8 = undefined;
     const sig_algs = encodeSignatureAlgorithms(&.{ 0x0403, 0x0807, 0x0804 }, &ext_data) catch &.{};
     const exts = [_]Extension{.{
-        .ext_type = @intFromEnum(ExtensionType.signature_algorithms),
+        .ext_type = @backingInt(ExtensionType.signature_algorithms),
         .data = sig_algs,
     }};
     var wire: [256]u8 = undefined;

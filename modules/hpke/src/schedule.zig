@@ -74,9 +74,9 @@ pub fn KdfOf(comptime Nh: usize) type {
 /// named once, in one place, matching `KdfOf` switch-arm for switch-arm.
 fn kdfIdOf(comptime Nh: usize) u16 {
     return switch (Nh) {
-        32 => @intFromEnum(suite.KdfId.hkdf_sha256),
-        48 => @intFromEnum(suite.KdfId.hkdf_sha384),
-        64 => @intFromEnum(suite.KdfId.hkdf_sha512),
+        32 => @backingInt(suite.KdfId.hkdf_sha256),
+        48 => @backingInt(suite.KdfId.hkdf_sha384),
+        64 => @backingInt(suite.KdfId.hkdf_sha512),
         else => @compileError("hpke: no RFC 9180 kdf_id registered for Nh=" ++ std.fmt.comptimePrint("{d}", .{Nh}) ++ " (valid: 32, 48, 64)"),
     };
 }
@@ -358,7 +358,7 @@ fn keyScheduleBody(
 
     // key_schedule_context = I2OSP(mode, 1) || psk_id_hash || info_hash
     var ksc: [1 + 2 * Nh]u8 = undefined;
-    ksc[0] = @intFromEnum(mode);
+    ksc[0] = @backingInt(mode);
     ksc[1 .. 1 + Nh].* = psk_id_hash;
     ksc[1 + Nh ..].* = info_hash;
 
@@ -380,8 +380,8 @@ fn keyScheduleBody(
 /// from their comptime type parameters alone. A compile error (not a
 /// runtime fallback) for an AEAD RFC 9180 doesn't register.
 fn aeadIdOf(comptime Aead: type) u16 {
-    if (Aead == std.crypto.aead.aes_gcm.Aes128Gcm) return @intFromEnum(suite.AeadId.aes128gcm);
-    if (Aead == std.crypto.aead.aes_gcm.Aes256Gcm) return @intFromEnum(suite.AeadId.aes256gcm);
+    if (Aead == std.crypto.aead.aes_gcm.Aes128Gcm) return @backingInt(suite.AeadId.aes128gcm);
+    if (Aead == std.crypto.aead.aes_gcm.Aes256Gcm) return @backingInt(suite.AeadId.aes256gcm);
     // BOTH ChaCha20-Poly1305 implementations map to the SAME registered id
     // 0x0003. The `chachapoly` sibling is byte-exact to std's (differentially
     // anchored there over every block-boundary edge length), so which one a
@@ -389,8 +389,8 @@ fn aeadIdOf(comptime Aead: type) u16 {
     // it is baked into the §7.2.1 `suite_id` that domain-separates every
     // labeled extract/expand in the key schedule. Two ids here would fork the
     // derived keys, i.e. silently break interop with any other HPKE peer.
-    if (Aead == chachapoly.ChaCha20Poly1305) return @intFromEnum(suite.AeadId.chacha20poly1305);
-    if (Aead == std.crypto.aead.chacha_poly.ChaCha20Poly1305) return @intFromEnum(suite.AeadId.chacha20poly1305);
+    if (Aead == chachapoly.ChaCha20Poly1305) return @backingInt(suite.AeadId.chacha20poly1305);
+    if (Aead == std.crypto.aead.chacha_poly.ChaCha20Poly1305) return @backingInt(suite.AeadId.chacha20poly1305);
     @compileError("hpke: no RFC 9180 aead_id registered for " ++ @typeName(Aead));
 }
 
@@ -1052,12 +1052,12 @@ test "incrementSeq: overflow guard fails closed at maxInt(u64), never wraps" {
 
 /// A PSK long enough to clear RFC 9180 §5.1.2's `Nh`-byte floor — test-only
 /// filler, NOT key material anything outside this file may reuse.
-const test_psk = [_]u8{0xab} ** 32;
+const test_psk = @as([32]u8, @splat(0xab));
 
 test "keySchedule: VerifyPSKInputs rejects every inconsistent mode/psk combination" {
     const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
     const suite_id = suite.suiteId(0x0020, 0x0001, 0x0001);
-    const ss = [_]u8{0x42} ** 32;
+    const ss = @as([32]u8, @splat(0x42));
     var ctx: Context(Aes128Gcm, 32) = undefined;
     // base mode with a PSK supplied.
     try testing.expectError(error.InconsistentPsk, keySchedule(Aes128Gcm, 32, &ctx, .base, &suite_id, &ss, "", &test_psk, "some id"));
@@ -1085,22 +1085,22 @@ test "keySchedule: RFC 9180 §5.1.2 PSK floor — a psk shorter than 32 bytes fa
     // KeyScheduleError.PskTooShort's doc comment and SPEC.md.
     const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
     const suite_id = suite.suiteId(0x0020, 0x0001, 0x0001);
-    const ss = [_]u8{0x42} ** 32;
+    const ss = @as([32]u8, @splat(0x42));
     var ctx: Context(Aes128Gcm, 32) = undefined;
     for ([_]usize{ 1, 8, 16, 31 }) |n| {
-        const short = ([_]u8{0xcd} ** 32)[0..n];
+        const short = (@as([32]u8, @splat(0xcd)))[0..n];
         try testing.expectError(error.PskTooShort, keySchedule(Aes128Gcm, 32, &ctx, .psk, &suite_id, &ss, "", short, "some id"));
         try testing.expectError(error.PskTooShort, keySchedule(Aes128Gcm, 32, &ctx, .auth_psk, &suite_id, &ss, "", short, "some id"));
     }
     // Exactly Nh bytes is accepted (the floor is inclusive) — and the RFC's
     // own Appendix A PSK vectors are exactly 32 bytes, so a stricter floor
     // would reject the spec's own test vectors.
-    try keySchedule(Aes128Gcm, 32, &ctx, .psk, &suite_id, &ss, "", ([_]u8{0xcd} ** 32)[0..32], "some id");
+    try keySchedule(Aes128Gcm, 32, &ctx, .psk, &suite_id, &ss, "", (@as([32]u8, @splat(0xcd)))[0..32], "some id");
     // The floor is 32 bytes at Nh = 48 and 64 too (the RFC's MUST; Nh is
     // only its SHOULD): 31 refused, 32 accepted. Before 2026-10-10 the floor
     // was Nh, which refused RFC 9180 A.6.2/A.6.4's own 32-byte PSK.
-    const psk31 = ([_]u8{0xcd} ** 32)[0..31];
-    const psk32 = ([_]u8{0xcd} ** 32)[0..32];
+    const psk31 = (@as([32]u8, @splat(0xcd)))[0..31];
+    const psk32 = (@as([32]u8, @splat(0xcd)))[0..32];
     var ctx48: Context(Aes128Gcm, 48) = undefined;
     try testing.expectError(error.PskTooShort, keySchedule(Aes128Gcm, 48, &ctx48, .psk, &suite_id, &ss, "", psk31, "some id"));
     try keySchedule(Aes128Gcm, 48, &ctx48, .psk, &suite_id, &ss, "", psk32, "some id");
@@ -1112,7 +1112,7 @@ test "keySchedule: RFC 9180 §5.1.2 PSK floor — a psk shorter than 32 bytes fa
 test "Context.seal/.open: round trip, seq advances, tampered ct rejected WITHOUT advancing seq" {
     const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
     const suite_id = suite.suiteId(0x0020, 0x0001, 0x0001);
-    const ss = [_]u8{0x42} ** 32;
+    const ss = @as([32]u8, @splat(0x42));
     var sender: Context(Aes128Gcm, 32) = undefined;
     try keySchedule(Aes128Gcm, 32, &sender, .base, &suite_id, &ss, "seq test", "", "");
     var receiver = sender;
@@ -1149,7 +1149,7 @@ test "Context.seal/.open: wrong-length out buffer fails closed with error.Invali
     // misbehave in ReleaseFast).
     const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
     const suite_id = suite.suiteId(0x0020, 0x0001, 0x0001);
-    const ss = [_]u8{0x42} ** 32;
+    const ss = @as([32]u8, @splat(0x42));
     var sender: Context(Aes128Gcm, 32) = undefined;
     try keySchedule(Aes128Gcm, 32, &sender, .base, &suite_id, &ss, "", "", "");
     var receiver = sender;
@@ -1183,7 +1183,7 @@ test "Context.seal/.open: wrong-length out buffer fails closed with error.Invali
 test "Context.seal/.open: fail closed at seq == maxInt(u64) BEFORE producing/consuming a ciphertext" {
     const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
     const suite_id = suite.suiteId(0x0020, 0x0001, 0x0001);
-    const ss = [_]u8{0x42} ** 32;
+    const ss = @as([32]u8, @splat(0x42));
     var ctx: Context(Aes128Gcm, 32) = undefined;
     try keySchedule(Aes128Gcm, 32, &ctx, .base, &suite_id, &ss, "", "", "");
     ctx.seq = std.math.maxInt(u64);
@@ -1258,7 +1258,7 @@ test "sealPsk/sealAuth/sealAuthPsk -> matching open: round trip on fresh random 
     var wrong_sender: Kem.KeyPair = undefined;
     Kem.generateKeyPair(&wrong_sender, io);
     const psk_id = "psk id";
-    const wrong_psk = [_]u8{0xcd} ** 32;
+    const wrong_psk = @as([32]u8, @splat(0xcd));
 
     const pt = "single-shot non-base modes";
     var ct: [pt.len + Aes128Gcm.tag_length]u8 = undefined;

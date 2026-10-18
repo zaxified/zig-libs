@@ -72,7 +72,7 @@ test "otel oracle: the middleware continues, restarts and carries state as OpenT
     try r.use(tc.middleware());
     try r.get("/", hOk);
 
-    var seen = [_]bool{false} ** divergences.len;
+    var seen = @as([divergences.len]bool, @splat(false));
     var bad: usize = 0;
     var continued: usize = 0;
     var restarted: usize = 0;

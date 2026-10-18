@@ -28,7 +28,7 @@ test "query oracle: validateQuery coerces as pydantic does" {
     defer arena.deinit();
     const a = arena.allocator();
     var bad: usize = 0;
-    var seen = [_]usize{0} ** vectors.classes.len;
+    var seen = @as([vectors.classes.len]usize, @splat(0));
     for (vectors.coerce) |c| {
         const rule = &vectors.rules[c.rule];
         var q: std.Io.Writer.Allocating = .init(a);

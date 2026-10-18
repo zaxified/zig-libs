@@ -232,7 +232,7 @@ pub fn encode(control: Control, asdu: []const u8, out: []u8) EncodeError![]u8 {
         },
         .u => |func| {
             if (asdu.len != 0) return error.AsduTooLong;
-            out[2] = @intFromEnum(func) | 0x03;
+            out[2] = @backingInt(func) | 0x03;
             out[3] = 0;
             out[4] = 0;
             out[5] = 0;
@@ -401,14 +401,14 @@ test "sequence numbers wrap at 32768, not 65536" {
 
 test "length octet boundary: 253 accepted, 254 rejected" {
     var buf: [max_apdu_len]u8 = undefined;
-    const asdu = [_]u8{0x5A} ** max_asdu_len; // 249 -> length 253
+    const asdu = @as([max_asdu_len]u8, @splat(0x5A)); // 249 -> length 253
     const frame = try encode(.{ .i = .{ .send_seq = 0, .recv_seq = 0 } }, &asdu, &buf);
     try testing.expectEqual(@as(u8, 253), frame[1]);
     try testing.expectEqual(max_apdu_len, frame.len);
     _ = try decode(frame);
 
     // One octet more must be refused at the encoder.
-    const too_long = [_]u8{0x5A} ** (max_asdu_len + 1);
+    const too_long = @as([max_asdu_len + 1]u8, @splat(0x5A));
     try testing.expectError(error.AsduTooLong, encode(.{ .i = .{ .send_seq = 0, .recv_seq = 0 } }, &too_long, &buf));
 
     // ... and a length octet above the cap must be refused at the decoder,
@@ -491,7 +491,7 @@ const decode_seeds = [_][]const u8{
     seed("680483000000"), // U-format TESTFR con
     seed("680401001200"), // S-format, N(R) = 9
     seed("680E02000400" ++ "640106002F0000000014"), // I-format with the value test's ASDU
-    seed("68FD00000000" ++ ("5A" ** 249)), // the longest legal APDU: length octet 253
+    seed("68FD00000000" ++ (strRepeat("5A", 249))), // the longest legal APDU: length octet 253
     seed("680407000000" ++ "680483000000"), // two frames: the tail must be left alone
     seed("68"), // ShortApdu
     seed("690407000000"), // BadStartByte
@@ -505,7 +505,7 @@ const decode_seeds = [_][]const u8{
     seed("680401020000"), // ReservedBitsSet: S-format with a dirty control octet 2
     seed("680500000100FF"), // ReservedBitsSet: I-format with the N(R) marker bit set
     seed("680400000000"), // ReservedBitsSet: I-format with no ASDU (F7)
-    seed("68FE" ++ ("00" ** 254)), // LengthTooLarge, with the octets really present
+    seed("68FE" ++ (strRepeat("00", 254))), // LengthTooLarge, with the octets really present
 };
 
 test "fuzz: apci decode never panics" {
@@ -577,11 +577,11 @@ const framer_seeds = [_][]const u8{
     seed("68"), // one octet
     // 30 octets of U-format frames, then the 253-length I-format APDU: 285
     // octets in all, so the 255-octet chunk cuts the last frame in half.
-    seed(("680407000000" ** 5) ++ "68FD00000000" ++ ("5A" ** 249)),
+    seed((strRepeat("680407000000", 5)) ++ "68FD00000000" ++ (strRepeat("5A", 249))),
     seed("68FF07000000"), // LengthTooLarge, raised before the frame completes
     seed("000407000000"), // BadStartByte
     seed("680407000000" ++ "6804"), // one whole frame, then a partial header
-    seed("68" ** 400), // self-consistent by accident: 0x68 is also a legal length
+    seed(strRepeat("68", 400)), // self-consistent by accident: 0x68 is also a legal length
 };
 
 test "fuzz: framer never panics or hangs on arbitrary stream bytes" {
@@ -682,4 +682,16 @@ test "an I-format APDU with no ASDU is refused by the framer, not by the state m
     const one_octet = [_]u8{ 0x68, 0x05, 0x00, 0x00, 0x00, 0x00, 0x2d };
     const f = try decode(&one_octet);
     try std.testing.expectEqual(@as(usize, 1), f.asdu.len);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

@@ -100,7 +100,7 @@ fn normalizeToFieldBytes(bytes: []const u8) ?[32]u8 {
     var b = bytes;
     while (b.len > 0 and b[0] == 0) b = b[1..];
     if (b.len > 32) return null;
-    var out = [_]u8{0} ** 32;
+    var out = @as([32]u8, @splat(0));
     @memcpy(out[32 - b.len ..], b);
     return out;
 }
@@ -350,7 +350,7 @@ test "pubkey encoding: compressed/uncompressed accepted, hybrid/garbage rejected
 test "checkEcdsaSig: empty signature verifies false with no allocation and no error" {
     var t: bitcointx.Transaction = .{
         .version = 1,
-        .vin = @constCast(&[_]bitcointx.TxIn{.{ .prevout = .{ .txid = [_]u8{0} ** 32, .vout = 0 }, .script_sig = &.{}, .sequence = 0xffffffff }}),
+        .vin = @constCast(&[_]bitcointx.TxIn{.{ .prevout = .{ .txid = @as([32]u8, @splat(0)), .vout = 0 }, .script_sig = &.{}, .sequence = 0xffffffff }}),
         .vout = &.{},
         .witness = &.{},
         .locktime = 0,
@@ -359,7 +359,7 @@ test "checkEcdsaSig: empty signature verifies false with no allocation and no er
     const spent = [_]bitcointx.TxOut{.{ .value = 1000, .script_pubkey = &.{} }};
     const ctx: TxContext = .{ .tx = t, .input_index = 0, .spent_outputs = &spent };
     var fail_alloc = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
-    const ok = try checkEcdsaSig(fail_alloc.allocator(), &.{}, &([_]u8{0x02} ** 33), &.{}, ctx, .base, ScriptFlags.none);
+    const ok = try checkEcdsaSig(fail_alloc.allocator(), &.{}, &(@as([33]u8, @splat(0x02))), &.{}, ctx, .base, ScriptFlags.none);
     try testing.expect(!ok);
     _ = &t;
 }

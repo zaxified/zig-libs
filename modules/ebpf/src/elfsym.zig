@@ -117,12 +117,12 @@ const rel_info = 8;
 
 /// `PT_LOAD`, `SHT_SYMTAB`, `SHT_DYNSYM`, `STT_FUNC`, `STT_GNU_IFUNC`,
 /// `SHN_UNDEF` — taken from std rather than re-declared.
-const PT_LOAD: u32 = @intFromEnum(elf.PT.LOAD);
-const SHT_SYMTAB: u32 = @intFromEnum(elf.SHT.SYMTAB);
-const SHT_DYNSYM: u32 = @intFromEnum(elf.SHT.DYNSYM);
-const STT_FUNC: u4 = @intFromEnum(elf.STT.FUNC);
-const STT_GNU_IFUNC: u4 = @intFromEnum(elf.STT.GNU_IFUNC);
-const STT_OBJECT: u4 = @intFromEnum(elf.STT.OBJECT);
+const PT_LOAD: u32 = @backingInt(elf.PT.LOAD);
+const SHT_SYMTAB: u32 = @backingInt(elf.SHT.SYMTAB);
+const SHT_DYNSYM: u32 = @backingInt(elf.SHT.DYNSYM);
+const STT_FUNC: u4 = @backingInt(elf.STT.FUNC);
+const STT_GNU_IFUNC: u4 = @backingInt(elf.STT.GNU_IFUNC);
+const STT_OBJECT: u4 = @backingInt(elf.STT.OBJECT);
 const SHN_UNDEF: u16 = elf.SHN_UNDEF;
 
 // ── sanity ceilings ─────────────────────────────────────────────────────────
@@ -254,10 +254,10 @@ pub fn resolveOpts(
     var ehdr: [EHDR_SIZE]u8 = undefined;
     try file.readExact(0, &ehdr);
     if (!std.mem.eql(u8, ehdr[0..4], elf.MAGIC)) return error.NotAnElf;
-    if (ehdr[elf.EI.CLASS] != @intFromEnum(elf.CLASS.@"64")) return error.UnsupportedElf;
+    if (ehdr[elf.EI.CLASS] != @backingInt(elf.CLASS.@"64")) return error.UnsupportedElf;
     const want_data: u8 = switch (native_endian) {
-        .little => @intFromEnum(elf.DATA.@"2LSB"),
-        .big => @intFromEnum(elf.DATA.@"2MSB"),
+        .little => @backingInt(elf.DATA.@"2LSB"),
+        .big => @backingInt(elf.DATA.@"2MSB"),
     };
     if (ehdr[elf.EI.DATA] != want_data) return error.UnsupportedElf;
     if (rd(u16, &ehdr, ehdr_ehsize) < EHDR_SIZE) return error.MalformedElf;
@@ -688,11 +688,11 @@ fn entryOffset(len: usize, ent: u64, n: u32, min: usize) ImageError!u64 {
 }
 
 /// `SHT_NOBITS` / `SHT_REL` / `SHT_STRTAB`, from std.
-const SHT_NOBITS: u32 = @intFromEnum(elf.SHT.NOBITS);
-pub const SHT_REL: u32 = @intFromEnum(elf.SHT.REL);
-const SHT_STRTAB: u32 = @intFromEnum(elf.SHT.STRTAB);
+const SHT_NOBITS: u32 = @backingInt(elf.SHT.NOBITS);
+pub const SHT_REL: u32 = @backingInt(elf.SHT.REL);
+const SHT_STRTAB: u32 = @backingInt(elf.SHT.STRTAB);
 /// `SHT_PROGBITS`.
-pub const SHT_PROGBITS: u32 = @intFromEnum(elf.SHT.PROGBITS);
+pub const SHT_PROGBITS: u32 = @backingInt(elf.SHT.PROGBITS);
 
 /// `SHF_ALLOC` / `SHF_EXECINSTR` — how a *program* section is told apart from
 /// a data section without knowing its name.
@@ -718,10 +718,10 @@ pub fn openImage(gpa: std.mem.Allocator, bytes: []const u8, own_bytes: bool) Ima
 
     if (bytes.len < EHDR_SIZE) return error.NotAnElf;
     if (!std.mem.eql(u8, bytes[0..4], elf.MAGIC)) return error.NotAnElf;
-    if (bytes[elf.EI.CLASS] != @intFromEnum(elf.CLASS.@"64")) return error.UnsupportedElf;
+    if (bytes[elf.EI.CLASS] != @backingInt(elf.CLASS.@"64")) return error.UnsupportedElf;
     const want_data: u8 = switch (native_endian) {
-        .little => @intFromEnum(elf.DATA.@"2LSB"),
-        .big => @intFromEnum(elf.DATA.@"2MSB"),
+        .little => @backingInt(elf.DATA.@"2LSB"),
+        .big => @backingInt(elf.DATA.@"2MSB"),
     };
     if (bytes[elf.EI.DATA] != want_data) return error.UnsupportedElf;
     const ehdr = bytes[0..EHDR_SIZE];
@@ -973,10 +973,10 @@ const SynthElf = struct {
 
         // ── Ehdr ──
         @memcpy(b[0..4], elf.MAGIC);
-        b[elf.EI.CLASS] = @intFromEnum(elf.CLASS.@"64");
+        b[elf.EI.CLASS] = @backingInt(elf.CLASS.@"64");
         b[elf.EI.DATA] = switch (native_endian) {
-            .little => @intFromEnum(elf.DATA.@"2LSB"),
-            .big => @intFromEnum(elf.DATA.@"2MSB"),
+            .little => @backingInt(elf.DATA.@"2LSB"),
+            .big => @backingInt(elf.DATA.@"2MSB"),
         };
         b[elf.EI.VERSION] = 1;
         wr(u16, b, ehdr_type, 3); // ET_DYN
@@ -1007,9 +1007,9 @@ const SynthElf = struct {
         putSym(b, symtab_off + 4 * SYM_SIZE, off_data, STT_OBJECT, 2, skewed_vaddr + 0x10, 4);
 
         // ── Shdrs ── 0 = null, 1 = .strtab, 2 = .symtab, 3 = a decoy
-        putShdr(b, shdr_off + 1 * SHDR_SIZE, @intFromEnum(elf.SHT.STRTAB), strtab_off, names.len, 0, 0);
+        putShdr(b, shdr_off + 1 * SHDR_SIZE, @backingInt(elf.SHT.STRTAB), strtab_off, names.len, 0, 0);
         putShdr(b, shdr_off + 2 * SHDR_SIZE, SHT_SYMTAB, symtab_off, 5 * SYM_SIZE, 1, SYM_SIZE);
-        putShdr(b, shdr_off + 3 * SHDR_SIZE, @intFromEnum(elf.SHT.PROGBITS), 0x1000, 0x800, 0, 0);
+        putShdr(b, shdr_off + 3 * SHDR_SIZE, @backingInt(elf.SHT.PROGBITS), 0x1000, 0x800, 0, 0);
 
         // Recognizable payload bytes at the two resolvable symbols, so a
         // test can prove the offset names the right place.
@@ -1426,7 +1426,7 @@ test "malformed inputs are typed errors, never a mis-parse" {
 
     // Not an ELF at all.
     {
-        const path = try writeTempFile(gpa, "notelf", "#!/bin/sh\necho hi\n" ** 8);
+        const path = try writeTempFile(gpa, "notelf", strRepeat("#!/bin/sh\necho hi\n", 8));
         defer {
             _ = linux.unlink(path.ptr);
             gpa.free(path);
@@ -1437,7 +1437,7 @@ test "malformed inputs are typed errors, never a mis-parse" {
     {
         const img = try SynthElf.build(gpa);
         defer gpa.free(img);
-        img[elf.EI.CLASS] = @intFromEnum(elf.CLASS.@"32");
+        img[elf.EI.CLASS] = @backingInt(elf.CLASS.@"32");
         const path = try writeTempFile(gpa, "elf32", img);
         defer {
             _ = linux.unlink(path.ptr);
@@ -1645,4 +1645,16 @@ test "real library: resolved offsets agree with an independent derivation" {
         const o = (try fileOffsetViaSections(gpa, path, s.vaddr)) orelse continue;
         try testing.expectEqual(o, s.file_offset);
     }
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

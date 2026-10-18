@@ -4598,7 +4598,7 @@ test "§12.4.1: a PreSharedKey proposal reaches the Welcome, and a joiner withou
     const psks = [_]ExternalPsk{.{ .psk_id = "shared-id", .psk = "the pre-shared key material" }};
     const psk_id: keyschedule.PreSharedKeyId = .{
         .id = .{ .external = "shared-id" },
-        .psk_nonce = &[_]u8{0x5a} ** TestSuite.Nh,
+        .psk_nonce = &@as([TestSuite.Nh]u8, @splat(0x5a)),
     };
 
     const c = try a.createCommit(gpa, .{
@@ -4776,7 +4776,7 @@ test "§12.2: createCommit refuses the proposal lists a receiver would reject" {
     try testing.expectError(error.InvalidProposalList, a.createCommit(gpa, .{
         .io = io,
         .signature_key_pair = &alice.sig,
-        .proposals = &.{.{ .by_value = .{ .external_init = &[_]u8{0xaa} ** 32 } }},
+        .proposals = &.{.{ .by_value = .{ .external_init = &@as([32]u8, @splat(0xaa)) } }},
     }));
     // All three refusals happened before the tree was touched, and the
     // group is still usable — as it is after a later refusal too, see the
@@ -5349,7 +5349,7 @@ test "§6.2: a new_member_commit PublicMessage has no membership_tag field, and 
         const msg = try framing.MLSMessage.decode(aa, &r);
         var pm = msg.public_message;
         try rejectExternalCommitFraming(pm); // as decoded: no tag, accepted
-        pm.membership_tag = &[_]u8{0} ** 32;
+        pm.membership_tag = &@as([32]u8, @splat(0));
         try testing.expectError(error.UnexpectedMembershipTag, rejectExternalCommitFraming(pm));
     }
 
@@ -5495,7 +5495,7 @@ test "§12.4.3.2: joinByExternalCommit refuses what a receiver would, and refuse
             .group_info_msg = published_gi,
             .key_package_msg = dave.kp_msg,
             .signature_key_pair = &dave.sig,
-            .proposals = &.{.{ .external_init = &[_]u8{0xaa} ** 32 }},
+            .proposals = &.{.{ .external_init = &@as([32]u8, @splat(0xaa)) }},
         }),
     );
 
@@ -5631,7 +5631,7 @@ test "§12.4.3.2/§8.4: a resyncing joiner resolves a resumption PSK the CALLER 
     // client present at epoch 1 could hold. Usage `application`, NOT
     // `reinit` — see `validatePskProposal` for why the RFC's own wording
     // here cannot be followed literally.
-    const nonce = [_]u8{0x77} ** TestSuite.Nh;
+    const nonce = @as([TestSuite.Nh]u8, @splat(0x77));
     const proposals = [_]content.Proposal{
         .{ .psk = resumptionId(.application, "resync-group", 1, &nonce) },
         .{ .remove = 1 },
@@ -5679,7 +5679,7 @@ test "§12.4.3.2/§8.4: a resyncing joiner resolves a resumption PSK the CALLER 
     // being ruled out is a `psk_secret` that stayed all-zero.)
     try testing.expectEqual(@as(u32, 1), b2.my_leaf_index);
     try testing.expectEqual(@as(usize, 2), a.treeSize());
-    try testing.expect(!std.mem.eql(u8, &tAuth(&a), &[_]u8{0} ** TestSuite.Nh));
+    try testing.expect(!std.mem.eql(u8, &tAuth(&a), &@as([TestSuite.Nh]u8, @splat(0))));
 
     // The group still works: the resynced member commits, the founder
     // follows. A join that produced state which cannot take another Commit
@@ -5735,7 +5735,7 @@ test "§8.4: a resumption PreSharedKeyID naming ANOTHER group does not resolve t
     // back for ANY `psk_group_id`. The joiner supplies exactly it, so the
     // two sides cannot be told apart by the bytes.
     const alice_epoch1 = try rememberedResumptionPsk(&a, 1);
-    const nonce = [_]u8{0x11} ** TestSuite.Nh;
+    const nonce = @as([TestSuite.Nh]u8, @splat(0x11));
 
     var joined = try tExternalJoin(gpa, gpa, .{
         .io = io,
@@ -5806,8 +5806,8 @@ test "§8.4: a caller-supplied resumption PSK matches on the WHOLE PreSharedKeyI
     defer gpa.free(published_gi);
 
     const real = try rememberedResumptionPsk(&a, 1);
-    const garbage = [_]u8{0xee} ** TestSuite.Nh;
-    const nonce = [_]u8{0x22} ** TestSuite.Nh;
+    const garbage = @as([TestSuite.Nh]u8, @splat(0xee));
+    const nonce = @as([TestSuite.Nh]u8, @splat(0x22));
 
     // Two entries for the SAME group and epoch, differing only in `usage`
     // and carrying different secrets — the wrong one first. §8.4 puts the
@@ -5816,7 +5816,7 @@ test "§8.4: a caller-supplied resumption PSK matches on the WHOLE PreSharedKeyI
     // `psk_secret` and alice, who resolves the id from her own history,
     // rejects the Commit. A matcher that ignored `usage` takes the first.
     const supplied = [_]ResumptionPsk{
-        .{ .usage = @enumFromInt(7), .group_id = "triple", .epoch = 1, .secret = &garbage },
+        .{ .usage = @fromBackingInt(@intCast(7)), .group_id = "triple", .epoch = 1, .secret = &garbage },
         .{ .usage = .application, .group_id = "triple", .epoch = 1, .secret = &real },
     };
 
@@ -5902,8 +5902,8 @@ test "§12.1.4: a PreSharedKey proposal with usage reinit or branch is invalid, 
     defer gpa.free(published_gi);
 
     const secret = try rememberedResumptionPsk(&a, 1);
-    const nonce = [_]u8{0x33} ** TestSuite.Nh;
-    const short_nonce = [_]u8{0x33} ** (TestSuite.Nh - 1);
+    const nonce = @as([TestSuite.Nh]u8, @splat(0x33));
+    const short_nonce = @as([TestSuite.Nh - 1]u8, @splat(0x33));
 
     // ── the SENDER's half: §12.2 opens with "A group member creating a
     // Commit AND a group member processing a Commit MUST verify", so a
@@ -5993,9 +5993,9 @@ test "§8.4: PSKs resolve POSITIONALLY — out[i] is the resolution of ids[i] an
     const gpa = testing.allocator;
     const G = Group(TestSuite);
 
-    const nonce = [_]u8{0x44} ** TestSuite.Nh;
-    const from_history = [_]u8{0xa1} ** TestSuite.Nh;
-    const from_caller = [_]u8{0xa2} ** TestSuite.Nh;
+    const nonce = @as([TestSuite.Nh]u8, @splat(0x44));
+    const from_history = @as([TestSuite.Nh]u8, @splat(0xa1));
+    const from_caller = @as([TestSuite.Nh]u8, @splat(0xa2));
 
     const ids = [_]keyschedule.PreSharedKeyId{
         .{ .id = .{ .external = "first" }, .psk_nonce = &nonce },
@@ -6298,7 +6298,7 @@ test "§12.4.3.1: a joiner refuses a group whose GroupContext declares a version
     try testing.expectEqual(keyschedule.ProtocolVersion.mls10, gi.group_context.version);
 
     var forged_gc = gi.group_context;
-    forged_gc.version = @enumFromInt(0x0999);
+    forged_gc.version = @fromBackingInt(@intCast(0x0999));
     var forged: welcome_mod.GroupInfo = .{
         .group_context = forged_gc,
         .extensions = gi.extensions,
@@ -6521,7 +6521,7 @@ test "transactional: a createCommit refused after §12.3 touched the tree leaves
     const psks = [_]ExternalPsk{.{ .psk_id = "txn-psk", .psk = "txn pre-shared key material" }};
     const psk_id: keyschedule.PreSharedKeyId = .{
         .id = .{ .external = "txn-psk" },
-        .psk_nonce = &[_]u8{0x3c} ** TestSuite.Nh,
+        .psk_nonce = &@as([TestSuite.Nh]u8, @splat(0x3c)),
     };
     const list = [_]Group(TestSuite).CommitSource{
         .{ .by_value = .{ .add = carol.kp } },
@@ -6594,7 +6594,7 @@ test "transactional: a member's Commit refused after §12.3 leaves the receiver 
     const psks = [_]ExternalPsk{.{ .psk_id = "late-psk", .psk = "arrives after the Commit does" }};
     const psk_id: keyschedule.PreSharedKeyId = .{
         .id = .{ .external = "late-psk" },
-        .psk_nonce = &[_]u8{0x4d} ** TestSuite.Nh,
+        .psk_nonce = &@as([TestSuite.Nh]u8, @splat(0x4d)),
     };
     const c = try a.createCommit(gpa, .{
         .io = io,
@@ -7131,7 +7131,7 @@ test "§12.4.2: an insider's forged Commit is refused by the rule it breaks, bef
         // refuse this, both `Malformed`: §7.9.2's check in `applyUpdatePath`
         // (pinned on its own in `kat_treekem_test.zig`) and, independently,
         // the receiver's HPKE open, whose context binds the tree hash.
-        .{ .want = error.Malformed, .edit = .{ .leaf_parent_hash = &([_]u8{0x5a} ** TestSuite.Nh) } },
+        .{ .want = error.Malformed, .edit = .{ .leaf_parent_hash = &(@as([TestSuite.Nh]u8, @splat(0x5a))) } },
     };
     for (cases, 0..) |cs, i| {
         errdefer std.debug.print("case {d}\n", .{i});
@@ -7275,7 +7275,7 @@ test "§12.2/§7.3: createCommit refuses the remaining list rules, and a duplica
         c.deinit(gpa);
     }
 
-    const nonce = [_]u8{0x44} ** TestSuite.Nh;
+    const nonce = @as([TestSuite.Nh]u8, @splat(0x44));
     const psk: content.Proposal = .{ .psk = .{ .id = .{ .external = "x" }, .psk_nonce = &nonce } };
     const gce: content.Proposal = .{ .group_context_extensions = &.{} };
     // An Update the committer itself proposed, committed by reference.
@@ -7350,7 +7350,7 @@ const LeakSweep = struct {
 
     const Clients = struct { alice: TestClient, bob: TestClient, carol: TestClient };
 
-    const psk_nonce = [_]u8{0x5a} ** TestSuite.Nh;
+    const psk_nonce = @as([TestSuite.Nh]u8, @splat(0x5a));
     const psk: content.Proposal = .{ .psk = .{ .id = .{ .external = "sweep" }, .psk_nonce = &psk_nonce } };
     const psks = [_]ExternalPsk{.{ .psk_id = "sweep", .psk = "sweep-secret" }};
 
@@ -7575,7 +7575,7 @@ test "low-order X25519 keys: every small-order encoding is detected, a real key 
     const good = (try TestSuite.Kem.KeyPair.generateDeterministic(@splat(7))).public_key;
     try testing.expect(!isLowOrderHpkeKey(TestSuite, &good));
     // Length is not this check's business.
-    try testing.expect(!isLowOrderHpkeKey(TestSuite, &[_]u8{0} ** 31));
+    try testing.expect(!isLowOrderHpkeKey(TestSuite, &@as([31]u8, @splat(0))));
 }
 
 test "low-order X25519 keys: createCommit refuses an Add whose init_key or encryption_key is one" {

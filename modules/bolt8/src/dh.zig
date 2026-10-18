@@ -239,7 +239,7 @@ test "meta-shape: public_length/seed_length match BOLT#8's 33/32-byte split" {
 test "KeyPair.generateDeterministic rejects 0 and the group order n" {
     // A secp256k1 private key is an integer in [1, n - 1] (SEC 1 v2 §3.2.1);
     // 0 has no public key and n reduces to 0.
-    try testing.expectError(error.InvalidSecretKey, tu.tryKeyPair([_]u8{0} ** 32));
+    try testing.expectError(error.InvalidSecretKey, tu.tryKeyPair(@as([32]u8, @splat(0))));
     var n: [32]u8 = undefined;
     _ = try std.fmt.hexToBytes(&n, "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141");
     try testing.expectError(error.InvalidSecretKey, tu.tryKeyPair(n));

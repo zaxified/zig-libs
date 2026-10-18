@@ -55,7 +55,7 @@ fn cbcEncrypt(alloc: std.mem.Allocator, comptime Aes: type, key: anytype, msg: [
     const pad = bs - (msg.len % bs); // 1..bs
     const total = bs + msg.len + pad;
     const out = try alloc.alloc(u8, total);
-    const iv = [_]u8{0x11} ** bs;
+    const iv = @as([bs]u8, @splat(0x11));
     @memcpy(out[0..bs], &iv);
     @memcpy(out[bs .. bs + msg.len], msg);
     // pad bytes: arbitrary except the last is the count.
@@ -77,7 +77,7 @@ fn cbcEncrypt(alloc: std.mem.Allocator, comptime Aes: type, key: anytype, msg: [
 }
 
 fn gcmEncrypt(alloc: std.mem.Allocator, comptime Gcm: type, key: anytype, msg: []const u8) ![]u8 {
-    const iv = [_]u8{0x22} ** 12;
+    const iv = @as([12]u8, @splat(0x22));
     const total = 12 + msg.len + 16;
     const out = try alloc.alloc(u8, total);
     @memcpy(out[0..12], &iv);
@@ -141,7 +141,7 @@ fn roundTrip(
 test "round-trip: OAEP-mgf1p (SHA1) + AES-256-GCM" {
     const a = std.testing.allocator;
     const kp = try makeKey();
-    const cek = [_]u8{0xC5} ** 32;
+    const cek = @as([32]u8, @splat(0xC5));
     const wrapped = try oaepWrapCek(a, Sha1, kp.public_key, &cek);
     defer a.free(wrapped);
     const content = try gcmEncrypt(a, Aes256Gcm, cek, plaintext_assertion);
@@ -155,7 +155,7 @@ test "round-trip: OAEP-mgf1p (SHA1) + AES-256-GCM" {
 test "round-trip: OAEP-mgf1p (SHA1) + AES-128-GCM" {
     const a = std.testing.allocator;
     const kp = try makeKey();
-    const cek = [_]u8{0x7A} ** 16;
+    const cek = @as([16]u8, @splat(0x7A));
     const wrapped = try oaepWrapCek(a, Sha1, kp.public_key, &cek);
     defer a.free(wrapped);
     const content = try gcmEncrypt(a, Aes128Gcm, cek, plaintext_assertion);
@@ -169,7 +169,7 @@ test "round-trip: OAEP-mgf1p (SHA1) + AES-128-GCM" {
 test "round-trip: OAEP-mgf1p (SHA1) + AES-256-CBC" {
     const a = std.testing.allocator;
     const kp = try makeKey();
-    const cek = [_]u8{0x3B} ** 32;
+    const cek = @as([32]u8, @splat(0x3B));
     const wrapped = try oaepWrapCek(a, Sha1, kp.public_key, &cek);
     defer a.free(wrapped);
     const content = try cbcEncrypt(a, aes.Aes256, cek, plaintext_assertion);
@@ -183,7 +183,7 @@ test "round-trip: OAEP-mgf1p (SHA1) + AES-256-CBC" {
 test "round-trip: OAEP-mgf1p (SHA1) + AES-128-CBC" {
     const a = std.testing.allocator;
     const kp = try makeKey();
-    const cek = [_]u8{0x9F} ** 16;
+    const cek = @as([16]u8, @splat(0x9F));
     const wrapped = try oaepWrapCek(a, Sha1, kp.public_key, &cek);
     defer a.free(wrapped);
     const content = try cbcEncrypt(a, aes.Aes128, cek, plaintext_assertion);
@@ -197,7 +197,7 @@ test "round-trip: OAEP-mgf1p (SHA1) + AES-128-CBC" {
 test "round-trip: xenc11 rsa-oaep (SHA256) + AES-256-GCM" {
     const a = std.testing.allocator;
     const kp = try makeKey();
-    const cek = [_]u8{0x42} ** 32;
+    const cek = @as([32]u8, @splat(0x42));
     const wrapped = try oaepWrapCek(a, Sha256, kp.public_key, &cek);
     defer a.free(wrapped);
     const content = try gcmEncrypt(a, Aes256Gcm, cek, plaintext_assertion);
@@ -240,7 +240,7 @@ test "round-trip: xenc11 rsa-oaep, digest SHA-256 != MGF1-SHA1 (previously Unsup
     // (digest=SHA-256, MGF1=SHA-1) that must now decrypt successfully.
     const a = std.testing.allocator;
     const kp = try makeKey();
-    const cek = [_]u8{0x5E} ** 32;
+    const cek = @as([32]u8, @splat(0x5E));
 
     // Wrap the CEK with the mismatched-hash OAEP encrypt side.
     var prng = std.Random.DefaultPrng.init(0xFEEDFACE);
@@ -282,7 +282,7 @@ test "round-trip: xenc11 rsa-oaep, digest SHA-256 != MGF1-SHA1 (previously Unsup
 test "teeth: xenc11 rsa-oaep with a genuinely unrecognized MGF algorithm -> UnsupportedAlgorithm (positive control for the digest!=MGF test above)" {
     const a = std.testing.allocator;
     const kp = try makeKey();
-    const cek = [_]u8{0x5E} ** 32;
+    const cek = @as([32]u8, @splat(0x5E));
     var prng = std.Random.DefaultPrng.init(0xFEEDFACE);
     const k = (kp.public_key.n.bits() + 7) / 8;
     var wrap_buf: [256]u8 = undefined;
@@ -323,7 +323,7 @@ test "teeth: xenc11 rsa-oaep with a genuinely unrecognized MGF algorithm -> Unsu
 test "round-trip via EncryptedAssertion wrapper convenience" {
     const a = std.testing.allocator;
     const kp = try makeKey();
-    const cek = [_]u8{0x11} ** 32;
+    const cek = @as([32]u8, @splat(0x11));
     const wrapped = try oaepWrapCek(a, Sha1, kp.public_key, &cek);
     defer a.free(wrapped);
     const content = try gcmEncrypt(a, Aes256Gcm, cek, plaintext_assertion);
@@ -346,8 +346,8 @@ test "round-trip via EncryptedAssertion wrapper convenience" {
 test "round-trip: kw-aes256 symmetric key wrap + AES-256-GCM" {
     const a = std.testing.allocator;
     const kp = try makeKey();
-    const kek = [_]u8{0x5A} ** 32;
-    const cek = [_]u8{0x99} ** 32;
+    const kek = @as([32]u8, @splat(0x5A));
+    const cek = @as([32]u8, @splat(0x99));
     // Wrap the CEK with RFC 3394 under the KEK (build the wrapped blob directly).
     var wrapped: [40]u8 = undefined;
     kwWrap(&kek, &cek, &wrapped);
@@ -361,7 +361,7 @@ test "round-trip: kw-aes256 symmetric key wrap + AES-256-GCM" {
 test "round-trip: RSAES-PKCS1-v1_5 gated by allow_weak_rsa15" {
     const a = std.testing.allocator;
     const kp = try makeKey();
-    const cek = [_]u8{0x77} ** 32;
+    const cek = @as([32]u8, @splat(0x77));
     const wrapped = try v15WrapCek(a, kp.public_key, &cek);
     defer a.free(wrapped);
     const content = try gcmEncrypt(a, Aes256Gcm, cek, plaintext_assertion);
@@ -628,7 +628,7 @@ test "TEETH (F1): the structural refusals nothing used to reach" {
         // Two of the cases are about AES-KW and need a KEK present: one with
         // the right length (so the blob's own length is the only thing that can
         // reject it) and one with the wrong one.
-        const kek = [_]u8{0} ** 32;
+        const kek = @as([32]u8, @splat(0));
         var o = opts;
         o.kek = kek[0..c.kek_len];
         const r = xmlenc.decryptData(testing.allocator, doc.root, &kp.secret_key, o);
@@ -649,13 +649,13 @@ test "TEETH (F1): the content EncryptionMethod really does bind the recovered ke
     var kp = try makeKey();
     defer kp.secret_key.deinit();
 
-    const cek16 = [_]u8{0xAB} ** 16;
+    const cek16 = @as([16]u8, @splat(0xAB));
     const wrapped = try oaepWrapCek(testing.allocator, Sha1, kp.public_key, &cek16);
     defer testing.allocator.free(wrapped);
 
     // A 16-byte CEK offered to AES-256-GCM. Whatever the content bytes are, the
     // answer must be the generic error and never a decryption with a short key.
-    const content = [_]u8{0} ** 64;
+    const content = @as([64]u8, @splat(0));
     try testing.expectError(error.DecryptionError, roundTrip(
         testing.allocator,
         "http://www.w3.org/2009/xmlenc11#aes256-gcm",
@@ -670,7 +670,7 @@ test "TEETH (F1): the content EncryptionMethod really does bind the recovered ke
 test "teeth: GCM tag tampering -> DecryptionError" {
     const a = std.testing.allocator;
     const kp = try makeKey();
-    const cek = [_]u8{0xC5} ** 32;
+    const cek = @as([32]u8, @splat(0xC5));
     const wrapped = try oaepWrapCek(a, Sha1, kp.public_key, &cek);
     defer a.free(wrapped);
     const content = try gcmEncrypt(a, Aes256Gcm, cek, plaintext_assertion);
@@ -682,7 +682,7 @@ test "teeth: GCM tag tampering -> DecryptionError" {
 test "teeth: CBC bad padding -> DecryptionError" {
     const a = std.testing.allocator;
     const kp = try makeKey();
-    const cek = [_]u8{0x3B} ** 32;
+    const cek = @as([32]u8, @splat(0x3B));
     const wrapped = try oaepWrapCek(a, Sha1, kp.public_key, &cek);
     defer a.free(wrapped);
     const content = try cbcEncrypt(a, aes.Aes256, cek, plaintext_assertion);
@@ -697,7 +697,7 @@ test "teeth: CBC bad padding -> DecryptionError" {
 test "teeth: unknown content algorithm -> UnsupportedAlgorithm" {
     const a = std.testing.allocator;
     const kp = try makeKey();
-    const cek = [_]u8{0xC5} ** 32;
+    const cek = @as([32]u8, @splat(0xC5));
     const wrapped = try oaepWrapCek(a, Sha1, kp.public_key, &cek);
     defer a.free(wrapped);
     const content = try gcmEncrypt(a, Aes256Gcm, cek, plaintext_assertion);
@@ -708,7 +708,7 @@ test "teeth: unknown content algorithm -> UnsupportedAlgorithm" {
 test "teeth: unknown key-transport algorithm -> UnsupportedAlgorithm" {
     const a = std.testing.allocator;
     const kp = try makeKey();
-    const cek = [_]u8{0xC5} ** 32;
+    const cek = @as([32]u8, @splat(0xC5));
     const wrapped = try oaepWrapCek(a, Sha1, kp.public_key, &cek);
     defer a.free(wrapped);
     const content = try gcmEncrypt(a, Aes256Gcm, cek, plaintext_assertion);
@@ -721,8 +721,8 @@ test "teeth: unknown key-transport algorithm -> UnsupportedAlgorithm" {
 test "round-trip: AES-192 everywhere — aes192-cbc and aes192-gcm content, kw-aes192 and rsa-oaep key transport" {
     const a = std.testing.allocator;
     const kp = try makeKey();
-    const cek = [_]u8{0xC5} ** 24;
-    const kek = [_]u8{0x6B} ** 24;
+    const cek = @as([24]u8, @splat(0xC5));
+    const kek = @as([24]u8, @splat(0x6B));
     var kw_wrapped: [32]u8 = undefined;
     kwWrap(&kek, &cek, &kw_wrapped);
     const oaep_wrapped = try oaepWrapCek(a, Sha1, kp.public_key, &cek);
@@ -750,7 +750,7 @@ test "teeth: wrong private key -> DecryptionError" {
     var prng = std.Random.DefaultPrng.init(0xDEADBEEF);
     var other: rsa.KeyPair = undefined;
     try rsa.generate(&other, prng.random(), 1024, 65537);
-    const cek = [_]u8{0xC5} ** 32;
+    const cek = @as([32]u8, @splat(0xC5));
     const wrapped = try oaepWrapCek(a, Sha1, kp.public_key, &cek);
     defer a.free(wrapped);
     const content = try gcmEncrypt(a, Aes256Gcm, cek, plaintext_assertion);
@@ -795,8 +795,8 @@ test "teeth: truncated CipherValue (not base64) -> MalformedStructure" {
 test "teeth: kw-aes* without kek -> KekNotProvided" {
     const a = std.testing.allocator;
     const kp = try makeKey();
-    const kek = [_]u8{0x5A} ** 32;
-    const cek = [_]u8{0x99} ** 32;
+    const kek = @as([32]u8, @splat(0x5A));
+    const cek = @as([32]u8, @splat(0x99));
     var wrapped: [40]u8 = undefined;
     kwWrap(&kek, &cek, &wrapped);
     const content = try gcmEncrypt(a, Aes256Gcm, cek, plaintext_assertion);
@@ -1009,7 +1009,7 @@ fn fuzzGenuine() !GenuineDocs {
     if (fuzz_genuine) |g| return g;
     const a = std.heap.page_allocator; // global-alloc-ok: process-lifetime fuzz fixture, outlives testing.allocator's per-test teardown
     const kp = try fuzzKeyPair();
-    const cek = [_]u8{0x5A} ** 32;
+    const cek = @as([32]u8, @splat(0x5A));
     const wrapped = try oaepWrapCek(a, Sha1, kp.public_key, &cek);
     const wrapped_b64 = try b64(a, wrapped);
     const gcm_ct = try gcmEncrypt(a, Aes256Gcm, cek, plaintext_assertion);
@@ -1131,18 +1131,18 @@ const XmlEncScript = struct {
 
 const xmlenc_seeds = [_][]const u8{
     fuzzseed.seed(""), // the empty seed: every knob at its minimum, which is exactly what this target ran
-    fuzzseed.seed("\x00\x00" ++ "\x00" ** 14), // the same, spelled out
-    fuzzseed.seed("\x00\x00\x01\x01\x01\x00\x00\x01\x01\x01\x00" ++ "\x00" ** 5 ++ "AAAABBBBCCCCDDDD"), // ⭐ digest, MGF and OAEP params all present
-    fuzzseed.seed("\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x01" ++ "\x00" ** 5 ++ "\xaa" ** 200), // aes256-cbc + rsa-oaep, a 32-octet KEK
-    fuzzseed.seed("\x03\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00" ++ "\x00" ** 5 ++ "\x5a" ** 300), // ⭐ aes256-gcm, the exact RSA block for the key text
-    fuzzseed.seed("\x02\x04\x00\x00\x00\x01\x01\x00\x00\x00\x00" ++ "\x00" ** 5 ++ "\x11" ** 64), // ⭐ kw-aes256: the symmetric key-wrap arm, not the RSA one
-    fuzzseed.seed("\x04\x02\x00\x00\x00\x00\x00\x00\x00\x01\x02" ++ "\x00" ** 5 ++ "\x22" ** 128), // ⭐ aes192-cbc and rsa-1_5 with `allow_weak_rsa15` set
-    fuzzseed.seed("\x05\x05\x00\x00\x00\x03\x02\x00\x00\x00\x00" ++ "\x00" ** 5), // ⭐ both algorithms unrecognised, both cipher texts empty
-    fuzzseed.seed("\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00" ++ "\x00" ** 5 ++ "\x33" ** 32), // ⭐ `cipher_reference`: a CipherReference instead of a CipherValue
-    fuzzseed.seed("\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00" ++ "\x00" ** 5 ++ "\x44" ** 32), // ⭐ `omit_key_info`: no EncryptedKey at all
-    fuzzseed.seed("\x03\x00\x00\x00\x00\x02\x01\x00\x00\x00\x00" ++ "\x00" ** 5 ++ "<EncryptedData>not really</EncryptedData>"), // the b64ish texts, and XML in the payload
-    fuzzseed.seed("\x01\x01\x00\x00\x00\x02\x01\x00\x00\x00\x00" ++ "\x00" ** 5 ++ "<?xml version=\"1.0\"?><a><b/></a>"), // ⭐ the unstructured direction gets a real XML document
-    fuzzseed.seed("\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00" ++ "\x00" ** 5 ++ "\xff" ** 512), // the payload filling the buffer
+    fuzzseed.seed("\x00\x00" ++ strRepeat("\x00", 14)), // the same, spelled out
+    fuzzseed.seed("\x00\x00\x01\x01\x01\x00\x00\x01\x01\x01\x00" ++ strRepeat("\x00", 5) ++ "AAAABBBBCCCCDDDD"), // ⭐ digest, MGF and OAEP params all present
+    fuzzseed.seed("\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x01" ++ strRepeat("\x00", 5) ++ strRepeat("\xaa", 200)), // aes256-cbc + rsa-oaep, a 32-octet KEK
+    fuzzseed.seed("\x03\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00" ++ strRepeat("\x00", 5) ++ strRepeat("\x5a", 300)), // ⭐ aes256-gcm, the exact RSA block for the key text
+    fuzzseed.seed("\x02\x04\x00\x00\x00\x01\x01\x00\x00\x00\x00" ++ strRepeat("\x00", 5) ++ strRepeat("\x11", 64)), // ⭐ kw-aes256: the symmetric key-wrap arm, not the RSA one
+    fuzzseed.seed("\x04\x02\x00\x00\x00\x00\x00\x00\x00\x01\x02" ++ strRepeat("\x00", 5) ++ strRepeat("\x22", 128)), // ⭐ aes192-cbc and rsa-1_5 with `allow_weak_rsa15` set
+    fuzzseed.seed("\x05\x05\x00\x00\x00\x03\x02\x00\x00\x00\x00" ++ strRepeat("\x00", 5)), // ⭐ both algorithms unrecognised, both cipher texts empty
+    fuzzseed.seed("\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00" ++ strRepeat("\x00", 5) ++ strRepeat("\x33", 32)), // ⭐ `cipher_reference`: a CipherReference instead of a CipherValue
+    fuzzseed.seed("\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00" ++ strRepeat("\x00", 5) ++ strRepeat("\x44", 32)), // ⭐ `omit_key_info`: no EncryptedKey at all
+    fuzzseed.seed("\x03\x00\x00\x00\x00\x02\x01\x00\x00\x00\x00" ++ strRepeat("\x00", 5) ++ "<EncryptedData>not really</EncryptedData>"), // the b64ish texts, and XML in the payload
+    fuzzseed.seed("\x01\x01\x00\x00\x00\x02\x01\x00\x00\x00\x00" ++ strRepeat("\x00", 5) ++ "<?xml version=\"1.0\"?><a><b/></a>"), // ⭐ the unstructured direction gets a real XML document
+    fuzzseed.seed("\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00" ++ strRepeat("\x00", 5) ++ strRepeat("\xff", 512)), // the payload filling the buffer
 };
 
 test "fuzz: decryptData never panics on a hostile EncryptedData" {
@@ -1272,8 +1272,8 @@ test "corpus: every seed builds a distinct document, and the algorithm spread is
     const kp = try fuzzKeyPair();
     const k = (kp.public_key.n.bits() + 7) / 8;
 
-    var content_seen = [_]bool{false} ** fuzz_content_algs.len;
-    var key_seen = [_]bool{false} ** fuzz_key_algs.len;
+    var content_seen = @as([fuzz_content_algs.len]bool, @splat(false));
+    var key_seen = @as([fuzz_key_algs.len]bool, @splat(false));
     var docs: std.ArrayList([]const u8) = .empty;
     var unstructured_octets: usize = 0;
     var with_kek: usize = 0;
@@ -1325,7 +1325,7 @@ test "the xmlenc fuzz harness reaches decryptData's crypto path (reachability)" 
     // 1. A document from the builder decrypts end to end — so the framing is
     //    right all the way through `unwrapCek` and `aesGcmDecrypt`.
     {
-        const cek = [_]u8{0x5A} ** 32;
+        const cek = @as([32]u8, @splat(0x5A));
         const wrapped = try oaepWrapCek(a, Sha1, kp.public_key, &cek);
         defer a.free(wrapped);
         const content = try gcmEncrypt(a, Aes256Gcm, cek, plaintext_assertion);
@@ -1373,7 +1373,7 @@ test "the xmlenc fuzz harness reaches decryptData's crypto path (reachability)" 
     }
 
     // 3. And the harness body itself runs to completion on fixed input.
-    var smith: std.testing.Smith = .{ .in = &([_]u8{0x02} ** 32 ++ [_]u8{0x00} ** 2048) };
+    var smith: std.testing.Smith = .{ .in = &(@as([32]u8, @splat(0x02)) ++ @as([2048]u8, @splat(0x00))) };
     try fuzzDecryptData(std.testing.Smith, &smith, a);
 }
 
@@ -1432,11 +1432,11 @@ test "Z1: the CBC plaintext scratch is wiped before it goes back to the allocato
     // our own `secureZero` is load-bearing, and the mode this repo builds as a
     // CI lane (CONVENTIONS §7.1). A skip here is honest coverage reporting, not
     // a silent pass.
-    if (@import("builtin").mode != .ReleaseFast) return error.SkipZigTest;
+    if (@import("builtin").mode != .fast) return error.SkipZigTest;
 
     const a = std.testing.allocator;
     const kp = try makeKey();
-    const cek = [_]u8{0x3B} ** 32;
+    const cek = @as([32]u8, @splat(0x3B));
     const wrapped = try oaepWrapCek(a, Sha1, kp.public_key, &cek);
     defer a.free(wrapped);
     const content = try cbcEncrypt(a, aes.Aes256, cek, plaintext_assertion);
@@ -1474,11 +1474,11 @@ test "Z1: decryptDataToDocument wipes the plaintext IT frees, not just the ones 
     // saying "every buffer *this* module frees on the way there ... is wiped
     // here") walked past this sibling three lines below it. Measured before the
     // fix: 1 of 12 released blocks still held the whole assertion.
-    if (@import("builtin").mode != .ReleaseFast) return error.SkipZigTest;
+    if (@import("builtin").mode != .fast) return error.SkipZigTest;
 
     const a = std.testing.allocator;
     const kp = try makeKey();
-    const cek = [_]u8{0x3B} ** 32;
+    const cek = @as([32]u8, @splat(0x3B));
     const wrapped = try oaepWrapCek(a, Sha1, kp.public_key, &cek);
     defer a.free(wrapped);
     const content = try cbcEncrypt(a, aes.Aes256, cek, plaintext_assertion);
@@ -1509,4 +1509,16 @@ test "Z1: decryptDataToDocument wipes the plaintext IT frees, not just the ones 
         std.debug.print("decryptDataToDocument released a block still holding the recovered assertion\n", .{});
         return error.PlaintextSurvivedFree;
     }
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

@@ -458,8 +458,8 @@ test "Ciphertext.encoded_bytes is 128 (96 G2 + 16 V + 16 W), matching drand's tl
 test "Ciphertext.toBytes/fromBytes round-trip (generator U, arbitrary V/W)" {
     const ct: Ciphertext = .{
         .u = g2.Affine.generator,
-        .v = [_]u8{0xab} ** block_bytes,
-        .w = [_]u8{0xcd} ** block_bytes,
+        .v = @as([block_bytes]u8, @splat(0xab)),
+        .w = @as([block_bytes]u8, @splat(0xcd)),
     };
     const bytes = ct.toBytes();
     try std.testing.expectEqual(@as(usize, Ciphertext.encoded_bytes), bytes.len);
@@ -473,8 +473,8 @@ test "Ciphertext.toBytes/fromBytes round-trip (generator U, arbitrary V/W)" {
 test "Ciphertext.fromBytes rejects a malformed G2 encoding (V/W untouched, U corrupted)" {
     var bytes = (Ciphertext{
         .u = g2.Affine.generator,
-        .v = [_]u8{0} ** block_bytes,
-        .w = [_]u8{0} ** block_bytes,
+        .v = @as([block_bytes]u8, @splat(0)),
+        .w = @as([block_bytes]u8, @splat(0)),
     }).toBytes();
     // Flip the compression-flag byte into an invalid combination: set
     // both the compressed bit and the infinity bit with a nonzero
@@ -517,17 +517,17 @@ test "fp12Pow: windowed result equals a bitwise reference for every window digit
     // Exponents chosen so that, between them, every 4-bit digit 0x0..0xf
     // appears — and appears in both the high and the low nibble of a byte, so
     // the two windows per byte cannot be swapped without a mismatch.
-    var e1 = [_]u8{0} ** 32;
+    var e1 = @as([32]u8, @splat(0));
     for (&e1, 0..) |*b, i| b.* = @truncate((i *% 0x1f) ^ 0x5a);
     e1[0] = 0x00; // keep it below r
-    var e2 = [_]u8{0} ** 32;
+    var e2 = @as([32]u8, @splat(0));
     for (&e2, 0..) |*b, i| b.* = @truncate(i *% 0x11); // nibbles walk 0..f
     e2[0] = 0x00;
-    var e3 = [_]u8{0} ** 32;
+    var e3 = @as([32]u8, @splat(0));
     e3[31] = 0x0f; // a single low window
-    var e4 = [_]u8{0} ** 32;
+    var e4 = @as([32]u8, @splat(0));
     e4[31] = 0xf0; // a single high window
-    var e5 = [_]u8{0} ** 32;
+    var e5 = @as([32]u8, @splat(0));
     e5[30] = 0x01; // window digit 1, one byte up
 
     for ([_][32]u8{ e1, e2, e3, e4, e5 }) |bytes| {
@@ -549,7 +549,7 @@ test "fp12Pow: base^0 = 1, base^1 = base" {
 test "fp12Pow matches pairing bilinearity: e(P,Q)^r == e(rP,Q)" {
     // r = an arbitrary multi-bit scalar (exercises both set and unset
     // bits across several bytes of the big-endian encoding).
-    var r_bytes = [_]u8{0} ** 32;
+    var r_bytes = @as([32]u8, @splat(0));
     r_bytes[28] = 0x01;
     r_bytes[29] = 0xf3;
     r_bytes[30] = 0x5a;
@@ -565,11 +565,11 @@ test "fp12Pow matches pairing bilinearity: e(P,Q)^r == e(rP,Q)" {
 }
 
 test "fp12Pow is multiplicative in the exponent: base^a * base^b == base^(a+b)" {
-    var a_bytes = [_]u8{0} ** 32;
+    var a_bytes = @as([32]u8, @splat(0));
     a_bytes[31] = 0x07;
-    var b_bytes = [_]u8{0} ** 32;
+    var b_bytes = @as([32]u8, @splat(0));
     b_bytes[31] = 0x0b;
-    var ab_bytes = [_]u8{0} ** 32;
+    var ab_bytes = @as([32]u8, @splat(0));
     ab_bytes[31] = 0x12; // 7 + 11 = 18
     const a = Fr.fromBytes(a_bytes) catch unreachable;
     const b = Fr.fromBytes(b_bytes) catch unreachable;

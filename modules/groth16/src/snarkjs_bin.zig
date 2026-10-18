@@ -207,7 +207,7 @@ pub fn frToMont2Le(v: Fr, r2_val: Fr) [32]u8 {
 /// `2⁵¹² mod r`, computed as `(2²⁵⁶ mod r)²` so no second hand-typed
 /// constant can disagree with the first.
 pub fn r2() Fr {
-    const r_mod = Fr.reduceWide(&(([_]u8{1} ++ [_]u8{0} ** 32)));
+    const r_mod = Fr.reduceWide(&(([_]u8{1} ++ @as([32]u8, @splat(0)))));
     return r_mod.mul(r_mod);
 }
 

@@ -65,7 +65,7 @@ fn closeFd(fd: Fd) void {
 /// Build a `sockaddr.un` for a pathname (non-abstract) unix socket. `path` is
 /// truncated to 107 bytes + NUL (the kernel limit) if longer.
 pub fn unixAddr(path: [:0]const u8) linux.sockaddr.un {
-    var addr = linux.sockaddr.un{ .family = linux.AF.UNIX, .path = [_]u8{0} ** 108 };
+    var addr = linux.sockaddr.un{ .family = linux.AF.UNIX, .path = @as([108]u8, @splat(0)) };
     const n = @min(path.len, 107);
     @memcpy(addr.path[0..n], path[0..n]);
     return addr;
@@ -513,7 +513,7 @@ test "Server+Client: N framed round-trips through a trivial echo dispatch" {
     defer th.join();
 
     // Happy path: varied payloads, including empty and larger-than-buffer.
-    const big = "x" ** (io_buf_size + 123);
+    const big = strRepeat("x", io_buf_size + 123);
     const msgs = [_][]const u8{ "ping", "", "hello world", "{\"cmd\":\"get\"}", big };
     var reply_buf: [io_buf_size * 2]u8 = undefined;
     for (msgs) |m| {
@@ -684,4 +684,16 @@ fn setNewKey(gpa: std.mem.Allocator) !void {
 
 test "Bus.set leaks nothing when any of its allocations fails" {
     try testing.checkAllAllocationFailures(testing.allocator, setNewKey, .{});
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

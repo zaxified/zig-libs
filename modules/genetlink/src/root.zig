@@ -259,12 +259,12 @@ pub const McastGroupError = ResolveError || error{GroupNotFound};
 /// Map an nlctrl `NLMSG_ERROR` errno onto `ResolveError`.
 fn resolveErrorFromCode(code: i32) ResolveError {
     return switch (@as(u32, @bitCast(-%code))) {
-        @intFromEnum(linux.E.NOENT) => error.FamilyNotFound,
-        @intFromEnum(linux.E.PERM),
-        @intFromEnum(linux.E.ACCES),
+        @backingInt(linux.E.NOENT) => error.FamilyNotFound,
+        @backingInt(linux.E.PERM),
+        @backingInt(linux.E.ACCES),
         => error.AccessDenied,
-        @intFromEnum(linux.E.NOBUFS),
-        @intFromEnum(linux.E.NOMEM),
+        @backingInt(linux.E.NOBUFS),
+        @backingInt(linux.E.NOMEM),
         => error.SystemResources,
         else => error.Unexpected,
     };
@@ -620,11 +620,11 @@ test "buildGetFamilyRequest: GENL_NAMSIZ boundary — one under fits, exactly at
     // GENL_NAMSIZ (16) includes the NUL terminator, so the longest name that
     // fits is 15 bytes; a name of exactly 16 bytes must be rejected even
     // though it is nowhere near the "way too long" case above.
-    const fits = "a" ** (GENL_NAMSIZ - 1);
+    const fits = strRepeat("a", GENL_NAMSIZ - 1);
     const req = try buildGetFamilyRequest(testing.allocator, 1, fits);
     testing.allocator.free(req);
 
-    const boundary = "a" ** GENL_NAMSIZ;
+    const boundary = strRepeat("a", GENL_NAMSIZ);
     try testing.expectError(error.NameTooLong, buildGetFamilyRequest(testing.allocator, 1, boundary));
 }
 
@@ -1407,7 +1407,7 @@ test "kernel replay: real GETFAMILY replies resolve every multicast group, as a 
         var t: GenlScripted = .{ .script = script, .pid = x.pid };
         if (x.id == null) {
             // The kernel's NLMSG_ERROR for an unknown family.
-            try testing.expectEqual(@as(u32, @intFromEnum(linux.E.NOENT)), x.errno);
+            try testing.expectEqual(@as(u32, @backingInt(linux.E.NOENT)), x.errno);
             try testing.expectError(error.FamilyNotFound, ctrlGetFamilyOver(&t, x.family, .family_id, 1));
             continue;
         }
@@ -1600,4 +1600,16 @@ test "F4: a short NLMSG_ERROR payload is a typed error, not a silent skip" {
 
     var t: GenlScripted = .{ .script = &.{list.items}, .pid = 7 };
     try testing.expectError(error.MalformedReply, ctrlGetFamilyOver(&t, "nlctrl", .family_id, 42));
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

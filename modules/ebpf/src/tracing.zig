@@ -451,13 +451,13 @@ pub fn buildProgLoadAttr(
         if (opts.prog_btf_fd == null) return error.MissingProgBtf;
     }
     var attr: ProgLoadAttr = .{
-        .prog_type = @intFromEnum(prog_type),
+        .prog_type = @backingInt(prog_type),
         .insn_cnt = @intCast(insns.len),
         .insns = @intFromPtr(insns.ptr),
         .license = @intFromPtr(license_z),
         .kern_version = opts.kern_version,
         .prog_flags = opts.prog_flags,
-        .expected_attach_type = if (opts.expected_attach_type) |t| @intFromEnum(t) else 0,
+        .expected_attach_type = if (opts.expected_attach_type) |t| @backingInt(t) else 0,
         .prog_btf_fd = opts.prog_btf_fd orelse 0,
         .attach_btf_id = opts.attach_btf_id,
         .attach_btf_obj_fd = opts.attach_btf_obj_fd,
@@ -603,10 +603,10 @@ test "TargetKind: prefix, BTF kind, attach type and prog type" {
     try testing.expectEqual(BPF.ProgType.lsm, TargetKind.lsm.progType());
 
     // The UAPI numbers those attach types must have.
-    try testing.expectEqual(@as(u32, 24), @intFromEnum(BPF.AttachType.trace_fentry));
-    try testing.expectEqual(@as(u32, 25), @intFromEnum(BPF.AttachType.trace_fexit));
-    try testing.expectEqual(@as(u32, 23), @intFromEnum(BPF.AttachType.trace_raw_tp));
-    try testing.expectEqual(@as(u32, 27), @intFromEnum(BPF.AttachType.lsm_mac));
+    try testing.expectEqual(@as(u32, 24), @backingInt(BPF.AttachType.trace_fentry));
+    try testing.expectEqual(@as(u32, 25), @backingInt(BPF.AttachType.trace_fexit));
+    try testing.expectEqual(@as(u32, 23), @backingInt(BPF.AttachType.trace_raw_tp));
+    try testing.expectEqual(@as(u32, 27), @backingInt(BPF.AttachType.lsm_mac));
 }
 
 test "targetName builds the prefixed name and refuses what cannot be one" {
@@ -621,9 +621,9 @@ test "targetName builds the prefixed name and refuses what cannot be one" {
     // A libbpf-style SEC() string must be split by the caller, not passed
     // whole — otherwise "fentry/vfs_read" would be looked up literally.
     try testing.expectError(error.InvalidName, targetName(.fentry, "fentry/vfs_read", &buf));
-    try testing.expectError(error.InvalidName, targetName(.fentry, "x" ** (max_name_len + 1), &buf));
+    try testing.expectError(error.InvalidName, targetName(.fentry, strRepeat("x", max_name_len + 1), &buf));
     // The prefix counts toward the limit.
-    try testing.expectError(error.InvalidName, targetName(.tp_btf, "x" ** (max_name_len - 5), &buf));
+    try testing.expectError(error.InvalidName, targetName(.tp_btf, strRepeat("x", max_name_len - 5), &buf));
 }
 
 test "golden: the extended BPF_PROG_LOAD attr layout" {
@@ -699,7 +699,7 @@ test "golden: an fentry prog_load attr's bytes" {
     });
     const bytes = std.mem.asBytes(&attr);
 
-    try testing.expectEqual(@as(u32, @intFromEnum(BPF.ProgType.tracing)), std.mem.readInt(u32, bytes[0..4], .little));
+    try testing.expectEqual(@as(u32, @backingInt(BPF.ProgType.tracing)), std.mem.readInt(u32, bytes[0..4], .little));
     try testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, bytes[4..8], .little));
     try testing.expectEqual(@as(u64, @intFromPtr(&insns)), std.mem.readInt(u64, bytes[8..16], .little));
     try testing.expectEqual(@as(u64, @intFromPtr(&lz)), std.mem.readInt(u64, bytes[16..24], .little));
@@ -930,4 +930,16 @@ test "attachExt refuses the pair the kernel would reject" {
     // half-filled pair are refused here, before any syscall.
     try testing.expectError(error.InvalidTarget, attachExt(3, 0, 7, 0));
     try testing.expectError(error.InvalidTarget, attachExt(3, 5, 0, 0));
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

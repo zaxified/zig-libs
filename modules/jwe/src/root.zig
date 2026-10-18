@@ -873,7 +873,7 @@ fn finishDecrypt(
 /// Production callers supply `.{ .csprng = … }` — see `entropy.zig`.
 fn seededForTest() Entropy {
     const S = struct {
-        var csprng = std.Random.DefaultCsprng.init([_]u8{0x42} ** 32);
+        var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x42)));
     };
     return .{ .fixed_for_test = S.csprng.random() };
 }
@@ -899,7 +899,7 @@ test {
 }
 
 test "dir + A128GCM real round-trip" {
-    const key = [_]u8{0x2b} ** 16;
+    const key = @as([16]u8, @splat(0x2b));
     const token = try encryptCompact(std.testing.allocator, .dir, .A128GCM, .{ .symmetric = &key }, "attack at dawn", "", seededForTest(), .{});
     defer std.testing.allocator.free(token);
 
@@ -909,7 +909,7 @@ test "dir + A128GCM real round-trip" {
 }
 
 test "dir + A256GCM real round-trip, empty plaintext" {
-    const key = [_]u8{0x11} ** 32;
+    const key = @as([32]u8, @splat(0x11));
     const token = try encryptCompact(std.testing.allocator, .dir, .A256GCM, .{ .symmetric = &key }, "", "", seededForTest(), .{});
     defer std.testing.allocator.free(token);
 
@@ -923,7 +923,7 @@ test "every A192 algorithm round-trips: A192KW, A192GCMKW, PBES2-HS384+A192KW, E
     // primitives' own KATs (aeskw RFC 3394 §4.2/§4.4, McGrew–Viega 7–10,
     // RFC 7518 B.2) plus these full-token round trips.
     const gpa = std.testing.allocator;
-    const kek = [_]u8{0x5c} ** 24;
+    const kek = @as([24]u8, @splat(0x5c));
     var recipient: ecdhes.EphemeralKeyPair = undefined;
     ecdhes.generateEphemeral(&recipient, .p256, seededForTest());
     inline for (.{ Enc.A192GCM, Enc.@"A192CBC-HS384" }) |e| {
@@ -946,7 +946,7 @@ test "every A192 algorithm round-trips: A192KW, A192GCMKW, PBES2-HS384+A192KW, E
 }
 
 test "A128GCMKW + A128GCM real round-trip" {
-    const kek = [_]u8{0x77} ** 16;
+    const kek = @as([16]u8, @splat(0x77));
     const token = try encryptCompact(std.testing.allocator, .A128GCMKW, .A128GCM, .{ .symmetric = &kek }, "the eagle flies at midnight", "", seededForTest(), .{});
     defer std.testing.allocator.free(token);
 
@@ -956,7 +956,7 @@ test "A128GCMKW + A128GCM real round-trip" {
 }
 
 test "tampered ciphertext fails authentication, never returns garbage plaintext" {
-    const key = [_]u8{0x2b} ** 16;
+    const key = @as([16]u8, @splat(0x2b));
     const token = try encryptCompact(std.testing.allocator, .dir, .A128GCM, .{ .symmetric = &key }, "attack at dawn", "", seededForTest(), .{});
     defer std.testing.allocator.free(token);
 
@@ -978,21 +978,21 @@ test "tampered ciphertext fails authentication, never returns garbage plaintext"
 }
 
 test "key-material confusion is rejected: dir token vs RSA key" {
-    const key = [_]u8{0x2b} ** 16;
+    const key = @as([16]u8, @splat(0x2b));
     const token = try encryptCompact(std.testing.allocator, .dir, .A128GCM, .{ .symmetric = &key }, "hi", "", seededForTest(), .{});
     defer std.testing.allocator.free(token);
 
-    const bogus_rsa = rsa.PublicKey.fromBytes(&[_]u8{0xff} ** 64, &[_]u8{ 0x01, 0x00, 0x01 }) catch unreachable;
+    const bogus_rsa = rsa.PublicKey.fromBytes(&@as([64]u8, @splat(0xff)), &[_]u8{ 0x01, 0x00, 0x01 }) catch unreachable;
     try std.testing.expectError(error.KeyMaterialMismatch, decryptCompact(std.testing.allocator, .{ .rsa_public = bogus_rsa }, token, .{}));
 }
 
 test "compact serialization rejects non-empty aad_extra" {
-    const key = [_]u8{0x2b} ** 16;
+    const key = @as([16]u8, @splat(0x2b));
     try std.testing.expectError(error.CompactSerializationNoAad, encryptCompact(std.testing.allocator, .dir, .A128GCM, .{ .symmetric = &key }, "hi", "extra", seededForTest(), .{}));
 }
 
 test "unknown alg/enc are rejected up front" {
-    const key = [_]u8{0x2b} ** 16;
+    const key = @as([16]u8, @splat(0x2b));
     try std.testing.expectError(error.UnsupportedAlg, encryptCompact(std.testing.allocator, .unknown, .A128GCM, .{ .symmetric = &key }, "hi", "", seededForTest(), .{}));
     try std.testing.expectError(error.UnsupportedEnc, encryptCompact(std.testing.allocator, .dir, .unknown, .{ .symmetric = &key }, "hi", "", seededForTest(), .{}));
 }
@@ -1084,7 +1084,7 @@ test "ECDH-ES key-material confusion is rejected: ECDH token vs symmetric key" {
     const token = try encryptCompact(std.testing.allocator, .@"ECDH-ES", .A128GCM, .{ .ec_public = recipient.public }, "hi", "", seededForTest(), .{});
     defer std.testing.allocator.free(token);
 
-    const key = [_]u8{0x2b} ** 16;
+    const key = @as([16]u8, @splat(0x2b));
     try std.testing.expectError(error.KeyMaterialMismatch, decryptCompact(std.testing.allocator, .{ .symmetric = &key }, token, .{}));
 }
 
@@ -1126,7 +1126,7 @@ test "ECDH-ES+A192KW real round-trip (P-256), through aeskw's AES-192 KEK" {
 }
 
 test "malformed compact tokens are rejected, never panic on arbitrary bytes" {
-    const key = [_]u8{0x2b} ** 16;
+    const key = @as([16]u8, @splat(0x2b));
     try std.testing.expectError(error.MalformedToken, decryptCompact(std.testing.allocator, .{ .symmetric = &key }, "not.enough.parts", .{}));
     try std.testing.expectError(error.MalformedToken, decryptCompact(std.testing.allocator, .{ .symmetric = &key }, "too.many.parts.here.for.sure", .{}));
     try std.testing.expectError(error.InvalidBase64, decryptCompact(std.testing.allocator, .{ .symmetric = &key }, "not!base64.a.b.c.d", .{}));
@@ -1155,8 +1155,8 @@ const token_seeds = [_][]const u8{
     fuzzseed.seedHex("01" ++ "0050" ++ "ff"), // deeper still: the IV or ciphertext
     fuzzseed.seedHex("01" ++ "00b0" ++ "00"), // ⭐ near the end: the authentication tag
     fuzzseed.seedHex("04" ++ "0000" ++ "61" ++ "0001" ++ "62" ++ "0002" ++ "63" ++ "0003" ++ "64"), // four flips across the header
-    fuzzseed.seedHex("18" ++ "00045a" ** 24), // the maximum flip count, all in the header
-    fuzzseed.seedHex("ff" ++ "003030" ** 8), // a flip count past the ceiling, clamped
+    fuzzseed.seedHex("18" ++ strRepeat("00045a", 24)), // the maximum flip count, all in the header
+    fuzzseed.seedHex("ff" ++ strRepeat("003030", 8)), // a flip count past the ceiling, clamped
     fuzzseed.seedHex("03" ++ "0002" ++ "7b" ++ "0003" ++ "22" ++ "0004" ++ "61"), // '{', '"', 'a' — pushing the header toward JSON-ish
 };
 
@@ -1182,7 +1182,7 @@ fn fuzzDecryptCompactSmith(_: void, smith: *std.testing.Smith) !void {
 }
 
 fn fuzzDecryptCompact(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
-    const key = [_]u8{0x2b} ** 16;
+    const key = @as([16]u8, @splat(0x2b));
 
     // ⚠ This harness used to draw 512 uniform-random bytes and hand them
     // straight to `decryptCompact`. Measured: **0 of 200,000** such inputs got
@@ -1337,7 +1337,7 @@ test "corpus: every token seed reaches decryptCompact, and how far each gets is 
     // input got past framing into the header parse and the key unwrap, which
     // is the surface this target exists for.
     const gpa = std.testing.allocator;
-    const key = [_]u8{0x2b} ** 16;
+    const key = @as([16]u8, @splat(0x2b));
     const token = try encryptCompact(gpa, .A128KW, .A128GCM, .{ .symmetric = &key }, "fuzz", "", seededForTest(), .{});
     defer gpa.free(token);
 
@@ -1382,7 +1382,7 @@ test "TEETH: the decrypt fuzz harness reaches the header parser" {
     // into a parsed header — before this, uniform random bytes reached it
     // 0 times in 200,000.
     const gpa = std.testing.allocator;
-    const key = [_]u8{0x2b} ** 16;
+    const key = @as([16]u8, @splat(0x2b));
     const token = try encryptCompact(gpa, .A128KW, .A128GCM, .{ .symmetric = &key }, "fuzz", "", seededForTest(), .{});
     defer gpa.free(token);
 
@@ -1424,7 +1424,7 @@ test "Entropy: exactly two arms, production and test are distinct, and nothing e
 
     // The SAME generator under the two arms — different claims about the same
     // bytes is precisely the distinction the type exists to carry.
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x77} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x77)));
     const production: Entropy = .{ .csprng = csprng.random() };
     const for_test: Entropy = .{ .fixed_for_test = csprng.random() };
     try std.testing.expect(std.meta.activeTag(production) != std.meta.activeTag(for_test));
@@ -1435,13 +1435,13 @@ test "the CSPRNG requirement is load-bearing: dir + A256GCM with a repeated gene
     // content IV is the only thing separating two messages. Two generators in
     // the same state stand in for "the consumer reached for DefaultPrng".
     const gpa = std.testing.allocator;
-    const key = [_]u8{0x2b} ** 32;
+    const key = @as([32]u8, @splat(0x2b));
     const p1 = "transfer 100 to alice!!!";
     const p2 = "transfer 999 to mallory??";
 
-    var g1 = std.Random.DefaultCsprng.init([_]u8{0x11} ** 32);
-    var g2 = std.Random.DefaultCsprng.init([_]u8{0x11} ** 32); // same seed
-    var g3 = std.Random.DefaultCsprng.init([_]u8{0x12} ** 32); // different
+    var g1 = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x11)));
+    var g2 = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x11))); // same seed
+    var g3 = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x12))); // different
 
     const t1 = try encryptCompact(gpa, .dir, .A256GCM, .{ .symmetric = &key }, p1, "", .{ .fixed_for_test = g1.random() }, .{});
     defer gpa.free(t1);
@@ -1511,7 +1511,7 @@ test "TEETH: RFC 7516 s11.5 — one error value for every encrypted-key failure"
     // correct-length CEK gave `AuthenticationFailed`. Read off the return
     // value, that is a padding oracle with no statistics required.
     const gpa = std.testing.allocator;
-    const kek = [_]u8{0x5a} ** 16;
+    const kek = @as([16]u8, @splat(0x5a));
 
     // A genuine token, so the tail of every case below is well-formed.
     const token = try encryptCompact(gpa, .A128KW, .A128GCM, .{ .symmetric = &kek }, "secret", "", seededForTest(), .{});
@@ -1528,7 +1528,7 @@ test "TEETH: RFC 7516 s11.5 — one error value for every encrypted-key failure"
     // Case B — length: a VALID wrap, of a message that is not the CEK length.
     // Built by wrapping a 24-byte key under the same KEK.
     var wrapped24: [32]u8 = undefined;
-    _ = try alg.aeskw.wrap(&kek, &[_]u8{0x11} ** 24, &wrapped24);
+    _ = try alg.aeskw.wrap(&kek, &@as([24]u8, @splat(0x11)), &wrapped24);
     var wrapped_b64: [64]u8 = undefined;
     const enc_len = std.base64.url_safe_no_pad.Encoder.encode(&wrapped_b64, &wrapped24).len;
     const wrong_len = try std.fmt.allocPrint(gpa, "{s}.{s}.{s}", .{ h, wrapped_b64[0..enc_len], rest });
@@ -1585,7 +1585,7 @@ test "TEETH: an attacker-chosen PBES2 work factor is REFUSED, not performed" {
     // production default (600_000, OWASP PBKDF2-HMAC-SHA256 guidance) costs
     // real seconds of unoptimized Debug SHA-256 per round trip here; scaled
     // down for Debug only, full default kept outside Debug.
-    const initial_p2c: u32 = if (builtin.mode == .Debug) 1_000 else 600_000;
+    const initial_p2c: u32 = if (builtin.mode == .debug) 1_000 else 600_000;
     const token = try encryptCompact(gpa, .@"PBES2-HS256+A128KW", .A128GCM, .{ .password = password }, "hi", "", seededForTest(), .{ .pbes2_iterations = initial_p2c });
     defer gpa.free(token);
     const pt = try decryptCompact(gpa, .{ .password = password }, token, .{});
@@ -1626,7 +1626,7 @@ test "TEETH: an attacker-chosen PBES2 work factor is REFUSED, not performed" {
     // exercises the identical comparison logic. `default_max_p2c` itself
     // (the production constant) is verified at its REAL value outside
     // Debug, where the cost is negligible.
-    const at_ceiling_p2c: u32 = if (builtin.mode == .Debug) 20_000 else default_max_p2c;
+    const at_ceiling_p2c: u32 = if (builtin.mode == .debug) 20_000 else default_max_p2c;
     const at_ceiling = try rewriteP2c(gpa, token, at_ceiling_p2c);
     defer gpa.free(at_ceiling);
     try std.testing.expectError(
@@ -1690,7 +1690,7 @@ fn buildCompact(a: std.mem.Allocator, header_json: []const u8, ek: []const u8, i
 /// A token whose content is A128GCM under `cek`, with `ek` as its Encrypted
 /// Key, whatever `ek` actually wraps.
 fn tokenWithCek(a: std.mem.Allocator, header_json: []const u8, ek: []const u8, cek: [16]u8, pt: []const u8) ![]u8 {
-    const iv = [_]u8{0x24} ** 12;
+    const iv = @as([12]u8, @splat(0x24));
     var hb: [256]u8 = undefined;
     const header_b64 = test_b64.Encoder.encode(&hb, header_json);
     const ct = try a.alloc(u8, pt.len);
@@ -1704,7 +1704,7 @@ test "dir refuses a non-empty encrypted_key segment (RFC 7516 §5.2 step 10)" {
     // Review finding 2026-10-05: only ECDH-ES checked this. The segment is
     // outside the AAD, so a dir token with bytes spliced into it decrypted
     // to the same plaintext — the malleability the ECDH-ES test names.
-    const key = [_]u8{0x2b} ** 16;
+    const key = @as([16]u8, @splat(0x2b));
     const token = try encryptCompact(std.testing.allocator, .dir, .A128GCM, .{ .symmetric = &key }, "hi", "", seededForTest(), .{});
     defer std.testing.allocator.free(token);
     var it = std.mem.splitScalar(u8, token, '.');
@@ -1718,7 +1718,7 @@ test "dir refuses a non-empty encrypted_key segment (RFC 7516 §5.2 step 10)" {
 test "expect_alg / expect_enc refuse a token of another algorithm" {
     // The caller's algorithm pin (RFC 8725 §3.1): without it the token's own
     // header picks the algorithm. Removing either check left every test green.
-    const key = [_]u8{0x2b} ** 16;
+    const key = @as([16]u8, @splat(0x2b));
     const token = try encryptCompact(std.testing.allocator, .dir, .A128GCM, .{ .symmetric = &key }, "pinned", "", seededForTest(), .{});
     defer std.testing.allocator.free(token);
     try std.testing.expectError(error.AlgMismatch, decryptCompact(std.testing.allocator, .{ .symmetric = &key }, token, .{ .expect_alg = .A128KW }));
@@ -1734,8 +1734,8 @@ test "unknown alg/enc and an empty header segment are typed errors, never reach 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const key = [_]u8{0x2b} ** 16;
-    const z = [_]u8{0} ** 16;
+    const key = @as([16]u8, @splat(0x2b));
+    const z = @as([16]u8, @splat(0));
     const bad_alg = try buildCompact(a, "{\"alg\":\"XYZ\",\"enc\":\"A128GCM\"}", "", &z, &z, &z);
     try std.testing.expectError(error.UnsupportedAlg, decryptCompact(std.testing.allocator, .{ .symmetric = &key }, bad_alg, .{}));
     const bad_enc = try buildCompact(a, "{\"alg\":\"dir\",\"enc\":\"XYZ\"}", "", &z, &z, &z);
@@ -1747,7 +1747,7 @@ test "header size limits: the b64 header at max + 1, a member at max_member_len 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const key = [_]u8{0x2b} ** 16;
+    const key = @as([16]u8, @splat(0x2b));
     for ([_]usize{ header.max_header_b64_len, header.max_header_b64_len + 1 }) |n| {
         const big = try a.alloc(u8, n + ".AA.AA.AA.AA".len);
         @memset(big[0..n], 'e');
@@ -1783,8 +1783,8 @@ test "a failed key unwrap never decrypts under a predictable CEK (RFC 7516 §11.
     // The decoy CEK is a hash of the key and the Encrypted Key; without it
     // the CEK would be whatever `cek_buf` held — 0xAA in the safe modes, so a
     // token whose content was sealed under 0xAA… would have DECRYPTED.
-    const kek = [_]u8{0x77} ** 16;
-    const bad_ek = [_]u8{0x01} ** 24;
+    const kek = @as([16]u8, @splat(0x77));
+    const bad_ek = @as([24]u8, @splat(0x01));
     for ([_]u8{ 0xAA, 0x00 }) |fill| {
         const token = try tokenWithCek(std.testing.allocator, "{\"alg\":\"A128KW\",\"enc\":\"A128GCM\"}", &bad_ek, @splat(fill), "predictable");
         defer std.testing.allocator.free(token);
@@ -1796,7 +1796,7 @@ test "content tags must be exactly the enc's length: one octet more is refused, 
     // RFC 7518 §5.2.2.2 / §5.3: the tag is T_LEN octets (16 for both here).
     // With the length checks moved, the first 16 octets were compared and a
     // token with a 17-octet tag decrypted.
-    const key = [_]u8{0x2b} ** 32;
+    const key = @as([32]u8, @splat(0x2b));
     for ([_]Enc{ .A128GCM, .@"A128CBC-HS256" }) |e| {
         const k = key[0..e.cekLen().?];
         const token = try encryptCompact(std.testing.allocator, .dir, e, .{ .symmetric = k }, "tag length", "", seededForTest(), .{});
@@ -1829,18 +1829,18 @@ test "unwrapCek: wrapped CEKs of the wrong length and GCMKW iv/tag of the wrong 
     var kp: rsa.KeyPair = undefined;
     try rsa.generate(&kp, prng.random(), 1024, 65537);
     const rsa_parsed = try header.parse(a, "{\"alg\":\"RSA-OAEP\",\"enc\":\"A128GCM\"}");
-    const cek17 = [_]u8{0x5a} ** 17;
+    const cek17 = @as([17]u8, @splat(0x5a));
     for ([_]usize{ 15, 17 }) |n| {
         var ek_buf: [max_encrypted_key_len]u8 = undefined;
         const ek = try alg.rsaOaepWrap(kp.public_key, .sha1, seededForTest(), cek17[0..n], &ek_buf);
         try std.testing.expectError(error.InvalidKey, unwrapCek(rsa_parsed, .{ .rsa_private = &kp.secret_key }, ek, &cek, 16, .{}));
     }
 
-    const kek = [_]u8{0x77} ** 16;
-    const iv13 = [_]u8{0x31} ** 13;
+    const kek = @as([16]u8, @splat(0x77));
+    const iv13 = @as([13]u8, @splat(0x31));
     var ct16: [16]u8 = undefined;
     var tag: [16]u8 = undefined;
-    _ = try alg.gcmkwWrap(&kek, iv13[0..12].*, &([_]u8{0x5a} ** 16), &ct16, &tag);
+    _ = try alg.gcmkwWrap(&kek, iv13[0..12].*, &(@as([16]u8, @splat(0x5a))), &ct16, &tag);
     var ivb: [32]u8 = undefined;
     var tb: [32]u8 = undefined;
     const tag17 = tag ++ [_]u8{0};
@@ -1850,7 +1850,7 @@ test "unwrapCek: wrapped CEKs of the wrong length and GCMKW iv/tag of the wrong 
     try std.testing.expectError(error.InvalidKey, unwrapCek(long_tag, .{ .symmetric = &kek }, &ct16, &cek, 16, .{}));
 
     var ct8: [8]u8 = undefined;
-    _ = try alg.gcmkwWrap(&kek, iv13[0..12].*, &([_]u8{0x5a} ** 8), &ct8, &tag);
+    _ = try alg.gcmkwWrap(&kek, iv13[0..12].*, &(@as([8]u8, @splat(0x5a))), &ct8, &tag);
     const short = try header.parse(a, try std.fmt.allocPrint(a, "{{\"alg\":\"A128GCMKW\",\"enc\":\"A128GCM\",\"iv\":\"{s}\",\"tag\":\"{s}\"}}", .{ test_b64.Encoder.encode(&ivb, iv13[0..12]), test_b64.Encoder.encode(&tb, &tag) }));
     try std.testing.expectError(error.InvalidKey, unwrapCek(short, .{ .symmetric = &kek }, &ct8, &cek, 16, .{}));
 }
@@ -1871,11 +1871,11 @@ test "PBES2: p2c above max_p2c is WorkFactorTooHigh, p2s under 8 octets is Inval
     const salt8 = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
     const kek = try alg.pbes2DeriveKek(.hs256_a128kw, password, &salt8, 10, &kek_buf);
     var ek: [24]u8 = undefined;
-    _ = try aeskw.wrap(kek, &([_]u8{0x5a} ** 16), &ek);
+    _ = try aeskw.wrap(kek, &(@as([16]u8, @splat(0x5a))), &ek);
 
     const at_max = try header.parse(a, try std.fmt.allocPrint(a, fmt, .{ p2s8, 10 }));
     try unwrapCek(at_max, .{ .password = password }, &ek, &cek, 16, .{ .max_p2c = 10 });
-    try std.testing.expectEqualSlices(u8, &([_]u8{0x5a} ** 16), &cek);
+    try std.testing.expectEqualSlices(u8, &(@as([16]u8, @splat(0x5a))), &cek);
     const over = try header.parse(a, try std.fmt.allocPrint(a, fmt, .{ p2s8, 11 }));
     try std.testing.expectError(error.WorkFactorTooHigh, unwrapCek(over, .{ .password = password }, &ek, &cek, 16, .{ .max_p2c = 10 }));
     const short_salt = try header.parse(a, try std.fmt.allocPrint(a, fmt, .{ p2s7, 10 }));
@@ -1903,4 +1903,16 @@ test "KAT: PBES2-HS256+A128KW against RFC 7517 Appendix C.4/C.5" {
     var cek: [32]u8 = undefined;
     try unwrapCek(parsed, .{ .password = password }, &ek, &cek, 32, .{});
     try std.testing.expectEqualSlices(u8, &want_cek, &cek);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

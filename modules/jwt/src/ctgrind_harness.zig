@@ -146,17 +146,17 @@ pub fn main(init: std.process.Init.Minimal) !void {
             try hmacOne(t, .HS512, 64);
         },
         .ec => {
-            const seed32 = [_]u8{7} ** 32;
+            const seed32 = @as([32]u8, @splat(7));
             var es256 = try jwt.EcdsaP256Sha256.KeyPair.generateDeterministic(seed32);
             taint(t, std.mem.asBytes(&es256.secret_key));
             try signWith("ES256", .{ .es256 = &es256 });
 
-            var es384 = try jwt.EcdsaP384Sha384.KeyPair.generateDeterministic([_]u8{7} ** jwt.EcdsaP384Sha384.KeyPair.seed_length);
+            var es384 = try jwt.EcdsaP384Sha384.KeyPair.generateDeterministic(@as([jwt.EcdsaP384Sha384.KeyPair.seed_length]u8, @splat(7)));
             taint(t, std.mem.asBytes(&es384.secret_key));
             try signWith("ES384", .{ .es384 = &es384 });
 
             var es512: jwt.EcdsaP521Sha512.KeyPair = undefined;
-            try jwt.EcdsaP521Sha512.KeyPair.generateDeterministicInto(&es512, &([_]u8{7} ** jwt.EcdsaP521Sha512.KeyPair.seed_length));
+            try jwt.EcdsaP521Sha512.KeyPair.generateDeterministicInto(&es512, &(@as([jwt.EcdsaP521Sha512.KeyPair.seed_length]u8, @splat(7))));
             taint(t, std.mem.asBytes(&es512.secret_key));
             try signWith("ES512", .{ .es512 = &es512 });
 
@@ -181,7 +181,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             taintMont(t, &sk.p_mont);
             taintMont(t, &sk.q_mont);
             try signWith("RS256", .{ .rs256 = &kp });
-            var rng = std.Random.DefaultCsprng.init([_]u8{0x42} ** std.Random.DefaultCsprng.secret_seed_length);
+            var rng = std.Random.DefaultCsprng.init(@as([std.Random.DefaultCsprng.secret_seed_length]u8, @splat(0x42)));
             try signWith("PS256", .{ .ps256 = .{ .key = &kp, .random = rng.random() } });
         },
     }

@@ -916,7 +916,7 @@ fn candidateValid(gpa: Allocator, pager: *Pager, m: Meta) RecoverError!bool {
             // walk used to do) let a corrupt `count`/`val_len` through to the
             // read path, which indexes the page with no bounds check of its
             // own. See `format.leafViewSafe`.
-            @intFromEnum(format.NodeKind.leaf) => {
+            @backingInt(format.NodeKind.leaf) => {
                 const leaf = format.leafViewSafe(&buf) orelse return false;
                 var i: usize = 0;
                 while (i < leaf.count()) : (i += 1) {
@@ -952,7 +952,7 @@ fn candidateValid(gpa: Allocator, pager: *Pager, m: Meta) RecoverError!bool {
                     }
                 }
             },
-            @intFromEnum(format.NodeKind.branch) => {
+            @backingInt(format.NodeKind.branch) => {
                 const br = format.branchViewSafe(&buf) orelse return false;
                 if (!pageIdOk(br.leftmost(), m.high_water)) return false;
                 stack.append(gpa, br.leftmost()) catch return error.OutOfMemory;
@@ -1121,7 +1121,7 @@ const RecoverSeed = struct {
 /// single entry, but the HARNESS writes `@min(n, capacity)` of them, so a seed
 /// that omits these would run off its own end and silently zero every draw
 /// after it.
-const over_capacity_entries = [_]u64{2} ** Freelist.capacity;
+const over_capacity_entries = @as([Freelist.capacity]u64, @splat(2));
 
 const recover_seeds = [_]RecoverSeed{
     // 1. A meta that is adopted: root 2 is a leaf, no freelist. The first seed
@@ -1273,7 +1273,7 @@ fn recoverMutatedHarness(comptime S: type, src: *S, gpa: Allocator) anyerror!voi
     var run: RecoverRun = .{};
     try driveRecover(std.testing.Smith, &sm, &run, gpa);
     if (run.adopted != null) fzMark(3) else fzMark(4);
-    if (run.root_kind) |k| if (k == @intFromEnum(format.NodeKind.branch)) fzMark(1);
+    if (run.root_kind) |k| if (k == @backingInt(format.NodeKind.branch)) fzMark(1);
 }
 
 test "fuzz driver: KVTREE_FUZZ (recover, recover-mutated)" {
@@ -1393,14 +1393,14 @@ fn driveRecover(comptime S: type, smith: *S, run: *RecoverRun, gpa: Allocator) !
                 0 => run.shapes[0] += 1,
                 1 => {
                     run.shapes[1] += 1;
-                    page[0] = @intFromEnum(format.NodeKind.leaf);
+                    page[0] = @backingInt(format.NodeKind.leaf);
                 },
                 2 => {
                     run.shapes[2] += 1;
                     // A branch whose geometry passes `branchViewSafe` so the
                     // walk descends, but whose child ids are fuzzed.
                     const count = smith.valueRangeAtMost(u16, 0, 4);
-                    page[0] = @intFromEnum(format.NodeKind.branch);
+                    page[0] = @backingInt(format.NodeKind.branch);
                     std.mem.writeInt(u16, page[2..4], count, .little);
                     std.mem.writeInt(
                         u32,
@@ -1499,7 +1499,7 @@ test "corpus: the recover seeds drive every knob, and the counts are pinned" {
         adopted += 1;
         txn_total += m.txn_id;
         if (m.free_root != 0) freelists_walked += 1;
-        if (run.root_kind == @intFromEnum(format.NodeKind.branch)) branch_roots += 1;
+        if (run.root_kind == @backingInt(format.NodeKind.branch)) branch_roots += 1;
     }
     try testing.expectEqual(@as(usize, 12), metas_stamped);
     // random, leaf, branch, freelist — all four shapes stamped at least once,
@@ -1529,7 +1529,7 @@ test "corpus: the recover seeds drive every knob, and the counts are pinned" {
     // refuses it, rather than something earlier in the walk. A count of 65 535
     // needs a 131 078-octet slot directory inside a 4 096-octet page.
     var poisoned: [page_size]u8 = @splat(0xff);
-    poisoned[0] = @intFromEnum(format.NodeKind.leaf);
+    poisoned[0] = @backingInt(format.NodeKind.leaf);
     try testing.expectEqual(@as(u16, 0xffff), std.mem.readInt(u16, poisoned[2..4], .little));
     try testing.expect(format.leafViewSafe(&poisoned) == null);
 }

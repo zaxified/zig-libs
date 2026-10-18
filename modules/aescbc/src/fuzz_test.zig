@@ -51,10 +51,10 @@ pub fn damage(src: anytype, buf: []u8, frame: []const u8) usize {
 /// binary and fails with `error.HarnessDoesNotReach` if a label never fired.
 pub fn Marker(comptime Label: type) type {
     return struct {
-        var counts: [@typeInfo(Label).@"enum".fields.len]usize = @splat(0);
+        var counts: [@typeInfo(Label).@"enum".field_names.len]usize = @splat(0);
 
         pub fn mark(comptime l: Label) void {
-            counts[@intFromEnum(l)] += 1;
+            counts[@backingInt(l)] += 1;
             fuzz_driver.hit(@tagName(l));
         }
 
@@ -69,7 +69,7 @@ pub fn Marker(comptime Label: type) type {
                 };
             }
             for (counts, 0..) |n, i| if (n == 0) {
-                std.debug.print("reach: " ++ name ++ " label {t} never hit in {d} seeds\n", .{ @as(Label, @enumFromInt(i)), seeds });
+                std.debug.print("reach: " ++ name ++ " label {t} never hit in {d} seeds\n", .{ @as(Label, @fromBackingInt(@intCast(i))), seeds });
                 return error.HarnessDoesNotReach;
             };
         }
@@ -307,7 +307,7 @@ fn fuzzPad(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
         var k: Cursor = .{ .bytes = raw[0..n] };
         for (&msg_store) |*x| x.* = k.byte();
         const msg = msg_store[0..k.ranged(0, 63)];
-        scheme = @enumFromInt(k.ranged(0, 4));
+        scheme = @fromBackingInt(@intCast(k.ranged(0, 4)));
         var r = std.Random.DefaultPrng.init(k.byte());
         len = switch (scheme) {
             .pkcs7 => try aescbc.padPkcs7(msg, &buf),
@@ -432,7 +432,7 @@ fn ctsCase(comptime Aes: type, k: *Cursor) !void {
     var fill = std.Random.DefaultPrng.init(k.byte());
     fill.random().bytes(&msg);
     const len = k.ranged(0, 8 * 16);
-    const variant: aescbc.CtsVariant = @enumFromInt(k.ranged(0, 2));
+    const variant: aescbc.CtsVariant = @fromBackingInt(@intCast(k.ranged(0, 2)));
     var got: [8 * 16]u8 = undefined;
     if (len < 16) {
         if (aescbc.encryptCts(Aes, variant, &key, iv, msg[0..len], &got)) |_| return error.ShortAccepted else |e| if (e != error.TooShort) return error.WrongError;

@@ -54,8 +54,8 @@ fn hexN(comptime n: usize, comptime hex: *const [2 * n:0]u8) [n]u8 {
 // ── RFC 9380 Appendix K.6: expand_message_xof(SHAKE256) ──────────────────
 
 const k6_dst = "QUUX-V01-CS02-with-expander-SHAKE256";
-const k6_q128 = "q128_" ++ "q" ** 128;
-const k6_a512 = "a512_" ++ "a" ** 512;
+const k6_q128 = "q128_" ++ strRepeat("q", 128);
+const k6_a512 = "a512_" ++ strRepeat("a", 512);
 
 const K6Short = struct { msg: []const u8, out: [0x20]u8 };
 const K6Long = struct { msg: []const u8, out: [0x80]u8 };
@@ -133,7 +133,7 @@ const oprf_vectors = [_]OprfVector{
         .output = hexN(64, "37d3f7922d9388a15b561de5829bbf654c4089ede89c0ce0f3f85bcdba09e382ce0ab3507e021f9e79706a1798ffeac68ebd5cf62e5eb9838c7068351d97ae37"),
     },
     .{
-        .input = &([_]u8{0x5a} ** 17),
+        .input = &(@as([17]u8, @splat(0x5a))),
         .blind = hexN(56, "64d37aed22a27f5191de1c1d69fadb899d8862b58eb4220029e036ec65fa3833a26e9388336361686ff1f83df55046504dfecad8549ba112"),
         .blinded = hexN(56, "86a88dc5c6331ecfcb1d9aacb50a68213803c462e377577cacc00af28e15f0ddbc2e3d716f2f39ef95f3ec1314a2c64d940a9f295d8f13bb"),
         .evaluated = hexN(56, "162e9fa6e9d527c3cd734a31bf122a34dbd5bcb7bb23651f1768a7a9274cc116c03b58afa6f0dede3994a60066c76370e7328e7062fd5819"),
@@ -197,4 +197,16 @@ test "RFC 9497 A.2 OPRF vectors 1-2: Blind/Evaluate/Finalize — hashToElement, 
         // and the unblinded element is skS * HashToGroup(input) directly
         try testing.expect(n.equals(h.scalarMul(&oprf_sk)));
     }
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

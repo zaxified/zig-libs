@@ -216,7 +216,7 @@ const Acc = struct {
             // Kind first: the group-key text alone makes text "1" and int 1
             // the same key.
             var buf: std.ArrayList(u8) = .empty;
-            try buf.append(a, @intFromEnum(kindOf(v)));
+            try buf.append(a, @backingInt(kindOf(v)));
             try appendValueKey(a, &buf, v);
             try self.distinct.put(a, try buf.toOwnedSlice(a), {});
         }
@@ -1522,7 +1522,7 @@ const filt_ds: Dataset = .{ .columns = &filt_cols, .rows = &filt_rows };
 fn keptRows(d: Dataset) [8]usize {
     // Index of each kept row in `filt_rows` (they are borrowed, so pointer
     // identity tells which), padded with maxInt.
-    var out = [_]usize{std.math.maxInt(usize)} ** 8;
+    var out = @as([8]usize, @splat(std.math.maxInt(usize)));
     for (d.rows, 0..) |r, i| {
         for (filt_rows, 0..) |orig, j| if (r.ptr == orig.ptr) {
             out[i] = j;

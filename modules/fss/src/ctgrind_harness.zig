@@ -206,8 +206,8 @@ fn runGen(taint: Taint) void {
 fn runEval(taint: Taint) void {
     const fixed_alpha: D.Index = 173;
     const fixed_beta: D.Elem = 0x01020304;
-    const fixed_s0: fss.prg.Seed = [_]u8{0x11} ** 16;
-    const fixed_s1: fss.prg.Seed = [_]u8{0x22} ** 16;
+    const fixed_s0: fss.prg.Seed = @as([16]u8, @splat(0x11));
+    const fixed_s1: fss.prg.Seed = @as([16]u8, @splat(0x22));
     var keys: [2]D.Key = undefined;
     D.genWithSeeds(fixed_alpha, fixed_beta, &fixed_s0, &fixed_s1, &keys);
     var key = keys[0];

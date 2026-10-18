@@ -128,7 +128,7 @@ noinline fn callInnocent() void {
 }
 
 test "STACKPROBE (A1 L4): wipe's zeroing survives the optimiser on a buffer nothing reads again" {
-    if (builtin.mode == .Debug or builtin.mode == .ReleaseSafe) return error.SkipZigTest;
+    if (builtin.mode == .debug or builtin.mode == .safe) return error.SkipZigTest;
     for (&secret, 0..) |*b, i| b.* = @truncate(0x41 + (i * 7) % 26);
 
     region_lo = stackHere() - PAD - WINDOW;
@@ -207,7 +207,7 @@ noinline fn parkKey() void {
 }
 
 test "STACKPROBE (A1 L4): the secret-key codecs leave neither the text nor the key on the dead stack" {
-    if (builtin.mode == .Debug or builtin.mode == .ReleaseSafe) return error.SkipZigTest;
+    if (builtin.mode == .debug or builtin.mode == .safe) return error.SkipZigTest;
     for (&codec_sk, 0..) |*b, i| b.* = @truncate(i * 13 + 5);
     sb.encodeSecretKeyBase64(&codec_b64, &codec_sk);
     sb.encodeSecretKeyHex(&codec_hex, &codec_sk);

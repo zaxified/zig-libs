@@ -187,7 +187,7 @@ fn secretBlock(comptime domain: []const u8, tainted: bool) [ciphersuite.block_by
 /// why that matters).
 const fixture_round: u64 = 424242;
 fn fixtureSk() bls12_381.Fr {
-    var sk_bytes = [_]u8{0} ** 32;
+    var sk_bytes = @as([32]u8, @splat(0));
     sk_bytes[31] = 0x2b;
     return bls12_381.Fr.fromBytes(sk_bytes) catch unreachable;
 }
@@ -237,8 +237,8 @@ fn secretRoundSignature(tainted: bool) g1.Affine {
 /// alongside its in-file count.
 fn fixtureCiphertext() tlock.Ciphertext {
     const p_pub = g2.Jacobian.fromAffine(g2.Affine.generator).scalarMul(fixtureSk()).toAffine();
-    const message = [_]u8{0x5a} ** ciphersuite.block_bytes;
-    const sigma = [_]u8{0x11} ** ciphersuite.block_bytes;
+    const message = @as([ciphersuite.block_bytes]u8, @splat(0x5a));
+    const sigma = @as([ciphersuite.block_bytes]u8, @splat(0x11));
     return tlock.encrypt(p_pub, fixture_round, &message, &sigma);
 }
 

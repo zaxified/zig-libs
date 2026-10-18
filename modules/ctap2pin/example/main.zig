@@ -78,7 +78,7 @@ fn runProtocol(comptime protocol: ctap2pin.Protocol, auth_scalar: [32]u8, platfo
     // ── pinUvAuthToken exchange: authenticator encrypts, platform decrypts ──
     // A synthetic 32-byte token standing in for what getPinToken would
     // actually return -- never a real PIN or real token.
-    const token = [_]u8{0x42} ** 32;
+    const token = @as([32]u8, @splat(0x42));
 
     if (protocol == .one) {
         var ciphertext: [32]u8 = undefined;
@@ -91,7 +91,7 @@ fn runProtocol(comptime protocol: ctap2pin.Protocol, auth_scalar: [32]u8, platfo
         // parameter rather than drawing it internally -- see root.zig's
         // Two.encrypt doc comment); a fixed pattern here, never reused
         // as real key material.
-        const iv = [_]u8{0xa5} ** 16;
+        const iv = @as([16]u8, @splat(0xa5));
         var ciphertext: [16 + 32]u8 = undefined;
         try Impl.encrypt(&auth_secret, iv, &ciphertext, &token);
         var recovered: [32]u8 = undefined;
@@ -102,7 +102,7 @@ fn runProtocol(comptime protocol: ctap2pin.Protocol, auth_scalar: [32]u8, platfo
 
     // ── command authentication: platform signs, authenticator verifies ──
     // A synthetic clientDataHash-shaped message, not a real WebAuthn hash.
-    const client_data_hash = [_]u8{0x99} ** 32;
+    const client_data_hash = @as([32]u8, @splat(0x99));
     // `One.authenticate` is fallible (audit finding L2: rejects an empty
     // key) and `Two.authenticate` is not (audit finding H2: the key is now
     // `*const [32]u8`, a compile-time-enforced length, so there is nothing
@@ -117,7 +117,7 @@ fn runProtocol(comptime protocol: ctap2pin.Protocol, auth_scalar: [32]u8, platfo
     std.debug.print("protocol {s}: pinUvAuthParam computed by the platform verifies under the authenticator's copy of the token\n", .{@tagName(protocol)});
 
     // ── negative: a DIFFERENT token must not verify the same param ──────
-    const wrong_token = [_]u8{0x43} ** 32;
+    const wrong_token = @as([32]u8, @splat(0x43));
     if (Impl.verify(&wrong_token, &client_data_hash, &pin_uv_auth_param)) return error.UnexpectedVerifyAccept;
     std.debug.print("protocol {s}: pinUvAuthParam rejected under a different token (verify -> false, as designed)\n", .{@tagName(protocol)});
 }
@@ -131,8 +131,8 @@ fn runProtocol(comptime protocol: ctap2pin.Protocol, auth_scalar: [32]u8, platfo
 /// `toPoint`, not `fromAffineCoordinates` alone, is what rejects that one,
 /// via `rejectIdentity`.)
 fn checkBadPeerKeyRejected() !void {
-    const platform_scalar = [_]u8{0x02} ** 32;
-    const bogus_peer = ctap2pin.PublicKey{ .x = [_]u8{0} ** 32, .y = [_]u8{0} ** 32 };
+    const platform_scalar = @as([32]u8, @splat(0x02));
+    const bogus_peer = ctap2pin.PublicKey{ .x = @as([32]u8, @splat(0)), .y = @as([32]u8, @splat(0)) };
     var z: [32]u8 = undefined;
     if (ctap2pin.ecdhZ(&z, &platform_scalar, bogus_peer)) |_| {
         return error.UnexpectedAccept;
@@ -146,7 +146,7 @@ fn checkBadPeerKeyRejected() !void {
 /// 2.1's own contract: "regenerate and retry") rather than silently
 /// producing the point at infinity.
 fn checkZeroScalarRejected() !void {
-    const zero_scalar = [_]u8{0} ** 32;
+    const zero_scalar = @as([32]u8, @splat(0));
     if (ctap2pin.publicKeyFromScalar(&zero_scalar)) |_| {
         return error.UnexpectedAccept;
     } else |err| switch (err) {
@@ -175,9 +175,9 @@ pub fn main() !void {
     // header. Kept only so a leak introduced by a future edit here would
     // still be caught.
 
-    const auth_scalar = [_]u8{0x01} ** 32;
-    const platform_scalar_one = [_]u8{0x02} ** 32;
-    const platform_scalar_two = [_]u8{0x03} ** 32; // a genuinely different platform key pair for the second session
+    const auth_scalar = @as([32]u8, @splat(0x01));
+    const platform_scalar_one = @as([32]u8, @splat(0x02));
+    const platform_scalar_two = @as([32]u8, @splat(0x03)); // a genuinely different platform key pair for the second session
 
     try runProtocol(.one, auth_scalar, platform_scalar_one);
     try runProtocol(.two, auth_scalar, platform_scalar_two);

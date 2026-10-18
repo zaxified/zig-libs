@@ -1281,8 +1281,8 @@ test "BOLT#12 KAT: invoice_request Merkle root + signature verify — signature-
     var threaded = std.Io.Threaded.init(allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
-    const bob_sk = try bip340.SecretKey.fromBytes([_]u8{0x42} ** 32);
-    const signed = try signMerkle(allocator, stream.items, invoice_request_sig_tag, &bob_sk, [_]u8{0} ** 32, io);
+    const bob_sk = try bip340.SecretKey.fromBytes(@as([32]u8, @splat(0x42)));
+    const signed = try signMerkle(allocator, stream.items, invoice_request_sig_tag, &bob_sk, @as([32]u8, @splat(0)), io);
     try testing.expectEqualSlices(u8, sig_buf, &signed);
 }
 
@@ -1314,21 +1314,21 @@ test "BOLT#12 round-trip: build+sign+decode+verify an invoice_request" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const sk = try bip340.SecretKey.fromBytes([_]u8{0x11} ** 32);
+    const sk = try bip340.SecretKey.fromBytes(@as([32]u8, @splat(0x11)));
     var kp: bip340.KeyPair = undefined;
     try bip340.KeyPair.fromSecretKey(&kp, &sk);
     var payer_id: [33]u8 = undefined;
     payer_id[0] = 0x02; // BIP-340 pubkey is always even-y
     payer_id[1..33].* = kp.public.x;
 
-    const metadata = [_]u8{0xab} ** 8;
+    const metadata = @as([8]u8, @splat(0xab));
     const records = [_]lnwire.RawRecord{
         .{ .type = IREQ_METADATA, .value = &metadata },
         .{ .type = TYPE_CURRENCY, .value = "EUR" },
         .{ .type = TYPE_AMOUNT, .value = &.{0x64} }, // 100
         .{ .type = INVREQ_PAYER_ID, .value = &payer_id },
     };
-    const lnr = try encodeSignedInvoiceRequest(allocator, &records, &sk, [_]u8{0} ** 32, io);
+    const lnr = try encodeSignedInvoiceRequest(allocator, &records, &sk, @as([32]u8, @splat(0)), io);
     defer allocator.free(lnr);
     try testing.expect(std.mem.startsWith(u8, lnr, "lnr1"));
 
@@ -1338,7 +1338,7 @@ test "BOLT#12 round-trip: build+sign+decode+verify an invoice_request" {
     try testing.expect(try ir.verify(allocator));
 
     // Wrong signer: swap in a different valid pubkey → verify fails.
-    const sk2 = try bip340.SecretKey.fromBytes([_]u8{0x22} ** 32);
+    const sk2 = try bip340.SecretKey.fromBytes(@as([32]u8, @splat(0x22)));
     var kp2: bip340.KeyPair = undefined;
     try bip340.KeyPair.fromSecretKey(&kp2, &sk2);
     var other = payer_id;
@@ -1353,21 +1353,21 @@ test "A1 F11 x lninvoice (round-2 Q4): a payer_id with a non-SEC1 prefix from th
     defer threaded.deinit();
     const io = threaded.io();
 
-    const sk = try bip340.SecretKey.fromBytes([_]u8{0x11} ** 32);
+    const sk = try bip340.SecretKey.fromBytes(@as([32]u8, @splat(0x11)));
     var kp: bip340.KeyPair = undefined;
     try bip340.KeyPair.fromSecretKey(&kp, &sk);
     var payer_id: [33]u8 = undefined;
     payer_id[0] = 0x02;
     payer_id[1..33].* = kp.public.x;
 
-    const metadata = [_]u8{0xab} ** 8;
+    const metadata = @as([8]u8, @splat(0xab));
     const records = [_]lnwire.RawRecord{
         .{ .type = IREQ_METADATA, .value = &metadata },
         .{ .type = TYPE_CURRENCY, .value = "EUR" },
         .{ .type = TYPE_AMOUNT, .value = &.{0x64} },
         .{ .type = INVREQ_PAYER_ID, .value = &payer_id },
     };
-    const lnr = try encodeSignedInvoiceRequest(allocator, &records, &sk, [_]u8{0} ** 32, io);
+    const lnr = try encodeSignedInvoiceRequest(allocator, &records, &sk, @as([32]u8, @splat(0)), io);
     defer allocator.free(lnr);
 
     var ir = try decodeInvoiceRequest(allocator, lnr);
@@ -1394,21 +1394,21 @@ test "BOLT#12 round-trip: build+sign+decode+verify an invoice" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const sk = try bip340.SecretKey.fromBytes([_]u8{0x33} ** 32);
+    const sk = try bip340.SecretKey.fromBytes(@as([32]u8, @splat(0x33)));
     var kp: bip340.KeyPair = undefined;
     try bip340.KeyPair.fromSecretKey(&kp, &sk);
     var node_id: [33]u8 = undefined;
     node_id[0] = 0x02;
     node_id[1..33].* = kp.public.x;
 
-    const payment_hash = [_]u8{0xcd} ** 32;
+    const payment_hash = @as([32]u8, @splat(0xcd));
     const records = [_]lnwire.RawRecord{
         .{ .type = INVOICE_CREATED_AT, .value = &.{ 0x66, 0x00, 0x00, 0x00 } },
         .{ .type = INVOICE_PAYMENT_HASH, .value = &payment_hash },
         .{ .type = INVOICE_AMOUNT, .value = &.{ 0x27, 0x10 } }, // 10000
         .{ .type = INVOICE_NODE_ID, .value = &node_id },
     };
-    const lni = try encodeSignedInvoice(allocator, &records, &sk, [_]u8{0} ** 32, io);
+    const lni = try encodeSignedInvoice(allocator, &records, &sk, @as([32]u8, @splat(0)), io);
     defer allocator.free(lni);
     try testing.expect(std.mem.startsWith(u8, lni, "lni1"));
 
@@ -1542,8 +1542,8 @@ test "BOLT#12 KAT: invoice ENCODE byte-exact against lni1 string — payer-proof
 
     // `invoice_node_id`'s own secret key from `payer-proof-test.json`'s
     // "keys" object (secret 0x46 repeated 32 times, same as the KAT above).
-    const sk = try bip340.SecretKey.fromBytes([_]u8{0x46} ** 32);
-    const got = try encodeSignedInvoice(allocator, records.items, &sk, [_]u8{0} ** 32, io);
+    const sk = try bip340.SecretKey.fromBytes(@as([32]u8, @splat(0x46)));
+    const got = try encodeSignedInvoice(allocator, records.items, &sk, @as([32]u8, @splat(0)), io);
     defer allocator.free(got);
 
     try testing.expectEqualStrings(invoice_encode_kat_want, got);
@@ -1603,8 +1603,8 @@ test "BOLT#12 KAT: invoice ENCODE byte-exact against lni1 string — payer-proof
         try records.append(allocator, .{ .type = f.type, .value = val });
     }
 
-    const sk = try bip340.SecretKey.fromBytes([_]u8{0x46} ** 32);
-    const got = try encodeSignedInvoice(allocator, records.items, &sk, [_]u8{0} ** 32, io);
+    const sk = try bip340.SecretKey.fromBytes(@as([32]u8, @splat(0x46)));
+    const got = try encodeSignedInvoice(allocator, records.items, &sk, @as([32]u8, @splat(0)), io);
     defer allocator.free(got);
 
     try testing.expectEqualStrings(want_lni1, got);
@@ -2065,24 +2065,24 @@ const bolt12_seeds = [_][]const u8{
     // Four records walking `known_offer_types` upward (indices 1, 3, 5, 7),
     // `lno` as the HRP, no string damage: the shape that reaches
     // `decodeOffer`'s per-record semantics rather than the TLV walk in front.
-    seed("01" ++ ("0101010101AA" ** 4) ++ "00" ++ "00" ++ "00"),
+    seed("01" ++ (strRepeat("0101010101AA", 4)) ++ "00" ++ "00" ++ "00"),
     // The same records with the string damaged: a `+` continuation at 0 and an
     // uppercase run at 5, both of which have their own path in
     // `stripContinuation` / `decodeNoChecksum`.
-    seed("01" ++ ("0101010101AA" ** 4) ++ "00" ++ "00" ++ "01" ++
+    seed("01" ++ (strRepeat("0101010101AA", 4)) ++ "00" ++ "00" ++ "01" ++
         "01" ++ "00" ++ "00" ++ "01" ++ "05" ++ "02" ++ "00"),
     // The same records under `lni`, so `decodeInvoice`'s envelope opens.
-    seed("01" ++ ("0101010101AA" ** 4) ++ "00" ++ "02" ++ "00"),
+    seed("01" ++ (strRepeat("0101010101AA", 4)) ++ "00" ++ "02" ++ "00"),
     // ... and under `lnr`, the invoice_request envelope.
-    seed("01" ++ ("0101010101AA" ** 4) ++ "00" ++ "01" ++ "00"),
+    seed("01" ++ (strRepeat("0101010101AA", 4)) ++ "00" ++ "01" ++ "00"),
     // One record whose declared length is 65535 against 64 octets that follow:
     // the over-claim `parseTlvStream` and `merkleRoot` must fail closed on.
-    seed("01" ++ "01" ++ "01" ++ "01" ++ "00" ++ "FFFF" ++ ("AA" ** 64) ++ "00" ++ "00" ++ "00"),
+    seed("01" ++ "01" ++ "01" ++ "01" ++ "00" ++ "FFFF" ++ (strRepeat("AA", 64)) ++ "00" ++ "00" ++ "00"),
     // Types drawn from the number spaces rather than the offer list — the
     // 235..1005 signature exclusion, which no `known_offer_types` walk visits.
-    seed("01" ++ ("01" ++ "00" ++ "02" ++ "0080" ++ "01" ++ "04" ++ "AAAAAAAA") ** 3 ++ "00" ++ "00" ++ "00"),
+    seed("01" ++ strRepeat(("01" ++ "00" ++ "02" ++ "0080" ++ "01" ++ "04" ++ "AAAAAAAA"), 3) ++ "00" ++ "00" ++ "00"),
     // Pure entropy, the minority arm the first octet selects: 64 octets.
-    seed("00" ++ "40" ++ ("5A" ** 64) ++ "00" ++ "00"),
+    seed("00" ++ "40" ++ (strRepeat("5A", 64)) ++ "00" ++ "00"),
     // Pure entropy of length 0 — the EMPTY stream, and exactly what the
     // collapsed harness produced on every input for its whole life.
     seed("00" ++ "00" ++ "00" ++ "00"),
@@ -2160,4 +2160,16 @@ test "corpus: every BOLT#12 script builds a stream, and what the parsers made of
     const zero = try runBolt12Script(allocator, &.{});
     try testing.expectEqual(@as(usize, 0), zero.stream_len);
     try testing.expectEqual(@as(usize, 0), zero.records);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

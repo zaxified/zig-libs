@@ -451,7 +451,7 @@ const readstring_seeds = [_][]const u8{
     testkit.fuzz.seedHex("00100001"), // one past it: StringTooLarge
     testkit.fuzz.seedHex("ffffffff"), // 4 GiB announced: StringTooLarge
     testkit.fuzz.seedHex("0000"), // header truncated: EndOfStream
-    testkit.fuzz.seed("\x00\x00\x02\xbc" ++ ("A" ** 700)), // the widest body
+    testkit.fuzz.seed("\x00\x00\x02\xbc" ++ (strRepeat("A", 700))), // the widest body
     testkit.fuzz.seed(""),
 };
 
@@ -534,7 +534,7 @@ const readmpint_seeds = [_][]const u8{
     testkit.fuzz.seedHex("0000000300000f"), // two leading zeros, only one stripped
     testkit.fuzz.seedHex("000000020001"), // a redundant pad on a small value
     testkit.fuzz.seedHex("0000006000") ++ "", // 96 announced, 1 present: EndOfStream
-    testkit.fuzz.seed("\x00\x00\x00\x60" ++ ("\x00" ++ ("Z" ** 95))), // widest, padded
+    testkit.fuzz.seed("\x00\x00\x00\x60" ++ ("\x00" ++ (strRepeat("Z", 95)))), // widest, padded
     testkit.fuzz.seedHex("00100001"), // StringTooLarge, through readString
     testkit.fuzz.seed(""),
 };
@@ -611,4 +611,16 @@ test "corpus: every readMpint seed reaches the reader, and the counts are pinned
     try std.testing.expectEqual(@as(usize, 6), accepted);
     try std.testing.expectEqual(@as(usize, 100), octets);
     try std.testing.expectEqual(@as(usize, 4), stripped);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

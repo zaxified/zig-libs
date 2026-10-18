@@ -64,7 +64,7 @@ fn replicated(gpa: std.mem.Allocator, small: []const Entry) BrotliError!Table {
 /// Build a table from per-symbol `code_lengths` (complex prefix code, 3.5).
 /// Enforces a complete (Kraft-equality) code, except the single-symbol case.
 pub fn buildComplex(gpa: std.mem.Allocator, code_lengths: []const u8) BrotliError!Table {
-    var count = [_]u16{0} ** 16;
+    var count = @as([16]u16, @splat(0));
     var max_len: u5 = 0;
     var nonzero: usize = 0;
     var last_sym: u16 = 0;
@@ -87,7 +87,7 @@ pub fn buildComplex(gpa: std.mem.Allocator, code_lengths: []const u8) BrotliErro
     }
     if (total != (@as(u32, 1) << max_len)) return error.InvalidHuffman;
 
-    var next_code = [_]u32{0} ** 16;
+    var next_code = @as([16]u32, @splat(0));
     var code: u32 = 0;
     len = 1;
     while (len <= max_len) : (len += 1) {
@@ -102,7 +102,7 @@ pub fn buildComplex(gpa: std.mem.Allocator, code_lengths: []const u8) BrotliErro
     // `root` bits (MSB-first: `key`). In canonical order the codes under one
     // key are contiguous and, the code being complete, fill its subtree; the
     // subtable is as deep as the longest of them.
-    var sub_max = [_]u5{0} ** (1 << root_bits);
+    var sub_max = @as([1 << root_bits]u5, @splat(0));
     if (max_len > root) {
         var nc = next_code;
         for (code_lengths) |l| {
@@ -115,7 +115,7 @@ pub fn buildComplex(gpa: std.mem.Allocator, code_lengths: []const u8) BrotliErro
             sub_max[key] = @max(sub_max[key], L);
         }
     }
-    var sub_off = [_]u16{0} ** (1 << root_bits);
+    var sub_off = @as([1 << root_bits]u16, @splat(0));
     var size = root_size;
     for (sub_max[0..root_size], sub_off[0..root_size]) |m, *off| {
         if (m == 0) continue;

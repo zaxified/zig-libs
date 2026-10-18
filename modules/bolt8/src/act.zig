@@ -275,11 +275,11 @@ const act1_seeds = [_][]const u8{
     // this tail instead of rejecting it (BOLT#8: "Read _exactly_ N bytes");
     // now this seed is REJECTED (ShortRead), which is what the "accepted"
     // count below counts.
-    testkit.fuzz.seed(&(kv.act1_bytes.* ++ [_]u8{0xAB} ** 32)),
+    testkit.fuzz.seed(&(kv.act1_bytes.* ++ @as([32]u8, @splat(0xAB)))),
     // Version 0 with every field zero — a third distinct ephemeral key, and
     // the shape the all-zero fuzz round would have produced had the length
     // draw not collapsed to 0 before it.
-    testkit.fuzz.seed(&[_]u8{0x00} ** act1_len),
+    testkit.fuzz.seed(&@as([act1_len]u8, @splat(0x00))),
     // The one input this target actually ran, for ever, before the corpus.
     testkit.fuzz.seed(""),
 };
@@ -382,9 +382,9 @@ const act2_seeds = [_][]const u8{
     // "transport-initiator act2 short read test": 49 octets -> ShortRead.
     testkit.fuzz.seed(kv.act2_bytes[0 .. act2_len - 1]),
     // Trailing octets past the act, filling the buffer — F9: now rejected.
-    testkit.fuzz.seed(&(kv.act2_bytes.* ++ [_]u8{0xAB} ** 32)),
+    testkit.fuzz.seed(&(kv.act2_bytes.* ++ @as([32]u8, @splat(0xAB)))),
     // All-zero act: version 0, a third distinct key.
-    testkit.fuzz.seed(&[_]u8{0x00} ** act2_len),
+    testkit.fuzz.seed(&@as([act2_len]u8, @splat(0x00))),
     testkit.fuzz.seed(""),
 };
 
@@ -439,9 +439,9 @@ const act3_seeds = [_][]const u8{
     // "transport-responder act3 short read test": 65 octets -> ShortRead.
     testkit.fuzz.seed(kv.act3_bytes[0 .. act3_len - 1]),
     // Trailing octets past the act, filling the buffer — F9: now rejected.
-    testkit.fuzz.seed(&(kv.act3_bytes.* ++ [_]u8{0xAB} ** 32)),
+    testkit.fuzz.seed(&(kv.act3_bytes.* ++ @as([32]u8, @splat(0xAB)))),
     // All-zero act: version 0, a fourth distinct `c`.
-    testkit.fuzz.seed(&[_]u8{0x00} ** act3_len),
+    testkit.fuzz.seed(&@as([act3_len]u8, @splat(0x00))),
     testkit.fuzz.seed(""),
 };
 

@@ -1009,7 +1009,7 @@ test "F4: a duplicate CAPABILITY name does not leak its own copy" {
 
 test "F11: hasCap sees a capability name longer than the old 64-byte buffer" {
     var p: Peer = undefined;
-    const long_name = "AUTH=" ++ "X" ** 70; // 75 bytes, well over the old buf[64]
+    const long_name = "AUTH=" ++ strRepeat("X", 70); // 75 bytes, well over the old buf[64]
     p.init("* OK [CAPABILITY IMAP4rev2] Service Ready\r\n" ++
         "* CAPABILITY " ++ long_name ++ "\r\n" ++
         "T1 OK CAPABILITY completed\r\n");
@@ -1020,7 +1020,7 @@ test "F11: hasCap sees a capability name longer than the old 64-byte buffer" {
     _ = try c.capability();
     try testing.expect(c.caps.contains(long_name)); // it WAS stored
     try testing.expect(c.hasCap(long_name)); // and hasCap must see it
-    try testing.expect(c.hasCap("auth=" ++ "x" ** 70)); // case-insensitively
+    try testing.expect(c.hasCap("auth=" ++ strRepeat("x", 70))); // case-insensitively
 }
 
 test "RFC 9051 §6.2.3: LOGINDISABLED refuses LOGIN instead of sending the password" {
@@ -1503,7 +1503,7 @@ test "untagged noise during FETCH and SEARCH is parsed in the per-line arena, no
     var script: std.ArrayList(u8) = .empty;
     defer script.deinit(gpa);
     try script.appendSlice(gpa, "* PREAUTH ok\r\nT1 OK [READ-WRITE] SELECT completed\r\n");
-    const noise = "* NOISE " ++ "x" ** 900 ++ "\r\n";
+    const noise = "* NOISE " ++ strRepeat("x", 900) ++ "\r\n";
     for (0..2000) |_| try script.appendSlice(gpa, noise);
     try script.appendSlice(gpa, "* 12 FETCH (UID 7 FLAGS (\\Seen))\r\nT2 OK FETCH completed\r\n");
     for (0..2000) |_| try script.appendSlice(gpa, noise);
@@ -1600,3 +1600,15 @@ test "IDLE: polling outside an IDLE, and nesting one, are both refused" {
 //     deleted, because the shape of that mistake — a divergence note
 //     describing the design intent instead of the code — is the thing to
 //     watch for.
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
+}

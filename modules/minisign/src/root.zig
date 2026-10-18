@@ -1721,7 +1721,7 @@ const comment_seeds = [_][]const u8{
     fuzzSeed("overlong\xc0\x80"), // an overlong encoding
     fuzzSeed("\xed\xa0\x80"), // a surrogate, which UTF-8 forbids
     fuzzSeed("\xff\xfe"), // octets that are never a lead
-    fuzzSeed("a" ** 64), // the full harness buffer
+    fuzzSeed(strRepeat("a", 64)), // the full harness buffer
     fuzzSeed(""), // the empty comment, and the ONE input the collapsed harness ran
 };
 
@@ -1926,4 +1926,16 @@ test "writers refuse a carriage return and an unprintable trusted comment" {
     try std.testing.expectError(error.EmbeddedNewline, writePublicKeyFile(&w, "bad\rcomment", pk));
     const sig: RawSignature = .{ .sig_alg = sig_alg_prehashed, .key_number = @splat(0), .signature = @splat(0) };
     try std.testing.expectError(error.UnprintableComment, writeSignatureFile(&w, "ok", sig, "esc\x1b[31m", @splat(0)));
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

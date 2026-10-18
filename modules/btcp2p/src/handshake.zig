@@ -240,10 +240,10 @@ test "hostile: decodeVersion with a user_agent length prefix exceeding remaining
 const version_seeds = [_][]const u8{
     seed(&wiki_version_payload), // the wiki's 60002 payload: no relay octet (pre-BIP37)
     seed(&(wiki_version_payload ++ [_]u8{0x01})), // the same with BIP37's relay = true appended
-    seedHex("00" ** 80 ++ "00" ++ "00000000"), // an empty user_agent
-    seedHex("00" ** 80 ++ "fd0001" ++ "61" ** 256 ++ "00000000"), // a user_agent exactly at max_subversion_length
-    seedHex("00" ** 80 ++ "fd0101" ++ "61" ** 257 ++ "00000000"), // SubversionTooLong: one octet over
-    seedHex("00" ** 80 ++ "fdff00"), // Truncated: claims 255 user_agent octets, none follow
+    seedHex(strRepeat("00", 80) ++ "00" ++ "00000000"), // an empty user_agent
+    seedHex(strRepeat("00", 80) ++ "fd0001" ++ strRepeat("61", 256) ++ "00000000"), // a user_agent exactly at max_subversion_length
+    seedHex(strRepeat("00", 80) ++ "fd0101" ++ strRepeat("61", 257) ++ "00000000"), // SubversionTooLong: one octet over
+    seedHex(strRepeat("00", 80) ++ "fdff00"), // Truncated: claims 255 user_agent octets, none follow
     seedHex("62ea0000" ++ "0100000000000000"), // Truncated: cut mid addr_recv, the hostile test's payload
 };
 
@@ -325,4 +325,16 @@ test "external anchor: max_subversion_length is Bitcoin Core's MAX_SUBVERSION_LE
     // 256;` and `CNode::SetSubVersion` truncates to it, so a peer that sends
     // more is talking to something that is not Bitcoin Core.
     try testing.expectEqual(@as(usize, 256), max_subversion_length);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

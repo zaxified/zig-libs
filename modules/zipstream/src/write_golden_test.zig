@@ -114,7 +114,7 @@ const golden: []const u8 = @embedFile("testdata/write_golden.zip");
 const stored_name = "stored.txt";
 const stored_data = "plain stored payload for the external zip oracle\n";
 const deflated_name = "deflated.txt";
-const deflated_data = "the quick brown fox jumps over the lazy dog. " ** 40;
+const deflated_data = strRepeat("the quick brown fox jumps over the lazy dog. ", 40);
 
 // Fixed-size ZIP records (APPNOTE.TXT), used to re-derive the offsets below
 // independently of `zipinfo -v`'s own report, as a sanity cross-check.
@@ -286,4 +286,16 @@ test "golden: fixture size + entry count canary" {
     try testing.expectEqual(@as(usize, 327), golden.len);
     const eocd = readStructAt(std.zip.EndRecord, golden, eocd_off);
     try testing.expectEqual(@as(u16, 2), eocd.record_count_total);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

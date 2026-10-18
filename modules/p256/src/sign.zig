@@ -274,7 +274,7 @@ pub const SignError = error{ InvalidSecretKey, InvalidNonce };
 /// 32-byte hash or field x-coordinate can exceed `n`, so a plain `fromBytes`
 /// would wrongly reject it). This is the ECDSA `e = int(H(m))` and `x(R) mod n`.
 fn reduceToScalar(bytes32: [32]u8) Scalar {
-    var wide = [_]u8{0} ** 48;
+    var wide = @as([48]u8, @splat(0));
     wide[16..48].* = bytes32;
     return Scalar.fromBytes48(wide, .big);
 }
@@ -358,7 +358,7 @@ pub fn derToRaw(sig_der: []const u8) ?[64]u8 {
     if (body.len_bytes + 1 + body.len != sig_der.len) return null; // trailing data
     var rest = sig_der[1 + body.len_bytes ..][0..body.len];
 
-    var out = [_]u8{0} ** 64;
+    var out = @as([64]u8, @splat(0));
     inline for (.{ 0, 32 }) |off| {
         if (rest.len < 2 or rest[0] != 0x02) return null;
         const int = readLen(rest[1..]) orelse return null;
@@ -429,8 +429,8 @@ pub fn rawToDer(sig_rs: [64]u8, buf: *[der_max_len]u8) []const u8 {
 fn rfc6979Nonce(privkey: [32]u8, hash32: [32]u8) Scalar {
     const h1 = reduceToScalar(hash32).toBytes(.big);
 
-    var v: [32]u8 = [_]u8{0x01} ** 32;
-    var k: [32]u8 = [_]u8{0x00} ** 32;
+    var v: [32]u8 = @as([32]u8, @splat(0x01));
+    var k: [32]u8 = @as([32]u8, @splat(0x00));
 
     var buf: [32 + 1 + 32 + 32]u8 = undefined;
     buf[0..32].* = v;
@@ -571,7 +571,7 @@ pub fn ecdsaVerifyDigest(pubkey_sec1: []const u8, digest: []const u8, sig_rs: [6
     const s = Scalar.fromBytes(sig_rs[32..64].*, .big) catch return false;
     if (r.isZero() or s.isZero()) return false;
 
-    var h = [_]u8{0} ** 32;
+    var h = @as([32]u8, @splat(0));
     const take = @min(digest.len, 32);
     @memcpy(h[32 - take ..], digest[0..take]);
     const e = reduceToScalar(h);
@@ -603,8 +603,8 @@ pub fn ecdsaVerifyDigest(pubkey_sec1: []const u8, digest: []const u8, sig_rs: [6
 // A minimal round-trip smoke test (the deep anchors live in oracle_test.zig +
 // kat_test.zig).
 test "ecdsa sign→verify round-trip (fixed key + nonce)" {
-    const sk = [_]u8{0x11} ** 32;
-    const k = [_]u8{0x22} ** 32;
+    const sk = @as([32]u8, @splat(0x11));
+    const k = @as([32]u8, @splat(0x22));
     const msg = "p256 scaffold smoke";
     const sig = try ecdsaSign(&sk, msg, &k);
     const pk = (P256.combMulBase(sk, .big) catch unreachable).toUncompressedSec1();
@@ -624,7 +624,7 @@ test "ecdsaVerifyDigest agrees with std's Ecdsa(P256, SHA-384/512/224) and with 
     const Curve = std.crypto.ecc.P256;
     inline for (.{ std.crypto.hash.sha2.Sha384, std.crypto.hash.sha2.Sha512, std.crypto.hash.sha2.Sha224, Sha256 }) |H| {
         const E = StdEcdsa(Curve, H);
-        const kp = E.KeyPair.generateDeterministic([_]u8{0x5a} ** E.KeyPair.seed_length) catch unreachable;
+        const kp = E.KeyPair.generateDeterministic(@as([E.KeyPair.seed_length]u8, @splat(0x5a))) catch unreachable;
         const pk = kp.public_key.toUncompressedSec1();
         var i: u8 = 0;
         while (i < 8) : (i += 1) {
@@ -643,7 +643,7 @@ test "ecdsaVerifyDigest agrees with std's Ecdsa(P256, SHA-384/512/224) and with 
             try std.testing.expect(!ecdsaVerifyDigest(&pk, &d, sig.toBytes()));
         }
     }
-    try std.testing.expect(!ecdsaVerifyDigest(&([_]u8{4} ++ [_]u8{0} ** 64), "", [_]u8{1} ** 64));
+    try std.testing.expect(!ecdsaVerifyDigest(&([_]u8{4} ++ @as([64]u8, @splat(0))), "", @as([64]u8, @splat(1))));
 }
 
 test "ecdsaVerify: r=0 and s=0 are rejected explicitly (never fed to any test before)" {
@@ -659,8 +659,8 @@ test "ecdsaVerify: r=0 and s=0 are rejected explicitly (never fed to any test be
     // 6979-adjacent "r, s in [1, n-1]") rather than the only thing
     // standing between here and a forgery. Pinned directly regardless,
     // matching this module's own sign-side r=0/s=0 rejection tests.
-    const sk = [_]u8{0x11} ** 32;
-    const k = [_]u8{0x22} ** 32;
+    const sk = @as([32]u8, @splat(0x11));
+    const k = @as([32]u8, @splat(0x22));
     const msg = "p256 zero r/s smoke";
     const sig = try ecdsaSign(&sk, msg, &k);
     const pk = (P256.combMulBase(sk, .big) catch unreachable).toUncompressedSec1();
@@ -680,7 +680,7 @@ test "ecdsaVerify: r=0 and s=0 are rejected explicitly (never fed to any test be
 // jwt/jwe rewire relies on.
 test "EcdsaP256Sha256 cross-verifies with std both directions" {
     const Std = std.crypto.sign.ecdsa.EcdsaP256Sha256;
-    const seed = [_]u8{0x37} ** Std.KeyPair.seed_length;
+    const seed = @as([Std.KeyPair.seed_length]u8, @splat(0x37));
     const kp = try EcdsaP256Sha256.KeyPair.generateDeterministic(seed);
     const std_kp = try Std.KeyPair.generateDeterministic(seed);
 
@@ -709,8 +709,8 @@ test "EcdsaP256Sha256 cross-verifies with std both directions" {
 fn rfc6979NonceOld(privkey: [32]u8, hash32: [32]u8) Scalar {
     const h1 = reduceToScalar(hash32).toBytes(.big);
 
-    var v: [32]u8 = [_]u8{0x01} ** 32;
-    var k: [32]u8 = [_]u8{0x00} ** 32;
+    var v: [32]u8 = @as([32]u8, @splat(0x01));
+    var k: [32]u8 = @as([32]u8, @splat(0x00));
 
     var buf: [32 + 1 + 32 + 32]u8 = undefined;
     buf[0..32].* = v;

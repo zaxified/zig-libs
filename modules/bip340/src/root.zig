@@ -325,7 +325,7 @@ pub const Signature = struct {
 /// so a plain `Scalar.fromBytes` (which REJECTS non-canonical values
 /// instead of reducing them) would be wrong here.
 fn reduceToScalar(bytes32: [32]u8) Scalar {
-    var wide = [_]u8{0} ** 48;
+    var wide = @as([48]u8, @splat(0));
     wide[16..48].* = bytes32;
     return Scalar.fromBytes48(wide, .big);
 }
@@ -743,7 +743,7 @@ pub fn verifyBatch(items: []const BatchItem, io: std.Io) bool {
         filled += 2;
         const last = i + 1 == items.len;
         if (filled == pts.len or last) {
-            const g_s = if (last) lhs_scalar.toBytes(.big) else [_]u8{0} ** 32;
+            const g_s = if (last) lhs_scalar.toBytes(.big) else @as([32]u8, @splat(0));
             // Every base was lifted above, so `IdentityElement` can only mean
             // this chunk's partial sum is O: it contributes nothing.
             if (Secp256k1.mulMultiBasePublic(g_s, pts[0..filled], scs[0..filled], .big)) |part| {
@@ -817,9 +817,9 @@ test "xonlyBytesOf: A1 F11 -- a 33-byte input with a non-SEC1 prefix is rejected
 }
 
 test "A1 F5 (round-2 follow-up): signImpl enforces step 10 on the REAL production path, not just in a standalone check function" {
-    const sk = try SecretKey.fromBytes([_]u8{0x11} ** 32);
+    const sk = try SecretKey.fromBytes(@as([32]u8, @splat(0x11)));
     const msg = "A1 F5 regression";
-    const aux_rand = [_]u8{0xAB} ** 32;
+    const aux_rand = @as([32]u8, @splat(0xAB));
 
     // Positive control: signImpl with the real computation is exactly what
     // sign() does -- same bytes, no regression from the seam.
@@ -857,23 +857,23 @@ test "SecretKey.fromBytes REJECTS the all-zero scalar (d == 0 is not in [1, n-1]
     // No official BIP340 test vector exercises this (all 8 secret-key
     // vectors are valid, nonzero scalars) — the zero-scalar guard is
     // otherwise unexercised by any KAT test.
-    try std.testing.expectError(error.InvalidSecretKey, SecretKey.fromBytes([_]u8{0} ** 32));
+    try std.testing.expectError(error.InvalidSecretKey, SecretKey.fromBytes(@as([32]u8, @splat(0))));
 }
 
 test "KeyPair.fromSecretKey REJECTS a hand-constructed all-zero SecretKey (defense-in-depth re-check)" {
     // SecretKey.bytes is a public field, so a SecretKey can be
     // hand-constructed bypassing fromBytes's own zero-check entirely —
     // KeyPair.fromSecretKey re-validates for exactly this reason.
-    const zero_sk = SecretKey{ .bytes = [_]u8{0} ** 32 };
+    const zero_sk = SecretKey{ .bytes = @as([32]u8, @splat(0)) };
     var zero_kp: KeyPair = undefined;
     try std.testing.expectError(error.InvalidSecretKey, KeyPair.fromSecretKey(&zero_kp, &zero_sk));
 }
 
 test "KeyPair.deinit zeroizes the effective signing scalar but leaves public untouched (regression: fails if secureZero is removed)" {
-    const sk = try SecretKey.fromBytes([_]u8{0x01} ** 32);
+    const sk = try SecretKey.fromBytes(@as([32]u8, @splat(0x01)));
     var kp: KeyPair = undefined;
     try KeyPair.fromSecretKey(&kp, &sk);
-    const zero: [32]u8 = [_]u8{0} ** 32;
+    const zero: [32]u8 = @as([32]u8, @splat(0));
     try std.testing.expect(!std.mem.eql(u8, &kp.secret, &zero));
     kp.deinit();
     try std.testing.expectEqualSlices(u8, &zero, &kp.secret);

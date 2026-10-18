@@ -576,7 +576,7 @@ fn decodeResponse(r: *Resolver, raw: []const u8, id: u16, name: []const u8, ty: 
 /// Go's fallback when resolv.conf is missing or names no servers.
 const default_servers = [_]netaddr.Ip{
     .{ .v4 = .{ 127, 0, 0, 1 } },
-    .{ .v6 = [_]u8{0} ** 15 ++ [_]u8{1} },
+    .{ .v6 = @as([15]u8, @splat(0)) ++ [_]u8{1} },
 };
 
 fn serverList(r: *Resolver) Error![]const netaddr.Ip {
@@ -1002,7 +1002,7 @@ fn jsonQueryUrl(gpa: std.mem.Allocator, url: []const u8, name: []const u8, ty: m
             try out.appendSlice(gpa, &.{ '%', hex[b >> 4], hex[b & 0xf] });
         }
     }
-    try out.print(gpa, "&type={d}", .{@intFromEnum(ty)});
+    try out.print(gpa, "&type={d}", .{@backingInt(ty)});
     return out.toOwnedSlice(gpa);
 }
 
@@ -1290,8 +1290,8 @@ test "jsonQueryUrl: the name is validated like the wire path and percent-encoded
 
     // And what the wire path refuses, this refuses by the same name.
     try testing.expectError(error.BadName, jsonQueryUrl(gpa, "https://x.test/r", "a..b", .a));
-    try testing.expectError(error.BadName, jsonQueryUrl(gpa, "https://x.test/r", "a" ** 64 ++ ".test", .a));
-    try testing.expectError(error.NameTooLong, jsonQueryUrl(gpa, "https://x.test/r", ("abcdefg." ** 32) ++ "x", .a));
+    try testing.expectError(error.BadName, jsonQueryUrl(gpa, "https://x.test/r", strRepeat("a", 64) ++ ".test", .a));
+    try testing.expectError(error.NameTooLong, jsonQueryUrl(gpa, "https://x.test/r", (strRepeat("abcdefg.", 32)) ++ "x", .a));
 }
 
 test "effectiveTimeoutMs/effectiveAttempts: resolv.conf wins only when Options was left at its own default (audit F10)" {
@@ -1624,7 +1624,7 @@ const EchoStub = struct {
             st.ids[n] = std.mem.readInt(u16, q[0..2], .big);
             st.served += 1;
             const question = q[message.header_len..][0..questionLen(q[message.header_len..])];
-            const is_a = std.mem.readInt(u16, question[question.len - 4 ..][0..2], .big) == @intFromEnum(message.Type.a);
+            const is_a = std.mem.readInt(u16, question[question.len - 4 ..][0..2], .big) == @backingInt(message.Type.a);
             var first: [512]u8 = undefined;
             switch (st.mode) {
                 .a_only => {},
@@ -2241,7 +2241,7 @@ test "query: the servers asked per rcode are the ones glibc asked (SERVFAIL, NOT
         var msg = try res;
         defer msg.deinit();
         // The reply handed back is the last one, whatever its rcode.
-        try testing.expectEqual(@as(u12, fx.rcode), @intFromEnum(msg.rcode()));
+        try testing.expectEqual(@as(u12, fx.rcode), @backingInt(msg.rcode()));
         try testing.expectEqual(fx.tried.len, log.slice().len);
         for (fx.tried, log.slice()) |want, n| {
             var buf: [16]u8 = undefined;
@@ -2261,7 +2261,7 @@ test "query: a refusing first server is skipped and the second server's answer r
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
-    const refused: u4 = @intCast(@intFromEnum(message.Rcode.refused));
+    const refused: u4 = @intCast(@backingInt(message.Rcode.refused));
     var log: RcodeLog = .{};
     var stubs = bindRcodeStubs(io, .{ refused, null, null }, &log) orelse
         return testkit.loopbackSkip("127.0.0.1-3 not bindable on one port", .{});
@@ -2276,4 +2276,16 @@ test "query: a refusing first server is skipped and the second server's answer r
     defer msg.deinit();
     try expectOnlyHonestA(&msg);
     try testing.expectEqualSlices(u8, &.{ 1, 2 }, log.slice());
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

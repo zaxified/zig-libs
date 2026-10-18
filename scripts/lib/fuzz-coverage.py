@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Read Zig 0.16's fuzz coverage maps without trusting the build runner's report.
+"""Read Zig's fuzz coverage maps without trusting the build runner's report.
+
+Zig 0.17 (2026-10-18): unchanged. The map is still `.zig-cache/v/<hex>` with
+the `SeenPcsHeader` layout below (0.17 `std/Build/abi.zig`, `Maker/Fuzz.zig`),
+and this file reads no `h/` cache manifest -- the part 0.17 made binary.
+Checked against the 0.17 sources only; not yet run against a 0.17 `--fuzz`.
 
 Used by `scripts/modtest <m> --fuzz`; not meant to be run by hand, but it can be:
 

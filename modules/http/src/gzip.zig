@@ -582,7 +582,7 @@ test "gzip round-trip through a Scratch (compress, then flate decompress)" {
     const scratch = try gpa.create(Scratch);
     defer gpa.destroy(scratch);
 
-    const plain = ("{\"key\":\"value\"," ** 100) ++ "\"end\":true}";
+    const plain = (strRepeat("{\"key\":\"value\",", 100)) ++ "\"end\":true}";
 
     var aw: std.Io.Writer.Allocating = try .initCapacity(gpa, 64);
     defer aw.deinit();
@@ -736,7 +736,7 @@ test "initCompress: the same state as std's Compress.init, field by field" {
         try testing.expect(std.meta.eql(x.hasher, y.hasher));
 
         // And the same bytes out for the same input.
-        const plain = ("{\"key\":\"value\"," ** 300) ++ "\"end\":true}";
+        const plain = (strRepeat("{\"key\":\"value\",", 300)) ++ "\"end\":true}";
         try x.writer.writeAll(plain);
         try x.finish();
         try y.writer.writeAll(plain);
@@ -847,4 +847,16 @@ test "checkTrailer: matches, CRC mismatch, ISIZE mismatch, truncated" {
 
     var in_short: std.Io.Reader = .fixed(good[0 .. good.len - 1]); // trailer missing its last byte
     try testing.expectError(error.EndOfStream, checkTrailer(&in_short, crc, size));
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

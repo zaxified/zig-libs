@@ -97,8 +97,8 @@ pub const Notify = struct {
     }
 
     /// `"\r%79s\r"` / `"\r%70s\r"`: a cleared line.
-    pub const clear79 = "\r" ++ " " ** 79 ++ "\r";
-    pub const clear70 = "\r" ++ " " ** 70 ++ "\r";
+    pub const clear79 = "\r" ++ strRepeat(" ", 79) ++ "\r";
+    pub const clear70 = "\r" ++ strRepeat(" ", 70) ++ "\r";
 
     /// One writer at a time: a futex word, 0 free and 1 taken.
     const lock = struct {
@@ -400,4 +400,16 @@ test "defaultDictId stays in 32768 .. 2^31 - 1" {
         const id = defaultDictId(c);
         try testing.expect(id >= 32768 and id < 1 << 31);
     }
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

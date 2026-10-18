@@ -180,9 +180,9 @@ test "a synced file's name survives a crash only once its directory is synced" {
 fn writeUnsynced(io: Io) !void {
     var f = try Dir.cwd().createFile(io, "log", .{});
     defer f.close(io);
-    try f.writePositionalAll(io, &([_]u8{0xaa} ** 2048), 0);
+    try f.writePositionalAll(io, &(@as([2048]u8, @splat(0xaa))), 0);
     try f.sync(io);
-    try f.writePositionalAll(io, &([_]u8{0xbb} ** 2048), 0); // never synced
+    try f.writePositionalAll(io, &(@as([2048]u8, @splat(0xbb))), 0); // never synced
 }
 
 test "unsynced writes survive a crash sector by sector: lost, kept or torn" {
@@ -486,9 +486,9 @@ test "search with disk faults finds silent corruption; a checksum catches it" {
 fn overwriteTwiceSynced(io: Io) !void {
     var f = try Dir.cwd().openFile(io, "page", .{ .mode = .read_write });
     defer f.close(io);
-    try f.writePositionalAll(io, &([_]u8{0x11} ** 512), 0);
+    try f.writePositionalAll(io, &(@as([512]u8, @splat(0x11))), 0);
     try f.sync(io);
-    try f.writePositionalAll(io, &([_]u8{0x22} ** 512), 0);
+    try f.writePositionalAll(io, &(@as([512]u8, @splat(0x22))), 0);
     try f.sync(io);
 }
 
@@ -498,7 +498,7 @@ test "a synced overwrite is final: a crash never brings an older write back" {
         newSim(&sim, seed);
         defer sim.deinit();
         const h = try sim.addHost(.{});
-        try h.putFile("page", &([_]u8{0} ** 512));
+        try h.putFile("page", &(@as([512]u8, @splat(0))));
         try h.spawn(overwriteTwiceSynced, .{h.io()});
         _ = sim.run();
         sim.crash(h);
@@ -571,7 +571,7 @@ test "an unsynced truncation may or may not survive a crash; a synced one does" 
             newSim(&sim, seed);
             defer sim.deinit();
             const h = try sim.addHost(.{});
-            try h.putFile("big", &([_]u8{7} ** 1000));
+            try h.putFile("big", &(@as([1000]u8, @splat(7))));
             try h.spawn(shrinkFile, .{ h.io(), sync });
             _ = sim.run();
             sim.crash(h);

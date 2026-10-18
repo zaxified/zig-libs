@@ -227,10 +227,10 @@ test "negative: a small-order public key is rejected by verify, not a crash" {
     // library: both are on-curve valid ENCODINGS (`Edwards25519.fromBytes`
     // succeeds) that `ECVRF_validate_key`'s cofactor-clear-then-
     // reject-identity check must still catch.
-    const identity_pk = [_]u8{0} ** 31 ++ [_]u8{1}; // y = 1, x = 0: the identity point
+    const identity_pk = @as([31]u8, @splat(0)) ++ [_]u8{1}; // y = 1, x = 0: the identity point
     try std.testing.expectError(error.InvalidPublicKey, ecvrf.verify(identity_pk, alpha, pi));
 
-    var order2_pk = [_]u8{0xff} ** 32; // y = p - 1
+    var order2_pk = @as([32]u8, @splat(0xff)); // y = p - 1
     order2_pk[0] = 0xec;
     order2_pk[31] = 0x7f;
     try std.testing.expectError(error.InvalidPublicKey, ecvrf.verify(order2_pk, alpha, pi));
@@ -259,7 +259,7 @@ test "negative: a small-order public key is rejected by verify, not a crash" {
 
     // A structurally invalid encoding (not on the curve at all) must
     // also reject cleanly rather than crash `Edwards25519.fromBytes`.
-    var not_on_curve = [_]u8{0xaa} ** 32;
+    var not_on_curve = @as([32]u8, @splat(0xaa));
     not_on_curve[31] &= 0x7f;
     // This specific byte pattern is not guaranteed to be off-curve for
     // every possible 0xaa-filled value, so only assert IF it actually
@@ -332,7 +332,7 @@ test "negative: decodeProof rejects a Gamma that is not a valid point encoding; 
     // a deterministic search, not a hardcoded magic constant.
     var t: u32 = 0;
     const bad_gamma: [32]u8 = while (t < 100_000) : (t += 1) {
-        var cand = [_]u8{0} ** 32;
+        var cand = @as([32]u8, @splat(0));
         std.mem.writeInt(u32, cand[0..4], t, .little);
         cand[31] = 0x40;
         if (Edwards25519.fromBytes(cand)) |_| {} else |_| break cand;
@@ -348,7 +348,7 @@ test "negative: decodeProof rejects a Gamma that is not a valid point encoding; 
 /// the point whose canonical encoding has `y` in its low byte and zeros
 /// above (only `y < 19` has one, since `y + p < 2^255`).
 fn plusP(y: u8, sign: u1) [32]u8 {
-    var out = [_]u8{0xff} ** 32;
+    var out = @as([32]u8, @splat(0xff));
     out[0] = 0xed + y;
     out[31] = 0x7f | (@as(u8, sign) << 7);
     return out;
@@ -363,7 +363,7 @@ test "negative: RFC 8032 §5.1.3 strict decoding refuses a non-canonical Gamma, 
     // Control: the identity, canonically encoded, IS a valid Gamma encoding
     // (decode_proof does not ask for a low-order check), so a rejection
     // below is about the bytes, not the point.
-    const identity = [_]u8{1} ++ [_]u8{0} ** 31;
+    const identity = [_]u8{1} ++ @as([31]u8, @splat(0));
     pi[0..32].* = identity;
     _ = try ecvrf.decodeProof(pi);
 
@@ -390,7 +390,7 @@ test "negative: a public key spelled y + p is refused although std decodes it to
     var found: ?u8 = null;
     var y: u8 = 2;
     while (y < 19) : (y += 1) {
-        var canon = [_]u8{0} ** 32;
+        var canon = @as([32]u8, @splat(0));
         canon[0] = y;
         const p = Edwards25519.fromBytes(canon) catch continue;
         p.clearCofactor().rejectIdentity() catch continue;
@@ -398,7 +398,7 @@ test "negative: a public key spelled y + p is refused although std decodes it to
         break;
     }
     const small_y = found orelse return error.NoSmallYKeyFound;
-    var canon = [_]u8{0} ** 32;
+    var canon = @as([32]u8, @splat(0));
     canon[0] = small_y;
 
     _ = try ecvrf.validateKey(canon); // control: the canonical spelling is a valid key

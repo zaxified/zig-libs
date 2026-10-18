@@ -273,7 +273,7 @@ pub fn parseInfo(gpa: std.mem.Allocator, bytes: []const u8) ParseError!ChainInfo
     // Zeroed, not `undefined`: `ChainInfo` is a plain value callers copy
     // and compare; the bytes past `pubkey_len` must not be whatever the
     // stack held (the audit read a neighbour's leftovers there).
-    var pubkey_bytes: [pubkey_max_bytes]u8 = [_]u8{0} ** pubkey_max_bytes;
+    var pubkey_bytes: [pubkey_max_bytes]u8 = @as([pubkey_max_bytes]u8, @splat(0));
     _ = std.fmt.hexToBytes(pubkey_bytes[0..pubkey_nbytes], raw.public_key) catch return error.InvalidHex;
 
     var pubkey_g2: ?g2.Affine = null;
@@ -309,7 +309,7 @@ pub fn parseInfo(gpa: std.mem.Allocator, bytes: []const u8) ParseError!ChainInfo
     if (raw.period.value > std.math.maxInt(u32)) return error.NumberOutOfRange;
 
     // Beacon ID label.
-    var beacon_id_buf: [max_beacon_id_bytes]u8 = [_]u8{0} ** max_beacon_id_bytes;
+    var beacon_id_buf: [max_beacon_id_bytes]u8 = @as([max_beacon_id_bytes]u8, @splat(0));
     var beacon_id_len: usize = 0;
     if (raw.metadata) |m| {
         if (m.beaconID) |id| {
@@ -384,7 +384,7 @@ test "parseInfo: decoded pubkey is in the G2 subgroup (KeyValidate ran)" {
 fn nonSubgroupG2Compressed() ![g2.compressed_bytes]u8 {
     var x: u8 = 1;
     while (x < 255) : (x += 1) {
-        var comp = [_]u8{0} ** g2.compressed_bytes;
+        var comp = @as([g2.compressed_bytes]u8, @splat(0));
         comp[0] = 0x80;
         comp[g2.compressed_bytes - 1] = x;
         const pt = g2.fromBytesCompressedUnchecked(comp) catch continue;
@@ -403,10 +403,10 @@ fn infoWithKey(gpa: std.mem.Allocator, pk_hex: []const u8) ![]u8 {
         .genesis_time = 1692803367,
         .chain_hash = undefined,
         .group_hash = try hexExact(32, "f477d5c89f21a17c863a7f937c6a6d15859414d2be09cd448d4279af331c5d3e"),
-        .pubkey_bytes = [_]u8{0} ** pubkey_max_bytes,
+        .pubkey_bytes = @as([pubkey_max_bytes]u8, @splat(0)),
         .pubkey_len = pk_hex.len / 2,
         .pubkey_g2 = null,
-        .beacon_id_buf = [_]u8{0} ** max_beacon_id_bytes,
+        .beacon_id_buf = @as([max_beacon_id_bytes]u8, @splat(0)),
         .beacon_id_len = 8,
     };
     _ = try std.fmt.hexToBytes(tmp.pubkey_bytes[0 .. pk_hex.len / 2], pk_hex);
@@ -453,7 +453,7 @@ test "parseInfo: a genuine chain hash over a FOREIGN key → ChainHashMismatch (
     ;
     try testing.expectError(error.ChainHashMismatch, parseInfo(testing.allocator, forged));
     // Any single field the hash covers, altered: groupHash, period, genesis, beaconID.
-    const bad_group = "{\"public_key\":\"83cf0f2896adee7eb8b5f01fcad3912212c437e0073e911fb90022d3e760183c8c4b450b6a0a6c3ac6a5776a2d1064510d1fec758c921cc22b0e17e63aaf4bcb5ed66304de9cf809bd274ca73bab4af5a6e9c76a4bc09e76eae8991ef5ece45a\",\"period\":3,\"genesis_time\":1692803367,\"hash\":\"52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f661792ba94600c84e971\",\"groupHash\":\"" ++ ("00" ** 32) ++ "\",\"schemeID\":\"bls-unchained-g1-rfc9380\",\"metadata\":{\"beaconID\":\"quicknet\"}}";
+    const bad_group = "{\"public_key\":\"83cf0f2896adee7eb8b5f01fcad3912212c437e0073e911fb90022d3e760183c8c4b450b6a0a6c3ac6a5776a2d1064510d1fec758c921cc22b0e17e63aaf4bcb5ed66304de9cf809bd274ca73bab4af5a6e9c76a4bc09e76eae8991ef5ece45a\",\"period\":3,\"genesis_time\":1692803367,\"hash\":\"52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f661792ba94600c84e971\",\"groupHash\":\"" ++ (strRepeat("00", 32)) ++ "\",\"schemeID\":\"bls-unchained-g1-rfc9380\",\"metadata\":{\"beaconID\":\"quicknet\"}}";
     try testing.expectError(error.ChainHashMismatch, parseInfo(testing.allocator, bad_group));
     const bad_period = "{\"public_key\":\"83cf0f2896adee7eb8b5f01fcad3912212c437e0073e911fb90022d3e760183c8c4b450b6a0a6c3ac6a5776a2d1064510d1fec758c921cc22b0e17e63aaf4bcb5ed66304de9cf809bd274ca73bab4af5a6e9c76a4bc09e76eae8991ef5ece45a\",\"period\":30,\"genesis_time\":1692803367,\"hash\":\"52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f661792ba94600c84e971\",\"groupHash\":\"f477d5c89f21a17c863a7f937c6a6d15859414d2be09cd448d4279af331c5d3e\",\"schemeID\":\"bls-unchained-g1-rfc9380\",\"metadata\":{\"beaconID\":\"quicknet\"}}";
     try testing.expectError(error.ChainHashMismatch, parseInfo(testing.allocator, bad_period));
@@ -492,7 +492,7 @@ test "parseInfo: bad hex in public_key → InvalidHex" {
 
 test "parseInfo: wrong-length key for quicknet → InvalidLength" {
     // 47 bytes of hex (94 chars, even) — decodes fine but is not 96.
-    const bad = "{\"public_key\":\"" ++ ("ab" ** 47) ++ "\",\"period\":3,\"genesis_time\":1,\"hash\":\"52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f661792ba94600c84e971\",\"groupHash\":\"f477d5c89f21a17c863a7f937c6a6d15859414d2be09cd448d4279af331c5d3e\",\"schemeID\":\"bls-unchained-g1-rfc9380\"}";
+    const bad = "{\"public_key\":\"" ++ (strRepeat("ab", 47)) ++ "\",\"period\":3,\"genesis_time\":1,\"hash\":\"52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f661792ba94600c84e971\",\"groupHash\":\"f477d5c89f21a17c863a7f937c6a6d15859414d2be09cd448d4279af331c5d3e\",\"schemeID\":\"bls-unchained-g1-rfc9380\"}";
     try testing.expectError(error.InvalidLength, parseInfo(testing.allocator, bad));
 }
 
@@ -518,7 +518,7 @@ test "parseInfo: identity (infinity) public key for quicknet → InvalidPoint, n
     // Compressed-G2 identity encoding (see bls12_381 g2.zig
     // `toBytesCompressed`): byte 0 = compression|infinity flags (0xc0),
     // remaining 95 bytes zero.
-    const identity_key_hex = "c0" ++ ("00" ** 95);
+    const identity_key_hex = "c0" ++ (strRepeat("00", 95));
     const bad = "{\"public_key\":\"" ++ identity_key_hex ++
         "\",\"period\":3,\"genesis_time\":1,\"hash\":\"52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f661792ba94600c84e971\",\"groupHash\":\"f477d5c89f21a17c863a7f937c6a6d15859414d2be09cd448d4279af331c5d3e\",\"schemeID\":\"bls-unchained-g1-rfc9380\"}";
     try testing.expectError(error.InvalidPoint, parseInfo(testing.allocator, bad));
@@ -603,10 +603,10 @@ fn chainedInfoWithKey(gpa: std.mem.Allocator, pk_hex: []const u8) ![]u8 {
         .genesis_time = 1595431050,
         .chain_hash = undefined,
         .group_hash = try hexExact(32, "176f93498eac9ca337150b46d21dd58673ea4e3581185f869672e59fa4cb390a"),
-        .pubkey_bytes = [_]u8{0} ** pubkey_max_bytes,
+        .pubkey_bytes = @as([pubkey_max_bytes]u8, @splat(0)),
         .pubkey_len = pk_hex.len / 2,
         .pubkey_g2 = null,
-        .beacon_id_buf = [_]u8{0} ** max_beacon_id_bytes,
+        .beacon_id_buf = @as([max_beacon_id_bytes]u8, @splat(0)),
         .beacon_id_len = 0,
     };
     _ = try std.fmt.hexToBytes(tmp.pubkey_bytes[0 .. pk_hex.len / 2], pk_hex);
@@ -621,7 +621,7 @@ test "parseInfo: chained key KeyValidate — off-subgroup, identity and wrong le
     _ = try parseInfo(testing.allocator, good);
 
     // The on-curve G1 point at x = 4 is outside the order-r subgroup.
-    var comp = [_]u8{0} ** g1.compressed_bytes;
+    var comp = @as([g1.compressed_bytes]u8, @splat(0));
     comp[0] = 0x80;
     comp[g1.compressed_bytes - 1] = 4;
     const pt = try g1.fromBytesCompressedUnchecked(comp);
@@ -632,7 +632,7 @@ test "parseInfo: chained key KeyValidate — off-subgroup, identity and wrong le
 
     // The identity key: e(identity, ·) = 1, which with an identity
     // signature would accept every round.
-    const identity = try chainedInfoWithKey(testing.allocator, "c0" ++ ("00" ** 47));
+    const identity = try chainedInfoWithKey(testing.allocator, "c0" ++ (strRepeat("00", 47)));
     defer testing.allocator.free(identity);
     try testing.expectError(error.InvalidPoint, parseInfo(testing.allocator, identity));
 
@@ -640,4 +640,16 @@ test "parseInfo: chained key KeyValidate — off-subgroup, identity and wrong le
     const g2_sized = try chainedInfoWithKey(testing.allocator, "83cf0f2896adee7eb8b5f01fcad3912212c437e0073e911fb90022d3e760183c8c4b450b6a0a6c3ac6a5776a2d1064510d1fec758c921cc22b0e17e63aaf4bcb5ed66304de9cf809bd274ca73bab4af5a6e9c76a4bc09e76eae8991ef5ece45a");
     defer testing.allocator.free(g2_sized);
     try testing.expectError(error.InvalidLength, parseInfo(testing.allocator, g2_sized));
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

@@ -1260,11 +1260,11 @@ test "DER: header length forms (short, 0x81, 0x82)" {
     const short = try d.tlv(0x04, "abc");
     try testing.expectEqualSlices(u8, "\x04\x03abc", short);
 
-    const mid = try d.tlv(0x04, "x" ** 200);
+    const mid = try d.tlv(0x04, strRepeat("x", 200));
     try testing.expectEqualSlices(u8, "\x04\x81\xc8", mid[0..3]);
     try testing.expectEqual(@as(usize, 203), mid.len);
 
-    const long = try d.tlv(0x04, "y" ** 300);
+    const long = try d.tlv(0x04, strRepeat("y", 300));
     try testing.expectEqualSlices(u8, "\x04\x82\x01\x2c", long[0..4]);
     try testing.expectEqual(@as(usize, 304), long.len);
 
@@ -1326,13 +1326,13 @@ test "CSR: any tampered byte breaks the signature (or the structure)" {
 test "CSR: domain validation" {
     const kp = testKeyPair(44);
     const cases = [_][]const u8{
-        "",                ".",               "example..com", "-bad.example",   "bad-.example",
+        "",                  ".",               "example..com", "-bad.example",   "bad-.example",
         "exa mple.com",
         "chybí.diakritika",
-        "x" ** 254,
-            // A wildcard is only the whole leftmost label (RFC 8555 §7.1.3).
-               "*",               "*.",           "**.example.com", "*example.com",
-        "a.*.example.com", "*.*.example.com",
+        strRepeat("x", 254),
+        // A wildcard is only the whole leftmost label (RFC 8555 §7.1.3).
+        "*",               "*.",           "**.example.com", "*example.com",
+        "a.*.example.com",   "*.*.example.com",
     };
     for (cases) |bad| {
         try testing.expectError(error.InvalidDomain, csrDer(testing.allocator, kp, &.{bad}));
@@ -1549,7 +1549,7 @@ test "TLS-ALPN-01 extension: openssl builds + re-parses the same bytes we do" {
 }
 
 test "PEM: encode/decode round-trip, wrapping, labels, garbage" {
-    const payload = "\x01\x02\x03" ++ ("D" ** 100); // forces a 2-line body
+    const payload = "\x01\x02\x03" ++ (strRepeat("D", 100)); // forces a 2-line body
     const pem = try pemEncode(testing.allocator, "CERTIFICATE", payload);
     defer testing.allocator.free(pem);
     try testing.expect(std.mem.startsWith(u8, pem, "-----BEGIN CERTIFICATE-----\n"));
@@ -1579,7 +1579,7 @@ test "PEM: encode/decode round-trip, wrapping, labels, garbage" {
     // The length guard used to be an `std.debug.assert`, which compiles out of
     // ReleaseFast/ReleaseSmall — the over-long label then reached the
     // `bufPrint(...) catch unreachable` below it.
-    const too_long = "A" ** (max_pem_label_len + 1);
+    const too_long = strRepeat("A", max_pem_label_len + 1);
     try testing.expectError(error.LabelTooLong, pemBlockCount(too_long, noisy));
 
     try testing.expectError(error.MissingPemBlock, pemDecode(testing.allocator, "CERTIFICATE REQUEST", noisy));
@@ -1776,10 +1776,10 @@ fn fuzzParseCsr(_: void, smith: *std.testing.Smith) !void {
 
 const fuzz_driver = testkit.fuzz.driver;
 const CsrLabel = enum { raw_rejected, raw_accepted, genuine_parsed, truncated_rejected, trailing_rejected, flipped_rejected };
-var csr_reach: [@typeInfo(CsrLabel).@"enum".fields.len]usize = @splat(0);
+var csr_reach: [@typeInfo(CsrLabel).@"enum".field_names.len]usize = @splat(0);
 
 fn markCsr(comptime l: CsrLabel) void {
-    csr_reach[@intFromEnum(l)] += 1;
+    csr_reach[@backingInt(l)] += 1;
     fuzz_driver.hit(@tagName(l));
 }
 
@@ -1864,7 +1864,7 @@ test "fuzz harness: 200 CSR seeds in every test run, and they get everywhere" {
         };
     }
     for (csr_reach, 0..) |n, i| {
-        const l: CsrLabel = @enumFromInt(i);
+        const l: CsrLabel = @fromBackingInt(@intCast(i));
         // Random octets are never a self-signed CSR: `raw_accepted` is reached
         // through the corpus only.
         if (l == .raw_accepted) continue;
@@ -1916,10 +1916,10 @@ test "isValidDomain: the RFC 1035 limits and the LDH alphabet" {
     // RFC 1035 §2.3.4: labels ≤ 63 octets, names ≤ 255 octets on the wire
     // (≤ 253 as text without the trailing dot); RFC 952/1123 LDH: letters,
     // digits, hyphen — no underscore in a hostname.
-    const l63 = "a" ** 63;
+    const l63 = strRepeat("a", 63);
     try testing.expect(isValidDomain(l63 ++ ".example"));
-    try testing.expect(!isValidDomain("a" ** 64 ++ ".example"));
-    const n253 = l63 ++ "." ++ l63 ++ "." ++ l63 ++ "." ++ "a" ** 61; // 253
+    try testing.expect(!isValidDomain(strRepeat("a", 64) ++ ".example"));
+    const n253 = l63 ++ "." ++ l63 ++ "." ++ l63 ++ "." ++ strRepeat("a", 61); // 253
     try testing.expect(isValidDomain(n253));
     try testing.expect(!isValidDomain(n253 ++ "a"));
     try testing.expect(!isValidDomain("under_score.example"));
@@ -2048,7 +2048,7 @@ test "EC private key PEM: found among other blocks; the first key block is used"
 test "pemDecode: an over-long label and an empty body are typed errors" {
     // The label is caller-supplied and formatted into fixed buffers (see
     // `pemDecode`'s comment); RFC 7468 §3: a block carries base64 data.
-    try testing.expectError(error.LabelTooLong, pemDecode(testing.allocator, "L" ** (max_pem_label_len + 1), "x"));
+    try testing.expectError(error.LabelTooLong, pemDecode(testing.allocator, strRepeat("L", max_pem_label_len + 1), "x"));
     try testing.expectError(error.InvalidPem, pemDecode(testing.allocator, "CERTIFICATE", "-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----\n"));
 }
 
@@ -2067,7 +2067,7 @@ test "ecPrivateKeyFromPem: version must be 1 and the private octets at most 32" 
     var scratch: Es256.KeyPair = undefined;
     try testing.expectError(error.MalformedKey, ecPrivateKeyFromPem(&scratch, testing.allocator, pem_v2));
 
-    const long_priv = "\x30\x26\x02\x01\x01\x04\x21" ++ "\x01" ** 33;
+    const long_priv = "\x30\x26\x02\x01\x01\x04\x21" ++ strRepeat("\x01", 33);
     const pem_long = try pemEncode(testing.allocator, "EC PRIVATE KEY", long_priv);
     defer testing.allocator.free(pem_long);
     try testing.expectError(error.MalformedKey, ecPrivateKeyFromPem(&scratch, testing.allocator, pem_long));
@@ -2862,7 +2862,7 @@ const openssl_ip_csr_hex = "3081fb3081a102010030003059301306072a8648ce3d02010608
 
 test "IP SANs (RFC 8738): csrDer writes openssl's GeneralNames; both CSRs parse back" {
     // The GeneralNames inside openssl's CSR: [7] c0000201, [7] 2001:db8::1, [2] a.example.
-    const openssl_names = "\x30\x23\x87\x04\xc0\x00\x02\x01\x87\x10\x20\x01\x0d\xb8" ++ "\x00" ** 11 ++
+    const openssl_names = "\x30\x23\x87\x04\xc0\x00\x02\x01\x87\x10\x20\x01\x0d\xb8" ++ strRepeat("\x00", 11) ++
         "\x01\x82\x09a.example";
     const ours = try csrDer(testing.allocator, testKeyPair(42), &.{ "192.0.2.1", "2001:db8::1", "a.example" });
     defer testing.allocator.free(ours);
@@ -2939,12 +2939,12 @@ test "PKCS#8 PEM: a version other than 0 or 1, or another key algorithm, is Malf
 
 test "EC private key PEM: a bare ECPrivateKey with only version and scalar loads into a typed pair" {
     const gpa = testing.allocator;
-    const der_bytes = [_]u8{ 0x30, 0x25, 0x02, 0x01, 0x01, 0x04, 0x20 } ++ [_]u8{0x01} ** 32;
+    const der_bytes = [_]u8{ 0x30, 0x25, 0x02, 0x01, 0x01, 0x04, 0x20 } ++ @as([32]u8, @splat(0x01));
     const pem = try pemEncode(gpa, "EC PRIVATE KEY", &der_bytes);
     defer gpa.free(pem);
     var out: Es256.KeyPair = undefined;
     try ecPrivateKeyFromPem(&out, gpa, pem);
-    try testing.expectEqualSlices(u8, &([_]u8{0x01} ** 32), &out.secret_key.toBytes());
+    try testing.expectEqualSlices(u8, &(@as([32]u8, @splat(0x01))), &out.secret_key.toBytes());
 }
 
 test "EC private key PEM: a dash inside the body is not the END line" {
@@ -2970,4 +2970,16 @@ test "pemBlockCount counts every block; PKCS#8 version 1 is accepted" {
     defer gpa.free(v1_pem);
     var out: Es256.KeyPair = undefined;
     try pkcs8PrivateKeyFromPem(&out, gpa, v1_pem);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

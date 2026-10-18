@@ -38,8 +38,8 @@ fn build(a: std.mem.Allocator) !void {
     var prng = std.Random.DefaultPrng.init(0x5A_11_E0_DE);
     try rsa.generate(&kp, prng.random(), 1024, 65537);
 
-    const cek = [_]u8{0xC5} ** 32;
-    const iv = [_]u8{0x22} ** 12;
+    const cek = @as([32]u8, @splat(0xC5));
+    const iv = @as([12]u8, @splat(0x22));
     var content: [12 + assertion.len + 16]u8 = undefined;
     @memcpy(content[0..12], &iv);
     var tag: [16]u8 = undefined;

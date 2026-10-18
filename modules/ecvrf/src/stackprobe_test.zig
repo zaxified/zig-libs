@@ -249,7 +249,7 @@ fn runProbe(label: []const u8, call: *const fn () void, n: *const Needles) !usiz
 }
 
 fn skipUnlessOptimized() !void {
-    if (builtin.mode == .Debug or builtin.mode == .ReleaseSafe) return error.SkipZigTest;
+    if (builtin.mode == .debug or builtin.mode == .safe) return error.SkipZigTest;
 }
 
 // ── the probed calls (all `noinline`, secrets read from static memory) ──────

@@ -209,7 +209,7 @@ const S0 = state.Suite(X25519, chachapoly.ChaCha20Poly1305, sha2.Sha256);
 const Token = @import("token.zig").Token;
 
 fn kp(b: u8) S0.KeyPair {
-    return S0.KeyPair.generateDeterministic([_]u8{b} ** 32) catch unreachable;
+    return S0.KeyPair.generateDeterministic(@as([32]u8, @splat(b))) catch unreachable;
 }
 
 test "init: missing keys, PSK count and invalid patterns are refused before anything runs" {
@@ -232,8 +232,8 @@ test "init: missing keys, PSK count and invalid patterns are refused before anyt
     // PSKs: exactly one per token.
     const xx3 = patterns.withPsk(patterns.XX, &.{3});
     try testing.expectError(error.PskCountMismatch, mk(S0, xx3, true, "", .{ .s = s1 }));
-    try testing.expectError(error.PskCountMismatch, mk(S0, patterns.XX, true, "", .{ .s = s1, .psks = &.{[_]u8{0} ** 32} }));
-    _ = try mk(S0, xx3, true, "", .{ .s = s1, .psks = &.{[_]u8{0} ** 32} });
+    try testing.expectError(error.PskCountMismatch, mk(S0, patterns.XX, true, "", .{ .s = s1, .psks = &.{@as([32]u8, @splat(0))} }));
+    _ = try mk(S0, xx3, true, "", .{ .s = s1, .psks = &.{@as([32]u8, @splat(0))} });
     // Invalid patterns (§7.3): a DH before its keys, a key sent twice, an
     // empty pattern, a DH token in a pre-message.
     const bad = [_]patterns.HandshakePattern{
@@ -244,7 +244,7 @@ test "init: missing keys, PSK count and invalid patterns are refused before anyt
         .{ .name = "B5", .pre_message_responder = &.{.s}, .message_patterns = &.{ &.{.e}, &.{ .e, .s } } },
         .{ .name = "B6", .message_patterns = &.{ &.{.e}, &.{ .e, .es } } },
         .{ .name = "B7", .message_patterns = &.{&.{ .e, .se }} },
-        .{ .name = "X" ** 120, .message_patterns = &.{&.{.e}} },
+        .{ .name = strRepeat("X", 120), .message_patterns = &.{&.{.e}} },
     };
     for (bad) |p| {
         try testing.expectError(error.InvalidPattern, mk(S0, p, true, "", .{ .s = s1, .rs = s2.public_key }));
@@ -324,7 +324,7 @@ test "sweep: whatever init accepts runs to an agreed handshake" {
         var slices: [4][]const Token = undefined;
         var pre: [2][2]Token = undefined;
         const p = randomPattern(r, &toks, &slices, &pre);
-        const psk_list = [_][32]u8{ [_]u8{7} ** 32, [_]u8{8} ** 32, [_]u8{9} ** 32, [_]u8{10} ** 32, [_]u8{11} ** 32, [_]u8{12} ** 32 };
+        const psk_list = [_][32]u8{ @as([32]u8, @splat(7)), @as([32]u8, @splat(8)), @as([32]u8, @splat(9)), @as([32]u8, @splat(10)), @as([32]u8, @splat(11)), @as([32]u8, @splat(12)) };
         var n_psk: usize = 0;
         for (p.message_patterns) |mp| for (mp) |t| {
             n_psk += @intFromBool(t == .psk);
@@ -393,7 +393,7 @@ test "sweep: a damaged handshake message is refused, never a panic" {
         for (0..400) |seed| {
             var prng = std.Random.DefaultPrng.init(seed);
             const r = prng.random();
-            const psk1 = [_][32]u8{[_]u8{5} ** 32};
+            const psk1 = [_][32]u8{@as([32]u8, @splat(5))};
             const pk: []const [32]u8 = if (c[1]) &psk1 else &.{};
             var ini = try mk(S0, p, true, "", .{ .s = i_s, .rs = r_s.public_key, .psks = pk });
             var rsp = try mk(S0, p, false, "", .{ .s = r_s, .rs = i_s.public_key, .psks = pk });
@@ -504,4 +504,16 @@ test "init: a pre-message ephemeral needs the key on both sides" {
     _ = try mk(S0, q, false, "", .{ .re = kp(3).public_key });
     // An `e` sent again after a pre-message `e` breaks §7.3.
     try testing.expectError(error.InvalidPattern, mk(S0, p, true, "", .{ .e = kp(3) }));
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

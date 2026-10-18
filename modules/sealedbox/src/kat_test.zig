@@ -180,9 +180,9 @@ const open_seeds = [_][]const u8{
     seed(&kat_sealed_bad_epk), // a flipped ephemeral public key
     seed(&kat_sealed_bad_tag), // a flipped Poly1305 tag
     seed(&kat_sealed_bad_body), // a flipped message byte
-    seed(&[_]u8{0} ** sealedbox.overhead), // exactly `overhead`: a zero-length plaintext
-    seed(&[_]u8{0} ** (sealedbox.overhead - 1)), // one octet short of `overhead`
-    seed(&[_]u8{0xAA} ** 256), // the full harness buffer
+    seed(&@as([sealedbox.overhead]u8, @splat(0))), // exactly `overhead`: a zero-length plaintext
+    seed(&@as([sealedbox.overhead - 1]u8, @splat(0))), // one octet short of `overhead`
+    seed(&@as([256]u8, @splat(0xAA))), // the full harness buffer
     seed(""), // the ONE input the collapsed harness ever ran
 };
 
@@ -295,7 +295,7 @@ test "fuzz: seal never fails or panics on arbitrary plaintext, and the result op
         seed(""),
         seed("x"),
         seed(kat.message),
-        seed(&[_]u8{0xAA} ** 256),
+        seed(&@as([256]u8, @splat(0xAA))),
     } });
 }
 
@@ -387,7 +387,7 @@ test "L5: open rejects a sealed box whose ephemeral-key prefix is a degenerate/s
         const epk = hexDecode32(hex);
         // epk (32) || tag (16, arbitrary — the point rejection fires before
         // the tag is ever consulted) || body (4, arbitrary).
-        var sealed: [32 + 16 + 4]u8 = [_]u8{0xAA} ** (32 + 16 + 4);
+        var sealed: [32 + 16 + 4]u8 = @as([32 + 16 + 4]u8, @splat(0xAA));
         @memcpy(sealed[0..32], &epk);
         var opened: [4]u8 = undefined;
         try testing.expectError(error.IdentityElement, sealedbox.open(&opened, &sealed, &kp));

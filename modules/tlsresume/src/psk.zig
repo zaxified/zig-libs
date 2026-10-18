@@ -85,7 +85,7 @@ pub fn earlySecret(comptime Hkdf: type, out: *[Hkdf.prk_length]u8, psk: []const 
 }
 
 fn earlySecretBody(comptime Hkdf: type, out: *[Hkdf.prk_length]u8, psk: []const u8) void {
-    const zero_salt = [_]u8{0} ** Hkdf.prk_length;
+    const zero_salt = @as([Hkdf.prk_length]u8, @splat(0));
     out.* = Hkdf.extract(&zero_salt, psk);
 }
 
@@ -230,7 +230,7 @@ test "sanity: RFC 8448 KAT chain is internally consistent (independent of the st
     // the constants above chain together correctly (HKDF/HMAC math via std
     // directly), so the guarded tests below have a known-good target once
     // unstubbed. Mirrors dtls/keyschedule.zig's own "byte-exact" KAT style.
-    const es = HkdfSha256.extract(&[_]u8{0} ** 32, &rfc8448_psk);
+    const es = HkdfSha256.extract(&@as([32]u8, @splat(0)), &rfc8448_psk);
     try testing.expectEqualSlices(u8, &rfc8448_early_secret, &es);
 
     const bk = std.crypto.tls.hkdfExpandLabel(HkdfSha256, es, "res binder", &emptyHash(), 32);
@@ -297,7 +297,7 @@ test "SHA-384 suite: chain runs at the 48-byte digest length and is internally c
     const Sha384 = std.crypto.hash.sha2.Sha384;
     try testing.expectEqual(@as(usize, 48), Hkdf384.prk_length);
 
-    const rms = [_]u8{0x5A} ** 48;
+    const rms = @as([48]u8, @splat(0x5A));
     const nonce = [_]u8{ 0x00, 0x01 };
     var psk: [48]u8 = undefined;
     var es: [48]u8 = undefined;

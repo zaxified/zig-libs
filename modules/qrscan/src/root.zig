@@ -488,7 +488,7 @@ fn ratioOk(runs: [5]u32) ?f32 {
 /// finder. That error is under a module and still moves every sampling point.
 fn confirmVertical(b: *const Bitmap, cx: u32, cy: u32) ?struct { unit: f32, centre: f32 } {
     if (!b.get(cx, cy)) return null;
-    var runs = [_]u32{0} ** 5;
+    var runs = @as([5]u32, @splat(0));
 
     // Up from the candidate: the rest of the centre band, then light, then dark.
     var y: i32 = @intCast(cy);
@@ -1946,7 +1946,7 @@ test "a dimension one version out is rejected by the timing pattern" {
 test "the ring test is what keeps a large symbol's own data from crowding it out" {
     const t = std.testing;
     var m: qr.Matrix = undefined;
-    try qr.encode(&m, "N" ** 300, .{ .ecc = .quartile });
+    try qr.encode(&m, strRepeat("N", 300), .{ .ecc = .quartile });
 
     var pixels: [900 * 900]u8 = undefined;
     var scratch: [scratchSize(900, 900)]u8 = undefined;
@@ -2058,7 +2058,7 @@ test "a broken ring has the finder ratio in both axes and is still not a finder"
 test "a large symbol needs the alignment patterns, not just its corners" {
     const t = std.testing;
     var m: qr.Matrix = undefined;
-    try qr.encode(&m, "N" ** 2000, .{ .ecc = .quartile });
+    try qr.encode(&m, strRepeat("N", 2000), .{ .ecc = .quartile });
     try t.expect(m.size >= 145); // version 33 or larger
 
     var pixels: [900 * 900]u8 = undefined;
@@ -2093,13 +2093,13 @@ test "a large symbol needs the alignment patterns, not just its corners" {
     const with = try sample(bits, c, refined);
     var fm = with.matrix;
     var out: [3000]u8 = undefined;
-    try t.expectEqualStrings("N" ** 2000, try qr.decode(&fm, &out));
+    try t.expectEqualStrings(strRepeat("N", 2000), try qr.decode(&fm, &out));
 }
 
 test "rotation holds at the largest versions, where the grid has furthest to drift" {
     const t = std.testing;
     var m: qr.Matrix = undefined;
-    try qr.encode(&m, "N" ** 2000, .{ .ecc = .quartile });
+    try qr.encode(&m, strRepeat("N", 2000), .{ .ecc = .quartile });
 
     var pixels: [900 * 900]u8 = undefined;
     var scratch: [scratchSize(900, 900)]u8 = undefined;
@@ -2115,7 +2115,7 @@ test "rotation holds at the largest versions, where the grid has furthest to dri
         const found = scan(img, &scratch) catch continue;
         var fm = found.matrix;
         const got = qr.decode(&fm, &out) catch continue;
-        if (std.mem.eql(u8, got, "N" ** 2000)) ok += 1;
+        if (std.mem.eql(u8, got, strRepeat("N", 2000))) ok += 1;
     }
 
     // Three pixels per module across 165 of them is the bottom of what this
@@ -2381,7 +2381,7 @@ fn fuzzScanRoundtrip(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror
     const n = 1 + src.index(text.len);
     for (text[0..n]) |*c| c.* = "ABCXYZ 0189$%*+-./:abcxyz~"[src.index(26)];
     if (n > 24) RoundtripMark.mark(.long_text);
-    const ecc: qr.Ecc = @enumFromInt(src.valueRangeAtMost(u8, 0, 3));
+    const ecc: qr.Ecc = @fromBackingInt(@intCast(src.valueRangeAtMost(u8, 0, 3)));
     const scale: u32 = src.valueRangeAtMost(u8, 3, 8);
     if (scale <= 4) RoundtripMark.mark(.scale_small) else RoundtripMark.mark(.scale_large);
 
@@ -2520,7 +2520,7 @@ const damage_scripts = [_][]const u8{
     kit.seed(""),
     kit.seed("\x01\x80\x80\xff"), // one blob, dead centre, white
     kit.seed("\x08\x10\x10\x00\x20\x20\xff\x30\x30\x00\x40\x40\xff"), // eight blobs across the top-left finder
-    kit.seed("\x3c" ++ "\x11\x22\x00" ** 4), // the maximum 60 blobs, cycling through four positions
+    kit.seed("\x3c" ++ strRepeat("\x11\x22\x00", 4)), // the maximum 60 blobs, cycling through four positions
     kit.seed("\x0a\x00\x00\xff\x00\x08\xff\x08\x00\xff"), // ten blobs whitening the top-left finder's corner
     kit.seed("\x14\xf0\xf0\x00\xf8\xf8\x00"), // twenty blobs in the bottom-right, where no finder is
     kit.seed("\x20\x80\x10\x7f\x10\x80\x7f"), // mid-grey blobs, which sit right on the binarisation threshold
@@ -3077,7 +3077,19 @@ test "solve8 pivots: a system with a zero leading coefficient is solved, not ref
 test "readable: a grid whose message is longer than the probe buffer still counts as readable" {
     const t = std.testing;
     var m: qr.Matrix = undefined;
-    const long = "A" ** 300; // longer than readable's 256-byte buffer
+    const long = strRepeat("A", 300); // longer than readable's 256-byte buffer
     try qr.encode(&m, long, .{ .ecc = .low });
     try t.expect(readable(&m));
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

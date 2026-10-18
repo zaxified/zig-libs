@@ -285,7 +285,7 @@ fn runProtocol(allocator: std.mem.Allocator, shares: []const KeyShare, randoms: 
     const t = shares.len;
     var indices: [2]u32 = undefined;
     for (shares, 0..) |s, i| indices[i] = s.index;
-    const sid = [_]u8{0x5a} ** 32;
+    const sid = @as([32]u8, @splat(0x5a));
 
     var parties: [2]presign.Party = undefined;
     for (0..t) |i| try presign.Party.init(allocator, &shares[i], indices[0..t], sid, &parties[i]);
@@ -453,7 +453,7 @@ fn runPiprm(allocator: std.mem.Allocator, tainted: bool) !void {
     const proof = try root.aux_proofs.Piprm.proveBound(allocator, aux, &trapdoor, "ctgrind", prng.random());
     // XOR of every z_i: the rounds with e_i = 1 carry λ's taint (z_i = a_i
     // alone when e_i = 0, untainted), so one fold is the witness for all.
-    var acc = [_]u8{0} ** root.aux_modulus_bytes;
+    var acc = @as([root.aux_modulus_bytes]u8, @splat(0));
     for (proof.entries) |entry| {
         var zb: [root.aux_modulus_bytes]u8 = undefined;
         try entry.z.toBytes(&zb, .big);
@@ -505,9 +505,9 @@ fn runOpen7(tainted: bool) !void {
     _ = try std.fmt.hexToBytes(&q, pp.paillier_q);
     var kp: paillier.KeyPair = undefined;
     try paillier.fromPrimes(&p, &q, &kp);
-    var m_buf = [_]u8{0} ** 32;
+    var m_buf = @as([32]u8, @splat(0));
     m_buf[31] = 0x2a;
-    var r_buf = [_]u8{0} ** 32;
+    var r_buf = @as([32]u8, @splat(0));
     r_buf[31] = 0x07;
     const c = try paillier.encrypt(kp.public, &(try paillier.Fe.fromBytes(kp.public.n_sq, &m_buf, .big)), &(try paillier.Fe.fromBytes(kp.public.n_sq, &r_buf, .big)));
     if (tainted) std.valgrind.memcheck.makeMemUndefined(std.mem.asBytes(&kp.secret.lambda.v.limbs_buffer));

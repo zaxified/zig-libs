@@ -184,7 +184,7 @@ pub fn Suite(comptime DH: type, comptime Cipher: type, comptime Hash: type) type
         /// big-endian for AESGCM (spec §12.3/§12.4).
         fn nonceBytes(n: u64) [Cipher.nonce_length]u8 {
             const big = comptime std.mem.eql(u8, cipherName(Cipher), "AESGCM");
-            var npub = [_]u8{0} ** Cipher.nonce_length;
+            var npub = @as([Cipher.nonce_length]u8, @splat(0));
             std.mem.writeInt(u64, npub[4..12], n, if (big) .big else .little);
             return npub;
         }
@@ -220,7 +220,7 @@ pub fn Suite(comptime DH: type, comptime Cipher: type, comptime Hash: type) type
         /// callers must consult `hasKey()` rather than inspecting `k`
         /// directly, matching the spec's explicit empty/non-empty state.
         pub const CipherState = struct {
-            k: [32]u8 = [_]u8{0} ** 32,
+            k: [32]u8 = @as([32]u8, @splat(0)),
             n: u64 = 0,
             has_key: bool = false,
 
@@ -346,7 +346,7 @@ pub fn Suite(comptime DH: type, comptime Cipher: type, comptime Hash: type) type
                 Cipher.encrypt(
                     ct[0..32],
                     ct[32..][0..TAGLEN],
-                    &([_]u8{0} ** 32),
+                    &(@as([32]u8, @splat(0))),
                     "",
                     nonceBytes(max_nonce),
                     self.k,
@@ -360,8 +360,8 @@ pub fn Suite(comptime DH: type, comptime Cipher: type, comptime Hash: type) type
         /// and an embedded `CipherState` used to en/decrypt handshake
         /// payloads once a key has been mixed in.
         pub const SymmetricState = struct {
-            ck: [HASHLEN]u8 = [_]u8{0} ** HASHLEN,
-            h: [HASHLEN]u8 = [_]u8{0} ** HASHLEN,
+            ck: [HASHLEN]u8 = @as([HASHLEN]u8, @splat(0)),
+            h: [HASHLEN]u8 = @as([HASHLEN]u8, @splat(0)),
             cipher_state: CipherState = .{},
 
             /// §5.2 `InitializeSymmetric(protocol_name)`: sets
@@ -370,7 +370,7 @@ pub fn Suite(comptime DH: type, comptime Cipher: type, comptime Hash: type) type
             /// the embedded `CipherState`.
             pub fn initializeSymmetric(self: *SymmetricState, protocol_name: []const u8) void {
                 if (protocol_name.len <= HASHLEN) {
-                    self.h = [_]u8{0} ** HASHLEN;
+                    self.h = @as([HASHLEN]u8, @splat(0));
                     @memcpy(self.h[0..protocol_name.len], protocol_name);
                 } else {
                     Hash.hash(protocol_name, &self.h, .{});
@@ -952,12 +952,12 @@ test "Suite(X25519, ChaCha20Poly1305, SHA256): DHLEN/HASHLEN + zero-value defaul
 
     const cs: S.CipherState = .{};
     try testing.expectEqual(@as(u64, 0), cs.n);
-    try testing.expectEqual([_]u8{0} ** 32, cs.k);
+    try testing.expectEqual(@as([32]u8, @splat(0)), cs.k);
     try testing.expectEqual(false, cs.hasKey());
 
     const ss: S.SymmetricState = .{};
-    try testing.expectEqual([_]u8{0} ** 32, ss.ck);
-    try testing.expectEqual([_]u8{0} ** 32, ss.h);
+    try testing.expectEqual(@as([32]u8, @splat(0)), ss.ck);
+    try testing.expectEqual(@as([32]u8, @splat(0)), ss.h);
 
     const hs: S.HandshakeState = .{};
     try testing.expectEqual(false, hs.initiator);
@@ -1005,7 +1005,7 @@ test "CipherState: no key = identity passthrough, n untouched" {
 
 test "CipherState: nonce = 4 zero bytes || LE64(n) for ChaChaPoly; n increments" {
     const Aead = std.crypto.aead.chacha_poly.ChaCha20Poly1305;
-    const key = [_]u8{0xab} ** 32;
+    const key = @as([32]u8, @splat(0xab));
     var cs: TestSuite.CipherState = .{};
     cs.initializeKey(&key);
     cs.setNonce(7);
@@ -1014,7 +1014,7 @@ test "CipherState: nonce = 4 zero bytes || LE64(n) for ChaChaPoly; n increments"
     try cs.encryptWithAd("assoc", "plaintext", &got);
     try testing.expectEqual(@as(u64, 8), cs.n);
 
-    var npub = [_]u8{0} ** 12;
+    var npub = @as([12]u8, @splat(0));
     std.mem.writeInt(u64, npub[4..12], 7, .little);
     var want: [9 + 16]u8 = undefined;
     Aead.encrypt(want[0..9], want[9..25], "plaintext", "assoc", npub, key);
@@ -1029,7 +1029,7 @@ test "CipherState: nonce = 4 zero bytes || LE64(n) for ChaChaPoly; n increments"
 
 test "CipherState: auth failure leaves n unchanged; nonce 2^64-1 exhausts" {
     var cs: TestSuite.CipherState = .{};
-    cs.initializeKey(&([_]u8{1} ** 32));
+    cs.initializeKey(&(@as([32]u8, @splat(1))));
     var ct: [3 + 16]u8 = undefined;
     try cs.encryptWithAd("", "abc", &ct);
     ct[0] ^= 1;
@@ -1046,7 +1046,7 @@ test "CipherState: auth failure leaves n unchanged; nonce 2^64-1 exhausts" {
 
 test "CipherState: rekey matches spec formula and keeps both directions in sync" {
     const Aead = std.crypto.aead.chacha_poly.ChaCha20Poly1305;
-    const key = [_]u8{0x42} ** 32;
+    const key = @as([32]u8, @splat(0x42));
     var a: TestSuite.CipherState = .{};
     var b: TestSuite.CipherState = .{};
     a.initializeKey(&key);
@@ -1054,10 +1054,10 @@ test "CipherState: rekey matches spec formula and keeps both directions in sync"
 
     a.rekey();
     // Spec §4.2: REKEY(k) = ENCRYPT(k, 2^64-1, zerolen, zeros[32])[0..32].
-    var npub = [_]u8{0} ** 12;
+    var npub = @as([12]u8, @splat(0));
     std.mem.writeInt(u64, npub[4..12], std.math.maxInt(u64), .little);
     var want: [48]u8 = undefined;
-    Aead.encrypt(want[0..32], want[32..48], &([_]u8{0} ** 32), "", npub, key);
+    Aead.encrypt(want[0..32], want[32..48], &(@as([32]u8, @splat(0))), "", npub, key);
     try testing.expectEqualSlices(u8, want[0..32], &a.k);
     try testing.expect(!std.mem.eql(u8, &a.k, &key));
 
@@ -1088,7 +1088,7 @@ test "SymmetricState: initializeSymmetric pads short names, hashes long ones" {
     const short = "Noise_NN_25519";
     ss.initializeSymmetric(short);
     try testing.expectEqualSlices(u8, short, ss.h[0..short.len]);
-    try testing.expectEqualSlices(u8, &([_]u8{0} ** (32 - short.len)), ss.h[short.len..]);
+    try testing.expectEqualSlices(u8, &(@as([32 - short.len]u8, @splat(0))), ss.h[short.len..]);
 }
 
 test "SymmetricState: Noise HKDF == RFC 5869 HKDF with empty info (mixKey/mixKeyAndHash/split)" {
@@ -1097,8 +1097,8 @@ test "SymmetricState: Noise HKDF == RFC 5869 HKDF with empty info (mixKey/mixKey
     // HKDF-Extract(salt=ck, ikm) + HKDF-Expand(prk, info="", 96) — use
     // std's independent implementation as the oracle.
     const Hkdf = std.crypto.kdf.hkdf.HkdfSha256;
-    const ck = [_]u8{0x11} ** 32;
-    const ikm = [_]u8{0x22} ** 32;
+    const ck = @as([32]u8, @splat(0x11));
+    const ikm = @as([32]u8, @splat(0x22));
     const prk = Hkdf.extract(&ck, &ikm);
     var okm: [96]u8 = undefined;
     Hkdf.expand(&okm, "", prk);
@@ -1151,7 +1151,7 @@ test "SymmetricState: encryptAndHash/decryptAndHash roundtrip and transcript adv
     try b.decryptAndHash(&out0, &pt0);
     try testing.expectEqual(a.h, b.h);
 
-    const ikm = [_]u8{0x77} ** 32;
+    const ikm = @as([32]u8, @splat(0x77));
     a.mixKey(&ikm);
     b.mixKey(&ikm);
     var out1: [5 + 16]u8 = undefined;
@@ -1562,7 +1562,7 @@ test "HandshakeState: reading a truncated message fails cleanly" {
     var plain: [64]u8 = undefined;
     // First NN message needs at least DHLEN bytes for the `e` token.
     var tp: [2]S.CipherState = undefined;
-    try testing.expectError(error.MessageTooShort, rsp.readMessage(&[_]u8{1} ** 16, &plain, &tp));
+    try testing.expectError(error.MessageTooShort, rsp.readMessage(&@as([16]u8, @splat(1)), &plain, &tp));
 }
 
 test "HandshakeState: identity-point remote static key is rejected (invalid-point DH)" {
@@ -1577,7 +1577,7 @@ test "HandshakeState: identity-point remote static key is rejected (invalid-poin
     var prng = std.Random.DefaultPrng.init(0x1d1d1d);
     const random = prng.random();
     var ini: S.HandshakeState = .{};
-    const zero_rs: [S.DHLEN]u8 = [_]u8{0} ** S.DHLEN;
+    const zero_rs: [S.DHLEN]u8 = @as([S.DHLEN]u8, @splat(0));
     // NK's pre-message gives the initiator the responder's static key
     // out of band; plant the identity element there so message 1's
     // `es` token (DH(e, rs)) computes against it.

@@ -247,13 +247,13 @@ test "Fp2.zero / Fp2.one round-trip through bytes" {
     try std.testing.expect(std.mem.allEqual(u8, &z, 0));
 
     const o = Fp2.one.toBytes();
-    var expected = [_]u8{0} ** Fp2.encoded_bytes;
+    var expected = @as([Fp2.encoded_bytes]u8, @splat(0));
     expected[Fp2.encoded_bytes - 1] = 1; // c0's low byte; c1 is all-zero (high half)
     try std.testing.expectEqualSlices(u8, &expected, &o);
 }
 
 test "Fp2.fromBytes / toBytes preserve c1||c0 ordering" {
-    var bytes = [_]u8{0} ** Fp2.encoded_bytes;
+    var bytes = @as([Fp2.encoded_bytes]u8, @splat(0));
     bytes[Fp.encoded_bytes - 1] = 0xaa; // c1's low byte
     bytes[Fp2.encoded_bytes - 1] = 0xbb; // c0's low byte
     const el = try Fp2.fromBytes(bytes);

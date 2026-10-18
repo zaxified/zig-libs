@@ -705,7 +705,7 @@ fn randomStartSeq() u16 {
         const rc = linux.getrandom(&buf, buf.len, 0);
         const signed: isize = @bitCast(rc);
         if (signed == buf.len) return std.mem.readInt(u16, &buf, .little);
-        if (signed == -@as(isize, @intFromEnum(linux.E.INTR))) continue;
+        if (signed == -@as(isize, @backingInt(linux.E.INTR))) continue;
         return 1; // getrandom unavailable: fall back to the old fixed start
     }
 }
@@ -1514,10 +1514,10 @@ fn classifyAll(packet: []const u8, ident: u16, seq: u16) void {
 const fuzz_driver = testkit.fuzz.driver;
 
 const FuzzLabel = enum { rejected, matched };
-var fuzz_reach: [@typeInfo(FuzzLabel).@"enum".fields.len]usize = @splat(0);
+var fuzz_reach: [@typeInfo(FuzzLabel).@"enum".field_names.len]usize = @splat(0);
 
 fn fuzz_mark(comptime l: FuzzLabel) void {
-    fuzz_reach[@intFromEnum(l)] += 1;
+    fuzz_reach[@backingInt(l)] += 1;
     fuzz_driver.hit(@tagName(l));
 }
 
@@ -1604,7 +1604,7 @@ test "fuzz harness: 400 seeds in every test run, and they get everywhere" {
         }
     }
     for (fuzz_reach, 0..) |n, i| if (n == 0) {
-        std.debug.print("reach: label {t} never hit in 400 seeds\n", .{@as(FuzzLabel, @enumFromInt(i))});
+        std.debug.print("reach: label {t} never hit in 400 seeds\n", .{@as(FuzzLabel, @fromBackingInt(@intCast(i)))});
         return error.HarnessDoesNotReach;
     };
 }

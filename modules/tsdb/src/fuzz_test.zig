@@ -21,10 +21,10 @@ const fuzz_driver = testkit.fuzz.driver;
 const codec = @import("codec.zig");
 
 pub const Label = enum { rejected, accepted, round_tripped, key_decoded, key_refused };
-var reach: [@typeInfo(Label).@"enum".fields.len]usize = @splat(0);
+var reach: [@typeInfo(Label).@"enum".field_names.len]usize = @splat(0);
 
 fn mark(comptime l: Label) void {
-    reach[@intFromEnum(l)] += 1;
+    reach[@backingInt(l)] += 1;
     fuzz_driver.hit(@tagName(l));
 }
 
@@ -139,7 +139,7 @@ test "fuzz harnesses: 400 seeds each in every test run, and they get everywhere"
         }
     }
     for (reach, 0..) |n, i| if (n == 0) {
-        std.debug.print("reach: label {t} never hit in 400 seeds\n", .{@as(Label, @enumFromInt(i))});
+        std.debug.print("reach: label {t} never hit in 400 seeds\n", .{@as(Label, @fromBackingInt(@intCast(i)))});
         return error.HarnessDoesNotReach;
     };
 }

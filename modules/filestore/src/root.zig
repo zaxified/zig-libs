@@ -944,8 +944,8 @@ test "edges pinned by the 2026-10-04 mutation run" {
     const gpa = std.testing.allocator;
 
     // `segmentSafe`: 1..128 bytes.
-    try t.expect(segmentSafe("k" ** 128));
-    try t.expect(!segmentSafe("k" ** 129));
+    try t.expect(segmentSafe(strRepeat("k", 128)));
+    try t.expect(!segmentSafe(strRepeat("k", 129)));
 
     // `putManyBytes` validates EVERY key before writing any (a bad key late
     // in the batch must not leave the earlier ones written, nor escape the
@@ -1596,4 +1596,16 @@ test "F6: a corrupt .expiry sidecar is treated as no-TTL, not propagated as a re
     try store2.putWithTTL("sessions", "well-formed", "bye", 100); // deadline 1100
     clk.now_ns = 2_000;
     try t.expect((try store2.getBytes(gpa, "sessions", "well-formed")) == null);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

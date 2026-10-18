@@ -181,7 +181,7 @@ test "crafted: a metadata block of 20 skipped bytes is skipped whole" {
     try w.window16();
     try metadata(&w, false, 0, 1, 19);
     try w.pad();
-    try w.raw(&([_]u8{0xEE} ** 20));
+    try w.raw(&(@as([20]u8, @splat(0xEE))));
     try w.lastEmpty();
     try expectOut(w.bytes.items, "");
 }
@@ -216,7 +216,7 @@ test "crafted: metadata with the reserved bit set, a zero top length byte, or no
         try w.window16();
         try metadata(&w, false, 0, 2, 5); // bytes 05 00
         try w.pad();
-        try w.raw(&([_]u8{0} ** 6));
+        try w.raw(&(@as([6]u8, @splat(0))));
         try w.lastEmpty();
         try expectErr(w.bytes.items, error.InvalidLength);
     }
@@ -705,7 +705,7 @@ test "crafted: streams back to back on one reader, in any pieces: each ends exac
 
 test "crafted: a source buffer under 16 bytes: at most 8 bytes are read past the stream" {
     const comp = @embedFile("testdata/alice29.txt.compressed");
-    const all = comp ++ "\xEE" ** 64;
+    const all = comp ++ strRepeat("\xEE", 64);
     var calls: [1]std.testing.Reader.Call = .{.{ .buffer = all }};
     var ibuf: [8]u8 = undefined;
     var tr: std.testing.Reader = .init(&ibuf, &calls);
@@ -745,7 +745,7 @@ test "crafted: metadata blocks reach the callback, whole and in order" {
     var buf: [256]u8 = undefined;
     var sw: brotli.StreamWriter = try .init(gpa, &out.writer, &buf, .{});
     defer sw.deinit();
-    const big = "m" ** 2000;
+    const big = strRepeat("m", 2000);
     try sw.writeMetadata("first");
     try sw.writer.writeAll("payload one, ");
     try sw.writeMetadata("");
@@ -975,4 +975,16 @@ test "crafted: a command header that needs a second refill near the end of the i
             try testing.expectEqualSlices(u8, want, got);
         }
     };
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

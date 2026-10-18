@@ -448,8 +448,8 @@ const fuzzSeed = testkit.fuzz.seed;
 /// than uniformly masked by `HeaderCorrupt`.
 const random_seeds = [_][]const u8{
     fuzzSeed("ZGI1"), // the magic alone: Truncated
-    fuzzSeed("ZGI0" ++ "\x00" ** 36), // wrong magic
-    fuzzSeed("ZGI1" ++ "\x00" ** 36), // right magic, wrong header CRC
+    fuzzSeed("ZGI0" ++ strRepeat("\x00", 36)), // wrong magic
+    fuzzSeed("ZGI1" ++ strRepeat("\x00", 36)), // right magic, wrong header CRC
     fuzzSeed("ZGI1\x01\x00\x02\x01\x00\x00\x00\x00\x00\x00\x00\x00'\x00\x08\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xcdY\xe3\x12"), // ⭐ the empty index: node_count 0, item_count 0 — legal, and it LOADS
     fuzzSeed("ZGI1\xff\xff\x02\x01\x00\x00\x00\x00\x00\x00\x00\x00'\x00\x08\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xf9\x01\xaf\xa7"), // an unsupported version, correctly sealed
     fuzzSeed("ZGI1\x01\x00\x01\x02\x00\x00\x00\x00\x00\x00\x00\x00'\x00\x08\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xb9\x17J\xf3"), // the endian marker byte-swapped, correctly sealed
@@ -672,4 +672,16 @@ test "corpus: the mutation scripts actually damage the index, and reach the desc
     try testing.expectEqual(@as(usize, 4), damaged_and_loaded);
     try testing.expectEqual(@as(usize, 5), damaged_and_rejected);
     try testing.expectEqual(@as(usize, 2), damaged_and_verified);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

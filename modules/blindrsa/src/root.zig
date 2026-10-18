@@ -745,7 +745,7 @@ pub fn blindSign(
     var s_bytes: [max_modulus_len]u8 = undefined;
     s.toBytes(&s_bytes, .big) catch unreachable; // s < n fits
     const m_check = rsa.rsavp1(max_modulus_len, s_bytes, pk) catch return error.SigningFailure;
-    var m_expect = [_]u8{0} ** max_modulus_len;
+    var m_expect = @as([max_modulus_len]u8, @splat(0));
     @memcpy(m_expect[max_modulus_len - modulus_len ..], blinded_msg);
     if (!std.crypto.timing_safe.eql([max_modulus_len]u8, m_check, m_expect)) {
         return error.SigningFailure;
@@ -864,7 +864,7 @@ test "prepareIdentity is a no-op" {
 }
 
 test "prepareRandomize prepends exactly randomizer_len fresh bytes and preserves msg" {
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x42} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x42)));
     var out: [randomizer_len + 5]u8 = undefined;
     const prepared = try prepareRandomize("hello", csprng.random(), &out);
     try std.testing.expectEqual(@as(usize, randomizer_len + 5), prepared.len);
@@ -872,7 +872,7 @@ test "prepareRandomize prepends exactly randomizer_len fresh bytes and preserves
 }
 
 test "prepareRandomize is non-deterministic across calls (fresh prefix each time)" {
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x7} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x7)));
     var out1: [randomizer_len + 3]u8 = undefined;
     var out2: [randomizer_len + 3]u8 = undefined;
     const p1 = try prepareRandomize("abc", csprng.random(), &out1);
@@ -889,11 +889,11 @@ test "prepareRandomize is non-deterministic across calls (fresh prefix each time
 // 2^32 vs 2^256). This test instead checks EVERY one of the 32 positions
 // independently across many draws.
 test "B10: prepareRandomize's 32-byte prefix carries real entropy in every byte position (audit mutation m12)" {
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x70} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x70)));
     const random = csprng.random();
 
     const draws = 64;
-    var seen: [randomizer_len][256]bool = [_][256]bool{[_]bool{false} ** 256} ** randomizer_len;
+    var seen: [randomizer_len][256]bool = @as([randomizer_len][256]bool, @splat(@as([256]bool, @splat(false))));
     var i: usize = 0;
     while (i < draws) : (i += 1) {
         var out: [randomizer_len]u8 = undefined;
@@ -917,7 +917,7 @@ test "pssEncode rejects a salt too long for the target size (RFC 8017 SS9.1.1 st
     var em: [16]u8 = undefined;
     try std.testing.expectError(
         error.EncodedMessageTooShort,
-        pssEncode(std.crypto.hash.sha2.Sha384, "m", &([_]u8{0} ** 40), 16 * 8, &em),
+        pssEncode(std.crypto.hash.sha2.Sha384, "m", &(@as([40]u8, @splat(0))), 16 * 8, &em),
     );
 }
 
@@ -954,7 +954,7 @@ test "feInvert reproduces the RFC 9474 published inv from r (and back) over the 
 
 test "feInvert rejects a factor of n (gcd(p, n) == p != 1)" {
     const pk = try kat.publicKey();
-    var p_wide = [_]u8{0} ** (kat.n.len);
+    var p_wide = @as([kat.n.len]u8, @splat(0));
     @memcpy(p_wide[kat.n.len - kat.p.len ..], &kat.p);
     const p_fe = try rsa.Fe.fromBytes(pk.n, &p_wide, .big);
     try std.testing.expectError(error.NotInvertible, feInvert(pk.n, p_fe));
@@ -1006,7 +1006,7 @@ test "B5: maskedInvert DRAWS a fresh scalar and RETRIES when the mask makes the 
     // First draw is `p`, a factor of `n`: `v = r*p mod n` still shares the
     // factor, so `feInvert` must fail and the loop must draw AGAIN. The second
     // draw is an ordinary value that works.
-    var second = [_]u8{0} ** kat.n.len;
+    var second = @as([kat.n.len]u8, @splat(0));
     second[kat.n.len - 1] = 0x07;
     var scripted = ScriptedRandom{ .values = &.{ &kat.p, &second } };
     const random = std.Random.init(&scripted, ScriptedRandom.fill);
@@ -1042,7 +1042,7 @@ test "B5: a mask that never changes cannot rescue a non-invertible product — t
 }
 
 test "maskedInvert matches the direct inverse (mask cancels exactly) and rejects non-invertible input" {
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x33} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x33)));
     const random = csprng.random();
     const pk = try kat.publicKey();
 
@@ -1052,7 +1052,7 @@ test "maskedInvert matches the direct inverse (mask cancels exactly) and rejects
     try inv.toBytes(&got, .big);
     try std.testing.expectEqualSlices(u8, &kat.a1.inv, &got);
 
-    var p_wide = [_]u8{0} ** (kat.n.len);
+    var p_wide = @as([kat.n.len]u8, @splat(0));
     @memcpy(p_wide[kat.n.len - kat.p.len ..], &kat.p);
     const p_fe = try rsa.Fe.fromBytes(pk.n, &p_wide, .big);
     try std.testing.expectError(error.NotInvertible, maskedInvert(pk.n, p_fe, random));
@@ -1096,7 +1096,7 @@ test "B12: isCoprime fails CLOSED (false), not open, when the underlying allocat
 }
 
 test "sampleFe: always in [1, n), even for a modulus with few top-byte bits" {
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x44} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x44)));
     const random = csprng.random();
     // 0x0209 = 521 (prime, 10 bits): the top byte carries only 2 usable
     // bits, so an unmasked draw would reject ~87% of the time — exercises
@@ -1122,7 +1122,7 @@ test "sampleFe: always in [1, n), even for a modulus with few top-byte bits" {
 // rejection). These two tests close that gap.
 
 test "B2: sampleFe is not biased toward the lower half of the modulus (audit mutation m7b)" {
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x66} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x66)));
     const random = csprng.random();
     // 1021 is prime; bits(1021) == 10 and 2^9 == 512 sits almost exactly at
     // 1021's own midpoint (50.1%) -- deliberately chosen so a real uniform
@@ -1159,7 +1159,7 @@ test "B2: sampleFe rejects a zero draw and retries rather than returning it (aud
             self.inner.bytes(buf);
         }
     };
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x67} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x67)));
     var scripted = ZeroThenRandom{ .inner = csprng.random(), .zeros_left = 1 };
     const random = std.Random.init(&scripted, ZeroThenRandom.fill);
 

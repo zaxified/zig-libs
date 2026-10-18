@@ -152,9 +152,9 @@ const ET_REL: u16 = 1;
 // Taken from std rather than re-declared: `STT_FUNC` is **2**, and writing 4
 // (which is `STT_FILE`) makes every function symbol invisible — a bug that
 // degrades silently into "one program per section, named after the section".
-const STT_FUNC: u4 = @intFromEnum(std.elf.STT.FUNC);
-const STT_OBJECT: u4 = @intFromEnum(std.elf.STT.OBJECT);
-const STT_SECTION: u4 = @intFromEnum(std.elf.STT.SECTION);
+const STT_FUNC: u4 = @backingInt(std.elf.STT.FUNC);
+const STT_OBJECT: u4 = @backingInt(std.elf.STT.OBJECT);
+const STT_SECTION: u4 = @backingInt(std.elf.STT.SECTION);
 
 /// BPF instruction classes (`code & 0x07`).
 const BPF_LD: u8 = 0x00;
@@ -895,7 +895,7 @@ fn parseBtfMaps(obj: *Object, a: std.mem.Allocator, sec_idx: usize, out: *std.Ar
                 else => {
                     const v = try uintMemberValue(b, mem.type_id);
                     switch (which) {
-                        .type => spec.map_type = @enumFromInt(v),
+                        .type => spec.map_type = @fromBackingInt(@intCast(v)),
                         .max_entries => spec.max_entries = v,
                         .map_flags => spec.map_flags = v,
                         .key_size => spec.key_size = v,
@@ -980,7 +980,7 @@ fn parseLegacyMaps(obj: *Object, a: std.mem.Allocator, sec_idx: usize, out: *std
         const d = data[at..][0..legacy_map_def_size];
         out.append(a, .{
             .name = a.dupe(u8, name) catch return error.OutOfMemory,
-            .map_type = @enumFromInt(std.mem.readInt(u32, d[0..4], .little)),
+            .map_type = @fromBackingInt(@intCast(std.mem.readInt(u32, d[0..4], .little))),
             .key_size = std.mem.readInt(u32, d[4..8], .little),
             .value_size = std.mem.readInt(u32, d[8..12], .little),
             .max_entries = std.mem.readInt(u32, d[12..16], .little),
@@ -1526,7 +1526,7 @@ fn needsEntries(t: BPF.MapType) bool {
 
 fn createMap(m: *const MapSpec) LoadError!linux.fd_t {
     var attr: BPF.MapCreateAttr = std.mem.zeroes(BPF.MapCreateAttr);
-    attr.map_type = @intFromEnum(m.map_type);
+    attr.map_type = @backingInt(m.map_type);
     attr.key_size = m.key_size;
     attr.value_size = m.value_size;
     attr.max_entries = m.max_entries;
@@ -2443,7 +2443,7 @@ test "hostile: truncated, non-ELF, and wrong-class objects are typed errors" {
     try testing.expectError(error.NotABpfObject, open(gpa, "", .{}));
     try testing.expectError(error.NotABpfObject, open(gpa, "not an elf at all, really", .{}));
     // Valid magic, truncated before the end of the Ehdr.
-    try testing.expectError(error.NotABpfObject, open(gpa, "\x7fELF\x02\x01\x01" ++ ("\x00" ** 20), .{}));
+    try testing.expectError(error.NotABpfObject, open(gpa, "\x7fELF\x02\x01\x01" ++ (strRepeat("\x00", 20)), .{}));
 
     // Every prefix of a real object: none may crash, hang, or leak.
     var cut: usize = 1;
@@ -2644,7 +2644,7 @@ test "hostile: a .maps VAR whose type is not a struct" {
 
     const info_at = btf_off + abs + 4;
     var info = std.mem.readInt(u32, img[info_at..][0..4], .little);
-    info = (info & 0xf0ff_ffff) | (@as(u32, @intFromEnum(btf_mod.Kind.int)) << 24);
+    info = (info & 0xf0ff_ffff) | (@as(u32, @backingInt(btf_mod.Kind.int)) << 24);
     std.mem.writeInt(u32, img[info_at..][0..4], info, .little);
 
     const e = open(gpa, img, .{});
@@ -3050,4 +3050,16 @@ test "corpus: every object seed reaches open, and the parsed counts are pinned" 
     defer gpa.free(overflow);
     ObjectCorpus.patchSymbolSizes(overflow, 8, 0xFFFF_FFFF_FFFF_FFF8);
     try testing.expectError(error.MalformedElf, open(gpa, overflow, .{}));
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

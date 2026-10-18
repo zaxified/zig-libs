@@ -81,7 +81,7 @@ pub const Reply = struct {
     lines: usize,
 
     pub fn class(self: Reply) Class {
-        return @enumFromInt(self.code / 100);
+        return @fromBackingInt(@intCast(self.code / 100));
     }
 
     pub fn isPositive(self: Reply) bool {
@@ -516,7 +516,7 @@ test "an over-long line is refused before it is buffered whole" {
     const gpa = testing.allocator;
     var p: Parser = .init(gpa, .{ .max_line = 64 }, .{});
     defer p.deinit();
-    const long = "250 " ++ "A" ** 200 ++ "\r\n";
+    const long = "250 " ++ strRepeat("A", 200) ++ "\r\n";
     try p.feed(long);
     try testing.expectError(error.ReplyLineTooLong, p.next());
 }
@@ -525,7 +525,7 @@ test "text accumulation is bounded even with a legal line count" {
     const gpa = testing.allocator;
     var p: Parser = .init(gpa, .{ .max_text = 32 }, .{});
     defer p.deinit();
-    try p.feed("250-" ++ "A" ** 20 ++ "\r\n250-" ++ "B" ** 20 ++ "\r\n250 done\r\n");
+    try p.feed("250-" ++ strRepeat("A", 20) ++ "\r\n250-" ++ strRepeat("B", 20) ++ "\r\n250 done\r\n");
     try testing.expectError(error.ReplyTooLong, p.next());
 }
 
@@ -533,7 +533,7 @@ test "pending input is bounded" {
     const gpa = testing.allocator;
     var p: Parser = .init(gpa, .{ .max_pending = 16 }, .{});
     defer p.deinit();
-    try testing.expectError(error.PendingTooLarge, p.feed("2" ** 32));
+    try testing.expectError(error.PendingTooLarge, p.feed(strRepeat("2", 32)));
 }
 
 test "one large feed moves at most as many bytes as it holds (amortized compact, A1 F13)" {
@@ -546,7 +546,7 @@ test "one large feed moves at most as many bytes as it holds (amortized compact,
     const lines = 1024;
     var p: Parser = .init(gpa, .{ .max_pending = 1 << 20 }, .{});
     defer p.deinit();
-    try p.feed(one ** lines);
+    try p.feed(strRepeat(one, lines));
 
     var moved: usize = 0;
     var compactions: usize = 0;
@@ -590,7 +590,7 @@ test "bench (opt-in via SMTP_BENCH_F1): total decode cost does not depend on how
     // concurrently with up to three other agents' lanes, is a flaky test
     // waiting to happen. Run it with:
     //   SMTP_BENCH_F1=1 scripts/modtest smtp -Doptimize=ReleaseFast
-    if (@import("builtin").mode == .Debug or std.testing.environ.getPosix("SMTP_BENCH_F1") == null) return error.SkipZigTest;
+    if (@import("builtin").mode == .debug or std.testing.environ.getPosix("SMTP_BENCH_F1") == null) return error.SkipZigTest;
 
     const gpa = testing.allocator;
     const one = "250 x\r\n";
@@ -672,8 +672,8 @@ const reply_seeds = [_][]const u8{
     seed("250-first\r\n251 different code\r\n"), // ReplyCodeMismatch
     seed("220 bare lf\n"), // BareLineFeed -- accepted only under allow_bare_lf
     seed("220 bare\rcr\r\n"), // BareCarriageReturn, in both modes
-    seed("250 " ++ "A" ** 300 ++ "\r\n"), // ReplyLineTooLong: over the harness's max_line of 256
-    seed("250-x\r\n" ** 17), // ReplyTooLong: one continuation past max_lines
+    seed("250 " ++ strRepeat("A", 300) ++ "\r\n"), // ReplyLineTooLong: over the harness's max_line of 256
+    seed(strRepeat("250-x\r\n", 17)), // ReplyTooLong: one continuation past max_lines
 };
 
 test "fuzz: no reply stream can crash, hang or leak the parser" {
@@ -739,4 +739,16 @@ test "corpus: every reply seed reaches the parser, and the accepted count is pin
     // Measured 2026-09-07: 0 of 17 seeds non-empty and 0 accepted before the
     // draw was fixed, 17 of 17 non-empty and 999 accepted after.
     try testing.expectEqual(@as(usize, 6), accepted);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

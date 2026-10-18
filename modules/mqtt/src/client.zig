@@ -649,7 +649,7 @@ pub const Client = struct {
                 !session_present
             else
                 e.len > c.server.maximum_packet_size or
-                    @intFromEnum(publishQos(c.outbox[e.offset..][0..e.len])) > @intFromEnum(c.server.maximum_qos) or
+                    @backingInt(publishQos(c.outbox[e.offset..][0..e.len])) > @backingInt(c.server.maximum_qos) or
                     c.entryRefused(c.outbox[e.offset..][0..e.len]);
             if (drop) {
                 c.removePending(e.id);
@@ -672,7 +672,7 @@ pub const Client = struct {
     }
 
     fn publishQos(bytes: []const u8) packet.QoS {
-        return @enumFromInt((bytes[0] >> 1) & 0x3);
+        return @fromBackingInt(@intCast((bytes[0] >> 1) & 0x3));
     }
 
     /// Send, in order, the outbox entries not yet transmitted on this
@@ -720,7 +720,7 @@ pub const Client = struct {
         const alias_only = topic_name.len == 0 and o.properties.topic_alias != null;
         if (!alias_only) topic_rules.validateName(topic_name) catch return error.InvalidTopic;
         if (c.version != .v5) return;
-        if (@intFromEnum(o.qos) > @intFromEnum(c.server.maximum_qos)) return error.QosNotSupported;
+        if (@backingInt(o.qos) > @backingInt(c.server.maximum_qos)) return error.QosNotSupported;
         if (o.retain and !c.server.retain_available) return error.RetainNotSupported;
         if (!o.properties.subscription_ids.isEmpty()) return error.InvalidProperty; // 3.3.4-6
         if (o.properties.topic_alias) |a| if (a > c.server.topic_alias_maximum) return error.TopicAliasInvalid;
@@ -1608,7 +1608,7 @@ test "v5 CONNACK: a refusal disconnects; the server's limits hold every later pu
     try testing.expectError(error.RetainNotSupported, c.publish(1, "t", "x", .{ .retain = true }));
     try testing.expectError(error.TopicAliasInvalid, c.publish(1, "t", "x", .{ .properties = .{ .topic_alias = 3 } }));
     try testing.expectError(error.InvalidProperty, c.publish(1, "t", "x", .{ .properties = .{ .subscription_ids = .{ .items = &.{1} } } }));
-    try testing.expectError(error.PacketTooLarge, c.publish(1, "t", "x" ** 40, .{ .qos = .at_least_once }));
+    try testing.expectError(error.PacketTooLarge, c.publish(1, "t", strRepeat("x", 40), .{ .qos = .at_least_once }));
     try testing.expectEqual(@as(usize, 0), c.pending_len); // the refused publish holds no id
 
     // Receive Maximum 2: the third unacknowledged QoS 1 publish waits for an ack.
@@ -1640,7 +1640,7 @@ test "v5 inbound Topic Aliases: set, reused with an empty topic, and every inval
     try feed5(&c, .{ .publish = .{ .topic = "t", .payload = "x", .properties = .{ .topic_alias = 3 } } }); // above ours
     try testing.expectError(error.TopicAliasInvalid, c.poll(1));
     c.resetRx();
-    try feed5(&c, .{ .publish = .{ .topic = "a/" ++ "x" ** alias_topic_capacity, .properties = .{ .topic_alias = 2 } } }); // too long to keep
+    try feed5(&c, .{ .publish = .{ .topic = "a/" ++ strRepeat("x", alias_topic_capacity), .properties = .{ .topic_alias = 2 } } }); // too long to keep
     try testing.expectError(error.TopicAliasInvalid, c.poll(1));
     c.resetRx();
 
@@ -1771,4 +1771,16 @@ test "v5 SUBSCRIBE options, UNSUBACK codes and DISCONNECT with a reason go out a
     var c3 = try makeConnected(&t3, &rx, &tx);
     try testing.expectError(error.UnsupportedInVersion, c3.subscribe(1, &.{.{ .filter = "a", .no_local = true }}));
     try testing.expectError(error.UnsupportedInVersion, c3.publish(1, "a", "x", .{ .properties = .{ .message_expiry_interval = 1 } }));
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

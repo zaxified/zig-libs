@@ -234,7 +234,7 @@ fn nonceExtsDer(b: der_writer.Builder, nonce: []const u8) ![]const u8 {
 /// *does* force a SHA-1 issuer-digest computation ahead of the real
 /// SHA-256 entry when both are walked in one `BasicOCSPResponse`.
 fn decoySha1CertIdDer(b: der_writer.Builder) ![]const u8 {
-    const zero20 = [_]u8{0} ** 20;
+    const zero20 = @as([20]u8, @splat(0));
     const alg = try b.seq(&.{ try b.oid(&oid_sha1), try b.null() });
     return b.seq(&.{
         alg,
@@ -313,7 +313,7 @@ fn buildResponseImpl(gpa: std.mem.Allocator, spec: RespSpec, with_decoy: bool) !
         signature = try b.a.dupe(u8, signature);
         sig_alg = try b.seq(&.{ try b.oid(&oid_sha256_rsa), try b.null() });
     } else if (spec.sign_ecdsa) |sk| {
-        const rs = try p256.sign.ecdsaSign(&sk, tbs, &([_]u8{0x2b} ** 32));
+        const rs = try p256.sign.ecdsaSign(&sk, tbs, &(@as([32]u8, @splat(0x2b))));
         signature = try ecdsaRsToDer(b, rs);
         sig_alg = try b.seq(&.{try b.oid(&oid_ecdsa_sha256)});
     } else return error.NoSigner;
@@ -1088,7 +1088,7 @@ test "verify: ECDSA-P256 direct-issuer signature accepted" {
     defer fx.deinit(gpa);
     const subject = try extractBits(fx.subject_der);
 
-    const kp = try p256.EcdsaP256Sha256.KeyPair.generateDeterministic([_]u8{0x77} ** 32);
+    const kp = try p256.EcdsaP256Sha256.KeyPair.generateDeterministic(@as([32]u8, @splat(0x77)));
     const sec1 = kp.public_key.toUncompressedSec1();
 
     var arena = std.heap.ArenaAllocator.init(gpa);
@@ -1223,7 +1223,7 @@ const parse_static_seeds = [_][]const u8{
     fuzzseed.seedHex("30840000ffff"), // a 4-octet long-form length claiming 65535 octets
     fuzzseed.seedHex("300a0a010030050603551d13"), // status 0 then a nested OID, not the basic-response wrapper
     fuzzseed.seedHex("30060a0101a00100"), // a non-zero responseStatus with a body behind it
-    fuzzseed.seedHex("ff" ** 64), // no DER structure at all
+    fuzzseed.seedHex(strRepeat("ff", 64)), // no DER structure at all
 };
 
 test "fuzz: parseResponse never panics on arbitrary bytes" {
@@ -1666,7 +1666,7 @@ fn verifyHarness(comptime S: type, smith: *S, ctx: *const VerifyFuzzCtx) !void {
 /// whose flips cancel, would leave "no crashes" reported for ever again — so
 /// the count of armed rounds is measured here, deterministically.
 fn verifyCorpusGuard(ctx: *const VerifyFuzzCtx) !void {
-    var modes = [_]usize{0} ** 5;
+    var modes = @as([5]usize, @splat(0));
     var armed: usize = 0;
     var nonempty: usize = 0;
     var script_octets: usize = 0;
@@ -1715,8 +1715,8 @@ const verify_seeds = [_][]const u8{
     fuzzseed.seedHex("03" ++ "02" ++ "0020" ++ "7f" ++ "0100" ++ "01" ++ "ffff" ++ "ffff" ++ "ffff"), // damage the subject cert, with the clock at its far end
     fuzzseed.seedHex("04" ++ "0000" ++ "0000" ++ "0000" ++ "0000" ++ "0000"), // ⭐ mode 4 with BOTH certificates empty
     fuzzseed.seedHex("04" ++ "0001" ++ "0001" ++ "30" ++ "30" ++ "0000" ++ "0000" ++ "0000"), // a single octet each
-    fuzzseed.seedHex("04" ++ "0400" ++ "0400" ++ "30820100" ** 4 ++ "0000" ++ "0000" ++ "0e10"), // 1024 octets each, opening like a certificate and then cycling
-    fuzzseed.seedHex("04" ++ "03e8" ++ "0064" ++ "ff" ** 32 ++ "0000" ++ "0000" ++ "0000"), // no DER structure at all where a certificate belongs
+    fuzzseed.seedHex("04" ++ "0400" ++ "0400" ++ strRepeat("30820100", 4) ++ "0000" ++ "0000" ++ "0e10"), // 1024 octets each, opening like a certificate and then cycling
+    fuzzseed.seedHex("04" ++ "03e8" ++ "0064" ++ strRepeat("ff", 32) ++ "0000" ++ "0000" ++ "0000"), // no DER structure at all where a certificate belongs
 };
 
 /// Extract the SubjectPublicKeyInfo TLV bytes from a certificate.
@@ -1831,4 +1831,16 @@ test "TEETH: no byte of a response, its embedded delegate certificate included, 
         }
     }
     try testing.expectEqual(@as(usize, 0), outside_survivors);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

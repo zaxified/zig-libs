@@ -566,7 +566,7 @@ test "iterator over an empty stream yields nothing" {
 }
 
 test "zero-length elements still advance (no infinite loop)" {
-    const ies = [_]u8{ 0, 0, 1, 0, 3, 0 } ** 8;
+    const ies = arrRepeat(u8, &.{ 0, 0, 1, 0, 3, 0 }, 8);
     var it: Iterator = .{ .buf = &ies };
     var n: usize = 0;
     while (try it.next()) |_| n += 1;
@@ -682,7 +682,7 @@ test "RSN: an element ending exactly at the end of the PMKID list is not Malform
         0x00, 0x00,
         0x00, 0x00,
         0x01, 0x00, // pmkid_count = 1
-    } ++ [_]u8{0xaa} ** 16;
+    } ++ @as([16]u8, @splat(0xaa));
     r = try parseRsn(&one_pmkid);
     try testing.expectEqual(@as(u16, 1), r.pmkid_count);
     try testing.expectEqual(@as(?u32, null), r.group_mgmt_cipher);
@@ -746,7 +746,7 @@ test "summarize on a hidden-SSID beacon" {
 
 test "summarize: an SSID element exactly at max_ssid_len is accepted, one byte more is skipped" {
     // At the cap: 32-byte SSID, accepted verbatim.
-    const at_cap = [_]u8{ 0, uapi.max_ssid_len } ++ [_]u8{'a'} ** uapi.max_ssid_len;
+    const at_cap = [_]u8{ 0, uapi.max_ssid_len } ++ @as([uapi.max_ssid_len]u8, @splat('a'));
     const s_at_cap = summarize(&at_cap);
     try testing.expectEqual(@as(usize, uapi.max_ssid_len), s_at_cap.ssid.len);
     try testing.expect(!s_at_cap.hidden_ssid);
@@ -756,7 +756,7 @@ test "summarize: an SSID element exactly at max_ssid_len is accepted, one byte m
     // unconditionally and would overflow a caller's `max_ssid_len`-sized
     // buffer (e.g. `iface.Interface.ssid_buf`). The oversized element is
     // now skipped: `s.ssid` stays empty rather than 33 bytes long.
-    const over_cap = [_]u8{ 0, uapi.max_ssid_len + 1 } ++ [_]u8{'a'} ** (uapi.max_ssid_len + 1);
+    const over_cap = [_]u8{ 0, uapi.max_ssid_len + 1 } ++ @as([uapi.max_ssid_len + 1]u8, @splat('a'));
     const s_over_cap = summarize(&over_cap);
     try testing.expectEqual(@as(usize, 0), s_over_cap.ssid.len);
     // …and the caller can tell that apart from "hidden" and from "no SSID
@@ -787,7 +787,7 @@ test "TEETH: the FIRST SSID element decides, as Wireshark and `find` both do" {
     // "homewifi" — disagreeing with every capture tool AND with its own
     // `find(ies, EID.SSID)`, which returns the first. A transmitter in range
     // chooses both elements, so it chose which name this module reported.
-    const ies = [_]u8{ 0, uapi.max_ssid_len + 1 } ++ [_]u8{'A'} ** (uapi.max_ssid_len + 1) ++
+    const ies = [_]u8{ 0, uapi.max_ssid_len + 1 } ++ @as([uapi.max_ssid_len + 1]u8, @splat('A')) ++
         [_]u8{ 0, 8, 'h', 'o', 'm', 'e', 'w', 'i', 'f', 'i' } ++
         [_]u8{ 3, 1, 6 };
     const s = summarize(&ies);
@@ -938,7 +938,7 @@ const ie_seeds = [_]IeSeed{
         .freq_mhz = 5180,
     },
     // Zero-length elements: legal, and they must still advance the walk.
-    .{ .ies = &([_]u8{ 0, 0, 1, 0, 3, 0 } ** 8), .freq_mhz = 2437 },
+    .{ .ies = &(arrRepeat(u8, &.{ 0, 0, 1, 0, 3, 0 }, 8)), .freq_mhz = 2437 },
     // An extension element at the very end with no extension id, and an
     // element declaring 200 octets over a four-octet stream.
     .{ .ies = &[_]u8{ 255, 0 }, .freq_mhz = 5745 },
@@ -1068,4 +1068,12 @@ test "corpus: every IE seed reaches the walk, and the counts are pinned" {
     try testing.expectEqual(entries.len, freqs);
     try testing.expectEqual(@as(usize, 40), elements);
     try testing.expectEqual(@as(usize, 3), protected);
+}
+
+/// Comptime array repetition; replaces the `**` operator removed in Zig 0.17.
+fn arrRepeat(comptime T: type, comptime unit: []const T, comptime n: usize) [unit.len * n]T {
+    @setEvalBranchQuota(n * unit.len * 2 + 1000);
+    var buf: [unit.len * n]T = undefined;
+    for (0..n) |i| @memcpy(buf[i * unit.len ..][0..unit.len], unit);
+    return buf;
 }

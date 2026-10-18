@@ -188,7 +188,7 @@ fn forceAll(comptime T: type, comptime depth: u8, comptime seen: []const type) v
     // the compiler rejects it ("comptime control flow inside runtime block").
     // The dispatch has to be a plain if/else chain.
     inline for (comptime std.meta.declarations(T)) |decl| {
-        const d = @field(T, decl.name);
+        const d = @field(T, decl);
         const is_type = @TypeOf(d) == type;
         // ⚠ Both conditions must be forced to comptime. `isContainer` is an
         // ordinary function, so `is_type and isContainer(d)` is a RUNTIME bool
@@ -208,7 +208,7 @@ fn forceAll(comptime T: type, comptime depth: u8, comptime seen: []const type) v
             } else {
                 // Taking the address is what forces the body through semantic
                 // analysis; naming the declaration alone does not.
-                force(T, decl.name);
+                force(T, decl);
             }
         }
     }
@@ -240,8 +240,8 @@ fn forceAll(comptime T: type, comptime depth: u8, comptime seen: []const type) v
 fn force(comptime T: type, comptime name: []const u8) void {
     const d = @field(T, name);
     const info = @typeInfo(@TypeOf(d));
-    if (comptime info == .@"fn" and info.@"fn".calling_convention == .@"inline" and
-        !info.@"fn".is_generic and !info.@"fn".is_var_args)
+    if (comptime info == .@"fn" and info.@"fn".attrs.@"callconv" == .@"inline" and
+        !info.@"fn".is_generic and !info.@"fn".attrs.varargs)
     {
         const F = @TypeOf(d);
         const wrapper = struct {

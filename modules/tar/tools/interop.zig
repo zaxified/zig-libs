@@ -39,8 +39,8 @@ fn with(item: Item, comptime field: []const u8, value: anytype) Item {
     return it;
 }
 
-const long150 = "d" ** 49 ++ "/" ++ "e" ** 100;
-const long300 = "p" ** 300;
+const long150 = strRepeat("d", 49) ++ "/" ++ strRepeat("e", 100);
+const long300 = strRepeat("p", 300);
 
 const basic = [_]Item{
     f("a.txt", "hello\n"),
@@ -48,8 +48,8 @@ const basic = [_]Item{
     .{ .entry = .{ .path = "d/link", .kind = .symlink, .mode = 0o777, .mtime = 1_600_000_000, .link_target = "../a.txt" } },
     .{ .entry = .{ .path = "hard", .kind = .hardlink, .mode = 0o644, .mtime = 1_600_000_000, .link_target = "a.txt" } },
     f("empty", ""),
-    f("b512", "x" ** 512),
-    f("b513", "y" ** 513),
+    f("b512", strRepeat("x", 512)),
+    f("b513", strRepeat("y", 513)),
     with(f("setuid", "s"), "mode", 0o4755),
     with(f("allbits", "a"), "mode", 0o7777),
     f("\xc4\x8d.txt", "c\n"),
@@ -58,7 +58,7 @@ const basic = [_]Item{
 const long = [_]Item{
     f(long150, "split\n"),
     f(long300, "whole\n"),
-    .{ .entry = .{ .path = "l", .kind = .symlink, .mode = 0o777, .mtime = 1_600_000_000, .link_target = "t" ** 150 } },
+    .{ .entry = .{ .path = "l", .kind = .symlink, .mode = 0o777, .mtime = 1_600_000_000, .link_target = strRepeat("t", 150) } },
     .{ .entry = .{ .path = "h", .kind = .hardlink, .mode = 0o644, .mtime = 1_600_000_000, .link_target = long300 } },
 };
 
@@ -254,4 +254,16 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     }
     std.debug.print("interop-tar: {s}\n", .{if (ok) "OK" else "NOT OK"});
     return if (ok) 0 else 1;
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

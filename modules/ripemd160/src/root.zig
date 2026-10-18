@@ -311,7 +311,7 @@ test "million 'a' vector — LE-length padding stress" {
     // in chunks so both the multi-block compress loop and the LE length
     // suffix (the historic RIPEMD/SHA endian mixup bug) are exercised.
     var d = Ripemd160.init(.{});
-    var chunk: [1000]u8 = [_]u8{'a'} ** 1000;
+    var chunk: [1000]u8 = @as([1000]u8, @splat('a'));
     for (0..1000) |_| d.update(&chunk);
     var out: [Ripemd160.digest_length]u8 = undefined;
     d.final(&out);
@@ -475,11 +475,11 @@ test "HMAC-RIPEMD160: RFC 2286 test vectors via std.crypto.auth.hmac.Hmac(Ripemd
     const Hmac = std.crypto.auth.hmac.Hmac(Ripemd160);
     const Case = struct { key: []const u8, msg: []const u8, hex: *const [40]u8 };
     const cases = [_]Case{
-        .{ .key = "\x0b" ** 20, .msg = "Hi There", .hex = "24cb4bd67d20fc1a5d2ed7732dcc39377f0a5668" },
+        .{ .key = strRepeat("\x0b", 20), .msg = "Hi There", .hex = "24cb4bd67d20fc1a5d2ed7732dcc39377f0a5668" },
         .{ .key = "Jefe", .msg = "what do ya want for nothing?", .hex = "dda6c0213a485a9e24f4742064a7f033b43c4069" },
-        .{ .key = "\xaa" ** 20, .msg = "\xdd" ** 50, .hex = "b0b105360de759960ab4f35298e116e295d8e7c1" },
-        .{ .key = "\xaa" ** 80, .msg = "Test Using Larger Than Block-Size Key - Hash Key First", .hex = "6466ca07ac5eac29e1bd523e5ada7605b791fd8b" },
-        .{ .key = "\xaa" ** 131, .msg = "Test With Truncation", .hex = "d02200748bbc0d22c4ff839623ce1f0fcba3d2d7" },
+        .{ .key = strRepeat("\xaa", 20), .msg = strRepeat("\xdd", 50), .hex = "b0b105360de759960ab4f35298e116e295d8e7c1" },
+        .{ .key = strRepeat("\xaa", 80), .msg = "Test Using Larger Than Block-Size Key - Hash Key First", .hex = "6466ca07ac5eac29e1bd523e5ada7605b791fd8b" },
+        .{ .key = strRepeat("\xaa", 131), .msg = "Test With Truncation", .hex = "d02200748bbc0d22c4ff839623ce1f0fcba3d2d7" },
         .{ .key = "k", .msg = "", .hex = "1c4760c49feb2f7bb5a8390950a48521d6557be5" },
         .{ .key = "", .msg = "", .hex = "44d86b658a3e7cbc1a2010848b53e35c917720ca" },
     };
@@ -535,15 +535,15 @@ const stream_seeds = [_][]const u8{
     fuzzseed.seed("message digest"), // the KAT above
     fuzzseed.seed("abcdefghijklmnopqrstuvwxyz"), // the KAT above
     fuzzseed.seed("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"), // 62 octets: one short of a block
-    fuzzseed.seed("1234567890" ** 8), // the 80-octet KAT: one full block plus a 16-octet remainder
-    fuzzseed.seed("x" ** 55), // ⭐ 55: the last length whose padding still fits in the same block
-    fuzzseed.seed("x" ** 56), // ⭐ 56: the first length that forces a SECOND padding block
-    fuzzseed.seed("x" ** 63), // one octet short of a block
-    fuzzseed.seed("x" ** 64), // exactly one block: the loop consumes it and the remainder is empty
-    fuzzseed.seed("x" ** 65), // a block plus one
-    fuzzseed.seed("\x00" ** 128), // two whole blocks of zeroes
-    fuzzseed.seed("\xff\x00\x80\x7f" ** 48), // 192 octets, three blocks, high bytes
-    fuzzseed.seed("Q" ** 200), // over two blocks with a 72-octet remainder, and 200 > 97 so the split loop runs at least three times
+    fuzzseed.seed(strRepeat("1234567890", 8)), // the 80-octet KAT: one full block plus a 16-octet remainder
+    fuzzseed.seed(strRepeat("x", 55)), // ⭐ 55: the last length whose padding still fits in the same block
+    fuzzseed.seed(strRepeat("x", 56)), // ⭐ 56: the first length that forces a SECOND padding block
+    fuzzseed.seed(strRepeat("x", 63)), // one octet short of a block
+    fuzzseed.seed(strRepeat("x", 64)), // exactly one block: the loop consumes it and the remainder is empty
+    fuzzseed.seed(strRepeat("x", 65)), // a block plus one
+    fuzzseed.seed(strRepeat("\x00", 128)), // two whole blocks of zeroes
+    fuzzseed.seed(strRepeat("\xff\x00\x80\x7f", 48)), // 192 octets, three blocks, high bytes
+    fuzzseed.seed(strRepeat("Q", 200)), // over two blocks with a 72-octet remainder, and 200 > 97 so the split loop runs at least three times
 };
 
 test "fuzz: streaming update matches one-shot hash, at every split the input picks" {
@@ -570,10 +570,10 @@ const Replay = struct {
 
 const fuzz_driver = fuzzseed.driver;
 const Reach = enum { empty, one_chunk, multi_chunk, block_plus };
-var reach: [@typeInfo(Reach).@"enum".fields.len]usize = @splat(0);
+var reach: [@typeInfo(Reach).@"enum".field_names.len]usize = @splat(0);
 
 fn mark(comptime l: Reach) void {
-    reach[@intFromEnum(l)] += 1;
+    reach[@backingInt(l)] += 1;
     fuzz_driver.hit(@tagName(l));
 }
 
@@ -646,7 +646,7 @@ test "fuzz harness: 500 seeds in every test run, and it gets everywhere" {
         };
     }
     for (reach, 0..) |n, i| if (n == 0) {
-        std.debug.print("reach: label {t} never hit in 500 seeds\n", .{@as(Reach, @enumFromInt(i))});
+        std.debug.print("reach: label {t} never hit in 500 seeds\n", .{@as(Reach, @fromBackingInt(@intCast(i)))});
         return error.HarnessDoesNotReach;
     };
 }
@@ -686,4 +686,16 @@ test "corpus: every seed reaches update, and the split the harness performs is p
     try testing.expectEqual(@as(usize, 1009), octets);
     try testing.expectEqual(@as(usize, 168), updates);
     try testing.expectEqual(@as(usize, 12), multi_chunk);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

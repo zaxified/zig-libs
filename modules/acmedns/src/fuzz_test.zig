@@ -22,10 +22,10 @@ const publishers = @import("publishers.zig");
 const zone = @import("zone.zig");
 
 pub const Label = enum { json_rejected, json_parsed, txt_rejected, txt_absent, txt_found };
-var reach: [@typeInfo(Label).@"enum".fields.len]usize = @splat(0);
+var reach: [@typeInfo(Label).@"enum".field_names.len]usize = @splat(0);
 
 fn mark(comptime l: Label) void {
-    reach[@intFromEnum(l)] += 1;
+    reach[@backingInt(l)] += 1;
     fuzz_driver.hit(@tagName(l));
 }
 
@@ -129,7 +129,7 @@ test "fuzz harness: 500 seeds in every test run, and they get everywhere" {
         try txtHarness(fuzz_driver.Rng, &rng, testing.allocator);
     }
     for (reach, 0..) |n, i| if (n == 0) {
-        std.debug.print("reach: label {t} never hit in 500 seeds\n", .{@as(Label, @enumFromInt(i))});
+        std.debug.print("reach: label {t} never hit in 500 seeds\n", .{@as(Label, @fromBackingInt(@intCast(i)))});
         return error.HarnessDoesNotReach;
     };
 }

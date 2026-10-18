@@ -446,7 +446,7 @@ pub const Config = struct {
         }
         // Checked in every mode/role (harmless where the field is unused):
         // a config error should not depend on which side reads the config.
-        if (!groupAdvertised(@intFromEnum(self.key_share_group))) return error.UnsupportedKeyShareGroup;
+        if (!groupAdvertised(@backingInt(self.key_share_group))) return error.UnsupportedKeyShareGroup;
         switch (self.key_exchange) {
             .psk => {
                 if (self.psk.len == 0) return error.EmptyPsk;
@@ -871,7 +871,7 @@ const default_signature_algorithms = [_]certverify.SignatureScheme{
 const supported_scheme_wire_values = blk: {
     const all = std.enums.values(certverify.SignatureScheme);
     var out: [all.len]u16 = undefined;
-    for (all, 0..) |s, i| out[i] = @intFromEnum(s);
+    for (all, 0..) |s, i| out[i] = @backingInt(s);
     break :blk out;
 };
 
@@ -883,9 +883,9 @@ const supported_scheme_wire_values = blk: {
 fn signatureAlgorithmsExtension(schemes: []const certverify.SignatureScheme, buf: []u8) HandshakeError!messages.Extension {
     var raw: [8]u16 = undefined;
     if (schemes.len > raw.len) return error.BufferTooShort;
-    for (schemes, 0..) |s, i| raw[i] = @intFromEnum(s);
+    for (schemes, 0..) |s, i| raw[i] = @backingInt(s);
     const data = messages.encodeSignatureAlgorithms(raw[0..schemes.len], buf) catch return error.BufferTooShort;
-    return .{ .ext_type = @intFromEnum(messages.ExtensionType.signature_algorithms), .data = data };
+    return .{ .ext_type = @backingInt(messages.ExtensionType.signature_algorithms), .data = data };
 }
 
 /// RFC 8446 §4.2.3 `signature_algorithms` negotiation: picks the
@@ -917,7 +917,7 @@ fn selectSignatureScheme(
         }
         if (!ours_too) continue;
         for (peer_sig_algs) |peer_raw| {
-            if (peer_raw == @intFromEnum(candidate)) return candidate;
+            if (peer_raw == @backingInt(candidate)) return candidate;
         }
     }
     return error.NoSignatureSchemeOverlap;
@@ -925,9 +925,9 @@ fn selectSignatureScheme(
 
 // ── (EC)DHE groups: the `.cert_dhe` key exchange ──────────────────────────
 
-const x25519_group: u16 = @intFromEnum(messages.NamedGroup.x25519);
-const secp256r1_group: u16 = @intFromEnum(messages.NamedGroup.secp256r1);
-const x25519_mlkem768_group: u16 = @intFromEnum(messages.NamedGroup.x25519_ml_kem768);
+const x25519_group: u16 = @backingInt(messages.NamedGroup.x25519);
+const secp256r1_group: u16 = @backingInt(messages.NamedGroup.secp256r1);
+const x25519_mlkem768_group: u16 = @backingInt(messages.NamedGroup.x25519_ml_kem768);
 
 /// The ML-KEM-768 half of the `x25519_ml_kem768` hybrid. The construction is
 /// draft-ietf-tls-ecdhe-mlkem's, transcribed here rather than taken from
@@ -1394,7 +1394,7 @@ fn cookieMac(hr: HelloRetryConfig, plaintext: []const u8) [cookie_mac_len]u8 {
 /// remember it had already sent one.
 fn mintCookie(hr: HelloRetryConfig, c: CookieContents, out: *[cookie_len]u8) void {
     out[0] = cookie_version;
-    std.mem.writeInt(u16, out[1..3], @intFromEnum(c.suite), .big);
+    std.mem.writeInt(u16, out[1..3], @backingInt(c.suite), .big);
     @memcpy(out[3..35], &c.client_hello1_hash);
     const mac = cookieMac(hr, out[0..cookie_plaintext_len]);
     @memcpy(out[cookie_plaintext_len..], &mac);
@@ -1450,13 +1450,13 @@ fn encodeHelloRetryRequest(suite: CipherSuite, cookie: []const u8, body_buf: []u
     if (cookie.len > max_cookie_len) return error.BufferTooShort;
     const cookie_ext = messages.encodeCookieExtension(cookie, &cookie_ext_buf) catch return error.BufferTooShort;
     const exts = [_]messages.Extension{
-        .{ .ext_type = @intFromEnum(messages.ExtensionType.supported_versions), .data = versions },
-        .{ .ext_type = @intFromEnum(messages.ExtensionType.cookie), .data = cookie_ext },
+        .{ .ext_type = @backingInt(messages.ExtensionType.supported_versions), .data = versions },
+        .{ .ext_type = @backingInt(messages.ExtensionType.cookie), .data = cookie_ext },
     };
     return messages.encodeServerHello(.{
         .random = messages.hello_retry_request_random,
         .legacy_session_id_echo = &.{},
-        .cipher_suite = @intFromEnum(suite),
+        .cipher_suite = @backingInt(suite),
         .extensions = &exts,
     }, body_buf) catch return error.BufferTooShort;
 }
@@ -1760,9 +1760,9 @@ pub const Connection = struct {
             // a share in (default `.x25519`; `.x25519_ml_kem768` for the PQ
             // hybrid). A server that wants a different one says so with a
             // HelloRetryRequest (`handleHelloRetryRequest`).
-            .cert_dhe, .cert_dhe_insecure_unauthenticated => try self.buildClientHelloCertDhe(entropy, null, @intFromEnum(self.config.key_share_group), &ch_body_buf),
+            .cert_dhe, .cert_dhe_insecure_unauthenticated => try self.buildClientHelloCertDhe(entropy, null, @backingInt(self.config.key_share_group), &ch_body_buf),
         };
-        self.transcript.append(@intFromEnum(messages.HandshakeType.client_hello), ch_body);
+        self.transcript.append(@backingInt(messages.HandshakeType.client_hello), ch_body);
         // ClientHello1 is the first message, so the transcript hash right
         // now IS `Hash(ClientHello1)` — the value RFC 8446 §4.4.1's
         // `message_hash` rewrite needs if a HelloRetryRequest arrives. It has
@@ -1770,7 +1770,7 @@ pub const Connection = struct {
         self.client_hello1_hash = self.transcript.currentHash();
 
         var frag_buf: [max_client_hello_body + handshake.header_len]u8 = undefined;
-        const fragment = try frameHandshakeMessage(@intFromEnum(messages.HandshakeType.client_hello), self.message_seq, ch_body, &frag_buf);
+        const fragment = try frameHandshakeMessage(@backingInt(messages.HandshakeType.client_hello), self.message_seq, ch_body, &frag_buf);
         self.message_seq +%= 1;
 
         const ch_seq = self.hs0.send_seq;
@@ -2180,7 +2180,7 @@ pub const Connection = struct {
 
         var cs_arr: [8]u16 = undefined;
         if (self.config.cipher_suites.len > cs_arr.len) return error.BufferTooShort;
-        for (self.config.cipher_suites, 0..) |cs, i| cs_arr[i] = @intFromEnum(cs);
+        for (self.config.cipher_suites, 0..) |cs, i| cs_arr[i] = @backingInt(cs);
         const cs_list = cs_arr[0..self.config.cipher_suites.len];
 
         var modes_buf: [4]u8 = undefined;
@@ -2190,7 +2190,7 @@ pub const Connection = struct {
         const sigalgs_ext = try signatureAlgorithmsExtension(self.config.signature_algorithms, &sigalgs_buf);
 
         // 32-byte (SHA-256) placeholder binder, patched below.
-        var placeholder_binder = [_]u8{0} ** 32;
+        var placeholder_binder = @as([32]u8, @splat(0));
         var psk_buf: [128]u8 = undefined;
         const identities = [_]messages.PskIdentity{.{ .identity = self.config.psk_identity, .obfuscated_ticket_age = 0 }};
         const binders = [_][]const u8{&placeholder_binder};
@@ -2217,21 +2217,21 @@ pub const Connection = struct {
         // the binder is computed over everything that precedes it.
         var exts_buf: [7]messages.Extension = undefined;
         var n_exts: usize = 0;
-        exts_buf[n_exts] = .{ .ext_type = @intFromEnum(messages.ExtensionType.supported_versions), .data = versions_ext };
+        exts_buf[n_exts] = .{ .ext_type = @backingInt(messages.ExtensionType.supported_versions), .data = versions_ext };
         n_exts += 1;
-        exts_buf[n_exts] = .{ .ext_type = @intFromEnum(messages.ExtensionType.supported_groups), .data = groups_ext };
+        exts_buf[n_exts] = .{ .ext_type = @backingInt(messages.ExtensionType.supported_groups), .data = groups_ext };
         n_exts += 1;
-        exts_buf[n_exts] = .{ .ext_type = @intFromEnum(messages.ExtensionType.key_share), .data = key_share_ext };
+        exts_buf[n_exts] = .{ .ext_type = @backingInt(messages.ExtensionType.key_share), .data = key_share_ext };
         n_exts += 1;
-        exts_buf[n_exts] = .{ .ext_type = @intFromEnum(messages.ExtensionType.psk_key_exchange_modes), .data = modes_ext };
+        exts_buf[n_exts] = .{ .ext_type = @backingInt(messages.ExtensionType.psk_key_exchange_modes), .data = modes_ext };
         n_exts += 1;
         exts_buf[n_exts] = sigalgs_ext;
         n_exts += 1;
         if (cookie_ext) |c| {
-            exts_buf[n_exts] = .{ .ext_type = @intFromEnum(messages.ExtensionType.cookie), .data = c };
+            exts_buf[n_exts] = .{ .ext_type = @backingInt(messages.ExtensionType.cookie), .data = c };
             n_exts += 1;
         }
-        exts_buf[n_exts] = .{ .ext_type = @intFromEnum(messages.ExtensionType.pre_shared_key), .data = psk_ext_data };
+        exts_buf[n_exts] = .{ .ext_type = @backingInt(messages.ExtensionType.pre_shared_key), .data = psk_ext_data };
         n_exts += 1;
         const exts = exts_buf[0..n_exts];
 
@@ -2259,7 +2259,7 @@ pub const Connection = struct {
         const binder_len: usize = 2 + 1 + 32;
         if (ch_full.len < binder_len) return error.Malformed;
         const truncated = ch_full[0 .. ch_full.len - binder_len];
-        const binder_th = self.transcript.wouldBeHash(@intFromEnum(messages.HandshakeType.client_hello), ch_full.len, truncated);
+        const binder_th = self.transcript.wouldBeHash(@backingInt(messages.HandshakeType.client_hello), ch_full.len, truncated);
 
         const Hkdf = std.crypto.kdf.hkdf.HkdfSha256;
         const Hmac = std.crypto.auth.hmac.sha2.HmacSha256;
@@ -2326,7 +2326,7 @@ pub const Connection = struct {
 
         var cs_arr: [8]u16 = undefined;
         if (self.config.cipher_suites.len > cs_arr.len) return error.BufferTooShort;
-        for (self.config.cipher_suites, 0..) |cs, i| cs_arr[i] = @intFromEnum(cs);
+        for (self.config.cipher_suites, 0..) |cs, i| cs_arr[i] = @backingInt(cs);
         const cs_list = cs_arr[0..self.config.cipher_suites.len];
 
         var groups_buf: [2 + 2 * advertised_groups.len]u8 = undefined;
@@ -2356,16 +2356,16 @@ pub const Connection = struct {
 
         var exts_buf: [5]messages.Extension = undefined;
         var n_exts: usize = 0;
-        exts_buf[n_exts] = .{ .ext_type = @intFromEnum(messages.ExtensionType.supported_versions), .data = versions_ext };
+        exts_buf[n_exts] = .{ .ext_type = @backingInt(messages.ExtensionType.supported_versions), .data = versions_ext };
         n_exts += 1;
-        exts_buf[n_exts] = .{ .ext_type = @intFromEnum(messages.ExtensionType.supported_groups), .data = groups_ext };
+        exts_buf[n_exts] = .{ .ext_type = @backingInt(messages.ExtensionType.supported_groups), .data = groups_ext };
         n_exts += 1;
         exts_buf[n_exts] = sigalgs_ext;
         n_exts += 1;
-        exts_buf[n_exts] = .{ .ext_type = @intFromEnum(messages.ExtensionType.key_share), .data = ks_ext };
+        exts_buf[n_exts] = .{ .ext_type = @backingInt(messages.ExtensionType.key_share), .data = ks_ext };
         n_exts += 1;
         if (cookie_ext) |c| {
-            exts_buf[n_exts] = .{ .ext_type = @intFromEnum(messages.ExtensionType.cookie), .data = c };
+            exts_buf[n_exts] = .{ .ext_type = @backingInt(messages.ExtensionType.cookie), .data = c };
             n_exts += 1;
         }
 
@@ -2394,7 +2394,7 @@ pub const Connection = struct {
 
     fn clientHelloShare(exts: []const messages.Extension) HandshakeError!PeerShare {
         for (exts) |e| {
-            if (e.ext_type != @intFromEnum(messages.ExtensionType.key_share)) continue;
+            if (e.ext_type != @backingInt(messages.ExtensionType.key_share)) continue;
             var entries: [8]messages.KeyShareEntry = undefined;
             const shares = messages.decodeKeyShareClientHello(e.data, &entries) catch return error.Malformed;
             for (advertised_groups) |want| {
@@ -2415,7 +2415,7 @@ pub const Connection = struct {
     /// The caller checks the group against the one it offered a share in.
     fn serverHelloShare(exts: []const messages.Extension) HandshakeError!PeerShare {
         for (exts) |e| {
-            if (e.ext_type != @intFromEnum(messages.ExtensionType.key_share)) continue;
+            if (e.ext_type != @backingInt(messages.ExtensionType.key_share)) continue;
             const share = messages.decodeKeyShareServerHello(e.data) catch return error.Malformed;
             return .{ .group = share.group, .share = share.key_exchange };
         }
@@ -2730,8 +2730,8 @@ pub const Connection = struct {
         frag_buf: []u8,
         out: []u8,
     ) HandshakeError!SentRecord {
-        self.transcript.append(@intFromEnum(msg_type), body);
-        const fragment = try frameHandshakeMessage(@intFromEnum(msg_type), self.message_seq, body, frag_buf);
+        self.transcript.append(@backingInt(msg_type), body);
+        const fragment = try frameHandshakeMessage(@backingInt(msg_type), self.message_seq, body, frag_buf);
         self.message_seq +%= 1;
         const seq = self.hs2.send_seq;
         const record_bytes = try self.protectHandshakeMessage(fragment, out);
@@ -2761,7 +2761,7 @@ pub const Connection = struct {
         const sig = try certverify.sign(scheme, cc.private_key, side, &th, entropy.source(), &sig_buf);
 
         var cv_body_buf: [max_certverify_body]u8 = undefined;
-        const cv_body = messages.encodeCertificateVerify(.{ .algorithm = @intFromEnum(scheme), .signature = sig }, &cv_body_buf) catch return error.BufferTooShort;
+        const cv_body = messages.encodeCertificateVerify(.{ .algorithm = @backingInt(scheme), .signature = sig }, &cv_body_buf) catch return error.BufferTooShort;
 
         var frag_buf: [max_certverify_body + handshake.header_len]u8 = undefined;
         return self.sendEpoch2Message(.certificate_verify, cv_body, &frag_buf, out);
@@ -2801,14 +2801,14 @@ pub const Connection = struct {
     ) HandshakeError!void {
         var advertised = false;
         for (self.config.signature_algorithms) |s| {
-            if (@intFromEnum(s) == scheme_raw) {
+            if (@backingInt(s) == scheme_raw) {
                 advertised = true;
                 break;
             }
         }
         if (!advertised) return error.SignatureSchemeNotAdvertised;
 
-        const scheme: certverify.SignatureScheme = @enumFromInt(scheme_raw);
+        const scheme: certverify.SignatureScheme = @fromBackingInt(@intCast(scheme_raw));
         const pubkey = certauth.parseLeafPublicKey(leaf_der) catch return error.CertificateRejected;
         certverify.verify(scheme, pubkey, signer_side, transcript_hash, signature) catch return error.CertVerifyFailed;
         switch (self.config.peer_verify) {
@@ -2927,14 +2927,14 @@ pub const Connection = struct {
             var received_buf: [max_cert_message_body]bool = undefined;
             const parsed = try self.takeHandshakeMessage(datagram, pos, .epoch2_protected, &msg_buf, &received_buf, &result.acks);
 
-            if (parsed.msg_type == @intFromEnum(messages.HandshakeType.finished)) {
+            if (parsed.msg_type == @backingInt(messages.HandshakeType.finished)) {
                 if (parsed.body.len > result.fin_buf.len) return error.Malformed;
                 @memcpy(result.fin_buf[0..parsed.body.len], parsed.body);
                 result.fin_len = parsed.body.len;
                 return result;
             }
 
-            if (parsed.msg_type == @intFromEnum(messages.HandshakeType.certificate_request)) {
+            if (parsed.msg_type == @backingInt(messages.HandshakeType.certificate_request)) {
                 if (!allow_certificate_request or result.saw_cert or result.requested_client_cert) return error.UnexpectedMessage;
                 var ext_buf: [4]messages.Extension = undefined;
                 const creq = messages.decodeCertificateRequest(parsed.body, &ext_buf) catch return error.Malformed;
@@ -2942,7 +2942,7 @@ pub const Connection = struct {
                 @memcpy(result.creq_context[0..creq.certificate_request_context.len], creq.certificate_request_context);
                 result.creq_context_len = creq.certificate_request_context.len;
                 for (creq.extensions) |e| {
-                    if (e.ext_type != @intFromEnum(messages.ExtensionType.signature_algorithms)) continue;
+                    if (e.ext_type != @backingInt(messages.ExtensionType.signature_algorithms)) continue;
                     // FILTER, do not decode wholesale. A real peer's
                     // CertificateRequest advertises far more schemes than any
                     // small fixed buffer holds — wolfSSL 5.9.1 sends 16 —
@@ -2964,7 +2964,7 @@ pub const Connection = struct {
                 }
                 result.requested_client_cert = true;
                 self.transcript.append(parsed.msg_type, parsed.body);
-            } else if (parsed.msg_type == @intFromEnum(messages.HandshakeType.certificate)) {
+            } else if (parsed.msg_type == @backingInt(messages.HandshakeType.certificate)) {
                 if (result.saw_cert) return error.UnexpectedMessage;
                 var entries_buf: [4]messages.CertificateEntry = undefined;
                 const dec = messages.decodeCertificate(parsed.body, &entries_buf) catch return error.Malformed;
@@ -2976,7 +2976,7 @@ pub const Connection = struct {
                     @memcpy(result.leaf_buf[0..leaf.len], leaf);
                     result.leaf_len = leaf.len;
                 }
-            } else if (parsed.msg_type == @intFromEnum(messages.HandshakeType.certificate_verify)) {
+            } else if (parsed.msg_type == @backingInt(messages.HandshakeType.certificate_verify)) {
                 if (!result.saw_cert or result.leaf_len == 0 or result.saw_cv) return error.UnexpectedMessage;
                 // Transcript hash "through Certificate" — everything
                 // appended so far, NOT including this CertificateVerify
@@ -3070,7 +3070,7 @@ pub const Connection = struct {
         // does not contain ClientHello1 at all (it contains the synthetic
         // `message_hash` message instead).
         var scratch = engine.Transcript{};
-        scratch.append(@intFromEnum(messages.HandshakeType.client_hello), ch_body);
+        scratch.append(@backingInt(messages.HandshakeType.client_hello), ch_body);
         var cookie: [cookie_len]u8 = undefined;
         mintCookie(hr, .{ .suite = suite, .client_hello1_hash = scratch.currentHash() }, &cookie);
 
@@ -3082,7 +3082,7 @@ pub const Connection = struct {
         // exactly this numbering on the (stateless, brand-new) connection
         // that handles ClientHello2.
         var frag_buf: [max_hrr_body_len + handshake.header_len]u8 = undefined;
-        const fragment = try frameHandshakeMessage(@intFromEnum(messages.HandshakeType.server_hello), 0, hrr_body, &frag_buf);
+        const fragment = try frameHandshakeMessage(@backingInt(messages.HandshakeType.server_hello), 0, hrr_body, &frag_buf);
         const record_bytes = try self.writeEpoch0Record(fragment, out);
 
         // The one thing recorded, and only so a caller (and a test) can SEE
@@ -3122,7 +3122,7 @@ pub const Connection = struct {
         self.transcript.resetToMessageHash(contents.client_hello1_hash);
         var hrr_body_buf: [max_hrr_body_len]u8 = undefined;
         const hrr_body = try encodeHelloRetryRequest(contents.suite, cookie, &hrr_body_buf);
-        self.transcript.append(@intFromEnum(messages.HandshakeType.server_hello), hrr_body);
+        self.transcript.append(@backingInt(messages.HandshakeType.server_hello), hrr_body);
 
         // The HelloRetryRequest occupied `message_seq` 0 and one epoch-0
         // record, and this connection — being brand new, which is the point
@@ -3153,7 +3153,7 @@ pub const Connection = struct {
         var received_buf: [max_client_hello_body]bool = undefined;
         var ch_pos: usize = 0;
         const parsed = try self.takeHandshakeMessage(datagram, &ch_pos, .epoch0_plaintext, &msg_buf, &received_buf, null);
-        if (parsed.msg_type != @intFromEnum(messages.HandshakeType.client_hello)) return error.UnexpectedMessage;
+        if (parsed.msg_type != @backingInt(messages.HandshakeType.client_hello)) return error.UnexpectedMessage;
         const ch_body = parsed.body;
 
         // 16, not 8: a real ClientHello is extension-rich (wolfSSL's carries
@@ -3174,7 +3174,7 @@ pub const Connection = struct {
         const retry_suite: ?CipherSuite = if (self.config.hello_retry) |hr| blk: {
             var cookie: ?[]const u8 = null;
             for (dec.extensions) |e| {
-                if (e.ext_type == @intFromEnum(messages.ExtensionType.cookie))
+                if (e.ext_type == @backingInt(messages.ExtensionType.cookie))
                     cookie = messages.decodeCookieExtension(e.data) catch return error.CookieVerifyFailed;
             }
             const c = cookie orelse return self.sendHelloRetryRequest(hr, dec, ch_body, out);
@@ -3196,7 +3196,7 @@ pub const Connection = struct {
         var client_sig_algs_buf: [supported_scheme_wire_values.len]u16 = undefined;
         var client_sig_algs_len: usize = 0;
         for (dec.extensions) |e| {
-            if (e.ext_type != @intFromEnum(messages.ExtensionType.signature_algorithms)) continue;
+            if (e.ext_type != @backingInt(messages.ExtensionType.signature_algorithms)) continue;
             const sig_algs = messages.filterU16ListExtension(e.data, &supported_scheme_wire_values, &client_sig_algs_buf) catch return error.Malformed;
             client_sig_algs_len = sig_algs.len;
         }
@@ -3214,7 +3214,7 @@ pub const Connection = struct {
             .psk => {
                 var psk_ext: ?messages.Extension = null;
                 for (dec.extensions) |e| {
-                    if (e.ext_type == @intFromEnum(messages.ExtensionType.pre_shared_key)) psk_ext = e;
+                    if (e.ext_type == @backingInt(messages.ExtensionType.pre_shared_key)) psk_ext = e;
                 }
                 const psk_data = (psk_ext orelse return error.NoMatchingPskIdentity).data;
 
@@ -3247,7 +3247,7 @@ pub const Connection = struct {
                 keyschedule.earlySecret(Hkdf, &es, self.config.psk);
                 var bk: [32]u8 = undefined;
                 keyschedule.binderKey(Hkdf, &bk, &es, &eh);
-                const binder_th = self.transcript.wouldBeHash(@intFromEnum(messages.HandshakeType.client_hello), ch_body.len, truncated);
+                const binder_th = self.transcript.wouldBeHash(@backingInt(messages.HandshakeType.client_hello), ch_body.len, truncated);
                 var expected_binder: [32]u8 = undefined;
                 keyschedule.pskBinder(Hkdf, Hmac, &expected_binder, &bk, &binder_th);
                 if (!std.crypto.timing_safe.eql([32]u8, expected_binder, binder0[0..32].*)) return error.BinderVerifyFailed;
@@ -3274,7 +3274,7 @@ pub const Connection = struct {
                 self.ecdhe_public_len = ex.public_len;
                 dhe_shared = ex.shared;
                 std.crypto.secureZero(u8, &ex.shared.bytes); // the copy in `dhe_shared` is now the only live one
-                const zero_psk = [_]u8{0} ** 32;
+                const zero_psk = @as([32]u8, @splat(0));
                 keyschedule.earlySecret(Hkdf, &es, &zero_psk);
             },
         }
@@ -3293,7 +3293,7 @@ pub const Connection = struct {
 
         // ClientHello accepted (PSK binder verified, or cert-DHE key_share
         // extracted): commit it to the transcript.
-        self.transcript.append(@intFromEnum(messages.HandshakeType.client_hello), ch_body);
+        self.transcript.append(@backingInt(messages.HandshakeType.client_hello), ch_body);
         self.suite = suite;
 
         var random_bytes: [32]u8 = undefined;
@@ -3306,14 +3306,14 @@ pub const Connection = struct {
         const sh_ext: messages.Extension = switch (self.config.key_exchange) {
             .psk => blk: {
                 messages.encodeSelectedIdentity(0, sh_ext_data_buf[0..2]);
-                break :blk .{ .ext_type = @intFromEnum(messages.ExtensionType.pre_shared_key), .data = sh_ext_data_buf[0..2] };
+                break :blk .{ .ext_type = @backingInt(messages.ExtensionType.pre_shared_key), .data = sh_ext_data_buf[0..2] };
             },
             .cert_dhe, .cert_dhe_insecure_unauthenticated => blk: {
                 const ks = messages.encodeKeyShareServerHello(.{
                     .group = self.ecdhe_group,
                     .key_exchange = self.ecdhe_public[0..self.ecdhe_public_len],
                 }, &sh_ext_data_buf) catch return error.BufferTooShort;
-                break :blk .{ .ext_type = @intFromEnum(messages.ExtensionType.key_share), .data = ks };
+                break :blk .{ .ext_type = @backingInt(messages.ExtensionType.key_share), .data = ks };
             },
         };
         // RFC 8446 §4.2.1: a server that negotiates 1.3 MUST answer with
@@ -3324,7 +3324,7 @@ pub const Connection = struct {
         var sh_versions_buf: [2]u8 = undefined;
         const sh_versions = try messages.encodeSupportedVersionsServerHello(messages.version_dtls13, &sh_versions_buf);
         const sh_exts = [_]messages.Extension{
-            .{ .ext_type = @intFromEnum(messages.ExtensionType.supported_versions), .data = sh_versions },
+            .{ .ext_type = @backingInt(messages.ExtensionType.supported_versions), .data = sh_versions },
             sh_ext,
         };
         var sh_body_buf: [max_server_hello_body]u8 = undefined;
@@ -3342,13 +3342,13 @@ pub const Connection = struct {
         const sh_body = messages.encodeServerHello(.{
             .random = random_bytes,
             .legacy_session_id_echo = &.{},
-            .cipher_suite = @intFromEnum(suite),
+            .cipher_suite = @backingInt(suite),
             .extensions = &sh_exts,
         }, &sh_body_buf) catch return error.BufferTooShort;
-        self.transcript.append(@intFromEnum(messages.HandshakeType.server_hello), sh_body);
+        self.transcript.append(@backingInt(messages.HandshakeType.server_hello), sh_body);
 
         var sh_frag_buf: [max_server_hello_body + handshake.header_len]u8 = undefined;
-        const sh_fragment = try frameHandshakeMessage(@intFromEnum(messages.HandshakeType.server_hello), self.message_seq, sh_body, &sh_frag_buf);
+        const sh_fragment = try frameHandshakeMessage(@backingInt(messages.HandshakeType.server_hello), self.message_seq, sh_body, &sh_frag_buf);
         self.message_seq +%= 1;
         const sh_seq = self.hs0.send_seq;
         var cursor: usize = 0;
@@ -3371,9 +3371,9 @@ pub const Connection = struct {
 
         var ee_body_buf: [8]u8 = undefined;
         const ee_body = messages.encodeEncryptedExtensions(&.{}, &ee_body_buf) catch return error.BufferTooShort;
-        self.transcript.append(@intFromEnum(messages.HandshakeType.encrypted_extensions), ee_body);
+        self.transcript.append(@backingInt(messages.HandshakeType.encrypted_extensions), ee_body);
         var ee_frag_buf: [8 + handshake.header_len]u8 = undefined;
-        const ee_fragment = try frameHandshakeMessage(@intFromEnum(messages.HandshakeType.encrypted_extensions), self.message_seq, ee_body, &ee_frag_buf);
+        const ee_fragment = try frameHandshakeMessage(@backingInt(messages.HandshakeType.encrypted_extensions), self.message_seq, ee_body, &ee_frag_buf);
         self.message_seq +%= 1;
         const ee_seq = self.hs2.send_seq;
         {
@@ -3433,9 +3433,9 @@ pub const Connection = struct {
         const th_before_finished = self.transcript.currentHash();
         var verify_data: [32]u8 = undefined;
         keyschedule.computeFinishedVerifyData(Hmac, &verify_data, &finished_key, &th_before_finished);
-        self.transcript.append(@intFromEnum(messages.HandshakeType.finished), &verify_data);
+        self.transcript.append(@backingInt(messages.HandshakeType.finished), &verify_data);
         var fin_frag_buf: [32 + handshake.header_len]u8 = undefined;
-        const fin_fragment = try frameHandshakeMessage(@intFromEnum(messages.HandshakeType.finished), self.message_seq, &verify_data, &fin_frag_buf);
+        const fin_fragment = try frameHandshakeMessage(@backingInt(messages.HandshakeType.finished), self.message_seq, &verify_data, &fin_frag_buf);
         self.message_seq +%= 1;
         const fin_seq = self.hs2.send_seq;
         {
@@ -3499,7 +3499,7 @@ pub const Connection = struct {
         var expected: [32]u8 = undefined;
         keyschedule.computeFinishedVerifyData(Hmac, &expected, &finished_key, &th);
         if (!std.crypto.timing_safe.eql([32]u8, expected, fin.verify_data[0..32].*)) return error.FinishedVerifyFailed;
-        self.transcript.append(@intFromEnum(messages.HandshakeType.finished), fin.verify_data);
+        self.transcript.append(@backingInt(messages.HandshakeType.finished), fin.verify_data);
 
         try self.installApplicationKeys(self.suite, &self.pending_ap_client, &self.pending_ap_server);
         self.clearFlightTracker();
@@ -3565,12 +3565,12 @@ pub const Connection = struct {
         var negotiated_version: ?[2]u8 = null;
         var selected_group: ?u16 = null;
         for (hrr.extensions) |e| switch (e.ext_type) {
-            @intFromEnum(messages.ExtensionType.cookie) => cookie = messages.decodeCookieExtension(e.data) catch return error.Malformed,
-            @intFromEnum(messages.ExtensionType.supported_versions) => negotiated_version = messages.decodeSupportedVersionsServerHello(e.data) catch return error.Malformed,
+            @backingInt(messages.ExtensionType.cookie) => cookie = messages.decodeCookieExtension(e.data) catch return error.Malformed,
+            @backingInt(messages.ExtensionType.supported_versions) => negotiated_version = messages.decodeSupportedVersionsServerHello(e.data) catch return error.Malformed,
             // The HelloRetryRequest `key_share` is the two-byte
             // `selected_group` form, NOT the ServerHello form — see
             // `messages.decodeKeyShareHelloRetryRequest`.
-            @intFromEnum(messages.ExtensionType.key_share) => selected_group = messages.decodeKeyShareHelloRetryRequest(e.data) catch return error.Malformed,
+            @backingInt(messages.ExtensionType.key_share) => selected_group = messages.decodeKeyShareHelloRetryRequest(e.data) catch return error.Malformed,
             else => {},
         };
         const version = negotiated_version orelse return error.VersionNotNegotiated;
@@ -3623,20 +3623,20 @@ pub const Connection = struct {
         // append the HelloRetryRequest, then ClientHello2. Order matters —
         // the binder in ClientHello2 is computed over exactly this prefix.
         self.transcript.resetToMessageHash(self.client_hello1_hash);
-        self.transcript.append(@intFromEnum(messages.HandshakeType.server_hello), hrr_body);
+        self.transcript.append(@backingInt(messages.HandshakeType.server_hello), hrr_body);
 
         var ch_body_buf: [max_client_hello_body]u8 = undefined;
         const ch_body = switch (self.config.key_exchange) {
             .psk => try self.buildClientHello(entropy, cookie orelse return error.HelloRetryRequestUnsupported, &ch_body_buf),
             .cert_dhe, .cert_dhe_insecure_unauthenticated => try self.buildClientHelloCertDhe(entropy, cookie, retry_group, &ch_body_buf),
         };
-        self.transcript.append(@intFromEnum(messages.HandshakeType.client_hello), ch_body);
+        self.transcript.append(@backingInt(messages.HandshakeType.client_hello), ch_body);
 
         // RFC 9147 §5.2: ClientHello2 is a NEW handshake message, so it takes
         // the next `message_seq` rather than reusing ClientHello1's (which is
         // what a retransmission would do).
         var frag_buf: [max_client_hello_body + handshake.header_len]u8 = undefined;
-        const fragment = try frameHandshakeMessage(@intFromEnum(messages.HandshakeType.client_hello), self.message_seq, ch_body, &frag_buf);
+        const fragment = try frameHandshakeMessage(@backingInt(messages.HandshakeType.client_hello), self.message_seq, ch_body, &frag_buf);
         self.message_seq +%= 1;
 
         const ch_seq = self.hs0.send_seq;
@@ -3664,7 +3664,7 @@ pub const Connection = struct {
         var sh_msg_buf: [max_server_hello_body]u8 = undefined;
         var sh_received_buf: [max_server_hello_body]bool = undefined;
         const sh_parsed = try self.takeHandshakeMessage(datagram, &pos, .epoch0_plaintext, &sh_msg_buf, &sh_received_buf, null);
-        if (sh_parsed.msg_type != @intFromEnum(messages.HandshakeType.server_hello)) return error.UnexpectedMessage;
+        if (sh_parsed.msg_type != @backingInt(messages.HandshakeType.server_hello)) return error.UnexpectedMessage;
 
         var ext_buf: [8]messages.Extension = undefined;
         const sh_dec = messages.decodeServerHello(sh_parsed.body, &ext_buf) catch return error.Malformed;
@@ -3678,7 +3678,7 @@ pub const Connection = struct {
         // continuing would mean deriving 1.3 keys for a 1.2 handshake.
         var negotiated_version: ?[2]u8 = null;
         for (sh_dec.extensions) |e| {
-            if (e.ext_type == @intFromEnum(messages.ExtensionType.supported_versions))
+            if (e.ext_type == @backingInt(messages.ExtensionType.supported_versions))
                 negotiated_version = messages.decodeSupportedVersionsServerHello(e.data) catch return error.Malformed;
         }
         const version = negotiated_version orelse return error.VersionNotNegotiated;
@@ -3702,7 +3702,7 @@ pub const Connection = struct {
         if (!offered_ok) return error.NoCipherSuiteOverlap;
         self.suite = suite;
 
-        self.transcript.append(@intFromEnum(messages.HandshakeType.server_hello), sh_parsed.body);
+        self.transcript.append(@backingInt(messages.HandshakeType.server_hello), sh_parsed.body);
         self.clearFlightTracker(); // the ClientHello flight is now implicitly ACKed
         self.retransmit_timer.reset();
 
@@ -3742,7 +3742,7 @@ pub const Connection = struct {
                 };
                 std.crypto.secureZero(u8, &self.ecdhe_secret); // forward secrecy: drop the ephemeral private key
                 self.ecdhe_secret_live = false;
-                const zero_psk = [_]u8{0} ** 32;
+                const zero_psk = @as([32]u8, @splat(0));
                 var es: [32]u8 = undefined;
                 keyschedule.earlySecret(Hkdf, &es, &zero_psk);
                 keyschedule.deriveHandshakeSecret(Hkdf, &hs_secret, &es, &eh, shared.slice());
@@ -3758,8 +3758,8 @@ pub const Connection = struct {
         var ee_msg_buf: [64]u8 = undefined;
         var ee_received_buf: [64]bool = undefined;
         const ee_parsed = try self.takeHandshakeMessage(datagram, &pos, .epoch2_protected, &ee_msg_buf, &ee_received_buf, null);
-        if (ee_parsed.msg_type != @intFromEnum(messages.HandshakeType.encrypted_extensions)) return error.UnexpectedMessage;
-        self.transcript.append(@intFromEnum(messages.HandshakeType.encrypted_extensions), ee_parsed.body);
+        if (ee_parsed.msg_type != @backingInt(messages.HandshakeType.encrypted_extensions)) return error.UnexpectedMessage;
+        self.transcript.append(@backingInt(messages.HandshakeType.encrypted_extensions), ee_parsed.body);
 
         // ── certificate mode: optional CertificateRequest?, Certificate?,
         // CertificateVerify? from the server, then the server's Finished —
@@ -3786,7 +3786,7 @@ pub const Connection = struct {
         var expected_server_vd: [32]u8 = undefined;
         keyschedule.computeFinishedVerifyData(Hmac, &expected_server_vd, &server_finished_key, &th_before_server_finished);
         if (!std.crypto.timing_safe.eql([32]u8, expected_server_vd, server_fin.verify_data[0..32].*)) return error.FinishedVerifyFailed;
-        self.transcript.append(@intFromEnum(messages.HandshakeType.finished), server_fin.verify_data);
+        self.transcript.append(@backingInt(messages.HandshakeType.finished), server_fin.verify_data);
 
         // Application traffic secrets are fixed at "through the SERVER's
         // Finished" (RFC 8446 §7.1) regardless of whatever the client sends
@@ -3844,10 +3844,10 @@ pub const Connection = struct {
         const th_for_client_finished = self.transcript.currentHash();
         var client_vd: [32]u8 = undefined;
         keyschedule.computeFinishedVerifyData(Hmac, &client_vd, &client_finished_key, &th_for_client_finished);
-        self.transcript.append(@intFromEnum(messages.HandshakeType.finished), &client_vd);
+        self.transcript.append(@backingInt(messages.HandshakeType.finished), &client_vd);
 
         var fin_frag_buf: [32 + handshake.header_len]u8 = undefined;
-        const client_fin_fragment = try frameHandshakeMessage(@intFromEnum(messages.HandshakeType.finished), self.message_seq, &client_vd, &fin_frag_buf);
+        const client_fin_fragment = try frameHandshakeMessage(@backingInt(messages.HandshakeType.finished), self.message_seq, &client_vd, &fin_frag_buf);
         self.message_seq +%= 1;
         const client_fin_seq = self.hs2.send_seq;
         const client_fin_record = try self.protectHandshakeMessage(client_fin_fragment, out[cursor..]);
@@ -4062,7 +4062,7 @@ fn selectCipherSuite(ours: []const CipherSuite, offered_raw: []const u8) ?Cipher
     for (ours) |want| {
         var it = messages.CipherSuiteIter{ .raw = offered_raw };
         while (it.next()) |offered| {
-            if (offered == @intFromEnum(want) and suiteParams(want) != null) return want;
+            if (offered == @backingInt(want) and suiteParams(want) != null) return want;
         }
     }
     return null;
@@ -4076,10 +4076,10 @@ fn selectCipherSuite(ours: []const CipherSuite, offered_raw: []const u8) ?Cipher
 /// non-panicking equivalent.
 fn cipherSuiteFromU16(v: u16) ?CipherSuite {
     return switch (v) {
-        @intFromEnum(CipherSuite.aes_128_gcm_sha256) => .aes_128_gcm_sha256,
-        @intFromEnum(CipherSuite.chacha20_poly1305_sha256) => .chacha20_poly1305_sha256,
-        @intFromEnum(CipherSuite.aes_128_ccm_sha256) => .aes_128_ccm_sha256,
-        @intFromEnum(CipherSuite.aes_128_ccm_8_sha256) => .aes_128_ccm_8_sha256,
+        @backingInt(CipherSuite.aes_128_gcm_sha256) => .aes_128_gcm_sha256,
+        @backingInt(CipherSuite.chacha20_poly1305_sha256) => .chacha20_poly1305_sha256,
+        @backingInt(CipherSuite.aes_128_ccm_sha256) => .aes_128_ccm_sha256,
+        @backingInt(CipherSuite.aes_128_ccm_8_sha256) => .aes_128_ccm_8_sha256,
         else => null,
     };
 }
@@ -4225,7 +4225,7 @@ fn seededForTest(csprng: *std.Random.DefaultCsprng) Entropy {
 test "startHandshake: server role is rejected (typed error, not a panic)" {
     const cfg = Config{ .role = .client, .psk_identity = "id", .psk = "secret" };
     var server = try Connection.serverInit(cfg);
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x01} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x01)));
     var out: [1500]u8 = undefined;
     try testing.expectError(error.WrongState, server.startHandshake(seededForTest(&csprng), 0, &out));
 }
@@ -4233,7 +4233,7 @@ test "startHandshake: server role is rejected (typed error, not a panic)" {
 test "startHandshake: wrong state (already mid-handshake) is rejected" {
     const cfg = Config{ .role = .client, .psk_identity = "id", .psk = "secret" };
     var client = try Connection.clientInit(cfg);
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x02} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x02)));
     var out: [1500]u8 = undefined;
     _ = try client.startHandshake(seededForTest(&csprng), 0, &out);
     try testing.expectError(error.WrongState, client.startHandshake(seededForTest(&csprng), 0, &out));
@@ -4242,7 +4242,7 @@ test "startHandshake: wrong state (already mid-handshake) is rejected" {
 test "startHandshake: real ClientHello bytes, not a stub — real DTLS 1.3 flight sent" {
     const cfg = Config{ .role = .client, .psk_identity = "device-1", .psk = "s3cr3t", .cipher_suites = &.{.aes_128_gcm_sha256} };
     var client = try Connection.clientInit(cfg);
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x03} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x03)));
     var out: [1500]u8 = undefined;
     const ch = try client.startHandshake(seededForTest(&csprng), 0, &out);
     try testing.expectEqual(State.wait_server_hello, client.state);
@@ -4386,7 +4386,7 @@ fn loopbackHandshake(suite: CipherSuite) !void {
     const cfg_server = Config{ .role = .server, .psk_identity = psk_identity, .psk = psk, .cipher_suites = &.{suite} };
     var client = try Connection.clientInit(cfg_client);
     var server = try Connection.serverInit(cfg_server);
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x10} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x10)));
     var buf1: [1500]u8 = undefined;
     var buf2: [1500]u8 = undefined;
 
@@ -4459,7 +4459,7 @@ test "handshake: the DEFAULT cipher_suites completes a handshake and protects re
     // saying nothing, which is the whole point of the test.
     var client = try Connection.clientInit(.{ .role = .client, .psk_identity = psk_identity, .psk = psk });
     var server = try Connection.serverInit(.{ .role = .server, .psk_identity = psk_identity, .psk = psk });
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x2d} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x2d)));
     var buf1: [1500]u8 = undefined;
     var buf2: [1500]u8 = undefined;
 
@@ -4519,7 +4519,7 @@ test "cipher suite negotiation: SERVER's own preference order wins, not the clie
     };
     var client = try Connection.clientInit(cfg_client);
     var server = try Connection.serverInit(cfg_server);
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x99} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x99)));
     var buf1: [1500]u8 = undefined;
     var buf2: [1500]u8 = undefined;
 
@@ -4687,7 +4687,7 @@ fn runFlightScript(bytes: []const u8) !FlightOutcome {
     var s = FlightScript{ .bytes = bytes };
     const psk_identity = "device-042";
     const psk = "a-shared-pre-shared-key";
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x5A} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x5A)));
     const rnd = seededForTest(&csprng);
 
     var client = try Connection.clientInit(.{ .role = .client, .psk_identity = psk_identity, .psk = psk, .cipher_suites = &.{.aes_128_gcm_sha256} });
@@ -4823,7 +4823,7 @@ test "reassembly: a ClientHello split across two datagrams, delivered OUT OF ORD
     const psk = "a-shared-pre-shared-key";
     var client = try Connection.clientInit(.{ .role = .client, .psk_identity = psk_identity, .psk = psk, .cipher_suites = &.{.aes_128_gcm_sha256} });
     var server = try Connection.serverInit(.{ .role = .server, .psk_identity = psk_identity, .psk = psk, .cipher_suites = &.{.aes_128_gcm_sha256} });
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x77} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x77)));
     const rnd = seededForTest(&csprng);
 
     var buf1: [1500]u8 = undefined;
@@ -4894,7 +4894,7 @@ test "reassembly: a THREE-fragment ClientHello, middle fragment duplicated" {
     const psk = "a-shared-pre-shared-key";
     var client = try Connection.clientInit(.{ .role = .client, .psk_identity = psk_identity, .psk = psk, .cipher_suites = &.{.aes_128_gcm_sha256} });
     var server = try Connection.serverInit(.{ .role = .server, .psk_identity = psk_identity, .psk = psk, .cipher_suites = &.{.aes_128_gcm_sha256} });
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x78} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x78)));
     const rnd = seededForTest(&csprng);
 
     var buf1: [1500]u8 = undefined;
@@ -4942,7 +4942,7 @@ test "reassembly: a CONTRADICTING overlapping fragment is rejected, not last-wri
     const psk = "a-shared-pre-shared-key";
     var client = try Connection.clientInit(.{ .role = .client, .psk_identity = psk_identity, .psk = psk, .cipher_suites = &.{.aes_128_gcm_sha256} });
     var server = try Connection.serverInit(.{ .role = .server, .psk_identity = psk_identity, .psk = psk, .cipher_suites = &.{.aes_128_gcm_sha256} });
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x79} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x79)));
     const rnd = seededForTest(&csprng);
 
     var buf1: [1500]u8 = undefined;
@@ -4981,7 +4981,7 @@ test "reassembly: a fragment that changes msg_type or total length mid-message i
     const cfg_c = Config{ .role = .client, .psk_identity = psk_identity, .psk = psk, .cipher_suites = &.{.aes_128_gcm_sha256} };
     const cfg_s = Config{ .role = .server, .psk_identity = psk_identity, .psk = psk, .cipher_suites = &.{.aes_128_gcm_sha256} };
 
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x7d} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x7d)));
     const rnd = seededForTest(&csprng);
     var buf1: [1500]u8 = undefined;
     var buf2: [1500]u8 = undefined;
@@ -5019,7 +5019,7 @@ test "reassembly: a fragment of a LATER message while one is in progress is reje
     const psk = "a-shared-pre-shared-key";
     var client = try Connection.clientInit(.{ .role = .client, .psk_identity = psk_identity, .psk = psk, .cipher_suites = &.{.aes_128_gcm_sha256} });
     var server = try Connection.serverInit(.{ .role = .server, .psk_identity = psk_identity, .psk = psk, .cipher_suites = &.{.aes_128_gcm_sha256} });
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x7a} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x7a)));
     const rnd = seededForTest(&csprng);
 
     var buf1: [1500]u8 = undefined;
@@ -5055,7 +5055,7 @@ test "spoofed epoch-0 datagram cannot wedge the handshake (state rolls back on r
     const cfg_c = Config{ .role = .client, .psk_identity = psk_identity, .psk = psk, .cipher_suites = &.{.aes_128_gcm_sha256} };
     const cfg_s = Config{ .role = .server, .psk_identity = psk_identity, .psk = psk, .cipher_suites = &.{.aes_128_gcm_sha256} };
 
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x7e} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x7e)));
     const rnd = seededForTest(&csprng);
     var buf1: [1500]u8 = undefined;
     var buf2: [1500]u8 = undefined;
@@ -5070,7 +5070,7 @@ test "spoofed epoch-0 datagram cannot wedge the handshake (state rolls back on r
     const seq_before = client.peer_message_seq;
     var frag_buf: [128]u8 = undefined;
     var rec_buf: [256]u8 = undefined;
-    const forged = handBuiltHandshakeFragment(2, 40, 0, 0, &([_]u8{0} ** 40), &frag_buf);
+    const forged = handBuiltHandshakeFragment(2, 40, 0, 0, &(@as([40]u8, @splat(0))), &frag_buf);
     try testing.expectError(
         error.VersionNotNegotiated,
         client.handleFlight(handBuiltPlaintextRecord(0, forged, &rec_buf), rnd, 0, &buf1),
@@ -5095,7 +5095,7 @@ test "a spoofed short-length fragment cannot shrink the reassembly slot" {
     const cfg_c = Config{ .role = .client, .psk_identity = psk_identity, .psk = psk, .cipher_suites = &.{.aes_128_gcm_sha256} };
     const cfg_s = Config{ .role = .server, .psk_identity = psk_identity, .psk = psk, .cipher_suites = &.{.aes_128_gcm_sha256} };
 
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x7f} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x7f)));
     const rnd = seededForTest(&csprng);
     var buf1: [1500]u8 = undefined;
     var buf2: [1500]u8 = undefined;
@@ -5125,7 +5125,7 @@ test "reassembly: buffered bytes are capped — a peer that never completes a me
     const psk = "a-shared-pre-shared-key";
     var client = try Connection.clientInit(.{ .role = .client, .psk_identity = psk_identity, .psk = psk, .cipher_suites = &.{.aes_128_gcm_sha256} });
     var server = try Connection.serverInit(.{ .role = .server, .psk_identity = psk_identity, .psk = psk, .cipher_suites = &.{.aes_128_gcm_sha256} });
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x7b} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x7b)));
     const rnd = seededForTest(&csprng);
 
     var buf1: [1500]u8 = undefined;
@@ -5183,7 +5183,7 @@ test "reassembly: an epoch-2 Finished split across datagrams, delivered OUT OF O
     const psk = "a-shared-pre-shared-key";
     var client = try Connection.clientInit(.{ .role = .client, .psk_identity = psk_identity, .psk = psk, .cipher_suites = &.{.aes_128_gcm_sha256} });
     var server = try Connection.serverInit(.{ .role = .server, .psk_identity = psk_identity, .psk = psk, .cipher_suites = &.{.aes_128_gcm_sha256} });
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x7c} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x7c)));
     const rnd = seededForTest(&csprng);
 
     var buf1: [1500]u8 = undefined;
@@ -5250,7 +5250,7 @@ fn connectedPair(suite: CipherSuite, seed: u8, client: *Connection, server: *Con
     const psk = "a-shared-pre-shared-key";
     client.* = try Connection.clientInit(.{ .role = .client, .psk_identity = psk_identity, .psk = psk, .cipher_suites = &.{suite} });
     server.* = try Connection.serverInit(.{ .role = .server, .psk_identity = psk_identity, .psk = psk, .cipher_suites = &.{suite} });
-    var csprng = std.Random.DefaultCsprng.init([_]u8{seed} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(seed)));
     var buf1: [1500]u8 = undefined;
     var buf2: [1500]u8 = undefined;
     try driveHandshake(client, server, seededForTest(&csprng), &buf1, &buf2);
@@ -5481,7 +5481,7 @@ test "handshake: wrong PSK -> binder verify fails (typed error, not a panic)" {
     const cfg_server = Config{ .role = .server, .psk_identity = psk_identity, .psk = "WRONG-psk", .cipher_suites = &.{.aes_128_gcm_sha256} };
     var client = try Connection.clientInit(cfg_client);
     var server = try Connection.serverInit(cfg_server);
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x20} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x20)));
     const rnd = seededForTest(&csprng);
     var buf1: [1500]u8 = undefined;
     var buf2: [1500]u8 = undefined;
@@ -5495,7 +5495,7 @@ test "handshake: mismatched PSK identity -> typed error, not a panic" {
     const cfg_server = Config{ .role = .server, .psk_identity = "device-OTHER", .psk = "shared", .cipher_suites = &.{.aes_128_gcm_sha256} };
     var client = try Connection.clientInit(cfg_client);
     var server = try Connection.serverInit(cfg_server);
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x23} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x23)));
     const rnd = seededForTest(&csprng);
     var buf1: [1500]u8 = undefined;
     var buf2: [1500]u8 = undefined;
@@ -5510,7 +5510,7 @@ test "handshake: corrupted ServerHello -> typed error, not a panic" {
     const cfg = Config{ .role = .client, .psk_identity = psk_identity, .psk = psk, .cipher_suites = &.{.aes_128_gcm_sha256} };
     var client = try Connection.clientInit(cfg);
     var server = try Connection.serverInit(.{ .role = .server, .psk_identity = psk_identity, .psk = psk, .cipher_suites = &.{.aes_128_gcm_sha256} });
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x21} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x21)));
     const rnd = seededForTest(&csprng);
     var buf1: [1500]u8 = undefined;
     var buf2: [1500]u8 = undefined;
@@ -5530,7 +5530,7 @@ test "handshake: corrupted ServerHello -> typed error, not a panic" {
 test "handshake: a HelloRetryRequest carrying nothing to change is a typed error" {
     const cfg = Config{ .role = .client, .psk_identity = "device-1", .psk = "shared", .cipher_suites = &.{.aes_128_gcm_sha256} };
     var client = try Connection.clientInit(cfg);
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x40} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x40)));
     const rnd = seededForTest(&csprng);
     var buf1: [1500]u8 = undefined;
     _ = try client.startHandshake(rnd, 0, &buf1);
@@ -5542,7 +5542,7 @@ test "handshake: a HelloRetryRequest carrying nothing to change is a typed error
     // nothing to do and must not be answered with a byte-identical retry.
     var sh_versions_buf: [2]u8 = undefined;
     const sh_versions = try messages.encodeSupportedVersionsServerHello(messages.version_dtls13, &sh_versions_buf);
-    const datagram = try hrrDatagram(&.{.{ .ext_type = @intFromEnum(messages.ExtensionType.supported_versions), .data = sh_versions }});
+    const datagram = try hrrDatagram(&.{.{ .ext_type = @backingInt(messages.ExtensionType.supported_versions), .data = sh_versions }});
 
     var buf2: [1500]u8 = undefined;
     try testing.expectError(error.HelloRetryRequestUnsupported, client.handleFlight(datagram.bytes[0..datagram.len], rnd, 0, &buf2));
@@ -5551,7 +5551,7 @@ test "handshake: a HelloRetryRequest carrying nothing to change is a typed error
 test "handshake: a second HelloRetryRequest is refused (RFC 8446 §4.1.4 abort)" {
     const cfg = Config{ .role = .client, .psk_identity = "device-1", .psk = "shared", .cipher_suites = &.{.aes_128_gcm_sha256} };
     var client = try Connection.clientInit(cfg);
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x41} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x41)));
     const rnd = seededForTest(&csprng);
     var buf1: [1500]u8 = undefined;
     _ = try client.startHandshake(rnd, 0, &buf1);
@@ -5561,8 +5561,8 @@ test "handshake: a second HelloRetryRequest is refused (RFC 8446 §4.1.4 abort)"
     var cookie_buf: [64]u8 = undefined;
     const cookie_ext = try messages.encodeCookieExtension("a-real-cookie", &cookie_buf);
     const exts = [_]messages.Extension{
-        .{ .ext_type = @intFromEnum(messages.ExtensionType.supported_versions), .data = sh_versions },
-        .{ .ext_type = @intFromEnum(messages.ExtensionType.cookie), .data = cookie_ext },
+        .{ .ext_type = @backingInt(messages.ExtensionType.supported_versions), .data = sh_versions },
+        .{ .ext_type = @backingInt(messages.ExtensionType.cookie), .data = cookie_ext },
     };
     const datagram = try hrrDatagram(&exts);
 
@@ -5602,7 +5602,7 @@ test "handshake: a HelloRetryRequest negotiating DTLS 1.2 (real legacy value) is
     // other.
     const cfg = Config{ .role = .client, .psk_identity = "device-1", .psk = "shared", .cipher_suites = &.{.aes_128_gcm_sha256} };
     var client = try Connection.clientInit(cfg);
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x43} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x43)));
     const rnd = seededForTest(&csprng);
     var buf1: [1500]u8 = undefined;
     _ = try client.startHandshake(rnd, 0, &buf1);
@@ -5612,8 +5612,8 @@ test "handshake: a HelloRetryRequest negotiating DTLS 1.2 (real legacy value) is
     var cookie_buf: [64]u8 = undefined;
     const cookie_ext = try messages.encodeCookieExtension("a-real-cookie", &cookie_buf);
     const exts = [_]messages.Extension{
-        .{ .ext_type = @intFromEnum(messages.ExtensionType.supported_versions), .data = sh_versions },
-        .{ .ext_type = @intFromEnum(messages.ExtensionType.cookie), .data = cookie_ext },
+        .{ .ext_type = @backingInt(messages.ExtensionType.supported_versions), .data = sh_versions },
+        .{ .ext_type = @backingInt(messages.ExtensionType.cookie), .data = cookie_ext },
     };
     const datagram = try hrrDatagram(&exts);
 
@@ -5624,7 +5624,7 @@ test "handshake: a HelloRetryRequest negotiating DTLS 1.2 (real legacy value) is
 test "handshake: ClientHello2 reuses ClientHello1's random and echoes the cookie" {
     const cfg = Config{ .role = .client, .psk_identity = "device-1", .psk = "shared", .cipher_suites = &.{.aes_128_gcm_sha256} };
     var client = try Connection.clientInit(cfg);
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x42} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x42)));
     const rnd = seededForTest(&csprng);
     var buf1: [1500]u8 = undefined;
     const ch1 = try client.startHandshake(rnd, 0, &buf1);
@@ -5638,8 +5638,8 @@ test "handshake: ClientHello2 reuses ClientHello1's random and echoes the cookie
     const cookie = "cookie-from-the-server";
     const cookie_ext = try messages.encodeCookieExtension(cookie, &cookie_buf);
     const exts = [_]messages.Extension{
-        .{ .ext_type = @intFromEnum(messages.ExtensionType.supported_versions), .data = sh_versions },
-        .{ .ext_type = @intFromEnum(messages.ExtensionType.cookie), .data = cookie_ext },
+        .{ .ext_type = @backingInt(messages.ExtensionType.supported_versions), .data = sh_versions },
+        .{ .ext_type = @backingInt(messages.ExtensionType.cookie), .data = cookie_ext },
     };
     const datagram = try hrrDatagram(&exts);
 
@@ -5676,12 +5676,12 @@ fn hrrDatagramSeq(exts: []const messages.Extension, message_seq: u16) !HrrDatagr
     const sh_body = try messages.encodeServerHello(.{
         .random = messages.hello_retry_request_random,
         .legacy_session_id_echo = &.{},
-        .cipher_suite = @intFromEnum(CipherSuite.aes_128_gcm_sha256),
+        .cipher_suite = @backingInt(CipherSuite.aes_128_gcm_sha256),
         .extensions = exts,
     }, &sh_body_buf);
 
     var frag_buf: [256 + handshake.header_len]u8 = undefined;
-    const fragment = try frameHandshakeMessage(@intFromEnum(messages.HandshakeType.server_hello), message_seq, sh_body, &frag_buf);
+    const fragment = try frameHandshakeMessage(@backingInt(messages.HandshakeType.server_hello), message_seq, sh_body, &frag_buf);
 
     var result: HrrDatagram = .{ .bytes = undefined, .len = 0 };
     const hdr = record.PlaintextHeader{ .content_type = content_type_handshake, .epoch = 0, .sequence_number = 0, .length = @intCast(fragment.len) };
@@ -5735,7 +5735,7 @@ fn expectHelloRetryRequest(datagram: []const u8) ![]const u8 {
     var msg_buf: [512]u8 = undefined;
     var received_buf: [512]bool = undefined;
     const parsed = try decodeSingleFragmentMessage(fragment, &msg_buf, &received_buf);
-    try testing.expectEqual(@intFromEnum(messages.HandshakeType.server_hello), parsed.msg_type);
+    try testing.expectEqual(@backingInt(messages.HandshakeType.server_hello), parsed.msg_type);
 
     var ext_buf: [8]messages.Extension = undefined;
     const sh = try messages.decodeServerHello(parsed.body, &ext_buf);
@@ -5751,8 +5751,8 @@ fn expectHelloRetryRequest(datagram: []const u8) ![]const u8 {
         // RFC 8446 §4.1.4: "The server's extensions MUST contain
         // 'supported_versions'" — and in DTLS it is the ONLY place the
         // negotiated version appears.
-        @intFromEnum(messages.ExtensionType.supported_versions) => saw_supported_versions = true,
-        @intFromEnum(messages.ExtensionType.cookie) => cookie = try messages.decodeCookieExtension(e.data),
+        @backingInt(messages.ExtensionType.supported_versions) => saw_supported_versions = true,
+        @backingInt(messages.ExtensionType.cookie) => cookie = try messages.decodeCookieExtension(e.data),
         else => return error.UnexpectedHelloRetryRequestExtension,
     };
     try testing.expect(saw_supported_versions);
@@ -5769,7 +5769,7 @@ test "HRR server: the cookie exchange completes — and the connection that answ
     const binding = "203.0.113.9:51000";
     var client = try Connection.clientInit(hrrClientConfig(hrr_psk));
     defer client.deinit();
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x71} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x71)));
     const rnd = seededForTest(&csprng);
     var buf1: [1500]u8 = undefined;
     var buf2: [1500]u8 = undefined;
@@ -5835,7 +5835,7 @@ test "HRR server: the cookie exchange completes — and the connection that answ
 
 test "HRR server: a cookie minted for one peer_binding does not verify from another (the return-routability check itself)" {
     var client = try Connection.clientInit(hrrClientConfig(hrr_psk));
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x72} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x72)));
     const rnd = seededForTest(&csprng);
     var buf1: [1500]u8 = undefined;
     var buf2: [1500]u8 = undefined;
@@ -5868,7 +5868,7 @@ test "HRR server: a cookie minted for one peer_binding does not verify from anot
 
 test "HRR server: a cookie minted under a different cookie_secret does not verify" {
     var client = try Connection.clientInit(hrrClientConfig(hrr_psk));
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x73} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x73)));
     const rnd = seededForTest(&csprng);
     var buf1: [1500]u8 = undefined;
     var buf2: [1500]u8 = undefined;
@@ -5893,7 +5893,7 @@ test "HRR server: a cookie minted under a different cookie_secret does not verif
 }
 
 test "HRR server: one flipped bit anywhere in the cookie — MAC or authenticated payload — does not verify" {
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x74} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x74)));
     const rnd = seededForTest(&csprng);
 
     // The cookie is the last `cookie_len` bytes of the HelloRetryRequest
@@ -5942,7 +5942,7 @@ test "HRR server: a GENUINE cookie with bytes appended is refused (length is exa
     // break, but "the length is exact" is a property worth a test that can
     // actually notice when it stops being true.
     const binding = "203.0.113.9:51000";
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x79} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x79)));
     const rnd = seededForTest(&csprng);
 
     var client = try Connection.clientInit(hrrClientConfig(hrr_psk));
@@ -5965,8 +5965,8 @@ test "HRR server: a GENUINE cookie with bytes appended is refused (length is exa
     var cookie_buf: [2 + max_cookie_len]u8 = undefined;
     const cookie_ext = try messages.encodeCookieExtension(&extended, &cookie_buf);
     const datagram = try hrrDatagram(&.{
-        .{ .ext_type = @intFromEnum(messages.ExtensionType.supported_versions), .data = sh_versions },
-        .{ .ext_type = @intFromEnum(messages.ExtensionType.cookie), .data = cookie_ext },
+        .{ .ext_type = @backingInt(messages.ExtensionType.supported_versions), .data = sh_versions },
+        .{ .ext_type = @backingInt(messages.ExtensionType.cookie), .data = cookie_ext },
     });
 
     var buf3: [1500]u8 = undefined;
@@ -5976,7 +5976,7 @@ test "HRR server: a GENUINE cookie with bytes appended is refused (length is exa
 }
 
 test "HRR server: an attacker-invented cookie is refused, whatever its length" {
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x75} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x75)));
     const rnd = seededForTest(&csprng);
 
     // No real HelloRetryRequest is involved: these are cookies a peer made
@@ -5985,8 +5985,8 @@ test "HRR server: an attacker-invented cookie is refused, whatever its length" {
     const forged = [_][]const u8{
         "", // an empty `cookie` extension
         "short",
-        &[_]u8{0} ** cookie_len, // right length, all zeroes
-        &[_]u8{0xff} ** (cookie_len + 1), // right shape, one byte too long
+        &@as([cookie_len]u8, @splat(0)), // right length, all zeroes
+        &@as([cookie_len + 1]u8, @splat(0xff)), // right shape, one byte too long
     };
     for (forged) |c| {
         var client = try Connection.clientInit(hrrClientConfig(hrr_psk));
@@ -5999,8 +5999,8 @@ test "HRR server: an attacker-invented cookie is refused, whatever its length" {
         var cookie_buf: [2 + max_cookie_len]u8 = undefined;
         const cookie_ext = try messages.encodeCookieExtension(c, &cookie_buf);
         const datagram = try hrrDatagram(&.{
-            .{ .ext_type = @intFromEnum(messages.ExtensionType.supported_versions), .data = sh_versions },
-            .{ .ext_type = @intFromEnum(messages.ExtensionType.cookie), .data = cookie_ext },
+            .{ .ext_type = @backingInt(messages.ExtensionType.supported_versions), .data = sh_versions },
+            .{ .ext_type = @backingInt(messages.ExtensionType.cookie), .data = cookie_ext },
         });
         const ch2 = client.handleFlight(datagram.bytes[0..datagram.len], rnd, 0, &buf1) catch |err| {
             // An empty cookie changes nothing about ClientHello2, which RFC
@@ -6017,7 +6017,7 @@ test "HRR server: an attacker-invented cookie is refused, whatever its length" {
 
 test "HRR server: a wrong-PSK ClientHello still gets only a retry — no crypto is spent before return routability is proven" {
     var client = try Connection.clientInit(hrrClientConfig("the-WRONG-psk"));
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x76} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x76)));
     const rnd = seededForTest(&csprng);
     var buf1: [1500]u8 = undefined;
     var buf2: [1500]u8 = undefined;
@@ -6049,7 +6049,7 @@ test "HRR server: off by default — an unconfigured server answers ClientHello1
         .psk = hrr_psk,
         .cipher_suites = &.{.aes_128_gcm_sha256},
     });
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x77} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x77)));
     const rnd = seededForTest(&csprng);
     var buf1: [1500]u8 = undefined;
     var buf2: [1500]u8 = undefined;
@@ -6091,7 +6091,7 @@ test "Config.validate: hello_retry with an empty secret or an empty binding is r
 
 test "cookie: the MAC covers the peer binding, the ClientHello hash, and the suite — separately" {
     const hr = HelloRetryConfig{ .cookie_secret = "k", .peer_binding = "203.0.113.9:51000" };
-    const contents = CookieContents{ .suite = .aes_128_gcm_sha256, .client_hello1_hash = [_]u8{0xab} ** 32 };
+    const contents = CookieContents{ .suite = .aes_128_gcm_sha256, .client_hello1_hash = @as([32]u8, @splat(0xab)) };
 
     var base: [cookie_len]u8 = undefined;
     mintCookie(hr, contents, &base);
@@ -6128,7 +6128,7 @@ test "cookie: the MAC covers the peer binding, the ClientHello hash, and the sui
 test "handshake: server handleFlight rejects the wrong state" {
     const cfg = Config{ .role = .client, .psk_identity = "id", .psk = "secret" };
     var server = try Connection.serverInit(cfg);
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x50} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x50)));
     var out: [64]u8 = undefined;
     // `server` is `.start`ed but this call pretends it's already past
     // `.wait_finished` by driving it there via a bogus (empty) datagram
@@ -6155,7 +6155,7 @@ test "handshake: dropped ClientHello retransmits via poll (fake clock), then com
     const cfg_server = Config{ .role = .server, .psk_identity = psk_identity, .psk = psk, .cipher_suites = &.{.aes_128_gcm_sha256} };
     var client = try Connection.clientInit(cfg_client);
     var server = try Connection.serverInit(cfg_server);
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x30} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x30)));
     const rnd = seededForTest(&csprng);
 
     var buf1: [1500]u8 = undefined;
@@ -6235,14 +6235,14 @@ test "selectSignatureScheme: intersects peer-advertised x self-permitted x key-p
     // Peer advertises sha384 (NOT this side's most-preferred sha256) plus an
     // unrelated scheme — proves a real intersection is computed, not "peer
     // offered something, so use our first candidate".
-    const peer_sig_algs = [_]u16{ @intFromEnum(certverify.SignatureScheme.ed25519), @intFromEnum(certverify.SignatureScheme.rsa_pss_rsae_sha384) };
+    const peer_sig_algs = [_]u16{ @backingInt(certverify.SignatureScheme.ed25519), @backingInt(certverify.SignatureScheme.rsa_pss_rsae_sha384) };
     try testing.expectEqual(certverify.SignatureScheme.rsa_pss_rsae_sha384, try selectSignatureScheme(cc, &our_sig_algs, &peer_sig_algs));
 }
 
 test "selectSignatureScheme: peer advertises nothing this key's family can produce -> NoSignatureSchemeOverlap" {
     const cc = CertConfig{ .chain = &.{}, .private_key = .{ .ecdsa_p256 = undefined } };
     const our_sig_algs = default_signature_algorithms; // permissive on our side
-    const peer_sig_algs = [_]u16{ @intFromEnum(certverify.SignatureScheme.rsa_pss_rsae_sha256), @intFromEnum(certverify.SignatureScheme.ed25519) };
+    const peer_sig_algs = [_]u16{ @backingInt(certverify.SignatureScheme.rsa_pss_rsae_sha256), @backingInt(certverify.SignatureScheme.ed25519) };
     try testing.expectError(error.NoSignatureSchemeOverlap, selectSignatureScheme(cc, &our_sig_algs, &peer_sig_algs));
 }
 
@@ -6251,7 +6251,7 @@ test "selectSignatureScheme: peer DOES advertise a key-producible scheme, but OU
     // wrongly succeed (peer + key overlap alone is not sufficient).
     const cc = CertConfig{ .chain = &.{}, .private_key = .{ .ecdsa_p256 = undefined } };
     const our_sig_algs = [_]certverify.SignatureScheme{.ed25519}; // deliberately excludes ecdsa_secp256r1_sha256
-    const peer_sig_algs = [_]u16{@intFromEnum(certverify.SignatureScheme.ecdsa_secp256r1_sha256)};
+    const peer_sig_algs = [_]u16{@backingInt(certverify.SignatureScheme.ecdsa_secp256r1_sha256)};
     try testing.expectError(error.NoSignatureSchemeOverlap, selectSignatureScheme(cc, &our_sig_algs, &peer_sig_algs));
 }
 
@@ -6271,12 +6271,12 @@ test "verifyPeerCert: rejects a CertificateVerify scheme this side never adverti
     // `error.CertVerifyFailed` from certverify's own scheme/key-family
     // dispatch) — proving THIS specific check is what fires here, not some
     // other rejection downstream.
-    const garbage_leaf = [_]u8{0} ** 4;
-    const garbage_sig = [_]u8{0} ** 4;
-    const garbage_th = [_]u8{0} ** 32;
+    const garbage_leaf = @as([4]u8, @splat(0));
+    const garbage_sig = @as([4]u8, @splat(0));
+    const garbage_th = @as([32]u8, @splat(0));
     try testing.expectError(
         error.SignatureSchemeNotAdvertised,
-        conn.verifyPeerCert(&garbage_leaf, @intFromEnum(certverify.SignatureScheme.rsa_pss_rsae_sha256), &garbage_sig, &garbage_th, .server),
+        conn.verifyPeerCert(&garbage_leaf, @backingInt(certverify.SignatureScheme.rsa_pss_rsae_sha256), &garbage_sig, &garbage_th, .server),
     );
 }
 
@@ -6303,7 +6303,7 @@ test "cert-mode: server-cert-only handshake completes, derives matching keys, ap
     };
     var client = try Connection.clientInit(cfg_client);
     var server = try Connection.serverInit(cfg_server);
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x60} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x60)));
     var buf1: [2048]u8 = undefined;
     var buf2: [2048]u8 = undefined;
 
@@ -6351,7 +6351,7 @@ test "cert-mode: CertificateVerify signed with the WRONG key is rejected (typed 
     };
     var client = try Connection.clientInit(cfg_client);
     var server = try Connection.serverInit(cfg_server);
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x61} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x61)));
     const rnd = seededForTest(&csprng);
     var buf1: [2048]u8 = undefined;
     var buf2: [2048]u8 = undefined;
@@ -6383,7 +6383,7 @@ test "cert-mode: a directly-tampered CertificateVerify signature byte is rejecte
     };
     var client = try Connection.clientInit(cfg_client);
     var server = try Connection.serverInit(cfg_server);
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x62} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x62)));
     const rnd = seededForTest(&csprng);
     var buf1: [2048]u8 = undefined;
     var buf2: [2048]u8 = undefined;
@@ -6439,7 +6439,7 @@ test "cert-mode: peer chain signed by an UNTRUSTED anchor is rejected" {
     };
     var client = try Connection.clientInit(cfg_client);
     var server = try Connection.serverInit(cfg_server);
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x63} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x63)));
     const rnd = seededForTest(&csprng);
     var buf1: [2048]u8 = undefined;
     var buf2: [2048]u8 = undefined;
@@ -6483,7 +6483,7 @@ test "cert-mode: expected_peer_name stops one anchor-issued peer impersonating a
     {
         var client = try Connection.clientInit(cfg_client);
         var server = try Connection.serverInit(cfg_server);
-        var csprng = std.Random.DefaultCsprng.init([_]u8{0x71} ** 32);
+        var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x71)));
         const rnd = seededForTest(&csprng);
         var buf1: [2048]u8 = undefined;
         var buf2: [2048]u8 = undefined;
@@ -6497,7 +6497,7 @@ test "cert-mode: expected_peer_name stops one anchor-issued peer impersonating a
         cfg_client.expected_peer_name = "dtls-test-server";
         var client = try Connection.clientInit(cfg_client);
         var server = try Connection.serverInit(cfg_server);
-        var csprng = std.Random.DefaultCsprng.init([_]u8{0x71} ** 32);
+        var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x71)));
         const rnd = seededForTest(&csprng);
         var buf1: [2048]u8 = undefined;
         var buf2: [2048]u8 = undefined;
@@ -6520,7 +6520,7 @@ test "cert-mode: expected_peer_name stops one anchor-issued peer impersonating a
                 .private_key = serverEcdsaKeyPair(),
             },
         });
-        var csprng = std.Random.DefaultCsprng.init([_]u8{0x72} ** 32);
+        var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x72)));
         const rnd = seededForTest(&csprng);
         var buf1: [2048]u8 = undefined;
         var buf2: [2048]u8 = undefined;
@@ -6547,7 +6547,7 @@ test "cert-mode: require_peer_cert rejects a server that presents no certificate
     const cfg_server = Config{ .role = .server, .psk_identity = psk_identity, .psk = psk, .cipher_suites = &.{.aes_128_gcm_sha256} };
     var client = try Connection.clientInit(cfg_client);
     var server = try Connection.serverInit(cfg_server);
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x64} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x64)));
     const rnd = seededForTest(&csprng);
     var buf1: [2048]u8 = undefined;
     var buf2: [2048]u8 = undefined;
@@ -6588,7 +6588,7 @@ test "cert-mode: CertificateRequest -> client presents its own cert -> mutual au
     };
     var client = try Connection.clientInit(cfg_client);
     var server = try Connection.serverInit(cfg_server);
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x65} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x65)));
     var buf1: [2048]u8 = undefined;
     var buf2: [2048]u8 = undefined;
 
@@ -6628,7 +6628,7 @@ test "cert-mode: server requires a client cert but client has none configured ->
     };
     var client = try Connection.clientInit(cfg_client);
     var server = try Connection.serverInit(cfg_server);
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x66} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x66)));
     const rnd = seededForTest(&csprng);
     var buf1: [2048]u8 = undefined;
     var buf2: [2048]u8 = undefined;
@@ -6652,7 +6652,7 @@ test "cert-mode: PSK-only Config fields (cert=null, peer_verify=.none) reproduce
     const cfg_server = Config{ .role = .server, .psk_identity = psk_identity, .psk = psk, .cipher_suites = &.{.aes_128_gcm_sha256} };
     var client = try Connection.clientInit(cfg_client);
     var server = try Connection.serverInit(cfg_server);
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x10} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x10)));
     var buf1: [1500]u8 = undefined;
     var buf2: [1500]u8 = undefined;
 
@@ -6691,7 +6691,7 @@ test "cert-mode: signature_algorithms negotiation picks the mutually-supported s
     };
     var client = try Connection.clientInit(cfg_client);
     var server = try Connection.serverInit(cfg_server);
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x67} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x67)));
     var buf1: [2048]u8 = undefined;
     var buf2: [2048]u8 = undefined;
 
@@ -6727,7 +6727,7 @@ test "cert-mode: no mutually-supported signature scheme for the server's own Cer
     };
     var client = try Connection.clientInit(cfg_client);
     var server = try Connection.serverInit(cfg_server);
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x68} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x68)));
     const rnd = seededForTest(&csprng);
     var buf1: [2048]u8 = undefined;
     var buf2: [2048]u8 = undefined;
@@ -6765,7 +6765,7 @@ test "cert-mode: no mutually-supported signature scheme for the CLIENT's own Cer
     };
     var client = try Connection.clientInit(cfg_client);
     var server = try Connection.serverInit(cfg_server);
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x69} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x69)));
     const rnd = seededForTest(&csprng);
     var buf1: [2048]u8 = undefined;
     var buf2: [2048]u8 = undefined;
@@ -6823,7 +6823,7 @@ test "cert-DHE KAT: X25519 key_share + key schedule reproduce RFC 8448 §3 byte-
     // "dtls13" prefix is separately KAT'd in keyschedule.zig); the point
     // proven is that the X25519 output is the correct HKDF-Extract IKM.
     const Hkdf = std.crypto.kdf.hkdf.HkdfSha256;
-    const zero_psk = [_]u8{0} ** 32;
+    const zero_psk = @as([32]u8, @splat(0));
     var es: [32]u8 = undefined;
     keyschedule.earlySecret(Hkdf, &es, &zero_psk);
     try testing.expectEqualSlices(u8, &hx(32, "33ad0a1c607ec03b09e6cd9893680ce210adf300aa1f2660e1b22e10f170f92a"), &es);
@@ -6862,7 +6862,7 @@ fn certDheClientConfig() Config {
 test "cert-DHE: server-only auth handshake completes, matching keys, app data round-trips" {
     var client = try Connection.clientInit(certDheClientConfig());
     var server = try Connection.serverInit(certDheServerConfig());
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x70} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x70)));
     var buf1: [2048]u8 = undefined;
     var buf2: [2048]u8 = undefined;
 
@@ -6878,7 +6878,7 @@ test "cert-DHE: server-only auth handshake completes, matching keys, app data ro
     // shared secret was computed — the WHOLE array, not just the group's own
     // prefix (the hybrid needs all `ecdhe_secret_len` bytes wiped).
     try testing.expect(!client.ecdhe_secret_live);
-    try testing.expectEqualSlices(u8, &([_]u8{0} ** ecdhe_secret_len), &client.ecdhe_secret);
+    try testing.expectEqualSlices(u8, &(@as([ecdhe_secret_len]u8, @splat(0))), &client.ecdhe_secret);
 
     var wire: [256]u8 = undefined;
     var plain: [256]u8 = undefined;
@@ -6899,7 +6899,7 @@ test "cert-DHE with key_share_group = .x25519_ml_kem768: PQ-hybrid handshake com
     client_config.key_share_group = .x25519_ml_kem768;
     var client = try Connection.clientInit(client_config);
     var server = try Connection.serverInit(certDheServerConfig());
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x71} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x71)));
     var buf1: [max_flight_bytes]u8 = undefined;
     var buf2: [max_flight_bytes]u8 = undefined;
 
@@ -6915,7 +6915,7 @@ test "cert-DHE with key_share_group = .x25519_ml_kem768: PQ-hybrid handshake com
     try testing.expectEqualSlices(u8, client.write_keys.key[0..client.write_keys.key_len], server.read_keys.key[0..server.read_keys.key_len]);
     try testing.expectEqualSlices(u8, client.read_keys.key[0..client.read_keys.key_len], server.write_keys.key[0..server.write_keys.key_len]);
     try testing.expect(!client.ecdhe_secret_live);
-    try testing.expectEqualSlices(u8, &([_]u8{0} ** ecdhe_secret_len), &client.ecdhe_secret);
+    try testing.expectEqualSlices(u8, &(@as([ecdhe_secret_len]u8, @splat(0))), &client.ecdhe_secret);
 
     var wire: [256]u8 = undefined;
     var plain: [256]u8 = undefined;
@@ -6935,7 +6935,7 @@ test "cert-DHE: ChaCha20-Poly1305 suite also completes" {
     cfg_s.cipher_suites = &.{.chacha20_poly1305_sha256};
     var client = try Connection.clientInit(cfg_c);
     var server = try Connection.serverInit(cfg_s);
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x71} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x71)));
     var buf1: [2048]u8 = undefined;
     var buf2: [2048]u8 = undefined;
     try driveHandshake(&client, &server, seededForTest(&csprng), &buf1, &buf2);
@@ -6957,7 +6957,7 @@ test "cert-DHE: mutual auth (CertificateRequest -> client cert) completes" {
 
     var client = try Connection.clientInit(cfg_c);
     var server = try Connection.serverInit(cfg_s);
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x72} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x72)));
     var buf1: [2048]u8 = undefined;
     var buf2: [2048]u8 = undefined;
 
@@ -6975,7 +6975,7 @@ test "cert-DHE: mutual auth (CertificateRequest -> client cert) completes" {
 test "cert-DHE reject: a tampered ServerHello key_share breaks the handshake (typed error, not a panic)" {
     var client = try Connection.clientInit(certDheClientConfig());
     var server = try Connection.serverInit(certDheServerConfig());
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x73} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x73)));
     const rnd = seededForTest(&csprng);
     var buf1: [2048]u8 = undefined;
     var buf2: [2048]u8 = undefined;
@@ -7010,7 +7010,7 @@ test "cert-DHE reject: CertificateVerify signed with the WRONG key is rejected" 
     };
     var client = try Connection.clientInit(certDheClientConfig());
     var server = try Connection.serverInit(cfg_s);
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x74} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x74)));
     const rnd = seededForTest(&csprng);
     var buf1: [2048]u8 = undefined;
     var buf2: [2048]u8 = undefined;
@@ -7025,7 +7025,7 @@ test "cert-DHE reject: untrusted anchor is rejected" {
     cfg_c.peer_verify = .{ .trust_anchor = &cert_kat.evil_anchor_cert_der };
     var client = try Connection.clientInit(cfg_c);
     var server = try Connection.serverInit(certDheServerConfig());
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x75} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x75)));
     const rnd = seededForTest(&csprng);
     var buf1: [2048]u8 = undefined;
     var buf2: [2048]u8 = undefined;
@@ -7046,7 +7046,7 @@ test "cert-DHE reject: a cert-DHE server rejects a ClientHello with no key_share
         .cipher_suites = &.{.aes_128_gcm_sha256},
     });
     var server = try Connection.serverInit(certDheServerConfig());
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x76} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x76)));
     const rnd = seededForTest(&csprng);
     var buf1: [2048]u8 = undefined;
     var buf2: [2048]u8 = undefined;
@@ -7118,7 +7118,7 @@ test "Config.validate: key_share_group must be an advertised group" {
     // ...and a real code point this module does not advertise (x448) is a
     // config error at validate time, not an HRR-refusal loop at run time.
     var cfg = certDheClientConfig();
-    cfg.key_share_group = @enumFromInt(0x001e);
+    cfg.key_share_group = @fromBackingInt(@intCast(0x001e));
     try testing.expectError(error.UnsupportedKeyShareGroup, cfg.validate());
 }
 
@@ -7135,7 +7135,7 @@ test "cert-DHE fail-closed: a server that presents NO certificate cannot complet
         .key_exchange = .cert_dhe_insecure_unauthenticated,
         .cipher_suites = &.{.aes_128_gcm_sha256},
     });
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x7f} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x7f)));
     const rnd = seededForTest(&csprng);
     var buf1: [2048]u8 = undefined;
     var buf2: [2048]u8 = undefined;
@@ -7165,7 +7165,7 @@ test "cert-DHE: the unauthenticated mode is reachable ONLY by its own name, and 
 
     var client = try Connection.clientInit(insecure_client);
     var server = try Connection.serverInit(insecure_server);
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x80} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x80)));
     var buf1: [2048]u8 = undefined;
     var buf2: [2048]u8 = undefined;
     try driveHandshake(&client, &server, seededForTest(&csprng), &buf1, &buf2);
@@ -7191,7 +7191,7 @@ test "advertised_groups and the (EC)DHE implementation agree (no group we cannot
     // `handleHelloRetryRequest` would then have to refuse — turning a
     // perfectly ordinary server into an unreachable one. This test is the
     // reason `advertised_groups` is a single list rather than two literals.
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x91} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x91)));
     const rnd = seededForTest(&csprng);
     for (advertised_groups) |g| {
         try testing.expect(groupAdvertised(g));
@@ -7235,19 +7235,19 @@ test "ecdheSharedSecret secp256r1 KAT: byte-exact against Python `cryptography` 
 test "ecdheSharedSecret: peer-supplied garbage is a typed error, never a panic" {
     const a_scalar = hx(32, "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20");
     // Wrong length for the group (an x25519-sized share labelled P-256).
-    try testing.expectError(error.MissingKeyShare, ecdheSharedSecret(secp256r1_group, &a_scalar, &([_]u8{0xAA} ** 32)));
+    try testing.expectError(error.MissingKeyShare, ecdheSharedSecret(secp256r1_group, &a_scalar, &(@as([32]u8, @splat(0xAA)))));
     // Right length, not a point on the curve.
-    var off_curve = [_]u8{0} ** 65;
+    var off_curve = @as([65]u8, @splat(0));
     off_curve[0] = 0x04;
     off_curve[1] = 0x01;
     try testing.expectError(error.KeyExchangeFailed, ecdheSharedSecret(secp256r1_group, &a_scalar, &off_curve));
     // A group this module does not speak.
-    try testing.expectError(error.MissingKeyShare, ecdheSharedSecret(0x001e, &a_scalar, &([_]u8{0xAA} ** 32)));
+    try testing.expectError(error.MissingKeyShare, ecdheSharedSecret(0x001e, &a_scalar, &(@as([32]u8, @splat(0xAA)))));
     // x25519's own low-order/identity rejection still stands.
-    try testing.expectError(error.KeyExchangeFailed, ecdheSharedSecret(x25519_group, &a_scalar, &([_]u8{0} ** 32)));
+    try testing.expectError(error.KeyExchangeFailed, ecdheSharedSecret(x25519_group, &a_scalar, &(@as([32]u8, @splat(0)))));
     // A private key shorter than the group needs is a typed error too — the
     // hybrid arm must not decapsulate with a truncated seed.
-    try testing.expectError(error.KeyExchangeFailed, ecdheSharedSecret(x25519_mlkem768_group, &a_scalar, &([_]u8{0xAA} ** hybrid_server_share_len)));
+    try testing.expectError(error.KeyExchangeFailed, ecdheSharedSecret(x25519_mlkem768_group, &a_scalar, &(@as([hybrid_server_share_len]u8, @splat(0xAA)))));
 }
 
 test "hybrid X25519MLKEM768: both sides agree, and each half is the RIGHT half in the RIGHT place" {
@@ -7259,7 +7259,7 @@ test "hybrid X25519MLKEM768: both sides agree, and each half is the RIGHT half i
     // bytes 0..32 must be the ML-KEM shared secret (recomputed by direct
     // decapsulation of the server's ciphertext), bytes 32..64 the X25519
     // scalarmult output — the draft's order, ML-KEM first despite the name.
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x77} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x77)));
     const rnd = seededForTest(&csprng);
 
     const kp = try ecdheGenerate(x25519_mlkem768_group, rnd);
@@ -7288,16 +7288,16 @@ test "hybrid X25519MLKEM768: both sides agree, and each half is the RIGHT half i
 }
 
 test "hybrid X25519MLKEM768: peer-supplied garbage is a typed error, never a panic" {
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x78} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x78)));
     const rnd = seededForTest(&csprng);
 
     // Server side: wrong client-share length (the SERVER form's 1120 —
     // right length for the other direction, so a copy-paste of the two
     // constants would pass a naive length check).
-    try testing.expectError(error.MissingKeyShare, ecdheServerExchange(x25519_mlkem768_group, &([_]u8{0xAA} ** hybrid_server_share_len), rnd));
+    try testing.expectError(error.MissingKeyShare, ecdheServerExchange(x25519_mlkem768_group, &(@as([hybrid_server_share_len]u8, @splat(0xAA))), rnd));
     // Server side: right length, non-canonical encapsulation key (0xFF
     // coefficients are ≥ q, FIPS 203 §7.2's modulus check must refuse).
-    try testing.expectError(error.KeyExchangeFailed, ecdheServerExchange(x25519_mlkem768_group, &([_]u8{0xFF} ** hybrid_client_share_len), rnd));
+    try testing.expectError(error.KeyExchangeFailed, ecdheServerExchange(x25519_mlkem768_group, &(@as([hybrid_client_share_len]u8, @splat(0xFF))), rnd));
     // Server side: canonical ML-KEM key, but the X25519 half is the
     // identity — the classical poisoning the hybrid must still refuse.
     const kp = try ecdheGenerate(x25519_mlkem768_group, rnd);
@@ -7306,7 +7306,7 @@ test "hybrid X25519MLKEM768: peer-supplied garbage is a typed error, never a pan
     try testing.expectError(error.KeyExchangeFailed, ecdheServerExchange(x25519_mlkem768_group, poisoned[0..hybrid_client_share_len], rnd));
 
     // Client side: wrong server-share length (the CLIENT form's 1216).
-    try testing.expectError(error.MissingKeyShare, ecdheSharedSecret(x25519_mlkem768_group, &kp.secret, &([_]u8{0xAA} ** hybrid_client_share_len)));
+    try testing.expectError(error.MissingKeyShare, ecdheSharedSecret(x25519_mlkem768_group, &kp.secret, &(@as([hybrid_client_share_len]u8, @splat(0xAA)))));
     // Client side: identity X25519 half in an otherwise well-formed answer.
     var ex = try ecdheServerExchange(x25519_mlkem768_group, kp.public[0..kp.public_len], rnd);
     @memset(ex.public[MlKem768.ciphertext_length..][0..32], 0);
@@ -7343,14 +7343,14 @@ fn certHrrDatagram(h: CertHrr) !HrrDatagram {
 
     var exts: [3]messages.Extension = undefined;
     var n: usize = 0;
-    exts[n] = .{ .ext_type = @intFromEnum(messages.ExtensionType.supported_versions), .data = sh_versions };
+    exts[n] = .{ .ext_type = @backingInt(messages.ExtensionType.supported_versions), .data = sh_versions };
     n += 1;
     if (h.cookie) |c| {
-        exts[n] = .{ .ext_type = @intFromEnum(messages.ExtensionType.cookie), .data = try messages.encodeCookieExtension(c, &cookie_buf) };
+        exts[n] = .{ .ext_type = @backingInt(messages.ExtensionType.cookie), .data = try messages.encodeCookieExtension(c, &cookie_buf) };
         n += 1;
     }
     if (h.selected_group) |g| {
-        exts[n] = .{ .ext_type = @intFromEnum(messages.ExtensionType.key_share), .data = try messages.encodeKeyShareHelloRetryRequest(g, &ks_buf) };
+        exts[n] = .{ .ext_type = @backingInt(messages.ExtensionType.key_share), .data = try messages.encodeKeyShareHelloRetryRequest(g, &ks_buf) };
         n += 1;
     }
 
@@ -7358,12 +7358,12 @@ fn certHrrDatagram(h: CertHrr) !HrrDatagram {
     const sh_body = try messages.encodeServerHello(.{
         .random = messages.hello_retry_request_random,
         .legacy_session_id_echo = &.{},
-        .cipher_suite = @intFromEnum(h.suite),
+        .cipher_suite = @backingInt(h.suite),
         .extensions = exts[0..n],
     }, &sh_body_buf);
 
     var frag_buf: [256 + handshake.header_len]u8 = undefined;
-    const fragment = try frameHandshakeMessage(@intFromEnum(messages.HandshakeType.server_hello), 0, sh_body, &frag_buf);
+    const fragment = try frameHandshakeMessage(@backingInt(messages.HandshakeType.server_hello), 0, sh_body, &frag_buf);
 
     var result: HrrDatagram = .{ .bytes = undefined, .len = 0 };
     const hdr = record.PlaintextHeader{ .content_type = content_type_handshake, .epoch = 0, .sequence_number = 0, .length = @intCast(fragment.len) };
@@ -7375,7 +7375,7 @@ fn certHrrDatagram(h: CertHrr) !HrrDatagram {
 
 fn findExt(exts: []const messages.Extension, t: messages.ExtensionType) ?[]const u8 {
     for (exts) |e| {
-        if (e.ext_type == @intFromEnum(t)) return e.data;
+        if (e.ext_type == @backingInt(t)) return e.data;
     }
     return null;
 }
@@ -7417,7 +7417,7 @@ fn expectClientHello2Conformant(
                 break cand;
             }
         } else return error.ClientHello2DroppedAnExtension;
-        if (x1.ext_type == @intFromEnum(messages.ExtensionType.key_share)) {
+        if (x1.ext_type == @backingInt(messages.ExtensionType.key_share)) {
             const changed = !std.mem.eql(u8, x1.data, x2.data);
             try testing.expectEqual(expect_key_share_changed, changed);
         } else {
@@ -7427,8 +7427,8 @@ fn expectClientHello2Conformant(
 
     // ...and the only extension CH2 may ADD is `cookie`.
     for (d2.extensions) |x2| {
-        if (findExt(d1.extensions, @enumFromInt(x2.ext_type)) != null) continue;
-        try testing.expectEqual(@intFromEnum(messages.ExtensionType.cookie), x2.ext_type);
+        if (findExt(d1.extensions, @fromBackingInt(@intCast(x2.ext_type))) != null) continue;
+        try testing.expectEqual(@backingInt(messages.ExtensionType.cookie), x2.ext_type);
     }
 
     if (expect_cookie) |want| {
@@ -7445,14 +7445,14 @@ fn clientHelloBodyOf(datagram: []const u8, out: []u8) ![]const u8 {
     const fragment = datagram[record.plaintext_header_len..][0..rec.length];
     var received_buf: [max_client_hello_body]bool = undefined;
     const parsed = try decodeSingleFragmentMessage(fragment, out, &received_buf);
-    try testing.expectEqual(@intFromEnum(messages.HandshakeType.client_hello), parsed.msg_type);
+    try testing.expectEqual(@backingInt(messages.HandshakeType.client_hello), parsed.msg_type);
     return parsed.body;
 }
 
 test "cert-DHE HRR: a GROUP-CHANGE retry regenerates the key_share in the named group and changes nothing else" {
     var client = try Connection.clientInit(certDheClientConfig());
     defer client.deinit();
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x80} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x80)));
     const rnd = seededForTest(&csprng);
     var buf1: [1500]u8 = undefined;
     var buf2: [1500]u8 = undefined;
@@ -7501,7 +7501,7 @@ test "cert-DHE HRR: a retry naming x25519_ml_kem768 upgrades a classical offer t
     // generate a share in it (the "advertised_groups agree" test's rule).
     var client = try Connection.clientInit(certDheClientConfig());
     defer client.deinit();
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x83} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x83)));
     const rnd = seededForTest(&csprng);
     var buf1: [max_flight_bytes]u8 = undefined;
     var buf2: [max_flight_bytes]u8 = undefined;
@@ -7533,7 +7533,7 @@ test "cert-DHE HRR: a retry naming x25519_ml_kem768 upgrades a classical offer t
 test "cert-DHE HRR: a COOKIE-ONLY retry leaves the key_share byte-identical (§4.1.2 permits no gratuitous change)" {
     var client = try Connection.clientInit(certDheClientConfig());
     defer client.deinit();
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x81} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x81)));
     const rnd = seededForTest(&csprng);
     var buf1: [1500]u8 = undefined;
     var buf2: [1500]u8 = undefined;
@@ -7568,7 +7568,7 @@ test "cert-DHE HRR: a COOKIE-ONLY retry leaves the key_share byte-identical (§4
 test "cert-DHE HRR: cookie AND group change in one retry are both applied" {
     var client = try Connection.clientInit(certDheClientConfig());
     defer client.deinit();
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x82} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x82)));
     const rnd = seededForTest(&csprng);
     var buf1: [1500]u8 = undefined;
     var buf2: [1500]u8 = undefined;
@@ -7593,7 +7593,7 @@ test "cert-DHE HRR: cookie AND group change in one retry are both applied" {
 test "cert-DHE HRR reject: a retry naming a group the client ALREADY offered a share in (the retry-loop case)" {
     var client = try Connection.clientInit(certDheClientConfig());
     defer client.deinit();
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x83} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x83)));
     const rnd = seededForTest(&csprng);
     var buf1: [1500]u8 = undefined;
     var buf2: [1500]u8 = undefined;
@@ -7623,7 +7623,7 @@ test "cert-DHE HRR reject: a retry naming a group the client ALREADY offered a s
 test "cert-DHE HRR reject: a retry naming a group never advertised in supported_groups" {
     var client = try Connection.clientInit(certDheClientConfig());
     defer client.deinit();
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x84} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x84)));
     const rnd = seededForTest(&csprng);
     var buf1: [1500]u8 = undefined;
     var buf2: [1500]u8 = undefined;
@@ -7639,7 +7639,7 @@ test "cert-DHE HRR reject: a retry naming a group never advertised in supported_
 test "cert-DHE HRR reject: a retry with neither a cookie nor a group change" {
     var client = try Connection.clientInit(certDheClientConfig());
     defer client.deinit();
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x85} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x85)));
     const rnd = seededForTest(&csprng);
     var buf1: [1500]u8 = undefined;
     var buf2: [1500]u8 = undefined;
@@ -7652,7 +7652,7 @@ test "cert-DHE HRR reject: a retry with neither a cookie nor a group change" {
 test "PSK HRR reject: a retry carrying a key_share (psk_ke has no (EC)DHE to update)" {
     var client = try Connection.clientInit(hrrClientConfig(hrr_psk));
     defer client.deinit();
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x86} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x86)));
     const rnd = seededForTest(&csprng);
     var buf1: [1500]u8 = undefined;
     var buf2: [1500]u8 = undefined;
@@ -7672,7 +7672,7 @@ test "HRR: the ServerHello must select the cipher suite the retry committed to (
     cfg.cipher_suites = &.{ .aes_128_gcm_sha256, .chacha20_poly1305_sha256 };
     var client = try Connection.clientInit(cfg);
     defer client.deinit();
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x87} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x87)));
     const rnd = seededForTest(&csprng);
     var buf1: [1500]u8 = undefined;
     var buf2: [1500]u8 = undefined;
@@ -7680,7 +7680,7 @@ test "HRR: the ServerHello must select the cipher suite the retry committed to (
 
     const hrr = try certHrrDatagram(.{ .selected_group = secp256r1_group, .suite = .aes_128_gcm_sha256 });
     _ = try client.handleFlight(hrr.bytes[0..hrr.len], rnd, 0, &buf2);
-    try testing.expectEqual(@as(?u16, @intFromEnum(CipherSuite.aes_128_gcm_sha256)), client.hrr_cipher_suite);
+    try testing.expectEqual(@as(?u16, @backingInt(CipherSuite.aes_128_gcm_sha256)), client.hrr_cipher_suite);
 
     // A ServerHello selecting the OTHER suite — one this client legitimately
     // offered, so nothing else rejects it — after the retry named the first.
@@ -7691,20 +7691,20 @@ test "HRR: the ServerHello must select the cipher suite the retry committed to (
     var sh_versions_buf: [2]u8 = undefined;
     const sh_versions = try messages.encodeSupportedVersionsServerHello(messages.version_dtls13, &sh_versions_buf);
     var ks_buf: [4 + max_key_share_len]u8 = undefined;
-    const dummy_share = [_]u8{0x04} ++ [_]u8{0x11} ** 64;
+    const dummy_share = [_]u8{0x04} ++ @as([64]u8, @splat(0x11));
     const ks = try messages.encodeKeyShareServerHello(.{ .group = secp256r1_group, .key_exchange = &dummy_share }, &ks_buf);
     const sh_body = try messages.encodeServerHello(.{
-        .random = [_]u8{0x5a} ** 32,
+        .random = @as([32]u8, @splat(0x5a)),
         .legacy_session_id_echo = &.{},
-        .cipher_suite = @intFromEnum(CipherSuite.chacha20_poly1305_sha256),
+        .cipher_suite = @backingInt(CipherSuite.chacha20_poly1305_sha256),
         .extensions = &.{
-            .{ .ext_type = @intFromEnum(messages.ExtensionType.supported_versions), .data = sh_versions },
-            .{ .ext_type = @intFromEnum(messages.ExtensionType.key_share), .data = ks },
+            .{ .ext_type = @backingInt(messages.ExtensionType.supported_versions), .data = sh_versions },
+            .{ .ext_type = @backingInt(messages.ExtensionType.key_share), .data = ks },
         },
     }, &sh_body_buf);
 
     var frag_buf: [256 + handshake.header_len]u8 = undefined;
-    const fragment = try frameHandshakeMessage(@intFromEnum(messages.HandshakeType.server_hello), 1, sh_body, &frag_buf);
+    const fragment = try frameHandshakeMessage(@backingInt(messages.HandshakeType.server_hello), 1, sh_body, &frag_buf);
     var wire: [400]u8 = undefined;
     const hdr = record.PlaintextHeader{ .content_type = content_type_handshake, .epoch = 0, .sequence_number = 1, .length = @intCast(fragment.len) };
     const hdr_slice = try record.encodePlaintext(hdr, &wire);
@@ -7731,7 +7731,7 @@ test "cert-DHE: a ServerHello answering in a DIFFERENT group than the client off
     // group is actually compared.
     var client = try Connection.clientInit(certDheClientConfig());
     defer client.deinit();
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x88} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x88)));
     const rnd = seededForTest(&csprng);
     var buf1: [1500]u8 = undefined;
     _ = try client.startHandshake(rnd, 0, &buf1); // offers x25519
@@ -7739,21 +7739,21 @@ test "cert-DHE: a ServerHello answering in a DIFFERENT group than the client off
     var sh_versions_buf: [2]u8 = undefined;
     const sh_versions = try messages.encodeSupportedVersionsServerHello(messages.version_dtls13, &sh_versions_buf);
     var ks_buf: [4 + max_key_share_len]u8 = undefined;
-    const p256_share = [_]u8{0x11} ** 32;
+    const p256_share = @as([32]u8, @splat(0x11));
     const ks = try messages.encodeKeyShareServerHello(.{ .group = secp256r1_group, .key_exchange = &p256_share }, &ks_buf);
     var sh_body_buf: [256]u8 = undefined;
     const sh_body = try messages.encodeServerHello(.{
-        .random = [_]u8{0x5b} ** 32,
+        .random = @as([32]u8, @splat(0x5b)),
         .legacy_session_id_echo = &.{},
-        .cipher_suite = @intFromEnum(CipherSuite.aes_128_gcm_sha256),
+        .cipher_suite = @backingInt(CipherSuite.aes_128_gcm_sha256),
         .extensions = &.{
-            .{ .ext_type = @intFromEnum(messages.ExtensionType.supported_versions), .data = sh_versions },
-            .{ .ext_type = @intFromEnum(messages.ExtensionType.key_share), .data = ks },
+            .{ .ext_type = @backingInt(messages.ExtensionType.supported_versions), .data = sh_versions },
+            .{ .ext_type = @backingInt(messages.ExtensionType.key_share), .data = ks },
         },
     }, &sh_body_buf);
 
     var frag_buf: [256 + handshake.header_len]u8 = undefined;
-    const fragment = try frameHandshakeMessage(@intFromEnum(messages.HandshakeType.server_hello), 0, sh_body, &frag_buf);
+    const fragment = try frameHandshakeMessage(@backingInt(messages.HandshakeType.server_hello), 0, sh_body, &frag_buf);
     var wire: [400]u8 = undefined;
     const hdr = record.PlaintextHeader{ .content_type = content_type_handshake, .epoch = 0, .sequence_number = 0, .length = @intCast(fragment.len) };
     const hdr_slice = try record.encodePlaintext(hdr, &wire);
@@ -7773,7 +7773,7 @@ test "cert-DHE: a ServerHello negotiating DTLS 1.2 (real legacy value, not garba
     // keys for a connection that only agreed on 1.2.
     var client = try Connection.clientInit(certDheClientConfig());
     defer client.deinit();
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x89} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x89)));
     const rnd = seededForTest(&csprng);
     var buf1: [1500]u8 = undefined;
     _ = try client.startHandshake(rnd, 0, &buf1); // offers x25519
@@ -7781,21 +7781,21 @@ test "cert-DHE: a ServerHello negotiating DTLS 1.2 (real legacy value, not garba
     var sh_versions_buf: [2]u8 = undefined;
     const sh_versions = try messages.encodeSupportedVersionsServerHello(messages.legacy_version_dtls12, &sh_versions_buf);
     var ks_buf: [4 + max_key_share_len]u8 = undefined;
-    const dummy_share = [_]u8{0x11} ** 32;
+    const dummy_share = @as([32]u8, @splat(0x11));
     const ks = try messages.encodeKeyShareServerHello(.{ .group = x25519_group, .key_exchange = &dummy_share }, &ks_buf);
     var sh_body_buf: [256]u8 = undefined;
     const sh_body = try messages.encodeServerHello(.{
-        .random = [_]u8{0x5c} ** 32,
+        .random = @as([32]u8, @splat(0x5c)),
         .legacy_session_id_echo = &.{},
-        .cipher_suite = @intFromEnum(CipherSuite.aes_128_gcm_sha256),
+        .cipher_suite = @backingInt(CipherSuite.aes_128_gcm_sha256),
         .extensions = &.{
-            .{ .ext_type = @intFromEnum(messages.ExtensionType.supported_versions), .data = sh_versions },
-            .{ .ext_type = @intFromEnum(messages.ExtensionType.key_share), .data = ks },
+            .{ .ext_type = @backingInt(messages.ExtensionType.supported_versions), .data = sh_versions },
+            .{ .ext_type = @backingInt(messages.ExtensionType.key_share), .data = ks },
         },
     }, &sh_body_buf);
 
     var frag_buf: [256 + handshake.header_len]u8 = undefined;
-    const fragment = try frameHandshakeMessage(@intFromEnum(messages.HandshakeType.server_hello), 0, sh_body, &frag_buf);
+    const fragment = try frameHandshakeMessage(@backingInt(messages.HandshakeType.server_hello), 0, sh_body, &frag_buf);
     var wire: [400]u8 = undefined;
     const hdr = record.PlaintextHeader{ .content_type = content_type_handshake, .epoch = 0, .sequence_number = 0, .length = @intCast(fragment.len) };
     const hdr_slice = try record.encodePlaintext(hdr, &wire);
@@ -7818,7 +7818,7 @@ test "cert-DHE HRR self-interop: our own server's stateless cookie exchange work
 
     var client = try Connection.clientInit(certDheClientConfig());
     defer client.deinit();
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x89} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x89)));
     const rnd = seededForTest(&csprng);
     var buf1: [2048]u8 = undefined;
     var buf2: [2048]u8 = undefined;
@@ -7865,7 +7865,7 @@ test "cert-DHE: our server accepts a secp256r1 client share and answers in the s
     defer client.deinit();
     var server = try Connection.serverInit(certDheServerConfig());
     defer server.deinit();
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x8a} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x8a)));
     const rnd = seededForTest(&csprng);
     var buf1: [2048]u8 = undefined;
     var buf2: [2048]u8 = undefined;
@@ -7920,7 +7920,7 @@ test "Entropy: exactly two arms, production and test are distinct, and nothing e
     // Distinct: the same generator under the two arms is not the same value,
     // so "which arm" survives being passed around. Without this the test would
     // still pass if the tag were cosmetic.
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0xB6} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0xB6)));
     const production: Entropy = .{ .csprng = csprng.random() };
     const for_test: Entropy = .{ .seeded_for_test = csprng.random() };
     try testing.expect(std.meta.activeTag(production) != std.meta.activeTag(for_test));
@@ -7943,8 +7943,8 @@ test "the CSPRNG requirement is load-bearing: a seeded RNG reproduces the ECDHE 
     // decrypts every recorded session, retroactively.
     // Only the first 32 bytes of `secret` are written for these two groups; the
     // tail is undefined (stack residue), so it is never compared.
-    var a = std.Random.DefaultCsprng.init([_]u8{0xB6} ** 32);
-    var b = std.Random.DefaultCsprng.init([_]u8{0xB6} ** 32);
+    var a = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0xB6)));
+    var b = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0xB6)));
     const ka = try ecdheGenerate(x25519_group, .{ .seeded_for_test = a.random() });
     const kb = try ecdheGenerate(x25519_group, .{ .seeded_for_test = b.random() });
     try testing.expectEqualSlices(u8, ka.secret[0..32], kb.secret[0..32]);
@@ -7953,7 +7953,7 @@ test "the CSPRNG requirement is load-bearing: a seeded RNG reproduces the ECDHE 
     // ... and it really is the generator that decides, not a constant in the
     // code: a different seed gives a different key. Both halves are needed —
     // the first alone would also pass if `ecdheGenerate` returned a fixed key.
-    var c = std.Random.DefaultCsprng.init([_]u8{0x6B} ** 32);
+    var c = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x6B)));
     const kc = try ecdheGenerate(x25519_group, .{ .seeded_for_test = c.random() });
     try testing.expect(!std.mem.eql(u8, ka.secret[0..32], kc.secret[0..32]));
 
@@ -7961,14 +7961,14 @@ test "the CSPRNG requirement is load-bearing: a seeded RNG reproduces the ECDHE 
     // generator gives the identical key. That is the honest statement of what
     // the type does and does not buy: it makes the choice explicit, it cannot
     // make a bad generator good.
-    var f = std.Random.DefaultCsprng.init([_]u8{0xB6} ** 32);
+    var f = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0xB6)));
     const kf = try ecdheGenerate(x25519_group, .{ .csprng = f.random() });
     try testing.expectEqualSlices(u8, ka.secret[0..32], kf.secret[0..32]);
 
     // Same for P-256, whose rejection-sampling loop could plausibly have
     // masked the dependency.
-    var d = std.Random.DefaultCsprng.init([_]u8{0xB6} ** 32);
-    var e = std.Random.DefaultCsprng.init([_]u8{0xB6} ** 32);
+    var d = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0xB6)));
+    var e = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0xB6)));
     const kd = try ecdheGenerate(secp256r1_group, .{ .seeded_for_test = d.random() });
     const ke = try ecdheGenerate(secp256r1_group, .{ .seeded_for_test = e.random() });
     try testing.expectEqualSlices(u8, kd.secret[0..32], ke.secret[0..32]);

@@ -1274,18 +1274,18 @@ const shim = @import("test_shim.zig");
 test "diffieHellman REPORTS NOTHING about a degenerate private key (ct25519)" {
     // A perfectly valid, non-identity peer element.
     const peer = voprf.Element.generator.toBytes();
-    const shared = try diffieHellman([_]u8{0} ** Nsk, peer);
+    const shared = try diffieHellman(@as([Nsk]u8, @splat(0)), peer);
     // k = 0 => the identity, which ristretto255 encodes as 32 zero bytes.
-    try std.testing.expectEqualSlices(u8, &[_]u8{0} ** Npk, &shared);
+    try std.testing.expectEqualSlices(u8, &@as([Npk]u8, @splat(0)), &shared);
 
     // std really does refuse this — pinning that the line above is a
     // behaviour change and not a tautology.
     const point = try voprf.Element.fromBytes(peer);
-    try std.testing.expectError(error.IdentityElement, point.p.mul([_]u8{0} ** Nsk));
+    try std.testing.expectError(error.IdentityElement, point.p.mul(@as([Nsk]u8, @splat(0))));
 
     // And a nonzero key still agrees with std byte-for-byte, so the swap
     // changed the leak and nothing else.
-    const k = shim.scalarFromWideBytes([_]u8{0x3c} ** 64);
+    const k = shim.scalarFromWideBytes(@as([64]u8, @splat(0x3c)));
     const want = try point.p.mul(k);
     try std.testing.expectEqualSlices(u8, &want.toBytes(), &(try diffieHellman(k, peer)));
 }
@@ -1466,7 +1466,7 @@ test "fuzz generateKE3 never panics on a hostile KE2" {
 
 test "M4: createRegistrationResponse rejects a non-canonical blinded_message" {
     const v = kat_vectors.real_1;
-    const request = RegistrationRequest{ .blinded_message = [_]u8{0xFF} ** 32 };
+    const request = RegistrationRequest{ .blinded_message = @as([32]u8, @splat(0xFF)) };
     try std.testing.expectError(
         error.InvalidMessage,
         shim.createRegistrationResponse(request, v.server_public_key, v.credential_identifier, v.oprf_seed),
@@ -1477,7 +1477,7 @@ test "M4: generateKE2 rejects a non-canonical blinded_message in a hostile KE1" 
     const v = kat_vectors.real_1;
     const record = RegistrationRecord.fromBytes(v.registration_upload);
     var login = try shim.generateKE1(v.password, v.blind_login, v.client_nonce, v.client_keyshare_seed);
-    login.ke1.credential_request.blinded_message = [_]u8{0xFF} ** 32;
+    login.ke1.credential_request.blinded_message = @as([32]u8, @splat(0xFF));
     try std.testing.expectError(error.InvalidMessage, shim.generateKE2(
         v.server_private_key,
         v.server_public_key,
@@ -1510,7 +1510,7 @@ test "M4: generateKE3 rejects a non-canonical server_public_keyshare in a hostil
         v.server_nonce,
         v.server_keyshare_seed,
     )).ke2;
-    ke2.auth_response.server_public_keyshare = [_]u8{0xFF} ** 32;
+    ke2.auth_response.server_public_keyshare = @as([32]u8, @splat(0xFF));
     try std.testing.expectError(
         error.InvalidPublicKey,
         shim.generateKE3(login.state, .{}, v.context, ke2, .identity),

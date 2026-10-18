@@ -165,7 +165,7 @@ fn explain(w: vectors.World, in: []const u8, want: []const u8, ours: []const u8,
 }
 
 test "rfc6724 oracle: destination order as glibc gives it (every ordered pair, then longer lists)" {
-    var hits = [_]usize{0} ** divergences.len;
+    var hits = @as([divergences.len]usize, @splat(0));
     var unexplained: usize = 0;
     var cases: usize = 0;
     var agreed: usize = 0;

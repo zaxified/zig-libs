@@ -51,7 +51,7 @@ fn checkWinners(
     divergences: []const Divergence,
     comptime ours: fn ([]const u8, []const []const u8) ?conneg.Negotiated,
 ) !void {
-    var used = [_]bool{false} ** 64;
+    var used = @as([64]bool, @splat(false));
     std.debug.assert(divergences.len <= used.len);
     var failed = false;
     for (cases) |c| {
@@ -141,7 +141,7 @@ fn lessParsed(_: void, a: Parsed, b: Parsed) bool {
 
 test "conneg oracle: Accept parses into the ranges and weights Werkzeug finds, or the difference is judged" {
     var failed = false;
-    var used = [_]bool{false} ** parse_divergences.len;
+    var used = @as([parse_divergences.len]bool, @splat(false));
     for (vectors.media) |c| {
         var mr_buf: [32]conneg.MediaRange = undefined;
         const mrs = conneg.parse(c.accept, &mr_buf);

@@ -51,10 +51,10 @@ pub const ScriptSource = struct {
 };
 
 pub const Label = enum { origin_refused, any_granted, headers_allowed, headers_refused, method_refused, pattern_granted, pattern_refused };
-var reach: [@typeInfo(Label).@"enum".fields.len]usize = @splat(0);
+var reach: [@typeInfo(Label).@"enum".field_names.len]usize = @splat(0);
 
 fn mark(l: Label) void {
-    reach[@intFromEnum(l)] += 1;
+    reach[@backingInt(l)] += 1;
     switch (l) {
         inline else => |c| fuzz_driver.hit(@tagName(c)),
     }
@@ -170,7 +170,7 @@ test "fuzz harness: 500 seeds in every test run, and they get everywhere" {
         };
     }
     for (reach, 0..) |n, i| if (n == 0) {
-        std.debug.print("reach: label {t} never hit in 500 seeds\n", .{@as(Label, @enumFromInt(i))});
+        std.debug.print("reach: label {t} never hit in 500 seeds\n", .{@as(Label, @fromBackingInt(@intCast(i)))});
         return error.HarnessDoesNotReach;
     };
 }

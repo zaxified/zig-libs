@@ -1906,7 +1906,7 @@ pub const Broker = struct {
         for (items) |it| {
             topic.validateName(it.topic) catch return error.InvalidMessage;
             if (it.payload.len == 0) return error.InvalidMessage;
-            if (@intFromEnum(it.qos) > @intFromEnum(b.config.maximum_qos)) return error.InvalidMessage;
+            if (@backingInt(it.qos) > @backingInt(b.config.maximum_qos)) return error.InvalidMessage;
             _ = packet.decodePropertyEntries(it.props, .publish) catch return error.InvalidMessage;
         }
         b.mutex.lock();
@@ -2012,7 +2012,7 @@ pub const Broker = struct {
         if (username) |u| if (u.len > max_username) return error.InvalidUsername;
         if (subs.len > b.config.max_subscriptions_per_conn) return error.TooManySubscriptions;
         for (subs) |sub| {
-            if (@intFromEnum(sub.qos) > @intFromEnum(b.config.maximum_qos)) return error.InvalidSubscription;
+            if (@backingInt(sub.qos) > @backingInt(b.config.maximum_qos)) return error.InvalidSubscription;
             topic.validateFilter(sub.filter) catch return error.InvalidSubscription;
             const inner = (splitShared(sub.filter) catch return error.InvalidSubscription) orelse sub.filter;
             if (std.mem.count(u8, inner, "/") + 1 > max_filter_levels) return error.InvalidSubscription;
@@ -2032,7 +2032,7 @@ pub const Broker = struct {
             for (list) |m| {
                 for (m.sub_ids) |sid| if (sid == 0 or sid > packet.max_remaining_length) return error.InvalidMessage;
                 topic.validateName(m.topic) catch return error.InvalidMessage;
-                if (@intFromEnum(m.qos) > @intFromEnum(b.config.maximum_qos)) return error.InvalidMessage;
+                if (@backingInt(m.qos) > @backingInt(b.config.maximum_qos)) return error.InvalidMessage;
                 _ = packet.decodePropertyEntries(m.props, .publish) catch return error.InvalidMessage;
             }
         }
@@ -2699,7 +2699,7 @@ pub const Broker = struct {
     /// would get.
     // secret-api-ok: `Broker.config` holds hooks and limits, no credential; this fans a topic and payload out.
     pub fn publishWith(b: *Broker, topic_name: []const u8, payload: []const u8, o: PublishOptions) Error!void {
-        if (@intFromEnum(o.qos) > @intFromEnum(b.config.maximum_qos)) return error.ProtocolViolation;
+        if (@backingInt(o.qos) > @backingInt(b.config.maximum_qos)) return error.ProtocolViolation;
         if (o.retain and !b.config.retain_available) return error.ProtocolViolation;
         topic.validateName(topic_name) catch return error.ProtocolViolation;
         const fwd = forwardable(o.properties);
@@ -2789,7 +2789,7 @@ pub const Broker = struct {
             // Until the CONNECT, the version is unknown: `.v5` decodes a
             // CONNECT of either level and says which. Any other first packet
             // is read as 3.1.1, to be refused as before (spec 3.1).
-            const first_is_connect = conn.rx_len > 0 and conn.rx_buf[0] >> 4 == @intFromEnum(packet.PacketType.connect);
+            const first_is_connect = conn.rx_len > 0 and conn.rx_buf[0] >> 4 == @backingInt(packet.PacketType.connect);
             const version: packet.Version = if (conn.state != .awaiting_connect or conn.auth_state == .connecting) conn.version else if (first_is_connect) .v5 else .v3_1_1;
             const dec = (packet.decodePacket(conn.rx_buf[0..conn.rx_len], version) catch |e| {
                 if (e == error.UnsupportedProtocol and first_is_connect and conn.state == .awaiting_connect) {
@@ -3088,7 +3088,7 @@ pub const Broker = struct {
             if (!b.aclAllows(conn, w.topic, .publish, w.retain)) {
                 return b.refuseConnect(conn, .not_authorized, .not_authorized);
             }
-            if (v5 and @intFromEnum(w.qos) > @intFromEnum(b.config.maximum_qos)) {
+            if (v5 and @backingInt(w.qos) > @backingInt(b.config.maximum_qos)) {
                 return b.refuseConnect(conn, .not_authorized, .qos_not_supported); // 3.2.2-12
             }
             const wt = try b.allocator.dupe(u8, w.topic);
@@ -3832,7 +3832,7 @@ pub const Broker = struct {
                 } else |_| {
                     code = .topic_filter_invalid;
                 }
-                codes[n] = if (v5) @intFromEnum(code) else if (reg == .refused) packet.suback_failure else @intFromEnum(granted);
+                codes[n] = if (v5) @backingInt(code) else if (reg == .refused) packet.suback_failure else @backingInt(granted);
                 n += 1;
                 // Retained messages at subscribe (3.3.1.3), as 5.0's Retain
                 // Handling allows — and never for a Shared Subscription (4.8.2).
@@ -4014,7 +4014,7 @@ pub const Broker = struct {
                     i += 1;
                 }
                 if (n < codes.len) {
-                    codes[n] = @intFromEnum(if (removed) packet.ReasonCode.success else .no_subscription_existed);
+                    codes[n] = @backingInt(if (removed) packet.ReasonCode.success else .no_subscription_existed);
                     n += 1;
                 } else if (conn.version == .v5) return error.TooManySubscriptions;
             }
@@ -4036,7 +4036,7 @@ pub const Broker = struct {
             conn.close_reason = .retain_not_supported;
             return error.ProtocolViolation;
         }
-        if (@intFromEnum(pub_pkt.qos) > @intFromEnum(b.config.maximum_qos)) {
+        if (@backingInt(pub_pkt.qos) > @backingInt(b.config.maximum_qos)) {
             conn.close_reason = .qos_not_supported; // 3.2.2-12
             return error.ProtocolViolation;
         }
@@ -4846,11 +4846,11 @@ fn isSysTopic(t: []const u8) bool {
 }
 
 fn minQos(a: QoS, b: QoS) QoS {
-    return if (@intFromEnum(a) <= @intFromEnum(b)) a else b;
+    return if (@backingInt(a) <= @backingInt(b)) a else b;
 }
 
 fn maxQos(a: QoS, b: QoS) QoS {
-    return if (@intFromEnum(a) >= @intFromEnum(b)) a else b;
+    return if (@backingInt(a) >= @backingInt(b)) a else b;
 }
 
 // ── optional real transport: an MQTT broker over TCP via std.Io.net ─────────
@@ -8357,7 +8357,7 @@ test "v5 refusals carry 5.0 reason codes" {
     const m = try connect5(&b, &t2, .{ .client_id = "x", .username = "alice", .password = "secret", .properties = .{ .authentication_method = "SCRAM-SHA-1" } }, 0);
     try testing.expectEqual(packet.ReasonCode.bad_authentication_method, m.connack.reason_code); // no extended auth here (4.12.0-1)
     var t3 = TestTransport{};
-    const long = try connect5(&b, &t3, .{ .client_id = "c" ** (max_client_id + 1) }, 0);
+    const long = try connect5(&b, &t3, .{ .client_id = strRepeat("c", max_client_id + 1) }, 0);
     try testing.expectEqual(packet.ReasonCode.client_identifier_not_valid, long.connack.reason_code);
 }
 
@@ -8832,7 +8832,7 @@ test "v5 the client's limits: Receive Maximum holds back, Maximum Packet Size dr
     try testing.expectEqual(@as(?packet.Packet, null), try next5(&tc));
     _ = try send5(&b, c.conn, .{ .puback = .{ .packet_id = held.packet_id } }, 1);
     try testing.expectEqualStrings("2", (try next5(&tc)).?.publish.payload);
-    try b.publish("t", "x" ** 50, .at_most_once, false); // larger than the client takes
+    try b.publish("t", strRepeat("x", 50), .at_most_once, false); // larger than the client takes
     try testing.expectEqual(@as(?packet.Packet, null), try next5(&tc));
     try testing.expectEqual(@as(u64, 1), b.oversizeDrops());
 
@@ -10176,4 +10176,16 @@ test "review L6: publishSys survives a clock step back, and its retained topics 
     _ = b.expireSessions(50_000);
     try testing.expectEqual(@as(usize, 16), b.retained.items.len);
     try testing.expectEqual(@as(u64, 0), b.messagesExpired());
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

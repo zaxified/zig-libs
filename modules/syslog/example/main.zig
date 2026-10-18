@@ -175,7 +175,7 @@ fn checkGrammar3164(io: std.Io) !void {
 /// directly (no peer needed -- the rule is internal policy, not a wire
 /// format an outside party parses).
 fn checkOversizedMessageTruncated() !void {
-    const msg = syslog.Message{ .facility = .user, .severity = .notice, .msg = "A" ** 400 };
+    const msg = syslog.Message{ .facility = .user, .severity = .notice, .msg = strRepeat("A", 400) };
     var scratch: [1024]u8 = undefined;
     const opts = syslog.Options{ .udp_limit = 64, .trunc_marker = "...[TRUNCATED]" };
     const dg = syslog.buildDatagram(&msg, &scratch, opts);
@@ -363,7 +363,7 @@ fn checkJournald(io: std.Io) !void {
     var wire5424_buf: [256]u8 = undefined;
     const wire5424 = try syslog.bufPrint(&msg5424, &wire5424_buf);
     try deliverToDevLog(io, wire5424);
-    try queryJournaldForMarker(io, marker_a, @intFromEnum(syslog.Severity.warning), @intFromEnum(syslog.Facility.local3));
+    try queryJournaldForMarker(io, marker_a, @backingInt(syslog.Severity.warning), @backingInt(syslog.Facility.local3));
 
     // RFC 3164 (BSD) legacy line.
     var text3164_buf: [64]u8 = undefined;
@@ -379,7 +379,7 @@ fn checkJournald(io: std.Io) !void {
     var wire3164_buf: [256]u8 = undefined;
     const wire3164 = try syslog.bsd.bufPrint(&msgbsd, &wire3164_buf);
     try deliverToDevLog(io, wire3164);
-    try queryJournaldForMarker(io, marker_b, @intFromEnum(syslog.Severity.err), @intFromEnum(syslog.Facility.local5));
+    try queryJournaldForMarker(io, marker_b, @backingInt(syslog.Severity.err), @backingInt(syslog.Facility.local5));
 }
 
 // ── real network paths: UdpEmitter / TcpEmitter over real loopback sockets -
@@ -464,4 +464,16 @@ pub fn main() !void {
     try checkLiveTcpEmitter(io);
 
     std.debug.print("OK: all syslog example checks passed\n", .{});
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

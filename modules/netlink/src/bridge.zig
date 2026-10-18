@@ -50,18 +50,18 @@ const testkit = @import("testkit");
 /// `RTM_SETLINK` (linux/rtnetlink.h) — the message `bridge vlan`/`bridge link
 /// set` use to change AF_BRIDGE state on an existing device. `RTM_DELLINK`
 /// with `ifi_family = AF_BRIDGE` is the matching removal.
-pub const RTM_SETLINK: u16 = @intFromEnum(std.os.linux.NetlinkMessageType.RTM_SETLINK);
+pub const RTM_SETLINK: u16 = @backingInt(std.os.linux.NetlinkMessageType.RTM_SETLINK);
 
 /// `IFLA_MASTER` — the bridge (or bond) an interface is enslaved to; 0 releases.
-pub const IFLA_MASTER: u16 = @intFromEnum(std.os.linux.IFLA.MASTER);
+pub const IFLA_MASTER: u16 = @backingInt(std.os.linux.IFLA.MASTER);
 /// `IFLA_PROTINFO` — family-specific per-port state; for AF_BRIDGE this nests
 /// `IFLA_BRPORT_*`.
-pub const IFLA_PROTINFO: u16 = @intFromEnum(std.os.linux.IFLA.PROTINFO);
+pub const IFLA_PROTINFO: u16 = @backingInt(std.os.linux.IFLA.PROTINFO);
 /// `IFLA_AF_SPEC` — family-specific link attributes; for AF_BRIDGE it nests
 /// `IFLA_BRIDGE_FLAGS` / `IFLA_BRIDGE_VLAN_INFO`.
-pub const IFLA_AF_SPEC: u16 = @intFromEnum(std.os.linux.IFLA.AF_SPEC);
+pub const IFLA_AF_SPEC: u16 = @backingInt(std.os.linux.IFLA.AF_SPEC);
 /// `IFLA_EXT_MASK` — extra content to include in a link dump (`RTEXT_FILTER_*`).
-pub const IFLA_EXT_MASK: u16 = @intFromEnum(std.os.linux.IFLA.EXT_MASK);
+pub const IFLA_EXT_MASK: u16 = @backingInt(std.os.linux.IFLA.EXT_MASK);
 
 /// `RTEXT_FILTER_*` (linux/rtnetlink.h) — `IFLA_EXT_MASK` values selecting
 /// optional dump content. `BRVLAN` is what makes `RTM_GETLINK` emit the
@@ -2073,7 +2073,7 @@ const builder_seeds = [_]BuilderSeed{
     // (`error.NothingToChange`).
     .{
         .name = "abcdefghijklmno",
-        .mac = &[_]u8{0xff} ** 6,
+        .mac = &@as([6]u8, @splat(0xff)),
         .br_seq = 0xffff_ffff,
         .br_flags = 0xffff,
         .fdb_seq = 11,
@@ -2115,7 +2115,7 @@ const builder_seeds = [_]BuilderSeed{
     // and, on the FDB side, vid 0 — the value every seed used to carry.
     .{
         .name = "br\x000",
-        .mac = &[_]u8{0xaa} ** 20,
+        .mac = &@as([20]u8, @splat(0xaa)),
         .ageing_time = 0,
         .br_priority = 0,
         .fdb_vlan = 0, // below `vlan_id_min`
@@ -2132,8 +2132,8 @@ const builder_seeds = [_]BuilderSeed{
     // A legal single VID with `pvid` and a `vid_end` EQUAL to it, which is the
     // one range `buildVlanRequest` lets a PVID have.
     .{
-        .name = &[_]u8{'x'} ** 24,
-        .mac = &[_]u8{0x5a} ** 40,
+        .name = &@as([24]u8, @splat('x')),
+        .mac = &@as([40]u8, @splat(0x5a)),
         .forward_delay = 1,
         .vlan_protocol = 0x8100,
         .fdb_vlan = 4094,

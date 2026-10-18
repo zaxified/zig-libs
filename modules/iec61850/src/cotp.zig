@@ -88,7 +88,7 @@ pub const TpduSize = enum(u8) {
     _,
 
     pub fn octets(self: TpduSize) usize {
-        const code = @intFromEnum(self);
+        const code = @backingInt(self);
         if (code < 0x07 or code > 0x0D) return 0;
         return @as(usize, 1) << @intCast(code);
     }
@@ -141,7 +141,7 @@ pub fn decode(bytes: []const u8) Error!Tpdu {
     const li: usize = bytes[0];
     if (li == 0) return error.BadLengthIndicator;
     if (bytes.len < li + 1) return error.BadLengthIndicator;
-    const code: Code = @enumFromInt(bytes[1] & 0xF0);
+    const code: Code = @fromBackingInt(@intCast(bytes[1] & 0xF0));
     // The low nibble is the credit field in class 0 and must be zero (a DT
     // reports it as `BadDataTpdu` below).
     if (bytes[1] & 0x0F != 0 and code != .dt) return error.UnknownTpduCode;
@@ -165,7 +165,7 @@ pub fn decode(bytes: []const u8) Error!Tpdu {
             while (try it.next()) |p| {
                 switch (p.code) {
                     Param.tpdu_size => if (p.value.len == 1) {
-                        c.tpdu_size = @enumFromInt(p.value[0]);
+                        c.tpdu_size = @fromBackingInt(@intCast(p.value[0]));
                     },
                     Param.calling_tsap => c.calling_tsap = p.value,
                     Param.called_tsap => c.called_tsap = p.value,
@@ -242,14 +242,14 @@ pub fn encodeConnect(
     if (li > 254) return error.BufferTooSmall;
     if (out.len < li + 1) return error.BufferTooSmall;
     out[0] = @intCast(li);
-    out[1] = @intFromEnum(code);
+    out[1] = @backingInt(code);
     std.mem.writeInt(u16, out[2..4], dst_ref, .big);
     std.mem.writeInt(u16, out[4..6], src_ref, .big);
     out[6] = 0x00; // class 0, no options
     var w: usize = 7;
     out[w] = Param.tpdu_size;
     out[w + 1] = 1;
-    out[w + 2] = @intFromEnum(size);
+    out[w + 2] = @backingInt(size);
     w += 3;
     out[w] = Param.called_tsap;
     out[w + 1] = @intCast(called_tsap.len);
@@ -267,7 +267,7 @@ pub fn encodeConnectVerbatim(c: Connect, out: []u8) Error![]u8 {
     const li = 6 + c.variable_part.len;
     if (li > 254 or out.len < li + 1) return error.BufferTooSmall;
     out[0] = @intCast(li);
-    out[1] = @intFromEnum(c.code);
+    out[1] = @backingInt(c.code);
     std.mem.writeInt(u16, out[2..4], c.dst_ref, .big);
     std.mem.writeInt(u16, out[4..6], c.src_ref, .big);
     out[6] = c.class_option;
@@ -278,7 +278,7 @@ pub fn encodeConnectVerbatim(c: Connect, out: []u8) Error![]u8 {
 pub fn encodeData(payload: []const u8, eot: bool, out: []u8) Error![]u8 {
     if (out.len < 3 + payload.len) return error.BufferTooSmall;
     out[0] = 2;
-    out[1] = @intFromEnum(Code.dt);
+    out[1] = @backingInt(Code.dt);
     out[2] = if (eot) 0x80 else 0x00;
     @memcpy(out[3..][0..payload.len], payload);
     return out[0 .. 3 + payload.len];
@@ -287,7 +287,7 @@ pub fn encodeData(payload: []const u8, eot: bool, out: []u8) Error![]u8 {
 pub fn encodeDisconnect(dst_ref: u16, src_ref: u16, reason: u8, out: []u8) Error![]u8 {
     if (out.len < 7) return error.BufferTooSmall;
     out[0] = 6;
-    out[1] = @intFromEnum(Code.dr);
+    out[1] = @backingInt(Code.dr);
     std.mem.writeInt(u16, out[2..4], dst_ref, .big);
     std.mem.writeInt(u16, out[4..6], src_ref, .big);
     out[6] = reason;
@@ -409,7 +409,7 @@ test "reassembly joins segments and refuses to grow" {
 
     // A peer that never sets EOT fills the buffer and then errors.
     var r2 = Reassembler.init(&storage);
-    _ = try r2.push(.{ .number = 0, .eot = false, .payload = &[_]u8{0} ** 8 });
+    _ = try r2.push(.{ .number = 0, .eot = false, .payload = &@as([8]u8, @splat(0)) });
     try testing.expectError(error.ReassemblyOverflow, r2.push(.{ .number = 0, .eot = false, .payload = &[_]u8{0} }));
 }
 

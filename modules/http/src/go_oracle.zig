@@ -306,7 +306,7 @@ test "go oracle serve: preconditions and ranges answer as Go's ServeContent, or 
 const servecontent = @import("servecontent.zig");
 
 fn serveContentHandler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
-    try servecontent.serveContent(req, rw, "0123456789" ** (vectors.serve_size / 10), .{
+    try servecontent.serveContent(req, rw, strRepeat("0123456789", vectors.serve_size / 10), .{
         .etag = serve_case.etag,
         .last_modified = serve_case.last_modified,
     });
@@ -1872,4 +1872,16 @@ test "go oracle crossorigin: the default denial is Go's" {
     try testing.expectEqual(@as(u16, want.status), try std.fmt.parseInt(u16, resp[9..12], 10));
     try testing.expectEqualStrings(want.content_type, responseHeader(resp, "Content-Type").?);
     try testing.expectEqualStrings(want.body, resp[std.mem.indexOf(u8, resp, "\r\n\r\n").? + 4 ..]);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

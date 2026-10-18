@@ -393,8 +393,8 @@ test "tweakSecretKey's internal bip340.KeyPair.deinit zeroizes the normalized sc
     // in bip340's secureZero call is caught from taproot's own test
     // binary too, not only bip340's.
     var kp: bip340.KeyPair = undefined;
-    try bip340.KeyPair.fromSecretKey(&kp, &(try bip340.SecretKey.fromBytes([_]u8{0x02} ** 32)));
-    const zero: [32]u8 = [_]u8{0} ** 32;
+    try bip340.KeyPair.fromSecretKey(&kp, &(try bip340.SecretKey.fromBytes(@as([32]u8, @splat(0x02)))));
+    const zero: [32]u8 = @as([32]u8, @splat(0));
     try std.testing.expect(!std.mem.eql(u8, &kp.secret, &zero));
     kp.deinit();
     try std.testing.expectEqualSlices(u8, &zero, &kp.secret);

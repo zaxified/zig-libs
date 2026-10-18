@@ -491,7 +491,7 @@ test "validateHashType accepts exactly the 7 BIP341 values, rejects everything e
 test "input_index out of range and prevouts-count mismatch are typed errors" {
     var t: tx.Transaction = .{
         .version = 1,
-        .vin = @constCast(&[_]tx.TxIn{.{ .prevout = .{ .txid = [_]u8{0} ** 32, .vout = 0 }, .script_sig = &.{}, .sequence = 0 }}),
+        .vin = @constCast(&[_]tx.TxIn{.{ .prevout = .{ .txid = @as([32]u8, @splat(0)), .vout = 0 }, .script_sig = &.{}, .sequence = 0 }}),
         .vout = @constCast(&[_]tx.TxOut{.{ .value = 100, .script_pubkey = &.{} }}),
         .witness = &.{},
         .locktime = 0,
@@ -507,8 +507,8 @@ test "SIGHASH_SINGLE with no corresponding output is rejected outright (no legac
     var t: tx.Transaction = .{
         .version = 1,
         .vin = @constCast(&[_]tx.TxIn{
-            .{ .prevout = .{ .txid = [_]u8{0} ** 32, .vout = 0 }, .script_sig = &.{}, .sequence = 0 },
-            .{ .prevout = .{ .txid = [_]u8{1} ** 32, .vout = 0 }, .script_sig = &.{}, .sequence = 0 },
+            .{ .prevout = .{ .txid = @as([32]u8, @splat(0)), .vout = 0 }, .script_sig = &.{}, .sequence = 0 },
+            .{ .prevout = .{ .txid = @as([32]u8, @splat(1)), .vout = 0 }, .script_sig = &.{}, .sequence = 0 },
         }),
         .vout = @constCast(&[_]tx.TxOut{.{ .value = 100, .script_pubkey = &.{} }}), // only 1 output, 2 inputs
         .witness = &.{},
@@ -526,14 +526,14 @@ test "X1: CommonOptions.spend_type bit 0 and annex_hash presence must agree" {
     // bytes no verifier computes — see finding X1, `A1/bitcointx.md`.
     var t: tx.Transaction = .{
         .version = 1,
-        .vin = @constCast(&[_]tx.TxIn{.{ .prevout = .{ .txid = [_]u8{0} ** 32, .vout = 0 }, .script_sig = &.{}, .sequence = 0 }}),
+        .vin = @constCast(&[_]tx.TxIn{.{ .prevout = .{ .txid = @as([32]u8, @splat(0)), .vout = 0 }, .script_sig = &.{}, .sequence = 0 }}),
         .vout = @constCast(&[_]tx.TxOut{.{ .value = 100, .script_pubkey = &.{} }}),
         .witness = &.{},
         .locktime = 0,
         .has_witness = false,
     };
     const prevouts = [_]tx.TxOut{.{ .value = 100, .script_pubkey = &.{} }};
-    const annex: [32]u8 = [_]u8{0xcc} ** 32;
+    const annex: [32]u8 = @as([32]u8, @splat(0xcc));
 
     // Positive controls that MUST keep succeeding: consistent combinations.
     {
@@ -567,7 +567,7 @@ test "V2: spend_type is committed byte-for-byte -- key-path and script-path SigM
     // the one byte that must carry `spend_type` and pins it.
     var t: tx.Transaction = .{
         .version = 1,
-        .vin = @constCast(&[_]tx.TxIn{.{ .prevout = .{ .txid = [_]u8{0} ** 32, .vout = 0 }, .script_sig = &.{}, .sequence = 0 }}),
+        .vin = @constCast(&[_]tx.TxIn{.{ .prevout = .{ .txid = @as([32]u8, @splat(0)), .vout = 0 }, .script_sig = &.{}, .sequence = 0 }}),
         .vout = @constCast(&[_]tx.TxOut{.{ .value = 100, .script_pubkey = &.{} }}),
         .witness = &.{},
         .locktime = 0,
@@ -612,13 +612,13 @@ test "B2: shaOutputs/shaScriptPubkeys/shaAmounts/shaPrevouts/shaSequences don't 
     // `sighash_bip143.zig`'s `hashOutputs`) should cut each builder to
     // exactly one allocator round trip.
     const n = 1024;
-    const spk = [_]u8{ 0x76, 0xa9, 0x14 } ++ [_]u8{0x42} ** 20 ++ [_]u8{ 0x88, 0xac }; // 25-byte P2PKH
+    const spk = [_]u8{ 0x76, 0xa9, 0x14 } ++ @as([20]u8, @splat(0x42)) ++ [_]u8{ 0x88, 0xac }; // 25-byte P2PKH
 
     var vin_buf: [n]tx.TxIn = undefined;
     var vout_buf: [n]tx.TxOut = undefined;
     var spent_buf: [n]tx.TxOut = undefined;
     for (0..n) |i| {
-        vin_buf[i] = .{ .prevout = .{ .txid = [_]u8{0} ** 32, .vout = 0 }, .script_sig = &.{}, .sequence = 0xffffffff };
+        vin_buf[i] = .{ .prevout = .{ .txid = @as([32]u8, @splat(0)), .vout = 0 }, .script_sig = &.{}, .sequence = 0xffffffff };
         vout_buf[i] = .{ .value = 100, .script_pubkey = &spk };
         spent_buf[i] = .{ .value = 100, .script_pubkey = &spk };
     }

@@ -718,8 +718,8 @@ fn randFe(rand: std.Random) struct { k: Fe, s: StdFe } {
 // Debug's std.crypto.ecc.Secp256k1.Fe path is unoptimized like the group-level
 // differentials elsewhere in this module (see group.zig's
 // `random_scalars_iters`) -- cut in Debug, full count elsewhere.
-const field_diff_iters: usize = if (builtin.mode == .Debug) 500 else 4000;
-const sqrt_diff_iters: usize = if (builtin.mode == .Debug) 300 else 2000;
+const field_diff_iters: usize = if (builtin.mode == .debug) 500 else 4000;
+const sqrt_diff_iters: usize = if (builtin.mode == .debug) 300 else 2000;
 
 test "differential vs std.Fe: mul/sq/add/sub/neg/invert on random inputs" {
     var prng = std.Random.DefaultPrng.init(0xC0FFEE_F1E1D);
@@ -790,7 +790,7 @@ test "invertPublic (safegcd) == invert on edges, structured and random elements"
     }
     var prng = std.Random.DefaultPrng.init(0x5AFE_6CD);
     const rand = prng.random();
-    const iters: usize = if (builtin.mode == .Debug) 3000 else 30000;
+    const iters: usize = if (builtin.mode == .debug) 3000 else 30000;
     for (0..iters) |i| {
         // Random, plus sparse values (few set bits) that stress long runs of
         // zero divsteps and the limb-shrinking path.
@@ -854,22 +854,22 @@ test "algebraic identities: a·a⁻¹ = 1, a − a = 0, (a·b) = (b·a)" {
 /// are therefore per-seed, not a uniform four.
 const fe_seeds = [_][]const u8{
     // Ordinary value, no boundary override: [bias=0, endian=big].
-    rawSeed(&([_]u8{0} ** 31 ++ [_]u8{1} ++ leWords(&.{ 0, 1 }))),
+    rawSeed(&(@as([31]u8, @splat(0)) ++ [_]u8{1} ++ leWords(&.{ 0, 1 }))),
     // The same, read little-endian: [bias=0, endian=little].
-    rawSeed(&([_]u8{0} ** 31 ++ [_]u8{1} ++ leWords(&.{ 0, 0 }))),
+    rawSeed(&(@as([31]u8, @splat(0)) ++ [_]u8{1} ++ leWords(&.{ 0, 0 }))),
     // `p` exactly, which `rejectNonCanonical` refuses:
     // [bias=1, offset=0, endian=big]. The byte payload is overwritten by the
     // bias branch, so its content does not matter here.
-    rawSeed(&([_]u8{0} ** 32 ++ leWords(&.{ 1, 0, 1 }))),
+    rawSeed(&(@as([32]u8, @splat(0)) ++ leWords(&.{ 1, 0, 1 }))),
     // `p - 1`, the largest canonical element: [bias=1, offset=1, plus=0]
     // (`+%= 0xff`), then endian=big.
-    rawSeed(&([_]u8{0} ** 32 ++ leWords(&.{ 1, 1, 0, 1 }))),
+    rawSeed(&(@as([32]u8, @splat(0)) ++ leWords(&.{ 1, 1, 0, 1 }))),
     // `p + 1`, refused: [bias=1, offset=1, plus=1], then endian=big.
-    rawSeed(&([_]u8{0} ** 32 ++ leWords(&.{ 1, 1, 1, 1 }))),
+    rawSeed(&(@as([32]u8, @splat(0)) ++ leWords(&.{ 1, 1, 1, 1 }))),
     // All-0xff: above `p` in either endianness.
-    rawSeed(&([_]u8{0xff} ** 32 ++ leWords(&.{ 0, 1 }))),
+    rawSeed(&(@as([32]u8, @splat(0xff)) ++ leWords(&.{ 0, 1 }))),
     // The all-zero, big-endian, no-bias input this target used to run for ever.
-    rawSeed(&([_]u8{0} ** 32 ++ leWords(&.{ 0, 0 }))),
+    rawSeed(&(@as([32]u8, @splat(0)) ++ leWords(&.{ 0, 0 }))),
 };
 
 /// The `u64` tail a `smith.bytes` seed needs so the knobs after it are alive.

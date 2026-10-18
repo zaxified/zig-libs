@@ -38,7 +38,7 @@ pub const LagrangeError = error{
 /// `Fr` embedding of a positive authority index `i` (1-based). Index `0`
 /// is rejected by the callers (it is the interpolation point).
 pub fn indexScalar(i: u64) Fr {
-    var buf: [32]u8 = [_]u8{0} ** 32;
+    var buf: [32]u8 = @as([32]u8, @splat(0));
     std.mem.writeInt(u64, buf[24..32], i, .big);
     // i < 2^64 ≪ r, so `fromBytes` never overflows the modulus.
     return Fr.fromBytes(buf) catch unreachable;
@@ -127,7 +127,7 @@ test "coefficientAtZero: rejects bad inputs" {
 }
 
 fn scalarFromU64(v: u64) [32]u8 {
-    var buf: [32]u8 = [_]u8{0} ** 32;
+    var buf: [32]u8 = @as([32]u8, @splat(0));
     std.mem.writeInt(u64, buf[24..32], v, .big);
     return buf;
 }

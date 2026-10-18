@@ -18,7 +18,7 @@ const talloc = std.testing.allocator;
 const tio = std.testing.io;
 
 fn gammaFor(j: usize) [32]u8 {
-    var g = [_]u8{0} ** 32;
+    var g = @as([32]u8, @splat(0));
     std.mem.writeInt(u64, g[0..8], 0x2545_f491_4f6c_dd1d *% (@as(u64, j) + 7), .little);
     return scalar.reduce(g);
 }
@@ -40,7 +40,7 @@ fn proveValues(gens: Generators, values: []const u64, salt: usize) !Proved {
     errdefer talloc.free(commitments);
     for (values, gammas, commitments, 0..) |v, *g, *c, j| {
         g.* = gammaFor(j + 16 * salt);
-        var vb = [_]u8{0} ** 32;
+        var vb = @as([32]u8, @splat(0));
         std.mem.writeInt(u64, vb[0..8], v, .little);
         c.* = bp.commit(gens, vb, g.*);
     }
@@ -94,7 +94,7 @@ test "verifyBatch: honest proofs with mixed m verify as one batch; empty batch i
 const Tamper = enum { t_hat, tau_x, mu, ipa_a, ipa_b, a, s, t1, t2, l0, r_last, commitment, swap_commitments };
 
 fn applyTamper(p: *Proved, which: Tamper, gens: Generators) bool {
-    const one = [_]u8{1} ++ [_]u8{0} ** 31;
+    const one = [_]u8{1} ++ @as([31]u8, @splat(0));
     switch (which) {
         .t_hat => p.proof.t_hat = scalar.add(p.proof.t_hat, one),
         .tau_x => p.proof.tau_x = scalar.add(p.proof.tau_x, one),

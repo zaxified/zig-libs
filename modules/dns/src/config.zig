@@ -387,7 +387,7 @@ test "NameIterator: Go conf.nameList semantics" {
 }
 
 test "NameIterator: over-long candidates are skipped" {
-    const long_domain = "d" ** 250;
+    const long_domain = strRepeat("d", 250);
     const search = [_][]const u8{ long_domain, "ok.example" };
     // "name." + 250 chars > 253 → skipped; the short domain and bare survive.
     try expectCandidates("myhost", &search, 1, &.{ "myhost.ok.example", "myhost" });
@@ -399,15 +399,27 @@ test "NameIterator: over-long candidates are skipped" {
     // 2026-10-04: both checks survived because every caller passed a
     // 253-byte buffer.
     var big: [512]u8 = undefined;
-    const d246 = [_][]const u8{"d" ** 246};
+    const d246 = [_][]const u8{strRepeat("d", 246)};
     var fits = NameIterator.init("myhost", &d246, 1); // 6 + 1 + 246 = 253
     try testing.expectEqual(@as(usize, 253), fits.next(&big).?.len);
-    const d247 = [_][]const u8{"d" ** 247};
+    const d247 = [_][]const u8{strRepeat("d", 247)};
     var over = NameIterator.init("myhost", &d247, 1); // 254: skipped, bare last
     try testing.expectEqualStrings("myhost", over.next(&big).?);
     try testing.expect(over.next(&big) == null);
-    var bare = NameIterator.init("b" ** 254, &.{}, 1);
+    var bare = NameIterator.init(strRepeat("b", 254), &.{}, 1);
     try testing.expect(bare.next(&big) == null);
-    var bare253 = NameIterator.init("b" ** 253, &.{}, 1);
+    var bare253 = NameIterator.init(strRepeat("b", 253), &.{}, 1);
     try testing.expectEqual(@as(usize, 253), bare253.next(&big).?.len);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

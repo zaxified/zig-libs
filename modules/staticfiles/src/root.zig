@@ -2405,7 +2405,7 @@ test "serve: a configured Cache-Control that cannot be set answers 500, not a qu
     // `conditional.apply` sets `ETag` between Cache-Control and Content-Type,
     // Content-Type then failed too, and the 500 it produced made the
     // mutation-with-`catch {}` pass. Generous margins, not tight arithmetic.
-    const cc = "public, max-age=31536000" ++ (", no-transform" ** 30);
+    const cc = "public, max-age=31536000" ++ (strRepeat(", no-transform", 30));
     var h = Handler.init(testing.io, fx.root, .{ .cache_control = cc });
     var out: [8192]u8 = undefined;
 
@@ -2965,7 +2965,7 @@ test "serve: a path segment over NAME_MAX answers 404, not 500 (A1 F13)" {
     defer fx.deinit();
     var h = Handler.init(testing.io, fx.root, .{});
     var wire_buf: [1024]u8 = undefined;
-    const too_long_name = "A" ** 300; // NAME_MAX is 255 on Linux
+    const too_long_name = strRepeat("A", 300); // NAME_MAX is 255 on Linux
     const wire = std.fmt.bufPrint(&wire_buf, "GET /{s} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", .{too_long_name}) catch unreachable;
     var out: [1024]u8 = undefined;
     const resp = runRequest(&h, wire, &out);
@@ -2975,7 +2975,7 @@ test "serve: a path segment over NAME_MAX answers 404, not 500 (A1 F13)" {
     // not exist also answers 404 — proves this is the SAME code path, not
     // a special case for "too long" alone.
     var wire_buf2: [1024]u8 = undefined;
-    const ok_len_name = "B" ** 254;
+    const ok_len_name = strRepeat("B", 254);
     const wire2 = std.fmt.bufPrint(&wire_buf2, "GET /{s} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", .{ok_len_name}) catch unreachable;
     const resp2 = runRequest(&h, wire2, &out);
     try testing.expectEqual(@as(u16, 404), statusOf(resp2));
@@ -3976,8 +3976,8 @@ test "Live.start: the thread picks up an edit; readers on other threads always s
     const io = testing.io;
     var root = try tmp.dir.createDirPathOpen(io, "root", .{ .open_options = .{ .iterate = true } });
     defer root.close(io);
-    const v1 = "v1:" ++ "a" ** 3000;
-    const v2 = "v2:" ++ "b" ** 5000;
+    const v1 = "v1:" ++ strRepeat("a", 3000);
+    const v2 = "v2:" ++ strRepeat("b", 5000);
     try writeTree(root, &.{.{ "f.txt", v1 }});
     const r = try tmp.dir.openDir(io, "root", .{ .iterate = true });
     var live = try Live.open(testing.allocator, io, r, .{ .rescan_ms = 50 });
@@ -4566,4 +4566,16 @@ test "fallback + precompressed: the fallback's sibling is negotiated, and Vary n
     // An existing file keeps its own Vary.
     var b2: [4096]u8 = undefined;
     try testing.expectEqualStrings("Accept-Encoding", headerOf(sendReq(&h, "GET", "/plain.txt", html_accept, &b2), "vary").?);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

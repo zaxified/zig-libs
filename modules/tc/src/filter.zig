@@ -730,10 +730,10 @@ test "parseU32Options: a selector with more keys than U32Wire holds fills it and
 }
 
 test "prefixMask6 builds IPv6 masks bit-exactly" {
-    try testing.expectEqualSlices(u8, &([_]u8{0xff} ** 4 ++ [_]u8{0} ** 12), &prefixMask6(32));
-    try testing.expectEqualSlices(u8, &([_]u8{0xff} ** 16), &prefixMask6(128));
-    try testing.expectEqualSlices(u8, &([_]u8{0} ** 16), &prefixMask6(0));
-    try testing.expectEqualSlices(u8, &([_]u8{ 0xff, 0xe0 } ++ [_]u8{0} ** 14), &prefixMask6(11));
+    try testing.expectEqualSlices(u8, &(@as([4]u8, @splat(0xff)) ++ @as([12]u8, @splat(0))), &prefixMask6(32));
+    try testing.expectEqualSlices(u8, &(@as([16]u8, @splat(0xff))), &prefixMask6(128));
+    try testing.expectEqualSlices(u8, &(@as([16]u8, @splat(0))), &prefixMask6(0));
+    try testing.expectEqualSlices(u8, &([_]u8{ 0xff, 0xe0 } ++ @as([14]u8, @splat(0))), &prefixMask6(11));
 }
 
 test "encode/decode round-trip: u32 selector with two keys" {
@@ -759,7 +759,7 @@ test "encode/decode round-trip: flower over IPv6" {
     const gpa = testing.allocator;
     var list: std.ArrayList(u8) = .empty;
     defer list.deinit(gpa);
-    const v6: [16]u8 = .{ 0x20, 0x01, 0x0d, 0xb8 } ++ [_]u8{0} ** 12;
+    const v6: [16]u8 = .{ 0x20, 0x01, 0x0d, 0xb8 } ++ @as([12]u8, @splat(0));
     try appendFlowerOptions(.{
         .eth_type = ETH_P.IPV6,
         .ip_proto = IPPROTO.UDP,
@@ -822,13 +822,13 @@ test "parseU32Options rejects a TCA_U32_SEL attribute shorter than tc_u32_sel_le
 
     var short_list: std.ArrayList(u8) = .empty;
     defer short_list.deinit(gpa);
-    try codec.appendAttr(gpa, &short_list, TCA_U32.SEL, &([_]u8{0} ** (tc_u32_sel_len - 1)));
+    try codec.appendAttr(gpa, &short_list, TCA_U32.SEL, &(@as([tc_u32_sel_len - 1]u8, @splat(0))));
     try testing.expectError(error.BadLength, parseU32Options(short_list.items));
 
     // Positive control: exactly tc_u32_sel_len bytes must still parse.
     var ok_list: std.ArrayList(u8) = .empty;
     defer ok_list.deinit(gpa);
-    try codec.appendAttr(gpa, &ok_list, TCA_U32.SEL, &([_]u8{0} ** tc_u32_sel_len));
+    try codec.appendAttr(gpa, &ok_list, TCA_U32.SEL, &(@as([tc_u32_sel_len]u8, @splat(0))));
     _ = try parseU32Options(ok_list.items);
 }
 
@@ -954,8 +954,8 @@ const FilterCorpus = struct {
         // Every `if (a.data.len == N)` here is a bound only a malformed reply
         // reaches; a well-formed capture cannot exercise one.
         var u32_short: std.ArrayList(u8) = .empty;
-        try codec.appendAttr(gpa, &u32_short, TCA_U32.CLASSID, &[_]u8{0} ** 2);
-        try codec.appendAttr(gpa, &u32_short, TCA_U32.SEL, &[_]u8{0} ** 8);
+        try codec.appendAttr(gpa, &u32_short, TCA_U32.CLASSID, &@as([2]u8, @splat(0)));
+        try codec.appendAttr(gpa, &u32_short, TCA_U32.SEL, &@as([8]u8, @splat(0)));
         self.push(u32_short.items, 0xffff_ffff);
 
         // A selector whose declared `nkeys` is 8 but whose payload holds one
@@ -970,18 +970,18 @@ const FilterCorpus = struct {
         self.push(u32_partial.items, 0);
 
         var flower_short: std.ArrayList(u8) = .empty;
-        try codec.appendAttr(gpa, &flower_short, TCA_FLOWER.KEY_ETH_TYPE, &[_]u8{0} ** 1);
+        try codec.appendAttr(gpa, &flower_short, TCA_FLOWER.KEY_ETH_TYPE, &@as([1]u8, @splat(0)));
         try codec.appendAttr(gpa, &flower_short, TCA_FLOWER.KEY_IP_PROTO, &.{});
-        try codec.appendAttr(gpa, &flower_short, TCA_FLOWER.KEY_IPV4_SRC, &[_]u8{0} ** 2);
-        try codec.appendAttr(gpa, &flower_short, TCA_FLOWER.KEY_IPV6_SRC, &[_]u8{0} ** 8);
-        try codec.appendAttr(gpa, &flower_short, TCA_FLOWER.KEY_TCP_SRC, &[_]u8{0} ** 1);
-        try codec.appendAttr(gpa, &flower_short, TCA_FLOWER.FLAGS, &[_]u8{0} ** 2);
-        try codec.appendAttr(gpa, &flower_short, TCA_FLOWER.CLASSID, &[_]u8{0} ** 3);
+        try codec.appendAttr(gpa, &flower_short, TCA_FLOWER.KEY_IPV4_SRC, &@as([2]u8, @splat(0)));
+        try codec.appendAttr(gpa, &flower_short, TCA_FLOWER.KEY_IPV6_SRC, &@as([8]u8, @splat(0)));
+        try codec.appendAttr(gpa, &flower_short, TCA_FLOWER.KEY_TCP_SRC, &@as([1]u8, @splat(0)));
+        try codec.appendAttr(gpa, &flower_short, TCA_FLOWER.FLAGS, &@as([2]u8, @splat(0)));
+        try codec.appendAttr(gpa, &flower_short, TCA_FLOWER.CLASSID, &@as([3]u8, @splat(0)));
         self.push(flower_short.items, 0x0800_0001);
 
         // ── the refusals ───────────────────────────────────────────────────
         // A payload one octet short of `struct tcmsg`.
-        self.push(&([_]u8{0} ** (qdisc.tcmsg_len - 1)), 0);
+        self.push(&(@as([qdisc.tcmsg_len - 1]u8, @splat(0))), 0);
         // A KIND string one octet past `qdisc.kind_max`.
         var long_kind: std.ArrayList(u8) = .empty;
         try tcmsg(gpa, &long_kind, 2, Handle.unspec, Handle.clsact, 0);

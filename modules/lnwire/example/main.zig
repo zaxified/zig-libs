@@ -23,17 +23,17 @@ pub fn main() !void {
     defer if (da.deinit() == .leak) @panic("leak");
     const gpa = da.allocator();
 
-    const preimage = [_]u8{0x42} ** 32;
+    const preimage = @as([32]u8, @splat(0x42));
     var payment_hash: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(&preimage, &payment_hash, .{});
 
     const add: lnwire.UpdateAddHtlc = .{
-        .channel_id = [_]u8{0xAA} ** 32,
+        .channel_id = @as([32]u8, @splat(0xAA)),
         .id = 7,
         .amount_msat = 150_000,
         .payment_hash = payment_hash,
         .cltv_expiry = 800_000,
-        .onion_routing_packet = [_]u8{0} ** lnwire.bolt2.ONION_ROUTING_PACKET_LEN,
+        .onion_routing_packet = @as([lnwire.bolt2.ONION_ROUTING_PACKET_LEN]u8, @splat(0)),
     };
 
     const wire_add = try lnwire.serializeUpdateAddHtlc(gpa, add);

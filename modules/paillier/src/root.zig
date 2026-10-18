@@ -711,8 +711,8 @@ fn fromPrimesImpl(p_bytes_in: []const u8, q_bytes_in: []const u8, comptime origi
     // |(Z/p²)*| = p(p-1) (Lagrange), so c^λ ≡ c^(λ mod p(p-1)) (mod p²).
     // (p−1) | λ, so λ mod p(p−1) = (p−1)·((λ/(p−1)) mod p): an exact
     // division by the even p − 1 (`nt.divExact`) and a reduction mod p.
-    var dp_buf = [_]u8{0} ** modulus_bytes;
-    var dq_buf = [_]u8{0} ** modulus_bytes;
+    var dp_buf = @as([modulus_bytes]u8, @splat(0));
+    var dq_buf = @as([modulus_bytes]u8, @splat(0));
     try crtExponent(&lam, &pv, &p1, 8 * pb.len - @clz(pb[0]), &dp_buf);
     try crtExponent(&lam, &qv, &q1, 8 * qb.len - @clz(qb[0]), &dq_buf);
 
@@ -834,7 +834,7 @@ const mr_rounds = 64;
 const sieve_primes = blk: {
     @setEvalBranchQuota(20_000);
     const limit = 1024;
-    var composite = [_]bool{false} ** limit;
+    var composite = @as([limit]bool, @splat(false));
     var count: usize = 0;
     var i: usize = 3;
     while (i < limit) : (i += 2) {
@@ -1543,14 +1543,14 @@ test "n_sq derivation matches a from-scratch big.int square (sanity, no phe need
 
 test "fromBytes refuses an n below min_modulus_bits; the floor-free parser is the control (F8)" {
     // 2^511 + 1: 512 bits, the narrowest n accepted.
-    var at_floor = [_]u8{0} ** 64;
+    var at_floor = @as([64]u8, @splat(0));
     at_floor[0] = 0x80;
     at_floor[63] = 0x01;
     // 2^511 - 1: 511 bits.
-    var below_floor = [_]u8{0xff} ** 64;
+    var below_floor = @as([64]u8, @splat(0xff));
     below_floor[0] = 0x7f;
     // The same 511-bit n behind leading zero octets: the floor counts bits, not bytes.
-    var below_padded = [_]u8{0} ** 72;
+    var below_padded = @as([72]u8, @splat(0));
     @memcpy(below_padded[8..], &below_floor);
     const one = [_]u8{1};
 
@@ -1644,9 +1644,9 @@ test "fromPrimes CRT exponents are λ mod p(p−1) exactly (factors of unequal s
     var kp: KeyPair = undefined;
     try fromPrimes(&p, &q, &kp);
     defer kp.secret.deinit();
-    var want_dp = [_]u8{0} ** modulus_bytes;
+    var want_dp = @as([modulus_bytes]u8, @splat(0));
     _ = try std.fmt.hexToBytes(want_dp[modulus_bytes - 16 ..], "4776ec7037a754bd972d839646d9666a");
-    var want_dq = [_]u8{0} ** modulus_bytes;
+    var want_dq = @as([modulus_bytes]u8, @splat(0));
     _ = try std.fmt.hexToBytes(want_dq[modulus_bytes - 40 ..], "3a6c6ba587a94e074f6ce5849e17300c4f8fd748950d870f4e0a009a4ea367eda0e1a8403b91b31e");
     try testing.expectEqualSlices(u8, &want_dp, &kp.secret.crt.?.dp);
     try testing.expectEqualSlices(u8, &want_dq, &kp.secret.crt.?.dq);
@@ -2238,8 +2238,8 @@ test "topBitsMatch: FIPS 186-5 closeness guard fires exactly at the 100-bit boun
     // 100 bits of two independently-drawn primes has probability ~2^-100),
     // so nothing in the round-trip/keygen tests above can ever discriminate
     // a broken guard from a working one. Exercise it directly instead.
-    var p: [16]u8 = [_]u8{0} ** 16;
-    var q: [16]u8 = [_]u8{0} ** 16;
+    var p: [16]u8 = @as([16]u8, @splat(0));
+    var q: [16]u8 = @as([16]u8, @splat(0));
     for (0..12) |i| {
         p[i] = @intCast(i + 1);
         q[i] = @intCast(i + 1);
@@ -2637,7 +2637,7 @@ const Corpus = struct {
         p += 1; // toy, explicit g, refused by the floor before g is read
         self.pub_entries[p] = seedFields(&self.pub_store[p], &.{ real_n, &self.ff });
         p += 1; // g far above n², refused
-        self.pub_entries[p] = seedFields(&self.pub_store[p], &.{ &[_]u8{0} ** 8, "" });
+        self.pub_entries[p] = seedFields(&self.pub_store[p], &.{ &@as([8]u8, @splat(0)), "" });
         p += 1; // all-zero n strips to empty, refused
         // The length bound, straddled: `boundaryLen` gives 252..260, and
         // `modulus_bytes` is 256, so the first five are accepted and the last
@@ -2694,7 +2694,7 @@ const Corpus = struct {
         //          after `stripLeadingZeros` and the full `Fe.fromBytes` walk
         self.ct_entries[c_i] = seedFields(&self.ct_store[c_i], &self.ff_frame());
         c_i += 1; // 272 octets of 0xff
-        self.ct_entries[c_i] = seedFields(&self.ct_store[c_i], &.{&[_]u8{0} ** 16});
+        self.ct_entries[c_i] = seedFields(&self.ct_store[c_i], &.{&@as([16]u8, @splat(0))});
         c_i += 1; // all zeros: strips to empty
         self.ct_entries[c_i] = seedFields(&self.ct_store[c_i], &.{""});
         c_i += 1; // the one input this target actually ran
@@ -3099,7 +3099,7 @@ fn stackProbeCount(hay: []const u8, needle: []const u8) usize {
 }
 
 test "decrypt: no secret full-value copy survives on the dead stack (paillier F2, ReleaseFast only)" {
-    if (@import("builtin").mode != .ReleaseFast) return error.SkipZigTest; // undefined poisoning (ReleaseSafe/Debug) defeats this probe
+    if (@import("builtin").mode != .fast) return error.SkipZigTest; // undefined poisoning (ReleaseSafe/Debug) defeats this probe
     var prng = std.Random.DefaultPrng.init(0x57ac4);
     const random = prng.random();
     var kp: KeyPair = undefined;

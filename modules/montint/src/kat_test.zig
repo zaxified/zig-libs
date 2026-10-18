@@ -125,7 +125,7 @@ fn fixedDiff(comptime L: usize, rand: std.Random, trials: usize) !void {
         // Every limb all-ones, operands m − 1: the largest products and the
         // longest carry runs every fold sees (the block kernels' window-top
         // folds rely on a value bound, not on a spare word).
-        if (t % 16 == 4) mv = .{~@as(u64, 0)} ** L;
+        if (t % 16 == 4) mv = @splat(~@as(u64, 0));
         const m = try M.fromElem(mv);
         var a: M.Elem = undefined;
         var b: M.Elem = undefined;
@@ -136,9 +136,9 @@ fn fixedDiff(comptime L: usize, rand: std.Random, trials: usize) !void {
         a[L - 1] %= mv[L - 1];
         b[L - 1] %= mv[L - 1];
         switch (t % 16) {
-            0 => a = .{0} ** L,
+            0 => a = @splat(0),
             1 => {
-                b = .{0} ** L;
+                b = @splat(0);
                 b[0] = 1;
             },
             2, 3, 4 => {
@@ -326,7 +326,7 @@ test "ASM squaring differential: asm montSqr == montSqrCios == asm montMul(a,a)"
 // DISAGREE with the oracle square, proving the asm differential has teeth.
 fn brokenAsmSqrNoDouble(comptime M: type, self: *const M, a: *const M.Elem) M.Elem {
     const L = M.L;
-    var A = [_]u64{0} ** (2 * L);
+    var A = @as([2 * L]u64, @splat(0));
     // cross-product rows via the real asm primitive (correct)
     var i: usize = 0;
     while (i + 1 < L) : (i += 1) {
@@ -399,7 +399,7 @@ test "positive control: an asm square missing the off-diagonal double is caught 
 fn brokenSqrNoDiagonal(comptime M: type, self: *const M, a: *const M.Elem) M.Elem {
     const L = M.L;
     const m = &self.m;
-    var A = [_]u64{0} ** (2 * L);
+    var A = @as([2 * L]u64, @splat(0));
     // cross products (correct)
     var i: usize = 0;
     while (i < L) : (i += 1) {
@@ -479,7 +479,7 @@ test "positive control: a square missing the diagonal term is caught (teeth)" {
 // Its result is in [0, 2m) instead of [0, m).
 fn brokenMontMulNoReduce(comptime M: type, self: *const M, a: *const M.Elem, b: *const M.Elem) M.Elem {
     const L = M.L;
-    var t = [_]u64{0} ** (L + 2);
+    var t = @as([L + 2]u64, @splat(0));
     var i: usize = 0;
     while (i < L) : (i += 1) {
         var carry: u64 = 0;

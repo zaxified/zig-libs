@@ -897,11 +897,11 @@ test "hostile: open_channel truncated before the trailing point fields fails clo
     try buf.appendSlice(allocator, &.{ 0x00, OPEN_CHANNEL_TYPE });
     try buf.appendSlice(allocator, &fillPattern(32, 1)); // chain_hash
     try buf.appendSlice(allocator, &fillPattern(32, 2)); // temporary_channel_id
-    try buf.appendSlice(allocator, &(([_]u8{0} ** 8) ** 6)); // 6 * u64
-    try buf.appendSlice(allocator, &([_]u8{0} ** 4)); // feerate_per_kw
-    try buf.appendSlice(allocator, &([_]u8{0} ** 2)); // to_self_delay
-    try buf.appendSlice(allocator, &([_]u8{0} ** 2)); // max_accepted_htlcs
-    try buf.appendSlice(allocator, &([_]u8{0xaa} ** 10)); // truncated funding_pubkey
+    try buf.appendSlice(allocator, &@as([48]u8, @splat(0))); // 6 * u64
+    try buf.appendSlice(allocator, &(@as([4]u8, @splat(0)))); // feerate_per_kw
+    try buf.appendSlice(allocator, &(@as([2]u8, @splat(0)))); // to_self_delay
+    try buf.appendSlice(allocator, &(@as([2]u8, @splat(0)))); // max_accepted_htlcs
+    try buf.appendSlice(allocator, &(@as([10]u8, @splat(0xaa)))); // truncated funding_pubkey
     try testing.expectError(error.Truncated, decodeOpenChannel(allocator, buf.items));
 }
 
@@ -1002,11 +1002,11 @@ test "hostile: update_add_htlc with a truncated onion_routing_packet fails close
     defer buf.deinit(allocator);
     try buf.appendSlice(allocator, &.{ 0x00, UPDATE_ADD_HTLC_TYPE });
     try buf.appendSlice(allocator, &fillPattern(32, 1)); // channel_id
-    try buf.appendSlice(allocator, &([_]u8{0} ** 8)); // id
-    try buf.appendSlice(allocator, &([_]u8{0} ** 8)); // amount_msat
+    try buf.appendSlice(allocator, &(@as([8]u8, @splat(0)))); // id
+    try buf.appendSlice(allocator, &(@as([8]u8, @splat(0)))); // amount_msat
     try buf.appendSlice(allocator, &fillPattern(32, 2)); // payment_hash
-    try buf.appendSlice(allocator, &([_]u8{0} ** 4)); // cltv_expiry
-    try buf.appendSlice(allocator, &([_]u8{0xff} ** 100)); // only 100 of 1366 onion bytes
+    try buf.appendSlice(allocator, &(@as([4]u8, @splat(0)))); // cltv_expiry
+    try buf.appendSlice(allocator, &(@as([100]u8, @splat(0xff)))); // only 100 of 1366 onion bytes
     try testing.expectError(error.Truncated, decodeUpdateAddHtlc(allocator, buf.items));
 }
 
@@ -1037,7 +1037,7 @@ test "hostile: update_fail_htlc with a reason length prefix exceeding remaining 
     defer buf.deinit(allocator);
     try buf.appendSlice(allocator, &.{ 0x00, UPDATE_FAIL_HTLC_TYPE });
     try buf.appendSlice(allocator, &fillPattern(32, 1));
-    try buf.appendSlice(allocator, &([_]u8{0} ** 8));
+    try buf.appendSlice(allocator, &(@as([8]u8, @splat(0))));
     try buf.appendSlice(allocator, &.{ 0xff, 0xff }); // reason len = 65535, nothing follows
     try testing.expectError(error.Truncated, decodeUpdateFailHtlc(allocator, buf.items));
 }
@@ -1117,7 +1117,7 @@ test "revoke_and_ack / update_fee / shutdown / closing_signed: round-trip" {
     const fee_decoded = try decodeUpdateFee(fee_bytes);
     try testing.expectEqual(fee.feerate_per_kw, fee_decoded.feerate_per_kw);
 
-    const sd: Shutdown = .{ .channel_id = fillPattern(32, 5), .scriptpubkey = &([_]u8{ 0x00, 0x14 } ++ [_]u8{0xaa} ** 20) };
+    const sd: Shutdown = .{ .channel_id = fillPattern(32, 5), .scriptpubkey = &([_]u8{ 0x00, 0x14 } ++ @as([20]u8, @splat(0xaa))) };
     const sd_bytes = try serializeShutdown(allocator, sd);
     defer allocator.free(sd_bytes);
     const sd_decoded = try decodeShutdown(sd_bytes);
@@ -1680,4 +1680,16 @@ test "corpus: every reestablish/malformed seed reaches a decoder, and the counts
     try testing.expectEqual(@as(usize, 1), malformed);
     // 2 from the both-TLV seed; the unknown-odd record is discarded.
     try testing.expectEqual(@as(usize, 2), records);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

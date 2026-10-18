@@ -39,7 +39,7 @@ fn timeIt(io: std.Io, ctx: anytype, comptime f: anytype) f64 {
     return @as(f64, @floatFromInt(best)) / @as(f64, @floatFromInt(n));
 }
 
-const msg = [_]u8{0x5a} ** 64;
+const msg = @as([64]u8, @splat(0x5a));
 
 fn doSign(kp: *const ed.KeyPair) ed.Signature {
     return ed.sign(kp, &msg, "") catch unreachable;
@@ -93,13 +93,13 @@ pub fn main(init: std.process.Init) !u8 {
         return 1;
     }
 
-    const kp = ed.KeyPair.create(&([_]u8{7} ** 57));
+    const kp = ed.KeyPair.create(&(@as([57]u8, @splat(7))));
     const sig = doSign(&kp);
     if (!doVerify(sig, kp.public_key)) return error.OwnSignatureDoesNotVerify;
     var a: x448.KeyPair = undefined;
-    try x448.KeyPair.generateDeterministic(&a, &([_]u8{9} ** x448.seed_length));
+    try x448.KeyPair.generateDeterministic(&a, &(@as([x448.seed_length]u8, @splat(9))));
     var b: x448.KeyPair = undefined;
-    try x448.KeyPair.generateDeterministic(&b, &([_]u8{3} ** x448.seed_length));
+    try x448.KeyPair.generateDeterministic(&b, &(@as([x448.seed_length]u8, @splat(3))));
 
     const rows = [_]struct { name: []const u8, ours: f64, theirs: f64 }{
         .{ .name = "sign", .ours = timeIt(io, .{&kp}, doSign), .theirs = 1e9 / sign_rate.? },

@@ -98,7 +98,7 @@ fn roundA(gpa: std.mem.Allocator) !void {
 
     const p_pub = quicknetPubkey();
     const round: u64 = 1000;
-    const message = [_]u8{0x5a} ** tlock.block_bytes;
+    const message = @as([tlock.block_bytes]u8, @splat(0x5a));
 
     // A production caller draws sigma from real entropy rather than a fixed
     // constant -- exercising the `entropy` dep this module declares.

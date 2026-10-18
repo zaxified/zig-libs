@@ -21,8 +21,8 @@ const Suite = noise.DefaultSuite;
 pub fn main() !void {
     // Fixed seeds keep this example reproducible; a real caller draws these
     // from a CSPRNG (e.g. `std.crypto.dh.X25519.KeyPair.generate(io)`).
-    const init_static = try Suite.KeyPair.generateDeterministic([_]u8{0x11} ** 32);
-    const resp_static = try Suite.KeyPair.generateDeterministic([_]u8{0x22} ** 32);
+    const init_static = try Suite.KeyPair.generateDeterministic(@as([32]u8, @splat(0x11)));
+    const resp_static = try Suite.KeyPair.generateDeterministic(@as([32]u8, @splat(0x22)));
     var init_rng = std.Random.DefaultPrng.init(0xC0FFEE);
     var resp_rng = std.Random.DefaultPrng.init(0xDECAFBAD);
 
@@ -32,7 +32,7 @@ pub fn main() !void {
     var storage: noise.PatternStorage = .{};
     const proto = try noise.parseProtocolName(&storage, "Noise_XXpsk3_25519_ChaChaPoly_SHA256");
     if (!Suite.matches(proto)) return error.WrongSuite;
-    const psk = [_][32]u8{[_]u8{0x33} ** 32};
+    const psk = [_][32]u8{@as([32]u8, @splat(0x33))};
 
     // XX: neither side knows the other's static key in advance (no `rs`);
     // both reveal their static key DURING the handshake. `init` checks the

@@ -310,7 +310,7 @@ fn runProbe(label: []const u8, call: *const fn () void, n: *const Needles) !usiz
 }
 
 fn skipUnlessOptimized() !void {
-    if (builtin.mode == .Debug or builtin.mode == .ReleaseSafe) return error.SkipZigTest;
+    if (builtin.mode == .debug or builtin.mode == .safe) return error.SkipZigTest;
 }
 
 // ── needles ─────────────────────────────────────────────────────────────────
@@ -396,7 +396,7 @@ const Matrix = enum { a, b, c };
 
 /// `col_i(τ)` as `prover.columnEvalAtTau` computes it.
 fn columnEval(sys: r1cs.System, which: Matrix, wire: usize, tau: Fr) Fr {
-    var evals = [_]Fr{Fr.zero} ** nt_domain;
+    var evals = @as([nt_domain]Fr, @splat(Fr.zero));
     for (sys.constraints, 0..) |con, j| {
         const lc = switch (which) {
             .a => con.a,
@@ -459,9 +459,9 @@ fn randomizerNeedles(n: *Needles, rand: prover.Randomizers, delta1: G1.Affine, d
 fn proveNeedles(n: *Needles, w: []const Fr, rand: prover.Randomizers, pk: prover.ProvingKey, sys: r1cs.System) void {
     addAll(n, "witness", w);
     randomizerNeedles(n, rand, pk.delta_g1, pk.delta_g2);
-    var a_ev = [_]Fr{Fr.zero} ** nt_domain;
-    var b_ev = [_]Fr{Fr.zero} ** nt_domain;
-    var c_ev = [_]Fr{Fr.zero} ** nt_domain;
+    var a_ev = @as([nt_domain]Fr, @splat(Fr.zero));
+    var b_ev = @as([nt_domain]Fr, @splat(Fr.zero));
+    var c_ev = @as([nt_domain]Fr, @splat(Fr.zero));
     for (0..nt_domain) |j| {
         const e = sys.evalConstraint(j, w);
         a_ev[j] = e.a;
@@ -477,11 +477,11 @@ fn proveNeedles(n: *Needles, w: []const Fr, rand: prover.Randomizers, pk: prover
     addAll(n, "a_coef", &a_ev);
     addAll(n, "b_coef", &b_ev);
     addAll(n, "c_coef", &c_ev);
-    var ab = [_]Fr{Fr.zero} ** (2 * nt_domain - 1);
+    var ab = @as([2 * nt_domain - 1]Fr, @splat(Fr.zero));
     fft.mulViaFFT(2 * nt_domain, &ab, &a_ev, &b_ev);
-    var p = [_]Fr{Fr.zero} ** (2 * nt_domain - 1);
+    var p = @as([2 * nt_domain - 1]Fr, @splat(Fr.zero));
     poly.sub(&p, &ab, &c_ev);
-    var h = [_]Fr{Fr.zero} ** (nt_domain - 1);
+    var h = @as([nt_domain - 1]Fr, @splat(Fr.zero));
     _ = poly.divByVanishing(&h, &p, nt_domain) catch unreachable;
     addAll(n, "ab", &ab);
     addAll(n, "p", &p);

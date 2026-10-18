@@ -121,7 +121,7 @@ test "big-endian accessors reject wrong widths and read network order" {
     try testing.expectError(error.BadLength, a16.asBe32());
     const a32: Attr = .{ .type = 1, .raw_type = 1, .data = &.{ 0x00, 0x00, 0x00, 0x0a } };
     try testing.expectEqual(@as(u32, 10), try a32.asBe32());
-    const a64: Attr = .{ .type = 1, .raw_type = 1, .data = &(([_]u8{0} ** 7) ++ [_]u8{0x2a}) };
+    const a64: Attr = .{ .type = 1, .raw_type = 1, .data = &((@as([7]u8, @splat(0))) ++ [_]u8{0x2a}) };
     try testing.expectEqual(@as(u64, 42), try a64.asBe64());
     try testing.expectError(error.BadLength, a64.asBe16());
 }
@@ -171,7 +171,7 @@ test "walkers reject truncated and bad-length input" {
     it = .{ .buf = &.{ 0x00, 0x00, 0x01, 0x00 } };
     try testing.expectError(error.BadLength, it.next());
 
-    var mit: MessageIterator = .{ .buf = &[_]u8{0} ** 10 };
+    var mit: MessageIterator = .{ .buf = &@as([10]u8, @splat(0)) };
     try testing.expectError(error.Truncated, mit.next());
     var small: [16]u8 = @splat(0);
     std.mem.writeInt(u32, small[0..4], 8, native_endian);

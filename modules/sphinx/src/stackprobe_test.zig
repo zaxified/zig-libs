@@ -211,7 +211,7 @@ fn buildNeedles(n: *Needles) !void {
 }
 
 test "STACKPROBE (review 2026-10-08): no key or shared-secret residue on the dead stack after construct/process" {
-    if (builtin.mode == .Debug or builtin.mode == .ReleaseSafe) return error.SkipZigTest;
+    if (builtin.mode == .debug or builtin.mode == .safe) return error.SkipZigTest;
 
     session_key = hex32(v.session_key);
     node_priv = .{ hex32(v.node_privkeys[0]), hex32(v.node_privkeys[1]) };

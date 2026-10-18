@@ -964,19 +964,19 @@ test "sim: a write into reserved zeros is lost to zeros by a crash before its sy
         var sim = SimStorage.init(testing.allocator);
         defer sim.deinit();
         const got = try reservedWriteThenCrash(&sim, .lose_unsynced, "XYZ", false);
-        try testing.expectEqualSlices(u8, "abc" ++ "\x00" ** 13, got);
+        try testing.expectEqualSlices(u8, "abc" ++ strRepeat("\x00", 13), got);
     }
     {
         var sim = SimStorage.init(testing.allocator);
         defer sim.deinit();
         const got = try reservedWriteThenCrash(&sim, .lose_unsynced, "XYZ", true);
-        try testing.expectEqualSlices(u8, "abcXYZ" ++ "\x00" ** 10, got);
+        try testing.expectEqualSlices(u8, "abcXYZ" ++ strRepeat("\x00", 10), got);
     }
     {
         var sim = SimStorage.init(testing.allocator);
         defer sim.deinit();
         const got = try reservedWriteThenCrash(&sim, .keep_unsynced, "XYZ", false);
-        try testing.expectEqualSlices(u8, "abcXYZ" ++ "\x00" ** 10, got);
+        try testing.expectEqualSlices(u8, "abcXYZ" ++ strRepeat("\x00", 10), got);
     }
     {
         // Torn: the first half of the un-synced data survives — as it would
@@ -984,7 +984,7 @@ test "sim: a write into reserved zeros is lost to zeros by a crash before its sy
         var sim = SimStorage.init(testing.allocator);
         defer sim.deinit();
         const got = try reservedWriteThenCrash(&sim, .torn_tail, "12345678", false);
-        try testing.expectEqualSlices(u8, "abc1234" ++ "\x00" ** 9, got);
+        try testing.expectEqualSlices(u8, "abc1234" ++ strRepeat("\x00", 9), got);
     }
 }
 
@@ -1485,4 +1485,16 @@ test "sim: reorder mode restores the pre-write bytes of a dropped overwrite, not
     }
     // The seed must actually have dropped something, or this proves nothing.
     try testing.expect(kept < 4);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

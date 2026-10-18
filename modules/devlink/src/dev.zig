@@ -396,7 +396,7 @@ test "parseInfo: hostile input is a typed error, never a read past the end" {
     // An over-long driver name.
     var list: std.ArrayList(u8) = .empty;
     defer list.deinit(gpa);
-    try codec.appendAttrString(gpa, &list, uapi.ATTR.INFO_DRIVER_NAME, "d" ** (uapi.name_max + 1));
+    try codec.appendAttrString(gpa, &list, uapi.ATTR.INFO_DRIVER_NAME, strRepeat("d", uapi.name_max + 1));
     try testing.expectError(error.BadLength, parseInfo(gpa, list.items));
 }
 
@@ -456,7 +456,7 @@ const Corpus = struct {
         // A driver name longer than the module accepts.
         var long_name: std.ArrayList(u8) = .empty;
         try handle.append(gpa, &long_name, .pci("0000:65:00.0"));
-        try codec.appendAttrString(gpa, &long_name, uapi.ATTR.INFO_DRIVER_NAME, "d" ** (uapi.name_max + 1));
+        try codec.appendAttrString(gpa, &long_name, uapi.ATTR.INFO_DRIVER_NAME, strRepeat("d", uapi.name_max + 1));
         self.push(long_name.items);
         // An attribute header declaring 0x40 octets over a 2-octet buffer.
         self.push(&[_]u8{ 0x40, 0x00 });
@@ -596,4 +596,16 @@ test "buildDevices is a bare dump; buildInfo is a handle-bearing doit" {
 test "buildInfo refuses a handle the kernel would reject" {
     const gpa = testing.allocator;
     try testing.expectError(error.InvalidRequest, buildInfo(gpa, 0x19, 1, .{ .bus = "pci", .dev = "" }));
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

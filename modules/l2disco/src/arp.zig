@@ -82,7 +82,7 @@ pub const Packet = struct {
         return .{
             .htype = std.mem.readInt(u16, bytes[0..2], .big),
             .ptype = std.mem.readInt(u16, bytes[2..4], .big),
-            .oper = @enumFromInt(std.mem.readInt(u16, bytes[6..8], .big)),
+            .oper = @fromBackingInt(@intCast(std.mem.readInt(u16, bytes[6..8], .big))),
             .sha = sha,
             .spa = spa,
             .tha = tha,
@@ -106,7 +106,7 @@ pub const Packet = struct {
         std.mem.writeInt(u16, buf[2..4], p.ptype, .big);
         buf[4] = @intCast(p.sha.len);
         buf[5] = @intCast(p.spa.len);
-        std.mem.writeInt(u16, buf[6..8], @intFromEnum(p.oper), .big);
+        std.mem.writeInt(u16, buf[6..8], @backingInt(p.oper), .big);
         var pos: usize = header_len;
         for ([_][]const u8{ p.sha, p.spa, p.tha, p.tpa }) |field| {
             @memcpy(buf[pos..][0..field.len], field);
@@ -206,7 +206,7 @@ pub const EthIpv4 = struct {
         std.mem.writeInt(u16, buf[2..4], ptype_ipv4, .big);
         buf[4] = 6;
         buf[5] = 4;
-        std.mem.writeInt(u16, buf[6..8], @intFromEnum(p.oper), .big);
+        std.mem.writeInt(u16, buf[6..8], @backingInt(p.oper), .big);
         buf[8..14].* = p.sender_mac.octets;
         buf[14..18].* = p.sender_ip;
         buf[18..24].* = p.target_mac.octets;
@@ -318,7 +318,7 @@ test "ARP: generic Packet parse + encode round-trip" {
 }
 
 test "ARP: trailing Ethernet padding is ignored" {
-    const padded = kat_request ++ [_]u8{0} ** 18; // 46-byte min payload pad
+    const padded = kat_request ++ @as([18]u8, @splat(0)); // 46-byte min payload pad
     const p = try EthIpv4.parse(&padded);
     try testing.expectEqual(Operation.request, p.oper);
 }
@@ -378,7 +378,7 @@ const arp_seeds = [_][]const u8{
     testkit.fuzz.seedHex("0001080006040001" ++ "001b213c9df8" ++ "00000000" ++ "000000000000" ++ "c0a801c8"),
     // The same request padded to Ethernet's 46-octet minimum payload — the
     // trailing octets must be ignored, not parsed.
-    testkit.fuzz.seedHex("0001080006040001" ++ "001b213c9df8" ++ "c0a80164" ++ "000000000000" ++ "c0a80101" ++ "00" ** 18),
+    testkit.fuzz.seedHex("0001080006040001" ++ "001b213c9df8" ++ "c0a80164" ++ "000000000000" ++ "c0a80101" ++ strRepeat("00", 18)),
 
     // ── generic `Packet`, refused by `EthIpv4` ─────────────────────────────
     // htype 6 (IEEE 802) instead of 1.
@@ -387,7 +387,7 @@ const arp_seeds = [_][]const u8{
     testkit.fuzz.seedHex("000186dd06040001" ++ "001b213c9df8" ++ "c0a80164" ++ "000000000000" ++ "c0a80101"),
     // hlen 14 / plen 8: a legal generic ARP whose address fields are 44
     // octets, so `Packet` slices four of them and `EthIpv4` says no.
-    testkit.fuzz.seedHex("0001080e0e080001" ++ "aa" ** 14 ++ "bb" ** 8 ++ "cc" ** 14 ++ "dd" ** 8),
+    testkit.fuzz.seedHex("0001080e0e080001" ++ strRepeat("aa", 14) ++ strRepeat("bb", 8) ++ strRepeat("cc", 14) ++ strRepeat("dd", 8)),
 
     // ── the refusals ───────────────────────────────────────────────────────
     // Nothing at all, and one octet short of the fixed header.
@@ -396,7 +396,7 @@ const arp_seeds = [_][]const u8{
     // The header is complete and hlen/plen are 0xff, so the four address
     // fields would need 1020 octets. `need` must be computed before the
     // slicing, not during it.
-    testkit.fuzz.seedHex("00010800ffff0001" ++ "00" ** 8),
+    testkit.fuzz.seedHex("00010800ffff0001" ++ strRepeat("00", 8)),
     // hlen/plen declaring exactly one octet more than the frame carries.
     testkit.fuzz.seedHex("0001080006040001" ++ "001b213c9df8" ++ "c0a80164" ++ "000000000000" ++ "c0a801"),
 };
@@ -483,4 +483,16 @@ test "fuzz driver: L2DISCO_FUZZ (arp)" {
 
 test "fuzz harness: 400 seeds in every test run, and they get everywhere (arp)" {
     try fz.checkReach("l2disco arp", .{ fuzzArpParse, fuzzArpMutated }, 400);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

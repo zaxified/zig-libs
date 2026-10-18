@@ -697,8 +697,8 @@ test "Initiator.init / Responder.init: BOLT#8 'Handshake State Initialization' m
     // Fixed identities from BOLT#8 Appendix A (see dh.zig's KAT constants
     // for provenance); re-derived here via public API so this test does
     // not reach into dh.zig's private test-only decls.
-    const init_ls = tu.keyPair([_]u8{0x11} ** 32);
-    const resp_ls = tu.keyPair([_]u8{0x21} ** 32);
+    const init_ls = tu.keyPair(@as([32]u8, @splat(0x11)));
+    const resp_ls = tu.keyPair(@as([32]u8, @splat(0x21)));
 
     const initiator = tu.initiator(&init_ls, resp_ls.public_key);
     const responder = tu.responder(&resp_ls);
@@ -750,19 +750,19 @@ test "Ephemeral: exactly two arms, production and test are distinct, and nothing
     try testing.expectEqualStrings("csprng", info.fields[0].name);
     try testing.expectEqualStrings("seeded_for_test", info.fields[1].name);
 
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x5a} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x5a)));
     const production: Ephemeral = .{ .csprng = csprng.random() };
     const for_test: Ephemeral = .{ .seeded_for_test = csprng.random() };
     try testing.expect(std.meta.activeTag(production) != std.meta.activeTag(for_test));
 }
 
 test "genAct1/genAct2 ALWAYS draw: the stored ephemeral is an output, and pre-setting it cannot steer Act One (B6 R1)" {
-    const ls = tu.keyPair([_]u8{0x11} ** 32);
-    const rs = tu.keyPair([_]u8{0x21} ** 32);
+    const ls = tu.keyPair(@as([32]u8, @splat(0x11)));
+    const rs = tu.keyPair(@as([32]u8, @splat(0x21)));
 
     // The exact attack the audit described: a consumer pins a constant
     // ephemeral of their own choosing and expects it to be used.
-    const attacker_fixed = tu.keyPair([_]u8{0x42} ** 32);
+    const attacker_fixed = tu.keyPair(@as([32]u8, @splat(0x42)));
 
     var prng = std.Random.DefaultPrng.init(0xb01783);
     var initiator = tu.initiator(&ls, rs.public_key);
@@ -799,8 +799,8 @@ test "genAct1/genAct2 ALWAYS draw: the stored ephemeral is an output, and pre-se
 }
 
 test "act ordering is enforced: no second genAct1/genAct2 can silently reuse the ephemeral (B6 R2)" {
-    const ls = tu.keyPair([_]u8{0x11} ** 32);
-    const rs = tu.keyPair([_]u8{0x21} ** 32);
+    const ls = tu.keyPair(@as([32]u8, @splat(0x11)));
+    const rs = tu.keyPair(@as([32]u8, @splat(0x21)));
     var prng = std.Random.DefaultPrng.init(0x60177);
     const rnd: Ephemeral = .{ .seeded_for_test = prng.random() };
 

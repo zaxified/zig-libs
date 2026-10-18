@@ -311,12 +311,12 @@ test "generate: events are sorted by time and stay within bounds" {
 }
 
 test "generate: over many seeds, every fault kind is exercised (teeth)" {
-    var seen = [_]bool{false} ** @typeInfo(FaultKind).@"union".fields.len;
+    var seen = @as([@typeInfo(FaultKind)]bool, @splat(false)).@"union".fields.len;
     var seed: u64 = 1;
     while (seed <= 400) : (seed += 1) {
         var tr = try generate(testing.allocator, seed, sampleTopo(), .{});
         defer tr.deinit();
-        for (tr.events) |e| seen[@intFromEnum(std.meta.activeTag(e.kind))] = true;
+        for (tr.events) |e| seen[@backingInt(std.meta.activeTag(e.kind))] = true;
     }
     for (seen) |s| try testing.expect(s);
 }

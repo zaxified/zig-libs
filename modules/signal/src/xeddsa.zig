@@ -118,7 +118,7 @@ pub const RandomData = [64]u8;
 /// spec-variant XEdDSA signature is also a valid Ed25519 signature under
 /// the sign-0 `A` (a property `kat_test.zig` exploits to cross-check
 /// `sign` against std's independent Ed25519 verifier).
-const hash1_prefix: [32]u8 = [_]u8{0xFE} ++ [_]u8{0xFF} ** 31;
+const hash1_prefix: [32]u8 = [_]u8{0xFE} ++ @as([31]u8, @splat(0xFF));
 
 pub const RecoverError = error{InvalidPublicKey};
 
@@ -463,10 +463,10 @@ test "a clamped X25519 seed can NEVER reduce to 0 mod L (the panic that was not)
 
     // Empirically, over the structural extremes of the clamped range.
     const seeds = [_][32]u8{
-        [_]u8{0x00} ** 32,
-        [_]u8{0xff} ** 32,
-        [_]u8{0x08} ++ [_]u8{0x00} ** 31,
-        [_]u8{0x00} ** 31 ++ [_]u8{0xff},
+        @as([32]u8, @splat(0x00)),
+        @as([32]u8, @splat(0xff)),
+        [_]u8{0x08} ++ @as([31]u8, @splat(0x00)),
+        @as([31]u8, @splat(0x00)) ++ [_]u8{0xff},
     };
     for (seeds) |seed| {
         var t = seed;
@@ -560,9 +560,9 @@ test "libsignal variant round-trips (self-consistency, both sign-bit branches) a
 }
 
 test "verify refuses s + L, an order-2 key that satisfies the equation, and a partly matching R" {
-    const priv = [_]u8{0x42} ** 32;
+    const priv = @as([32]u8, @splat(0x42));
     const public = try std.crypto.dh.X25519.recoverPublicKey(priv);
-    const sig = shim.xeddsa.sign(priv, "msg", [_]u8{7} ** 64);
+    const sig = shim.xeddsa.sign(priv, "msg", @as([64]u8, @splat(7)));
     try std.testing.expect(verify(public, "msg", sig));
 
     // `s + L` moves no point, so only the canonicity check refuses it.
@@ -575,8 +575,8 @@ test "verify refuses s + L, an order-2 key that satisfies the equation, and a pa
     // `sB - hA == R` for every message whose h is even.
     var forged: Signature = undefined;
     forged[0..32].* = Edwards25519.basePoint.toBytes();
-    forged[32..64].* = [_]u8{1} ++ [_]u8{0} ** 31;
-    for (0..16) |i| try std.testing.expect(!verify([_]u8{0} ** 32, &[_]u8{@intCast(i)}, forged));
+    forged[32..64].* = [_]u8{1} ++ @as([31]u8, @splat(0));
+    for (0..16) |i| try std.testing.expect(!verify(@as([32]u8, @splat(0)), &[_]u8{@intCast(i)}, forged));
 
     // Every byte of R is compared: of 2048 tampered R values (each with a
     // fresh h), roughly eight would match R_check on any single byte.
@@ -611,7 +611,7 @@ test "verify refuses an order-8 key that satisfies the equation" {
     try std.testing.expect(@reduce(.Or, @as(@Vector(32, u8), a_point.dbl().dbl().toBytes()) != @as(@Vector(32, u8), identity)));
 
     var forged: Signature = undefined;
-    const s = [_]u8{9} ++ [_]u8{0} ** 31;
+    const s = [_]u8{9} ++ @as([31]u8, @splat(0));
     forged[0..32].* = (try Edwards25519.basePoint.mul(s)).toBytes();
     forged[32..64].* = s;
     var hits: usize = 0;
@@ -633,11 +633,11 @@ test "verify refuses an order-8 key that satisfies the equation" {
 
 test "edwardsFromMontgomery fail-closed edges: non-canonical u, pole u = p-1, twist u, identity/low-order map images" {
     // Non-canonical: top bit set.
-    var bad = [_]u8{0} ** 32;
+    var bad = @as([32]u8, @splat(0));
     bad[31] = 0x80;
     try std.testing.expectError(error.InvalidPublicKey, edwardsFromMontgomery(bad));
     // Non-canonical: u >= p (p itself: 0xed, 0xff*30, 0x7f).
-    var p_bytes = [_]u8{0xFF} ** 32;
+    var p_bytes = @as([32]u8, @splat(0xFF));
     p_bytes[0] = 0xED;
     p_bytes[31] = 0x7F;
     try std.testing.expectError(error.InvalidPublicKey, edwardsFromMontgomery(p_bytes));
@@ -653,7 +653,7 @@ test "edwardsFromMontgomery fail-closed edges: non-canonical u, pole u = p-1, tw
     var found_curve = false;
     var small: u8 = 2;
     while (small < 64 and !(found_twist and found_curve)) : (small += 1) {
-        var u_bytes = [_]u8{0} ** 32;
+        var u_bytes = @as([32]u8, @splat(0));
         u_bytes[0] = small;
         const u = Fe.fromBytes(u_bytes);
         const rhs = u.sq().mul(u).add(Fe.edwards25519a.mul(u.sq())).add(u);
@@ -670,7 +670,7 @@ test "edwardsFromMontgomery fail-closed edges: non-canonical u, pole u = p-1, tw
     // u = 0 maps to the order-2 point (0, -1): the CONVERSION succeeds
     // (it is a real point) — rejecting it is verify's step 2, not this
     // function's job.
-    const zero_u = [_]u8{0} ** 32;
+    const zero_u = @as([32]u8, @splat(0));
     const low_order = try edwardsFromMontgomery(zero_u);
     try std.testing.expectError(error.WeakPublicKey, low_order.rejectLowOrder());
 }

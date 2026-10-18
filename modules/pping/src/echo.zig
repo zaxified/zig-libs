@@ -247,7 +247,7 @@ test "parseIcmpEcho: truncated echo headers and non-zero codes fail closed" {
 }
 
 fn ipv4Echo(buf: *[28]u8, ihl_words: u8, total: u16, flags_frag: u16, proto: u8, icmp: [8]u8) []u8 {
-    buf.* = [_]u8{0} ** 28;
+    buf.* = @as([28]u8, @splat(0));
     buf[0] = 0x40 | ihl_words;
     std.mem.writeInt(u16, buf[2..4], total, .big);
     std.mem.writeInt(u16, buf[6..8], flags_frag, .big);
@@ -396,10 +396,10 @@ const fuzz_corpus = [_][]const u8{
     fuzzseed.seedHex("4500001c000000004006000000000000000000000800000000010001"), // TCP, not ICMP
     fuzzseed.seedHex("4500001c000020014001000000000000000000000800000000010001"), // non-first fragment
     fuzzseed.seedHex("4f00001c"), // IHL 15, truncated
-    fuzzseed.seedHex("6000000000083a40" ++ "00" ** 32 ++ "8100000000010001"), // bare ICMPv6 reply
-    fuzzseed.seedHex("6000000000100040" ++ "00" ** 32 ++ "3a00000000000000" ++ "8000000000010001"), // HbH then request
-    fuzzseed.seedHex("60000000002c3c40" ++ "00" ** 32 ++ ("3c00000000000000" ** 5)), // DestOpts chain
-    fuzzseed.seedHex("6000000000203340" ++ "00" ** 32 ++ "3aff"), // AH claiming 1028 octets
+    fuzzseed.seedHex("6000000000083a40" ++ strRepeat("00", 32) ++ "8100000000010001"), // bare ICMPv6 reply
+    fuzzseed.seedHex("6000000000100040" ++ strRepeat("00", 32) ++ "3a00000000000000" ++ "8000000000010001"), // HbH then request
+    fuzzseed.seedHex("60000000002c3c40" ++ strRepeat("00", 32) ++ (strRepeat("3c00000000000000", 5))), // DestOpts chain
+    fuzzseed.seedHex("6000000000203340" ++ strRepeat("00", 32) ++ "3aff"), // AH claiming 1028 octets
     fuzzseed.seedHex("7000"), // version 7
 };
 
@@ -502,4 +502,16 @@ test "corpus: every seed reaches the walk, and the outcomes are pinned" {
     try testing.expectEqual(@as(usize, 4), echoes);
     try testing.expectEqual(@as(usize, 2), nulls);
     try testing.expectEqual(@as(usize, 4), errors);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

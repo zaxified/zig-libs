@@ -65,7 +65,7 @@ fn b64(alloc: std.mem.Allocator, data: []const u8) ![]u8 {
 }
 
 fn gcmEncrypt256(alloc: std.mem.Allocator, key: [32]u8, msg: []const u8) ![]u8 {
-    const iv = [_]u8{0x22} ** 12;
+    const iv = @as([12]u8, @splat(0x22));
     const total = 12 + msg.len + 16;
     const out = try alloc.alloc(u8, total);
     @memcpy(out[0..12], &iv);
@@ -97,7 +97,7 @@ fn selfContainedAssertion(alloc: std.mem.Allocator) ![]u8 {
 /// Wrap arbitrary plaintext octets as an AES-256-GCM / RSA-OAEP
 /// `<saml:EncryptedAssertion>` decryptable by `pk`'s private half.
 fn encryptedAssertionXml(alloc: std.mem.Allocator, pk: rsa.PublicKey, plaintext: []const u8) ![]u8 {
-    const cek = [_]u8{0xC5} ** 32;
+    const cek = @as([32]u8, @splat(0xC5));
     const wrapped = try oaepWrapCek(alloc, pk, &cek);
     defer alloc.free(wrapped);
     const content = try gcmEncrypt256(alloc, cek, plaintext);
@@ -178,7 +178,7 @@ test "encrypted flow: decrypt -> verify -> extract yields the SAME AuthnResult a
 test "Z1: the decrypted assertion body does not survive in any block consumeResponseXml releases" {
     // ReleaseFast ONLY — see `test_encutil.FreeScanner` for why the safe lanes
     // cannot observe a heap wipe at all.
-    if (@import("builtin").mode != .ReleaseFast) return error.SkipZigTest;
+    if (@import("builtin").mode != .fast) return error.SkipZigTest;
 
     const alloc = testing.allocator;
     const kp = try makeSpKey(0x5A11_2E20);

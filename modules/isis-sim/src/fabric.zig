@@ -2908,7 +2908,7 @@ test "MEASURED: a lossy LAN converges through the DIS's CSNPs; without them it s
     // 48 LAN runs take ~47 s in Debug and well under a second optimized; the
     // Debug lane keeps 4 seeds, which still show every property below (the
     // CSNP-off control agreed on 0 of 16).
-    const seeds: usize = if (@import("builtin").mode == .Debug) 4 else 16;
+    const seeds: usize = if (@import("builtin").mode == .debug) 4 else 16;
     // Lossless control: nothing dropped, every seed agrees.
     const clean = try runLossyLan(seeds, 0, true);
     try testing.expectEqual(@as(u64, 0), clean.dropped);

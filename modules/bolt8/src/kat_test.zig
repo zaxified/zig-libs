@@ -237,8 +237,8 @@ test "wiring sanity: Transport built from the published sk/rk/ck reproduces the 
         .sk = kv.init_sk.*,
         .rk = kv.init_rk.*,
         .ck = kv.ck_temp_k3[0].*,
-        .handshake_hash = [_]u8{0} ** 32,
-        .remote_static = [_]u8{0} ** 33,
+        .handshake_hash = @as([32]u8, @splat(0)),
+        .remote_static = @as([33]u8, @splat(0)),
     });
     var out: [transport.length_frame_len + 5 + 16]u8 = undefined;
     try t.sendMessage("hello", &out);
@@ -254,15 +254,15 @@ test "README 'post-handshake transport' snippet, verbatim, with real types (F9 2
         .sk = kv.init_sk.*,
         .rk = kv.init_rk.*,
         .ck = kv.ck_temp_k3[0].*,
-        .handshake_hash = [_]u8{0} ** 32,
-        .remote_static = [_]u8{0} ** 33,
+        .handshake_hash = @as([32]u8, @splat(0)),
+        .remote_static = @as([33]u8, @splat(0)),
     });
     var receiver = tu.transportOf(.{
         .sk = kv.init_rk.*,
         .rk = kv.init_sk.*,
         .ck = kv.ck_temp_k3[0].*,
-        .handshake_hash = [_]u8{0} ** 32,
-        .remote_static = [_]u8{0} ** 33,
+        .handshake_hash = @as([32]u8, @splat(0)),
+        .remote_static = @as([33]u8, @splat(0)),
     });
     const msg = "hello";
     var out: [transport.length_frame_len + msg.len + 16]u8 = undefined;
@@ -365,7 +365,7 @@ test "F2: deinit zeroes the key material each object directly owns" {
     try testing.expect(std.mem.allEqual(u8, &responder.ls.secret_key, 0));
     try testing.expect(std.mem.allEqual(u8, &responder.ss.ck, 0));
 
-    var t = tu.transportOf(.{ .sk = kv.init_sk.*, .rk = kv.init_rk.*, .ck = kv.ck_temp_k3[0].*, .handshake_hash = [_]u8{0} ** 32, .remote_static = [_]u8{0} ** 33 });
+    var t = tu.transportOf(.{ .sk = kv.init_sk.*, .rk = kv.init_rk.*, .ck = kv.ck_temp_k3[0].*, .handshake_hash = @as([32]u8, @splat(0)), .remote_static = @as([33]u8, @splat(0)) });
     try testing.expect(!std.mem.allEqual(u8, &t.tx.cipher.k, 0));
     t.deinit();
     try testing.expect(std.mem.allEqual(u8, &t.tx.cipher.k, 0));

@@ -483,7 +483,7 @@ pub const Adjacency = struct {
         }
         // Level compatibility: the circuit-type low bits are a level bitmask
         // (bit0 = L1, bit1 = L2). Disjoint masks share no level → no adjacency.
-        if ((@intFromEnum(rx.circuit_type) & @intFromEnum(self.cfg.circuit_type)) == 0) {
+        if ((@backingInt(rx.circuit_type) & @backingInt(self.cfg.circuit_type)) == 0) {
             return .{ .rejected = .level_mismatch };
         }
         // Maximum Area Addresses (ISO 10589 §8.2): a neighbour disagreeing with
@@ -1524,7 +1524,7 @@ test "malformed bytes and a malformed 240 are typed errors, state unchanged" {
     var adj = Adjacency.init(cfgA());
     _ = adj.start(0);
     // Garbage: long enough to pass the length check, but a bad discriminator.
-    try testing.expectError(error.BadDiscriminator, adj.rxHelloBytes(&([_]u8{0xFF} ** 24), 1));
+    try testing.expectError(error.BadDiscriminator, adj.rxHelloBytes(&(@as([24]u8, @splat(0xFF))), 1));
     try testing.expectEqual(State.down, adj.currentState());
 
     // A well-formed P2P IIH but with a TLV 240 of illegal length (2 octets).

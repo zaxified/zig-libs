@@ -228,7 +228,7 @@ fn decodeNormalMode(bytes: []const u8, cp: *Cp) Error!void {
                 if (cp.result_count >= max_contexts) return error.TooManyContexts;
                 var f = ber.Iterator.init(entry.content);
                 const r = try f.expect(ber.Tag.ctx(0));
-                cp.results[cp.result_count] = @enumFromInt(try ber.decodeUint(u8, r.content));
+                cp.results[cp.result_count] = @fromBackingInt(@intCast(try ber.decodeUint(u8, r.content)));
                 cp.result_count += 1;
             }
         } else if (e.tag.eql(tag_user_data)) {
@@ -297,7 +297,7 @@ pub fn encodeCpa(user_data: []const u8, opts: CpaOptions, out: []u8) Error![]con
         if (opts.results[i] == .acceptance) {
             try w.primitive(ber.Tag.ctx(1), opts.transfer_syntax);
         }
-        try w.integer(ber.Tag.ctx(0), @intFromEnum(opts.results[i]));
+        try w.integer(ber.Tag.ctx(0), @backingInt(opts.results[i]));
         try w.header(ber.Tag.sequence, entry);
     }
     try w.header(tag_context_result_list, list_mark);
@@ -530,7 +530,7 @@ test "the context table refuses to grow without bound" {
     try testing.expectError(error.TooManyContexts, table.define(99, &ber.oids.mms_abstract_syntax));
     // And an absurdly long abstract syntax OID.
     var t2 = ContextTable{};
-    try testing.expectError(error.TooManyContexts, t2.define(1, &[_]u8{0} ** 32));
+    try testing.expectError(error.TooManyContexts, t2.define(1, &@as([32]u8, @splat(0))));
 }
 
 test "malformed CP PPDUs are typed errors" {

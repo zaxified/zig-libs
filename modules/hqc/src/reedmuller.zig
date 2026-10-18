@@ -236,7 +236,7 @@ pub fn RM(comptime p: params.Params) type {
             // accumulator. Starting from zero and summing ALL copies is
             // arithmetically identical to the reference's "assign first
             // copy, += the rest".
-            var expanded: [128]i16 = [_]i16{0} ** 128;
+            var expanded: [128]i16 = @as([128]i16, @splat(0));
             for (0..multiplicity) |copy| {
                 for (0..4) |part| {
                     const word = std.mem.readInt(u32, cdw[copy * 16 + part * 4 ..][0..4], .little);
@@ -324,6 +324,6 @@ test "RM128: encodeSymbol duplicates encodeBlock exactly multiplicity times" {
 
 test "RM128: encodeBlock(0) is the all-zero block, encodeBlock(0x80) is the all-ones block" {
     const t = std.testing;
-    try t.expectEqualSlices(u8, &([_]u8{0} ** 16), &RM128.encodeBlock(0));
-    try t.expectEqualSlices(u8, &([_]u8{0xff} ** 16), &RM128.encodeBlock(0x80));
+    try t.expectEqualSlices(u8, &(@as([16]u8, @splat(0))), &RM128.encodeBlock(0));
+    try t.expectEqualSlices(u8, &(@as([16]u8, @splat(0xff))), &RM128.encodeBlock(0x80));
 }

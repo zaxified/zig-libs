@@ -961,7 +961,7 @@ test "comb: combMulBaseCt(s) == mulCt(G, s) on edge and random 48-byte scalars, 
     for (cases) |s| try testing.expect(P384.combMulBaseCt(&base_table, &s).equivalent(P384.mulCt(G, &s)));
 
     var prng = std.Random.DefaultPrng.init(0x9384_c0b);
-    const iters: usize = if (@import("builtin").mode == .Debug) 24 else 400;
+    const iters: usize = if (@import("builtin").mode == .debug) 24 else 400;
     for (0..iters) |_| {
         var s: [48]u8 = undefined;
         prng.random().bytes(&s);
@@ -1058,7 +1058,7 @@ test "jacobian: mulCt == RCB reference on edge and random scalars, G and another
     const pts = [_]P384{ P384.basePoint, mulRcbReference(P384.basePoint, t) };
     for (pts) |p| {
         for (edgeScalars()) |s| try expectSamePoint(mulRcbReference(p, s), P384.mulCt(p, &s));
-        const iters: usize = if (@import("builtin").mode == .Debug) 8 else 100;
+        const iters: usize = if (@import("builtin").mode == .debug) 8 else 100;
         for (0..iters) |_| {
             var s: [48]u8 = undefined;
             r.bytes(&s);
@@ -1080,7 +1080,7 @@ test "jacobian: mulPublic and mulDoubleBasePublic == RCB reference, incl. doubli
             try testing.expectError(error.IdentityElement, G2.mulPublic(s, .little));
         } else try expectSamePoint(want, try G2.mulPublic(s, .little));
     }
-    const iters: usize = if (@import("builtin").mode == .Debug) 6 else 60;
+    const iters: usize = if (@import("builtin").mode == .debug) 6 else 60;
     for (0..iters) |_| {
         var a: [48]u8 = undefined;
         var b: [48]u8 = undefined;

@@ -601,7 +601,7 @@ const Fixture = struct {
         const d = f.tmp.dir;
 
         try d.createDirPath(io, "plain");
-        try d.writeFile(io, .{ .sub_path = "plain/data.bin", .data = &[_]u8{0xab} ** plain_size });
+        try d.writeFile(io, .{ .sub_path = "plain/data.bin", .data = &@as([plain_size]u8, @splat(0xab)) });
 
         try d.createDirPath(io, "sparse");
         {
@@ -615,7 +615,7 @@ const Fixture = struct {
 
         try d.createDirPath(io, "links/a");
         try d.createDirPath(io, "links/b");
-        try d.writeFile(io, .{ .sub_path = "links/a/orig.bin", .data = &[_]u8{0xcd} ** link_size });
+        try d.writeFile(io, .{ .sub_path = "links/a/orig.bin", .data = &@as([link_size]u8, @splat(0xcd)) });
         try d.hardLink("links/a/orig.bin", d, "links/b/same.bin", io, .{});
 
         try d.createDirPath(io, "syms");
@@ -810,7 +810,7 @@ test "unreadable directory: reported, counted, and stepped over" {
 
     const d = f.tmp.dir;
     try d.createDirPath(io, "locked");
-    try d.writeFile(io, .{ .sub_path = "locked/secret.bin", .data = &[_]u8{1} ** 9000 });
+    try d.writeFile(io, .{ .sub_path = "locked/secret.bin", .data = &@as([9000]u8, @splat(1)) });
     if (linux.errno(linux.fchmodat(d.handle, "locked", 0o000)) != .SUCCESS) return error.SkipZigTest;
     defer _ = linux.fchmodat(d.handle, "locked", 0o755); // so cleanup can delete it
 

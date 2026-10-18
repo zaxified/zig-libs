@@ -1205,7 +1205,7 @@ test "DERIVED: summing answerRange shards reproduces answer bit-for-bit, over se
                 if (qi < c.count) {
                     try testing.expectEqualSlices(u8, database.record(qi), &got_rec);
                 } else {
-                    try testing.expectEqualSlices(u8, &[_]u8{0} ** record_len, &got_rec);
+                    try testing.expectEqualSlices(u8, &@as([record_len]u8, @splat(0)), &got_rec);
                 }
             }
         }
@@ -1256,7 +1256,7 @@ test "SELF: answerRange explicit len-0 (start/middle/end) and len-1 shards, boun
         try P.answerRange(1, &shares[1], database, range[0], range[1], a1[0..n_words]);
         var got: [record_len]u8 = undefined;
         try P.reconstruct(a0[0..n_words], a1[0..n_words], &got);
-        try testing.expectEqualSlices(u8, &[_]u8{0} ** record_len, &got);
+        try testing.expectEqualSlices(u8, &@as([record_len]u8, @splat(0)), &got);
     }
 }
 
@@ -1357,7 +1357,7 @@ test "SELF: an index inside the domain but past the database reconstructs to zer
     try P.answer(1, &shares[1], database, &a1);
     var got: [record_len]u8 = undefined;
     try P.reconstruct(&a0, &a1, &got);
-    try testing.expectEqualSlices(u8, &[_]u8{0} ** record_len, &got);
+    try testing.expectEqualSlices(u8, &@as([record_len]u8, @splat(0)), &got);
 }
 
 test "SELF: geometry errors are returned, never asserted" {
@@ -1383,8 +1383,8 @@ test "SELF: geometry errors are returned, never asserted" {
     );
 
     var sc_p: P.Share = undefined;
-    try testing.expectError(error.ShareLengthMismatch, P.shareFromBytes(&sc_p, &[_]u8{0} ** 3));
-    try testing.expectError(error.ShareLengthMismatch, P.shareFromBytes(&sc_p, &[_]u8{0} ** (P.share_len + 1)));
+    try testing.expectError(error.ShareLengthMismatch, P.shareFromBytes(&sc_p, &@as([3]u8, @splat(0))));
+    try testing.expectError(error.ShareLengthMismatch, P.shareFromBytes(&sc_p, &@as([P.share_len + 1]u8, @splat(0))));
 
     var buf: [7]u8 = undefined;
     try testing.expectError(error.AnswerLengthMismatch, P.answerFromBytes(&buf, &out));
@@ -1989,15 +1989,15 @@ test "SELF: multi-index geometry errors are returned, never asserted" {
     );
 
     var sc_m: M.Share = undefined;
-    try testing.expectError(error.ShareLengthMismatch, M.shareFromBytes(&sc_m, &[_]u8{0} ** 3));
+    try testing.expectError(error.ShareLengthMismatch, M.shareFromBytes(&sc_m, &@as([3]u8, @splat(0))));
     try testing.expectError(
         error.ShareLengthMismatch,
-        M.shareFromBytes(&sc_m, &[_]u8{0} ** (M.share_len + 1)),
+        M.shareFromBytes(&sc_m, &@as([M.share_len + 1]u8, @splat(0))),
     );
     // exactly one share's worth is NOT enough for a two-instance share
     try testing.expectError(
         error.ShareLengthMismatch,
-        M.shareFromBytes(&sc_m, &[_]u8{0} ** (M.share_len / 2)),
+        M.shareFromBytes(&sc_m, &@as([M.share_len / 2]u8, @splat(0))),
     );
 
     var rec: [2 * 6]u8 = undefined;
@@ -2194,7 +2194,7 @@ test "SELF: keyword retrieval — a hit returns the record; a miss is the SAME c
         try P.answer(0, &shares[0], small, a0[0..n_words]);
         try P.answer(1, &shares[1], small, a1[0..n_words]);
         try P.reconstruct(a0[0..n_words], a1[0..n_words], &got);
-        try testing.expectEqualSlices(u8, &[_]u8{0} ** record_len, &got);
+        try testing.expectEqualSlices(u8, &@as([record_len]u8, @splat(0)), &got);
     }
 }
 
@@ -2370,7 +2370,7 @@ const ShareCorpus = struct {
         // An all-zero share of the right length: a legal parse over degenerate
         // key material, which is a different thing from a legal parse over no
         // material at all.
-        self.push(&[_]u8{0} ** FuzzPir.share_len);
+        self.push(&@as([FuzzPir.share_len]u8, @splat(0)));
         // The one input this target ever ran before it had a corpus.
         self.push("");
         return self.entries[0..self.n];
@@ -2493,7 +2493,7 @@ const AnswerCorpus = struct {
         // An all-zero share over the geometry the collapsed harness used to
         // run: one 1-octet record, party 0. Kept so the old behaviour stays
         // covered rather than merely replaced.
-        self.push(&[_]u8{0} ** FuzzPir.share_len, 1, 1, 1, 0);
+        self.push(&@as([FuzzPir.share_len]u8, @splat(0)), 1, 1, 1, 0);
         return self.entries[0..self.n];
     }
 };
@@ -2632,7 +2632,7 @@ const ReconCorpus = struct {
         // three words: the geometry, not the buffer, decides the length.
         self.push(&w[0], &w[1], 9);
         // A full-width geometry: 64-octet records, 16 words each side.
-        const wide = [_]u8{0xa5} ** 64;
+        const wide = @as([64]u8, @splat(0xa5));
         self.push(&wide, &wide, 64);
         // record_len 1 — one word, three octets of padding in it.
         self.push(&[_]u8{ 1, 2, 3, 4 }, &[_]u8{ 5, 6, 7, 8 }, 1);
@@ -2755,7 +2755,7 @@ const MultiShareCorpus = struct {
         // ⛔ Truncated to the SINGLE-index share length: the one confusion a
         // codec with no count field has to refuse by length alone.
         self.push(b[0..FuzzPir.share_len]);
-        self.push(&[_]u8{0} ** FuzzMulti.share_len);
+        self.push(&@as([FuzzMulti.share_len]u8, @splat(0)));
         self.push("");
         return self.entries[0..self.n];
     }
@@ -2857,7 +2857,7 @@ const MultiAnswerCorpus = struct {
         self.push(&b, 128, 16, 8, 1);
         // The geometry the collapsed harness ran: one 1-octet record, party 0,
         // over an all-zero share.
-        self.push(&[_]u8{0} ** FuzzMulti.share_len, 1, 1, 1, 0);
+        self.push(&@as([FuzzMulti.share_len]u8, @splat(0)), 1, 1, 1, 0);
         return self.entries[0..self.n];
     }
 };
@@ -2987,7 +2987,7 @@ const MultiReconCorpus = struct {
         // Server 1's answer one block short: AnswerLengthMismatch.
         self.push(&w[0], w[1][0..16], record_len, 3 * record_len);
         // The widest geometry the buffers allow: 32-octet records, 3×8 words.
-        const wide = [_]u8{0x5a} ** 96;
+        const wide = @as([96]u8, @splat(0x5a));
         self.push(&wide, &wide, 32, 96);
         // ⛔ The all-zero geometry, which SUCCEEDS: `answerWords(0)` is 0 and
         // `k * 0` is 0, so every length check compares 0 with 0. This is the

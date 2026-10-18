@@ -31,7 +31,7 @@ pub const cache_line: usize = std.atomic.cache_line;
 pub fn CachePadded(comptime T: type) type {
     return struct {
         value: T,
-        _pad: [pad_len]u8 = [_]u8{0} ** pad_len,
+        _pad: [pad_len]u8 = @as([pad_len]u8, @splat(0)),
 
         const pad_len = if (@sizeOf(T) % cache_line == 0)
             0

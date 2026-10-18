@@ -385,7 +385,7 @@ test "what libzstd leaves undefined is refused" {
     const gpa = std.testing.allocator;
     var comp: zstd.Compressor = .init(gpa);
     defer comp.deinit();
-    const src = "abcdefghabcdefghabcdefgh" ** 4;
+    const src = strRepeat("abcdefghabcdefghabcdefgh", 4);
     var dst: [256]u8 = undefined;
     const ok = [_]zstd.Sequence{ .{ .offset = 8, .lit_length = 8, .match_length = 88 }, .{ .offset = 0, .lit_length = 0, .match_length = 0 } };
     const explicit: zstd.Options = .{ .advanced = .{ .block_delimiters = .explicit } };
@@ -436,4 +436,16 @@ test "a sequence producer's workspace is counted, and a static context has room 
     try std.testing.expectEqual(src.len, try zstd.decompress(gpa, back, dst[0..n]));
     try std.testing.expectEqualSlices(u8, src, back);
     try std.testing.expect(prod.calls > 0);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

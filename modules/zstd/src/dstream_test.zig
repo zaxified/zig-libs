@@ -107,9 +107,9 @@ test "a window-sized ring: a stream without content size, window smaller than th
 }
 
 test "concatenated and skippable frames stream one after another" {
-    const a = try zstd.compressAlloc(gpa, "first " ** 300, .{});
+    const a = try zstd.compressAlloc(gpa, strRepeat("first ", 300), .{});
     defer gpa.free(a);
-    const b = try zstd.compressAlloc(gpa, "second " ** 300, .{ .level = 9, .checksum = true });
+    const b = try zstd.compressAlloc(gpa, strRepeat("second ", 300), .{ .level = 9, .checksum = true });
     defer gpa.free(b);
     const skip = [_]u8{ 0x5f, 0x2a, 0x4d, 0x18, 0x03, 0x00, 0x00, 0x00, 1, 2, 3 };
     const z = try std.mem.concat(gpa, u8, &.{ &skip, a, &skip, b, &skip });
@@ -117,7 +117,7 @@ test "concatenated and skippable frames stream one after another" {
     for (0..4) |seed| {
         const back = try streamDecode(z, .{ .in_max = 5, .out_max = 50 }, seed, .{});
         defer gpa.free(back);
-        try std.testing.expectEqualStrings("first " ** 300 ++ "second " ** 300, back);
+        try std.testing.expectEqualStrings(strRepeat("first ", 300) ++ strRepeat("second ", 300), back);
     }
 }
 
@@ -143,7 +143,7 @@ test "a skippable frame longer than the input buffer, fed in pieces" {
     // is such a frame). Then an ordinary frame.
     const a = try zstd.compressAlloc(gpa, "after the skippable frame", .{});
     defer gpa.free(a);
-    const skip = [_]u8{ 0x5e, 0x2a, 0x4d, 0x18, 45, 0, 0, 0 } ++ [_]u8{0xab} ** 45;
+    const skip = [_]u8{ 0x5e, 0x2a, 0x4d, 0x18, 45, 0, 0, 0 } ++ @as([45]u8, @splat(0xab));
     const z = try std.mem.concat(gpa, u8, &.{ &skip, a });
     defer gpa.free(z);
     for (0..4) |seed| {
@@ -165,7 +165,7 @@ test "a window limit in bytes (setMaxWindowSize): exact, and over window_log_max
 }
 
 test "stable output: straight into the caller's buffer, which must not move" {
-    const src = "stable output " ** 500;
+    const src = strRepeat("stable output ", 500);
     const z = try zstd.compressAlloc(gpa, src, .{ .level = 3 });
     defer gpa.free(z);
     var s = try zstd.DecompressStream.init(gpa, .{ .stable_output = true });
@@ -188,7 +188,7 @@ test "stable output: straight into the caller's buffer, which must not move" {
 }
 
 test "a truncated frame leaves a nonzero hint; no progress is an error after 16 calls" {
-    const z = try zstd.compressAlloc(gpa, "truncated stream " ** 100, .{ .checksum = true });
+    const z = try zstd.compressAlloc(gpa, strRepeat("truncated stream ", 100), .{ .checksum = true });
     defer gpa.free(z);
     var s = try zstd.DecompressStream.init(gpa, .{});
     defer s.deinit();
@@ -205,7 +205,7 @@ test "a truncated frame leaves a nonzero hint; no progress is an error after 16 
 }
 
 test "a corrupt frame is refused by the stream as by the one-shot decoder" {
-    const z = try zstd.compressAlloc(gpa, "checksummed " ** 200, .{ .checksum = true });
+    const z = try zstd.compressAlloc(gpa, strRepeat("checksummed ", 200), .{ .checksum = true });
     defer gpa.free(z);
     z[z.len - 2] ^= 0x10;
     try std.testing.expectError(error.ChecksumWrong, streamDecode(z, .{ .in_max = 9, .out_max = 30 }, 1, .{}));
@@ -241,7 +241,7 @@ test "DecompressReader reads every frame of another reader" {
 }
 
 test "decompressContinue decodes a frame piece by piece" {
-    const src = "piece by piece " ** 200;
+    const src = strRepeat("piece by piece ", 200);
     const z = try zstd.compressAlloc(gpa, src, .{ .level = 2, .checksum = true });
     defer gpa.free(z);
     var d = try zstd.Decompressor.init(gpa, .{});
@@ -284,7 +284,7 @@ fn expectSteps(z: []const u8, steps: []const Step, empty_after_first: bool) !voi
 }
 
 test "stream hints, input consumption and the hostage byte, as libzstd" {
-    const text = "hint " ** 600;
+    const text = strRepeat("hint ", 600);
     const z = try zstd.compressAlloc(gpa, text, .{ .level = 3, .checksum = true });
     defer gpa.free(z);
     try std.testing.expectEqual(@as(usize, 26), z.len);
@@ -497,4 +497,16 @@ test "a call after an error does not resume the broken raw block (fuzz 2026-10-0
     try std.testing.expect(failed);
     var more: zstd.InBuffer = .{ .src = "B" };
     if (s.decompressStream(&out, &more)) |_| return error.TestUnexpectedResult else |_| {}
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

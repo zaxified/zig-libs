@@ -68,7 +68,7 @@ pub fn main() !void {
     std.debug.print("imported a compressed mainnet key and re-exported it identically\n", .{});
 
     // A zero scalar is not a key; the encoder says so instead of emitting one.
-    const zero = [_]u8{0} ** 32;
+    const zero = @as([32]u8, @splat(0));
     if (btcaddr.wifEncode(&zero, true, .mainnet, &out)) |_| {
         return error.ZeroKeyEncoded;
     } else |e| switch (e) {

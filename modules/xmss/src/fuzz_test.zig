@@ -52,10 +52,10 @@ pub fn damage(src: anytype, buf: []u8, frame: []const u8) usize {
 /// binary and fails with `error.HarnessDoesNotReach` if a label never fired.
 pub fn Marker(comptime Label: type) type {
     return struct {
-        var counts: [@typeInfo(Label).@"enum".fields.len]usize = @splat(0);
+        var counts: [@typeInfo(Label).@"enum".field_names.len]usize = @splat(0);
 
         pub fn mark(comptime l: Label) void {
-            counts[@intFromEnum(l)] += 1;
+            counts[@backingInt(l)] += 1;
             fuzz_driver.hit(@tagName(l));
         }
 
@@ -70,7 +70,7 @@ pub fn Marker(comptime Label: type) type {
                 };
             }
             for (counts, 0..) |n, i| if (n == 0) {
-                std.debug.print("reach: " ++ name ++ " label {t} never hit in {d} seeds\n", .{ @as(Label, @enumFromInt(i)), seeds });
+                std.debug.print("reach: " ++ name ++ " label {t} never hit in {d} seeds\n", .{ @as(Label, @fromBackingInt(@intCast(i))), seeds });
                 return error.HarnessDoesNotReach;
             };
         }
@@ -87,8 +87,8 @@ var fixture_cache: ?struct { pk: [X.public_key_length]u8, msg: [64]u8, sig: [X.s
 fn fixture() @TypeOf(fixture_cache.?) {
     if (fixture_cache) |f| return f;
     var kp: X.KeyPair = undefined;
-    X.keyGen(&kp, &([_]u8{1} ** root.n), &([_]u8{2} ** root.n), &([_]u8{3} ** root.n));
-    const msg = [_]u8{0xA7} ** 64;
+    X.keyGen(&kp, &(@as([root.n]u8, @splat(1))), &(@as([root.n]u8, @splat(2))), &(@as([root.n]u8, @splat(3))));
+    const msg = @as([64]u8, @splat(0xA7));
     var sig: [X.signature_length]u8 = undefined;
     X.sign(&kp.sk, &sig, &msg) catch unreachable;
     fixture_cache = .{ .pk = kp.pk.toBytes(), .msg = msg, .sig = sig };
@@ -184,7 +184,7 @@ const SignMark = Marker(enum { genuine_accepted, flipped_refused, truncated_refu
 fn fuzzSignVerify(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
     if (sign_key == null) {
         sign_key = @as(X.KeyPair, undefined);
-        X.keyGen(&sign_key.?, &([_]u8{9} ** root.n), &([_]u8{8} ** root.n), &([_]u8{7} ** root.n));
+        X.keyGen(&sign_key.?, &(@as([root.n]u8, @splat(9))), &(@as([root.n]u8, @splat(8))), &(@as([root.n]u8, @splat(7))));
     }
     var mbuf: [70]u8 = undefined;
     const ml = src.index(mbuf.len + 1);

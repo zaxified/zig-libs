@@ -402,7 +402,7 @@ test "regression: over-long NSEC3 owner-hash label does not overflow (was OOB st
     // the exact reachable path (proveDenial -> matchNsec3/coverNsec3 ->
     // decodeOwnerHash): the malicious record must pass `usableRecord`
     // (algo 1 / iterations 0 / empty salt) so the decode is actually reached.
-    const evil_label = "0" ** 200; // 200 valid base32hex chars => 125 decoded bytes
+    const evil_label = strRepeat("0", 200); // 200 valid base32hex chars => 125 decoded bytes
     const empty_types: rdata.TypeBitMap = .{ .raw = "" };
     const record: Nsec3Record = .{
         .owner_hash_label = evil_label,
@@ -411,7 +411,7 @@ test "regression: over-long NSEC3 owner-hash label does not overflow (was OOB st
             .flags = 0,
             .iterations = 0,
             .salt = "",
-            .next_hashed_owner_name = &[_]u8{0} ** sha1_digest_len,
+            .next_hashed_owner_name = &@as([sha1_digest_len]u8, @splat(0)),
             .types = empty_types,
         },
     };
@@ -513,7 +513,7 @@ test "proveDenial: over-cap NSEC3 record count is refused even when a real proof
             .flags = 0,
             .iterations = 0,
             .salt = "",
-            .next_hashed_owner_name = &[_]u8{0} ** sha1_digest_len,
+            .next_hashed_owner_name = &@as([sha1_digest_len]u8, @splat(0)),
             .types = .{ .raw = "" }, // empty bitmap: direct match -> NODATA
         },
     };
@@ -528,7 +528,7 @@ test "proveDenial: over-cap NSEC3 record count is refused even when a real proof
             .flags = 0,
             .iterations = 0,
             .salt = "",
-            .next_hashed_owner_name = &[_]u8{0} ** sha1_digest_len,
+            .next_hashed_owner_name = &@as([sha1_digest_len]u8, @splat(0)),
             .types = .{ .raw = "" },
         },
     };
@@ -578,7 +578,7 @@ test "proveDenial NSEC3: insecure delegation -- DS NODATA with NS set, no SOA, n
                 .flags = 0,
                 .iterations = iters,
                 .salt = salt,
-                .next_hashed_owner_name = &[_]u8{0xff} ** sha1_digest_len, // irrelevant to a direct match
+                .next_hashed_owner_name = &@as([sha1_digest_len]u8, @splat(0xff)), // irrelevant to a direct match
                 .types = ns_only_types,
             },
         }},
@@ -635,10 +635,10 @@ const label_reject_seeds = [_][]const u8{
     seed("0123456789ABCDEFGHIJKLMNOPQRSTU="), // padding, which base32hex here does not take
     seed("!@#$%^&*()"), // entirely outside the alphabet
     seed("0123456789ABCDEFGHIJKLMNOPQRST\xff\xfe"), // in-alphabet with two high bytes at the end
-    seed("A" ** 63), // a label at the DNS maximum
-    seed("A" ** 64), // one over the DNS maximum
-    seed("A" ** 200), // ⭐ far over `decodeOwnerHash`'s fixed [64]u8 scratch buffer: the shape of the fixed regression above
-    seed("\x00" ** 32), // 32 NULs
+    seed(strRepeat("A", 63)), // a label at the DNS maximum
+    seed(strRepeat("A", 64)), // one over the DNS maximum
+    seed(strRepeat("A", 200)), // ⭐ far over `decodeOwnerHash`'s fixed [64]u8 scratch buffer: the shape of the fixed regression above
+    seed(strRepeat("\x00", 32)), // 32 NULs
 };
 
 /// The whole corpus: the shapes above, plus the real owner labels
@@ -681,7 +681,7 @@ fn labelRecord(label: []const u8) Nsec3Record {
             .flags = 0,
             .iterations = 0,
             .salt = "",
-            .next_hashed_owner_name = &[_]u8{0} ** sha1_digest_len,
+            .next_hashed_owner_name = &@as([sha1_digest_len]u8, @splat(0)),
             .types = .{ .raw = "" },
         },
     };
@@ -773,4 +773,16 @@ test "corpus: every label seed reaches decodeOwnerHash, and the hashes decoded a
     // read as the same 20 bytes as its first 32 — the aliasing the move to
     // `base32` removed (see the "33-character label" regression test).
     try testing.expectEqual(@as(usize, 9), decoded_folded);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

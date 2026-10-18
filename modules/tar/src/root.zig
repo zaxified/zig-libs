@@ -1405,8 +1405,8 @@ fn readAllContent(tr: *Reader, gpa: Allocator) ![]u8 {
 
 test "write -> read round-trip preserves uid/gid/mtime/mode/size/path/link_target" {
     const gpa = testing.allocator;
-    const long_path = "deep/" ** 29 ++ "leaf.txt"; // 153 bytes > 100
-    const long_target = "../" ** 40 ++ "target-far-away"; // 135 bytes > 100
+    const long_path = strRepeat("deep/", 29) ++ "leaf.txt"; // 153 bytes > 100
+    const long_target = strRepeat("../", 40) ++ "target-far-away"; // 135 bytes > 100
 
     var aw: std.Io.Writer.Allocating = .init(gpa);
     defer aw.deinit();
@@ -1492,7 +1492,7 @@ test "next() auto-skips unread content" {
     var aw: std.Io.Writer.Allocating = .init(gpa);
     defer aw.deinit();
     const tw = Writer.init(&aw.writer);
-    try tw.writeEntry(.{ .path = "a.bin" }, "0123456789" ** 100); // 1000 bytes
+    try tw.writeEntry(.{ .path = "a.bin" }, strRepeat("0123456789", 100)); // 1000 bytes
     try tw.writeEntry(.{ .path = "b.txt" }, "b");
     try tw.finish();
 
@@ -1547,7 +1547,7 @@ test "packTarGz into a writer with no buffer of its own (Allocating.init, an unb
     // the GzStage pass-through.
     const gpa = testing.allocator;
     const entries = [_]ContentEntry{
-        .{ .entry = .{ .path = "a.txt", .mode = 0o644, .mtime = 1_600_000_000 }, .content = "hello\n" ** 300 },
+        .{ .entry = .{ .path = "a.txt", .mode = 0o644, .mtime = 1_600_000_000 }, .content = strRepeat("hello\n", 300) },
         .{ .entry = .{ .path = "d", .kind = .dir, .mode = 0o755 } },
     };
     var buffered: std.Io.Writer.Allocating = try .initCapacity(gpa, 4096);
@@ -1572,7 +1572,7 @@ test "packTarGz into a writer with no buffer of its own (Allocating.init, an unb
 
 test "gzip round-trip: packTarGz -> flate.Decompress -> Reader" {
     const gpa = testing.allocator;
-    const long_path = "dir-with-a-rather-long-name/" ** 5 ++ "file.dat"; // 148 bytes
+    const long_path = strRepeat("dir-with-a-rather-long-name/", 5) ++ "file.dat"; // 148 bytes
 
     var aw: std.Io.Writer.Allocating = try .initCapacity(gpa, 4096);
     defer aw.deinit();
@@ -1716,9 +1716,9 @@ test "record helper: the length prefix counts itself" {
     var b: [128]u8 = undefined;
     try testing.expectEqualStrings("8 a=bcd\n", paxRecord(&b, "a", "bcd"));
     try testing.expectEqualStrings("12 path=abc\n", paxRecord(&b, "path", "abc"));
-    try testing.expectEqualStrings("99 k=" ++ "v" ** 93 ++ "\n", paxRecord(&b, "k", "v" ** 93));
+    try testing.expectEqualStrings("99 k=" ++ strRepeat("v", 93) ++ "\n", paxRecord(&b, "k", strRepeat("v", 93)));
     // One byte more and the prefix needs a third digit, which is one more byte again.
-    try testing.expectEqualStrings("101 k=" ++ "v" ** 94 ++ "\n", paxRecord(&b, "k", "v" ** 94));
+    try testing.expectEqualStrings("101 k=" ++ strRepeat("v", 94) ++ "\n", paxRecord(&b, "k", strRepeat("v", 94)));
 }
 
 test "pax 'x' path overrides the header name; unused records are parsed past, padding skipped" {
@@ -1726,7 +1726,7 @@ test "pax 'x' path overrides the header name; unused records are parsed past, pa
     // archive/tar and bsdtar write for a name over 100 bytes: a pax `path`,
     // and a TRUNCATED name in the ustar field. Before 2026-09-30 this reader
     // discarded the pax header and reported the truncated name.
-    const long = "dir/" ** 30 ++ "file.txt"; // 128 bytes
+    const long = strRepeat("dir/", 30) ++ "file.txt"; // 128 bytes
     var rb: [3][256]u8 = undefined;
     const payload = try std.mem.concat(testing.allocator, u8, &.{
         paxRecord(&rb[0], "mtime", "1600000000.123456789"),
@@ -1776,7 +1776,7 @@ test "pax 'x' size overrides the header size (the >8 GiB case), so the stream st
 }
 
 test "pax 'x' linkpath overrides the header link target" {
-    const target = "../" ** 40 ++ "target"; // 126 bytes
+    const target = strRepeat("../", 40) ++ "target"; // 126 bytes
     var rb: [256]u8 = undefined;
     var buf: [8 * block_size]u8 = undefined;
     var dst: std.Io.Writer = .fixed(&buf);
@@ -1839,7 +1839,7 @@ test "pax 'x': an empty value deletes the keyword, falling back to the header fi
 
 test "pax 'x': a malformed or hostile header -> error.BadHeader, never a misread" {
     const cases = [_][]const u8{
-        "30 path=some.attr=value\n" ++ "\x00" ** 6, // length says 30, the record is 24
+        "30 path=some.attr=value\n" ++ strRepeat("\x00", 6), // length says 30, the record is 24
         "11 path=abc", // right length, but no newline
         "x2 path=abc\n", // non-digit length
         " path=abcde\n", // no length
@@ -2251,12 +2251,12 @@ test "writer refuses a numeric field that does not fit, instead of truncating it
     try testing.expectError(error.FieldOutOfRange, tw.writeEntry(.{ .path = "a\x00b" }, ""));
     try testing.expectError(error.FieldOutOfRange, tw.writeEntry(.{ .path = "l", .kind = .symlink, .link_target = "t\x00" }, ""));
     const pw = Writer.initOptions(tw.dst, .{ .long_names = .pax });
-    try testing.expectError(error.FieldOutOfRange, pw.writeEntry(.{ .path = "p" ** 150 ++ "\x00" }, ""));
+    try testing.expectError(error.FieldOutOfRange, pw.writeEntry(.{ .path = strRepeat("p", 150) ++ "\x00" }, ""));
 
     // The refusal happens before any byte is emitted, so a rejected entry
     // leaves no partial header (and no orphan 'L' record) in the stream.
     const after_ok = dst.buffered().len;
-    try testing.expectError(error.FieldOutOfRange, tw.writeEntry(.{ .path = "x" ** 60, .uid = max_octal_8 + 1 }, ""));
+    try testing.expectError(error.FieldOutOfRange, tw.writeEntry(.{ .path = strRepeat("x", 60), .uid = max_octal_8 + 1 }, ""));
     try testing.expectEqual(after_ok, dst.buffered().len);
 }
 
@@ -2464,7 +2464,7 @@ const ArchiveCorpus = struct {
         {
             var w: std.Io.Writer = .fixed(&self.scratch);
             const tw = Writer.init(&w);
-            try tw.writeEntry(.{ .path = "long/" ++ ("n" ** 130) ++ "/f", .mode = 0o644 }, "x");
+            try tw.writeEntry(.{ .path = "long/" ++ (strRepeat("n", 130)) ++ "/f", .mode = 0o644 }, "x");
             try tw.finish();
             self.entries[n] = kit.seedInto(&self.stores[n], w.buffered());
             n += 1;
@@ -2631,7 +2631,7 @@ fn walkArchive(gpa: std.mem.Allocator, bytes: []const u8) void {
     }
 }
 
-const mut_names = [_][]const u8{ "a", "etc/hostname", "tree/", "x/y/z.txt", "long/" ++ ("n" ** 130) ++ "/f" };
+const mut_names = [_][]const u8{ "a", "etc/hostname", "tree/", "x/y/z.txt", "long/" ++ (strRepeat("n", 130)) ++ "/f" };
 
 /// A valid archive from this module's own `Writer`, then damaged: a few
 /// octets flipped, the first header's checksum maybe re-stamped (so the
@@ -2700,7 +2700,7 @@ test "GNU tar --format=pax: a long name arrives through the pax 'x' header (exte
     gpa.free(probe_res.stdout);
     gpa.free(probe_res.stderr);
 
-    const long_dir = "pax-" ** 30; // 120 bytes, no slash: one path component
+    const long_dir = strRepeat("pax-", 30); // 120 bytes, no slash: one path component
     const long_path = long_dir ++ "/f.txt";
     try tmp.dir.createDirPath(io, long_dir);
     try tmp.dir.writeFile(io, .{ .sub_path = long_path, .data = "pax content\n" });
@@ -2740,7 +2740,7 @@ test "GNU tar extracts + lists our archive (external cross-check)" {
     gpa.free(probe_res.stderr);
 
     // Write an archive with our Writer (incl. a >100-byte GNU long name).
-    const long_path = "nested/" ** 16 ++ "deep-file.txt"; // 125 bytes
+    const long_path = strRepeat("nested/", 16) ++ "deep-file.txt"; // 125 bytes
     {
         var f = try tmp.dir.createFile(io, "ours.tar", .{});
         defer f.close(io);
@@ -2824,8 +2824,8 @@ test "GNU tar lists + extracts our pax-mode archive (external cross-check of the
     gpa.free(probe_res.stdout);
     gpa.free(probe_res.stderr);
 
-    const long_path = "p" ** 150; // one component: no prefix split, so a pax `path`
-    const long_target = "t" ** 130;
+    const long_path = strRepeat("p", 150); // one component: no prefix split, so a pax `path`
+    const long_target = strRepeat("t", 130);
     {
         var f = try tmp.dir.createFile(io, "ours-pax.tar", .{});
         defer f.close(io);
@@ -3061,9 +3061,9 @@ test "writer: the ustar name/prefix limits are exact (100 / 155 bytes)" {
     // threshold and in `splitPrefix` (name 101, prefix 156) all survived --
     // the copy into the field silently truncated.
     const cases = [_]struct { path: []const u8, mode: LongNames }{
-        .{ .path = "a" ** 101, .mode = .gnu },
-        .{ .path = "d/" ++ "n" ** 101, .mode = .pax },
-        .{ .path = "p" ** 156 ++ "/n", .mode = .pax },
+        .{ .path = strRepeat("a", 101), .mode = .gnu },
+        .{ .path = "d/" ++ strRepeat("n", 101), .mode = .pax },
+        .{ .path = strRepeat("p", 156) ++ "/n", .mode = .pax },
     };
     for (cases) |c| {
         var abuf: [8 * block_size]u8 = undefined;
@@ -3109,4 +3109,16 @@ test {
     _ = @import("write_golden_test.zig");
     _ = @import("pax_test.zig");
     _ = @import("go_oracle.zig");
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

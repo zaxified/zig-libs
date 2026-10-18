@@ -293,9 +293,9 @@ pub const Lsdb = struct {
     /// forever (the entry itself was never observable this way, since
     /// `FlagIterator` cross-checks against `map` — but the *union* query
     /// was not, before that test).
-    srm_queue: [max_interfaces]FlagQueue = [_]FlagQueue{.empty} ** max_interfaces,
+    srm_queue: [max_interfaces]FlagQueue = @as([max_interfaces]FlagQueue, @splat(.empty)),
     /// SSN counterpart of `srm_queue`. See there.
-    ssn_queue: [max_interfaces]FlagQueue = [_]FlagQueue{.empty} ** max_interfaces,
+    ssn_queue: [max_interfaces]FlagQueue = @as([max_interfaces]FlagQueue, @splat(.empty)),
 
     pub fn init(alloc: std.mem.Allocator, cfg: Config) Lsdb {
         std.debug.assert(cfg.interface_count <= max_interfaces);
@@ -1308,7 +1308,7 @@ test "locally-originated LSP (null arrival) floods every interface, no SSN" {
 test "malformed LSP bytes are a typed error, store unchanged" {
     var db = Lsdb.init(testing.allocator, testCfg());
     defer db.deinit();
-    try testing.expectError(error.BadDiscriminator, db.insert(&([_]u8{0xFF} ** 30), 0, 0));
+    try testing.expectError(error.BadDiscriminator, db.insert(&(@as([30]u8, @splat(0xFF))), 0, 0));
     try testing.expectEqual(@as(usize, 0), db.count());
 }
 

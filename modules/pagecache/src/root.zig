@@ -190,7 +190,7 @@ pub const PageCache = struct {
     epoch: u64 = 0,
     /// Per-handle "last full-page index accessed", a tiny lossy table: a
     /// forgotten handle only costs one missed read-ahead, never correctness.
-    seq: [seq_slots]SeqSlot = [_]SeqSlot{.{}} ** seq_slots,
+    seq: [seq_slots]SeqSlot = @as([seq_slots]SeqSlot, @splat(.{})),
     seq_next: usize = 0,
     /// Files with at least one open handle. Few entries (kvtree holds two), so
     /// lookups by path or id are linear scans; the table never grows with the
@@ -2760,9 +2760,9 @@ const MfModel = struct {
     /// Path -> file. The model is per PATH for names and per FILE (inode) for
     /// bytes, like the backend: a handle follows its file across `rename` and
     /// `delete`, and a name can lead to a different file after either.
-    name: [n_paths]?usize = .{null} ** n_paths,
+    name: [n_paths]?usize = @splat(null),
     used: usize = 0,
-    len: [pool]usize = .{0} ** pool,
+    len: [pool]usize = @splat(0),
     data: [pool][cap]u8 = undefined,
 
     fn write(m: *MfModel, ino: usize, off: usize, bytes: []const u8) void {
@@ -2842,10 +2842,10 @@ fn mfCase(gpa: std.mem.Allocator, seed: u64, reach: *MfReach) !void {
 
     var model = MfModel{};
     // Up to two handles per path (slot k), each bound to the file it opened.
-    var hs: [MfModel.n_paths][2]?MfHandle = .{.{ null, null }} ** MfModel.n_paths;
-    var borrows: [6]?MfBorrow = .{null} ** 6;
+    var hs: [MfModel.n_paths][2]?MfHandle = @splat(.{ null, null });
+    var borrows: [6]?MfBorrow = @splat(null);
     // Which handle slot last wrote each file (for the shared-read reach class).
-    var last_writer: [MfModel.pool]?Storage.Handle = .{null} ** MfModel.pool;
+    var last_writer: [MfModel.pool]?Storage.Handle = @splat(null);
     var full_reads: u64 = 0;
     var ref_ok: u64 = 0;
     defer for (&borrows) |*slot| {

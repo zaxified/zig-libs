@@ -191,7 +191,7 @@ test "max_frame_size above 1 GiB is refused" {
 test "a seek table for frames made elsewhere (FrameLog)" {
     // three ordinary frames, then a table written by hand into a 5-byte
     // buffer at a time
-    const parts = [_][]const u8{ "alpha " ** 50, "beta " ** 70, "gamma " ** 30 };
+    const parts = [_][]const u8{ strRepeat("alpha ", 50), strRepeat("beta ", 70), strRepeat("gamma ", 30) };
     var z: std.ArrayList(u8) = .empty;
     defer z.deinit(gpa);
     var log: seekable.FrameLog = .init(true);
@@ -426,4 +426,16 @@ test "a seek table whose frame sizes disagree with the frames is refused, never 
             }
         }
     }
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

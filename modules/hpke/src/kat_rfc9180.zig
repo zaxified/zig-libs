@@ -715,15 +715,15 @@ pub const a3_auth_psk = struct {
 // ── composition tests (real labeledExtract/labeledExpand, no dhkem/schedule) ──
 
 test "A.1/A.2/A.3 header ids match suite.KemId/KdfId/AeadId" {
-    try testing.expectEqual(@as(u16, @intFromEnum(suite.KemId.dhkem_x25519_hkdf_sha256)), a1.kem_id);
-    try testing.expectEqual(@as(u16, @intFromEnum(suite.KdfId.hkdf_sha256)), a1.kdf_id);
-    try testing.expectEqual(@as(u16, @intFromEnum(suite.AeadId.aes128gcm)), a1.aead_id);
+    try testing.expectEqual(@as(u16, @backingInt(suite.KemId.dhkem_x25519_hkdf_sha256)), a1.kem_id);
+    try testing.expectEqual(@as(u16, @backingInt(suite.KdfId.hkdf_sha256)), a1.kdf_id);
+    try testing.expectEqual(@as(u16, @backingInt(suite.AeadId.aes128gcm)), a1.aead_id);
 
-    try testing.expectEqual(@as(u16, @intFromEnum(suite.KemId.dhkem_x25519_hkdf_sha256)), a2.kem_id);
-    try testing.expectEqual(@as(u16, @intFromEnum(suite.AeadId.chacha20poly1305)), a2.aead_id);
+    try testing.expectEqual(@as(u16, @backingInt(suite.KemId.dhkem_x25519_hkdf_sha256)), a2.kem_id);
+    try testing.expectEqual(@as(u16, @backingInt(suite.AeadId.chacha20poly1305)), a2.aead_id);
 
-    try testing.expectEqual(@as(u16, @intFromEnum(suite.KemId.dhkem_p256_hkdf_sha256)), a3.kem_id);
-    try testing.expectEqual(@as(u16, @intFromEnum(suite.AeadId.aes128gcm)), a3.aead_id);
+    try testing.expectEqual(@as(u16, @backingInt(suite.KemId.dhkem_p256_hkdf_sha256)), a3.kem_id);
+    try testing.expectEqual(@as(u16, @backingInt(suite.AeadId.aes128gcm)), a3.aead_id);
 }
 
 test "A.1.1: enc == pkEm (base-mode DHKEM's enc IS the ephemeral public key, no extra encoding)" {
@@ -958,9 +958,9 @@ test "A.3: P-256 + AES-128-GCM — Encap/Decap + KeySchedule + seq-0 Seal, byte-
 // falling back to HKDF-SHA256. See a4's own doc comment for provenance.
 
 test "A.4 header ids match suite.KemId/KdfId/AeadId (kdf_id is hkdf_sha512, NOT hkdf_sha256)" {
-    try testing.expectEqual(@as(u16, @intFromEnum(suite.KemId.dhkem_p256_hkdf_sha256)), a4.kem_id);
-    try testing.expectEqual(@as(u16, @intFromEnum(suite.KdfId.hkdf_sha512)), a4.kdf_id);
-    try testing.expectEqual(@as(u16, @intFromEnum(suite.AeadId.aes128gcm)), a4.aead_id);
+    try testing.expectEqual(@as(u16, @backingInt(suite.KemId.dhkem_p256_hkdf_sha256)), a4.kem_id);
+    try testing.expectEqual(@as(u16, @backingInt(suite.KdfId.hkdf_sha512)), a4.kdf_id);
+    try testing.expectEqual(@as(u16, @backingInt(suite.AeadId.aes128gcm)), a4.aead_id);
 }
 
 test "A.4: DHKEM(P-256).encapDeterministic/.decap reproduce enc/shared_secret — UNCHANGED by the outer kdf_id" {
@@ -1090,7 +1090,7 @@ test "A.4: sealBaseDeterministic/openBase (Nh=64) reproduce enc + the first ciph
 /// comptime-known, so a psk-less vector never instantiates the `ikmS` path
 /// and vice versa.
 fn driveVector(comptime V: type, comptime Kem: type, comptime Aead: type) !void {
-    const mode: suite.Mode = @enumFromInt(V.mode);
+    const mode: suite.Mode = @fromBackingInt(@intCast(V.mode));
     const is_auth = comptime (mode == .auth or mode == .auth_psk);
     // RFC 9180 §5.1's default_psk/default_psk_id are both "" — a non-psk
     // vector passes the empty string, exactly as VerifyPSKInputs expects.
@@ -1245,7 +1245,7 @@ test "non-base vectors disagree pairwise: mode byte / psk / sender key each chan
 // receives reproduces the RFC" — the thing MLS's external-init/
 // external-commit (RFC 9420 §8.3/§12.4) will call directly.
 fn driveSetupVector(comptime V: type, comptime Kem: type, comptime Aead: type) !void {
-    const mode: suite.Mode = @enumFromInt(V.mode);
+    const mode: suite.Mode = @fromBackingInt(@intCast(V.mode));
     const is_psk = comptime (mode == .psk or mode == .auth_psk);
 
     // RFC 9180 §5.1's default_psk/default_psk_id are both "" (see
@@ -1461,7 +1461,7 @@ test "setupBaseS/setupPskS/setupAuthS/setupAuthPskS: real std.Io random-ephemera
     const Kem = dhkem.X25519Kem;
     const Aead = std.crypto.aead.aes_gcm.Aes128Gcm;
     const info = "hpke setup*S io-path smoke test";
-    const psk = [_]u8{0x42} ** 32;
+    const psk = @as([32]u8, @splat(0x42));
     const psk_id = "psk-id";
 
     var skR: Kem.KeyPair = undefined;

@@ -1233,9 +1233,9 @@ test "SecurityPolicy.uri" {
 }
 
 test "SecurityMode matches services.MessageSecurityMode's wire values" {
-    try testing.expectEqual(@as(u32, 1), @intFromEnum(SecurityMode.none));
-    try testing.expectEqual(@as(u32, 2), @intFromEnum(SecurityMode.sign));
-    try testing.expectEqual(@as(u32, 3), @intFromEnum(SecurityMode.sign_and_encrypt));
+    try testing.expectEqual(@as(u32, 1), @backingInt(SecurityMode.none));
+    try testing.expectEqual(@as(u32, 2), @backingInt(SecurityMode.sign));
+    try testing.expectEqual(@as(u32, 3), @backingInt(SecurityMode.sign_and_encrypt));
 }
 
 test "SecurityLengths.basic256sha256" {
@@ -1390,7 +1390,7 @@ test "deriveKeys: directions differ, deterministic, matches raw P-SHA256 layout"
 }
 
 test "asymmetricEncrypt -> asymmetricDecrypt round-trip (multi-block)" {
-    var prng = std.Random.DefaultCsprng.init([_]u8{7} ** 32);
+    var prng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(7)));
     const random = prng.random();
     var kp: rsa.KeyPair = undefined;
     try rsa.generate(&kp, random, 512, 65537); // k = 64, plain block = 22 -> multi-block fast
@@ -1415,7 +1415,7 @@ test "asymmetricEncrypt -> asymmetricDecrypt round-trip (multi-block)" {
 }
 
 test "asymmetricSign -> asymmetricVerify round-trip + tamper" {
-    var prng = std.Random.DefaultCsprng.init([_]u8{9} ** 32);
+    var prng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(9)));
     const random = prng.random();
     var kp: rsa.KeyPair = undefined;
     try rsa.generate(&kp, random, 512, 65537);
@@ -1515,7 +1515,7 @@ test "symmetricDecryptAndVerify negatives: tampered MAC / body / header, bad pad
 }
 
 test "sealAsymmetricMessage -> openAsymmetricMessage round-trip (two key pairs)" {
-    var prng = std.Random.DefaultCsprng.init([_]u8{5} ** 32);
+    var prng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(5)));
     const random = prng.random();
 
     var client: ClientCredentials = undefined;
@@ -1762,7 +1762,7 @@ test "viewAsymmetricHeader: borrows the three plaintext fields, refuses truncati
 }
 
 test "user identity token secret: encrypt -> decrypt, replayed nonce and wrong key rejected" {
-    var prng = std.Random.DefaultCsprng.init([_]u8{0x21} ** 32);
+    var prng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x21)));
     const random = prng.random();
     var server_kp: rsa.KeyPair = undefined;
     try rsa.generate(&server_kp, random, 512, 65537);
@@ -1808,7 +1808,7 @@ test "user identity token secret: encrypt -> decrypt, replayed nonce and wrong k
 }
 
 test "certificateValidity: notBefore/notAfter come back out of a certificate we built" {
-    var prng = std.Random.DefaultCsprng.init([_]u8{0x33} ** 32);
+    var prng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x33)));
     var creds: ClientCredentials = undefined;
     try ClientCredentials.generateSelfSigned(
         testing.allocator,
@@ -1855,7 +1855,7 @@ test "hostile certificates: truncation, tampering and garbage are typed errors, 
     // bounds test, `end = start + declared_len` with no clamp), and on a
     // server the certificate is entirely attacker-supplied — so the two
     // parsing helpers must be *total*. This is the test that keeps them so.
-    var prng = std.Random.DefaultCsprng.init([_]u8{0x5A} ** 32);
+    var prng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x5A)));
     var creds: ClientCredentials = undefined;
     try ClientCredentials.generateSelfSigned(
         testing.allocator,
@@ -1972,7 +1972,7 @@ fn buildCertificateCorpus(
 /// The credentials both the harness and its guard build their corpus from.
 /// Deterministic PRNG, 512-bit modulus: this is a fixture, not a key.
 fn certificateCorpusCredentials(allocator: std.mem.Allocator, out: *ClientCredentials) !void {
-    var prng = std.Random.DefaultCsprng.init([_]u8{0x5A} ** 32);
+    var prng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x5A)));
     return ClientCredentials.generateSelfSigned(allocator, prng.random(), .{
         .modulus_bits = 512,
         .common_name = "fuzz-corpus",

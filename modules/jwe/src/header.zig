@@ -315,8 +315,8 @@ test "encode + parse round-trip: plain alg/enc" {
 
 test "encode + parse round-trip: GCMKW iv/tag + kid" {
     var buf: [max_header_json_len]u8 = undefined;
-    const iv = [_]u8{1} ** 12;
-    const tag = [_]u8{2} ** 16;
+    const iv = @as([12]u8, @splat(1));
+    const tag = @as([16]u8, @splat(2));
     const json = try encode(&buf, .{
         .alg = "A128GCMKW",
         .enc = "A128GCM",
@@ -336,7 +336,7 @@ test "encode + parse round-trip: GCMKW iv/tag + kid" {
 
 test "encode + parse round-trip: PBES2 p2s/p2c" {
     var buf: [max_header_json_len]u8 = undefined;
-    const salt = [_]u8{9} ** 16;
+    const salt = @as([16]u8, @splat(9));
     const json = try encode(&buf, .{
         .alg = "PBES2-HS256+A128KW",
         .enc = "A128CBC-HS256",
@@ -354,8 +354,8 @@ test "encode + parse round-trip: PBES2 p2s/p2c" {
 
 test "encode + parse round-trip: ECDH-ES epk/apu/apv (EC and OKP shapes)" {
     var buf: [max_header_json_len]u8 = undefined;
-    const x = [_]u8{0xaa} ** 32;
-    const y = [_]u8{0xbb} ** 32;
+    const x = @as([32]u8, @splat(0xaa));
+    const y = @as([32]u8, @splat(0xbb));
     const json = try encode(&buf, .{
         .alg = "ECDH-ES",
         .enc = "A128GCM",
@@ -453,8 +453,8 @@ const header_seeds = [_][]const u8{
     fuzzseed.seed("\x01"), // the PBES2 alg name, no optional members
     fuzzseed.seed("\x02" ++ "\x00\x00\x27\x10"), // ⭐ p2c = 10000, a plausible iteration count
     fuzzseed.seed("\x02" ++ "\xff\xff\xff\xff"), // ⭐ p2c = 4294967295: the `optionalUint` ceiling
-    fuzzseed.seed("\x04" ++ "\x00" ** 8), // ⭐ an 8-octet p2s, the conventional PBES2 salt size
-    fuzzseed.seed("\x04" ++ "\xab" ** 64), // a 64-octet p2s
+    fuzzseed.seed("\x04" ++ strRepeat("\x00", 8)), // ⭐ an 8-octet p2s, the conventional PBES2 salt size
+    fuzzseed.seed("\x04" ++ strRepeat("\xab", 64)), // a 64-octet p2s
     fuzzseed.seed("\x08" ++ "identity-key-1"), // a kid
     fuzzseed.seed("\x10"), // ⭐ an epk, the `optionalEpk` path
     fuzzseed.seed("\x1f" ++ "\x00\x00\x00\x01" ++ "salt-and-kid"), // every optional member at once, PBES2 alg
@@ -623,4 +623,16 @@ test "TEETH: any crit header is refused (RFC 7516 s5.2 step 5)" {
     // everything.
     const ok = try parse(gpa, "{\"alg\":\"dir\",\"enc\":\"A128GCM\"}");
     try std.testing.expectEqual(Alg.dir, ok.alg);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

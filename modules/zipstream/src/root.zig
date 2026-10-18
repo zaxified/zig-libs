@@ -1161,7 +1161,7 @@ fn buildZip64(a: Allocator, name: []const u8, data: []const u8, method: std.zip.
     try buf.appendSlice(a, name);
     {
         var hdr: [4]u8 = undefined;
-        std.mem.writeInt(u16, hdr[0..2], @intFromEnum(std.zip.ExtraHeader.zip64_info), .little);
+        std.mem.writeInt(u16, hdr[0..2], @backingInt(std.zip.ExtraHeader.zip64_info), .little);
         std.mem.writeInt(u16, hdr[2..4], 16, .little);
         try buf.appendSlice(a, &hdr);
         var v64: [8]u8 = undefined;
@@ -1197,7 +1197,7 @@ fn buildZip64(a: Allocator, name: []const u8, data: []const u8, method: std.zip.
     try buf.appendSlice(a, name);
     {
         var hdr: [4]u8 = undefined;
-        std.mem.writeInt(u16, hdr[0..2], @intFromEnum(std.zip.ExtraHeader.zip64_info), .little);
+        std.mem.writeInt(u16, hdr[0..2], @backingInt(std.zip.ExtraHeader.zip64_info), .little);
         std.mem.writeInt(u16, hdr[2..4], 24, .little);
         try buf.appendSlice(a, &hdr);
         var v64: [8]u8 = undefined;
@@ -1338,7 +1338,7 @@ test "EntryReader: streams a stored entry, then a second one (shared cursor)" {
 test "EntryReader: multi-entry archive with Store + Deflate mix" {
     const a = testing.allocator;
     const long_text =
-        "the quick brown fox jumps over the lazy dog, " ** 40; // compresses well
+        strRepeat("the quick brown fox jumps over the lazy dog, ", 40); // compresses well
     const zip = try buildZip(a, &.{
         .{ .name = "stored.txt", .data = "plain stored bytes", .method = .store },
         .{ .name = "deflated.txt", .data = long_text, .method = .deflate },
@@ -1708,7 +1708,7 @@ test "ArchiveWriter: Store + Deflate round-trip through zipstream's own reader, 
     const a = testing.allocator;
 
     const stored_data = "plain stored payload, unmodified bytes end to end";
-    const deflate_data = "the quick brown fox jumps over the lazy dog, " ** 40;
+    const deflate_data = strRepeat("the quick brown fox jumps over the lazy dog, ", 40);
 
     var aw: std.Io.Writer.Allocating = .init(a);
     defer aw.deinit();
@@ -2096,7 +2096,7 @@ test "Archive/EntryReader: zip64 extra fields (per-entry sizes/offset + zip64 EO
 
 test "Archive/EntryReader: zip64 with Deflate-compressed data" {
     const a = testing.allocator;
-    const data = "the quick brown fox jumps over the lazy dog, " ** 60;
+    const data = strRepeat("the quick brown fox jumps over the lazy dog, ", 60);
     const zip = try buildZip64(a, "deflated-big.bin", data, .deflate);
     defer a.free(zip);
 
@@ -2195,7 +2195,7 @@ const ZipCorpus = struct {
         var zw = ArchiveWriter.init(testing.allocator, &base_writer);
         defer zw.deinit();
         try zw.addEntry("a.txt", "hello fuzz world, this member is stored verbatim", .{ .method = .store });
-        try zw.addEntry("b.txt", "hello fuzz world, this member is deflated " ** 20, .{ .method = .deflate });
+        try zw.addEntry("b.txt", strRepeat("hello fuzz world, this member is deflated ", 20), .{ .method = .deflate });
         try zw.finish();
         const good = base_writer.buffered();
 
@@ -2355,7 +2355,7 @@ fn archiveHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!vo
     tryArchiveBytes(gpa, buf[0..len]);
 }
 
-const mut_names = [_][]const u8{ "a.txt", "dir/b.bin", "x/y/z", "long" ** 20 };
+const mut_names = [_][]const u8{ "a.txt", "dir/b.bin", "x/y/z", strRepeat("long", 20) };
 
 /// A valid archive from this module's own `ArchiveWriter`, then damaged: a few
 /// octets flipped, maybe cut short. Random octets never assemble a walkable
@@ -2416,4 +2416,16 @@ test {
     _ = @import("xlsx_fixture_test.zig");
     _ = @import("mtime_test.zig");
     _ = @import("go_oracle.zig");
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

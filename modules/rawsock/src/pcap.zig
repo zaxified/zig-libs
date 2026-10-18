@@ -251,7 +251,7 @@ test "writeHeader + writeRecord reproduce tcpdump's files byte for byte" {
 
 test "Reader: big-endian files, truncation, corrupt lengths, foreign magic" {
     // A big-endian µs header + one 2-byte record captured from a 60-byte frame.
-    const be = [_]u8{ 0xa1, 0xb2, 0xc3, 0xd4, 0, 2, 0, 4 } ++ [_]u8{0} ** 8 ++
+    const be = [_]u8{ 0xa1, 0xb2, 0xc3, 0xd4, 0, 2, 0, 4 } ++ @as([8]u8, @splat(0)) ++
         [_]u8{ 0, 0, 0, 64, 0, 0, 0, 1 } ++
         [_]u8{ 0, 0, 0, 10, 0, 0, 0, 5, 0, 0, 0, 2, 0, 0, 0, 60, 0xab, 0xcd };
     var r = try Reader.init(&be);
@@ -269,7 +269,7 @@ test "Reader: big-endian files, truncation, corrupt lengths, foreign magic" {
     var r3 = try Reader.init(be[0 .. be.len - 1]);
     try testing.expectError(error.Truncated, r3.next());
     // pcapng's section-header magic is not a pcap file.
-    try testing.expectError(error.BadMagic, Reader.init(&([_]u8{ 0x0a, 0x0d, 0x0d, 0x0a } ++ [_]u8{0} ** 20)));
+    try testing.expectError(error.BadMagic, Reader.init(&([_]u8{ 0x0a, 0x0d, 0x0d, 0x0a } ++ @as([20]u8, @splat(0)))));
     var v1 = be;
     v1[5] = 1; // major version 1
     try testing.expectError(error.UnsupportedVersion, Reader.init(&v1));

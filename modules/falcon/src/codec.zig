@@ -346,7 +346,7 @@ test "comp encode/decode round-trip; minus-zero and junk padding rejected" {
 
     // "-0": sign bit set, zero mantissa, immediate stop bit -> 1000_0000 1...
     // First coefficient encoded as sign=1, low7=0, then unary stop "1".
-    var mz = [_]u8{ 0x80, 0x80 } ++ [_]u8{0} ** 16;
+    var mz = [_]u8{ 0x80, 0x80 } ++ @as([16]u8, @splat(0));
     try std.testing.expectError(error.InvalidEncoding, compDecode(&back, &mz));
 
     // Out-of-range coefficient rejected by the encoder.
@@ -358,8 +358,8 @@ test "hashToPoint: deterministic, all points < q, nonce-sensitive" {
     var c1: poly.Poly = undefined;
     var c2: poly.Poly = undefined;
     var c3: poly.Poly = undefined;
-    const nonce1 = [_]u8{0xab} ** 40;
-    const nonce2 = [_]u8{0xac} ** 40;
+    const nonce1 = @as([40]u8, @splat(0xab));
+    const nonce2 = @as([40]u8, @splat(0xac));
     hashToPoint(&nonce1, "falcon", &c1);
     hashToPoint(&nonce1, "falcon", &c2);
     hashToPoint(&nonce2, "falcon", &c3);
@@ -437,7 +437,7 @@ test "Falcon-1024 codec: comp encode/decode round-trip; minus-zero rejected" {
     try std.testing.expectError(error.InvalidEncoding, Codec1024.compDecode(&back, buf[0 .. len + 1]));
     try std.testing.expectError(error.InvalidEncoding, Codec1024.compDecode(&back, buf[0 .. len - 1]));
 
-    var mz = [_]u8{ 0x80, 0x80 } ++ [_]u8{0} ** 16;
+    var mz = [_]u8{ 0x80, 0x80 } ++ @as([16]u8, @splat(0));
     try std.testing.expectError(error.InvalidEncoding, Codec1024.compDecode(&back, &mz));
 }
 
@@ -445,8 +445,8 @@ test "Falcon-1024 codec: hashToPoint deterministic, all points < q, nonce-sensit
     var c1: poly.Ring1024.Poly = undefined;
     var c2: poly.Ring1024.Poly = undefined;
     var c3: poly.Ring1024.Poly = undefined;
-    const nonce1 = [_]u8{0xab} ** 40;
-    const nonce2 = [_]u8{0xac} ** 40;
+    const nonce1 = @as([40]u8, @splat(0xab));
+    const nonce2 = @as([40]u8, @splat(0xac));
     Codec1024.hashToPoint(&nonce1, "falcon", &c1);
     Codec1024.hashToPoint(&nonce1, "falcon", &c2);
     Codec1024.hashToPoint(&nonce2, "falcon", &c3);

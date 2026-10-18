@@ -313,7 +313,7 @@ const huff_tree: [513]HuffNode = buildHuffTree();
 
 fn buildHuffTree() [513]HuffNode {
     @setEvalBranchQuota(200_000);
-    var nodes = [_]HuffNode{.{ .next = .{ 0, 0 }, .sym = -1 }} ** 513;
+    var nodes = @as([513]HuffNode, @splat(.{ .next = .{ 0, 0 }, .sym = -1 }));
     var n_nodes: u16 = 1;
     for (huff_codes, 0..) |hc, sym| {
         var node: u16 = 0;
@@ -1431,7 +1431,7 @@ test "huffman: EOS and padding rules" {
     // Output cap (decompression-bomb guard).
     var enc: std.ArrayList(u8) = .empty;
     defer enc.deinit(gpa);
-    try huffmanEncode(gpa, &enc, "0" ** 100);
+    try huffmanEncode(gpa, &enc, strRepeat("0", 100));
     try testing.expectError(error.HeaderListTooLarge, huffmanDecodeAlloc(gpa, enc.items, 99));
 }
 
@@ -1740,7 +1740,7 @@ test "decoder: header-list size limit bounds memory" {
     defer out.deinit(gpa);
     try enc.encodeBlock(&.{
         .{ .name = "x-a", .value = "ok" },
-        .{ .name = "x-large", .value = "0123456789" ** 10 },
+        .{ .name = "x-large", .value = strRepeat("0123456789", 10) },
     }, &out);
 
     // Large enough limit: fine.
@@ -1776,10 +1776,10 @@ test "dynamic table: oversized entry clears the table (§4.4)" {
     try testing.expectEqual(@as(usize, 1), dec.dynamicTableCount());
 
     out.clearRetainingCapacity();
-    try enc.encodeBlock(&.{.{ .name = "x-big", .value = "0123456789" ** 8 }}, &out);
+    try enc.encodeBlock(&.{.{ .name = "x-big", .value = strRepeat("0123456789", 8) }}, &out);
     hl = try dec.decodeBlock(out.items);
     defer hl.deinit(gpa);
-    try expectFields(hl, &.{.{ .name = "x-big", .value = "0123456789" ** 8 }});
+    try expectFields(hl, &.{.{ .name = "x-big", .value = strRepeat("0123456789", 8) }});
     try testing.expectEqual(@as(usize, 0), enc.dynamicTableCount());
     try testing.expectEqual(@as(usize, 0), dec.dynamicTableCount());
     try testing.expectEqual(@as(usize, 0), dec.dynamicTableSize());
@@ -2411,4 +2411,16 @@ test "sensitive fields: default_sensitive = false indexes credentials like any f
     try enc.encodeBlock(&.{.{ .name = "authorization", .value = "Basic dXNlcjpwYXNz" }}, &out);
     try testing.expectEqual(@as(u8, 0x40), out.items[0] & 0xc0);
     try testing.expectEqual(@as(usize, 1), enc.dynamicTableCount());
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

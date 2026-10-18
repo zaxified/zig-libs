@@ -218,8 +218,8 @@ test "exp/log round-trip (table self-consistency)" {
 /// below, as a from-scratch cross-check that the transcribed tables
 /// really are `poly`'s exp/log tables and not a transcription slip.
 fn generateTables() struct { exp: [258]u16, log: [256]u16 } {
-    var e: [258]u16 = [_]u16{0} ** 258;
-    var l: [256]u16 = [_]u16{0} ** 256;
+    var e: [258]u16 = @as([258]u16, @splat(0));
+    var l: [256]u16 = @as([256]u16, @splat(0));
     var elt: u16 = 1;
     for (0..255) |i| {
         e[i] = elt;

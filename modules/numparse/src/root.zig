@@ -482,7 +482,7 @@ test "parse: signs, accounting negatives, percent and exponent" {
     try expectParse(null, "1.5E12345", o);
     // An exponent long enough to overflow i64 is refused by the digit cap,
     // not accumulated (mutation 2026-10-04: without the cap this panicked).
-    try expectParse(null, "1E" ++ "9" ** 25, o);
+    try expectParse(null, "1E" ++ strRepeat("9", 25), o);
     try expectParse(null, "1.5E3", .{}); // off by default
     o.percent = true;
     try expectParse("15", "1.5E3%", o); // the percent folds into the exponent
@@ -512,7 +512,7 @@ test "parse: exact past f64, and out of range is null" {
     // Beyond Decimal's ≈1.7e26 range.
     try expectParse(null, "999,999,999,999,999,999,999,999,999", .{});
     // A normalized form longer than the internal buffer is refused, not cut.
-    try expectParse(null, "1" ++ "0" ** 120, .{});
+    try expectParse(null, "1" ++ strRepeat("0", 120), .{});
 }
 
 test "parse agrees with parseGroupedNumber where both apply" {
@@ -542,4 +542,16 @@ test "parse agrees with parseGroupedNumber where both apply" {
         compared += 1;
     }
     try testing.expect(compared > 15_000);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

@@ -807,7 +807,7 @@ test "differential: aeadSeal/aeadOpen are byte-identical under chachapoly and st
 }
 
 test "header codec round-trips; fromBytes rejects wrong length" {
-    const h: Header = .{ .dh = [_]u8{0xAB} ** 32, .pn = 7, .n = 42 };
+    const h: Header = .{ .dh = @as([32]u8, @splat(0xAB)), .pn = 7, .n = 42 };
     const bytes = h.toBytes();
     try testing.expectEqual(@as(usize, 40), bytes.len);
     const back = try Header.fromBytes(&bytes);
@@ -816,11 +816,11 @@ test "header codec round-trips; fromBytes rejects wrong length" {
     try testing.expectEqualSlices(u8, &h.dh, &back.dh);
     // Truncated / oversized headers fail closed (parse error).
     try testing.expectError(error.InvalidHeader, Header.fromBytes(bytes[0..39]));
-    try testing.expectError(error.InvalidHeader, Header.fromBytes(&([_]u8{0} ** 41)));
+    try testing.expectError(error.InvalidHeader, Header.fromBytes(&(@as([41]u8, @splat(0)))));
 }
 
 test "KDF_CK uses distinct 0x01/0x02 constants (MK != CK', both != input)" {
-    const ck: [32]u8 = [_]u8{0x11} ** 32;
+    const ck: [32]u8 = @as([32]u8, @splat(0x11));
     const step = kdfCk(ck);
     try testing.expect(!std.mem.eql(u8, &step.mk, &step.ck));
     try testing.expect(!std.mem.eql(u8, &step.mk, &ck));
@@ -945,7 +945,7 @@ test "MAX_SKIP: a header claiming a huge N is rejected without OOM" {
 
     // Forge a header in the SAME chain but far beyond max_skip.
     const forged: Header = .{ .dh = bob.dhr.?, .pn = 0, .n = max_skip + 2 };
-    var dummy_ct: [tag_length + 4]u8 = [_]u8{0} ** (tag_length + 4);
+    var dummy_ct: [tag_length + 4]u8 = @as([tag_length + 4]u8, @splat(0));
     try testing.expectError(
         error.TooManySkippedMessages,
         bob.decrypt(alloc, forged, &dummy_ct, io),
@@ -1111,16 +1111,16 @@ const fuzzseed = @import("testkit").fuzz;
 /// seeds are 40 octets unless they are deliberately testing the gate itself.
 const header_seeds = [_][]const u8{
     fuzzseed.seedHex(""), // the empty slice: exactly what the collapsed draw ran, for ever
-    fuzzseed.seedHex("00" ** 40), // all zeroes: a valid header naming dh = 0, pn = 0, n = 0
-    fuzzseed.seedHex("ff" ** 40), // ⭐ pn and n both 0xffffffff — the far end of `skipMessageKeys`'s arithmetic
-    fuzzseed.seedHex("00" ** 32 ++ "00000000" ++ "01000000"), // n = 1, little-endian
-    fuzzseed.seedHex("00" ** 32 ++ "01000000" ++ "00000000"), // pn = 1, n = 0
-    fuzzseed.seedHex("00" ** 32 ++ "e8030000" ++ "e8030000"), // ⭐ pn = n = 1000 = `max_skip` exactly
-    fuzzseed.seedHex("00" ** 32 ++ "e9030000" ++ "e9030000"), // ⭐ 1001: one past `max_skip`
-    fuzzseed.seedHex("09" ** 32 ++ "ffffffff" ++ "00000000"), // pn saturated, n zero
-    fuzzseed.seedHex("00" ** 39), // 39 octets: one short of the gate
-    fuzzseed.seedHex("00" ** 41), // 41 octets: one over
-    fuzzseed.seedHex("00" ** 48), // the whole buffer, well over the gate
+    fuzzseed.seedHex(strRepeat("00", 40)), // all zeroes: a valid header naming dh = 0, pn = 0, n = 0
+    fuzzseed.seedHex(strRepeat("ff", 40)), // ⭐ pn and n both 0xffffffff — the far end of `skipMessageKeys`'s arithmetic
+    fuzzseed.seedHex(strRepeat("00", 32) ++ "00000000" ++ "01000000"), // n = 1, little-endian
+    fuzzseed.seedHex(strRepeat("00", 32) ++ "01000000" ++ "00000000"), // pn = 1, n = 0
+    fuzzseed.seedHex(strRepeat("00", 32) ++ "e8030000" ++ "e8030000"), // ⭐ pn = n = 1000 = `max_skip` exactly
+    fuzzseed.seedHex(strRepeat("00", 32) ++ "e9030000" ++ "e9030000"), // ⭐ 1001: one past `max_skip`
+    fuzzseed.seedHex(strRepeat("09", 32) ++ "ffffffff" ++ "00000000"), // pn saturated, n zero
+    fuzzseed.seedHex(strRepeat("00", 39)), // 39 octets: one short of the gate
+    fuzzseed.seedHex(strRepeat("00", 41)), // 41 octets: one over
+    fuzzseed.seedHex(strRepeat("00", 48)), // the whole buffer, well over the gate
     fuzzseed.seedHex("2a"), // a single octet
 };
 
@@ -1184,22 +1184,22 @@ const decrypt_buf_len = Header.encoded_length + 256;
 /// `dhRatchet` refuses it with `error.IdentityElement` before the skip
 /// counters are ever consulted — a corpus of zero headers cannot reach
 /// `skipMessageKeys` at all, which is exactly what the measurement showed.
-const base_point_hex = "09" ++ "00" ** 31;
+const base_point_hex = "09" ++ strRepeat("00", 31);
 
 const decrypt_seeds = [_][]const u8{
     fuzzseed.seedHex(""), // exactly what the collapsed draws ran: a zero header and an empty ciphertext
-    fuzzseed.seedHex("00" ** 40 ++ "00" ** 16), // a bare 16-octet Poly1305 tag, zero plaintext length
-    fuzzseed.seedHex("00" ** 40 ++ "ff" ** 16), // the same length, all-ones tag
-    fuzzseed.seedHex("00" ** 40 ++ "00" ** 15), // ⭐ one octet SHORT of a tag: the truncation branch of `aeadOpen`
-    fuzzseed.seedHex("00" ** 32 ++ "00000000" ++ "01000000" ++ "41" ** 32), // n = 1: one key skipped before the open
-    fuzzseed.seedHex(base_point_hex ++ "00000000" ++ "e8030000" ++ "41" ** 32), // ⭐ n = 1000 = `max_skip`: the largest skip that is allowed
-    fuzzseed.seedHex(base_point_hex ++ "00000000" ++ "e9030000" ++ "41" ** 32), // ⭐ n = 1001: one past `max_skip` → `TooManySkippedMessages`
-    fuzzseed.seedHex("00" ** 32 ++ "ffffffff" ++ "ffffffff" ++ "41" ** 32), // both counters saturated
-    fuzzseed.seedHex(base_point_hex ++ "00000000" ++ "00000000" ++ "41" ** 32), // ⭐ a usable `dh`: the DH ratchet actually steps, instead of failing on an identity element
-    fuzzseed.seedHex(base_point_hex ++ "01000000" ++ "02000000" ++ "41" ** 32), // a ratchet step that also skips in the previous chain
-    fuzzseed.seedHex("00" ** 40 ++ "41" ** 256), // the ciphertext filling the buffer
-    fuzzseed.seedHex("00" ** 40), // header only: a zero-length ciphertext, which cannot even hold a tag
-    fuzzseed.seedHex("ff" ** 40 ++ "00" ** 16), // an all-ones header
+    fuzzseed.seedHex(strRepeat("00", 40) ++ strRepeat("00", 16)), // a bare 16-octet Poly1305 tag, zero plaintext length
+    fuzzseed.seedHex(strRepeat("00", 40) ++ strRepeat("ff", 16)), // the same length, all-ones tag
+    fuzzseed.seedHex(strRepeat("00", 40) ++ strRepeat("00", 15)), // ⭐ one octet SHORT of a tag: the truncation branch of `aeadOpen`
+    fuzzseed.seedHex(strRepeat("00", 32) ++ "00000000" ++ "01000000" ++ strRepeat("41", 32)), // n = 1: one key skipped before the open
+    fuzzseed.seedHex(base_point_hex ++ "00000000" ++ "e8030000" ++ strRepeat("41", 32)), // ⭐ n = 1000 = `max_skip`: the largest skip that is allowed
+    fuzzseed.seedHex(base_point_hex ++ "00000000" ++ "e9030000" ++ strRepeat("41", 32)), // ⭐ n = 1001: one past `max_skip` → `TooManySkippedMessages`
+    fuzzseed.seedHex(strRepeat("00", 32) ++ "ffffffff" ++ "ffffffff" ++ strRepeat("41", 32)), // both counters saturated
+    fuzzseed.seedHex(base_point_hex ++ "00000000" ++ "00000000" ++ strRepeat("41", 32)), // ⭐ a usable `dh`: the DH ratchet actually steps, instead of failing on an identity element
+    fuzzseed.seedHex(base_point_hex ++ "01000000" ++ "02000000" ++ strRepeat("41", 32)), // a ratchet step that also skips in the previous chain
+    fuzzseed.seedHex(strRepeat("00", 40) ++ strRepeat("41", 256)), // the ciphertext filling the buffer
+    fuzzseed.seedHex(strRepeat("00", 40)), // header only: a zero-length ciphertext, which cannot even hold a tag
+    fuzzseed.seedHex(strRepeat("ff", 40) ++ strRepeat("00", 16)), // an all-ones header
 };
 
 test "fuzz: decrypt (wire header+ciphertext) never panics on arbitrary bytes" {
@@ -1404,4 +1404,16 @@ test "interop: this module's own KDF_RK info is a pinned literal, and is NOT lib
     const ours = kdfRk(hex32(rr.rk), hex32(rr.dh_recv));
     try testing.expect(!std.mem.eql(u8, &ours.rk, &hex32(rr.rk1)));
     try testing.expect(!std.mem.eql(u8, &ours.ck, &hex32(rr.ckr)));
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

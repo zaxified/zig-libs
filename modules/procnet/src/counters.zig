@@ -819,7 +819,7 @@ test "CpuTimes: steal counts in total; unchanged busy time over elapsed idle is 
 
 test "parseDiskstats: a 32-byte name is kept, 33 is not; a 16-counter row has no flush group" {
     const gpa = testing.allocator;
-    const name32 = "n" ** 32;
+    const name32 = strRepeat("n", 32);
     const text = "8 0 " ++ name32 ++ " 1 2 3 4 5 6 7 8 9 10 11\n" ++
         "8 1 " ++ name32 ++ "x 1 2 3 4 5 6 7 8 9 10 11\n" ++
         "8 2 sdc 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16\n";
@@ -830,4 +830,16 @@ test "parseDiskstats: a 32-byte name is kept, 33 is not; a 16-counter row has no
     try testing.expectEqualStrings("sdc", ds[1].name());
     try testing.expect(ds[1].discard != null);
     try testing.expect(ds[1].flush == null);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

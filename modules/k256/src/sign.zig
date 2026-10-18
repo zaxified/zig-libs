@@ -43,7 +43,7 @@ fn taggedHash(comptime tag: []const u8, parts: []const []const u8) [32]u8 {
 /// `int(bytes32) mod n` — reduce a 32-byte value into the scalar field (a
 /// 32-byte hash can exceed `n`, so a plain `fromBytes` would wrongly reject it).
 fn reduceToScalar(bytes32: [32]u8) Scalar {
-    var wide = [_]u8{0} ** 48;
+    var wide = @as([48]u8, @splat(0));
     wide[16..48].* = bytes32;
     return Scalar.fromBytes48(wide, .big);
 }
@@ -255,7 +255,7 @@ test "ecdsaVerify: the 00 (point at infinity) public key verifies nothing, not e
     var h: [32]u8 = undefined;
     Sha256.hash(msg, &h, .{});
     const e = reduceToScalar(h);
-    const k = try Scalar.fromBytes([_]u8{0} ** 31 ++ [_]u8{7}, .big);
+    const k = try Scalar.fromBytes(@as([31]u8, @splat(0)) ++ [_]u8{7}, .big);
     const R = try Secp256k1.combMulBase(k.toBytes(.big), .big);
     const r = reduceToScalar(R.affineCoordinates().x.toBytes(.big));
     const s = e.mul(k.invert());
@@ -305,10 +305,10 @@ const Bip340Corpus = struct {
     }
 
     fn build(self: *Bip340Corpus) []const []const u8 {
-        const sk = [_]u8{0} ** 31 ++ [_]u8{1};
+        const sk = @as([31]u8, @splat(0)) ++ [_]u8{1};
         const pk = Secp256k1.basePoint.affineCoordinates().x.toBytes(.big);
-        const msg = [_]u8{0xAB} ** 32;
-        const sig = bip340Sign(&sk, &msg, [_]u8{0} ** 32) catch unreachable;
+        const msg = @as([32]u8, @splat(0xAB));
+        const sig = bip340Sign(&sk, &msg, @as([32]u8, @splat(0))) catch unreachable;
         self.push(pk, sig, &msg); // a real signature over a real key
         var flipped = sig;
         flipped[63] ^= 0x01; // one octet in `s`: still parses, fails the equation

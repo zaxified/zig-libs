@@ -75,7 +75,7 @@ test "DERIVED: the recorded answers reconstruct the recorded record" {
             try std.testing.expectEqualSlices(u8, v.db[at..][0..v.record_len], &rec);
         } else {
             // in-domain but unpopulated index: the base layer reconstructs zeros
-            try std.testing.expectEqualSlices(u8, &[_]u8{0} ** v.record_len, &rec);
+            try std.testing.expectEqualSlices(u8, &@as([v.record_len]u8, @splat(0)), &rec);
         }
     }
 }

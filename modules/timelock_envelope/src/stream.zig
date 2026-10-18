@@ -308,23 +308,23 @@ test "deriveStreamKey matches an independent Python HKDF recomputation" {
     // Python hmac/hashlib, 2026-10-06: HKDF-SHA256(salt = stream_kdf_salt,
     // ikm = 0xA1^16 || 0xB2^32, info = "TLE2-stream-key" || 0x02 || 0x10 ||
     // be64(42) || 0xC3^32), 32 octets.
-    const k = deriveStreamKeyV([_]u8{0xA1} ** 16, [_]u8{0xB2} ** 32, 16, 42, [_]u8{0xC3} ** 32);
+    const k = deriveStreamKeyV(@as([16]u8, @splat(0xA1)), @as([32]u8, @splat(0xB2)), 16, 42, @as([32]u8, @splat(0xC3)));
     var want: [32]u8 = undefined;
     _ = try std.fmt.hexToBytes(&want, "01c4b91de51f4744107c149831848382412854ed7747b20f9130711bbbeaa44d");
     try testing.expectEqualSlices(u8, &want, &k);
 }
 
 test "deriveStreamKey: each input separates the key, and it never equals version 1's" {
-    const base = deriveStreamKeyV([_]u8{0xA1} ** 16, [_]u8{0xB2} ** 32, 16, 42, [_]u8{0xC3} ** 32);
+    const base = deriveStreamKeyV(@as([16]u8, @splat(0xA1)), @as([32]u8, @splat(0xB2)), 16, 42, @as([32]u8, @splat(0xC3)));
     const variants = [_][32]u8{
-        deriveStreamKeyV([_]u8{0} ** 16, [_]u8{0xB2} ** 32, 16, 42, [_]u8{0xC3} ** 32),
-        deriveStreamKeyV([_]u8{0xA1} ** 16, [_]u8{0} ** 32, 16, 42, [_]u8{0xC3} ** 32),
-        deriveStreamKeyV([_]u8{0xA1} ** 16, [_]u8{0xB2} ** 32, 32, 42, [_]u8{0xC3} ** 32),
-        deriveStreamKeyV([_]u8{0xA1} ** 16, [_]u8{0xB2} ** 32, 16, 43, [_]u8{0xC3} ** 32),
-        deriveStreamKeyV([_]u8{0xA1} ** 16, [_]u8{0xB2} ** 32, 16, 42, [_]u8{0xC4} ** 32),
+        deriveStreamKeyV(@as([16]u8, @splat(0)), @as([32]u8, @splat(0xB2)), 16, 42, @as([32]u8, @splat(0xC3))),
+        deriveStreamKeyV(@as([16]u8, @splat(0xA1)), @as([32]u8, @splat(0)), 16, 42, @as([32]u8, @splat(0xC3))),
+        deriveStreamKeyV(@as([16]u8, @splat(0xA1)), @as([32]u8, @splat(0xB2)), 32, 42, @as([32]u8, @splat(0xC3))),
+        deriveStreamKeyV(@as([16]u8, @splat(0xA1)), @as([32]u8, @splat(0xB2)), 16, 43, @as([32]u8, @splat(0xC3))),
+        deriveStreamKeyV(@as([16]u8, @splat(0xA1)), @as([32]u8, @splat(0xB2)), 16, 42, @as([32]u8, @splat(0xC4))),
         blk: {
             var k: envelope.DerivedKeys = undefined;
-            envelope.deriveKeys(&k, &([_]u8{0xA1} ** 16), &([_]u8{0xB2} ** 32), 16, 42);
+            envelope.deriveKeys(&k, &(@as([16]u8, @splat(0xA1))), &(@as([32]u8, @splat(0xB2))), 16, 42);
             break :blk k.key;
         },
     };

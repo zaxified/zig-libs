@@ -50,7 +50,7 @@ pub const Kind = enum(u8) {
 
 pub fn kindFromByte(b: u8) ?Kind {
     inline for (@typeInfo(Kind).@"enum".fields) |f| {
-        if (b == f.value) return @enumFromInt(f.value);
+        if (b == f.value) return @fromBackingInt(@intCast(f.value));
     }
     return null;
 }
@@ -133,7 +133,7 @@ pub fn codecError(err: anytype) MessageError {
 /// `kind || body` in a fresh buffer.
 pub fn frame(allocator: std.mem.Allocator, kind: Kind, body: []const u8) std.mem.Allocator.Error![]u8 {
     const out = try allocator.alloc(u8, 1 + body.len);
-    out[0] = @intFromEnum(kind);
+    out[0] = @backingInt(kind);
     @memcpy(out[1..], body);
     return out;
 }
@@ -158,9 +158,9 @@ test "kindFromByte covers exactly the declared kinds" {
     var b: usize = 0;
     while (b < 256) : (b += 1) {
         if (kindFromByte(@intCast(b))) |k| {
-            try std.testing.expectEqual(@as(u8, @intCast(b)), @intFromEnum(k));
+            try std.testing.expectEqual(@as(u8, @intCast(b)), @backingInt(k));
             known += 1;
         }
     }
-    try std.testing.expectEqual(@typeInfo(Kind).@"enum".fields.len, known);
+    try std.testing.expectEqual(@typeInfo(Kind).@"enum".field_names.len, known);
 }

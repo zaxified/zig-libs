@@ -185,7 +185,7 @@ pub fn validate(
 ) ValidateError!ValidationResult {
     if (rrset.len == 0) return .bogus;
     if (!rrsigTimeValid(rrsig, opts.now)) return .bogus;
-    if (rrsig.type_covered != @intFromEnum(rrset[0].ty)) return .bogus;
+    if (rrsig.type_covered != @backingInt(rrset[0].ty)) return .bogus;
     if (!dnskey.isZoneKey()) return .bogus;
     // The key is decoded per `dnskey.algorithm` but the signature is verified
     // per `rrsig.algorithm`; `keys.verifySignature` then reads the field of the
@@ -302,7 +302,7 @@ test "regression: algorithm-mismatched DNSKEY/RRSIG is rejected, not union-confu
     const owner = "example.com";
     const rrset = [_]dns.Record{.{
         .name = owner,
-        .ty = @enumFromInt(rdata.rr_type.dnskey),
+        .ty = @fromBackingInt(@intCast(rdata.rr_type.dnskey)),
         .class = .in,
         .ttl = 3600,
         .data = .{ .unknown = &raw },
@@ -316,7 +316,7 @@ test "regression: algorithm-mismatched DNSKEY/RRSIG is rejected, not union-confu
         .inception = 0,
         .key_tag = 0,
         .signer_name = owner,
-        .signature = &[_]u8{0} ** 64,
+        .signature = &@as([64]u8, @splat(0)),
     };
     const anchor: chain.TrustAnchor = .{ .dnskey_rdata = &raw };
     const r = try validate(testing.allocator, &rrset, rrsig, owner, dnskey, anchor, .{ .now = 1000 });
@@ -360,11 +360,11 @@ test "regression: validate does not bind rrsig.signer_name to owner_name (audit 
         .inception = 0,
         .key_tag = rdata.keyTag(&raw, dnskey.algorithm),
         .signer_name = "example.com", // attacker's own zone, NOT victim.org
-        .signature = &[_]u8{0} ** 64,
+        .signature = &@as([64]u8, @splat(0)),
     };
     const rrset = [_]dns.Record{.{
         .name = owner,
-        .ty = @enumFromInt(16),
+        .ty = @fromBackingInt(@intCast(16)),
         .class = .in,
         .ttl = 3600,
         .data = .{ .unknown = "pwned" },
@@ -420,11 +420,11 @@ test "regression: rrsig.labels greater than the owner's own label count is rejec
         .inception = 0,
         .key_tag = rdata.keyTag(&raw, dnskey.algorithm),
         .signer_name = "example.com",
-        .signature = &[_]u8{0} ** 64,
+        .signature = &@as([64]u8, @splat(0)),
     };
     const rrset = [_]dns.Record{.{
         .name = owner,
-        .ty = @enumFromInt(16),
+        .ty = @fromBackingInt(@intCast(16)),
         .class = .in,
         .ttl = 3600,
         .data = .{ .unknown = "x" },

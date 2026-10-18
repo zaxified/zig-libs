@@ -91,7 +91,7 @@ const Hits = struct {
 };
 
 test "parse oracle: what is an address, as glibc inet_pton decides" {
-    var seen = [_]bool{false} ** parse_divergences.len;
+    var seen = @as([parse_divergences.len]bool, @splat(false));
     const h: Hits = .{ .seen = &seen };
     var bad: usize = 0;
     for (vectors.literals) |l| {
@@ -130,7 +130,7 @@ test "parse oracle: canonical text, as glibc inet_ntop prints it" {
 }
 
 test "parse oracle: prefixes, as Python ip_network(strict=False) reads them" {
-    var seen = [_]bool{false} ** prefix_divergences.len;
+    var seen = @as([prefix_divergences.len]bool, @splat(false));
     const h: Hits = .{ .seen = &seen };
     var bad: usize = 0;
     for (vectors.prefixes) |c| {

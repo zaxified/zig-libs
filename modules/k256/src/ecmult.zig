@@ -205,7 +205,7 @@ pub fn wnafDigits(comptime w: u5, h: GlvHalf) [wnaf_len]i16 {
     comptime std.debug.assert(w >= 2 and w <= 15);
     const full: u32 = 1 << w;
     const half: i32 = 1 << (w - 1);
-    var e = [_]i16{0} ** wnaf_len;
+    var e = @as([wnaf_len]i16, @splat(0));
     var v = h.mag;
     var i: usize = 0;
     while (v != 0) : (i += 1) {
@@ -440,7 +440,7 @@ test "ecmult: G tables are the affine odd multiples of G and φ(G)" {
     }
 }
 
-const ecmult_random_iters: usize = if (builtin.mode == .Debug) 60 else 600;
+const ecmult_random_iters: usize = if (builtin.mode == .debug) 60 else 600;
 
 test "ecmult: s1·G + s2·P == double-and-add oracle, random scalars and points" {
     var prng = std.Random.DefaultPrng.init(0xEC_3017_0001);
@@ -574,7 +574,7 @@ fn expectMultiSame(g: u256, pts: []const Secp256k1, ss: []const u256) !void {
     }
 }
 
-const multi_random_iters: usize = if (builtin.mode == .Debug) 12 else 120;
+const multi_random_iters: usize = if (builtin.mode == .debug) 12 else 120;
 
 test "ecmult: mulMultiG == Σ double-and-add, 1..16 random points, z ≠ 1 and duplicates" {
     var prng = std.Random.DefaultPrng.init(0xEC_3017_0002);
@@ -651,7 +651,7 @@ test "ecmult: Secp256k1.mulMultiBasePublic chunks past multi_max_points; empty a
     try std.testing.expectEqual(g_want.x.toInt(), g_only.x.toInt());
     // An identity base, and an identity sum, are both `error.IdentityElement`.
     try std.testing.expectError(error.IdentityElement, Secp256k1.mulMultiBasePublic(gb, &.{ pts[0], Secp256k1.identityElement }, sb[0..2], .big));
-    const zero = [_]u8{0} ** 32;
+    const zero = @as([32]u8, @splat(0));
     try std.testing.expectError(error.IdentityElement, Secp256k1.mulMultiBasePublic(zero, &.{ pts[0], pts[0].neg() }, &.{ sb[0], sb[0] }, .big));
 }
 

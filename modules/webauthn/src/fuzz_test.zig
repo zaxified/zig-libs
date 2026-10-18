@@ -47,10 +47,10 @@ pub fn damage(src: anytype, buf: []u8, frame: []const u8) usize {
 /// Reach counters for one harness file's labels (see jwt's fuzz_test.zig).
 pub fn Marker(comptime Label: type) type {
     return struct {
-        var counts: [@typeInfo(Label).@"enum".fields.len]usize = @splat(0);
+        var counts: [@typeInfo(Label).@"enum".field_names.len]usize = @splat(0);
 
         pub fn mark(comptime l: Label) void {
-            counts[@intFromEnum(l)] += 1;
+            counts[@backingInt(l)] += 1;
             fuzz_driver.hit(@tagName(l));
         }
 
@@ -65,7 +65,7 @@ pub fn Marker(comptime Label: type) type {
                 };
             }
             for (counts, 0..) |n, i| if (n == 0) {
-                std.debug.print("reach: " ++ name ++ " label {t} never hit in {d} seeds\n", .{ @as(Label, @enumFromInt(i)), seeds });
+                std.debug.print("reach: " ++ name ++ " label {t} never hit in {d} seeds\n", .{ @as(Label, @fromBackingInt(@intCast(i))), seeds });
                 return error.HarnessDoesNotReach;
             };
         }
@@ -145,7 +145,7 @@ pub fn fuzzAssertion(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror
             8, 9 => .signature,
             else => .key,
         };
-    } else part = @enumFromInt(src.index(5));
+    } else part = @fromBackingInt(@intCast(src.index(5)));
 
     var ad: [1024]u8 = undefined;
     var cd: [1024]u8 = undefined;
@@ -258,7 +258,7 @@ pub fn fuzzRegistration(comptime S: type, src: *S, gpa: std.mem.Allocator) anyer
             2, 3, 4 => .client_data,
             else => .attestation,
         };
-    } else which = @enumFromInt(src.index(3));
+    } else which = @fromBackingInt(@intCast(src.index(3)));
 
     var cdb: [1024]u8 = undefined;
     var aob: [2048]u8 = undefined;

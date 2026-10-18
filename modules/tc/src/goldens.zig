@@ -1269,8 +1269,8 @@ test "golden: flower filter add over IPv6/UDP" {
     // tc filter add dev lo parent 1: protocol ipv6 prio 4 flower \
     //     ip_proto udp src_ip 2001:db8::/32 dst_ip 2001:db8:1::1/128 \
     //     dst_port 53 classid 1:30
-    const src: [16]u8 = .{ 0x20, 0x01, 0x0d, 0xb8 } ++ [_]u8{0} ** 12;
-    const dst: [16]u8 = .{ 0x20, 0x01, 0x0d, 0xb8, 0x00, 0x01 } ++ [_]u8{0} ** 9 ++ [_]u8{0x01};
+    const src: [16]u8 = .{ 0x20, 0x01, 0x0d, 0xb8 } ++ @as([12]u8, @splat(0));
+    const dst: [16]u8 = .{ 0x20, 0x01, 0x0d, 0xb8, 0x00, 0x01 } ++ @as([9]u8, @splat(0)) ++ [_]u8{0x01};
     const req = try message.buildFilterSet(
         gpa,
         seq_flower_filter_add_v6,

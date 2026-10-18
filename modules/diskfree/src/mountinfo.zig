@@ -459,10 +459,10 @@ const ScriptSource = struct {
 };
 
 const FuzzLabel = enum { no_entries, entries, from_sample };
-var fuzz_reach: [@typeInfo(FuzzLabel).@"enum".fields.len]usize = @splat(0);
+var fuzz_reach: [@typeInfo(FuzzLabel).@"enum".field_names.len]usize = @splat(0);
 
 fn mark(comptime l: FuzzLabel) void {
-    fuzz_reach[@intFromEnum(l)] += 1;
+    fuzz_reach[@backingInt(l)] += 1;
     fuzz_driver.hit(@tagName(l));
 }
 
@@ -493,7 +493,7 @@ test "fuzz harness (mountinfo): 300 seeds in every test run, and they get everyw
         };
     }
     for (fuzz_reach, 0..) |n, i| if (n == 0) {
-        std.debug.print("reach: label {t} never hit in 300 seeds\n", .{@as(FuzzLabel, @enumFromInt(i))});
+        std.debug.print("reach: label {t} never hit in 300 seeds\n", .{@as(FuzzLabel, @fromBackingInt(@intCast(i)))});
         return error.HarnessDoesNotReach;
     };
 }

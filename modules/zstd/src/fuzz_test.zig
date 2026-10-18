@@ -127,7 +127,7 @@ const Setup = struct {
         if (input.len == 0) return null;
         const b = input[0];
         var su: Setup = .{
-            .dict = @enumFromInt(b & 3),
+            .dict = @fromBackingInt(@intCast(b & 3)),
             .magicless = b & 4 != 0,
             .schedule = @truncate(b >> 3),
             .frame = input[1..],
@@ -313,10 +313,10 @@ fn fuzzCompress(_: void, smith: *std.testing.Smith) !void {
 const fuzz_driver = @import("testkit").fuzz.driver;
 
 const Reach = enum { raw_nonempty, structured_run, mutated };
-var reach: [@typeInfo(Reach).@"enum".fields.len]usize = @splat(0);
+var reach: [@typeInfo(Reach).@"enum".field_names.len]usize = @splat(0);
 
 fn mark(comptime l: Reach) void {
-    reach[@intFromEnum(l)] += 1;
+    reach[@backingInt(l)] += 1;
     fuzz_driver.hit(@tagName(l));
 }
 
@@ -388,8 +388,8 @@ const DecodeDict = Target(decodeWithDictionary, &decode_dict_seed_corpus);
 const DecodeStream = Target(decodeStreamAnything, &decode_stream_seed_corpus);
 const SeekableT = Target(seekableAnything, &seekable_seed_corpus);
 
-const seed_words = "the frame of the block of the window, the match of the literal; " ** 40;
-const seed_runs = ("a" ** 300) ++ ("b" ** 300) ++ ("a" ** 300);
+const seed_words = strRepeat("the frame of the block of the window, the match of the literal; ", 40);
+const seed_runs = (strRepeat("a", 300)) ++ (strRepeat("b", 300)) ++ (strRepeat("a", 300));
 const seed_noise = blk: {
     @setEvalBranchQuota(10_000);
     var b: [4096]u8 = undefined;
@@ -411,7 +411,7 @@ const fuzz_seed_corpus = [_][]const u8{
     fuzzSeed(seed_words ++ seed_noise ++ seed_words),
     // over 16 KB: the lazy levels switch from the hash chain to the row finder
     // (17 927 bytes -> levels[7], level 6)
-    fuzzSeed(seed_words ** 7 ++ "abcdefg"),
+    fuzzSeed(strRepeat(seed_words, 7) ++ "abcdefg"),
 };
 
 /// Decoder seeds: hand-built frames (empty; raw block; RLE block;
@@ -604,7 +604,19 @@ test "fuzz harness: seeds in every test run, and it gets everywhere" {
         }
     }
     for (reach, 0..) |n, i| if (n == 0) {
-        std.debug.print("reach: label {t} never hit\n", .{@as(Reach, @enumFromInt(i))});
+        std.debug.print("reach: label {t} never hit\n", .{@as(Reach, @fromBackingInt(@intCast(i)))});
         return error.HarnessDoesNotReach;
     };
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

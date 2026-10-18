@@ -51,7 +51,7 @@ test "KAT: tapTweakHash on the key-path-only row (index 0) hashes over P_x alone
     // Sanity: hashing with an explicit all-zero root gives a DIFFERENT
     // result than passing null (proves the two code paths are distinct,
     // not accidentally equivalent for this particular internal key).
-    const with_zero_root = taproot.tapTweakHash(internal_x, [_]u8{0} ** 32);
+    const with_zero_root = taproot.tapTweakHash(internal_x, @as([32]u8, @splat(0)));
     try std.testing.expect(!std.mem.eql(u8, &want, &with_zero_root));
 }
 
@@ -98,7 +98,7 @@ test "tweaked key pair signs and verifies: bip340.sign under q verifies against 
     const io = threaded.io();
 
     const msg = "taproot key-path spend round-trip";
-    const aux = [_]u8{0} ** 32;
+    const aux = @as([32]u8, @splat(0));
 
     for (v.vectors) |vec| {
         const internal = try bip340.XOnlyPublicKey.fromBytes(try hex32(vec.internal_pubkey));

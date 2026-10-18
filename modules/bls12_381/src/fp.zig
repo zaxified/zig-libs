@@ -263,7 +263,7 @@ fn subLimbs(a: Limbs, b: Limbs) Limbs {
 /// (Koç et al., Fig. 6; radix 2^64, `u128` widening products). Result is
 /// fully reduced (`< p`). No secret-dependent branch/index/early-exit.
 fn montMul(a: Limbs, b: Limbs) Limbs {
-    var t = [_]u64{0} ** (L + 2);
+    var t = @as([L + 2]u64, @splat(0));
     inline for (0..L) |i| {
         // t += a * b[i]
         var carry: u64 = 0;
@@ -301,7 +301,7 @@ fn montMul(a: Limbs, b: Limbs) Limbs {
 /// (the differential test below). No secret-dependent branch/index.
 fn montSqr(a: Limbs) Limbs {
     // A holds the full 2L-word square across all four phases.
-    var A = [_]u64{0} ** (2 * L);
+    var A = @as([2 * L]u64, @splat(0));
 
     // 1. cross products: A = Σ_{i<j} a[i]·a[j]·B^(i+j)
     inline for (0..L) |i| {
@@ -464,7 +464,7 @@ pub const Fp = struct {
     /// passes yield `(X mod p)·R` — the Montgomery form of `X mod p`.
     pub fn reduceWide(comptime nbytes: usize, bytes: [nbytes]u8) Fp {
         comptime std.debug.assert(nbytes % 8 == 0 and nbytes <= 2 * L * 8);
-        var A = [_]u64{0} ** (2 * L);
+        var A = @as([2 * L]u64, @splat(0));
         inline for (0..nbytes / 8) |i| {
             const off = nbytes - 8 * (i + 1);
             A[i] = std.mem.readInt(u64, bytes[off .. off + 8][0..8], .big);
@@ -634,7 +634,7 @@ test "half_p is exactly (p-1)/2" {
         if (borrow == 0) break;
     }
 
-    var shifted = [_]u8{0} ** 48;
+    var shifted = @as([48]u8, @splat(0));
     var carry: u8 = 0;
     for (p_minus_1, 0..) |byte, idx| {
         shifted[idx] = (byte >> 1) | (carry << 7);
@@ -648,7 +648,7 @@ test "Fp.zero / Fp.one round-trip through bytes" {
     const z = Fp.zero.toBytes();
     try std.testing.expect(std.mem.allEqual(u8, &z, 0));
     const o = Fp.one.toBytes();
-    var expected = [_]u8{0} ** 48;
+    var expected = @as([48]u8, @splat(0));
     expected[47] = 1;
     try std.testing.expectEqualSlices(u8, &expected, &o);
 }
@@ -669,7 +669,7 @@ test "Fp.fromInt rejects p itself and accepts p-1" {
 
 test "Fp.fromInt(4) matches the b=4 curve-constant byte pattern" {
     const four = try Fp.fromInt(u8, 4);
-    var expected = [_]u8{0} ** 48;
+    var expected = @as([48]u8, @splat(0));
     expected[47] = 4;
     try std.testing.expectEqualSlices(u8, &expected, &four.toBytes());
 }
@@ -723,7 +723,7 @@ test "Fp.sgn0 (RFC 9380 sgn0_m_eq_1): parity of the canonical representative" {
 
 test "Fp.pow: a^0 == 1, a^1 == a, a^2 == square(a)" {
     const a = try Fp.fromInt(u64, 31337);
-    var e = [_]u8{0} ** 48;
+    var e = @as([48]u8, @splat(0));
     try std.testing.expect(a.pow(e).eql(Fp.one));
     e[47] = 1;
     try std.testing.expect(a.pow(e).eql(a));

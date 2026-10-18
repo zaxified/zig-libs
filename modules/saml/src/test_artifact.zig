@@ -41,7 +41,7 @@ test "Artifact: encode/decode round-trips (raw and base64)" {
     const a: saml.Artifact = .{
         .endpoint_index = 7,
         .source_id = saml.sourceIdFromEntityId(idp_entity_id),
-        .message_handle = [_]u8{0xAB} ** 20,
+        .message_handle = @as([20]u8, @splat(0xAB)),
     };
     const raw = saml.encodeArtifact(a);
     try testing.expectEqual(@as(usize, 44), raw.len);
@@ -76,8 +76,8 @@ test "decodeArtifact: wrong length -> InvalidArtifact" {
 test "decodeArtifact: wrong type code -> UnsupportedTypeCode" {
     var raw = saml.encodeArtifact(.{
         .endpoint_index = 1,
-        .source_id = [_]u8{0x01} ** 20,
-        .message_handle = [_]u8{0x02} ** 20,
+        .source_id = @as([20]u8, @splat(0x01)),
+        .message_handle = @as([20]u8, @splat(0x02)),
     });
     raw[1] = 0x05; // not the SAML 2.0 type code
     try testing.expectError(error.UnsupportedTypeCode, saml.decodeArtifact(&raw));
@@ -90,7 +90,7 @@ test "buildArtifactResolveSoap: unsigned, well-formed SOAP structure" {
     const artifact_b64 = try saml.encodeArtifactBase64(alloc, .{
         .endpoint_index = 0,
         .source_id = saml.sourceIdFromEntityId("https://sp.example.org/metadata"),
-        .message_handle = [_]u8{0x99} ** 20,
+        .message_handle = @as([20]u8, @splat(0x99)),
     });
     defer alloc.free(artifact_b64);
 
@@ -119,7 +119,7 @@ test "buildArtifactResolveSoap: signed output verifies through xmldsig.verify di
     const artifact_b64 = try saml.encodeArtifactBase64(alloc, .{
         .endpoint_index = 0,
         .source_id = saml.sourceIdFromEntityId("https://sp.example.org/metadata"),
-        .message_handle = [_]u8{0x77} ** 20,
+        .message_handle = @as([20]u8, @splat(0x77)),
     });
     defer alloc.free(artifact_b64);
 

@@ -249,7 +249,7 @@ test "round trip: client against adapter over an in-memory wire" {
     const svc = try c.listServices();
     try testing.expectEqualStrings("Communications", svc.trimmedName());
     try testing.expectEqual(@as(usize, 0), try c.listInterfaces());
-    const name = try c.getAttributeSingle(@intFromEnum(ClassCode.identity), 1, 7);
+    const name = try c.getAttributeSingle(@backingInt(ClassCode.identity), 1, 7);
     try testing.expectEqualStrings(
         "zig-enip adapter",
         (try types.decodeValue(.short_string, name)).string,
@@ -324,21 +324,21 @@ test "a multiple service packet larger than the reply table is refused, not trun
     var storage: [over_cap][32]u8 = undefined;
     var reqs: [over_cap][]const u8 = undefined;
     for (0..over_cap) |i| {
-        reqs[i] = cip.getAttributesAll(@intFromEnum(cip.ClassCode.identity), 1, &storage[i]) catch unreachable;
+        reqs[i] = cip.getAttributesAll(@backingInt(cip.ClassCode.identity), 1, &storage[i]) catch unreachable;
     }
     var payload_buf: [1024]u8 = undefined;
     const payload = cip.MultipleService.encode(&reqs, &payload_buf) catch unreachable;
 
     var path_buf: [16]u8 = undefined;
     const router_path = epath.logicalPath(
-        @intFromEnum(cip.ClassCode.message_router),
+        @backingInt(cip.ClassCode.message_router),
         1,
         null,
         &path_buf,
     ) catch unreachable;
     var wire_buf: [2048]u8 = undefined;
     const wire = (cip.Request{
-        .service = @intFromEnum(cip.Service.multiple_service_packet),
+        .service = @backingInt(cip.Service.multiple_service_packet),
         .path = router_path,
         .data = payload,
     }).encode(&wire_buf) catch unreachable;
@@ -371,9 +371,9 @@ fn encodeWriteInt(name: []const u8, value: i16, out: []u8) ![]const u8 {
 fn encodeBatch(reqs: []const []const u8, payload_buf: []u8, out: []u8) ![]u8 {
     const payload = try cip.MultipleService.encode(reqs, payload_buf);
     var path_buf: [16]u8 = undefined;
-    const router_path = try epath.logicalPath(@intFromEnum(cip.ClassCode.message_router), 1, null, &path_buf);
+    const router_path = try epath.logicalPath(@backingInt(cip.ClassCode.message_router), 1, null, &path_buf);
     return (cip.Request{
-        .service = @intFromEnum(cip.Service.multiple_service_packet),
+        .service = @backingInt(cip.Service.multiple_service_packet),
         .path = router_path,
         .data = payload,
     }).encode(out);
@@ -394,7 +394,7 @@ test "a multiple service packet with a bad offset table executes none of its req
     var w_buf: [64]u8 = undefined;
     var g_buf: [32]u8 = undefined;
     const write = try encodeWriteInt("SCADA[0]", 0x1234, &w_buf);
-    const get = try cip.getAttributesAll(@intFromEnum(cip.ClassCode.identity), 1, &g_buf);
+    const get = try cip.getAttributesAll(@backingInt(cip.ClassCode.identity), 1, &g_buf);
     var payload_buf: [256]u8 = undefined;
     var wire_buf: [512]u8 = undefined;
     const wire = try encodeBatch(&.{ write, get, get }, &payload_buf, &wire_buf);
@@ -568,7 +568,7 @@ test "Forward_Close only closes the connection whose full originator triple matc
     // different originator_serial: this must NOT close it.
     var path_buf: [8]u8 = undefined;
     var b = epath.Builder.init(&path_buf);
-    b.class(@intFromEnum(cip.ClassCode.message_router)) catch unreachable;
+    b.class(@backingInt(cip.ClassCode.message_router)) catch unreachable;
     b.instance(1) catch unreachable;
     const mismatched = connmgr.ForwardClose{
         .connection_serial = c.connection.?.serial,
@@ -582,7 +582,7 @@ test "Forward_Close only closes the connection whose full originator triple matc
     try testing.expect(!reply.general_status.isSuccess());
     try testing.expectEqual(cip.GeneralStatus.connection_failure, reply.general_status);
     try testing.expectEqual(
-        @as(u16, @intFromEnum(connmgr.ExtendedStatus.connection_not_found)),
+        @as(u16, @backingInt(connmgr.ExtendedStatus.connection_not_found)),
         reply.extendedStatus().?,
     );
     try testing.expect(target.connections[0].in_use); // still open
@@ -605,7 +605,7 @@ test "Forward_Open past the connection pool's capacity is refused, not stolen fr
 
     var path_buf: [8]u8 = undefined;
     var b = epath.Builder.init(&path_buf);
-    b.class(@intFromEnum(cip.ClassCode.message_router)) catch unreachable;
+    b.class(@backingInt(cip.ClassCode.message_router)) catch unreachable;
     b.instance(1) catch unreachable;
 
     const params = connmgr.ConnectionParameters{ .size = 500, .variable = true };
@@ -655,7 +655,7 @@ test "Forward_Open past the connection pool's capacity is refused, not stolen fr
     try testing.expect(!reply5.general_status.isSuccess());
     try testing.expectEqual(cip.GeneralStatus.connection_failure, reply5.general_status);
     try testing.expectEqual(
-        @as(u16, @intFromEnum(connmgr.ExtendedStatus.connection_limit_reached)),
+        @as(u16, @backingInt(connmgr.ExtendedStatus.connection_limit_reached)),
         reply5.extendedStatus().?,
     );
 
@@ -731,7 +731,7 @@ test "round trip: an adapter refuses Reset unless it was allowed" {
     var buf: [8192]u8 = undefined;
     var c = try Client.init(paired.seam(), &buf, .{ .routing = .direct });
     _ = try c.registerSession();
-    try testing.expectError(error.CipError, c.reset(@intFromEnum(ClassCode.identity), 1));
+    try testing.expectError(error.CipError, c.reset(@backingInt(ClassCode.identity), 1));
     try testing.expect(!target.reset_requested);
 
     var allowed = Adapter.init(.{ .allow_reset = true }, &tags);
@@ -739,7 +739,7 @@ test "round trip: an adapter refuses Reset unless it was allowed" {
     var buf2: [8192]u8 = undefined;
     var c2 = try Client.init(paired2.seam(), &buf2, .{ .routing = .direct });
     _ = try c2.registerSession();
-    try c2.reset(@intFromEnum(ClassCode.identity), 1);
+    try c2.reset(@backingInt(ClassCode.identity), 1);
     try testing.expect(allowed.reset_requested);
 }
 
@@ -756,7 +756,7 @@ test "round trip: an adapter refuses Reset unless it was allowed" {
 fn symbolListRequest(start_instance: u32, out: []u8) []const u8 {
     var path_buf: [16]u8 = undefined;
     const path = epath.logicalPath(
-        @intFromEnum(cip.ClassCode.symbol),
+        @backingInt(cip.ClassCode.symbol),
         start_instance,
         null,
         &path_buf,
@@ -930,7 +930,7 @@ test "an attribute the Symbol Object does not implement is refused, and refused 
     var target = Adapter.init(.{}, &tags);
 
     var path_buf: [16]u8 = undefined;
-    const path = try epath.logicalPath(@intFromEnum(cip.ClassCode.symbol), 0, null, &path_buf);
+    const path = try epath.logicalPath(@backingInt(cip.ClassCode.symbol), 0, null, &path_buf);
     // Attribute 1 is supported, 4 is not. The supported one being first is
     // the point: the refusal must not arrive after a partial record.
     const attrs = [_]u16{ 1, 4 };
@@ -957,7 +957,7 @@ test "the Symbol Object's service code means nothing on another class" {
 
     var path_buf: [16]u8 = undefined;
     // Same service code, Identity class instead of the Symbol Object.
-    const path = try epath.logicalPath(@intFromEnum(cip.ClassCode.identity), 0, null, &path_buf);
+    const path = try epath.logicalPath(@backingInt(cip.ClassCode.identity), 0, null, &path_buf);
     var req_buf: [64]u8 = undefined;
     const req = try (cip.Request{
         .service = cip.LogixService.get_instance_attribute_list,
@@ -975,7 +975,7 @@ test "the Program Name object answers instance 1 only, and can be withheld entir
     const tags = [_]TagBinding{.{ .name = "Speed", .type = .dint, .bytes = &speed }};
     var out: [1024]u8 = undefined;
     var req_buf: [64]u8 = undefined;
-    const class = @intFromEnum(cip.ClassCode.program_name);
+    const class = @backingInt(cip.ClassCode.program_name);
 
     var target = Adapter.init(.{ .program_name = "MainProgram" }, &tags);
     const ok = try cip.Reply.decode(try target.messageRouter(
@@ -1023,7 +1023,7 @@ test "a symbol instance id addresses the same tag as its name, and an unknown on
     // element `Counts[1]` names.
     var path_buf: [16]u8 = undefined;
     var pb = epath.Builder.init(&path_buf);
-    try pb.class(@intFromEnum(cip.ClassCode.symbol));
+    try pb.class(@backingInt(cip.ClassCode.symbol));
     try pb.instance(2);
     try pb.member(1);
     var req_buf: [64]u8 = undefined;
@@ -1041,7 +1041,7 @@ test "a symbol instance id addresses the same tag as its name, and an unknown on
     // An id past the end of the binding table names nothing.
     var missing_path: [16]u8 = undefined;
     var mb = epath.Builder.init(&missing_path);
-    try mb.class(@intFromEnum(cip.ClassCode.symbol));
+    try mb.class(@backingInt(cip.ClassCode.symbol));
     try mb.instance(99);
     const missing = try (cip.Request{
         .service = cip.LogixService.read_tag,
@@ -1098,14 +1098,14 @@ test "the adapter never panics on hostile encapsulation input" {
         // Truncated header.
         &[_]u8{ 0x6F, 0x00 },
         // Length disagreeing with the payload.
-        &([_]u8{ 0x6F, 0x00, 0xFF, 0x00 } ++ [_]u8{0} ** 20),
+        &([_]u8{ 0x6F, 0x00, 0xFF, 0x00 } ++ @as([20]u8, @splat(0))),
         // SendRRData with an empty body.
-        &([_]u8{ 0x6F, 0x00, 0x00, 0x00 } ++ [_]u8{0} ** 20),
+        &([_]u8{ 0x6F, 0x00, 0x00, 0x00 } ++ @as([20]u8, @splat(0))),
         // A CPF item count that overruns.
-        &([_]u8{ 0x6F, 0x00, 0x08, 0x00 } ++ [_]u8{0} ** 20 ++
+        &([_]u8{ 0x6F, 0x00, 0x08, 0x00 } ++ @as([20]u8, @splat(0)) ++
             [_]u8{ 0, 0, 0, 0, 0, 0, 0xFF, 0xFF }),
         // An unknown command.
-        &([_]u8{ 0x34, 0x12, 0x00, 0x00 } ++ [_]u8{0} ** 20),
+        &([_]u8{ 0x34, 0x12, 0x00, 0x00 } ++ @as([20]u8, @splat(0))),
     };
     for (hostile) |h| {
         _ = target.handle(h, &out) catch continue;

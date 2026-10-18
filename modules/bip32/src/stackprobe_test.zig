@@ -335,7 +335,7 @@ fn buildNeedles(n: *Needles) !void {
 }
 
 test "STACKPROBE (review 2026-10-08): no key, seed or entropy residue on the dead stack after bip32/bip39 calls" {
-    if (builtin.mode == .Debug or builtin.mode == .ReleaseSafe) return error.SkipZigTest;
+    if (builtin.mode == .debug or builtin.mode == .safe) return error.SkipZigTest;
 
     try bip32.masterFromSeed(&probe_seed, &master);
     defer master.deinit();

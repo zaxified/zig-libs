@@ -101,8 +101,8 @@ pub const Method = enum(u12) {
 /// Interleave a class and method into the 16-bit STUN message type (RFC 8489
 /// §5): method bits M11..M0 are split around the two class bits C1/C0.
 pub fn encodeType(class: Class, method: Method) u16 {
-    const m: u16 = @intFromEnum(method);
-    const c: u16 = @intFromEnum(class);
+    const m: u16 = @backingInt(method);
+    const c: u16 = @backingInt(class);
     return ((m & 0x0F80) << 2) | ((m & 0x0070) << 1) | (m & 0x000F) |
         ((c & 0x2) << 7) | ((c & 0x1) << 4);
 }
@@ -110,7 +110,7 @@ pub fn encodeType(class: Class, method: Method) u16 {
 /// Recover the class from a 16-bit message type.
 pub fn decodeClass(t: u16) Class {
     const c: u2 = @intCast(((t >> 4) & 0x1) | ((t >> 7) & 0x2));
-    return @enumFromInt(c);
+    return @fromBackingInt(@intCast(c));
 }
 
 /// Recover the 12-bit method from a 16-bit message type.
@@ -141,7 +141,7 @@ pub const AttributeType = enum(u16) {
 };
 
 fn attrCode(t: AttributeType) u16 {
-    return @intFromEnum(t);
+    return @backingInt(t);
 }
 
 // ── errors ───────────────────────────────────────────────────────────────────
@@ -476,7 +476,7 @@ pub fn parseUri(text: []const u8) UriError!Uri {
     const colon = std.mem.indexOfScalar(u8, text, ':') orelse return error.InvalidUri;
     const scheme_text = text[0..colon];
     const scheme: Uri.Scheme = inline for (@typeInfo(Uri.Scheme).@"enum".fields) |f| {
-        if (std.ascii.eqlIgnoreCase(scheme_text, f.name)) break @enumFromInt(f.value);
+        if (std.ascii.eqlIgnoreCase(scheme_text, f.name)) break @fromBackingInt(@intCast(f.value));
     } else return error.InvalidUri;
     var rest = text[colon + 1 ..];
     var out: Uri = .{
@@ -679,7 +679,7 @@ pub fn decode(bytes: []const u8) DecodeError!Message {
     return .{
         .bytes = bytes[0 .. @as(usize, header_len) + length],
         .class = decodeClass(t),
-        .method = @enumFromInt(decodeMethod(t)),
+        .method = @fromBackingInt(@intCast(decodeMethod(t))),
         .length = length,
         .transaction_id = bytes[8..20].*,
     };
@@ -1196,7 +1196,7 @@ test "ERROR-CODE parse (class*100 + number + reason)" {
 }
 
 test "decode rejects non-STUN, bad cookie, and truncation" {
-    try testing.expectError(error.Truncated, decode(&[_]u8{0} ** 8));
+    try testing.expectError(error.Truncated, decode(&@as([8]u8, @splat(0))));
     // Wrong cookie.
     var bad_cookie = req_2_1;
     bad_cookie[4] = 0x00;
@@ -1447,8 +1447,8 @@ test "Builder: ERROR-CODE and UNKNOWN-ATTRIBUTES encode per RFC 8489 §14.8/§14
     try testing.expectEqual(@as(u16, 438), (try (try decode(b.finish())).errorCode()).?.code);
     try testing.expectError(error.InvalidErrorCode, b.addErrorCode(299, "x"));
     try testing.expectError(error.InvalidErrorCode, b.addErrorCode(700, "x"));
-    try testing.expectError(error.ValueTooLong, b.addErrorCode(500, &([_]u8{'x'} ** 764)));
-    try testing.expectError(error.ValueTooLong, b.addUnknownAttributes(&([_]u16{1} ** 65)));
+    try testing.expectError(error.ValueTooLong, b.addErrorCode(500, &(@as([764]u8, @splat('x')))));
+    try testing.expectError(error.ValueTooLong, b.addUnknownAttributes(&(@as([65]u16, @splat(1)))));
 }
 
 test "STUN/TURN URIs: RFC 7064 and RFC 7065 examples" {
@@ -1671,7 +1671,7 @@ const decode_seeds = [_][]const u8{
     seed(&req_bad_cookie), // BadCookie
     seed(&req_not_stun), // NotStun
     seed(&req_length_past_end), // Truncated: declared length past the buffer
-    seed(&[_]u8{0} ** 8), // Truncated: shorter than the header
+    seed(&@as([8]u8, @splat(0))), // Truncated: shorter than the header
     // A bare 20-octet Binding request: header only, zero attributes. Decodes,
     // and every accessor below must cope with an empty attribute list.
     seed(&[_]u8{ 0x00, 0x01, 0x00, 0x00, 0x21, 0x12, 0xa4, 0x42 } ++ rfc5769_txid),

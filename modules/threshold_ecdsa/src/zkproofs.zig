@@ -241,7 +241,7 @@ fn readLenPrefixed(bytes: []const u8, offset: *usize) InvalidEncodingError![]con
 /// via `Scalar.fromBytes48`'s constant-time wide reduction, so a digest
 /// `>= q` folds instead of getting rejected.
 fn reduceToScalar(bytes32: [32]u8) Scalar {
-    var wide = [_]u8{0} ** 48;
+    var wide = @as([48]u8, @splat(0));
     wide[16..48].* = bytes32;
     return Scalar.fromBytes48(wide, .big);
 }
@@ -690,7 +690,7 @@ fn auxExponentTooLong(bytes: []const u8, nt: anytype) bool {
 /// precondition, not a fact (see `mta.mtaAliceFinalize`).
 pub fn scalarFromWide(bytes: []const u8) Scalar {
     // 2^128 as a Scalar (bit 128 => byte 31 of a 48-byte BE buffer).
-    var radix_buf = [_]u8{0} ** 48;
+    var radix_buf = @as([48]u8, @splat(0));
     radix_buf[31] = 1;
     const radix = Scalar.fromBytes48(radix_buf, .big);
 
@@ -709,7 +709,7 @@ pub fn scalarFromWide(bytes: []const u8) Scalar {
 
 fn chunkScalar(chunk: []const u8) Scalar {
     std.debug.assert(chunk.len <= 16);
-    var buf = [_]u8{0} ** 48;
+    var buf = @as([48]u8, @splat(0));
     @memcpy(buf[48 - chunk.len ..], chunk);
     return Scalar.fromBytes48(buf, .big);
 }
@@ -2264,7 +2264,7 @@ const other_prover_ctx: []const u8 = "zkproofs-test-session\x01";
 const testing = std.testing;
 
 fn scalarFromU64(v: u64) Scalar {
-    var buf = [_]u8{0} ** 48;
+    var buf = @as([48]u8, @splat(0));
     std.mem.writeInt(u64, buf[40..48], v, .big);
     return Scalar.fromBytes48(buf, .big);
 }
@@ -2541,7 +2541,7 @@ test "GG18 A.1 honest accept: Alice's range proof verifies, and re-verifies afte
     // Heavy: 2048-bit keygen. `threshold_ecdsa` is `heavy` in build.zig,
     // so the DEFAULT lane builds it at ReleaseSafe and DOES run this test;
     // it skips ONLY under `-Dstrict-debug` (audit N2 claimed the opposite).
-    if (builtin.mode == .Debug) return error.SkipZigTest;
+    if (builtin.mode == .debug) return error.SkipZigTest;
     const allocator = testing.allocator;
     const setup = try realAuxAndKey(0xa11ce_0001);
     const pk = setup.kp.public;
@@ -2579,7 +2579,7 @@ test "GG18 A.1 reject (SECURITY-CRITICAL): out-of-range a fails the range check 
     // Heavy: 2048-bit keygen. `threshold_ecdsa` is `heavy` in build.zig,
     // so the DEFAULT lane builds it at ReleaseSafe and DOES run this test;
     // it skips ONLY under `-Dstrict-debug` (audit N2 claimed the opposite).
-    if (builtin.mode == .Debug) return error.SkipZigTest;
+    if (builtin.mode == .debug) return error.SkipZigTest;
     const allocator = testing.allocator;
     const setup = try realAuxAndKey(0xa11ce_0002);
     const pk = setup.kp.public;
@@ -2620,7 +2620,7 @@ test "GG18 A.1 reject (SECURITY-CRITICAL): non-unit u/s let Alice's factor blank
     // and s ≡ 0 (mod P) make equation 2 read 0 = 0 mod P². Multiplying u by
     // (P²)^N and s by P² keeps the Q² side consistent (the factor cancels).
     // Every non-unit-aware check passes: s1 = alpha ≤ q³, Ñ side commits to 0.
-    if (builtin.mode == .Debug) return error.SkipZigTest;
+    if (builtin.mode == .debug) return error.SkipZigTest;
     const allocator = testing.allocator;
     const setup = try realAuxAndKey(0xa11ce_0004);
     const pk = setup.kp.public;
@@ -2662,7 +2662,7 @@ test "GG18 A.1 reject (SECURITY-CRITICAL): non-unit u/s let Alice's factor blank
     var a_big = try Big.init(allocator);
     defer a_big.deinit();
     try a_big.mul(&k, &q_big);
-    var a_bytes = [_]u8{0} ** paillier.modulus_bytes;
+    var a_bytes = @as([paillier.modulus_bytes]u8, @splat(0));
     a_big.toConst().writeTwosComplement(&a_bytes, .big);
 
     const r_a = testPaillierRandomness(pk, random);
@@ -2732,7 +2732,7 @@ test "GG18 A.1 reject (SECURITY-CRITICAL): tampered c_a and every mangled proof 
     // Heavy: 2048-bit keygen. `threshold_ecdsa` is `heavy` in build.zig,
     // so the DEFAULT lane builds it at ReleaseSafe and DOES run this test;
     // it skips ONLY under `-Dstrict-debug` (audit N2 claimed the opposite).
-    if (builtin.mode == .Debug) return error.SkipZigTest;
+    if (builtin.mode == .debug) return error.SkipZigTest;
     const allocator = testing.allocator;
     const setup = try realAuxAndKey(0xa11ce_0003);
     const pk = setup.kp.public;
@@ -2786,7 +2786,7 @@ test "GG18 A.1 reject (SECURITY-CRITICAL): tampered c_a and every mangled proof 
 /// A small test blind left-padded to the provers' `β'` width (value-identical
 /// to the 32-byte encoding `buildCb` folds into `c_b`).
 fn bpWide(s: Scalar) [beta_prime_bytes]u8 {
-    var out = [_]u8{0} ** beta_prime_bytes;
+    var out = @as([beta_prime_bytes]u8, @splat(0));
     out[beta_prime_bytes - 32 ..].* = s.toBytes(.big);
     return out;
 }
@@ -2795,7 +2795,7 @@ test "GG18 A.3 honest accept: Bob's MtA proof over checked-MtA-shaped ciphertext
     // Heavy: 2048-bit keygen. `threshold_ecdsa` is `heavy` in build.zig,
     // so the DEFAULT lane builds it at ReleaseSafe and DOES run this test;
     // it skips ONLY under `-Dstrict-debug` (audit N2 claimed the opposite).
-    if (builtin.mode == .Debug) return error.SkipZigTest;
+    if (builtin.mode == .debug) return error.SkipZigTest;
     const allocator = testing.allocator;
     const setup = try realAuxAndKey(0xb0b_0001);
     const pk = setup.kp.public;
@@ -2835,7 +2835,7 @@ test "GG18 A.3 reject (SECURITY-CRITICAL): out-of-range b (s1 > q³) and out-of-
     // Heavy: 2048-bit keygen. `threshold_ecdsa` is `heavy` in build.zig,
     // so the DEFAULT lane builds it at ReleaseSafe and DOES run this test;
     // it skips ONLY under `-Dstrict-debug` (audit N2 claimed the opposite).
-    if (builtin.mode == .Debug) return error.SkipZigTest;
+    if (builtin.mode == .debug) return error.SkipZigTest;
     const allocator = testing.allocator;
     const setup = try realAuxAndKey(0xb0b_0002);
     const pk = setup.kp.public;
@@ -2883,7 +2883,7 @@ test "GG18 A.3 reject (SECURITY-CRITICAL): a non-unit s with a matching non-unit
     // same factor P^(2N) on both sides — a unit mod Q², zero mod P² — and
     // still holds, while `s` is no unit of Z*_N. Equations 3 and 4 (mod Ñ)
     // and the range bounds do not see `s` or `v`. Only the unit check does.
-    if (builtin.mode == .Debug) return error.SkipZigTest;
+    if (builtin.mode == .debug) return error.SkipZigTest;
     const allocator = testing.allocator;
     const setup = try realAuxAndKey(0xb0b_0005);
     const pk = setup.kp.public;
@@ -2968,7 +2968,7 @@ test "GG18 A.3 reject (SECURITY-CRITICAL): tampered c_b, wrong beta' witness, an
     // Heavy: 2048-bit keygen. `threshold_ecdsa` is `heavy` in build.zig,
     // so the DEFAULT lane builds it at ReleaseSafe and DOES run this test;
     // it skips ONLY under `-Dstrict-debug` (audit N2 claimed the opposite).
-    if (builtin.mode == .Debug) return error.SkipZigTest;
+    if (builtin.mode == .debug) return error.SkipZigTest;
     const allocator = testing.allocator;
     const setup = try realAuxAndKey(0xb0b_0003);
     const pk = setup.kp.public;
@@ -3044,7 +3044,7 @@ test "GG18 A.2 MtAwc: honest accept; wrong B, tampered u1, and cross-protocol pr
     // Heavy: 2048-bit keygen. `threshold_ecdsa` is `heavy` in build.zig,
     // so the DEFAULT lane builds it at ReleaseSafe and DOES run this test;
     // it skips ONLY under `-Dstrict-debug` (audit N2 claimed the opposite).
-    if (builtin.mode == .Debug) return error.SkipZigTest;
+    if (builtin.mode == .debug) return error.SkipZigTest;
     const allocator = testing.allocator;
     const setup = try realAuxAndKey(0xb0b_0004);
     const pk = setup.kp.public;
@@ -3111,7 +3111,7 @@ test "GG18 A.2 MtAwc check 6 in isolation: b does not match the agreed B, transc
     // that mismatch, exactly the "last-mover"-style attack the module doc
     // comment describes: a malicious Bob whose MtA input diverges from
     // the EC share he already committed to.
-    if (builtin.mode == .Debug) return error.SkipZigTest;
+    if (builtin.mode == .debug) return error.SkipZigTest;
     const allocator = testing.allocator;
     const setup = try realAuxAndKey(0xb0b_0005);
     const pk = setup.kp.public;
@@ -3401,7 +3401,7 @@ test "audit: a proof-legal beta' that crosses 2^512 keeps the MtA identity alpha
     // Both X values are proof-legal and must now behave identically. The pair
     // is the point: X = 2000 held before the fix too, so a single case would
     // not have distinguished a working reduction from a lucky one.
-    if (builtin.mode == .Debug) return error.SkipZigTest;
+    if (builtin.mode == .debug) return error.SkipZigTest;
     const mta_mod = @import("mta.zig");
     const allocator = testing.allocator;
     const setup = try realAuxAndKey(0x4155444954_01);
@@ -3443,7 +3443,7 @@ test "audit: an over-long s2 is refused before it is used as an exponent" {
     // bound is `96 + |N~| + 1` bytes (`e*rho + gamma` with `e < q`,
     // `rho < q*N~`, `gamma < q^3*N~`), so the cap rejects nothing an honest
     // prover can produce -- asserted here from both sides.
-    if (builtin.mode == .Debug) return error.SkipZigTest;
+    if (builtin.mode == .debug) return error.SkipZigTest;
     const allocator = testing.allocator;
     const setup = try realAuxAndKey(0x4155444954_02);
     const pk = setup.kp.public;
@@ -3564,9 +3564,9 @@ test "audit R2 (LOW): fixed-length mulAddBytes is bit-exact against the old earl
 
     // Boundary: every operand byte 0xFF — maximises per-digit carries.
     {
-        const e = [_]u8{0xFF} ** 4;
-        const x = [_]u8{0xFF} ** 4;
-        const addend = [_]u8{0xFF} ** 9;
+        const e = @as([4]u8, @splat(0xFF));
+        const x = @as([4]u8, @splat(0xFF));
+        const addend = @as([9]u8, @splat(0xFF));
         var out_old: [10]u8 = undefined;
         var out_new: [10]u8 = undefined;
         const got_old = mulAddBytesEarlyExitRef(&e, &x, &addend, &out_old);
@@ -3579,7 +3579,7 @@ test "audit R2 (LOW): fixed-length mulAddBytes is bit-exact against the old earl
     {
         const e = [_]u8{1};
         const x = [_]u8{1};
-        const addend = [_]u8{0xFF} ** 5;
+        const addend = @as([5]u8, @splat(0xFF));
         var out_old: [6]u8 = undefined;
         var out_new: [6]u8 = undefined;
         const got_old = mulAddBytesEarlyExitRef(&e, &x, &addend, &out_old);
@@ -3725,7 +3725,7 @@ fn mulBase(base: root.Element, k: Scalar) root.Element {
 }
 
 test "PdlProof: honest accepts (and after a codec round trip); every false statement and mangled field rejects" {
-    if (builtin.mode == .Debug) return error.SkipZigTest;
+    if (builtin.mode == .debug) return error.SkipZigTest;
     const allocator = testing.allocator;
     const setup = try realAuxAndKey(0x70646c_0001);
     const pk = setup.kp.public;
@@ -3792,7 +3792,7 @@ test "PdlProof: honest accepts (and after a codec round trip); every false state
 }
 
 test "PdlProof reject (SECURITY-CRITICAL): an out-of-range exponent (s1 > q³) fails although every equation holds" {
-    if (builtin.mode == .Debug) return error.SkipZigTest;
+    if (builtin.mode == .debug) return error.SkipZigTest;
     const allocator = testing.allocator;
     const setup = try realAuxAndKey(0x70646c_0002);
     const pk = setup.kp.public;

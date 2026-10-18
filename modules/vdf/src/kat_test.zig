@@ -43,7 +43,7 @@ const testing = std.testing;
 
 /// `x = 5` as a canonical `group.modulus_bytes`-wide big-endian element.
 fn fiveElement() [group.modulus_bytes]u8 {
-    var buf: [group.modulus_bytes]u8 = [_]u8{0} ** group.modulus_bytes;
+    var buf: [group.modulus_bytes]u8 = @as([group.modulus_bytes]u8, @splat(0));
     buf[group.modulus_bytes - 1] = 5;
     return buf;
 }
@@ -255,7 +255,7 @@ test "completeness: different x values all verify" {
     const t: u64 = 500;
     const xs = [_]u64{ 2, 3, 5, 7, 11, 13 };
     for (xs) |xv| {
-        var x_bytes: [group.modulus_bytes]u8 = [_]u8{0} ** group.modulus_bytes;
+        var x_bytes: [group.modulus_bytes]u8 = @as([group.modulus_bytes]u8, @splat(0));
         x_bytes[group.modulus_bytes - 1] = @intCast(xv);
         const x = try group.elementFromBytes(m, &x_bytes);
         const y = vdf.eval(m, x, t);
@@ -333,7 +333,7 @@ test "soundness: x/y/pi outside Z_N* (0, N, >= N) are rejected, not UB" {
     try group.toBytes(y, &y_bytes);
     const proof = try vdf.prove(m, &x_bytes, &y_bytes, t);
 
-    var zero_bytes: [group.modulus_bytes]u8 = [_]u8{0} ** group.modulus_bytes;
+    var zero_bytes: [group.modulus_bytes]u8 = @as([group.modulus_bytes]u8, @splat(0));
     var n_bytes: [group.modulus_bytes]u8 = undefined;
     try m.toBytes(&n_bytes, .big);
 
@@ -379,7 +379,7 @@ fn brokenVerifyUnboundY(m: group.Modulus, x_bytes: []const u8, y_bytes: []const 
     var n_canon: [group.modulus_bytes]u8 = undefined;
     m.toBytes(&n_canon, .big) catch unreachable;
     // y EXCLUDED from the Fiat-Shamir binding (the injected soundness bug):
-    const y_placeholder = [_]u8{0} ** group.modulus_bytes;
+    const y_placeholder = @as([group.modulus_bytes]u8, @splat(0));
     const l_bytes = vdf.hashToPrime(&n_canon, &x_canon, &y_placeholder, t);
     const lm = vdf.PrimeModulus.fromBytes(&l_bytes, .big) catch unreachable;
     const r = vdf.pow2Mod(lm, t);
@@ -406,7 +406,7 @@ test "soundness (y-binding): an adaptive false-y forgery is rejected by verify b
     try group.toBytes(x, &x_canon);
     var n_canon: [group.modulus_bytes]u8 = undefined;
     try m.toBytes(&n_canon, .big);
-    const y_placeholder = [_]u8{0} ** group.modulus_bytes;
+    const y_placeholder = @as([group.modulus_bytes]u8, @splat(0));
     const l_bytes = vdf.hashToPrime(&n_canon, &x_canon, &y_placeholder, t);
     const lm = try vdf.PrimeModulus.fromBytes(&l_bytes, .big);
     const r = vdf.pow2Mod(lm, t);
@@ -414,7 +414,7 @@ test "soundness (y-binding): an adaptive false-y forgery is rejected by verify b
     try r.toBytes(&r_bytes, .big);
 
     // Attacker's arbitrary proof element pi' = 7 (any valid group element).
-    var pi_bytes: [group.modulus_bytes]u8 = [_]u8{0} ** group.modulus_bytes;
+    var pi_bytes: [group.modulus_bytes]u8 = @as([group.modulus_bytes]u8, @splat(0));
     pi_bytes[group.modulus_bytes - 1] = 7;
     const pi = try group.elementFromBytes(m, &pi_bytes);
 

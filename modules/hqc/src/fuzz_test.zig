@@ -16,10 +16,10 @@ const fuzz_driver = testkit.fuzz.driver;
 const kat = @import("kem_kat_test.zig");
 
 pub const Label = enum { arbitrary, roundtrip, implicit_reject };
-var reach: [@typeInfo(Label).@"enum".fields.len]usize = @splat(0);
+var reach: [@typeInfo(Label).@"enum".field_names.len]usize = @splat(0);
 
 pub fn mark(comptime l: Label) void {
-    reach[@intFromEnum(l)] += 1;
+    reach[@backingInt(l)] += 1;
     fuzz_driver.hit(@tagName(l));
 }
 
@@ -73,7 +73,7 @@ test "fuzz harness: 60 seeds in every test run, and they get everywhere" {
     }
     // Reach before verdict: every outcome the harness judges was seen.
     for (reach, 0..) |n, i| if (n == 0) {
-        std.debug.print("reach: label {t} never hit in 60 seeds\n", .{@as(Label, @enumFromInt(i))});
+        std.debug.print("reach: label {t} never hit in 60 seeds\n", .{@as(Label, @fromBackingInt(@intCast(i)))});
         return error.HarnessDoesNotReach;
     };
 }

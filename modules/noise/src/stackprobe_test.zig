@@ -387,14 +387,14 @@ fn buildNeedles(n: *Needles) !void {
 fn rekeyed(k: [32]u8) [32]u8 {
     var out: [32]u8 = undefined;
     var tag: [16]u8 = undefined;
-    var nonce = [_]u8{0} ** 12;
+    var nonce = @as([12]u8, @splat(0));
     std.mem.writeInt(u64, nonce[4..12], std.math.maxInt(u64), .little);
-    std.crypto.aead.chacha_poly.ChaCha20Poly1305.encrypt(&out, &tag, &([_]u8{0} ** 32), "", nonce, k);
+    std.crypto.aead.chacha_poly.ChaCha20Poly1305.encrypt(&out, &tag, &(@as([32]u8, @splat(0))), "", nonce, k);
     return out;
 }
 
 fn skipUnlessOptimized() !void {
-    if (builtin.mode == .Debug or builtin.mode == .ReleaseSafe) return error.SkipZigTest;
+    if (builtin.mode == .debug or builtin.mode == .safe) return error.SkipZigTest;
 }
 
 test "STACKPROBE noise (wave 9): no key, DH or HKDF residue on the dead stack after any entry point" {

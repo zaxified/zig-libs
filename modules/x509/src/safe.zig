@@ -748,7 +748,7 @@ test "safeCertificate: guard length and scratch preconditions" {
     try testing.expectError(error.ScratchTooSmall, safeCertificate(&fixtures.leaf_rsa, &small));
     try testing.expectError(error.Empty, safeCertificate("", &small));
     var scratch: [max_certificate_len + parse_slack]u8 = undefined;
-    const huge = [_]u8{0x30} ** (max_certificate_len + 1);
+    const huge = @as([max_certificate_len + 1]u8, @splat(0x30));
     try testing.expectError(error.TooLarge, safeCertificate(&huge, &scratch));
 }
 
@@ -1024,11 +1024,11 @@ test "spkiOf: shapes that are well-formed DER but not a certificate fail closed"
     try testing.expectError(error.NotCertificate, spkiOf(&.{ 0x02, 0x01, 0x00 }));
     // Certificate-shaped with only five TBS fields (serialNumber .. subject):
     // no subjectPublicKeyInfo follows at all.
-    const five = [_]u8{ 0x30, 0x0c, 0x30, 0x0a } ++ [_]u8{ 0x02, 0x00 } ** 5;
+    const five = [_]u8{ 0x30, 0x0c, 0x30, 0x0a } ++ arrRepeat(u8, &.{ 0x02, 0x00 }, 5);
     try testing.expectError(error.MalformedTbsCertificate, spkiOf(&five));
     // Six TBS fields, so a subjectPublicKeyInfo slot exists — but it holds an
     // INTEGER rather than a SEQUENCE.
-    const six = [_]u8{ 0x30, 0x0e, 0x30, 0x0c } ++ [_]u8{ 0x02, 0x00 } ** 6;
+    const six = [_]u8{ 0x30, 0x0e, 0x30, 0x0c } ++ arrRepeat(u8, &.{ 0x02, 0x00 }, 6);
     try testing.expectError(error.MalformedSubjectPublicKeyInfo, spkiOf(&six));
 }
 
@@ -1450,4 +1450,12 @@ test "message() is exactly the TBS header this module already validated (X4b)" {
     // where the TBS header begins) through TBS's content end.
     const expected = cert.buffer[outer.content_start..tbs.content_end];
     try testing.expectEqualSlices(u8, expected, parsed.message());
+}
+
+/// Comptime array repetition; replaces the `**` operator removed in Zig 0.17.
+fn arrRepeat(comptime T: type, comptime unit: []const T, comptime n: usize) [unit.len * n]T {
+    @setEvalBranchQuota(n * unit.len * 2 + 1000);
+    var buf: [unit.len * n]T = undefined;
+    for (0..n) |i| @memcpy(buf[i * unit.len ..][0..unit.len], unit);
+    return buf;
 }

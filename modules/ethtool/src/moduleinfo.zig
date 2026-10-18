@@ -44,8 +44,8 @@ pub fn parse(attr_bytes: []const u8) codec.Error!ModuleInfo {
     var it: codec.AttrIterator = .{ .buf = attr_bytes };
     while (try it.next()) |a| switch (a.type) {
         uapi.MODULE.HEADER => out.device = try header.parse(a.data),
-        uapi.MODULE.POWER_MODE_POLICY => out.power_mode_policy = @enumFromInt(try a.asU8()),
-        uapi.MODULE.POWER_MODE => out.power_mode = @enumFromInt(try a.asU8()),
+        uapi.MODULE.POWER_MODE_POLICY => out.power_mode_policy = @fromBackingInt(@intCast(try a.asU8())),
+        uapi.MODULE.POWER_MODE => out.power_mode = @fromBackingInt(@intCast(try a.asU8())),
         else => {},
     };
     return out;
@@ -56,7 +56,7 @@ pub fn appendSet(
     list: *std.ArrayList(u8),
     policy: uapi.ModulePowerModePolicy,
 ) std.mem.Allocator.Error!void {
-    try codec.appendAttrU8(gpa, list, uapi.MODULE.POWER_MODE_POLICY, @intFromEnum(policy));
+    try codec.appendAttrU8(gpa, list, uapi.MODULE.POWER_MODE_POLICY, @backingInt(policy));
 }
 
 /// Encode a complete `ETHTOOL_MSG_MODULE_GET` request — `nlmsghdr`,
@@ -198,7 +198,7 @@ test "MODULE_GET decodes the two power-mode fields" {
     defer list.deinit(gpa);
     try header.append(gpa, &list, uapi.MODULE.HEADER, .{ .target = .byIndex(4) });
     try appendSet(gpa, &list, .auto);
-    try codec.appendAttrU8(gpa, &list, uapi.MODULE.POWER_MODE, @intFromEnum(uapi.ModulePowerMode.high));
+    try codec.appendAttrU8(gpa, &list, uapi.MODULE.POWER_MODE, @backingInt(uapi.ModulePowerMode.high));
 
     const m = try parse(list.items);
     try testing.expectEqual(@as(?u32, 4), m.device.index);
@@ -242,7 +242,7 @@ test "EEPROM reply hands back raw bytes and bounds them" {
 
     // More than the kernel's own ceiling is a malformed reply.
     list.clearRetainingCapacity();
-    const big = [_]u8{0} ** (max_eeprom_read + 1);
+    const big = @as([max_eeprom_read + 1]u8, @splat(0));
     try codec.appendAttr(gpa, &list, uapi.MODULE_EEPROM.DATA, &big);
     try testing.expectError(error.BadLength, parseEeprom(gpa, list.items));
 }

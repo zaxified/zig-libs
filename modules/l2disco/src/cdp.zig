@@ -279,7 +279,7 @@ pub const Frame = struct {
                 }
                 return err;
             } orelse break;
-            switch (@as(TlvType, @enumFromInt(tlv.type))) {
+            switch (@as(TlvType, @fromBackingInt(@intCast(tlv.type)))) {
                 .device_id => f.device_id = tlv.value,
                 .port_id => f.port_id = tlv.value,
                 .software_version => f.software_version = tlv.value,
@@ -295,7 +295,7 @@ pub const Frame = struct {
                 },
                 .duplex => {
                     if (tlv.value.len != 1) return ParseError.BadTlvValue;
-                    f.duplex = @enumFromInt(tlv.value[0]);
+                    f.duplex = @fromBackingInt(@intCast(tlv.value[0]));
                 },
                 .addresses => f.addresses_raw = tlv.value,
                 _ => {}, // unknown: reachable via tlvIterator()
@@ -374,39 +374,39 @@ pub const Builder = struct {
     }
 
     pub fn addDeviceId(b: *Builder, id: []const u8) BuildError!void {
-        try b.addTlv(@intFromEnum(TlvType.device_id), id);
+        try b.addTlv(@backingInt(TlvType.device_id), id);
     }
 
     pub fn addPortId(b: *Builder, id: []const u8) BuildError!void {
-        try b.addTlv(@intFromEnum(TlvType.port_id), id);
+        try b.addTlv(@backingInt(TlvType.port_id), id);
     }
 
     pub fn addSoftwareVersion(b: *Builder, v: []const u8) BuildError!void {
-        try b.addTlv(@intFromEnum(TlvType.software_version), v);
+        try b.addTlv(@backingInt(TlvType.software_version), v);
     }
 
     pub fn addPlatform(b: *Builder, p: []const u8) BuildError!void {
-        try b.addTlv(@intFromEnum(TlvType.platform), p);
+        try b.addTlv(@backingInt(TlvType.platform), p);
     }
 
     pub fn addVtpDomain(b: *Builder, d: []const u8) BuildError!void {
-        try b.addTlv(@intFromEnum(TlvType.vtp_domain), d);
+        try b.addTlv(@backingInt(TlvType.vtp_domain), d);
     }
 
     pub fn addCapabilities(b: *Builder, caps: Capabilities) BuildError!void {
         var word: [4]u8 = undefined;
         std.mem.writeInt(u32, &word, caps.toWire(), .big);
-        try b.addTlv(@intFromEnum(TlvType.capabilities), &word);
+        try b.addTlv(@backingInt(TlvType.capabilities), &word);
     }
 
     pub fn addNativeVlan(b: *Builder, vlan: u16) BuildError!void {
         var be: [2]u8 = undefined;
         std.mem.writeInt(u16, &be, vlan, .big);
-        try b.addTlv(@intFromEnum(TlvType.native_vlan), &be);
+        try b.addTlv(@backingInt(TlvType.native_vlan), &be);
     }
 
     pub fn addDuplex(b: *Builder, d: Duplex) BuildError!void {
-        try b.addTlv(@intFromEnum(TlvType.duplex), &.{@intFromEnum(d)});
+        try b.addTlv(@backingInt(TlvType.duplex), &.{@backingInt(d)});
     }
 
     /// An Addresses TLV holding IPv4 addresses (NLPID 0xCC entries).
@@ -415,7 +415,7 @@ pub const Builder = struct {
         const total = 4 + addrs.len * entry_len;
         if (total > 0xffff - 4) return BuildError.ValueTooLong;
         if (b.pos + 4 + total > b.buf.len) return BuildError.BufferTooSmall;
-        std.mem.writeInt(u16, b.buf[b.pos..][0..2], @intFromEnum(TlvType.addresses), .big);
+        std.mem.writeInt(u16, b.buf[b.pos..][0..2], @backingInt(TlvType.addresses), .big);
         std.mem.writeInt(u16, b.buf[b.pos + 2 ..][0..2], @intCast(4 + total), .big);
         var pos = b.pos + 4;
         std.mem.writeInt(u32, b.buf[pos..][0..4], @intCast(addrs.len), .big);
@@ -580,7 +580,7 @@ test "CDP tolerant: 802.3 zero-padding to the 60-byte minimum truncates the trai
     try b.addDeviceId("edge-sw1");
     const payload = b.finish(); // real CDP payload only, no padding yet
 
-    var padded: [60]u8 = [_]u8{0} ** 60;
+    var padded: [60]u8 = @as([60]u8, @splat(0));
     @memcpy(padded[0..payload.len], payload);
 
     try testing.expectError(
@@ -613,7 +613,7 @@ test "CDP tolerant: a malformed TLV followed by more non-zero bytes is NOT paddi
     @memcpy(frame_bytes[0..device_id_tlv.len], device_id_tlv);
     // Malformed TLV: type = platform (0x0006), declared total length = 2
     // (< the 4-byte header it would need to be well-formed).
-    std.mem.writeInt(u16, frame_bytes[11..13], @intFromEnum(TlvType.platform), .big);
+    std.mem.writeInt(u16, frame_bytes[11..13], @backingInt(TlvType.platform), .big);
     std.mem.writeInt(u16, frame_bytes[13..15], 2, .big);
     // Non-zero trailer standing in for an unreachable, would-be-legitimate
     // TLV -- the opposite of Ethernet zero-padding.
@@ -699,7 +699,7 @@ const cdp_seeds = [_][]const u8{
     // arms of `Address.ip` decode.
     testkit.fuzz.seedHex("02b40000" ++ "0002002d" ++ "00000002" ++
         "0101cc0004c0a80a02" ++
-        "020800000000000086dd0010" ++ "20" ** 16),
+        "020800000000000086dd0010" ++ strRepeat("20", 16)),
     // A count of 0xffffffff over one entry's worth of bytes: the iterator
     // must run out of buffer, not out of patience.
     testkit.fuzz.seedHex("02b40000" ++ "00020011" ++ "ffffffff" ++ "0101cc0004c0a80a02"),
@@ -838,4 +838,16 @@ test "fuzz driver: L2DISCO_FUZZ (cdp)" {
 
 test "fuzz harness: 400 seeds in every test run, and they get everywhere (cdp)" {
     try fz.checkReach("l2disco cdp", .{ fuzzCdpParse, fuzzCdpMutated }, 400);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

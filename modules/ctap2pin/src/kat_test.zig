@@ -387,7 +387,7 @@ test "protocol two: wrong-length inputs are typed errors, no panic" {
     try t.expectError(error.InvalidLength, Two.decrypt(&key, pt[0..1], buf[0..17]));
     try t.expectError(error.InvalidLength, Two.decrypt(&key, pt[0..8], buf[0..40]));
     // IV-only ciphertext = empty plaintext, valid.
-    const empty_ct = [_]u8{0x11} ** 16;
+    const empty_ct = @as([16]u8, @splat(0x11));
     try Two.decrypt(&key, pt[0..0], &empty_ct);
     // Destination mismatches.
     try t.expectError(error.InvalidLength, Two.decrypt(&key, pt[0..16], &buf));
@@ -447,8 +447,8 @@ test "protocol two: tampered ciphertext (incl. IV) fails MAC verification" {
 test "Impl(): comptime dispatch maps the wire enum to the namespaces" {
     try t.expectEqual(One, ctap2pin.Impl(.one));
     try t.expectEqual(Two, ctap2pin.Impl(.two));
-    try t.expectEqual(@as(u8, 1), @intFromEnum(ctap2pin.Protocol.one));
-    try t.expectEqual(@as(u8, 2), @intFromEnum(ctap2pin.Protocol.two));
+    try t.expectEqual(@as(u8, 1), @backingInt(ctap2pin.Protocol.one));
+    try t.expectEqual(@as(u8, 2), @backingInt(ctap2pin.Protocol.two));
     // The generic path works for both protocols. `authenticate`'s return
     // type and `verify`'s key type genuinely differ between the two (One:
     // fallible []const u8 key -- audit L2; Two: infallible *const [32]u8

@@ -30,9 +30,9 @@ test "KAT: keygen chain — seed_dk -> (y, x), chained same Xof context" {
 
     var y_support: [P.omega]u32 = undefined;
     prng.sampleFixedWeightRejection(&xof, P.n, P.nMu(), P.rejectionThreshold(), P.omega, &y_support);
-    var y = [_]u64{0} ** P.words();
+    var y = @as([P.words()]u64, @splat(0));
     prng.writeSupportToVector(P.omega, &y_support, &y);
-    var y_bytes = [_]u8{0} ** P.nBytes();
+    var y_bytes = @as([P.nBytes()]u8, @splat(0));
     const R = gf2x.Ring(P.n);
     R.toBytes(y, &y_bytes);
 
@@ -43,9 +43,9 @@ test "KAT: keygen chain — seed_dk -> (y, x), chained same Xof context" {
     // that only passes if getBytes's stream-position rounding is right.
     var x_support: [P.omega]u32 = undefined;
     prng.sampleFixedWeightRejection(&xof, P.n, P.nMu(), P.rejectionThreshold(), P.omega, &x_support);
-    var x = [_]u64{0} ** P.words();
+    var x = @as([P.words()]u64, @splat(0));
     prng.writeSupportToVector(P.omega, &x_support, &x);
-    var x_bytes = [_]u8{0} ** P.nBytes();
+    var x_bytes = @as([P.nBytes()]u8, @splat(0));
     R.toBytes(x, &x_bytes);
 
     const want_x = hexBytes(P.nBytes(), v.hqc128_x);
@@ -58,10 +58,10 @@ test "KAT: keygen chain — seed_ek -> h (SampleVect)" {
     const seed_ek = hexBytes(32, v.hqc128_seed_ek);
 
     var xof = prng.Xof.init(&seed_ek);
-    var h = [_]u64{0} ** P.words();
+    var h = @as([P.words()]u64, @splat(0));
     prng.sampleVect(&xof, P.n, &h);
 
-    var h_bytes = [_]u8{0} ** P.nBytes();
+    var h_bytes = @as([P.nBytes()]u8, @splat(0));
     const R = gf2x.Ring(P.n);
     R.toBytes(h, &h_bytes);
 

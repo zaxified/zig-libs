@@ -139,7 +139,7 @@ pub fn signedBlob(
     key_blob: []const u8,
 ) std.Io.Writer.Error!void {
     try messages.writeString(w, session_id);
-    try w.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_USERAUTH_REQUEST));
+    try w.writeByte(@backingInt(messages.MessageType.SSH_MSG_USERAUTH_REQUEST));
     try messages.writeString(w, user);
     try messages.writeString(w, service);
     try messages.writeString(w, "publickey");
@@ -345,7 +345,7 @@ pub fn authenticatePassword(
         gpa.free(buf);
     }
     var w: std.Io.Writer = .fixed(buf);
-    try w.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_USERAUTH_REQUEST));
+    try w.writeByte(@backingInt(messages.MessageType.SSH_MSG_USERAUTH_REQUEST));
     try messages.writeString(&w, user);
     try messages.writeString(&w, connection_service);
     try messages.writeString(&w, "password");
@@ -427,7 +427,7 @@ pub fn authenticateKeyboardInteractive(
     {
         var buf: [max_user_len + 128]u8 = undefined;
         var w: std.Io.Writer = .fixed(&buf);
-        try w.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_USERAUTH_REQUEST));
+        try w.writeByte(@backingInt(messages.MessageType.SSH_MSG_USERAUTH_REQUEST));
         try messages.writeString(&w, user);
         try messages.writeString(&w, connection_service);
         try messages.writeString(&w, "keyboard-interactive");
@@ -442,10 +442,10 @@ pub fn authenticateKeyboardInteractive(
         const pkt = try t.recvPacket(scratch);
         const mt = msgType(pkt);
         switch (mt) {
-            @intFromEnum(messages.MessageType.SSH_MSG_USERAUTH_SUCCESS) => return,
-            @intFromEnum(messages.MessageType.SSH_MSG_USERAUTH_FAILURE) => return error.AuthenticationFailed,
-            @intFromEnum(messages.MessageType.SSH_MSG_EXT_INFO) => try t.takeExtInfo(pkt.payload),
-            @intFromEnum(messages.MessageType.SSH_MSG_USERAUTH_BANNER) => {
+            @backingInt(messages.MessageType.SSH_MSG_USERAUTH_SUCCESS) => return,
+            @backingInt(messages.MessageType.SSH_MSG_USERAUTH_FAILURE) => return error.AuthenticationFailed,
+            @backingInt(messages.MessageType.SSH_MSG_EXT_INFO) => try t.takeExtInfo(pkt.payload),
+            @backingInt(messages.MessageType.SSH_MSG_USERAUTH_BANNER) => {
                 var c = Cursor{ .b = pkt.payload[1..] };
                 const msg = try c.string();
                 if (msg.len > max_banner_len) return error.NameTooLong;
@@ -503,7 +503,7 @@ fn sendPublickeyRequest(
         blob.len + if (signature) |s| s.len else 0);
     defer gpa.free(buf);
     var w: std.Io.Writer = .fixed(buf);
-    try w.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_USERAUTH_REQUEST));
+    try w.writeByte(@backingInt(messages.MessageType.SSH_MSG_USERAUTH_REQUEST));
     try messages.writeString(&w, user);
     try messages.writeString(&w, service);
     try messages.writeString(&w, "publickey");
@@ -524,7 +524,7 @@ fn awaitAuthReply(t: *transport.Transport, scratch: []u8, banner: ?BannerHandler
     var seen: usize = 0;
     while (seen < 64) : (seen += 1) {
         const pkt = try t.recvPacket(scratch);
-        switch (@as(messages.MessageType, @enumFromInt(msgType(pkt)))) {
+        switch (@as(messages.MessageType, @fromBackingInt(@intCast(msgType(pkt))))) {
             .SSH_MSG_IGNORE, .SSH_MSG_DEBUG => continue,
             // RFC 8308 §2.4's SECOND opportunity: a server may send EXT_INFO
             // "immediately preceding" SSH_MSG_USERAUTH_SUCCESS, and §2.4 says
@@ -810,7 +810,7 @@ pub fn serveUserauth(
     var attempts: u32 = 0;
     while (attempts < config.max_attempts) {
         const pkt = try t.recvPacket(scratch);
-        switch (@as(messages.MessageType, @enumFromInt(msgType(pkt)))) {
+        switch (@as(messages.MessageType, @fromBackingInt(@intCast(msgType(pkt))))) {
             .SSH_MSG_IGNORE, .SSH_MSG_DEBUG => continue,
             .SSH_MSG_DISCONNECT => {
                 if (config.failure) |out| out.* = .peer_disconnected;
@@ -996,7 +996,7 @@ fn servePublickey(
         // §7 query phase: SSH_MSG_USERAUTH_PK_OK || string alg || string blob.
         var buf: [max_key_blob_len + 256]u8 = undefined;
         var w: std.Io.Writer = .fixed(&buf);
-        try w.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_USERAUTH_PK_OK));
+        try w.writeByte(@backingInt(messages.MessageType.SSH_MSG_USERAUTH_PK_OK));
         try messages.writeString(&w, algorithm);
         try messages.writeString(&w, key_blob);
         try t.sendPacket(w.buffered());
@@ -1031,7 +1031,7 @@ fn servePublickey(
 }
 
 fn sendSuccess(t: *transport.Transport) UserauthError!void {
-    return t.sendPacket(&[_]u8{@intFromEnum(messages.MessageType.SSH_MSG_USERAUTH_SUCCESS)});
+    return t.sendPacket(&[_]u8{@backingInt(messages.MessageType.SSH_MSG_USERAUTH_SUCCESS)});
 }
 
 /// SSH_MSG_USERAUTH_FAILURE (§5.1): `name-list of methods that can continue
@@ -1054,7 +1054,7 @@ fn sendFailure(t: *transport.Transport, config: AuthConfig) UserauthError!void {
     }
     var buf: [128]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
-    try w.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_USERAUTH_FAILURE));
+    try w.writeByte(@backingInt(messages.MessageType.SSH_MSG_USERAUTH_FAILURE));
     try messages.writeNameList(&w, names[0..n]);
     try w.writeByte(0);
     return t.sendPacket(w.buffered());
@@ -1064,7 +1064,7 @@ fn sendBanner(t: *transport.Transport, banner: []const u8) UserauthError!void {
     if (banner.len > max_banner_len) return error.NameTooLong;
     var buf: [max_banner_len + 64]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
-    try w.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_USERAUTH_BANNER));
+    try w.writeByte(@backingInt(messages.MessageType.SSH_MSG_USERAUTH_BANNER));
     try messages.writeString(&w, banner);
     try messages.writeString(&w, ""); // language tag
     return t.sendPacket(w.buffered());
@@ -1184,7 +1184,7 @@ const UserauthCorpus = struct {
     /// whatever the method-specific parser is then handed.
     fn request(buf: []u8, user: []const u8, method: []const u8, rest: []const u8) []const u8 {
         var w: std.Io.Writer = .fixed(buf);
-        w.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_USERAUTH_REQUEST)) catch unreachable;
+        w.writeByte(@backingInt(messages.MessageType.SSH_MSG_USERAUTH_REQUEST)) catch unreachable;
         messages.writeString(&w, user) catch unreachable;
         messages.writeString(&w, connection_service) catch unreachable;
         messages.writeString(&w, method) catch unreachable;
@@ -1221,7 +1221,7 @@ const UserauthCorpus = struct {
         var tail1: [256]u8 = undefined;
         const query = publickeyTail(&tail1, false, "ssh-ed25519", blob, "");
         var tail2: [512]u8 = undefined;
-        const signed = publickeyTail(&tail2, true, "ssh-ed25519", blob, &([_]u8{0x5a} ** 83));
+        const signed = publickeyTail(&tail2, true, "ssh-ed25519", blob, &(@as([83]u8, @splat(0x5a))));
 
         var r1: [512]u8 = undefined;
         var r2: [768]u8 = undefined;
@@ -1244,7 +1244,7 @@ const UserauthCorpus = struct {
         // A user string announcing 4 GiB — the oversize-string refusal.
         var r6: [64]u8 = undefined;
         var w6: std.Io.Writer = .fixed(&r6);
-        w6.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_USERAUTH_REQUEST)) catch unreachable;
+        w6.writeByte(@backingInt(messages.MessageType.SSH_MSG_USERAUTH_REQUEST)) catch unreachable;
         w6.writeAll(&[_]u8{ 0xff, 0xff, 0xff, 0xff }) catch unreachable;
         w6.writeAll("junk") catch unreachable;
         self.push(&.{w6.buffered()});
@@ -1396,7 +1396,7 @@ test "serveUserauth: an oversize peer string is a typed error, not a panic" {
     // SSH_MSG_USERAUTH_REQUEST whose `user` string announces 4 GiB.
     var pbuf: [64]u8 = undefined;
     var pw: std.Io.Writer = .fixed(&pbuf);
-    try pw.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_USERAUTH_REQUEST));
+    try pw.writeByte(@backingInt(messages.MessageType.SSH_MSG_USERAUTH_REQUEST));
     try pw.writeAll(&[_]u8{ 0xff, 0xff, 0xff, 0xff });
     try pw.writeAll("junk");
 
@@ -1422,7 +1422,7 @@ test "serveUserauth: an oversize packet length is rejected by the framing layer"
     const t = std.testing;
     // A packet_length field of 0xffff_ffff — the Binary Packet Protocol must
     // refuse it before anything tries to allocate or index with it.
-    const evil = [_]u8{ 0xff, 0xff, 0xff, 0xff } ++ [_]u8{0} ** 16;
+    const evil = [_]u8{ 0xff, 0xff, 0xff, 0xff } ++ @as([16]u8, @splat(0));
     var r: std.Io.Reader = .fixed(&evil);
     var sink_buf: [512]u8 = undefined;
     var sink: std.Io.Writer = .fixed(&sink_buf);
@@ -1445,7 +1445,7 @@ test "serveUserauth: a received plaintext password does not survive in the freed
     const secret = "s3cr3t-correct-horse-battery";
     var pbuf: [256]u8 = undefined;
     var pw: std.Io.Writer = .fixed(&pbuf);
-    try pw.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_USERAUTH_REQUEST));
+    try pw.writeByte(@backingInt(messages.MessageType.SSH_MSG_USERAUTH_REQUEST));
     try messages.writeString(&pw, "alice");
     try messages.writeString(&pw, connection_service);
     try messages.writeString(&pw, "password");
@@ -1500,7 +1500,7 @@ test "serveUserauth: a received plaintext password does not survive in the freed
 test "an ed25519 userauth signature verifies only against its own session id" {
     const t = std.testing;
     const gpa = t.allocator;
-    const seed: [32]u8 = [_]u8{7} ** 32;
+    const seed: [32]u8 = @as([32]u8, @splat(7));
     const key: AuthKey = .{ .ed25519 = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed) };
     const blob = try key.publicBlob(gpa);
     defer gpa.free(blob);
@@ -1540,7 +1540,7 @@ test "servePublickey: an ed25519 key blob, its OWN valid signature, wrapped in a
     // signature is cryptographically valid over exactly this forged request.
     const t = std.testing;
     const gpa = t.allocator;
-    const seed: [32]u8 = [_]u8{9} ** 32;
+    const seed: [32]u8 = @as([32]u8, @splat(9));
     const kp = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed);
     const key: AuthKey = .{ .ed25519 = kp };
     const blob = try key.publicBlob(gpa);
@@ -1613,7 +1613,7 @@ test "delivered DoS-limit defaults are pinned to their documented values" {
 /// `tail` appended verbatim (the method-specific fields).
 fn frameAuthRequest(out: []u8, payload_buf: []u8, method: []const u8, tail: []const u8) ![]const u8 {
     var pw: std.Io.Writer = .fixed(payload_buf);
-    try pw.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_USERAUTH_REQUEST));
+    try pw.writeByte(@backingInt(messages.MessageType.SSH_MSG_USERAUTH_REQUEST));
     try messages.writeString(&pw, "alice");
     try messages.writeString(&pw, connection_service);
     try messages.writeString(&pw, method);
@@ -1780,7 +1780,7 @@ test "serveUserauth reports WHY it refused, which the wire deliberately cannot" 
     {
         var payload: [256]u8 = undefined;
         var pw: std.Io.Writer = .fixed(&payload);
-        try pw.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_USERAUTH_REQUEST));
+        try pw.writeByte(@backingInt(messages.MessageType.SSH_MSG_USERAUTH_REQUEST));
         try messages.writeString(&pw, "alice");
         try messages.writeString(&pw, "some-other-service");
         try messages.writeString(&pw, "password");
@@ -1800,7 +1800,7 @@ test "serveUserauth reports WHY it refused, which the wire deliberately cannot" 
     {
         var payload: [64]u8 = undefined;
         var pw: std.Io.Writer = .fixed(&payload);
-        try pw.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_DISCONNECT));
+        try pw.writeByte(@backingInt(messages.MessageType.SSH_MSG_DISCONNECT));
         var wire: [256]u8 = undefined;
         const framed = try framePackets(&wire, &.{pw.buffered()});
         var why: AuthFailure = .bad_signature;
@@ -1818,7 +1818,7 @@ test "AuthorizedKeyCheck: the caller's context decides, and its refusal is named
     // live peer to answer SSH_MSG_USERAUTH_PK_OK.
     const t = std.testing;
     const gpa = t.allocator;
-    const key: AuthKey = .{ .ed25519 = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic([_]u8{3} ** 32) };
+    const key: AuthKey = .{ .ed25519 = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(3))) };
     const blob = try key.publicBlob(gpa);
     defer gpa.free(blob);
 

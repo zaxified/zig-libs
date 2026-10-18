@@ -2869,12 +2869,12 @@ const net = std.Io.net;
 
 /// 256 bytes — larger than the small client windows the flow-control tests
 /// advertise, so the response body must be window-throttled.
-const big_body = "abcdefgh" ** 32;
+const big_body = strRepeat("abcdefgh", 32);
 
 /// 8 KiB — larger than the default 4 KiB `response_buffer_size`, so a
 /// handler writing it forces `ResponseWriter` into streaming (chunked)
 /// framing and the response reaches the wire *before* the handler returns.
-const long_body = "0123456789abcdef" ** 512;
+const long_body = strRepeat("0123456789abcdef", 512);
 
 /// Scratch the `/stream-count` route drains into. File scope, not a stack
 /// array: it is 16 KiB and the handler runs on the connection's task.
@@ -3768,7 +3768,7 @@ fn postEncoded(path: []const u8, coding: []const u8) [5]hpack.Field {
 }
 
 /// 52 plain bytes: repetitive, so the gzip member is shorter than the text.
-const gz_plain = "gzipped-body!" ** 4;
+const gz_plain = strRepeat("gzipped-body!", 4);
 
 test "h2c serve: a gzip request body is decoded for the handler when max_decompressed_request_bytes is set, as on h1" {
     const gpa = testing.allocator;
@@ -4035,7 +4035,7 @@ test "h2c serve: the codec's own error answers carry date and server, as h1's do
     defer peer.deinit();
     try peer.conn.sendPreface(&peer.wire);
     const sid = try peer.conn.startStream(&peer.wire, &fieldsFor("POST", "/drain"), false);
-    try peer.conn.sendData(&peer.wire, sid, "x" ** 32, true);
+    try peer.conn.sendData(&peer.wire, sid, strRepeat("x", 32), true);
 
     var out_buf: [2048]u8 = undefined;
     try runOffline(&peer, .{
@@ -4058,7 +4058,7 @@ test "h2c serve: request body over max_body_bytes → 413, connection closes (of
 
     try peer.conn.sendPreface(&peer.wire);
     const sid = try peer.conn.startStream(&peer.wire, &fieldsFor("POST", "/drain"), false);
-    try peer.conn.sendData(&peer.wire, sid, "x" ** 32, true);
+    try peer.conn.sendData(&peer.wire, sid, strRepeat("x", 32), true);
 
     var out_buf: [2048]u8 = undefined;
     try runOffline(&peer, .{ .handler = testHandler, .max_body_bytes = 8 }, &out_buf);
@@ -4075,7 +4075,7 @@ test "h2c serve: request body over max_body_bytes → 413, connection closes (of
     defer peer2.deinit();
     try peer2.conn.sendPreface(&peer2.wire);
     const sid2 = try peer2.conn.startStream(&peer2.wire, &fieldsFor("POST", "/drain"), false);
-    try peer2.conn.sendData(&peer2.wire, sid2, "x" ** 8, true);
+    try peer2.conn.sendData(&peer2.wire, sid2, strRepeat("x", 8), true);
     try runOffline(&peer2, .{ .handler = testHandler, .max_body_bytes = 8 }, &out_buf);
     try testing.expectEqual(@as(u16, 200), peer2.resp(sid2).status);
     try testing.expectEqualStrings("drained 8", peer2.resp(sid2).body.items);
@@ -4095,9 +4095,9 @@ test "h2c serve: max_body_bytes is enforced CONNECTION-WIDE, not per stream (A1 
 
     try peer.conn.sendPreface(&peer.wire);
     const sid1 = try peer.conn.startStream(&peer.wire, &fieldsFor("POST", "/drain"), false);
-    try peer.conn.sendData(&peer.wire, sid1, "x" ** 5, false); // 5 bytes, not yet complete
+    try peer.conn.sendData(&peer.wire, sid1, strRepeat("x", 5), false); // 5 bytes, not yet complete
     const sid2 = try peer.conn.startStream(&peer.wire, &fieldsFor("POST", "/drain"), false);
-    try peer.conn.sendData(&peer.wire, sid2, "y" ** 5, true); // 5 alone, but 5+5 > 8 connection-wide
+    try peer.conn.sendData(&peer.wire, sid2, strRepeat("y", 5), true); // 5 alone, but 5+5 > 8 connection-wide
     try peer.conn.sendData(&peer.wire, sid1, "", true); // complete stream 1 at exactly its own 5 bytes
 
     var out_buf: [2048]u8 = undefined;
@@ -4188,8 +4188,8 @@ test "h2c serve: CONTINUATION flood (CVE-2024-27316) → GOAWAY(ENHANCE_YOUR_CAL
         var peer: TestPeer = .init(gpa, .{});
         defer peer.deinit();
         try peer.conn.sendPreface(&peer.wire);
-        try h2.encodeHeaders(gpa, &peer.wire, 1, &(.{0} ** 200), .{ .end_headers = false });
-        try h2.encodeContinuation(gpa, &peer.wire, 1, &(.{0} ** 200), false);
+        try h2.encodeHeaders(gpa, &peer.wire, 1, &@as([200]u8, @splat(0)), .{ .end_headers = false });
+        try h2.encodeContinuation(gpa, &peer.wire, 1, &@as([200]u8, @splat(0)), false);
         var out_buf: [1024]u8 = undefined;
         try runOffline(&peer, .{
             .handler = testHandler,
@@ -4327,7 +4327,7 @@ test "h2c serve: PING flood → GOAWAY(ENHANCE_YOUR_CALM)" {
     defer peer.deinit();
 
     try peer.conn.sendPreface(&peer.wire);
-    for (0..20) |_| try peer.conn.sendPing(&peer.wire, .{0xaa} ** 8);
+    for (0..20) |_| try peer.conn.sendPing(&peer.wire, @splat(0xaa));
 
     var out_buf: [2048]u8 = undefined;
     try runOffline(&peer, .{
@@ -4685,7 +4685,7 @@ test "h2 streaming request: WINDOW_UPDATE follows consumption, not arrival" {
 
     try peer.conn.sendPreface(&peer.wire);
     const sid = try peer.conn.startStream(&peer.wire, &fieldsFor("POST", "/stream-partial"), false);
-    try peer.conn.sendData(&peer.wire, sid, "x" ** 100, false);
+    try peer.conn.sendData(&peer.wire, sid, strRepeat("x", 100), false);
 
     var out_buf: [8192]u8 = undefined;
     try runOffline(&peer, streamOpts(), &out_buf);
@@ -4712,7 +4712,7 @@ test "h2 streaming request: a handler that never reads does not wedge the connec
 
     try peer.conn.sendPreface(&peer.wire);
     const sid = try peer.conn.startStream(&peer.wire, &fieldsFor("POST", "/stream-ignore"), false);
-    try peer.conn.sendData(&peer.wire, sid, "y" ** 500, false); // never ended
+    try peer.conn.sendData(&peer.wire, sid, strRepeat("y", 500), false); // never ended
     // A second stream behind it must still be served.
     const sid2 = try peer.conn.startStream(&peer.wire, &get_fields, true);
 
@@ -4775,7 +4775,7 @@ test "h2 streaming request: max_body_bytes → 413, the connection survives" {
 
     try peer.conn.sendPreface(&peer.wire);
     const sid = try peer.conn.startStream(&peer.wire, &fieldsFor("POST", "/stream-count"), false);
-    try peer.conn.sendData(&peer.wire, sid, "z" ** 32, true);
+    try peer.conn.sendData(&peer.wire, sid, strRepeat("z", 32), true);
     const sid2 = try peer.conn.startStream(&peer.wire, &get_fields, true);
 
     var out_buf: [8192]u8 = undefined;
@@ -6954,4 +6954,16 @@ test "h2: a buffered request body is zeroed before the codec frees it" {
 
     try testing.expectEqual(@as(u16, 200), peer.resp(sid).status);
     try testing.expectEqual(@as(usize, 0), watch.dirty_frees);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

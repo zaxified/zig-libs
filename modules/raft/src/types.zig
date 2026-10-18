@@ -96,9 +96,9 @@ pub const DecodeError = error{
 /// with "invalid enum value" for anything outside the three defined kinds.
 fn entryKindFrom(b: u8) DecodeError!EntryKind {
     return switch (b) {
-        @intFromEnum(EntryKind.noop) => .noop,
-        @intFromEnum(EntryKind.command) => .command,
-        @intFromEnum(EntryKind.config) => .config,
+        @backingInt(EntryKind.noop) => .noop,
+        @backingInt(EntryKind.command) => .command,
+        @backingInt(EntryKind.config) => .config,
         else => error.InvalidEncoding,
     };
 }
@@ -114,7 +114,7 @@ pub const LogEntry = struct {
 
     pub fn encode(self: LogEntry, buf: *[wire_len]u8) void {
         std.mem.writeInt(u64, buf[0..8], self.term, .little);
-        buf[8] = @intFromEnum(self.kind);
+        buf[8] = @backingInt(self.kind);
         std.mem.writeInt(u64, buf[9..17], self.command, .little);
     }
 
@@ -148,10 +148,10 @@ pub const RpcTag = enum(u8) {
 pub fn tagOf(payload: []const u8) DecodeError!RpcTag {
     if (payload.len < 1) return error.Truncated;
     return switch (payload[0]) {
-        @intFromEnum(RpcTag.request_vote_req) => .request_vote_req,
-        @intFromEnum(RpcTag.request_vote_resp) => .request_vote_resp,
-        @intFromEnum(RpcTag.append_entries_req) => .append_entries_req,
-        @intFromEnum(RpcTag.append_entries_resp) => .append_entries_resp,
+        @backingInt(RpcTag.request_vote_req) => .request_vote_req,
+        @backingInt(RpcTag.request_vote_resp) => .request_vote_resp,
+        @backingInt(RpcTag.append_entries_req) => .append_entries_req,
+        @backingInt(RpcTag.append_entries_resp) => .append_entries_resp,
         else => error.InvalidEncoding,
     };
 }
@@ -167,7 +167,7 @@ pub const RequestVoteReq = struct {
     pub const wire_len = 1 + 8 + 4 + 8 + 8; // = 29
 
     pub fn encode(self: RequestVoteReq, buf: *[wire_len]u8) void {
-        buf[0] = @intFromEnum(RpcTag.request_vote_req);
+        buf[0] = @backingInt(RpcTag.request_vote_req);
         std.mem.writeInt(u64, buf[1..9], self.term, .little);
         std.mem.writeInt(u32, buf[9..13], self.candidate_id, .little);
         std.mem.writeInt(u64, buf[13..21], self.last_log_index, .little);
@@ -194,7 +194,7 @@ pub const RequestVoteResp = struct {
     pub const wire_len = 1 + 8 + 1; // = 10
 
     pub fn encode(self: RequestVoteResp, buf: *[wire_len]u8) void {
-        buf[0] = @intFromEnum(RpcTag.request_vote_resp);
+        buf[0] = @backingInt(RpcTag.request_vote_resp);
         std.mem.writeInt(u64, buf[1..9], self.term, .little);
         buf[9] = @intFromBool(self.vote_granted);
     }
@@ -226,7 +226,7 @@ pub const AppendEntriesReq = struct {
     /// Encode into `buf`; returns the number of bytes written.
     pub fn encode(self: AppendEntriesReq, buf: *[max_wire]u8) usize {
         std.debug.assert(self.entries.len <= max_entries_per_msg);
-        buf[0] = @intFromEnum(RpcTag.append_entries_req);
+        buf[0] = @backingInt(RpcTag.append_entries_req);
         std.mem.writeInt(u64, buf[1..9], self.term, .little);
         std.mem.writeInt(u32, buf[9..13], self.leader_id, .little);
         std.mem.writeInt(u64, buf[13..21], self.prev_log_index, .little);
@@ -293,7 +293,7 @@ pub const AppendEntriesResp = struct {
     pub const wire_len = 1 + 8 + 1 + 8; // = 18
 
     pub fn encode(self: AppendEntriesResp, buf: *[wire_len]u8) void {
-        buf[0] = @intFromEnum(RpcTag.append_entries_resp);
+        buf[0] = @backingInt(RpcTag.append_entries_resp);
         std.mem.writeInt(u64, buf[1..9], self.term, .little);
         buf[9] = @intFromBool(self.success);
         std.mem.writeInt(u64, buf[10..18], self.match_index, .little);
@@ -510,7 +510,7 @@ test "PersistentState with an empty log and no vote round-trips" {
 
 test "decoders reject every input too short for their fixed fields" {
     try testing.expectError(error.Truncated, tagOf(&[_]u8{}));
-    try testing.expectError(error.Truncated, LogEntry.decode(&[_]u8{0} ** (LogEntry.wire_len - 1)));
+    try testing.expectError(error.Truncated, LogEntry.decode(&@as([LogEntry.wire_len - 1]u8, @splat(0))));
     // The exact reproducer from the bug report.
     try testing.expectError(error.Truncated, RequestVoteReq.decode(&[_]u8{0}));
     try testing.expectError(error.Truncated, RequestVoteResp.decode(&[_]u8{0}));
@@ -528,7 +528,7 @@ test "decoders reject every input too short for their fixed fields" {
 
 test "decoders reject undefined tag and entry-kind bytes" {
     for (4..256) |b| try testing.expectError(error.InvalidEncoding, tagOf(&[_]u8{@intCast(b)}));
-    var e = [_]u8{0} ** LogEntry.wire_len;
+    var e = @as([LogEntry.wire_len]u8, @splat(0));
     for (3..256) |b| {
         e[8] = @intCast(b);
         try testing.expectError(error.InvalidEncoding, LogEntry.decode(&e));
@@ -602,7 +602,7 @@ test "AppendEntriesReq rejects a wire entry count the buffer cannot back" {
     // fires if the array is ever resized), not just off an arbitrarily large
     // count — a bound anywhere in [9, 65534] would pass a bare "reject 0xFFFF"
     // check, including one that has quietly stopped protecting `scratch`.
-    var p = [_]u8{0} ** AppendEntriesReq.header_len;
+    var p = @as([AppendEntriesReq.header_len]u8, @splat(0));
     std.mem.writeInt(u16, p[37..39], max_entries_per_msg + 1, .little);
     try testing.expectError(error.InvalidEncoding, AppendEntriesReq.decode(&p, &scratch));
 
@@ -618,7 +618,7 @@ test "AppendEntriesReq rejects a wire entry count the buffer cannot back" {
     try testing.expectError(error.Truncated, AppendEntriesReq.decode(&p, &scratch));
 
     // One entry short of the declared count is still rejected.
-    var q = [_]u8{0} ** (AppendEntriesReq.header_len + 2 * LogEntry.wire_len);
+    var q = @as([AppendEntriesReq.header_len + 2 * LogEntry.wire_len]u8, @splat(0));
     std.mem.writeInt(u16, q[37..39], 3, .little);
     try testing.expectError(error.Truncated, AppendEntriesReq.decode(&q, &scratch));
     std.mem.writeInt(u16, q[37..39], 2, .little);
@@ -627,11 +627,11 @@ test "AppendEntriesReq rejects a wire entry count the buffer cannot back" {
 
 test "PersistentState.deserialize rejects a log count the image cannot back" {
     const gpa = testing.allocator;
-    try testing.expectError(error.Truncated, PersistentState.deserialize(gpa, &[_]u8{0} ** 15));
+    try testing.expectError(error.Truncated, PersistentState.deserialize(gpa, &@as([15]u8, @splat(0))));
 
     // 16 bytes claiming 1_000_000 entries: previously allocated 24 MB and then
     // read far past the buffer ("index out of bounds: index 33, len 16").
-    var b = [_]u8{0} ** PersistentState.header_len;
+    var b = @as([PersistentState.header_len]u8, @splat(0));
     std.mem.writeInt(u32, b[12..16], 1_000_000, .little);
     try testing.expectError(error.Truncated, PersistentState.deserialize(gpa, &b));
 
@@ -823,11 +823,11 @@ const append_entries_seeds = [_][]const u8{
         "0400000000000000" ++ "00" ++ "2a00000000000000" ++
         "0500000000000000" ++ "01" ++ "2b00000000000000"), // two entries, both kinds
     seed("02" ++ "0100000000000000" ++ "07000000" ++ "0300000000000000" ++ "0100000000000000" ++ "0200000000000000" ++ "0800" ++
-        ("0400000000000000" ++ "00" ++ "2a00000000000000") ** 8), // the full batch: `max_entries_per_msg`
+        strRepeat(("0400000000000000" ++ "00" ++ "2a00000000000000"), 8)), // the full batch: `max_entries_per_msg`
     seed("02" ++ "0100000000000000" ++ "07000000" ++ "0300000000000000" ++ "0100000000000000" ++ "0200000000000000" ++ "0900"), // ⭐ a count of 9: one past `max_entries_per_msg`, with no entries behind it
     seed("02" ++ "0100000000000000" ++ "07000000" ++ "0300000000000000" ++ "0100000000000000" ++ "0200000000000000" ++ "ffff"), // ⭐ a count of 65535
     seed("02" ++ "0100000000000000" ++ "07000000" ++ "0300000000000000" ++ "0100000000000000" ++ "0200000000000000" ++ "0800" ++
-        ("0400000000000000" ++ "00" ++ "2a00000000000000") ** 3), // ⭐ a count of 8 with only 3 entries behind it: the lying count
+        strRepeat(("0400000000000000" ++ "00" ++ "2a00000000000000"), 3)), // ⭐ a count of 8 with only 3 entries behind it: the lying count
     seed("02" ++ "0100000000000000" ++ "07000000" ++ "0300000000000000" ++ "0100000000000000" ++ "0200000000000000" ++ "0100" ++
         "0400000000000000" ++ "03" ++ "2a00000000000000"), // an entry with an UNDEFINED kind inside a well-formed batch
     seed("02" ++ "0100000000000000" ++ "07000000" ++ "0300000000000000" ++ "0100000000000000" ++ "0200000000"), // truncated inside the header
@@ -891,7 +891,7 @@ const persistent_state_seeds = [_][]const u8{
     seed("0000000000000000" ++ "ffffffff" ++ "00000000"), // `no_vote`
     seed("0100000000000000" ++ "07000000" ++ "01000000" ++ "0400000000000000" ++ "00" ++ "2a00000000000000"), // one log entry
     seed("0100000000000000" ++ "07000000" ++ "04000000" ++
-        ("0400000000000000" ++ "00" ++ "2a00000000000000") ** 4), // four entries: the buffer's full width
+        strRepeat(("0400000000000000" ++ "00" ++ "2a00000000000000"), 4)), // four entries: the buffer's full width
     seed("0100000000000000" ++ "07000000" ++ "40420f00"), // ⭐ 1 000 000 entries: the 24 MB over-allocation
     seed("0100000000000000" ++ "07000000" ++ "ffffffff"), // ⭐ 0xFFFFFFFF entries: ~103 GB demanded
     seed("0100000000000000" ++ "07000000" ++ "02000000" ++ "0400000000000000" ++ "00" ++ "2a00000000000000"), // ⭐ a count of 2 with one entry behind it
@@ -1032,4 +1032,16 @@ test "corpus: every raft seed reaches its decoder, and what each accepted is pin
     try testing.expectEqual(@as(usize, 4), ps_images);
     // Likewise: an empty log is a legal image, so this is the reach number.
     try testing.expectEqual(@as(usize, 5), ps_entries);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

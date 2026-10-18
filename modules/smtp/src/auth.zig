@@ -240,7 +240,7 @@ const auth_seeds = [_][]const u8{
     seed("  "), // whitespace only: trimmed to empty, which is legal
     seed("ti\x00m"), // InvalidCredential: a NUL would forge the RFC 4616 separator
     seed("pw\r\nQUIT"), // InvalidCredential: a CRLF would forge a command line
-    seed("A" ** 200), // exactly the harness buffer: over the PLAIN output cap
+    seed(strRepeat("A", 200)), // exactly the harness buffer: over the PLAIN output cap
 };
 
 test "fuzz: arbitrary challenges and credentials never crash" {
@@ -302,4 +302,16 @@ test "corpus: every auth seed reaches all four entry points, and the counts are 
     // 3 = the two LOGIN challenges plus the PLAIN response, whose decoded
     // "\x00test\x00tEsTiNg" contains "test" and so reads as a username prompt.
     try testing.expectEqual(@as(usize, 3), classified);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

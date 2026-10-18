@@ -40,7 +40,7 @@ const burn = @import("burn.zig");
 pub const encoded_bytes = 56;
 pub const CompressedScalar = [encoded_bytes]u8;
 
-pub const zero: CompressedScalar = [_]u8{0} ** encoded_bytes;
+pub const zero: CompressedScalar = @as([encoded_bytes]u8, @splat(0));
 
 pub const ScalarError = ed448.scalar.ScalarError;
 
@@ -166,7 +166,7 @@ pub const one: CompressedScalar = blk: {
 /// `HashToScalar` width (see `hash.hashToScalar`).
 pub fn reduce(comptime n: usize, bytes: [n]u8) CompressedScalar {
     comptime if (n > 114) @compileError("scalar.reduce: at most 114 bytes");
-    var wide = [_]u8{0} ** 114;
+    var wide = @as([114]u8, @splat(0));
     wide[0..n].* = bytes;
     return fromEd448(ed448.scalar.reduceWide(wide));
 }
@@ -345,14 +345,14 @@ test "fromWide/reduce agree with the big-integer oracle (SELF-DERIVED)" {
         const want64 = @as(Big, std.mem.readInt(u512, &w64, .little)) % l_big;
         try std.testing.expectEqualSlices(u8, &scalarOf(want64), &reduce(64, w64));
     }
-    const ff = [_]u8{0xff} ** 114;
+    const ff = @as([114]u8, @splat(0xff));
     const want_ff = ((@as(Big, 1) << 912) - 1) % l_big;
     try std.testing.expectEqualSlices(u8, &scalarOf(want_ff), &fromWide(ff));
     // l itself and 0 reduce to 0
-    var l114 = [_]u8{0} ** 114;
+    var l114 = @as([114]u8, @splat(0));
     l114[0..57].* = ed448.scalar.l_bytes;
     try std.testing.expectEqualSlices(u8, &zero, &fromWide(l114));
-    try std.testing.expectEqualSlices(u8, &zero, &fromWide([_]u8{0} ** 114));
+    try std.testing.expectEqualSlices(u8, &zero, &fromWide(@as([114]u8, @splat(0))));
 }
 
 test "random: canonical and (overwhelmingly) distinct" {

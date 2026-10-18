@@ -354,7 +354,7 @@ pub const journal = struct {
             n += 1;
             var prio_buf: [1]u8 = undefined;
             if (opts.priority) |p| {
-                prio_buf[0] = '0' + @as(u8, @intFromEnum(p));
+                prio_buf[0] = '0' + @as(u8, @backingInt(p));
                 buf[n] = .{ .name = "PRIORITY", .value = prio_buf[0..1] };
                 n += 1;
             }
@@ -423,10 +423,10 @@ test "a socket path must leave room for the NUL; sendMessage counts its own fiel
     // caller's fields. Mutation 2026-10-04: an off-by-one path check and a
     // missing field-count check in `sendMessage` both survived.
     const sun_len = @typeInfo(@FieldType(linux.sockaddr.un, "path")).array.len;
-    try std.testing.expectError(error.PathTooLong, UnixEmitter.open("p" ** sun_len));
+    try std.testing.expectError(error.PathTooLong, UnixEmitter.open(strRepeat("p", sun_len)));
     var e = try journal.Emitter.open("/nonexistent-zig-libs-test-socket");
     defer e.close();
-    const many = [_]journal.Field{.{ .name = "F", .value = "v" }} ** journal.max_fields;
+    const many = @as([journal.max_fields]journal.Field, @splat(.{ .name = "F", .value = "v" }));
     try std.testing.expectError(error.TooManyFields, e.sendMessage(.{ .message = "m", .fields = &many }));
 }
 
@@ -522,7 +522,7 @@ test "UnixEmitter: sendRaw over budget is MessageTooLarge, not a truncated send"
 }
 
 test "UnixEmitter: PathTooLong instead of a silently truncated (wrong) path" {
-    const too_long = "x" ** 200;
+    const too_long = strRepeat("x", 200);
     try t.expectError(error.PathTooLong, UnixEmitter.open(too_long));
 }
 
@@ -532,8 +532,8 @@ test "journal.validFieldName: sd_journal's rules" {
     try journal.validFieldName("A");
     try journal.validFieldName("A0");
     try t.expectError(error.FieldNameEmpty, journal.validFieldName(""));
-    try t.expectError(error.FieldNameTooLong, journal.validFieldName("A" ** 65));
-    try journal.validFieldName("A" ** 64); // exactly at the limit: fine
+    try t.expectError(error.FieldNameTooLong, journal.validFieldName(strRepeat("A", 65)));
+    try journal.validFieldName(strRepeat("A", 64)); // exactly at the limit: fine
     try t.expectError(error.FieldNameInvalidStart, journal.validFieldName("1FOO"));
     try t.expectError(error.FieldNameInvalidStart, journal.validFieldName("_FOO")); // reserved for trusted fields
     try t.expectError(error.FieldNameInvalidChar, journal.validFieldName("foo")); // lowercase
@@ -736,4 +736,16 @@ test "journald oracle: journal.Emitter and UnixEmitter.sendBsd send the bytes jo
         try ue.sendBsd(&c.msg);
         try t.expectEqualSlices(u8, c.unix, try r.recv(&buf));
     }
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

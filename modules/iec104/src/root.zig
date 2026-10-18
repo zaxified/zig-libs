@@ -591,7 +591,7 @@ test "a frame split across TCP segments survives a frame_buf at the documented m
     var f2: [apci.max_apdu_len]u8 = undefined;
     const full = try apci.encode(
         .{ .i = .{ .send_seq = 0, .recv_seq = 0 } },
-        &[_]u8{0} ** apci.max_asdu_len,
+        &@as([apci.max_asdu_len]u8, @splat(0)),
         &f2,
     );
     loop.deliver(full[0..200]);

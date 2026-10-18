@@ -62,13 +62,13 @@ const Entropy = dtls.Entropy;
 const certverify = dtls.certverify;
 const net = std.Io.net;
 
-const x25519_group: u16 = @intFromEnum(dtls.messages.NamedGroup.x25519);
-const secp256r1_group: u16 = @intFromEnum(dtls.messages.NamedGroup.secp256r1);
-const x25519_mlkem768_group: u16 = @intFromEnum(dtls.messages.NamedGroup.x25519_ml_kem768);
+const x25519_group: u16 = @backingInt(dtls.messages.NamedGroup.x25519);
+const secp256r1_group: u16 = @backingInt(dtls.messages.NamedGroup.secp256r1);
+const x25519_mlkem768_group: u16 = @backingInt(dtls.messages.NamedGroup.x25519_ml_kem768);
 
 /// Test fixtures — duplicated verbatim in `wolfssl_peer.c`. Test material
 /// only; nothing here is a default for anything.
-const psk = [_]u8{0x0b} ** 16;
+const psk = @as([16]u8, @splat(0x0b));
 const psk_identity = "zig-libs-dtls";
 
 /// The MAC key the stateless-cookie case's server uses. Test material.
@@ -655,7 +655,7 @@ fn clientConfig(case: Case, fx: *const Fixtures) dtls.Config {
             .chain = &fx.client_chain,
             .private_key = fx.clientKey(),
         } else null,
-        .key_share_group = @enumFromInt(case.offer_group),
+        .key_share_group = @fromBackingInt(@intCast(case.offer_group)),
     };
 }
 
@@ -748,7 +748,7 @@ fn runClientFlow(
     defer sock.close(io);
     const server_addr: net.IpAddress = .{ .ip4 = .loopback(port) };
 
-    const seed = [_]u8{case.seed} ** 32;
+    const seed = @as([32]u8, @splat(case.seed));
     var csprng = std.Random.DefaultCsprng.init(seed);
     const rnd = seededForTest(&csprng);
 
@@ -932,7 +932,7 @@ fn runServerFlow(
     // cleanup for the early-return paths; `wait` below is the real one.
     defer child.kill(io);
 
-    const seed = [_]u8{case.seed} ** 32;
+    const seed = @as([32]u8, @splat(case.seed));
     var csprng = std.Random.DefaultCsprng.init(seed);
     const rnd = seededForTest(&csprng);
 

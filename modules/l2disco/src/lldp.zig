@@ -227,7 +227,7 @@ pub const ManagementAddress = struct {
         var pos: usize = 1 + addr_str_len;
         // interface subtype (1) + interface number (4) + oid length (1).
         if (pos + 6 > value.len) return ParseError.BadManagementAddress;
-        const iface_subtype: InterfaceNumberingSubtype = @enumFromInt(value[pos]);
+        const iface_subtype: InterfaceNumberingSubtype = @fromBackingInt(@intCast(value[pos]));
         const iface_num = std.mem.readInt(u32, value[pos + 1 ..][0..4], .big);
         const oid_len: usize = value[pos + 5];
         pos += 6;
@@ -349,7 +349,7 @@ pub const OrgSpecific = struct {
                     if (o.info.len < 3) return null;
                     return .{ .med_capabilities = .{
                         .capabilities = std.mem.readInt(u16, o.info[0..2], .big),
-                        .device_type = @enumFromInt(o.info[2]),
+                        .device_type = @fromBackingInt(@intCast(o.info[2])),
                     } };
                 },
                 2 => { // Network Policy: app type (1) + U T X VLAN(12) prio(3) DSCP(6)
@@ -379,7 +379,7 @@ pub const OrgSpecific = struct {
                     } };
                 },
                 5...11 => return .{ .med_inventory = .{
-                    .field = @enumFromInt(o.subtype),
+                    .field = @fromBackingInt(@intCast(o.subtype)),
                     .text = o.info,
                 } },
                 else => return null,
@@ -507,7 +507,7 @@ pub const TlvIterator = struct {
         if (it.done or it.pos == it.buf.len) return null;
         if (it.pos + 2 > it.buf.len) return ParseError.Truncated;
         const header = std.mem.readInt(u16, it.buf[it.pos..][0..2], .big);
-        const t: TlvType = @enumFromInt(@as(u7, @intCast(header >> 9)));
+        const t: TlvType = @fromBackingInt(@intCast(@as(u7, @intCast(header >> 9))));
         const len: usize = header & 0x1ff;
         if (it.pos + 2 + len > it.buf.len) return ParseError.TruncatedTlv;
         const value = it.buf[it.pos + 2 ..][0..len];
@@ -605,8 +605,8 @@ pub const Lldpdu = struct {
         if (t.type != .ttl or t.value.len != 2) return ParseError.MissingMandatory;
 
         var du: Lldpdu = .{
-            .chassis_id = .{ .subtype = @enumFromInt(c.value[0]), .value = c.value[1..] },
-            .port_id = .{ .subtype = @enumFromInt(p.value[0]), .value = p.value[1..] },
+            .chassis_id = .{ .subtype = @fromBackingInt(@intCast(c.value[0])), .value = c.value[1..] },
+            .port_id = .{ .subtype = @fromBackingInt(@intCast(p.value[0])), .value = p.value[1..] },
             .ttl_s = std.mem.readInt(u16, t.value[0..2], .big),
             .raw = bytes,
         };
@@ -695,7 +695,7 @@ pub const Builder = struct {
     pub fn addTlv(b: *Builder, tlv_type: TlvType, value: []const u8) BuildError!void {
         if (value.len > max_tlv_len) return BuildError.ValueTooLong;
         if (b.pos + 2 + value.len > b.buf.len) return BuildError.BufferTooSmall;
-        const header: u16 = (@as(u16, @intFromEnum(tlv_type)) << 9) | @as(u16, @intCast(value.len));
+        const header: u16 = (@as(u16, @backingInt(tlv_type)) << 9) | @as(u16, @intCast(value.len));
         std.mem.writeInt(u16, b.buf[b.pos..][0..2], header, .big);
         @memcpy(b.buf[b.pos + 2 ..][0..value.len], value);
         b.pos += 2 + value.len;
@@ -703,7 +703,7 @@ pub const Builder = struct {
 
     /// Chassis ID with an explicit subtype + value.
     pub fn addChassisId(b: *Builder, subtype: ChassisIdSubtype, value: []const u8) BuildError!void {
-        try b.addSubtyped(.chassis_id, @intFromEnum(subtype), value);
+        try b.addSubtyped(.chassis_id, @backingInt(subtype), value);
     }
 
     pub fn addChassisIdMac(b: *Builder, mac: Mac) BuildError!void {
@@ -711,7 +711,7 @@ pub const Builder = struct {
     }
 
     pub fn addPortId(b: *Builder, subtype: PortIdSubtype, value: []const u8) BuildError!void {
-        try b.addSubtyped(.port_id, @intFromEnum(subtype), value);
+        try b.addSubtyped(.port_id, @backingInt(subtype), value);
     }
 
     pub fn addPortIdIfName(b: *Builder, name: []const u8) BuildError!void {
@@ -765,7 +765,7 @@ pub const Builder = struct {
         scratch[n + 1] = family;
         @memcpy(scratch[n + 2 ..][0..addr.len], addr);
         n += 2 + addr.len;
-        scratch[n] = @intFromEnum(opts.interface_subtype);
+        scratch[n] = @backingInt(opts.interface_subtype);
         std.mem.writeInt(u32, scratch[n + 1 ..][0..4], opts.interface_number, .big);
         scratch[n + 5] = @intCast(opts.oid.len);
         n += 6;
@@ -798,7 +798,7 @@ pub const Builder = struct {
     pub fn addMedCapabilities(b: *Builder, capabilities: u16, device_type: MedDeviceType) BuildError!void {
         var v: [3]u8 = undefined;
         std.mem.writeInt(u16, v[0..2], capabilities, .big);
-        v[2] = @intFromEnum(device_type);
+        v[2] = @backingInt(device_type);
         try b.addOrgSpecific(oui_tia, 1, &v);
     }
 
@@ -829,7 +829,7 @@ pub const Builder = struct {
     fn addSubtyped(b: *Builder, tlv_type: TlvType, subtype: u8, value: []const u8) BuildError!void {
         if (value.len + 1 > max_tlv_len) return BuildError.ValueTooLong;
         if (b.pos + 2 + 1 + value.len > b.buf.len) return BuildError.BufferTooSmall;
-        const header: u16 = (@as(u16, @intFromEnum(tlv_type)) << 9) | @as(u16, @intCast(1 + value.len));
+        const header: u16 = (@as(u16, @backingInt(tlv_type)) << 9) | @as(u16, @intCast(1 + value.len));
         std.mem.writeInt(u16, b.buf[b.pos..][0..2], header, .big);
         b.buf[b.pos + 2] = subtype;
         @memcpy(b.buf[b.pos + 3 ..][0..value.len], value);
@@ -942,7 +942,7 @@ test "LLDP: network-address chassis id + IPv6 management address" {
     try b.addChassisId(.network_address, &.{ 1, 10, 0, 0, 1 });
     try b.addPortId(.mac_address, &kat_mac.octets);
     try b.addTtl(30);
-    try b.addManagementAddress(.{ .ip = .{ .v6 = [_]u8{0} ** 15 ++ [_]u8{1} } });
+    try b.addManagementAddress(.{ .ip = .{ .v6 = @as([15]u8, @splat(0)) ++ [_]u8{1} } });
     try b.addMaxFrameSize(1522);
     const bytes = try b.finish();
 
@@ -967,16 +967,16 @@ test "LLDP: an oversized management-address OID is refused, not a scratch-buffer
     // `scratch` in addManagementAddress is a fixed [64]u8; an IPv6 address
     // consumes 2 + 16 + 6 = 24 of it, leaving 40 for the OID. 41 bytes used
     // to overrun the buffer before the length guard was added.
-    const long_oid = [_]u8{7} ** 41;
+    const long_oid = @as([41]u8, @splat(7));
     try testing.expectError(BuildError.ValueTooLong, b.addManagementAddress(.{
-        .ip = .{ .v6 = [_]u8{0} ** 15 ++ [_]u8{1} },
+        .ip = .{ .v6 = @as([15]u8, @splat(0)) ++ [_]u8{1} },
         .oid = &long_oid,
     }));
 
     // A 40-byte OID (the exact boundary) still fits and round-trips.
-    const max_oid = [_]u8{7} ** 40;
+    const max_oid = @as([40]u8, @splat(7));
     try b.addManagementAddress(.{
-        .ip = .{ .v6 = [_]u8{0} ** 15 ++ [_]u8{1} },
+        .ip = .{ .v6 = @as([15]u8, @splat(0)) ++ [_]u8{1} },
         .oid = &max_oid,
     });
 }
@@ -987,14 +987,14 @@ test "LLDP: unknown optional TLV passes through, never fails parse" {
     try b.addChassisIdMac(kat_mac);
     try b.addPortIdIfName("e0");
     try b.addTtl(60);
-    try b.addTlv(@enumFromInt(100), &.{ 0xde, 0xad, 0xbe, 0xef }); // reserved/unknown type
+    try b.addTlv(@fromBackingInt(@intCast(100)), &.{ 0xde, 0xad, 0xbe, 0xef }); // reserved/unknown type
     const bytes = try b.finish();
 
     const du = try Lldpdu.parse(bytes, .{}); // must not error
     var it = du.tlvIterator();
     var saw_unknown = false;
     while (try it.next()) |tlv| {
-        if (@intFromEnum(tlv.type) == 100) {
+        if (@backingInt(tlv.type) == 100) {
             try testing.expectEqualSlices(u8, &.{ 0xde, 0xad, 0xbe, 0xef }, tlv.value);
             saw_unknown = true;
         }
@@ -1251,7 +1251,7 @@ const lldp_seeds = [_][]const u8{
     // only the first, so the iterator is the only way to the second.
     testkit.fuzz.seedHex("0207" ++ "04001b213c9df8" ++ "0406" ++ "054769302f31" ++ "06020078" ++
         "100c" ++ "0501c0a80a02" ++ "0200000001" ++ "00" ++
-        "1018" ++ "1102" ++ "20" ** 16 ++ "0200000002" ++ "00" ++ "0000"),
+        "1018" ++ "1102" ++ strRepeat("20", 16) ++ "0200000002" ++ "00" ++ "0000"),
     // Three org-specific TLVs: 802.1 port VLAN, 802.3 MAC/PHY, and an OUI
     // this codec does not know — so `decode()` returns a value, a value and
     // null, in that order.
@@ -1551,4 +1551,16 @@ test "fuzz driver: L2DISCO_FUZZ (lldp)" {
 
 test "fuzz harness: 400 seeds in every test run, and they get everywhere (lldp)" {
     try fz.checkReach("l2disco lldp", .{ fuzzLldpParse, fuzzLldpMutated }, 400);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

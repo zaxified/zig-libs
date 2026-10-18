@@ -1754,9 +1754,9 @@ test "the ocspcache fuzz harnesses reach the AIA walk and ocsp.verify (reachabil
     }
 
     // 4. And both harness bodies run to completion on fixed input.
-    var s1: std.testing.Smith = .{ .in = &([_]u8{0x01} ** 32 ++ [_]u8{0x00} ** 1024) };
+    var s1: std.testing.Smith = .{ .in = &(@as([32]u8, @splat(0x01)) ++ @as([1024]u8, @splat(0x00))) };
     try fuzzAia(std.testing.Smith, &s1, a);
-    var s2: std.testing.Smith = .{ .in = &([_]u8{0x00} ** 1024) };
+    var s2: std.testing.Smith = .{ .in = &(@as([1024]u8, @splat(0x00))) };
     try fuzzRefresh(std.testing.Smith, &s2, a);
 }
 

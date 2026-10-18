@@ -926,11 +926,11 @@ pub const PosixConnector = struct {
         if (device) |d| {
             // NUL-terminated copy: the kernel reads `optlen` bytes into its own
             // IFNAMSIZ buffer, and the length we pass includes the terminator.
-            var name: [ifname_max + 1]u8 = [_]u8{0} ** (ifname_max + 1);
+            var name: [ifname_max + 1]u8 = @as([ifname_max + 1]u8, @splat(0));
             @memcpy(name[0..d.len], d);
             const rc = linux.setsockopt(fd, linux.SOL.SOCKET, linux.SO.BINDTODEVICE, &name, @intCast(d.len + 1));
             if (linux.errno(rc) != .SUCCESS)
-                return .{ .status = .@"error", .errno = @intFromEnum(linux.errno(rc)) };
+                return .{ .status = .@"error", .errno = @backingInt(linux.errno(rc)) };
         }
         if (source) |src| {
             const bind_rc = switch (src) {
@@ -944,7 +944,7 @@ pub const PosixConnector = struct {
                 },
             };
             if (linux.errno(bind_rc) != .SUCCESS)
-                return .{ .status = .@"error", .errno = @intFromEnum(linux.errno(bind_rc)) };
+                return .{ .status = .@"error", .errno = @backingInt(linux.errno(bind_rc)) };
         }
 
         // Saturating: `Connector.connect` takes an arbitrary u64 from the
@@ -973,7 +973,7 @@ pub const PosixConnector = struct {
             // requires polling for completion, NOT a second connect().
             .INPROGRESS, .INTR => {},
             // Everything definitive arrives synchronously, ECONNREFUSED included.
-            else => |e| return .{ .status = classifyErrno(@intFromEnum(e)), .errno = @intFromEnum(e) },
+            else => |e| return .{ .status = classifyErrno(@backingInt(e)), .errno = @backingInt(e) },
         }
 
         var pfd = [1]linux.pollfd{.{ .fd = fd, .events = linux.POLL.OUT, .revents = 0 }};
@@ -992,7 +992,7 @@ pub const PosixConnector = struct {
             switch (linux.errno(poll_rc)) {
                 .SUCCESS => {},
                 .INTR => continue, // budget recomputed at the top of the loop
-                else => |e| return .{ .status = .@"error", .errno = @intFromEnum(e) },
+                else => |e| return .{ .status = .@"error", .errno = @backingInt(e) },
             }
             if (poll_rc == 0) continue; // timed out (or short) — the top decides
             break;
@@ -1013,7 +1013,7 @@ pub const PosixConnector = struct {
             &so_len,
         );
         if (linux.errno(opt_rc) != .SUCCESS)
-            return .{ .status = .@"error", .errno = @intFromEnum(linux.errno(opt_rc)) };
+            return .{ .status = .@"error", .errno = @backingInt(linux.errno(opt_rc)) };
         // No pending error and not writable: POLLERR/POLLHUP on their own do
         // not mean a completed handshake.
         if (so_error == 0 and revents & linux.POLL.OUT == 0) return .{ .status = .@"error" };
@@ -1069,8 +1069,8 @@ pub const PosixConnector = struct {
 fn classifyErrno(code: i32) Status {
     const E = std.os.linux.E;
     if (code == 0) return .up;
-    if (code == @intFromEnum(E.CONNREFUSED)) return .refused;
-    if (code == @intFromEnum(E.TIMEDOUT)) return .timeout;
+    if (code == @backingInt(E.CONNREFUSED)) return .refused;
+    if (code == @backingInt(E.TIMEDOUT)) return .timeout;
     // EHOSTUNREACH / ENETUNREACH / ENETDOWN / EACCES and the rest are neither
     // "the port is closed" nor "no answer in time".
     return .@"error";
@@ -1250,8 +1250,8 @@ test "probeTcp carries the connector's underlying error through to Result, uncla
     // it does so without changing which Status it carries.
     const E = std.os.linux.E;
     var scripts = [_]FakeConnector.Script{
-        .{ .host = "refused", .outcomes = &.{.{ .status = .refused, .errno = @intFromEnum(E.CONNREFUSED) }} },
-        .{ .host = "posix-timeout", .outcomes = &.{.{ .status = .timeout, .errno = @intFromEnum(E.TIMEDOUT) }} },
+        .{ .host = "refused", .outcomes = &.{.{ .status = .refused, .errno = @backingInt(E.CONNREFUSED) }} },
+        .{ .host = "posix-timeout", .outcomes = &.{.{ .status = .timeout, .errno = @backingInt(E.TIMEDOUT) }} },
         .{ .host = "live-refused", .outcomes = &.{.{ .status = .refused, .err_name = "ConnectionRefused" }} },
         .{ .host = "up", .outcomes = &.{.{ .status = .up, .rtt_ns = 5 }} },
     };
@@ -1260,12 +1260,12 @@ test "probeTcp carries the connector's underlying error through to Result, uncla
 
     const ref = probeTcp(.{ .host = "refused", .port = 80 }, opts);
     try testing.expectEqual(Status.refused, ref.kind); // classification unchanged
-    try testing.expectEqual(@as(?i32, @intFromEnum(E.CONNREFUSED)), ref.errno);
+    try testing.expectEqual(@as(?i32, @backingInt(E.CONNREFUSED)), ref.errno);
     try testing.expectEqual(@as(?[]const u8, null), ref.err_name);
 
     const to = probeTcp(.{ .host = "posix-timeout", .port = 80 }, opts);
     try testing.expectEqual(Status.timeout, to.kind);
-    try testing.expectEqual(@as(?i32, @intFromEnum(E.TIMEDOUT)), to.errno);
+    try testing.expectEqual(@as(?i32, @backingInt(E.TIMEDOUT)), to.errno);
 
     const live_ref = probeTcp(.{ .host = "live-refused", .port = 80 }, opts);
     try testing.expectEqual(Status.refused, live_ref.kind);
@@ -1596,7 +1596,7 @@ fn listenLoopback(v6: bool, backlog: u32) error{ListenSetup}!TestListener {
         var sa: tl.sockaddr.in6 = .{
             .port = 0,
             .flowinfo = 0,
-            .addr = [_]u8{0} ** 15 ++ [_]u8{1}, // ::1
+            .addr = @as([15]u8, @splat(0)) ++ [_]u8{1}, // ::1
             .scope_id = 0,
         };
         if (tl.errno(tl.bind(fd, @ptrCast(&sa), @sizeOf(tl.sockaddr.in6))) != .SUCCESS)
@@ -1794,7 +1794,7 @@ test "PosixConnector.VerdictFold: every multi-address rule, one sequence each" {
     // or budget) turns a non-refused answer into `.timeout`; `.up` wins.
     const F = PosixConnector.VerdictFold;
     const V = PosixConnector.Verdict;
-    const ecr: i32 = @intFromEnum(std.os.linux.E.CONNREFUSED);
+    const ecr: i32 = @backingInt(std.os.linux.E.CONNREFUSED);
     {
         // refused, then an error from the next address: still refused.
         var f: F = .{};
@@ -1862,7 +1862,7 @@ test "live: a closed loopback port is refused fast, and is never reported as a t
     // The classification is `.refused`, and the concrete errno it was
     // classified from also survives — measured on this kernel as SO_ERROR
     // 111 (see `classifyErrno`'s own pinned constant test).
-    try testing.expectEqual(@as(?i32, @intFromEnum(std.os.linux.E.CONNREFUSED)), out.errno);
+    try testing.expectEqual(@as(?i32, @backingInt(std.os.linux.E.CONNREFUSED)), out.errno);
 }
 
 test "live: a listening loopback port is up, with a measured rtt" {
@@ -2006,7 +2006,7 @@ test "live: system resolution does resolve a name, without leaving the host" {
     for (addrs[0..n]) |ip| {
         const loopback = switch (ip) {
             .v4 => |q| q[0] == 127,
-            .v6 => |b| std.mem.eql(u8, &b, &([_]u8{0} ** 15 ++ [_]u8{1})),
+            .v6 => |b| std.mem.eql(u8, &b, &(@as([15]u8, @splat(0)) ++ [_]u8{1})),
         };
         try testing.expect(loopback);
     }
@@ -2056,7 +2056,7 @@ test "live: a fan-out over black-holed targets finishes on the budget" {
 
     var buf: [24]u8 = undefined;
     const t = try bh.target(&buf);
-    const targets = [_]Target{t} ** 8;
+    const targets = @as([8]Target, @splat(t));
 
     var pc: PosixConnector = .{ .resolve = .literal_only };
     const t0 = monoNs();
@@ -2078,24 +2078,24 @@ test "live: a fan-out over black-holed targets finishes on the budget" {
 
 test "classifyErrno keeps refused, timeout and error distinct" {
     const E = std.os.linux.E;
-    try testing.expectEqual(Status.refused, classifyErrno(@intFromEnum(E.CONNREFUSED)));
-    try testing.expectEqual(Status.timeout, classifyErrno(@intFromEnum(E.TIMEDOUT)));
-    try testing.expectEqual(Status.@"error", classifyErrno(@intFromEnum(E.HOSTUNREACH)));
-    try testing.expectEqual(Status.@"error", classifyErrno(@intFromEnum(E.NETUNREACH)));
-    try testing.expectEqual(Status.@"error", classifyErrno(@intFromEnum(E.ACCES)));
+    try testing.expectEqual(Status.refused, classifyErrno(@backingInt(E.CONNREFUSED)));
+    try testing.expectEqual(Status.timeout, classifyErrno(@backingInt(E.TIMEDOUT)));
+    try testing.expectEqual(Status.@"error", classifyErrno(@backingInt(E.HOSTUNREACH)));
+    try testing.expectEqual(Status.@"error", classifyErrno(@backingInt(E.NETUNREACH)));
+    try testing.expectEqual(Status.@"error", classifyErrno(@backingInt(E.ACCES)));
     try testing.expectEqual(Status.up, classifyErrno(0));
     // Not an errno at all: taken as an integer precisely so this cannot be
     // illegal behaviour, and it must not be mistaken for a known code.
     try testing.expectEqual(Status.@"error", classifyErrno(0x7fff_ffff));
     try testing.expectEqual(Status.@"error", classifyErrno(-1));
     // The two that must never collapse into each other.
-    try testing.expect(classifyErrno(@intFromEnum(E.CONNREFUSED)) !=
-        classifyErrno(@intFromEnum(E.TIMEDOUT)));
+    try testing.expect(classifyErrno(@backingInt(E.CONNREFUSED)) !=
+        classifyErrno(@backingInt(E.TIMEDOUT)));
     // The CONSTANTS, not just the mechanism: a mapping written in terms of
     // `E.CONNREFUSED` still passes if the enum is re-spelled, so pin the wire
     // values Linux actually reports through SO_ERROR.
-    try testing.expectEqual(@as(i32, 111), @as(i32, @intFromEnum(E.CONNREFUSED)));
-    try testing.expectEqual(@as(i32, 110), @as(i32, @intFromEnum(E.TIMEDOUT)));
+    try testing.expectEqual(@as(i32, 111), @as(i32, @backingInt(E.CONNREFUSED)));
+    try testing.expectEqual(@as(i32, 110), @as(i32, @backingInt(E.TIMEDOUT)));
     try testing.expectEqual(Status.refused, classifyErrno(111));
     try testing.expectEqual(Status.timeout, classifyErrno(110));
 }
@@ -2373,9 +2373,9 @@ const AppRejectOdd = struct {
 };
 
 test "model: probeTarget and probeMany agree with a naive model on random outcome scripts" {
-    var reach = [_]usize{0} ** @typeInfo(ProbeReach).@"enum".fields.len;
+    var reach = @as([@typeInfo(ProbeReach)]usize, @splat(0)).@"enum".field_names.len;
     var dummy: u8 = 0;
-    const seeds = if (@import("builtin").mode == .Debug) 80 else 300;
+    const seeds = if (@import("builtin").mode == .debug) 80 else 300;
     for (0..seeds) |case_seed| {
         errdefer std.debug.print("probe model: seed={d}\n", .{case_seed});
         var prng = std.Random.DefaultPrng.init(case_seed);
@@ -2425,7 +2425,7 @@ test "model: probeTarget and probeMany agree with a naive model on random outcom
             .app_check = if (use_app) .{ .ctx = &dummy, .checkFn = AppRejectOdd.check } else null,
         };
         const many = rnd.boolean();
-        if (many) reach[@intFromEnum(ProbeReach.many)] += 1;
+        if (many) reach[@backingInt(ProbeReach.many)] += 1;
         const results: []TargetResult = if (many)
             try probeMany(testing.allocator, targets[0..n_targets], opts)
         else blk: {
@@ -2448,7 +2448,7 @@ test "model: probeTarget and probeMany agree with a naive model on random outcom
                 try testing.expectEqual(want.err_name, got.err_name);
                 if (want.kind == .canceled) canceled += 1;
                 reach[
-                    @intFromEnum(switch (o.status) {
+                    @backingInt(switch (o.status) {
                         .up => if (!app_ok) ProbeReach.app_rejected else if (o.rtt_ns == null) ProbeReach.up_no_rtt else ProbeReach.up,
                         .refused => ProbeReach.refused,
                         .timeout => ProbeReach.timeout,
@@ -2460,12 +2460,12 @@ test "model: probeTarget and probeMany agree with a naive model on random outcom
             try ProbeModel.check(r.samples, r.stats);
             try testing.expectEqual(canceled, r.canceledCount());
             try testing.expectEqual(r.stats.received > 0, r.reachable());
-            if (canceled == eff) reach[@intFromEnum(ProbeReach.all_canceled)] += 1;
-            if (canceled < eff and !r.reachable()) reach[@intFromEnum(ProbeReach.unreachable_host)] += 1;
+            if (canceled == eff) reach[@backingInt(ProbeReach.all_canceled)] += 1;
+            if (canceled < eff and !r.reachable()) reach[@backingInt(ProbeReach.unreachable_host)] += 1;
         }
     }
     for (reach, 0..) |n, i| if (n == 0) {
-        std.debug.print("model reach: {t} never hit\n", .{@as(ProbeReach, @enumFromInt(i))});
+        std.debug.print("model reach: {t} never hit\n", .{@as(ProbeReach, @fromBackingInt(@intCast(i)))});
         return error.ModelDoesNotReach;
     };
 }
@@ -2480,7 +2480,7 @@ const SleepRec = struct {
     wrong_ns: std.atomic.Value(u32) = .init(0),
     expect_ns: u64,
     /// Connect count seen at each of the first 8 sleeps (single-thread tests).
-    connects_at: [8]u32 = [_]u32{0} ** 8,
+    connects_at: [8]u32 = @as([8]u32, @splat(0)),
 
     fn sleeper(self: *SleepRec) Sleeper {
         return .{ .ctx = self, .sleepFn = sleepImpl };
@@ -2575,8 +2575,8 @@ test "IoSleeper sleeps for the requested time on the std.Io clock" {
 test "selectAddresses: every IpProtocol, order within a family kept" {
     const v4a: netaddr.Ip = .{ .v4 = .{ 10, 0, 0, 1 } };
     const v4b: netaddr.Ip = .{ .v4 = .{ 10, 0, 0, 2 } };
-    const v6a: netaddr.Ip = .{ .v6 = [_]u8{0} ** 15 ++ [_]u8{1} };
-    const v6b: netaddr.Ip = .{ .v6 = [_]u8{0} ** 15 ++ [_]u8{2} };
+    const v6a: netaddr.Ip = .{ .v6 = @as([15]u8, @splat(0)) ++ [_]u8{1} };
+    const v6b: netaddr.Ip = .{ .v6 = @as([15]u8, @splat(0)) ++ [_]u8{2} };
     const mixed = [_]netaddr.Ip{ v6a, v4a, v6b, v4b };
 
     const Case = struct { p: IpProtocol, want: []const netaddr.Ip };
@@ -2596,7 +2596,7 @@ test "selectAddresses: every IpProtocol, order within a family kept" {
     }
 
     // A restriction can leave nothing; a preference never does.
-    var only4 = [_]netaddr.Ip{v4a} ++ [_]netaddr.Ip{v4a} ** (PosixConnector.max_addresses - 1);
+    var only4 = [_]netaddr.Ip{v4a} ++ @as([PosixConnector.max_addresses - 1]netaddr.Ip, @splat(v4a));
     try testing.expectEqual(@as(usize, 0), selectAddresses(&only4, 1, .ip6));
     try testing.expectEqual(@as(usize, 1), selectAddresses(&only4, 1, .prefer_ip6));
 }
@@ -2661,7 +2661,7 @@ test "live: a source of the wrong family or not on this host is an error Result,
     const t = try Target.parse(try std.fmt.bufPrint(&buf, "127.0.0.1:{d}", .{ln.port}));
 
     // v6 source, v4 target: the family check fires before any syscall.
-    var pc: PosixConnector = .{ .resolve = .literal_only, .source = .{ .v6 = [_]u8{0} ** 15 ++ [_]u8{1} } };
+    var pc: PosixConnector = .{ .resolve = .literal_only, .source = .{ .v6 = @as([15]u8, @splat(0)) ++ [_]u8{1} } };
     var out = pc.connector().connect(t, 2 * std.time.ns_per_s);
     try testing.expectEqual(Status.@"error", out.status);
     try testing.expectEqual(@as(?i32, null), out.errno);
@@ -2670,7 +2670,7 @@ test "live: a source of the wrong family or not on this host is an error Result,
     pc.source = .{ .v4 = .{ 203, 0, 113, 1 } };
     out = pc.connector().connect(t, 2 * std.time.ns_per_s);
     try testing.expectEqual(Status.@"error", out.status);
-    try testing.expectEqual(@as(?i32, @intFromEnum(tl.E.ADDRNOTAVAIL)), out.errno);
+    try testing.expectEqual(@as(?i32, @backingInt(tl.E.ADDRNOTAVAIL)), out.errno);
 }
 
 test "live: device — lo works, an unknown or malformed name is an error Result" {
@@ -2683,7 +2683,7 @@ test "live: device — lo works, an unknown or malformed name is an error Result
     const lo = pc.connector().connect(t, 2 * std.time.ns_per_s);
     // Before Linux 5.7 SO_BINDTODEVICE needs CAP_NET_RAW; an EPERM is the
     // documented error Result, and then the positive half cannot be shown.
-    if (lo.status == .@"error" and lo.errno == @as(?i32, @intFromEnum(tl.E.PERM)))
+    if (lo.status == .@"error" and lo.errno == @as(?i32, @backingInt(tl.E.PERM)))
         return testkit.skip("SO_BINDTODEVICE needs CAP_NET_RAW on this kernel", .{});
     try testing.expectEqual(Status.up, lo.status);
 

@@ -29,7 +29,7 @@ const vectors_mod = @import("script_tests_witness_vectors.zig");
 fn buildCreditingTx(allocator: std.mem.Allocator, script_pubkey: []const u8, amount: i64) !bitcointx.Transaction {
     const vin = try allocator.alloc(bitcointx.TxIn, 1);
     vin[0] = .{
-        .prevout = .{ .txid = [_]u8{0} ** 32, .vout = 0xffffffff },
+        .prevout = .{ .txid = @as([32]u8, @splat(0)), .vout = 0xffffffff },
         .script_sig = &[_]u8{ 0x00, 0x00 }, // OP_0 OP_0
         .sequence = 0xffffffff,
     };

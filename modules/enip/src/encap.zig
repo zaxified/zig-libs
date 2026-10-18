@@ -177,9 +177,9 @@ pub fn decodePrefix(bytes: []const u8) DecodeError!Message {
     // steering a future extension.
     if (options != 0) return error.BadOptions;
     return .{
-        .command = @enumFromInt(std.mem.readInt(u16, bytes[0..2], .little)),
+        .command = @fromBackingInt(@intCast(std.mem.readInt(u16, bytes[0..2], .little))),
         .session_handle = std.mem.readInt(u32, bytes[4..8], .little),
-        .status = @enumFromInt(std.mem.readInt(u32, bytes[8..12], .little)),
+        .status = @fromBackingInt(@intCast(std.mem.readInt(u32, bytes[8..12], .little))),
         .sender_context = bytes[12..20].*,
         .options = options,
         .data = bytes[header_len..total],
@@ -194,10 +194,10 @@ pub fn encode(msg: Message, out: []u8) EncodeError![]u8 {
     if (msg.data.len > max_data_len) return error.TooLong;
     const total = header_len + msg.data.len;
     if (out.len < total) return error.BufferTooSmall;
-    std.mem.writeInt(u16, out[0..2], @intFromEnum(msg.command), .little);
+    std.mem.writeInt(u16, out[0..2], @backingInt(msg.command), .little);
     std.mem.writeInt(u16, out[2..4], @intCast(msg.data.len), .little);
     std.mem.writeInt(u32, out[4..8], msg.session_handle, .little);
-    std.mem.writeInt(u32, out[8..12], @intFromEnum(msg.status), .little);
+    std.mem.writeInt(u32, out[8..12], @backingInt(msg.status), .little);
     @memcpy(out[12..20], &msg.sender_context);
     std.mem.writeInt(u32, out[20..24], msg.options, .little);
     @memcpy(out[header_len..total], msg.data);
@@ -355,7 +355,7 @@ pub const Identity = struct {
             .status = std.mem.readInt(u16, bytes[26..28], .little),
             .serial_number = std.mem.readInt(u32, bytes[28..32], .little),
             .product_name = bytes[33 .. 33 + name_len],
-            .state = @enumFromInt(bytes[33 + name_len]),
+            .state = @fromBackingInt(@intCast(bytes[33 + name_len])),
         };
     }
 
@@ -374,7 +374,7 @@ pub const Identity = struct {
         std.mem.writeInt(u32, out[28..32], self.serial_number, .little);
         out[32] = @intCast(self.product_name.len);
         @memcpy(out[33..][0..self.product_name.len], self.product_name);
-        out[33 + self.product_name.len] = @intFromEnum(self.state);
+        out[33 + self.product_name.len] = @backingInt(self.state);
         return out[0..total];
     }
 };
@@ -497,7 +497,7 @@ test "header round trips" {
 
 test "length field counts the data, not the header" {
     // 24-octet header claiming 4 octets of data, with 4 present.
-    const wire = [_]u8{ 0x65, 0x00, 0x04, 0x00 } ++ [_]u8{0} ** 20 ++ [_]u8{ 0x01, 0x00, 0x00, 0x00 };
+    const wire = [_]u8{ 0x65, 0x00, 0x04, 0x00 } ++ @as([20]u8, @splat(0)) ++ [_]u8{ 0x01, 0x00, 0x00, 0x00 };
     const m = try decode(&wire);
     try testing.expectEqual(@as(usize, 4), m.data.len);
     try testing.expectEqual(@as(usize, 28), m.total_len);
@@ -505,7 +505,7 @@ test "length field counts the data, not the header" {
 }
 
 test "a length that disagrees with the payload is refused in both directions" {
-    var wire = [_]u8{ 0x65, 0x00, 0x04, 0x00 } ++ [_]u8{0} ** 20 ++ [_]u8{ 1, 0, 0, 0 };
+    var wire = [_]u8{ 0x65, 0x00, 0x04, 0x00 } ++ @as([20]u8, @splat(0)) ++ [_]u8{ 1, 0, 0, 0 };
     try testing.expectError(error.LengthMismatch, decode(wire[0..27])); // short
     // Long: announce 3 but present 4.
     wire[2] = 3;
@@ -514,11 +514,11 @@ test "a length that disagrees with the payload is refused in both directions" {
 
 test "a truncated header is not a length problem" {
     try testing.expectError(error.Truncated, decode(&[_]u8{ 0x65, 0x00 }));
-    try testing.expectError(error.Truncated, peekTotalLen(&[_]u8{0} ** 23));
+    try testing.expectError(error.Truncated, peekTotalLen(&@as([23]u8, @splat(0))));
 }
 
 test "non-zero options are refused" {
-    var wire = [_]u8{ 0x63, 0x00, 0x00, 0x00 } ++ [_]u8{0} ** 20;
+    var wire = [_]u8{ 0x63, 0x00, 0x00, 0x00 } ++ @as([20]u8, @splat(0));
     wire[20] = 1;
     try testing.expectError(error.BadOptions, decode(&wire));
 }
@@ -541,7 +541,7 @@ test "commands classify" {
     try testing.expect(Command.list_identity.isSessionless());
     try testing.expect(!Command.send_rr_data.isSessionless());
     try testing.expect(Command.send_unit_data.isKnown());
-    try testing.expect(!(@as(Command, @enumFromInt(0x1234))).isKnown());
+    try testing.expect(!(@as(Command, @fromBackingInt(@intCast(0x1234)))).isKnown());
 }
 
 test "framer splits a stream carrying three messages" {
@@ -584,7 +584,7 @@ test "framer splits a stream carrying three messages" {
 test "framer waits for a partial message and never spins" {
     var storage: [128]u8 = undefined;
     var f = Framer.init(&storage);
-    try f.feed(&([_]u8{ 0x65, 0x00, 0x04, 0x00 } ++ [_]u8{0} ** 20));
+    try f.feed(&([_]u8{ 0x65, 0x00, 0x04, 0x00 } ++ @as([20]u8, @splat(0))));
     try testing.expectEqual(@as(?Message, null), try f.next());
     try f.feed(&[_]u8{ 1, 0 });
     try testing.expectEqual(@as(?Message, null), try f.next());
@@ -596,7 +596,7 @@ test "framer refuses a message larger than its storage instead of waiting foreve
     var storage: [40]u8 = undefined;
     var f = Framer.init(&storage);
     // Announce 1000 octets of data; storage can never hold it.
-    try f.feed(&([_]u8{ 0x6F, 0x00, 0xE8, 0x03 } ++ [_]u8{0} ** 20));
+    try f.feed(&([_]u8{ 0x6F, 0x00, 0xE8, 0x03 } ++ @as([20]u8, @splat(0))));
     try testing.expectError(error.Overflow, f.next());
 }
 
@@ -611,7 +611,7 @@ test "RegisterSession payload round trips" {
 }
 
 test "socket address is big-endian inside a little-endian message" {
-    const wire = [_]u8{ 0x00, 0x02, 0xAF, 0x12, 192, 168, 1, 5 } ++ [_]u8{0} ** 8;
+    const wire = [_]u8{ 0x00, 0x02, 0xAF, 0x12, 192, 168, 1, 5 } ++ @as([8]u8, @splat(0));
     const sa = try SocketAddress.decode(&wire);
     try testing.expectEqual(@as(i16, 2), sa.family);
     try testing.expectEqual(@as(u16, 44818), sa.port);

@@ -5,7 +5,7 @@
 //! trainer did with it before finalization: the content's length and SHA-256
 //! and the small-corpus warning, or the error (`ZSTD_ErrorCode`) it refused with.
 
-pub const Golden = struct { err: u32 = 0, len: usize = 0, small: bool = false, sha256: *const [64]u8 = "-" ** 64 };
+pub const Golden = struct { err: u32 = 0, len: usize = 0, small: bool = false, sha256: *const [64]u8 = strRepeat("-", 64) };
 
 pub const rows = [_]Golden{
     .{ .len = 1024, .small = false, .sha256 = "795db28ed89ae78e26e7d759cf17833f857fa9b7d35414b811f913b6768a803d" }, // cover json-200 1024 k=50 d=6 f=0 accel=0 split=1
@@ -63,3 +63,15 @@ pub const rows = [_]Golden{
     .{ .err = 70 }, // fastcover json-200 200 k=50 d=6 f=0 accel=0 split=1
     .{ .len = 20, .small = true, .sha256 = "f6cff2b0f4dd8c48b4cef4d686c94941a7498c1b956605e4e8075072b83427c7" }, // fastcover tiny-6 256 k=50 d=8 f=0 accel=0 split=0.9
 };
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
+}

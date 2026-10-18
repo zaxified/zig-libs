@@ -159,7 +159,7 @@ pub fn salsa20Xor(out: []u8, in: []const u8, counter: u64, key: *const [8]u32, n
         ctr +%= 1;
     }
     if (i < in.len) {
-        var buf = [_]u8{0} ** 64;
+        var buf = @as([64]u8, @splat(0));
         const rest = in.len - i;
         @memcpy(buf[0..rest], in[i..]);
         xorBlocks(1, &buf, &buf, &base, ctr);
@@ -198,7 +198,7 @@ fn extend(k: [key_length]u8, npub: [nonce_length]u8) Extended {
 /// Block 0 of the stream: its first 32 bytes are the one-time Poly1305 key,
 /// the other 32 encrypt the first 32 message bytes.
 fn firstBlock(e: *const Extended) [64]u8 {
-    var b = [_]u8{0} ** 64;
+    var b = @as([64]u8, @splat(0));
     salsa20Xor(&b, &b, 0, &e.key, e.nonce);
     return b;
 }
@@ -342,8 +342,8 @@ test "hsalsa20 matches std XSalsa20 subkey (via the stream)" {
         var n: [24]u8 = undefined;
         r.bytes(&k);
         r.bytes(&n);
-        var a = [_]u8{0} ** 128;
-        var b = [_]u8{0} ** 128;
+        var a = @as([128]u8, @splat(0));
+        var b = @as([128]u8, @splat(0));
         StdXSalsa.xor(&a, &a, 0, k, n);
         crypto.stream.salsa.Salsa20.xor(&b, &b, 0, hsalsa20(n[0..16].*, k), n[16..24].*);
         try std.testing.expectEqualSlices(u8, &a, &b);

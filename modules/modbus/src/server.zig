@@ -346,8 +346,8 @@ pub const Server = struct {
 
     fn isRestartDiagnostic(request: []const u8) bool {
         return request.len >= 3 and
-            request[0] == @intFromEnum(FunctionCode.diagnostics) and
-            std.mem.readInt(u16, request[1..3], .big) == @intFromEnum(DiagnosticSubFunction.restart_comm_option);
+            request[0] == @backingInt(FunctionCode.diagnostics) and
+            std.mem.readInt(u16, request[1..3], .big) == @backingInt(DiagnosticSubFunction.restart_comm_option);
     }
 
     // ── PDU layer ───────────────────────────────────────────────────────────
@@ -370,18 +370,18 @@ pub const Server = struct {
         const body = request[1..];
 
         const result: ?ExceptionCode = switch (fc_byte) {
-            @intFromEnum(FunctionCode.read_coils) => self.doReadBits(.coils, body, out),
-            @intFromEnum(FunctionCode.read_discrete_inputs) => self.doReadBits(.discrete_inputs, body, out),
-            @intFromEnum(FunctionCode.read_holding_registers) => self.doReadRegisters(.holding_registers, body, out),
-            @intFromEnum(FunctionCode.read_input_registers) => self.doReadRegisters(.input_registers, body, out),
-            @intFromEnum(FunctionCode.write_single_coil) => self.doWriteSingleCoil(body, out),
-            @intFromEnum(FunctionCode.write_single_register) => self.doWriteSingleRegister(body, out),
-            @intFromEnum(FunctionCode.write_multiple_coils) => self.doWriteMultipleCoils(body, out),
-            @intFromEnum(FunctionCode.write_multiple_registers) => self.doWriteMultipleRegisters(body, out),
-            @intFromEnum(FunctionCode.read_write_multiple_registers) => self.doReadWriteRegisters(body, out),
-            @intFromEnum(FunctionCode.read_exception_status) => self.doReadExceptionStatus(body, out),
-            @intFromEnum(FunctionCode.diagnostics) => self.doDiagnostics(body, out),
-            @intFromEnum(FunctionCode.report_slave_id) => self.doReportSlaveId(body, out),
+            @backingInt(FunctionCode.read_coils) => self.doReadBits(.coils, body, out),
+            @backingInt(FunctionCode.read_discrete_inputs) => self.doReadBits(.discrete_inputs, body, out),
+            @backingInt(FunctionCode.read_holding_registers) => self.doReadRegisters(.holding_registers, body, out),
+            @backingInt(FunctionCode.read_input_registers) => self.doReadRegisters(.input_registers, body, out),
+            @backingInt(FunctionCode.write_single_coil) => self.doWriteSingleCoil(body, out),
+            @backingInt(FunctionCode.write_single_register) => self.doWriteSingleRegister(body, out),
+            @backingInt(FunctionCode.write_multiple_coils) => self.doWriteMultipleCoils(body, out),
+            @backingInt(FunctionCode.write_multiple_registers) => self.doWriteMultipleRegisters(body, out),
+            @backingInt(FunctionCode.read_write_multiple_registers) => self.doReadWriteRegisters(body, out),
+            @backingInt(FunctionCode.read_exception_status) => self.doReadExceptionStatus(body, out),
+            @backingInt(FunctionCode.diagnostics) => self.doDiagnostics(body, out),
+            @backingInt(FunctionCode.report_slave_id) => self.doReportSlaveId(body, out),
             else => .illegal_function,
         };
 
@@ -405,7 +405,7 @@ pub const Server = struct {
     fn exception(self: *Server, out: []u8, fc_byte: u8, code: ExceptionCode) []u8 {
         self.counters.slave_exception_error +%= 1;
         out[0] = fc_byte | 0x80;
-        out[1] = @intFromEnum(code);
+        out[1] = @backingInt(code);
         self.reply_len = 2;
         return out[0..2];
     }
@@ -427,9 +427,9 @@ pub const Server = struct {
 
         const nbytes = mb.bitByteCount(quantity);
         out[0] = if (area == .coils)
-            @intFromEnum(FunctionCode.read_coils)
+            @backingInt(FunctionCode.read_coils)
         else
-            @intFromEnum(FunctionCode.read_discrete_inputs);
+            @backingInt(FunctionCode.read_discrete_inputs);
         out[1] = @intCast(nbytes);
         @memset(out[2..][0..nbytes], 0);
         const start = bits.index(addr).?;
@@ -459,9 +459,9 @@ pub const Server = struct {
         if (!regs.contains(addr, quantity)) return .illegal_data_address;
 
         out[0] = if (area == .holding_registers)
-            @intFromEnum(FunctionCode.read_holding_registers)
+            @backingInt(FunctionCode.read_holding_registers)
         else
-            @intFromEnum(FunctionCode.read_input_registers);
+            @backingInt(FunctionCode.read_input_registers);
         out[1] = @intCast(2 * quantity);
         const start = regs.index(addr).?;
         for (0..quantity) |i| {
@@ -488,7 +488,7 @@ pub const Server = struct {
         if (self.hook) |h| h.notify(.{ .area = .coils, .addr = addr, .count = 1 });
 
         // The response is an exact echo of the request.
-        out[0] = @intFromEnum(FunctionCode.write_single_coil);
+        out[0] = @backingInt(FunctionCode.write_single_coil);
         @memcpy(out[1..5], body[0..4]);
         self.reply_len = 5;
         return null;
@@ -504,7 +504,7 @@ pub const Server = struct {
         self.db.holding_registers.values[idx] = value;
         if (self.hook) |h| h.notify(.{ .area = .holding_registers, .addr = addr, .count = 1 });
 
-        out[0] = @intFromEnum(FunctionCode.write_single_register);
+        out[0] = @backingInt(FunctionCode.write_single_register);
         @memcpy(out[1..5], body[0..4]);
         self.reply_len = 5;
         return null;
@@ -533,7 +533,7 @@ pub const Server = struct {
         }
         if (self.hook) |h| h.notify(.{ .area = .coils, .addr = addr, .count = quantity });
 
-        out[0] = @intFromEnum(FunctionCode.write_multiple_coils);
+        out[0] = @backingInt(FunctionCode.write_multiple_coils);
         @memcpy(out[1..5], body[0..4]); // echo start address + quantity
         self.reply_len = 5;
         return null;
@@ -559,7 +559,7 @@ pub const Server = struct {
         }
         if (self.hook) |h| h.notify(.{ .area = .holding_registers, .addr = addr, .count = quantity });
 
-        out[0] = @intFromEnum(FunctionCode.write_multiple_registers);
+        out[0] = @backingInt(FunctionCode.write_multiple_registers);
         @memcpy(out[1..5], body[0..4]);
         self.reply_len = 5;
         return null;
@@ -594,7 +594,7 @@ pub const Server = struct {
         if (self.hook) |h| h.notify(.{ .area = .holding_registers, .addr = write_addr, .count = write_quantity });
 
         const read_start = self.db.holding_registers.index(read_addr).?;
-        out[0] = @intFromEnum(FunctionCode.read_write_multiple_registers);
+        out[0] = @backingInt(FunctionCode.read_write_multiple_registers);
         out[1] = @intCast(2 * read_quantity);
         for (0..read_quantity) |i| {
             std.mem.writeInt(u16, out[2 + 2 * i ..][0..2], self.db.holding_registers.values[read_start + i], .big);
@@ -608,7 +608,7 @@ pub const Server = struct {
     fn doReadExceptionStatus(self: *Server, body: []const u8, out: []u8) ?ExceptionCode {
         const status = self.config.exception_status orelse return .illegal_function;
         if (body.len != 0) return .illegal_data_value;
-        out[0] = @intFromEnum(FunctionCode.read_exception_status);
+        out[0] = @backingInt(FunctionCode.read_exception_status);
         out[1] = status;
         self.reply_len = 2;
         return null;
@@ -619,10 +619,10 @@ pub const Server = struct {
     fn doDiagnostics(self: *Server, body: []const u8, out: []u8) ?ExceptionCode {
         if (!self.config.diagnostics) return .illegal_function;
         if (body.len < 2) return .illegal_data_value;
-        const sub: DiagnosticSubFunction = @enumFromInt(std.mem.readInt(u16, body[0..2], .big));
+        const sub: DiagnosticSubFunction = @fromBackingInt(@intCast(std.mem.readInt(u16, body[0..2], .big)));
         const data = body[2..];
 
-        out[0] = @intFromEnum(FunctionCode.diagnostics);
+        out[0] = @backingInt(FunctionCode.diagnostics);
         @memcpy(out[1..3], body[0..2]);
 
         switch (sub) {
@@ -706,7 +706,7 @@ pub const Server = struct {
         const count = self.config.slave_id.len + 1 + self.config.slave_id_extra.len;
         if (count > 0xFF or 2 + count > mb.max_pdu_len) return .server_device_failure;
 
-        out[0] = @intFromEnum(FunctionCode.report_slave_id);
+        out[0] = @backingInt(FunctionCode.report_slave_id);
         out[1] = @intCast(count);
         var pos: usize = 2;
         @memcpy(out[pos..][0..self.config.slave_id.len], self.config.slave_id);
@@ -727,10 +727,10 @@ const testing = std.testing;
 /// A small device used by most tests below: coils 0..15, discrete inputs
 /// 0..15, holding registers 100..115, input registers 200..207.
 const Fixture = struct {
-    coils: [16]bool = [_]bool{false} ** 16,
-    discretes: [16]bool = [_]bool{false} ** 16,
-    holdings: [16]u16 = [_]u16{0} ** 16,
-    inputs: [8]u16 = [_]u16{0} ** 8,
+    coils: [16]bool = @as([16]bool, @splat(false)),
+    discretes: [16]bool = @as([16]bool, @splat(false)),
+    holdings: [16]u16 = @as([16]u16, @splat(0)),
+    inputs: [8]u16 = @as([8]u16, @splat(0)),
 
     fn server(self: *Fixture, framing: mb.Framing) Server {
         return Server.init(.{ .unit_id = 5, .framing = framing }, .{
@@ -745,7 +745,7 @@ const Fixture = struct {
 fn expectException(reply: []const u8, fc: u8, code: ExceptionCode) !void {
     try testing.expectEqual(@as(usize, 2), reply.len);
     try testing.expectEqual(fc | 0x80, reply[0]);
-    try testing.expectEqual(@intFromEnum(code), reply[1]);
+    try testing.expectEqual(@backingInt(code), reply[1]);
 }
 
 // ── address windows ─────────────────────────────────────────────────────────
@@ -787,7 +787,7 @@ test "address windows: a request outside the window is IllegalDataAddress, never
 }
 
 test "address windows: an unimplemented area answers IllegalDataAddress, not a crash" {
-    var coils = [_]bool{false} ** 8;
+    var coils = @as([8]bool, @splat(false));
     // Only coils exist; the other three areas are empty.
     var server = Server.init(
         .{ .unit_id = 1, .framing = .rtu },
@@ -829,8 +829,8 @@ test "address windows: base offsets are honoured on every area" {
 // ── quantity limits ─────────────────────────────────────────────────────────
 
 test "quantity limits: over-large reads are IllegalDataValue, not truncated reads" {
-    var bits = [_]bool{false} ** 3000;
-    var regs = [_]u16{0} ** 200;
+    var bits = @as([3000]bool, @splat(false));
+    var regs = @as([200]u16, @splat(0));
     var server = Server.init(.{ .unit_id = 1, .framing = .rtu }, .{
         .coils = .{ .base = 0, .values = &bits },
         .discrete_inputs = .{ .base = 0, .values = &bits },
@@ -893,8 +893,8 @@ test "quantity limits: over-large writes are IllegalDataValue, and only because 
     // probe below into a real accepted write (`reply.len == 5`, not an
     // exception), which fails `expectException` below rather than staying
     // green.
-    var bits = [_]bool{false} ** 3000;
-    var regs = [_]u16{0} ** 200;
+    var bits = @as([3000]bool, @splat(false));
+    var regs = @as([200]u16, @splat(0));
     var server = Server.init(.{ .unit_id = 1, .framing = .rtu }, .{
         .coils = .{ .base = 0, .values = &bits },
         .holding_registers = .{ .base = 0, .values = &regs },
@@ -1085,7 +1085,7 @@ test "hostile: a short output buffer is a typed error, not a stomp" {
 }
 
 test "hostile: a maximal read still fits max_pdu_len" {
-    var regs = [_]u16{0xFFFF} ** 125;
+    var regs = @as([125]u16, @splat(0xFFFF));
     var server = Server.init(
         .{ .unit_id = 1, .framing = .tcp },
         .{ .holding_registers = .{ .base = 0, .values = &regs } },
@@ -1422,10 +1422,10 @@ test "write hook fires once per write, after the data bank is already updated" {
 // ── fuzz ────────────────────────────────────────────────────────────────────
 
 test "fuzz: random PDUs and ADUs never panic and always resolve to a reply or silence" {
-    var coils = [_]bool{false} ** 64;
-    var discretes = [_]bool{false} ** 64;
-    var holdings = [_]u16{0} ** 64;
-    var inputs = [_]u16{0} ** 64;
+    var coils = @as([64]bool, @splat(false));
+    var discretes = @as([64]bool, @splat(false));
+    var holdings = @as([64]u16, @splat(0));
+    var inputs = @as([64]u16, @splat(0));
     var server = Server.init(.{
         .unit_id = 5,
         .framing = .tcp,
@@ -1486,8 +1486,8 @@ test "fuzz: structurally valid requests with wire-controlled fields never panic"
     // Same as above but every PDU starts with a real function code, so the
     // fuzzer spends its budget inside the handlers rather than bouncing off
     // the dispatch table.
-    var coils = [_]bool{false} ** 64;
-    var holdings = [_]u16{0} ** 64;
+    var coils = @as([64]bool, @splat(false));
+    var holdings = @as([64]u16, @splat(0));
     var server = Server.init(.{ .unit_id = 1, .framing = .rtu }, .{
         .coils = .{ .base = 7, .values = &coils },
         .holding_registers = .{ .base = 0xFFF0, .values = &holdings },
@@ -1592,10 +1592,10 @@ test "corpus: every request seed reaches the dispatch table, and the replies are
         const len: usize = smith.slice(&frame);
         if (len != 0) nonempty += 1;
         for ([_]mb.Framing{ .tcp, .rtu }) |framing| {
-            var coils = [_]bool{false} ** 64;
-            var discretes = [_]bool{false} ** 64;
-            var holdings = [_]u16{0} ** 64;
-            var inputs = [_]u16{0} ** 64;
+            var coils = @as([64]bool, @splat(false));
+            var discretes = @as([64]bool, @splat(false));
+            var holdings = @as([64]u16, @splat(0));
+            var inputs = @as([64]u16, @splat(0));
             var server = Server.init(.{
                 .unit_id = 5,
                 .framing = framing,
@@ -1649,10 +1649,10 @@ test "fuzz harness: fuzzServer, 400 seeds, reaches every outcome" {
 }
 
 fn fuzzServerOnce(framing: mb.Framing, bytes: []const u8) !void {
-    var coils = [_]bool{false} ** 64;
-    var discretes = [_]bool{false} ** 64;
-    var holdings = [_]u16{0} ** 64;
-    var inputs = [_]u16{0} ** 64;
+    var coils = @as([64]bool, @splat(false));
+    var discretes = @as([64]bool, @splat(false));
+    var holdings = @as([64]u16, @splat(0));
+    var inputs = @as([64]u16, @splat(0));
     var server = Server.init(.{
         .unit_id = 5,
         .framing = framing,

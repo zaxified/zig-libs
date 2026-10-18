@@ -916,9 +916,9 @@ const fuzz_seeds = [_][]const u8{
     fuzzseed.seed("\x00"), // a NUL and nothing else
     fuzzseed.seed("/etc/\x00passwd"), // a NUL after a plausible prefix: the silent-truncation shape
     fuzzseed.seed(&[_]u8{ 0xff, 0xfe, 0x80, 0x01, '/', 0xc0 }), // not UTF-8; the kernel takes bytes, not text
-    fuzzseed.seed("/" ** 300), // many separators, well inside PATH_MAX
-    fuzzseed.seed("/" ** 5000), // past PATH_MAX: the entry the old length header could have silently emptied
-    fuzzseed.seed("a" ** fuzz_path_buf_len), // exactly the buffer - one octet more and the seed reads back EMPTY
+    fuzzseed.seed(strRepeat("/", 300)), // many separators, well inside PATH_MAX
+    fuzzseed.seed(strRepeat("/", 5000)), // past PATH_MAX: the entry the old length header could have silently emptied
+    fuzzseed.seed(strRepeat("a", fuzz_path_buf_len)), // exactly the buffer - one octet more and the seed reads back EMPTY
     fuzzseed.seed(""), // the empty path
     fuzzseed.seed("/"), // a path that really exists: the ACCEPTING branch, which no other seed reaches
     fuzzseed.seed("/proc/self"), // a real symlink - `lstatPath` must not follow it
@@ -1010,4 +1010,16 @@ fn fuzzLstatPath(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!voi
     // crashing, the same way every other `testing.fuzz` target in this
     // collection is checked — is a failure.
     if (result) |_| LstatMark.mark(.resolved) else |_| LstatMark.mark(.stat_error);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

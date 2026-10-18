@@ -1043,7 +1043,7 @@ fn randomIdentAndSeq() struct { ident: u16, seq_base: u16 } {
             .ident = std.mem.readInt(u16, buf[0..2], .little),
             .seq_base = std.mem.readInt(u16, buf[2..4], .little),
         };
-        if (signed == -@as(isize, @intFromEnum(linux.E.INTR))) continue;
+        if (signed == -@as(isize, @backingInt(linux.E.INTR))) continue;
         return .{ .ident = 0x7472, .seq_base = 1 }; // getrandom unavailable: old fixed values
     }
 }
@@ -2690,7 +2690,7 @@ const fuzz_corpus = [_][]const u8{
     &fuzz_seed_te,
     &fuzz_seed_er,
     // an IHL that lies (0x4f = 60 bytes claimed) plus filler
-    &(.{ 200, 0x4f } ++ .{0xaa} ** 199),
+    &([_]u8{ 200, 0x4f } ++ @as([199]u8, @splat(0xaa))),
 };
 
 /// `fuzz_corpus` as `Smith.slice` frames: `FuzzScript` reads its bytes from
@@ -2741,10 +2741,10 @@ test "fuzz corpus really reaches the classifier (a green fuzz run is not vacuous
 const fuzz_driver = testkit.fuzz.driver;
 
 const FuzzLabel = enum { silent, resolved };
-var fuzz_reach: [@typeInfo(FuzzLabel).@"enum".fields.len]usize = @splat(0);
+var fuzz_reach: [@typeInfo(FuzzLabel).@"enum".field_names.len]usize = @splat(0);
 
 fn fuzz_mark(comptime l: FuzzLabel) void {
-    fuzz_reach[@intFromEnum(l)] += 1;
+    fuzz_reach[@backingInt(l)] += 1;
     fuzz_driver.hit(@tagName(l));
 }
 
@@ -2823,7 +2823,7 @@ test "fuzz harness: 400 seeds in every test run, and they get everywhere" {
         }
     }
     for (fuzz_reach, 0..) |n, i| if (n == 0) {
-        std.debug.print("reach: label {t} never hit in 400 seeds\n", .{@as(FuzzLabel, @enumFromInt(i))});
+        std.debug.print("reach: label {t} never hit in 400 seeds\n", .{@as(FuzzLabel, @fromBackingInt(@intCast(i)))});
         return error.HarnessDoesNotReach;
     };
 }

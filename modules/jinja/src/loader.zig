@@ -278,18 +278,18 @@ test "checkName bounds the whole name and the component count, each on its own" 
     // 4 × 255-byte components + "/a" = 1025 bytes: every component within
     // its own cap, so only `max_name_len` can refuse it. The all-`a` probe
     // below hits the component cap first and never tested this one.
-    const c = "a" ** max_component_len;
+    const c = strRepeat("a", max_component_len);
     const long_name = c ++ "/" ++ c ++ "/" ++ c ++ "/" ++ c ++ "/a";
     comptime std.debug.assert(long_name.len == max_name_len + 1);
     try testing.expectError(error.MalformedName, checkName(long_name));
     // 32 one-byte components pass; 33 do not.
-    const at_cap = "a/" ** (max_components - 1) ++ "a";
+    const at_cap = strRepeat("a/", max_components - 1) ++ "a";
     try checkName(at_cap);
     try testing.expectError(error.MalformedName, checkName("a/" ++ at_cap));
 }
 
 test "checkName bounds name and component length" {
-    const long_component = "a" ** (max_component_len + 1);
+    const long_component = strRepeat("a", max_component_len + 1);
     try testing.expectError(error.MalformedName, checkName(long_component));
     var buf: [max_name_len + 2]u8 = undefined;
     @memset(&buf, 'a');
@@ -304,4 +304,16 @@ test "MapLoader answers by exact name and null otherwise" {
     try testing.expectEqualStrings("BC", (try l.load(l.ctx, a, "b/c")).?);
     try testing.expect((try l.load(l.ctx, a, "nope")) == null);
     try testing.expect((try l.load(l.ctx, a, "")) == null);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

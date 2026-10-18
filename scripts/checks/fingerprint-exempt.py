@@ -12,8 +12,11 @@ A check's make function cannot change what a module compiles to or what its
 tests do, so it does not belong in the key.
 
 The rule, fail-closed:
-  * check roots = every identifier named as `.makeFn = X` (or `X.make`) in
-    build.zig, and every struct with a `make` method that `build()` allocates;
+  * check roots = every build.zig declaration the gate tool reads
+    (`defs.X` in `scripts/gates/*.zig`, Zig 0.17: the checks left build.zig
+    when custom steps were removed), plus -- for a build.zig that still has
+    them -- every identifier named as `.makeFn = X` (or `X.make`) and every
+    struct with a `make` method that `build()` allocates;
   * machinery roots = every other identifier `build()` references, plus
     `Module` and `module_list`;
   * exempt = declarations reachable from a check root and NOT reachable from a
@@ -24,6 +27,7 @@ The rule, fail-closed:
   scripts/checks/fingerprint-exempt.py --write   # rewrite the list in build.zig
 """
 
+import glob
 import re
 import sys
 
@@ -65,8 +69,13 @@ def compute(src):
     step_structs = {n for n in names if re.search(r"\bfn make\(", d[n]) and d[n].lstrip().startswith(("const", "pub const"))}
     check_roots |= step_structs
     check_roots &= names
-
+    # A make function named in build() is wiring of a CHECK, not of a module;
+    # a declaration the gate tool reads but build() also uses is both, and
+    # stays in the hash (it is in `machinery` below).
     machinery_roots = (refs(build_body, names) - check_roots - {"build"}) | {"Module", "module_list"}
+    for gate_src in sorted(glob.glob("scripts/gates/*.zig")):
+        check_roots |= set(re.findall(r"\bdefs\.([A-Za-z_][A-Za-z0-9_]*)", strip_comments_and_strings(open(gate_src).read())))
+    check_roots &= names
 
     def closure(roots):
         seen, stack = set(), list(roots)

@@ -2048,7 +2048,7 @@ fn fuzzModel(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
 
     var rt = try compute(gpa, &db, sysId(1), 0);
     defer rt.deinit();
-    var seen = [_]bool{false} ** 6;
+    var seen = @as([6]bool, @splat(false));
     for (rt.routes) |r| {
         const v: usize = r.dest[5] - 1;
         seen[v] = true;

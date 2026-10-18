@@ -160,7 +160,7 @@ fn fuzzResponses(comptime S: type, src: *S, a: std.mem.Allocator) anyerror!void 
             @memcpy(key_resp[1..][0..enc_body.len], enc_body);
             var tr = testutil.ScriptTransport.init(a, &.{ key_resp[0 .. 1 + enc_body.len], body });
             defer tr.deinit();
-            const scalars = fuzz_platform_scalar ++ [_]u8{1} ** 16;
+            const scalars = fuzz_platform_scalar ++ @as([16]u8, @splat(1));
             var rnd: testutil.ScriptRandom = .{ .bytes = &scalars };
             const protocol: ctap2pin.Protocol = if (script[0] & 0x80 != 0) .two else .one;
             const c = clientpin.Client.init(a, tr.transport(), rnd.random(), protocol);

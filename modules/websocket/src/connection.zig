@@ -70,7 +70,7 @@ pub const IncrementalUtf8 = struct {
     const s5: u8 = 0x34; // accept 3 (0x90-0xBF), size 4 -- excludes overlong 4-byte (lead 0xF0)
     const s6: u8 = 0x04; // accept 0 (generic), size 4
     const s7: u8 = 0x44; // accept 4 (0x80-0x8F), size 4 -- excludes > U+10FFFF (lead 0xF4)
-    const lead_byte_info = [_]u8{as} ** 128 ++ [_]u8{xx} ** 64 ++ [_]u8{
+    const lead_byte_info = @as([128]u8, @splat(as)) ++ @as([64]u8, @splat(xx)) ++ [_]u8{
         xx, xx, s1, s1, s1, s1, s1, s1, s1, s1, s1, s1, s1, s1, s1, s1,
         s1, s1, s1, s1, s1, s1, s1, s1, s1, s1, s1, s1, s1, s1, s1, s1,
         s2, s3, s3, s3, s3, s3, s3, s3, s3, s3, s3, s3, s3, s4, s3, s3,
@@ -897,10 +897,10 @@ const foreign_peer_corpus = [_]ForeignCase{
     .{ .label = "valid_text_hello", .wire = "\x81\x85\x37\xfa\x21\x3d\x7f\x9f\x4d\x51\x58", .verdict = .accept, .close_code = null, .peers = "py=ACCEPT coder=ACCEPT gorilla=ACCEPT" },
     .{ .label = "valid_ping_hello", .wire = "\x89\x85\x37\xfa\x21\x3d\x7f\x9f\x4d\x51\x58", .verdict = .accept, .close_code = null, .peers = "py=ACCEPT coder=ACCEPT gorilla=ACCEPT" },
     .{ .label = "valid_pong_hello", .wire = "\x8a\x85\x37\xfa\x21\x3d\x7f\x9f\x4d\x51\x58", .verdict = .accept, .close_code = null, .peers = "py=ACCEPT coder=ACCEPT gorilla=ACCEPT" },
-    .{ .label = "valid_text_125", .wire = "\x81\xfd\x37\xfa\x21\x3d" ++ ("\x56\x9b\x40\x5c" ** 31) ++ "\x56", .verdict = .accept, .close_code = null, .peers = "py=ACCEPT coder=ACCEPT gorilla=ACCEPT" },
-    .{ .label = "valid_text_126_16bit", .wire = "\x81\xfe\x00\x7e\x37\xfa\x21\x3d" ++ ("\x56\x9b\x40\x5c" ** 31) ++ "\x56\x9b", .verdict = .accept, .close_code = null, .peers = "py=ACCEPT coder=ACCEPT gorilla=ACCEPT" },
+    .{ .label = "valid_text_125", .wire = "\x81\xfd\x37\xfa\x21\x3d" ++ (strRepeat("\x56\x9b\x40\x5c", 31)) ++ "\x56", .verdict = .accept, .close_code = null, .peers = "py=ACCEPT coder=ACCEPT gorilla=ACCEPT" },
+    .{ .label = "valid_text_126_16bit", .wire = "\x81\xfe\x00\x7e\x37\xfa\x21\x3d" ++ (strRepeat("\x56\x9b\x40\x5c", 31)) ++ "\x56\x9b", .verdict = .accept, .close_code = null, .peers = "py=ACCEPT coder=ACCEPT gorilla=ACCEPT" },
     .{ .label = "valid_text_empty", .wire = "\x81\x80\x37\xfa\x21\x3d", .verdict = .accept, .close_code = null, .peers = "py=ACCEPT coder=ACCEPT gorilla=ACCEPT" },
-    .{ .label = "valid_ctrl_125", .wire = "\x89\xfd\x37\xfa\x21\x3d" ++ ("\x56\x9b\x40\x5c" ** 31) ++ "\x56", .verdict = .accept, .close_code = null, .peers = "py=ACCEPT coder=ACCEPT gorilla=ACCEPT" },
+    .{ .label = "valid_ctrl_125", .wire = "\x89\xfd\x37\xfa\x21\x3d" ++ (strRepeat("\x56\x9b\x40\x5c", 31)) ++ "\x56", .verdict = .accept, .close_code = null, .peers = "py=ACCEPT coder=ACCEPT gorilla=ACCEPT" },
     .{ .label = "valid_close_1000", .wire = "\x88\x82\x37\xfa\x21\x3d\x34\x12", .verdict = .accept, .close_code = null, .peers = "py=ACCEPT coder=ACCEPT/1000 gorilla=ACCEPT/1000" },
     .{ .label = "valid_close_1000_reason", .wire = "\x88\x85\x37\xfa\x21\x3d\x34\x12\x43\x44\x52", .verdict = .accept, .close_code = null, .peers = "py=ACCEPT coder=ACCEPT/1000 gorilla=ACCEPT/1000" },
     .{ .label = "valid_close_empty", .wire = "\x88\x80\x37\xfa\x21\x3d", .verdict = .accept, .close_code = null, .peers = "py=ACCEPT coder=ACCEPT gorilla=ACCEPT" },
@@ -921,7 +921,7 @@ const foreign_peer_corpus = [_]ForeignCase{
     .{ .label = "opcode_0xF_reserved", .wire = "\x8f\x80\x37\xfa\x21\x3d", .verdict = .reject, .close_code = 1002, .peers = "py=REJECT/1002 coder=REJECT/1002 gorilla=REJECT/1002" },
     .{ .label = "fragmented_ping", .wire = "\x09\x81\x37\xfa\x21\x3d\x4f", .verdict = .reject, .close_code = 1002, .peers = "py=REJECT/1002 coder=REJECT/1002 gorilla=REJECT/1002" },
     .{ .label = "fragmented_close", .wire = "\x08\x82\x37\xfa\x21\x3d\x34\x12", .verdict = .reject, .close_code = 1002, .peers = "py=REJECT/1002 coder=REJECT/1002 gorilla=REJECT/1002" },
-    .{ .label = "control_payload_126", .wire = "\x89\xfe\x00\x7e\x37\xfa\x21\x3d" ++ ("\x56\x9b\x40\x5c" ** 31) ++ "\x56\x9b", .verdict = .reject, .close_code = 1002, .peers = "py=REJECT/1002 coder=REJECT/1002 gorilla=REJECT/1002" },
+    .{ .label = "control_payload_126", .wire = "\x89\xfe\x00\x7e\x37\xfa\x21\x3d" ++ (strRepeat("\x56\x9b\x40\x5c", 31)) ++ "\x56\x9b", .verdict = .reject, .close_code = 1002, .peers = "py=REJECT/1002 coder=REJECT/1002 gorilla=REJECT/1002" },
     .{ .label = "nonminimal_len16", .wire = "\x81\xfe\x00\x05\x37\xfa\x21\x3d\x7f\x9f\x4d\x51\x58", .verdict = .divergence, .close_code = 1002, .peers = "py=ACCEPT coder=ACCEPT gorilla=ACCEPT" },
     .{ .label = "nonminimal_len16_zero", .wire = "\x81\xfe\x00\x00\x37\xfa\x21\x3d", .verdict = .divergence, .close_code = 1002, .peers = "py=ACCEPT coder=ACCEPT gorilla=ACCEPT" },
     .{ .label = "nonminimal_len64", .wire = "\x81\xff\x00\x00\x00\x00\x00\x00\x00\x05\x37\xfa\x21\x3d\x7f\x9f\x4d\x51\x58", .verdict = .divergence, .close_code = 1002, .peers = "py=ACCEPT coder=ACCEPT gorilla=ACCEPT" },
@@ -1613,11 +1613,11 @@ const client_seeds = [_][]const u8{
     seed("89026869"), // ping "hi"
     seed("818537FA213D7F9F4D5158"), // MASKED text "Hello" -- illegal from a server
     seed("8102FFFE"), // text with an invalid-UTF-8 payload
-    seed("0102" ++ "4142" ++ "8042" ++ ("43" ** 66)), // 2-byte fragment + 66-byte continuation, 68 > the harness's 64-byte message_buf -- MessageTooLarge mid-reassembly
+    seed("0102" ++ "4142" ++ "8042" ++ (strRepeat("43", 66))), // 2-byte fragment + 66-byte continuation, 68 > the harness's 64-byte message_buf -- MessageTooLarge mid-reassembly
     seed("880503e8627965" ++ "810548656c6c6f"), // close, then a data frame after it -- DataAfterClose
     seed("81"), // need_more: one octet, no length byte yet
     seed("8185FA213D7F9F"), // a masked header is rejected before the mask key/payload even need to be present
-    seed("0100" ++ "0000" ** 8), // an empty start + 8 empty continuations against the harness's max_fragments=8 -- TooManyFragments
+    seed("0100" ++ strRepeat("0000", 8)), // an empty start + 8 empty continuations against the harness's max_fragments=8 -- TooManyFragments
 };
 
 test "fuzz: Connection.receive never panics, client role" {
@@ -1821,7 +1821,7 @@ test "deflate: decompressed text is UTF-8-checked; caps on the plain and the com
     var w: std.Io.Writer = .fixed(&wire);
 
     // Invalid UTF-8 inside compressed text: 1007 after decompression.
-    const bad = "ok \xff" ** 40;
+    const bad = strRepeat("ok \xff", 40);
     try frame.writeFrame(&w, .{ .opcode = .text, .payload = comp.compressMessage(bad, &out, 6).?, .compressed = true });
     try testing.expectError(error.InvalidUtf8, conn.receive(w.buffered()));
     // ...the same bytes as binary are fine.
@@ -1831,7 +1831,7 @@ test "deflate: decompressed text is UTF-8-checked; caps on the plain and the com
 
     // 400 plain bytes into a 300-byte message buffer: 1009.
     w.end = 0;
-    try frame.writeFrame(&w, .{ .opcode = .text, .payload = comp.compressMessage("a" ** 400, &out, 6).?, .compressed = true });
+    try frame.writeFrame(&w, .{ .opcode = .text, .payload = comp.compressMessage(strRepeat("a", 400), &out, 6).?, .compressed = true });
     try testing.expectError(error.MessageTooLarge, conn.receive(w.buffered()));
     try testing.expectEqual(@as(u16, 1009), frame.closeCode(error.MessageTooLarge));
 
@@ -1852,8 +1852,8 @@ test "deflate: decompressed text is UTF-8-checked; caps on the plain and the com
 
     // After all those errors the connection still reads a good message.
     w.end = 0;
-    try frame.writeFrame(&w, .{ .opcode = .text, .payload = comp.compressMessage("x" ** 250, &out, 6).?, .compressed = true });
-    try testing.expectEqualStrings("x" ** 250, (try conn.receive(w.buffered())).event.message.payload);
+    try frame.writeFrame(&w, .{ .opcode = .text, .payload = comp.compressMessage(strRepeat("x", 250), &out, 6).?, .compressed = true });
+    try testing.expectEqualStrings(strRepeat("x", 250), (try conn.receive(w.buffered())).event.message.payload);
 }
 
 test "deflate: masked client frames, fragmented, with a ping in the middle" {
@@ -1861,7 +1861,7 @@ test "deflate: masked client frames, fragmented, with a ping in the middle" {
     const comp = try gpa.create(deflate.Compressor);
     defer gpa.destroy(comp);
     var out: [2048]u8 = undefined;
-    const text = "{\"op\":\"update\",\"id\":17,\"value\":\"hello\"}" ** 20;
+    const text = strRepeat("{\"op\":\"update\",\"id\":17,\"value\":\"hello\"}", 20);
     const z = comp.compressMessage(text, &out, 1).?;
     try testing.expect(z.len < text.len / 4);
 
@@ -1900,4 +1900,16 @@ test "deflate: writeFrame refuses compressed control and continuation frames" {
     try testing.expectEqual(@as(usize, 0), w.end);
     try frame.writeFrame(&w, .{ .opcode = .text, .payload = &.{ 0xf2, 0x48, 0xcd, 0xc9, 0xc9, 0x07, 0x00 }, .compressed = true });
     try testing.expectEqualSlices(u8, &.{ 0xc1, 0x07, 0xf2, 0x48, 0xcd, 0xc9, 0xc9, 0x07, 0x00 }, w.buffered()); // RFC 7692 7.2.3.1
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

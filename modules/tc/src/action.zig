@@ -242,11 +242,11 @@ pub const Verdict = enum(i32) {
     _,
 
     pub fn raw(v: Verdict) i32 {
-        return @intFromEnum(v);
+        return @backingInt(v);
     }
 
     pub fn fromRaw(v: i32) Verdict {
-        return @enumFromInt(v);
+        return @fromBackingInt(@intCast(v));
     }
 };
 
@@ -334,7 +334,7 @@ pub const GactProb = struct {
 
     pub fn encode(p: GactProb) [tc_gact_p_len]u8 {
         var out: [tc_gact_p_len]u8 = undefined;
-        std.mem.writeInt(u16, out[0..2], @intFromEnum(p.ptype), native_endian);
+        std.mem.writeInt(u16, out[0..2], @backingInt(p.ptype), native_endian);
         std.mem.writeInt(u16, out[2..4], p.pval, native_endian);
         std.mem.writeInt(i32, out[4..8], p.paction.raw(), native_endian);
         return out;
@@ -342,7 +342,7 @@ pub const GactProb = struct {
 
     pub fn decode(b: *const [tc_gact_p_len]u8) GactProb {
         return .{
-            .ptype = @enumFromInt(std.mem.readInt(u16, b[0..2], native_endian)),
+            .ptype = @fromBackingInt(@intCast(std.mem.readInt(u16, b[0..2], native_endian))),
             .pval = std.mem.readInt(u16, b[2..4], native_endian),
             .paction = Verdict.fromRaw(std.mem.readInt(i32, b[4..8], native_endian)),
         };
@@ -406,7 +406,7 @@ pub const Mirred = struct {
 
 /// Wire readback of a mirred action's options.
 pub const MirredWire = struct {
-    eaction: MirredAction = @enumFromInt(0),
+    eaction: MirredAction = @fromBackingInt(@intCast(0)),
     ifindex: u32 = 0,
 };
 
@@ -544,7 +544,7 @@ pub const Vlan = struct {
 
 /// Wire readback of a vlan action's options.
 pub const VlanWire = struct {
-    v_action: VlanAction = @enumFromInt(0),
+    v_action: VlanAction = @fromBackingInt(@intCast(0)),
     id: ?u16 = null,
     proto: ?u16 = null,
     prio: ?u8 = null,
@@ -692,7 +692,7 @@ fn appendMirredOptions(
     };
     var buf: [tc_mirred_len]u8 = undefined;
     buf[0..tc_gen_len].* = gen.encode();
-    std.mem.writeInt(i32, buf[20..24], @intFromEnum(m.eaction), native_endian);
+    std.mem.writeInt(i32, buf[20..24], @backingInt(m.eaction), native_endian);
     std.mem.writeInt(u32, buf[24..28], m.ifindex, native_endian);
     try appendAttr(gpa, list, TCA_MIRRED.PARMS, &buf);
 }
@@ -794,7 +794,7 @@ fn appendVlanOptions(
     const gen: Gen = .{ .index = v.index, .action = v.action };
     var buf: [tc_vlan_len]u8 = undefined;
     buf[0..tc_gen_len].* = gen.encode();
-    std.mem.writeInt(i32, buf[20..24], @intFromEnum(v.v_action), native_endian);
+    std.mem.writeInt(i32, buf[20..24], @backingInt(v.v_action), native_endian);
     try appendAttr(gpa, list, TCA_VLAN.PARMS, &buf);
     if (v.id) |id| try codec.appendAttrU16(gpa, list, TCA_VLAN.PUSH_VLAN_ID, id);
     if (v.proto) |pr| try appendAttrBe16(gpa, list, TCA_VLAN.PUSH_VLAN_PROTOCOL, pr);
@@ -997,7 +997,7 @@ fn parseMirredOptions(a: *Action, data: []const u8) codec.Error!void {
         TCA_MIRRED.PARMS => {
             if (attr.data.len < tc_mirred_len) return error.BadLength;
             a.gen = Gen.decode(attr.data[0..tc_gen_len]);
-            w.eaction = @enumFromInt(std.mem.readInt(i32, attr.data[20..24], native_endian));
+            w.eaction = @fromBackingInt(@intCast(std.mem.readInt(i32, attr.data[20..24], native_endian)));
             w.ifindex = std.mem.readInt(u32, attr.data[24..28], native_endian);
         },
         TCA_MIRRED.TM => a.tm = parseTm(attr.data),
@@ -1084,7 +1084,7 @@ fn parseVlanOptions(a: *Action, data: []const u8) codec.Error!void {
         TCA_VLAN.PARMS => {
             if (attr.data.len < tc_vlan_len) return error.BadLength;
             a.gen = Gen.decode(attr.data[0..tc_gen_len]);
-            w.v_action = @enumFromInt(std.mem.readInt(i32, attr.data[20..24], native_endian));
+            w.v_action = @fromBackingInt(@intCast(std.mem.readInt(i32, attr.data[20..24], native_endian)));
         },
         TCA_VLAN.PUSH_VLAN_ID => if (attr.data.len >= 2) {
             w.id = std.mem.readInt(u16, attr.data[0..2], native_endian);
@@ -1294,14 +1294,14 @@ test "parseMirredOptions rejects a TCA_MIRRED_PARMS attribute shorter than tc_mi
 
     var short_list: std.ArrayList(u8) = .empty;
     defer short_list.deinit(gpa);
-    try codec.appendAttr(gpa, &short_list, TCA_MIRRED.PARMS, &([_]u8{0} ** (tc_mirred_len - 1)));
+    try codec.appendAttr(gpa, &short_list, TCA_MIRRED.PARMS, &(@as([tc_mirred_len - 1]u8, @splat(0))));
     var a: Action = .{ .order = 1 };
     try testing.expectError(error.BadLength, parseMirredOptions(&a, short_list.items));
 
     // Positive control: exactly tc_mirred_len bytes must still parse.
     var ok_list: std.ArrayList(u8) = .empty;
     defer ok_list.deinit(gpa);
-    try codec.appendAttr(gpa, &ok_list, TCA_MIRRED.PARMS, &([_]u8{0} ** tc_mirred_len));
+    try codec.appendAttr(gpa, &ok_list, TCA_MIRRED.PARMS, &(@as([tc_mirred_len]u8, @splat(0))));
     var a2: Action = .{ .order = 1 };
     try parseMirredOptions(&a2, ok_list.items);
 }
@@ -1312,14 +1312,14 @@ test "parsePoliceOptions rejects a TCA_POLICE_TBF attribute shorter than tc_poli
 
     var short_list: std.ArrayList(u8) = .empty;
     defer short_list.deinit(gpa);
-    try codec.appendAttr(gpa, &short_list, TCA_POLICE.TBF, &([_]u8{0} ** (tc_police_len - 1)));
+    try codec.appendAttr(gpa, &short_list, TCA_POLICE.TBF, &(@as([tc_police_len - 1]u8, @splat(0))));
     var a: Action = .{ .order = 1 };
     try testing.expectError(error.BadLength, parsePoliceOptions(&a, short_list.items));
 
     // Positive control: exactly tc_police_len bytes must still parse.
     var ok_list: std.ArrayList(u8) = .empty;
     defer ok_list.deinit(gpa);
-    try codec.appendAttr(gpa, &ok_list, TCA_POLICE.TBF, &([_]u8{0} ** tc_police_len));
+    try codec.appendAttr(gpa, &ok_list, TCA_POLICE.TBF, &(@as([tc_police_len]u8, @splat(0))));
     var a2: Action = .{ .order = 1 };
     try parsePoliceOptions(&a2, ok_list.items);
 }
@@ -1418,7 +1418,7 @@ test "a cookie longer than TC_COOKIE_MAX_SIZE is rejected before any output" {
     const gpa = testing.allocator;
     var list: std.ArrayList(u8) = .empty;
     defer list.deinit(gpa);
-    const acts = [_]ActionSpec{.{ .gact = .{ .cookie = &[_]u8{0xAA} ** (max_cookie_len + 1) } }};
+    const acts = [_]ActionSpec{.{ .gact = .{ .cookie = &@as([max_cookie_len + 1]u8, @splat(0xAA)) } }};
     try testing.expectError(
         error.CookieTooLong,
         appendActionList(gpa, &list, 7, &acts, ratespec.golden_psched),
@@ -1782,17 +1782,17 @@ const ActionCorpus = struct {
         // Every `if (a.data.len >= N)` in `parseStats` and `parseAction` is a
         // bound a well-formed dump cannot exercise.
         var short: std.ArrayList(u8) = .empty;
-        try codec.appendAttr(gpa, &short, TCA_STATS.BASIC, &[_]u8{0} ** 8);
-        try codec.appendAttr(gpa, &short, TCA_STATS.QUEUE, &[_]u8{0} ** 12);
-        try codec.appendAttr(gpa, &short, TCA_STATS.PKT64, &[_]u8{0} ** 4);
-        try codec.appendAttr(gpa, &short, TCA_ACT.INDEX, &[_]u8{0} ** 2);
+        try codec.appendAttr(gpa, &short, TCA_STATS.BASIC, &@as([8]u8, @splat(0)));
+        try codec.appendAttr(gpa, &short, TCA_STATS.QUEUE, &@as([12]u8, @splat(0)));
+        try codec.appendAttr(gpa, &short, TCA_STATS.PKT64, &@as([4]u8, @splat(0)));
+        try codec.appendAttr(gpa, &short, TCA_ACT.INDEX, &@as([2]u8, @splat(0)));
         self.push(short.items, 1);
 
         // A cookie twice `max_cookie_len`: the `@min` in `parseAction` is the
         // only thing between a 32-octet attribute and a 16-octet buffer.
         var big_cookie: std.ArrayList(u8) = .empty;
         try codec.appendAttrString(gpa, &big_cookie, TCA_ACT.KIND, kind_gact);
-        try codec.appendAttr(gpa, &big_cookie, TCA_ACT.COOKIE, &[_]u8{0xAA} ** (max_cookie_len * 2));
+        try codec.appendAttr(gpa, &big_cookie, TCA_ACT.COOKIE, &@as([max_cookie_len * 2]u8, @splat(0xAA)));
         self.push(big_cookie.items, 4);
 
         // ── the refusals ───────────────────────────────────────────────────
@@ -1826,7 +1826,7 @@ test "an unknown gact probability type from the wire is carried, not a panic" {
     const nest = (try outer.next()).?;
     var it: ActionIterator = .init(nest.data);
     const g = (try it.next()).?;
-    try testing.expectEqual(@as(u16, 0x7777), @intFromEnum(g.gact.?.random.?.ptype));
+    try testing.expectEqual(@as(u16, 0x7777), @backingInt(g.gact.?.random.?.ptype));
     try testing.expectEqual(@as(u16, 4), g.gact.?.random.?.pval);
 }
 

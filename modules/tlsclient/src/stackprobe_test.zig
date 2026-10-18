@@ -270,7 +270,7 @@ fn runProbe(label: []const u8, call: *const fn () void, n: *const Needles) !usiz
 }
 
 fn skipUnlessOptimized() !void {
-    if (builtin.mode == .Debug or builtin.mode == .ReleaseSafe) return error.SkipZigTest;
+    if (builtin.mode == .debug or builtin.mode == .safe) return error.SkipZigTest;
 }
 
 // ── needles ─────────────────────────────────────────────────────────────────
@@ -335,7 +335,7 @@ var sig_sink: []const u8 = &.{};
 
 /// TLS 1.3 CertificateVerify content shape: 64 spaces, the context string, a
 /// zero byte, the transcript hash (RFC 8446 §4.4.3).
-const signed_msg = "\x20" ** 64 ++ "TLS 1.3, client CertificateVerify\x00" ++ "\x5a" ** 48;
+const signed_msg = strRepeat("\x20", 64) ++ "TLS 1.3, client CertificateVerify\x00" ++ strRepeat("\x5a", 48);
 
 noinline fn callSign() void {
     sig_sink = Client.signCertificateVerify(&sig_buf, &cur_key, cur_key.scheme(), .{ .message = signed_msg }, sign_rng.random()) catch unreachable;
@@ -492,16 +492,16 @@ fn buildFlight(ci: u8, group: tls.NamedGroup, suite: tls.CipherSuite, share: []c
     in_buf[p] = 32;
     p += 1;
     putBytes(&p, kex_entropy[32..64]); // legacy_session_id echo
-    putInt(u16, &p, @intFromEnum(suite));
+    putInt(u16, &p, @backingInt(suite));
     in_buf[p] = 0; // legacy_compression_method
     p += 1;
     putInt(u16, &p, @intCast(6 + 4 + 4 + share.len)); // extensions
-    putInt(u16, &p, @intFromEnum(tls.ExtensionType.supported_versions));
+    putInt(u16, &p, @backingInt(tls.ExtensionType.supported_versions));
     putInt(u16, &p, 2);
     putInt(u16, &p, 0x0304);
-    putInt(u16, &p, @intFromEnum(tls.ExtensionType.key_share));
+    putInt(u16, &p, @backingInt(tls.ExtensionType.key_share));
     putInt(u16, &p, @intCast(4 + share.len));
-    putInt(u16, &p, @intFromEnum(group));
+    putInt(u16, &p, @backingInt(group));
     putInt(u16, &p, @intCast(share.len));
     putBytes(&p, share);
     std.mem.writeInt(u24, in_buf[6..9], @intCast(p - 9), .big);
@@ -533,7 +533,7 @@ fn Schedule(comptime Hash: type) type {
 fn scheduleNeedles(comptime Hash: type, comptime aead_key_len: usize, n: *Needles, shared: []const u8, hello_hash: *const [Hash.digest_length]u8) Schedule(Hash) {
     const K = Hkdf(if (Hash == Sha256) Hmac.HmacSha256 else Hmac.HmacSha384);
     const dl = Hash.digest_length;
-    const zeroes = [1]u8{0} ** dl;
+    const zeroes = @as([dl]u8, @splat(0));
     const early = K.extract(&[1]u8{0}, &zeroes);
     const empty = tls.emptyHash(Hash);
     const hs_derived = tls.hkdfExpandLabel(K, early, "derived", &empty, dl);
@@ -594,7 +594,7 @@ fn derFromPem(comptime pem: []const u8) []const u8 {
 
 /// One handshake message (`typ`, u24 length, `body`) into `buf`.
 fn hsMsg(buf: []u8, typ: tls.HandshakeType, body: []const u8) []const u8 {
-    buf[0] = @intFromEnum(typ);
+    buf[0] = @backingInt(typ);
     std.mem.writeInt(u24, buf[1..4], @intCast(body.len), .big);
     @memcpy(buf[4..][0..body.len], body);
     return buf[0 .. 4 + body.len];
@@ -604,10 +604,10 @@ fn hsMsg(buf: []u8, typ: tls.HandshakeType, body: []const u8) []const u8 {
 fn appendRecord(comptime Aead: type, key: [Aead.key_length]u8, iv: [Aead.nonce_length]u8, seq: u64, msg: []const u8) void {
     var pt: [2048]u8 = undefined;
     @memcpy(pt[0..msg.len], msg);
-    pt[msg.len] = @intFromEnum(tls.ContentType.handshake);
+    pt[msg.len] = @backingInt(tls.ContentType.handshake);
     const inner = pt[0 .. msg.len + 1];
     const rec = in_buf[in_len..];
-    rec[0..3].* = .{ @intFromEnum(tls.ContentType.application_data), 3, 3 };
+    rec[0..3].* = .{ @backingInt(tls.ContentType.application_data), 3, 3 };
     std.mem.writeInt(u16, rec[3..5], @intCast(inner.len + Aead.tag_length), .big);
     var nonce = iv;
     var seq_be: [8]u8 = undefined;
@@ -631,7 +631,7 @@ fn appendServerFlight(comptime Hash: type, comptime Aead: type, n: *Needles, sch
 
     // The middlebox-compatibility ChangeCipherSpec: std's client switches to
     // the handshake keys on it, not on the ServerHello.
-    putBytes(&in_len, &.{ @intFromEnum(tls.ContentType.change_cipher_spec), 3, 3, 0, 1, 1 });
+    putBytes(&in_len, &.{ @backingInt(tls.ContentType.change_cipher_spec), 3, 3, 0, 1, 1 });
 
     const ee = hsMsg(&buf, .encrypted_extensions, &.{ 0, 0 });
     transcript.update(ee);
@@ -650,13 +650,13 @@ fn appendServerFlight(comptime Hash: type, comptime Aead: type, n: *Needles, sch
     // SEC1 ECPrivateKey: 30 77 02 01 01 04 20 <32-byte scalar> …
     try std.testing.expectEqualSlices(u8, "\x30\x77\x02\x01\x01\x04\x20", server_key_der[0..7]);
     const kp = try Es256.KeyPair.fromSecretKey(try Es256.SecretKey.fromBytes(server_key_der[7..39].*));
-    const signed = " " ** 64 ++ "TLS 1.3, server CertificateVerify\x00";
+    const signed = strRepeat(" ", 64) ++ "TLS 1.3, server CertificateVerify\x00";
     var cv_msg: [signed.len + dl]u8 = undefined;
     cv_msg[0..signed.len].* = signed.*;
     cv_msg[signed.len..].* = transcript.peek();
     var sig_der: [Es256.Signature.der_encoded_length_max]u8 = undefined;
     const sig = (try kp.sign(&cv_msg, null)).toDer(&sig_der);
-    std.mem.writeInt(u16, body[0..2], @intFromEnum(tls.SignatureScheme.ecdsa_secp256r1_sha256), .big);
+    std.mem.writeInt(u16, body[0..2], @backingInt(tls.SignatureScheme.ecdsa_secp256r1_sha256), .big);
     std.mem.writeInt(u16, body[2..4], @intCast(sig.len), .big);
     @memcpy(body[4..][0..sig.len], sig);
     const cv = hsMsg(&buf, .certificate_verify, body[0 .. 4 + sig.len]);
@@ -852,4 +852,16 @@ test "STACKPROBE: no application secret residue on the dead stack after a full C
         }
     }
     try std.testing.expectEqual(@as(usize, 0), bad);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

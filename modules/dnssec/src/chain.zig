@@ -113,7 +113,7 @@ pub fn validateDnskeySet(
     defer gpa.free(records);
     for (dnskey_rrset, 0..) |raw, i| records[i] = .{
         .name = zone_name,
-        .ty = @enumFromInt(rdata.rr_type.dnskey),
+        .ty = @fromBackingInt(@intCast(rdata.rr_type.dnskey)),
         .class = .in,
         .ttl = 0,
         .data = .{ .unknown = raw },
@@ -197,7 +197,7 @@ test "regression: algorithm-mismatched DNSKEY/RRSIG is rejected, not union-confu
         .inception = 0,
         .key_tag = 0,
         .signer_name = zone,
-        .signature = &[_]u8{0} ** 64,
+        .signature = &@as([64]u8, @splat(0)),
     };
     // A pinned trust anchor equal to the key's raw RDATA makes `anchorMatches`
     // pass, so WITHOUT the guard execution would reach the crashing dispatch.
@@ -236,7 +236,7 @@ const F5Rig = struct {
     fn sign(self: F5Rig, zone_name: []const u8, rrsig: rdata.Rrsig) ![64]u8 {
         const records = [_]dns.Record{.{
             .name = zone_name,
-            .ty = @enumFromInt(rdata.rr_type.dnskey),
+            .ty = @fromBackingInt(@intCast(rdata.rr_type.dnskey)),
             .class = .in,
             .ttl = 0,
             .data = .{ .unknown = &self.raw },
@@ -263,7 +263,7 @@ test "regression: DNSKEY RRSIG covering the wrong type is not authenticated (aud
         .inception = 0,
         .key_tag = 0,
         .signer_name = zone,
-        .signature = &[_]u8{0} ** 64,
+        .signature = &@as([64]u8, @splat(0)),
     };
     const sig_bytes = try rig.sign(zone, rrsig);
     rrsig.signature = &sig_bytes;
@@ -289,7 +289,7 @@ test "regression: DNSKEY RRSIG signed by a different zone is not authenticated (
         .inception = 0,
         .key_tag = 0,
         .signer_name = "sub.example.com", // a DIFFERENT zone
-        .signature = &[_]u8{0} ** 64,
+        .signature = &@as([64]u8, @splat(0)),
     };
     const sig_bytes = try rig.sign(zone, rrsig);
     rrsig.signature = &sig_bytes;
@@ -316,7 +316,7 @@ test "regression: DNSKEY RRSIG with the wrong labels count is not authenticated 
         .inception = 0,
         .key_tag = 0,
         .signer_name = zone,
-        .signature = &[_]u8{0} ** 64,
+        .signature = &@as([64]u8, @splat(0)),
     };
     const sig_bytes = try rig.sign(zone, rrsig);
     rrsig.signature = &sig_bytes;

@@ -42,9 +42,9 @@ pub fn main() !void {
 
     // Two operands loaded the same way real wire values arrive: big-endian
     // bytes, reduced against the modulus.
-    var a_be = [_]u8{0} ** 32;
+    var a_be = @as([32]u8, @splat(0));
     a_be[31] = 7; // a = 7
-    var b_be = [_]u8{0} ** 32;
+    var b_be = @as([32]u8, @splat(0));
     b_be[31] = 3; // b = 3
 
     const a = try m.elementFromBytesBE(&a_be);
@@ -52,14 +52,14 @@ pub fn main() !void {
 
     // Normal-domain modular multiplication: (a * b) mod m.
     const product = m.mul(&a, &b);
-    var product_be = [_]u8{0} ** 32;
+    var product_be = @as([32]u8, @splat(0));
     m.toBytesBE(&product, &product_be);
     std.debug.print("7 * 3 mod m, last byte: 0x{x:0>2}\n", .{product_be[31]});
 
     // Modular exponentiation: a^b mod m, the modexp primitive RSA/Paillier
     // build their public operations on.
     const result = m.powMont(&a, &b);
-    var result_be = [_]u8{0} ** 32;
+    var result_be = @as([32]u8, @splat(0));
     m.toBytesBE(&result, &result_be);
     std.debug.print("7^3 mod m, last byte: 0x{x:0>2}\n", .{result_be[31]}); // 343 = 0x157
 

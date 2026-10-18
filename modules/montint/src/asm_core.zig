@@ -755,7 +755,7 @@ pub fn montSqrFixed(comptime L: usize, z: *[L]u64, a: *const [L]u64, m: *const [
 
 fn montSqrFixedAmd64(comptime L: usize, z: *[L]u64, a: *const [L]u64, m: *const [L]u64, n0inv: u64) void {
     comptime std.debug.assert(L >= 2 and L <= sqr_fixed_max_limbs);
-    var A: [2 * L]u64 = [_]u64{0} ** (2 * L);
+    var A: [2 * L]u64 = @as([2 * L]u64, @splat(0));
     defer std.crypto.secureZero(u64, &A);
     const text = comptime sqrFixedText(L);
     var cc: u64 = undefined;
@@ -1341,13 +1341,13 @@ test "condSub pass 2: the borrow must survive a limb where z[i] == m[i]" {
     //     m = 2^2047 + 7; value = B^32 + 3, which is ≥ m and < 2m = B^32 + 14.
     //     Limbs 1..30 are 0 on both sides with a borrow in from limb 0, so the
     //     `s2[1]` term has to fire 30 times in a row. Result 2^2047 − 4.
-    var m_a = [_]u64{0} ** n;
+    var m_a = @as([n]u64, @splat(0));
     m_a[0] = 7;
     m_a[n - 1] = top_bit;
-    var z_a = [_]u64{0} ** n;
+    var z_a = @as([n]u64, @splat(0));
     z_a[0] = 3;
     condSub(&z_a, 1, &m_a);
-    var want_a = [_]u64{ones} ** n;
+    var want_a = @as([n]u64, @splat(ones));
     want_a[0] = ones - 3;
     want_a[n - 1] = top_bit - 1;
     try std.testing.expectEqualSlices(u64, &want_a, &z_a);
@@ -1355,7 +1355,7 @@ test "condSub pass 2: the borrow must survive a limb where z[i] == m[i]" {
     // (b) top == 0, and the equal limb is a NONZERO one, so (a) cannot be
     //     dismissed as an artifact of zero limbs. m and z agree on limbs 3..31;
     //     z − m = B² − 2, which needs the borrow to cross the equal limb 1.
-    var m_b = [_]u64{0xa5a5_a5a5_a5a5_a5a5} ** n;
+    var m_b = @as([n]u64, @splat(0xa5a5_a5a5_a5a5_a5a5));
     m_b[0] = 5;
     m_b[1] = 7;
     m_b[2] = 9;
@@ -1364,7 +1364,7 @@ test "condSub pass 2: the borrow must survive a limb where z[i] == m[i]" {
     z_b[0] = 3;
     z_b[2] = 10; // z > m, so the subtract fires
     condSub(&z_b, 0, &m_b);
-    var want_b = [_]u64{0} ** n;
+    var want_b = @as([n]u64, @splat(0));
     want_b[0] = ones - 1;
     want_b[1] = ones;
     try std.testing.expectEqualSlices(u64, &want_b, &z_b);
@@ -1400,7 +1400,7 @@ test "condSub pass 1: the outgoing borrow must survive a limb where z[i] == m[i]
     //     z = m − 1 = 2^2047. Limbs 1..31 are equal with a borrow in from
     //     limb 0, so `s2[1]` has to fire 31 times in a row for pass 1 to see
     //     that z < m.
-    var m_a = [_]u64{0} ** n;
+    var m_a = @as([n]u64, @splat(0));
     m_a[0] = 1;
     m_a[n - 1] = top_bit;
     var z_a = m_a;
@@ -1412,7 +1412,7 @@ test "condSub pass 1: the outgoing borrow must survive a limb where z[i] == m[i]
     // (b) the equal limbs are NONZERO, so (a) cannot be dismissed as an
     //     artifact of zero limbs. m = 0xa5a5… in every limb but limb 0 (top
     //     bit already set, so it is full width), z = m − 1 again.
-    var m_b = [_]u64{0xa5a5_a5a5_a5a5_a5a5} ** n;
+    var m_b = @as([n]u64, @splat(0xa5a5_a5a5_a5a5_a5a5));
     m_b[0] = 5;
     var z_b = m_b;
     z_b[0] = 4;
@@ -1423,7 +1423,7 @@ test "condSub pass 1: the outgoing borrow must survive a limb where z[i] == m[i]
     // A guard on the guard: the mutant's answer is `B^n − 1`, so if either
     // case above ever starts returning that, it is the mutation's signature
     // and not a new correct behaviour.
-    const all_ones = [_]u64{ones} ** n;
+    const all_ones = @as([n]u64, @splat(ones));
     try std.testing.expect(!std.mem.eql(u64, &all_ones, &z_a));
     try std.testing.expect(!std.mem.eql(u64, &all_ones, &z_b));
 }

@@ -127,7 +127,7 @@ test "PS256/384/512: our signatures verify, are randomized, and carry the RFC 75
     var kp: jwt.rsa.KeyPair = undefined;
     try keyPair(&kp);
     defer kp.secret_key.deinit();
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x52} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x52)));
     const random = csprng.random();
     const key = try publicKey();
     const input = "eyJhbGciOiJQUzI1NiJ9.eyJzdWIiOiJ4In0";
@@ -160,7 +160,7 @@ test "RS256/384/512 and PS*: encode round-trips through parseAndVerify" {
     var kp: jwt.rsa.KeyPair = undefined;
     try keyPair(&kp);
     defer kp.secret_key.deinit();
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x17} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x17)));
     const keys = [_]jwt.SigningKey{
         .{ .rs256 = &kp },                                        .{ .rs384 = &kp },                                        .{ .rs512 = &kp },
         .{ .ps256 = .{ .key = &kp, .random = csprng.random() } }, .{ .ps384 = .{ .key = &kp, .random = csprng.random() } }, .{ .ps512 = .{ .key = &kp, .random = csprng.random() } },
@@ -173,7 +173,7 @@ test "RS256/384/512 and PS*: encode round-trips through parseAndVerify" {
         defer parsed.deinit();
         try testing.expectEqual(sk.alg(), parsed.alg);
         // An RSA token never verifies under an EC key (RFC 8725 §2.1).
-        const ec = try jwt.EcdsaP256Sha256.KeyPair.generateDeterministic([_]u8{7} ** 32);
+        const ec = try jwt.EcdsaP256Sha256.KeyPair.generateDeterministic(@as([32]u8, @splat(7)));
         try testing.expectError(error.AlgKeyMismatch, jwt.parseAndVerify(testing.allocator, token, .{ .ecdsa_p256 = ec.public_key }, opts));
     }
 }
@@ -193,14 +193,14 @@ test "RSA keys: below 2048 bits refused; a 2049-bit modulus (std's PSS assert) i
     @memcpy(wide[1..], n);
     const key = try jwt.Key.rsaFromModExp(&wide, &.{ 1, 0, 1 });
     try testing.expectEqual(@as(usize, 257), key.rsa.modulus_len);
-    const sig = [_]u8{0x33} ** 257;
+    const sig = @as([257]u8, @splat(0x33));
     inline for (.{ jwt.Alg.PS256, jwt.Alg.PS384, jwt.Alg.PS512, jwt.Alg.RS256 }) |alg| {
         var t = bare(alg, "a.b", &sig);
         try testing.expectError(error.BadSignature, jwt.verify(&t, key));
     }
     // Signing refuses a short key too.
     var small: jwt.rsa.KeyPair = undefined;
-    var csprng = std.Random.DefaultCsprng.init([_]u8{9} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(9)));
     try jwt.rsa.generate(&small, csprng.random(), 1024, 65537);
     defer small.secret_key.deinit();
     var out: [jwt.SigningKey.max_signature_len]u8 = undefined;

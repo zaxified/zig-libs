@@ -17,7 +17,7 @@ const limits = @import("limits.zig");
 
 fn dummyCtx() txctx.TxContext {
     return .{
-        .tx = .{ .version = 1, .vin = @constCast(&[_]bitcointx.TxIn{.{ .prevout = .{ .txid = [_]u8{0} ** 32, .vout = 0 }, .script_sig = &.{}, .sequence = 0xffffffff }}), .vout = &.{}, .witness = &.{}, .locktime = 0, .has_witness = false },
+        .tx = .{ .version = 1, .vin = @constCast(&[_]bitcointx.TxIn{.{ .prevout = .{ .txid = @as([32]u8, @splat(0)), .vout = 0 }, .script_sig = &.{}, .sequence = 0xffffffff }}), .vout = &.{}, .witness = &.{}, .locktime = 0, .has_witness = false },
         .input_index = 0,
         .spent_outputs = &[_]bitcointx.TxOut{.{ .value = 1000, .script_pubkey = &.{} }},
     };
@@ -28,7 +28,7 @@ test "DoS: witness item count over the consensus-adjacent bound is rejected, no 
     defer arena.deinit();
     const a = arena.allocator();
 
-    const script_pubkey = [_]u8{ 0x00, 0x20 } ++ [_]u8{0xcc} ** 32; // P2WSH program
+    const script_pubkey = [_]u8{ 0x00, 0x20 } ++ @as([32]u8, @splat(0xcc)); // P2WSH program
     var items: std.ArrayList([]const u8) = .empty;
     var i: usize = 0;
     while (i < limits.max_stack_items_in_witness + 5) : (i += 1) try items.append(a, "x");
@@ -60,10 +60,10 @@ test "DoS: P2WPKH witness item oversized is rejected" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const script_pubkey = [_]u8{ 0x00, 0x14 } ++ [_]u8{0xaa} ** 20;
+    const script_pubkey = [_]u8{ 0x00, 0x14 } ++ @as([20]u8, @splat(0xaa));
     var big_sig: [limits.max_script_element_size + 1]u8 = undefined;
     @memset(&big_sig, 0x01);
-    const pubkey = [_]u8{0x02} ** 33;
+    const pubkey = @as([33]u8, @splat(0x02));
     const witness = [_][]const u8{ &big_sig, &pubkey };
     try testing.expectError(error.PushSize, verify.verifyScript(a, &.{}, &script_pubkey, &witness, .{ .witness = true }, dummyCtx()));
 }

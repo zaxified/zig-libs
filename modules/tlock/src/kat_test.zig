@@ -152,8 +152,8 @@ test "encrypt/decrypt round trip against a real quicknet round signature" {
     const round: u64 = 1000;
     const sig = round1000Signature();
 
-    const message = [_]u8{0x5a} ** ciphersuite.block_bytes;
-    const sigma = [_]u8{0x11} ** ciphersuite.block_bytes;
+    const message = @as([ciphersuite.block_bytes]u8, @splat(0x5a));
+    const sigma = @as([ciphersuite.block_bytes]u8, @splat(0x11));
 
     const ct = testEncrypt(p_pub, round, message, sigma);
     const recovered = try testDecrypt(sig, ct);
@@ -164,8 +164,8 @@ test "decrypt rejects a wrong round signature (FO consistency check fires)" {
     if (!gate.core_implemented) return error.SkipZigTest;
 
     const p_pub = quicknetPubkey();
-    const message = [_]u8{0x5a} ** ciphersuite.block_bytes;
-    const sigma = [_]u8{0x11} ** ciphersuite.block_bytes;
+    const message = @as([ciphersuite.block_bytes]u8, @splat(0x5a));
+    const sigma = @as([ciphersuite.block_bytes]u8, @splat(0x11));
 
     // A signature for a DIFFERENT identity entirely (reuse the same
     // round-1000 signature but pretend it is for round 1001's
@@ -178,8 +178,8 @@ test "decrypt rejects a tampered ciphertext (V flipped)" {
     if (!gate.core_implemented) return error.SkipZigTest;
 
     const p_pub = quicknetPubkey();
-    const message = [_]u8{0x5a} ** ciphersuite.block_bytes;
-    const sigma = [_]u8{0x11} ** ciphersuite.block_bytes;
+    const message = @as([ciphersuite.block_bytes]u8, @splat(0x5a));
+    const sigma = @as([ciphersuite.block_bytes]u8, @splat(0x11));
     var ct = testEncrypt(p_pub, 1000, message, sigma);
     ct.v[0] ^= 0xff;
 
@@ -190,8 +190,8 @@ test "decrypt rejects a tampered ciphertext (W flipped)" {
     if (!gate.core_implemented) return error.SkipZigTest;
 
     const p_pub = quicknetPubkey();
-    const message = [_]u8{0x5a} ** ciphersuite.block_bytes;
-    const sigma = [_]u8{0x11} ** ciphersuite.block_bytes;
+    const message = @as([ciphersuite.block_bytes]u8, @splat(0x5a));
+    const sigma = @as([ciphersuite.block_bytes]u8, @splat(0x11));
     var ct = testEncrypt(p_pub, 1000, message, sigma);
     ct.w[0] ^= 0xff;
 
@@ -202,8 +202,8 @@ test "encrypt with a fixed sigma is deterministic (pins the ciphertext for a fut
     if (!gate.core_implemented) return error.SkipZigTest;
 
     const p_pub = quicknetPubkey();
-    const message = [_]u8{0x5a} ** ciphersuite.block_bytes;
-    const sigma = [_]u8{0x11} ** ciphersuite.block_bytes;
+    const message = @as([ciphersuite.block_bytes]u8, @splat(0x5a));
+    const sigma = @as([ciphersuite.block_bytes]u8, @splat(0x11));
 
     const ct1 = testEncrypt(p_pub, 1000, message, sigma);
     const ct2 = testEncrypt(p_pub, 1000, message, sigma);
@@ -258,7 +258,7 @@ test "entropy seam: randomSigma really draws, and two encryptions of one message
     // guessable one unlocks the ciphertext before its round, which is the
     // single property the whole construction sells.
     const p_pub = quicknetPubkey();
-    const message = [_]u8{0x5a} ** ciphersuite.block_bytes;
+    const message = @as([ciphersuite.block_bytes]u8, @splat(0x5a));
 
     var sigma1: [tlock.block_bytes]u8 = undefined;
     ciphersuite.randomSigma(&sigma1, io);
@@ -526,7 +526,7 @@ const DamageSubject = struct {
     bytes: [tlock.Ciphertext.encoded_bytes]u8,
 
     fn build() DamageSubject {
-        var sk_bytes = [_]u8{0} ** 32;
+        var sk_bytes = @as([32]u8, @splat(0));
         sk_bytes[31] = 0x07;
         const sk = bls12_381.Fr.fromBytes(sk_bytes) catch unreachable;
         const p_pub = g2.Jacobian.fromAffine(g2.Affine.generator).scalarMul(sk).toAffine();
@@ -535,8 +535,8 @@ const DamageSubject = struct {
         const id = ciphersuite.beaconId(round);
         const round_signature = g1.Jacobian.fromAffine(ciphersuite.h1(id)).scalarMul(sk).toAffine();
 
-        const message = [_]u8{0xCD} ** tlock.block_bytes;
-        const sigma = [_]u8{0x22} ** tlock.block_bytes;
+        const message = @as([tlock.block_bytes]u8, @splat(0xCD));
+        const sigma = @as([tlock.block_bytes]u8, @splat(0x22));
         return .{
             .round_signature = round_signature,
             .bytes = testEncrypt(p_pub, round, message, sigma).toBytes(),
@@ -593,7 +593,7 @@ fn fuzzDecrypt(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
         return;
     };
     if (!pristine) return error.DamagedCiphertextDecrypted;
-    if (!std.mem.eql(u8, &m, &([_]u8{0xCD} ** tlock.block_bytes))) return error.GenuineCiphertextChanged;
+    if (!std.mem.eql(u8, &m, &(@as([tlock.block_bytes]u8, @splat(0xCD))))) return error.GenuineCiphertextChanged;
     DecryptMark.mark(.genuine_accepted);
 }
 

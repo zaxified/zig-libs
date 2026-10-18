@@ -149,7 +149,7 @@ pub const Mode = enum(u8) {
 /// `"OPRFV1-" || I2OSP(mode, 1) || "-" || identifier` (the mode byte is
 /// the raw value 0x00/0x01/0x02, NOT an ASCII digit).
 pub fn contextString(comptime mode: Mode) []const u8 {
-    return "OPRFV1-" ++ [1]u8{@intFromEnum(mode)} ++ "-" ++ identifier;
+    return "OPRFV1-" ++ [1]u8{@backingInt(mode)} ++ "-" ++ identifier;
 }
 
 // ── hash layer (RFC 9380 §5.4.1 + RFC 9497 §4.1) ─────────────────────────
@@ -169,7 +169,7 @@ pub fn expandMessageXmd(
     comptime std.debug.assert(len_in_bytes > 0 and len_in_bytes <= 64); // ell == 1
     std.debug.assert(dst.len > 0 and dst.len <= 255);
     const block_size = 128; // SHA-512 input block size (s_in_bytes)
-    const z_pad = [_]u8{0} ** block_size;
+    const z_pad = @as([block_size]u8, @splat(0));
     var l_i_b_str: [2]u8 = undefined;
     std.mem.writeInt(u16, &l_i_b_str, len_in_bytes, .big);
     const dst_len = [1]u8{@intCast(dst.len)};
@@ -352,7 +352,7 @@ fn DeriveBody(comptime mode: Mode) type {
                 // against zero with `std.crypto.timing_safe.eql` instead — an
                 // OR-accumulation with a single branch on the final verdict, not on
                 // any individual byte.
-                if (std.crypto.timing_safe.eql([Ns]u8, sk, [_]u8{0} ** Ns)) continue;
+                if (std.crypto.timing_safe.eql([Ns]u8, sk, @as([Ns]u8, @splat(0)))) continue;
                 // SECRET scalar: `ct25519.mulRistrettoBase`, not std's `mul` (see
                 // the Security notes). The `catch continue` this replaces was a
                 // second branch on `sk` on top of the RFC's own zero test.
@@ -602,7 +602,7 @@ fn unblind(blind_scalar: [Ns]u8, evaluated_element: Element) FinalizeError![Ne]u
     // Not `std.mem.allEqual`: it exits at the first non-zero byte of the
     // secret blind (ctgrind `voprf/client`, 2026-10-10). One verdict, taken
     // on a constant-time compare.
-    if (std.crypto.timing_safe.eql([Ns]u8, blind_scalar, [_]u8{0} ** Ns)) return error.InvalidBlind;
+    if (std.crypto.timing_safe.eql([Ns]u8, blind_scalar, @as([Ns]u8, @splat(0)))) return error.InvalidBlind;
     const inv = scalar.Scalar.fromBytes(blind_scalar).invert().toBytes();
     // `inv` is derived from the SECRET blind: constant-time multiply.
     return ct25519.mulRistretto(evaluated_element.p, inv).toBytes();
@@ -885,7 +885,7 @@ fn blindEvaluatePoprfBatchBody(
     const t = scalar.add(sk.*, m);
     // `t = skS + m` is secret: constant-time zero check, not the early-exit
     // `std.mem.allEqual` (ctgrind `voprf/server`, 2026-10-10).
-    if (std.crypto.timing_safe.eql([Ns]u8, t, [_]u8{0} ** Ns)) return error.InverseError;
+    if (std.crypto.timing_safe.eql([Ns]u8, t, @as([Ns]u8, @splat(0)))) return error.InverseError;
     const t_inv = scalar.Scalar.fromBytes(t).invert().toBytes();
     for (blinded, evaluated_out) |blinded_element, *out| {
         // `t_inv`/`t` are derived from the SECRET key: constant-time.
@@ -981,7 +981,7 @@ fn evaluatePoprfBody(sk: *const [Ns]u8, input: []const u8, info: []const u8, out
     const t = scalar.add(sk.*, m);
     // `t = skS + m` is secret: constant-time zero check, not the early-exit
     // `std.mem.allEqual` (ctgrind `voprf/server`, 2026-10-10).
-    if (std.crypto.timing_safe.eql([Ns]u8, t, [_]u8{0} ** Ns)) return error.InverseError;
+    if (std.crypto.timing_safe.eql([Ns]u8, t, @as([Ns]u8, @splat(0)))) return error.InverseError;
     const t_inv = scalar.Scalar.fromBytes(t).invert().toBytes();
     const evaluated = ct25519.mulRistretto(input_element.p, t_inv); // SECRET t_inv
     out.* = finalizeHash(input, info, evaluated.toBytes());
@@ -1016,9 +1016,9 @@ test "contextString has the exact RFC 9497 §3.1 shape" {
 
 test "Element.fromBytes rejects the identity element and junk" {
     // The ristretto255 identity encodes as 32 zero bytes.
-    try std.testing.expectError(error.InvalidElement, Element.fromBytes([_]u8{0} ** 32));
+    try std.testing.expectError(error.InvalidElement, Element.fromBytes(@as([32]u8, @splat(0))));
     // Non-canonical / invalid encoding.
-    try std.testing.expectError(error.InvalidElement, Element.fromBytes([_]u8{0xff} ** 32));
+    try std.testing.expectError(error.InvalidElement, Element.fromBytes(@as([32]u8, @splat(0xff))));
 }
 
 // ── constant-time regression: no API reports a secret scalar's value ─────
@@ -1037,9 +1037,9 @@ test "blind REPORTS NOTHING about a zero blind (constant-time, ct25519)" {
     // Old shape: `input_element.p.mul(blind_scalar) catch return
     // error.InvalidBlind` — an error whose presence is decided by the
     // client's SECRET blind. Now the product is simply the identity.
-    const zero_blind = [_]u8{0} ** Ns;
+    const zero_blind = @as([Ns]u8, @splat(0));
     const blinded = try shim.blind(.oprf, "ct regression", zero_blind);
-    try std.testing.expectEqualSlices(u8, &[_]u8{0} ** Ne, &blinded.toBytes());
+    try std.testing.expectEqualSlices(u8, &@as([Ne]u8, @splat(0)), &blinded.toBytes());
     // And the same input under std's own multiply really does error —
     // pinning that this is a behaviour change, not a tautology.
     const p = try hashToGroup(.oprf, "ct regression");
@@ -1052,9 +1052,9 @@ test "blindEvaluate REPORTS NOTHING about a degenerate skS (constant-time)" {
     // Old shape: `blinded_element.p.mul(sk) catch return
     // error.InvalidSecretKey`. `deriveKeyPair` guarantees skS != 0, so this
     // path was unreachable in the protocol and existed only to leak.
-    const blinded = try shim.blind(.oprf, "ct regression", shim.scalarFromWideBytes([_]u8{0x5a} ** 64));
-    const evaluated = shim.blindEvaluate([_]u8{0} ** Ns, blinded);
-    try std.testing.expectEqualSlices(u8, &[_]u8{0} ** Ne, &evaluated.toBytes());
+    const blinded = try shim.blind(.oprf, "ct regression", shim.scalarFromWideBytes(@as([64]u8, @splat(0x5a))));
+    const evaluated = shim.blindEvaluate(@as([Ns]u8, @splat(0)), blinded);
+    try std.testing.expectEqualSlices(u8, &@as([Ne]u8, @splat(0)), &evaluated.toBytes());
 }
 
 test "blind/blindEvaluate carry no error a caller could branch on a secret with" {
@@ -1069,8 +1069,8 @@ test "blind/blindEvaluate carry no error a caller could branch on a secret with"
 }
 
 test "deserializeScalar enforces canonicity" {
-    try std.testing.expectError(error.InvalidScalar, deserializeScalar([_]u8{0xff} ** 32));
-    _ = try deserializeScalar([_]u8{0} ** 32); // zero is canonical (validity is contextual)
+    try std.testing.expectError(error.InvalidScalar, deserializeScalar(@as([32]u8, @splat(0xff))));
+    _ = try deserializeScalar(@as([32]u8, @splat(0))); // zero is canonical (validity is contextual)
 }
 
 /// `s + L` as 32 little-endian bytes: the same scalar to the group, a
@@ -1082,9 +1082,9 @@ fn plusOrder(s: [Ns]u8) [Ns]u8 {
 }
 
 test "verifyProof refuses s + L (malleability) and a C/D length mismatch" {
-    const kp = try shim.deriveKeyPair(.voprf, [_]u8{0x2b} ** 32, "verifyProof refusals");
-    const blinded = try shim.blind(.voprf, "input", shim.scalarFromWideBytes([_]u8{0x22} ** 64));
-    const ev = try shim.blindEvaluateVerifiable(kp.sk, kp.pk, blinded, shim.scalarFromWideBytes([_]u8{0x33} ** 64));
+    const kp = try shim.deriveKeyPair(.voprf, @as([32]u8, @splat(0x2b)), "verifyProof refusals");
+    const blinded = try shim.blind(.voprf, "input", shim.scalarFromWideBytes(@as([64]u8, @splat(0x22))));
+    const ev = try shim.blindEvaluateVerifiable(kp.sk, kp.pk, blinded, shim.scalarFromWideBytes(@as([64]u8, @splat(0x33))));
     try verifyProof(.voprf, Element.generator, kp.pk, &.{blinded}, &.{ev.evaluated_element}, ev.proof);
 
     // `s + L` multiplies every point exactly as `s` does, so only the
@@ -1097,8 +1097,8 @@ test "verifyProof refuses s + L (malleability) and a C/D length mismatch" {
 }
 
 test "finalize refuses a non-canonical blind (blind + L)" {
-    const kp = try shim.deriveKeyPair(.oprf, [_]u8{0x7e} ** 32, "non-canonical blind");
-    const b = shim.scalarFromWideBytes([_]u8{0x11} ** 64);
+    const kp = try shim.deriveKeyPair(.oprf, @as([32]u8, @splat(0x7e)), "non-canonical blind");
+    const b = shim.scalarFromWideBytes(@as([64]u8, @splat(0x11)));
     const evaluated = shim.blindEvaluate(kp.sk, try shim.blind(.oprf, "input", b));
     _ = try shim.finalize("input", b, evaluated);
     try std.testing.expectError(error.InvalidBlind, shim.finalize("input", plusOrder(b), evaluated));
@@ -1107,7 +1107,7 @@ test "finalize refuses a non-canonical blind (blind + L)" {
 test "POPRF: skS == -m is InverseError, and pkS == -m*G is a refused tweaked key" {
     const info = "inverse";
     const sk = scalar.neg(poprfInfoScalar(info));
-    const b = shim.scalarFromWideBytes([_]u8{0x44} ** 64);
+    const b = shim.scalarFromWideBytes(@as([64]u8, @splat(0x44)));
     const blinded = try shim.blind(.poprf, "input", b);
     var out: [1]Element = undefined;
     try std.testing.expectError(error.InverseError, shim.blindEvaluatePoprfBatch(sk, &.{blinded}, info, &out, b));
@@ -1147,8 +1147,8 @@ const Fixtures = struct {
         self.g = Element.generator.toBytes();
         const two = Element{ .p = Element.generator.p.add(Element.generator.p) };
         self.g2 = two.toBytes();
-        const c = deserializeScalar([_]u8{2} ++ [_]u8{0} ** 31) catch unreachable;
-        const s = deserializeScalar([_]u8{3} ++ [_]u8{0} ** 31) catch unreachable;
+        const c = deserializeScalar([_]u8{2} ++ @as([31]u8, @splat(0))) catch unreachable;
+        const s = deserializeScalar([_]u8{3} ++ @as([31]u8, @splat(0))) catch unreachable;
         self.proof = (Proof{ .c = c, .s = s }).toBytes();
     }
 };

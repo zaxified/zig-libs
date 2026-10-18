@@ -271,8 +271,8 @@ test "Writer/Reader round-trip: le ints, compactSize, varBytes" {
 const varbytes_seeds = [_][]const u8{
     seedHex("00"), // the empty var_str: length 0, nothing follows
     seedHex("0568656c6c6f"), // "hello", the round-trip test's own var_str
-    seedHex("fc" ++ ("41" ** 252)), // 252 'A's: the widest 1-octet length
-    seedHex("fdfd00" ++ ("41" ** 253)), // 253 'A's: the narrowest legal 3-octet length
+    seedHex("fc" ++ (strRepeat("41", 252))), // 252 'A's: the widest 1-octet length
+    seedHex("fdfd00" ++ (strRepeat("41", 253))), // 253 'A's: the narrowest legal 3-octet length
     seedHex("fd0001"), // Truncated: claims 256 octets, none follow
     seedHex("fd0a00"), // NonMinimal: 10 does not need the 3-octet form
     seedHex("fe01000000"), // NonMinimal: 1 in the 5-octet form
@@ -344,4 +344,16 @@ test "corpus: every var_str seed reaches the reader, and the accepted count is p
     // Measured 2026-09-07: 0 of 12 non-empty and 0 accepted before the draw
     // was fixed, 12 of 12 and 4 after.
     try testing.expectEqual(@as(usize, 4), accepted);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

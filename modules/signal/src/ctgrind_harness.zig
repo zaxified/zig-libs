@@ -222,7 +222,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             const msg = "ctgrind-signal-harness-signed-prekey-public-placeholder";
             // PUBLIC-tolerant auxiliary randomness (SPEC.md's own claim).
             // Not tainted -- see the module doc comment.
-            const z: xeddsa.RandomData = [_]u8{0x5A} ** 64;
+            const z: xeddsa.RandomData = @as([64]u8, @splat(0x5A));
 
             const sig = shim.xeddsa.sign(priv, msg, z);
             // Propagation proof: std.debug.print is NOT constant-time.

@@ -29,7 +29,7 @@ const sample_apdu = [_]u8{ 0x61, 0x1a, 0x80, 0x01, 0x00 } ++ "trip-breaker-1" ++
 // comment on why a *shared* key makes IV/nonce uniqueness this module's
 // sharpest edge; HMAC needs no IV at all, which is why this example
 // sidesteps that edge rather than demonstrating it).
-const group_key = [_]u8{0x5a} ** 32;
+const group_key = @as([32]u8, @splat(0x5a));
 
 pub fn main() !void {
     var out: [256]u8 = undefined;

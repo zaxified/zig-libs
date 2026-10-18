@@ -158,7 +158,7 @@ test "zero-length and 255-length TLVs both walk safely" {
     var buf: [2 + 255 + 2]u8 = undefined;
     var b = Builder.init(&buf);
     try b.addTlv(0x08, &.{}); // padding, empty value
-    const big = [_]u8{0x5a} ** 255;
+    const big = @as([255]u8, @splat(0x5a));
     try b.addTlv(0x08, &big); // maximum-length value
     var it = TlvIterator.init(b.written());
     const t0 = (try it.next()).?;
@@ -218,7 +218,7 @@ test "builder rejects oversize value and buffer overflow" {
     try testing.expectError(error.BufferTooSmall, b.addTlv(0x02, &.{ 0xbb, 0xcc })); // needs 4, 1 left
     var big_buf: [512]u8 = undefined;
     var b2 = Builder.init(&big_buf);
-    const too_long = [_]u8{0} ** 256;
+    const too_long = @as([256]u8, @splat(0));
     try testing.expectError(error.ValueTooLong, b2.addTlv(0x01, &too_long));
 }
 

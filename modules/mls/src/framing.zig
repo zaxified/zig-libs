@@ -1186,8 +1186,8 @@ fn testGroupContext(allocator: std.mem.Allocator) ![]u8 {
         .cipher_suite = TestSuite.id,
         .group_id = "group",
         .epoch = 7,
-        .tree_hash = &[_]u8{0x11} ** 32,
-        .confirmed_transcript_hash = &[_]u8{0x22} ** 32,
+        .tree_hash = &@as([32]u8, @splat(0x11)),
+        .confirmed_transcript_hash = &@as([32]u8, @splat(0x22)),
     };
     return gc.encodeAlloc(allocator);
 }
@@ -1213,7 +1213,7 @@ test "Sender: every arm round-trips, and §6.1's GroupContext select is per send
 test "FramedContentAuthData: a Commit without a confirmation_tag cannot be encoded" {
     var buf: [128]u8 = undefined;
     var w = codec.Writer.init(&buf);
-    const auth: FramedContentAuthData = .{ .signature = &[_]u8{0xaa} ** 64 };
+    const auth: FramedContentAuthData = .{ .signature = &@as([64]u8, @splat(0xaa)) };
     try testing.expectError(error.MissingConfirmationTag, auth.encode(&w, .commit));
     // The same auth data is perfectly valid for a proposal.
     var w2 = codec.Writer.init(&buf);
@@ -1521,11 +1521,11 @@ test "MLSMessage: every §17.2 wire format decodes; an unregistered value is Mal
     try testing.expectError(error.Malformed, MLSMessage.decode(testing.allocator, &r2));
 
     // §17.2's Table 8 values.
-    try testing.expectEqual(@as(u16, 1), @intFromEnum(WireFormat.mls_public_message));
-    try testing.expectEqual(@as(u16, 2), @intFromEnum(WireFormat.mls_private_message));
-    try testing.expectEqual(@as(u16, 3), @intFromEnum(WireFormat.mls_welcome));
-    try testing.expectEqual(@as(u16, 4), @intFromEnum(WireFormat.mls_group_info));
-    try testing.expectEqual(@as(u16, 5), @intFromEnum(WireFormat.mls_key_package));
+    try testing.expectEqual(@as(u16, 1), @backingInt(WireFormat.mls_public_message));
+    try testing.expectEqual(@as(u16, 2), @backingInt(WireFormat.mls_private_message));
+    try testing.expectEqual(@as(u16, 3), @backingInt(WireFormat.mls_welcome));
+    try testing.expectEqual(@as(u16, 4), @backingInt(WireFormat.mls_group_info));
+    try testing.expectEqual(@as(u16, 5), @backingInt(WireFormat.mls_key_package));
 }
 
 // ── fuzz: the outermost untrusted-wire decoder never panics/OOB ───────────
@@ -1590,8 +1590,8 @@ const MessageCorpus = struct {
 
     fn build(self: *MessageCorpus) ![]const []const u8 {
         const leaf: tree.LeafNode = .{
-            .encryption_key = &[_]u8{0xa0} ** 32,
-            .signature_key = &[_]u8{0xa1} ** 32,
+            .encryption_key = &@as([32]u8, @splat(0xa0)),
+            .signature_key = &@as([32]u8, @splat(0xa1)),
             .credential = .{ .basic = "fuzz-signer" },
             .capabilities = .{
                 .versions = &.{1},
@@ -1603,7 +1603,7 @@ const MessageCorpus = struct {
             .leaf_node_source = .key_package,
             .lifetime = .{ .not_before = 0, .not_after = 1 },
             .extensions = &.{},
-            .signature = &[_]u8{0xa2} ** 64,
+            .signature = &@as([64]u8, @splat(0xa2)),
         };
         const msgs = [5]MLSMessage{
             .{
@@ -1617,39 +1617,39 @@ const MessageCorpus = struct {
                         .sender = .{ .external = 3 },
                         .body = .{ .application = "hello" },
                     },
-                    .auth = .{ .signature = &[_]u8{0xDD} ** 64 },
+                    .auth = .{ .signature = &@as([64]u8, @splat(0xDD)) },
                 },
             },
             .{ .private_message = .{
                 .group_id = "fuzz-group",
                 .epoch = 7,
                 .content_type = .proposal,
-                .encrypted_sender_data = &[_]u8{0x11} ** 8,
-                .ciphertext = &[_]u8{0x22} ** 32,
+                .encrypted_sender_data = &@as([8]u8, @splat(0x11)),
+                .ciphertext = &@as([32]u8, @splat(0x22)),
             } },
             .{ .key_package = .{
-                .cipher_suite = @enumFromInt(1),
-                .init_key = &[_]u8{0xb0} ** 32,
+                .cipher_suite = @fromBackingInt(@intCast(1)),
+                .init_key = &@as([32]u8, @splat(0xb0)),
                 .leaf_node = leaf,
-                .signature = &[_]u8{0xb1} ** 64,
+                .signature = &@as([64]u8, @splat(0xb1)),
             } },
             .{ .welcome = .{
-                .cipher_suite = @enumFromInt(1),
+                .cipher_suite = @fromBackingInt(@intCast(1)),
                 .secrets = &.{},
-                .encrypted_group_info = &[_]u8{0xEE} ** 48,
+                .encrypted_group_info = &@as([48]u8, @splat(0xEE)),
             } },
             .{ .group_info = .{
                 .group_context = .{
                     .version = .mls10,
-                    .cipher_suite = @enumFromInt(1),
+                    .cipher_suite = @fromBackingInt(@intCast(1)),
                     .group_id = "fuzz-group",
                     .epoch = 7,
-                    .tree_hash = &[_]u8{0xAA} ** 32,
-                    .confirmed_transcript_hash = &[_]u8{0xBB} ** 32,
+                    .tree_hash = &@as([32]u8, @splat(0xAA)),
+                    .confirmed_transcript_hash = &@as([32]u8, @splat(0xBB)),
                 },
-                .confirmation_tag = &[_]u8{0xCC} ** 32,
+                .confirmation_tag = &@as([32]u8, @splat(0xCC)),
                 .signer = 0,
-                .signature = &[_]u8{0xDD} ** 64,
+                .signature = &@as([64]u8, @splat(0xDD)),
             } },
         };
         var public_len: usize = 0;
@@ -1705,7 +1705,7 @@ fn fuzzMessageInput(smith: *std.testing.Smith, buf: *[2048]u8) struct { input: [
     if (len >= 4) {
         const knob = smith.value(u8);
         if (knob & 3 != 0) {
-            std.mem.writeInt(u16, buf[0..2], @intFromEnum(keyschedule.ProtocolVersion.mls10), .big);
+            std.mem.writeInt(u16, buf[0..2], @backingInt(keyschedule.ProtocolVersion.mls10), .big);
             std.mem.writeInt(u16, buf[2..4], 1 + @as(u16, knob >> 5) % 5, .big);
             stamped = true;
         }
@@ -1793,8 +1793,8 @@ test "the MLSMessage fuzz harness reaches all five sub-decoders (reachability)" 
     }) |wf| {
         errdefer std.debug.print("wire format {t}\n", .{wf});
         var header: [4]u8 = undefined;
-        std.mem.writeInt(u16, header[0..2], @intFromEnum(keyschedule.ProtocolVersion.mls10), .big);
-        std.mem.writeInt(u16, header[2..4], @intFromEnum(wf), .big);
+        std.mem.writeInt(u16, header[0..2], @backingInt(keyschedule.ProtocolVersion.mls10), .big);
+        std.mem.writeInt(u16, header[2..4], @backingInt(wf), .big);
         try testing.expectError(error.BufferTooShort, fuzzDecodeOnce(a, &header));
     }
 
@@ -1804,15 +1804,15 @@ test "the MLSMessage fuzz harness reaches all five sub-decoders (reachability)" 
     const gi: welcome_mod.GroupInfo = .{
         .group_context = .{
             .version = .mls10,
-            .cipher_suite = @enumFromInt(1),
+            .cipher_suite = @fromBackingInt(@intCast(1)),
             .group_id = "reach",
             .epoch = 7,
-            .tree_hash = &[_]u8{0xAA} ** 32,
-            .confirmed_transcript_hash = &[_]u8{0xBB} ** 32,
+            .tree_hash = &@as([32]u8, @splat(0xAA)),
+            .confirmed_transcript_hash = &@as([32]u8, @splat(0xBB)),
         },
-        .confirmation_tag = &[_]u8{0xCC} ** 32,
+        .confirmation_tag = &@as([32]u8, @splat(0xCC)),
         .signer = 0,
-        .signature = &[_]u8{0xDD} ** 64,
+        .signature = &@as([64]u8, @splat(0xDD)),
     };
     const msg: MLSMessage = .{ .group_info = gi };
     const bytes = try msg.encodeAlloc(a);

@@ -1066,7 +1066,7 @@ test "verify: tampered body / wrong secret / malformed all rejected (constant-ti
     try testing.expect(!verify(secret, "payload-byteS", value)); // one body byte flipped
     try testing.expect(!verify("wrongsecret", body, value)); // wrong secret
     try testing.expect(!verify(secret, body, "sha256=deadbeef")); // wrong length
-    try testing.expect(!verify(secret, body, "sha1=" ++ ("0" ** 64))); // wrong prefix
+    try testing.expect(!verify(secret, body, "sha1=" ++ (strRepeat("0", 64)))); // wrong prefix
     try testing.expect(!verify(secret, body, value[7..])); // prefix stripped by caller
     try testing.expect(!verify(secret, body, "")); // empty
     // Same-length, single hex nibble flipped → must still be denied (proves
@@ -1115,7 +1115,7 @@ const presented_seeds = [_][]const u8{
     seed(anchor_hex), // no prefix: wrong length for `verify`, RIGHT length for the empty-prefix call
     seed("sha256="), // prefix only: the length gate
     seed("sha256=" ++ anchor_hex ++ "0"), // one octet too long
-    seed("a" ** 128), // the full harness buffer
+    seed(strRepeat("a", 128)), // the full harness buffer
     seed(""), // the ONE input the collapsed harness ever ran
 };
 
@@ -1186,8 +1186,8 @@ fn fuzzVerify(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     const prefixes = [_][]const u8{ "sha256=", "", "v1,", "sha1=", "sha512=" };
     const f: Format = .{
         .prefix = prefixes[knobs.ranged(0, prefixes.len - 1)],
-        .digest = @enumFromInt(knobs.ranged(0, 2)),
-        .encoding = @enumFromInt(knobs.ranged(0, 1)),
+        .digest = @fromBackingInt(@intCast(knobs.ranged(0, 2))),
+        .encoding = @fromBackingInt(@intCast(knobs.ranged(0, 1))),
     };
     var sig_buf: [160]u8 = undefined;
     const sig = signFormat(f, secret, body, &sig_buf) catch return error.SignFailed;
@@ -1281,9 +1281,9 @@ test "corpus: every presented value reaches presentedMac, and the counts are pin
 test "decodeMac: a padded-length base64 value with no `=` is refused, not decoded past the MAC" {
     // Regression 2026-10-09: 44 base64 characters decode to 33 octets, one more
     // than SHA-256's 32; only the length was checked before the decode.
-    try testing.expect(decodeMac(.sha256, .base64, "A" ** 44) == null);
-    try testing.expect(decodeMac(.sha512, .base64, "A" ** 88) == null);
-    try testing.expect(decodeMac(.sha256, .base64, "A" ** 43 ++ "=") != null);
+    try testing.expect(decodeMac(.sha256, .base64, strRepeat("A", 44)) == null);
+    try testing.expect(decodeMac(.sha512, .base64, strRepeat("A", 88)) == null);
+    try testing.expect(decodeMac(.sha256, .base64, strRepeat("A", 43) ++ "=") != null);
 }
 
 test "computeHex is lowercase hex and matches a well-known HMAC-SHA256 demo vector" {
@@ -1592,10 +1592,10 @@ test "Standard Webhooks: verify, multi-signature list, and the tolerance boundar
 test "Standard Webhooks: more than max_signatures entries is refused" {
     var kb: [standard.max_secret_len]u8 = undefined;
     const key = try standard.decodeSecret(&kb, sw_secret);
-    const junk = "v9,x " ** max_signatures;
+    const junk = strRepeat("v9,x ", max_signatures);
     try testing.expectError(error.InvalidHeader, standard.verify(.{ .secrets = &.{key} }, sw_id, "1614265330", junk ++ sw_v1, sw_payload, @intCast(sw_ts), 300));
     // Exactly max_signatures entries, the good one last, is fine.
-    const ok_list = "v9,x " ** (max_signatures - 1);
+    const ok_list = strRepeat("v9,x ", max_signatures - 1);
     try standard.verify(.{ .secrets = &.{key} }, sw_id, "1614265330", ok_list ++ sw_v1, sw_payload, @intCast(sw_ts), 300);
 }
 
@@ -1623,13 +1623,13 @@ test "Standard Webhooks v1a: Ed25519 against openssl, both whsk_ layouts" {
     try testing.expectError(error.InvalidKey, standard.decodePublicKey("whpk_AAAA"));
     // The v1a cap: max_ed25519_signatures junk entries before the good one
     // are one too many.
-    const junk = "v1a,x " ** max_ed25519_signatures;
+    const junk = strRepeat("v1a,x ", max_ed25519_signatures);
     try testing.expectError(error.InvalidHeader, standard.verify(keys, sw_id, "1614265330", junk ++ sw_v1a, sw_payload, @intCast(sw_ts), 300));
     // An 88-character v1a value WITHOUT `==` padding decodes to 66 octets: it
     // must be skipped, not decoded into the 64-octet signature buffer (same
     // shape as the websocket key defect of 2026-10-09).
-    try standard.verify(keys, sw_id, "1614265330", "v1a," ++ "A" ** 88 ++ " " ++ sw_v1a, sw_payload, @intCast(sw_ts), 300);
-    const fits = "v1a,x " ** (max_ed25519_signatures - 1);
+    try standard.verify(keys, sw_id, "1614265330", "v1a," ++ strRepeat("A", 88) ++ " " ++ sw_v1a, sw_payload, @intCast(sw_ts), 300);
+    const fits = strRepeat("v1a,x ", max_ed25519_signatures - 1);
     try standard.verify(keys, sw_id, "1614265330", fits ++ sw_v1a, sw_payload, @intCast(sw_ts), 300);
 }
 
@@ -1640,11 +1640,11 @@ test "Standard Webhooks: secret decoding refusals" {
     try testing.expectError(error.InvalidKey, standard.decodeSecret(&kb, "whsec_"));
     try testing.expectError(error.InvalidKey, standard.decodeSecret(&kb, "whsec_not*base64!"));
     // 65 bytes: one past the 64-byte maximum.
-    try testing.expectError(error.InvalidKey, standard.decodeSecret(&kb, "whsec_" ++ "A" ** 88));
+    try testing.expectError(error.InvalidKey, standard.decodeSecret(&kb, "whsec_" ++ strRepeat("A", 88)));
     var eb: [128]u8 = undefined;
     try testing.expectError(error.InvalidKey, standard.encodeSecret(&eb, "short"));
     var tiny: [8]u8 = undefined;
-    try testing.expectError(error.OutputTooSmall, standard.encodeSecret(&tiny, "x" ** 24));
+    try testing.expectError(error.OutputTooSmall, standard.encodeSecret(&tiny, strRepeat("x", 24)));
 }
 
 // Slack's documented example, transcribed from docs.slack.dev and
@@ -1673,7 +1673,7 @@ test "Stripe: sign and verify (Python hmac as the oracle)" {
     try testing.expectEqualStrings(want, try stripe.sign(&out, secret, 1492774577, payload));
     try stripe.verify(&.{secret}, want, payload, 1492774577, 300);
     // Stripe sends extra schemes and several v1 values; spaces tolerated.
-    try stripe.verify(&.{secret}, "t=1492774577, v1=" ++ "00" ** 32 ++ ", v1=" ++ want[16..] ++ ",v0=abc", payload, 1492774577, 300);
+    try stripe.verify(&.{secret}, "t=1492774577, v1=" ++ strRepeat("00", 32) ++ ", v1=" ++ want[16..] ++ ",v0=abc", payload, 1492774577, 300);
     try stripe.verify(&.{ "whsec_old", secret }, want, payload, 1492774577, 300);
     try stripe.verify(&.{ secret, "whsec_old" }, want, payload, 1492774577, 300);
     try testing.expectError(error.InvalidHeader, stripe.verify(&.{secret}, want[13..], payload, 1492774577, 300)); // no t=
@@ -1984,13 +1984,13 @@ test "a signature one byte short is refused even when the missing byte is zero" 
 test "Standard Webhooks key encodings: sizes outside the spec are refused" {
     var eb: [256]u8 = undefined;
     // 64 bytes is the spec's maximum and encodes; 65 does not.
-    _ = try standard.encodeSecret(&eb, "k" ** 64);
-    try testing.expectError(error.InvalidKey, standard.encodeSecret(&eb, "k" ** 65));
+    _ = try standard.encodeSecret(&eb, strRepeat("k", 64));
+    try testing.expectError(error.InvalidKey, standard.encodeSecret(&eb, strRepeat("k", 65)));
     // Unpadded base64 is accepted (the reference libraries append "==" before
     // decoding): 25 bytes of 'x', padded and unpadded (Python's base64).
     var kb: [standard.max_secret_len]u8 = undefined;
-    try testing.expectEqualStrings("x" ** 25, try standard.decodeSecret(&kb, "whsec_eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eA=="));
-    try testing.expectEqualStrings("x" ** 25, try standard.decodeSecret(&kb, "whsec_eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eA"));
+    try testing.expectEqualStrings(strRepeat("x", 25), try standard.decodeSecret(&kb, "whsec_eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eA=="));
+    try testing.expectEqualStrings(strRepeat("x", 25), try standard.decodeSecret(&kb, "whsec_eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eA"));
     // A public key is exactly 32 bytes: the 64-byte signing-key value is not one.
     try testing.expectError(error.InvalidKey, standard.decodePublicKey("whpk_nWGxne/9WmC6hEr0kuwsxERJxWl7MmkZcDusAxyuf2DXWpgBgrEKt9VL/tPJZAc6DuFy89qmIyWvAhpo9wdRGg=="));
 }
@@ -1999,4 +1999,16 @@ test {
     _ = @import("fuzz_test.zig");
     _ = @import("stackprobe_test.zig");
     _ = @import("stackprobe2_test.zig");
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

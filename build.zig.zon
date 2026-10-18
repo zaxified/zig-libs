@@ -1,7 +1,7 @@
 .{
     .name = .zig_libs,
     .version = "0.0.0",
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .fingerprint = 0x411fad481a34245a,
     // What a consumer actually receives. A file not listed here is NOT part of
     // the package, however visible it is on GitHub -- which is how `LICENSE`

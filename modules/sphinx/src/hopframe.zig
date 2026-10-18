@@ -165,8 +165,8 @@ test "shiftSize: 3-byte bigsize (l >= 253) is 3 + l + 32" {
 
 test "writeHopFrame/readHopFrame round-trip" {
     var dest: [512]u8 = undefined;
-    const payload = [_]u8{0xaa} ** 40;
-    const hmac = [_]u8{0xbb} ** hmac_len;
+    const payload = @as([40]u8, @splat(0xaa));
+    const hmac = @as([hmac_len]u8, @splat(0xbb));
     const written = try writeHopFrame(&dest, &payload, hmac);
     try testing.expectEqual(shiftSize(40), written.len);
 
@@ -180,7 +180,7 @@ test "writeHopFrame/readHopFrame: 272-byte payload forces the 3-byte bigsize for
     var dest: [400]u8 = undefined;
     var payload: [272]u8 = undefined;
     for (&payload, 0..) |*b, i| b.* = @truncate(i);
-    const hmac = [_]u8{0xcc} ** hmac_len;
+    const hmac = @as([hmac_len]u8, @splat(0xcc));
     const written = try writeHopFrame(&dest, &payload, hmac);
     try testing.expectEqualSlices(u8, &.{ 0xfd, 0x01, 0x10 }, written[0..3]);
 
@@ -190,28 +190,28 @@ test "writeHopFrame/readHopFrame: 272-byte payload forces the 3-byte bigsize for
 
 test "writeHopFrame rejects reserved payload lengths (0, 1)" {
     var dest: [64]u8 = undefined;
-    try testing.expectError(error.ReservedPayloadLength, writeHopFrame(&dest, &.{}, [_]u8{0} ** hmac_len));
-    try testing.expectError(error.ReservedPayloadLength, writeHopFrame(&dest, &.{0x01}, [_]u8{0} ** hmac_len));
+    try testing.expectError(error.ReservedPayloadLength, writeHopFrame(&dest, &.{}, @as([hmac_len]u8, @splat(0))));
+    try testing.expectError(error.ReservedPayloadLength, writeHopFrame(&dest, &.{0x01}, @as([hmac_len]u8, @splat(0))));
 }
 
 test "readHopFrame rejects a truncated buffer" {
     // bigsize says 40 bytes of payload + 32-byte hmac follow, but only 10
     // bytes actually remain.
-    var buf = [_]u8{0} ** 11;
+    var buf = @as([11]u8, @splat(0));
     buf[0] = 40;
     try testing.expectError(error.BufferTooSmall, readHopFrame(&buf));
 }
 
 test "hop frame edges: one-short dest, length 1 reserved, exact-fit buffer" {
     // Mutation run 2026-10-05: none of these three edges had a test.
-    const payload = [_]u8{0xaa} ** 2;
-    const hmac = [_]u8{0xbb} ** hmac_len;
+    const payload = @as([2]u8, @splat(0xaa));
+    const hmac = @as([hmac_len]u8, @splat(0xbb));
     var dest: [1 + 2 + hmac_len]u8 = undefined;
     try testing.expectError(error.BufferTooSmall, writeHopFrame(dest[0 .. dest.len - 1], &payload, hmac));
     const written = try writeHopFrame(&dest, &payload, hmac); // exactly fits
     const parsed = try readHopFrame(written); // and reads back from exactly that many octets
     try testing.expectEqual(dest.len, parsed.consumed);
-    var one = [_]u8{0} ** 40;
+    var one = @as([40]u8, @splat(0));
     one[0] = 1;
     try testing.expectError(error.ReservedPayloadLength, readHopFrame(&one));
 }

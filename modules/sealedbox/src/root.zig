@@ -663,7 +663,7 @@ test "round-trip: buffer API, various sizes including empty" {
     const io = std.testing.io;
     const kp = KeyPair.generate(io);
 
-    const msgs = [_][]const u8{ "", "x", "hello sealed box", "a" ** 100 };
+    const msgs = [_][]const u8{ "", "x", "hello sealed box", strRepeat("a", 100) };
     inline for (msgs) |msg| {
         var boxed: [msg.len + overhead]u8 = undefined;
         try seal(io, &boxed, msg, kp.public_key);
@@ -733,7 +733,7 @@ test "too-short/garbage ciphertext: clean error, no panic" {
     var opened: [4]u8 = undefined;
 
     // shorter than the overhead
-    const short = [_]u8{0xaa} ** (overhead - 1);
+    const short = @as([overhead - 1]u8, @splat(0xaa));
     try std.testing.expectError(error.InvalidCiphertext, open(&opened, &short, &kp));
     try std.testing.expectError(error.InvalidCiphertext, openAlloc(gpa, &short, &kp));
 
@@ -742,7 +742,7 @@ test "too-short/garbage ciphertext: clean error, no panic" {
     try std.testing.expectError(error.InvalidCiphertext, openAlloc(gpa, "", &kp));
 
     // long enough but out-length mismatch
-    const mismatched = [_]u8{0xbb} ** (overhead + 10);
+    const mismatched = @as([overhead + 10]u8, @splat(0xbb));
     try std.testing.expectError(error.InvalidCiphertext, open(&opened, &mismatched, &kp));
 
     // well-sized garbage: must fail authentication, never panic
@@ -1062,7 +1062,7 @@ test "constant-time parsers reject exactly what the std-backed ones reject" {
 test "wipe: the encoded secret really is gone from the buffer" {
     // Round-trips first, so the test cannot pass by wiping something that was
     // never a secret in the first place.
-    const sk = [_]u8{0xA5} ** secret_length;
+    const sk = @as([secret_length]u8, @splat(0xA5));
     var text = testEncodeSecretKeyBase64(sk);
     try std.testing.expectEqual(sk, try testParseSecretKeyBase64(&text));
 
@@ -1079,5 +1079,17 @@ test "wipe: the encoded secret really is gone from the buffer" {
     // And the raw scalar itself.
     var raw = sk;
     wipe(&raw);
-    try std.testing.expectEqual([_]u8{0} ** secret_length, raw);
+    try std.testing.expectEqual(@as([secret_length]u8, @splat(0)), raw);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

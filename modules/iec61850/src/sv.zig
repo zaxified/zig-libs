@@ -132,7 +132,7 @@ pub const Asdu = struct {
                 4 => a.refr_tm = try mmsdata.UtcTime.parse(f.content),
                 5 => {
                     if (f.content.len != 1) return error.LengthMismatch;
-                    a.smp_synch = @enumFromInt(f.content[0]);
+                    a.smp_synch = @fromBackingInt(@intCast(f.content[0]));
                 },
                 6 => {
                     if (f.content.len != 2) return error.LengthMismatch;
@@ -164,7 +164,7 @@ pub const Asdu = struct {
         if (self.smp_mod) |v| try emitU16(w, tag_smp_mod, v);
         try w.primitive(tag_seq_data, self.seq_data);
         if (self.smp_rate) |v| try emitU16(w, tag_smp_rate, v);
-        try w.primitive(tag_smp_synch, &[_]u8{@intFromEnum(self.smp_synch)});
+        try w.primitive(tag_smp_synch, &[_]u8{@backingInt(self.smp_synch)});
         if (self.refr_tm) |t| {
             var tmp: [8]u8 = undefined;
             t.encode(&tmp);
@@ -441,7 +441,7 @@ test "an SV frame with a GOOSE EtherType is refused" {
     const bytes = unhex(captured_frame_hex, &buf);
     bytes[13] = 0xB8;
     try testing.expectError(error.NotGoose, decodeFrame(bytes));
-    try testing.expectError(error.ShortFrame, decodeFrame(&[_]u8{0} ** 10));
+    try testing.expectError(error.ShortFrame, decodeFrame(&@as([10]u8, @splat(0))));
 }
 
 test "an SV frame carries a VLAN tag the same way GOOSE does" {

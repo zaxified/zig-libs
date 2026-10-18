@@ -101,9 +101,9 @@ pub const Backend = enum {
 pub fn backend() Backend {
     if (comptime staticBackend()) |b| return b;
     const cached = detected.load(.monotonic);
-    if (cached != 0) return @enumFromInt(cached - 1);
+    if (cached != 0) return @fromBackingInt(@intCast(cached - 1));
     const b = detect();
-    detected.store(@intFromEnum(b) + 1, .monotonic);
+    detected.store(@backingInt(b) + 1, .monotonic);
     return b;
 }
 
@@ -754,10 +754,10 @@ var fuzz_buf: [6 * long_block + 3 * short_block + 64]u8 = undefined;
 /// Reach counters for the in-suite test (the driver's own `hit` is process-wide
 /// and printed only by `fuzz_driver.run`).
 const Reach = enum { empty, short, split_short, split_long, cut_inside, hw_backend };
-var reach: [@typeInfo(Reach).@"enum".fields.len]usize = @splat(0);
+var reach: [@typeInfo(Reach).@"enum".field_names.len]usize = @splat(0);
 
 fn mark(comptime l: Reach) void {
-    reach[@intFromEnum(l)] += 1;
+    reach[@backingInt(l)] += 1;
     fuzz_driver.hit(@tagName(l));
 }
 
@@ -819,14 +819,14 @@ test "fuzz harness: 500 seeds in every test run, and it gets everywhere" {
         };
     }
     // hw_backend depends on the CPU the suite runs on; the rest must be reached.
-    for (reach, 0..) |n, i| if (n == 0 and i != @intFromEnum(Reach.hw_backend)) {
-        std.debug.print("reach: label {t} never hit in 500 seeds\n", .{@as(Reach, @enumFromInt(i))});
+    for (reach, 0..) |n, i| if (n == 0 and i != @backingInt(Reach.hw_backend)) {
+        std.debug.print("reach: label {t} never hit in 500 seeds\n", .{@as(Reach, @fromBackingInt(@intCast(i)))});
         return error.HarnessDoesNotReach;
     };
 }
 
 test "the shift tables are the zero-byte operator they claim to be" {
-    const zeros = [_]u8{0} ** long_block;
+    const zeros = @as([long_block]u8, @splat(0));
     var prng = std.Random.DefaultPrng.init(3);
     for (0..40) |i| {
         const r: u32 = if (i < 32) @as(u32, 1) << @intCast(i) else prng.random().int(u32);

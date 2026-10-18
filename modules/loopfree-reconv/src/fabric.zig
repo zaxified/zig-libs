@@ -129,18 +129,18 @@ pub const Fabric = struct {
     /// `edges`). `spf.Graph` is undirected-only, so a `link_down`/`link_up`
     /// fault on EITHER direction of a ring edge takes the whole edge down/up
     /// in this model — see the module doc.
-    up: [EDGE_COUNT]bool = [_]bool{true} ** EDGE_COUNT,
+    up: [EDGE_COUNT]bool = @as([EDGE_COUNT]bool, @splat(true)),
     /// Currently-APPLIED next-hop per node toward `dest` (`null` = no route,
     /// drop). This is the live FIB the data plane forwards against.
-    next_hop: [NODE_COUNT]?NodeId = [_]?NodeId{null} ** NODE_COUNT,
+    next_hop: [NODE_COUNT]?NodeId = @as([NODE_COUNT]?NodeId, @splat(null)),
 
     /// Per-frame-slot bookkeeping (`frame_id % MAX_FRAMES`, reclaimed by a
     /// fresh `frame_id` claiming the slot). `slot_visited` is a per-node
     /// bitmask (NODE_COUNT <= 8, fits `u8`); `slot_last` is the most
     /// recently visited node, encoded `node + 1` (0 = none).
-    slot_owner: [MAX_FRAMES]u32 = [_]u32{std.math.maxInt(u32)} ** MAX_FRAMES,
-    slot_visited: [MAX_FRAMES]u8 = [_]u8{0} ** MAX_FRAMES,
-    slot_last: [MAX_FRAMES]u8 = [_]u8{0} ** MAX_FRAMES,
+    slot_owner: [MAX_FRAMES]u32 = @as([MAX_FRAMES]u32, @splat(std.math.maxInt(u32))),
+    slot_visited: [MAX_FRAMES]u8 = @as([MAX_FRAMES]u8, @splat(0)),
+    slot_last: [MAX_FRAMES]u8 = @as([MAX_FRAMES]u8, @splat(0)),
     next_frame_id: u32 = 0,
     /// Count of frame ids that have terminated (delivered, dropped, or
     /// loop-violated — see `deliverAt`'s three terminal branches), i.e. can

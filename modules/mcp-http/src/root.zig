@@ -161,7 +161,7 @@ fn fillRandom(buf: []u8) void {
         const rc = std.os.linux.getrandom(buf.ptr + off, buf.len - off, 0);
         const signed: isize = @bitCast(rc);
         if (signed < 0) {
-            if (signed == -@as(isize, @intFromEnum(std.os.linux.E.INTR))) continue;
+            if (signed == -@as(isize, @backingInt(std.os.linux.E.INTR))) continue;
             @panic("getrandom failed");
         }
         off += @intCast(signed);
@@ -1295,7 +1295,7 @@ test "isInitialize: single-pass scan matches the old full-tree-parse semantics (
     try testing.expect(!isInitialize(gpa, "{}"));
     // A "method" value long enough to require allocation past a short cap
     // is still read correctly (regression guard on `max_field_len`).
-    try testing.expect(!isInitialize(gpa, "{\"method\":\"" ++ "x" ** 100 ++ "\"}"));
+    try testing.expect(!isInitialize(gpa, "{\"method\":\"" ++ strRepeat("x", 100) ++ "\"}"));
 }
 
 test "POST initialize → 200 application/json with a result" {
@@ -2399,7 +2399,7 @@ const jsonrpc_corpus = [_][]const u8{
     fuzzseed.seed("\x00" ++ "{\"jsonrpc\":\"2.0\",\"id\":5,\"result\":{}}"), // ⭐ a correlatable response
     fuzzseed.seed("\x00" ++ "{\"jsonrpc\":\"2.0\",\"id\":5,\"error\":{\"code\":-1,\"message\":\"x\"}}"), // the error form of one
     fuzzseed.seed("\x00" ++ "{\"jsonrpc\":\"2.0\",\"id\":\"abc\",\"result\":null}"), // a string id
-    fuzzseed.seed("\x00" ++ "{\"method\":\"" ++ "x" ** 100 ++ "\"}"), // a method name past `max_field_len`
+    fuzzseed.seed("\x00" ++ "{\"method\":\"" ++ strRepeat("x", 100) ++ "\"}"), // a method name past `max_field_len`
     fuzzseed.seed("\x00" ++ "{\"method\":\"initialize\",\"method\":\"tools/list\"}"), // ⭐ the key twice: which one wins is a real decision
     fuzzseed.seed("\x00"), // the empty body
     fuzzseed.seed("\x01" ++ "\x03\x00\x00\x01\x01\x02\x02"), // script: an object of three fields
@@ -2962,7 +2962,7 @@ pub fn fuzzWire(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void
     const Kind = enum { list, call, note, get, delete, origin, forged, damaged, garbage };
     var kind: Kind = .garbage;
     if (S == fz.fuzz_driver.Rng) {
-        kind = @enumFromInt(src.index(9));
+        kind = @fromBackingInt(@intCast(src.index(9)));
     }
     var req_buf: [2048]u8 = undefined;
     const sid_a: []const u8 = &sids[0];
@@ -3075,4 +3075,16 @@ test "fuzz driver: MCP_HTTP_FUZZ (wire)" {
 
 test "fuzz harness: wire, 400 seeds, reaches every outcome" {
     try WireMark.reach(fuzzWire, "mcp-http-wire", 400);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

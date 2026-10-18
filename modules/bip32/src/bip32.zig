@@ -648,7 +648,7 @@ var scratch_key: ExtendedPrivKey = undefined;
 var scratch_parsed: ParsedKey = undefined;
 
 test "masterFromSeed + serializePriv/serializePub round-trip via parseExtended" {
-    const seed = [_]u8{0x01} ** 32;
+    const seed = @as([32]u8, @splat(0x01));
     var master: ExtendedPrivKey = undefined;
     try masterFromSeed(&seed, &master);
     defer master.deinit();
@@ -673,7 +673,7 @@ test "masterFromSeed + serializePriv/serializePub round-trip via parseExtended" 
 }
 
 test "ckdPriv hardened vs normal both derive, and neuter(ckdPriv) == ckdPub(neuter) for normal" {
-    const seed = [_]u8{0xab} ** 32;
+    const seed = @as([32]u8, @splat(0xab));
     var master: ExtendedPrivKey = undefined;
     try masterFromSeed(&seed, &master);
     defer master.deinit();
@@ -704,7 +704,7 @@ test "ckdPrivWithParentPub matches ckdPriv exactly, for both hardened and normal
     // compute the parent's pubkey ONCE and skip ckdPriv's internal
     // recompute; it must be bit-for-bit interchangeable with ckdPriv when
     // given the correct parent pubkey, for both derivation kinds.
-    const seed = [_]u8{0x5e} ** 32;
+    const seed = @as([32]u8, @splat(0x5e));
     var master: ExtendedPrivKey = undefined;
     try masterFromSeed(&seed, &master);
     defer master.deinit();
@@ -737,14 +737,14 @@ test "ckdPub rejects a non-canonical IL (IL >= n, BIP-32 CKDpub step 3)" {
     // with a synthetic IL of all-0xFF bytes, which as a big-endian 256-bit
     // integer is far above the secp256k1 order n
     // (0xFFFF...FFFE BAAEDCE6 AF48A03B BFD25E8C D0364141).
-    const seed = [_]u8{0xcd} ** 32;
+    const seed = @as([32]u8, @splat(0xcd));
     var master: ExtendedPrivKey = undefined;
     try masterFromSeed(&seed, &master);
     defer master.deinit();
     const master_pub = try neuter(&master);
 
-    const non_canonical_il = [_]u8{0xff} ** 32;
-    const ir = [_]u8{0x11} ** 32;
+    const non_canonical_il = @as([32]u8, @splat(0xff));
+    const ir = @as([32]u8, @splat(0x11));
     try testing.expectError(error.InvalidChildKey, ckdPubFromIL(master_pub, 0, non_canonical_il, ir));
 }
 
@@ -760,18 +760,18 @@ test "masterFromSeed rejects seeds outside BIP-32's 128-512-bit range (H3)" {
     // BIP-32 "Master key generation": seed length must be 128-512 bits.
     // Before this guard `masterFromSeed` took any length, including 0.
     try testing.expectError(error.InvalidSeedLength, masterFromSeed(&[_]u8{}, &scratch_key));
-    try testing.expectError(error.InvalidSeedLength, masterFromSeed(&[_]u8{0x01} ** 1, &scratch_key));
-    try testing.expectError(error.InvalidSeedLength, masterFromSeed(&[_]u8{0x01} ** (min_seed_bytes - 1), &scratch_key));
-    try testing.expectError(error.InvalidSeedLength, masterFromSeed(&[_]u8{0x01} ** (max_seed_bytes + 1), &scratch_key));
-    try testing.expectError(error.InvalidSeedLength, masterFromSeed(&[_]u8{0x01} ** 256, &scratch_key));
+    try testing.expectError(error.InvalidSeedLength, masterFromSeed(&@as([1]u8, @splat(0x01)), &scratch_key));
+    try testing.expectError(error.InvalidSeedLength, masterFromSeed(&@as([min_seed_bytes - 1]u8, @splat(0x01)), &scratch_key));
+    try testing.expectError(error.InvalidSeedLength, masterFromSeed(&@as([max_seed_bytes + 1]u8, @splat(0x01)), &scratch_key));
+    try testing.expectError(error.InvalidSeedLength, masterFromSeed(&@as([256]u8, @splat(0x01)), &scratch_key));
 
     // Positive control: the boundary lengths BIP-32 allows must still work —
     // both are real BIP-32 test vector lengths (vector 1 = 16B, vector 3/2 = 64B).
     var min_ok: ExtendedPrivKey = undefined;
-    try masterFromSeed(&[_]u8{0x01} ** min_seed_bytes, &min_ok);
+    try masterFromSeed(&@as([min_seed_bytes]u8, @splat(0x01)), &min_ok);
     min_ok.deinit();
     var max_ok: ExtendedPrivKey = undefined;
-    try masterFromSeed(&[_]u8{0x01} ** max_seed_bytes, &max_ok);
+    try masterFromSeed(&@as([max_seed_bytes]u8, @splat(0x01)), &max_ok);
     max_ok.deinit();
 }
 
@@ -782,7 +782,7 @@ test "parseExtended rejects private keys beyond n: a ladder, not just n and 0 (H
     // to match only those two exact bit patterns passes the whole suite.
     // This builds the missing rungs directly: n+1, n+2, and 2^256-1, plus a
     // positive control at n-1 (the largest value the range check must ACCEPT).
-    const seed = [_]u8{0x01} ** 32;
+    const seed = @as([32]u8, @splat(0x01));
     var master: ExtendedPrivKey = undefined;
     try masterFromSeed(&seed, &master);
     defer master.deinit();
@@ -821,12 +821,12 @@ test "ckdPub rejects IL near n, not just an all-0xFF pattern (M2 weaken-resistan
     // match only that exact byte pattern (e.g. `il[0]==0xff and
     // il[31]==0xff`) still passes it. n itself and n+1 are the values
     // actually adjacent to the boundary the guard exists to enforce.
-    const seed = [_]u8{0xcd} ** 32;
+    const seed = @as([32]u8, @splat(0xcd));
     var master: ExtendedPrivKey = undefined;
     try masterFromSeed(&seed, &master);
     defer master.deinit();
     const master_pub = try neuter(&master);
-    const ir = [_]u8{0x11} ** 32;
+    const ir = @as([32]u8, @splat(0x11));
 
     var il_n: [32]u8 = undefined;
     _ = try std.fmt.hexToBytes(&il_n, secp256k1_n_hex);
@@ -840,14 +840,14 @@ test "ckdPub rejects IL near n, not just an all-0xFF pattern (M2 weaken-resistan
 test "masterFromSeed's IL>=n and IL==0 rejects are live code, not dead branches (M1)" {
     var il_n: [32]u8 = undefined;
     _ = try std.fmt.hexToBytes(&il_n, secp256k1_n_hex);
-    const ir = [_]u8{0x22} ** 32;
+    const ir = @as([32]u8, @splat(0x22));
     try testing.expectError(error.InvalidMasterKey, masterFromIL(il_n, ir));
 
-    const il_zero = [_]u8{0} ** 32;
+    const il_zero = @as([32]u8, @splat(0));
     try testing.expectError(error.InvalidMasterKey, masterFromIL(il_zero, ir));
 
     // Positive control: a legitimate small IL must still succeed.
-    const il_one = [_]u8{0} ** 31 ++ [_]u8{1};
+    const il_one = @as([31]u8, @splat(0)) ++ [_]u8{1};
     var ok = try masterFromIL(il_one, ir);
     ok.deinit();
 }
@@ -857,14 +857,14 @@ test "ckdPriv's child_priv==0 reject is live code, not a dead branch (M1)" {
     // is the unique value that drives it to 0, and it's computable here
     // because the test knows the parent scalar — no honest HMAC output will
     // ever land on it.
-    const seed = [_]u8{0x77} ** 32;
+    const seed = @as([32]u8, @splat(0x77));
     var master: ExtendedPrivKey = undefined;
     try masterFromSeed(&seed, &master);
     defer master.deinit();
     const master_pub = try neuter(&master);
 
     const il_neg = try Secp256k1.scalar.neg(master.privkey, .big);
-    const ir = [_]u8{0x33} ** 32;
+    const ir = @as([32]u8, @splat(0x33));
     try testing.expectError(error.InvalidChildKey, ckdPrivFromIL(&master, master_pub.pubkey, 0, il_neg, ir));
 }
 
@@ -873,14 +873,14 @@ test "ckdPubFromIL's rejectIdentity reject is live code, distinct from rejectNon
     // above: IL*G + parent_pub = -parent_pub + parent_pub = the identity
     // point, which is a DIFFERENT guard (`rejectIdentity`) from the IL>=n
     // check the M2 test above exercises.
-    const seed = [_]u8{0x77} ** 32;
+    const seed = @as([32]u8, @splat(0x77));
     var master: ExtendedPrivKey = undefined;
     try masterFromSeed(&seed, &master);
     defer master.deinit();
     const master_pub = try neuter(&master);
 
     const il_neg = try Secp256k1.scalar.neg(master.privkey, .big);
-    const ir = [_]u8{0x44} ** 32;
+    const ir = @as([32]u8, @splat(0x44));
     try testing.expectError(error.InvalidChildKey, ckdPubFromIL(master_pub, 0, il_neg, ir));
 }
 
@@ -890,14 +890,14 @@ test "parseExtended rejects non-78-byte payloads regardless of checksum validity
     // LENGTH, so the length check has never been exercised by the corpus.
     var enc_buf: [bech32.base58.max_encoded_len]u8 = undefined;
     inline for (.{ 10, 40, 77, 79, 120 }) |plen| {
-        var payload: [plen]u8 = [_]u8{0} ** plen;
+        var payload: [plen]u8 = @as([plen]u8, @splat(0));
         if (plen >= 4) std.mem.writeInt(u32, payload[0..4], version_mainnet_priv, .big);
         const s = try bech32.base58.checkEncode(&payload, &enc_buf);
         try testing.expectError(error.InvalidLength, parseExtended(s, .mainnet, &scratch_parsed));
     }
     // Positive control: the real length still parses (any other test already
     // covers this; repeated here so this test alone proves 78 is special).
-    const seed = [_]u8{0x09} ** 32;
+    const seed = @as([32]u8, @splat(0x09));
     var master: ExtendedPrivKey = undefined;
     try masterFromSeed(&seed, &master);
     defer master.deinit();
@@ -964,7 +964,7 @@ test "parsePath rejects unbounded leading zeros: m/7 and m/007 must not be the s
 }
 
 test "derivePath matches manual chained ckdPriv" {
-    const seed = [_]u8{0x42} ** 32;
+    const seed = @as([32]u8, @splat(0x42));
     var master: ExtendedPrivKey = undefined;
     try masterFromSeed(&seed, &master);
     defer master.deinit();
@@ -1019,7 +1019,7 @@ const XKeyCorpus = struct {
     slots: [xkey_seed_count][]const u8 = undefined,
 
     fn build(self: *XKeyCorpus) ![]const []const u8 {
-        const master_seed = [_]u8{0x01} ** 32;
+        const master_seed = @as([32]u8, @splat(0x01));
         var master: ExtendedPrivKey = undefined;
         try masterFromSeed(&master_seed, &master);
         defer master.deinit();
@@ -1058,7 +1058,7 @@ const XKeyCorpus = struct {
             "xprv9s21ZrQH143K3QTDL4LXw2F7HEK3wJUD2nW2nRk4stbPy6cq3jPPqjiChkVvvNKmPGJxWUtg6LnF5kejMRNNU3TGtRBeJgk33yuGBxrMPHL",
         );
         // Not Base58 at all: `0` and `l` are outside the alphabet.
-        self.slots[6] = tkfuzz.seedInto(&self.stores[6], "xprv0lIO" ++ "1" ** 100);
+        self.slots[6] = tkfuzz.seedInto(&self.stores[6], "xprv0lIO" ++ strRepeat("1", 100));
         self.slots[7] = tkfuzz.seedInto(&self.stores[7], ""); // the ONE input the collapsed harness ran
         return &self.slots;
     }
@@ -1149,14 +1149,14 @@ const path_seeds = [_][]const u8{
     pathSeed("m//0"), // InvalidPathSegment: doubled slash
     pathSeed("m/0/"), // InvalidPathSegment: trailing slash
     pathSeed("/m/0"), // InvalidPathSegment: leading slash
-    pathSeed("m" ++ "/0" ** 33), // PathTooDeep: 33 segments against max_path_depth = 32
+    pathSeed("m" ++ strRepeat("/0", 33)), // PathTooDeep: 33 segments against max_path_depth = 32
     // The charset knob, one `u64` word per octet it is meant to decide.
     // ⛔ Measured 2026-09-08: over the fifteen seeds above, `boolWeighted(1, 4)`
     // was drawn 159 times and returned `true` **zero** times, because the byte
     // draw leaves nothing behind and an exhausted `Smith` returns the weight
     // minimum. The alphabet-bending loop had never executed its body. These
     // two seeds are the only inputs in the ordinary lane that reach it.
-    bentPathSeed(&[_]u8{ 14, 10, 0, 11, 10, 1 }, &([_]u64{1} ** 6)), // -> "m/0'/1"
+    bentPathSeed(&[_]u8{ 14, 10, 0, 11, 10, 1 }, &(@as([6]u64, @splat(1)))), // -> "m/0'/1"
     bentPathSeed("X/0", &.{1}), // only the FIRST octet bent: 'X' -> '8', rest verbatim
     pathSeed(""), // the ONE input the collapsed harness ever ran
 };
@@ -1183,7 +1183,7 @@ test "scalarInRange (constant-time) agrees with rejectNonCanonical + non-zero" {
         }
     }.f;
     var edges: [7][32]u8 = undefined;
-    edges[0] = [_]u8{0} ** 32;
+    edges[0] = @as([32]u8, @splat(0));
     edges[1] = edges[0];
     edges[1][31] = 1;
     edges[2] = order_be;
@@ -1191,7 +1191,7 @@ test "scalarInRange (constant-time) agrees with rejectNonCanonical + non-zero" {
     edges[3] = order_be; // n
     edges[4] = order_be;
     edges[4][31] += 1; // n + 1
-    edges[5] = [_]u8{0xff} ** 32;
+    edges[5] = @as([32]u8, @splat(0xff));
     edges[6] = edges[0];
     edges[6][0] = 1;
     for (&edges) |*e| try testing.expectEqual(oracle(e), scalarInRange(e));
@@ -1277,4 +1277,16 @@ test "corpus: every path reaches parsePath, and the counts are pinned" {
     // — `bend_draws` moves if a seed is shortened, `bent` if a tail is lost.
     try testing.expectEqual(@as(usize, 168), bend_draws);
     try testing.expectEqual(@as(usize, 7), bent);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

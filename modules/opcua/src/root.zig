@@ -1615,7 +1615,7 @@ test "secure offline self-consistency: sealed OPN handshake (Basic256Sha256/Sign
     // consistent end-to-end. (The LIVE open62541 secure interop test below
     // is the independent oracle; this one runs offline everywhere.)
     const testing = std.testing;
-    var prng = std.Random.DefaultCsprng.init([_]u8{42} ** 32);
+    var prng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(42)));
     const random = prng.random();
 
     // Small keys keep this fast in Debug; nothing below hardcodes 2048-bit

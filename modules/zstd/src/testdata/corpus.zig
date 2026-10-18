@@ -529,7 +529,7 @@ fn random(r: *Rng, out: []u8) void {
 /// De Bruijn sequence B(k, n) over the bytes 'a'.., linearised (length k^n):
 /// every n-byte window of the cyclic sequence occurs once.
 fn deBruijn(k: u8, comptime n: usize, out: []u8) void {
-    var a = [_]u8{0} ** (n + 1);
+    var a = @as([n + 1]u8, @splat(0));
     var len: usize = 0;
     // Recursive "db(t, p)" of Ruskey/Savage/Wang, unrolled with an explicit stack.
     const Frame = struct { t: usize, p: usize, j: u8 };
@@ -602,7 +602,7 @@ fn mix(r: *Rng, out: []u8) void {
 /// Fill `out` with the input of `case`.
 pub fn generate(case: Case, out: []u8) void {
     std.debug.assert(out.len == case.len);
-    var r: Rng = .{ .s = case.len *% 31 +% @intFromEnum(case.kind) +% case.seed *% 0xD1B54A32D192ED03 };
+    var r: Rng = .{ .s = case.len *% 31 +% @backingInt(case.kind) +% case.seed *% 0xD1B54A32D192ED03 };
     switch (case.kind) {
         .words => words(&r, out),
         .csv => csv(&r, out),
@@ -2700,7 +2700,7 @@ fn crafted(content: Case, id: u32, out: []u8) usize {
     // 127, implied). Zero for the control bytes but '\n'; 2 for the 31
     // most common text bytes, 1 for the other 65: 31 * 2 + 65 = 127, so the
     // implied weight is 1 and the table log 7.
-    var w = [_]u8{0} ** 128;
+    var w = @as([128]u8, @splat(0));
     for (32..127) |s| w[s] = 1;
     w['\n'] = 1;
     for ("abcdefghijklmnopqrstuvwxyz ,.\n0") |s| w[s] = 2;
@@ -2713,17 +2713,17 @@ fn crafted(content: Case, id: u32, out: []u8) usize {
     }
     // offset codes (log 6): 0..20 but 5, so the table has a zero within
     // what the content's offsets need
-    var of_norm = [_]i16{0} ** 32;
+    var of_norm = @as([32]i16, @splat(0));
     for (0..21) |s| of_norm[s] = 3;
     of_norm[5] = 0;
     of_norm[0] += 4;
     p += writeNCount(out[p..], &of_norm, 20, 6);
     // match lengths (log 6): codes 0..31 only
-    var ml_norm = [_]i16{0} ** 53;
+    var ml_norm = @as([53]i16, @splat(0));
     for (0..32) |s| ml_norm[s] = 2;
     p += writeNCount(out[p..], &ml_norm, 31, 6);
     // literal lengths (log 6): codes 0..15 only
-    var ll_norm = [_]i16{0} ** 36;
+    var ll_norm = @as([36]i16, @splat(0));
     for (0..16) |s| ll_norm[s] = 4;
     p += writeNCount(out[p..], &ll_norm, 15, 6);
     for ([_]u32{ 1, 4, 8 }) |rep| {
@@ -3313,7 +3313,7 @@ fn fromSequences(out: []u8, seqs: []const seqgen.Seq, lits: []const u8) void {
 
 /// `n` copies of `s`.
 fn seqRun(comptime n: usize, comptime s: seqgen.Seq) [n]seqgen.Seq {
-    return [_]seqgen.Seq{s} ** n;
+    return @as([n]seqgen.Seq, @splat(s));
 }
 
 /// Round robin over the symbols 0.. (symbol `s` `counts[s]` times): the
@@ -3341,9 +3341,9 @@ fn roundRobin(comptime counts: []const u16) [countSum(counts)]u8 {
 // split would not pay.
 const split_largest_seqs = seqRun(512, .{ .offset = 1, .lit_length = 64, .match_length = 4 }) ++ [_]seqgen.Seq{.{ .offset = 0, .lit_length = 4, .match_length = 0 }};
 fn splitLargestLits() [32772]u8 {
-    const a = comptime roundRobin(&(.{133} ** 64 ++ .{123} ** 64));
-    const b = comptime roundRobin(&(.{123} ** 64 ++ .{133} ** 64));
-    return a ++ b ++ [_]u8{0} ** 4;
+    const a = comptime roundRobin(&(@as([64]u16, @splat(133)) ++ @as([64]u16, @splat(123))));
+    const b = comptime roundRobin(&(@as([64]u16, @splat(123)) ++ @as([64]u16, @splat(133))));
+    return a ++ b ++ @as([4]u8, @splat(0));
 }
 
 // A split half of exactly 1024 literals (`split-1024`): 160 sequences with
@@ -3367,7 +3367,7 @@ fn split1024Lits() [1024 + 1113]u8 {
 // match at offset 1.
 const entropy_table_block = seqRun(256, .{ .offset = 1, .lit_length = 32, .match_length = 480 }) ++ [_]seqgen.Seq{.{ .offset = 0, .lit_length = 0, .match_length = 0 }};
 fn entropyTableLits() [8192]u8 {
-    return comptime roundRobin(&(.{4096} ++ .{64} ** 32 ++ .{32} ** 32 ++ .{16} ** 64));
+    return comptime roundRobin(&([_]u16{4096} ++ @as([32]u16, @splat(64)) ++ @as([32]u16, @splat(32)) ++ @as([64]u16, @splat(16))));
 }
 
 // Then (`split-repeat`) 320 sequences, 70 of them with a literal (the
@@ -3782,7 +3782,7 @@ pub const seq_cases = [_]SeqCase{
     } } },
     .{ .name = "cseq-window-edge-dict-v", .input = "words-16384", .cmd = "cseq", .params = explicit ++ ",validateSequences=1,windowLog=10", .dict = .{ .mode = "load", .input = "words-262144", .len = 2000 }, .gen = .{ .list = &[_]seqgen.Seq{
         .{ .offset = 1500, .lit_length = 1000, .match_length = 24 }, .{ .offset = 0, .lit_length = 0, .match_length = 0 },
-    } ++ [_]seqgen.Seq{.{ .offset = 0, .lit_length = 1024, .match_length = 0 }} ** 15 } },
+    } ++ @as([15]seqgen.Seq, @splat(.{ .offset = 0, .lit_length = 1024, .match_length = 0 })) } },
     .{ .name = "cseq-rep0-minus-1", .input = "words-1000", .cmd = "cseq", .params = explicit ++ ",repcodeResolution=1", .gen = .{ .list = &[_]seqgen.Seq{
         .{ .offset = 8, .lit_length = 10, .match_length = 5 }, .{ .offset = 7, .lit_length = 0, .match_length = 5 },
         .{ .offset = 7, .lit_length = 3, .match_length = 4 },  .{ .offset = 0, .lit_length = 973, .match_length = 0 },
@@ -3795,8 +3795,8 @@ pub const seq_cases = [_]SeqCase{
         .{ .offset = 0, .lit_length = 130057, .match_length = 0 },
     } } },
     // the store's room (1000-byte blocks: 250 sequences), one over
-    .{ .name = "cseq-max-seqs", .input = "words-1000", .cmd = "cseq", .params = explicit, .gen = .{ .list = &([_]seqgen.Seq{.{ .offset = 1, .lit_length = 0, .match_length = 3 }} ** 251 ++ [_]seqgen.Seq{.{ .offset = 0, .lit_length = 247, .match_length = 0 }}) } },
-    .{ .name = "clit-max-seqs", .input = "words-1000", .cmd = "clit", .params = explicit, .gen = .{ .list = &([_]seqgen.Seq{.{ .offset = 1, .lit_length = 0, .match_length = 3 }} ** 249 ++ [_]seqgen.Seq{.{ .offset = 0, .lit_length = 253, .match_length = 0 }}) } },
+    .{ .name = "cseq-max-seqs", .input = "words-1000", .cmd = "cseq", .params = explicit, .gen = .{ .list = &(@as([251]seqgen.Seq, @splat(.{ .offset = 1, .lit_length = 0, .match_length = 3 })) ++ [_]seqgen.Seq{.{ .offset = 0, .lit_length = 247, .match_length = 0 }}) } },
+    .{ .name = "clit-max-seqs", .input = "words-1000", .cmd = "clit", .params = explicit, .gen = .{ .list = &(@as([249]seqgen.Seq, @splat(.{ .offset = 1, .lit_length = 0, .match_length = 3 })) ++ [_]seqgen.Seq{.{ .offset = 0, .lit_length = 253, .match_length = 0 }}) } },
     // validation positions carry the previous block's last literals
     .{ .name = "cseq-pos-after-delim-v", .input = "words-1000", .cmd = "cseq", .params = explicit ++ ",validateSequences=1", .gen = .{ .list = &[_]seqgen.Seq{
         .{ .offset = 10, .lit_length = 10, .match_length = 10 }, .{ .offset = 0, .lit_length = 100, .match_length = 0 },
@@ -3861,7 +3861,7 @@ pub const seq_cases = [_]SeqCase{
     // Below `lazy`, a table is predefined when its most frequent code
     // occurs fewer than nbSeq >> (log - 1) times: 320 sequences whose
     // match-length codes 1..32 occur 10 times each, exactly 320 >> 5.
-    .{ .name = "cseq-ml-most-frequent-edge", .input = "words-16384", .cmd = "cseq", .params = explicit, .levels = &.{1}, .gen = .{ .list = &mlCodeBlock(&(.{0} ++ .{10} ** 32), 16384) } },
+    .{ .name = "cseq-ml-most-frequent-edge", .input = "words-16384", .cmd = "cseq", .params = explicit, .levels = &.{1}, .gen = .{ .list = &mlCodeBlock(&([_]u16{0} ++ @as([32]u16, @splat(10))), 16384) } },
     // From `lazy` up, `ZSTD_NCountCost` prices a table normalized with
     // low-probability counts of -1 from exactly 2048 sequences on: a block
     // of 2048 whose match-length table header is one byte shorter that way,

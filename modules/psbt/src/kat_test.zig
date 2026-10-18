@@ -297,8 +297,8 @@ test "combine rejects a matching-txid pair with a DIFFERENT map count (A1 F5, is
 test "combine: two signers' PARTIAL_SIG records for the same input both survive (same keytype, different keydata)" {
     const allocator = testing.allocator;
     const tx_bytes = "dummy-tx-for-combine-key-collision-test";
-    const pubkey_a = [_]u8{0xAA} ** 33;
-    const pubkey_b = [_]u8{0xBB} ** 33;
+    const pubkey_a = @as([33]u8, @splat(0xAA));
+    const pubkey_b = @as([33]u8, @splat(0xBB));
 
     var a: psbt.Psbt = .{
         .global = .{ .records = try allocator.dupe(psbt.Record, &.{

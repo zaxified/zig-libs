@@ -19,10 +19,10 @@ const testkit = @import("testkit");
 pub const fuzz_driver = testkit.fuzz.driver;
 
 pub const Label = enum { rejected, parsed };
-var reach: [@typeInfo(Label).@"enum".fields.len]usize = @splat(0);
+var reach: [@typeInfo(Label).@"enum".field_names.len]usize = @splat(0);
 
 pub fn mark(comptime l: Label) void {
-    reach[@intFromEnum(l)] += 1;
+    reach[@backingInt(l)] += 1;
     fuzz_driver.hit(@tagName(l));
 }
 
@@ -103,7 +103,7 @@ pub fn checkReach(comptime name: []const u8, comptime harnesses: anytype, n: usi
         }
     }
     for (reach, 0..) |c, i| if (c == 0) {
-        std.debug.print(name ++ " reach: label {t} never hit in {d} seeds\n", .{ @as(Label, @enumFromInt(i)), n });
+        std.debug.print(name ++ " reach: label {t} never hit in {d} seeds\n", .{ @as(Label, @fromBackingInt(@intCast(i))), n });
         return error.HarnessDoesNotReach;
     };
 }

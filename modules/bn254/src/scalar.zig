@@ -174,7 +174,7 @@ test "Fr.zero / Fr.one round-trip through bytes" {
     const z = Fr.zero.toBytes();
     try std.testing.expect(std.mem.allEqual(u8, &z, 0));
     const o = Fr.one.toBytes();
-    var expected = [_]u8{0} ** 32;
+    var expected = @as([32]u8, @splat(0));
     expected[31] = 1;
     try std.testing.expectEqualSlices(u8, &expected, &o);
 }
@@ -188,11 +188,11 @@ test "Fr.fromBytes rejects r itself (non-canonical) and accepts r-1" {
 }
 
 test "Fr arithmetic identities: a + (-a) = 0, square == mul(a,a), (a+b)^2 law" {
-    var a_bytes = [_]u8{0} ** 32;
+    var a_bytes = @as([32]u8, @splat(0));
     a_bytes[31] = 0xef;
     a_bytes[0] = 0x11; // large-ish, still < r (r's top byte is 0x30)
     const a = try Fr.fromBytes(a_bytes);
-    var b_bytes = [_]u8{0} ** 32;
+    var b_bytes = @as([32]u8, @splat(0));
     b_bytes[30] = 0xab;
     const b = try Fr.fromBytes(b_bytes);
     try std.testing.expect(a.add(a.neg()).isZero());
@@ -202,7 +202,7 @@ test "Fr arithmetic identities: a + (-a) = 0, square == mul(a,a), (a+b)^2 law" {
 }
 
 test "Fr.inv: a * a^-1 == 1; inv(0) errors" {
-    var a_bytes = [_]u8{0} ** 32;
+    var a_bytes = @as([32]u8, @splat(0));
     a_bytes[31] = 42;
     const a = try Fr.fromBytes(a_bytes);
     try std.testing.expect(a.mul(try a.inv()).eql(Fr.one));
@@ -210,10 +210,10 @@ test "Fr.inv: a * a^-1 == 1; inv(0) errors" {
 }
 
 test "Fr.pow: a^0 = 1, a^1 = a, a^2 = square" {
-    var a_bytes = [_]u8{0} ** 32;
+    var a_bytes = @as([32]u8, @splat(0));
     a_bytes[31] = 5;
     const a = try Fr.fromBytes(a_bytes);
-    var e = [_]u8{0} ** 32;
+    var e = @as([32]u8, @splat(0));
     try std.testing.expect(a.pow(e).eql(Fr.one));
     e[31] = 1;
     try std.testing.expect(a.pow(e).eql(a));
@@ -228,14 +228,14 @@ test "Fr.reduceWide: r reduces to 0, r+1 to 1, canonical values unchanged, 64-by
     r_plus_1[31] += 1; // r's low byte is 0x01, no carry
     try std.testing.expect(Fr.reduceWide(&r_plus_1).eql(Fr.one));
 
-    var small = [_]u8{0} ** 32;
+    var small = @as([32]u8, @splat(0));
     small[31] = 0x7f;
     try std.testing.expect(Fr.reduceWide(&small).eql(try Fr.fromBytes(small)));
 
     // 64 bytes of 0xff mod r — independently computed with big-integer
     // arithmetic outside this module (Python `int.from_bytes(b'\xff'*64,
     // 'big') % r`; see SPEC.md's "Verification performed").
-    const wide = [_]u8{0xff} ** 64;
+    const wide = @as([64]u8, @splat(0xff));
     var expected_bytes: [32]u8 = undefined;
     _ = try std.fmt.hexToBytes(&expected_bytes, "0216d0b17f4e44a58c49833d53bb808553fe3ab1e35c59e31bb8e645ae216da6");
     try std.testing.expectEqualSlices(u8, &expected_bytes, &Fr.reduceWide(&wide).toBytes());

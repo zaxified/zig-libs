@@ -297,5 +297,17 @@ test "the output round-trips through std.json into Problem" {
 test "a full writer surfaces WriteFailed" {
     var buf: [16]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
-    try testing.expectError(error.WriteFailed, write(&w, .{ .status = 404, .detail = "x" ** 64 }, .{}));
+    try testing.expectError(error.WriteFailed, write(&w, .{ .status = 404, .detail = strRepeat("x", 64) }, .{}));
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

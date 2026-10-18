@@ -5266,7 +5266,7 @@ fn armWatchdog(seconds: isize) void {
         .interval = .{ .sec = 0, .usec = 0 },
         .value = .{ .sec = seconds, .usec = 0 },
     };
-    _ = linux.syscall3(.setitimer, @intCast(@intFromEnum(linux.ITIMER.REAL)), @intFromPtr(&it), 0);
+    _ = linux.syscall3(.setitimer, @intCast(@backingInt(linux.ITIMER.REAL)), @intFromPtr(&it), 0);
 }
 
 /// Child exit codes (0 = the expected outcome).
@@ -5410,13 +5410,13 @@ test "FsStorage: allocate reserves zeros past the data; syncData makes writes in
     try std.testing.expectEqual(@as(u64, 4096), try st.size(h));
     var buf: [16]u8 = undefined;
     try std.testing.expectEqual(@as(usize, 16), try st.pread(h, &buf, 0));
-    try std.testing.expectEqualSlices(u8, "hello" ++ "\x00" ** 11, &buf);
+    try std.testing.expectEqualSlices(u8, "hello" ++ strRepeat("\x00", 11), &buf);
 
     try st.writeAll(h, "world", 5);
     try st.syncData(h);
     try std.testing.expectEqual(@as(u64, 4096), try st.size(h)); // still the reservation
     try std.testing.expectEqual(@as(usize, 16), try st.pread(h, &buf, 0));
-    try std.testing.expectEqualSlices(u8, "helloworld" ++ "\x00" ** 6, &buf);
+    try std.testing.expectEqualSlices(u8, "helloworld" ++ strRepeat("\x00", 6), &buf);
     try std.testing.expect(try st.allocate(h, 100)); // never shrinks
     try std.testing.expectEqual(@as(u64, 4096), try st.size(h));
 
@@ -5499,4 +5499,16 @@ test "Storage: a backend without allocate answers false; syncData falls back to 
     const before = sim.ops_seen;
     try st.syncData(h);
     try std.testing.expectEqual(before + 1, sim.ops_seen); // the full sync ran
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

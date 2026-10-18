@@ -67,10 +67,10 @@ pub fn main() !void {
     var node_privkeys: [num_hops][32]u8 = undefined;
     var node_pubkeys: [num_hops][sphinx.pubkey_len]u8 = undefined;
     for (&node_privkeys, &node_pubkeys, 0..) |*sk, *pk, i| {
-        sk.* = [_]u8{@intCast(i + 1)} ** 32;
+        sk.* = @as([32]u8, @splat(@intCast(i + 1)));
         pk.* = pointOf(sk.*);
     }
-    const session_key = [_]u8{0x99} ** 32;
+    const session_key = @as([32]u8, @splat(0x99));
 
     // Each hop's TLV-encoded payload — fabricated, illustrative content
     // (a real payload is amt_to_forward/outgoing_cltv/short_channel_id
@@ -83,7 +83,7 @@ pub fn main() !void {
         &[_]u8{ 0x02, 0x01, 0x02 },
         &[_]u8{ 0x06, 0x01, 0x2a, 0x02, 0x03, 0xff },
     };
-    const associated_data = [_]u8{0xAD} ** 32; // stands in for a payment_hash
+    const associated_data = @as([32]u8, @splat(0xAD)); // stands in for a payment_hash
 
     // ── The sender's shared-secret/blinding chain, called directly (it
     // is public API in its own right, not just `construct`'s internal

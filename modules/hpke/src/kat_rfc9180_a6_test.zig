@@ -19,13 +19,13 @@ const Aes256Gcm = std.crypto.aead.aes_gcm.Aes256Gcm;
 const Kem = dhkem.P521Kem;
 
 fn drive(comptime V: type) !void {
-    const mode: suite.Mode = @enumFromInt(V.mode);
+    const mode: suite.Mode = @fromBackingInt(@intCast(V.mode));
     const is_auth = comptime (mode == .auth or mode == .auth_psk);
     const psk: []const u8 = if (@hasDecl(V, "psk")) &V.psk else "";
     const psk_id: []const u8 = if (@hasDecl(V, "psk_id")) &V.psk_id else "";
     try testing.expectEqual(Kem.kem_id, V.kem_id);
-    try testing.expectEqual(@as(u16, @intFromEnum(suite.KdfId.hkdf_sha512)), V.kdf_id);
-    try testing.expectEqual(@as(u16, @intFromEnum(suite.AeadId.aes256gcm)), V.aead_id);
+    try testing.expectEqual(@as(u16, @backingInt(suite.KdfId.hkdf_sha512)), V.kdf_id);
+    try testing.expectEqual(@as(u16, @backingInt(suite.AeadId.aes256gcm)), V.aead_id);
 
     // 1. DeriveKeyPair (§7.1.3, bitmask 0x01).
     var kpE: Kem.KeyPair = undefined;
@@ -146,5 +146,5 @@ test "P521Kem: malformed or off-curve peer points are DeserializeError, never a 
     var kpR: Kem.KeyPair = undefined;
     Kem.deriveKeyPair(&kpR, &V.ikmR);
     var s: [Kem.Nsecret]u8 = undefined;
-    try testing.expectError(error.DeserializeError, Kem.decap(&s, [_]u8{0} ** Kem.Npk, &kpR));
+    try testing.expectError(error.DeserializeError, Kem.decap(&s, @as([Kem.Npk]u8, @splat(0)), &kpR));
 }

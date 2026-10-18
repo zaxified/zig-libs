@@ -169,7 +169,7 @@ pub fn create(out: *[mac_length]u8, msg: []const u8, key: *const [key_length]u8)
         h = mul(1, add(1, h, load(1, msg[i..], 16)), r1, s1);
     }
     if (i < msg.len) {
-        var buf = [_]u8{0} ** 16;
+        var buf = @as([16]u8, @splat(0));
         @memcpy(buf[0 .. msg.len - i], msg[i..]);
         buf[msg.len - i] = 1;
         var b = load(1, &buf, 16);
@@ -293,9 +293,9 @@ test "finish reduces every limb state carry can leave, edge states included" {
 test "h near the modulus takes the reduced branch" {
     // Messages whose accumulator lands in [p, 2^130): all-0xff blocks under
     // r = 1 make h = sum of (2^129 - 1) values, exercising the final select.
-    var key = [_]u8{0} ** 32;
+    var key = @as([32]u8, @splat(0));
     key[0] = 1;
-    var msg = [_]u8{0xff} ** 160;
+    var msg = @as([160]u8, @splat(0xff));
     for (0..msg.len + 1) |len| {
         var a: [16]u8 = undefined;
         var b: [16]u8 = undefined;

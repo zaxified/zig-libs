@@ -85,7 +85,7 @@ test "RNS CRT byte-exact KAT vs Python re-derivation" {
 // (b) the real NTT matches the negacyclic one, NOT the cyclic one.
 
 fn cyclicMulSchoolbook(comptime N: usize, q: u64, a: *const [N]u64, b: *const [N]u64) [N]u64 {
-    var out = [_]u64{0} ** N;
+    var out = @as([N]u64, @splat(0));
     for (0..N) |i| for (0..N) |j| {
         const c = ma.mulMod(a[i], b[j], q);
         out[(i + j) % N] = ma.addMod(out[(i + j) % N], c, q); // X^N = +1 (WRONG for RLWE)
@@ -363,8 +363,8 @@ test "positive control: corrupted relin key is caught by the mul anchor (key-swi
         }
     }
     const Pt = BM.Plaintext;
-    const a = Pt.fromCoeffs(PM.t, [_]u64{3} ** BM.degree);
-    const b = Pt.fromCoeffs(PM.t, [_]u64{5} ** BM.degree);
+    const a = Pt.fromCoeffs(PM.t, @as([BM.degree]u64, @splat(3)));
+    const b = Pt.fromCoeffs(PM.t, @as([BM.degree]u64, @splat(5)));
     const ca = inst.encryptForTest(&kp.pk, &a, rnd);
     const cb = inst.encryptForTest(&kp.pk, &b, rnd);
     const prod2 = inst.relinearize(&inst.mul(&ca, &cb), &rlk);

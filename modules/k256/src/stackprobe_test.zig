@@ -166,7 +166,7 @@ noinline fn callLeaky() void {
 }
 
 fn reduce32(b: [32]u8) Scalar {
-    var wide: [48]u8 = [_]u8{0} ** 48;
+    var wide: [48]u8 = @as([48]u8, @splat(0));
     wide[16..48].* = b;
     return Scalar.fromBytes48(wide, .big);
 }
@@ -175,8 +175,8 @@ fn reduce32(b: [32]u8) Scalar {
 /// asking the module (which would itself leave copies).
 fn nonceFor(privkey: [32]u8, hash32: [32]u8) [32]u8 {
     const h1 = reduce32(hash32).toBytes(.big);
-    var v: [32]u8 = [_]u8{0x01} ** 32;
-    var k: [32]u8 = [_]u8{0x00} ** 32;
+    var v: [32]u8 = @as([32]u8, @splat(0x01));
+    var k: [32]u8 = @as([32]u8, @splat(0x00));
     var buf: [97]u8 = undefined;
     for ([_]u8{ 0x00, 0x01 }) |sep| {
         buf[0..32].* = v;
@@ -233,7 +233,7 @@ const needle_names = [_][]const u8{
 };
 
 test "STACKPROBE (A1 G2): no RFC 6979 nonce or key residue on the dead stack after ecdsa_recover.sign" {
-    if (builtin.mode == .Debug or builtin.mode == .ReleaseSafe) return error.SkipZigTest;
+    if (builtin.mode == .debug or builtin.mode == .safe) return error.SkipZigTest;
 
     for (&cur_pk, 0..) |*b, i| b.* = @intCast(0x40 +% i);
     for (&cur_hash, 0..) |*b, i| b.* = @intCast(0x90 +% i);
@@ -298,7 +298,7 @@ noinline fn callMul() void {
 }
 
 test "STACKPROBE (A1 R1): no scalar residue on the dead stack after Secp256k1.mulInto" {
-    if (builtin.mode == .Debug or builtin.mode == .ReleaseSafe) return error.SkipZigTest;
+    if (builtin.mode == .debug or builtin.mode == .safe) return error.SkipZigTest;
 
     var seed: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash("k256 stackprobe R1 point", &seed, .{});
@@ -362,7 +362,7 @@ noinline fn callBip340Sign() void {
 }
 
 test "STACKPROBE (review 2026-10-08): no key or nonce residue on the dead stack after sign.bip340Sign" {
-    if (builtin.mode == .Debug or builtin.mode == .ReleaseSafe) return error.SkipZigTest;
+    if (builtin.mode == .debug or builtin.mode == .safe) return error.SkipZigTest;
 
     // Two keys, so both arms of the even-y select run: `d = d'` and `d = n − d'`.
     for ([_]u8{ 0x02, 0x03 }) |last| {
@@ -389,13 +389,13 @@ test "STACKPROBE (review 2026-10-08): no key or nonce residue on the dead stack 
         leak_src = needles[0];
         cur_hash = cur_aux;
 
-        var scratch = [_]usize{0} ** needles.len;
+        var scratch = @as([needles.len]usize, @splat(0));
         measure(callInnocent);
         const neg = countAll(&needles, &scratch);
         measure(callLeaky);
         const pos = countIn(&needles[0]);
 
-        var hits = [_]usize{0} ** needles.len;
+        var hits = @as([needles.len]usize, @splat(0));
         resetDepths();
         for (0..5) |_| {
             measure(callBip340Sign);
@@ -425,7 +425,7 @@ noinline fn callCombMulBase() void {
 }
 
 test "STACKPROBE (review 2026-10-08): no scalar residue on the dead stack after Secp256k1.combMulBase" {
-    if (builtin.mode == .Debug or builtin.mode == .ReleaseSafe) return error.SkipZigTest;
+    if (builtin.mode == .debug or builtin.mode == .safe) return error.SkipZigTest;
 
     std.crypto.hash.sha2.Sha256.hash("k256 stackprobe combMulBase secret scalar", &cur_scalar, .{});
     cur_scalar[0] &= 0x7f;

@@ -129,7 +129,7 @@ pub fn wordsPerRecord(record_len: usize, word_bytes: usize) usize {
 // has, or could have, an external anchor.
 
 test "SELF: Database.init validates geometry" {
-    const bytes = [_]u8{0} ** 12;
+    const bytes = @as([12]u8, @splat(0));
     const db = try Database.init(&bytes, 4);
     try std.testing.expectEqual(@as(usize, 3), db.count());
     try std.testing.expectEqual(@as(usize, 4), db.record(2).len);

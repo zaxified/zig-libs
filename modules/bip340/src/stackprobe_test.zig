@@ -242,7 +242,7 @@ fn needlesFor(sk_bytes: [32]u8, aux: [32]u8) !Needles {
 /// five times per key beside a negative and a positive control, and fail on
 /// any secret found.
 fn runCases(label: []const u8, call: *const fn () void) !void {
-    if (builtin.mode == .Debug or builtin.mode == .ReleaseSafe) return error.SkipZigTest;
+    if (builtin.mode == .debug or builtin.mode == .safe) return error.SkipZigTest;
 
     for (cases, 0..) |case, ci| {
         cur_case = ci;

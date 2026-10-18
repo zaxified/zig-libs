@@ -87,8 +87,8 @@ test "round trip: setup -> extract -> encrypt -> decrypt recovers the message, s
 
     for (cases) |c| {
         const d_id = testExtract(ibe.Default, kp.msk, c.id);
-        const message = [_]u8{c.msg} ** ibe.block_bytes;
-        const sigma = [_]u8{c.sig} ** ibe.block_bytes;
+        const message = @as([ibe.block_bytes]u8, @splat(c.msg));
+        const sigma = @as([ibe.block_bytes]u8, @splat(c.sig));
 
         const ct = testEncrypt(ibe.Default, kp.mpk, c.id, message, sigma);
         const recovered = try testDecrypt(ibe.Default, d_id, ct);
@@ -105,7 +105,7 @@ test "round trip: sigma sourced from randomSigma (production entropy path)" {
 
     const id = "alice@example.com";
     const d_id = testExtract(ibe.Default, kp.msk, id);
-    const message = [_]u8{0x5a} ** ibe.block_bytes;
+    const message = @as([ibe.block_bytes]u8, @splat(0x5a));
     var sigma: [ciphersuite.block_bytes]u8 = undefined;
     ciphersuite.randomSigma(&sigma, io);
 
@@ -165,7 +165,7 @@ test "entropy seam: randomSigma really draws, and two encryptions of one message
     var kp: ibe.KeyPair = undefined;
     ibe.setup(&kp, io);
     const id = "alice@example.com";
-    const message = [_]u8{0x5a} ** ibe.block_bytes;
+    const message = @as([ibe.block_bytes]u8, @splat(0x5a));
 
     var sigma1: [ciphersuite.block_bytes]u8 = undefined;
     ciphersuite.randomSigma(&sigma1, io);
@@ -200,8 +200,8 @@ test "encrypt is deterministic given fixed (mpk, id, message, sigma)" {
     ibe.setup(&kp, threaded.io());
 
     const id = "alice@example.com";
-    const message = [_]u8{0x33} ** ibe.block_bytes;
-    const sigma = [_]u8{0x44} ** ibe.block_bytes;
+    const message = @as([ibe.block_bytes]u8, @splat(0x33));
+    const sigma = @as([ibe.block_bytes]u8, @splat(0x44));
 
     const ct1 = testEncrypt(ibe.Default, kp.mpk, id, message, sigma);
     const ct2 = testEncrypt(ibe.Default, kp.mpk, id, message, sigma);
@@ -218,8 +218,8 @@ test "pairing consistency: e(d_id, U) == fp12Pow(Gid, r) directly, on a known ca
 
     const id = "alice@example.com";
     const d_id = testExtract(ibe.Default, kp.msk, id);
-    const message = [_]u8{0x12} ** ibe.block_bytes;
-    const sigma = [_]u8{0x34} ** ibe.block_bytes;
+    const message = @as([ibe.block_bytes]u8, @splat(0x12));
+    const sigma = @as([ibe.block_bytes]u8, @splat(0x34));
 
     // Reproduce encrypt's internal Gid/r/U exactly, to check the core
     // identity independent of the XOR/hash masking layer.
@@ -266,7 +266,7 @@ test "pairing consistency: e(d_id, G2gen) == e(H1(id), mpk) — the Extract corr
 // ── 3. fp12Pow KAT (bilinearity cross-check) ─────────────────────────
 
 test "fp12Pow matches pairing bilinearity: e(P,Q)^r == e(rP,Q) (KAT, module-exposed helper)" {
-    var r_bytes = [_]u8{0} ** 32;
+    var r_bytes = @as([32]u8, @splat(0));
     r_bytes[20] = 0x9c;
     r_bytes[27] = 0x02;
     r_bytes[31] = 0x11;
@@ -289,8 +289,8 @@ test "soundness: tampered U is rejected by the FO check" {
     ibe.setup(&kp, threaded.io());
     const id = "alice@example.com";
     const d_id = testExtract(ibe.Default, kp.msk, id);
-    const message = [_]u8{0x01} ** ibe.block_bytes;
-    const sigma = [_]u8{0x02} ** ibe.block_bytes;
+    const message = @as([ibe.block_bytes]u8, @splat(0x01));
+    const sigma = @as([ibe.block_bytes]u8, @splat(0x02));
 
     var ct = testEncrypt(ibe.Default, kp.mpk, id, message, sigma);
     // Corrupt U by using a different point (the generator scaled by a
@@ -308,8 +308,8 @@ test "soundness: tampered V is rejected by the FO check" {
     ibe.setup(&kp, threaded.io());
     const id = "alice@example.com";
     const d_id = testExtract(ibe.Default, kp.msk, id);
-    const message = [_]u8{0x01} ** ibe.block_bytes;
-    const sigma = [_]u8{0x02} ** ibe.block_bytes;
+    const message = @as([ibe.block_bytes]u8, @splat(0x01));
+    const sigma = @as([ibe.block_bytes]u8, @splat(0x02));
 
     var ct = testEncrypt(ibe.Default, kp.mpk, id, message, sigma);
     ct.v[0] ^= 0xff;
@@ -324,8 +324,8 @@ test "soundness: tampered W is rejected by the FO check" {
     ibe.setup(&kp, threaded.io());
     const id = "alice@example.com";
     const d_id = testExtract(ibe.Default, kp.msk, id);
-    const message = [_]u8{0x01} ** ibe.block_bytes;
-    const sigma = [_]u8{0x02} ** ibe.block_bytes;
+    const message = @as([ibe.block_bytes]u8, @splat(0x01));
+    const sigma = @as([ibe.block_bytes]u8, @splat(0x02));
 
     var ct = testEncrypt(ibe.Default, kp.mpk, id, message, sigma);
     ct.w[0] ^= 0xff;
@@ -340,8 +340,8 @@ test "soundness: a random G1 point as d_id is rejected (not the identity's real 
     var kp: ibe.KeyPair = undefined;
     ibe.setup(&kp, io);
     const id = "alice@example.com";
-    const message = [_]u8{0x01} ** ibe.block_bytes;
-    const sigma = [_]u8{0x02} ** ibe.block_bytes;
+    const message = @as([ibe.block_bytes]u8, @splat(0x01));
+    const sigma = @as([ibe.block_bytes]u8, @splat(0x02));
     const ct = testEncrypt(ibe.Default, kp.mpk, id, message, sigma);
 
     // A random scalar multiple of H1(id) that is NOT msk*H1(id).
@@ -362,8 +362,8 @@ test "soundness: extract for id_A cannot decrypt a ciphertext encrypted to id_B"
     const id_b = "bob@example.com";
     const d_id_a = testExtract(ibe.Default, kp.msk, id_a);
 
-    const message = [_]u8{0x77} ** ibe.block_bytes;
-    const sigma = [_]u8{0x88} ** ibe.block_bytes;
+    const message = @as([ibe.block_bytes]u8, @splat(0x77));
+    const sigma = @as([ibe.block_bytes]u8, @splat(0x88));
     const ct_for_b = testEncrypt(ibe.Default, kp.mpk, id_b, message, sigma);
 
     try std.testing.expectError(error.FoCheckFailed, testDecrypt(ibe.Default, d_id_a, ct_for_b));
@@ -379,8 +379,8 @@ test "soundness: a different PKG's msk (different setup) cannot extract a workin
     ibe.setup(&kp_other, io);
 
     const id = "alice@example.com";
-    const message = [_]u8{0x55} ** ibe.block_bytes;
-    const sigma = [_]u8{0x66} ** ibe.block_bytes;
+    const message = @as([ibe.block_bytes]u8, @splat(0x55));
+    const sigma = @as([ibe.block_bytes]u8, @splat(0x66));
     const ct = testEncrypt(ibe.Default, kp_real.mpk, id, message, sigma);
 
     const d_id_wrong_pkg = testExtract(ibe.Default, kp_other.msk, id);
@@ -636,13 +636,13 @@ const CtCorpus = struct {
 
     /// The fixed self-issued PKG context every entry is built against.
     fn fixture() struct { d_id: g1.Affine, bytes: [cap]u8 } {
-        var msk_bytes = [_]u8{0} ** 32;
+        var msk_bytes = @as([32]u8, @splat(0));
         msk_bytes[31] = 0x07;
         const msk = Fr.fromBytes(msk_bytes) catch unreachable;
         const mpk = g2.Jacobian.fromAffine(g2.Affine.generator).scalarMul(msk).toAffine();
         const id = "fuzz@example.com";
-        const message = [_]u8{0xAB} ** ibe.block_bytes;
-        const sigma = [_]u8{0x11} ** ibe.block_bytes;
+        const message = @as([ibe.block_bytes]u8, @splat(0xAB));
+        const sigma = @as([ibe.block_bytes]u8, @splat(0x11));
         return .{
             .d_id = testExtract(ibe.Default, msk, id),
             .bytes = testEncrypt(ibe.Default, mpk, id, message, sigma).toBytes(),
@@ -688,7 +688,7 @@ const CtCorpus = struct {
 
         // 6: 160 zero octets — a cleared compression flag, which is also what
         //    a short or empty draw pads to.
-        t = [_]u8{0} ** cap;
+        t = @as([cap]u8, @splat(0));
         self.entries[6] = kit.seedInto(&self.stores[6], &t);
 
         // 7: the empty input, which is what an empty corpus produced.
@@ -713,14 +713,14 @@ fn fuzzDecryptSmith(_: void, smith: *std.testing.Smith) !void {
 fn fuzzDecrypt(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
     if (fixture_cache == null) {
         const f = CtCorpus.fixture();
-        var msk_bytes = [_]u8{0} ** 32;
+        var msk_bytes = @as([32]u8, @splat(0));
         msk_bytes[31] = 0x07;
         const msk = Fr.fromBytes(msk_bytes) catch unreachable;
         fixture_cache = .{ .d_id = f.d_id, .other_id = testExtract(ibe.Default, msk, "other@example.com"), .bytes = f.bytes };
     }
     const f = fixture_cache.?;
 
-    var bytes: [ibe.Ciphertext.encoded_bytes]u8 = [_]u8{0} ** ibe.Ciphertext.encoded_bytes;
+    var bytes: [ibe.Ciphertext.encoded_bytes]u8 = @as([ibe.Ciphertext.encoded_bytes]u8, @splat(0));
     if (S == fz.fuzz_driver.Rng and src.value(bool)) {
         // The driver's structured half: the real ciphertext with 0-3 octets
         // damaged (the other half is the plain draw below, for wild input).
@@ -750,7 +750,7 @@ fn fuzzDecrypt(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
         return;
     };
     if (!pristine) return error.DamagedCiphertextDecrypted;
-    if (!std.mem.eql(u8, &m, &([_]u8{0xAB} ** ibe.block_bytes))) return error.GenuineCiphertextChanged;
+    if (!std.mem.eql(u8, &m, &(@as([ibe.block_bytes]u8, @splat(0xAB))))) return error.GenuineCiphertextChanged;
     DecryptMark.mark(.genuine_accepted);
     // The same ciphertext under another identity's key is refused.
     if (testDecrypt(ibe.Default, f.other_id, corrupted)) |_| return error.WrongKeyDecrypted else |_| {}
@@ -794,7 +794,7 @@ test "corpus: every ciphertext seed reaches fromBytes, and the outcomes are pinn
         var buf: [ibe.Ciphertext.encoded_bytes]u8 = undefined;
         const n: usize = smith.slice(&buf);
         if (n != 0) nonempty += 1;
-        var bytes: [ibe.Ciphertext.encoded_bytes]u8 = [_]u8{0} ** ibe.Ciphertext.encoded_bytes;
+        var bytes: [ibe.Ciphertext.encoded_bytes]u8 = @as([ibe.Ciphertext.encoded_bytes]u8, @splat(0));
         @memcpy(bytes[0..n], buf[0..n]);
         const ct = ibe.Ciphertext.fromBytes(bytes) catch {
             refused_by_decode += 1;

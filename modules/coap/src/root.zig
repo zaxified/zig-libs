@@ -165,17 +165,17 @@ pub const Code = enum(u8) {
 
     /// The 3-bit class (0, 2, 4, 5).
     pub fn class(c: Code) u3 {
-        return @intCast(@intFromEnum(c) >> 5);
+        return @intCast(@backingInt(c) >> 5);
     }
 
     /// The 5-bit detail (0..31).
     pub fn detail(c: Code) u5 {
-        return @intCast(@intFromEnum(c) & 0x1f);
+        return @intCast(@backingInt(c) & 0x1f);
     }
 
     /// Build a code from class + detail (e.g. `Code.init(2, 5)` == `.content`).
     pub fn init(cls: u3, det: u5) Code {
-        return @enumFromInt((@as(u8, cls) << 5) | det);
+        return @fromBackingInt(@intCast((@as(u8, cls) << 5) | det));
     }
 
     /// A request code (class 0, and not the Empty message).
@@ -242,10 +242,10 @@ pub fn parse(bytes: []const u8, options_buf: []Option) ParseError!Message {
     if (bytes.len < 4) return error.TooShort;
     const b0 = bytes[0];
     if (b0 >> 6 != version) return error.BadVersion;
-    const typ: Type = @enumFromInt(@as(u2, @truncate(b0 >> 4)));
+    const typ: Type = @fromBackingInt(@intCast(@as(u2, @truncate(b0 >> 4))));
     const tkl: u4 = @truncate(b0);
     if (tkl > max_token_len) return error.BadTokenLength;
-    const code: Code = @enumFromInt(bytes[1]);
+    const code: Code = @fromBackingInt(@intCast(bytes[1]));
     const message_id = std.mem.readInt(u16, bytes[2..4], .big);
 
     var pos: usize = 4;
@@ -347,9 +347,9 @@ pub fn serialize(msg: Message, out: []u8) SerializeError!usize {
     if (msg.token.len > max_token_len) return error.BadTokenLength;
     if (out.len < 4 + msg.token.len) return error.BufferTooSmall;
     out[0] = (@as(u8, version) << 6) |
-        (@as(u8, @intFromEnum(msg.type)) << 4) |
+        (@as(u8, @backingInt(msg.type)) << 4) |
         @as(u8, @intCast(msg.token.len));
-    out[1] = @intFromEnum(msg.code);
+    out[1] = @backingInt(msg.code);
     std.mem.writeInt(u16, out[2..4], msg.message_id, .big);
     var pos: usize = 4;
     @memcpy(out[pos..][0..msg.token.len], msg.token);
@@ -452,7 +452,7 @@ test "hand-built datagram: CON GET, token, repeated Uri-Path, no payload" {
 
 test "extended nibble forms round-trip across the 13 and 269 boundaries" {
     const long20 = "abcdefghijklmnopqrst"; // length 20 → length nibble 13
-    const long300 = "x" ** 300; // length 300 → length nibble 14
+    const long300 = strRepeat("x", 300); // length 300 → length nibble 14
     try expectRoundTrip(.{
         .type = .non_confirmable,
         .code = .content,
@@ -591,7 +591,7 @@ test "encodedLen matches serialize across shapes" {
             .message_id = 3,
             .options = &.{
                 .{ .number = 1, .value = "" },
-                .{ .number = 270, .value = "y" ** 269 },
+                .{ .number = 270, .value = strRepeat("y", 269) },
             },
             .payload = "z",
         },
@@ -658,7 +658,7 @@ const parse_seeds = [_][]const u8{
         "c161" ++
         "dd" ++ "0007" ++ "6162636465666768696a6b6c6d6e6f7071727374" ++
         "d1" ++ "ff" ++ "62" ++
-        "ee" ++ "0000" ++ "001f" ++ ("78" ** 300)),
+        "ee" ++ "0000" ++ "001f" ++ (strRepeat("78", 300))),
 };
 
 test "fuzz: parse never panics on arbitrary bytes" {
@@ -735,4 +735,16 @@ test "corpus: every parse seed reaches the decoder, and the counts are pinned" {
     try testing.expectEqual(parse_seeds.len, nonempty);
     try testing.expectEqual(@as(usize, 6), parsed);
     try testing.expectEqual(@as(usize, 9), option_count);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

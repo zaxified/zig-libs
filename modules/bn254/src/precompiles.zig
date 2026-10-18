@@ -111,7 +111,7 @@ pub const EcPairingError = PrecompileError || std.mem.Allocator.Error;
 /// three fixed precompile input widths (`128`/`96` for `ecAdd`/
 /// `ecMul`; `ecPairing` uses no padding at all — see `ecPairingCheck`).
 fn padTo(comptime n: usize, input: []const u8) [n]u8 {
-    var buf: [n]u8 = [_]u8{0} ** n;
+    var buf: [n]u8 = @as([n]u8, @splat(0));
     const copy_len = @min(input.len, n);
     @memcpy(buf[0..copy_len], input[0..copy_len]);
     return buf;
@@ -205,7 +205,7 @@ pub fn ecPairingCheck(allocator: std.mem.Allocator, input: []const u8) EcPairing
 /// EVM precompile returns it: 32 bytes, all-zero for `false`, `1` in
 /// the low-order byte for `true` (`0x00..01`).
 pub fn encodeBool(result: bool) [32]u8 {
-    var out = [_]u8{0} ** 32;
+    var out = @as([32]u8, @splat(0));
     if (result) out[31] = 1;
     return out;
 }
@@ -232,7 +232,7 @@ test "padTo: shorter input is zero-right-padded" {
 
 test "padTo: empty input yields all-zero" {
     const buf = padTo(8, &[_]u8{});
-    try std.testing.expectEqualSlices(u8, &[_]u8{0} ** 8, &buf);
+    try std.testing.expectEqualSlices(u8, &@as([8]u8, @splat(0)), &buf);
 }
 
 test "padTo: exact-length input passes through unchanged" {
@@ -257,14 +257,14 @@ test "ecAdd: identity + generator == generator" {
 }
 
 test "ecAdd: rejects a coordinate >= p" {
-    var bytes = [_]u8{0} ** 128;
+    var bytes = @as([128]u8, @splat(0));
     const fp_mod = @import("fp.zig");
     bytes[0..32].* = fp_mod.p_bytes; // p.x == p, non-canonical
     try std.testing.expectError(error.InvalidFieldElement, ecAdd(&bytes));
 }
 
 test "ecAdd: rejects an off-curve point" {
-    var bytes = [_]u8{0} ** 128;
+    var bytes = @as([128]u8, @splat(0));
     bytes[31] = 1;
     bytes[63] = 3; // (1, 3): off-curve, see g1.zig's own equivalent test
     try std.testing.expectError(error.NotOnCurve, ecAdd(&bytes));
@@ -299,15 +299,15 @@ test "ecPairingCheck: empty input is true (empty product)" {
 }
 
 test "ecPairingCheck: length not a multiple of 192 fails" {
-    var bad = [_]u8{0} ** 100;
+    var bad = @as([100]u8, @splat(0));
     try std.testing.expectError(error.BadLength, ecPairingCheck(std.testing.allocator, &bad));
-    var bad2 = [_]u8{0} ** 191;
+    var bad2 = @as([191]u8, @splat(0));
     try std.testing.expectError(error.BadLength, ecPairingCheck(std.testing.allocator, &bad2));
 }
 
 test "ecPairing: encodeBool matches the 32-byte ABI shape" {
     const t = encodeBool(true);
-    var expected_true = [_]u8{0} ** 32;
+    var expected_true = @as([32]u8, @splat(0));
     expected_true[31] = 1;
     try std.testing.expectEqualSlices(u8, &expected_true, &t);
 
@@ -321,7 +321,7 @@ test "ecPairingCheck: on-twist-but-not-in-subgroup G2 operand is rejected (subgr
     // subgroup — see g2.zig's "G2 subgroupCheck: an on-twist point
     // OUTSIDE the subgroup fails" test for the independent Python
     // verification of this exact point.
-    var c1_bytes = [_]u8{0} ** 32;
+    var c1_bytes = @as([32]u8, @splat(0));
     c1_bytes[31] = 1;
     var y_c0_bytes: [32]u8 = undefined;
     _ = try std.fmt.hexToBytes(&y_c0_bytes, "0cf32d3c49a2cb8a092f24ec3201e68dc299b6216e6321ee60573e3a7f596ea8");
@@ -563,10 +563,10 @@ const ecadd_seeds = blk: {
     out[add_vectors.len + 0] = testkit.fuzz.seedHex(nibbled(add_vectors[0].input, 20));
     // A coordinate at 2^256-1, far above the field modulus p
     // -> error.InvalidFieldElement.
-    out[add_vectors.len + 1] = testkit.fuzz.seedHex("ff" ** 128);
+    out[add_vectors.len + 1] = testkit.fuzz.seedHex(strRepeat("ff", 128));
     // 65 octets: past the first point, mid-way through the second, so the
     // right-pad rule has to finish the frame.
-    out[add_vectors.len + 2] = testkit.fuzz.seedHex("11" ** 65);
+    out[add_vectors.len + 2] = testkit.fuzz.seedHex(strRepeat("11", 65));
     break :blk out;
 };
 
@@ -611,7 +611,7 @@ const ecmul_seeds = blk: {
     // `chfast1` with one nibble of p.x changed -> error.NotOnCurve.
     out[mul_vectors.len + 0] = testkit.fuzz.seedHex(nibbled(mul_vectors[0].input, 20));
     // A coordinate above the field modulus -> error.InvalidFieldElement.
-    out[mul_vectors.len + 1] = testkit.fuzz.seedHex("ff" ** 96);
+    out[mul_vectors.len + 1] = testkit.fuzz.seedHex(strRepeat("ff", 96));
     // Only the point, no scalar: the right-pad rule supplies s = 0, so the
     // result is the point at infinity — accepted, and it must NOT count
     // towards `points`.
@@ -663,7 +663,7 @@ const ecpairing_seeds = blk: {
     // 191 octets: not a multiple of 192 -> error.BadLength.
     out[pairing_vectors.len + 1] = testkit.fuzz.seedHex(pairing_vectors[0].input[0 .. 191 * 2]);
     // One pair of coordinates all above the field modulus.
-    out[pairing_vectors.len + 2] = testkit.fuzz.seedHex("ff" ** 192);
+    out[pairing_vectors.len + 2] = testkit.fuzz.seedHex(strRepeat("ff", 192));
     break :blk out;
 };
 
@@ -705,4 +705,16 @@ test "corpus: the ecPairing seeds reach the decoder, and the counts are pinned" 
     try std.testing.expectEqual(ecpairing_seeds.len - 1, nonempty);
     try std.testing.expectEqual(@as(usize, 14), accepted);
     try std.testing.expectEqual(@as(usize, 2), falses);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

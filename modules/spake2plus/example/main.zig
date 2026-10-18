@@ -286,7 +286,7 @@ pub fn main() !void {
     // allocation (`computeTranscript` is never reached) — a different
     // named error from the confirmation-MAC failures above.
     const share_p5 = try spake.proverStart(&scalars4.w0, &w0);
-    const share_v_bad = [_]u8{0xff} ** 65;
+    const share_v_bad = @as([65]u8, @splat(0xff));
     var result5: spake.ProverFinishResult = undefined;
     if (spake.proverFinish(
         &result5,
@@ -299,7 +299,7 @@ pub fn main() !void {
         &scalars4.w0,
         share_p5,
         share_v_bad,
-        [_]u8{0} ** 32,
+        @as([32]u8, @splat(0)),
     )) {
         return error.UnexpectedAccept;
     } else |err| switch (err) {

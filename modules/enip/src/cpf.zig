@@ -133,7 +133,7 @@ pub fn decode(bytes: []const u8, storage: []Item) DecodeError!ItemList {
     var i: usize = 0;
     while (i < count) : (i += 1) {
         if (off + 4 > bytes.len) return error.Truncated;
-        const type_id: ItemType = @enumFromInt(std.mem.readInt(u16, bytes[off..][0..2], .little));
+        const type_id: ItemType = @fromBackingInt(@intCast(std.mem.readInt(u16, bytes[off..][0..2], .little)));
         const len: usize = std.mem.readInt(u16, bytes[off + 2 ..][0..2], .little);
         off += 4;
         if (off + len > bytes.len) return error.ItemOverruns;
@@ -157,7 +157,7 @@ pub fn encode(items: []const Item, out: []u8) EncodeError![]u8 {
     std.mem.writeInt(u16, out[0..2], @intCast(items.len), .little);
     var off: usize = 2;
     for (items) |it| {
-        std.mem.writeInt(u16, out[off..][0..2], @intFromEnum(it.type_id), .little);
+        std.mem.writeInt(u16, out[off..][0..2], @backingInt(it.type_id), .little);
         std.mem.writeInt(u16, out[off + 2 ..][0..2], @intCast(it.data.len), .little);
         off += 4;
         @memcpy(out[off..][0..it.data.len], it.data);
@@ -361,7 +361,7 @@ test "an item length that overruns the buffer is refused" {
 }
 
 test "an item count that overruns the storage is refused, not truncated" {
-    const wire = [_]u8{ 0x08, 0x00 } ++ [_]u8{ 0x00, 0x00, 0x00, 0x00 } ** 8;
+    const wire = [_]u8{ 0x08, 0x00 } ++ arrRepeat(u8, &.{ 0x00, 0x00, 0x00, 0x00 }, 8);
     var storage: [2]Item = undefined;
     try testing.expectError(error.ItemOverruns, decode(&wire, &storage));
     var big: [8]Item = undefined;
@@ -609,4 +609,12 @@ test "fuzz driver: ENIP_FUZZ (fuzzEnvelope)" {
 
 test "fuzz harness: fuzzEnvelope, 400 seeds, reaches every outcome" {
     try fuzzEnvelopeMark.reach(fuzzEnvelope, "enip-cpf-envelope", 400);
+}
+
+/// Comptime array repetition; replaces the `**` operator removed in Zig 0.17.
+fn arrRepeat(comptime T: type, comptime unit: []const T, comptime n: usize) [unit.len * n]T {
+    @setEvalBranchQuota(n * unit.len * 2 + 1000);
+    var buf: [unit.len * n]T = undefined;
+    for (0..n) |i| @memcpy(buf[i * unit.len ..][0..unit.len], unit);
+    return buf;
 }

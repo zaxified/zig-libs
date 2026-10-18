@@ -42,7 +42,7 @@ fn fill(out: []u8, label: []const u8) void {
 }
 
 fn setup() !void {
-    prng = std.Random.DefaultCsprng.init([_]u8{0x42} ** 32);
+    prng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x42)));
     const opts = security.ClientCredentials.GenerateSelfSignedOptions{
         .modulus_bits = 512,
         .common_name = "opcua-probe-client",

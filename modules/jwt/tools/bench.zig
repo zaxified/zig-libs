@@ -121,7 +121,7 @@ pub fn main(init: std.process.Init) !u8 {
     try jwt.rsa.SecretKey.fromPrimes(&rsa_kp.secret_key, try b64Alloc(arena, rsa_p), try b64Alloc(arena, rsa_q), &.{ 1, 0, 1 });
     rsa_kp.public_key = try jwt.rsa.PublicKey.fromBytes(n, &.{ 1, 0, 1 });
     // PS256's salt and blinding: a fixed-seed CSPRNG (a bench, not a key).
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x5a} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x5a)));
     try dir.writeFile(io, .{ .sub_path = "hs256.key", .data = &hmac_key });
     try dir.writeFile(io, .{ .sub_path = "es256.key", .data = &ec_kp.secret_key.toBytes() });
     try dir.writeFile(io, .{ .sub_path = "es384.key", .data = &ec384_kp.secret_key.toBytes() });

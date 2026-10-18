@@ -200,7 +200,7 @@ pub fn encodePlaintext(hdr: PlaintextHeader, out: []u8) RecordError![]u8 {
 
 pub fn decodePlaintext(buf: []const u8) RecordError!PlaintextHeader {
     if (buf.len < plaintext_header_len) return error.BufferTooShort;
-    var seq_bytes: [8]u8 = .{0} ** 8;
+    var seq_bytes: [8]u8 = @splat(0);
     @memcpy(seq_bytes[2..8], buf[5..11]);
     return .{
         .content_type = buf[0],

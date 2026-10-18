@@ -1143,8 +1143,8 @@ pub fn verifyBatch(gens: Generators, io: std.Io, entries: []const BatchEntry) Ve
 test "commit: matches direct scalar-mult + add" {
     const gens = try Generators.init(std.testing.allocator, 8);
     defer gens.deinit(std.testing.allocator);
-    const v = [_]u8{5} ++ [_]u8{0} ** 31;
-    const gamma = [_]u8{9} ++ [_]u8{0} ** 31;
+    const v = [_]u8{5} ++ @as([31]u8, @splat(0));
+    const gamma = [_]u8{9} ++ @as([31]u8, @splat(0));
     const got = commit(gens, v, gamma);
     const want = (try gens.g.mul(v)).add(try gens.h.mul(gamma));
     try std.testing.expect(got.equivalent(want));
@@ -1153,8 +1153,8 @@ test "commit: matches direct scalar-mult + add" {
 test "commit: v=0 reduces to gamma*H; gamma=0 reduces to v*G; both zero is identity" {
     const gens = try Generators.init(std.testing.allocator, 8);
     defer gens.deinit(std.testing.allocator);
-    const gamma = [_]u8{9} ++ [_]u8{0} ** 31;
-    const v = [_]u8{5} ++ [_]u8{0} ** 31;
+    const gamma = [_]u8{9} ++ @as([31]u8, @splat(0));
+    const v = [_]u8{5} ++ @as([31]u8, @splat(0));
 
     const c1 = commit(gens, scalarvec.zero, gamma);
     try std.testing.expect(c1.equivalent(try gens.h.mul(gamma)));
@@ -1169,16 +1169,16 @@ test "commit: v=0 reduces to gamma*H; gamma=0 reduces to v*G; both zero is ident
 test "commit: distinct (v, gamma) pairs give distinct commitments" {
     const gens = try Generators.init(std.testing.allocator, 8);
     defer gens.deinit(std.testing.allocator);
-    const c1 = commit(gens, [_]u8{1} ++ [_]u8{0} ** 31, [_]u8{2} ++ [_]u8{0} ** 31);
-    const c2 = commit(gens, [_]u8{1} ++ [_]u8{0} ** 31, [_]u8{3} ++ [_]u8{0} ** 31);
+    const c1 = commit(gens, [_]u8{1} ++ @as([31]u8, @splat(0)), [_]u8{2} ++ @as([31]u8, @splat(0)));
+    const c2 = commit(gens, [_]u8{1} ++ @as([31]u8, @splat(0)), [_]u8{3} ++ @as([31]u8, @splat(0)));
     try std.testing.expect(!c1.equivalent(c2));
 }
 
 test "deltaYZ: n=1 matches hand-derived formula for arbitrary y,z" {
     // n=1: sum y^i for i in [0,1) is just y^0 = 1, independent of y.
     // delta = (z - z^2)*1 - z^3*(2^1 - 1) = (z - z^2) - z^3.
-    const y = [_]u8{42} ++ [_]u8{0} ** 31;
-    const z = [_]u8{7} ++ [_]u8{0} ** 31;
+    const y = [_]u8{42} ++ @as([31]u8, @splat(0));
+    const z = [_]u8{7} ++ @as([31]u8, @splat(0));
     const got = try deltaYZ(std.testing.allocator, y, z, 1);
 
     const z2 = scalar.mul(z, z);
@@ -1190,20 +1190,20 @@ test "deltaYZ: n=1 matches hand-derived formula for arbitrary y,z" {
 test "deltaYZ: n=4, y=3, z=5 matches an independently-computed value" {
     // sum_{i=0}^{3} 3^i = 1+3+9+27 = 40. 2^4 - 1 = 15.
     // delta = (5-25)*40 - 125*15 = (-20)*40 - 1875 = -800 - 1875 = -2675.
-    const y = [_]u8{3} ++ [_]u8{0} ** 31;
-    const z = [_]u8{5} ++ [_]u8{0} ** 31;
+    const y = [_]u8{3} ++ @as([31]u8, @splat(0));
+    const z = [_]u8{5} ++ @as([31]u8, @splat(0));
     const got = try deltaYZ(std.testing.allocator, y, z, 4);
 
     // Independently constructed as field_order - 2675 via scalar.neg on
     // the positive magnitude 2675 (0x0A73), little-endian.
-    const magnitude = [_]u8{ 0x73, 0x0A } ++ [_]u8{0} ** 30;
+    const magnitude = [_]u8{ 0x73, 0x0A } ++ @as([30]u8, @splat(0));
     const want = scalar.neg(magnitude);
     try std.testing.expectEqualSlices(u8, &want, &got);
 }
 
 test "deltaYZ: n=0 gives -z^3 (empty sum_y term)" {
-    const y = [_]u8{9} ++ [_]u8{0} ** 31;
-    const z = [_]u8{4} ++ [_]u8{0} ** 31;
+    const y = [_]u8{9} ++ @as([31]u8, @splat(0));
+    const z = [_]u8{4} ++ @as([31]u8, @splat(0));
     const got = try deltaYZ(std.testing.allocator, y, z, 0);
     // sum_y = 0 (empty), 2^0 - 1 = 0, so delta = 0 - 0 = 0.
     try std.testing.expectEqualSlices(u8, &scalarvec.zero, &got);
@@ -1221,7 +1221,7 @@ fn fakeIpaProof(allocator: std.mem.Allocator, rounds: usize) !InnerProductProof 
         r.* = g;
         g = g.dbl();
     }
-    return .{ .l_vec = l_vec, .r_vec = r_vec, .a = [_]u8{3} ++ [_]u8{0} ** 31, .b = [_]u8{4} ++ [_]u8{0} ** 31 };
+    return .{ .l_vec = l_vec, .r_vec = r_vec, .a = [_]u8{3} ++ @as([31]u8, @splat(0)), .b = [_]u8{4} ++ @as([31]u8, @splat(0)) };
 }
 
 test "RangeProof: byte round-trip" {
@@ -1234,9 +1234,9 @@ test "RangeProof: byte round-trip" {
         .s = gens.h,
         .t1 = gens.g_vec[0],
         .t2 = gens.h_vec[0],
-        .tau_x = [_]u8{1} ++ [_]u8{0} ** 31,
-        .mu = [_]u8{2} ++ [_]u8{0} ** 31,
-        .t_hat = [_]u8{3} ++ [_]u8{0} ** 31,
+        .tau_x = [_]u8{1} ++ @as([31]u8, @splat(0)),
+        .mu = [_]u8{2} ++ @as([31]u8, @splat(0)),
+        .t_hat = [_]u8{3} ++ @as([31]u8, @splat(0)),
         .ipa = ipa_proof,
     };
     defer proof.deinit(std.testing.allocator);
@@ -1348,7 +1348,7 @@ test "prove: n=64 construction-time guard is skipped, and the boundary values it
     // `prove`-calling tests above.)
     const gens = try Generators.init(std.testing.allocator, 64);
     defer gens.deinit(std.testing.allocator);
-    const gamma = [_]u8{7} ++ [_]u8{0} ** 31;
+    const gamma = [_]u8{7} ++ @as([31]u8, @splat(0));
 
     // The guard's own boundary values: 0, 1, and the maximum representable
     // u64 (2^64 - 1) -- exactly the shift-amount edge case the removed
@@ -1379,26 +1379,26 @@ const rp_fuzz_buf_len = 1024;
 
 /// The Ristretto255 identity - accepted by `fromBytes`, so a hand-written
 /// seed can be a decodable proof without a real transcript behind it.
-const rp_identity_hex = "00" ** 32;
-const rp_bad_point_hex = "ff" ** 32;
+const rp_identity_hex = strRepeat("00", 32);
+const rp_bad_point_hex = strRepeat("ff", 32);
 /// `a, s, t1, t2` (four points) then `t_hat, tau_x, mu` (three raw scalars).
-const rp_fixed_hex = rp_identity_hex ** 4 ++ "01" ** 32 ++ "02" ** 32 ++ "03" ** 32;
+const rp_fixed_hex = strRepeat(rp_identity_hex, 4) ++ strRepeat("01", 32) ++ strRepeat("02", 32) ++ strRepeat("03", 32);
 
 // Rewritten 2026-09-30 for dalek's layout: the nested IPA has no rounds
 // field any more, its round count is implied by the remaining length.
 const rp_seeds = [_][]const u8{
     fuzzseed.seedHex(""), // the empty slice: exactly what the collapsed draw ran, for ever
-    fuzzseed.seedHex("00" ** 223), // one octet short of the 224-octet fixed part
-    fuzzseed.seedHex("00" ** 224), // the fixed part alone: the IPA tail is empty, so the nested decode refuses
-    fuzzseed.seedHex(rp_fixed_hex ++ "00" ** 64), // a complete, ACCEPTED proof with a rounds = 0 IPA
-    fuzzseed.seedHex(rp_fixed_hex ++ rp_identity_hex ** 2 ++ "00" ** 64), // accepted, one IPA round
-    fuzzseed.seedHex(rp_fixed_hex ++ rp_identity_hex ** 12 ++ "44" ** 64), // six rounds - the IPA width an n = 64 range proof produces
-    fuzzseed.seedHex(rp_bad_point_hex ++ rp_identity_hex ** 3 ++ "00" ** 96 ++ "00" ** 64), // `a` is not a valid point: refused on the FIRST of the four
-    fuzzseed.seedHex(rp_identity_hex ** 3 ++ rp_bad_point_hex ++ "00" ** 96 ++ "00" ** 64), // `t2` is not a valid point: refused on the LAST of the four
-    fuzzseed.seedHex(rp_fixed_hex ++ rp_bad_point_hex ++ rp_identity_hex ++ "00" ** 64), // the fixed part decodes and the nested IPA then fails
-    fuzzseed.seedHex(rp_fixed_hex ++ "00" ** 63), // the IPA tail one octet short
-    fuzzseed.seedHex(rp_fixed_hex ++ rp_identity_hex ** 3 ++ "00" ** 64), // an odd element count behind a valid fixed part: an L without its R
-    fuzzseed.seedHex("ff" ** 224), // every one of the four points invalid
+    fuzzseed.seedHex(strRepeat("00", 223)), // one octet short of the 224-octet fixed part
+    fuzzseed.seedHex(strRepeat("00", 224)), // the fixed part alone: the IPA tail is empty, so the nested decode refuses
+    fuzzseed.seedHex(rp_fixed_hex ++ strRepeat("00", 64)), // a complete, ACCEPTED proof with a rounds = 0 IPA
+    fuzzseed.seedHex(rp_fixed_hex ++ strRepeat(rp_identity_hex, 2) ++ strRepeat("00", 64)), // accepted, one IPA round
+    fuzzseed.seedHex(rp_fixed_hex ++ strRepeat(rp_identity_hex, 12) ++ strRepeat("44", 64)), // six rounds - the IPA width an n = 64 range proof produces
+    fuzzseed.seedHex(rp_bad_point_hex ++ strRepeat(rp_identity_hex, 3) ++ strRepeat("00", 96) ++ strRepeat("00", 64)), // `a` is not a valid point: refused on the FIRST of the four
+    fuzzseed.seedHex(strRepeat(rp_identity_hex, 3) ++ rp_bad_point_hex ++ strRepeat("00", 96) ++ strRepeat("00", 64)), // `t2` is not a valid point: refused on the LAST of the four
+    fuzzseed.seedHex(rp_fixed_hex ++ rp_bad_point_hex ++ rp_identity_hex ++ strRepeat("00", 64)), // the fixed part decodes and the nested IPA then fails
+    fuzzseed.seedHex(rp_fixed_hex ++ strRepeat("00", 63)), // the IPA tail one octet short
+    fuzzseed.seedHex(rp_fixed_hex ++ strRepeat(rp_identity_hex, 3) ++ strRepeat("00", 64)), // an odd element count behind a valid fixed part: an L without its R
+    fuzzseed.seedHex(strRepeat("ff", 224)), // every one of the four points invalid
 };
 
 fn fuzzFromBytesAlloc(_: void, smith: *std.testing.Smith) !void {
@@ -1447,4 +1447,16 @@ test "corpus: every range-proof seed reaches the decoder, and the nested IPA rou
     // rounds).
     try std.testing.expectEqual(@as(usize, 2), accepted);
     try std.testing.expectEqual(@as(usize, 1), ipa_rounds);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

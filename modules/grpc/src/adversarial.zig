@@ -267,7 +267,7 @@ const DeframeCorpus = struct {
         // A zero-length message: a legal frame that carries nothing.
         self.pushHex("00" ++ "00000000", 64);
         // 200 octets, so the payload spans several 64-octet pushes.
-        self.pushHex("00" ++ "000000C8" ++ ("AA" ** 200), 64);
+        self.pushHex("00" ++ "000000C8" ++ (strRepeat("AA", 200)), 64);
         // Truncated: a header with no body, and a body one octet short.
         self.pushHex("00" ++ "000000", 64);
         self.pushHex("00" ++ "00000005" ++ "68656c", 64);
@@ -279,7 +279,7 @@ const DeframeCorpus = struct {
         self.pushHex("00" ++ "00000005" ++ "68656c6c6f" ++ "00" ++ "000000", 64);
         // 512 zero octets: an accidental stream of empty messages, five octets
         // each, with two left over that `endOfStream` refuses.
-        self.pushHex("00" ** 512, 64);
+        self.pushHex(strRepeat("00", 512), 64);
         return self.entries[0..self.n];
     }
 };
@@ -462,4 +462,16 @@ test "corpus: every field seed reaches the parsers, and what they resolved is pi
     try testing.expectEqual(@as(usize, 2), timeouts);
     try testing.expectEqual(@as(usize, 6), bin_values);
     try testing.expectEqual(@as(usize, 92), decoded_bytes);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

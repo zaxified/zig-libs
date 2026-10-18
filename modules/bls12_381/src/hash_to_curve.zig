@@ -181,7 +181,7 @@ pub fn expandMessageXmdParts(comptime len_in_bytes: usize, parts: []const []cons
     dst_prime_buf[dst.len] = @intCast(dst.len);
     const dst_prime = dst_prime_buf[0 .. dst.len + 1];
 
-    const z_pad = [_]u8{0} ** s_in_bytes;
+    const z_pad = @as([s_in_bytes]u8, @splat(0));
     var l_i_b_str: [2]u8 = undefined;
     std.mem.writeInt(u16, &l_i_b_str, len_in_bytes, .big);
 
@@ -858,8 +858,8 @@ test "expandMessageXmd: RFC 9380 Appendix K.1, len_in_bytes=0x20 (ell=1), all 5 
         .{ .msg = "", .uniform_hex = "68a985b87eb6b46952128911f2a4412bbc302a9d759667f87f7a21d803f07235" },
         .{ .msg = "abc", .uniform_hex = "d8ccab23b5985ccea865c6c97b6e5b8350e794e603b4b97902f53a8a0d605615" },
         .{ .msg = "abcdef0123456789", .uniform_hex = "eff31487c770a893cfb36f912fbfcbff40d5661771ca4b2cb4eafe524333f5c1" },
-        .{ .msg = "q128_" ++ "q" ** 128, .uniform_hex = "b23a1d2b4d97b2ef7785562a7e8bac7eed54ed6e97e29aa51bfe3f12ddad1ff9" },
-        .{ .msg = "a512_" ++ "a" ** 512, .uniform_hex = "4623227bcc01293b8c130bf771da8c298dede7383243dc0993d2d94823958c4c" },
+        .{ .msg = "q128_" ++ strRepeat("q", 128), .uniform_hex = "b23a1d2b4d97b2ef7785562a7e8bac7eed54ed6e97e29aa51bfe3f12ddad1ff9" },
+        .{ .msg = "a512_" ++ strRepeat("a", 512), .uniform_hex = "4623227bcc01293b8c130bf771da8c298dede7383243dc0993d2d94823958c4c" },
     };
     for (vectors) |vec| {
         const expected = hexN(32, vec.uniform_hex);
@@ -884,11 +884,11 @@ test "expandMessageXmd: RFC 9380 Appendix K.1, len_in_bytes=0x80 (ell=4), all 5 
             .uniform_hex = "ef904a29bffc4cf9ee82832451c946ac3c8f8058ae97d8d629831a74c6572bd9ebd0df635cd1f208e2038e760c4994984ce73f0d55ea9f22af83ba4734569d4bc95e18350f740c07eef653cbb9f87910d833751825f0ebefa1abe5420bb52be14cf489b37fe1a72f7de2d10be453b2c9d9eb20c7e3f6edc5a60629178d9478df",
         },
         .{
-            .msg = "q128_" ++ "q" ** 128,
+            .msg = "q128_" ++ strRepeat("q", 128),
             .uniform_hex = "80be107d0884f0d881bb460322f0443d38bd222db8bd0b0a5312a6fedb49c1bbd88fd75d8b9a09486c60123dfa1d73c1cc3169761b17476d3c6b7cbbd727acd0e2c942f4dd96ae3da5de368d26b32286e32de7e5a8cb2949f866a0b80c58116b29fa7fabb3ea7d520ee603e0c25bcaf0b9a5e92ec6a1fe4e0391d1cdbce8c68a",
         },
         .{
-            .msg = "a512_" ++ "a" ** 512,
+            .msg = "a512_" ++ strRepeat("a", 512),
             .uniform_hex = "546aff5444b5b79aa6148bd81728704c32decb73a3ba76e9e75885cad9def1d06d6792f8a7d12794e90efed817d96920d728896a4510864370c207f99bd4a608ea121700ef01ed879745ee3e4ceef777eda6d9e5e38b90c86ea6fb0b36504ba4a45d22e86f6db5dd43d98a294bebb9125d5b794e9d2a81181066eb954966a487",
         },
     };
@@ -925,12 +925,12 @@ const g1_j91_vectors = [_]G1HashToFieldVec{
         .u1 = "0cdc3e2f271f29c4ff75020857ce6c5d36008c9b48385ea2f2bf6f96f428a3deb798aa033cd482d1cdc8b30178b08e3a",
     },
     .{
-        .msg = "q128_" ++ "q" ** 128,
+        .msg = "q128_" ++ strRepeat("q", 128),
         .u0 = "010476f6a060453c0b1ad0b628f3e57c23039ee16eea5e71bb87c3b5419b1255dc0e5883322e563b84a29543823c0e86",
         .u1 = "0b1a912064fb0554b180e07af7e787f1f883a0470759c03c1b6509eb8ce980d1670305ae7b928226bb58fdc0a419f46e",
     },
     .{
-        .msg = "a512_" ++ "a" ** 512,
+        .msg = "a512_" ++ strRepeat("a", 512),
         .u0 = "0a8ffa7447f6be1c5a2ea4b959c9454b431e29ccc0802bc052413a9c5b4f9aac67a93431bd480d15be1e057c8a08e8c6",
         .u1 = "05d487032f602c90fa7625dbafe0f4a49ef4a6b0b33d7bb349ff4cf5410d297fd6241876e3e77b651cfc8191e40a68b7",
     },
@@ -976,14 +976,14 @@ const g2_j101_vectors = [_]G2HashToFieldVec{
         .u1_c1 = "01897665d9cb5db16a27657760bbea7951f67ad68f8d55f7113f24ba6ddd82caef240a9bfa627972279974894701d975",
     },
     .{
-        .msg = "q128_" ++ "q" ** 128,
+        .msg = "q128_" ++ strRepeat("q", 128),
         .u0_c0 = "025820cefc7d06fd38de7d8e370e0da8a52498be9b53cba9927b2ef5c6de1e12e12f188bbc7bc923864883c57e49e253",
         .u0_c1 = "034147b77ce337a52e5948f66db0bab47a8d038e712123bb381899b6ab5ad20f02805601e6104c29df18c254b8618c7b",
         .u1_c0 = "0930315cae1f9a6017c3f0c8f2314baa130e1cf13f6532bff0a8a1790cd70af918088c3db94bda214e896e1543629795",
         .u1_c1 = "10c4df2cacf67ea3cb3108b00d4cbd0b3968031ebc8eac4b1ebcefe84d6b715fde66bef0219951ece29d1facc8a520ef",
     },
     .{
-        .msg = "a512_" ++ "a" ** 512,
+        .msg = "a512_" ++ strRepeat("a", 512),
         .u0_c0 = "190b513da3e66fc9a3587b78c76d1d132b1152174d0b83e3c1114066392579a45824c5fa17649ab89299ddd4bda54935",
         .u0_c1 = "12ab625b0fe0ebd1367fe9fac57bb1168891846039b4216b9d94007b674de2d79126870e88aeef54b2ec717a887dcf39",
         .u1_c0 = "0e6a42010cf435fb5bacc156a585e1ea3294cc81d0ceb81924d95040298380b164f702275892cedd81b62de3aba3f6b5",
@@ -1171,12 +1171,12 @@ const g1_j91_curve_vectors = [_]G1CurveVec{
         .py = "03a87ae2caf14e8ee52e51fa2ed8eefe80f02457004ba4d486d6aa1f517c0889501dc7413753f9599b099ebcbbd2d709",
     },
     .{
-        .msg = "q128_" ++ "q" ** 128,
+        .msg = "q128_" ++ strRepeat("q", 128),
         .px = "15f68eaa693b95ccb85215dc65fa81038d69629f70aeee0d0f677cf22285e7bf58d7cb86eefe8f2e9bc3f8cb84fac488",
         .py = "1807a1d50c29f430b8cafc4f8638dfeeadf51211e1602a5f184443076715f91bb90a48ba1e370edce6ae1062f5e6dd38",
     },
     .{
-        .msg = "a512_" ++ "a" ** 512,
+        .msg = "a512_" ++ strRepeat("a", 512),
         .px = "082aabae8b7dedb0e78aeb619ad3bfd9277a2f77ba7fad20ef6aabdc6c31d19ba5a6d12283553294c1825c4b3ca2dcfe",
         .py = "05b84ae5a942248eea39e1d91030458c40153f3b654ab7872d779ad1e942856a20c438e8d99bc8abfbf74729ce1f7ac8",
     },
@@ -1217,14 +1217,14 @@ const g2_j101_curve_vectors = [_]G2CurveVec{
         .py_c1 = "0bb5e7572275c567462d91807de765611490205a941a5a6af3b1691bfe596c31225d3aabdf15faff860cb4ef17c7c3be",
     },
     .{
-        .msg = "q128_" ++ "q" ** 128,
+        .msg = "q128_" ++ strRepeat("q", 128),
         .px_c0 = "19a84dd7248a1066f737cc34502ee5555bd3c19f2ecdb3c7d9e24dc65d4e25e50d83f0f77105e955d78f4762d33c17da",
         .px_c1 = "0934aba516a52d8ae479939a91998299c76d39cc0c035cd18813bec433f587e2d7a4fef038260eef0cef4d02aae3eb91",
         .py_c0 = "14f81cd421617428bc3b9fe25afbb751d934a00493524bc4e065635b0555084dd54679df1536101b2c979c0152d09192",
         .py_c1 = "09bcccfa036b4847c9950780733633f13619994394c23ff0b32fa6b795844f4a0673e20282d07bc69641cee04f5e5662",
     },
     .{
-        .msg = "a512_" ++ "a" ** 512,
+        .msg = "a512_" ++ strRepeat("a", 512),
         .px_c0 = "01a6ba2f9a11fa5598b2d8ace0fbe0a0eacb65deceb476fbbcb64fd24557c2f4b18ecfc5663e54ae16a84f5ab7f62534",
         .px_c1 = "11fca2ff525572795a801eed17eb12785887c7b63fb77a42be46ce4a34131d71f7a73e95fee3f812aea3de78b4d01569",
         .py_c0 = "0b6798718c8aed24bc19cb27f866f1c9effcdbf92397ad6448b5c9db90d2b9da6cbabf48adc1adf59a1a28344e79d57e",
@@ -1394,4 +1394,16 @@ test "expandMessageXof(SHAKE-256) matches RFC 9380 Appendix K.6" {
         // Parts = the concatenation.
         try std.testing.expectEqualSlices(u8, &want_l, &expandMessageXofParts(0x80, &.{ c.msg[0..1], c.msg[1..] }, dst));
     }
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

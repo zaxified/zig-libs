@@ -289,7 +289,7 @@ fn wordIndex(w: []const u8) ?u11 {
     // at `max_word_len` cannot misclassify a too-long `w` as a match: any
     // real wordlist entry has `word.len <= max_word_len`, so `cond` below
     // is false for a truncated `w` on the `word.len == w.len` term alone.
-    var wbuf = [_]u8{0} ** max_word_len;
+    var wbuf = @as([max_word_len]u8, @splat(0));
     const copy_len = @min(w.len, max_word_len);
     @memcpy(wbuf[0..copy_len], w[0..copy_len]);
 
@@ -336,8 +336,8 @@ test "wordIndex round-trips every wordlist entry" {
 
 test "entropyToMnemonic rejects a bad entropy length" {
     var out: [max_mnemonic_len]u8 = undefined;
-    try testing.expectError(error.InvalidEntropyLength, entropyToMnemonic(&[_]u8{0} ** 15, &out));
-    try testing.expectError(error.InvalidEntropyLength, entropyToMnemonic(&[_]u8{0} ** 33, &out));
+    try testing.expectError(error.InvalidEntropyLength, entropyToMnemonic(&@as([15]u8, @splat(0)), &out));
+    try testing.expectError(error.InvalidEntropyLength, entropyToMnemonic(&@as([33]u8, @splat(0)), &out));
 }
 
 test "entropyToMnemonic / mnemonicToEntropy round-trip at every valid length" {
@@ -359,7 +359,7 @@ test "entropyToMnemonic / mnemonicToEntropy round-trip at every valid length" {
 }
 
 test "mnemonicToEntropy rejects a tampered checksum word (positive control)" {
-    var entropy = [_]u8{0} ** 16;
+    var entropy = @as([16]u8, @splat(0));
     var mnemonic_buf: [max_mnemonic_len]u8 = undefined;
     const mnemonic = try entropyToMnemonic(&entropy, &mnemonic_buf);
     _ = &entropy;
@@ -469,7 +469,7 @@ test "mnemonicToEntropy/entropyToMnemonic reject interior invalid counts and len
     var out: [max_mnemonic_len]u8 = undefined;
     const bad_ent_lens = [_]usize{ 17, 18, 19, 21, 23, 25, 27, 29, 31 };
     for (bad_ent_lens) |elen| {
-        const ent_buf: [max_entropy_bytes]u8 = [_]u8{0} ** max_entropy_bytes;
+        const ent_buf: [max_entropy_bytes]u8 = @as([max_entropy_bytes]u8, @splat(0));
         try testing.expectError(error.InvalidEntropyLength, entropyToMnemonic(ent_buf[0..elen], &out));
     }
 }
@@ -486,6 +486,6 @@ test "mnemonicToSeed matches a hand-computed PBKDF2-HMAC-SHA512 call" {
 
 test "mnemonicToSeed rejects an over-long passphrase" {
     var got: [64]u8 = undefined;
-    const too_long = [_]u8{'x'} ** (max_passphrase_len + 1);
+    const too_long = @as([max_passphrase_len + 1]u8, @splat('x'));
     try testing.expectError(error.PassphraseTooLong, mnemonicToSeed("abandon", &too_long, &got));
 }

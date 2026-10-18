@@ -110,7 +110,7 @@ pub const SaltSource = struct {
     mode: Mode,
     /// The IV produced by the previous encryption through this source (8 bytes
     /// for DES-CBC, 16 for AES-CFB); `last_iv_len == 0` means "none yet".
-    last_iv: [16]u8 = [_]u8{0} ** 16,
+    last_iv: [16]u8 = @as([16]u8, @splat(0)),
     last_iv_len: u8 = 0,
     /// DES-CBC only: the `snmpEngineBoots` epoch the low 32 counter bits are
     /// being consumed under, and how many salts have gone out inside it.
@@ -425,12 +425,12 @@ test "keyLen / saltLen" {
 test "encrypt rejects short key; decrypt rejects a wrong-length wire salt" {
     var out: [64]u8 = undefined;
     var src = SaltSource.counter(1);
-    const short_key = [_]u8{0} ** 8;
+    const short_key = @as([8]u8, @splat(0));
     try testing.expectError(error.KeyTooShort, encrypt(.aes128_cfb, &short_key, 0, 0, &src, "hello", &out));
-    const key16 = [_]u8{0} ** 16;
+    const key16 = @as([16]u8, @splat(0));
     // `decrypt` still takes the salt off the wire, so it must range-check it.
-    try testing.expectError(error.BadSalt, decrypt(.des_cbc, &key16, 0, 0, &[_]u8{0} ** 7, &[_]u8{0} ** 8, &out));
-    try testing.expectError(error.BadSalt, decrypt(.aes128_cfb, &key16, 0, 0, &[_]u8{0} ** 9, &[_]u8{0} ** 8, &out));
+    try testing.expectError(error.BadSalt, decrypt(.des_cbc, &key16, 0, 0, &@as([7]u8, @splat(0)), &@as([8]u8, @splat(0)), &out));
+    try testing.expectError(error.BadSalt, decrypt(.aes128_cfb, &key16, 0, 0, &@as([9]u8, @splat(0)), &@as([8]u8, @splat(0)), &out));
 }
 
 test "successive encryptions under one key use different salts and different IVs" {
@@ -438,7 +438,7 @@ test "successive encryptions under one key use different salts and different IVs
     // boots and time must not produce the same ciphertext twice. If the salt
     // repeated, AES-CFB would reuse the keystream outright (C1^C2 == P1^P2) and
     // DES-CBC would reuse the IV.
-    const key = [_]u8{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88 } ** 2;
+    const key = arrRepeat(u8, &.{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88 }, 2);
     const pt = "0123456789abcdef0123456789abcdef";
     inline for (.{ PrivProtocol.aes128_cfb, PrivProtocol.des_cbc }) |proto| {
         var src = SaltSource.counter(0x0102030405060708);
@@ -470,48 +470,48 @@ test "successive encryptions under one key use different salts and different IVs
 }
 
 test "counter salts have the RFC shape (AES: 64-bit BE; DES: boots ‖ counter[31:0])" {
-    const key = [_]u8{0} ** 16;
+    const key = @as([16]u8, @splat(0));
     var out: [32]u8 = undefined;
 
     var aes_src = SaltSource.counter(0x0102030405060708);
-    const a1 = try encrypt(.aes128_cfb, &key, 1, 1, &aes_src, "x" ** 16, &out);
-    const a2 = try encrypt(.aes128_cfb, &key, 1, 1, &aes_src, "x" ** 16, &out);
+    const a1 = try encrypt(.aes128_cfb, &key, 1, 1, &aes_src, strRepeat("x", 16), &out);
+    const a2 = try encrypt(.aes128_cfb, &key, 1, 1, &aes_src, strRepeat("x", 16), &out);
     try testing.expectEqualSlices(u8, &[_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 }, &a1.salt);
     try testing.expectEqualSlices(u8, &[_]u8{ 1, 2, 3, 4, 5, 6, 7, 9 }, &a2.salt);
 
     var des_src = SaltSource.counter(0x0102030405060708);
-    const d1 = try encrypt(.des_cbc, &key, 0xdeadbeef, 1, &des_src, "x" ** 16, &out);
+    const d1 = try encrypt(.des_cbc, &key, 0xdeadbeef, 1, &des_src, strRepeat("x", 16), &out);
     try testing.expectEqualSlices(u8, &[_]u8{ 0xde, 0xad, 0xbe, 0xef }, d1.salt[0..4]);
     try testing.expectEqualSlices(u8, &[_]u8{ 5, 6, 7, 8 }, d1.salt[4..8]);
 }
 
 test "a deliberately repeated salt is rejected (adjacent-IV detector)" {
-    const key = [_]u8{ 0xa5, 0x5a } ** 8;
+    const key = arrRepeat(u8, &.{ 0xa5, 0x5a }, 8);
     var out: [32]u8 = undefined;
     const salt = [8]u8{ 1, 1, 1, 1, 1, 1, 1, 1 };
 
     // AES-CFB: the IV is boots‖time‖salt, so a pinned salt at the SAME
     // boots/time repeats the IV exactly — rejected.
     var aes_src = SaltSource.fixedForInterop(salt);
-    _ = try encrypt(.aes128_cfb, &key, 3, 42, &aes_src, "x" ** 16, &out);
-    try testing.expectError(error.SaltReuse, encrypt(.aes128_cfb, &key, 3, 42, &aes_src, "x" ** 16, &out));
+    _ = try encrypt(.aes128_cfb, &key, 3, 42, &aes_src, strRepeat("x", 16), &out);
+    try testing.expectError(error.SaltReuse, encrypt(.aes128_cfb, &key, 3, 42, &aes_src, strRepeat("x", 16), &out));
     // A different engineTime moves the AES IV even with the salt pinned, so it
     // is accepted — the boots/time prefix really is doing work for AES.
-    _ = try encrypt(.aes128_cfb, &key, 3, 43, &aes_src, "x" ** 16, &out);
+    _ = try encrypt(.aes128_cfb, &key, 3, 43, &aes_src, strRepeat("x", 16), &out);
 
     // DES-CBC has NO boots/time in its IV (iv = pre_iv XOR salt), so the very
     // same time change does not help: the IV repeats and is rejected.
     var des_src = SaltSource.fixedForInterop(salt);
-    _ = try encrypt(.des_cbc, &key, 3, 42, &des_src, "x" ** 16, &out);
-    try testing.expectError(error.SaltReuse, encrypt(.des_cbc, &key, 3, 43, &des_src, "x" ** 16, &out));
-    try testing.expectError(error.SaltReuse, encrypt(.des_cbc, &key, 9, 999, &des_src, "x" ** 16, &out));
+    _ = try encrypt(.des_cbc, &key, 3, 42, &des_src, strRepeat("x", 16), &out);
+    try testing.expectError(error.SaltReuse, encrypt(.des_cbc, &key, 3, 43, &des_src, strRepeat("x", 16), &out));
+    try testing.expectError(error.SaltReuse, encrypt(.des_cbc, &key, 9, 999, &des_src, strRepeat("x", 16), &out));
 }
 
 test "the detector is adjacent-only: an A,B,A salt sequence is NOT caught" {
     // Documenting the limit, not endorsing it: only the immediately preceding
     // IV is remembered, so an older repeat sails through. This is why the
     // counter source — not this check — is what the design rests on.
-    const key = [_]u8{ 0xa5, 0x5a } ** 8;
+    const key = arrRepeat(u8, &.{ 0xa5, 0x5a }, 8);
     const salt_a = [8]u8{ 1, 1, 1, 1, 1, 1, 1, 1 };
     const salt_b = [8]u8{ 2, 2, 2, 2, 2, 2, 2, 2 };
     // Separate buffers: `encrypt` returns a slice INTO `out`, so a shared
@@ -521,13 +521,13 @@ test "the detector is adjacent-only: an A,B,A salt sequence is NOT caught" {
     var out_b: [32]u8 = undefined;
     var out_c: [32]u8 = undefined;
     var src = SaltSource.fixedForInterop(salt_a);
-    const a = try encrypt(.des_cbc, &key, 3, 42, &src, "x" ** 16, &out_a);
+    const a = try encrypt(.des_cbc, &key, 3, 42, &src, strRepeat("x", 16), &out_a);
     src.mode = .{ .fixed_for_interop = salt_b };
-    const b = try encrypt(.des_cbc, &key, 3, 42, &src, "x" ** 16, &out_b);
+    const b = try encrypt(.des_cbc, &key, 3, 42, &src, strRepeat("x", 16), &out_b);
     src.mode = .{ .fixed_for_interop = salt_a };
     // Reaching here at all is the documented behaviour: A,B,A is ACCEPTED.
     // Were the detector ever widened beyond adjacent-only, this `try` fails.
-    const c = try encrypt(.des_cbc, &key, 3, 42, &src, "x" ** 16, &out_c);
+    const c = try encrypt(.des_cbc, &key, 3, 42, &src, strRepeat("x", 16), &out_c);
 
     // Anchor each salt against the pinned literal it was seeded with, rather
     // than against each other — comparing a.salt to c.salt is constant-vs-
@@ -545,23 +545,23 @@ test "the detector is adjacent-only: an A,B,A salt sequence is NOT caught" {
 }
 
 test "a DES counter source refuses to wrap its 32-bit budget under one boots" {
-    const key = [_]u8{0} ** 16;
+    const key = @as([16]u8, @splat(0));
     var out: [32]u8 = undefined;
     var src = SaltSource.counter(0);
-    _ = try encrypt(.des_cbc, &key, 4, 0, &src, "x" ** 16, &out);
+    _ = try encrypt(.des_cbc, &key, 4, 0, &src, strRepeat("x", 16), &out);
     // Fast-forward to one salt short of the RFC 3414 §8.1.1.1 32-bit space.
     src.des_issued = (@as(u64, 1) << 32) - 1;
-    _ = try encrypt(.des_cbc, &key, 4, 0, &src, "x" ** 16, &out);
-    try testing.expectError(error.SaltExhausted, encrypt(.des_cbc, &key, 4, 0, &src, "x" ** 16, &out));
+    _ = try encrypt(.des_cbc, &key, 4, 0, &src, strRepeat("x", 16), &out);
+    try testing.expectError(error.SaltExhausted, encrypt(.des_cbc, &key, 4, 0, &src, strRepeat("x", 16), &out));
     // A new engineBoots epoch has its own 32-bit space (boots is in the salt).
-    _ = try encrypt(.des_cbc, &key, 5, 0, &src, "x" ** 16, &out);
+    _ = try encrypt(.des_cbc, &key, 5, 0, &src, strRepeat("x", 16), &out);
 }
 
 test "DES decrypt rejects non-multiple-of-8 ciphertext" {
-    const key16 = [_]u8{0} ** 16;
+    const key16 = @as([16]u8, @splat(0));
     var out: [64]u8 = undefined;
-    try testing.expectError(error.InvalidLength, decrypt(.des_cbc, &key16, 0, 0, &[_]u8{0} ** 8, &[_]u8{0} ** 7, &out));
-    try testing.expectError(error.InvalidLength, decrypt(.des_cbc, &key16, 0, 0, &[_]u8{0} ** 8, &.{}, &out));
+    try testing.expectError(error.InvalidLength, decrypt(.des_cbc, &key16, 0, 0, &@as([8]u8, @splat(0)), &@as([7]u8, @splat(0)), &out));
+    try testing.expectError(error.InvalidLength, decrypt(.des_cbc, &key16, 0, 0, &@as([8]u8, @splat(0)), &.{}, &out));
 }
 
 /// Round-trip both privacy protocols end-to-end through the public message
@@ -610,7 +610,7 @@ fn expectPrivRoundTrip(proto: PrivProtocol) !void {
         .engine_boots = boots,
         .engine_time = time,
         .user_name = "priv",
-        .auth_params = &(.{0} ** usm.digest_len),
+        .auth_params = &@as([usm.digest_len]u8, @splat(0)),
         .priv_params = &salt,
     });
     var dg_buf: [512]u8 = undefined;
@@ -659,4 +659,24 @@ test "privacy round-trip over a real v3 datagram: DES-CBC" {
 
 test "privacy round-trip over a real v3 datagram: AES-128-CFB" {
     try expectPrivRoundTrip(.aes128_cfb);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
+}
+
+/// Comptime array repetition; replaces the `**` operator removed in Zig 0.17.
+fn arrRepeat(comptime T: type, comptime unit: []const T, comptime n: usize) [unit.len * n]T {
+    @setEvalBranchQuota(n * unit.len * 2 + 1000);
+    var buf: [unit.len * n]T = undefined;
+    for (0..n) |i| @memcpy(buf[i * unit.len ..][0..unit.len], unit);
+    return buf;
 }

@@ -372,7 +372,7 @@ const testing = std.testing;
 
 fn dummyCtx() TxContext {
     return .{
-        .tx = .{ .version = 1, .vin = @constCast(&[_]bitcointx.TxIn{.{ .prevout = .{ .txid = [_]u8{0} ** 32, .vout = 0 }, .script_sig = &.{}, .sequence = 0xffffffff }}), .vout = &.{}, .witness = &.{}, .locktime = 0, .has_witness = false },
+        .tx = .{ .version = 1, .vin = @constCast(&[_]bitcointx.TxIn{.{ .prevout = .{ .txid = @as([32]u8, @splat(0)), .vout = 0 }, .script_sig = &.{}, .sequence = 0xffffffff }}), .vout = &.{}, .witness = &.{}, .locktime = 0, .has_witness = false },
         .input_index = 0,
         .spent_outputs = &[_]bitcointx.TxOut{.{ .value = 1000, .script_pubkey = &.{} }},
     };
@@ -418,7 +418,7 @@ test "P2SH: scriptSig must be push-only when SCRIPT_VERIFY_P2SH is set" {
 test "witness program: scriptSig must be empty" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const script_pubkey = [_]u8{ 0x00, 0x14 } ++ [_]u8{0xaa} ** 20; // P2WPKH program
+    const script_pubkey = [_]u8{ 0x00, 0x14 } ++ @as([20]u8, @splat(0xaa)); // P2WPKH program
     const nonempty_sig = [_]u8{0x51};
     try testing.expectError(error.WitnessMalleated, verifyScript(arena.allocator(), &nonempty_sig, &script_pubkey, &.{ "sig", "pubkey" }, .{ .witness = true }, dummyCtx()));
 }
@@ -426,7 +426,7 @@ test "witness program: scriptSig must be empty" {
 test "taproot script-path: a malformed control block fails closed (wrong control size)" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const script_pubkey = [_]u8{ 0x51, 0x20 } ++ [_]u8{0xbb} ** 32; // P2TR program
+    const script_pubkey = [_]u8{ 0x51, 0x20 } ++ @as([32]u8, @splat(0xbb)); // P2TR program
     // 13-byte control block is not 33 + 32m -> TaprootWrongControlSize.
     const w = [_][]const u8{ "leaf-script", "control-block" };
     try testing.expectError(error.TaprootWrongControlSize, verifyScript(arena.allocator(), &.{}, &script_pubkey, &w, .{ .witness = true, .taproot = true }, dummyCtx()));
@@ -489,9 +489,9 @@ const verify_seeds = [_][]const u8{
     fuzzseed.seedHex("00" ++ "00" ++ "00" ++ "00" ++ "00" ++ "00" ++ "01" ++ "10" ++ "01" ++ "5a"), // ⭐ one witness item, 519 octets: just under the 520 push limit
     fuzzseed.seedHex("00" ++ "00" ++ "00" ++ "00" ++ "00" ++ "00" ++ "01" ++ "10" ++ "02" ++ "5a"), // ⭐ one witness item, 521 octets: just over
     fuzzseed.seedHex("00" ++ "00" ++ "00" ++ "00" ++ "00" ++ "00" ++ "04" ++ "08" ++ "00" ++ "08" ++ "00" ++ "08" ++ "00" ++ "08" ++ "00"), // the full four-item witness stack
-    fuzzseed.seedHex("00" ++ "00" ++ "00" ++ "00" ++ "00" ++ "00" ++ "00" ++ "ff" ** 24), // ⭐ every ScriptFlags boolean set
-    fuzzseed.seedHex("00" ++ "00" ++ "00" ++ "00" ++ "00" ++ "00" ++ "00" ++ "aa" ** 24), // an alternating flag pattern
-    fuzzseed.seedHex("08" ++ "01a9" ++ "0114" ++ "0100" ** 6 ++ "00" ++ "00" ++ "00" ++ "00" ++ "00"), // a P2SH-ish redeem prefix
+    fuzzseed.seedHex("00" ++ "00" ++ "00" ++ "00" ++ "00" ++ "00" ++ "00" ++ strRepeat("ff", 24)), // ⭐ every ScriptFlags boolean set
+    fuzzseed.seedHex("00" ++ "00" ++ "00" ++ "00" ++ "00" ++ "00" ++ "00" ++ strRepeat("aa", 24)), // an alternating flag pattern
+    fuzzseed.seedHex("08" ++ "01a9" ++ "0114" ++ strRepeat("0100", 6) ++ "00" ++ "00" ++ "00" ++ "00" ++ "00"), // a P2SH-ish redeem prefix
 };
 
 const fz = @import("fuzz_test.zig");
@@ -686,4 +686,16 @@ test "corpus: every seed builds a case, and the limits the corpus crosses are pi
     try testing.expectEqual(@as(usize, 8), over_200);
     try testing.expectEqual(@as(usize, 3), over_10k);
     try testing.expectEqual(@as(usize, 1), witness_over_520);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

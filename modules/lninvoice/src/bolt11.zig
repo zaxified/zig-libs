@@ -1345,7 +1345,7 @@ const InvoiceCorpus = struct {
         std.mem.writeInt(u16, script[k..][0..2], @intCast(raw.data.len), .big);
         k += 2;
         for (raw.data) |q| {
-            script[k] = @intFromEnum(@as(enum(u5) { _ }, @enumFromInt(q)));
+            script[k] = @backingInt(@as(enum(u5) { _ }, @fromBackingInt(@intCast(q))));
             k += 1;
         }
         self.push(script[0..k]);
@@ -1358,21 +1358,21 @@ const InvoiceCorpus = struct {
 
         // lnbc, no amount, 111 quintets: the shortest data part that carries a
         // timestamp and a signature, so the tagged-field loop runs.
-        self.pushHex("00" ++ "00" ++ "00" ++ "0000000000" ++ "00" ++ "00" ++ "01" ++ "0000" ++ ("01" ** 32));
+        self.pushHex("00" ++ "00" ++ "00" ++ "0000000000" ++ "00" ++ "00" ++ "01" ++ "0000" ++ (strRepeat("01", 32)));
         // lntb with a `2500u` amount and a long data part.
-        self.pushHex("01" ++ "01" ++ "04" ++ "0205000000" ++ "01" ++ "01" ++ "01" ++ "00C8" ++ ("07" ** 32));
+        self.pushHex("01" ++ "01" ++ "04" ++ "0205000000" ++ "01" ++ "01" ++ "01" ++ "00C8" ++ (strRepeat("07", 32)));
         // lntbs, amount digits but NO multiplier — the bare-satoshi HRP form.
-        self.pushHex("02" ++ "01" ++ "03" ++ "0102030000" ++ "00" ++ "00" ++ "01" ++ "0080" ++ ("1F" ** 32));
+        self.pushHex("02" ++ "01" ++ "03" ++ "0102030000" ++ "00" ++ "00" ++ "01" ++ "0080" ++ (strRepeat("1F", 32)));
         // lnbcrt, the longest HRP this harness can build, with a `p` multiplier.
-        self.pushHex("03" ++ "01" ++ "05" ++ "0908070605" ++ "01" ++ "03" ++ "01" ++ "00C8" ++ ("00" ** 32));
+        self.pushHex("03" ++ "01" ++ "05" ++ "0908070605" ++ "01" ++ "03" ++ "01" ++ "00C8" ++ (strRepeat("00", 32)));
         // A data part of exactly 110 quintets: one short of the timestamp +
         // signature floor, so `InvoiceTooShort` fires.
-        self.pushHex("00" ++ "00" ++ "00" ++ "0000000000" ++ "00" ++ "00" ++ "00" ++ "006E" ++ ("01" ** 32));
+        self.pushHex("00" ++ "00" ++ "00" ++ "0000000000" ++ "00" ++ "00" ++ "00" ++ "006E" ++ (strRepeat("01", 32)));
         // A data part of 0: the shape the collapsed draw produced on every input.
         self.pushHex("00" ++ "00" ++ "00" ++ "0000000000" ++ "00" ++ "00" ++ "00" ++ "0000");
         // The full 800 quintets — the whole raised buffer, so the ceiling is
         // exercised rather than merely raised.
-        self.pushHex("00" ++ "00" ++ "00" ++ "0000000000" ++ "00" ++ "00" ++ "01" ++ "0320" ++ ("15" ** 32));
+        self.pushHex("00" ++ "00" ++ "00" ++ "0000000000" ++ "00" ++ "00" ++ "01" ++ "0320" ++ (strRepeat("15", 32)));
         // A one-octet script, cycled: the degenerate case.
         self.pushHex("00");
         return self.entries[0..self.n];
@@ -1669,4 +1669,16 @@ test "BOLT#11 amount anchor (bitcoinjs/bolt11): the amount strings upstream reje
             return error.TestUnexpectedResult;
         } else |_| {}
     }
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

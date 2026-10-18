@@ -235,7 +235,7 @@ test "bench (opt-in via K256_BENCH)" {
 
     // ── ECDSA verify (k256 vs std) on a real std signature ──
     {
-        const kp = Ecdsa.KeyPair.generateDeterministic([_]u8{7} ** 32) catch return;
+        const kp = Ecdsa.KeyPair.generateDeterministic(@as([32]u8, @splat(7))) catch return;
         const msg = "k256 bench message";
         const sig = kp.sign(msg, null) catch return;
         const sig_rs = sig.toBytes();
@@ -273,14 +273,14 @@ test "bench (opt-in via K256_BENCH)" {
         std.debug.print("std       ecdsa sign        : {d:>8} ns/op\n", .{dt / sig_iters});
 
         // k256 BIP340 sign/verify (no direct std analog; report standalone).
-        const sk = [_]u8{3} ** 32;
-        const bsig = sign.bip340Sign(&sk, msg, [_]u8{0} ** 32) catch return;
+        const sk = @as([32]u8, @splat(3));
+        const bsig = sign.bip340Sign(&sk, msg, @as([32]u8, @splat(0))) catch return;
         const pub_xonly = (Secp256k1.basePoint.mul(sk, .big) catch return).affineCoordinates().x.toBytes(.big);
         sink = 0;
         t0 = nowNs();
         i = 0;
         while (i < sig_iters) : (i += 1) {
-            const s2 = sign.bip340Sign(&sk, msg, [_]u8{0} ** 32) catch continue;
+            const s2 = sign.bip340Sign(&sk, msg, @as([32]u8, @splat(0))) catch continue;
             sink ^= s2[0];
         }
         dt = nowNs() - t0;
@@ -299,7 +299,7 @@ test "bench (opt-in via K256_BENCH)" {
         // in-repo consumer (`lninvoice`/BOLT#11) actually calls —
         // `ecdsa_recover.sign` (RFC 6979) and `recoverPubkey` — while
         // measuring five things nothing in the repo calls. Added 2026-09-10.
-        const ec_privkey = [_]u8{9} ** 32;
+        const ec_privkey = @as([32]u8, @splat(9));
         var ec_hash: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(msg, &ec_hash, .{});
 

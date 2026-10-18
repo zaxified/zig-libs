@@ -1029,7 +1029,7 @@ test {
 }
 
 test "smoke: module compiles and CoseKey.alg dispatch works" {
-    const key: CoseKey = .{ .ec2 = .{ .alg = cbor.cose.alg_es256, .crv = cbor.cose.crv_p256, .x = &[_]u8{0} ** 32, .y = &[_]u8{0} ** 32 } };
+    const key: CoseKey = .{ .ec2 = .{ .alg = cbor.cose.alg_es256, .crv = cbor.cose.crv_p256, .x = &@as([32]u8, @splat(0)), .y = &@as([32]u8, @splat(0)) } };
     try std.testing.expectEqual(@as(?i64, cbor.cose.alg_es256), key.alg());
 }
 
@@ -1210,18 +1210,18 @@ test "corpus: every clientData seed reaches the parser, and the challenge octets
 /// key -- are assembled at run time from the vectors below.
 const auth_data_reject_seeds = [_][]const u8{
     seed(""), // empty
-    seed("\xCC" ** 36), // one octet short of the fixed 37-octet header
-    seed("\xCC" ** 32 ++ "\x01\x00\x00\x00\x00"), // the minimum: UP set, no attested credential data
-    seed("\xCC" ** 32 ++ "\x01\x01\x02\x03\x04"), // an asymmetric signCount, for the big-endian read
-    seed("\xCC" ** 32 ++ "\x00\x00\x00\x00\x00"), // UP clear: structurally fine, refused a layer up
-    seed("\xCC" ** 32 ++ "\x81\x00\x00\x00\x00"), // the ED flag with no extension data
-    seed("\xCC" ** 32 ++ "\x41\x00\x00\x00\x00"), // the AT flag with NO attested credential data behind it
-    seed("\xCC" ** 32 ++ "\x41\x00\x00\x00\x00" ++ "\x00" ** 16), // AT, an AAGUID, and nothing else
-    seed("\xCC" ** 32 ++ "\x41\x00\x00\x00\x00" ++ "\x00" ** 16 ++ "\xff\xff"), // a credential-id length of 65535
-    seed("\xCC" ** 32 ++ "\x41\x00\x00\x00\x00" ++ "\x00" ** 16 ++ "\x00\x04" ++ "\xaa\xbb\xcc\xdd"), // a 4-octet credential id and no COSE key
-    seed("\xCC" ** 32 ++ "\xc1\x00\x00\x00\x00" ++ "\x00" ** 16 ++ "\x00\x01\xaa\xa0"), // AT and ED, an empty map where the COSE key belongs
-    seed("\x00" ** 300), // 300 zero octets: no AT/ED flag, so 263 trailing octets (TrailingData since 2026-09-30)
-    seed("\xCC" ** 32 ++ "\x81\x00\x00\x00\x07" ++ "\xa1\x61x\x01"), // UP|ED and a one-entry extensions map {"x": 1}: accepted
+    seed(strRepeat("\xCC", 36)), // one octet short of the fixed 37-octet header
+    seed(strRepeat("\xCC", 32) ++ "\x01\x00\x00\x00\x00"), // the minimum: UP set, no attested credential data
+    seed(strRepeat("\xCC", 32) ++ "\x01\x01\x02\x03\x04"), // an asymmetric signCount, for the big-endian read
+    seed(strRepeat("\xCC", 32) ++ "\x00\x00\x00\x00\x00"), // UP clear: structurally fine, refused a layer up
+    seed(strRepeat("\xCC", 32) ++ "\x81\x00\x00\x00\x00"), // the ED flag with no extension data
+    seed(strRepeat("\xCC", 32) ++ "\x41\x00\x00\x00\x00"), // the AT flag with NO attested credential data behind it
+    seed(strRepeat("\xCC", 32) ++ "\x41\x00\x00\x00\x00" ++ strRepeat("\x00", 16)), // AT, an AAGUID, and nothing else
+    seed(strRepeat("\xCC", 32) ++ "\x41\x00\x00\x00\x00" ++ strRepeat("\x00", 16) ++ "\xff\xff"), // a credential-id length of 65535
+    seed(strRepeat("\xCC", 32) ++ "\x41\x00\x00\x00\x00" ++ strRepeat("\x00", 16) ++ "\x00\x04" ++ "\xaa\xbb\xcc\xdd"), // a 4-octet credential id and no COSE key
+    seed(strRepeat("\xCC", 32) ++ "\xc1\x00\x00\x00\x00" ++ strRepeat("\x00", 16) ++ "\x00\x01\xaa\xa0"), // AT and ED, an empty map where the COSE key belongs
+    seed(strRepeat("\x00", 300)), // 300 zero octets: no AT/ED flag, so 263 trailing octets (TrailingData since 2026-09-30)
+    seed(strRepeat("\xCC", 32) ++ "\x81\x00\x00\x00\x07" ++ "\xa1\x61x\x01"), // UP|ED and a one-entry extensions map {"x": 1}: accepted
 };
 
 /// The whole corpus: the shapes above plus a real registration
@@ -1345,7 +1345,7 @@ test "F5: parseAuthenticatorData decodes aaguid + user_present/user_verified byt
     defer raw.deinit(std.testing.allocator);
     const a = std.testing.allocator;
 
-    try raw.appendSlice(a, &([_]u8{0xCC} ** 32)); // rp_id_hash
+    try raw.appendSlice(a, &(@as([32]u8, @splat(0xCC)))); // rp_id_hash
     // flags: user_present=1, user_verified=1, attested_credential_data=1.
     // (bit0 | bit2 | bit6)
     try raw.append(a, 0b0100_0101);
@@ -1475,4 +1475,16 @@ test "F4: checkAaguidExtension enforces WebAuthn §8.2.1's id-fido-gen-ce-aaguid
         const cert: std.crypto.Certificate = .{ .buffer = der_bytes, .index = 0 };
         try checkAaguidExtension(cert, aaguid);
     }
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

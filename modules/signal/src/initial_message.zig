@@ -90,6 +90,6 @@ pub fn open(
 }
 
 test "open refuses a buffer one byte shorter than the tag" {
-    const short = [_]u8{0} ** (tag_length - 1);
+    const short = @as([tag_length - 1]u8, @splat(0));
     try std.testing.expectError(error.InitialMessageAuthenticationFailed, open(std.testing.allocator, @splat(1), "", &short));
 }

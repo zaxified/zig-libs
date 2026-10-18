@@ -41,10 +41,10 @@ pub const Label = enum {
     deflate_conn_message,
     deflate_conn_refused,
 };
-var reach: [@typeInfo(Label).@"enum".fields.len]usize = @splat(0);
+var reach: [@typeInfo(Label).@"enum".field_names.len]usize = @splat(0);
 
 pub fn mark(l: Label) void {
-    reach[@intFromEnum(l)] += 1;
+    reach[@backingInt(l)] += 1;
     switch (l) {
         inline else => |c| fuzz_driver.hit(@tagName(c)),
     }
@@ -56,7 +56,7 @@ pub fn resetReach() void {
 
 /// Reach before verdict: every listed label was seen since `resetReach`.
 pub fn expectReached(labels: []const Label) !void {
-    for (labels) |l| if (reach[@intFromEnum(l)] == 0) {
+    for (labels) |l| if (reach[@backingInt(l)] == 0) {
         std.debug.print("reach: label {t} never hit\n", .{l});
         return error.HarnessDoesNotReach;
     };

@@ -748,7 +748,7 @@ fn curve25519KexServerBody(
     // SSH_MSG_KEX_ECDH_INIT: byte || string Q_C.
     var buf: [16384]u8 = undefined;
     const pkt = try transport.readKexPacket(r, ciphers, &buf);
-    if (msgType(pkt) != @intFromEnum(messages.MessageType.SSH_MSG_KEXDH_INIT)) return error.KexFailed;
+    if (msgType(pkt) != @backingInt(messages.MessageType.SSH_MSG_KEXDH_INIT)) return error.KexFailed;
     var cur = WireCursor{ .b = pkt.payload[1..] };
     const q_c = try cur.string();
     if (q_c.len != 32) return error.KexFailed;
@@ -793,7 +793,7 @@ fn curve25519KexServerBody(
     // SSH_MSG_KEX_ECDH_REPLY: byte || string K_S || string Q_S || string sig.
     var obuf: [2048]u8 = undefined;
     var ow: std.Io.Writer = .fixed(&obuf);
-    try ow.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_KEXDH_REPLY));
+    try ow.writeByte(@backingInt(messages.MessageType.SSH_MSG_KEXDH_REPLY));
     try messages.writeString(&ow, k_s);
     try messages.writeString(&ow, &q_s);
     try messages.writeString(&ow, sig);
@@ -874,7 +874,7 @@ fn ecdhNistKexServerBody(
     // SSH_MSG_KEX_ECDH_INIT: byte || string Q_C.
     var buf: [16384]u8 = undefined;
     const pkt = try transport.readKexPacket(r, ciphers, &buf);
-    if (msgType(pkt) != @intFromEnum(messages.MessageType.SSH_MSG_KEXDH_INIT)) return error.KexFailed;
+    if (msgType(pkt) != @backingInt(messages.MessageType.SSH_MSG_KEXDH_INIT)) return error.KexFailed;
     var cur = WireCursor{ .b = pkt.payload[1..] };
     const q_c = try cur.string();
 
@@ -895,7 +895,7 @@ fn ecdhNistKexServerBody(
     // SSH_MSG_KEX_ECDH_REPLY: byte || string K_S || string Q_S || string sig.
     var obuf: [2048]u8 = undefined;
     var ow: std.Io.Writer = .fixed(&obuf);
-    try ow.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_KEXDH_REPLY));
+    try ow.writeByte(@backingInt(messages.MessageType.SSH_MSG_KEXDH_REPLY));
     try messages.writeString(&ow, k_s);
     try messages.writeString(&ow, &kp.public);
     try messages.writeString(&ow, sig);
@@ -969,7 +969,7 @@ fn dhGroupKexServerBody(
     // SSH_MSG_KEXDH_INIT: byte || mpint e.
     var buf: [16384]u8 = undefined;
     const pkt = try transport.readKexPacket(r, ciphers, &buf);
-    if (msgType(pkt) != @intFromEnum(messages.MessageType.SSH_MSG_KEXDH_INIT)) return error.KexFailed;
+    if (msgType(pkt) != @backingInt(messages.MessageType.SSH_MSG_KEXDH_INIT)) return error.KexFailed;
     var cur = WireCursor{ .b = pkt.payload[1..] };
     const e = stripLeadingZeros(try cur.string());
     // 1 < e < p-1 (reject degenerate peer values — RFC 4253 §8. `e == p`
@@ -1030,7 +1030,7 @@ fn dhGroupKexServerBody(
     // SSH_MSG_KEXDH_REPLY: byte || string K_S || mpint f || string sig.
     var obuf: [8 + transport.dh_max_prime_len + 2048]u8 = undefined;
     var ow: std.Io.Writer = .fixed(&obuf);
-    try ow.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_KEXDH_REPLY));
+    try ow.writeByte(@backingInt(messages.MessageType.SSH_MSG_KEXDH_REPLY));
     try messages.writeString(&ow, k_s);
     try messages.writeMpint(&ow, f);
     try messages.writeString(&ow, sig);
@@ -1209,7 +1209,7 @@ fn mlkem768x25519KexServerBody(
     // SSH_MSG_KEX_ECDH_INIT: byte || string C.
     var buf: [16384]u8 = undefined;
     const pkt = try transport.readKexPacket(r, ciphers, &buf);
-    if (msgType(pkt) != @intFromEnum(messages.MessageType.SSH_MSG_KEXDH_INIT)) return error.KexFailed;
+    if (msgType(pkt) != @backingInt(messages.MessageType.SSH_MSG_KEXDH_INIT)) return error.KexFailed;
     var cur = WireCursor{ .b = pkt.payload[1..] };
     const cinit = try cur.string();
     if (cinit.len != transport.mlkem_cinit_len) return error.KexFailed;
@@ -1266,7 +1266,7 @@ fn mlkem768x25519KexServerBody(
     // SSH_MSG_KEX_ECDH_REPLY: byte || string K_S || string S || string sig.
     var obuf: [16 + transport.mlkem_sreply_len + 2048]u8 = undefined;
     var ow: std.Io.Writer = .fixed(&obuf);
-    try ow.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_KEXDH_REPLY));
+    try ow.writeByte(@backingInt(messages.MessageType.SSH_MSG_KEXDH_REPLY));
     try messages.writeString(&ow, k_s);
     try messages.writeString(&ow, &sreply);
     try messages.writeString(&ow, sig);
@@ -1379,7 +1379,7 @@ pub fn serverHandshake(t: *transport.Transport, gpa: std.mem.Allocator, config: 
     defer gpa.free(scratch);
     while (true) {
         const pkt = try t.recvPacket(scratch);
-        switch (@as(messages.MessageType, @enumFromInt(msgType(pkt)))) {
+        switch (@as(messages.MessageType, @fromBackingInt(@intCast(msgType(pkt))))) {
             // The client's own RFC 8308 §2.4 opportunity — OpenSSH always
             // takes it once we advertise `ext-info-s`, sending
             // `publickey-hostbound@openssh.com` and `ping@openssh.com`. This
@@ -1394,7 +1394,7 @@ pub fn serverHandshake(t: *transport.Transport, gpa: std.mem.Allocator, config: 
                 if (!std.mem.eql(u8, service, "ssh-userauth")) return error.ProtocolError;
                 var abuf: [64]u8 = undefined;
                 var aw: std.Io.Writer = .fixed(&abuf);
-                try aw.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_SERVICE_ACCEPT));
+                try aw.writeByte(@backingInt(messages.MessageType.SSH_MSG_SERVICE_ACCEPT));
                 try messages.writeString(&aw, service);
                 try t.sendPacket(aw.buffered());
                 return;
@@ -1457,7 +1457,7 @@ fn serverKexRoundBody(
     defer if (i_c_owned) |b| gpa.free(b);
     const i_c = peer_kexinit orelse blk: {
         const cpkt = try transport.readKexPacket(t.reader, ciphers, scratch);
-        if (msgType(cpkt) != @intFromEnum(messages.MessageType.SSH_MSG_KEXINIT)) return error.ProtocolError;
+        if (msgType(cpkt) != @backingInt(messages.MessageType.SSH_MSG_KEXINIT)) return error.ProtocolError;
         const b = try gpa.dupe(u8, cpkt.payload);
         i_c_owned = b;
         break :blk b;
@@ -1564,10 +1564,10 @@ fn serverKexRoundBody(
     // 5-6. NEWKEYS both ways; SERVER direction mapping: we ENCRYPT with the
     // server-to-client keys ('B'/'D'/'F') and DECRYPT with the
     // client-to-server keys ('A'/'C'/'E'), the exact swap of the client's.
-    try transport.writePacket(t.writer, ciphers.w, t.entropy, &[_]u8{@intFromEnum(messages.MessageType.SSH_MSG_NEWKEYS)});
+    try transport.writePacket(t.writer, ciphers.w, t.entropy, &[_]u8{@backingInt(messages.MessageType.SSH_MSG_NEWKEYS)});
     try t.installCipher(.write, cipher_s2c, mac_s2c, .s2c, &kex_result);
     const nk = try transport.readKexPacket(t.reader, ciphers, scratch);
-    if (msgType(nk) != @intFromEnum(messages.MessageType.SSH_MSG_NEWKEYS)) return error.ProtocolError;
+    if (msgType(nk) != @backingInt(messages.MessageType.SSH_MSG_NEWKEYS)) return error.ProtocolError;
     try t.installCipher(.read, cipher_c2s, mac_c2s, .c2s, &kex_result);
 
     return .{ .client_wants_ext_info = client_wants_ext_info };
@@ -1596,7 +1596,7 @@ fn testFillRandom(buf: []u8) void {
 
 test "HostKey type compiles" {
     const t = std.testing;
-    var seed: [32]u8 = [_]u8{0} ** 32;
+    var seed: [32]u8 = @as([32]u8, @splat(0));
     const kp = Ed25519.KeyPair.generateDeterministic(seed) catch unreachable;
     const hk: HostKey = .{ .ed25519 = kp };
     try t.expectEqualStrings("ssh-ed25519", hk.algorithmName());
@@ -1619,7 +1619,7 @@ test "HostKey type compiles" {
 
 test "ServerConfig is constructible with a default server_software" {
     const t = std.testing;
-    var seed: [32]u8 = [_]u8{1} ** 32;
+    var seed: [32]u8 = @as([32]u8, @splat(1));
     const kp = Ed25519.KeyPair.generateDeterministic(seed) catch unreachable;
     const keys = [_]HostKey{.{ .ed25519 = kp }};
     const cfg = ServerConfig{ .host_keys = &keys };
@@ -1661,7 +1661,7 @@ test "HostKey.fromOpenSSH: ed25519 fixture parses; K_S matches ssh-keygen's .pub
     try t.expectEqualSlices(u8, expected, blob);
 
     // Sign + verify round-trip through the wire blob.
-    const h = [_]u8{0x5A} ** 32;
+    const h = @as([32]u8, @splat(0x5A));
     const sig_blob = try hk.sign(t.allocator, &h);
     defer t.allocator.free(sig_blob);
     var cur = WireCursor{ .b = sig_blob };
@@ -1685,7 +1685,7 @@ test "HostKey.fromOpenSSH: rsa fixture parses; K_S matches .pub; sha2-256 and sh
     const expected = try decodeFixturePub(fixture_rsa_pub_b64, &pubbuf);
     try t.expectEqualSlices(u8, expected, blob);
 
-    const h = [_]u8{0xA5} ** 32;
+    const h = @as([32]u8, @splat(0xA5));
     inline for (.{ HostKey.RsaHash.sha2_256, HostKey.RsaHash.sha2_512 }) |hash| {
         hk.rsa.hash = hash;
         const sig_blob = try hk.sign(t.allocator, &h);
@@ -1726,7 +1726,7 @@ test "HostKey.fromOpenSSH: ecdsa-p256 fixture parses; K_S matches ssh-keygen's .
     // Sign + verify round-trip through the wire blob, same mpint(r)||mpint(s)
     // decode the "wire shape verifies" test below uses.
     const pk = hk.ecdsa_p256.public_key;
-    const h = [_]u8{0x3C} ** 32;
+    const h = @as([32]u8, @splat(0x3C));
     const sig_blob = try hk.sign(t.allocator, &h);
     defer t.allocator.free(sig_blob);
     var scur = WireCursor{ .b = sig_blob };
@@ -1736,7 +1736,7 @@ test "HostKey.fromOpenSSH: ecdsa-p256 fixture parses; K_S matches ssh-keygen's .
     const r_m = stripLeadingZeros(try icur.string());
     const s_m = stripLeadingZeros(try icur.string());
     try t.expect(r_m.len <= 32 and s_m.len <= 32);
-    var rs = [_]u8{0} ** 64;
+    var rs = @as([64]u8, @splat(0));
     @memcpy(rs[32 - r_m.len .. 32], r_m);
     @memcpy(rs[64 - s_m.len .. 64], s_m);
     try EcdsaP256.Signature.fromBytes(rs).verify(&h, pk);
@@ -1756,7 +1756,7 @@ test "HostKey.fromOpenSSH: ecdsa-p384 fixture parses; K_S matches ssh-keygen's .
 
     // The client's verifier accepts it, and refuses it under the wrong curve
     // name, a flipped octet of H, and as a P-256 key.
-    const h = [_]u8{0x3C} ** 48;
+    const h = @as([48]u8, @splat(0x3C));
     const sig_blob = try hk.sign(t.allocator, &h);
     defer t.allocator.free(sig_blob);
     try transport.verifySignature("ecdsa-sha2-nistp384", blob, sig_blob, &h);
@@ -1776,7 +1776,7 @@ test "HostKey.fromOpenSSH: ecdsa-p521 fixture parses; K_S matches ssh-keygen's .
     var pubbuf: [256]u8 = undefined;
     const expected = try decodeFixturePub(fixture_ecdsa_p521_pub_b64, &pubbuf);
     try t.expectEqualSlices(u8, expected, blob);
-    const h = [_]u8{0x3C} ** 64;
+    const h = @as([64]u8, @splat(0x3C));
     const sig_blob = try hk.sign(t.allocator, &h);
     defer t.allocator.free(sig_blob);
     try transport.verifySignature("ecdsa-sha2-nistp521", blob, sig_blob, &h);
@@ -1833,7 +1833,7 @@ test "HostKey.sign/publicBlob: ecdsa-p256 mpint(r)||mpint(s) wire shape verifies
     const q = try kcur.string();
     const pk = try EcdsaP256.PublicKey.fromSec1(q);
 
-    const h = [_]u8{0x3C} ** 32;
+    const h = @as([32]u8, @splat(0x3C));
     const sig_blob = try hk.sign(t.allocator, &h);
     defer t.allocator.free(sig_blob);
     var scur = WireCursor{ .b = sig_blob };
@@ -1843,7 +1843,7 @@ test "HostKey.sign/publicBlob: ecdsa-p256 mpint(r)||mpint(s) wire shape verifies
     const r_m = stripLeadingZeros(try icur.string());
     const s_m = stripLeadingZeros(try icur.string());
     try t.expect(r_m.len <= 32 and s_m.len <= 32);
-    var rs = [_]u8{0} ** 64;
+    var rs = @as([64]u8, @splat(0));
     @memcpy(rs[32 - r_m.len .. 32], r_m);
     @memcpy(rs[64 - s_m.len .. 64], s_m);
     try EcdsaP256.Signature.fromBytes(rs).verify(&h, pk);
@@ -2173,14 +2173,14 @@ const SelfTestClient = struct {
         // want_reply=false SSH_MSG_GLOBAL_REQUEST, which reaches the caller.
         var mb: [64]u8 = undefined;
         var mw: std.Io.Writer = .fixed(&mb);
-        try mw.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_GLOBAL_REQUEST));
+        try mw.writeByte(@backingInt(messages.MessageType.SSH_MSG_GLOBAL_REQUEST));
         try messages.writeString(&mw, "probe-c2s");
         try mw.writeByte(0);
         try t.sendPacket(mw.buffered());
 
         // Encrypted s2c probe back from the server.
         const pkt = try t.recvPacket(&pbuf);
-        if (msgType(pkt) != @intFromEnum(messages.MessageType.SSH_MSG_GLOBAL_REQUEST)) return error.ProtocolError;
+        if (msgType(pkt) != @backingInt(messages.MessageType.SSH_MSG_GLOBAL_REQUEST)) return error.ProtocolError;
         if (std.mem.indexOf(u8, pkt.payload, "probe-s2c") == null) return error.ProtocolError;
 
         self.session_id = t.session_id;
@@ -2221,13 +2221,13 @@ fn selfConsistencyWith(host_key: *const HostKey, client_algs: transport.Algorith
     // The client's encrypted probe must decrypt on our side...
     var pbuf: [8192]u8 = undefined;
     const pkt = try t.recvPacket(&pbuf);
-    try std.testing.expectEqual(@intFromEnum(messages.MessageType.SSH_MSG_GLOBAL_REQUEST), msgType(pkt));
+    try std.testing.expectEqual(@backingInt(messages.MessageType.SSH_MSG_GLOBAL_REQUEST), msgType(pkt));
     try std.testing.expect(std.mem.indexOf(u8, pkt.payload, "probe-c2s") != null);
 
     // ...and ours on the client's.
     var mb: [64]u8 = undefined;
     var mw: std.Io.Writer = .fixed(&mb);
-    try mw.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_GLOBAL_REQUEST));
+    try mw.writeByte(@backingInt(messages.MessageType.SSH_MSG_GLOBAL_REQUEST));
     try messages.writeString(&mw, "probe-s2c");
     try mw.writeByte(0);
     try t.sendPacket(mw.buffered());
@@ -2533,7 +2533,7 @@ test "dhGroupKex (client): rejects a genuine rsa-sha2-256 host-key signature whe
 fn fakeKexdhInit(e_mag: []const u8, out: []u8) ![]const u8 {
     var payload_buf: [4096 + 64]u8 = undefined;
     var pw: std.Io.Writer = .fixed(&payload_buf);
-    try pw.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_KEXDH_INIT));
+    try pw.writeByte(@backingInt(messages.MessageType.SSH_MSG_KEXDH_INIT));
     try messages.writeMpint(&pw, e_mag);
 
     var none: transport.CipherState = .plaintext;
@@ -2612,7 +2612,7 @@ const GuessingClient = struct {
         // number counted the discarded guess.
         var pbuf: [1024]u8 = undefined;
         const pkt = try t.recvPacket(&pbuf);
-        if (msgType(pkt) != @intFromEnum(messages.MessageType.SSH_MSG_GLOBAL_REQUEST)) return error.ProtocolError;
+        if (msgType(pkt) != @backingInt(messages.MessageType.SSH_MSG_GLOBAL_REQUEST)) return error.ProtocolError;
         self.got_probe = std.mem.indexOf(u8, pkt.payload, "after-guess") != null;
     }
 };
@@ -2705,7 +2705,7 @@ test "clientHandshake discards a server's wrongly-guessed first KEX packet inste
     // here sits exactly where the real KEXDH_REPLY belongs in step 5.
     var junk_buf: [16]u8 = undefined;
     var jw: std.Io.Writer = .fixed(&junk_buf);
-    try jw.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_IGNORE));
+    try jw.writeByte(@backingInt(messages.MessageType.SSH_MSG_IGNORE));
     try messages.writeString(&jw, "x");
     try transport.writePacket(&sw.interface, &none_w, .os, jw.buffered());
 
@@ -2719,9 +2719,9 @@ test "clientHandshake discards a server's wrongly-guessed first KEX packet inste
     defer res.zeroize();
 
     // 6. NEWKEYS both ways.
-    try transport.writePacket(&sw.interface, &none_w, .os, &[_]u8{@intFromEnum(messages.MessageType.SSH_MSG_NEWKEYS)});
+    try transport.writePacket(&sw.interface, &none_w, .os, &[_]u8{@backingInt(messages.MessageType.SSH_MSG_NEWKEYS)});
     const nk = try transport.readPacket(&sr.interface, &none_r, &scratch);
-    try std.testing.expectEqual(@intFromEnum(messages.MessageType.SSH_MSG_NEWKEYS), msgType(nk));
+    try std.testing.expectEqual(@backingInt(messages.MessageType.SSH_MSG_NEWKEYS), msgType(nk));
 
     // 7. One encrypted packet. This server sent FOUR plaintext packets
     // (KEXINIT, the guess, KEXDH_REPLY, NEWKEYS) and no strict-KEX
@@ -2736,7 +2736,7 @@ test "clientHandshake discards a server's wrongly-guessed first KEX packet inste
     try st.installCipher(.write, "chacha20-poly1305@openssh.com", null, .s2c, &res);
     var probe: [32]u8 = undefined;
     var pw: std.Io.Writer = .fixed(&probe);
-    try pw.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_GLOBAL_REQUEST));
+    try pw.writeByte(@backingInt(messages.MessageType.SSH_MSG_GLOBAL_REQUEST));
     try messages.writeString(&pw, "after-guess");
     try pw.writeByte(0);
     try st.sendPacket(pw.buffered());
@@ -2913,8 +2913,8 @@ fn liveOpensshClientMac(keygen_type: []const u8, hostkey_algo: []const u8, kex_n
     while (true) {
         const pkt = try t.recvPacket(&pbuf);
         switch (msgType(pkt)) {
-            @intFromEnum(messages.MessageType.SSH_MSG_IGNORE),
-            @intFromEnum(messages.MessageType.SSH_MSG_DEBUG),
+            @backingInt(messages.MessageType.SSH_MSG_IGNORE),
+            @backingInt(messages.MessageType.SSH_MSG_DEBUG),
             => continue,
             50 => break, // SSH_MSG_USERAUTH_REQUEST decrypted successfully
             else => return error.ProtocolError,

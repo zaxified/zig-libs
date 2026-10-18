@@ -88,9 +88,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // Deterministic keys: this harness must print the same bytes on every run,
     // because `scripts/checks/ctgrind.sh --check` pins a digest of what it printed.
     var ils: root.Secp256k1DH.KeyPair = undefined;
-    try root.Secp256k1DH.KeyPair.generateDeterministicInto(&ils, &([_]u8{0x11} ** 32));
+    try root.Secp256k1DH.KeyPair.generateDeterministicInto(&ils, &(@as([32]u8, @splat(0x11))));
     var rls: root.Secp256k1DH.KeyPair = undefined;
-    try root.Secp256k1DH.KeyPair.generateDeterministicInto(&rls, &([_]u8{0x21} ** 32));
+    try root.Secp256k1DH.KeyPair.generateDeterministicInto(&rls, &(@as([32]u8, @splat(0x21))));
     var prng = std.Random.DefaultPrng.init(0xb01783);
     const e: root.handshake.Ephemeral = .{ .seeded_for_test = prng.random() };
 
@@ -101,7 +101,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         const s = try root.Secp256k1DH.dh(&sk, rls.public_key);
         std.debug.print("dh={x}\n", .{s});
     } else if (std.mem.eql(u8, target, "keygen")) {
-        var seed: [32]u8 = [_]u8{0x42} ** 32;
+        var seed: [32]u8 = @as([32]u8, @splat(0x42));
         taint(t, seed[0..]);
         const sd = reloadVolatile(32, &seed);
         var kp: root.Secp256k1DH.KeyPair = undefined;
@@ -148,7 +148,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         taint(t, rx.rx.cipher.k[0..]);
         taint(t, rx.rx.chain[0..]);
         var frame: [18 + 64 + 16]u8 = undefined;
-        var msg: [64]u8 = [_]u8{0xa5} ** 64;
+        var msg: [64]u8 = @as([64]u8, @splat(0xa5));
         // Enough messages to cross a key rotation (500 per direction), so the
         // rotation path is measured and not merely present.
         for (0..600) |_| {

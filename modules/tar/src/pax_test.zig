@@ -98,7 +98,7 @@ test "anchor (GNU tar --format=pax): 130-byte path and a negative fractional mti
     var tr = Reader.init(testing.allocator, &src);
     defer tr.deinit();
     const e = (try tr.next()).?;
-    try testing.expectEqualStrings("d" ** 60 ++ "/" ++ "e" ** 60 ++ "-file.txt", e.path);
+    try testing.expectEqualStrings(strRepeat("d", 60) ++ "/" ++ strRepeat("e", 60) ++ "-file.txt", e.path);
     try testing.expectEqual(@as(u32, 0o600), e.mode);
     try testing.expectEqual(@as(u32, 7), e.uid);
     try testing.expectEqual(@as(u32, 8), e.gid);
@@ -117,7 +117,7 @@ test "anchor (Python tarfile PAX_FORMAT): 150-byte path, uid 5000000, mtime 1727
     defer tr.deinit();
 
     const a = (try tr.next()).?;
-    try testing.expectEqualStrings("p" ** 150, a.path);
+    try testing.expectEqualStrings(strRepeat("p", 150), a.path);
     try testing.expectEqual(@as(u32, 5_000_000), a.uid);
     try testing.expectEqual(@as(u32, 6_000_000), a.gid);
     try testing.expectEqual(@as(i64, 1_727_700_007), a.mtime);
@@ -136,7 +136,7 @@ test "anchor (Python tarfile PAX_FORMAT): 150-byte path, uid 5000000, mtime 1727
     const c = (try tr.next()).?;
     try testing.expectEqualStrings("link", c.path);
     try testing.expectEqual(Kind.symlink, c.kind);
-    try testing.expectEqualStrings("t" ** 130, c.link_target);
+    try testing.expectEqualStrings(strRepeat("t", 130), c.link_target);
     try testing.expectEqual(@as(u32, 0o777), c.mode);
     try testing.expectEqual(@as(i64, 1_600_000_000), c.mtime);
     try testing.expectEqual(@as(u32, 0), c.mtime_nsec);
@@ -149,7 +149,7 @@ test "pax writer: exact bytes for a path with no prefix split, uid over the usta
     var buf: [8 * block_size]u8 = undefined;
     var dst: std.Io.Writer = .fixed(&buf);
     const tw = Writer.initOptions(&dst, .{ .long_names = .pax });
-    const path = "x" ** 120; // one component: cannot split into prefix/name
+    const path = strRepeat("x", 120); // one component: cannot split into prefix/name
     try tw.writeEntry(.{
         .path = path,
         .mode = 0o644,
@@ -178,7 +178,7 @@ test "pax writer: exact bytes for a path with no prefix split, uid over the usta
     // The ustar block: name truncated to 100 bytes, ids that do not fit are 0,
     // the mtime field holds the whole seconds (1727700007 = 0o14676516047).
     const h = out[2 * block_size ..][0..block_size];
-    try testing.expectEqualStrings("x" ** 100, std.mem.sliceTo(h[0..100], 0));
+    try testing.expectEqualStrings(strRepeat("x", 100), std.mem.sliceTo(h[0..100], 0));
     try testing.expectEqualStrings("0000644\x00", h[100..108]);
     try testing.expectEqualStrings("0000000\x00", h[108..116]); // uid
     try testing.expectEqualStrings("0000001\x00", h[116..124]); // gid
@@ -209,7 +209,7 @@ test "pax writer: the record length counts itself across a digit boundary (99/10
         var buf: [8 * block_size]u8 = undefined;
         var dst: std.Io.Writer = .fixed(&buf);
         const tw = Writer.initOptions(&dst, .{ .long_names = .pax });
-        const path = "y" ** c[0];
+        const path = strRepeat("y", c[0]);
         try tw.writeHeader(.{ .path = path, .mode = 0o644 });
         const out = dst.buffered();
         try testing.expect(std.mem.startsWith(u8, out[block_size..], c[1]));
@@ -227,13 +227,13 @@ test "pax writer: a path that splits into prefix/name needs no pax header" {
     var buf: [4 * block_size]u8 = undefined;
     var dst: std.Io.Writer = .fixed(&buf);
     const tw = Writer.initOptions(&dst, .{ .long_names = .pax });
-    const dir = "dir/" ** 20 ++ "last"; // 84 bytes
-    const path = dir ++ "/" ++ "n" ** 80; // 165 bytes, splits at the '/' before the 80-byte name
+    const dir = strRepeat("dir/", 20) ++ "last"; // 84 bytes
+    const path = dir ++ "/" ++ strRepeat("n", 80); // 165 bytes, splits at the '/' before the 80-byte name
     try tw.writeHeader(.{ .path = path, .mode = 0o644 });
     const out = dst.buffered();
     try testing.expectEqual(@as(usize, block_size), out.len); // one block, no 'x'
     try testing.expectEqual(@as(u8, '0'), out[156]);
-    try testing.expectEqualStrings("n" ** 80, std.mem.sliceTo(out[0..100], 0));
+    try testing.expectEqualStrings(strRepeat("n", 80), std.mem.sliceTo(out[0..100], 0));
     try testing.expectEqualStrings(dir, std.mem.sliceTo(out[345..500], 0));
 
     var src: std.Io.Reader = .fixed(out);
@@ -265,10 +265,10 @@ fn roundTrip(e: Entry, content: []const u8, comptime check: fn (Entry) anyerror!
 }
 
 test "pax round trip: 150-byte path with no split" {
-    const path = "q" ** 150;
+    const path = strRepeat("q", 150);
     const S = struct {
         fn check(g: Entry) anyerror!void {
-            try testing.expectEqualStrings("q" ** 150, g.path);
+            try testing.expectEqualStrings(strRepeat("q", 150), g.path);
             try testing.expectEqual(@as(u32, 0o600), g.mode);
             try testing.expectEqual(@as(u64, 3), g.size);
         }
@@ -340,16 +340,16 @@ test "pax round trip: mtime past the 33-bit octal range, exact bytes of the reco
 }
 
 test "pax round trip: long symlink and hard-link targets" {
-    const target = "../" ** 50 ++ "t"; // 151 bytes
+    const target = strRepeat("../", 50) ++ "t"; // 151 bytes
     const S = struct {
         fn check(g: Entry) anyerror!void {
             try testing.expectEqual(Kind.symlink, g.kind);
-            try testing.expectEqualStrings("../" ** 50 ++ "t", g.link_target);
+            try testing.expectEqualStrings(strRepeat("../", 50) ++ "t", g.link_target);
             try testing.expectEqualStrings("l", g.path);
         }
         fn hard(g: Entry) anyerror!void {
             try testing.expectEqual(Kind.hardlink, g.kind);
-            try testing.expectEqualStrings("../" ** 50 ++ "t", g.link_target);
+            try testing.expectEqualStrings(strRepeat("../", 50) ++ "t", g.link_target);
         }
     };
     try testing.expectEqual(@as(usize, 1), try roundTrip(.{ .path = "l", .kind = .symlink, .link_target = target }, "", S.check));
@@ -378,9 +378,9 @@ test "pax round trip: everything at once, then a plain entry that must not inher
     var dst: std.Io.Writer = .fixed(&buf);
     const tw = Writer.initOptions(&dst, .{ .long_names = .pax });
     try tw.writeEntry(.{
-        .path = "z" ** 130,
+        .path = strRepeat("z", 130),
         .kind = .symlink,
-        .link_target = "w" ** 130,
+        .link_target = strRepeat("w", 130),
         .uid = 3_000_000,
         .gid = 4_000_001,
         .mtime = -5,
@@ -392,8 +392,8 @@ test "pax round trip: everything at once, then a plain entry that must not inher
     var tr = Reader.init(testing.allocator, &src);
     defer tr.deinit();
     const a = (try tr.next()).?;
-    try testing.expectEqualStrings("z" ** 130, a.path);
-    try testing.expectEqualStrings("w" ** 130, a.link_target);
+    try testing.expectEqualStrings(strRepeat("z", 130), a.path);
+    try testing.expectEqualStrings(strRepeat("w", 130), a.link_target);
     try testing.expectEqual(@as(u32, 3_000_000), a.uid);
     try testing.expectEqual(@as(u32, 4_000_001), a.gid);
     try testing.expectEqual(@as(i64, -5), a.mtime);
@@ -411,7 +411,7 @@ test "pax round trip: everything at once, then a plain entry that must not inher
 // ── the default stays exactly what it was ───────────────────────────────────
 
 test "default (GNU) mode: byte-identical with and without options, no pax header, fraction dropped" {
-    const e: Entry = .{ .path = "n" ** 120, .mode = 0o644, .uid = 7, .gid = 8, .mtime = 1_600_000_000, .mtime_nsec = 999 };
+    const e: Entry = .{ .path = strRepeat("n", 120), .mode = 0o644, .uid = 7, .gid = 8, .mtime = 1_600_000_000, .mtime_nsec = 999 };
     var b1: [8 * block_size]u8 = undefined;
     var d1: std.Io.Writer = .fixed(&b1);
     try Writer.init(&d1).writeEntry(e, "abc");
@@ -451,4 +451,16 @@ test "pax mode still refuses a mode that does not fit (there is no pax keyword f
     const gw = Writer.init(&d2);
     try testing.expectError(error.FieldOutOfRange, gw.writeHeader(.{ .path = "f", .mtime = -1 }));
     try testing.expectError(error.FieldOutOfRange, gw.writeHeader(.{ .path = "f", .uid = 0o10000000 }));
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

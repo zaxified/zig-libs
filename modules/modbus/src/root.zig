@@ -297,7 +297,7 @@ pub const pdu = struct {
         };
         try checkRange(addr, quantity, max);
         if (buf.len < 5) return error.BufferTooSmall;
-        buf[0] = @intFromEnum(fc);
+        buf[0] = @backingInt(fc);
         std.mem.writeInt(u16, buf[1..3], addr, .big);
         std.mem.writeInt(u16, buf[3..5], quantity, .big);
         return buf[0..5];
@@ -306,7 +306,7 @@ pub const pdu = struct {
     /// FC 05 request: output value 0xFF00 = ON, 0x0000 = OFF.
     pub fn encodeWriteSingleCoil(buf: []u8, addr: u16, on: bool) EncodeError![]u8 {
         if (buf.len < 5) return error.BufferTooSmall;
-        buf[0] = @intFromEnum(FunctionCode.write_single_coil);
+        buf[0] = @backingInt(FunctionCode.write_single_coil);
         std.mem.writeInt(u16, buf[1..3], addr, .big);
         std.mem.writeInt(u16, buf[3..5], if (on) 0xFF00 else 0x0000, .big);
         return buf[0..5];
@@ -315,7 +315,7 @@ pub const pdu = struct {
     /// FC 06 request.
     pub fn encodeWriteSingleRegister(buf: []u8, addr: u16, value: u16) EncodeError![]u8 {
         if (buf.len < 5) return error.BufferTooSmall;
-        buf[0] = @intFromEnum(FunctionCode.write_single_register);
+        buf[0] = @backingInt(FunctionCode.write_single_register);
         std.mem.writeInt(u16, buf[1..3], addr, .big);
         std.mem.writeInt(u16, buf[3..5], value, .big);
         return buf[0..5];
@@ -328,7 +328,7 @@ pub const pdu = struct {
         const nbytes = bitByteCount(values.len);
         const total = 6 + nbytes;
         if (buf.len < total) return error.BufferTooSmall;
-        buf[0] = @intFromEnum(FunctionCode.write_multiple_coils);
+        buf[0] = @backingInt(FunctionCode.write_multiple_coils);
         std.mem.writeInt(u16, buf[1..3], addr, .big);
         std.mem.writeInt(u16, buf[3..5], quantity, .big);
         buf[5] = @intCast(nbytes);
@@ -342,7 +342,7 @@ pub const pdu = struct {
         try checkRange(addr, quantity, limits.max_write_registers);
         const total = 6 + 2 * values.len;
         if (buf.len < total) return error.BufferTooSmall;
-        buf[0] = @intFromEnum(FunctionCode.write_multiple_registers);
+        buf[0] = @backingInt(FunctionCode.write_multiple_registers);
         std.mem.writeInt(u16, buf[1..3], addr, .big);
         std.mem.writeInt(u16, buf[3..5], quantity, .big);
         buf[5] = @intCast(2 * values.len);
@@ -364,7 +364,7 @@ pub const pdu = struct {
         try checkRange(write_addr, wq, limits.max_rw_write_registers);
         const total = 10 + 2 * write_values.len;
         if (buf.len < total) return error.BufferTooSmall;
-        buf[0] = @intFromEnum(FunctionCode.read_write_multiple_registers);
+        buf[0] = @backingInt(FunctionCode.read_write_multiple_registers);
         std.mem.writeInt(u16, buf[1..3], read_addr, .big);
         std.mem.writeInt(u16, buf[3..5], read_quantity, .big);
         std.mem.writeInt(u16, buf[5..7], write_addr, .big);
@@ -379,7 +379,7 @@ pub const pdu = struct {
     /// for a well-formed exception response (expected | 0x80).
     pub fn checkFunction(resp: []const u8, expected: FunctionCode) (ParseError || ExceptionError)![]const u8 {
         if (resp.len == 0) return error.ShortFrame;
-        const want = @intFromEnum(expected);
+        const want = @backingInt(expected);
         if (resp[0] == want) return resp[1..];
         if (resp[0] == want | 0x80) {
             if (resp.len < 2) return error.ShortFrame;
@@ -1114,7 +1114,7 @@ test "bit packing round trip, LSB-first" {
 // build that ships. Written in terms of bitByteCount rather than a literal
 // so it keeps measuring the mechanism if that arithmetic ever changes.
 test "packBits/unpackBits: a buffer one byte short of bitByteCount is an error, not an assert" {
-    const bits = [_]bool{true} ** 10; // bitByteCount(10) == 2
+    const bits = @as([10]bool, @splat(true)); // bitByteCount(10) == 2
     const n = bitByteCount(bits.len);
 
     var short_dst: [1]u8 = undefined;
@@ -1376,17 +1376,17 @@ test "quantity limits -> typed errors" {
     _ = try pdu.encodeReadRequest(&buf, .read_coils, 0, 2000);
     _ = try pdu.encodeReadRequest(&buf, .read_holding_registers, 0, 125);
 
-    const coils_ok = [_]bool{false} ** 1968;
+    const coils_ok = @as([1968]bool, @splat(false));
     _ = try pdu.encodeWriteMultipleCoils(&buf, 0, &coils_ok);
-    const coils_bad = [_]bool{false} ** 1969;
+    const coils_bad = @as([1969]bool, @splat(false));
     try testing.expectError(error.InvalidQuantity, pdu.encodeWriteMultipleCoils(&buf, 0, &coils_bad));
 
-    const regs_ok = [_]u16{0} ** 123;
+    const regs_ok = @as([123]u16, @splat(0));
     _ = try pdu.encodeWriteMultipleRegisters(&buf, 0, &regs_ok);
-    const regs_bad = [_]u16{0} ** 124;
+    const regs_bad = @as([124]u16, @splat(0));
     try testing.expectError(error.InvalidQuantity, pdu.encodeWriteMultipleRegisters(&buf, 0, &regs_bad));
 
-    const rw_bad = [_]u16{0} ** 122;
+    const rw_bad = @as([122]u16, @splat(0));
     try testing.expectError(error.InvalidQuantity, pdu.encodeReadWriteMultipleRegisters(&buf, 0, 1, 0, &rw_bad));
     try testing.expectError(error.InvalidQuantity, pdu.encodeReadWriteMultipleRegisters(&buf, 0, 126, 0, &.{0}));
 }
@@ -1403,7 +1403,7 @@ test "encode buffer too small -> BufferTooSmall" {
     try testing.expectError(error.BufferTooSmall, tcp.encodeAdu(&tiny, 1, 1, &.{ 0x03, 0x00 }));
     try testing.expectError(error.BufferTooSmall, rtu.encodeAdu(&tiny, 1, &.{ 0x03, 0x00 }));
     var big: [300]u8 = undefined;
-    const oversized = [_]u8{0} ** (max_pdu_len + 1);
+    const oversized = @as([max_pdu_len + 1]u8, @splat(0));
     try testing.expectError(error.PduTooLong, tcp.encodeAdu(&big, 1, 1, &oversized));
     try testing.expectError(error.PduTooLong, rtu.encodeAdu(&big, 1, &oversized));
 }
@@ -1494,7 +1494,7 @@ test "short and truncated frames -> ShortFrame, never panic" {
     var bits: [4]bool = undefined;
     try testing.expectError(error.ShortFrame, pdu.parseReadBitsResponse(&.{0x01}, .read_coils, &bits));
 
-    const too_long = [_]u8{0} ** 300;
+    const too_long = @as([300]u8, @splat(0));
     try testing.expectError(error.FrameTooLong, tcp.decodeAdu(&too_long));
     try testing.expectError(error.FrameTooLong, rtu.decodeAdu(&too_long));
 }

@@ -65,7 +65,7 @@ fn normalizeLowS(sig: EcdsaSecp256k1Sha256.Signature) EcdsaSecp256k1Sha256.Signa
 fn creditingTx(allocator: std.mem.Allocator, script_pubkey: []const u8, value: i64) !bitcointx.Transaction {
     const vin = try allocator.alloc(bitcointx.TxIn, 1);
     vin[0] = .{
-        .prevout = .{ .txid = [_]u8{0} ** 32, .vout = 0xffffffff },
+        .prevout = .{ .txid = @as([32]u8, @splat(0)), .vout = 0xffffffff },
         .script_sig = &.{},
         .sequence = 0xffffffff,
     };
@@ -101,7 +101,7 @@ test "e2e: real P2PKH spend verifies; a tampered signature byte fails closed" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const seed: [32]u8 = [_]u8{0x11} ** 32;
+    const seed: [32]u8 = @as([32]u8, @splat(0x11));
     const kp = try EcdsaSecp256k1Sha256.KeyPair.generateDeterministic(seed);
     const pubkey = kp.public_key.toCompressedSec1();
 
@@ -159,7 +159,7 @@ test "e2e: real P2WPKH spend verifies via BIP143 sighash; tampered signature fai
     defer arena.deinit();
     const a = arena.allocator();
 
-    const seed: [32]u8 = [_]u8{0x22} ** 32;
+    const seed: [32]u8 = @as([32]u8, @splat(0x22));
     const kp = try EcdsaSecp256k1Sha256.KeyPair.generateDeterministic(seed);
     const pubkey = kp.public_key.toCompressedSec1();
 
@@ -215,7 +215,7 @@ test "e2e: real P2TR key-path spend verifies via BIP341 sighash + BIP340 Schnorr
     defer arena.deinit();
     const a = arena.allocator();
 
-    const sk = try bip340.SecretKey.fromBytes([_]u8{0x33} ** 32);
+    const sk = try bip340.SecretKey.fromBytes(@as([32]u8, @splat(0x33)));
     var kp: bip340.KeyPair = undefined;
     try bip340.KeyPair.fromSecretKey(&kp, &sk);
     const program = kp.public.x; // untweaked internal key used directly as the output key (module doc comment)
@@ -234,7 +234,7 @@ test "e2e: real P2TR key-path spend verifies via BIP341 sighash + BIP340 Schnorr
     const sighash = try bitcointx.bip341.sighash(a, spend_tx, 0, bitcointx.bip341.SIGHASH_DEFAULT, &spent);
 
     const io_undefined: std.Io = undefined;
-    const sig64 = try bip340.sign(&sk, &sighash, [_]u8{0x44} ** 32, io_undefined);
+    const sig64 = try bip340.sign(&sk, &sighash, @as([32]u8, @splat(0x44)), io_undefined);
 
     const witness = [_][]const u8{&sig64};
     const ctx: txctx.TxContext = .{ .tx = spend_tx, .input_index = 0, .spent_outputs = &spent };

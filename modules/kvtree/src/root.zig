@@ -1626,7 +1626,7 @@ test "steady state: overwriting a fixed key set stops growing the file (the free
     defer db.close();
 
     var key_buf: [16]u8 = undefined;
-    const val = "v" ** 64;
+    const val = strRepeat("v", 64);
     const keys = 16;
 
     // Warm up: the tree reaches its shape, and the freelist reaches the state
@@ -1672,7 +1672,7 @@ test "recovery rejects a leaf page with corrupt geometry instead of adopting it"
     var page: [page_size]u8 = undefined;
 
     @memset(&page, 0);
-    page[0] = @intFromEnum(format.NodeKind.leaf);
+    page[0] = @backingInt(format.NodeKind.leaf);
     std.mem.writeInt(u16, page[2..4], 0xFFFF, .little); // impossible count
     try p.writePage(2, &page);
 
@@ -1733,7 +1733,7 @@ test "a live Db.cursor keeps its pages: commits during a scan cannot recycle the
     defer db.close();
 
     var key_buf: [16]u8 = undefined;
-    const val = "v" ** 64;
+    const val = strRepeat("v", 64);
     const keys = 120; // enough entries at this value size for a multi-level tree
 
     var i: usize = 0;
@@ -1827,7 +1827,7 @@ test "open on a short non-kvtree file returns NotAKvtreeFile and leaves it untou
 test "open on a bigger foreign file (past the 2-page threshold) also returns NotAKvtreeFile, not Corrupt" {
     var sim = kv.SimStorage.init(testing.allocator);
     defer sim.deinit();
-    const foreign = "x" ** (3 * page_size); // big enough to reach core.recover
+    const foreign = strRepeat("x", 3 * page_size); // big enough to reach core.recover
     try sim.installFile("big.dat", foreign);
     try testing.expectError(
         error.NotAKvtreeFile,
@@ -2836,7 +2836,7 @@ test "overflow values: recovery refuses a chain whose last page is not an overfl
         const bytes = sim.fileContent("e.kvt").?;
         switch (how) {
             // The last page, `next` still 0: only its kind byte is wrong.
-            .kind_of_last => bytes[off] = @intFromEnum(format.NodeKind.leaf),
+            .kind_of_last => bytes[off] = @backingInt(format.NodeKind.leaf),
             // A chain that does not end where its length says.
             .next_of_last => std.mem.writeInt(u32, bytes[off + 4 ..][0..4], pages[0], .little),
             .next_of_first => std.mem.writeInt(u32, bytes[off + 4 ..][0..4], 0, .little),
@@ -3670,4 +3670,16 @@ test "buckets: recover rejects a version whose bucket cell is corrupt and adopts
         defer snap.release();
         try expectBucketGet((try snap.bucket("b")).?, "k", "v");
     }
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

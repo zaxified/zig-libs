@@ -82,13 +82,13 @@ pub const Limit = struct {
 /// All rows of one `limits` file. A row the file lacks (an older kernel) is
 /// null in `get`.
 pub const Limits = struct {
-    rows: [@typeInfo(Resource).@"enum".fields.len]?Limit = @splat(null),
+    rows: [@typeInfo(Resource).@"enum".field_names.len]?Limit = @splat(null),
     /// Rows that matched no known `Max ...` label, or whose numbers were not
     /// `unlimited` / decimal. They are skipped, not fatal.
     skipped_rows: u32 = 0,
 
     pub fn get(l: *const Limits, r: Resource) ?Limit {
-        return l.rows[@intFromEnum(r)];
+        return l.rows[@backingInt(r)];
     }
 
     /// `process_max_fds`: the soft `Max open files`; null = unlimited or absent.
@@ -126,7 +126,7 @@ pub fn parseLimits(text: []const u8) Limits {
         if (line.len == 0) continue;
         var matched = false;
         inline for (@typeInfo(Resource).@"enum".fields) |f| {
-            const r: Resource = @enumFromInt(f.value);
+            const r: Resource = @fromBackingInt(@intCast(f.value));
             const lab = comptime r.label();
             if (!matched and std.mem.startsWith(u8, line, lab) and
                 (line.len == lab.len or line[lab.len] == ' ' or line[lab.len] == '\t'))
@@ -720,7 +720,7 @@ test "parsePidStatus: kernel thread, nested namespaces, cpu lists, hostile value
     try testing.expectEqual(std.math.maxInt(u64), ns.cap_eff);
 
     // Hostile: a huge range does not expand, bad ranges are skipped, kB overflow saturates.
-    const h = parsePidStatus("Cpus_allowed_list:\t0-18446744073709551615,9-3,x,-4,2-\nVmRSS:\t18446744073709551615 kB\nNSpid:\t1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34\nName:\t" ++ "n" ** 200 ++ "\n:\n\nNoColon\n");
+    const h = parsePidStatus("Cpus_allowed_list:\t0-18446744073709551615,9-3,x,-4,2-\nVmRSS:\t18446744073709551615 kB\nNSpid:\t1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34\nName:\t" ++ strRepeat("n", 200) ++ "\n:\n\nNoColon\n");
     try testing.expectEqual(@as(usize, 1), h.cpuRanges().len);
     try testing.expectEqual(std.math.maxInt(u64), h.cpus_allowed_count);
     try testing.expectEqual(std.math.maxInt(u64), h.vm_rss);
@@ -884,4 +884,16 @@ test "parseLimits: a label must end at a word boundary; soft and hard are told a
     try testing.expectEqual(@as(?u64, 8192), l.get(.address_space).?.hard);
     try testing.expectEqual(@as(?u64, 4096), l.get(.open_files).?.hard);
     try testing.expectEqual(@as(u32, 0), l.skipped_rows);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

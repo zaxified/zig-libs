@@ -201,7 +201,7 @@ pub fn Ring(comptime n: u32) type {
         const top_mask: u64 = (@as(u64, 1) << top_bits) - 1;
 
         pub const Elem = [words]u64;
-        pub const zero: Elem = [_]u64{0} ** words;
+        pub const zero: Elem = @as([words]u64, @splat(0));
 
         /// Zero every bit at position >= n (enforces the canonical
         /// invariant after a raw fill, e.g. from PRNG output).
@@ -369,7 +369,7 @@ pub fn Ring(comptime n: u32) type {
         /// (X^n - 1). This is the always-available fallback AND the oracle
         /// the CLMUL path's differential test is pinned against.
         pub fn mulPortable(a: Elem, b: Elem) Elem {
-            var acc: [ext_words]u64 = [_]u64{0} ** ext_words;
+            var acc: [ext_words]u64 = @as([ext_words]u64, @splat(0));
             for (0..n) |i| {
                 const bit: u64 = (a[i / 64] >> @intCast(i % 64)) & 1;
                 const mask: u64 = 0 -% bit; // all-ones if bit=1, else 0
@@ -491,7 +491,7 @@ fn testClmulDifferential(comptime R: type, seed: u64) !void {
     // Also pin edge operands (all-zero, single monomials, all-ones-canonical).
     const zero = R.zero;
     try t.expectEqualSlices(u64, &R.mulPortable(zero, zero), &R.mulClmul(zero, zero));
-    var full: R.Elem = [_]u64{~@as(u64, 0)} ** R.words;
+    var full: R.Elem = @as([R.words]u64, @splat(~@as(u64, 0)));
     R.maskTop(&full);
     try t.expectEqualSlices(u64, &R.mulPortable(full, full), &R.mulClmul(full, full));
 }
@@ -609,11 +609,11 @@ fn testReduceProductDifferential(comptime R: type, seed: u64) !void {
         try t.expectEqualSlices(u64, &want, &got);
     }
 
-    var full: [ew]u64 = [_]u64{~@as(u64, 0)} ** ew;
+    var full: [ew]u64 = @as([ew]u64, @splat(~@as(u64, 0)));
     zeroAboveMeaningful(&full);
     try t.expectEqualSlices(u64, &R.reduceProductBitwiseRef(full), &R.reduceProduct(&full));
 
-    const z: [ew]u64 = [_]u64{0} ** ew;
+    const z: [ew]u64 = @as([ew]u64, @splat(0));
     try t.expectEqualSlices(u64, &R.reduceProductBitwiseRef(z), &R.reduceProduct(&z));
 }
 
@@ -671,17 +671,17 @@ test "fromBytes/toBytes round-trip and LSB-first bit convention" {
     const t = std.testing;
     // Byte 0x01 -> bit 0 set (LSB-first), matching spec §2.1's "index 0
     // is the least-significant bit".
-    var bytes = [_]u8{0} ** R128.n_bytes;
+    var bytes = @as([R128.n_bytes]u8, @splat(0));
     bytes[0] = 0x01;
     const v = R128.fromBytes(&bytes);
     try t.expectEqual(@as(u1, 1), R128.getBit(v, 0));
     try t.expectEqual(@as(u1, 0), R128.getBit(v, 1));
 
     var rng = std.Random.DefaultPrng.init(7);
-    var raw = [_]u8{0} ** R128.n_bytes;
+    var raw = @as([R128.n_bytes]u8, @splat(0));
     rng.random().bytes(&raw);
     const parsed = R128.fromBytes(&raw);
-    var out = [_]u8{0} ** R128.n_bytes;
+    var out = @as([R128.n_bytes]u8, @splat(0));
     R128.toBytes(parsed, &out);
     // Top bits beyond n get masked on the way in, so re-encode must equal
     // the masked value, not necessarily the raw random bytes verbatim.
@@ -699,7 +699,7 @@ test "fromBytes zeroes bits >= n even when the raw source bytes have them set (L
     // carries whatever was in bits >= n straight through unchanged. This
     // test asserts the canonical invariant directly against a RAW byte
     // source with every bit set, including the ones beyond n.
-    const raw = [_]u8{0xFF} ** R128.n_bytes;
+    const raw = @as([R128.n_bytes]u8, @splat(0xFF));
     const v = R128.fromBytes(&raw);
     var i: u32 = R128.bit_len;
     while (i < R128.words * 64) : (i += 1) {

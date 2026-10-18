@@ -13,16 +13,16 @@ pub fn build(b: *std.Build) void {
     // want from a binary handling keys; `-Doptimize=ReleaseFast` if you have
     // measured that you need it.
     //
-    // ⚠ NOT `standardOptimizeOption(.{ .preferred_optimize_mode = .ReleaseSafe })`,
+    // ⚠ NOT `standardOptimizeOption(.{ .preferred_optimize_mode = .safe })`,
     // which is what the sibling apps started as and which does neither of the
     // two things the sentence above promises. Read std's implementation: given
     // a preferred mode it registers `-Drelease=[bool]` and NOT `-Doptimize` at
-    // all, and with no flag it returns `.Debug`.
+    // all, and with no flag it returns `.debug`.
     const optimize = b.option(
         std.builtin.OptimizeMode,
         "optimize",
         "Prioritize performance, safety, or binary size (default: ReleaseSafe)",
-    ) orelse .ReleaseSafe;
+    ) orelse .safe;
 
     const zig_libs = b.dependency("zig_libs", .{ .target = target, .optimize = optimize });
 
@@ -46,6 +46,6 @@ pub fn build(b: *std.Build) void {
 
     const run = b.addRunArtifact(exe);
     run.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run.addArgs(args);
+    run.addPassthruArgs();
     b.step("run", "Build and run (pass args after --, e.g. -- info --in msg.tc)").dependOn(&run.step);
 }

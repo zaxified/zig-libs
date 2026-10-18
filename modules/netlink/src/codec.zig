@@ -747,7 +747,7 @@ test "message iterator: single and multi-part with NLMSG_DONE" {
 
 test "message iterator rejects truncated and bad-length headers" {
     // Buffer shorter than one header.
-    var it: MessageIterator = .{ .buf = &[_]u8{0} ** 10 };
+    var it: MessageIterator = .{ .buf = &@as([10]u8, @splat(0)) };
     try testing.expectError(error.Truncated, it.next());
     // Declared length smaller than the header itself.
     var small: [16]u8 = @splat(0);
@@ -770,7 +770,7 @@ test "NLMSG_ERROR payload yields the errno (and ACK)" {
     std.mem.writeInt(i32, &code, -1, native_endian); // -EPERM
     try appendPadded(gpa, &list, &code);
     // struct nlmsgerr also carries the offending header; append one.
-    try appendPadded(gpa, &list, &([_]u8{0} ** header_len));
+    try appendPadded(gpa, &list, &(@as([header_len]u8, @splat(0))));
     finishHeader(&list, h);
 
     var it: MessageIterator = .{ .buf = list.items };
@@ -801,7 +801,7 @@ test "a nest that cannot fit an nlattr length is refused, not truncated" {
     const off = try nestBegin(gpa, &list, 1);
     // 700 * 100 bytes = 70 000, comfortably past 65535.
     var i: usize = 0;
-    while (i < 700) : (i += 1) try appendAttr(gpa, &list, 2, &[_]u8{0xAA} ** 96);
+    while (i < 700) : (i += 1) try appendAttr(gpa, &list, 2, &@as([96]u8, @splat(0xAA)));
     try std.testing.expectError(error.AttrTooLong, nestEnd(&list, off));
     // And the header is left as `nestBegin` wrote it -- no half-truth on the
     // wire even if a caller ignores the error.
@@ -848,7 +848,7 @@ test "extended ACK: NLMSGERR_ATTR_MSG extracted for capped and echoed errors" {
     var code: [4]u8 = undefined;
     std.mem.writeInt(i32, &code, -22, native_endian); // -EINVAL
     try appendPadded(gpa, &capped, &code);
-    try appendPadded(gpa, &capped, &([_]u8{0} ** header_len)); // echoed request hdr
+    try appendPadded(gpa, &capped, &(@as([header_len]u8, @splat(0)))); // echoed request hdr
     try appendAttrString(gpa, &capped, NLMSGERR_ATTR.MSG, "Unknown device type");
     finishHeader(&capped, h1);
 
@@ -976,7 +976,7 @@ test "big-endian accessors read network order and reject wrong widths" {
     try testing.expectEqual(@as(u32, 10), try a32.asBe32());
     try testing.expectError(error.BadLength, a32.asBe16());
 
-    const a64: Attr = .{ .type = 1, .raw_type = 1, .data = &(([_]u8{0} ** 7) ++ [_]u8{0x2a}) };
+    const a64: Attr = .{ .type = 1, .raw_type = 1, .data = &((@as([7]u8, @splat(0))) ++ [_]u8{0x2a}) };
     try testing.expectEqual(@as(u64, 42), try a64.asBe64());
     try testing.expectError(error.BadLength, a64.asBe16());
 
@@ -1146,7 +1146,7 @@ const Corpus = struct {
         var link: std.ArrayList(u8) = .empty;
         {
             var attrs: std.ArrayList(u8) = .empty;
-            try appendPadded(gpa, &attrs, &[_]u8{0} ** 16);
+            try appendPadded(gpa, &attrs, &@as([16]u8, @splat(0)));
             try appendAttrString(gpa, &attrs, 3, "lo"); // IFLA_IFNAME
             try appendAttrU32(gpa, &attrs, 4, 65536); // IFLA_MTU
             const nest = try nestBegin(gpa, &attrs, 18); // IFLA_LINKINFO
@@ -1213,7 +1213,7 @@ const Corpus = struct {
         self.push(&overrun, 0);
 
         // Fifteen octets: one short of a header.
-        self.push(&[_]u8{0} ** 15, 0);
+        self.push(&@as([15]u8, @splat(0)), 0);
 
         // A well-formed header whose attribute declares 200 octets of payload.
         var attr_overrun: std.ArrayList(u8) = .empty;

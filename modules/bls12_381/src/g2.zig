@@ -418,7 +418,7 @@ pub fn toBytesUncompressed(p: Affine) [uncompressed_bytes]u8 {
 /// `Fp2.isLexicographicallyLargest` (REAL, `fp2.zig`).
 pub fn toBytesCompressed(p: Affine) [compressed_bytes]u8 {
     if (p.infinity) {
-        var out: [compressed_bytes]u8 = [_]u8{0} ** compressed_bytes;
+        var out: [compressed_bytes]u8 = @as([compressed_bytes]u8, @splat(0));
         out[0] = packFlags(0, .{ .compression = true, .infinity = true, .sort = false });
         return out;
     }
@@ -682,7 +682,7 @@ test "G2 scalarMul edge cases and distributivity" {
     try expectSamePoint(g.scalarMul(Fr.one), g);
     const two = Fr.one.add(Fr.one);
     try expectSamePoint(g.scalarMul(two), g.double());
-    var a_bytes = [_]u8{0} ** 32;
+    var a_bytes = @as([32]u8, @splat(0));
     a_bytes[31] = 0x2f;
     a_bytes[20] = 0xe1;
     const sa = try Fr.fromBytes(a_bytes);
@@ -694,7 +694,7 @@ test "G2 subgroupCheck: generator passes, non-subgroup twist point fails; clearC
     // x = u (c0 = 0, c1 = 1) gives an on-twist point NOT in the
     // order-r subgroup (verified independently: [r]P != O — see
     // NOTICE). Constructed via decompression (c1 || c0 wire order).
-    var comp = [_]u8{0} ** compressed_bytes;
+    var comp = @as([compressed_bytes]u8, @splat(0));
     comp[0] = 0x80; // compression flag, sort = 0; x.c1's top byte
     comp[Fp.encoded_bytes - 1] = 1; // x.c1 = 1
     try std.testing.expectError(error.NotInSubgroup, fromBytesCompressed(comp));

@@ -98,11 +98,11 @@ fn zero(buf: []u32) void {
 
 /// Context id (UTF8 mode) -> one of two contexts: after a byte 0x80..0xBF
 /// or not (`kStaticContextMapSimpleUTF8`).
-const map_simple_utf8: [64]u8 = .{ 0, 0, 1, 1 } ++ .{0} ** 60;
+const map_simple_utf8: [64]u8 = [_]u8{ 0, 0, 1, 1 } ++ @as([60]u8, @splat(0));
 /// Three contexts: after ASCII, after a UTF-8 lead byte, after a
 /// continuation byte (`kStaticContextMapContinuation`).
-const map_continuation: [64]u8 = .{ 1, 1, 2, 2 } ++ .{0} ** 60;
-pub const map_single: [64]u8 = .{0} ** 64;
+const map_continuation: [64]u8 = [_]u8{ 1, 1, 2, 2 } ++ @as([60]u8, @splat(0));
+pub const map_single: [64]u8 = @splat(0);
 /// Thirteen contexts for long inputs (`kStaticContextMapComplexUTF8`): by
 /// the class of the byte before (control, line feed, space, punctuation
 /// groups, digit, letter) and whether the byte before that was one too.
@@ -479,10 +479,10 @@ test "Splitter: a short stream is one block of its real length; none is one empt
 }
 
 test "chooseStaticContexts: ASCII text one context, mixed UTF-8 more, quality 6 never three" {
-    const ascii = "the quick brown fox jumps over the lazy dog " ** 200;
+    const ascii = strRepeat("the quick brown fox jumps over the lazy dog ", 200);
     try testing.expectEqual(@as(u32, 1), chooseStaticContexts(ascii, 9, 0).n);
     // Two-byte UTF-8 (Cyrillic): lead and continuation bytes alternate.
-    const cyr = "привет мир, как дела? " ** 400;
+    const cyr = strRepeat("привет мир, как дела? ", 400);
     const q9 = chooseStaticContexts(cyr, 9, 0);
     try testing.expect(q9.n >= 2);
     try testing.expect(chooseStaticContexts(cyr, 6, 0).n <= 2);
@@ -525,7 +525,7 @@ test "chooseStaticContexts: the thresholds between one, two and three contexts" 
     // (Entropies per literal from the sampled bigrams.) ASCII and lead bytes
     // alternating: two contexts save nothing (e1 - e2 = 0), three save a
     // whole bit — three, not one: one context needs BOTH savings small.
-    const alt = comptime classBytes("02" ** 32);
+    const alt = comptime classBytes(strRepeat("02", 32));
     try testing.expectEqual(@as(u32, 3), chooseStaticContexts(&alt, 9, 0).n);
     // e1 1.436, e2 0.671, e3 0.556 bits: the third context saves 0.115, past
     // the 0.02 that keeps two.
@@ -572,4 +572,16 @@ test "Splitter: a block about as close to both last types joins the last one" {
     try testing.expectEqual(@as(u32, 2), sp.ntypes);
     try testing.expectEqualSlices(u8, &.{ 0, 1 }, sp.types);
     try testing.expectEqualSlices(u32, &.{ 512, 1024 }, sp.lens);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

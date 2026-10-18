@@ -767,7 +767,7 @@ pub const P256 = struct {
     /// `s·p` by width-`wnaf_w` NAF over a batch-normalised affine table of the
     /// odd multiples. `p` must not be the identity (caller-checked).
     fn mulPublicJac(p: P256, s: u256) Jac {
-        var naf: [wnaf_len]i8 = [_]i8{0} ** wnaf_len;
+        var naf: [wnaf_len]i8 = @as([wnaf_len]i8, @splat(0));
         const l = computeWnaf(s, &naf);
         const tab = oddMultiplesAffine(p);
         var q = Jac.identity;
@@ -782,8 +782,8 @@ pub const P256 = struct {
 
     /// Interleaved wNAF (Straus–Shamir) for two arbitrary non-identity bases.
     fn mulDoubleBaseJac(p1: P256, s1: u256, p2: P256, s2: u256) Jac {
-        var naf1: [wnaf_len]i8 = [_]i8{0} ** wnaf_len;
-        var naf2: [wnaf_len]i8 = [_]i8{0} ** wnaf_len;
+        var naf1: [wnaf_len]i8 = @as([wnaf_len]i8, @splat(0));
+        var naf2: [wnaf_len]i8 = @as([wnaf_len]i8, @splat(0));
         const l1 = computeWnaf(s1, &naf1);
         const l2 = computeWnaf(s2, &naf2);
         const l = @max(l1, l2);
@@ -1337,7 +1337,7 @@ test "GATED differential: point_asm programs == the Zig Jacobian formulas, bit f
     const edges = [_]u256{ 0, 1, 2, p_minus_1, p_minus_1 - 1, 1 << 255, (1 << 224) - 1, 1 << 64 };
     var prng = std.Random.DefaultPrng.init(0x9256_a5a5);
     const rand = prng.random();
-    const iters: usize = if (builtin.mode == .Debug) 4000 else 40000;
+    const iters: usize = if (builtin.mode == .debug) 4000 else 40000;
     var i: usize = 0;
     while (i < iters) : (i += 1) {
         var c: [5]field.Fe = undefined;
@@ -1431,8 +1431,8 @@ test "basePoint.mulPublic takes the fixed-base table and agrees with std + the C
         }
     }
     // Zero → the identity → rejected, like std.
-    try std.testing.expectError(error.IdentityElement, P256.basePoint.mulPublic([_]u8{0} ** 32, .big));
-    try std.testing.expectError(error.IdentityElement, Std.basePoint.mul([_]u8{0} ** 32, .big));
+    try std.testing.expectError(error.IdentityElement, P256.basePoint.mulPublic(@as([32]u8, @splat(0)), .big));
+    try std.testing.expectError(error.IdentityElement, Std.basePoint.mul(@as([32]u8, @splat(0)), .big));
 }
 
 test "mulDoubleBasePublic with G in either slot, and with neither, matches std" {
@@ -1471,7 +1471,7 @@ test "mulDoubleBasePublic with G in either slot, and with neither, matches std" 
     const g_other = P256.basePoint.dbl().add(P256.basePoint.neg()); // G, but not `isBasePointRepr`
     try std.testing.expect(!g_other.isBasePointRepr());
     const got = try P256.mulDoubleBasePublic(P256.basePoint, sb, g_other, sb, .big);
-    try eqAffine(got, try Std.basePoint.mul([_]u8{0} ** 31 ++ [_]u8{14}, .big));
+    try eqAffine(got, try Std.basePoint.mul(@as([31]u8, @splat(0)) ++ [_]u8{14}, .big));
 }
 
 // Debug: this test (7 std-touching point ops per draw: two basePoint muls,
@@ -1483,7 +1483,7 @@ test "mulDoubleBasePublic with G in either slot, and with neither, matches std" 
 // there) is the cost, not a bug in the code under test (same shape as the
 // k256 `oracle_test.comb` fix, `14b2e983`). ReleaseFast/ReleaseSafe/
 // ReleaseSmall keep the full count -- they are fast enough already.
-const group_diff_iters: usize = if (builtin.mode == .Debug) 30 else 400;
+const group_diff_iters: usize = if (builtin.mode == .debug) 30 else 400;
 
 test "differential vs std: dbl/add/scalarmul/combMulBase on random scalars" {
     var prng = std.Random.DefaultPrng.init(0x60D_C0DE_9256);
@@ -1545,7 +1545,7 @@ test "recoverY / lift_x matches std (a = −3 curve equation)" {
 // compressed/uncompressed/malformed) lives separately in "corpus: every
 // SEC1 seed reaches fromSec1" below, unconditionally in every mode -- this
 // only trims the random-sample count.
-const sec1_roundtrip_iters: usize = if (builtin.mode == .Debug) 100 else 300;
+const sec1_roundtrip_iters: usize = if (builtin.mode == .debug) 100 else 300;
 
 test "SEC1 round-trip (compressed + uncompressed) matches std" {
     var prng = std.Random.DefaultPrng.init(0x5EC1_9256);
@@ -1656,10 +1656,10 @@ fn fuzzFromSec1(_: void, smith: *std.testing.Smith) !void {
 
 const fuzz_driver = @import("testkit").fuzz.driver;
 const FuzzLabel = enum { raw_rejected, raw_accepted, roundtrip, flip_rejected };
-var fuzz_reach: [@typeInfo(FuzzLabel).@"enum".fields.len]usize = @splat(0);
+var fuzz_reach: [@typeInfo(FuzzLabel).@"enum".field_names.len]usize = @splat(0);
 
 fn mark(comptime l: FuzzLabel) void {
-    fuzz_reach[@intFromEnum(l)] += 1;
+    fuzz_reach[@backingInt(l)] += 1;
     fuzz_driver.hit(@tagName(l));
 }
 
@@ -1678,7 +1678,7 @@ test "fuzz harness: 300 seeds in every test run, and they get everywhere" {
         };
     }
     for (fuzz_reach, 0..) |n, i| {
-        const l: FuzzLabel = @enumFromInt(i);
+        const l: FuzzLabel = @fromBackingInt(@intCast(i));
         // A random SEC1 string is accepted only as the lone tag 0x00 (the
         // identity), which is 1 in ~2^8 per input; the roundtrip overlay below
         // covers the accepting paths, so `raw_accepted` is not demanded.

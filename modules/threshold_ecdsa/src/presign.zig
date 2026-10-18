@@ -379,7 +379,7 @@ fn randomScalar(random: std.Random) Scalar {
 /// both the message digest and `R.x`, so `m` and `r` here are the values
 /// std's verifier recomputes.
 fn scalarFromHash32(bytes32: [32]u8) Scalar {
-    var wide = [_]u8{0} ** 48;
+    var wide = @as([48]u8, @splat(0));
     wide[16..48].* = bytes32;
     return Scalar.fromBytes48(wide, .big);
 }
@@ -2667,7 +2667,7 @@ fn signAll(allocator: std.mem.Allocator, presigs: []Presignature, message: Messa
 }
 
 test "presign: per-signer state machines, 2-of-3 and 3-of-3, sign bytes and a prehashed digest; std ECDSA verifies" {
-    if (builtin.mode == .Debug) return error.SkipZigTest;
+    if (builtin.mode == .debug) return error.SkipZigTest;
     const allocator = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x7072_6573_6967_6e31);
     const random = prng.random();
@@ -2797,22 +2797,22 @@ fn expectDeviationsAbort(cases: []const DeviationExpect) !void {
 }
 
 test "presign: every deviation aborts every honest signer, naming the cheater where GG20 §4.2 can (proofs)" {
-    if (builtin.mode == .Debug) return error.SkipZigTest;
+    if (builtin.mode == .debug) return error.SkipZigTest;
     try expectDeviationsAbort(deviation_cases[0..8]);
 }
 
 test "presign: every deviation aborts every honest signer, naming the cheater where GG20 §4.2 can (transport)" {
-    if (builtin.mode == .Debug) return error.SkipZigTest;
+    if (builtin.mode == .debug) return error.SkipZigTest;
     try expectDeviationsAbort(deviation_cases[8..16]);
 }
 
 test "presign: every deviation aborts every honest signer, naming the cheater where GG20 §4.2 can (attestations, sums)" {
-    if (builtin.mode == .Debug) return error.SkipZigTest;
+    if (builtin.mode == .debug) return error.SkipZigTest;
     try expectDeviationsAbort(deviation_cases[16..]);
 }
 
 test "presign: §4.3 opening — a signer lying in its opening is named by everyone who received the lie" {
-    if (builtin.mode == .Debug) return error.SkipZigTest;
+    if (builtin.mode == .debug) return error.SkipZigTest;
     const allocator = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x6f70_656e_6c69_65);
     const random = prng.random();
@@ -2868,17 +2868,17 @@ fn expectOpeningNamesLiar(cases: []const OpeningCase) !void {
 }
 
 test "presign: §4.3 opening — a forged round-2 message or a decryption lifted by N names the opener (lies, malformed)" {
-    if (builtin.mode == .Debug) return error.SkipZigTest;
+    if (builtin.mode == .debug) return error.SkipZigTest;
     try expectOpeningNamesLiar(opening_cases[0..7]);
 }
 
 test "presign: §4.3 opening — a forged round-2 message or a decryption lifted by N names the opener (late messages)" {
-    if (builtin.mode == .Debug) return error.SkipZigTest;
+    if (builtin.mode == .debug) return error.SkipZigTest;
     try expectOpeningNamesLiar(opening_cases[7..]);
 }
 
 test "presign: an opening shown two ways is caught by the echo round, its signer named by everyone (review F5)" {
-    if (builtin.mode == .Debug) return error.SkipZigTest;
+    if (builtin.mode == .debug) return error.SkipZigTest;
     const allocator = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x6563_686f_6f70_656e);
     const random = prng.random();
@@ -2894,7 +2894,7 @@ test "presign: an opening shown two ways is caught by the echo round, its signer
 }
 
 test "presign: an abandoned §4.3 opening wipes the kept secrets at once (review F11)" {
-    if (builtin.mode == .Debug) return error.SkipZigTest;
+    if (builtin.mode == .debug) return error.SkipZigTest;
     const allocator = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x6162_616e_646f_6e);
     const random = prng.random();
@@ -2907,7 +2907,7 @@ test "presign: an abandoned §4.3 opening wipes the kept secrets at once (review
 }
 
 test "presign: a pooled presignature survives encoding, is taken at most once, and signs" {
-    if (builtin.mode == .Debug) return error.SkipZigTest;
+    if (builtin.mode == .debug) return error.SkipZigTest;
     const allocator = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x706f_6f6c);
     const random = prng.random();
@@ -3088,7 +3088,7 @@ fn fuzzPresigDecode(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!
 }
 
 test "presign: a wrong signature share is named by combine; a missing or foreign one is refused" {
-    if (builtin.mode == .Debug) return error.SkipZigTest;
+    if (builtin.mode == .debug) return error.SkipZigTest;
     const allocator = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x7369_6773_6861_7265);
     const random = prng.random();
@@ -3190,13 +3190,13 @@ test "presign: a wrong signature share is named by combine; a missing or foreign
 }
 
 test "presign: init refuses a bad signer set" {
-    if (builtin.mode == .Debug) return error.SkipZigTest;
+    if (builtin.mode == .debug) return error.SkipZigTest;
     const allocator = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x6261_6473_6574);
     const random = prng.random();
     const kg = try signing.testKeygen(allocator, random, 2, 3);
     defer kg.deinit(allocator);
-    const sid = [_]u8{7} ** 32;
+    const sid = @as([32]u8, @splat(7));
     const share = kg.key_shares[0];
     var scratch: Party = undefined;
     try testing.expectError(error.InvalidParameters, Party.init(allocator, &share, &[_]u32{1}, sid, &scratch));
@@ -3261,13 +3261,13 @@ test "presign: a message signature binds its whole header; peekHeader refuses a 
 }
 
 test "presign: the session id binds the signer set, the threshold and the public-key table (review F9)" {
-    if (builtin.mode == .Debug) return error.SkipZigTest;
+    if (builtin.mode == .debug) return error.SkipZigTest;
     const allocator = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x7373_6964_6269_6e64);
     const random = prng.random();
     const kg = try signing.testKeygen(allocator, random, 2, 3);
     defer kg.deinit(allocator);
-    const sid = [_]u8{3} ** 32;
+    const sid = @as([32]u8, @splat(3));
     const share = kg.key_shares[0];
 
     var base: Party = undefined;
@@ -3354,7 +3354,7 @@ fn fuzzCombine(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void 
     var keys = [_]Ed25519.PublicKey{ kp.public_key, kp.public_key };
     const public: PresignaturePublic = .{
         .allocator = gpa,
-        .sid = [_]u8{0} ** 32,
+        .sid = @as([32]u8, @splat(0)),
         .group_public_key = g,
         .signers = &signers,
         .r_point = g,
@@ -3371,13 +3371,13 @@ fn fuzzCombine(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void 
 }
 
 test "presign: round 1 refuses a party whose own aux tuple or Paillier key fails the peer checks" {
-    if (builtin.mode == .Debug) return error.SkipZigTest;
+    if (builtin.mode == .debug) return error.SkipZigTest;
     const allocator = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x6c6f_6361_6c6b_6579);
     const random = prng.random();
     const kg = try signing.testKeygen(allocator, random, 2, 2);
     defer kg.deinit(allocator);
-    const sid = [_]u8{9} ** 32;
+    const sid = @as([32]u8, @splat(9));
 
     // Own ring-Pedersen tuple with h1 = 1: `AuxParams.validate` refuses it.
     {
@@ -3406,7 +3406,7 @@ test "presign: round 1 refuses a party whose own aux tuple or Paillier key fails
 }
 
 test "presign: the pool refuses a duplicate id, and a record filed under another id" {
-    if (builtin.mode == .Debug) return error.SkipZigTest;
+    if (builtin.mode == .debug) return error.SkipZigTest;
     const allocator = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x706f_6f6c_6964);
     const random = prng.random();

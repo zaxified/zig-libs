@@ -337,7 +337,7 @@ test "square/mul agree with direct std.crypto.ff calls" {
 
 test "elementFromBytes: rejects 0" {
     const m = rsa2048ChallengeModulus();
-    var zero_bytes: [modulus_bytes]u8 = [_]u8{0} ** modulus_bytes;
+    var zero_bytes: [modulus_bytes]u8 = @as([modulus_bytes]u8, @splat(0));
     try testing.expectError(error.ZeroElement, elementFromBytes(m, &zero_bytes));
 }
 
@@ -360,7 +360,7 @@ test "elementFromBytes: rejects N itself and anything >= N (non-canonical)" {
 
 test "elementFromBytes: accepts an ordinary small element" {
     const m = rsa2048ChallengeModulus();
-    var five: [modulus_bytes]u8 = [_]u8{0} ** modulus_bytes;
+    var five: [modulus_bytes]u8 = @as([modulus_bytes]u8, @splat(0));
     five[modulus_bytes - 1] = 5;
     const fe = try elementFromBytes(m, &five);
     try testing.expect(!fe.isZero());
@@ -390,7 +390,7 @@ test "canonicalize/isCanonical/negate: the class {v, N-v} has one representative
 
 test "toBytes: round trip through elementFromBytes" {
     const m = rsa2048ChallengeModulus();
-    var five: [modulus_bytes]u8 = [_]u8{0} ** modulus_bytes;
+    var five: [modulus_bytes]u8 = @as([modulus_bytes]u8, @splat(0));
     five[modulus_bytes - 1] = 5;
     const fe = try elementFromBytes(m, &five);
     var out: [modulus_bytes]u8 = undefined;

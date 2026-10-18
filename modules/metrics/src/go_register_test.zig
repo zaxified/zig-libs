@@ -15,7 +15,7 @@ const vectors = @import("go_register_vectors.zig");
 
 test "go register oracle: the Registry accepts and refuses what client_golang does" {
     var bad: usize = 0;
-    var seen = [_]usize{0} ** vectors.classes.len;
+    var seen = @as([vectors.classes.len]usize, @splat(0));
     for (vectors.cases, 0..) |ops, ci| {
         var reg = metrics.Registry.init(testing.allocator);
         defer reg.deinit();

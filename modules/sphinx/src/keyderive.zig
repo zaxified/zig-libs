@@ -73,7 +73,7 @@ pub fn generateCipherStream(key: *const [32]u8, out: []u8) void {
 }
 
 fn generateCipherStreamBody(key: *const [32]u8, out: []u8) void {
-    const zero_nonce = [_]u8{0} ** ChaCha20IETF.nonce_length;
+    const zero_nonce = @as([ChaCha20IETF.nonce_length]u8, @splat(0));
     ChaCha20IETF.stream(out, 0, key.*, zero_nonce);
 }
 
@@ -87,7 +87,7 @@ fn tKey(key_type: KeyType, ss: [32]u8) [32]u8 {
 // ── tests ────────────────────────────────────────────────────────────────
 
 test "generateKey: distinct key types yield distinct keys for the same secret" {
-    const ss = [_]u8{0x42} ** 32;
+    const ss = @as([32]u8, @splat(0x42));
     const rho = tKey(.rho, ss);
     const mu = tKey(.mu, ss);
     const um = tKey(.um, ss);
@@ -101,7 +101,7 @@ test "generateKey: distinct key types yield distinct keys for the same secret" {
 }
 
 test "generateKey: deterministic, and matches a std-only recomputation (HMAC-key/message roles)" {
-    const ss = [_]u8{0x7a} ** 32;
+    const ss = @as([32]u8, @splat(0x7a));
     const a = tKey(.rho, ss);
     const b = tKey(.rho, ss);
     try std.testing.expectEqualSlices(u8, &a, &b);
@@ -123,7 +123,7 @@ test "generateKey: the four labels have no 0x00 terminator (3/2/2/3 bytes)" {
 }
 
 test "generateCipherStream: deterministic, full-length, and matches raw ChaCha20IETF.stream" {
-    const key = [_]u8{0x11} ** 32;
+    const key = @as([32]u8, @splat(0x11));
     var a: [1300]u8 = undefined;
     var b: [1300]u8 = undefined;
     generateCipherStream(&key, &a);
@@ -131,7 +131,7 @@ test "generateCipherStream: deterministic, full-length, and matches raw ChaCha20
     try std.testing.expectEqualSlices(u8, &a, &b);
 
     var expected: [1300]u8 = undefined;
-    ChaCha20IETF.stream(&expected, 0, key, [_]u8{0} ** ChaCha20IETF.nonce_length);
+    ChaCha20IETF.stream(&expected, 0, key, @as([ChaCha20IETF.nonce_length]u8, @splat(0)));
     try std.testing.expectEqualSlices(u8, &expected, &a);
 
     // Not all-zero (sanity: this is really ChaCha20 output, not a memset).
@@ -141,7 +141,7 @@ test "generateCipherStream: deterministic, full-length, and matches raw ChaCha20
 test "generateCipherStream: different keys produce different streams" {
     var a: [64]u8 = undefined;
     var b: [64]u8 = undefined;
-    generateCipherStream(&([_]u8{1} ** 32), &a);
-    generateCipherStream(&([_]u8{2} ** 32), &b);
+    generateCipherStream(&(@as([32]u8, @splat(1))), &a);
+    generateCipherStream(&(@as([32]u8, @splat(2))), &b);
     try std.testing.expect(!std.mem.eql(u8, &a, &b));
 }

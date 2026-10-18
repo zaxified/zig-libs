@@ -36,7 +36,7 @@ pub const init_networks_chain_hash =
 /// `0x02`, `data` = the ASCII string `"rust-lightning"`.
 pub const error_payload_hex =
     "0202020202020202020202020202020202020202020202020202020202020202000e727573742d6c696768746e696e67";
-pub const error_channel_id = [_]u8{0x02} ** 32;
+pub const error_channel_id = @as([32]u8, @splat(0x02));
 pub const error_data = "rust-lightning";
 
 /// `ping`: `ponglen = 64`, `byteslen = 64`, 64 zero-filled `ignored` bytes.

@@ -87,7 +87,7 @@ pub const nonce_tag = "adaptor/nonce";
 /// would reject instead of reduce). Duplicated locally per `musig2`'s own
 /// precedent — `bip340` does not export its private `reduceToScalar`.
 fn reduceToScalar(bytes32: [32]u8) Scalar {
-    var wide = [_]u8{0} ** 48;
+    var wide = @as([48]u8, @splat(0));
     wide[16..48].* = bytes32;
     return Scalar.fromBytes48(wide, .big);
 }
@@ -763,18 +763,18 @@ test "PreSignature round-trips through fromBytes/toBytes (codec only, no crypto 
 test "audit F7: AdaptorPoint.fromBytes rejects all four malformed SEC1 shapes" {
     // x = 0 with prefix 0x02: y^2 = 7, and 7 has no square root mod p — no
     // on-curve solution.
-    var no_solution = [_]u8{0} ** 33;
+    var no_solution = @as([33]u8, @splat(0));
     no_solution[0] = 0x02;
     try std.testing.expectError(error.InvalidAdaptorPoint, AdaptorPoint.fromBytes(no_solution));
 
     // x >= p (all-0xFF x bytes with a valid-looking prefix).
-    var x_too_large = [_]u8{0xFF} ** 33;
+    var x_too_large = @as([33]u8, @splat(0xFF));
     x_too_large[0] = 0x02;
     try std.testing.expectError(error.InvalidAdaptorPoint, AdaptorPoint.fromBytes(x_too_large));
 
     // An otherwise-valid compressed point with the uncompressed-form prefix
     // byte (0x04) instead of 0x02/0x03.
-    var uncompressed_prefix = (try AdaptorPoint.fromSecret(&([_]u8{0x01} ** 31 ++ [_]u8{0x01}))).toBytes();
+    var uncompressed_prefix = (try AdaptorPoint.fromSecret(&(@as([31]u8, @splat(0x01)) ++ [_]u8{0x01}))).toBytes();
     uncompressed_prefix[0] = 0x04;
     try std.testing.expectError(error.InvalidAdaptorPoint, AdaptorPoint.fromBytes(uncompressed_prefix));
 
@@ -785,7 +785,7 @@ test "audit F7: AdaptorPoint.fromBytes rejects all four malformed SEC1 shapes" {
 }
 
 test "PreSignature.fromBytes rejects a flag byte other than 0/1" {
-    var bytes: [65]u8 = [_]u8{0} ** 65;
+    var bytes: [65]u8 = @as([65]u8, @splat(0));
     bytes[0] = 1;
     bytes[32] = 1;
     bytes[64] = 2;
@@ -793,7 +793,7 @@ test "PreSignature.fromBytes rejects a flag byte other than 0/1" {
 }
 
 test "AdaptorPoint.fromSecret round-trips through .point() to the same secp256k1 point basePoint.mul gives directly" {
-    const t_bytes = [_]u8{0x01} ** 31 ++ [_]u8{0x02}; // arbitrary small nonzero scalar
+    const t_bytes = @as([31]u8, @splat(0x01)) ++ [_]u8{0x02}; // arbitrary small nonzero scalar
     const ap = try AdaptorPoint.fromSecret(&t_bytes);
     const got = try ap.point();
     const want = try Secp256k1.combMulBase(t_bytes, .big);
@@ -820,7 +820,7 @@ test "audit F1: AdaptorPoint.fromSecret rejects adaptor_secret >= n (matches ada
     // Control: `n + 1` and `1` used to alias to the SAME point (mod-n
     // reduction) — confirm that pre-fix aliasing is what's being refused,
     // not something unrelated.
-    const one = [_]u8{0x00} ** 31 ++ [_]u8{0x01};
+    const one = @as([31]u8, @splat(0x00)) ++ [_]u8{0x01};
     const t_one = try AdaptorPoint.fromSecret(&one);
     _ = t_one;
 
@@ -833,11 +833,11 @@ test "audit F1: AdaptorPoint.fromSecret rejects adaptor_secret >= n (matches ada
 }
 
 test "A1 F5 (round-2 follow-up): preSignImpl enforces step 9 on the REAL production path, not just in a standalone check function" {
-    const sk = try bip340.SecretKey.fromBytes([_]u8{0x42} ** 32);
-    const t_bytes = [_]u8{0x01} ** 31 ++ [_]u8{0x07};
+    const sk = try bip340.SecretKey.fromBytes(@as([32]u8, @splat(0x42)));
+    const t_bytes = @as([31]u8, @splat(0x01)) ++ [_]u8{0x07};
     const adaptor_point = try AdaptorPoint.fromSecret(&t_bytes);
     const msg = "A1 F5 adaptor regression";
-    const aux_rand = [_]u8{0xCD} ** 32;
+    const aux_rand = @as([32]u8, @splat(0xCD));
 
     // Positive control: preSignImpl with the real computation is exactly
     // what preSign() does -- same fields, no regression from the seam.

@@ -121,7 +121,7 @@ fn trailerHandler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!voi
     }
 }
 
-const streamed_body = "abcdefgh" ** 512; // 4 KiB: several chunks / DATA frames
+const streamed_body = strRepeat("abcdefgh", 512); // 4 KiB: several chunks / DATA frames
 const download_chunks = 64; // × 4 KiB = 256 KiB, far past any buffer
 const upload_bytes = 256 * 1024; // ≫ the 65 535-octet initial window
 
@@ -566,4 +566,16 @@ test "LIVE curl: HTTP/2 trailers survive a multi-DATA-frame streamed body" {
     defer gpa.free(dump);
     const split = try splitHeaderDump(dump);
     try testing.expect(std.mem.indexOf(u8, split.after_head, "x-checksum: deadbeef") != null);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

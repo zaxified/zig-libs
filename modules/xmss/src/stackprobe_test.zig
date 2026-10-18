@@ -320,7 +320,7 @@ fn buildNeedles(needles: *Needles, used: ?u32) void {
 var needle_set: Needles = .{};
 
 test "STACKPROBE: no seed or WOTS+ chain value on the dead stack after keyGen and sign" {
-    if (builtin.mode == .Debug or builtin.mode == .ReleaseSafe) return error.SkipZigTest;
+    if (builtin.mode == .debug or builtin.mode == .safe) return error.SkipZigTest;
 
     leak_src = sk_seed;
     X.keyGen(&pristine, &sk_seed, &sk_prf, &pub_seed);

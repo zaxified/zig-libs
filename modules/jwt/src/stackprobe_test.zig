@@ -276,7 +276,7 @@ fn runProbe(label: []const u8, call: *const fn () void, n: *const Needles) !usiz
 }
 
 fn skipUnlessOptimized() !void {
-    if (builtin.mode == .Debug or builtin.mode == .ReleaseSafe) return error.SkipZigTest;
+    if (builtin.mode == .debug or builtin.mode == .safe) return error.SkipZigTest;
 }
 
 /// Distinct byte values in a window: below 8 it is padding or a zero run.
@@ -400,7 +400,7 @@ fn mldsaNeedles(n: *Needles, kp: anytype, seed: [32]u8, signed: []const u8) void
     var rho_prime: [64]u8 = undefined;
     var hr = Shake256.init(.{});
     hr.update(&kp.secret_key.key);
-    hr.update(&([_]u8{0} ** 32)); // deterministic: rnd = 0
+    hr.update(&(@as([32]u8, @splat(0)))); // deterministic: rnd = 0
     hr.update(&mu);
     hr.squeeze(&rho_prime);
     n.addImage("rho'", &rho_prime);

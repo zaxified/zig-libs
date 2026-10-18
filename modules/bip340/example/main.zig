@@ -144,7 +144,7 @@ pub fn main() !void {
     // ── negative paths at the wire boundary: named errors only ─────────
 
     // (1) An all-zero secret key: BIP340 requires d in [1, n-1].
-    if (bip340.SecretKey.fromBytes([_]u8{0} ** 32)) |_| {
+    if (bip340.SecretKey.fromBytes(@as([32]u8, @splat(0)))) |_| {
         return error.UnexpectedAccept;
     } else |err| switch (err) {
         error.InvalidSecretKey => std.debug.print("all-zero secret key: InvalidSecretKey (expected)\n", .{}),

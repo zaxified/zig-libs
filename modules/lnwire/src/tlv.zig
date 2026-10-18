@@ -458,7 +458,7 @@ test "TLV Appendix B: decoding failures (either namespace)" {
     }
     // value truncated: length=0x0201=513 but far fewer value bytes follow.
     {
-        const b = try hexBytes(allocator, "0ffd0201" ++ "00" ** 258);
+        const b = try hexBytes(allocator, "0ffd0201" ++ strRepeat("00", 258));
         defer allocator.free(b);
         try testing.expectError(error.Truncated, n1Decode(allocator, b));
     }
@@ -708,7 +708,7 @@ fn buildStream(allocator: Allocator, script: []const u8, out: *std.ArrayList(u8)
 const stream_seeds = [_][]const u8{
     // Twelve records, all typeForm=1/type=0/length=0: strictly-NON-increasing,
     // so `NotStrictlyIncreasing` fires on record two. Tail length 0.
-    seed("0B" ++ "01" ++ "00" ++ "01" ++ "00" ++ ("00" ** 16) ++ "00"),
+    seed("0B" ++ "01" ++ "00" ++ "01" ++ "00" ++ (strRepeat("00", 16)) ++ "00"),
     // Four records with ASCENDING known types 0, 1, 2, 3 — four of the five
     // `known_types` this harness parses against, so this is the one stream
     // that actually fills `parsed.records`.
@@ -721,26 +721,26 @@ const stream_seeds = [_][]const u8{
     // what the first draft of this corpus did, and what the pinned counts
     // caught.
     seed("03" ++
-        "01" ++ "00" ++ "01" ++ "03" ++ "AABBCC" ++ ("00" ** 13) ++
-        "01" ++ "01" ++ "01" ++ "03" ++ "DDEEFF" ++ ("00" ** 13) ++
-        "01" ++ "02" ++ "01" ++ "03" ++ "112233" ++ ("00" ** 13) ++
-        "01" ++ "03" ++ "01" ++ "00" ++ ("00" ** 16) ++
+        "01" ++ "00" ++ "01" ++ "03" ++ "AABBCC" ++ (strRepeat("00", 13)) ++
+        "01" ++ "01" ++ "01" ++ "03" ++ "DDEEFF" ++ (strRepeat("00", 13)) ++
+        "01" ++ "02" ++ "01" ++ "03" ++ "112233" ++ (strRepeat("00", 13)) ++
+        "01" ++ "03" ++ "01" ++ "00" ++ (strRepeat("00", 16)) ++
         "00"),
     // One record of type 4: unknown and EVEN, which BOLT#1 says must be
     // refused with `UnknownEvenType`.
-    seed("00" ++ "01" ++ "04" ++ "01" ++ "01" ++ "AA" ++ ("00" ** 15) ++ "00"),
+    seed("00" ++ "01" ++ "04" ++ "01" ++ "01" ++ "AA" ++ (strRepeat("00", 15)) ++ "00"),
     // One record of type 5: unknown and ODD, which must be tolerated by being
     // discarded — so this stream parses and yields NO record.
-    seed("00" ++ "01" ++ "05" ++ "01" ++ "01" ++ "AA" ++ ("00" ** 15) ++ "00"),
+    seed("00" ++ "01" ++ "05" ++ "01" ++ "01" ++ "AA" ++ (strRepeat("00", 15)) ++ "00"),
     // One known record followed by a 32-octet tail of 0xFF: the tail is not a
     // record, so this is the truncation path behind a valid prefix.
-    seed("00" ++ "01" ++ "00" ++ "01" ++ "02" ++ "AABB" ++ ("00" ** 14) ++ "20" ++ ("FF" ** 32)),
+    seed("00" ++ "01" ++ "00" ++ "01" ++ "02" ++ "AABB" ++ (strRepeat("00", 14)) ++ "20" ++ (strRepeat("FF", 32))),
     // typeForm=0, so the type octet lands raw: 0xFF is the nine-octet BigSize
     // form and there are not nine octets behind it.
-    seed("00" ++ "00" ++ "FF" ++ "01" ++ "00" ++ ("00" ** 16) ++ "00"),
+    seed("00" ++ "00" ++ "FF" ++ "01" ++ "00" ++ (strRepeat("00", 16)) ++ "00"),
     // Both forms raw: every octet lands verbatim, which is the uniform noise
     // the bias in the old harness existed to steer away from.
-    seed("00" ++ "00" ++ "FD" ++ "00" ++ "00" ++ ("00" ** 16) ++ "20" ++ ("5A" ** 32)),
+    seed("00" ++ "00" ++ "FD" ++ "00" ++ "00" ++ (strRepeat("00", 16)) ++ "20" ++ (strRepeat("5A", 32))),
     // A one-octet script, cycled: the degenerate case, and exactly what the
     // collapsed harness produced on every input for its whole life.
     seed("00"),
@@ -829,4 +829,16 @@ test "corpus: every stream script builds a distinct stream, and the records are 
     defer zero.deinit(allocator);
     try testing.expectEqual(@as(u8, 1), try buildStream(allocator, &.{}, &zero));
     try testing.expectEqualSlices(u8, &.{ 0, 0 }, zero.items);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

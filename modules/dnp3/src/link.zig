@@ -122,11 +122,11 @@ pub const Control = struct {
     function: u4,
 
     pub fn primaryFunction(self: Control) PrimaryFunction {
-        return @enumFromInt(self.function);
+        return @fromBackingInt(@intCast(self.function));
     }
 
     pub fn secondaryFunction(self: Control) SecondaryFunction {
-        return @enumFromInt(self.function);
+        return @fromBackingInt(@intCast(self.function));
     }
 
     pub fn toByte(self: Control) u8 {
@@ -285,11 +285,11 @@ test "CRC-16/DNP known-answer vectors (cross-checked vs. an independent bit-seri
     var seq: [16]u8 = undefined;
     for (&seq, 0..) |*b, i| b.* = @intCast(i);
     try testing.expectEqual(@as(u16, 0x10EC), crc16(&seq));
-    try testing.expectEqual(@as(u16, 0x91E0), crc16(&([_]u8{0xAA} ** 16)));
+    try testing.expectEqual(@as(u16, 0x91E0), crc16(&(@as([16]u8, @splat(0xAA)))));
 }
 
 test "control octet round-trip" {
-    const c = Control{ .dir = true, .prm = true, .fcb = true, .fcv_or_dfc = false, .function = @intFromEnum(PrimaryFunction.confirmed_user_data) };
+    const c = Control{ .dir = true, .prm = true, .fcb = true, .fcv_or_dfc = false, .function = @backingInt(PrimaryFunction.confirmed_user_data) };
     const b = c.toByte();
     try testing.expectEqual(@as(u8, 0xE3), b); // DIR|PRM|FCB | 0x03
     const back = Control.fromByte(b);
@@ -301,7 +301,7 @@ test "control octet round-trip" {
 }
 
 test "frame round-trip: no user data (RESET_LINK_STATES)" {
-    const control = Control{ .dir = true, .prm = true, .function = @intFromEnum(PrimaryFunction.reset_link_states) };
+    const control = Control{ .dir = true, .prm = true, .function = @backingInt(PrimaryFunction.reset_link_states) };
     var out: [32]u8 = undefined;
     const frame = try encodeFrame(control, 1, 1024, &.{}, &out);
     try testing.expectEqual(@as(usize, 10), frame.len);
@@ -317,7 +317,7 @@ test "frame round-trip: no user data (RESET_LINK_STATES)" {
 }
 
 test "frame round-trip: single short block" {
-    const control = Control{ .dir = true, .prm = true, .fcv_or_dfc = true, .function = @intFromEnum(PrimaryFunction.unconfirmed_user_data) };
+    const control = Control{ .dir = true, .prm = true, .fcv_or_dfc = true, .function = @backingInt(PrimaryFunction.unconfirmed_user_data) };
     const payload = "hello dnp3";
     var out: [64]u8 = undefined;
     const frame = try encodeFrame(control, 4, 3, payload, &out);
@@ -331,7 +331,7 @@ test "frame round-trip: single short block" {
 test "frame round-trip: multi-block user data (>16 bytes)" {
     var payload: [40]u8 = undefined;
     for (&payload, 0..) |*b, i| b.* = @intCast(i % 251);
-    const control = Control{ .dir = false, .prm = true, .function = @intFromEnum(PrimaryFunction.unconfirmed_user_data) };
+    const control = Control{ .dir = false, .prm = true, .function = @backingInt(PrimaryFunction.unconfirmed_user_data) };
 
     var out: [80]u8 = undefined;
     const frame = try encodeFrame(control, 7, 8, &payload, &out);
@@ -391,7 +391,7 @@ test "decode: malformed frames never panic" {
     try testing.expectError(error.TruncatedBlock, decodeFrame(frame[0 .. frame.len - 1], &user_buf));
 
     // A sweep of pure garbage of every short length must never panic.
-    var garbage: [24]u8 = .{0xAA} ** 24;
+    var garbage: [24]u8 = @splat(0xAA);
     var len: usize = 0;
     while (len <= garbage.len) : (len += 1) {
         _ = decodeFrame(garbage[0..len], &user_buf) catch {};
@@ -440,7 +440,7 @@ const FrameCorpus = struct {
         self.push(try self.encoded("")); // no user data: header block only
         self.push(try self.encoded("0123456789ABCDEF")); // exactly one full block
         self.push(try self.encoded("0123456789ABCDEF!")); // one octet into block two
-        self.push(try self.encoded(&[_]u8{0x5A} ** max_user_data_len)); // 250: sixteen blocks
+        self.push(try self.encoded(&@as([max_user_data_len]u8, @splat(0x5A)))); // 250: sixteen blocks
 
         // ── refusals, each one octet away from the frame above it ───────────
         {
@@ -468,7 +468,7 @@ const FrameCorpus = struct {
             self.push(f);
         }
         self.push(&[_]u8{ 0x05, 0x64, 0x05, 0xC4, 0x01 }); // ShortFrame: five octets
-        self.push(&[_]u8{0x00} ** 512); // a full buffer of zeroes
+        self.push(&@as([512]u8, @splat(0x00))); // a full buffer of zeroes
         self.push(&.{}); // the empty frame
         return self.entries[0..self.n];
     }

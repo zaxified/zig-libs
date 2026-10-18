@@ -201,7 +201,7 @@ pub fn parse(allocator: Allocator, body: []const u8) (ParseError || Allocator.Er
 
 /// Send `authenticatorGetInfo` over `transport` and parse the answer.
 pub fn get(allocator: Allocator, transport: framing.Transport, max_response: usize) framing.CallError!Info {
-    const resp = try framing.call(allocator, transport, @intFromEnum(framing.Command.get_info), null, max_response);
+    const resp = try framing.call(allocator, transport, @backingInt(framing.Command.get_info), null, max_response);
     defer resp.deinit(allocator);
     return parse(allocator, resp.body);
 }
@@ -223,7 +223,7 @@ fn baseEntries(aaguid: []const u8) [2]cbor.MapEntry {
 
 test "parse: a full PIN-relevant GetInfo" {
     const a = testing.allocator;
-    const aaguid = [_]u8{0xAB} ** 16;
+    const aaguid = @as([16]u8, @splat(0xAB));
     const opts = [_]cbor.MapEntry{
         .{ .key = .{ .text = "clientPin" }, .value = .{ .bool = true } },
         .{ .key = .{ .text = "pinUvAuthToken" }, .value = .{ .bool = true } },
@@ -257,7 +257,7 @@ test "parse: a full PIN-relevant GetInfo" {
 
 test "parse: minimal response, CTAP 2.0 defaults" {
     const a = testing.allocator;
-    const aaguid = [_]u8{0} ** 16;
+    const aaguid = @as([16]u8, @splat(0));
     const b = baseEntries(&aaguid);
     const bytes = try enc(a, .{ .map = &b });
     defer a.free(bytes);
@@ -270,7 +270,7 @@ test "parse: minimal response, CTAP 2.0 defaults" {
 
 test "parse: unknown protocols are dropped, an unspeakable-only list has no preferred protocol" {
     const a = testing.allocator;
-    const aaguid = [_]u8{0} ** 16;
+    const aaguid = @as([16]u8, @splat(0));
     const b = baseEntries(&aaguid);
     const entries = [_]cbor.MapEntry{
         b[0],                                                                                                                       b[1],
@@ -299,7 +299,7 @@ fn expectParseError(expected: anyerror, entries: []const cbor.MapEntry) !void {
 }
 
 test "parse: wrong types, missing and malformed fields are typed errors" {
-    const aaguid = [_]u8{0} ** 16;
+    const aaguid = @as([16]u8, @splat(0));
     const b = baseEntries(&aaguid);
     // missing versions / aaguid
     try expectParseError(error.MissingField, &.{b[1]});
@@ -334,13 +334,13 @@ test "parse: not a map, empty, truncated and trailing bytes" {
 }
 
 test "parse: an aaguid longer than 16 bytes is refused" {
-    const aaguid = [_]u8{0} ** 17;
+    const aaguid = @as([17]u8, @splat(0));
     const b = baseEntries(&aaguid);
     try expectParseError(error.BadLength, &b);
 }
 
 test "parse: a duplicated option id is refused" {
-    const aaguid = [_]u8{0} ** 16;
+    const aaguid = @as([16]u8, @splat(0));
     const b = baseEntries(&aaguid);
     const opts = [_]cbor.MapEntry{
         .{ .key = .{ .text = "uv" }, .value = .{ .bool = true } },
@@ -351,7 +351,7 @@ test "parse: a duplicated option id is refused" {
 
 test "parse: every version string sets its own flag" {
     const a = testing.allocator;
-    const aaguid = [_]u8{0} ** 16;
+    const aaguid = @as([16]u8, @splat(0));
     const b = baseEntries(&aaguid);
     const names = [_][]const u8{ "FIDO_2_1", "FIDO_2_0", "FIDO_2_1_PRE", "U2F_V2" };
     for (names, 0..) |name, which| {

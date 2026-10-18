@@ -56,7 +56,7 @@ const work_dir = ".zig-cache/bench-brotli";
 const default_lib_dir = "/usr/lib/x86_64-linux-gnu";
 const payload_names = [_][]const u8{ "json", "html", "text", "font" };
 
-const n_efforts = @typeInfo(brotli.Effort).@"enum".fields.len;
+const n_efforts = @typeInfo(brotli.Effort).@"enum".field_names.len;
 const n_qualities = 12;
 
 /// The reference quality closest to `ours` (one size per payload) by the

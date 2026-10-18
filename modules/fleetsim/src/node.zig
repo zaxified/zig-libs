@@ -255,7 +255,7 @@ test "framing: every length rule agrees with a real frame from its protocol" {
     const link = [_]u8{ 0x05, 0x64, 0x05, 0xC0, 0x01, 0x00, 0x00, 0x04, 0xE9, 0x21 };
     try testing.expectEqual(@as(?usize, 10), try Framing.dnp3_link.frameLen(&link));
     // LEN 5 + 10 user bytes -> 10 + 10 + 2 (one block CRC).
-    const link2 = [_]u8{ 0x05, 0x64, 15, 0xC4, 0x01, 0x00, 0x00, 0x04 } ++ [_]u8{0} ** 14;
+    const link2 = [_]u8{ 0x05, 0x64, 15, 0xC4, 0x01, 0x00, 0x00, 0x04 } ++ @as([14]u8, @splat(0));
     try testing.expectEqual(@as(?usize, 22), try Framing.dnp3_link.frameLen(&link2));
     // LEN 5 + exactly 16 user bytes (one whole 16-byte block, no remainder)
     // -> 10 + 16 + 2 (still just ONE block CRC, not two). Every other case
@@ -271,19 +271,19 @@ test "framing: every length rule agrees with a real frame from its protocol" {
     try testing.expectEqual(@as(?usize, 6), try Framing.iec104_apci.frameLen(&apci));
 
     // TPKT header claims the total length.
-    const tpkt = [_]u8{ 0x03, 0x00, 0x00, 0x16 } ++ [_]u8{0} ** 18;
+    const tpkt = [_]u8{ 0x03, 0x00, 0x00, 0x16 } ++ @as([18]u8, @splat(0));
     try testing.expectEqual(@as(?usize, 22), try Framing.tpkt.frameLen(&tpkt));
 
     // ENIP RegisterSession: 24-byte header + 4-byte body.
-    const enip = [_]u8{ 0x65, 0x00, 0x04, 0x00 } ++ [_]u8{0} ** 24;
+    const enip = [_]u8{ 0x65, 0x00, 0x04, 0x00 } ++ @as([24]u8, @splat(0));
     try testing.expectEqual(@as(?usize, 28), try Framing.enip_encap.frameLen(&enip));
 
     // OPC UA HEL chunk, total length little-endian at [4..8].
-    const ua = [_]u8{ 'H', 'E', 'L', 'F', 0x20, 0x00, 0x00, 0x00 } ++ [_]u8{0} ** 24;
+    const ua = [_]u8{ 'H', 'E', 'L', 'F', 0x20, 0x00, 0x00, 0x00 } ++ @as([24]u8, @splat(0));
     try testing.expectEqual(@as(?usize, 32), try Framing.opcua_uatcp.frameLen(&ua));
 
     // BACnet BVLC Original-Unicast-NPDU.
-    const bvlc = [_]u8{ 0x81, 0x0A, 0x00, 0x0C } ++ [_]u8{0} ** 8;
+    const bvlc = [_]u8{ 0x81, 0x0A, 0x00, 0x0C } ++ @as([8]u8, @splat(0));
     try testing.expectEqual(@as(?usize, 12), try Framing.bacnet_bvll.frameLen(&bvlc));
 }
 

@@ -136,18 +136,18 @@ pub const meta = .{
 // on each declaration.
 
 /// rtnetlink message types (std.os.linux.NetlinkMessageType values).
-pub const RTM_NEWLINK: u16 = @intFromEnum(linux.NetlinkMessageType.RTM_NEWLINK);
-pub const RTM_GETLINK: u16 = @intFromEnum(linux.NetlinkMessageType.RTM_GETLINK);
-pub const RTM_NEWADDR: u16 = @intFromEnum(linux.NetlinkMessageType.RTM_NEWADDR);
-pub const RTM_GETADDR: u16 = @intFromEnum(linux.NetlinkMessageType.RTM_GETADDR);
-pub const RTM_NEWROUTE: u16 = @intFromEnum(linux.NetlinkMessageType.RTM_NEWROUTE);
-pub const RTM_GETROUTE: u16 = @intFromEnum(linux.NetlinkMessageType.RTM_GETROUTE);
-pub const RTM_NEWNEIGH: u16 = @intFromEnum(linux.NetlinkMessageType.RTM_NEWNEIGH);
-pub const RTM_GETNEIGH: u16 = @intFromEnum(linux.NetlinkMessageType.RTM_GETNEIGH);
-pub const RTM_DELLINK: u16 = @intFromEnum(linux.NetlinkMessageType.RTM_DELLINK);
-pub const RTM_DELADDR: u16 = @intFromEnum(linux.NetlinkMessageType.RTM_DELADDR);
-pub const RTM_DELROUTE: u16 = @intFromEnum(linux.NetlinkMessageType.RTM_DELROUTE);
-pub const RTM_DELNEIGH: u16 = @intFromEnum(linux.NetlinkMessageType.RTM_DELNEIGH);
+pub const RTM_NEWLINK: u16 = @backingInt(linux.NetlinkMessageType.RTM_NEWLINK);
+pub const RTM_GETLINK: u16 = @backingInt(linux.NetlinkMessageType.RTM_GETLINK);
+pub const RTM_NEWADDR: u16 = @backingInt(linux.NetlinkMessageType.RTM_NEWADDR);
+pub const RTM_GETADDR: u16 = @backingInt(linux.NetlinkMessageType.RTM_GETADDR);
+pub const RTM_NEWROUTE: u16 = @backingInt(linux.NetlinkMessageType.RTM_NEWROUTE);
+pub const RTM_GETROUTE: u16 = @backingInt(linux.NetlinkMessageType.RTM_GETROUTE);
+pub const RTM_NEWNEIGH: u16 = @backingInt(linux.NetlinkMessageType.RTM_NEWNEIGH);
+pub const RTM_GETNEIGH: u16 = @backingInt(linux.NetlinkMessageType.RTM_GETNEIGH);
+pub const RTM_DELLINK: u16 = @backingInt(linux.NetlinkMessageType.RTM_DELLINK);
+pub const RTM_DELADDR: u16 = @backingInt(linux.NetlinkMessageType.RTM_DELADDR);
+pub const RTM_DELROUTE: u16 = @backingInt(linux.NetlinkMessageType.RTM_DELROUTE);
+pub const RTM_DELNEIGH: u16 = @backingInt(linux.NetlinkMessageType.RTM_DELNEIGH);
 /// `RTM_SETLINK` — the AF_BRIDGE "change link state" message (`bridge vlan`,
 /// `bridge link set`). Re-exported from `bridge` for symmetry with the rest.
 pub const RTM_SETLINK: u16 = bridge.RTM_SETLINK;
@@ -361,11 +361,11 @@ pub const IFLA_INFO = struct {
 
 // Attribute types taken from std.os.linux enums. Public so the bridge
 // builders (and sibling modules) encode the same attribute numbers.
-pub const IFLA_ADDRESS: u16 = @intFromEnum(linux.IFLA.ADDRESS);
-pub const IFLA_IFNAME: u16 = @intFromEnum(linux.IFLA.IFNAME);
-pub const IFLA_MTU: u16 = @intFromEnum(linux.IFLA.MTU);
-pub const IFLA_TXQLEN: u16 = @intFromEnum(linux.IFLA.TXQLEN);
-pub const IFLA_LINKINFO: u16 = @intFromEnum(linux.IFLA.LINKINFO);
+pub const IFLA_ADDRESS: u16 = @backingInt(linux.IFLA.ADDRESS);
+pub const IFLA_IFNAME: u16 = @backingInt(linux.IFLA.IFNAME);
+pub const IFLA_MTU: u16 = @backingInt(linux.IFLA.MTU);
+pub const IFLA_TXQLEN: u16 = @backingInt(linux.IFLA.TXQLEN);
+pub const IFLA_LINKINFO: u16 = @backingInt(linux.IFLA.LINKINFO);
 /// `IFLA_MASTER` — the bridge/bond an interface is enslaved to (0 = release).
 pub const IFLA_MASTER: u16 = bridge.IFLA_MASTER;
 /// `IFLA_LINK` — the lower device: a VLAN's parent, a veth's peer.
@@ -461,11 +461,11 @@ const ifla_ifname = IFLA_IFNAME;
 const ifla_mtu = IFLA_MTU;
 const ifla_txqlen = IFLA_TXQLEN;
 const ifla_linkinfo = IFLA_LINKINFO;
-const ifa_address: u16 = @intFromEnum(linux.IFA.ADDRESS);
-const ifa_local: u16 = @intFromEnum(linux.IFA.LOCAL);
-const ifa_label: u16 = @intFromEnum(linux.IFA.LABEL);
-const ifa_broadcast: u16 = @intFromEnum(linux.IFA.BROADCAST);
-const ifa_flags_attr: u16 = @intFromEnum(linux.IFA.FLAGS);
+const ifa_address: u16 = @backingInt(linux.IFA.ADDRESS);
+const ifa_local: u16 = @backingInt(linux.IFA.LOCAL);
+const ifa_label: u16 = @backingInt(linux.IFA.LABEL);
+const ifa_broadcast: u16 = @backingInt(linux.IFA.BROADCAST);
+const ifa_flags_attr: u16 = @backingInt(linux.IFA.FLAGS);
 
 // ── typed results ───────────────────────────────────────────────────────────
 // All result types are plain data (fixed inline buffers, no pointers), so an
@@ -1570,7 +1570,7 @@ fn buildLinkAddRequest(
             const data = try codec.nestBegin(gpa, &list, IFLA_INFO.DATA);
             // PROTOCOL (when given) precedes ID, and is __be16 (captured
             // `protocol 802.1ad` → 88 a8).
-            if (v.protocol) |pr| try codec.appendAttrBe16(gpa, &list, IFLA_VLAN.PROTOCOL, @intFromEnum(pr));
+            if (v.protocol) |pr| try codec.appendAttrBe16(gpa, &list, IFLA_VLAN.PROTOCOL, @backingInt(pr));
             try codec.appendAttrU16(gpa, &list, IFLA_VLAN.ID, v.id);
             try codec.nestEnd(&list, data);
         },
@@ -1624,7 +1624,7 @@ fn buildRuleRequest(
     if (spec.iifname) |n| try checkName(n);
     if (spec.oifname) |n| try checkName(n);
     const table = spec.table orelse 0;
-    const default_action: u8 = if (msg_type == RTM_NEWRULE) @intFromEnum(RuleAction.to_table) else 0;
+    const default_action: u8 = if (msg_type == RTM_NEWRULE) @backingInt(RuleAction.to_table) else 0;
 
     var list: std.ArrayList(u8) = .empty;
     errdefer list.deinit(gpa);
@@ -1634,7 +1634,7 @@ fn buildRuleRequest(
     fixed[1] = dst_len;
     fixed[2] = src_len;
     fixed[4] = if (table <= 255) @intCast(table) else @intCast(RT_TABLE.UNSPEC);
-    fixed[7] = if (spec.action) |a| @intFromEnum(a) else default_action;
+    fixed[7] = if (spec.action) |a| @backingInt(a) else default_action;
     std.mem.writeInt(u32, fixed[8..12], if (spec.invert) FIB_RULE_INVERT else 0, native_endian);
     try codec.appendPadded(gpa, &list, &fixed);
     if (spec.src) |a| try codec.appendAttr(gpa, &list, FRA.SRC, a);
@@ -1708,9 +1708,9 @@ fn buildNeighborRequest(
 pub fn errorFromCode(code: i32) DumpError {
     if (code >= 0 or code == std.math.minInt(i32)) return error.Unexpected;
     return switch (@as(u32, @intCast(-code))) {
-        @intFromEnum(linux.E.PERM), @intFromEnum(linux.E.ACCES) => error.AccessDenied,
-        @intFromEnum(linux.E.INVAL), @intFromEnum(linux.E.OPNOTSUPP) => error.InvalidRequest,
-        @intFromEnum(linux.E.NOBUFS), @intFromEnum(linux.E.NOMEM) => error.SystemResources,
+        @backingInt(linux.E.PERM), @backingInt(linux.E.ACCES) => error.AccessDenied,
+        @backingInt(linux.E.INVAL), @backingInt(linux.E.OPNOTSUPP) => error.InvalidRequest,
+        @backingInt(linux.E.NOBUFS), @backingInt(linux.E.NOMEM) => error.SystemResources,
         else => error.Unexpected,
     };
 }
@@ -1776,20 +1776,20 @@ pub const WriteError = RequestError || BuildError;
 pub fn writeErrorFromCode(code: i32) RequestError {
     if (code >= 0 or code == std.math.minInt(i32)) return error.Unexpected;
     return switch (@as(u32, @intCast(-code))) {
-        @intFromEnum(linux.E.PERM), @intFromEnum(linux.E.ACCES) => error.AccessDenied,
-        @intFromEnum(linux.E.EXIST) => error.Exists,
-        @intFromEnum(linux.E.NOENT), @intFromEnum(linux.E.SRCH) => error.NotFound,
-        @intFromEnum(linux.E.NODEV) => error.NoSuchDevice,
-        @intFromEnum(linux.E.ADDRNOTAVAIL) => error.AddressNotAvailable,
-        @intFromEnum(linux.E.NETUNREACH), @intFromEnum(linux.E.HOSTUNREACH) => error.NetworkUnreachable,
-        @intFromEnum(linux.E.NETDOWN) => error.NetworkDown,
-        @intFromEnum(linux.E.BUSY) => error.Busy,
-        @intFromEnum(linux.E.INVAL) => error.InvalidRequest,
-        @intFromEnum(linux.E.OPNOTSUPP),
-        @intFromEnum(linux.E.AFNOSUPPORT),
-        @intFromEnum(linux.E.PROTONOSUPPORT),
+        @backingInt(linux.E.PERM), @backingInt(linux.E.ACCES) => error.AccessDenied,
+        @backingInt(linux.E.EXIST) => error.Exists,
+        @backingInt(linux.E.NOENT), @backingInt(linux.E.SRCH) => error.NotFound,
+        @backingInt(linux.E.NODEV) => error.NoSuchDevice,
+        @backingInt(linux.E.ADDRNOTAVAIL) => error.AddressNotAvailable,
+        @backingInt(linux.E.NETUNREACH), @backingInt(linux.E.HOSTUNREACH) => error.NetworkUnreachable,
+        @backingInt(linux.E.NETDOWN) => error.NetworkDown,
+        @backingInt(linux.E.BUSY) => error.Busy,
+        @backingInt(linux.E.INVAL) => error.InvalidRequest,
+        @backingInt(linux.E.OPNOTSUPP),
+        @backingInt(linux.E.AFNOSUPPORT),
+        @backingInt(linux.E.PROTONOSUPPORT),
         => error.NotSupported,
-        @intFromEnum(linux.E.NOBUFS), @intFromEnum(linux.E.NOMEM) => error.SystemResources,
+        @backingInt(linux.E.NOBUFS), @backingInt(linux.E.NOMEM) => error.SystemResources,
         else => error.Unexpected,
     };
 }
@@ -2882,7 +2882,7 @@ test "parseLink: canned lo message" {
         fn build(gpa: std.mem.Allocator, list: *std.ArrayList(u8)) !void {
             try codec.appendAttrString(gpa, list, ifla_ifname, "lo");
             try codec.appendAttrU32(gpa, list, ifla_mtu, 65536);
-            try codec.appendAttr(gpa, list, ifla_address, &(.{0} ** 6));
+            try codec.appendAttr(gpa, list, ifla_address, &@as([6]u8, @splat(0)));
             try codec.appendAttrU32(gpa, list, 999, 1); // unknown attr — ignored
         }
     }.build);
@@ -2898,7 +2898,7 @@ test "parseLink: canned lo message" {
 }
 
 test "parseLink: truncated fixed header and hostile attrs error out" {
-    try testing.expectError(error.Truncated, parseLink(&[_]u8{0} ** 8));
+    try testing.expectError(error.Truncated, parseLink(&@as([8]u8, @splat(0))));
     // Attr whose declared length overruns the payload.
     var bad: [ifinfomsg_len + 4]u8 = @splat(0);
     std.mem.writeInt(u16, bad[ifinfomsg_len..][0..2], 200, native_endian);
@@ -2940,7 +2940,7 @@ test "parseAddress: IFA_ADDRESS fallback, and null when no address" {
     fixed[1] = 128;
     const v6 = try cannedPayload(testing.allocator, &fixed, struct {
         fn build(gpa: std.mem.Allocator, list: *std.ArrayList(u8)) !void {
-            const loopback6 = [_]u8{0} ** 15 ++ [_]u8{1};
+            const loopback6 = @as([15]u8, @splat(0)) ++ [_]u8{1};
             try codec.appendAttr(gpa, list, ifa_address, &loopback6);
         }
     }.build);
@@ -3235,10 +3235,10 @@ test "neighborFlushEligible: exempts only PERMANENT/NOARP under the default mask
 }
 
 test "errorFromCode maps NLMSG_ERROR errnos" {
-    try testing.expectEqual(error.AccessDenied, errorFromCode(-@as(i32, @intFromEnum(linux.E.PERM))));
-    try testing.expectEqual(error.AccessDenied, errorFromCode(-@as(i32, @intFromEnum(linux.E.ACCES))));
-    try testing.expectEqual(error.InvalidRequest, errorFromCode(-@as(i32, @intFromEnum(linux.E.INVAL))));
-    try testing.expectEqual(error.SystemResources, errorFromCode(-@as(i32, @intFromEnum(linux.E.NOBUFS))));
+    try testing.expectEqual(error.AccessDenied, errorFromCode(-@as(i32, @backingInt(linux.E.PERM))));
+    try testing.expectEqual(error.AccessDenied, errorFromCode(-@as(i32, @backingInt(linux.E.ACCES))));
+    try testing.expectEqual(error.InvalidRequest, errorFromCode(-@as(i32, @backingInt(linux.E.INVAL))));
+    try testing.expectEqual(error.SystemResources, errorFromCode(-@as(i32, @backingInt(linux.E.NOBUFS))));
     try testing.expectEqual(error.Unexpected, errorFromCode(-9999));
     // Non-errors / degenerate values must not be misread.
     try testing.expectEqual(error.Unexpected, errorFromCode(0));
@@ -3304,7 +3304,7 @@ test "build: RTM_DELADDR drops CREATE/EXCL, keeps REQUEST|ACK" {
 }
 
 test "build: IPv6 address with scope/flags/label/broadcast attributes" {
-    const v6 = [_]u8{ 0xfd, 0, 0, 0 } ++ [_]u8{0} ** 11 ++ [_]u8{1};
+    const v6 = [_]u8{ 0xfd, 0, 0, 0 } ++ @as([11]u8, @splat(0)) ++ [_]u8{1};
     const req = try buildAddressRequest(testing.allocator, 1, RTM_NEWADDR, (Create{}).flags(), .{
         .ifindex = 3,
         .local = &v6,
@@ -3454,7 +3454,7 @@ test "build: route table > 255 moves to RTA_TABLE, family derivation, validation
         1,
         RTM_NEWROUTE,
         0,
-        .{ .dst = &.{ 10, 0, 0, 0 }, .dst_prefixlen = 8, .gateway = &([_]u8{0} ** 16) },
+        .{ .dst = &.{ 10, 0, 0, 0 }, .dst_prefixlen = 8, .gateway = &(@as([16]u8, @splat(0))) },
     ));
 }
 
@@ -3668,26 +3668,26 @@ test "build: Create option flags map onto NLM_F_* modifiers" {
 }
 
 test "writeErrorFromCode maps the write-path errnos" {
-    try testing.expectEqual(error.AccessDenied, writeErrorFromCode(-@as(i32, @intFromEnum(linux.E.PERM))));
-    try testing.expectEqual(error.Exists, writeErrorFromCode(-@as(i32, @intFromEnum(linux.E.EXIST))));
-    try testing.expectEqual(error.NotFound, writeErrorFromCode(-@as(i32, @intFromEnum(linux.E.NOENT))));
-    try testing.expectEqual(error.NoSuchDevice, writeErrorFromCode(-@as(i32, @intFromEnum(linux.E.NODEV))));
+    try testing.expectEqual(error.AccessDenied, writeErrorFromCode(-@as(i32, @backingInt(linux.E.PERM))));
+    try testing.expectEqual(error.Exists, writeErrorFromCode(-@as(i32, @backingInt(linux.E.EXIST))));
+    try testing.expectEqual(error.NotFound, writeErrorFromCode(-@as(i32, @backingInt(linux.E.NOENT))));
+    try testing.expectEqual(error.NoSuchDevice, writeErrorFromCode(-@as(i32, @backingInt(linux.E.NODEV))));
     try testing.expectEqual(
         error.AddressNotAvailable,
-        writeErrorFromCode(-@as(i32, @intFromEnum(linux.E.ADDRNOTAVAIL))),
+        writeErrorFromCode(-@as(i32, @backingInt(linux.E.ADDRNOTAVAIL))),
     );
     try testing.expectEqual(
         error.NetworkUnreachable,
-        writeErrorFromCode(-@as(i32, @intFromEnum(linux.E.NETUNREACH))),
+        writeErrorFromCode(-@as(i32, @backingInt(linux.E.NETUNREACH))),
     );
     try testing.expectEqual(
         error.NetworkDown,
-        writeErrorFromCode(-@as(i32, @intFromEnum(linux.E.NETDOWN))),
+        writeErrorFromCode(-@as(i32, @backingInt(linux.E.NETDOWN))),
     );
-    try testing.expectEqual(error.Busy, writeErrorFromCode(-@as(i32, @intFromEnum(linux.E.BUSY))));
-    try testing.expectEqual(error.InvalidRequest, writeErrorFromCode(-@as(i32, @intFromEnum(linux.E.INVAL))));
-    try testing.expectEqual(error.NotSupported, writeErrorFromCode(-@as(i32, @intFromEnum(linux.E.OPNOTSUPP))));
-    try testing.expectEqual(error.SystemResources, writeErrorFromCode(-@as(i32, @intFromEnum(linux.E.NOMEM))));
+    try testing.expectEqual(error.Busy, writeErrorFromCode(-@as(i32, @backingInt(linux.E.BUSY))));
+    try testing.expectEqual(error.InvalidRequest, writeErrorFromCode(-@as(i32, @backingInt(linux.E.INVAL))));
+    try testing.expectEqual(error.NotSupported, writeErrorFromCode(-@as(i32, @backingInt(linux.E.OPNOTSUPP))));
+    try testing.expectEqual(error.SystemResources, writeErrorFromCode(-@as(i32, @backingInt(linux.E.NOMEM))));
     try testing.expectEqual(error.Unexpected, writeErrorFromCode(-9999));
     // Degenerate values must never be misread as a specific failure.
     try testing.expectEqual(error.Unexpected, writeErrorFromCode(0));
@@ -3717,7 +3717,7 @@ const builder_seeds = [_]BuilderSeed{
     // An IPv4 host address on ifindex 2, main table, a 1500-byte MTU.
     .{ .addr = &.{ 192, 168, 1, 10 }, .prefix = 24, .ifindex = 2, .table = 254, .mtu = 1500, .flags = IFF.UP, .flags_mask = IFF.UP },
     // IPv6, /64, jumbo MTU.
-    .{ .addr = &[_]u8{ 0x20, 0x01, 0x0d, 0xb8 } ++ [_]u8{0} ** 11 ++ [_]u8{1}, .prefix = 64, .ifindex = 3, .table = 254, .mtu = 9000, .flags = 0, .flags_mask = 0 },
+    .{ .addr = &[_]u8{ 0x20, 0x01, 0x0d, 0xb8 } ++ @as([11]u8, @splat(0)) ++ [_]u8{1}, .prefix = 64, .ifindex = 3, .table = 254, .mtu = 9000, .flags = 0, .flags_mask = 0 },
     // A 6-byte MAC: too short for an address, the right length for `mac`.
     .{ .addr = &.{ 0xde, 0xad, 0xbe, 0xef, 0x00, 0x01 }, .prefix = 0, .ifindex = 1, .table = 0, .mtu = 68, .flags = 0, .flags_mask = 0xffffffff },
     // 0.0.0.0 with a prefix past any family's. (The *empty* address needs no
@@ -3727,7 +3727,7 @@ const builder_seeds = [_]BuilderSeed{
     .{ .addr = &.{ 0, 0, 0, 0 }, .prefix = 255, .ifindex = 0, .table = 0, .mtu = 0, .flags = 0, .flags_mask = 0 },
     // 16 octets with a /32 prefix — an IPv6-length address claiming an IPv4
     // prefix, the mismatch a builder has to refuse rather than truncate.
-    .{ .addr = &[_]u8{0xff} ** 16, .prefix = 32, .ifindex = 0xffffffff, .table = 0xffffffff, .mtu = 0xffffffff, .flags = 0xffffffff, .flags_mask = 0 },
+    .{ .addr = &@as([16]u8, @splat(0xff)), .prefix = 32, .ifindex = 0xffffffff, .table = 0xffffffff, .mtu = 0xffffffff, .flags = 0xffffffff, .flags_mask = 0 },
 };
 
 /// Serialise `builder_seeds` into the byte strings `Smith` reads.
@@ -3919,8 +3919,8 @@ test "corpus: every builder seed reaches the builders, and the counts are pinned
 }
 
 test "wire constants agree with std.os.linux" {
-    try testing.expectEqual(@as(u16, @intFromEnum(linux.NetlinkMessageType.DONE)), codec.NLMSG_DONE);
-    try testing.expectEqual(@as(u16, @intFromEnum(linux.NetlinkMessageType.ERROR)), codec.NLMSG_ERROR);
+    try testing.expectEqual(@as(u16, @backingInt(linux.NetlinkMessageType.DONE)), codec.NLMSG_DONE);
+    try testing.expectEqual(@as(u16, @backingInt(linux.NetlinkMessageType.ERROR)), codec.NLMSG_ERROR);
     try testing.expectEqual(@as(u16, linux.NLM_F_REQUEST), codec.NLM_F_REQUEST);
     try testing.expectEqual(@as(u16, linux.NLM_F_DUMP), codec.NLM_F_DUMP);
     try testing.expectEqual(@as(u16, linux.NLM_F_DUMP_INTR), codec.NLM_F_DUMP_INTR);
@@ -3982,7 +3982,7 @@ const ParserCorpus = struct {
             try codec.appendPadded(gpa, &list, &f);
             try codec.appendAttrString(gpa, &list, ifla_ifname, "lo");
             try codec.appendAttrU32(gpa, &list, ifla_mtu, 65536);
-            try codec.appendAttr(gpa, &list, ifla_address, &(.{0} ** 6));
+            try codec.appendAttr(gpa, &list, ifla_address, &@as([6]u8, @splat(0)));
             try codec.appendAttrU32(gpa, &list, 999, 1); // unknown attr — ignored
             self.push(list.items);
         }
@@ -4008,7 +4008,7 @@ const ParserCorpus = struct {
             f[1] = 128;
             var list: std.ArrayList(u8) = .empty;
             try codec.appendPadded(gpa, &list, &f);
-            try codec.appendAttr(gpa, &list, ifa_address, &([_]u8{0} ** 15 ++ [_]u8{1}));
+            try codec.appendAttr(gpa, &list, ifa_address, &(@as([15]u8, @splat(0)) ++ [_]u8{1}));
             self.push(list.items);
             self.push(&f);
         }
@@ -4041,7 +4041,7 @@ const ParserCorpus = struct {
         }
         // ── the refusals ───────────────────────────────────────────────────
         // Eight octets: shorter than every fixed header here but ndmsg's.
-        self.push(&[_]u8{0} ** 8);
+        self.push(&@as([8]u8, @splat(0)));
         // An attribute whose declared length overruns the payload.
         {
             var bad: [ifinfomsg_len + 4]u8 = @splat(0);
@@ -4349,7 +4349,7 @@ test "integration: address dump has a loopback address on lo" {
     for (addrs) |*a| {
         const is_v4_loop = a.family == AF.INET and std.mem.eql(u8, a.bytes(), &.{ 127, 0, 0, 1 });
         const is_v6_loop = a.family == AF.INET6 and
-            std.mem.eql(u8, a.bytes(), &([_]u8{0} ** 15 ++ [_]u8{1}));
+            std.mem.eql(u8, a.bytes(), &(@as([15]u8, @splat(0)) ++ [_]u8{1}));
         if (is_v4_loop or is_v6_loop) {
             try testing.expectEqual(@as(u32, 1), a.ifindex);
             found = true;
@@ -5260,13 +5260,13 @@ test "build: veth == `ip link add zv0 type veth peer name zv1`" {
     try expectRequestBytes(req, &(.{
         0x58, 0x00, 0x00, 0x00, 0x10, 0x00, 0x05, 0x06, // len 88, RTM_NEWLINK, REQ|ACK|EXCL|CREATE
         0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // seq, pid
-    } ++ [_]u8{0} ** 16 ++ .{ // ifinfomsg, all zero
+    } ++ @as([16]u8, @splat(0)) ++ .{ // ifinfomsg, all zero
         0x08, 0x00, 0x03, 0x00, 'z', 'v', '0', 0x00, // IFLA_IFNAME
         0x30, 0x00, 0x12, 0x00, // IFLA_LINKINFO, 48
         0x09, 0x00, 0x01, 0x00, 'v', 'e', 't', 'h', 0x00, 0x00, 0x00, 0x00, // IFLA_INFO_KIND
         0x20, 0x00, 0x02, 0x00, // IFLA_INFO_DATA, 32
         0x1c, 0x00, 0x01, 0x00, // VETH_INFO_PEER, 28 (no NLA_F_NESTED, as `ip` sends it)
-    } ++ [_]u8{0} ** 16 ++ .{ // the peer's ifinfomsg
+    } ++ @as([16]u8, @splat(0)) ++ .{ // the peer's ifinfomsg
         0x08, 0x00, 0x03, 0x00, 'z', 'v', '1', 0x00, // the peer's IFLA_IFNAME
     }));
 }
@@ -5283,7 +5283,7 @@ test "build: vlan == `ip link add link zv0 name zv0.10 type vlan id 10` (zv0 = 3
     try expectRequestBytes(req, &(.{
         0x50, 0x00, 0x00, 0x00, 0x10, 0x00, 0x05, 0x06,
         0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    } ++ [_]u8{0} ** 16 ++ .{
+    } ++ @as([16]u8, @splat(0)) ++ .{
         0x08, 0x00, 0x05, 0x00, 0x03, 0x00, 0x00, 0x00, // IFLA_LINK = 3, BEFORE the name
         0x0b, 0x00, 0x03, 0x00, 'z', 'v', '0', '.', '1', '0', 0x00, 0x00, // IFLA_IFNAME
         0x1c, 0x00, 0x12, 0x00, // IFLA_LINKINFO, 28
@@ -5307,7 +5307,7 @@ test "build: vlan 802.1ad == `… type vlan protocol 802.1ad id 20`" {
     try expectRequestBytes(req, &(.{
         0x58, 0x00, 0x00, 0x00, 0x10, 0x00, 0x05, 0x06,
         0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    } ++ [_]u8{0} ** 16 ++ .{
+    } ++ @as([16]u8, @splat(0)) ++ .{
         0x08, 0x00, 0x05, 0x00, 0x03, 0x00, 0x00, 0x00,
         0x0b, 0x00, 0x03, 0x00, 'z',  'v',  '0',  '.',
         '2',  '0',  0x00, 0x00,
@@ -5401,7 +5401,7 @@ test "build: rule selectors == `ip rule add to …/24 lookup 200`, `fwmark 0x10`
 
 test "build: IPv6 rule == `ip -6 rule add from 2001:db8::/32 table 103 priority 1004`" {
     if (native_endian != .little) return error.SkipZigTest;
-    const a: [16]u8 = .{ 0x20, 0x01, 0x0d, 0xb8 } ++ [_]u8{0} ** 12;
+    const a: [16]u8 = .{ 0x20, 0x01, 0x0d, 0xb8 } ++ @as([12]u8, @splat(0));
     const req = try ruleReq(.{ .src = &a, .src_len = 32, .table = 103, .priority = 1004 });
     defer testing.allocator.free(req);
     try expectRequestBytes(req, &(.{
@@ -5445,9 +5445,9 @@ test "build: rule table > 255 moves to FRA_TABLE; bad specs are refused" {
 
     try testing.expectError(error.FamilyRequired, ruleReq(.{ .table = 100 }));
     try testing.expectError(error.InvalidPrefixLength, ruleReq(.{ .src = &.{ 10, 0, 0, 0 }, .src_len = 33 }));
-    try testing.expectError(error.InvalidPrefixLength, ruleReq(.{ .dst = &([_]u8{0} ** 16), .dst_len = 129 }));
+    try testing.expectError(error.InvalidPrefixLength, ruleReq(.{ .dst = &(@as([16]u8, @splat(0))), .dst_len = 129 }));
     try testing.expectError(error.MixedFamilies, ruleReq(.{ .family = AF.INET6, .src = &.{ 10, 0, 0, 0 } }));
-    try testing.expectError(error.MixedFamilies, ruleReq(.{ .src = &.{ 10, 0, 0, 0 }, .dst = &([_]u8{0} ** 16) }));
+    try testing.expectError(error.MixedFamilies, ruleReq(.{ .src = &.{ 10, 0, 0, 0 }, .dst = &(@as([16]u8, @splat(0))) }));
     try testing.expectError(error.InvalidName, ruleReq(.{ .family = AF.INET, .oifname = "" }));
     // A /32 default: `from 10.1.2.3` with no length means the one host.
     const host = try ruleReq(.{ .src = &.{ 10, 1, 2, 3 } });
@@ -5456,7 +5456,7 @@ test "build: rule table > 255 moves to FRA_TABLE; bad specs are refused" {
 }
 
 test "parseRule: every selector reads back; hostile lengths are refused" {
-    const a: [16]u8 = .{ 0x20, 0x01, 0x0d, 0xb8 } ++ [_]u8{0} ** 12;
+    const a: [16]u8 = .{ 0x20, 0x01, 0x0d, 0xb8 } ++ @as([12]u8, @splat(0));
     const req = try ruleReq(.{
         .dst = &a,
         .dst_len = 48,
@@ -5477,15 +5477,15 @@ test "parseRule: every selector reads back; hostile lengths are refused" {
     try testing.expectEqual(@as(?u32, 7), r.fwmark);
     try testing.expectEqual(@as(u32, 42), r.priority);
     try testing.expectEqual(@as(u32, 9), r.table);
-    try testing.expectEqual(@intFromEnum(RuleAction.blackhole), r.action);
+    try testing.expectEqual(@backingInt(RuleAction.blackhole), r.action);
     try testing.expectEqual(@as(usize, 0), r.srcBytes().len);
 
     try testing.expectError(error.Truncated, parseRule(&.{ 2, 0, 0 }));
     // FRA_PRIORITY with a 2-byte value.
-    const bad = [_]u8{0} ** 12 ++ [_]u8{ 0x06, 0x00, 0x06, 0x00, 0x01, 0x00, 0x00, 0x00 };
+    const bad = @as([12]u8, @splat(0)) ++ [_]u8{ 0x06, 0x00, 0x06, 0x00, 0x01, 0x00, 0x00, 0x00 };
     try testing.expectError(error.BadLength, parseRule(&bad));
     // An IIFNAME longer than IFNAMSIZ.
-    const long = [_]u8{0} ** 12 ++ [_]u8{ 0x18, 0x00, 0x03, 0x00 } ++ [_]u8{'x'} ** 20;
+    const long = @as([12]u8, @splat(0)) ++ [_]u8{ 0x18, 0x00, 0x03, 0x00 } ++ @as([20]u8, @splat('x'));
     try testing.expectError(error.BadLength, parseRule(&long));
 }
 
@@ -5569,19 +5569,19 @@ test "parseLink: vlan data of another kind is ignored; short stats are refused" 
     try testing.expectEqual(@as(?u16, 10), ls.vlan_id);
     // Exactly the ten decoded counters (80 bytes) is enough — the bound is
     // what is READ, not the size of today's struct (mutation 2026-10-04).
-    const exact = [_]u8{ 0x54, 0x00, 0x17, 0x00 } ++ [_]u8{0} ** 72 ++ [_]u8{ 9, 0, 0, 0, 0, 0, 0, 0 };
+    const exact = [_]u8{ 0x54, 0x00, 0x17, 0x00 } ++ @as([72]u8, @splat(0)) ++ [_]u8{ 9, 0, 0, 0, 0, 0, 0, 0 };
     const le = (try parseLink(linkPayload(&pb, &exact))).?;
     try testing.expectEqual(@as(u64, 9), le.stats.?.collisions);
     // 72 bytes of stats: one u64 short of the ten decoded counters.
-    const short = [_]u8{ 0x4c, 0x00, 0x17, 0x00 } ++ [_]u8{0} ** 72;
+    const short = [_]u8{ 0x4c, 0x00, 0x17, 0x00 } ++ @as([72]u8, @splat(0));
     try testing.expectError(error.BadLength, parseLink(linkPayload(&pb, &short)));
     // A kind longer than the buffer leaves kind empty rather than failing
     // the whole dump.
-    const long_kind = [_]u8{ 0x24, 0x00, 0x12, 0x00, 0x20, 0x00, 0x01, 0x00 } ++ [_]u8{'k'} ** 28;
+    const long_kind = [_]u8{ 0x24, 0x00, 0x12, 0x00, 0x20, 0x00, 0x01, 0x00 } ++ @as([28]u8, @splat('k'));
     const lk = (try parseLink(linkPayload(&pb, &long_kind))).?;
     try testing.expectEqual(@as(usize, 0), lk.kind().len);
     // A kind exactly at the buffer size is kept.
-    const max_kind = [_]u8{ 0x20, 0x00, 0x12, 0x00, 0x1c, 0x00, 0x01, 0x00 } ++ [_]u8{'k'} ** Link.kind_max;
+    const max_kind = [_]u8{ 0x20, 0x00, 0x12, 0x00, 0x1c, 0x00, 0x01, 0x00 } ++ @as([Link.kind_max]u8, @splat('k'));
     const lm = (try parseLink(linkPayload(&pb, &max_kind))).?;
     try testing.expectEqual(@as(usize, Link.kind_max), lm.kind().len);
 }
@@ -5616,7 +5616,7 @@ test "EventIterator: typed events from one datagram, other messages skipped" {
     codec.finishHeader(&dg, h1);
     // A message type no event models (RTM_NEWQDISC = 36): skipped.
     const h2 = try codec.appendHeader(gpa, &dg, 36, 0, 0, 0);
-    try codec.appendPadded(gpa, &dg, &([_]u8{0} ** 20));
+    try codec.appendPadded(gpa, &dg, &(@as([20]u8, @splat(0))));
     codec.finishHeader(&dg, h2);
     // RTM_DELADDR 10.0.0.1/24 on 7.
     const h3 = try codec.appendHeader(gpa, &dg, RTM_DELADDR, 0, 0, 0);
@@ -5769,7 +5769,7 @@ fn netnsCoreOn(nl: *Socket) !void {
         for (rs) |r| switch (r.priority) {
             1000 => {
                 if (r.table != 100 or r.src_len != 8 or r.srcBytes()[0] != 10) return error.TestRule1000;
-                if (r.action != @intFromEnum(RuleAction.to_table)) return error.TestRuleAction;
+                if (r.action != @backingInt(RuleAction.to_table)) return error.TestRuleAction;
                 seen |= 1;
             },
             1001 => {
@@ -5783,7 +5783,7 @@ fn netnsCoreOn(nl: *Socket) !void {
     if (seen != 3) return error.TestRulesMissing;
     // The family filter reaches the kernel: an IPv6 rule stays out of an
     // AF_INET dump and shows up in an AF_INET6 one.
-    try nl.ruleAdd(.{ .src = &(.{ 0x20, 0x01, 0x0d, 0xb8 } ++ [_]u8{0} ** 12), .src_len = 32, .table = 103, .priority = 1002 }, .{});
+    try nl.ruleAdd(.{ .src = &(.{ 0x20, 0x01, 0x0d, 0xb8 } ++ @as([12]u8, @splat(0))), .src_len = 32, .table = 103, .priority = 1002 }, .{});
     {
         const r4 = try nl.rules(.{ .family = AF.INET });
         defer gpa.free(r4);

@@ -101,7 +101,7 @@ pub const FunctionalConstraint = enum {
     pub fn parse(s: []const u8) Error!FunctionalConstraint {
         if (s.len != 2) return error.UnknownFunctionalConstraint;
         inline for (@typeInfo(FunctionalConstraint).@"enum".fields) |f| {
-            if (std.mem.eql(u8, s, f.name)) return @enumFromInt(f.value);
+            if (std.mem.eql(u8, s, f.name)) return @fromBackingInt(@intCast(f.value));
         }
         return error.UnknownFunctionalConstraint;
     }
@@ -349,7 +349,7 @@ test "every functional constraint parses and names itself" {
         const fc = try FunctionalConstraint.parse(f.name);
         try testing.expectEqualStrings(f.name, fc.name());
     }
-    try testing.expectEqual(@as(usize, 17), @typeInfo(FunctionalConstraint).@"enum".fields.len);
+    try testing.expectEqual(@as(usize, 17), @typeInfo(FunctionalConstraint).@"enum".field_names.len);
     try testing.expect(FunctionalConstraint.CO.isOperational());
     try testing.expect(FunctionalConstraint.SP.isOperational());
     try testing.expect(!FunctionalConstraint.MX.isOperational());
@@ -364,7 +364,7 @@ test "isOperational and isControlBlock cover every FC, not just a sample" {
     const operational = [_]FunctionalConstraint{ .CO, .SP, .SV, .SG, .SE };
     const control_block = [_]FunctionalConstraint{ .BR, .RP, .LG, .GO, .GS, .MS, .US };
     inline for (@typeInfo(FunctionalConstraint).@"enum".fields) |f| {
-        const fc: FunctionalConstraint = @enumFromInt(f.value);
+        const fc: FunctionalConstraint = @fromBackingInt(@intCast(f.value));
         const want_op = for (operational) |o| {
             if (o == fc) break true;
         } else false;
@@ -402,7 +402,7 @@ test "malformed ACSI references are typed errors" {
         parseAcsi("LD/LN.a.b.c.d.e.f.g.h.i", .ST),
     );
     // Too long.
-    const long = "LD/" ++ "A" ** 200;
+    const long = "LD/" ++ strRepeat("A", 200);
     try testing.expectError(error.ReferenceTooLong, parseAcsi(long, .ST));
 }
 
@@ -482,7 +482,7 @@ const parse_seeds = [_][]const u8{
     seed("LD/$ST$Ind1"), // EmptyComponent: no logical node
     seed("LD/GGIO1$$Ind1"), // EmptyComponent: no FC
     seed("LD/GGIO1$ST$"), // EmptyComponent: nothing below the FC
-    seed("LD/" ++ ("x" ** 200)), // ReferenceTooLong
+    seed("LD/" ++ (strRepeat("x", 200))), // ReferenceTooLong
 };
 
 test "fuzz: reference parsing never panics" {
@@ -554,4 +554,16 @@ test "corpus: every seed reaches both parsers, and the accepted counts are pinne
     try testing.expectEqual(parse_seeds.len, nonempty);
     try testing.expectEqual(@as(usize, 4), acsi_ok);
     try testing.expectEqual(@as(usize, 4), mms_ok);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

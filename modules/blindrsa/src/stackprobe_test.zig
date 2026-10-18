@@ -175,7 +175,7 @@ fn count(needle: []const u8) usize {
 }
 
 test "STACKPROBE (A1 B6/B9): blind() leaves no r and no masked v on the dead stack" {
-    if (builtin.mode == .Debug or builtin.mode == .ReleaseSafe) return error.SkipZigTest;
+    if (builtin.mode == .debug or builtin.mode == .safe) return error.SkipZigTest;
     pk = try kat.publicKey();
 
     // Needle A: `r` big-endian — the `r_bytes` buffer `blindCore` wipes. This

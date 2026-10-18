@@ -38,7 +38,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const k: u64 = if (args.next()) |s| (std.fmt.parseInt(u64, s, 10) catch 200000) else 200000;
 
     const m = vdf.group.rsa2048ChallengeModulus();
-    var xb: [vdf.group.modulus_bytes]u8 = [_]u8{0} ** vdf.group.modulus_bytes;
+    var xb: [vdf.group.modulus_bytes]u8 = @as([vdf.group.modulus_bytes]u8, @splat(0));
     xb[vdf.group.modulus_bytes - 1] = 5;
     const x = try vdf.group.elementFromBytes(m, &xb);
 

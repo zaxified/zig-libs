@@ -233,7 +233,7 @@ test "identity-element client_public_keyshare in KE1 is rejected (InvalidPublicK
     const record = opaque_pake.RegistrationRecord.fromBytes(v.registration_upload);
     const client = try shim.generateKE1(v.password, v.blind_login, v.client_nonce, v.client_keyshare_seed);
     var poisoned_ke1 = client.ke1;
-    poisoned_ke1.auth_request.client_public_keyshare = [_]u8{0} ** opaque_pake.Npk; // identity element
+    poisoned_ke1.auth_request.client_public_keyshare = @as([opaque_pake.Npk]u8, @splat(0)); // identity element
 
     try testing.expectError(error.InvalidPublicKey, shim.generateKE2(
         v.server_private_key,
@@ -271,7 +271,7 @@ test "identity-element server_public_keyshare in KE2 is rejected (InvalidPublicK
         v.server_keyshare_seed,
     );
     var poisoned_ke2 = server.ke2;
-    poisoned_ke2.auth_response.server_public_keyshare = [_]u8{0} ** opaque_pake.Npk; // identity element
+    poisoned_ke2.auth_response.server_public_keyshare = @as([opaque_pake.Npk]u8, @splat(0)); // identity element
 
     try testing.expectError(
         error.InvalidPublicKey,
@@ -291,9 +291,9 @@ test "fresh end-to-end registration + login agree on session_key and export_key"
     for (&wide, 0..) |*b, i| b.* = @truncate(i *% 59 +% 3);
     const blind_login = shim.scalarFromWideBytes(wide);
 
-    const server_key_seed = [_]u8{0xa7} ** 32;
+    const server_key_seed = @as([32]u8, @splat(0xa7));
     const server_keys = try shim.deriveAkeKeyPair(server_key_seed);
-    const oprf_seed = [_]u8{0x5c} ** 64;
+    const oprf_seed = @as([64]u8, @splat(0x5c));
     const credential_identifier = "user-42";
     const password = "hunter2, but longer";
     const identities = opaque_pake.Identities{ .client = "user-42", .server = "example.com" };
@@ -312,7 +312,7 @@ test "fresh end-to-end registration + login agree on session_key and export_key"
         blind_reg,
         response,
         identities,
-        [_]u8{0x11} ** 32, // envelope_nonce,
+        @as([32]u8, @splat(0x11)), // envelope_nonce,
         .identity,
     );
 
@@ -320,8 +320,8 @@ test "fresh end-to-end registration + login agree on session_key and export_key"
     const client = try shim.generateKE1(
         password,
         blind_login,
-        [_]u8{0x22} ** 32, // client_nonce
-        [_]u8{0x33} ** 32, // client_keyshare_seed
+        @as([32]u8, @splat(0x22)), // client_nonce
+        @as([32]u8, @splat(0x33)), // client_keyshare_seed
     );
     const server = try shim.generateKE2(
         server_keys.private_key,
@@ -332,9 +332,9 @@ test "fresh end-to-end registration + login agree on session_key and export_key"
         client.ke1,
         identities,
         context,
-        [_]u8{0x44} ** 32, // masking_nonce
-        [_]u8{0x55} ** 32, // server_nonce
-        [_]u8{0x66} ** 32, // server_keyshare_seed
+        @as([32]u8, @splat(0x44)), // masking_nonce
+        @as([32]u8, @splat(0x55)), // server_nonce
+        @as([32]u8, @splat(0x66)), // server_keyshare_seed
     );
     const finished = try shim.generateKE3(client.state, identities, context, server.ke2, .identity);
     const server_session_key = try shim.serverFinish(server.state, finished.ke3);
@@ -392,7 +392,7 @@ test "M6: a real KSF (Argon2id) changes session_key/export_key, and matching KSF
     var argon2: Argon2Ksf = .{
         .allocator = testing.allocator,
         .io = io,
-        .salt = [_]u8{0} ** 16,
+        .salt = @as([16]u8, @splat(0)),
         .params = std.crypto.pwhash.argon2.Params.owasp_2id,
     };
 
@@ -401,9 +401,9 @@ test "M6: a real KSF (Argon2id) changes session_key/export_key, and matching KSF
     const blind_reg = shim.scalarFromWideBytes(wide);
     for (&wide, 0..) |*b, i| b.* = @truncate(i *% 59 +% 3);
     const blind_login = shim.scalarFromWideBytes(wide);
-    const server_key_seed = [_]u8{0xa7} ** 32;
+    const server_key_seed = @as([32]u8, @splat(0xa7));
     const server_keys = try shim.deriveAkeKeyPair(server_key_seed);
-    const oprf_seed = [_]u8{0x5c} ** 64;
+    const oprf_seed = @as([64]u8, @splat(0x5c));
     const credential_identifier = "user-42";
     const password = "hunter2, but longer";
     const identities = opaque_pake.Identities{ .client = "user-42", .server = "example.com" };
@@ -421,15 +421,15 @@ test "M6: a real KSF (Argon2id) changes session_key/export_key, and matching KSF
         blind_reg,
         response,
         identities,
-        [_]u8{0x11} ** 32,
+        @as([32]u8, @splat(0x11)),
         argon2.ksf(),
     );
 
     const client = try shim.generateKE1(
         password,
         blind_login,
-        [_]u8{0x22} ** 32,
-        [_]u8{0x33} ** 32,
+        @as([32]u8, @splat(0x22)),
+        @as([32]u8, @splat(0x33)),
     );
     const server = try shim.generateKE2(
         server_keys.private_key,
@@ -440,9 +440,9 @@ test "M6: a real KSF (Argon2id) changes session_key/export_key, and matching KSF
         client.ke1,
         identities,
         context,
-        [_]u8{0x44} ** 32,
-        [_]u8{0x55} ** 32,
-        [_]u8{0x66} ** 32,
+        @as([32]u8, @splat(0x44)),
+        @as([32]u8, @splat(0x55)),
+        @as([32]u8, @splat(0x66)),
     );
     // Matching Argon2id on both sides: still a normal, successful login.
     const finished = try shim.generateKE3(client.state, identities, context, server.ke2, argon2.ksf());
@@ -459,7 +459,7 @@ test "M6: a real KSF (Argon2id) changes session_key/export_key, and matching KSF
     // A mismatched KSF between registration and login is exactly as fatal
     // as a wrong password (`randomized_password` differs either way) --
     // fails closed via the existing envelope MAC, not a new failure mode.
-    const wrong_client = try shim.generateKE1(password, blind_login, [_]u8{0x22} ** 32, [_]u8{0x33} ** 32);
+    const wrong_client = try shim.generateKE1(password, blind_login, @as([32]u8, @splat(0x22)), @as([32]u8, @splat(0x33)));
     const wrong_server = try shim.generateKE2(
         server_keys.private_key,
         server_keys.public_key,
@@ -469,9 +469,9 @@ test "M6: a real KSF (Argon2id) changes session_key/export_key, and matching KSF
         wrong_client.ke1,
         identities,
         context,
-        [_]u8{0x44} ** 32,
-        [_]u8{0x55} ** 32,
-        [_]u8{0x66} ** 32,
+        @as([32]u8, @splat(0x44)),
+        @as([32]u8, @splat(0x55)),
+        @as([32]u8, @splat(0x66)),
     );
     try testing.expectError(
         error.EnvelopeRecovery,
@@ -485,7 +485,7 @@ test "M6: a failing KSF propagates error.KsfFailed, not silently swallowed or pa
     var argon2: Argon2Ksf = .{
         .allocator = testing.allocator,
         .io = threaded.io(),
-        .salt = [_]u8{0} ** 16,
+        .salt = @as([16]u8, @splat(0)),
         .params = std.crypto.pwhash.argon2.Params.owasp_2id,
         .fail = true,
     };
@@ -493,9 +493,9 @@ test "M6: a failing KSF propagates error.KsfFailed, not silently swallowed or pa
     var wide: [64]u8 = undefined;
     for (&wide, 0..) |*b, i| b.* = @truncate(i *% 101 +% 7);
     const blind_reg = shim.scalarFromWideBytes(wide);
-    const server_key_seed = [_]u8{0xa7} ** 32;
+    const server_key_seed = @as([32]u8, @splat(0xa7));
     const server_keys = try shim.deriveAkeKeyPair(server_key_seed);
-    const oprf_seed = [_]u8{0x5c} ** 64;
+    const oprf_seed = @as([64]u8, @splat(0x5c));
     const identities = opaque_pake.Identities{ .client = "user-42", .server = "example.com" };
 
     const request = try shim.createRegistrationRequest("hunter2", blind_reg);
@@ -507,7 +507,7 @@ test "M6: a failing KSF propagates error.KsfFailed, not silently swallowed or pa
             blind_reg,
             response,
             identities,
-            [_]u8{0x11} ** 32,
+            @as([32]u8, @splat(0x11)),
             argon2.ksf(),
         ),
     );
@@ -678,7 +678,7 @@ test "RFC 9807 C.2.1 fake credential response reproduces KE2 byte-exact" {
     const record = opaque_pake.RegistrationRecord{
         .client_public_key = client_public_key,
         .masking_key = masking_key,
-        .envelope = opaque_pake.Envelope.fromBytes([_]u8{0} ** opaque_pake.Envelope.encoded_length),
+        .envelope = opaque_pake.Envelope.fromBytes(@as([opaque_pake.Envelope.encoded_length]u8, @splat(0))),
     };
     const ke1_msg = opaque_pake.KE1.fromBytes(ke1);
     const res = try shim.generateKE2(
@@ -783,6 +783,6 @@ test "L1: RegistrationRecord.validate catches a degenerate client_public_key" {
     // (the same degenerate value the KE1/KE2 keyshare tests above use)
     // must not.
     var poisoned = good;
-    poisoned.client_public_key = [_]u8{0} ** opaque_pake.Npk;
+    poisoned.client_public_key = @as([opaque_pake.Npk]u8, @splat(0));
     try testing.expectError(error.InvalidPublicKey, poisoned.validate());
 }

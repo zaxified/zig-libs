@@ -1192,7 +1192,7 @@ pub const RetentionState = struct {
 /// A scan position: a point key, a point key + 0x00 (resume strictly after it),
 /// or the bare tag byte (the start of the point partition).
 const ScanPos = struct {
-    buf: [codec.max_scan_key_len]u8 = [_]u8{0} ** codec.max_scan_key_len,
+    buf: [codec.max_scan_key_len]u8 = @as([codec.max_scan_key_len]u8, @splat(0)),
     len: u8 = 0,
 
     fn set(self: *ScanPos, bytes: []const u8) void {

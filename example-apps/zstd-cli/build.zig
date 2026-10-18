@@ -14,7 +14,7 @@ pub fn build(b: *std.Build) void {
         std.builtin.OptimizeMode,
         "optimize",
         "Prioritize performance, safety, or binary size (default: ReleaseFast)",
-    ) orelse .ReleaseFast;
+    ) orelse .fast;
 
     const zig_libs = b.dependency("zig_libs", .{ .target = target, .optimize = optimize });
     const zstd = zig_libs.module("zstd");
@@ -33,7 +33,7 @@ pub fn build(b: *std.Build) void {
 
     const run = b.addRunArtifact(exe);
     run.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run.addArgs(args);
+    run.addPassthruArgs();
     b.step("run", "Build and run (pass args after --, e.g. -- -19 file)").dependOn(&run.step);
 
     const tests = b.addTest(.{

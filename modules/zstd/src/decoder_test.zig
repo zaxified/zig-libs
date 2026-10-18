@@ -37,7 +37,7 @@ test "hand-built frames: empty, raw, RLE, compressed with zero sequences" {
     try std.testing.expectEqualStrings("hello", r);
     const z = try decodeAll(&rle_frame);
     defer gpa.free(z);
-    try std.testing.expectEqualSlices(u8, &([_]u8{'z'} ** 64), z);
+    try std.testing.expectEqualSlices(u8, &(@as([64]u8, @splat('z'))), z);
     const s = try decodeAll(&zero_seq_frame);
     defer gpa.free(s);
     try std.testing.expectEqualStrings("abc", s);
@@ -73,15 +73,15 @@ test "skippable frames are skipped, read, and recognised" {
 }
 
 test "concatenated frames decode to the concatenation; size queries agree" {
-    const a = try zstd.compressAlloc(gpa, "first frame " ** 50, .{ .level = 3 });
+    const a = try zstd.compressAlloc(gpa, strRepeat("first frame ", 50), .{ .level = 3 });
     defer gpa.free(a);
-    const b = try zstd.compressAlloc(gpa, "second one, checksummed " ** 70, .{ .level = 19, .checksum = true });
+    const b = try zstd.compressAlloc(gpa, strRepeat("second one, checksummed ", 70), .{ .level = 19, .checksum = true });
     defer gpa.free(b);
     const src = try std.mem.concat(gpa, u8, &.{ a, &skippable, b });
     defer gpa.free(src);
     const out = try decodeAll(src);
     defer gpa.free(out);
-    try std.testing.expectEqualStrings("first frame " ** 50 ++ "second one, checksummed " ** 70, out);
+    try std.testing.expectEqualStrings(strRepeat("first frame ", 50) ++ strRepeat("second one, checksummed ", 70), out);
     try std.testing.expectEqual(a.len, try zstd.findFrameCompressedSize(src));
     try std.testing.expectEqual(@as(?u64, out.len), try zstd.findDecompressedSize(src));
     try std.testing.expectEqual(@as(u64, out.len), try zstd.decompressBound(src));
@@ -91,7 +91,7 @@ test "concatenated frames decode to the concatenation; size queries agree" {
     try std.testing.expectEqual(@as(usize, h.header_size), try zstd.frameHeaderSize(b));
     // trailing bytes after the frames
     for ([_]usize{ 1, 4, 5 }) |extra| {
-        const t = try std.mem.concat(gpa, u8, &.{ src, ("\x00" ** 5)[0..extra] });
+        const t = try std.mem.concat(gpa, u8, &.{ src, (strRepeat("\x00", 5))[0..extra] });
         defer gpa.free(t);
         const buf = try gpa.alloc(u8, out.len + 16);
         defer gpa.free(buf);
@@ -104,7 +104,7 @@ test "a streamed frame of unknown size decodes through the bound" {
     defer s.deinit();
     var buf: [512]u8 = undefined;
     var o: zstd.OutBuffer = .{ .dst = &buf };
-    const text = "no content size in this header " ** 10;
+    const text = strRepeat("no content size in this header ", 10);
     // `continue` first: ended in its first call, a stream records the size
     var in: zstd.InBuffer = .{ .src = text };
     _ = try s.compressStream2(&o, &in, .@"continue");
@@ -121,7 +121,7 @@ test "a streamed frame of unknown size decodes through the bound" {
 }
 
 test "content checksum: a wrong one is refused unless ignored" {
-    const z = try zstd.compressAlloc(gpa, "checksummed content " ** 20, .{ .checksum = true });
+    const z = try zstd.compressAlloc(gpa, strRepeat("checksummed content ", 20), .{ .checksum = true });
     defer gpa.free(z);
     z[z.len - 1] ^= 1;
     var out: [512]u8 = undefined;
@@ -165,7 +165,7 @@ test "frame header errors" {
 }
 
 test "every truncation of a frame is refused" {
-    const z = try zstd.compressAlloc(gpa, "truncate me somewhere, anywhere at all " ** 30, .{ .level = 5, .checksum = true });
+    const z = try zstd.compressAlloc(gpa, strRepeat("truncate me somewhere, anywhere at all ", 30), .{ .level = 5, .checksum = true });
     defer gpa.free(z);
     var out: [2048]u8 = undefined;
     for (1..z.len) |n| {
@@ -177,7 +177,7 @@ test "every truncation of a frame is refused" {
 }
 
 test "a destination too small is refused" {
-    const z = try zstd.compressAlloc(gpa, "x" ** 1000 ++ "yz" ** 500, .{});
+    const z = try zstd.compressAlloc(gpa, strRepeat("x", 1000) ++ strRepeat("yz", 500), .{});
     defer gpa.free(z);
     var out: [1999]u8 = undefined;
     try std.testing.expectError(error.DstSizeTooSmall, zstd.decompress(gpa, &out, z));
@@ -215,13 +215,13 @@ test "a context is reusable across frames and after errors" {
     var d = try zstd.Decompressor.init(gpa, .{});
     defer d.deinit();
     var out: [4096]u8 = undefined;
-    const z = try zstd.compressAlloc(gpa, "reuse " ** 400, .{ .level = 9 });
+    const z = try zstd.compressAlloc(gpa, strRepeat("reuse ", 400), .{ .level = 9 });
     defer gpa.free(z);
     for (0..3) |_| {
         try std.testing.expectEqual(@as(usize, 2400), try d.decompress(&out, z));
         try std.testing.expectError(error.PrefixUnknown, d.decompress(&out, "junk, not a frame"));
     }
-    try std.testing.expectEqualStrings("reuse " ** 400, out[0..2400]);
+    try std.testing.expectEqualStrings(strRepeat("reuse ", 400), out[0..2400]);
 }
 
 test "window size: exponent and mantissa" {
@@ -644,4 +644,16 @@ test "the assembly sequence loop decodes as the Zig one, valid and damaged frame
     }
     try std.testing.expect(frames > 50);
     try std.testing.expect(dblock.fastSeqEntriesForTest() - entries0 > 100);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

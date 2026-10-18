@@ -442,7 +442,7 @@ test "make_keypackage_ref / make_proposal_ref: distinct labels produce distinct 
 }
 
 test "DeriveSecret: equals ExpandWithLabel(secret, label, \"\", Nh)" {
-    const secret = [_]u8{0x11} ** TestSuite.Nh;
+    const secret = @as([TestSuite.Nh]u8, @splat(0x11));
     var got: [TestSuite.Nh]u8 = undefined;
     try DeriveSecret(TestSuite, &secret, "test label", &got);
     var want: [TestSuite.Nh]u8 = undefined;
@@ -451,10 +451,10 @@ test "DeriveSecret: equals ExpandWithLabel(secret, label, \"\", Nh)" {
 }
 
 test "kdfLabelLen: matches what encodeKdfLabel actually writes, and sizes ExpandWithLabelScratch exactly" {
-    const secret = [_]u8{0x33} ** TestSuite.Nh;
+    const secret = @as([TestSuite.Nh]u8, @splat(0x33));
     // A context far larger than `label_scratch_len` — the GroupContext-with-
     // extensions case `ExpandWithLabel`'s fixed buffer cannot serve.
-    const big_context = [_]u8{0xab} ** 4096;
+    const big_context = @as([4096]u8, @splat(0xab));
     const label = "epoch";
 
     const need = try kdfLabelLen(label, &big_context);
@@ -474,7 +474,7 @@ test "kdfLabelLen: matches what encodeKdfLabel actually writes, and sizes Expand
 }
 
 test "DeriveTreeSecret: context is the big-endian uint32 generation" {
-    const secret = [_]u8{0x22} ** TestSuite.Nh;
+    const secret = @as([TestSuite.Nh]u8, @splat(0x22));
     var got: [16]u8 = undefined;
     try DeriveTreeSecret(TestSuite, &secret, "key", 0x01020304, &got);
     var want: [16]u8 = undefined;

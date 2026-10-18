@@ -877,7 +877,7 @@ test "§7.2: LeafNode.sign round-trips through verifySignature, and the group bi
     const sig_pub = kp.public_key.toBytes();
 
     var leaf: LeafNode = .{
-        .encryption_key = &[_]u8{0xa0} ** 32,
+        .encryption_key = &@as([32]u8, @splat(0xa0)),
         .signature_key = &sig_pub,
         .credential = .{ .basic = "signer" },
         .capabilities = .{
@@ -888,7 +888,7 @@ test "§7.2: LeafNode.sign round-trips through verifySignature, and the group bi
             .credentials = &.{1},
         },
         .leaf_node_source = .commit,
-        .parent_hash = &[_]u8{0xb0} ** 32,
+        .parent_hash = &@as([32]u8, @splat(0xb0)),
         .extensions = &.{},
         .signature = &.{},
     };
@@ -929,8 +929,8 @@ test "leafNode: leaf index is doubled, a blank leaf is null, past the end is nul
     // leaves behind. Built by hand rather than decoded, so the test says what
     // the layout is instead of inheriting it from the decoder it is checking.
     const leaf0: LeafNode = .{
-        .encryption_key = &[_]u8{0x00} ** 32,
-        .signature_key = &[_]u8{0x10} ** 32,
+        .encryption_key = &@as([32]u8, @splat(0x00)),
+        .signature_key = &@as([32]u8, @splat(0x10)),
         .credential = .{ .basic = "zero" },
         .capabilities = .{ .versions = &.{1}, .cipher_suites = &.{1}, .extensions = &.{}, .proposals = &.{}, .credentials = &.{1} },
         .leaf_node_source = .key_package,
@@ -942,7 +942,7 @@ test "leafNode: leaf index is doubled, a blank leaf is null, past the end is nul
     leaf2.credential = .{ .basic = "two" };
 
     const parent: ParentNode = .{
-        .encryption_key = &[_]u8{0x20} ** 32,
+        .encryption_key = &@as([32]u8, @splat(0x20)),
         .parent_hash = &.{},
         .unmerged_leaves = &.{},
     };
@@ -1014,7 +1014,7 @@ test "§7.1: a peer-supplied unmerged leaf index outside the tree is refused at 
     var bw = codec.Writer.init(&body);
     try bw.writePresence(false); // node 0: blank leaf
     try bw.writePresence(true); // node 1: the hostile parent
-    try bw.writeU8(@intFromEnum(NodeType.parent));
+    try bw.writeU8(@backingInt(NodeType.parent));
     try bw.writeVector(&.{}); // encryption_key
     try bw.writeVector(&.{}); // parent_hash
     try wire.encodeU32Vec(&bw, &[_]u32{0x7FFF_FFFF}); // unmerged_leaves
@@ -1030,7 +1030,7 @@ test "§7.1: a peer-supplied unmerged leaf index outside the tree is refused at 
     var bw2 = codec.Writer.init(&body2);
     try bw2.writePresence(false);
     try bw2.writePresence(true);
-    try bw2.writeU8(@intFromEnum(NodeType.parent));
+    try bw2.writeU8(@backingInt(NodeType.parent));
     try bw2.writeVector(&.{});
     try bw2.writeVector(&.{});
     try wire.encodeU32Vec(&bw2, &[_]u32{ 1, 1 }); // in range, but duplicated
@@ -1046,7 +1046,7 @@ test "§7.1: a peer-supplied unmerged leaf index outside the tree is refused at 
     var bw3 = codec.Writer.init(&body3);
     try bw3.writePresence(false);
     try bw3.writePresence(true);
-    try bw3.writeU8(@intFromEnum(NodeType.parent));
+    try bw3.writeU8(@backingInt(NodeType.parent));
     try bw3.writeVector(&.{});
     try bw3.writeVector(&.{});
     try wire.encodeU32Vec(&bw3, &[_]u32{1});
@@ -1085,8 +1085,8 @@ const testing = std.testing;
 /// BUILT rather than quoted.
 fn fuzzLeaf(source: LeafNodeSource, identity: []const u8) LeafNode {
     return .{
-        .encryption_key = &[_]u8{0xa0} ** 32,
-        .signature_key = &[_]u8{0xa1} ** 32,
+        .encryption_key = &@as([32]u8, @splat(0xa0)),
+        .signature_key = &@as([32]u8, @splat(0xa1)),
         .credential = .{ .basic = identity },
         .capabilities = .{
             .versions = &.{1},
@@ -1097,9 +1097,9 @@ fn fuzzLeaf(source: LeafNodeSource, identity: []const u8) LeafNode {
         },
         .leaf_node_source = source,
         .lifetime = if (source == .key_package) .{ .not_before = 0, .not_after = 1 } else null,
-        .parent_hash = if (source == .commit) &[_]u8{0xb0} ** 32 else null,
+        .parent_hash = if (source == .commit) &@as([32]u8, @splat(0xb0)) else null,
         .extensions = &.{},
-        .signature = &[_]u8{0xa2} ** 64,
+        .signature = &@as([64]u8, @splat(0xa2)),
     };
 }
 
@@ -1128,8 +1128,8 @@ const TreeCorpus = struct {
         //    present with different credentials, leaf 1 blank (the shape a
         //    Remove leaves behind), both parents present.
         const parent: ParentNode = .{
-            .encryption_key = &[_]u8{0x20} ** 32,
-            .parent_hash = &[_]u8{0x21} ** 32,
+            .encryption_key = &@as([32]u8, @splat(0x20)),
+            .parent_hash = &@as([32]u8, @splat(0x21)),
             .unmerged_leaves = &.{2},
         };
         var nodes = [_]?Node{
@@ -1159,7 +1159,7 @@ const TreeCorpus = struct {
         var bw = codec.Writer.init(&body);
         try bw.writePresence(false);
         try bw.writePresence(true);
-        try bw.writeU8(@intFromEnum(NodeType.parent));
+        try bw.writeU8(@backingInt(NodeType.parent));
         try bw.writeVector(&.{});
         try bw.writeVector(&.{});
         try wire.encodeU32Vec(&bw, &[_]u32{0x7FFF_FFFF});
@@ -1173,7 +1173,7 @@ const TreeCorpus = struct {
         var bw2 = codec.Writer.init(&body);
         try bw2.writePresence(false);
         try bw2.writePresence(true);
-        try bw2.writeU8(@intFromEnum(NodeType.parent));
+        try bw2.writeU8(@backingInt(NodeType.parent));
         try bw2.writeVector(&.{});
         try bw2.writeVector(&.{});
         try wire.encodeU32Vec(&bw2, &[_]u32{ 1, 1 });
@@ -1262,9 +1262,9 @@ const LeafCorpus = struct {
         // The source octet sits after both keys, the credential and the
         // capabilities; found by search rather than by arithmetic so this does
         // not silently move when a field above it grows.
-        const src_at = std.mem.indexOf(u8, kp, &[_]u8{@intFromEnum(LeafNodeSource.key_package)}) orelse
+        const src_at = std.mem.indexOf(u8, kp, &[_]u8{@backingInt(LeafNodeSource.key_package)}) orelse
             return error.SourceOctetNotFound;
-        confused[src_at] = @intFromEnum(LeafNodeSource.commit);
+        confused[src_at] = @backingInt(LeafNodeSource.commit);
         self.entries[3] = testkit.fuzz.seedInto(&self.stores[3], confused[0..kp.len]);
         // 4. A truncated leaf: the header is intact, the tail is cut off.
         self.entries[4] = testkit.fuzz.seedInto(&self.stores[4], kp[0 .. kp.len / 2]);

@@ -263,7 +263,7 @@ test "a leader that OOMs on the result copy hands EVERY follower the error, not 
     // whole thing self-healed on the next get. Every participant must instead
     // see `error.OutOfMemory`.
     const value_len = 4093;
-    const big = "y" ** value_len;
+    const big = strRepeat("y", value_len);
 
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
     defer threaded.deinit();
@@ -319,4 +319,16 @@ test "a leader that OOMs on the result copy hands EVERY follower the error, not 
         try testing.expect(!p.empty_value);
         try testing.expectEqual(@as(?anyerror, error.OutOfMemory), p.err);
     }
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

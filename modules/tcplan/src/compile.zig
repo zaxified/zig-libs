@@ -272,13 +272,13 @@ const MatchKey = struct {
         switch (m) {
             .ipv4 => |v| {
                 k.fam = 4;
-                k.dir = @intFromEnum(v.dir);
+                k.dir = @backingInt(v.dir);
                 k.len = v.prefix_len;
                 @memcpy(k.start[0..4], &v.addr);
             },
             .ipv6 => |v| {
                 k.fam = 6;
-                k.dir = @intFromEnum(v.dir);
+                k.dir = @backingInt(v.dir);
                 k.len = v.prefix_len;
                 k.start = v.addr;
             },
@@ -407,18 +407,18 @@ test "flowerFor: dir picks src vs dst field for both ipv4 and ipv6" {
     try testing.expectEqualSlices(u8, &.{ 10, 0, 0, 2 }, &f4_src.ipv4_src.?.addr);
 
     // ipv6, default dir (.dst) — field values, not just "a filter exists".
-    const m6_dst: Match = .{ .ipv6 = .{ .addr = [_]u8{0xab} ** 16, .prefix_len = 64 } };
+    const m6_dst: Match = .{ .ipv6 = .{ .addr = @as([16]u8, @splat(0xab)), .prefix_len = 64 } };
     const f6_dst = flowerFor(m6_dst, classid);
     try testing.expectEqual(tc.ETH_P.IPV6, f6_dst.eth_type);
     try testing.expect(f6_dst.ipv6_src == null);
-    try testing.expectEqualSlices(u8, &([_]u8{0xab} ** 16), &f6_dst.ipv6_dst.?.addr);
+    try testing.expectEqualSlices(u8, &(@as([16]u8, @splat(0xab))), &f6_dst.ipv6_dst.?.addr);
     try testing.expectEqual(@as(u8, 64), f6_dst.ipv6_dst.?.prefix_len);
 
     // ipv6, dir = .src.
-    const m6_src: Match = .{ .ipv6 = .{ .addr = [_]u8{0xcd} ** 16, .dir = .src } };
+    const m6_src: Match = .{ .ipv6 = .{ .addr = @as([16]u8, @splat(0xcd)), .dir = .src } };
     const f6_src = flowerFor(m6_src, classid);
     try testing.expect(f6_src.ipv6_dst == null);
-    try testing.expectEqualSlices(u8, &([_]u8{0xcd} ** 16), &f6_src.ipv6_src.?.addr);
+    try testing.expectEqualSlices(u8, &(@as([16]u8, @splat(0xcd))), &f6_src.ipv6_src.?.addr);
     try testing.expectEqual(classid.raw, f6_src.classid.?.raw);
 }
 
@@ -490,7 +490,7 @@ test "a leaf without a classifier does not consume a filter prio" {
 
 test "multi-match: one class, one filter per entry, consecutive prios in slice order" {
     const gpa = testing.allocator;
-    const v6: [16]u8 = .{ 0x20, 0x01, 0x0d, 0xb8, 0x00, 0x01 } ++ [_]u8{0} ** 10;
+    const v6: [16]u8 = .{ 0x20, 0x01, 0x0d, 0xb8, 0x00, 0x01 } ++ @as([10]u8, @splat(0));
     const subs = [_]Node{
         .{ .name = "dual", .rate_bps = 500, .match = &.{
             .{ .ipv4 = .{ .addr = .{ 100, 64, 0, 1 } } },
@@ -544,8 +544,8 @@ test "invariant: overlapping classifiers are refused, within and across subscrib
 
     // IPv6, input order reversed against sort order: a host given first,
     // the /32 covering it given second.
-    const v6a: [16]u8 = .{ 0x20, 0x01, 0x0d, 0xb8 } ++ [_]u8{0} ** 12;
-    const v6b: [16]u8 = .{ 0x20, 0x01, 0x0d, 0xb8, 0xff } ++ [_]u8{0} ** 11;
+    const v6a: [16]u8 = .{ 0x20, 0x01, 0x0d, 0xb8 } ++ @as([12]u8, @splat(0));
+    const v6b: [16]u8 = .{ 0x20, 0x01, 0x0d, 0xb8, 0xff } ++ @as([11]u8, @splat(0));
     const nested = [_]Node{
         .{ .name = "z", .rate_bps = 1000, .cpu = 0, .match = &.{.{ .ipv6 = .{ .addr = v6b } }} },
         .{ .name = "x", .rate_bps = 1000, .cpu = 0, .match = &.{.{ .ipv6 = .{ .addr = v6a, .prefix_len = 32 } }} },

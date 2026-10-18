@@ -158,7 +158,7 @@ fn ours(gpa: mem.Allocator, src: []const u8) !Ours {
 
 test "ref oracle: preprocess + std.json read every document as the reference JSON5 does" {
     const gpa = testing.allocator;
-    var seen = [_]bool{false} ** divergences.len;
+    var seen = @as([divergences.len]bool, @splat(false));
     var bad: usize = 0;
     var agreed_values: usize = 0;
     var recovered: usize = 0;

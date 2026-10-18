@@ -309,7 +309,7 @@ pub fn appendNfgenmsg(
     res_id: u16,
 ) std.mem.Allocator.Error!void {
     var raw: [nfgenmsg_len]u8 = undefined;
-    raw[0] = @intFromEnum(family);
+    raw[0] = @backingInt(family);
     raw[1] = NFNETLINK_V0;
     std.mem.writeInt(u16, raw[2..4], res_id, .big);
     try list.appendSlice(gpa, &raw);
@@ -504,7 +504,7 @@ fn decodeCounters(nest: []const u8) DecodeError!Counters {
 /// always rejected (`error.Truncated`/`error.BadLength`).
 pub fn decodeFlow(payload: []const u8) DecodeError!Flow {
     const hdr = try parseNfgenmsg(payload);
-    var out: Flow = .{ .family = @enumFromInt(hdr.family) };
+    var out: Flow = .{ .family = @fromBackingInt(@intCast(hdr.family)) };
     var it = hdr.attrIterator();
     while (try it.next()) |a| switch (a.type) {
         CTA.TUPLE_ORIG => out.orig = try decodeTuple(a.data),
@@ -531,7 +531,7 @@ pub fn decodeFlow(payload: []const u8) DecodeError!Flow {
                 if (pa.type != CTA_PROTOINFO.TCP) continue; // DCCP/SCTP: deferred
                 var tcp = pa.nested();
                 while (try tcp.next()) |ta| switch (ta.type) {
-                    CTA_PROTOINFO_TCP.STATE => out.tcp_state = @enumFromInt(try ta.asU8()),
+                    CTA_PROTOINFO_TCP.STATE => out.tcp_state = @fromBackingInt(@intCast(try ta.asU8())),
                     CTA_PROTOINFO_TCP.WSCALE_ORIGINAL => out.tcp_wscale_orig = try ta.asU8(),
                     CTA_PROTOINFO_TCP.WSCALE_REPLY => out.tcp_wscale_reply = try ta.asU8(),
                     CTA_PROTOINFO_TCP.FLAGS_ORIGINAL => out.tcp_flags_orig = try tcpFlags(ta),
@@ -629,7 +629,7 @@ pub fn buildDumpRequest(seq: u32, family: Family) [codec.header_len + nfgenmsg_l
     std.mem.writeInt(u16, req[6..8], codec.NLM_F_REQUEST | codec.NLM_F_DUMP, native_endian);
     std.mem.writeInt(u32, req[8..12], seq, native_endian);
     // nlmsg_pid stays 0 — the kernel routes replies by socket.
-    req[codec.header_len] = @intFromEnum(family);
+    req[codec.header_len] = @backingInt(family);
     req[codec.header_len + 1] = NFNETLINK_V0;
     // res_id (__be16) stays 0.
     return req;
@@ -777,7 +777,7 @@ pub fn buildNewRequest(
         const pi_off = try codec.nestBegin(gpa, &list, codec.NLA_F_NESTED | CTA.PROTOINFO);
         const tcp_off = try codec.nestBegin(gpa, &list, codec.NLA_F_NESTED | CTA_PROTOINFO.TCP);
         if (spec.tcp_state) |s|
-            try codec.appendAttrU8(gpa, &list, CTA_PROTOINFO_TCP.STATE, @intFromEnum(s));
+            try codec.appendAttrU8(gpa, &list, CTA_PROTOINFO_TCP.STATE, @backingInt(s));
         if (spec.tcp_flags_orig) |f| try codec.appendAttr(
             gpa,
             &list,
@@ -1615,8 +1615,8 @@ const DecodeCorpus = struct {
         try appendNfgenmsg(gpa, &tuple6, .ipv6, 0);
         {
             const ip = try codec.nestBegin(gpa, &tuple6, CTA_TUPLE.IP);
-            try codec.appendAttr(gpa, &tuple6, CTA_IP.V6_SRC, &([_]u8{0x20} ++ [_]u8{0} ** 15));
-            try codec.appendAttr(gpa, &tuple6, CTA_IP.V6_DST, &([_]u8{0xfe} ++ [_]u8{0} ** 15));
+            try codec.appendAttr(gpa, &tuple6, CTA_IP.V6_SRC, &([_]u8{0x20} ++ @as([15]u8, @splat(0))));
+            try codec.appendAttr(gpa, &tuple6, CTA_IP.V6_DST, &([_]u8{0xfe} ++ @as([15]u8, @splat(0))));
             try codec.nestEnd(&tuple6, ip);
         }
         self.push(tuple6.items);
@@ -1627,7 +1627,7 @@ const DecodeCorpus = struct {
         try appendNfgenmsg(gpa, &wrong_ip, .ipv4, 0);
         {
             const ip = try codec.nestBegin(gpa, &wrong_ip, CTA_TUPLE.IP);
-            try codec.appendAttr(gpa, &wrong_ip, CTA_IP.V4_SRC, &([_]u8{0} ** 16));
+            try codec.appendAttr(gpa, &wrong_ip, CTA_IP.V4_SRC, &(@as([16]u8, @splat(0))));
             try codec.nestEnd(&wrong_ip, ip);
         }
         self.push(wrong_ip.items);
@@ -1635,7 +1635,7 @@ const DecodeCorpus = struct {
         try appendNfgenmsg(gpa, &wrong_ip6, .ipv6, 0);
         {
             const ip = try codec.nestBegin(gpa, &wrong_ip6, CTA_TUPLE.IP);
-            try codec.appendAttr(gpa, &wrong_ip6, CTA_IP.V6_SRC, &([_]u8{0} ** 4));
+            try codec.appendAttr(gpa, &wrong_ip6, CTA_IP.V6_SRC, &(@as([4]u8, @splat(0))));
             try codec.nestEnd(&wrong_ip6, ip);
         }
         self.push(wrong_ip6.items);

@@ -170,7 +170,7 @@ const Fr = bls.Fr;
 /// uses only to produce a valid `Credential` to re-randomise). Mirrors
 /// `credential.zig`'s own `frOf` test helper.
 fn frOf(v: u64) Fr {
-    var buf: [32]u8 = [_]u8{0} ** 32;
+    var buf: [32]u8 = @as([32]u8, @splat(0));
     std.mem.writeInt(u64, buf[24..32], v, .big);
     return Fr.fromBytes(buf) catch unreachable;
 }

@@ -363,7 +363,7 @@ test "an impossible device name is rejected locally, not by the kernel" {
     }));
     try testing.expectError(error.InvalidRequest, append(gpa, &list, 1, .{ .target = .byName("eth\x000") }));
     // Exactly IFNAMSIZ-1 characters is the longest legal name.
-    try append(gpa, &list, 1, .{ .target = .byName("a" ** (uapi.ifnamesize - 1)) });
+    try append(gpa, &list, 1, .{ .target = .byName(strRepeat("a", uapi.ifnamesize - 1)) });
 }
 
 test "parse recovers index and name, and bounds the name" {
@@ -394,4 +394,16 @@ test "find locates the header nest among sibling attributes" {
     const d = (try find(list.items, uapi.RINGS.HEADER)).?;
     try testing.expectEqual(@as(?u32, 3), d.index);
     try testing.expect((try find(list.items, uapi.STATS.HEADER)) == null);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

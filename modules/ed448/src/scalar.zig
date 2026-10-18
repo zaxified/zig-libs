@@ -60,7 +60,7 @@ pub const l_bytes: [encoded_bytes]u8 = hexBytes(encoded_bytes, "f34458ab92c27823
 /// helpers) without changing this public byte-array API.
 pub const CompressedScalar = [encoded_bytes]u8;
 
-pub const zero: CompressedScalar = [_]u8{0} ** encoded_bytes;
+pub const zero: CompressedScalar = @as([encoded_bytes]u8, @splat(0));
 
 /// Check that a 57-byte scalar encoding is canonical (`< L`). REAL:
 /// constant-time big-integer byte comparison against `l_bytes`
@@ -116,7 +116,7 @@ const num_limbs = 9;
 /// byte-aligned, no cross-limb bit splitting). `bytes.len` may be
 /// anything `<= n_limbs * 7`.
 fn limbsFromBytes(comptime n_limbs: usize, bytes: []const u8) [n_limbs]u64 {
-    var limbs = [_]u64{0} ** n_limbs;
+    var limbs = @as([n_limbs]u64, @splat(0));
     for (bytes, 0..) |b, i| {
         limbs[i / 7] |= @as(u64, b) << @intCast(8 * (i % 7));
     }
@@ -126,7 +126,7 @@ fn limbsFromBytes(comptime n_limbs: usize, bytes: []const u8) [n_limbs]u64 {
 /// Pack 9 canonical (< 2^56 each, value < L) limbs back into the 57-byte
 /// wire form.
 fn limbsToBytes(limbs: [num_limbs]u64) CompressedScalar {
-    var out = [_]u8{0} ** encoded_bytes;
+    var out = @as([encoded_bytes]u8, @splat(0));
     for (&out, 0..) |*b, i| {
         b.* = @truncate(limbs[i / 7] >> @intCast(8 * (i % 7)));
     }
@@ -161,7 +161,7 @@ fn condSubL(limbs: [num_limbs]u64) [num_limbs]u64 {
 /// iteration executes identically regardless of data — no secret-
 /// dependent branch, no early exit.
 fn reduceLimbs(comptime n_limbs: usize, wide: [n_limbs]u64) [num_limbs]u64 {
-    var r = [_]u64{0} ** num_limbs;
+    var r = @as([num_limbs]u64, @splat(0));
     var bit_index: usize = n_limbs * limb_bits;
     while (bit_index > 0) {
         bit_index -= 1;
@@ -216,7 +216,7 @@ pub fn mul(a: CompressedScalar, b: CompressedScalar) CompressedScalar {
     const bl = limbsFromBytes(num_limbs, &b);
     // 9×9 schoolbook into 17 columns; each column sums at most 9
     // products of 56-bit limbs (< 9 * 2^112 < 2^116, fits u128).
-    var cols = [_]u128{0} ** 17;
+    var cols = @as([17]u128, @splat(0));
     inline for (0..num_limbs) |i| {
         inline for (0..num_limbs) |j| {
             cols[i + j] += @as(u128, al[i]) * bl[j];
@@ -272,12 +272,12 @@ test "rejectNonCanonical decides at the most significant differing byte" {
 }
 
 test "clamp: RFC 8032 §5.2.5 pruning (REAL)" {
-    var buf = [_]u8{0xff} ** encoded_bytes;
+    var buf = @as([encoded_bytes]u8, @splat(0xff));
     clamp(&buf);
     try std.testing.expectEqual(@as(u8, 0xfc), buf[0]);
     try std.testing.expectEqual(@as(u8, 0x00), buf[encoded_bytes - 1]);
     try std.testing.expectEqual(@as(u8, 0xff), buf[encoded_bytes - 2]); // 0xff | 0x80 == 0xff
-    var zbuf = [_]u8{0x00} ** encoded_bytes;
+    var zbuf = @as([encoded_bytes]u8, @splat(0x00));
     clamp(&zbuf);
     try std.testing.expectEqual(@as(u8, 0x00), zbuf[0]);
     try std.testing.expectEqual(@as(u8, 0x00), zbuf[encoded_bytes - 1]);
@@ -285,13 +285,13 @@ test "clamp: RFC 8032 §5.2.5 pruning (REAL)" {
 }
 
 test "reduceWide: small values pass through; L and 2L reduce to zero; L+1 to one" {
-    var digest = [_]u8{0} ** 114;
+    var digest = @as([114]u8, @splat(0));
     digest[0] = 1;
     var one = zero;
     one[0] = 1;
     try std.testing.expectEqualSlices(u8, &one, &reduceWide(digest));
 
-    var l_wide = [_]u8{0} ** 114;
+    var l_wide = @as([114]u8, @splat(0));
     l_wide[0..encoded_bytes].* = l_bytes;
     try std.testing.expectEqualSlices(u8, &zero, &reduceWide(l_wide));
 
@@ -300,7 +300,7 @@ test "reduceWide: small values pass through; L and 2L reduce to zero; L+1 to one
     try std.testing.expectEqualSlices(u8, &one, &reduceWide(l_plus_1));
 
     // 2L: shift L left one bit across the wide buffer.
-    var two_l = [_]u8{0} ** 114;
+    var two_l = @as([114]u8, @splat(0));
     var carry: u8 = 0;
     for (l_wide, 0..) |b, i| {
         two_l[i] = (b << 1) | carry;

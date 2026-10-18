@@ -466,13 +466,13 @@ test "verifyContribution: a δ that the proof of knowledge does not account for"
     const testing = std.testing;
     var z = try zkey_mod.parse(testing.allocator, @embedFile("testdata/snarkjs/t0.zkey"));
     defer z.deinit(testing.allocator);
-    const x = Fr.reduceWide(&[_]u8{7} ** 32);
-    const s = Fr.reduceWide(&[_]u8{9} ** 32);
+    const x = Fr.reduceWide(&@as([32]u8, @splat(7)));
+    const s = Fr.reduceWide(&@as([32]u8, @splat(9)));
     try contribute(testing.allocator, &z, &x, &s, "mallory");
     try testing.expect(verifyContribution(z, 0));
 
     var rec = &z.contributions[0];
-    rec.delta_after = mulG1(Fr.reduceWide(&[_]u8{5} ** 32));
+    rec.delta_after = mulG1(Fr.reduceWide(&@as([32]u8, @splat(5))));
     rec.transcript = transcriptOf(z.circuit_hash, G1.Affine.generator, rec.*);
     rec.g2_spx = G2.Jacobian.fromAffine(g2Sp(rec.transcript)).scalarMul(x).toAffine();
     // The first check (g1_s, g1_sx) still holds — the forgery is consistent there.

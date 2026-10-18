@@ -341,7 +341,7 @@ noinline fn callSignShare() void {
 }
 
 test "STACKPROBE: no secret on the dead stack after presign rounds, finish and signShare" {
-    if (builtin.mode == .Debug or builtin.mode == .ReleaseSafe) return error.SkipZigTest;
+    if (builtin.mode == .debug or builtin.mode == .safe) return error.SkipZigTest;
     const allocator = std.testing.allocator;
 
     var prng = std.Random.DefaultPrng.init(0x737461636b70726f); // "stackpro"
@@ -707,7 +707,7 @@ fn probeCallPublic(label: []const u8, comptime call: fn () void, comptime fill: 
 }
 
 test "STACKPROBE: no secret on the dead stack after the MtA, proof, keygen and codec entry points" {
-    if (builtin.mode == .Debug or builtin.mode == .ReleaseSafe) return error.SkipZigTest;
+    if (builtin.mode == .debug or builtin.mode == .safe) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     arena_state = .init(std.heap.page_allocator);
     defer arena_state.deinit();
@@ -926,7 +926,7 @@ fn routeBroadcasts(allocator: std.mem.Allocator, boxes: *[t]?presign.Outbox, hel
 }
 
 test "STACKPROBE: no secret on the dead stack after the abort opening rounds and signWithShares" {
-    if (builtin.mode == .Debug or builtin.mode == .ReleaseSafe) return error.SkipZigTest;
+    if (builtin.mode == .debug or builtin.mode == .safe) return error.SkipZigTest;
     const allocator = std.testing.allocator;
 
     var prng = std.Random.DefaultPrng.init(0x737461636b707233); // "stackpr3"

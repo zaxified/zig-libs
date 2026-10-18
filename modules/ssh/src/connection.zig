@@ -126,7 +126,7 @@ pub const ChannelState = struct {
 };
 
 fn writeChannelHeader(w: *std.Io.Writer, msg: messages.MessageType, recipient: u32) std.Io.Writer.Error!void {
-    try w.writeByte(@intFromEnum(msg));
+    try w.writeByte(@backingInt(msg));
     var b: [4]u8 = undefined;
     std.mem.writeInt(u32, &b, recipient, .big);
     try w.writeAll(&b);
@@ -310,7 +310,7 @@ pub const Session = struct {
         const buf = try self.gpa.alloc(u8, 64 + kind.len + extra.len);
         defer self.gpa.free(buf);
         var w: std.Io.Writer = .fixed(buf);
-        try w.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_CHANNEL_OPEN));
+        try w.writeByte(@backingInt(messages.MessageType.SSH_MSG_CHANNEL_OPEN));
         try messages.writeString(&w, kind);
         try writeU32(&w, self.ch.local_id);
         try writeU32(&w, self.ch.local_window);
@@ -507,7 +507,7 @@ pub const Session = struct {
     pub fn pumpOnce(self: *Session) ChannelError!Event {
         if (self.conn) |c| return c.pumpFor(self);
         const pkt = try self.t.recvPacket(self.scratch);
-        const mt: messages.MessageType = @enumFromInt(msgType(pkt));
+        const mt: messages.MessageType = @fromBackingInt(@intCast(msgType(pkt)));
         switch (mt) {
             .SSH_MSG_IGNORE, .SSH_MSG_DEBUG => return .other,
             .SSH_MSG_DISCONNECT => return error.ChannelClosed,
@@ -525,7 +525,7 @@ pub const Session = struct {
 
     /// Apply one channel message (types 91-100) addressed to this channel.
     fn handleChannelPacket(self: *Session, payload: []const u8) ChannelError!Event {
-        const mt: messages.MessageType = @enumFromInt(if (payload.len == 0) 0 else payload[0]);
+        const mt: messages.MessageType = @fromBackingInt(@intCast(if (payload.len == 0) 0 else payload[0]));
         var c = Cursor{ .b = payload[1..] };
         switch (mt) {
             .SSH_MSG_CHANNEL_OPEN_CONFIRMATION => {
@@ -634,7 +634,7 @@ fn refuseGlobalRequest(t: *transport.Transport, payload: []const u8) ChannelErro
     var c = Cursor{ .b = payload[1..] };
     _ = try c.string();
     if (try c.boolean())
-        try t.sendPacket(&[_]u8{@intFromEnum(messages.MessageType.SSH_MSG_REQUEST_FAILURE)});
+        try t.sendPacket(&[_]u8{@backingInt(messages.MessageType.SSH_MSG_REQUEST_FAILURE)});
 }
 
 /// §5.1: refuse a channel the peer opens towards us (an X11, agent or
@@ -816,7 +816,7 @@ pub const Connection = struct {
         const buf = try self.gpa.alloc(u8, 32 + name.len + address.len);
         defer self.gpa.free(buf);
         var w: std.Io.Writer = .fixed(buf);
-        try w.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_GLOBAL_REQUEST));
+        try w.writeByte(@backingInt(messages.MessageType.SSH_MSG_GLOBAL_REQUEST));
         try messages.writeString(&w, name);
         try w.writeByte(1); // want_reply
         try messages.writeString(&w, address);
@@ -843,7 +843,7 @@ pub const Connection = struct {
     /// concerns `target` (`.other` otherwise).
     fn pumpFor(self: *Connection, target: ?*Session) ChannelError!Session.Event {
         const pkt = try self.t.recvPacket(self.scratch);
-        const mt: messages.MessageType = @enumFromInt(msgType(pkt));
+        const mt: messages.MessageType = @fromBackingInt(@intCast(msgType(pkt)));
         switch (mt) {
             .SSH_MSG_DISCONNECT => return error.ChannelClosed,
             .SSH_MSG_GLOBAL_REQUEST => {
@@ -1401,7 +1401,7 @@ const Server = struct {
     /// `run`'s job), so it is safe to call while another channel's output
     /// is waiting for window space.
     fn dispatch(srv: *Server, payload: []const u8) ChannelError!void {
-        const mt: messages.MessageType = @enumFromInt(if (payload.len == 0) 0 else payload[0]);
+        const mt: messages.MessageType = @fromBackingInt(@intCast(if (payload.len == 0) 0 else payload[0]));
         var c = Cursor{ .b = payload[1..] };
         switch (mt) {
             .SSH_MSG_IGNORE, .SSH_MSG_DEBUG => {},
@@ -1702,7 +1702,7 @@ fn sendOpenFailure(
     var buf: [256]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     try writeChannelHeader(&w, .SSH_MSG_CHANNEL_OPEN_FAILURE, sender);
-    try writeU32(&w, @intFromEnum(reason));
+    try writeU32(&w, @backingInt(reason));
     try messages.writeString(&w, description[0..@min(description.len, 128)]);
     try messages.writeString(&w, ""); // language tag
     return t.sendPacket(w.buffered());
@@ -1948,7 +1948,7 @@ const accept_any_host_key: transport.HostKeyPolicy = .{ .verifier = .{ .verifyFn
 }.f }, .host = "127.0.0.1" };
 
 fn testKey(seed_byte: u8) userauth.AuthKey {
-    const seed: [32]u8 = [_]u8{seed_byte} ** 32;
+    const seed: [32]u8 = @as([32]u8, @splat(seed_byte));
     return .{ .ed25519 = Ed25519.KeyPair.generateDeterministic(seed) catch unreachable };
 }
 
@@ -2114,14 +2114,14 @@ const ClientCtx = struct {
                 // server must refuse and disconnect.
                 var buf: [64]u8 = undefined;
                 var w: std.Io.Writer = .fixed(&buf);
-                try w.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_CHANNEL_OPEN));
+                try w.writeByte(@backingInt(messages.MessageType.SSH_MSG_CHANNEL_OPEN));
                 try messages.writeString(&w, "session");
                 try writeU32(&w, 0);
                 try writeU32(&w, default_window_size);
                 try writeU32(&w, default_max_packet_size);
                 try t.sendPacket(w.buffered());
                 const pkt = try t.recvPacket(&pbuf);
-                if (msgType(pkt) != @intFromEnum(messages.MessageType.SSH_MSG_DISCONNECT))
+                if (msgType(pkt) != @backingInt(messages.MessageType.SSH_MSG_DISCONNECT))
                     return error.ExpectedDisconnect;
                 return;
             },
@@ -2187,7 +2187,7 @@ fn runCase(case: Case) !ClientCtx {
     // every run and the substitution would be invisible.)
     var exec_labels: [std.meta.fields(Case).len]ExecLabel = undefined;
     inline for (std.meta.fields(Case), 0..) |f, i| exec_labels[i] = .{ .label = f.name };
-    const exec_label = &exec_labels[@intFromEnum(case)];
+    const exec_label = &exec_labels[@backingInt(case)];
 
     var port: u16 = 0;
     var listener = try testListenLoopback(io, &port);
@@ -2743,7 +2743,7 @@ fn framePackets(out: []u8, payloads: []const []const u8) ![]const u8 {
 
 fn channelOpenPayload(buf: []u8, sender: u32, window: u32, max_packet: u32) ![]const u8 {
     var w: std.Io.Writer = .fixed(buf);
-    try w.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_CHANNEL_OPEN));
+    try w.writeByte(@backingInt(messages.MessageType.SSH_MSG_CHANNEL_OPEN));
     try messages.writeString(&w, "session");
     try writeU32(&w, sender);
     try writeU32(&w, window);
@@ -2801,7 +2801,7 @@ const SessionCorpus = struct {
 
     fn dataPayload(buf: []u8, recipient: u32, body: []const u8) []const u8 {
         var w: std.Io.Writer = .fixed(buf);
-        w.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_CHANNEL_DATA)) catch unreachable;
+        w.writeByte(@backingInt(messages.MessageType.SSH_MSG_CHANNEL_DATA)) catch unreachable;
         writeU32(&w, recipient) catch unreachable;
         messages.writeString(&w, body) catch unreachable;
         return w.buffered();
@@ -2809,7 +2809,7 @@ const SessionCorpus = struct {
 
     fn execPayload(buf: []u8, recipient: u32, command: []const u8) []const u8 {
         var w: std.Io.Writer = .fixed(buf);
-        w.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_CHANNEL_REQUEST)) catch unreachable;
+        w.writeByte(@backingInt(messages.MessageType.SSH_MSG_CHANNEL_REQUEST)) catch unreachable;
         writeU32(&w, recipient) catch unreachable;
         messages.writeString(&w, "exec") catch unreachable;
         w.writeByte(1) catch unreachable; // want_reply
@@ -2819,7 +2819,7 @@ const SessionCorpus = struct {
 
     fn onePayload(buf: []u8, mt: messages.MessageType, recipient: u32) []const u8 {
         var w: std.Io.Writer = .fixed(buf);
-        w.writeByte(@intFromEnum(mt)) catch unreachable;
+        w.writeByte(@backingInt(mt)) catch unreachable;
         writeU32(&w, recipient) catch unreachable;
         return w.buffered();
     }
@@ -2836,7 +2836,7 @@ const SessionCorpus = struct {
         var b5: [128]u8 = undefined;
         const data = dataPayload(&b5, 0, "stdin bytes");
         var b6: [128]u8 = undefined;
-        const overrun = dataPayload(&b6, 0, &([_]u8{0x41} ** 100));
+        const overrun = dataPayload(&b6, 0, &(@as([100]u8, @splat(0x41))));
 
         // A complete, well-formed session: open, stdin, exec, eof, close.
         self.push(&.{ open, data, exec_req, eof, close });
@@ -2976,7 +2976,7 @@ test "serveSession REJECT: a peer that overruns the advertised window" {
     var data_buf: [256]u8 = undefined;
     var dw: std.Io.Writer = .fixed(&data_buf);
     try writeChannelHeader(&dw, .SSH_MSG_CHANNEL_DATA, 0);
-    try messages.writeString(&dw, &[_]u8{'z'} ** 64);
+    try messages.writeString(&dw, &@as([64]u8, @splat('z')));
 
     var wire: [1024]u8 = undefined;
     const framed = try framePackets(&wire, &.{ open, dw.buffered() });
@@ -3021,7 +3021,7 @@ test "serveSession REJECT: a non-session channel type gets OPEN_FAILURE, not a c
 
     var open_buf: [96]u8 = undefined;
     var ow: std.Io.Writer = .fixed(&open_buf);
-    try ow.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_CHANNEL_OPEN));
+    try ow.writeByte(@backingInt(messages.MessageType.SSH_MSG_CHANNEL_OPEN));
     try messages.writeString(&ow, "direct-tcpip"); // port forwarding: not offered
     try writeU32(&ow, 5);
     try writeU32(&ow, 4096);
@@ -3052,12 +3052,12 @@ test "serveSession REJECT: a non-session channel type gets OPEN_FAILURE, not a c
     _ = try reply.uint32(); // packet_length
     _ = try reply.byte(); // padding_length
     try t.expectEqual(
-        @as(u8, @intFromEnum(messages.MessageType.SSH_MSG_CHANNEL_OPEN_FAILURE)),
+        @as(u8, @backingInt(messages.MessageType.SSH_MSG_CHANNEL_OPEN_FAILURE)),
         try reply.byte(),
     );
     try t.expectEqual(@as(u32, 5), try reply.uint32());
     try t.expectEqual(
-        @as(u32, @intFromEnum(messages.ChannelOpenFailureReason.unknown_channel_type)),
+        @as(u32, @backingInt(messages.ChannelOpenFailureReason.unknown_channel_type)),
         try reply.uint32(),
     );
 }
@@ -3110,7 +3110,7 @@ test "serveSession: on_channel_open_refused fires on a non-session channel type 
 
     var open_buf: [96]u8 = undefined;
     var ow: std.Io.Writer = .fixed(&open_buf);
-    try ow.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_CHANNEL_OPEN));
+    try ow.writeByte(@backingInt(messages.MessageType.SSH_MSG_CHANNEL_OPEN));
     try messages.writeString(&ow, "direct-tcpip");
     try writeU32(&ow, 5);
     try writeU32(&ow, 4096);
@@ -3192,7 +3192,7 @@ test "serveSession: subsystem_names rejects a name not on the list before CHANNE
 
     var open_buf: [32]u8 = undefined;
     var ow: std.Io.Writer = .fixed(&open_buf);
-    try ow.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_CHANNEL_OPEN));
+    try ow.writeByte(@backingInt(messages.MessageType.SSH_MSG_CHANNEL_OPEN));
     try messages.writeString(&ow, "session");
     try writeU32(&ow, 5);
     try writeU32(&ow, 4096);
@@ -3243,12 +3243,12 @@ test "serveSession: subsystem_names rejects a name not on the list before CHANNE
 
     const open_reply = try reply_t.recvPacket(&scratch);
     try t.expectEqual(
-        @as(u8, @intFromEnum(messages.MessageType.SSH_MSG_CHANNEL_OPEN_CONFIRMATION)),
+        @as(u8, @backingInt(messages.MessageType.SSH_MSG_CHANNEL_OPEN_CONFIRMATION)),
         open_reply.payload[0],
     );
     const subsystem_reply = try reply_t.recvPacket(&scratch);
     try t.expectEqual(
-        @as(u8, @intFromEnum(messages.MessageType.SSH_MSG_CHANNEL_FAILURE)),
+        @as(u8, @backingInt(messages.MessageType.SSH_MSG_CHANNEL_FAILURE)),
         subsystem_reply.payload[0],
     );
 
@@ -3281,7 +3281,7 @@ test "serveSession: subsystem_names rejects a name not on the list before CHANNE
     _ = try reply_t2.recvPacket(&scratch); // OPEN_CONFIRMATION
     const subsystem_reply2 = try reply_t2.recvPacket(&scratch);
     try t.expectEqual(
-        @as(u8, @intFromEnum(messages.MessageType.SSH_MSG_CHANNEL_SUCCESS)),
+        @as(u8, @backingInt(messages.MessageType.SSH_MSG_CHANNEL_SUCCESS)),
         subsystem_reply2.payload[0],
     );
 }
@@ -3323,5 +3323,5 @@ test "serveSession: messages the client sends after our CLOSE are dropped, not a
     var pbuf: [512]u8 = undefined;
     var last: u8 = 0;
     while (transport.readPacket(&rr, &c, &pbuf)) |pkt| last = pkt.payload[0] else |_| {}
-    try t.expectEqual(@as(u8, @intFromEnum(messages.MessageType.SSH_MSG_CHANNEL_CLOSE)), last);
+    try t.expectEqual(@as(u8, @backingInt(messages.MessageType.SSH_MSG_CHANNEL_CLOSE)), last);
 }

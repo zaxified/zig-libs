@@ -292,7 +292,7 @@ test "pump cross-connects two pipes" {
 
 test "loop transport refuses to overflow" {
     var lt: LoopTransport = .{};
-    const big = [_]u8{0} ** 8192;
+    const big = @as([8192]u8, @splat(0));
     try lt.transport().write(&big);
     try testing.expectError(error.WriteFailed, lt.transport().write(&[_]u8{1}));
 }

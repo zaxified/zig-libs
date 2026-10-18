@@ -491,30 +491,30 @@ pub const Encoder = struct {
         switch (value) {
             .numeric => |v| {
                 if (v.namespace == 0 and v.id <= std.math.maxInt(u8)) {
-                    try e.writer.writeByte(extra_flags | @intFromEnum(NodeIdEncodingByte.two_byte));
+                    try e.writer.writeByte(extra_flags | @backingInt(NodeIdEncodingByte.two_byte));
                     try e.writer.writeByte(@intCast(v.id));
                 } else if (v.namespace <= std.math.maxInt(u8) and v.id <= std.math.maxInt(u16)) {
-                    try e.writer.writeByte(extra_flags | @intFromEnum(NodeIdEncodingByte.four_byte));
+                    try e.writer.writeByte(extra_flags | @backingInt(NodeIdEncodingByte.four_byte));
                     try e.writer.writeByte(@intCast(v.namespace));
                     try e.writer.writeInt(u16, @intCast(v.id), .little);
                 } else {
-                    try e.writer.writeByte(extra_flags | @intFromEnum(NodeIdEncodingByte.numeric));
+                    try e.writer.writeByte(extra_flags | @backingInt(NodeIdEncodingByte.numeric));
                     try e.writer.writeInt(u16, v.namespace, .little);
                     try e.writer.writeInt(u32, v.id, .little);
                 }
             },
             .string => |v| {
-                try e.writer.writeByte(extra_flags | @intFromEnum(NodeIdEncodingByte.string));
+                try e.writer.writeByte(extra_flags | @backingInt(NodeIdEncodingByte.string));
                 try e.writer.writeInt(u16, v.namespace, .little);
                 try e.encodeString(v.id);
             },
             .guid => |v| {
-                try e.writer.writeByte(extra_flags | @intFromEnum(NodeIdEncodingByte.guid));
+                try e.writer.writeByte(extra_flags | @backingInt(NodeIdEncodingByte.guid));
                 try e.writer.writeInt(u16, v.namespace, .little);
                 try e.encodeGuid(v.id);
             },
             .byte_string => |v| {
-                try e.writer.writeByte(extra_flags | @intFromEnum(NodeIdEncodingByte.byte_string));
+                try e.writer.writeByte(extra_flags | @backingInt(NodeIdEncodingByte.byte_string));
                 try e.writer.writeInt(u16, v.namespace, .little);
                 try e.encodeByteString(v.id);
             },
@@ -550,7 +550,7 @@ pub const Encoder = struct {
 
     pub fn encodeExtensionObject(e: *Encoder, value: ExtensionObject) EncodeError!void {
         try e.encodeNodeId(value.type_id);
-        try e.writer.writeByte(@intFromEnum(value.encoding));
+        try e.writer.writeByte(@backingInt(value.encoding));
         switch (value.encoding) {
             .no_body => {},
             .byte_string, .xml_element => try e.encodeByteString(value.body),
@@ -781,7 +781,7 @@ pub const Decoder = struct {
     /// `decodeExpandedNodeId` (which additionally strips the `0x80`/`0x40`
     /// flag bits before dispatching here) — OPC 10000-6 §5.2.2.9 Table 7.
     fn decodeNodeIdBody(d: *Decoder, form: u8) DecodeError!NodeId {
-        const eb: NodeIdEncodingByte = @enumFromInt(form);
+        const eb: NodeIdEncodingByte = @fromBackingInt(@intCast(form));
         switch (eb) {
             .two_byte => return .{ .numeric = .{ .namespace = 0, .id = try d.decodeByte() } },
             .four_byte => {
@@ -1342,7 +1342,7 @@ test "NodeId: string/guid/byte_string forms round-trip" {
     {
         var w = testWriter(&buf);
         var e = Encoder.init(&w);
-        const g: Guid = .{ .data1 = 1, .data2 = 2, .data3 = 3, .data4 = .{0} ** 8 };
+        const g: Guid = .{ .data1 = 1, .data2 = 2, .data3 = 3, .data4 = @splat(0) };
         const nid: NodeId = .{ .guid = .{ .namespace = 2, .id = g } };
         try e.encodeNodeId(nid);
         var r: std.Io.Reader = .fixed(w.buffered());
@@ -1678,7 +1678,7 @@ test "Variant array: every built-in type round-trips (present array)" {
     {
         var w = testWriter(&buf);
         var e = Encoder.init(&w);
-        const arr = [_]Guid{.{ .data1 = 1, .data2 = 2, .data3 = 3, .data4 = .{0} ** 8 }};
+        const arr = [_]Guid{.{ .data1 = 1, .data2 = 2, .data3 = 3, .data4 = @splat(0) }};
         try e.encodeVariant(.{ .array = .{ .items = .{ .guid = &arr } } });
         var r: std.Io.Reader = .fixed(w.buffered());
         var d = Decoder.init(&r, testing.allocator);

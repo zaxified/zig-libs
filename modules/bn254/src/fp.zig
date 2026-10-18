@@ -244,7 +244,7 @@ fn subLimbs(a: Limbs, b: Limbs) Limbs {
 /// (Koç et al., Fig. 6; radix 2^64, `u128` widening products). Result is
 /// fully reduced (`< p`). No secret-dependent branch/index/early-exit.
 fn montMul(a: Limbs, b: Limbs) Limbs {
-    var t = [_]u64{0} ** (L + 2);
+    var t = @as([L + 2]u64, @splat(0));
     inline for (0..L) |i| {
         // t += a * b[i]
         var carry: u64 = 0;
@@ -285,7 +285,7 @@ fn montMul(a: Limbs, b: Limbs) Limbs {
 /// "Constant time".
 fn montSqr(a: Limbs) Limbs {
     // A holds the full 2L-word square across all four phases.
-    var A = [_]u64{0} ** (2 * L);
+    var A = @as([2 * L]u64, @splat(0));
 
     // 1. cross products: A = Σ_{i<j} a[i]·a[j]·B^(i+j)
     inline for (0..L) |i| {
@@ -547,7 +547,7 @@ test "Fp.zero / Fp.one round-trip through bytes" {
     const z = Fp.zero.toBytes();
     try std.testing.expect(std.mem.allEqual(u8, &z, 0));
     const o = Fp.one.toBytes();
-    var expected = [_]u8{0} ** 32;
+    var expected = @as([32]u8, @splat(0));
     expected[31] = 1;
     try std.testing.expectEqualSlices(u8, &expected, &o);
 }
@@ -615,7 +615,7 @@ test "Fp.fromInt rejects a negative or oversize T by name rather than by illegal
 
 test "Fp.fromInt(3) matches the b=3 curve-constant byte pattern" {
     const three = try Fp.fromInt(u8, 3);
-    var expected = [_]u8{0} ** 32;
+    var expected = @as([32]u8, @splat(0));
     expected[31] = 3;
     try std.testing.expectEqualSlices(u8, &expected, &three.toBytes());
 }
@@ -630,7 +630,7 @@ test "Fp arithmetic: additive identities (a + 0 = a, a + (-a) = 0, a - a = 0)" {
 
 test "Fp arithmetic: (a + b)^2 == a^2 + 2ab + b^2 and square == mul(a, a)" {
     const a = try Fp.fromInt(u64, 0x0123_4567_89ab_cdef);
-    var b_bytes = [_]u8{0} ** 32;
+    var b_bytes = @as([32]u8, @splat(0));
     _ = try std.fmt.hexToBytes(&b_bytes, "183227397098d014dc2822db40c0ac2ecbc0b548b438e5469e10460b6c3e7ea3"); // (p-1)/2
     const b = try Fp.fromBytes(b_bytes);
     const lhs = a.add(b).square();
@@ -656,7 +656,7 @@ test "Fp.inv0 (RFC 9380): inv0(0) == 0, inv0(a) == a^-1 otherwise" {
 
 test "Fp.pow: a^0 == 1, a^1 == a, a^2 == square(a)" {
     const a = try Fp.fromInt(u64, 31337);
-    var e = [_]u8{0} ** 32;
+    var e = @as([32]u8, @splat(0));
     try std.testing.expect(a.pow(e).eql(Fp.one));
     e[31] = 1;
     try std.testing.expect(a.pow(e).eql(a));

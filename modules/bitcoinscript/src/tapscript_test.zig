@@ -50,7 +50,7 @@ const consensus_taproot: ScriptFlags = .{
 };
 
 fn keypair(seed: u8) !struct { sk: bip340.SecretKey, x: [32]u8 } {
-    const sk = try bip340.SecretKey.fromBytes([_]u8{seed} ** 32);
+    const sk = try bip340.SecretKey.fromBytes(@as([32]u8, @splat(seed)));
     var kp: bip340.KeyPair = undefined;
     try bip340.KeyPair.fromSecretKey(&kp, &sk);
     return .{ .sk = sk, .x = kp.public.x };
@@ -102,7 +102,7 @@ fn buildSingleLeaf(a: std.mem.Allocator, internal_x: [32]u8, script: []const u8)
     const credit_value: i64 = 20000;
 
     const vin = try a.alloc(bitcointx.TxIn, 1);
-    vin[0] = .{ .prevout = .{ .txid = [_]u8{0x77} ** 32, .vout = 0 }, .script_sig = &.{}, .sequence = 0xffffffff };
+    vin[0] = .{ .prevout = .{ .txid = @as([32]u8, @splat(0x77)), .vout = 0 }, .script_sig = &.{}, .sequence = 0xffffffff };
     const vout = try a.alloc(bitcointx.TxOut, 1);
     vout[0] = .{ .value = 19000, .script_pubkey = &.{} };
     const tx: bitcointx.Transaction = .{ .version = 2, .vin = vin, .vout = vout, .witness = &.{}, .locktime = 0, .has_witness = true };
@@ -124,7 +124,7 @@ fn signLeaf(a: std.mem.Allocator, sk: bip340.SecretKey, s: *const Setup, aux: u8
     var exec: tapscript.ExecData = .{ .tapleaf_hash = s.tapleaf_hash, .codesep_pos = 0xffffffff };
     const sighash = try tapscript.sighash(a, s.tx, 0, tapscript.SIGHASH_DEFAULT, s.spent, &exec);
     const io: std.Io = undefined;
-    return bip340.sign(&sk, &sighash, [_]u8{aux} ** 32, io);
+    return bip340.sign(&sk, &sighash, @as([32]u8, @splat(aux)), io);
 }
 
 // ── 1. script-path CHECKSIG spend ────────────────────────────────────────
@@ -332,15 +332,15 @@ const tapscript_seeds = [_][]const u8{
     fuzzseed.seedHex("0002" ++ "01ba" ++ "0151" ++ "00" ++ "00" ++ "00"), // ⭐ OP_CHECKSIGADD (0xba), the BIP342 opcode this target exists for
     fuzzseed.seedHex("0001" ++ "01ba" ++ "00" ++ "02" ++ "40" ++ "40" ++ "00" ++ "00"), // ⭐ CHECKSIGADD with two 64-octet stack items under it
     fuzzseed.seedHex("0004" ++ "0150" ++ "0163" ++ "0151" ++ "0168" ++ "00" ++ "01" ++ "01" ++ "00" ++ "00"), // OP_0 OP_IF OP_1 OP_ENDIF: the `minimalif` shape
-    fuzzseed.seedHex("00ff" ++ "0151" ** 8 ++ "00" ++ "00" ++ "00"), // ⭐ a 255-octet leaf, filling the buffer — no old seed could ask for more than 15
-    fuzzseed.seedHex("0080" ++ "0151" ** 4 ++ "00" ++ "00" ++ "00"), // a 128-octet leaf
+    fuzzseed.seedHex("00ff" ++ strRepeat("0151", 8) ++ "00" ++ "00" ++ "00"), // ⭐ a 255-octet leaf, filling the buffer — no old seed could ask for more than 15
+    fuzzseed.seedHex("0080" ++ strRepeat("0151", 4) ++ "00" ++ "00" ++ "00"), // a 128-octet leaf
     fuzzseed.seedHex("0002" ++ "05fe" ++ "0151" ++ "00" ++ "00" ++ "00"), // ⭐ an OP_SUCCESSx byte (0xfe), which the pre-scan must catch
     fuzzseed.seedHex("0002" ++ "05ff" ++ "05ff" ++ "00" ++ "00" ++ "00"), // two bytes past the defined opcode range
     fuzzseed.seedHex("0001" ++ "0151" ++ "07" ++ "00" ++ "00"), // a different internal key
     fuzzseed.seedHex("0001" ++ "0151" ++ "00" ++ "03" ++ "48" ++ "48" ++ "48" ++ "00" ++ "00"), // the full three-item stack, each 72 octets
     fuzzseed.seedHex("0001" ++ "0151" ++ "00" ++ "00" ++ "01" ++ "00" ++ "ff"), // ⭐ the control block damaged at octet 0
     fuzzseed.seedHex("0001" ++ "0151" ++ "00" ++ "00" ++ "01" ++ "20" ++ "01"), // ⭐ damaged at its last octet
-    fuzzseed.seedHex("0002" ++ "01ba" ++ "0151" ++ "00" ++ "00" ++ "00" ++ "ff" ** 8), // every `discourage_*` policy on
+    fuzzseed.seedHex("0002" ++ "01ba" ++ "0151" ++ "00" ++ "00" ++ "00" ++ strRepeat("ff", 8)), // every `discourage_*` policy on
 };
 
 const fz = @import("fuzz_test.zig");
@@ -478,4 +478,16 @@ test "corpus: every tapscript seed builds a leaf, and the leaf sizes reached are
     try testing.expectEqual(@as(usize, 404), total_script);
     try testing.expectEqual(@as(usize, 7), stack_items);
     try testing.expectEqual(@as(usize, 11), armed);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

@@ -597,7 +597,7 @@ fn writeRevokePayload(js: *std.json.Stringify, cert_b64: []const u8, reason: ?Re
     try js.write(cert_b64);
     if (reason) |r| {
         try js.objectField("reason");
-        try js.write(@intFromEnum(r));
+        try js.write(@backingInt(r));
     }
     try js.endObject();
 }
@@ -2327,7 +2327,7 @@ const order_seeds = [_][]const u8{
     seed("{\"status\":\"deactivated\",\"finalize\":\"\"}"), // a status `pollOrder` refuses as MalformedResponse
     seed("{\"status\":\"brand-new-state\",\"finalize\":\"f\"}"), // an unregistered status maps to `.unknown`, not an error
     seed("{\"finalize\":\"f\",\"unknownExtension\":{\"a\":[1,2]}}"), // ignore_unknown_fields, and no `status` at all
-    seed("{\"status\":\"pending\",\"authorizations\":[\"" ++ ("a" ** 200) ++ "\"],\"finalize\":\"f\"}"), // a very long authorization URL
+    seed("{\"status\":\"pending\",\"authorizations\":[\"" ++ (strRepeat("a", 200)) ++ "\"],\"finalize\":\"f\"}"), // a very long authorization URL
     seed("{}"), // ⚠ a legal order response: every member defaults
     seed("{\"status\":42}"), // a wrong-typed member
     seed("{\"authorizations\":\"not-a-list\"}"), // a wrong-typed list
@@ -2346,10 +2346,10 @@ fn fuzzParseOrder(_: void, smith: *std.testing.Smith) !void {
 
 const fuzz_driver = @import("testkit").fuzz.driver;
 const JsonLabel = enum { raw_rejected, raw_accepted, genuine_parsed, truncated_rejected, flipped };
-var json_reach: [@typeInfo(JsonLabel).@"enum".fields.len]usize = @splat(0);
+var json_reach: [@typeInfo(JsonLabel).@"enum".field_names.len]usize = @splat(0);
 
 fn markJson(comptime l: JsonLabel) void {
-    json_reach[@intFromEnum(l)] += 1;
+    json_reach[@backingInt(l)] += 1;
     fuzz_driver.hit(@tagName(l));
 }
 
@@ -2430,7 +2430,7 @@ fn jsonReachCheck(comptime harness: anytype, name: []const u8, seeds: usize) !vo
         };
     }
     for (json_reach, 0..) |n, i| {
-        const l: JsonLabel = @enumFromInt(i);
+        const l: JsonLabel = @fromBackingInt(@intCast(i));
         // Random octets are not JSON of the right shape: `raw_accepted` is
         // reached through the corpus only.
         if (l == .raw_accepted) continue;
@@ -3957,7 +3957,7 @@ test "DNS-01 preconditions: wildcard needs dns_01, dns_01 needs a publisher, a r
 
     var buf: [dns01_max_name_len]u8 = undefined;
     try testing.expectEqualStrings("_acme-challenge.example.org", dns01RecordName(&buf, "example.org"));
-    try testing.expectEqualStrings("_acme-challenge." ++ "x" ** 253, dns01RecordName(&buf, "x" ** 253));
+    try testing.expectEqualStrings("_acme-challenge." ++ strRepeat("x", 253), dns01RecordName(&buf, strRepeat("x", 253)));
 }
 
 test "parseAuthz: selects dns-01 and reads the wildcard flag" {
@@ -4246,8 +4246,8 @@ test "revocation (RFC 8555 §7.6): by account key and by certificate key; reason
     lab.mock.resetFails();
 
     // `Reason` carries the RFC 5280 codes numerically and stays open.
-    try testing.expectEqual(@as(u8, 9), @intFromEnum(Reason.privilege_withdrawn));
-    try testing.expectEqual(@as(u8, 2), @intFromEnum(@as(Reason, @enumFromInt(2))));
+    try testing.expectEqual(@as(u8, 9), @backingInt(Reason.privilege_withdrawn));
+    try testing.expectEqual(@as(u8, 2), @backingInt(@as(Reason, @fromBackingInt(@intCast(2)))));
 }
 
 test "NotSupported: a CA without keyChange, revokeCert, renewalInfo" {
@@ -5325,4 +5325,16 @@ test "AcmeIssuer: a CA that refuses `replaces` gets the order once more without 
     defer issued.deinit(testing.allocator);
     try testing.expectEqual(@as(u32, 1), lab.mock.replaces_refused);
     try testing.expectEqualStrings(x509.test_cert_pem ++ x509.test_root_cert_pem, issued.chain_pem);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

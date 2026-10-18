@@ -264,7 +264,7 @@ const TwistPoint = g2.Jacobian;
 fn millerLoopBatch(pairs: []const PairingPair) Fp12 {
     std.debug.assert(pairs.len <= miller_batch_max);
     var ts: [miller_batch_max]TwistPoint = undefined;
-    var live = [_]bool{false} ** miller_batch_max;
+    var live = @as([miller_batch_max]bool, @splat(false));
     for (pairs, 0..) |pair, j| {
         live[j] = !(pair.p.infinity or pair.q.infinity);
         if (live[j]) ts[j] = TwistPoint.fromAffine(pair.q);

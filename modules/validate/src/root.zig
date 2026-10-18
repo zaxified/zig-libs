@@ -4513,7 +4513,7 @@ test "format truth table: email" {
         "a.@b.com", // dot at local end
         "a..b@c.com", // consecutive dots
         "a@-b.com", // hyphen at label start
-        ("a" ** 65) ++ "@b.com", // local > 64
+        (strRepeat("a", 65)) ++ "@b.com", // local > 64
     });
 }
 
@@ -4603,11 +4603,11 @@ test "format truth table: hostname" {
         "a",
         "xn--nxasmq6b.example", // punycode shape
         "123.example",
-        ("a" ** 63) ++ ".example", // longest legal label
+        (strRepeat("a", 63)) ++ ".example", // longest legal label
         // Exactly 253 bytes, the RFC 1035 §2.3.4 255-octet wire limit minus
         // the leading length octet and the root label (mutation 2026-10-04:
         // a 254 cap survived, only a 257-byte name was tested):
-        ("a" ** 63) ++ "." ++ ("b" ** 63) ++ "." ++ ("c" ** 63) ++ "." ++ ("d" ** 61),
+        (strRepeat("a", 63)) ++ "." ++ (strRepeat("b", 63)) ++ "." ++ (strRepeat("c", 63)) ++ "." ++ (strRepeat("d", 61)),
     }, &.{
         "",
         "-bad.example", // hyphen at label start
@@ -4615,10 +4615,10 @@ test "format truth table: hostname" {
         "a..b", // empty label
         "foo.example.com.", // trailing dot = empty last label
         "foo_bar.example", // underscore
-        ("a" ** 64) ++ ".example", // label > 63
-        ("a" ** 63) ++ "." ++ ("b" ** 63) ++ "." ++ ("c" ** 63) ++ "." ++ ("d" ** 62), // 254 bytes
+        (strRepeat("a", 64)) ++ ".example", // label > 63
+        (strRepeat("a", 63)) ++ "." ++ (strRepeat("b", 63)) ++ "." ++ (strRepeat("c", 63)) ++ "." ++ (strRepeat("d", 62)), // 254 bytes
         // 257 bytes of valid labels → total-length limit trips:
-        ("a" ** 63) ++ "." ++ ("b" ** 63) ++ "." ++ ("c" ** 63) ++ "." ++ ("d" ** 63) ++ ".e",
+        (strRepeat("a", 63)) ++ "." ++ (strRepeat("b", 63)) ++ "." ++ (strRepeat("c", 63)) ++ "." ++ (strRepeat("d", 63)) ++ ".e",
     });
 }
 
@@ -4726,16 +4726,16 @@ test "format robustness: every format rejects hostile input without panicking" {
     const hostile = [_][]const u8{
         "", // empty
         "\xff\xfe\x80garbage\x00", // non-UTF-8 bytes + NUL
-        "a" ** 5000, // huge
+        strRepeat("a", 5000), // huge
         "%", "~", "-", ".", ":", "@", // lone specials near each grammar
     };
     inline for (@typeInfo(Format).@"enum".fields) |f| {
-        const format: Format = @enumFromInt(f.value);
+        const format: Format = @fromBackingInt(@intCast(f.value));
         for (hostile) |s| _ = validateFormat(format, s);
     }
     // And the huge/garbage cases really are invalid everywhere.
     inline for (@typeInfo(Format).@"enum".fields) |f| {
-        const format: Format = @enumFromInt(f.value);
+        const format: Format = @fromBackingInt(@intCast(f.value));
         try testing.expect(!validateFormat(format, "\xff\xfe\x80garbage\x00"));
     }
 }
@@ -4960,7 +4960,7 @@ test "limits: defaults protect a caller who sets nothing (via validateJson)" {
     const schema = [_]Rule{.{ .field = "x", .kind = .int }};
     // 40 levels of nesting > the default max_depth of 32 → rejected out of the
     // box, no explicit Limits passed.
-    const deep = ("[" ** 40) ++ ("]" ** 40);
+    const deep = (strRepeat("[", 40)) ++ (strRepeat("]", 40));
     var r = try validateJson(testing.allocator, deep, &schema);
     defer r.deinit();
     try testing.expectEqual(@as(usize, 1), r.errors.len);
@@ -5789,7 +5789,7 @@ test "Limits.max_errors lowers the cap on every limited path, and never to zero"
     defer zero.deinit();
     try testing.expectEqual(@as(usize, 1), zero.errors.len);
     // Above the module's own cap: the module's cap.
-    var many = try validateJsonLimited(testing.allocator, "{\"a\":[" ++ "1," ** 1200 ++ "1]}", &schema, .{ .max_errors = 5000 });
+    var many = try validateJsonLimited(testing.allocator, "{\"a\":[" ++ strRepeat("1,", 1200) ++ "1]}", &schema, .{ .max_errors = 5000 });
     defer many.deinit();
     try testing.expectEqual(max_errors, many.errors.len);
 }
@@ -6570,7 +6570,7 @@ const json_seeds = [_][]const u8{
     fuzzseed.seed("\x00" ++ "{\"name\":\"ok\",\"meta\":{\"id\":1}}"), // ⭐ the minimum that satisfies both required rules
     fuzzseed.seed("\x00" ++ "{\"name\":\"ok\",\"age\":42,\"email\":\"a@b.co\",\"code\":\"ID-7\",\"tags\":[\"x\"],\"meta\":{\"id\":1,\"active\":true}}"), // ⭐ every rule satisfied
     fuzzseed.seed("\x00" ++ "{\"name\":\"\",\"meta\":{\"id\":1}}"), // ⭐ `min_len` 1 violated by the empty string
-    fuzzseed.seed("\x00" ++ "{\"name\":\"" ++ "x" ** 40 ++ "\",\"meta\":{\"id\":1}}"), // `max_len` 32 exceeded
+    fuzzseed.seed("\x00" ++ "{\"name\":\"" ++ strRepeat("x", 40) ++ "\",\"meta\":{\"id\":1}}"), // `max_len` 32 exceeded
     fuzzseed.seed("\x00" ++ "{\"name\":\"ok\",\"age\":151,\"meta\":{\"id\":1}}"), // ⭐ `max` 150 exceeded by one
     fuzzseed.seed("\x00" ++ "{\"name\":\"ok\",\"age\":-1,\"meta\":{\"id\":1}}"), // `min` 0 violated
     fuzzseed.seed("\x00" ++ "{\"name\":\"ok\",\"email\":\"not-an-email\",\"meta\":{\"id\":1}}"), // ⭐ the `.email` format check
@@ -6868,7 +6868,7 @@ test "corpus: every Format is exercised, and the strings each accepts are pinned
     // selects. All of them (34 since 2026-10-11), and the accepted count
     // beside it so a corpus of refusals only would be visible.
     const formats = std.enums.values(Format);
-    var seen = [_]bool{false} ** 34;
+    var seen = @as([34]bool, @splat(false));
     var nonempty: usize = 0;
     var accepted: usize = 0;
     for (format_seeds) |sd| {
@@ -6877,7 +6877,7 @@ test "corpus: every Format is exercised, and the strings each accepts are pinned
         const n: usize = smith.slice(&raw);
         var buf: [format_buf_len]u8 = undefined;
         const case = buildFormatCase(raw[0..n], &buf);
-        seen[@intFromEnum(case[0])] = true;
+        seen[@backingInt(case[0])] = true;
         if (case[1].len != 0) nonempty += 1;
         if (validateFormat(case[0], case[1])) accepted += 1;
     }
@@ -7907,4 +7907,16 @@ test "fuzz: the cross corpus reaches cross-field violations" {
         };
     }
     try testing.expect(hit_corpus);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

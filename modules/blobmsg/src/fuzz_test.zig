@@ -16,10 +16,10 @@ const testkit = @import("testkit");
 const fuzz_driver = testkit.fuzz.driver;
 
 pub const Label = enum { attr_walked, attr_refused, field_walked, json_decoded, text_unparsed, encoded, encode_refused };
-var reach: [@typeInfo(Label).@"enum".fields.len]usize = @splat(0);
+var reach: [@typeInfo(Label).@"enum".field_names.len]usize = @splat(0);
 
 pub fn mark(l: Label) void {
-    reach[@intFromEnum(l)] += 1;
+    reach[@backingInt(l)] += 1;
     switch (l) {
         inline else => |c| fuzz_driver.hit(@tagName(c)),
     }
@@ -32,7 +32,7 @@ pub fn resetReach() void {
 /// Reach before verdict: every label was seen since `resetReach`.
 pub fn expectAllReached() !void {
     for (reach, 0..) |n, i| if (n == 0) {
-        std.debug.print("reach: label {t} never hit\n", .{@as(Label, @enumFromInt(i))});
+        std.debug.print("reach: label {t} never hit\n", .{@as(Label, @fromBackingInt(@intCast(i)))});
         return error.HarnessDoesNotReach;
     };
 }

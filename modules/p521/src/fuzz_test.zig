@@ -30,10 +30,10 @@ const E = root.EcdsaP521Sha512;
 const P521 = root.P521;
 
 const Label = enum { genuine, der, flip_msg, flip_sig, flip_key, ecdh, homomorphic, deterministic, noisy };
-var counts: [@typeInfo(Label).@"enum".fields.len]usize = @splat(0);
+var counts: [@typeInfo(Label).@"enum".field_names.len]usize = @splat(0);
 
 fn mark(comptime l: Label) void {
-    counts[@intFromEnum(l)] += 1;
+    counts[@backingInt(l)] += 1;
     fuzz_driver.hit(@tagName(l));
 }
 
@@ -139,7 +139,7 @@ test "fuzz harness: 12 seeds reach every check" {
         };
     }
     for (counts, 0..) |n, i| if (n == 0) {
-        std.debug.print("reach: p521-ecdsa-ecdh label {t} never hit\n", .{@as(Label, @enumFromInt(i))});
+        std.debug.print("reach: p521-ecdsa-ecdh label {t} never hit\n", .{@as(Label, @fromBackingInt(@intCast(i)))});
         return error.HarnessDoesNotReach;
     };
 }

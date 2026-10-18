@@ -108,7 +108,7 @@ pub const wots_len = wots_len1 + wots_len2;
 // §5.1 domain-separation prefixes: toByte(i, 32) for i = 0..4. Index 4 is
 // PRF_keygen from NIST SP 800-208 (see doc comment).
 fn padPrefix(comptime i: u8) [n]u8 {
-    var p = [_]u8{0} ** n;
+    var p = @as([n]u8, @splat(0));
     p[n - 1] = i;
     return p;
 }
@@ -120,7 +120,7 @@ const pad_prf_keygen = padPrefix(4);
 
 /// toByte(x, 32) (§2.4): 32-byte big-endian encoding of an integer.
 pub fn toByte32(x: u64) [32]u8 {
-    var out = [_]u8{0} ** 32;
+    var out = @as([32]u8, @splat(0));
     std.mem.writeInt(u64, out[24..32], x, .big);
     return out;
 }
@@ -1091,7 +1091,7 @@ test "public key wire round-trip and OID rejection" {
 }
 
 test "base-w + checksum example (§2.6: 0x1234 -> 1,2,3,4)" {
-    var msg = [_]u8{0} ** n;
+    var msg = @as([n]u8, @splat(0));
     msg[0] = 0x12;
     msg[1] = 0x34;
     const digits = msgToBaseW(&msg);
@@ -1114,7 +1114,7 @@ test "stateful discipline: sign advances idx, never repeats, fails closed when e
     X.keyGen(&kp, &sk_seed, &sk_prf, &pub_seed);
 
     var sig: [X.signature_length]u8 = undefined;
-    var seen = [_]bool{false} ** X.max_signatures;
+    var seen = @as([X.max_signatures]bool, @splat(false));
     var k: u32 = 0;
     while (k < X.max_signatures) : (k += 1) {
         // `idx` is the NEXT unused leaf before signing.
@@ -1354,8 +1354,8 @@ test "SecretKey.zeroize wipes the seeds and leaves the public state alone" {
     const root_before = kp.sk.root;
     kp.sk.idx = 7;
     kp.sk.zeroize();
-    try std.testing.expectEqualSlices(u8, &[_]u8{0} ** n, &kp.sk.sk_seed);
-    try std.testing.expectEqualSlices(u8, &[_]u8{0} ** n, &kp.sk.sk_prf);
+    try std.testing.expectEqualSlices(u8, &@as([n]u8, @splat(0)), &kp.sk.sk_seed);
+    try std.testing.expectEqualSlices(u8, &@as([n]u8, @splat(0)), &kp.sk.sk_prf);
     try std.testing.expectEqualSlices(u8, &root_before, &kp.sk.root);
     try std.testing.expectEqual(@as(u32, 7), kp.sk.idx); // a zeroed idx would look fresh
 }
@@ -1400,9 +1400,9 @@ const XmssCorpus = struct {
 
     fn build(self: *XmssCorpus) []const []const u8 {
         var kp: X.KeyPair = undefined;
-        X.keyGen(&kp, &([_]u8{1} ** n), &([_]u8{2} ** n), &([_]u8{3} ** n));
+        X.keyGen(&kp, &(@as([n]u8, @splat(1))), &(@as([n]u8, @splat(2))), &(@as([n]u8, @splat(3))));
         const pk = kp.pk.toBytes();
-        const msg = [_]u8{0xA7} ** 64;
+        const msg = @as([64]u8, @splat(0xA7));
         var sig: [X.signature_length]u8 = undefined;
         X.sign(&kp.sk, &sig, &msg) catch unreachable;
 

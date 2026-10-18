@@ -111,7 +111,7 @@ fn secretKeyBytes() [secret_length]u8 {
 }
 
 const sb_len = 1100;
-const sb_nonce = [_]u8{0x24} ** secretbox.nonce_length;
+const sb_nonce = @as([secretbox.nonce_length]u8, @splat(0x24));
 
 fn reloadVolatile(comptime n: usize, src: *const [n]u8) [n]u8 {
     var out: [n]u8 = undefined;

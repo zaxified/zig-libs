@@ -27,7 +27,7 @@ pub fn Plaintext(comptime N: usize) type {
         t: u64,
 
         pub fn zero(t: u64) Self {
-            return .{ .coeffs = [_]u64{0} ** N, .t = t };
+            return .{ .coeffs = @as([N]u64, @splat(0)), .t = t };
         }
 
         /// Coefficient encoding: reduce each supplied coefficient mod `t`.
@@ -81,7 +81,7 @@ pub fn Plaintext(comptime N: usize) type {
         /// compute after decrypt. O(N^2), exact, independent of any NTT.
         /// Signed `i128` accumulation folds `X^N = -1` before reducing mod `t`.
         pub fn mulRef(a: *const Self, b: *const Self) Self {
-            var acc = [_]i128{0} ** N;
+            var acc = @as([N]i128, @splat(0));
             for (0..N) |i| for (0..N) |j| {
                 const prod: i128 = @as(i128, @intCast(a.coeffs[i])) * @as(i128, @intCast(b.coeffs[j]));
                 const k = i + j;

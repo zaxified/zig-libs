@@ -38,10 +38,10 @@ const Rng = fuzz_driver.Rng;
 
 fn Marker(comptime Label: type) type {
     return struct {
-        var counts: [@typeInfo(Label).@"enum".fields.len]usize = @splat(0);
+        var counts: [@typeInfo(Label).@"enum".field_names.len]usize = @splat(0);
 
         fn mark(comptime l: Label) void {
-            counts[@intFromEnum(l)] += 1;
+            counts[@backingInt(l)] += 1;
             fuzz_driver.hit(@tagName(l));
         }
 
@@ -56,7 +56,7 @@ fn Marker(comptime Label: type) type {
                 };
             }
             for (counts, 0..) |n, i| if (n == 0) {
-                std.debug.print("reach: " ++ name ++ " label {t} never hit in {d} seeds\n", .{ @as(Label, @enumFromInt(i)), seeds });
+                std.debug.print("reach: " ++ name ++ " label {t} never hit in {d} seeds\n", .{ @as(Label, @fromBackingInt(@intCast(i))), seeds });
                 return error.HarnessDoesNotReach;
             };
         }
@@ -273,7 +273,7 @@ fn fuzzSession(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void 
             .will = if (k.ranged(0, 2) == 0) .{
                 .topic = will_topics[k.ranged(0, will_topics.len - 1)],
                 .message = "gone",
-                .qos = @enumFromInt(k.ranged(0, 2)),
+                .qos = @fromBackingInt(@intCast(k.ranged(0, 2))),
                 .retain = k.byte() & 1 == 0,
             } else null,
             .properties = if (k.byte() & 1 == 0) .{
@@ -286,7 +286,7 @@ fn fuzzSession(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void 
                 .properties = .{ .authentication_method = methods[k.ranged(0, 1)], .authentication_data = data[0..k.ranged(0, 8)] },
             } }),
             2, 3, 4, 11, 12, 13 => blk: {
-                const qos: packet.QoS = @enumFromInt(k.ranged(0, 2));
+                const qos: packet.QoS = @fromBackingInt(@intCast(k.ranged(0, 2)));
                 const utf8 = k.byte() & 1 == 0;
                 break :blk try packet.encodePacket(&buf, .v5, .{ .publish = .{
                     .topic = topics[k.ranged(0, topics.len - 1)],
@@ -297,7 +297,7 @@ fn fuzzSession(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void 
                     .properties = .{ .payload_format = if (k.byte() & 1 == 0) .utf8 else null },
                 } });
             },
-            5 => try packet.encodePacket(&buf, .v5, .{ .subscribe = .{ .packet_id = @intCast(k.ranged(1, 4)), .filters = &.{.{ .filter = filters[k.ranged(0, filters.len - 1)], .qos = @enumFromInt(k.ranged(0, 2)) }} } }),
+            5 => try packet.encodePacket(&buf, .v5, .{ .subscribe = .{ .packet_id = @intCast(k.ranged(1, 4)), .filters = &.{.{ .filter = filters[k.ranged(0, filters.len - 1)], .qos = @fromBackingInt(@intCast(k.ranged(0, 2))) }} } }),
             6 => try packet.encodePacket(&buf, .v5, .{ .unsubscribe = .{ .packet_id = @intCast(k.ranged(1, 4)), .filters = &.{filters[k.ranged(0, filters.len - 1)]} } }),
             7 => try packet.encodePacket(&buf, .v5, .{ .puback = .{ .packet_id = @intCast(k.ranged(1, 4)) } }),
             8 => try packet.encodePacket(&buf, .v5, .{ .pubrel = .{ .packet_id = @intCast(k.ranged(1, 4)) } }),

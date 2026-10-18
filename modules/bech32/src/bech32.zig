@@ -33,7 +33,7 @@ fn encodingConst(e: Encoding) u32 {
 pub const charset: *const [32]u8 = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
 
 const charset_rev: [256]i8 = blk: {
-    var t: [256]i8 = [_]i8{-1} ** 256;
+    var t: [256]i8 = @as([256]i8, @splat(-1));
     for (charset, 0..) |c, i| t[c] = @intCast(i);
     break :blk t;
 };
@@ -453,7 +453,7 @@ const decode_seeds = [_][]const u8{
     // The charset knob, one word per octet: sixteen octets that are NOT in
     // the charset, every one of them bent into it — the input a tail-less
     // seed cannot produce, and the only one that reaches the loop body.
-    bendSeed(&[_]u8{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 }, &([_]u64{1} ** 16)),
+    bendSeed(&[_]u8{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 }, &(@as([16]u64, @splat(1)))),
     bendSeed("", &.{}), // and the input a corpus-less target runs for ever
 };
 

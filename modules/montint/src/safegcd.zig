@@ -459,14 +459,14 @@ test "safegcd Inverter: x·x⁻¹ ≡ 1 against big-int, random odd moduli 64..4
     const sizes = [_]usize{ 64, 65, 127, 512, 1000, 1024, 1536, 2048, 3072, 4095, 4096 };
     for (sizes) |nbits| {
         for (0..6) |t| {
-            var m = [_]u64{0} ** I.N;
+            var m = @as([I.N]u64, @splat(0));
             const nl = (nbits + 63) / 64;
             for (0..nl) |i| m[i] = rand.int(u64);
             const topbits: u6 = @intCast(nbits - 64 * (nl - 1) - 1);
             m[nl - 1] &= (@as(u64, 2) << topbits) -% 1;
             m[nl - 1] |= @as(u64, 1) << topbits; // exactly nbits bits
             m[0] |= 1;
-            var x = [_]u64{0} ** I.N;
+            var x = @as([I.N]u64, @splat(0));
             switch (t) {
                 0 => x[0] = 1,
                 1 => x[0] = 2,
@@ -491,8 +491,8 @@ test "safegcd Inverter: x·x⁻¹ ≡ 1 against big-int, random odd moduli 64..4
         var ms: [2][I.N]u64 = undefined;
         var xs: [2][I.N]u64 = undefined;
         for ([_]usize{ nb1, nb2 }, 0..) |nbits, l| {
-            ms[l] = [_]u64{0} ** I.N;
-            xs[l] = [_]u64{0} ** I.N;
+            ms[l] = @as([I.N]u64, @splat(0));
+            xs[l] = @as([I.N]u64, @splat(0));
             const nl = (nbits + 63) / 64;
             for (0..nl) |i| ms[l][i] = rand.int(u64);
             const topbits: u6 = @intCast(nbits - 64 * (nl - 1) - 1);
@@ -517,9 +517,9 @@ test "safegcd Inverter: x·x⁻¹ ≡ 1 against big-int, random odd moduli 64..4
     }
 
     // A non-unit that is not 0: m = 3·5·(odd), x = 15.
-    var m = [_]u64{0} ** I.N;
+    var m = @as([I.N]u64, @splat(0));
     m[0] = 15 * 0x1234567;
-    var x = [_]u64{0} ** I.N;
+    var x = @as([I.N]u64, @splat(0));
     x[0] = 15;
     try checkOne(I, gpa, &x, &m, 64 - @clz(m[0]));
 }

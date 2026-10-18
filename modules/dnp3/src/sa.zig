@@ -315,7 +315,7 @@ pub fn encodeObject(variation: ObjectVariation, data: []const u8, out: []u8) Obj
     if (out.len < total) return error.BufferTooSmall;
     if (data.len > 0xFFFF) return error.BufferTooSmall;
     out[0] = 120;
-    out[1] = @intFromEnum(variation);
+    out[1] = @backingInt(variation);
     out[2] = free_format_qualifier;
     out[3] = 1; // object count
     std.mem.writeInt(u16, out[4..6], @intCast(data.len), .little);
@@ -337,7 +337,7 @@ pub fn decodeObject(bytes: []const u8) ObjError!DecodedObject {
     const end = object_header_len + @as(usize, size);
     if (bytes.len < end) return error.Truncated;
     return .{
-        .variation = @enumFromInt(bytes[1]),
+        .variation = @fromBackingInt(@intCast(bytes[1])),
         .data = bytes[object_header_len..end],
         .consumed = end,
     };
@@ -362,8 +362,8 @@ pub const Challenge = struct {
         if (out.len < total) return error.BufferTooSmall;
         std.mem.writeInt(u32, out[0..4], self.challenge_seq_num, .little);
         std.mem.writeInt(u16, out[4..6], self.user_number, .little);
-        out[6] = @intFromEnum(self.mac_algorithm);
-        out[7] = @intFromEnum(self.reason);
+        out[6] = @backingInt(self.mac_algorithm);
+        out[7] = @backingInt(self.reason);
         @memcpy(out[8..total], self.challenge_data);
         return out[0..total];
     }
@@ -373,8 +373,8 @@ pub const Challenge = struct {
         return .{
             .challenge_seq_num = std.mem.readInt(u32, bytes[0..4], .little),
             .user_number = std.mem.readInt(u16, bytes[4..6], .little),
-            .mac_algorithm = @enumFromInt(bytes[6]),
-            .reason = @enumFromInt(bytes[7]),
+            .mac_algorithm = @fromBackingInt(@intCast(bytes[6])),
+            .reason = @fromBackingInt(@intCast(bytes[7])),
             .challenge_data = bytes[8..],
         };
     }
@@ -478,9 +478,9 @@ pub const SessionKeyStatus = struct {
         if (self.challenge_data.len > 0xFFFF) return error.BufferTooSmall;
         std.mem.writeInt(u32, out[0..4], self.key_change_seq_num, .little);
         std.mem.writeInt(u16, out[4..6], self.user_number, .little);
-        out[6] = @intFromEnum(self.key_wrap_algorithm);
-        out[7] = @intFromEnum(self.key_status);
-        out[8] = @intFromEnum(self.mac_algorithm);
+        out[6] = @backingInt(self.key_wrap_algorithm);
+        out[7] = @backingInt(self.key_status);
+        out[8] = @backingInt(self.mac_algorithm);
         std.mem.writeInt(u16, out[9..11], @intCast(self.challenge_data.len), .little);
         var p: usize = fixed_len;
         @memcpy(out[p..][0..self.challenge_data.len], self.challenge_data);
@@ -497,9 +497,9 @@ pub const SessionKeyStatus = struct {
         return .{
             .key_change_seq_num = std.mem.readInt(u32, bytes[0..4], .little),
             .user_number = std.mem.readInt(u16, bytes[4..6], .little),
-            .key_wrap_algorithm = @enumFromInt(bytes[6]),
-            .key_status = @enumFromInt(bytes[7]),
-            .mac_algorithm = @enumFromInt(bytes[8]),
+            .key_wrap_algorithm = @fromBackingInt(@intCast(bytes[6])),
+            .key_status = @fromBackingInt(@intCast(bytes[7])),
+            .mac_algorithm = @fromBackingInt(@intCast(bytes[8])),
             .challenge_data = bytes[fixed_len..cd_end],
             .mac_value = bytes[cd_end..],
         };
@@ -568,7 +568,7 @@ pub const SaError = struct {
         std.mem.writeInt(u32, out[0..4], self.sequence_number, .little);
         std.mem.writeInt(u16, out[4..6], self.user_number, .little);
         std.mem.writeInt(u16, out[6..8], self.association_id, .little);
-        out[8] = @intFromEnum(self.error_code);
+        out[8] = @backingInt(self.error_code);
         std.mem.writeInt(u48, out[9..15], self.time_of_error, .little);
         @memcpy(out[15..total], self.error_text);
         return out[0..total];
@@ -580,7 +580,7 @@ pub const SaError = struct {
             .sequence_number = std.mem.readInt(u32, bytes[0..4], .little),
             .user_number = std.mem.readInt(u16, bytes[4..6], .little),
             .association_id = std.mem.readInt(u16, bytes[6..8], .little),
-            .error_code = @enumFromInt(bytes[8]),
+            .error_code = @fromBackingInt(@intCast(bytes[8])),
             .time_of_error = std.mem.readInt(u48, bytes[9..15], .little),
             .error_text = bytes[15..],
         };
@@ -948,8 +948,8 @@ test "MAC: HMAC-SHA-1 KAT (RFC 2202 case 2) at 4/8/10-octet truncations" {
 
 test "MAC: AES-GMAC via GCM empty-plaintext path — McGrew GCM test case 1" {
     // AES-128, key=0, IV=0, empty plaintext, empty AAD -> tag 58e2...455a.
-    const key = [_]u8{0} ** 16;
-    const iv = [_]u8{0} ** 12;
+    const key = @as([16]u8, @splat(0));
+    const iv = @as([12]u8, @splat(0));
     const expect_tag = hexToBytes("58e2fccefa7e3061367f1d57a4e7455a");
     var tag: [16]u8 = undefined;
     mac.Aes128Gcm.encrypt(&.{}, &tag, &.{}, &.{}, iv, key);
@@ -1002,7 +1002,7 @@ test "g120v1 Challenge encode/decode round-trip" {
     var out: [64]u8 = undefined;
     const bytes = try ch.encode(&out);
     try testing.expectEqual(@as(usize, 8 + cd.len), bytes.len);
-    try testing.expectEqual(@as(u8, @intFromEnum(HmacAlgorithm.hmac_sha256_trunc_16)), bytes[6]);
+    try testing.expectEqual(@as(u8, @backingInt(HmacAlgorithm.hmac_sha256_trunc_16)), bytes[6]);
     try testing.expectEqual(@as(u8, 1), bytes[7]); // reason = critical
     const back = try Challenge.decode(bytes);
     try testing.expectEqual(@as(u32, 0x11223344), back.challenge_seq_num);
@@ -1025,7 +1025,7 @@ test "g120v5 Session-Key Status encode/decode splits challenge data + MAC" {
     };
     var out: [128]u8 = undefined;
     const bytes = try st.encode(&out);
-    try testing.expectEqual(@as(u8, @intFromEnum(KeyStatus.ok)), bytes[7]);
+    try testing.expectEqual(@as(u8, @backingInt(KeyStatus.ok)), bytes[7]);
     const back = try SessionKeyStatus.decode(bytes);
     try testing.expectEqual(KeyStatus.ok, back.key_status);
     try testing.expectEqual(KeyWrapAlgorithm.aes_256, back.key_wrap_algorithm);
@@ -1078,7 +1078,7 @@ test "g120 v3/v4/v6/v9 round-trips" {
 test "decode: short/garbage g120 objects are typed errors, never panic" {
     try testing.expectError(error.ShortObject, Challenge.decode(&.{ 1, 2, 3 }));
     try testing.expectError(error.ShortObject, Reply.decode(&.{ 1, 2 }));
-    try testing.expectError(error.ShortObject, SaError.decode(&[_]u8{0} ** 10));
+    try testing.expectError(error.ShortObject, SaError.decode(&@as([10]u8, @splat(0))));
     try testing.expectError(error.ShortObject, decodeObject(&.{ 120, 2 }));
     // wrong group / qualifier
     try testing.expectError(error.ShortObject, decodeObject(&.{ 99, 2, 0x5B, 1, 0, 0 }));
@@ -1087,7 +1087,7 @@ test "decode: short/garbage g120 objects are typed errors, never panic" {
     try testing.expectError(error.Truncated, decodeObject(&.{ 120, 2, 0x5B, 1, 40, 0, 0xAA }));
     var i: usize = 0;
     while (i < 16) : (i += 1) {
-        const garbage: [16]u8 = .{0xFF} ** 16;
+        const garbage: [16]u8 = @splat(0xFF);
         _ = Challenge.decode(garbage[0..i]) catch {};
         _ = SessionKeyStatus.decode(garbage[0..i]) catch {};
         _ = decodeObject(garbage[0..i]) catch {};
@@ -1226,8 +1226,8 @@ test "SeqCounter and KeyExpiry behave as pure counters (no wall clock)" {
 }
 
 test "lookupUpdateKey finds the user's update key" {
-    const k1 = [_]u8{0x11} ** 16;
-    const k2 = [_]u8{0x22} ** 32;
+    const k1 = @as([16]u8, @splat(0x11));
+    const k2 = @as([32]u8, @splat(0x22));
     const table = [_]UserAssociation{
         .{ .user_number = 1, .update_key = &k1 },
         .{ .user_number = 9, .update_key = &k2 },

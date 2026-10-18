@@ -42,7 +42,7 @@ fn emptyTranscriptHash() [32]u8 {
 
 pub fn main() !void {
     const now_ms: i64 = 1_700_000_000_000;
-    const stek_key = [_]u8{0x42} ** tlsresume.stek.key_length;
+    const stek_key = @as([tlsresume.stek.key_length]u8, @splat(0x42));
 
     var ring: tlsresume.StekRing(3) = .init();
     ring.rotate(1, &stek_key, @divTrunc(now_ms, 1000));
@@ -59,7 +59,7 @@ pub fn main() !void {
     const plaintext = try state.serialize(&plaintext_buf);
 
     var blob_buf: [128]u8 = undefined;
-    const nonce = [_]u8{0xA1} ** tlsresume.stek.nonce_length;
+    const nonce = @as([tlsresume.stek.nonce_length]u8, @splat(0xA1));
     const sealed_ticket = try ring.seal(plaintext, nonce, &blob_buf);
 
     var nst_buf: [256]u8 = undefined;

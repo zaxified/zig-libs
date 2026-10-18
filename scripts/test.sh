@@ -561,8 +561,9 @@ ZL_RUN_EXAMPLES=1
 #
 # A dead-stack probe (`stackprobe_test.zig` and its kin) can only see a dead
 # frame where `undefined` is left alone, so it skips in Debug and ReleaseSafe:
-# `if (builtin.mode == .Debug or builtin.mode == .ReleaseSafe) return
-# error.SkipZigTest`, or `mode != .ReleaseFast`. The `changed` lane runs in the
+# `if (builtin.mode == .debug or builtin.mode == .safe) return
+# error.SkipZigTest`, or `mode != .fast` (Zig 0.17 spellings; the 0.16
+# `.Debug`/`.ReleaseSafe`/`.ReleaseFast` no longer compile, 2026-10-18). The `changed` lane runs in the
 # default mode, so between two tags NOTHING ran these tests. That is how a
 # regression of bip340's A1 F2 (the signing key copied into `sign`'s own frame,
 # 359a678d) sat red at HEAD for a day with every lane green -- the probe written
@@ -574,7 +575,7 @@ ZL_RUN_EXAMPLES=1
 # verdict is about the binary). Detected from source rather than listed, so a
 # probe added tomorrow is covered without anyone remembering this function.
 # Skipped where the lane already builds ReleaseFast or ReleaseSmall.
-RF_ONLY_RE='mode != \.ReleaseFast\) return error\.SkipZigTest|mode == \.Debug or [A-Za-z_.@"()]*mode == \.ReleaseSafe\) return error\.SkipZigTest'
+RF_ONLY_RE='mode != \.fast\) return error\.SkipZigTest|mode == \.debug or [A-Za-z_.@"()]*mode == \.safe\) return error\.SkipZigTest'
 
 rf_only_modules() {
     local m out=""
@@ -1271,7 +1272,7 @@ capability_check() {
     # would be passwordless root, not a narrow grant: `zig build` executes
     # build.zig, i.e. arbitrary code, as root.
     local zig_abs; zig_abs="$(command -v zig 2>/dev/null || echo zig)"
-    _cap_wants tc && { _CAP_GAP_MODS="$_CAP_GAP_MODS tc"; gaps+=("tc RTM_NEWACTION needs real root|tc action tests skip (the rest of tc runs)|sudo unshare -n $zig_abs build test-tc --cache-dir /tmp/zig-cache-root --global-cache-dir /tmp/zig-gcache-root"); }
+    _cap_wants tc && { _CAP_GAP_MODS="$_CAP_GAP_MODS tc"; gaps+=("tc RTM_NEWACTION needs real root|tc action tests skip (the rest of tc runs)|sudo env ZIG_GLOBAL_CACHE_DIR=/tmp/zig-gcache-root unshare -n $zig_abs build test-tc --cache-dir /tmp/zig-cache-root"); }
 
     # ⭐ THE EXAMPLES' OWN PEERS, and they are a different class from everything
     # above. The gate RUNS each example (it only compiled them until
@@ -1426,10 +1427,11 @@ cmd_changed() {
                 # nothing a push lane runs, and counting it as a harness edit
                 # sent nearly every crypto push down the smoke path (2026-10-10).
                 ;;
-            .github/*|scripts/test.sh|scripts/tag.sh|scripts/check-apps.sh|scripts/lib/*|scripts/checks/*|scripts/hooks/*)
+            .github/*|scripts/test.sh|scripts/tag.sh|scripts/check-apps.sh|scripts/lib/*|scripts/checks/*|scripts/hooks/*|scripts/gates/*)
                 # The harness or the CI lane definition itself: no narrower set
                 # can be trusted, because what narrows it is the thing that
-                # changed.
+                # changed. `scripts/gates/` (Zig 0.17, 2026-10-18) IS the gates
+                # build.zig used to carry as make functions.
                 #
                 # ⚠ The membership rule is "the gate EXECUTES it", not "it lives
                 # in scripts/". Four of these were missing until 2026-08-15 and
@@ -1769,7 +1771,7 @@ cmd_changed() {
 #     passed by luck, `f88a102`).
 #   * tests in this repo that run ONLY in Debug: zero.
 #   * tests that SKIP in Debug: fifteen, all in `threshold_ecdsa`, gated on
-#     `builtin.mode == .Debug` because they are too slow there. Measured:
+#     `builtin.mode == .debug` because they are too slow there. Measured:
 #     `-Dstrict-debug` gives 48/63 with 15 skipped where every other lane gives
 #     63/63. The lane proved LESS than its siblings, not more.
 #   * no finding in the audit corpus is attributed to this lane.

@@ -57,7 +57,7 @@ const RangeProof = rangeproof.RangeProof;
 const VerifyTrace = rangeproof.VerifyTrace;
 
 const talloc = std.testing.allocator;
-const heavy = builtin.mode != .Debug;
+const heavy = builtin.mode != .debug;
 
 // ── the pre-B8 reference ─────────────────────────────────────────────────────
 
@@ -401,7 +401,7 @@ fn forge(
 /// The order-2 Edwards point (0, -1). Adding it to a Ristretto255 element's
 /// internal representation leaves the element — and its encoding — unchanged.
 fn order2() Edwards25519 {
-    return Edwards25519.fromBytes([_]u8{0xec} ++ [_]u8{0xff} ** 30 ++ [_]u8{0x7f}) catch unreachable;
+    return Edwards25519.fromBytes([_]u8{0xec} ++ @as([30]u8, @splat(0xff)) ++ [_]u8{0x7f}) catch unreachable;
 }
 
 fn shifted(p: Ristretto255) Ristretto255 {
@@ -435,7 +435,7 @@ test "B8 diff: honest proofs at every width verify identically, bytes of P and b
 const WireField = enum(u8) { A, S, T1, T2, t_hat, tau_x, mu, L, R, a, b };
 
 fn wireField(off: usize, len: usize) WireField {
-    if (off < 224) return @enumFromInt(off / 32);
+    if (off < 224) return @fromBackingInt(@intCast(off / 32));
     if (off >= len - 32) return .b;
     if (off >= len - 64) return .a;
     return if ((off - 224) % 64 < 32) .L else .R;
@@ -449,7 +449,7 @@ test "B8 diff: a single-bit flip at every byte of every wire field is rejected i
     // halve `diffOne` calls (~30s->~15s isolated for n=2's ~750-byte
     // encoding, part of the module's full-gate Debug timeout).
     const masks: []const u8 = if (heavy) &.{ 0x01, 0x80 } else &.{0x01};
-    const field_count = @typeInfo(WireField).@"enum".fields.len;
+    const field_count = @typeInfo(WireField).@"enum".field_names.len;
     var prng = std.Random.DefaultPrng.init(0xB8_0002);
     const random = prng.random();
     for (widths) |n| {
@@ -488,7 +488,7 @@ test "B8 diff: a single-bit flip at every byte of every wire field is rejected i
                 work[off] ^= m;
                 const forged = RangeProof.fromBytesAlloc(talloc, work) catch continue;
                 defer forged.deinit(talloc);
-                const f = @intFromEnum(wireField(off, bytes.len));
+                const f = @backingInt(wireField(off, bytes.len));
                 decoded[f] += 1;
                 const got = try diffOne(gens, fx.v_point, forged);
                 try std.testing.expect(!got.verdict);
@@ -498,8 +498,8 @@ test "B8 diff: a single-bit flip at every byte of every wire field is rejected i
         // Not blind: every field put flips past the codec, and every field
         // bound after check 1 — mu, the IPA points, the IPA scalars — put
         // forgeries into the IPA.
-        for (std.enums.values(WireField)) |f| try std.testing.expect(decoded[@intFromEnum(f)] > 0);
-        for ([_]WireField{ .mu, .L, .R, .a, .b }) |f| try std.testing.expect(reached[@intFromEnum(f)] > 0);
+        for (std.enums.values(WireField)) |f| try std.testing.expect(decoded[@backingInt(f)] > 0);
+        for ([_]WireField{ .mu, .L, .R, .a, .b }) |f| try std.testing.expect(reached[@backingInt(f)] > 0);
     }
 }
 

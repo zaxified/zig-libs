@@ -455,7 +455,7 @@ test "pilot http: http.Server drops a client that stalls mid-head after read_tim
 test "pilot http: http.Server bounds a dribbling client by request_timeout_ms" {
     // One byte every 200 ms never trips the 1000 ms stall timeout; the
     // 3000 ms whole-request deadline must.
-    var rude: Rude = .{ .request = "GET /data/1 HTTP/1.1\r\nHost: x\r\nX-Slow: " ++ "a" ** 40, .gap_ms = 200 };
+    var rude: Rude = .{ .request = "GET /data/1 HTTP/1.1\r\nHost: x\r\nX-Slow: " ++ strRepeat("a", 40), .gap_ms = 200 };
     const r = try runRude(&rude, real_options);
     const at = r.closed_at_ms orelse return error.NeverClosed;
     try testing.expect(at >= 3000 and at <= 3100);
@@ -476,4 +476,16 @@ test "pilot http: with the timeouts off a stalled client holds its connection fo
     const r = try runRude(&rude, opts);
     try testing.expectEqual(@as(?i64, null), r.closed_at_ms);
     try testing.expectEqual(@as(usize, 1), r.active_at_end);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

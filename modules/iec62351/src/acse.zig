@@ -1007,7 +1007,7 @@ test "signed token: ECDSA round-trip" {
     var sig_buf: [64]u8 = undefined;
     var token_buf: [512]u8 = undefined;
     const token = try signToken(&token_buf, &sig_buf, .{
-        .ecdsa_p256_sha256 = .{ .key_pair = &kp, .noise = [_]u8{0x9e} ** EcdsaP256.noise_length },
+        .ecdsa_p256_sha256 = .{ .key_pair = &kp, .noise = @as([EcdsaP256.noise_length]u8, @splat(0x9e)) },
     }, 1, test_now_s, "ied-7");
     const got = try verifyToken(token, .{ .ecdsa_p256_sha256 = kp.public_key }, test_now_s, .{});
     try testing.expectEqualSlices(u8, "ied-7", got.identity);
@@ -1020,7 +1020,7 @@ test "signed token: tampering with any covered field breaks the signature" {
     var sig_buf: [64]u8 = undefined;
     var token_buf: [512]u8 = undefined;
     const token = try signToken(&token_buf, &sig_buf, .{
-        .ecdsa_p256_sha256 = .{ .key_pair = &kp, .noise = [_]u8{0x9e} ** EcdsaP256.noise_length },
+        .ecdsa_p256_sha256 = .{ .key_pair = &kp, .noise = @as([EcdsaP256.noise_length]u8, @splat(0x9e)) },
     }, 1, test_now_s, "ied-7");
 
     // Flip a byte of the identity...
@@ -1054,7 +1054,7 @@ test "signed token: a valid signature does not survive the freshness window" {
     var sig_buf: [64]u8 = undefined;
     var token_buf: [512]u8 = undefined;
     const token = try signToken(&token_buf, &sig_buf, .{
-        .ecdsa_p256_sha256 = .{ .key_pair = &kp, .noise = [_]u8{0x9e} ** EcdsaP256.noise_length },
+        .ecdsa_p256_sha256 = .{ .key_pair = &kp, .noise = @as([EcdsaP256.noise_length]u8, @splat(0x9e)) },
     }, 1, test_now_s, "ied-7");
     const v: TokenVerifier = .{ .ecdsa_p256_sha256 = kp.public_key };
 

@@ -207,7 +207,7 @@ test "ClientSession: fresh within the lifetime and before the leaf expires; chai
     const ch = s.chain(&out);
     try testing.expectEqual(@as(usize, 2), ch.len);
     try testing.expectEqualStrings("inter", ch[1]);
-    const big = [_]u8{0} ** (max_chain_bytes + 1);
+    const big = @as([max_chain_bytes + 1]u8, @splat(0));
     try testing.expect(!s.setChain(&.{&big}));
     try testing.expectEqual(@as(u8, 0), s.chain_count);
 }

@@ -70,7 +70,7 @@ pub const Ip = union(enum) {
     /// The address as 16 bytes; IPv4 becomes IPv4-mapped (`::ffff:a.b.c.d`).
     pub fn as16(ip: Ip) [16]u8 {
         return switch (ip) {
-            .v4 => |q| [_]u8{0} ** 10 ++ [_]u8{ 0xff, 0xff } ++ q,
+            .v4 => |q| @as([10]u8, @splat(0)) ++ [_]u8{ 0xff, 0xff } ++ q,
             .v6 => |b| b,
         };
     }
@@ -273,11 +273,11 @@ pub const Ip = union(enum) {
     pub const ipv4_unspecified: Ip = .{ .v4 = @splat(0) };
     pub const ipv4_broadcast: Ip = .{ .v4 = @splat(0xff) };
     pub const ipv6_unspecified: Ip = .{ .v6 = @splat(0) };
-    pub const ipv6_loopback: Ip = .{ .v6 = [_]u8{0} ** 15 ++ [_]u8{1} };
+    pub const ipv6_loopback: Ip = .{ .v6 = @as([15]u8, @splat(0)) ++ [_]u8{1} };
     /// `ff02::1`.
-    pub const ipv6_link_local_all_nodes: Ip = .{ .v6 = [_]u8{ 0xff, 0x02 } ++ [_]u8{0} ** 13 ++ [_]u8{1} };
+    pub const ipv6_link_local_all_nodes: Ip = .{ .v6 = [_]u8{ 0xff, 0x02 } ++ @as([13]u8, @splat(0)) ++ [_]u8{1} };
     /// `ff02::2`.
-    pub const ipv6_link_local_all_routers: Ip = .{ .v6 = [_]u8{ 0xff, 0x02 } ++ [_]u8{0} ** 13 ++ [_]u8{2} };
+    pub const ipv6_link_local_all_routers: Ip = .{ .v6 = [_]u8{ 0xff, 0x02 } ++ @as([13]u8, @splat(0)) ++ [_]u8{2} };
 
     fn isV4Mapped(b: [16]u8) bool {
         return std.mem.allEqual(u8, b[0..10], 0) and b[10] == 0xff and b[11] == 0xff;
@@ -1216,7 +1216,7 @@ fn rangeBlockBits(w: u8, cur: u128, to: u128) u8 {
 const RangeKey = struct { fam: IpFamily, from: u128, to: u128 };
 
 fn rangeKeyLess(_: void, a: RangeKey, b: RangeKey) bool {
-    if (a.fam != b.fam) return @intFromEnum(a.fam) < @intFromEnum(b.fam);
+    if (a.fam != b.fam) return @backingInt(a.fam) < @backingInt(b.fam);
     if (a.from != b.from) return a.from < b.from;
     return a.to < b.to;
 }
@@ -1413,7 +1413,7 @@ fn firstSpanEndingAtOrAfter(spans: []const RangeKey, fam: IpFamily, v: u128) usi
     while (lo < hi) {
         const mid = lo + (hi - lo) / 2;
         const k = spans[mid];
-        const before = @intFromEnum(k.fam) < @intFromEnum(fam) or (k.fam == fam and k.to < v);
+        const before = @backingInt(k.fam) < @backingInt(fam) or (k.fam == fam and k.to < v);
         if (before) lo = mid + 1 else hi = mid;
     }
     return lo;
@@ -1421,7 +1421,7 @@ fn firstSpanEndingAtOrAfter(spans: []const RangeKey, fam: IpFamily, v: u128) usi
 
 /// `x` ends before `y` ends, in set order (family, then end address).
 fn spanEndsBefore(x: RangeKey, y: RangeKey) bool {
-    if (x.fam != y.fam) return @intFromEnum(x.fam) < @intFromEnum(y.fam);
+    if (x.fam != y.fam) return @backingInt(x.fam) < @backingInt(y.fam);
     return x.to < y.to;
 }
 
@@ -1608,7 +1608,7 @@ fn subtractSpans(
     var j: usize = 0;
     for (a) |x| {
         // Skip what ends before `x` begins; it cannot touch later spans either.
-        while (j < b.len and (@intFromEnum(b[j].fam) < @intFromEnum(x.fam) or
+        while (j < b.len and (@backingInt(b[j].fam) < @backingInt(x.fam) or
             (b[j].fam == x.fam and b[j].to < x.from))) j += 1;
         var cur = x.from;
         var covered = false;
@@ -1650,7 +1650,7 @@ pub fn scopeOf(ip: Ip) Scope {
         .v4 => return .global,
         .v6 => |b| {
             if (Ip.isV4Mapped(b)) return .global;
-            if (b[0] == 0xff) return @enumFromInt(@as(u4, @truncate(b[1])));
+            if (b[0] == 0xff) return @fromBackingInt(@intCast(@as(u4, @truncate(b[1]))));
             if (b[0] == 0xfe and (b[1] & 0xc0) == 0xc0) return .site_local;
             return .global;
         },
@@ -1750,7 +1750,7 @@ const Attr = struct { scope: u4, precedence: u8, label: u8 };
 
 fn attrOf(ip: Ip) Attr {
     const p = policyOf(ip);
-    return .{ .scope = @intFromEnum(scopeOf(ip)), .precedence = p.precedence, .label = p.label };
+    return .{ .scope = @backingInt(scopeOf(ip)), .precedence = p.precedence, .label = p.label };
 }
 
 fn attrOfSource(ip: ?Ip) Attr {
@@ -1939,9 +1939,9 @@ fn sourceBefore(sa: Ip, sb: Ip, dst: Ip) bool {
     if (sb.eql(dst)) return false;
 
     // Rule 2: prefer appropriate scope.
-    const scope_a = @intFromEnum(scopeOf(sa));
-    const scope_b = @intFromEnum(scopeOf(sb));
-    const scope_d = @intFromEnum(scopeOf(dst));
+    const scope_a = @backingInt(scopeOf(sa));
+    const scope_b = @backingInt(scopeOf(sb));
+    const scope_d = @backingInt(scopeOf(dst));
     if (scope_a < scope_b) return scope_a >= scope_d;
     if (scope_b < scope_a) return scope_b < scope_d;
 
@@ -2040,8 +2040,8 @@ test "parseIp6 accepts valid literals" {
     try testing.expect(parseIp6("2001:0db8:0000:0000:0000:0000:0000:0001") != null);
     try testing.expect(parseIp6("1:2:3:4:5:6:7:8") != null);
     // Compression.
-    try testing.expectEqual([_]u8{0} ** 16, parseIp6("::").?);
-    try testing.expectEqual([_]u8{0} ** 15 ++ [_]u8{1}, parseIp6("::1").?);
+    try testing.expectEqual(@as([16]u8, @splat(0)), parseIp6("::").?);
+    try testing.expectEqual(@as([15]u8, @splat(0)) ++ [_]u8{1}, parseIp6("::1").?);
     try testing.expect(parseIp6("1::") != null);
     try testing.expect(parseIp6("1:2:3:4:5:6:7::") != null);
     try testing.expect(parseIp6("::1:2:3:4:5:6:7") != null);

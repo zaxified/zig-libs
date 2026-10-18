@@ -84,10 +84,10 @@ const Env = fio.Env;
 
 pub fn main(init: std.process.Init.Minimal) !u8 {
     var da: std.heap.DebugAllocator(.{}) = .init;
-    defer if (builtin.mode == .Debug or builtin.mode == .ReleaseSafe) {
+    defer if (builtin.mode == .debug or builtin.mode == .safe) {
         if (da.deinit() == .leak) @panic("memory leak");
     };
-    const gpa = if (builtin.mode == .Debug or builtin.mode == .ReleaseSafe) da.allocator() else std.heap.smp_allocator;
+    const gpa = if (builtin.mode == .debug or builtin.mode == .safe) da.allocator() else std.heap.smp_allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
@@ -244,7 +244,7 @@ fn setMaxCompression(cp: *fio.CParams, prefs: *fio.Prefs) void {
         .search_log = L.search_log_max,
         .min_match = L.min_match_min,
         .target_length = L.target_length_max,
-        .strategy = @intFromEnum(zstd.Strategy.btultra2),
+        .strategy = @backingInt(zstd.Strategy.btultra2),
     };
     prefs.overlap_log = L.overlap_log_max;
     prefs.ldm_hash_log = L.ldm_hash_log_max;
@@ -284,7 +284,7 @@ fn printDefaultCParams(env: Env, name: []const u8, dict_name: ?[]const u8, level
     disp.always(" - searchLog     : {d}\n", .{cp.search_log});
     disp.always(" - minMatch      : {d}\n", .{cp.min_match});
     disp.always(" - targetLength  : {d}\n", .{cp.target_length});
-    disp.always(" - strategy      : {s} ({d})\n", .{ strategyName(cp.strategy), @intFromEnum(cp.strategy) });
+    disp.always(" - strategy      : {s} ({d})\n", .{ strategyName(cp.strategy), @backingInt(cp.strategy) });
 }
 
 /// `printActualCParams`: the level's parameters with the explicit ones over
@@ -297,10 +297,10 @@ fn printActualCParams(env: Env, name: []const u8, dict_name: ?[]const u8, level:
         }
     }.f;
     disp.always("--zstd=wlog={d},clog={d},hlog={d},slog={d},mml={d},tlen={d},strat={d}\n", .{
-        pick(cp.window_log, d.window_log),           pick(cp.chain_log, d.chain_log),
-        pick(cp.hash_log, d.hash_log),               pick(cp.search_log, d.search_log),
-        pick(cp.min_match, d.min_match),             pick(cp.target_length, d.target_length),
-        pick(cp.strategy, @intFromEnum(d.strategy)),
+        pick(cp.window_log, d.window_log),          pick(cp.chain_log, d.chain_log),
+        pick(cp.hash_log, d.hash_log),              pick(cp.search_log, d.search_log),
+        pick(cp.min_match, d.min_match),            pick(cp.target_length, d.target_length),
+        pick(cp.strategy, @backingInt(d.strategy)),
     });
 }
 
@@ -312,12 +312,12 @@ fn displayCompressionParameters(prefs: *const fio.Prefs) void {
     const lit = [3][]const u8{ "", " --compress-literals", " --no-compress-literals" };
     disp.always("--format=.zst --no-sparse{s}{s} --block-size={d}", .{ if (prefs.dict_id) "" else " --no-dictID", check[prefs.checksum], prefs.block_size });
     if (prefs.adaptive) disp.always(" --adapt=min={d},max={d}", .{ prefs.adapt_min, prefs.adapt_max });
-    disp.always("{s}{s}", .{ row[@intFromEnum(prefs.row_match_finder)], if (prefs.rsyncable) " --rsyncable" else "" });
+    disp.always("{s}{s}", .{ row[@backingInt(prefs.row_match_finder)], if (prefs.rsyncable) " --rsyncable" else "" });
     if (prefs.stream_src_size != 0) disp.always(" --stream-size={d}", .{@as(u32, @truncate(prefs.stream_src_size))});
     if (prefs.src_size_hint != 0) disp.always(" --size-hint={d}", .{@as(i32, @bitCast(prefs.src_size_hint))});
     if (prefs.target_cblock_size != 0) disp.always(" --target-compressed-block-size={d}", .{prefs.target_cblock_size});
     disp.always("{s} --memory={d} --threads={d}{s} --{s}content-size\n", .{
-        lit[@intFromEnum(prefs.literal_compression)],
+        lit[@backingInt(prefs.literal_compression)],
         if (prefs.mem_limit != 0) prefs.mem_limit else 128 << 20,
         prefs.nb_workers,
         if (prefs.exclude_compressed) " --exclude-compressed" else "",

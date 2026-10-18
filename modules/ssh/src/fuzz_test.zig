@@ -27,10 +27,10 @@ const vectors = @import("hostkey_vectors.zig");
 /// harness, `check` after the in-suite seeds.
 pub fn Reach(comptime L: type) type {
     return struct {
-        var counts: [@typeInfo(L).@"enum".fields.len]usize = @splat(0);
+        var counts: [@typeInfo(L).@"enum".field_names.len]usize = @splat(0);
 
         pub fn mark(comptime l: L) void {
-            counts[@intFromEnum(l)] += 1;
+            counts[@backingInt(l)] += 1;
             fuzz_driver.hit(@tagName(l));
         }
 
@@ -40,7 +40,7 @@ pub fn Reach(comptime L: type) type {
 
         pub fn check(name: []const u8) !void {
             for (counts, 0..) |n, i| if (n == 0) {
-                std.debug.print("reach: {s}: label {t} never hit\n", .{ name, @as(L, @enumFromInt(i)) });
+                std.debug.print("reach: {s}: label {t} never hit\n", .{ name, @as(L, @fromBackingInt(@intCast(i))) });
                 return error.HarnessDoesNotReach;
             };
         }

@@ -156,7 +156,7 @@ test "encodeCanonicalName: round-trips through decodeUncompressedName (lowercase
 
 test "encodeCanonicalName: label too long errors" {
     var buf: [max_canonical_wire_len]u8 = undefined;
-    const long_label = "a" ** 64;
+    const long_label = strRepeat("a", 64);
     try testing.expectError(error.BadLabel, encodeCanonicalName(long_label, &buf));
 }
 
@@ -194,15 +194,15 @@ const name_seeds = [_][]const u8{
     seed("\x07example\x00"), // one label
     seed("\x00"), // the root name: an empty text result, and a legal one
     seed("\x03foo\x00\x03bar\x00"), // two names back to back: the sweep decodes both
-    seed("\x01a" ** 100 ++ "\x00"), // 100 single-octet labels: 199 text octets
-    seed("\x3f" ++ ("a" ** 63) ++ "\x00"), // a label at the 63-octet maximum
-    seed("\x40" ++ ("a" ** 64) ++ "\x00"), // 0x40: the top bits are 01, so BadLabel
-    seed("\x80" ++ ("a" ** 10) ++ "\x00"), // 0x80: top bits 10, also BadLabel
+    seed(strRepeat("\x01a", 100) ++ "\x00"), // 100 single-octet labels: 199 text octets
+    seed("\x3f" ++ (strRepeat("a", 63)) ++ "\x00"), // a label at the 63-octet maximum
+    seed("\x40" ++ (strRepeat("a", 64)) ++ "\x00"), // 0x40: the top bits are 01, so BadLabel
+    seed("\x80" ++ (strRepeat("a", 10)) ++ "\x00"), // 0x80: top bits 10, also BadLabel
     seed("\xc0\x0c"), // a compression pointer: forbidden by RFC 4034 §6.2
     seed("\x03foo\xc0\x00"), // a pointer after a legitimate label
     seed("\x03fo"), // a label length that runs off the end
     seed("\x03foo"), // a name with no root terminator
-    seed(("\x01a" ** 130) ++ "\x00"), // 259 text octets: over `max_name_text_len`
+    seed((strRepeat("\x01a", 130)) ++ "\x00"), // 259 text octets: over `max_name_text_len`
     seed("\xff"), // a single 0xff octet
     seed(""), // the empty buffer
 };
@@ -281,4 +281,16 @@ test "corpus: every name seed reaches the decoder, and the offsets that decode a
     // overflowing it. That is the boundary this decoder's `NameTooLong` check
     // defends, and the collapsed harness had never been within 253 of it.
     try testing.expectEqual(@as(usize, max_name_text_len), longest);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

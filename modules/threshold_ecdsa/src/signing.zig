@@ -42,7 +42,7 @@ pub const Signature = ecdsa.Signature;
 /// Converts a PUBLIC participant index to its `Scalar` (u32 << q, always
 /// canonical) — same convention as `root.zig`'s private helper.
 fn scalarFromIndex(index: u32) Scalar {
-    var buf = [_]u8{0} ** Ns;
+    var buf = @as([Ns]u8, @splat(0));
     std.mem.writeInt(u32, buf[Ns - 4 .. Ns], index, .big);
     return Scalar.fromBytes(buf, .big) catch unreachable;
 }
@@ -346,7 +346,7 @@ test "signWithShares: decisive test — keygen(2,3) -> sign over 2 shares -> ver
     // Heavy: 2048-bit keygen. `threshold_ecdsa` is `heavy` in build.zig, so
     // the DEFAULT lane builds it at ReleaseSafe and runs this; it skips only
     // under `-Dstrict-debug`.
-    if (builtin.mode == .Debug) return error.SkipZigTest;
+    if (builtin.mode == .debug) return error.SkipZigTest;
     const allocator = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x736967_6e696e67); // "signing"
     const random = prng.random();
@@ -362,7 +362,7 @@ test "signWithShares: decisive test — keygen(2,3) -> sign over 2 shares -> ver
 }
 
 test "signWithShares: every t-subset of n, and a signing set larger than t, verify under X" {
-    if (builtin.mode == .Debug) return error.SkipZigTest;
+    if (builtin.mode == .debug) return error.SkipZigTest;
     const allocator = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x7375627365747300); // "subsets"
     const random = prng.random();
@@ -380,7 +380,7 @@ test "signWithShares: every t-subset of n, and a signing set larger than t, veri
 }
 
 test "signWithShares: a flipped bit and a different message do not verify" {
-    if (builtin.mode == .Debug) return error.SkipZigTest;
+    if (builtin.mode == .debug) return error.SkipZigTest;
     const allocator = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x74616d706572); // "tamper"
     const random = prng.random();
@@ -397,7 +397,7 @@ test "signWithShares: a flipped bit and a different message do not verify" {
 }
 
 test "signWithShares: rejects one share, mixed keys, a duplicate index, a set below t" {
-    if (builtin.mode == .Debug) return error.SkipZigTest;
+    if (builtin.mode == .debug) return error.SkipZigTest;
     const allocator = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x76616c6964617465); // "validate"
     const random = prng.random();
@@ -417,7 +417,7 @@ test "signWithShares: rejects one share, mixed keys, a duplicate index, a set be
 }
 
 test "signWithShares: fails closed, not panic/UB, when a KeyShare's own index is missing from public_keys (audit F2 HIGH, 2026-09-10 fix)" {
-    if (builtin.mode == .Debug) return error.SkipZigTest;
+    if (builtin.mode == .debug) return error.SkipZigTest;
     const allocator = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x66325f68696768); // "f2_high"
     const random = prng.random();
@@ -437,7 +437,7 @@ test "signWithShares: fails closed, not panic/UB, when a KeyShare's own index is
 }
 
 test "signWithShares: a verifying share that does not match the key is refused before any round" {
-    if (builtin.mode == .Debug) return error.SkipZigTest;
+    if (builtin.mode == .debug) return error.SkipZigTest;
     const allocator = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x62616478); // "badx"
     const random = prng.random();
@@ -457,7 +457,7 @@ test "signWithShares: a verifying share that does not match the key is refused b
 }
 
 test "audit F6: the threaded driver gives the same signature as the sequential one" {
-    if (builtin.mode == .Debug) return error.SkipZigTest;
+    if (builtin.mode == .debug) return error.SkipZigTest;
     const allocator = testing.allocator;
     var kprng = std.Random.DefaultPrng.init(0xF6_6b6579); // "key"
     const kg = try testKeygen(allocator, kprng.random(), 3, 3);
@@ -477,7 +477,7 @@ test "audit F6: the threaded driver gives the same signature as the sequential o
 }
 
 test "lagrangeCoefficient: Σ λ_i · x_i over a subset reconstructs the group secret (self-consistency)" {
-    if (builtin.mode == .Debug) return error.SkipZigTest;
+    if (builtin.mode == .debug) return error.SkipZigTest;
     const allocator = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x6c6167_72616e6765); // "lagrange"
     const random = prng.random();

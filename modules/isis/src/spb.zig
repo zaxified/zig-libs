@@ -364,12 +364,12 @@ test "SPB Instance sub-TLV round-trips SPSourceID + ECT-VID tuples" {
 
 test "SPBM-SI with a partial I-SID entry is rejected" {
     // 6 B-MAC + 2 base-vid + 3 stray bytes (not a multiple of 4).
-    const value = [_]u8{0} ** 8 ++ [_]u8{ 0x80, 0x00, 0x64 };
+    const value = @as([8]u8, @splat(0)) ++ [_]u8{ 0x80, 0x00, 0x64 };
     try testing.expectError(error.BadLength, SpbmServiceId.decode(&value));
 }
 
 test "SPB Instance num-trees larger than the tuple bytes is rejected" {
-    var value = [_]u8{0} ** (SpbInstance.fixed_len);
+    var value = @as([SpbInstance.fixed_len]u8, @splat(0));
     value[18] = 5; // claims 5 trees, no tuple bytes follow
     try testing.expectError(error.BadLength, SpbInstance.decode(&value));
 }

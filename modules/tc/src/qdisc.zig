@@ -963,9 +963,9 @@ fn appendCakeOptions(
     // Emission order mirrors iproute2's q_cake.c so a request is byte-identical
     // to the equivalent `tc` command line (verified against captured goldens).
     if (c.bandwidth) |v| try appendAttrU64(gpa, list, TCA_CAKE.BASE_RATE64, v);
-    if (c.diffserv) |v| try codec.appendAttrU32(gpa, list, TCA_CAKE.DIFFSERV_MODE, @intFromEnum(v));
-    if (c.atm) |v| try codec.appendAttrU32(gpa, list, TCA_CAKE.ATM, @intFromEnum(v));
-    if (c.flow_mode) |v| try codec.appendAttrU32(gpa, list, TCA_CAKE.FLOW_MODE, @intFromEnum(v));
+    if (c.diffserv) |v| try codec.appendAttrU32(gpa, list, TCA_CAKE.DIFFSERV_MODE, @backingInt(v));
+    if (c.atm) |v| try codec.appendAttrU32(gpa, list, TCA_CAKE.ATM, @backingInt(v));
+    if (c.flow_mode) |v| try codec.appendAttrU32(gpa, list, TCA_CAKE.FLOW_MODE, @backingInt(v));
     if (c.overhead) |v| try codec.appendAttrU32(gpa, list, TCA_CAKE.OVERHEAD, @bitCast(v));
     if (c.raw) try codec.appendAttrU32(gpa, list, TCA_CAKE.RAW, 0);
     if (c.mpu) |v| try codec.appendAttrU32(gpa, list, TCA_CAKE.MPU, v);
@@ -977,7 +977,7 @@ fn appendCakeOptions(
     if (c.nat) |v| try codec.appendAttrU32(gpa, list, TCA_CAKE.NAT, @intFromBool(v));
     if (c.wash) |v| try codec.appendAttrU32(gpa, list, TCA_CAKE.WASH, @intFromBool(v));
     if (c.split_gso) |v| try codec.appendAttrU32(gpa, list, TCA_CAKE.SPLIT_GSO, @intFromBool(v));
-    if (c.ack_filter) |v| try codec.appendAttrU32(gpa, list, TCA_CAKE.ACK_FILTER, @intFromEnum(v));
+    if (c.ack_filter) |v| try codec.appendAttrU32(gpa, list, TCA_CAKE.ACK_FILTER, @backingInt(v));
     if (c.ingress) |v| try codec.appendAttrU32(gpa, list, TCA_CAKE.INGRESS, @intFromBool(v));
 }
 
@@ -1276,10 +1276,10 @@ test "attribute-type constants agree with the kernel UAPI" {
     try testing.expectEqual(@as(u16, 16), TCA_CAKE.ACK_FILTER);
     try testing.expectEqual(@as(u16, 18), TCA_CAKE.FWMARK);
     // cake enum values match the kernel's sch_cake.c constants.
-    try testing.expectEqual(@as(u32, 1), @intFromEnum(CakeDiffservMode.diffserv4));
-    try testing.expectEqual(@as(u32, 5), @intFromEnum(CakeFlowMode.dual_srchost));
-    try testing.expectEqual(@as(u32, 2), @intFromEnum(CakeAtmMode.ptm));
-    try testing.expectEqual(@as(u32, 1), @intFromEnum(CakeAckFilter.filter));
+    try testing.expectEqual(@as(u32, 1), @backingInt(CakeDiffservMode.diffserv4));
+    try testing.expectEqual(@as(u32, 5), @backingInt(CakeFlowMode.dual_srchost));
+    try testing.expectEqual(@as(u32, 2), @backingInt(CakeAtmMode.ptm));
+    try testing.expectEqual(@as(u32, 1), @backingInt(CakeAckFilter.filter));
     try testing.expectEqual(@as(usize, 20), tcmsg_len);
     try testing.expectEqual(@as(usize, 44), tc_htb_opt_len);
     try testing.expectEqual(@as(usize, 36), tc_tbf_qopt_len);
@@ -1698,44 +1698,44 @@ const OptionsCorpus = struct {
         // bounds, because the harness handed every parser an empty slice and
         // no test ever put a short attribute in front of one.
         var netem_short: std.ArrayList(u8) = .empty;
-        try netem_short.appendSlice(gpa, &([_]u8{0} ** tc_netem_qopt_len));
-        try codec.appendAttr(gpa, &netem_short, TCA_NETEM.CORR, &[_]u8{0} ** 4);
-        try codec.appendAttr(gpa, &netem_short, TCA_NETEM.REORDER, &[_]u8{0} ** 4);
-        try codec.appendAttr(gpa, &netem_short, TCA_NETEM.CORRUPT, &[_]u8{0} ** 4);
-        try codec.appendAttr(gpa, &netem_short, TCA_NETEM.RATE, &[_]u8{0} ** 2);
-        try codec.appendAttr(gpa, &netem_short, TCA_NETEM.LATENCY64, &[_]u8{0} ** 4);
-        try codec.appendAttr(gpa, &netem_short, TCA_NETEM.JITTER64, &[_]u8{0} ** 4);
+        try netem_short.appendSlice(gpa, &(@as([tc_netem_qopt_len]u8, @splat(0))));
+        try codec.appendAttr(gpa, &netem_short, TCA_NETEM.CORR, &@as([4]u8, @splat(0)));
+        try codec.appendAttr(gpa, &netem_short, TCA_NETEM.REORDER, &@as([4]u8, @splat(0)));
+        try codec.appendAttr(gpa, &netem_short, TCA_NETEM.CORRUPT, &@as([4]u8, @splat(0)));
+        try codec.appendAttr(gpa, &netem_short, TCA_NETEM.RATE, &@as([2]u8, @splat(0)));
+        try codec.appendAttr(gpa, &netem_short, TCA_NETEM.LATENCY64, &@as([4]u8, @splat(0)));
+        try codec.appendAttr(gpa, &netem_short, TCA_NETEM.JITTER64, &@as([4]u8, @splat(0)));
         self.push(netem_short.items);
 
         // htb, both levels. RATE64/CEIL64 come before the short PARMS, which
         // ends the class walk with `BadLength`.
         var htb_short: std.ArrayList(u8) = .empty;
-        try codec.appendAttr(gpa, &htb_short, TCA_HTB.INIT, &[_]u8{0} ** 4);
-        try codec.appendAttr(gpa, &htb_short, TCA_HTB.DIRECT_QLEN, &[_]u8{0} ** 2);
-        try codec.appendAttr(gpa, &htb_short, TCA_HTB.RATE64, &[_]u8{0} ** 4);
-        try codec.appendAttr(gpa, &htb_short, TCA_HTB.CEIL64, &[_]u8{0} ** 4);
-        try codec.appendAttr(gpa, &htb_short, TCA_HTB.PARMS, &[_]u8{0} ** 4);
+        try codec.appendAttr(gpa, &htb_short, TCA_HTB.INIT, &@as([4]u8, @splat(0)));
+        try codec.appendAttr(gpa, &htb_short, TCA_HTB.DIRECT_QLEN, &@as([2]u8, @splat(0)));
+        try codec.appendAttr(gpa, &htb_short, TCA_HTB.RATE64, &@as([4]u8, @splat(0)));
+        try codec.appendAttr(gpa, &htb_short, TCA_HTB.CEIL64, &@as([4]u8, @splat(0)));
+        try codec.appendAttr(gpa, &htb_short, TCA_HTB.PARMS, &@as([4]u8, @splat(0)));
         self.push(htb_short.items);
 
         var tbf_short: std.ArrayList(u8) = .empty;
-        try codec.appendAttr(gpa, &tbf_short, TCA_TBF.RATE64, &[_]u8{0} ** 4);
-        try codec.appendAttr(gpa, &tbf_short, TCA_TBF.PRATE64, &[_]u8{0} ** 4);
-        try codec.appendAttr(gpa, &tbf_short, TCA_TBF.BURST, &[_]u8{0} ** 2);
-        try codec.appendAttr(gpa, &tbf_short, TCA_TBF.PBURST, &[_]u8{0} ** 2);
-        try codec.appendAttr(gpa, &tbf_short, TCA_TBF.PARMS, &[_]u8{0} ** 4);
+        try codec.appendAttr(gpa, &tbf_short, TCA_TBF.RATE64, &@as([4]u8, @splat(0)));
+        try codec.appendAttr(gpa, &tbf_short, TCA_TBF.PRATE64, &@as([4]u8, @splat(0)));
+        try codec.appendAttr(gpa, &tbf_short, TCA_TBF.BURST, &@as([2]u8, @splat(0)));
+        try codec.appendAttr(gpa, &tbf_short, TCA_TBF.PBURST, &@as([2]u8, @splat(0)));
+        try codec.appendAttr(gpa, &tbf_short, TCA_TBF.PARMS, &@as([4]u8, @splat(0)));
         self.push(tbf_short.items);
 
         var cake_short: std.ArrayList(u8) = .empty;
-        try codec.appendAttr(gpa, &cake_short, TCA_CAKE.BASE_RATE64, &[_]u8{0} ** 4);
-        try codec.appendAttr(gpa, &cake_short, TCA_CAKE.OVERHEAD, &[_]u8{0} ** 2);
-        try codec.appendAttr(gpa, &cake_short, TCA_CAKE.DIFFSERV_MODE, &[_]u8{0} ** 2);
-        try codec.appendAttr(gpa, &cake_short, TCA_CAKE.MPU, &[_]u8{0} ** 8);
+        try codec.appendAttr(gpa, &cake_short, TCA_CAKE.BASE_RATE64, &@as([4]u8, @splat(0)));
+        try codec.appendAttr(gpa, &cake_short, TCA_CAKE.OVERHEAD, &@as([2]u8, @splat(0)));
+        try codec.appendAttr(gpa, &cake_short, TCA_CAKE.DIFFSERV_MODE, &@as([2]u8, @splat(0)));
+        try codec.appendAttr(gpa, &cake_short, TCA_CAKE.MPU, &@as([8]u8, @splat(0)));
         try codec.appendAttr(gpa, &cake_short, TCA_CAKE.RAW, &.{});
         self.push(cake_short.items);
 
         // ── the refusals ───────────────────────────────────────────────────
         // A payload one octet short of `struct tcmsg`.
-        self.push(&([_]u8{0} ** (tcmsg_len - 1)));
+        self.push(&(@as([tcmsg_len - 1]u8, @splat(0))));
         // A KIND string one octet past `kind_max`, which `copyKind` refuses.
         var long_kind: std.ArrayList(u8) = .empty;
         try tcmsg(gpa, &long_kind, 2, Handle.unspec, Handle.root);
@@ -1744,9 +1744,9 @@ const OptionsCorpus = struct {
         // An attribute header declaring 0x40 octets over a 2-octet buffer.
         self.push(&[_]u8{ 0x40, 0x00 });
         // A netem qopt one octet short of `tc_netem_qopt_len`.
-        self.push(&([_]u8{0} ** (tc_netem_qopt_len - 1)));
+        self.push(&(@as([tc_netem_qopt_len - 1]u8, @splat(0))));
         // A complete netem qopt followed by a TLV running off the end.
-        self.push(&([_]u8{0} ** tc_netem_qopt_len ++ [_]u8{ 0x40, 0x00, 0x03, 0x00, 0x01 }));
+        self.push(&(@as([tc_netem_qopt_len]u8, @splat(0)) ++ [_]u8{ 0x40, 0x00, 0x03, 0x00, 0x01 }));
 
         return self.entries[0..self.n];
     }

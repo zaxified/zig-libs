@@ -225,7 +225,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             // r is the ONLY tainted value; the masking secret `u` (drawn
             // inside maskedInvert via the SAME `random`) and every redraw
             // come from the untainted ChaCha stream below — see BlindRandom.
-            var br = BlindRandom.init(&kat.r, taint, [_]u8{0x51} ** 32);
+            var br = BlindRandom.init(&kat.r, taint, @as([32]u8, @splat(0x51)));
             const random = std.Random.init(&br, BlindRandom.fill);
 
             var ctx: blindrsa.Context = undefined;
@@ -247,7 +247,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .sign => {
             // b (the server's own §7.2 blinding factor) is drawn fresh from
             // an untainted deterministic CSPRNG — only sk is tainted.
-            var csprng = std.Random.ChaCha.init([_]u8{0x9c} ** 32);
+            var csprng = std.Random.ChaCha.init(@as([32]u8, @splat(0x9c)));
             const random = csprng.random();
 
             var sk = try kat.secretKey();

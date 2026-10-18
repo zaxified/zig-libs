@@ -167,7 +167,7 @@ fn levelsOf(comptime spec: []const struct { lms.ParamSet, lms.OtsParamSet }) [sp
 
 test "HSS round trip for L = 1 .. 8 (H5, w1 at every level)" {
     inline for (1..9) |count| {
-        const levels = [_]Level{.{ .lms = .sha256_m32_h5, .ots = .sha256_n32_w1 }} ** count;
+        const levels = @as([count]Level, @splat(.{ .lms = .sha256_m32_h5, .ots = .sha256_n32_w1 }));
         var sk: lms.SecretKey = undefined;
         try lms.SecretKey.init(&sk, gpa, &levels, &seedOf(count), idOf(count), null);
         defer sk.deinit();
@@ -211,7 +211,7 @@ fn signatureQs(sig: []const u8, levels: []const Level, out: *[lms.max_levels]u32
 }
 
 test "HSS L=2: the position increases strictly across a lower-tree boundary and every signature verifies" {
-    const levels = [_]Level{.{ .lms = .sha256_m32_h5, .ots = .sha256_n32_w1 }} ** 2;
+    const levels = @as([2]Level, @splat(.{ .lms = .sha256_m32_h5, .ots = .sha256_n32_w1 }));
     var sk: lms.SecretKey = undefined;
     try lms.SecretKey.init(&sk, gpa, &levels, &seedOf(1), idOf(2), null);
     defer sk.deinit();
@@ -241,7 +241,7 @@ test "HSS L=2: the position increases strictly across a lower-tree boundary and 
 }
 
 test "HSS: an exhausted key refuses, after exactly the product of the tree sizes" {
-    const levels = [_]Level{.{ .lms = .sha256_m32_h5, .ots = .sha256_n32_w1 }} ** 2;
+    const levels = @as([2]Level, @splat(.{ .lms = .sha256_m32_h5, .ots = .sha256_n32_w1 }));
     var sk: lms.SecretKey = undefined;
     try lms.SecretKey.init(&sk, gpa, &levels, &seedOf(5), idOf(6), null);
     defer sk.deinit();
@@ -258,7 +258,7 @@ test "HSS: an exhausted key refuses, after exactly the product of the tree sizes
 }
 
 test "HSS: a key restored at a position signs exactly what the walked key would" {
-    const levels = [_]Level{.{ .lms = .sha256_m32_h5, .ots = .sha256_n32_w1 }} ** 2;
+    const levels = @as([2]Level, @splat(.{ .lms = .sha256_m32_h5, .ots = .sha256_n32_w1 }));
     var a: lms.SecretKey = undefined;
     try lms.SecretKey.init(&a, gpa, &levels, &seedOf(8), idOf(9), null);
     defer a.deinit();
@@ -285,7 +285,7 @@ test "HSS init validation" {
     var scratch: lms.SecretKey = undefined;
     try std.testing.expectError(error.InvalidLevels, lms.SecretKey.init(&scratch, gpa, &.{}, &seedOf(1), idOf(1), null));
     try std.testing.expect(std.mem.allEqual(u8, &scratch.seed, 0)); // zeroed on error
-    const nine = one ** 9;
+    const nine = arrRepeat(Level, &one, 9);
     try std.testing.expectError(error.InvalidLevels, lms.SecretKey.init(&scratch, gpa, &nine, &seedOf(1), idOf(1), null));
     var bad: lms.Position = .{};
     bad.q[0] = 32;
@@ -317,7 +317,7 @@ const Log = struct {
 };
 
 test "SigningKey: the next position is persisted before signing; a failed write burns no leaf" {
-    const levels = [_]Level{.{ .lms = .sha256_m32_h5, .ots = .sha256_n32_w1 }} ** 2;
+    const levels = @as([2]Level, @splat(.{ .lms = .sha256_m32_h5, .ots = .sha256_n32_w1 }));
     var log: Log = .{};
     var sk: lms.SecretKey = undefined;
     try lms.SecretKey.init(&sk, gpa, &levels, &seedOf(3), idOf(3), null);
@@ -398,7 +398,7 @@ test "SigningKey: a copied handle refuses to sign" {
 }
 
 test "deinit wipes the seeds" {
-    const levels = [_]Level{.{ .lms = .sha256_m32_h5, .ots = .sha256_n32_w1 }} ** 2;
+    const levels = @as([2]Level, @splat(.{ .lms = .sha256_m32_h5, .ots = .sha256_n32_w1 }));
     var sk: lms.SecretKey = undefined;
     try lms.SecretKey.init(&sk, gpa, &levels, &seedOf(0xAA), idOf(1), null);
     const buf = try gpa.alloc(u8, sk.signatureLength());
@@ -580,7 +580,7 @@ test "HssPublicKey.verify: a hand-built key with L outside 1..8 verifies nothing
 }
 
 test "HSS: every lower tree is its own tree, and its seed is not its public identifier" {
-    const levels = [_]Level{.{ .lms = .sha256_m32_h5, .ots = .sha256_n32_w1 }} ** 3;
+    const levels = @as([3]Level, @splat(.{ .lms = .sha256_m32_h5, .ots = .sha256_n32_w1 }));
     var sk: lms.SecretKey = undefined;
     try lms.SecretKey.init(&sk, gpa, &levels, &seedOf(0x5a), idOf(0x5b), null);
     defer sk.deinit();
@@ -616,7 +616,7 @@ test "HSS: every lower tree is its own tree, and its seed is not its public iden
 }
 
 test "HSS: out of memory while building a lower tree burns no leaf; staying in a tree allocates nothing" {
-    const levels = [_]Level{.{ .lms = .sha256_m32_h5, .ots = .sha256_n32_w1 }} ** 2;
+    const levels = @as([2]Level, @splat(.{ .lms = .sha256_m32_h5, .ots = .sha256_n32_w1 }));
     var fa = std.testing.FailingAllocator.init(gpa, .{});
     var log: Log = .{};
     var sk: lms.SecretKey = undefined;
@@ -660,7 +660,7 @@ test "HSS: out of memory while building a lower tree burns no leaf; staying in a
 }
 
 test "HSS: a position persisted as exhausted restores as exhausted and never signs" {
-    const levels = [_]Level{.{ .lms = .sha256_m32_h5, .ots = .sha256_n32_w1 }} ** 2;
+    const levels = @as([2]Level, @splat(.{ .lms = .sha256_m32_h5, .ots = .sha256_n32_w1 }));
     var last: lms.Position = .{};
     last.q[0] = 31;
     last.q[1] = 31;
@@ -775,4 +775,12 @@ test "SigningKey: a second signer cannot enter while the first is inside the per
     if (builtin.single_threaded) return error.SkipZigTest;
     try exclusionRun(false); // spin guard
     try exclusionRun(true); // Io mutex
+}
+
+/// Comptime array repetition; replaces the `**` operator removed in Zig 0.17.
+fn arrRepeat(comptime T: type, comptime unit: []const T, comptime n: usize) [unit.len * n]T {
+    @setEvalBranchQuota(n * unit.len * 2 + 1000);
+    var buf: [unit.len * n]T = undefined;
+    for (0..n) |i| @memcpy(buf[i * unit.len ..][0..unit.len], unit);
+    return buf;
 }

@@ -255,7 +255,7 @@ test "parseUnix: abstract names, spaces in paths, seqpacket, old kernels, junk" 
     try testing.expectEqual(@as(u64, 9), nh[0].inode);
 
     // Overlong path is clamped, not dropped.
-    const long = try parseUnix(testing.allocator, "ffff: 00000002 00000000 00000000 0001 01 9 /" ++ "p" ** 300 ++ "\n");
+    const long = try parseUnix(testing.allocator, "ffff: 00000002 00000000 00000000 0001 01 9 /" ++ strRepeat("p", 300) ++ "\n");
     defer testing.allocator.free(long);
     try testing.expectEqual(@as(usize, 1), long.len);
     try testing.expectEqual(@as(usize, path_max), long[0].path().len);
@@ -312,4 +312,16 @@ test "parseUnix: tabs and CRLF separate columns; 0x20000 is not the listening bi
     try testing.expectEqual(@as(u64, 77), es[0].inode);
     try testing.expect(!es[0].isListening());
     try testing.expect(!es[0].isAbstract());
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

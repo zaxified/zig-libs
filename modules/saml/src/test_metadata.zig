@@ -338,10 +338,10 @@ test "SP metadata: invalid options are refused with typed errors" {
     const acs: []const saml.AcsEndpoint = &.{.{ .location = "https://sp.example.org/acs", .index = 0 }};
 
     try testing.expectError(error.InvalidEntityId, saml.buildSpMetadata(alloc, .{ .entity_id = "", .assertion_consumer_services = acs }));
-    const long = "x" ** 1025;
+    const long = strRepeat("x", 1025);
     try testing.expectError(error.InvalidEntityId, saml.buildSpMetadata(alloc, .{ .entity_id = long, .assertion_consumer_services = acs }));
     // 1024 characters is the limit, counted in characters not octets.
-    const ok_long = try saml.buildSpMetadata(alloc, .{ .entity_id = "\u{e9}" ** 1024, .assertion_consumer_services = acs });
+    const ok_long = try saml.buildSpMetadata(alloc, .{ .entity_id = strRepeat("\u{e9}", 1024), .assertion_consumer_services = acs });
     alloc.free(ok_long);
 
     try testing.expectError(error.NoAssertionConsumerService, saml.buildSpMetadata(alloc, .{ .entity_id = "e", .assertion_consumer_services = &.{} }));
@@ -404,4 +404,16 @@ test "SP metadata: no allocation is leaked on any failure path" {
             a.free(out);
         }
     }.run, .{signedOpts(&sk)});
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

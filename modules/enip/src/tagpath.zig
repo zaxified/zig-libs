@@ -305,9 +305,9 @@ test "malformed paths are typed errors" {
         try testing.expectError(c.want, parse(c.text, &storage));
     }
     // A name of exactly 41 characters, all legal, is a length error.
-    try testing.expectError(error.NameTooLong, parse("A" ** 41, &storage));
+    try testing.expectError(error.NameTooLong, parse(strRepeat("A", 41), &storage));
     // 40 is fine.
-    _ = try parse("A" ** 40, &storage);
+    _ = try parse(strRepeat("A", 40), &storage);
     // More components than the caller's storage.
     var tiny: [1]Component = undefined;
     try testing.expectError(error.BufferTooSmall, parse("A.B", &tiny));
@@ -400,4 +400,16 @@ test "fuzz driver: ENIP_FUZZ (fuzzParse)" {
 
 test "fuzz harness: fuzzParse, 400 seeds, reaches every outcome" {
     try fuzzParseMark.reach(fuzzParse, "enip-tagpath-parse", 400);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

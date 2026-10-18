@@ -170,7 +170,7 @@ const calls = [_]struct { name: []const u8, call: *const fn () void }{
 const lengths = [_]usize{ 16, 100, 200, 1024, 4096 };
 
 test "STACKPROBE (review 2026-10-08): no key residue on the dead stack after the AEAD and the stream cipher" {
-    if (builtin.mode == .Debug or builtin.mode == .ReleaseSafe) return error.SkipZigTest;
+    if (builtin.mode == .debug or builtin.mode == .safe) return error.SkipZigTest;
     defer cp.force_wide = false;
 
     var poly: [32]u8 = @splat(0);

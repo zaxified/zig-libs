@@ -222,8 +222,8 @@ const compat = @import("test_shim.zig");
 test "ExportedSessionKey encode/decode round-trip" {
     var key = ExportedSessionKey{
         .ratchet_index = 0x01020304,
-        .ratchet = [_]u8{0x77} ** ratchet_mod.ratchet_len,
-        .signing_key = [_]u8{0x33} ** pubkey_len,
+        .ratchet = @as([ratchet_mod.ratchet_len]u8, @splat(0x77)),
+        .signing_key = @as([pubkey_len]u8, @splat(0x33)),
     };
     const raw = compat.encodeExported(&key);
     try testing.expectEqual(@as(usize, export_len), raw.len);
@@ -236,8 +236,8 @@ test "ExportedSessionKey encode/decode round-trip" {
 }
 
 test "ExportedSessionKey rejects wrong length and wrong version" {
-    try testing.expectError(error.WrongLength, compat.decodeExported(&[_]u8{0} ** (export_len - 1)));
-    var bad_version = [_]u8{0} ** export_len;
+    try testing.expectError(error.WrongLength, compat.decodeExported(&@as([export_len - 1]u8, @splat(0))));
+    var bad_version = @as([export_len]u8, @splat(0));
     bad_version[0] = share_version; // 0x02 instead of 0x01
     try testing.expectError(error.UnsupportedVersion, compat.decodeExported(&bad_version));
 }
@@ -250,7 +250,7 @@ test "SessionKey signs itself and self-verifies on decode" {
 
     var inner = ExportedSessionKey{
         .ratchet_index = 0,
-        .ratchet = [_]u8{0x11} ** ratchet_mod.ratchet_len,
+        .ratchet = @as([ratchet_mod.ratchet_len]u8, @splat(0x11)),
         .signing_key = kp.public_key.toBytes(),
     };
     var signed_part: [signed_part_len]u8 = undefined;
@@ -273,7 +273,7 @@ test "SessionKey rejects a tampered signature" {
 
     var inner = ExportedSessionKey{
         .ratchet_index = 0,
-        .ratchet = [_]u8{0x22} ** ratchet_mod.ratchet_len,
+        .ratchet = @as([ratchet_mod.ratchet_len]u8, @splat(0x22)),
         .signing_key = kp.public_key.toBytes(),
     };
     var signed_part: [signed_part_len]u8 = undefined;
@@ -295,7 +295,7 @@ test "SessionKey rejects a signature that doesn't match the embedded ratchet (ta
 
     var inner = ExportedSessionKey{
         .ratchet_index = 0,
-        .ratchet = [_]u8{0x22} ** ratchet_mod.ratchet_len,
+        .ratchet = @as([ratchet_mod.ratchet_len]u8, @splat(0x22)),
         .signing_key = kp.public_key.toBytes(),
     };
     var signed_part: [signed_part_len]u8 = undefined;
@@ -372,7 +372,7 @@ const SessionKeyCorpus = struct {
         const kp = Ed25519.KeyPair.generate(io);
         var inner = ExportedSessionKey{
             .ratchet_index = 0x01020304,
-            .ratchet = [_]u8{0x77} ** ratchet_mod.ratchet_len,
+            .ratchet = @as([ratchet_mod.ratchet_len]u8, @splat(0x77)),
             .signing_key = kp.public_key.toBytes(),
         };
         const exported = compat.encodeExported(&inner);
@@ -417,8 +417,8 @@ test "corpus: the session-key seeds drive the length sweep, and the counts are p
     var threaded = testIo();
     defer threaded.deinit();
     var corpus: SessionKeyCorpus = .{};
-    var lengths = [_]usize{0} ** 4;
-    var versions = [_]usize{0} ** 3;
+    var lengths = @as([4]usize, @splat(0));
+    var versions = @as([3]usize, @splat(0));
     var b64_corrupted: usize = 0;
     var exports: usize = 0;
     var shares: usize = 0;
@@ -442,7 +442,7 @@ test "corpus: the session-key seeds drive the length sweep, and the counts are p
         len_total += len;
         if (len > 0) {
             const which = smith.value(enum { share, exp, any });
-            versions[@intFromEnum(which)] += 1;
+            versions[@backingInt(which)] += 1;
             buf[0] = switch (which) {
                 .share => share_version,
                 .exp => export_version,

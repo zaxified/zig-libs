@@ -466,10 +466,10 @@ test "InventoryList: exactly MAX_INV_ENTRIES decodes; one more is refused even w
 const inventory_seeds = [_][]const u8{
     seed(&dissected_inv_payload), // the two-entry inv Wireshark read for us
     seedHex("00"), // count 0: the empty list, byte-exact from the round-trip test
-    seedHex("01" ++ "01000000" ++ "42" ** 32), // one MSG_TX entry
+    seedHex("01" ++ "01000000" ++ strRepeat("42", 32)), // one MSG_TX entry
     seedHex("fd51c3"), // TooManyItems: 50001, one over MAX_INV_ENTRIES
     seedHex("fde803"), // TooManyItems: 1000 under the cap, no octets behind it
-    seedHex("01" ++ "01000000" ++ "42" ** 31), // TooManyItems: one octet short of a single entry
+    seedHex("01" ++ "01000000" ++ strRepeat("42", 31)), // TooManyItems: one octet short of a single entry
     seedHex("fd"), // a CompactSize prefix with no octets behind it
 };
 
@@ -543,10 +543,10 @@ test "corpus: every inventory seed reaches the decoder, and the accepted count i
 /// draw: a locator is only well-formed if 32 octets remain AFTER the hash list
 /// the count announced, so the accepted seeds have to be built to that rule.
 const locator_seeds = [_][]const u8{
-    seedHex("7f110100" ++ "00" ++ "00" ** 32), // protocol 70015, no locator hashes, zero hash_stop
-    seedHex("7f110100" ++ "02" ++ "11" ** 32 ++ "22" ** 32 ++ "00" ** 32), // the round-trip test's two hashes
+    seedHex("7f110100" ++ "00" ++ strRepeat("00", 32)), // protocol 70015, no locator hashes, zero hash_stop
+    seedHex("7f110100" ++ "02" ++ strRepeat("11", 32) ++ strRepeat("22", 32) ++ strRepeat("00", 32)), // the round-trip test's two hashes
     seedHex("01000000" ++ "fdf401"), // TooManyItems: 500 hashes claimed, none follow
-    seedHex("7f110100" ++ "00" ++ "00" ** 31), // Truncated: hash_stop one octet short
+    seedHex("7f110100" ++ "00" ++ strRepeat("00", 31)), // Truncated: hash_stop one octet short
     seedHex("7f1101"), // Truncated: not even the version field
 };
 
@@ -609,12 +609,12 @@ test "corpus: every locator seed reaches the decoder, and the accepted count is 
 /// Each entry is an 80-octet header plus its own CompactSize `txn_count`, so
 /// nothing shorter than 82 octets can produce even one entry.
 const headers_seeds = [_][]const u8{
-    seedHex("01" ++ "00" ** 80 ++ "00"), // one header, txn_count 0 -- what a real `headers` carries
-    seedHex("02" ++ "00" ** 80 ++ "00" ++ "ff" ** 80 ++ "00"), // two entries
+    seedHex("01" ++ strRepeat("00", 80) ++ "00"), // one header, txn_count 0 -- what a real `headers` carries
+    seedHex("02" ++ strRepeat("00", 80) ++ "00" ++ strRepeat("ff", 80) ++ "00"), // two entries
     seedHex("00"), // count 0: an empty headers message
     seedHex("fe40420f00"), // TooManyItems: the hostile test's 1000000 count
-    seedHex("01" ++ "00" ** 80), // Truncated: a header with its txn_count missing
-    seedHex("01" ++ "00" ** 79), // TooManyItems: one octet short of a single entry
+    seedHex("01" ++ strRepeat("00", 80)), // Truncated: a header with its txn_count missing
+    seedHex("01" ++ strRepeat("00", 79)), // TooManyItems: one octet short of a single entry
 };
 
 const HeadersMark = fz.Marker(enum { ok, refused });
@@ -700,4 +700,16 @@ test "external anchor: the inventory type numbers are the protocol's, not ours" 
     try testing.expectEqual(INV_MSG_WITNESS_TX, INV_MSG_TX | witness_flag);
     try testing.expectEqual(INV_MSG_WITNESS_BLOCK, INV_MSG_BLOCK | witness_flag);
     try testing.expectEqual(INV_MSG_FILTERED_WITNESS_BLOCK, INV_MSG_FILTERED_BLOCK | witness_flag);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

@@ -897,7 +897,7 @@ test "TokenBucket: replays captured x/time/rate AllowN/ReserveN/CancelAt/SetLimi
     // recording `last_event_ns`; (c) `advanceAt` capping only when time
     // moved (a lowered burst then leaves the balance above it).
     const tokens_tolerance = 1e-9;
-    var reach = [_]usize{0} ** 6; // allow-deny, reserve-future, cancel-restored, cancel-noop, set_limit, set_burst
+    var reach = @as([6]usize, @splat(0)); // allow-deny, reserve-future, cancel-restored, cancel-noop, set_limit, set_burst
     for (xrate_ops.cases) |c| {
         var cfg: TokenBucket.Config = .{ .rate_per_s = c.rate_per_s, .burst = c.burst };
         var b: TokenBucket = .full(cfg, 0);

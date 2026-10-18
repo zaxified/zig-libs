@@ -156,7 +156,7 @@ fn z2Gamma() [32]u8 {
 }
 
 test "STACKPROBE (A1 B12): no witness or blinding secret on the dead stack after prove()" {
-    if (builtin.mode == .Debug or builtin.mode == .ReleaseSafe) return error.SkipZigTest;
+    if (builtin.mode == .debug or builtin.mode == .safe) return error.SkipZigTest;
     const gpa = std.testing.allocator;
 
     gens = try bp.Generators.init(gpa, 64);

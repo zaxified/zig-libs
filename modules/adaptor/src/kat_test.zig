@@ -311,7 +311,7 @@ test "property: adapt REJECTS an all-zero adaptor secret" {
         .s_prime = hexN(32, vec.s_prime),
         .needs_negation = vec.needs_negation,
     };
-    try std.testing.expectError(error.InvalidAdaptorSecret, adaptor.adapt(presig, &([_]u8{0} ** 32)));
+    try std.testing.expectError(error.InvalidAdaptorSecret, adaptor.adapt(presig, &(@as([32]u8, @splat(0)))));
 }
 
 // ── malleability: preVerify must REJECT non-canonical s_prime, not reduce it ─
@@ -343,7 +343,7 @@ test "property: preVerify REJECTS a non-canonical (>= n) re-encoding of an other
     challenge_hasher.update(&r_bytes);
     challenge_hasher.update(&px.x);
     challenge_hasher.update(msg);
-    var wide = [_]u8{0} ** 48;
+    var wide = @as([48]u8, @splat(0));
     wide[16..48].* = challenge_hasher.finalResult();
     const e = Scalar.fromBytes48(wide, .big);
 

@@ -14,7 +14,7 @@ const vectors = @import("setcookie_vectors.zig");
 
 test "setcookie oracle: write produces what Chrome stores as meant, refuses the rest" {
     var bad: usize = 0;
-    var seen = [_]usize{0} ** vectors.classes.len;
+    var seen = @as([vectors.classes.len]usize, @splat(0));
     for (vectors.cases, 0..) |c, i| {
         var buf: [8192]u8 = undefined;
         if (c.sc.bufPrint(&buf)) |line| {

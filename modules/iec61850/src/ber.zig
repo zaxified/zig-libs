@@ -141,7 +141,7 @@ pub const Tag = struct {
 pub fn decodeTag(bytes: []const u8) Error!struct { tag: Tag, len: usize } {
     if (bytes.len < 1) return error.Truncated;
     const first = bytes[0];
-    const class: Class = @enumFromInt(@as(u2, @truncate(first >> 6)));
+    const class: Class = @fromBackingInt(@intCast(@as(u2, @truncate(first >> 6))));
     const constructed = (first & 0x20) != 0;
     const low: u32 = first & 0x1F;
     if (low != 0x1F) {
@@ -170,7 +170,7 @@ pub fn decodeTag(bytes: []const u8) Error!struct { tag: Tag, len: usize } {
 }
 
 pub fn encodeTag(tag: Tag, out: []u8) Error!usize {
-    const first: u8 = (@as(u8, @intFromEnum(tag.class)) << 6) | (if (tag.constructed) @as(u8, 0x20) else 0);
+    const first: u8 = (@as(u8, @backingInt(tag.class)) << 6) | (if (tag.constructed) @as(u8, 0x20) else 0);
     if (tag.number < 31) {
         if (out.len < 1) return error.BufferTooSmall;
         out[0] = first | @as(u8, @intCast(tag.number));
@@ -959,7 +959,7 @@ test "the writer emits the long-form length when it must" {
     var buf: [512]u8 = undefined;
     var w = Writer.init(&buf);
     const m = w.mark();
-    try w.bytes(&[_]u8{0xAA} ** 200);
+    try w.bytes(&@as([200]u8, @splat(0xAA)));
     try w.header(Tag.ctxc(2), m);
     const out = w.done();
     try testing.expectEqualSlices(u8, &[_]u8{ 0xA2, 0x81, 0xC8 }, out[0..3]);
@@ -977,7 +977,7 @@ test "the writer emits the long-form tag when it must" {
 test "the writer refuses to overflow its buffer" {
     var buf: [4]u8 = undefined;
     var w = Writer.init(&buf);
-    try testing.expectError(error.BufferTooSmall, w.bytes(&[_]u8{0} ** 5));
+    try testing.expectError(error.BufferTooSmall, w.bytes(&@as([5]u8, @splat(0))));
     var w2 = Writer.init(&buf);
     try w2.bytes(&[_]u8{ 1, 2, 3, 4 });
     try testing.expectError(error.BufferTooSmall, w2.byte(5));
@@ -1018,7 +1018,7 @@ const decode_seeds = [_][]const u8{
     seed("BF4800"), // the long-form tag, context 72
     seed("A103020107"), // a context-1 constructed element
     seed("020105"), // a bare INTEGER
-    seed("A281C8" ++ ("AA" ** 200)), // the long-form length the writer emits at 200 octets
+    seed("A281C8" ++ (strRepeat("AA", 200))), // the long-form length the writer emits at 200 octets
     seed("048103616263"), // a NON-MINIMAL long-form length: legal BER, 81 03 for 3
     seed("30100102"), // Overrun: a definite length past the buffer
     seed("0482FFFF00"), // Overrun: 65535 declared over five octets
@@ -1231,7 +1231,7 @@ fn fuzzTagLength(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!voi
     var word: [8]u8 = @splat(0);
     @memcpy(word[0..@min(word.len, in.len)], in[0..@min(word.len, in.len)]);
     const t = Tag{
-        .class = @enumFromInt(@as(u2, @truncate(word[0] >> 6))),
+        .class = @fromBackingInt(@intCast(@as(u2, @truncate(word[0] >> 6)))),
         .constructed = (word[0] & 0x20) != 0,
         .number = std.mem.readInt(u32, word[0..4], .little),
     };
@@ -1305,4 +1305,16 @@ test "corpus: every seed reaches its decoder, and the accepted counts are pinned
     try testing.expectEqual(taglength_seeds.len - 1, tl_nonempty);
     try testing.expectEqual(@as(usize, 10), tags);
     try testing.expectEqual(@as(usize, 6), lengths);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

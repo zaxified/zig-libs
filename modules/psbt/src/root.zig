@@ -733,7 +733,7 @@ test "hostile: vallen exceeding remaining bytes fails closed, no panic" {
     try buf.append(testing.allocator, 0x01); // keylen=1
     try buf.append(testing.allocator, 0x00); // key = UNSIGNED_TX (type only)
     try buf.append(testing.allocator, 0xff); // vallen = 9-byte CompactSize form...
-    try buf.appendSlice(testing.allocator, &([_]u8{0xff} ** 8)); // ...claiming ~2^64 bytes
+    try buf.appendSlice(testing.allocator, &(@as([8]u8, @splat(0xff)))); // ...claiming ~2^64 bytes
     try testing.expectError(error.Truncated, parse(testing.allocator, buf.items));
 }
 
@@ -805,7 +805,7 @@ const psbt_seeds = [_][]const u8{
     seed("0300" ++ "00" ++ "01" ++ "FF" ++ "20" ++ "AA"), // 3 in, 0 out, finalized with a 32-octet script
     seed("0102" ++ "02" ++ "00" ++ "FFFF" ++ "41" ++ "00" ++ "50"), // raw keytypes and a 65-octet keydata
     seed("0201" ++ "03" ++ "01" ++ "00" ++ "01" ++ "01" ++ "04"), // BIP32-shaped 16-octet values
-    seed("AA55" ** 24), // a repeating pattern the Cursor cycles over every branch
+    seed(strRepeat("AA55", 24)), // a repeating pattern the Cursor cycles over every branch
 };
 
 const fz = @import("fuzz_test.zig");
@@ -1229,7 +1229,7 @@ test "hostile: WITNESS_UTXO script length claiming ~2^64 bytes is rejected, not 
     std.mem.writeInt(i64, &amt, 1000, .little);
     try buf.appendSlice(testing.allocator, &amt);
     try buf.append(testing.allocator, 0xff); // CompactSize 9-byte form
-    try buf.appendSlice(testing.allocator, &([_]u8{0xff} ** 8)); // declares len = 2^64-1
+    try buf.appendSlice(testing.allocator, &(@as([8]u8, @splat(0xff)))); // declares len = 2^64-1
     try testing.expectError(error.Truncated, decodeWitnessUtxoValue(buf.items));
 }
 
@@ -1250,7 +1250,7 @@ test "hostile: PSBT_GLOBAL_VERSION value length != 4 is rejected before its cont
 }
 
 test "hostile: BIP32_DERIVATION value whose length isn't 4 + 4k is rejected (A1 F8, isolates requireBip32ValueShape)" {
-    const pubkey = [_]u8{0x02} ++ [_]u8{0xaa} ** 32;
+    const pubkey = [_]u8{0x02} ++ @as([32]u8, @splat(0xaa));
     var recs = [_]Record{
         // Fingerprint (4B) + one path element (4B) + 2 stray bytes = 10, not 4+4k.
         .{ .keytype = input_key.BIP32_DERIVATION, .keydata = &pubkey, .value = &.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 } },
@@ -1262,15 +1262,15 @@ test "hostile: BIP32_DERIVATION value whose length isn't 4 + 4k is rejected (A1 
 // ── mutation run 2026-10-05: edges the tests above left unpinned ─────────
 
 test "WITNESS_UTXO: 7 octets is Truncated; a script followed by stray octets is TrailingBytes" {
-    try testing.expectError(error.Truncated, decodeWitnessUtxoValue(&([_]u8{0} ** 7)));
-    const ok = [_]u8{0} ** 8 ++ [_]u8{ 0x01, 0x51 };
+    try testing.expectError(error.Truncated, decodeWitnessUtxoValue(&(@as([7]u8, @splat(0)))));
+    const ok = @as([8]u8, @splat(0)) ++ [_]u8{ 0x01, 0x51 };
     try testing.expectEqual(@as(usize, 1), (try decodeWitnessUtxoValue(&ok)).script_pubkey.len);
     try testing.expectError(error.TrailingBytes, decodeWitnessUtxoValue(&(ok ++ [_]u8{0x00})));
 }
 
 test "PARTIAL_SIG keydata: 33 and 65 octets accepted, 64 refused; SIGHASH_TYPE of 5 octets refused" {
     const sig = [_]u8{0x30};
-    const key = [_]u8{0x04} ** 65;
+    const key = @as([65]u8, @splat(0x04));
     for ([_]usize{ 33, 65 }) |n| {
         var recs = [_]Record{.{ .keytype = input_key.PARTIAL_SIG, .keydata = key[0..n], .value = &sig }};
         try validateInputMap(.{ .records = &recs });
@@ -1282,6 +1282,18 @@ test "PARTIAL_SIG keydata: 33 and 65 octets accepted, 64 refused; SIGHASH_TYPE o
 }
 
 test "global XPUB: a value that is not fingerprint + 4k octets is refused" {
-    var recs = [_]Record{.{ .keytype = global_key.XPUB, .keydata = &([_]u8{0} ** 78), .value = &([_]u8{0} ** 10) }};
+    var recs = [_]Record{.{ .keytype = global_key.XPUB, .keydata = &(@as([78]u8, @splat(0))), .value = &(@as([10]u8, @splat(0))) }};
     try testing.expectError(error.InvalidFixedFieldLength, validateGlobalMap(.{ .records = &recs }));
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

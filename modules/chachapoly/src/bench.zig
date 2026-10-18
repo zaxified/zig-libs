@@ -54,9 +54,9 @@ test "bench (opt-in via CHACHAPOLY_BENCH)" {
     var prng = std.Random.DefaultPrng.init(0xC1A0_5EED);
     prng.random().bytes(&buf);
 
-    const key = [_]u8{0x42} ** 32;
-    const nonce = [_]u8{0x24} ** 12;
-    const otk = [_]u8{0x17} ** 32;
+    const key = @as([32]u8, @splat(0x42));
+    const nonce = @as([12]u8, @splat(0x24));
+    const otk = @as([32]u8, @splat(0x17));
 
     std.debug.print(
         \\

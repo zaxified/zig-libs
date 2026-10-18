@@ -104,7 +104,7 @@ test "NewSessionTicket12: RFC 5077 shape byte-exact" {
 }
 
 test "NewSessionTicket12: max-size ticket round trip" {
-    const big = [_]u8{0x5a} ** 65535;
+    const big = @as([65535]u8, @splat(0x5a));
     var buf: [65535 + 6]u8 = undefined;
     const wire = try (NewSessionTicket12{ .lifetime_hint_s = 1, .ticket = &big }).encode(&buf);
     const back = try NewSessionTicket12.decode(wire);
@@ -114,7 +114,7 @@ test "NewSessionTicket12: max-size ticket round trip" {
 test "NewSessionTicket12: encode errors" {
     var small: [8]u8 = undefined;
     try testing.expectError(error.BufferTooSmall, (NewSessionTicket12{ .lifetime_hint_s = 0, .ticket = "abc" }).encode(&small));
-    const huge = [_]u8{0} ** 65536;
+    const huge = @as([65536]u8, @splat(0));
     var big: [65536 + 6]u8 = undefined;
     try testing.expectError(error.BufferTooSmall, (NewSessionTicket12{ .lifetime_hint_s = 0, .ticket = &huge }).encode(&big));
 }
@@ -146,9 +146,9 @@ test "classifyClientExtension and extension_type" {
 test "ticket bytes are a StekRing blob (seal -> frame -> decode -> open)" {
     const stek = @import("stek.zig");
     var ring = stek.DefaultRing.init();
-    ring.rotate(3, &([_]u8{0x42} ** stek.key_length), 0);
+    ring.rotate(3, &(@as([stek.key_length]u8, @splat(0x42))), 0);
     var blob: [64]u8 = undefined;
-    const sealed = try ring.seal("tls12 session state", [_]u8{1} ** stek.nonce_length, &blob);
+    const sealed = try ring.seal("tls12 session state", @as([stek.nonce_length]u8, @splat(1)), &blob);
     var wire: [80]u8 = undefined;
     const msg = try (NewSessionTicket12{ .lifetime_hint_s = 600, .ticket = sealed }).encode(&wire);
     const dec = try NewSessionTicket12.decode(msg);

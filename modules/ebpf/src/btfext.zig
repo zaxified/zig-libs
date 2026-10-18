@@ -136,7 +136,7 @@ pub const CoreRelo = extern struct {
     kind: u32,
 
     pub fn reloKind(self: CoreRelo) ReloKind {
-        return @enumFromInt(self.kind);
+        return @fromBackingInt(@intCast(self.kind));
     }
 };
 
@@ -826,7 +826,7 @@ test "wire layout: the .BTF.ext record structs" {
     try testing.expect(!ReloKind.enumval_value.isField());
     // A kind this build has never heard of must not be an invalid enum.
     const future: CoreRelo = .{ .insn_off = 0, .type_id = 1, .access_str_off = 1, .kind = 999 };
-    try testing.expectEqual(@as(u32, 999), @intFromEnum(future.reloKind()));
+    try testing.expectEqual(@as(u32, 999), @backingInt(future.reloKind()));
     try testing.expect(!future.reloKind().isField());
 }
 
@@ -1208,7 +1208,7 @@ test "hostile .BTF.ext: every malformation is a typed error" {
 
     try testing.expectError(error.NotBtfExt, parseExt(&.{ 1, 2 }));
     {
-        var b = [_]u8{0} ** 64;
+        var b = @as([64]u8, @splat(0));
         std.mem.writeInt(u16, b[0..2], 0x1234, native_endian);
         try testing.expectError(error.NotBtfExt, parseExt(&b));
         std.mem.writeInt(u16, b[0..2], @byteSwap(magic), native_endian);
@@ -1481,7 +1481,7 @@ test "CO-RE: a spec relocated against ITSELF reproduces the compiler's layout" {
 
     // A relo kind outside FIELD_* is refused before any work happens.
     {
-        const bad: CoreRelo = .{ .insn_off = 0, .type_id = 2, .access_str_off = s.coreRelo(0).access_str_off, .kind = @intFromEnum(ReloKind.type_size) };
+        const bad: CoreRelo = .{ .insn_off = 0, .type_id = 2, .access_str_off = s.coreRelo(0).access_str_off, .kind = @backingInt(ReloKind.type_size) };
         try testing.expectError(error.UnsupportedReloKind, computeFieldRelo(&local, &local, bad));
     }
     // An access string that names a member index the local type does not

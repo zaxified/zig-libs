@@ -241,7 +241,7 @@ fn drawOp(r: *Rng, op: Op, arg: u64, buf: []u8) u128 {
         .range64 => r.valueRangeAtMost(u64, arg, std.math.maxInt(u64)),
         .range128 => r.valueRangeAtMost(u128, 0, @as(u128, arg) << 64 | arg),
         .boolean => @intFromBool(r.value(bool)),
-        .enumv => @intFromEnum(r.value(E)),
+        .enumv => @backingInt(r.value(E)),
         .int16 => r.value(u16),
         .int128 => r.value(u128),
         .index => r.index(@intCast(arg % 1000 + 1)),
@@ -277,7 +277,7 @@ pub fn fuzzTape(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void
     var b1: [200]u8 = undefined;
     var b2: [200]u8 = undefined;
     for (prog[0..n], args, 0..) |o, arg, i| {
-        const op: Op = @enumFromInt(o % @typeInfo(Op).@"enum".fields.len);
+        const op: Op = @fromBackingInt(@intCast(o % @typeInfo(Op).@"enum".field_names.len));
         seen[i] = drawOp(&a, op, arg, &b1);
         try testing.expectEqual(drawOp(&plain, op, arg, &b2), seen[i]);
     }
@@ -288,7 +288,7 @@ pub fn fuzzTape(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void
     var p3 = std.Random.DefaultPrng.init(~seed);
     var r: Rng = .{ .r = p3.random(), .tape = &rep };
     for (prog[0..n], args, 0..) |o, arg, i| {
-        const op: Op = @enumFromInt(o % @typeInfo(Op).@"enum".fields.len);
+        const op: Op = @fromBackingInt(@intCast(o % @typeInfo(Op).@"enum".field_names.len));
         try testing.expectEqual(seen[i], drawOp(&r, op, arg, &b1));
     }
     try testing.expectEqual(rec.len, rep.at);

@@ -1203,7 +1203,7 @@ test "TTL expiry: after the recorded response expires, the handler re-runs" {
 }
 
 test "encode/decode round-trips digest, status, content-type and body" {
-    const d1: [digest_len]u8 = [_]u8{0xAB} ** digest_len;
+    const d1: [digest_len]u8 = @as([digest_len]u8, @splat(0xAB));
     const blob = try encode(testing.allocator, d1, 201, "application/json", "{\"ok\":true}");
     defer testing.allocator.free(blob);
     const rec = decode(blob).?;
@@ -1214,7 +1214,7 @@ test "encode/decode round-trips digest, status, content-type and body" {
 
     // Empty content-type is valid; an all-zero digest is a valid bit pattern
     // too (just not one SHA-256 is expected to ever actually produce).
-    const d2: [digest_len]u8 = [_]u8{0} ** digest_len;
+    const d2: [digest_len]u8 = @as([digest_len]u8, @splat(0));
     const blob2 = try encode(testing.allocator, d2, 204, "", "");
     defer testing.allocator.free(blob2);
     const rec2 = decode(blob2).?;

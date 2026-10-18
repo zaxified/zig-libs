@@ -75,7 +75,7 @@ test "schema oracle: every rule set exports the schema the validators judged" {
 
 test "schema oracle: validateJson answers what the schema validators answer" {
     var bad: usize = 0;
-    var seen = [_]usize{0} ** vectors.classes.len;
+    var seen = @as([vectors.classes.len]usize, @splat(0));
     for (vectors.cases) |c| {
         const rules = vectors.sets[c.set].rules;
         var tree = try validate.validateJson(testing.allocator, c.doc, rules);

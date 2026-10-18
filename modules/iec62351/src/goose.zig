@@ -991,7 +991,7 @@ fn buildSample(out: []u8, algorithm: MacAlgorithm, key: []const u8) ![]u8 {
 
 test "build/verify round-trip for every modelled MAC algorithm" {
     var out: [512]u8 = undefined;
-    const gmac_key = [_]u8{0x2a} ** 16;
+    const gmac_key = @as([16]u8, @splat(0x2a));
     for ([_]MacAlgorithm{
         .hmac_sha256_80, .hmac_sha256_128, .hmac_sha256_256, .aes_gmac_64, .aes_gmac_128,
     }) |alg| {
@@ -1106,7 +1106,7 @@ test "negative: Ethernet padding is excluded from the covered range" {
 test "negative: wrong key fails" {
     var out: [512]u8 = undefined;
     const frame_bytes = try buildSample(&out, .hmac_sha256_80, &sample_key);
-    const other = [_]u8{0x0c} ** 20;
+    const other = @as([20]u8, @splat(0x0c));
     try testing.expectError(error.AuthenticationFailed, verify(
         frame_bytes,
         .ed2020,
@@ -1125,7 +1125,7 @@ test "negative: the same bytes read under the wrong algorithm fail" {
     try testing.expectError(error.AuthenticationFailed, verify(
         frame_bytes,
         .ed2020,
-        .{ .mac = .{ .algorithm = .aes_gmac_128, .key = &[_]u8{0x2a} ** 16 } },
+        .{ .mac = .{ .algorithm = .aes_gmac_128, .key = &@as([16]u8, @splat(0x2a)) } },
     ));
 }
 
@@ -1265,12 +1265,12 @@ test "IV presence must match the algorithm in both directions" {
         .appid = 1,
         .apdu = &sample_apdu,
         .auth = .{ .key_id = 1, .tag = &.{} },
-    }, .{ .mac = .{ .algorithm = .aes_gmac_128, .key = &[_]u8{0x2a} ** 16 } }));
+    }, .{ .mac = .{ .algorithm = .aes_gmac_128, .key = &@as([16]u8, @splat(0x2a)) } }));
     // HMAC with one.
     try testing.expectError(error.IvMismatch, build(&out, .{
         .appid = 1,
         .apdu = &sample_apdu,
-        .auth = .{ .key_id = 1, .iv = [_]u8{0} ** 12, .tag = &.{} },
+        .auth = .{ .key_id = 1, .iv = @as([12]u8, @splat(0)), .tag = &.{} },
     }, .{ .mac = .{ .algorithm = .hmac_sha256_128, .key = &sample_key } }));
 }
 
@@ -1285,7 +1285,7 @@ test "GMAC IV: no (key, IV) pair is ever emitted twice, across publishers of one
     // out of each built frame via `verify`, because that is the value an
     // attacker sees.
     var out: [512]u8 = undefined;
-    const group_key = [_]u8{0x2a} ** 16; // ONE key, shared by the segment
+    const group_key = @as([16]u8, @splat(0x2a)); // ONE key, shared by the segment
     var seen = std.AutoHashMap([12]u8, void).init(testing.allocator);
     defer seen.deinit();
 
@@ -1324,10 +1324,10 @@ test "positive control: a fixed IV repeats, which is what the counter prevents" 
             .appid = 0x3001,
             .apdu = &sample_apdu,
             .auth = .{ .key_id = 7, .tag = &.{} },
-            .iv_source = .{ .asserted_unique = [_]u8{0x11} ** 12 },
-        }, .{ .mac = .{ .algorithm = .aes_gmac_128, .key = &[_]u8{0x2a} ** 16 } });
+            .iv_source = .{ .asserted_unique = @as([12]u8, @splat(0x11)) },
+        }, .{ .mac = .{ .algorithm = .aes_gmac_128, .key = &@as([16]u8, @splat(0x2a)) } });
         const r = try verify(frame, .ed2020, .{
-            .mac = .{ .algorithm = .aes_gmac_128, .key = &[_]u8{0x2a} ** 16 },
+            .mac = .{ .algorithm = .aes_gmac_128, .key = &@as([16]u8, @splat(0x2a)) },
         });
         slot.* = r.iv.?;
     }
@@ -1336,7 +1336,7 @@ test "positive control: a fixed IV repeats, which is what the counter prevents" 
 
 test "GMAC IV: build refuses every way of not having a unique-IV source" {
     var out: [512]u8 = undefined;
-    const gmac: Sealer = .{ .mac = .{ .algorithm = .aes_gmac_128, .key = &[_]u8{0x2a} ** 16 } };
+    const gmac: Sealer = .{ .mac = .{ .algorithm = .aes_gmac_128, .key = &@as([16]u8, @splat(0x2a)) } };
     // (a) No source at all.
     try testing.expectError(error.IvMismatch, build(&out, .{
         .appid = 1,
@@ -1348,7 +1348,7 @@ test "GMAC IV: build refuses every way of not having a unique-IV source" {
     try testing.expectError(error.IvMismatch, build(&out, .{
         .appid = 1,
         .apdu = &sample_apdu,
-        .auth = .{ .key_id = 1, .iv = [_]u8{0x11} ** 12, .tag = &.{} },
+        .auth = .{ .key_id = 1, .iv = @as([12]u8, @splat(0x11)), .tag = &.{} },
     }, gmac));
     // (c) A source for a profile that takes none — and the counter must not be
     // drawn down by a call that fails.
@@ -1376,8 +1376,8 @@ test "GMAC IV: the counter refuses at SP 800-38D's per-key invocation cap" {
 
 test "AuthenticationValue: encode/parse round-trip with and without an IV" {
     var out: [128]u8 = undefined;
-    const tag = [_]u8{0xa5} ** 16;
-    for ([_]?[12]u8{ null, [_]u8{0x33} ** 12 }) |iv| {
+    const tag = @as([16]u8, @splat(0xa5));
+    for ([_]?[12]u8{ null, @as([12]u8, @splat(0x33)) }) |iv| {
         const v: AuthenticationValue = .{
             .version = 1,
             .time_of_current_key = 0x1234_5678,
@@ -1399,7 +1399,7 @@ test "AuthenticationValue: encode/parse round-trip with and without an IV" {
 
 test "AuthenticationValue: parse rejects trailing bytes and empty tags" {
     var out: [128]u8 = undefined;
-    const tag = [_]u8{0xa5} ** 16;
+    const tag = @as([16]u8, @splat(0xa5));
     const enc = try (AuthenticationValue{ .key_id = 1, .tag = &tag }).encode(&out);
     var longer: [128]u8 = undefined;
     @memcpy(longer[0..enc.len], enc);
@@ -1413,7 +1413,7 @@ test "AuthenticationValue: parse rejects trailing bytes and empty tags" {
 
 test "AuthenticationValue: an over-long tag is refused by the parse bound" {
     var out: [128]u8 = undefined;
-    const tag = [_]u8{0xa5} ** 40;
+    const tag = @as([40]u8, @splat(0xa5));
     const enc = try (AuthenticationValue{ .key_id = 1, .tag = &tag }).encode(&out);
     try testing.expectError(error.TagTooLong, AuthenticationValue.parse(enc, false, max_mac_len));
 }
@@ -1442,7 +1442,7 @@ test "RSASSA-PSS/SHA-256 signature profile round-trips and rejects tampering" {
 }
 
 test "ECDSA P-256/SHA-256 signature profile round-trips and rejects tampering" {
-    const seed = [_]u8{0x17} ** EcdsaP256.KeyPair.seed_length;
+    const seed = @as([EcdsaP256.KeyPair.seed_length]u8, @splat(0x17));
     var kp: EcdsaP256.KeyPair = undefined;
     EcdsaP256.KeyPair.generateDeterministicInto(&kp, &seed) catch unreachable;
     defer std.crypto.secureZero(u8, std.mem.asBytes(&kp));
@@ -1452,7 +1452,7 @@ test "ECDSA P-256/SHA-256 signature profile round-trips and rejects tampering" {
         .appid = 0x3003,
         .apdu = &sample_apdu,
         .auth = .{ .key_id = 9, .tag = &.{} },
-    }, .{ .ecdsa_p256_sha256 = .{ .key_pair = &kp, .noise = [_]u8{0x5c} ** EcdsaP256.noise_length } });
+    }, .{ .ecdsa_p256_sha256 = .{ .key_pair = &kp, .noise = @as([EcdsaP256.noise_length]u8, @splat(0x5c)) } });
 
     const r = try verify(frame_bytes, .ed2020, .{ .ecdsa_p256_sha256 = kp.public_key });
     try testing.expectEqual(@as(usize, 64), r.tag.len);
@@ -1563,7 +1563,7 @@ test "F6: build's tag scratch buffer is sized per sealer, not always rsa.max_mod
     // And build() still round-trips correctly through the now-per-variant-
     // sized buffer for the smallest (MAC) case.
     var out: [128]u8 = undefined;
-    const key = [_]u8{0x2a} ** 16;
+    const key = @as([16]u8, @splat(0x2a));
     const sealer: Sealer = .{ .mac = .{ .algorithm = .hmac_sha256_80, .key = &key } };
     const frame = try build(&out, .{ .appid = 1, .apdu = "abc" }, sealer);
     const r = try verify(frame, .ed2020, .{ .mac = .{ .algorithm = .hmac_sha256_80, .key = &key } });
@@ -1637,7 +1637,7 @@ test "fuzz: extension parse never panics for arbitrary extension octets" {
     var built: [256]u8 = undefined;
     const frame = try buildSample(&built, .hmac_sha256_128, &sample_key);
     const parsed = try parse(frame, .ed2020);
-    const gmac_key = [_]u8{0x2a} ** 16;
+    const gmac_key = @as([16]u8, @splat(0x2a));
     var gmac_built: [256]u8 = undefined;
     const gmac_frame = try buildSample(&gmac_built, .aes_gmac_128, &gmac_key);
     const gmac_parsed = try parse(gmac_frame, .ed2020);

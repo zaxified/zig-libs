@@ -344,7 +344,7 @@ test "varint round-trip over a range of values including multi-byte boundaries" 
 
 test "readVarint rejects a truncated buffer and an over-long varint" {
     try testing.expectError(error.Truncated, readVarint(&.{0x80}));
-    const all_continuation = [_]u8{0x80} ** 11;
+    const all_continuation = @as([11]u8, @splat(0x80));
     try testing.expectError(error.VarintTooLong, readVarint(&all_continuation));
 }
 
@@ -353,8 +353,8 @@ fn dummyMessage(allocator: std.mem.Allocator) !Message {
     return .{
         .message_index = 42,
         .ciphertext = ciphertext,
-        .mac = [_]u8{0xAA} ** wire_mac_len,
-        .signature = [_]u8{0xBB} ** signature_len,
+        .mac = @as([wire_mac_len]u8, @splat(0xAA)),
+        .signature = @as([signature_len]u8, @splat(0xBB)),
     };
 }
 
@@ -390,18 +390,18 @@ test "Message base64 round-trip" {
 }
 
 test "decode rejects: too short, wrong version, unknown field tag" {
-    try testing.expectError(error.MessageTooShort, Message.decode(testing.allocator, &[_]u8{0x03} ** 10));
+    try testing.expectError(error.MessageTooShort, Message.decode(testing.allocator, &@as([10]u8, @splat(0x03))));
 
-    var too_short_but_versioned = [_]u8{0} ** (min_len - 1);
+    var too_short_but_versioned = @as([min_len - 1]u8, @splat(0));
     too_short_but_versioned[0] = version;
     try testing.expectError(error.MessageTooShort, Message.decode(testing.allocator, &too_short_but_versioned));
 
-    var wrong_version = [_]u8{0} ** min_len;
+    var wrong_version = @as([min_len]u8, @splat(0));
     wrong_version[0] = 0x04;
     try testing.expectError(error.UnsupportedVersion, Message.decode(testing.allocator, &wrong_version));
 
     // version + one unknown tag byte (0x20) then the fixed suffix.
-    var unknown_tag = [_]u8{0} ** (min_len + 1);
+    var unknown_tag = @as([min_len + 1]u8, @splat(0));
     unknown_tag[0] = version;
     unknown_tag[1] = 0x20;
     try testing.expectError(error.UnknownField, Message.decode(testing.allocator, &unknown_tag));
@@ -499,7 +499,7 @@ test "decode rejects a ciphertext length claiming more bytes than remain (trunca
     // version, tag 0x08, index=0 (1-byte varint), tag 0x12, length=200 (a
     // 2-byte varint claiming way more than actually remains), then the
     // fixed 72-byte suffix and nothing else: 1+1+1+1+2 header + suffix.
-    var buf = [_]u8{0} ** (1 + 1 + 1 + 1 + 2 + suffix_len);
+    var buf = @as([1 + 1 + 1 + 1 + 2 + suffix_len]u8, @splat(0));
     buf[0] = version;
     buf[1] = 0x08;
     buf[2] = 0x00;
@@ -672,7 +672,7 @@ const MessageCorpus = struct {
         t.field(1, 0x12, 1, 8); // a ciphertext field, narrow claimed length
         t.bytes("megolmct"); // ...and the 8 octets it claims
         t.stop();
-        t.bytes(&([_]u8{0} ** suffix_len)); // the 72-octet MAC + signature
+        t.bytes(&(@as([suffix_len]u8, @splat(0)))); // the 72-octet MAC + signature
         self.pushRaw("", t.slice());
 
         var u: TailWriter = .{};
@@ -685,7 +685,7 @@ const MessageCorpus = struct {
         u.field(2, 0x20, 0, 0); // tag_kind 2: an arbitrary NARROW tag
         u.field(3, 0x12_3456, 0, 0); // tag_kind 3: an arbitrary WIDE tag
         u.stop();
-        u.bytes(&([_]u8{0} ** suffix_len));
+        u.bytes(&(@as([suffix_len]u8, @splat(0))));
         self.pushRaw("", u.slice());
 
         self.push("", &.{}); // and the input this target used to run for ever

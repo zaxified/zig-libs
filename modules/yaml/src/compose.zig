@@ -117,7 +117,7 @@ const ScalarKey = union(enum) {
 const ScalarKeyContext = struct {
     pub fn hash(_: @This(), key: ScalarKey) u64 {
         var h = std.hash.Wyhash.init(0);
-        h.update(&[_]u8{@intFromEnum(key)});
+        h.update(&[_]u8{@backingInt(key)});
         switch (key) {
             .null_v => {},
             .bool_v => |x| h.update(&[_]u8{@intFromBool(x)}),
@@ -128,7 +128,7 @@ const ScalarKeyContext = struct {
         return h.final();
     }
     pub fn eql(_: @This(), a: ScalarKey, b: ScalarKey) bool {
-        if (@intFromEnum(a) != @intFromEnum(b)) return false;
+        if (@backingInt(a) != @backingInt(b)) return false;
         return switch (a) {
             .null_v => true,
             .bool_v => |x| x == b.bool_v,
@@ -1514,8 +1514,8 @@ const compose_seeds = [_][]const u8{
     seed("- 42\n- -7\n- true\n- null\n- 0x1F\n- .inf\n- .nan\n"), // the core schema's kinds
     seed("---\n---\n"), // a multi-document stream of empty documents
     seed("...\n"), // a stream with no document at all
-    seed("[" ++ "&a0 1," ** 40 ++ "*a0]\n"), // forty anchors: the indexed anchor table
-    seed("[" ** 80 ++ "]" ** 80 ++ "\n"), // deep nesting, for the depth budget
+    seed("[" ++ strRepeat("&a0 1,", 40) ++ "*a0]\n"), // forty anchors: the indexed anchor table
+    seed(strRepeat("[", 80) ++ strRepeat("]", 80) ++ "\n"), // deep nesting, for the depth budget
     seed("-?:,[]{}#&*!|>'\"%@` \tabc0129\n"), // one line of the old byte-soup alphabet
     seed(""), // the empty document
 };
@@ -1824,4 +1824,16 @@ test "corpus: the anchor/alias generator actually varies, and the counts are pin
     try testing.expectEqual(@as(usize, 19), aliases);
     try testing.expectEqual(@as(usize, 2), cycles);
     try testing.expectEqual(@as(usize, 25), entries);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

@@ -1434,7 +1434,7 @@ const encode_seeds = [_][]const u8{
     seedText("{\"k\":"), // truncated: std.json refuses before encodeArgs runs
     seedText("not json at all"), // not JSON in the first place
     seedText("{\"\":\"\"}"), // an empty name and an empty value
-    seedText("{" ++ ("\"a\":{" ** 70) ++ "1" ++ ("}" ** 70) ++ "}"), // 70 levels: the TooDeep cap
+    seedText("{" ++ (strRepeat("\"a\":{", 70)) ++ "1" ++ (strRepeat("}", 70)) ++ "}"), // 70 levels: the TooDeep cap
 };
 
 test "fuzz: encodeArgs never crashes on arbitrary JSON-shaped text" {
@@ -2122,4 +2122,16 @@ test "real capture count canary: nine frozen messages, byte lengths unchanged" {
     try testing.expectEqual(@as(usize, 56), captured_invoke_devstatus_req.len);
     try testing.expectEqual(@as(usize, 2000), captured_data_devstatus.len);
     try testing.expectEqual(@as(usize, 792), captured_data_ifstatus.len);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

@@ -679,7 +679,7 @@ test "checkMediaType: Go's verdicts on type, parameter and duplicate shapes" {
         };
     }
     // Past the parameter cap: malformed, the type kept.
-    const many = "a/b" ++ ("; p=1" ** (max_checked_params + 1));
+    const many = "a/b" ++ (strRepeat("; p=1", max_checked_params + 1));
     const got = checkMediaType(many);
     try testing.expectEqualStrings("a/b", got.media_type);
     try testing.expect(!got.clean);
@@ -697,4 +697,16 @@ test "ContentType.paramUnescaped: quoted-pairs before tspecials only, unquoted c
     // A trailing lone backslash stays.
     var v = "a\\".*;
     try std.testing.expectEqualStrings("a\\", unescapeQuoted(&v));
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

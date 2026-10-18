@@ -663,10 +663,10 @@ test "header injection through a value is refused" {
 
 test "a token that cannot be folded below the hard limit is an error" {
     const gpa = testing.allocator;
-    const monster = "A" ** 1200;
+    const monster = strRepeat("A", 1200);
     try testing.expectError(error.LineTooLong, renderHeader(gpa, writeUnstructured, .{ "Subject", monster, Options{} }));
     // ...but a 900-octet token is legal, ugly as it is.
-    const big = try renderHeader(gpa, writeUnstructured, .{ "Subject", "A" ** 900, Options{} });
+    const big = try renderHeader(gpa, writeUnstructured, .{ "Subject", strRepeat("A", 900), Options{} });
     defer gpa.free(big);
     try checkLineLengths(big, 998);
 }
@@ -719,7 +719,7 @@ test "RFC 2047: non-ASCII subjects become encoded words under 76 octets" {
 test "RFC 2047: a UTF-8 sequence is never split across two encoded words" {
     const gpa = testing.allocator;
     // 120 two-octet characters — long enough to need several words.
-    const text = "á" ** 120;
+    const text = strRepeat("á", 120);
     const out = try renderHeader(gpa, writeUnstructured, .{ "Subject", text, Options{} });
     defer gpa.free(out);
     // Decode every word and concatenate: the result must be the input.
@@ -896,7 +896,7 @@ test "quoted-printable soft breaks never exceed 76 columns nor split a triple" {
     var aw: std.Io.Writer.Allocating = .init(gpa);
     defer aw.deinit();
     // Non-ASCII throughout, so every character is three octets encoded.
-    try writeQuotedPrintable(&aw.writer, "ř" ** 200);
+    try writeQuotedPrintable(&aw.writer, strRepeat("ř", 200));
     var it = std.mem.splitSequence(u8, aw.written(), "\r\n");
     while (it.next()) |l| {
         try testing.expect(l.len <= 76);
@@ -908,7 +908,7 @@ test "quoted-printable soft breaks never exceed 76 columns nor split a triple" {
     // Decoding gives the input back.
     const back = try decodeQuotedPrintable(gpa, aw.written());
     defer gpa.free(back);
-    try testing.expectEqualStrings("ř" ** 200, back);
+    try testing.expectEqualStrings(strRepeat("ř", 200), back);
 }
 
 fn decodeQuotedPrintable(gpa: std.mem.Allocator, s: []const u8) ![]u8 {
@@ -955,9 +955,9 @@ test "base64 bodies are 76-column and decode back" {
 
 test "checkLineLengths finds the offending line" {
     try checkLineLengths("short\r\nalso short\r\n", 998);
-    try testing.expectError(error.LineTooLong, checkLineLengths("ok\r\n" ++ "A" ** 999 ++ "\r\n", 998));
-    try testing.expectError(error.LineTooLong, checkLineLengths("A" ** 999, 998));
-    try checkLineLengths("A" ** 998, 998);
+    try testing.expectError(error.LineTooLong, checkLineLengths("ok\r\n" ++ strRepeat("A", 999) ++ "\r\n", 998));
+    try testing.expectError(error.LineTooLong, checkLineLengths(strRepeat("A", 999), 998));
+    try checkLineLengths(strRepeat("A", 998), 998);
 }
 
 /// `testkit.fuzz.seed`, aliased so the corpus below reads as the header values
@@ -990,10 +990,10 @@ const header_seeds = [_][]const u8{
     seed("hi\r\nBcc: victim@example.net"), // ControlCharacterInHeader: the injection attempt
     seed("hi\nX: y"), // ControlCharacterInHeader: a bare LF
     seed("hi\x00"), // ControlCharacterInHeader: a NUL
-    seed("A" ** 300), // exactly the harness buffer: one unfoldable token
-    seed(" " ** 100), // nothing but fold points
-    seed("=" ** 100), // every octet quoted-printable must escape
-    seed("ř" ** 100), // 200 octets of two-octet UTF-8: the QP soft-break path
+    seed(strRepeat("A", 300)), // exactly the harness buffer: one unfoldable token
+    seed(strRepeat(" ", 100)), // nothing but fold points
+    seed(strRepeat("=", 100)), // every octet quoted-printable must escape
+    seed(strRepeat("ř", 100)), // 200 octets of two-octet UTF-8: the QP soft-break path
 };
 
 test "fuzz: arbitrary header text never crashes and never emits a bare CR/LF" {
@@ -1065,4 +1065,16 @@ test "corpus: every header seed reaches the renderers, and the counts are pinned
     // and every renderer saw the empty value; 17 of 17 after.
     try testing.expectEqual(@as(usize, 14), rendered);
     try testing.expectEqual(@as(usize, 7), encoded_words);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

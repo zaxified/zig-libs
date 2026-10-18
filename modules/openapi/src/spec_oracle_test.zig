@@ -66,7 +66,7 @@ test "spec oracle: every route table builds the document the validator accepted"
 
 test "spec oracle: validateOpenApi31 answers what the validator answered on each mutation" {
     var bad: usize = 0;
-    var seen = [_]usize{0} ** vectors.classes.len;
+    var seen = @as([vectors.classes.len]usize, @splat(0));
     for (vectors.mutations) |m| {
         const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, m.doc, .{});
         defer parsed.deinit();

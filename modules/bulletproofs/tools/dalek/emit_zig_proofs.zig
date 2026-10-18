@@ -33,7 +33,7 @@ pub fn main(init: std.process.Init) !void {
             var gamma: [32]u8 = undefined;
             init.io.random(&gamma);
             gamma = bp.Ristretto255.scalar.reduce(gamma);
-            var v_bytes = [_]u8{0} ** 32;
+            var v_bytes = @as([32]u8, @splat(0));
             std.mem.writeInt(u64, v_bytes[0..8], v, .little);
             const commitment = bp.commit(gens, v_bytes, gamma);
 
@@ -64,7 +64,7 @@ pub fn main(init: std.process.Init) !void {
         for (b.values, gammas, 0..) |v, *gamma, j| {
             init.io.random(gamma);
             gamma.* = bp.Ristretto255.scalar.reduce(gamma.*);
-            var v_bytes = [_]u8{0} ** 32;
+            var v_bytes = @as([32]u8, @splat(0));
             std.mem.writeInt(u64, v_bytes[0..8], v, .little);
             const v_enc = bp.commit(gens, v_bytes, gamma.*).toBytes();
             try w.print("{s}{x}", .{ if (j == 0) "" else ",", @as([]const u8, &v_enc) });

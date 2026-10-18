@@ -197,14 +197,14 @@ fn pbes2DeriveKekBody(
 }
 
 test "dirCek: CEK is literally the shared key" {
-    const shared = [_]u8{0xab} ** 32;
+    const shared = @as([32]u8, @splat(0xab));
     var out: [32]u8 = undefined;
     const cek = try dirCek(&shared, 32, &out);
     try std.testing.expectEqualSlices(u8, &shared, cek);
 }
 
 test "dirCek: wrong shared-key length is rejected, not silently truncated" {
-    const shared = [_]u8{0xab} ** 16;
+    const shared = @as([16]u8, @splat(0xab));
     var out: [32]u8 = undefined;
     try std.testing.expectError(error.InvalidKey, dirCek(&shared, 32, &out));
 }
@@ -235,9 +235,9 @@ test "RSA-OAEP-256 wrap/unwrap real round-trip (RFC 7516 A.1's 2048-bit key, SHA
     var sk: rsa.SecretKey = undefined;
     try rsa.SecretKey.fromPrimes(&sk, p, q, &e);
 
-    const cek = [_]u8{0x77} ** 32;
+    const cek = @as([32]u8, @splat(0x77));
     var wrapped: [256]u8 = undefined;
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x11} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x11)));
     const ek = try rsaOaepWrap(pk, .sha256, .{ .fixed_for_test = csprng.random() }, &cek, &wrapped);
 
     var recovered: [256]u8 = undefined;
@@ -246,10 +246,10 @@ test "RSA-OAEP-256 wrap/unwrap real round-trip (RFC 7516 A.1's 2048-bit key, SHA
 }
 
 test "GCMKW real round-trip" {
-    const kek = [_]u8{0x55} ** 32;
-    const cek = [_]u8{0x99} ** 32; // pretend A256GCM CEK
+    const kek = @as([32]u8, @splat(0x55));
+    const cek = @as([32]u8, @splat(0x99)); // pretend A256GCM CEK
     var iv: [12]u8 = undefined;
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x22} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x22)));
     csprng.random().bytes(&iv);
     var ct: [32]u8 = undefined;
     var tag: [16]u8 = undefined;
@@ -269,11 +269,11 @@ test "GCMKW A256 (32-byte KEK): every byte of the KEK is load-bearing, not just 
     // 32-byte KEKs that agree on the first 16 bytes but differ in the last
     // 16 MUST wrap the same CEK to a DIFFERENT ciphertext/tag — if they
     // didn't, only the first half of the KEK would actually be in play.
-    const cek = [_]u8{0x99} ** 32;
-    const iv = [_]u8{0x11} ** 12;
+    const cek = @as([32]u8, @splat(0x99));
+    const iv = @as([12]u8, @splat(0x11));
 
-    const kek_a = [_]u8{0x55} ** 16 ++ [_]u8{0xAA} ** 16;
-    const kek_b = [_]u8{0x55} ** 16 ++ [_]u8{0xBB} ** 16;
+    const kek_a = @as([16]u8, @splat(0x55)) ++ @as([16]u8, @splat(0xAA));
+    const kek_b = @as([16]u8, @splat(0x55)) ++ @as([16]u8, @splat(0xBB));
 
     var ct_a: [32]u8 = undefined;
     var tag_a: [16]u8 = undefined;
@@ -294,11 +294,11 @@ test "GCMKW A256 (32-byte KEK): every byte of the KEK is load-bearing, not just 
 test "GCMKW A192: McGrew–Viega GCM test case 8 as a key wrap, round trip, wrong KEK refused" {
     // TC 8: K = 0^192, IV = 0^96, P = 0^128, no AAD -- exactly GCMKW's shape
     // (a 16-byte CEK, empty AAD).
-    const kek = [_]u8{0} ** 24;
-    const cek = [_]u8{0} ** 16;
+    const kek = @as([24]u8, @splat(0));
+    const cek = @as([16]u8, @splat(0));
     var ct: [16]u8 = undefined;
     var tag: [16]u8 = undefined;
-    _ = try gcmkwWrap(&kek, [_]u8{0} ** 12, &cek, &ct, &tag);
+    _ = try gcmkwWrap(&kek, @as([12]u8, @splat(0)), &cek, &ct, &tag);
     var want_ct: [16]u8 = undefined;
     var want_tag: [16]u8 = undefined;
     _ = try std.fmt.hexToBytes(&want_ct, "98e7247c07f0fe411c267e4384b0f600");
@@ -306,10 +306,10 @@ test "GCMKW A192: McGrew–Viega GCM test case 8 as a key wrap, round trip, wron
     try std.testing.expectEqualSlices(u8, &want_ct, &ct);
     try std.testing.expectEqualSlices(u8, &want_tag, &tag);
     var back: [16]u8 = undefined;
-    try std.testing.expectEqualSlices(u8, &cek, try gcmkwUnwrap(&kek, [_]u8{0} ** 12, tag, &ct, &back));
-    const other = [_]u8{1} ** 24;
-    try std.testing.expectError(error.UnwrapFailed, gcmkwUnwrap(&other, [_]u8{0} ** 12, tag, &ct, &back));
-    try std.testing.expectError(error.UnsupportedKeyLength, gcmkwWrap(&([_]u8{0} ** 20), [_]u8{0} ** 12, &cek, &ct, &tag));
+    try std.testing.expectEqualSlices(u8, &cek, try gcmkwUnwrap(&kek, @as([12]u8, @splat(0)), tag, &ct, &back));
+    const other = @as([24]u8, @splat(1));
+    try std.testing.expectError(error.UnwrapFailed, gcmkwUnwrap(&other, @as([12]u8, @splat(0)), tag, &ct, &back));
+    try std.testing.expectError(error.UnsupportedKeyLength, gcmkwWrap(&(@as([20]u8, @splat(0))), @as([12]u8, @splat(0)), &cek, &ct, &tag));
 }
 
 test "PBES2 KDF wiring is real: deterministic, salt/iteration/password sensitive, correct output length" {

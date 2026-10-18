@@ -170,7 +170,7 @@ pub fn main() !void {
     // proves rather than prints: that scratch buffer is freed even though
     // the call returns an error, i.e. no leak on the reject path.
     {
-        const big_note = "x" ** 64;
+        const big_note = strRepeat("x", 64);
         var out: [8]u8 = undefined;
         var w: std.Io.Writer = .fixed(&out);
         if (Codec.writeFramed(.{ .status = .{ .ok = false, .note = big_note } }, gpa, &w, tiny_limits)) |_| {
@@ -195,4 +195,16 @@ pub fn main() !void {
             else => return err,
         }
     }
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

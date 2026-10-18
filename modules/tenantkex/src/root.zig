@@ -499,7 +499,7 @@ test "composition: keys open in the right orientation via a direct ChaCha20-Poly
         const msg = dir[2];
         var ct: [msg.len]u8 = undefined;
         var tag: [16]u8 = undefined;
-        const nonce = [_]u8{0} ** 12;
+        const nonce = @as([12]u8, @splat(0));
         const aad = &out.i.transcript_hash; // transcript hash as channel/aad id
         Aead.encrypt(&ct, &tag, msg, aad, nonce, seal_key);
         var pt: [msg.len]u8 = undefined;
@@ -515,16 +515,16 @@ test "an initiator static key other than the provisioned one is UnknownInitiator
     // Verified before the fix: this exact exchange completed with matching
     // session keys on both sides.
     const rs = kp(resp_static_priv);
-    const attacker = kp([_]u8{0x77} ** 32); // provisioned nowhere
+    const attacker = kp(@as([32]u8, @splat(0x77))); // provisioned nowhere
     var ini = tIni(attacker, rs.public_key, demo_ctx);
     var rsp = tRsp(rs, kp(init_static_priv).public_key, demo_ctx);
     var prng = testRandom(0x7777);
     var m1: [256]u8 = undefined;
     var m2: [256]u8 = undefined;
-    var pl = [_]u8{0} ** 64;
+    var pl = @as([64]u8, @splat(0));
     const n1 = try ini.writeMessage1(prng.random(), "sneaky", m1[0..message1Len(6)]);
     try testing.expectError(error.UnknownInitiator, rsp.readMessage1(m1[0..n1], &pl));
-    try testing.expectEqualSlices(u8, &([_]u8{0} ** 64), &pl); // the unauthorised payload is gone
+    try testing.expectEqualSlices(u8, &(@as([64]u8, @splat(0))), &pl); // the unauthorised payload is gone
     try testing.expectError(error.WrongState, write2(&rsp, prng.random(), "", m2[0..message2Len(0)]));
     try testing.expectError(error.WrongState, rsp.readMessage1(m1[0..n1], &pl));
 }
@@ -753,7 +753,7 @@ test "message length helpers match the actual wire sizes" {
 test "SessionKeys.wipe zeroizes both secret keys but leaves the transcript hash intact" {
     const out = try runHandshake(demo_ctx, demo_ctx);
     var keys = out.i;
-    const zero = [_]u8{0} ** 32;
+    const zero = @as([32]u8, @splat(0));
     try testing.expect(!std.mem.eql(u8, &keys.send_key, &zero));
     try testing.expect(!std.mem.eql(u8, &keys.recv_key, &zero));
     const saved_transcript = keys.transcript_hash;
@@ -798,7 +798,7 @@ test "Initiator/Responder.wipe destroys the copied long-term static secret key" 
     ini.wipe();
     res.wipe();
 
-    const zero = [_]u8{0} ** 32;
+    const zero = @as([32]u8, @splat(0));
     try testing.expectEqualSlices(u8, &zero, &ini.hs.s.?.secret_key);
     try testing.expectEqualSlices(u8, &zero, &res.hs.s.?.secret_key);
     // The caller's own copy is untouched — we only own the copy inside `hs`.
@@ -831,21 +831,21 @@ const msg2_len = message2Len(0);
 /// corpus entry at all.
 const msg1_static_seeds = [_][]const u8{
     fuzzseed.seed(""), // the empty message: exactly what the collapsed draw ran, for ever
-    fuzzseed.seed(&[_]u8{0} ** (msg1_len - 1)), // one octet short of a well-formed msg1
-    fuzzseed.seed(&[_]u8{0} ** msg1_len), // ⭐ the right length, all zeroes: reaches the DH and fails the tag
-    fuzzseed.seed(&[_]u8{0xff} ** msg1_len), // the right length, all ones
-    fuzzseed.seed(&[_]u8{0} ** (msg1_len + 1)), // one octet over
-    fuzzseed.seed(&[_]u8{0} ** wire_buf_len), // the whole buffer
-    fuzzseed.seed(&[_]u8{0} ** 32), // just an ephemeral, nothing behind it
+    fuzzseed.seed(&@as([msg1_len - 1]u8, @splat(0))), // one octet short of a well-formed msg1
+    fuzzseed.seed(&@as([msg1_len]u8, @splat(0))), // ⭐ the right length, all zeroes: reaches the DH and fails the tag
+    fuzzseed.seed(&@as([msg1_len]u8, @splat(0xff))), // the right length, all ones
+    fuzzseed.seed(&@as([msg1_len + 1]u8, @splat(0))), // one octet over
+    fuzzseed.seed(&@as([wire_buf_len]u8, @splat(0))), // the whole buffer
+    fuzzseed.seed(&@as([32]u8, @splat(0))), // just an ephemeral, nothing behind it
 };
 
 const msg2_static_seeds = [_][]const u8{
     fuzzseed.seed(""), // the empty message
-    fuzzseed.seed(&[_]u8{0} ** (msg2_len - 1)), // one octet short
-    fuzzseed.seed(&[_]u8{0} ** msg2_len), // the right length, all zeroes
-    fuzzseed.seed(&[_]u8{0xff} ** msg2_len), // the right length, all ones
-    fuzzseed.seed(&[_]u8{0} ** (msg2_len + 1)), // one octet over
-    fuzzseed.seed(&[_]u8{0} ** wire_buf_len), // the whole buffer
+    fuzzseed.seed(&@as([msg2_len - 1]u8, @splat(0))), // one octet short
+    fuzzseed.seed(&@as([msg2_len]u8, @splat(0))), // the right length, all zeroes
+    fuzzseed.seed(&@as([msg2_len]u8, @splat(0xff))), // the right length, all ones
+    fuzzseed.seed(&@as([msg2_len + 1]u8, @splat(0))), // one octet over
+    fuzzseed.seed(&@as([wire_buf_len]u8, @splat(0))), // the whole buffer
 };
 
 /// The msg1 an Initiator with the test static keys and `testRandom(0x1111)`
@@ -1014,7 +1014,7 @@ test "wipe mid-handshake clears the ephemeral secret and the chaining key" {
     try testing.expect(std.mem.allEqual(u8, &ini.hs.symmetric_state.ck, 0));
 
     // The refusal path wipes too: the responder's chaining key after msg1.
-    var ini2 = tIni(kp([_]u8{0x77} ** 32), rs.public_key, demo_ctx);
+    var ini2 = tIni(kp(@as([32]u8, @splat(0x77))), rs.public_key, demo_ctx);
     var rsp = tRsp(rs, kp(init_static_priv).public_key, demo_ctx);
     const n1 = try ini2.writeMessage1(prng.random(), "", m1[0..message1Len(0)]);
     var pl: [8]u8 = undefined;

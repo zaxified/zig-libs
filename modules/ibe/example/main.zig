@@ -92,8 +92,8 @@ pub fn main() !void {
     var d_id_alice: g1.Affine = undefined;
     ibe.extract(&d_id_alice, &msk1, alice_id);
 
-    const message1 = [_]u8{0xAB} ** 32; // stands in for a 256-bit symmetric key
-    const sigma1 = [_]u8{0x11} ** 32; // production draws this via ciphersuite.randomSigma(io); fixed here for reproducibility
+    const message1 = @as([32]u8, @splat(0xAB)); // stands in for a 256-bit symmetric key
+    const sigma1 = @as([32]u8, @splat(0x11)); // production draws this via ciphersuite.randomSigma(io); fixed here for reproducibility
 
     const ct1 = ibe.encrypt(mpk1, alice_id, &message1, &sigma1);
 
@@ -129,7 +129,7 @@ pub fn main() !void {
     const bob_id = "bob@example.com";
     var d_id_bob2: g1.Affine = undefined;
     ibe.extract(&d_id_bob2, &kp2.msk, bob_id);
-    const message2 = [_]u8{0xCD} ** 32;
+    const message2 = @as([32]u8, @splat(0xCD));
     var sigma2: [ibe.block_bytes]u8 = undefined;
     ibe.ciphersuite.randomSigma(&sigma2, io); // the real production randomness path
     const ct2 = ibe.encrypt(kp2.mpk, bob_id, &message2, &sigma2);

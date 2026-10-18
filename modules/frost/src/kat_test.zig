@@ -347,8 +347,8 @@ test "trustedDealerKeygen at t = 3: every share passes the Feldman check against
     const gpa = std.testing.allocator;
     const secret_key = scalarFromHex(v.group.secret_key);
     const coefficients = [_]frost.Scalar{
-        frost.Scalar.fromBytes48([_]u8{0x31} ** 48, .big),
-        frost.Scalar.fromBytes48([_]u8{0x47} ** 48, .big),
+        frost.Scalar.fromBytes48(@as([48]u8, @splat(0x31)), .big),
+        frost.Scalar.fromBytes48(@as([48]u8, @splat(0x47)), .big),
     };
     const dealt = try frost.trustedDealerKeygen(gpa, secret_key, &coefficients, 5, 3);
     defer gpa.free(dealt.shares);
@@ -386,7 +386,7 @@ test "secretShareCombine refuses a single share and a repeated identifier" {
 test "Identifier.fromBytes refuses zero and Element.fromPoint refuses the identity" {
     // RFC 9591 §3.1: an identifier is a NonZeroScalar, and SerializeElement
     // is undefined on the identity. Neither refusal had a test.
-    try std.testing.expectError(error.InvalidIdentifier, frost.Identifier.fromBytes([_]u8{0} ** 32));
+    try std.testing.expectError(error.InvalidIdentifier, frost.Identifier.fromBytes(@as([32]u8, @splat(0))));
     try std.testing.expectError(error.InvalidElement, frost.Element.fromPoint(frost.Secp256k1.identityElement));
 }
 
@@ -513,7 +513,7 @@ test "end-to-end (2,3) round trip: keygen -> commit -> sign -> aggregate -> veri
     var secret_bytes: [32]u8 = undefined;
     random.bytes(&secret_bytes);
     const secret_key = frost.Scalar.fromBytes48(blk: {
-        var wide = [_]u8{0} ** 48;
+        var wide = @as([48]u8, @splat(0));
         wide[16..48].* = secret_bytes;
         break :blk wide;
     }, .big);
@@ -521,7 +521,7 @@ test "end-to-end (2,3) round trip: keygen -> commit -> sign -> aggregate -> veri
     var coeff_bytes: [32]u8 = undefined;
     random.bytes(&coeff_bytes);
     const coefficients = [_]frost.Scalar{frost.Scalar.fromBytes48(blk: {
-        var wide = [_]u8{0} ** 48;
+        var wide = @as([48]u8, @splat(0));
         wide[16..48].* = coeff_bytes;
         break :blk wide;
     }, .big)};
@@ -763,7 +763,7 @@ fn fuzzProtocolSmith(_: void, smith: *std.testing.Smith) !void {
 }
 
 fn drawScalar(comptime S: type, src: *S) frost.Scalar {
-    var wide = [_]u8{0} ** 48;
+    var wide = @as([48]u8, @splat(0));
     src.bytes(wide[16..48]);
     return frost.Scalar.fromBytes48(wide, .big);
 }
@@ -788,7 +788,7 @@ fn fuzzProtocol(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void
 
     // A quorum of `min` distinct participants.
     var picked: [5]usize = undefined;
-    var used = [_]bool{false} ** 5;
+    var used = @as([5]bool, @splat(false));
     for (picked[0..min]) |*p| {
         var idx = src.index(max);
         while (used[idx]) idx = (idx + 1) % max;

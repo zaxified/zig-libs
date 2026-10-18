@@ -165,7 +165,7 @@ pub const min_tablelog = 5;
 /// `max_sv` to the last symbol present and sets `table_log`.
 pub fn readNCount(norm: []i16, max_sv: *u32, table_log: *u32, header: []const u8) Error!usize {
     if (header.len < 8) {
-        var buffer = [_]u8{0} ** 8;
+        var buffer = @as([8]u8, @splat(0));
         @memcpy(buffer[0..header.len], header);
         const count_size = try readNCount(norm, max_sv, table_log, &buffer);
         if (count_size > header.len) return error.CorruptionDetected;

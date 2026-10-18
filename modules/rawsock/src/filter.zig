@@ -306,7 +306,7 @@ const Gen = struct {
             .t => |c| {
                 if (c.ind) try g.emit(.{ .insn = .{ .code = op.ldx | op.b | op.msh, .jt = 0, .jf = 0, .k = 14 } });
                 try g.emit(.{ .insn = .{
-                    .code = op.ld | @intFromEnum(c.size) | (if (c.ind) op.ind else op.abs),
+                    .code = op.ld | @backingInt(c.size) | (if (c.ind) op.ind else op.abs),
                     .jt = 0,
                     .jf = 0,
                     .k = c.off,
@@ -956,16 +956,28 @@ test "compile: malformed and unsupported expressions are refused, never mis-comp
 
 test "compile: nesting and size are bounded" {
     // 65 nested `not`s exceed the parser's depth bound…
-    try testing.expectError(error.FilterTooComplex, compile(testing.allocator, "not " ** 65 ++ "ip"));
+    try testing.expectError(error.FilterTooComplex, compile(testing.allocator, strRepeat("not ", 65) ++ "ip"));
     // …64 do not.
-    const ok = try compile(testing.allocator, "not " ** 64 ++ "ip");
+    const ok = try compile(testing.allocator, strRepeat("not ", 64) ++ "ip");
     testing.allocator.free(ok);
     // A long disjunction needs a jump past 255 instructions to reach the
     // accept: refused rather than silently truncated.
-    try testing.expectError(error.FilterTooComplex, compile(testing.allocator, "port 1" ++ " or port 1" ** 20));
+    try testing.expectError(error.FilterTooComplex, compile(testing.allocator, "port 1" ++ strRepeat(" or port 1", 20)));
     // The accepting/dropping tail is ret #262144 / ret #0, as libpcap's.
     const p = try compile(testing.allocator, "arp");
     defer testing.allocator.free(p);
     try testing.expectEqual(@as(usize, 4), p.len);
     try testing.expectEqual(@as(u32, 0), p[3].k);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

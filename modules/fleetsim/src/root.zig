@@ -188,19 +188,19 @@ test "a fleet of five protocols answers on one clock" {
     const iec_id = try f.addNode(.{ .node = iec_node.node(), .tag = 2, .tick_period_ms = 1000 });
 
     // 3. S7 CPU.
-    var db1 = [_]u8{0} ** 64;
+    var db1 = @as([64]u8, @splat(0));
     const areas = [_]s7comm.AreaBinding{.{ .area = .db, .db_number = 1, .bytes = &db1 }};
     var s7_node = S7Node.init(.{}, &areas);
     const s7_id = try f.addNode(.{ .node = s7_node.node(), .tag = 3 });
 
     // 4. EtherNet/IP adapter.
-    var tag_bytes = [_]u8{0} ** 16;
+    var tag_bytes = @as([16]u8, @splat(0));
     const tags = [_]enip.TagBinding{.{ .name = "Speed", .type = .dint, .bytes = &tag_bytes }};
     var enip_node = EnipNode.init(.{}, &tags);
     const enip_id = try f.addNode(.{ .node = enip_node.node(), .tag = 4 });
 
     // 5. DNP3 outstation.
-    var binaries = [_]dnp3.outstation.BinaryInput{.{ .value = true, .class = .class1 }} ** 4;
+    var binaries = @as([4]dnp3.outstation.BinaryInput, @splat(.{ .value = true, .class = .class1 }));
     var events: [16]dnp3.outstation.Event = undefined;
     var rx_buf: [512]u8 = undefined;
     var scratch: [512]u8 = undefined;
@@ -227,13 +227,13 @@ test "a fleet of five protocols answers on one clock" {
         0xC1, 0x02, 0x01, 0x00, 0xC2, 0x02, 0x01, 0x02, 0xC0, 0x01, 0x0A,
     }, 0);
     var enip_req: [28]u8 = @splat(0);
-    std.mem.writeInt(u16, enip_req[0..2], @intFromEnum(enip.Command.register_session), .little);
+    std.mem.writeInt(u16, enip_req[0..2], @backingInt(enip.Command.register_session), .little);
     std.mem.writeInt(u16, enip_req[2..4], 4, .little);
     std.mem.writeInt(u16, enip_req[24..26], 1, .little);
     try f.submit(enip_id, &enip_req, 0);
     var link_buf: [64]u8 = undefined;
     const reset = try dnp3.link.encodeFrame(
-        .{ .dir = true, .prm = true, .function = @intFromEnum(dnp3.link.PrimaryFunction.reset_link_states) },
+        .{ .dir = true, .prm = true, .function = @backingInt(dnp3.link.PrimaryFunction.reset_link_states) },
         1024,
         1,
         &.{},
@@ -244,7 +244,7 @@ test "a fleet of five protocols answers on one clock" {
     _ = try f.advance(10);
 
     // Every one of them answered, and every answer parses as its own framing.
-    var seen = [_]bool{false} ** 5;
+    var seen = @as([5]bool, @splat(false));
     for (f.outbound()) |out| {
         seen[out.node] = true;
         const bytes = f.frameBytes(out);
@@ -299,7 +299,7 @@ fn cannedRun(seed: u64, collect: ?*std.ArrayList(u8)) !TraceDigest {
     });
     defer f.deinit();
 
-    var holdings = [_]u16{0} ** 8;
+    var holdings = @as([8]u16, @splat(0));
     var mb_node = ModbusNode.init(
         .{ .unit_id = 1, .framing = .tcp },
         .{ .holding_registers = .{ .base = 0, .values = &holdings } },
@@ -309,8 +309,8 @@ fn cannedRun(seed: u64, collect: ?*std.ArrayList(u8)) !TraceDigest {
         .link = .{ .delay_ms = 3, .jitter_ms = 5, .loss_permille = 80, .dup_permille = 60, .reorder_permille = 90 },
     });
 
-    var binaries = [_]dnp3.outstation.BinaryInput{.{ .value = false, .class = .class1 }} ** 4;
-    var analogs = [_]dnp3.outstation.AnalogInput{.{ .value = 0, .class = .class2 }} ** 2;
+    var binaries = @as([4]dnp3.outstation.BinaryInput, @splat(.{ .value = false, .class = .class1 }));
+    var analogs = @as([2]dnp3.outstation.AnalogInput, @splat(.{ .value = 0, .class = .class2 }));
     var events: [32]dnp3.outstation.Event = undefined;
     var rx_buf: [512]u8 = undefined;
     var scratch: [512]u8 = undefined;
@@ -355,7 +355,7 @@ fn cannedRun(seed: u64, collect: ?*std.ArrayList(u8)) !TraceDigest {
     var mb_buf: [modbus.tcp.max_adu_len]u8 = undefined;
     var link_buf: [64]u8 = undefined;
     const reset = try dnp3.link.encodeFrame(
-        .{ .dir = true, .prm = true, .function = @intFromEnum(dnp3.link.PrimaryFunction.reset_link_states) },
+        .{ .dir = true, .prm = true, .function = @backingInt(dnp3.link.PrimaryFunction.reset_link_states) },
         1024,
         1,
         &.{},
@@ -571,7 +571,7 @@ test "faults: a restart makes a DNP3 master see IIN1.7 again" {
     var f = try Fleet.init(testing.allocator, .{ .seed = 3, .max_frame_len = 512 });
     defer f.deinit();
 
-    var binaries = [_]dnp3.outstation.BinaryInput{.{ .value = true, .class = .class1 }} ** 4;
+    var binaries = @as([4]dnp3.outstation.BinaryInput, @splat(.{ .value = true, .class = .class1 }));
     var events: [16]dnp3.outstation.Event = undefined;
     var rx_buf: [512]u8 = undefined;
     var scratch: [512]u8 = undefined;
@@ -639,17 +639,17 @@ test "hostile: garbage aimed at every adapter is answered or ignored, never fata
     var f = try Fleet.init(testing.allocator, .{ .seed = 11, .max_frame_len = 2048 });
     defer f.deinit();
 
-    var holdings = [_]u16{0} ** 4;
+    var holdings = @as([4]u16, @splat(0));
     var mb_node = ModbusNode.init(
         .{ .unit_id = 1, .framing = .tcp },
         .{ .holding_registers = .{ .base = 0, .values = &holdings } },
     );
     const mb_id = try f.addNode(.{ .node = mb_node.node() });
-    var db1 = [_]u8{0} ** 16;
+    var db1 = @as([16]u8, @splat(0));
     const areas = [_]s7comm.AreaBinding{.{ .area = .db, .db_number = 1, .bytes = &db1 }};
     var s7_node = S7Node.init(.{}, &areas);
     const s7_id = try f.addNode(.{ .node = s7_node.node() });
-    var tag_bytes = [_]u8{0} ** 8;
+    var tag_bytes = @as([8]u8, @splat(0));
     const tags = [_]enip.TagBinding{.{ .name = "T", .type = .dint, .bytes = &tag_bytes }};
     var enip_node = EnipNode.init(.{}, &tags);
     const enip_id = try f.addNode(.{ .node = enip_node.node() });
@@ -658,7 +658,7 @@ test "hostile: garbage aimed at every adapter is answered or ignored, never fata
         &.{0x00},
         &.{ 0xFF, 0xFF, 0xFF, 0xFF },
         &.{ 0x03, 0x00, 0xFF, 0xFF, 0x00 },
-        &[_]u8{0xAA} ** 200,
+        &@as([200]u8, @splat(0xAA)),
         &.{ 0x68, 0xFF, 0x00, 0x00, 0x00, 0x00 },
     };
     for ([_]NodeId{ mb_id, s7_id, enip_id }) |id| {
@@ -700,8 +700,8 @@ const dispatch_inputs = [_][]const u8{
     &.{ 0x68, 0x04, 0x07, 0x00, 0x00, 0x00 }, // an IEC 104 APDU
     &.{ 0x00, 0x01, 0x00, 0x00, 0x00, 0x06, 0x01, 0x03, 0x00, 0x00, 0x00, 0x02 }, // a Modbus/TCP read-holding-registers request
     &.{ 0x03, 0x00, 0x00, 0x16, 0x11, 0xE0 }, // a TPKT/COTP connect request
-    &[_]u8{0xFF} ** 64, // ⭐ every chunk 256 octets long, so the whole input is one chunk
-    &[_]u8{0x00} ** 64, // ⭐ every chunk 1 octet long, so the input is 64 dispatches
+    &@as([64]u8, @splat(0xFF)), // ⭐ every chunk 256 octets long, so the whole input is one chunk
+    &@as([64]u8, @splat(0x00)), // ⭐ every chunk 1 octet long, so the input is 64 dispatches
     &.{ 0x01, 0x00, 0x01, 0x00, 0x02, 0x00, 0x03, 0x00, 0x04, 0x00, 0x05 }, // ⭐ the chunk head cycles through all six adapters
     &.{ 0x0B, 0x00, 0x01, 0x00, 0x00, 0x00, 0x06, 0x01, 0x03, 0x00, 0x00, 0x00, 0x02 }, // a Modbus request behind a length octet, so it arrives as one frame
     &.{ 0xFF, 0x05, 0x64, 0x05, 0xC0, 0x01, 0x00, 0x00, 0x04, 0xE9, 0x21 }, // ⭐ a length octet claiming more than remains: the clamp
@@ -831,7 +831,7 @@ fn fuzzDispatchScript(gpa: std.mem.Allocator, input: []const u8, script: ?[]cons
     });
     defer f.deinit();
 
-    var holdings = [_]u16{0} ** 8;
+    var holdings = @as([8]u16, @splat(0));
     var mb_node = ModbusNode.init(
         .{ .unit_id = 1, .framing = .tcp },
         .{ .holding_registers = .{ .base = 0, .values = &holdings } },
@@ -841,7 +841,7 @@ fn fuzzDispatchScript(gpa: std.mem.Allocator, input: []const u8, script: ?[]cons
         .link = .{ .loss_permille = 100, .dup_permille = 100 },
     });
 
-    var db1 = [_]u8{0} ** 32;
+    var db1 = @as([32]u8, @splat(0));
     const areas = [_]s7comm.AreaBinding{.{ .area = .db, .db_number = 1, .bytes = &db1 }};
     var s7_node = S7Node.init(.{}, &areas);
     const s7_id = try f.addNode(.{ .node = s7_node.node() });
@@ -870,7 +870,7 @@ fn fuzzDispatchScript(gpa: std.mem.Allocator, input: []const u8, script: ?[]cons
     // inputs would let a session table grow without bound over a long sweep.
     // It needs its own harness with a shared fixture and a per-input reset —
     // recorded here rather than bolted on badly.
-    var binaries = [_]dnp3.outstation.BinaryInput{.{ .value = true, .class = .class1 }} ** 4;
+    var binaries = @as([4]dnp3.outstation.BinaryInput, @splat(.{ .value = true, .class = .class1 }));
     var events: [16]dnp3.outstation.Event = undefined;
     var dnp_rx: [512]u8 = undefined;
     var dnp_scratch: [512]u8 = undefined;
@@ -886,7 +886,7 @@ fn fuzzDispatchScript(gpa: std.mem.Allocator, input: []const u8, script: ?[]cons
     );
     const dnp_id = try f.addNode(.{ .node = dnp_node.node() });
 
-    var tag_bytes = [_]u8{0} ** 16;
+    var tag_bytes = @as([16]u8, @splat(0));
     const tags = [_]enip.TagBinding{.{ .name = "Speed", .type = .dint, .bytes = &tag_bytes }};
     var enip_node = EnipNode.init(.{}, &tags);
     const enip_id = try f.addNode(.{ .node = enip_node.node() });
@@ -1248,8 +1248,8 @@ test "live: a real DNP3 master drives a simulated outstation, and sees IIN1.6" {
         .{ .value = dnp3_verdict.counters[0], .class = .class3 },
         .{ .value = dnp3_verdict.counters[1], .class = .class3 },
     };
-    var binary_outputs = [_]dnp3.outstation.BinaryOutputStatus{.{}} ** dnp3_verdict.binary_output_count;
-    var analog_outputs = [_]dnp3.outstation.AnalogOutputStatus{.{}} ** dnp3_verdict.analog_output_count;
+    var binary_outputs = @as([dnp3_verdict.binary_output_count]dnp3.outstation.BinaryOutputStatus, @splat(.{}));
+    var analog_outputs = @as([dnp3_verdict.analog_output_count]dnp3.outstation.AnalogOutputStatus, @splat(.{}));
     // The last analog output is range-bounded, so the OUTSTATION gets to
     // choose the refusal code for a write outside it. What the master writes
     // back is the code opendnp3 read off the echoed command object — not our
@@ -1626,7 +1626,7 @@ const iec104_verdict = struct {
         var sum: i32 = 0;
         for (points) |p| {
             if (!p.type_id.isMonitoring()) continue;
-            sum = @rem(sum + @as(i32, @intCast(p.ioa)) * 7 + @intFromEnum(p.type_id), checksum_mod);
+            sum = @rem(sum + @as(i32, @intCast(p.ioa)) * 7 + @backingInt(p.type_id), checksum_mod);
         }
         return @intCast(sum);
     }
@@ -1714,17 +1714,17 @@ test "live: a real S7 client drives a simulated CPU, and sees it go to STOP" {
     var f = try Fleet.init(testing.allocator, .{ .seed = 7, .max_frame_len = 2048, .outbox_bytes = 1 << 16 });
     defer f.deinit();
 
-    var db1 = [_]u8{0} ** 64;
+    var db1 = @as([64]u8, @splat(0));
     for (&db1, 0..) |*b, i| b.* = @intCast(i);
     // DB2 is the verdict channel — see `s7_verdict`. Sized for its ten
     // big-endian u32 marks and nothing else, so a client that wrote past the
     // block is refused rather than quietly scribbling into a neighbour.
-    var db2 = [_]u8{0} ** (4 * s7_verdict.slots);
+    var db2 = @as([4 * s7_verdict.slots]u8, @splat(0));
     // DB3 is a fixed typed record the client decodes with its OWN accessors:
     // a REAL, an INT and a DINT, all big-endian per the S7 process image. It
     // exists because DB1 is bytes — a byte sum grades framing but not typed
     // decoding, and a sine drives DB1.DBD8 so DB1 cannot be summed whole.
-    var db3 = [_]u8{0} ** 16;
+    var db3 = @as([16]u8, @splat(0));
     std.mem.writeInt(u32, db3[0..4], @bitCast(s7_verdict.real_value), .big);
     std.mem.writeInt(i16, db3[4..6], s7_verdict.int_value, .big);
     std.mem.writeInt(i32, db3[6..10], s7_verdict.dint_value, .big);
@@ -2047,7 +2047,7 @@ test "live: two real masters, two nodes, one binding thread" {
     defer f.deinit();
 
     // Node A: Modbus. Node B: IEC 104. Two protocols, two sockets, one thread.
-    var holdings = [_]u16{0} ** 16;
+    var holdings = @as([16]u16, @splat(0));
     for (&holdings, 0..) |*h, i| h.* = @intCast(1000 + i);
     var slave = ModbusNode.init(
         .{ .unit_id = 1, .framing = .tcp, .accept_any_unit = true },
@@ -2106,8 +2106,8 @@ test "live: a real Modbus master drives a simulated slave over the TCP binding" 
     var f = try Fleet.init(testing.allocator, .{ .seed = 1, .max_frame_len = 300, .outbox_bytes = 1 << 16 });
     defer f.deinit();
 
-    var holdings = [_]u16{0} ** 32;
-    var coils = [_]bool{false} ** 32;
+    var holdings = @as([32]u16, @splat(0));
+    var coils = @as([32]bool, @splat(false));
     var inputs = [_]u16{ 1000, 2000, 3000, 4000 };
     for (&holdings, 0..) |*h, i| h.* = @intCast(i * 111);
     var slave = ModbusNode.init(
@@ -2258,23 +2258,23 @@ test "live: a real EtherNet/IP master drives a simulated adapter" {
     var f = try Fleet.init(testing.allocator, .{ .seed = 2, .max_frame_len = 4096, .outbox_bytes = 1 << 16 });
     defer f.deinit();
 
-    var speed = [_]u8{0} ** 4;
-    var level = [_]u8{0} ** 4;
+    var speed = @as([4]u8, @splat(0));
+    var level = @as([4]u8, @splat(0));
     std.mem.writeInt(i32, speed[0..4], 1500, .little);
     // `Counts` is a DINT array with six deliberately unequal elements, and
     // `Setpoint` a fixed REAL. Neither is driven by a signal, so both are
     // freezable — and both exist so the master has something to *sum* and
     // something to *scale*, rather than something to echo. See `enip_verdict`.
-    var counts = [_]u8{0} ** (4 * enip_verdict.counts.len);
+    var counts = @as([4 * enip_verdict.counts.len]u8, @splat(0));
     for (enip_verdict.counts, 0..) |v, i| {
         std.mem.writeInt(i32, counts[i * 4 ..][0..4], v, .little);
     }
-    var setpoint = [_]u8{0} ** 4;
+    var setpoint = @as([4]u8, @splat(0));
     std.mem.writeInt(u32, setpoint[0..4], @bitCast(enip_verdict.setpoint), .little);
     // The verdict channel: an eight-element DINT array the master writes its
     // marks into, and a separate DINT it writes its pass mark into.
-    var verdict = [_]u8{0} ** (4 * enip_verdict.slots);
-    var verdict_pass = [_]u8{0} ** 4;
+    var verdict = @as([4 * enip_verdict.slots]u8, @splat(0));
+    var verdict_pass = @as([4]u8, @splat(0));
     const tags = [_]enip.TagBinding{
         .{ .name = "Speed", .type = .dint, .bytes = &speed },
         .{ .name = "Level", .type = .real, .bytes = &level },

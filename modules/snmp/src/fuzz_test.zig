@@ -50,10 +50,10 @@ pub fn damage(src: anytype, buf: []u8, frame: []const u8) usize {
 /// Reach counters for one harness file's labels (see jwt's fuzz_test.zig).
 pub fn Marker(comptime Label: type) type {
     return struct {
-        var counts: [@typeInfo(Label).@"enum".fields.len]usize = @splat(0);
+        var counts: [@typeInfo(Label).@"enum".field_names.len]usize = @splat(0);
 
         pub fn mark(comptime l: Label) void {
-            counts[@intFromEnum(l)] += 1;
+            counts[@backingInt(l)] += 1;
             fuzz_driver.hit(@tagName(l));
         }
 
@@ -68,7 +68,7 @@ pub fn Marker(comptime Label: type) type {
                 };
             }
             for (counts, 0..) |n, i| if (n == 0) {
-                std.debug.print("reach: " ++ name ++ " label {t} never hit in {d} seeds\n", .{ @as(Label, @enumFromInt(i)), seeds });
+                std.debug.print("reach: " ++ name ++ " label {t} never hit in {d} seeds\n", .{ @as(Label, @fromBackingInt(@intCast(i))), seeds });
                 return error.HarnessDoesNotReach;
             };
         }
@@ -303,7 +303,7 @@ pub fn fuzzAuthPriv(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!
     src.bytes(&strings);
 
     // A signed authNoPriv message: USM parameters with a zero-filled auth field.
-    var zeros = [_]u8{0} ** usm.max_digest_len;
+    var zeros = @as([usm.max_digest_len]u8, @splat(0));
     var usm_buf: [160]u8 = undefined;
     const usm_bytes = try usm.encode(&usm_buf, .{
         .engine_id = engine[0 .. 5 + src.index(12)],
@@ -464,7 +464,7 @@ fn Tamper(comptime S: type) type {
 
 pub fn fuzzV3Reply(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     _ = gpa;
-    const level: v3client.SecurityLevel = @enumFromInt(src.index(3));
+    const level: v3client.SecurityLevel = @fromBackingInt(@intCast(src.index(3)));
     const auth = all_auth[src.index(all_auth.len)];
     const pp = all_priv[src.index(all_priv.len)];
     const user: v3client.User = .{

@@ -534,7 +534,7 @@ pub const V3Client = struct {
         // placeholder must already be that long (RFC 3414 §6.3.1 / RFC 7860
         // §4.2.1). Encoding it any shorter and patching afterwards would shift
         // every following byte and invalidate the digest.
-        const zeros = [_]u8{0} ** usm.max_digest_len;
+        const zeros = @as([usm.max_digest_len]u8, @splat(0));
         const auth_placeholder: []const u8 = if (level.hasAuth())
             zeros[0..c.user.auth_protocol.digestLen()]
         else
@@ -1006,7 +1006,7 @@ pub const FakeAgent = struct {
     fn frame(a: *FakeAgent, msg_id_in: i32, pdu: message.EncodePdu, authed: bool, encrypted: bool) ![]const u8 {
         const msg_id = a.force_msg_id orelse msg_id_in;
         const skewed: u32 = @intCast(@max(0, @as(i64, a.time) + a.time_skew));
-        const zeros = [_]u8{0} ** usm.max_digest_len;
+        const zeros = @as([usm.max_digest_len]u8, @splat(0));
         const auth_ph: []const u8 = if (authed) zeros[0..a.user.auth_protocol.digestLen()] else &.{};
         // The fake agent pins its reply salt so datagrams are reproducible; a
         // fresh source per reply keeps that behaviour byte-identical.
@@ -1256,7 +1256,7 @@ test "seedEngine: missing credentials and bad engine IDs are typed errors" {
     }, .{});
     try testing.expectError(error.MissingCredentials, c.seedEngine("engine", 1, 1));
     try testing.expectError(error.BadEngineId, c.seedEngine("", 1, 1));
-    try testing.expectError(error.BadEngineId, c.seedEngine(&[_]u8{0} ** (max_engine_id_len + 1), 1, 1));
+    try testing.expectError(error.BadEngineId, c.seedEngine(&@as([max_engine_id_len + 1]u8, @splat(0)), 1, 1));
 
     var c2 = V3Client.init(agent.transport(), .{
         .name = "u",
@@ -1266,7 +1266,7 @@ test "seedEngine: missing credentials and bad engine IDs are typed errors" {
     }, .{});
     try testing.expectError(error.MissingCredentials, c2.seedEngine("engine", 1, 1));
 
-    var c3 = V3Client.init(agent.transport(), .{ .name = &[_]u8{'x'} ** (max_user_name_len + 1) }, .{});
+    var c3 = V3Client.init(agent.transport(), .{ .name = &@as([max_user_name_len + 1]u8, @splat('x')) }, .{});
     try testing.expectError(error.BadUserName, c3.seedEngine("engine", 1, 1));
 }
 
@@ -1727,15 +1727,15 @@ test "the three v3 client limits are the values RFC 3411/3414 fix, not whatever 
     var agent: FakeAgent = .{ .user = .{ .name = "u" } };
     const user: User = .{ .name = "u" }; // noAuthNoPriv: no passwords needed
     var c = V3Client.init(agent.transport(), user, .{});
-    try testing.expectError(error.BadEngineId, c.seedEngine(&[_]u8{0} ** 4, 1, 1));
-    try c.seedEngine(&[_]u8{0} ** 5, 1, 1);
-    try c.seedEngine(&[_]u8{0} ** 32, 1, 1);
-    try testing.expectError(error.BadEngineId, c.seedEngine(&[_]u8{0} ** 33, 1, 1));
+    try testing.expectError(error.BadEngineId, c.seedEngine(&@as([4]u8, @splat(0)), 1, 1));
+    try c.seedEngine(&@as([5]u8, @splat(0)), 1, 1);
+    try c.seedEngine(&@as([32]u8, @splat(0)), 1, 1);
+    try testing.expectError(error.BadEngineId, c.seedEngine(&@as([33]u8, @splat(0)), 1, 1));
 
-    var c32 = V3Client.init(agent.transport(), .{ .name = &[_]u8{'x'} ** 32 }, .{});
-    try c32.seedEngine(&[_]u8{0} ** 5, 1, 1);
-    var c33 = V3Client.init(agent.transport(), .{ .name = &[_]u8{'x'} ** 33 }, .{});
-    try testing.expectError(error.BadUserName, c33.seedEngine(&[_]u8{0} ** 5, 1, 1));
+    var c32 = V3Client.init(agent.transport(), .{ .name = &@as([32]u8, @splat('x')) }, .{});
+    try c32.seedEngine(&@as([5]u8, @splat(0)), 1, 1);
+    var c33 = V3Client.init(agent.transport(), .{ .name = &@as([33]u8, @splat('x')) }, .{});
+    try testing.expectError(error.BadUserName, c33.seedEngine(&@as([5]u8, @splat(0)), 1, 1));
 
     // 32 OIDs go out; 33 are refused without touching the transport.
     var oids: [33]Oid = @splat(try Oid.parse("1.3.6.1"));

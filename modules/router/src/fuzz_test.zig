@@ -42,11 +42,11 @@ const testkit = @import("testkit");
 const fuzz_driver = testkit.fuzz.driver;
 
 const Label = enum { routed, not_found, wrong_method, redirect, constrained, mounted, grouped };
-var reach: [@typeInfo(Label).@"enum".fields.len]usize = @splat(0);
+var reach: [@typeInfo(Label).@"enum".field_names.len]usize = @splat(0);
 
 fn hit(comptime l: Label) void {
     fuzz_driver.hit(@tagName(l));
-    reach[@intFromEnum(l)] += 1;
+    reach[@backingInt(l)] += 1;
 }
 
 const words = [_][]const u8{ "a", "b", "v1", "x.y", "users" };
@@ -377,7 +377,7 @@ test "fuzz harness: 400 seeds in every test run, and it gets everywhere" {
         };
     }
     for (reach, 0..) |n, i| if (n == 0) {
-        std.debug.print("unreached: {t}\n", .{@as(Label, @enumFromInt(i))});
+        std.debug.print("unreached: {t}\n", .{@as(Label, @fromBackingInt(@intCast(i)))});
         return error.Unreached;
     };
 }

@@ -140,11 +140,11 @@ pub const Fe = struct {
     limbs: [num_limbs]u64,
 
     /// The additive identity.
-    pub const zero: Fe = .{ .limbs = [_]u64{0} ** num_limbs };
+    pub const zero: Fe = .{ .limbs = @as([num_limbs]u64, @splat(0)) };
 
     /// The multiplicative identity.
     pub const one: Fe = .{ .limbs = blk: {
-        var l = [_]u64{0} ** num_limbs;
+        var l = @as([num_limbs]u64, @splat(0));
         l[0] = 1;
         break :blk l;
     } };
@@ -361,7 +361,7 @@ pub const Fe = struct {
     pub fn mul(a: Fe, b: Fe) Fe {
         // 8×8 schoolbook into 15 u128 column accumulators (column i+j
         // sums at most 8 products of 56-bit limbs: < 8 * 2^112 < 2^115).
-        var cols = [_]u128{0} ** 15;
+        var cols = @as([15]u128, @splat(0));
         inline for (0..num_limbs) |i| {
             inline for (0..num_limbs) |j| {
                 cols[i + j] += @as(u128, a.limbs[i]) * b.limbs[j];
@@ -420,7 +420,7 @@ pub const Fe = struct {
         // (`a[k/2]^2 < 2^112`) plus ≤4 doubled cross products
         // (`2*a[i]*a[j] < 2^113`) ⇒ each column `< 2^112 + 4*2^113 < 2^116`,
         // inside `reduceProduct`'s input contract.
-        var cols = [_]u128{0} ** 15;
+        var cols = @as([15]u128, @splat(0));
         inline for (0..num_limbs) |i| {
             cols[2 * i] += @as(u128, a.limbs[i]) * a.limbs[i];
             inline for (i + 1..num_limbs) |j| {
@@ -592,7 +592,7 @@ test "Fe.zero / Fe.one round-trip through bytes (REAL codec)" {
     const z = Fe.zero.toBytes();
     try std.testing.expect(std.mem.allEqual(u8, &z, 0));
     const o = Fe.one.toBytes();
-    var expected = [_]u8{0} ** encoded_bytes;
+    var expected = @as([encoded_bytes]u8, @splat(0));
     expected[0] = 1;
     try std.testing.expectEqualSlices(u8, &expected, &o);
 }
@@ -608,7 +608,7 @@ test "Fe.fromBytes rejects p itself (non-canonical) and accepts p-1" {
 test "Fe.isZero and Fe.eql read every limb" {
     // 2^440 (only the top byte set; < p, so canonical) is not zero, and it
     // differs from 0 and 2^440 + 1 from 1 although their low limbs agree.
-    var bytes = [_]u8{0} ** encoded_bytes;
+    var bytes = @as([encoded_bytes]u8, @splat(0));
     bytes[encoded_bytes - 1] = 1;
     const top = try Fe.fromBytes(bytes);
     try std.testing.expect(!top.isZero());
@@ -619,7 +619,7 @@ test "Fe.isZero and Fe.eql read every limb" {
 }
 
 test "Fe.fromBytes / toBytes round-trip on an arbitrary canonical value (REAL codec)" {
-    var bytes = [_]u8{0} ** encoded_bytes;
+    var bytes = @as([encoded_bytes]u8, @splat(0));
     bytes[0] = 0x12;
     bytes[1] = 0x34;
     bytes[27] = 0xab; // well below p's high byte, stays canonical
@@ -630,15 +630,15 @@ test "Fe.fromBytes / toBytes round-trip on an arbitrary canonical value (REAL co
 test "Fe.isOdd reads the low bit of the canonical encoding (REAL)" {
     try std.testing.expect(!Fe.zero.isOdd());
     try std.testing.expect(Fe.one.isOdd());
-    var two_bytes = [_]u8{0} ** encoded_bytes;
+    var two_bytes = @as([encoded_bytes]u8, @splat(0));
     two_bytes[0] = 2;
     try std.testing.expect(!(try Fe.fromBytes(two_bytes)).isOdd());
 }
 
 test "Fe.ctSelect / Fe.ctSwap pick the right operand (REAL)" {
-    var a_bytes = [_]u8{0} ** encoded_bytes;
+    var a_bytes = @as([encoded_bytes]u8, @splat(0));
     a_bytes[0] = 7;
-    var b_bytes = [_]u8{0} ** encoded_bytes;
+    var b_bytes = @as([encoded_bytes]u8, @splat(0));
     b_bytes[0] = 9;
     const a = try Fe.fromBytes(a_bytes);
     const b = try Fe.fromBytes(b_bytes);
@@ -671,7 +671,7 @@ test "Fe.random produces canonical, (overwhelmingly) distinct elements (REAL)" {
 
 test "Fe arithmetic: a + a == 2" {
     const a = Fe.one;
-    var expected = [_]u8{0} ** encoded_bytes;
+    var expected = @as([encoded_bytes]u8, @splat(0));
     expected[0] = 2;
     try std.testing.expectEqualSlices(u8, &expected, &a.add(a).toBytes());
 }
@@ -688,7 +688,7 @@ test "p limb form matches p_bytes" {
 /// below (bytes deliberately spread across several limbs; high byte kept
 /// well below p's).
 fn testElement() Fe {
-    var bytes = [_]u8{0} ** encoded_bytes;
+    var bytes = @as([encoded_bytes]u8, @splat(0));
     for (&bytes, 0..) |*b, i| b.* = @intCast((i * 37 + 11) % 251);
     bytes[encoded_bytes - 1] = 0x3a; // < 0xff, comfortably canonical
     return Fe.fromBytes(bytes) catch unreachable;
@@ -705,7 +705,7 @@ test "Fe arithmetic: add/sub/neg round-trip and identities" {
     var pm1_bytes = p_bytes;
     pm1_bytes[0] -= 1;
     const pm1 = try Fe.fromBytes(pm1_bytes);
-    var two_bytes = [_]u8{0} ** encoded_bytes;
+    var two_bytes = @as([encoded_bytes]u8, @splat(0));
     two_bytes[0] = 2;
     const two = try Fe.fromBytes(two_bytes);
     try std.testing.expect(pm1.add(two).eql(Fe.one));

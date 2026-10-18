@@ -334,7 +334,7 @@ test "h2/h4 are deterministic, tag-domain-separated, and truncate to the request
     const b = h2(block_bytes, gt);
     try std.testing.expectEqualSlices(u8, &a, &b); // deterministic
 
-    const sigma = [_]u8{0x42} ** block_bytes;
+    const sigma = @as([block_bytes]u8, @splat(0x42));
     const c = h4(block_bytes, &sigma);
     const d = h4(block_bytes, &sigma);
     try std.testing.expectEqualSlices(u8, &c, &d);
@@ -348,15 +348,15 @@ test "h2/h4 are deterministic, tag-domain-separated, and truncate to the request
 }
 
 test "h3 is deterministic and produces a canonical (< r) Fr scalar" {
-    const sigma = [_]u8{0x11} ** block_bytes;
-    const msg = [_]u8{0x22} ** block_bytes;
+    const sigma = @as([block_bytes]u8, @splat(0x11));
+    const msg = @as([block_bytes]u8, @splat(0x22));
     const r1 = h3(&sigma, &msg);
     const r2 = h3(&sigma, &msg);
     try std.testing.expect(r1.eql(r2));
     try std.testing.expect(!r1.isZero());
 
     // A different sigma must (overwhelmingly likely) give a different r.
-    const other_sigma = [_]u8{0x99} ** block_bytes;
+    const other_sigma = @as([block_bytes]u8, @splat(0x99));
     const r3 = h3(&other_sigma, &msg);
     try std.testing.expect(!r1.eql(r3));
 }
@@ -369,8 +369,8 @@ test "h3's masking never produces a value >= r on repeated random-ish inputs" {
     // through Fr's own canonical byte codec as an extra check.
     var i: u8 = 0;
     while (i < 32) : (i += 1) {
-        const sigma = [_]u8{i} ** block_bytes;
-        const msg = [_]u8{i +% 1} ** block_bytes;
+        const sigma = @as([block_bytes]u8, @splat(i));
+        const msg = @as([block_bytes]u8, @splat(i +% 1));
         const r = h3(&sigma, &msg);
         _ = try Fr.fromBytes(r.toBytes()); // must not error
     }

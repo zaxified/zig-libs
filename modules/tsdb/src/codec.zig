@@ -488,7 +488,7 @@ test "canonicalize rejects duplicate labels and oversize components" {
     }));
 
     out.clearRetainingCapacity();
-    const long = "x" ** (max_component_len + 1);
+    const long = strRepeat("x", max_component_len + 1);
     try testing.expectError(error.ComponentTooLong, canonicalize(gpa, &out, long, &.{}));
 
     out.clearRetainingCapacity();
@@ -500,7 +500,7 @@ test "canonicalize rejects duplicate labels and oversize components" {
     out.clearRetainingCapacity();
     var labels: [8]Label = undefined;
     var names: [8][4]u8 = undefined;
-    const val = "v" ** 512;
+    const val = strRepeat("v", 512);
     for (&labels, &names, 0..) |*l, *n, i| {
         n.* = .{ 'l', @intCast('0' + i), 0, 0 };
         l.* = .{ .name = n[0..2], .value = val };
@@ -705,4 +705,16 @@ test "corpus: the point-key seeds reach the decoder, and the counts are pinned" 
     try testing.expectEqual(point_key_seeds.len - 1, nonempty); // all but the empty seed
     try testing.expectEqual(@as(usize, 3), decoded);
     try testing.expectEqual(@as(usize, 3), round_tripped);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

@@ -267,7 +267,7 @@ test "Assembler: gather blocks then detect completion" {
     var store: [4096]u8 = undefined;
     var asm_ = Assembler.init(&store);
 
-    const src = "z" ** 40; // szx 0 ⇒ blocks of 16, so 16+16+8
+    const src = strRepeat("z", 40); // szx 0 ⇒ blocks of 16, so 16+16+8
     var num: u32 = 0;
     while (true) : (num += 1) {
         const c = try split(src, 0, num);
@@ -460,4 +460,16 @@ test "C6 end-to-end: Block1 PUT — client splits, server assembles, 2.31 Contin
     }
     try testing.expect(reasm.isComplete());
     try testing.expectEqualSlices(u8, &body, reasm.payload());
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

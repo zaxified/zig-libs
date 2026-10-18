@@ -4667,7 +4667,7 @@ test "verify: ES256/ES384 generated round-trip, tampering" {
     }) |case| {
         const Scheme = case[0];
         const kp = try Scheme.KeyPair.generateDeterministic(
-            [_]u8{0x42} ** Scheme.KeyPair.seed_length,
+            @as([Scheme.KeyPair.seed_length]u8, @splat(0x42)),
         );
         // Wrap via the coords constructor — the same path P4's JWK takes.
         const sec1 = kp.public_key.toUncompressedSec1();
@@ -4714,7 +4714,7 @@ test "verify: ES256/ES384 generated round-trip, tampering" {
 
         // A different keypair's key → BadSignature.
         const other = try Scheme.KeyPair.generateDeterministic(
-            [_]u8{0x43} ** Scheme.KeyPair.seed_length,
+            @as([Scheme.KeyPair.seed_length]u8, @splat(0x43)),
         );
         const other_key = switch (Scheme) {
             EcdsaP256Sha256 => Key{ .ecdsa_p256 = other.public_key },
@@ -4726,7 +4726,7 @@ test "verify: ES256/ES384 generated round-trip, tampering" {
 }
 
 test "verify: EdDSA generated round-trip through a full token" {
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x24} ** 32);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x24)));
     const key = try Key.ed25519FromBytes(kp.public_key.toBytes());
 
     var buf: [512]u8 = undefined;
@@ -4757,7 +4757,7 @@ test "verify: EdDSA generated round-trip through a full token" {
     try testing.expectError(error.BadSignature, verify(&p_forged, key));
 
     // A different keypair's public key → BadSignature.
-    const other = try Ed25519.KeyPair.generateDeterministic([_]u8{0x25} ** 32);
+    const other = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x25)));
     try testing.expectError(error.BadSignature, verify(&parsed, .{ .ed25519 = other.public_key }));
 }
 
@@ -4778,7 +4778,7 @@ test "verify: ML-DSA-65 round-trip through a full token (RFC 9964)" {
     // anchored by std's own FIPS-204 vectors, and what this file adds is the
     // JOSE binding (alg name, empty context, raw signature bytes). Those are
     // what this exercises.
-    const kp = try MlDsa65.KeyPair.generateDeterministic([_]u8{0x31} ** 32);
+    const kp = try MlDsa65.KeyPair.generateDeterministic(@as([32]u8, @splat(0x31)));
     const key = try Key.mlDsa65FromBytes(kp.public_key.toBytes());
 
     // An ML-DSA-65 signature is 3309 bytes -> ~4412 base64url characters, so
@@ -4812,12 +4812,12 @@ test "verify: ML-DSA-65 round-trip through a full token (RFC 9964)" {
     try testing.expectError(error.BadSignature, verify(&p_forged, key));
 
     // A different key of the SAME parameter set -> BadSignature.
-    const other = try MlDsa65.KeyPair.generateDeterministic([_]u8{0x32} ** 32);
+    const other = try MlDsa65.KeyPair.generateDeterministic(@as([32]u8, @splat(0x32)));
     try testing.expectError(error.BadSignature, verify(&parsed, .{ .ml_dsa_65 = other.public_key }));
 
     // A key of a DIFFERENT parameter set -> AlgKeyMismatch, not BadSignature:
     // the mismatch is caught by the alg/key pairing, before any verification.
-    const kp44 = try MlDsa44.KeyPair.generateDeterministic([_]u8{0x33} ** 32);
+    const kp44 = try MlDsa44.KeyPair.generateDeterministic(@as([32]u8, @splat(0x33)));
     try testing.expectError(error.AlgKeyMismatch, verify(&parsed, .{ .ml_dsa_44 = kp44.public_key }));
 }
 
@@ -4835,7 +4835,7 @@ test "verify: ML-DSA sizes are exactly FIPS 204's, which is what a JWS carries" 
 }
 
 test "parseJwks: kty AKP carries its parameter set in alg, and verifies a token" {
-    const kp = try MlDsa65.KeyPair.generateDeterministic([_]u8{0x41} ** 32);
+    const kp = try MlDsa65.KeyPair.generateDeterministic(@as([32]u8, @splat(0x41)));
     const pk_bytes = kp.public_key.toBytes();
 
     var pub_b64: [3000]u8 = undefined;
@@ -4871,7 +4871,7 @@ test "parseJwks: an AKP key without alg is skipped -- the set is NOT inferred fr
     // are distinct, so inferring the parameter set would "work" -- and would
     // accept a key whose alg claims one set and whose bytes are another, which
     // is the algorithm-confusion shape RFC 8725 §3.1 exists to close.
-    const kp = try MlDsa65.KeyPair.generateDeterministic([_]u8{0x42} ** 32);
+    const kp = try MlDsa65.KeyPair.generateDeterministic(@as([32]u8, @splat(0x42)));
     const pk_bytes = kp.public_key.toBytes();
     var pub_b64: [3000]u8 = undefined;
     const pub_s = pub_b64[0..std.base64.url_safe_no_pad.Encoder.encode(&pub_b64, &pk_bytes).len];
@@ -4890,7 +4890,7 @@ test "parseJwks: an AKP key without alg is skipped -- the set is NOT inferred fr
 }
 
 test "parseJwks: an AKP key whose pub length contradicts its alg is skipped" {
-    const kp = try MlDsa44.KeyPair.generateDeterministic([_]u8{0x43} ** 32);
+    const kp = try MlDsa44.KeyPair.generateDeterministic(@as([32]u8, @splat(0x43)));
     const pk_bytes = kp.public_key.toBytes(); // 1312 bytes: an ML-DSA-44 key
     var pub_b64: [3000]u8 = undefined;
     const pub_s = pub_b64[0..std.base64.url_safe_no_pad.Encoder.encode(&pub_b64, &pk_bytes).len];
@@ -4914,8 +4914,8 @@ test "parseJwks: the pub-length guard holds for ML-DSA-44 and -87 too, not just 
     // plausibly hit all three — but only the -65 arm was pinned, and deleting
     // the other two left the suite green. Each arm gets a key of the WRONG
     // parameter set presented under its own `alg`.
-    const kp65 = try MlDsa65.KeyPair.generateDeterministic([_]u8{0x44} ** 32);
-    const kp87 = try MlDsa87.KeyPair.generateDeterministic([_]u8{0x45} ** 32);
+    const kp65 = try MlDsa65.KeyPair.generateDeterministic(@as([32]u8, @splat(0x44)));
+    const kp87 = try MlDsa87.KeyPair.generateDeterministic(@as([32]u8, @splat(0x45)));
     const pk65 = kp65.public_key.toBytes(); // 1952
     const pk87 = kp87.public_key.toBytes(); // 2592
 
@@ -4943,7 +4943,7 @@ test "SECURITY: a network JWKS that publishes a private key is refused, every kt
     // the signing half is readable by anyone who can GET the document, so a
     // token that key "verifies" is forgeable — trusting it would authenticate
     // forgeries as genuine. RFC 7517 §4 and RFC 9964 §3 both say MUST NOT.
-    const kp = try MlDsa65.KeyPair.generateDeterministic([_]u8{0x46} ** 32);
+    const kp = try MlDsa65.KeyPair.generateDeterministic(@as([32]u8, @splat(0x46)));
     const pk_bytes = kp.public_key.toBytes();
     var pub_b64: [4000]u8 = undefined;
     const pub_s = pub_b64[0..std.base64.url_safe_no_pad.Encoder.encode(&pub_b64, &pk_bytes).len];
@@ -4984,14 +4984,14 @@ test "verify: alg none is always rejected, key or no key (RFC 8725 §2.1)" {
     defer parsed.deinit();
 
     try testing.expectError(error.UnsecuredToken, verify(&parsed, .{ .hmac = "secret" }));
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{7} ** 32);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(7)));
     try testing.expectError(error.UnsecuredToken, verify(&parsed, .{ .ed25519 = kp.public_key }));
 }
 
 test "verify: alg confusion — token alg must match the key type" {
-    const ed_kp = try Ed25519.KeyPair.generateDeterministic([_]u8{9} ** 32);
-    const ec256_kp = try EcdsaP256Sha256.KeyPair.generateDeterministic([_]u8{9} ** 32);
-    const ec384_kp = try EcdsaP384Sha384.KeyPair.generateDeterministic([_]u8{9} ** 48);
+    const ed_kp = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(9)));
+    const ec256_kp = try EcdsaP256Sha256.KeyPair.generateDeterministic(@as([32]u8, @splat(9)));
+    const ec384_kp = try EcdsaP384Sha384.KeyPair.generateDeterministic(@as([48]u8, @splat(9)));
 
     // The RFC 8725 §2.1 downgrade: attacker takes a server that holds an
     // asymmetric PUBLIC key, mints an HS256 token HMAC'd with those public
@@ -5058,7 +5058,7 @@ test "verify: ML-DSA wrong-length signatures are BadSignature, never an OOB read
     // and the RSA one below). In Debug a regression is a remote panic; in
     // ReleaseFast, which this suite also builds, there is no bounds check and
     // it becomes a silent read of adjacent heap fed into `Signature.fromBytes`.
-    const kp = try MlDsa65.KeyPair.generateDeterministic([_]u8{0x31} ** 32);
+    const kp = try MlDsa65.KeyPair.generateDeterministic(@as([32]u8, @splat(0x31)));
     const key = try Key.mlDsa65FromBytes(kp.public_key.toBytes());
 
     var buf: [8192]u8 = undefined;
@@ -5070,7 +5070,7 @@ test "verify: ML-DSA wrong-length signatures are BadSignature, never an OOB read
         ,
             \\{"exp":1000}
         );
-        const token = finishToken(&buf, si.len, &([_]u8{0xAB} ** bad_len));
+        const token = finishToken(&buf, si.len, &(@as([bad_len]u8, @splat(0xAB))));
         var parsed = try parse(testing.allocator, token);
         defer parsed.deinit();
         try testing.expectError(error.BadSignature, verify(&parsed, key));
@@ -5082,15 +5082,15 @@ test "verify: ML-DSA wrong-length signatures are BadSignature, never an OOB read
     ,
         \\{"exp":1000}
     );
-    const token = finishToken(&buf, si.len, &([_]u8{0xAB} ** 3309));
+    const token = finishToken(&buf, si.len, &(@as([3309]u8, @splat(0xAB))));
     var parsed = try parse(testing.allocator, token);
     defer parsed.deinit();
     try testing.expectError(error.BadSignature, verify(&parsed, key));
 }
 
 test "verify: wrong-length or garbage signatures never panic" {
-    const ec_kp = try EcdsaP256Sha256.KeyPair.generateDeterministic([_]u8{1} ** 32);
-    const ed_kp = try Ed25519.KeyPair.generateDeterministic([_]u8{1} ** 32);
+    const ec_kp = try EcdsaP256Sha256.KeyPair.generateDeterministic(@as([32]u8, @splat(1)));
+    const ed_kp = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(1)));
     const ec_key: Key = .{ .ecdsa_p256 = ec_kp.public_key };
     const ed_key: Key = .{ .ed25519 = ed_kp.public_key };
 
@@ -5103,7 +5103,7 @@ test "verify: wrong-length or garbage signatures never panic" {
             const si = signingInputInto(&buf, "{\"alg\":\"" ++ alg_name ++ "\"}",
                 \\{"exp":1000}
             );
-            const token = finishToken(&buf, si.len, &([_]u8{0xAB} ** bad_len));
+            const token = finishToken(&buf, si.len, &(@as([bad_len]u8, @splat(0xAB))));
             var parsed = try parse(testing.allocator, token);
             defer parsed.deinit();
             try testing.expectError(error.BadSignature, verify(&parsed, key));
@@ -5112,7 +5112,7 @@ test "verify: wrong-length or garbage signatures never panic" {
         const si = signingInputInto(&buf, "{\"alg\":\"" ++ alg_name ++ "\"}",
             \\{"exp":1000}
         );
-        const token = finishToken(&buf, si.len, &([_]u8{0xAB} ** 64));
+        const token = finishToken(&buf, si.len, &(@as([64]u8, @splat(0xAB))));
         var parsed = try parse(testing.allocator, token);
         defer parsed.deinit();
         try testing.expectError(error.BadSignature, verify(&parsed, key));
@@ -5124,21 +5124,21 @@ test "verify: wrong-length or garbage signatures never panic" {
     ,
         \\{"exp":1000}
     );
-    const token = finishToken(&buf, si.len, &([_]u8{0xCD} ** 64));
+    const token = finishToken(&buf, si.len, &(@as([64]u8, @splat(0xCD))));
     var parsed = try parse(testing.allocator, token);
     defer parsed.deinit();
-    const ec384_kp = try EcdsaP384Sha384.KeyPair.generateDeterministic([_]u8{1} ** 48);
+    const ec384_kp = try EcdsaP384Sha384.KeyPair.generateDeterministic(@as([48]u8, @splat(1)));
     try testing.expectError(error.BadSignature, verify(&parsed, .{ .ecdsa_p384 = ec384_kp.public_key }));
 }
 
 test "Key constructors: invalid key bytes → InvalidKey, never a panic" {
     // (0,0) is not on P-256/P-384 (b != 0), and all-0xFF exceeds the field.
-    try testing.expectError(error.InvalidKey, Key.ecdsaP256FromCoords([_]u8{0} ** 32, [_]u8{0} ** 32));
-    try testing.expectError(error.InvalidKey, Key.ecdsaP256FromCoords([_]u8{0xFF} ** 32, [_]u8{0xFF} ** 32));
-    try testing.expectError(error.InvalidKey, Key.ecdsaP384FromCoords([_]u8{0} ** 48, [_]u8{0} ** 48));
-    try testing.expectError(error.InvalidKey, Key.ecdsaP384FromCoords([_]u8{0xFF} ** 48, [_]u8{0xFF} ** 48));
+    try testing.expectError(error.InvalidKey, Key.ecdsaP256FromCoords(@as([32]u8, @splat(0)), @as([32]u8, @splat(0))));
+    try testing.expectError(error.InvalidKey, Key.ecdsaP256FromCoords(@as([32]u8, @splat(0xFF)), @as([32]u8, @splat(0xFF))));
+    try testing.expectError(error.InvalidKey, Key.ecdsaP384FromCoords(@as([48]u8, @splat(0)), @as([48]u8, @splat(0))));
+    try testing.expectError(error.InvalidKey, Key.ecdsaP384FromCoords(@as([48]u8, @splat(0xFF)), @as([48]u8, @splat(0xFF))));
     // Non-canonical Ed25519 encoding.
-    try testing.expectError(error.InvalidKey, Key.ed25519FromBytes([_]u8{0xFF} ** 32));
+    try testing.expectError(error.InvalidKey, Key.ed25519FromBytes(@as([32]u8, @splat(0xFF))));
 }
 
 test "parseAndVerify: end-to-end happy path and each failure stage" {
@@ -5175,7 +5175,7 @@ test "parseAndVerify: end-to-end happy path and each failure stage" {
         .{ .now_s = 1000, .issuer = .any, .audience = .any },
     ));
     // Wrong key type → AlgKeyMismatch.
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{3} ** 32);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(3)));
     try testing.expectError(error.AlgKeyMismatch, parseAndVerify(
         gpa,
         token,
@@ -5399,9 +5399,9 @@ test "verify: RSA alg confusion — RS tokens vs non-RSA keys and vice versa" {
     // The RFC RS256 token offered every non-RSA key type → AlgKeyMismatch.
     var parsed = try parse(testing.allocator, rfc7515_a2_token);
     defer parsed.deinit();
-    const ed_kp = try Ed25519.KeyPair.generateDeterministic([_]u8{9} ** 32);
-    const ec256_kp = try EcdsaP256Sha256.KeyPair.generateDeterministic([_]u8{9} ** 32);
-    const ec384_kp = try EcdsaP384Sha384.KeyPair.generateDeterministic([_]u8{9} ** 48);
+    const ed_kp = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(9)));
+    const ec256_kp = try EcdsaP256Sha256.KeyPair.generateDeterministic(@as([32]u8, @splat(9)));
+    const ec384_kp = try EcdsaP384Sha384.KeyPair.generateDeterministic(@as([48]u8, @splat(9)));
     try testing.expectError(error.AlgKeyMismatch, verify(&parsed, .{ .hmac = "secret" }));
     try testing.expectError(error.AlgKeyMismatch, verify(&parsed, .{ .ed25519 = ed_kp.public_key }));
     try testing.expectError(error.AlgKeyMismatch, verify(&parsed, .{ .ecdsa_p256 = ec256_kp.public_key }));
@@ -5439,7 +5439,7 @@ test "verify: RSA wrong-length and garbage signatures never panic" {
         ,
             \\{"exp":1000}
         );
-        const token = finishToken(&buf, si.len, &([_]u8{0xAB} ** bad_len));
+        const token = finishToken(&buf, si.len, &(@as([bad_len]u8, @splat(0xAB))));
         var parsed = try parse(testing.allocator, token);
         defer parsed.deinit();
         try testing.expectError(error.BadSignature, verify(&parsed, key));
@@ -5454,7 +5454,7 @@ test "verify: RSA wrong-length and garbage signatures never panic" {
         ,
             \\{"exp":1000}
         );
-        const token = finishToken(&buf, si.len, &([_]u8{fill} ** 256));
+        const token = finishToken(&buf, si.len, &(@as([256]u8, @splat(fill))));
         var parsed = try parse(testing.allocator, token);
         defer parsed.deinit();
         try testing.expectError(error.BadSignature, verify(&parsed, key));
@@ -5477,16 +5477,16 @@ test "Key.rsaFromModExp: invalid modulus/exponent shapes → InvalidKey" {
 
     // Empty / all-zero modulus or exponent.
     try testing.expectError(error.InvalidKey, Key.rsaFromModExp("", &e_ok));
-    try testing.expectError(error.InvalidKey, Key.rsaFromModExp(&([_]u8{0} ** 256), &e_ok));
+    try testing.expectError(error.InvalidKey, Key.rsaFromModExp(&(@as([256]u8, @splat(0))), &e_ok));
     try testing.expectError(error.InvalidKey, Key.rsaFromModExp(n_bytes, ""));
     try testing.expectError(error.InvalidKey, Key.rsaFromModExp(n_bytes, &.{ 0, 0 }));
 
     // Too-small (512-bit), odd-sized (800-bit) and oversized (one octet
     // past rsa's cap, 8192 bits since 2026-10-14) moduli; 8192 itself passes.
-    try testing.expectError(error.InvalidKey, Key.rsaFromModExp(&([_]u8{0xFF} ** 64), &e_ok));
-    try testing.expectError(error.InvalidKey, Key.rsaFromModExp(&([_]u8{0xFF} ** 100), &e_ok));
-    try testing.expectError(error.InvalidKey, Key.rsaFromModExp(&([_]u8{0xFF} ** (rsa.max_modulus_len + 1)), &e_ok));
-    _ = try Key.rsaFromModExp(&([_]u8{0xFF} ** rsa.max_modulus_len), &e_ok);
+    try testing.expectError(error.InvalidKey, Key.rsaFromModExp(&(@as([64]u8, @splat(0xFF))), &e_ok));
+    try testing.expectError(error.InvalidKey, Key.rsaFromModExp(&(@as([100]u8, @splat(0xFF))), &e_ok));
+    try testing.expectError(error.InvalidKey, Key.rsaFromModExp(&(@as([rsa.max_modulus_len + 1]u8, @splat(0xFF))), &e_ok));
+    _ = try Key.rsaFromModExp(&(@as([rsa.max_modulus_len]u8, @splat(0xFF))), &e_ok);
 
     // Even modulus (an RSA modulus is a product of odd primes).
     var even_n: [256]u8 = undefined;
@@ -5555,12 +5555,12 @@ const test_jwks_hmac_secret = "jwks-multi-key-shared-secret";
 
 fn testEs256KeyPair() !EcdsaP256Sha256.KeyPair {
     return EcdsaP256Sha256.KeyPair.generateDeterministic(
-        [_]u8{0x42} ** EcdsaP256Sha256.KeyPair.seed_length,
+        @as([EcdsaP256Sha256.KeyPair.seed_length]u8, @splat(0x42)),
     );
 }
 
 fn testEd25519KeyPair() !Ed25519.KeyPair {
-    return Ed25519.KeyPair.generateDeterministic([_]u8{0x24} ** 32);
+    return Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x24)));
 }
 
 /// Build the standard 4-key test JWKS: oct "hs" + EC P-256 "es" +
@@ -5961,11 +5961,11 @@ test "JWKS: malformed JWKs are skipped with reasons, never a panic" {
         "{\"kty\":\"RSA\",\"n\":\"!!!\",\"e\":\"AQAB\"}," ++ // bad base64url n
         "{\"kty\":\"RSA\",\"e\":\"AQAB\"}," ++ // n missing
         "{\"kty\":\"EC\",\"x\":\"AAAA\",\"y\":\"AAAA\"}," ++ // crv missing
-        "{\"kty\":\"EC\",\"crv\":\"P-256\",\"x\":\"" ++ ("A" ** 22) ++
-        "\",\"y\":\"" ++ ("A" ** 22) ++ "\"}," ++ // 16-byte coords: wrong length
-        "{\"kty\":\"EC\",\"crv\":\"P-256\",\"x\":\"" ++ ("A" ** 43) ++
-        "\",\"y\":\"" ++ ("A" ** 43) ++ "\"}," ++ // (0,0): not on the curve
-        "{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"x\":\"" ++ ("_" ** 42) ++
+        "{\"kty\":\"EC\",\"crv\":\"P-256\",\"x\":\"" ++ (strRepeat("A", 22)) ++
+        "\",\"y\":\"" ++ (strRepeat("A", 22)) ++ "\"}," ++ // 16-byte coords: wrong length
+        "{\"kty\":\"EC\",\"crv\":\"P-256\",\"x\":\"" ++ (strRepeat("A", 43)) ++
+        "\",\"y\":\"" ++ (strRepeat("A", 43)) ++ "\"}," ++ // (0,0): not on the curve
+        "{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"x\":\"" ++ (strRepeat("_", 42)) ++
         "8\"}," ++ // 0xFF…: non-canonical Ed25519
         "{\"kty\":\"oct\",\"k\":\"\"}," ++ // empty secret: unusable
         "{\"kty\":\"oct\",\"k\":\"c2VjcmV0\",\"kid\":42}," ++ // kid wrong type
@@ -6522,7 +6522,7 @@ test "Provider by issuer: discovery + injected issuer end-to-end" {
     // Asymmetric (Ed25519) key: a fetched JWKS may not carry symmetric `oct`
     // keys (they would be forgeable), so the issuer publishes a public key and
     // signs with EdDSA.
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x51} ** 32);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x51)));
     const pub_bytes = kp.public_key.toBytes();
     var x_b64: [43]u8 = undefined;
     var set_buf: [256]u8 = undefined;
@@ -6580,8 +6580,8 @@ test "Provider: key rotation refreshes once, rate limit stops a bogus-kid flood,
     const gpa = testing.allocator;
     const enc = std.base64.url_safe_no_pad.Encoder;
     // Asymmetric (Ed25519) keys — a fetched JWKS may not carry `oct` secrets.
-    const kp_old = try Ed25519.KeyPair.generateDeterministic([_]u8{0x61} ** 32);
-    const kp_new = try Ed25519.KeyPair.generateDeterministic([_]u8{0x62} ** 32);
+    const kp_old = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x61)));
+    const kp_new = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x62)));
     const pub_old = kp_old.public_key.toBytes();
     const pub_new = kp_new.public_key.toBytes();
     var old_b64: [43]u8 = undefined;
@@ -6681,8 +6681,8 @@ test "Provider: a clock stepped back does not freeze the TTL re-fetch or the rot
     // fire and a token signed with a freshly rotated key was NoMatchingKey.
     const gpa = testing.allocator;
     const enc = std.base64.url_safe_no_pad.Encoder;
-    const kp_old = try Ed25519.KeyPair.generateDeterministic([_]u8{0x71} ** 32);
-    const kp_new = try Ed25519.KeyPair.generateDeterministic([_]u8{0x72} ** 32);
+    const kp_old = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x71)));
+    const kp_new = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x72)));
     const pub_old = kp_old.public_key.toBytes();
     const pub_new = kp_new.public_key.toBytes();
     var old_b64: [43]u8 = undefined;
@@ -6765,8 +6765,8 @@ const ManualClock = struct {
 test "Provider: with an interval clock a wall step forward does not expire the TTL; the claims still use now_s" {
     const gpa = testing.allocator;
     const enc = std.base64.url_safe_no_pad.Encoder;
-    const kp_old = try Ed25519.KeyPair.generateDeterministic([_]u8{0x73} ** 32);
-    const kp_new = try Ed25519.KeyPair.generateDeterministic([_]u8{0x74} ** 32);
+    const kp_old = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x73)));
+    const kp_new = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x74)));
     const pub_old = kp_old.public_key.toBytes();
     const pub_new = kp_new.public_key.toBytes();
     var old_b64: [43]u8 = undefined;
@@ -7765,7 +7765,7 @@ test "PKCE: RFC 7636 Appendix B known-answer vector (S256 challenge)" {
 }
 
 test "PKCE: pkceGenerateS256 — lengths, cross-checks pkceChallengeS256, distinct across calls" {
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x70} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x70)));
     const random = csprng.random();
 
     const p1 = pkceGenerateS256(random);
@@ -7799,17 +7799,17 @@ test "SECURITY: pkceGenerate* deliver the CSPRNG's next 32 bytes verbatim (entro
     // requires the verifier to have at least 256 bits of entropy, and it is
     // the ONLY thing standing between an intercepted authorization code and
     // token redemption, so the delivered draw is pinned like `state`/`nonce`.
-    var oracle = std.Random.DefaultCsprng.init([_]u8{0x4d} ** 32);
+    var oracle = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x4d)));
     var raw: [32]u8 = undefined;
     oracle.random().bytes(&raw);
     var expect: [43]u8 = undefined;
     _ = std.base64.url_safe_no_pad.Encoder.encode(&expect, &raw);
 
-    var s256_rng = std.Random.DefaultCsprng.init([_]u8{0x4d} ** 32);
+    var s256_rng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x4d)));
     const s256 = pkceGenerateS256(s256_rng.random());
     try testing.expectEqualStrings(&expect, s256.verifier());
 
-    var plain_rng = std.Random.DefaultCsprng.init([_]u8{0x4d} ** 32);
+    var plain_rng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x4d)));
     const plain = pkceGeneratePlain(plain_rng.random());
     try testing.expectEqualStrings(&expect, plain.verifier());
 
@@ -7819,7 +7819,7 @@ test "SECURITY: pkceGenerate* deliver the CSPRNG's next 32 bytes verbatim (entro
 }
 
 test "PKCE: pkceGeneratePlain — challenge equals verifier verbatim (discouraged fallback)" {
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x71} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x71)));
     const p = pkceGeneratePlain(csprng.random());
     try testing.expectEqual(ChallengeMethod.plain, p.method);
     try testing.expectEqualStrings("plain", p.method.wireName());
@@ -7828,7 +7828,7 @@ test "PKCE: pkceGeneratePlain — challenge equals verifier verbatim (discourage
 }
 
 test "generateState / generateNonce: non-empty, correct length, high entropy, base64url alphabet" {
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x72} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x72)));
     const random = csprng.random();
 
     const s1 = generateState(random);
@@ -7856,7 +7856,7 @@ test "SECURITY: generateState/generateNonce deliver the CSPRNG's next 32 bytes v
     //     exactly these 43 characters. Any change to how much randomness is
     //     drawn, or to how it is encoded, changes them.
     {
-        var csprng = std.Random.DefaultCsprng.init([_]u8{0x72} ** 32);
+        var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x72)));
         const s = generateState(csprng.random());
         try testing.expectEqualStrings("2-3w7lc6IlUMeknpJ4FakX5bquD-YmXDpYbbdfGdcAc", &s);
         const n = generateNonce(csprng.random());
@@ -7869,19 +7869,19 @@ test "SECURITY: generateState/generateNonce deliver the CSPRNG's next 32 bytes v
     //     test phrased in terms of the module's own constants would only
     //     re-assert them.
     {
-        var oracle = std.Random.DefaultCsprng.init([_]u8{0x91} ** 32);
+        var oracle = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x91)));
         var raw: [32]u8 = undefined;
         oracle.random().bytes(&raw);
         var expect: [43]u8 = undefined;
         _ = std.base64.url_safe_no_pad.Encoder.encode(&expect, &raw);
 
-        var csprng = std.Random.DefaultCsprng.init([_]u8{0x91} ** 32);
+        var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x91)));
         const s = generateState(csprng.random());
         try testing.expectEqualStrings(&expect, &s);
 
         // Same for `nonce`: it must consume the same 32-byte draw, not a
         // narrower one.
-        var csprng2 = std.Random.DefaultCsprng.init([_]u8{0x91} ** 32);
+        var csprng2 = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x91)));
         const n = generateNonce(csprng2.random());
         try testing.expectEqualStrings(&expect, &n);
 
@@ -8304,7 +8304,7 @@ test "parseOAuthError: every registered code maps, RFC 6749 section 5.2 example"
         const body = "{\"error\":\"" ++ n ++ "\"}";
         var e = try parseOAuthError(gpa, body);
         defer e.deinit();
-        try testing.expectEqual(@as(OAuthErrorCode, @enumFromInt(i)), e.code);
+        try testing.expectEqual(@as(OAuthErrorCode, @fromBackingInt(@intCast(i))), e.code);
         try testing.expectEqualStrings(n, e.code_text);
         try testing.expect(e.description == null and e.uri == null and e.state == null);
     }
@@ -8722,7 +8722,7 @@ test "IdTokenProviderOptions.leeway_s: the default clock-skew window is exactly 
     // never set OR checked by any test at all.
     const gpa = testing.allocator;
     const enc = std.base64.url_safe_no_pad.Encoder;
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x71} ** 32);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x71)));
     const pub_bytes = kp.public_key.toBytes();
     var x_b64: [43]u8 = undefined;
     var set_buf: [256]u8 = undefined;
@@ -8816,7 +8816,7 @@ test "acceptIdTokenProvider: turnkey ID Token acceptance through the cached Prov
     const enc = std.base64.url_safe_no_pad.Encoder;
     // A fetched JWKS may not carry symmetric `oct` keys, so the OP signs
     // with EdDSA over a published public key — same rule Provider tests use.
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x53} ** 32);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x53)));
     const pub_bytes = kp.public_key.toBytes();
     var x_b64: [43]u8 = undefined;
     var set_buf: [256]u8 = undefined;
@@ -9021,7 +9021,7 @@ test "SECURITY: a valid signature with a byte appended is BadSignature, every al
     const es256_sig = (try es256.sign(si, null)).toBytes();
     try expectExactSigLength(.ES256, si, &es256_sig, .{ .ecdsa_p256 = es256.public_key });
 
-    const es384 = try EcdsaP384Sha384.KeyPair.generateDeterministic([_]u8{0x42} ** EcdsaP384Sha384.KeyPair.seed_length);
+    const es384 = try EcdsaP384Sha384.KeyPair.generateDeterministic(@as([EcdsaP384Sha384.KeyPair.seed_length]u8, @splat(0x42)));
     const es384_sig = (try es384.sign(si, null)).toBytes();
     try expectExactSigLength(.ES384, si, &es384_sig, .{ .ecdsa_p384 = es384.public_key });
 
@@ -9034,7 +9034,7 @@ test "SECURITY: a valid signature with a byte appended is BadSignature, every al
     const rs_sig = rsaTestSign(sha2.Sha256, 256, si, b64uDecode(&n_buf, rfc7515_a2_n_b64), b64uDecode(&d_buf, rfc7515_a2_d_b64));
     try expectExactSigLength(.RS256, si, &rs_sig, rfc7515A2Key());
 
-    const ml = try MlDsa65.KeyPair.generateDeterministic([_]u8{0x34} ** 32);
+    const ml = try MlDsa65.KeyPair.generateDeterministic(@as([32]u8, @splat(0x34)));
     const ml_sig = (try ml.sign(si, null)).toBytes();
     try expectExactSigLength(.@"ML-DSA-65", si, &ml_sig, .{ .ml_dsa_65 = ml.public_key });
 }
@@ -9080,7 +9080,7 @@ test "JWKS: key material one byte too long is invalid_key, never truncated" {
         "\"}",
     );
 
-    const es384 = try EcdsaP384Sha384.KeyPair.generateDeterministic([_]u8{0x42} ** EcdsaP384Sha384.KeyPair.seed_length);
+    const es384 = try EcdsaP384Sha384.KeyPair.generateDeterministic(@as([EcdsaP384Sha384.KeyPair.seed_length]u8, @splat(0x42)));
     const sec1 = es384.public_key.toUncompressedSec1();
     var long_x: [49]u8 = undefined;
     @memcpy(long_x[0..48], sec1[1..49]);
@@ -9100,7 +9100,7 @@ test "JWKS: key material one byte too long is invalid_key, never truncated" {
     long_ed[32] = 0;
     try expectJwkInvalidKey("{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"x\":\"", &long_ed, "\"}");
 
-    const ml = try MlDsa65.KeyPair.generateDeterministic([_]u8{0x35} ** 32);
+    const ml = try MlDsa65.KeyPair.generateDeterministic(@as([32]u8, @splat(0x35)));
     const ml_pub = ml.public_key.toBytes();
     var long_ml: [ml_pub.len + 1]u8 = undefined;
     @memcpy(long_ml[0..ml_pub.len], &ml_pub);
@@ -9117,7 +9117,7 @@ test "Provider by issuer: iss is checked against the DISCOVERED issuer, not the 
     // carrying the discovered spelling must verify.
     const gpa = testing.allocator;
     const enc = std.base64.url_safe_no_pad.Encoder;
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x52} ** 32);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x52)));
     const pub_bytes = kp.public_key.toBytes();
     var x_b64: [43]u8 = undefined;
     var set_buf: [256]u8 = undefined;
@@ -9278,7 +9278,7 @@ test "SECURITY: acceptIdTokenProvider rejects an ID Token audienced at ANOTHER c
     // but `aud` naming a different client must fail with AudienceMismatch.
     const gpa = testing.allocator;
     const enc = std.base64.url_safe_no_pad.Encoder;
-    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x54} ** 32);
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x54)));
     const pub_bytes = kp.public_key.toBytes();
     var x_b64: [43]u8 = undefined;
     var set_buf: [256]u8 = undefined;
@@ -9382,7 +9382,7 @@ test "verify: RFC 7515 A.4 ES512 known-answer signature (and d derives x, y)" {
     try testing.expectError(error.BadSignature, verify(&kat, key));
     kat.signature = sig;
     // alg/key confusion both ways.
-    const p384 = try EcdsaP384Sha384.KeyPair.generateDeterministic([_]u8{3} ** EcdsaP384Sha384.KeyPair.seed_length);
+    const p384 = try EcdsaP384Sha384.KeyPair.generateDeterministic(@as([EcdsaP384Sha384.KeyPair.seed_length]u8, @splat(3)));
     try testing.expectError(error.AlgKeyMismatch, verify(&kat, .{ .ecdsa_p384 = p384.public_key }));
     try testing.expectError(error.AlgKeyMismatch, verify(&kat, .{ .hmac = "secret" }));
     kat.alg = .ES384;
@@ -9409,4 +9409,16 @@ test "JWKS: an RFC 7515 A.4 P-521 JWK resolves to an ES512 key; wrong coordinate
     defer bad_jwks.deinit();
     try testing.expectEqual(@as(usize, 0), bad_jwks.keys.len);
     try testing.expectEqual(JwkSkipReason.invalid_key, bad_jwks.skipped[0].reason);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

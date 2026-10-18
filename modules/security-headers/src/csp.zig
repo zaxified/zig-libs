@@ -162,7 +162,7 @@ fn checkValue(name: Name, v: []const u8) Error!void {
     for (keywords) |k| if (std.ascii.eqlIgnoreCase(k, v)) return error.UnquotedKeyword;
 }
 
-const n_names = @typeInfo(Name).@"enum".fields.len;
+const n_names = @typeInfo(Name).@"enum".field_names.len;
 
 /// Output sink: counts when `buf` is null, so one pass sizes and a second
 /// fills (the comptime path needs the exact length for its array).
@@ -189,14 +189,14 @@ const Out = struct {
 };
 
 fn renderImpl(spec: Spec, nonce: ?[]const u8, nonce_in: []const Name, buf: ?[]u8) Error!usize {
-    var present = [_]bool{false} ** n_names;
+    var present = @as([n_names]bool, @splat(false));
     var vals: [n_names][]const []const u8 = undefined;
     var order: [n_names]Name = undefined;
     var count: usize = 0;
 
     if (spec.use_defaults) {
         for (default_directives) |d| {
-            const i = @intFromEnum(d.name);
+            const i = @backingInt(d.name);
             present[i] = true;
             vals[i] = d.values;
             order[count] = d.name;
@@ -205,7 +205,7 @@ fn renderImpl(spec: Spec, nonce: ?[]const u8, nonce_in: []const Name, buf: ?[]u8
     }
     for (spec.remove) |r| {
         for (spec.directives) |d| if (d.name == r) return error.ConflictingRemove;
-        const i = @intFromEnum(r);
+        const i = @backingInt(r);
         if (!present[i]) continue;
         present[i] = false;
         var k: usize = 0;
@@ -217,9 +217,9 @@ fn renderImpl(spec: Spec, nonce: ?[]const u8, nonce_in: []const Name, buf: ?[]u8
         }
         count = k;
     }
-    var seen = [_]bool{false} ** n_names;
+    var seen = @as([n_names]bool, @splat(false));
     for (spec.directives) |d| {
-        const i = @intFromEnum(d.name);
+        const i = @backingInt(d.name);
         if (seen[i]) return error.DuplicateDirective;
         seen[i] = true;
         if (!present[i]) {
@@ -231,14 +231,14 @@ fn renderImpl(spec: Spec, nonce: ?[]const u8, nonce_in: []const Name, buf: ?[]u8
     }
     if (count == 0) return error.NoDirectives;
     for (nonce_in) |n| {
-        if (!present[@intFromEnum(n)]) return error.NonceDirectiveMissing;
+        if (!present[@backingInt(n)]) return error.NonceDirectiveMissing;
         if (!n.isSourceList()) return error.NonceDirectiveInvalid;
-        for (vals[@intFromEnum(n)]) |v| if (std.ascii.eqlIgnoreCase(v, "'none'")) return error.NonceDirectiveInvalid;
+        for (vals[@backingInt(n)]) |v| if (std.ascii.eqlIgnoreCase(v, "'none'")) return error.NonceDirectiveInvalid;
     }
 
     var out: Out = .{ .buf = buf };
     for (order[0..count], 0..) |name, idx| {
-        const values = vals[@intFromEnum(name)];
+        const values = vals[@backingInt(name)];
         if (name.isFlag() and values.len != 0) return error.UnexpectedValues;
         var with_nonce = false;
         if (nonce != null) {
@@ -444,7 +444,7 @@ test "nonce: fromBytes is base64 of the bytes, 22 chars, standard alphabet" {
     const raw = [_]u8{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
     const n = Nonce.fromBytes(&raw);
     try testing.expectEqualStrings("AAECAwQFBgcICQoLDA0ODw", n.slice());
-    const ff = Nonce.fromBytes(&([_]u8{0xfb} ** 16));
+    const ff = Nonce.fromBytes(&(@as([16]u8, @splat(0xfb))));
     try testing.expectEqual(@as(usize, Nonce.text_len), ff.slice().len);
     try testing.expectEqualStrings("+/v7+/v7+/v7+/v7+/v7+w", ff.slice());
 }
@@ -464,8 +464,8 @@ test "nonce: secure() yields distinct well-formed values" {
 }
 
 test "renderNonce: nonce appended to the named directives only; missing directive refused" {
-    const nonce = Nonce.fromBytes(&([_]u8{0} ** 16));
-    const zero_nonce = "A" ** 22;
+    const nonce = Nonce.fromBytes(&(@as([16]u8, @splat(0))));
+    const zero_nonce = strRepeat("A", 22);
     var buf: [1024]u8 = undefined;
     const got = try renderNonce(.{}, &nonce, &.{ .script_src, .style_src }, &buf);
     try testing.expectEqualStrings("default-src 'self';base-uri 'self';font-src 'self' https: data:;" ++
@@ -532,8 +532,8 @@ test "render: a buffer that fits exactly works when the LAST write is a value, o
     var short: [want.len - 1]u8 = undefined;
     try testing.expectError(error.NoSpaceLeft, render(spec, &short));
     // same for the closing quote of a nonce (the final write there)
-    const nonce = Nonce.fromBytes(&([_]u8{0} ** 16));
-    const want_n = "script-src 'nonce-" ++ ("A" ** 22) ++ "'";
+    const nonce = Nonce.fromBytes(&(@as([16]u8, @splat(0))));
+    const want_n = "script-src 'nonce-" ++ (strRepeat("A", 22)) ++ "'";
     const spec_n: Spec = .{ .use_defaults = false, .directives = &.{.{ .name = .script_src }} };
     var exact_n: [want_n.len]u8 = undefined;
     try testing.expectEqualStrings(want_n, try renderNonce(spec_n, &nonce, &.{.script_src}, &exact_n));
@@ -542,14 +542,26 @@ test "render: a buffer that fits exactly works when the LAST write is a value, o
 }
 
 test "renderNonce: an empty source list is allowed only because the nonce fills it; 'none' is refused in any case" {
-    const nonce = Nonce.fromBytes(&([_]u8{0} ** 16));
+    const nonce = Nonce.fromBytes(&(@as([16]u8, @splat(0))));
     var buf: [256]u8 = undefined;
     const spec: Spec = .{ .use_defaults = false, .directives = &.{.{ .name = .script_src }} };
     try testing.expectError(error.EmptyDirective, render(spec, &buf));
     try testing.expectError(error.EmptyDirective, renderNonce(spec, &nonce, &.{}, &buf));
-    try testing.expectEqualStrings("script-src 'nonce-" ++ ("A" ** 22) ++ "'", try renderNonce(spec, &nonce, &.{.script_src}, &buf));
+    try testing.expectEqualStrings("script-src 'nonce-" ++ (strRepeat("A", 22)) ++ "'", try renderNonce(spec, &nonce, &.{.script_src}, &buf));
     // `'none'` is matched case-insensitively (CSP keywords are)
     try testing.expectError(error.NonceDirectiveInvalid, renderNonce(.{ .use_defaults = false, .directives = &.{
         .{ .name = .script_src, .values = &.{"'NONE'"} },
     } }, &nonce, &.{.script_src}, &buf));
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

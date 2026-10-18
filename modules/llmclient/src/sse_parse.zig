@@ -279,7 +279,7 @@ test "Parser: a group whose joined data exceeds max_data_bytes is DataTooLarge, 
     // 300 legal 40-byte `data:` lines in ONE group: each line is well under
     // any per-line bound, the group is not.
     const line = "data: 0123456789012345678901234567890123\n";
-    const wire = line ** 300 ++ "\n";
+    const wire = strRepeat(line, 300) ++ "\n";
     var reader: std.Io.Reader = .fixed(wire);
     var p = Parser.init(&reader, testing.allocator);
     defer p.deinit();
@@ -287,14 +287,14 @@ test "Parser: a group whose joined data exceeds max_data_bytes is DataTooLarge, 
     try testing.expectError(error.DataTooLarge, p.next());
     try testing.expectEqual(@as(usize, 0), p.data_buf.capacity);
     // Exactly at the cap is fine: 100 lines × (34 + 1) = 3500 ≤ 4096.
-    var reader2: std.Io.Reader = .fixed(line ** 100 ++ "\n");
+    var reader2: std.Io.Reader = .fixed(strRepeat(line, 100) ++ "\n");
     var p2 = Parser.init(&reader2, testing.allocator);
     defer p2.deinit();
     p2.max_data_bytes = 3500;
     const e = (try p2.next()).?;
     try testing.expectEqual(@as(usize, 3499), e.data.len);
     p2.max_data_bytes = 3499;
-    var reader3: std.Io.Reader = .fixed(line ** 100 ++ "\n");
+    var reader3: std.Io.Reader = .fixed(strRepeat(line, 100) ++ "\n");
     p2.reader = &reader3;
     try testing.expectError(error.DataTooLarge, p2.next());
 }
@@ -548,4 +548,16 @@ fn fuzzSseStream(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!voi
         StreamMark.mark(.multi_line);
         break;
     };
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

@@ -1469,7 +1469,7 @@ pub const Connection = struct {
 
     fn writeChunkHeader(out: *std.Io.Writer, message_type: transport.MessageType, chunk_type: transport.ChunkType, size: usize) ServerError!void {
         try out.writeAll(message_type.code());
-        try out.writeByte(@intFromEnum(chunk_type));
+        try out.writeByte(@backingInt(chunk_type));
         try out.writeInt(u32, @intCast(size), .little);
     }
 
@@ -1544,7 +1544,7 @@ pub const Connection = struct {
         const sealed = try security.symmetricSealChunk(
             c.server.allocator,
             message_type.code(),
-            @intFromEnum(chunk_type),
+            @backingInt(chunk_type),
             body.writer.buffered(),
             c.sec_mode,
             &keys,
@@ -2485,7 +2485,7 @@ pub const Connection = struct {
             }
             const target = ctx.srv.store.getNode(ref.target_id.node_id);
             const node_class: services.NodeClass = if (target) |t| t.nodeClass() else .unspecified;
-            if (filter.node_class_mask != 0 and (filter.node_class_mask & @intFromEnum(node_class)) == 0) continue;
+            if (filter.node_class_mask != 0 and (filter.node_class_mask & @backingInt(node_class)) == 0) continue;
 
             if (refs.items.len >= max_refs) {
                 truncated = true;
@@ -4317,7 +4317,7 @@ test "session: an unknown authentication token is BadSessionIdInvalid, and a use
     try rig.createSession();
 
     // A guessed token names no session.
-    const bogus: encoding.NodeId = .{ .byte_string = .{ .namespace = 1, .id = &[_]u8{0xAB} ** 32 } };
+    const bogus: encoding.NodeId = .{ .byte_string = .{ .namespace = 1, .id = &@as([32]u8, @splat(0xAB)) } };
     try testing.expectError(error.ServiceFault, rig.call(
         .message,
         services.type_id.close_session_request,
@@ -5274,7 +5274,7 @@ test "hostile: a transport ERR releases the session slots on the aborted channel
     // `deinit`.
     var header_bytes: [8]u8 = undefined;
     header_bytes[0..3].* = "MSG".*;
-    header_bytes[3] = @intFromEnum(transport.ChunkType.final);
+    header_bytes[3] = @backingInt(transport.ChunkType.final);
     std.mem.writeInt(u32, header_bytes[4..8], 10_000_000, .little);
     try rig.conn.feed(&header_bytes, &rig.server_out.writer, 0);
     try rig.expectTransportError(status.bad_tcp_message_too_large);
@@ -5314,14 +5314,14 @@ test "hostile: a SessionName over 512 bytes is refused, 512 is kept" {
     try rig.openChannel();
 
     // 513 bytes: one past the delivered cap.
-    const too_long = [_]u8{'n'} ** 513;
+    const too_long = @as([513]u8, @splat('n'));
     try testing.expectError(error.ServiceFault, rig.createSessionNamed(&too_long));
     try testing.expectEqual(status.bad_encoding_limits_exceeded, rig.channel.last_service_result);
     try testing.expectEqual(@as(usize, 0), rig.srv.sessionCount());
 
     // Exactly 512 is accepted and stored verbatim — the cap is a bound, not a
     // truncation, and this pins its value from below.
-    const at_cap = [_]u8{'n'} ** 512;
+    const at_cap = @as([512]u8, @splat('n'));
     try rig.createSessionNamed(&at_cap);
     try testing.expectEqual(@as(usize, 1), rig.srv.sessionCount());
     try testing.expectEqualSlices(u8, &at_cap, rig.srv.sessions.items[0].session_name);
@@ -5516,7 +5516,7 @@ test "chunking: a multi-chunk response is emitted as C…F and a multi-chunk req
         offset += size;
         const is_last = offset >= written.len;
         try testing.expectEqual(
-            @as(u8, if (is_last) @intFromEnum(transport.ChunkType.final) else @intFromEnum(transport.ChunkType.intermediate)),
+            @as(u8, if (is_last) @backingInt(transport.ChunkType.final) else @backingInt(transport.ChunkType.intermediate)),
             chunk_type,
         );
     }
@@ -5589,7 +5589,7 @@ test "hostile: a chunk larger than the negotiated receive buffer is refused" {
     // A header claiming 100_000 bytes — never allocated, just refused.
     var header_bytes: [8]u8 = undefined;
     header_bytes[0..3].* = "MSG".*;
-    header_bytes[3] = @intFromEnum(transport.ChunkType.final);
+    header_bytes[3] = @backingInt(transport.ChunkType.final);
     std.mem.writeInt(u32, header_bytes[4..8], 100_000, .little);
     try rig.conn.feed(&header_bytes, &rig.server_out.writer, 0);
     try rig.expectTransportError(status.bad_tcp_message_too_large);
@@ -5742,10 +5742,10 @@ test "hostile: malformed bodies become ServiceFaults, never crashes" {
     // Each body is a MSG payload: a type-id NodeId followed by (broken) fields.
     const cases = [_]Case{
         // A NodeId whose encoding byte is a reserved value (0x7F).
-        .{ .name = "reserved NodeId encoding byte", .body = &[_]u8{0x7F} ++ &[_]u8{0} ** 8, .expect = status.bad_decoding_error },
+        .{ .name = "reserved NodeId encoding byte", .body = &[_]u8{0x7F} ++ &@as([8]u8, @splat(0)), .expect = status.bad_decoding_error },
         // A well-formed type id for a service this server does not implement
         // (RegisterServer, i=437).
-        .{ .name = "unimplemented service", .body = &[_]u8{ 0x01, 0x00 } ++ &[_]u8{ 0xB5, 0x01 } ++ &[_]u8{0} ** 32, .expect = status.bad_service_unsupported },
+        .{ .name = "unimplemented service", .body = &[_]u8{ 0x01, 0x00 } ++ &[_]u8{ 0xB5, 0x01 } ++ &@as([32]u8, @splat(0)), .expect = status.bad_service_unsupported },
         // A ReadRequest truncated in the middle of its RequestHeader.
         .{ .name = "truncated ReadRequest", .body = &[_]u8{ 0x01, 0x00, 0x77, 0x02, 0x00 }, .expect = status.bad_decoding_error },
     };
@@ -5839,7 +5839,7 @@ const hello_frame = blk: {
     const body_len = 5 * 4 + 4 + test_endpoint_url.len;
     var f: [8 + body_len]u8 = undefined;
     f[0..3].* = "HEL".*;
-    f[3] = @intFromEnum(transport.ChunkType.final);
+    f[3] = @backingInt(transport.ChunkType.final);
     std.mem.writeInt(u32, f[4..8], f.len, .little);
     std.mem.writeInt(u32, f[8..12], 0, .little); // ProtocolVersion
     std.mem.writeInt(u32, f[12..16], 65536, .little); // ReceiveBufferSize
@@ -5856,7 +5856,7 @@ const hello_frame = blk: {
 const msg_size_below_header = blk: {
     var f: [8]u8 = undefined;
     f[0..3].* = "MSG".*;
-    f[3] = @intFromEnum(transport.ChunkType.final);
+    f[3] = @backingInt(transport.ChunkType.final);
     std.mem.writeInt(u32, f[4..8], 3, .little);
     break :blk f;
 };
@@ -5866,7 +5866,7 @@ const msg_size_below_header = blk: {
 const msg_under_claiming = blk: {
     var f: [40]u8 = @splat(0xAA);
     f[0..3].* = "MSG".*;
-    f[3] = @intFromEnum(transport.ChunkType.final);
+    f[3] = @backingInt(transport.ChunkType.final);
     std.mem.writeInt(u32, f[4..8], 20, .little);
     break :blk f;
 };
@@ -6047,7 +6047,7 @@ test "hostile: a chunk header whose size disagrees with the bytes that follow" {
         var frame: [40]u8 = undefined;
         @memset(&frame, 0xAA);
         frame[0..3].* = "MSG".*;
-        frame[3] = @intFromEnum(transport.ChunkType.final);
+        frame[3] = @backingInt(transport.ChunkType.final);
         std.mem.writeInt(u32, frame[4..8], 20, .little); // claims 20, sends 40
         try rig.conn.feed(&frame, &rig.server_out.writer, 0);
         try rig.expectTransportError(status.bad_tcp_secure_channel_unknown);
@@ -6061,7 +6061,7 @@ test "hostile: a chunk header whose size disagrees with the bytes that follow" {
 
         var frame: [8]u8 = undefined;
         frame[0..3].* = "MSG".*;
-        frame[3] = @intFromEnum(transport.ChunkType.final);
+        frame[3] = @backingInt(transport.ChunkType.final);
         std.mem.writeInt(u32, frame[4..8], 3, .little); // smaller than the header
         try rig.conn.feed(&frame, &rig.server_out.writer, 0);
         try rig.expectTransportError(status.bad_tcp_message_type_invalid);
@@ -6078,7 +6078,7 @@ test "hostile: a chunk header whose size disagrees with the bytes that follow" {
 
         var frame: [12]u8 = undefined;
         frame[0..3].* = "MSG".*;
-        frame[3] = @intFromEnum(transport.ChunkType.final);
+        frame[3] = @backingInt(transport.ChunkType.final);
         std.mem.writeInt(u32, frame[4..8], 12, .little);
         std.mem.writeInt(u32, frame[8..12], rig.channel.channel_id, .little);
         try rig.conn.feed(&frame, &rig.server_out.writer, 0);
@@ -6104,7 +6104,7 @@ test "secure: a #None channel is refused when no endpoint advertises #None" {
     // `secureTestEndpoints` puts the None endpoint in slot 0, so slicing it off
     // is exactly the deployment in question.
     const gpa = testing.allocator;
-    var prng = std.Random.DefaultCsprng.init([_]u8{0x11} ** 32);
+    var prng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x11)));
     const pki = try TestPki.init(gpa, &prng, .{});
     defer pki.deinit(gpa);
     var endpoint_buf: [3]services.EndpointDescription = undefined;
@@ -6125,7 +6125,7 @@ test "secure: a #None channel is refused when no endpoint advertises #None" {
 
 test "secure: GetEndpoints advertises None + Sign + SignAndEncrypt with certificates and levels" {
     const gpa = testing.allocator;
-    var prng = std.Random.DefaultCsprng.init([_]u8{0x11} ** 32);
+    var prng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x11)));
     const pki = try TestPki.init(gpa, &prng, .{});
     defer pki.deinit(gpa);
     var endpoint_buf: [3]services.EndpointDescription = undefined;
@@ -6194,7 +6194,7 @@ test "secure: GetEndpoints advertises None + Sign + SignAndEncrypt with certific
 test "secure: Basic256Sha256 end-to-end at Sign and at SignAndEncrypt" {
     const gpa = testing.allocator;
     for ([_]services.MessageSecurityMode{ .sign, .sign_and_encrypt }) |mode| {
-        var prng = std.Random.DefaultCsprng.init([_]u8{0x22} ** 32);
+        var prng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x22)));
         const pki = try TestPki.init(gpa, &prng, .{});
         defer pki.deinit(gpa);
         var endpoint_buf: [3]services.EndpointDescription = undefined;
@@ -6340,7 +6340,7 @@ test "secure: Basic256Sha256 end-to-end at Sign and at SignAndEncrypt" {
 
 test "secure: token renewal keeps the old token alive for the overlap, then stops" {
     const gpa = testing.allocator;
-    var prng = std.Random.DefaultCsprng.init([_]u8{0x33} ** 32);
+    var prng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x33)));
     const pki = try TestPki.init(gpa, &prng, .{});
     defer pki.deinit(gpa);
     var endpoint_buf: [3]services.EndpointDescription = undefined;
@@ -6448,7 +6448,7 @@ test "secure: token renewal keeps the old token alive for the overlap, then stop
 // `#None` beside a secured endpoint. A renewal must keep the channel's policy.
 test "secure: a None channel cannot be renewed into Basic256Sha256 (H1)" {
     const gpa = testing.allocator;
-    var prng = std.Random.DefaultCsprng.init([_]u8{0x3A} ** 32);
+    var prng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x3A)));
     const pki = try TestPki.init(gpa, &prng, .{});
     defer pki.deinit(gpa);
     var endpoint_buf: [3]services.EndpointDescription = undefined;
@@ -6494,7 +6494,7 @@ test "secure: a None channel cannot be renewed into Basic256Sha256 (H1)" {
 // and asyncua both demand exactly `previous + 1` (with the wrap below 1024).
 test "secure: a replayed MSG chunk is refused by its SequenceNumber (M1)" {
     const gpa = testing.allocator;
-    var prng = std.Random.DefaultCsprng.init([_]u8{0x3B} ** 32);
+    var prng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x3B)));
     const pki = try TestPki.init(gpa, &prng, .{});
     defer pki.deinit(gpa);
     var endpoint_buf: [3]services.EndpointDescription = undefined;
@@ -6565,7 +6565,7 @@ fn forgedOpn(gpa: std.mem.Allocator, pki: TestPki, chunk_type: u8, encrypted_len
 
 test "secure: a multi-chunk or oversize OPN is refused before any RSA operation (review 2026-10-06 a)" {
     const gpa = testing.allocator;
-    var prng = std.Random.DefaultCsprng.init([_]u8{0x3C} ** 32);
+    var prng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x3C)));
     const pki = try TestPki.init(gpa, &prng, .{});
     defer pki.deinit(gpa);
     var endpoint_buf: [3]services.EndpointDescription = undefined;
@@ -6594,7 +6594,7 @@ test "secure: a multi-chunk or oversize OPN is refused before any RSA operation 
 
 test "secure: max_opn_encrypted_len admits a real OPN at its size and refuses it one byte under" {
     const gpa = testing.allocator;
-    var prng = std.Random.DefaultCsprng.init([_]u8{0x3D} ** 32);
+    var prng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x3D)));
     const pki = try TestPki.init(gpa, &prng, .{});
     defer pki.deinit(gpa);
     var endpoint_buf: [3]services.EndpointDescription = undefined;
@@ -6725,7 +6725,7 @@ test "sampleDue: an OutOfMemory leaves the monitored item intact (L1)" {
 
 test "secure: an expired SecurityToken is refused" {
     const gpa = testing.allocator;
-    var prng = std.Random.DefaultCsprng.init([_]u8{0x44} ** 32);
+    var prng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x44)));
     const pki = try TestPki.init(gpa, &prng, .{});
     defer pki.deinit(gpa);
     var endpoint_buf: [3]services.EndpointDescription = undefined;
@@ -6757,7 +6757,7 @@ test "secure: an expired SecurityToken is refused" {
 
 test "secure negatives: tampered signature, wrong keys, malformed padding" {
     const gpa = testing.allocator;
-    var prng = std.Random.DefaultCsprng.init([_]u8{0x55} ** 32);
+    var prng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x55)));
     const pki = try TestPki.init(gpa, &prng, .{});
     defer pki.deinit(gpa);
     var endpoint_buf: [3]services.EndpointDescription = undefined;
@@ -6846,7 +6846,7 @@ test "secure negatives: tampered signature, wrong keys, malformed padding" {
 
 test "secure negatives: the OpenSecureChannel gate" {
     const gpa = testing.allocator;
-    var prng = std.Random.DefaultCsprng.init([_]u8{0x66} ** 32);
+    var prng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x66)));
     const pki = try TestPki.init(gpa, &prng, .{});
     defer pki.deinit(gpa);
 
@@ -6976,7 +6976,7 @@ test "secure negatives: the OpenSecureChannel gate" {
 
 test "secure: the session's ClientSignature must cover serverCertificate + serverNonce" {
     const gpa = testing.allocator;
-    var prng = std.Random.DefaultCsprng.init([_]u8{0x77} ** 32);
+    var prng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x77)));
     const pki = try TestPki.init(gpa, &prng, .{});
     defer pki.deinit(gpa);
     var endpoint_buf: [3]services.EndpointDescription = undefined;
@@ -7079,7 +7079,7 @@ test "secure: the session's ClientSignature must cover serverCertificate + serve
 
 test "secure: a session presented on a different SecureChannel is refused" {
     const gpa = testing.allocator;
-    var prng = std.Random.DefaultCsprng.init([_]u8{0x88} ** 32);
+    var prng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x88)));
     const pki = try TestPki.init(gpa, &prng, .{});
     defer pki.deinit(gpa);
     var endpoint_buf: [3]services.EndpointDescription = undefined;
@@ -7137,7 +7137,7 @@ test "secure: a session presented on a different SecureChannel is refused" {
 
 test "secure: encrypted UserNameIdentityToken over a SecurityPolicy#None channel" {
     const gpa = testing.allocator;
-    var prng = std.Random.DefaultCsprng.init([_]u8{0x99} ** 32);
+    var prng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x99)));
     const pki = try TestPki.init(gpa, &prng, .{});
     defer pki.deinit(gpa);
     var endpoint_buf: [3]services.EndpointDescription = undefined;
@@ -7449,7 +7449,7 @@ fn scenarioSecure(rig: *TestRig, pki: TestPki) !void {
 
 fn secureConfigGlobal() !struct { cfg: Config, pki: TestPki } {
     if (pki_global == null) {
-        pki_prng = std.Random.DefaultCsprng.init([_]u8{0x3D} ** 32);
+        pki_prng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x3D)));
         pki_global = try TestPki.init(std.heap.page_allocator, &pki_prng, .{}); // global-alloc-ok: process-lifetime fuzz/test fixture cached across driver runs, outlives testing.allocator's per-test teardown
     }
     const pki = pki_global.?;

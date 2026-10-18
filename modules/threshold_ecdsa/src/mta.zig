@@ -337,7 +337,7 @@ fn finalizeLift(c_b: paillier.Ciphertext, alice_sk: paillier.SecretKey, centered
     // `β'` (which the proof's slack also admits) is what `centeredModQ`
     // handles (relation audit LOW 3).
     const n_len = alice_sk.nByteLen();
-    var wide: [paillier.modulus_bytes]u8 = [_]u8{0} ** paillier.modulus_bytes;
+    var wide: [paillier.modulus_bytes]u8 = @as([paillier.modulus_bytes]u8, @splat(0));
     defer std.crypto.secureZero(u8, wide[0..n_len]);
     try alpha_fe.toBytes(wide[0..n_len], .big);
     if (!centered) return zkproofs.scalarFromWide(wide[0..n_len]);
@@ -714,7 +714,7 @@ const test_ctx: []const u8 = "mta-test-session";
 const testing = std.testing;
 
 fn scalarFromU64(v: u64) Scalar {
-    var buf = [_]u8{0} ** 48;
+    var buf = @as([48]u8, @splat(0));
     std.mem.writeInt(u64, buf[40..48], v, .big);
     return Scalar.fromBytes48(buf, .big);
 }
@@ -863,7 +863,7 @@ test "MtA composes over real keygenTrustedDealer KeyShare Paillier material" {
 test "Phase 2c checked init/response compose correctly: α + β ≡ a·b (mod q), same as Phase 2b" {
     // 2048-bit: `mtaBobResponseChecked` refuses N <= q⁷ (audit F5). Heavy
     // lane is ReleaseSafe; skipped only under -Dstrict-debug.
-    if (builtin.mode == .Debug) return error.SkipZigTest;
+    if (builtin.mode == .debug) return error.SkipZigTest;
     var kprng = std.Random.DefaultPrng.init(0x636865636b6564); // "checked"
     var kp: paillier.KeyPair = undefined;
     try paillier.generate(kprng.random(), 2048, &kp);
@@ -888,7 +888,7 @@ test "Phase 2c checked init/response compose correctly: α + β ≡ a·b (mod q)
 }
 
 test "Phase 2c: mtaBobResponseChecked's c_b differs byte-for-byte from mtaBobResponse's (fresh r_b changes the ciphertext, not the plaintext)" {
-    if (builtin.mode == .Debug) return error.SkipZigTest; // 2048-bit, see above
+    if (builtin.mode == .debug) return error.SkipZigTest; // 2048-bit, see above
     var kprng = std.Random.DefaultPrng.init(0x64696666_6572); // "differ"
     var kp: paillier.KeyPair = undefined;
     try paillier.generate(kprng.random(), 2048, &kp);
@@ -934,7 +934,7 @@ test "Phase 2c end-to-end: mtaAliceInitChecked -> verifyAliceRange -> mtaBobResp
     // both > q⁷ ≈ 2^1792). Slow in real Debug, so it is gated -- but this
     // module is `heavy` in build.zig, so the DEFAULT lane builds it at
     // ReleaseSafe and DOES run this; it skips ONLY under `-Dstrict-debug`.
-    if (builtin.mode == .Debug) return error.SkipZigTest;
+    if (builtin.mode == .debug) return error.SkipZigTest;
     var kprng = std.Random.DefaultPrng.init(0x66696e616c697a65); // "finalize"
     const krandom = kprng.random();
     var kp: paillier.KeyPair = undefined;
@@ -1048,7 +1048,7 @@ fn aliceRecoversBobsInput(
     var plaintext: paillier.Fe = undefined;
     try paillier.decrypt(&sk, c_b, &plaintext);
     const n_len = sk.nByteLen();
-    var buf: [paillier.modulus_bytes]u8 = [_]u8{0} ** paillier.modulus_bytes;
+    var buf: [paillier.modulus_bytes]u8 = @as([paillier.modulus_bytes]u8, @splat(0));
     try plaintext.toBytes(buf[0..n_len], .big);
 
     var num = try bigFromBytesTest(allocator, buf[0..n_len]);
@@ -1101,7 +1101,7 @@ test "audit F5: Alice's own decryption of c_B must not reveal Bob's b (the β' b
 
     // Checked path (Phase 2c, what signWithShares runs), 2048-bit key. Heavy
     // lane is ReleaseSafe; skipped only under -Dstrict-debug.
-    if (builtin.mode != .Debug) {
+    if (builtin.mode != .debug) {
         var kprng = std.Random.DefaultPrng.init(0xF5_0002);
         var kp: paillier.KeyPair = undefined;
         try paillier.generate(kprng.random(), 2048, &kp);
@@ -1150,7 +1150,7 @@ test "centeredModQ: a negative β' (wrapped plaintext) still yields α ≡ a·b 
 }
 
 test "mutation audit: the verified finalize centres a wrapped plaintext; the checked finalize is bound to the proof context" {
-    if (builtin.mode == .Debug) return error.SkipZigTest;
+    if (builtin.mode == .debug) return error.SkipZigTest;
     var kprng = std.Random.DefaultPrng.init(0x6d75_7461_7564_6974);
     const krandom = kprng.random();
     var kp: paillier.KeyPair = undefined;

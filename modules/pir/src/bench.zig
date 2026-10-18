@@ -48,8 +48,8 @@ fn benchShardOverhead(
     const database = try pir.Database.init(bytes, record_len);
     const n_words = P.answerWords(record_len);
 
-    const s0 = [_]u8{0x11} ** 16;
-    const s1 = [_]u8{0x22} ** 16;
+    const s0 = @as([16]u8, @splat(0x11));
+    const s1 = @as([16]u8, @splat(0x22));
     var shares: [2]P.Share = undefined;
     try P.query(count / 3, &s0, &s1, &shares);
 

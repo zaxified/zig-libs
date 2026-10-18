@@ -155,7 +155,7 @@ test "RFC 9369 A.1: v2 initial secrets and client/server key/iv/hp (same DCID as
 }
 
 test "RFC 9369 A.2: client Initial — protect (seal + header protection) is byte-exact" {
-    var payload = [_]u8{0} ** a2_payload_len;
+    var payload = @as([a2_payload_len]u8, @splat(0));
     @memcpy(payload[0..rfc9369_a2_crypto_frame.len], &rfc9369_a2_crypto_frame);
 
     var pkt: [a2_header.len + a2_payload_len + 16]u8 = undefined;

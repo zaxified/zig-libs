@@ -19,13 +19,13 @@ const talloc = std.testing.allocator;
 
 /// A deterministic, distinct, nonzero blinding per index.
 fn gammaFor(j: usize) [32]u8 {
-    var g = [_]u8{0} ** 32;
+    var g = @as([32]u8, @splat(0));
     std.mem.writeInt(u64, g[0..8], 0x9e37_79b9_7f4a_7c15 *% (@as(u64, j) + 1), .little);
     return scalar.reduce(g);
 }
 
 fn commitU64(gens: Generators, v: u64, gamma: [32]u8) Ristretto255 {
-    var v_bytes = [_]u8{0} ** 32;
+    var v_bytes = @as([32]u8, @splat(0));
     std.mem.writeInt(u64, v_bytes[0..8], v, .little);
     return bp.commit(gens, v_bytes, gamma);
 }
@@ -203,11 +203,11 @@ test "soundness: one flipped bit in any 32-byte element of an aggregated proof i
 test "deltaYZMultiple: n = 2, m = 2 against the formula expanded by hand" {
     // delta = (z - z^2)(1 + y + y^2 + y^3) - z^3 * (2^2 - 1) * (1 + z)
     // y = 3, z = 5: (5 - 25) * 40 - 125 * 3 * 6 = -800 - 2250 = -3050.
-    const y = [_]u8{3} ++ [_]u8{0} ** 31;
-    const z = [_]u8{5} ++ [_]u8{0} ** 31;
+    const y = [_]u8{3} ++ @as([31]u8, @splat(0));
+    const z = [_]u8{5} ++ @as([31]u8, @splat(0));
     const got = try bp.deltaYZMultiple(talloc, y, z, 2, 2);
     // 3050 = 0x0BEA, little-endian, negated.
-    const want = scalar.neg([_]u8{ 0xEA, 0x0B } ++ [_]u8{0} ** 30);
+    const want = scalar.neg([_]u8{ 0xEA, 0x0B } ++ @as([30]u8, @splat(0)));
     try std.testing.expectEqualSlices(u8, &want, &got);
 
     // m = 1 is deltaYZ.

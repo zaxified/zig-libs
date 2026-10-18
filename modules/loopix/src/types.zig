@@ -265,7 +265,7 @@ pub const MixHeader = struct {
     pub const wire_len = 1 + 8 + 1 + 1 + max_hops * 4 + 1 + max_hops * 4 + 4;
 
     pub fn encode(self: MixHeader, buf: *[wire_len]u8) void {
-        buf[0] = @intFromEnum(self.kind);
+        buf[0] = @backingInt(self.kind);
         std.mem.writeInt(u64, buf[1..9], self.id, .little);
         buf[9] = self.hop;
         buf[10] = self.n_hops;
@@ -293,9 +293,9 @@ pub const MixHeader = struct {
     pub fn decode(payload: []const u8) DecodeError!MixHeader {
         if (payload.len < wire_len) return error.MalformedMixHeader;
         const kind: MsgKind = switch (payload[0]) {
-            @intFromEnum(MsgKind.real) => .real,
-            @intFromEnum(MsgKind.loop_cover) => .loop_cover,
-            @intFromEnum(MsgKind.drop_cover) => .drop_cover,
+            @backingInt(MsgKind.real) => .real,
+            @backingInt(MsgKind.loop_cover) => .loop_cover,
+            @backingInt(MsgKind.drop_cover) => .drop_cover,
             else => return error.MalformedMixHeader,
         };
         const hop = payload[9];
@@ -412,7 +412,7 @@ test "MixHeader.decode fails closed on truncated / malformed input, never OOB" {
     // out-of-bounds read / panic on hostile bytes (checked under ReleaseSafe).
     var full: [MixHeader.wire_len]u8 = undefined;
     @memset(&full, 0);
-    full[0] = @intFromEnum(MsgKind.real);
+    full[0] = @backingInt(MsgKind.real);
     var i: usize = 0;
     while (i < MixHeader.wire_len) : (i += 1) {
         try testing.expectError(error.MalformedMixHeader, MixHeader.decode(full[0..i]));
@@ -427,14 +427,14 @@ test "MixHeader.decode fails closed on truncated / malformed input, never OOB" {
     // n_hops past the route capacity would let currentMix/nextHop over-index.
     var bad_nhops: [MixHeader.wire_len]u8 = undefined;
     @memset(&bad_nhops, 0);
-    bad_nhops[0] = @intFromEnum(MsgKind.real);
+    bad_nhops[0] = @backingInt(MsgKind.real);
     bad_nhops[10] = max_layers + 1;
     try testing.expectError(error.MalformedMixHeader, MixHeader.decode(&bad_nhops));
 
     // hop running past n_hops is likewise rejected.
     var bad_hop: [MixHeader.wire_len]u8 = undefined;
     @memset(&bad_hop, 0);
-    bad_hop[0] = @intFromEnum(MsgKind.real);
+    bad_hop[0] = @backingInt(MsgKind.real);
     bad_hop[10] = 3; // n_hops
     bad_hop[9] = 4; // hop > n_hops
     try testing.expectError(error.MalformedMixHeader, MixHeader.decode(&bad_hop));
@@ -480,7 +480,7 @@ fn encodedHeader(comptime kind: MsgKind, comptime id: u64, comptime hop: u8, com
 }
 
 const valid_header = encodedHeader(.loop_cover, 0xDEADBEEFCAFE, 2, 3, .{ 2, 4, 7, 11, 0, 0, 0 });
-const boundary_header = encodedHeader(.real, 42, max_layers, max_layers, .{0} ** max_hops);
+const boundary_header = encodedHeader(.real, 42, max_layers, max_layers, @splat(0));
 
 /// The three malformed shapes `MixHeader.decode fails closed on truncated /
 /// malformed input` builds at run time, lifted to comptime for the corpus.
@@ -502,7 +502,7 @@ const bad_hop_header = blk: {
     const out = b;
     break :blk out;
 };
-const long_header = valid_header ++ [_]u8{0xAA} ** 8;
+const long_header = valid_header ++ @as([8]u8, @splat(0xAA));
 const delays_header = blk: {
     var h = MixHeader{ .kind = .real, .id = 5, .hop = 1, .n_hops = 3, .route = .{ 1, 4, 7, 13, 0, 0, 0 } };
     h.has_delays = true;
@@ -538,7 +538,7 @@ const header_seeds = [_][]const u8{
     seed(&long_header), // longer than wire_len: still decodes
     seed(&delays_header), // sender-chosen delays + a recipient: decodes
     seed(&bad_flag_header), // MalformedMixHeader: has_delays neither 0 nor 1
-    seed(&[_]u8{0} ** MixHeader.wire_len), // all zeros: kind .real, hop 0, n_hops 0
+    seed(&@as([MixHeader.wire_len]u8, @splat(0))), // all zeros: kind .real, hop 0, n_hops 0
     seed(""), // the ONE input the collapsed harness ever ran
 };
 
@@ -574,7 +574,7 @@ fn fuzzMixHeaderDecode(comptime S: type, smith: *S, _: std.mem.Allocator) anyerr
     const len: usize = fz.drawInput(S, smith, &buf, &header_seeds);
     const h = MixHeader.decode(buf[0..len]) catch {
         HeaderMark.mark(.refused);
-        if (len >= wire_len_min and buf[0] > @intFromEnum(MsgKind.drop_cover)) HeaderMark.mark(.refused_kind);
+        if (len >= wire_len_min and buf[0] > @backingInt(MsgKind.drop_cover)) HeaderMark.mark(.refused_kind);
         if (len >= wire_len_min and buf[10] > max_layers) HeaderMark.mark(.refused_hops);
         return;
     };

@@ -865,7 +865,7 @@ test "Signature.encoded_bytes is 80 (48 G1 compressed + 32 Fr)" {
 
 test "Signature round-trips through toBytes/fromBytes" {
     const a = G1.Affine.generator;
-    var e_bytes = [_]u8{0} ** 32;
+    var e_bytes = @as([32]u8, @splat(0));
     e_bytes[31] = 9;
     const e = try Fr.fromBytes(e_bytes);
     const sig: Signature = .{ .a = a, .e = e };
@@ -877,7 +877,7 @@ test "Signature round-trips through toBytes/fromBytes" {
 
 test "Signature.fromBytes rejects e == 0" {
     const a = G1.Affine.generator;
-    const e_zero = [_]u8{0} ** 32;
+    const e_zero = @as([32]u8, @splat(0));
     const sig: Signature = .{ .a = a, .e = Fr.zero };
     var bytes = sig.toBytes();
     bytes[G1.compressed_bytes..].* = e_zero;
@@ -890,16 +890,16 @@ test "Proof.encodedLen matches the draft-12 formula (3*48 + (4+U)*32)" {
 }
 
 test "Proof round-trips through toBytes/fromBytes (U = 2 undisclosed)" {
-    var m1b = [_]u8{0} ** 32;
+    var m1b = @as([32]u8, @splat(0));
     m1b[31] = 11;
-    var m2b = [_]u8{0} ** 32;
+    var m2b = @as([32]u8, @splat(0));
     m2b[31] = 22;
     const m_hat = try testing.allocator.alloc(Fr, 2);
     defer testing.allocator.free(m_hat);
     m_hat[0] = try Fr.fromBytes(m1b);
     m_hat[1] = try Fr.fromBytes(m2b);
 
-    var scalar_bytes = [_]u8{0} ** 32;
+    var scalar_bytes = @as([32]u8, @splat(0));
     scalar_bytes[31] = 3;
     const some_scalar = try Fr.fromBytes(scalar_bytes);
 
@@ -947,10 +947,10 @@ test "proofGen validates disclosed_indexes/random_scalars count before touching 
     const messages = [_][]const u8{ "a", "b", "c" };
     var sig_bytes: [Signature.encoded_bytes]u8 = @splat(0);
     sig_bytes[0..G1.compressed_bytes].* = G1.toBytesCompressed(G1.Affine.generator);
-    var e_bytes = [_]u8{0} ** 32;
+    var e_bytes = @as([32]u8, @splat(0));
     e_bytes[31] = 1;
     sig_bytes[G1.compressed_bytes..].* = e_bytes;
-    var sk_bytes = [_]u8{0} ** 32;
+    var sk_bytes = @as([32]u8, @splat(0));
     sk_bytes[31] = 1;
     const sk = try testSecretKey(sk_bytes);
     const pk = keys.skToPk(&sk);
@@ -1004,10 +1004,10 @@ test "proofGen REJECTS a duplicate disclosed index instead of silently under-cou
     const messages = [_][]const u8{ "a", "b", "c" };
     var sig_bytes: [Signature.encoded_bytes]u8 = @splat(0);
     sig_bytes[0..G1.compressed_bytes].* = G1.toBytesCompressed(G1.Affine.generator);
-    var e_bytes = [_]u8{0} ** 32;
+    var e_bytes = @as([32]u8, @splat(0));
     e_bytes[31] = 1;
     sig_bytes[G1.compressed_bytes..].* = e_bytes;
-    var sk_bytes = [_]u8{0} ** 32;
+    var sk_bytes = @as([32]u8, @splat(0));
     sk_bytes[31] = 1;
     const sk = try testSecretKey(sk_bytes);
     const pk = keys.skToPk(&sk);
@@ -1015,10 +1015,10 @@ test "proofGen REJECTS a duplicate disclosed index instead of silently under-cou
     // NONZERO scalars throughout — critically r1, r2 != 0, so this
     // exercises the duplicate-index guard itself rather than the separate
     // zero-scalar rejections.
-    var one_bytes = [_]u8{0} ** 32;
+    var one_bytes = @as([32]u8, @splat(0));
     one_bytes[31] = 1;
     const one = try Fr.fromBytes(one_bytes);
-    const random_scalars = [_]Fr{one} ** 6; // 5 + formula's undisclosed_count(1)
+    const random_scalars = @as([6]Fr, @splat(one)); // 5 + formula's undisclosed_count(1)
     try testing.expectError(error.RandomScalarCountMismatch, proofGen(
         testing.allocator,
         pk,
@@ -1032,7 +1032,7 @@ test "proofGen REJECTS a duplicate disclosed index instead of silently under-cou
 }
 
 test "proofVerify validates disclosed_messages/disclosed_indexes count before touching the core" {
-    var sk_bytes = [_]u8{0} ** 32;
+    var sk_bytes = @as([32]u8, @splat(0));
     sk_bytes[31] = 1;
     const sk = try testSecretKey(sk_bytes);
     const pk = keys.skToPk(&sk);
@@ -1050,11 +1050,11 @@ test "proofVerify validates disclosed_messages/disclosed_indexes count before to
 // ── refusals the mutation run of 2026-10-05 found unpinned ───────────────
 
 /// `(0, 2)`: on `y² = x³ + 4`, of order 3, so outside `G1`.
-const g1_order3_compressed: [G1.compressed_bytes]u8 = .{0x80} ++ .{0} ** (G1.compressed_bytes - 1);
-const g1_identity_compressed: [G1.compressed_bytes]u8 = .{0xc0} ++ .{0} ** (G1.compressed_bytes - 1);
+const g1_order3_compressed: [G1.compressed_bytes]u8 = [_]u8{0x80} ++ @as([G1.compressed_bytes - 1]u8, @splat(0));
+const g1_identity_compressed: [G1.compressed_bytes]u8 = [_]u8{0xc0} ++ @as([G1.compressed_bytes - 1]u8, @splat(0));
 
 fn testKeyPair() !struct { sk: SecretKey, pk: PublicKey } {
-    var sk_bytes = [_]u8{0} ** 32;
+    var sk_bytes = @as([32]u8, @splat(0));
     sk_bytes[31] = 5;
     const sk = try testSecretKey(sk_bytes);
     return .{ .sk = sk, .pk = keys.skToPk(&sk) };
@@ -1185,7 +1185,7 @@ test "RNG seam: calculateRandomScalars really draws entropy, and round-trips thr
     // sign a message, then prove-and-verify selective disclosure with
     // random_scalars drawn from the same `io` (U = 0 undisclosed, so 5
     // scalars — r1, r2, e~, r1~, r3~).
-    var sk_bytes = [_]u8{0} ** 32;
+    var sk_bytes = @as([32]u8, @splat(0));
     sk_bytes[31] = 1;
     const sk = try testSecretKey(sk_bytes);
     const pk = keys.skToPk(&sk);
@@ -1236,7 +1236,7 @@ const Fixtures = struct {
     proof_u2: [Proof.encodedLen(2)]u8 = undefined,
 
     fn build(self: *Fixtures) void {
-        var sk_bytes = [_]u8{0} ** 32;
+        var sk_bytes = @as([32]u8, @splat(0));
         sk_bytes[31] = 1;
         const sk = testSecretKey(sk_bytes) catch unreachable;
         const pk = keys.skToPk(&sk);
@@ -1505,7 +1505,7 @@ const ProofCorpus = struct {
         self.push(&t0);
         self.push(fx.proof_u0[0 .. fx.proof_u0.len - 1]); // one octet under the floor
         self.push(fx.proof_u2[0 .. fx.proof_u2.len - 1]); // over the floor, bad remainder
-        self.push(&[_]u8{0} ** Proof.encodedLen(0)); // all-zero at a legal length
+        self.push(&@as([Proof.encodedLen(0)]u8, @splat(0))); // all-zero at a legal length
         self.push(""); // and the input this target used to run for ever
         return self.entries[0..self.n];
     }
@@ -1587,7 +1587,7 @@ test "corpus: Proof seeds reach the decoder, and the counts are pinned" {
 /// A key pair from the source: 16 random octets in the low half of a 32-octet
 /// scalar (below the group order under either byte order, forced nonzero).
 fn drawKeyPair(comptime S: type, src: *S) !struct { sk: SecretKey, pk: PublicKey } {
-    var b = [_]u8{0} ** 32;
+    var b = @as([32]u8, @splat(0));
     src.bytes(b[16..]);
     b[31] |= 1;
     const sk = try testSecretKey(b);
@@ -1803,7 +1803,7 @@ test "F4 oracle: computeB (sequential) == msmLoop == msmPippenger == computeBPub
     // "well past it" boundary (8 already clears msm_crossover == 2 by 4x) --
     // trimmed in Debug only, full set kept in ReleaseFast/ReleaseSafe/
     // ReleaseSmall.
-    const ls: []const usize = if (builtin.mode == .Debug)
+    const ls: []const usize = if (builtin.mode == .debug)
         &[_]usize{ 0, 1, 2, 3, 4, 8 }
     else
         &[_]usize{ 0, 1, 2, 3, 4, 8, 16, 64, 300 };
@@ -1856,7 +1856,7 @@ test "F4 oracle: proofVerifyInit's MSM form matches the sequential draft-12 form
     // total = R (disclosed) + U (undisclosed); cover R/U = 0 and a spread
     // straddling msm_crossover (== 2) for each MSM call (T1 has 3 terms,
     // Bv R+2, T2 U+2). Debug trims the 300 case (createGenerators dominates).
-    const totals: []const usize = if (builtin.mode == .Debug)
+    const totals: []const usize = if (builtin.mode == .debug)
         &[_]usize{ 0, 1, 2, 3, 8 }
     else
         &[_]usize{ 0, 1, 2, 3, 8, 300 };

@@ -369,7 +369,7 @@ test "encode: round-trip small text" {
 }
 
 test "encode: round-trip highly repetitive" {
-    const data = "abcabcabc" ** 5000;
+    const data = strRepeat("abcabcabc", 5000);
     try roundTrip(data);
 }
 
@@ -465,8 +465,8 @@ test "encode: round-trip every input shape" {
     try roundTrip("a");
     try roundTrip("ab");
     try roundTrip("abc");
-    try roundTrip(&[_]u8{0} ** 5);
-    try roundTrip(&[_]u8{0xff} ** 100000);
+    try roundTrip(&@as([5]u8, @splat(0)));
+    try roundTrip(&@as([100000]u8, @splat(0xff)));
     {
         // Every byte value present, so the literal code spans the alphabet.
         var buf: [256]u8 = undefined;
@@ -676,4 +676,16 @@ test "corpus: every reference stream reaches the decoder, and the output is pinn
     try testing.expectEqual(@as(usize, 17), decoded);
     try testing.expectEqual(@as(usize, 3), refused);
     try testing.expectEqual(@as(usize, 981867), octets_out);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

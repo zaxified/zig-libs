@@ -224,14 +224,14 @@ test "match overlap: family, direction, prefix containment, host bits" {
     // /0 covers everything of its family, nothing of the other.
     const any4: Match = .{ .ipv4 = .{ .addr = @splat(0), .prefix_len = 0 } };
     try testing.expect(any4.overlaps(outside));
-    const v6: Match = .{ .ipv6 = .{ .addr = .{ 0x20, 0x01, 0x0d, 0xb8 } ++ [_]u8{0} ** 12, .prefix_len = 32 } };
-    const v6_in: Match = .{ .ipv6 = .{ .addr = .{ 0x20, 0x01, 0x0d, 0xb8, 0, 1 } ++ [_]u8{0} ** 10, .prefix_len = 56 } };
-    const v6_out: Match = .{ .ipv6 = .{ .addr = .{ 0x20, 0x01, 0x0d, 0xb9 } ++ [_]u8{0} ** 12, .prefix_len = 48 } };
+    const v6: Match = .{ .ipv6 = .{ .addr = .{ 0x20, 0x01, 0x0d, 0xb8 } ++ @as([12]u8, @splat(0)), .prefix_len = 32 } };
+    const v6_in: Match = .{ .ipv6 = .{ .addr = .{ 0x20, 0x01, 0x0d, 0xb8, 0, 1 } ++ @as([10]u8, @splat(0)), .prefix_len = 56 } };
+    const v6_out: Match = .{ .ipv6 = .{ .addr = .{ 0x20, 0x01, 0x0d, 0xb9 } ++ @as([12]u8, @splat(0)), .prefix_len = 48 } };
     try testing.expect(!any4.overlaps(v6));
     try testing.expect(v6.overlaps(v6_in) and v6_in.overlaps(v6));
     try testing.expect(!v6.overlaps(v6_out));
-    const v6_host_a: Match = .{ .ipv6 = .{ .addr = [_]u8{0} ** 15 ++ .{1} } };
-    const v6_host_b: Match = .{ .ipv6 = .{ .addr = [_]u8{0} ** 15 ++ .{2} } };
+    const v6_host_a: Match = .{ .ipv6 = .{ .addr = @as([15]u8, @splat(0)) ++ .{1} } };
+    const v6_host_b: Match = .{ .ipv6 = .{ .addr = @as([15]u8, @splat(0)) ++ .{2} } };
     try testing.expect(!v6_host_a.overlaps(v6_host_b));
     try testing.expect(v6_host_a.overlaps(v6_host_a));
 }

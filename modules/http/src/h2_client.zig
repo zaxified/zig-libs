@@ -1340,7 +1340,7 @@ test "h2 client: response spanning many DATA frames replenishes flow control (of
     // 48 KiB in 1 KiB DATA frames â€” most of the 64 KiB initial window; the
     // client must grant it back via WINDOW_UPDATE or a real server would
     // stall on the next response (asserted below via window reconciliation).
-    const chunk = "0123456789abcdef" ** 64; // 1024 B
+    const chunk = strRepeat("0123456789abcdef", 64); // 1024 B
     var srv: ScriptedServer = try .init(out.buffered());
     defer srv.deinit();
     try srv.conn.sendHeaders(&srv.wire, sid, &ok_fields, false);
@@ -1882,4 +1882,16 @@ test "h2 client: DATA arriving before any HEADERS is not handed to the reader (Â
     // guard this returns "leak".
     var rbuf: [64]u8 = undefined;
     try testing.expectError(error.ConnectionClosed, s.readBody(sid, &rbuf));
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

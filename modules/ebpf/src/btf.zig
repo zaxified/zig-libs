@@ -141,7 +141,7 @@ pub const Kind = std_btf.Kind;
 /// `error.MalformedBtf` rather than a silently-mis-sized record: the record's
 /// trailing data length depends on the kind, so guessing would desynchronize
 /// the whole type section.
-pub const max_kind: u5 = @intFromEnum(Kind.enum64);
+pub const max_kind: u5 = @backingInt(Kind.enum64);
 
 /// `enum btf_func_linkage` — carried in a `BTF_KIND_FUNC`'s `vlen`, which is
 /// why `FUNC` records have no trailing data despite a non-zero `vlen`.
@@ -284,7 +284,7 @@ pub const Type = struct {
 
     /// A `FUNC`'s linkage lives in `vlen`, not in trailing data.
     pub fn funcLinkage(self: Type) ?FuncLinkage {
-        return if (self.kind == .func) @enumFromInt(self.vlen) else null;
+        return if (self.kind == .func) @fromBackingInt(@intCast(self.vlen)) else null;
     }
 
     /// True for the kinds `skipModifiers` walks through.
@@ -581,7 +581,7 @@ pub const Btf = struct {
     pub fn varLinkage(self: *const Btf, t: Type) TypeError!VarLinkage {
         _ = self;
         if (t.kind != .@"var") return error.WrongKind;
-        return @enumFromInt(rd32(t.extra, 0));
+        return @fromBackingInt(@intCast(rd32(t.extra, 0)));
     }
 
     /// Entry `i` of a `DATASEC`.
@@ -899,8 +899,8 @@ pub fn parse(gpa: std.mem.Allocator, bytes: []const u8, opts: ParseOptions) Pars
         const info = rd32(types, off + 4);
         const vlen: u16 = @truncate(info & 0xffff);
         const kind_raw: u5 = @truncate((info >> 24) & 0x1f);
-        if (kind_raw > max_kind or kind_raw == @intFromEnum(Kind.unknown)) return error.MalformedBtf;
-        const kind: Kind = @enumFromInt(kind_raw);
+        if (kind_raw > max_kind or kind_raw == @backingInt(Kind.unknown)) return error.MalformedBtf;
+        const kind: Kind = @fromBackingInt(@intCast(kind_raw));
         const extra = extraLen(kind, vlen);
         const total = @as(u64, type_header_size) + extra;
         if (type_len - off < total) return error.MalformedBtf;
@@ -956,7 +956,7 @@ fn decodeAt(types: []const u8, off: u32, id: u32) TypeError!Type {
     if (off + type_header_size > types.len) return error.TypeIdOutOfRange;
     const info = rd32(types, off + 4);
     const vlen: u16 = @truncate(info & 0xffff);
-    const kind: Kind = @enumFromInt(@as(u5, @truncate((info >> 24) & 0x1f)));
+    const kind: Kind = @fromBackingInt(@intCast(@as(u5, @truncate((info >> 24) & 0x1f))));
     const extra_len = extraLen(kind, vlen);
     const start = off + type_header_size;
     if (start + extra_len > types.len) return error.TypeIdOutOfRange;
@@ -1137,7 +1137,7 @@ pub const Builder = struct {
     fn emit(self: *Builder, name_off: u32, kind: Kind, vlen: u16, kind_flag: bool, size_type: u32) !u32 {
         var hdr: [12]u8 = undefined;
         const info: u32 = @as(u32, vlen) |
-            (@as(u32, @intFromEnum(kind)) << 24) |
+            (@as(u32, @backingInt(kind)) << 24) |
             (@as(u32, @intFromBool(kind_flag)) << 31);
         std.mem.writeInt(u32, hdr[0..4], name_off, native_endian);
         std.mem.writeInt(u32, hdr[4..8], info, native_endian);
@@ -1234,7 +1234,7 @@ pub const Builder = struct {
     /// `BTF_KIND_FUNC`. `proto` must be a `FUNC_PROTO` id.
     pub fn addFunc(self: *Builder, name: []const u8, proto: u32, linkage: FuncLinkage) !u32 {
         const n = try self.addString(name);
-        return self.emit(n, .func, @intFromEnum(linkage), false, proto);
+        return self.emit(n, .func, @backingInt(linkage), false, proto);
     }
 
     /// Serialize. The caller owns the returned bytes.
@@ -1308,12 +1308,12 @@ test "wire layout agrees with std's BPF.btf structs" {
 
     // The `Kind` values this file switches on must be std's, in the UAPI's
     // order — a renumbering would silently re-size every trailing record.
-    try testing.expectEqual(@as(u5, 1), @intFromEnum(Kind.int));
-    try testing.expectEqual(@as(u5, 4), @intFromEnum(Kind.@"struct"));
-    try testing.expectEqual(@as(u5, 12), @intFromEnum(Kind.func));
-    try testing.expectEqual(@as(u5, 13), @intFromEnum(Kind.func_proto));
-    try testing.expectEqual(@as(u5, 15), @intFromEnum(Kind.datasec));
-    try testing.expectEqual(@as(u5, 19), @intFromEnum(Kind.enum64));
+    try testing.expectEqual(@as(u5, 1), @backingInt(Kind.int));
+    try testing.expectEqual(@as(u5, 4), @backingInt(Kind.@"struct"));
+    try testing.expectEqual(@as(u5, 12), @backingInt(Kind.func));
+    try testing.expectEqual(@as(u5, 13), @backingInt(Kind.func_proto));
+    try testing.expectEqual(@as(u5, 15), @backingInt(Kind.datasec));
+    try testing.expectEqual(@as(u5, 19), @backingInt(Kind.enum64));
 }
 
 test "extraLen: FUNC's vlen is a linkage, not a member count" {
@@ -1341,8 +1341,8 @@ test "extraLen: FUNC's vlen is a linkage, not a member count" {
 test "golden: BPF_BTF_LOAD attr bytes" {
     if (native_endian != .little) return error.SkipZigTest;
 
-    var blob = [_]u8{0xAB} ** 3;
-    var log = [_]u8{0} ** 5;
+    var blob = @as([3]u8, @splat(0xAB));
+    var log = @as([5]u8, @splat(0));
     const attr = buildBtfLoadAttr(&blob, &log, 1);
     const bytes = std.mem.asBytes(&attr);
 
@@ -1445,7 +1445,7 @@ const Synth = struct {
         _ = try b.emit(try b.addString("opaque"), .fwd, 0, false, 0);
 
         const var_id = try b.emit(try b.addString("gvar"), .@"var", 0, false, int_id);
-        try b.emitU32(@intFromEnum(VarLinkage.global_allocated));
+        try b.emitU32(@backingInt(VarLinkage.global_allocated));
 
         _ = try b.emit(try b.addString(".data"), .datasec, 1, false, 4);
         try b.emitU32(var_id);
@@ -1497,7 +1497,7 @@ const Synth = struct {
     fn rec(name_off: u32, kind: Kind, vlen: u16, kflag: bool, size_type: u32) [12]u8 {
         var r: [12]u8 = undefined;
         const info: u32 = @as(u32, vlen) |
-            (@as(u32, @intFromEnum(kind)) << 24) |
+            (@as(u32, @backingInt(kind)) << 24) |
             (@as(u32, @intFromBool(kflag)) << 31);
         std.mem.writeInt(u32, r[0..4], name_off, native_endian);
         std.mem.writeInt(u32, r[4..8], info, native_endian);
@@ -1890,27 +1890,27 @@ test "hostile BTF: every malformation is a typed error, never a crash" {
     try testing.expectError(error.NotBtf, parse(gpa, &.{ 0x9f, 0xeb }, .{}));
     // Wrong magic.
     {
-        var buf = [_]u8{0} ** 64;
+        var buf = @as([64]u8, @splat(0));
         std.mem.writeInt(u16, buf[0..2], 0x1234, native_endian);
         try testing.expectError(error.NotBtf, parse(gpa, &buf, .{}));
     }
     // Byte-swapped magic = a foreign-endian producer, which is refused as
     // UNSUPPORTED rather than mis-parsed.
     {
-        var buf = [_]u8{0} ** 64;
+        var buf = @as([64]u8, @splat(0));
         std.mem.writeInt(u16, buf[0..2], @byteSwap(magic), native_endian);
         try testing.expectError(error.UnsupportedBtf, parse(gpa, &buf, .{}));
     }
     // Wrong version.
     {
-        var buf = [_]u8{0} ** 64;
+        var buf = @as([64]u8, @splat(0));
         std.mem.writeInt(u16, buf[0..2], magic, native_endian);
         buf[2] = 2;
         try testing.expectError(error.UnsupportedBtf, parse(gpa, &buf, .{}));
     }
     // hdr_len shorter than the header, and hdr_len past the blob.
     {
-        var buf = [_]u8{0} ** 64;
+        var buf = @as([64]u8, @splat(0));
         std.mem.writeInt(u16, buf[0..2], magic, native_endian);
         buf[2] = version;
         std.mem.writeInt(u32, buf[4..8], 16, native_endian);
@@ -2380,7 +2380,7 @@ test "loadModule rejects a name that could escape /sys/kernel/btf" {
     try testing.expectError(error.InvalidModuleName, loadModule(gpa, "../../etc/passwd", &dummy));
     try testing.expectError(error.InvalidModuleName, loadModule(gpa, "a/b", &dummy));
     try testing.expectError(error.InvalidModuleName, loadModule(gpa, "..", &dummy));
-    try testing.expectError(error.InvalidModuleName, loadModule(gpa, "x" ** 200, &dummy));
+    try testing.expectError(error.InvalidModuleName, loadModule(gpa, strRepeat("x", 200), &dummy));
 }
 
 test "findMember: the search is bounded by WORK, not only by depth" {
@@ -2478,4 +2478,16 @@ test "LIVE: BPF_BTF_LOAD accepts a blob this module built" {
     } else |e| {
         try testing.expectEqual(KernelLoadError.InvalidBtf, e);
     }
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

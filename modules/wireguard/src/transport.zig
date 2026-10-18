@@ -1556,10 +1556,10 @@ fn fuzzOpen(_: void, smith: *std.testing.Smith) !void {
 
 const fuzz_driver = testkit.fuzz.driver;
 const OpenLabel = enum { raw_opened, raw_refused, sealed_opened, replay_rejected, flipped_rejected, truncated_rejected };
-var open_reach: [@typeInfo(OpenLabel).@"enum".fields.len]usize = @splat(0);
+var open_reach: [@typeInfo(OpenLabel).@"enum".field_names.len]usize = @splat(0);
 
 fn markOpen(comptime l: OpenLabel) void {
-    open_reach[@intFromEnum(l)] += 1;
+    open_reach[@backingInt(l)] += 1;
     fuzz_driver.hit(@tagName(l));
 }
 
@@ -1634,7 +1634,7 @@ test "fuzz harness: 300 seeds in every test run, and they get everywhere" {
         };
     }
     for (open_reach, 0..) |n, i| {
-        const l: OpenLabel = @enumFromInt(i);
+        const l: OpenLabel = @fromBackingInt(@intCast(i));
         // A random message never authenticates: `raw_opened` is the corpus's.
         if (l == .raw_opened) continue;
         if (n == 0) {

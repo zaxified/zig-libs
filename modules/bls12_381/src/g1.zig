@@ -489,7 +489,7 @@ pub fn toBytesUncompressed(p: Affine) [uncompressed_bytes]u8 {
 /// arithmetic, and NO `Fp.sqrt` needed (unlike decoding).
 pub fn toBytesCompressed(p: Affine) [compressed_bytes]u8 {
     if (p.infinity) {
-        var out: [compressed_bytes]u8 = [_]u8{0} ** compressed_bytes;
+        var out: [compressed_bytes]u8 = @as([compressed_bytes]u8, @splat(0));
         out[0] = packFlags(0, .{ .compression = true, .infinity = true, .sort = false });
         return out;
     }
@@ -780,11 +780,11 @@ test "G1 scalarMul edge cases: [0]P = O, [1]P = P, [2]P = double(P)" {
 }
 
 test "G1 scalarMul distributes: [a+b]G == [a]G + [b]G and [a*b]G == [a]([b]G)" {
-    var a_bytes = [_]u8{0} ** 32;
+    var a_bytes = @as([32]u8, @splat(0));
     a_bytes[31] = 0x35;
     a_bytes[16] = 0x9c;
     const sa = try Fr.fromBytes(a_bytes);
-    var b_bytes = [_]u8{0} ** 32;
+    var b_bytes = @as([32]u8, @splat(0));
     b_bytes[31] = 0x0b;
     b_bytes[8] = 0x77;
     const sb = try Fr.fromBytes(b_bytes);
@@ -798,7 +798,7 @@ test "G1 subgroupCheck: generator passes ([r]G == O), non-subgroup curve point f
     // x = 4 gives an on-curve point that is NOT in the order-r subgroup
     // (verified independently: [r]P != O — see NOTICE). Constructed via
     // decompression to also exercise recoverY on a non-generator x.
-    var comp = [_]u8{0} ** compressed_bytes;
+    var comp = @as([compressed_bytes]u8, @splat(0));
     comp[0] = 0x80; // compression flag, sort = 0
     comp[compressed_bytes - 1] = 4;
     try std.testing.expectError(error.NotInSubgroup, fromBytesCompressed(comp));
@@ -838,7 +838,7 @@ test "G1 decompression rejects an x with no square root (not on curve)" {
     // x = 1: 1^3 + 4 = 5 is a quadratic non-residue mod p (verified
     // independently — see NOTICE), so decompression must fail with
     // NotOnCurve.
-    var comp = [_]u8{0} ** compressed_bytes;
+    var comp = @as([compressed_bytes]u8, @splat(0));
     comp[0] = 0x80;
     comp[compressed_bytes - 1] = 1;
     try std.testing.expectError(G1Error.NotOnCurve, fromBytesCompressed(comp));

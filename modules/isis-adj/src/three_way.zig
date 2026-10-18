@@ -150,7 +150,7 @@ pub const ThreeWayTlv = struct {
         const n = self.encodedLen();
         if (out.len < n) return error.BufferTooSmall;
         if (self.neighbor != null and self.extended_local_circuit_id == null) return error.MalformedTlv;
-        out[0] = @intFromEnum(self.state);
+        out[0] = @backingInt(self.state);
         if (self.extended_local_circuit_id) |ext| {
             std.mem.writeInt(u32, out[1..5], ext, .big);
         }
@@ -169,9 +169,9 @@ pub const ThreeWayTlv = struct {
 const testing = std.testing;
 
 test "three-way state wire values are RFC 5303 (up==0, down==2)" {
-    try testing.expectEqual(@as(u8, 0), @intFromEnum(ThreeWayState.up));
-    try testing.expectEqual(@as(u8, 1), @intFromEnum(ThreeWayState.initializing));
-    try testing.expectEqual(@as(u8, 2), @intFromEnum(ThreeWayState.down));
+    try testing.expectEqual(@as(u8, 0), @backingInt(ThreeWayState.up));
+    try testing.expectEqual(@as(u8, 1), @backingInt(ThreeWayState.initializing));
+    try testing.expectEqual(@as(u8, 2), @backingInt(ThreeWayState.down));
     try testing.expectEqual(ThreeWayState.up, try ThreeWayState.fromByte(0));
     try testing.expectEqual(ThreeWayState.down, try ThreeWayState.fromByte(2));
     try testing.expectError(error.BadState, ThreeWayState.fromByte(3));
@@ -293,7 +293,7 @@ test "golden TLV240 1-octet (state-only) form (Wireshark-anchored, reverse direc
 test "TLV 240 rejects bad length and bad state, never over-reads" {
     try testing.expectError(error.BadLength, ThreeWayTlv.decode(&.{})); // empty
     try testing.expectError(error.BadLength, ThreeWayTlv.decode(&[_]u8{ 0, 1 })); // 2 octets
-    try testing.expectError(error.BadLength, ThreeWayTlv.decode(&[_]u8{0} ** 12)); // 12 octets
+    try testing.expectError(error.BadLength, ThreeWayTlv.decode(&@as([12]u8, @splat(0)))); // 12 octets
     // 5-octet form with an illegal state value.
     try testing.expectError(error.BadState, ThreeWayTlv.decode(&[_]u8{ 9, 0, 0, 0, 0 }));
 }

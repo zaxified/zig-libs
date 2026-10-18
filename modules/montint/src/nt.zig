@@ -110,9 +110,9 @@ pub fn divExact(comptime n: usize, a: *const [n]u64, b: *const [n]u64) error{Not
 /// full-width bound, then `|f|`.
 fn gcdOdd(comptime n: usize, f_in: *const [n]u64, g_in: *const [n]u64) [n]u64 {
     const W = n + 1; // two's complement, one sign limb
-    var f = [_]u64{0} ** W;
+    var f = @as([W]u64, @splat(0));
     f[0..n].* = f_in.*;
-    var g = [_]u64{0} ** W;
+    var g = @as([W]u64, @splat(0));
     g[0..n].* = g_in.*;
     defer std.crypto.secureZero(u64, &f);
     defer std.crypto.secureZero(u64, &g);
@@ -137,13 +137,13 @@ fn gcdOdd(comptime n: usize, f_in: *const [n]u64, g_in: *const [n]u64) [n]u64 {
 /// `m⁻¹ mod 2^(64n)` for an odd `m`, by Newton from the 64-bit inverse,
 /// precision doubling each step; the step count depends on `n` only.
 pub fn invPow2(comptime n: usize, m: *const [n]u64) [n]u64 {
-    var inv = [_]u64{0} ** n;
+    var inv = @as([n]u64, @splat(0));
     inv[0] = 0 -% montint.negInvMod2_64(m[0]);
     var prec: usize = 64;
     while (prec < 64 * n) : (prec *= 2) {
         var t: [n]u64 = undefined;
         mulLow(n, &t, m, &inv); // m·y
-        var two = [_]u64{0} ** n;
+        var two = @as([n]u64, @splat(0));
         two[0] = 2;
         _ = @import("limbs.zig").subInto(&two, &t); // 2 − m·y
         var y: [n]u64 = undefined;
@@ -155,7 +155,7 @@ pub fn invPow2(comptime n: usize, m: *const [n]u64) [n]u64 {
 
 /// `z = x·y mod 2^(64n)` — the low half of the schoolbook product.
 pub fn mulLow(comptime n: usize, z: *[n]u64, x: *const [n]u64, y: *const [n]u64) void {
-    z.* = [_]u64{0} ** n;
+    z.* = @as([n]u64, @splat(0));
     for (0..n) |i| {
         var carry: u64 = 0;
         for (0..n - i) |j| {
@@ -414,7 +414,7 @@ fn keepLowBits(comptime n: usize, x: *[n]u64, bits: usize) void {
 }
 
 test "nt divExact refuses a zero or non-dividing divisor (review L4)" {
-    const z = [_]u64{0} ** 4;
+    const z = @as([4]u64, @splat(0));
     var a = z;
     var b = z;
     a[0] = 7;
@@ -452,12 +452,12 @@ test "nt divExact refuses a zero or non-dividing divisor (review L4)" {
 }
 
 test "nt oddPart of a power of two and of 2^(64n) − 1" {
-    var p2 = [_]u64{0} ** 4;
+    var p2 = @as([4]u64, @splat(0));
     p2[3] = @as(u64, 1) << 63;
     const r = oddPart(4, &p2);
     try testing.expectEqual(@as(usize, 255), r.t);
     try testing.expectEqual(@as(u64, 1), r.u[0]);
-    const all = [_]u64{~@as(u64, 0)} ** 4;
+    const all = @as([4]u64, @splat(~@as(u64, 0)));
     const r2 = oddPart(4, &all);
     try testing.expectEqual(@as(usize, 0), r2.t);
     try testing.expectEqualSlices(u64, &all, &r2.u);

@@ -305,7 +305,7 @@ noinline fn constructBody(
     }
 
     // Step 5: the REVERSE-order wrap loop (last hop's layer first).
-    var next_hmac = [_]u8{0} ** hmac_len; // all-zero marks "final hop" for hop n-1
+    var next_hmac = @as([hmac_len]u8, @splat(0)); // all-zero marks "final hop" for hop n-1
     var i = n;
     while (i > 0) {
         i -= 1;
@@ -506,7 +506,7 @@ noinline fn processBody(node_privkey: *const [32]u8, pkt: OnionPacket, associate
     // into one `vptest` (ctgrind 2026-09-09) — safe by accident only. The
     // branch on the verdict is the hop's own public decision (forward or
     // deliver), not a leak.
-    const zero_hmac = [_]u8{0} ** hmac_len;
+    const zero_hmac = @as([hmac_len]u8, @splat(0));
     if (std.crypto.timing_safe.eql([hmac_len]u8, frame.hmac, zero_hmac)) return result;
 
     // Step 9a: blinding_factor = SHA256(compressed(epk) ‖ ss) — the same
@@ -576,7 +576,7 @@ test "error sets: ConstructError/ProcessError both include SharedSecretError" {
 }
 
 test "construct: empty route / hop-count mismatch / reserved payload length fail closed" {
-    const session_key = [_]u8{0x41} ** 32;
+    const session_key = @as([32]u8, @splat(0x41));
     const g = Secp256k1.basePoint.toCompressedSec1();
     const payload = [_]u8{ 0x02, 0x03, 0x04 };
 
@@ -592,13 +592,13 @@ test "construct: empty route / hop-count mismatch / reserved payload length fail
 }
 
 test "construct: a route that cannot fit 1300 bytes is RouteTooLong (both forms)" {
-    const session_key = [_]u8{0x41} ** 32;
+    const session_key = @as([32]u8, @splat(0x41));
     const g = Secp256k1.basePoint.toCompressedSec1();
 
     // 4 hops x shiftSize(300) = 4 x 335 = 1340 > 1300.
-    const big_payload = [_]u8{0xaa} ** 300;
-    const pubkeys4 = [_][pubkey_len]u8{g} ** 4;
-    const payloads4 = [_][]const u8{&big_payload} ** 4;
+    const big_payload = @as([300]u8, @splat(0xaa));
+    const pubkeys4 = @as([4][pubkey_len]u8, @splat(g));
+    const payloads4 = @as([4][]const u8, @splat(&big_payload));
     try std.testing.expectError(
         error.RouteTooLong,
         construct(&session_key, &pubkeys4, &payloads4, ""),
@@ -606,8 +606,8 @@ test "construct: a route that cannot fit 1300 bytes is RouteTooLong (both forms)
 
     // More hops than can ever fit (max_hops + 1), regardless of payload size.
     const tiny = [_]u8{ 0x01, 0x02 };
-    const pubkeys38 = [_][pubkey_len]u8{g} ** (max_hops + 1);
-    const payloads38 = [_][]const u8{&tiny} ** (max_hops + 1);
+    const pubkeys38 = @as([max_hops + 1][pubkey_len]u8, @splat(g));
+    const payloads38 = @as([max_hops + 1][]const u8, @splat(&tiny));
     try std.testing.expectError(
         error.RouteTooLong,
         construct(&session_key, &pubkeys38, &payloads38, ""),
@@ -621,16 +621,16 @@ test "deriveHopSecrets: an off-curve hop pubkey is InvalidPublicKey" {
     var out: [2]HopSecret = undefined;
     try std.testing.expectError(
         error.InvalidPublicKey,
-        deriveHopSecrets(&[_]u8{0x41} ** 32, &.{ g, bad }, &out),
+        deriveHopSecrets(&@as([32]u8, @splat(0x41)), &.{ g, bad }, &out),
     );
 }
 
 test "HopSecret / ProcessResult field shapes" {
-    const hs = HopSecret{ .shared_secret = [_]u8{0} ** 32, .ephemeral_pubkey = [_]u8{2} ++ [_]u8{0} ** 32 };
+    const hs = HopSecret{ .shared_secret = @as([32]u8, @splat(0)), .ephemeral_pubkey = [_]u8{2} ++ @as([32]u8, @splat(0)) };
     try std.testing.expectEqual(@as(usize, 32), hs.shared_secret.len);
     try std.testing.expectEqual(@as(usize, pubkey_len), hs.ephemeral_pubkey.len);
 
-    var pr = ProcessResult{ .payload_buf = [_]u8{0} ** hop_payloads_len, .payload_len = 3, .next_packet = null };
+    var pr = ProcessResult{ .payload_buf = @as([hop_payloads_len]u8, @splat(0)), .payload_len = 3, .next_packet = null };
     @memcpy(pr.payload_buf[0..3], &[_]u8{ 1, 2, 3 });
     try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3 }, pr.payload());
 }
@@ -644,8 +644,8 @@ test "HopSecret / ProcessResult field shapes" {
 fn sealForTest(node_privkey: [32]u8, plaintext: []const u8, associated_data: []const u8) !OnionPacket {
     const node_pub = (try Secp256k1.combMulBase(node_privkey, .big)).toCompressedSec1();
     var hs: [1]HopSecret = undefined;
-    try deriveHopSecrets(&[_]u8{0x41} ** 32, &.{node_pub}, &hs);
-    var buf = [_]u8{0} ** hop_payloads_len;
+    try deriveHopSecrets(&@as([32]u8, @splat(0x41)), &.{node_pub}, &hs);
+    var buf = @as([hop_payloads_len]u8, @splat(0));
     @memcpy(buf[0..plaintext.len], plaintext);
     var stream: [hop_payloads_len]u8 = undefined;
     var rho_k: [32]u8 = undefined;
@@ -663,7 +663,7 @@ fn sealForTest(node_privkey: [32]u8, plaintext: []const u8, associated_data: []c
 }
 
 test "process: each frame refusal surfaces as its own error" {
-    const node_privkey = [_]u8{0x42} ** 32;
+    const node_privkey = @as([32]u8, @splat(0x42));
     const ad = "ad";
     // Lengths 0 and 1 are reserved.
     try std.testing.expectError(error.ReservedPayloadLength, process(&node_privkey, try sealForTest(node_privkey, &.{0x00}, ad), ad));
@@ -675,8 +675,8 @@ test "process: each frame refusal surfaces as its own error" {
 }
 
 test "construct/process: one hop whose frame fills the 1300 octets exactly" {
-    const session_key = [_]u8{0x41} ** 32;
-    const node_privkey = [_]u8{0x42} ** 32;
+    const session_key = @as([32]u8, @splat(0x41));
+    const node_privkey = @as([32]u8, @splat(0x42));
     const node_pub = (try Secp256k1.combMulBase(node_privkey, .big)).toCompressedSec1();
     var payload: [hop_payloads_len - 3 - hmac_len]u8 = undefined; // 1265
     for (&payload, 0..) |*b, i| b.* = @truncate(i);
@@ -688,9 +688,9 @@ test "construct/process: one hop whose frame fills the 1300 octets exactly" {
 }
 
 test "process: an off-curve ephemeral key is InvalidPublicKey" {
-    var pkt = try sealForTest([_]u8{0x42} ** 32, &.{ 0x02, 0xaa, 0xbb }, "");
+    var pkt = try sealForTest(@as([32]u8, @splat(0x42)), &.{ 0x02, 0xaa, 0xbb }, "");
     pkt.public_key[0] = 0x05;
-    try std.testing.expectError(error.InvalidPublicKey, process(&[_]u8{0x42} ** 32, pkt, ""));
+    try std.testing.expectError(error.InvalidPublicKey, process(&@as([32]u8, @splat(0x42)), pkt, ""));
 }
 
 // ── fuzz: a hop's full untrusted-wire decode-then-unwrap pipeline ─────────
@@ -704,7 +704,7 @@ fn fuzzProcess(_: void, smith: *std.testing.Smith) !void {
     var buf: [packet.packet_len]u8 = undefined;
     smith.bytes(&buf);
     const pkt = OnionPacket.fromBytes(buf) catch return;
-    const node_privkey = [_]u8{0x41} ** 32;
+    const node_privkey = @as([32]u8, @splat(0x41));
     const result = process(&node_privkey, pkt, "") catch return;
     _ = result.payload();
 }

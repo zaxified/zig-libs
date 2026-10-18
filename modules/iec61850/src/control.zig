@@ -81,7 +81,7 @@ pub const CtlModel = enum(u8) {
 
     pub fn fromInt(v: i64) Error!CtlModel {
         return switch (v) {
-            0...4 => @enumFromInt(@as(u8, @intCast(v))),
+            0...4 => @fromBackingInt(@intCast(@as(u8, @intCast(v)))),
             else => error.UnknownCtlModel,
         };
     }
@@ -125,7 +125,7 @@ pub const CtlModel = enum(u8) {
 
     pub fn parseScl(s: []const u8) Error!CtlModel {
         inline for (@typeInfo(CtlModel).@"enum".fields) |f| {
-            const m: CtlModel = @enumFromInt(f.value);
+            const m: CtlModel = @fromBackingInt(@intCast(f.value));
             if (std.mem.eql(u8, s, m.sclName())) return m;
         }
         // SCL files in the wild also carry the bare ordinal.
@@ -152,7 +152,7 @@ pub const OrCat = enum(u8) {
 
     pub fn fromInt(v: i64) Error!OrCat {
         return switch (v) {
-            0...8 => @enumFromInt(@as(u8, @intCast(v))),
+            0...8 => @fromBackingInt(@intCast(@as(u8, @intCast(v)))),
             else => error.UnknownOrCat,
         };
     }
@@ -172,7 +172,7 @@ pub const Origin = struct {
         if (self.or_ident.len > max_ident_len) return error.BufferTooSmall;
         const m = w.mark();
         try mmsdata.Emit.octetString(w, self.or_ident);
-        try mmsdata.Emit.integer(w, @intFromEnum(self.or_cat));
+        try mmsdata.Emit.integer(w, @backingInt(self.or_cat));
         try mmsdata.Emit.structure(w, m);
     }
 
@@ -364,7 +364,7 @@ pub const AddCause = enum(i32) {
 
     pub fn fromInt(v: i64) Error!AddCause {
         return switch (v) {
-            0...27 => @enumFromInt(@as(i32, @intCast(v))),
+            0...27 => @fromBackingInt(@intCast(@as(i32, @intCast(v)))),
             else => error.UnknownAddCause,
         };
     }
@@ -400,7 +400,7 @@ pub const ControlError = enum(i32) {
 
     pub fn fromInt(v: i64) Error!ControlError {
         return switch (v) {
-            0...3 => @enumFromInt(@as(i32, @intCast(v))),
+            0...3 => @fromBackingInt(@intCast(@as(i32, @intCast(v)))),
             else => error.UnknownControlError,
         };
     }
@@ -448,10 +448,10 @@ pub const LastApplError = struct {
 
     pub fn emit(self: LastApplError, w: *ber.Writer) Error!void {
         const m = w.mark();
-        try mmsdata.Emit.integer(w, @intFromEnum(self.add_cause));
+        try mmsdata.Emit.integer(w, @backingInt(self.add_cause));
         try mmsdata.Emit.unsigned(w, self.ctl_num);
         try self.origin.emit(w);
-        try mmsdata.Emit.integer(w, @intFromEnum(self.err));
+        try mmsdata.Emit.integer(w, @backingInt(self.err));
         try mmsdata.Emit.visibleString(w, self.ctl_obj_ref);
         try mmsdata.Emit.structure(w, m);
     }
@@ -1258,7 +1258,7 @@ test "the Check bits are the two safety overrides, in the standard's order" {
 }
 
 test "every AddCause is named and out-of-range is a typed error" {
-    try testing.expectEqual(@as(usize, 28), @typeInfo(AddCause).@"enum".fields.len);
+    try testing.expectEqual(@as(usize, 28), @typeInfo(AddCause).@"enum".field_names.len);
     try testing.expectEqual(AddCause.blocked_by_interlocking, try AddCause.fromInt(10));
     try testing.expectEqual(AddCause.blocked_by_synchrocheck, try AddCause.fromInt(11));
     try testing.expectEqual(AddCause.object_not_selected, try AddCause.fromInt(18));

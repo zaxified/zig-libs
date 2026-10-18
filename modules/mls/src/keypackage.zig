@@ -250,8 +250,8 @@ const TestSuite = suite.default;
 
 fn sampleLeaf() tree.LeafNode {
     return .{
-        .encryption_key = &[_]u8{0xaa} ** 32,
-        .signature_key = &[_]u8{0xbb} ** 32,
+        .encryption_key = &@as([32]u8, @splat(0xaa)),
+        .signature_key = &@as([32]u8, @splat(0xbb)),
         .credential = .{ .basic = "alice" },
         .capabilities = .{
             .versions = &[_]u16{1},
@@ -263,17 +263,17 @@ fn sampleLeaf() tree.LeafNode {
         .leaf_node_source = .key_package,
         .lifetime = .{ .not_before = 0, .not_after = 1 },
         .extensions = &.{},
-        .signature = &[_]u8{0xcc} ** 64,
+        .signature = &@as([64]u8, @splat(0xcc)),
     };
 }
 
 test "KeyPackage: encodedLen matches what encode actually writes, and decode round-trips" {
     const kp: KeyPackage = .{
         .cipher_suite = TestSuite.id,
-        .init_key = &[_]u8{0xdd} ** 32,
+        .init_key = &@as([32]u8, @splat(0xdd)),
         .leaf_node = sampleLeaf(),
         .extensions = &.{},
-        .signature = &[_]u8{0xee} ** 64,
+        .signature = &@as([64]u8, @splat(0xee)),
     };
     const bytes = try kp.encodeAlloc(testing.allocator);
     defer testing.allocator.free(bytes);
@@ -305,7 +305,7 @@ test "KeyPackage: sign then verify, and a flipped TBS byte is rejected" {
 
     var kp: KeyPackage = .{
         .cipher_suite = TestSuite.id,
-        .init_key = &[_]u8{0xdd} ** 32,
+        .init_key = &@as([32]u8, @splat(0xdd)),
         .leaf_node = leaf,
         .signature = &.{},
     };
@@ -316,18 +316,18 @@ test "KeyPackage: sign then verify, and a flipped TBS byte is rejected" {
 
     // Perturbing a field COVERED by KeyPackageTBS must break the signature.
     var kp2 = kp;
-    kp2.init_key = &[_]u8{0xdc} ** 32;
+    kp2.init_key = &@as([32]u8, @splat(0xdc));
     try testing.expectError(error.SignatureVerificationFailed, kp2.verifySignature(TestSuite, testing.allocator));
 }
 
 test "KeyPackage.verifySignature: a non-Ed25519-sized key/signature is WrongKeyLength, not a crash" {
     var leaf = sampleLeaf();
-    leaf.signature_key = &[_]u8{0xbb} ** 31; // one byte short
+    leaf.signature_key = &@as([31]u8, @splat(0xbb)); // one byte short
     const kp: KeyPackage = .{
         .cipher_suite = TestSuite.id,
-        .init_key = &[_]u8{0xdd} ** 32,
+        .init_key = &@as([32]u8, @splat(0xdd)),
         .leaf_node = leaf,
-        .signature = &[_]u8{0xee} ** 64,
+        .signature = &@as([64]u8, @splat(0xee)),
     };
     try testing.expectError(error.WrongKeyLength, kp.verifySignature(TestSuite, testing.allocator));
 }

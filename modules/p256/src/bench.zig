@@ -151,7 +151,7 @@ test "bench (opt-in via P256_BENCH)" {
 
     // ── ECDSA verify + sign (p256 vs std) on a real std key ──
     {
-        const kp = StdEcdsa.KeyPair.generateDeterministic([_]u8{7} ** 32) catch return;
+        const kp = StdEcdsa.KeyPair.generateDeterministic(@as([32]u8, @splat(7))) catch return;
         const msg = "p256 bench message";
         const sig = kp.sign(msg, null) catch return;
         const sig_rs = sig.toBytes();
@@ -177,7 +177,7 @@ test "bench (opt-in via P256_BENCH)" {
         std.debug.print("std       ecdsa verify      : {d:>8} ns/op\n", .{dt / sig_iters});
 
         // p256 sign (caller-nonce; std sign for the comparison column).
-        const sk = [_]u8{3} ** 32;
+        const sk = @as([32]u8, @splat(3));
         var nonce: [32]u8 = undefined;
         rand.bytes(&nonce);
         sink = 0;

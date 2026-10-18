@@ -95,7 +95,7 @@ pub const OpIterator = struct {
     /// Bit i: input i has a head (its current key is `iters[i].currentKey()`).
     has_head: u64 = 0,
     /// The value of each input's current head.
-    head_values: [max_indexes]u32 = [_]u32{0} ** max_indexes,
+    head_values: [max_indexes]u32 = @as([max_indexes]u32, @splat(0)),
     done: bool = false,
     spent: bool = false,
 

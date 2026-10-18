@@ -249,7 +249,7 @@ const framer_seeds = [_][]const u8{
     seed("0300000702F080" ++ "0300000702F080"), // two DT TPDUs in one feed
     seed("0300000702F0"), // stops one octet into the payload
     seed("0300"), // stops inside the header
-    seed("03000050" ++ ("AA" ** 76)), // 80 octets: a payload split across two chunks
+    seed("03000050" ++ (strRepeat("AA", 76))), // 80 octets: a payload split across two chunks
     seed("03001000"), // declares 4096 with nothing behind it
     seed("0300000702F080" ++ "0300"), // one whole frame, then a partial header
 };
@@ -302,4 +302,16 @@ test "fuzz driver: IEC61850_FUZZ (fuzzFramer)" {
 
 test "fuzz harness: fuzzFramer, 400 seeds, reaches every outcome" {
     try fuzzFramerMark.reach(fuzzFramer, "iec61850-tpkt-framer", 400);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

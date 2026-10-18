@@ -453,7 +453,7 @@ const EcSpec = struct { ec_per_block: u8, blocks: u8 };
 
 fn ecSpec(version: u6, ecc: Ecc) EcSpec {
     const row = ec_table[@as(usize, version) - 1];
-    const cell = row[@intFromEnum(ecc)];
+    const cell = row[@backingInt(ecc)];
     return .{ .ec_per_block = cell[0], .blocks = cell[1] };
 }
 
@@ -605,7 +605,7 @@ fn buildCodewords(out: []u8, mode: Mode, text: []const u8, version: u6, ecc: Ecc
         w.put(q.parity, 8);
     }
 
-    w.put(@intFromEnum(mode), 4);
+    w.put(@backingInt(mode), 4);
     w.put(text.len, countBits(mode, version));
     switch (mode) {
         .numeric => {
@@ -1210,8 +1210,8 @@ fn rsDecode(block: []u8, ec_len: usize) DecodeError!void {
 
     // Berlekamp-Massey: the shortest LFSR that generates the syndromes is the
     // error locator.
-    var lambda: [31]u8 = [_]u8{0} ** 31;
-    var prev: [31]u8 = [_]u8{0} ** 31;
+    var lambda: [31]u8 = @as([31]u8, @splat(0));
+    var prev: [31]u8 = @as([31]u8, @splat(0));
     lambda[0] = 1;
     prev[0] = 1;
     var l: usize = 0;
@@ -1265,7 +1265,7 @@ fn rsDecode(block: []u8, ec_len: usize) DecodeError!void {
     if (count != l) return DecodeError.Uncorrectable; // locator disagrees with itself
 
     // Forney: omega = synd * lambda mod x^ec_len, magnitude = omega/lambda'.
-    var omega: [31]u8 = [_]u8{0} ** 31;
+    var omega: [31]u8 = @as([31]u8, @splat(0));
     for (0..ec_len) |i| {
         for (0..l + 1) |j| {
             if (i + j < ec_len) omega[i + j] ^= gf.mul(synd[i], lambda[j]);
@@ -1567,7 +1567,7 @@ fn runEncodeScript(bytes: []const u8) !EncodeOutcome {
     const mask_byte: u8 = if (bytes.len > 2) bytes[2] else 8;
     const text: []const u8 = if (bytes.len > 3) bytes[3..] else "";
 
-    out.ecc = @enumFromInt(ecc_byte % 4);
+    out.ecc = @fromBackingInt(@intCast(ecc_byte % 4));
     // ⭐ `% 42` and NOT `@min(.., 40)`. The old harness wrote
     // `@intCast(@min(forced_version, 40))` under a comment saying "0 and 41
     // exercise the guards" — but the clamp turns 41 into 40, so `BadVersion`
@@ -1615,7 +1615,7 @@ const encode_seeds = [_][]const u8{
     seed("\x00\x01\x08" ++ "A"), // version 1 forced: the smallest symbol
     seed("\x00\x28\x08" ++ "A"), // version 40 forced: the largest
     seed("\x00\x29\x08" ++ "A"), // ⭐ version 41: `BadVersion`, which the old harness's own comment claimed to exercise and never did
-    seed("\x00\x01\x08" ++ ("A" ** 60)), // too long for the forced version: `TooLong`
+    seed("\x00\x01\x08" ++ (strRepeat("A", 60))), // too long for the forced version: `TooLong`
     seed("\x00\x00\x00" ++ "MASK ZERO"), // every mask forced, 0 through 7
     seed("\x00\x00\x01" ++ "MASK ONE"),
     seed("\x00\x00\x02" ++ "MASK TWO"),
@@ -1624,7 +1624,7 @@ const encode_seeds = [_][]const u8{
     seed("\x00\x00\x05" ++ "MASK FIVE"),
     seed("\x00\x00\x06" ++ "MASK SIX"),
     seed("\x00\x00\x07" ++ "MASK SEVEN"),
-    seed("\x03\x00\x08" ++ ("A" ** 480)), // high ECC and a long message: near the capacity ceiling
+    seed("\x03\x00\x08" ++ (strRepeat("A", 480))), // high ECC and a long message: near the capacity ceiling
     seed("\x00\x00\x08" ++ "\x00\x01\x02\xfd\xfe\xff"), // control and high bytes
     seed("\x00\x00\x08"), // the knobs with an EMPTY text
     seed(""), // the empty script: exactly what the collapsed harness ran
@@ -1671,15 +1671,15 @@ test "corpus: every encode seed reaches the encoder, and the symbols built are p
     var nonempty: usize = 0;
     var encoded: usize = 0;
     var round_tripped: usize = 0;
-    var ecc_seen = [_]bool{false} ** 4;
-    var versions_seen = [_]bool{false} ** 41;
+    var ecc_seen = @as([4]bool, @splat(false));
+    var versions_seen = @as([41]bool, @splat(false));
     for (encode_seeds) |sd| {
         var smith: std.testing.Smith = .{ .in = sd };
         var buf: [512]u8 = undefined;
         const len: usize = smith.slice(&buf);
         if (len != 0) nonempty += 1;
         const out = try runEncodeScript(buf[0..len]);
-        ecc_seen[@intFromEnum(out.ecc)] = true;
+        ecc_seen[@backingInt(out.ecc)] = true;
         if (out.encoded) {
             encoded += 1;
             versions_seen[out.version] = true;
@@ -2002,7 +2002,7 @@ fn runDamageScript(bytes: []const u8) !DamageOutcome {
     // blocks then exercise Berlekamp-Massey, Chien and Forney for real.
     var s = Script{ .bytes = bytes };
     var out: DamageOutcome = .{};
-    out.ecc = @enumFromInt(s.byte() % 4);
+    out.ecc = @fromBackingInt(@intCast(s.byte() % 4));
 
     var m: Matrix = undefined;
     encode(&m, "FUZZ TARGET 12345", .{ .ecc = out.ecc }) catch return out;
@@ -2099,7 +2099,7 @@ test "corpus: the grid and damage scripts reach the decoder, and what they did i
     // and says nothing. What the collapsed harness could not do was try a
     // second grid shape at all.
     var grid_nonempty: usize = 0;
-    var sizes_seen = [_]bool{false} ** (max_size + 1);
+    var sizes_seen = @as([max_size + 1]bool, @splat(false));
     for (decode_seeds) |sd| {
         var smith: std.testing.Smith = .{ .in = sd };
         var script: [512]u8 = undefined;
@@ -2128,14 +2128,14 @@ test "corpus: the grid and damage scripts reach the decoder, and what they did i
     var total_flips: usize = 0;
     var recovered: usize = 0;
     var damaged_and_recovered: usize = 0;
-    var ecc_seen = [_]bool{false} ** 4;
+    var ecc_seen = @as([4]bool, @splat(false));
     for (damage_seeds) |sd| {
         var smith: std.testing.Smith = .{ .in = sd };
         var script: [512]u8 = undefined;
         const n: usize = smith.slice(&script);
         if (n != 0) damage_nonempty += 1;
         const out = try runDamageScript(script[0..n]);
-        ecc_seen[@intFromEnum(out.ecc)] = true;
+        ecc_seen[@backingInt(out.ecc)] = true;
         total_flips += out.flips;
         if (out.recovered) {
             recovered += 1;
@@ -2180,7 +2180,7 @@ test "input that cannot fit is refused rather than truncated" {
 test "a sequence round-trips: split, read each part, put it back together" {
     const t = std.testing;
     // Long enough to need several symbols at a size a phone screen shows well.
-    const message = "signed-payload:" ++ ("0123456789abcdef" ** 40);
+    const message = "signed-payload:" ++ (strRepeat("0123456789abcdef", 40));
 
     var symbols: [16]Matrix = undefined;
     const seq = try encodeSequence(&symbols, message, .{ .ecc = .quartile, .version = 6 });
@@ -2210,7 +2210,7 @@ test "a sequence round-trips: split, read each part, put it back together" {
 test "a part is refused by decode rather than returned as a message" {
     const t = std.testing;
     var symbols: [8]Matrix = undefined;
-    const seq = try encodeSequence(&symbols, "N" ** 200, .{ .version = 2, .ecc = .low });
+    const seq = try encodeSequence(&symbols, strRepeat("N", 200), .{ .version = 2, .ecc = .low });
     try t.expect(seq.len > 1);
 
     var buf: [256]u8 = undefined;
@@ -2242,19 +2242,19 @@ test "parity separates two sequences that arrive interleaved" {
 test "a message that needs more symbols than there is room for is refused" {
     const t = std.testing;
     var two: [2]Matrix = undefined;
-    try t.expectError(Error.TooLong, encodeSequence(&two, "N" ** 400, .{ .version = 1, .ecc = .high }));
+    try t.expectError(Error.TooLong, encodeSequence(&two, strRepeat("N", 400), .{ .version = 1, .ecc = .high }));
     // Room is what is missing, not capacity: the same message splits happily
     // once there are symbols to put it in.
     var plenty: [16]Matrix = undefined;
-    _ = try encodeSequence(&plenty, "N" ** 400, .{ .version = 6, .ecc = .high });
+    _ = try encodeSequence(&plenty, strRepeat("N", 400), .{ .version = 6, .ecc = .high });
 
     // Sixteen is the standard's ceiling, not ours, so a message that needs a
     // seventeenth symbol at the forced version is refused even with room.
     var many: [16]Matrix = undefined;
-    try t.expectError(Error.TooLong, encodeSequence(&many, "N" ** 5000, .{ .version = 1, .ecc = .high }));
+    try t.expectError(Error.TooLong, encodeSequence(&many, strRepeat("N", 5000), .{ .version = 1, .ecc = .high }));
 
     // Without a forced version the encoder grows the symbol instead of the count.
-    const seq = try encodeSequence(&many, "N" ** 5000, .{ .ecc = .high });
+    const seq = try encodeSequence(&many, strRepeat("N", 5000), .{ .ecc = .high });
     try t.expect(seq.len <= 16);
     try t.expect(seq[0].version > 1);
 }
@@ -2296,7 +2296,7 @@ fn runSequenceScript(bytes: []const u8) !SequenceOutcome {
     var out: SequenceOutcome = .{};
     const ecc_byte: u8 = if (bytes.len > 0) bytes[0] else 0;
     const text: []const u8 = if (bytes.len > 1) bytes[1..] else "";
-    out.ecc = @enumFromInt(ecc_byte % 4);
+    out.ecc = @fromBackingInt(@intCast(ecc_byte % 4));
     out.text_len = text.len;
 
     var symbols: [16]Matrix = undefined;
@@ -2325,16 +2325,16 @@ fn runSequenceScript(bytes: []const u8) !SequenceOutcome {
 /// Sequence scripts: `ecc, text...`.
 const sequence_seeds = [_][]const u8{
     seed("\x00" ++ "SHORT"), // one symbol: the degenerate sequence, header still present
-    seed("\x00" ++ ("A" ** 100)), // still one symbol at low ECC
-    seed("\x00" ++ ("A" ** 400)), // ⭐ several symbols: the split this target exists for
-    seed("\x01" ++ ("A" ** 400)), // the same message at medium
-    seed("\x02" ++ ("A" ** 400)), // quartile: more symbols again
-    seed("\x03" ++ ("A" ** 400)), // high: the most symbols
-    seed("\x03" ++ ("N" ** 599)), // the longest message that fits the 600-octet buffer
-    seed("\x00" ++ "0123456789" ** 40), // numeric mode across a split
-    seed("\x00" ++ "HELLO WORLD $%*+-./: " ** 15), // alphanumeric across a split
-    seed("\x00" ++ "\x00\xff" ** 150), // bytes that force byte mode across a split
-    seed("\x00" ++ "P\xc5\x99\xc3\xadli\xc5\xa1 \xc5\xbelu\xc5\xa5ou\xc4\x8dk\xc3\xbd " ** 12), // multi-byte UTF-8 split mid-codepoint
+    seed("\x00" ++ (strRepeat("A", 100))), // still one symbol at low ECC
+    seed("\x00" ++ (strRepeat("A", 400))), // ⭐ several symbols: the split this target exists for
+    seed("\x01" ++ (strRepeat("A", 400))), // the same message at medium
+    seed("\x02" ++ (strRepeat("A", 400))), // quartile: more symbols again
+    seed("\x03" ++ (strRepeat("A", 400))), // high: the most symbols
+    seed("\x03" ++ (strRepeat("N", 599))), // the longest message that fits the 600-octet buffer
+    seed("\x00" ++ strRepeat("0123456789", 40)), // numeric mode across a split
+    seed("\x00" ++ strRepeat("HELLO WORLD $%*+-./: ", 15)), // alphanumeric across a split
+    seed("\x00" ++ strRepeat("\x00\xff", 150)), // bytes that force byte mode across a split
+    seed("\x00" ++ strRepeat("P\xc5\x99\xc3\xadli\xc5\xa1 \xc5\xbelu\xc5\xa5ou\xc4\x8dk\xc3\xbd ", 12)), // multi-byte UTF-8 split mid-codepoint
     seed("\x00"), // the ecc byte with an EMPTY message
     seed(""), // the empty script: exactly what the collapsed harness ran
 };
@@ -2376,14 +2376,14 @@ test "corpus: the sequence scripts really split, and the symbol counts are pinne
     var encoded: usize = 0;
     var multi_symbol: usize = 0;
     var total_symbols: usize = 0;
-    var ecc_seen = [_]bool{false} ** 4;
+    var ecc_seen = @as([4]bool, @splat(false));
     for (sequence_seeds) |sd| {
         var smith: std.testing.Smith = .{ .in = sd };
         var script: [601]u8 = undefined;
         const n: usize = smith.slice(&script);
         if (n != 0) nonempty += 1;
         const out = try runSequenceScript(script[0..n]);
-        ecc_seen[@intFromEnum(out.ecc)] = true;
+        ecc_seen[@backingInt(out.ecc)] = true;
         if (out.symbols != 0) encoded += 1;
         if (out.symbols > 1) multi_symbol += 1;
         total_symbols += out.symbols;
@@ -2561,8 +2561,8 @@ test "EXTERNAL ORACLE: 160 segno-produced grids decode back to segno's own input
     off = 4;
     try std.testing.expect(count == 160);
 
-    var seen_versions = [_]bool{false} ** 41;
-    var seen_ecc = [_]bool{false} ** 4;
+    var seen_versions = @as([41]bool, @splat(false));
+    var seen_ecc = @as([4]bool, @splat(false));
     var decoded: usize = 0;
 
     var i: u32 = 0;
@@ -2608,4 +2608,16 @@ test "EXTERNAL ORACLE: 160 segno-produced grids decode back to segno's own input
     for (1..41) |v| try std.testing.expect(seen_versions[v]);
     for (0..4) |e| try std.testing.expect(seen_ecc[e]);
     try std.testing.expectEqual(blob.len, off);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

@@ -121,7 +121,7 @@ fn roundA(gpa: std.mem.Allocator) !void {
     // hitting the syntax error -- an allocating failure that returns early,
     // not a check that short-circuits before any allocation happens (unlike
     // the DocumentTooLarge guard, which fires before the arena even opens).
-    const garbage = "{\"public_key\": \"not json past this point" ++ ("x" ** 200);
+    const garbage = "{\"public_key\": \"not json past this point" ++ (strRepeat("x", 200));
     if (drand.parseInfo(gpa, garbage)) |_| {
         return error.UnexpectedAccept;
     } else |err| switch (err) {
@@ -132,7 +132,7 @@ fn roundA(gpa: std.mem.Allocator) !void {
     // ── negative: a degenerate (point-at-infinity) public key ───────────
     // drand's own KeyValidate rejects the identity point outright -- the
     // compressed-G2 identity encoding is flag byte 0xc0 followed by zeros.
-    const identity_key_hex = "c0" ++ ("00" ** 95);
+    const identity_key_hex = "c0" ++ (strRepeat("00", 95));
     const bad_key_doc = "{\"public_key\":\"" ++ identity_key_hex ++
         "\",\"period\":3,\"genesis_time\":1,\"hash\":\"52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f661792ba94600c84e971\"," ++
         "\"groupHash\":\"f477d5c89f21a17c863a7f937c6a6d15859414d2be09cd448d4279af331c5d3e\",\"schemeID\":\"bls-unchained-g1-rfc9380\"}";
@@ -233,4 +233,16 @@ pub fn main() !void {
     try roundC(gpa);
 
     std.debug.print("OK: all drand example checks passed\n", .{});
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

@@ -367,7 +367,7 @@ var fuzz_kp: ?Kem128.KeyPair = null;
 
 fn fuzzKeypair() Kem128.KeyPair {
     if (fuzz_kp) |kp| return kp;
-    const seed_kem = [_]u8{0x37} ** params.seed_bytes;
+    const seed_kem = @as([params.seed_bytes]u8, @splat(0x37));
     fuzz_kp = keypairV(Kem128, &seed_kem);
     return fuzz_kp.?;
 }

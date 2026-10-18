@@ -141,7 +141,7 @@ fn checkParams(c: *Ctx) void {
         .{ .ok = in(c.cp.search_log, L.search_log_min, L.search_log_max), .call = "ZSTD_CCtx_setParameter( ctx, ZSTD_c_searchLog, (int)comprParams->searchLog)" },
         .{ .ok = in(c.cp.min_match, L.min_match_min, L.min_match_max), .call = "ZSTD_CCtx_setParameter( ctx, ZSTD_c_minMatch, (int)comprParams->minMatch)" },
         .{ .ok = c.cp.target_length <= L.target_length_max, .call = "ZSTD_CCtx_setParameter( ctx, ZSTD_c_targetLength, (int)comprParams->targetLength)" },
-        .{ .ok = c.cp.strategy <= @intFromEnum(zstd.Strategy.btultra2), .call = "ZSTD_CCtx_setParameter( ctx, ZSTD_c_strategy, (int)comprParams->strategy)" },
+        .{ .ok = c.cp.strategy <= @backingInt(zstd.Strategy.btultra2), .call = "ZSTD_CCtx_setParameter( ctx, ZSTD_c_strategy, (int)comprParams->strategy)" },
         .{ .ok = p.target_cblock_size <= L.target_length_max, .call = "ZSTD_CCtx_setParameter( ctx, ZSTD_c_targetCBlockSize, (int)adv->targetCBlockSize)" },
     };
     for (checks) |k| if (!k.ok) {
@@ -361,7 +361,7 @@ fn benchMem(env: fio.Env, src_in: []const u8, file_sizes: []const usize, level: 
     var c_speed: u64 = 0;
     var d_speed: u64 = 0;
     if (disp.level >= 2) {
-        out.writeAll("\r" ++ " " ** 70 ++ "\r") catch {};
+        out.writeAll("\r" ++ strRepeat(" ", 70) ++ "\r") catch {};
         progress(out, marks[0], name, src_size, null, 0, 0, null);
     }
     while (!(c_done and d_done)) {
@@ -517,4 +517,16 @@ pub fn syntheticTest(env: fio.Env, compressibility: ?f64, start: i32, end: i32, 
         name = std.fmt.bufPrint(&name_buf, "Synthetic {d}%", .{@as(u32, @intFromFloat(c * 100))}) catch unreachable;
     } else synthetic.lorem(src, 0);
     return benchLevels(env, src, &.{size}, start, end, cp, null, name, params);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

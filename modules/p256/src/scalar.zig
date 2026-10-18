@@ -237,7 +237,7 @@ test "the wrapper forwards std's arithmetic unchanged" {
         try std.testing.expectEqual(sa.sub(sb).toBytes(.big), a.sub(b).toBytes(.big));
         try std.testing.expectEqual(sa.neg().toBytes(.big), a.neg().toBytes(.big));
         try std.testing.expectEqual(sa.sq().toBytes(.big), a.sq().toBytes(.big));
-        var wide = [_]u8{0} ** 48;
+        var wide = @as([48]u8, @splat(0));
         rand.bytes(&wide);
         try std.testing.expectEqual(StdScalar.fromBytes48(wide, .big).toBytes(.big), Scalar.fromBytes48(wide, .big).toBytes(.big));
         try std.testing.expectEqual(sa.isOdd(), a.isOdd());

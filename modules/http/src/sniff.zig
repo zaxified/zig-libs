@@ -170,7 +170,7 @@ const signatures = [_]Signature{
     exact("\x1a\x45\xdf\xa3", "video/webm"),
 
     // §6.3 fonts. Embedded OpenType: "LP" at offset 34.
-    masked(("\x00" ** 34) ++ "LP", ("\x00" ** 34) ++ "\xff\xff", "application/vnd.ms-fontobject"),
+    masked((strRepeat("\x00", 34)) ++ "LP", (strRepeat("\x00", 34)) ++ "\xff\xff", "application/vnd.ms-fontobject"),
     exact("\x00\x01\x00\x00", "font/ttf"),
     exact("OTTO", "font/otf"),
     exact("ttcf", "font/collection"),
@@ -211,7 +211,7 @@ test "detectContentType: one row of every table" {
         .{ "\x00\x00\x00\x18ftypisom\x00\x00\x00\x00isomiso2", octet_stream },
         .{ "\x1f\x8b\x08\x00", "application/x-gzip" },
         .{ "\x00asm\x01\x00\x00\x00", "application/wasm" },
-        .{ ("\x00" ** 34) ++ "LP", "application/vnd.ms-fontobject" },
+        .{ (strRepeat("\x00", 34)) ++ "LP", "application/vnd.ms-fontobject" },
     };
     for (cases) |c| try testing.expectEqualStrings(c[1], detectContentType(c[0]));
 }
@@ -294,4 +294,16 @@ fn fuzzSniff(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     } else if (std.mem.eql(u8, ct, octet_stream)) {
         SniffMark.mark(.binary);
     } else SniffMark.mark(.other_signature);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

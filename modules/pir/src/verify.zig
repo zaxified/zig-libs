@@ -643,12 +643,12 @@ test "SOUNDNESS: the MAC scalar is forced ODD, whatever the caller supplies" {
     // directly rather than left to be inferred from the attack tests.
     const W = Verified(4, 4, 8);
     const seeds = [4]W.Seed{
-        [_]u8{0xA1} ** 16, [_]u8{0xB2} ** 16,
-        [_]u8{0xC3} ** 16, [_]u8{0xD4} ** 16,
+        @as([16]u8, @splat(0xA1)), @as([16]u8, @splat(0xB2)),
+        @as([16]u8, @splat(0xC3)), @as([16]u8, @splat(0xD4)),
     };
 
     // An all-even `mac_rand`, i.e. the worst thing a caller can hand in.
-    var mac_rand = [_]u8{0} ** W.tag_word_len;
+    var mac_rand = @as([W.tag_word_len]u8, @splat(0));
     for (&mac_rand, 0..) |*b, i| b.* = @truncate((i * 2) & 0xFE);
     var q: W.Query = undefined;
     try W.query(0, &mac_rand, &seeds[0], &seeds[1], &seeds[2], &seeds[3], &q);
@@ -656,7 +656,7 @@ test "SOUNDNESS: the MAC scalar is forced ODD, whatever the caller supplies" {
 
     // And an already-odd one must be left alone apart from that bit, so the
     // forcing costs exactly the one bit the bound accounts for.
-    var odd_rand = [_]u8{0} ** W.tag_word_len;
+    var odd_rand = @as([W.tag_word_len]u8, @splat(0));
     for (&odd_rand, 0..) |*b, i| b.* = @truncate(i * 7 + 1);
     const raw = std.mem.readInt(W.TagWord, &odd_rand, .little);
     var q2: W.Query = undefined;
@@ -1376,10 +1376,10 @@ test "SELF: geometry errors are returned, never asserted" {
     try testing.expectError(error.AnswerLengthMismatch, V.answer(0, &q.shares[0], database, &va, ta[0..2]));
 
     var sc_v: V.Share = undefined;
-    try testing.expectError(error.ShareLengthMismatch, V.shareFromBytes(&sc_v, &[_]u8{0} ** 3));
+    try testing.expectError(error.ShareLengthMismatch, V.shareFromBytes(&sc_v, &@as([3]u8, @splat(0))));
     try testing.expectError(
         error.ShareLengthMismatch,
-        V.shareFromBytes(&sc_v, &[_]u8{0} ** (V.share_len + 1)),
+        V.shareFromBytes(&sc_v, &@as([V.share_len + 1]u8, @splat(0))),
     );
 
     var rec: [t_record_len]u8 = undefined;
@@ -1545,7 +1545,7 @@ const VerShareCorpus = struct {
         // tag key with no separator, so this is the confusion the single
         // accepted length has to catch.
         self.push(b[0..FuzzVer.Value.share_len]);
-        self.push(&[_]u8{0} ** FuzzVer.share_len);
+        self.push(&@as([FuzzVer.share_len]u8, @splat(0)));
         self.push("");
         return self.entries[0..self.n];
     }
@@ -1656,7 +1656,7 @@ const VerAnswerCorpus = struct {
         self.push(&a, 40, 5, 8, 0); // record_len not a whole word
         self.push(&b, 96, 12, 8, 1); // the widest geometry that fits
         // The geometry the collapsed harness ran, kept rather than replaced.
-        self.push(&[_]u8{0} ** FuzzVer.share_len, 1, 1, 1, 0);
+        self.push(&@as([FuzzVer.share_len]u8, @splat(0)), 1, 1, 1, 0);
         return self.entries[0..self.n];
     }
 };
@@ -1792,8 +1792,8 @@ const VerReconCorpus = struct {
         // "accepted" was never the number to look at for this target.
         self.push("", "", "", "", 0, 1);
         // The widest geometry: 24-octet records, 6 value words, 7 tag words.
-        const wide_v = [_]u8{0x33} ** 24;
-        const wide_t = [_]u8{0x77} ** 56;
+        const wide_v = @as([24]u8, @splat(0x33));
+        const wide_t = @as([56]u8, @splat(0x77));
         self.push(&wide_v, &wide_v, &wide_t, &wide_t, 24, 0xdead_beef_dead_beef);
         return self.entries[0..self.n];
     }

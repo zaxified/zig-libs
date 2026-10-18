@@ -146,7 +146,7 @@ pub const MessageType = enum(u8) {
     _,
 
     pub fn isProprietary(self: MessageType) bool {
-        return @intFromEnum(self) >= 0x80;
+        return @backingInt(self) >= 0x80;
     }
 };
 
@@ -184,7 +184,7 @@ pub const Npci = struct {
         if (self.destination != null) c |= 0x20;
         if (self.source != null) c |= 0x08;
         if (self.expecting_reply) c |= 0x04;
-        c |= @intFromEnum(self.priority);
+        c |= @backingInt(self.priority);
         return c;
     }
 
@@ -275,7 +275,7 @@ pub fn decode(buf: []const u8) Error!Npdu {
 
     var npci: Npci = .{
         .expecting_reply = control & 0x04 != 0,
-        .priority = @enumFromInt(@as(u2, @truncate(control & 0x03))),
+        .priority = @fromBackingInt(@intCast(@as(u2, @truncate(control & 0x03)))),
         .network_message = control & 0x80 != 0,
     };
 
@@ -314,7 +314,7 @@ pub fn decode(buf: []const u8) Error!Npdu {
     }
 
     if (pos + 1 > buf.len) return error.Truncated;
-    const kind: MessageType = @enumFromInt(buf[pos]);
+    const kind: MessageType = @fromBackingInt(@intCast(buf[pos]));
     pos += 1;
     var vendor: ?u16 = null;
     if (kind.isProprietary()) {
@@ -351,7 +351,7 @@ pub fn decode(buf: []const u8) Error!Npdu {
         .reject_message_to_network => blk: {
             if (body.len != 3) return error.Truncated;
             break :blk .{ .reject_message_to_network = .{
-                .reason = @enumFromInt(body[0]),
+                .reason = @fromBackingInt(@intCast(body[0])),
                 .net = std.mem.readInt(u16, body[1..3], .big),
             } };
         },
@@ -395,31 +395,31 @@ pub fn encodeNetworkMessage(npci_in: Npci, msg: NetworkMessage, out: []u8) Error
     try w.npci(npci);
     switch (msg) {
         .who_is_router_to_network => |maybe_net| {
-            try w.byte(@intFromEnum(MessageType.who_is_router_to_network));
+            try w.byte(@backingInt(MessageType.who_is_router_to_network));
             if (maybe_net) |n| try w.u16be(n);
         },
         .i_am_router_to_network,
         .router_busy_to_network,
         .router_available_to_network,
         => |list| {
-            try w.byte(@intFromEnum(msg.kind()));
+            try w.byte(@backingInt(msg.kind()));
             // Re-emit the borrowed body verbatim: it is already big-endian
             // `u16`s and re-serialising through the iterator would be the same
             // octets with more chances to be wrong.
             try w.raw(list.body);
         },
         .i_could_be_router_to_network => |c| {
-            try w.byte(@intFromEnum(MessageType.i_could_be_router_to_network));
+            try w.byte(@backingInt(MessageType.i_could_be_router_to_network));
             try w.u16be(c.net);
             try w.byte(c.performance_index);
         },
         .reject_message_to_network => |r| {
-            try w.byte(@intFromEnum(MessageType.reject_message_to_network));
-            try w.byte(@intFromEnum(r.reason));
+            try w.byte(@backingInt(MessageType.reject_message_to_network));
+            try w.byte(@backingInt(r.reason));
             try w.u16be(r.net);
         },
         .other => |o| {
-            try w.byte(@intFromEnum(o.kind));
+            try w.byte(@backingInt(o.kind));
             if (o.kind.isProprietary()) try w.u16be(o.vendor_id orelse return error.InvalidControl);
             try w.raw(o.body);
         },
@@ -446,7 +446,7 @@ pub fn encodeNetworkList(
     npci.network_message = true;
     var w = HeaderWriter{ .out = out };
     try w.npci(npci);
-    try w.byte(@intFromEnum(kind));
+    try w.byte(@backingInt(kind));
     for (nets) |n| try w.u16be(n);
     return out[0..w.pos];
 }
@@ -739,7 +739,7 @@ test "an unmodelled network message is passed through, with its vendor id" {
     var out: [32]u8 = undefined;
     try testing.expectEqualSlices(u8, &vendor, try encodeNetworkMessage(
         .{},
-        .{ .other = .{ .kind = @enumFromInt(0x90), .vendor_id = 300, .body = &.{ 0xDE, 0xAD } } },
+        .{ .other = .{ .kind = @fromBackingInt(@intCast(0x90)), .vendor_id = 300, .body = &.{ 0xDE, 0xAD } } },
         &out,
     ));
 
@@ -824,7 +824,7 @@ test "mac_len cannot name an octet outside the MAC storage" {
     }
 
     // The boundary the decoder enforces is the same number, not a second one.
-    try testing.expectError(error.InvalidControl, NetAddress.fromMac(1, &[_]u8{0} ** (cap + 1)));
+    try testing.expectError(error.InvalidControl, NetAddress.fromMac(1, &@as([cap + 1]u8, @splat(0))));
     // DLEN one past the cap, with the octets actually present, is still refused.
     var wire: [2 + 3 + cap + 1 + 1]u8 = @splat(0);
     wire[0] = version;

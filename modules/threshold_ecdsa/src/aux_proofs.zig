@@ -2053,7 +2053,7 @@ test "F10: an honest proof over a tuple below the q⁷ floor passes the proofs b
 test "F10: verifyWellFormed accepts an honest tuple above the q⁷ floor, and still refuses a tampered proof for it" {
     // 2048-bit Πprm/Πmod: skipped only in Debug, like zkproofs.zig's 2048-bit
     // fixtures (this module is `heavy`, so the default lane is ReleaseSafe).
-    if (@import("builtin").mode == .Debug) return error.SkipZigTest;
+    if (@import("builtin").mode == .debug) return error.SkipZigTest;
     if (!gate.aux_proofs_core_implemented) return error.SkipZigTest;
     const allocator = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0xF10_0002);

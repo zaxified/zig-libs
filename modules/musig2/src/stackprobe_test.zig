@@ -220,12 +220,12 @@ noinline fn callSign() void {
 }
 
 test "STACKPROBE (audit 2026-10-08): no key or nonce residue on the dead stack after sign()" {
-    if (builtin.mode == .Debug or builtin.mode == .ReleaseSafe) return error.SkipZigTest;
+    if (builtin.mode == .debug or builtin.mode == .safe) return error.SkipZigTest;
     const io = std.testing.io;
-    const partner_sk = [_]u8{0x6B} ** 32;
+    const partner_sk = @as([32]u8, @splat(0x6B));
     const partner_pk = musig2.PlainPublicKey{ .bytes = (try k256.Secp256k1.combMulBase(partner_sk, .big)).toCompressedSec1() };
     var partner: musig2.NonceGenResult = undefined;
-    try musig2.nonceGen(&partner, &partner_sk, partner_pk.bytes, null, msg, null, &@as([32]u8, [_]u8{0x77} ** 32), io);
+    try musig2.nonceGen(&partner, &partner_sk, partner_pk.bytes, null, msg, null, &@as([32]u8, @as([32]u8, @splat(0x77))), io);
 
     for (cases) |case| {
         probe_sk = try bip340.SecretKey.fromBytes(case.sk);

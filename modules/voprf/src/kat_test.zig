@@ -339,10 +339,10 @@ test "blindEvaluatePoprfBatch: empty batch and mismatched output length are erro
 // ── end-to-end round trips with fresh (non-vector) material ─────────────
 
 test "e2e OPRF: fresh key + fresh blind round-trips and agrees with evaluate" {
-    const seed = [_]u8{0x7e} ** 32;
+    const seed = @as([32]u8, @splat(0x7e));
     const kp = try shim.deriveKeyPair(.oprf, seed, "e2e oprf");
     // Deterministic stand-ins for CSPRNG output (tests must not use RNG).
-    const blind_scalar = shim.scalarFromWideBytes([_]u8{0x11} ** 64);
+    const blind_scalar = shim.scalarFromWideBytes(@as([64]u8, @splat(0x11)));
     const input = "e2e private input";
 
     const blinded = try shim.blind(.oprf, input, blind_scalar);
@@ -357,10 +357,10 @@ test "e2e OPRF: fresh key + fresh blind round-trips and agrees with evaluate" {
 }
 
 test "e2e VOPRF: fresh key, verified round trip agrees with evaluate" {
-    const seed = [_]u8{0x2b} ** 32;
+    const seed = @as([32]u8, @splat(0x2b));
     const kp = try shim.deriveKeyPair(.voprf, seed, "e2e voprf");
-    const blind_scalar = shim.scalarFromWideBytes([_]u8{0x22} ** 64);
-    const proof_r = shim.scalarFromWideBytes([_]u8{0x33} ** 64);
+    const blind_scalar = shim.scalarFromWideBytes(@as([64]u8, @splat(0x22)));
+    const proof_r = shim.scalarFromWideBytes(@as([64]u8, @splat(0x33)));
     const input = "e2e verifiable input";
 
     const blinded = try shim.blind(.voprf, input, blind_scalar);
@@ -377,7 +377,7 @@ test "e2e VOPRF: fresh key, verified round trip agrees with evaluate" {
     try testing.expectEqualSlices(u8, &direct, &output);
 
     // A proof made under a DIFFERENT key must be rejected by finalize.
-    const other_kp = try shim.deriveKeyPair(.voprf, [_]u8{0x2c} ** 32, "e2e voprf");
+    const other_kp = try shim.deriveKeyPair(.voprf, @as([32]u8, @splat(0x2c)), "e2e voprf");
     const forged = try shim.blindEvaluateVerifiable(other_kp.sk, other_kp.pk, blinded, proof_r);
     try testing.expectError(error.InvalidProof, shim.finalizeVerifiable(
         input,
@@ -390,10 +390,10 @@ test "e2e VOPRF: fresh key, verified round trip agrees with evaluate" {
 }
 
 test "e2e POPRF: fresh key, verified round trip agrees with evaluate" {
-    const seed = [_]u8{0x5d} ** 32;
+    const seed = @as([32]u8, @splat(0x5d));
     const kp = try shim.deriveKeyPair(.poprf, seed, "e2e poprf");
-    const blind_scalar = shim.scalarFromWideBytes([_]u8{0x44} ** 64);
-    const proof_r = shim.scalarFromWideBytes([_]u8{0x55} ** 64);
+    const blind_scalar = shim.scalarFromWideBytes(@as([64]u8, @splat(0x44)));
+    const proof_r = shim.scalarFromWideBytes(@as([64]u8, @splat(0x55)));
     const input = "e2e partially oblivious input";
     const info = "public metadata";
 
@@ -417,7 +417,7 @@ test "e2e POPRF: fresh key, verified round trip agrees with evaluate" {
 }
 
 test "Proof.fromBytes rejects non-canonical scalars" {
-    var bytes = [_]u8{0} ** 64;
+    var bytes = @as([64]u8, @splat(0));
     @memset(bytes[0..32], 0xff); // c >= group order
     try testing.expectError(error.InvalidScalar, Proof.fromBytes(bytes));
 }
@@ -440,10 +440,10 @@ test "finalize REJECTS a zero blind scalar (degenerate unblind, RFC 9497 Invalid
     // (KAT or e2e) ever exercises unblind's own zero-blind guard — every
     // vector's/e2e test's blind scalar is a genuine nonzero value, so
     // this guard could be deleted without any existing test noticing.
-    const seed = [_]u8{0x99} ** 32;
+    const seed = @as([32]u8, @splat(0x99));
     const kp = try shim.deriveKeyPair(.oprf, seed, "zero blind test");
-    const real_blind = shim.scalarFromWideBytes([_]u8{0x77} ** 64);
-    const zero_blind = [_]u8{0} ** voprf.Ns;
+    const real_blind = shim.scalarFromWideBytes(@as([64]u8, @splat(0x77)));
+    const zero_blind = @as([voprf.Ns]u8, @splat(0));
     const input = "zero blind input";
 
     const blinded = try shim.blind(.oprf, input, real_blind);

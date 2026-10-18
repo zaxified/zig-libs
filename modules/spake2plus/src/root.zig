@@ -490,7 +490,7 @@ noinline fn computeW0W1Body(out: *W0W1, pbkdf_output: []const u8) ComputeW0W1Err
     // Each 40-byte big-endian half, zero-padded with 8 LEADING zero
     // bytes to 48, then wide-reduced mod p via Scalar.fromBytes48 (the
     // widen-and-wide-reduce pattern — see the doc comment above).
-    var wide = [_]u8{0} ** 48;
+    var wide = @as([48]u8, @splat(0));
     @memcpy(wide[8..48], pbkdf_output[0..40]);
     out.w0 = Scalar.fromBytes48(wide, .big).toBytes(.big);
     @memcpy(wide[8..48], pbkdf_output[40..80]);
@@ -1360,7 +1360,7 @@ fn fuzzShareDecode(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!v
     const n: usize = fz.drawInput(S, src, &buf, &share_seeds);
     // The entry points take `[share_length]u8`, so a short draw is padded
     // exactly the way a short wire read would have to be handled.
-    var share: [share_length]u8 = [_]u8{0} ** share_length;
+    var share: [share_length]u8 = @as([share_length]u8, @splat(0));
     @memcpy(share[0..n], buf[0..n]);
 
     // The bare decode boundary.
@@ -1371,7 +1371,7 @@ fn fuzzShareDecode(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!v
 
     // And the real entry point behind it: parse, RFC 9383 §6 group check,
     // then the secret-touching arithmetic and the transcript allocation.
-    const w = [_]u8{0x2a} ** scalar_length;
+    const w = @as([scalar_length]u8, @splat(0x2a));
     var res: ProverFinishResult = undefined;
     if (proverFinish(
         &res,
@@ -1384,7 +1384,7 @@ fn fuzzShareDecode(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!v
         &w,
         share,
         share,
-        [_]u8{0} ** hash_length,
+        @as([hash_length]u8, @splat(0)),
     )) {
         // Unreachable in practice (a zero confirmation): the MAC would have
         // to be all zero. Free anyway, and say so.
@@ -1525,7 +1525,7 @@ test "corpus: every share seed reaches fromSec1, and the points parsed are pinne
         var buf: [share_length]u8 = undefined;
         const n: usize = smith.slice(&buf);
         if (n != 0) nonempty += 1;
-        var share: [share_length]u8 = [_]u8{0} ** share_length;
+        var share: [share_length]u8 = @as([share_length]u8, @splat(0));
         @memcpy(share[0..n], buf[0..n]);
         const point = P256.fromSec1(&share) catch continue;
         parsed += 1;

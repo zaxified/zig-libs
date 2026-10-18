@@ -41,8 +41,8 @@ pub fn main() !void {
     // Client: two fresh seeds. Production: a CSPRNG, one pair per query —
     // reusing seeds across queries would let the two servers correlate
     // requests even without colluding on content.
-    const s0: fss.prg.Seed = [_]u8{0x11} ** 16;
-    const s1: fss.prg.Seed = [_]u8{0x22} ** 16;
+    const s0: fss.prg.Seed = @as([16]u8, @splat(0x11));
+    const s1: fss.prg.Seed = @as([16]u8, @splat(0x22));
     var shares: [2]P.Share = undefined;
     try P.query(want_index, &s0, &s1, &shares);
     std.debug.print("query built: two {d}-byte shares, one per server\n", .{P.share_len});
@@ -100,8 +100,8 @@ pub fn main() !void {
     const n_words_kw = P.answerWords(kw_record_len);
     // A second query needs its OWN fresh seed pair — reusing `s0`/`s1`
     // here would correlate this lookup with the one above.
-    const s0b: fss.prg.Seed = [_]u8{0x33} ** 16;
-    const s1b: fss.prg.Seed = [_]u8{0x44} ** 16;
+    const s0b: fss.prg.Seed = @as([16]u8, @splat(0x33));
+    const s1b: fss.prg.Seed = @as([16]u8, @splat(0x44));
     var kw_shares: [2]P.Share = undefined;
     try P.queryKeyword("carol", &s0b, &s1b, &kw_shares);
     var kwa0: [1]P.Word = undefined;
@@ -132,8 +132,8 @@ pub fn main() !void {
     // the first outside caller.
     const Pct = pir.PirWith(fss.prg.Sha256Prg, 3, 16);
     const Vct = pir.VerifiedWith(fss.prg.Sha256Prg, 3, 16, 8);
-    const s0c: fss.prg.Seed = [_]u8{0x55} ** 16;
-    const s1c: fss.prg.Seed = [_]u8{0x66} ** 16;
+    const s0c: fss.prg.Seed = @as([16]u8, @splat(0x55));
+    const s1c: fss.prg.Seed = @as([16]u8, @splat(0x66));
     var ct_shares: [2]Pct.Share = undefined;
     try Pct.query(want_index, &s0c, &s1c, &ct_shares);
     var c0: [1]Pct.Word = undefined;

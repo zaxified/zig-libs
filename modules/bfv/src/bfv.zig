@@ -1414,9 +1414,9 @@ pub fn Bfv(comptime P: params.Params) type {
             const x1 = self.centeredCoeffs(&x.components[1]);
             const y0 = self.centeredCoeffs(&y.components[0]);
             const y1 = self.centeredCoeffs(&y.components[1]);
-            var t0 = [_]TensorI{0} ** N;
-            var t1 = [_]TensorI{0} ** N;
-            var t2 = [_]TensorI{0} ** N;
+            var t0 = @as([N]TensorI, @splat(0));
+            var t1 = @as([N]TensorI, @splat(0));
+            var t2 = @as([N]TensorI, @splat(0));
             negaMulAcc(&x0, &y0, &t0);
             negaMulAcc(&x0, &y1, &t1);
             negaMulAcc(&x1, &y0, &t1);
@@ -1530,12 +1530,12 @@ test "instance builds and exposes real ring add on ciphertext components" {
     const primes = [_]u64{ 17, 97 };
     var a = B.Ciphertext{ .components = .{
         B.Ring.fromCoeffs(&primes, .{ [_]u64{ 1, 2, 3, 4, 5, 6, 7, 8 }, [_]u64{ 1, 1, 1, 1, 1, 1, 1, 1 } }),
-        B.Ring.fromCoeffs(&primes, .{ [_]u64{0} ** 8, [_]u64{0} ** 8 }),
+        B.Ring.fromCoeffs(&primes, .{ @as([8]u64, @splat(0)), @as([8]u64, @splat(0)) }),
         B.Ring.zero(.coeff),
     }, .len = 2 };
     const b = B.Ciphertext{ .components = .{
         B.Ring.fromCoeffs(&primes, .{ [_]u64{ 16, 16, 16, 16, 16, 16, 16, 16 }, [_]u64{ 96, 96, 96, 96, 96, 96, 96, 96 } }),
-        B.Ring.fromCoeffs(&primes, .{ [_]u64{0} ** 8, [_]u64{0} ** 8 }),
+        B.Ring.fromCoeffs(&primes, .{ @as([8]u64, @splat(0)), @as([8]u64, @splat(0)) }),
         B.Ring.zero(.coeff),
     }, .len = 2 };
     const c = inst.add(&a, &b);

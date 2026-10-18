@@ -240,8 +240,8 @@ test "go oracle: FileServer paths and ServeContent preconditions/ranges answer a
     var plain = staticfiles.Handler.init(io, tree.root, .{});
     var strong = staticfiles.Handler.init(io, tree.root, .{ .strong_etag = true });
 
-    var seen = [_]bool{false} ** divergences.len;
-    var range_seen = [_]bool{false} ** range_divergences.len;
+    var seen = @as([divergences.len]bool, @splat(false));
+    var range_seen = @as([range_divergences.len]bool, @splat(false));
     var bad: usize = 0;
     for (vectors.cases) |c| {
         var wire_buf: [4096]u8 = undefined;

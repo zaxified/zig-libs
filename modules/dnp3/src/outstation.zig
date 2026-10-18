@@ -875,7 +875,7 @@ pub const Outstation = struct {
         var any = false;
         for (self.events.in_flight..self.events.len) |i| {
             const cls = self.events.at(i).class;
-            if (self.unsolicited_enabled[@as(usize, @intFromEnum(cls)) - 1]) any = true;
+            if (self.unsolicited_enabled[@as(usize, @backingInt(cls)) - 1]) any = true;
         }
         if (!any) return null;
 
@@ -1161,7 +1161,7 @@ pub const Outstation = struct {
         // Everything in this class that was pending has now been offered.
         var pending: usize = 0;
         for (0..self.events.len) |i| {
-            if (@intFromEnum(self.events.at(i).class) == class) pending += 1;
+            if (@backingInt(self.events.at(i).class) == class) pending += 1;
         }
         return cursor.events_sent >= pending;
     }
@@ -1345,7 +1345,7 @@ pub const Outstation = struct {
         var i: usize = 0;
         while (i < self.events.len) : (i += 1) {
             const ev = self.events.at(i);
-            if (!classes[@as(usize, @intFromEnum(ev.class)) - 1]) continue;
+            if (!classes[@as(usize, @backingInt(ev.class)) - 1]) continue;
             if (kind_filter) |k| {
                 if (ev.kind != k) continue;
             }
@@ -1596,7 +1596,7 @@ pub const Outstation = struct {
                     pos += prefix_len;
                 }
                 @memcpy(out[pos..][0..record_len], object);
-                out[pos + record_len - 1] = @intFromEnum(status);
+                out[pos + record_len - 1] = @backingInt(status);
                 pos += record_len;
             }
         }
@@ -1919,7 +1919,7 @@ fn valueAsFloat(value: records.Value) f64 {
         .analog_int => |i| @floatFromInt(i),
         .counter => |c| @floatFromInt(c),
         .binary => |b| @floatFromInt(@intFromBool(b)),
-        .double_bit => |d| @floatFromInt(@intFromEnum(d)),
+        .double_bit => |d| @floatFromInt(@backingInt(d)),
     };
 }
 
@@ -2061,7 +2061,7 @@ pub const Session = struct {
             // to the first draft of this code.
             .dir = false,
             .prm = true,
-            .function = @intFromEnum(link.PrimaryFunction.unconfirmed_user_data),
+            .function = @backingInt(link.PrimaryFunction.unconfirmed_user_data),
         };
         var seg = transport.Segmenter.init(fragment);
         seg.seq = self.tx_seq;
@@ -2086,7 +2086,7 @@ pub const Session = struct {
             .dir = false, // outstation -> master, see sendFragment
             .prm = false,
             .fcv_or_dfc = false,
-            .function = @intFromEnum(function),
+            .function = @backingInt(function),
         };
         return try link.encodeFrame(control, dest, self.outstation.config.address, &.{}, out);
     }
@@ -2110,7 +2110,7 @@ const Fixture = struct {
 
     fn station(self: *Fixture, config: Config) Outstation {
         for (&self.binaries, 0..) |*p, i| p.* = .{ .value = (i % 2 == 0), .class = .class1, .static_variation = 2, .event_variation = 2 };
-        for (&self.dbits, 0..) |*p, i| p.* = .{ .value = @enumFromInt(@as(u2, @intCast(i + 1))), .class = .class1 };
+        for (&self.dbits, 0..) |*p, i| p.* = .{ .value = @fromBackingInt(@intCast(@as(u2, @intCast(i + 1)))), .class = .class1 };
         for (&self.bouts) |*p| p.* = .{ .value = false, .class = .class1 };
         for (&self.counters, 0..) |*p, i| p.* = .{ .value = @intCast(100 + i), .class = .class3 };
         for (&self.frozen) |*p| p.* = .{ .value = 0, .class = null };
@@ -2694,7 +2694,7 @@ fn buildCrobRange(
 /// The status byte of the first echoed command object in a response.
 fn commandStatus(fragment: []const u8) !CommandStatus {
     const decoded = try application.decodeResponseHeader(fragment);
-    return @enumFromInt(decoded.rest[decoded.rest.len - 1]);
+    return @fromBackingInt(@intCast(decoded.rest[decoded.rest.len - 1]));
 }
 
 test "update and reportChange ignore an index one past the database" {
@@ -2993,7 +2993,7 @@ test "analog output block: variations 2 (i16), 3 (f32) and 4 (f64) all decode" {
             buf[pos] = index;
             pos += 1;
             std.mem.writeInt(u64, buf[pos..][0..8], @bitCast(value), .little);
-            buf[pos + 8] = @intFromEnum(objects.g12.CommandStatus.success);
+            buf[pos + 8] = @backingInt(objects.g12.CommandStatus.success);
             pos += 9;
             return buf[0..pos];
         }
@@ -3134,7 +3134,7 @@ test "ENABLE/DISABLE_UNSOLICITED toggles the classes, or is refused outright" {
     try testing.expectEqualSlices(bool, &.{ true, true, true }, &supported.unsolicited_enabled);
 
     req[0] = 0xC1;
-    req[1] = @intFromEnum(FunctionCode.disable_unsolicited);
+    req[1] = @backingInt(FunctionCode.disable_unsolicited);
     _ = (try supported.handle(req[0..pos], 200, &out)).?;
     try testing.expectEqualSlices(bool, &.{ false, false, false }, &supported.unsolicited_enabled);
 }
@@ -3368,7 +3368,7 @@ test "Session: link-layer service requests get link-layer answers" {
     var frame_buf: [64]u8 = undefined;
 
     const reset = try link.encodeFrame(
-        .{ .dir = true, .prm = true, .fcv_or_dfc = true, .function = @intFromEnum(link.PrimaryFunction.reset_link_states) },
+        .{ .dir = true, .prm = true, .fcv_or_dfc = true, .function = @backingInt(link.PrimaryFunction.reset_link_states) },
         10,
         1,
         &.{},
@@ -3383,7 +3383,7 @@ test "Session: link-layer service requests get link-layer answers" {
     try testing.expectEqual(@as(u16, 10), decoded.src);
 
     const status = try link.encodeFrame(
-        .{ .dir = true, .prm = true, .function = @intFromEnum(link.PrimaryFunction.request_link_status) },
+        .{ .dir = true, .prm = true, .function = @backingInt(link.PrimaryFunction.request_link_status) },
         10,
         1,
         &.{},
@@ -3401,7 +3401,7 @@ fn frameFor(dest: u16, src: u16, fragment: []const u8, out: []u8) ![]u8 {
     user[0] = 0xC0; // transport FIR + FIN, seq 0
     @memcpy(user[1..][0..fragment.len], fragment);
     return try link.encodeFrame(
-        .{ .dir = true, .prm = true, .function = @intFromEnum(link.PrimaryFunction.unconfirmed_user_data) },
+        .{ .dir = true, .prm = true, .function = @backingInt(link.PrimaryFunction.unconfirmed_user_data) },
         dest,
         src,
         user[0 .. 1 + fragment.len],
@@ -3457,7 +3457,7 @@ test "Session: a frame addressed to another outstation is dropped, not executed"
         var station = fix.station(.{ .address = 10, .master_address = 1 });
         var session = Session.init(&station, &rx, &scratch, &tx);
         const reset = try link.encodeFrame(
-            .{ .dir = true, .prm = true, .fcv_or_dfc = true, .function = @intFromEnum(link.PrimaryFunction.reset_link_states) },
+            .{ .dir = true, .prm = true, .fcv_or_dfc = true, .function = @backingInt(link.PrimaryFunction.reset_link_states) },
             999,
             1,
             &.{},
@@ -3690,7 +3690,7 @@ test "Session: a frame from a station other than our master is dropped by defaul
         var station = fix.station(.{ .address = us, .master_address = a });
         var session = Session.init(&station, &rx, &scratch, &tx);
         const reset = try link.encodeFrame(
-            .{ .dir = true, .prm = true, .fcv_or_dfc = true, .function = @intFromEnum(link.PrimaryFunction.reset_link_states) },
+            .{ .dir = true, .prm = true, .fcv_or_dfc = true, .function = @backingInt(link.PrimaryFunction.reset_link_states) },
             us,
             b,
             &.{},
@@ -3888,7 +3888,7 @@ test "Session: a fragment split across transport segments reassembles" {
 
     var wire: [1024]u8 = undefined;
     const frames = try @import("root.zig").sendFragment(
-        .{ .dir = true, .prm = true, .function = @intFromEnum(link.PrimaryFunction.unconfirmed_user_data) },
+        .{ .dir = true, .prm = true, .function = @backingInt(link.PrimaryFunction.unconfirmed_user_data) },
         10,
         1,
         fragment[0..pos],
@@ -3923,7 +3923,7 @@ test "Session: a transport segment out of order is a typed error, not a crash" {
     const control = link.Control{
         .dir = true,
         .prm = true,
-        .function = @intFromEnum(link.PrimaryFunction.unconfirmed_user_data),
+        .function = @backingInt(link.PrimaryFunction.unconfirmed_user_data),
     };
     // FIR, seq 0, not FIN.
     const first = try link.encodeFrame(control, 10, 1, &.{ 0x40, 0xC0, 0x01 }, &frame_buf);
@@ -3951,7 +3951,7 @@ test "Session: a frame with a bad CRC is a typed error" {
     var frame_buf: [64]u8 = undefined;
 
     const good = try link.encodeFrame(
-        .{ .dir = true, .prm = true, .function = @intFromEnum(link.PrimaryFunction.unconfirmed_user_data) },
+        .{ .dir = true, .prm = true, .function = @backingInt(link.PrimaryFunction.unconfirmed_user_data) },
         10,
         1,
         &.{ 0xC0, 0xC0, 0x01, 0x3C, 0x01, 0x06 },
@@ -4426,10 +4426,10 @@ const ScriptCorpus = struct {
         // g12v1 (CROB), no prefix, range code 2 (32-bit start/stop),
         // start = 0x1_0000 and stop = 0x1_0001 (both past the u16 index
         // space), 22 body octets — two whole CROBs, which is `index_past_u16`.
-        self.push(&[_]u8{ 0, 1, 1, 1, 1, 3, 0, 0, 0, 2, 8, 9, 5 } ++ [_]u8{0xAA} ** 22);
+        self.push(&[_]u8{ 0, 1, 1, 1, 1, 3, 0, 0, 0, 2, 8, 9, 5 } ++ @as([22]u8, @splat(0xAA)));
         // The same header with start = 0 and stop = 0xFFFF_FFFF: the whole u32
         // space in one range, which is `full_width_range` (the F4 overflow).
-        self.push(&[_]u8{ 0, 1, 1, 1, 1, 4, 0, 0, 0, 2, 0, 13, 5 } ++ [_]u8{0xBB} ** 22);
+        self.push(&[_]u8{ 0, 1, 1, 1, 1, 4, 0, 0, 0, 2, 0, 13, 5 } ++ @as([22]u8, @splat(0xBB)));
 
         const starts = [_]u32{
             0x9E37_79B9, 0x2B7E_1516, 0x0123_4567, 0xF0E1_D2C3,

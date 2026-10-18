@@ -63,12 +63,12 @@ fn deterministicSecret(comptime E: type, comptime Curve: type, comptime Hash: ty
     const Prf = crypto.auth.hmac.Hmac(Hash);
     const sl = Curve.scalar.encoded_length;
     const nl = E.noise_length;
-    const h = [_]u8{0x00} ** Hash.digest_length;
-    const x = [_]u8{0x01} ** sl;
+    const h = @as([Hash.digest_length]u8, @splat(0x00));
+    const x = @as([sl]u8, @splat(0x01));
 
-    var k = [_]u8{0x00} ** h.len;
-    var m = [_]u8{0x00} ** (h.len + 1 + nl + x.len + h.len);
-    var t = [_]u8{0x00} ** sl;
+    var k = @as([h.len]u8, @splat(0x00));
+    var m = @as([h.len + 1 + nl + x.len + h.len]u8, @splat(0x00));
+    var t = @as([sl]u8, @splat(0x00));
     defer crypto.secureZero(u8, &k);
     defer crypto.secureZero(u8, &m);
     defer crypto.secureZero(u8, &t);

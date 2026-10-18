@@ -856,13 +856,13 @@ test "raw CBC rejects non-block-aligned input" {
 
 test "raw CBC rejects an undersized out buffer" {
     var out: [16]u8 = undefined; // plaintext is 2 blocks, out is 1
-    const pt = [_]u8{0x41} ** 32;
+    const pt = @as([32]u8, @splat(0x41));
     try testing.expectError(error.BufferTooSmall, encrypt(Aes128, &f_2_1_key, f_2_1_iv, &pt, &out));
 }
 
 test "raw CBC decrypt rejects an undersized out buffer" {
     var out: [16]u8 = undefined; // ciphertext is 2 blocks, out is 1
-    const ct = [_]u8{0x41} ** 32;
+    const ct = @as([32]u8, @splat(0x41));
     try testing.expectError(error.BufferTooSmall, decrypt(Aes128, &f_2_1_key, f_2_1_iv, &ct, &out));
 }
 
@@ -875,8 +875,8 @@ test "raw CBC round-trip: empty message" {
 }
 
 test "raw CBC round-trip: multi-block message, self-consistency" {
-    const key = [_]u8{0x5a} ** 32;
-    const iv = [_]u8{0x11} ** block_len;
+    const key = @as([32]u8, @splat(0x5a));
+    const iv = @as([block_len]u8, @splat(0x11));
     // Four AES blocks (64 bytes) of distinguishable, non-repeating content.
     var pt: [64]u8 = undefined;
     for (&pt, 0..) |*b, i| b.* = @truncate(i);
@@ -904,7 +904,7 @@ test "PKCS#7 pad/unpad round-trip: not block-aligned" {
 }
 
 test "PKCS#7 pad/unpad round-trip: exactly block-aligned still gains a full pad block" {
-    const msg = [_]u8{0x42} ** 16;
+    const msg = @as([16]u8, @splat(0x42));
     var padded: [32]u8 = undefined;
     const n = try padPkcs7(&msg, &padded);
     try testing.expectEqual(@as(usize, 32), n);
@@ -915,8 +915,8 @@ test "PKCS#7 pad/unpad round-trip: exactly block-aligned still gains a full pad 
 }
 
 test "PKCS#7 pad/unpad round-trip through real CBC encrypt/decrypt" {
-    const key = [_]u8{0x33} ** 16;
-    const iv = [_]u8{0x44} ** block_len;
+    const key = @as([16]u8, @splat(0x33));
+    const iv = @as([block_len]u8, @splat(0x44));
     const msg = "A message that is not a multiple of the block size.";
 
     var padded: [128]u8 = undefined;
@@ -932,13 +932,13 @@ test "PKCS#7 pad/unpad round-trip through real CBC encrypt/decrypt" {
 }
 
 test "PKCS#7 unpad rejects: zero-length pad byte (0x00)" {
-    var buf = [_]u8{0x41} ** block_len;
+    var buf = @as([block_len]u8, @splat(0x41));
     buf[block_len - 1] = 0x00;
     try testing.expectError(error.InvalidPadding, unpadPkcs7(&buf));
 }
 
 test "PKCS#7 unpad rejects: pad length > block_len" {
-    var buf = [_]u8{0x41} ** block_len;
+    var buf = @as([block_len]u8, @splat(0x41));
     buf[block_len - 1] = 0x11; // 17 > 16
     try testing.expectError(error.InvalidPadding, unpadPkcs7(&buf));
 }
@@ -948,13 +948,13 @@ test "PKCS#7 unpad rejects: pad length > block_len" {
 // unpinned — relaxed to `n > 17`, a whole block of 0x11 unpadded to
 // `len - 16`. RFC 5652 §6.3: the pad length is 1..block_len.
 test "PKCS#7 unpad rejects: a whole block of 0x11 (pad 17, every byte consistent)" {
-    const buf = [_]u8{0x41} ** block_len ++ [_]u8{0x11} ** block_len;
+    const buf = @as([block_len]u8, @splat(0x41)) ++ @as([block_len]u8, @splat(0x11));
     try testing.expectError(error.InvalidPadding, unpadPkcs7(&buf));
     try testing.expectError(error.InvalidPadding, unpadXmlEnc(&buf));
 }
 
 test "PKCS#7 unpad rejects: inconsistent pad bytes" {
-    var buf = [_]u8{0x41} ** block_len;
+    var buf = @as([block_len]u8, @splat(0x41));
     buf[block_len - 1] = 0x04; // claims last 4 bytes == 0x04
     buf[block_len - 2] = 0x04;
     buf[block_len - 3] = 0x04;
@@ -968,7 +968,7 @@ test "PKCS#7 unpad rejects: empty or non-block-aligned buffer" {
 }
 
 test "PKCS#7 unpad accepts: pad length == block_len with a full pad block, empty-ish message" {
-    const buf = [_]u8{0x10} ** block_len; // valid: N=16, all 16 bytes == 16
+    const buf = @as([block_len]u8, @splat(0x10)); // valid: N=16, all 16 bytes == 16
     const n = try unpadPkcs7(&buf);
     try testing.expectEqual(@as(usize, 0), n);
 }
@@ -976,7 +976,7 @@ test "PKCS#7 unpad accepts: pad length == block_len with a full pad block, empty
 // ── XML-Enc padding tests ────────────────────────────────────────────────────
 
 test "XML-Enc unpad accepts a valid pad with arbitrary non-final pad bytes" {
-    var buf = [_]u8{0x41} ** block_len;
+    var buf = @as([block_len]u8, @splat(0x41));
     buf[block_len - 1] = 0x04; // N=4
     buf[block_len - 2] = 0xAA; // arbitrary, NOT required to equal N
     buf[block_len - 3] = 0x00; // arbitrary
@@ -986,19 +986,19 @@ test "XML-Enc unpad accepts a valid pad with arbitrary non-final pad bytes" {
 }
 
 test "XML-Enc unpad accepts: pad length == block_len with a full pad block, empty-ish message" {
-    const buf = [_]u8{0x10} ** block_len; // valid: N=16, all 16 bytes are pad
+    const buf = @as([block_len]u8, @splat(0x10)); // valid: N=16, all 16 bytes are pad
     const n = try unpadXmlEnc(&buf);
     try testing.expectEqual(@as(usize, 0), n);
 }
 
 test "XML-Enc unpad rejects: zero-length pad byte" {
-    var buf = [_]u8{0x41} ** block_len;
+    var buf = @as([block_len]u8, @splat(0x41));
     buf[block_len - 1] = 0x00;
     try testing.expectError(error.InvalidPadding, unpadXmlEnc(&buf));
 }
 
 test "XML-Enc unpad rejects: pad length > block_len" {
-    var buf = [_]u8{0x41} ** block_len;
+    var buf = @as([block_len]u8, @splat(0x41));
     buf[block_len - 1] = 0xFF;
     try testing.expectError(error.InvalidPadding, unpadXmlEnc(&buf));
 }
@@ -1009,8 +1009,8 @@ test "XML-Enc unpad rejects: empty or non-block-aligned buffer" {
 }
 
 test "XML-Enc unpad round-trip through real CBC encrypt/decrypt" {
-    const key = [_]u8{0x77} ** 32;
-    const iv = [_]u8{0x88} ** block_len;
+    const key = @as([32]u8, @splat(0x77));
+    const iv = @as([block_len]u8, @splat(0x88));
     const msg = "recovered plaintext";
     // xmlenc-style pad: last byte = N, preceding N-1 bytes arbitrary (use
     // PKCS#7's own construction here as one valid instance of the scheme).
@@ -1062,19 +1062,19 @@ const unpad_seeds = [_][]const u8{
     // PKCS#7-valid, one block: 11 octets of message + 5 × 0x05.
     testkit.fuzz.seedHex("6161616161616161616161" ++ "0505050505"),
     // PKCS#7-valid, two blocks, a full block of padding (N = 16).
-    testkit.fuzz.seedHex("00112233445566778899aabbccddeeff" ++ ("10" ** 16)),
+    testkit.fuzz.seedHex("00112233445566778899aabbccddeeff" ++ (strRepeat("10", 16))),
     // PKCS#7-valid with N = 1: the shortest pad the scheme allows.
     testkit.fuzz.seedHex("000102030405060708090a0b0c0d0e" ++ "01"),
     // ⭐ The scheme split: last byte 0x10 but the preceding 15 are not, so
     // PKCS#7 refuses and XML-Enc — which only reads the LENGTH byte — accepts
     // and returns 0. The one seed that tells the two functions apart.
-    testkit.fuzz.seedHex(("a5" ** 15) ++ "10"),
+    testkit.fuzz.seedHex((strRepeat("a5", 15)) ++ "10"),
     // N = 0: refused by both, and the reason `unpadPkcs7` latches a flag
     // instead of returning early.
-    testkit.fuzz.seedHex(("a5" ** 15) ++ "00"),
+    testkit.fuzz.seedHex((strRepeat("a5", 15)) ++ "00"),
     // N = 17 > block_len: refused by both, and the input that would run the
     // `@min` clamp off the end of the buffer if it were not clamped.
-    testkit.fuzz.seedHex(("a5" ** 15) ++ "11"),
+    testkit.fuzz.seedHex((strRepeat("a5", 15)) ++ "11"),
     // 20 octets: not block-aligned, refused before the last byte is read.
     testkit.fuzz.seedHex("00112233445566778899aabbccddeeff" ++ "05050505"),
     // The input this target ran, and only ran, for ever.
@@ -1141,9 +1141,9 @@ test "raw CBC vs jwe's/xmlenc's hand-rolled shape: same output on the same input
     // Sanity oracle: reproduce the loop shape from jwe/src/enc.zig and
     // xmlenc/src/root.zig using ONLY std.crypto (not this module's own
     // encrypt/decrypt) and confirm they agree with the module.
-    const key = [_]u8{0x21} ** 16;
-    const iv = [_]u8{0x22} ** block_len;
-    const pt = [_]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10 } ** 2;
+    const key = @as([16]u8, @splat(0x21));
+    const iv = @as([block_len]u8, @splat(0x22));
+    const pt = arrRepeat(u8, &.{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10 }, 2);
 
     var expected: [pt.len]u8 = undefined;
     {
@@ -1261,11 +1261,11 @@ test "ANSI X9.23: pad layout, round trip, refusals" {
     var out: [32]u8 = undefined;
     const n = try padAnsiX923("YELLOW SUBMARINE!", &out);
     try testing.expectEqual(@as(usize, 32), n);
-    try testing.expectEqualSlices(u8, &(.{0} ** 14 ++ .{15}), out[17..32]);
+    try testing.expectEqualSlices(u8, &(@as([14]u8, @splat(0)) ++ [_]u8{15}), out[17..32]);
     try testing.expectEqual(@as(usize, 17), try unpadAnsiX923(out[0..n]));
     out[20] = 1; // a non-zero filler byte
     try testing.expectError(error.InvalidPadding, unpadAnsiX923(out[0..n]));
-    var full: [16]u8 = .{0} ** 15 ++ .{16};
+    var full: [16]u8 = @as([15]u8, @splat(0)) ++ [_]u8{16};
     try testing.expectEqual(@as(usize, 0), try unpadAnsiX923(&full));
     full[15] = 17;
     try testing.expectError(error.InvalidPadding, unpadAnsiX923(&full));
@@ -1277,13 +1277,13 @@ test "ISO/IEC 7816-4: pad layout, round trip, refusals" {
     var out: [32]u8 = undefined;
     const n = try padIso7816("0123456789abcdef", &out);
     try testing.expectEqual(@as(usize, 32), n);
-    try testing.expectEqualSlices(u8, &(.{0x80} ++ .{0} ** 15), out[16..32]);
+    try testing.expectEqualSlices(u8, &([_]u8{0x80} ++ @as([15]u8, @splat(0))), out[16..32]);
     try testing.expectEqual(@as(usize, 16), try unpadIso7816(out[0..n]));
     var blk: [16]u8 = "abcdefghijklmno\x80".*;
     try testing.expectEqual(@as(usize, 15), try unpadIso7816(&blk));
     blk[15] = 0x81;
     try testing.expectError(error.InvalidPadding, unpadIso7816(&blk));
-    blk = .{0} ** 16;
+    blk = @splat(0);
     try testing.expectError(error.InvalidPadding, unpadIso7816(&blk)); // no marker
     blk[3] = 0x80;
     try testing.expectEqual(@as(usize, 3), try unpadIso7816(&blk));
@@ -1300,7 +1300,7 @@ test "ISO 10126 and zero padding" {
     try testing.expectEqual(@as(usize, 3), try unpadIso10126(out[0..n]));
 
     try testing.expectEqual(@as(usize, 16), try padZero("abc", &out));
-    try testing.expectEqualSlices(u8, &(.{0} ** 13), out[3..16]);
+    try testing.expectEqualSlices(u8, &@as([13]u8, @splat(0)), out[3..16]);
     try testing.expectEqual(@as(usize, 3), try unpadZero(out[0..16]));
     // Aligned: nothing added.
     try testing.expectEqual(@as(usize, 16), try padZero("0123456789abcdef", &out));
@@ -1312,4 +1312,24 @@ test "ISO 10126 and zero padding" {
 test {
     _ = @import("stackprobe_test.zig");
     _ = @import("fuzz_test.zig");
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
+}
+
+/// Comptime array repetition; replaces the `**` operator removed in Zig 0.17.
+fn arrRepeat(comptime T: type, comptime unit: []const T, comptime n: usize) [unit.len * n]T {
+    @setEvalBranchQuota(n * unit.len * 2 + 1000);
+    var buf: [unit.len * n]T = undefined;
+    for (0..n) |i| @memcpy(buf[i * unit.len ..][0..unit.len], unit);
+    return buf;
 }

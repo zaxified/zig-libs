@@ -2423,10 +2423,10 @@ test "error recovery: a huge malformed key yields a capped message" {
     // diagnostic (W2 F10). Mutation 2026-10-04: an uncapped `trimForMessage`
     // survived. 200 `k`s in, at most 30 of them in the message.
     const alloc = std.testing.allocator;
-    const out = try preprocess(alloc, "{" ++ "k" ** 200 ++ " x: 1}");
+    const out = try preprocess(alloc, "{" ++ strRepeat("k", 200) ++ " x: 1}");
     defer alloc.free(out);
-    try std.testing.expect(std.mem.indexOf(u8, out, "k" ** (message_fragment_max + 1)) == null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "k" ** message_fragment_max) != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, strRepeat("k", message_fragment_max + 1)) == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, strRepeat("k", message_fragment_max)) != null);
 }
 
 test "numeric literals: every JSON5 form becomes a plain JSON number" {
@@ -2470,7 +2470,7 @@ test "numeric literals: a hex value of any length becomes its exact decimal inte
 
     // The largest accepted literal — 256 significant digits, 2^1024 - 1 — is
     // checked against an independent bignum rather than a typed-in constant.
-    const digits = "F" ** hex_digits_max;
+    const digits = strRepeat("F", hex_digits_max);
     const out = try preprocess(alloc, "[0x" ++ digits ++ "]");
     defer alloc.free(out);
     try std.testing.expectEqual(@as(u8, '['), out[0]);
@@ -2490,7 +2490,7 @@ test "numeric literals: a hex value of any length becomes its exact decimal inte
 
 test "numeric literals: a hex value beyond 256 significant digits is an error, not a rounding" {
     const alloc = std.testing.allocator;
-    const src = "[0x1" ++ "0" ** hex_digits_max ++ "]"; // 257 digits
+    const src = "[0x1" ++ strRepeat("0", hex_digits_max) ++ "]"; // 257 digits
     var diag: Diagnostic = .{};
     try std.testing.expectError(error.HexLiteralTooLarge, preprocessWithOptions(alloc, src, .{ .diagnostic = &diag }));
     try std.testing.expectEqual(@as(usize, 1), diag.line);
@@ -2939,4 +2939,16 @@ test "numbers: a dropped + never joins two numbers into one" {
     try expectRefusedByBoth("[1+2]");
     try expectRefusedByBoth("1.+3");
     try expectValue("[+1, +.5]", "[1, 0.5]");
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

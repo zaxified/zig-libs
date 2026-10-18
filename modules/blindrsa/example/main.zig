@@ -60,7 +60,7 @@ fn must(ok: bool, src: std.builtin.SourceLocation) void {
 const Sha384 = std.crypto.hash.sha2.Sha384;
 
 pub fn main() !void {
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x5a} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x5a)));
     const random = csprng.random();
 
     // ── issuer setup (once) ─────────────────────────────────────────────

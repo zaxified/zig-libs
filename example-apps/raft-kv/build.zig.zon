@@ -1,7 +1,7 @@
 .{
     .name = .raft_kv,
     .version = "0.0.0",
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .fingerprint = 0x8f93784d7886c873,
     .paths = .{ "build.zig", "build.zig.zon", "src", "init.sh", "smoke.sh", "README.md" },
     .dependencies = .{

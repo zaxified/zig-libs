@@ -306,7 +306,7 @@ fn buildNeedles(n: *Needles) !void {
 }
 
 fn skipUnlessOptimized() !void {
-    if (builtin.mode == .Debug or builtin.mode == .ReleaseSafe) return error.SkipZigTest;
+    if (builtin.mode == .debug or builtin.mode == .safe) return error.SkipZigTest;
 }
 
 test "STACKPROBE tenantkex (wave 9): no key, DH or HKDF residue on the dead stack after any handshake call" {

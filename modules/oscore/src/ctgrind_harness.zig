@@ -76,8 +76,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // A standalone measurement program has no caller to take an allocator from,
     // and nothing here is reachable from `oscore`'s published surface.
     const gpa = std.heap.smp_allocator; // global-alloc-ok: standalone ctgrind harness, not module code and not on the published surface
-    var master: [16]u8 = [_]u8{0x42} ** 16;
-    const salt: [8]u8 = [_]u8{0x9e} ** 8;
+    var master: [16]u8 = @as([16]u8, @splat(0x42));
+    const salt: [8]u8 = @as([8]u8, @splat(0x9e));
 
     if (std.mem.eql(u8, target, "derive")) {
         taint(t, master[0..]);

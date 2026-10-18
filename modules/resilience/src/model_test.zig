@@ -40,10 +40,10 @@ const Rng = fuzz_driver.Rng;
 /// Reach counters for one harness's labels (the same plumbing as aescbc's).
 fn Marker(comptime Label: type) type {
     return struct {
-        var counts: [@typeInfo(Label).@"enum".fields.len]usize = @splat(0);
+        var counts: [@typeInfo(Label).@"enum".field_names.len]usize = @splat(0);
 
         fn mark(l: Label) void {
-            counts[@intFromEnum(l)] += 1;
+            counts[@backingInt(l)] += 1;
             switch (l) {
                 inline else => |c| fuzz_driver.hit(@tagName(c)),
             }
@@ -60,7 +60,7 @@ fn Marker(comptime Label: type) type {
                 };
             }
             for (counts, 0..) |n, i| if (n == 0) {
-                std.debug.print("reach: " ++ name ++ " label {t} never hit in {d} seeds\n", .{ @as(Label, @enumFromInt(i)), seeds });
+                std.debug.print("reach: " ++ name ++ " label {t} never hit in {d} seeds\n", .{ @as(Label, @fromBackingInt(@intCast(i))), seeds });
                 return error.HarnessDoesNotReach;
             };
         }
@@ -551,7 +551,7 @@ fn fuzzRetry(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
         1 => @as(u64, k.word()) * 1000,
         else => 1_000_000_000,
     };
-    const jitter: r.Jitter = @enumFromInt(k.ranged(0, 3));
+    const jitter: r.Jitter = @fromBackingInt(@intCast(k.ranged(0, 3)));
     const jf: f64 = @as(f64, @floatFromInt(k.ranged(0, 100))) / 100;
     const policy: r.Retry = .{
         .base_delay_ms = base,

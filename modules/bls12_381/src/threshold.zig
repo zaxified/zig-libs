@@ -414,7 +414,7 @@ fn evalPolynomialAt(secret: Fr, coefficients: []const Fr, index: u32) Fr {
 /// Every `u32` is far below the group order `r` (~2^255), so
 /// `Fr.fromBytes`'s canonicality rejection can never fire.
 fn frFromIndex(index: u32) Fr {
-    var buf = [_]u8{0} ** Fr.encoded_bytes;
+    var buf = @as([Fr.encoded_bytes]u8, @splat(0));
     std.mem.writeInt(u32, buf[Fr.encoded_bytes - 4 ..][0..4], index, .big);
     return Fr.fromBytes(buf) catch unreachable; // u32 << r: always canonical
 }
@@ -616,7 +616,7 @@ pub fn combineSignatures(partials: []const PartialSignature, t: u32) ThresholdEr
 // ── tests: wire/plumbing ─────────────────────────────────────────────
 
 test "SecretKeyShare/PublicKeyShare/PartialSignature byte codecs round-trip" {
-    const sk_share: SecretKeyShare = .{ .index = 3, .scalar = try Fr.fromBytes([_]u8{0} ** 31 ++ [_]u8{7}) };
+    const sk_share: SecretKeyShare = .{ .index = 3, .scalar = try Fr.fromBytes(@as([31]u8, @splat(0)) ++ [_]u8{7}) };
     var sk_bytes: [SecretKeyShare.encoded_bytes]u8 = undefined;
     sk_share.toBytes(&sk_bytes);
     try std.testing.expectEqual(@as(usize, 36), sk_bytes.len);
@@ -641,7 +641,7 @@ test "SecretKeyShare/PublicKeyShare/PartialSignature byte codecs round-trip" {
 }
 
 test "SecretKeyShare.deinit zeroizes scalar but leaves index untouched (regression: fails if secureZero is removed)" {
-    var sk_share: SecretKeyShare = .{ .index = 3, .scalar = try Fr.fromBytes([_]u8{0} ** 31 ++ [_]u8{7}) };
+    var sk_share: SecretKeyShare = .{ .index = 3, .scalar = try Fr.fromBytes(@as([31]u8, @splat(0)) ++ [_]u8{7}) };
     // `Fr`'s in-memory (Montgomery) size may exceed its 32-byte canonical
     // encoding, so assert over the raw struct bytes, not a fixed-width buffer.
     var any_nonzero = false;
@@ -655,16 +655,16 @@ test "SecretKeyShare.deinit zeroizes scalar but leaves index untouched (regressi
 }
 
 test "SecretKeyShare/PublicKeyShare/PartialSignature fromBytes rejects a zero index" {
-    var sk_bytes = [_]u8{0} ** SecretKeyShare.encoded_bytes;
+    var sk_bytes = @as([SecretKeyShare.encoded_bytes]u8, @splat(0));
     sk_bytes[SecretKeyShare.encoded_bytes - 1] = 1; // scalar = 1, index = 0
     var bad_share: SecretKeyShare = undefined;
     try std.testing.expectError(error.ZeroIndex, SecretKeyShare.fromBytes(&bad_share, &sk_bytes));
 
-    var pk_bytes = [_]u8{0} ** PublicKeyShare.encoded_bytes;
+    var pk_bytes = @as([PublicKeyShare.encoded_bytes]u8, @splat(0));
     pk_bytes[4..PublicKeyShare.encoded_bytes].* = g1.toBytesCompressed(g1.Affine.generator);
     try std.testing.expectError(error.ZeroIndex, PublicKeyShare.fromBytes(pk_bytes));
 
-    var sig_bytes = [_]u8{0} ** PartialSignature.encoded_bytes;
+    var sig_bytes = @as([PartialSignature.encoded_bytes]u8, @splat(0));
     sig_bytes[4..PartialSignature.encoded_bytes].* = g2.toBytesCompressed(g2.Affine.generator);
     try std.testing.expectError(error.ZeroIndex, PartialSignature.fromBytes(sig_bytes));
 }
@@ -691,13 +691,13 @@ test "VerificationVector toBytesAlloc/fromBytesAlloc round-trip" {
 
 test "VerificationVector.fromBytesAlloc rejects a length/count mismatch" {
     const allocator = std.testing.allocator;
-    var bytes = [_]u8{0} ** 4;
+    var bytes = @as([4]u8, @splat(0));
     std.mem.writeInt(u32, bytes[0..4], 3, .big); // claims 3 commitments, has 0
     try std.testing.expectError(error.InvalidEncoding, VerificationVector.fromBytesAlloc(allocator, &bytes));
 
     // Trailing bytes past the declared count are refused too (mutation
     // run 2026-10-05: `!=` weakened to `<` survived).
-    var long = [_]u8{0} ** (4 + g1.compressed_bytes + 1);
+    var long = @as([4 + g1.compressed_bytes + 1]u8, @splat(0));
     std.mem.writeInt(u32, long[0..4], 1, .big);
     long[4..][0..g1.compressed_bytes].* = g1.toBytesCompressed(g1.Affine.generator);
     const exact = try VerificationVector.fromBytesAlloc(allocator, long[0 .. long.len - 1]);
@@ -718,7 +718,7 @@ test "groupPublicKey extracts commitments[0]" {
 test "splitSecretKey rejects invalid (t, n, coefficients) combinations before any crypto work" {
     const allocator = std.testing.allocator;
     var sk: bls_sig.SecretKey = undefined;
-    try bls_sig.keyGen(&sk, &([_]u8{0x9a} ** 32), "");
+    try bls_sig.keyGen(&sk, &(@as([32]u8, @splat(0x9a))), "");
     try std.testing.expectError(error.InvalidParameters, splitSecretKey(allocator, &sk, 0, 5, &.{}));
     try std.testing.expectError(error.InvalidParameters, splitSecretKey(allocator, &sk, 3, 0, &.{}));
     try std.testing.expectError(error.InvalidParameters, splitSecretKey(allocator, &sk, 4, 3, &.{ Fr.one, Fr.one, Fr.one }));
@@ -758,7 +758,7 @@ test "partialSign/verifyPartialSignature round-trip in isolation (a share IS jus
     // like an ordinary bls_sig.SecretKey for these two functions' own
     // contracts, since partialSign IS bls_sig.sign under the hood.
     var sk: bls_sig.SecretKey = undefined;
-    try bls_sig.keyGen(&sk, &([_]u8{0x5c} ** 32), "");
+    try bls_sig.keyGen(&sk, &(@as([32]u8, @splat(0x5c))), "");
     const share: SecretKeyShare = .{ .index = 7, .scalar = sk.scalar };
     const pk_share: PublicKeyShare = .{ .index = 7, .point = bls_sig.skToPk(&sk).point };
 
@@ -776,7 +776,7 @@ test "partialSign/verifyPartialSignature round-trip in isolation (a share IS jus
     // Wrong message, wrong key, and an index mismatch must all reject.
     try std.testing.expect(!verifyPartialSignature(pk_share, "wrong message", partial));
     var other_sk: bls_sig.SecretKey = undefined;
-    try bls_sig.keyGen(&other_sk, &([_]u8{0x5d} ** 32), "");
+    try bls_sig.keyGen(&other_sk, &(@as([32]u8, @splat(0x5d))), "");
     const other_pk_share: PublicKeyShare = .{ .index = 7, .point = bls_sig.skToPk(&other_sk).point };
     try std.testing.expect(!verifyPartialSignature(other_pk_share, msg, partial));
     const mismatched_partial: PartialSignature = .{ .index = 8, .point = partial.point };
@@ -792,11 +792,11 @@ test "partialSign/verifyPartialSignature round-trip in isolation (a share IS jus
 /// dial the same knobs consistently.
 fn testSplit(allocator: std.mem.Allocator, ikm_byte: u8, t: u32, n: u32) !struct { sk: bls_sig.SecretKey, split: SplitResult } {
     var sk: bls_sig.SecretKey = undefined;
-    try bls_sig.keyGen(&sk, &([_]u8{ikm_byte} ** 32), "");
+    try bls_sig.keyGen(&sk, &(@as([32]u8, @splat(ikm_byte))), "");
     var coeffs: [8]Fr = undefined;
     var j: usize = 0;
     while (j < t - 1) : (j += 1) {
-        var seed = [_]u8{0} ** 32;
+        var seed = @as([32]u8, @splat(0));
         seed[31] = @intCast(j + 1);
         seed[30] = ikm_byte;
         coeffs[j] = Fr.reduceWide(&seed);

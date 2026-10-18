@@ -233,7 +233,7 @@ pub fn parseNest(gpa: std.mem.Allocator, nest_bytes: []const u8) ParseError!Para
     while (try it.next()) |a| switch (a.type) {
         uapi.ATTR.PARAM_NAME => try uapi.copyName(&p.name_buf, &p.name_len, a),
         uapi.ATTR.PARAM_GENERIC => p.generic = true,
-        uapi.ATTR.PARAM_TYPE => p.type = @enumFromInt(try a.asU8()),
+        uapi.ATTR.PARAM_TYPE => p.type = @fromBackingInt(@intCast(try a.asU8())),
         else => {},
     };
 
@@ -251,7 +251,7 @@ pub fn parseNest(gpa: std.mem.Allocator, nest_bytes: []const u8) ParseError!Para
             var pv: ParamValue = .{};
             var inner: codec.AttrIterator = .{ .buf = ve.data };
             while (try inner.next()) |x| switch (x.type) {
-                uapi.ATTR.PARAM_VALUE_CMODE => pv.cmode = @enumFromInt(try x.asU8()),
+                uapi.ATTR.PARAM_VALUE_CMODE => pv.cmode = @fromBackingInt(@intCast(try x.asU8())),
                 uapi.ATTR.PARAM_VALUE_DATA => {
                     // Without a declared type there is no way to know how wide
                     // this is; keeping the bytes is the only honest answer.
@@ -334,8 +334,8 @@ pub fn appendSet(
 ) BuildError!void {
     try handle.append(gpa, list, h);
     try appendName(gpa, list, param_name);
-    try codec.appendAttrU8(gpa, list, uapi.ATTR.PARAM_TYPE, @intFromEnum(value.paramType()));
-    try codec.appendAttrU8(gpa, list, uapi.ATTR.PARAM_VALUE_CMODE, @intFromEnum(cmode));
+    try codec.appendAttrU8(gpa, list, uapi.ATTR.PARAM_TYPE, @backingInt(value.paramType()));
+    try codec.appendAttrU8(gpa, list, uapi.ATTR.PARAM_VALUE_CMODE, @backingInt(cmode));
     switch (value) {
         .uint8 => |x| try codec.appendAttrU8(gpa, list, uapi.ATTR.PARAM_VALUE_DATA, x),
         .uint16 => |x| try codec.appendAttrU16(gpa, list, uapi.ATTR.PARAM_VALUE_DATA, x),
@@ -425,7 +425,7 @@ fn buildParamNest(
     for (specs) |s| {
         const v = try codec.nestBegin(gpa, list, uapi.ATTR.PARAM_VALUE);
         if (s.data) |d| try codec.appendAttr(gpa, list, uapi.ATTR.PARAM_VALUE_DATA, d);
-        try codec.appendAttrU8(gpa, list, uapi.ATTR.PARAM_VALUE_CMODE, @intFromEnum(s.cmode));
+        try codec.appendAttrU8(gpa, list, uapi.ATTR.PARAM_VALUE_CMODE, @backingInt(s.cmode));
         try codec.nestEnd(list, v);
     }
     try codec.nestEnd(list, vl);
@@ -440,7 +440,7 @@ test "parse dispatches the value width on PARAM_TYPE, even when it comes last" {
     var list: std.ArrayList(u8) = .empty;
     defer list.deinit(gpa);
     try handle.append(gpa, &list, .pci("0000:65:00.0"));
-    try buildParamNest(gpa, &list, "max_macs", @intFromEnum(uapi.ParamType.u32_), true, &.{
+    try buildParamNest(gpa, &list, "max_macs", @backingInt(uapi.ParamType.u32_), true, &.{
         .{ .cmode = .driverinit, .data = &.{ 0x80, 0x00, 0x00, 0x00 } },
     });
 
@@ -471,7 +471,7 @@ test "parse handles every declared type" {
         if (native_endian != .little and (c.t == .u16_ or c.t == .u32_ or c.t == .u64_)) continue;
         var list: std.ArrayList(u8) = .empty;
         defer list.deinit(gpa);
-        try buildParamNest(gpa, &list, "p", @intFromEnum(c.t), false, &.{
+        try buildParamNest(gpa, &list, "p", @backingInt(c.t), false, &.{
             .{ .cmode = .runtime, .data = c.data },
         });
         var p = try parse(gpa, list.items);
@@ -482,7 +482,7 @@ test "parse handles every declared type" {
     // Strings are their own case: the payload keeps its NUL on the wire.
     var list: std.ArrayList(u8) = .empty;
     defer list.deinit(gpa);
-    try buildParamNest(gpa, &list, "p", @intFromEnum(uapi.ParamType.string), false, &.{
+    try buildParamNest(gpa, &list, "p", @backingInt(uapi.ParamType.string), false, &.{
         .{ .cmode = .permanent, .data = "flash\x00" },
     });
     var p = try parse(gpa, list.items);
@@ -495,7 +495,7 @@ test "a declared width the data does not match is a malformed reply" {
     var list: std.ArrayList(u8) = .empty;
     defer list.deinit(gpa);
     // Declared u32, sent 8 bytes wide.
-    try buildParamNest(gpa, &list, "p", @intFromEnum(uapi.ParamType.u32_), false, &.{
+    try buildParamNest(gpa, &list, "p", @backingInt(uapi.ParamType.u32_), false, &.{
         .{ .cmode = .runtime, .data = &.{ 0, 0, 0, 0, 0, 0, 0, 0 } },
     });
     try testing.expectError(error.BadLength, parse(gpa, list.items));
@@ -510,7 +510,7 @@ test "an unknown PARAM_TYPE keeps the raw bytes instead of dropping the value" {
     });
     var p = try parse(gpa, list.items);
     defer p.deinit(gpa);
-    try testing.expectEqual(@as(u8, 200), @intFromEnum(p.type.?));
+    try testing.expectEqual(@as(u8, 200), @backingInt(p.type.?));
     try testing.expectEqualSlices(u8, &.{ 0xde, 0xad }, p.forCmode(.runtime).?.value.?.asBytes().?);
 }
 
@@ -518,7 +518,7 @@ test "a cmode with no data is 'supported but unset', not absent" {
     const gpa = testing.allocator;
     var list: std.ArrayList(u8) = .empty;
     defer list.deinit(gpa);
-    try buildParamNest(gpa, &list, "enable_roce", @intFromEnum(uapi.ParamType.flag), true, &.{
+    try buildParamNest(gpa, &list, "enable_roce", @backingInt(uapi.ParamType.flag), true, &.{
         .{ .cmode = .runtime, .data = &.{} },
         .{ .cmode = .permanent, .data = null },
     });
@@ -535,7 +535,7 @@ test "reloadWouldChange compares runtime against driverinit" {
     const gpa = testing.allocator;
     var list: std.ArrayList(u8) = .empty;
     defer list.deinit(gpa);
-    try buildParamNest(gpa, &list, "enable_roce", @intFromEnum(uapi.ParamType.u8_), true, &.{
+    try buildParamNest(gpa, &list, "enable_roce", @backingInt(uapi.ParamType.u8_), true, &.{
         .{ .cmode = .runtime, .data = &.{1} },
         .{ .cmode = .driverinit, .data = &.{0} },
     });
@@ -544,7 +544,7 @@ test "reloadWouldChange compares runtime against driverinit" {
     try testing.expect(p.reloadWouldChange());
 
     list.clearRetainingCapacity();
-    try buildParamNest(gpa, &list, "enable_roce", @intFromEnum(uapi.ParamType.u8_), true, &.{
+    try buildParamNest(gpa, &list, "enable_roce", @backingInt(uapi.ParamType.u8_), true, &.{
         .{ .cmode = .runtime, .data = &.{1} },
         .{ .cmode = .driverinit, .data = &.{1} },
     });
@@ -554,7 +554,7 @@ test "reloadWouldChange compares runtime against driverinit" {
 
     // A parameter with only one cmode cannot be changed by a reload.
     list.clearRetainingCapacity();
-    try buildParamNest(gpa, &list, "x", @intFromEnum(uapi.ParamType.u8_), false, &.{
+    try buildParamNest(gpa, &list, "x", @backingInt(uapi.ParamType.u8_), false, &.{
         .{ .cmode = .runtime, .data = &.{1} },
     });
     var r = try parse(gpa, list.items);
@@ -568,7 +568,7 @@ test "a values list longer than max_values is refused, not allocated" {
     defer list.deinit(gpa);
     var specs: [max_values + 1]ValueSpec = undefined;
     for (&specs) |*s| s.* = .{ .cmode = .runtime, .data = &.{1} };
-    try buildParamNest(gpa, &list, "p", @intFromEnum(uapi.ParamType.u8_), false, &specs);
+    try buildParamNest(gpa, &list, "p", @backingInt(uapi.ParamType.u8_), false, &specs);
     try testing.expectError(error.BadLength, parse(gpa, list.items));
 }
 
@@ -638,7 +638,7 @@ test "appendSet round-trips through the decoder for every integer width" {
         defer reply.deinit(gpa);
         const nest = try codec.nestBegin(gpa, &reply, uapi.ATTR.PARAM);
         try codec.appendAttrString(gpa, &reply, uapi.ATTR.PARAM_NAME, "p");
-        try codec.appendAttrU8(gpa, &reply, uapi.ATTR.PARAM_TYPE, @intFromEnum(v.paramType()));
+        try codec.appendAttrU8(gpa, &reply, uapi.ATTR.PARAM_TYPE, @backingInt(v.paramType()));
         const vl = try codec.nestBegin(gpa, &reply, uapi.ATTR.PARAM_VALUES_LIST);
         const one = try codec.nestBegin(gpa, &reply, uapi.ATTR.PARAM_VALUE);
         // Copy the DATA attribute verbatim out of the request.
@@ -647,7 +647,7 @@ test "appendSet round-trips through the decoder for every integer width" {
             if (a.type == uapi.ATTR.PARAM_VALUE_DATA)
                 try codec.appendAttr(gpa, &reply, uapi.ATTR.PARAM_VALUE_DATA, a.data);
         }
-        try codec.appendAttrU8(gpa, &reply, uapi.ATTR.PARAM_VALUE_CMODE, @intFromEnum(uapi.ParamCmode.runtime));
+        try codec.appendAttrU8(gpa, &reply, uapi.ATTR.PARAM_VALUE_CMODE, @backingInt(uapi.ParamCmode.runtime));
         try codec.nestEnd(&reply, one);
         try codec.nestEnd(&reply, vl);
         try codec.nestEnd(&reply, nest);
@@ -669,15 +669,15 @@ test "appendSet rejects a name the kernel would reject" {
         gpa,
         &list,
         h,
-        "n" ** (uapi.name_max + 1),
+        strRepeat("n", uapi.name_max + 1),
         .runtime,
         .{ .flag = true },
     ));
 }
 
 test "Bytes.from bounds the value length" {
-    try testing.expectError(error.InvalidRequest, Bytes.from("v" ** (uapi.value_max + 1)));
-    const b = try Bytes.from("v" ** uapi.value_max);
+    try testing.expectError(error.InvalidRequest, Bytes.from(strRepeat("v", uapi.value_max + 1)));
+    const b = try Bytes.from(strRepeat("v", uapi.value_max));
     try testing.expectEqual(@as(usize, uapi.value_max), b.get().len);
 }
 
@@ -711,7 +711,7 @@ const Corpus = struct {
         // shape `reloadWouldChange` exists for.
         var u32_param: std.ArrayList(u8) = .empty;
         try handle.append(gpa, &u32_param, .pci("0000:65:00.0"));
-        try buildParamNest(gpa, &u32_param, "max_macs", @intFromEnum(uapi.ParamType.u32_), true, &.{
+        try buildParamNest(gpa, &u32_param, "max_macs", @backingInt(uapi.ParamType.u32_), true, &.{
             .{ .cmode = .runtime, .data = &[_]u8{ 128, 0, 0, 0 } },
             .{ .cmode = .driverinit, .data = &[_]u8{ 64, 0, 0, 0 } },
         });
@@ -720,7 +720,7 @@ const Corpus = struct {
         // A flag parameter: PARAM_VALUE_DATA is present but empty.
         var flag_param: std.ArrayList(u8) = .empty;
         try handle.append(gpa, &flag_param, .pci("0000:65:00.0"));
-        try buildParamNest(gpa, &flag_param, "enable_roce", @intFromEnum(uapi.ParamType.flag), true, &.{
+        try buildParamNest(gpa, &flag_param, "enable_roce", @backingInt(uapi.ParamType.flag), true, &.{
             .{ .cmode = .driverinit, .data = &.{} },
         });
         self.push(flag_param.items);
@@ -728,7 +728,7 @@ const Corpus = struct {
         // A string parameter.
         var str_param: std.ArrayList(u8) = .empty;
         try handle.append(gpa, &str_param, .pci("0000:65:00.0"));
-        try buildParamNest(gpa, &str_param, "fw_load_policy", @intFromEnum(uapi.ParamType.string), false, &.{
+        try buildParamNest(gpa, &str_param, "fw_load_policy", @backingInt(uapi.ParamType.string), false, &.{
             .{ .cmode = .permanent, .data = "flash" },
         });
         self.push(str_param.items);
@@ -744,7 +744,7 @@ const Corpus = struct {
         // A u32 parameter whose value is two octets wide.
         var narrow: std.ArrayList(u8) = .empty;
         try handle.append(gpa, &narrow, .pci("0000:65:00.0"));
-        try buildParamNest(gpa, &narrow, "max_macs", @intFromEnum(uapi.ParamType.u32_), false, &.{
+        try buildParamNest(gpa, &narrow, "max_macs", @backingInt(uapi.ParamType.u32_), false, &.{
             .{ .cmode = .runtime, .data = &[_]u8{ 128, 0 } },
         });
         self.push(narrow.items);
@@ -878,11 +878,11 @@ test "buildSetParam frames a whole PARAM_SET, headers and all" {
             seen_name = true;
         },
         uapi.ATTR.PARAM_TYPE => {
-            try testing.expectEqual(@intFromEnum(uapi.ParamType.u32_), try a.asU8());
+            try testing.expectEqual(@backingInt(uapi.ParamType.u32_), try a.asU8());
             seen_type = true;
         },
         uapi.ATTR.PARAM_VALUE_CMODE => {
-            try testing.expectEqual(@intFromEnum(uapi.ParamCmode.driverinit), try a.asU8());
+            try testing.expectEqual(@backingInt(uapi.ParamCmode.driverinit), try a.asU8());
             seen_cmode = true;
         },
         uapi.ATTR.PARAM_VALUE_DATA => {
@@ -972,12 +972,12 @@ test "an oversized PARAM_VALUE_DATA is refused, on the binary branch and on the 
     // sends 200 bytes still passes when the bound is widened to
     // `value_max + 8`, so it pins the existence of a check and not its VALUE
     // -- `feedback_mutate_the_constant`.
-    const big = [_]u8{0xAB} ** (uapi.value_max + 1);
+    const big = @as([uapi.value_max + 1]u8, @splat(0xAB));
 
-    inline for ([_]uapi.ParamType{ .binary, @enumFromInt(200) }) |t| {
+    inline for ([_]uapi.ParamType{ .binary, @fromBackingInt(@intCast(200)) }) |t| {
         var msg: std.ArrayList(u8) = .empty;
         defer msg.deinit(gpa);
-        try codec.appendAttrU8(gpa, &msg, uapi.ATTR.PARAM_TYPE, @intFromEnum(t));
+        try codec.appendAttrU8(gpa, &msg, uapi.ATTR.PARAM_TYPE, @backingInt(t));
         try codec.appendAttr(gpa, &msg, uapi.ATTR.PARAM_VALUE_DATA, &big);
         const attrs = msg.items;
 
@@ -985,7 +985,7 @@ test "an oversized PARAM_VALUE_DATA is refused, on the binary branch and on the 
         var ty: ?uapi.ParamType = null;
         var got: ?codec.Error!Value = null;
         while (try it.next()) |a| {
-            if (a.type == uapi.ATTR.PARAM_TYPE) ty = @enumFromInt(try a.asU8());
+            if (a.type == uapi.ATTR.PARAM_TYPE) ty = @fromBackingInt(@intCast(try a.asU8()));
             if (a.type == uapi.ATTR.PARAM_VALUE_DATA) got = decodeData(ty.?, a);
         }
         try testing.expectError(error.BadLength, got.?);
@@ -995,10 +995,22 @@ test "an oversized PARAM_VALUE_DATA is refused, on the binary branch and on the 
     // pinned from both sides.
     var ok_msg: std.ArrayList(u8) = .empty;
     defer ok_msg.deinit(gpa);
-    const small = [_]u8{0xCD} ** uapi.value_max;
+    const small = @as([uapi.value_max]u8, @splat(0xCD));
     try codec.appendAttr(gpa, &ok_msg, uapi.ATTR.PARAM_VALUE_DATA, &small);
     var ok_it: codec.AttrIterator = .{ .buf = ok_msg.items };
     const a = (try ok_it.next()).?;
     const v = try decodeData(.binary, a);
     try testing.expectEqual(@as(u8, uapi.value_max), v.binary.len);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

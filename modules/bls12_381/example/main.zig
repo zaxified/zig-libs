@@ -97,7 +97,7 @@ pub fn main(init: std.process.Init) !void {
 
     // An Ethereum validator signing key from a mnemonic-derived seed, by
     // its EIP-2334 path.
-    const seed = [_]u8{0x5e} ** 32;
+    const seed = @as([32]u8, @splat(0x5e));
     const path = try bls12_381.eip2333.parsePath("m/12381/3600/0/0/0");
     var vsk: bls_sig.SecretKey = undefined;
     try bls12_381.eip2333.derivePath(&vsk, &seed, path.slice());

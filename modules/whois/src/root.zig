@@ -938,7 +938,7 @@ test "formatQuery round-trips per RFC 3912" {
 
 test "formatQuery enforces length and rejects CRLF injection" {
     var buf: [600]u8 = undefined;
-    const long = "x" ** (max_query_len + 1);
+    const long = strRepeat("x", max_query_len + 1);
     try testing.expectError(error.QueryTooLong, formatQuery(&buf, long));
     var tiny: [8]u8 = undefined;
     try testing.expectError(error.QueryTooLong, formatQuery(&tiny, "toolongforbuf"));
@@ -952,7 +952,7 @@ test "documented query conveniences" {
         "domain example.com\r\n",
         try verisignDomainQuery(&buf, "example.com"),
     );
-    try testing.expectError(error.QueryTooLong, arinIpQuery(&buf, "x" ** max_query_len));
+    try testing.expectError(error.QueryTooLong, arinIpQuery(&buf, strRepeat("x", max_query_len)));
 }
 
 test "fieldValue: case-insensitive key, trimmed value, skips empty" {
@@ -988,7 +988,7 @@ test "parseServerRef: whois:// URL form, ports, rejects other schemes/garbage" {
     try testing.expect(parseServerRef("host:notaport") == null);
     try testing.expect(parseServerRef("no spaces allowed") == null);
     try testing.expect(parseServerRef("") == null);
-    try testing.expect(parseServerRef("x" ** (max_host_len + 1)) == null);
+    try testing.expect(parseServerRef(strRepeat("x", max_host_len + 1)) == null);
 }
 
 test "parseServerRef: IPv6 referrals — bracketed with/without a port, and bare without one (audit F10)" {
@@ -1209,7 +1209,7 @@ test "anyResolvedIsSpecialUse: catches address-level SSRF encodings a string che
     // caller plugs in (SPEC invites callers to supply their own).
     const loopback: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 43 } };
     const link_local: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 169, 254, 169, 254 }, .port = 43 } };
-    const loopback6: std.Io.net.IpAddress = .{ .ip6 = .{ .bytes = ([_]u8{0} ** 15) ++ [_]u8{1}, .port = 43 } };
+    const loopback6: std.Io.net.IpAddress = .{ .ip6 = .{ .bytes = (@as([15]u8, @splat(0))) ++ [_]u8{1}, .port = 43 } };
     const public: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 93, 184, 216, 34 }, .port = 43 } };
 
     try testing.expect(anyResolvedIsSpecialUse(&.{loopback}));
@@ -1381,10 +1381,10 @@ test "nextServer: a reply with no referral scans about the same lines/byte as on
     // defect is a PASS COUNT, not a duration, so it's counted directly via
     // `lines_scanned` (line 168-ish, test-only, `builtin.is_test`-gated) --
     // deterministic and load-independent by construction: no clock is read.
-    const no_referral = ("% filler\n" ** 1600); // no referral anywhere
-    const realistic = ("% filler\n" ** 500) ++
+    const no_referral = (strRepeat("% filler\n", 1600)); // no referral anywhere
+    const realistic = (strRepeat("% filler\n", 500)) ++
         "Registrar WHOIS Server: whois.markmonitor.com\r\n" ++ // hits the 3rd key
-        ("% filler\n" ** 1100);
+        (strRepeat("% filler\n", 1100));
     const lines_no_referral: f64 = @floatFromInt(std.mem.count(u8, no_referral, "\n") + 1);
     const lines_realistic: f64 = @floatFromInt(std.mem.count(u8, realistic, "\n") + 1);
 
@@ -1437,7 +1437,7 @@ test "lookup: empty and garbage responses are clean terminals" {
 
 test "lookup: byte cap — oversized response surfaces ResponseTooLarge" {
     var scripted: ScriptedTransport = .{ .entries = &.{
-        .{ .server = "big.example", .response = "x" ** 128 },
+        .{ .server = "big.example", .response = strRepeat("x", 128) },
     } };
     var small: [64]u8 = undefined;
     try testing.expectError(
@@ -1479,11 +1479,11 @@ test "lookup: invalid root and oversized query rejected up front" {
     );
     try testing.expectError(
         error.InvalidRoot,
-        lookup(scripted.transport(), "q", .{ .root = "x" ** (max_host_len + 1) }, &buf),
+        lookup(scripted.transport(), "q", .{ .root = strRepeat("x", max_host_len + 1) }, &buf),
     );
     try testing.expectError(
         error.QueryTooLong,
-        lookup(scripted.transport(), "x" ** (max_query_len + 1), .{}, &buf),
+        lookup(scripted.transport(), strRepeat("x", max_query_len + 1), .{}, &buf),
     );
     try testing.expectEqual(@as(usize, 0), scripted.call_count); // never hit the wire
 }
@@ -1541,8 +1541,8 @@ const referral_seeds = [_][]const u8{
     seed("host:notaport"), // a port that is not a number
     seed("host:99999"), // a port past u16
     seed("no spaces allowed"), // a space is not a legal host octet
-    seed("x" ** 255), // exactly `max_host_len`: accepted
-    seed("x" ** 256), // ⭐ one past it: the refusal a 128-octet buffer could never reach
+    seed(strRepeat("x", 255)), // exactly `max_host_len`: accepted
+    seed(strRepeat("x", 256)), // ⭐ one past it: the refusal a 128-octet buffer could never reach
     seed("refer:        whois.verisign-grs.com\n"), // a whole IANA line: `nextServer` key 1
     seed("ReferralServer: whois://whois.ripe.net\n"), // ARIN's key
     seed("  registrar whois server:  whois.markmonitor.com \r\n"), // Verisign's, case-folded and padded
@@ -1854,4 +1854,16 @@ test "TcpTransport: timeout_ms = null (default) preserves today's unbounded beha
 test {
     _ = @import("goldens.zig");
     _ = @import("fuzz_test.zig");
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

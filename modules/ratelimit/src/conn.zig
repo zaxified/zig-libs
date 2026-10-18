@@ -540,7 +540,7 @@ fn peer6(b: [16]u8, port: u16) std.Io.net.IpAddress {
 /// v4 peer — spelled out here rather than parsed, because this is the exact
 /// byte pattern the hook has to cope with.
 fn mapped(q: [4]u8) [16]u8 {
-    return [_]u8{0} ** 10 ++ [_]u8{ 0xff, 0xff } ++ q;
+    return @as([10]u8, @splat(0)) ++ [_]u8{ 0xff, 0xff } ++ q;
 }
 
 test "ConnectionLimiter: the hook itself resolves a v4-mapped peer to the user" {

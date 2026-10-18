@@ -1075,7 +1075,7 @@ test "Z1: verify() scrubs the canonicalized plaintext before its arena goes back
     // 0xaa and a scanner sees nothing whatever this module does. ReleaseFast is
     // the mode where our own `secureZero` is load-bearing — and the mode an
     // integrator ships (CONVENTIONS §2.1). A visible skip beats a silent pass.
-    if (@import("builtin").mode != .ReleaseFast) return error.SkipZigTest;
+    if (@import("builtin").mode != .fast) return error.SkipZigTest;
 
     const a = testing.allocator;
     var sd = try buildSignedRsaDoc(a, false, false);
@@ -1208,7 +1208,7 @@ test "verify: wrong key fails" {
     defer doc.deinit();
     const sig = childByName(doc.root, "Signature").?;
     // A different modulus (same exponent) — valid RSA key, wrong signer.
-    const wrong = try rsa.PublicKey.fromBytes(&([_]u8{0xC5} ** 256), &[_]u8{ 0x01, 0x00, 0x01 });
+    const wrong = try rsa.PublicKey.fromBytes(&(@as([256]u8, @splat(0xC5))), &[_]u8{ 0x01, 0x00, 0x01 });
     var res = try verify(testing.allocator, &doc, sig, .{ .key = .{ .rsa = wrong } });
     defer res.deinit(testing.allocator);
     try testing.expect(!res.valid);
@@ -1216,7 +1216,7 @@ test "verify: wrong key fails" {
 
 test "verify: ECDSA-P256-SHA256 enveloped signature round-trips" {
     const a = testing.allocator;
-    const sk = [_]u8{0x11} ** 32;
+    const sk = @as([32]u8, @splat(0x11));
     const pub_sec1 = (try p256.P256.combMulBase(sk, .big)).toUncompressedSec1();
 
     const doc_template =
@@ -1259,7 +1259,7 @@ test "verify: ECDSA-P256-SHA256 enveloped signature round-trips" {
     const si_canon = try c14n.canonicalize(a, si2, .{ .mode = .exclusive });
     defer a.free(si_canon);
 
-    const nonce = [_]u8{0x42} ** 32;
+    const nonce = @as([32]u8, @splat(0x42));
     const rs = try p256.sign.ecdsaSign(&sk, si_canon, &nonce);
     var sb64: [128]u8 = undefined;
     const sig_b64 = std.base64.standard.Encoder.encode(&sb64, &rs);
@@ -1282,7 +1282,7 @@ test "verify: ECDSA-P256-SHA256 enveloped signature round-trips" {
     // reference digest intact, so only the ECDSA verify can flip the verdict.
 
     // (a) Right document, a different (valid) P-256 key.
-    const other_pub = (try p256.P256.combMulBase([_]u8{0x22} ** 32, .big)).toUncompressedSec1();
+    const other_pub = (try p256.P256.combMulBase(@as([32]u8, @splat(0x22)), .big)).toUncompressedSec1();
     var wrong_key_res = try verify(a, &doc, sig, .{ .key = .{ .ecdsa_p256_sec1 = &other_pub } });
     defer wrong_key_res.deinit(a);
     try testing.expect(!wrong_key_res.valid);
@@ -2019,7 +2019,7 @@ const verify_scripts = [_][]const u8{
     kit.seed("\x00\x01\x00\x01\x01\x01\x01\x01\x01"), // the second algorithm of each list, both transforms present
     kit.seed("\x01\x00\x08\x3c\x3f\x78\x6d\x6c\x20\x3e\x00\x02\x02\x02\x01"), // an unstructured prefix that looks like an XML declaration
     kit.seed("\x00\x00\x00\x02\x01\x00\x03\x03\x03\x01\x02\x01\x02\x01\x01"), // the third algorithm of each list, a second reference, a KeyInfo cert
-    kit.seed("\xff\xff\x40" ++ "\x3c\x2f\x3e\x20" ** 4), // every flag on, 64 unstructured octets of angle brackets
+    kit.seed("\xff\xff\x40" ++ strRepeat("\x3c\x2f\x3e\x20", 4)), // every flag on, 64 unstructured octets of angle brackets
     kit.seed("\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x1f"), // mode 2 with the largest mutation the generator can write
     kit.seed("\x01\x01\x10\xab\xcd\xef\x01\x02\x02\x00\x01\x02\x00\x01\x02\x00\x10\x10"), // a mid-document mutation
 };
@@ -2286,9 +2286,9 @@ test "the xmldsig fuzz harness reaches verify's digest and signature checks (rea
     //    structural error) means C14N, the reference digest and
     //    `verifySignature` all executed.
     {
-        const digest_b64 = try b64Encode(a, &[_]u8{0xAB} ** 32);
+        const digest_b64 = try b64Encode(a, &@as([32]u8, @splat(0xAB)));
         defer a.free(digest_b64);
-        const sig_b64 = try b64Encode(a, &[_]u8{0xCD} ** 256);
+        const sig_b64 = try b64Encode(a, &@as([256]u8, @splat(0xCD)));
         defer a.free(sig_b64);
         const src = try buildFuzzSignature(a, .{
             .c14n_alg = alg_exc_c14n,
@@ -2316,7 +2316,7 @@ test "the xmldsig fuzz harness reaches verify's digest and signature checks (rea
     }
 
     // 3. And the harness body itself runs to completion on fixed input.
-    var smith: std.testing.Smith = .{ .in = &([_]u8{0x01} ** 64 ++ [_]u8{0x00} ** 2048) };
+    var smith: std.testing.Smith = .{ .in = &(@as([64]u8, @splat(0x01)) ++ @as([2048]u8, @splat(0x00))) };
     try fuzzVerifySignature(std.testing.Smith, &smith, a);
 }
 
@@ -2451,6 +2451,18 @@ test "verify: an RSA signature method with an EC key is KeyAlgorithmMismatch, no
     defer sd.deinit(a);
     var doc = try xml.parse(a, sd.xml, .{});
     defer doc.deinit();
-    const ec = (try p256.P256.combMulBase([_]u8{0x11} ** 32, .big)).toUncompressedSec1();
+    const ec = (try p256.P256.combMulBase(@as([32]u8, @splat(0x11)), .big)).toUncompressedSec1();
     try testing.expectError(error.KeyAlgorithmMismatch, verify(a, &doc, childByName(doc.root, "Signature").?, .{ .key = .{ .ecdsa_p256_sec1 = &ec } }));
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

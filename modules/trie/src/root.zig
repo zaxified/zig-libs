@@ -985,8 +985,8 @@ const fuzzSeed = testkit.fuzz.seed;
 /// `node_region_len`) reachable rather than masked by `HeaderCorrupt`.
 const random_seeds = [_][]const u8{
     fuzzSeed("ZTR1"), // the magic alone: Truncated
-    fuzzSeed("ZTR0" ++ "\x01\x00" ++ "\x02\x01" ++ "\x00" ** 28), // wrong magic
-    fuzzSeed("ZTR1" ++ "\x01\x00" ++ "\x02\x01" ++ "\x00" ** 28), // right magic, wrong header CRC
+    fuzzSeed("ZTR0" ++ "\x01\x00" ++ "\x02\x01" ++ strRepeat("\x00", 28)), // wrong magic
+    fuzzSeed("ZTR1" ++ "\x01\x00" ++ "\x02\x01" ++ strRepeat("\x00", 28)), // right magic, wrong header CRC
     fuzzSeed("ZTR1\xff\xff\x02\x01\x00\x00\x00\x00\x08\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00$\x00\x00\x00\x00\x00\x00\x00\xff\xbcc^\x00\x00\x00\x00\x00\x00\x00\x00"), // an unsupported version, correctly sealed
     fuzzSeed("ZTR1\x01\x00\x01\x02\x00\x00\x00\x00\x08\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00$\x00\x00\x00\x00\x00\x00\x00\xcf,\xf4\xc5\x00\x00\x00\x00\x00\x00\x00\x00"), // the endian marker byte-swapped, correctly sealed
     fuzzSeed("ZTR1\x01\x00\x02\x01\x00\x00\x00\x00\xff\xff\xff\xff\x00\x00\x00\x00\x00\x00\x00\x00$\x00\x00\x00\x00\x00\x00\x00\xa4\xc5\xbfo"), // node_region_len 4 GiB, correctly sealed: Truncated
@@ -994,8 +994,8 @@ const random_seeds = [_][]const u8{
     fuzzSeed("ZTR1\x01\x00\x02\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00$\x00\x00\x00\x00\x00\x00\x00\xd6\xa1\x95\x9f"), // node_region_len 0: MalformedRoot
     fuzzSeed("ZTR1\x01\x00\x02\x01\x00\x00\x00\x00\x10\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00$\x00\x00\x00\x00\x00\x00\x00\xf3\x0aS\x7f\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"), // ⭐ a sealed header over an all-zero node region: LOADS, and every query is then bounds-checked
     fuzzSeed("ZTR1\x01\x00\x02\x01\x00\x00\x00\x00\x10\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00$\x00\x00\x00\x00\x00\x00\x00\xf3\x0aS\x7f\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff"), // ⭐ the same, all-ones node region: an edge_count of 65535 the walk must refuse
-    fuzzSeed("\x00" ** 36), // an all-zero header
-    fuzzSeed("\xff" ** 64), // all ones
+    fuzzSeed(strRepeat("\x00", 36)), // an all-zero header
+    fuzzSeed(strRepeat("\xff", 64)), // all ones
     fuzzSeed(""), // the empty buffer: what the collapsed harness ran, every time
 };
 
@@ -1348,4 +1348,16 @@ test "format 2: each load and decode check refuses its own damage" {
 
     // Positive control: the untouched buffer answers.
     try testing.expectEqual(@as(?u32, 1), try (try Frozen.loadVerified(base)).lookup("ab"));
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

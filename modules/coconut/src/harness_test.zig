@@ -273,7 +273,7 @@ test "THRESHOLD (gated): fewer than t partials fails aggregation" {
 }
 
 fn frOf(v: u64) Fr {
-    var buf: [32]u8 = [_]u8{0} ** 32;
+    var buf: [32]u8 = @as([32]u8, @splat(0));
     std.mem.writeInt(u64, buf[24..32], v, .big);
     return Fr.fromBytes(buf) catch unreachable;
 }

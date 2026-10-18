@@ -1828,7 +1828,7 @@ fn driveOpsWith(gpa: std.mem.Allocator, cur: *testkit.fuzz.Cursor) !usize {
     var executed: usize = 0;
     var i: usize = 0;
     while (i < n_ops) : (i += 1) {
-        const op: FuzzOp = @enumFromInt(cur.ranged(0, @typeInfo(FuzzOp).@"enum".fields.len - 1));
+        const op: FuzzOp = @fromBackingInt(@intCast(cur.ranged(0, @typeInfo(FuzzOp).@"enum".field_names.len - 1)));
         const isid = isid_pool[cur.ranged(0, isid_pool.len - 1)];
         const pe = pe_pool[cur.ranged(0, pe_pool.len - 1)];
         const mac = mac_pool[cur.ranged(0, mac_pool.len - 1)];

@@ -1678,7 +1678,7 @@ test "KvStore: sessions live under their prefix next to other data; ids no manag
     // A cookie naming a non-session key under no prefix, or an oversized id.
     var l: Session = .{};
     try testing.expectEqual(Manager.LoadResult.absent, m.lookup("user:1", &l));
-    const long_id = "a" ** (2 * max_id_bytes + 1);
+    const long_id = strRepeat("a", 2 * max_id_bytes + 1);
     try testing.expect(m.store.put(long_id, "0123456789abcdef", 0) == null);
     const got = try m.store.get(testing.allocator, long_id);
     try testing.expect(got == null);
@@ -1686,7 +1686,7 @@ test "KvStore: sessions live under their prefix next to other data; ids no manag
     try env.db.put("session:short", "xy");
     try testing.expect((try m.store.get(testing.allocator, "short")) == null);
 
-    try testing.expectError(error.PrefixTooLong, KvStore.init(&env.db, .{ .prefix = "p" ** (KvStore.max_prefix_len + 1) }));
+    try testing.expectError(error.PrefixTooLong, KvStore.init(&env.db, .{ .prefix = strRepeat("p", KvStore.max_prefix_len + 1) }));
 }
 
 test "Manager.init refuses the monotonic clock over a persistent store" {
@@ -1748,7 +1748,7 @@ noinline fn setFromDeadFrame(m: *const Manager, res: *http.Server.ResponseWriter
     // A fixed, known id instead of `m.create`'s CSPRNG draw — the wire
     // assertion below needs an exact expected value, not just "looks like
     // hex". 64 bytes, all landing inside this frame's `s.id_buf`.
-    const known_id = "deadbeef" ** 8;
+    const known_id = strRepeat("deadbeef", 8);
     @memcpy(s.id_buf[0..known_id.len], known_id);
     s.id_len = known_id.len;
     s.created_ns = 1;
@@ -1800,7 +1800,7 @@ test "Manager.save: the session id in the Set-Cookie survives writeCookie's dead
     // The id, read back off the wire after every byte of its source frame
     // was overwritten, plus the hardening attributes `writeCookie` always
     // sets on a live session cookie.
-    try testing.expect(std.mem.indexOf(u8, wire, "Set-Cookie: session=" ++ ("deadbeef" ** 8) ++ "; Path=/; Max-Age=10; Secure; HttpOnly; SameSite=Lax\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, wire, "Set-Cookie: session=" ++ (strRepeat("deadbeef", 8)) ++ "; Path=/; Max-Age=10; Secure; HttpOnly; SameSite=Lax\r\n") != null);
     // …and not one byte of the clobber pattern anywhere on it.
     try testing.expect(std.mem.indexOf(u8, wire, "#") == null);
 }
@@ -1824,7 +1824,7 @@ test "__Host- prefixed cookie name: the OWASP hardening measure the config surfa
     });
 
     var s: Session = .{};
-    const known_id = "cafebabe" ** 8;
+    const known_id = strRepeat("cafebabe", 8);
     @memcpy(s.id_buf[0..known_id.len], known_id);
     s.id_len = known_id.len;
     s.created_ns = 1;
@@ -1841,7 +1841,7 @@ test "__Host- prefixed cookie name: the OWASP hardening measure the config surfa
     const wire = out.buffered();
 
     const sc = headerValue(wire, "Set-Cookie").?;
-    try testing.expect(std.mem.startsWith(u8, sc, "__Host-session=" ++ ("cafebabe" ** 8)));
+    try testing.expect(std.mem.startsWith(u8, sc, "__Host-session=" ++ (strRepeat("cafebabe", 8))));
     try testing.expect(std.mem.indexOf(u8, sc, "Secure") != null);
     try testing.expect(std.mem.indexOf(u8, sc, "Path=/") != null);
     // The `__Host-` contract is void the moment a Domain attribute appears.
@@ -2408,7 +2408,7 @@ const cookie_header_seeds = [_][]const u8{
     fuzzSeed("Session=abc123"), // RFC 6265 §5.4 is case-SENSITIVE → must not match
     fuzzSeed("a=1; b=2"), // the name is simply absent
     fuzzSeed(";;;  ;  "), // separators and OWS only
-    fuzzSeed(default_cookie_name ++ "=" ++ "a" ** 100), // a 108-octet header, inside the 128 buffer
+    fuzzSeed(default_cookie_name ++ "=" ++ strRepeat("a", 100)), // a 108-octet header, inside the 128 buffer
     fuzzSeed(""), // zero length: the ONLY input this target ever ran
 };
 
@@ -2670,10 +2670,10 @@ test "KvStore: once closed by a failed write, a readable record is still not ser
 const fuzz_driver = @import("testkit").fuzz.driver;
 
 const FuzzLabel = enum { absent, loaded, expired, cookie_found, cookie_missing, values_ok, values_malformed };
-var fuzz_reach: [@typeInfo(FuzzLabel).@"enum".fields.len]usize = @splat(0);
+var fuzz_reach: [@typeInfo(FuzzLabel).@"enum".field_names.len]usize = @splat(0);
 
 fn fuzz_mark(comptime l: FuzzLabel) void {
-    fuzz_reach[@intFromEnum(l)] += 1;
+    fuzz_reach[@backingInt(l)] += 1;
     fuzz_driver.hit(@tagName(l));
 }
 
@@ -2902,7 +2902,7 @@ test "fuzz harness: 400 seeds in every test run, and they get everywhere" {
         }
     }
     for (fuzz_reach, 0..) |n, i| if (n == 0) {
-        std.debug.print("reach: label {t} never hit in 400 seeds\n", .{@as(FuzzLabel, @enumFromInt(i))});
+        std.debug.print("reach: label {t} never hit in 400 seeds\n", .{@as(FuzzLabel, @fromBackingInt(@intCast(i)))});
         return error.HarnessDoesNotReach;
     };
 }
@@ -2976,7 +2976,7 @@ const SessionModel = struct {
 
 const ModelReach = enum { loaded, absent, expired_idle, expired_absolute, persist_won, persist_stale, regenerated, deleted, restarted };
 
-fn sessionModelRun(comptime kv_backed: bool, case_seed: u64, reach: *[@typeInfo(ModelReach).@"enum".fields.len]usize) !void {
+fn sessionModelRun(comptime kv_backed: bool, case_seed: u64, reach: *[@typeInfo(ModelReach).@"enum".field_names.len]usize) !void {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -3004,7 +3004,7 @@ fn sessionModelRun(comptime kv_backed: bool, case_seed: u64, reach: *[@typeInfo(
     var md: SessionModel = .{ .arena = arena, .tombstones = !kv_backed, .idle = idle, .absolute = absolute };
     const handles = try testing.allocator.alloc(Session, 6);
     defer testing.allocator.free(handles);
-    var live = [_]bool{false} ** 6;
+    var live = @as([6]bool, @splat(false));
     var data_buf: [max_session_bytes]u8 = undefined;
 
     const steps = 60 + rnd.uintLessThan(usize, 120);
@@ -3041,11 +3041,11 @@ fn sessionModelRun(comptime kv_backed: bool, case_seed: u64, reach: *[@typeInfo(
                 switch (want) {
                     .absent => {
                         try testing.expectEqual(Manager.LoadResult.absent, r);
-                        reach[@intFromEnum(ModelReach.absent)] += 1;
+                        reach[@backingInt(ModelReach.absent)] += 1;
                     },
                     .expired_absolute, .expired_idle => {
                         try testing.expectEqual(Manager.LoadResult.expired, r);
-                        reach[@intFromEnum(if (want == .expired_idle) ModelReach.expired_idle else ModelReach.expired_absolute)] += 1;
+                        reach[@backingInt(if (want == .expired_idle) ModelReach.expired_idle else ModelReach.expired_absolute)] += 1;
                     },
                     .loaded => |l| {
                         try testing.expectEqual(Manager.LoadResult.loaded, r);
@@ -3054,7 +3054,7 @@ fn sessionModelRun(comptime kv_backed: bool, case_seed: u64, reach: *[@typeInfo(
                         try testing.expectEqual(l.gen, got.generation);
                         try testing.expectEqual(clock_ptr.now_ns, got.last_seen_ns);
                         handles[h] = got;
-                        reach[@intFromEnum(ModelReach.loaded)] += 1;
+                        reach[@backingInt(ModelReach.loaded)] += 1;
                     },
                 }
             },
@@ -3069,7 +3069,7 @@ fn sessionModelRun(comptime kv_backed: bool, case_seed: u64, reach: *[@typeInfo(
                 const ok = m.persist(&handles[h]);
                 try testing.expectEqual(want != null, ok);
                 if (want) |g| try testing.expectEqual(g, handles[h].generation);
-                reach[@intFromEnum(if (ok) ModelReach.persist_won else ModelReach.persist_stale)] += 1;
+                reach[@backingInt(if (ok) ModelReach.persist_won else ModelReach.persist_stale)] += 1;
             },
             // A second request holds the same session.
             7 => if (live[h]) {
@@ -3082,30 +3082,30 @@ fn sessionModelRun(comptime kv_backed: bool, case_seed: u64, reach: *[@typeInfo(
                 try md.delete(handles[h].id());
                 m.regenerate(&handles[h]);
                 try testing.expectEqual(@as(Generation, 0), handles[h].generation);
-                reach[@intFromEnum(ModelReach.regenerated)] += 1;
+                reach[@backingInt(ModelReach.regenerated)] += 1;
             },
             // Logout / admin delete of the handle's id; or a restart (kv).
             else => if (kv_backed and rnd.uintLessThan(u8, 3) == 0) {
                 try env.restart();
-                reach[@intFromEnum(ModelReach.restarted)] += 1;
+                reach[@backingInt(ModelReach.restarted)] += 1;
             } else if (live[h]) {
                 try md.delete(handles[h].id());
                 m.store.delete(handles[h].id());
-                reach[@intFromEnum(ModelReach.deleted)] += 1;
+                reach[@backingInt(ModelReach.deleted)] += 1;
             },
         }
     }
 }
 
 test "model: Manager over RamcacheStore and KvStore agrees with a naive session model on random operation sequences" {
-    var reach = [_]usize{0} ** @typeInfo(ModelReach).@"enum".fields.len;
-    const seeds = if (@import("builtin").mode == .Debug) 60 else 200;
+    var reach = @as([@typeInfo(ModelReach)]usize, @splat(0)).@"enum".field_names.len;
+    const seeds = if (@import("builtin").mode == .debug) 60 else 200;
     for (0..seeds) |case_seed| {
         try sessionModelRun(false, case_seed, &reach);
         try sessionModelRun(true, case_seed, &reach);
     }
     for (reach, 0..) |n, i| if (n == 0) {
-        std.debug.print("model reach: {t} never hit\n", .{@as(ModelReach, @enumFromInt(i))});
+        std.debug.print("model reach: {t} never hit\n", .{@as(ModelReach, @fromBackingInt(@intCast(i)))});
         return error.ModelDoesNotReach;
     };
 }
@@ -3173,9 +3173,9 @@ test "Session values: raw setData on the same session is Malformed, never a valu
 
 test "model: the key/value layer agrees with an ordered map on random operations" {
     const Reach = enum { put_new, put_replace, overflow, invalid_key, removed, remove_absent, popped, too_small, cleared, malformed };
-    var reach = [_]usize{0} ** @typeInfo(Reach).@"enum".fields.len;
-    const key_pool = [_][]const u8{ "uid", "a", "flash", "csrf", "theme", "k" ** 255, "x" ** 40, "lang" };
-    for (0..(if (@import("builtin").mode == .Debug) 100 else 400)) |case_seed| {
+    var reach = @as([@typeInfo(Reach)]usize, @splat(0)).@"enum".field_names.len;
+    const key_pool = [_][]const u8{ "uid", "a", "flash", "csrf", "theme", strRepeat("k", 255), strRepeat("x", 40), "lang" };
+    for (0..(if (@import("builtin").mode == .debug) 100 else 400)) |case_seed| {
         var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
@@ -3199,10 +3199,10 @@ test "model: the key/value layer agrees with an ordered map on random operations
                     const after = (if (size == 0) 1 else 1 + size) - old + 3 + key.len + vlen;
                     if (after > max_session_bytes) {
                         try testing.expectError(error.Overflow, s.putValue(key, scratch[0..vlen]));
-                        reach[@intFromEnum(Reach.overflow)] += 1;
+                        reach[@backingInt(Reach.overflow)] += 1;
                     } else {
                         try s.putValue(key, scratch[0..vlen]);
-                        reach[@intFromEnum(if (old != 0) Reach.put_replace else Reach.put_new)] += 1;
+                        reach[@backingInt(if (old != 0) Reach.put_replace else Reach.put_new)] += 1;
                         try md.put(arena, key, try arena.dupe(u8, scratch[0..vlen]));
                     }
                 },
@@ -3210,13 +3210,13 @@ test "model: the key/value layer agrees with an ordered map on random operations
                     const long_key: [256]u8 = @splat('z');
                     const bad_key: []const u8 = if (rnd.boolean()) "" else &long_key;
                     try testing.expectError(error.InvalidKey, s.putValue(bad_key, "v"));
-                    reach[@intFromEnum(Reach.invalid_key)] += 1;
+                    reach[@backingInt(Reach.invalid_key)] += 1;
                 },
                 6, 7 => {
                     const had = md.contains(key);
                     try testing.expectEqual(had, try s.removeValue(key));
                     if (had) _ = md.orderedRemove(key);
-                    reach[@intFromEnum(if (had) Reach.removed else Reach.remove_absent)] += 1;
+                    reach[@backingInt(if (had) Reach.removed else Reach.remove_absent)] += 1;
                 },
                 8, 9 => {
                     var pbuf: [64]u8 = undefined;
@@ -3224,18 +3224,18 @@ test "model: the key/value layer agrees with an ordered map on random operations
                     if (md.get(key)) |v| {
                         if (v.len > blen) {
                             try testing.expectError(error.BufferTooSmall, s.popValue(key, pbuf[0..blen]));
-                            reach[@intFromEnum(Reach.too_small)] += 1;
+                            reach[@backingInt(Reach.too_small)] += 1;
                         } else {
                             try testing.expectEqualSlices(u8, v, (try s.popValue(key, pbuf[0..blen])).?);
                             _ = md.orderedRemove(key);
-                            reach[@intFromEnum(Reach.popped)] += 1;
+                            reach[@backingInt(Reach.popped)] += 1;
                         }
                     } else try testing.expect((try s.popValue(key, pbuf[0..blen])) == null);
                 },
                 10 => if (rnd.uintLessThan(u8, 3) == 0) {
                     s.clearValues();
                     md.clearRetainingCapacity();
-                    reach[@intFromEnum(Reach.cleared)] += 1;
+                    reach[@backingInt(Reach.cleared)] += 1;
                 },
                 else => if (rnd.uintLessThan(u8, 6) == 0) {
                     // A raw payload on the same session: every access says so.
@@ -3243,7 +3243,7 @@ test "model: the key/value layer agrees with an ordered map on random operations
                     try testing.expectError(error.Malformed, s.getValue(key));
                     s.clearValues();
                     md.clearRetainingCapacity();
-                    reach[@intFromEnum(Reach.malformed)] += 1;
+                    reach[@backingInt(Reach.malformed)] += 1;
                 },
             }
             // The whole state agrees: same entries, same order.
@@ -3258,7 +3258,7 @@ test "model: the key/value layer agrees with an ordered map on random operations
         }
     }
     for (reach, 0..) |n, i| if (n == 0) {
-        std.debug.print("values model reach: {t} never hit\n", .{@as(Reach, @enumFromInt(i))});
+        std.debug.print("values model reach: {t} never hit\n", .{@as(Reach, @fromBackingInt(@intCast(i)))});
         return error.ModelDoesNotReach;
     };
 }
@@ -3307,31 +3307,31 @@ test "persist_cookie: the three Set-Cookie shapes, byte for byte (and the cleari
 
     // 1. Default: every cookie carries Max-Age -- today's bytes.
     const m_default = try Manager.init(testing.allocator, env.store.store(), .{ .io = testing.io, .clock = env.clk.clock(), .idle_timeout_ns = idle });
-    var s1 = knownSession("deadbeef" ** 8);
-    try testing.expectEqualStrings("session=" ++ ("deadbeef" ** 8) ++ "; Path=/; Max-Age=10" ++ tail, setCookieOf(&m_default, &s1, &out_buf));
+    var s1 = knownSession(strRepeat("deadbeef", 8));
+    try testing.expectEqualStrings("session=" ++ (strRepeat("deadbeef", 8)) ++ "; Path=/; Max-Age=10" ++ tail, setCookieOf(&m_default, &s1, &out_buf));
 
     // 2. persist_cookie = false, not remembered: a browser-session cookie.
     const m_session = try Manager.init(testing.allocator, env.store.store(), .{ .io = testing.io, .clock = env.clk.clock(), .idle_timeout_ns = idle, .persist_cookie = false });
-    var s2 = knownSession("cafebabe" ** 8);
-    try testing.expectEqualStrings("session=" ++ ("cafebabe" ** 8) ++ "; Path=/" ++ tail, setCookieOf(&m_session, &s2, &out_buf));
+    var s2 = knownSession(strRepeat("cafebabe", 8));
+    try testing.expectEqualStrings("session=" ++ (strRepeat("cafebabe", 8)) ++ "; Path=/" ++ tail, setCookieOf(&m_session, &s2, &out_buf));
 
     // 3. persist_cookie = false, rememberMe(true): Max-Age again.
-    var s3 = knownSession("feedface" ** 8);
+    var s3 = knownSession(strRepeat("feedface", 8));
     s3.rememberMe(true);
-    try testing.expectEqualStrings("session=" ++ ("feedface" ** 8) ++ "; Path=/; Max-Age=10" ++ tail, setCookieOf(&m_session, &s3, &out_buf));
+    try testing.expectEqualStrings("session=" ++ (strRepeat("feedface", 8)) ++ "; Path=/; Max-Age=10" ++ tail, setCookieOf(&m_session, &s3, &out_buf));
 
     // The default manager ignores the flag; rememberMe(false) is off again.
-    var s4 = knownSession("0123abcd" ** 8);
+    var s4 = knownSession(strRepeat("0123abcd", 8));
     s4.rememberMe(true);
     s4.rememberMe(false);
-    try testing.expectEqualStrings("session=" ++ ("0123abcd" ** 8) ++ "; Path=/" ++ tail, setCookieOf(&m_session, &s4, &out_buf));
+    try testing.expectEqualStrings("session=" ++ (strRepeat("0123abcd", 8)) ++ "; Path=/" ++ tail, setCookieOf(&m_session, &s4, &out_buf));
 
     // The clearing cookie is the same for both.
     var out: Writer = .fixed(&out_buf);
     var body_buf: [64]u8 = undefined;
     var chunk_buf: [32]u8 = undefined;
     var rw: http.Server.ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
-    m_session.destroy(&rw, "cafebabe" ** 8);
+    m_session.destroy(&rw, strRepeat("cafebabe", 8));
     try rw.end();
     try testing.expectEqualStrings("session=; Path=/; Max-Age=-1" ++ tail, headerValue(out.buffered(), "Set-Cookie").?);
 }
@@ -3678,4 +3678,16 @@ test "hash_id_in_store: KvStore keys are prefix ++ SHA-256(id); iterate shows th
     for (ids[0..3]) |*id| try testing.expectEqual(Manager.LoadResult.absent, m.lookup(id, &l));
     for (ids[3..5]) |*id| try testing.expectEqual(Manager.LoadResult.loaded, m.lookup(id, &l));
     try testing.expect(!env.db.exists(hashed_key));
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

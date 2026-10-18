@@ -285,7 +285,7 @@ const prgs = .{ Sha256Prg, Aes128Mmo };
 test "every PRG: expand is deterministic" {
     inline for (prgs) |P| {
         const p = P.init();
-        const s: Seed = [_]u8{0x00} ** 16;
+        const s: Seed = @as([16]u8, @splat(0x00));
         const a = p.expand(s);
         const b = p.expand(s);
         try std.testing.expectEqualSlices(u8, &a.s_l, &b.s_l);
@@ -298,7 +298,7 @@ test "every PRG: expand is deterministic" {
 test "every PRG: left/right differ, and a one-bit seed change changes both" {
     inline for (prgs) |P| {
         const p = P.init();
-        const s: Seed = [_]u8{0xAB} ** 16;
+        const s: Seed = @as([16]u8, @splat(0xAB));
         const e = p.expand(s);
         try std.testing.expect(!std.mem.eql(u8, &e.s_l, &e.s_r));
         var s2 = s;
@@ -312,7 +312,7 @@ test "every PRG: left/right differ, and a one-bit seed change changes both" {
 test "every PRG: convert is deterministic and width-correct" {
     inline for (prgs) |P| {
         const p = P.init();
-        const s: Seed = [_]u8{0x42} ** 16;
+        const s: Seed = @as([16]u8, @splat(0x42));
         try std.testing.expectEqual(p.convert(4, s), p.convert(4, s));
         try std.testing.expectEqual(@as(type, u32), @TypeOf(p.convert(4, s)));
         try std.testing.expectEqual(@as(type, u64), @TypeOf(p.convert(8, s)));
@@ -335,7 +335,7 @@ test "every PRG: convert is separated from both children" {
     // slip that would make the leaf value predictable from the tree.
     inline for (prgs) |P| {
         const p = P.init();
-        const s: Seed = [_]u8{0x5A} ** 16;
+        const s: Seed = @as([16]u8, @splat(0x5A));
         const e = p.expand(s);
         const cv = p.convert(16, s);
         var cv_bytes: [16]u8 = undefined;
@@ -468,7 +468,7 @@ test "every PRG: convert(L) is the low L bytes of convert(32), for every L" {
     // the two-block path.
     inline for (prgs) |P| {
         const p = P.init();
-        const s: Seed = [_]u8{0x3C} ** 16;
+        const s: Seed = @as([16]u8, @splat(0x3C));
         const full = p.convert(32, s);
         inline for (1..33) |L| {
             const T = std.meta.Int(.unsigned, 8 * L);

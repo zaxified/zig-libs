@@ -426,7 +426,7 @@ test "pump cross-connects two pipes" {
 
 test "loop transport refuses to overflow" {
     var lt: LoopTransport = .{};
-    const big = [_]u8{0} ** 16384;
+    const big = @as([16384]u8, @splat(0));
     try lt.transport().write(&big);
     try testing.expectError(error.WriteFailed, lt.transport().write(&[_]u8{1}));
 }
@@ -606,7 +606,7 @@ fn expectStalledMessageTimesOut(prefix: []const u8) !void {
 /// A NOP header announcing `body_len` octets of data.
 fn nopHeader(body_len: u16) [encap.header_len]u8 {
     var h: [encap.header_len]u8 = @splat(0);
-    std.mem.writeInt(u16, h[0..2], @intFromEnum(encap.Command.nop), .little);
+    std.mem.writeInt(u16, h[0..2], @backingInt(encap.Command.nop), .little);
     std.mem.writeInt(u16, h[2..4], body_len, .little);
     return h;
 }

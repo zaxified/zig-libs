@@ -94,7 +94,7 @@ fn Int(comptime cap: usize) type {
         const Self = @This();
         pub const capacity = cap;
 
-        buf: [cap]u8 = [_]u8{0} ** cap,
+        buf: [cap]u8 = @as([cap]u8, @splat(0)),
         len: usize = 0,
 
         pub fn bytes(self: *const Self) []const u8 {
@@ -718,7 +718,7 @@ test "FacProof.fromBytes refuses an integer wider than an honest one" {
         try fe.toBytes(&buf, .big);
         try appendLenPrefixed(&list, testing.allocator, &buf);
     }
-    const wide = [_]u8{1} ** (sigma_cap + 1);
+    const wide = @as([sigma_cap + 1]u8, @splat(1));
     try appendLenPrefixed(&list, testing.allocator, &wide); // σ one byte past its cap
     for ([_][]const u8{ proof.z1.bytes(), proof.z2.bytes(), proof.w1.bytes(), proof.w2.bytes(), proof.v.bytes() }) |f|
         try appendLenPrefixed(&list, testing.allocator, f);

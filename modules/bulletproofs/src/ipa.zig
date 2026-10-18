@@ -524,8 +524,8 @@ fn fakeProof(allocator: std.mem.Allocator, rounds: usize) !InnerProductProof {
     return .{
         .l_vec = l_vec,
         .r_vec = r_vec,
-        .a = [_]u8{7} ++ [_]u8{0} ** 31,
-        .b = [_]u8{9} ++ [_]u8{0} ** 31,
+        .a = [_]u8{7} ++ @as([31]u8, @splat(0)),
+        .b = [_]u8{9} ++ @as([31]u8, @splat(0)),
     };
 }
 
@@ -643,8 +643,8 @@ test "proveIpa: length mismatch rejected before reaching the stub" {
     var t = Transcript.init("bulletproofs/ipa/v1");
     const g_vec = [_]Ristretto255{ Ristretto255.basePoint, Ristretto255.basePoint.dbl() };
     const h_vec = [_]Ristretto255{ Ristretto255.basePoint, Ristretto255.basePoint.dbl() };
-    const a = [_][32]u8{[_]u8{1} ++ [_]u8{0} ** 31};
-    const b = [_][32]u8{ [_]u8{1} ++ [_]u8{0} ** 31, [_]u8{1} ++ [_]u8{0} ** 31 };
+    const a = [_][32]u8{[_]u8{1} ++ @as([31]u8, @splat(0))};
+    const b = [_][32]u8{ [_]u8{1} ++ @as([31]u8, @splat(0)), [_]u8{1} ++ @as([31]u8, @splat(0)) };
     try std.testing.expectError(
         error.LengthMismatch,
         proveIpa(std.testing.allocator, &t, &g_vec, &h_vec, Ristretto255.basePoint, &a, &b),
@@ -653,9 +653,9 @@ test "proveIpa: length mismatch rejected before reaching the stub" {
 
 test "proveIpa: non-power-of-two length rejected before reaching the stub" {
     var t = Transcript.init("bulletproofs/ipa/v1");
-    const g_vec = [_]Ristretto255{ Ristretto255.basePoint, Ristretto255.basePoint.dbl(), Ristretto255.basePoint.mul([_]u8{3} ++ [_]u8{0} ** 31) catch unreachable };
+    const g_vec = [_]Ristretto255{ Ristretto255.basePoint, Ristretto255.basePoint.dbl(), Ristretto255.basePoint.mul([_]u8{3} ++ @as([31]u8, @splat(0))) catch unreachable };
     const h_vec = g_vec;
-    const a = [_][32]u8{ [_]u8{1} ++ [_]u8{0} ** 31, [_]u8{1} ++ [_]u8{0} ** 31, [_]u8{1} ++ [_]u8{0} ** 31 };
+    const a = [_][32]u8{ [_]u8{1} ++ @as([31]u8, @splat(0)), [_]u8{1} ++ @as([31]u8, @splat(0)), [_]u8{1} ++ @as([31]u8, @splat(0)) };
     const b = a;
     try std.testing.expectError(
         error.NotPowerOfTwo,
@@ -683,22 +683,22 @@ pub const ipa_fuzz_buf_len = 1024;
 /// The all-zero 32 octets are the Ristretto255 IDENTITY, which
 /// `Ristretto255.fromBytes` accepts — that is what lets a hand-written seed
 /// be an ACCEPTED proof here without carrying a real transcript.
-const ipa_identity_hex = "00" ** 32;
+const ipa_identity_hex = strRepeat("00", 32);
 /// 32 octets that are not a canonical Ristretto encoding.
-const ipa_bad_point_hex = "ff" ** 32;
+const ipa_bad_point_hex = strRepeat("ff", 32);
 
 pub const ipa_seeds = [_][]const u8{
     fuzzseed.seedHex(""), // the empty slice: exactly what the collapsed draw ran, for ever
-    fuzzseed.seedHex("00" ** 63), // one octet short of the two final scalars
-    fuzzseed.seedHex("00" ** 64), // ⭐ rounds = 0: the shortest ACCEPTED proof, a and b only
-    fuzzseed.seedHex(ipa_identity_hex ** 2 ++ "00" ** 64), // ⭐ rounds = 1, both points the identity: accepted
-    fuzzseed.seedHex(ipa_identity_hex ** 4 ++ "11" ** 64), // rounds = 2, non-canonical a and b scalars
-    fuzzseed.seedHex(ipa_bad_point_hex ++ ipa_identity_hex ++ "00" ** 64), // ⭐ L is not a valid point: the errdefer-freed path
-    fuzzseed.seedHex(ipa_identity_hex ++ ipa_bad_point_hex ++ "00" ** 64), // R is not a valid point, one loop iteration further in
-    fuzzseed.seedHex(ipa_identity_hex ** 2 ++ "00" ** 63), // not a whole number of elements (one octet short)
-    fuzzseed.seedHex(ipa_identity_hex ** 2 ++ "00" ** 65), // one octet over
-    fuzzseed.seedHex(ipa_identity_hex ** 3 ++ "00" ** 64), // an odd element count: an L without its R
-    fuzzseed.seedHex(ipa_identity_hex ** 28 ++ "00" ** 64), // ⭐ rounds = 14
+    fuzzseed.seedHex(strRepeat("00", 63)), // one octet short of the two final scalars
+    fuzzseed.seedHex(strRepeat("00", 64)), // ⭐ rounds = 0: the shortest ACCEPTED proof, a and b only
+    fuzzseed.seedHex(strRepeat(ipa_identity_hex, 2) ++ strRepeat("00", 64)), // ⭐ rounds = 1, both points the identity: accepted
+    fuzzseed.seedHex(strRepeat(ipa_identity_hex, 4) ++ strRepeat("11", 64)), // rounds = 2, non-canonical a and b scalars
+    fuzzseed.seedHex(ipa_bad_point_hex ++ ipa_identity_hex ++ strRepeat("00", 64)), // ⭐ L is not a valid point: the errdefer-freed path
+    fuzzseed.seedHex(ipa_identity_hex ++ ipa_bad_point_hex ++ strRepeat("00", 64)), // R is not a valid point, one loop iteration further in
+    fuzzseed.seedHex(strRepeat(ipa_identity_hex, 2) ++ strRepeat("00", 63)), // not a whole number of elements (one octet short)
+    fuzzseed.seedHex(strRepeat(ipa_identity_hex, 2) ++ strRepeat("00", 65)), // one octet over
+    fuzzseed.seedHex(strRepeat(ipa_identity_hex, 3) ++ strRepeat("00", 64)), // an odd element count: an L without its R
+    fuzzseed.seedHex(strRepeat(ipa_identity_hex, 28) ++ strRepeat("00", 64)), // ⭐ rounds = 14
 };
 
 fn fuzzFromBytesAlloc(_: void, smith: *std.testing.Smith) !void {
@@ -750,4 +750,16 @@ test "corpus: every IPA seed reaches the decoder, and the rounds decoded are pin
     // 2 rounds).
     try std.testing.expectEqual(@as(usize, 3), accepted);
     try std.testing.expectEqual(@as(usize, 15), rounds_decoded);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

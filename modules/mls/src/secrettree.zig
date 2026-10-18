@@ -476,13 +476,13 @@ fn tSender(comptime S: type, sds: [S.Nh]u8, ct: []const u8) !SenderDataKeys(S) {
 }
 
 test "nodeSecret: a one-leaf tree's only node IS the root, so its secret is encryption_secret" {
-    const es = [_]u8{0x42} ** TestSuite.Nh;
+    const es = @as([TestSuite.Nh]u8, @splat(0x42));
     const got = try tNode(TestSuite, es, 1, 0);
     try testing.expectEqualSlices(u8, &es, &got);
 }
 
 test "nodeSecret: children differ from each other and from the parent; out-of-range is rejected" {
-    const es = [_]u8{0x11} ** TestSuite.Nh;
+    const es = @as([TestSuite.Nh]u8, @splat(0x11));
     // n_leaves = 4 -> node_width 7, root 3, children 1 and 5.
     try testing.expectEqual(@as(usize, 7), treemath.node_width(4));
     const root_secret = try tNode(TestSuite, es, 4, 3);
@@ -502,7 +502,7 @@ test "nodeSecret: children differ from each other and from the parent; out-of-ra
 }
 
 test "ratchetBaseSecret: handshake and application ratchets are independent per leaf" {
-    const es = [_]u8{0x21} ** TestSuite.Nh;
+    const es = @as([TestSuite.Nh]u8, @splat(0x21));
     const h0 = try tBase(TestSuite, es, 4, 0, .handshake);
     const a0 = try tBase(TestSuite, es, 4, 0, .application);
     const h1 = try tBase(TestSuite, es, 4, 1, .handshake);
@@ -512,7 +512,7 @@ test "ratchetBaseSecret: handshake and application ratchets are independent per 
 }
 
 test "Ratchet: current() is pure, advance() moves forward and destroys the old secret" {
-    const base = [_]u8{0x31} ** TestSuite.Nh;
+    const base = @as([TestSuite.Nh]u8, @splat(0x31));
     var r = tRatchet(base);
 
     const g0a = try tCurrent(&r);
@@ -530,11 +530,11 @@ test "Ratchet: current() is pure, advance() moves forward and destroys the old s
     try testing.expect(!std.mem.eql(u8, &g0a.nonce, &g1.nonce));
 
     r.wipe();
-    try testing.expectEqualSlices(u8, &[_]u8{0} ** TestSuite.Nh, &r.secret);
+    try testing.expectEqualSlices(u8, &@as([TestSuite.Nh]u8, @splat(0)), &r.secret);
 }
 
 test "Window: in-order delivery matches the bare ratchet generation for generation" {
-    const base = [_]u8{0x41} ** TestSuite.Nh;
+    const base = @as([TestSuite.Nh]u8, @splat(0x41));
     var w = tWindow(8, base);
     var r = tRatchet(base);
 
@@ -549,7 +549,7 @@ test "Window: in-order delivery matches the bare ratchet generation for generati
 }
 
 test "Window: a skipped generation is retained and later served exactly once" {
-    const base = [_]u8{0x51} ** TestSuite.Nh;
+    const base = @as([TestSuite.Nh]u8, @splat(0x51));
     var w = tWindow(8, base);
     var r = tRatchet(base);
 
@@ -572,7 +572,7 @@ test "Window: a skipped generation is retained and later served exactly once" {
 }
 
 test "Window: eviction past capacity, and a huge forward jump is refused not computed" {
-    const base = [_]u8{0x61} ** TestSuite.Nh;
+    const base = @as([TestSuite.Nh]u8, @splat(0x61));
     var w = tWindow(2, base);
 
     _ = try tGet(&w, 4); // retains generations 0..3 into a 2-slot ring
@@ -590,7 +590,7 @@ test "Window: eviction past capacity, and a huge forward jump is refused not com
     _ = try tGet(&w2, 4);
 
     w.wipe();
-    try testing.expectEqualSlices(u8, &[_]u8{0} ** TestSuite.Nh, &w.ratchet.secret);
+    try testing.expectEqualSlices(u8, &@as([TestSuite.Nh]u8, @splat(0)), &w.ratchet.secret);
 }
 
 test "Window: the FINAL generation is consumed too — a replay of it is refused" {
@@ -601,7 +601,7 @@ test "Window: the FINAL generation is consumed too — a replay of it is refused
     // An attacker who has driven a sender's ratchet to the end could then
     // replay one captured message without limit, against a module whose doc
     // promises the opposite.
-    const base = [_]u8{0x62} ** TestSuite.Nh;
+    const base = @as([TestSuite.Nh]u8, @splat(0x62));
     var w = tWindow(2, base);
     // Park the ratchet on the last generation without paying 2^32 KDF calls.
     w.ratchet.generation = std.math.maxInt(u32);
@@ -611,12 +611,12 @@ test "Window: the FINAL generation is consumed too — a replay of it is refused
     try testing.expectError(error.GenerationConsumed, tGet(&w, std.math.maxInt(u32)));
     // The served key is still a real one, and the spent secret is gone.
     try testing.expect(!std.mem.allEqual(u8, &first.key, 0));
-    try testing.expectEqualSlices(u8, &[_]u8{0} ** TestSuite.Nh, &w.ratchet.secret);
+    try testing.expectEqualSlices(u8, &@as([TestSuite.Nh]u8, @splat(0)), &w.ratchet.secret);
 }
 
 test "senderDataKeys: bound to the ciphertext sample, and a short ciphertext uses all of it" {
-    const sds = [_]u8{0x71} ** TestSuite.Nh;
-    const ct_a = [_]u8{0xaa} ** 64;
+    const sds = @as([TestSuite.Nh]u8, @splat(0x71));
+    const ct_a = @as([64]u8, @splat(0xaa));
     var ct_b = ct_a;
     ct_b[0] ^= 0x01; // inside the first KDF.Nh bytes
 
@@ -633,7 +633,7 @@ test "senderDataKeys: bound to the ciphertext sample, and a short ciphertext use
     try testing.expectEqualSlices(u8, &a.key, &c.key);
 
     // A ciphertext shorter than KDF.Nh samples the whole thing.
-    const short = [_]u8{0xbb} ** 8;
+    const short = @as([8]u8, @splat(0xbb));
     const s1 = try tSender(TestSuite, sds, &short);
     const s2 = try tSender(TestSuite, sds, short[0..8]);
     try testing.expectEqualSlices(u8, &s1.key, &s2.key);

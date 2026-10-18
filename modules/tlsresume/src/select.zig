@@ -294,7 +294,7 @@ fn clientBinder(rms: *const [32]u8, nonce: []const u8, empty_hash: []const u8, c
 test "SessionState: serialize/parse round-trip (real — pure struct packing, no crypto)" {
     const S = SessionState(32);
     const s = S{
-        .resumption_master_secret = [_]u8{0xAB} ** 32,
+        .resumption_master_secret = @as([32]u8, @splat(0xAB)),
         .ticket_nonce = &[_]u8{ 0x00, 0x00 },
         .issued_at_ms = 1_752_000_000_000,
         .ticket_age_add = 0xfad6aac5,
@@ -313,7 +313,7 @@ test "SessionState: serialize/parse round-trip (real — pure struct packing, no
 test "SessionState: parse ignores an engine's trailing appended fields" {
     const S = SessionState(32);
     const s = S{
-        .resumption_master_secret = [_]u8{0x11} ** 32,
+        .resumption_master_secret = @as([32]u8, @splat(0x11)),
         .ticket_nonce = &[_]u8{0x01},
         .issued_at_ms = 42,
         .ticket_age_add = 7,
@@ -332,7 +332,7 @@ test "SessionState: parse ignores an engine's trailing appended fields" {
 
 test "SessionState: truncated input is a typed Malformed error" {
     const S = SessionState(32);
-    try testing.expectError(error.Malformed, S.parse(&[_]u8{0} ** 10));
+    try testing.expectError(error.Malformed, S.parse(&@as([10]u8, @splat(0))));
 }
 
 // ── fuzz: SessionState.parse never panics on arbitrary bytes ──────────────
@@ -386,7 +386,7 @@ const StateCorpus = struct {
         // 0: a record with an empty nonce — the ONLY input this target ever
         //    ran, kept so the "before" case stays covered.
         const empty_nonce = try (S{
-            .resumption_master_secret = [_]u8{0xAB} ** 32,
+            .resumption_master_secret = @as([32]u8, @splat(0xAB)),
             .ticket_nonce = "",
             .issued_at_ms = 0,
             .ticket_age_add = 0,
@@ -396,7 +396,7 @@ const StateCorpus = struct {
 
         // 1: a realistic record: an 8-octet nonce and non-zero timestamps.
         const full = try (S{
-            .resumption_master_secret = [_]u8{0xAB} ** 32,
+            .resumption_master_secret = @as([32]u8, @splat(0xAB)),
             .ticket_nonce = "\x01\x02\x03\x04\x05\x06\x07\x08",
             .issued_at_ms = 1_700_000_000_000,
             .ticket_age_add = 0xDEAD_BEEF,
@@ -461,10 +461,10 @@ fn fuzzSessionStateParse(_: void, smith: *std.testing.Smith) !void {
 
 const fuzz_driver = @import("testkit").fuzz.driver;
 const StateLabel = enum { raw_rejected, raw_accepted, roundtrip, truncated_rejected, flipped_parsed };
-var state_reach: [@typeInfo(StateLabel).@"enum".fields.len]usize = @splat(0);
+var state_reach: [@typeInfo(StateLabel).@"enum".field_names.len]usize = @splat(0);
 
 fn markState(comptime l: StateLabel) void {
-    state_reach[@intFromEnum(l)] += 1;
+    state_reach[@backingInt(l)] += 1;
     fuzz_driver.hit(@tagName(l));
 }
 
@@ -530,7 +530,7 @@ test "fuzz harness: 300 state seeds in every test run, and they get everywhere" 
         };
     }
     for (state_reach, 0..) |n, i| if (n == 0) {
-        std.debug.print("reach: label {t} never hit in 300 seeds\n", .{@as(StateLabel, @enumFromInt(i))});
+        std.debug.print("reach: label {t} never hit in 300 seeds\n", .{@as(StateLabel, @fromBackingInt(@intCast(i)))});
         return error.HarnessDoesNotReach;
     };
 }
@@ -581,9 +581,9 @@ fn sha256Of(s: []const u8) [32]u8 {
 test "selectPsk end-to-end: STEK-issued ticket -> ClientHello2 -> restored PSK; tamper/forge/stale/replay all reject" {
     // ── issue side: SessionState.serialize -> ring.seal -> ticket bytes ──
     var ring = stek.DefaultRing.init();
-    ring.rotate(1, &([_]u8{0x42} ** stek.key_length), 0);
+    ring.rotate(1, &(@as([stek.key_length]u8, @splat(0x42))), 0);
 
-    const rms = [_]u8{0xAB} ** 32;
+    const rms = @as([32]u8, @splat(0xAB));
     const ticket_nonce = [_]u8{ 0x00, 0x00 };
     const issued_at_ms: i64 = 1_000_000;
     const ticket_age_add: u32 = 0xfad6aac5;
@@ -596,7 +596,7 @@ test "selectPsk end-to-end: STEK-issued ticket -> ClientHello2 -> restored PSK; 
     var plaintext_buf: [128]u8 = undefined;
     const plaintext = try state.serialize(&plaintext_buf);
     var blob_buf: [160]u8 = undefined;
-    const ticket = try ring.seal(plaintext, [_]u8{0x01} ** stek.nonce_length, &blob_buf);
+    const ticket = try ring.seal(plaintext, @as([stek.nonce_length]u8, @splat(0x01)), &blob_buf);
 
     // ── resume side: what an RFC-8446 client would independently derive ──
     const age_ms: u32 = 5_000;
@@ -654,9 +654,9 @@ test "selectPsk end-to-end: STEK-issued ticket -> ClientHello2 -> restored PSK; 
 
 test "selectPsk: second offered identity wins when the first is not ours (selected_index echoes position)" {
     var ring = stek.DefaultRing.init();
-    ring.rotate(3, &([_]u8{0x77} ** stek.key_length), 0);
+    ring.rotate(3, &(@as([stek.key_length]u8, @splat(0x77))), 0);
 
-    const rms = [_]u8{0xCD} ** 32;
+    const rms = @as([32]u8, @splat(0xCD));
     const ticket_nonce = [_]u8{0x01};
     const issued_at_ms: i64 = 500_000;
     const ticket_age_add: u32 = 0x1234_5678;
@@ -669,7 +669,7 @@ test "selectPsk: second offered identity wins when the first is not ours (select
     var plaintext_buf: [128]u8 = undefined;
     const plaintext = try state.serialize(&plaintext_buf);
     var blob_buf: [160]u8 = undefined;
-    const ticket = try ring.seal(plaintext, [_]u8{0x02} ** stek.nonce_length, &blob_buf);
+    const ticket = try ring.seal(plaintext, @as([stek.nonce_length]u8, @splat(0x02)), &blob_buf);
 
     const age_ms: u32 = 100;
     const now_ms: i64 = issued_at_ms + age_ms;
@@ -678,9 +678,9 @@ test "selectPsk: second offered identity wins when the first is not ours (select
     const good_binder = clientBinder(&rms, &ticket_nonce, &empty_hash, &truncated_ch_hash);
 
     // Identity 0: some other server's ticket (opaque garbage to our ring).
-    const foreign = OfferedIdentity{ .ticket = &([_]u8{0x5C} ** 48), .obfuscated_ticket_age = 0 };
+    const foreign = OfferedIdentity{ .ticket = &(@as([48]u8, @splat(0x5C))), .obfuscated_ticket_age = 0 };
     const ours = OfferedIdentity{ .ticket = ticket, .obfuscated_ticket_age = replay.obfuscateAge(age_ms, ticket_age_add) };
-    const dummy_binder = [_]u8{0} ** 32;
+    const dummy_binder = @as([32]u8, @splat(0));
 
     var scratch: [128]u8 = undefined;
     const selection = try selectV(&ring, &.{ foreign, ours }, &.{ dummy_binder, good_binder }, &empty_hash, &truncated_ch_hash, now_ms, 10_000, null, &scratch);
@@ -699,14 +699,14 @@ test "selectPsk: a ticket from the future and a strike register that cannot allo
     // allocation failure is fail-closed (doc step 5: "fails to allocate —
     // fail-closed"), never an accept.
     var ring = stek.DefaultRing.init();
-    ring.rotate(1, &([_]u8{0x42} ** stek.key_length), 0);
-    const rms = [_]u8{0xAB} ** 32;
+    ring.rotate(1, &(@as([stek.key_length]u8, @splat(0x42))), 0);
+    const rms = @as([32]u8, @splat(0xAB));
     const nonce = [_]u8{ 0, 0 };
     const issued_at_ms: i64 = 1_000_000;
     const state = SessionState(32){ .resumption_master_secret = rms, .ticket_nonce = &nonce, .issued_at_ms = issued_at_ms, .ticket_age_add = 7 };
     var pt_buf: [128]u8 = undefined;
     var blob_buf: [160]u8 = undefined;
-    const ticket = try ring.seal(try state.serialize(&pt_buf), [_]u8{0x01} ** stek.nonce_length, &blob_buf);
+    const ticket = try ring.seal(try state.serialize(&pt_buf), @as([stek.nonce_length]u8, @splat(0x01)), &blob_buf);
     const empty_hash = sha256Of("");
     const ch_hash = sha256Of("truncated ClientHello");
     const binder = clientBinder(&rms, &nonce, &empty_hash, &ch_hash);

@@ -632,7 +632,7 @@ fn buildTree(gpa: Allocator, io: std.Io, d: std.Io.Dir, seed: u64, cross_links: 
         while (lvl < 25) : (lvl += 1) try chain.appendSlice(gpa, "/x");
         try d.createDirPath(io, chain.items);
         try chain.appendSlice(gpa, "/bottom.bin");
-        try d.writeFile(io, .{ .sub_path = chain.items, .data = "deep" ** 100 });
+        try d.writeFile(io, .{ .sub_path = chain.items, .data = strRepeat("deep", 100) });
     }
 
     // Wide: 100 sibling directories, each holding one file.
@@ -644,7 +644,7 @@ fn buildTree(gpa: Allocator, io: std.Io, d: std.Io.Dir, seed: u64, cross_links: 
         try d.createDirPath(io, sub);
         var fbuf: [96]u8 = undefined;
         const f = try std.fmt.bufPrint(&fbuf, "{s}/f.bin", .{sub});
-        try d.writeFile(io, .{ .sub_path = f, .data = "w" ** 300 });
+        try d.writeFile(io, .{ .sub_path = f, .data = strRepeat("w", 300) });
     }
 
     // Files, with a few hard links and symlinks.
@@ -787,7 +787,7 @@ test "parallel: an unreadable directory is reported once and stepped over" {
     const d = tmp.dir;
     try buildTree(testing.allocator, io, d, 3, false);
     try d.createDirPath(io, "wide/locked");
-    try d.writeFile(io, .{ .sub_path = "wide/locked/secret", .data = "s" ** 9000 });
+    try d.writeFile(io, .{ .sub_path = "wide/locked/secret", .data = strRepeat("s", 9000) });
     if (linux.errno(linux.fchmodat(d.handle, "wide/locked", 0o000)) != .SUCCESS) return error.SkipZigTest;
     defer _ = linux.fchmodat(d.handle, "wide/locked", 0o755);
     if (d.openDir(io, "wide/locked", .{ .iterate = true })) |*probe| {
@@ -822,10 +822,10 @@ test "should_descend: a pruned subtree is never entered, sequential and parallel
     defer tmp.cleanup();
     const d = tmp.dir;
     try d.createDirPath(io, "keep/inner");
-    try d.writeFile(io, .{ .sub_path = "keep/inner/k.bin", .data = "k" ** 700 });
+    try d.writeFile(io, .{ .sub_path = "keep/inner/k.bin", .data = strRepeat("k", 700) });
     try d.createDirPath(io, "excl/inner/deeper");
-    try d.writeFile(io, .{ .sub_path = "excl/e.bin", .data = "e" ** 5000 });
-    try d.writeFile(io, .{ .sub_path = "excl/inner/deeper/e2.bin", .data = "e" ** 5000 });
+    try d.writeFile(io, .{ .sub_path = "excl/e.bin", .data = strRepeat("e", 5000) });
+    try d.writeFile(io, .{ .sub_path = "excl/inner/deeper/e2.bin", .data = strRepeat("e", 5000) });
 
     // The subtree's own numbers, from a scan rooted at it.
     const sub = try scan.scanAt(testing.allocator, io, d, "excl", .{});
@@ -987,3 +987,15 @@ test "allocation failure at any point of a parallel scan leaks nothing" {
 }
 
 fn ignoreDirectory(_: ?*anyopaque, _: []const u8, _: u32, _: Totals) scan.SinkError!void {}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
+}

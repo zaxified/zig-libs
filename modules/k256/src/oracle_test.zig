@@ -32,7 +32,7 @@ const Ecdsa = std.crypto.sign.ecdsa.EcdsaSecp256k1Sha256;
 // full count adds materially to the full-gate Debug timeout budget (see
 // group.zig's `random_scalars_iters`). Random draws cut in Debug; other modes
 // keep the full count.
-const ecdsa_oracle_iters: usize = if (builtin.mode == .Debug) 40 else 200;
+const ecdsa_oracle_iters: usize = if (builtin.mode == .debug) 40 else 200;
 
 test "ECDSA: k256 verifies every std-produced signature, rejects tampering" {
     var seed: [Ecdsa.KeyPair.seed_length]u8 = undefined;
@@ -88,7 +88,7 @@ test "ECDSA malleability: std's own signatures come in both S forms; only low-S 
     // Debug is std's unoptimized signer (see `ecdsa_oracle_iters` above) --
     // cut in Debug, full count elsewhere. Both S-orientations still land
     // well before this shrinks to statistically flaky territory.
-    const malleability_iters: usize = if (builtin.mode == .Debug) 20 else 100;
+    const malleability_iters: usize = if (builtin.mode == .debug) 20 else 100;
 
     var std_was_low: usize = 0;
     var std_was_high: usize = 0;
@@ -161,7 +161,7 @@ fn eqAffineStd(k: Secp256k1, s: StdCurve) !void {
 // attempt 6, `group.test.differential` timed the full gate out separately;
 // fixing that alone left this test as the next-largest contributor). Cut
 // further; every named edge scalar below is unconditional in all modes.
-const comb_random_iters: usize = if (builtin.mode == .Debug) 50 else 4000;
+const comb_random_iters: usize = if (builtin.mode == .debug) 50 else 4000;
 
 test "comb: combMulBase(k)·G == std.basePoint.mul(k), random + edges" {
     var prng = std.Random.DefaultPrng.init(0xC0FB_0A5E_11);
@@ -216,7 +216,7 @@ test "comb positive control: a corrupted table DISAGREES with std (harness has t
     // Same std-mul cost as `comb_random_iters` above (~30ms/draw in Debug):
     // 500 draws ran ~15s isolated. Cut in Debug; the ~15/16 expected
     // disagreement rate needs only a modest sample to stay far from flaky.
-    const rounds: usize = if (builtin.mode == .Debug) 50 else 500;
+    const rounds: usize = if (builtin.mode == .debug) 50 else 500;
     const min_disagreements = rounds - rounds / 5; // > 80%, expected ~93.75%
 
     var prng = std.Random.DefaultPrng.init(0xBADC_0FFE_10);
@@ -243,7 +243,7 @@ test "GATED differential: fast_core.fieldMul/fieldSq == portable Solinas" {
 
     // amd64 fast_core is implemented, so this actually runs (not skipped) --
     // Debug margin for the module's <40s budget, full count elsewhere.
-    const fast_core_iters: usize = if (builtin.mode == .Debug) 800 else 5000;
+    const fast_core_iters: usize = if (builtin.mode == .debug) 800 else 5000;
 
     var prng = std.Random.DefaultPrng.init(0xA5_F1E1D_01);
     const rand = prng.random();
@@ -530,7 +530,7 @@ test "F5: windowed mul == mulLadder == std, random + edge scalars over base/rand
     }
 
     // Random: a fresh random point and a raw 256-bit scalar each round.
-    const rounds: usize = if (@import("builtin").mode == .Debug) 48 else 1000;
+    const rounds: usize = if (@import("builtin").mode == .debug) 48 else 1000;
     var i: usize = 0;
     while (i < rounds) : (i += 1) {
         rand.bytes(&rb);
@@ -544,7 +544,7 @@ test "F5: windowed mul == mulLadder == std, random + edge scalars over base/rand
 test "F5 positive control: a corrupted per-point table DISAGREES with std (the differential has teeth)" {
     var prng = std.Random.DefaultPrng.init(0xF5_BAD_7AB1E);
     const rand = prng.random();
-    const rounds: usize = if (@import("builtin").mode == .Debug) 32 else 500;
+    const rounds: usize = if (@import("builtin").mode == .debug) 32 else 500;
     var disagreements: usize = 0;
     var i: usize = 0;
     while (i < rounds) : (i += 1) {

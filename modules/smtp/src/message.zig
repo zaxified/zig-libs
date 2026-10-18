@@ -973,7 +973,7 @@ test "a verbatim header keeps its bytes; raw still folds; injection and long lin
         }, p.random(), .{}));
     }
     var p = fixedRandom(1);
-    const long = [_]u8{'b'} ** 1000;
+    const long = @as([1000]u8, @splat('b'));
     try testing.expectError(error.LineTooLong, render(gpa, .{
         .from = .{ .addr = "a@example.com" },
         .date = epoch_2026,
@@ -1046,7 +1046,7 @@ test "a very long line in a 7bit-looking body forces an encoding that fits" {
         .from = .{ .addr = "a@example.com" },
         .date = epoch_2026,
         .message_id = "id@example.com",
-        .body = .{ .text = .{ .body = "A" ** 5000 ++ "\r\n" } },
+        .body = .{ .text = .{ .body = strRepeat("A", 5000) ++ "\r\n" } },
     }, prng.random(), .{});
     defer gpa.free(out);
     try testing.expect(std.mem.indexOf(u8, out, "Content-Transfer-Encoding: quoted-printable") != null);
@@ -1097,14 +1097,14 @@ fn seedSplit(
 const render_seeds = [_][]const u8{
     seedSplit("Hello, worldThis is the body text.", 12, 0x9E37_79B9_7F4A_7C15, 1_767_225_600), // an ordinary ASCII message, 2026-01-01
     seedSplit("žluťoučký kůňpříliš dlouhý text", 15, 0x0123_4567_89AB_CDEF, -1), // a non-ASCII subject (forces an RFC 2047 encoded word), one second before the epoch
-    seedSplit("A" ** 400, 200, 0xF0E1_D2C3_B4A5_9687, std.math.maxInt(i32)), // exactly the harness buffer, split down the middle, the 2038 edge
-    seedSplit("A" ** 400, 0, 0xFFFF_FFFF_FFFF_FFFF, std.math.minInt(i32)), // the same with no subject at all, the 1901 edge
+    seedSplit(strRepeat("A", 400), 200, 0xF0E1_D2C3_B4A5_9687, std.math.maxInt(i32)), // exactly the harness buffer, split down the middle, the 2038 edge
+    seedSplit(strRepeat("A", 400), 0, 0xFFFF_FFFF_FFFF_FFFF, std.math.minInt(i32)), // the same with no subject at all, the 1901 edge
     seedSplit("Subject line\r\n\r\nBody text\r\n", 12, 0x6C62_1F4D_3A98_5E27, 0), // a subject with CRLF right behind it in the body, the epoch itself
-    seedSplit("\r\n" ** 50, 20, 0x2468_ACE0_1357_9BDF, 951_782_400), // nothing but line breaks, 2000-02-29 (a leap day)
-    seedSplit("=" ** 200, 100, 0x1357_9BDF_2468_ACE0, 1_000_000_000), // every octet quoted-printable must escape
-    seedSplit("." ** 100, 40, 0x5A5A_5A5A_A5A5_A5A5, -2_147_483_648 + 1), // leading dots, which the transport layer will stuff
-    seedSplit("\x00" ** 32, 16, 0x0000_0000_0000_0001, 86_399), // NULs: the subject must be refused, not smuggled
-    seedSplit(" " ** 200, 100, 0xDEAD_BEEF_CAFE_F00D, -86_400), // nothing but fold points, one day before the epoch
+    seedSplit(strRepeat("\r\n", 50), 20, 0x2468_ACE0_1357_9BDF, 951_782_400), // nothing but line breaks, 2000-02-29 (a leap day)
+    seedSplit(strRepeat("=", 200), 100, 0x1357_9BDF_2468_ACE0, 1_000_000_000), // every octet quoted-printable must escape
+    seedSplit(strRepeat(".", 100), 40, 0x5A5A_5A5A_A5A5_A5A5, -2_147_483_648 + 1), // leading dots, which the transport layer will stuff
+    seedSplit(strRepeat("\x00", 32), 16, 0x0000_0000_0000_0001, 86_399), // NULs: the subject must be refused, not smuggled
+    seedSplit(strRepeat(" ", 200), 100, 0xDEAD_BEEF_CAFE_F00D, -86_400), // nothing but fold points, one day before the epoch
 };
 
 test "fuzz: any body and subject renders to a document that respects the limits" {
@@ -1215,4 +1215,16 @@ test "corpus: every render seed reaches the renderer, and the counts are pinned"
     // date. ⛔ Not `> 1` — the count is what notices a seed losing its tail.
     try testing.expectEqual(@as(usize, 8), boundaries.count());
     try testing.expectEqual(@as(usize, 4), pre_epoch);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

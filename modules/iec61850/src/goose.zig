@@ -529,7 +529,7 @@ test "a frame whose Length covers an IEC 62351-6 extension is refused by decode 
     // the shape `iec62351.goose.build` puts on the wire.
     var body: [512]u8 = undefined;
     @memcpy(body[0..plain.pdu.len], plain.pdu);
-    const ext = [_]u8{ 0x30, 0x1d } ++ [_]u8{0xaa} ** 29;
+    const ext = [_]u8{ 0x30, 0x1d } ++ @as([29]u8, @splat(0xaa));
     @memcpy(body[plain.pdu.len..][0..ext.len], &ext);
     const pdu_and_ext = body[0 .. plain.pdu.len + ext.len];
     var fbuf: [600]u8 = undefined;
@@ -581,13 +581,13 @@ test "an allData count contradicting the entries is refused" {
 }
 
 test "a non-GOOSE EtherType and a short frame are typed errors" {
-    try testing.expectError(error.ShortFrame, Frame.decode(&[_]u8{0} ** 13));
+    try testing.expectError(error.ShortFrame, Frame.decode(&@as([13]u8, @splat(0))));
     var buf: [512]u8 = undefined;
     const bytes = unhex(captured_frame_hex, &buf);
     bytes[13] = 0xB9;
     try testing.expectError(error.NotGoose, Frame.decode(bytes));
     // A VLAN tag with nothing behind it.
-    const dangling_vlan = [_]u8{0} ** 12 ++ [_]u8{ 0x81, 0x00, 0x00, 0x64 };
+    const dangling_vlan = @as([12]u8, @splat(0)) ++ [_]u8{ 0x81, 0x00, 0x00, 0x64 };
     try testing.expectError(error.ShortFrame, Frame.decode(&dangling_vlan));
 }
 
@@ -598,7 +598,7 @@ test "a PDU missing a mandatory field is refused" {
         Pdu.decode(&[_]u8{ 0x61, 0x08, 0x80, 0x01, 'a', 0x8A, 0x01, 0x00, 0xAB, 0x00 }),
     );
     // gocbRef present, t present, but no allData.
-    const no_all_data = [_]u8{ 0x61, 0x0D, 0x80, 0x01, 'a', 0x84, 0x08 } ++ [_]u8{0} ** 7 ++ [_]u8{0x0A};
+    const no_all_data = [_]u8{ 0x61, 0x0D, 0x80, 0x01, 'a', 0x84, 0x08 } ++ @as([7]u8, @splat(0)) ++ [_]u8{0x0A};
     try testing.expectError(error.MissingField, Pdu.decode(&no_all_data));
 }
 
@@ -617,7 +617,7 @@ test "a GOOSE PDU omitting stNum, sqNum or confRev is refused" {
         0x80, 0x01,
         'a',  0x84,
         0x08,
-    } ++ [_]u8{0} ** 7 ++ [_]u8{0x0A} ++ [_]u8{ 0xAB, 0x00 };
+    } ++ @as([7]u8, @splat(0)) ++ [_]u8{0x0A} ++ [_]u8{ 0xAB, 0x00 };
     try testing.expectError(error.MissingField, Pdu.decode(&missing_all_three));
 
     // Same PDU but with stNum = 0 added explicitly: sqNum and confRev are
@@ -628,7 +628,7 @@ test "a GOOSE PDU omitting stNum, sqNum or confRev is refused" {
         0x80, 0x01,
         'a',  0x84,
         0x08,
-    } ++ [_]u8{0} ** 7 ++ [_]u8{0x0A} ++ [_]u8{ 0x85, 0x01, 0x00, 0xAB, 0x00 };
+    } ++ @as([7]u8, @splat(0)) ++ [_]u8{0x0A} ++ [_]u8{ 0x85, 0x01, 0x00, 0xAB, 0x00 };
     try testing.expectError(error.MissingField, Pdu.decode(&missing_sq_and_conf));
 }
 
@@ -642,7 +642,7 @@ test "a GOOSE PDU with a duplicated [5] stNum is refused, not last-wins" {
         0x61, 0x1B,
         0x80, 0x01, 'a', // [0] gocbRef
         0x84, 0x08,
-    } ++ [_]u8{0} ** 7 ++ [_]u8{0x0A} ++ [_]u8{ // [4] t
+    } ++ @as([7]u8, @splat(0)) ++ [_]u8{0x0A} ++ [_]u8{ // [4] t
         0x85, 0x01, 0x01, // [5] stNum #1 = 1
         0x85, 0x01, 0x09, // [5] stNum #2 = 9 (duplicate)
         0x86, 0x01, 0x00, // [6] sqNum

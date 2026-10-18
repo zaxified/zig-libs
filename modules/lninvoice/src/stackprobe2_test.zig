@@ -17,8 +17,8 @@ var fba: std.heap.FixedBufferAllocator = undefined;
 var key: [32]u8 = undefined;
 
 const fields = [_]bolt11.TaggedFieldOut{
-    .{ .payment_hash = [_]u8{0x01} ** 32 },
-    .{ .payment_secret = [_]u8{0x11} ** 32 },
+    .{ .payment_hash = @as([32]u8, @splat(0x01)) },
+    .{ .payment_secret = @as([32]u8, @splat(0x11)) },
     .{ .description = "lninvoice dead-stack probe" },
 };
 

@@ -241,7 +241,7 @@ noinline fn callPreSign() void {
 }
 
 test "STACKPROBE (audit 2026-10-08): no key or nonce residue on the dead stack after preSign()" {
-    if (builtin.mode == .Debug or builtin.mode == .ReleaseSafe) return error.SkipZigTest;
+    if (builtin.mode == .debug or builtin.mode == .safe) return error.SkipZigTest;
     var th = std.Io.Threaded.init(std.testing.allocator, .{});
     defer th.deinit();
     presign_io = th.io();

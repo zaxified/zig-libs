@@ -390,7 +390,7 @@ test "G1 scalarMul wipes its own secret-scalar byte scratch before returning (F9
     // left on the stack with no secureZero. Using the out-parameter seam
     // (`scalarMulZeroing`) to hold onto the scratch buffer after the call:
     // if the wipe did not run, `buf` would still hold `s`'s nonzero bytes.
-    var s_bytes = [_]u8{0xff} ** 32;
+    var s_bytes = @as([32]u8, @splat(0xff));
     s_bytes[0] = 0x01; // stay < r (r's top byte is 0x30)
     const s = try Fr.fromBytes(s_bytes);
     var buf: [Fr.encoded_bytes]u8 = undefined;
@@ -399,11 +399,11 @@ test "G1 scalarMul wipes its own secret-scalar byte scratch before returning (F9
 }
 
 test "G1 scalarMul distributes: [a+b]G == [a]G + [b]G and [a*b]G == [a]([b]G)" {
-    var a_bytes = [_]u8{0} ** 32;
+    var a_bytes = @as([32]u8, @splat(0));
     a_bytes[31] = 0x35;
     a_bytes[16] = 0x9c;
     const sa = try Fr.fromBytes(a_bytes);
-    var b_bytes = [_]u8{0} ** 32;
+    var b_bytes = @as([32]u8, @splat(0));
     b_bytes[31] = 0x0b;
     b_bytes[8] = 0x77;
     const sb = try Fr.fromBytes(b_bytes);
@@ -457,7 +457,7 @@ test "G1 KAT: [k]G matches the independent cross-check vector" {
 
 test "toBytes/fromBytes round-trip the generator; byte-exact KAT" {
     const bytes = toBytes(Affine.generator);
-    var expected = [_]u8{0} ** encoded_bytes;
+    var expected = @as([encoded_bytes]u8, @splat(0));
     expected[31] = 1; // x = 1
     expected[63] = 2; // y = 2
     try std.testing.expectEqualSlices(u8, &expected, &bytes);
@@ -483,14 +483,14 @@ test "toBytes(identity) is all-zero; fromBytes(all-zero) is identity" {
 }
 
 test "fromBytes rejects the wrong length" {
-    var short = [_]u8{0} ** (encoded_bytes - 1);
+    var short = @as([encoded_bytes - 1]u8, @splat(0));
     try std.testing.expectError(error.InvalidEncoding, fromBytes(&short));
-    var long = [_]u8{0} ** (encoded_bytes + 1);
+    var long = @as([encoded_bytes + 1]u8, @splat(0));
     try std.testing.expectError(error.InvalidEncoding, fromBytes(&long));
 }
 
 test "fromBytes rejects a coordinate >= p" {
-    var bytes = [_]u8{0} ** encoded_bytes;
+    var bytes = @as([encoded_bytes]u8, @splat(0));
     bytes[0..32].* = fp.p_bytes; // x == p, non-canonical
     bytes[63] = 2;
     try std.testing.expectError(error.InvalidFieldElement, fromBytes(&bytes));
@@ -498,7 +498,7 @@ test "fromBytes rejects a coordinate >= p" {
 
 test "fromBytes rejects an off-curve (x, y) pair" {
     // (1, 3): 3^2 = 9 != 1^3 + 3 = 4.
-    var bytes = [_]u8{0} ** encoded_bytes;
+    var bytes = @as([encoded_bytes]u8, @splat(0));
     bytes[31] = 1;
     bytes[63] = 3;
     try std.testing.expectError(error.NotOnCurve, fromBytes(&bytes));

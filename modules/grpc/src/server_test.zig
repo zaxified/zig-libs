@@ -105,7 +105,7 @@ fn bidiImpl(s: *M.Stream) anyerror!void {
 
 /// Fails before anything has gone out → a Trailers-Only response.
 fn failImpl(c: *server.Call, req: EchoRequest) anyerror!EchoReply {
-    return c.fail(@enumFromInt(@as(u32, @intCast(req.count))), req.text);
+    return c.fail(@fromBackingInt(@intCast(@as(u32, @intCast(req.count)))), req.text);
 }
 
 /// Sends `count` messages and THEN fails → the status lands in a real
@@ -428,7 +428,7 @@ test "finish: trailing metadata that cannot be written turns the RPC INTERNAL, n
         try runOffline(&peer, &router);
         const r = peer.resp(sid);
         try testing.expectEqualStrings("0", r.trailer("grpc-status").?);
-        try testing.expectEqualStrings("x" ** 8, r.trailer("x-tail").?);
+        try testing.expectEqualStrings(strRepeat("x", 8), r.trailer("x-tail").?);
     }
 
     // The arm that matters: the value cannot fit the copy store, so
@@ -630,7 +630,7 @@ test "server: an error before any message is a Trailers-Only response" {
     const detail = "boom\nline two \xe2\x98\x83 100% done";
     const req = try encodeReq(gpa, .{
         .text = detail,
-        .count = @intFromEnum(status_mod.Status.permission_denied),
+        .count = @backingInt(status_mod.Status.permission_denied),
     });
     defer gpa.free(req);
     const sid = try startCall(&peer, "/echo.Echo/Fail", &.{req});
@@ -1202,4 +1202,16 @@ test "server: every StatusError keeps its own code on the way out" {
     try testing.expectEqual(status_mod.Status.unknown, server.statusForError(error.SomethingElse));
     try testing.expectEqual(status_mod.Status.resource_exhausted, server.statusForError(error.OutOfMemory));
     try testing.expectEqual(status_mod.Status.resource_exhausted, server.statusForError(error.MessageTooLarge));
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

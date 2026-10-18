@@ -99,7 +99,7 @@ fn computeMaskChaCha20Body(hp_key: []const u8, sample: [16]u8) Mask {
     std.debug.assert(hp_key.len == 32);
     const counter = std.mem.readInt(u32, sample[0..4], .little);
     const chacha_nonce: [12]u8 = sample[4..16].*;
-    var keystream: [5]u8 = [_]u8{0} ** 5;
+    var keystream: [5]u8 = @as([5]u8, @splat(0));
     std.crypto.stream.chacha.ChaCha20IETF.stream(&keystream, counter, hp_key[0..32].*, chacha_nonce);
     return keystream;
 }
@@ -261,7 +261,7 @@ const remove_seeds = [_][]const u8{
     fuzzseed.seedHex("00" ++ "ff" ++ "0000000000" ++ "0102030405"), // pn_offset 255, far past the packet: PacketTooShort after the restore
     fuzzseed.seedHex("00" ++ "04" ++ "0000000000" ++ "03000000"), // pn_offset at exactly packet.len: the boundary of `pn_offset > packet.len`
     fuzzseed.seedHex("01" ++ "12" ++ "437b9aec36"), // the script with NO packet: length 0, the first-line refusal, kept on purpose
-    fuzzseed.seedHex("01" ++ "10" ++ "ffffffffff" ++ "ff" ** hp_packet_len), // ⭐ a full-buffer packet of 0xff with an all-ones mask
+    fuzzseed.seedHex("01" ++ "10" ++ "ffffffffff" ++ strRepeat("ff", hp_packet_len)), // ⭐ a full-buffer packet of 0xff with an all-ones mask
 };
 
 test "fuzz: remove never panics on arbitrary packet bytes / offsets / masks" {
@@ -285,7 +285,7 @@ test "corpus: every seed reaches remove, and the pn_len values recovered are pin
     var nonempty: usize = 0;
     var accepted: usize = 0;
     var long_form: usize = 0;
-    var pn_len_seen = [_]bool{false} ** 4;
+    var pn_len_seen = @as([4]bool, @splat(false));
     var pn_octets: usize = 0;
     for (remove_seeds) |sd| {
         var smith: std.testing.Smith = .{ .in = sd };
@@ -356,7 +356,7 @@ test "sanity: App. A.2/A.3 AES-ECB mask matches RFC (std.crypto directly)" {
 test "sanity: App. A.5 ChaCha20 mask matches RFC (std.crypto directly)" {
     const counter = std.mem.readInt(u32, rfc_a5_sample[0..4], .little);
     const chacha_nonce: [12]u8 = rfc_a5_sample[4..16].*;
-    var keystream: [5]u8 = [_]u8{0} ** 5;
+    var keystream: [5]u8 = @as([5]u8, @splat(0));
     std.crypto.stream.chacha.ChaCha20IETF.stream(&keystream, counter, rfc_a5_hp, chacha_nonce);
     try testing.expectEqualSlices(u8, &rfc_a5_mask, &keystream);
 }
@@ -465,4 +465,16 @@ test "apply: pn_offset past the end and a PN running one octet past the end are 
     try testing.expectError(error.PacketTooShort, apply(&pkt, .short, 2, 4, mask)); // needs 6 octets
     try testing.expectEqualSlices(u8, &.{ 0x40, 1, 2, 3, 4 }, &pkt);
     try apply(&pkt, .short, 1, 4, mask); // exactly fits
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

@@ -71,7 +71,7 @@ test "fromScriptPubKey: non-standard scripts are UnsupportedScript" {
         hex("0114" ++ h20), // OP_PUSH1 is not a witness version
         hex("5114" ++ h20 ++ "00"), // push length != remaining bytes
         hex("5101ff"), // 1-byte program
-        hex("6029" ++ ("00" ** 41)), // 41-byte program
+        hex("6029" ++ (strRepeat("00", 41))), // 41-byte program
         hex("004c14" ++ h20), // OP_PUSHDATA1 (non-minimal) form
     };
     for (bad) |s| {
@@ -117,7 +117,7 @@ test "classify: the witness version opcode is exactly OP_0 or OP_1..OP_16" {
 }
 
 test "helpers: a 65-byte key must start with 0x04 (hybrid 06/07 refused)" {
-    var hybrid = [_]u8{0x06} ++ [_]u8{0x11} ** 64;
+    var hybrid = [_]u8{0x06} ++ @as([64]u8, @splat(0x11));
     try testing.expectError(error.InvalidPublicKey, btcaddr.p2pkhOfPublicKey(&hybrid));
     hybrid[0] = 0x07;
     try testing.expectError(error.InvalidPublicKey, btcaddr.p2pkhOfPublicKey(&hybrid));
@@ -145,11 +145,11 @@ test "toScriptPubKey: typed rejection reasons" {
     try testing.expectError(error.ChecksumMismatch, btcaddr.toScriptPubKey("1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMJ"));
     try testing.expectError(error.InvalidChar, btcaddr.toScriptPubKey("1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAM0"));
     var buf: [64]u8 = undefined;
-    const short = try bech32.base58.checkEncode(&([_]u8{0x00} ++ ([_]u8{7} ** 19)), &buf);
+    const short = try bech32.base58.checkEncode(&([_]u8{0x00} ++ (@as([19]u8, @splat(7)))), &buf);
     try testing.expectError(error.InvalidPayloadLength, btcaddr.toScriptPubKey(short));
-    const unk = try bech32.base58.checkEncode(&([_]u8{0x01} ++ ([_]u8{7} ** 20)), &buf);
+    const unk = try bech32.base58.checkEncode(&([_]u8{0x01} ++ (@as([20]u8, @splat(7)))), &buf);
     try testing.expectError(error.UnknownVersionByte, btcaddr.toScriptPubKey(unk));
-    try testing.expectError(error.InvalidPayloadLength, btcaddr.toScriptPubKey("1" ** 180));
+    try testing.expectError(error.InvalidPayloadLength, btcaddr.toScriptPubKey(strRepeat("1", 180)));
     try testing.expectError(error.TooShort, btcaddr.toScriptPubKey("11"));
     // wrong network is its own reason
     const rt = try btcaddr.fromScriptPubKey(hex("0014751e76e8199196d454941c45d1b3a323f1433bd6"), .regtest);
@@ -158,7 +158,7 @@ test "toScriptPubKey: typed rejection reasons" {
 }
 
 test "WIF: typed rejection reasons and well-known key 1" {
-    var one = [_]u8{0} ** 32;
+    var one = @as([32]u8, @splat(0));
     one[31] = 1;
     var wscratch: btcaddr.Wif = undefined;
     var out: [btcaddr.max_wif_len]u8 = undefined;
@@ -172,7 +172,7 @@ test "WIF: typed rejection reasons and well-known key 1" {
     try testing.expect(w.compressed and w.chains.unique() == .mainnet);
     try testing.expectEqualSlices(u8, &one, &w.key);
     w.wipe();
-    try testing.expectEqualSlices(u8, &([_]u8{0} ** 32), &w.key);
+    try testing.expectEqualSlices(u8, &(@as([32]u8, @splat(0))), &w.key);
 
     var buf: [64]u8 = undefined;
     var payload: [35]u8 = undefined;
@@ -203,7 +203,7 @@ test "WIF: typed rejection reasons and well-known key 1" {
     try btcaddr.wifDecode(&ok, try bech32.base58.checkEncode(payload[0..33], &buf));
     ok.wipe();
     try testing.expectError(error.InvalidKey, btcaddr.wifEncode(n, true, .mainnet, &out));
-    try testing.expectError(error.InvalidKey, btcaddr.wifEncode(&([_]u8{0} ** 32), true, .mainnet, &out));
+    try testing.expectError(error.InvalidKey, btcaddr.wifEncode(&(@as([32]u8, @splat(0))), true, .mainnet, &out));
     // checksum
     try testing.expectError(error.ChecksumMismatch, btcaddr.wifDecode(&wscratch, "KwDiBf89QgGbjEhKnhXJuH7LrciVrZi3qYjgd9M7rFU73sVHnoWm"));
     // an address is not a WIF key
@@ -251,7 +251,7 @@ test "helpers: keys, P2SH, P2WSH, P2SH-P2WPKH" {
 }
 
 test "helpers: typed rejections" {
-    const uncompressed = [_]u8{0x04} ++ [_]u8{0x11} ** 64;
+    const uncompressed = [_]u8{0x04} ++ @as([64]u8, @splat(0x11));
     _ = try btcaddr.p2pkhOfPublicKey(&uncompressed);
     try testing.expectError(error.UncompressedPublicKey, btcaddr.p2wpkhOfPublicKey(&uncompressed));
     try testing.expectError(error.UncompressedPublicKey, btcaddr.p2shP2wpkhOfPublicKey(&uncompressed));
@@ -447,4 +447,16 @@ fn fuzzRoundtripSmith(_: void, smith: *testing.Smith) !void {
 
 test "fuzz: roundtrip, exploration" {
     try testing.fuzz({}, fuzzRoundtripSmith, .{});
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

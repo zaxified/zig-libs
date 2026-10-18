@@ -290,7 +290,7 @@ fn DecoderOf(comptime Sink: type) type {
         }
 
         fn readComplexHuffman(self: *Self, alphabet_size: u32, hskip: u32) Error!Table {
-            var cl_lengths = [_]u8{0} ** tables.code_length_codes;
+            var cl_lengths = @as([tables.code_length_codes]u8, @splat(0));
             var space: i32 = 32;
             var num_codes: u32 = 0;
             var i: u32 = hskip;

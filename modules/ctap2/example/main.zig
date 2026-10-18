@@ -61,7 +61,7 @@ const Authenticator = struct {
             };
             const entries = [_]cbor.MapEntry{
                 .{ .key = .{ .uint = 1 }, .value = .{ .array = &.{.{ .text = "FIDO_2_1" }} } },
-                .{ .key = .{ .uint = 3 }, .value = .{ .bytes = &([_]u8{0x11} ** 16) } },
+                .{ .key = .{ .uint = 3 }, .value = .{ .bytes = &(@as([16]u8, @splat(0x11))) } },
                 .{ .key = .{ .uint = 4 }, .value = .{ .map = &opts } },
                 .{ .key = .{ .uint = 6 }, .value = .{ .array = &.{.{ .uint = 2 }} } },
                 .{ .key = .{ .uint = 0x0D }, .value = .{ .uint = 4 } },

@@ -35,12 +35,12 @@ pub fn main() !void {
 
     // Fixed ratchet state + deterministic signing key stand in for a real
     // sender's `OutboundSession.init(io)` draw — see module doc comment.
-    const signing_key = try Ed25519.KeyPair.generateDeterministic([_]u8{0x42} ** 32);
+    const signing_key = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x42)));
     var outbound: megolm.OutboundSession = .{
         .ratchet = undefined,
         .signing_key = signing_key,
     };
-    megolm.Ratchet.init(&([_]u8{0x37} ** megolm.ratchet.ratchet_len), 0, &outbound.ratchet);
+    megolm.Ratchet.init(&(@as([megolm.ratchet.ratchet_len]u8, @splat(0x37))), 0, &outbound.ratchet);
     defer outbound.deinit();
 
     // ── session setup: share the key with the room ────────────────────

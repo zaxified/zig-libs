@@ -386,7 +386,7 @@ const FrameCorpus = struct {
         self.push(try self.framed(allocator, 33, &.{
             .{ .type = 0, .value = &.{} },
             .{ .type = 1, .value = &.{0x08} },
-            .{ .type = 3, .value = &[_]u8{0xAA} ** 32 },
+            .{ .type = 3, .value = &@as([32]u8, @splat(0xAA)) },
             .{ .type = 254, .value = &.{ 1, 2, 3 } },
         }), true);
         // A frame with no extension at all: the whole message is its type.

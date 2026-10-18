@@ -348,7 +348,7 @@ fn challengeGeneration(p1: PublicKey, p2: PublicKey, p3: PublicKey, p4: PublicKe
 /// 32-byte `Edwards25519.scalar.CompressedScalar` for use in scalar-field
 /// arithmetic (`c < 2^128`, always `< q`, so no reduction is needed).
 fn padChallenge(c: [c_len]u8) scalar.CompressedScalar {
-    var out = [_]u8{0} ** 32;
+    var out = @as([32]u8, @splat(0));
     out[0..c_len].* = c;
     return out;
 }

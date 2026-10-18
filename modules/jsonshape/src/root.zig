@@ -1866,9 +1866,9 @@ test "RFC 9535 syntax: what is not well-formed or well-typed selects nothing" {
     try expectNodes(a, "{\"a\\\"b\": 1, \"\\ud83d\\ude00\": 2}", "$[\"a\\\"b\"]", "[1]");
     try expectNodes(a, "{\"\\ud83d\\ude00\": 2}", "$['\\uD83D\\uDE00']", "[2]"); // surrogate pair → U+1F600
     // Expression nesting is bounded: 10 parentheses parse, 40 do not.
-    const p10 = "$.a[?" ++ "(" ** 10 ++ "@ == 1" ++ ")" ** 10 ++ "]";
+    const p10 = "$.a[?" ++ strRepeat("(", 10) ++ "@ == 1" ++ strRepeat(")", 10) ++ "]";
     try expectNodes(a, doc, p10, "[1]");
-    const p40 = "$.a[?" ++ "(" ** 40 ++ "@ == 1" ++ ")" ** 40 ++ "]";
+    const p40 = "$.a[?" ++ strRepeat("(", 40) ++ "@ == 1" ++ strRepeat(")", 40) ++ "]";
     try expectNodes(a, doc, p40, "[]");
 }
 
@@ -1994,4 +1994,16 @@ test "RFC 9535 edges the mutation run asked for, part 2" {
     try testing.expectError(Error.TooManyMatches, shape(a, doc, .{ .path = "$.r[?count($.d[*]) > 0]", .columns = &col, .max_matches = 8 }));
     const ok = try shape(a, doc, .{ .path = "$.r[?count($.d[*]) == 9]", .columns = &col, .max_matches = 9 });
     try testing.expectEqual(@as(usize, 1), ok.rows.len);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

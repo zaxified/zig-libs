@@ -193,7 +193,7 @@ test "h2/h4 are deterministic, tag-domain-separated, and exactly block_bytes wid
     try std.testing.expectEqual(@as(usize, block_bytes), a.len);
     try std.testing.expectEqualSlices(u8, &a, &b); // deterministic
 
-    const sigma = [_]u8{0x42} ** block_bytes;
+    const sigma = @as([block_bytes]u8, @splat(0x42));
     const c = h4(&sigma);
     const d = h4(&sigma);
     try std.testing.expectEqualSlices(u8, &c, &d);
@@ -207,15 +207,15 @@ test "h2/h4 are deterministic, tag-domain-separated, and exactly block_bytes wid
 }
 
 test "h3 is deterministic and produces a canonical (< r) Fr scalar" {
-    const sigma = [_]u8{0x11} ** block_bytes;
-    const msg = [_]u8{0x22} ** block_bytes;
+    const sigma = @as([block_bytes]u8, @splat(0x11));
+    const msg = @as([block_bytes]u8, @splat(0x22));
     const r1 = h3(&sigma, &msg);
     const r2 = h3(&sigma, &msg);
     try std.testing.expect(r1.eql(r2));
     try std.testing.expect(!r1.isZero());
 
     // A different sigma must (overwhelmingly likely) give a different r.
-    const other_sigma = [_]u8{0x99} ** block_bytes;
+    const other_sigma = @as([block_bytes]u8, @splat(0x99));
     const r3 = h3(&other_sigma, &msg);
     try std.testing.expect(!r1.eql(r3));
 }
@@ -223,8 +223,8 @@ test "h3 is deterministic and produces a canonical (< r) Fr scalar" {
 test "h3 is domain-separated from an unrelated SHA-512 use (tag matters)" {
     // Same (sigma, msg) input, but hashed without the tag, must differ
     // (sanity that the tag is actually mixed in, not a no-op).
-    const sigma = [_]u8{0x33} ** block_bytes;
-    const msg = [_]u8{0x44} ** block_bytes;
+    const sigma = @as([block_bytes]u8, @splat(0x33));
+    const msg = @as([block_bytes]u8, @splat(0x44));
     var hasher = Sha512.init(.{});
     hasher.update(&sigma);
     hasher.update(&msg);

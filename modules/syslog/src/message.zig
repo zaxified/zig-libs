@@ -55,7 +55,7 @@ pub const Severity = enum(u3) {
 
 /// The `<PRI>` numeric value: `facility * 8 + severity` (RFC 5424 §6.2.1).
 pub fn priority(f: Facility, s: Severity) u8 {
-    return @as(u8, @intFromEnum(f)) * 8 + @intFromEnum(s);
+    return @as(u8, @backingInt(f)) * 8 + @backingInt(s);
 }
 
 // ── timestamp ───────────────────────────────────────────────────────────────
@@ -410,10 +410,10 @@ test "header fields truncate at RFC 5424 length limits" {
     const msg = Message{
         .facility = .user,
         .severity = .notice,
-        .hostname = "h" ** 300,
-        .app_name = "a" ** 60,
-        .procid = "p" ** 200,
-        .msgid = "m" ** 40,
+        .hostname = strRepeat("h", 300),
+        .app_name = strRepeat("a", 60),
+        .procid = strRepeat("p", 200),
+        .msgid = strRepeat("m", 40),
     };
     var buf: [1024]u8 = undefined;
     const out = try bufPrint(&msg, &buf);
@@ -495,12 +495,12 @@ test "RFC 5424 edges: the first instant past year 9999, an empty field, a 33-byt
     const empty = Message{ .hostname = "" };
     try t.expectEqualStrings("<13>1 - - - - - -", try bufPrint(&empty, &buf));
     // §6.3.2/§6.3.3: SD-NAME = 1*32PRINTUSASCII; a longer SD-ID is cut at 32.
-    const long_id = Message{ .structured_data = &.{.{ .id = "a" ** 33 }} };
-    try t.expectEqualStrings("<13>1 - - - - - [" ++ "a" ** 32 ++ "]", try bufPrint(&long_id, &buf));
+    const long_id = Message{ .structured_data = &.{.{ .id = strRepeat("a", 33) }} };
+    try t.expectEqualStrings("<13>1 - - - - - [" ++ strRepeat("a", 32) ++ "]", try bufPrint(&long_id, &buf));
 }
 
 test "bufPrint reports NoSpaceLeft when the buffer is too small" {
-    const msg = Message{ .facility = .user, .severity = .notice, .msg = "x" ** 100 };
+    const msg = Message{ .facility = .user, .severity = .notice, .msg = strRepeat("x", 100) };
     var tiny: [16]u8 = undefined;
     try t.expectError(error.NoSpaceLeft, bufPrint(&msg, &tiny));
 }
@@ -527,4 +527,16 @@ test "the calendar: leap days, year boundaries and both ends of the range" {
         try writeRfc3339(&w, .{ .unix_ms = c.ms });
         try std.testing.expectEqualStrings(c.want, w.buffered());
     }
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

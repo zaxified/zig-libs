@@ -277,7 +277,7 @@ test "field: differential against wide integer arithmetic" {
     var prng = std.Random.DefaultPrng.init(0x384);
     const r = prng.random();
     const edges = [_]u1152{ 0, 1, 2, PW - 1, PW - 2, (PW + 1) / 2, 1 << 383, (1 << 383) - 1, 1 << 128, (1 << 256) - 1, (1 << 64) - 1, PW - (1 << 32) };
-    const iters: usize = if (@import("builtin").mode == .Debug) 1000 else 3000;
+    const iters: usize = if (@import("builtin").mode == .debug) 1000 else 3000;
     for (0..iters) |i| {
         const a = if (i < edges.len * edges.len) fromU(edges[i % edges.len]) else randFe(r);
         const b = if (i < edges.len * edges.len) fromU(edges[i / edges.len]) else randFe(r);
@@ -381,7 +381,7 @@ test "field: amd64 core == portable product (edges and random)" {
     for (edges) |a| for (edges) |b| {
         try testing.expectEqualSlices(u64, &a.mulPortable(b).limbs, &a.mul(b).limbs);
     };
-    const iters: usize = if (@import("builtin").mode == .Debug) 20_000 else 200_000;
+    const iters: usize = if (@import("builtin").mode == .debug) 20_000 else 200_000;
     for (0..iters) |_| {
         const a = randFe(r);
         const b = randFe(r);

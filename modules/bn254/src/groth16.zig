@@ -437,7 +437,7 @@ test "tampered proof: B on-curve but OUTSIDE the r-subgroup verifies FALSE" {
     // comment's "Trust boundary" section for why the check is still
     // required (EIP-197's own precedent), even though this test alone
     // cannot discriminate its removal.
-    var c1_bytes = [_]u8{0} ** 32;
+    var c1_bytes = @as([32]u8, @splat(0));
     c1_bytes[31] = 1;
     var y_c0_bytes: [32]u8 = undefined;
     _ = try std.fmt.hexToBytes(&y_c0_bytes, "0cf32d3c49a2cb8a092f24ec3201e68dc299b6216e6321ee60573e3a7f596ea8");

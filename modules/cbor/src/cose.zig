@@ -625,7 +625,7 @@ test "COSE_Sign1: round-trip build/parse + Sig_structure shape" {
     const protected = [_]u8{ 0xa1, 0x01, 0x26 }; // {1: -7} — {alg: ES256}, definite map
     const unprotected = [_]MapEntry{};
     const payload = "hello cose";
-    const signature = [_]u8{ 0xde, 0xad, 0xbe, 0xef } ** 4; // 16 bytes, arbitrary
+    const signature = arrRepeat(u8, &.{ 0xde, 0xad, 0xbe, 0xef }, 4); // 16 bytes, arbitrary
 
     const s = Sign1{ .protected = &protected, .unprotected = &unprotected, .payload = payload, .signature = &signature };
     const bytes = try encodeSign1(a, s);
@@ -655,7 +655,7 @@ test "COSE_Sign1: detached payload (nil) round-trips to null" {
     const a = arena.allocator();
     const protected = [_]u8{0xa0}; // {} empty definite map
     const unprotected = [_]MapEntry{};
-    const signature = [_]u8{1} ** 8;
+    const signature = @as([8]u8, @splat(1));
     const s = Sign1{ .protected = &protected, .unprotected = &unprotected, .payload = null, .signature = &signature };
     const bytes = try encodeSign1(a, s);
     const decoded = try cbor.decode(a, bytes, .{});
@@ -669,7 +669,7 @@ test "COSE_Sign1: tag-18-wrapped input parses the same as bare array" {
     const a = arena.allocator();
     const protected = [_]u8{0xa0};
     const unprotected = [_]MapEntry{};
-    const signature = [_]u8{9} ** 4;
+    const signature = @as([4]u8, @splat(9));
     const s = Sign1{ .protected = &protected, .unprotected = &unprotected, .payload = "p", .signature = &signature };
     const bare_bytes = try encodeSign1(a, s);
     const bare_value = try cbor.decode(a, bare_bytes, .{});
@@ -912,8 +912,8 @@ test "a key may not claim another family's algorithm" {
         .{ .key = .{ .uint = @intCast(label_kty) }, .value = .{ .uint = @intCast(kty_ec2) } },
         .{ .key = .{ .uint = @intCast(label_alg) }, .value = Value.fromI64(alg_ml_dsa_44) },
         .{ .key = Value.fromI64(label_crv), .value = Value.fromI64(crv_p256) },
-        .{ .key = Value.fromI64(label_x), .value = .{ .bytes = &[_]u8{0} ** 32 } },
-        .{ .key = Value.fromI64(label_y), .value = .{ .bytes = &[_]u8{0} ** 32 } },
+        .{ .key = Value.fromI64(label_x), .value = .{ .bytes = &@as([32]u8, @splat(0)) } },
+        .{ .key = Value.fromI64(label_y), .value = .{ .bytes = &@as([32]u8, @splat(0)) } },
     };
     try testing.expectError(error.AlgKtyMismatch, parseKey(.{ .map = &ec2_claiming_mldsa }));
 
@@ -921,14 +921,14 @@ test "a key may not claim another family's algorithm" {
         .{ .key = .{ .uint = @intCast(label_kty) }, .value = .{ .uint = @intCast(kty_okp) } },
         .{ .key = .{ .uint = @intCast(label_alg) }, .value = Value.fromI64(alg_ml_dsa_87) },
         .{ .key = Value.fromI64(label_crv), .value = Value.fromI64(crv_ed25519) },
-        .{ .key = Value.fromI64(label_x), .value = .{ .bytes = &[_]u8{0} ** 32 } },
+        .{ .key = Value.fromI64(label_x), .value = .{ .bytes = &@as([32]u8, @splat(0)) } },
     };
     try testing.expectError(error.AlgKtyMismatch, parseKey(.{ .map = &okp_claiming_mldsa }));
 
     const akp_claiming_es256 = [_]MapEntry{
         .{ .key = .{ .uint = @intCast(label_kty) }, .value = .{ .uint = @intCast(kty_akp) } },
         .{ .key = .{ .uint = @intCast(label_alg) }, .value = Value.fromI64(alg_es256) },
-        .{ .key = Value.fromI64(label_pub), .value = .{ .bytes = &[_]u8{0} ** 32 } },
+        .{ .key = Value.fromI64(label_pub), .value = .{ .bytes = &@as([32]u8, @splat(0)) } },
     };
     try testing.expectError(error.AlgKtyMismatch, parseKey(.{ .map = &akp_claiming_es256 }));
 
@@ -938,9 +938,17 @@ test "a key may not claim another family's algorithm" {
         .{ .key = .{ .uint = @intCast(label_kty) }, .value = .{ .uint = @intCast(kty_ec2) } },
         .{ .key = .{ .uint = @intCast(label_alg) }, .value = Value.fromI64(-777) },
         .{ .key = Value.fromI64(label_crv), .value = Value.fromI64(crv_p256) },
-        .{ .key = Value.fromI64(label_x), .value = .{ .bytes = &[_]u8{0} ** 32 } },
-        .{ .key = Value.fromI64(label_y), .value = .{ .bytes = &[_]u8{0} ** 32 } },
+        .{ .key = Value.fromI64(label_x), .value = .{ .bytes = &@as([32]u8, @splat(0)) } },
+        .{ .key = Value.fromI64(label_y), .value = .{ .bytes = &@as([32]u8, @splat(0)) } },
     };
     const k = try parseKey(.{ .map = &ec2_unlisted_alg });
     try testing.expectEqual(@as(?i64, -777), k.ec2.alg);
+}
+
+/// Comptime array repetition; replaces the `**` operator removed in Zig 0.17.
+fn arrRepeat(comptime T: type, comptime unit: []const T, comptime n: usize) [unit.len * n]T {
+    @setEvalBranchQuota(n * unit.len * 2 + 1000);
+    var buf: [unit.len * n]T = undefined;
+    for (0..n) |i| @memcpy(buf[i * unit.len ..][0..unit.len], unit);
+    return buf;
 }

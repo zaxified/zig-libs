@@ -201,12 +201,12 @@ test "an impossible handle is rejected locally, not by the kernel" {
     try testing.expectError(error.InvalidRequest, append(gpa, &list, .{ .bus = "", .dev = "d" }));
     try testing.expectError(error.InvalidRequest, append(gpa, &list, .{ .bus = "pci", .dev = "" }));
     try testing.expectError(error.InvalidRequest, append(gpa, &list, .{
-        .bus = "a" ** (uapi.bus_name_max + 1),
+        .bus = strRepeat("a", uapi.bus_name_max + 1),
         .dev = "d",
     }));
     try testing.expectError(error.InvalidRequest, append(gpa, &list, .{
         .bus = "pci",
-        .dev = "d" ** (uapi.dev_name_max + 1),
+        .dev = strRepeat("d", uapi.dev_name_max + 1),
     }));
     // An embedded NUL would make the kernel see a shorter name than intended.
     try testing.expectError(error.InvalidRequest, append(gpa, &list, .{ .bus = "p\x00i", .dev = "d" }));
@@ -263,7 +263,7 @@ test "parse bounds an over-long name instead of overrunning the buffer" {
     const gpa = testing.allocator;
     var list: std.ArrayList(u8) = .empty;
     defer list.deinit(gpa);
-    try codec.appendAttrString(gpa, &list, uapi.ATTR.DEV_NAME, "d" ** (uapi.dev_name_max + 1));
+    try codec.appendAttrString(gpa, &list, uapi.ATTR.DEV_NAME, strRepeat("d", uapi.dev_name_max + 1));
     try testing.expectError(error.BadLength, parse(list.items));
 
     // A truncated TLV is a typed error too.
@@ -279,4 +279,16 @@ test "Owned formats as the CLI's bus/dev" {
     const s = try std.fmt.allocPrint(gpa, "{f}", .{o});
     defer gpa.free(s);
     try testing.expectEqualStrings("pci/0000:65:00.0", s);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

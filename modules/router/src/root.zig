@@ -129,7 +129,7 @@ pub const max_path_segments = 256;
 /// grows a path — so every `raw` this buffer receives already fits.
 const normalize_buf_len = 2048;
 
-const method_count = @typeInfo(http.Method).@"enum".fields.len;
+const method_count = @typeInfo(http.Method).@"enum".field_names.len;
 
 /// One bit per `http.Method`, used to accumulate the union of methods a
 /// path shape supports across every candidate `matchIn` visits (audit
@@ -151,9 +151,9 @@ fn methodBits(node: *const Node) AllowSet {
 /// shared with the request-time merged Allow (`dispatch`, `.backtrack`).
 fn writeAllow(buf: []u8, bits: AllowSet) []const u8 {
     var w: std.Io.Writer = .fixed(buf);
-    const has_get = bits.isSet(@intFromEnum(http.Method.get));
+    const has_get = bits.isSet(@backingInt(http.Method.get));
     inline for (@typeInfo(http.Method).@"enum".fields, 0..) |f, i| {
-        const m: http.Method = @enumFromInt(f.value);
+        const m: http.Method = @fromBackingInt(@intCast(f.value));
         // `.other` has no token to list: a route for it serves extension
         // methods, which `Allow` cannot name.
         if (m != .other and (bits.isSet(i) or (m == .head and has_get))) {
@@ -1004,7 +1004,7 @@ pub const Router = struct {
                 },
             }
         }
-        const idx = @intFromEnum(method);
+        const idx = @backingInt(method);
         if (node.endpoints[idx] != null) return error.DuplicateRoute;
         node.endpoints[idx] = .{ .handler = h, .chain = chain, .pattern = pattern };
         try r.rebuildAllow(node);
@@ -1050,13 +1050,13 @@ pub const Router = struct {
         // 2026-10; `.other` is never listed).
         var worst: usize = 0;
         for (@typeInfo(http.Method).@"enum".fields) |f| {
-            const m: http.Method = @enumFromInt(f.value);
+            const m: http.Method = @fromBackingInt(@intCast(f.value));
             if (m != .other) worst += m.token().len + 2; // ", " separator; one spare is fine
         }
         if (worst > 64) @compileError(std.fmt.comptimePrint(
             "router: http.Method has grown to {d} members ({d} bytes worst-case " ++
                 "Allow, ', '-joined) -- past rebuildAllow's 64-byte buffer, widen it",
-            .{ @typeInfo(http.Method).@"enum".fields.len, worst },
+            .{ @typeInfo(http.Method).@"enum".field_names.len, worst },
         ));
     }
 
@@ -1431,8 +1431,8 @@ pub const Allow = struct {
     pub const max_len = 64;
 
     pub fn has(a: Allow, m: http.Method) bool {
-        if (a.bits.isSet(@intFromEnum(m))) return true;
-        return m == .head and a.bits.isSet(@intFromEnum(http.Method.get));
+        if (a.bits.isSet(@backingInt(m))) return true;
+        return m == .head and a.bits.isSet(@backingInt(http.Method.get));
     }
 
     /// The header value into `buf` -- the same bytes `Router`'s 405 sends.
@@ -1574,8 +1574,8 @@ const StaticTree = struct {
     }
     inline fn routeFor(t: StaticTree, n: Ref, m: http.Method) ?usize {
         const rs = t.nodes[n].routes;
-        if (rs[@intFromEnum(m)]) |i| return i;
-        if (m == .head) if (rs[@intFromEnum(http.Method.get)]) |i| return i;
+        if (rs[@backingInt(m)]) |i| return i;
+        if (m == .head) if (rs[@backingInt(http.Method.get)]) |i| return i;
         return null;
     }
     inline fn serves(t: StaticTree, n: Ref, m: http.Method) bool {
@@ -1669,7 +1669,7 @@ fn buildStatic(comptime routes: []const StaticRoute) []const StaticNode {
                 }
                 rest = if (kind == .wildcard) null else next;
             }
-            const m = @intFromEnum(rt.method);
+            const m = @backingInt(rt.method);
             if (nodes[node].routes[m]) |prev| @compileError(std.fmt.comptimePrint(
                 "router.Static: route {d} ({s} {s}) duplicates route {d} -- see router.AddError.DuplicateRoute",
                 .{ ri, @tagName(rt.method), rt.pattern, prev },
@@ -2133,8 +2133,8 @@ const Endpoint = struct {
 };
 
 fn endpointFor(node: *const Node, method: http.Method) ?Endpoint {
-    if (node.endpoints[@intFromEnum(method)]) |ep| return ep;
-    if (method == .head) return node.endpoints[@intFromEnum(http.Method.get)];
+    if (node.endpoints[@backingInt(method)]) |ep| return ep;
+    if (method == .head) return node.endpoints[@backingInt(http.Method.get)];
     return null;
 }
 
@@ -3828,7 +3828,7 @@ fn diffOne(comptime routes: []const StaticRoute, comptime prec: MethodPrecedence
     for (0..3000) |_| {
         const path = diffPath(rng, &buf);
         inline for (@typeInfo(http.Method).@"enum".fields) |f| {
-            const m: http.Method = @enumFromInt(f.value);
+            const m: http.Method = @fromBackingInt(@intCast(f.value));
             var ps: Params = .{};
             const got = S.match(m, path, &ps);
 
@@ -4539,8 +4539,8 @@ test "review M2: a group prefix with a capture scopes fallbacks segment by segme
 }
 
 test "review L2/L3: deeper than max_path_segments is refused; Host junk after ] or a non-numeric port routes nowhere" {
-    try testing.expectError(error.InvalidPattern, validatePattern("/a" ** (max_path_segments + 1)));
-    try validatePattern("/a" ** max_path_segments);
+    try testing.expectError(error.InvalidPattern, validatePattern(strRepeat("/a", max_path_segments + 1)));
+    try validatePattern(strRepeat("/a", max_path_segments));
     var ra = Router.init(testing.allocator);
     defer ra.deinit();
     var hr = HostRouter.init(testing.allocator);
@@ -4551,4 +4551,16 @@ test "review L2/L3: deeper than max_path_segments is refused; Host junk after ] 
     try testing.expectEqual(@as(?*Router, null), hr.routerFor("[::1]evil"));
     try testing.expectEqual(@as(?*Router, null), hr.routerFor("a.example.com:xyz"));
     try testing.expectEqual(@as(?*Router, &ra), hr.routerFor("a.example.com:443"));
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

@@ -804,10 +804,10 @@ test "decodeIgnoring: rejected after octets were written, and they are gone" {
     @memset(&out, 0xaa);
     // Two quanta decoded, then a character neither alphabet nor ignored.
     try testing.expectError(error.InvalidCharacter, standard.decodeIgnoring(&out, "QUJDQUJD!", ""));
-    try testing.expectEqualSlices(u8, &(.{0} ** 6), out[0..6]);
+    try testing.expectEqualSlices(u8, &@as([6]u8, @splat(0)), out[0..6]);
     @memset(&out, 0xaa);
     try testing.expectError(error.InvalidCharacter, standard_no_pad.decodeIgnoring(&out, "QUJDQUJD!QUI", ""));
-    try testing.expectEqualSlices(u8, &(.{0} ** 6), out[0..6]);
+    try testing.expectEqualSlices(u8, &@as([6]u8, @splat(0)), out[0..6]);
 }
 
 test "every decoder wipes what it wrote on every error path" {
@@ -815,15 +815,15 @@ test "every decoder wipes what it wrote on every error path" {
     // decodePrefix, stray bits after two decoded quanta.
     @memset(&out, 0xaa);
     try testing.expectError(error.InvalidPadding, standard.decodePrefix(&out, "QUJDQUJ=;", ""));
-    try testing.expectEqualSlices(u8, &(.{0} ** 5), out[0..5]);
+    try testing.expectEqualSlices(u8, &@as([5]u8, @splat(0)), out[0..5]);
     // decodePrefix, missing padding after decoded data.
     @memset(&out, 0xaa);
     try testing.expectError(error.InvalidPadding, standard.decodePrefix(&out, "QUJDQUI;", ""));
-    try testing.expectEqualSlices(u8, &(.{0} ** 5), out[0..5]);
+    try testing.expectEqualSlices(u8, &@as([5]u8, @splat(0)), out[0..5]);
     // NoSpaceLeft after the part that fitted was written.
     @memset(&out, 0xaa);
     try testing.expectError(error.NoSpaceLeft, standard.decodeIgnoring(out[0..4], "QUJDQUJD", ""));
-    try testing.expectEqualSlices(u8, &(.{0} ** 3), out[0..3]);
+    try testing.expectEqualSlices(u8, &@as([3]u8, @splat(0)), out[0..3]);
     try testing.expectEqual(@as(u8, 0xaa), out[3]); // never written
 }
 

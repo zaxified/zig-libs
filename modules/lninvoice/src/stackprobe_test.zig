@@ -166,8 +166,8 @@ var out_req: []u8 = &.{};
 var out_inv: []u8 = &.{};
 var sig_merkle: [64]u8 = undefined;
 
-const payment_hash = [_]u8{0x01} ** 32;
-const payment_secret = [_]u8{0x11} ** 32;
+const payment_hash = @as([32]u8, @splat(0x01));
+const payment_secret = @as([32]u8, @splat(0x11));
 const fields11 = [_]bolt11.TaggedFieldOut{
     .{ .payment_hash = payment_hash },
     .{ .payment_secret = payment_secret },
@@ -187,7 +187,7 @@ const T_CURRENCY = 6;
 const T_AMOUNT = 8;
 const T_PAYER_ID = 88;
 const T_NODE_ID = 176;
-const metadata = [_]u8{0xab} ** 8;
+const metadata = @as([8]u8, @splat(0xab));
 var req_records: [4]lnwire.RawRecord = undefined;
 var inv_records: [3]lnwire.RawRecord = undefined;
 var req_stream: std.ArrayList(u8) = .empty;
@@ -284,7 +284,7 @@ fn needles12(n: *Needles, stream: []const u8, comptime tag: []const u8, sig_r: *
 }
 
 fn skipUnlessOptimized() !void {
-    if (builtin.mode == .Debug or builtin.mode == .ReleaseSafe) return error.SkipZigTest;
+    if (builtin.mode == .debug or builtin.mode == .safe) return error.SkipZigTest;
 }
 
 test "STACKPROBE lninvoice: no key or nonce residue on the dead stack after the signing entry points" {

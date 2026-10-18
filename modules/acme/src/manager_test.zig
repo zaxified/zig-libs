@@ -396,8 +396,8 @@ test "issuers: random policy spreads over issuers (seeded)" {
     f.init(day0 + day);
     defer f.deinit();
     const ok: FakeIssuer.Step = .{ .ok = .{ .chain = chainOf(fx.b1_crt), .key = fx.b1_key } };
-    var x: FakeIssuer = .{ .name = "x", .script = &(.{ok} ** 16) };
-    var y: FakeIssuer = .{ .name = "y", .script = &(.{ok} ** 16) };
+    var x: FakeIssuer = .{ .name = "x", .script = &@as([16]u8, @splat(ok)) };
+    var y: FakeIssuer = .{ .name = "y", .script = &@as([16]u8, @splat(ok)) };
     // Sixteen managers, sixteen seeds: each issuer goes first sometimes, and
     // only the first is asked (it succeeds).
     for (0..16) |seed| {
@@ -1090,7 +1090,7 @@ test "backoff: doubles from one minute for 20 steps then stays; Retry-After only
     var f: Fixture = undefined;
     f.init(day0 + day);
     defer f.deinit();
-    const fails = [_]FakeIssuer.Step{.{ .fail = .{ .problem = "boom" } }} ** 22;
+    const fails = @as([22]FakeIssuer.Step, @splat(.{ .fail = .{ .problem = "boom" } }));
     var fake: FakeIssuer = .{ .script = &fails };
     var o = opts();
     o.max_backoff_s = 4_000_000_000;
@@ -1383,7 +1383,7 @@ test "unmanage: a 253-character name is found" {
     defer f.deinit();
     var m = f.manager(opts());
     defer m.deinit();
-    const long = ("a" ** 63 ++ ".") ** 3 ++ ("a" ** 61);
+    const long = strRepeat((strRepeat("a", 63) ++ "."), 3) ++ (strRepeat("a", 61));
     try testing.expectEqual(@as(usize, 253), long.len);
     try m.manage(&.{long});
     try testing.expect(m.unmanage(long));
@@ -1397,9 +1397,9 @@ test "HTTP-01 edges: HEAD, a 256-character token, host validation, redirect targ
     defer m.deinit();
     const solvers = m.challengeSolvers();
     try solvers[0].present(solvers[0].ctx, &challenge_req);
-    const tok256 = "a" ** 256;
+    const tok256 = strRepeat("a", 256);
     try m.http_tokens.set(tok256, "KA256");
-    try m.http_tokens.set("b" ** 257, "KA257");
+    try m.http_tokens.set(strRepeat("b", 257), "KA257");
     // A value only another node would know (storage), without `distributed_challenges`.
     try f.mem.storage().store("challenges/http-01/stored", "FROMSTORAGE");
 
@@ -1413,7 +1413,7 @@ test "HTTP-01 edges: HEAD, a 256-character token, host validation, redirect targ
     try testing.expect(std.mem.startsWith(u8, head, "HTTP/1.1 200"));
     const t256 = runWire(&r, "GET /.well-known/acme-challenge/" ++ tok256 ++ " HTTP/1.1\r\nHost: a.example\r\nConnection: close\r\n\r\n", &buf);
     try testing.expect(std.mem.endsWith(u8, t256, "KA256"));
-    const t257 = runWire(&r, "GET /.well-known/acme-challenge/" ++ ("b" ** 257) ++ " HTTP/1.1\r\nHost: a.example\r\nConnection: close\r\n\r\n", &buf);
+    const t257 = runWire(&r, "GET /.well-known/acme-challenge/" ++ (strRepeat("b", 257)) ++ " HTTP/1.1\r\nHost: a.example\r\nConnection: close\r\n\r\n", &buf);
     try testing.expect(std.mem.startsWith(u8, t257, "HTTP/1.1 404"));
     const local_only = runWire(&r, "GET /.well-known/acme-challenge/stored HTTP/1.1\r\nHost: a.example\r\nConnection: close\r\n\r\n", &buf);
     try testing.expect(std.mem.startsWith(u8, local_only, "HTTP/1.1 404"));
@@ -1439,7 +1439,7 @@ test "HTTP-01 distributed: a stored key authorization exactly as long as the buf
     defer f.deinit();
     var m = f.manager(.{ .storage = undefined, .distributed_challenges = true });
     defer m.deinit();
-    const v = "k" ** jws.max_key_authorization_len;
+    const v = strRepeat("k", jws.max_key_authorization_len);
     try f.mem.storage().store("challenges/http-01/full", v);
     var r = router.Router.init(testing.allocator);
     defer r.deinit();
@@ -1637,7 +1637,7 @@ test "certificate: malformed names never reach the policy; a 253-character name 
     try m.addIssuer(fake.issuer(false));
     try testing.expectEqual(@as(?Manager.Material, null), try m.certificate(testing.allocator, "bad name.example"));
     try testing.expectEqual(@as(usize, 0), policy.asked);
-    const long = ("a" ** 63 ++ ".") ** 3 ++ ("a" ** 53) ++ ".example";
+    const long = strRepeat((strRepeat("a", 63) ++ "."), 3) ++ (strRepeat("a", 53)) ++ ".example";
     try testing.expectEqual(@as(usize, 253), long.len);
     try testing.expectEqual(@as(?Manager.Material, null), try m.certificate(testing.allocator, long));
     try testing.expectEqual(@as(usize, 1), policy.asked); // asked: the name was not too long
@@ -1645,4 +1645,16 @@ test "certificate: malformed names never reach the policy; a 253-character name 
     try m.tls_alpn.set(long, "der", "pem");
     var mat = (try m.tlsAlpnMaterial(testing.allocator, long)).?;
     mat.deinit(testing.allocator);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

@@ -210,7 +210,7 @@ test "strict: deterministic decoding, case by case from RFC 8949 §4.2.1" {
     const det: cbor.DecodeOptions = .{ .deterministic = true };
     const ok = [_][]const u8{
         "17", "1818", "18ff", "190100", "19ffff", "1a00010000", "1b0000000100000000",
-        "37",           "3818",                   "5818" ++ "00" ** 24, // a 24-byte string needs the 1-byte length
+        "37",           "3818",                   "5818" ++ strRepeat("00", 24), // a 24-byte string needs the 1-byte length
         "f93e00",       "fb3ff199999999999a",     "f97e00",
         "f90001",       "f97c00",                 "f98000",
         "fa47c35000",
@@ -374,9 +374,9 @@ test "reader: incremental — a token cut short waits for more input" {
 test "reader: skipValue gives decode's verdict on hostile inputs" {
     const a = testing.allocator;
     const cases = [_][]const u8{
-        "",                 "18",               "1c",       "1f",                 "ff",   "f818",   "5f01ff", "5f5fff", "7f4100ff", "61ff", "7f61ff",
-        "82",               "8201",             "9f01",     "a1",                 "a101", "bf01ff", "c1",     "5f41",   "5f4200",   "5f1c", "5f19",
-        "81" ** 70 ++ "01", "c1" ** 70 ++ "01", "5f4101ff", "a26161016162820203",
+        "",                          "18",                        "1c",       "1f",                 "ff",   "f818",   "5f01ff", "5f5fff", "7f4100ff", "61ff", "7f61ff",
+        "82",                        "8201",                      "9f01",     "a1",                 "a101", "bf01ff", "c1",     "5f41",   "5f4200",   "5f1c", "5f19",
+        strRepeat("81", 70) ++ "01", strRepeat("c1", 70) ++ "01", "5f4101ff", "a26161016162820203",
     };
     for (cases) |h| {
         const bytes = try unhexAlloc(a, h);
@@ -684,4 +684,16 @@ test "typed: the allocation cap stops a small input from becoming a huge T" {
     try testing.expectEqual(@as(usize, 100), p.value.len);
     // A count times a size that overflows usize is refused, not wrapped.
     try testing.expectError(error.TooLarge, cbor.typed.decode([]const Fat, a, &input, .{ .max_alloc_bytes = 0 }));
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

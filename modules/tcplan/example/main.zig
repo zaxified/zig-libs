@@ -28,7 +28,7 @@ const subscribers = [_]tcplan.Node{
         // steer into her one HTB class, so they share her 100/500 Mbit.
         .match = &.{
             .{ .ipv4 = .{ .addr = .{ 100, 64, 0, 1 } } },
-            .{ .ipv6 = .{ .addr = .{ 0x20, 0x01, 0x0d, 0xb8, 0x00, 0x01 } ++ [_]u8{0} ** 10, .prefix_len = 56 } },
+            .{ .ipv6 = .{ .addr = .{ 0x20, 0x01, 0x0d, 0xb8, 0x00, 0x01 } ++ @as([10]u8, @splat(0)), .prefix_len = 56 } },
         },
         // Served before bob when there is spare bandwidth to lend.
         .htb = .{ .prio = 1 },

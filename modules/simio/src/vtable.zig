@@ -580,7 +580,7 @@ fn netLookupInner(
         n = 1;
     } else |_| {
         const v4: [4]u8, const v6: [16]u8 = if (std.ascii.eqlIgnoreCase(name, "localhost") or std.ascii.eqlIgnoreCase(name, "localhost."))
-            .{ .{ 127, 0, 0, 1 }, .{0} ** 15 ++ .{1} }
+            .{ .{ 127, 0, 0, 1 }, @as([15]u8, @splat(0)) ++ [_]u8{1} }
         else if (h.sim.hostByName(name)) |target|
             .{ target.ip4, target.ip6 }
         else

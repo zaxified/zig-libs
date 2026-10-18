@@ -46,7 +46,7 @@ pub fn main() !void {
     // metadata pinned ahead of time — never learned from an incoming
     // <KeyInfo>. A placeholder here since no signature is ever reached in
     // the rejection paths below.
-    const idp_key: saml.VerifyKey = .{ .ecdsa_p256_sec1 = &([_]u8{0} ** 33) };
+    const idp_key: saml.VerifyKey = .{ .ecdsa_p256_sec1 = &(@as([33]u8, @splat(0))) };
 
     const config: saml.Config = .{
         .idp_entity_id = "https://idp.example.org/saml",

@@ -495,13 +495,13 @@ pub const Client = struct {
     }
 
     fn send(self: *const Client, arena: Allocator, params: *const Params) ClientPinError!framing.Response {
-        return framing.call(arena, self.transport, @intFromEnum(framing.Command.client_pin), params.value(), self.max_response);
+        return framing.call(arena, self.transport, @backingInt(framing.Command.client_pin), params.value(), self.max_response);
     }
 
     fn begin(self: *const Client, sub: SubCommand) Params {
         var p: Params = .{};
-        p.put(0x01, .{ .uint = @intFromEnum(self.protocol) });
-        p.put(0x02, .{ .uint = @intFromEnum(sub) });
+        p.put(0x01, .{ .uint = @backingInt(self.protocol) });
+        p.put(0x02, .{ .uint = @backingInt(sub) });
         return p;
     }
 
@@ -704,15 +704,15 @@ test "validateNewPin: minPINLength above 4 is honoured, below 4 is not" {
 }
 
 test "validateNewPin: 63 vs 64 bytes" {
-    const p63 = "a" ** 63;
-    const p64 = "a" ** 64;
+    const p63 = strRepeat("a", 63);
+    const p64 = strRepeat("a", 64);
     try validateNewPin(p63, 4);
     try testing.expectError(error.PinTooLong, validateNewPin(p64, 4));
     // 21 * 3 = 63 bytes of euro signs, 22 * 3 = 66.
-    try validateNewPin("\u{20ac}" ** 21, 4);
-    try testing.expectError(error.PinTooLong, validateNewPin("\u{20ac}" ** 22, 4));
+    try validateNewPin(strRepeat("\u{20ac}", 21), 4);
+    try testing.expectError(error.PinTooLong, validateNewPin(strRepeat("\u{20ac}", 22), 4));
     // 62 ASCII bytes + one 2-byte code point = 64 bytes although only 63 code points.
-    try testing.expectError(error.PinTooLong, validateNewPin(("a" ** 62) ++ "\u{e4}", 4));
+    try testing.expectError(error.PinTooLong, validateNewPin((strRepeat("a", 62)) ++ "\u{e4}", 4));
 }
 
 test "validateNewPin: invalid UTF-8 is rejected" {
@@ -724,8 +724,8 @@ test "validateNewPin: invalid UTF-8 is rejected" {
 test "validateCurrentPin: only the 63-byte cap applies" {
     try validateCurrentPin("");
     try validateCurrentPin("1");
-    try validateCurrentPin("a" ** 63);
-    try testing.expectError(error.PinTooLong, validateCurrentPin("a" ** 64));
+    try validateCurrentPin(strRepeat("a", 63));
+    try testing.expectError(error.PinTooLong, validateCurrentPin(strRepeat("a", 64)));
 }
 
 test "padPin and pinHash" {
@@ -733,7 +733,7 @@ test "padPin and pinHash" {
     try testing.expectEqual(@as(usize, 64), p.len);
     try testing.expectEqualSlices(u8, "1234", p[0..4]);
     for (p[4..]) |b| try testing.expectEqual(@as(u8, 0), b);
-    const full = padPin("a" ** 63);
+    const full = padPin(strRepeat("a", 63));
     try testing.expectEqual(@as(u8, 0), full[63]); // always at least one padding byte
     // SHA-256("1234") starts 03ac674216f3e15c761ee1a5e255f067 (same value ctap2pin's vectors use).
     try testing.expectEqualSlices(u8, &.{ 0x03, 0xac, 0x67, 0x42, 0x16, 0xf3, 0xe1, 0x5c, 0x76, 0x1e, 0xe1, 0xa5, 0xe2, 0x55, 0xf0, 0x67 }, &pinHash("1234"));
@@ -747,4 +747,16 @@ test "Permissions bit values" {
     try testing.expectEqual(@as(u8, 0x10), (Permissions{ .lbw = true }).toInt());
     try testing.expectEqual(@as(u8, 0x20), (Permissions{ .acfg = true }).toInt());
     try testing.expectEqual(@as(u8, 0x3f), (Permissions{ .mc = true, .ga = true, .cm = true, .be = true, .lbw = true, .acfg = true }).toInt());
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

@@ -153,12 +153,12 @@ pub const ReasonCode = enum(u8) {
 
     /// Codes of 0x80 and above report a failure (spec 2.4).
     pub fn isError(rc: ReasonCode) bool {
-        return @intFromEnum(rc) >= 0x80;
+        return @backingInt(rc) >= 0x80;
     }
 
     /// The SUBACK code granting `qos`.
     pub fn granted(qos: QoS) ReasonCode {
-        return @enumFromInt(@intFromEnum(qos));
+        return @fromBackingInt(@intCast(@backingInt(qos)));
     }
 };
 
@@ -326,7 +326,7 @@ pub const PropertyContext = enum { connect, connack, publish, will, puback, pubr
 
 fn idMask(comptime ids: []const PropertyId) u64 {
     var m: u64 = 0;
-    for (ids) |id| m |= @as(u64, 1) << @as(u6, @intCast(@intFromEnum(id)));
+    for (ids) |id| m |= @as(u64, 1) << @as(u6, @intCast(@backingInt(id)));
     return m;
 }
 
@@ -345,7 +345,7 @@ fn allowedMask(ctx: PropertyContext) u64 {
 }
 
 fn idAllowed(ctx: PropertyContext, id: PropertyId) bool {
-    return allowedMask(ctx) & (@as(u64, 1) << @as(u6, @intCast(@intFromEnum(id)))) != 0;
+    return allowedMask(ctx) & (@as(u64, 1) << @as(u6, @intCast(@backingInt(id)))) != 0;
 }
 
 /// Payload Format Indicator values (5.0 spec 3.3.2.3.2).
@@ -390,7 +390,7 @@ pub const UserProperties = struct {
 
         pub fn next(it: *Iterator) ?UserProperty {
             while (it.raw.next()) |e| {
-                if (e.id == @intFromEnum(PropertyId.user_property)) return .{ .name = e.a, .value = e.b };
+                if (e.id == @backingInt(PropertyId.user_property)) return .{ .name = e.a, .value = e.b };
             }
             if (it.i >= it.items.len) return null;
             it.i += 1;
@@ -433,7 +433,7 @@ pub const SubscriptionIds = struct {
 
         pub fn next(it: *Iterator) ?u32 {
             while (it.raw.next()) |e| {
-                if (e.id == @intFromEnum(PropertyId.subscription_identifier)) return e.int;
+                if (e.id == @backingInt(PropertyId.subscription_identifier)) return e.int;
             }
             if (it.i >= it.items.len) return null;
             it.i += 1;
@@ -522,7 +522,7 @@ const RawIterator = struct {
         const raw_id = try r.varint();
         if (raw_id > 0x7F) return error.MalformedPacket;
         const id = std.enums.fromInt(PropertyId, raw_id) orelse return error.MalformedPacket;
-        var e = RawEntry{ .id = @intFromEnum(id) };
+        var e = RawEntry{ .id = @backingInt(id) };
         switch (id) {
             .payload_format_indicator, .request_problem_information, .request_response_information, .maximum_qos, .retain_available, .wildcard_subscription_available, .subscription_identifier_available, .shared_subscription_available => e.int = try r.byte(),
             .server_keep_alive, .receive_maximum, .topic_alias_maximum, .topic_alias => e.int = try r.u16be(),
@@ -562,7 +562,7 @@ fn decodeBlock(block: []const u8, ctx: PropertyContext) DecodeError!Properties {
     var seen: u64 = 0;
     var br = BodyReader{ .rest = block };
     while (try RawIterator.readEntry(&br)) |e| {
-        const id: PropertyId = @enumFromInt(e.id);
+        const id: PropertyId = @fromBackingInt(@intCast(e.id));
         // An identifier the packet type may not carry: Malformed (2.2.2.2).
         if (!idAllowed(ctx, id)) return error.MalformedPacket;
         const bit = @as(u64, 1) << @intCast(e.id);
@@ -660,12 +660,12 @@ fn writePropertyEntries(cur: *Cursor, p: Properties, ctx: PropertyContext) Encod
     const W = struct {
         fn head(c: *Cursor, x: PropertyContext, id: PropertyId) EncodeError!void {
             if (!idAllowed(x, id)) return error.InvalidProperty;
-            try c.byte(@intFromEnum(id));
+            try c.byte(@backingInt(id));
         }
     };
     if (p.payload_format) |v| {
         try W.head(cur, ctx, .payload_format_indicator);
-        try cur.byte(@intFromEnum(v));
+        try cur.byte(@backingInt(v));
     }
     if (p.message_expiry_interval) |v| {
         try W.head(cur, ctx, .message_expiry_interval);
@@ -757,7 +757,7 @@ fn writePropertyEntries(cur: *Cursor, p: Properties, ctx: PropertyContext) Encod
     if (p.maximum_qos) |v| {
         if (v == .exactly_once) return error.InvalidProperty;
         try W.head(cur, ctx, .maximum_qos);
-        try cur.byte(@intFromEnum(v));
+        try cur.byte(@backingInt(v));
     }
     if (p.retain_available) |v| {
         try W.head(cur, ctx, .retain_available);
@@ -875,10 +875,10 @@ pub const Subscription = struct {
     retain_handling: RetainHandling = .send_on_subscribe,
 
     fn optionsByte(s: Subscription) u8 {
-        var b: u8 = @intFromEnum(s.qos);
+        var b: u8 = @backingInt(s.qos);
         if (s.no_local) b |= 0x04;
         if (s.retain_as_published) b |= 0x08;
-        b |= @as(u8, @intFromEnum(s.retain_handling)) << 4;
+        b |= @as(u8, @backingInt(s.retain_handling)) << 4;
         return b;
     }
 
@@ -926,10 +926,10 @@ pub const Subscribe = struct {
             if (q > 2 or rh > 2 or opts & 0xC0 != 0) return null;
             return .{
                 .filter = filter,
-                .qos = @enumFromInt(@as(u2, @intCast(q))),
+                .qos = @fromBackingInt(@intCast(@as(u2, @intCast(q)))),
                 .no_local = opts & 0x04 != 0,
                 .retain_as_published = opts & 0x08 != 0,
-                .retain_handling = @enumFromInt(@as(u2, @intCast(rh))),
+                .retain_handling = @fromBackingInt(@intCast(@as(u2, @intCast(rh)))),
             };
         }
     };
@@ -1132,7 +1132,7 @@ const Cursor = struct {
     }
 
     fn fixedHeader(c: *Cursor, t: PacketType, flags: u4, remaining: u32) EncodeError!void {
-        try c.byte(@as(u8, @intFromEnum(t)) << 4 | flags);
+        try c.byte(@as(u8, @backingInt(t)) << 4 | flags);
         try c.varint(remaining);
     }
 
@@ -1150,7 +1150,7 @@ fn checkedRemaining(remaining: u64) EncodeError!u32 {
 fn fixedFlags(p: Packet) u4 {
     return switch (p) {
         .publish => |x| blk: {
-            var flags: u4 = @as(u4, @intFromEnum(x.qos)) << 1;
+            var flags: u4 = @as(u4, @backingInt(x.qos)) << 1;
             if (x.dup and x.qos != .at_most_once) flags |= 0x8;
             if (x.retain) flags |= 0x1;
             break :blk flags;
@@ -1207,12 +1207,12 @@ fn writeBody(cur: *Cursor, version: Version, p: Packet) EncodeError!void {
         .connack => |c| {
             try cur.byte(if (c.session_present) 1 else 0);
             if (v5) {
-                if (!reasonAllowed(.connack, @intFromEnum(c.reason_code))) return error.InvalidReasonCode;
-                try cur.byte(@intFromEnum(c.reason_code));
+                if (!reasonAllowed(.connack, @backingInt(c.reason_code))) return error.InvalidReasonCode;
+                try cur.byte(@backingInt(c.reason_code));
                 try writeProperties(cur, c.properties, .connack);
             } else {
                 if (!c.properties.isEmpty()) return error.UnsupportedInVersion;
-                try cur.byte(@intFromEnum(c.return_code));
+                try cur.byte(@backingInt(c.return_code));
             }
         },
         .publish => |x| {
@@ -1291,12 +1291,12 @@ fn writeConnect(cur: *Cursor, c: Connect) EncodeError!void {
         if (c.will) |w| if (!w.properties.isEmpty()) return error.UnsupportedInVersion;
     }
     try cur.lenPrefixed(protocol_name);
-    try cur.byte(@intFromEnum(c.version));
+    try cur.byte(@backingInt(c.version));
 
     var flags: u8 = 0;
     if (c.clean_session) flags |= 0x02;
     if (c.will) |w| {
-        flags |= 0x04 | @as(u8, @intFromEnum(w.qos)) << 3;
+        flags |= 0x04 | @as(u8, @backingInt(w.qos)) << 3;
         if (w.retain) flags |= 0x20;
     }
     if (c.username != null) flags |= 0x80;
@@ -1323,13 +1323,13 @@ fn writeAck(cur: *Cursor, v5: bool, a: Ack, comptime ctx: PropertyContext) Encod
         return;
     }
     const rctx: ReasonContext = @field(ReasonContext, @tagName(ctx));
-    if (!reasonAllowed(rctx, @intFromEnum(a.reason_code))) return error.InvalidReasonCode;
+    if (!reasonAllowed(rctx, @backingInt(a.reason_code))) return error.InvalidReasonCode;
     // Short forms (3.4.2.1): reason and property length may be omitted.
     if (a.properties.isEmpty()) {
-        if (a.reason_code != .success) try cur.byte(@intFromEnum(a.reason_code));
+        if (a.reason_code != .success) try cur.byte(@backingInt(a.reason_code));
         return;
     }
-    try cur.byte(@intFromEnum(a.reason_code));
+    try cur.byte(@backingInt(a.reason_code));
     try writeProperties(cur, a.properties, ctx);
 }
 
@@ -1340,12 +1340,12 @@ fn writeReasonOnly(cur: *Cursor, v5: bool, rc: ReasonCode, props: Properties, co
         if (rc != .success or !props.isEmpty()) return error.UnsupportedInVersion;
         return;
     }
-    if (!reasonAllowed(@field(ReasonContext, @tagName(ctx)), @intFromEnum(rc))) return error.InvalidReasonCode;
+    if (!reasonAllowed(@field(ReasonContext, @tagName(ctx)), @backingInt(rc))) return error.InvalidReasonCode;
     if (props.isEmpty()) {
-        if (rc != .success) try cur.byte(@intFromEnum(rc));
+        if (rc != .success) try cur.byte(@backingInt(rc));
         return;
     }
-    try cur.byte(@intFromEnum(rc));
+    try cur.byte(@backingInt(rc));
     try writeProperties(cur, props, ctx);
 }
 
@@ -1536,7 +1536,7 @@ pub fn decodePacket(bytes: []const u8, version: Version) DecodeError!?Decoded {
     const type_raw: u8 = b0 >> 4;
     const max_type: u8 = if (version == .v5) 15 else 14;
     if (type_raw < 1 or type_raw > max_type) return error.UnknownPacketType;
-    const ptype: PacketType = @enumFromInt(type_raw);
+    const ptype: PacketType = @fromBackingInt(@intCast(type_raw));
     const flags: u4 = @truncate(b0);
 
     const rl = try decodeRemainingLength(bytes[1..]) orelse return null;
@@ -1565,7 +1565,7 @@ fn decodeBody(version: Version, ptype: PacketType, flags: u4, body: []const u8) 
             const rc = try r.byte();
             if (v5) {
                 if (!reasonAllowed(.connack, rc)) return error.MalformedPacket;
-                const reason: ReasonCode = @enumFromInt(rc);
+                const reason: ReasonCode = @fromBackingInt(@intCast(rc));
                 const props = try decodeProperties(&r, .connack);
                 try r.expectEmpty();
                 return .{ .connack = .{
@@ -1577,7 +1577,7 @@ fn decodeBody(version: Version, ptype: PacketType, flags: u4, body: []const u8) 
             }
             if (rc > 5) return error.MalformedPacket;
             try r.expectEmpty();
-            const code: ConnectReturnCode = @enumFromInt(rc);
+            const code: ConnectReturnCode = @fromBackingInt(@intCast(rc));
             return .{ .connack = .{
                 .session_present = ack_flags & 0x1 != 0,
                 .return_code = code,
@@ -1682,7 +1682,7 @@ fn decodeAck(r: *BodyReader, v5: bool, comptime ctx: PropertyContext) DecodeErro
     // Remaining length 3: no Property Length, none.
     const props: Properties = if (r.rest.len == 0) .{} else try decodeProperties(r, ctx);
     try r.expectEmpty();
-    return .{ .packet_id = id, .reason_code = @enumFromInt(rc), .properties = props };
+    return .{ .packet_id = id, .reason_code = @fromBackingInt(@intCast(rc)), .properties = props };
 }
 
 fn decodeReasonOnly(r: *BodyReader, comptime ctx: PropertyContext) DecodeError!struct { code: ReasonCode, props: Properties } {
@@ -1691,7 +1691,7 @@ fn decodeReasonOnly(r: *BodyReader, comptime ctx: PropertyContext) DecodeError!s
     if (!reasonAllowed(@field(ReasonContext, @tagName(ctx)), rc)) return error.MalformedPacket;
     const props: Properties = if (r.rest.len == 0) .{} else try decodeProperties(r, ctx);
     try r.expectEmpty();
-    return .{ .code = @enumFromInt(rc), .props = props };
+    return .{ .code = @fromBackingInt(@intCast(rc)), .props = props };
 }
 
 fn decodeConnect(r: *BodyReader, version: Version) DecodeError!Connect {
@@ -1734,7 +1734,7 @@ fn decodeConnect(r: *BodyReader, version: Version) DecodeError!Connect {
         will = .{
             .topic = topic,
             .message = try r.lenPrefixed(),
-            .qos = @enumFromInt(@as(u2, @intCast(will_qos_raw))),
+            .qos = @fromBackingInt(@intCast(@as(u2, @intCast(will_qos_raw)))),
             .retain = will_retain,
             .properties = will_props,
         };
@@ -1758,7 +1758,7 @@ fn decodeConnect(r: *BodyReader, version: Version) DecodeError!Connect {
 fn decodePublish(r: *BodyReader, flags: u4, v5: bool) DecodeError!Publish {
     const qos_raw: u8 = (@as(u8, flags) >> 1) & 0x3;
     if (qos_raw == 3) return error.InvalidQos;
-    const qos: QoS = @enumFromInt(@as(u2, @intCast(qos_raw)));
+    const qos: QoS = @fromBackingInt(@intCast(@as(u2, @intCast(qos_raw))));
     const dup = flags & 0x8 != 0;
     const retain = flags & 0x1 != 0;
     if (dup and qos == .at_most_once) return error.MalformedPacket; // spec 3.3.1-2
@@ -2281,7 +2281,7 @@ const StreamCorpus = struct {
         self.pushHex("20020200"); // MalformedPacket: reserved bits in the CONNACK flags
         self.pushHex("82020007"); // ProtocolViolation: SUBSCRIBE with no filters
         self.pushHex("30050002FFFE41"); // InvalidUtf8: a PUBLISH topic that is not UTF-8
-        self.pushHex("00" ** 256); // a full buffer of zeroes
+        self.pushHex(strRepeat("00", 256)); // a full buffer of zeroes
 
         return self.entries[0..self.n];
     }
@@ -2834,7 +2834,7 @@ test "v5 decode errors map to the reason code §4.13 answers with" {
     try testing.expectEqual(ReasonCode.unsupported_protocol_version, reasonForDecodeError(error.UnsupportedProtocol));
     // 3.1.1 return codes and 5.0 reason codes map onto each other where they can.
     inline for (@typeInfo(ConnectReturnCode).@"enum".fields) |f| {
-        const rc: ConnectReturnCode = @enumFromInt(f.value);
+        const rc: ConnectReturnCode = @fromBackingInt(@intCast(f.value));
         try testing.expectEqual(rc, returnCodeFromReason(reasonFromReturnCode(rc)));
     }
     try testing.expectEqual(ConnectReturnCode.server_unavailable, returnCodeFromReason(.quota_exceeded));
@@ -3016,10 +3016,10 @@ test "corpus v5: every seed reaches decodePacket, and the packets walked are pin
 const fuzz_driver = testkit.fuzz.driver;
 
 const FuzzLabel = enum { rejected, need_more, decoded };
-var fuzz_reach: [@typeInfo(FuzzLabel).@"enum".fields.len]usize = @splat(0);
+var fuzz_reach: [@typeInfo(FuzzLabel).@"enum".field_names.len]usize = @splat(0);
 
 fn fuzz_mark(comptime l: FuzzLabel) void {
-    fuzz_reach[@intFromEnum(l)] += 1;
+    fuzz_reach[@backingInt(l)] += 1;
     fuzz_driver.hit(@tagName(l));
 }
 
@@ -3117,7 +3117,19 @@ test "fuzz harness: 400 seeds in every test run, and they get everywhere" {
         }
     }
     for (fuzz_reach, 0..) |n, i| if (n == 0) {
-        std.debug.print("reach: label {t} never hit in 400 seeds\n", .{@as(FuzzLabel, @enumFromInt(i))});
+        std.debug.print("reach: label {t} never hit in 400 seeds\n", .{@as(FuzzLabel, @fromBackingInt(@intCast(i)))});
         return error.HarnessDoesNotReach;
     };
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

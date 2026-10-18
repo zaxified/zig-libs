@@ -274,7 +274,7 @@ test "Conn: a frame bigger than the reader's buffer is refused with 1009, not a 
     const gpa = testing.allocator;
     var wire: std.Io.Writer.Allocating = .init(gpa);
     defer wire.deinit();
-    try frame.writeFrame(&wire.writer, .{ .opcode = .binary, .payload = &([_]u8{7} ** 100), .mask_key = .{ 1, 2, 3, 4 } });
+    try frame.writeFrame(&wire.writer, .{ .opcode = .binary, .payload = &(@as([100]u8, @splat(7))), .mask_key = .{ 1, 2, 3, 4 } });
     var src = pipe(&wire);
     var small: [32]u8 = undefined;
     var in: std.Io.Reader = .{ .vtable = &.{ .stream = trickle }, .buffer = &small, .seek = 0, .end = 0 };
@@ -303,7 +303,7 @@ test "Conn: permessage-deflate both ways, small messages stay uncompressed" {
     var none: std.Io.Reader = .fixed("");
     var cmsg: [4096]u8 = undefined;
     var client: Conn = .init(.client, &none, &c_out.writer, &cmsg, .{ .mask_random = prng.random(), .deflate = d });
-    const big = "{\"k\":\"value\",\"n\":12345}" ** 64;
+    const big = strRepeat("{\"k\":\"value\",\"n\":12345}", 64);
     try client.writeMessage(.text, big);
     try client.writeMessage(.text, "short");
     const wire = c_out.written();
@@ -317,4 +317,16 @@ test "Conn: permessage-deflate both ways, small messages stay uncompressed" {
     var server: Conn = .init(.server, &in, &out.writer, &smsg, .{ .deflate = d });
     try testing.expectEqualStrings(big, (try server.readMessage()).payload);
     try testing.expectEqualStrings("short", (try server.readMessage()).payload);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

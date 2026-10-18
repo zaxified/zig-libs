@@ -234,7 +234,7 @@ fn expandMessageXmd48(msg_parts: []const []const u8, dst: []const u8) [48]u8 {
     dst_prime_buf[dst.len] = @intCast(dst.len);
     const dst_prime = dst_prime_buf[0 .. dst.len + 1];
 
-    const z_pad = [_]u8{0} ** 64; // s_in_bytes for SHA-256
+    const z_pad = @as([64]u8, @splat(0)); // s_in_bytes for SHA-256
     const l_i_b_str = [_]u8{ 0x00, 0x30 }; // I2OSP(48, 2)
 
     var hasher0 = std.crypto.hash.sha2.Sha256.init(.{});
@@ -403,7 +403,7 @@ pub const Identifier = struct {
     /// `[1, 65535]`. Rejects `i == 0` (RFC 9591 §3.1's `NonZeroScalar`).
     pub fn fromU16(i: u16) IdentifierError!Identifier {
         if (i == 0) return error.InvalidIdentifier;
-        var bytes = [_]u8{0} ** Ns;
+        var bytes = @as([Ns]u8, @splat(0));
         std.mem.writeInt(u16, bytes[Ns - 2 .. Ns], i, .big);
         return .{ .bytes = bytes };
     }
@@ -1499,7 +1499,7 @@ test "encoded_length constants match RFC 9591 §6.5's Ne=33/Ns=32" {
 }
 
 fn testScalarOf(v: u32) Scalar {
-    var buf: [Ns]u8 = [_]u8{0} ** Ns;
+    var buf: [Ns]u8 = @as([Ns]u8, @splat(0));
     std.mem.writeInt(u32, buf[Ns - 4 .. Ns], v, .big);
     return Scalar.fromBytes(buf, .big) catch unreachable;
 }
@@ -1513,12 +1513,12 @@ test "SigningNonces/SigningShare/ParticipantShare.deinit zero their secret scala
 
     var share = SigningShare.fromScalar(testScalarOf(33));
     share.deinit();
-    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** Ns), &share.bytes);
+    try std.testing.expectEqualSlices(u8, &(@as([Ns]u8, @splat(0))), &share.bytes);
 
     const id = try Identifier.fromU16(7);
     var pshare = ParticipantShare{ .identifier = id, .signing_share = SigningShare.fromScalar(testScalarOf(44)) };
     pshare.deinit();
-    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** Ns), &pshare.signing_share.bytes);
+    try std.testing.expectEqualSlices(u8, &(@as([Ns]u8, @splat(0))), &pshare.signing_share.bytes);
     try std.testing.expectEqual(id, pshare.identifier); // public field untouched
 }
 
@@ -1533,7 +1533,7 @@ test "Element.fromBytes rejects the identity element" {
     // fromSec1 would map to Secp256k1.identityElement), so this is
     // exercised indirectly: any structurally-invalid all-zero input is
     // rejected too.
-    try std.testing.expectError(error.InvalidElement, Element.fromBytes([_]u8{0} ** 33));
+    try std.testing.expectError(error.InvalidElement, Element.fromBytes(@as([33]u8, @splat(0))));
 }
 
 test "deriveInterpolatingValue rejects x_i absent from participant_list" {

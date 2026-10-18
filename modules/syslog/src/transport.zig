@@ -165,7 +165,7 @@ test "buildDatagram: a budget shorter than the marker keeps only the marker's he
     // budget. Mutation 2026-10-04: an unclamped marker survived (it
     // underflows `limit - mlen`).
     var scratch: [scratch_len]u8 = undefined;
-    const msg = Message{ .msg = "A" ** 100 };
+    const msg = Message{ .msg = strRepeat("A", 100) };
     const dg = buildDatagram(&msg, &scratch, .{ .udp_limit = 4 });
     try std.testing.expectEqualStrings("...[", dg);
 }
@@ -177,18 +177,18 @@ test "buildDatagram marks a message that overflows the scratch buffer itself" {
     // used to come back exactly `scratch.len` bytes and unmarked, because
     // only `bytes.len > limit` was checked (audit 2026-10-04).
     var scratch: [64]u8 = undefined;
-    const msg = Message{ .msg = "x" ** 200 };
+    const msg = Message{ .msg = strRepeat("x", 200) };
     const dg = buildDatagram(&msg, &scratch, .{ .udp_limit = 2048 });
     try std.testing.expectEqual(@as(usize, 64), dg.len);
     try std.testing.expect(std.mem.endsWith(u8, dg, default_trunc_marker));
     // A message that fits the scratch exactly is still passed through whole.
     var fits: [256]u8 = undefined;
     const whole = buildDatagram(&msg, &fits, .{ .udp_limit = 2048 });
-    try std.testing.expect(std.mem.endsWith(u8, whole, "x" ** 200));
+    try std.testing.expect(std.mem.endsWith(u8, whole, strRepeat("x", 200)));
 }
 
 test "buildDatagram truncates and appends the marker over budget" {
-    const msg = Message{ .facility = .user, .severity = .notice, .msg = "A" ** 400 };
+    const msg = Message{ .facility = .user, .severity = .notice, .msg = strRepeat("A", 400) };
     var scratch: [scratch_len]u8 = undefined;
     const opts = Options{ .udp_limit = 64, .trunc_marker = "...[TRUNCATED]" };
     const dg = buildDatagram(&msg, &scratch, opts);
@@ -206,4 +206,16 @@ test "real UDP send is not exercised in unit tests" {
     // The live path (bind + sendto) is gated behind runtime construction; a
     // networked integration test would build a UdpEmitter here.
     return error.SkipZigTest;
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

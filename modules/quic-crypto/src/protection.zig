@@ -243,7 +243,7 @@ test "sanity: App. A.2 client Initial AES-128-GCM protected-payload head matches
     // only need the first 16 ciphertext bytes to match the RFC's header-
     // protection sample, so build the padded plaintext and check the head.
     const crypto_frame = hexTo(245, "060040f1010000ed0303ebf8fa56f12939b9584a3896472ec40bb863cfd3e86804fe3a47f06a2b69484c00000413011302010000c000000010000e00000b6578616d706c652e636f6dff01000100000a00080006001d0017001800100007000504616c706e000500050100000000003300260024001d00209370b2c9caa47fbabaf4559fedba753de171fa71f50f1ce15d43e994ec74d748002b0003020304000d0010000e0403050306030203080408050806002d00020101001c00024001003900320408ffffffffffffffff05048000ffff07048000ffff0801100104800075300901100f088394c8f03e51570806048000ffff");
-    var plain: [1162]u8 = [_]u8{0} ** 1162;
+    var plain: [1162]u8 = @as([1162]u8, @splat(0));
     @memcpy(plain[0..crypto_frame.len], &crypto_frame);
     var out: [1162 + 16]u8 = undefined;
     var tag: [16]u8 = undefined;

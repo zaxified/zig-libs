@@ -34,8 +34,8 @@ test "Key.deriveInto: cookie-rs derive_from (HKDF-SHA256 Expand) for 32..100-byt
         try testing.expectEqualSlices(u8, v.key[32..64], &k.encryption);
     }
     var k: Key = undefined;
-    try testing.expectError(error.KeyTooShort, Key.deriveInto(&k, &[_]u8{1} ** 31));
-    try testing.expectError(error.KeyTooShort, Key.fromBytesInto(&k, &[_]u8{1} ** 63));
+    try testing.expectError(error.KeyTooShort, Key.deriveInto(&k, &@as([31]u8, @splat(1))));
+    try testing.expectError(error.KeyTooShort, Key.fromBytesInto(&k, &@as([63]u8, @splat(1))));
     // fromBytesInto: first 32 sign, next 32 encrypt, the rest ignored.
     var bytes: [70]u8 = undefined;
     for (&bytes, 0..) |*b, i| b.* = @intCast(i);

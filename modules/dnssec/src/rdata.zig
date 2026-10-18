@@ -435,7 +435,7 @@ test "TypeBitMap: contains + iterator over A, RRSIG, NSEC" {
     // Window 0: A(1), RRSIG(46), NSEC(47) — matches the RFC 4034 §4.1.2
     // worked example's window-0 bitmap shape (bytes differ; types chosen
     // for a compact test).
-    var bitmap = [_]u8{0} ** 6; // covers bits up to 47
+    var bitmap = @as([6]u8, @splat(0)); // covers bits up to 47
     bitmap[0] |= 0x40; // bit 1 (A)
     bitmap[5] |= 0x03; // bits 46,47 (RRSIG, NSEC)
     const raw = [_]u8{ 0, 6 } ++ bitmap;
@@ -577,12 +577,12 @@ const rdata_reject_seeds = [_][]const u8{
     seed("\x00\x06\x08\x01\x00\x00\x0e\x10\x6b\x36\xec\x80\x69\x55\xb9\x00\x9c\x91\xc0\x0c"), // a COMPRESSION POINTER where RFC 4034 §6.2 forbids one
     seed("\x9c\x91\x08\x02"), // a DS with a zero-length digest
     seed("\x00\x00\x01"), // a type bit map window with a length and no octets
-    seed("\x00\x21" ++ ("\xff" ** 33)), // a bit-map window claiming 33 octets: over the 32 maximum
+    seed("\x00\x21" ++ (strRepeat("\xff", 33))), // a bit-map window claiming 33 octets: over the 32 maximum
     seed("\x00\x01\x40\x00\x01\x40"), // two windows with a NON-INCREASING window number
     seed("\x01\x00\x00\x0a\x02\xaa"), // an NSEC3PARAM whose salt is one octet short
     seed("\x01\x00\x00\x0a\x02\xaa\xbb\x14"), // an NSEC3 whose next-hashed-owner runs off the end
-    seed("\x01" ++ ("\xff" ** 40)), // a long run of 0xff through every parser at once
-    seed(("\x00" ** 300)), // 300 zero octets: over the OLD 256 buffer, on purpose
+    seed("\x01" ++ (strRepeat("\xff", 40))), // a long run of 0xff through every parser at once
+    seed((strRepeat("\x00", 300))), // 300 zero octets: over the OLD 256 buffer, on purpose
 };
 
 /// The whole corpus: the refusals above, plus the real DNSKEY, RRSIG, DS and
@@ -733,4 +733,16 @@ test "corpus: every RDATA seed reaches the parsers, and what each accepted is pi
     try testing.expectEqual(@as(usize, 1), nsec);
     try testing.expectEqual(@as(usize, 1), nsec3);
     try testing.expectEqual(@as(usize, 1), nsec3param);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

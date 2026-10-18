@@ -317,7 +317,7 @@ test "HoK cross-form: an off-curve presented point can never match" {
     var s = try mintResponse(alloc, conf);
     defer s.deinit(alloc);
 
-    const off_curve = [_]u8{0x04} ++ ([_]u8{0xA1} ** 32) ++ ([_]u8{0xB2} ** 32);
+    const off_curve = [_]u8{0x04} ++ (@as([32]u8, @splat(0xA1))) ++ (@as([32]u8, @splat(0xB2)));
     var cfg = baseConfig(s.key);
     cfg.subject_confirmation = .holder_of_key;
     cfg.presented_holder_key = .{ .ec_sec1 = &off_curve };

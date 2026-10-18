@@ -47,7 +47,7 @@ fn dummyCtx() txctx.TxContext {
         .tx = .{
             .version = 1,
             .vin = @constCast(&[_]bitcointx.TxIn{.{
-                .prevout = .{ .txid = [_]u8{0} ** 32, .vout = 0 },
+                .prevout = .{ .txid = @as([32]u8, @splat(0)), .vout = 0 },
                 .script_sig = &.{},
                 .sequence = 0xffffffff,
             }}),
@@ -67,7 +67,7 @@ test "CHECKSIG over an undecodable scriptCode reports Core's error class, not BA
     const a = arena.allocator();
 
     // scriptSig: a 9-byte non-DER "signature", then a 33-byte "pubkey".
-    const script_sig = [_]u8{0x09} ++ [_]u8{0xaa} ** 9 ++ [_]u8{0x21} ++ [_]u8{0x02} ++ [_]u8{0xbb} ** 32;
+    const script_sig = [_]u8{0x09} ++ @as([9]u8, @splat(0xaa)) ++ [_]u8{0x21} ++ [_]u8{0x02} ++ @as([32]u8, @splat(0xbb));
     // scriptPubKey: OP_CHECKSIG followed by script_tests.json's "PUSHDATA2
     // with not enough bytes" bytes. The CHECKSIG executes first, so it must
     // build a scriptCode out of an undecodable byte string.

@@ -248,7 +248,7 @@ test "the stream Stream gives for the same calls, whatever the writes and the bu
 
 test "splat writes go to the stream like any other" {
     const gpa = testing.allocator;
-    const src = "head:" ++ "z" ** 250_000 ++ "ab" ** 30_000;
+    const src = "head:" ++ strRepeat("z", 250_000) ++ strRepeat("ab", 30_000);
     const want = try expected(src, .{ .level = 1 }, &.{});
     defer gpa.free(want);
     var out: Writer.Allocating = .init(gpa);
@@ -463,4 +463,16 @@ test "a warm writer allocates nothing per frame; a static one never" {
     defer st_short.deinit();
     try testing.expectError(error.WriteFailed, writeFrame(&st_short, src, 10_000));
     try testing.expectEqual(error.OutOfMemory, st_short.err.?);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

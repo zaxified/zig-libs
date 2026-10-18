@@ -69,7 +69,7 @@ pub const LegacyError = error{InputIndexOutOfRange} || Allocator.Error;
 /// without serializing anything, when `hash_type`'s base type is `SINGLE`
 /// and `input_index` has no corresponding output.
 pub const sighash_single_bug: [32]u8 = blk: {
-    var b = [_]u8{0} ** 32;
+    var b = @as([32]u8, @splat(0));
     b[0] = 1;
     break :blk b;
 };
@@ -373,7 +373,7 @@ fn oneInOneOutTx(vin_buf: *[1]tx.TxIn, vout_buf: *[1]tx.TxOut, prevout_txid: [32
 test "input_index out of range is a typed error" {
     var vin_buf: [1]tx.TxIn = undefined;
     var vout_buf: [1]tx.TxOut = undefined;
-    var t = oneInOneOutTx(&vin_buf, &vout_buf, [_]u8{0} ** 32, 1000);
+    var t = oneInOneOutTx(&vin_buf, &vout_buf, @as([32]u8, @splat(0)), 1000);
     try testing.expectError(error.InputIndexOutOfRange, sighash(testing.allocator, t, 5, &.{}, ALL));
     _ = &t;
 }
@@ -388,8 +388,8 @@ test "SIGHASH_SINGLE bug: input_index with no corresponding output returns the f
     var t: tx.Transaction = .{
         .version = 1,
         .vin = @constCast(&[_]tx.TxIn{
-            .{ .prevout = .{ .txid = [_]u8{0xaa} ** 32, .vout = 0 }, .script_sig = &.{}, .sequence = 0xffffffff },
-            .{ .prevout = .{ .txid = [_]u8{0xbb} ** 32, .vout = 1 }, .script_sig = &.{}, .sequence = 0xffffffff },
+            .{ .prevout = .{ .txid = @as([32]u8, @splat(0xaa)), .vout = 0 }, .script_sig = &.{}, .sequence = 0xffffffff },
+            .{ .prevout = .{ .txid = @as([32]u8, @splat(0xbb)), .vout = 1 }, .script_sig = &.{}, .sequence = 0xffffffff },
         }),
         .vout = @constCast(&[_]tx.TxOut{.{ .value = 1000, .script_pubkey = &.{} }}),
         .witness = &.{},
@@ -411,8 +411,8 @@ test "sighashForSigning: SIGHASH_SINGLE bug is a typed error, not the constant (
     var t: tx.Transaction = .{
         .version = 1,
         .vin = @constCast(&[_]tx.TxIn{
-            .{ .prevout = .{ .txid = [_]u8{0xaa} ** 32, .vout = 0 }, .script_sig = &.{}, .sequence = 0xffffffff },
-            .{ .prevout = .{ .txid = [_]u8{0xbb} ** 32, .vout = 1 }, .script_sig = &.{}, .sequence = 0xffffffff },
+            .{ .prevout = .{ .txid = @as([32]u8, @splat(0xaa)), .vout = 0 }, .script_sig = &.{}, .sequence = 0xffffffff },
+            .{ .prevout = .{ .txid = @as([32]u8, @splat(0xbb)), .vout = 1 }, .script_sig = &.{}, .sequence = 0xffffffff },
         }),
         .vout = @constCast(&[_]tx.TxOut{.{ .value = 1000, .script_pubkey = &.{} }}),
         .witness = &.{},
@@ -429,7 +429,7 @@ test "sighashForSigning: SIGHASH_SINGLE bug is a typed error, not the constant (
 test "sighashForSigning: matches sighash bit-for-bit whenever the bug does not trigger (positive control)" {
     var vin_buf: [1]tx.TxIn = undefined;
     var vout_buf: [1]tx.TxOut = undefined;
-    var t = oneInOneOutTx(&vin_buf, &vout_buf, [_]u8{0x11} ** 32, 5000);
+    var t = oneInOneOutTx(&vin_buf, &vout_buf, @as([32]u8, @splat(0x11)), 5000);
     // ALL-like, NONE and an in-range SINGLE all avoid the bug condition --
     // sighashForSigning must be byte-identical to sighash on every one.
     for ([_]u32{ ALL, NONE, SINGLE }) |ht| {
@@ -443,7 +443,7 @@ test "sighashForSigning: matches sighash bit-for-bit whenever the bug does not t
 test "sighashForSigning: out-of-range input_index still reports InputIndexOutOfRange (positive control)" {
     var vin_buf: [1]tx.TxIn = undefined;
     var vout_buf: [1]tx.TxOut = undefined;
-    var t = oneInOneOutTx(&vin_buf, &vout_buf, [_]u8{0} ** 32, 1000);
+    var t = oneInOneOutTx(&vin_buf, &vout_buf, @as([32]u8, @splat(0)), 1000);
     try testing.expectError(error.InputIndexOutOfRange, sighashForSigning(testing.allocator, t, 5, &.{}, ALL));
     _ = &t;
 }
@@ -591,9 +591,9 @@ test "B2: sighash's preimage buffer doesn't reallocate growing many outputs" {
     // serializing the whole transaction. Measured before
     // `estimatePreimageCapacity` existed and after, at 1024 outputs.
     const n = 1024;
-    const spk = [_]u8{ 0x76, 0xa9, 0x14 } ++ [_]u8{0x42} ** 20 ++ [_]u8{ 0x88, 0xac }; // 25-byte P2PKH
+    const spk = [_]u8{ 0x76, 0xa9, 0x14 } ++ @as([20]u8, @splat(0x42)) ++ [_]u8{ 0x88, 0xac }; // 25-byte P2PKH
 
-    var vin_buf: [1]tx.TxIn = .{.{ .prevout = .{ .txid = [_]u8{0} ** 32, .vout = 0 }, .script_sig = &.{}, .sequence = 0xffffffff }};
+    var vin_buf: [1]tx.TxIn = .{.{ .prevout = .{ .txid = @as([32]u8, @splat(0)), .vout = 0 }, .script_sig = &.{}, .sequence = 0xffffffff }};
     var vout_buf: [n]tx.TxOut = undefined;
     for (0..n) |i| vout_buf[i] = .{ .value = 100, .script_pubkey = &spk };
     const t: tx.Transaction = .{

@@ -95,7 +95,7 @@ pub fn parseNest(nest_bytes: []const u8) codec.Error!Reporter {
     var it: codec.AttrIterator = .{ .buf = nest_bytes };
     while (try it.next()) |a| switch (a.type) {
         uapi.ATTR.HEALTH_REPORTER_NAME => try uapi.copyName(&r.name_buf, &r.name_len, a),
-        uapi.ATTR.HEALTH_REPORTER_STATE => r.state = @enumFromInt(try a.asU8()),
+        uapi.ATTR.HEALTH_REPORTER_STATE => r.state = @fromBackingInt(@intCast(try a.asU8())),
         uapi.ATTR.HEALTH_REPORTER_ERR_COUNT => r.err_count = try uapi.asU64(a),
         uapi.ATTR.HEALTH_REPORTER_RECOVER_COUNT => r.recover_count = try uapi.asU64(a),
         uapi.ATTR.HEALTH_REPORTER_DUMP_TS => r.dump_ts = try uapi.asU64(a),
@@ -347,7 +347,7 @@ test "hostile reporter input is a typed error" {
     // An over-long reporter name.
     list.clearRetainingCapacity();
     const n2 = try codec.nestBegin(gpa, &list, uapi.ATTR.HEALTH_REPORTER);
-    try codec.appendAttrString(gpa, &list, uapi.ATTR.HEALTH_REPORTER_NAME, "r" ** (uapi.name_max + 1));
+    try codec.appendAttrString(gpa, &list, uapi.ATTR.HEALTH_REPORTER_NAME, strRepeat("r", uapi.name_max + 1));
     try codec.nestEnd(&list, n2);
     try testing.expectError(error.BadLength, parse(list.items));
 }
@@ -576,4 +576,16 @@ test "the health builders: dump vs one reporter, GET vs RECOVER" {
 
     try testing.expectError(error.InvalidRequest, buildHealthReporter(gpa, 0x19, 1, h, ""));
     try testing.expectError(error.InvalidRequest, buildRecoverHealthReporter(gpa, 0x19, 1, h, "a\x00b"));
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

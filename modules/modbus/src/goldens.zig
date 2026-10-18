@@ -36,7 +36,7 @@ fn captureServer(
     inputs: *[16]u16,
 ) srv.Server {
     for (coils, 0..) |*v, i| v.* = (i % 2 == 0);
-    discretes.* = [_]bool{false} ** 16;
+    discretes.* = @as([16]bool, @splat(false));
     for ([_]usize{ 1, 2, 3, 5, 8, 13 }) |i| discretes[i] = true;
     for (holdings, 0..) |*v, i| v.* = @intCast(0x1000 + i);
     for (inputs, 0..) |*v, i| v.* = @intCast(0x2000 + i * 2);
@@ -561,7 +561,7 @@ test "CAPTURED: pymodbus's CRC-16 and ours agree on every RTU golden" {
 // assumes.
 
 test "SPEC 6.1: FC 01 read coils 20-38 produces the spec's response bytes" {
-    var coils = [_]bool{false} ** 64;
+    var coils = @as([64]bool, @splat(false));
     const pattern = [_]u8{ 0xCD, 0x6B, 0x05 };
     for (0..19) |i| {
         const shift: u3 = @intCast(i % 8);
@@ -577,7 +577,7 @@ test "SPEC 6.1: FC 01 read coils 20-38 produces the spec's response bytes" {
 }
 
 test "SPEC 6.2: FC 02 read discrete inputs 197-218" {
-    var inputs = [_]bool{false} ** 256;
+    var inputs = @as([256]bool, @splat(false));
     const pattern = [_]u8{ 0xAC, 0xDB, 0x35 };
     for (0..22) |i| {
         const shift: u3 = @intCast(i % 8);
@@ -593,7 +593,7 @@ test "SPEC 6.2: FC 02 read discrete inputs 197-218" {
 }
 
 test "SPEC 6.3: FC 03 read holding registers 108-110" {
-    var regs = [_]u16{0} ** 128;
+    var regs = @as([128]u16, @splat(0));
     regs[107] = 555;
     regs[108] = 0;
     regs[109] = 100;
@@ -607,7 +607,7 @@ test "SPEC 6.3: FC 03 read holding registers 108-110" {
 }
 
 test "SPEC 6.4: FC 04 read input register 9" {
-    var regs = [_]u16{0} ** 16;
+    var regs = @as([16]u16, @splat(0));
     regs[8] = 10;
     var server = srv.Server.init(
         .{ .unit_id = 1, .framing = .rtu },
@@ -619,8 +619,8 @@ test "SPEC 6.4: FC 04 read input register 9" {
 }
 
 test "SPEC 6.5/6.6: FC 05 and FC 06 echo the request" {
-    var coils = [_]bool{false} ** 256;
-    var regs = [_]u16{0} ** 16;
+    var coils = @as([256]bool, @splat(false));
+    var regs = @as([16]u16, @splat(0));
     var server = srv.Server.init(.{ .unit_id = 1, .framing = .rtu }, .{
         .coils = .{ .base = 0, .values = &coils },
         .holding_registers = .{ .base = 0, .values = &regs },
@@ -637,8 +637,8 @@ test "SPEC 6.5/6.6: FC 05 and FC 06 echo the request" {
 }
 
 test "SPEC 6.11/6.12: FC 0F and FC 10 echo address + quantity" {
-    var coils = [_]bool{false} ** 64;
-    var regs = [_]u16{0} ** 16;
+    var coils = @as([64]bool, @splat(false));
+    var regs = @as([16]u16, @splat(0));
     var server = srv.Server.init(.{ .unit_id = 1, .framing = .rtu }, .{
         .coils = .{ .base = 0, .values = &coils },
         .holding_registers = .{ .base = 0, .values = &regs },
@@ -657,7 +657,7 @@ test "SPEC 6.11/6.12: FC 0F and FC 10 echo address + quantity" {
 }
 
 test "SPEC 6.17: FC 17 writes before it reads" {
-    var regs = [_]u16{0} ** 32;
+    var regs = @as([32]u16, @splat(0));
     regs[3] = 0x00FE;
     regs[4] = 0x0ACD;
     regs[5] = 0x0001;
@@ -720,8 +720,8 @@ fn Loopback(comptime framing: mb.Framing) type {
 }
 
 test "SELF-DERIVED: our Client and our Server complete a full TCP round trip" {
-    var coils = [_]bool{false} ** 32;
-    var regs = [_]u16{0} ** 32;
+    var coils = @as([32]bool, @splat(false));
+    var regs = @as([32]u16, @splat(0));
     var server = srv.Server.init(.{ .unit_id = 3, .framing = .tcp }, .{
         .coils = .{ .base = 0, .values = &coils },
         .holding_registers = .{ .base = 0, .values = &regs },
@@ -756,7 +756,7 @@ test "SELF-DERIVED: our Client and our Server complete a full TCP round trip" {
 }
 
 test "SELF-DERIVED: our Client and our Server complete a full RTU round trip" {
-    var regs = [_]u16{0} ** 16;
+    var regs = @as([16]u16, @splat(0));
     var server = srv.Server.init(
         .{ .unit_id = 9, .framing = .rtu },
         .{ .holding_registers = .{ .base = 100, .values = &regs } },

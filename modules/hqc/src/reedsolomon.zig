@@ -114,7 +114,7 @@ pub fn RS(comptime p: params.Params, comptime generator: [2 * p.delta + 1]u8) ty
         /// trailing 0xff bytes, the unmodified message, with everything
         /// before that being the LFSR remainder).
         pub fn encode(msg: Message) Codeword {
-            var cdw: Codeword = [_]u8{0} ** n1;
+            var cdw: Codeword = @as([n1]u8, @splat(0));
             for (0..k) |i| {
                 const gate_value = msg[k - 1 - i] ^ cdw[redundancy - 1];
                 var tmp: [generator.len]u8 = undefined;
@@ -276,27 +276,27 @@ pub fn RS(comptime p: params.Params, comptime generator: [2 * p.delta + 1]u8) ty
             var cdw_bytes: Codeword = cdw;
 
             // Step 1: syndromes.
-            var syndromes: [2 * delta]u16 = [_]u16{0} ** (2 * delta);
+            var syndromes: [2 * delta]u16 = @as([2 * delta]u16, @splat(0));
             computeSyndromes(&syndromes, &cdw_bytes);
 
             // Step 2: error-locator polynomial sigma(x), constant-time
             // Berlekamp-Massey. Sigma's degree is at most delta but the
             // additive FFT requires the buffer padded to 2^param_fft.
-            var sigma: [fft_len]u16 = [_]u16{0} ** fft_len;
+            var sigma: [fft_len]u16 = @as([fft_len]u16, @splat(0));
             const deg = computeElp(&sigma, &syndromes);
 
             // Step 3: root-finding via the Gao-Mateer additive FFT ->
             // per-position error indicator array.
-            var err: [1 << param_m]u8 = [_]u8{0} ** (1 << param_m);
+            var err: [1 << param_m]u8 = @as([1 << param_m]u8, @splat(0));
             computeRoots(&err, &sigma);
 
             // Step 4: error-evaluator polynomial z(x).
-            var z: [delta + 1]u16 = [_]u16{0} ** (delta + 1);
+            var z: [delta + 1]u16 = @as([delta + 1]u16, @splat(0));
             computeZPoly(&z, &sigma, deg, &syndromes);
 
             // Step 5: error values via Forney's formula (the reference's
             // constant-access-pattern beta_j/e_j bookkeeping).
-            var error_values: [n1]u16 = [_]u16{0} ** n1;
+            var error_values: [n1]u16 = @as([n1]u16, @splat(0));
             computeErrorValues(&error_values, &z, &err);
 
             // Step 6: correct and extract the systematic message suffix.
@@ -386,8 +386,8 @@ pub fn RS(comptime p: params.Params, comptime generator: [2 * p.delta + 1]u8) ty
             var deg_sigma: u16 = 0;
             var deg_sigma_p: u16 = 0;
             var deg_sigma_copy: u16 = 0;
-            var sigma_copy: [delta + 1]u16 = [_]u16{0} ** (delta + 1);
-            var x_sigma_p: [delta + 1]u16 = [_]u16{0} ** (delta + 1);
+            var sigma_copy: [delta + 1]u16 = @as([delta + 1]u16, @splat(0));
+            var x_sigma_p: [delta + 1]u16 = @as([delta + 1]u16, @splat(0));
             x_sigma_p[1] = 1;
             var pp: u16 = 0xffff; // 2*rho
             var d_p: u16 = 1;
@@ -459,7 +459,7 @@ pub fn RS(comptime p: params.Params, comptime generator: [2 * p.delta + 1]u8) ty
         /// FFT twists only its own internal half-buffers), so it stays
         /// valid for step 4.
         fn computeRoots(err: *[1 << param_m]u8, sigma: *const [fft_len]u16) void {
-            var w: [1 << param_m]u16 = [_]u16{0} ** (1 << param_m);
+            var w: [1 << param_m]u16 = @as([1 << param_m]u16, @splat(0));
             fftMain(&w, sigma, delta + 1);
             fftRetrieveErrorPoly(err, &w);
         }
@@ -541,12 +541,12 @@ pub fn RS(comptime p: params.Params, comptime generator: [2 * p.delta + 1]u8) ty
         fn radixBig(f0: []u16, f1: []u16, f: []const u16, m_f: usize) void {
             // Buffer sizes follow the reference's worst-case declarations
             // (2*(2^(param_fft-2))+1 / 2^(param_fft-2)).
-            var q: [2 * (1 << (param_fft - 2)) + 1]u16 = [_]u16{0} ** (2 * (1 << (param_fft - 2)) + 1);
-            var r: [2 * (1 << (param_fft - 2)) + 1]u16 = [_]u16{0} ** (2 * (1 << (param_fft - 2)) + 1);
-            var q0: [1 << (param_fft - 2)]u16 = [_]u16{0} ** (1 << (param_fft - 2));
-            var q1: [1 << (param_fft - 2)]u16 = [_]u16{0} ** (1 << (param_fft - 2));
-            var r0: [1 << (param_fft - 2)]u16 = [_]u16{0} ** (1 << (param_fft - 2));
-            var r1: [1 << (param_fft - 2)]u16 = [_]u16{0} ** (1 << (param_fft - 2));
+            var q: [2 * (1 << (param_fft - 2)) + 1]u16 = @as([2 * (1 << (param_fft - 2)) + 1]u16, @splat(0));
+            var r: [2 * (1 << (param_fft - 2)) + 1]u16 = @as([2 * (1 << (param_fft - 2)) + 1]u16, @splat(0));
+            var q0: [1 << (param_fft - 2)]u16 = @as([1 << (param_fft - 2)]u16, @splat(0));
+            var q1: [1 << (param_fft - 2)]u16 = @as([1 << (param_fft - 2)]u16, @splat(0));
+            var r0: [1 << (param_fft - 2)]u16 = @as([1 << (param_fft - 2)]u16, @splat(0));
+            var r1: [1 << (param_fft - 2)]u16 = @as([1 << (param_fft - 2)]u16, @splat(0));
 
             const n = @as(usize, 1) << @intCast(m_f - 2);
             @memcpy(q[0..n], f[3 * n .. 4 * n]);
@@ -573,16 +573,16 @@ pub fn RS(comptime p: params.Params, comptime generator: [2 * p.delta + 1]u8) ty
         /// `f` is twisted in place at each level (it is always one of the
         /// caller's own half-buffers, never the original sigma).
         fn fftRec(w: []u16, f: []u16, f_coeffs: usize, m: usize, m_f: usize, betas: []const u16) void {
-            var f0_buf: [1 << (param_fft - 2)]u16 = [_]u16{0} ** (1 << (param_fft - 2));
-            var f1_buf: [1 << (param_fft - 2)]u16 = [_]u16{0} ** (1 << (param_fft - 2));
-            var gammas: [param_m - 2]u16 = [_]u16{0} ** (param_m - 2);
-            var deltas: [param_m - 2]u16 = [_]u16{0} ** (param_m - 2);
-            var gammas_sums: [1 << (param_m - 2)]u16 = [_]u16{0} ** (1 << (param_m - 2));
-            var u_buf: [1 << (param_m - 2)]u16 = [_]u16{0} ** (1 << (param_m - 2));
-            var v_buf: [1 << (param_m - 2)]u16 = [_]u16{0} ** (1 << (param_m - 2));
+            var f0_buf: [1 << (param_fft - 2)]u16 = @as([1 << (param_fft - 2)]u16, @splat(0));
+            var f1_buf: [1 << (param_fft - 2)]u16 = @as([1 << (param_fft - 2)]u16, @splat(0));
+            var gammas: [param_m - 2]u16 = @as([param_m - 2]u16, @splat(0));
+            var deltas: [param_m - 2]u16 = @as([param_m - 2]u16, @splat(0));
+            var gammas_sums: [1 << (param_m - 2)]u16 = @as([1 << (param_m - 2)]u16, @splat(0));
+            var u_buf: [1 << (param_m - 2)]u16 = @as([1 << (param_m - 2)]u16, @splat(0));
+            var v_buf: [1 << (param_m - 2)]u16 = @as([1 << (param_m - 2)]u16, @splat(0));
             // At the recursion floor m always equals param_m-(param_fft-1)
             // (m and m_f decrement in lockstep from param_m-1/param_fft-1).
-            var tmp: [param_m - (param_fft - 1)]u16 = [_]u16{0} ** (param_m - (param_fft - 1));
+            var tmp: [param_m - (param_fft - 1)]u16 = @as([param_m - (param_fft - 1)]u16, @splat(0));
 
             // Step 1: base case — f is linear, evaluate directly by
             // doubling over the basis.
@@ -652,13 +652,13 @@ pub fn RS(comptime p: params.Params, comptime generator: [2 * p.delta + 1]u8) ty
         /// ends with 1 (beta_m = 1), so there is no twist here; `f`
         /// itself is only READ (radixConv copies into local halves).
         fn fftMain(w: *[1 << param_m]u16, f: *const [fft_len]u16, f_coeffs: usize) void {
-            var betas: [param_m - 1]u16 = [_]u16{0} ** (param_m - 1);
-            var betas_sums: [1 << (param_m - 1)]u16 = [_]u16{0} ** (1 << (param_m - 1));
-            var f0: [1 << (param_fft - 1)]u16 = [_]u16{0} ** (1 << (param_fft - 1));
-            var f1: [1 << (param_fft - 1)]u16 = [_]u16{0} ** (1 << (param_fft - 1));
-            var deltas: [param_m - 1]u16 = [_]u16{0} ** (param_m - 1);
-            var u: [1 << (param_m - 1)]u16 = [_]u16{0} ** (1 << (param_m - 1));
-            var v: [1 << (param_m - 1)]u16 = [_]u16{0} ** (1 << (param_m - 1));
+            var betas: [param_m - 1]u16 = @as([param_m - 1]u16, @splat(0));
+            var betas_sums: [1 << (param_m - 1)]u16 = @as([1 << (param_m - 1)]u16, @splat(0));
+            var f0: [1 << (param_fft - 1)]u16 = @as([1 << (param_fft - 1)]u16, @splat(0));
+            var f1: [1 << (param_fft - 1)]u16 = @as([1 << (param_fft - 1)]u16, @splat(0));
+            var deltas: [param_m - 1]u16 = @as([param_m - 1]u16, @splat(0));
+            var u: [1 << (param_m - 1)]u16 = @as([1 << (param_m - 1)]u16, @splat(0));
+            var v: [1 << (param_m - 1)]u16 = @as([1 << (param_m - 1)]u16, @splat(0));
 
             computeFftBetas(&betas);
             computeSubsetSums(&betas_sums, &betas);
@@ -693,8 +693,8 @@ pub fn RS(comptime p: params.Params, comptime generator: [2 * p.delta + 1]u8) ty
         /// zero-test is the same branch-free `(0 - w) >> 15` the
         /// reference uses.
         fn fftRetrieveErrorPoly(err: *[1 << param_m]u8, w: *const [1 << param_m]u16) void {
-            var gammas: [param_m - 1]u16 = [_]u16{0} ** (param_m - 1);
-            var gammas_sums: [1 << (param_m - 1)]u16 = [_]u16{0} ** (1 << (param_m - 1));
+            var gammas: [param_m - 1]u16 = @as([param_m - 1]u16, @splat(0));
+            var gammas_sums: [1 << (param_m - 1)]u16 = @as([1 << (param_m - 1)]u16, @splat(0));
 
             computeFftBetas(&gammas);
             computeSubsetSums(&gammas_sums, &gammas);
@@ -747,8 +747,8 @@ pub fn RS(comptime p: params.Params, comptime generator: [2 * p.delta + 1]u8) ty
         /// actually-found error count. Finally scatter e_j back to
         /// positions with the same constant-access walk.
         fn computeErrorValues(error_values: *[n1]u16, z: *const [delta + 1]u16, err: *const [1 << param_m]u8) void {
-            var beta_j: [delta]u16 = [_]u16{0} ** delta;
-            var e_j: [delta]u16 = [_]u16{0} ** delta;
+            var beta_j: [delta]u16 = @as([delta]u16, @splat(0));
+            var e_j: [delta]u16 = @as([delta]u16, @splat(0));
 
             // Compute the beta_{j_i} (locators of the flagged positions).
             var delta_counter: u16 = 0;
@@ -816,9 +816,9 @@ test "RS: redundancy == 2*delta for every parameter set" {
 
 test "RS128: encode of the all-zero message is the all-zero codeword" {
     const t = std.testing;
-    const msg: RS128.Message = [_]u8{0} ** RS128.k;
+    const msg: RS128.Message = @as([RS128.k]u8, @splat(0));
     const cdw = RS128.encode(msg);
-    try t.expectEqualSlices(u8, &([_]u8{0} ** RS128.n1), &cdw);
+    try t.expectEqualSlices(u8, &(@as([RS128.n1]u8, @splat(0))), &cdw);
 }
 
 test "RS128: encode is systematic (message bytes reappear verbatim as the codeword's tail)" {

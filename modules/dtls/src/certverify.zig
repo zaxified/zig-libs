@@ -568,7 +568,7 @@ test "buildSignedContent: client side matches the ed25519_client KAT content byt
 
 test "buildSignedContent: exact shape -- 64 spaces, context string, single 0x00, then the hash" {
     var buf: [max_signed_content_len]u8 = undefined;
-    const transcript_hash = [_]u8{0xAA} ** 32;
+    const transcript_hash = @as([32]u8, @splat(0xAA));
     const content = try buildSignedContent(.server, &transcript_hash, &buf);
 
     try testing.expectEqual(@as(usize, 64 + server_context_string.len + 1 + 32), content.len);
@@ -585,7 +585,7 @@ test "buildSignedContent: exact shape -- 64 spaces, context string, single 0x00,
 test "buildSignedContent: server vs. client differ only in the context string" {
     var buf_server: [max_signed_content_len]u8 = undefined;
     var buf_client: [max_signed_content_len]u8 = undefined;
-    const transcript_hash = [_]u8{0x99} ** 48;
+    const transcript_hash = @as([48]u8, @splat(0x99));
     const server = try buildSignedContent(.server, &transcript_hash, &buf_server);
     const client = try buildSignedContent(.client, &transcript_hash, &buf_client);
 
@@ -604,10 +604,10 @@ test "buildSignedContent: exact RFC 8446 §4.4.3 context strings, byte-for-byte"
 
 test "buildSignedContent: rejects an oversized transcript hash and an undersized buffer" {
     var buf: [max_signed_content_len]u8 = undefined;
-    const too_long = [_]u8{0} ** (max_transcript_hash_len + 1);
+    const too_long = @as([max_transcript_hash_len + 1]u8, @splat(0));
     try testing.expectError(error.TranscriptHashTooLong, buildSignedContent(.server, &too_long, &buf));
 
-    const transcript_hash = [_]u8{0} ** 32;
+    const transcript_hash = @as([32]u8, @splat(0));
     var small: [10]u8 = undefined;
     try testing.expectError(error.BufferTooSmall, buildSignedContent(.server, &transcript_hash, &small));
 }
@@ -635,12 +635,12 @@ test "SignatureScheme.hashDigestLen matches RFC 8446 §4.2.3's hash pairing" {
 }
 
 test "SignatureScheme: RFC 8446 §4.2.3 wire code points" {
-    try testing.expectEqual(@as(u16, 0x0403), @intFromEnum(SignatureScheme.ecdsa_secp256r1_sha256));
-    try testing.expectEqual(@as(u16, 0x0503), @intFromEnum(SignatureScheme.ecdsa_secp384r1_sha384));
-    try testing.expectEqual(@as(u16, 0x0804), @intFromEnum(SignatureScheme.rsa_pss_rsae_sha256));
-    try testing.expectEqual(@as(u16, 0x0805), @intFromEnum(SignatureScheme.rsa_pss_rsae_sha384));
-    try testing.expectEqual(@as(u16, 0x0806), @intFromEnum(SignatureScheme.rsa_pss_rsae_sha512));
-    try testing.expectEqual(@as(u16, 0x0807), @intFromEnum(SignatureScheme.ed25519));
+    try testing.expectEqual(@as(u16, 0x0403), @backingInt(SignatureScheme.ecdsa_secp256r1_sha256));
+    try testing.expectEqual(@as(u16, 0x0503), @backingInt(SignatureScheme.ecdsa_secp384r1_sha384));
+    try testing.expectEqual(@as(u16, 0x0804), @backingInt(SignatureScheme.rsa_pss_rsae_sha256));
+    try testing.expectEqual(@as(u16, 0x0805), @backingInt(SignatureScheme.rsa_pss_rsae_sha384));
+    try testing.expectEqual(@as(u16, 0x0806), @backingInt(SignatureScheme.rsa_pss_rsae_sha512));
+    try testing.expectEqual(@as(u16, 0x0807), @backingInt(SignatureScheme.ed25519));
 }
 
 // -- candidateSchemes: real, complete --
@@ -675,13 +675,13 @@ test "verify: rejects a key-family mismatch before reaching the crypto stub" {
 
 test "verify: rejects a transcript hash length that doesn't match the scheme's hash" {
     const pk = PublicKey{ .ecdsa_p256 = try kat.ecdsa_p256_server.publicKey() };
-    const wrong_len_hash = [_]u8{0} ** 48; // ecdsa_secp256r1_sha256 wants 32
+    const wrong_len_hash = @as([48]u8, @splat(0)); // ecdsa_secp256r1_sha256 wants 32
     try testing.expectError(error.HashLengthMismatch, verify(.ecdsa_secp256r1_sha256, pk, .server, &wrong_len_hash, &kat.ecdsa_p256_server.signature_der));
 }
 
 test "verify: rejects an unrecognized SignatureScheme wire value" {
     const pk = PublicKey{ .ed25519 = (try kat.ed25519_client.keyPair()).public_key };
-    const unknown: SignatureScheme = @enumFromInt(0xffff);
+    const unknown: SignatureScheme = @fromBackingInt(@intCast(0xffff));
     try testing.expectError(error.UnsupportedScheme, verify(unknown, pk, .client, &kat.ed25519_client.transcript_hash, &kat.ed25519_client.signature));
 }
 

@@ -844,7 +844,7 @@ test "tracestate: invalid values (empty, too long, control char) are dropped, no
         try r.get("/", hEchoCurrent);
 
         var req_buf: [4096]u8 = undefined;
-        const too_long = "k1=" ++ "a" ** 254 ++ ",k2=" ++ "b" ** 252; // 513
+        const too_long = "k1=" ++ strRepeat("a", 254) ++ ",k2=" ++ strRepeat("b", 252); // 513
         comptime std.debug.assert(too_long.len == max_state_len + 1);
         const req = try std.fmt.bufPrint(&req_buf, "GET / HTTP/1.1\r\nHost: t\r\n" ++
             "traceparent: " ++ sample ++ "\r\ntracestate: {s}\r\n" ++
@@ -876,7 +876,7 @@ test "tracestate: invalid values (empty, too long, control char) are dropped, no
         try r.get("/", hEchoCurrent);
 
         var req_buf: [4096]u8 = undefined;
-        const at_boundary = "k1=" ++ "a" ** 253 ++ ",k2=" ++ "b" ** 252;
+        const at_boundary = "k1=" ++ strRepeat("a", 253) ++ ",k2=" ++ strRepeat("b", 252);
         comptime std.debug.assert(at_boundary.len == max_state_len);
         const req = try std.fmt.bufPrint(&req_buf, "GET / HTTP/1.1\r\nHost: t\r\n" ++
             "traceparent: " ++ sample ++ "\r\ntracestate: {s}\r\n" ++
@@ -1013,7 +1013,7 @@ test "TraceState.write truncates whole members: over 128 characters first, then 
     // (right-most first only) failed the first expectation (it keeps the
     // 150-character member and drops `c`, `b`).
     var ts: TraceState = .{};
-    const long = "x" ** 150;
+    const long = strRepeat("x", 150);
     try ts.put("c", "3");
     try ts.put("long", long);
     try ts.put("b", "2");
@@ -1133,8 +1133,8 @@ test "model-fuzz: TraceState.parse matches the grammar model; write/parse round-
     const seed: u64 = 0x7472616365737431;
     var prng = std.Random.DefaultPrng.init(seed);
     const rnd = prng.random();
-    const pieces = [_][]const u8{ "a", "z9", "k_-*/", "t@s", "1x", "@x", "A", "a.b", "", "foo", "x" ** 255, "y" ** 256 };
-    const vals = [_][]const u8{ "1", " lead", "v ", "", "a=b", "a,b", "~!#", "\x7f", "\t", "z" ** 256, "w" ** 257 };
+    const pieces = [_][]const u8{ "a", "z9", "k_-*/", "t@s", "1x", "@x", "A", "a.b", "", "foo", strRepeat("x", 255), strRepeat("y", 256) };
+    const vals = [_][]const u8{ "1", " lead", "v ", "", "a=b", "a,b", "~!#", "\x7f", "\t", strRepeat("z", 256), strRepeat("w", 257) };
     var reach_ok: usize = 0;
     var reach_bad: usize = 0;
     var reach_dup: usize = 0;
@@ -1402,4 +1402,16 @@ test "corpus: every traceparent seed reaches the parser, and what it accepts is 
     try testing.expectEqual(@as(usize, 791), octets);
     try testing.expectEqual(@as(usize, 3), accepted);
     try testing.expectEqual(@as(usize, 2), sampled);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

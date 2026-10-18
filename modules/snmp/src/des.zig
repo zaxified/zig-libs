@@ -314,9 +314,9 @@ test "FIPS 46-3 single-block KAT" {
 
 test "DES all-zero key/plaintext KAT" {
     // Independent vector: key=0, plaintext=0 → 8CA64DE9C1B123A7 (well-known).
-    const zero_key = [_]u8{0} ** 8;
+    const zero_key = @as([8]u8, @splat(0));
     const des = Des.init(&zero_key);
-    const ct = des.encryptBlock(.{0} ** 8);
+    const ct = des.encryptBlock(@splat(0));
     try testing.expectEqualSlices(u8, &[_]u8{
         0x8C, 0xA6, 0x4D, 0xE9, 0xC1, 0xB1, 0x23, 0xA7,
     }, &ct);
@@ -351,10 +351,10 @@ test "DES-CBC multi-block round-trip" {
 
 test "DES-CBC rejects non-block-aligned lengths" {
     var buf: [16]u8 = undefined;
-    const zero_key = [_]u8{0} ** 8;
-    try testing.expectError(error.InvalidLength, cbcDecrypt(&zero_key, .{0} ** 8, &.{}, &buf));
-    try testing.expectError(error.InvalidLength, cbcDecrypt(&zero_key, .{0} ** 8, &[_]u8{0} ** 7, &buf));
-    try testing.expectError(error.NotPadded, cbcEncrypt(&zero_key, .{0} ** 8, &[_]u8{0} ** 7, &buf));
+    const zero_key = @as([8]u8, @splat(0));
+    try testing.expectError(error.InvalidLength, cbcDecrypt(&zero_key, @splat(0), &.{}, &buf));
+    try testing.expectError(error.InvalidLength, cbcDecrypt(&zero_key, @splat(0), &@as([7]u8, @splat(0)), &buf));
+    try testing.expectError(error.NotPadded, cbcEncrypt(&zero_key, @splat(0), &@as([7]u8, @splat(0)), &buf));
 }
 
 test "DES-CBC one block equals raw block XOR IV" {

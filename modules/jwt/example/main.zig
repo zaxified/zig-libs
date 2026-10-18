@@ -111,7 +111,7 @@ pub fn main(init: std.process.Init) !void {
 /// which `parseJwksSource(.network)` now enforces, refusing any published key
 /// that carries `d` or `priv`.
 fn postQuantum(gpa: std.mem.Allocator, io: std.Io) !void {
-    const kp = try jwt.MlDsa65.KeyPair.generateDeterministic([_]u8{0x5a} ** 32);
+    const kp = try jwt.MlDsa65.KeyPair.generateDeterministic(@as([32]u8, @splat(0x5a)));
 
     // The issuer's side: sign `header.payload` with the raw FIPS-204
     // signature, no framing and an empty context — what RFC 9964 §2 fixes.

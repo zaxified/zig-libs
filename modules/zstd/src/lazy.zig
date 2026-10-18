@@ -1487,7 +1487,7 @@ inline fn repMatchLength(ms: *const MatchState, w: Base, curr: u32, offset: u32,
 }
 
 test "the next row slot cycles backwards and skips the head" {
-    var tag_row = [_]u8{0} ** 16;
+    var tag_row = @as([16]u8, @splat(0));
     try std.testing.expectEqual(@as(u32, 15), rowNextIndex(&tag_row, 15));
     try std.testing.expectEqual(@as(u32, 14), rowNextIndex(&tag_row, 15));
     tag_row[0] = 1;
@@ -1495,7 +1495,7 @@ test "the next row slot cycles backwards and skips the head" {
 }
 
 test "the match mask starts at the row head" {
-    var tag_row = [_]u8{0} ** 16;
+    var tag_row = @as([16]u8, @splat(0));
     tag_row[3] = 7;
     tag_row[9] = 7;
     // head 5: slot 9 is 4 steps from the head, slot 3 wraps around to 14

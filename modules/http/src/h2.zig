@@ -186,7 +186,7 @@ pub const FrameHeader = struct {
         out[0] = @intCast(h.length >> 16);
         out[1] = @intCast((h.length >> 8) & 0xff);
         out[2] = @intCast(h.length & 0xff);
-        out[3] = @intFromEnum(h.frame_type);
+        out[3] = @backingInt(h.frame_type);
         out[4] = h.flags;
         std.mem.writeInt(u32, out[5..9], h.stream_id, .big);
         return out;
@@ -195,7 +195,7 @@ pub const FrameHeader = struct {
     pub fn decode(bytes: *const [frame_header_len]u8) FrameHeader {
         return .{
             .length = (@as(u32, bytes[0]) << 16) | (@as(u32, bytes[1]) << 8) | bytes[2],
-            .frame_type = @enumFromInt(bytes[3]),
+            .frame_type = @fromBackingInt(@intCast(bytes[3])),
             .flags = bytes[4],
             // High bit is the reserved bit — ignored on receipt (§4.1).
             .stream_id = @intCast(std.mem.readInt(u32, bytes[5..9], .big) & max_window_size),
@@ -251,7 +251,7 @@ pub const SettingsIterator = struct {
         const chunk = it.payload[it.pos..][0..6];
         it.pos += 6;
         return .{
-            .id = @enumFromInt(std.mem.readInt(u16, chunk[0..2], .big)),
+            .id = @fromBackingInt(@intCast(std.mem.readInt(u16, chunk[0..2], .big))),
             .value = std.mem.readInt(u32, chunk[2..6], .big),
         };
     }
@@ -338,7 +338,7 @@ pub fn parseFrame(h: FrameHeader, payload: []const u8) ParseError!Frame {
             if (payload.len != 4) return error.FrameSizeError;
             return .{ .rst_stream = .{
                 .stream_id = h.stream_id,
-                .code = @enumFromInt(std.mem.readInt(u32, payload[0..4], .big)),
+                .code = @fromBackingInt(@intCast(std.mem.readInt(u32, payload[0..4], .big))),
             } };
         },
         .settings => {
@@ -373,7 +373,7 @@ pub fn parseFrame(h: FrameHeader, payload: []const u8) ParseError!Frame {
             if (payload.len < 8) return error.FrameSizeError;
             return .{ .goaway = .{
                 .last_stream_id = @intCast(std.mem.readInt(u32, payload[0..4], .big) & max_window_size),
-                .code = @enumFromInt(std.mem.readInt(u32, payload[4..8], .big)),
+                .code = @fromBackingInt(@intCast(std.mem.readInt(u32, payload[4..8], .big))),
                 .debug = payload[8..],
             } };
         },
@@ -396,7 +396,7 @@ pub fn parseFrame(h: FrameHeader, payload: []const u8) ParseError!Frame {
             } };
         },
         _ => return .{ .unknown = .{
-            .frame_type = @intFromEnum(h.frame_type),
+            .frame_type = @backingInt(h.frame_type),
             .stream_id = h.stream_id,
         } },
     }
@@ -548,7 +548,7 @@ pub fn encodeRstStream(
     code: ErrorCode,
 ) Allocator.Error!void {
     var payload: [4]u8 = undefined;
-    std.mem.writeInt(u32, &payload, @intFromEnum(code), .big);
+    std.mem.writeInt(u32, &payload, @backingInt(code), .big);
     try encodeRawFrame(gpa, out, .rst_stream, 0, stream_id, &payload);
 }
 
@@ -627,7 +627,7 @@ pub fn encodeGoaway(
     try out.appendSlice(gpa, &h.encode());
     var fixed: [8]u8 = undefined;
     std.mem.writeInt(u32, fixed[0..4], last_stream_id, .big);
-    std.mem.writeInt(u32, fixed[4..8], @intFromEnum(code), .big);
+    std.mem.writeInt(u32, fixed[4..8], @backingInt(code), .big);
     try out.appendSlice(gpa, &fixed);
     try out.appendSlice(gpa, debug);
 }
@@ -665,7 +665,7 @@ fn writePriorityBytes(bytes: *[5]u8, p: Priority) void {
 }
 
 fn putSetting(buf: *[36]u8, n: *usize, id: Settings.Id, value: u32) void {
-    std.mem.writeInt(u16, buf[n.*..][0..2], @intFromEnum(id), .big);
+    std.mem.writeInt(u16, buf[n.*..][0..2], @backingInt(id), .big);
     std.mem.writeInt(u32, buf[n.* + 2 ..][0..4], value, .big);
     n.* += 6;
 }
@@ -1982,9 +1982,9 @@ test "RST_STREAM: round-trip incl. unknown code; length check" {
     try testing.expectEqual(ErrorCode.cancel, r.rst_stream.code);
 
     out.clearRetainingCapacity();
-    try encodeRstStream(gpa, &out, 5, @enumFromInt(0xdeadbeef)); // unknown code survives
+    try encodeRstStream(gpa, &out, 5, @fromBackingInt(@intCast(0xdeadbeef))); // unknown code survives
     const unk = try parseOne(out.items);
-    try testing.expectEqual(@as(u32, 0xdeadbeef), @intFromEnum(unk.rst_stream.code));
+    try testing.expectEqual(@as(u32, 0xdeadbeef), @backingInt(unk.rst_stream.code));
 
     out.clearRetainingCapacity();
     try encodeRawFrame(gpa, &out, .rst_stream, 0, 5, &.{ 0, 0, 8 }); // 3 bytes
@@ -2038,7 +2038,7 @@ test "SETTINGS: round-trip via iterator; ACK; malformed lengths" {
 
     // ACK with payload → FRAME_SIZE_ERROR (§6.5).
     out.clearRetainingCapacity();
-    try encodeRawFrame(gpa, &out, .settings, Flags.ack, 0, &(.{0} ** 6));
+    try encodeRawFrame(gpa, &out, .settings, Flags.ack, 0, &@as([6]u8, @splat(0)));
     try testing.expectError(error.FrameSizeError, parseOne(out.items));
 
     // Length not a multiple of 6 → FRAME_SIZE_ERROR (§6.5).
@@ -2108,7 +2108,7 @@ test "PING/GOAWAY/WINDOW_UPDATE/CONTINUATION: malformed rejected" {
     try testing.expectError(error.FrameSizeError, parseOne(out.items));
 
     out.clearRetainingCapacity();
-    try encodeRawFrame(gpa, &out, .ping, 0, 3, &(.{0} ** 8)); // stream != 0
+    try encodeRawFrame(gpa, &out, .ping, 0, 3, &@as([8]u8, @splat(0))); // stream != 0
     try testing.expectError(error.ProtocolError, parseOne(out.items));
 
     out.clearRetainingCapacity();
@@ -2116,7 +2116,7 @@ test "PING/GOAWAY/WINDOW_UPDATE/CONTINUATION: malformed rejected" {
     try testing.expectError(error.FrameSizeError, parseOne(out.items));
 
     out.clearRetainingCapacity();
-    try encodeRawFrame(gpa, &out, .goaway, 0, 1, &(.{0} ** 8)); // stream != 0
+    try encodeRawFrame(gpa, &out, .goaway, 0, 1, &@as([8]u8, @splat(0))); // stream != 0
     try testing.expectError(error.ProtocolError, parseOne(out.items));
 
     out.clearRetainingCapacity();
@@ -2137,7 +2137,7 @@ test "unknown frame type parses as .unknown; boundary-length payload" {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
 
-    try encodeRawFrame(gpa, &out, @enumFromInt(0xbe), 0xff, 21, "whatever");
+    try encodeRawFrame(gpa, &out, @fromBackingInt(@intCast(0xbe)), 0xff, 21, "whatever");
     const u = try parseOne(out.items);
     try testing.expectEqual(@as(u8, 0xbe), u.unknown.frame_type);
     try testing.expectEqual(@as(u31, 21), u.unknown.stream_id);
@@ -2214,7 +2214,7 @@ test "connection: first frame not SETTINGS → PROTOCOL_ERROR" {
     var bytes: std.ArrayList(u8) = .empty;
     defer bytes.deinit(gpa);
     try bytes.appendSlice(gpa, preface);
-    try encodePing(gpa, &bytes, .{0} ** 8, false);
+    try encodePing(gpa, &bytes, @splat(0), false);
     try expectViolation(&conn, bytes.items, error.ProtocolError, .connection);
 }
 
@@ -2258,7 +2258,7 @@ test "connection: HEADERS without END_HEADERS then another frame → PROTOCOL_ER
     var bytes: std.ArrayList(u8) = .empty;
     defer bytes.deinit(gpa);
     try encodeHeaders(gpa, &bytes, 1, &.{0x82}, .{ .end_headers = false });
-    try encodePing(gpa, &bytes, .{0} ** 8, false); // must have been CONTINUATION
+    try encodePing(gpa, &bytes, @splat(0), false); // must have been CONTINUATION
     try expectViolation(&conn, bytes.items, error.ProtocolError, .connection);
 }
 
@@ -2289,7 +2289,7 @@ test "connection: SETTINGS ACK with payload → FRAME_SIZE_ERROR" {
     defer conn.deinit();
     var bytes: std.ArrayList(u8) = .empty;
     defer bytes.deinit(gpa);
-    try encodeRawFrame(gpa, &bytes, .settings, Flags.ack, 0, &(.{0} ** 6));
+    try encodeRawFrame(gpa, &bytes, .settings, Flags.ack, 0, &@as([6]u8, @splat(0)));
     try expectViolation(&conn, bytes.items, error.FrameSizeError, .connection);
 }
 
@@ -2454,7 +2454,7 @@ test "connection: frames in flight for a stream we reset are ignored, their DATA
     // DATA, then a trailer section with a field new to the HPACK table.
     try client.sendRstStream(&c2s, a, .cancel);
     c2s.clearRetainingCapacity(); // the RST stays "in flight"
-    const body = "x" ** 300;
+    const body = strRepeat("x", 300);
     try server.sendData(&s2c, a, body, false);
     try server.sendHeaders(&s2c, a, &.{.{ .name = "x-checksum", .value = "c0ffee" }}, true);
     try deliver(&s2c, &client, &c2s, &c_events);
@@ -2518,7 +2518,7 @@ test "connection: after a stream error we answered, the stream's in-flight frame
     clearEvents(&s_events);
     try server.sendHeaders(&s2c, a, &.{.{ .name = ":status", .value = "200" }}, false);
     // 20 octets into a 10-octet stream window: a stream FLOW_CONTROL_ERROR.
-    try encodeData(gpa, &s2c, a, "x" ** 20, .{});
+    try encodeData(gpa, &s2c, a, strRepeat("x", 20), .{});
     try testing.expectError(error.FlowControlError, client.recv(s2c.items, &c2s, &c_events));
     s2c.clearRetainingCapacity();
     const v = client.recoverStreamError().?;
@@ -2670,7 +2670,7 @@ test "connection: header block spans HEADERS + CONTINUATION both directions" {
 
     var wire: std.ArrayList(u8) = .empty;
     defer wire.deinit(gpa);
-    const long_value = "0123456789-abcdefghijklmnopqrstuvwxyz-ABCDEFGHIJKLMNOPQRSTUVWXYZ" ** 3;
+    const long_value = strRepeat("0123456789-abcdefghijklmnopqrstuvwxyz-ABCDEFGHIJKLMNOPQRSTUVWXYZ", 3);
     const sid = try client.startStream(&wire, &.{
         .{ .name = ":method", .value = "GET" },
         .{ .name = "x-long", .value = long_value },
@@ -2804,7 +2804,7 @@ test "connection: DATA past the receive window → FLOW_CONTROL_ERROR" {
     var wire: std.ArrayList(u8) = .empty;
     defer wire.deinit(gpa);
     try encodeHeaders(gpa, &wire, 1, &.{0x82}, .{});
-    const chunk = [_]u8{0xaa} ** 16_000;
+    const chunk = @as([16_000]u8, @splat(0xaa));
     // 5 × 16000 = 80000 > 65535: the fifth frame overdraws the window.
     for (0..5) |_| try encodeData(gpa, &wire, 1, &chunk, .{});
     try expectViolation(&conn, wire.items, error.FlowControlError, .connection);
@@ -3205,7 +3205,7 @@ test "connection: header block over max_header_block → ENHANCE_YOUR_CALM" {
         defer conn.deinit();
         var wire: std.ArrayList(u8) = .empty;
         defer wire.deinit(gpa);
-        try encodeHeaders(gpa, &wire, 1, &(.{0} ** 65), .{ .end_headers = false });
+        try encodeHeaders(gpa, &wire, 1, &@as([65]u8, @splat(0)), .{ .end_headers = false });
         try expectViolation(&conn, wire.items, error.EnhanceYourCalm, .connection);
     }
     // (b) CONTINUATION growth crosses the cap.
@@ -3214,8 +3214,8 @@ test "connection: header block over max_header_block → ENHANCE_YOUR_CALM" {
         defer conn.deinit();
         var wire: std.ArrayList(u8) = .empty;
         defer wire.deinit(gpa);
-        try encodeHeaders(gpa, &wire, 1, &(.{0} ** 40), .{ .end_headers = false });
-        try encodeContinuation(gpa, &wire, 1, &(.{0} ** 40), false);
+        try encodeHeaders(gpa, &wire, 1, &@as([40]u8, @splat(0)), .{ .end_headers = false });
+        try encodeContinuation(gpa, &wire, 1, &@as([40]u8, @splat(0)), false);
         try expectViolation(&conn, wire.items, error.EnhanceYourCalm, .connection);
     }
 }
@@ -3227,7 +3227,7 @@ test "connection: PING flood → ENHANCE_YOUR_CALM; productive frames reset the 
         defer conn.deinit();
         var wire: std.ArrayList(u8) = .empty;
         defer wire.deinit(gpa);
-        for (0..8) |_| try encodePing(gpa, &wire, .{0} ** 8, false);
+        for (0..8) |_| try encodePing(gpa, &wire, @splat(0), false);
         try expectViolation(&conn, wire.items, error.EnhanceYourCalm, .connection);
     }
     // The same number of PINGs interleaved with real requests is fine —
@@ -3239,8 +3239,8 @@ test "connection: PING flood → ENHANCE_YOUR_CALM; productive frames reset the 
         defer wire.deinit(gpa);
         var sid: u31 = 1;
         for (0..4) |_| {
-            try encodePing(gpa, &wire, .{0} ** 8, false);
-            try encodePing(gpa, &wire, .{0} ** 8, false);
+            try encodePing(gpa, &wire, @splat(0), false);
+            try encodePing(gpa, &wire, @splat(0), false);
             try encodeHeaders(gpa, &wire, sid, &.{0x82}, .{ .end_stream = true });
             sid += 2;
         }
@@ -3462,7 +3462,7 @@ const parse_frame_seeds = [_][]const u8{
     frameSeed(.window_update, 0, 1, "\x00\x00\x00\x00"), // a zero increment is a protocol error
     frameSeed(.window_update, 0, 0, "\x00\x00\x40"), // WINDOW_UPDATE one octet short
     frameSeed(.continuation, Flags.end_headers, 1, "\x82"), // §6.10 CONTINUATION
-    frameSeed(@enumFromInt(0xff), 0, 1, "unknown"), // an unregistered type must be ignored, not refused
+    frameSeed(@fromBackingInt(@intCast(0xff)), 0, 1, "unknown"), // an unregistered type must be ignored, not refused
 };
 
 const fz = @import("fuzz_test.zig");
@@ -3627,7 +3627,7 @@ const warm_seeds = [_][]const u8{
         .frame_type = .data,
         .flags = 0,
         .stream_id = 1,
-    }) ++ [_]u8{'x'} ** 64)), // a frame declaring one octet more than SETTINGS_MAX_FRAME_SIZE
+    }) ++ @as([64]u8, @splat('x')))), // a frame declaring one octet more than SETTINGS_MAX_FRAME_SIZE
     seed(&(request_headers ++ request_headers)), // the same stream id opened twice
     seed(&(frameArr(.headers, Flags.end_headers, 3, hpack_get_request) ++ request_headers)), // a stream id going backwards
     seed(&frameArr(.headers, Flags.end_headers, 1, "\xff\xff\xff\xff\xff")), // HEADERS whose HPACK block is malformed
@@ -3727,4 +3727,16 @@ test "corpus: every recv seed reaches the connection, and the events raised are 
     try testing.expectEqual(@as(usize, 27), cold_written);
     try testing.expectEqual(@as(usize, 10), warm_events);
     try testing.expectEqual(@as(usize, 17), warm_written);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

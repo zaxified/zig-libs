@@ -408,7 +408,7 @@ test "NIST CAVP AESAVS: every AES-192 ECB KAT and MMT vector (GFSbox, KeySbox, V
     var buf_in: [160]u8 = undefined;
     var buf_out: [160]u8 = undefined;
     var buf_want: [160]u8 = undefined;
-    var per_file = [_]usize{0} ** 5;
+    var per_file = @as([5]usize, @splat(0));
     const files = [_][]const u8{ "ECBGFSbox192.rsp", "ECBKeySbox192.rsp", "ECBVarKey192.rsp", "ECBVarTxt192.rsp", "ECBMMT192.rsp" };
     for (cavp.vectors) |v| {
         var key: [24]u8 = undefined;

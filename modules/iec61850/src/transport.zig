@@ -420,7 +420,7 @@ test "the loop transport hands back one TPKT per read" {
 
 test "the loop transport refuses to overflow" {
     var lt: LoopTransport = .{};
-    const big = [_]u8{0} ** 65536;
+    const big = @as([65536]u8, @splat(0));
     try lt.transport().write(&big);
     try testing.expectError(error.WriteFailed, lt.transport().write(&[_]u8{1}));
 }
@@ -449,7 +449,7 @@ test "a full send queue is reported, not silently dropped" {
 
 test "a frame larger than the receive buffer is an error, not a truncation" {
     var a: LoopLink = .{};
-    a.deliver(&[_]u8{0xAA} ** 100);
+    a.deliver(&@as([100]u8, @splat(0xAA)));
     var small: [10]u8 = undefined;
     try testing.expectError(error.RecvFailed, a.link().recv(&small));
 }

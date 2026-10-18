@@ -36,7 +36,7 @@ const StdCurve = std.crypto.ecc.P256;
 // `p256`'s module lane running 4-9m under full-gate load; this and the
 // sibling ECDSA test below are part of that total). ReleaseFast/
 // ReleaseSafe/ReleaseSmall keep the full count.
-const ecdsa_verify_iters: usize = if (builtin.mode == .Debug) 80 else 200;
+const ecdsa_verify_iters: usize = if (builtin.mode == .debug) 80 else 200;
 
 test "ECDSA: p256 verifies every std-produced signature, rejects tampering" {
     var seed: [StdEcdsa.KeyPair.seed_length]u8 = undefined;
@@ -75,8 +75,8 @@ test "ECDSA: p256 verifies every std-produced signature, rejects tampering" {
 // 10s per-test budget. `produced_min` below is scaled with it (was
 // `> 150` at 200 draws, i.e. >75%; the degenerate-k skip rate does not
 // depend on the draw count, so the same ratio applies at the smaller count).
-const ecdsa_sign_iters: usize = if (builtin.mode == .Debug) 100 else 200;
-const ecdsa_sign_produced_min: usize = if (builtin.mode == .Debug) 75 else 150;
+const ecdsa_sign_iters: usize = if (builtin.mode == .debug) 100 else 200;
+const ecdsa_sign_produced_min: usize = if (builtin.mode == .debug) 75 else 150;
 
 test "ECDSA: p256-produced signatures verify under BOTH p256 and std" {
     var prng = std.Random.DefaultPrng.init(0x516E_9256);
@@ -232,7 +232,7 @@ test "GATED differential: fast_core.montMul/montSq == portable REDC == naive RED
 // per-test 3-minute timeout also hit `p256` (same shape as the sibling
 // `group.zig` differential above and the k256 `oracle_test.comb` fix,
 // `14b2e983`). ReleaseFast/ReleaseSafe/ReleaseSmall keep the full count.
-const comb_fast_std_iters: usize = if (builtin.mode == .Debug) 150 else 2000;
+const comb_fast_std_iters: usize = if (builtin.mode == .debug) 150 else 2000;
 
 test "GATED differential: group.combMulBaseFast(k)·G == portable ladder + std" {
     if (!gate.fast_scalarmul_implemented) return error.SkipZigTest; // core not filled (scaffold)
@@ -261,7 +261,7 @@ test "GATED differential: group.combMulBaseFast(k)·G == portable ladder + std" 
 // them: 60 draws at the same >80% threshold (48; expected ~56, fixed PRNG
 // seed, so deterministic) still fail on a harness that could not see the
 // corruption. ReleaseFast/ReleaseSafe/ReleaseSmall keep 500.
-const comb_control_iters: usize = if (builtin.mode == .Debug) 60 else 500;
+const comb_control_iters: usize = if (builtin.mode == .debug) 60 else 500;
 const comb_control_min_disagree: usize = comb_control_iters * 4 / 5;
 
 test "comb positive control: a corrupted table DISAGREES with std (harness has teeth)" {
@@ -349,7 +349,7 @@ test "GATED differential: mulCtWindowed edge scalars == portable CT ladder" {
 // deleted redirect breaks. 40 draws in Debug still put the
 // module's `mul`, its comb and std on the same random points;
 // ReleaseFast/ReleaseSafe/ReleaseSmall keep 256.
-const redirect_std_iters: usize = if (builtin.mode == .Debug) 40 else 256;
+const redirect_std_iters: usize = if (builtin.mode == .debug) 40 else 256;
 
 test "basePoint.mul takes the comb redirect, and the redirect changes no answer" {
     // Two separate claims, and it is worth being precise about which is which
@@ -416,11 +416,11 @@ test "basePoint.mul takes the comb redirect, and the redirect changes no answer"
     //    does not, and ECDSA signing -- the caller the redirect exists for --
     //    reaches it.
     group.comb_calls_for_testing = 0;
-    _ = try group.P256.basePoint.mul([_]u8{7} ** 32, .big);
+    _ = try group.P256.basePoint.mul(@as([32]u8, @splat(7)), .big);
     try std.testing.expectEqual(@as(usize, 1), group.comb_calls_for_testing);
-    _ = try group.P256.basePoint.dbl().mul([_]u8{7} ** 32, .big);
+    _ = try group.P256.basePoint.dbl().mul(@as([32]u8, @splat(7)), .big);
     try std.testing.expectEqual(@as(usize, 1), group.comb_calls_for_testing);
-    const kp = try sign.EcdsaP256Sha256.KeyPair.generateDeterministic([_]u8{0x37} ** StdEcdsa.KeyPair.seed_length);
+    const kp = try sign.EcdsaP256Sha256.KeyPair.generateDeterministic(@as([StdEcdsa.KeyPair.seed_length]u8, @splat(0x37)));
     group.comb_calls_for_testing = 0;
     _ = try kp.sign("redirect", null);
     try std.testing.expect(group.comb_calls_for_testing >= 1);
@@ -428,8 +428,8 @@ test "basePoint.mul takes the comb redirect, and the redirect changes no answer"
     // And a point that is not G must still be multiplied the ordinary way:
     // the comb table is G's alone, so answering with it here would be wrong
     // rather than merely fast.
-    const other = try group.P256.basePoint.dbl().mul([_]u8{3} ** 32, .big);
-    const other_ref = try std.crypto.ecc.P256.basePoint.dbl().mul([_]u8{3} ** 32, .big);
+    const other = try group.P256.basePoint.dbl().mul(@as([32]u8, @splat(3)), .big);
+    const other_ref = try std.crypto.ecc.P256.basePoint.dbl().mul(@as([32]u8, @splat(3)), .big);
     try std.testing.expectEqualSlices(
         u8,
         &other_ref.affineCoordinates().x.toBytes(.big),

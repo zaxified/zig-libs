@@ -107,9 +107,9 @@ pub const Backend = enum {
 pub fn backend() Backend {
     if (comptime staticBackend()) |b| return b;
     const cached = detected.load(.monotonic);
-    if (cached != 0) return @enumFromInt(cached - 1);
+    if (cached != 0) return @fromBackingInt(@intCast(cached - 1));
     const b = detect();
-    detected.store(@as(u8, @intFromEnum(b)) + 1, .monotonic);
+    detected.store(@as(u8, @backingInt(b)) + 1, .monotonic);
     return b;
 }
 
@@ -1747,10 +1747,10 @@ test "fuzz: every backend agrees with std on arbitrary key, nonce, AD and messag
 
 const fuzz_driver = @import("testkit").fuzz.driver;
 const FuzzLabel = enum { genuine_accepted, forged_rejected, nonempty_message, other_shape_agreed };
-var fuzz_reach: [@typeInfo(FuzzLabel).@"enum".fields.len]usize = @splat(0);
+var fuzz_reach: [@typeInfo(FuzzLabel).@"enum".field_names.len]usize = @splat(0);
 
 fn mark(comptime l: FuzzLabel) void {
-    fuzz_reach[@intFromEnum(l)] += 1;
+    fuzz_reach[@backingInt(l)] += 1;
     fuzz_driver.hit(@tagName(l));
 }
 
@@ -1769,7 +1769,7 @@ test "fuzz harness: 300 seeds in every test run, and they get everywhere" {
         };
     }
     for (fuzz_reach, 0..) |n, i| if (n == 0) {
-        std.debug.print("reach: label {t} never hit in 300 seeds\n", .{@as(FuzzLabel, @enumFromInt(i))});
+        std.debug.print("reach: label {t} never hit in 300 seeds\n", .{@as(FuzzLabel, @fromBackingInt(@intCast(i)))});
         return error.HarnessDoesNotReach;
     };
 }

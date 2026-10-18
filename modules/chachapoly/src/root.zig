@@ -961,7 +961,7 @@ fn ChaChaPoly(comptime rounds: comptime_int) type {
             }
             note(&aead_path, .wide);
 
-            var poly_key = [_]u8{0} ** 32;
+            var poly_key = @as([32]u8, @splat(0));
             Cipher.xorBody(poly_key[0..], poly_key[0..], 0, k, npub);
 
             Cipher.xorBody(c[0..m.len], m, 1, k, npub);
@@ -1015,7 +1015,7 @@ fn ChaChaPoly(comptime rounds: comptime_int) type {
             }
             note(&aead_path, .wide);
 
-            var poly_key = [_]u8{0} ** 32;
+            var poly_key = @as([32]u8, @splat(0));
             Cipher.xorBody(poly_key[0..], poly_key[0..], 0, k, npub);
 
             var mac = Poly1305.init(poly_key[0..]);
@@ -1117,7 +1117,7 @@ pub const XChaCha8Poly1305 = XChaChaPoly(8);
 /// Poly1305 zero-padding to the next 16-byte boundary.
 fn pad16(mac: *Poly1305, len: usize) void {
     if (len % 16 != 0) {
-        const zeros = [_]u8{0} ** 16;
+        const zeros = @as([16]u8, @splat(0));
         mac.update(zeros[0 .. 16 - (len % 16)]);
     }
 }
@@ -1566,8 +1566,8 @@ test "delegation thresholds route each length to the engine it was measured for"
     // So the cases live in TABLES that are replayed against every
     // implementation of the comparison. A case cannot be covered on one side
     // and forgotten on the other, because there is only one side.
-    const key = [_]u8{0x21} ** 32;
-    const nonce = [_]u8{0x43} ** 12;
+    const key = @as([32]u8, @splat(0x21));
+    const nonce = @as([12]u8, @splat(0x43));
     const grp = 64 * wide;
     var buf: [2 * grp]u8 = undefined;
     var out: [2 * grp]u8 = undefined;
@@ -1760,8 +1760,8 @@ test "in-place xor (out == in) matches the out-of-place result, 0..1024" {
 }
 
 test "in-place AEAD (c == m buffer) seal/open" {
-    const key = [_]u8{0x11} ** 32;
-    const nonce = [_]u8{0x22} ** 12;
+    const key = @as([32]u8, @splat(0x11));
+    const nonce = @as([12]u8, @splat(0x22));
     var prng = std.Random.DefaultPrng.init(0xA11A5);
     var msg: [777]u8 = undefined;
     prng.random().bytes(&msg);
@@ -1787,8 +1787,8 @@ test "in-place AEAD (c == m buffer) seal/open" {
 // unaligned vector loads/stores. Slide both `in` and `out` across every offset
 // in a 64-byte window, independently, so no combination is accidentally aligned.
 test "unaligned in/out offsets produce identical bytes" {
-    const key = [_]u8{0x5C} ** 32;
-    const nonce = [_]u8{0x3E} ** 12;
+    const key = @as([32]u8, @splat(0x5C));
+    const nonce = @as([12]u8, @splat(0x3E));
     var prng = std.Random.DefaultPrng.init(0x0DDA_1160);
     var backing_in: [64 + 600]u8 = undefined;
     var backing_out: [64 + 600]u8 = undefined;
@@ -1810,8 +1810,8 @@ test "counter increment across the wide/tail boundary (>8 blocks)" {
     // 20 blocks exercises two wide (8-block) passes + a 4-block tail and the
     // per-lane counter increment across the boundary; byte-exact vs std. A
     // non-zero start counter checks the base-counter + per-lane iota add.
-    const key = [_]u8{7} ** 32;
-    const nonce = [_]u8{9} ** 12;
+    const key = @as([32]u8, @splat(7));
+    const nonce = @as([12]u8, @splat(9));
     var ours: [20 * 64]u8 = undefined;
     var theirs: [20 * 64]u8 = undefined;
     ChaCha20.stream(&ours, 12345, key, nonce);
@@ -1823,14 +1823,14 @@ test "decrypt zeroes the output buffer on authentication failure (audit F3)" {
     // The doc promises `m` is zeroed on failure; make it observable. Pre-load `m`
     // with a sentinel, feed a tampered tag, and assert every byte is zero after
     // the rejection (goes RED if the secureZero is dropped back to memset-undefined).
-    const key = [_]u8{3} ** 32;
-    const nonce = [_]u8{5} ** 12;
+    const key = @as([32]u8, @splat(3));
+    const nonce = @as([12]u8, @splat(5));
     const msg = "sensitive plaintext bytes";
     var c: [msg.len]u8 = undefined;
     var tag: [16]u8 = undefined;
     ChaCha20Poly1305.encrypt(&c, &tag, msg, "", nonce, key);
 
-    var m = [_]u8{0xAA} ** msg.len; // caller sentinel
+    var m = @as([msg.len]u8, @splat(0xAA)); // caller sentinel
     var bad_tag = tag;
     bad_tag[0] +%= 1;
     try testing.expectError(error.AuthenticationFailed, ChaCha20Poly1305.decrypt(&m, &c, bad_tag, "", nonce, key));
@@ -1841,8 +1841,8 @@ test "counter space boundary: the last non-wrapping block is accepted (audit F1)
     // A request that exactly consumes the remaining 32-bit counter space must
     // succeed; one more block would trip the anti-wrap assert (see `xor`). Here
     // counter = 2^32 - 1 with a single 64-byte block uses the last valid counter.
-    const key = [_]u8{1} ** 32;
-    const nonce = [_]u8{2} ** 12;
+    const key = @as([32]u8, @splat(1));
+    const nonce = @as([12]u8, @splat(2));
     var ours: [64]u8 = undefined;
     var theirs: [64]u8 = undefined;
     ChaCha20.stream(&ours, 0xFFFF_FFFF, key, nonce);
@@ -1911,8 +1911,8 @@ const AeadCorpus = struct {
     slots: [7][]const u8 = undefined,
 
     fn build(self: *AeadCorpus) []const []const u8 {
-        const key = [_]u8{0x42} ** ChaCha20Poly1305.key_length;
-        const nonce = [_]u8{0x24} ** ChaCha20Poly1305.nonce_length;
+        const key = @as([ChaCha20Poly1305.key_length]u8, @splat(0x42));
+        const nonce = @as([ChaCha20Poly1305.nonce_length]u8, @splat(0x24));
         const ad = "additional data";
         const msg = "the quick brown fox jumps over the lazy dog";
 
@@ -1974,10 +1974,10 @@ fn fuzzDecrypt(_: void, smith: *std.testing.Smith) !void {
 
 /// Reach labels of `decryptHarness`.
 const FuzzLabel = enum { raw_rejected, raw_opened, sealed_opened, flip_rejected };
-var fuzz_reach: [@typeInfo(FuzzLabel).@"enum".fields.len]usize = @splat(0);
+var fuzz_reach: [@typeInfo(FuzzLabel).@"enum".field_names.len]usize = @splat(0);
 
 fn mark(comptime l: FuzzLabel) void {
-    fuzz_reach[@intFromEnum(l)] += 1;
+    fuzz_reach[@backingInt(l)] += 1;
     fuzz_driver.hit(@tagName(l));
 }
 
@@ -2067,7 +2067,7 @@ test "fuzz harness: 300 seeds in every test run, and they get everywhere" {
     // raw_opened is unreachable from random bytes (no random tuple
     // authenticates); the corpus test below pins the one genuine open.
     for (fuzz_reach, 0..) |n, i| {
-        const l: FuzzLabel = @enumFromInt(i);
+        const l: FuzzLabel = @fromBackingInt(@intCast(i));
         if (l == .raw_opened) continue;
         if (n == 0) {
             std.debug.print("reach: label {t} never hit in 300 seeds\n", .{l});
@@ -2137,9 +2137,9 @@ test "the 32-bit counter anti-wrap rule is arithmetic anyone can check, in every
 
     // A boundary that exactly consumes the counter space still runs.
     var out: [64]u8 = undefined;
-    ChaCha20.stream(&out, std.math.maxInt(u32), [_]u8{7} ** 32, [_]u8{9} ** 12);
+    ChaCha20.stream(&out, std.math.maxInt(u32), @as([32]u8, @splat(7)), @as([12]u8, @splat(9)));
     var std_out: [64]u8 = undefined;
-    StdChaCha.stream(&std_out, std.math.maxInt(u32), [_]u8{7} ** 32, [_]u8{9} ** 12);
+    StdChaCha.stream(&std_out, std.math.maxInt(u32), @as([32]u8, @splat(7)), @as([12]u8, @splat(9)));
     try testing.expectEqualSlices(u8, &std_out, &out);
 }
 
@@ -2148,8 +2148,8 @@ test "the counter-space boundary runs through THIS module's engine, not std's" {
     // call is inside `delegate_max_bytes`, so it compared `StdChaCha` with
     // `StdChaCha` and touched none of this module's counter arithmetic
     // (audit 2026-09-02, read off the path witness).
-    const key = [_]u8{0x42} ** 32;
-    const nonce = [_]u8{0x24} ** 12;
+    const key = @as([32]u8, @splat(0x42));
+    const nonce = @as([12]u8, @splat(0x24));
 
     force_wide = true;
     defer force_wide = false;
@@ -2246,7 +2246,7 @@ test "Wycheproof chacha20_poly1305_test.json: the RFC 8439 MAC input tags right 
         mem.writeInt(u64, buf[lens_at + 8 ..][0..8], ct_len, .little);
         const mac_in = buf[0 .. lens_at + 16];
 
-        var poly_key = [_]u8{0} ** 32;
+        var poly_key = @as([32]u8, @splat(0));
         force_wide = true;
         ChaCha20.xor(poly_key[0..], poly_key[0..], 0, key, iv);
         force_wide = false;
@@ -2426,7 +2426,7 @@ test "libsodium goldens: original 64-bit-nonce ChaCha20, XChaCha20 stream, XChaC
     var msg: [sodium.max_len]u8 = undefined;
     var ad: [300]u8 = undefined;
     for (sodium.rows) |row| {
-        counts[@intFromEnum(row.kind)] += 1;
+        counts[@backingInt(row.kind)] += 1;
         var want: [32]u8 = undefined;
         _ = try std.fmt.hexToBytes(&want, row.sha256);
         for ([_]bool{ false, true }) |fw| {

@@ -120,7 +120,7 @@ pub fn main() !void {
     }
 
     // ── negative path #2: wrong recipient keypair -> AuthenticationFailed ─
-    const wrong_sk = [_]u8{0x5b} ** sealedbox.secret_length;
+    const wrong_sk = @as([sealedbox.secret_length]u8, @splat(0x5b));
     var wrong_kp: sealedbox.KeyPair = undefined;
     try sealedbox.keyPairFromSecretKey(&wrong_kp, &wrong_sk);
     var opened_wrong: [msg1.len]u8 = undefined;

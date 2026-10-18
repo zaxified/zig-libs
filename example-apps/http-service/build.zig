@@ -13,11 +13,11 @@ pub fn build(b: *std.Build) void {
     // want from a network-facing binary; `-Doptimize=ReleaseFast` if you have
     // measured that you need it.
     //
-    // ⚠ NOT `standardOptimizeOption(.{ .preferred_optimize_mode = .ReleaseSafe })`,
+    // ⚠ NOT `standardOptimizeOption(.{ .preferred_optimize_mode = .safe })`,
     // which is what this was and which does neither of the two things the
     // sentence above promises. Read std's implementation: given a preferred
     // mode it registers `-Drelease=[bool]` and NOT `-Doptimize` at all, and
-    // with no flag it returns `.Debug` — so every build of this app was a Debug
+    // with no flag it returns `.debug` — so every build of this app was a Debug
     // build, and the documented `-Doptimize=ReleaseFast` was rejected as an
     // invalid option. Found by trying to build the app in a second optimize
     // mode for the smoke gate.
@@ -25,7 +25,7 @@ pub fn build(b: *std.Build) void {
         std.builtin.OptimizeMode,
         "optimize",
         "Prioritize performance, safety, or binary size (default: ReleaseSafe)",
-    ) orelse .ReleaseSafe;
+    ) orelse .safe;
 
     const zig_libs = b.dependency("zig_libs", .{ .target = target, .optimize = optimize });
 
@@ -62,6 +62,6 @@ pub fn build(b: *std.Build) void {
 
     const run = b.addRunArtifact(exe);
     run.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run.addArgs(args);
+    run.addPassthruArgs();
     b.step("run", "Build and run (pass options after --, e.g. -- --port 8087)").dependOn(&run.step);
 }

@@ -591,7 +591,7 @@ test "F1: unprotect refuses an over-long payload BEFORE the AEAD (no pre-authent
 test "F2: computeNonce refuses a Partial IV that does not fit its 5-byte field instead of truncating it" {
     // Truncation made nonce(2^40 + x) == nonce(x): a nonce collision under
     // one key, reachable through unprotect's request_nonce_source.
-    const common_iv = [_]u8{0} ** oscore.nonce_length;
+    const common_iv = @as([oscore.nonce_length]u8, @splat(0));
     _ = try oscore.computeNonce(common_iv, &.{0x01}, oscore.max_partial_iv);
     try std.testing.expectError(error.PartialIvTooLarge, oscore.computeNonce(common_iv, &.{0x01}, oscore.max_partial_iv + 1));
     try std.testing.expectError(error.PartialIvTooLarge, oscore.computeNonce(common_iv, &.{0x01}, (1 << 40) + 7));
@@ -623,7 +623,7 @@ test "F2: unprotect refuses a request_nonce_source.partial_iv beyond max_partial
 }
 
 test "F3: Appendix B.1.1 — needsCheckpoint fires on multiples of K, resumeAfterRestart lands at SSN1 + K + F" {
-    var sc = oscore.SenderContext{ .id = "c1", .key = [_]u8{0} ** oscore.key_length };
+    var sc = oscore.SenderContext{ .id = "c1", .key = @as([oscore.key_length]u8, @splat(0)) };
     try std.testing.expect(sc.needsCheckpoint(16)); // 0 is a multiple of everything
     sc.sequence_number = 15;
     try std.testing.expect(!sc.needsCheckpoint(16));
@@ -894,14 +894,14 @@ test "F12: the three fail-closed guards — IdTooLong, MissingPartialIv, a paylo
     pair.client.sender.id = "8bytes!!";
     try std.testing.expectError(error.IdTooLong, oscore.protect(allocator, &pair.client, "x", aad, true, null));
     try std.testing.expectEqual(@as(u64, 0), pair.client.sender.sequence_number);
-    try std.testing.expectError(error.IdTooLong, oscore.unprotect(allocator, &pair.server, .{}, &([_]u8{0} ** 9), aad, .{ .id = "8bytes!!", .partial_iv = 0 }, false));
+    try std.testing.expectError(error.IdTooLong, oscore.unprotect(allocator, &pair.server, .{}, &(@as([9]u8, @splat(0))), aad, .{ .id = "8bytes!!", .partial_iv = 0 }, false));
 
     // MissingPartialIv: no Partial IV in the option and no request source.
-    try std.testing.expectError(error.MissingPartialIv, oscore.unprotect(allocator, &pair.server, .{}, &([_]u8{0} ** 9), aad, null, false));
+    try std.testing.expectError(error.MissingPartialIv, oscore.unprotect(allocator, &pair.server, .{}, &(@as([9]u8, @splat(0))), aad, null, false));
 
     // Shorter than the tag: 0..7 bytes cannot carry a tag; rejected as a
     // tag failure without an underflow, and without touching the window.
-    var short: [oscore.tag_length]u8 = [_]u8{0} ** oscore.tag_length;
+    var short: [oscore.tag_length]u8 = @as([oscore.tag_length]u8, @splat(0));
     var len: usize = 0;
     while (len < oscore.tag_length) : (len += 1) {
         try std.testing.expectError(error.AuthenticationFailed, oscore.unprotect(allocator, &pair.server, .{ .partial_iv = 9 }, short[0..len], aad, null, true));

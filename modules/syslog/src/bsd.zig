@@ -224,13 +224,13 @@ test "TAG longer than 32 bytes is truncated" {
         .facility = .user,
         .severity = .notice,
         .hostname = "h",
-        .tag = "t" ** 40,
+        .tag = strRepeat("t", 40),
         .msg = "x",
     };
     var buf: [128]u8 = undefined;
     const out = try bufPrint(&msg, &buf);
-    try t.expect(std.mem.indexOf(u8, out, ("t" ** max_tag) ++ ": x") != null);
-    try t.expect(std.mem.indexOf(u8, out, "t" ** (max_tag + 1)) == null);
+    try t.expect(std.mem.indexOf(u8, out, (strRepeat("t", max_tag)) ++ ": x") != null);
+    try t.expect(std.mem.indexOf(u8, out, strRepeat("t", max_tag + 1)) == null);
 }
 
 test "HOSTNAME: sent only when it is one; else omitted (glibc's shape)" {
@@ -239,11 +239,11 @@ test "HOSTNAME: sent only when it is one; else omitted (glibc's shape)" {
     // an empty one, a trailing '-', an IPv6 literal, a word ending in ':',
     // and a hostname that forges TAG and PID.
     var buf: [128]u8 = undefined;
-    for ([_]?[]const u8{ null, "", "-", "--", "a-", "-a", "2001:db8::1", "::1", "h:", "host:1", "[h]", "evil app[1]:", "a..b", "x" ** 64 }) |h| {
+    for ([_]?[]const u8{ null, "", "-", "--", "a-", "-a", "2001:db8::1", "::1", "h:", "host:1", "[h]", "evil app[1]:", "a..b", strRepeat("x", 64) }) |h| {
         const msg = Message{ .facility = .local0, .severity = .warning, .timestamp = .{ .unix_ms = 1783600496000 }, .hostname = h, .tag = "app", .pid = "123", .msg = "hello" };
         try t.expectEqualStrings("<132>Jul  9 12:34:56 app[123]: hello", try bufPrint(&msg, &buf));
     }
-    for ([_][]const u8{ "host", "1", "host_1", "Host.Example.COM", "192.0.2.1", "a-b.c", "x" ** 63 }) |h| {
+    for ([_][]const u8{ "host", "1", "host_1", "Host.Example.COM", "192.0.2.1", "a-b.c", strRepeat("x", 63) }) |h| {
         const msg = Message{ .facility = .local0, .severity = .warning, .timestamp = .{ .unix_ms = 1783600496000 }, .hostname = h, .tag = "app", .msg = "hello" };
         const out = try bufPrint(&msg, &buf);
         try t.expect(std.mem.startsWith(u8, out, "<132>Jul  9 12:34:56 "));
@@ -256,4 +256,16 @@ test "PID: brackets cannot close [PID] early" {
     const msg = Message{ .hostname = "host", .tag = "app", .pid = "a]b[c", .msg = "x" };
     var buf: [64]u8 = undefined;
     try t.expectEqualStrings("<13>host app[a-b-c]: x", try bufPrint(&msg, &buf));
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

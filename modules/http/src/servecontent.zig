@@ -184,7 +184,7 @@ test "serveContent: HEAD has the GET head and no body; 304 drops the metadata" {
 }
 
 test "serveContent: one range, several ranges, an unsatisfiable range, an oversized set" {
-    Fixture.content = "0123456789" ** 10;
+    Fixture.content = strRepeat("0123456789", 10);
     Fixture.opts = .{ .content_type = "text/plain" };
     var out: [2048]u8 = undefined;
     const one = try run("GET /x HTTP/1.1\r\nHost: t\r\nRange: bytes=10-14\r\nConnection: close\r\n\r\n", &out);
@@ -218,7 +218,7 @@ test "serveContent: one range, several ranges, an unsatisfiable range, an oversi
 test "serveContent: the boundary is deterministic and absent from the content" {
     var buf: [boundary_len]u8 = undefined;
     var again: [boundary_len]u8 = undefined;
-    const content = "--0123456789abcdef--" ** 8;
+    const content = strRepeat("--0123456789abcdef--", 8);
     const b = boundary(content, "\"v1\"", &buf);
     try testing.expectEqualStrings(b, boundary(content, "\"v1\"", &again));
     try testing.expect(std.mem.indexOf(u8, content, b) == null);
@@ -234,4 +234,16 @@ fn responseHeader(resp: []const u8, name: []const u8) ?[]const u8 {
         if (std.ascii.eqlIgnoreCase(line[0..colon], name)) return std.mem.trim(u8, line[colon + 1 ..], " ");
     }
     return null;
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

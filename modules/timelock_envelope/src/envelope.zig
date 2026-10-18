@@ -496,28 +496,28 @@ test "overhead accounting matches the concrete field sizes" {
 }
 
 test "deriveKeys: dropping s_time changes the derived key (time secret is load-bearing)" {
-    const s_time = [_]u8{0xA1} ** time_secret_bytes;
-    const s_pq = [_]u8{0xB2} ** hqc.params.shared_secret_bytes;
+    const s_time = @as([time_secret_bytes]u8, @splat(0xA1));
+    const s_pq = @as([hqc.params.shared_secret_bytes]u8, @splat(0xB2));
     const full = deriveKeysV(s_time, s_pq, 16, 42);
 
     // A KDF that dropped s_time (used all-zero in its place) must yield a
     // DIFFERENT key — otherwise the time lock would not affect K at all.
-    const dropped = deriveKeysV([_]u8{0} ** time_secret_bytes, s_pq, 16, 42);
+    const dropped = deriveKeysV(@as([time_secret_bytes]u8, @splat(0)), s_pq, 16, 42);
     try testing.expect(!std.mem.eql(u8, &full.key, &dropped.key));
 }
 
 test "deriveKeys: dropping s_pq changes the derived key (PQ secret is load-bearing)" {
-    const s_time = [_]u8{0xA1} ** time_secret_bytes;
-    const s_pq = [_]u8{0xB2} ** hqc.params.shared_secret_bytes;
+    const s_time = @as([time_secret_bytes]u8, @splat(0xA1));
+    const s_pq = @as([hqc.params.shared_secret_bytes]u8, @splat(0xB2));
     const full = deriveKeysV(s_time, s_pq, 16, 42);
 
-    const dropped = deriveKeysV(s_time, [_]u8{0} ** hqc.params.shared_secret_bytes, 16, 42);
+    const dropped = deriveKeysV(s_time, @as([hqc.params.shared_secret_bytes]u8, @splat(0)), 16, 42);
     try testing.expect(!std.mem.eql(u8, &full.key, &dropped.key));
 }
 
 test "deriveKeys: round, suite and version all separate the key" {
-    const s_time = [_]u8{0xA1} ** time_secret_bytes;
-    const s_pq = [_]u8{0xB2} ** hqc.params.shared_secret_bytes;
+    const s_time = @as([time_secret_bytes]u8, @splat(0xA1));
+    const s_pq = @as([hqc.params.shared_secret_bytes]u8, @splat(0xB2));
     const base = deriveKeysV(s_time, s_pq, 16, 42);
     const other_round = deriveKeysV(s_time, s_pq, 16, 43);
     const other_suite = deriveKeysV(s_time, s_pq, 32, 42);
@@ -531,8 +531,8 @@ test "deriveKeys matches an independent Python HKDF recomputation (salt, version
     // 44 octets = key (32) || nonce (12). The mutation run of that date
     // changed the salt, the version byte and the nonce offset, and the
     // "separates" tests above stayed green.
-    const s_time = [_]u8{0xA1} ** time_secret_bytes;
-    const s_pq = [_]u8{0xB2} ** hqc.params.shared_secret_bytes;
+    const s_time = @as([time_secret_bytes]u8, @splat(0xA1));
+    const s_pq = @as([hqc.params.shared_secret_bytes]u8, @splat(0xB2));
     const k = deriveKeysV(s_time, s_pq, 16, 42);
     var want_key: [32]u8 = undefined;
     _ = try std.fmt.hexToBytes(&want_key, "d102cf0c3b0f168a67877302ed2e212482c701580f056baee580da9885ad5c34");
@@ -543,7 +543,7 @@ test "deriveKeys matches an independent Python HKDF recomputation (salt, version
 }
 
 test "parse rejects trailing bytes past the declared length" {
-    var buf = [_]u8{0} ** (Envelope128.overhead + 1);
+    var buf = @as([Envelope128.overhead + 1]u8, @splat(0));
     @memcpy(buf[0..4], &magic);
     buf[4] = version;
     buf[5] = Envelope128.suite_id;
@@ -557,7 +557,7 @@ test "parse rejects truncated / bad-magic / wrong-version / wrong-suite / wrong-
 
     // A minimal well-formed-length buffer for pt_len = 0, then corrupt
     // each discriminator in turn.
-    var buf = [_]u8{0} ** Envelope128.overhead;
+    var buf = @as([Envelope128.overhead]u8, @splat(0));
     @memcpy(buf[0..4], &magic);
     buf[4] = version;
     buf[5] = Envelope128.suite_id;
@@ -583,7 +583,7 @@ test "parse rejects truncated / bad-magic / wrong-version / wrong-suite / wrong-
 }
 
 test "an all-but-one-byte-short buffer is Truncated, not a panic" {
-    const buf = [_]u8{0} ** (header_bytes - 1);
+    const buf = @as([header_bytes - 1]u8, @splat(0));
     try testing.expectError(error.Truncated, Envelope128.parse(&buf));
 }
 

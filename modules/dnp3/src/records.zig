@@ -122,7 +122,7 @@ pub const Value = union(enum) {
     pub fn asInt(self: Value) i64 {
         return switch (self) {
             .binary => |b| @intFromBool(b),
-            .double_bit => |d| @intFromEnum(d),
+            .double_bit => |d| @backingInt(d),
             .counter => |c| c,
             .analog_int => |v| v,
             .analog_float => |f| std.math.lossyCast(i64, f),
@@ -380,7 +380,7 @@ pub fn encode(layout: Layout, flags: Flags, value: Value, time_ms: u48, time_rel
             },
             .double_bit => |d| {
                 byte &= 0x3F;
-                byte |= @as(u8, @intFromEnum(d)) << 6;
+                byte |= @as(u8, @backingInt(d)) << 6;
             },
             else => {},
         }
@@ -463,7 +463,7 @@ pub fn decode(layout: Layout, kind: PointKind, bytes: []const u8) DecodeError!Re
 
     const value: Value = switch (layout.value) {
         .in_flags => switch (kind) {
-            .double_bit_input => .{ .double_bit = @enumFromInt(@as(u2, @truncate(bytes[0] >> 6))) },
+            .double_bit_input => .{ .double_bit = @fromBackingInt(@intCast(@as(u2, @truncate(bytes[0] >> 6)))) },
             else => .{ .binary = (bytes[0] & 0x80) != 0 },
         },
         .packed_bit, .packed_dbit => unreachable,
@@ -535,12 +535,12 @@ pub fn getPackedBit(bytes: []const u8, i: usize) bool {
 pub fn setPackedDoubleBit(out: []u8, i: usize, state: DoubleBit) void {
     const shift: u3 = @intCast((i % 4) * 2);
     out[i / 4] &= ~(@as(u8, 0b11) << shift);
-    out[i / 4] |= @as(u8, @intFromEnum(state)) << shift;
+    out[i / 4] |= @as(u8, @backingInt(state)) << shift;
 }
 
 pub fn getPackedDoubleBit(bytes: []const u8, i: usize) DoubleBit {
     const shift: u3 = @intCast((i % 4) * 2);
-    return @enumFromInt(@as(u2, @truncate(bytes[i / 4] >> shift)));
+    return @fromBackingInt(@intCast(@as(u2, @truncate(bytes[i / 4] >> shift))));
 }
 
 // ── tests ───────────────────────────────────────────────────────────────────
@@ -683,7 +683,7 @@ test "encode/decode: packed shapes are refused by the record codec" {
 }
 
 test "packed bits and double bits round-trip LSB-first" {
-    var buf = [_]u8{0} ** 4;
+    var buf = @as([4]u8, @splat(0));
     const values = [_]bool{ true, false, true, true, false, false, false, true, true };
     for (values, 0..) |v, i| setPackedBit(&buf, i, v);
     try testing.expectEqual(@as(usize, 2), packedBitBytes(values.len));
@@ -691,7 +691,7 @@ test "packed bits and double bits round-trip LSB-first" {
     try testing.expectEqual(@as(u8, 0b0000_0001), buf[1]);
     for (values, 0..) |v, i| try testing.expectEqual(v, getPackedBit(&buf, i));
 
-    var dbuf = [_]u8{0} ** 4;
+    var dbuf = @as([4]u8, @splat(0));
     const states = [_]DoubleBit{ .determined_on, .determined_off, .indeterminate, .intermediate, .determined_on };
     for (states, 0..) |s, i| setPackedDoubleBit(&dbuf, i, s);
     try testing.expectEqual(@as(usize, 2), packedDoubleBitBytes(states.len));
@@ -703,7 +703,7 @@ test "decode: short records are typed errors, never panics" {
     const layout = layoutOf(32, 3).?;
     var i: usize = 0;
     while (i < 11) : (i += 1) {
-        const bytes = [_]u8{0xFF} ** 11;
+        const bytes = @as([11]u8, @splat(0xFF));
         try testing.expectError(error.ShortRecord, decode(layout, .analog_input, bytes[0..i]));
     }
 }

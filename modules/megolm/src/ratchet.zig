@@ -289,8 +289,8 @@ test "advanceStep and advanceTo(counter+1) agree, at every boundary depth" {
         0x00FFFFFF, // -> 0x01000000, crosses h=0 (part 0's 2^24 boundary)
     };
     for (starting_counters) |c| {
-        var a = compat.ratchetInit(&([_]u8{0} ** ratchet_len), c);
-        var b = compat.ratchetInit(&([_]u8{0} ** ratchet_len), c);
+        var a = compat.ratchetInit(&(@as([ratchet_len]u8, @splat(0))), c);
+        var b = compat.ratchetInit(&(@as([ratchet_len]u8, @splat(0))), c);
         a.advanceStep();
         try b.advanceTo(c + 1);
         try testing.expectEqual(a.counter, b.counter);
@@ -299,7 +299,7 @@ test "advanceStep and advanceTo(counter+1) agree, at every boundary depth" {
 }
 
 test "advanceTo refuses to move backward" {
-    var r = compat.ratchetInit(&([_]u8{0xAB} ** ratchet_len), 5);
+    var r = compat.ratchetInit(&(@as([ratchet_len]u8, @splat(0xAB))), 5);
     const before = r.data;
     try testing.expectError(error.CannotRatchetBackward, r.advanceTo(3));
     // Fail-closed: the rejected call must not have mutated anything.
@@ -308,7 +308,7 @@ test "advanceTo refuses to move backward" {
 }
 
 test "advanceTo(same index) is a no-op, not an error" {
-    var r = compat.ratchetInit(&([_]u8{0x11} ** ratchet_len), 7);
+    var r = compat.ratchetInit(&(@as([ratchet_len]u8, @splat(0x11))), 7);
     const before = r.data;
     try r.advanceTo(7);
     try testing.expectEqual(@as(u32, 7), r.counter);
@@ -316,7 +316,7 @@ test "advanceTo(same index) is a no-op, not an error" {
 }
 
 test "advanceStep at a high counter does not panic (no overflow trap)" {
-    var r = compat.ratchetInit(&([_]u8{0} ** ratchet_len), 0x00FFFFFF);
+    var r = compat.ratchetInit(&(@as([ratchet_len]u8, @splat(0))), 0x00FFFFFF);
     r.advanceStep();
     try testing.expectEqual(@as(u32, 0x01000000), r.counter);
 }

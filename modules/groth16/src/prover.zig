@@ -163,7 +163,7 @@ const Matrix = enum { a, b, c };
 /// is the anchored inverse NTT (`fft.intt`); the result is `poly.eval` at
 /// `tau`. Allocation-free (stack `[n]Fr`).
 fn columnEvalAtTau(comptime n: usize, sys: r1cs.System, which: Matrix, wire: usize, tau: Fr) Fr {
-    var evals = [_]Fr{Fr.zero} ** n;
+    var evals = @as([n]Fr, @splat(Fr.zero));
     for (sys.constraints, 0..) |con, j| {
         if (j >= n) break;
         const lc = switch (which) {
@@ -370,9 +370,9 @@ fn proveBody(
     // fully owned by this call (never aliased into the returned `Proof`, which
     // is built purely from the `pi_a`/`pi_b`/`pi_c` group elements below) — so
     // every one of them is wiped on exit, success or otherwise.
-    var a_ev = [_]Fr{Fr.zero} ** n;
-    var b_ev = [_]Fr{Fr.zero} ** n;
-    var c_ev = [_]Fr{Fr.zero} ** n;
+    var a_ev = @as([n]Fr, @splat(Fr.zero));
+    var b_ev = @as([n]Fr, @splat(Fr.zero));
+    var c_ev = @as([n]Fr, @splat(Fr.zero));
     defer std.crypto.secureZero(u8, std.mem.asBytes(&a_ev));
     defer std.crypto.secureZero(u8, std.mem.asBytes(&b_ev));
     defer std.crypto.secureZero(u8, std.mem.asBytes(&c_ev));
@@ -388,13 +388,13 @@ fn proveBody(
     fft.intt(n, &b_ev);
     fft.intt(n, &c_ev);
 
-    var ab = [_]Fr{Fr.zero} ** (2 * n - 1);
+    var ab = @as([2 * n - 1]Fr, @splat(Fr.zero));
     defer std.crypto.secureZero(u8, std.mem.asBytes(&ab));
     fft.mulViaFFT(2 * n, &ab, &a_ev, &b_ev);
-    var p = [_]Fr{Fr.zero} ** (2 * n - 1);
+    var p = @as([2 * n - 1]Fr, @splat(Fr.zero));
     defer std.crypto.secureZero(u8, std.mem.asBytes(&p));
     poly.sub(&p, &ab, &c_ev);
-    var h = [_]Fr{Fr.zero} ** (n - 1);
+    var h = @as([n - 1]Fr, @splat(Fr.zero));
     defer std.crypto.secureZero(u8, std.mem.asBytes(&h));
     // Exact for a satisfying witness (the boolean is the satisfaction oracle);
     // for a non-satisfying one the quotient is bogus and the proof won't verify.

@@ -819,9 +819,9 @@ test "comptime evaluation" {
 const fuzz_driver = @import("testkit").fuzz.driver;
 
 const AgreeMark = enum { stdlib, simd, scalar, boundary, multi_cut, peek_checked, oneshot_checked, empty };
-var agree_counts: [@typeInfo(AgreeMark).@"enum".fields.len]usize = @splat(0);
+var agree_counts: [@typeInfo(AgreeMark).@"enum".field_names.len]usize = @splat(0);
 fn markAgree(comptime l: AgreeMark) void {
-    agree_counts[@intFromEnum(l)] += 1;
+    agree_counts[@backingInt(l)] += 1;
     fuzz_driver.hit(@tagName(l));
 }
 
@@ -845,7 +845,7 @@ test "fuzz harness: sha2-agree, 300 seeds, reaches every outcome" {
         try fuzzAgree(fuzz_driver.Rng, &rng, testing.allocator);
     }
     for (agree_counts, 0..) |n, i| if (n == 0) {
-        const m: AgreeMark = @enumFromInt(i);
+        const m: AgreeMark = @fromBackingInt(@intCast(i));
         // A backend label is reachable only where that backend is compiled
         // (`.simd` is x86-64 AVX2 only; the arm64 lane never has it).
         const absent = switch (m) {
@@ -866,7 +866,7 @@ test "fuzz harness: sha2-hmac, 300 seeds" {
         try fuzzHmac(fuzz_driver.Rng, &rng, testing.allocator);
     }
     for (hmac_counts, 0..) |n, i| if (n == 0) {
-        std.debug.print("reach: sha2-hmac label {t} never hit\n", .{@as(HmacMark, @enumFromInt(i))});
+        std.debug.print("reach: sha2-hmac label {t} never hit\n", .{@as(HmacMark, @fromBackingInt(@intCast(i)))});
         return error.HarnessDoesNotReach;
     };
 }
@@ -938,9 +938,9 @@ fn fuzzAgree(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
 }
 
 const HmacMark = enum { long_key, block_key, short_key, empty_message, hkdf };
-var hmac_counts: [@typeInfo(HmacMark).@"enum".fields.len]usize = @splat(0);
+var hmac_counts: [@typeInfo(HmacMark).@"enum".field_names.len]usize = @splat(0);
 fn markHmac(comptime l: HmacMark) void {
-    hmac_counts[@intFromEnum(l)] += 1;
+    hmac_counts[@backingInt(l)] += 1;
     fuzz_driver.hit(@tagName(l));
 }
 
@@ -996,10 +996,10 @@ const Hkdf = std.crypto.kdf.hkdf.Hkdf;
 test "HMAC through std's Hmac: RFC 4231 test cases 1, 2, 6, 7" {
     defer test_hooks.forced = null;
     const Case = struct { key: []const u8, data: []const u8, h256: []const u8, h384: []const u8, h512: []const u8 };
-    const key131 = [_]u8{0xaa} ** 131;
+    const key131 = @as([131]u8, @splat(0xaa));
     const cases = [_]Case{
         .{
-            .key = &([_]u8{0x0b} ** 20),
+            .key = &(@as([20]u8, @splat(0x0b))),
             .data = "Hi There",
             .h256 = "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7",
             .h384 = "afd03944d84895626b0825f4ab46907f15f9dadbe4101ec682aa034c7cebc59cfaea9ea9076ede7f4af152e8b2fa9cb6",
@@ -1059,7 +1059,7 @@ test "HKDF through std's Hkdf: RFC 5869 A.1–A.3 (SHA-256), SHA-384 vs std and 
         salt2[i] = @intCast(0x60 + i);
         info2[i] = @intCast(0xb0 + i);
     }
-    const ikm22 = [_]u8{0x0b} ** 22;
+    const ikm22 = @as([22]u8, @splat(0x0b));
     const salt1 = unhex(13, "000102030405060708090a0b0c");
     const info1 = unhex(10, "f0f1f2f3f4f5f6f7f8f9");
     const cases = [_]Case{

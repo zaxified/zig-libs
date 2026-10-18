@@ -128,8 +128,8 @@ pub const OptionIterator = struct {
         while (it.pos < it.buf.len) {
             const code = it.buf[it.pos];
             switch (code) {
-                @intFromEnum(OptionCode.pad) => it.pos += 1,
-                @intFromEnum(OptionCode.end) => {
+                @backingInt(OptionCode.pad) => it.pos += 1,
+                @backingInt(OptionCode.end) => {
                     it.pos = it.buf.len;
                     return null;
                 },
@@ -227,7 +227,7 @@ pub const Message = struct {
         if (!std.mem.eql(u8, bytes[header_len..][0..4], &magic_cookie)) return ParseError.BadCookie;
 
         var m: Message = .{
-            .op = @enumFromInt(bytes[0]),
+            .op = @fromBackingInt(@intCast(bytes[0])),
             .htype = bytes[1],
             .hlen = bytes[2],
             .hops = bytes[3],
@@ -246,8 +246,8 @@ pub const Message = struct {
 
         var it = OptionIterator.init(m.options_raw);
         while (try it.next()) |opt| {
-            switch (@as(OptionCode, @enumFromInt(opt.code))) {
-                .message_type => m.message_type = @enumFromInt(try one(opt.data)),
+            switch (@as(OptionCode, @fromBackingInt(@intCast(opt.code)))) {
+                .message_type => m.message_type = @fromBackingInt(@intCast(try one(opt.data))),
                 .requested_ip => m.requested_ip = try four(opt.data),
                 .server_id => m.server_id = try four(opt.data),
                 .lease_time => m.lease_time_s = std.mem.readInt(u32, &try four(opt.data), .big),
@@ -258,7 +258,7 @@ pub const Message = struct {
                 .host_name => m.host_name = opt.data,
                 .param_request_list => m.param_request_list = opt.data,
                 .client_id => m.client_id = opt.data,
-                .option_overload => m.overload = @enumFromInt(try one(opt.data)),
+                .option_overload => m.overload = @fromBackingInt(@intCast(try one(opt.data))),
                 .ntp_servers => m.ntp_servers = try ip4List(opt.data),
                 .vendor_specific => m.vendor_specific = opt.data,
                 .vendor_class_id => m.vendor_class_id = opt.data,
@@ -469,7 +469,7 @@ pub const Builder = struct {
     pub fn init(buf: []u8, hdr: HeaderOptions) BuildError!Builder {
         if (buf.len < header_len + magic_cookie.len + 1) return BuildError.BufferTooSmall;
         @memset(buf[0..header_len], 0);
-        buf[0] = @intFromEnum(hdr.op);
+        buf[0] = @backingInt(hdr.op);
         buf[1] = hdr.htype;
         buf[2] = hdr.hlen;
         buf[3] = hdr.hops;
@@ -505,19 +505,19 @@ pub const Builder = struct {
     /// Option 42; `addrs` as for `addRouters`.
     pub fn addNtpServers(b: *Builder, addrs: []const u8) BuildError!void {
         std.debug.assert(addrs.len >= 4 and addrs.len % 4 == 0);
-        try b.addOption(@intFromEnum(OptionCode.ntp_servers), addrs);
+        try b.addOption(@backingInt(OptionCode.ntp_servers), addrs);
     }
 
     pub fn addVendorClassId(b: *Builder, id: []const u8) BuildError!void {
-        try b.addOption(@intFromEnum(OptionCode.vendor_class_id), id);
+        try b.addOption(@backingInt(OptionCode.vendor_class_id), id);
     }
 
     pub fn addTftpServerName(b: *Builder, name: []const u8) BuildError!void {
-        try b.addOption(@intFromEnum(OptionCode.tftp_server_name), name);
+        try b.addOption(@backingInt(OptionCode.tftp_server_name), name);
     }
 
     pub fn addBootfileName(b: *Builder, name: []const u8) BuildError!void {
-        try b.addOption(@intFromEnum(OptionCode.bootfile_name), name);
+        try b.addOption(@backingInt(OptionCode.bootfile_name), name);
     }
 
     /// Option 82 with an Agent Circuit ID and/or an Agent Remote ID.
@@ -532,7 +532,7 @@ pub const Builder = struct {
             @memcpy(tmp[n + 2 ..][0..d.len], d);
             n += 2 + d.len;
         }
-        try b.addOption(@intFromEnum(OptionCode.relay_agent_info), tmp[0..n]);
+        try b.addOption(@backingInt(OptionCode.relay_agent_info), tmp[0..n]);
     }
 
     /// Option 121. Host bits beyond `prefix_len` in a destination are not
@@ -549,7 +549,7 @@ pub const Builder = struct {
             @memcpy(tmp[n + 1 + sig ..][0..4], &r.router);
             n += 1 + sig + 4;
         }
-        try b.addOption(@intFromEnum(OptionCode.classless_static_route), tmp[0..n]);
+        try b.addOption(@backingInt(OptionCode.classless_static_route), tmp[0..n]);
     }
 
     /// Option 119, uncompressed (every receiver must accept that). Each name
@@ -570,59 +570,59 @@ pub const Builder = struct {
             tmp[n] = 0;
             n += 1;
         }
-        try b.addOption(@intFromEnum(OptionCode.domain_search), tmp[0..n]);
+        try b.addOption(@backingInt(OptionCode.domain_search), tmp[0..n]);
     }
 
     pub fn addMessageType(b: *Builder, t: MessageType) BuildError!void {
-        try b.addOption(@intFromEnum(OptionCode.message_type), &.{@intFromEnum(t)});
+        try b.addOption(@backingInt(OptionCode.message_type), &.{@backingInt(t)});
     }
 
     pub fn addRequestedIp(b: *Builder, ip: [4]u8) BuildError!void {
-        try b.addOption(@intFromEnum(OptionCode.requested_ip), &ip);
+        try b.addOption(@backingInt(OptionCode.requested_ip), &ip);
     }
 
     pub fn addServerId(b: *Builder, ip: [4]u8) BuildError!void {
-        try b.addOption(@intFromEnum(OptionCode.server_id), &ip);
+        try b.addOption(@backingInt(OptionCode.server_id), &ip);
     }
 
     pub fn addLeaseTime(b: *Builder, seconds: u32) BuildError!void {
         var be: [4]u8 = undefined;
         std.mem.writeInt(u32, &be, seconds, .big);
-        try b.addOption(@intFromEnum(OptionCode.lease_time), &be);
+        try b.addOption(@backingInt(OptionCode.lease_time), &be);
     }
 
     pub fn addSubnetMask(b: *Builder, mask: [4]u8) BuildError!void {
-        try b.addOption(@intFromEnum(OptionCode.subnet_mask), &mask);
+        try b.addOption(@backingInt(OptionCode.subnet_mask), &mask);
     }
 
     /// `addrs` is a packed list of 4-byte addresses (len % 4 == 0, >= 4).
     pub fn addRouters(b: *Builder, addrs: []const u8) BuildError!void {
         std.debug.assert(addrs.len >= 4 and addrs.len % 4 == 0);
-        try b.addOption(@intFromEnum(OptionCode.router), addrs);
+        try b.addOption(@backingInt(OptionCode.router), addrs);
     }
 
     /// `addrs` is a packed list of 4-byte addresses (len % 4 == 0, >= 4).
     pub fn addDnsServers(b: *Builder, addrs: []const u8) BuildError!void {
         std.debug.assert(addrs.len >= 4 and addrs.len % 4 == 0);
-        try b.addOption(@intFromEnum(OptionCode.dns_server), addrs);
+        try b.addOption(@backingInt(OptionCode.dns_server), addrs);
     }
 
     pub fn addDomainName(b: *Builder, name: []const u8) BuildError!void {
-        try b.addOption(@intFromEnum(OptionCode.domain_name), name);
+        try b.addOption(@backingInt(OptionCode.domain_name), name);
     }
 
     pub fn addHostName(b: *Builder, name: []const u8) BuildError!void {
-        try b.addOption(@intFromEnum(OptionCode.host_name), name);
+        try b.addOption(@backingInt(OptionCode.host_name), name);
     }
 
     pub fn addParamRequestList(b: *Builder, codes: []const u8) BuildError!void {
-        try b.addOption(@intFromEnum(OptionCode.param_request_list), codes);
+        try b.addOption(@backingInt(OptionCode.param_request_list), codes);
     }
 
     /// The common `htype + hardware address` client identifier.
     pub fn addClientIdMac(b: *Builder, mac: Mac) BuildError!void {
         const data = [_]u8{0x01} ++ mac.octets;
-        try b.addOption(@intFromEnum(OptionCode.client_id), &data);
+        try b.addOption(@backingInt(OptionCode.client_id), &data);
     }
 
     pub const FinishOptions = struct {
@@ -634,7 +634,7 @@ pub const Builder = struct {
     /// Appends End(255) and returns the finished message bytes.
     pub fn finish(b: *Builder, opts: FinishOptions) BuildError![]const u8 {
         if (b.pos + 1 > b.buf.len) return BuildError.BufferTooSmall;
-        b.buf[b.pos] = @intFromEnum(OptionCode.end);
+        b.buf[b.pos] = @backingInt(OptionCode.end);
         b.pos += 1;
         if (b.pos < opts.pad_to) {
             if (opts.pad_to > b.buf.len) return BuildError.BufferTooSmall;
@@ -657,10 +657,10 @@ const kat_mac = Mac{ .octets = .{ 0x00, 0x0b, 0x82, 0x01, 0xfc, 0x42 } };
 const kat_discover = [_]u8{ 0x01, 0x01, 0x06, 0x00 } // op, htype, hlen, hops
     ++ [_]u8{ 0x39, 0x03, 0xf3, 0x26 } // xid
     ++ [_]u8{ 0x00, 0x00, 0x00, 0x00 } // secs, flags
-    ++ [_]u8{0} ** 16 // ciaddr, yiaddr, siaddr, giaddr
-    ++ [_]u8{ 0x00, 0x0b, 0x82, 0x01, 0xfc, 0x42 } ++ [_]u8{0} ** 10 // chaddr
-    ++ [_]u8{0} ** 64 // sname
-    ++ [_]u8{0} ** 128 // file
+    ++ @as([16]u8, @splat(0)) // ciaddr, yiaddr, siaddr, giaddr
+    ++ [_]u8{ 0x00, 0x0b, 0x82, 0x01, 0xfc, 0x42 } ++ @as([10]u8, @splat(0)) // chaddr
+    ++ @as([64]u8, @splat(0)) // sname
+    ++ @as([128]u8, @splat(0)) // file
     ++ magic_cookie ++ [_]u8{ 53, 1, 1 } // message type: DISCOVER
     ++ [_]u8{ 61, 7, 0x01, 0x00, 0x0b, 0x82, 0x01, 0xfc, 0x42 } // client id
     ++ [_]u8{ 50, 4, 192, 168, 0, 10 } // requested IP
@@ -676,9 +676,9 @@ const kat_ack = [_]u8{ 0x02, 0x01, 0x06, 0x00 } // op: BOOTREPLY
     ++ [_]u8{ 192, 168, 0, 10 } // yiaddr
     ++ [_]u8{ 192, 168, 0, 1 } // siaddr
     ++ [_]u8{ 0, 0, 0, 0 } // giaddr
-    ++ [_]u8{ 0x00, 0x0b, 0x82, 0x01, 0xfc, 0x42 } ++ [_]u8{0} ** 10 // chaddr
-    ++ [_]u8{0} ** 64 // sname
-    ++ [_]u8{0} ** 128 // file
+    ++ [_]u8{ 0x00, 0x0b, 0x82, 0x01, 0xfc, 0x42 } ++ @as([10]u8, @splat(0)) // chaddr
+    ++ @as([64]u8, @splat(0)) // sname
+    ++ @as([128]u8, @splat(0)) // file
     ++ magic_cookie ++ [_]u8{ 53, 1, 5 } // message type: ACK
     ++ [_]u8{ 54, 4, 192, 168, 0, 1 } // server identifier
     ++ [_]u8{ 51, 4, 0x00, 0x01, 0x51, 0x80 } // lease time: 86400 s
@@ -821,7 +821,7 @@ test "DHCP: option overload surfaced" {
     var buf: [400]u8 = undefined;
     var b = try Builder.init(&buf, .{ .op = .boot_reply, .xid = 2 });
     try b.addMessageType(.offer);
-    try b.addOption(@intFromEnum(OptionCode.option_overload), &.{2}); // sname holds options
+    try b.addOption(@backingInt(OptionCode.option_overload), &.{2}); // sname holds options
     const bytes = try b.finish(.{});
     const m = try Message.parse(bytes);
     try testing.expectEqual(Overload.sname, m.overload.?);
@@ -1171,8 +1171,8 @@ test "option 119: loops, forward pointers, overruns and reserved label types are
         &.{ 3, 'a', 'b' }, // label runs past the data
         &.{ 1, 'a' }, // no terminating zero
         &.{0x40}, // reserved 01 label type
-        &([_]u8{0x40} ++ [_]u8{'a'} ** 64 ++ [_]u8{0}), // 01 type with 64 bytes behind it: still reserved, not a label
-        &([_]u8{0x80} ++ [_]u8{'a'} ** 128 ++ [_]u8{0}), // 10 type likewise
+        &([_]u8{0x40} ++ @as([64]u8, @splat('a')) ++ [_]u8{0}), // 01 type with 64 bytes behind it: still reserved, not a label
+        &([_]u8{0x80} ++ @as([128]u8, @splat('a')) ++ [_]u8{0}), // 10 type likewise
         &.{0xc0}, // pointer cut in half
     };
     for (bad) |b| {
@@ -1235,7 +1235,7 @@ test "Builder: the new options reproduce the tcpdump-checked bytes" {
     try b.addMessageType(.ack);
     try b.addServerId(.{ 10, 1, 1, 1 });
     try b.addNtpServers(&.{ 10, 1, 1, 5, 10, 1, 1, 6 });
-    try b.addOption(@intFromEnum(OptionCode.vendor_specific), &.{ 1, 4, 'a', 'b', 'c', 'd' });
+    try b.addOption(@backingInt(OptionCode.vendor_specific), &.{ 1, 4, 'a', 'b', 'c', 'd' });
     try b.addVendorClassId("MSFT 5.0");
     try b.addTftpServerName("tftp.example");
     try b.addBootfileName("boot.efi");

@@ -1645,7 +1645,7 @@ test "F5: an oversized refcount sidecar is never misread as a truncated smaller 
     // valid (but wrong) refcount 0.
     var pbuf: [768]u8 = undefined;
     const rc_path = try store.casRefPath(&pbuf, &d1.hex);
-    const oversized = ("0" ** 40) ++ "2";
+    const oversized = (strRepeat("0", 40)) ++ "2";
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = rc_path, .data = oversized });
 
     // casRefRead falls back to default_if_missing rather than returning a
@@ -2110,7 +2110,7 @@ test "SECURITY: every raw-hex CAS entry point rejects a hex that is not one" {
     const store = try testStore(&tmp, &base_buf);
 
     var pbuf: [800]u8 = undefined;
-    for ([_][]const u8{ "../victim", "..", "", "abc", "/etc/passwd", "AB" ** 32 }) |bad| {
+    for ([_][]const u8{ "../victim", "..", "", "abc", "/etc/passwd", strRepeat("AB", 32) }) |bad| {
         try t.expectError(error.InvalidName, store.casPath(&pbuf, bad));
         try t.expect(!store.casHas(bad));
         try t.expectError(error.InvalidName, store.casDelete(bad));
@@ -2180,4 +2180,16 @@ test "casRefWrite leaves no temp behind, and a stale one is never taken for a bl
     try t.expectEqual(@as(u64, 0), stats.blobs_removed);
     try t.expect(store.has(d));
     try t.expectEqual(@as(u64, 1), store.casRefRead(&d.hex, 0));
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

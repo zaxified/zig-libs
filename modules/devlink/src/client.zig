@@ -115,15 +115,15 @@ pub const SubscribeError = RequestError || error{GroupNotFound};
 pub fn errnoToError(code: i32) RequestError {
     if (code >= 0 or code == std.math.minInt(i32)) return error.Unexpected;
     return switch (@as(u32, @intCast(-code))) {
-        @intFromEnum(linux.E.PERM), @intFromEnum(linux.E.ACCES) => error.AccessDenied,
-        @intFromEnum(linux.E.NODEV), @intFromEnum(linux.E.NXIO) => error.NoSuchDevice,
+        @backingInt(linux.E.PERM), @backingInt(linux.E.ACCES) => error.AccessDenied,
+        @backingInt(linux.E.NODEV), @backingInt(linux.E.NXIO) => error.NoSuchDevice,
         // ENOENT from a devlink command means "no such object"; from nlctrl it
         // means "no such family", which `genl.resolveFamily` handles.
-        @intFromEnum(linux.E.NOENT) => error.NoSuchDevice,
-        @intFromEnum(linux.E.OPNOTSUPP) => error.NotSupported,
-        @intFromEnum(linux.E.INVAL), @intFromEnum(linux.E.MSGSIZE) => error.InvalidRequest,
-        @intFromEnum(linux.E.BUSY), @intFromEnum(linux.E.AGAIN) => error.Busy,
-        @intFromEnum(linux.E.NOBUFS), @intFromEnum(linux.E.NOMEM) => error.SystemResources,
+        @backingInt(linux.E.NOENT) => error.NoSuchDevice,
+        @backingInt(linux.E.OPNOTSUPP) => error.NotSupported,
+        @backingInt(linux.E.INVAL), @backingInt(linux.E.MSGSIZE) => error.InvalidRequest,
+        @backingInt(linux.E.BUSY), @backingInt(linux.E.AGAIN) => error.Busy,
+        @backingInt(linux.E.NOBUFS), @backingInt(linux.E.NOMEM) => error.SystemResources,
         else => error.Unexpected,
     };
 }
@@ -1047,15 +1047,15 @@ pub fn parseNotification(
 const testing = std.testing;
 
 test "errnoToError maps the errnos devlink actually returns" {
-    try testing.expectEqual(error.AccessDenied, errnoToError(-@as(i32, @intFromEnum(linux.E.PERM))));
+    try testing.expectEqual(error.AccessDenied, errnoToError(-@as(i32, @backingInt(linux.E.PERM))));
     // The single most common devlink outcome: a valid request against a
     // handle no driver has registered.
-    try testing.expectEqual(error.NoSuchDevice, errnoToError(-@as(i32, @intFromEnum(linux.E.NODEV))));
-    try testing.expectEqual(error.NoSuchDevice, errnoToError(-@as(i32, @intFromEnum(linux.E.NOENT))));
-    try testing.expectEqual(error.NotSupported, errnoToError(-@as(i32, @intFromEnum(linux.E.OPNOTSUPP))));
-    try testing.expectEqual(error.InvalidRequest, errnoToError(-@as(i32, @intFromEnum(linux.E.INVAL))));
-    try testing.expectEqual(error.Busy, errnoToError(-@as(i32, @intFromEnum(linux.E.BUSY))));
-    try testing.expectEqual(error.SystemResources, errnoToError(-@as(i32, @intFromEnum(linux.E.NOMEM))));
+    try testing.expectEqual(error.NoSuchDevice, errnoToError(-@as(i32, @backingInt(linux.E.NODEV))));
+    try testing.expectEqual(error.NoSuchDevice, errnoToError(-@as(i32, @backingInt(linux.E.NOENT))));
+    try testing.expectEqual(error.NotSupported, errnoToError(-@as(i32, @backingInt(linux.E.OPNOTSUPP))));
+    try testing.expectEqual(error.InvalidRequest, errnoToError(-@as(i32, @backingInt(linux.E.INVAL))));
+    try testing.expectEqual(error.Busy, errnoToError(-@as(i32, @backingInt(linux.E.BUSY))));
+    try testing.expectEqual(error.SystemResources, errnoToError(-@as(i32, @backingInt(linux.E.NOMEM))));
     try testing.expectEqual(error.Unexpected, errnoToError(0));
     try testing.expectEqual(error.Unexpected, errnoToError(7));
     try testing.expectEqual(error.Unexpected, errnoToError(std.math.minInt(i32)));
@@ -1075,7 +1075,7 @@ test "parseNotification recovers the command and the handle" {
     defer attrs.deinit(gpa);
     try handle_mod.append(gpa, &attrs, .pci("0000:65:00.0"));
     try codec.appendAttrU32(gpa, &attrs, uapi.ATTR.PORT_INDEX, 3);
-    try codec.appendAttrU16(gpa, &attrs, uapi.ATTR.PORT_TYPE, @intFromEnum(uapi.PortType.eth));
+    try codec.appendAttrU16(gpa, &attrs, uapi.ATTR.PORT_TYPE, @backingInt(uapi.PortType.eth));
 
     var n = try parseNotification(gpa, uapi.CMD.PORT_NEW, attrs.items);
     defer n.deinit(gpa);
@@ -1101,7 +1101,7 @@ test "parseNotification on a request-only command is not a notification" {
 test "parseNotification: malformed attributes are typed errors" {
     try testing.expectError(error.Truncated, parseNotification(testing.allocator, 1, &.{ 0x40, 0x00 }));
     // A DEV_NAME longer than `Owned` can hold: rejected, not truncated.
-    const oversize = [_]u8{ 0x45, 0x00, 0x02, 0x00 } ++ [_]u8{'x'} ** 65;
+    const oversize = [_]u8{ 0x45, 0x00, 0x02, 0x00 } ++ @as([65]u8, @splat('x'));
     try testing.expectError(error.BadLength, parseNotification(testing.allocator, 1, &oversize));
 }
 
@@ -1142,7 +1142,7 @@ const Corpus = struct {
         var port_new: std.ArrayList(u8) = .empty;
         try handle_mod.append(gpa, &port_new, .pci("0000:65:00.0"));
         try codec.appendAttrU32(gpa, &port_new, uapi.ATTR.PORT_INDEX, 3);
-        try codec.appendAttrU16(gpa, &port_new, uapi.ATTR.PORT_TYPE, @intFromEnum(uapi.PortType.eth));
+        try codec.appendAttrU16(gpa, &port_new, uapi.ATTR.PORT_TYPE, @backingInt(uapi.PortType.eth));
         self.push(port_new.items, uapi.CMD.PORT_NEW);
 
         // The same bytes under a request-only command: not a notification.
@@ -1158,7 +1158,7 @@ const Corpus = struct {
         self.push(&[_]u8{ 0x40, 0x00 }, uapi.CMD.PORT_NEW);
         // A DEV_NAME longer than `Owned` can hold: rejected, not truncated.
         var oversize: std.ArrayList(u8) = .empty;
-        try codec.appendAttr(gpa, &oversize, uapi.ATTR.DEV_NAME, &[_]u8{'x'} ** 65);
+        try codec.appendAttr(gpa, &oversize, uapi.ATTR.DEV_NAME, &@as([65]u8, @splat('x')));
         self.push(oversize.items, uapi.CMD.PORT_NEW);
 
         return self.entries[0..self.n];
@@ -1398,7 +1398,7 @@ test "Walk.next turns an NLMSG_ERROR's negative errno into an error, not an ACK"
     var list: std.ArrayList(u8) = .empty;
     defer list.deinit(gpa);
     var code: [4]u8 = undefined;
-    std.mem.writeInt(i32, &code, -@as(i32, @intFromEnum(linux.E.NODEV)), @import("builtin").cpu.arch.endian());
+    std.mem.writeInt(i32, &code, -@as(i32, @backingInt(linux.E.NODEV)), @import("builtin").cpu.arch.endian());
     try appendMessage(gpa, &list, codec.NLMSG_ERROR, seq, pid, &code);
 
     var cl: MockDevlink = .{ .sock = .{ .portid = pid, .datagram = list.items }, .family_id = 0x19 };

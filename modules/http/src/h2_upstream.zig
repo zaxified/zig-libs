@@ -533,7 +533,7 @@ test "h2_upstream: a backend host too wide for an entry is REJECTED, not truncat
     // 255 bytes is the widest host an entry holds (`Entry.max_host`).
     // Accepted — and, decisively, it MATCHES ITSELF on the next lookup, so
     // one backend keeps exactly one entry and one connection.
-    const host_255 = "h" ** 255;
+    const host_255 = strRepeat("h", 255);
     const be_255: Backend = .{ .host = host_255, .port = 8080 };
     const e1 = try pool.getOrCreateEntry(be_255);
     try testing.expectEqual(@as(usize, 255), e1.host().len);
@@ -544,7 +544,7 @@ test "h2_upstream: a backend host too wide for an entry is REJECTED, not truncat
     try testing.expectEqual(@as(usize, 1), pool.entries.items.len);
 
     // 256 bytes: a typed error at the first call, and no entry is created.
-    const host_256 = "h" ** 256;
+    const host_256 = strRepeat("h", 256);
     const be_256: Backend = .{ .host = host_256, .port = 8080 };
     try testing.expectError(error.BackendHostTooLong, pool.getOrCreateEntry(be_256));
     try testing.expectError(error.BackendHostTooLong, pool.getOrCreateEntry(be_256));
@@ -670,7 +670,7 @@ test "h2_upstream: large body proxied through (flow control / WINDOW_UPDATE)" {
     // 200 KiB — well past the 64 KiB initial window, so both the send-side
     // (sendBody blocking for grants) and the receive-side (awaitResponse
     // replenishing) WINDOW_UPDATE paths run.
-    const payload = "abcdefgh" ** (25 * 1024); // 200 KiB
+    const payload = strRepeat("abcdefgh", 25 * 1024); // 200 KiB
     var res = pool.roundtrip(be, .{
         .method = .post,
         .path = "/echo",
@@ -730,4 +730,16 @@ test "h2_upstream: buffer pool backs dialed sessions and is reused across dials"
     try testing.expectEqual(@as(usize, 2), bp.checkoutCount());
     try testing.expectEqual(@as(usize, 1), bp.reuseCount()); // second dial reused the slab
     try testing.expectEqual(@as(usize, 1), bp.allocCount()); // only the first ever allocated
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

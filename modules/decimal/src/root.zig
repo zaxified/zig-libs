@@ -1126,7 +1126,7 @@ test "bridge: narrowing rounds the 13th digit with the caller's mode" {
     try expectStr(try Decimal.fromBigDecimal(testing.allocator, nb, .floor), "-0.123456789013");
 
     // Arbitrary precision far past 12 digits, no tie: rounds, never truncates.
-    var wide = try BigDecimal.parse(testing.allocator, "1." ++ "9" ** 60);
+    var wide = try BigDecimal.parse(testing.allocator, "1." ++ strRepeat("9", 60));
     defer wide.deinit();
     try expectStr(try Decimal.fromBigDecimal(testing.allocator, wide, .half_even), "2");
     try expectStr(try Decimal.fromBigDecimal(testing.allocator, wide, .down), "1.999999999999");
@@ -1169,7 +1169,7 @@ test "bridge: out-of-range narrowing is a typed error, checked before allocating
     try testing.expectError(error.Overflow, Decimal.fromBigDecimal(testing.allocator, absurd, .down));
 
     // A coefficient far wider than i128, at a benign exponent.
-    var wide = try BigDecimal.parse(testing.allocator, "9" ** 45 ++ ".5");
+    var wide = try BigDecimal.parse(testing.allocator, strRepeat("9", 45) ++ ".5");
     defer wide.deinit();
     try testing.expectError(error.Overflow, Decimal.fromBigDecimal(testing.allocator, wide, .down));
 }
@@ -1271,7 +1271,7 @@ const parse_seeds = [_][]const u8{
     seed("999999999999999999999999999999"), // Overflow: past i128
     seed("99999999999999999999999999999e36"), // Overflow: mantissa × exponent
     seed("1000000000000000000000000000000000000000000000000000000000000"), // 61 digits
-    seed("9" ** 90), // the width cap: 90 digits, past i256's ~77-digit capacity
+    seed(strRepeat("9", 90)), // the width cap: 90 digits, past i256's ~77-digit capacity
 };
 
 test "fuzz: parse never panics on arbitrary text" {
@@ -1626,8 +1626,8 @@ test "float bridge: huge magnitudes are Overflow, tiny-but-not-negligible ones s
 
 test "parse: documented width and exponent limits sit exactly where the doc comment says" {
     // 60 mantissa digits are accepted, the 61st is the documented Overflow.
-    try testing.expectEqual(Decimal.one.raw, (try Decimal.parse("0" ** 59 ++ "1")).raw);
-    try testing.expectError(error.Overflow, Decimal.parse("0" ** 61));
+    try testing.expectEqual(Decimal.one.raw, (try Decimal.parse(strRepeat("0", 59) ++ "1")).raw);
+    try testing.expectError(error.Overflow, Decimal.parse(strRepeat("0", 61)));
     // Exponent literals: up to 4 digits; a 5th is InvalidCharacter.
     try testing.expectEqual(@as(i128, 100_000) * Decimal.scale_factor, (try Decimal.parse("1e0005")).raw);
     try testing.expectError(error.InvalidCharacter, Decimal.parse("1e00005"));
@@ -1637,7 +1637,7 @@ test "parse: documented width and exponent limits sit exactly where the doc comm
     // 6e47 * 10^-60 = 6e-13 -> half-away rounds to one ulp (Python:
     // Decimal('6E-13').quantize(Decimal('1E-12'), ROUND_HALF_UP) = 1E-12);
     // this drops exactly 48 digits, the largest power the rounder materialises.
-    try testing.expectEqual(@as(i128, 1), (try Decimal.parse("6" ++ "0" ** 47 ++ "e-60")).raw);
+    try testing.expectEqual(@as(i128, 1), (try Decimal.parse("6" ++ strRepeat("0", 47) ++ "e-60")).raw);
 }
 
 test "round: any rounding place past the range is 0, not 'unchanged' (Python quantize -> 0E+37)" {
@@ -1655,7 +1655,19 @@ test "parse: values far below the last place round to 0 instead of Overflow" {
     try testing.expectEqual(@as(i128, 0), (try Decimal.parse("-1e-100")).raw);
     // 60-digit mantissa 5e59 * 10^-70 = 5e-11 = 50 ulps, with the exponent
     // dropping 58 digits (49..60 still divide exactly, then round half-away).
-    try testing.expectEqual(@as(i128, 50), (try Decimal.parse("5" ++ "0" ** 59 ++ "e-70")).raw);
+    try testing.expectEqual(@as(i128, 50), (try Decimal.parse("5" ++ strRepeat("0", 59) ++ "e-70")).raw);
     // Half-away tie at a 49-digit drop: 5e48 * 10^-61 = 5e-13 -> one ulp.
-    try testing.expectEqual(@as(i128, 1), (try Decimal.parse("5" ++ "0" ** 48 ++ "e-61")).raw);
+    try testing.expectEqual(@as(i128, 1), (try Decimal.parse("5" ++ strRepeat("0", 48) ++ "e-61")).raw);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

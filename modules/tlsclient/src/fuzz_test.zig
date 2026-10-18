@@ -58,10 +58,10 @@ pub fn damage(src: anytype, buf: []u8, frame: []const u8) usize {
 /// Reach counters for one harness file's labels (see jwt's fuzz_test.zig).
 pub fn Marker(comptime Label: type) type {
     return struct {
-        var counts: [@typeInfo(Label).@"enum".fields.len]usize = @splat(0);
+        var counts: [@typeInfo(Label).@"enum".field_names.len]usize = @splat(0);
 
         pub fn mark(comptime l: Label) void {
-            counts[@intFromEnum(l)] += 1;
+            counts[@backingInt(l)] += 1;
             fuzz_driver.hit(@tagName(l));
         }
 
@@ -76,7 +76,7 @@ pub fn Marker(comptime Label: type) type {
                 };
             }
             for (counts, 0..) |n, i| if (n == 0) {
-                std.debug.print("reach: " ++ name ++ " label {t} never hit in {d} seeds\n", .{ @as(Label, @enumFromInt(i)), seeds });
+                std.debug.print("reach: " ++ name ++ " label {t} never hit in {d} seeds\n", .{ @as(Label, @fromBackingInt(@intCast(i))), seeds });
                 return error.HarnessDoesNotReach;
             };
         }
@@ -190,7 +190,7 @@ fn runClient(input: []const u8, out_copy: ?*Writer) Outcome {
 }
 
 fn hsMsg(buf: []u8, typ: tls.HandshakeType, body: []const u8) []const u8 {
-    buf[0] = @intFromEnum(typ);
+    buf[0] = @backingInt(typ);
     std.mem.writeInt(u24, buf[1..4], @intCast(body.len), .big);
     @memcpy(buf[4..][0..body.len], body);
     return buf[0 .. 4 + body.len];
@@ -203,7 +203,7 @@ var cur_nrecords: *usize = &tm.f13_nrecords;
 fn putRecord(w: *Writer, ct: tls.ContentType, body: []const u8) void {
     cur_records[cur_nrecords.*] = w.end;
     cur_nrecords.* += 1;
-    w.writeByte(@intFromEnum(ct)) catch unreachable;
+    w.writeByte(@backingInt(ct)) catch unreachable;
     w.writeAll(&.{ 3, 3 }) catch unreachable;
     w.writeInt(u16, @intCast(body.len), .big) catch unreachable;
     w.writeAll(body) catch unreachable;
@@ -212,10 +212,10 @@ fn putRecord(w: *Writer, ct: tls.ContentType, body: []const u8) void {
 fn putEncrypted(w: *Writer, key: [16]u8, iv: [12]u8, seq: u64, ct: tls.ContentType, msg: []const u8) void {
     var inner: [2048]u8 = undefined;
     @memcpy(inner[0..msg.len], msg);
-    inner[msg.len] = @intFromEnum(ct);
+    inner[msg.len] = @backingInt(ct);
     const n = msg.len + 1;
     var rec: [2048 + 16]u8 = undefined;
-    var header: [5]u8 = .{ @intFromEnum(tls.ContentType.application_data), 3, 3, 0, 0 };
+    var header: [5]u8 = .{ @backingInt(tls.ContentType.application_data), 3, 3, 0, 0 };
     std.mem.writeInt(u16, header[3..5], @intCast(n + 16), .big);
     var nonce = iv;
     var seq_be: [8]u8 = undefined;
@@ -239,28 +239,28 @@ fn ensureTemplates() !void {
     const session_echo = tm.entropy[32..64];
     const client_rand = tm.entropy[0..32];
     const client_x25519 = try X25519.KeyPair.generateDeterministic(tm.entropy[208..240].*);
-    const srv_sk: [32]u8 = [_]u8{0x5c} ** 32;
+    const srv_sk: [32]u8 = @as([32]u8, @splat(0x5c));
     const srv_pub = try X25519.recoverPublicKey(srv_sk);
-    const server_rand: [32]u8 = [_]u8{0x77} ** 32;
+    const server_rand: [32]u8 = @as([32]u8, @splat(0x77));
 
     // ── TLS 1.3 ─────────────────────────────────────────────────────────────
     var sh: [128]u8 = undefined;
     var shw = Writer.fixed(&sh);
-    shw.writeByte(@intFromEnum(tls.HandshakeType.server_hello)) catch unreachable;
+    shw.writeByte(@backingInt(tls.HandshakeType.server_hello)) catch unreachable;
     shw.writeInt(u24, 0, .big) catch unreachable; // patched
     shw.writeInt(u16, 0x0303, .big) catch unreachable;
     shw.writeAll(&server_rand) catch unreachable;
     shw.writeByte(32) catch unreachable;
     shw.writeAll(session_echo) catch unreachable;
-    shw.writeInt(u16, @intFromEnum(tls.CipherSuite.AES_128_GCM_SHA256), .big) catch unreachable;
+    shw.writeInt(u16, @backingInt(tls.CipherSuite.AES_128_GCM_SHA256), .big) catch unreachable;
     shw.writeByte(0) catch unreachable;
     shw.writeInt(u16, 6 + 4 + 4 + 32, .big) catch unreachable;
-    shw.writeInt(u16, @intFromEnum(tls.ExtensionType.supported_versions), .big) catch unreachable;
+    shw.writeInt(u16, @backingInt(tls.ExtensionType.supported_versions), .big) catch unreachable;
     shw.writeInt(u16, 2, .big) catch unreachable;
     shw.writeInt(u16, 0x0304, .big) catch unreachable;
-    shw.writeInt(u16, @intFromEnum(tls.ExtensionType.key_share), .big) catch unreachable;
+    shw.writeInt(u16, @backingInt(tls.ExtensionType.key_share), .big) catch unreachable;
     shw.writeInt(u16, 4 + 32, .big) catch unreachable;
-    shw.writeInt(u16, @intFromEnum(tls.NamedGroup.x25519), .big) catch unreachable;
+    shw.writeInt(u16, @backingInt(tls.NamedGroup.x25519), .big) catch unreachable;
     shw.writeInt(u16, 32, .big) catch unreachable;
     shw.writeAll(&srv_pub) catch unreachable;
     std.mem.writeInt(u24, sh[1..4], @intCast(shw.end - 4), .big);
@@ -280,17 +280,17 @@ fn ensureTemplates() !void {
         const cookie = "fuzz-cookie-0123";
         hw.writeAll(&.{ 22, 3, 3 }) catch unreachable;
         hw.writeInt(u16, 0, .big) catch unreachable; // patched
-        hw.writeByte(@intFromEnum(tls.HandshakeType.server_hello)) catch unreachable;
+        hw.writeByte(@backingInt(tls.HandshakeType.server_hello)) catch unreachable;
         hw.writeInt(u24, 0, .big) catch unreachable; // patched
         hw.writeInt(u16, 0x0303, .big) catch unreachable;
         hw.writeAll(&tls.hello_retry_request_sequence) catch unreachable;
         hw.writeByte(32) catch unreachable;
         hw.writeAll(session_echo) catch unreachable;
-        hw.writeInt(u16, @intFromEnum(tls.CipherSuite.AES_128_GCM_SHA256), .big) catch unreachable;
+        hw.writeInt(u16, @backingInt(tls.CipherSuite.AES_128_GCM_SHA256), .big) catch unreachable;
         hw.writeByte(0) catch unreachable;
         hw.writeInt(u16, 6 + 4 + 2 + cookie.len, .big) catch unreachable;
         hw.writeAll(&.{ 0, 43, 0, 2, 3, 4 }) catch unreachable; // supported_versions: 1.3
-        hw.writeInt(u16, @intFromEnum(tls.ExtensionType.cookie), .big) catch unreachable;
+        hw.writeInt(u16, @backingInt(tls.ExtensionType.cookie), .big) catch unreachable;
         hw.writeInt(u16, 2 + cookie.len, .big) catch unreachable;
         hw.writeInt(u16, cookie.len, .big) catch unreachable;
         hw.writeAll(cookie) catch unreachable;
@@ -304,7 +304,7 @@ fn ensureTemplates() !void {
         var h1: [32]u8 = undefined;
         Sha256.hash(client_hello[tls.record_header_len..], &h1, .{});
         var thh = Sha256.init(.{});
-        thh.update(&.{ @intFromEnum(tls.HandshakeType.message_hash), 0, 0, 32 });
+        thh.update(&.{ @backingInt(tls.HandshakeType.message_hash), 0, 0, 32 });
         thh.update(&h1);
         thh.update(hrr_record[tls.record_header_len..]);
         thh.update(ch2);
@@ -331,7 +331,7 @@ fn ensureTemplates() !void {
     // The certificate's key is P-256, so the suite is ECDHE_ECDSA (RFC 8422
     // §5.3; the client checks the pairing since 2026-10-13 -- std accepted
     // ECDHE_RSA here).
-    bw.writeInt(u16, @intFromEnum(tls.CipherSuite.ECDHE_ECDSA_WITH_AES_128_GCM_SHA256), .big) catch unreachable;
+    bw.writeInt(u16, @backingInt(tls.CipherSuite.ECDHE_ECDSA_WITH_AES_128_GCM_SHA256), .big) catch unreachable;
     bw.writeByte(0) catch unreachable;
     putPlain(&w12, hsMsg(&m12, .server_hello, body[0..bw.end]));
 
@@ -343,7 +343,7 @@ fn ensureTemplates() !void {
 
     var params: [3 + 1 + 32]u8 = undefined;
     params[0] = 3;
-    std.mem.writeInt(u16, params[1..3], @intFromEnum(tls.NamedGroup.x25519), .big);
+    std.mem.writeInt(u16, params[1..3], @backingInt(tls.NamedGroup.x25519), .big);
     params[3] = 32;
     params[4..][0..32].* = srv_pub;
     var to_sign: [32 + 32 + params.len]u8 = undefined;
@@ -353,7 +353,7 @@ fn ensureTemplates() !void {
     const sig12 = (try kp.sign(&to_sign, null)).toDer(&sig_der);
     bw = Writer.fixed(&body);
     bw.writeAll(&params) catch unreachable;
-    bw.writeInt(u16, @intFromEnum(tls.SignatureScheme.ecdsa_secp256r1_sha256), .big) catch unreachable;
+    bw.writeInt(u16, @backingInt(tls.SignatureScheme.ecdsa_secp256r1_sha256), .big) catch unreachable;
     bw.writeInt(u16, @intCast(sig12.len), .big) catch unreachable;
     bw.writeAll(sig12) catch unreachable;
     putPlain(&w12, hsMsg(&m12, .server_key_exchange, body[0..bw.end]));
@@ -371,7 +371,7 @@ fn buildFlight13(out: []u8, prefix: []const u8, th0: Sha256, server_hello: []con
     th.update(server_hello);
     const hello_hash = th.peek();
     const shared = try X25519.scalarmult(srv_sk, client_x25519_pub);
-    const zeroes = [1]u8{0} ** 32;
+    const zeroes = @as([32]u8, @splat(0));
     const early = Hkdf.extract(&[1]u8{0}, &zeroes);
     const empty = tls.emptyHash(Sha256);
     const hs_derived = tls.hkdfExpandLabel(Hkdf, early, "derived", &empty, 32);
@@ -401,13 +401,13 @@ fn buildFlight13(out: []u8, prefix: []const u8, th0: Sha256, server_hello: []con
     putEncrypted(&w13, key, iv, 1, .handshake, cert);
 
     const kp = try Es256.KeyPair.fromSecretKey(try Es256.SecretKey.fromBytes(server_key_der[7..39].*));
-    const signed = " " ** 64 ++ "TLS 1.3, server CertificateVerify\x00";
+    const signed = strRepeat(" ", 64) ++ "TLS 1.3, server CertificateVerify\x00";
     var cv_msg: [signed.len + 32]u8 = undefined;
     cv_msg[0..signed.len].* = signed.*;
     cv_msg[signed.len..].* = th.peek();
     var sig_der: [Es256.Signature.der_encoded_length_max]u8 = undefined;
     const sig = (try kp.sign(&cv_msg, null)).toDer(&sig_der);
-    std.mem.writeInt(u16, body[0..2], @intFromEnum(tls.SignatureScheme.ecdsa_secp256r1_sha256), .big);
+    std.mem.writeInt(u16, body[0..2], @backingInt(tls.SignatureScheme.ecdsa_secp256r1_sha256), .big);
     std.mem.writeInt(u16, body[2..4], @intCast(sig.len), .big);
     @memcpy(body[4..][0..sig.len], sig);
     const cv = hsMsg(&buf, .certificate_verify, body[0 .. 4 + sig.len]);
@@ -441,7 +441,7 @@ fn buildFlight13(out: []u8, prefix: []const u8, th0: Sha256, server_hello: []con
 }
 
 fn putPlain(w: *Writer, msg: []const u8) void {
-    w.writeByte(@intFromEnum(tls.ContentType.handshake)) catch unreachable;
+    w.writeByte(@backingInt(tls.ContentType.handshake)) catch unreachable;
     w.writeAll(&.{ 3, 3 }) catch unreachable;
     w.writeInt(u16, @intCast(msg.len), .big) catch unreachable;
     w.writeAll(msg) catch unreachable;
@@ -610,7 +610,7 @@ test "a short or all-zero application record ends the read with an error, not an
 /// padding included by the caller).
 fn putEncryptedRaw(w: *Writer, key: [16]u8, iv: [12]u8, seq: u64, inner: []const u8) void {
     var rec: [2048 + 16]u8 = undefined;
-    var header: [5]u8 = .{ @intFromEnum(tls.ContentType.application_data), 3, 3, 0, 0 };
+    var header: [5]u8 = .{ @backingInt(tls.ContentType.application_data), 3, 3, 0, 0 };
     std.mem.writeInt(u16, header[3..5], @intCast(inner.len + 16), .big);
     var nonce = iv;
     var seq_be: [8]u8 = undefined;
@@ -618,4 +618,16 @@ fn putEncryptedRaw(w: *Writer, key: [16]u8, iv: [12]u8, seq: u64, inner: []const
     for (nonce[4..], seq_be) |*b, sb| b.* ^= sb;
     Aead.encrypt(rec[0..inner.len], rec[inner.len..][0..16], inner, &header, nonce, key);
     putRecord(w, .application_data, rec[0 .. inner.len + 16]);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

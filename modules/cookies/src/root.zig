@@ -890,7 +890,7 @@ test "set: an over-long cookie is refused, not truncated" {
     // not a truncation.
     var out2: Writer = .fixed(&out_buf);
     var rw2: http.Server.ResponseWriter = .init(&out2, &body_buf, &chunk_buf, .{});
-    try rw2.setHeader("X-Pad", "p" ** 64);
+    try rw2.setHeader("X-Pad", strRepeat("p", 64));
     var big: [max_set_cookie_bytes - 40]u8 = undefined;
     @memset(&big, 'y');
     try testing.expectError(error.HeaderBytesExhausted, set(&rw2, .{ .name = "n", .value = &big }));
@@ -958,7 +958,7 @@ const cookie_seeds = [_][]const u8{
     seed("a=1;;b=2"), // an empty segment between two real ones
     seed("\"=\"; \"=\""), // a quote where a name should be
     seed("a=\t\\,XYZ019"), // the tab, backslash and comma the old alphabet carried
-    seed("a=1; " ** 60), // 300 octets of repetition: a long header, well inside the 512 buffer
+    seed(strRepeat("a=1; ", 60)), // 300 octets of repetition: a long header, well inside the 512 buffer
     seed(""), // zero length: the ONLY input this target ever ran
 };
 
@@ -1014,4 +1014,16 @@ test "find matches the cookie name case-sensitively" {
     // case-folding match would let `SESSION=…` stand in for `session`.
     try testing.expectEqualStrings("b", find("Session=a; session=b", "session").?);
     try testing.expectEqual(@as(?[]const u8, null), find("SESSION=x", "session"));
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

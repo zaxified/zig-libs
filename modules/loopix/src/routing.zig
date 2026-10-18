@@ -136,7 +136,7 @@ test "sphinx plumbing: a real onion carries (next_hop, delay) per hop and peels 
     }
     const payloads = [_][]const u8{ &payload_bufs[0], &payload_bufs[1], &payload_bufs[2] };
 
-    const session_key = [_]u8{0x42} ** 32;
+    const session_key = @as([32]u8, @splat(0x42));
     const ad = "loopix-mix";
     var pkt = try sphinx.construct(&session_key, &pubs, &payloads, ad);
 

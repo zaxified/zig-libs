@@ -649,7 +649,7 @@ test "golden interop: an auth field of the wrong length inside a real envelope" 
         .engine_boots = 1,
         .engine_time = 15,
         .user_name = "md5User",
-        .auth_params = &[_]u8{0} ** 11,
+        .auth_params = &@as([11]u8, @splat(0)),
         .priv_params = &.{},
     });
     var buf: [512]u8 = undefined;
@@ -676,7 +676,7 @@ test "golden interop: a ScopedPDU that fails to decrypt is a typed error" {
     // Wrong salt → wrong IV → garbage plaintext → BER failure (or, at worst, a
     // structure that does not match the real one). Never a panic.
     var out: [512]u8 = undefined;
-    const bad_salt = [_]u8{0xff} ** 8;
+    const bad_salt = @as([8]u8, @splat(0xff));
     if (priv.decryptScopedPdu(.des_cbc, key, sp.engine_boots, sp.engine_time, &bad_salt, m.data.encrypted, &out)) |scoped| {
         try testing.expect(!std.mem.eql(u8, scoped.context_engine_id, &engine_id));
     } else |_| {}

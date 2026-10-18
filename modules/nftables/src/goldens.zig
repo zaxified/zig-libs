@@ -1247,7 +1247,7 @@ test "golden: interval 255.255.255.0/24 is open (no element past the top)" {
 }
 
 test "golden: interval 2001:db8::/32 (16-byte keys, end 2001:db9::)" {
-    const a: [16]u8 = .{ 0x20, 0x01, 0x0d, 0xb8 } ++ [_]u8{0} ** 12;
+    const a: [16]u8 = .{ 0x20, 0x01, 0x0d, 0xb8 } ++ @as([12]u8, @splat(0));
     const r = try wire.prefixInterval(16, a, 32);
     var two: [2]wire.SetElem = undefined;
     const pair = r.elems(&two);
@@ -1255,7 +1255,7 @@ test "golden: interval 2001:db8::/32 (16-byte keys, end 2001:db9::)" {
     defer b.deinit();
     try b.addSetElems(.inet, "filter", "b6", 3, &.{
         // nft's empty-set leading marker again, supplied by hand.
-        .{ .key = &([_]u8{0} ** 16), .flags = wire.NFT_SET_ELEM_INTERVAL_END },
+        .{ .key = &(@as([16]u8, @splat(0))), .flags = wire.NFT_SET_ELEM_INTERVAL_END },
         pair[0],
         pair[1],
     });
@@ -1284,7 +1284,7 @@ test "interval helpers: carries, bounds and refusals" {
     try testing.expectEqualSlices(u8, &.{ 192, 0, 2, 128 }, &half.start);
     try testing.expectEqualSlices(u8, &.{ 192, 0, 3, 0 }, &half.end);
     try testing.expectError(error.InvalidPrefixLength, wire.prefixInterval(4, .{ 1, 2, 3, 4 }, 33));
-    try testing.expectError(error.InvalidPrefixLength, wire.prefixInterval(16, [_]u8{0} ** 16, 129));
+    try testing.expectError(error.InvalidPrefixLength, wire.prefixInterval(16, @as([16]u8, @splat(0)), 129));
 }
 
 test "golden: inet ingress chain on lo (hooknum 5 = NF_INET_INGRESS)" {
@@ -1302,7 +1302,7 @@ test "golden: inet ingress chain on lo (hooknum 5 = NF_INET_INGRESS)" {
     try expectGolden(g_add_chain_inet_ingress, try b.finish());
 }
 
-const db8: [16]u8 = .{ 0x20, 0x01, 0x0d, 0xb8 } ++ [_]u8{0} ** 12;
+const db8: [16]u8 = .{ 0x20, 0x01, 0x0d, 0xb8 } ++ @as([12]u8, @splat(0));
 
 test "golden: rule — ip6 saddr 2001:db8::/32 drop (byte-aligned, 4-byte load at 8)" {
     var p = expr.Program.init(gpa, .inet);
@@ -1330,11 +1330,11 @@ test "golden: rule — ip6 saddr 2001:db8::/33 drop (bitwise ffffffff80…)" {
 test "ipv6MaskBytes: boundaries and refusal" {
     // /33 = 32 one-bits then one more: ff ff ff ff 80 00 … (the capture's mask).
     const m33 = try expr.ipv6MaskBytes(33);
-    try testing.expectEqualSlices(u8, &(.{ 0xff, 0xff, 0xff, 0xff, 0x80 } ++ [_]u8{0} ** 11), &m33);
+    try testing.expectEqualSlices(u8, &(.{ 0xff, 0xff, 0xff, 0xff, 0x80 } ++ @as([11]u8, @splat(0))), &m33);
     const m0 = try expr.ipv6MaskBytes(0);
-    try testing.expectEqualSlices(u8, &([_]u8{0} ** 16), &m0);
+    try testing.expectEqualSlices(u8, &(@as([16]u8, @splat(0))), &m0);
     const m128 = try expr.ipv6MaskBytes(128);
-    try testing.expectEqualSlices(u8, &([_]u8{0xff} ** 16), &m128);
+    try testing.expectEqualSlices(u8, &(@as([16]u8, @splat(0xff))), &m128);
     const m127 = try expr.ipv6MaskBytes(127);
     try testing.expectEqual(@as(u8, 0xfe), m127[15]);
     try testing.expectError(error.InvalidPrefixLength, expr.ipv6MaskBytes(129));
@@ -1378,7 +1378,7 @@ test "ip6 prefix clears host bits before the cmp (2001:db8:ffff::1/33)" {
     _ = p.ip6SaddrPrefix(addr, 33);
     const exprs = try p.finish();
     const last = exprs[exprs.len - 1].cmp.data.value;
-    try testing.expectEqualSlices(u8, &(.{ 0x20, 0x01, 0x0d, 0xb8, 0x80 } ++ [_]u8{0} ** 11), last);
+    try testing.expectEqualSlices(u8, &(.{ 0x20, 0x01, 0x0d, 0xb8, 0x80 } ++ @as([11]u8, @splat(0))), last);
 }
 
 test "payloadVmap refuses a key wider than one register" {

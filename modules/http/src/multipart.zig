@@ -1202,7 +1202,7 @@ test "Reader.init refuses a boundary RFC 2046 forbids or the buffer cannot hold"
     var in_buf: [80]u8 = undefined;
     var chunked: ChunkedReader = .init("", 1, &in_buf);
     var hdr: [header_buf_len]u8 = undefined;
-    const b70 = "b" ** 70;
+    const b70 = strRepeat("b", 70);
     try testing.expectError(error.MalformedBody, Reader.init(&chunked.interface, "", &hdr, .{}));
     try testing.expectError(error.MalformedBody, Reader.init(&chunked.interface, b70 ++ "b", &hdr, .{}));
     _ = try Reader.init(&chunked.interface, b70, &hdr, .{});
@@ -1242,7 +1242,7 @@ test "header_buf_len is the default cap plus the blank line" {
 test "Reader: an endless header block stops at max_header_bytes, not at the end of header_buf" {
     // `parse` would call this malformed once the body ran out; the reader
     // must stop reading at the cap, however much storage it was lent.
-    const src = db ++ crlf ++ "X-Long: " ++ "a" ** 200;
+    const src = db ++ crlf ++ "X-Long: " ++ strRepeat("a", 200);
     var in_buf: [64]u8 = undefined;
     var chunked: ChunkedReader = .init(src, 7, &in_buf);
     var hdr: [256]u8 = undefined;
@@ -1351,4 +1351,16 @@ test "a disposition with more parameters than max_disposition_params is dropped,
         else
             try testing.expectEqual(@as(?[]const u8, null), p.name);
     }
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

@@ -1,7 +1,7 @@
 .{
     .name = .http_service,
     .version = "0.0.0",
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .fingerprint = 0xe486bf192c6d2305,
     .paths = .{ "build.zig", "build.zig.zon", "src", "init.sh", "smoke.sh", "README.md" },
     .dependencies = .{

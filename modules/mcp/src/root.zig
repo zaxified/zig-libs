@@ -5271,7 +5271,7 @@ test "initialize: an over-long clientInfo field is truncated, not rejected" {
     defer s.deinit();
     try testing.expect(s.max_client_info_field_len < 300); // the test assumes the default cap
 
-    const long_name = "a" ** 300;
+    const long_name = strRepeat("a", 300);
     const msg = try std.fmt.allocPrint(
         testing.allocator,
         "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{{}},\"clientInfo\":{{\"name\":\"{s}\",\"version\":\"{s}\",\"title\":\"{s}\"}}}}}}",
@@ -7455,7 +7455,7 @@ const ResponseFuzzProbe = struct {
                 self.err_payloads += 1;
                 std.mem.doNotOptimizeAway(e.code);
                 std.mem.doNotOptimizeAway(e.message.len);
-                if (e.data) |d| std.mem.doNotOptimizeAway(@intFromEnum(std.meta.activeTag(d)));
+                if (e.data) |d| std.mem.doNotOptimizeAway(@backingInt(std.meta.activeTag(d)));
                 if (resp.userRejected()) self.rejected += 1;
             },
             .result => {},
@@ -7475,7 +7475,7 @@ const ResponseFuzzProbe = struct {
         } else |_| {}
         if (resp.elicitationResult()) |r| {
             if (resp.kind == .elicitation) self.elicitation_ok += 1;
-            std.mem.doNotOptimizeAway(@intFromEnum(r.action));
+            std.mem.doNotOptimizeAway(@backingInt(r.action));
             if (r.content) |c| std.mem.doNotOptimizeAway(c == .object);
         } else |_| {}
     }
@@ -8650,7 +8650,7 @@ test "mcp: 2026-07-28 spec-anchor classification matches servedStatelessly (cana
     // Both directions, as the session canary: every method a modern request
     // may call is anchored here, and nothing here is unreachable statelessly.
     inline for (std.meta.fields(DispatchMethod)) |f| {
-        const m: DispatchMethod = @enumFromInt(f.value);
+        const m: DispatchMethod = @fromBackingInt(@intCast(f.value));
         var found = false;
         for (modern_spec_anchor_index) |a| {
             if (eql(a.method, f.name)) found = true;
@@ -9206,10 +9206,10 @@ test "subscriptions/listen: integer ids echo as integers; a non-object filter is
 const fuzz_driver = @import("testkit").fuzz.driver;
 
 const FuzzLabel = enum { error_reply, ok_reply, error_payload, result_unparsed };
-var fuzz_reach: [@typeInfo(FuzzLabel).@"enum".fields.len]usize = @splat(0);
+var fuzz_reach: [@typeInfo(FuzzLabel).@"enum".field_names.len]usize = @splat(0);
 
 fn fuzz_mark(comptime l: FuzzLabel) void {
-    fuzz_reach[@intFromEnum(l)] += 1;
+    fuzz_reach[@backingInt(l)] += 1;
     fuzz_driver.hit(@tagName(l));
 }
 
@@ -9278,7 +9278,19 @@ test "fuzz harness: 400 seeds in every test run, and they get everywhere" {
         }
     }
     for (fuzz_reach, 0..) |n, i| if (n == 0) {
-        std.debug.print("reach: label {t} never hit in 400 seeds\n", .{@as(FuzzLabel, @enumFromInt(i))});
+        std.debug.print("reach: label {t} never hit in 400 seeds\n", .{@as(FuzzLabel, @fromBackingInt(@intCast(i)))});
         return error.HarnessDoesNotReach;
     };
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

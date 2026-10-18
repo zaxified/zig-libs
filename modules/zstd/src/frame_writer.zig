@@ -214,7 +214,7 @@ test "splat writes fill frames like any other" {
     try fw.writer.splatByteAll('z', 2500);
     try fw.writer.splatBytesAll("ab", 300);
     try fw.finish();
-    const src = "head:" ++ "z" ** 2500 ++ "ab" ** 300;
+    const src = "head:" ++ strRepeat("z", 2500) ++ strRepeat("ab", 300);
     try expectFrames(&.{ src[0..1000], src[1000..2000], src[2000..3000], src[3000..] }, .{ .level = -1 }, out.written());
 }
 
@@ -260,4 +260,16 @@ test "a failing output is WriteFailed with no cause of our own" {
     try fw.writer.writeAll("more than four bytes of frame");
     try testing.expectError(error.WriteFailed, fw.writer.flush());
     try testing.expectEqual(null, fw.err);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

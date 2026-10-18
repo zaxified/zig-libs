@@ -31,7 +31,7 @@ pub fn main() !void {
         defer writer.deinit();
 
         try writer.addEntry("summary.csv", "id,total\n1,42\n2,17\n", .{ .method = .store });
-        const long_text = "row,value\n" ** 200; // compresses well
+        const long_text = strRepeat("row,value\n", 200); // compresses well
         try writer.addEntry("detail.csv", long_text, .{ .method = .deflate });
 
         // A member name that would escape the extraction directory on
@@ -75,4 +75,16 @@ pub fn main() !void {
     std.debug.print("summary.csv content round-tripped:\n{s}", .{content.items});
     if (er.crcMismatch()) return error.Crc32UnexpectedlyMismatched;
     std.debug.print("crc32 verified: true\n", .{});
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

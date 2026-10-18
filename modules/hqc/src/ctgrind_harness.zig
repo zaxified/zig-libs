@@ -73,10 +73,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     std.debug.print("valgrind_support={} target={s}\n", .{ builtin.valgrind_support, target });
 
-    var seed: [32]u8 = [_]u8{0x5A} ** 32;
+    var seed: [32]u8 = @as([32]u8, @splat(0x5A));
     var kp: Kem.KeyPair = undefined;
     Kem.keypair(&kp, &seed);
-    var coins: [Kem.coins_bytes]u8 = [_]u8{0x21} ** Kem.coins_bytes;
+    var coins: [Kem.coins_bytes]u8 = @as([Kem.coins_bytes]u8, @splat(0x21));
     var enc_ct: Kem.Ciphertext = undefined;
     var enc_ss: Kem.SharedSecret = undefined;
     Kem.encaps(&enc_ct, &enc_ss, &kp.ek, &coins);
@@ -106,7 +106,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         // The hottest secret path in the module: the fixed-weight sampler that
         // scatters the long-term secret vector `y`, run on every decapsulation.
         // This is where `writeSupportToVector` lives.
-        var sd: [32]u8 = [_]u8{0x11} ** 32;
+        var sd: [32]u8 = @as([32]u8, @splat(0x11));
         taint(t, sd[0..]);
         var xof = root.prng.Xof.init(&sd);
         const P = params.hqc128;

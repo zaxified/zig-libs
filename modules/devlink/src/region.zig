@@ -718,7 +718,7 @@ test "appendRead and the snapshot builders reject impossible arguments" {
         gpa,
         &list,
         h,
-        "r" ** (uapi.name_max + 1),
+        strRepeat("r", uapi.name_max + 1),
         1,
     ));
 }
@@ -774,8 +774,8 @@ const Corpus = struct {
         // ascending address order.
         var chunks: std.ArrayList(u8) = .empty;
         try buildChunks(gpa, &chunks, &.{
-            .{ .addr = 0, .data = &[_]u8{0xaa} ** 32 },
-            .{ .addr = 32, .data = &[_]u8{0xbb} ** 32 },
+            .{ .addr = 0, .data = &@as([32]u8, @splat(0xaa)) },
+            .{ .addr = 32, .data = &@as([32]u8, @splat(0xbb)) },
         });
         self.push(chunks.items);
 
@@ -783,9 +783,9 @@ const Corpus = struct {
         // assembler's 256-octet window.
         var reordered: std.ArrayList(u8) = .empty;
         try buildChunks(gpa, &reordered, &.{
-            .{ .addr = 64, .data = &[_]u8{0xcc} ** 16 },
-            .{ .addr = 0, .data = &[_]u8{0xdd} ** 16 },
-            .{ .addr = 4096, .data = &[_]u8{0xee} ** 16 },
+            .{ .addr = 64, .data = &@as([16]u8, @splat(0xcc)) },
+            .{ .addr = 0, .data = &@as([16]u8, @splat(0xdd)) },
+            .{ .addr = 4096, .data = &@as([16]u8, @splat(0xee)) },
         });
         self.push(reordered.items);
 
@@ -796,7 +796,7 @@ const Corpus = struct {
         {
             const top = try codec.nestBegin(gpa, &no_addr, uapi.ATTR.REGION_CHUNKS);
             const one = try codec.nestBegin(gpa, &no_addr, uapi.ATTR.REGION_CHUNK);
-            try codec.appendAttr(gpa, &no_addr, uapi.ATTR.REGION_CHUNK_DATA, &[_]u8{0x11} ** 8);
+            try codec.appendAttr(gpa, &no_addr, uapi.ATTR.REGION_CHUNK_DATA, &@as([8]u8, @splat(0x11)));
             try codec.nestEnd(&no_addr, one);
             try codec.nestEnd(&no_addr, top);
         }
@@ -1015,4 +1015,16 @@ test "buildRegions dumps, buildRegion and buildDelSnapshot name one region" {
         .region = "cr-space",
         .length = 0,
     }));
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

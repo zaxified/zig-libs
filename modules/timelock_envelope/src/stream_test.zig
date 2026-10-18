@@ -127,11 +127,11 @@ test "stream round-trips across all three HQC parameter sets" {
         const E = pair[0];
         const K = pair[1];
         var kp: K.KeyPair = undefined;
-        K.keypair(&kp, &[_]u8{0x07} ** 32);
+        K.keypair(&kp, &@as([32]u8, @splat(0x07)));
         const rnd: E.SealRandomness = .{
-            .s_time = [_]u8{0x44} ** envelope.time_secret_bytes,
-            .tlock_sigma = [_]u8{0x55} ** envelope.time_secret_bytes,
-            .kem_coins = [_]u8{0x66} ** K.coins_bytes,
+            .s_time = @as([envelope.time_secret_bytes]u8, @splat(0x44)),
+            .tlock_sigma = @as([envelope.time_secret_bytes]u8, @splat(0x55)),
+            .kem_coins = @as([K.coins_bytes]u8, @splat(0x66)),
         };
         const pt = "the launch codes expire at dawn";
         var aw: std.Io.Writer.Allocating = .init(testing.allocator);
@@ -256,7 +256,7 @@ test "a stream sealed for one HQC set is SuiteMismatch for another" {
     const wire = try sealAlloc("secret", kp);
     defer testing.allocator.free(wire);
     var kp256: hqc.Hqc256.KeyPair = undefined;
-    hqc.Hqc256.keypair(&kp256, &[_]u8{0x01} ** 32);
+    hqc.Hqc256.keypair(&kp256, &@as([32]u8, @splat(0x01)));
     var out: std.Io.Writer.Allocating = .init(testing.allocator);
     defer out.deinit();
     var r: std.Io.Reader = .fixed(wire);

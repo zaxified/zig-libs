@@ -122,7 +122,7 @@ pub const RANDOM_CHALLENGE_KZG_BATCH_DOMAIN = "RCKZGBATCH___V1_";
 /// allowed to skip the subgroup check (spec: "Perform ... KeyValidate ...
 /// but do allow the identity point").
 pub const G1_POINT_AT_INFINITY: Bytes48 = blk: {
-    var out: Bytes48 = [_]u8{0} ** 48;
+    var out: Bytes48 = @as([48]u8, @splat(0));
     out[0] = 0xc0;
     break :blk out;
 };
@@ -614,7 +614,7 @@ pub fn computePowers(allocator: std.mem.Allocator, x: Fr, n: usize) ![]Fr {
 /// embedding — always canonical for `u64`-sized values, `r` being
 /// ~2^255).
 fn frFromU64(v: u64) Fr {
-    var bytes = [_]u8{0} ** 32;
+    var bytes = @as([32]u8, @splat(0));
     std.mem.writeInt(u64, bytes[24..32], v, .big);
     return Fr.fromBytes(bytes) catch unreachable; // v << r
 }
@@ -630,7 +630,7 @@ const root32_exponent_bytes: [32]u8 = blk: {
     var r_minus_1 = scalar.r_bytes;
     if (r_minus_1[31] != 0x01) @compileError("bls12_381/kzg: r_bytes' low byte is expected to be 0x01");
     r_minus_1[31] = 0x00;
-    var shifted = [_]u8{0} ** 32;
+    var shifted = @as([32]u8, @splat(0));
     @memcpy(shifted[4..32], r_minus_1[0..28]);
     break :blk shifted;
 };
@@ -674,7 +674,7 @@ pub fn computeRootsOfUnity(allocator: std.mem.Allocator, order: usize) ![]Fr {
     const log2_order: u6 = std.math.log2_int(usize, order);
     const shift: u6 = 32 - log2_order;
     const exponent: u64 = @as(u64, 1) << shift;
-    var exponent_bytes: [32]u8 = [_]u8{0} ** 32;
+    var exponent_bytes: [32]u8 = @as([32]u8, @splat(0));
     std.mem.writeInt(u64, exponent_bytes[24..32], exponent, .big);
     const root_order = root_32.pow(exponent_bytes);
     return computePowers(allocator, root_order, order);
@@ -1409,9 +1409,9 @@ test "KAT: blobToKzgCommitment — c-kzg-4844 valid_blob_1 (constant) + valid_bl
 test "KAT: computeKzgProof — compute_kzg_proof_case_valid_blob_1_0 byte-exact" {
     const setup = testSetup();
     const blob = loadTestBlobConstant2();
-    const z_bytes: Bytes32 = [_]u8{0} ** 32;
+    const z_bytes: Bytes32 = @as([32]u8, @splat(0));
     const expected_y: Bytes32 = blk: {
-        var b = [_]u8{0} ** 32;
+        var b = @as([32]u8, @splat(0));
         b[31] = 2;
         break :blk b;
     };
@@ -1432,7 +1432,7 @@ test "KAT: computeKzgProof — compute_kzg_proof_case_valid_blob_4_{2,5} byte-ex
     const blob = loadTestBlobRandom4();
 
     { // case _4_2: z = 2
-        var z_bytes: Bytes32 = [_]u8{0} ** 32;
+        var z_bytes: Bytes32 = @as([32]u8, @splat(0));
         z_bytes[31] = 2;
         const expected_proof = hexBytesN(48, "a35c4f136a09a33c6437c26dc0c617ce6548a14bc4af7127690a411f5e1cde2f73157365212dbcea6432e0e7869cb006");
         const expected_y = hexBytesN(32, "549345dd3612e36fab0ab7baffe3faa5b820d56b71348c89ecaf63f7c4f85370");
@@ -1457,9 +1457,9 @@ test "KAT: computeKzgProof — compute_kzg_proof_case_valid_blob_4_{2,5} byte-ex
 test "KAT: verifyKzgProof accept — verify_kzg_proof_case_correct_proof_1_0" {
     const setup = testSetup();
     const commitment_bytes = hexBytesN(48, commitment_constant_2_hex);
-    const z_bytes: Bytes32 = [_]u8{0} ** 32;
+    const z_bytes: Bytes32 = @as([32]u8, @splat(0));
     const y_bytes: Bytes32 = blk: {
-        var b = [_]u8{0} ** 32;
+        var b = @as([32]u8, @splat(0));
         b[31] = 2;
         break :blk b;
     };
@@ -1476,7 +1476,7 @@ test "KAT: verifyKzgProof accept — verify_kzg_proof_case_correct_proof_1_0" {
 test "KAT: verifyKzgProof — verify_kzg_proof_case_{correct,incorrect}_proof_4_2 (random blob)" {
     const setup = testSetup();
     const commitment_bytes = hexBytesN(48, commitment_random_4_hex);
-    var z_bytes: Bytes32 = [_]u8{0} ** 32;
+    var z_bytes: Bytes32 = @as([32]u8, @splat(0));
     z_bytes[31] = 2;
     const y_bytes = hexBytesN(32, "549345dd3612e36fab0ab7baffe3faa5b820d56b71348c89ecaf63f7c4f85370");
 
@@ -1497,8 +1497,8 @@ test "KAT: verifyKzgProof — verify_kzg_proof_case_{correct,incorrect}_proof_4_
 test "KAT: verifyKzgProof reject — verify_kzg_proof_case_incorrect_proof_0_0" {
     const setup = testSetup();
     const commitment_bytes = G1_POINT_AT_INFINITY;
-    const z_bytes: Bytes32 = [_]u8{0} ** 32;
-    const y_bytes: Bytes32 = [_]u8{0} ** 32;
+    const z_bytes: Bytes32 = @as([32]u8, @splat(0));
+    const y_bytes: Bytes32 = @as([32]u8, @splat(0));
     const proof_bytes = hexBytesN(48, "97f1d3a73197d7942695638c4fa9ac0fc3688c4f9774b905a14e3a3f171bac586c55e83ff97a1aeffb3af00adb22c6bb");
 
     try std.testing.expect(!(try verifyKzgProof(commitment_bytes, z_bytes, y_bytes, proof_bytes, setup)));
@@ -1606,7 +1606,7 @@ test "verifyBlobKzgProofBatch: length mismatch is rejected" {
 }
 
 test "bytesToBlsField / blsFieldToBytes: canonical round-trip, non-canonical rejected" {
-    var b = [_]u8{0} ** 32;
+    var b = @as([32]u8, @splat(0));
     b[31] = 7;
     const fe = try bytesToBlsField(b);
     try std.testing.expectEqualSlices(u8, &b, &blsFieldToBytes(fe));
@@ -1620,24 +1620,24 @@ test "validateKzgG1: identity allowed, generator allowed, non-subgroup point rej
     // x = 4: on-curve but NOT in the subgroup (same non-subgroup point
     // g1.zig's own subgroupCheck test uses — see that file's NOTICE-cited
     // independent verification).
-    var comp = [_]u8{0} ** 48;
+    var comp = @as([48]u8, @splat(0));
     comp[0] = 0x80;
     comp[47] = 4;
     try std.testing.expectError(error.PointNotInSubgroup, validateKzgG1(comp));
 }
 
 test "blobToPolynomial: canonical blob round-trips, non-canonical element rejected" {
-    var blob: Blob = [_]u8{0} ** BYTES_PER_BLOB;
+    var blob: Blob = @as([BYTES_PER_BLOB]u8, @splat(0));
     blob[31] = 5; // element 0 = 5
     blob[63] = 9; // element 1 = 9
     const poly = try blobToPolynomial(std.testing.allocator, &blob);
     defer std.testing.allocator.free(poly);
     try std.testing.expectEqual(@as(usize, FIELD_ELEMENTS_PER_BLOB), poly.len);
-    var five = [_]u8{0} ** 32;
+    var five = @as([32]u8, @splat(0));
     five[31] = 5;
     try std.testing.expect(poly[0].eql(try Fr.fromBytes(five)));
 
-    var bad_blob: Blob = [_]u8{0} ** BYTES_PER_BLOB;
+    var bad_blob: Blob = @as([BYTES_PER_BLOB]u8, @splat(0));
     bad_blob[0..32].* = BLS_MODULUS; // element 0 == r itself: non-canonical
     try std.testing.expectError(error.InvalidFieldElement, blobToPolynomial(std.testing.allocator, &bad_blob));
 }
@@ -1713,10 +1713,10 @@ test "roots of unity: the derived 2^32 root has order exactly 2^32; the 4096 dom
 
     // w32^(2^32) == 1 and w32^(2^31) == -1 (so the order is exactly
     // 2^32, not a proper divisor).
-    var exp_2_32 = [_]u8{0} ** 32;
+    var exp_2_32 = @as([32]u8, @splat(0));
     exp_2_32[27] = 0x01; // 2^32
     try std.testing.expect(w32.pow(exp_2_32).eql(Fr.one));
-    var exp_2_31 = [_]u8{0} ** 32;
+    var exp_2_31 = @as([32]u8, @splat(0));
     exp_2_31[28] = 0x80; // 2^31
     const minus_one = Fr.zero.sub(Fr.one);
     try std.testing.expect(w32.pow(exp_2_31).eql(minus_one));
@@ -1909,7 +1909,7 @@ test "non-canonical field elements are rejected fail-closed at every bytes entry
     const setup = testSetup();
     const blob = loadTestBlobConstant2();
     const commitment = hexBytesN(48, commitment_constant_2_hex);
-    const zero: Bytes32 = [_]u8{0} ** 32;
+    const zero: Bytes32 = @as([32]u8, @splat(0));
 
     // z >= r in computeKzgProof.
     try std.testing.expectError(error.InvalidFieldElement, computeKzgProof(std.testing.allocator, &blob, BLS_MODULUS, setup));

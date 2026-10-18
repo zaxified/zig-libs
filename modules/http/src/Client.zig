@@ -6920,7 +6920,7 @@ test "HTTP/1.1 trailers: read behind the head after the body, next response star
     const without = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\n\r\n";
     // One trailer line longer than what a 128-byte head buffer leaves.
     const big = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nx\r\n0\r\nX-Small: s\r\nX-Sig: " ++
-        ("a" ** 200) ++ "\r\n\r\n";
+        (strRepeat("a", 200)) ++ "\r\n\r\n";
     var lb: GzipLoopback = undefined;
     try lb.start(io, &.{ with_trailers, without }, "/");
     defer lb.finish(io);
@@ -7794,4 +7794,16 @@ fn fuzzH2Head(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     }
     if (it.next() != null) return error.FieldInjected;
     H2HeadMark.mark(.ok);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

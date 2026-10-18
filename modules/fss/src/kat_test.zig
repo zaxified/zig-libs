@@ -51,8 +51,8 @@ test "positive control: firstMismatch rejects an all-β (constant) sharing" {
     const beta: D.Elem = 287454020;
     // brokenAllBeta: reconstructs β at EVERY x (party0 all-zero, party1 all-β).
     // A real DPF must be 0 off-target, so this must be rejected at some x≠α.
-    var e0: [D.domain_size]D.Elem = [_]D.Elem{0} ** D.domain_size;
-    var e1: [D.domain_size]D.Elem = [_]D.Elem{beta} ** D.domain_size;
+    var e0: [D.domain_size]D.Elem = @as([D.domain_size]D.Elem, @splat(0));
+    var e1: [D.domain_size]D.Elem = @as([D.domain_size]D.Elem, @splat(beta));
     const bad = D.firstMismatch(&e0, &e1, alpha, beta);
     try std.testing.expect(bad != null);
     try std.testing.expect(bad.? != @as(usize, alpha)); // wrong at an off-target point
@@ -62,8 +62,8 @@ test "positive control: firstMismatch rejects an all-zero sharing (misses β at 
     const D = Dpf(4, 4);
     const alpha: D.Index = 5;
     const beta: D.Elem = 287454020;
-    const e0: [D.domain_size]D.Elem = [_]D.Elem{0} ** D.domain_size;
-    const e1: [D.domain_size]D.Elem = [_]D.Elem{0} ** D.domain_size;
+    const e0: [D.domain_size]D.Elem = @as([D.domain_size]D.Elem, @splat(0));
+    const e1: [D.domain_size]D.Elem = @as([D.domain_size]D.Elem, @splat(0));
     // reconstructs 0 everywhere → the α point is wrong (should be β).
     try std.testing.expectEqual(@as(?usize, @as(usize, alpha)), D.firstMismatch(&e0, &e1, alpha, beta));
 }
@@ -145,8 +145,8 @@ test "security smell test: a single key's EvalAll is ~uniform (heuristic)" {
     const D = Dpf(8, 4);
     const alpha: D.Index = 123;
     const beta: D.Elem = 0x01020304;
-    const s0 = [_]u8{0x5A} ** 16;
-    const s1 = [_]u8{0xA5} ** 16;
+    const s0 = @as([16]u8, @splat(0x5A));
+    const s1 = @as([16]u8, @splat(0xA5));
     var keys: [2]D.Key = undefined;
     D.genWithSeeds(alpha, beta, &s0, &s1, &keys);
     var b0: [D.domain_size]D.Elem = undefined;
@@ -175,8 +175,8 @@ test "positive control (stronger, GATED): flipping one CW bit breaks reconstruct
     const D = Dpf(6, 4);
     const alpha: D.Index = 21;
     const beta: D.Elem = 0x0BADF00D;
-    const s0 = [_]u8{0x11} ** 16;
-    const s1 = [_]u8{0x22} ** 16;
+    const s0 = @as([16]u8, @splat(0x11));
+    const s1 = @as([16]u8, @splat(0x22));
     var keys: [2]D.Key = undefined;
     D.genWithSeeds(alpha, beta, &s0, &s1, &keys);
     // sanity: unperturbed keys reconstruct

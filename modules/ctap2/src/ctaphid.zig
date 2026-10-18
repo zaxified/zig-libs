@@ -63,7 +63,7 @@ pub const Encoder = struct {
 
     pub fn init(cid: u32, cmd: Command, payload: []const u8) EncodeError!Encoder {
         if (payload.len > max_payload) return error.PayloadTooLong;
-        return .{ .cid = cid, .cmd = @intFromEnum(cmd), .payload = payload };
+        return .{ .cid = cid, .cmd = @backingInt(cmd), .payload = payload };
     }
 
     /// Number of reports `payload_len` bytes need (at least one).
@@ -173,7 +173,7 @@ pub const Assembler = struct {
             self.have += n;
         }
         if (self.have < self.want) return .incomplete;
-        const msg: Message = .{ .cid = self.cid, .cmd = @enumFromInt(self.cmd), .payload = self.buf[0..self.want] };
+        const msg: Message = .{ .cid = self.cid, .cmd = @fromBackingInt(@intCast(self.cmd)), .payload = self.buf[0..self.want] };
         self.active = false;
         return .{ .complete = msg };
     }
@@ -281,7 +281,7 @@ pub const Channel = struct {
                         if (keepalives > max_keepalives) return error.TransportFailed;
                     },
                     .@"error" => {
-                        self.last_hid_error = if (m.payload.len >= 1) @enumFromInt(m.payload[0]) else .other;
+                        self.last_hid_error = if (m.payload.len >= 1) @fromBackingInt(@intCast(m.payload[0])) else .other;
                         return error.TransportFailed;
                     },
                     else => {
@@ -322,9 +322,9 @@ test "constants match the spec" {
     try testing.expectEqual(@as(usize, 57), init_data_size);
     try testing.expectEqual(@as(usize, 59), cont_data_size);
     try testing.expectEqual(@as(usize, 7609), max_payload); // CTAP 2.1 §11.2.4
-    try testing.expectEqual(@as(u8, 0x10), @intFromEnum(Command.cbor));
-    try testing.expectEqual(@as(u8, 0x06), @intFromEnum(Command.init));
-    try testing.expectEqual(@as(u8, 0x3F), @intFromEnum(Command.@"error"));
+    try testing.expectEqual(@as(u8, 0x10), @backingInt(Command.cbor));
+    try testing.expectEqual(@as(u8, 0x06), @backingInt(Command.init));
+    try testing.expectEqual(@as(u8, 0x3F), @backingInt(Command.@"error"));
 }
 
 test "init packet layout: CID | 0x80|CMD | BCNT | data, zero padded" {
@@ -401,7 +401,7 @@ test "encoder/assembler round trip at every boundary length" {
 }
 
 test "encoder: over-long payload is refused" {
-    const big = [_]u8{0} ** (max_payload + 1);
+    const big = @as([max_payload + 1]u8, @splat(0));
     try testing.expectError(error.PayloadTooLong, Encoder.init(1, .cbor, &big));
 }
 
@@ -805,7 +805,7 @@ fn fuzzHid(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     src.bytes(&payload);
     const body = payload[0..plen];
     const raw_cmd = src.valueRangeAtMost(u8, 0, 0x7f);
-    const cmd: Command = @enumFromInt(raw_cmd);
+    const cmd: Command = @fromBackingInt(@intCast(raw_cmd));
     switch (cmd) {
         .ping, .msg, .lock, .init, .wink, .cbor, .cancel, .keepalive, .@"error" => {},
         _ => HidMark.mark(.unknown_command),

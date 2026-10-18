@@ -794,7 +794,7 @@ fn cofactorTorsionPoint() g1.Affine {
     };
     var x: u8 = 1;
     while (true) : (x += 1) {
-        var enc = [_]u8{0} ** g1.compressed_bytes;
+        var enc = @as([g1.compressed_bytes]u8, @splat(0));
         enc[0] = 0x80;
         enc[g1.compressed_bytes - 1] = x;
         const p = g1.fromBytesCompressedUnchecked(enc) catch continue;
@@ -860,7 +860,7 @@ test "SOUNDNESS: a point outside G1 is no credential (no authority signed anythi
 
 /// `(0, 2)`: on `y² = x³ + 4`, of order 3, so outside `G1`.
 fn order3Point() g1.Affine {
-    var enc = [_]u8{0} ** g1.compressed_bytes;
+    var enc = @as([g1.compressed_bytes]u8, @splat(0));
     enc[0] = 0x80;
     return g1.fromBytesCompressedUnchecked(enc) catch unreachable;
 }
@@ -1105,7 +1105,7 @@ test "gate is flipped: the gated end-to-end tests EXECUTE (no silent skip)" {
 }
 
 fn frOf(v: u64) Fr {
-    var buf: [32]u8 = [_]u8{0} ** 32;
+    var buf: [32]u8 = @as([32]u8, @splat(0));
     std.mem.writeInt(u64, buf[24..32], v, .big);
     return Fr.fromBytes(buf) catch unreachable;
 }

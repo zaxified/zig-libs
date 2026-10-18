@@ -117,7 +117,7 @@ const Challenge = struct {
 
     /// SHA-256 digest reduced mod q through a 48-byte buffer (bias 2⁻¹²⁸).
     fn finish(self: *Challenge) Scalar {
-        var wide = [_]u8{0} ** 48;
+        var wide = @as([48]u8, @splat(0));
         wide[16..48].* = self.hasher.finalResult();
         return Scalar.fromBytes48(wide, .big);
     }

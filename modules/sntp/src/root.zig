@@ -186,9 +186,9 @@ pub const Packet = struct {
     /// Serialize to the 48 wire bytes (big-endian).
     pub fn encode(self: Packet) [packet_len]u8 {
         var out: [packet_len]u8 = undefined;
-        out[0] = (@as(u8, @intFromEnum(self.leap)) << 6) |
+        out[0] = (@as(u8, @backingInt(self.leap)) << 6) |
             (@as(u8, self.version) << 3) |
-            @as(u8, @intFromEnum(self.mode));
+            @as(u8, @backingInt(self.mode));
         out[1] = self.stratum;
         out[2] = @bitCast(self.poll);
         out[3] = @bitCast(self.precision);
@@ -208,9 +208,9 @@ pub const Packet = struct {
         if (bytes.len != packet_len) return error.InvalidLength;
         const b0 = bytes[0];
         return .{
-            .leap = @enumFromInt(@as(u2, @truncate(b0 >> 6))),
+            .leap = @fromBackingInt(@intCast(@as(u2, @truncate(b0 >> 6)))),
             .version = @truncate(b0 >> 3),
-            .mode = @enumFromInt(@as(u3, @truncate(b0))),
+            .mode = @fromBackingInt(@intCast(@as(u3, @truncate(b0)))),
             .stratum = bytes[1],
             .poll = @bitCast(bytes[2]),
             .precision = @bitCast(bytes[3]),
@@ -739,7 +739,7 @@ test "encode/decode round-trips a packet" {
 
 test "decode: parsed header byte splits into LI/VN/Mode" {
     // LI=2 (10), VN=4 (100), Mode=4 (100)  →  10_100_100 = 0xA4.
-    var bytes = [_]u8{0} ** packet_len;
+    var bytes = @as([packet_len]u8, @splat(0));
     bytes[0] = 0xA4;
     bytes[1] = 3; // stratum
     const p = try Packet.decode(&bytes);
@@ -751,7 +751,7 @@ test "decode: parsed header byte splits into LI/VN/Mode" {
 
 test "decodeResponse: canned server reply" {
     // A hand-built server response: LI=0 VN=4 Mode=4 (0x24), stratum 2.
-    var bytes = [_]u8{0} ** packet_len;
+    var bytes = @as([packet_len]u8, @splat(0));
     bytes[0] = 0x24;
     bytes[1] = 2; // stratum 2
     bytes[2] = 4; // poll
@@ -773,21 +773,21 @@ test "decodeResponse: canned server reply" {
 }
 
 test "decodeResponse: rejects wrong length" {
-    const short = [_]u8{0} ** 40;
+    const short = @as([40]u8, @splat(0));
     try testing.expectError(error.InvalidLength, decodeResponse(&short, null));
-    const long = [_]u8{0} ** 56;
+    const long = @as([56]u8, @splat(0));
     try testing.expectError(error.InvalidLength, decodeResponse(&long, null));
 }
 
 test "decodeResponse: rejects non-server mode" {
-    var bytes = [_]u8{0} ** packet_len;
+    var bytes = @as([packet_len]u8, @splat(0));
     bytes[0] = 0x23; // mode 3 (client)
     bytes[1] = 2;
     try testing.expectError(error.NotServerMode, decodeResponse(&bytes, null));
 }
 
 test "decodeResponse: rejects version 0 (RFC 4330 §5 item 4, VN per Errata 2263)" {
-    var bytes = [_]u8{0} ** packet_len;
+    var bytes = @as([packet_len]u8, @splat(0));
     bytes[0] = 0x04; // LI=0, VN=0, Mode=4 (server)
     bytes[1] = 2; // stratum 2
     std.mem.writeInt(u32, bytes[40..44], 1, .big); // non-zero transmit, isolates the VN check
@@ -795,7 +795,7 @@ test "decodeResponse: rejects version 0 (RFC 4330 §5 item 4, VN per Errata 2263
 }
 
 test "decodeResponse: stratum 16 and above is UnsynchronizedStratum" {
-    var bytes = [_]u8{0} ** packet_len;
+    var bytes = @as([packet_len]u8, @splat(0));
     bytes[0] = 0x24; // VN=4, server mode
     std.mem.writeInt(u32, bytes[40..44], 1, .big); // non-zero transmit
     bytes[1] = 16;
@@ -805,7 +805,7 @@ test "decodeResponse: stratum 16 and above is UnsynchronizedStratum" {
 }
 
 test "decodeResponse: stratum 15 (top of the valid secondary-reference range) is accepted" {
-    var bytes = [_]u8{0} ** packet_len;
+    var bytes = @as([packet_len]u8, @splat(0));
     bytes[0] = 0x24; // VN=4, server mode
     bytes[1] = 15;
     std.mem.writeInt(u32, bytes[32..36], 1, .big); // non-zero receive (F3)
@@ -815,7 +815,7 @@ test "decodeResponse: stratum 15 (top of the valid secondary-reference range) is
 }
 
 test "decodeResponse: rejects an all-zero Transmit Timestamp (RFC 4330 §5 item 4)" {
-    var bytes = [_]u8{0} ** packet_len;
+    var bytes = @as([packet_len]u8, @splat(0));
     bytes[0] = 0x24; // VN=4, server mode
     bytes[1] = 2; // stratum 2, well clear of KissOfDeath/UnsynchronizedStratum
     // bytes[40..48] (transmit) left all-zero; receive left all-zero too, but
@@ -828,7 +828,7 @@ test "decodeResponse: rejects an all-zero Receive Timestamp (audit finding F3)" 
     // reporting T2 = 0 passed every check before this and drove `query`'s
     // offset to -63 years (measured against a live stub). transmit is set
     // so only the new T2 check is isolated.
-    var bytes = [_]u8{0} ** packet_len;
+    var bytes = @as([packet_len]u8, @splat(0));
     bytes[0] = 0x24; // VN=4, server mode
     bytes[1] = 2; // stratum 2
     std.mem.writeInt(u32, bytes[40..44], 1, .big); // non-zero transmit
@@ -838,7 +838,7 @@ test "decodeResponse: rejects an all-zero Receive Timestamp (audit finding F3)" 
 
 test "decodeResponse: rejects Leap Indicator 3 (unsynchronized), a KoD-shaped stratum aside (audit finding F7)" {
     // LI=3 (11), VN=4 (100), Mode=4 (100)  ->  11_100_100 = 0xE4.
-    var bytes = [_]u8{0} ** packet_len;
+    var bytes = @as([packet_len]u8, @splat(0));
     bytes[0] = 0xE4;
     bytes[1] = 2; // stratum 2, clear of KissOfDeath/UnsynchronizedStratum
     std.mem.writeInt(u32, bytes[32..36], 1, .big); // non-zero receive
@@ -848,8 +848,8 @@ test "decodeResponse: rejects Leap Indicator 3 (unsynchronized), a KoD-shaped st
 
 test "decodeResponse: LI 0-2 (not the alarm value) still accepted, isolating F7's check" {
     inline for ([_]LeapIndicator{ .no_warning, .last_minute_61, .last_minute_59 }) |li| {
-        var bytes = [_]u8{0} ** packet_len;
-        bytes[0] = (@as(u8, @intFromEnum(li)) << 6) | (4 << 3) | 4; // LI | VN=4 | Mode=4
+        var bytes = @as([packet_len]u8, @splat(0));
+        bytes[0] = (@as(u8, @backingInt(li)) << 6) | (4 << 3) | 4; // LI | VN=4 | Mode=4
         bytes[1] = 2;
         std.mem.writeInt(u32, bytes[32..36], 1, .big);
         std.mem.writeInt(u32, bytes[40..44], 1, .big);
@@ -859,7 +859,7 @@ test "decodeResponse: LI 0-2 (not the alarm value) still accepted, isolating F7'
 }
 
 test "decodeResponse: stratum 0 is Kiss-o'-Death" {
-    var bytes = [_]u8{0} ** packet_len;
+    var bytes = @as([packet_len]u8, @splat(0));
     bytes[0] = 0x24; // server mode
     bytes[1] = 0; // stratum 0 → KoD
     @memcpy(bytes[12..16], "RATE");
@@ -867,7 +867,7 @@ test "decodeResponse: stratum 0 is Kiss-o'-Death" {
 }
 
 test "decodeResponse: surfaces the parsed Kiss-o'-Death code and raw bytes via kiss_out" {
-    var bytes = [_]u8{0} ** packet_len;
+    var bytes = @as([packet_len]u8, @splat(0));
     bytes[0] = 0x24; // server mode
     bytes[1] = 0; // stratum 0 → KoD
     @memcpy(bytes[12..16], "RATE");
@@ -879,7 +879,7 @@ test "decodeResponse: surfaces the parsed Kiss-o'-Death code and raw bytes via k
 }
 
 test "decodeResponse: an unregistered/malformed kiss code maps to .unrecognized, not an error" {
-    var bytes = [_]u8{0} ** packet_len;
+    var bytes = @as([packet_len]u8, @splat(0));
     bytes[0] = 0x24;
     bytes[1] = 0;
     @memcpy(bytes[12..16], "XABC"); // RFC 5905 §7.4: "X"-prefixed experimental range
@@ -901,7 +901,7 @@ test "decodeResponse: an unregistered/malformed kiss code maps to .unrecognized,
 test "decodeResponse: an unsynchronized server's stratum-0 reply is UnsynchronizedLeap, not Kiss-o'-Death" {
     // chronyd 4.8 with no reference, byte for byte (ntp oracle 2026-10-05):
     // LI=3 VN=4 mode 4, stratum 0, Reference ID 0.
-    var bytes = [_]u8{0} ** packet_len;
+    var bytes = @as([packet_len]u8, @splat(0));
     bytes[0] = 0xe4;
     bytes[3] = 0xe6;
     var kod: KissOfDeath = .{ .code = .rate, .raw = "SENT".* };
@@ -1267,8 +1267,8 @@ const decode_seeds = [_][]const u8{
     seed("240100EC0000000000000007474F4F47EE187A1CF6989F83EE187A1CEF6B2800EE187A1CF6989F84EE187A1CF6989F86"),
     // The canned reply: LI=0 VN=4 Mode=4, stratum 2, ref id "GPS\0". Accepted.
     seed("240204EC0000000000000000475053000000000000000000000000000000000000000064000000000000006500000000"),
-    seed("00" ** 40), // InvalidLength: 40 octets
-    seed("00" ** 56), // InvalidLength: 56 octets
+    seed(strRepeat("00", 40)), // InvalidLength: 40 octets
+    seed(strRepeat("00", 56)), // InvalidLength: 56 octets
     // NotServerMode: 0x23 is mode 3 (client).
     seed("230200000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"),
     // InvalidVersion: VN=0 with a non-zero transmit, so the VN check is what fires.
@@ -1347,4 +1347,16 @@ test "corpus: every seed reaches decodeResponse, and the accepted count is pinne
 test {
     _ = @import("fuzz_test.zig");
     _ = @import("ntp_oracle_test.zig");
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

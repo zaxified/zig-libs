@@ -289,9 +289,9 @@ test "redirectLocation: the open-redirect `/\\` form is refused, a long location
     var buf: [redirect_buf_len]u8 = undefined;
     try testing.expectError(error.InvalidLocation, redirectLocation("/a", "/\\evil.example", &buf));
     try testing.expectError(error.InvalidLocation, redirectLocation("/a", "\\evil.example", &buf));
-    try testing.expectError(error.LocationTooLong, redirectLocation("/a", "/" ++ "x" ** max_location, &buf));
+    try testing.expectError(error.LocationTooLong, redirectLocation("/a", "/" ++ strRepeat("x", max_location), &buf));
     // Non-ASCII triples in the header: a location that fits joined but not escaped.
-    try testing.expectError(error.LocationTooLong, redirectLocation("/a", "/" ++ "\xc4" ** (max_location / 2), &buf));
+    try testing.expectError(error.LocationTooLong, redirectLocation("/a", "/" ++ strRepeat("\xc4", max_location / 2), &buf));
     // `*` has no directory: the location is cleaned as a relative path.
     const star = try redirectLocation("*", "x/../y", &buf);
     try testing.expectEqualStrings("y", star.header);
@@ -369,4 +369,16 @@ fn fuzzHelpers(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void 
             try testing.expect(std.mem.indexOf(u8, p, "/./") == null and std.mem.indexOf(u8, p, "/../") == null);
         }
     } else |_| HelperMark.mark(.redirect_refused);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

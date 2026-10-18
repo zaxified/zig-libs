@@ -244,8 +244,8 @@ const session = [_]Exchange{
 test "anchor: replay a real pymodbus 3.14.0 master's recorded session offline" {
     // The live test's fixture, rebuilt exactly (src/root.zig, test "live: a
     // real Modbus master drives a simulated slave over the TCP binding").
-    var holdings = [_]u16{0} ** 32;
-    var coils = [_]bool{false} ** 32;
+    var holdings = @as([32]u16, @splat(0));
+    var coils = @as([32]bool, @splat(false));
     var inputs = [_]u16{ 1000, 2000, 3000, 4000 };
     for (&holdings, 0..) |*h, i| h.* = @intCast(i * 111);
 
@@ -637,15 +637,15 @@ const enip_session = [_]Step{
 };
 
 test "anchor: replay a real pycomm3 1.2.16 master's recorded session offline" {
-    var speed = [_]u8{0} ** 4;
-    var level = [_]u8{0} ** 4;
+    var speed = @as([4]u8, @splat(0));
+    var level = @as([4]u8, @splat(0));
     std.mem.writeInt(i32, speed[0..4], 1500, .little);
-    var counts = [_]u8{0} ** (4 * enip_counts.len);
+    var counts = @as([4 * enip_counts.len]u8, @splat(0));
     for (enip_counts, 0..) |v, i| std.mem.writeInt(i32, counts[i * 4 ..][0..4], v, .little);
-    var setpoint = [_]u8{0} ** 4;
+    var setpoint = @as([4]u8, @splat(0));
     std.mem.writeInt(u32, setpoint[0..4], @bitCast(enip_setpoint), .little);
-    var verdict = [_]u8{0} ** 32;
-    var verdict_pass = [_]u8{0} ** 4;
+    var verdict = @as([32]u8, @splat(0));
+    var verdict_pass = @as([4]u8, @splat(0));
 
     const tags = [_]enip.TagBinding{
         .{ .name = "Speed", .type = .dint, .bytes = &speed },
@@ -872,10 +872,10 @@ const s7_session = [_]Step{
 };
 
 test "anchor: replay a real python-snap7 3.1.0 client's recorded session offline" {
-    var db1 = [_]u8{0} ** 64;
+    var db1 = @as([64]u8, @splat(0));
     for (&db1, 0..) |*b, i| b.* = @intCast(i);
-    var db2 = [_]u8{0} ** 40;
-    var db3 = [_]u8{0} ** 16;
+    var db2 = @as([40]u8, @splat(0));
+    var db3 = @as([16]u8, @splat(0));
     std.mem.writeInt(u32, db3[0..4], @bitCast(s7_real), .big);
     std.mem.writeInt(i16, db3[4..6], s7_int, .big);
     std.mem.writeInt(i32, db3[6..10], s7_dint, .big);
@@ -1570,7 +1570,7 @@ test "anchor: replay a real c104 2.2.1 master's recorded session offline" {
     var checksum: i32 = 0;
     for (points) |p| {
         if (!p.type_id.isMonitoring()) continue;
-        checksum = @rem(checksum + @as(i32, @intCast(p.ioa)) * 7 + @intFromEnum(p.type_id), 30011);
+        checksum = @rem(checksum + @as(i32, @intCast(p.ioa)) * 7 + @backingInt(p.type_id), 30011);
     }
     try testing.expectEqual(@as(i16, @intCast(checksum)), mark(&points, 6));
 
@@ -1948,8 +1948,8 @@ test "anchor: replay a real opendnp3 3.1.2 master's recorded session offline" {
         .{ .value = dnp3_counters[0], .class = .class3 },
         .{ .value = dnp3_counters[1], .class = .class3 },
     };
-    var binary_outputs = [_]dnp3.outstation.BinaryOutputStatus{.{}} ** dnp3_binary_output_count;
-    var analog_outputs = [_]dnp3.outstation.AnalogOutputStatus{.{}} ** dnp3_analog_output_count;
+    var binary_outputs = @as([dnp3_binary_output_count]dnp3.outstation.BinaryOutputStatus, @splat(.{}));
+    var analog_outputs = @as([dnp3_analog_output_count]dnp3.outstation.AnalogOutputStatus, @splat(.{}));
     analog_outputs[dnp3_bounded_slot] = .{ .min = 0, .max = 100 };
     var events: [64]dnp3.outstation.Event = undefined;
     var rx_buf: [2048]u8 = undefined;

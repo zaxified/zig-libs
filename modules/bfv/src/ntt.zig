@@ -210,7 +210,7 @@ pub fn Ntt(comptime N: usize) type {
         /// NTT path, so agreement is strong evidence of transform
         /// correctness (defeats a self-consistent-but-wrong NTT).
         pub fn mulSchoolbook(q: u64, a: *const Poly, b: *const Poly) Poly {
-            var out = [_]u64{0} ** N;
+            var out = @as([N]u64, @splat(0));
             for (0..N) |i| {
                 for (0..N) |j| {
                     const c = ma.mulMod(a[i], b[j], q);

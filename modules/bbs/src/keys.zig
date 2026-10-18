@@ -208,23 +208,23 @@ test "keyGen rejects key_material shorter than 32 bytes" {
 }
 
 test "keyGen rejects key_info longer than 65535 bytes" {
-    const key_material = "0" ** 32;
+    const key_material = strRepeat("0", 32);
     const big_info: [65536]u8 = @splat('a');
     try testing.expectError(error.KeyInfoTooLong, testKeyGen(key_material, &big_info));
 }
 
 test "keyGen length edges: 31 bytes refused, 32 accepted; 65535-byte key_info is not KeyInfoTooLong" {
     // Mutation run 2026-10-05: `< 31` and `>= 65535` both survived.
-    try testing.expectError(error.KeyMaterialTooShort, testKeyGen("0" ** 31, ""));
-    _ = try testKeyGen("0" ** 32, "");
+    try testing.expectError(error.KeyMaterialTooShort, testKeyGen(strRepeat("0", 31), ""));
+    _ = try testKeyGen(strRepeat("0", 32), "");
     const info: [65535]u8 = @splat('a');
-    try testing.expectError(error.DeriveInputTooLong, testKeyGen("0" ** 32, &info));
+    try testing.expectError(error.DeriveInputTooLong, testKeyGen(strRepeat("0", 32), &info));
 }
 
 test "PublicKey.fromBytes refuses an on-twist point outside G2" {
     // x = u (c1 = 1, c0 = 0, wire order c1 || c0) is on the twist and not
     // in G2 (`bls12_381`'s g2 tests pin both facts).
-    var bytes = [_]u8{0} ** PublicKey.encoded_bytes;
+    var bytes = @as([PublicKey.encoded_bytes]u8, @splat(0));
     bytes[0] = 0x80;
     bytes[47] = 1;
     _ = try G2.fromBytesCompressedUnchecked(bytes);
@@ -232,7 +232,7 @@ test "PublicKey.fromBytes refuses an on-twist point outside G2" {
 }
 
 test "skToPk is a fixed-base scalar multiplication of BP2" {
-    var sk_bytes = [_]u8{0} ** 32;
+    var sk_bytes = @as([32]u8, @splat(0));
     sk_bytes[31] = 7;
     const sk = try testSecretKey(sk_bytes);
     const pk = skToPk(&sk);
@@ -241,7 +241,7 @@ test "skToPk is a fixed-base scalar multiplication of BP2" {
 }
 
 test "SecretKey / PublicKey byte round-trips" {
-    var sk_bytes = [_]u8{0} ** 32;
+    var sk_bytes = @as([32]u8, @splat(0));
     sk_bytes[31] = 42;
     const sk = try testSecretKey(sk_bytes);
     try testing.expectEqualSlices(u8, &sk_bytes, &testSkBytes(&sk));
@@ -253,9 +253,21 @@ test "SecretKey / PublicKey byte round-trips" {
 }
 
 test "SecretKey.deinit zeroes the scalar" {
-    var sk_bytes = [_]u8{0} ** 32;
+    var sk_bytes = @as([32]u8, @splat(0));
     sk_bytes[31] = 99;
     var sk = try testSecretKey(sk_bytes);
     sk.deinit();
-    try testing.expectEqualSlices(u8, &([_]u8{0} ** 32), &testSkBytes(&sk));
+    try testing.expectEqualSlices(u8, &(@as([32]u8, @splat(0))), &testSkBytes(&sk));
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

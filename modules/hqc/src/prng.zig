@@ -442,13 +442,13 @@ test "the *Vec wrappers equal sampler + writeSupportToVector on the same stream"
     // Rejection sampler: wrapper vs. the two steps it wraps.
     {
         var xof_a = Xof.init(seed);
-        var got = [_]u64{0} ** ((P.n + 63) / 64);
+        var got = @as([(P.n + 63) / 64]u64, @splat(0));
         sampleFixedWeightRejectionVec(&xof_a, P.n, P.nMu(), P.rejectionThreshold(), P.omega, &got);
 
         var xof_b = Xof.init(seed);
         var support: [P.omega]u32 = undefined;
         sampleFixedWeightRejection(&xof_b, P.n, P.nMu(), P.rejectionThreshold(), P.omega, &support);
-        var want = [_]u64{0} ** ((P.n + 63) / 64);
+        var want = @as([(P.n + 63) / 64]u64, @splat(0));
         writeSupportToVector(P.omega, &support, &want);
 
         try t.expectEqualSlices(u64, &want, &got);
@@ -460,13 +460,13 @@ test "the *Vec wrappers equal sampler + writeSupportToVector on the same stream"
     // Biased sampler: same shape.
     {
         var xof_a = Xof.init(seed);
-        var got = [_]u64{0} ** ((P.n + 63) / 64);
+        var got = @as([(P.n + 63) / 64]u64, @splat(0));
         sampleFixedWeightBiasedVec(&xof_a, P.n, P.omega_r, &got);
 
         var xof_b = Xof.init(seed);
         var support: [P.omega_r]u32 = undefined;
         sampleFixedWeightBiased(&xof_b, P.n, P.omega_r, &support);
-        var want = [_]u64{0} ** ((P.n + 63) / 64);
+        var want = @as([(P.n + 63) / 64]u64, @splat(0));
         writeSupportToVector(P.omega_r, &support, &want);
 
         try t.expectEqualSlices(u64, &want, &got);
@@ -486,7 +486,7 @@ test "sampleFixedWeightRejection: exact weight, no duplicates, in range" {
     for (support, 0..) |s, i| {
         for (support[i + 1 ..]) |s2| try t.expect(s != s2);
     }
-    var out = [_]u64{0} ** ((P.n + 63) / 64);
+    var out = @as([(P.n + 63) / 64]u64, @splat(0));
     writeSupportToVector(P.omega, &support, &out);
     var w: u32 = 0;
     for (out) |word| w += @popCount(word);
@@ -532,7 +532,7 @@ test "sampleFixedWeightBiased: exact weight, no duplicates, in range" {
     for (support, 0..) |s, i| {
         for (support[i + 1 ..]) |s2| try t.expect(s != s2);
     }
-    var out = [_]u64{0} ** ((P.n + 63) / 64);
+    var out = @as([(P.n + 63) / 64]u64, @splat(0));
     writeSupportToVector(P.omega_r, &support, &out);
     var w: u32 = 0;
     for (out) |word| w += @popCount(word);
@@ -543,7 +543,7 @@ test "sampleVect masks bits beyond n" {
     const t = std.testing;
     const P = params.hqc128;
     var xof = Xof.init("sample vect seed");
-    var out = [_]u64{0} ** P.words();
+    var out = @as([P.words()]u64, @splat(0));
     sampleVect(&xof, P.n, &out);
     var i: u32 = P.n;
     const top_word = P.n / 64;

@@ -537,7 +537,7 @@ test "G2 scalarMul edge cases: [0]P = O, [1]P = P, [2]P = double(P)" {
 
 test "G2 scalarMul wipes its own secret-scalar byte scratch before returning (F9)" {
     // See g1.zig's identically-shaped test — same wave-2 audit F9.
-    var s_bytes = [_]u8{0xff} ** 32;
+    var s_bytes = @as([32]u8, @splat(0xff));
     s_bytes[0] = 0x01; // stay < r (r's top byte is 0x30)
     const s = try Fr.fromBytes(s_bytes);
     var buf: [Fr.encoded_bytes]u8 = undefined;
@@ -546,11 +546,11 @@ test "G2 scalarMul wipes its own secret-scalar byte scratch before returning (F9
 }
 
 test "G2 scalarMul distributes: [a+b]G == [a]G + [b]G and [a*b]G == [a]([b]G)" {
-    var a_bytes = [_]u8{0} ** 32;
+    var a_bytes = @as([32]u8, @splat(0));
     a_bytes[31] = 0x2f;
     a_bytes[20] = 0xe1;
     const sa = try Fr.fromBytes(a_bytes);
-    var b_bytes = [_]u8{0} ** 32;
+    var b_bytes = @as([32]u8, @splat(0));
     b_bytes[31] = 0x0b;
     b_bytes[10] = 0x44;
     const sb = try Fr.fromBytes(b_bytes);
@@ -571,7 +571,7 @@ test "G2 subgroupCheck: an on-twist point OUTSIDE the subgroup fails; isOnCurve 
     // the order-r subgroup. Verified independently in Python
     // (SPEC.md's "Verification performed"): on_curve == True,
     // [r]P == O is False.
-    var c1_bytes = [_]u8{0} ** 32;
+    var c1_bytes = @as([32]u8, @splat(0));
     c1_bytes[31] = 1;
     const x = Fp2{ .c0 = Fp.zero, .c1 = try Fp.fromBytes(c1_bytes) };
     var y_c0_bytes: [32]u8 = undefined;
@@ -686,9 +686,9 @@ test "toBytes(identity) is all-zero; fromBytes(all-zero) is identity" {
 }
 
 test "fromBytes rejects the wrong length" {
-    var short = [_]u8{0} ** (encoded_bytes - 1);
+    var short = @as([encoded_bytes - 1]u8, @splat(0));
     try std.testing.expectError(error.InvalidEncoding, fromBytes(&short));
-    var long = [_]u8{0} ** (encoded_bytes + 1);
+    var long = @as([encoded_bytes + 1]u8, @splat(0));
     try std.testing.expectError(error.InvalidEncoding, fromBytes(&long));
 }
 
@@ -703,9 +703,9 @@ test "fromBytes rejects an off-curve (x, y) pair" {
     // (x, y) = (1, 1): swap the generator's y for 1 (definitely off-twist).
     var bytes: [encoded_bytes]u8 = undefined;
     _ = try std.fmt.hexToBytes(&bytes, generator_eip197_hex);
-    var one_bytes = [_]u8{0} ** 32;
+    var one_bytes = @as([32]u8, @splat(0));
     one_bytes[31] = 1;
-    bytes[64..96].* = [_]u8{0} ** 32; // y.c1 = 0
+    bytes[64..96].* = @as([32]u8, @splat(0)); // y.c1 = 0
     bytes[96..128].* = one_bytes; // y.c0 = 1
     try std.testing.expectError(error.NotOnCurve, fromBytes(&bytes));
 }

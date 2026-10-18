@@ -171,7 +171,7 @@ test "parseTcpTimestamps: length byte declares one past the buffer end -> null, 
 }
 
 test "parseTcpTimestamps: all-NOP buffer -> null, no OOB" {
-    const bytes = [_]u8{1} ** 40;
+    const bytes = @as([40]u8, @splat(1));
     try testing.expectEqual(@as(?Timestamps, null), parseTcpTimestamps(&bytes));
 }
 
@@ -313,9 +313,9 @@ const fuzz_corpus = [_][]const u8{
     fuzzseed.seed("\x00\x08\x0a\x00\x00\x00\x01\x00\x00\x00\x02"), // a complete Timestamps option and nothing else
     fuzzseed.seed("\x00\x01\x01\x01\x08\x0a\xff\xff\xff\xff\x00\x00\x00\x00"), // three NOPs then Timestamps
     fuzzseed.seed("\x00\x00\x08\x0a\x00\x00\x00\x01\x00\x00\x00\x02"), // ⭐ END first: the Timestamps behind it must NOT be found
-    fuzzseed.seed("\x00\x02\xff" ++ "\xaa" ** 40), // an option claiming 255 octets inside a 43-octet list
-    fuzzseed.seed("\x00\x02\x00" ++ "\xaa" ** 8), // a length of 0, which cannot advance the walk
-    fuzzseed.seed("\x00\x02\x01" ++ "\xaa" ** 8), // a length of 1, ditto
+    fuzzseed.seed("\x00\x02\xff" ++ strRepeat("\xaa", 40)), // an option claiming 255 octets inside a 43-octet list
+    fuzzseed.seed("\x00\x02\x00" ++ strRepeat("\xaa", 8)), // a length of 0, which cannot advance the walk
+    fuzzseed.seed("\x00\x02\x01" ++ strRepeat("\xaa", 8)), // a length of 1, ditto
     fuzzseed.seed("\x01" ++ "\x08" ++ "\x02\x02\x02\x02\x02\x02\x02\x02"), // script: eight genuine Timestamps entries back to back
     fuzzseed.seed("\x01" ++ "\x08" ++ "\x01\x01\x01\x03\x03\x03\x00\x02"), // script: NOPs, opaque options, then END
     fuzzseed.seed("\x01" ++ "\x04" ++ "\x03\xff\xff\x03\x08\x08"), // script: opaque options with hostile kind/length octets
@@ -491,4 +491,16 @@ test "corpus: every seed reaches the parser, and the Timestamps options found ar
     try std.testing.expectEqual(@as(usize, 309), octets);
     try std.testing.expectEqual(@as(usize, 6), found);
     try std.testing.expectEqual(@as(u64, 7817081300), tsval_sum);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

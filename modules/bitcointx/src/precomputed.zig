@@ -134,7 +134,7 @@ const instrument = @import("instrument.zig");
 fn buildTx(allocator: Allocator, n: usize) !tx.Transaction {
     const vin = try allocator.alloc(tx.TxIn, n);
     for (vin, 0..) |*v, i| v.* = .{
-        .prevout = .{ .txid = [_]u8{@truncate(i)} ** 32, .vout = @intCast(i) },
+        .prevout = .{ .txid = @as([32]u8, @splat(@truncate(i))), .vout = @intCast(i) },
         .script_sig = &.{},
         .sequence = 0xfffffffe -% @as(u32, @intCast(i)),
     };

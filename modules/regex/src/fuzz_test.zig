@@ -58,11 +58,11 @@ const fuzz_driver = testkit.fuzz.driver;
 /// Reach labels: the driver's `hit` (printed by `REGEX_FUZZ` runs) and a
 /// local count the in-suite test checks.
 const Label = enum { refused, compiled, full, matched, group, literal, posix, posix_refused, longest_ref };
-var reach: [@typeInfo(Label).@"enum".fields.len]usize = @splat(0);
+var reach: [@typeInfo(Label).@"enum".field_names.len]usize = @splat(0);
 
 fn hit(comptime l: Label) void {
     fuzz_driver.hit(@tagName(l));
-    reach[@intFromEnum(l)] += 1;
+    reach[@backingInt(l)] += 1;
 }
 
 const Gen = struct {
@@ -420,7 +420,7 @@ test "fuzz harness: 500 seeds in every test run, and it gets everywhere" {
     }
     // Reach before verdict: every oracle had something to judge.
     for (reach, 0..) |n, i| if (n == 0) {
-        std.debug.print("unreached: {t}\n", .{@as(Label, @enumFromInt(i))});
+        std.debug.print("unreached: {t}\n", .{@as(Label, @fromBackingInt(@intCast(i)))});
         return error.Unreached;
     };
 }

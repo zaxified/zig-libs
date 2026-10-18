@@ -364,7 +364,7 @@ fn alpnPhase(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, env: 
     {
         const url = try std.fmt.allocPrint(arena, "https://127.0.0.1:{s}/echo", .{h2_port});
         var up = try client.requestStreaming(.post, url, .{}, null);
-        for (0..64) |_| try up.writer().writeAll("0123456789abcdef" ** 64);
+        for (0..64) |_| try up.writer().writeAll(strRepeat("0123456789abcdef", 64));
         var res = try up.finish();
         defer res.deinit();
         const body = try res.readAllAlloc(arena, 1 << 20);
@@ -423,4 +423,16 @@ fn sameFields(label: []const u8, ours: []const u8, go: []const u8, proto: []cons
     }
     if (!good) std.debug.print("  alpn FAIL {s}: Go's server saw\n--- ours\n{s}--- Go's\n{s}", .{ label, ours, go });
     return good;
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

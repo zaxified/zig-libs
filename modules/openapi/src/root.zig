@@ -468,7 +468,7 @@ pub const Generator = struct {
             // route/value); here it is `error.PathCollision`, not a silent
             // merge.
             inline for (@typeInfo(http.Method).@"enum".fields) |f| {
-                const method: http.Method = @enumFromInt(f.value);
+                const method: http.Method = @fromBackingInt(@intCast(f.value));
                 // An OpenAPI 3.1 Path Item names eight methods; CONNECT and
                 // an extension method (`.other`) are not among them, so
                 // their routes stay out of the document.
@@ -2633,7 +2633,7 @@ test "endpoint: a malformed request_schema fails once, then a CACHED error on ev
     // Debug-mode timing is too noisy for the ratio assertion below (GC
     // pauses, no optimization); the correctness half (same error every
     // time) still runs, at a smaller N so Debug stays fast.
-    const release = @import("builtin").mode != .Debug;
+    const release = @import("builtin").mode != .debug;
     const n: usize = if (release) 3000 else 200;
     var r = router.Router.init(testing.allocator);
     defer r.deinit();
@@ -2759,7 +2759,7 @@ test "endpoint: concurrent first callers all get the one cached document (F2)" {
 }
 
 test "generate: route-table build time scales linearly, not quadratically, with route count (F7)" {
-    if (@import("builtin").mode == .Debug) return; // timing assertion needs ReleaseFast
+    if (@import("builtin").mode == .debug) return; // timing assertion needs ReleaseFast
     const gpa = std.heap.smp_allocator;
     const small = try benchBuildNs(gpa, 500);
     const big = try benchBuildNs(gpa, 4000); // 8x the routes

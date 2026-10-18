@@ -29,7 +29,7 @@ pub fn RnsPoly(comptime N: usize, comptime L: usize) type {
         domain: Domain,
 
         pub fn zero(domain: Domain) Self {
-            return .{ .limbs = [_][N]u64{[_]u64{0} ** N} ** L, .domain = domain };
+            return .{ .limbs = @as([L][N]u64, @splat(@as([N]u64, @splat(0)))), .domain = domain };
         }
 
         /// Reduce arbitrary per-limb inputs into `[0, q_i)` and tag as coeff.

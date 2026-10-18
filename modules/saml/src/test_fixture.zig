@@ -211,7 +211,7 @@ test "teeth: wrong configured key fails the signature" {
     const alloc = testing.allocator;
     var cfg = baseConfig(fx.t_valid);
     const RsaPub = @FieldType(@import("xmldsig").VerifyKey, "rsa");
-    const wrong = try RsaPub.fromBytes(&([_]u8{0xC5} ** 256), &[_]u8{ 0x01, 0x00, 0x01 });
+    const wrong = try RsaPub.fromBytes(&(@as([256]u8, @splat(0xC5))), &[_]u8{ 0x01, 0x00, 0x01 });
     cfg.idp_key = .{ .rsa = wrong };
     try testing.expectError(error.SignatureInvalid, saml.consumeResponseXml(alloc, fx.signed_response, cfg));
 }

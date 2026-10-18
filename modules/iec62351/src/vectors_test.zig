@@ -39,16 +39,16 @@ const rfc4231 = struct {
         hmac_sha256: [32]u8,
     };
 
-    const key1 = [_]u8{0x0b} ** 20;
-    const key3 = [_]u8{0xaa} ** 20;
+    const key1 = @as([20]u8, @splat(0x0b));
+    const key3 = @as([20]u8, @splat(0xaa));
     const key4 = [_]u8{
         0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c,
         0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
         0x19,
     };
-    const key_long = [_]u8{0xaa} ** 131;
-    const data3 = [_]u8{0xdd} ** 50;
-    const data4 = [_]u8{0xcd} ** 50;
+    const key_long = @as([131]u8, @splat(0xaa));
+    const data3 = @as([50]u8, @splat(0xdd));
+    const data4 = @as([50]u8, @splat(0xcd));
 
     const cases = [_]Case{
         .{
@@ -163,7 +163,7 @@ test "standard: AES-GCM test cases 1 and 13 (the GMAC primitive)" {
     // plaintext and empty AAD.
     {
         var tag: [16]u8 = undefined;
-        std.crypto.aead.aes_gcm.Aes128Gcm.encrypt(&.{}, &tag, &.{}, &.{}, [_]u8{0} ** 12, [_]u8{0} ** 16);
+        std.crypto.aead.aes_gcm.Aes128Gcm.encrypt(&.{}, &tag, &.{}, &.{}, @as([12]u8, @splat(0)), @as([16]u8, @splat(0)));
         try testing.expectEqualSlices(u8, &.{
             0x58, 0xe2, 0xfc, 0xce, 0xfa, 0x7e, 0x30, 0x61,
             0x36, 0x7f, 0x1d, 0x57, 0xa4, 0xe7, 0x45, 0x5a,
@@ -172,7 +172,7 @@ test "standard: AES-GCM test cases 1 and 13 (the GMAC primitive)" {
     // Test case 13: the same, with AES-256.
     {
         var tag: [16]u8 = undefined;
-        std.crypto.aead.aes_gcm.Aes256Gcm.encrypt(&.{}, &tag, &.{}, &.{}, [_]u8{0} ** 12, [_]u8{0} ** 32);
+        std.crypto.aead.aes_gcm.Aes256Gcm.encrypt(&.{}, &tag, &.{}, &.{}, @as([12]u8, @splat(0)), @as([32]u8, @splat(0)));
         try testing.expectEqualSlices(u8, &.{
             0x53, 0x0f, 0x8a, 0xfb, 0xc7, 0x45, 0x36, 0xb9,
             0xa9, 0x63, 0xb4, 0xf1, 0xc4, 0xcb, 0x73, 0x8b,
@@ -181,8 +181,8 @@ test "standard: AES-GCM test cases 1 and 13 (the GMAC primitive)" {
 }
 
 test "standard: AES-GMAC-64/128 truncate the GCM tag from the left" {
-    const key = [_]u8{0} ** 16;
-    const iv = [_]u8{0} ** 12;
+    const key = @as([16]u8, @splat(0));
+    const iv = @as([12]u8, @splat(0));
     const full = [_]u8{
         0x58, 0xe2, 0xfc, 0xce, 0xfa, 0x7e, 0x30, 0x61,
         0x36, 0x7f, 0x1d, 0x57, 0xa4, 0xe7, 0x45, 0x5a,
@@ -199,14 +199,14 @@ test "standard: an AES-GMAC key that is neither 128 nor 256 bits is refused" {
     var out: [goose.max_mac_len]u8 = undefined;
     try testing.expectError(error.KeyLength, goose.computeMac(
         .aes_gmac_128,
-        &[_]u8{0} ** 24,
+        &@as([24]u8, @splat(0)),
         &.{},
-        [_]u8{0} ** 12,
+        @as([12]u8, @splat(0)),
         &out,
     ));
     try testing.expectError(error.IvRequired, goose.computeMac(
         .aes_gmac_128,
-        &[_]u8{0} ** 16,
+        &@as([16]u8, @splat(0)),
         &.{},
         null,
         &out,
@@ -226,9 +226,9 @@ const kat = struct {
     const time_to_next_key: u16 = 60;
     /// RFC 4231 test case 1's key, reused so the MAC input is the only novel
     /// part of the vector.
-    const hmac_key = [_]u8{0x0b} ** 20;
-    const gmac_key = [_]u8{0x2a} ** 16;
-    const iv = [_]u8{0x11} ** 12;
+    const hmac_key = @as([20]u8, @splat(0x0b));
+    const gmac_key = @as([16]u8, @splat(0x2a));
+    const iv = @as([12]u8, @splat(0x11));
     /// Stand-in APDU octets — this module never parses an APDU.
     const apdu = [_]u8{
         0x61, 0x1a, 0x80, 0x04, 0x74, 0x65, 0x73, 0x74, 0x81, 0x02, 0x03, 0xe8,
@@ -390,8 +390,8 @@ test "self: a frozen RSASSA-PSS signature over the covered range verifies" {
 /// self-derived — ECDSA P-256/SHA-256 over the `kat` frame's covered range
 /// with a fixed key seed and fixed signing noise, so the value *is*
 /// reproducible (unlike PSS above).
-const kat_ecdsa_seed = [_]u8{0x17} ** EcdsaP256.KeyPair.seed_length;
-const kat_ecdsa_noise = [_]u8{0x5c} ** EcdsaP256.noise_length;
+const kat_ecdsa_seed = @as([EcdsaP256.KeyPair.seed_length]u8, @splat(0x17));
+const kat_ecdsa_noise = @as([EcdsaP256.noise_length]u8, @splat(0x5c));
 const kat_ecdsa_signature = [_]u8{
     0x7e, 0x87, 0xa8, 0xa2, 0xec, 0x51, 0x3e, 0x7f, 0x1b, 0xce, 0xf0, 0xd2,
     0xdf, 0x7e, 0x12, 0x23, 0x48, 0xdc, 0x0e, 0x55, 0x67, 0xba, 0x0a, 0xec,

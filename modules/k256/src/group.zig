@@ -889,7 +889,7 @@ test "base point + identity match std" {
 // mulDoubleBasePublic PER iteration -- full count timed out the full gate
 // (`k256` alone: 2m34s Debug, this one test ~65s of it). Random draws cut
 // in Debug; ReleaseFast/ReleaseSafe/ReleaseSmall keep the full count.
-const random_scalars_iters: usize = if (builtin.mode == .Debug) 30 else 400;
+const random_scalars_iters: usize = if (builtin.mode == .debug) 30 else 400;
 
 test "differential vs std: dbl/add/scalarmul on random scalars" {
     var prng = std.Random.DefaultPrng.init(0x60D_C0DE_11);
@@ -942,7 +942,7 @@ test "GLV endomorphism: (β·x, y) == λ·P (validates β and λ against the cur
     }
 }
 
-const recover_y_iters: usize = if (builtin.mode == .Debug) 400 else 1500;
+const recover_y_iters: usize = if (builtin.mode == .debug) 400 else 1500;
 
 test "recoverY / lift_x matches std" {
     var prng = std.Random.DefaultPrng.init(0x11F7_0011);
@@ -990,7 +990,7 @@ test "fromSec1 refuses what std refuses: trailing bytes after 00/02/04, hybrid 0
 // fallback it must agree with refuses an identity base. The check is what
 // keeps `ecdsaVerify` from accepting the `00` public key (see sign.zig).
 test "mulDoubleBasePublic refuses an identity base, like its double-add fallback" {
-    const five = [_]u8{0} ** 31 ++ [_]u8{5};
+    const five = @as([31]u8, @splat(0)) ++ [_]u8{5};
     const P = Secp256k1.basePoint;
     const O = Secp256k1.identityElement;
     try std.testing.expectError(error.IdentityElement, Secp256k1.mulDoubleBasePublic(O, five, P, five, .big));
@@ -999,7 +999,7 @@ test "mulDoubleBasePublic refuses an identity base, like its double-add fallback
     try std.testing.expectError(error.IdentityElement, Secp256k1.mulDoubleBasePublicDoubleAdd(P, five, O, five, .big));
     // Positive control: 5·G + 5·G = 10·G.
     const ten = try Secp256k1.mulDoubleBasePublic(P, five, P, five, .big);
-    try std.testing.expect(ten.equivalent(try P.mulPublic([_]u8{0} ** 31 ++ [_]u8{10}, .big)));
+    try std.testing.expect(ten.equivalent(try P.mulPublic(@as([31]u8, @splat(0)) ++ [_]u8{10}, .big)));
 }
 
 // ── fuzz: fromSec1 never panics on arbitrary attacker-supplied encodings ──

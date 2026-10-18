@@ -67,7 +67,7 @@ pub const Drbg = struct {
     }
 
     pub fn init(seed: *const [48]u8) Drbg {
-        var d: Drbg = .{ .key = [_]u8{0} ** 32, .ctr = [_]u8{0} ** 16 };
+        var d: Drbg = .{ .key = @as([32]u8, @splat(0)), .ctr = @as([16]u8, @splat(0)) };
         d.update(seed);
         return d;
     }

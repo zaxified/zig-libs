@@ -382,7 +382,7 @@ test "golden: what `devlink dev param set` really sends first" {
     defer msg.deinit(gpa);
     const off = try beginRequest(gpa, &msg, uapi.CMD.PARAM_GET, seq_writes, REQ | ACK);
     try param.appendGetByName(gpa, &msg, cap_handle, "test_param");
-    try codec.appendAttrU8(gpa, &msg, uapi.ATTR.PARAM_VALUE_CMODE, @intFromEnum(uapi.ParamCmode.runtime));
+    try codec.appendAttrU8(gpa, &msg, uapi.ATTR.PARAM_VALUE_CMODE, @backingInt(uapi.ParamCmode.runtime));
     codec.finishHeader(&msg, off);
     try testing.expectEqualSlices(u8, &req_param_get_with_cmode, msg.items);
 
@@ -876,10 +876,10 @@ test "constructed: a PORT_GET dump with a physical port and two representors" {
         defer a.deinit(gpa);
         try handle.append(gpa, &a, h);
         try codec.appendAttrU32(gpa, &a, uapi.ATTR.PORT_INDEX, 1);
-        try codec.appendAttrU16(gpa, &a, uapi.ATTR.PORT_TYPE, @intFromEnum(uapi.PortType.eth));
+        try codec.appendAttrU16(gpa, &a, uapi.ATTR.PORT_TYPE, @backingInt(uapi.PortType.eth));
         try codec.appendAttrU32(gpa, &a, uapi.ATTR.PORT_NETDEV_IFINDEX, 4);
         try codec.appendAttrString(gpa, &a, uapi.ATTR.PORT_NETDEV_NAME, "enp101s0f0np0");
-        try codec.appendAttrU16(gpa, &a, uapi.ATTR.PORT_FLAVOUR, @intFromEnum(uapi.PortFlavour.physical));
+        try codec.appendAttrU16(gpa, &a, uapi.ATTR.PORT_FLAVOUR, @backingInt(uapi.PortFlavour.physical));
         try codec.appendAttrU32(gpa, &a, uapi.ATTR.PORT_NUMBER, 0);
         try codec.appendAttrU8(gpa, &a, uapi.ATTR.PORT_SPLITTABLE, 1);
         try wrapMessage(gpa, &dgram, uapi.CMD.PORT_NEW, 1, codec.NLM_F_MULTI, a.items);
@@ -889,7 +889,7 @@ test "constructed: a PORT_GET dump with a physical port and two representors" {
         defer a.deinit(gpa);
         try handle.append(gpa, &a, h);
         try codec.appendAttrU32(gpa, &a, uapi.ATTR.PORT_INDEX, 65535 - @as(u32, vf));
-        try codec.appendAttrU16(gpa, &a, uapi.ATTR.PORT_FLAVOUR, @intFromEnum(uapi.PortFlavour.pci_vf));
+        try codec.appendAttrU16(gpa, &a, uapi.ATTR.PORT_FLAVOUR, @backingInt(uapi.PortFlavour.pci_vf));
         try codec.appendAttrU16(gpa, &a, uapi.ATTR.PORT_PCI_PF_NUMBER, 0);
         try codec.appendAttrU16(gpa, &a, uapi.ATTR.PORT_PCI_VF_NUMBER, vf);
         try wrapMessage(gpa, &dgram, uapi.CMD.PORT_NEW, 1, codec.NLM_F_MULTI, a.items);
@@ -920,7 +920,7 @@ test "constructed: a PARAM_GET reply with all three cmodes carrying a u32" {
     const nest = try codec.nestBegin(gpa, &attrs, uapi.ATTR.PARAM);
     try codec.appendAttrString(gpa, &attrs, uapi.ATTR.PARAM_NAME, "max_macs");
     try codec.appendAttr(gpa, &attrs, uapi.ATTR.PARAM_GENERIC, &.{});
-    try codec.appendAttrU8(gpa, &attrs, uapi.ATTR.PARAM_TYPE, @intFromEnum(uapi.ParamType.u32_));
+    try codec.appendAttrU8(gpa, &attrs, uapi.ATTR.PARAM_TYPE, @backingInt(uapi.ParamType.u32_));
     const vl = try codec.nestBegin(gpa, &attrs, uapi.ATTR.PARAM_VALUES_LIST);
     const vals = [_]struct { cmode: uapi.ParamCmode, v: ?u32 }{
         .{ .cmode = .runtime, .v = 128 },
@@ -930,7 +930,7 @@ test "constructed: a PARAM_GET reply with all three cmodes carrying a u32" {
     for (vals) |x| {
         const one = try codec.nestBegin(gpa, &attrs, uapi.ATTR.PARAM_VALUE);
         if (x.v) |v| try codec.appendAttrU32(gpa, &attrs, uapi.ATTR.PARAM_VALUE_DATA, v);
-        try codec.appendAttrU8(gpa, &attrs, uapi.ATTR.PARAM_VALUE_CMODE, @intFromEnum(x.cmode));
+        try codec.appendAttrU8(gpa, &attrs, uapi.ATTR.PARAM_VALUE_CMODE, @backingInt(x.cmode));
         try codec.nestEnd(&attrs, one);
     }
     try codec.nestEnd(&attrs, vl);
@@ -1076,7 +1076,7 @@ test "constructed: a chunked REGION_READ dump reassembles into 48 bytes" {
 
     try testing.expect(data.isComplete());
     try testing.expectEqual(@as(u64, 0x1000), data.address);
-    try testing.expectEqualSlices(u8, &(.{0xaa} ** 16 ++ .{0xbb} ** 16 ++ .{0xcc} ** 16), data.bytes);
+    try testing.expectEqualSlices(u8, &(@as([16]u8, @splat(0xaa)) ++ @as([16]u8, @splat(0xbb)) ++ @as([16]u8, @splat(0xcc))), data.bytes);
 }
 
 test "constructed: a HEALTH_REPORTER_GET dump with a tripped reporter" {

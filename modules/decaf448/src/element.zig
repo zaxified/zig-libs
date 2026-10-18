@@ -72,7 +72,7 @@ const Point = ed448.ed448.Point;
 /// REAL: pure byte layout, no field arithmetic — `ONE_MINUS_D`/
 /// `ONE_MINUS_TWO_D` below are both `< 2^17`, comfortably `< p`.
 fn smallFe(comptime n: u32) Fe {
-    var bytes = [_]u8{0} ** field.encoded_bytes;
+    var bytes = @as([field.encoded_bytes]u8, @splat(0));
     bytes[0] = @truncate(n);
     bytes[1] = @truncate(n >> 8);
     bytes[2] = @truncate(n >> 16);
@@ -614,9 +614,9 @@ test "repeated addition matches RFC 9496 Appendix B.1's own recipe shape: [k]G v
 test "feFromBytesReduced: MAP's input reduction accepts values >= p (RFC 9496 §5.3.4)" {
     // None of Appendix B.3's halves is >= p, so the vectors never reach the
     // subtracting branch. 2^448 - 1 reduces to 2^224, and p itself to zero.
-    var want = [_]u8{0} ** 56;
+    var want = @as([56]u8, @splat(0));
     want[28] = 1;
-    try testing.expect(feFromBytesReduced([_]u8{0xff} ** 56).eql(try Fe.fromBytes(want)));
+    try testing.expect(feFromBytesReduced(@as([56]u8, @splat(0xff))).eql(try Fe.fromBytes(want)));
     try testing.expect(feFromBytesReduced(field.p_bytes).eql(Fe.zero));
 }
 

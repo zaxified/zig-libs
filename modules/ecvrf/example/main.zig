@@ -138,7 +138,7 @@ pub fn main() !void {
     // endian y with sign bit 0 is byte 0x01 followed by 31 zero bytes).
     // `ECVRF_validate_key` (RFC 9381 §5.4.5) must reject it even though
     // `Edwards25519.fromBytes` decodes it as a structurally valid point.
-    var identity_pk: ecvrf.PublicKey = [_]u8{0} ** 32;
+    var identity_pk: ecvrf.PublicKey = @as([32]u8, @splat(0));
     identity_pk[0] = 0x01;
     if (ecvrf.validateKey(identity_pk)) |_| {
         return error.UnexpectedAccept;

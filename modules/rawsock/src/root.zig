@@ -694,7 +694,7 @@ pub const Socket = struct {
     /// join one group, once; the kernel refuses a second join and a join
     /// whose mode or flags disagree with the group's (`error.FanoutFailed`).
     pub fn joinFanout(self: Socket, group: u16, mode: FanoutMode, opts: FanoutOptions) FanoutError!void {
-        var type_flags: u32 = @intFromEnum(mode);
+        var type_flags: u32 = @backingInt(mode);
         if (opts.defrag) type_flags |= PACKET_FANOUT_FLAG_DEFRAG;
         if (opts.rollover) type_flags |= PACKET_FANOUT_FLAG_ROLLOVER;
         var arg: u32 = fanoutArg(group, type_flags);
@@ -1133,7 +1133,7 @@ test "LinkAddr.fromSockaddr decode" {
     // A cooked (halen 0) address zero-fills the hwaddr.
     var cooked = sll;
     cooked.halen = 0;
-    try testing.expectEqual([_]u8{0} ** hwaddr_len, LinkAddr.fromSockaddr(cooked).hwaddr);
+    try testing.expectEqual(@as([hwaddr_len]u8, @splat(0)), LinkAddr.fromSockaddr(cooked).hwaddr);
 
     // A malformed/oversized halen (sll_addr is only 8 bytes; a hostile or
     // buggy peer could report more than the Ethernet hwaddr_len) must clamp
@@ -1309,7 +1309,7 @@ test "F16: ifaceIndexOn rejects an over-length interface name before any syscall
     // must return cleanly, syscall never reached (fd -1 would surface as a
     // syscall failure, not this specific error, if the guard were skipped
     // and the copy somehow survived).
-    const too_long = "a" ** 20;
+    const too_long = strRepeat("a", 20);
     try testing.expectEqual(error.NoSuchInterface, ifaceIndexOn(-1, too_long));
 }
 
@@ -2716,9 +2716,9 @@ test "parseTimestampNs: SCM_TIMESTAMPNS decoded; malformed or foreign cmsgs igno
 
 test "fanoutArg: group id low 16 bits, mode and flags high 16 (packet(7))" {
     // PACKET_FANOUT_LB = 1, PACKET_FANOUT_FLAG_DEFRAG = 0x8000.
-    try testing.expectEqual(@as(u32, 0x8001_0007), fanoutArg(7, @intFromEnum(FanoutMode.lb) | PACKET_FANOUT_FLAG_DEFRAG));
-    try testing.expectEqual(@as(u32, 0x1003_ffff), fanoutArg(0xffff, @intFromEnum(FanoutMode.rollover) | PACKET_FANOUT_FLAG_ROLLOVER));
-    try testing.expectEqual(@as(u32, 0), fanoutArg(0, @intFromEnum(FanoutMode.hash)));
+    try testing.expectEqual(@as(u32, 0x8001_0007), fanoutArg(7, @backingInt(FanoutMode.lb) | PACKET_FANOUT_FLAG_DEFRAG));
+    try testing.expectEqual(@as(u32, 0x1003_ffff), fanoutArg(0xffff, @backingInt(FanoutMode.rollover) | PACKET_FANOUT_FLAG_ROLLOVER));
+    try testing.expectEqual(@as(u32, 0), fanoutArg(0, @backingInt(FanoutMode.hash)));
 }
 
 /// Open a capture on `lo` for `test_ethertype`, or skip (no CAP_NET_RAW).
@@ -2843,4 +2843,16 @@ test "live: a compiled filter attached at open passes only what it names (needs 
 
 test {
     testing.refAllDecls(@This());
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

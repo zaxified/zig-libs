@@ -294,7 +294,7 @@ test "kernel golden: this module's own encoder is semantically equal to wg-tool'
             .persistent_keepalive_interval = 25,
             .allowed_ips = &.{
                 wg.AllowedIp.v4(.{ 10, 0, 0, 0 }, 24),
-                wg.AllowedIp.v6([_]u8{ 0xfd, 0x00, 0x00, 0xaa } ++ [_]u8{0} ** 12, 64),
+                wg.AllowedIp.v6([_]u8{ 0xfd, 0x00, 0x00, 0xaa } ++ @as([12]u8, @splat(0)), 64),
             },
         }},
     }, wg.default_max_msg_len);

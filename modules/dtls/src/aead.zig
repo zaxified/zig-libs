@@ -199,7 +199,7 @@ fn encryptSequenceNumberChaCha20Body(
     std.debug.assert(seq_bytes.len <= 16);
     const counter = std.mem.readInt(u32, ciphertext_sample[0..4], .little);
     const chacha_nonce: [12]u8 = ciphertext_sample[4..16].*;
-    var keystream: [16]u8 = [_]u8{0} ** 16;
+    var keystream: [16]u8 = @as([16]u8, @splat(0));
     std.crypto.stream.chacha.ChaCha20IETF.stream(&keystream, counter, sn_key[0..32].*, chacha_nonce);
     for (seq_bytes, 0..) |*b, i| b.* ^= keystream[i];
 }
@@ -247,7 +247,7 @@ test "nonce: RFC 9147 §4.2.2 XOR of right-aligned seq into static IV" {
 }
 
 test "nonce: multi-byte seq spans the low 8 nonce bytes" {
-    const iv = [_]u8{0} ** 12;
+    const iv = @as([12]u8, @splat(0));
     const P = Protection(Aes128Gcm);
     const n = P.nonce(iv, 0, 0x0102030405060708);
     try testing.expectEqualSlices(u8, &hexTo(12, "000000000102030405060708"), &n);
@@ -331,8 +331,8 @@ test "unprotect: tampered tag/ciphertext/AAD -> DecryptionFailed, never panic" {
 
 test "unprotect: ciphertext shorter than the tag is a typed error" {
     const P = Protection(Aes128Gcm);
-    const key = [_]u8{0} ** 16;
-    const iv = [_]u8{0} ** 12;
+    const key = @as([16]u8, @splat(0));
+    const iv = @as([12]u8, @splat(0));
     var back: [4]u8 = undefined;
     const tiny = [_]u8{ 1, 2, 3 };
     try testing.expectError(error.RecordTooShort, P.unprotect(&key, iv, 0, 0, &tiny, "", &back));
@@ -374,19 +374,19 @@ test "seq-number mask (ChaCha20): byte-exact vs OpenSSL" {
 }
 
 test "seq-number mask: sample shorter than 16 bytes is a typed error" {
-    const sn_key = [_]u8{0} ** 16;
-    const short = [_]u8{0} ** 15;
+    const sn_key = @as([16]u8, @splat(0));
+    const short = @as([15]u8, @splat(0));
     var two = [_]u8{ 1, 2 };
     try testing.expectError(error.RecordTooShort, encryptSequenceNumberAes(&sn_key, &short, &two));
     var two2 = [_]u8{ 1, 2 };
-    const sk32 = [_]u8{0} ** 32;
+    const sk32 = @as([32]u8, @splat(0));
     try testing.expectError(error.RecordTooShort, encryptSequenceNumberChaCha20(&sk32, &short, &two2));
 }
 
 test "protect: output buffer too small is a typed error" {
     const P = Protection(Aes128Gcm);
-    const key = [_]u8{0} ** 16;
-    const iv = [_]u8{0} ** 12;
+    const key = @as([16]u8, @splat(0));
+    const iv = @as([12]u8, @splat(0));
     var tiny: [4]u8 = undefined;
     try testing.expectError(error.BufferTooShort, P.protect(&key, iv, 0, 0, "hello", "", &tiny));
 }

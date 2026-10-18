@@ -217,7 +217,7 @@ noinline fn callTweak() void {
 }
 
 test "STACKPROBE (review 2026-10-08): no key residue on the dead stack after tweakSecretKey()" {
-    if (builtin.mode == .Debug or builtin.mode == .ReleaseSafe) return error.SkipZigTest;
+    if (builtin.mode == .debug or builtin.mode == .safe) return error.SkipZigTest;
 
     for (cases) |case| {
         probe_sk = try bip340.SecretKey.fromBytes(case);

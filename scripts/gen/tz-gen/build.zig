@@ -32,6 +32,6 @@ pub fn build(b: *std.Build) void {
     });
 
     const run = b.addRunArtifact(exe);
-    if (b.args) |a| run.addArgs(a);
+    run.addPassthruArgs();
     b.step("run", "Generate modules/tz/src/tz_data.zig from IANA tzdata").dependOn(&run.step);
 }

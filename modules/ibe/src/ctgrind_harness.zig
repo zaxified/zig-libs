@@ -209,8 +209,8 @@ fn buildDecryptFixture() !struct { d_id: g1.Affine, ct: ibe_mod.Ciphertext } {
     const id = "ctgrind-ibe-harness-identity@example.com";
     var d_id: g1.Affine = undefined;
     ibe_mod.extract(&d_id, &msk, id);
-    const message = [_]u8{0xAB} ** ibe_mod.block_bytes;
-    const sigma = [_]u8{0x11} ** ibe_mod.block_bytes;
+    const message = @as([ibe_mod.block_bytes]u8, @splat(0xAB));
+    const sigma = @as([ibe_mod.block_bytes]u8, @splat(0x11));
     const ct = ibe_mod.encrypt(mpk, id, &message, &sigma);
     return .{ .d_id = d_id, .ct = ct };
 }

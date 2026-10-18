@@ -815,7 +815,7 @@ test "keys distribute across shards (histogram sanity — hits >1 shard, all sha
     var store = try Store.init(testing.allocator, sim.storage(), .{ .n_shards = n_shards });
     defer store.deinit();
 
-    var hist = [_]usize{0} ** n_shards;
+    var hist = @as([n_shards]usize, @splat(0));
     var buf: [32]u8 = undefined;
     for (0..2000) |n| {
         const k = try std.fmt.bufPrint(&buf, "user:{d}", .{n});
@@ -1915,7 +1915,7 @@ test "scan: every allocation failure is reported, sticky, and leak-free" {
     // Enough keys for multi-level trees, plus overflow values (the cursor
     // allocates to assemble those, mid-scan).
     var kbuf: [8]u8 = undefined;
-    const big = [_]u8{'v'} ** 5000;
+    const big = @as([5000]u8, @splat('v'));
     for (0..300) |n| {
         const k = try std.fmt.bufPrint(&kbuf, "k{d:0>4}", .{n});
         try store.put(k, if (n % 50 == 0) &big else k);

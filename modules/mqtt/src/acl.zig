@@ -413,7 +413,7 @@ pub const Passwords = struct {
                 break;
             }
         }
-        const dummy_salt = [_]u8{0} ** 12;
+        const dummy_salt = @as([12]u8, @splat(0));
         const salt = if (found) |f| f.salt[0..f.salt_len] else &dummy_salt;
         const iterations = if (found) |f| f.iterations else p.dummyIterations();
         var dk: [hash_len]u8 = undefined;

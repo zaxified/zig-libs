@@ -118,7 +118,7 @@ const seedHex = testkit.fuzz.seedHex;
 /// it the harness's corpus could not contain a single accepted block.
 const genesis_raw = [_]u8{
     0x01, 0x00, 0x00, 0x00, // version
-} ++ ([_]u8{0} ** 32) // prev_block
+} ++ (@as([32]u8, @splat(0))) // prev_block
 ++ [_]u8{
     0x3b, 0xa3, 0xed, 0xfd, 0x7a, 0x7b, 0x12, 0xb2, 0x7a, 0xc7, 0x2c, 0x3e,
     0x67, 0x76, 0x8f, 0x61, 0x7f, 0xc8, 0x1b, 0xc3, 0x88, 0x8a, 0x51, 0x32,
@@ -130,7 +130,7 @@ const genesis_raw = [_]u8{
     // -- coinbase transaction --
     0x01, 0x00, 0x00, 0x00, // tx version
     0x01, // 1 input
-} ++ ([_]u8{0} ** 32) // null prevout hash
+} ++ (@as([32]u8, @splat(0))) // null prevout hash
 ++ [_]u8{ 0xff, 0xff, 0xff, 0xff } // prevout index
 ++ [_]u8{0x4d} // scriptSig length = 77
 ++ [_]u8{
@@ -191,7 +191,7 @@ test "decodeBlock accepts a block whose one transaction is exactly MIN_TX_LEN oc
     const before = w.list.items.len;
     try w.putU32le(allocator, 1); // version
     try w.putU8(allocator, 1); // one input
-    try w.putBytes(allocator, &([_]u8{0} ** 36)); // prevout
+    try w.putBytes(allocator, &(@as([36]u8, @splat(0)))); // prevout
     try w.putU8(allocator, 0); // empty scriptSig
     try w.putU32le(allocator, 0xffffffff); // sequence
     try w.putU8(allocator, 1); // one output
@@ -206,7 +206,7 @@ test "decodeBlock accepts a block whose one transaction is exactly MIN_TX_LEN oc
 
 test "hostile: decodeBlock on a truncated header fails closed" {
     const allocator = testing.allocator;
-    try testing.expectError(error.Truncated, decodeBlock(allocator, &[_]u8{0} ** 40));
+    try testing.expectError(error.Truncated, decodeBlock(allocator, &@as([40]u8, @splat(0))));
 }
 
 /// `block` payloads, in the format `Smith.slice` reads (see `testkit.fuzz`).
@@ -218,11 +218,11 @@ test "hostile: decodeBlock on a truncated header fails closed" {
 /// positive half by itself; the rest pin the count guard and the header cut.
 const decode_seeds = [_][]const u8{
     seed(&genesis_raw), // the published genesis block: header + its coinbase tx
-    seedHex("00" ** 80 ++ "00"), // a header with txn_count = 0: a legal empty block
-    seedHex("00" ** 80 ++ "feffffffff"), // TooManyItems: the hostile test's 0xffffffff count
-    seedHex("00" ** 80 ++ "01"), // TooManyItems: 1 transaction claimed, 0 octets behind it
-    seedHex("00" ** 80 ++ "01" ++ "41" ** 100), // one claimed tx over 100 junk octets
-    seedHex("00" ** 40), // Truncated: the hostile test's cut-off header
+    seedHex(strRepeat("00", 80) ++ "00"), // a header with txn_count = 0: a legal empty block
+    seedHex(strRepeat("00", 80) ++ "feffffffff"), // TooManyItems: the hostile test's 0xffffffff count
+    seedHex(strRepeat("00", 80) ++ "01"), // TooManyItems: 1 transaction claimed, 0 octets behind it
+    seedHex(strRepeat("00", 80) ++ "01" ++ strRepeat("41", 100)), // one claimed tx over 100 junk octets
+    seedHex(strRepeat("00", 40)), // Truncated: the hostile test's cut-off header
     // The two knobs drawn AFTER the byte draw, one `u64` word each: `1`
     // enables the bias, then the CompactSize octet the bias writes.
     // ⛔ Measured 2026-09-08 over the six seeds above: `smith.value(bool)`
@@ -234,8 +234,8 @@ const decode_seeds = [_][]const u8{
     // ACCEPTED once the bias rewrites offset 80, which is the only way the
     // corpus can show the branch does something.
     biasedSeed(&genesis_bad_count, &.{ 1, 1 }),
-    biasedSeed(&([_]u8{0} ** 80 ++ [_]u8{0xff}), &.{ 1, 0 }), // bias to a legal empty block
-    biasedSeed(&([_]u8{0} ** 80 ++ [_]u8{0x00}), &.{ 0, 0 }), // the knob explicitly OFF
+    biasedSeed(&(@as([80]u8, @splat(0)) ++ [_]u8{0xff}), &.{ 1, 0 }), // bias to a legal empty block
+    biasedSeed(&(@as([80]u8, @splat(0)) ++ [_]u8{0x00}), &.{ 0, 0 }), // the knob explicitly OFF
 };
 
 /// The genesis block with its transaction count (the octet right after the
@@ -355,4 +355,16 @@ test "corpus: every block seed reaches the decoder, and the accepted count is pi
     try testing.expectEqual(@as(usize, 2), biased);
     try testing.expectEqual(@as(usize, 5), accepted);
     try testing.expectEqual(@as(usize, 2), txns);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

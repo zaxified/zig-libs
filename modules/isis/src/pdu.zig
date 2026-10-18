@@ -113,7 +113,7 @@ pub const CircuitType = enum(u2) {
 fn decodeCircuitType(octet: u8) DecodeError!CircuitType {
     const levels: u2 = @intCast(octet & 0x03);
     if (levels == 0) return error.ReservedCircuitType;
-    return @enumFromInt(levels);
+    return @fromBackingInt(@intCast(levels));
 }
 
 // ── IIH: LAN Hello (types 15/16) ─────────────────────────────────────────────
@@ -178,7 +178,7 @@ pub const LanHelloBuilder = struct {
             .id_length = modeled_id_length,
             .max_area_addresses = f.max_area_addresses,
         }, buf[0..header.common_header_len]) catch unreachable;
-        buf[8] = @intFromEnum(f.circuit_type);
+        buf[8] = @backingInt(f.circuit_type);
         @memcpy(buf[9..15], &f.source_id);
         std.mem.writeInt(u16, buf[15..17], f.holding_time, .big);
         std.mem.writeInt(u16, buf[17..19], 0, .big); // PDU length, backfilled
@@ -248,7 +248,7 @@ pub const P2pHelloBuilder = struct {
             .id_length = modeled_id_length,
             .max_area_addresses = f.max_area_addresses,
         }, buf[0..header.common_header_len]) catch unreachable;
-        buf[8] = @intFromEnum(f.circuit_type);
+        buf[8] = @backingInt(f.circuit_type);
         @memcpy(buf[9..15], &f.source_id);
         std.mem.writeInt(u16, buf[15..17], f.holding_time, .big);
         std.mem.writeInt(u16, buf[17..19], 0, .big);
@@ -672,8 +672,8 @@ test "IIH Circuit Type 0 refuses the whole PDU; the six high reserved bits are i
         lan_buf[8] = octet;
         p2p_buf[8] = octet;
         const levels: u2 = @intCast(octet & 0x03);
-        try testing.expectEqual(levels, @intFromEnum((try LanHello.decode(lan)).circuit_type));
-        try testing.expectEqual(levels, @intFromEnum((try P2pHello.decode(p2p)).circuit_type));
+        try testing.expectEqual(levels, @backingInt((try LanHello.decode(lan)).circuit_type));
+        try testing.expectEqual(levels, @backingInt((try P2pHello.decode(p2p)).circuit_type));
     }
 }
 
@@ -877,7 +877,7 @@ test "§7.3.11: finishStamped emits the checksum the standard requires" {
 }
 
 test "§7.3.11 helpers reject a malformed LSP the same way decode does" {
-    try testing.expectError(error.BadDiscriminator, checkLspChecksum(&([_]u8{0xFF} ** 30)));
+    try testing.expectError(error.BadDiscriminator, checkLspChecksum(&(@as([30]u8, @splat(0xFF)))));
     try testing.expectError(error.TruncatedBody, computeLspChecksum(graded_lsp[0..20]));
 }
 
@@ -899,7 +899,7 @@ test "an over-large builder buffer cannot wrap the u16 PDU Length field" {
     });
 
     // Fill with the widest TLV there is (2 + 255 octets each) until refused.
-    const value = [_]u8{0xAA} ** 255;
+    const value = @as([255]u8, @splat(0xAA));
     var added: usize = 0;
     while (b.tlvs.addTlv(0x0E, &value)) |_| {
         added += 1;

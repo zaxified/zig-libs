@@ -510,7 +510,7 @@ pub const Sim = struct {
         errdefer sim.gpa.destroy(h);
         const id: u32 = @intCast(sim.hosts.items.len);
         const n: u32 = id + 1;
-        var ip6: [16]u8 = .{ 0xfd, 0 } ++ .{0} ** 14;
+        var ip6: [16]u8 = [_]u8{ 0xfd, 0 } ++ @as([14]u8, @splat(0));
         std.mem.writeInt(u32, ip6[12..16], n, .big);
         h.* = .{
             .sim = sim,
@@ -1013,7 +1013,7 @@ pub const Sim = struct {
         f.wait_gen += 1;
         f.wake_reason = reason;
         f.state = .ready;
-        sim.mix(f.id ^ (@as(u64, @intFromEnum(reason)) << 60) ^ (sim.now *% 0xbf58476d1ce4e5b9));
+        sim.mix(f.id ^ (@as(u64, @backingInt(reason)) << 60) ^ (sim.now *% 0xbf58476d1ce4e5b9));
         sim.ready.appendAssumeCapacity(f); // capacity invariant: see `fibers`
     }
 

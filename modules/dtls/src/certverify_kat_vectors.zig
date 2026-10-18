@@ -43,7 +43,7 @@ pub const ed25519_client = struct {
     pub const public_key_bytes = hexLit("248acbdbaf9e050196de704bea2d68770e519150d103b587dae2d9cad53dd930");
     /// Fixed 32-byte (SHA-256-sized) stand-in transcript hash -- NOT a real
     /// handshake transcript, just a fixed repeated byte for KAT purposes.
-    pub const transcript_hash = [_]u8{0x11} ** 32;
+    pub const transcript_hash = @as([32]u8, @splat(0x11));
     /// Byte-exact expected `buildSignedContent(.client, transcript_hash, _)`
     /// output (64x0x20 || "TLS 1.3, client CertificateVerify" || 0x00 || transcript_hash).
     pub const content = hexLit("20202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020544c5320312e332c20636c69656e74204365727469666963617465566572696679001111111111111111111111111111111111111111111111111111111111111111");
@@ -73,7 +73,7 @@ pub const ecdsa_p256_server = struct {
     pub const seed = hexLit("cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd");
     pub const secret_key_bytes = hexLit("d79d97378a09572484464e950ab78ebe10da96a244da4bb6560f23965c888dc4");
     pub const public_key_uncompressed_sec1 = hexLit("04e2fe7dc6c2128508c062cf493820af31868868017cc26520a6cf9b26458c162026a8b2e0810feaa6a3e172e2ff06f2154f988441df7bcc3f671d9186328f7c1c");
-    pub const transcript_hash = [_]u8{0x11} ** 32;
+    pub const transcript_hash = @as([32]u8, @splat(0x11));
     pub const content = hexLit("20202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020544c5320312e332c20736572766572204365727469666963617465566572696679001111111111111111111111111111111111111111111111111111111111111111");
     /// Raw (r || s), 64 bytes.
     pub const signature_raw = hexLit("e889a650ef35d306f443ddf2018e4091d0896944aacd1bab1b860c0628ef5cc03942ce232acfc1aad9154bc6a493be9c69cd95ce066f1b75d911dec4ff224e57");
@@ -98,7 +98,7 @@ pub const ecdsa_p384_server = struct {
     pub const seed = hexLit("efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef");
     pub const secret_key_bytes = hexLit("b72d5a467df0b2eb1d5de3778e015d8ce868d290e555d0096d3c76e51aa12732db763a7c14e5decc87d3dda29caf716a");
     pub const public_key_uncompressed_sec1 = hexLit("042df805cdc6f5d2e9094bc2432a413e975d18da91fe920bbee152e8950de9b0dfdd6b1517c5ea5463c937ffd5dd721ebee5e4356468174dca8d2ca5e5469644014a899731b8b8bb3e197bfbe4ec987f4944dc60671b4b381fc8d6a90272b50864");
-    pub const transcript_hash = [_]u8{0x22} ** 48;
+    pub const transcript_hash = @as([48]u8, @splat(0x22));
     pub const content = hexLit("20202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020544c5320312e332c2073657276657220436572746966696361746556657269667900222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222");
     pub const signature_raw = hexLit("e626f16735e281b1f20157db23355fe4ca4cc1a055e72fd633b63b06860bb37c518ab56ab665fed02ba1d896480a58a61881487571d0b80127ee5aa842bad2bbedd5f962b8f1c4d816580a8f5ecf5675e5ab4a780fea592255d826fd6b0eac36");
     pub const signature_der = hexLit("3065023100e626f16735e281b1f20157db23355fe4ca4cc1a055e72fd633b63b06860bb37c518ab56ab665fed02ba1d896480a58a602301881487571d0b80127ee5aa842bad2bbedd5f962b8f1c4d816580a8f5ecf5675e5ab4a780fea592255d826fd6b0eac36");

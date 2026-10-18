@@ -95,9 +95,9 @@ pub const Error = error{NoSpaceLeft};
 /// ClientHello) and writes the binder into the last `binder_len` bytes.
 pub fn write(buf: []u8, p: Params) Error![]u8 {
     var w: W = .{ .buf = buf };
-    try w.byte(@intFromEnum(tls.HandshakeType.client_hello));
+    try w.byte(@backingInt(tls.HandshakeType.client_hello));
     const msg_len = try w.hole(3);
-    try w.int(u16, @intFromEnum(tls.ProtocolVersion.tls_1_2)); // legacy_version
+    try w.int(u16, @backingInt(tls.ProtocolVersion.tls_1_2)); // legacy_version
     try w.bytes(p.random);
     try w.byte(32);
     try w.bytes(p.session_id);
@@ -106,35 +106,35 @@ pub fn write(buf: []u8, p: Params) Error![]u8 {
     const exts_len = try w.hole(2);
 
     {
-        const e = try w.ext(@intFromEnum(tls.ExtensionType.supported_versions));
+        const e = try w.ext(@backingInt(tls.ExtensionType.supported_versions));
         try w.byte(@intCast(2 * p.versions.len));
-        for (p.versions) |v| try w.int(u16, @intFromEnum(v));
+        for (p.versions) |v| try w.int(u16, @backingInt(v));
         w.close(e);
     }
     {
-        const e = try w.ext(@intFromEnum(tls.ExtensionType.signature_algorithms));
+        const e = try w.ext(@backingInt(tls.ExtensionType.signature_algorithms));
         try w.int(u16, @intCast(2 * signature_algorithms.len));
-        for (signature_algorithms) |s| try w.int(u16, @intFromEnum(s));
+        for (signature_algorithms) |s| try w.int(u16, @backingInt(s));
         w.close(e);
     }
     {
-        const e = try w.ext(@intFromEnum(tls.ExtensionType.supported_groups));
+        const e = try w.ext(@backingInt(tls.ExtensionType.supported_groups));
         try w.int(u16, @intCast(2 * p.groups.len));
-        for (p.groups) |g| try w.int(u16, @intFromEnum(g));
+        for (p.groups) |g| try w.int(u16, @backingInt(g));
         w.close(e);
     }
     {
-        const e = try w.ext(@intFromEnum(tls.ExtensionType.psk_key_exchange_modes));
-        try w.bytes(&.{ 1, @intFromEnum(tls.PskKeyExchangeMode.psk_dhe_ke) });
+        const e = try w.ext(@backingInt(tls.ExtensionType.psk_key_exchange_modes));
+        try w.bytes(&.{ 1, @backingInt(tls.PskKeyExchangeMode.psk_dhe_ke) });
         w.close(e);
     }
     // key_share is TLS 1.3's (RFC 8446 §4.2.8): absent from a TLS 1.2-only
     // hello, an empty list when 1.3 is offered without shares.
     if (mem.indexOfScalar(tls.ProtocolVersion, p.versions, .tls_1_3) != null) {
-        const e = try w.ext(@intFromEnum(tls.ExtensionType.key_share));
+        const e = try w.ext(@backingInt(tls.ExtensionType.key_share));
         const list = try w.hole(2);
         for (p.shares) |s| {
-            try w.int(u16, @intFromEnum(s.group));
+            try w.int(u16, @backingInt(s.group));
             try w.int(u16, @intCast(s.key.len));
             try w.bytes(s.key);
         }
@@ -142,7 +142,7 @@ pub fn write(buf: []u8, p: Params) Error![]u8 {
         w.close(e);
     }
     if (p.host.len != 0) {
-        const e = try w.ext(@intFromEnum(tls.ExtensionType.server_name));
+        const e = try w.ext(@backingInt(tls.ExtensionType.server_name));
         try w.int(u16, @intCast(1 + 2 + p.host.len)); // server_name_list
         try w.byte(0); // host_name
         try w.int(u16, @intCast(p.host.len));
@@ -152,11 +152,11 @@ pub fn write(buf: []u8, p: Params) Error![]u8 {
     try w.bytes(p.alpn_ext);
     if (p.status_request) {
         // CertificateStatusRequest: ocsp(1), no responder ids, no extensions.
-        const e = try w.ext(@intFromEnum(tls.ExtensionType.status_request));
+        const e = try w.ext(@backingInt(tls.ExtensionType.status_request));
         try w.bytes(&.{ 1, 0, 0, 0, 0 });
         w.close(e);
     }
-    if (p.signed_certificate_timestamp) w.close(try w.ext(@intFromEnum(tls.ExtensionType.signed_certificate_timestamp)));
+    if (p.signed_certificate_timestamp) w.close(try w.ext(@backingInt(tls.ExtensionType.signed_certificate_timestamp)));
     if (p.extended_master_secret) w.close(try w.ext(ext_extended_master_secret));
     if (p.renegotiation_info) {
         const e = try w.ext(ext_renegotiation_info);
@@ -164,13 +164,13 @@ pub fn write(buf: []u8, p: Params) Error![]u8 {
         w.close(e);
     }
     if (p.cookie.len != 0) {
-        const e = try w.ext(@intFromEnum(tls.ExtensionType.cookie));
+        const e = try w.ext(@backingInt(tls.ExtensionType.cookie));
         try w.int(u16, @intCast(p.cookie.len));
         try w.bytes(p.cookie);
         w.close(e);
     }
     if (p.psk) |psk| {
-        const e = try w.ext(@intFromEnum(tls.ExtensionType.pre_shared_key));
+        const e = try w.ext(@backingInt(tls.ExtensionType.pre_shared_key));
         try w.int(u16, @intCast(2 + psk.identity.len + 4)); // identities
         try w.int(u16, @intCast(psk.identity.len));
         try w.bytes(psk.identity);
@@ -284,9 +284,9 @@ test "hello: lengths are consistent, PSK binders last and zero-filled" {
         count += 1;
     }
     try testing.expectEqual(exts_end, i);
-    try testing.expectEqual(@as(u16, @intFromEnum(tls.ExtensionType.pre_shared_key)), last);
+    try testing.expectEqual(@as(u16, @backingInt(tls.ExtensionType.pre_shared_key)), last);
     try testing.expectEqual(@as(usize, 12), count);
-    try testing.expectEqualSlices(u8, &([_]u8{0} ** 32), m[m.len - 32 ..]);
+    try testing.expectEqualSlices(u8, &(@as([32]u8, @splat(0))), m[m.len - 32 ..]);
     try testing.expectEqual(@as(usize, 35), bindersLen(psk));
     try testing.expectEqual(@as(u8, 32), m[m.len - 33]);
 }

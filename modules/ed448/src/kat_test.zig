@@ -56,12 +56,12 @@ test "RFC 7748 §5: X448 of a small-order u (0, 1, p - 1) is all zeros" {
     // clamped scalar is a multiple of the cofactor 4, so the ladder ends at
     // the point at infinity, z_2 = 0, and RFC 7748 §5's x_2 · z_2^(p-2) is 0.
     // RFC 7748 §6.2 names this all-zero output as the check a caller MAY make.
-    var p_minus_1 = [_]u8{0xff} ** 56; // p = 2^448 - 2^224 - 1, little-endian
+    var p_minus_1 = @as([56]u8, @splat(0xff)); // p = 2^448 - 2^224 - 1, little-endian
     p_minus_1[28] = 0xfe;
     p_minus_1[0] = 0xfe;
-    var one = [_]u8{0} ** 56;
+    var one = @as([56]u8, @splat(0));
     one[0] = 1;
-    const zero = [_]u8{0} ** 56;
+    const zero = @as([56]u8, @splat(0));
     for ([_][56]u8{ zero, one, p_minus_1 }) |u| {
         var out: [x448.shared_length]u8 = undefined;
         try x448.scalarmult(&out, &v.x448.dh.alice_private, u);

@@ -137,7 +137,7 @@ fn x509Confirmation(alloc: std.mem.Allocator, cert_der: []const u8) ![]u8 {
 
 // A SEC1-shaped uncompressed P-256 point (0x04 || X(32) || Y(32)). Opaque:
 // byte-compared, never parsed.
-const presented_point = [_]u8{0x04} ++ ([_]u8{0xA1} ** 32) ++ ([_]u8{0xB2} ** 32);
+const presented_point = [_]u8{0x04} ++ (@as([32]u8, @splat(0xA1))) ++ (@as([32]u8, @splat(0xB2)));
 
 test "HoK KeyValue: RSAKeyValue matching presented rsa key -> accepted" {
     const alloc = testing.allocator;
@@ -251,7 +251,7 @@ test "HoK KeyValue: ECKeyValue not matching presented sec1 point -> HolderOfKeyM
     var s = try mintResponse(alloc, conf);
     defer s.deinit(alloc);
 
-    const wrong = [_]u8{0x04} ++ ([_]u8{0x00} ** 64);
+    const wrong = [_]u8{0x04} ++ (@as([64]u8, @splat(0x00)));
     var cfg = baseConfig(s.key);
     cfg.subject_confirmation = .holder_of_key;
     cfg.presented_holder_key = .{ .ec_sec1 = &wrong };
@@ -293,7 +293,7 @@ test "HoK KeyValue: no presented cert nor key -> PresentedKeyMissing" {
 
 test "HoK KeyValue: confirmation is X509 but only a bare key configured -> HolderOfKeyCrossFormUnsupported" {
     const alloc = testing.allocator;
-    const cert = [_]u8{ 0x30, 0x82, 0x01, 0x00, 0xAB, 0xCD } ++ ([_]u8{0x77} ** 40);
+    const cert = [_]u8{ 0x30, 0x82, 0x01, 0x00, 0xAB, 0xCD } ++ (@as([40]u8, @splat(0x77)));
     const conf = try x509Confirmation(alloc, &cert);
     defer alloc.free(conf);
     var s = try mintResponse(alloc, conf);
@@ -315,7 +315,7 @@ test "HoK KeyValue: confirmation is KeyValue but only a cert configured -> Holde
     var s = try mintResponse(alloc, conf);
     defer s.deinit(alloc);
 
-    const cert = [_]u8{ 0x30, 0x82, 0x01, 0x00 } ++ ([_]u8{0x42} ** 32);
+    const cert = [_]u8{ 0x30, 0x82, 0x01, 0x00 } ++ (@as([32]u8, @splat(0x42)));
     var cfg = baseConfig(s.key);
     cfg.subject_confirmation = .holder_of_key;
     cfg.presented_holder_cert_der = &cert;
@@ -329,7 +329,7 @@ test "HoK KeyValue: both cert and key configured, KeyValue confirmation matches 
     var s = try mintResponse(alloc, conf);
     defer s.deinit(alloc);
 
-    const cert = [_]u8{ 0x30, 0x82, 0x01, 0x00 } ++ ([_]u8{0x42} ** 32);
+    const cert = [_]u8{ 0x30, 0x82, 0x01, 0x00 } ++ (@as([32]u8, @splat(0x42)));
     var cfg = baseConfig(s.key);
     cfg.subject_confirmation = .holder_of_key;
     cfg.presented_holder_cert_der = &cert; // present but irrelevant to a KeyValue confirmation

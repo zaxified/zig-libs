@@ -672,7 +672,7 @@ pub fn Generic(comptime L: usize) type {
             const seed_limbs = importAcc(st.inner.h);
             var acc = loadBlocks64(L, m[0..][0 .. block_length * L]);
             inline for (0..5) |k| {
-                var seed: [L]u64 = .{0} ** L;
+                var seed: [L]u64 = @splat(0);
                 seed[0] = seed_limbs[k]; // lane 0 is block 0 (`laneBlock`)
                 acc[k] += @as(V64, seed);
             }
@@ -716,7 +716,7 @@ pub fn Generic(comptime L: usize) type {
             const seed_limbs = importAcc(st.inner.h);
             var acc = loadBlocks64(H, m[0..][0 .. block_length * H]);
             inline for (0..5) |k| {
-                var seed: [H]u64 = .{0} ** H;
+                var seed: [H]u64 = @splat(0);
                 seed[0] = seed_limbs[k]; // lane 0 is block 0 (`laneBlock`)
                 acc[k] += @as(V64, seed);
             }
@@ -873,9 +873,9 @@ fn hex(comptime s: []const u8) [s.len / 2]u8 {
 
 test "RFC 8439 §A.3 Poly1305 vectors, every lane width" {
     // #1: r = 0, s = 0 over 64 zero bytes → zero tag.
-    const v1_key = [_]u8{0} ** 32;
-    const v1_msg = [_]u8{0} ** 64;
-    const v1_tag = [_]u8{0} ** 16;
+    const v1_key = @as([32]u8, @splat(0));
+    const v1_msg = @as([64]u8, @splat(0));
+    const v1_tag = @as([16]u8, @splat(0));
 
     // #2: r = 0, s ≠ 0 → the tag is s itself, whatever the message.
     const v2_key = hex("0000000000000000000000000000000036e5f6b5c5e06070f0efca96227a863e");
@@ -1005,7 +1005,7 @@ test "differential vs std with random keys (carry-chain stress)" {
 test "all-ones key and message (maximal limbs)" {
     // r clamps to its largest legal value and every message limb is maximal;
     // this is the worst case for the deferred-carry bound.
-    const key = [_]u8{0xff} ** 32;
+    const key = @as([32]u8, @splat(0xff));
     var msg: [1024]u8 = undefined;
     @memset(&msg, 0xff);
     inline for (widths) |L| {
@@ -1149,7 +1149,7 @@ test "wide_min_groups routes each length to the engine it was measured for" {
     try testing.expectEqual(@as(usize, 192), Generic(4).wide_min_bytes);
     try testing.expectEqual(@as(usize, 384), Generic(8).wide_min_bytes);
 
-    const key = [_]u8{0x7C} ** 32;
+    const key = @as([32]u8, @splat(0x7C));
     var msg: [1024]u8 = undefined;
     for (&msg, 0..) |*b, i| b.* = @truncate(i *% 97);
     var tag: [16]u8 = undefined;
@@ -1200,7 +1200,7 @@ test "a partial block topped up by update still reaches the wide engine" {
     // serial core with every byte still equal (mutation run 2026-10-04,
     // survivor). Here the bulk after a 1/5/15-byte head is far past
     // `wide_min_bytes` at every width, so it must run wide.
-    const key = [_]u8{0x3D} ** 32;
+    const key = @as([32]u8, @splat(0x3D));
     var msg: [1024]u8 = undefined;
     for (&msg, 0..) |*b, i| b.* = @truncate(i *% 131);
     inline for (.{ 2, 4, 8 }) |L| {
@@ -1229,7 +1229,7 @@ test "final wipes the key-derived power table it built" {
     // dropping any one of the four wipes, or all of them, stayed green
     // (mutation run 2026-10-04). 512 bytes reaches the wide path at every
     // width, so the table is built before `final` runs.
-    const key = [_]u8{0xA7} ** 32;
+    const key = @as([32]u8, @splat(0xA7));
     var msg: [512]u8 = undefined;
     @memset(&msg, 0x5C);
     inline for (.{ 2, 4, 8 }) |L| {
@@ -1257,7 +1257,7 @@ test "the half engine's power table is the full table's prefix" {
     // r^1..r^L table. A wrong index there (r^(H+1), an off-by-one fold) fails
     // the byte comparisons only at the lengths that take the half engine, so
     // pin those lengths against std here, with a partial head, at L = 8.
-    const key = [_]u8{0xE1} ** 32;
+    const key = @as([32]u8, @splat(0xE1));
     var msg: [400]u8 = undefined;
     for (&msg, 0..) |*b, i| b.* = @truncate(i *% 53 +% 7);
     for ([_]usize{ 192, 200, 255, 256, 320, 383 }) |len| {
@@ -1331,14 +1331,14 @@ const poly_seeds = [_][]const u8{
         "43727970746f6772617068696320466f72756d2052657365617263682047726f7570"),
     polySeed("85d6be7857556d337f4452fe42d506a80103808afb0db2fd4abff6af4149f51b"), // the empty message
     polySeed("85d6be7857556d337f4452fe42d506a80103808afb0db2fd4abff6af4149f51b" ++ "41"), // one octet
-    polySeed("85d6be7857556d337f4452fe42d506a80103808afb0db2fd4abff6af4149f51b" ++ "AA" ** 15), // one short of a block
-    polySeed("85d6be7857556d337f4452fe42d506a80103808afb0db2fd4abff6af4149f51b" ++ "AA" ** 16), // exactly one block
-    polySeed("85d6be7857556d337f4452fe42d506a80103808afb0db2fd4abff6af4149f51b" ++ "AA" ** 17), // one block plus a leftover
-    polySeed("85d6be7857556d337f4452fe42d506a80103808afb0db2fd4abff6af4149f51b" ++ "AA" ** 128), // a wide run
-    polySeed("85d6be7857556d337f4452fe42d506a80103808afb0db2fd4abff6af4149f51b" ++ "AA" ** 608), // the full 640-octet buffer
-    polySeed("00" ** 32 ++ "AA" ** 64), // an all-zero key: r = 0, every product vanishes
-    polySeed("ff" ** 32 ++ "ff" ** 64), // all-ones key and message: maximal limbs
-    polySeed("02" ** 32), // a key with no message at all
+    polySeed("85d6be7857556d337f4452fe42d506a80103808afb0db2fd4abff6af4149f51b" ++ strRepeat("AA", 15)), // one short of a block
+    polySeed("85d6be7857556d337f4452fe42d506a80103808afb0db2fd4abff6af4149f51b" ++ strRepeat("AA", 16)), // exactly one block
+    polySeed("85d6be7857556d337f4452fe42d506a80103808afb0db2fd4abff6af4149f51b" ++ strRepeat("AA", 17)), // one block plus a leftover
+    polySeed("85d6be7857556d337f4452fe42d506a80103808afb0db2fd4abff6af4149f51b" ++ strRepeat("AA", 128)), // a wide run
+    polySeed("85d6be7857556d337f4452fe42d506a80103808afb0db2fd4abff6af4149f51b" ++ strRepeat("AA", 608)), // the full 640-octet buffer
+    polySeed(strRepeat("00", 32) ++ strRepeat("AA", 64)), // an all-zero key: r = 0, every product vanishes
+    polySeed(strRepeat("ff", 32) ++ strRepeat("ff", 64)), // all-ones key and message: maximal limbs
+    polySeed(strRepeat("02", 32)), // a key with no message at all
 };
 
 test "fuzz: MAC agrees with std on arbitrary key/message" {
@@ -1351,10 +1351,10 @@ fn fuzzAgainstStd(_: void, smith: *std.testing.Smith) !void {
 
 const fuzz_driver = @import("testkit").fuzz.driver;
 const FuzzLabel = enum { empty_message, short_message, wide_message };
-var fuzz_reach: [@typeInfo(FuzzLabel).@"enum".fields.len]usize = @splat(0);
+var fuzz_reach: [@typeInfo(FuzzLabel).@"enum".field_names.len]usize = @splat(0);
 
 fn mark(comptime l: FuzzLabel) void {
-    fuzz_reach[@intFromEnum(l)] += 1;
+    fuzz_reach[@backingInt(l)] += 1;
     fuzz_driver.hit(@tagName(l));
 }
 
@@ -1402,7 +1402,7 @@ test "fuzz harness: 300 seeds in every test run, and they get everywhere" {
     }
     for (fuzz_reach, 0..) |n, i| if (n == 0) {
         // The wide label needs a message of 48 * lanes octets; Rng.slice reaches it.
-        std.debug.print("reach: label {t} never hit in 300 seeds\n", .{@as(FuzzLabel, @enumFromInt(i))});
+        std.debug.print("reach: label {t} never hit in 300 seeds\n", .{@as(FuzzLabel, @fromBackingInt(@intCast(i)))});
         return error.HarnessDoesNotReach;
     };
 }
@@ -1452,4 +1452,16 @@ test "corpus: every seed reaches the MAC, and the message coverage is pinned" {
     try testing.expectEqual(poly_seeds.len, pairs);
     try testing.expectEqual(@as(usize, 947), octets);
     try testing.expect(wide_runs >= 1);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

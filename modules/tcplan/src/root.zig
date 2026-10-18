@@ -246,7 +246,7 @@ test "a leaf without a classifier gets a class + CAKE but no filter" {
 // queue, a site, and one subscriber owning an IPv4 /32 and an IPv6 /56 with
 // every HTB knob set. `tools/capture_dualstack.sh` lists the `tc` command line
 // each op corresponds to and re-derives `testdata/dualstack_iproute2.txt`.
-const ds_v6: [16]u8 = .{ 0x20, 0x01, 0x0d, 0xb8, 0x00, 0x01 } ++ [_]u8{0} ** 10;
+const ds_v6: [16]u8 = .{ 0x20, 0x01, 0x0d, 0xb8, 0x00, 0x01 } ++ @as([10]u8, @splat(0));
 const ds_subs = [_]Node{.{
     .name = "circuit-1",
     .rate_bps = mbit(100),

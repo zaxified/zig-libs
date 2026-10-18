@@ -125,7 +125,7 @@ pub fn StekRing(comptime depth: usize) type {
         const Self = @This();
 
         /// Fixed-size slots, oldest-first; `null` = never installed.
-        keys: [depth]?Stek = [_]?Stek{null} ** depth,
+        keys: [depth]?Stek = @as([depth]?Stek, @splat(null)),
         /// Index of the slot holding the CURRENT encrypt-with key (the most
         /// recently rotated-in one). All other populated slots are
         /// decrypt-only (accepted for `open`, never used by `seal`).
@@ -318,7 +318,7 @@ test "StekRing: rotate installs the active key; findKey/activeKey agree" {
     var ring = DefaultRing.init();
     try testing.expect(ring.activeKey() == null);
 
-    ring.rotate(1, &([_]u8{0xAA} ** key_length), 1_000);
+    ring.rotate(1, &(@as([key_length]u8, @splat(0xAA))), 1_000);
     const active = ring.activeKey().?;
     try testing.expectEqual(@as(u8, 1), active.id);
     try testing.expectEqual(@as(i64, 1_000), active.installed_at_s);
@@ -328,13 +328,13 @@ test "StekRing: rotate installs the active key; findKey/activeKey agree" {
 
 test "StekRing: rotating past depth evicts the oldest key (ring-buffer wraparound)" {
     var ring = StekRing(2).init();
-    ring.rotate(1, &([_]u8{0x01} ** key_length), 1);
-    ring.rotate(2, &([_]u8{0x02} ** key_length), 2);
+    ring.rotate(1, &(@as([key_length]u8, @splat(0x01))), 1);
+    ring.rotate(2, &(@as([key_length]u8, @splat(0x02))), 2);
     // Both still live (depth = 2, exactly full).
     try testing.expect(ring.findKey(1) != null);
     try testing.expect(ring.findKey(2) != null);
 
-    ring.rotate(3, &([_]u8{0x03} ** key_length), 3);
+    ring.rotate(3, &(@as([key_length]u8, @splat(0x03))), 3);
     // Key 1 evicted; 2 and 3 live; 3 is now active.
     try testing.expect(ring.findKey(1) == null);
     try testing.expect(ring.findKey(2) != null);
@@ -350,13 +350,13 @@ test "seal/open: round-trip, tamper detection, unknown id, malformed, buffer bou
     var ring = DefaultRing.init();
     var blob_buf: [128]u8 = undefined;
     var out_buf: [128]u8 = undefined;
-    const nonce = [_]u8{0xA1} ** nonce_length;
+    const nonce = @as([nonce_length]u8, @splat(0xA1));
     const plaintext = "serialized session state";
 
     // No key ever rotated in -> NoActiveKey.
     try testing.expectError(error.NoActiveKey, ring.seal(plaintext, nonce, &blob_buf));
 
-    ring.rotate(7, &([_]u8{0x42} ** key_length), 1_000);
+    ring.rotate(7, &(@as([key_length]u8, @splat(0x42))), 1_000);
 
     // 1. Round-trip.
     const blob = try ring.seal(plaintext, nonce, &blob_buf);
@@ -393,7 +393,7 @@ test "seal/open: AAD binds the key id (same key bytes under a different id rejec
     // key-id byte at the other slot must still fail, proving the id is
     // authenticated as AAD, not merely used for key lookup.
     var ring = DefaultRing.init();
-    const key = [_]u8{0x42} ** key_length;
+    const key = @as([key_length]u8, @splat(0x42));
     ring.rotate(1, &key, 1_000);
     ring.rotate(2, &key, 2_000);
 
@@ -401,7 +401,7 @@ test "seal/open: AAD binds the key id (same key bytes under a different id rejec
     var out_buf: [128]u8 = undefined;
     var ring_one_active = ring;
     ring_one_active.active = 0; // seal under id 1 explicitly
-    const blob = try ring_one_active.seal("state", [_]u8{0xB2} ** nonce_length, &blob_buf);
+    const blob = try ring_one_active.seal("state", @as([nonce_length]u8, @splat(0xB2)), &blob_buf);
 
     var repointed: [128]u8 = undefined;
     @memcpy(repointed[0..blob.len], blob);
@@ -411,19 +411,19 @@ test "seal/open: AAD binds the key id (same key bytes under a different id rejec
 
 test "seal/open: an older still-live STEK still opens its tickets after rotation" {
     var ring = DefaultRing.init();
-    ring.rotate(1, &([_]u8{0x01} ** key_length), 1_000);
+    ring.rotate(1, &(@as([key_length]u8, @splat(0x01))), 1_000);
 
     var blob_buf: [128]u8 = undefined;
     var out_buf: [128]u8 = undefined;
-    const blob = try ring.seal("pre-rotation ticket", [_]u8{0xC3} ** nonce_length, &blob_buf);
+    const blob = try ring.seal("pre-rotation ticket", @as([nonce_length]u8, @splat(0xC3)), &blob_buf);
 
-    ring.rotate(2, &([_]u8{0x02} ** key_length), 2_000); // key 1 now decrypt-only
+    ring.rotate(2, &(@as([key_length]u8, @splat(0x02))), 2_000); // key 1 now decrypt-only
     const opened = try ring.open(blob, &out_buf);
     try testing.expectEqualSlices(u8, "pre-rotation ticket", opened);
 
     // New seals go out under the NEW active key.
     var blob_buf2: [128]u8 = undefined;
-    const blob2 = try ring.seal("post-rotation ticket", [_]u8{0xC4} ** nonce_length, &blob_buf2);
+    const blob2 = try ring.seal("post-rotation ticket", @as([nonce_length]u8, @splat(0xC4)), &blob_buf2);
     try testing.expectEqual(@as(u8, 2), blob2[0]);
 }
 
@@ -431,7 +431,7 @@ test "RotationPolicy: needsRotation boundary, empty ring" {
     var ring = DefaultRing.init();
     const policy = RotationPolicy{ .period_s = 100, .lifetime_s = 1000 };
     try testing.expect(ring.needsRotation(policy, 0));
-    ring.rotate(0, &([_]u8{1} ** key_length), 50);
+    ring.rotate(0, &(@as([key_length]u8, @splat(1))), 50);
     try testing.expect(!ring.needsRotation(policy, 50 + 99));
     try testing.expect(ring.needsRotation(policy, 50 + 100));
 }
@@ -439,7 +439,7 @@ test "RotationPolicy: needsRotation boundary, empty ring" {
 test "maybeRotate: rotates at the boundary, ids increment and wrap 255 -> 0" {
     var ring = DefaultRing.init();
     const policy = RotationPolicy{ .period_s = 100, .lifetime_s = 1000 };
-    const key = [_]u8{7} ** key_length;
+    const key = @as([key_length]u8, @splat(7));
     try testing.expect(ring.maybeRotate(policy, &key, 0)); // empty -> id 0
     try testing.expectEqual(@as(u8, 0), ring.activeKey().?.id);
     try testing.expect(!ring.maybeRotate(policy, &key, 99));
@@ -456,8 +456,8 @@ test "maybeRotate: rotates at the boundary, ids increment and wrap 255 -> 0" {
 test "expire: wipes old non-active keys, keeps the active one" {
     var ring = DefaultRing.init();
     const policy = RotationPolicy{ .period_s = 100, .lifetime_s = 300 };
-    ring.rotate(1, &([_]u8{1} ** key_length), 0);
-    ring.rotate(2, &([_]u8{2} ** key_length), 100);
+    ring.rotate(1, &(@as([key_length]u8, @splat(1))), 0);
+    ring.rotate(2, &(@as([key_length]u8, @splat(2))), 100);
     ring.expire(policy, 299);
     try testing.expect(ring.findKey(1) != null);
     ring.expire(policy, 300); // 0 + 300 <= 300
@@ -473,7 +473,7 @@ test "expire: wipes old non-active keys, keeps the active one" {
 test "maybeRotate expires in the same call" {
     var ring = DefaultRing.init();
     const policy = RotationPolicy{ .period_s = 100, .lifetime_s = 250 };
-    const key = [_]u8{3} ** key_length;
+    const key = @as([key_length]u8, @splat(3));
     _ = ring.maybeRotate(policy, &key, 0);
     _ = ring.maybeRotate(policy, &key, 100);
     _ = ring.maybeRotate(policy, &key, 200);
@@ -486,11 +486,11 @@ test "maybeRotate expires in the same call" {
 test "openAt refuses an over-lifetime key still in the ring" {
     var ring = DefaultRing.init();
     const policy = RotationPolicy{ .period_s = 100, .lifetime_s = 300 };
-    ring.rotate(1, &([_]u8{1} ** key_length), 0);
+    ring.rotate(1, &(@as([key_length]u8, @splat(1))), 0);
     var blob_buf: [64]u8 = undefined;
     var out_buf: [64]u8 = undefined;
-    const blob = try ring.seal("state", [_]u8{9} ** nonce_length, &blob_buf);
-    ring.rotate(2, &([_]u8{2} ** key_length), 100);
+    const blob = try ring.seal("state", @as([nonce_length]u8, @splat(9)), &blob_buf);
+    ring.rotate(2, &(@as([key_length]u8, @splat(2))), 100);
     try testing.expectEqualSlices(u8, "state", try ring.openAt(blob, 299, policy, &out_buf));
     try testing.expectError(error.UnknownKeyId, ring.openAt(blob, 300, policy, &out_buf));
     // plain open still accepts it (not yet expired from the ring)
@@ -500,9 +500,9 @@ test "openAt refuses an over-lifetime key still in the ring" {
 
 test "rotate wipes the evicted slot's key" {
     var ring = StekRing(1).init();
-    ring.rotate(1, &([_]u8{0xEE} ** key_length), 0);
+    ring.rotate(1, &(@as([key_length]u8, @splat(0xEE))), 0);
     const old_ptr: *const [key_length]u8 = &ring.keys[0].?.key;
-    ring.rotate(2, &([_]u8{0x11} ** key_length), 1);
+    ring.rotate(2, &(@as([key_length]u8, @splat(0x11))), 1);
     // single slot: overwritten in place with the new key, never the old bytes
     try testing.expectEqual(@as(u8, 0x11), old_ptr[0]);
     try testing.expectEqual(@as(u8, 2), ring.activeKey().?.id);
@@ -513,7 +513,7 @@ test "depthFor: a ring of that depth keeps every key the policy accepts" {
     try testing.expectEqual(@as(usize, 4), depthFor(.{ .period_s = 100, .lifetime_s = 300 }));
     const policy = RotationPolicy{ .period_s = 100, .lifetime_s = 300 };
     var ring = StekRing(depthFor(policy)).init();
-    const key = [_]u8{4} ** key_length;
+    const key = @as([key_length]u8, @splat(4));
     var t: i64 = 0;
     while (t <= 300) : (t += 100) _ = ring.maybeRotate(policy, &key, t);
     // At t = 300 the key from t = 0 is exactly expired; 100, 200, 300 remain.

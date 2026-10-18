@@ -429,7 +429,7 @@ test "keyschedule.hkdfExpandLabel: uses the DTLS \"dtls13\" prefix (RFC 9147 §5
     // tls13-prefix variant is validated against std + RFC 8448 in
     // keyschedule.zig's own tests.
     const Hkdf = std.crypto.kdf.hkdf.HkdfSha256;
-    const secret = [_]u8{0x42} ** 32;
+    const secret = @as([32]u8, @splat(0x42));
     var out: [16]u8 = undefined;
     keyschedule.hkdfExpandLabel(Hkdf, 16, &out, &secret, "test label", "");
     try std.testing.expectEqual(@as(usize, 16), out.len);

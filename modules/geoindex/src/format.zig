@@ -261,7 +261,7 @@ fn encodeLeaf(buf: []u8, base: usize, lat: f64, lon: f64, value: u32) void {
 }
 
 test "header round-trips and both CRCs validate" {
-    const body = [_]u8{0} ** node_size_bytes;
+    const body = @as([node_size_bytes]u8, @splat(0));
     var buf: [header_size + body.len]u8 = undefined;
     @memcpy(buf[header_size..], &body);
     const h = Header{ .flags = 0, .node_count = 1, .fanout = 16, .item_count = 1, .root_index = 0 };
@@ -275,7 +275,7 @@ test "header round-trips and both CRCs validate" {
 }
 
 test "header load rejects short / bad-magic / bad-version / bad-endian / flipped" {
-    const body = [_]u8{0} ** node_size_bytes;
+    const body = @as([node_size_bytes]u8, @splat(0));
     var buf: [header_size + body.len]u8 = undefined;
     @memcpy(buf[header_size..], &body);
     const h = Header{ .flags = 0, .node_count = 1, .fanout = 16, .item_count = 1, .root_index = 0 };

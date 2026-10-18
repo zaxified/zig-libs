@@ -246,7 +246,7 @@ test "a stream ended in its first call is the one-shot frame" {
 
 test "a pledged size is enforced both ways" {
     const gpa = std.testing.allocator;
-    const src = "0123456789" ** 10;
+    const src = strRepeat("0123456789", 10);
     // more than pledged
     try std.testing.expectError(error.SrcSizeWrong, run(gpa, src, 1, false, "p50,c*,e0"));
     // less than pledged, at the end
@@ -689,4 +689,16 @@ test "setLevel refuses a level above the highest and keeps the one it has" {
     try std.testing.expectEqual(@as(i32, 3), s.opts.level);
     try s.setLevel(stream.max_level);
     try std.testing.expectEqual(stream.max_level, s.opts.level);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

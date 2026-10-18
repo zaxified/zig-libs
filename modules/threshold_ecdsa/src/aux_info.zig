@@ -249,7 +249,7 @@ pub fn reusesMaterial(new: Announcement, old: root.PartyPublicKeys) bool {
 }
 
 fn modulusBytes(pk: paillier.PublicKey) [root.aux_modulus_bytes]u8 {
-    var out = [_]u8{0} ** root.aux_modulus_bytes;
+    var out = @as([root.aux_modulus_bytes]u8, @splat(0));
     const len = pk.nByteLen();
     if (len <= out.len) pk.nToBytes(out[out.len - len ..]) catch {};
     return out;
@@ -626,8 +626,8 @@ test "aux_info: each party checks its peers, Πfac pairwise, then assembles its 
 
     // A 2-of-3 sharing stands in for the DKG's output here (the `dkg`
     // module's own test runs the real protocol end to end).
-    const secret = try root.Scalar.fromBytes([_]u8{0} ** 31 ++ [_]u8{42}, .big);
-    const coeff = [_]root.Scalar{try root.Scalar.fromBytes([_]u8{0} ** 31 ++ [_]u8{7}, .big)};
+    const secret = try root.Scalar.fromBytes(@as([31]u8, @splat(0)) ++ [_]u8{42}, .big);
+    const coeff = [_]root.Scalar{try root.Scalar.fromBytes(@as([31]u8, @splat(0)) ++ [_]u8{7}, .big)};
     const split = try root.splitSecretKey(allocator, &secret, 2, 3, &coeff);
     defer allocator.free(split.shares);
     defer allocator.free(split.commitments.commitments);

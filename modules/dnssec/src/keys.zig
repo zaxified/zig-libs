@@ -278,15 +278,15 @@ const key_reject_seeds = [_][]const u8{
     fuzzSeed("\x08\x03\x01\x00\x01"), // a valid exponent and an EMPTY modulus
     fuzzSeed("\x08\xff\x01"), // a 255-octet exponent claimed over 1 octet
     fuzzSeed("\x0d"), // ECDSAP256SHA256 with an empty key
-    fuzzSeed("\x0d" ++ ("\x00" ** 64)), // 64 octets of zero: the right length, not on the curve
-    fuzzSeed("\x0d" ++ ("\xff" ** 64)), // coordinates past the field prime
-    fuzzSeed("\x0d" ++ ("\x01" ** 63)), // one octet short of a P-256 point
-    fuzzSeed("\x0e" ++ ("\x00" ** 96)), // the same for P-384
-    fuzzSeed("\x0f" ++ ("\x00" ** 32)), // ⭐ ACCEPTED, measured: `Ed25519.PublicKey.fromBytes` only checks the length, so the all-zero point decodes. It is the 5th acceptance in the guard below and the only one that is not a real zone key.
-    fuzzSeed("\x0f" ++ ("\x00" ** 31)), // one octet short of an Ed25519 key
+    fuzzSeed("\x0d" ++ (strRepeat("\x00", 64))), // 64 octets of zero: the right length, not on the curve
+    fuzzSeed("\x0d" ++ (strRepeat("\xff", 64))), // coordinates past the field prime
+    fuzzSeed("\x0d" ++ (strRepeat("\x01", 63))), // one octet short of a P-256 point
+    fuzzSeed("\x0e" ++ (strRepeat("\x00", 96))), // the same for P-384
+    fuzzSeed("\x0f" ++ (strRepeat("\x00", 32))), // ⭐ ACCEPTED, measured: `Ed25519.PublicKey.fromBytes` only checks the length, so the all-zero point decodes. It is the 5th acceptance in the guard below and the only one that is not a real zone key.
+    fuzzSeed("\x0f" ++ (strRepeat("\x00", 31))), // one octet short of an Ed25519 key
     fuzzSeed("\x05\x03\x01\x00\x01\x00"), // RSASHA1: a modulus of a single zero octet
     fuzzSeed("\xc8\x00"), // algorithm 200: unregistered
-    fuzzSeed("\xff" ++ ("\xff" ** 260)), // over the old 256 buffer, on purpose
+    fuzzSeed("\xff" ++ (strRepeat("\xff", 260))), // over the old 256 buffer, on purpose
 };
 
 /// The whole corpus: the refusals above, plus the four real DNSKEYs.
@@ -357,7 +357,7 @@ test "corpus: every key seed reaches decodePublicKey, and the families decoded a
     // when all four of this file's decoders ran.
     var nonempty: usize = 0;
     var accepted: usize = 0;
-    var seen = [_]bool{false} ** 4;
+    var seen = @as([4]bool, @splat(false));
     var corpus: KeyCorpus = .{};
     const entries = corpus.build();
     for (entries) |sd| {
@@ -368,7 +368,7 @@ test "corpus: every key seed reaches decodePublicKey, and the families decoded a
         if (len == 0) continue;
         const key = decodePublicKey(buf[0], buf[1..len]) catch continue;
         accepted += 1;
-        seen[@intFromEnum(std.meta.activeTag(key))] = true;
+        seen[@backingInt(std.meta.activeTag(key))] = true;
     }
     var families: usize = 0;
     for (seen) |b| {
@@ -382,4 +382,16 @@ test "corpus: every key seed reaches decodePublicKey, and the families decoded a
     // `fromBytes` accepts on length alone.
     try testing.expectEqual(@as(usize, 5), accepted);
     try testing.expectEqual(@as(usize, 4), families);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

@@ -1384,7 +1384,7 @@ pub const Server = struct {
 /// journal services. Everything else is answered with a `confirmed-ErrorPDU`,
 /// which is what an honest server does.
 pub const server_services_supported = blk: {
-    var bits = [_]u8{0} ** 12;
+    var bits = @as([12]u8, @splat(0));
     bits[0] = 3; // unused bits in the last octet
     const set = [_]usize{
         mms.Initiate.service_bit.status,
@@ -1822,7 +1822,7 @@ test "a written value that is not well-formed Data is refused" {
     // A value larger than the variable's storage.
     var big: [128]u8 = undefined;
     var w = ber.Writer.init(&big);
-    try mmsdata.Emit.visibleString(&w, "x" ** 100);
+    try mmsdata.Emit.visibleString(&w, strRepeat("x", 100));
     try testing.expectEqual(
         mms.WriteResult{ .failure = .object_value_invalid },
         srv.store(v, w.done()),
@@ -3241,4 +3241,16 @@ test "an abandoned setting-group edit expires on the server's own clock" {
     try c.writeObject(domain ++ "/LLN0.SGCB.EditSG", .SP, w3.done());
     try testing.expectEqual(@as(u32, 2), fx.sgcb.editor.?);
     c.disconnect();
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

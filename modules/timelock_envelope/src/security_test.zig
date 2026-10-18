@@ -82,15 +82,15 @@ pub fn wrongSignature() g1.Affine {
 // randomness is an explicit input; see envelope.SealRandomness).
 pub fn fixedRandomness() Env.SealRandomness {
     return .{
-        .s_time = [_]u8{0x11} ** envelope.time_secret_bytes,
-        .tlock_sigma = [_]u8{0x22} ** envelope.time_secret_bytes,
-        .kem_coins = [_]u8{0x33} ** Kem.coins_bytes,
+        .s_time = @as([envelope.time_secret_bytes]u8, @splat(0x11)),
+        .tlock_sigma = @as([envelope.time_secret_bytes]u8, @splat(0x22)),
+        .kem_coins = @as([Kem.coins_bytes]u8, @splat(0x33)),
     };
 }
 
 pub fn recipientKeypair(seed_byte: u8) Kem.KeyPair {
     var kp: Kem.KeyPair = undefined;
-    Kem.keypair(&kp, &[_]u8{seed_byte} ** 32);
+    Kem.keypair(&kp, &@as([32]u8, @splat(seed_byte)));
     return kp;
 }
 
@@ -121,11 +121,11 @@ test "round-trip works across all three HQC parameter sets" {
         const E = pair[0];
         const K = pair[1];
         var kp: K.KeyPair = undefined;
-        K.keypair(&kp, &[_]u8{0x07} ** 32);
+        K.keypair(&kp, &@as([32]u8, @splat(0x07)));
         const rnd: E.SealRandomness = .{
-            .s_time = [_]u8{0x44} ** envelope.time_secret_bytes,
-            .tlock_sigma = [_]u8{0x55} ** envelope.time_secret_bytes,
-            .kem_coins = [_]u8{0x66} ** K.coins_bytes,
+            .s_time = @as([envelope.time_secret_bytes]u8, @splat(0x44)),
+            .tlock_sigma = @as([envelope.time_secret_bytes]u8, @splat(0x55)),
+            .kem_coins = @as([K.coins_bytes]u8, @splat(0x66)),
         };
         const env = try E.seal(testing.allocator, plaintext, &kp.ek, quicknetPubkey(), seal_round, &rnd);
         defer testing.allocator.free(env);
@@ -362,7 +362,7 @@ test "positive control: a KDF that dropped s_pq would let the PQ-lock negative p
     // detector: on the real construction it rejects; under this broken
     // KDF it would not.
     const rnd = fixedRandomness();
-    const zero_pq = [_]u8{0} ** hqc.params.shared_secret_bytes;
+    const zero_pq = @as([hqc.params.shared_secret_bytes]u8, @splat(0));
 
     // Broken seal: key ignores s_pq.
     const broken_keys = deriveKeysV(rnd.s_time, zero_pq, Env.suite_id, seal_round);
@@ -393,7 +393,7 @@ test "positive control: the REAL construction binds s_pq (attacker without it ca
     Kem.encaps(&enc.ct, &enc.ss, &kp.ek, &rnd.kem_coins);
     const real_keys = deriveKeysV(rnd.s_time, enc.ss, Env.suite_id, seal_round);
 
-    const zero_pq = [_]u8{0} ** hqc.params.shared_secret_bytes;
+    const zero_pq = @as([hqc.params.shared_secret_bytes]u8, @splat(0));
     const attacker_keys = deriveKeysV(rnd.s_time, zero_pq, Env.suite_id, seal_round);
 
     try testing.expect(!std.mem.eql(u8, &real_keys.key, &attacker_keys.key));
@@ -485,7 +485,7 @@ const open_seeds = [_][]const u8{
     openSeed(&[_]u8{ 8, 3, 0x11, 20, 0x22, 60, 0x33, 100, 0x44, 130, 0x55, 170, 0x66, 200, 0x77, 230, 0x88 }, 1),
     // The raw arm: bytes that are not an envelope at all, at a few lengths.
     openSeed("not an envelope", 0),
-    openSeed(&[_]u8{0} ** 64, 0),
+    openSeed(&@as([64]u8, @splat(0)), 0),
     openSeed("", 0), // and the input this target used to run for ever
 };
 

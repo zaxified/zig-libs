@@ -173,10 +173,10 @@ test "hostile: NetAddr.decode on a truncated buffer fails closed" {
 /// buffer is refused.
 const decode_seeds = [_][]const u8{
     seed(&wiki_net_addr), // the wiki's ::ffff:10.0.0.1 port 8333
-    seedHex("00" ** 26), // the all-zero net_addr a `version` message carries
-    seedHex("ab" ** 26), // a real IPv6 address (ipv4() is null for it)
-    seedHex("ff" ** 30), // 4 octets of trailing junk after a full net_addr
-    seedHex("00" ** 25), // Truncated: one octet short of the fixed width
+    seedHex(strRepeat("00", 26)), // the all-zero net_addr a `version` message carries
+    seedHex(strRepeat("ab", 26)), // a real IPv6 address (ipv4() is null for it)
+    seedHex(strRepeat("ff", 30)), // 4 octets of trailing junk after a full net_addr
+    seedHex(strRepeat("00", 25)), // Truncated: one octet short of the fixed width
     seedHex("000000"), // Truncated: the 3-octet buffer from the hostile test
 };
 
@@ -240,4 +240,16 @@ test "corpus: every net_addr seed reaches the decoder, and the accepted count is
     // Measured 2026-09-07: 0 of 6 seeds non-empty and 0 accepted before the
     // draw was fixed, 6 of 6 non-empty and 4 accepted after.
     try testing.expectEqual(@as(usize, 4), accepted);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

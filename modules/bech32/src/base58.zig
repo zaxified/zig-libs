@@ -38,7 +38,7 @@ const base58_vectors = @import("base58_vectors.zig");
 pub const alphabet: *const [58]u8 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
 const alphabet_rev: [256]i8 = blk: {
-    var t: [256]i8 = [_]i8{-1} ** 256;
+    var t: [256]i8 = @as([256]i8, @splat(-1));
     for (alphabet, 0..) |c, i| t[c] = @intCast(i);
     break :blk t;
 };
@@ -886,13 +886,13 @@ fn bendSeed(comptime raw: []const u8, comptime bends: []const u64) []const u8 {
 
 const decode_seeds = [_][]const u8{
     bendSeed(p2pkh_vector_address, &.{}), // the module's real P2PKH address
-    bendSeed(&([_]u8{'1'} ** max_encoded_len), &.{}), // the 180-'1' boundary input
-    bendSeed(&([_]u8{'1'} ** (max_encoded_len + 1)), &.{}), // InputTooLong, one over
+    bendSeed(&(@as([max_encoded_len]u8, @splat('1'))), &.{}), // the 180-'1' boundary input
+    bendSeed(&(@as([max_encoded_len + 1]u8, @splat('1'))), &.{}), // InputTooLong, one over
     bendSeed("1111111111111111111114oLvT2", &.{}), // leading-zero run + checksum
     // The charset knob, one word per octet: eight octets that are NOT in the
     // alphabet, every one of them bent — the pair a tail-less seed cannot
     // produce, and the only input that reaches the bending branch at all.
-    bendSeed(&[_]u8{ 0, 1, 2, 3, 4, 5, 6, 7 }, &([_]u64{1} ** 8)),
+    bendSeed(&[_]u8{ 0, 1, 2, 3, 4, 5, 6, 7 }, &(@as([8]u64, @splat(1)))),
     bendSeed("", &.{}), // and the input a corpus-less target runs for ever
 };
 

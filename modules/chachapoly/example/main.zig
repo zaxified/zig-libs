@@ -89,7 +89,7 @@ pub fn main() !void {
     // error.
     var bad_tag = tag;
     bad_tag[0] ^= 0x01;
-    var poisoned: [m.len]u8 = [_]u8{0xAA} ** m.len;
+    var poisoned: [m.len]u8 = @as([m.len]u8, @splat(0xAA));
     if (ChaCha20Poly1305.decrypt(&poisoned, &ct, bad_tag, ad, nonce, key)) |_| {
         unreachable; // a flipped tag byte cannot survive constant-time comparison
     } else |err| switch (err) {

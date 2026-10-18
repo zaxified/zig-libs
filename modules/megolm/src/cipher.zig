@@ -144,7 +144,7 @@ const testing = std.testing;
 const compat = @import("test_shim.zig");
 
 test "deriveKeys is deterministic and produces distinct key material" {
-    const ratchet_bytes = [_]u8{0x42} ** ratchet_mod.ratchet_len;
+    const ratchet_bytes = @as([ratchet_mod.ratchet_len]u8, @splat(0x42));
     var k1 = compat.deriveKeys(&ratchet_bytes);
     defer k1.deinit();
     var k2 = compat.deriveKeys(&ratchet_bytes);
@@ -160,7 +160,7 @@ test "deriveKeys is deterministic and produces distinct key material" {
 }
 
 test "encryptCbc/decryptCbc round-trip, various lengths crossing the block boundary" {
-    const ratchet_bytes = [_]u8{0x07} ** ratchet_mod.ratchet_len;
+    const ratchet_bytes = @as([ratchet_mod.ratchet_len]u8, @splat(0x07));
     var keys = compat.deriveKeys(&ratchet_bytes);
     defer keys.deinit();
 
@@ -181,7 +181,7 @@ test "encryptCbc/decryptCbc round-trip, various lengths crossing the block bound
 }
 
 test "verifyTruncatedMac rejects a tampered tag and a tampered message" {
-    const ratchet_bytes = [_]u8{0x99} ** ratchet_mod.ratchet_len;
+    const ratchet_bytes = @as([ratchet_mod.ratchet_len]u8, @splat(0x99));
     var keys = compat.deriveKeys(&ratchet_bytes);
     defer keys.deinit();
 
@@ -197,7 +197,7 @@ test "verifyTruncatedMac rejects a tampered tag and a tampered message" {
 }
 
 test "decryptCbc rejects a corrupted-padding ciphertext" {
-    const ratchet_bytes = [_]u8{0x55} ** ratchet_mod.ratchet_len;
+    const ratchet_bytes = @as([ratchet_mod.ratchet_len]u8, @splat(0x55));
     var keys = compat.deriveKeys(&ratchet_bytes);
     defer keys.deinit();
 

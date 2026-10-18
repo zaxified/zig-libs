@@ -65,7 +65,7 @@ pub fn identifierMatches(r: ParseResult) bool {
 /// maps to byte `0x80 + index`.
 pub fn parseWhatwgIndex(text: []const u8) !ParseResult {
     var table: [128]u21 = undefined;
-    var have: [128]bool = [_]bool{false} ** 128;
+    var have: [128]bool = @as([128]bool, @splat(false));
     var count: usize = 0;
 
     var identifier: ?[64]u8 = null;
@@ -112,7 +112,7 @@ pub fn parseWhatwgIndex(text: []const u8) !ParseResult {
 /// such rows actually found.
 pub fn parseUnicodeOrgTable(text: []const u8) !ParseResult {
     var table: [128]u21 = undefined;
-    var have: [128]bool = [_]bool{false} ** 128;
+    var have: [128]bool = @as([128]bool, @splat(false));
     var count: usize = 0;
 
     var lines = std.mem.splitScalar(u8, text, '\n');

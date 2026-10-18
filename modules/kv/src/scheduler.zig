@@ -66,7 +66,7 @@ pub const FaultClass = enum {
     io_input_output,
     clean,
 
-    pub const count = @typeInfo(FaultClass).@"enum".fields.len;
+    pub const count = @typeInfo(FaultClass).@"enum".field_names.len;
 
     fn ofCrash(mode: CrashMode) FaultClass {
         return switch (mode) {
@@ -89,7 +89,7 @@ pub const TimingBucket = enum {
     early, // ops_until_crash < early_threshold (or a clean epoch)
     late,
 
-    pub const count = @typeInfo(TimingBucket).@"enum".fields.len;
+    pub const count = @typeInfo(TimingBucket).@"enum".field_names.len;
 
     fn of(ops_until_crash: usize, early_threshold: usize) TimingBucket {
         return if (ops_until_crash < early_threshold) .early else .late;
@@ -104,11 +104,11 @@ pub const Coverage = struct {
     counts: [FaultClass.count][TimingBucket.count]usize = @splat(@splat(0)),
 
     pub fn record(self: *Coverage, class: FaultClass, bucket: TimingBucket) void {
-        self.counts[@intFromEnum(class)][@intFromEnum(bucket)] += 1;
+        self.counts[@backingInt(class)][@backingInt(bucket)] += 1;
     }
 
     pub fn countOf(self: *const Coverage, class: FaultClass, bucket: TimingBucket) usize {
-        return self.counts[@intFromEnum(class)][@intFromEnum(bucket)];
+        return self.counts[@backingInt(class)][@backingInt(bucket)];
     }
 
     /// Total distinct (class, bucket) combinations that have never been
@@ -209,8 +209,8 @@ pub const reachable_cells = blk: {
     var n: usize = 0;
     for (0..FaultClass.count) |ci| {
         for (0..TimingBucket.count) |bi| {
-            const class: FaultClass = @enumFromInt(ci);
-            const bucket: TimingBucket = @enumFromInt(bi);
+            const class: FaultClass = @fromBackingInt(@intCast(ci));
+            const bucket: TimingBucket = @fromBackingInt(@intCast(bi));
             if (class == .clean and bucket == .late) continue;
             arr[n] = .{ .class = class, .bucket = bucket };
             n += 1;
@@ -348,7 +348,7 @@ test "uniformScheduler: over many draws, exercises every FaultClass and both tim
     try testing.expectEqual(@as(usize, 1), cov.uncoveredCount());
     try testing.expectEqual(@as(usize, 0), cov.countOf(.clean, .late));
     inline for (@typeInfo(FaultClass).@"enum".fields) |f| {
-        const class: FaultClass = @enumFromInt(f.value);
+        const class: FaultClass = @fromBackingInt(@intCast(f.value));
         if (class == .clean) continue;
         try testing.expect(cov.countOf(class, .early) > 0);
         try testing.expect(cov.countOf(class, .late) > 0);

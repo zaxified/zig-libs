@@ -442,7 +442,7 @@ pub fn serialize(a: std.mem.Allocator, d: Dataset) SerializeError![]u8 {
     for (d.columns) |col| {
         try putU32(&buf, a, try lenU32(col.name.len));
         try buf.appendSlice(a, col.name);
-        try buf.append(a, @intFromEnum(col.type));
+        try buf.append(a, @backingInt(col.type));
     }
     try putU32(&buf, a, try lenU32(d.rows.len));
     for (d.rows) |row| {
@@ -557,8 +557,8 @@ pub fn deserialize(a: std.mem.Allocator, bytes: []const u8) DeserializeError!Dat
         const nlen = try cur.u32v();
         col.name = try a.dupe(u8, try cur.take(nlen));
         const tb = try cur.byte();
-        if (tb >= @typeInfo(ColumnType).@"enum".fields.len) return DeserializeError.Corrupt;
-        col.type = @enumFromInt(tb);
+        if (tb >= @typeInfo(ColumnType).@"enum".field_names.len) return DeserializeError.Corrupt;
+        col.type = @fromBackingInt(@intCast(tb));
     }
     const nrow = try cur.u32v();
     // Same rule for rows, and it multiplies: each row allocates `ncol` values,
@@ -1473,7 +1473,7 @@ test "wire: a timestamp column round-trips, and column type 7 is still refused" 
     const rows = [_][]const Value{&r0};
     const bytes = try serialize(a, .{ .columns = &cols, .rows = &rows });
     // ncol=1 | name len 1 | "t" | type 6 | nrow=1 | int tag 1 | -1 as i64 LE.
-    try testing.expectEqualSlices(u8, &[_]u8{ 1, 0, 0, 0, 1, 0, 0, 0, 't', 6, 1, 0, 0, 0, 1 } ++ [_]u8{0xff} ** 8, bytes);
+    try testing.expectEqualSlices(u8, &[_]u8{ 1, 0, 0, 0, 1, 0, 0, 0, 't', 6, 1, 0, 0, 0, 1 } ++ @as([8]u8, @splat(0xff)), bytes);
     const back = try deserialize(a, bytes);
     try testing.expectEqual(ColumnType.timestamp, back.columns[0].type);
     try testing.expectEqual(Value{ .int = -1 }, back.rows[0][0]);
@@ -1707,7 +1707,7 @@ test "deserialize: the column bound is 5 bytes per column, checked before any al
     // failing allocator turns any allocation into OutOfMemory, so getting
     // Corrupt proves nothing was allocated.
     var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
-    const claim = "\x05\x00\x00\x00" ++ "\x00" ** 24;
+    const claim = "\x05\x00\x00\x00" ++ strRepeat("\x00", 24);
     try testing.expectError(DeserializeError.Corrupt, deserialize(failing.allocator(), claim));
     // With 25 bytes the claim is plausible: the decoder allocates (and here
     // gets OutOfMemory, which shows the bound let it through).
@@ -1873,4 +1873,16 @@ test "corpus: every seed reaches deserialize, and the cells decoded are pinned" 
     // 14 since the `.timestamp` column joined the built image (2 rows x 7).
     try testing.expectEqual(@as(usize, 2), accepted);
     try testing.expectEqual(@as(usize, 14), cells);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

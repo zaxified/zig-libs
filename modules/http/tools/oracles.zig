@@ -249,7 +249,7 @@ const SseCase = struct {
     want_data: []const u8,
 };
 
-const ten_k = "0123456789abcdef" ** 640;
+const ten_k = strRepeat("0123456789abcdef", 640);
 
 const sse_cases = [_]SseCase{
     .{ .ev = .{ .data = "hello" }, .want_data = "hello" },
@@ -332,7 +332,7 @@ const sse_parser =
 /// Unlisted differences between the clients' events and §9.2.6.
 fn sseCompare(arena: std.mem.Allocator, out: []const u8, quiet: bool) !usize {
     var bad: usize = 0;
-    var used = [_]bool{false} ** sse_divergences.len;
+    var used = @as([sse_divergences.len]bool, @splat(false));
     for ([_][]const u8{ "sseclient", "httpx-sse" }) |lib| {
         var at: usize = 0;
         var lines = std.mem.splitScalar(u8, out, '\n');
@@ -439,4 +439,16 @@ pub fn ssePhase(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, en
     try zigStr(w, stream);
     try w.writeAll(";\n");
     return settle(io, arena, "sse_oracle_vectors.zig", v.written(), write);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

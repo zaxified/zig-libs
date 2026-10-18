@@ -289,7 +289,7 @@ test "seal/open round-trip: derived early key/iv protect and recover a record" {
     const inner_plaintext = "early GET /" ++ [_]u8{0x17};
     const header = [_]u8{ 0x17, 0x03, 0x03, 0x00, inner_plaintext.len + Aes128Gcm.tag_length };
 
-    var seq_padded = [_]u8{0} ** 12;
+    var seq_padded = @as([12]u8, @splat(0));
     std.mem.writeInt(u64, seq_padded[4..12], 1, .big); // second record: seq = 1
     var nonce: [12]u8 = undefined;
     for (&nonce, ctx.iv, seq_padded) |*n, iv_b, s_b| n.* = iv_b ^ s_b;
@@ -320,7 +320,7 @@ test "SHA-384 / key_len 32 suite: chain runs at the 48-byte digest length and is
     const Sha384 = std.crypto.hash.sha2.Sha384;
     const Aes256Gcm = std.crypto.aead.aes_gcm.Aes256Gcm;
 
-    const psk = [_]u8{0x5A} ** 48;
+    const psk = @as([48]u8, @splat(0x5A));
     var ch_hash: [48]u8 = undefined;
     Sha384.hash("fake complete client hello", &ch_hash, .{});
 
@@ -359,7 +359,7 @@ test "different ClientHello hashes yield different early traffic secrets" {
     // Sanity that the transcript context actually feeds the derivation
     // (guards against a copy-paste bug passing "" as context, which would
     // silently produce a fixed secret per PSK).
-    const other_hash = [_]u8{0xAB} ** 32;
+    const other_hash = @as([32]u8, @splat(0xAB));
     var a: [32]u8 = undefined;
     var b: [32]u8 = undefined;
     clientEarlyTrafficSecret(HkdfSha256, &a, &rfc8448_early_secret, &rfc8448_client_hello_hash);

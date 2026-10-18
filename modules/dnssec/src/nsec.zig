@@ -345,7 +345,7 @@ test "canonicalNameCmp: RFC 4034 §6.1 worked ordering" {
 
 test "canonicalNameCmp: malformed name yields null (no panic)" {
     try testing.expectEqual(@as(?std.math.Order, null), canonicalNameCmp("a..b", "a.b"));
-    const too_long = "a" ** 64; // over the 63-octet label limit
+    const too_long = strRepeat("a", 64); // over the 63-octet label limit
     try testing.expectEqual(@as(?std.math.Order, null), canonicalNameCmp(too_long, "a.b"));
 }
 
@@ -553,15 +553,15 @@ test "proveDenial: empty set and malformed qname fail closed to bogus (no panic)
 /// SAME order the harness reads them: owner, next_domain_name, qname.
 const nsec_fuzz_names = [_][]const u8{
     "", ".", "a", "www.example.com", "*.example.com",
-    "a" ** 63 ++ ".example", // one label at the DNS 63-octet max
-    "a" ** 64 ++ ".example", // one label OVER the max
-    ("a." ** 130) ++ "example", // over max_labels (128) label count
+    strRepeat("a", 63) ++ ".example", // one label at the DNS 63-octet max
+    strRepeat("a", 64) ++ ".example", // one label OVER the max
+    (strRepeat("a.", 130)) ++ "example", // over max_labels (128) label count
     "a..b", // empty interior label
     ".a.b", // leading dot
     "a.b.", // trailing dot (legal: root-terminated)
     "\x00.example", // embedded NUL
     "EXAMPLE.COM", // uppercase
-    "a" ** 300, // grossly over any real name, no dots at all
+    strRepeat("a", 300), // grossly over any real name, no dots at all
 };
 
 /// One seed per (owner, next, qname) triple drawn from `nsec_fuzz_names`
@@ -668,4 +668,16 @@ test "corpus: every fuzz seed actually reaches splitLabels with non-empty text" 
     // every entry has at least one non-empty field); assert the corpus is not
     // silently degenerate.
     try testing.expectEqual(nsec_fuzz_names.len, nonempty);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

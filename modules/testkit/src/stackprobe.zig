@@ -47,7 +47,7 @@ const builtin = @import("builtin");
 
 /// Runtime-known, so the code after `skipUnlessOptimized` is analysed in
 /// every optimize mode (see the module doc).
-pub var enabled: bool = builtin.mode == .ReleaseFast or builtin.mode == .ReleaseSmall;
+pub var enabled: bool = builtin.mode == .fast or builtin.mode == .small;
 
 pub fn skipUnlessOptimized() error{SkipZigTest}!void {
     if (!@as(*volatile bool, &enabled).*) return error.SkipZigTest;

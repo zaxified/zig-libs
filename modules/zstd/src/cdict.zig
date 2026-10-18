@@ -197,8 +197,8 @@ fn ddsGetCParams(level: i32, dict_size: usize) params.CParams {
 
 /// `ZSTD_dedicatedDictSearch_isSupported`.
 fn ddsIsSupported(cp: params.CParams) bool {
-    return @intFromEnum(cp.strategy) >= @intFromEnum(params.Strategy.greedy) and
-        @intFromEnum(cp.strategy) <= @intFromEnum(params.Strategy.lazy2) and
+    return @backingInt(cp.strategy) >= @backingInt(params.Strategy.greedy) and
+        @backingInt(cp.strategy) <= @backingInt(params.Strategy.lazy2) and
         cp.hash_log > cp.chain_log and
         cp.chain_log <= 24;
 }
@@ -558,7 +558,7 @@ fn testDictionary(buf: []u8, lit_counts: []const u32, max_symbol: u32, of_max: c
     const log = try huf.buildCTable(&ct, lit_counts, max_symbol, 11);
     p += try huf.writeCTable(buf[p..], &ct, max_symbol, log);
     inline for (.{ .{ of_max, 5 }, .{ sequences.max_ml, 6 }, .{ sequences.max_ll, 6 } }) |t| {
-        var norm = [_]i16{1} ** (t[0] + 1);
+        var norm = @as([t[0] + 1]i16, @splat(1));
         const sum: i16 = t[0] + 1;
         norm[0] += (@as(i16, 1) << t[1]) - sum;
         p += try fse.writeNCount(buf[p..], &norm, t[0], t[1]);
@@ -573,7 +573,7 @@ fn testDictionary(buf: []u8, lit_counts: []const u32, max_symbol: u32, of_max: c
 
 test "a Huffman table is valid only with every byte and no zero weight" {
     var buf: [2048]u8 = undefined;
-    const content = "0123456789abcdef" ** 4;
+    const content = strRepeat("0123456789abcdef", 4);
     var counts: [256]u32 = undefined;
     for (&counts, 0..) |*c, i| c.* = 1 + @as(u32, @intCast(i % 7));
     var bs: frame.BlockState = .{};
@@ -619,7 +619,7 @@ test "a CDict made without the ID flag has ID 0" {
     var buf: [2048]u8 = undefined;
     var counts: [256]u32 = undefined;
     for (&counts, 0..) |*c, i| c.* = 1 + @as(u32, @intCast(i % 7));
-    const n = try testDictionary(&buf, &counts, 255, sequences.max_off, "0123456789abcdef" ** 4);
+    const n = try testDictionary(&buf, &counts, 255, sequences.max_off, strRepeat("0123456789abcdef", 4));
     var with = try CDict.init(gpa, buf[0..n], 3);
     defer with.deinit();
     try std.testing.expectEqual(@as(u32, 7), with.dictId());
@@ -634,10 +634,10 @@ test "the offset table must reach the code of the content size + 128 KB" {
     var counts: [256]u32 = undefined;
     for (&counts, 0..) |*c, i| c.* = 1 + @as(u32, @intCast(i % 7));
     var bs: frame.BlockState = .{};
-    var n = try testDictionary(&buf, &counts, 255, 17, "0123456789abcdef" ** 4);
+    var n = try testDictionary(&buf, &counts, 255, 17, strRepeat("0123456789abcdef", 4));
     _ = try loadCEntropy(&bs, buf[0..n]);
     try std.testing.expectEqual(sequences.FseRepeat.valid, bs.fse.of_repeat);
-    n = try testDictionary(&buf, &counts, 255, 16, "0123456789abcdef" ** 4);
+    n = try testDictionary(&buf, &counts, 255, 16, strRepeat("0123456789abcdef", 4));
     _ = try loadCEntropy(&bs, buf[0..n]);
     try std.testing.expectEqual(sequences.FseRepeat.check, bs.fse.of_repeat);
 }
@@ -729,4 +729,16 @@ test "estimateSize is what a CDict holds" {
         try std.testing.expectEqual(p.memorySize(), try CDict.estimateSize(n, .{ .level = level }, true));
     };
     try std.testing.expectError(error.LevelUnsupported, CDict.estimateSize(10, .{ .level = 23 }, true));
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

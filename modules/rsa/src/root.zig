@@ -2054,7 +2054,7 @@ fn emsaPssEncodeDigest(comptime Hash: type, comptime MgfHash: type, m_hash: *con
 
     // steps 5-6: H = Hash(M'), M' = (0x00 × 8) || mHash || salt.
     var st = Hash.init(.{});
-    st.update(&[_]u8{0} ** 8);
+    st.update(&@as([8]u8, @splat(0)));
     st.update(m_hash);
     st.update(salt);
     st.final(h);
@@ -2258,7 +2258,7 @@ fn verifyPssDigestMont(mp: *const MontParams, e: u32, comptime Hash: type, compt
     // steps 12-13: H' = Hash((0x00 × 8) || mHash || salt).
     var h_prime: [h_len]u8 = undefined;
     var st = Hash.init(.{});
-    st.update(&[_]u8{0} ** 8);
+    st.update(&@as([8]u8, @splat(0)));
     st.update(m_hash);
     st.update(salt);
     st.final(&h_prime);
@@ -3136,7 +3136,7 @@ const mr_rounds = 64;
 const sieve_primes = blk: {
     @setEvalBranchQuota(20_000);
     const limit = 1024;
-    var composite = [_]bool{false} ** limit;
+    var composite = @as([limit]bool, @splat(false));
     var count: usize = 0;
     var i: usize = 3;
     while (i < limit) : (i += 2) {
@@ -4215,7 +4215,7 @@ test "widening path: 2048-bit key through max_modulus_len primitives (writeMontR
 
     // A representative < n, presented left-zero-padded to the full max width
     // (exactly what OS2IP of a sub-max value into a max-width buffer yields).
-    var m_wide = [_]u8{0} ** max_modulus_len;
+    var m_wide = @as([max_modulus_len]u8, @splat(0));
     for (m_wide[max_modulus_len - k ..], 0..) |*b, i| b.* = @truncate(i *% 37 +% 11);
     m_wide[max_modulus_len - k] = 0; // keep the representative < n
 
@@ -4540,7 +4540,7 @@ test "encryptOaep rejects oversize messages and undersized buffers/keys" {
     var ct: [max_modulus_len]u8 = undefined;
 
     // Max mLen for k=256/SHA-256 is 190: 191 is rejected, 190 encrypts.
-    const big = [_]u8{0xaa} ** 191;
+    const big = @as([191]u8, @splat(0xaa));
     try testing.expectError(error.MessageTooLong, encryptOaep(pk, Sha256, random, &big, "", &ct));
     _ = try encryptOaep(pk, Sha256, random, big[0..190], "", &ct);
 
@@ -4581,10 +4581,10 @@ test "PublicKey.fromBytes accepts/rejects per RFC 8017 §3.1 sanity rules" {
     even_n[255] &= 0xfe;
     try testing.expectError(error.InvalidPublicKey, PublicKey.fromBytes(&even_n, &kat2048.e));
     // Modulus below the 512-bit floor.
-    const tiny_n = [_]u8{0xff} ** 32;
+    const tiny_n = @as([32]u8, @splat(0xff));
     try testing.expectError(error.InvalidPublicKey, PublicKey.fromBytes(&tiny_n, &kat2048.e));
     // Modulus above max_modulus_bits.
-    const huge_n = [_]u8{0xff} ** (max_modulus_len + 1);
+    const huge_n = @as([max_modulus_len + 1]u8, @splat(0xff));
     try testing.expectError(error.InvalidPublicKey, PublicKey.fromBytes(&huge_n, &kat2048.e));
 }
 
@@ -4717,7 +4717,7 @@ test "verifyPss rejects a wrong trailer byte and nonzero top bits" {
     // so that em[0] | 0x80 stays below n's top byte (0xa2): the top-bit
     // corruption below must keep the representative < n, or RSASP1's range
     // check would reject it before verifyPss ever sees it.
-    var salt = [_]u8{0} ** 32;
+    var salt = @as([32]u8, @splat(0));
     var em: [256]u8 = undefined;
     var found = false;
     var s: usize = 0;
@@ -5205,7 +5205,7 @@ test "F1: a φ-reduced (or any other valid) d is accepted and kept, so it round-
     var buf2: [max_pkcs1_private_der_len]u8 = undefined;
     try testing.expectEqualSlices(u8, der, try back.toPkcs1Der(&buf2));
     // The non-CRT path uses d: still the right key.
-    const m = [_]u8{0} ** 255 ++ [_]u8{42};
+    const m = @as([255]u8, @splat(0)) ++ [_]u8{42};
     try testing.expectEqualSlices(u8, &try rsadp(256, m, &sk), &try rsadp(256, m, &back));
 }
 
@@ -5442,7 +5442,7 @@ test "PBES2 parameters: keyLength, PRF parameters, IV, salt, iteration and ciphe
     try (Epki{ .iv = "ivivivivivivivi" }).expect(a, error.InvalidDer);
     try (Epki{ .iv = "ivivivivivivivi!!" }).expect(a, error.InvalidDer);
     // Salt: 1 .. max_pbes2_salt_len octets.
-    const salt64 = [_]u8{0x11} ** max_pbes2_salt_len;
+    const salt64 = @as([max_pbes2_salt_len]u8, @splat(0x11));
     try (Epki{ .salt = &salt64 }).expect(a, null);
     try (Epki{ .salt = &(salt64 ++ [_]u8{0x11}) }).expect(a, error.InvalidDer);
     try (Epki{ .salt = "" }).expect(a, error.InvalidDer);
@@ -5646,7 +5646,7 @@ test "digest entry points: a digest of the wrong length is refused by all four, 
     const pk = sk.publicKey();
     var prng = std.Random.DefaultPrng.init(0x5018);
     var out: [256]u8 = undefined;
-    const digest = [_]u8{0x42} ** 65;
+    const digest = @as([65]u8, @splat(0x42));
     for ([_]usize{ 31, 33 }) |len| {
         const dg = digest[0..len];
         try testing.expectError(error.InvalidDigestLength, signPkcs1v15Digest(&sk, .sha256, dg, &out));
@@ -5704,11 +5704,11 @@ test "PEM: two blocks of one label load the first; a '-' inside the body is no E
 }
 
 test "PEM: a label of exactly 32 octets is a label, 33 is not; an END line before the BEGIN is no block" {
-    const a32 = "A" ** 32;
+    const a32 = strRepeat("A", 32);
     const ok = "-----BEGIN " ++ a32 ++ "-----\nAAAA\n-----END " ++ a32 ++ "-----\n";
     try testing.expectError(error.UnsupportedPemLabel, PublicKey.fromPem(ok));
     try testing.expectError(error.UnsupportedPemLabel, SecretKey.fromPem(&test_sk_out, ok));
-    const a33 = "A" ** 33;
+    const a33 = strRepeat("A", 33);
     const long = "-----BEGIN " ++ a33 ++ "-----\nAAAA\n-----END " ++ a33 ++ "-----\n";
     try testing.expectError(error.InvalidPem, PublicKey.fromPem(long));
     const swapped = "-----END PUBLIC KEY-----\n-----BEGIN PUBLIC KEY-----\nAAAA\n";
@@ -5775,7 +5775,7 @@ test "8192-bit keys (R7): OpenSSL's key parses and round-trips; v1.5 sign byte-e
 }
 
 test "modulus cap: a modulus one byte wider is refused, one at the cap is not" {
-    var n = [_]u8{0xff} ** (max_modulus_len + 1);
+    var n = @as([max_modulus_len + 1]u8, @splat(0xff));
     n[n.len - 1] = 0xfd; // odd
     try testing.expectError(error.InvalidPublicKey, PublicKey.fromBytes(&n, &.{ 1, 0, 1 }));
     try testing.expectError(error.InvalidPublicKey, VerifyKey.fromBytes(&n, &.{ 1, 0, 1 }));
@@ -5794,14 +5794,14 @@ test "generate: FIPS 186-5 d > 2^(nlen/2) bound (F2)" {
     defer sk.deinit();
     try testing.expect(privateExponentAboveHalf(&sk, 1024));
     // A d at and just above the bound (not valid keys; the check alone).
-    var d = [_]u8{0} ** 256;
+    var d = @as([256]u8, @splat(0));
     d[256 - 129] = 1; // 2^1024
     sk.d = try Fe.fromBytes(sk.n, &d, .big);
     try testing.expect(!privateExponentAboveHalf(&sk, 1024));
     d[255] = 1; // 2^1024 + 1
     sk.d = try Fe.fromBytes(sk.n, &d, .big);
     try testing.expect(privateExponentAboveHalf(&sk, 1024));
-    d = [_]u8{0} ** 256;
+    d = @as([256]u8, @splat(0));
     d[255] = 3;
     sk.d = try Fe.fromBytes(sk.n, &d, .big);
     try testing.expect(!privateExponentAboveHalf(&sk, 1024));
@@ -6638,7 +6638,7 @@ test "fromOpenSSH: rejects unsupported cipher/kdf and foreign PEM labels" {
             @memset(opts[4..20], 0x5a);
             std.mem.writeInt(u32, opts[20..24], rounds, .big);
             var b = OpensshTestBuilder{};
-            _ = b.raw("openssh-key-v1\x00").str("aes256-ctr").str("bcrypt").str(&opts).int(1).str("").str(&([_]u8{0} ** 16));
+            _ = b.raw("openssh-key-v1\x00").str("aes256-ctr").str("bcrypt").str(&opts).int(1).str("").str(&(@as([16]u8, @splat(0))));
             try testing.expectError(error.KdfRoundsTooLarge, fromOpenSSH(&test_sk_out, b.pem(&pem_buf), "pw"));
         }
     }
@@ -6708,7 +6708,7 @@ test "EMSA-PKCS1-v1_5 refuses an encoding with fewer than 8 PS octets" {
     try testing.expectError(error.EncodedMessageTooShort, emsaPkcs1v15Encode(Sha256, "m", em[0..61]));
     try emsaPkcs1v15Encode(Sha256, "m", &em);
     try testing.expectEqualSlices(u8, &.{ 0x00, 0x01 }, em[0..2]);
-    try testing.expectEqualSlices(u8, &([_]u8{0xff} ** 8), em[2..10]);
+    try testing.expectEqualSlices(u8, &(@as([8]u8, @splat(0xff))), em[2..10]);
     try testing.expectEqual(@as(u8, 0x00), em[10]);
 }
 
@@ -6757,7 +6757,7 @@ test "verifyPss refuses a nonzero PS octet and a wrong separator octet" {
     const sk = try kat2048.secretKey();
     const pk = try kat2048.publicKey();
     const msg = "pss db edits";
-    const salt = [_]u8{0x5a} ** 32;
+    const salt = @as([32]u8, @splat(0x5a));
     var em: [256]u8 = undefined;
     try emsaPssEncode(Sha256, msg, &salt, 2047, &em);
     const good = try rsasp1(256, em, &sk);
@@ -6807,7 +6807,7 @@ test "verifyPss refuses a representative wider than emLen when modBits ≡ 1 mod
     try testing.expectEqual(@as(usize, 521), pk.n.bits());
     const msg = "emLen = k - 1";
     var x: [66]u8 = undefined;
-    var salt = [_]u8{0} ** 16;
+    var salt = @as([16]u8, @splat(0));
     var s: u8 = 0;
     // 0x01 ‖ EM must stay below n (= 0x01e0…): pick a salt whose EM[0] < 0xe0.
     while (true) : (s += 1) {
@@ -7248,10 +7248,10 @@ const ModuliSeen = struct {
 
 const fuzz_driver = testkit.fuzz.driver;
 const FuzzLabel = enum { raw_rejected, raw_accepted, pristine_accepted, damaged_rejected, damaged_accepted };
-var fuzz_reach: [@typeInfo(FuzzLabel).@"enum".fields.len]usize = @splat(0);
+var fuzz_reach: [@typeInfo(FuzzLabel).@"enum".field_names.len]usize = @splat(0);
 
 fn mark(comptime l: FuzzLabel) void {
-    fuzz_reach[@intFromEnum(l)] += 1;
+    fuzz_reach[@backingInt(l)] += 1;
     fuzz_driver.hit(@tagName(l));
 }
 
@@ -7923,7 +7923,7 @@ fn reachCheck(comptime harness: anytype, name: []const u8, seeds: usize, optiona
         };
     }
     for (fuzz_reach, 0..) |n, i| {
-        const l: FuzzLabel = @enumFromInt(i);
+        const l: FuzzLabel = @fromBackingInt(@intCast(i));
         // Random octets are never a valid key encoding: `raw_accepted` is
         // reached only through the corpus, not by the driver.
         if (l == .raw_accepted) continue;
@@ -7953,4 +7953,16 @@ test "fuzz harness: seeds in every test run, and they get everywhere" {
     // the ciphertext; acceptance is luck (a pad-free change in an ignored
     // NULL), so not demanded.
     try reachCheck(pbes2Harness, "rsa-pbes2", 60, .damaged_accepted);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

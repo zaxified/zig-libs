@@ -113,9 +113,9 @@ pub fn parse(attr_bytes: []const u8) codec.Error!Port {
         uapi.ATTR.BUS_NAME => try uapi.copyName(&p.handle.bus_buf, &p.handle.bus_len, a),
         uapi.ATTR.DEV_NAME => try uapi.copyName(&p.handle.dev_buf, &p.handle.dev_len, a),
         uapi.ATTR.PORT_INDEX => p.index = try a.asU32(),
-        uapi.ATTR.PORT_TYPE => p.type = @enumFromInt(try a.asU16()),
-        uapi.ATTR.PORT_DESIRED_TYPE => p.desired_type = @enumFromInt(try a.asU16()),
-        uapi.ATTR.PORT_FLAVOUR => p.flavour = @enumFromInt(try a.asU16()),
+        uapi.ATTR.PORT_TYPE => p.type = @fromBackingInt(@intCast(try a.asU16())),
+        uapi.ATTR.PORT_DESIRED_TYPE => p.desired_type = @fromBackingInt(@intCast(try a.asU16())),
+        uapi.ATTR.PORT_FLAVOUR => p.flavour = @fromBackingInt(@intCast(try a.asU16())),
         uapi.ATTR.PORT_NETDEV_IFINDEX => p.netdev_ifindex = try a.asU32(),
         uapi.ATTR.PORT_NETDEV_NAME => try uapi.copyName(&p.netdev_name_buf, &p.netdev_name_len, a),
         uapi.ATTR.PORT_IBDEV_NAME => try uapi.copyName(&p.ibdev_name_buf, &p.ibdev_name_len, a),
@@ -152,7 +152,7 @@ pub fn appendSetType(
 ) Error!void {
     if (t == .notset) return error.InvalidRequest;
     try handle.appendPort(gpa, list, p);
-    try codec.appendAttrU16(gpa, list, uapi.ATTR.PORT_TYPE, @intFromEnum(t));
+    try codec.appendAttrU16(gpa, list, uapi.ATTR.PORT_TYPE, @backingInt(t));
 }
 
 /// Attributes of a `DEVLINK_CMD_PORT_SPLIT`. `count` must be at least 2 —
@@ -259,10 +259,10 @@ const native_endian = @import("builtin").cpu.arch.endian();
 fn buildPortReply(gpa: std.mem.Allocator, list: *std.ArrayList(u8)) !void {
     try handle.append(gpa, list, .pci("0000:65:00.0"));
     try codec.appendAttrU32(gpa, list, uapi.ATTR.PORT_INDEX, 1);
-    try codec.appendAttrU16(gpa, list, uapi.ATTR.PORT_TYPE, @intFromEnum(uapi.PortType.eth));
+    try codec.appendAttrU16(gpa, list, uapi.ATTR.PORT_TYPE, @backingInt(uapi.PortType.eth));
     try codec.appendAttrU32(gpa, list, uapi.ATTR.PORT_NETDEV_IFINDEX, 4);
     try codec.appendAttrString(gpa, list, uapi.ATTR.PORT_NETDEV_NAME, "enp101s0f0np0");
-    try codec.appendAttrU16(gpa, list, uapi.ATTR.PORT_FLAVOUR, @intFromEnum(uapi.PortFlavour.physical));
+    try codec.appendAttrU16(gpa, list, uapi.ATTR.PORT_FLAVOUR, @backingInt(uapi.PortFlavour.physical));
     try codec.appendAttrU32(gpa, list, uapi.ATTR.PORT_NUMBER, 0);
     try codec.appendAttrU8(gpa, list, uapi.ATTR.PORT_SPLITTABLE, 1);
     try codec.appendAttrU32(gpa, list, uapi.ATTR.PORT_LANES, 4);
@@ -297,8 +297,8 @@ test "parse decodes a pci_vf representor with no netdev at all" {
     defer list.deinit(gpa);
     try handle.append(gpa, &list, .pci("0000:65:00.0"));
     try codec.appendAttrU32(gpa, &list, uapi.ATTR.PORT_INDEX, 65535);
-    try codec.appendAttrU16(gpa, &list, uapi.ATTR.PORT_TYPE, @intFromEnum(uapi.PortType.notset));
-    try codec.appendAttrU16(gpa, &list, uapi.ATTR.PORT_FLAVOUR, @intFromEnum(uapi.PortFlavour.pci_vf));
+    try codec.appendAttrU16(gpa, &list, uapi.ATTR.PORT_TYPE, @backingInt(uapi.PortType.notset));
+    try codec.appendAttrU16(gpa, &list, uapi.ATTR.PORT_FLAVOUR, @backingInt(uapi.PortFlavour.pci_vf));
     try codec.appendAttrU16(gpa, &list, uapi.ATTR.PORT_PCI_PF_NUMBER, 0);
     try codec.appendAttrU16(gpa, &list, uapi.ATTR.PORT_PCI_VF_NUMBER, 3);
     try codec.appendAttrU32(gpa, &list, uapi.ATTR.PORT_CONTROLLER_NUMBER, 0);
@@ -343,7 +343,7 @@ test "parse: an unknown enum value survives instead of being rejected" {
     defer list.deinit(gpa);
     try codec.appendAttrU16(gpa, &list, uapi.ATTR.PORT_FLAVOUR, 250);
     const p = try parse(list.items);
-    try testing.expectEqual(@as(u16, 250), @intFromEnum(p.flavour.?));
+    try testing.expectEqual(@as(u16, 250), @backingInt(p.flavour.?));
 }
 
 test "parse: a wrong-width attribute is a typed error" {
@@ -356,7 +356,7 @@ test "parse: a wrong-width attribute is a typed error" {
 
     // An over-long netdev name.
     list.clearRetainingCapacity();
-    try codec.appendAttrString(gpa, &list, uapi.ATTR.PORT_NETDEV_NAME, "n" ** uapi.ifnamesize ++ "x");
+    try codec.appendAttrString(gpa, &list, uapi.ATTR.PORT_NETDEV_NAME, strRepeat("n", uapi.ifnamesize) ++ "x");
     try testing.expectError(error.BadLength, parse(list.items));
 }
 
@@ -431,8 +431,8 @@ const Corpus = struct {
         var vf: std.ArrayList(u8) = .empty;
         try handle.append(gpa, &vf, .pci("0000:65:00.0"));
         try codec.appendAttrU32(gpa, &vf, uapi.ATTR.PORT_INDEX, 65535);
-        try codec.appendAttrU16(gpa, &vf, uapi.ATTR.PORT_TYPE, @intFromEnum(uapi.PortType.notset));
-        try codec.appendAttrU16(gpa, &vf, uapi.ATTR.PORT_FLAVOUR, @intFromEnum(uapi.PortFlavour.pci_vf));
+        try codec.appendAttrU16(gpa, &vf, uapi.ATTR.PORT_TYPE, @backingInt(uapi.PortType.notset));
+        try codec.appendAttrU16(gpa, &vf, uapi.ATTR.PORT_FLAVOUR, @backingInt(uapi.PortFlavour.pci_vf));
         try codec.appendAttrU16(gpa, &vf, uapi.ATTR.PORT_PCI_PF_NUMBER, 0);
         try codec.appendAttrU16(gpa, &vf, uapi.ATTR.PORT_PCI_VF_NUMBER, 3);
         try codec.appendAttrU32(gpa, &vf, uapi.ATTR.PORT_CONTROLLER_NUMBER, 0);
@@ -461,7 +461,7 @@ const Corpus = struct {
         self.push(&[_]u8{ 0x40, 0x00 });
         // A DEV_NAME longer than the handle can hold: rejected, not truncated.
         var oversize: std.ArrayList(u8) = .empty;
-        try codec.appendAttr(gpa, &oversize, uapi.ATTR.DEV_NAME, &[_]u8{'x'} ** 65);
+        try codec.appendAttr(gpa, &oversize, uapi.ATTR.DEV_NAME, &@as([65]u8, @splat('x')));
         self.push(oversize.items);
         // PORT_INDEX with a 2-octet payload where a u32 belongs.
         var narrow: std.ArrayList(u8) = .empty;
@@ -607,4 +607,16 @@ test "the port builders refuse what the appenders refuse" {
         .handle = .{ .bus = "", .dev = "d" },
         .index = 1,
     }));
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

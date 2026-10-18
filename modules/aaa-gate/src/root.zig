@@ -2400,7 +2400,7 @@ test "throttle keying: an oversized X-Forwarded-For is clamped to client_key_len
     var buf: [4096]u8 = undefined;
 
     tc.ns = std.time.ns_per_s;
-    const prefix = "9" ** client_key_len_max;
+    const prefix = strRepeat("9", client_key_len_max);
     const xff_a = "X-Forwarded-For: " ++ prefix ++ "-tail-one\r\n";
     const xff_b = "X-Forwarded-For: " ++ prefix ++ "-tail-two-is-much-longer\r\n";
 
@@ -3055,7 +3055,7 @@ const query_seeds = [_][]const u8{
     seed("&&&"), // separators only
     seed("=v"), // an empty name
     seed("api_key=\xff\xfe\xfd"), // a non-ASCII value
-    seed("api_key=" ++ ("k" ** 200)), // a value most of the buffer wide
+    seed("api_key=" ++ (strRepeat("k", 200))), // a value most of the buffer wide
 };
 
 test "fuzz queryValue never panics" {
@@ -3181,7 +3181,7 @@ const client_key_seeds = [_][]const u8{
     seed("a, \x1f198.51.100.2"), // empty XFF tail falls through to X-Real-IP
     seed("\x1f198.51.100.2"), // XFF absent (empty before the split), X-Real-IP present
     seed(""), // neither side present: falls all the way to the shared fallback
-    seed(("x" ** 100)), // a forged value past the 48-byte cap: must clamp, never overflow
+    seed((strRepeat("x", 100))), // a forged value past the 48-byte cap: must clamp, never overflow
     seed(" 198.51.100.2 \x1f"), // SP around the XFF value is trimmed
     seed(",,,"), // degenerate separators only
     seed("\xff\xfe\xfd\x1f\xfc\xfb"), // non-ASCII on both sides
@@ -3287,7 +3287,7 @@ test "clientKeyFrom: XFF rightmost, then X-Real-IP, then peer, then fallback; cl
     try testing.expectEqualStrings("198.51.100.2", clientKeyFrom("a, ", "198.51.100.2", null, &buf));
     try testing.expectEqualStrings(fallback_key, clientKeyFrom(null, null, null, &buf));
     // A forged, unbounded header value is clamped to the key cap.
-    const huge = "x" ** 300;
+    const huge = strRepeat("x", 300);
     try testing.expectEqual(client_key_len_max, clientKeyFrom(huge, null, null, &buf).len);
     // The peer path unifies IPv4-mapped IPv6 with plain IPv4.
     const peer: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 192, 0, 2, 9 }, .port = 4433 } };
@@ -3939,4 +3939,16 @@ test "middleware: ctx.data is restored when the gate returns (an outer middlewar
 
 test {
     _ = @import("model_test.zig");
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

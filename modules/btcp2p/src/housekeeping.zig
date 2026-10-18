@@ -141,7 +141,7 @@ pub const Reject = struct {
 pub fn decodeReject(bytes: []const u8) DecodeError!Reject {
     var r: Reader = .{ .bytes = bytes };
     const msg = try r.varBytes();
-    const ccode: RejectCode = @enumFromInt(try r.byte());
+    const ccode: RejectCode = @fromBackingInt(@intCast(try r.byte()));
     const reason = try r.varBytes();
     const data = r.rest();
     return .{ .message = msg, .ccode = ccode, .reason = reason, .data = data };
@@ -151,7 +151,7 @@ pub fn serializeReject(allocator: Allocator, rej: Reject) Allocator.Error![]u8 {
     var w: Writer = .{};
     defer w.deinit(allocator);
     try w.putVarBytes(allocator, rej.message);
-    try w.putU8(allocator, @intFromEnum(rej.ccode));
+    try w.putU8(allocator, @backingInt(rej.ccode));
     try w.putVarBytes(allocator, rej.reason);
     try w.putBytes(allocator, rej.data);
     return w.toOwned(allocator);
@@ -276,7 +276,7 @@ test "Reject: round-trip, matches the wiki's documented CCodes" {
     try testing.expectEqualStrings("tx", decoded.message);
     try testing.expectEqual(RejectCode.dust, decoded.ccode);
     try testing.expectEqualStrings("output below dust threshold", decoded.reason);
-    try testing.expectEqualSlices(u8, &([_]u8{0xcd} ** 32), decoded.data);
+    try testing.expectEqualSlices(u8, &(@as([32]u8, @splat(0xcd))), decoded.data);
 }
 
 test "Reject: an unrecognized ccode byte is opaque, not rejected" {
@@ -288,7 +288,7 @@ test "Reject: an unrecognized ccode byte is opaque, not rejected" {
     try w.putVarBytes(allocator, "unknown");
     var rej = try decodeReject(w.list.items);
     defer rej.deinit(allocator);
-    try testing.expectEqual(@as(u8, 0x99), @intFromEnum(rej.ccode));
+    try testing.expectEqual(@as(u8, 0x99), @backingInt(rej.ccode));
 }
 
 test "hostile: decodeAddr/decodeReject never panic on truncated buffers" {
@@ -388,7 +388,7 @@ test "corpus: every addr seed reaches the decoder, and the accepted count is pin
 /// the payload" behind them, so the interesting cases are the length prefixes:
 /// both empty, both populated, and each one claiming more than follows.
 const reject_seeds = [_][]const u8{
-    seed("\x02tx\x41\x1boutput below dust threshold" ++ ("\xcd" ** 32)), // the round-trip test's reject, data = a txid
+    seed("\x02tx\x41\x1boutput below dust threshold" ++ (strRepeat("\xcd", 32))), // the round-trip test's reject, data = a txid
     seed("\x02tx\x41\x1boutput below dust threshold"), // the same with no trailing data
     seed("\x05block\x99\x07unknown"), // an undocumented ccode, kept opaque rather than refused
     seedHex("000000"), // both var_strs empty, ccode 0
@@ -447,4 +447,16 @@ test "corpus: every reject seed reaches the decoder, and the accepted count is p
     // Measured 2026-09-07: 0 of 8 seeds non-empty and 0 accepted before the
     // draw was fixed, 8 of 8 non-empty and 4 accepted after.
     try testing.expectEqual(@as(usize, 4), accepted);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

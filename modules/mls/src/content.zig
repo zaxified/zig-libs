@@ -321,8 +321,8 @@ test "Proposal: the allocation-free arms round-trip and carry their §17.4 type 
     try roundTrip(.{ .remove = 3 });
     try roundTrip(.{ .external_init = &[_]u8{ 1, 2, 3, 4 } });
     try roundTrip(.{ .psk = .{
-        .id = .{ .external = &[_]u8{0xab} ** 8 },
-        .psk_nonce = &[_]u8{0xcd} ** 32,
+        .id = .{ .external = &@as([8]u8, @splat(0xab)) },
+        .psk_nonce = &@as([32]u8, @splat(0xcd)),
     } });
     try roundTrip(.{ .reinit = .{
         .group_id = "g",
@@ -332,9 +332,9 @@ test "Proposal: the allocation-free arms round-trip and carry their §17.4 type 
     try roundTrip(.{ .group_context_extensions = &.{} });
 
     // §17.4's registry values, checked against the RFC's own table.
-    try testing.expectEqual(@as(u16, 1), @intFromEnum(ProposalType.add));
-    try testing.expectEqual(@as(u16, 3), @intFromEnum(ProposalType.remove));
-    try testing.expectEqual(@as(u16, 7), @intFromEnum(ProposalType.group_context_extensions));
+    try testing.expectEqual(@as(u16, 1), @backingInt(ProposalType.add));
+    try testing.expectEqual(@as(u16, 3), @backingInt(ProposalType.remove));
+    try testing.expectEqual(@as(u16, 7), @backingInt(ProposalType.group_context_extensions));
 }
 
 test "Proposal.decode: an unknown proposal_type is Malformed, not a mis-parse" {
@@ -362,7 +362,7 @@ test "Commit: an empty proposal list with no path is three bytes, and round-trip
 }
 
 test "Commit: by-value and by-reference entries coexist in one proposals vector" {
-    const refbytes = [_]u8{0x5a} ** 32;
+    const refbytes = @as([32]u8, @splat(0x5a));
     const c: Commit = .{ .proposals = &.{
         .{ .proposal = .{ .remove = 1 } },
         .{ .reference = &refbytes },

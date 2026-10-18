@@ -419,8 +419,8 @@ const Deriver = struct {
 
 const Cache = VerifiedCache(TestValue);
 
-const secret_a = [_]u8{0x11} ** 32;
-const secret_b = [_]u8{0x22} ** 32;
+const secret_a = @as([32]u8, @splat(0x11));
+const secret_b = @as([32]u8, @splat(0x22));
 // base64url of 32 × 0x11 and 32 × 0x22.
 const jwks_a =
     \\{"keys":[{"kty":"oct","kid":"a","k":"ERERERERERERERERERERERERERERERERERERERERERE"}]}
@@ -686,7 +686,7 @@ test "VerifiedCache: capacity rounds up; eviction prefers free, then expired, th
     var set = try root.parseJwks(testing.allocator, jwks_a);
     defer set.deinit();
     try testing.expectError(error.InvalidCapacity, Cache.init(testing.allocator, testing.io, .{ .capacity = 0 }));
-    try testing.expectError(error.ContextTooLong, Cache.init(testing.allocator, testing.io, .{ .capacity = 1, .context = &([_]u8{'x'} ** 65) }));
+    try testing.expectError(error.ContextTooLong, Cache.init(testing.allocator, testing.io, .{ .capacity = 1, .context = &(@as([65]u8, @splat('x'))) }));
     var big: Cache = try .init(testing.allocator, testing.io, .{ .capacity = 9 });
     try testing.expectEqual(@as(usize, 16), big.capacity()); // 3 buckets -> 4
     big.deinit();
@@ -803,7 +803,7 @@ test "VerifiedCache: several threads hammering one small table never see a torn 
 }
 
 test "VerifiedCache: ES256 end to end -- the hit returns what the verify derived" {
-    const kp = try root.EcdsaP256Sha256.KeyPair.generateDeterministic([_]u8{0x42} ** root.EcdsaP256Sha256.KeyPair.seed_length);
+    const kp = try root.EcdsaP256Sha256.KeyPair.generateDeterministic(@as([root.EcdsaP256Sha256.KeyPair.seed_length]u8, @splat(0x42)));
     const sec1 = kp.public_key.toUncompressedSec1();
     const enc = std.base64.url_safe_no_pad.Encoder;
     var x: [43]u8 = undefined;

@@ -61,7 +61,7 @@ pub const a24: u32 = 39081;
 /// `field.zig`'s native 56-byte little-endian `Fe` wire format: a single
 /// byte `0x05` followed by 55 zero bytes.
 pub const base_u: [public_length]u8 = blk: {
-    var b = [_]u8{0} ** public_length;
+    var b = @as([public_length]u8, @splat(0));
     b[0] = 5;
     break :blk b;
 };
@@ -260,17 +260,17 @@ test "a24 == (156326 - 2) / 4 == 39081 (RFC 7748 §5)" {
 }
 
 test "base_u encodes u=5 in field.zig's native little-endian 56-byte layout (REAL)" {
-    var expected = [_]u8{0} ** public_length;
+    var expected = @as([public_length]u8, @splat(0));
     expected[0] = 5;
     try std.testing.expectEqualSlices(u8, &expected, &base_u);
 }
 
 test "clamp: two low bits of byte 0 cleared, high bit of byte 55 set (REAL, RFC 7748 §5)" {
-    var s = [_]u8{0xff} ** scalar_length;
+    var s = @as([scalar_length]u8, @splat(0xff));
     clamp(&s);
     try std.testing.expectEqual(@as(u8, 0xfc), s[0]);
     try std.testing.expectEqual(@as(u8, 0xff), s[scalar_length - 1]); // 0xff | 0x80 == 0xff
-    var z = [_]u8{0x00} ** scalar_length;
+    var z = @as([scalar_length]u8, @splat(0x00));
     clamp(&z);
     try std.testing.expectEqual(@as(u8, 0x00), z[0]);
     try std.testing.expectEqual(@as(u8, 0x80), z[scalar_length - 1]);
@@ -300,7 +300,7 @@ test "KeyPair.deinit zeroizes secret_key in place (regression: fails if secureZe
         "700a779c984c24f8cdd78fbff44943eba368f54b29259a4f1c600ad3");
     var kp: KeyPair = undefined;
     try KeyPair.generateDeterministic(&kp, &seed);
-    const zero_scalar = [_]u8{0} ** scalar_length;
+    const zero_scalar = @as([scalar_length]u8, @splat(0));
     try std.testing.expect(!std.mem.eql(u8, &kp.secret_key, &zero_scalar));
     kp.deinit();
     try std.testing.expectEqualSlices(u8, &zero_scalar, &kp.secret_key);

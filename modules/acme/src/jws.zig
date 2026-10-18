@@ -1154,7 +1154,7 @@ test "key authorization: token.thumbprint, bad tokens rejected" {
     try testing.expectError(error.InvalidToken, keyAuthorization(&buf, "a/b", kp.public_key));
     try testing.expectError(error.InvalidToken, keyAuthorization(&buf, "a.b", kp.public_key));
     try testing.expectError(error.InvalidToken, keyAuthorization(&buf, "tok en", kp.public_key));
-    try testing.expectError(error.InvalidToken, keyAuthorization(&buf, "x" ** 257, kp.public_key));
+    try testing.expectError(error.InvalidToken, keyAuthorization(&buf, strRepeat("x", 257), kp.public_key));
 }
 
 test "acmeIdentifier (RFC 8737 §3): SHA-256 of the key authorization" {
@@ -1328,7 +1328,7 @@ test "verifyFlattened: malformed and tampered inputs never verify" {
     try testing.expectError(error.MalformedJws, verifyFlattened(testing.allocator, "not json", null));
     try testing.expectError(error.MalformedJws, verifyFlattened(testing.allocator, "{}", null));
     // kid and jwk are mutually exclusive; neither is also an error.
-    const no_key = "{\"protected\":\"" ++ "eyJhbGciOiJFUzI1NiJ9" ++ "\",\"payload\":\"\",\"signature\":\"" ++ ("A" ** 86) ++ "\"}";
+    const no_key = "{\"protected\":\"" ++ "eyJhbGciOiJFUzI1NiJ9" ++ "\",\"payload\":\"\",\"signature\":\"" ++ (strRepeat("A", 86)) ++ "\"}";
     try testing.expectError(error.UnsupportedJws, verifyFlattened(testing.allocator, no_key, null));
 }
 
@@ -1948,4 +1948,16 @@ test "generateRsaKeyPair: refuses sizes other than 2048/3072/4096; one real 2048
     try testing.expect(v.jwk_key.?.eql(publicOfPair(&kp)));
     // It is not the fixture key.
     try testing.expect(!v.jwk_key.?.eql(publicOfPair(try rsa2048KeyPair())));
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

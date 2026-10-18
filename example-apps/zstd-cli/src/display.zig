@@ -96,7 +96,7 @@ pub fn updateProgress(io: std.Io, comptime fmt: []const u8, args: anytype) void 
 
 /// `DISPLAY_PROGRESS("\r%79s\r", "")`: clear the progress line.
 pub fn clearProgress() void {
-    if (shouldProgress()) at(1, "\r" ++ " " ** 79 ++ "\r", .{});
+    if (shouldProgress()) at(1, "\r" ++ strRepeat(" ", 79) ++ "\r", .{});
 }
 
 /// `UTIL_HumanReadableSize_t`.
@@ -236,4 +236,16 @@ test "human-readable sizes pick the unit and precision as UTIL_makeHumanReadable
         try w.print("{f}", .{hrs(c.size)});
         try std.testing.expectEqualStrings(c.want, w.buffered());
     }
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

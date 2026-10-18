@@ -2104,7 +2104,7 @@ const parse_seeds = [_][]const u8{
     seed("option v 'x'\n"), // an option before any section
     seed("config x\n\toption k 'a'\n\tlist k 'b'\n"), // mixed option/list under one key → MixedOptionList
     seed("# a comment\nconfig x\n"), // a comment line
-    seed("config x\n\toption k 'v'\n" ** 40), // ~800 octets, inside the 1024 buffer
+    seed(strRepeat("config x\n\toption k 'v'\n", 40)), // ~800 octets, inside the 1024 buffer
     seed("\x00\x01\x02\xff"), // control and high bytes: the "rejects at the keyword check" half
     seed(""), // zero length: the ONLY input this target ever ran
 };
@@ -2134,10 +2134,10 @@ fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
 const fuzz_driver = @import("testkit").fuzz.driver;
 
 const FuzzLabel = enum { parse_rejected, parse_accepted, rt_compared, rt_refused_value };
-var fuzz_reach: [@typeInfo(FuzzLabel).@"enum".fields.len]usize = @splat(0);
+var fuzz_reach: [@typeInfo(FuzzLabel).@"enum".field_names.len]usize = @splat(0);
 
 fn fuzzMark(comptime l: FuzzLabel) void {
-    fuzz_reach[@intFromEnum(l)] += 1;
+    fuzz_reach[@backingInt(l)] += 1;
     fuzz_driver.hit(@tagName(l));
 }
 
@@ -2204,7 +2204,7 @@ test "fuzz harness: 500 seeds in every test run, and they get everywhere" {
         };
     }
     for (fuzz_reach, 0..) |n, i| if (n == 0) {
-        std.debug.print("reach: label {t} never hit in 500 seeds\n", .{@as(FuzzLabel, @enumFromInt(i))});
+        std.debug.print("reach: label {t} never hit in 500 seeds\n", .{@as(FuzzLabel, @fromBackingInt(@intCast(i)))});
         return error.HarnessDoesNotReach;
     };
 }
@@ -2937,4 +2937,16 @@ test "real uci count canary: frozen raw configs + real capture, byte lengths unc
     try testing.expectEqual(@as(usize, 445), captured_testcfg_raw.len);
     try testing.expectEqual(@as(usize, 462), captured_testcfg_export.len);
     try testing.expectEqual(@as(usize, 198), captured_esctest_raw.len);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

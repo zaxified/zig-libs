@@ -140,8 +140,8 @@ pub const DecodeError = error{
 pub fn tagOf(payload: []const u8) DecodeError!MsgTag {
     if (payload.len < 1) return error.Truncated;
     return switch (payload[0]) {
-        @intFromEnum(MsgTag.hello) => .hello,
-        @intFromEnum(MsgTag.bum) => .bum,
+        @backingInt(MsgTag.hello) => .hello,
+        @backingInt(MsgTag.bum) => .bum,
         else => error.InvalidEncoding,
     };
 }
@@ -169,7 +169,7 @@ pub const Hello = struct {
     pub const wire_len = 17;
 
     pub fn encode(self: Hello, buf: *[wire_len]u8) void {
-        buf[0] = @intFromEnum(MsgTag.hello);
+        buf[0] = @backingInt(MsgTag.hello);
         std.mem.writeInt(u32, buf[1..5], self.origin, .little);
         std.mem.writeInt(u32, buf[5..9], self.seq, .little);
         std.mem.writeInt(u32, buf[9..13], self.segment, .little);
@@ -185,7 +185,7 @@ pub const Hello = struct {
         // become a `segment` id. Every dispatch site does check the tag today;
         // this makes that an invariant of the decoder instead of a convention
         // a new call site can forget.
-        if (payload[0] != @intFromEnum(MsgTag.hello)) return error.InvalidEncoding;
+        if (payload[0] != @backingInt(MsgTag.hello)) return error.InvalidEncoding;
         return .{
             .origin = std.mem.readInt(u32, payload[1..5], .little),
             .seq = std.mem.readInt(u32, payload[5..9], .little),
@@ -218,7 +218,7 @@ pub const BumFrame = struct {
     pub const wire_len = 17;
 
     pub fn encode(self: BumFrame, buf: *[wire_len]u8) void {
-        buf[0] = @intFromEnum(MsgTag.bum);
+        buf[0] = @backingInt(MsgTag.bum);
         std.mem.writeInt(u32, buf[1..5], self.origin, .little);
         std.mem.writeInt(u32, buf[5..9], self.seq, .little);
         std.mem.writeInt(u32, buf[9..13], self.ingress_segment, .little);
@@ -227,7 +227,7 @@ pub const BumFrame = struct {
 
     pub fn decode(payload: []const u8) DecodeError!BumFrame {
         if (payload.len < wire_len) return error.Truncated;
-        if (payload[0] != @intFromEnum(MsgTag.bum)) return error.InvalidEncoding;
+        if (payload[0] != @backingInt(MsgTag.bum)) return error.InvalidEncoding;
         return .{
             .origin = std.mem.readInt(u32, payload[1..5], .little),
             .seq = std.mem.readInt(u32, payload[5..9], .little),
@@ -308,7 +308,7 @@ test "tagOf and the frame decoders reject short and undefined input" {
     try testing.expectError(error.Truncated, Hello.decode(&[_]u8{0}));
     try testing.expectError(error.Truncated, BumFrame.decode(&[_]u8{1}));
     // A BUM frame in the pre-2026-09-30 13-octet layout (no tag) is short.
-    try testing.expectError(error.Truncated, BumFrame.decode(&([_]u8{1} ++ [_]u8{0} ** 12)));
+    try testing.expectError(error.Truncated, BumFrame.decode(&([_]u8{1} ++ @as([12]u8, @splat(0)))));
 
     // Every prefix of a valid frame is rejected; the full frame still decodes.
     var buf: [Hello.wire_len]u8 = undefined;

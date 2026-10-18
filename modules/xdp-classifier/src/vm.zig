@@ -101,14 +101,14 @@ fn lpmValueAddr(i: usize) u64 {
 
 /// Execute `prog` against `env`. `r1` starts as the xdp_md context pointer.
 pub fn exec(prog: []const Insn, env: *Env) VmError!Result {
-    var r: [11]u64 = .{0} ** 11;
+    var r: [11]u64 = @splat(0);
     r[10] = stack_top;
 
     // Stack shadow: 512 bytes below stack_top, with an initialised bitmap so
     // we can catch a map key read that touches an uninitialised slot (the
     // verifier rejects exactly that, so it is worth detecting offline).
-    var stack: [512]u8 = .{0} ** 512;
-    var stack_init: [512]bool = .{false} ** 512;
+    var stack: [512]u8 = @splat(0);
+    var stack_init: [512]bool = @splat(false);
 
     const ctx_ptr: u64 = 0x9_0000; // xdp_md
     r[1] = ctx_ptr;
@@ -817,7 +817,7 @@ fn fuzzPacketPathAgrees(comptime S: type, src: *S, gpa: std.mem.Allocator) anyer
     const knobs = src.value(u64);
     const cfg: Config = .{
         .key_field = if (knobs % 2 == 0) .dst else .src,
-        .vlan_depth = @enumFromInt((knobs / 2) % 3),
+        .vlan_depth = @fromBackingInt(@intCast((knobs / 2) % 3)),
         .v6 = (knobs / 6) % 2 == 1,
         .default_class = @truncate(knobs >> 32),
     };

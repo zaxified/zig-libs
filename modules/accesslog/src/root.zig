@@ -1253,7 +1253,7 @@ test "entryFromRequest: a chunked (streamed) response logs its body octets, not 
     var body_buf: [16]u8 = undefined;
     var res: http.Server.ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
     res.setStatus(200);
-    try res.writeAll("x" ** 100); // outgrows the buffer: chunked
+    try res.writeAll(strRepeat("x", 100)); // outgrows the buffer: chunked
     try res.end();
 
     var addr_buf: [64]u8 = undefined;
@@ -1660,7 +1660,7 @@ const fuzz_corpus = [_][]const u8{
     fuzzCase(all_fields, .{ "\"\r\n", "\\\xff", "\x00\x1f\x7f", "\xff\"\r\n{\"a\":1}", "\xf0", "\xed\xbf\xbf", "\xc2", "\xe2\x82\xac", "\"\r\n\xff", "\xe0\x80" }),
     // Every field at the pool maximum, all ill-formed: the widest expansion the
     // output buffer has to absorb (3 bytes of U+FFFD per input byte).
-    fuzzCaseNumeric(all_fields, .{ "\xff" ** 32, "\x80" ** 32, "\xed\xa0\x80" ** 10, "\xc0" ** 32, "\xf5" ** 32, "\xfe" ** 32, "\xe2\x82" ** 16, "\xf0\x9f\x98" ** 10, "\xc0" ** 32, "\xed\xa0\x80" ** 10 }, std.math.minInt(i64), 599, std.math.maxInt(u64), std.math.maxInt(u64), std.math.maxInt(u64)),
+    fuzzCaseNumeric(all_fields, .{ strRepeat("\xff", 32), strRepeat("\x80", 32), strRepeat("\xed\xa0\x80", 10), strRepeat("\xc0", 32), strRepeat("\xf5", 32), strRepeat("\xfe", 32), strRepeat("\xe2\x82", 16), strRepeat("\xf0\x9f\x98", 10), strRepeat("\xc0", 32), strRepeat("\xed\xa0\x80", 10) }, std.math.minInt(i64), 599, std.math.maxInt(u64), std.math.maxInt(u64), std.math.maxInt(u64)),
     // Well-formed control: all-valid UTF-8 across the whole of Table 3-7, so a
     // sweep cannot pass by sanitizing everything into U+FFFD.
     fuzzCaseNumeric(all_fields, .{ "22/Jul/2026:10:00:00 +0000", "[2001:db8::1]:443", "GET", "/\u{00e9}\u{20ac}\u{1f600}", "HTTP/1.1", "curl/8.0 \u{fffd}", "https://example.org/", "req-1", "4bf92f3577b34da6a3ce929d0e0e4736", "00f067aa0ba902b7" }, 1, 404, 0, 1, 999999999),
@@ -1796,10 +1796,10 @@ const testkit = @import("testkit");
 const fuzz_driver = testkit.fuzz.driver;
 
 const FuzzLabel = enum { exact_roundtrip, replacement, optional_null, optional_present };
-var fuzz_reach: [@typeInfo(FuzzLabel).@"enum".fields.len]usize = @splat(0);
+var fuzz_reach: [@typeInfo(FuzzLabel).@"enum".field_names.len]usize = @splat(0);
 
 fn mark(comptime l: FuzzLabel) void {
-    fuzz_reach[@intFromEnum(l)] += 1;
+    fuzz_reach[@backingInt(l)] += 1;
     fuzz_driver.hit(@tagName(l));
 }
 
@@ -1947,7 +1947,7 @@ test "fuzz harnesses: 300 seeds each in every test run, and they get everywhere"
         }
     }
     for (fuzz_reach, 0..) |n, i| if (n == 0) {
-        std.debug.print("reach: label {t} never hit in 300 seeds\n", .{@as(FuzzLabel, @enumFromInt(i))});
+        std.debug.print("reach: label {t} never hit in 300 seeds\n", .{@as(FuzzLabel, @fromBackingInt(@intCast(i)))});
         return error.HarnessDoesNotReach;
     };
 }
@@ -2005,23 +2005,23 @@ test "JSON: ill-formed UTF-8 becomes U+FFFD, one per MAXIMAL SUBPART, exact byte
         // not one policy from the other.
         .{ .in = "\xed\xa0\x80", .want = R ++ R ++ R, .why = "U+D800 high surrogate" },
         .{ .in = "\xed\xbf\xbf", .want = R ++ R ++ R, .why = "U+DFFF low surrogate" },
-        .{ .in = "\xed\xa0\xbd\xed\xb8\x80", .want = R ** 6, .why = "CESU-8 surrogate pair" },
+        .{ .in = "\xed\xa0\xbd\xed\xb8\x80", .want = strRepeat(R, 6), .why = "CESU-8 surrogate pair" },
 
         // ── overlong encodings.
         .{ .in = "\xc0\xaf", .want = R ++ R, .why = "overlong '/' (C0 AF)" },
         .{ .in = "\xc1\xbf", .want = R ++ R, .why = "overlong U+007F" },
-        .{ .in = "\xe0\x80\xaf", .want = R ** 3, .why = "3-byte overlong '/'" },
-        .{ .in = "\xf0\x80\x80\xaf", .want = R ** 4, .why = "4-byte overlong '/'" },
+        .{ .in = "\xe0\x80\xaf", .want = strRepeat(R, 3), .why = "3-byte overlong '/'" },
+        .{ .in = "\xf0\x80\x80\xaf", .want = strRepeat(R, 4), .why = "4-byte overlong '/'" },
 
         // ── past U+10FFFF.
-        .{ .in = "\xf4\x90\x80\x80", .want = R ** 4, .why = "U+110000" },
-        .{ .in = "\xf5\x80\x80\x80", .want = R ** 4, .why = "F5: no such lead byte" },
+        .{ .in = "\xf4\x90\x80\x80", .want = strRepeat(R, 4), .why = "U+110000" },
+        .{ .in = "\xf5\x80\x80\x80", .want = strRepeat(R, 4), .why = "F5: no such lead byte" },
         .{ .in = "\xff", .want = R, .why = "FF: never appears in UTF-8" },
-        .{ .in = "\xfe\xfe\xff\xff", .want = R ** 4, .why = "a BOM-ish byte run" },
+        .{ .in = "\xfe\xfe\xff\xff", .want = strRepeat(R, 4), .why = "a BOM-ish byte run" },
 
         // ── bare continuation bytes.
         .{ .in = "\x80", .want = R, .why = "lone continuation" },
-        .{ .in = "\x80\xbf\x80", .want = R ** 3, .why = "run of continuations" },
+        .{ .in = "\x80\xbf\x80", .want = strRepeat(R, 3), .why = "run of continuations" },
 
         // ── interleaving with well-formed text: only the bad part is touched.
         .{ .in = "curl\xffbad", .want = "curl" ++ R ++ "bad", .why = "the finding's own vector" },
@@ -2356,7 +2356,7 @@ test "extra: empty, and a list of only unusable keys, change no output byte" {
 }
 
 test "extra: a key cannot forge, shadow or duplicate a field -- it is skipped" {
-    const long65 = "k" ** 65;
+    const long65 = strRepeat("k", 65);
     const bad_keys = [_][]const u8{
         "",         long65,        "a b",    "a=b",    "a\"b",   "a\nb",     "a\rb",   "a\x00b",        "{x}",            "k\xc3\xa9",  "a,b",        "a:b",     "\\",
         // Collisions with every fixed key, exact and case-folded.
@@ -2383,11 +2383,11 @@ test "extra: a key cannot forge, shadow or duplicate a field -- it is skipped" {
     }
     // Boundary: 64 bytes is the longest valid key (positive control for the bound).
     var e = sampleEntry();
-    e.extra = &.{.{ .key = "k" ** 64, .value = "v" }};
+    e.extra = &.{.{ .key = strRepeat("k", 64), .value = "v" }};
     var jb3: [4096]u8 = undefined;
     var lb3: [4096]u8 = undefined;
     const ok = try renderBoth(e, &jb3, &lb3);
-    try testing.expect(std.mem.indexOf(u8, ok.json, "\"" ++ "k" ** 64 ++ "\":\"v\"") != null);
+    try testing.expect(std.mem.indexOf(u8, ok.json, "\"" ++ strRepeat("k", 64) ++ "\":\"v\"") != null);
     // A repeated key: the first wins, the second is skipped (also case-folded).
     e.extra = &.{ .{ .key = "dup", .value = "first" }, .{ .key = "DUP", .value = "second" }, .{ .key = "dup", .value = "third" } };
     const dup = try renderBoth(e, &jb3, &lb3);
@@ -2516,4 +2516,16 @@ test "LogFormat: Common Log Format golden, and a fixed %{key}x line over extra" 
     const ex = comptime LogFormat.comptimeParse("%{tenant}x %D");
     try ex.write(e, &w);
     try testing.expectEqualStrings("ac\\\"me 1500\n", w.buffered());
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

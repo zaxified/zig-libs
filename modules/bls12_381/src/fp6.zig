@@ -245,13 +245,13 @@ test "Fp6.zero / Fp6.one round-trip through bytes" {
     try std.testing.expect(std.mem.allEqual(u8, &z, 0));
 
     const o = Fp6.one.toBytes();
-    var expected = [_]u8{0} ** Fp6.encoded_bytes;
+    var expected = @as([Fp6.encoded_bytes]u8, @splat(0));
     expected[Fp6.encoded_bytes - 1] = 1; // c0's Fp2 low byte
     try std.testing.expectEqualSlices(u8, &expected, &o);
 }
 
 test "Fp6.fromBytes / toBytes round-trip" {
-    var bytes = [_]u8{0} ** Fp6.encoded_bytes;
+    var bytes = @as([Fp6.encoded_bytes]u8, @splat(0));
     bytes[0] = 0x11; // top byte of c2
     bytes[Fp6.encoded_bytes - 1] = 0x22; // low byte of c0
     const el = try Fp6.fromBytes(bytes);

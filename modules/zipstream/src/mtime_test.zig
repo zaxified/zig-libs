@@ -45,7 +45,7 @@ const infozip_ut: []const u8 = @embedFile("testdata/infozip_ut.zip");
 const write_golden: []const u8 = @embedFile("testdata/write_golden.zip");
 
 const stored_data = "plain stored payload for the external zip oracle\n";
-const deflated_data = "the quick brown fox jumps over the lazy dog. " ** 40;
+const deflated_data = strRepeat("the quick brown fox jumps over the lazy dog. ", 40);
 
 test "mtime/mode: ArchiveWriter reproduces the zipinfo/Python-verified archive byte-for-byte" {
     const a = testing.allocator;
@@ -144,4 +144,16 @@ test "DosDateTime: conversions, clamps and invalid fields" {
         try testing.expectEqual(c.extra, lfh.extra_len);
         try testing.expectEqual(@as(?i64, c.dos), (DosDateTime{ .time = lfh.last_modification_time, .date = lfh.last_modification_date }).toUnix());
     }
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

@@ -1748,7 +1748,7 @@ test "ChunkedReader captures trailers when a buffer is provided" {
 }
 
 test "ChunkedReader: trailer capture overflow is flagged, body still decodes" {
-    var src: Reader = .fixed("3\r\nabc\r\n0\r\nX-Big: " ++ ("z" ** 200) ++ "\r\n\r\n");
+    var src: Reader = .fixed("3\r\nabc\r\n0\r\nX-Big: " ++ (strRepeat("z", 200)) ++ "\r\n\r\n");
     var cbuf: [64]u8 = undefined;
     var tbuf: [16]u8 = undefined; // too small for the trailer line
     var cr: ChunkedReader = .initCapturingTrailers(&src, &cbuf, &tbuf);
@@ -1769,8 +1769,8 @@ test "ChunkedReader: the trailer section is bounded, in both a single line's len
     // line at a time, unbounded. The audit's two shapes: one line far
     // larger than any real trailer, and many small lines that individually
     // look harmless.
-    const one_huge_line = "3\r\nabc\r\n0\r\nX-Big: " ++ ("z" ** 40_000) ++ "\r\n\r\n";
-    const many_small_lines = "3\r\nabc\r\n0\r\n" ++ ("A: 1\r\n" ** 6_000) ++ "\r\n";
+    const one_huge_line = "3\r\nabc\r\n0\r\nX-Big: " ++ (strRepeat("z", 40_000)) ++ "\r\n\r\n";
+    const many_small_lines = "3\r\nabc\r\n0\r\n" ++ (strRepeat("A: 1\r\n", 6_000)) ++ "\r\n";
     for ([_][]const u8{ one_huge_line, many_small_lines }) |wire| {
         // Discarding (no trailer_buf) — the shape that previously had no
         // bound at all.
@@ -2223,4 +2223,16 @@ test "isValidFieldValue: every byte at every position of every path length agree
         try std.testing.expect(isValidFieldValue(buf[0..len]));
     }
     try std.testing.expect(isValidFieldValue(""));
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

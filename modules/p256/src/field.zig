@@ -606,7 +606,7 @@ fn randFe(rand: std.Random) struct { k: Fe, s: StdFe } {
 // are cheap relative to a full point multiply, so a modest trim suffices;
 // ReleaseFast/ReleaseSafe/ReleaseSmall keep the full count (they are not the
 // problem).
-const field_diff_iters: usize = if (builtin.mode == .Debug) 2000 else 4000;
+const field_diff_iters: usize = if (builtin.mode == .debug) 2000 else 4000;
 
 test "differential vs std.Fe: mul/sq/add/sub/neg/invert on random inputs" {
     var prng = std.Random.DefaultPrng.init(0xC0FFEE_9256D);

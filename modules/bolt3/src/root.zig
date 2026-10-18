@@ -68,7 +68,7 @@ pub const Error = error{
 /// (widen to 48 bytes, right-aligned, then a wide reduction) so `Scalar`'s
 /// canonical check never rejects a legitimate hash value.
 fn hashToScalar(h: [32]u8) Scalar {
-    var wide = [_]u8{0} ** 48;
+    var wide = @as([48]u8, @splat(0));
     @memcpy(wide[16..48], &h);
     return Scalar.fromBytes48(wide, .big);
 }
@@ -283,15 +283,15 @@ test "per-commitment secret feeds the revocation derivation end-to-end" {
 }
 
 test "invalid point / secret surface as typed errors" {
-    const bad33 = [_]u8{0} ** 33;
+    const bad33 = @as([33]u8, @splat(0));
     try std.testing.expectError(error.InvalidPoint, derivePublicKey(bad33, tv_pcp));
-    const bad32 = [_]u8{0} ** 32; // zero is a non-canonical secret
+    const bad32 = @as([32]u8, @splat(0)); // zero is a non-canonical secret
     try std.testing.expectError(error.InvalidSecret, tPriv(bad32, tv_pcs));
 }
 
 test "revocation derivation: invalid point / secret surface as typed errors" {
-    const bad33 = [_]u8{0} ** 33;
-    const bad32 = [_]u8{0} ** 32; // zero is a non-canonical secret
+    const bad33 = @as([33]u8, @splat(0));
+    const bad32 = @as([32]u8, @splat(0)); // zero is a non-canonical secret
     try std.testing.expectError(error.InvalidPoint, deriveRevocationPublicKey(bad33, tv_pcp));
     try std.testing.expectError(error.InvalidPoint, deriveRevocationPublicKey(tv_base_point, bad33));
     try std.testing.expectError(error.InvalidSecret, tRevPriv(bad32, tv_pcs));
@@ -301,9 +301,9 @@ test "revocation derivation: invalid point / secret surface as typed errors" {
 test "every input is validated: bad per_commitment_point, zero or >= n secrets" {
     // Mutation run 2026-10-05: each of these refusals could be deleted (or
     // re-labelled) without any test above noticing.
-    const bad33 = [_]u8{0} ** 33;
-    const zero = [_]u8{0} ** 32;
-    const over_n = [_]u8{0xff} ** 32; // > n: not a canonical scalar
+    const bad33 = @as([33]u8, @splat(0));
+    const zero = @as([32]u8, @splat(0));
+    const over_n = @as([32]u8, @splat(0xff)); // > n: not a canonical scalar
     try std.testing.expectError(error.InvalidPoint, derivePublicKey(tv_base_point, bad33));
     try std.testing.expectError(error.InvalidSecret, tPriv(tv_base_secret, zero));
     try std.testing.expectError(error.InvalidSecret, tPriv(over_n, tv_pcs));
@@ -316,7 +316,7 @@ test "regression: derivePrivateKey refuses a per_commitment_secret >= n" {
     // reduces a non-canonical scalar mod n, so this secret was accepted and
     // silently reduced, while `deriveRevocationPrivateKey` refused the same
     // bytes and `Error.InvalidSecret` promises a canonical (< n) scalar.
-    const over_n = [_]u8{0xff} ** 32;
+    const over_n = @as([32]u8, @splat(0xff));
     try std.testing.expectError(error.InvalidSecret, tPriv(tv_base_secret, over_n));
 }
 

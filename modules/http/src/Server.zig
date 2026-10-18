@@ -4856,16 +4856,16 @@ fn bumpHits(req: *Request) void {
 
 /// 87 bytes (0x57) — longer than the offline response buffer (64) so it
 /// forces chunked streaming there.
-const big_body = ("0123456789" ** 8) ++ "ABCDEFG";
+const big_body = (strRepeat("0123456789", 8)) ++ "ABCDEFG";
 
 /// 32 bytes of JSON — fits the offline response buffer (64), so it takes
 /// the fully-buffered path; above the tests' min_size 16, below the 1 KiB
 /// default.
-const small_json = "{\"k\":\"" ++ ("v" ** 24) ++ "\"}";
+const small_json = "{\"k\":\"" ++ (strRepeat("v", 24)) ++ "\"}";
 
 /// ~1.8 KiB of repetitive JSON — above the default 1 KiB compression
 /// min_size and every offline serving buffer, so it always streams.
-const json_body = "{\"data\":[" ++ ("\"abcdefgh\"," ** 160) ++ "\"end\"]}";
+const json_body = "{\"data\":[" ++ (strRepeat("\"abcdefgh\",", 160)) ++ "\"end\"]}";
 
 fn testHandler(req: *Request, rw: *ResponseWriter) anyerror!void {
     bumpHits(req);
@@ -5423,7 +5423,7 @@ test "serveStream: protocol rejections (505, 400s, 431)" {
     try testing.expect(std.mem.startsWith(u8, runStream(null, "GET * HTTP/1.1\r\nHost: t\r\n\r\n", &out_buf), "HTTP/1.1 400 Bad Request\r\n"));
     // A 1.0 client gets no 100 Continue (RFC 9110 §10.1.1).
     try testing.expect(std.mem.indexOf(u8, runStream(null, "POST /echo HTTP/1.0\r\nHost: t\r\nExpect: 100-continue\r\nContent-Length: 2\r\n\r\nhi", &out_buf), "100 Continue") == null);
-    const long_head = "GET / HTTP/1.1\r\nHost: t\r\nX-Big: " ++ ("a" ** 2000) ++ "\r\n\r\n";
+    const long_head = "GET / HTTP/1.1\r\nHost: t\r\nX-Big: " ++ (strRepeat("a", 2000)) ++ "\r\n\r\n";
     try testing.expect(std.mem.startsWith(u8, runStream(null, long_head, &out_buf), "HTTP/1.1 431 Request Header Fields Too Large\r\n"));
 }
 
@@ -5806,7 +5806,7 @@ test "ResponseWriter: header, cookie and trailer bytes survive the caller's dead
     // Header name AND value, the cookie, and the trailer — every byte that
     // went through the copy store, read back off the wire after its source
     // was overwritten.
-    try testing.expect(std.mem.indexOf(u8, wire, "X-Doomed-7: " ++ "v" ** 48 ++ "\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, wire, "X-Doomed-7: " ++ strRepeat("v", 48) ++ "\r\n") != null);
     try testing.expect(std.mem.indexOf(u8, wire, "Set-Cookie: sid=4242; Path=/\r\n") != null);
     try testing.expect(std.mem.indexOf(u8, wire, "Trailer: X-Rows-2\r\n") != null);
     try testing.expect(std.mem.indexOf(u8, wire, "X-Rows-2: 987654\r\n") != null);
@@ -5964,7 +5964,7 @@ test "ResponseWriter: reset after the head is on the wire is refused, not assert
     // puts the head on the wire from INSIDE the handler — the state a
     // consumer reaches by accident, not by hostile input.
     try rw.setHeader("X-First", "1");
-    try rw.writeAll("a" ** 26);
+    try rw.writeAll(strRepeat("a", 26));
     try testing.expect(rw.headSent());
 
     // The precondition must hold in every optimize mode. When it was
@@ -6130,7 +6130,7 @@ test "methodFromToken" {
 
 test "serveStream: over-long request line → 414; limit is configurable" {
     var out_buf: [4096]u8 = undefined;
-    const wire_bytes = "GET /" ++ ("a" ** 100) ++ " HTTP/1.1\r\nHost: t\r\n\r\n";
+    const wire_bytes = "GET /" ++ (strRepeat("a", 100)) ++ " HTTP/1.1\r\nHost: t\r\n\r\n";
     try testing.expect(std.mem.startsWith(
         u8,
         runStreamWith(.{ .max_request_line_bytes = 64 }, null, wire_bytes, &out_buf),
@@ -6147,7 +6147,7 @@ test "serveStream: over-long request line → 414; limit is configurable" {
 test "serveStream: declared Content-Length over max_body_bytes → golden 413 before the handler" {
     var hits: Hits = .init(0);
     var out_buf: [4096]u8 = undefined;
-    const got = runStreamWith(.{ .max_body_bytes = 16 }, &hits, "POST /drain HTTP/1.1\r\nHost: t\r\nContent-Length: 17\r\n\r\n" ++ ("b" ** 17), &out_buf);
+    const got = runStreamWith(.{ .max_body_bytes = 16 }, &hits, "POST /drain HTTP/1.1\r\nHost: t\r\nContent-Length: 17\r\n\r\n" ++ (strRepeat("b", 17)), &out_buf);
     try testing.expectEqualStrings("HTTP/1.1 413 Content Too Large\r\n" ++
         "Date: " ++ test_date ++ "\r\n" ++
         "Server: test\r\n" ++
@@ -6159,7 +6159,7 @@ test "serveStream: declared Content-Length over max_body_bytes → golden 413 be
     try testing.expectEqual(@as(u32, 0), hits.load(.monotonic)); // handler never ran
 
     // Exactly at the limit passes.
-    const ok = runStreamWith(.{ .max_body_bytes = 16 }, &hits, "POST /drain HTTP/1.1\r\nHost: t\r\nContent-Length: 16\r\n\r\n" ++ ("b" ** 16), &out_buf);
+    const ok = runStreamWith(.{ .max_body_bytes = 16 }, &hits, "POST /drain HTTP/1.1\r\nHost: t\r\nContent-Length: 16\r\n\r\n" ++ (strRepeat("b", 16)), &out_buf);
     try testing.expect(std.mem.endsWith(u8, ok, "drained 16"));
     try testing.expectEqual(@as(u32, 1), hits.load(.monotonic));
 }
@@ -6171,9 +6171,9 @@ test "serveStream: chunked body over max_body_bytes → 413 while streaming, mem
     // buffer combined (head 1 KiB + request-body 256 + response 64 + chunk
     // 128), so it can only be handled streaming; the cap fires long before
     // the wire ends and nothing is ever buffered whole.
-    const chunk = "40\r\n" ++ ("x" ** 0x40) ++ "\r\n";
+    const chunk = "40\r\n" ++ (strRepeat("x", 0x40)) ++ "\r\n";
     const wire_bytes = "POST /drain HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n" ++
-        (chunk ** 64) ++ "0\r\n\r\n" ++
+        (strRepeat(chunk, 64)) ++ "0\r\n\r\n" ++
         "GET /hello HTTP/1.1\r\nHost: t\r\n\r\n";
     const got = runStreamWith(.{ .max_body_bytes = 1024 }, &hits, wire_bytes, &out_buf);
     try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 413 Content Too Large\r\n"));
@@ -6185,9 +6185,9 @@ test "serveStream: chunked body over max_body_bytes → 413 while streaming, mem
 test "serveStream: chunked body exactly at max_body_bytes passes; unread overrun closes" {
     var hits: Hits = .init(0);
     var out_buf: [4096]u8 = undefined;
-    const chunk = "40\r\n" ++ ("x" ** 0x40) ++ "\r\n";
+    const chunk = "40\r\n" ++ (strRepeat("x", 0x40)) ++ "\r\n";
     const exact = "POST /drain HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n" ++
-        (chunk ** 16) ++ "0\r\n\r\n" ++
+        (strRepeat(chunk, 16)) ++ "0\r\n\r\n" ++
         "GET /hello HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n";
     const got = runStreamWith(.{ .max_body_bytes = 1024 }, &hits, exact, &out_buf);
     try testing.expect(std.mem.indexOf(u8, got, "drained 1024") != null);
@@ -6197,7 +6197,7 @@ test "serveStream: chunked body exactly at max_body_bytes passes; unread overrun
     // post-handler drain hits the cap → the connection closes.
     hits = .init(0);
     const unread = "POST /hello HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n" ++
-        (chunk ** 64) ++ "0\r\n\r\n" ++
+        (strRepeat(chunk, 64)) ++ "0\r\n\r\n" ++
         "GET /hello HTTP/1.1\r\nHost: t\r\n\r\n";
     const got2 = runStreamWith(.{ .max_body_bytes = 1024 }, &hits, unread, &out_buf);
     try testing.expect(std.mem.startsWith(u8, got2, "HTTP/1.1 200 OK\r\n"));
@@ -6344,7 +6344,7 @@ test "serveStream: per-connection request cap closes the connection" {
     var out_buf: [4096]u8 = undefined;
     // Cap = 2 over three pipelined requests: two are served, the second
     // carries Connection: close, and the third is never read.
-    const three = "GET /hello HTTP/1.1\r\nHost: t\r\n\r\n" ** 3;
+    const three = strRepeat("GET /hello HTTP/1.1\r\nHost: t\r\n\r\n", 3);
     const got = runStreamWith(.{ .max_requests_per_conn = 2 }, &hits, three, &out_buf);
     try testing.expectEqual(@as(u32, 2), hits.load(.monotonic));
     try testing.expectEqual(@as(usize, 2), std.mem.count(u8, got, "HTTP/1.1 200 OK\r\n"));
@@ -6609,7 +6609,7 @@ test "serveStream: trailers on a streamed body arrive after the last chunk" {
 }
 
 test "ResponseWriter.bodyBytesSent: chunked and until-close count body octets, not framing" {
-    const body = "0123456789" ** 10; // 100 bytes, past the 16-byte body buffer
+    const body = strRepeat("0123456789", 10); // 100 bytes, past the 16-byte body buffer
     {
         var out_buf: [512]u8 = undefined;
         var out: Writer = .fixed(&out_buf);
@@ -6650,7 +6650,7 @@ test "ResponseWriter.bodyBytesSent: a compressed body counts the coded octets" {
         .accept_gzip = true,
     });
     try rw.setHeader("Content-Type", "text/plain");
-    const plain = "all work and no play makes a dull log line\n" ** 40; // compresses well
+    const plain = strRepeat("all work and no play makes a dull log line\n", 40); // compresses well
     try rw.writeAll(plain);
     try rw.end();
     try testing.expect(rw.body == .encoded);
@@ -6838,7 +6838,7 @@ test "ResponseWriter: trailer capacity is bounded" {
     // A name list longer than `trailer_decl_bytes` is refused too.
     var out2: Writer = .fixed(&out_buf);
     var rw2 = trailerWriter(&out2, &body_buf, &chunk_buf, .{});
-    const long = "X-" ++ ("a" ** 200);
+    const long = "X-" ++ (strRepeat("a", 200));
     try rw2.declareTrailer(long);
     try testing.expectError(error.TooManyTrailers, rw2.declareTrailer(long ++ "b"));
 }
@@ -7207,7 +7207,7 @@ fn gzipRequest(content_encoding: []const u8, compressed: []const u8) ![]u8 {
 test "serveStream: gzip request body is decompressed for the handler" {
     // 52 decompressed bytes: fits /echo's response buffer (64) so the reply
     // is exact-Content-Length — endsWith(plain) proves the decoded plaintext.
-    const plain = "gzipped-body!" ** 4;
+    const plain = strRepeat("gzipped-body!", 4);
     const compressed = try gzipAlloc(plain);
     defer testing.allocator.free(compressed);
     try testing.expect(compressed.len < plain.len); // repetitive → shrinks
@@ -7228,7 +7228,7 @@ test "serveStream: gzip request body is decompressed for the handler" {
 }
 
 test "serveStream: gzip request body over the decompressed cap → 413 (zip-bomb guard)" {
-    const plain = "gzipped-body!" ** 4; // 52 decompressed bytes
+    const plain = strRepeat("gzipped-body!", 4); // 52 decompressed bytes
     const compressed = try gzipAlloc(plain);
     defer testing.allocator.free(compressed);
     const wire = try gzipRequest("gzip", compressed);
@@ -7342,7 +7342,7 @@ fn gzipMemberWithHeader(header: []const u8, plain: []const u8) ![]u8 {
 }
 
 test "serveStream: verify_inbound_trailer on — a valid member round-trips, plain bytes identical" {
-    const plain = "gzipped-body!" ** 4; // 52 decompressed bytes
+    const plain = strRepeat("gzipped-body!", 4); // 52 decompressed bytes
     const compressed = try gzipAlloc(plain);
     defer testing.allocator.free(compressed);
     const wire = try gzipRequest("gzip", compressed);
@@ -7360,7 +7360,7 @@ test "serveStream: verify_inbound_trailer on — a valid member round-trips, pla
 }
 
 test "serveStream: verify_inbound_trailer on — a flipped CRC bit is refused" {
-    const plain = "gzipped-body!" ** 4;
+    const plain = strRepeat("gzipped-body!", 4);
     const compressed = try gzipAlloc(plain);
     defer testing.allocator.free(compressed);
     compressed[compressed.len - 8] ^= 0x01; // one flipped bit in the stored CRC-32
@@ -7379,7 +7379,7 @@ test "serveStream: verify_inbound_trailer on — a flipped CRC bit is refused" {
 }
 
 test "serveStream: verify_inbound_trailer on — ISIZE off by one is refused" {
-    const plain = "gzipped-body!" ** 4;
+    const plain = strRepeat("gzipped-body!", 4);
     const compressed = try gzipAlloc(plain);
     defer testing.allocator.free(compressed);
     const isize_bytes = compressed[compressed.len - 4 ..][0..4];
@@ -7396,7 +7396,7 @@ test "serveStream: verify_inbound_trailer on — ISIZE off by one is refused" {
 }
 
 test "serveStream: verify_inbound_trailer on — a truncated trailer is refused" {
-    const plain = "gzipped-body!" ** 4;
+    const plain = strRepeat("gzipped-body!", 4);
     const compressed = try gzipAlloc(plain);
     defer testing.allocator.free(compressed);
     const short = compressed[0 .. compressed.len - 1]; // drop the trailer's last byte
@@ -7412,7 +7412,7 @@ test "serveStream: verify_inbound_trailer on — a truncated trailer is refused"
 }
 
 test "serveStream: verify_inbound_trailer on — FEXTRA/FNAME/FHCRC header variants still round-trip" {
-    const plain = "header-variant-body" ** 3;
+    const plain = strRepeat("header-variant-body", 3);
     var header: std.ArrayList(u8) = .empty;
     defer header.deinit(testing.allocator);
     const flg: u8 = 0b0001_1110; // FHCRC | FEXTRA | FNAME | FCOMMENT
@@ -7438,7 +7438,7 @@ test "serveStream: verify_inbound_trailer on — FEXTRA/FNAME/FHCRC header varia
 }
 
 test "serveStream: the same corrupt trailer is ACCEPTED when verify_inbound_trailer is off (today's default)" {
-    const plain = "gzipped-body!" ** 4;
+    const plain = strRepeat("gzipped-body!", 4);
     const compressed = try gzipAlloc(plain);
     defer testing.allocator.free(compressed);
     compressed[compressed.len - 8] ^= 0x01; // the same flipped CRC bit as above
@@ -8160,7 +8160,7 @@ test "integration: an enable_h2c connection kept 'productive' forever still ends
     while (rounds < 20) : (rounds += 1) {
         try sleepMs(io, 40);
         wire.clearRetainingCapacity();
-        h2.encodePing(testing.allocator, &wire, .{0} ** 8, false) catch break;
+        h2.encodePing(testing.allocator, &wire, @splat(0), false) catch break;
         sw.interface.writeAll(wire.items) catch break; // server may have hung up
         sw.interface.flush() catch break;
     }
@@ -8910,7 +8910,7 @@ test "the stamp is reformatted only when the second changes" {
     // what the first call stored, ask again inside the same second, and the
     // poison has to come back -- which it can only do if nothing reformatted.
     @memset(&date_cache, 'X');
-    try testing.expectEqualStrings("X" ** http_date_len, httpDateInto(clock.now(), &buf));
+    try testing.expectEqualStrings(strRepeat("X", http_date_len), httpDateInto(clock.now(), &buf));
 
     // The clock is still read every time -- what is saved is the formatting,
     // and a cache that stopped reading the clock could not notice the second
@@ -9007,8 +9007,8 @@ test "the serving frame stays inside its budget" {
     // ReleaseFast reaches 16.5; asserting one number against both would either
     // pass everything or fail honestly-built code. The optimized modes are the
     // ones a server ships, and they are the ones held to the budget.
-    const optimized = builtin.mode == .ReleaseFast or builtin.mode == .ReleaseSafe or
-        builtin.mode == .ReleaseSmall;
+    const optimized = builtin.mode == .fast or builtin.mode == .safe or
+        builtin.mode == .small;
     if (!optimized) return;
     if (frame_probe.measured > codec_frame_budget) {
         std.debug.print(
@@ -9064,7 +9064,7 @@ test "integration: an h2c session ends in FIN, not RST, while the peer is still 
     var wbuf: [4096]u8 = undefined;
     var sw = stream.writer(io, &wbuf);
     const settings = [_]u8{ 0, 0, 0, 4, 0, 0, 0, 0, 0 };
-    const goaway = [_]u8{ 0, 0, 8, 7, 0, 0, 0, 0, 0 } ++ [_]u8{0} ** 8;
+    const goaway = [_]u8{ 0, 0, 8, 7, 0, 0, 0, 0, 0 } ++ @as([8]u8, @splat(0));
     const ping = [_]u8{ 0, 0, 8, 6, 0, 0, 0, 0, 0 } ++ "lingerok".*;
     try sw.interface.writeAll(h2.preface ++ settings ++ goaway);
     for (0..32 * 1024 / ping.len) |_| try sw.interface.writeAll(&ping);
@@ -9533,4 +9533,16 @@ test "upgrade: a writer the h1 loop did not build refuses (h2, hand-built)" {
     var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
     try testing.expectError(error.Unsupported, rw.upgrade("websocket"));
     try testing.expectEqual(@as(usize, 0), out.buffered().len);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

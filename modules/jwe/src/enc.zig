@@ -445,8 +445,8 @@ pub const cbc_hmac = struct {
 };
 
 test "A128GCM real round-trip (self-consistency, not a KAT)" {
-    const key = [_]u8{0x42} ** 16;
-    const iv = [_]u8{0x24} ** 12;
+    const key = @as([16]u8, @splat(0x42));
+    const iv = @as([12]u8, @splat(0x24));
     const aad = "additional-data";
     const pt = "The quick brown fox jumps over the lazy dog.";
     var ct: [pt.len]u8 = undefined;
@@ -459,8 +459,8 @@ test "A128GCM real round-trip (self-consistency, not a KAT)" {
 }
 
 test "A256GCM real round-trip + tamper detection" {
-    const key = [_]u8{0x7a} ** 32;
-    const iv = [_]u8{0x11} ** 12;
+    const key = @as([32]u8, @splat(0x7a));
+    const iv = @as([12]u8, @splat(0x11));
     const aad = "";
     const pt = "encrypt me please";
     var ct: [pt.len]u8 = undefined;
@@ -581,7 +581,7 @@ test "CBC-HMAC decrypt fails closed: tag mismatch and padding failure are the SA
     // decryption ends in 0x00 — an always-invalid PKCS#7 pad — then MAC it
     // correctly with the real MAC_KEY. The only failure left is padding; the
     // caller must not be able to tell it apart from a tag failure.
-    var block: [16]u8 = .{0x41} ** 16;
+    var block: [16]u8 = @splat(0x41);
     block[15] = 0x00;
     for (&block, b1.iv) |*b, p| b.* ^= p;
     Aes128.initEnc(b1.enc_key.*).encrypt(&block, &block);
@@ -600,8 +600,8 @@ test "CBC-HMAC decrypt fails closed: tag mismatch and padding failure are the SA
 }
 
 test "CBC-HMAC round-trip: non-block-aligned plaintext (partial-block PKCS#7 pad)" {
-    const key = [_]u8{0x33} ** 32;
-    const iv = [_]u8{0x44} ** 16;
+    const key = @as([32]u8, @splat(0x33));
+    const iv = @as([16]u8, @splat(0x44));
     const aad = "jwe-aad";
     const pt = "seventeen bytes!!"; // 17 bytes -> one full block + 1 byte + 15 pad
     var ct: [32]u8 = undefined;

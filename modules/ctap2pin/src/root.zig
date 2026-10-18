@@ -256,7 +256,7 @@ noinline fn ecdhZUnburned(out: *[32]u8, private_scalar: *const [32]u8, peer: Pub
     // `timing_safe.eql` promises it instead, which is what the line 35 lines
     // above already does deliberately — and `scripts/check-ct-compare.py` now
     // pins the call so it cannot be swapped back unnoticed.
-    if (std.crypto.timing_safe.eql([32]u8, private_scalar.*, [_]u8{0} ** 32)) return error.InvalidScalar;
+    if (std.crypto.timing_safe.eql([32]u8, private_scalar.*, @as([32]u8, @splat(0)))) return error.InvalidScalar;
     const point = try peer.toPoint();
     var shared: P256 = undefined;
     defer std.crypto.secureZero(u8, std.mem.asBytes(&shared));
@@ -614,7 +614,7 @@ const to_point_seeds = [_][]const u8{
     // on-curve point, decoded from hex at comptime (no curve arithmetic).
     &(hx64("6B17D1F2E12C4247F8BCE6E563A440F277037D812DEB33A0F4A13945D898C296") ++
         hx64("4FE342E2FE1A7F9B8EE7EB4A7C0F9E162BCE33576B315ECECBB6406837BF51F5")),
-    &([_]u8{0} ** 32 ++ [_]u8{0} ** 31 ++ [_]u8{1}), // (0, 1): the identity element
+    &(@as([32]u8, @splat(0)) ++ @as([31]u8, @splat(0)) ++ [_]u8{1}), // (0, 1): the identity element
 };
 
 test "fuzz PublicKey.toPoint never panics" {
@@ -670,8 +670,8 @@ const decrypt_seeds = [_][]const u8{
 /// which key is used decides nothing about the length gate under test.
 fn twoSeed(comptime cipher_len: usize) []const u8 {
     return &struct {
-        const bytes = [_]u8{0} ** Two.shared_secret_length ++
-            std.mem.toBytes(@as(u32, cipher_len)) ++ [_]u8{0xA5} ** cipher_len;
+        const bytes = @as([Two.shared_secret_length]u8, @splat(0)) ++
+            std.mem.toBytes(@as(u32, cipher_len)) ++ @as([cipher_len]u8, @splat(0xA5));
     }.bytes;
 }
 

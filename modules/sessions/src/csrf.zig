@@ -254,7 +254,7 @@ test "token/verify round-trip; wrong session id and tamper fail" {
 
     // Wrong length / non-hex → reject (no crash).
     try testing.expect(!c.verify("session-A", "short"));
-    try testing.expect(!c.verify("session-A", "zz" ++ ("0" ** 62)));
+    try testing.expect(!c.verify("session-A", "zz" ++ (strRepeat("0", 62))));
 }
 
 /// The handler/middleware half of the dead-frame test below: issue a token
@@ -526,7 +526,7 @@ test "Csrf.check: false on missing cookie, false on wrong token, true on the rig
 
     // Session cookie present, but the token does not verify -> false.
     var out2: [4096]u8 = undefined;
-    const wrong_token = runWire(&r, "GET /c HTTP/1.1\r\nHost: t\r\nCookie: session=sess1\r\nX-CSRF-Token: " ++ ("0" ** token_hex_len) ++ "\r\nConnection: close\r\n\r\n", &out2);
+    const wrong_token = runWire(&r, "GET /c HTTP/1.1\r\nHost: t\r\nCookie: session=sess1\r\nX-CSRF-Token: " ++ (strRepeat("0", token_hex_len)) ++ "\r\nConnection: close\r\n\r\n", &out2);
     try testing.expect(std.mem.endsWith(u8, wrong_token, "false"));
 
     // Session cookie + the matching token -> true.
@@ -654,4 +654,16 @@ test "Csrf.check: no session cookie is false even with the token an empty sessio
     const req = try std.fmt.bufPrint(&req_buf, "GET /c HTTP/1.1\r\nHost: t\r\nX-CSRF-Token: {s}\r\nConnection: close\r\n\r\n", .{tok_for_empty});
     var out: [4096]u8 = undefined;
     try testing.expect(std.mem.endsWith(u8, runWire(&r, req, &out), "false"));
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

@@ -114,7 +114,7 @@ const Plan = struct {
 /// Encoder for one block. The whole block lives inside the struct: no
 /// allocation, and the struct is cheap to copy (about 1 KiB).
 pub const Writer = struct {
-    buf: [max_block_bytes]u8 = [_]u8{0} ** max_block_bytes,
+    buf: [max_block_bytes]u8 = @as([max_block_bytes]u8, @splat(0)),
     /// Bits used in the stream (after the 2-byte header).
     nbits: usize = 0,
     n: u16 = 0,
@@ -857,7 +857,7 @@ fn drain(block: []const u8) error{Corrupt}!void {
 
 /// Hand-assembles a block (count header + bit stream) for malformed-input tests.
 const Craft = struct {
-    buf: [64]u8 = [_]u8{0} ** 64,
+    buf: [64]u8 = @as([64]u8, @splat(0)),
     pos: usize = 0,
     n: u16,
 

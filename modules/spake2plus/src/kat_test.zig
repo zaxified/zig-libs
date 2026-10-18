@@ -237,7 +237,7 @@ test "KAT: verifierFinish reproduces Z, V, TT, key schedule, confirmV, and K_sha
 // identityElement` — so its uncompressed SEC1 encoding is the fixed byte
 // pattern below (0x04 || 32 zero bytes || 31 zero bytes || 0x01), built
 // directly rather than via an unexported `P256` type from this module.
-const identity_share_v1: [65]u8 = [_]u8{0x04} ++ [_]u8{0} ** 32 ++ [_]u8{0} ** 31 ++ [_]u8{0x01};
+const identity_share_v1: [65]u8 = [_]u8{0x04} ++ @as([32]u8, @splat(0)) ++ @as([31]u8, @splat(0)) ++ [_]u8{0x01};
 
 test "proverFinish REJECTS an identity-element share_v (RFC 9383 §6 group-membership check)" {
     const vec = v.vectors[0];
@@ -397,7 +397,7 @@ test "the non-canonical guard is load-bearing: n+1 would otherwise alias onto 1"
     // primitive rather than as a claim: the group operation itself does not
     // distinguish `n+1` from `1`, so the canonical check is the only thing
     // that does.
-    var one = [_]u8{0} ** 32;
+    var one = @as([32]u8, @splat(0));
     one[31] = 1;
     const l_one = try api.computeL(one);
 
@@ -557,7 +557,7 @@ test "property: a mismatched password fails at the first confirmation, with no k
         hexN(32, vec.y),
         share_p,
         share_v,
-        [_]u8{0xab} ** 32,
+        @as([32]u8, @splat(0xab)),
     ));
 }
 
@@ -637,7 +637,7 @@ test "property: proverFinish REJECTS a shareV tampered to a different (but still
 // BoringSSL's Register()) split exactly 80 octets into two 40-octet halves;
 // anything longer is a caller error, not "use the first 80".
 test "computeW0W1 takes exactly 80 octets: 79 and 81 are refused" {
-    const buf = [_]u8{0x5a} ** 81;
+    const buf = @as([81]u8, @splat(0x5a));
     var out: spake2plus.W0W1 = undefined;
     try spake2plus.computeW0W1(&out, buf[0..80]);
     try std.testing.expectError(error.InvalidPbkdfOutputLength, spake2plus.computeW0W1(&out, buf[0..79]));
@@ -686,7 +686,7 @@ const WipeCheckAllocator = struct {
 // buffers, so the module must wipe them (the SPEC's own "freeing it is not
 // the same as zeroing it first").
 test "transcripts the module frees itself are zeroed first (ReleaseFast)" {
-    if (@import("builtin").mode != .ReleaseFast) return error.SkipZigTest;
+    if (@import("builtin").mode != .fast) return error.SkipZigTest;
     const vec = v.vectors[0];
     var wc: WipeCheckAllocator = .{ .child = std.testing.allocator };
     const a = wc.allocator();

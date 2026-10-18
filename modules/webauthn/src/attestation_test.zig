@@ -482,7 +482,7 @@ fn runAttestationScript(a: std.mem.Allocator, bytes: []const u8) !AttestationOut
     out.fmt_index = s.byte() % fuzz_formats.len;
     const fmt = fuzz_formats[out.fmt_index];
     const alg = fuzz_algs[s.byte() % fuzz_algs.len];
-    out.mode = @enumFromInt(s.byte() % @typeInfo(X5cMode).@"enum".fields.len);
+    out.mode = @fromBackingInt(@intCast(s.byte() % @typeInfo(X5cMode).@"enum".field_names.len));
 
     var raw: [512]u8 = undefined;
     const raw_len: usize = s.word() % (raw.len + 1);
@@ -607,8 +607,8 @@ test "corpus: every attestation script builds a distinct object, and what it bui
     // certificate modes, and `auth_data_octets` only when authData is assembled
     // rather than left at its collapsed default.
     var nonempty: usize = 0;
-    var fmts_seen = [_]bool{false} ** fuzz_formats.len;
-    var modes_seen = [_]bool{false} ** @typeInfo(X5cMode).@"enum".fields.len;
+    var fmts_seen = @as([fuzz_formats.len]bool, @splat(false));
+    var modes_seen = @as([@typeInfo(X5cMode)]bool, @splat(false)).@"enum".field_names.len;
     var x5c_octets: usize = 0;
     var auth_data_octets: usize = 0;
     for (attestation_seeds) |sd| {
@@ -620,7 +620,7 @@ test "corpus: every attestation script builds a distinct object, and what it bui
         defer arena.deinit();
         const out = try runAttestationScript(arena.allocator(), script[0..n]);
         fmts_seen[out.fmt_index] = true;
-        modes_seen[@intFromEnum(out.mode)] = true;
+        modes_seen[@backingInt(out.mode)] = true;
         x5c_octets += out.x5c_octets;
         auth_data_octets += out.auth_data_octets;
     }
@@ -637,7 +637,7 @@ test "corpus: every attestation script builds a distinct object, and what it bui
     // Measured 2026-09-07: 1 fmt, 1 mode and 0 x5c octets before the draws
     // were restructured — every seed produced the same object.
     try testing.expectEqual(fuzz_formats.len, fmts);
-    try testing.expectEqual(@typeInfo(X5cMode).@"enum".fields.len, modes);
+    try testing.expectEqual(@typeInfo(X5cMode).@"enum".field_names.len, modes);
     try testing.expectEqual(@as(usize, 2883), x5c_octets);
     try testing.expectEqual(@as(usize, 2808), auth_data_octets);
 }
@@ -686,7 +686,7 @@ test "the attestation fuzz harness reaches the certificate parser (reachability)
 
     // And the harness body itself runs to completion on fixed input — it does
     // not, for instance, bail out before it has built anything.
-    var smith: std.testing.Smith = .{ .in = &([_]u8{0x01} ** 64 ++ [_]u8{0x00} ** 1024) };
+    var smith: std.testing.Smith = .{ .in = &(@as([64]u8, @splat(0x01)) ++ @as([1024]u8, @splat(0x00))) };
     try fuzzVerifyAttestation({}, &smith);
 }
 
@@ -1092,34 +1092,34 @@ const RegistrationOutcome = struct {
 const registration_seeds = [_][]const u8{
     // The six accepting ceremonies: vector i, its own clientDataJSON, the real
     // rp_id, its own challenge, origin 0, neither `require_*` set.
-    seed("0000" ++ "00" ++ "00" ++ "00" ++ "00" ++ ("00" ** 32) ++ "00" ++ "01" ++ "01"),
-    seed("0100" ++ "00" ++ "00" ++ "01" ++ "00" ++ ("00" ** 32) ++ "00" ++ "01" ++ "01"),
-    seed("0200" ++ "00" ++ "00" ++ "02" ++ "00" ++ ("00" ** 32) ++ "00" ++ "01" ++ "01"),
-    seed("0300" ++ "00" ++ "00" ++ "03" ++ "00" ++ ("00" ** 32) ++ "00" ++ "01" ++ "01"),
-    seed("0400" ++ "00" ++ "00" ++ "04" ++ "00" ++ ("00" ** 32) ++ "00" ++ "01" ++ "01"),
-    seed("0500" ++ "00" ++ "00" ++ "05" ++ "00" ++ ("00" ** 32) ++ "00" ++ "01" ++ "01"),
+    seed("0000" ++ "00" ++ "00" ++ "00" ++ "00" ++ (strRepeat("00", 32)) ++ "00" ++ "01" ++ "01"),
+    seed("0100" ++ "00" ++ "00" ++ "01" ++ "00" ++ (strRepeat("00", 32)) ++ "00" ++ "01" ++ "01"),
+    seed("0200" ++ "00" ++ "00" ++ "02" ++ "00" ++ (strRepeat("00", 32)) ++ "00" ++ "01" ++ "01"),
+    seed("0300" ++ "00" ++ "00" ++ "03" ++ "00" ++ (strRepeat("00", 32)) ++ "00" ++ "01" ++ "01"),
+    seed("0400" ++ "00" ++ "00" ++ "04" ++ "00" ++ (strRepeat("00", 32)) ++ "00" ++ "01" ++ "01"),
+    seed("0500" ++ "00" ++ "00" ++ "05" ++ "00" ++ (strRepeat("00", 32)) ++ "00" ++ "01" ++ "01"),
     // ⭐ vector 2 with ANOTHER ceremony's clientDataJSON: the cross-ceremony
     // replay the §7.1 binding exists to refuse.
-    seed("0201" ++ "05" ++ "00" ++ "00" ++ "02" ++ "00" ++ ("00" ** 32) ++ "00" ++ "01" ++ "01"),
+    seed("0201" ++ "05" ++ "00" ++ "00" ++ "02" ++ "00" ++ (strRepeat("00", 32)) ++ "00" ++ "01" ++ "01"),
     // ⭐ vector 2 with its own ASSERTION clientDataJSON: type is webauthn.get.
-    seed("0202" ++ "00" ++ "00" ++ "02" ++ "00" ++ ("00" ** 32) ++ "00" ++ "01" ++ "01"),
+    seed("0202" ++ "00" ++ "00" ++ "02" ++ "00" ++ (strRepeat("00", 32)) ++ "00" ++ "01" ++ "01"),
     // A hand-assembled clientDataJSON: type index 0, origin index 0, 32 octets
     // of challenge.
-    seed("0003" ++ "20" ++ ("00" ** 32) ++ "00" ++ "00" ++ "00" ++ "00" ++ "00" ++ "00" ++ ("00" ** 32) ++ "00" ++ "01" ++ "01"),
+    seed("0003" ++ "20" ++ (strRepeat("00", 32)) ++ "00" ++ "00" ++ "00" ++ "00" ++ "00" ++ "00" ++ (strRepeat("00", 32)) ++ "00" ++ "01" ++ "01"),
     // ⭐ the WRONG rp_id: "example.com" against a zone signed for example.org.
-    seed("0000" ++ "01" ++ "00" ++ "00" ++ "00" ++ ("00" ** 32) ++ "00" ++ "01" ++ "01"),
+    seed("0000" ++ "01" ++ "00" ++ "00" ++ "00" ++ (strRepeat("00", 32)) ++ "00" ++ "01" ++ "01"),
     // ⭐ the WRONG expected origin: the confusable "https://example.org.evil.test".
-    seed("0000" ++ "00" ++ "00" ++ "00" ++ "00" ++ ("00" ** 32) ++ "01" ++ "01" ++ "01"),
+    seed("0000" ++ "00" ++ "00" ++ "00" ++ "00" ++ (strRepeat("00", 32)) ++ "01" ++ "01" ++ "01"),
     // ⭐ an expected challenge belonging to a DIFFERENT vector.
-    seed("0000" ++ "00" ++ "00" ++ "03" ++ "00" ++ ("00" ** 32) ++ "00" ++ "01" ++ "01"),
+    seed("0000" ++ "00" ++ "00" ++ "03" ++ "00" ++ (strRepeat("00", 32)) ++ "00" ++ "01" ++ "01"),
     // ⭐ a raw expected challenge of 32 zero octets: right length, wrong value.
-    seed("0000" ++ "00" ++ "01" ++ "00" ++ "20" ++ ("00" ** 32) ++ "00" ++ "01" ++ "01"),
+    seed("0000" ++ "00" ++ "01" ++ "00" ++ "20" ++ (strRepeat("00", 32)) ++ "00" ++ "01" ++ "01"),
     // ⭐ `require_user_verification` set, on a vector whose UV bit is what it is.
-    seed("0000" ++ "00" ++ "00" ++ "00" ++ "00" ++ ("00" ** 32) ++ "00" ++ "00" ++ "01"),
+    seed("0000" ++ "00" ++ "00" ++ "00" ++ "00" ++ (strRepeat("00", 32)) ++ "00" ++ "00" ++ "01"),
     // ⭐ `require_attestation` set: `none` attestation must then be refused.
-    seed("0000" ++ "00" ++ "00" ++ "00" ++ "00" ++ ("00" ** 32) ++ "00" ++ "01" ++ "00"),
+    seed("0000" ++ "00" ++ "00" ++ "00" ++ "00" ++ (strRepeat("00", 32)) ++ "00" ++ "01" ++ "00"),
     // Both flags set, on the x5c vector that can satisfy attestation.
-    seed("0200" ++ "00" ++ "00" ++ "02" ++ "00" ++ ("00" ** 32) ++ "00" ++ "00" ++ "00"),
+    seed("0200" ++ "00" ++ "00" ++ "02" ++ "00" ++ (strRepeat("00", 32)) ++ "00" ++ "00" ++ "00"),
     seed("00"), // one octet, cycled: the degenerate script
     seed(""), // the empty script: exactly what the collapsed harness ran
 };
@@ -1164,7 +1164,7 @@ test "the collapsed registration harness never reached its own oracle (regressio
     // directly, and only asks of the harness that its body "runs to
     // completion".
     inline for (.{ 0x00, 0x01, 0x02, 0x55, 0x7f, 0xff }) |filler| {
-        var smith: std.testing.Smith = .{ .in = &([_]u8{filler} ** 64 ++ [_]u8{0} ** 512) };
+        var smith: std.testing.Smith = .{ .in = &(@as([64]u8, @splat(filler)) ++ @as([512]u8, @splat(0))) };
         _ = smith.index(AllVectors.count); // the R1 first draw
         _ = smith.valueRangeAtMost(u8, 0, 3); // the clientData mode
         var chal: [32]u8 = undefined;
@@ -1205,9 +1205,9 @@ test "corpus: the registration scripts reach both verdicts, and the spread is pi
     var nonempty: usize = 0;
     var accepted: usize = 0;
     var refused: usize = 0;
-    var vectors_seen = [_]bool{false} ** AllVectors.count;
-    var modes_seen = [_]bool{false} ** 4;
-    var origins_seen = [_]bool{false} ** fuzz_origins.len;
+    var vectors_seen = @as([AllVectors.count]bool, @splat(false));
+    var modes_seen = @as([4]bool, @splat(false));
+    var origins_seen = @as([fuzz_origins.len]bool, @splat(false));
     for (registration_seeds) |sd| {
         var smith: std.testing.Smith = .{ .in = sd };
         var script: [256]u8 = undefined;
@@ -1269,7 +1269,7 @@ test "the registration fuzz harness reaches an accepted registration (reachabili
 
     // And the harness body itself runs to completion on fixed input.
     inline for (.{ 0x00, 0x01, 0x02, 0x55, 0x7f, 0xff }) |filler| {
-        var smith: std.testing.Smith = .{ .in = &([_]u8{filler} ** 64 ++ [_]u8{0} ** 512) };
+        var smith: std.testing.Smith = .{ .in = &(@as([64]u8, @splat(filler)) ++ @as([512]u8, @splat(0))) };
         try fuzzRegistrationBinding({}, &smith);
     }
 }
@@ -1367,7 +1367,7 @@ test "authData: extension data (ED) is parsed, and malformed extensions have tee
     const parsed = try webauthn.parseAuthenticatorData(a, reg);
     try testing.expect(parsed.flags.extension_data and parsed.flags.attested_credential_data);
     try testing.expectEqual(@as(u32, 0), parsed.sign_count);
-    try testing.expectEqualSlices(u8, &([_]u8{0xc1} ** 16), parsed.attested_credential_data.?.credential_id);
+    try testing.expectEqualSlices(u8, &(@as([16]u8, @splat(0xc1))), parsed.attested_credential_data.?.credential_id);
     var ext_buf: [fido2_reg_ext_hex.len / 2]u8 = undefined;
     try testing.expectEqualSlices(u8, try std.fmt.hexToBytes(&ext_buf, fido2_reg_ext_hex), parsed.extensions.?);
     // The raw map decodes to what python-fido2 read: credProtect = 2.
@@ -1453,8 +1453,8 @@ test "credential key: duplicate COSE labels are refused (re-audit F2)" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const n1 = [_]u8{0xC1} ** 256;
-    const n2 = [_]u8{0xD2} ** 256;
+    const n1 = @as([256]u8, @splat(0xC1));
+    const n2 = @as([256]u8, @splat(0xD2));
     const e = [_]u8{ 0x01, 0x00, 0x01 };
     const rsa_dup = [_]cbor.MapEntry{
         .{ .key = .{ .uint = 1 }, .value = .{ .uint = 3 } }, // kty: RSA
@@ -1612,7 +1612,7 @@ test "fido-u2f: x5c must hold exactly one element (re-audit F11 — §8.6 step 2
     arr[0] = .{ .bytes = leaf };
     arr[1] = .{ .bytes = &[_]u8{ 0xde, 0xad } };
     const att = [_]cbor.MapEntry{
-        .{ .key = .{ .text = "sig" }, .value = .{ .bytes = &[_]u8{0} ** 8 } },
+        .{ .key = .{ .text = "sig" }, .value = .{ .bytes = &@as([8]u8, @splat(0)) } },
         .{ .key = .{ .text = "x5c" }, .value = .{ .array = arr } },
     };
     const entries = [_]cbor.MapEntry{
@@ -1642,7 +1642,7 @@ test "x5c: an EMPTY array is refused rather than indexed (re-audit F10)" {
     for ([_][]const u8{ "packed", "fido-u2f" }) |fmt| {
         const att = [_]cbor.MapEntry{
             .{ .key = .{ .text = "alg" }, .value = .{ .negint = 6 } }, // -7 = ES256
-            .{ .key = .{ .text = "sig" }, .value = .{ .bytes = &[_]u8{0} ** 8 } },
+            .{ .key = .{ .text = "sig" }, .value = .{ .bytes = &@as([8]u8, @splat(0)) } },
             .{ .key = .{ .text = "x5c" }, .value = .{ .array = &.{} } },
         };
         const entries = [_]cbor.MapEntry{
@@ -1727,7 +1727,7 @@ test "packed x5c: the attStmt alg must agree with the certificate's own key (re-
             .fmt = "packed",
             .alg = wrong,
             .x5c = leaf,
-            .sig = &[_]u8{0} ** 8,
+            .sig = &@as([8]u8, @splat(0)),
             .auth_data = auth_data,
         });
         try testing.expectError(error.UnsupportedAlgorithm, webauthn.verifyAttestation(
@@ -1742,7 +1742,7 @@ test "packed x5c: the attStmt alg must agree with the certificate's own key (re-
         .fmt = "packed",
         .alg = cbor.cose.alg_es256,
         .x5c = leaf,
-        .sig = &[_]u8{0} ** 8,
+        .sig = &@as([8]u8, @splat(0)),
         .auth_data = auth_data,
     });
     const err = webauthn.verifyAttestation(a, honest, clientDataHash(&v.registration_client_data_json));
@@ -1763,7 +1763,7 @@ test "packed x5c: an attestation certificate below the RSA modulus floor is refu
         .fmt = "packed",
         .alg = webauthn.alg_rs256,
         .x5c = &vectors.weak_rsa_attestation_cert_der,
-        .sig = &[_]u8{0} ** 128,
+        .sig = &@as([128]u8, @splat(0)),
         .auth_data = auth_data,
     });
     try testing.expectError(error.InvalidKey, webauthn.verifyAttestation(
@@ -1830,7 +1830,7 @@ test "packed x5c: an EC attestation key on P-384 is UnsupportedAlgorithm under E
     // refused by curve, not handed to the P-256 verifier.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    try testing.expectError(error.UnsupportedAlgorithm, packedWith(arena.allocator(), cbor.cose.alg_es256, &fx.p384_attestation_cert_der, &([_]u8{0x30} ++ [_]u8{0} ** 7)));
+    try testing.expectError(error.UnsupportedAlgorithm, packedWith(arena.allocator(), cbor.cose.alg_es256, &fx.p384_attestation_cert_der, &([_]u8{0x30} ++ @as([7]u8, @splat(0)))));
 }
 
 test "packed x5c: the id-fido-gen-ce-aaguid extension must match authData's AAGUID and be an OCTET STRING" {
@@ -1842,7 +1842,7 @@ test "packed x5c: the id-fido-gen-ce-aaguid extension must match authData's AAGU
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const junk = [_]u8{0x30} ++ [_]u8{0} ** 7;
+    const junk = [_]u8{0x30} ++ @as([7]u8, @splat(0));
     try testing.expectError(error.AaguidExtensionMismatch, packedWith(a, cbor.cose.alg_es256, &fx.p256_wrong_aaguid_cert_der, &junk));
     try testing.expectError(error.InvalidCertificate, packedWith(a, cbor.cose.alg_es256, &fx.p256_aaguid_not_octet_string_cert_der, &junk));
 }
@@ -1856,22 +1856,22 @@ test "fido-u2f: a credential key on any curve but P-256 is InvalidKey" {
     defer arena.deinit();
     const a = arena.allocator();
     const v = vectors.fido_u2f_es256;
-    const key = try cbor.cose.encodeEc2Key(a, .{ .alg = cbor.cose.alg_es256, .crv = 8, .x = &([_]u8{0x11} ** 32), .y = &([_]u8{0x22} ** 32) });
+    const key = try cbor.cose.encodeEc2Key(a, .{ .alg = cbor.cose.alg_es256, .crv = 8, .x = &(@as([32]u8, @splat(0x11))), .y = &(@as([32]u8, @splat(0x22))) });
     const key_bytes = try cbor.encode(a, key, .{});
     var auth: std.ArrayList(u8) = .empty;
     var rp_hash: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash("example.org", &rp_hash, .{});
     try auth.appendSlice(a, &rp_hash);
     try auth.appendSlice(a, &.{ 0x41, 0, 0, 0, 0 }); // UP | AT, signCount 0
-    try auth.appendSlice(a, &([_]u8{0} ** 16)); // U2F AAGUID is all zero
+    try auth.appendSlice(a, &(@as([16]u8, @splat(0)))); // U2F AAGUID is all zero
     try auth.appendSlice(a, &.{ 0, 16 });
-    try auth.appendSlice(a, &([_]u8{0xc1} ** 16));
+    try auth.appendSlice(a, &(@as([16]u8, @splat(0xc1))));
     try auth.appendSlice(a, key_bytes);
     const obj = try buildAttestationObject(a, .{
         .fmt = "fido-u2f",
         .alg = cbor.cose.alg_es256,
         .x5c = try realX5c(a, &v.attestation_object),
-        .sig = &([_]u8{0x30} ++ [_]u8{0} ** 7),
+        .sig = &([_]u8{0x30} ++ @as([7]u8, @splat(0))),
         .auth_data = auth.items,
     });
     try testing.expectError(error.InvalidKey, webauthn.verifyAttestation(a, obj, clientDataHash(&v.registration_client_data_json)));
@@ -1881,7 +1881,7 @@ test "authData: an attested-credential header one octet short is Truncated, not 
     // §6.5.1: AT set means aaguid (16) + credentialIdLength (2) follow the
     // 37-octet header. With 54 octets the length field is cut in half; the
     // check is the only thing between it and a read past the buffer.
-    var raw = [_]u8{0} ** 55;
+    var raw = @as([55]u8, @splat(0));
     raw[32] = 0x41; // UP | AT
     try testing.expectError(error.Truncated, webauthn.parseAuthenticatorData(testing.allocator, raw[0..54]));
     try testing.expectError(error.Truncated, webauthn.parseAuthenticatorData(testing.allocator, raw[0..53]));
@@ -1893,7 +1893,7 @@ test "verifySignature: a key is used only with its own curve and algorithm" {
     // RS256 (here). Each valid signature is refused under a mismatch.
     const msg = "webauthn key/alg binding";
     const Ecdsa = std.crypto.sign.ecdsa.EcdsaP256Sha256;
-    const ekp = try Ecdsa.KeyPair.generateDeterministic([_]u8{7} ** Ecdsa.KeyPair.seed_length);
+    const ekp = try Ecdsa.KeyPair.generateDeterministic(@as([Ecdsa.KeyPair.seed_length]u8, @splat(7)));
     const epub = ekp.public_key.toUncompressedSec1();
     var der_buf: [Ecdsa.Signature.der_encoded_length_max]u8 = undefined;
     const der = (try ekp.sign(msg, null)).toDer(&der_buf);
@@ -1905,7 +1905,7 @@ test "verifySignature: a key is used only with its own curve and algorithm" {
     try testing.expectError(error.UnsupportedAlgorithm, webauthn.verifySignature(ec2_k1, cbor.cose.alg_es256, msg, der));
 
     const Ed25519 = std.crypto.sign.Ed25519;
-    const dkp = try Ed25519.KeyPair.generateDeterministic([_]u8{9} ** 32);
+    const dkp = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(9)));
     const dpub = dkp.public_key.toBytes();
     const dsig = (try dkp.sign(msg, null)).toBytes();
     const okp: webauthn.CoseKey = .{ .okp = .{ .alg = cbor.cose.alg_eddsa, .crv = cbor.cose.crv_ed25519, .x = &dpub } };
@@ -1927,4 +1927,16 @@ test "verifySignature: the RS256 credential floor is exactly 2048 bits" {
     try webauthn.verifySignature(k2048, webauthn.alg_rs256, fx.rsa_floor_msg, &fx.rsa2048_credential_sig);
     const k2047: webauthn.CoseKey = .{ .rsa = .{ .alg = webauthn.alg_rs256, .n = &fx.rsa2047_credential_n, .e = &fx.rsa2047_credential_e } };
     try testing.expectError(error.InvalidKey, webauthn.verifySignature(k2047, webauthn.alg_rs256, fx.rsa_floor_msg, &fx.rsa2047_credential_sig));
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

@@ -46,7 +46,7 @@ fn handshake(suite: dtls.CipherSuite, psk: []const u8, client: *Connection, serv
     const id = "device-042";
     client.* = try Connection.clientInit(.{ .role = .client, .psk_identity = id, .psk = psk, .cipher_suites = &.{suite} });
     server.* = try Connection.serverInit(.{ .role = .server, .psk_identity = id, .psk = psk, .cipher_suites = &.{suite} });
-    var csprng = std.Random.DefaultCsprng.init([_]u8{0x10} ** 32);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x10)));
     const rnd: dtls.Entropy = .{ .seeded_for_test = csprng.random() };
     var buf1: [1500]u8 = undefined;
     var buf2: [1500]u8 = undefined;

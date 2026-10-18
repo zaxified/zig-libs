@@ -146,7 +146,7 @@ pub const cmd_lut: [num_command_symbols]CmdLutElement = blk: {
 // Context lookup table (2048 bytes): context = lut[p1] | lut[256 + p2],
 // where lut = &table[mode << 9]. Modes: 0=LSB6, 1=MSB6, 2=UTF8, 3=SIGNED.
 fn rep(comptime v: u8, comptime n: usize) [n]u8 {
-    return [_]u8{v} ** n;
+    return @as([n]u8, @splat(v));
 }
 
 const lsb6_last: [256]u8 = blk: {
@@ -171,7 +171,7 @@ const utf8_last: [256]u8 = // stylua: ignore
         52, 52, 52, 52, 52, 48, 52, 52, 52, 52, 52, 24, 12, 28, 12, 12,
         12, 56, 60, 60, 60, 56, 60, 60, 60, 56, 60, 60, 60, 60, 60, 56,
         60, 60, 60, 60, 60, 56, 60, 60, 60, 60, 60, 24, 12, 28, 12, 0,
-    } ++ (.{ 0, 1 } ** 32) ++ (.{ 2, 3 } ** 32);
+    } ++ arrRepeat(u8, &.{ 0, 1 }, 32) ++ arrRepeat(u8, &.{ 2, 3 }, 32);
 
 /// 0x80..0xDF (continuation and two-byte lead bytes) are class 0, 0xE0..0xFF
 /// (three- and four-byte lead bytes) class 2. 0xD0..0xDF were class 2 until
@@ -220,4 +220,12 @@ test "context_lookup is libbrotli's _kBrotliContextLookupTable" {
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(&context_lookup, &digest, .{});
     try std.testing.expectEqualStrings("0e4abc034ef46244934d117f15876cd477d0fb2ac94a023093338e72e37f7ad9", &std.fmt.bytesToHex(digest, .lower));
+}
+
+/// Comptime array repetition; replaces the `**` operator removed in Zig 0.17.
+fn arrRepeat(comptime T: type, comptime unit: []const T, comptime n: usize) [unit.len * n]T {
+    @setEvalBranchQuota(n * unit.len * 2 + 1000);
+    var buf: [unit.len * n]T = undefined;
+    for (0..n) |i| @memcpy(buf[i * unit.len ..][0..unit.len], unit);
+    return buf;
 }

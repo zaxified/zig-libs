@@ -445,7 +445,7 @@ test "expectedRound: round 1000's own start instant round-trips to 1000, not 999
 /// By bilinearity `e(sig + T, Q) = e(sig, Q)` — the pairing equation
 /// literally cannot distinguish the two.
 fn cofactorTorsionPoint() !g1.Jacobian {
-    var comp = [_]u8{0} ** g1.compressed_bytes;
+    var comp = @as([g1.compressed_bytes]u8, @splat(0));
     comp[0] = 0x80; // compression flag set, sort = 0
     comp[g1.compressed_bytes - 1] = 4;
     const p = try g1.fromBytesCompressedUnchecked(comp);
@@ -685,7 +685,7 @@ test "chained positive control: the DST and the message order are load-bearing" 
 fn g2CofactorTorsionPoint() !g2.Jacobian {
     var x: u8 = 1;
     while (x < 255) : (x += 1) {
-        var comp = [_]u8{0} ** g2.compressed_bytes;
+        var comp = @as([g2.compressed_bytes]u8, @splat(0));
         comp[0] = 0x80;
         comp[g2.compressed_bytes - 1] = x;
         const pt = g2.fromBytesCompressedUnchecked(comp) catch continue;
@@ -856,7 +856,7 @@ const parse_seeds = [_][]const u8{
     parseSeed(
         \\{"public_key": "00", "period": 3, "genesis_time": 0, "hash": "52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f661792ba94600c84e971", "groupHash": "f477d5c89f21a17c863a7f937c6a6d15859414d2be09cd448d4279af331c5d3e", "schemeID": "bls-unchained-g1-rfc9380"}
     ), // a one-octet public key
-    parseSeed("{" ++ "[" ** 200), // 200 levels of unbalanced nesting
+    parseSeed("{" ++ strRepeat("[", 200)), // 200 levels of unbalanced nesting
     parseSeed("null"), // valid JSON that is not an object
     parseSeed("\x00\xff\xfe not json at all"), // non-UTF-8 bytes
     parseSeed(""), // the empty document: what the collapsed harness ran, every time
@@ -1349,4 +1349,16 @@ test "verifyRoundPoints rejects identity operands (total-forgery guard)" {
     // identity key outright), but a test cannot honestly claim to enforce it.
     try std.testing.expect(!verifyRoundPoints(g2.Affine.identity, 1, g1.Affine.generator));
     try std.testing.expect(!verifyRoundPoints(g2.Affine.generator, 1, g1.Affine.identity));
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

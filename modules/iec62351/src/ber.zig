@@ -238,8 +238,8 @@ const ber_seeds = [_][]const u8{
     fuzzSeed("30060201050500"), // SEQUENCE of two children
     fuzzSeed("a107060528ca220203"), // a context-constructed [1]
     fuzzSeed("601c80020780a107060528ca220203be0d280b06025101a005a803800105"), // a whole AARQ
-    fuzzSeed("048140" ++ ("aa" ** 64)), // long-form length, one length octet
-    fuzzSeed("04820040" ++ ("bb" ** 64)), // long-form length, two length octets
+    fuzzSeed("048140" ++ (strRepeat("aa", 64))), // long-form length, one length octet
+    fuzzSeed("04820040" ++ (strRepeat("bb", 64))), // long-form length, two length octets
     fuzzSeed("1f81020105"), // a multi-octet tag number
     fuzzSeed("0403aabb"), // a declared length past the end
     fuzzSeed("0484ffffffff"), // a length that cannot fit the buffer
@@ -278,4 +278,16 @@ fn fuzzRead(_: void, smith: *std.testing.Smith) !void {
             try testing.expect(child.encoded_len <= e.content.len);
         }
     }
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

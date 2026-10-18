@@ -135,7 +135,7 @@ test "HoK: non-matching presented cert -> HolderOfKeyMismatch" {
     var signed = try mintResponse(alloc, conf);
     defer signed.deinit(alloc);
 
-    const wrong = [_]u8{0x99} ** 32;
+    const wrong = @as([32]u8, @splat(0x99));
     var cfg = baseConfig(signed.key);
     cfg.subject_confirmation = .holder_of_key;
     cfg.presented_holder_cert_der = &wrong;

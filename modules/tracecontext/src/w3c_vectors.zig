@@ -621,7 +621,7 @@ pub const vectors = [_]Vector{
         .headers = &.{
             .{ .name = "traceparent", .value = "00-" ++ trace_id_a ++ "-" ++ parent_id_a ++ "-00" },
             .{ .name = "tracestate", .value = "foo=1" },
-            .{ .name = "tracestate", .value = "z" ** 257 ++ "=1" },
+            .{ .name = "tracestate", .value = strRepeat("z", 257) ++ "=1" },
         },
         .traceparent = .{ .preserved = trace_id_a },
         .tracestate = .absent,
@@ -681,3 +681,15 @@ pub const vectors = [_]Vector{
         .out_of_scope = reason_level2,
     },
 };
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
+}

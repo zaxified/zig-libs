@@ -86,7 +86,7 @@ test "glibc oracle: nameservers and attempts are the servers glibc tried, in its
     for (rec.servers) |fx| {
         const conf = config.parseResolvConf(fx.text);
         var ours: std.ArrayList([]const u8) = .empty;
-        const fallback = [_]netaddr.Ip{ .{ .v4 = .{ 127, 0, 0, 1 } }, .{ .v6 = [_]u8{0} ** 15 ++ [_]u8{1} } };
+        const fallback = [_]netaddr.Ip{ .{ .v4 = .{ 127, 0, 0, 1 } }, .{ .v6 = @as([15]u8, @splat(0)) ++ [_]u8{1} } };
         const servers = if (conf.servers().len > 0) conf.servers() else &fallback;
         for (0..conf.attempts) |_| for (servers) |s| try ours.append(a, try ipText(a, s));
 

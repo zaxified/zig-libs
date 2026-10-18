@@ -476,7 +476,7 @@ fn f4Pass(arm: F4Arm, sink: F4Sink, threads: usize, lines: usize) !F4Result {
 }
 
 test "bench (opt-in via ACCESSLOG_BENCH_F4): F4 Sink.log cost under concurrency" {
-    if (@import("builtin").mode == .Debug or std.testing.environ.getPosix("ACCESSLOG_BENCH_F4") == null) return error.SkipZigTest;
+    if (@import("builtin").mode == .debug or std.testing.environ.getPosix("ACCESSLOG_BENCH_F4") == null) return error.SkipZigTest;
     const reps = 7;
     const tcounts = [_]usize{ 1, 2, 4, 8 };
     const arms = comptime std.enums.values(F4Arm);

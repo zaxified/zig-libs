@@ -449,7 +449,7 @@ test "LogoutResponse: nested (second-level) StatusCode extracted, e.g. PartialLo
 test "Z1: Decrypted.deinit wipes the recovered NameID before its buffer is freed" {
     // ReleaseFast only — see `test_encutil.FreeScanner` for why the safe lanes
     // cannot observe this.
-    if (@import("builtin").mode != .ReleaseFast) return error.SkipZigTest;
+    if (@import("builtin").mode != .fast) return error.SkipZigTest;
 
     const alloc = testing.allocator;
     const sp = try enc.makeSpKey(0x510_ED01);

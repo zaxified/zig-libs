@@ -276,8 +276,8 @@ test "RFC 3394 §4.6 KAT — 256-bit KEK wraps 256-bit key data (n=4), byte-exac
 }
 
 test "unwrap fails closed: wrong KEK / corrupted ciphertext -> Unauthentic, output zeroed (with a correct-KEK positive control)" {
-    const kek = [_]u8{0x11} ** 16;
-    const key = [_]u8{0x22} ** 16;
+    const kek = @as([16]u8, @splat(0x11));
+    const key = @as([16]u8, @splat(0x22));
     var ct: [24]u8 = undefined;
     _ = try wrap(&kek, &key, &ct);
 
@@ -286,15 +286,15 @@ test "unwrap fails closed: wrong KEK / corrupted ciphertext -> Unauthentic, outp
     try std.testing.expectEqualSlices(u8, &key, try unwrap(&kek, &ct, &good_out));
 
     var out: [16]u8 = undefined;
-    const bad_kek = [_]u8{0x12} ** 16;
+    const bad_kek = @as([16]u8, @splat(0x12));
     try std.testing.expectError(error.Unauthentic, unwrap(&bad_kek, &ct, &out));
-    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 16), &out); // no partial-key leak
+    try std.testing.expectEqualSlices(u8, &(@as([16]u8, @splat(0))), &out); // no partial-key leak
 
     var corrupt = ct;
     corrupt[9] ^= 0x01;
     out = undefined;
     try std.testing.expectError(error.Unauthentic, unwrap(&kek, &corrupt, &out));
-    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 16), &out);
+    try std.testing.expectEqualSlices(u8, &(@as([16]u8, @splat(0))), &out);
 }
 
 // ── fuzz: `unwrap` on an attacker-controlled ciphertext ─────────────────────
@@ -453,13 +453,13 @@ fn probeRoundTrip(pt: []const u8, recovered_total: *usize) !void {
 /// The seed's LENGTH picks the semiblock count, so the corpus below is a set of
 /// lengths rather than a set of frames.
 const roundtrip_seeds = [_][]const u8{
-    testkit.fuzz.seed("A" ** 16), // n = 2, the floor
-    testkit.fuzz.seed("B" ** 24), // n = 3
-    testkit.fuzz.seed("C" ** 32), // n = 4
-    testkit.fuzz.seed("D" ** 17), // rounded down to n = 2
-    testkit.fuzz.seed("E" ** 100), // rounded down to n = 12
-    testkit.fuzz.seed("F" ** 248), // n = 31, the ceiling `wrap`'s output holds
-    testkit.fuzz.seed("G" ** 7), // below the floor: raised to n = 2
+    testkit.fuzz.seed(strRepeat("A", 16)), // n = 2, the floor
+    testkit.fuzz.seed(strRepeat("B", 24)), // n = 3
+    testkit.fuzz.seed(strRepeat("C", 32)), // n = 4
+    testkit.fuzz.seed(strRepeat("D", 17)), // rounded down to n = 2
+    testkit.fuzz.seed(strRepeat("E", 100)), // rounded down to n = 12
+    testkit.fuzz.seed(strRepeat("F", 248)), // n = 31, the ceiling `wrap`'s output holds
+    testkit.fuzz.seed(strRepeat("G", 7)), // below the floor: raised to n = 2
     testkit.fuzz.seed(""), // the only case this target used to run
 };
 
@@ -500,39 +500,39 @@ test "corpus: the round trip runs at the sizes the seeds name, count pinned" {
 }
 
 test "length + KEK validation (16/24/32-byte KEKs only), with positive controls" {
-    const kek = [_]u8{0} ** 16;
+    const kek = @as([16]u8, @splat(0));
     var buf: [64]u8 = undefined;
 
     // Positive controls: the same shapes succeed at the boundary.
-    _ = try wrap(&kek, &[_]u8{0} ** 16, &buf); // exactly 16 bytes: OK
+    _ = try wrap(&kek, &@as([16]u8, @splat(0)), &buf); // exactly 16 bytes: OK
     var ct: [24]u8 = undefined;
-    _ = try wrap(&kek, &[_]u8{0} ** 16, &ct);
+    _ = try wrap(&kek, &@as([16]u8, @splat(0)), &ct);
     var pt: [16]u8 = undefined;
     _ = try unwrap(&kek, &ct, &pt); // exactly 24 bytes: OK
 
     try std.testing.expectError(error.InvalidLength, wrap(&kek, &.{ 1, 2, 3 }, &buf)); // not a multiple of 8
-    try std.testing.expectError(error.InvalidLength, wrap(&kek, &[_]u8{0} ** 8, &buf)); // < 16
-    try std.testing.expectError(error.InvalidLength, unwrap(&kek, &[_]u8{0} ** 16, &buf)); // < 24
-    try std.testing.expectError(error.BufferTooSmall, wrap(&kek, &[_]u8{0} ** 16, buf[0..16]));
+    try std.testing.expectError(error.InvalidLength, wrap(&kek, &@as([8]u8, @splat(0)), &buf)); // < 16
+    try std.testing.expectError(error.InvalidLength, unwrap(&kek, &@as([16]u8, @splat(0)), &buf)); // < 24
+    try std.testing.expectError(error.BufferTooSmall, wrap(&kek, &@as([16]u8, @splat(0)), buf[0..16]));
     try std.testing.expectError(error.BufferTooSmall, unwrap(&kek, &ct, pt[0..8]));
     // Boundary: out short by exactly one byte must also be rejected, not just
     // a wildly-undersized buffer.
-    try std.testing.expectError(error.BufferTooSmall, wrap(&kek, &[_]u8{0} ** 16, buf[0..23]));
+    try std.testing.expectError(error.BufferTooSmall, wrap(&kek, &@as([16]u8, @splat(0)), buf[0..23]));
     try std.testing.expectError(error.BufferTooSmall, unwrap(&kek, &ct, pt[0..15]));
 
     // Every non-AES KEK width is refused; the three AES widths are accepted
     // (the 24-byte one since aes192, 2026-10-10).
     for ([_]usize{ 0, 8, 15, 17, 20, 23, 25, 31, 33, 48 }) |kl| {
-        const bad = [_]u8{0} ** 48;
-        try std.testing.expectError(error.UnsupportedKeyLength, wrap(bad[0..kl], &[_]u8{0} ** 16, &buf));
-        try std.testing.expectError(error.UnsupportedKeyLength, unwrap(bad[0..kl], &[_]u8{0} ** 24, &buf));
+        const bad = @as([48]u8, @splat(0));
+        try std.testing.expectError(error.UnsupportedKeyLength, wrap(bad[0..kl], &@as([16]u8, @splat(0)), &buf));
+        try std.testing.expectError(error.UnsupportedKeyLength, unwrap(bad[0..kl], &@as([24]u8, @splat(0)), &buf));
     }
     for ([_]usize{ 16, 24, 32 }) |kl| {
-        const good = [_]u8{0x42} ** 32;
+        const good = @as([32]u8, @splat(0x42));
         var c: [24]u8 = undefined;
-        _ = try wrap(good[0..kl], &[_]u8{0x5a} ** 16, &c);
+        _ = try wrap(good[0..kl], &@as([16]u8, @splat(0x5a)), &c);
         var p: [16]u8 = undefined;
-        try std.testing.expectEqualSlices(u8, &[_]u8{0x5a} ** 16, try unwrap(good[0..kl], &c, &p));
+        try std.testing.expectEqualSlices(u8, &@as([16]u8, @splat(0x5a)), try unwrap(good[0..kl], &c, &p));
     }
 }
 
@@ -545,13 +545,13 @@ test "F4 regression: wrap validates KEK width before writing plaintext into `out
     // `wrap`'s own module doc claims for the pair — would see its plaintext
     // sitting in `out` despite the reported failure (wave-2 audit finding
     // `aeskw` F4).
-    const kek20 = [_]u8{0} ** 20; // not an AES key width -> unsupported
-    const plaintext = [_]u8{0xAA} ** 16;
-    var out = [_]u8{0} ** 24;
+    const kek20 = @as([20]u8, @splat(0)); // not an AES key width -> unsupported
+    const plaintext = @as([16]u8, @splat(0xAA));
+    var out = @as([24]u8, @splat(0));
     try std.testing.expectError(error.UnsupportedKeyLength, wrap(&kek20, &plaintext, &out));
     // `out` must still be all-zero: the plaintext must never have been
     // copied in before the KEK width was validated.
-    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 24), &out);
+    try std.testing.expectEqualSlices(u8, &(@as([24]u8, @splat(0))), &out);
 }
 
 // Mutation run 2026-10-05: with the `% 8` check gone, `wrap` of a 17-octet
@@ -559,10 +559,10 @@ test "F4 regression: wrap validates KEK width before writing plaintext into `out
 // fed it an unaligned length >= 16. RFC 3394 §2: the key data is n 64-bit
 // blocks, n >= 2.
 test "wrap refuses key data that is not a whole number of 64-bit blocks" {
-    const kek = [_]u8{0x11} ** 16;
+    const kek = @as([16]u8, @splat(0x11));
     var out: [64]u8 = undefined;
     for ([_]usize{ 17, 20, 23, 25 }) |len| {
-        const pt = [_]u8{0x5a} ** 32;
+        const pt = @as([32]u8, @splat(0x5a));
         try std.testing.expectError(error.InvalidLength, wrap(&kek, pt[0..len], &out));
     }
 }
@@ -570,4 +570,16 @@ test "wrap refuses key data that is not a whole number of 64-bit blocks" {
 test {
     _ = @import("fuzz_test.zig");
     _ = @import("stackprobe_test.zig");
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

@@ -217,8 +217,8 @@ fn selectMidstates(
     const base = hashtype.baseType(hash_type);
     const anyone_can_pay = hashtype.isAnyoneCanPay(hash_type);
 
-    var hash_prevouts: [32]u8 = [_]u8{0} ** 32;
-    var hash_sequence: [32]u8 = [_]u8{0} ** 32;
+    var hash_prevouts: [32]u8 = @as([32]u8, @splat(0));
+    var hash_sequence: [32]u8 = @as([32]u8, @splat(0));
     if (!anyone_can_pay) {
         hash_prevouts = if (pre) |p| p.hash_prevouts else try hashPrevouts(allocator, transaction);
 
@@ -228,7 +228,7 @@ fn selectMidstates(
         }
     }
 
-    var hash_outputs: [32]u8 = [_]u8{0} ** 32;
+    var hash_outputs: [32]u8 = @as([32]u8, @splat(0));
     if (base != NONE and base != SINGLE) {
         hash_outputs = if (pre) |p| p.hash_outputs else try hashOutputs(allocator, transaction);
     } else if (base == SINGLE and input_index < transaction.vout.len) {
@@ -384,8 +384,8 @@ test "SIGHASH_SINGLE with a corresponding output hashes exactly that output (not
     var t: tx.Transaction = .{
         .version = 1,
         .vin = @constCast(&[_]tx.TxIn{
-            .{ .prevout = .{ .txid = [_]u8{0} ** 32, .vout = 0 }, .script_sig = &.{}, .sequence = 0 },
-            .{ .prevout = .{ .txid = [_]u8{1} ** 32, .vout = 0 }, .script_sig = &.{}, .sequence = 0 },
+            .{ .prevout = .{ .txid = @as([32]u8, @splat(0)), .vout = 0 }, .script_sig = &.{}, .sequence = 0 },
+            .{ .prevout = .{ .txid = @as([32]u8, @splat(1)), .vout = 0 }, .script_sig = &.{}, .sequence = 0 },
         }),
         .vout = @constCast(&[_]tx.TxOut{
             .{ .value = 111, .script_pubkey = &[_]u8{0xAA} },
@@ -418,8 +418,8 @@ test "SIGHASH_SINGLE with NO corresponding output preserves the historical bug: 
     var t: tx.Transaction = .{
         .version = 1,
         .vin = @constCast(&[_]tx.TxIn{
-            .{ .prevout = .{ .txid = [_]u8{0} ** 32, .vout = 0 }, .script_sig = &.{}, .sequence = 0 },
-            .{ .prevout = .{ .txid = [_]u8{1} ** 32, .vout = 0 }, .script_sig = &.{}, .sequence = 0 },
+            .{ .prevout = .{ .txid = @as([32]u8, @splat(0)), .vout = 0 }, .script_sig = &.{}, .sequence = 0 },
+            .{ .prevout = .{ .txid = @as([32]u8, @splat(1)), .vout = 0 }, .script_sig = &.{}, .sequence = 0 },
         }),
         .vout = @constCast(&[_]tx.TxOut{.{ .value = 100, .script_pubkey = &.{} }}),
         .witness = &.{},
@@ -427,29 +427,29 @@ test "SIGHASH_SINGLE with NO corresponding output preserves the historical bug: 
         .has_witness = false,
     };
     const mid = try midstates(testing.allocator, t, 1, SINGLE);
-    try testing.expectEqualSlices(u8, &([_]u8{0} ** 32), &mid.hash_outputs);
+    try testing.expectEqualSlices(u8, &(@as([32]u8, @splat(0))), &mid.hash_outputs);
     _ = &t;
 }
 
 test "ANYONECANPAY leaves hashPrevouts/hashSequence all-zero (not derived from vin at all)" {
     var t: tx.Transaction = .{
         .version = 1,
-        .vin = @constCast(&[_]tx.TxIn{.{ .prevout = .{ .txid = [_]u8{7} ** 32, .vout = 3 }, .script_sig = &.{}, .sequence = 99 }}),
+        .vin = @constCast(&[_]tx.TxIn{.{ .prevout = .{ .txid = @as([32]u8, @splat(7)), .vout = 3 }, .script_sig = &.{}, .sequence = 99 }}),
         .vout = @constCast(&[_]tx.TxOut{.{ .value = 5, .script_pubkey = &.{} }}),
         .witness = &.{},
         .locktime = 0,
         .has_witness = false,
     };
     const mid = try midstates(testing.allocator, t, 0, ALL | ANYONECANPAY);
-    try testing.expectEqualSlices(u8, &([_]u8{0} ** 32), &mid.hash_prevouts);
-    try testing.expectEqualSlices(u8, &([_]u8{0} ** 32), &mid.hash_sequence);
+    try testing.expectEqualSlices(u8, &(@as([32]u8, @splat(0))), &mid.hash_prevouts);
+    try testing.expectEqualSlices(u8, &(@as([32]u8, @splat(0))), &mid.hash_sequence);
     _ = &t;
 }
 
 test "input_index out of range is a typed error (midstates and sighash)" {
     var t: tx.Transaction = .{
         .version = 1,
-        .vin = @constCast(&[_]tx.TxIn{.{ .prevout = .{ .txid = [_]u8{0} ** 32, .vout = 0 }, .script_sig = &.{}, .sequence = 0 }}),
+        .vin = @constCast(&[_]tx.TxIn{.{ .prevout = .{ .txid = @as([32]u8, @splat(0)), .vout = 0 }, .script_sig = &.{}, .sequence = 0 }}),
         .vout = &.{},
         .witness = &.{},
         .locktime = 0,
@@ -466,9 +466,9 @@ test "B2: hashOutputs doesn't reallocate growing many outputs" {
     // `hashPrevouts`/`hashSequence`, which F2 already covered).
     const testutil = @import("testutil.zig");
     const n = 1024;
-    const spk = [_]u8{ 0x76, 0xa9, 0x14 } ++ [_]u8{0x42} ** 20 ++ [_]u8{ 0x88, 0xac }; // 25-byte P2PKH
+    const spk = [_]u8{ 0x76, 0xa9, 0x14 } ++ @as([20]u8, @splat(0x42)) ++ [_]u8{ 0x88, 0xac }; // 25-byte P2PKH
 
-    var vin_buf: [1]tx.TxIn = .{.{ .prevout = .{ .txid = [_]u8{0} ** 32, .vout = 0 }, .script_sig = &.{}, .sequence = 0xffffffff }};
+    var vin_buf: [1]tx.TxIn = .{.{ .prevout = .{ .txid = @as([32]u8, @splat(0)), .vout = 0 }, .script_sig = &.{}, .sequence = 0xffffffff }};
     var vout_buf: [n]tx.TxOut = undefined;
     for (0..n) |i| vout_buf[i] = .{ .value = 100, .script_pubkey = &spk };
     const t: tx.Transaction = .{

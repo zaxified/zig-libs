@@ -333,7 +333,7 @@ pub const Point = struct {
         const z_inv = p.z.invert() catch unreachable; // z is never 0 for a valid point
         const x_affine = p.x.mul(z_inv);
         const y_affine = p.y.mul(z_inv);
-        var out = [_]u8{0} ** 57;
+        var out = @as([57]u8, @splat(0));
         out[0..field.encoded_bytes].* = y_affine.toBytes();
         if (x_affine.isOdd()) out[56] |= 0x80;
         return out;
@@ -758,14 +758,14 @@ test "Signature round-trips through fromBytes/toBytes (REAL codec, no crypto cor
 }
 
 test "Signature.fromBytes rejects a non-canonical S (>= L)" {
-    var bytes = [_]u8{0} ** 114;
+    var bytes = @as([114]u8, @splat(0));
     bytes[57..114].* = scalar.l_bytes; // S == L itself: non-canonical
     try std.testing.expectError(error.NonCanonical, Signature.fromBytes(bytes));
 }
 
 test "absorbDom4 rejects an oversized context (REAL)" {
     var hasher = Shake256.init(.{});
-    const too_long = [_]u8{0} ** 256;
+    const too_long = @as([256]u8, @splat(0));
     try std.testing.expectError(error.ContextTooLong, absorbDom4(&hasher, 0, &too_long));
 }
 
@@ -809,7 +809,7 @@ test "Point encode/decode round-trip: base point, its double, and its negation (
         try std.testing.expectEqualSlices(u8, &enc, &dec.toBytes());
     }
     // Identity: (0, 1), sign bit clear.
-    var id_enc = [_]u8{0} ** 57;
+    var id_enc = @as([57]u8, @splat(0));
     id_enc[0] = 1;
     try std.testing.expectEqualSlices(u8, &id_enc, &Point.identityElement.toBytes());
     try std.testing.expect((try Point.fromBytes(id_enc)).equivalent(Point.identityElement));
@@ -817,7 +817,7 @@ test "Point encode/decode round-trip: base point, its double, and its negation (
 
 test "Point.fromBytes rejects non-canonical and invalid encodings" {
     // y == p (non-canonical field element), sign bit clear.
-    var p_enc = [_]u8{0} ** 57;
+    var p_enc = @as([57]u8, @splat(0));
     p_enc[0..field.encoded_bytes].* = field.p_bytes;
     try std.testing.expectError(error.NonCanonical, Point.fromBytes(p_enc));
 
@@ -827,13 +827,13 @@ test "Point.fromBytes rejects non-canonical and invalid encodings" {
     try std.testing.expectError(error.InvalidEncoding, Point.fromBytes(pad_enc));
 
     // x == 0 with sign bit set: the identity's "negative" does not exist.
-    var neg_id = [_]u8{0} ** 57;
+    var neg_id = @as([57]u8, @splat(0));
     neg_id[0] = 1;
     neg_id[56] = 0x80;
     try std.testing.expectError(error.InvalidEncoding, Point.fromBytes(neg_id));
 
     // y == 2 is not on the curve (u/v is a non-residue for it).
-    var off_curve = [_]u8{0} ** 57;
+    var off_curve = @as([57]u8, @splat(0));
     off_curve[0] = 2;
     try std.testing.expectError(error.InvalidEncoding, Point.fromBytes(off_curve));
 }
@@ -860,9 +860,9 @@ test "RFC 8032 §7.4 Ed448 test vector (empty message): keygen public key, byte-
 }
 
 test "SecretKey.deinit zeroizes the 57-byte seed (regression: fails if secureZero is removed)" {
-    var sk = SecretKey.fromBytes([_]u8{0xab} ** 57);
+    var sk = SecretKey.fromBytes(@as([57]u8, @splat(0xab)));
     sk.deinit();
-    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 57), &sk.bytes);
+    try std.testing.expectEqualSlices(u8, &(@as([57]u8, @splat(0))), &sk.bytes);
 }
 
 test "KeyPair.deinit zeroizes secret_key.bytes but leaves public_key untouched (regression)" {
@@ -872,7 +872,7 @@ test "KeyPair.deinit zeroizes secret_key.bytes but leaves public_key untouched (
         "528c8a3fcc2f044e39a3fc5b94492f8f" ++
         "032e7549a20098f95b");
     var kp = KeyPair.create(&seed);
-    const zero: [57]u8 = [_]u8{0} ** 57;
+    const zero: [57]u8 = @as([57]u8, @splat(0));
     try std.testing.expect(!std.mem.eql(u8, &kp.secret_key.bytes, &zero));
     kp.deinit();
     try std.testing.expectEqualSlices(u8, &zero, &kp.secret_key.bytes);
@@ -944,7 +944,7 @@ test "verify rejects an identity public key (universal forgery)" {
     // hand these bytes straight in.
     const id_bytes = Point.identityElement.toBytes();
     const pk = PublicKey.fromBytes(id_bytes);
-    const sig: Signature = .{ .r = id_bytes, .s = [_]u8{0} ** 57 };
+    const sig: Signature = .{ .r = id_bytes, .s = @as([57]u8, @splat(0)) };
 
     for ([_][]const u8{ "", "any message at all", "a completely different one" }) |msg| {
         try std.testing.expectError(error.SignatureVerificationFailed, verify(sig, msg, "", pk));
@@ -952,7 +952,7 @@ test "verify rejects an identity public key (universal forgery)" {
 
     // A genuine signature must still verify — the guard must not be a blanket
     // rejection that would make this test pass for the wrong reason.
-    const kp = KeyPair.create(&([_]u8{7} ** 57));
+    const kp = KeyPair.create(&(@as([57]u8, @splat(7))));
     const good = try sign(&kp, "hello", "");
     try verify(good, "hello", "", kp.public_key);
 
@@ -961,7 +961,7 @@ test "verify rejects an identity public key (universal forgery)" {
     // R = O. Here S = 1, R = B. (An earlier note here called the two guards
     // "not independently pinnable" because the pair above needs both; the
     // 2026-10-04 mutation run left the A' guard's removal alive.)
-    var one = [_]u8{0} ** 57;
+    var one = @as([57]u8, @splat(0));
     one[0] = 1;
     const sig_b: Signature = .{ .r = Point.basePoint.toBytes(), .s = one };
     for ([_][]const u8{ "", "any message at all" }) |msg| {
@@ -997,7 +997,7 @@ test "verify rejects a small-order R even from the key holder (this module's pol
     // S = k·s). `verifyInternal` refuses small-order R before the equation as
     // defence in depth; this pins that choice. Without the guard both sides
     // of the cofactored equation are the identity and it verifies.
-    const kp = KeyPair.create(&([_]u8{7} ** 57));
+    const kp = KeyPair.create(&(@as([57]u8, @splat(7))));
     const r_bytes = Point.identityElement.toBytes();
     const k = scalar.reduceWide(try shake114(0, "", &.{ &r_bytes, &kp.public_key.bytes, "hello" }));
     const sig: Signature = .{ .r = r_bytes, .s = scalar.mulAdd(k, testSecretScalar(kp), scalar.zero) };
@@ -1014,7 +1014,7 @@ test "verify is cofactored: an order-4 component on R is accepted (RFC 8032 §5.
     try std.testing.expect(t4.clearCofactor().equivalent(Point.identityElement));
     try std.testing.expect(!t4.dbl().equivalent(Point.identityElement));
 
-    const kp = KeyPair.create(&([_]u8{5} ** 57));
+    const kp = KeyPair.create(&(@as([57]u8, @splat(5))));
     var r = scalar.zero;
     r[0] = 42;
     const r_bytes = Point.mulBasePoint(r).add(t4).toBytes();
@@ -1027,7 +1027,7 @@ test "verify rejects S >= L in a Signature built field by field (RFC 8032 §5.2.
     // S + L is the same scalar mod L, so without the range check inside
     // verify the equation holds: a second valid encoding of one signature.
     // `Signature.fromBytes` rejects it, but the struct's fields are public.
-    const kp = KeyPair.create(&([_]u8{9} ** 57));
+    const kp = KeyPair.create(&(@as([57]u8, @splat(9))));
     const good = try sign(&kp, "msg", "");
     try verify(good, "msg", "", kp.public_key);
 
@@ -1056,11 +1056,11 @@ test "Point.equivalent tells P from -P" {
 
 test "a context of exactly 255 octets signs and verifies (RFC 8032 §5.2)" {
     // RFC 8032 §5.2: the context is "an octet string of at most 255 octets".
-    const ctx = [_]u8{0xab} ** max_context_length;
-    const kp = KeyPair.create(&([_]u8{3} ** 57));
+    const ctx = @as([max_context_length]u8, @splat(0xab));
+    const kp = KeyPair.create(&(@as([57]u8, @splat(3))));
     const sig = try sign(&kp, "m", &ctx);
     try verify(sig, "m", &ctx, kp.public_key);
-    try std.testing.expectError(error.ContextTooLong, sign(&kp, "m", &([_]u8{0xab} ** (max_context_length + 1))));
+    try std.testing.expectError(error.ContextTooLong, sign(&kp, "m", &(@as([max_context_length + 1]u8, @splat(0xab)))));
 }
 
 // ── the RNG seam (entropy re-audit 2026-08-13) ──────────────────────────────

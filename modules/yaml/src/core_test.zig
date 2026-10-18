@@ -249,7 +249,7 @@ test "emit: a long key takes the explicit form (implicit keys stop at 1024 chara
     // 150 control characters escape to 600 characters plus quotes: fine as
     // an implicit key on its own, but the emitter's bound (100 source bytes,
     // so even 10-character escapes stay under 1024) sends it to `? `.
-    const key = "\x01" ** 150;
+    const key = strRepeat("\x01", 150);
     const pairs = [_]Pair{.{ .key = .{ .string = key }, .value = .{ .int = 1 } }};
     const text = try yaml.stringify(a, .{ .mapping = &pairs });
     defer a.free(text);
@@ -288,7 +288,7 @@ test "emit: an aliased KEY keeps a space before ':' (an alias name may contain '
     const a = testing.allocator;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
-    const long = "k" ** 40; // 32+ bytes: shared strings are anchored too
+    const long = strRepeat("k", 40); // 32+ bytes: shared strings are anchored too
     const src = "a: {&k " ++ long ++ ": 1}\nb: {*k : 2}\nc: [{? {*k : 3} : 4}]\n";
     const docs = try yaml.composeAllLeaky(arena.allocator(), src, .{});
     const text = try yaml.stringify(a, docs[0]);
@@ -296,4 +296,16 @@ test "emit: an aliased KEY keeps a space before ':' (an alias name may contain '
     try testing.expect(std.mem.indexOf(u8, text, "*a1 :") != null);
     const back = try yaml.composeAllLeaky(arena.allocator(), text, .{});
     try testing.expect(yaml.valueEql(docs[0], back[0]));
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

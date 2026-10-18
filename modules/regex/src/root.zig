@@ -1429,7 +1429,7 @@ test "Unicode classes: categories, scripts, aliases, loose names, negation, fold
     const ident = comptime comptimeCompile("\\p{L}[\\p{L}\\p{N}_]*");
     try testing.expect(ident.fullMatch("π_2ž"));
     try testing.expect(!ident.fullMatch("2π"));
-    var many = try Regex.compile(testing.allocator, "\\p{L}" ** 12);
+    var many = try Regex.compile(testing.allocator, strRepeat("\\p{L}", 12));
     defer many.deinit(testing.allocator);
     try testing.expect(many.ranges.len < 2 * 1000);
 }
@@ -1620,7 +1620,7 @@ test "the backtracker and the Pike VM agree on long texts, past the bit budget a
     // handed to the Pike VM and still answers.
     var deep = try Regex.compile(gpa, "((?:a|b))*c");
     defer deep.deinit(gpa);
-    const long = "a" ** 20_000 ++ "c";
+    const long = strRepeat("a", 20_000) ++ "c";
     try testing.expect(deep.insts.len * long.len < Matcher.max_backtrack_bits); // the bits fit,
     var dm = try Matcher.init(gpa, &deep);
     defer dm.deinit();
@@ -1708,7 +1708,7 @@ test "the backtracker's window: an exploration that reaches its very end is hand
     var src: [80]u8 = undefined;
     var found = false;
     for (1..60) |k| {
-        const p = try std.fmt.bufPrint(&src, "a[ab]*{s}", .{("c" ** 60)[0..k]});
+        const p = try std.fmt.bufPrint(&src, "a[ab]*{s}", .{(strRepeat("c", 60))[0..k]});
         var re = try Regex.compile(gpa, p);
         defer re.deinit(gpa);
         const n = re.insts.len;
@@ -1722,7 +1722,7 @@ test "the backtracker's window: an exploration that reaches its very end is hand
         defer m.deinit();
         try testing.expectEqual(@as(?Span, null), m.find(text, 0));
         // Followed by a match: found, by the Pike VM, from where the walk stopped.
-        @memcpy(text[text.len - k ..], ("c" ** 60)[0..k]);
+        @memcpy(text[text.len - k ..], (strRepeat("c", 60))[0..k]);
         try testing.expectEqual(@as(?Span, .{ .start = 0, .end = text.len }), m.find(text, 0));
     }
     try testing.expect(found);
@@ -1843,7 +1843,7 @@ test "syntax errors" {
 test "linear time: the classic exponential backtracking case is instant" {
     var re = try Regex.compile(testing.allocator, "(a+)+$");
     defer re.deinit(testing.allocator);
-    const input = "a" ** 5000 ++ "b";
+    const input = strRepeat("a", 5000) ++ "b";
     try testing.expect(!re.isMatch(input));
     try testing.expect((try re.find(testing.allocator, input)) == null);
 }
@@ -1936,7 +1936,7 @@ test "prefilter: anchoring and first bytes worked out from the program" {
         .{ .p = "INV-\\d|INV-x", .lit = "INV-" },
         .{ .p = "(?i)abc", .lit = "" },
         .{ .p = "a\\x{fffd}b", .lit = "a" }, // U+FFFD also matches an invalid byte
-        .{ .p = "x" ** 40, .lit = "x" ** 16 },
+        .{ .p = strRepeat("x", 40), .lit = strRepeat("x", 16) },
     }) |c| {
         var re = try Regex.compile(testing.allocator, c.p);
         defer re.deinit(testing.allocator);
@@ -1977,15 +1977,15 @@ test "compile: a pattern past the stack builder's capacity takes the full one" {
     var re = try Regex.compile(testing.allocator, "a{600}");
     defer re.deinit(testing.allocator);
     try testing.expect(re.insts.len > small_capacity.insts);
-    try testing.expect(re.fullMatch("a" ** 600));
+    try testing.expect(re.fullMatch(strRepeat("a", 600)));
     try testing.expectError(error.PatternTooLarge, Regex.compile(testing.allocator, "a{1000}b{1000}"));
 }
 
 test "deep nesting compiles (or is refused) on a 512 KiB thread stack" {
     const Run = struct {
         fn go(out: *[2]?anyerror) void {
-            const deep = "(?:" ** (max_depth - 1) ++ "a*" ++ ")" ** (max_depth - 1);
-            const deeper = "(?:" ** (max_depth + 1) ++ "a" ++ ")" ** (max_depth + 1);
+            const deep = strRepeat("(?:", max_depth - 1) ++ "a*" ++ strRepeat(")", max_depth - 1);
+            const deeper = strRepeat("(?:", max_depth + 1) ++ "a" ++ strRepeat(")", max_depth + 1);
             var b = std.heap.page_allocator.create(Builder) catch unreachable;
             defer std.heap.page_allocator.destroy(b);
             out[0] = if (b.compile(deep)) |_| null else |e| e;
@@ -2004,4 +2004,16 @@ test "nested counted repetitions multiply, as Go limits them — no compile-time
     try testing.expectError(error.InvalidRepeatSize, Regex.compile(testing.allocator, "(?:a{2}|b{600}){2}"));
     var ok = try Regex.compile(testing.allocator, "(?:(?:a{0}){100}){10}");
     ok.deinit(testing.allocator);
+}
+
+/// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
+fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    const rep_result = comptime blk: {
+        @setEvalBranchQuota(n * 2 + 1000);
+        var buf: [s.len * n:0]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const rep_final = buf;
+        break :blk rep_final;
+    };
+    return &rep_result;
 }

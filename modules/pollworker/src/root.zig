@@ -145,19 +145,19 @@ pub fn JobTable(comptime N: usize, comptime Job: type) type {
         pub const OnDone = *const fn (job: *Job) void;
 
         const Slot = struct {
-            state: std.atomic.Value(u8) = std.atomic.Value(u8).init(@intFromEnum(State.free)),
+            state: std.atomic.Value(u8) = std.atomic.Value(u8).init(@backingInt(State.free)),
             job: Job = undefined,
         };
 
-        slots: [N]Slot = [_]Slot{.{}} ** N,
+        slots: [N]Slot = @as([N]Slot, @splat(.{})),
 
         /// Reserve a FREE slot and mark it RUNNING; returns a pointer to its Job
         /// for the caller/worker to populate, or null when all slots are busy.
         /// Loop-thread only. The returned Job is NOT zeroed — the caller owns it.
         pub fn claim(self: *Self) ?*Job {
             for (&self.slots) |*s| {
-                if (s.state.load(.acquire) != @intFromEnum(State.free)) continue;
-                s.state.store(@intFromEnum(State.running), .release);
+                if (s.state.load(.acquire) != @backingInt(State.free)) continue;
+                s.state.store(@backingInt(State.running), .release);
                 return &s.job;
             }
             return null;
@@ -169,7 +169,7 @@ pub fn JobTable(comptime N: usize, comptime Job: type) type {
         pub fn finish(self: *Self, job: *Job) void {
             _ = self;
             const slot: *Slot = @fieldParentPtr("job", job);
-            slot.state.store(@intFromEnum(State.done), .release);
+            slot.state.store(@backingInt(State.done), .release);
         }
 
         /// Loop-thread rollback: return a claimed-but-unused slot to FREE without
@@ -177,16 +177,16 @@ pub fn JobTable(comptime N: usize, comptime Job: type) type {
         pub fn release(self: *Self, job: *Job) void {
             _ = self;
             const slot: *Slot = @fieldParentPtr("job", job);
-            slot.state.store(@intFromEnum(State.free), .release);
+            slot.state.store(@backingInt(State.free), .release);
         }
 
         /// Reap every DONE slot: call `on_done(&job)` then recycle it to FREE.
         /// Loop-thread only.
         pub fn drain(self: *Self, on_done: OnDone) void {
             for (&self.slots) |*s| {
-                if (s.state.load(.acquire) != @intFromEnum(State.done)) continue;
+                if (s.state.load(.acquire) != @backingInt(State.done)) continue;
                 on_done(&s.job);
-                s.state.store(@intFromEnum(State.free), .release);
+                s.state.store(@backingInt(State.free), .release);
             }
         }
 
@@ -194,7 +194,7 @@ pub fn JobTable(comptime N: usize, comptime Job: type) type {
         pub fn busy(self: *const Self) usize {
             var n: usize = 0;
             for (&self.slots) |*s| {
-                if (s.state.load(.acquire) != @intFromEnum(State.free)) n += 1;
+                if (s.state.load(.acquire) != @backingInt(State.free)) n += 1;
             }
             return n;
         }

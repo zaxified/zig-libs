@@ -195,7 +195,7 @@ pub fn main() !void {
     // KE1 decoder meets. `error.InvalidPublicKey` fires before any DH
     // computation, at `voprf.Element.fromBytes`'s canonical-decode check.
     var ke1_bad = ke1_res_2.ke1;
-    ke1_bad.auth_request.client_public_keyshare = [_]u8{0xff} ** opq.Npk;
+    ke1_bad.auth_request.client_public_keyshare = @as([opq.Npk]u8, @splat(0xff));
     var scratch_ke2: opq.GenerateKE2Result = undefined;
     if (opq.generateKE2(
         &server_kp.private_key,

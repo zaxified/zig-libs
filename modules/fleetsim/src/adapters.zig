@@ -113,7 +113,7 @@ pub const Modbus = struct {
     /// perform the requested action" — the closest thing Modbus has to
     /// "I am broken", and what a fault-injection run wants a master to see.
     fn troubleReply(self: *Modbus, adu: []const u8, out: []u8) NodeError!?[]const u8 {
-        const failure: u8 = @intFromEnum(modbus.ExceptionCode.server_device_failure);
+        const failure: u8 = @backingInt(modbus.ExceptionCode.server_device_failure);
         switch (self.server.config.framing) {
             .tcp => {
                 const frame = modbus.tcp.decodeAdu(adu) catch return null;
@@ -937,7 +937,7 @@ test "modbus adapter: a real read round-trips, and trouble turns it into 0x04" {
 }
 
 test "modbus adapter: restart returns counters and listen-only mode to as-built" {
-    var coils = [_]bool{false} ** 8;
+    var coils = @as([8]bool, @splat(false));
     var slave = Modbus.init(
         .{ .unit_id = 1, .framing = .rtu },
         .{ .coils = .{ .base = 0, .values = &coils } },
@@ -954,8 +954,8 @@ test "modbus adapter: restart returns counters and listen-only mode to as-built"
 }
 
 test "dnp3 adapter: a link-layer reset gets a link-layer answer; restart re-arms IIN1.7" {
-    var binaries = [_]dnp3.outstation.BinaryInput{.{ .value = true, .class = .class1 }} ** 4;
-    var analogs = [_]dnp3.outstation.AnalogInput{.{ .value = 7, .class = .class2 }} ** 2;
+    var binaries = @as([4]dnp3.outstation.BinaryInput, @splat(.{ .value = true, .class = .class1 }));
+    var analogs = @as([2]dnp3.outstation.AnalogInput, @splat(.{ .value = 7, .class = .class2 }));
     var event_storage: [16]dnp3.outstation.Event = undefined;
     var rx_buf: [512]u8 = undefined;
     var scratch: [512]u8 = undefined;
@@ -975,7 +975,7 @@ test "dnp3 adapter: a link-layer reset gets a link-layer answer; restart re-arms
     // RESET_LINK_STATES (function 0, PRM=1) must be ACKed.
     var frame_buf: [64]u8 = undefined;
     const reset = try dnp3.link.encodeFrame(
-        .{ .dir = true, .prm = true, .function = @intFromEnum(dnp3.link.PrimaryFunction.reset_link_states) },
+        .{ .dir = true, .prm = true, .function = @backingInt(dnp3.link.PrimaryFunction.reset_link_states) },
         1024,
         1,
         &.{},
@@ -1018,7 +1018,7 @@ test "iec104 adapter: STARTDT act is answered STARTDT con through the shim" {
 }
 
 test "s7comm adapter: a COTP connect is answered, and STOP is visible as trouble" {
-    var db1 = [_]u8{0} ** 32;
+    var db1 = @as([32]u8, @splat(0));
     const areas = [_]s7comm.AreaBinding{.{ .area = .db, .db_number = 1, .bytes = &db1 }};
     var plc = S7comm.init(.{}, &areas);
     const n = plc.node();
@@ -1040,7 +1040,7 @@ test "s7comm adapter: a COTP connect is answered, and STOP is visible as trouble
 }
 
 test "s7comm adapter: garbage is dropped silently, never answered" {
-    var db1 = [_]u8{0} ** 8;
+    var db1 = @as([8]u8, @splat(0));
     const areas = [_]s7comm.AreaBinding{.{ .area = .db, .db_number = 1, .bytes = &db1 }};
     var plc = S7comm.init(.{}, &areas);
     const n = plc.node();
@@ -1049,14 +1049,14 @@ test "s7comm adapter: garbage is dropped silently, never answered" {
 }
 
 test "enip adapter: RegisterSession round-trips and restart clears the handle" {
-    var tag_bytes = [_]u8{0} ** 8;
+    var tag_bytes = @as([8]u8, @splat(0));
     const tags = [_]enip.TagBinding{.{ .name = "Speed", .type = .dint, .bytes = &tag_bytes }};
     var dev = Enip.init(.{}, &tags);
     const n = dev.node();
 
     var out: [512]u8 = undefined;
     var req: [28]u8 = @splat(0);
-    std.mem.writeInt(u16, req[0..2], @intFromEnum(enip.Command.register_session), .little);
+    std.mem.writeInt(u16, req[0..2], @backingInt(enip.Command.register_session), .little);
     std.mem.writeInt(u16, req[2..4], 4, .little);
     std.mem.writeInt(u16, req[24..26], 1, .little); // protocol version
     const reply = (try n.deliver(&req, &out, 0)).?;
@@ -1068,7 +1068,7 @@ test "enip adapter: RegisterSession round-trips and restart clears the handle" {
 }
 
 test "enip adapter: trouble sets the Identity status word and refuses CIP with 0x10" {
-    var tag_bytes = [_]u8{0} ** 8;
+    var tag_bytes = @as([8]u8, @splat(0));
     const tags = [_]enip.TagBinding{.{ .name = "Speed", .type = .dint, .bytes = &tag_bytes }};
     var dev = Enip.init(.{}, &tags);
     const n = dev.node();
@@ -1076,7 +1076,7 @@ test "enip adapter: trouble sets the Identity status word and refuses CIP with 0
 
     // Register a session first, so the CIP path is reachable.
     var reg: [28]u8 = @splat(0);
-    std.mem.writeInt(u16, reg[0..2], @intFromEnum(enip.Command.register_session), .little);
+    std.mem.writeInt(u16, reg[0..2], @backingInt(enip.Command.register_session), .little);
     std.mem.writeInt(u16, reg[2..4], 4, .little);
     std.mem.writeInt(u16, reg[24..26], 1, .little);
     _ = (try n.deliver(&reg, &out, 0)).?;
@@ -1085,7 +1085,7 @@ test "enip adapter: trouble sets the Identity status word and refuses CIP with 0
     // An unconnected Get_Attributes_All on the Identity object, healthy.
     var cip_buf: [32]u8 = undefined;
     const cip_req = try enip.cip.getAttributesAll(
-        @intFromEnum(enip.cip.ClassCode.identity),
+        @backingInt(enip.cip.ClassCode.identity),
         1,
         &cip_buf,
     );
@@ -1112,7 +1112,7 @@ test "enip adapter: trouble sets the Identity status word and refuses CIP with 0
 
     // … ListIdentity still answers, and reports the fault …
     var li: [24]u8 = @splat(0);
-    std.mem.writeInt(u16, li[0..2], @intFromEnum(enip.Command.list_identity), .little);
+    std.mem.writeInt(u16, li[0..2], @backingInt(enip.Command.list_identity), .little);
     const ident_reply = (try n.deliver(&li, &out, 0)).?;
     try testing.expect(std.mem.indexOfScalar(
         u8,

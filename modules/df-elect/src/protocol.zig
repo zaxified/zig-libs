@@ -984,7 +984,7 @@ fn dupDelay(d: checks.Duplicate, trace: []const netsim.FaultEvent) Time {
 test "real: fuzzed partitions, cuts, crashes, clock jumps — split-horizon never, duplicates only in the heal window, zero-DF bounded" {
     if (!gate.fable_core_implemented) return error.SkipZigTest;
     const gpa = testing.allocator;
-    const seeds: u64 = if (@import("builtin").mode == .Debug) 120 else 400;
+    const seeds: u64 = if (@import("builtin").mode == .debug) 120 else 400;
     for (algorithms) |alg| {
         var df = try DfElect.init(gpa, NODE_N, .{ .algorithm = alg });
         defer df.deinit(gpa);
@@ -1073,8 +1073,8 @@ test "malformed inbound frames are dropped and counted, and never crash the node
     const cases = [_][]const u8{
         &.{}, // empty: tagOf out of bounds
         &.{7}, // undefined tag byte: "invalid enum value"
-        &.{@intFromEnum(types.MsgTag.hello)}, // the reported reproducer
-        &.{@intFromEnum(types.MsgTag.bum)},
+        &.{@backingInt(types.MsgTag.hello)}, // the reported reproducer
+        &.{@backingInt(types.MsgTag.bum)},
         &wild_origin,
         &wild_bum_origin,
         &wild_seq,

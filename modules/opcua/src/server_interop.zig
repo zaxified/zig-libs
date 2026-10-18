@@ -2011,8 +2011,8 @@ test "LIVE open62541 client_encryption -> our server: picks the Basic256Sha256 S
 
 /// The nonce pair every symmetric golden derives its keys from. Fixed
 /// constants, not secrets.
-const golden_client_nonce = [_]u8{0x11} ** 32;
-const golden_server_nonce = [_]u8{0x22} ** 32;
+const golden_client_nonce = @as([32]u8, @splat(0x11));
+const golden_server_nonce = @as([32]u8, @splat(0x22));
 
 /// Plaintext MSG body behind both symmetric goldens: SecureChannelId 42,
 /// TokenId 7, SequenceNumber 51, RequestId 51, then 24 bytes of payload.
@@ -2070,8 +2070,8 @@ test "golden (self-derived): symmetric MSG chunks at Sign and SignAndEncrypt" {
 /// pure function of its random stream, so a fixed CSPRNG seed pins the whole
 /// key pair — and therefore the certificate, the OAEP ciphertext and the
 /// PKCS#1 v1.5 signature.
-const golden_key_seed = [_]u8{0xA5} ** 32;
-const golden_seal_seed = [_]u8{0x5A} ** 32;
+const golden_key_seed = @as([32]u8, @splat(0xA5));
+const golden_seal_seed = @as([32]u8, @splat(0x5A));
 
 /// SELF-DERIVED. The 512-bit client application certificate `golden_key_seed`
 /// produces (a small key so the golden stays readable; the live interop runs
