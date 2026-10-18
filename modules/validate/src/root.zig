@@ -1964,7 +1964,7 @@ fn assertLookup(comptime P: type) void {
         else => false,
     };
     if (!ok) @compileError("validateParams: " ++ @typeName(P) ++
-        " is not a param lookup -- it needs `get(name: []const u8) ?[]const u8`");
+        " is not a param lookup -- it needs `pub fn get(name: []const u8) ?[]const u8` (0.17: `@hasDecl` sees only `pub` decls)");
 }
 
 /// Coerce one string value to the rule's kind, then run the shared checks.
@@ -2155,6 +2155,31 @@ fn decodeComponent(a: Allocator, s: []const u8) Allocator.Error![]const u8 {
 
 // ── the typed style: comptime schema from a struct ──────────────────────────
 
+/// One struct field as `std.builtin.Type.StructField` had it before Zig 0.17
+/// dropped `Struct.fields`: rebuilt from `field_names` / `field_types` /
+/// `field_attrs` so the reflection bodies below stay as they were.
+const StructField = struct {
+    name: [:0]const u8,
+    type: type,
+    default_value_ptr: ?*const anyopaque,
+
+    inline fn defaultValue(comptime f: StructField) ?f.type {
+        const dp: *const f.type = @ptrCast(@alignCast(f.default_value_ptr orelse return null));
+        return dp.*;
+    }
+};
+
+fn structFields(comptime T: type) [@typeInfo(T).@"struct".field_names.len]StructField {
+    comptime {
+        const info = @typeInfo(T).@"struct";
+        var out: [info.field_names.len]StructField = undefined;
+        for (&out, info.field_names, info.field_types, info.field_attrs) |*o, n, t, a| {
+            o.* = .{ .name = n, .type = t, .default_value_ptr = a.default_value_ptr };
+        }
+        return out;
+    }
+}
+
 /// Derive a validation schema from struct `T` by reflection (evaluated at
 /// comptime, cached by the compiler):
 ///
@@ -2177,7 +2202,7 @@ pub fn rulesFor(comptime T: type) []const Rule {
         const info = @typeInfo(T);
         if (info != .@"struct")
             @compileError("validate.rulesFor: " ++ @typeName(T) ++ " is not a struct");
-        const fields = info.@"struct".fields;
+        const fields = structFields(T);
         var rules: [fields.len]Rule = undefined;
         for (fields, 0..) |f, i| {
             var rule = ruleForType(f.type);
@@ -2241,8 +2266,8 @@ fn ruleForType(comptime T: type) Rule {
             },
             .float => return .{ .field = "", .kind = .float },
             .@"enum" => |ei| {
-                var names: [ei.fields.len][]const u8 = undefined;
-                for (ei.fields, 0..) |f, i| names[i] = f.name;
+                var names: [ei.field_names.len][]const u8 = undefined;
+                for (ei.field_names, 0..) |f_name, i| names[i] = f_name;
                 const final = names;
                 return .{ .field = "", .kind = .string, .one_of = &final };
             },
@@ -2374,7 +2399,7 @@ pub fn parseIntoLimited(comptime T: type, gpa: Allocator, body: []const u8, limi
 /// `limits`, only `max_errors` applies.
 pub fn parseQueryLeaky(comptime T: type, arena: Allocator, query: []const u8, limits: Limits) Allocator.Error!LeakyResult(T) {
     comptime assertQueryStruct(T);
-    const fields = @typeInfo(T).@"struct".fields;
+    const fields = comptime structFields(T);
     const schema = comptime rulesFor(T);
     const extra: []const Rule = if (@hasDecl(T, "validate_rules")) T.validate_rules else &.{};
 
@@ -2426,7 +2451,7 @@ pub fn parseQueryLeaky(comptime T: type, arena: Allocator, query: []const u8, li
 fn assertQueryStruct(comptime T: type) void {
     if (@typeInfo(T) != .@"struct")
         @compileError("validate.parseQueryLeaky: " ++ @typeName(T) ++ " is not a struct");
-    for (@typeInfo(T).@"struct".fields) |f| {
+    for (structFields(T)) |f| {
         const U = switch (@typeInfo(f.type)) {
             .optional => |o| o.child,
             else => f.type,
@@ -2529,8 +2554,9 @@ pub fn parseIntoLeaky(comptime T: type, arena: Allocator, body: []const u8, limi
 /// it always had (limits first, then JSON errors, then rules). The walker's
 /// own memory is a stack buffer first, so a body-sized arena still fits.
 fn parseOnePass(comptime T: type, arena: Allocator, body: []const u8, limits: Limits, extra: []const Rule) Allocator.Error!?LeakyResult(T) {
-    var fallback = std.heap.stackFallback(2048, arena);
-    const scratch = fallback.get();
+    var scratch_buf: [2048]u8 align(16) = undefined; // 0.17: `stackFallback` is `BufferFirstAllocator`; aligned so the fit does not depend on the frame address
+    var fallback = std.heap.BufferFirstAllocator.init(&scratch_buf, arena);
+    const scratch = fallback.allocator();
     var b = Builder.initCapped(arena, limits.max_errors);
     var w: Walker = undefined;
     w.startRoot(scratch, body.len, &b, comptime rootRuleFor(T), extra, limits);
@@ -2660,9 +2686,10 @@ fn walkDocument(b: *Builder, gpa: Allocator, body: []const u8, root: Rule, extra
     defer scanner.deinit();
     // The walker's frames and key copies: a stack buffer first, as the
     // recursion's locals were.
-    var fallback = std.heap.stackFallback(1024, gpa);
+    var scratch_buf: [1024]u8 align(16) = undefined; // 0.17: `stackFallback` is `BufferFirstAllocator`; aligned so the fit does not depend on the frame address
+    var fallback = std.heap.BufferFirstAllocator.init(&scratch_buf, gpa);
     var w: Walker = undefined;
-    w.startRoot(fallback.get(), body.len, b, root, extra, null);
+    w.startRoot(fallback.allocator(), body.len, b, root, extra, null);
     defer w.deinit();
     while (true) {
         // A non-OOM error here is the document's, not ours: it is the VALUE
@@ -4729,13 +4756,13 @@ test "format robustness: every format rejects hostile input without panicking" {
         strRepeat("a", 5000), // huge
         "%", "~", "-", ".", ":", "@", // lone specials near each grammar
     };
-    inline for (@typeInfo(Format).@"enum".fields) |f| {
-        const format: Format = @fromBackingInt(@intCast(f.value));
+    inline for (@typeInfo(Format).@"enum".field_values) |f_value| {
+        const format: Format = @fromBackingInt(@intCast(f_value));
         for (hostile) |s| _ = validateFormat(format, s);
     }
     // And the huge/garbage cases really are invalid everywhere.
-    inline for (@typeInfo(Format).@"enum".fields) |f| {
-        const format: Format = @fromBackingInt(@intCast(f.value));
+    inline for (@typeInfo(Format).@"enum".field_values) |f_value| {
+        const format: Format = @fromBackingInt(@intCast(f_value));
         try testing.expect(!validateFormat(format, "\xff\xfe\x80garbage\x00"));
     }
 }
@@ -5308,7 +5335,7 @@ test "params: validateParams over a lookup that is not router.Params" {
     const Pairs = struct {
         names: []const []const u8,
         values: []const []const u8,
-        fn get(p: @This(), name: []const u8) ?[]const u8 {
+        pub fn get(p: @This(), name: []const u8) ?[]const u8 {
             for (p.names, p.values) |n, v| if (std.mem.eql(u8, n, name)) return v;
             return null;
         }
@@ -5351,15 +5378,21 @@ test "every allocation failure point: no leak, no double free" {
         .{ .field = "tags", .kind = .array, .max_len = 4 },
     };
     const S = struct {
-        fn parse(gpa: Allocator, body: []const u8) !void {
+        fn parse(gpa_in: Allocator, body: []const u8) !void {
+            var no_resize: NoResize = .{ .inner = gpa_in };
+            const gpa = no_resize.allocator();
             var r = try parseIntoLimited(T, gpa, body, .{});
             r.deinit();
         }
-        fn json(gpa: Allocator, body: []const u8, rules: []const Rule) !void {
+        fn json(gpa_in: Allocator, body: []const u8, rules: []const Rule) !void {
+            var no_resize: NoResize = .{ .inner = gpa_in };
+            const gpa = no_resize.allocator();
             var r = try validateJsonLimited(gpa, body, rules, .{});
             r.deinit();
         }
-        fn query(gpa: Allocator, q: []const u8, rules: []const Rule) !void {
+        fn query(gpa_in: Allocator, q: []const u8, rules: []const Rule) !void {
+            var no_resize: NoResize = .{ .inner = gpa_in };
+            const gpa = no_resize.allocator();
             var r = try validateQuery(gpa, q, rules);
             r.deinit();
         }
@@ -5794,13 +5827,43 @@ test "Limits.max_errors lowers the cap on every limited path, and never to zero"
     try testing.expectEqual(max_errors, many.errors.len);
 }
 
+/// Wraps the allocator `checkAllAllocationFailures` hands out so that
+/// resize/remap always refuse and every growth goes through `alloc`, which is
+/// what the check counts.
+// zig 0.17.1: 7c793c2 — remove once checkAllAllocationFailures refuses resizes itself
+const NoResize = struct {
+    inner: Allocator,
+
+    fn allocator(self: *NoResize) Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn alloc(ctx: *anyopaque, len: usize, al: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *NoResize = @ptrCast(@alignCast(ctx));
+        return self.inner.rawAlloc(len, al, ra);
+    }
+    fn resize(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) bool {
+        return false;
+    }
+    fn remap(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) ?[*]u8 {
+        return null;
+    }
+    fn free(ctx: *anyopaque, m: []u8, al: std.mem.Alignment, ra: usize) void {
+        const self: *NoResize = @ptrCast(@alignCast(ctx));
+        self.inner.rawFree(m, al, ra);
+    }
+};
+
 test "streaming: every allocation failure point, no leak, no double free" {
     const S = struct {
-        fn stream(gpa: Allocator, body: []const u8) !void {
+        fn stream(gpa_in: Allocator, body: []const u8) !void {
+            var no_resize: NoResize = .{ .inner = gpa_in };
+            const gpa = no_resize.allocator();
             var r = try validateJsonStreaming(gpa, body, &fuzz_schema, .{});
             r.deinit();
         }
-        fn typed(gpa: Allocator, body: []const u8) !void {
+        fn typed(gpa_in: Allocator, body: []const u8) !void {
+            var no_resize: NoResize = .{ .inner = gpa_in };
+            const gpa = no_resize.allocator();
             var arena = std.heap.ArenaAllocator.init(gpa);
             defer arena.deinit();
             var r = try parseIntoLeaky(StreamUser, arena.allocator(), body, .{});
@@ -6192,6 +6255,26 @@ test "Body middleware: over-limit body → 413" {
     try expectStatus(got, "413");
     try testing.expect(std.mem.indexOf(u8, got, "\"code\":\"too_large\"") != null);
     try testing.expect(!probe.invoked);
+}
+
+test "Body middleware: max_body_bytes boundary - exactly the cap passes, one byte over → 413" {
+    // Zig 0.17 `allocRemaining(.limited(n))` accepts exactly n bytes; the
+    // documented `max_body_bytes` is the largest accepted body.
+    var probe: Probe = .{};
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    r.state = &probe;
+    const body_mw: Body = .{ .gpa = testing.allocator, .schema = &thing_schema, .max_body_bytes = 8 };
+    try r.use(body_mw.middleware());
+    try r.post("/things", hEchoBody);
+
+    var buf: [2048]u8 = undefined;
+    // 8 bytes: past the size gate (any other status than 413).
+    const at = runWire(&r, postWire("/things", "{\"a\":10}"), &buf);
+    try testing.expect(!std.mem.startsWith(u8, at, "HTTP/1.1 413"));
+    // 9 bytes: refused.
+    const over = runWire(&r, postWire("/things", "{\"a\":100}"), &buf);
+    try expectStatus(over, "413");
 }
 
 test "Body middleware: structurally over-limit body → 400 too_deep, handler NOT invoked" {
@@ -7461,7 +7544,9 @@ test "cross: both rule sets of a typed body (derived + validate_rules) with cros
 
 test "cross: streaming allocation failures at every point, no leak" {
     const S = struct {
-        fn run(gpa: Allocator, body: []const u8) !void {
+        fn run(gpa_in: Allocator, body: []const u8) !void {
+            var no_resize: NoResize = .{ .inner = gpa_in };
+            const gpa = no_resize.allocator();
             var r = try validateJsonStreaming(gpa, body, &req_schema, .{});
             r.deinit();
             var r2 = try validateJsonStreaming(gpa, body, &pw_schema, .{});
