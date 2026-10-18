@@ -668,7 +668,7 @@ fn peerDescription(stream: *std.Io.net.Stream, buf: *[64]u8) []const u8 {
     std.posix.getpeername(stream.socket.handle, @ptrCast(&sa), &len) catch return "an unnamed peer";
     if (sa.family != std.posix.AF.INET) return "a non-IPv4 peer";
     const in: *const std.posix.sockaddr.in = @ptrCast(@alignCast(&sa));
-    const octets: [4]u8 = @bitCast(in.addr);
+    const octets: [4]u8 = std.mem.toBytes(in.addr); // memory (network) order on every target
     return std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d} port {d}", .{
         octets[0], octets[1], octets[2], octets[3], std.mem.bigToNative(u16, in.port),
     }) catch "a peer with an unprintable address";

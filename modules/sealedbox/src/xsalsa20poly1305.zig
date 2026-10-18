@@ -111,8 +111,13 @@ inline fn xorBlocks(comptime n: comptime_int, out: []u8, in: []const u8, base: *
             // target, so `iv` already holds LE words and `ks` needs no byte swap
             // (0.16 read native-order words and swapped `ks` on big-endian).
             const ks = t[b];
-            const iv: V = @bitCast(in[off..][0 .. 4 * n].*);
-            out[off..][0 .. 4 * n].* = @bitCast(iv ^ ks);
+            // Through `@Vector(4 * n, u8)`: LLVM 22 lowers a byte-array <-> wider-lane
+            // vector `@bitCast` byte by byte (8 -> 142 instructions at n = 8);
+            // the u8-vector coercion plus a vector -> vector `@bitCast` is one
+            // plain vector move with the same meaning.
+            const B = @Vector(4 * n, u8);
+            const iv: V = @bitCast(@as(B, in[off..][0 .. 4 * n].*));
+            out[off..][0 .. 4 * n].* = @as(B, @bitCast(iv ^ ks));
         }
     }
 }

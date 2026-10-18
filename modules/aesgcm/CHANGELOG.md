@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — Zig 0.17 codegen: LLVM 22 lowers a byte-array <-> wider-lane vector `@bitCast` byte by byte; `load`/`store` (16-byte block <-> `@Vector(2, u64)`) now goes through `@Vector(n, u8)` and a vector -> vector `@bitCast` (one vector move, same little-endian-logical meaning on every target). Spelling only: no new branch or index, no API change.
 - **2026-10-18** — Test fix: the `Context` size bounds in the backend test apply only when std's AES key schedule is plain round keys; on targets with software AES (s390x, mips) the schedule is 3-4 KiB, so the bound measured std, not this module. No source change.
 - **2026-10-18** — Ported to Zig 0.17.0. No source change beyond the repo-wide codemod (all `@bitCast` sites audited; aesgcm's are x86-64-only, so LE memory order is unchanged).
 - **2026-10-10** — Nonce and tag lengths: `pub fn AesGcm(key_bits, Options)` with

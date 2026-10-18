@@ -619,12 +619,16 @@ fn wipeBlocks(p: [*]u8, n: usize) void {
     for (0..n) |i| v[i] = zero_v;
 }
 
+// Through `@Vector(16, u8)`: zig 0.17 (LLVM 22) lowers a byte-array <->
+// u64-vector `@bitCast` byte by byte ([16]u8 -> V: 6 -> 51 instructions);
+// the u8-vector coercion plus a vector -> vector `@bitCast` is one plain
+// vector move, with the same little-endian-logical meaning on every target.
 inline fn load(p: *const [16]u8) V {
-    return @bitCast(p.*);
+    return @bitCast(@as(@Vector(16, u8), p.*));
 }
 
 inline fn store(p: *[16]u8, v: V) void {
-    p.* = @bitCast(v);
+    p.* = @as(@Vector(16, u8), @bitCast(v));
 }
 
 /// The byte-reversed counter block `ctr` advanced by `n` (inc32, n times).
