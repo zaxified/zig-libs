@@ -61,10 +61,10 @@ pub const Extension = struct {
 pub const Param = struct {
     name: []const u8,
     /// null = the parameter has no value. A quoted-string value is
-    /// unescaped into `value_buf`; values longer than it (none of RFC 7692's
-    /// are) come back as `error.Malformed`.
+    /// unescaped into the iterator's `value_buf` (valid until the next
+    /// `next` call); values longer than it (none of RFC 7692's are) come
+    /// back as `error.Malformed`.
     value: ?[]const u8,
-    value_buf: [16]u8 = undefined,
 };
 
 /// Splits one header value into its comma-separated elements. Commas inside
@@ -109,6 +109,9 @@ pub const ExtensionIterator = struct {
 
 pub const ParamIterator = struct {
     s: []const u8,
+    // zig 0.17: the unescape buffer lives here, not in the returned `Param`
+    // (a slice into a by-value `Param` dangled once it was copied out).
+    value_buf: [16]u8 = undefined,
 
     pub fn next(it: *ParamIterator) error{Malformed}!?Param {
         var s = std.mem.trimStart(u8, it.s, " \t");
@@ -134,14 +137,14 @@ pub const ParamIterator = struct {
                         if (k >= s.len) return error.Malformed;
                         c = s[k];
                     }
-                    if (out == p.value_buf.len) return error.Malformed;
-                    p.value_buf[out] = c;
+                    if (out == it.value_buf.len) return error.Malformed;
+                    it.value_buf[out] = c;
                     out += 1;
                 }
                 s = s[k + 1 ..];
                 // RFC 7692 §5: a quoted value must still be a token once unescaped.
-                if (!http.h1.isToken(p.value_buf[0..out])) return error.Malformed;
-                p.value = p.value_buf[0..out];
+                if (!http.h1.isToken(it.value_buf[0..out])) return error.Malformed;
+                p.value = it.value_buf[0..out];
             } else {
                 var v: usize = 0;
                 while (v < s.len and s[v] != ';' and s[v] != ' ' and s[v] != '\t') v += 1;

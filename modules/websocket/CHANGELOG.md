@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — Ported to Zig 0.17.0. **Fixed a latent dangling slice:** `deflate.ParamIterator.next` returned a `Param` whose quoted-value slice pointed into the `Param`'s own `value_buf` (invalid once the struct is copied out; 0.16 survived by result-location luck, 0.17 panicked in `windowBits`). The unescape buffer now lives in the `ParamIterator`; `Param.value_buf` is gone (value valid until the next `next`).
 - **2026-10-12** — **`handshake.respondUpgraded`: run the WebSocket inside an `http.Server`
   handler, additive.** `respond` plus `http.Server.Request.upgraded`: the connection's reader and
   writer for `conn.Conn`, with the HTTP timeouts lifted (gorilla's and coder's `Accept` hijack the

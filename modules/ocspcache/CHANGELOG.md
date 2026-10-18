@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — Ported to Zig 0.17.0. Test-only `ReadCueIo` overrides `vtable.operate` and counts `.net_read`. No behaviour change.
 - **2026-10-09** — tests: deterministic fuzz driver `OCSPCACHE_FUZZ` over the existing harnesses (`aia`, `refresh`); `refresh` checks the genuine captured response is accepted and an altered one refused.
 - **2026-09-15** — **NO CONSUMER-VISIBLE CHANGE:** tests only. The two `httpFetch` cancel tests (connect/head wait, body wait) canceled after a fixed
   sleep. They now cancel once the client is inside the socket read under test (`ReadCueIo`, a

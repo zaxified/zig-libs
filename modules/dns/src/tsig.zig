@@ -58,8 +58,8 @@ pub const Algorithm = enum {
     /// Case-insensitive; one trailing dot allowed (`hmac-sha256.`).
     pub fn fromName(text: []const u8) ?Algorithm {
         const t = if (std.mem.endsWith(u8, text, ".")) text[0 .. text.len - 1] else text;
-        inline for (@typeInfo(Algorithm).@"enum".fields) |f| {
-            const a: Algorithm = @enumFromInt(f.value);
+        inline for (@typeInfo(Algorithm).@"enum".field_values) |fv| {
+            const a: Algorithm = @fromBackingInt(@intCast(fv));
             if (std.ascii.eqlIgnoreCase(t, a.name())) return a;
         }
         return null;
@@ -186,7 +186,7 @@ fn signBody(buf: []u8, msg_len: usize, key: *const Key, options: *const SignOpti
     const fields: Fields = .{
         .time = options.time,
         .fudge = options.fudge,
-        .err = @intFromEnum(options.@"error"),
+        .err = @backingInt(options.@"error"),
         .other = options.other,
     };
     computeMac(key, options.request_mac, buf[0..message.header_len], buf[message.header_len..msg_len], owner, alg, &fields, out_mac);
@@ -201,8 +201,8 @@ fn signBody(buf: []u8, msg_len: usize, key: *const Key, options: *const SignOpti
 fn writeRecord(w: *std.Io.Writer, owner: []const u8, alg: []const u8, f: *const Fields, mac: []const u8, original_id: u16) error{WriteFailed}!void {
     const rdlen = alg.len + 6 + 2 + 2 + mac.len + 2 + 2 + 2 + f.other.len;
     try w.writeAll(owner);
-    try w.writeInt(u16, @intFromEnum(message.Type.tsig), .big);
-    try w.writeInt(u16, @intFromEnum(message.Class.any), .big);
+    try w.writeInt(u16, @backingInt(message.Type.tsig), .big);
+    try w.writeInt(u16, @backingInt(message.Class.any), .big);
     try w.writeInt(u32, 0, .big);
     try w.writeInt(u16, @intCast(rdlen), .big);
     try w.writeAll(alg);
@@ -267,7 +267,7 @@ fn verifyBody(msg: []const u8, key: *const Key, options: *const VerifyOptions, o
     const alg = canonicalName(&alg_buf, key.algorithm.name()) catch unreachable;
     if (!std.ascii.eqlIgnoreCase(rec.owner, owner) or !std.ascii.eqlIgnoreCase(rec.alg, alg)) return error.BadKey;
 
-    const peer_error: TsigError = @enumFromInt(rec.fields.err);
+    const peer_error: TsigError = @fromBackingInt(@intCast(rec.fields.err));
     if (rec.mac.len == 0) return switch (peer_error) {
         .no_error => error.BadSig,
         .bad_sig => error.PeerBadSig,
@@ -356,7 +356,7 @@ fn computeMac(
             h.update(header);
             h.update(body);
             h.update(owner);
-            std.mem.writeInt(u16, be[0..2], @intFromEnum(message.Class.any), .big);
+            std.mem.writeInt(u16, be[0..2], @backingInt(message.Class.any), .big);
             h.update(be[0..2]);
             h.update(&[4]u8{ 0, 0, 0, 0 }); // TTL
             h.update(alg);
@@ -406,7 +406,7 @@ fn findRecord(msg: []const u8) VerifyError!Record {
     for (0..before_last) |_| {
         pos = try skipName(msg, pos);
         if (msg.len - pos < 10) return error.Malformed;
-        if (std.mem.readInt(u16, msg[pos..][0..2], .big) == @intFromEnum(message.Type.tsig)) return error.Malformed;
+        if (std.mem.readInt(u16, msg[pos..][0..2], .big) == @backingInt(message.Type.tsig)) return error.Malformed;
         const rdlen = std.mem.readInt(u16, msg[pos + 8 ..][0..2], .big);
         pos += 10;
         if (msg.len - pos < rdlen) return error.Malformed;
@@ -416,11 +416,11 @@ fn findRecord(msg: []const u8) VerifyError!Record {
     const start = pos;
     const owner_end = try skipName(msg, pos);
     if (msg.len - owner_end < 10) return error.Malformed;
-    if (std.mem.readInt(u16, msg[owner_end..][0..2], .big) != @intFromEnum(message.Type.tsig)) return error.Unsigned;
+    if (std.mem.readInt(u16, msg[owner_end..][0..2], .big) != @backingInt(message.Type.tsig)) return error.Unsigned;
     const owner = msg[start..owner_end];
     if (!isUncompressed(owner)) return error.Malformed;
     var p = owner_end + 2;
-    if (std.mem.readInt(u16, msg[p..][0..2], .big) != @intFromEnum(message.Class.any)) return error.Malformed;
+    if (std.mem.readInt(u16, msg[p..][0..2], .big) != @backingInt(message.Class.any)) return error.Malformed;
     p += 2;
     if (std.mem.readInt(u32, msg[p..][0..4], .big) != 0) return error.Malformed;
     p += 4;
@@ -621,7 +621,7 @@ test "sign then verify: request/response chain, peer errors" {
         var ew: std.Io.Writer = .fixed(ebuf[q.len..]);
         var ob: [max_wire_name]u8 = undefined;
         var ab: [max_wire_name]u8 = undefined;
-        try writeRecord(&ew, try canonicalName(&ob, key.name), try canonicalName(&ab, key.algorithm.name()), &.{ .time = 1_700_000_001, .fudge = 300, .err = @intFromEnum(c[0]), .other = "" }, "", 0x1234);
+        try writeRecord(&ew, try canonicalName(&ob, key.name), try canonicalName(&ab, key.algorithm.name()), &.{ .time = 1_700_000_001, .fudge = 300, .err = @backingInt(c[0]), .other = "" }, "", 0x1234);
         std.mem.writeInt(u16, ebuf[10..12], 1, .big);
         try testing.expectError(c[1], verify(ebuf[0 .. q.len + ew.end], &key, .{ .now = 1_700_000_002, .request_mac = req_mac.slice() }, &seen));
     }

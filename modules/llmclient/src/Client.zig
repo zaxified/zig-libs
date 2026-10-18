@@ -685,7 +685,7 @@ const ReadCueIo = struct {
         inner_vtable = inner.vtable;
         reads.store(0, .release);
         var vt = inner.vtable.*;
-        vt.netRead = netRead;
+        vt.operate = operate; // 0.17: socket reads are `Operation.net_read` through `vtable.operate`
         return .{ .vtable = vt, .userdata = inner.userdata };
     }
 
@@ -693,9 +693,9 @@ const ReadCueIo = struct {
         return .{ .userdata = self.userdata, .vtable = &self.vtable };
     }
 
-    fn netRead(userdata: ?*anyopaque, src: std.Io.net.Socket.Handle, data: [][]u8) std.Io.net.Stream.Reader.Error!usize {
-        _ = reads.fetchAdd(1, .monotonic);
-        return inner_vtable.netRead(userdata, src, data);
+    fn operate(userdata: ?*anyopaque, op: std.Io.Operation) std.Io.Cancelable!std.Io.Operation.Result {
+        if (op == .net_read) _ = reads.fetchAdd(1, .monotonic);
+        return inner_vtable.operate(userdata, op);
     }
 
     /// Wait until the client has entered its `n`-th socket read. The deadline
@@ -1181,13 +1181,14 @@ test "Client.create: status exactly 300 is UnexpectedStatus, the >= 300 boundary
 
 test "Client.create: max_response_bytes is enforced at the exact wire byte count, off by one either way (A1 F8)" {
     // A minimal valid Message body of known exact length `L`. `http`'s own
-    // `readAllAlloc(a, max)` requires `max > L` to succeed (measured: `max
-    // == L` is already `error.BodyTooLarge`), so the tight pair is `max ==
-    // L` (must refuse) / `max == L + 1` (must succeed) — one byte apart.
+    // `readAllAlloc(a, max)` accepts exactly `max` bytes since Zig 0.17
+    // (`allocRemaining(.limited(n))` allows n; 0.16 refused `max == L`), so
+    // the tight pair is `max == L - 1` (must refuse) / `max == L` (must
+    // succeed) -- one byte apart.
     // `max_response_bytes` is forwarded to it unmodified; this single pair
     // catches M04 (cap removed), M05 (1024x looser) and M06 (a one-byte
     // shift in what gets forwarded) all at once: under any of the three,
-    // `max == L` would wrongly succeed.
+    // `max == L - 1` would wrongly succeed.
     const min_msg = "{\"id\":\"m\",\"model\":\"m\",\"role\":\"assistant\",\"content\":[]," ++
         "\"stop_reason\":\"end_turn\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}";
     var lb: Loopback = undefined;
@@ -1195,10 +1196,10 @@ test "Client.create: max_response_bytes is enforced at the exact wire byte count
     defer lb.finish();
     var c = try lb.client();
 
-    c.max_response_bytes = min_msg.len;
+    c.max_response_bytes = min_msg.len - 1;
     try testing.expectError(error.ResponseTooLarge, c.create(testing.allocator, canned_request));
 
-    c.max_response_bytes = min_msg.len + 1;
+    c.max_response_bytes = min_msg.len;
     var parsed = try c.create(testing.allocator, canned_request);
     defer parsed.deinit();
     try testing.expectEqualStrings("m", parsed.value.id);

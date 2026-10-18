@@ -391,18 +391,18 @@ pub const CountTokensRequest = struct {
 /// null optional left out, `system`/`system_blocks` merged under `system`.
 fn writeRequestObject(comptime T: type, self: T, jw: anytype) !void {
     try jw.beginObject();
-    inline for (std.meta.fields(T)) |f| {
-        if (comptime std.mem.eql(u8, f.name, "system_blocks")) continue;
-        if (comptime std.mem.eql(u8, f.name, "system")) {
+    inline for (@typeInfo(T).@"struct".field_names, @typeInfo(T).@"struct".field_types) |f_name, f_type| {
+        if (comptime std.mem.eql(u8, f_name, "system_blocks")) continue;
+        if (comptime std.mem.eql(u8, f_name, "system")) {
             try writeSystem(self.system, self.system_blocks, jw);
-        } else if (@typeInfo(f.type) == .optional) {
-            if (@field(self, f.name)) |v| {
-                try jw.objectField(f.name);
+        } else if (@typeInfo(f_type) == .optional) {
+            if (@field(self, f_name)) |v| {
+                try jw.objectField(f_name);
                 try jw.write(v);
             }
         } else {
-            try jw.objectField(f.name);
-            try jw.write(@field(self, f.name));
+            try jw.objectField(f_name);
+            try jw.write(@field(self, f_name));
         }
     }
     try jw.endObject();

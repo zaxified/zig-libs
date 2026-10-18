@@ -1193,8 +1193,8 @@ test "server: grpc-timeout converts to nanoseconds without losing the unit" {
 }
 
 test "server: every StatusError keeps its own code on the way out" {
-    inline for (@typeInfo(status_mod.StatusError).error_set.?) |e| {
-        const se: status_mod.StatusError = @field(status_mod.StatusError, e.name);
+    inline for (@typeInfo(status_mod.StatusError).error_set.error_names.?) |e| {
+        const se: status_mod.StatusError = @field(status_mod.StatusError, e);
         try testing.expectEqual(status_mod.fromError(se), server.statusForError(se));
     }
     // An error that is not a status is UNKNOWN — the code that exists for

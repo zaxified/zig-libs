@@ -1311,7 +1311,7 @@ fn wantsFallback(req: *const http.Server.Request, allow_dotfiles: bool) bool {
     const leaf = rel[(mem.lastIndexOfScalar(u8, rel, '/') orelse 0)..];
     if (mem.indexOfScalar(u8, leaf, '.') != null) return false;
     const accept = req.header("accept") orelse return false;
-    return std.ascii.indexOfIgnoreCase(accept, "text/html") != null;
+    return std.ascii.findIgnoreCase(accept, "text/html") != null;
 }
 
 // ── Snapshot: a root opened once, served without opening anything ───────────

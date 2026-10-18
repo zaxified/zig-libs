@@ -151,7 +151,7 @@ pub fn parse(value: []const u8) ?Status {
         if (c < '0' or c > '9') return null;
     }
     const n = std.fmt.parseInt(u32, value, 10) catch return null;
-    return @enumFromInt(n);
+    return @fromBackingInt(@intCast(n));
 }
 
 /// The status a **non-200** HTTP response maps to, per the gRPC-over-HTTP2
@@ -258,19 +258,19 @@ pub fn encodeMessage(message: []const u8, out: []u8) []u8 {
 const testing = std.testing;
 
 test "status: codes, names and the error mapping round trip" {
-    try testing.expectEqual(@as(u32, 0), @intFromEnum(Status.ok));
-    try testing.expectEqual(@as(u32, 16), @intFromEnum(Status.unauthenticated));
+    try testing.expectEqual(@as(u32, 0), @backingInt(Status.ok));
+    try testing.expectEqual(@as(u32, 16), @backingInt(Status.unauthenticated));
     try testing.expectEqualStrings("RESOURCE_EXHAUSTED", Status.resource_exhausted.name());
 
-    inline for (@typeInfo(Status).@"enum".fields) |f| {
-        const s: Status = @enumFromInt(f.value);
+    inline for (@typeInfo(Status).@"enum".field_values) |fv| {
+        const s: Status = @fromBackingInt(@intCast(fv));
         if (s == .ok) continue;
         try testing.expectEqual(s, fromError(toError(s)));
     }
 }
 
 test "status: an unrecognized code is representable and reads as UNKNOWN" {
-    const s: Status = @enumFromInt(99);
+    const s: Status = @fromBackingInt(@intCast(99));
     try testing.expectEqualStrings("UNRECOGNIZED", s.name());
     try testing.expectEqual(error.Unknown, toError(s));
 }

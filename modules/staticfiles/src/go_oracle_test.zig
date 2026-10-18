@@ -173,7 +173,7 @@ fn parseResponse(raw: []const u8, body_buf: []u8) !Response {
         if (std.ascii.eqlIgnoreCase(name, "Location")) r.location = value;
         if (std.ascii.eqlIgnoreCase(name, "Content-Range")) r.content_range = value;
         if (std.ascii.eqlIgnoreCase(name, "Content-Length")) r.content_length = value;
-        if (std.ascii.eqlIgnoreCase(name, "Transfer-Encoding") and std.ascii.indexOfIgnoreCase(value, "chunked") != null) r.chunked = true;
+        if (std.ascii.eqlIgnoreCase(name, "Transfer-Encoding") and std.ascii.findIgnoreCase(value, "chunked") != null) r.chunked = true;
     }
     const rest = raw[end + 4 ..];
     if (!r.chunked) {

@@ -139,7 +139,7 @@ const method_count = @typeInfo(http.Method).@"enum".field_names.len;
 const AllowSet = std.bit_set.IntegerBitSet(method_count);
 
 fn methodBits(node: *const Node) AllowSet {
-    var bits: AllowSet = .initEmpty();
+    var bits: AllowSet = .empty;
     for (node.endpoints, 0..) |ep, i| {
         if (ep != null) bits.set(i);
     }
@@ -152,8 +152,8 @@ fn methodBits(node: *const Node) AllowSet {
 fn writeAllow(buf: []u8, bits: AllowSet) []const u8 {
     var w: std.Io.Writer = .fixed(buf);
     const has_get = bits.isSet(@backingInt(http.Method.get));
-    inline for (@typeInfo(http.Method).@"enum".fields, 0..) |f, i| {
-        const m: http.Method = @fromBackingInt(@intCast(f.value));
+    inline for (@typeInfo(http.Method).@"enum".field_values, 0..) |fv, i| {
+        const m: http.Method = @fromBackingInt(@intCast(fv));
         // `.other` has no token to list: a route for it serves extension
         // methods, which `Allow` cannot name.
         if (m != .other and (bits.isSet(i) or (m == .head and has_get))) {
@@ -653,7 +653,7 @@ pub const Router = struct {
                     miss_allow = node.allow;
             },
             .backtrack => {
-                var allow_bits: AllowSet = .initEmpty();
+                var allow_bits: AllowSet = .empty;
                 if (matchRecMethod(&r.root, req.path[1..], &params, req.method, &allow_bits)) |node|
                     matched = endpointFor(node, req.method).? // guaranteed: see matchIn
                 else if (allow_bits.count() != 0)
@@ -1049,8 +1049,8 @@ pub const Router = struct {
         // methods use 62 of 64 bytes since CONNECT and TRACE joined in
         // 2026-10; `.other` is never listed).
         var worst: usize = 0;
-        for (@typeInfo(http.Method).@"enum".fields) |f| {
-            const m: http.Method = @fromBackingInt(@intCast(f.value));
+        for (@typeInfo(http.Method).@"enum".field_values) |fv| {
+            const m: http.Method = @fromBackingInt(@intCast(fv));
             if (m != .other) worst += m.token().len + 2; // ", " separator; one spare is fine
         }
         if (worst > 64) @compileError(std.fmt.comptimePrint(
@@ -1425,7 +1425,7 @@ fn hostAdapter(req: *http.Server.Request, rw: *http.Server.ResponseWriter) anyer
 /// GET, `http.Method` order). What `Static.match` reports for a path whose
 /// shape exists but whose method does not.
 pub const Allow = struct {
-    bits: AllowSet = .initEmpty(),
+    bits: AllowSet = .empty,
 
     /// Longest `write` output: every method token, comma-separated.
     pub const max_len = 64;
@@ -1489,7 +1489,7 @@ pub fn Static(comptime routes: []const StaticRoute, comptime options: StaticOpti
             params.len = 0;
             if (path.len == 0 or path[0] != '/') return .not_found;
             const rest = path[1..];
-            var allow: AllowSet = .initEmpty();
+            var allow: AllowSet = .empty;
             switch (options.method_precedence) {
                 .backtrack => {
                     if (matchIn(tree, 0, rest, false, params, 0, segmentsRemaining(rest, false), method, &allow)) |n|
@@ -1515,7 +1515,7 @@ pub fn Static(comptime routes: []const StaticRoute, comptime options: StaticOpti
         pub fn trailingSlashVariant(method: http.Method, path: []const u8) ?SlashVariant {
             if (path.len == 0 or path[0] != '/') return null;
             var probe: Params = .{};
-            var unused: AllowSet = .initEmpty();
+            var unused: AllowSet = .empty;
             if (path.len > 1 and path[path.len - 1] == '/') {
                 const alt = path[1 .. path.len - 1];
                 const n = matchIn(tree, 0, alt, false, &probe, 0, segmentsRemaining(alt, false), null, &unused) orelse return null;
@@ -1536,7 +1536,7 @@ const StaticNode = struct {
     wildcard: ?StaticEdge = null,
     /// Route index per method.
     routes: [method_count]?u32 = @splat(null),
-    allow_bits: AllowSet = .initEmpty(),
+    allow_bits: AllowSet = .empty,
     min_reach: u32 = std.math.maxInt(u32),
 };
 
@@ -2088,7 +2088,7 @@ const Node = struct {
     /// Precomputed Allow header value (non-empty iff any endpoint).
     allow: []const u8 = "",
     /// `allow`'s bitset twin -- see `rebuildAllow`.
-    allow_bits: AllowSet = .initEmpty(),
+    allow_bits: AllowSet = .empty,
     /// Fewest ADDITIONAL segments a query needs, from this node, to reach any
     /// endpoint in this node's subtree (0 once `hasEndpoint()`). Maintained
     /// incrementally by `insert` (a route can only ever shrink an ancestor's
@@ -2151,7 +2151,7 @@ fn endpointFor(node: *const Node, method: http.Method) ?Endpoint {
 /// `max_path_segments` (see `matchIn`) — not by whatever caps the
 /// path upstream.
 fn matchRec(node: *const Node, rest: ?[]const u8, extra: bool, params: *Params) ?*const Node {
-    var unused_allow: AllowSet = .initEmpty();
+    var unused_allow: AllowSet = .empty;
     return matchIn(runtime_tree, node, rest, extra, params, 0, segmentsRemaining(rest, extra), null, &unused_allow);
 }
 
@@ -3827,13 +3827,13 @@ fn diffOne(comptime routes: []const StaticRoute, comptime prec: MethodPrecedence
     var checked: usize = 0;
     for (0..3000) |_| {
         const path = diffPath(rng, &buf);
-        inline for (@typeInfo(http.Method).@"enum".fields) |f| {
-            const m: http.Method = @fromBackingInt(@intCast(f.value));
+        inline for (@typeInfo(http.Method).@"enum".field_values) |fv| {
+            const m: http.Method = @fromBackingInt(@intCast(fv));
             var ps: Params = .{};
             const got = S.match(m, path, &ps);
 
             var pr: Params = .{};
-            var allow_bits: AllowSet = .initEmpty();
+            var allow_bits: AllowSet = .empty;
             var want_pattern: ?[]const u8 = null;
             switch (prec) {
                 .backtrack => {

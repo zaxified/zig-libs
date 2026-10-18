@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — Ported to Zig 0.17.0. No source change beyond the mechanical codemod.
 - **2026-10-18** — Backlog: percent/hex helpers and `isCookieValue` are not constant-time (low; pre-tag constant-time sweep).
 - **2026-10-17** — cookie-date (`jar.zig`, RFC 6265 §5.1.1) uses `datefmt.daysInMonth`/`ymdToEpochDay` (new direct dep `datefmt`, already in the closure via `http`) instead of its own copies of the civil-calendar helpers. No behaviour change.
 - **2026-10-12** — **Server-side expiry for signed/private values.** `signed.signTimed`/`verifyTimed`, `private.sealTimed`/`sealTimedNonce`/`openTimed` (`timedLen`, `max_timed_name`): issue time inside the MAC/ciphertext under a `timed1` domain, verifier takes `now_s`/`max_age_s`. Tests, fuzz, ctgrind rows, stack probe extended.
