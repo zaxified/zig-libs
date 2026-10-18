@@ -370,7 +370,7 @@ test "corpus: every certificate seed reaches the parser, and the key kinds are p
     const entries = corpus.build();
     var nonempty: usize = 0;
     var parsed: usize = 0;
-    var kinds = std.EnumSet(std.meta.Tag(certverify.PublicKey)).initEmpty();
+    var kinds = std.EnumSet(std.meta.Tag(certverify.PublicKey)).empty;
     for (entries) |sd| {
         var smith: std.testing.Smith = .{ .in = sd };
         var buf: [1024]u8 = undefined;

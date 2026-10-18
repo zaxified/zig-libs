@@ -729,7 +729,7 @@ fn kexCase(comptime group: tls.NamedGroup, comptime suite: tls.CipherSuite, comp
         .mlkem = try MLKem768.KeyPair.generateDeterministic(kex_entropy[64..128].*),
         .p256 = try Es256Pair.generateDeterministic(kex_entropy[128..160].*),
         .p384 = try Es384Pair.generateDeterministic(kex_entropy[160..208].*),
-        .x25519 = try X25519.KeyPair.generateDeterministic(kex_entropy[208..240].*),
+        .x25519 = X25519.KeyPair.generateDeterministic(kex_entropy[208..240].*),
     };
 
     var n: Needles = .{};
@@ -743,7 +743,7 @@ fn kexCase(comptime group: tls.NamedGroup, comptime suite: tls.CipherSuite, comp
     switch (group) {
         .x25519_ml_kem768, .x25519 => {
             const srv_sk = derive("tls-server-x25519", ci, 32);
-            const srv_pub = try X25519.recoverPublicKey(srv_sk);
+            const srv_pub = X25519.recoverPublicKey(srv_sk);
             const xs = try X25519.scalarmult(srv_sk, keys.x25519.public_key);
             n.addBoth("x25519 shared", &xs);
             if (group == .x25519) {
@@ -855,7 +855,7 @@ test "STACKPROBE: no application secret residue on the dead stack after a full C
 }
 
 /// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
-fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     const rep_result = comptime blk: {
         @setEvalBranchQuota(n * (s.len + 4) + 1000);
         var buf: [s.len * n:0]u8 = undefined;

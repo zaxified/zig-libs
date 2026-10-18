@@ -189,8 +189,8 @@ fn appendRecord(key: [Aead.key_length]u8, iv: [Aead.nonce_length]u8, seq: u64, m
 /// Builds the whole server flight in `in_buf` from an untainted pass.
 fn buildFlight() !void {
     const srv_sk = derive("tls-server-x25519", 32);
-    const srv_pub = try X25519.recoverPublicKey(srv_sk);
-    const cli = try X25519.KeyPair.generateDeterministic(entropy[208..240].*);
+    const srv_pub = X25519.recoverPublicKey(srv_sk);
+    const cli = X25519.KeyPair.generateDeterministic(entropy[208..240].*);
     const shared = try X25519.scalarmult(srv_sk, cli.public_key);
     buildServerHello(&srv_pub);
     hello_len = in_len;
@@ -304,7 +304,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
 }
 
 /// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
-fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     const rep_result = comptime blk: {
         @setEvalBranchQuota(n * (s.len + 4) + 1000);
         var buf: [s.len * n:0]u8 = undefined;

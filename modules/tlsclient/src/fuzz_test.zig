@@ -238,9 +238,9 @@ fn ensureTemplates() !void {
     tm.hello_len = client_hello.len;
     const session_echo = tm.entropy[32..64];
     const client_rand = tm.entropy[0..32];
-    const client_x25519 = try X25519.KeyPair.generateDeterministic(tm.entropy[208..240].*);
+    const client_x25519 = X25519.KeyPair.generateDeterministic(tm.entropy[208..240].*);
     const srv_sk: [32]u8 = @as([32]u8, @splat(0x5c));
-    const srv_pub = try X25519.recoverPublicKey(srv_sk);
+    const srv_pub = X25519.recoverPublicKey(srv_sk);
     const server_rand: [32]u8 = @as([32]u8, @splat(0x77));
 
     // ── TLS 1.3 ─────────────────────────────────────────────────────────────
@@ -621,7 +621,7 @@ fn putEncryptedRaw(w: *Writer, key: [16]u8, iv: [12]u8, seq: u64, inner: []const
 }
 
 /// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
-fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     const rep_result = comptime blk: {
         @setEvalBranchQuota(n * (s.len + 4) + 1000);
         var buf: [s.len * n:0]u8 = undefined;

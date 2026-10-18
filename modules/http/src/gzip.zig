@@ -166,10 +166,10 @@ pub fn initCompress(
             "writer", "history_len", "history_end_unhashed", "bit_writer", "buffered_tokens",
             "lookup", "container",   "hasher",               "opts",
         };
-        const fields = std.meta.fields(flate.Compress);
+        const fields = @typeInfo(flate.Compress).@"struct".field_names;
         if (fields.len != expected.len) @compileError("gzip.initCompress: std's flate.Compress changed its fields; update the copy");
-        for (fields, expected) |f, e| if (!std.mem.eql(u8, f.name, e))
-            @compileError("gzip.initCompress: std's flate.Compress field '" ++ f.name ++ "' is new or moved; update the copy");
+        for (fields, expected) |f, e| if (!std.mem.eql(u8, f, e))
+            @compileError("gzip.initCompress: std's flate.Compress field '" ++ f ++ "' is new or moved; update the copy");
     }
     std.debug.assert(output.buffer.len > 8);
     std.debug.assert(buffer.len >= flate.max_window_len);
@@ -850,7 +850,7 @@ test "checkTrailer: matches, CRC mismatch, ISIZE mismatch, truncated" {
 }
 
 /// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
-fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     const rep_result = comptime blk: {
         @setEvalBranchQuota(n * (s.len + 4) + 1000);
         var buf: [s.len * n:0]u8 = undefined;

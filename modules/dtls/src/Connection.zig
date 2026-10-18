@@ -1098,7 +1098,7 @@ fn ecdheGenerate(group: u16, entropy: Entropy) HandshakeError!EcdheKeyPair {
         x25519_group => {
             var seed: [32]u8 = undefined;
             random.bytes(&seed);
-            const x = X25519.KeyPair.generateDeterministic(seed) catch return error.KeyExchangeFailed;
+            const x = X25519.KeyPair.generateDeterministic(seed);
             std.crypto.secureZero(u8, &seed);
             kp.secret[0..32].* = x.secret_key;
             kp.public[0..32].* = x.public_key;
@@ -1129,11 +1129,7 @@ fn ecdheGenerate(group: u16, entropy: Entropy) HandshakeError!EcdheKeyPair {
             };
             var x_seed: [32]u8 = undefined;
             random.bytes(&x_seed);
-            const x = X25519.KeyPair.generateDeterministic(x_seed) catch {
-                std.crypto.secureZero(u8, &kem_seed);
-                std.crypto.secureZero(u8, &x_seed);
-                return error.KeyExchangeFailed;
-            };
+            const x = X25519.KeyPair.generateDeterministic(x_seed);
             kp.secret[0..MlKem768.seed_length].* = kem_seed;
             kp.secret[MlKem768.seed_length..][0..32].* = x.secret_key;
             std.crypto.secureZero(u8, &kem_seed);
@@ -1275,7 +1271,7 @@ fn ecdheServerExchange(group: u16, peer_share: []const u8, entropy: Entropy) Han
             defer std.crypto.secureZero(u8, &enc.shared_secret);
             var x_seed: [32]u8 = undefined;
             random.bytes(&x_seed);
-            var x = X25519.KeyPair.generateDeterministic(x_seed) catch return error.KeyExchangeFailed;
+            var x = X25519.KeyPair.generateDeterministic(x_seed);
             std.crypto.secureZero(u8, &x_seed);
             defer std.crypto.secureZero(u8, &x.secret_key);
             // Same low-order/identity rejection as the classical arm — the
@@ -6804,8 +6800,8 @@ test "cert-DHE KAT: X25519 key_share + key schedule reproduce RFC 8448 §3 byte-
 
     // (1) Public keys recovered from the private scalars — proves the exact
     // key_share bytes this module would put on the wire.
-    try testing.expectEqualSlices(u8, &client_pub, &(try X25519.recoverPublicKey(client_priv)));
-    try testing.expectEqualSlices(u8, &server_pub, &(try X25519.recoverPublicKey(server_priv)));
+    try testing.expectEqualSlices(u8, &client_pub, &X25519.recoverPublicKey(client_priv));
+    try testing.expectEqualSlices(u8, &server_pub, &X25519.recoverPublicKey(server_priv));
 
     // (2) The DH shared secret, computed from BOTH sides — proves
     // scalarmult(client_priv, server_pub) == scalarmult(server_priv,
@@ -7913,9 +7909,9 @@ test "Entropy: exactly two arms, production and test are distinct, and nothing e
     // third arm appears, or the two collapse into one, or the production arm
     // is renamed out from under the callers, this fails.
     const info = @typeInfo(Entropy).@"union";
-    try testing.expectEqual(@as(usize, 2), info.fields.len);
-    try testing.expectEqualStrings("csprng", info.fields[0].name);
-    try testing.expectEqualStrings("seeded_for_test", info.fields[1].name);
+    try testing.expectEqual(@as(usize, 2), info.field_names.len);
+    try testing.expectEqualStrings("csprng", info.field_names[0]);
+    try testing.expectEqualStrings("seeded_for_test", info.field_names[1]);
 
     // Distinct: the same generator under the two arms is not the same value,
     // so "which arm" survives being passed around. Without this the test would
@@ -7931,8 +7927,8 @@ test "Entropy: exactly two arms, production and test are distinct, and nothing e
 
     // Both arms carry a `std.Random` — the difference is the caller's claim
     // about it, which is exactly what this module cannot check for itself.
-    try testing.expectEqual(std.Random, info.fields[0].type);
-    try testing.expectEqual(std.Random, info.fields[1].type);
+    try testing.expectEqual(std.Random, info.field_types[0]);
+    try testing.expectEqual(std.Random, info.field_types[1]);
 }
 
 test "the CSPRNG requirement is load-bearing: a seeded RNG reproduces the ECDHE private key exactly" {

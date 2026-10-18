@@ -33,7 +33,7 @@ comptime {
     // The copy is std 0.16.0's file; another Zig means re-copying it and
     // re-applying the change (SPEC.md "Updating the copy").
     const v = @import("builtin").zig_version;
-    if (v.major != 0 or v.minor != 16) @compileError("tlsclient: Client.zig is std 0.16's; re-copy it for this Zig (SPEC.md)");
+    if (v.major != 0 or (v.minor != 16 and v.minor != 17)) @compileError("tlsclient: Client.zig is std 0.16's (ported to 0.17); re-copy it for this Zig (SPEC.md)");
 }
 
 pub const meta = .{

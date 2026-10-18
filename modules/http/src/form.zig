@@ -262,7 +262,9 @@ fn readBody(arena: Allocator, src: Source, cap: usize) ParseError![]u8 {
         src.body.get().readSliceAll(buf) catch return error.ReadFailed;
         return buf;
     }
-    return src.body.get().allocRemaining(arena, .limited(cap +| 1)) catch |e| switch (e) {
+    // Zig 0.17: `allocRemaining` allows exactly `limit` bytes (0.16 failed at
+    // `limit`, hence the former `cap +| 1`).
+    return src.body.get().allocRemaining(arena, .limited(cap)) catch |e| switch (e) {
         error.StreamTooLong => error.BodyTooLarge,
         error.ReadFailed => error.ReadFailed,
         error.OutOfMemory => error.OutOfMemory,

@@ -76,13 +76,13 @@ const standard_members = [_][]const u8{ "type", "status", "title", "detail", "in
 pub fn write(w: *std.Io.Writer, p: Problem, extensions: anytype) std.Io.Writer.Error!void {
     const E = @TypeOf(extensions);
     const fields = switch (@typeInfo(E)) {
-        .@"struct" => |s| s.fields,
+        .@"struct" => |s| s.field_names,
         else => @compileError("problem.write: extensions must be a struct value, got " ++ @typeName(E)),
     };
     inline for (fields) |f| {
         inline for (standard_members) |m| {
-            if (comptime std.mem.eql(u8, f.name, m))
-                @compileError("problem.write: extension member '" ++ f.name ++ "' shadows a standard member (RFC 9457 §3.1)");
+            if (comptime std.mem.eql(u8, f, m))
+                @compileError("problem.write: extension member '" ++ f ++ "' shadows a standard member (RFC 9457 §3.1)");
         }
     }
 
@@ -111,8 +111,8 @@ pub fn write(w: *std.Io.Writer, p: Problem, extensions: anytype) std.Io.Writer.E
         try writeText(&s, i);
     }
     inline for (fields) |f| {
-        try s.objectField(f.name);
-        try s.write(@field(extensions, f.name));
+        try s.objectField(f);
+        try s.write(@field(extensions, f));
     }
     try s.endObject();
 }
@@ -301,7 +301,7 @@ test "a full writer surfaces WriteFailed" {
 }
 
 /// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
-fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     const rep_result = comptime blk: {
         @setEvalBranchQuota(n * (s.len + 4) + 1000);
         var buf: [s.len * n:0]u8 = undefined;

@@ -875,7 +875,7 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
                         const nonce = nonce: {
                             const V = @Vector(P.AEAD.nonce_length, u8);
                             const pad = @as([P.AEAD.nonce_length - 8]u8, @splat(0));
-                            const operand: V = pad ++ @as([8]u8, @bitCast(big(read_seq)));
+                            const operand: V = pad ++ @as([8]u8, @bitCast(@byteSwap(read_seq)));
                             break :nonce @as(V, pv.server_handshake_iv) ^ operand;
                         };
                         P.AEAD.decrypt(cleartext, ciphertext, auth_tag, record_header, nonce, pv.server_handshake_key) catch
@@ -918,7 +918,7 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
                         const nonce: [P.AEAD.nonce_length]u8 = nonce: {
                             const V = @Vector(P.AEAD.nonce_length, u8);
                             const pad = @as([P.AEAD.nonce_length - 8]u8, @splat(0));
-                            const operand: V = pad ++ @as([8]u8, @bitCast(big(masked_read_seq)));
+                            const operand: V = pad ++ @as([8]u8, @bitCast(@byteSwap(masked_read_seq)));
                             break :nonce @as(V, pv.app_cipher.server_write_IV ++ record_iv) ^ operand;
                         };
                         const ciphertext = record_decoder.slice(message_len);
@@ -1568,7 +1568,7 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
                                 const nonce: [P.AEAD.nonce_length]u8 = nonce: {
                                     const V = @Vector(P.AEAD.nonce_length, u8);
                                     const pad = @as([P.AEAD.nonce_length - 8]u8, @splat(0));
-                                    const operand: V = pad ++ @as([8]u8, @bitCast(big(write_seq)));
+                                    const operand: V = pad ++ @as([8]u8, @bitCast(@byteSwap(write_seq)));
                                     break :nonce @as(V, pv.app_cipher.client_write_IV ++ pv.app_cipher.client_salt) ^ operand;
                                 };
                                 var client_verify_msg = .{@backingInt(tls.ContentType.handshake)} ++
@@ -2392,7 +2392,7 @@ fn writeHandshakeRecords(comptime P: type, output: *Writer, parts: []const []con
         const nonce = nonce: {
             const V = @Vector(P.AEAD.nonce_length, u8);
             const pad = @as([P.AEAD.nonce_length - 8]u8, @splat(0));
-            const operand: V = pad ++ @as([8]u8, @bitCast(big(seq)));
+            const operand: V = pad ++ @as([8]u8, @bitCast(@byteSwap(seq)));
             break :nonce @as(V, iv) ^ operand;
         };
         P.AEAD.encrypt(rec[5..][0..pt.len], rec[5 + pt.len ..][0..P.AEAD.tag_length], pt, rec[0..5], nonce, key);
@@ -2563,7 +2563,7 @@ fn prepareCiphertextRecord(
                     const nonce: [P.AEAD.nonce_length]u8 = nonce: {
                         const V = @Vector(P.AEAD.nonce_length, u8);
                         const pad = @as([P.AEAD.nonce_length - 8]u8, @splat(0));
-                        const operand: V = pad ++ @as([8]u8, @bitCast(big(c.write_seq)));
+                        const operand: V = pad ++ @as([8]u8, @bitCast(@byteSwap(c.write_seq)));
                         break :nonce @as(V, pv.client_write_IV ++ pv.client_salt) ^ operand;
                     };
                     record_iv.* = nonce[P.fixed_iv_length..].*;
@@ -2698,7 +2698,7 @@ fn readIndirect(c: *Client) Reader.Error!usize {
                 const nonce: [P.AEAD.nonce_length]u8 = nonce: {
                     const V = @Vector(P.AEAD.nonce_length, u8);
                     const pad = @as([P.AEAD.nonce_length - 8]u8, @splat(0));
-                    const operand: V = pad ++ @as([8]u8, @bitCast(big(masked_read_seq)));
+                    const operand: V = pad ++ @as([8]u8, @bitCast(@byteSwap(masked_read_seq)));
                     break :nonce @as(V, pv.server_write_IV ++ record_iv) ^ operand;
                 };
                 const ciphertext = input.take(message_len) catch unreachable; // already peeked
@@ -2810,11 +2810,11 @@ fn failRead(c: *Client, err: ReadError) error{ReadFailed} {
 }
 
 fn logSecrets(w: *Writer, context: anytype, secrets: anytype) void {
-    inline for (@typeInfo(@TypeOf(secrets)).@"struct".fields) |field| w.print("{s}" ++
-        (if (@hasField(@TypeOf(context), "counter")) "_{d}" else "") ++ " {x} {x}\n", .{field.name} ++
+    inline for (@typeInfo(@TypeOf(secrets)).@"struct".field_names) |field_name| w.print("{s}" ++
+        (if (@hasField(@TypeOf(context), "counter")) "_{d}" else "") ++ " {x} {x}\n", .{field_name} ++
         (if (@hasField(@TypeOf(context), "counter")) .{context.counter} else .{}) ++ .{
         context.client_random,
-        @field(secrets, field.name),
+        @field(secrets, field_name),
     }) catch {};
 }
 
@@ -2905,7 +2905,7 @@ const KeyShare = struct {
                 ks.have_ml_kem = true;
             },
             .x25519 => if (!ks.have_x25519) {
-                ks.x25519_kp = try .generateDeterministic(ks.seed[144..176].*);
+                ks.x25519_kp = .generateDeterministic(ks.seed[144..176].*);
                 ks.have_x25519 = true;
             },
             // zig-libs tlsclient: std's key pairs, byte for byte, with the
@@ -3426,9 +3426,10 @@ test "server signature: a genuine P-256 / P-384 / RSA-PSS / PKCS#1 signature ver
     // else in this file fed `verifySignature` a bad one (both negative
     // controls survived, 2026-10-11). Content split in parts as the callers
     // pass it.
-    const parts = [_][]const u8{ strRepeat(" ", 64), "TLS 1.3, server CertificateVerify\x00", &(@as([32]u8, @splat(0x5c))) };
-    const content = parts[0] ++ parts[1] ++ parts[2];
-    const other = [_][]const u8{ strRepeat(" ", 64), "TLS 1.3, client CertificateVerify\x00", &(@as([32]u8, @splat(0x5c))) };
+    const five_c: [32]u8 = @splat(0x5c);
+    const parts = [_][]const u8{ strRepeat(" ", 64), "TLS 1.3, server CertificateVerify\x00", &five_c };
+    const content = strRepeat(" ", 64) ++ "TLS 1.3, server CertificateVerify\x00" ++ five_c;
+    const other = [_][]const u8{ strRepeat(" ", 64), "TLS 1.3, client CertificateVerify\x00", &five_c };
 
     // ECDSA P-256 and P-384, signed by std (independent of the verifiers
     // under test: p256's and, since 2026-10-13, p384's).
@@ -3633,7 +3634,7 @@ test "exportKeyingMaterial: TLS 1.2 refuses reserved labels; no exporter before 
 }
 
 /// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
-fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     const rep_result = comptime blk: {
         @setEvalBranchQuota(n * (s.len + 4) + 1000);
         var buf: [s.len * n:0]u8 = undefined;

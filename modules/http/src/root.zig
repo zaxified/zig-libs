@@ -252,8 +252,8 @@ pub const Method = enum {
     /// standard name, `.other` for any other token. The caller checks
     /// that `tok` is a token (`h1.isToken`).
     pub fn fromToken(tok: []const u8) Method {
-        inline for (@typeInfo(Method).@"enum".fields) |f| {
-            const m: Method = @enumFromInt(f.value);
+        inline for (@typeInfo(Method).@"enum".field_values) |v| {
+            const m: Method = @fromBackingInt(@intCast(v));
             if (m != .other and std.mem.eql(u8, tok, comptime m.token())) return m;
         }
         return .other;

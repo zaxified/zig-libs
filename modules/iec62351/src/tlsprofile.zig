@@ -69,7 +69,7 @@ pub const TlsVersion = enum(u16) {
     _,
 
     pub fn atLeast(v: TlsVersion, floor: TlsVersion) bool {
-        return @intFromEnum(v) >= @intFromEnum(floor);
+        return @backingInt(v) >= @backingInt(floor);
     }
 };
 
@@ -290,7 +290,7 @@ pub const Violation = enum {
 /// The outcome of a check: the set of rules that failed, in a fixed order so
 /// `first` is deterministic.
 pub const Report = struct {
-    violations: std.EnumSet(Violation) = .initEmpty(),
+    violations: std.EnumSet(Violation) = .empty,
 
     pub fn ok(r: Report) bool {
         return r.violations.count() == 0;
@@ -604,7 +604,7 @@ test "obsolete suites are rejected twice over: forbidden and not permitted" {
 
 test "an unknown cipher-suite code point is not permitted, and does not crash" {
     var s = conforming_session;
-    s.cipher_suite = @enumFromInt(0xdead);
+    s.cipher_suite = @fromBackingInt(@intCast(0xdead));
     const r = Profile.iec62351_3.checkSession(s);
     try testing.expect(r.has(.cipher_suite_not_permitted));
     try testing.expect(!r.has(.cipher_suite_forbidden));

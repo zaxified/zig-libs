@@ -1213,7 +1213,7 @@ pub const PathGuardError = error{ PathTooLong, PathForbidden };
 pub fn checkOriginPath(path: []const u8) PathGuardError!void {
     if (path.len > max_normalized_path) return error.PathTooLong;
     if (std.mem.indexOfScalar(u8, path, 0) != null or
-        std.ascii.indexOfIgnoreCase(path, "%00") != null)
+        std.ascii.findIgnoreCase(path, "%00") != null)
         return error.PathForbidden;
 }
 
@@ -6171,7 +6171,7 @@ test "serveStream: chunked body over max_body_bytes → 413 while streaming, mem
     // buffer combined (head 1 KiB + request-body 256 + response 64 + chunk
     // 128), so it can only be handled streaming; the cap fires long before
     // the wire ends and nothing is ever buffered whole.
-    const chunk = "40\r\n" ++ (strRepeat("x", 0x40)) ++ "\r\n";
+    const chunk = comptime "40\r\n" ++ (strRepeat("x", 0x40)) ++ "\r\n";
     const wire_bytes = "POST /drain HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n" ++
         (strRepeat(chunk, 64)) ++ "0\r\n\r\n" ++
         "GET /hello HTTP/1.1\r\nHost: t\r\n\r\n";
@@ -6185,7 +6185,7 @@ test "serveStream: chunked body over max_body_bytes → 413 while streaming, mem
 test "serveStream: chunked body exactly at max_body_bytes passes; unread overrun closes" {
     var hits: Hits = .init(0);
     var out_buf: [4096]u8 = undefined;
-    const chunk = "40\r\n" ++ (strRepeat("x", 0x40)) ++ "\r\n";
+    const chunk = comptime "40\r\n" ++ (strRepeat("x", 0x40)) ++ "\r\n";
     const exact = "POST /drain HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n" ++
         (strRepeat(chunk, 16)) ++ "0\r\n\r\n" ++
         "GET /hello HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n";
@@ -9536,7 +9536,7 @@ test "upgrade: a writer the h1 loop did not build refuses (h2, hand-built)" {
 }
 
 /// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
-fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     const rep_result = comptime blk: {
         @setEvalBranchQuota(n * (s.len + 4) + 1000);
         var buf: [s.len * n:0]u8 = undefined;

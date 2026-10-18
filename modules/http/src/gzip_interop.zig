@@ -177,7 +177,7 @@ fn checkRoute(
     try testing.expectEqual(@as(u8, 0), c1);
     const head = try readFile(io, dir, gpa, "head.txt");
     defer gpa.free(head);
-    if (std.ascii.indexOfIgnoreCase(head, "content-encoding: gzip") == null) {
+    if (std.ascii.findIgnoreCase(head, "content-encoding: gzip") == null) {
         std.debug.print("\n{s} {s}: not gzip-encoded; head:\n{s}\n", .{ proto, r.path, head });
         return error.NotCompressed;
     }
@@ -234,7 +234,7 @@ test "LIVE gzip: levels 1 and 9 decode the same way" {
 }
 
 /// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
-fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     const rep_result = comptime blk: {
         @setEvalBranchQuota(n * (s.len + 4) + 1000);
         var buf: [s.len * n:0]u8 = undefined;

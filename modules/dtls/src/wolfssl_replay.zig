@@ -254,7 +254,7 @@ const Recorded = struct {
                     .chain = &.{&cert_kat.client_cert_der},
                     .private_key = clientKey(),
                 } else null,
-                .key_share_group = @enumFromInt(self.offer_group),
+                .key_share_group = @fromBackingInt(@intCast(self.offer_group)),
             },
             .server => .{
                 .role = .server,
@@ -290,8 +290,8 @@ const Replay = struct {
     conn: ?Connection = null,
     tally: Tally = .{},
     cases_seen: usize = 0,
-    flows_seen: std.EnumSet(Flow) = .initEmpty(),
-    kx_seen: std.EnumSet(KeyExchange) = .initEmpty(),
+    flows_seen: std.EnumSet(Flow) = .empty,
+    kx_seen: std.EnumSet(KeyExchange) = .empty,
     retry_cases: usize = 0,
     /// Big enough for the whole of a hybrid ServerHello flight in one buffer.
     out: [4096]u8 = undefined,

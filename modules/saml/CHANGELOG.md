@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — Ported to Zig 0.17.0 (no source change needed).
 - **2026-10-17** — **NO CONSUMER-VISIBLE CHANGE:** consume burn 128 → 256 KiB, probe window 256 → 512 KiB: `consumeResponseXml` reached the 256 KiB window at CI's `-Dcpu` (the larger rsa capacity).
 
 - **2026-10-11** — **Fix (remote abort):** `decodeRedirectField` on a raw-DEFLATE field cut short

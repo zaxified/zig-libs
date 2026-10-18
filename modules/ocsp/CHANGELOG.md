@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — Ported to Zig 0.17.0 (no source change needed).
 - **2026-10-17** — **BREAKING (test-fixture API):** `der_writer` is now `rsa.der_writer` (the shared encoder; `src/der_writer.zig` removed). Renamed: `octet` → `octetString`, `seqOf` → `seq`, `setOf` → `set`, `integerU8` → `integerU64` (now adds the sign octet at ≥ 0x80), `enumerated` takes a `u64`; `implicitConstructed` removed (same octet as `explicit`). `buildRequest` output byte-identical.
 - **2026-10-09** — tests: deterministic fuzz driver `OCSP_FUZZ` over the existing harnesses (`parse`, `verify`); `verify` checks the genuine delegated response is accepted and a flipped one refused.
 - **2026-10-08** — **NO CONSUMER-VISIBLE CHANGE:** `ocsp_test.zig` follows p256's `ecdsaSign`, which now takes
