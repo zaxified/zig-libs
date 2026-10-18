@@ -4016,12 +4016,22 @@ test "Blinding.cached: equals the unblinded op across refreshes and key changes;
             var got: [max_modulus_len]u8 = undefined;
             try privateOpCrtPtr(sk, msg[0..k], plain[0..k], .none);
             const before = prng;
+            const prev = cache.pair;
             try privateOpCrtPtr(sk, msg[0..k], got[0..k], .{ .cached = &cache });
             try testing.expectEqualSlices(u8, plain[0..k], got[0..k]);
             // The generator is read on the first op for this key and then
             // every `refresh_every` ops, never in between.
             const drew = !std.mem.eql(u8, std.mem.asBytes(&before), std.mem.asBytes(&prng));
             try testing.expectEqual(i % BlindingCache.refresh_every == 0, drew);
+            // Between draws the pair is the previous one squared. Reusing
+            // the same `r` unchanged passes every other check here (mutation
+            // 2026-10-18), so the update itself is pinned.
+            if (!drew) {
+                try testing.expect(MontParams.eql(&cache.pair.rpe, &sk.p_mont.sq(&prev.rpe)));
+                try testing.expect(MontParams.eql(&cache.pair.rp_inv, &sk.p_mont.sq(&prev.rp_inv)));
+                try testing.expect(MontParams.eql(&cache.pair.rqe, &sk.q_mont.sq(&prev.rqe)));
+                try testing.expect(MontParams.eql(&cache.pair.rq_inv, &sk.q_mont.sq(&prev.rq_inv)));
+            }
             // The squared pair still blinds and unblinds: r^e·(r⁻¹)^e ≡ 1.
             var e_be: [4]u8 = undefined;
             std.mem.writeInt(u32, &e_be, sk.publicExponent(), .big);
@@ -4059,6 +4069,44 @@ test "Blinding.cached: equals the unblinded op across refreshes and key changes;
     const b = try signPkcs1v15(&sk2048, Sha256, "cached", &sig_plain);
     try testing.expectEqualSlices(u8, b, a);
     try testing.expect(!std.mem.eql(u8, std.mem.asBytes(&before_deinit), std.mem.asBytes(&prng)));
+}
+
+// The cache's key check compares the modulus AND the exponent. The test
+// above alternates keys of different widths, which a limb-count check alone
+// tells apart; here the other key differs only in `e` (same primes), or only
+// in `n` (same width) — a pair kept for the old key would blind with the
+// wrong `r^e` and fail as `error.FaultDetected` (mutation 2026-10-18).
+test "Blinding.cached: another exponent on the same modulus, or another modulus of the same width, draws afresh" {
+    var sk_a: SecretKey = undefined;
+    try SecretKey.fromPrimes(&sk_a, &kat512.p, &kat512.q, &kat512.e);
+    // Same primes, a different valid exponent (the first one coprime to λ).
+    var sk_e: SecretKey = undefined;
+    for ([_]u8{ 3, 5, 7, 11, 13, 17 }) |e| {
+        SecretKey.fromPrimes(&sk_e, &kat512.p, &kat512.q, &.{e}) catch continue;
+        break;
+    } else return error.NoSecondExponent;
+    // A different 512-bit modulus: same limb count as `sk_a`.
+    var key_rng = std.Random.DefaultPrng.init(0xb11d_cace_0003);
+    var kp: KeyPair = undefined;
+    try generate(&kp, key_rng.random(), 512, 65537);
+    try testing.expectEqual(sk_a.n_mont.L, kp.secret_key.n_mont.L);
+
+    var prng = std.Random.DefaultPrng.init(0xb11d_cace_0004);
+    var cache = BlindingCache.init(prng.random());
+    defer cache.deinit();
+    const keys = [_]*const SecretKey{ &sk_a, &sk_e, &sk_a, &kp.secret_key, &sk_a };
+    for (keys, 0..) |sk, i| {
+        const k = byteLen(sk.n.bits());
+        var msg: [max_modulus_len]u8 = @splat(0);
+        msg[k - 1] = @intCast(i + 2);
+        var plain: [max_modulus_len]u8 = undefined;
+        var got: [max_modulus_len]u8 = undefined;
+        try privateOpCrtPtr(sk, msg[0..k], plain[0..k], .none);
+        const before = prng;
+        try privateOpCrtPtr(sk, msg[0..k], got[0..k], .{ .cached = &cache });
+        try testing.expectEqualSlices(u8, plain[0..k], got[0..k]);
+        try testing.expect(!std.mem.eql(u8, std.mem.asBytes(&before), std.mem.asBytes(&prng)));
+    }
 }
 
 test "the blinded twins reach drawBlindingPair from the PUBLIC API, and produce identical output (audit R1)" {
