@@ -563,7 +563,7 @@ pub const SecretKey = struct {
     /// full `max_modulus_bits` capacity, whatever the key size).
     pub fn fromPrimes(out: *SecretKey, p_bytes: []const u8, q_bytes: []const u8, e_bytes: []const u8) FromPrimesError!void {
         const r = fromPrimesUnburned(out, p_bytes, q_bytes, e_bytes);
-        burn.stack(burn.private_op_burn);
+        burn.stack(burn.key_burn);
         return r;
     }
 
@@ -592,7 +592,7 @@ pub const SecretKey = struct {
     /// `PrivateKey.Validate` refuse.
     pub fn fromDer(out: *SecretKey, bytes: []const u8) FromDerError!void {
         const r = fromDerUnburned(out, bytes);
-        burn.stack(burn.private_op_burn);
+        burn.stack(burn.key_burn);
         return r;
     }
 
@@ -619,7 +619,7 @@ pub const SecretKey = struct {
     /// `error.UnsupportedPemLabel` here, never silently misparsed.
     pub fn fromPem(out: *SecretKey, text: []const u8) PemError!void {
         const r = fromPemUnburned(out, text);
-        burn.stack(burn.private_op_burn);
+        burn.stack(burn.key_burn);
         return r;
     }
 
@@ -681,7 +681,7 @@ pub const SecretKey = struct {
     /// reads (the password is then unused).
     pub fn fromPemEncrypted(out: *SecretKey, text: []const u8, password: []const u8) (PemError || FromEncryptedError)!void {
         const r = fromPemEncryptedUnburned(out, text, password);
-        burn.stack(burn.private_op_burn);
+        burn.stack(burn.key_burn);
         return r;
     }
 
@@ -705,7 +705,7 @@ pub const SecretKey = struct {
     /// `out` is zeroed on error.
     pub fn toPkcs8Encrypted(sk: *const SecretKey, password: []const u8, random: std.Random, opts: Pbes2Options, out: []u8) EncryptError![]u8 {
         const r = marshal.encryptedDer(sk, password, random, opts, out);
-        burn.stack(burn.private_op_burn);
+        burn.stack(burn.key_burn);
         return r;
     }
 
@@ -713,7 +713,7 @@ pub const SecretKey = struct {
     /// `out.len ≥ max_encrypted_pem_len` always suffices.
     pub fn toPemEncrypted(sk: *const SecretKey, password: []const u8, random: std.Random, opts: Pbes2Options, out: []u8) EncryptError![]u8 {
         const r = marshal.encryptedPem(sk, password, random, opts, out);
-        burn.stack(burn.private_op_burn);
+        burn.stack(burn.key_burn);
         return r;
     }
 };
@@ -1040,30 +1040,106 @@ pub const Blinding = union(enum) {
     /// oracle exposed to the network.
     none,
 
-    /// Deliberately NOT `pub`: the point of the type is that the choice is
-    /// visible at the call site, and a public accessor would hand callers
-    /// back the flat `?std.Random` this replaced.
-    fn rng(self: Blinding) ?std.Random {
-        return switch (self) {
-            .csprng => |r| r,
-            .none => null,
-        };
+    /// Base blinding ON from a pair the caller keeps between operations
+    /// (`BlindingCache`, the OpenSSL/BoringSSL `BN_BLINDING` scheme): each op
+    /// squares the cached pair instead of drawing and inverting a fresh `r`,
+    /// and a fresh `r` comes from the cache's CSPRNG every
+    /// `BlindingCache.refresh_every` ops. Same masking guarantee as
+    /// `.csprng` for a base the attacker chooses; ~5 % faster at 2048 bits
+    /// (the inverse and `r^e` were most of the blinding cost). The cache is
+    /// mutable and holds secrets — see `BlindingCache`.
+    cached: *BlindingCache,
+};
+
+/// The state behind `Blinding.cached`: a blinding pair for ONE key, in the
+/// CRT domain — `r^e` and `r⁻¹` modulo `p` and modulo `q` for a random unit
+/// `r` mod n — and the count of ops it may still serve.
+///
+/// Use: `var cache = BlindingCache.init(csprng); defer cache.deinit();` then
+/// pass `.{ .cached = &cache }` to any `…Blinded` entry point. One cache per
+/// thread: it is mutated by every op and has no lock. A cache follows the
+/// key it last served (its modulus and public exponent, both public); handed
+/// a different key, it draws a fresh pair for that one, so sharing a cache
+/// between keys is correct, only slower.
+///
+/// **It holds key material.** `r^e mod p` and `r⁻¹ mod p` together give `p`
+/// (`gcd(r^e·(r⁻¹)^e − 1 mod n, n)`), so the cache needs the care of the
+/// `SecretKey` itself: keep it out of logs and swap like the key, and call
+/// `deinit` when done. The stack burn of a private op does not reach it.
+///
+/// Update rule (`r ← r²` between fresh draws): `(r²)^e = (r^e)²` and
+/// `(r²)⁻¹ = (r⁻¹)²`, four half-size squarings per op instead of two
+/// half-size inverses and two `r^e`. Consecutive blinding values are
+/// related (known squares of each other) — the property OpenSSL accepts
+/// with its 32-op refresh; an attacker sees neither, both stay secret like
+/// the fresh `r` of `.csprng`.
+pub const BlindingCache = struct {
+    /// Fresh `r` after this many ops on one pair (OpenSSL's
+    /// `BN_BLINDING_COUNTER`).
+    pub const refresh_every: u32 = 32;
+
+    rng: std.Random,
+    /// Ops left on `pair`; 0 = draw a fresh pair on the next op.
+    left: u32,
+    /// The key `pair` belongs to: its public modulus (low `n_limbs` limbs)
+    /// and exponent.
+    n: MontElem,
+    n_limbs: usize,
+    e: u32,
+    pair: BlindingPair,
+
+    /// `rng` MUST be cryptographically secure (see `Blinding.csprng`).
+    pub fn init(rng: std.Random) BlindingCache {
+        return .{ .rng = rng, .left = 0, .n = undefined, .n_limbs = 0, .e = 0, .pair = undefined };
+    }
+
+    /// Wipe the pair (key material, see above); the cache stays usable and
+    /// draws afresh on its next op.
+    pub fn deinit(self: *BlindingCache) void {
+        std.crypto.secureZero(u8, std.mem.asBytes(&self.pair));
+        self.left = 0;
+        self.n_limbs = 0;
+    }
+
+    fn serves(self: *const BlindingCache, sk: *const SecretKey) bool {
+        const L = sk.n_mont.L;
+        return self.left != 0 and self.n_limbs == L and self.e == sk.publicExponent() and
+            std.mem.eql(u64, self.n[0..L], sk.n_mont.m[0..L]); // public values
+    }
+
+    /// The pair for this op: the cached one squared, or a fresh draw.
+    fn next(self: *BlindingCache, sk: *const SecretKey) void {
+        if (self.serves(sk)) {
+            const P = &self.pair;
+            P.rpe = sk.p_mont.sq(&P.rpe);
+            P.rp_inv = sk.p_mont.sq(&P.rp_inv);
+            P.rqe = sk.q_mont.sq(&P.rqe);
+            P.rq_inv = sk.q_mont.sq(&P.rq_inv);
+        } else {
+            self.pair = drawBlindingPair(sk, self.rng);
+            const L = sk.n_mont.L;
+            @memcpy(self.n[0..L], sk.n_mont.m[0..L]);
+            self.n_limbs = L;
+            self.e = sk.publicExponent();
+            self.left = refresh_every;
+        }
+        self.left -= 1;
     }
 };
 
-/// F2 base-blinding factors for one CRT private op, in the CRT domain: for a
-/// fresh random unit `r` mod n, `cp = (c mod p)·r^e mod p` and
-/// `cq = (c mod q)·r^e mod q` are the blinded halves, `rp_inv`/`rq_inv` the
-/// inverses of `r` mod p and mod q that undo them (`cp^dP = m1·r` mod p since
-/// `e·dP ≡ 1 (mod p − 1)`, likewise for q).
-const BlindingFactors = struct { cp: MontElem, cq: MontElem, rp_inv: MontElem, rq_inv: MontElem };
+/// An F2 base-blinding pair in the CRT domain: for a random unit `r` mod n,
+/// `r^e` and `r⁻¹` modulo `p` and modulo `q`. The op blinds the halves of
+/// its input, `cp = (c mod p)·r^e` (likewise mod q), and unblinds the
+/// results by `r⁻¹` (`cp^dP = m1·r` mod p since `e·dP ≡ 1 (mod p − 1)`).
+/// Every field is a montint result, zero above its prime's slot.
+const BlindingPair = struct { rpe: MontElem, rqe: MontElem, rp_inv: MontElem, rq_inv: MontElem };
 
 /// Draw a fresh blinding pair. `r` is drawn uniformly mod the PUBLIC modulus
 /// `n` (rejection on `n` only — nothing here samples against a secret prime);
 /// `rng` MUST be cryptographically secure — a predictable `r` voids the
 /// masking.
 ///
-/// Since 2026-10-14 the factors live in the CRT domain: `r mod p` and
+/// Since 2026-10-14 the pair lives in the CRT domain: `r mod p` and
 /// `r mod q` are inverted together by `safegcd.Inverter.invert2` (two
 /// half-size inversions, interleaved, ~½ the cost of one inverse mod n), and
 /// `r^e`, the blind and the unblind are half-size operations. Before, the
@@ -1071,8 +1147,9 @@ const BlindingFactors = struct { cp: MontElem, cq: MontElem, rp_inv: MontElem, r
 /// `bench-rsa`). Each inverse is checked (`r·r⁻¹ ≡ 1`) before use, so neither
 /// a non-unit `r` (shares `p` or `q`: probability ~2^-1023) nor a divstep-
 /// bound shortfall can produce a wrong unblinding; both just redraw — a
-/// decision about the random `r`, not about a secret.
-fn makeBlinding(sk: *const SecretKey, c: *const MontElem, rng: std.Random) BlindingFactors {
+/// decision about the random `r`, not about a secret. Still ~5 % of a
+/// 2048-bit op (2026-10-18), which `Blinding.cached` amortizes.
+fn drawBlindingPair(sk: *const SecretKey, rng: std.Random) BlindingPair {
     const n_len = sk.n_mont.byteLen();
     var e_be: [4]u8 = undefined;
     std.mem.writeInt(u32, &e_be, sk.publicExponent(), .big);
@@ -1094,7 +1171,7 @@ fn makeBlinding(sk: *const SecretKey, c: *const MontElem, rng: std.Random) Blind
         defer std.crypto.secureZero(u64, &rp);
         var rq = sk.q_mont.reduceLimbs(r_el[0..sk.n_mont.L]);
         defer std.crypto.secureZero(u64, &rq);
-        var out: BlindingFactors = undefined; // invert2 writes both inverses whole
+        var out: BlindingPair = undefined; // invert2 writes both inverses whole
         const units = BlindInverter.invert2(&rp, &sk.p_mont.m, &rq, &sk.q_mont.m, half_bits, &out.rp_inv, &out.rq_inv);
         // One verdict, read once: the four checks run mod the SECRET primes,
         // so each would otherwise be its own branch on p/q (ctgrind). It is
@@ -1105,13 +1182,9 @@ fn makeBlinding(sk: *const SecretKey, c: *const MontElem, rng: std.Random) Blind
             @intFromBool(MontParams.eql(&sk.q_mont.mul(&rq, &out.rq_inv), &one));
         if (ok == 0) continue;
 
-        // cp = (c mod p)·r^e mod p, cq likewise (public exponent).
-        var rpe = sk.p_mont.powPublic(&rp, e_s);
-        defer std.crypto.secureZero(u64, &rpe);
-        var rqe = sk.q_mont.powPublic(&rq, e_s);
-        defer std.crypto.secureZero(u64, &rqe);
-        out.cp = sk.p_mont.mul(&sk.p_mont.reduceLimbs(c[0..sk.n_mont.L]), &rpe);
-        out.cq = sk.q_mont.mul(&sk.q_mont.reduceLimbs(c[0..sk.n_mont.L]), &rqe);
+        // r^e mod p, r^e mod q (public exponent).
+        out.rpe = sk.p_mont.powPublic(&rp, e_s);
+        out.rqe = sk.q_mont.powPublic(&rq, e_s);
         return out;
     }
 }
@@ -1138,19 +1211,27 @@ fn privateOpCrtPtr(sk: *const SecretKey, in: []const u8, out: []u8, blinding: Bl
         std.crypto.secureZero(u64, ri.p[0..sk.p_mont.L]);
         std.crypto.secureZero(u64, ri.q[0..sk.q_mont.L]);
     };
-    if (blinding.rng()) |g| {
-        var b = makeBlinding(sk, &c, g);
-        // Every field is a montint result: zero above its slot, so only the
-        // slot limbs can hold a secret (wiping the 4 KiB struct byte by byte
-        // cost ~1 µs at the 8192-bit capacity).
-        defer for ([_]*MontElem{ &b.cp, &b.rp_inv }) |x| std.crypto.secureZero(u64, x[0..sk.p_mont.L]);
-        defer for ([_]*MontElem{ &b.cq, &b.rq_inv }) |x| std.crypto.secureZero(u64, x[0..sk.q_mont.L]);
-        cp = b.cp;
-        cq = b.cq;
-        r_inv = .{ .p = b.rp_inv, .q = b.rq_inv };
-    } else {
-        cp = sk.p_mont.reduceLimbs(c[0..sk.n_mont.L]);
-        cq = sk.q_mont.reduceLimbs(c[0..sk.n_mont.L]);
+    cp = sk.p_mont.reduceLimbs(c[0..sk.n_mont.L]);
+    cq = sk.q_mont.reduceLimbs(c[0..sk.n_mont.L]);
+    switch (blinding) {
+        .none => {},
+        .csprng => |g| {
+            var b = drawBlindingPair(sk, g);
+            // Every field is a montint result: zero above its slot, so only
+            // the slot limbs can hold a secret (wiping the 4 KiB struct byte
+            // by byte cost ~1 µs at the 8192-bit capacity).
+            defer for ([_]*MontElem{ &b.rpe, &b.rp_inv }) |x| std.crypto.secureZero(u64, x[0..sk.p_mont.L]);
+            defer for ([_]*MontElem{ &b.rqe, &b.rq_inv }) |x| std.crypto.secureZero(u64, x[0..sk.q_mont.L]);
+            cp = sk.p_mont.mul(&cp, &b.rpe);
+            cq = sk.q_mont.mul(&cq, &b.rqe);
+            r_inv = .{ .p = b.rp_inv, .q = b.rq_inv };
+        },
+        .cached => |cache| {
+            cache.next(sk);
+            cp = sk.p_mont.mul(&cp, &cache.pair.rpe);
+            cq = sk.q_mont.mul(&cq, &cache.pair.rqe);
+            r_inv = .{ .p = cache.pair.rp_inv, .q = cache.pair.rq_inv };
+        },
     }
 
     // The secret CRT parameters as montint elements, wiped on return.
@@ -1237,7 +1318,7 @@ pub fn rsadpCrt(comptime modulus_len: usize, c: [modulus_len]u8, sk: *const Secr
 }
 
 noinline fn rsadpCrtUnburned(comptime modulus_len: usize, c: [modulus_len]u8, sk: *const SecretKey) PrimitiveError![modulus_len]u8 {
-    return rsadpCrtBlinded(modulus_len, c, sk, .none);
+    return rsadpCrtBlindedUnburned(modulus_len, c, sk, .none);
 }
 
 /// `rsadpCrt` with an explicit F2 base-blinding choice.
@@ -1263,7 +1344,7 @@ pub fn rsasp1(comptime modulus_len: usize, m: [modulus_len]u8, sk: *const Secret
 }
 
 noinline fn rsasp1Unburned(comptime modulus_len: usize, m: [modulus_len]u8, sk: *const SecretKey) PrimitiveError![modulus_len]u8 {
-    return rsadpCrt(modulus_len, m, sk);
+    return rsadpCrtBlindedUnburned(modulus_len, m, sk, .none);
 }
 
 // ── P1: EMSA-PKCS1-v1_5 sign / verify (RFC 8017 §8.2, §9.2) ─────────────────
@@ -1431,7 +1512,7 @@ pub fn signPkcs1v15(sk: *const SecretKey, comptime Hash: type, msg: []const u8, 
 }
 
 noinline fn signPkcs1v15Unburned(sk: *const SecretKey, comptime Hash: type, msg: []const u8, out: []u8) SignPkcs1v15Error![]u8 {
-    return signPkcs1v15Blinded(sk, Hash, .none, msg, out);
+    return signPkcs1v15BlindedUnburned(sk, Hash, .none, msg, out);
 }
 
 /// `signPkcs1v15` with an explicit F2 base-blinding choice. The emitted
@@ -1689,7 +1770,7 @@ pub fn decryptOaep(sk: *const SecretKey, comptime Hash: type, ct: []const u8, la
 }
 
 noinline fn decryptOaepUnburned(sk: *const SecretKey, comptime Hash: type, ct: []const u8, label: []const u8, out: []u8) DecryptOaepError![]u8 {
-    return decryptOaepHBlinded(sk, Hash, Hash, .none, ct, label, out);
+    return decryptOaepHBlindedUnburned(sk, Hash, Hash, .none, ct, label, out);
 }
 
 /// `decryptOaep` with an explicit F2 base-blinding choice. The recovered
@@ -1701,7 +1782,7 @@ pub fn decryptOaepBlinded(sk: *const SecretKey, comptime Hash: type, blinding: B
 }
 
 noinline fn decryptOaepBlindedUnburned(sk: *const SecretKey, comptime Hash: type, blinding: Blinding, ct: []const u8, label: []const u8, out: []u8) DecryptOaepError![]u8 {
-    return decryptOaepHBlinded(sk, Hash, Hash, blinding, ct, label, out);
+    return decryptOaepHBlindedUnburned(sk, Hash, Hash, blinding, ct, label, out);
 }
 
 /// Decoupled-hash RSAES-OAEP decrypt (RFC 8017 §7.1.2). `LabelHash` is the
@@ -1719,7 +1800,7 @@ pub fn decryptOaepH(sk: *const SecretKey, comptime LabelHash: type, comptime Mgf
 }
 
 noinline fn decryptOaepHUnburned(sk: *const SecretKey, comptime LabelHash: type, comptime MgfHash: type, ct: []const u8, label: []const u8, out: []u8) DecryptOaepError![]u8 {
-    return decryptOaepHBlinded(sk, LabelHash, MgfHash, .none, ct, label, out);
+    return decryptOaepHBlindedUnburned(sk, LabelHash, MgfHash, .none, ct, label, out);
 }
 
 /// `decryptOaepH` with an explicit F2 base-blinding choice — the one entry
@@ -2441,7 +2522,7 @@ pub const FromPkcs8Error = error{ InvalidDer, InvalidPrivateKey };
 /// `fromPkcs8Encrypted`.
 pub fn fromPkcs8(out: *SecretKey, bytes: []const u8) FromPkcs8Error!void {
     const r = fromPkcs8Unburned(out, bytes);
-    burn.stack(burn.private_op_burn);
+    burn.stack(burn.key_burn);
     return r;
 }
 
@@ -2518,7 +2599,7 @@ pub const FromEncryptedError = error{
 /// wiped before return.
 pub fn fromPkcs8Encrypted(out: *SecretKey, der: []const u8, password: []const u8) FromEncryptedError!void {
     const r = fromPkcs8EncryptedUnburned(out, der, password);
-    burn.stack(burn.private_op_burn);
+    burn.stack(burn.key_burn);
     return r;
 }
 
@@ -2825,7 +2906,7 @@ pub const OpensshCipher = enum {
 /// to match the derived one as an integrity cross-check).
 pub fn fromOpenSSH(out: *SecretKey, text: []const u8, passphrase: []const u8) FromOpenSSHError!void {
     const r = fromOpenSSHUnburned(out, text, passphrase);
-    burn.stack(burn.private_op_burn);
+    burn.stack(burn.key_burn);
     return r;
 }
 
@@ -3189,7 +3270,7 @@ pub const GenerateError = error{
 /// grows (2048+ is noticeably slow in Debug builds).
 pub fn generate(out: *KeyPair, random: std.Random, bits: usize, e: u64) GenerateError!void {
     const r = generateUnburned(out, random, bits, e);
-    burn.stack(burn.private_op_burn);
+    burn.stack(burn.key_burn);
     return r;
 }
 
@@ -3893,29 +3974,94 @@ test "CRT base blinding round-trips and matches the unblinded result (audit F2)"
 
 // ── B6 RNG-seam pins (2026-08-12) ─────────────────────────────────────
 //
-// R1 was: F2 base blinding existed (`makeBlinding`) but the three private-key
+// R1 was: F2 base blinding existed (`makeBlinding`, now `drawBlindingPair`) but the three private-key
 // entry points that run over ATTACKER-CHOSEN input — `decryptOaep`,
 // `decryptOaepH`, `signPkcs1v15` (and the `rsadpCrt` primitive) — hard-coded
 // `privateOpCrt(…, null)`, and the public API had no parameter through which a
 // consumer could turn it on. The default is unchanged (see `Blinding`); what
 // changed is that there is now a way to ask, and the choice has a name.
 
-test "Blinding: exactly two arms, and the unblinded one is a name rather than a null" {
+test "Blinding: three arms, and the unblinded one is a name rather than a null" {
     const info = @typeInfo(Blinding).@"union";
-    try testing.expectEqual(@as(usize, 2), info.fields.len);
+    try testing.expectEqual(@as(usize, 3), info.fields.len);
     try testing.expectEqualStrings("csprng", info.fields[0].name);
     try testing.expectEqualStrings("none", info.fields[1].name);
+    try testing.expectEqualStrings("cached", info.fields[2].name);
     // `.none` carries no payload — it is a decision, not an absent argument.
     try testing.expectEqual(void, info.fields[1].type);
-
-    var prng = std.Random.DefaultPrng.init(0xb11d_0000_5eed_0009);
-    const on: Blinding = .{ .csprng = prng.random() };
-    const off: Blinding = .none;
-    try testing.expect(on.rng() != null);
-    try testing.expect(off.rng() == null);
+    try testing.expectEqual(*BlindingCache, info.fields[2].type);
 }
 
-test "the blinded twins reach makeBlinding from the PUBLIC API, and produce identical output (audit R1)" {
+// `Blinding.cached` (2026-10-18): the cached pair is squared per op and
+// redrawn every `refresh_every` ops or on a key change. Each case compares
+// against the unblinded op, so a wrong pair — one not satisfying
+// `r^e·(r⁻¹)^e ≡ 1` — fails as a different output or `error.FaultDetected`.
+test "Blinding.cached: equals the unblinded op across refreshes and key changes; draws only on refresh" {
+    var sk512: SecretKey = undefined;
+    try SecretKey.fromPrimes(&sk512, &kat512.p, &kat512.q, &kat512.e);
+    const sk2048 = try kat2048.secretKey();
+    var msg_rng = std.Random.DefaultPrng.init(0xb11d_cace_0001);
+    var prng = std.Random.DefaultPrng.init(0xb11d_cace_0002);
+    var cache = BlindingCache.init(prng.random());
+    defer cache.deinit();
+
+    const n_ops = 2 * BlindingCache.refresh_every + 5;
+    for ([_]*const SecretKey{ &sk512, &sk2048 }) |sk| {
+        const k = byteLen(sk.n.bits());
+        for (0..n_ops) |i| {
+            var msg: [max_modulus_len]u8 = undefined;
+            msg_rng.random().bytes(msg[0..k]);
+            msg[0] = 0; // < n
+            var plain: [max_modulus_len]u8 = undefined;
+            var got: [max_modulus_len]u8 = undefined;
+            try privateOpCrtPtr(sk, msg[0..k], plain[0..k], .none);
+            const before = prng;
+            try privateOpCrtPtr(sk, msg[0..k], got[0..k], .{ .cached = &cache });
+            try testing.expectEqualSlices(u8, plain[0..k], got[0..k]);
+            // The generator is read on the first op for this key and then
+            // every `refresh_every` ops, never in between.
+            const drew = !std.mem.eql(u8, std.mem.asBytes(&before), std.mem.asBytes(&prng));
+            try testing.expectEqual(i % BlindingCache.refresh_every == 0, drew);
+            // The squared pair still blinds and unblinds: r^e·(r⁻¹)^e ≡ 1.
+            var e_be: [4]u8 = undefined;
+            std.mem.writeInt(u32, &e_be, sk.publicExponent(), .big);
+            var one: MontElem = MontParams.zero;
+            one[0] = 1;
+            const P = &cache.pair;
+            try testing.expect(MontParams.eql(&sk.p_mont.mul(&P.rpe, &sk.p_mont.powPublic(&P.rp_inv, stripLeadingZeros(&e_be))), &one));
+            try testing.expect(MontParams.eql(&sk.q_mont.mul(&P.rqe, &sk.q_mont.powPublic(&P.rq_inv, stripLeadingZeros(&e_be))), &one));
+        }
+    }
+
+    // Alternating keys: every op is a key change, so every op draws.
+    for (0..4) |i| {
+        const sk: *const SecretKey = if (i % 2 == 0) &sk512 else &sk2048;
+        const k = byteLen(sk.n.bits());
+        var msg: [max_modulus_len]u8 = @splat(0);
+        msg[k - 1] = @intCast(i + 2);
+        var plain: [max_modulus_len]u8 = undefined;
+        var got: [max_modulus_len]u8 = undefined;
+        try privateOpCrtPtr(sk, msg[0..k], plain[0..k], .none);
+        const before = prng;
+        try privateOpCrtPtr(sk, msg[0..k], got[0..k], .{ .cached = &cache });
+        try testing.expectEqualSlices(u8, plain[0..k], got[0..k]);
+        try testing.expect(!std.mem.eql(u8, std.mem.asBytes(&before), std.mem.asBytes(&prng)));
+    }
+
+    // deinit wipes the pair and forgets the key: the next op draws afresh.
+    cache.deinit();
+    try testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&cache.pair), 0));
+    const before_deinit = prng;
+    var sig: [max_modulus_len]u8 = undefined;
+    var sig_plain: [max_modulus_len]u8 = undefined;
+    const Sha256 = std.crypto.hash.sha2.Sha256;
+    const a = try signPkcs1v15Blinded(&sk2048, Sha256, .{ .cached = &cache }, "cached", &sig);
+    const b = try signPkcs1v15(&sk2048, Sha256, "cached", &sig_plain);
+    try testing.expectEqualSlices(u8, b, a);
+    try testing.expect(!std.mem.eql(u8, std.mem.asBytes(&before_deinit), std.mem.asBytes(&prng)));
+}
+
+test "the blinded twins reach drawBlindingPair from the PUBLIC API, and produce identical output (audit R1)" {
     const sk = try kat2048.secretKey();
     const pk = try kat2048.publicKey();
     const k = byteLen(sk.n.bits());
@@ -3923,7 +4069,7 @@ test "the blinded twins reach makeBlinding from the PUBLIC API, and produce iden
 
     // Two generators in the same state. Every case below drives one of them
     // through a `…Blinded` entry point and leaves the other untouched: if the
-    // generator never reaches `makeBlinding`, the two states stay equal and
+    // generator never reaches `drawBlindingPair`, the two states stay equal and
     // the assertion fails. That is what pins "the knob is wired", as opposed
     // to "the knob exists".
     const seed = 0xb11d_0000_5eed_000a;

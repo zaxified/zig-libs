@@ -20,6 +20,8 @@
 //!   verify_<b>  `verifyPkcs1v15(Sha256)` vs OpenSSL verify
 //!   dec_<b>     `decryptOaep(Sha256)` (blinding OFF) vs OpenSSL OAEP decrypt
 //!   decbl_<b>   `decryptOaepBlinded(.csprng)` vs the same OpenSSL decrypt
+//!   signca_<b>, decca_<b>  the same with `.cached` blinding (one
+//!               `BlindingCache`, the scheme OpenSSL itself runs)
 //! The message is 32 bytes (OpenSSL side: `SHA256` + `EVP_PKEY_sign/verify`).
 //!
 //! Method (`testkit.bench`): each side doubles its batch until it
@@ -42,7 +44,7 @@ const work_dir = ".zig-cache/bench-rsa";
 const default_so = "/usr/lib/x86_64-linux-gnu/libcrypto.so.3";
 const sizes = [_]usize{ 2048, 3072, 4096 };
 
-const Kind = enum { sign, signbl, verify, dec, decbl };
+const Kind = enum { sign, signbl, signca, verify, dec, decbl, decca };
 const Op = struct { kind: Kind, size: usize };
 
 const Key = struct {
@@ -57,6 +59,7 @@ const Ctx = struct {
     msg: [32]u8,
     out: [512]u8,
     rng: std.Random,
+    cache: rsa.BlindingCache,
     op: Op = undefined,
 };
 
@@ -65,12 +68,14 @@ fn once(x: *Ctx) usize {
     switch (x.op.kind) {
         .sign => return (rsa.signPkcs1v15(k.sk, Sha256, &x.msg, &x.out) catch unreachable).len,
         .signbl => return (rsa.signPkcs1v15Blinded(k.sk, Sha256, .{ .csprng = x.rng }, &x.msg, &x.out) catch unreachable).len,
+        .signca => return (rsa.signPkcs1v15Blinded(k.sk, Sha256, .{ .cached = &x.cache }, &x.msg, &x.out) catch unreachable).len,
         .verify => {
             rsa.verifyPkcs1v15(k.pk, Sha256, &x.msg, k.sig) catch unreachable;
             return 1;
         },
         .dec => return (rsa.decryptOaep(k.sk, Sha256, k.ct, "", &x.out) catch unreachable).len,
         .decbl => return (rsa.decryptOaepBlinded(k.sk, Sha256, .{ .csprng = x.rng }, k.ct, "", &x.out) catch unreachable).len,
+        .decca => return (rsa.decryptOaepBlinded(k.sk, Sha256, .{ .cached = &x.cache }, k.ct, "", &x.out) catch unreachable).len,
     }
 }
 
@@ -90,6 +95,8 @@ pub fn main(init: std.process.Init) !u8 {
     var csprng = std.Random.DefaultCsprng.init(@splat(0x5a));
     var ctx: Ctx = undefined;
     ctx.rng = csprng.random();
+    ctx.cache = rsa.BlindingCache.init(ctx.rng);
+    defer ctx.cache.deinit();
     prng.random().bytes(&ctx.msg);
     try dir.writeFile(io, .{ .sub_path = "msg.bin", .data = &ctx.msg });
 
@@ -124,9 +131,9 @@ pub fn main(init: std.process.Init) !u8 {
     var ws: std.ArrayList(Work) = .empty;
     for (sizes) |bits| for (std.enums.values(Kind)) |kind| {
         const theirs: []const u8 = switch (kind) {
-            .sign, .signbl => "sign",
+            .sign, .signbl, .signca => "sign",
             .verify => "verify",
-            .dec, .decbl => "dec",
+            .dec, .decbl, .decca => "dec",
         };
         try ws.append(arena, .{
             .name = try std.fmt.allocPrint(arena, "{s}_{d}", .{ @tagName(kind), bits }),

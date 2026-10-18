@@ -115,11 +115,13 @@ fn reloadVolatile(comptime T: type, s: *const T) T {
     return out;
 }
 
-const Target = enum { crt, noncrt, keygen };
+const Target = enum { crt, crtbl, crtcache, noncrt, keygen };
 const Taint = enum { yes, no };
 
 fn parseTarget(s: []const u8) !Target {
     if (std.mem.eql(u8, s, "crt")) return .crt;
+    if (std.mem.eql(u8, s, "crtbl")) return .crtbl;
+    if (std.mem.eql(u8, s, "crtcache")) return .crtcache;
     if (std.mem.eql(u8, s, "noncrt")) return .noncrt;
     if (std.mem.eql(u8, s, "keygen")) return .keygen;
     return error.UnknownTarget;
@@ -196,7 +198,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // else -- see the module doc comment for why n/n_mont/e stay public in
     // both targets.
     switch (target) {
-        .crt => {
+        .crt, .crtbl, .crtcache => {
             taintBytes(taint, std.mem.asBytes(&sk.p));
             taintBytes(taint, std.mem.asBytes(&sk.q));
             taintBytes(taint, std.mem.asBytes(&sk.dp));
@@ -218,9 +220,23 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     const sk_reloaded = reloadVolatile(rsa.SecretKey, &sk);
 
+    // `crtbl`/`crtcache` (2026-10-18): the same CRT op with base blinding
+    // on, `.csprng` (a fresh pair drawn and inverted) and `.cached` (two
+    // ops on one cache: the first draws the pair, the second squares it).
+    // The generator is a fixed-seed ChaCha: `r` is random, not secret input
+    // to the claim, and its rejection against the PUBLIC n is a branch on
+    // it by design; everything mod p, q is covered by the key taint.
+    var chacha = std.Random.ChaCha.init(@splat(0x42));
     var out: [modulus_len]u8 = undefined;
     switch (target) {
         .crt => out = try rsa.rsadpCrt(modulus_len, c, &sk_reloaded),
+        .crtbl => out = try rsa.rsadpCrtBlinded(modulus_len, c, &sk_reloaded, .{ .csprng = chacha.random() }),
+        .crtcache => {
+            var cache = rsa.BlindingCache.init(chacha.random());
+            defer cache.deinit();
+            out = try rsa.rsadpCrtBlinded(modulus_len, c, &sk_reloaded, .{ .cached = &cache });
+            out = try rsa.rsadpCrtBlinded(modulus_len, c, &sk_reloaded, .{ .cached = &cache });
+        },
         .noncrt => out = try rsa.rsadp(modulus_len, c, &sk_reloaded),
         .keygen => unreachable,
     }

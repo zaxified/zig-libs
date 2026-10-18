@@ -61,6 +61,15 @@ vectors (see "Verification" below).
   so a consumer whose input is attacker-chosen (an OAEP decryption oracle
   above all) can turn masking on without editing the module. Output is
   byte-identical either way; only the side-channel posture differs.
+- **Cached blinding** (`Blinding.cached`, the OpenSSL scheme): a server that
+  blinds every op keeps one `BlindingCache` per thread and saves ~5 % of a
+  2048-bit op over `.csprng`. The cache holds key material — wipe it:
+
+  ```zig
+  var cache = rsa.BlindingCache.init(csprng.random());
+  defer cache.deinit();
+  const pt = try rsa.decryptOaepBlinded(&sk, Sha256, .{ .cached = &cache }, ct, "", &buf);
+  ```
 
 ## Provenance
 

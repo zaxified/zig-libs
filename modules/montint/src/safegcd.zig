@@ -28,13 +28,15 @@
 //! PUBLIC modulus bit length — `f, g` never grow past the modulus and `d, e`
 //! stay in `(−2m, m)`, so the limbs above `k` are never touched.
 //!
-//! Trip count: `⌊(49·b + 57)/17⌋` divsteps for a `b`-bit modulus (Bernstein–
-//! Yang Theorem 11.2's bound for the original divstep, `b ≥ 46`), rounded up
-//! to whole batches. The half-delta variant used here converges at least as
-//! fast in practice (libsecp256k1 proves 590 for 256 bits where this formula
-//! gives 741), and the result is NOT trusted on the bound alone: `invert`
-//! returns `false` unless `g = 0` and `f = ±1` at the end, and the caller
-//! (`makeBlinding`) additionally checks `x·x⁻¹ ≡ 1` and redraws otherwise.
+//! Trip count: `⌊(45907·b + 26313)/19929⌋` divsteps for a `b`-bit modulus,
+//! the bound for the half-delta divstep used here with `0 ≤ g ≤ f`
+//! (sipa/safegcd-bounds `genproofhd.md`, a computer-aided convex-hull proof;
+//! libsecp256k1 runs 590 for 256 bits, one below it), rounded up to whole
+//! batches — 40 batches at 1024 bits. Until 2026-10-18 it was Bernstein–Yang
+//! Theorem 11.2's bound for the original divstep (51 batches). The result is
+//! NOT trusted on the bound alone: `invert` returns `false` unless `g = 0`
+//! and `f = ±1` at the end, and the callers (rsa's `drawBlindingPair`,
+//! `DynModint.inverse`) additionally check `x·x⁻¹ ≡ 1`.
 //!
 //! ## Constant-time contract
 //!
@@ -315,9 +317,17 @@ pub fn Inverter(comptime max_bits: usize) type {
             return .{ st1.finish(k, out1), st2.finish(k, out2) };
         }
 
+        /// Batches for `⌊(45907·b + 26313)/19929⌋` hddivsteps, the bound for
+        /// the half-delta divstep run here with `0 ≤ g ≤ f < 2^b`
+        /// (sipa/safegcd-bounds `genproofhd.md`; libsecp256k1's 590 for 256
+        /// bits sits one below it). Until 2026-10-18 this was Bernstein–Yang
+        /// Theorem 11.2's bound for the ORIGINAL divstep, `(49·b + 57)/17`:
+        /// 51 batches for rsa-2048's 1024-bit primes instead of 40, ~1 % of a
+        /// blinded private op. The result is checked either way (`invert`'s
+        /// verdict, then every caller's `x·x⁻¹ ≡ 1`), so a shortfall would be
+        /// a refusal or a redraw, never a wrong inverse.
         fn batchCount(nbits: usize) usize {
-            const b = @max(nbits, 46);
-            const steps = (49 * b + 57) / 17;
+            const steps = (45907 * nbits + 26313) / 19929;
             return (steps + 58) / 59;
         }
 

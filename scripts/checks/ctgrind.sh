@@ -186,7 +186,7 @@ declare -A TARGETS=(
     [montint]="small portable asmcore field ffcontrol dyn"
     # ── added 2026-09-09, A1 R2's first four ────────────────────────────────
     [p256]="comb sign"
-    [rsa]="crt noncrt keygen"
+    [rsa]="crt crtbl crtcache noncrt keygen"
     [slhdsa]="seed prf"
     # ⚠ `falcon` is here against its own SPEC.md, which argued it should NOT
     # have a row because the red would only measure the sampler's deliberate
@@ -510,6 +510,8 @@ declare -A PATTERN=(
     # someone else would be the evasion this gate exists to refuse.
     [p256/sign]='ecdsa[.]zig|common[.]zig|scalar[.]zig|group[.]zig|field[.]zig|fast_core[.]zig|point_asm[.]zig'
     [rsa/crt]='root[.]zig|ff[.]zig|dyn[.]zig|nt[.]zig|montint[.]zig|limbs[.]zig|asm_core[.]zig'
+    [rsa/crtbl]='root[.]zig|ff[.]zig|dyn[.]zig|nt[.]zig|montint[.]zig|limbs[.]zig|asm_core[.]zig|safegcd[.]zig'
+    [rsa/crtcache]='root[.]zig|ff[.]zig|dyn[.]zig|nt[.]zig|montint[.]zig|limbs[.]zig|asm_core[.]zig|safegcd[.]zig'
     [rsa/noncrt]='root[.]zig|ff[.]zig|dyn[.]zig|nt[.]zig|montint[.]zig|limbs[.]zig|asm_core[.]zig'
     [rsa/keygen]='root[.]zig|ff[.]zig|dyn[.]zig|nt[.]zig|montint[.]zig|limbs[.]zig|asm_core[.]zig'
     [slhdsa/seed]='engine[.]zig|address[.]zig'
@@ -833,6 +835,8 @@ declare -A LABEL=(
     [p256/comb]='p256 combMulBase'
     [p256/sign]='p256 sign+std ecdsa'
     [rsa/crt]='rsa CRT p/q+std ff'
+    [rsa/crtbl]='rsa CRT p/q, .csprng blinding'
+    [rsa/crtcache]='rsa CRT p/q, .cached blinding x2'
     [rsa/noncrt]='rsa non-CRT d+std ff'
     [rsa/keygen]='rsa fromPrimes, p/q tainted'
     [slhdsa/seed]='slhdsa SK.seed'

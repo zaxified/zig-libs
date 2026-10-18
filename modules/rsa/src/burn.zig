@@ -28,15 +28,26 @@ pub noinline fn stack(comptime n: usize) void {
     for (0..buf.len) |i| p[i] = @splat(0);
 }
 
-/// Signing / decryption dirtied 187 KiB in ReleaseFast at the 4096-bit cap
-/// (2026-10-08): the key is carried at the capacity whatever its size, so the
-/// depth does not shrink with the key. With the 8192-bit cap (2026-10-14)
-/// `fromPrimes` alone dirtied 325 KiB (STACKPROBE residue 232–277 KiB deep
-/// under the old 200 KiB burn); at 384 KiB every probed call is clean.
-/// ~8 µs of zeroing against a 2048-bit private operation's ~0.6–1 ms.
-/// Nested public calls (`signPkcs1v15` → `signPkcs1v15Blinded`) burn at
-/// each level.
-pub const private_op_burn = 384 * 1024;
+/// Signing, decryption and the raw RSADP/RSASP1 primitives. They dirtied
+/// 121.7 KiB (OAEP decrypt, PKCS#1 v1.5 sign, at every key size from 2048 to
+/// 8192 bits) to 124.9 KiB (non-CRT `rsadp` + `signPss`, 8192 bits) in
+/// ReleaseFast at the 8192-bit cap (2026-10-18): the operands are carried at
+/// the capacity, so the depth does not follow the key. 160 KiB leaves ~28 %
+/// headroom; `stackprobe_test.zig` goes red when a body outgrows it. Until
+/// 2026-10-18 these shared the key-loading burn (384 KiB), and the nested
+/// public calls (`decryptOaepBlinded` → `decryptOaepHBlinded`, `rsasp1` →
+/// `rsadpCrt` → `rsadpCrtBlinded`) burned at each level: 2-3 × 384 KiB,
+/// ~2 % of a 2048-bit blinded decryption, more than the 256 KiB L2 of the
+/// machine it was measured on. Now a public call runs the inner BODY
+/// (`…Unburned`) and burns once.
+pub const private_op_burn = 160 * 1024;
+
+/// Key loading and generation (`fromPrimes` and everything routed through it,
+/// `generate`, the encrypted exports). `fromPrimes` alone dirtied 325 KiB at
+/// the 8192-bit cap (2026-10-14: STACKPROBE residue 232–277 KiB deep under
+/// the old 200 KiB burn); at 384 KiB every probed call is clean. ~8 µs of
+/// zeroing, once per key.
+pub const key_burn = 384 * 1024;
 
 /// `bcryptPbkdf` and `Blowfish.init` (4 KiB Blowfish state per frame, one
 /// SHA-512 of the passphrase): one-shot slow KDF, generous size, not yet
