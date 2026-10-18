@@ -32,7 +32,7 @@ _ = crc32.backend();                           // .pclmul / .armv8 / .table
 `AT_HWCAP` on Linux arm64), once, unless the build target already guarantees
 it — so a binary built for baseline x86-64 still folds with PCLMULQDQ on a
 CPU that has it. The instructions are inline assembly, which Zig 0.16 emits
-whatever the target's feature set. Inputs under 32 bytes use the table,
+whatever the target's feature set (measured on 0.16, not re-checked on 0.17). Inputs under 32 bytes use the table,
 which is as fast there.
 
 ## Speed

@@ -179,5 +179,8 @@ The other run (same day, spreads ≤ 20 %): ours/musl 0.41–1.05, worst again
 
 ## Open
 
-- Delete this module once std's compiler_rt `memset` is vectorised (check on each
+- **TRIGGERED on Zig 0.17.0 (2026-10-18):** `lib/compiler_rt.zig` `memset` is now
+  `fastMemset` (vector stores with overlapping ends; byte-wise `smallMemset` only in
+  ReleaseSmall). Re-measure `bench-fastmem` against it and decide delete / keep for
+  ReleaseSmall and the `rep stosq` large-clear path. Original item: delete this module once std's compiler_rt `memset` is vectorised (check on each
   Zig upgrade: `lib/compiler_rt.zig`, `pub fn memset`).

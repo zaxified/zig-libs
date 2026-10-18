@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC statements that `std.crypto.random` is gone / std has no ambient entropy re-checked against the 0.17.0 std (still true).
+
 - **2026-10-18** — Ported to Zig 0.17.0: tests: `EnumSet.empty`, enum iteration via `field_values`.
 - **2026-10-11** — **HashSLH-DSA pre-hash (FIPS 205 §10.2.2, Algorithms 23/25):** `signPrehash`, `signPrehashDigest`, `verifyPrehash`, `verifyPrehashDigest` and the `PreHash` enum (`src/prehash.zig`, re-exported as `slhdsa.prehash`; SHA-2 ×6, SHA3 ×4, SHAKE128/256 with their DER OIDs). Additive, no change to existing entry points. Tests: NIST ACVP pre-hash sigGen (all twelve PH functions, deterministic + hedged, SHA2-128f and SHAKE-128f) and sigVer (valid, modified message/R/SIGFORS) vectors, digest-length and context-bound checks; the verify fuzz harnesses also feed the pure-signature fixture to the pre-hash verifiers. Scope core → parity.
 

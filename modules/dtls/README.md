@@ -49,7 +49,7 @@ Implemented and validated:
   leaf-to-trust-anchor check (`certauth.zig`) that routes PEER-supplied DER
   through the `x509` module's bounds-checked `spkiOf`/`safeCertificate`
   bridge rather than `std.crypto.Certificate.parse` directly (that std path
-  was confirmed by fuzzing to crash on adversarial DER in Zig 0.16 — closed
+  was confirmed by fuzzing to crash on adversarial DER in Zig 0.16 (reader unchanged in 0.17.0) — closed
   here, see `certauth.zig`'s "CLOSED GAP" note).
 
 Real framing (as before): unified + legacy record headers, handshake
@@ -194,8 +194,8 @@ the middle of an incomplete one — see `handleFlight`'s "KNOWN LIMIT".
 (multi-hop chains, name constraints, revocation — `.trust_anchor` is a
 minimal one-hop check only), `CertificateEntry` extensions (OCSP/SCT),
 0-RTT/early data,
-session resumption, key update, and the CCM suites (Zig 0.16 std ships only
-a 13-byte-nonce CCM; the TLS/DTLS profile needs a 12-byte nonce — see
+session resumption, key update, and the CCM suites (Zig 0.17 std ships only
+13-byte-nonce CCM presets, its generic `AesCcm` is not `pub`; the TLS/DTLS profile needs a 12-byte nonce — see
 `src/aead.zig`).
 
 ## Import

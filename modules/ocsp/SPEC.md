@@ -133,7 +133,7 @@ so a malformed length yields a catchable error instead of a process abort.
 Consequences:
 
 - The module **never** calls `std.crypto.Certificate.parse` on untrusted input
-  (its extension-walk can panic on hostile DER under Zig 0.16). It walks
+  (its extension-walk can panic on hostile DER under Zig 0.16; its DER reader is unchanged in 0.17.0). It walks
   certificate structure itself (`parseCert`) with the same bounded reader, and
   decodes the ECDSA `SEQUENCE { r, s }` itself rather than via a std parser.
 - `parseCert` requires an embedded certificate's outer `signatureAlgorithm` to

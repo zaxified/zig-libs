@@ -476,6 +476,15 @@ libsodium 1.015–1.044 (that column's spread reached 7.8 %). Earlier the same d
 the u64-lane pass: 16 KiB 1.096–1.101 (P3 by 0.001); 2026-10-10, before both passes: 16 KiB
 1.31–1.33, 1420 B 1.05–1.08.
 
+**On Zig 0.17.0 (2026-10-18, migration check; the table above is the 0.16.0 measurement).**
+0.17 lowered the `[N]u8` <-> wide-lane `@Vector` `@bitCast` in the Poly1305 loads and the
+keystream stores byte by byte; the loads and stores now go through `@Vector(n, u8)` and a
+vector-to-vector `@bitCast`, which restores the 0.16 instruction counts. `count-insns`
+(ReleaseFast, x86_64_v3), 0.16 baseline -> 0.17 after the fix: seal-1KiB 8237.1 -> 8059.1,
+seal-16KiB 82757.6 -> 82579.5 (before the fix 34294.1 / 500614.5). `bench-chachapoly` on 0.17,
+on a noisy machine (spread up to 105 %): ref 0.51–0.94× OpenSSL. This is a loaded-machine
+check, not a re-measurement of the card; the card's figures stay the 2026-10-13 ones.
+
 **The 2026-10-13 pass** (each step measured with this bench; profiles from `perf`): OpenSSL's
 EVP ChaCha20-Poly1305 is two passes too (its AEAD costs the sum of its ChaCha20 and Poly1305), so
 the stitched one-pass lever below was not the gap — both kernels were. (1) ChaCha20: the 8×8

@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC brought up to Zig 0.17.0 (version statements, snippets, measurement labels).
+
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Ported to Zig 0.17.0. `std.meta.Int` -> `@Int` (vdf.zig).
 
 - **2026-10-10** — **NO CONSUMER-VISIBLE CHANGE:** deterministic fuzz driver (`VDF_FUZZ`, `src/fuzz_test.zig`): a genuine (x, y, T, proof) is accepted and every damaged copy refused (flipped octets, edge values 0/1/N-1/N/N+2/2^2048-1, wrong lengths, another delay, a proof of another statement); `Proof.fromBytes` accepts exactly `modulus_bytes` and round-trips; `eval` equals the naive squaring chain and its output proves and verifies. 200,000 codec runs clean in ReleaseSafe; verify and eval run at their scale (the proof work costs ~5 ms per run).

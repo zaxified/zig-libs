@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC statements about std AES (128/256 only, no CBC) and the two std software-backend defects re-checked against the 0.17.0 std (both defects are still there).
+
 - **2026-10-18** — Ported to Zig 0.17.0. No source change beyond the repo-wide codemod (all `@bitCast` sites audited; aesgcm's are x86-64-only, so LE memory order is unchanged).
 - **2026-10-10** — tests: deterministic fuzz driver `AESKW_FUZZ` (`src/fuzz_test.zig`): `aeskw-unwrap` — a wrapped key (AES-128/192/256 KEK, 2-8 semiblocks) unwraps exactly; one flipped bit, another KEK, any truncation and a damaged copy are refused, every refusal leaves `out` all zero (no partial key material); unsupported KEK sizes and short buffers get their own errors. ReleaseSafe, clean.
 - **2026-10-10** — AES-192 KEK: `wrap`/`unwrap` accept a 24-byte KEK, run on the new `aes192` module (dep added; std 0.16 has no AES-192). RFC 3394 §4.2/§4.4 KATs added; both fuzz harnesses and their pinned corpus counts now cover three KEK widths; ctgrind `wrap` row extended to AES-192 (6 in-file, the integrity verdict twice per KEK size). A 24-byte KEK no longer returns `UnsupportedKeyLength`; the jwe consumer's `ECDH-ES+A192KW` test flipped to a round trip accordingly.

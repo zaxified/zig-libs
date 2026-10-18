@@ -113,7 +113,7 @@ compresses, go through `compressScalar` (a full-width schedule for one block
 costs more instructions than the scalar schedule).
 
 There is **no run-time CPU detection**: a build for baseline x86-64 on an AVX2
-machine runs `.scalar`. Zig 0.16 has no per-function target features, so a
+machine runs `.scalar`. Zig 0.16 has no per-function target features (measured on 0.16, not re-checked on 0.17), so a
 run-time-selected AVX2 path would need hand-written inline assembly for the
 whole schedule; see *Backlog*.
 
@@ -237,7 +237,7 @@ vector schedule would save about one instruction per word.
 ## Backlog / deferred
 
 - **Run-time AVX2 dispatch for baseline-x86-64 builds.** Needs the schedule
-  in inline assembly (Zig 0.16 has no per-function target features), gated
+  in inline assembly (Zig 0.16 has no per-function target features; measured on 0.16, not re-checked on 0.17), gated
   like crc32's `pclmul_emittable`. Deferred until a consumer ships a baseline
   build.
 - **std's truncated variants** (`Sha256T192`, `Sha512T224`, `Sha512T256`,

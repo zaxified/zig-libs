@@ -26,7 +26,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [google/crc32c](https://github.com/google/crc32c) | C++ | BSD-3-Clause | 517 | 1.1.2 tag (push 2025-04) | Runtime dispatch, `Extend`. CMake/C++ dependency, no combine *(inferred from README)*. |
 | [zowens/crc32c](https://github.com/zowens/crc32c) | Rust | MIT OR Apache-2.0 (LICENSE-MIT + LICENSE-APACHE present) | 56 | v0.6.8 (push 2026-02) | SSE4.2 (runtime cpuid) and aarch64 crc; README shows one-shot only, `crc32c_append` *(inferred)*. |
 | [srijs/rust-crc32fast](https://github.com/srijs/rust-crc32fast) | Rust | MIT OR Apache-2.0 | 338 | v1.5.2 (push 2026-09) | IEEE polynomial only (not CRC-32C); has `combine`. Different polynomial. |
-| [Zig `std.hash.crc`](https://ziglang.org/documentation/master/std/#std.hash.crc) | Zig | MIT | — | Zig std | `Crc32Iscsi` bytewise table only, ~0.45 GB/s (README measurement); no hardware, no combine. |
+| [Zig `std.hash.crc`](https://ziglang.org/documentation/master/std/#std.hash.crc) | Zig | MIT | — | Zig std | `Crc32Iscsi` bytewise table only, ~0.45 GB/s (README measurement, Zig 0.16); no combine. Zig 0.17 renamed it `@"CRC-32/ISCSI"` and uses a hardware `Crc32c.zig` on builds with the x86-64 `crc32` feature (not re-measured here). |
 
 **Where we are ahead:** hardware CRC-32C plus a `combine` in one package, pure Zig with runtime dispatch (Go and the Rust crates have no combine for CRC-32C); 15-45x std · **Where we are behind:** no PCLMULQDQ folding (deliberate, see *What is deliberately not done*); no other polynomials (`std.hash.crc` covers them).
 
@@ -74,7 +74,7 @@ Detection is idempotent, so a race stores the same value twice. The
 self-hosted x86_64 backend (the Debug default) encodes only what the target
 CPU model has, so on a target without `sse4_2` that build has no SSE4.2 path
 and is the table (`sse42_emittable`; LLVM builds keep the run-time path). The last
-bytes go through the table because Zig 0.16's self-hosted x86 backend (Debug)
+bytes go through the table because Zig 0.16's self-hosted x86 backend (Debug; not re-checked on 0.17)
 cannot encode the byte-wide `crc32b` form.
 
 ## Limits and refusals
@@ -88,8 +88,8 @@ None: every length, every alignment (loads are unaligned `readInt`s), and
   (`"123456789"` → 0xE3069283) and the four 32-byte vectors of RFC 3720
   appendix B.4 (zeros, ones, ascending, descending), through every backend
   this CPU has. Test `published vectors`.
-- **External** — `std.hash.crc.Crc32Iscsi`, a foreign implementation (Zig's
-  standard library, bytewise, written apart from this module) used as a black
+- **External** — `std.hash.crc.@"CRC-32/ISCSI"` (`Crc32Iscsi` before Zig 0.17), a foreign implementation (Zig's
+  standard library, bytewise on 0.16 and on 0.17 builds without the x86-64 `crc32` feature, written apart from this module) used as a black
   box, over every length 0 … 808, ±24 bytes around one and three
   long blocks and six long blocks, at 16 alignments (a subset for the long
   ones), per available backend; `extend`, the streaming form and `combine`
@@ -146,7 +146,7 @@ only the single chain runs.
 - **PCLMULQDQ / PMULL folding** (Linux `crc32c-pcl-intel`, ~2× more on very
   long inputs). Not now: the three-chain path is already ~45× std, and a
   folding kernel needs vector target features Zig 0.16 cannot enable per
-  function — it would be baseline-hostile or compile-time-only.
+  function (measured on 0.16, not re-checked on 0.17) — it would be baseline-hostile or compile-time-only.
 - **Other polynomials.** Refused: std's generic `Crc` has them.
 
 ## Open

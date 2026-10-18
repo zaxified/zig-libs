@@ -156,8 +156,8 @@ const obj = try dnp3.objects.decodeObjectHeader(req.rest);
 ### Outstation
 
 ```zig
-var binaries = [_]dnp3.outstation.BinaryInput{.{ .class = .class1 }} ** 8;
-var analogs = [_]dnp3.outstation.AnalogInput{.{ .class = .class2 }} ** 4;
+var binaries: [8]dnp3.outstation.BinaryInput = @splat(.{ .class = .class1 });
+var analogs: [4]dnp3.outstation.AnalogInput = @splat(.{ .class = .class2 });
 var event_storage: [64]dnp3.outstation.Event = undefined;
 
 var station = dnp3.outstation.Outstation.init(.{

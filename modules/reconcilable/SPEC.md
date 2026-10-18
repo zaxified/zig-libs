@@ -67,7 +67,7 @@ instant as a parameter. Reasons, in order of weight:
    synchronise with, and every apply it performs would have to cross back to
    the loop thread that owns the netlink/WireGuard handles anyway. Owning a
    thread would buy nothing and cost a synchronisation design.
-2. **Zig 0.16 has no `std.Thread.Mutex`/`Condition`** (CONVENTIONS §2). An
+2. **Zig 0.16 and 0.17 have no `std.Thread.Mutex`/`Condition`** (CONVENTIONS §2). An
    internal thread would mean hand-rolling POSIX synchronisation inside a
    module that otherwise has zero platform surface — and would cost the `.any`
    platform tag.

@@ -170,8 +170,8 @@ once, after decompression — fail-fast per fragment is impossible on compressed
 Sending: `Compressor.compressMessage` resets std's `flate.Compress` per message, sync-flushes,
 and closes with one `0x00` (an empty stored block minus the four bytes §7.2.1 strips); a message
 that does not shrink or does not fit goes out uncompressed, which §6 allows per message.
-⚠ std 0.16 defect worked around: `flate.Decompress.tossBitsShort` checks
-`bufferedLen()*8 + consumed_bits` where it needs `-`, so on input that ends inside a block it can
+⚠ std 0.16 defect worked around (**fixed in 0.17.0**: `Decompress.zig:601` now subtracts; the workaround stays, harmless): `flate.Decompress.tossBitsShort` checked
+`bufferedLen()*8 + consumed_bits` where it needed `-`, so on input that ends inside a block it can
 drop bits past the end, and the next `peekBitsEnding` underflows (`left.len * 8 -
 consumed_bits` with `left.len == 0`): an integer-overflow panic in safe builds, wrapped
 arithmetic in ReleaseFast — on bytes a peer chooses. `inflate` feeds the decoder through

@@ -57,8 +57,7 @@ citation lives here:
   `userspace-api/landlock.rst`.
 - `capability.h` — `_LINUX_CAPABILITY_VERSION_3` (0x20080522), the v3 two-word data layout.
 - `audit.h` + `elf.h` — `AUDIT_ARCH_*` = `EM_<arch>` OR'd with the 64-bit/little-endian flags,
-  computed directly (std's `linux.AUDIT.ARCH` enum is unbuildable in Zig 0.16 — a bad `elf.EM.FRV`
-  member — so the arch token is derived clean-room from `builtin.cpu.arch`).
+  computed directly (std's `linux.AUDIT.ARCH` enum is unbuildable in Zig 0.16 and 0.17.0 — `os/linux.zig:11027` uses `elf.EM.FRV`, which `elf.zig` does not declare — so the arch token is derived clean-room from `builtin.cpu.arch`).
 
 ## Design & invariants
 

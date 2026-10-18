@@ -473,7 +473,7 @@ of 5. ⚠ The valgrind pass below predates sessions and has not been repeated fo
 the Debug build was made and is not evidence either way — CONVENTIONS §7.1: nothing measured under
 valgrind may be a Debug build.)
 
-Race-detection method: Zig **0.16.0's `-fsanitize-thread` is a no-op** here — it compiles and links but
+Race-detection method: Zig **0.16.0's `-fsanitize-thread` is a no-op** here (self-hosted backend; TSan needs `-fllvm`; measured on 0.16, not re-checked on 0.17) — it compiles and links but
 emits **zero `__tsan_*` instrumentation** and fails to flag a deliberate data race — so, per the SPEC's
 own fallback, race detection is the real-thread run under **Debug and `-Doptimize=ReleaseFast`, repeated
 (the committed 16×40 config was run 15× Debug + 40× ReleaseFast, plus one heavy 48×150 pass, all clean)**

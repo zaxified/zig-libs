@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC brought up to Zig 0.17.0 (version statements, snippets, measurement labels).
+
 - **2026-10-10** — tests: deterministic fuzz driver `IBE_FUZZ` (`ibe-ciphertext`) with oracles: the pristine ciphertext decrypts to its message and is refused under another identity's key; any damaged one (0-3 octets of the real ciphertext, or wild bytes) is refused at the decoder or the FO check. No change in `src/` outside tests.
 - **2026-10-09** — **BREAKING, HIGH: every BF-IBE entry point left its secrets on the dead stack.**
   New ReleaseFast stack probe (`stackprobe_test.zig`), 5 calls each, before → after: `setup` msk

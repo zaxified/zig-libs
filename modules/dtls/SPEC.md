@@ -575,7 +575,7 @@ two `Connection`s written from the same reading of the RFC cannot see.
 - **A second independent stack.** wolfSSL agreeing with us rules out the
   four defects above, but a bug the two happen to share would still pass.
   mbedTLS or picotls would be the natural cross-check.
-- **CCM suites** — unwired (Zig 0.16 std ships only a 13-byte-nonce CCM; the
+- **CCM suites** — unwired (Zig 0.17 std ships only 13-byte-nonce CCM presets -- `aes_ccm.zig` has a generic `AesCcm(Aes, tag_len, nonce_len)` for nonces 7..13 but it is not `pub`; the
   DTLS profile needs 12), so the RFC 7925 CoAP default suite is untested
   against any peer.
 
@@ -592,7 +592,7 @@ two `Connection`s written from the same reading of the RFC cannot see.
 
 - **DTLS 1.2 (RFC 6347) client/server** (survey 2026-09-30). Every mbedtls-, OpenSSL- and most wolfSSL-based peer, WebRTC, LwM2M and most CoAP gear speak 1.2; pion/dtls and wolfSSL both offer it. A user with any such peer cannot connect. Effort: large (separate handshake, cookie exchange, CBC/GCM/CCM record layer, EMS). Fits §2.
 - **KeyUpdate (send and receive) and the 48-bit sequence rekey** (survey 2026-09-30). A peer that sends KeyUpdate makes the connection unusable here (`ReceivedPostHandshakeMessage`), and the sender stops at the 2^48 ceiling. Effort: medium. Fits §2.
-- **CCM / CCM_8 suites and AES-256-GCM** (survey 2026-09-30). RFC 7925's constrained-device profile, this module's stated CoAP audience, mandates CCM_8. Blocked on a 12-byte-nonce CCM (std ships 13 bytes); needs an own CCM. Effort: medium. Fits §2.
+- **CCM / CCM_8 suites and AES-256-GCM** (survey 2026-09-30). RFC 7925's constrained-device profile, this module's stated CoAP audience, mandates CCM_8. Blocked on a 12-byte-nonce CCM (std 0.17 exports only the 13-byte presets; its generic `AesCcm` is private, `aes_ccm.zig:36`); needs an own CCM. Effort: medium. Fits §2.
 - **Session tickets / resumption and 0-RTT** (survey 2026-09-30). Saves a handshake on constrained links; pion has it for 1.2, wolfSSL for 1.3. Effort: medium (sibling `tlsresume` covers the server ticket seal for TLS). Fits §2.
 - **TLS exporter (RFC 5705/8446 §7.5) and ALPN, then use_srtp** (survey 2026-09-30). Needed for DTLS-SRTP (WebRTC) and for any protocol that binds keys to the channel. Effort: small (exporter), small (ALPN), medium (SRTP). Fits §2.
 - **Dead-stack hygiene, what the 2026-10-09 sweep did not cover** (narrowed from "beyond CertificateVerify signing"). `Connection.startHandshake`/`handleFlight`/`installApplicationKeys`/`send`/`recv` are burned and probed through a full in-memory handshake (PSK, cert X25519, cert P-256 with mutual auth, cert X25519MLKEM768; both AEADs; 0 residue, see CHANGELOG). Not covered: (a) the standalone public helpers `keyschedule.*`, `aead.Protection`, `record.*` called directly by a consumer return/take secrets by value in the CALLER's frame (the engine's own uses are inside the entry-point burns); (b) secrets that stay in the live `Connection` after the handshake (`pending_ap_*` on the server, `hs_*` keys and traffic secrets until `deinit`) are by design, not dead stack; (c) HelloRetryRequest/cookie flows and the retransmission path (`poll`) are not driven by the probe; (d) the signature noise and nonce of the client/server CertificateVerify are measured only as far as the entropy draw and `certverify.sign`'s own probe, not the ECDSA nonce itself inside a live connection. Effort: small.

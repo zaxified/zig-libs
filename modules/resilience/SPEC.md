@@ -62,7 +62,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   transitions may be delivered in either order (`counts().transitions` counts them).
 - **Clock/delay/random seams:** every timed path takes an injected `Clock` (posix `clock_gettime`
   default, swappable) and `Delay` (posix `nanosleep` default, or `.none`, or a recording no-op for
-  tests); jitter takes a caller-seeded `std.Random` (Zig 0.16 std has no ambient entropy — no hidden
+  tests); jitter takes a caller-seeded `std.Random` (Zig 0.17 std has no ambient entropy — no hidden
   globals). Tests never sleep for real.
 - **Error policy:** typed errors (`error.CircuitOpen`, `error.BulkheadFull`, `error.Timeout`), never
   panics; a breaker denial is never retried within one `run` — fast-fail is the point.

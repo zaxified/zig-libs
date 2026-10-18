@@ -158,7 +158,7 @@ correct SP posture: an attacker can always attach their own cert + matching
 signature, so a self-consistent `<KeyInfo>` proves nothing.
 
 We deliberately do **not** feed the embedded cert into
-`std.crypto.Certificate.parse`: in Zig 0.16 that path is not panic-safe on
+`std.crypto.Certificate.parse`: in Zig 0.16 (and 0.17.0: the DER element reader is unchanged) that path is not panic-safe on
 adversarial DER (a tracked library hazard). We only base64-decode and surface
 the bytes; extracting a public key from the cert (with DER-defensive parsing) is
 left to the caller / a future helper.

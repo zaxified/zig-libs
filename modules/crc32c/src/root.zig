@@ -7,8 +7,9 @@
 //! reflected, polynomial 0x1EDC6F41 (0x82F63B78 reflected), initial value and
 //! final XOR 0xFFFFFFFF; `hash("123456789") == 0xE3069283`.
 //!
-//! std has it as `std.hash.crc.Crc32Iscsi`, one table lookup per byte —
-//! about 0.4 GB/s. This module picks, once, the fastest of:
+//! std has it as `std.hash.crc.@"CRC-32/ISCSI"` (`Crc32Iscsi` in 0.16): one table
+//! lookup per byte on 0.16 (about 0.4 GB/s) and on 0.17 builds without the
+//! x86-64 `crc32` feature; a hardware path with it. This module picks, once, the fastest of:
 //!
 //! - **x86-64 SSE4.2** `crc32` instruction, three streams interleaved over
 //!   8 KiB and 256-byte blocks and joined by precomputed shift tables
@@ -61,7 +62,7 @@ pub fn combine(crc_a: u32, crc_b: u32, len_b: u64) u32 {
     return multModP(xPow8n(len_b), crc_a) ^ crc_b;
 }
 
-/// Streaming form, with the shape of `std.hash.crc.Crc32Iscsi`.
+/// Streaming form, with the shape of `std.hash.crc.@"CRC-32/ISCSI"`.
 pub const Crc32c = struct {
     crc: u32 = 0,
 
@@ -387,7 +388,8 @@ test "published vectors: the CRC catalogue check value and RFC 3720 B.4" {
 }
 
 test "every backend agrees with std's implementation at every length and alignment" {
-    // std's `Crc32Iscsi` is an independent, bytewise implementation. Lengths
+    // std's `@"CRC-32/ISCSI"` is an independent implementation (bytewise table on 0.16;
+    // on 0.17 hardware `crc32` instructions when the target has the feature). Lengths
     // run densely through every threshold of the three-way split: 8, one and
     // three short blocks, one and three long blocks, and past them.
     const max = 3 * long_block * 2 + 3 * short_block + 64;

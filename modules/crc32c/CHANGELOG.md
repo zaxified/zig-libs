@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC/comments: std's `Crc32Iscsi` is `@"CRC-32/ISCSI"` in 0.17 with a hardware path on x86-64 `crc32` targets; the speed table is labelled as 0.16 std.
+
 - **2026-10-18** — Ported to Zig 0.17.0: tests: std oracle renamed `Crc32Iscsi` -> `@"CRC-32/ISCSI"`.
 - **2026-10-08** — **NO CONSUMER-VISIBLE CHANGE:** `tools/count.tsv` rewritten, 2139 → 1631
   instructions per 4 KiB round (−24 %): the 2026-10-07 `crc32q` chain change below, which the

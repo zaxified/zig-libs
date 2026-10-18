@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC statements about std AES (128/256 only, no CBC) and the two std software-backend defects re-checked against the 0.17.0 std (both defects are still there).
+
 - **2026-10-11** — Performance P3 → P2 (grade 3 → 2): comparative bench `tools/bench.zig`
   (`zig build bench-aes192`) against OpenSSL 3.5.5 EVP AES-192 — ECB both ways, CBC, CTR at
   0.97–1.01×, key setup 0.74–0.81×. Key setup was 1.65–1.81× before: the key-schedule burn is

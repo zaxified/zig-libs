@@ -105,7 +105,7 @@ returns a trusted `AuthnResult`, or a typed error.
   ambient-authority decision.
 - Adversarial DER is never parsed here. `parseIdpMetadata` hands back raw
   certificate DER for the caller to parse/pin — it does **not** feed it to
-  `std.crypto.Certificate` (which is not panic-safe on hostile DER in Zig 0.16).
+  `std.crypto.Certificate` (which is not panic-safe on hostile DER in Zig 0.16; its unchecked DER reader is unchanged in 0.17.0).
 
 ## The XML-Signature-Wrapping (XSW) defense (the headline property)
 
@@ -244,7 +244,7 @@ TLS client certificate) and/or as a bare public key
 - **Key match — three SAME-FORM structural comparisons, no DER parsing.**
   - `<ds:X509Data><ds:X509Certificate>`: the DER is base64-decoded and compared
     **byte-for-byte** to `presented_holder_cert_der`. The certificate is **never
-    parsed** (Zig 0.16 `std.crypto.Certificate.parse` is not panic-safe on hostile
+    parsed** (Zig 0.16 and 0.17.0 `std.crypto.Certificate.parse` is not panic-safe on hostile
     DER — the same policy as `parseIdpMetadata`).
   - `<ds:KeyValue><ds:RSAKeyValue>`: `<Modulus>` + `<Exponent>` are base64-decoded
     and compared as big-endian integers (leading-zero tolerant) to the presented

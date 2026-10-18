@@ -423,7 +423,7 @@ Survey 2026-09-30 — missing and it matters (all pure Zig, fit CONVENTIONS §2;
   the `EINVAL` net below is what stands behind it.
 - `mips64-linux-muslabin32` (mips n32 ABI) does not currently build at all —
   the failure is inside Zig 0.16.0's own `std.Io.Threaded`/`std.os.linux`
-  support for that target (a `.llseek` syscall missing from the `MipsN32`
+  support for that target (measured on 0.16, not re-checked on 0.17) (a `.llseek` syscall missing from the `MipsN32`
   table, an `arg6` width mismatch), unrelated to this module's code. Not
   investigated further here: out of scope for a `diskfree` fix, and o32
   (`.mips`/`.mipsel`) — the concrete target this module's requirements

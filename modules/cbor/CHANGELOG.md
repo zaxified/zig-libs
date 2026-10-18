@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC brought up to Zig 0.17.0 (version statements, snippets, measurement labels).
+
 - **2026-10-18** — Ported to Zig 0.17.0. `typed.zig` iterates struct fields through a small `fieldRecs` shim over the 0.17 struct-of-arrays `@typeInfo`; `@Int` replaces `std.meta.Int`; `info.attrs.@"const"`. `cbor_options` is still honoured when `pub` (it is only probed with `@hasDecl`, which is pub-only in 0.17).
 - **2026-10-04** — **mvp → core** (reference: libcbor 0.14; feature yardstick fxamacker/cbor 2.9).
   - **Strict decoding:** `DecodeOptions.reject_duplicate_keys` (RFC 8949 §5.6 data-model

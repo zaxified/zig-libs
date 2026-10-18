@@ -30,7 +30,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [spiral-ladder/noiz](https://github.com/spiral-ladder/noiz) | Zig | MIT | 11 | pushed 2025-06-19 | The Zig peer: work-in-progress; README: every rev-34 primitive except Curve448, cacophony vectors. Zig 0.14, stale. |
 | Zig `std.crypto` | Zig | MIT | — | Zig 0.16.0 | Provides the primitives (X25519, ChaCha20-Poly1305, AES-GCM, SHA-2, BLAKE2) but no Noise framework. |
 
-**Where we are ahead:** current (Zig 0.16), zero dependencies beyond std, comptime suite with no vtable, and six noise-c vectors checked byte-exact including the handshake hash. **Where we are behind** (re-checked 2026-10-04): no `fallback` modifier (snow lacks it too), no X448 bound by default (std has none; a caller plugs the `ed448` sibling's X448 in by `noise_name`), no runtime-selected suite (types are comptime; `Suite.matches` checks a parsed name against the binding), no hybrid/PQ handshakes. Built since the survey: all 38 patterns, PSK modifiers, protocol-name parsing, pluggable DH/AEAD/hash naming, the checked `init`.
+**Where we are ahead:** current (Zig 0.17), zero dependencies beyond std, comptime suite with no vtable, and six noise-c vectors checked byte-exact including the handshake hash. **Where we are behind** (re-checked 2026-10-04): no `fallback` modifier (snow lacks it too), no X448 bound by default (std has none; a caller plugs the `ed448` sibling's X448 in by `noise_name`), no runtime-selected suite (types are comptime; `Suite.matches` checks a parsed name against the binding), no hybrid/PQ handshakes. Built since the survey: all 38 patterns, PSK modifiers, protocol-name parsing, pluggable DH/AEAD/hash naming, the checked `init`.
 
 ## Design
 

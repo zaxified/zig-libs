@@ -142,7 +142,7 @@ switch (other.steal()) {                // any thread: oldest first
   bits `T`'s alignment leaves free), loaded, stored, swapped and CASed together,
   with `fetchOrTag`/`fetchAndTag`/`fetchXorTag` (crossbeam's tagged `Atomic`).
 - `Backoff` / `SpinLock` / `CachePadded` / `cache_line` — mechanical atomic
-  helpers over `std.atomic` (0.16 has no `std.Thread.Mutex`). `SpinLock` is
+  helpers over `std.atomic` (0.17 has no `std.Thread.Mutex`). `SpinLock` is
   test-only, used by the harness oracle; never on a lock-free path.
 - `runStress` / `StressConfig` / `Verdict` — the concurrent stress driver: N
   producers push disjoint tagged ranges, M consumers drain, and the merged

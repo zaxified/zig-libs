@@ -424,7 +424,7 @@ already, see "std inventory" below), `ebpf.Program` (the
 
 ## std inventory — what's already free
 
-`std.os.linux.BPF` (`lib/std/os/linux/bpf.zig` in this Zig 0.16 toolchain)
+`std.os.linux.BPF` (`lib/std/os/linux/bpf.zig` in the Zig 0.17.0 toolchain)
 already ships, and this module does **not** duplicate:
 
 - **Instruction encoders**: `Insn` (a `packed struct` matching the kernel's

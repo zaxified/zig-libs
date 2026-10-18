@@ -5,7 +5,11 @@ replace compiler_rt's, which in Zig 0.16 stores one byte per iteration. Every
 runtime-length `@memset` and every `std.crypto.secureZero` in the binary — std's
 own included — then runs 20–27× faster.
 
-- **Status:** gap — without libc, std has no fast `memset` at all.
+- **Status:** gap on Zig 0.16 — without libc, std had no fast `memset` at all.
+  **Zig 0.17.0's `compiler_rt.memset` is vectorised** (`fastMemset`; byte-wise only
+  in ReleaseSmall), so the premise of this module no longer holds on 0.17; the
+  speed table below and the 20–27× in the first paragraph are 0.16 figures, not
+  yet re-measured against 0.17 (see SPEC § Open).
 - **Model after:** musl's and Go's runtime `memclr`: full-width vector stores
   with overlapping unaligned first and last vectors; `rep stosq` for the middle
   of clears past 192 KiB on x86-64 (level with musl and glibc at 1 MiB).

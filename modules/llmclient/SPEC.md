@@ -206,9 +206,9 @@ response), so this module should not carry the same grade as one whose live path
 exercised.
 
 One live test
-against the real API is present but unconditionally `error.SkipZigTest` — Zig 0.16's
-`std.process.Environ` (needed to read `ANTHROPIC_API_KEY`) is only reachable from `main`'s `Init`
-parameter, not from a plain `test` block; the dead-code path (`if (false)`) still type-checks the
+against the real API is present but unconditionally `error.SkipZigTest` — the
+`std.process.Environ` needed to read `ANTHROPIC_API_KEY` was taken to be reachable only from `main`'s `Init`
+parameter, not from a plain `test` block (the repo's other modules read it via `std.testing.environ`, which this test does not use yet); the dead-code path (`if (false)`) still type-checks the
 real call shape so an API-shape regression fails `zig build test-llmclient` without ever making a
 network call. Run: `zig build test-llmclient`.
 

@@ -55,7 +55,7 @@ reference at every leaf for two heights, plus a dedicated resync test).
 
 - **Model after:** RFC 8391 (public IRTF spec, clean-room); the XMSS
   reference implementation used only as a black-box KAT oracle (NOTICE).
-  Fills a real std gap: Zig 0.16 `std.crypto` has no stateful hash-based
+  Fills a real std gap: Zig 0.17 `std.crypto` has no stateful hash-based
   signature (RFC 8391 XMSS / RFC 8554 LMS — the NIST SP 800-208 pair).
 - **Deps:** none (std only — `std.crypto.hash.sha2.Sha256`).
 - **Consumer:** SCADA firmware signing (IEC 62443-style code-signing

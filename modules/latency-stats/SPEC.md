@@ -111,7 +111,7 @@ Survey 2026-09-30 — missing and it matters (pure Zig, fit CONVENTIONS §2):
   parallel-combine formula). `Histogram.add` exists, the moment half has no equivalent. Effort: small.
 - (survey 2026-09-30) **Serialization of a `Histogram`** (HdrHistogram V2/compressed log format for interchange with the
   Java/C/Rust tools). Why: ship histograms between processes or feed HdrHistogram plotters. Effort: medium; needs
-  DEFLATE for the compressed variant (`std.compress.flate` has both `Compress` and `Decompress` in Zig 0.16) and the format spec, not source.
+  DEFLATE for the compressed variant (`std.compress.flate` has both `Compress` and `Decompress` in Zig 0.16 and 0.17) and the format spec, not source.
 - Deliberately not done (already in Threat model above): thread safety / interval recorders (single-owner by design) and
   exponential histograms / windowing / decay. `Histogram` of floating-point values (HdrHistogram "DoubleHistogram") is
   not listed anywhere — question for the owner.

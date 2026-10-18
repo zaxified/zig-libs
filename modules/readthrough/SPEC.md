@@ -45,7 +45,7 @@ push the locking onto every consumer and could not coalesce two threads' misses
 at all. So `readthrough` is `.threadsafe`: it owns its synchronization.
 
 **Primitive.** Zig 0.16 removed `std.Thread.Mutex` / `Condition` / `Futex`
-(futexes moved onto the `std.Io` vtable). Following the repo's established
+(futexes moved onto the `std.Io` vtable; `lib/std/Thread.zig` of 0.17.0 still declares none of them). Following the repo's established
 pattern (`writebehind`, `lockfree`, `workerpool`), shared state is guarded by a
 tiny `std.atomic` **SpinLock** for the short critical sections (map lookup,
 `ramcache` access, generation read, stats), and coalesced followers **block on

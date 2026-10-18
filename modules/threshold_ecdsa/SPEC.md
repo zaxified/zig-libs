@@ -66,7 +66,7 @@ theory AND Phase 2d's online signing are now implemented and tested, see the
 dedicated sections below). `zig build test-threshold_ecdsa` passes, and the
 security-critical reject tests are NOT skipped in the default run: this
 module is marked `heavy` in the root `build.zig`, so a Debug request builds
-it at ReleaseSafe, where the `builtin.mode == .Debug` guards on the
+it at ReleaseSafe, where the `builtin.mode == .debug` guards on the
 2048-bit-keygen fixtures do not fire. (Those guards still matter under
 `-Dstrict-debug`, which forces genuine Debug — that mode DOES skip them, and
 is not the CI default.) The audit-F1/F2/F3 received-parameter validation and

@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC brought up to Zig 0.17.0 (version statements, snippets, measurement labels).
+
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** ported to Zig 0.17.0 (test-only `CueIo` counts socket reads through `vtable.operate` instead of the removed `netRead` slot).
 
 - **2026-10-10** — tests: deterministic fuzz driver `FLEETSIM_FUZZ` (`fleetsim-dispatch`: the existing chunked dispatch harness, now generic over its source with a damaged-seed half; new `fleetsim-frames`: the valid first frame of each of the six adapters, 0-3 octets damaged in a share of them, aimed at the adapter by name -- the dispatch harness routes by the first octet `% 6`, so a valid S7, DNP3 or BACnet frame (first octets 0x03, 0x05, 0x81) can never reach its own adapter there). `dispatch_stats.outbound` now accumulates over every `advance` (it only ever read the frames of the final, empty one, so it was always 0). The OPC UA adapter is still not fuzzed (see the comment in `fuzzDispatchScript`). New `src/fuzz_test.zig`. No change in `src/` outside tests.

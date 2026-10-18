@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC brought up to Zig 0.17.0 (version statements, snippets, measurement labels).
+
 - **2026-10-18** — Ported to Zig 0.17.0: `std.meta.Int` -> `@Int` (test); `strRepeat` branch quota scaled with length. Examples/tools ported to Zig 0.17.0 (bench `std.meta.Tuple` -> `@Tuple`).
 - **2026-10-18** — **Build option `montint-asm-unroll`** (wgs request): `false`, or `-Dprofile=small`, runs every Montgomery multiply/square from 1024 bits up on the one looped asm kernel instead of straight-line asm per limb count. Same results and constant-time shape; size probe (`DynModint(8192)`, ReleaseSmall, ADX/BMI2) 319 288 → 173 104 B; modexp 1.6–2.0× slower. Default unchanged. New `tools/sizeprobe.zig` + floor row.
 - **2026-10-18** — **Performance:** `safegcd.Inverter` runs the half-delta divstep bound `⌊(45907·b + 26313)/19929⌋` (sipa/safegcd-bounds `genproofhd.md`, `0 ≤ g ≤ f`; libsecp256k1's 590 at 256 bits is one below it) instead of Bernstein–Yang Theorem 11.2's original-divstep bound: 40 batches instead of 51 at 1024 bits (rsa-2048's blinding inverse), ~22 % fewer at every size. Results stay verified (`invert`'s verdict, then `x·x⁻¹ ≡ 1` in every caller), so a shortfall would refuse or redraw, never return a wrong inverse. Tests unchanged and green (big-int differential 64…4096 bits, edges, non-units); paillier and threshold_ecdsa modtests green; ctgrind counts of montint, paillier, threshold_ecdsa, ssh, k256, jwt, blindrsa unchanged.

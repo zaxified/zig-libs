@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC brought up to Zig 0.17.0 (version statements, snippets, measurement labels).
+
 - **2026-10-17** — Segqueue `skip_ready_wait` positive control parks displaced spares in the graveyard like `read_before_copy`: its bug writes into a recycled block, and a real free crashed the run (SIGSEGV, arm64 CI) instead of failing it with a verdict. Test only.
 
 - **2026-10-14** — **Faster `BoundedQueue`/`ArrayQueue` under producers meeting a full ring:** the refusal counter is four cache-line stripes (`refusedCount` sums them; exact once producers stop) — `bounded_4x4` 0.92–1.96× → 0.82–1.06× crossbeam. The value grows by 192 bytes. Card: Performance measured (ref 0.51–1.06× crossbeam). SPEC §8.

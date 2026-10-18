@@ -3,10 +3,13 @@
 **CRC-32C (Castagnoli)** at hardware speed: the SSE4.2 `crc32` instruction
 on x86-64 and the ARMv8 `crc32c*` instructions on arm64, three streams
 interleaved, with a slicing-by-8 fallback everywhere else. The same value as
-`std.hash.crc.Crc32Iscsi`, 15–45× faster (below).
+`std.hash.crc.Crc32Iscsi` (renamed `std.hash.crc.@"CRC-32/ISCSI"` in Zig 0.17),
+15–45× faster than std 0.16's table (below).
 
-- **Status:** gap — std has CRC-32C only as a bytewise table (~0.45 GB/s),
-  which made it the bottleneck of `seglog`'s reads.
+- **Status:** gap on Zig 0.16 — std had CRC-32C only as a bytewise table (~0.45 GB/s),
+  which made it the bottleneck of `seglog`'s reads. Zig 0.17's std uses a hardware
+  `Crc32c.zig` when the build target has the x86-64 `crc32` feature (SSE4.2) and the
+  bytewise table otherwise; the speed table below is the 0.16 std and is not re-measured.
 - **Model after:** Go `hash/crc32` (Castagnoli with SSE4.2, three-way) and
   zlib's `crc32_combine`; the three-stream construction is Intel's "Fast CRC
   Computation for iSCSI Polynomial Using CRC32 Instruction" (2011).
@@ -32,14 +35,14 @@ _ = crc32c.backend();                          // .sse42 / .armv8 / .table
 `AT_HWCAP` on Linux arm64), once, unless the build target already guarantees
 it — so a binary built for baseline x86-64 still gets SSE4.2 on a CPU that
 has it. The instructions are inline assembly, which Zig 0.16 emits whatever
-the target's feature set.
+the target's feature set (measured on 0.16, not re-checked on 0.17).
 
 ## Speed
 
 GB/s, best of 5, ReleaseFast, one core of the development notebook
 (2026-09-27, x86-64 with SSE4.2; a loaded machine, so the ratios are the point):
 
-| bytes | std `Crc32Iscsi` | `.table` | hardware |
+| bytes | std 0.16 `Crc32Iscsi` | `.table` | hardware |
 |---:|---:|---:|---:|
 | 64 | 0.49 | 2.10 | 7.1 |
 | 180 | 0.47 | 1.92 | 7.1 |

@@ -1,6 +1,6 @@
 # p521
 
-**NIST P-521 (secp521r1), the curve Zig 0.16's std does not ship.** std has P-256 and
+**NIST P-521 (secp521r1), the curve Zig 0.17's std does not ship.** std has P-256 and
 P-384; every P-521 feature in this collection — ssh `ecdh-sha2-nistp521` /
 `ecdsa-sha2-nistp521`, jwt `ES512`, x509 P-521 certificates, hpke DHKEM(P-521),
 acme — was refused for lack of a curve. This module provides the field, the group, ECDH

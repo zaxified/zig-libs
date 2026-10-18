@@ -237,6 +237,11 @@ seal 64 KiB **0.93x**, open 64 B 1.11x, open 64 KiB 1.13x. What keeps P at 3 is 
 64 KiB row is the bulk path (Poly1305 over the ciphertext, then Salsa20 — two passes), the
 64 B row is one X25519 ladder against libsodium's.
 
+Zig 0.17.0 (2026-10-18, loaded machine, not a quiet-host figure): LLVM 22 lowered the keystream
+`[4n]u8` <-> `@Vector(n, u32)` XOR byte by byte (0.68-1.20x libsodium, seal 64 KiB 1.20x); after the
+spelling fix (see CHANGELOG) the range is 0.77-1.04x. The 0.86-1.13x card above is the 2026-10-09
+quiet-host measurement; re-measure on a quiet machine before changing it.
+
 Components on 64 KiB (scratch microbench, same host): Salsa20 0.51 → 2.38 GB/s, Poly1305
 1.41 → 2.92 GB/s. Small messages are X25519 (std's, ~1.25x libsodium's) and did not move.
 

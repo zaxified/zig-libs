@@ -47,7 +47,7 @@ techniques.
 
 - `round_robin` — strict rotation over the healthy set (default).
 - `random` — uniform over the healthy set, from a **seeded** PRNG
-  (`Options.seed`; Zig 0.16 std has no ambient entropy, no hidden globals).
+  (`Options.seed`; Zig 0.17 std has no ambient entropy, no hidden globals).
 - `weighted_round_robin` — smooth WRR (the nginx algorithm): over any
   window of `sum(weights)` picks each healthy upstream is chosen exactly
   `weight` times, interleaved rather than bursty.

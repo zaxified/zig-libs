@@ -60,7 +60,7 @@ conditional jumps); both `Fr`s are now views of `Field`. Evidence: ctgrind
 target `field` (the bls12_381 `r`, operands, exponent and a 64-byte reduce
 input tainted) — 0 in-file contexts except `inv`'s documented zero check —
 next to `ffcontrol`, the replaced ff path on the same operands, which must
-stay non-zero in `ff.zig` (27 contexts on 2026-10-02). Differential tests
+stay non-zero in `ff.zig` (27 contexts on 2026-10-02; 28 on Zig 0.17.0, 2026-10-18: std's `ff` `pow` window select changed, still a positive control, the pin is `>=1`). Differential tests
 against `std.crypto.ff` at L=4 (bls12_381 `r`) and L=7 (ed448 `l`).
 
 **`DynModint(max_bits)` (2026-10-02)** is the run-time counterpart of `Field`:
@@ -664,7 +664,7 @@ Three costs outside the products mattered as much (perf on the whole op first):
   would be data-timed on AMD Zen 1/2), reading the accumulator's high half
   directly so no copy is made.
 - **Zig 0.16 `@memset`/copies of a few hundred bytes become calls into the
-  byte-wise `compiler_rt`**: zeroing the 768-byte accumulator of an L = 48
+  byte-wise `compiler_rt`** (0.16 measurement; 0.17.0's `compiler_rt.memset` is vectorised, not re-measured): zeroing the 768-byte accumulator of an L = 48
   multiply cost 735 cycles. `zeroWords` (vector stores in asm) zeroes and wipes
   it; an asm store with a memory clobber is never elided, so it is the wipe too.
 - **`powMont`'s gather** kept its accumulator in memory (a load and a store per

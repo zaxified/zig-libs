@@ -28,7 +28,7 @@ measured by this survey; the only measured comparison is with `std.hash.Crc32` (
 | [trifectatechfoundation/zlib-rs](https://github.com/trifectatechfoundation/zlib-rs) | Rust | Zlib | 697 | v0.6.8 (2026-09-15) | Rust zlib port; CRC-32 is an internal part of the deflate/gzip path, not the point of the crate *(inferred)*. |
 | [srijs/rust-crc32fast](https://github.com/srijs/rust-crc32fast) | Rust | Apache-2.0 per API (crate is dual MIT/Apache-2.0 *(inferred)*) | 338 | no releases (push 2026-09-21) | "Fast, SIMD-accelerated CRC32 (IEEE)": several implementations (baseline 16 bytes/iteration, SIMD on x86 and arm64), `Hasher` with `combine` *(inferred)*. The same shape as ours. |
 | Go `hash/crc32` ([docs](https://pkg.go.dev/hash/crc32)) | Go | BSD-3-Clause | — | Go stdlib | `ChecksumIEEE`, `Update`, `New`; hardware-accelerated on amd64 and arm64; no `combine` in the standard library *(inferred)*. |
-| Zig `std.hash.Crc32` | Zig | MIT | — | Zig 0.16.0 | Same value; bytewise table, ~0.45 GB/s (measured here, README *Speed*); no `combine`; no hardware path. |
+| Zig `std.hash.Crc32` | Zig | MIT | — | Zig 0.16.0 | Same value; bytewise table, ~0.45 GB/s (measured here on 0.16, README *Speed*); no `combine`; no hardware path (0.17.0: `Crc32` = `@"CRC-32/ISO-HDLC"`, still the generic table, `hash/crc.zig:800`). |
 
 **Where we are ahead:** of the Zig alternative (`std`), ~50x from 1 KiB (22.9 vs 0.45 GB/s on the measured
 i7-7920HQ) and the only `combine`; PCLMULQDQ folding and the ARMv8 `crc32x` path are chosen at run time without C or
@@ -91,7 +91,7 @@ CPUID leaf 1 ECX bit 1 (PCLMULQDQ), or `getauxval(AT_HWCAP)` bit 7
 stores the same value twice). The exception is the self-hosted x86_64
 backend (the Debug default) on a target without `pclmul`: it encodes only
 what the target CPU model has, so that build has no PCLMUL path and is the
-table (`pclmul_emittable`; LLVM builds keep the run-time path). Zig 0.16 has no per-function target features,
+table (`pclmul_emittable`; LLVM builds keep the run-time path). Zig 0.16 has no per-function target features (measured on 0.16, not re-checked on 0.17),
 so every hardware instruction is inline assembly. On x86-64 each
 `pclmulqdq` is its own asm statement with register operands only: the
 self-hosted x86 backend (the Debug default) rejects an SSE memory operand
@@ -221,7 +221,7 @@ table.
   `scripts/check-portable.sh`, `-Dtarget=x86_64-linux`).** The PCLMUL path is
   chosen at run time (`cpuidPclmul`), so `pclmulUpdate`'s inline
   `pclmulqdq` is compiled for every x86_64 target; Zig 0.16's self-hosted
-  x86_64 backend (Debug) cannot encode it for a CPU model without `pclmul`
+  x86_64 backend (Debug; not re-checked on 0.17) cannot encode it for a CPU model without `pclmul`
   (`error(x86_64_encoder): no encoding found for: none pclmulqdq`). LLVM
   builds are unaffected. Fix: compile the runtime-dispatched PCLMUL path only
   where the backend can emit it (`builtin.zig_backend != .stage2_x86_64`, or

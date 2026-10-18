@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC statements about std AES (128/256 only, no CBC) and the two std software-backend defects re-checked against the 0.17.0 std (both defects are still there).
+
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** the four rejecting unpadders (`unpadPkcs7`, `unpadXmlEnc`/`unpadIso10126`, `unpadAnsiX923`, `unpadIso7816`) take their single accept/reject branch through `rejectIf`, an empty-asm barrier on the folded flag. Zig 0.17 / LLVM had split `unpadIso7816`'s `if (invalid != 0)` into two jumps (one per failure reason: wrong marker, no marker) when inlined into the ctgrind harness's `main` (6 contexts / 2 in-file, was 5 / 1 on 0.16); with the barrier 5 / 1 again in that same harness shape. Results unchanged, checked against a branchy reference on structured and random last blocks (new test) and at comptime. ctgrind harness: one `noinline` instance per stripper, because 0.17 tail-merged the inlined pkcs7/x923 verdicts into one jump DWARF reports at `ctgrind_harness.zig:0` (in-file 0, an unattributed context).
 - **2026-10-18** — Ported to Zig 0.17.0. No source change beyond the repo-wide codemod (all `@bitCast` sites audited; aesgcm's are x86-64-only, so LE memory order is unchanged). Examples/tools ported to Zig 0.17.0 (bench enum loop -> `field_names`/`field_values`).
 - **2026-10-17** — Stack probe test silent on success (it printed every report; a lane treats stderr from a passing test as a failure). Test only.

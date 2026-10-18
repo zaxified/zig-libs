@@ -129,7 +129,7 @@ to revisit again.
    Required — `check-apps.sh` refuses an app without one. Wait on the program's
    own output rather than on a fixed `sleep`, pick an ephemeral port per run,
    give the script a watchdog, and print every process's log on failure. Each
-   of those is a lesson from writing the three that exist: a `sleep` is either
+   of those is a lesson from writing the first three: a `sleep` is either
    flaky or slow, a fixed port collides with the previous run's `TIME_WAIT`, and
    a readiness probe that opens a socket IS a client — it consumed the single
    connection `ssh-demo --once` had to give.

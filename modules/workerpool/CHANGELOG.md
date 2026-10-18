@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC statements that Zig has no io-less blocking mutex / `std.Thread` primitives re-checked against the 0.17.0 std (still true).
+
 - **2026-10-14** — **The queue is now `lockfree.SegQueue(Job)`** (was `lockfree.MpmcQueue` over EBR
   with a `NodePool` box per job): jobs travel by value, no allocation per job (a block per 63), no
   epoch domain, and `submit` from any thread takes no lock. `bench-workerpool` vs thpool

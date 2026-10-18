@@ -62,6 +62,8 @@ try hs.init(proto.pattern, true, prologue, &.{ .s = &my_static, .psks = &.{psk} 
 // Any other primitive joins a suite by declaring its spec §8 name, e.g. an
 // X448 adapter over the `ed448` module: `pub const noise_name = "448";`
 // plus the std DH shape (public_length, seed_length, KeyPair, scalarmult).
+// Zig 0.17: `noise_name` and `noise_stack_bytes` are probed with `@hasDecl`,
+// which sees only `pub` declarations, so declare them `pub`.
 ```
 
 ## Verify

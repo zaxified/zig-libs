@@ -50,8 +50,8 @@ ours 5–210 % on the four-producer row (thread spawn is inside its timing on bo
 
 ## 1. Dedup / std-gap
 
-Zig 0.16 std has **no** general-purpose thread pool available to this module
-set. `std.Thread.Pool` is gone in 0.16.0 (no `Pool` in `lib/std/Thread.zig`;
+Zig 0.17 std has **no** general-purpose thread pool available to this module
+set. `std.Thread.Pool` is gone since 0.16.0 and still absent in 0.17.0 (no `Pool` in `lib/std/Thread.zig`;
 std's replacement is `std.Io.Group`), and the blocking primitives a
 hand-rolled pool would need — `std.Thread.Mutex`, `std.Thread.Condition`,
 `std.Thread.Semaphore`, `std.Thread.Futex` — were **removed** in 0.16 (futexes

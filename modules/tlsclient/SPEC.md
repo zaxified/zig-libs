@@ -182,7 +182,7 @@ std has neither, and adding them is not this module's job. `.ca =
 
 ## Updating the copy
 
-A comptime check in `root.zig` refuses any Zig but 0.16. On an upgrade:
+A comptime check in `root.zig` refuses any Zig but 0.16 and 0.17 (the copy was ported to 0.17 on 2026-10-18). On an upgrade:
 first check #35877. If std now checks CA constraints, the tripwire test in
 `interop_test.zig` ("std's client still accepts the forged chain") is red --
 retire this module and point `http` back at `std.crypto.tls`. If not,

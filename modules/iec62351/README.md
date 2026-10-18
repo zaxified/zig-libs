@@ -60,7 +60,7 @@ before the tag is computed.
 const goose = iec62351.goose;
 
 var frame_buf: [1518]u8 = undefined;
-const key = [_]u8{ /* 62351-9 / GDOI-distributed group key */ } ** 32;
+const key: [32]u8 = @splat(0); // placeholder: the 62351-9 / GDOI-distributed group key
 
 const frame = try goose.build(&frame_buf, .{
     .ether_type = goose.ether_type_goose,     // 0x88b8 (0x88ba for SV)

@@ -169,7 +169,7 @@ element's end as `start + declared_length` without clamping it to the buffer.
 several points probes for an OPTIONAL sibling at a boundary without first
 checking a byte exists there. On a malformed, attacker-supplied certificate
 (a TLS/OPC-UA/GOOSE peer certificate is fully attacker-controlled) this
-indexes past the buffer. **Verified on Zig 0.16.0 out of band**: in **Debug**
+indexes past the buffer. **Verified on Zig 0.16.0 out of band** (`der.Element.parse` is unchanged in 0.17.0, `Certificate.zig:971-1000`: unchecked `bytes[i]`; the repros were not re-run): in **Debug**
 it panics (`index out of bounds`, aborting the process); in **ReleaseFast**
 the same inputs either read out of bounds *silently* — returning a `Parsed`
 built from whatever lay past the buffer — or segfault. Reproductions used for
@@ -302,7 +302,7 @@ used to be caught by the padding and is now refused by
 padding covers is real and cheap to keep.
 
 ⚠ `requireStdDescentPoints` mirrors `std.crypto.Certificate.parse` as of Zig
-0.16, which is a coupling. The alternative is to stop offering a guarded
+0.16 (re-read on 0.17.0: `der.Element.parse` unchanged), which is a coupling. The alternative is to stop offering a guarded
 `parse` at all and route every consumer through a defensive field walk of our
 own, the way `spkiOf` already does. That is the larger change and it is not
 made here. `safe.zig`'s tests take the union of the three former guards'
@@ -528,7 +528,7 @@ matching rule fail closed (§ Threat model).
 
 - **DONE 2026-10-10 (decided by the coordinator, delegated by the owner): `parse_slack` in
   `verifyChain`.** The open question was whether std, seeing the caller's buffer without padding,
-  could still probe past its end. Reading `Certificate.parse` (0.16) settles it: every probe lands
+  could still probe past its end. Reading `Certificate.parse` (0.16; the DER element reader is unchanged in 0.17.0) settles it: every probe lands
   at the end of an element std just read, and with `requireStdDescentPoints` all of those lie
   inside the buffer except the one after `signatureAlgorithm`, which reads the signatureValue
   header. A certificate without its signatureValue was well-formed DER and passed the guard, so

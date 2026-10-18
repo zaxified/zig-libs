@@ -43,7 +43,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   enum `Protocol` and comptime dispatch `Impl(protocol)` on top. There is
   no `initialize`/`regenerate` state: all randomness (the platform ECDH
   scalar, the protocol-Two IV) is a caller input, so the module is
-  deterministic, KAT-able, and RNG-agnostic (std 0.16 has no
+  deterministic, KAT-able, and RNG-agnostic (std 0.17 has no
   `std.crypto.random`).
 - **std recon (confirmed against `lib/std/crypto`, 0.16.0)**:
   - `core.aes.Aes256` is the raw block cipher only (`initEnc`/`initDec`,

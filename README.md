@@ -14,7 +14,7 @@ cross-project-reusable capability — a production-grade implementation of a pro
 or a fill for a genuine gap in the Zig ecosystem. zig-libs is the canonical home for these; the
 authors' other projects depend on it, not the reverse.
 
-**Status:** 249 modules (Zig 0.16, tests green in `ReleaseSafe` and `ReleaseFast`)
+**Status:** 249 modules (Zig 0.17.0, tests green in `ReleaseSafe` and `ReleaseFast`)
 · **MIT** (see `LICENSE`). `NOTICE` answers one question —
 whether consuming zig-libs obliges you to anything beyond MIT — and lists the modules that
 carry their own attribution; it does not catalogue provenance.
@@ -53,6 +53,9 @@ carry their own attribution; it does not catalogue provenance.
 
 Three ways to declare the dependency, and a fourth that overrides whichever you picked. The
 `build.zig` half is identical for all of them.
+
+Requires Zig 0.17.0 (`minimum_zig_version` in `build.zig.zon`); Tags up to and including `2026-10-18`
+build with Zig 0.16.
 
 **1. Local path** — developing against an unpushed checkout. Relative, so the manifest
 carries no home-dir path:
@@ -180,7 +183,9 @@ the harness itself adds every check plus a smoke run. See `scripts/README.md`, "
 run: stamps". Reach for `zig build test` when you actually want everything regardless of what
 changed.
 
-`zig build -l` lists the rest, including the other `check-*` gates.
+`zig build -l` lists the rest, including the other `check-*` gates. The `check-*`/`gen-*`
+steps are one host program, `zl-gates` (`scripts/gates/`, built ReleaseSafe on the first run and
+again after a change to `build.zig` or `scripts/gates/`, ~70 s); see `scripts/README.md`.
 
 ## Versioning & stability
 
@@ -260,7 +265,7 @@ instead: an independent reference model compared by fuzzing (1), a model or inva
 hand-computed values (3). The catalog cell shows the grade and, in brackets, the axes that cap
 it — `3 (S,P)` is core, and also not yet measured for speed.
 
-The grade is not chosen, it is computed: the rule is `maturityGrade` in `build.zig`;
+The grade is not chosen, it is computed: the rule is `maturityGrade` in `scripts/gates/gates.zig`;
 `zig build gen-catalog` writes the card's Grade line and this column from the same computation,
 and `zig build check-catalog-table` fails when either is stale — and when a module that a project
 outside this repository depends on grades 4 or 5. `zig build maturity-report` lists every module
@@ -711,5 +716,5 @@ become a module.
 | Structured logging | `karlseguin/log.zig` | Cleanest "just use it" |
 | S3 | `lobo/aws-sdk-for-zig` | SigV4 built in |
 | Redis/Valkey | `kristoff-it/zig-okredis` (partial/alpha) | Best available design |
-| xz compression | bind `liblzma`; or compress outside the process (the `xz` CLI in the consumer's pipeline) | Decoding is covered: std 0.16 ships an `std.compress.xz` decoder, and zstd is a module both ways (`zstd`: every level 1–22, and a decoder). What remains is an LZMA2 encoder — a large arc with no in-process consumer yet; today's consumers write plain bytes and compress in a backup/build step <!-- non-goal-ok: zstd --> |
+| xz compression | bind `liblzma`; or compress outside the process (the `xz` CLI in the consumer's pipeline) | Decoding is covered: std 0.17 ships an `std.compress.xz` decoder, and zstd is a module both ways (`zstd`: every level 1–22, and a decoder). What remains is an LZMA2 encoder — a large arc with no in-process consumer yet; today's consumers write plain bytes and compress in a backup/build step <!-- non-goal-ok: zstd --> |
 | HTTP/3 transport | `ngtcp2` | The transport (streams, loss detection, ACK logic, flight scheduling) is a bigger arc than SSH or OPC-UA were, and ngtcp2 is crypto-agnostic by design — it takes a TLS backend, which is the shape `quic-crypto` already has. The RFC 9001 crypto seam is ours; the state machine is not <!-- non-goal-ok: http, quic-crypto, ssh --> |

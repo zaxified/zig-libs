@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC notes on `socketpair` and Unix datagram sockets re-checked against the 0.17.0 std (unchanged).
+
 - **2026-10-18** — Ported to Zig 0.17.0. Socket stream I/O moved into `vtable.operate` (`net_send`, `net_read`, `net_write`; 0.17 removed the `netSend`/`netRead`/`netWrite` slots) and `netClose` takes `[]const net.Socket`. **Consumer-visible:** a stream read that hits the simulated connection timeout now fails with `error.ConnectionTimedOut` (std's `NetRead.Error` has no `Timeout`; matches Linux ETIMEDOUT); connect and `receiveTimeout` still report `error.Timeout`.
 
 - **2026-10-17** — A socket bound to `0.0.0.0` no longer receives IPv6 traffic (`::` still takes both, the Linux default): std's `HostName.connect` connects to every resolved address at once, and simio resolves a host name to its IPv4 and IPv6 addresses, so one lookup left two connections at an IPv4 listener, and which one the client kept depended on the schedule (the `timeouts` pilot went red after an unrelated http change shifted it; bisected to http `16982eb6`). The `timeouts` pilot's peer drains the request before closing (closing over unread bytes is a reset, which a short read made seed-dependent). Pilot passes for seeds 5–8.

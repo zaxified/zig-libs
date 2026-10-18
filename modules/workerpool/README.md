@@ -15,7 +15,7 @@ panics.
 ```zig
 const workerpool = @import("workerpool");
 
-// The futex-backed wait/wake needs an Io (Zig 0.16 has no io-less blocking
+// The futex-backed wait/wake needs an Io (Zig 0.17 has no io-less blocking
 // wait — std.Thread.Condition/Futex are gone). Pass the server's Io.
 var threaded = std.Io.Threaded.init(allocator, .{});
 defer threaded.deinit();

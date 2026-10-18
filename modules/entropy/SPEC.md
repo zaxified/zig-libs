@@ -172,7 +172,7 @@ was wrong until 2026-08-13. It sets `userdata = self` so the overrides can find
 the probe, which means every slot that is *not* overridden holds the inner
 implementation's function pointer and receives the **probe's** userdata —
 a `*CountingIo` where a `*std.Io.Threaded` is expected. `std.Io.VTable` has 109
-slots at Zig 0.16; three are overridden and the other 106 are mis-bound, so
+slots at Zig 0.16 (about 110 `: *const fn` fields at 0.17.0, not re-audited); three are overridden and the other 106 are mis-bound, so
 calling one is undefined behaviour. Copying the vtable buys compilation against
 a moving std and nothing else. The rule that replaces the false guarantee:
 **every `std.Io` function reachable from `fill` or `SecureSource` needs an

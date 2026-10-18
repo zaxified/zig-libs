@@ -1264,10 +1264,12 @@ test "BoundedAllocator: refuses past the limit, credits frees back, and flags th
 
 // Real network call against the live API — skipped unconditionally.
 //
-// This module is pure Zig (no libc), and 0.16's `std.process.Environ`
-// (the only way to read `ANTHROPIC_API_KEY` from the environment) is
-// only reachable through `main`'s `Init` parameter, not from inside a
-// plain `test` block — unlike `http.Client`'s gated "live:" tests, which
+// This module is pure Zig (no libc), and `std.process.Environ` (the
+// way to read `ANTHROPIC_API_KEY` from the environment) was taken to be
+// reachable only through `main`'s `Init` parameter, not from inside a
+// plain `test` block (the repo's other modules read it via
+// `std.testing.environ`; this test does not use that yet) — unlike
+// `http.Client`'s gated "live:" tests, which
 // need no credentials and so don't hit this problem. Exercise this path
 // manually via a real `main`/CLI wired up with a key from `Init`, using
 // the exact shape below.

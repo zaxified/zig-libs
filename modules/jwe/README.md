@@ -16,7 +16,7 @@ the plaintext, with `header` itself as Additional Authenticated Data.
 
 All listed algorithms are implemented and KAT-validated — see "Status"
 below. AES-192 (every `A192*`) runs on the `aes192` block cipher and
-`aesgcm`'s `Aes192Gcm`, since std 0.16 has none.
+`aesgcm`'s `Aes192Gcm`, since std (0.17.0) has none.
 
 - **Model after:** RFC 7516 (JWE) + RFC 7518 (JWA encryption algorithms) +
   RFC 3394 (AES Key Wrap).
@@ -47,7 +47,7 @@ below. AES-192 (every `A192*`) runs on the `aes192` block cipher and
 const jwe = @import("jwe");
 
 // `dir` + A256GCM: fully real, end to end.
-const key = [_]u8{0x2b} ** 32;
+const key: [32]u8 = @splat(0x2b);
 var csprng = std.Random.DefaultCsprng.init(seed); // your own CSPRNG, not std.crypto.random (removed in 0.16)
 const token = try jwe.encryptCompact(
     gpa, .dir, .A256GCM, .{ .symmetric = &key }, "attack at dawn", "",
@@ -94,7 +94,7 @@ honest fit here.
   `.{ .fixed_for_test = r }` — not a bare `std.Random`. It supplies the CEK
   (when `alg` isn't `dir`), the content IV, the AxxxGCMKW wrap IV, the PBES2
   salt input and the ECDH-ES ephemeral scalar. `std.crypto.random` was removed
-  in Zig 0.16; supply your own CSPRNG (e.g. `std.Random.DefaultCsprng` seeded
+  in Zig 0.16 (still absent in 0.17); supply your own CSPRNG (e.g. `std.Random.DefaultCsprng` seeded
   from real OS entropy). **`dir` is the sharp case:** there the CEK *is* your
   long-lived key, so the content IV is the only thing separating two messages
   — a repeated IV under `A128GCM`/`A256GCM` yields `C1 XOR C2 = P1 XOR P2`

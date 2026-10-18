@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC statements that `std.crypto.random` is gone / std has no ambient entropy re-checked against the 0.17.0 std (still true).
+
 - **2026-10-18** — Ported to Zig 0.17.0. `X25519.recoverPublicKey` no longer returns an error (ecdhes.zig `generateEphemeral`: the resample-on-error `catch continue` is gone); test reflection on `Entropy` uses `field_names`.
 - **2026-10-10** — AES-192 everywhere: `A192GCM` and `A192GCMKW` on `aesgcm.Aes192Gcm`, `A192CBC-HS384` on `aes192.Aes192` through `aescbc` (RFC 7518 B.2 now byte-exact both directions), `A192KW`/`PBES2-HS384+A192KW`/`ECDH-ES+A192KW` through `aeskw`'s new 24-byte KEK arm. New deps `aes192`, `aesgcm`. The tests that pinned these as an AES-192 std gap now check McGrew–Viega 10 (A192GCM), 8 (as a GCMKW wrap) and a full-token round trip of every A192 `alg` × `enc` pair; the fuzz round trip draws the A192 algorithms too. A 24-byte key no longer returns `UnsupportedKeyLength`.
 - **2026-10-10** — `ECDH-ES+A192KW` (and every A192KW key wrap passed through to `aeskw`) now works: `aeskw` accepts a 24-byte KEK over the new `aes192` module. The test that pinned it as an AES-192 std gap is now a P-256 round trip. Docs and the remaining A192 algorithms follow in the jwe AES-192 wiring.

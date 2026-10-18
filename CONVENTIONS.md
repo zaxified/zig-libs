@@ -11,7 +11,7 @@ Per-module design/threat-model lives in each module's `SPEC.md`.
 2. **Performance + universality.** Design for parallelism/streaming where relevant (the
    `⚡` tag). Prefer zero-allocation hot paths, caller-supplied allocators, no hidden
    globals.
-3. **Prefer std; build a dep only where std 0.16 has a real gap** (recursive-sublib
+3. **Prefer std; build a dep only where std 0.17 has a real gap** (recursive-sublib
    rule, §5). `std.json`, `std.crypto.tls` (client), `std.compress` (flate/zstd decode)
    already exist — use them, don't reimplement.
 4. **Every module is headless-verifiable.** Ship tests. Where a conformance/golden
@@ -30,7 +30,7 @@ Per-module design/threat-model lives in each module's `SPEC.md`.
   compile-time `builtin.link_libc` *type* branch that only adapts IF a consumer already
   links libc, e.g. in `procrun`, is not a violation — the module itself never forces
   libc.)
-  - **0.16 gotcha:** there is no `std.Thread.Mutex`/`Condition` in this era — use
+  - **0.16/0.17 gotcha:** there is no `std.Thread.Mutex`/`Condition` in this era — use
     `std.posix` primitives / an atomic spinlock. Don't reach for `std.c.*` either.
 - **Zero-dep rule.** Any capability whose value is fundamentally **C-level** (a hardened
   SQLite wrapper's `sqlite3_set_authorizer`/`PRAGMA query_only`/`open_v2(READONLY)`
@@ -141,7 +141,7 @@ assert that the field was non-zero first, or the test passes vacuously
 (`tenantkex/src/root.zig`'s `SessionKeys.wipe` test is the model). A wipe of a *heap buffer before
 `free`* is testable only under `-Doptimize=ReleaseFast`, for the reason above: route the
 allocation through a test-local allocator wrapper that inspects the bytes handed to `rawFree`, and
-gate the test on `builtin.mode == .ReleaseFast` with `error.SkipZigTest` so the skip is visible
+gate the test on `builtin.mode == .fast` (0.17 spelling of ReleaseFast) with `error.SkipZigTest` so the skip is visible
 rather than a silent pass (`xmlenc/src/test_roundtrip.zig`'s `FreeScanner` is the model). A wipe
 of a **stack local is not testable at all**, and no reviewer should ask for a red test on one: the
 dead frame lies below the stack pointer, so any function that reads it must first build a frame
@@ -212,7 +212,7 @@ A new module that draws a secret and does neither of the above is a finding.
 - **Internal casing.** Types → `TitleCase`; type-returning fns → `TitleCase`; other
   callables → `camelCase`; everything else → `snake_case`.
 - **Recursive sub-libraries.** A module may need its own building blocks (e.g. `dns` over
-  DoH wants http + tls + json). Rule: prefer Zig 0.16 std for a dep; only promote a
+  DoH wants http + tls + json). Rule: prefer Zig 0.17 std for a dep; only promote a
   sub-dependency to its own module when std has a *real gap* and it makes sense to own
   it long-term.
 - **Repo shape:**
@@ -695,8 +695,8 @@ lane proves something the others cannot:
 | `-Doptimize=ReleaseSafe` | the combination the other two never form — optimisations *and* safety checks armed. Not a formality: it is the lane that caught the only real defect of 2026-08-12 (a use-after-scope) while Debug and ReleaseFast both passed it by luck (`f88a102`). Integrators build in all three, so all three must pass |
 
 **⛔ Nothing measured under valgrind may be a Debug build.** Debug is the only mode
-whose default backend is Zig 0.16's self-hosted x86_64 one, and valgrind's DWARF reader
-cannot parse the `.debug_line` it emits — measured 2026-09-08 on a ten-line program with
+whose default backend is Zig's self-hosted x86_64 one, and valgrind's DWARF reader
+cannot parse the `.debug_line` it emits — measured 2026-09-08 (Zig 0.16; not re-measured on 0.17.0) on a ten-line program with
 no inline asm and no `std.valgrind` call: 35 159 `Badly formed extended line op` warnings
 with `-fno-llvm`, **0** with `-fllvm`, and the release modes break identically when forced
 `-fno-llvm` (48 395 / 37 369), so it is the backend and not the mode. The cost is not lost
@@ -912,7 +912,7 @@ nothing about a `ReleaseFast` one. What an integrator does with that is their ca
   the check existed before that but searched for the substring "N modules" ANYWHERE in the
   file, and the Portability section's generated sentence contains exactly that string — so
   the generated copy satisfied the check on the hand-written one's behalf, and a wrong
-  Status line passed all four catalog gates. It is anchored to the Status line now. See `checkChangelog` in `build.zig` for the full
+  Status line passed all four catalog gates. It is anchored to the Status line now. See `checkChangelog` in `scripts/gates/gates.zig` for the full
   calibration and for what a green run does not prove.
 - **Maturity = a computed grade over a per-module card, plus the explicit caveats**
   (revised 2026-09-30; before that, caveats only. **Grading v2, 2026-10-07, owner's decision:**
@@ -936,7 +936,7 @@ nothing about a `ReleaseFast` one. What an integrator does with that is their ca
   axes; `?` marks it provisional while the scope is unsurveyed or the survey is over a year
   old, and a lead older than 180 days counts as parity until re-measured. A consumed module
   must grade 3 or better (`check-catalog-table` fails otherwise). The exact rule is
-  `maturityGrade` in `build.zig`, the vocabulary is in `modules/_template/SPEC.md`, the scale
+  `maturityGrade` in `scripts/gates/gates.zig`, the vocabulary is in `modules/_template/SPEC.md`, the scale
   is explained in the README's "Module grades", and the grade appears in the catalog next to
   the module's description with the capping axes in brackets.
   ⚠ The v2 cards started pessimistic on purpose (2026-10-07): no audit carries a source hash
@@ -1087,7 +1087,7 @@ that reaches it can notice.
      two sides per workload and keeps each side's best of several rounds (user-mode
      cycles where the CPU counts them): timed one after the other on a shared machine they
      see different loads, measured at ±10 % (zstd, 2026-10-09). The grade's 10 % tolerance
-     for P2 (`p2_ref_tolerance` in `build.zig`) assumes this method.
+     for P2 (`p2_ref_tolerance` in `scripts/gates/gates.zig`) assumes this method.
 
   All three go to `modules/<name>/tools/`, each with a header saying what it needs and what it
   produces. Mutation runners, probes for one finding, benchmarks of a fixed regression and

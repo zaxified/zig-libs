@@ -41,7 +41,7 @@ RustCrypto's other block modes (CFB, OFB, IGE, PCBC — separate modules' busine
 
 Raw AES-CBC (NIST SP800-38A §6.2) over `std.crypto.core.aes`'s
 `Aes128`/`Aes256`, plus the two padding schemes this repo's consumers need.
-`std.crypto.core.aes` (Zig 0.16) ships the AES block cipher but no CBC mode;
+`std.crypto.core.aes` (Zig 0.17) ships the AES block cipher but no CBC mode (`modes.zig` has `ctr`/`ctrSlice` only);
 CBC had been hand-rolled independently in `xmlenc` (XML-Encryption content
 decryption) and `jwe` (`AxxxCBC-HSxxx`, RFC 7518 §5.2). This module is the
 single extracted core both now build on (see Status).
@@ -190,7 +190,7 @@ the oracle on their own**:
 
 ## AES-192
 
-`std.crypto.core.aes` in Zig 0.16 exports only `Aes128`/`Aes256`. Since
+`std.crypto.core.aes` in Zig 0.17 exports only `Aes128`/`Aes256`. Since
 2026-10-10 the `aes192` module supplies `Aes192` with the same declarations
 (`key_bits`, `initEnc`, `initDec`, the contexts' `encrypt`/`decrypt`), and
 because this module is `comptime`-generic over the block-cipher type it takes

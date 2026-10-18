@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — Zig 0.17.0: `@hasDecl` sees only `pub` declarations, so the operation type passed to `Pool.call` must declare `pub fn call` (a non-`pub` one is now reported as "has no call() method" at compile time). No code change.
 - **2026-10-04** — **mvp → core.** Membership changes while serving: `remove(id)`
   (drains, leaves the list and the ring, stays valid for calls in flight),
   `reap()`, `retiredCount()`, `drain`/`undrain`; `add` takes the lock and may run

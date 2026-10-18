@@ -39,7 +39,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 - **Layered:** `TokenBucket` — the bare algorithm, no clock/lock/allocation, caller passes `now_ns`.
   `Limiter` — per-key buckets in a bounded LRU store (`max_keys` + idle `ttl_ms`), internally
   synchronized (spinlock around a hash lookup + O(1) LRU relink — the std `SmpAllocator` pattern,
-  since Zig 0.16 std has no io-less blocking mutex), clock injected via `Options.clock` (default OS
+  since Zig 0.17 std has no io-less blocking mutex (`std.atomic.Mutex` is try-lock only; `Io.Mutex.lock` needs an `Io`)), clock injected via `Options.clock` (default OS
   `CLOCK_MONOTONIC`). `Limiter.middleware()` is the `router.Middleware`. Modeled after Go
   `golang.org/x/time/rate` (float balance, lazy refill, burst cap) + nginx `limit_req`'s keyed
   store — design refs only, see NOTICE.

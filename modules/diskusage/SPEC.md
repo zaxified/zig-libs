@@ -47,8 +47,9 @@ them on every file.
 
 ## Why a raw syscall layer is needed at all
 
-`std.Io.File.Stat` (0.16) carries `size`, `mode`, `kind`, `inode` and three
-timestamps. It carries neither of the two fields this module is built on:
+`std.Io.File.Stat` (0.16; on 0.17 `mode` became `permissions` and `nlink` and
+`block_size` were added, still no blocks or device) carries `size`, `mode`, `kind`,
+`inode` and three timestamps. It carries neither of the two fields this module is built on:
 
 | Field | What it decides | In `std.Io.File.Stat`? |
 |---|---|---|

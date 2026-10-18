@@ -222,7 +222,7 @@ exactly `i`).
   secret chain values; still, treat timing as out of scope.
 - **No internal RNG:** keyGen takes caller-supplied `sk_seed`, `sk_prf`
   (secret) and `pub_seed` (public but MUST be high-entropy, §4.1.3) —
-  bring a CSPRNG (std 0.16 removed `std.crypto.random`). Everything is
+  bring a CSPRNG (std removed `std.crypto.random` in 0.16; still absent in 0.17). Everything is
   deterministic, which is what makes the KATs byte-exact.
 - **No allocation, no I/O:** all buffers are fixed-size (largest: `BdsState`
   itself, 2544 B at h=20 — bigger than the 67x32 B WOTS+ arrays this line used

@@ -24,7 +24,7 @@ const vdf = @import("vdf");
 const m = vdf.group.rsa2048ChallengeModulus();
 
 // x as a canonical big-endian element.
-var x_bytes: [vdf.group.modulus_bytes]u8 = [_]u8{0} ** vdf.group.modulus_bytes;
+var x_bytes: [vdf.group.modulus_bytes]u8 = @splat(0);
 x_bytes[x_bytes.len - 1] = 5;
 const x = try vdf.group.elementFromBytes(m, &x_bytes);
 

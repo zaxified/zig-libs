@@ -85,7 +85,7 @@ platform-free); file system and storage faults **in scope from the start**.
   per host; a path is taken while its listener lives (`AddressInUse`), a missing
   one is `FileNotFound`, a crash removes the host's paths. Under the hood a Unix
   stream is a loopback stream on an address private to the host (`unix_ip`).
-  `socketpair` stays refused: std 0.16's `CreatePairOptions` names an *IP* family
+  `socketpair` stays refused: std 0.17's `CreatePairOptions` (`Io/net.zig:1250`) names an *IP* family
   and Linux answers `socketpair(AF_INET)` with EOPNOTSUPP — the differential oracle
   caught simio offering a pair the real `Io` cannot make.
 - Names: `netLookup` resolves `HostOptions.name` (case-insensitive), IP literals
@@ -101,8 +101,8 @@ platform-free); file system and storage faults **in scope from the start**.
 **Out (the operation behaves exactly as in `std.Io.failing` — an error such as
 `error.NetworkDown` or `error.OperationUnsupported`, never a fabricated success):** processes (`processSpawn*`, `childWait`, `processReplace*`),
 DNS on the wire (a module's own resolver, like `dns`, runs against simulated name
-servers instead), `socketpair` (see above), Unix datagram sockets (std 0.16 has
-none), terminals beyond stderr, preemptive
+servers instead), `socketpair` (see above), Unix datagram sockets (std 0.17 has
+none: `Socket.bind`/`send` take an `IpAddress`), terminals beyond stderr, preemptive
 threads, the CPU memory model. Code that bypasses `std.Io` (raw `std.os.linux`
 syscalls, `std.Thread`, globals keyed by address) is outside simulation and is the
 consumer's to remove.
@@ -293,7 +293,8 @@ can say what is right):
   now a per-host lock over the host's stderr writer (into `console`), and
   `NotTerminalDevice`.
 - A stream over a link losing everything retransmitted forever on the scheduler's
-  stack; now the connection times out at the user timeout.
+  stack; now the connection times out at the user timeout (a stream read that
+  times out reports `error.ConnectionTimedOut`, the 0.17 `NetRead` error set has no `Timeout`).
 - A `Batch` with two receives on one socket registered the task twice: a double
   wake (an assertion), then a stale wake cutting a later sleep short.
 - `MSG_PEEK` consumed the datagram (oracle).

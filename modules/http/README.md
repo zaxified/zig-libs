@@ -465,7 +465,7 @@ Each accept loop owns its own `Io.Group`; `shutdown` drains all N, `serve`
 returns once every listener's connections have drained. Pass
 `http.Server.cpuCount()` for one listener per core. With an ephemeral port
 (port 0) all N listeners share the *resolved* port. io_uring is deliberately
-not used — its net vtable is `Unavailable` in std 0.16.
+not used — its net vtable is `Unavailable` in std 0.17.
 
 ```zig
 var server = http.Server.init(io, gpa, .{
@@ -723,7 +723,7 @@ provider is called concurrently too. For zstd, zig-libs `zstd.StreamWriter`
   client" above) — use them when every target is `http://` and binary size
   matters; `request`/`requestStreaming`/`putFile` are unaffected either way.
 - **Timeouts:** both budgets are enforced, and neither by the socket layer —
-  std 0.16.0 has no per-read deadline and `Io.Threaded` panics outright ("TODO
+  std 0.17.0 has no per-read deadline and `Io.Threaded` panics outright ("TODO
   implement netConnectIpPosix with timeout") if `ConnectOptions.timeout` is
   set. What std does offer is cancelation, so each blocking phase runs on a
   concurrent task and blowing the deadline cancels it, interrupting the

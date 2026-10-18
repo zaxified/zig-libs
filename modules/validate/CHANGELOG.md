@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC brought up to Zig 0.17.0 (version statements, snippets, measurement labels).
+
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** tools ported to Zig 0.17.0 (compile only): `tools/bench.zig`: struct `.fields[0].name` -> `field_names[0]`.
 - **2026-10-18** — Ported to Zig 0.17.0. Non-mechanical: private `StructField`/`structFields` shim over `field_names`/`field_types`/`field_attrs` for `rulesFor` and `parseQueryLeaky` (struct `.fields` is gone); `std.heap.stackFallback` -> `BufferFirstAllocator` over a stack buffer (2 sites); the `checkAllAllocationFailures` tests wrap their allocator in a resize-refusing `NoResize` (zig 0.17.1: 7c793c2); `validateParams`' param lookup `get` must now be `pub` (`@hasDecl` sees only pub decls; compile error text says so, `validate_rules` was already documented as `pub`). `max_body_bytes` (`readBody`): 0.17 `allocRemaining(.limited(n))` accepts exactly n bytes = the documented cap; new test pins n accepted, n+1 -> 413.
 - **2026-10-17** — `date`/`date-time` checks and instant comparison use `datefmt.daysInMonth`/`ymdToEpochDay` (new direct dep `datefmt`, already in the closure via `http`) instead of this module's own civil-calendar helpers. No behaviour change.

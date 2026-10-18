@@ -159,7 +159,7 @@ malformed length field into a typed error instead of an out-of-bounds panic
 The canonical guard in front of `std.crypto.Certificate.parse`, whose
 unchecked DER reader **panics in Debug and reads out of bounds / segfaults in
 ReleaseFast** on a malformed, attacker-supplied certificate (verified on Zig
-0.16.0). `safe.validate` / `safe.validateCertificate` are a recursive-descent
+0.16.0; the std DER reader is unchanged in 0.17.0, not re-run). `safe.validate` / `safe.validateCertificate` are a recursive-descent
 DER well-formedness validator (its own bounds-checked decoder — it does not
 trust std's reader) returning a typed `safe.Error`. **They do not on their own
 make an input safe to `parse`** — a tiling proof says nothing about the inside

@@ -307,7 +307,7 @@ OpenSSL's documented dispatch, not measured.)
 Raising `max_modulus_bits` to 8192 doubled every capacity-sized object, and work that scaled
 with the capacity instead of the key showed up at 2048 bits: blinded sign/decrypt 1.08 → 1.12×,
 verify 0.83 → 0.91× (A/B against the same tree at 4096: perf put it in `compiler_rt.memset` —
-Zig 0.16 lowers a `@memset` of a few hundred bytes to a byte-wise call — in volatile byte
+Zig 0.16 lowers a `@memset` of a few hundred bytes to a byte-wise call (0.17.0's is vectorised, not re-measured) — in volatile byte
 wipes of 1–5 KiB structs, and in 1 KiB compares). Fixed by bounding the work by the key: verify
 on exactly k octets, blinding wipes the slot limbs only and takes `e` as a `u32`; in montint
 `DynModint` results zero only above the slot (vector stores), `elemFromBytesBE` subtracts over

@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC brought up to Zig 0.17.0 (version statements, snippets, measurement labels).
 - **2026-10-06** — ADDED: several classifiers per subscriber and HTB class knobs. **BREAKING:**
   `Node.match` is now `[]const Match` (was `?Match`): write `.match = &.{m}` for one entry,
   `&.{v4, v6}` for a dual-stack circuit; each entry becomes one `flower` filter into the

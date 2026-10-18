@@ -10,7 +10,7 @@ zero globals.
   `limit_req`'s keyed-store shape.
 - **Platform:** any. **Role:** util. **Concurrency:** threadsafe — the
   `Limiter` is internally synchronized (a spinlock around a hash lookup +
-  O(1) LRU relink; Zig 0.16 std has no io-less blocking mutex — this is the
+  O(1) LRU relink; Zig 0.17 std has no io-less blocking mutex (`std.atomic.Mutex` is try-lock only, `Io.Mutex.lock` needs an `Io`) — this is the
   std `SmpAllocator` pattern). The bare `TokenBucket` is single-owner.
 - **Deps:** `router`, `http`, `netaddr` (peer-IP key formatting).
 

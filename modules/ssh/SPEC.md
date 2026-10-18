@@ -365,7 +365,7 @@ Consumer build options (CONVENTIONS §4.2), added 2026-10-18:
 
 - ~~**Ed25519 host key: the seed is not checked against the public key in ReleaseFast/ReleaseSmall**~~
   — **fixed 2026-10-18**: `parseEd25519Body` derives the pair with `Ed25519.KeyPair.generateDeterministic(seed)`
-  and compares its public key with the container's (std 0.16 `fromSecretKey` re-derives only under runtime
+  and compares its public key with the container's (std `fromSecretKey` (0.16, unchanged in 0.17.0: `ed25519.zig:358`) re-derives only under runtime
   safety, so the old check compared the container's copy with itself). Test `parseEd25519Body: a seed that does
   not derive the container's public key is refused in every mode`, run in ReleaseFast; the old derivation fails it.
 - ~~**Constant time: the OpenSSH host-key PEM is decoded with std's table base64**~~ — **fixed

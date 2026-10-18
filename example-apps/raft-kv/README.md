@@ -66,7 +66,7 @@ Now `kill -9` the process that logged `LEADER` and run the `put` again: it
 retries through the election and lands on the new leader. Restart the killed
 node with the same command line and watch `dump` on it converge.
 
-`init.sh` needs Zig 0.16.0 on `PATH` and installs nothing for you.
+`init.sh` needs Zig 0.17.0 on `PATH` and installs nothing for you.
 
 ## What is worth reading it for
 

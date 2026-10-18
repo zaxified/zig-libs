@@ -30,7 +30,7 @@ README.
 | Zig `std.crypto` 0.16.0, Zig ecosystem | Zig | MIT | — | Zig 0.16.0 | std has `Aes128`/`Aes256` only (its context asserts `key_bits == 128 or 256`); GitHub search (`aes`, language Zig) found modes over std's AES, no AES-192. This module is the only one. |
 
 **Where we are ahead:** the only Zig AES-192, std-shaped so std's generic modes take it unchanged;
-ctgrind-checked on AES-NI; works around two std 0.16 software-backend defects (*Algorithm*).
+ctgrind-checked on AES-NI; works around two std software-backend defects (present in 0.16 and 0.17.0) (*Algorithm*).
 **Where we are behind:** no constant-time software backend — RustCrypto has a bitsliced one, Go
 and std do not (deliberately not done here, see *What is deliberately not done*).
 
@@ -60,12 +60,12 @@ FIPS-197 (2001; 2023 update `-upd1`), Nk = 6, Nr = 12.
 - **Decryption** — the equivalent inverse cipher, §5.3.5 (as std's `AesDecryptCtx`): round
   keys reversed, InvMixColumns on rk1..rk11, then `Block.decrypt` × 11 and `decryptLast`.
   InvMixColumns is composed as `decrypt(encryptLast(x, 0), 0)` rather than
-  `Block.invMixColumns`, because on std 0.16's software backend the latter branches on the
-  key byte (`soft.zig:805`, inside its GF(2^8) `mul`) — measured: 872 memcheck contexts in the
+  `Block.invMixColumns`, because on std's software backend (0.16, and still in 0.17.0) the latter branches on the
+  key byte (`soft.zig:805` in 0.16, `soft.zig:820` in 0.17.0, inside its GF(2^8) `mul`) — measured: 872 memcheck contexts in the
   `dec` harness before the change, 0 branches after.
 - **Wide calls** — an unrolled loop of one-block rounds (`roundWide`), which is what std's
-  `Block.parallel.*Wide` is on AES-NI/ARMv8. Not called through std because in Zig 0.16.0 the
-  software backend's `parallel.*Wide` does not compile (`var i = 0;`, `soft.zig:315`).
+  `Block.parallel.*Wide` is on AES-NI/ARMv8. Not called through std because in Zig 0.16.0 and 0.17.0 the
+  software backend's `parallel.*Wide` does not compile (`var i = 0;`, `soft.zig:315` in 0.16, `soft.zig:318` in 0.17.0).
 
 ## Design & invariants
 

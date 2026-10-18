@@ -83,7 +83,7 @@ try sim.setLinkUp(a, b, false);            // partition, then run on
 - `addHost(.{ .name = "db" })` makes `HostName.lookup`/`connect` find the host by
   name (`localhost` and IP literals work too; nothing else exists).
 - `UnixAddress.listen`/`connect` work by path, per host; `socketpair` is refused,
-  as std 0.16 on Linux refuses it.
+  as std 0.17 on Linux refuses it (its `CreatePairOptions.family` is an IP family).
 
 ### Crashes, faults and search
 

@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README: std inventory path now points at the 0.17.0 toolchain.
+
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** `zig fmt` (0.17) rewrote `@intFromEnum`/`@enumFromInt` to `@backingInt`/`@fromBackingInt` in sources and tests; same values, same behaviour.
 - **2026-10-18** — Ported to Zig 0.17.0. bufPrintZ/dupeZ -> bufPrintSentinel/dupeSentinel; ELF program-header layout test uses `elf.Elf64.Phdr`. Also: comptime `strRepeat` helper quota raised.
 - **2026-10-10** — Fixed: `fixupDatasecs` panicked (`@intCast` integer does not fit) on an object whose variable symbol has `st_value` or `st_size` above 32 bits; it now returns `error.MalformedElf` (found by the new `EBPF_FUZZ` driver, ebpf-object seed 1867; regression test added).

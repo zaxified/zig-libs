@@ -135,7 +135,7 @@ WOTS+/XMSS/hypertree/FORS code serves all twelve sets.
   reaches for OS entropy itself.
 - **Out of scope this pass:** streaming/incremental signing APIs (the pre-hash
   entry points are the answer for digests computed elsewhere). The `keyGen`/`sign` seeds/randomness
-  are caller-supplied by design (std 0.16 removed `std.crypto.random`).
+  are caller-supplied by design (std removed `std.crypto.random` in 0.16; still absent in 0.17).
 - **Signature size is inherent:** 7 856 B (128s) up to 49 856 B (256f) per
   signature — see the size table in README.md. Protocol designs that
   cannot carry that should pick a different scheme; within SLH-DSA the

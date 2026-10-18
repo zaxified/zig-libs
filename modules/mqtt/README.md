@@ -246,7 +246,7 @@ that never stalls behind a fan-out (a liveness probe reconnects throughout),
 correct post-storm delivery, no torn packets, and a connection/subscription
 count that drains cleanly to zero (no take-over zombie). It is socket-gated
 (`error.SkipZigTest` where loopback/threads are unavailable). Zig 0.16.0's
-`-fsanitize-thread` is a no-op (no `__tsan_*` instrumentation is linked), so the
+`-fsanitize-thread` is a no-op on the self-hosted backend (TSan works only with `-fllvm`; measured on 0.16, not re-checked on 0.17) (no `__tsan_*` instrumentation is linked), so the
 race detection is the real-thread run under Debug and `-Doptimize=ReleaseFast`,
 repeated many times, cross-checked with a valgrind `memcheck` pass (no errors).
 Since 2026-10-01 half its workers speak 5.0 — QoS 2, Subscription Identifiers, a

@@ -3,7 +3,7 @@
 A subprocess runner whose hard core is a **reap-race-tolerant wait**. In a host
 process where a sibling thread calls `wait4(-1)` (reaps *any* child — a language
 VM's exit-code handler, or a shell that left `SIGCHLD` as `SIG_IGN` so the
-kernel auto-reaps), the child can be reaped out from under you. Zig 0.16's
+kernel auto-reaps), the child can be reaped out from under you. Zig 0.16's (and 0.17.0's, `Io/Threaded.zig:15686`)
 `std.process.Child.wait` treats the resulting `ECHILD` as an `errnoBug`
 (double-free) and **panics** (a racy `SIGABRT`). `procrun.waitTolerant` reaps
 through a path that maps `ECHILD` to `Term.unknown` (child gone, status

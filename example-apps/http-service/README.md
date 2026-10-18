@@ -44,7 +44,7 @@ content, by `scripts/check-apps.sh --pinned`.
 ./zig-out/bin/http-service    # listens on 127.0.0.1:8087
 ```
 
-`init.sh` needs Zig 0.16.0 on `PATH` and installs nothing for you. It prints
+`init.sh` needs Zig 0.17.0 on `PATH` and installs nothing for you. It prints
 a fixed demo `X-Api-Key` and webhook HMAC secret on startup — override both
 with `--api-key`/`--webhook-secret` for anything beyond a loopback demo (and
 never on a real deployment's command line, where `ps` can read it — the same

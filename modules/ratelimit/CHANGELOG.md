@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC statements that Zig has no io-less blocking mutex / `std.Thread` primitives re-checked against the 0.17.0 std (still true).
+
 - **2026-10-11** — x/time/rate parity: `TokenBucket.allowNAt`/`reserveNAt`/`cancelAt`/`tokensAt`/`advanceAt`, `Reservation`; `Limiter.allowN`/`allowNAt`, `waitN` (sleeps on an `Io`; `WaitError`), `setRate`/`setBurst`/`setConfigAt`, `currentConfig`. `Decision` gains `limit` (the burst it was made against; the middleware's `RateLimit-Limit` now reads it, so a concurrent `setBurst` is not a data race) and `retry_after_ms = maxInt(u64)` for `n > burst`. `TokenBucket.tokens` may be negative while reservations are outstanding; `TokenBucket` gains `last_event_ns` (defaulted). A pending reservation keeps its key from the idle-TTL reset. Anchored on 10 captured x/time/rate operation sequences (`src/xrate_ops_vectors.zig`, driver `tools/xrate/ops.go`). Deliberate differences: a second `cancelAt` is a no-op (x/time/rate v0.15.0 restores again), `waitN` cancelled via `io` keeps the tokens.
 
 - **2026-10-10** — Comparative benchmark `tools/bench.zig` (`zig build bench-ratelimit`, kept instrument kind 3): card Performance 0.08–0.38× golang.org/x/time/rate, measured on a quiet host. Tooling only, no code change.

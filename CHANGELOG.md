@@ -12,7 +12,7 @@ semantic version.
 
 ## Unreleased
 
-The collection grew 77 → 230 modules since v0.1.0, spanning pairing/EC
+The collection grew 77 → 249 modules since v0.1.0, spanning pairing/EC
 crypto, Bitcoin/Lightning, post-quantum, FHE/ZK/MPC, protocol security,
 distributed fabric and kernel/networking. Every module now carries a
 `CHANGELOG.md`, not only the ones with a code change to record: each
@@ -24,6 +24,24 @@ directory.
 
 ### Collection-wide notes (belong to no single module)
 
+- **Zig 0.17.0 (2026-10-18) — BREAKING for every consumer: `minimum_zig_version` is 0.17.0.** The
+  last tag on Zig 0.16 is `2026-10-18`; the next tag is the first on 0.17 and cannot be used from 0.16.
+  All 249 modules, their examples, tools and the six example-apps were ported; every module passed its
+  tests on 0.17.0, the repo gates, `check-portable`, ctgrind (254 rows) and a big-endian qemu sweep
+  (s390x, mips) compared against a 0.16 baseline. Build: Zig 0.17 removed custom build steps, so the repo
+  gates now run as one host tool (`scripts/gates/`, `zig build <gate>` unchanged). Consumer-visible API
+  notes (details in each module's CHANGELOG): `@hasDecl` sees only `pub` declarations, so consumer option
+  and hook decls must be `pub` (cbor `cbor_options`, yaml `yaml_keys`, protobuf `pb_fields`, noise
+  `noise_name`/`noise_stack_bytes`, resilience and upstream operation hooks, validate `pub fn get`);
+  websocket `deflate.Param.value_buf` removed (latent dangling slice fixed); simio stream-read timeout is
+  `error.ConnectionTimedOut`; body limits built on `Reader.allocRemaining` now accept exactly the limit
+  (http, webhooksig, mcp-http, idempotency, validate, llmclient — each documented limit kept). Found and
+  fixed on the way: constant-time regressions introduced by LLVM 22 in aescbc (padding verdict split
+  into two jumps) and fss (jump on the secret control bit); big-endian keystream errors in chachapoly and
+  sealedbox (0.17 array `@bitCast` is little-endian on every target); LLVM 22 byte-loop codegen for
+  byte-array↔vector bitcasts in chachapoly/poly1305, aesgcm and sealedbox (speed back to 0.16); tlsclient
+  now rejects malformed post-handshake messages (KeyUpdate length, short handshake fragment, KeyUpdate
+  on TLS 1.2) instead of panicking.
 - **Module grades v2 (2026-10-07) — every module re-graded, most one step lower.** The scale
   is now scope-led: 1 ahead of the competition (parity plus a dated, measured lead; a speed
   lead must beat the fastest implementation in the field, not just the reference), 2 parity,

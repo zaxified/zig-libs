@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC statements about std's unchecked DER reader (`Certificate.parse`) re-read against the 0.17.0 std (unchanged); 0.16-only measurements are labelled as such.
+
 - **2026-10-18** — Ported to Zig 0.17.0. `safe.zig` `std_descent_points_verified_against` raised 0.16.0 -> 0.17.0 after diffing `std.crypto.Certificate.parse` between the two toolchains (identical descent points). `EnumSet.initEmpty()` -> `.empty` (chain.zig); test-only `std.meta.fields` -> `@typeInfo(..).field_names`.
 - **2026-10-17** — `names.parseIp4`/`parseIp6` are now `netaddr`'s parsers (new dep `netaddr`) instead of a second implementation in this module. Same API, same answers: a differential run over 20 M random and mutated inputs found no disagreement (negative-controlled with a planted leading-zero mutant). Existing `names` tests and the `x509-names` fuzz harness now exercise the shared parser.
 - **2026-10-16** — single-field readers for consumers (acme): `chain.certValidity` (notBefore/notAfter over the bounded shape walk), `chain.certAuthorityKeyId` (the AKI keyIdentifier), `names.nameAttribute` + `names.oid_common_name` (first value of an attribute in a `Name`, e.g. the issuer CN). Tests: values equal to openssl's reading of `data/p521/` fixtures; every truncation and single-byte change errors without an out-of-bounds read.

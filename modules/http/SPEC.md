@@ -658,7 +658,7 @@ set, the session lock is a `std.Io.Mutex` and `waitForPeer`/the drain park on a 
 `progress` counter sampled under the lock makes the wait immune to a wakeup that lands between the
 caller's unlock and its wait. `null` keeps the yield-spin. Tested under `BatonIo` (OS threads, one
 runner at a time, the baton handed over only inside a blocking `Io` call = the fiber rule), because
-`std.Io.Evented` does not compile in Zig 0.16.0; without `io` the first such test hangs, and a `pump`
+`std.Io.Evented` did not compile in Zig 0.16.0 (not re-checked on 0.17); without `io` the first such test hangs, and a `pump`
 that does not broadcast hangs the flow-control one (both measured).
 
 **h2 upstream forwarding** reuses the multiplexing `h2_client.Session` through its *buffered*

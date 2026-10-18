@@ -83,7 +83,7 @@ const fleetsim = @import("fleetsim");
 var f = try fleetsim.Fleet.init(gpa, .{ .seed = 0xC0FFEE, .max_frame_len = 300 });
 defer f.deinit();
 
-var holdings = [_]u16{0} ** 16;
+var holdings: [16]u16 = @splat(0);
 var slave = fleetsim.ModbusNode.init(
     .{ .unit_id = 1, .framing = .tcp },
     .{ .holding_registers = .{ .base = 0, .values = &holdings } },

@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC brought up to Zig 0.17.0 (version statements, snippets, measurement labels).
+
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** tools ported to Zig 0.17.0 (compile only): `tools/interop.zig`: `dupeZ` -> `dupeSentinel`, `Ast.parse` takes `.{ .mode = .zig }`.
 - **2026-10-18** — tests: mutation audit of the code added since 2026-09-11 (139 schemata mutants, 135 killed, 4 equivalent); eleven tests added in `root.zig` and two in `summary.zig` (summary descriptor limits and option comparison, callback and collector refusals, `Sink` bounds, `negotiate` ties, request size with `Content-Length`, wrong-length `delete` lookups, ticket reaping). **NO CONSUMER-VISIBLE CHANGE.**
 - **2026-10-18** — Series removed by `delete`/`reset`/`unregister` while scrapes overlap are now freed once the scrapes that started before the removal end (ticketed scrapes); before, the parking list was drained only when no scrape at all was running, so back-to-back scrapers kept every removed series (review L5). **Added:** `Registry.lastCollectorError()` — the error of the collector that last failed a scrape, which `write` reports only as `WriteFailed` (L9). Review L4/L6/L7/L8 closed without change (SPEC). Tests: overlapping scrapes keep at most one series parked (fails under the old rule), the collector error is kept.

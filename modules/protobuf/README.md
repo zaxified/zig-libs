@@ -2,7 +2,8 @@
 
 Protocol Buffers **wire format** (proto3) — encode and decode — with the schema derived at
 compile time from ordinary Zig structs. There is **no `.proto` compiler and no generated code**:
-a message is a plain struct that declares `pub const pb_fields`, and the codec is specialised
+a message is a plain struct that declares `pub const pb_fields` (it must be `pub`: Zig 0.17's
+`@hasDecl` ignores private declarations, so a private `pb_fields` is not a message), and the codec is specialised
 from `@typeInfo`. Untrusted input is the design centre — every length-delimited field's declared
 length is validated against the bytes actually present before it can size an allocation or bound
 a loop, and embedded-message nesting is capped.

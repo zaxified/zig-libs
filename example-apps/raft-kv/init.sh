@@ -3,7 +3,7 @@
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
-NEED_ZIG=0.16.0
+NEED_ZIG=0.17.0
 
 have() { command -v "$1" >/dev/null 2>&1; }
 

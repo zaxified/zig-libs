@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC: 'no per-function target features' and codegen notes labelled as 0.16 measurements, not re-checked on 0.17; std CRC/memset facts updated for 0.17.0.
+
 - **2026-10-17** — Fuzz reach test: a backend label (`simd`, x86-64 AVX2 only) is required only where that backend is compiled (arm64 CI). Test only.
 
 - **2026-10-10** — **NO CONSUMER-VISIBLE CHANGE:** deterministic fuzz driver (`SHA2_FUZZ`): every backend, up to six `update` cuts, `peek` after each cut and the one-shot `hash` agree with std on arbitrary bytes and on lengths at the padding boundaries; HMAC-SHA-256/384/512 (keys short, at and past the block size) and HKDF extract/expand agree with std's. 200,000 runs per harness clean in ReleaseSafe.

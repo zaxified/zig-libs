@@ -127,7 +127,8 @@ no `COSE_Mac0`/`Encrypt0`/`Sign` (libcbor has no COSE at all).
   comptime-generated walk; the result may alias the `Value`, so it lives in an arena
   (`Parsed(T)` owns one). Struct keys by field name, or `cbor_options.keys` (int, negative too,
   or text); `cbor_options.bytes` marks `[]const u8` fields carried as byte strings (default:
-  text). Every allocation the mapping makes is charged against `max_alloc_bytes` (default
+  text). `cbor_options` must be a `pub const` (since Zig 0.17 `@hasDecl` sees only `pub` decls; a
+  non-`pub` one is silently ignored). Every allocation the mapping makes is charged against `max_alloc_bytes` (default
   64 MiB) before it is made — a one-byte item can become a large `T`.
 - **Mutation 2026-10-04, four equivalents:** `shortestFloat`'s binary16 test by value instead of
   bits (they differ only for NaN, which every caller handles first, and ±0, whose bits survive

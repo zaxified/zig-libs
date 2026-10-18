@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC statements that `std.crypto.random` is gone / std has no ambient entropy re-checked against the 0.17.0 std (still true).
+
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** `zig fmt` (0.17) rewrote `@intFromEnum`/`@enumFromInt` to `@backingInt`/`@fromBackingInt` in sources and tests; same values, same behaviour.
 - **2026-10-18** — Ported to Zig 0.17.0. Tests use `field_names` for enum/union `@typeInfo`.
 - **2026-10-10** — tests: deterministic fuzz driver `SNMP_FUZZ` (`src/fuzz_test.zig`). `snmp-wire`: genuine v1/v2c messages (every PDU type and varbind value type), v3 envelopes and USM parameters damaged and decoded (undamaged decode to what was encoded; damaged never panic, accepted ones iterate to their end; BER primitives on every element). `snmp-auth-priv`: USM as an oracle (signed message verifies; a flipped octet anywhere, a wrong key, wrong protocol or short key is refused; DES-CBC / AES-128-CFB round trip, wrong key / salt / salt length do not decrypt). `snmp-v3-reply`: `V3Client` against the in-memory `FakeAgent` with the discovery Report or the reply damaged: untampered returns the agent's value, a damaged authenticated reply is never data. 200,000-run verdicts clean (v3-reply at `.scale` 64). No code change.

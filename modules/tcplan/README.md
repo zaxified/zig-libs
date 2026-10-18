@@ -61,7 +61,7 @@ const sub = [_]tcplan.Node{
        .htb = .{ .prio = 1, .burst = 32 * 1024 },
        .match = &.{
            .{ .ipv4 = .{ .addr = .{ 100, 64, 0, 1 } } },
-           .{ .ipv6 = .{ .addr = .{ 0x20, 0x01, 0x0d, 0xb8, 0, 1 } ++ [_]u8{0} ** 10,
+           .{ .ipv6 = .{ .addr = .{ 0x20, 0x01, 0x0d, 0xb8, 0, 1 } ++ @as([10]u8, @splat(0)),
                          .prefix_len = 56 } },
        } },
 };

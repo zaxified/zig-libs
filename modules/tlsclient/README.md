@@ -4,7 +4,7 @@ std's TLS client (TLS 1.3 and 1.2), made into a client a Go programmer
 recognises: Go `crypto/tls`'s defaults and options (S2 parity, 2026-10-13),
 on top of the fix it was forked for. The fix: the certificate chain a
 server sends is verified by RFC 5280 path validation (`x509.verifyChain`), not
-link by link. Zig 0.16's `std.crypto.tls.Client` checks the issuer name, the
+link by link. Zig 0.16's `std.crypto.tls.Client` (not re-diffed on 0.17) checks the issuer name, the
 validity and the signature of each link and nothing else -- no
 basicConstraints, pathLenConstraint or keyUsage (ziglang/zig #35877) -- so
 anyone holding one valid certificate for any name can sign a leaf for any

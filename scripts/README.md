@@ -97,7 +97,7 @@ unused (see each row).
 
 This table said "the same gate CI runs" until 2026-09-09, and it was not true.
 CI additionally runs a `consumer` job that `test.sh` never calls at all:
-`scripts/check-apps.sh --run` builds the five `example-apps/` packages and runs
+`scripts/check-apps.sh --run` builds the six `example-apps/` packages and runs
 each one's `smoke.sh` in ReleaseSafe and then ReleaseFast, and
 `scripts/check-apps.sh --pinned` builds them through their published pins.
 
@@ -210,7 +210,7 @@ at its current fingerprint.
   and the own hash of every module in its dependency closure. So a
   change in `rsa` re-keys the 17 modules above it (`blindrsa`, `ssh`, `xmldsig`,
   `saml`, …) without any reverse-dependency pass, and editing a comment re-keys
-  nothing. Per-file hashes are memoised in the cache dir (0.2 s warm, 8 s cold).
+  nothing. Per-file hashes are not memoised on disk any more (Zig 0.17 gives a gate no cache root; the `zl-gates` tool is ReleaseSafe, measured 5.6 s for the whole tree on 2026-10-18) and only per process.
 - **Dry run** — `ZIGLIBS_DRY_RUN=1`: every step prints what it would run and
   passes; selection, fingerprints and stamps are real, and the stamps carry
   `DRY` in the lane key so they never stand in for real ones. `ci.yml` has a
@@ -387,7 +387,7 @@ wall limit 600 s, one fuzz run per machine via a lock in `$XDG_RUNTIME_DIR`).
 The limited form never starts the web UI; bare `--fuzz` is rewritten to
 `--fuzz=$ZIGLIBS_FUZZ_ITERS` and `--webui`/`--watch` are refused. The verdict is
 built from evidence zig cannot misreport, because zig 0.16.0 **exits 0 when a
-fuzz test crashes** (see `fuzz-sweep.sh`):
+fuzz test crashes** (see `fuzz-sweep.sh`; measured on 0.16.0, not re-verified on 0.17.0 — the verdict does not depend on it):
 
 | verdict | exit | evidence |
 |---|---|---|
@@ -624,7 +624,7 @@ Tag/dispatch only, like `interop`, and it needs
 `scripts/lib/ci-environment.sh ctgrind` to install valgrind. It FAILS rather than
 skips without it — a lane whose only purpose is the measurement must not report
 green for not having taken it. Measured 310 s warm for all 8 modules and all 20
-rows.
+rows (2026-09; on 2026-10-18 the lane covers 84 modules and 254 rows and took 2926 s on 0.16 — the 0.17 `--check` is green, see `ctgrind-expected.tsv`).
 
 ⛔ **`zig build check-ctgrind` is NOT this.** It compiles every harness as a rot
 guard and takes no measurement, deliberately, so that `zig build test` passes on
@@ -645,7 +645,7 @@ table, exit 0. A pinned claim nobody measures is worse than no claim.
 **⛔ Nothing measured under valgrind may be a Debug build — this is a repo-wide
 rule, not a ctgrind detail.** Zig 0.16 compiles Debug with the self-hosted
 x86_64 backend (Debug is the only optimize mode where that backend is the
-default), and valgrind's DWARF reader cannot parse the `.debug_line` it emits.
+default; measured on 0.16, not re-measured on 0.17.0), and valgrind's DWARF reader cannot parse the `.debug_line` it emits.
 Measured 2026-09-08 on a ten-line program with **no inline asm and no
 `std.valgrind` call at all**: `-fno-llvm` 35 159 `Badly formed extended line op`
 warnings, `-fllvm` **0**. It is a property of the backend and not of the mode —
@@ -683,7 +683,7 @@ modes turn that flag off, so a ReleaseFast binary built **without the switch**
 is a silent no-op under valgrind and reports a clean `0 errors` whatever the
 code does. A ctgrind claim that does not state its **mode**, its **switch** and
 its **context count** is therefore unfalsifiable — indistinguishable from a
-measurement that never happened. Seven modules carry a harness today; five of
+measurement that never happened. Seven modules carried a harness when this was written (2026-09; 84 today); five of
 them carried exactly such a claim (one with a seven-row table) before these
 harnesses existed, and `k256` + `montint` carried claims with **no** numbers at
 all — only disassembly read once by hand.
@@ -713,7 +713,7 @@ same reason a plumbing frame is only accepted with a real line number — a
 module function inlined into the print and reported at `Writer.zig:0` is not
 std, and must not pass as std.
 
-`scripts/checks/ctgrind.sh --self-test` runs that classifier against 17 recorded
+`scripts/checks/ctgrind.sh --self-test` runs that classifier against 23 recorded
 paragraphs (real memcheck output, no valgrind, no build, milliseconds), and
 every measurement runs it first. The rule that decides what every number here
 means is itself text processing, so it is cheap to test and expensive to leave
@@ -922,7 +922,7 @@ Three things compound it, and none of them is a bug in isolation:
 - `scripts/test.sh` runs `check-fuzz` and never `fuzz-sweep.sh`.
 - `.github/workflows/ci.yml` contains no fuzz step at all.
 - ⚠ **`zig build --fuzz` compiles in the Release modes and NOT in Debug.**
-  Measured on Zig 0.16.0, same module, one variable:
+  Measured on Zig 0.16.0 (not re-measured on 0.17.0), same module, one variable:
 
   ```
   $ zig build test-lnwire                --fuzz=20 ; echo $?    # Debug

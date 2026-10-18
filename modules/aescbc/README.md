@@ -67,7 +67,7 @@ _ = try aescbc.encryptCts(Aes256, .cs3, &key, iv, msg, ct);
 
 None of it allocates — caller supplies `out`. The cipher is a
 `comptime` type parameter: `std.crypto.core.aes.Aes128`/`Aes256`, or for
-AES-192 (which std 0.16 lacks) the `aes192` module's `Aes192`.
+AES-192 (which std 0.17 lacks) the `aes192` module's `Aes192`.
 
 **Padding-oracle warning:** never call `decrypt` + an unpad helper directly
 against attacker-controlled ciphertext without an authentication step (a MAC

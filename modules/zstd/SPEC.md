@@ -2879,7 +2879,7 @@ Before Z11 (2026-09-24) the same measurement gave 1.2–1.4× at levels
 - **Repcode swaps without `std.mem.swap`**: swapping two hot `u32` locals
   through pointers made LLVM keep them in memory and reassemble them byte
   by byte — 16 % of all instructions at level 1. A plain temporary fixes
-  it. (`a, b = .{ b, a }` is not a swap in Zig 0.16: the tuple is built in
+  it. (`a, b = .{ b, a }` is not a swap in Zig 0.16 (not re-checked on 0.17): the tuple is built in
   place, so `b` receives the new `a`; the goldens caught it.)
 - `fast`/`dfast` prefetch 64 and 128 bytes ahead when their step grows, as
   libzstd does.
@@ -2895,7 +2895,7 @@ that input is one job and 4 workers gain nothing, as in libzstd.
 **Small frames** (Z21, 2026-09-26; the 20 MB tar of Zig's `lib/` cut
 into frames, level 3, one reused context each way, compress then decode,
 cycles, `-mcpu=native`): libzstd's glibc `memset` is vectorised, Zig 0.16's
-`compiler_rt.memset` without libc stores byte by byte, and every block
+`compiler_rt.memset` without libc stores byte by byte (0.17.0's is vectorised, `compiler_rt.zig` `fastMemset`; these figures are 0.16), and every block
 clears a few KB of tables. `fill.zig` clears them, and the decoder's RLE
 blocks and literals, in 32-byte stores, and the FSE spread writes 8 bytes
 at a time (libzstd's `FSE_buildCTable_wksp` / `FSE_buildDTable`): 1 KB
@@ -2903,10 +2903,10 @@ frames went from 1.50× to 1.27× libzstd's cycles, 4 KB from 1.33× to
 1.21× (64 KB: 1.13×, unchanged); decoding an RLE-heavy input −20 %. What is left at
 1 KB is the table building itself (`huf.buildCTable`, `fse.CTable.build`,
 `huf_dec.readDTableX1`). `fill.zig` goes when Zig's `memset` is
-vectorised (upstream, after 0.16).
+vectorised (upstream, after 0.16 -- **triggered in 0.17.0**; re-measure, then decide).
 
 Z32 (2026-09-28) found more of the same, per call rather than per block:
-Zig 0.16 lowers `var x: ?T = null` for a large `T`, and any `.{}` whose
+Zig 0.16 (codegen, not re-checked on 0.17) lowers `var x: ?T = null` for a large `T`, and any `.{}` whose
 field defaults include an `undefined` or a zero array, to a `memset` of the
 whole value -- checked in the generated code; an explicit
 `.{ .field = undefined }` is not cleared. `Compressor.compress` cleared its
@@ -3574,7 +3574,7 @@ From the port-vs-libzstd comparison (2026-09-26; a 20 MB tar of Zig's
   port gets them only from the build's target. Built for baseline x86-64,
   compression takes 1.15–1.25× libzstd's cycles (1.05–1.09× with
   `-mcpu=native`) and decoding 893 vs 1043 MB/s. Zig 0.16 has no
-  per-function target features, so ~~say so in the README~~ (done
+  per-function target features (measured on 0.16, not re-checked on 0.17), so ~~say so in the README~~ (done
   2026-09-27: *Speed* bullet, build with `-Dcpu=x86_64_v3` or `native`);
   still open: revisit run-time dispatch when Zig can.
 - ~~**Z33 — Decoder: the sequence loop keeps its cursors in locals.**~~

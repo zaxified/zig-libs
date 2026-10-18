@@ -353,6 +353,14 @@ review, as §2.1 says they must be.
 Measured 2026-10-10 against OpenSSL 3.5.5 (system `libcrypto.so.3`, EVP AES-GCM: the
 AES-NI/PCLMULQDQ stitched `aesni_gcm` assembly). Host: Intel Core i7-7920HQ (Kaby Lake, 4 cores / 8 threads; AVX2, AES-NI, PCLMULQDQ, ADX/BMI2; no SHA-NI, VAES or AVX-512), Linux 7.0, Zig 0.16.0 (ReleaseFast) against `zig cc -O3 -march=native`. The machine was shared with concurrent fuzz jobs (hyper-thread siblings busy), which is what the spread columns show; each side's best round is the figure, so a spread inflates the worst round, not the ratio.
 
+**On Zig 0.17.0 (2026-10-18, migration check; the figures here are the 0.16.0 measurement).**
+0.17 lowered the `[16]u8` <-> `@Vector(2, u64)` `@bitCast` in `load`/`store` byte by byte
+(probe: 6 -> 51 / 7 -> 63 instructions per block; `bench-aesgcm` ref 0.29–2.03× OpenSSL
+against the card's 0.23–1.00×). Both now go through `@Vector(16, u8)` and a vector-to-vector
+`@bitCast`: `load` 52 -> 6 instructions, and `bench-aesgcm` on 0.17 reads ref 0.25–1.04×
+OpenSSL (loaded machine, spread up to 108 %). A loaded-machine check, not a re-measurement
+of the card.
+
 Method: `zig build bench-aesgcm` (`tools/bench.zig` driving `tools/c_bench/foreign_bench.c`): each side doubles its batch until it takes over 100 ms and keeps the best of five; per workload the sides alternate for `BENCH_ROUNDS` rounds and each keeps its best; ratio = ours/theirs by user-mode cycles; spread = (worst round − best round) / best round per side. Before timing, an interop check (OpenSSL's AES-256-GCM ciphertext and tag of the 16 KiB message must equal ours byte for byte).
 
 Workloads: AES-128/256-GCM encrypt and decrypt of 64 B, 1420 B and 16 KiB with 13 bytes of

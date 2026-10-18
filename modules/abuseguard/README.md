@@ -12,8 +12,8 @@ nothing (the server's documented `on_connect` posture; no polite 503).
   escalation) + Cloudflare-style IP reputation (ban/greylist lists).
 - **Platform:** posix (the default clock uses the posix `clock_gettime`
   form). **Role:** server. **Concurrency:** threadsafe — internally
-  synchronized (a spinlock around a hash lookup + O(1) LRU relink; Zig 0.16
-  std has no io-less blocking mutex — this is the std `SmpAllocator`
+  synchronized (a spinlock around a hash lookup + O(1) LRU relink; Zig 0.17
+  std has no io-less blocking mutex (`std.atomic.Mutex` is try-lock only) — this is the std `SmpAllocator`
   pattern, same as `ratelimit`).
 - **Deps:** `http` (the Phase-2.1 server hooks), `netaddr` (IP keying),
   `router` (the optional auto-strike middleware).

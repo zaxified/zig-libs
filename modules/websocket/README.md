@@ -86,8 +86,8 @@ const result = try websocket.handshake.verifyResponse(response_head, &key, &.{})
   `ServerAccept.deflate` / `ClientVerifyResult.deflate` say whether it was agreed, and
   `writeResponse`/`respond` then answer with the extension.
   ⚠ A libc-free executable that sends compressed messages should install `fastmem`
-  (`fastmem.exportSymbols()` in its root): std 0.16's compressor memsets 96 KiB per message,
-  which Zig 0.16's own memset does a byte at a time (~30 µs per message).
+  (`fastmem.exportSymbols()` in its root): std's compressor resets a 96 KiB token list per message (unchanged in 0.17.0, `flate/Compress.zig:60-66`),
+  which Zig 0.16's own memset does a byte at a time (~30 µs per message, measured on 0.16; 0.17.0's compiler_rt memset is vectorised, not re-measured here).
 - **`conn`** — optional read/write loop over a `std.Io.Reader` + `std.Io.Writer`:
   `Conn.init(role, reader, writer, message_buf, .{ .mask_random, .deflate })`,
   `readMessage()` (answers pings, answers the peer's close and returns `error.Closed`, answers a

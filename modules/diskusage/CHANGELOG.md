@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC brought up to Zig 0.17.0 (version statements, snippets, measurement labels).
+
 - **2026-10-18** — Ported to Zig 0.17.0. `fstatat` raw syscall uses `.newfstatat` where the 0.17 syscall table has it (same number), else `.fstatat64`; `dupeSentinel` for `dupeZ`; `@typeInfo` field names.
 - **2026-10-10** — tests: deterministic fuzz driver `DISKUSAGE_FUZZ` over the existing harnesses (lstatPath on corpus-damaged path bytes: embedded NUL refused, never truncated); reach labels count real outcomes. No code or API change.
 - **2026-09-30** — **Added: parallel traversal (`Options.threads`) and a

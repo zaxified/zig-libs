@@ -30,7 +30,7 @@ cd example-apps/ssh-demo
 ./zig-out/bin/ssh-demo client --port 2222  # another
 ```
 
-`init.sh` needs Zig 0.16.0 on `PATH` and installs nothing for you.
+`init.sh` needs Zig 0.17.0 on `PATH` and installs nothing for you.
 
 ## What is worth reading it for
 

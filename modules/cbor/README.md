@@ -44,7 +44,8 @@ code needs no attribution; the RFC example vectors embedded in `src/` are covere
    caller buffer via `std.Io.Writer.fixed`, a file, a socket.
 7. **Typed mapping** (`cbor.typed`): `typed.decode(T, gpa, bytes, .{})` → `Parsed(T)` and
    `typed.encode(gpa, x, .{})` for bools, integers, floats, strings, byte arrays, slices, arrays,
-   tuples, structs (keys by field name or `pub const cbor_options = .{ .keys = .{ .alg = 3 } }`,
+   tuples, structs (keys by field name or `pub const cbor_options = .{ .keys = .{ .alg = 3 } }` — it must be `pub`, 0.17's
+   `@hasDecl` ignores private decls —,
    integer keys negative too), optionals, enums, tagged unions, pointers, and raw `Value`s.
    Missing / duplicate / unknown fields, range, length and type mismatches are typed errors; what
    the mapping allocates is capped (`max_alloc_bytes`, default 64 MiB).

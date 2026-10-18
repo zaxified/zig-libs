@@ -163,8 +163,9 @@ zig fmt --check modules/timelock_envelope/
 
 Run `scripts/modtest timelock_envelope` for the module's tests. (The fuzz test's
 body runs deterministically in normal test mode; interactive `--fuzz`
-mode is currently blocked by an unrelated Zig 0.16 `test_runner` bug,
-repo-wide.)
+mode was blocked by an unrelated Zig 0.16 `test_runner` bug (a `StackTrace` type
+mismatch under `-ffuzz`, repo-wide; 0.17.0's `test_runner.zig` no longer mentions
+`StackTrace`, but `--fuzz` was not re-run on 0.17).)
 
 Provenance: this module is a clean-room composition; the drand quicknet
 KAT vector it reuses for its timelock round-trip is `tlock`'s, whose

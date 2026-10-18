@@ -127,7 +127,7 @@ var sigma: [tlock.block_bytes]u8 = undefined;
 tlock.ciphersuite.randomSigma(&sigma, io);
 
 // A fixed value (KAT reproducibility / deterministic ciphertext pinning):
-const sigma = [_]u8{0x11} ** tlock.block_bytes;
+const sigma: [tlock.block_bytes]u8 = @splat(0x11);
 ```
 
 ## Import graph

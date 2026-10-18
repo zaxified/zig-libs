@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC brought up to Zig 0.17.0 (version statements, snippets, measurement labels).
+
 - **2026-10-18** — Example only (big-endian): the peer address in `example/main.zig` was `@bitCast(in.addr)` to `[4]u8`, little-endian-logical in Zig 0.17 and so octet-reversed on big-endian; now `std.mem.toBytes` (memory = network order).
 - **2026-10-18** — Ported to Zig 0.17.0. Test-only `ReadCueIo` now hooks `Io.VTable.operate` and counts `Operation.net_read` (`netRead` left the vtable).
 - **2026-10-10** — tests: deterministic fuzz driver `MODBUS_FUZZ` over the existing harnesses (now generic over their choice source; the driver draws a corpus entry with 0-3 octets damaged, maybe truncated) with an in-suite reach test per harness. Harnesses: `decodeAdu`, `server`. Verdict: 200,000 runs each, ReleaseSafe, clean.

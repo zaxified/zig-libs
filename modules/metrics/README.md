@@ -27,7 +27,7 @@ exempt per root `NOTICE` §0; no Prometheus source or test corpus is reproduced.
   atomics (`.monotonic`); registration lookups (an O(1) name→family index,
   not a linear scan) and `Histogram.observe` take a documented spinlock
   (`std.atomic.Mutex` + `spinLoopHint`, the std SmpAllocator pattern — Zig
-  0.16 std has no io-less blocking mutex) with string-compare-sized critical
+  0.17 std has no io-less blocking mutex) with string-compare-sized critical
   sections. `writeText` holds the registry lock only long enough to
   snapshot the family/children pointers (O(number of families)), then
   formats from that snapshot with the lock released, so a large registry's

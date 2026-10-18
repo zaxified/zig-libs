@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC: 0.17.0's compiler_rt `memset` is vectorised; the gap and speed table are labelled as 0.16 measurements; the delete-the-module trigger is recorded as fired.
 - **2026-10-10** — `set` stores the middle of a clear of 192 KiB or more with
   `rep stosq` on x86-64 (head and tail vectors unchanged): 1 MiB went from
   1.23–1.32× musl's and glibc's `memset` to 0.90–1.02×; shorter lengths run the

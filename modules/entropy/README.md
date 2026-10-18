@@ -7,7 +7,7 @@ without libc under std's own `Threaded` Io, out of the kernel's vDSO
 `getrandom` (the same CRNG, run in user space from a kernel-keyed state; see
 `src/vgetrandom.zig`).
 
-- **Why:** std 0.16's `std.Io.random` is a CSPRNG with a documented
+- **Why:** std's `std.Io.random` (0.16 and 0.17.0, `Io.zig:2656-2668`) is a CSPRNG with a documented
   silent-degrade clause ("seeded by `randomSecure`, or a less secure mechanism
   upon failure"), and `std.Io.Threaded` honours it literally — on
   `error.EntropyUnavailable` it seeds from a zeroed buffer plus an ASLR

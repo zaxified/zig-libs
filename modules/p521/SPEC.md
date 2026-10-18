@@ -42,7 +42,7 @@ consumers, as Go keeps them in `crypto/x509`.
 ## What this module is, and what it is not
 
 NIST P-521 (secp521r1): the base field, the scalar field, the group, ECDH and
-ECDSA-P521 with RFC 6979 nonces. Zig 0.16's std ships P-256 and P-384 only, so
+ECDSA-P521 with RFC 6979 nonces. Zig's std (checked on 0.17.0) ships P-256 and P-384 only, so
 every P-521 feature in this collection — ssh `ecdh-sha2-nistp521` and
 `ecdsa-sha2-nistp521`, jwt `ES512`, x509 P-521 certificates, hpke
 DHKEM(P-521, HKDF-SHA512), acme — was refused for lack of a curve. This module

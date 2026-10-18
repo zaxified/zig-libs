@@ -44,7 +44,7 @@ member count; anything you type after that is an encrypted application message
 to the group. `/who` lists the leaves, `/remove <name>` commits a Remove,
 `/leave` proposes your own, and `/quit` merely disconnects.
 
-`init.sh` needs Zig 0.16.0 on `PATH` and installs nothing for you.
+`init.sh` needs Zig 0.17.0 on `PATH` and installs nothing for you.
 
 ## What is worth reading it for
 

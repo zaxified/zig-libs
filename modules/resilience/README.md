@@ -120,7 +120,7 @@ the point; call `run` again later to probe after the cooldown.
   best contention spread per the AWS analysis) and the *default*; `equal`
   (`[d/2, d]`), `proportional` (`d × (1 ± jitter_factor)`, cenkalti/failsafe-go
   style) and `none` are also available. A jittered flavor only takes
-  effect once you also pass a seeded `std.Random` — Zig 0.16 std has no
+  effect once you also pass a seeded `std.Random` — Zig 0.17 std has no
   ambient entropy and this module has no hidden globals, so with no rng
   supplied, delays deterministically fall back to the un-jittered schedule
   regardless of `jitter`'s value (safe default even before you wire up
@@ -139,7 +139,9 @@ the point; call `run` again later to probe after the cooldown.
   successful-but-unwanted result (a 503 in an Ok response); `retryAfterMs(self)
   ?u64` replaces the computed delay with the server's (clamped to
   `max_delay_ms`). `Retry.max_elapsed_ms` bounds attempts plus waits;
-  `Policy.on_retry` is told before each wait.
+  `Policy.on_retry` is told before each wait. Hook declarations (and `call`,
+  `setDeadline`) must be `pub`: on Zig 0.17 `@hasDecl` sees only `pub` decls,
+  so a private hook is silently ignored.
 - **Retried attempts may repeat side effects** — only wrap idempotent work
   (the standard retry caveat).
 - **Bulkhead** (resilience4j's semaphore bulkhead, behavior only): at most

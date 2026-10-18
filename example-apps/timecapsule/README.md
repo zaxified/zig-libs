@@ -64,7 +64,7 @@ reaches it, the plaintext is written to `<out>.partial` and renamed to
 no output file, and an existing one untouched. Capsules sealed by earlier
 releases (the version-1 one-shot wire, up to 16 MiB) still open.
 
-`init.sh` needs Zig 0.16.0 on `PATH` and installs nothing for you.
+`init.sh` needs Zig 0.17.0 on `PATH` and installs nothing for you.
 
 ## Where the "nobody can open it early" comes from
 

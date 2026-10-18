@@ -35,7 +35,7 @@ bytes — bring your own CSPRNG.
 
 - **Model after:** FIPS 205 (August 2024), clean-room from the standard;
   NIST ACVP `SLH-DSA-{keyGen,sigGen}-FIPS205` JSON vectors as the KAT
-  oracle. Fills a real std gap: Zig 0.16 `std.crypto` ships ML-DSA and
+  oracle. Fills a real std gap: Zig 0.17 `std.crypto` ships ML-DSA and
   ML-KEM but no SLH-DSA.
 - **Deps:** none (std only — `std.crypto.hash.sha2.{Sha256,Sha512}`,
   `std.crypto.auth.hmac.sha2.{HmacSha256,HmacSha512}`,

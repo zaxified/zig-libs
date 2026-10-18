@@ -46,8 +46,8 @@ RFC 3394 AES Key Wrap. Usage: see ./README.md.
   §4.1's alternative IV + padding scheme on top of this module's block-recurrence core) and
   would not change this module's existing `wrap`/`unwrap` signatures or KATs.
 - **KEK width: AES-128 (16-byte), AES-192 (24-byte) and AES-256 (32-byte).** Anything else
-  returns `error.UnsupportedKeyLength`. Zig 0.16's `std.crypto.core.aes` ships only
-  `Aes128`/`Aes256`; the 24-byte arm of `encBlock`/`decBlock` runs on the sibling `aes192`
+  returns `error.UnsupportedKeyLength`. Zig 0.17's `std.crypto.core.aes` ships only
+  `Aes128`/`Aes256` (`aes.zig:27-28`); the 24-byte arm of `encBlock`/`decBlock` runs on the sibling `aes192`
   module (own FIPS-197 key expansion over std's round primitive, same constant-time posture),
   added 2026-10-10. Before that a 24-byte KEK was refused.
 

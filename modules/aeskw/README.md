@@ -55,7 +55,7 @@ writes `ciphertext.len - 8` bytes to `out` and returns that slice, or fails with
 failed unwrap never leaks partially-recovered, KEK-derived plaintext. The KEK width (16, 24 or
 32 bytes) is read from `kek.len` at each call — there's no separate AES-128/192/256 selection
 argument or comptime variant; any other width returns `error.UnsupportedKeyLength`. AES-192
-runs on the `aes192` module, since std 0.16 has no AES-192 (see `SPEC.md`).
+runs on the `aes192` module, since std 0.17 has no AES-192 (see `SPEC.md`).
 
 ## Tests
 

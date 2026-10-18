@@ -113,7 +113,7 @@ OAEPparams (the OAEP label `L`) is honored when present, empty otherwise.
   input, invalid pad) collapses to this module's generic `DecryptionError`.
 
 **AES-192 (`aes192-cbc`/`aes192-gcm`, and `kw-aes192`) since 2026-10-10:**
-std 0.16 ships only `Aes128`/`Aes256`, so CBC runs `aescbc` over the `aes192`
+std 0.17 ships only `Aes128`/`Aes256`, so CBC runs `aescbc` over the `aes192`
 module's `Aes192` and GCM is `aesgcm.Aes192Gcm`; the key wrap is `aeskw`'s
 24-byte KEK arm. Before that date all three were `UnsupportedAlgorithm`. The
 CEK length must match the content algorithm's key size, else

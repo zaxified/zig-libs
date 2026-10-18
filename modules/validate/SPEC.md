@@ -55,7 +55,7 @@ allocation, never panic on any byte sequence. Clean-room; design references pyda
 go-playground/validator (struct-tag ergonomics) — behavior/format only, no source copied — see NOTICE.
 
 **Typed query** (`parseQueryLeaky`, 2026-09-28, qap M11.7): a query string decoded into struct `T`
-under `rulesFor(T)` + `T.validate_rules`, with `validateQuery`'s decoding and coercion (lenient
+under `rulesFor(T)` + `T.validate_rules` (a `pub` decl: Zig 0.17 `@hasDecl` ignores private ones), with `validateQuery`'s decoding and coercion (lenient
 percent-decoding, first duplicate wins, unknown keys ignored). Fields are what one query value can
 spell (bool, ints, floats, enums, `[]const u8`, `[N]u8`, `?U` of those; else a compile error); a
 field is optional when it has a default. One walk over the query, keys compared as they decode

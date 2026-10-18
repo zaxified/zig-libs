@@ -111,7 +111,7 @@ USM is the security-sensitive part.
     caller asserting that `v` came from a cryptographically secure source, `.fixed_for_test = v`
     names the reproducible-vector path, and `null` (the default) means "this client never sends
     authPriv" — the first encrypted message it attempts is refused with `error.SaltSeedRequired`.
-    This module owns no RNG (std 0.16 removed `std.crypto.random`) and no clock, so it has nothing
+    This module owns no RNG (std removed `std.crypto.random` in 0.16; still absent in 0.17) and no clock, so it has nothing
     unpredictable of its own to fall back on, and every value it *could* pick is public.
     ⚠ **Superseded design, recorded because it was wrong in an instructive way:** the counter used
     to be seeded from the engine's discovered `engineBoots‖engineTime`. Those are clock/boot

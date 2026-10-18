@@ -1,6 +1,6 @@
 # aes192
 
-**The AES-192 block cipher that Zig 0.16's std does not ship.** `std.crypto.core.aes` has
+**The AES-192 block cipher that Zig 0.17's std does not ship.** `std.crypto.core.aes` has
 `Aes128` and `Aes256` only, so every AES mode in this collection (CBC, key wrap, GCM, JWE,
 XML-Enc, SSH `aes192-ctr`) refused 192-bit keys. This module adds the third member of that
 family with the same declarations — `key_bits`, `rounds`, `block`, `initEnc`, `initDec`, and

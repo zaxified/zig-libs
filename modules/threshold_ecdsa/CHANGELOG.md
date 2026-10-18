@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC brought up to Zig 0.17.0 (version statements, snippets, measurement labels).
+
 - **2026-10-10** — **NO CONSUMER-VISIBLE CHANGE:** the presign deviation and §4.3-opening tests and the
   aux_info end-to-end test are split into tests of at most ~45 s ReleaseSafe (aux_info over a shared
   announcement fixture); together they exceeded CI's 3-minute `--test-timeout` under a full crypto lane.

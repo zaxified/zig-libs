@@ -41,7 +41,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 
 - **Reap-race-tolerant wait is the hard core.** In a host process where a sibling thread calls
   `wait4(-1)` (reaps *any* child — a language VM's exit handler, or a shell that left `SIGCHLD` as
-  `SIG_IGN` so the kernel auto-reaps), a child can be reaped out from under a runner. Zig 0.16's
+  `SIG_IGN` so the kernel auto-reaps), a child can be reaped out from under a runner. Zig 0.16's (and 0.17.0's, `Io/Threaded.zig:15686`)
   `std.process.Child.wait` treats the resulting `ECHILD` as an `errnoBug` and panics (a racy
   `SIGABRT`); `procrun.waitTolerant` maps `ECHILD` to `Term.unknown` and closes the child's stdio
   handles itself instead. Original work of the zig-libs authors (MIT) —

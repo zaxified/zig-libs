@@ -67,8 +67,8 @@ The slave side is a pure function from one frame to one frame — no threads, no
 timers, no allocation, and the transport is left as a seam:
 
 ```zig
-var coils = [_]bool{false} ** 16;
-var holding = [_]u16{0} ** 32;
+var coils: [16]bool = @splat(false);
+var holding: [32]u16 = @splat(0);
 
 var server = modbus.server.Server.init(.{
     .unit_id = 7,

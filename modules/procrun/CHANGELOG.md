@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README note on `Child.wait` and `ECHILD` re-checked against the 0.17.0 std (still a `errnoBug`).
+
 - **2026-10-18** — Ported to Zig 0.17.0. `bufPrintSentinel` for `bufPrintZ`; `wait4` status is `i32`.
 - **2026-09-30** — **Stdio redirection.** `StdioMode` is now a tagged union with `.ignore`
   (`/dev/null`; stdin reads EOF at once), `.file: std.Io.File` (caller-owned, never closed by

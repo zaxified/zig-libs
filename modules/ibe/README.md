@@ -96,7 +96,7 @@ var sigma: [ibe.block_bytes]u8 = undefined;
 ibe.ciphersuite.randomSigma(&sigma, io);
 
 // A fixed value (KAT reproducibility / deterministic ciphertext pinning):
-const sigma = [_]u8{0x11} ** ibe.block_bytes;
+const sigma: [ibe.block_bytes]u8 = @splat(0x11);
 ```
 
 ## Import graph

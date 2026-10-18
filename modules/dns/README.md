@@ -109,7 +109,7 @@ if (rcode != .no_error) return error.UpdateRefused;
   the six live captures and hammers this.
 - `timeout_ms` bounds each UDP attempt and each TCP attempt end to end
   (connect + write + reads, via a canceled task — std 0.16.0 has no stream
-  read deadline). It is per attempt per server: a `query` may take
+  read deadline; not re-checked on 0.17). It is per attempt per server: a `query` may take
   `timeout_ms × attempts × servers`, and `lookupIp` runs one per search
   candidate and address family on top. Set it small, shorten `servers`, or
   pass a rooted name (trailing dot) when a call must be bounded.
