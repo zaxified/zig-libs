@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — ctgrind target `wif` (new `src/ctgrind_harness.zig`): private key through `wifEncode` → `wifDecode`, 0 in-file contexts; the pre-2026-10-18 early-exit range check gives 6 (negative control). Pinned in `scripts/checks/ctgrind-expected.tsv`. Tool only, no API change.
 - **2026-10-18** — constant time on the WIF paths: `wifEncode`/`wifDecode` use `bech32.base58.checkEncodeSecret`/`checkDecodeSecret`, the version byte and compression flag are declassified as public metadata, and `keyInRange` is a borrow-and-mask comparison (was `std.mem.eql` + `std.mem.order`, early exit on the key). Same results and errors; `wifEncode`'s `out` must now hold 51 (uncompressed) / 52 (compressed) bytes, which every WIF needs anyway.
 - **2026-10-10** — tests: deterministic fuzz driver `BTCADDR_FUZZ` over the address/WIF decode harness (generic over its choice source) plus a roundtrip oracle (an address issued for a random script decodes to it, a substituted character is refused, a WIF roundtrips). No code change.
 - **2026-10-09** — **BREAKING:** `wifDecode(s)` returning `Wif` by value is now `wifDecode(out: *Wif, s) WifDecodeError!void`: the private key is written only into the caller's slot (`out.key` zeroed on error), never returned, and the body runs under an 8 KiB `burn.run`. Migrate `var w = try wifDecode(s)` to `var w: Wif = undefined; try wifDecode(&w, s)`. No caller outside this module's tests and `example/main.zig`. Probed in `stackprobe_test.zig`.

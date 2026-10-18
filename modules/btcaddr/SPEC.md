@@ -129,8 +129,10 @@ check compares against a public constant, but a caller who needs it must not rel
 **Update 2026-10-18:** (1) is fixed — `keyInRange` is now a constant-time borrow-and-mask
 comparison with one declassified verdict — and the WIF paths use `bech32`'s constant-time
 `checkEncodeSecret`/`checkDecodeSecret`; (2) still holds (51 / 52 bytes, the CT encoder's
-`maxEncodedLenFor` bound, which is every WIF's actual length). No ctgrind target in this module
-yet; the same base58 code is measured by `bip32`'s `xprv` row.
+`maxEncodedLenFor` bound, which is every WIF's actual length). ctgrind target `wif`
+(`src/ctgrind_harness.zig`, 2026-10-18): the key through `wifEncode` and back through `wifDecode`,
+0 in-file contexts, witness 2; the old early-exit range check measured 6 in-file (negative
+control), so the row guards `keyInRange` as well as the base58 path `bip32`'s `xprv` row covers.
 (3) `Decoded.script_buf` / `Address.buf` bytes past `len` are undefined; use `script()` / `slice()`.
 
 Mutation run (schemata, ReleaseSafe, one binary, 53 mutants on the template bytes, version-opcode

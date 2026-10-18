@@ -1118,6 +1118,14 @@ bip32	ReleaseFast	mnemonic	1	3	a5dbfbf5eee08b66	d42db8cf9cdc2200
 # (base58.zig lives in modules/bech32): re-run `--check bip32` after a
 # bech32 edit.
 bip32	ReleaseFast	xprv	1	0	59f2a617bb825f45	446d9a369af15cee
+# btcaddr wif, new 2026-10-18: the private key tainted through wifEncode and
+# back through wifDecode (PATTERN base58.zig|root.zig). 0 in-file, witness 2.
+# Negative control the same day: btcaddr's old early-exit range check
+# (`mem.allEqual` + `mem.order` instead of the borrow-and-mask keyInRange)
+# gave 6 in-file — the row sees a regression of the check base58 does not
+# cover. Source digest covers btcaddr/src only: re-run `--check btcaddr`
+# after a bech32 edit (as for bip32/xprv).
+btcaddr	ReleaseFast	wif	1	0	bf842f71d5a56931	3724f47a31d201ab
 # aesgcm — added 2026-09-28. Key AND plaintext tainted (so round keys, H
 # powers, keystream, ciphertext and tag are all secret-derived to memcheck).
 # The 4 in-file contexts per row are ONE line, the tag-check branch
