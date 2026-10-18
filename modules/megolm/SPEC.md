@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-08-06 · mutation 2026-08-13 · src ?
 
-**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, MEGOLM_FUZZ) · ct 2026-10-17 (ctgrind: ratchet + signing key through encrypt/decrypt, session-key base64, sealed pickles; `msg` 16 / `skey` 23 / `pickle` 26 in-file, none a megolm branch on a key; `skey` was 40 before the private b64ct copy (2026-10-10), 26 with it, 23 with the `b64ct` module)
+**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, MEGOLM_FUZZ) · ct 2026-10-17 (ctgrind: ratchet + signing key through encrypt/decrypt, session-key base64, sealed pickles; `msg` 16 / `skey` 23 / `pickle` 26 in-file, none a megolm branch on a key; `skey` was 40 before the private b64ct copy (2026-10-10), 26 with it, 23 with the `b64ct` module; 25 on Zig 0.17.0 (2026-10-18): std `Edwards25519.fromBytes` added RFC 8032 §5.1.3's `x = 0` + sign-bit refusal, 2 contexts over the session key's Ed25519 public key inside signature verification, public input)
 **Performance:** not measured
 
 **Known defects:** none recorded

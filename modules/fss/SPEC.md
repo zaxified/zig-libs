@@ -535,6 +535,16 @@ an empty inline-asm (the montint `b199192` idiom, as in `p256`, `k256` and
 directly: `fss/eval` reports 0 in-file contexts, and did report one before the
 barrier was added.
 
+⛔ **The leaf's `cw_final` mask needs the same barrier (Zig 0.17.0, 2026-10-18).**
+`key.cw_final & (0 -% @as(Elem, t))` is the select LLVM recognises as
+`t ? cw_final : 0`; under Zig 0.17.0 (LLVM 22) `eval`'s leaf compiled it to
+`test $0x1,%r13b` / `je` over the load of `cw_final` -- a jump on the secret
+final control bit, `fss/eval` 0 -> 1 (the 0.16 build was branch-free). Every mask
+built from a secret bit over an `Elem` -- `eval`'s and `evalFull`'s leaf, Gen's
+`cw_final` negation, `Mpf`'s leaf and seed-CW masks -- now goes through
+`secretMask` (`dpf.zig`): the mask is made in one opaque machine word behind the
+empty-asm barrier and replicated across the `Elem` width.
+
 What remains, and it is in the PRG rather than the tree: on a target where
 `std.crypto.core.aes.has_hardware_support` is false, std falls back to a T-table
 AES whose table indices depend on the data. std applies cache-line-granular

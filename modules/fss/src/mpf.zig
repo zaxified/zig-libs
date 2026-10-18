@@ -369,7 +369,7 @@ pub fn MpfWith(comptime P: type, comptime n_bits: usize, comptime out_bytes: usi
                 var v: [k]Elem = undefined;
                 for (0..k) |j| {
                     const leaf: Elem = p.convert(out_bytes, s[j]);
-                    const e0 = G.add(leaf, key.keys[j].cw_final & (0 -% @as(Elem, t[j])));
+                    const e0 = G.add(leaf, key.keys[j].cw_final & dpf_mod.secretMask(Elem, t[j]));
                     const b_mask: Elem = 0 -% @as(Elem, b);
                     v[j] = (G.neg(e0) & b_mask) | (e0 & ~b_mask);
                 }
@@ -392,7 +392,7 @@ pub fn MpfWith(comptime P: type, comptime n_bits: usize, comptime out_bytes: usi
                 // instance — applied after both children's bits are derived
                 // from that same parent bit. Masked, not branched: `t` is key
                 // material (see dpf.zig §"Constant time").
-                const m: u8 = 0 -% @as(u8, t[j]);
+                const m: u8 = dpf_mod.secretMask(u8, t[j]);
                 for (&s_l[j], c.s_cw) |*d, q| d.* ^= q & m;
                 for (&s_r[j], c.s_cw) |*d, q| d.* ^= q & m;
             }

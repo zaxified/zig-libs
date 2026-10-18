@@ -224,7 +224,7 @@ pub fn parse(allocator: Allocator, bytes: []const u8) Error!ZKey {
             const m = try c.int(u32);
             if (m > 1) return error.BadIndex;
             co.* = .{
-                .matrix = @enumFromInt(m),
+                .matrix = @fromBackingInt(@intCast(m)),
                 .constraint = try c.int(u32),
                 .signal = try c.int(u32),
                 .value = try bin.frFromMont2Le((try c.take(32))[0..32], r2_inv),
@@ -322,7 +322,7 @@ pub fn write(z: ZKey, w: *std.Io.Writer) std.Io.Writer.Error!void {
                 try w.writeInt(u32, @intCast(z.coefs.len), .little);
                 const r2 = bin.r2();
                 for (z.coefs) |co| {
-                    try w.writeInt(u32, @intFromEnum(co.matrix), .little);
+                    try w.writeInt(u32, @backingInt(co.matrix), .little);
                     try w.writeInt(u32, co.constraint, .little);
                     try w.writeInt(u32, co.signal, .little);
                     try w.writeAll(&bin.frToMont2Le(co.value, r2));

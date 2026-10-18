@@ -107,6 +107,29 @@ inline fn xorMasked(dst: *Seed, src: Seed, cond: u1) void {
     for (dst, src) |*d, q| d.* ^= q & m;
 }
 
+/// All-ones `T` when `bit` is 1, zero when it is 0, through the same barrier
+/// as `xorMasked`: the mask is made in one opaque machine word and replicated
+/// across `T`'s width, so LLVM cannot tell that it is 0 or ~0.
+///
+/// ⛔ Load-bearing, measured. `x & (0 -% @as(T, t))` with a `u1` `t` is the
+/// pattern LLVM rewrites to `t ? x : 0`, and Zig 0.17.0 (LLVM 22) then lowered
+/// that select in `eval`'s leaf, `key.cw_final & (0 -% t)`, to
+/// `test $0x1,%r13b` / `je` skipping the load of `cw_final` -- a jump on the
+/// secret final control bit (ctgrind `fss/eval` 0 -> 1, 2026-10-18; the 0.16
+/// build was branch-free). Every secret-bit mask over an `Elem` uses this.
+pub inline fn secretMask(comptime T: type, bit: u1) T {
+    const word_bits = @bitSizeOf(usize);
+    const raw: usize = 0 -% @as(usize, bit);
+    const w: usize = if (@inComptime()) raw else asm volatile (""
+        : [ret] "=r" (-> usize),
+        : [x] "0" (raw),
+    );
+    if (@bitSizeOf(T) <= word_bits) return @truncate(w);
+    var m: T = 0;
+    inline for (0..(@bitSizeOf(T) + word_bits - 1) / word_bits) |k| m |= @as(T, w) << (k * word_bits);
+    return m;
+}
+
 /// A 2-party single-point DPF over domain `{0,1}^n_bits`, output group
 /// Z_{2^{8*out_bytes}}, using the DEFAULT PRG (`prg.default`, fixed-key AES).
 /// `n_bits ∈ 1..31`, `out_bytes ∈ 1..32`.
@@ -337,7 +360,7 @@ pub fn DpfWith(comptime P: type, comptime n_bits: usize, comptime out_bytes: usi
             const c1 = p.convert(out_bytes, cur1);
             const raw: Elem = G.add(G.sub(beta, c0), c1);
             // `t1` is key material; select the negation without branching.
-            const neg_mask: Elem = 0 -% @as(Elem, t1);
+            const neg_mask: Elem = secretMask(Elem, t1);
             const cw_final: Elem = (G.neg(raw) & neg_mask) | (raw & ~neg_mask);
 
             out[0] = .{ .seed = s0, .cw = cw, .cw_final = cw_final };
@@ -375,7 +398,7 @@ pub fn DpfWith(comptime P: type, comptime n_bits: usize, comptime out_bytes: usi
                 t = nt;
             }
             const leaf: Elem = p.convert(out_bytes, s);
-            const out = G.add(leaf, key.cw_final & (0 -% @as(Elem, t)));
+            const out = G.add(leaf, key.cw_final & secretMask(Elem, t));
             const b_mask: Elem = 0 -% @as(Elem, b);
             return (G.neg(out) & b_mask) | (out & ~b_mask);
         }
@@ -538,7 +561,7 @@ pub fn DpfWith(comptime P: type, comptime n_bits: usize, comptime out_bytes: usi
             if (base + size <= lo) return;
             if (level == n_bits) {
                 const leaf: Elem = p.convert(out_bytes, s);
-                const v0 = G.add(leaf, key.cw_final & (0 -% @as(Elem, t)));
+                const v0 = G.add(leaf, key.cw_final & secretMask(Elem, t));
                 const b_mask: Elem = 0 -% @as(Elem, b);
                 emit(context, base, (G.neg(v0) & b_mask) | (v0 & ~b_mask));
                 return;
@@ -703,4 +726,17 @@ test "firstMismatch: a correct sharing passes, a wrong one is caught (REAL, no c
     // Corrupt one point → must be caught.
     e1[2] = D.G.add(e1[2], 1);
     try std.testing.expectEqual(@as(?usize, 2), D.firstMismatch(&e0, &e1, alpha, beta));
+}
+
+test "secretMask is 0 or all-ones at every width, at runtime and at comptime" {
+    inline for (.{ u1, u8, u32, u64, u72, u128, u200, u256 }) |T| {
+        var bit: u1 = 0;
+        _ = &bit; // runtime value: the asm barrier path
+        try std.testing.expectEqual(@as(T, 0), secretMask(T, bit));
+        bit = 1;
+        try std.testing.expectEqual(~@as(T, 0), secretMask(T, bit));
+        // comptime evaluation bypasses the asm barrier
+        comptime std.debug.assert(secretMask(T, 0) == 0);
+        comptime std.debug.assert(secretMask(T, 1) == ~@as(T, 0));
+    }
 }

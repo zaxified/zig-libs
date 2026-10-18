@@ -90,7 +90,7 @@ pub const Ptau = struct {
     pub fn lagrangeBytes(self: Ptau, basis: Basis, level: u5) ParseError![]const u8 {
         const top: u5 = if (basis == .tau_g1 and self.power < 28) self.power + 1 else self.power;
         if (level > top) return error.BadIndex;
-        const s = try self.file.get(@intFromEnum(basis));
+        const s = try self.file.get(@backingInt(basis));
         const width: usize = if (basis == .tau_g2) bin.g2_bytes else bin.g1_bytes;
         const start = ((@as(usize, 1) << level) - 1) * width;
         return s[start..][0 .. (@as(usize, 1) << level) * width];

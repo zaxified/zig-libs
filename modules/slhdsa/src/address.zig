@@ -38,7 +38,7 @@ pub const Address = struct {
     /// setTypeAndClear (§4.2): set the type word AND zero the three
     /// type-specific words that follow it.
     pub fn setTypeAndClear(a: *Address, t: Type) void {
-        std.mem.writeInt(u32, a.bytes[16..20], @intFromEnum(t), .big);
+        std.mem.writeInt(u32, a.bytes[16..20], @backingInt(t), .big);
         @memset(a.bytes[20..32], 0);
     }
 

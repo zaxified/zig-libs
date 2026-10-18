@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE (constant-time fix):** under Zig 0.17.0 `eval`'s leaf compiled `key.cw_final & (0 -% t)` to a jump on the secret final control bit `t` (ctgrind `fss/eval` 0 -> 1). Every secret-bit mask over an `Elem` (eval/evalFull leaf, Gen's `cw_final` negation, `Mpf` leaf and seed-CW masks) now goes through `secretMask`, an asm-laundered word mask; `fss/eval` back to 0.
 - **2026-10-18** — Ported to Zig 0.17.0: `std.meta.Int` -> `@Int`; `Fn.params` -> `param_types` (test).
 - **2026-10-10** — **NO CONSUMER-VISIBLE CHANGE:** deterministic fuzz driver (`FSS_FUZZ`, `src/fuzz_test.zig`) over DPF and MPF keys: generated key pairs reconstruct the point function through the byte codec, a wrong format tag is refused, a repeated MPF seed is refused (`SeedReuse`), and on arbitrary or damaged key bytes the tree-reuse walk equals the per-point `eval`, `evalEach` sums to `eval`, and re-encoding reaches a fixed point. 200,000 runs per harness clean in ReleaseSafe.
 

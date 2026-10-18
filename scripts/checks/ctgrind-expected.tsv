@@ -137,18 +137,18 @@
 #
 # `act1` has no row on purpose: the initiator's Act One never touches the static
 # key, so its zero would say nothing about constant time. See the harness.
-bolt8	ReleaseFast	dh	1	1	bd35f976b480952b	0147038b2745ef44
-bolt8	ReleaseFast	keygen	1	3	bd35f976b480952b	d7a8d7540234ad3e
-bolt8	ReleaseFast	act3	1	6	b5e60b6126d5351f	f60e20889f25f0aa
-bolt8	ReleaseFast	transport	1	3	2aa7f2da3691694c	859416d386f56f8a
-bn254	ReleaseFast	field	1	1	27af92a0c130f0a6	831aa25b5c3d2f05
+bolt8	ReleaseFast	dh	1	1	3a5322cf2306f6db	0147038b2745ef44
+bolt8	ReleaseFast	keygen	1	3	3a5322cf2306f6db	d7a8d7540234ad3e
+bolt8	ReleaseFast	act3	1	6	942ed0411744f8f1	f60e20889f25f0aa
+bolt8	ReleaseFast	transport	1	3	93208fea6d4e37fc	859416d386f56f8a
+bn254	ReleaseFast	field	1	1	e6846e4ec6c4207e	831aa25b5c3d2f05
 # bn254 scalarmul 5 -> 2 (re-pin 2026-09-15): `3cda42bf`/`b80e3cce` made
 # `Fr.toBytes` reduce with bn254's own CIOS behind a `blackBox` barrier instead
 # of `std.crypto.ff`'s `fromMontgomery`; exactly the three contexts attributed
 # to std's ff went (9 -> 6 total), output byte-identical.
-bn254	ReleaseFast	scalarmul	1	2	2b67af362ef59b94	1bba83824af4d763
-chachapoly	ReleaseFast	poly1305	1	0	5bd0445bbfefe3cc	ff3ba8f00b851bdf
-chachapoly	ReleaseSafe	poly1305	1	>=1	5bd0445bbfefe3cc	ff3ba8f00b851bdf
+bn254	ReleaseFast	scalarmul	1	2	0e0d8a21c6f2f388	1bba83824af4d763
+chachapoly	ReleaseFast	poly1305	1	0	a26f90c435558fa3	ff3ba8f00b851bdf
+chachapoly	ReleaseSafe	poly1305	1	>=1	a26f90c435558fa3	ff3ba8f00b851bdf
 # The AEAD's own claim (added 2026-09-02). SPEC.md and root.zig state that the
 # tag is compared in constant time, and until this row existed the module was
 # measured with the `poly1305` target ALONE -- the harness never touched
@@ -191,10 +191,10 @@ chachapoly	ReleaseSafe	poly1305	1	>=1	5bd0445bbfefe3cc	ff3ba8f00b851bdf
 # is consumed in Debug, and CONVENTIONS §7.1 narrowed the Debug CI lane to
 # compile-only in 2026-08-15 on the same kind of measurement. See
 # `scripts/checks/ctgrind.sh` § MODES.
-chachapoly	ReleaseFast	aead	1	4	52794d136d2a5760	870a36cbebbc4588
-chachapoly	ReleaseFast	xaead	1	4	52794d136d2a5760	4caee5e0b86063e7
-chachapoly	ReleaseSafe	aead	1	>=1	52794d136d2a5760	870a36cbebbc4588
-chachapoly	ReleaseSafe	xaead	1	>=1	52794d136d2a5760	4caee5e0b86063e7
+chachapoly	ReleaseFast	aead	1	4	04e4fef7217ae846	870a36cbebbc4588
+chachapoly	ReleaseFast	xaead	1	4	04e4fef7217ae846	4caee5e0b86063e7
+chachapoly	ReleaseSafe	aead	1	>=1	04e4fef7217ae846	870a36cbebbc4588
+chachapoly	ReleaseSafe	xaead	1	>=1	04e4fef7217ae846	4caee5e0b86063e7
 # oscore — added 2026-09-08. SPEC.md § "Threat model / limits" claims the key
 # material is routed ONLY through std's constant-time HMAC/AES-CCM, with no
 # comparison or branch on key bytes in this module's own code; until today that
@@ -211,9 +211,9 @@ chachapoly	ReleaseSafe	xaead	1	>=1	52794d136d2a5760	4caee5e0b86063e7
 # `crypto.timing_safe.eql` two lines above it. Branching on the answer is the
 # API; the comparison that produced it is the constant-time one. It is here and
 # not in the other two because only `unprotect` verifies a tag.
-oscore	ReleaseFast	derive	1	0	27958d87aa1dac88	2f7c17dad79da56d
-oscore	ReleaseFast	protect	1	0	27958d87aa1dac88	6eac6a90e3479ab8
-oscore	ReleaseFast	unprotect	1	1	27958d87aa1dac88	ed85db89e3d7e9fd
+oscore	ReleaseFast	derive	1	0	23ccaa2a4630981c	2f7c17dad79da56d
+oscore	ReleaseFast	protect	1	0	23ccaa2a4630981c	6eac6a90e3479ab8
+oscore	ReleaseFast	unprotect	1	1	23ccaa2a4630981c	ed85db89e3d7e9fd
 # ssh dh / ffpow (2026-10-02). `dh`: the MODP DH secret x through
 # dhPowModPrime (montint powMont) in group14 and group16 — 0 contexts in
 # montint; the 4 in-file are stripLeadingZeros on e (public) and on K, twice:
@@ -221,7 +221,11 @@ oscore	ReleaseFast	unprotect	1	1	27958d87aa1dac88	ed85db89e3d7e9fd
 # reaches the exchange hash whatever the code does. `ffpow`: POSITIVE CONTROL,
 # the same K through the std.crypto.ff pow dhPowModPrime used until this date
 # — its window select compiles to a jump in ReleaseFast. It must stay >= 1.
-ssh	ReleaseFast	dh	1	4	8505f526740ccf3b	95639ff37028e502
+ssh	ReleaseFast	dh	1	4	ae961a238b7335b3	95639ff37028e502
+# Zig 0.17.0 (2026-10-18): ffpow 3 -> 17, still the positive control (>=1). 0.17 std ff pow's
+# table select is now `cmov(ct.eql(k, i+1))` (ff.zig:968/975 -> :359) and compiles to a jump per
+# table entry (16) instead of 2 `eql` jumps: std ff pow leaks the secret exponent's window values
+# more visibly on 0.17.0. ssh's `dh` path (montint powMont) does not use it: dh 4 SAME.
 ssh	ReleaseFast	ffpow	1	>=1	NO-OWN-SRC	95639ff37028e502
 # ssh ecdh (2026-10-10): ecdh-sha2-nistp256/384/521, the ephemeral scalar tainted
 # through fromScalar, ecdhNistShared and ecdhNistFinish, P-256, P-384, then P-521
@@ -238,8 +242,8 @@ ssh	ReleaseFast	ffpow	1	>=1	NO-OWN-SRC	95639ff37028e502
 # montint's DynModint (the server-chosen prime; group14 and group16 primes
 # here) — 0 contexts in dyn/montint/limbs; the 2 in-file are stripLeadingZeros
 # on e and K (RFC 4251 §5 mpint length, as `dh`).
-ssh	ReleaseFast	gex	1	2	8505f526740ccf3b	2d8d321e6c103efe
-ssh	ReleaseFast	ecdh	1	22	8505f526740ccf3b	8683e4aaf784b64c
+ssh	ReleaseFast	gex	1	2	ae961a238b7335b3	2d8d321e6c103efe
+ssh	ReleaseFast	ecdh	1	22	ae961a238b7335b3	8683e4aaf784b64c
 # ssh pem / pemstd (2026-10-18): HostKey.fromOpenSSH on the ed25519 fixture with the base64
 # characters carrying only seed bits tainted (44 - 2 edge characters; the edges share bits with
 # the private string's 0x40 length and the public-key copy, and tainting them made every later
@@ -256,7 +260,7 @@ ssh	ReleaseFast	ecdh	1	22	8505f526740ccf3b	8683e4aaf784b64c
 # replaced decoder (std.mem.indexOfPos = Boyer-Moore-Horspool + std.base64 table decode): 18 in
 # mem.zig/base64.zig on the first and second measurement. It must stay >= 1; no witness, since a
 # value loaded through a tainted table index reads as defined to memcheck.
-ssh	ReleaseFast	pem	1	3	9ed841b40dd79831	2ba7559fa99a2188
+ssh	ReleaseFast	pem	1	3	2618df2b5d08f7f0	2ba7559fa99a2188
 ssh	ReleaseFast	pemstd	1	>=1	NO-OWN-SRC	2ba7559fa99a2188
 # ct25519 — columns below are `total_min in_file`, NOT "in_file total_min".
 # Row 1's `1 0` is `total_min=1, in_file=0`: ct25519's OWN code has zero
@@ -269,7 +273,7 @@ ssh	ReleaseFast	pemstd	1	>=1	NO-OWN-SRC	2ba7559fa99a2188
 # "one witness context, zero in-file", never as "one expected context in
 # ct25519's own code" — that reading would describe the fragile
 # single-context pin this module deliberately does not have.
-ct25519	ReleaseFast	ct25519	1	0	ab8719fbfa0a4968	4e5e08fafcda58f8
+ct25519	ReleaseFast	ct25519	1	0	a4b50ee28d66371d	4e5e08fafcda58f8
 ct25519	ReleaseFast	std	1	>=1	NO-OWN-SRC	4e5e08fafcda58f8
 # ct25519 targets added 2026-09-16, first pinned 2026-09-15 (A1 ct25519 C3/C4,
 # bulletproofs B9). All four claim zero in-file contexts, 2 witness each
@@ -282,10 +286,10 @@ ct25519	ReleaseFast	std	1	>=1	NO-OWN-SRC	4e5e08fafcda58f8
 #               the same point as the `ct25519` row, so its output pin equals
 #               that row's.
 #   msm         `mulMultiRistretto` over 9 terms (B9).
-ct25519	ReleaseFast	comb	1	0	ab8719fbfa0a4968	60c9dcf57e8f3e1f
-ct25519	ReleaseFast	ladderbase	1	0	ab8719fbfa0a4968	60c9dcf57e8f3e1f
-ct25519	ReleaseFast	ladder	1	0	ab8719fbfa0a4968	4e5e08fafcda58f8
-ct25519	ReleaseFast	msm	1	0	ab8719fbfa0a4968	09aa32de83cec03a
+ct25519	ReleaseFast	comb	1	0	a4b50ee28d66371d	60c9dcf57e8f3e1f
+ct25519	ReleaseFast	ladderbase	1	0	a4b50ee28d66371d	60c9dcf57e8f3e1f
+ct25519	ReleaseFast	ladder	1	0	a4b50ee28d66371d	4e5e08fafcda58f8
+ct25519	ReleaseFast	msm	1	0	a4b50ee28d66371d	09aa32de83cec03a
 # x25519 (added 2026-09-28, pinned 2026-09-29 with P6): `X25519.recoverPublicKey`
 # (comb + Edwards->Montgomery map) and then `X25519.scalarmult` of the same
 # tainted key against RFC 7748 §6.1 Bob's public key -- the shared-secret
@@ -295,8 +299,8 @@ ct25519	ReleaseFast	msm	1	0	ab8719fbfa0a4968	09aa32de83cec03a
 # shape is declassified (a function of the public point only, SPEC.md § P6);
 # positive controls in SPEC.md § P6: without the declassify 1 in-file at that
 # line, a branching cswap 1 in-file at the swap (native and -mcpu=x86_64_v3).
-ct25519	ReleaseFast	x25519	1	0	ab8719fbfa0a4968	8af2fe8213b778aa
-decaf448	ReleaseFast	scalarmul	1	0	dd1af0024c4e1323	77a1bd1038ca1053
+ct25519	ReleaseFast	x25519	1	0	a4b50ee28d66371d	8af2fe8213b778aa
+decaf448	ReleaseFast	scalarmul	1	0	3f804876c85b9670	77a1bd1038ca1053
 # ecvrf prove 3 -> 0 (4db1e627): the three contexts were try-and-increment
 # branches on H, which is derived from the PUBLIC key. The harness now
 # declassifies Y, so what remains is a claim about the secret alone.
@@ -311,8 +315,8 @@ decaf448	ReleaseFast	scalarmul	1	0	dd1af0024c4e1323	77a1bd1038ca1053
 # stringToPoint already made itself at :368 (ecvrf SPEC.md, verify note).
 ecvrf	ReleaseFast	prove	1	0	6ecc5638f6f2ad27	f676793e0800a787
 ecvrf	ReleaseFast	verify	1	>=1	6ecc5638f6f2ad27	087c8ff4d336d9b1
-ed448	ReleaseFast	full	1	3	838a6c0b078b46f2	5853bb35135afb85
-ed448	ReleaseFast	ladder	1	0	a56ef8197ddaa7a3	43db8426e0d6c6e7
+ed448	ReleaseFast	full	1	3	4a443ccd656660fd	5853bb35135afb85
+ed448	ReleaseFast	ladder	1	0	129f9496bc7eba8f	43db8426e0d6c6e7
 # k256 — the field layer is clean; every group/sign/ecdsa context is a
 # `rejectIdentity`, an input/output validation, or (in `ecdsa` alone) the RFC
 # 6979 §3.2 nonce-retry rejection, itemised line by line in
@@ -400,11 +404,11 @@ ed448	ReleaseFast	ladder	1	0	a56ef8197ddaa7a3	43db8426e0d6c6e7
 # context would go and the timing signal would stay -- a prettier measurement of
 # the same defect. See SPEC.md.
 # ⭐ encaps' 0 means something only because the row carries an output pin.
-hqc	ReleaseFast	decaps	1	2	e7b0086877e71817	91caa495ae54247e
-hqc	ReleaseFast	keygen	1	4	e7b0086877e71817	a20c02ff5f2e81ee
-hqc	ReleaseFast	encaps	1	0	e7b0086877e71817	e91a390cf03fd6ad
-hqc	ReleaseFast	sampler	1	2	7e59fdc1fd8879ef	b93fa60c89578576
-k256	ReleaseFast	field	1	0	2dedcaab36aab2ff	4f13cccddea81376
+hqc	ReleaseFast	decaps	1	2	7408c99a0485df58	91caa495ae54247e
+hqc	ReleaseFast	keygen	1	4	7408c99a0485df58	a20c02ff5f2e81ee
+hqc	ReleaseFast	encaps	1	0	7408c99a0485df58	e91a390cf03fd6ad
+hqc	ReleaseFast	sampler	1	2	decb3883d68990da	b93fa60c89578576
+k256	ReleaseFast	field	1	0	b1745f6995d37402	4f13cccddea81376
 # k256, re-pin 2026-09-15, after F5 (1ce3087e: signed-window variable-base
 # mul) and the re-audit fixes in ff305abc.
 #   mul 2 -> 1   7/1/6/0. The one context is `rejectIdentity` at
@@ -415,10 +419,13 @@ k256	ReleaseFast	field	1	0	2dedcaab36aab2ff	4f13cccddea81376
 #                base point, which let LLVM fold `mul`'s per-call table (not
 #                the ECDH binary).
 #   ecdsa 10 -> 11   16/11/5/0 (G7 19a05328, `sign` handles R.x >= n).
-k256	ReleaseFast	mul	1	1	ceab4cb6d212db1a	2e85d4bddb851304
-k256	ReleaseFast	comb	1	1	ceab4cb6d212db1a	2ac21fe395f35487
-k256	ReleaseFast	sign	1	11	854b89d042a90eed	bb06c2ed85209b8d
-k256	ReleaseFast	ecdsa	1	11	d18c18d9264b2af5	8ff4812d21149442
+k256	ReleaseFast	mul	1	1	cf685f2fdb5d72dd	2e85d4bddb851304
+k256	ReleaseFast	comb	1	1	cf685f2fdb5d72dd	2ac21fe395f35487
+k256	ReleaseFast	sign	1	11	9857bbdba6779794	bb06c2ed85209b8d
+# Zig 0.17.0 (2026-10-18): ecdsa 11 -> 10 (decrease). One of signInner's five own contexts
+# (ecdsa_recover.zig) is gone in the LLVM 22 build; every other context has the same shape (the
+# harness frame now prints as `ctgrind_harness.main`). Normalised --stacks diff vs B0.
+k256	ReleaseFast	ecdsa	1	10	42799e9bf06c6a60	8ff4812d21149442
 # montint — all three dispatch sizes clean, no residual. `small` (L=4) and
 # `portable` (L=16) were DEFECT rows at 7 and 5 when the harness was added:
 # ReleaseFast lowered `condSubTop`'s masked select, and `sub`'s masked add-back,
@@ -433,9 +440,9 @@ k256	ReleaseFast	ecdsa	1	11	d18c18d9264b2af5	8ff4812d21149442
 # `portable` moved from Modint(1024) to Modint(512) (L=8) because L=16 left the
 # portable bodies, so its output pin was re-taken (different modulus, different
 # printed result); the L=16 kernel is measured by `dyn` (2 in-file, unchanged).
-montint	ReleaseFast	small	1	0	2242e5a7085cc1ad	4e9f8c0b1ac8efe3
-montint	ReleaseFast	portable	1	0	2242e5a7085cc1ad	a65d399a02be7ebb
-montint	ReleaseFast	asmcore	1	0	2242e5a7085cc1ad	51c0595ca47bd7cc
+montint	ReleaseFast	small	1	0	3a9d8b6915dcc409	4e9f8c0b1ac8efe3
+montint	ReleaseFast	portable	1	0	3a9d8b6915dcc409	a65d399a02be7ebb
+montint	ReleaseFast	asmcore	1	0	3a9d8b6915dcc409	51c0595ca47bd7cc
 # `field` (2026-10-02): `Field(r)` for the bls12_381 scalar order — the backend of
 # both pairing modules' `Fr`. Operands, exponent and a 64-byte reduce input
 # tainted; the one in-file context is `inv`'s zero check (`NotInvertible`).
@@ -444,7 +451,12 @@ montint	ReleaseFast	asmcore	1	0	2242e5a7085cc1ad	51c0595ca47bd7cc
 # extra-reduction select, the pow window select, toBytes). If it reads zero,
 # std fixed ff or the instrument went blind; `field`'s 1 means nothing until
 # that is understood.
-montint	ReleaseFast	field	1	1	8926fd39e03827a3	efbe5c72b7a484c2
+montint	ReleaseFast	field	1	1	526df7cce588262e	efbe5c72b7a484c2
+# Zig 0.17.0 (2026-10-18): ffcontrol 27 -> 28, still the positive control (>=1). 0.17 std
+# rewrote ff pow's window select: the old `eql` contexts in montgomeryMul/pow (15) became 16 in
+# `cmov` (ff.zig:359, `ct.select` per table entry, unswitched into a jump) under
+# powWithEncodedExponentInternal; montgomeryMul's extra-reduction select remains. std ff still
+# branches on a secret exponent on 0.17.0; montint's own rows do not use std ff.
 montint	ReleaseFast	ffcontrol	1	>=1	NO-OWN-SRC	e5fa1af501069bfb
 # montint dyn (2026-10-02): DynModint with a SECRET modulus (value fields
 # tainted after construction, slot L not), operands, exponent, wide inputs, at
@@ -454,11 +466,11 @@ montint	ReleaseFast	ffcontrol	1	>=1	NO-OWN-SRC	e5fa1af501069bfb
 # against a secret EVEN value, both widths, operands coprime to the modulus so
 # the success path runs (results = Python pow(x, -1, m)); still 2 in-file —
 # the divsteps and the Hensel step add no context, their verdicts are witness.
-montint	ReleaseFast	dyn	1	2	abb1b44d3caa77cd	880a04f6d911e62c
+montint	ReleaseFast	dyn	1	2	d119905673d7d9aa	880a04f6d911e62c
 # 2026-10-13: p256 `rejectIdentity` launders its verdict (one `je`, was two) -> every row whose count included the p256 comb/windowed identity check drops by 1 (--stacks diff vs the base: the second jump of `rejectIdentity` gone, no other context moved).
 # 2026-10-14: p256 point formulas as generated asm (point_asm.zig; pattern gains it). Counts unchanged (comb 1 = rejectIdentity group.zig:690 per --stacks, sign <=12); comb output re-pinned because the harness prints raw projective coordinates and the CT mixed addition is now madd-2004-hmv (another representative of the same point; sign pk+sig digest unchanged). ctap2 digests re-pinned too: stale since 9fc3c70d (root.zig fuzz test only), counts 0/0.
-p256	ReleaseFast	comb	1	1	a586a888406f5725	e3c458c38b8cf4a8
-p256	ReleaseFast	sign	1	<=12	59ec791d711e5e93	af4baed5c5134f3f
+p256	ReleaseFast	comb	1	1	164010ffd874d4b1	e3c458c38b8cf4a8
+p256	ReleaseFast	sign	1	<=12	8d710891aad93635	af4baed5c5134f3f
 # rsa 2026-10-02 — the private path moved onto montint.DynModint (reduce of c
 # mod p/q, Garner, unblinding, F3). crt 213 -> 1: the 212 were std.crypto.ff's
 # reduce (shiftIn, compare-and-subtract) and montgomeryMul over the secret
@@ -471,15 +483,15 @@ p256	ReleaseFast	sign	1	<=12	59ec791d711e5e93	af4baed5c5134f3f
 # 2026-10-14: crt 2 -> 1: the doubled FaultDetected verdict context is gone
 # (privateOpCrtPtr restructured for CRT-domain blinding); the 1 left is the
 # F3 verdict, root.zig:985 (--stacks).
-rsa	ReleaseFast	crt	1	1	0469da096375518f	d4057b00f9df7b56
-rsa	ReleaseFast	noncrt	1	0	0469da096375518f	d4057b00f9df7b56
+rsa	ReleaseFast	crt	1	1	2afe751d281e2cb1	d4057b00f9df7b56
+rsa	ReleaseFast	noncrt	1	0	2afe751d281e2cb1	d4057b00f9df7b56
 # rsa crtbl / crtcache (2026-10-18) — the CRT op with base blinding: `.csprng`
 # (2 = the F3 verdict root.zig `MontParams.eql(&chk, &c)` + drawBlindingPair's
 # one redraw verdict `ok == 0`, a decision about the random r) and `.cached`
 # twice on one cache (3 = the F3 verdict from each of the harness's two call
 # sites + the draw verdict of the first op; the squaring update adds none).
-rsa	ReleaseFast	crtbl	1	2	0469da096375518f	d4057b00f9df7b56
-rsa	ReleaseFast	crtcache	1	3	0469da096375518f	d4057b00f9df7b56
+rsa	ReleaseFast	crtbl	1	2	2afe751d281e2cb1	d4057b00f9df7b56
+rsa	ReleaseFast	crtcache	1	3	2afe751d281e2cb1	d4057b00f9df7b56
 # rsa keygen (2026-10-03) — SecretKey.fromPrimes on the 2048-bit KAT, p and q
 # tainted. λ = montint.nt.lcm, d/dP/dQ = inverseOfModulus (even moduli), qInv by
 # Fermat on montint: 0 contexts in nt.zig and in the inversion/ladder code. Left,
@@ -491,11 +503,16 @@ rsa	ReleaseFast	crtcache	1	3	0469da096375518f	d4057b00f9df7b56
 # stripLeadingZeros on p, q (2, their length); fromLimbsBits/build of p_mont,
 # q_mont (length verdicts); the verdicts p == q, gcd(e, λ) = 1, d/dP/dQ ≠ 0 and
 # the qInv self-check.
-rsa	ReleaseFast	keygen	1	<=173	0469da096375518f	2cb28867b78d48a6
-slhdsa	ReleaseFast	seed	1	4	26bc77070b29ba18	e0fdde7f5c62a2d6
-slhdsa	ReleaseFast	prf	1	8	26bc77070b29ba18	e0fdde7f5c62a2d6
-falcon	ReleaseFast	sign	1	<=133	ced123e2ab52d8b3	3f5a6dbb61a76d9d
-bls12_381	ReleaseFast	field	1	1	3747e93eca1a8b27	c1e8a3c184eada53
+rsa	ReleaseFast	keygen	1	<=173	2afe751d281e2cb1	2cb28867b78d48a6
+slhdsa	ReleaseFast	seed	1	4	960caaf9efdcbd42	e0fdde7f5c62a2d6
+# Zig 0.17.0 (2026-10-18): prf 8 -> 9, BENIGN (public by the scheme). The +1 is xmssPkFromSig's
+# auth-path direction test `(idx >> k) & 1` (engine.zig:432) at a fourth address (loop unrolled).
+# idx_leaf/idx_tree come from H_msg(R, ...) and R is part of the signature: tainting SK.prf taints
+# them only as the harness doc says (an honest consequence, not a secret the signature hides).
+# Signing is not constant-time hardened (SPEC.md); seed 4 SAME.
+slhdsa	ReleaseFast	prf	1	9	960caaf9efdcbd42	e0fdde7f5c62a2d6
+falcon	ReleaseFast	sign	1	<=133	bf8a648cee2e2f5f	3f5a6dbb61a76d9d
+bls12_381	ReleaseFast	field	1	1	6718617f9f6e38c1	c1e8a3c184eada53
 # 2026-10-02 — Fr off std.crypto.ff, bls12_381 ctSelect + Fp2.isZero barriers.
 # `Fr` (bls12_381, bn254) is now `montint.Field`; ff branched on secrets in
 # ReleaseFast (montint `ffcontrol`). The old counts here held two contexts per
@@ -520,8 +537,8 @@ bls12_381	ReleaseFast	field	1	1	3747e93eca1a8b27	c1e8a3c184eada53
 # the authorities); ibe's Miller loop over `d_id` (the pairing makes no
 # constant-time claim — ibe SPEC); and the FO re-encryption compare in ibe/tlock
 # decrypt (`std.mem.eql`, accept/reject public by the code's own comment).
-bls12_381	ReleaseFast	g1_scalarmul	1	2	878576067b788c35	b53b0d7808e48c1c
-bls12_381	ReleaseFast	g2_scalarmul	1	2	17f4aae9d4d3ded9	7f4e15a241002b3f
+bls12_381	ReleaseFast	g1_scalarmul	1	2	db7e8188261ffb9b	b53b0d7808e48c1c
+bls12_381	ReleaseFast	g2_scalarmul	1	2	ff4570e3f9019260	7f4e15a241002b3f
 # Re-pin 2026-09-15. Every moved bound below was diffed context-by-context
 # against a --stacks run of the tree at 0c0ef527:
 #   bip340 sign 79 -> 80   The F5 seam (f3c75612) moved sign's body into
@@ -563,7 +580,7 @@ bls12_381	ReleaseFast	g2_scalarmul	1	2	17f4aae9d4d3ded9	7f4e15a241002b3f
 # the step-10 self-check's `if (r_xy.y.isOdd()) return false` on the public R, same line, still
 # inside this row's pattern. Nothing else moved (normalised stack diff, ~/CML/zig-017/report-CT1.md).
 bip340	ReleaseFast	sign	1	<=90	30c9a464c391b5a5	0ce3274dc49157be
-blindrsa	ReleaseFast	blind	1	<=493	84729d86c80ede27	4352055809b3f3c7
+blindrsa	ReleaseFast	blind	1	<=493	4f803be7e3f9669a	4352055809b3f3c7
 # blindrsa sign 218 -> 7 (2026-10-02): rsa's CRT path left std.crypto.ff. Left,
 # all on the signature s that is about to be published: blindSign's ff parse of
 # s_b (rejectNonCanonical, 1) and its unblinding `sk.n.mul(s_b, b_inv)` (ff
@@ -576,7 +593,7 @@ blindrsa	ReleaseFast	blind	1	<=493	84729d86c80ede27	4352055809b3f3c7
 # callee is no longer inlined into it. Same verdict, on a value about to be
 # published or refused.
 # 2026-10-14: sign 8 -> 7: rsa's doubled F3-verdict context gone (see rsa crt).
-blindrsa	ReleaseFast	sign	1	7	84729d86c80ede27	4d5e3740a158032d
+blindrsa	ReleaseFast	sign	1	7	4f803be7e3f9669a	4d5e3740a158032d
 # A1 threshold_ecdsa R2 fix (2026-09-15, fixwt/a): `zkproofs.mulAddBytes`'s
 # carry-propagation tail no longer exits early on `carry != 0` (which compiled
 # to `cmp $0x100`/`jb` over the tainted running sum, zkproofs.zig, was :356);
@@ -654,8 +671,21 @@ blindrsa	ReleaseFast	sign	1	7	84729d86c80ede27	4d5e3740a158032d
 # under zkproofs.verifyBobInner (lines 2070/2071) -- class (a) above, the
 # verifier over public proof bytes -- now split into more unique stacks; no new
 # site, nothing in montint's kernels; the ed25519 verifier rows dropped by 4.
-threshold_ecdsa	ReleaseFast	share	1	<=291	5b4a514d57aa2dbb	3ac5880d3dc76e1e
-threshold_ecdsa	ReleaseFast	nonce	1	<=518	5b4a514d57aa2dbb	3ac5880d3dc76e1e
+# Zig 0.17.0 (2026-10-18, measured at 78225ade): share 275 -> 506, nonce 515 -> 870, betaprime
+# 317 -> 559 in-file; bounds moved to the measurement. BENIGN, class (a). 0.17 std rewrote
+# `Secp256k1.mulPublic` (and mulDoubleBasePublic) onto a generic n-base wNAF `mulMultiPublic`
+# (std/crypto/pcurves/secp256k1.zig) whose digit scans (`findLastNone`), table adds and carries
+# branch at many more distinct sites than 0.16's `mulDoubleBasePublicEndo`. Classified by first
+# in-module frame (ctfix2/firstmod.py over --stacks, B0 vs 0.17): contexts under std's public
+# multiplication 71 -> 351 (share), 120 -> 618 (nonce), 78 -> 394 (betaprime), ALL under
+# ecproofs.verifySt / verifyPedersen / verifySchnorr's mulAdd and presign `combine` -- the
+# verifier over proof responses and published R/δ that the single-process harness derives
+# from the tainted secrets. Everything else went DOWN (share 134 -> 85, nonce 304 -> 161,
+# betaprime 177 -> 103), only attribution moves (decryptByValue root -> mta.finalizeLift,
+# ff parse root.fromBytes -> round2/3Inner), no new prover-side site. The `mulPublic` here is
+# std's public-input function by contract; nothing secret enters it.
+threshold_ecdsa	ReleaseFast	share	1	<=506	9b0ac2cd5623f72c	3ac5880d3dc76e1e
+threshold_ecdsa	ReleaseFast	nonce	1	<=870	9b0ac2cd5623f72c	3ac5880d3dc76e1e
 # ✅ threshold_ecdsa betaprime — R2 FIXED 2026-09-15 (was DEFECT, RED ON
 # PURPOSE, see git history of this comment for the pre-fix analysis).
 # Added 2026-09-15 for R1: nothing tainted Bob's 160-byte MtA blind β' before.
@@ -691,7 +721,8 @@ threshold_ecdsa	ReleaseFast	nonce	1	<=518	5b4a514d57aa2dbb	3ac5880d3dc76e1e
 # ff montgomeryMul/add final subtractions on beta' named in R1 are gone with
 # mta's beta' parse and the MtA products; what reaches beta' now is
 # sampleBetaPrime's std.mem.order (4) and the verifier side.
-threshold_ecdsa	ReleaseFast	betaprime	1	<=320	5b4a514d57aa2dbb	3ac5880d3dc76e1e
+# Zig 0.17.0 (2026-10-18): 317 -> 559, see the share/nonce note above (std mulMultiPublic, class (a)).
+threshold_ecdsa	ReleaseFast	betaprime	1	<=559	9b0ac2cd5623f72c	3ac5880d3dc76e1e
 # threshold_ecdsa fac — Πfac prover over the Paillier factors p, q (dealer-free
 # keygen, 2026-10-02). First measurement found the real defect: std.crypto.ff's
 # powWithEncodedExponent compiles its cmov(ct.eql(k, i)) window select to
@@ -711,7 +742,7 @@ threshold_ecdsa	ReleaseFast	betaprime	1	<=320	5b4a514d57aa2dbb	3ac5880d3dc76e1e
 # montgomeryMul final subtractions went with powSecret's and the commitments'
 # move to montint.DynModint (pedersenCt). Left: Scalar.fromBytes48 on e (2),
 # stripLeadingZeros on e and v (2), the v < 0 redraw (1) — all as above.
-threshold_ecdsa	ReleaseFast	fac	1	5	a20f1f02aec38d67	9f67f62d291aa5c7
+threshold_ecdsa	ReleaseFast	fac	1	5	e9a0c8de17533d94	9f67f62d291aa5c7
 # threshold_ecdsa pimod (2026-10-03) — Πmod prover over tss-lib's 2048-bit N,
 # Paillier p, q tainted. The per-round work (Legendre symbols by Euler's
 # criterion, the 4th roots with a CT ±s select, the CRT, q^-1 mod p by Fermat)
@@ -721,14 +752,14 @@ threshold_ecdsa	ReleaseFast	fac	1	5	a20f1f02aec38d67	9f67f62d291aa5c7
 # of p, q, φ and the extended Euclid (451 + 84 + 4). Left: fromLimbsBits's
 # length verdict, once per factor (2), and the `if (b_bit)`/`if (a_bit)`
 # blends of y' (aux_proofs.zig, 2) — a_i, b_i are published in the proof.
-threshold_ecdsa	ReleaseFast	pimod	1	4	33e12b13d084dfe5	97edec9453ab2d0b
+threshold_ecdsa	ReleaseFast	pimod	1	4	fa25f48ce8a74115	97edec9453ab2d0b
 # threshold_ecdsa piprm (2026-10-03) — Πprm prover (proveBound) over tss-lib's
 # 2048-bit Ñ, p̃, q̃ and λ tainted. φ is a limb product, z_i = a_i + e_i·λ mod φ
 # one masked subtraction (was big-int divFloor on φ, λ). Left: fromLimbsBits's
 # length verdict for p̃ and q̃ (2) and the nonce draw's accept verdict a_i < φ
 # (aux_proofs.zig, 1 — its count depends on φ/2^bits only). The witness folds
 # every z_i (z_i = a_i alone when e_i = 0).
-threshold_ecdsa	ReleaseFast	piprm	1	3	33e12b13d084dfe5	dba9d0e9fdb30553
+threshold_ecdsa	ReleaseFast	piprm	1	3	fa25f48ce8a74115	dba9d0e9fdb30553
 # threshold_ecdsa prime (2026-10-03) — root.isProbablePrime on tss-lib's
 # 1024-bit Blum prime, tainted, its length (1024) given by the caller as the
 # prime searches do. 4 in-file: fromLimbsBits's verdict (1), the `s` scan over
@@ -741,7 +772,7 @@ threshold_ecdsa	ReleaseFast	piprm	1	3	33e12b13d084dfe5	dba9d0e9fdb30553
 # (dyn.zig, 1 — s = v2(p − 1) is documented as observable; 1 for these
 # candidates, all ≡ 3 mod 4), and the round verdict `pass == 0` (dyn.zig, 1;
 # always passes for a prime).
-threshold_ecdsa	ReleaseFast	prime	1	3	fe41781493acef68	d2b3154e6a6b44ed
+threshold_ecdsa	ReleaseFast	prime	1	3	62d728b8f67b41d8	d2b3154e6a6b44ed
 # auxgen (2026-10-03): the ring-Pedersen setup over tss-lib's tainted safe
 # primes (root.auxParamsWithTrapdoorFromSafePrimes). N~ = p~·q~ and
 # ord = p'·q' are montint limb products, lambda is kept on the borrow of
@@ -753,13 +784,18 @@ threshold_ecdsa	ReleaseFast	prime	1	3	fe41781493acef68	d2b3154e6a6b44ed
 # Before: std.math.big.int products and a big-int compare against ord.
 # 2026-10-14: auxgen 116 -> 115: montint DynModint's Horner reducer works on
 # whole L-limb digits now (no `digit_bits` from the tainted modulus length).
-threshold_ecdsa	ReleaseFast	auxgen	1	115	7032dceac909d27c	9577aa06dd1bf0e4
+# Zig 0.17.0 (2026-10-18): auxgen 115 -> 96 (decrease, std ff rewrite). The ff carriers of the
+# public N~ changed shape (conditionalSubWithOverflow/shrink/isZero -> orLimbs/decodeBytes/eql),
+# 19 fewer contexts, all class (a) under deriveAuxFromSafePrimes/sampleNonzeroLtModulus. No
+# context in ff pow: lambda's h1 = h2^lambda is montint powSecret here (the std ff `pow` with a
+# secret lambda is test-only code: aux_proofs.zig floorAuxWithTrapdoor, aux_info/root tests).
+threshold_ecdsa	ReleaseFast	auxgen	1	96	727f8b37999c8918	9577aa06dd1bf0e4
 # open7 (2026-10-03): mta.decryptWithRandomness, the §4.3 type-7 opening's
 # decryption proof, with the Paillier lambda tainted. 2 in-file: the
 # inverseOfModulus verdict (gcd(N, lambda) = 1, constant for a valid key) and
 # ff's canonicality check on rho — the opening PUBLISHES rho. The inverse
 # modulo the secret even lambda and the power ran without a context.
-threshold_ecdsa	ReleaseFast	open7	1	2	c86454dda969bdea	e040997143d67ecf
+threshold_ecdsa	ReleaseFast	open7	1	2	9d28768b1816a6b3	e040997143d67ecf
 # Output cannot repeat: `prove` draws alpha, s_l/s_r, rho and tau1/tau2 from
 # getrandom(2), because a range proof that is not randomised is not a range
 # proof. RANDOMIZED keeps the half of the pin that still works -- a value must
@@ -773,8 +809,8 @@ threshold_ecdsa	ReleaseFast	open7	1	2	c86454dda969bdea	e040997143d67ecf
 # rangeproof.zig, the IPA transcript replay and challenge products moved into
 # `ipa.replayChallenges`/`challengeProducts`, verifier side only). Both rows
 # re-measured unchanged.
-bulletproofs	ReleaseFast	rangeproof	1	0	181843cb28768e6b	RANDOMIZED
-bulletproofs	ReleaseFast	ipa	1	0	59c8171ea03060ea	2ade41bb2f418497
+bulletproofs	ReleaseFast	rangeproof	1	0	3306be7238c18cd1	RANDOMIZED
+bulletproofs	ReleaseFast	ipa	1	0	285a7224998e122c	2ade41bb2f418497
 # paillier 2026-10-02 — decrypt, gPow and the homomorphic products moved onto
 # montint.DynModint; the L-function is DynModint.divExact (Hensel) instead of
 # std.math.big.int divFloor. crt 325 -> 2, noncrt 133 -> 3, mul 9 -> 0,
@@ -845,20 +881,30 @@ paillier	ReleaseFast	keygen	1	<=314	290004aa2c412afd	61a35e2d95a376cf
 # fp12pow, and :397 (pairing final-exp inv), :421, :423, :424 (the FO
 # re-encryption compare: toBytesCompressed + mem.eql) for decrypt; the leaves
 # are in bls12_381 (field/fp/fp2/g2.zig) since tlock moved onto it.
-tlock	ReleaseFast	fp12pow	1	5	f82258ea8bb02c5b	b904bd817d356db7
-tlock	ReleaseFast	decrypt	1	8	f82258ea8bb02c5b	3a939f7ff5b39d03
-ibe	ReleaseFast	extract	1	1	a6e90ea318021603	686f0732e74c5ef7
-ibe	ReleaseFast	decrypt	1	10	171884ea14542550	fb52b6c55cc51706
-ibe	ReleaseFast	fp12pow	1	0	a6e90ea318021603	d2e187260f9f18a2
+tlock	ReleaseFast	fp12pow	1	5	7a2544b26eb57c29	b904bd817d356db7
+tlock	ReleaseFast	decrypt	1	8	7a2544b26eb57c29	3a939f7ff5b39d03
+ibe	ReleaseFast	extract	1	1	84994872a36be185	686f0732e74c5ef7
+# Zig 0.17.0 (2026-10-18): decrypt 10 -> 8 (decrease, inlining only): millerLoopBatch's 3
+# contexts are one in multiMillerLoop (merged by inlining), and the FO compare's 2 `eqlBytes`
+# contexts are now 1 there + 1 attributed to decryptBody. Same sites.
+ibe	ReleaseFast	decrypt	1	8	4599590eeac6a32f	fb52b6c55cc51706
+ibe	ReleaseFast	fp12pow	1	0	84994872a36be185	d2e187260f9f18a2
 # frost sign 5 -> 13 (audit 2026-10-08): round2Sign now recomputes its own
 # commitments (RFC 9591 §5.2's MUST check) -- the two combMulBase ladders and
 # two Element.fromPoint of round1Commit (the classes the commit row already
 # counts), plus 2 eqlBytes and 2 branches comparing them with the listed,
 # public commitments. Diffed context by context against 50d173d8; the harness
 # lists commitments from an untainted twin of the nonce inputs.
-frost	ReleaseFast	commit	1	8	c9ace0d39198830a	94a2e96655c4ce21
-frost	ReleaseFast	sign	1	13	c9ace0d39198830a	1da8c496388f45b0
-musig2	ReleaseFast	sign	1	<=101	702a6e7aa6caef74	2a2f275cd0c5c7c5
+frost	ReleaseFast	commit	1	8	e99682f40d9df045	94a2e96655c4ce21
+frost	ReleaseFast	sign	1	13	e99682f40d9df045	1da8c496388f45b0
+# Zig 0.17.0 (2026-10-18): sign 101 -> 103 (bound <=101 -> <=103), BENIGN (public input). k256
+# `Fe.fromBytes`'s `v >= p` test (field.zig:206) now shows under BOTH `XOnlyPublicKey.fromBytes`
+# and `lift` inside musig2 `cpoint` (x3 each, was x3): LLVM 22 no longer folds lift's repeated
+# canonicity check of the same 32 bytes into the first one. Reached from partialSigVerifyInternal's
+# parse of the signer's own public key and public nonce -- values the signer publishes, tainted
+# because the harness derives them from the secrets. One group.add context in mulPublicGlv gone
+# (inlining). musig2 SPEC.md CT note.
+musig2	ReleaseFast	sign	1	<=103	788991e5952c4c0a	2a2f275cd0c5c7c5
 # taproot secret 10 -> 9 (re-pin 2026-09-15). The row was already stale at
 # 0c0ef527: a --stacks run of that tree reads 9, with the SAME context set as
 # today. The source pin never moved, so the drop came from a dependency before
@@ -869,54 +915,54 @@ musig2	ReleaseFast	sign	1	<=101	702a6e7aa6caef74	2a2f275cd0c5c7c5
 # Source pin moved 2026-10-02 after the BIP341 script trees (7a956ff7): --stacks
 # reads the same nine, at shifted lines -- group.zig:400 x2, taproot
 # root.zig:279/286 (the same two `Scalar.fromBytes` canonicality checks).
-taproot	ReleaseFast	secret	1	9	63be958a4d45e65e	966e0c7b70c18936
-adaptor	ReleaseFast	presign	1	<=90	51fa98054fac0da5	d3d7ee2d921fc316
-adaptor	ReleaseFast	adapt	1	2	51fa98054fac0da5	6e42ff967657d98e
-adaptor	ReleaseFast	extract	1	3	51fa98054fac0da5	76dc1be38fd7746f
+taproot	ReleaseFast	secret	1	9	fda0b898c79c1701	966e0c7b70c18936
+adaptor	ReleaseFast	presign	1	<=90	39b6f3114b858836	d3d7ee2d921fc316
+adaptor	ReleaseFast	adapt	1	2	39b6f3114b858836	6e42ff967657d98e
+adaptor	ReleaseFast	extract	1	3	39b6f3114b858836	76dc1be38fd7746f
 # 2026-10-08 (p256 dead-stack burns): the p256-consumer rows below dropped their in-file
 # count (spake2plus 7/7/12/10 -> 6/6/9/7, hpke p256 2/4 -> 1/2, ctap2pin 4/7/7 -> 3/6/6).
 # Context diff vs the base (--stacks, both trees): the same classes only — mulCtWindowed,
 # combMulBaseFastWithTable, isBasePointRepr — now under `P256.mulUnburned` instead of an
 # inlined `P256.mul`; the contexts whose top frame was the inlined `P256.mul` itself are
 # gone because `mul` is now a branch-free wrapper. No new class, no new file.
-spake2plus	ReleaseFast	w0w1	1	4	aa2a2e5310920650	5530136493ed4097
+spake2plus	ReleaseFast	w0w1	1	4	435b7883c575b1db	5530136493ed4097
 # 2026-10-13: p256 `rejectIdentity` launders its verdict (one `je`, was two) -> every row whose count included the p256 comb/windowed identity check drops by 1 (--stacks diff vs the base: the second jump of `rejectIdentity` gone, no other context moved).
-spake2plus	ReleaseFast	computel	1	2	aa2a2e5310920650	37d06a2f53487905
+spake2plus	ReleaseFast	computel	1	2	435b7883c575b1db	37d06a2f53487905
 # 2026-10-13: p256 `rejectIdentity` launders its verdict (one `je`, was two) -> every row whose count included the p256 comb/windowed identity check drops by 1 (--stacks diff vs the base: the second jump of `rejectIdentity` gone, no other context moved).
-spake2plus	ReleaseFast	proverstart	1	5	aa2a2e5310920650	5b3e4131495365d6
+spake2plus	ReleaseFast	proverstart	1	5	435b7883c575b1db	5b3e4131495365d6
 # 2026-10-13: p256 `rejectIdentity` launders its verdict (one `je`, was two) -> every row whose count included the p256 comb/windowed identity check drops by 1 (--stacks diff vs the base: the second jump of `rejectIdentity` gone, no other context moved).
-spake2plus	ReleaseFast	verifierstart	1	5	aa2a2e5310920650	ce61814fc8e1b2b7
-spake2plus	ReleaseFast	proverfinish	1	9	aa2a2e5310920650	5cdf0fe20429a208
-spake2plus	ReleaseFast	verifierfinish	1	7	aa2a2e5310920650	dbdff43379a90cf5
+spake2plus	ReleaseFast	verifierstart	1	5	435b7883c575b1db	ce61814fc8e1b2b7
+spake2plus	ReleaseFast	proverfinish	1	9	435b7883c575b1db	5cdf0fe20429a208
+spake2plus	ReleaseFast	verifierfinish	1	7	435b7883c575b1db	dbdff43379a90cf5
 # bbs proofgen 9 -> 15 (re-pin 2026-10-06, draft-04 -> draft-12): the proof gained
 # two public points (D, T2) -- serialized into the challenge (bbs.zig:387, 5 points
 # now), made affine (:632-634, :640) and encoded (:153 via :653) -- plus the
 # zero-check of the blinding scalar r1 (:617, next to r2.inv at :616). Every
 # context is on a value the proof publishes or on "is this random scalar 0".
-bbs	ReleaseFast	sign	1	3	813913e577c813bc	0929643a5972b8ba
-bbs	ReleaseFast	proofgen	1	15	813913e577c813bc	464ac571cf1943c2
-coconut	ReleaseFast	authority_sign	1	2	73f35687d5c0db5e	3492f1201b641f09
-coconut	ReleaseFast	user_issue	1	21	a6281f1d04b2a243	af24664cb307a403
+bbs	ReleaseFast	sign	1	3	f3b9102ff748998e	0929643a5972b8ba
+bbs	ReleaseFast	proofgen	1	15	f3b9102ff748998e	464ac571cf1943c2
+coconut	ReleaseFast	authority_sign	1	2	580bc6f94c4a7f19	3492f1201b641f09
+coconut	ReleaseFast	user_issue	1	21	06c770f681312a71	af24664cb307a403
 # Count 27 -> 26 on 2026-10-09 (dead-stack sweep: proveCredential's body runs one
 # frame down under `burn.run`, `Entropy.scalar` writes in place). --stacks diff vs
 # the base: every context is the same site renamed (proveCredentialFrom ->
 # proveBody < run@burn.zig) except the Fr.fromBytes rejection-sampler context
 # reached from Entropy.scalar, 5 -> 4 distinct chains. No new site.
-coconut	ReleaseFast	user_show	1	26	73f35687d5c0db5e	286e5ea12d924b29
-hpke	ReleaseFast	x25519_decap	1	1	0284b00feeb2e2fb	c0cee0a8c6bf72c3
-hpke	ReleaseFast	x25519_authdecap	1	2	0284b00feeb2e2fb	05af25d1d0e3943d
-hpke	ReleaseFast	p256_decap	1	1	0284b00feeb2e2fb	851ee3406999dacc
-hpke	ReleaseFast	p256_authdecap	1	2	0284b00feeb2e2fb	4b0f0c964acb8411
-hpke	ReleaseFast	p384_decap	1	2	0284b00feeb2e2fb	6b70bba9cc229a39
-hpke	ReleaseFast	p384_authdecap	1	4	0284b00feeb2e2fb	2741ac2ff5069767
-hpke	ReleaseFast	open	1	1	42d3ebff03e12947	59883c70dcd08ee6
+coconut	ReleaseFast	user_show	1	26	580bc6f94c4a7f19	286e5ea12d924b29
+hpke	ReleaseFast	x25519_decap	1	1	f5fa6d114eb81f0a	c0cee0a8c6bf72c3
+hpke	ReleaseFast	x25519_authdecap	1	2	f5fa6d114eb81f0a	05af25d1d0e3943d
+hpke	ReleaseFast	p256_decap	1	1	f5fa6d114eb81f0a	851ee3406999dacc
+hpke	ReleaseFast	p256_authdecap	1	2	f5fa6d114eb81f0a	4b0f0c964acb8411
+hpke	ReleaseFast	p384_decap	1	2	f5fa6d114eb81f0a	6b70bba9cc229a39
+hpke	ReleaseFast	p384_authdecap	1	4	f5fa6d114eb81f0a	2741ac2ff5069767
+hpke	ReleaseFast	open	1	1	8491a853bcc6a79d	59883c70dcd08ee6
 # hpke p521 (2026-10-10): DHKEM(P-521, HKDF-SHA512) decap / authDecap, skR tainted,
 # group through the `p521` module's ecdhInto: 0 in-file (p521's range/identity verdicts
 # are declassified there, see modules/p521/SPEC.md).
-hpke	ReleaseFast	p521_decap	1	0	a61e96c24833076e	f9c48b1e130f8af6
-hpke	ReleaseFast	p521_authdecap	1	0	a61e96c24833076e	f00506c9b354a23b
-signal	ReleaseFast	sign	1	1	8913e487185c7429	b2a0053066d93a75
-signal	ReleaseFast	ratchet	1	2	769b7983e02f8179	92ab00fad0ce5c41
+hpke	ReleaseFast	p521_decap	1	0	7be057de1c4ee47e	f9c48b1e130f8af6
+hpke	ReleaseFast	p521_authdecap	1	0	7be057de1c4ee47e	f00506c9b354a23b
+signal	ReleaseFast	sign	1	1	49152120eaf5e986	b2a0053066d93a75
+signal	ReleaseFast	ratchet	1	2	b772c31bd87426da	92ab00fad0ce5c41
 # sphinx construct 10 -> 8 (re-pin 2026-09-15): its two ECDH `k256.mul` calls
 # (core.zig:124/:152) read 2 contexts each on the old ladder and 1 each now --
 # `rejectIdentity` at group.zig:347 via `mulInner`, exactly k256/mul's 2 -> 1.
@@ -938,31 +984,35 @@ sphinx	ReleaseFast	process	1	<=47	a25085a4c95dd966	e7c50d755f64b027
 # derivePrivateKey now refuses a per_commitment_secret >= n, so the std scalar
 # canonicality verdict (common.zig:75 via scalar.zig:87, root.zig:98) appears
 # for the second secret too — the class already counted for basepoint_secret.
-bolt3	ReleaseFast	derive	1	8	37db66c6e7011623	c0fc92c5fbd8fb55
-bolt3	ReleaseFast	revocation	1	10	37db66c6e7011623	bc9bf12a55a312c4
-bolt3	ReleaseFast	shachain	1	0	37db66c6e7011623	0516122e43713a52
-bolt3	ReleaseFast	shachain_index	1	1	37db66c6e7011623	21055013990ce08a
-ctap2pin	ReleaseFast	ecdh	1	3	64d834cb1828a65d	4596df5a3f29ae3b
+bolt3	ReleaseFast	derive	1	8	89862ff95d60a3b5	c0fc92c5fbd8fb55
+bolt3	ReleaseFast	revocation	1	10	89862ff95d60a3b5	bc9bf12a55a312c4
+bolt3	ReleaseFast	shachain	1	0	89862ff95d60a3b5	0516122e43713a52
+bolt3	ReleaseFast	shachain_index	1	1	89862ff95d60a3b5	21055013990ce08a
+ctap2pin	ReleaseFast	ecdh	1	3	914283e2a43d83d0	4596df5a3f29ae3b
 # 2026-10-13: p256 `rejectIdentity` launders its verdict (one `je`, was two) -> every row whose count included the p256 comb/windowed identity check drops by 1 (--stacks diff vs the base: the second jump of `rejectIdentity` gone, no other context moved).
-ctap2pin	ReleaseFast	one	1	5	64d834cb1828a65d	12de2588e792c80e
+ctap2pin	ReleaseFast	one	1	5	914283e2a43d83d0	12de2588e792c80e
 # 2026-10-13: p256 `rejectIdentity` launders its verdict (one `je`, was two) -> every row whose count included the p256 comb/windowed identity check drops by 1 (--stacks diff vs the base: the second jump of `rejectIdentity` gone, no other context moved).
-ctap2pin	ReleaseFast	two	1	5	64d834cb1828a65d	4f76909ff534c3cc
-ctap2pin	ReleaseFast	token	1	0	64d834cb1828a65d	076a3a6729a924b0
-fss	ReleaseFast	gen	1	0	540cf7ddd46fc712	b40b02f9cf423f05
+ctap2pin	ReleaseFast	two	1	5	914283e2a43d83d0	4f76909ff534c3cc
+ctap2pin	ReleaseFast	token	1	0	914283e2a43d83d0	076a3a6729a924b0
+fss	ReleaseFast	gen	1	0	87070291f4d13650	b40b02f9cf423f05
 # Was `>=1` and a confirmed defect: `dpf.zig:326`'s xorMasked compiled to
 # `test $0x1,%r9b` / `je` on the secret control bit at THIS call site while
 # staying branch-free at genWithSeeds'. Fixed by laundering the mask through
 # an optimization barrier (dpf.zig `blackBox`), so 0 is now the claim and the
 # barrier is what holds it -- deleting it puts the branch back.
-fss	ReleaseFast	eval	1	0	540cf7ddd46fc712	da79011b1ab46d96
-bfv	ReleaseFast	keygen	1	<=29	bc16154aabf7fc3c	85d334608120f4fc
-bfv	ReleaseFast	encrypt	1	<=17	bc16154aabf7fc3c	e4cdbb1aa2e9c9dc
-bfv	ReleaseFast	decrypt	1	<=6	bc16154aabf7fc3c	51de1d1011ed3c4c
-tfhe	ReleaseFast	keygen	1	0	d7bdf2c8b7a0e856	69d480284dbfd7e8
-tfhe	ReleaseFast	encrypt	1	0	d7bdf2c8b7a0e856	01f895b45b944863
-tfhe	ReleaseFast	decrypt	1	0	9e8ba53ace7bcde5	3d8c08984d3541f6
-tfhe	ReleaseFast	bootstrap	1	0	fea674dae24fd621	88cf61492d6e15bc
-tfhe	ReleaseFast	noise	1	0	c8575223bcdb4191	57f844d8aeb1660a
+# Zig 0.17.0 (2026-10-18): REAL, fixed. The first 0.17 run read 1: `evalBody`'s leaf
+# `key.cw_final & (0 -% @as(Elem, t))` (dpf.zig) compiled to `test $0x1,%r13b` / `je` over the
+# load of cw_final -- a jump on the secret final control bit. Every secret-bit mask over an `Elem`
+# now goes through `secretMask` (asm-laundered word, dpf.zig); back to 0.
+fss	ReleaseFast	eval	1	0	87070291f4d13650	da79011b1ab46d96
+bfv	ReleaseFast	keygen	1	<=29	ad0f69d92e1faff8	85d334608120f4fc
+bfv	ReleaseFast	encrypt	1	<=17	ad0f69d92e1faff8	e4cdbb1aa2e9c9dc
+bfv	ReleaseFast	decrypt	1	<=6	ad0f69d92e1faff8	51de1d1011ed3c4c
+tfhe	ReleaseFast	keygen	1	0	fa6a123b93890ef2	69d480284dbfd7e8
+tfhe	ReleaseFast	encrypt	1	0	fa6a123b93890ef2	01f895b45b944863
+tfhe	ReleaseFast	decrypt	1	0	8510bdf6aaf984e1	3d8c08984d3541f6
+tfhe	ReleaseFast	bootstrap	1	0	9f9a6e5e7fc598ac	88cf61492d6e15bc
+tfhe	ReleaseFast	noise	1	0	70ff09c65f907b6b	57f844d8aeb1660a
 # dkg -- the module makes no constant-time claim (see its ctgrind_harness.zig);
 # these rows are measurements, kept so a change in them is seen. Re-measured
 # 2026-10-02 after the participant layer and GJKR step 4 (ba92d6fc, a528d9fa):
@@ -981,7 +1031,7 @@ tfhe	ReleaseFast	noise	1	0	c8575223bcdb4191	57f844d8aeb1660a
 # inlined into `Dkg.run` and merged into one call chain are now distinct call
 # chains (verifyFeldmanShare 3 -> 5, its SEC1 decoding 6 -> 11). Bound moved to
 # the measurement.
-dkg	ReleaseFast	coeffs	1	<=110	c963ea07f866f7c7	ace23d0e40b2c8f5
+dkg	ReleaseFast	coeffs	1	<=110	f7f3b05928e3236e	ace23d0e40b2c8f5
 dkg	ReleaseFast	combine	1	0	89feb80b007daf9a	6407896882d3491c
 # aescbc — the two padding strippers, the only place this module does its own
 # arithmetic over a secret. ⭐ The claim these rows test is NOT "zero": both
@@ -1044,10 +1094,10 @@ aescbc	ReleaseFast	zero	1	0	1a3b50fc45e7e9c5	c4046968725e140d
 # pin is the whole gate, which is why the guard-stripping fix that gave bolt3
 # its pin back matters here too -- a row with NO-OWN-SRC and an unchanged count
 # would have let the barrier be deleted in silence.
-sealedbox	ReleaseFast	hexenc	1	0	facecdf4850308dd	677e9993da327f0d
-sealedbox	ReleaseFast	hexdec	1	1	facecdf4850308dd	1c8749621d19a09b
-sealedbox	ReleaseFast	b64enc	1	0	facecdf4850308dd	ec1bc04ea2ea3ff7
-sealedbox	ReleaseFast	b64dec	1	1	facecdf4850308dd	1c8749621d19a09b
+sealedbox	ReleaseFast	hexenc	1	0	0b4563a361435856	677e9993da327f0d
+sealedbox	ReleaseFast	hexdec	1	1	0b4563a361435856	1c8749621d19a09b
+sealedbox	ReleaseFast	b64enc	1	0	0b4563a361435856	ec1bc04ea2ea3ff7
+sealedbox	ReleaseFast	b64dec	1	1	0b4563a361435856	1c8749621d19a09b
 # ── sealedbox: the XSalsa20-Poly1305 core of seal/open (2026-10-07) ─────────
 # Module code since the multi-block rewrite (`xsalsa20poly1305.zig`,
 # `poly1305.zig`); before it, std's and not a target. 1100-byte message so every
@@ -1057,8 +1107,8 @@ sealedbox	ReleaseFast	b64dec	1	1	facecdf4850308dd	1c8749621d19a09b
 # accept/reject it returns to its caller. The harness declassifies that result
 # before its own `try`: LLVM turns the verdict into a select, so without it the
 # `try` is a second, unattributed context (measured, and --check refused it).
-sealedbox	ReleaseFast	seal	1	0	40988af8340a00a7	162755ddf8591877
-sealedbox	ReleaseFast	open	1	1	40988af8340a00a7	4d07318504db8dd7
+sealedbox	ReleaseFast	seal	1	0	42024a56c0a4cc47	162755ddf8591877
+sealedbox	ReleaseFast	open	1	1	42024a56c0a4cc47	4d07318504db8dd7
 # ── cookies: signed/private cookie values, secure.zig (2026-10-12) ──────────
 # Key (and for `seal` the plaintext) tainted. derive/sign/seal: exact 0 in-file.
 # `sign` and `seal` declassify their output inside secure.zig before base64 (it
@@ -1067,20 +1117,20 @@ sealedbox	ReleaseFast	open	1	1	40988af8340a00a7	4d07318504db8dd7
 # the harness prints it tainted as the witness). `open`: exact 2, both aesgcm's
 # own accept/reject branch (aesgcm root.zig, `decryptBody`), once for the
 # genuine and once for the forged value -- secure.zig adds none.
-cookies	ReleaseFast	derive	1	0	2fbeea8830c047e3	91529f00f4a937a1
-cookies	ReleaseFast	sign	0	0	2fbeea8830c047e3	cb319d1ef6d579dd
-cookies	ReleaseFast	verify	1	0	2fbeea8830c047e3	c63e696876bcc630
-cookies	ReleaseFast	seal	0	0	2fbeea8830c047e3	48f87b677a6c2d06
-cookies	ReleaseFast	open	1	2	2fbeea8830c047e3	c63e696876bcc630
+cookies	ReleaseFast	derive	1	0	32e647cf5992d429	91529f00f4a937a1
+cookies	ReleaseFast	sign	0	0	32e647cf5992d429	cb319d1ef6d579dd
+cookies	ReleaseFast	verify	1	0	32e647cf5992d429	c63e696876bcc630
+cookies	ReleaseFast	seal	0	0	32e647cf5992d429	48f87b677a6c2d06
+cookies	ReleaseFast	open	1	2	32e647cf5992d429	c63e696876bcc630
 # Timed values (2026-10-12): tsign/tseal exact 0 like sign/seal; tverify exact 0
 # and no witness -- verifyTimed declassifies its own verdict before parsing the
 # public issue time (without that: 18 in-file contexts, all the parse of the
 # client's own text through a select-tainted pointer); topen exact 2 = aesgcm's
 # verdict for the fresh and the expired call, the issue time is declassified.
-cookies	ReleaseFast	tsign	0	0	2fbeea8830c047e3	d1dec0eaab33231d
-cookies	ReleaseFast	tverify	0	0	2fbeea8830c047e3	c63e696876bcc630
-cookies	ReleaseFast	tseal	0	0	2fbeea8830c047e3	a7bf24d4bb3b15a0
-cookies	ReleaseFast	topen	1	2	2fbeea8830c047e3	c63e696876bcc630
+cookies	ReleaseFast	tsign	0	0	32e647cf5992d429	d1dec0eaab33231d
+cookies	ReleaseFast	tverify	0	0	32e647cf5992d429	c63e696876bcc630
+cookies	ReleaseFast	tseal	0	0	32e647cf5992d429	a7bf24d4bb3b15a0
+cookies	ReleaseFast	topen	1	2	32e647cf5992d429	c63e696876bcc630
 # ── pir: the query index, and the client's check ───────────────────────────
 # A1 `pir.md` M2 -- the module's central claim had never been machine-checked,
 # and its sibling `fss` exposed a REAL defect the day it entered the gate.
@@ -1100,8 +1150,8 @@ cookies	ReleaseFast	topen	1	2	2fbeea8830c047e3	c63e696876bcc630
 # SPEC.md says the soft fallback leaks the query index. A row whose colour
 # depends on the gate's CPU says nothing. ⛔ So a green `query` row is NOT a
 # claim about the default instantiation on a soft-AES target.
-pir	ReleaseFast	query	1	1	9a280b55c5d8d087	0dba0d89ed6fb4ab
-pir	ReleaseFast	reconstruct	1	1	1dd419343384c25c	b6ecd96f96e9b339
+pir	ReleaseFast	query	1	1	a8cc1e09f13e7fc5	0dba0d89ed6fb4ab
+pir	ReleaseFast	reconstruct	1	1	0c7c6be6301bb4c1	b6ecd96f96e9b339
 # ── opaque and bip32: first harnesses, 2026-09-16 (A1 opaque M5, bip32 M6) ──
 # First pinned 2026-09-15. Each target taints ONE party's secrets, and the
 # other party runs untainted first, so nothing public on the wire counts as
@@ -1110,9 +1160,9 @@ pir	ReleaseFast	reconstruct	1	1	1dd419343384c25c	b6ecd96f96e9b339
 # pattern also matches voprf's and ct25519's root.zig by basename. An edit to
 # voprf does NOT turn these rows red by digest; re-run `--check opaque` after
 # one.
-opaque	ReleaseFast	register	1	4	bb71626120e8018c	843c12b053124a78
-opaque	ReleaseFast	login	1	11	bb71626120e8018c	f8be3480eb708638
-opaque	ReleaseFast	serverke2	1	2	bb71626120e8018c	4ef279b842b3cb55
+opaque	ReleaseFast	register	1	4	3ca3303e4347557d	843c12b053124a78
+opaque	ReleaseFast	login	1	11	3ca3303e4347557d	f8be3480eb708638
+opaque	ReleaseFast	serverke2	1	2	3ca3303e4347557d	4ef279b842b3cb55
 # bip32 mnemonic 3 is the M6-CT tree (8c2f1aa4, constant-time `wordIndex`).
 # The three are the mnemonic split plus two accept/reject verdicts, not the
 # word search.
@@ -1129,10 +1179,10 @@ opaque	ReleaseFast	serverke2	1	2	bb71626120e8018c	4ef279b842b3cb55
 # checkEncodeSecret/checkDecodeSecret, parseExtendedBody declassifies the
 # public header and checks the scalar with a CT `scalarInRange`. master and
 # derive run none of that: same counts (2 / 25), same contexts, digest only.
-bip32	ReleaseFast	master	1	2	59f2a617bb825f45	7e14466ed98567fa
-bip32	ReleaseFast	derive	1	25	59f2a617bb825f45	8b410bdbd3955f08
-bip32	ReleaseFast	seed	1	0	a5dbfbf5eee08b66	9e74b23db4ad7bdc
-bip32	ReleaseFast	mnemonic	1	3	a5dbfbf5eee08b66	d42db8cf9cdc2200
+bip32	ReleaseFast	master	1	2	76043262dfb7665b	7e14466ed98567fa
+bip32	ReleaseFast	derive	1	25	76043262dfb7665b	8b410bdbd3955f08
+bip32	ReleaseFast	seed	1	0	4e16b43c5b05b3aa	9e74b23db4ad7bdc
+bip32	ReleaseFast	mnemonic	1	3	4e16b43c5b05b3aa	d42db8cf9cdc2200
 # bip32 xprv, new 2026-10-18: the master scalar tainted through serializePriv
 # and back through parseExtended (PATTERN base58.zig|bip32.zig). Measured
 # before the switch, on the variable-time checkEncode/checkDecode: 12 in-file,
@@ -1143,7 +1193,7 @@ bip32	ReleaseFast	mnemonic	1	3	a5dbfbf5eee08b66	d42db8cf9cdc2200
 # through the whole round trip). The source digest covers bip32.zig only
 # (base58.zig lives in modules/bech32): re-run `--check bip32` after a
 # bech32 edit.
-bip32	ReleaseFast	xprv	1	0	59f2a617bb825f45	446d9a369af15cee
+bip32	ReleaseFast	xprv	1	0	76043262dfb7665b	446d9a369af15cee
 # btcaddr wif, new 2026-10-18: the private key tainted through wifEncode and
 # back through wifDecode (PATTERN base58.zig|root.zig). 0 in-file, witness 2.
 # Negative control the same day: btcaddr's old early-exit range check
@@ -1151,7 +1201,7 @@ bip32	ReleaseFast	xprv	1	0	59f2a617bb825f45	446d9a369af15cee
 # gave 6 in-file — the row sees a regression of the check base58 does not
 # cover. Source digest covers btcaddr/src only: re-run `--check btcaddr`
 # after a bech32 edit (as for bip32/xprv).
-btcaddr	ReleaseFast	wif	1	0	bf842f71d5a56931	3724f47a31d201ab
+btcaddr	ReleaseFast	wif	1	0	444c7820fd321227	3724f47a31d201ab
 # aesgcm — added 2026-09-28. Key AND plaintext tainted (so round keys, H
 # powers, keystream, ciphertext and tag are all secret-derived to memcheck).
 # The 4 in-file contexts per row are ONE line, the tag-check branch
@@ -1173,9 +1223,9 @@ btcaddr	ReleaseFast	wif	1	0	bf842f71d5a56931	3724f47a31d201ab
 # 2026-10-10: AES-192 added to the harness (Aes192Gcm; generic over the aes192
 # module, kernel with Nr = 12) -- 4 -> 6 per row, the same tag-check line for
 # the third key size, nothing else.
-aesgcm	ReleaseFast	ctx	1	6	8ecf4daa6af9a981	b60805fea700d105
-aesgcm	ReleaseFast	stateless	1	6	8ecf4daa6af9a981	b60805fea700d105
-aesgcm	ReleaseFast	generic	1	6	8ecf4daa6af9a981	b60805fea700d105
+aesgcm	ReleaseFast	ctx	1	6	dcbf7eb8cb93230e	b60805fea700d105
+aesgcm	ReleaseFast	stateless	1	6	dcbf7eb8cb93230e	b60805fea700d105
+aesgcm	ReleaseFast	generic	1	6	dcbf7eb8cb93230e	b60805fea700d105
 # groth16 (2026-10-09): the zkey prover's `.constant_time` MSM choice
 # (`zkprove.proveWith`). zkprove_ct pins 6 in-file, all at the public end:
 # `toAffine` on the three proof points (zkprove.zig, the return) -- the identity
@@ -1185,14 +1235,18 @@ aesgcm	ReleaseFast	generic	1	6	8ecf4daa6af9a981	b60805fea700d105
 # the default Pippenger MSM, variable-time in the witness by design (SPEC.md
 # § 5b item 4); 26 in-file when pinned, bound >=10 so a compiler change in
 # the bucket loop does not turn the control red for nothing.
-groth16	ReleaseFast	zkprove_ct	1	6	c5f4a202c843392d	928bc8e1cc116243
-groth16	ReleaseFast	zkprove_vt	1	>=10	c5f4a202c843392d	928bc8e1cc116243
+groth16	ReleaseFast	zkprove_ct	1	6	1dd0722b21fb88ee	928bc8e1cc116243
+# Zig 0.17.0 (2026-10-18): zkprove_vt 26 -> 54 in-file (bound >=10 holds). All added contexts are
+# the Pippenger `small` path's per-bit `if ((byte >> bit) & 1 == 1)` (msm.zig:158) and its zero/one
+# shortcuts, at more instruction addresses: LLVM 22 unrolls the 8-bit loop (19 jumps at :158 in the
+# ReleaseFast binary). Variable-time in the witness by design (SPEC § 5b item 4); zkprove_ct 6 SAME.
+groth16	ReleaseFast	zkprove_vt	1	>=10	1dd0722b21fb88ee	928bc8e1cc116243
 # ripemd160 (2026-10-09) — unkeyed, so the MESSAGE is tainted: a hashed preimage
 # or key fed through hash160 is the case a branch in `compress` would leak.
 # hash: one-shot at 0/1/55/56/64/1000 B + a 3-chunk stream; hash160: std
 # SHA-256 + ours at 33 and 1000 B. All contexts are the hex witness.
-ripemd160	ReleaseFast	hash	1	0	253ec0e585e73059	247e27e8a7e8ddd7
-ripemd160	ReleaseFast	hash160	1	0	253ec0e585e73059	dc357526ecc9275d
+ripemd160	ReleaseFast	hash	1	0	d3af007a21d915ce	247e27e8a7e8ddd7
+ripemd160	ReleaseFast	hash160	1	0	d3af007a21d915ce	dc357526ecc9275d
 # b64ct (2026-10-17) — encode: the octets tainted (every variant at 0-5, 32,
 # 121, 223 B + encodeWrapped 64/LF, 76/CRLF); decode: the encoded text tainted
 # (every variant, same lengths); ignore: a PEM body through decodeIgnoring and
@@ -1200,28 +1254,28 @@ ripemd160	ReleaseFast	hash160	1	0	253ec0e585e73059	dc357526ecc9275d
 # verdict, skipped-character positions) are the contract's, so 0 in-file; all
 # contexts are the hex witness. Positive controls (reverted): std's tables in
 # sextet / value+values16 -> 204 / 69 / 46 in-file.
-b64ct	ReleaseFast	encode	1	0	569cc26a7f6a418a	3838113cd8a91ae8
-b64ct	ReleaseFast	decode	1	0	569cc26a7f6a418a	5de320ddef17d055
-b64ct	ReleaseFast	ignore	1	0	569cc26a7f6a418a	6dd74893330925a8
+b64ct	ReleaseFast	encode	1	0	2c458bc71832cbad	3838113cd8a91ae8
+b64ct	ReleaseFast	decode	1	0	2c458bc71832cbad	5de320ddef17d055
+b64ct	ReleaseFast	ignore	1	0	2c458bc71832cbad	6dd74893330925a8
 # stun (2026-10-09) — mi: the MESSAGE-INTEGRITY HMAC-SHA1 key tainted through
 # Builder.addMessageIntegrity + verifyMessageIntegrity (valid and tampered);
 # ltkey: the password through longTermKey (MD5). All contexts are the witness.
-stun	ReleaseFast	mi	1	0	0db158b97faffcd3	9f2207d86c2e2592
-stun	ReleaseFast	ltkey	1	0	0db158b97faffcd3	f48e64fbf4283df1
+stun	ReleaseFast	mi	1	0	794e65975bb52378	9f2207d86c2e2592
+stun	ReleaseFast	ltkey	1	0	794e65975bb52378	f48e64fbf4283df1
 # sessions (2026-10-09) — csrf: the CSRF key through Csrf.token + verify
 # (8 in-file before idhex: std.fmt.bytesToHex's table index, then 6 from
 # std.fmt.hexToBytes on the presented = secret token); newid: the session-id
 # bytes through idhex.encode (what Manager.newId runs on its draw).
-sessions	ReleaseFast	csrf	1	0	334d058ea8f049bb	f2cf7c06791be126
-sessions	ReleaseFast	newid	1	0	d58029f36b123eb7	7a197b81f402a7ea
+sessions	ReleaseFast	csrf	1	0	96be855abad85b10	f2cf7c06791be126
+sessions	ReleaseFast	newid	1	0	8e2306d27b257552	7a197b81f402a7ea
 # mqtt (2026-10-09) — CONNECT password + 5.0 authentication data tainted
 # through encodePacket (CONNECT 3.1.1/5.0, AUTH) and, as wire bytes only,
 # through decodePacket. The codec copies/slices them and nothing else.
-mqtt	ReleaseFast	encode	1	0	10e691c441a4a4a7	f9bc065c9f983504
-mqtt	ReleaseFast	decode	1	0	10e691c441a4a4a7	c3c3038ba153dcbb
+mqtt	ReleaseFast	encode	1	0	7f49b94910a31b20	f9bc065c9f983504
+mqtt	ReleaseFast	decode	1	0	7f49b94910a31b20	c3c3038ba153dcbb
 # 2026-10-17: acl.Passwords.verify with the password tainted -- PBKDF2-HMAC-SHA512 then
 # timing_safe.eql; 0 contexts inside acl.zig (the bool it returns is the verdict).
-mqtt	ReleaseFast	pwverify	1	0	7aadf8ff5dd9145d	bcc95d04fa79c847
+mqtt	ReleaseFast	pwverify	1	0	37254960cb4eb9dc	bcc95d04fa79c847
 # noise (2026-10-10) — hs: Noise_XXpsk3 (DefaultSuite) both roles, statics +
 # every ephemeral seed + the PSK tainted; transport: the split keys tainted
 # through encrypt/decrypt both ways + rekey. Every in-file context is a std
@@ -1230,8 +1284,8 @@ mqtt	ReleaseFast	pwverify	1	0	7aadf8ff5dd9145d	bcc95d04fa79c847
 # (curve25519.zig:77; 2 ephemeral keygens + 4 DH) + 2 x the AEAD tag-verify
 # outcome (std chacha20.zig:713 via chachapoly); transport 6 = the tag-verify
 # outcome of the 6 decryptions.
-noise	ReleaseFast	hs	1	8	7f2a256be9da1778	95912b58e70d0846
-noise	ReleaseFast	transport	1	6	dde901de8c90da98	b4443cf65f6c3849
+noise	ReleaseFast	hs	1	8	9dcf7cae5918a4d1	95912b58e70d0846
+noise	ReleaseFast	transport	1	6	f6b576f8a7aa26f8	b4443cf65f6c3849
 # tlsclient (2026-10-10) — kex: Client.initInto on a canned ServerHello with
 # the key-share secrets (entropy[64..240]) tainted; cv: signCertificateVerify
 # with the client key tainted (P-256, P-384, Ed25519). No context is a branch
@@ -1267,7 +1321,7 @@ noise	ReleaseFast	transport	1	6	dde901de8c90da98	b4443cf65f6c3849
 # and Ed25519 internals; the 14 std P-384 signer contexts are gone. The cv
 # result changed: p384's P-384 signature is RFC 6979 exact, not std's bytes.
 # 2026-10-13: p256 `rejectIdentity` launders its verdict (one `je`, was two) -> every row whose count included the p256 comb/windowed identity check drops by 1 (--stacks diff vs the base: the second jump of `rejectIdentity` gone, no other context moved).
-tlsclient	ReleaseFast	kex	1	17	893c0757cf76d668	18dc5af726922286
+tlsclient	ReleaseFast	kex	1	17	0b20a8855a136af4	18dc5af726922286
 # 2026-10-13 (S2 R6) — cv 18 -> 32: the harness also signs a TLS 1.2
 # handshake-messages digest (`.digest` input) with the P-256 and P-384 keys
 # under ECDSA+SHA384. The 14 new contexts are std's Ecdsa(P256, Sha384)
@@ -1276,7 +1330,11 @@ tlsclient	ReleaseFast	kex	1	17	893c0757cf76d668	18dc5af726922286
 # -- the class already documented for P-256 above; P-384 via p384 adds 0.
 # Innermost frames diffed: none in Client.zig, none in p384/src. RSA keys are
 # not tainted here: their private op is the rsa module's rows.
-tlsclient	ReleaseFast	cv	1	32	dba09a403fa47ccf	a92e71f50313cf2b
+# Zig 0.17.0 (2026-10-18): cv 32 -> 30 (decrease, std). The 0.17 std Ed25519 signing path lost
+# its two contexts (`fromBytes`/`sign` in ed25519.zig under generateDeterministic/sign); the ECDSA
+# P-256/P-384 contexts are the same sites with `pcMul16 < mul` now the top frame (attribution).
+# No new site (normalised --stacks diff vs B0).
+tlsclient	ReleaseFast	cv	1	30	2461bbc2646de3c7	a92e71f50313cf2b
 # dtls (2026-10-10) — hs: in-memory PSK handshake (AES-128-GCM), the PSK
 # tainted on both sides; app: after an untainted handshake both directions'
 # record keys (key, IV, sn mask key) tainted, send/recv both ways under
@@ -1293,8 +1351,8 @@ tlsclient	ReleaseFast	cv	1	32	dba09a403fa47ccf	a92e71f50313cf2b
 # engine.zig). hs 119 is almost all (b) — the encrypted handshake flight is
 # public to the peer that sent it; app 14 = 4 AEAD verdicts + seq-number
 # reconstruction + padding scan + content-type dispatch per record.
-dtls	ReleaseFast	hs	1	119	fa8e494e972566e9	ca9a2595f120b466
-dtls	ReleaseFast	app	1	14	fa8e494e972566e9	ac0eb91f2511d729
+dtls	ReleaseFast	hs	1	119	49b6bedd8eb84691	ca9a2595f120b466
+dtls	ReleaseFast	app	1	14	49b6bedd8eb84691	ac0eb91f2511d729
 # quic-crypto (2026-10-10) — aes / chacha: a 1-RTT traffic secret tainted
 # through derivePacketKeys, advanceKeys, Protection.seal/open and header
 # protection (computeMask*, apply, remove). In-file 4 each, none a branch on a
@@ -1304,8 +1362,8 @@ dtls	ReleaseFast	app	1	14	fa8e494e972566e9	ac0eb91f2511d729
 # AEAD tag-verify outcome in open. The harness marks the unmasked header
 # defined before open; without that the AEAD's length handling on it adds ~50
 # artefacts.
-quic-crypto	ReleaseFast	aes	1	4	807dcd889a53e75b	4d96b4e7d3af1ed7
-quic-crypto	ReleaseFast	chacha	1	4	807dcd889a53e75b	d1cf9a5cadb2a284
+quic-crypto	ReleaseFast	aes	1	4	760ca070cccee49a	4d96b4e7d3af1ed7
+quic-crypto	ReleaseFast	chacha	1	4	760ca070cccee49a	d1cf9a5cadb2a284
 # megolm (2026-10-10) — msg: ratchet + Ed25519 signing key tainted through
 # encrypt/decrypt (the harness marks the wire message, the decrypted length
 # and its own allocator index defined: all public); skey: SessionKey and
@@ -1324,12 +1382,18 @@ quic-crypto	ReleaseFast	chacha	1	4	807dcd889a53e75b	d1cf9a5cadb2a284
 # (b64ct.zig:141/142, one branch at the end). pickle 26 = the AEAD verdict 2, std Ed25519 keygen/sign on
 # the decrypted seed, and parsing of the decrypted pickle (checkFrame,
 # counters, Ratchet.advanceTo to the stored index, the public-key compare).
-megolm	ReleaseFast	msg	1	16	0ff715052883dcef	505eb3dc7b45f5cd
+megolm	ReleaseFast	msg	1	16	0dc084197166909f	505eb3dc7b45f5cd
 # 2026-10-17 (dedupe wave 3): skey 26 -> 23 — the private b64ct.zig became the b64ct
 # module, whose verdict is declassified by contract (`public`); the 3 verdict contexts
 # (b64ct.zig:141/142) are gone, nothing else moved.
-megolm	ReleaseFast	skey	1	23	0ff715052883dcef	a22db1b8b5220a74
-megolm	ReleaseFast	pickle	1	26	0ff715052883dcef	f06f4b1b938d2036
+# Zig 0.17.0 (2026-10-18): skey 23 -> 25, BENIGN (public input). +2 = std
+# `Edwards25519.fromBytes`'s new RFC 8032 §5.1.3 refusal (`x == 0` with the sign bit set,
+# edwards25519.zig:46) inside `Ed25519.Signature.verify`'s `Verifier.init`, over the session key's
+# Ed25519 PUBLIC key -- tainted only because the harness derives it from the tainted signing key.
+# Same std change as ecvrf verify (CTFIX). One mulDoubleBasePublic context moved into its `add`
+# frame (inlining), net 0. megolm SPEC.md CT note.
+megolm	ReleaseFast	skey	1	25	0dc084197166909f	a22db1b8b5220a74
+megolm	ReleaseFast	pickle	1	26	0dc084197166909f	f06f4b1b938d2036
 # mls (2026-10-10, suite 0x0001) — ks: deriveEpoch with init/commit/PSK
 # secrets tainted; tree: every node secret, ratchet base, Ratchet and Window
 # under a tainted encryption secret; priv: protectPrivate with the content
@@ -1338,9 +1402,9 @@ megolm	ReleaseFast	pickle	1	26	0ff715052883dcef	f06f4b1b938d2036
 # ks and tree: 0. priv 4 = std Ed25519 signing internals 2 (sign:376,
 # pcMul16 rejectIdentity) + the AES-GCM tag-verify outcome of the two
 # decryptions. TreeKEM/HPKE are the hpke module's rows.
-mls	ReleaseFast	ks	1	0	d34f115335c14c00	cbdae823f31fa99e
-mls	ReleaseFast	tree	1	0	d34f115335c14c00	22ea84b82599122e
-mls	ReleaseFast	priv	1	4	d34f115335c14c00	616cb338b933af50
+mls	ReleaseFast	ks	1	0	77652bdc0c367ab9	cbdae823f31fa99e
+mls	ReleaseFast	tree	1	0	77652bdc0c367ab9	22ea84b82599122e
+mls	ReleaseFast	priv	1	4	77652bdc0c367ab9	616cb338b933af50
 # otp (2026-10-10) — code: the shared secret through hotp/totp/hotpFmt/
 # totpVerify for SHA-1/256/512. FIX: the RFC 4226 dynamic truncation read
 # mac[offset..][0..4] with offset = the MAC's low nibble, a load address
@@ -1355,20 +1419,20 @@ otp	ReleaseFast	uri	1	0	1288f82d8f75df11	36cedfe2472c9cba
 # (192 via the aes192 module since 2026-10-10), wrap, unwrap, tampered unwrap.
 # 6 = the integrity verdict after the constant-time IV compare, twice per KEK
 # size.
-aeskw	ReleaseFast	wrap	1	6	a64afcf85099d452	a613db024e13b3d3
+aeskw	ReleaseFast	wrap	1	6	3ca217354ff3bdb1	a613db024e13b3d3
 # aeadframe (2026-10-10) — chacha / aes: channel keys + plaintext tainted,
 # seal x3, rekeyInto, seal, open x4 + a tampered record. 5 each = the AEAD
 # tag-verify outcome of the opens (4 contexts) + rekey's NonceSpaceReuse
 # verdict on its constant-time same-key compare (channel.zig:210).
-aeadframe	ReleaseFast	chacha	1	5	1b2c360d10f83e40	9e2cdfce46f95d92
-aeadframe	ReleaseFast	aes	1	5	1b2c360d10f83e40	9e2cdfce46f95d92
+aeadframe	ReleaseFast	chacha	1	5	0c3175f8e1d4fc96	9e2cdfce46f95d92
+aeadframe	ReleaseFast	aes	1	5	0c3175f8e1d4fc96	9e2cdfce46f95d92
 # tenantkex (2026-10-10) — ik: Noise_IK both PEs, static private keys and
 # every ephemeral seed tainted. 9, none a branch of tenantkex's on a key:
 # 6 x std X25519 identity-point check (2 ephemeral keygens, 4 DH) + 2 x the
 # AEAD tag-verify outcome (via noise -> chachapoly) + 1 = the verdict on
 # the constant-time compare of the decrypted initiator static against the
 # provisioned one (root.zig:359).
-tenantkex	ReleaseFast	ik	1	9	23b4dcc4cfb1cd72	85fb9350a2be9ee1
+tenantkex	ReleaseFast	ik	1	9	02afd7b5d3d0602e	85fb9350a2be9ee1
 # ctap2 (2026-10-10) — pin: an 8-byte PIN + the ECDH shared secret tainted
 # through validateNewPin, padPin, pinHash, SharedSecret.encrypt/authenticate
 # (protocols One and Two); token: the shared secret through decryptToken +
@@ -1377,8 +1441,8 @@ tenantkex	ReleaseFast	ik	1	9	23b4dcc4cfb1cd72	85fb9350a2be9ee1
 # bytes (unicode.zig:209, ASCII fast path then a decode per sequence): pin
 # 1 -> 0 with the mask-only utf8CountCt (one verdict; the harness marks that
 # returned verdict defined before its own `try`).
-ctap2	ReleaseFast	pin	1	0	2023f16e0a17362b	01e08eb2902d2802
-ctap2	ReleaseFast	token	1	0	2023f16e0a17362b	e927dca40cedb432
+ctap2	ReleaseFast	pin	1	0	3b4d91780e47edc5	01e08eb2902d2802
+ctap2	ReleaseFast	token	1	0	3b4d91780e47edc5	e927dca40cedb432
 # base32 (2026-10-10) — encode: a tainted 20-byte secret (+ 1..4-byte tails)
 # through encode, std/hex alphabets, padded/unpadded, upper/lower case: 0.
 # decode: the tainted encoded text through decode (padding required/optional,
@@ -1386,8 +1450,14 @@ ctap2	ReleaseFast	token	1	0	2023f16e0a17362b	e927dca40cedb432
 # test (root.zig:258, x3; for canonical text the '=' positions are fixed by
 # the public length, so the outcome carries nothing) + the validity verdict
 # taken once at the end (root.zig:287, x2).
-base32	ReleaseFast	encode	1	0	e94632916a01c5b6	123eeef97ba0d81b
-base32	ReleaseFast	decode	1	5	e94632916a01c5b6	4b6a48f852c57125
+base32	ReleaseFast	encode	1	0	42c9bed22bd0d392	123eeef97ba0d81b
+# Zig 0.17.0 (2026-10-18): decode 5 -> 8 in-file, no new line and no new class. The three new
+# contexts are the same `c == '='` test at root.zig:261 (once per decode call, x3), now at a SECOND
+# address: LLVM 22 emits the loop twice (a copy with the skip_whitespace `bt` test and one without),
+# each with its own `cmp $0x3d,%edi` / `je` (objdump 0x1076333 and 0x10764d3). Same per-character
+# padding test the 5 already counted, whose outcome the public length fixes for canonical text;
+# the validity verdict (root.zig:290, x2) unchanged. ~/CML/zig-017/report-CTFIX2.md finding 1.
+base32	ReleaseFast	decode	1	8	42c9bed22bd0d392	4b6a48f852c57125
 # voprf (2026-10-10, ristretto255-SHA512) — server: skS + proof nonce through
 # blindEvaluate/Verifiable/Poprf, evaluate, evaluatePoprf; client: the
 # private input + blinds through blind/finalize/finalizeVerifiable/
@@ -1400,27 +1470,27 @@ base32	ReleaseFast	decode	1	5	e94632916a01c5b6	4b6a48f852c57125
 # the t == 0 verdict 2; client 8 = hashToGroup rejectIdentity 2 + the blind
 # canonical-scalar verdict 3 + the blind == 0 verdict 3; keygen 3 = the
 # constant-time skS == 0 verdict per mode.
-voprf	ReleaseFast	server	1	5	df42adce86abaefb	985a5bcd0456a35f
-voprf	ReleaseFast	client	1	8	df42adce86abaefb	82e99d9133134c5f
-voprf	ReleaseFast	keygen	1	3	df42adce86abaefb	f2504d3c494735f2
+voprf	ReleaseFast	server	1	5	ca4f2c5f28dea4fd	985a5bcd0456a35f
+voprf	ReleaseFast	client	1	8	ca4f2c5f28dea4fd	82e99d9133134c5f
+voprf	ReleaseFast	keygen	1	3	ca4f2c5f28dea4fd	f2504d3c494735f2
 # smtp (2026-10-10) — auth: the password through plainResponse/loginResponse
 # at three tail lengths. FIX: std.base64 indexed its alphabet by the secret
 # and checkCredential branched per byte: 312 -> 6. The 6 = the one
 # NUL/CR/LF verdict per call (auth.zig:62).
-smtp	ReleaseFast	auth	1	6	dda2db4387c330e4	58737f369d111669
+smtp	ReleaseFast	auth	1	6	968602f2e5458e1a	58737f369d111669
 # mcp-http (2026-10-10) — sid: the 16 CSPRNG bytes of an Mcp-Session-Id
 # through sidhex.encode (what Sessions.create runs). FIX: it used std.fmt
 # "{x}", a digit table indexed by the secret nibble. 0.
-mcp-http	ReleaseFast	sid	1	0	39244be613cb9fbb	693d310c7437c6ed
+mcp-http	ReleaseFast	sid	1	0	2b96736341db7cbf	693d310c7437c6ed
 # dnp3 (2026-10-10) — mac: SA session key through mac.compute/verify (all
 # HMAC truncations + AES-GMAC) and computeReplyMac/verifyReplyMac: 0.
 # keys: update + session keys through wrapSessionKeys/unwrapSessionKeys
 # (16/32-byte keys) + tampered unwrap: 2 = aeskw's integrity verdict.
-dnp3	ReleaseFast	mac	1	0	3e76f94ec5a2e0cb	0dcd2c9e71d8d02f
-dnp3	ReleaseFast	keys	1	2	3e76f94ec5a2e0cb	d2337903af778cbe
+dnp3	ReleaseFast	mac	1	0	919a51600b2d612d	0dcd2c9e71d8d02f
+dnp3	ReleaseFast	keys	1	2	919a51600b2d612d	d2337903af778cbe
 # iec62351 (2026-10-10) — mac: GOOSE/SV MAC key through computeMac/verifyMac
 # for HMAC-SHA256-80/128/256 and AES-GMAC-64/128 (AES-128/256): 0.
-iec62351	ReleaseFast	mac	1	0	baa343dce2c14435	760ede68c6c5b472
+iec62351	ReleaseFast	mac	1	0	3494d8cce7afc3ab	760ede68c6c5b472
 # opcua (2026-10-10, Basic256Sha256) — kdf: both channel nonces through
 # deriveKeys: 0. chunk: channel keys + body through symmetricSignAndEncrypt/
 # symmetricDecryptAndVerify (Sign, SignAndEncrypt, wrong-direction reject).
@@ -1428,25 +1498,25 @@ iec62351	ReleaseFast	mac	1	0	baa343dce2c14435	760ede68c6c5b472
 # what follows it on the AUTHENTICATED plaintext: the padding-byte checks
 # (834-840) and the dupe/alloc/free of the unpadded body (its length). The
 # padding is checked only after the MAC, so it is no padding oracle.
-opcua	ReleaseFast	kdf	1	0	554dc002dc1fc260	29be2a7621f75ceb
-opcua	ReleaseFast	chunk	1	14	554dc002dc1fc260	17e08703a66ffe0f
+opcua	ReleaseFast	kdf	1	0	575a2fdb5db27dc4	29be2a7621f75ceb
+opcua	ReleaseFast	chunk	1	14	575a2fdb5db27dc4	17e08703a66ffe0f
 # sha2 (2026-10-10) — hash: the message tainted through hash/update/peek for
 # SHA-224/256/384/512 at 0..1000 bytes; hmac: std Hmac over sha2.Sha256/512
 # with key + message tainted. Both 0.
-sha2	ReleaseFast	hash	1	0	425dcbeb1f99a767	5159f9e4e7e6085d
-sha2	ReleaseFast	hmac	1	0	425dcbeb1f99a767	f0186875cfa058e3
+sha2	ReleaseFast	hash	1	0	80f8cbae14048436	5159f9e4e7e6085d
+sha2	ReleaseFast	hmac	1	0	80f8cbae14048436	f0186875cfa058e3
 # xmss (2026-10-10) — sign: keyGen + 5 signs at h=4 with SK_SEED/SK_PRF
 # tainted. 2 = the WOTS chain length loop (root.zig:284): its count is a
 # base-w digit of H_msg(r, root, idx, M), and r = PRF(SK_PRF, idx) is
 # tainted though it is PUBLISHED in the signature. An artefact of tainting
 # SK_PRF, not a leak.
-xmss	ReleaseFast	sign	1	2	eef28f7262383e05	eb0cb3d6777ae4c6
+xmss	ReleaseFast	sign	1	2	b7dac1e9585b8c2c	eb0cb3d6777ae4c6
 # lms (2026-10-10) — lms: H5/W4 keygen + 2 signs; hss: 2-level H5/W4 keygen
 # + 2 signs; seed tainted. lms 4 / hss 6 = the LM-OTS chain loop (core.zig:210)
 # whose count is a digit of Q = H(I||q||D_MESG||C||msg); C is derived from
 # the seed but published in the signature. Same artefact as xmss.
-lms	ReleaseFast	lms	1	4	b94156931571380a	570900fe0d49b5a9
-lms	ReleaseFast	hss	1	6	b94156931571380a	43dd64bf2e77e52a
+lms	ReleaseFast	lms	1	4	beb645660d49985c	570900fe0d49b5a9
+lms	ReleaseFast	hss	1	6	beb645660d49985c	43dd64bf2e77e52a
 # timelock_envelope (2026-10-10) — kdf: s_time + s_pq through deriveKeys and
 # deriveStreamKey: 0. env: Envelope128 seal (randomness + plaintext tainted)
 # and open (HQC dk tainted). 8, none in this module's own code: the AEAD
@@ -1454,18 +1524,18 @@ lms	ReleaseFast	hss	1	6	b94156931571380a	43dd64bf2e77e52a
 # tlock.encrypt (h3 scalar reduction, g2 toAffine inversion and compressed
 # encoding of U = r*G2, which is the PUBLIC ciphertext half) 5, HQC's
 # dkParse fixed-weight rejection sampling on the decapsulation key 2.
-timelock_envelope	ReleaseFast	kdf	1	0	2e9264668ba4b00c	1dd423b6c587c4a7
-timelock_envelope	ReleaseFast	env	1	8	2e9264668ba4b00c	eb40a7f3ed6eaa0a
+timelock_envelope	ReleaseFast	kdf	1	0	58d6d84ce8471213	1dd423b6c587c4a7
+timelock_envelope	ReleaseFast	env	1	8	58d6d84ce8471213	eb40a7f3ed6eaa0a
 # snmp (2026-10-10) — kdf: password through passwordToUserKey + localizeKey
 # (MD5, SHA-1); auth: localized key through computeDigestInto, all six
 # protocols; aes: AES-128-CFB privacy round trip. All 0. des: DES-CBC
 # privacy round trip, OPEN FINDING: des.zig is table-driven (S-box and
 # permutation lookups indexed by key- and data-dependent values) -> 256.
 # Not fixed: SNMPv3 DES is legacy; replacing it is the owner's decision.
-snmp	ReleaseFast	kdf	1	0	89a9cf04a32dadad	b7a78ad081fdb5eb
-snmp	ReleaseFast	auth	1	0	89a9cf04a32dadad	42cc3493cbe134d7
-snmp	ReleaseFast	aes	1	0	69eb3b1a572eceba	aeff07ae5b6a7083
-snmp	ReleaseFast	des	1	256	c58a69cb557ea3a6	f7e7b8e6152d7073
+snmp	ReleaseFast	kdf	1	0	6c8a62e4e7a7070a	b7a78ad081fdb5eb
+snmp	ReleaseFast	auth	1	0	6c8a62e4e7a7070a	42cc3493cbe134d7
+snmp	ReleaseFast	aes	1	0	e28290dd21cc2804	aeff07ae5b6a7083
+snmp	ReleaseFast	des	1	256	74cdcb4742558a04	f7e7b8e6152d7073
 # aes192 (2026-10-10) — enc / dec: key + plaintext (enc) or ciphertext (dec)
 # tainted through initEnc/initEncInto/initDec/initDecInto/initFromEnc, the
 # one-block, wide and xor paths and std's modes.ctr. Pinned on the AES-NI
@@ -1474,8 +1544,8 @@ snmp	ReleaseFast	des	1	256	c58a69cb557ea3a6	f7e7b8e6152d7073
 # secret-indexed LOAD in std's cache-line-masked sbox/table lookups
 # (soft.zig:127-134, 838-840, 878-880), no branch — std's own Aes128/Aes256
 # posture there; see modules/aes192/SPEC.md.
-aes192	ReleaseFast	enc	1	0	8a27e95d551dc294	2b73cb024e51118c
-aes192	ReleaseFast	dec	1	0	8a27e95d551dc294	68602ef849690825
+aes192	ReleaseFast	enc	1	0	3fc0be6866777f1a	2b73cb024e51118c
+aes192	ReleaseFast	dec	1	0	3fc0be6866777f1a	68602ef849690825
 # p521 (2026-10-10) — NIST P-521, new module. mul / keygen / sign / ecdh: the
 # secret (scalar, d, seed, ECDH secret) tainted end to end: 0 in-file on all
 # four. The branches the API reveals (range and identity verdicts, r = 0 /
@@ -1490,11 +1560,11 @@ aes192	ReleaseFast	dec	1	0	8a27e95d551dc294	68602ef849690825
 # limbs and the product now comes back as (X·Z : Y : Z³) of the Jacobian
 # point — the same point (tests compare SEC1 bytes against the old RCB
 # ladder); `ecdh`/`keygen`/`sign` print affine bytes and did not move.
-p521	ReleaseFast	mul	1	0	355a2021c33889c0	7bcb91b4acac23e9
-p521	ReleaseFast	keygen	1	0	4a9d338feaf97809	b44de7eb8b02a855
-p521	ReleaseFast	sign	1	0	4a9d338feaf97809	b620c1c667ef0084
-p521	ReleaseFast	ecdh	1	0	355a2021c33889c0	a348bd01a2bccfcc
-p521	ReleaseFast	vartime	1	>=1	4b5f833bed1febc7	11557f4b46d4c2af
+p521	ReleaseFast	mul	1	0	a84441a8ca66dc90	7bcb91b4acac23e9
+p521	ReleaseFast	keygen	1	0	761f8d4528a6f6f9	b44de7eb8b02a855
+p521	ReleaseFast	sign	1	0	761f8d4528a6f6f9	b620c1c667ef0084
+p521	ReleaseFast	ecdh	1	0	a84441a8ca66dc90	a348bd01a2bccfcc
+p521	ReleaseFast	vartime	1	>=1	681f6d30dc32257a	11557f4b46d4c2af
 # p384 (2026-10-13) — NIST P-384, new module (p521's algorithms over a Montgomery
 # field with an amd64 MULX/ADX core, fast_core.zig — CPU skylake has ADX, so the
 # asm path is the one measured). mul / keygen / sign / ecdh: secret tainted end to
@@ -1504,11 +1574,11 @@ p521	ReleaseFast	vartime	1	>=1	4b5f833bed1febc7	11557f4b46d4c2af
 # it — the comb now uses `addMixedComplete` from a valid default entry
 # (tlsclient's P-384 comb had the same finding on std's addMixed, 2026-10-11).
 # `vartime` is the POSITIVE CONTROL (11 in-file: wNAF and Jacobian branches).
-p384	ReleaseFast	mul	1	0	c7653832a212e384	c6ed226b169947b1
-p384	ReleaseFast	keygen	1	0	9dc527b41c0ebdb0	c28d014cde15df1e
-p384	ReleaseFast	sign	1	0	9dc527b41c0ebdb0	d03df64890394e70
-p384	ReleaseFast	ecdh	1	0	c7653832a212e384	cbf100ff8ddb053f
-p384	ReleaseFast	vartime	1	>=1	5b113f602cb88152	38cf29c815d8f1f4
+p384	ReleaseFast	mul	1	0	0b0bb73d6e052372	c6ed226b169947b1
+p384	ReleaseFast	keygen	1	0	7677e59235f4ea8e	c28d014cde15df1e
+p384	ReleaseFast	sign	1	0	7677e59235f4ea8e	d03df64890394e70
+p384	ReleaseFast	ecdh	1	0	0b0bb73d6e052372	cbf100ff8ddb053f
+p384	ReleaseFast	vartime	1	>=1	8182168cc51eb45a	38cf29c815d8f1f4
 # tlsresume (2026-10-13) — the STEK, the resumption secret / PSK / binder key and the
 # 0-RTT key schedule through the module's public API; SHA-256 and SHA-384 suites.
 # stek: STEK + session state tainted through seal, open, tampered open. 2 = the
@@ -1521,9 +1591,9 @@ p384	ReleaseFast	vartime	1	>=1	5b113f602cb88152	38cf29c815d8f1f4
 # on a tainted PSK: 0. select.selectPsk is deliberately not a row: tainting the
 # STEK taints the nonce length / issue time inside the unsealed plaintext and
 # the row would pin that artefact (47 contexts measured; see the harness doc).
-tlsresume	ReleaseFast	stek	1	2	0cb282c45fba86a7	d08464d6d9f54d25
-tlsresume	ReleaseFast	psk	1	0	3df562eba5e33200	eacdeeff2d24e2c4
-tlsresume	ReleaseFast	early	1	0	958e96d1ea73a044	042b8c43588c7881
+tlsresume	ReleaseFast	stek	1	2	fba650a8ca20f3db	d08464d6d9f54d25
+tlsresume	ReleaseFast	psk	1	0	d6669b6ec28b5079	eacdeeff2d24e2c4
+tlsresume	ReleaseFast	early	1	0	8d3469578904a641	042b8c43588c7881
 # acme (2026-10-13) — the P-256 account / certificate private key (only the scalar
 # tainted; public key, headers, payloads, names defined). No EAB/HMAC in the module.
 # jws 57 = 13 + 44. 13 = the delegated p256 signer on the tainted scalar (Scalar
@@ -1580,10 +1650,10 @@ tlsresume	ReleaseFast	early	1	0	958e96d1ea73a044	042b8c43588c7881
 # context). Writer side 0. pkcs8 17 (2 of them the findScalarPos above, one per read) = PKCS#8 round trips of the P-256 key (2: keyFromDer's [0]
 # test on the inner ECPrivateKey, p256 comb) and of the P-384 key (13: the pem384 classes); the
 # writer side 0. Read in the --stacks dump of the day; nothing in jws/burn, nothing new in kind.
-acme	ReleaseFast	pem	1	18	ae9d23f8b5893e87	e3f3e71bec825dd7
-acme	ReleaseFast	pem384	1	18	ae9d23f8b5893e87	5eb84a3bc4959381
-acme	ReleaseFast	pkcs8	1	17	ae9d23f8b5893e87	b26448f1c577ca4e
-acme	ReleaseFast	anykey	1	5	ae9d23f8b5893e87	7dff1d27c302259e
+acme	ReleaseFast	pem	1	18	283acfe12650a85a	e3f3e71bec825dd7
+acme	ReleaseFast	pem384	1	18	283acfe12650a85a	5eb84a3bc4959381
+acme	ReleaseFast	pkcs8	1	17	283acfe12650a85a	b26448f1c577ca4e
+acme	ReleaseFast	anykey	1	5	283acfe12650a85a	7dff1d27c302259e
 # jwt (2026-10-13) — every secret the module holds: HMAC secrets (HS256/384/512,
 # sign and verify), ES256 (p256 module), ES384 (std), ES512 (p521 module), EdDSA
 # (std Ed25519; only the 32-byte seed is tainted) and RSA (RS256 + PS256 through
@@ -1594,7 +1664,7 @@ acme	ReleaseFast	anykey	1	5	ae9d23f8b5893e87	7dff1d27c302259e
 # (timing_safe.eql in verifyHmac) yields a tainted verdict that reaches only the
 # harness printer (67 witness); no branch or load of root.zig / encode.zig takes
 # the secret. Needs no declassification: the verdict is public by design.
-jwt	ReleaseFast	hmac	1	0	e211169a04e8b37c	82c3cf6208c0b9d8
+jwt	ReleaseFast	hmac	1	0	7e264929bbe2142f	82c3cf6208c0b9d8
 # ec 10 = ES256 9 + EdDSA 1. Every ES context carries encode.zig:274
 # (signEc) in its stack, so the pattern attributes the DELEGATED signer to jwt,
 # exactly as acme's p256 contexts; none is a branch in jwt's own code and p256 /
@@ -1611,7 +1681,7 @@ jwt	ReleaseFast	hmac	1	0	e211169a04e8b37c	82c3cf6208c0b9d8
 #   Left as is (std's basePoint.mul has the same refusal); FINDING for the
 #   coordinator, not fixed here.
 # 2026-10-13: p256 `rejectIdentity` launders its verdict (one `je`, was two) -> every row whose count included the p256 comb/windowed identity check drops by 1 (--stacks diff vs the base: the second jump of `rejectIdentity` gone, no other context moved).
-jwt	ReleaseFast	ec	1	9	e211169a04e8b37c	6c14c21a4454880c
+jwt	ReleaseFast	ec	1	9	7e264929bbe2142f	6c14c21a4454880c
 # rsa 2 = RS256 1 + PS256 1: rsa/src/root.zig:954 privateOpCrtPtr, the F3
 # Bellcore fault-check verdict `if (!eql(m^e, c)) return error.FaultDetected`
 # (the rsa module's own `crt` row, 2, documents the same verdict). Delegated to
@@ -1621,7 +1691,7 @@ jwt	ReleaseFast	ec	1	9	e211169a04e8b37c	6c14c21a4454880c
 # blinding verdict (root.zig:906 makeBlinding): since CRT-domain blinding the
 # r⁻¹ checks run mod the secret p, q, folded into ONE branch-once verdict that
 # is false only for r ≡ 0 mod p or q (~2^-1023) and only causes a redraw.
-jwt	ReleaseFast	rsa	1	3	e211169a04e8b37c	f2bee89c3c58cdaf
+jwt	ReleaseFast	rsa	1	3	7e264929bbe2142f	f2bee89c3c58cdaf
 # aaa-gate (2026-10-17) — the secrets are the gate's stored SHA-256 fingerprints
 # (tokens, API keys, Basic user:password), tainted in place; the presented value
 # is the client's own and the verdict is public. Each target verifies a good and
@@ -1630,6 +1700,6 @@ jwt	ReleaseFast	rsa	1	3	e211169a04e8b37c	f2bee89c3c58cdaf
 # (`containsFp`, timing_safe.eql folded without early exit) adds none. No
 # witness: the verdict leaves the module as a constant enum chosen by that one
 # branch, so total = in-file.
-aaa-gate	ReleaseFast	bearer	2	2	0562ac89385bbaec	b0e8295638441324
-aaa-gate	ReleaseFast	api_key	2	2	0562ac89385bbaec	964c6a19647f3cd3
-aaa-gate	ReleaseFast	basic	2	2	0562ac89385bbaec	3e1202ab86ba6261
+aaa-gate	ReleaseFast	bearer	2	2	fb91dd0c2720e2b7	b0e8295638441324
+aaa-gate	ReleaseFast	api_key	2	2	fb91dd0c2720e2b7	964c6a19647f3cd3
+aaa-gate	ReleaseFast	basic	2	2	fb91dd0c2720e2b7	3e1202ab86ba6261

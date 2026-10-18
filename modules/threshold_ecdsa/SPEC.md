@@ -789,7 +789,15 @@ std's constant-time `Secp256k1.mul`, `paillier`'s and `montint`'s
 constant-time modexp. Verification uses `mulPublic` over public values only.
 Measured by `ctgrind_harness.zig` (targets `share`, `nonce` — now every
 48-byte secret-scalar draw of every party — and `betaprime`), see
-`scripts/checks/ctgrind-expected.tsv`.
+`scripts/checks/ctgrind-expected.tsv`. On Zig 0.17.0 (2026-10-18) the three
+rows read 506 / 870 / 559 (0.16: 275 / 515 / 317): std's `mulPublic` became
+a generic n-base wNAF (`mulMultiPublic`) with many more variable-time branch
+sites, all under the verifiers (`verifySt`/`verifyPedersen`/`verifySchnorr`)
+and `combine`, over values the single-process harness derives from the
+tainted secrets but the protocol publishes; every other class went down.
+0.17.0's std ff pow still branches on a secret exponent (`cmov` per window
+entry); no production path here passes a secret exponent to it (`powSecret`
+on montint; the ff `pow` with `λ` is test-only).
 
 **Audit 2026-10-02.** Independent review (Sonnet, from the paper text) of
 `presign.zig`, `ecproofs.zig`, `PdlProof` and the driver: no HIGH; one MED —

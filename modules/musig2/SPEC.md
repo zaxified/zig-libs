@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-10-08 · mutation 2026-10-08 (39/41, 2 eq) · src fa0e93d42519a5dd
 
-**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, MUSIG2_FUZZ; psig at 1/4, session at 1/20 of it) · ct 2026-09-09 (ctgrind)
+**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, MUSIG2_FUZZ; psig at 1/4, session at 1/20 of it) · ct 2026-09-09 (ctgrind; `sign` <=103 in-file since Zig 0.17.0, 2026-10-18: +2 = k256 `Fe.fromBytes`'s canonicity test inside `cpoint`'s `lift`, no longer folded into the identical check of `XOnlyPublicKey.fromBytes`, over the signer's own public key and public nonce that partial-signature self-verification parses -- public values)
 
 **Performance:** not measured
 

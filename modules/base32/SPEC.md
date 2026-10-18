@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-10-03 · mutation 2026-10-03 (38/40, 2 eq) · src ?
 
-**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, BASE32_FUZZ) · ct 2026-10-10 (ctgrind: secret through encode, both alphabets/pad/case, 0 in-file; encoded secret through decode 5 = the per-char `=` test, whose outcome the public length fixes, + the final validity verdict)
+**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, BASE32_FUZZ) · ct 2026-10-10 (ctgrind: secret through encode, both alphabets/pad/case, 0 in-file; encoded secret through decode 5 = the per-char `=` test, whose outcome the public length fixes, + the final validity verdict; 8 on Zig 0.17.0, 2026-10-18: LLVM 22 emits the decode loop twice, so the same `=` test has a second instruction address per call)
 **Performance:** not measured
 
 **Known defects:** none recorded

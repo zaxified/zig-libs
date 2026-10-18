@@ -137,14 +137,14 @@ var r1cs_fixture: ?circom.R1cs = null;
 fn fixtures() !void {
     if (witness != null) return;
     const pa = std.heap.page_allocator; // global-alloc-ok: process-lifetime fixtures of a test-only harness
-    witness = try circom.parseWitness(pa, files[@intFromEnum(Kind.wtns)]);
-    r1cs_fixture = try circom.parseR1cs(pa, files[@intFromEnum(Kind.r1cs)]);
+    witness = try circom.parseWitness(pa, files[@backingInt(Kind.wtns)]);
+    r1cs_fixture = try circom.parseR1cs(pa, files[@backingInt(Kind.r1cs)]);
 }
 
 fn readersHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     try fixtures();
-    const kind: Kind = @enumFromInt(src.index(files.len));
-    const base = files[@intFromEnum(kind)];
+    const kind: Kind = @fromBackingInt(@intCast(src.index(files.len)));
+    const base = files[@backingInt(kind)];
     const in = damage(S, src, base);
     const intact = std.mem.eql(u8, in, base);
 
@@ -173,7 +173,7 @@ fn readersHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!vo
                 };
                 fuzz_driver.hit("zkey_proved");
             }
-            const p = try ptau_mod.Ptau.parse(files[@intFromEnum(Kind.ptau)]);
+            const p = try ptau_mod.Ptau.parse(files[@backingInt(Kind.ptau)]);
             const v = try phase2.verify(gpa, std.testing.io, r1cs_fixture.?, p, z);
             if (intact and v != .ok) return error.IntactNotVerified;
             if (v == .ok) fuzz_driver.hit("zkey_verified") else fuzz_driver.hit("zkey_rejected");

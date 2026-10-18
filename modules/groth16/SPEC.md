@@ -277,7 +277,7 @@ for byte (`snarkjs_files_test.zig`), measured by `src/ctgrind_harness.zig`
 with the private witness and `r`/`s` tainted — 6 in-file contexts, all
 `toAffine` on the three published proof points, none in the MSM, the NTTs or
 the A·w/B·w accumulation; the Pippenger row of the same harness (the positive
-control) reads 26. It costs ~21× the default: 34 s against 1.6 s at 10 000
+control) reads 26 (54 on Zig 0.17.0: LLVM 22 unrolls the per-bit branch of the small-MSM path, same branch at more addresses). It costs ~21× the default: 34 s against 1.6 s at 10 000
 constraints, one core, ReleaseFast (`tools/snarkjs/g16 prove-ct`; snarkjs
 verified that proof). `zkprove.prove` stays Pippenger, the default every
 other prover has. The toy `prove` uses the constant-time naive MSM.

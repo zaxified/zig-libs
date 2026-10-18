@@ -255,7 +255,7 @@ counting rule were added). Three bucket columns, not one, and they sum to
 | `sign` | 32-byte secret key | yes | **yes** | 13 | **11** | 2 | 0 | 99 |
 | `sign` | — | yes | no | 0 | 0 | 0 | 0 | 0 *(control)* |
 | `sign` | — | **no** | yes | 0 | 0 | 0 | 0 | 0 *(trap)* |
-| `ecdsa` | 32-byte private key | yes | **yes** | 16 | **11** | 5 | 0 | 99 *(2026-09-16, `r = x(R) mod n`; 15/10 before, see below)* |
+| `ecdsa` | 32-byte private key | yes | **yes** | 15 | **10** | 5 | 0 | 99 *(Zig 0.17.0, 2026-10-18: one of `signInner`'s contexts gone in the LLVM 22 build; 16/11 on 0.16 since 2026-09-16, `r = x(R) mod n`; 15/10 before, see below)* |
 | `ecdsa` | — | yes | no | 0 | 0 | 0 | 0 | 0 *(control)* |
 | `ecdsa` | — | **no** | yes | 0 | 0 | 0 | 0 | 0 *(trap)* |
 
