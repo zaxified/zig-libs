@@ -809,3 +809,25 @@ test "driver: 3000 PRNG scripts through every counter parser (deterministic)" {
     try testing.expect(rows > 10_000);
     try testing.expect(mutated > 10_000);
 }
+
+test "CpuTimes: steal counts in total; unchanged busy time over elapsed idle is 0, not null" {
+    try testing.expectEqual(@as(u64, 7), (CpuTimes{ .steal = 7 }).total());
+    const a: CpuTimes = .{ .user = 10, .idle = 100 };
+    const b: CpuTimes = .{ .user = 10, .idle = 150 };
+    try testing.expectEqual(@as(?f64, 0.0), a.busyFraction(b));
+}
+
+test "parseDiskstats: a 32-byte name is kept, 33 is not; a 16-counter row has no flush group" {
+    const gpa = testing.allocator;
+    const name32 = "n" ** 32;
+    const text = "8 0 " ++ name32 ++ " 1 2 3 4 5 6 7 8 9 10 11\n" ++
+        "8 1 " ++ name32 ++ "x 1 2 3 4 5 6 7 8 9 10 11\n" ++
+        "8 2 sdc 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16\n";
+    const ds = try parseDiskstats(gpa, text);
+    defer gpa.free(ds);
+    try testing.expectEqual(@as(usize, 2), ds.len);
+    try testing.expectEqualStrings(name32, ds[0].name());
+    try testing.expectEqualStrings("sdc", ds[1].name());
+    try testing.expect(ds[1].discard != null);
+    try testing.expect(ds[1].flush == null);
+}

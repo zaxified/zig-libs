@@ -423,7 +423,10 @@ test "corpus: every routes script reaches the parser, and the rows decoded are p
         var choice: fuzzsample.Choice = .{};
         const text = fuzzsample.build(script[0..n], &routes_samples, &buf, &choice);
         mutations += choice.mutations;
-        const entries = parseRoutes(testing.allocator, text) catch continue;
+        // The samples are little-endian captures: decode them as such, or a
+        // big-endian target (qemu-mips, 2026-10-18: 7 rows) rejects their
+        // masks as non-contiguous and the pin below means nothing there.
+        const entries = parseRoutesWithEndian(testing.allocator, text, .little) catch continue;
         defer testing.allocator.free(entries);
         rows += entries.len;
     }

@@ -328,6 +328,11 @@ test "readPidStat: this process, by .self and by pid" {
     if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
 
     const a = readPidStat(io, .self) orelse return error.SkipZigTest;
+    // Under qemu-user (the big-endian lane: qemu-mips) `/proc/self/stat` is
+    // qemu's own synthesis — pid, comm, ppid, num_threads, starttime and
+    // startstack, every other field 0 — not the kernel's; no real process has
+    // a zero `vsize`.
+    if (a.vsize == 0) return error.SkipZigTest;
     const my_pid: u32 = @intCast(std.os.linux.getpid());
     try testing.expectEqual(my_pid, a.pid);
     try testing.expect(a.vsize > 0);
@@ -343,4 +348,19 @@ test "readPidStat: this process, by .self and by pid" {
     try testing.expectEqual(a.starttime, b.starttime);
     // A pid that cannot exist (pid_max is below 2^22).
     try testing.expectEqual(@as(?PidStat, null), readPidStat(io, .{ .pid = 4_294_967_000 }));
+}
+
+test "PidStat.residentBytes: a negative rss reads as zero at any magnitude" {
+    var s = parsePidStat("1 (a) S 0").?;
+    s.rss = -1;
+    try testing.expectEqual(@as(u64, 0), s.residentBytes(4096));
+    s.rss = std.math.minInt(i64);
+    try testing.expectEqual(@as(u64, 0), s.residentBytes(4096));
+    s.rss = 3;
+    try testing.expectEqual(@as(u64, 3 * 16384), s.residentBytes(16384));
+}
+
+test "parsePidStat: a close-paren before the open-paren is no comm" {
+    try testing.expect(parsePidStat("12 ) (x S 1") == null);
+    try testing.expect(parsePidStat("12 )( S 1") == null);
 }

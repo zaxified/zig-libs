@@ -327,3 +327,13 @@ test "live: net/netstat and net/snmp for self, by pid, and system-wide agree" {
     defer gone.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 0), gone.entries.len);
 }
+
+test "parsePairs: an empty section name is no pair; ipExtOctets needs InOctets as well" {
+    const gpa = testing.allocator;
+    const empty = try parsePairs(gpa, ": a b\n: 1 2\n");
+    defer empty.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), empty.entries.len);
+    const only_out = try parsePairs(gpa, "IpExt: OutOctets\nIpExt: 5\n");
+    defer only_out.deinit(gpa);
+    try testing.expect(only_out.ipExtOctets() == null);
+}

@@ -300,3 +300,16 @@ test "live: readUnix sees a listener this process binds" {
     }
     try testing.expect(found);
 }
+
+test "parseUnix: tabs and CRLF separate columns; 0x20000 is not the listening bit" {
+    const gpa = testing.allocator;
+    const text = "Num       RefCount Protocol Flags    Type St Inode Path\r\n" ++
+        "0000000000000000:\t00000002\t00000000\t00020000\t0001\t01\t77\t/tmp/a b\r\n";
+    const es = try parseUnix(gpa, text);
+    defer gpa.free(es);
+    try testing.expectEqual(@as(usize, 1), es.len);
+    try testing.expectEqualStrings("/tmp/a b", es[0].path());
+    try testing.expectEqual(@as(u64, 77), es[0].inode);
+    try testing.expect(!es[0].isListening());
+    try testing.expect(!es[0].isAbstract());
+}

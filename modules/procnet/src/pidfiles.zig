@@ -814,11 +814,14 @@ test "live: readPidLimits / readPidIo / readPidStatus / cmdline / cgroup for sel
     try testing.expect(st.cpus_allowed_count >= 1);
     try testing.expect(!st.truncated);
     try testing.expect(st.name().len > 0);
-    // status VmRSS agrees with stat's rss * page size to within a few pages' churn.
+    // status VmRSS agrees with stat's rss * page size to within a few pages' churn
+    // (not under qemu-user, whose `/proc/self/stat` is synthetic: vsize and rss 0).
     const ps = procnet.readPidStat(io, .self).?;
-    const a = st.vm_rss;
-    const b = ps.residentBytesNow();
-    try testing.expect(@max(a, b) - @min(a, b) < 4 * 1024 * 1024);
+    if (ps.vsize != 0) {
+        const a = st.vm_rss;
+        const b = ps.residentBytesNow();
+        try testing.expect(@max(a, b) - @min(a, b) < 4 * 1024 * 1024);
+    }
 
     const cl = readPidCmdline(testing.allocator, io, .self) orelse return error.SkipZigTest;
     defer cl.deinit(testing.allocator);
@@ -866,4 +869,19 @@ test "countFds: tracks descriptors this process opens" {
     try testing.expect(manual == after or manual == after + 1);
 
     try testing.expectEqual(@as(?u64, null), countFds(io, .{ .pid = 4_294_967_000 }));
+}
+
+test "parseLimits: a label must end at a word boundary; soft and hard are told apart" {
+    const glued = parseLimits("Max open files5 6 7\n");
+    try testing.expect(glued.get(.open_files) == null);
+    try testing.expectEqual(@as(u32, 1), glued.skipped_rows);
+
+    const l = parseLimits("Limit Soft Limit Hard Limit Units\n" ++
+        "Max open files            1024                 4096                 files\n" ++
+        "Max address space         unlimited            8192                 bytes\n");
+    try testing.expectEqual(@as(?u64, 1024), l.maxOpenFiles());
+    try testing.expect(l.maxAddressSpace() == null);
+    try testing.expectEqual(@as(?u64, 8192), l.get(.address_space).?.hard);
+    try testing.expectEqual(@as(?u64, 4096), l.get(.open_files).?.hard);
+    try testing.expectEqual(@as(u32, 0), l.skipped_rows);
 }
