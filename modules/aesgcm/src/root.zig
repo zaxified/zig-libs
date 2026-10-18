@@ -1732,9 +1732,23 @@ test "backend picks AES-NI when the CPU has it" {
     }
     // A context is per key and per direction of a connection, so its size
     // is per-connection memory: round keys + H..H^8, or the AES schedule + H.
-    try testing.expect(@sizeOf(Aes128Gcm.Context) <= 320);
-    try testing.expect(@sizeOf(Aes192Gcm.Context) <= 352);
-    try testing.expect(@sizeOf(Aes256Gcm.Context) <= 384);
+    // That holds while std's key schedule is just the round keys (hardware
+    // AES, or x86 AES-NI). std's software AES on targets without it (s390x,
+    // mips, ...) keeps expanded tables in the schedule (Aes128 ~3 KiB,
+    // Aes256 ~4 KiB), which `Generic` embeds by design; the bound then
+    // tests std's size, not ours.
+    inline for (.{ .{ 128, Aes128Gcm, 320 }, .{ 192, Aes192Gcm, 352 }, .{ 256, Aes256Gcm, 384 } }) |t| {
+        const Aes = switch (t[0]) {
+            128 => crypto.core.aes.Aes128,
+            192 => aes192.Aes192,
+            else => crypto.core.aes.Aes256,
+        };
+        const Enc = @typeInfo(@TypeOf(Aes.initEnc)).@"fn".return_type.?;
+        const round_keys = 16 * (t[0] / 32 + 7);
+        if (@sizeOf(Enc) <= round_keys) {
+            try testing.expect(@sizeOf(t[1].Context) <= t[2]);
+        }
+    }
     // std's constants, so the type drops in where std's was.
     try testing.expectEqual(crypto.aead.aes_gcm.Aes256Gcm.key_length, Aes256Gcm.key_length);
     try testing.expectEqual(crypto.aead.aes_gcm.Aes128Gcm.nonce_length, Aes128Gcm.nonce_length);
