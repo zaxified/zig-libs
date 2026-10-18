@@ -356,11 +356,16 @@ fn loadBlocks(comptime W: usize, m: *const [16 * W]u8) [5]@Vector(W, u32) {
 inline fn columns8(m: *const [128]u8) [4]@Vector(8, u32) {
     const V = @Vector(8, u32);
     // y[p] = block 2p's words 0..3 | block 2p+1's words 0..3.
+    // Through `@Vector(32, u8)`: zig 0.17 lowers a byte-array -> u32-vector
+    // `@bitCast` to a byte-by-byte integer assembly (~140 instructions per
+    // 32 bytes); the u8-vector load plus a vector -> vector `@bitCast` is one
+    // `vmovdqu`, with the same little-endian-logical meaning on every target.
+    const B = @Vector(32, u8);
     const y: [4]V = .{
-        @bitCast(m[0..32].*),
-        @bitCast(m[32..64].*),
-        @bitCast(m[64..96].*),
-        @bitCast(m[96..128].*),
+        @bitCast(@as(B, m[0..32].*)),
+        @bitCast(@as(B, m[32..64].*)),
+        @bitCast(@as(B, m[64..96].*)),
+        @bitCast(@as(B, m[96..128].*)),
     };
     const lo32 = @Vector(8, i32){ 0, ~@as(i32, 0), 1, ~@as(i32, 1), 4, ~@as(i32, 4), 5, ~@as(i32, 5) };
     const hi32 = @Vector(8, i32){ 2, ~@as(i32, 2), 3, ~@as(i32, 3), 6, ~@as(i32, 6), 7, ~@as(i32, 7) };
@@ -409,7 +414,13 @@ fn laneBlock(comptime W: usize, comptime j: usize) usize {
 inline fn loadBlocks64(comptime W: usize, m: *const [16 * W]u8) [5]@Vector(W, u64) {
     const V64 = @Vector(W, u64);
     if (comptime !qwordLoad(W)) return widen(W, loadBlocks(W, m));
-    const q: @Vector(2 * W, u64) = @bitCast(m.*);
+    // Via `@Vector(16 * W, u8)`, not `@bitCast(m.*)`: zig 0.17 (LLVM 22)
+    // lowers a byte-array -> u64-vector `@bitCast` to a byte-at-a-time shift
+    // loop through a wide integer (2026-10-18: `update` 620K -> 8.98M Ir at
+    // 16 KiB). The u8-vector load is plain `vmovdqu`s and the vector -> vector
+    // `@bitCast` is free; both are little-endian-logical on every target, so
+    // the lanes are the same quadwords as before.
+    const q: @Vector(2 * W, u64) = @bitCast(@as(@Vector(16 * W, u8), m.*));
     // Quadword 2b is block b's low half, 2b+1 its high half; per pair of
     // 32-byte loads the unpack yields blocks 0 2 1 3.
     const lo_idx = comptime blk: {

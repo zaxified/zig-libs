@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — **Fix (big-endian):** ChaCha20 keystream byte-reversed on big-endian targets under Zig 0.17. `blockWords` still byte-swapped the word vector before the vector -> bytes `@bitCast`, which 0.17 defines as little-endian on every target, so the swap now double-swapped. Swap removed. s390x (qemu, ReleaseSafe) modtest 27/55 -> 49/55 (6 skipped), as on 0.16; little-endian targets unchanged.
+- **2026-10-18** — **Speed (Zig 0.17 regression):** zig 0.17 (LLVM 22) lowers a `@bitCast` between a byte array and a vector of wider lanes byte by byte through a wide integer; `loadBlocks64`'s `[16*W]u8 -> @Vector(2W, u64)` made `Poly1305` `update` 14.5x the instructions (seal 16 KiB 82757 -> 500614 instructions, ~5x OpenSSL's time). That load, `columns8`'s and the keystream stores now go through a `@Vector(n, u8)` and a vector -> vector `@bitCast` (same little-endian-logical meaning, same constant-time shape: plain loads/stores, no new branch or index). `scripts/count-insns` seal 16 KiB 82579.5 (-0.2 % vs the 0.16 baseline), 1 KiB 8059.1 (-2.2 %), 64 B 2044.0 (-15.6 %, std 0.17's short path; unchanged by this fix).
 - **2026-10-18** — Ported to Zig 0.17.0: `Fn.params` -> `param_types` (test); `strRepeat` branch quota scaled with length.
 - **2026-10-17** — Instruction-count baseline (`tools/count.tsv`) rewritten for the 2026-10-13 u64-lane Poly1305 (seal 64 B +5.2 %, 1 KiB +7.4 %, 16 KiB −9.3 % instructions). Tooling only.
 

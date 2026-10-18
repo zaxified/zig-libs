@@ -46,6 +46,11 @@ const linux = std.os.linux;
 // ── loopback plumbing this example needs, that the module itself has no
 //    reason to publish (probe never opens a listener — it only connects) ──
 
+/// 127.0.0.1 as `sockaddr.in.addr` (network order = memory order). Not
+/// `@bitCast([4]u8{...})`: zig 0.17 makes that little-endian-logical, which
+/// reverses the octets on big-endian.
+const loopback_addr = std.mem.bytesToValue(u32, &[4]u8{ 127, 0, 0, 1 });
+
 /// Bind+listen on `127.0.0.1:0` and report the kernel-assigned port. No
 /// `accept()` loop is needed: a completed TCP handshake (what makes a
 /// connect attempt classify `.up`) only needs the listening socket's own
@@ -56,7 +61,7 @@ fn openLoopbackListener() !struct { fd: i32, port: u16 } {
     const fd: i32 = @intCast(rc);
     errdefer _ = linux.close(fd);
 
-    var sa: linux.sockaddr.in = .{ .port = 0, .addr = @bitCast([4]u8{ 127, 0, 0, 1 }) };
+    var sa: linux.sockaddr.in = .{ .port = 0, .addr = loopback_addr };
     if (linux.errno(linux.bind(fd, @ptrCast(&sa), @sizeOf(linux.sockaddr.in))) != .SUCCESS)
         return error.BindFailed;
 
@@ -79,7 +84,7 @@ fn pickClosedPort() !u16 {
     const fd: i32 = @intCast(rc);
     defer _ = linux.close(fd);
 
-    var sa: linux.sockaddr.in = .{ .port = 0, .addr = @bitCast([4]u8{ 127, 0, 0, 1 }) };
+    var sa: linux.sockaddr.in = .{ .port = 0, .addr = loopback_addr };
     if (linux.errno(linux.bind(fd, @ptrCast(&sa), @sizeOf(linux.sockaddr.in))) != .SUCCESS)
         return error.BindFailed;
 

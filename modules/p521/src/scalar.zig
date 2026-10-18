@@ -354,7 +354,12 @@ test "scalar: differential against wide integer arithmetic" {
         var wb: CompressedScalar = undefined;
         std.mem.writeInt(u528, &wb, w, .big);
         try testing.expectEqual(@as(u1200, w) % NN, valueOf(Scalar.fromBytesReduce(wb, .big)));
-        try testing.expectEqual(@as(u1200, w) % NN, valueOf(Scalar.fromBytesReduce(@bitCast(std.mem.nativeToLittle(u528, w)), .little)));
+        // writeInt, not `@bitCast(nativeToLittle(w))`: zig 0.17's int -> array
+        // `@bitCast` is already little-endian on every target, so the swap
+        // reversed the bytes on big-endian.
+        var wl: CompressedScalar = undefined;
+        std.mem.writeInt(u528, &wl, w, .little);
+        try testing.expectEqual(@as(u1200, w) % NN, valueOf(Scalar.fromBytesReduce(wl, .little)));
     }
 }
 

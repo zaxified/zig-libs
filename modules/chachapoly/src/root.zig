@@ -342,8 +342,11 @@ inline fn chachaCore(comptime N: usize, comptime rounds: comptime_int, k: [8]u32
 }
 
 /// The transpose. Gather block `j`'s 16 words out of the word-major state into
-/// one `@Vector(16, u32)` in memory order, byte-swapped so that a `@bitCast` to
-/// `[64]u8` is the little-endian keystream block RFC 8439 specifies.
+/// one `@Vector(16, u32)` in block order. Zig 0.17 defines a vector -> byte
+/// array `@bitCast` as little-endian on every target (lane 0's low byte first),
+/// so the `@bitCast` to `[64]u8` is the little-endian keystream block RFC 8439
+/// specifies on both endiannesses; no byte swap (0.16's bitcast followed
+/// memory order and needed one on big-endian — keeping it double-swapped).
 ///
 /// Every consumer of the core goes through here, so there is exactly one place
 /// that knows the lane layout. LLVM recognises the lane-extract pattern and
@@ -352,8 +355,7 @@ inline fn chachaCore(comptime N: usize, comptime rounds: comptime_int, k: [8]u32
 inline fn blockWords(comptime N: usize, x: [16]@Vector(N, u32), comptime j: usize) @Vector(16, u32) {
     var w: @Vector(16, u32) = undefined;
     inline for (0..16) |i| w[i] = x[i][j];
-    // comptime branch on target endianness — no runtime cost, no secret input.
-    return if (native_endian == .little) w else @byteSwap(w);
+    return w;
 }
 
 /// The 8-lane transpose as register shuffles: for word group `g` (words
@@ -409,14 +411,17 @@ fn keystream(comptime N: usize, comptime rounds: comptime_int, ks: *[64 * N]u8, 
     const x = chachaCore(N, rounds, k, row3);
     if (N == 8 and fast_transpose) {
         const t = transpose8(x);
+        // Through a u8 vector: zig 0.17 lowers a vector -> byte-array
+        // `@bitCast` of another element type byte by byte; vector -> vector
+        // is free and has the same little-endian-logical meaning.
         inline for (0..8) |j| {
-            ks[64 * j ..][0..32].* = @bitCast(t[j][0]);
-            ks[64 * j + 32 ..][0..32].* = @bitCast(t[j][1]);
+            ks[64 * j ..][0..32].* = @as(@Vector(32, u8), @bitCast(t[j][0]));
+            ks[64 * j + 32 ..][0..32].* = @as(@Vector(32, u8), @bitCast(t[j][1]));
         }
         return;
     }
     inline for (0..N) |j| {
-        ks[64 * j ..][0..64].* = @bitCast(blockWords(N, x, j));
+        ks[64 * j ..][0..64].* = @as(@Vector(64, u8), @bitCast(blockWords(N, x, j)));
     }
 }
 
