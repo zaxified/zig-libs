@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — Ported to Zig 0.17.0. comptime `strRepeat` helper: larger `@setEvalBranchQuota` (0.17 counts more branches per iteration).
 - **2026-10-04** — ADDED: RFC 9535 JSONPath (survey 2026-09-30 gap) and paths as column keys.
   - Selectors: quoted names with RFC escapes, negative indices, slices (§2.3.4.2.2 algorithm),
     unions (`[0, 'a', 1:3]`), `..*` / `..[sel]`; filters over array elements AND object member

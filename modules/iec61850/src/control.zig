@@ -124,8 +124,8 @@ pub const CtlModel = enum(u8) {
     }
 
     pub fn parseScl(s: []const u8) Error!CtlModel {
-        inline for (@typeInfo(CtlModel).@"enum".fields) |f| {
-            const m: CtlModel = @fromBackingInt(@intCast(f.value));
+        inline for (@typeInfo(CtlModel).@"enum".field_names, @typeInfo(CtlModel).@"enum".field_values) |_, f_value| {
+            const m: CtlModel = @fromBackingInt(@intCast(f_value));
             if (std.mem.eql(u8, s, m.sclName())) return m;
         }
         // SCL files in the wild also carry the bare ordinal.

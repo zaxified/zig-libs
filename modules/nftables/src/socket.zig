@@ -873,7 +873,7 @@ fn sendUdp(addr: [4]u8) !void {
     defer _ = linux.close(fd);
     var sa: linux.sockaddr.in = .{
         .port = std.mem.nativeToBig(u16, 9),
-        .addr = @bitCast(addr),
+        .addr = std.mem.bytesToValue(u32, &addr),
     };
     const rc = linux.sendto(fd, "x", 1, 0, @ptrCast(&sa), @sizeOf(linux.sockaddr.in));
     if (linux.errno(rc) != .SUCCESS) return error.SendFailed;
@@ -1032,7 +1032,7 @@ test "live: interval set, named counter/quota, verdict map and inet ingress agai
     for (objs.items) |o| {
         if (!std.mem.eql(u8, o.table, test_table_core)) continue;
         if (std.mem.eql(u8, o.name, "hits")) {
-            try testing.expectEqual(@as(u32, @intFromEnum(expr.ObjectType.counter)), o.obj_type);
+            try testing.expectEqual(@as(u32, @backingInt(expr.ObjectType.counter)), o.obj_type);
             try testing.expectEqual(@as(u64, 1), o.counter.?.packets);
             // One IPv4 header (20) + UDP header (8) + 1 payload byte.
             try testing.expectEqual(@as(u64, 29), o.counter.?.bytes);

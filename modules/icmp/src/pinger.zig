@@ -238,7 +238,7 @@ pub const Addr = union(echo.Family) {
         return switch (ip) {
             .v4 => |q| .{ .v4 = .{
                 .port = 0,
-                .addr = @bitCast(q),
+                .addr = std.mem.bytesToValue(u32, &q),
             } },
             .v6 => |b| .{ .v6 = .{
                 .port = 0,
@@ -253,7 +253,7 @@ pub const Addr = union(echo.Family) {
     /// there and is dropped).
     pub fn toIp(self: Addr) netaddr.Ip {
         return switch (self) {
-            .v4 => |sa| .{ .v4 = @bitCast(sa.addr) },
+            .v4 => |sa| .{ .v4 = std.mem.toBytes(sa.addr) },
             .v6 => |sa| .{ .v6 = sa.addr },
         };
     }
@@ -301,7 +301,7 @@ pub const Addr = union(echo.Family) {
     fn subnetKey(self: Addr) u64 {
         switch (self) {
             .v4 => |sa| {
-                const bytes: [4]u8 = @bitCast(sa.addr);
+                const bytes: [4]u8 = std.mem.toBytes(sa.addr);
                 const prefix = std.mem.readInt(u32, &bytes, .big) >> 8;
                 return (1 << 32) | @as(u64, prefix);
             },
@@ -1518,7 +1518,7 @@ test "A1 F2: check_source now validates the quoted destination inside an ICMP er
     // Positive control: same packet, quoted destination corrected to the
     // real target -- must be counted.
     const target_bytes: [4]u8 = switch (p.targetAddr(id)) {
-        .v4 => |a| @bitCast(a.addr),
+        .v4 => |a| std.mem.toBytes(a.addr),
         .v6 => unreachable,
     };
     @memcpy(pkt[8 + 16 ..][0..4], &target_bytes);
@@ -1601,7 +1601,7 @@ test "A1 F12 m4/m32: an ICMP error's orig_ident check compares the WHOLE 16 bits
     orig[0] = echo.v4.echo_request;
     std.mem.writeInt(u16, orig[6..8], seq, .big);
     const target_bytes: [4]u8 = switch (p.targetAddr(id)) {
-        .v4 => |a| @bitCast(a.addr),
+        .v4 => |a| std.mem.toBytes(a.addr),
         .v6 => unreachable,
     };
     @memcpy(pkt[8 + 16 ..][0..4], &target_bytes); // correct quoted dest -- isolate the ident check
@@ -1849,7 +1849,7 @@ test "A1 F3: step() returns promptly even while its socket is being flooded" {
     var stop = std.atomic.Value(bool).init(false);
     const Flooder = struct {
         fn run(s: *const Socket, halt: *std.atomic.Value(bool)) void {
-            var dst: linux.sockaddr.in = .{ .port = 0, .addr = @bitCast([4]u8{ 127, 0, 0, 1 }) };
+            var dst: linux.sockaddr.in = .{ .port = 0, .addr = std.mem.bytesToValue(u32, &[4]u8{ 127, 0, 0, 1 }) };
             const dst_ptr: *const linux.sockaddr = @ptrCast(&dst);
             var pkt: [echo.echo_header_len]u8 = @splat(0);
             pkt[0] = echo.v4.echo_request;
@@ -1931,7 +1931,7 @@ test "A1 F5: the socket error queue delivers ICMP errors for a DGRAM ping socket
     pkt[8 + 14] = 0;
     pkt[8 + 15] = 1;
     const target_bytes: [4]u8 = switch (p.targetAddr(id)) {
-        .v4 => |a| @bitCast(a.addr),
+        .v4 => |a| std.mem.toBytes(a.addr),
         .v6 => unreachable,
     };
     @memcpy(pkt[8 + 16 ..][0..4], &target_bytes); // quoted destination
@@ -1941,7 +1941,7 @@ test "A1 F5: the socket error queue delivers ICMP errors for a DGRAM ping socket
     std.mem.writeInt(u16, orig[6..8], seq, .big);
     std.mem.writeInt(u16, pkt[2..4], echo.checksum(&pkt), .big);
 
-    var dst_sa: linux.sockaddr.in = .{ .port = 0, .addr = @bitCast([4]u8{ 127, 0, 0, 1 }) };
+    var dst_sa: linux.sockaddr.in = .{ .port = 0, .addr = std.mem.bytesToValue(u32, &[4]u8{ 127, 0, 0, 1 }) };
     try injector.sendTo(@ptrCast(&dst_sa), @sizeOf(linux.sockaddr.in), &pkt);
 
     // Give the kernel a moment to route the injected packet and queue the

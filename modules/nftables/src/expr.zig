@@ -367,7 +367,7 @@ pub const RegAlloc = struct {
     pub fn alloc(a: *RegAlloc) RegError!Reg {
         if (a.next > 4) return error.OutOfRegisters;
         defer a.next += 1;
-        return @enumFromInt(a.next);
+        return @fromBackingInt(@intCast(a.next));
     }
 };
 
@@ -573,7 +573,7 @@ pub fn appendExpr(
     const data = try nl.nestBegin(gpa, list, nl.NLA_F_NESTED | NFTA_EXPR.DATA);
     switch (e) {
         .payload_load => |p| {
-            try nl.appendAttrBe32(gpa, list, NFTA_PAYLOAD.DREG, @intFromEnum(p.dreg));
+            try nl.appendAttrBe32(gpa, list, NFTA_PAYLOAD.DREG, @backingInt(p.dreg));
             try nl.appendAttrBe32(gpa, list, NFTA_PAYLOAD.BASE, p.base.base());
             try nl.appendAttrBe32(gpa, list, NFTA_PAYLOAD.OFFSET, p.offset);
             try nl.appendAttrBe32(gpa, list, NFTA_PAYLOAD.LEN, p.len);
@@ -581,28 +581,28 @@ pub fn appendExpr(
         .meta_load => |m| {
             try nl.appendAttrBe32(gpa, list, NFTA_META.KEY, m.key.key() orelse
                 return error.UnsupportedMetaKey);
-            try nl.appendAttrBe32(gpa, list, NFTA_META.DREG, @intFromEnum(m.dreg));
+            try nl.appendAttrBe32(gpa, list, NFTA_META.DREG, @backingInt(m.dreg));
         },
         .meta_set => |m| {
             try nl.appendAttrBe32(gpa, list, NFTA_META.KEY, m.key.key() orelse
                 return error.UnsupportedMetaKey);
-            try nl.appendAttrBe32(gpa, list, NFTA_META.SREG, @intFromEnum(m.sreg));
+            try nl.appendAttrBe32(gpa, list, NFTA_META.SREG, @backingInt(m.sreg));
         },
         .ct_load => |c| {
             try nl.appendAttrBe32(gpa, list, NFTA_CT.KEY, c.key);
-            try nl.appendAttrBe32(gpa, list, NFTA_CT.DREG, @intFromEnum(c.dreg));
+            try nl.appendAttrBe32(gpa, list, NFTA_CT.DREG, @backingInt(c.dreg));
             if (c.dir) |d| try nl.appendAttrU8(gpa, list, NFTA_CT.DIRECTION, d.dir());
         },
         .cmp => |c| {
-            try nl.appendAttrBe32(gpa, list, NFTA_CMP.SREG, @intFromEnum(c.sreg));
+            try nl.appendAttrBe32(gpa, list, NFTA_CMP.SREG, @backingInt(c.sreg));
             try nl.appendAttrBe32(gpa, list, NFTA_CMP.OP, c.op);
             try appendData(gpa, list, NFTA_CMP.DATA, c.data);
         },
         .bitwise => |b| {
             if (b.mask.len != b.len or b.xor.len != b.len)
                 return error.BitwiseLengthMismatch;
-            try nl.appendAttrBe32(gpa, list, NFTA_BITWISE.SREG, @intFromEnum(b.sreg));
-            try nl.appendAttrBe32(gpa, list, NFTA_BITWISE.DREG, @intFromEnum(b.dreg));
+            try nl.appendAttrBe32(gpa, list, NFTA_BITWISE.SREG, @backingInt(b.sreg));
+            try nl.appendAttrBe32(gpa, list, NFTA_BITWISE.DREG, @backingInt(b.dreg));
             try nl.appendAttrBe32(gpa, list, NFTA_BITWISE.LEN, b.len);
             try appendData(gpa, list, NFTA_BITWISE.MASK, .{ .value = b.mask });
             try appendData(gpa, list, NFTA_BITWISE.XOR, .{ .value = b.xor });
@@ -610,8 +610,8 @@ pub fn appendExpr(
         .lookup => |l| {
             // `nft` puts DREG between SREG and SET when there is one (the
             // `tcp dport vmap @vm` golden) and leaves it out otherwise.
-            try nl.appendAttrBe32(gpa, list, NFTA_LOOKUP.SREG, @intFromEnum(l.sreg));
-            if (l.dreg) |d| try nl.appendAttrBe32(gpa, list, NFTA_LOOKUP.DREG, @intFromEnum(d));
+            try nl.appendAttrBe32(gpa, list, NFTA_LOOKUP.SREG, @backingInt(l.sreg));
+            if (l.dreg) |d| try nl.appendAttrBe32(gpa, list, NFTA_LOOKUP.DREG, @backingInt(d));
             try nl.appendAttrString(gpa, list, NFTA_LOOKUP.SET, l.set);
             if (l.set_id) |id| try nl.appendAttrBe32(gpa, list, NFTA_LOOKUP.SET_ID, id);
             if (l.invert) try nl.appendAttrBe32(gpa, list, NFTA_LOOKUP.FLAGS, NFT_LOOKUP_F_INV);
@@ -625,7 +625,7 @@ pub fn appendExpr(
             }
         },
         .immediate => |i| {
-            try nl.appendAttrBe32(gpa, list, NFTA_IMMEDIATE.DREG, @intFromEnum(i.dreg));
+            try nl.appendAttrBe32(gpa, list, NFTA_IMMEDIATE.DREG, @backingInt(i.dreg));
             try appendData(gpa, list, NFTA_IMMEDIATE.DATA, i.data);
         },
         .limit => |l| {
@@ -654,21 +654,21 @@ pub fn appendExpr(
             try nl.appendAttrBe32(gpa, list, NFTA_NAT.TYPE, n.kind);
             try nl.appendAttrBe32(gpa, list, NFTA_NAT.FAMILY, n.family);
             if (n.reg_addr_min) |r|
-                try nl.appendAttrBe32(gpa, list, NFTA_NAT.REG_ADDR_MIN, @intFromEnum(r));
+                try nl.appendAttrBe32(gpa, list, NFTA_NAT.REG_ADDR_MIN, @backingInt(r));
             if (n.reg_addr_max) |r|
-                try nl.appendAttrBe32(gpa, list, NFTA_NAT.REG_ADDR_MAX, @intFromEnum(r));
+                try nl.appendAttrBe32(gpa, list, NFTA_NAT.REG_ADDR_MAX, @backingInt(r));
             if (n.reg_proto_min) |r|
-                try nl.appendAttrBe32(gpa, list, NFTA_NAT.REG_PROTO_MIN, @intFromEnum(r));
+                try nl.appendAttrBe32(gpa, list, NFTA_NAT.REG_PROTO_MIN, @backingInt(r));
             if (n.reg_proto_max) |r|
-                try nl.appendAttrBe32(gpa, list, NFTA_NAT.REG_PROTO_MAX, @intFromEnum(r));
+                try nl.appendAttrBe32(gpa, list, NFTA_NAT.REG_PROTO_MAX, @backingInt(r));
             if (n.flags != 0) try nl.appendAttrBe32(gpa, list, NFTA_NAT.FLAGS, n.flags);
         },
         .masq => |m| {
             if (m.flags != 0) try nl.appendAttrBe32(gpa, list, NFTA_MASQ.FLAGS, m.flags);
             if (m.reg_proto_min) |r|
-                try nl.appendAttrBe32(gpa, list, NFTA_MASQ.REG_PROTO_MIN, @intFromEnum(r));
+                try nl.appendAttrBe32(gpa, list, NFTA_MASQ.REG_PROTO_MIN, @backingInt(r));
             if (m.reg_proto_max) |r|
-                try nl.appendAttrBe32(gpa, list, NFTA_MASQ.REG_PROTO_MAX, @intFromEnum(r));
+                try nl.appendAttrBe32(gpa, list, NFTA_MASQ.REG_PROTO_MAX, @backingInt(r));
         },
         .reject => |r| {
             try nl.appendAttrBe32(gpa, list, NFTA_REJECT.TYPE, r.type);
@@ -686,9 +686,9 @@ pub fn appendExpr(
         },
         .redir => |r| {
             if (r.reg_proto_min) |reg|
-                try nl.appendAttrBe32(gpa, list, NFTA_REDIR.REG_PROTO_MIN, @intFromEnum(reg));
+                try nl.appendAttrBe32(gpa, list, NFTA_REDIR.REG_PROTO_MIN, @backingInt(reg));
             if (r.reg_proto_max) |reg|
-                try nl.appendAttrBe32(gpa, list, NFTA_REDIR.REG_PROTO_MAX, @intFromEnum(reg));
+                try nl.appendAttrBe32(gpa, list, NFTA_REDIR.REG_PROTO_MAX, @backingInt(reg));
             if (r.flags != 0) try nl.appendAttrBe32(gpa, list, NFTA_REDIR.FLAGS, r.flags);
         },
         .quota => |q| {
@@ -698,7 +698,7 @@ pub fn appendExpr(
             try nl.appendAttrBe32(gpa, list, NFTA_QUOTA.FLAGS, if (q.over) NFT_QUOTA_F_INV else 0);
         },
         .objref => |o| {
-            try nl.appendAttrBe32(gpa, list, NFTA_OBJREF.IMM_TYPE, @intFromEnum(o.obj_type));
+            try nl.appendAttrBe32(gpa, list, NFTA_OBJREF.IMM_TYPE, @backingInt(o.obj_type));
             // `nft` sends the object name WITHOUT a terminating NUL here
             // (`counter name c1` → a 6-byte attribute, captured), unlike every
             // other name attribute; the kernel's NLA_STRING policy accepts
@@ -1196,7 +1196,7 @@ pub const Program = struct {
     pub fn reject(p: *Program, with: RejectWith) *Program {
         return p.push(.{ .reject = switch (with) {
             .icmp => |code| .{ .type = NFT_REJECT.ICMP_UNREACH, .icmp_code = code },
-            .icmpx => |code| .{ .type = NFT_REJECT.ICMPX_UNREACH, .icmp_code = @intFromEnum(code) },
+            .icmpx => |code| .{ .type = NFT_REJECT.ICMPX_UNREACH, .icmp_code = @backingInt(code) },
             .tcp_reset => .{ .type = NFT_REJECT.TCP_RST, .icmp_code = 0 },
         } });
     }
@@ -1412,13 +1412,13 @@ test "every meta key maps and encodes; the bridge-name keys alias ibriport/obrip
     // those aliases.
     var list: std.ArrayList(u8) = .empty;
     defer list.deinit(testing.allocator);
-    inline for (@typeInfo(MetaKey).@"enum".fields) |f| {
-        const k: MetaKey = @enumFromInt(f.value);
+    inline for (@typeInfo(MetaKey).@"enum".field_names, @typeInfo(MetaKey).@"enum".field_values) |_, f_value| {
+        const k: MetaKey = @fromBackingInt(@intCast(f_value));
         try testing.expect(k.key() != null);
         try appendExpr(testing.allocator, &list, .{ .meta_load = .{ .key = k, .dreg = .r1 } });
-        inline for (@typeInfo(MetaKey).@"enum".fields) |g| {
-            const j: MetaKey = @enumFromInt(g.value);
-            if (f.value < g.value and k.key().? == j.key().?) {
+        inline for (@typeInfo(MetaKey).@"enum".field_names, @typeInfo(MetaKey).@"enum".field_values) |_, g_value| {
+            const j: MetaKey = @fromBackingInt(@intCast(g_value));
+            if (f_value < g_value and k.key().? == j.key().?) {
                 const alias = (k == .ibriport and j == .ibridgename) or (k == .obriport and j == .obridgename);
                 try testing.expect(alias);
             }

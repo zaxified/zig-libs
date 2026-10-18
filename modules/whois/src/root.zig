@@ -1665,7 +1665,7 @@ const ReadCueIo = struct {
         inner_vtable = inner.vtable;
         reads.store(0, .release);
         var vt = inner.vtable.*;
-        vt.netRead = netRead;
+        vt.operate = operate; // 0.17: socket reads are `Operation.net_read` through `vtable.operate`
         return .{ .vtable = vt, .userdata = inner.userdata };
     }
 
@@ -1673,9 +1673,9 @@ const ReadCueIo = struct {
         return .{ .userdata = self.userdata, .vtable = &self.vtable };
     }
 
-    fn netRead(userdata: ?*anyopaque, src: std.Io.net.Socket.Handle, data: [][]u8) std.Io.net.Stream.Reader.Error!usize {
-        _ = reads.fetchAdd(1, .monotonic);
-        return inner_vtable.netRead(userdata, src, data);
+    fn operate(userdata: ?*anyopaque, op: std.Io.Operation) std.Io.Cancelable!std.Io.Operation.Result {
+        if (op == .net_read) _ = reads.fetchAdd(1, .monotonic);
+        return inner_vtable.operate(userdata, op);
     }
 
     /// Wait until the client has entered its `n`-th socket read. The deadline
@@ -1859,7 +1859,7 @@ test {
 /// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
 fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     const rep_result = comptime blk: {
-        @setEvalBranchQuota(n * 2 + 1000);
+        @setEvalBranchQuota(n * (s.len + 4) + 1000);
         var buf: [s.len * n:0]u8 = undefined;
         for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
         const rep_final = buf;

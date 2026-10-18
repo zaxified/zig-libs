@@ -935,7 +935,7 @@ pub const PosixConnector = struct {
         if (source) |src| {
             const bind_rc = switch (src) {
                 .v4 => |q| blk: {
-                    const sa: linux.sockaddr.in = .{ .port = 0, .addr = @bitCast(q) };
+                    const sa: linux.sockaddr.in = .{ .port = 0, .addr = std.mem.bytesToValue(u32, &q) };
                     break :blk linux.bind(fd, @ptrCast(&sa), @sizeOf(linux.sockaddr.in));
                 },
                 .v6 => |b| blk: {
@@ -956,7 +956,7 @@ pub const PosixConnector = struct {
         var sa6: linux.sockaddr.in6 = undefined;
         const conn_rc = switch (ip) {
             .v4 => |q| blk: {
-                sa4 = .{ .port = be_port, .addr = @bitCast(q) };
+                sa4 = .{ .port = be_port, .addr = std.mem.bytesToValue(u32, &q) };
                 break :blk linux.connect(fd, @ptrCast(&sa4), @sizeOf(linux.sockaddr.in));
             },
             .v6 => |b| blk: {
@@ -1606,7 +1606,7 @@ fn listenLoopback(v6: bool, backlog: u32) error{ListenSetup}!TestListener {
             return error.ListenSetup;
         break :p std.mem.bigToNative(u16, sa.port);
     } else p: {
-        var sa: tl.sockaddr.in = .{ .port = 0, .addr = @bitCast([4]u8{ 127, 0, 0, 1 }) };
+        var sa: tl.sockaddr.in = .{ .port = 0, .addr = std.mem.bytesToValue(u32, &[4]u8{ 127, 0, 0, 1 }) };
         if (tl.errno(tl.bind(fd, @ptrCast(&sa), @sizeOf(tl.sockaddr.in))) != .SUCCESS)
             return error.ListenSetup;
         var alen: tl.socklen_t = @sizeOf(tl.sockaddr.in);
@@ -1652,7 +1652,7 @@ const BlackHole = struct {
             f.* = @intCast(rc);
             var sa: tl.sockaddr.in = .{
                 .port = std.mem.nativeToBig(u16, bh.port),
-                .addr = @bitCast([4]u8{ 127, 0, 0, 1 }),
+                .addr = std.mem.bytesToValue(u32, &[4]u8{ 127, 0, 0, 1 }),
             };
             // Non-blocking and never awaited: whichever of these fit into the
             // one-slot accept queue is enough to close it.
@@ -2373,7 +2373,7 @@ const AppRejectOdd = struct {
 };
 
 test "model: probeTarget and probeMany agree with a naive model on random outcome scripts" {
-    var reach = @as([@typeInfo(ProbeReach)]usize, @splat(0)).@"enum".field_names.len;
+    var reach: [@typeInfo(ProbeReach).@"enum".field_names.len]usize = @splat(0);
     var dummy: u8 = 0;
     const seeds = if (@import("builtin").mode == .debug) 80 else 300;
     for (0..seeds) |case_seed| {
@@ -2651,7 +2651,7 @@ test "live: source binds the local address — the peer sees 127.0.0.2" {
     const arc = tl.accept4(ln.fd, @ptrCast(&peer), &plen, tl.SOCK.CLOEXEC);
     try testing.expectEqual(tl.E.SUCCESS, tl.errno(arc));
     defer _ = tl.close(@intCast(arc));
-    try testing.expectEqual([4]u8{ 127, 0, 0, 2 }, @as([4]u8, @bitCast(peer.addr)));
+    try testing.expectEqual([4]u8{ 127, 0, 0, 2 }, std.mem.toBytes(peer.addr));
 }
 
 test "live: a source of the wrong family or not on this host is an error Result, never a panic" {

@@ -245,7 +245,7 @@ pub fn resolveOpts(
         @compileError("ebpf.elfsym is Linux-only (raw open/pread syscalls)");
     if (name.len == 0) return error.SymbolNotFound;
 
-    const path_z = gpa.dupeZ(u8, path) catch return error.OutOfMemory;
+    const path_z = gpa.dupeSentinel(u8, path, 0) catch return error.OutOfMemory;
     defer gpa.free(path_z);
 
     var file = try File.open(path_z.ptr);
@@ -787,7 +787,7 @@ pub fn readFileAlloc(gpa: std.mem.Allocator, path: []const u8, max_bytes: usize)
     if (comptime builtin.os.tag != .linux)
         @compileError("ebpf.elfsym is Linux-only (raw open/pread syscalls)");
 
-    const path_z = gpa.dupeZ(u8, path) catch return error.OutOfMemory;
+    const path_z = gpa.dupeSentinel(u8, path, 0) catch return error.OutOfMemory;
     defer gpa.free(path_z);
 
     var file = File.open(path_z.ptr) catch return error.FileOpenFailed;
@@ -883,12 +883,12 @@ test "ELF64 field offsets match std's struct layout" {
     try testing.expectEqual(ehdr_shentsize, @offsetOf(elf.Elf64_Ehdr, "e_shentsize"));
     try testing.expectEqual(ehdr_shnum, @offsetOf(elf.Elf64_Ehdr, "e_shnum"));
 
-    try testing.expectEqual(PHDR_SIZE, @sizeOf(elf.Elf64_Phdr));
-    try testing.expectEqual(phdr_type, @offsetOf(elf.Elf64_Phdr, "p_type"));
-    try testing.expectEqual(phdr_offset, @offsetOf(elf.Elf64_Phdr, "p_offset"));
-    try testing.expectEqual(phdr_vaddr, @offsetOf(elf.Elf64_Phdr, "p_vaddr"));
-    try testing.expectEqual(phdr_filesz, @offsetOf(elf.Elf64_Phdr, "p_filesz"));
-    try testing.expectEqual(phdr_memsz, @offsetOf(elf.Elf64_Phdr, "p_memsz"));
+    try testing.expectEqual(PHDR_SIZE, @sizeOf(elf.Elf64.Phdr));
+    try testing.expectEqual(phdr_type, @offsetOf(elf.Elf64.Phdr, "type"));
+    try testing.expectEqual(phdr_offset, @offsetOf(elf.Elf64.Phdr, "offset"));
+    try testing.expectEqual(phdr_vaddr, @offsetOf(elf.Elf64.Phdr, "vaddr"));
+    try testing.expectEqual(phdr_filesz, @offsetOf(elf.Elf64.Phdr, "filesz"));
+    try testing.expectEqual(phdr_memsz, @offsetOf(elf.Elf64.Phdr, "memsz"));
 
     try testing.expectEqual(SHDR_SIZE, @sizeOf(elf.Elf64_Shdr));
     try testing.expectEqual(shdr_type, @offsetOf(elf.Elf64_Shdr, "sh_type"));
@@ -1478,7 +1478,7 @@ test "malformed inputs are typed errors, never a mis-parse" {
 /// the SECTION headers (`sh_addr` + `sh_offset`) instead of the program
 /// headers `vaddrToFileOffset` uses. Two different tables that must agree.
 fn fileOffsetViaSections(gpa: std.mem.Allocator, path: []const u8, vaddr: u64) !?u64 {
-    const path_z = try gpa.dupeZ(u8, path);
+    const path_z = try gpa.dupeSentinel(u8, path, 0);
     defer gpa.free(path_z);
     var file = try File.open(path_z.ptr);
     defer file.close();
@@ -1629,7 +1629,7 @@ test "real library: resolved offsets agree with an independent derivation" {
 
     // The offset must also be inside the file.
     {
-        const path_z = try gpa.dupeZ(u8, path);
+        const path_z = try gpa.dupeSentinel(u8, path, 0);
         defer gpa.free(path_z);
         var f = try File.open(path_z.ptr);
         defer f.close();
@@ -1650,7 +1650,7 @@ test "real library: resolved offsets agree with an independent derivation" {
 /// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
 fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     const rep_result = comptime blk: {
-        @setEvalBranchQuota(n * 2 + 1000);
+        @setEvalBranchQuota(n * (s.len + 4) + 1000);
         var buf: [s.len * n:0]u8 = undefined;
         for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
         const rep_final = buf;

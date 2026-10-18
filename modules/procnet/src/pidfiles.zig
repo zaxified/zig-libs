@@ -125,8 +125,8 @@ pub fn parseLimits(text: []const u8) Limits {
         }
         if (line.len == 0) continue;
         var matched = false;
-        inline for (@typeInfo(Resource).@"enum".fields) |f| {
-            const r: Resource = @fromBackingInt(@intCast(f.value));
+        inline for (@typeInfo(Resource).@"enum".field_names, @typeInfo(Resource).@"enum".field_values) |_, f_value| {
+            const r: Resource = @fromBackingInt(@intCast(f_value));
             const lab = comptime r.label();
             if (!matched and std.mem.startsWith(u8, line, lab) and
                 (line.len == lab.len or line[lab.len] == ' ' or line[lab.len] == '\t'))
@@ -140,7 +140,7 @@ pub fn parseLimits(text: []const u8) Limits {
                     const h = parseLimitValue(hard.?);
                     if (s) |sv| {
                         if (h) |hv| {
-                            out.rows[f.value] = .{ .soft = sv, .hard = hv };
+                            out.rows[f_value] = .{ .soft = sv, .hard = hv };
                         } else |_| out.skipped_rows += 1;
                     } else |_| out.skipped_rows += 1;
                 } else out.skipped_rows += 1;
@@ -889,7 +889,7 @@ test "parseLimits: a label must end at a word boundary; soft and hard are told a
 /// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
 fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     const rep_result = comptime blk: {
-        @setEvalBranchQuota(n * 2 + 1000);
+        @setEvalBranchQuota(n * (s.len + 4) + 1000);
         var buf: [s.len * n:0]u8 = undefined;
         for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
         const rep_final = buf;

@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — Ported to Zig 0.17.0. RecvInfo source parse and the sockaddr.in `addr` <-> `[4]u8` conversions use `std.mem.bytesToValue`/`toBytes` (memory order; `@bitCast` of arrays/extern structs changed meaning or was removed). Also: comptime `strRepeat` helper quota raised.
 - **2026-10-07** — **NO CONSUMER-VISIBLE CHANGE:** the `testing.fuzz` harness
   bodies are now generic over their source and run by testkit's deterministic
   driver `ICMP_FUZZ` (new `src/fuzz_test.zig`, a seed loop with reach checks in

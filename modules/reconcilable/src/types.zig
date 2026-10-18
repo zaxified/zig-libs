@@ -157,10 +157,10 @@ pub fn assertPlainKey(comptime Key: type) void {
         .array => |a| assertPlainKey(a.child),
         .optional => |o| assertPlainKey(o.child),
         .@"struct" => |s| {
-            inline for (s.fields) |f| assertPlainKey(f.type);
+            inline for (s.field_types) |ft| assertPlainKey(ft);
         },
         .@"union" => |u| {
-            inline for (u.fields) |f| assertPlainKey(f.type);
+            inline for (u.field_types) |ft| assertPlainKey(ft);
         },
         else => @compileError(
             "reconcilable: key type '" ++ @typeName(Key) ++ "' is not a plain value type.",

@@ -82,7 +82,7 @@ pub fn infoOf(msg: net.IncomingMessage) Socket.RecvInfo {
 
 fn srcOf(from: net.IpAddress) Socket.RecvInfo.SrcAddr {
     return switch (from) {
-        .ip4 => |a| .{ .v4 = .{ .port = 0, .addr = @bitCast(a.bytes) } },
+        .ip4 => |a| .{ .v4 = .{ .port = 0, .addr = std.mem.bytesToValue(u32, &a.bytes) } },
         .ip6 => |a| .{ .v6 = .{ .port = 0, .flowinfo = 0, .addr = a.bytes, .scope_id = 0 } },
     };
 }
@@ -90,7 +90,7 @@ fn srcOf(from: net.IpAddress) Socket.RecvInfo.SrcAddr {
 /// The `std.Io.net` address of a `linux.sockaddr` target.
 pub fn ipOf(sa: anytype) net.IpAddress {
     return switch (@TypeOf(sa)) {
-        linux.sockaddr.in => .{ .ip4 = .{ .bytes = @bitCast(sa.addr), .port = 0 } },
+        linux.sockaddr.in => .{ .ip4 = .{ .bytes = std.mem.toBytes(sa.addr), .port = 0 } },
         linux.sockaddr.in6 => .{ .ip6 = .{ .bytes = sa.addr, .port = 0 } },
         else => @compileError("not an IP sockaddr"),
     };

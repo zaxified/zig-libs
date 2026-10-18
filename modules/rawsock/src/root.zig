@@ -834,7 +834,7 @@ pub fn ifaceByName(name: []const u8) IfaceError!i32 {
 /// the NUL) is returned — so the result does not dangle.
 pub fn ifaceName(fd: i32, ifindex: i32, out: *[16]u8) IfaceError![]const u8 {
     var req: ifreq = .{};
-    req.un[0..4].* = @bitCast(ifindex); // ifr_ifindex (native-endian i32)
+    req.un[0..4].* = std.mem.toBytes(ifindex); // ifr_ifindex (native-endian i32, memory order)
     if (linux.errno(linux.ioctl(fd, linux.SIOCGIFNAME, @intFromPtr(&req))) != .SUCCESS)
         return error.NoSuchInterface;
     @memcpy(out, &req.name);
@@ -1000,7 +1000,7 @@ const ARPHRD_ETHER: u16 = 1;
 /// indistinguishable from a real zero MAC. Neither is a MAC address this
 /// module has any business returning. See `A1/rawsock.md` F6.
 fn hwaddrFromIfreq(req: ifreq) ?[hwaddr_len]u8 {
-    const family: u16 = @bitCast(req.un[0..2].*);
+    const family: u16 = std.mem.bytesToValue(u16, req.un[0..2]); // memory order
     if (family != ARPHRD_ETHER) return null;
     var mac: [hwaddr_len]u8 = undefined;
     @memcpy(&mac, req.un[2..8]);
@@ -1013,7 +1013,7 @@ fn ifaceIndexOn(fd: i32, name: []const u8) error{NoSuchInterface}!i32 {
     @memcpy(req.name[0..name.len], name);
     if (linux.errno(linux.ioctl(fd, linux.SIOCGIFINDEX, @intFromPtr(&req))) != .SUCCESS)
         return error.NoSuchInterface;
-    return @bitCast(req.un[0..4].*); // ifr_ifindex, native endian
+    return std.mem.bytesToValue(i32, req.un[0..4]); // ifr_ifindex, native endian (memory order)
 }
 
 /// `SO_ATTACH_FILTER` on `fd` directly — shared by `Socket.setFilter` (called
@@ -1176,14 +1176,14 @@ test "sockaddrInAddr decodes a real SIOCGIFADDR/SIOCGIFNETMASK ifreq layout" {
     // family AF_INET (2, native-endian u16) at [0..2), port 0 at [2..4),
     // address at [4..8), the sin_zero padding after (untouched, left 0).
     var req: ifreq = .{};
-    req.un[0..2].* = @bitCast(@as(u16, linux.AF.INET));
+    req.un[0..2].* = std.mem.toBytes(@as(u16, linux.AF.INET));
     req.un[4..8].* = .{ 192, 0, 2, 1 };
     try testing.expectEqual([_]u8{ 192, 0, 2, 1 }, sockaddrInAddr(req));
 
     // A real SIOCGIFNETMASK reply for a /24 (255.255.255.0): same layout,
     // different address bytes — the two ioctls share one wire shape.
     var mreq: ifreq = .{};
-    mreq.un[0..2].* = @bitCast(@as(u16, linux.AF.INET));
+    mreq.un[0..2].* = std.mem.toBytes(@as(u16, linux.AF.INET));
     mreq.un[4..8].* = .{ 255, 255, 255, 0 };
     try testing.expectEqual([_]u8{ 255, 255, 255, 0 }, sockaddrInAddr(mreq));
 }
@@ -1336,24 +1336,24 @@ test "F6: hwaddrFromIfreq rejects a non-Ethernet hardware-address family, offlin
     // whose 4-byte remote address `198.51.100.7` was read back as MAC
     // `c6:33:64:07:00:00`), ARPHRD_LOOPBACK=772 (`lo`, all-zero).
     var eth_req: ifreq = .{};
-    eth_req.un[0..2].* = @bitCast(@as(u16, 1)); // ARPHRD_ETHER
+    eth_req.un[0..2].* = std.mem.toBytes(@as(u16, 1)); // ARPHRD_ETHER
     eth_req.un[2..8].* = .{ 0xbe, 0x68, 0x94, 0xcf, 0xca, 0xfc };
     try testing.expectEqual([_]u8{ 0xbe, 0x68, 0x94, 0xcf, 0xca, 0xfc }, hwaddrFromIfreq(eth_req).?);
 
     var sit_req: ifreq = .{};
-    sit_req.un[0..2].* = @bitCast(@as(u16, 776)); // ARPHRD_SIT
+    sit_req.un[0..2].* = std.mem.toBytes(@as(u16, 776)); // ARPHRD_SIT
     sit_req.un[2..8].* = .{ 0xc6, 0x33, 0x64, 0x07, 0x00, 0x00 }; // 198.51.100.7 as hex
     try testing.expectEqual(@as(?[hwaddr_len]u8, null), hwaddrFromIfreq(sit_req));
 
     var lo_req: ifreq = .{};
-    lo_req.un[0..2].* = @bitCast(@as(u16, 772)); // ARPHRD_LOOPBACK
+    lo_req.un[0..2].* = std.mem.toBytes(@as(u16, 772)); // ARPHRD_LOOPBACK
     try testing.expectEqual(@as(?[hwaddr_len]u8, null), hwaddrFromIfreq(lo_req));
 
     // The offset itself, pinned: bytes [2..8) are the MAC, [8..10) are NOT —
     // a mutant that shifts the read window (audit's `m23_hwaddr_offset`,
     // `un[4..10]` instead of `un[2..8]`) must fail this.
     var offset_req: ifreq = .{};
-    offset_req.un[0..2].* = @bitCast(@as(u16, 1));
+    offset_req.un[0..2].* = std.mem.toBytes(@as(u16, 1));
     offset_req.un[2..10].* = .{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0xff, 0xff };
     try testing.expectEqual([_]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06 }, hwaddrFromIfreq(offset_req).?);
 }
@@ -2848,7 +2848,7 @@ test {
 /// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
 fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     const rep_result = comptime blk: {
-        @setEvalBranchQuota(n * 2 + 1000);
+        @setEvalBranchQuota(n * (s.len + 4) + 1000);
         var buf: [s.len * n:0]u8 = undefined;
         for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
         const rep_final = buf;

@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — Ported to Zig 0.17.0. `assertPlainKey` iterates `field_types` of struct/union. Also: comptime `strRepeat` helper quota raised.
 - **2026-08-06** — Security audit: five findings fixed (part of the collection-wide
   audit; the root changelog records no further detail than this). Modeled on Kubernetes
   controller-runtime `workqueue` + `DelayingInterface` (design ref, documentation only)

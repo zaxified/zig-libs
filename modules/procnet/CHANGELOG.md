@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — Ported to Zig 0.17.0. enum `@typeInfo` loop uses `field_names`/`field_values`. Also: comptime `strRepeat` helper quota raised.
 - **2026-10-18** — tests: mutation audit of the procfs-parity files and `counters.zig` (62 schemata mutants, 60 killed, 2 equivalent); seven tests added (negative `rss`, `pairs` empty section and missing `InOctets`, tab/CRLF `unix` rows, `limits` label boundary and soft/hard, `busyFraction` and `total`, disk name and column thresholds). **NO CONSUMER-VISIBLE CHANGE.**
 - **2026-10-17** — Comparative benchmark `tools/bench.zig` + `tools/go_bench/` (`zig build bench-procnet`)
   against prometheus/procfs v0.21.1: nine read-and-parse rows (pid stat/limits/status/io/netstat,

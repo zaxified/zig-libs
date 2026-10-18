@@ -91,7 +91,7 @@ pub const Config = struct {
     /// LSP is *not* acknowledged with an SSN/PSNP (the DIS's periodic CSNP does
     /// the sync); on point-to-point circuits (the default — empty set) it is.
     /// This is the only ISO LAN-vs-P2P distinction the flag matrix needs.
-    broadcast_interfaces: InterfaceSet = InterfaceSet.initEmpty(),
+    broadcast_interfaces: InterfaceSet = InterfaceSet.empty,
     /// The DoS bound on distinct stored LSPs (see the file-level Capacity note).
     capacity: usize = default_capacity,
     /// `ZeroAgeLifetime`: purge-hold duration, in `Time` units.
@@ -754,7 +754,7 @@ pub const Lsdb = struct {
     /// The set of interfaces that have something queued to flood (SRM
     /// non-empty on that circuit).
     pub fn interfacesWithSrm(self: *const Lsdb) InterfaceSet {
-        var acc = InterfaceSet.initEmpty();
+        var acc = InterfaceSet.empty;
         var i: u8 = 0;
         while (i < self.cfg.interface_count) : (i += 1) {
             if (self.srm_queue[i].count() != 0) acc.set(i);
@@ -765,7 +765,7 @@ pub const Lsdb = struct {
     /// The SRM flag set for one LSP, or `null` if it is not stored.
     pub fn srmSet(self: *const Lsdb, id: LspId) ?InterfaceSet {
         if (!self.map.contains(id)) return null;
-        var acc = InterfaceSet.initEmpty();
+        var acc = InterfaceSet.empty;
         var i: u8 = 0;
         while (i < self.cfg.interface_count) : (i += 1) {
             if (self.srm_queue[i].contains(id)) acc.set(i);
@@ -792,7 +792,7 @@ pub const Lsdb = struct {
     /// The SSN flag set for one LSP, or `null` if it is not stored.
     pub fn ssnSet(self: *const Lsdb, id: LspId) ?InterfaceSet {
         if (!self.map.contains(id)) return null;
-        var acc = InterfaceSet.initEmpty();
+        var acc = InterfaceSet.empty;
         var i: u8 = 0;
         while (i < self.cfg.interface_count) : (i += 1) {
             if (self.ssn_queue[i].contains(id)) acc.set(i);
@@ -1615,7 +1615,7 @@ test "determinism: identical (ops, now) streams yield identical flag state" {
 }
 
 test "broadcast interface: newer LSP received on it is not SSN-acked" {
-    var bcast = InterfaceSet.initEmpty();
+    var bcast = InterfaceSet.empty;
     bcast.set(2);
     var db = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 4, .capacity = 8, .broadcast_interfaces = bcast });
     defer db.deinit();

@@ -174,7 +174,7 @@ pub fn buildCreateAttr(
     return .{
         .prog_fd = prog_fd,
         .target = target,
-        .attach_type = @intFromEnum(attach_type),
+        .attach_type = @backingInt(attach_type),
         .flags = opts.flags,
         .extra = opts.extra,
     };
@@ -258,7 +258,7 @@ pub const Info = extern struct {
     _pad: u32 = 0,
 
     pub fn linkType(self: Info) LinkType {
-        return @enumFromInt(self.type);
+        return @fromBackingInt(@intCast(self.type));
     }
 };
 
@@ -403,7 +403,7 @@ pub fn linkGetFdById(link_id: u32) LinkError!LinkHandle {
     const rc = linux.bpf(.link_get_fd_by_id, @ptrCast(&buf), @sizeOf(BPF.GetIdAttr));
     switch (linux.errno(rc)) {
         // The attach type is not known from an id alone; `info()` reports it.
-        .SUCCESS => return .{ .fd = @intCast(rc), .attach_type = @enumFromInt(0) },
+        .SUCCESS => return .{ .fd = @intCast(rc), .attach_type = @fromBackingInt(@intCast(0)) },
         else => |e| return errnoToLinkError(e),
     }
 }
@@ -554,7 +554,7 @@ test "golden: BPF_LINK_CREATE attr bytes for each attach type this module drives
             0xef, 0xbe, 0xad, 0xde, 0x00, 0x00, 0x00, 0x00, // perf_event.bpf_cookie
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // union tail
         }, bytes);
-        try testing.expectEqual(@as(u32, 41), @intFromEnum(BPF.AttachType.perf_event));
+        try testing.expectEqual(@as(u32, 41), @backingInt(BPF.AttachType.perf_event));
     }
 
     // An XDP link: the target is an IFINDEX, and the flags are XDP_FLAGS_*.
@@ -571,7 +571,7 @@ test "golden: BPF_LINK_CREATE attr bytes for each attach type this module drives
             0x00, 0x00, 0x00, 0x00,
             0x00, 0x00, 0x00, 0x00,
         }, bytes);
-        try testing.expectEqual(@as(u32, 37), @intFromEnum(BPF.AttachType.xdp));
+        try testing.expectEqual(@as(u32, 37), @backingInt(BPF.AttachType.xdp));
     }
 
     // A cgroup link.
@@ -601,11 +601,11 @@ test "Info mirrors the kernel's bpf_link_info prefix" {
     try testing.expectEqual(@as(usize, 8), @offsetOf(Info, "prog_id"));
     try testing.expectEqual(@as(usize, 16), @sizeOf(Info));
 
-    const i: Info = .{ .type = @intFromEnum(LinkType.perf_event), .id = 3, .prog_id = 9 };
+    const i: Info = .{ .type = @backingInt(LinkType.perf_event), .id = 3, .prog_id = 9 };
     try testing.expectEqual(LinkType.perf_event, i.linkType());
     // A link kind this build has never heard of must not be an invalid enum.
     const future: Info = .{ .type = 9999, .id = 1, .prog_id = 1 };
-    try testing.expectEqual(@as(u32, 9999), @intFromEnum(future.linkType()));
+    try testing.expectEqual(@as(u32, 9999), @backingInt(future.linkType()));
 }
 
 test "errno mapping: EINVAL means 'fall back', not 'you passed garbage'" {
@@ -661,7 +661,7 @@ test "LIVE: create, inspect, update and detach a real cgroup link" {
     }
 
     var path_buf: [64]u8 = undefined;
-    const dir = try std.fmt.bufPrintZ(&path_buf, "/sys/fs/cgroup/zig-libs-ebpf-link-{d}", .{linux.getpid()});
+    const dir = try std.fmt.bufPrintSentinel(&path_buf, "/sys/fs/cgroup/zig-libs-ebpf-link-{d}", .{linux.getpid()}, 0);
     switch (linux.errno(linux.mkdir(dir.ptr, 0o755))) {
         .SUCCESS => {},
         else => {

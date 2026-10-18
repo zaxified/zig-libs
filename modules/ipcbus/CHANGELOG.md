@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — Ported to Zig 0.17.0. test helper `bufPrintZ` -> `bufPrintSentinel`. Also: comptime `strRepeat` helper quota raised.
 - **2026-10-05** — Mutation run: 25 of 25 killed, 0 equivalent; 7 tests added
   (`CLOEXEC` on every fd, stale-path replace and unlink on `deinit`, one-byte
   transport and `readExact` EOF, `FdWriter.drain` splat and count, `handleOne`

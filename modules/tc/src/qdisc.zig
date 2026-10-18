@@ -1763,9 +1763,9 @@ const OptionsCorpus = struct {
 /// ran cannot. `pub` because `filter.zig` and `action.zig` pin the same number.
 pub fn optionalsSet(v: anytype) usize {
     var n: usize = 0;
-    inline for (@typeInfo(@TypeOf(v)).@"struct".fields) |f| {
-        if (@typeInfo(f.type) == .optional) {
-            if (@field(v, f.name) != null) n += 1;
+    inline for (@typeInfo(@TypeOf(v)).@"struct".field_names, @typeInfo(@TypeOf(v)).@"struct".field_types) |f_name, f_type| {
+        if (@typeInfo(f_type) == .optional) {
+            if (@field(v, f_name) != null) n += 1;
         }
     }
     return n;

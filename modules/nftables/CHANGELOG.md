@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — Ported to Zig 0.17.0. enum `@typeInfo` loop uses `field_names`/`field_values`; test sockaddr `addr` built with `std.mem.bytesToValue` (memory order). Also: comptime `strRepeat` helper quota raised.
 - **2026-10-09** — tests: deterministic fuzz driver `NFTABLES_FUZZ` over the existing harnesses (object decoders,
   expression walker).
 

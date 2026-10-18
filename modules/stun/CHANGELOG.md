@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — Ported to Zig 0.17.0. enum `@typeInfo` loop uses `field_names`/`field_values`. Also: comptime `strRepeat` helper quota raised.
 - **2026-10-09** — Constant time: new `src/ctgrind_harness.zig` (`scripts/checks/ctgrind.sh stun`, targets `mi`, `ltkey`). The MESSAGE-INTEGRITY key through `Builder.addMessageIntegrity` and `Message.verifyMessageIntegrity` (valid and tampered message), and the password through `longTermKey`, show 0 secret-dependent contexts in ReleaseFast. Pinned in `ctgrind-expected.tsv`. No code change.
 
 - **2026-10-09** — tests: deterministic fuzz driver `STUN_FUZZ` over the existing harnesses.

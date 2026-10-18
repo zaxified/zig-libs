@@ -475,8 +475,8 @@ pub const UriError = error{InvalidUri};
 pub fn parseUri(text: []const u8) UriError!Uri {
     const colon = std.mem.indexOfScalar(u8, text, ':') orelse return error.InvalidUri;
     const scheme_text = text[0..colon];
-    const scheme: Uri.Scheme = inline for (@typeInfo(Uri.Scheme).@"enum".fields) |f| {
-        if (std.ascii.eqlIgnoreCase(scheme_text, f.name)) break @fromBackingInt(@intCast(f.value));
+    const scheme: Uri.Scheme = inline for (@typeInfo(Uri.Scheme).@"enum".field_names, @typeInfo(Uri.Scheme).@"enum".field_values) |f_name, f_value| {
+        if (std.ascii.eqlIgnoreCase(scheme_text, f_name)) break @fromBackingInt(@intCast(f_value));
     } else return error.InvalidUri;
     var rest = text[colon + 1 ..];
     var out: Uri = .{

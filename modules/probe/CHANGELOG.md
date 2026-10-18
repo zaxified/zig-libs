@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — Ported to Zig 0.17.0. sockaddr.in `addr` <-> `[4]u8` conversions use `std.mem.bytesToValue`/`toBytes` (memory order); fixed a malformed model-test `reach` counter left by the 0.17 codemod. Also: comptime `strRepeat` helper quota raised.
 - **2026-10-11** — **Added (additive; every new field defaults to the old behaviour):**
   `PosixConnector.source` / `.device` (bind the local address, `SO_BINDTODEVICE`),
   `PosixConnector.ip_protocol` (`IpProtocol`: `.any`/`.ip4`/`.ip6`/`.prefer_ip4`/`.prefer_ip6`

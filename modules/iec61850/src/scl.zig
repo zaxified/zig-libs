@@ -125,8 +125,8 @@ pub const Fc = enum {
     SR,
 
     pub fn parse(s: []const u8) Error!Fc {
-        inline for (@typeInfo(Fc).@"enum".fields) |f| {
-            if (std.mem.eql(u8, s, f.name)) return @fromBackingInt(@intCast(f.value));
+        inline for (@typeInfo(Fc).@"enum".field_names, @typeInfo(Fc).@"enum".field_values) |f_name, f_value| {
+            if (std.mem.eql(u8, s, f_name)) return @fromBackingInt(@intCast(f_value));
         }
         return error.UnknownFunctionalConstraint;
     }
@@ -184,8 +184,8 @@ pub const BType = enum {
     unknown,
 
     pub fn parse(s: []const u8) Error!BType {
-        inline for (@typeInfo(BType).@"enum".fields) |f| {
-            if (std.mem.eql(u8, s, f.name)) return @fromBackingInt(@intCast(f.value));
+        inline for (@typeInfo(BType).@"enum".field_names, @typeInfo(BType).@"enum".field_values) |f_name, f_value| {
+            if (std.mem.eql(u8, s, f_name)) return @fromBackingInt(@intCast(f_value));
         }
         return error.UnknownBasicType;
     }
@@ -1447,7 +1447,7 @@ fn resolveLn(ctx: *ResolveCtx, scl: *const Scl, node: Ln) Error!void {
     // Which functional constraints appear anywhere below this logical node?
     // The FC lives on the DA, so this cannot be known without walking the
     // types first.
-    var seen = std.EnumSet(Fc).initEmpty();
+    var seen = std.EnumSet(Fc).empty;
     for (ln_type.dos) |do_ref| {
         const do_type = scl.templates.doType(do_ref.type) orelse return error.UnresolvedType;
         try collectFcs(scl, do_type, &seen, max_type_depth);
@@ -1479,7 +1479,7 @@ fn resolveLn(ctx: *ResolveCtx, scl: *const Scl, node: Ln) Error!void {
 
         for (ln_type.dos) |do_ref| {
             const do_type = scl.templates.doType(do_ref.type) orelse return error.UnresolvedType;
-            var below = std.EnumSet(Fc).initEmpty();
+            var below = std.EnumSet(Fc).empty;
             try collectFcs(scl, do_type, &below, max_type_depth);
             if (!contains(&below, fc, ctx.mirror_se_to_sg)) continue;
 
@@ -1612,7 +1612,7 @@ fn resolveDoType(
     }
     for (do_type.sdos) |sdo| {
         const sub = scl.templates.doType(sdo.type) orelse return error.UnresolvedType;
-        var below = std.EnumSet(Fc).initEmpty();
+        var below = std.EnumSet(Fc).empty;
         try collectFcs(scl, sub, &below, max_type_depth);
         if (!contains(&below, fc, ctx.mirror_se_to_sg)) continue;
         var buf: [acsi.max_reference_len]u8 = undefined;
@@ -2076,10 +2076,10 @@ test "an FCDA resolves to the MMS item the GOOSE decoder will see" {
 
 test "the SCL functional constraints are a superset of the ACSI ones" {
     // Every ACSI constraint is an SCL one…
-    inline for (@typeInfo(acsi.FunctionalConstraint).@"enum".fields) |f| {
-        const fc = try Fc.parse(f.name);
+    inline for (@typeInfo(acsi.FunctionalConstraint).@"enum".field_names, @typeInfo(acsi.FunctionalConstraint).@"enum".field_values) |f_name, f_value| {
+        const fc = try Fc.parse(f_name);
         try testing.expectEqual(
-            @as(?acsi.FunctionalConstraint, @fromBackingInt(@intCast(f.value))),
+            @as(?acsi.FunctionalConstraint, @fromBackingInt(@intCast(f_value))),
             fc.toAcsi(),
         );
     }
@@ -2480,7 +2480,7 @@ test "corpus: every SCL seed reaches the parser, and the accepted counts are pin
 /// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
 fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     const rep_result = comptime blk: {
-        @setEvalBranchQuota(n * 2 + 1000);
+        @setEvalBranchQuota(n * (s.len + 4) + 1000);
         var buf: [s.len * n:0]u8 = undefined;
         for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
         const rep_final = buf;

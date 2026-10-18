@@ -100,8 +100,8 @@ pub const FunctionalConstraint = enum {
 
     pub fn parse(s: []const u8) Error!FunctionalConstraint {
         if (s.len != 2) return error.UnknownFunctionalConstraint;
-        inline for (@typeInfo(FunctionalConstraint).@"enum".fields) |f| {
-            if (std.mem.eql(u8, s, f.name)) return @fromBackingInt(@intCast(f.value));
+        inline for (@typeInfo(FunctionalConstraint).@"enum".field_names, @typeInfo(FunctionalConstraint).@"enum".field_values) |f_name, f_value| {
+            if (std.mem.eql(u8, s, f_name)) return @fromBackingInt(@intCast(f_value));
         }
         return error.UnknownFunctionalConstraint;
     }
@@ -345,9 +345,9 @@ test "a GOOSE control block reference parses" {
 }
 
 test "every functional constraint parses and names itself" {
-    inline for (@typeInfo(FunctionalConstraint).@"enum".fields) |f| {
-        const fc = try FunctionalConstraint.parse(f.name);
-        try testing.expectEqualStrings(f.name, fc.name());
+    inline for (@typeInfo(FunctionalConstraint).@"enum".field_names, @typeInfo(FunctionalConstraint).@"enum".field_values) |f_name, _| {
+        const fc = try FunctionalConstraint.parse(f_name);
+        try testing.expectEqualStrings(f_name, fc.name());
     }
     try testing.expectEqual(@as(usize, 17), @typeInfo(FunctionalConstraint).@"enum".field_names.len);
     try testing.expect(FunctionalConstraint.CO.isOperational());
@@ -363,8 +363,8 @@ test "isOperational and isControlBlock cover every FC, not just a sample" {
     // .BR/.LG/.GS/.MS/.US for isControlBlock at all, in either direction.
     const operational = [_]FunctionalConstraint{ .CO, .SP, .SV, .SG, .SE };
     const control_block = [_]FunctionalConstraint{ .BR, .RP, .LG, .GO, .GS, .MS, .US };
-    inline for (@typeInfo(FunctionalConstraint).@"enum".fields) |f| {
-        const fc: FunctionalConstraint = @fromBackingInt(@intCast(f.value));
+    inline for (@typeInfo(FunctionalConstraint).@"enum".field_names, @typeInfo(FunctionalConstraint).@"enum".field_values) |_, f_value| {
+        const fc: FunctionalConstraint = @fromBackingInt(@intCast(f_value));
         const want_op = for (operational) |o| {
             if (o == fc) break true;
         } else false;
@@ -559,7 +559,7 @@ test "corpus: every seed reaches both parsers, and the accepted counts are pinne
 /// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
 fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     const rep_result = comptime blk: {
-        @setEvalBranchQuota(n * 2 + 1000);
+        @setEvalBranchQuota(n * (s.len + 4) + 1000);
         var buf: [s.len * n:0]u8 = undefined;
         for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
         const rep_final = buf;

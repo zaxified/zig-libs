@@ -415,9 +415,9 @@ fn parseSrc(storage: *const [@sizeOf(linux.sockaddr.in6)]u8, namelen: linux.sock
     if (namelen < 2) return .none;
     const af = std.mem.readInt(u16, storage[0..2], .little);
     if (af == linux.AF.INET and namelen >= @sizeOf(linux.sockaddr.in)) {
-        return .{ .v4 = @bitCast(storage[0..@sizeOf(linux.sockaddr.in)].*) };
+        return .{ .v4 = std.mem.bytesToValue(linux.sockaddr.in, storage[0..@sizeOf(linux.sockaddr.in)]) };
     } else if (af == linux.AF.INET6 and namelen >= @sizeOf(linux.sockaddr.in6)) {
-        return .{ .v6 = @bitCast(storage[0..@sizeOf(linux.sockaddr.in6)].*) };
+        return .{ .v6 = std.mem.bytesToValue(linux.sockaddr.in6, storage[0..@sizeOf(linux.sockaddr.in6)]) };
     }
     return .none;
 }

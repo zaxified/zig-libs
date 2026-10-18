@@ -357,7 +357,7 @@ pub fn attachKprobeOpts(
     const pmu_type = try kprobePmuType();
     const retprobe_bit = kprobeRetprobeBit();
 
-    const sym_z = try gpa.dupeZ(u8, symbol);
+    const sym_z = try gpa.dupeSentinel(u8, symbol, 0);
     defer gpa.free(sym_z);
 
     var attr = buildKprobeAttr(pmu_type, retprobe_bit, opts.retprobe, sym_z.ptr, opts.offset);
@@ -691,7 +691,7 @@ pub fn attachUprobeOpts(
     const retprobe_bit = uprobeRetprobeBit();
     const ref_ctr_shift = uprobeRefCtrShift();
 
-    const path_z = gpa.dupeZ(u8, binary_path) catch return error.OutOfMemory;
+    const path_z = gpa.dupeSentinel(u8, binary_path, 0) catch return error.OutOfMemory;
     defer gpa.free(path_z);
 
     var attr = buildUprobeAttr(
@@ -906,10 +906,11 @@ pub fn tracepointId(category: []const u8, name: []const u8) TracepointAttachErro
     var saw_root = false;
     for (tracefs_roots) |root| {
         var path_buf: [512]u8 = undefined;
-        const path = std.fmt.bufPrintZ(
+        const path = std.fmt.bufPrintSentinel(
             &path_buf,
             "{s}/events/{s}/{s}/id",
             .{ root, category, name },
+            0,
         ) catch return error.InvalidName;
 
         var buf: [32]u8 = undefined;
@@ -922,7 +923,7 @@ pub fn tracepointId(category: []const u8, name: []const u8) TracepointAttachErro
     // problem) from "that tracepoint does not exist" (a caller problem).
     for (tracefs_roots) |root| {
         var path_buf: [512]u8 = undefined;
-        const probe = std.fmt.bufPrintZ(&path_buf, "{s}/events", .{root}) catch continue;
+        const probe = std.fmt.bufPrintSentinel(&path_buf, "{s}/events", .{root}, 0) catch continue;
         const rc = linux.open(probe.ptr, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }, 0);
         if (linux.errno(rc) == .SUCCESS) {
             _ = linux.close(@intCast(rc));
@@ -1019,7 +1020,7 @@ pub fn attachRawTracepoint(
     if (name.len == 0 or name.len > 128) return error.InvalidName;
     if (std.mem.indexOfScalar(u8, name, 0) != null) return error.InvalidName;
 
-    const name_z = gpa.dupeZ(u8, name) catch return error.OutOfMemory;
+    const name_z = gpa.dupeSentinel(u8, name, 0) catch return error.OutOfMemory;
     defer gpa.free(name_z);
 
     var attr = buildRawTracepointAttr(name_z.ptr, prog_fd);
@@ -2378,7 +2379,7 @@ test "LIVE: cgroup attach prefers a BPF link and reports which path it took" {
     }
 
     var path_buf: [64]u8 = undefined;
-    const dir = try std.fmt.bufPrintZ(&path_buf, "/sys/fs/cgroup/zig-libs-ebpf-auto-{d}", .{linux.getpid()});
+    const dir = try std.fmt.bufPrintSentinel(&path_buf, "/sys/fs/cgroup/zig-libs-ebpf-auto-{d}", .{linux.getpid()}, 0);
     switch (linux.errno(linux.mkdir(dir.ptr, 0o755))) {
         .SUCCESS => {},
         else => {
@@ -2430,7 +2431,7 @@ test "LIVE: cgroup attach + detach in a throwaway cgroup" {
 
     // A private child cgroup so nothing system-wide is touched even briefly.
     var path_buf: [64]u8 = undefined;
-    const dir = try std.fmt.bufPrintZ(&path_buf, "/sys/fs/cgroup/zig-libs-ebpf-{d}", .{linux.getpid()});
+    const dir = try std.fmt.bufPrintSentinel(&path_buf, "/sys/fs/cgroup/zig-libs-ebpf-{d}", .{linux.getpid()}, 0);
     switch (linux.errno(linux.mkdir(dir.ptr, 0o755))) {
         .SUCCESS => {},
         else => {
@@ -2605,7 +2606,7 @@ fn fuzzParseConfigShift(comptime S: type, src: *S, gpa: std.mem.Allocator) anyer
 /// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
 fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     const rep_result = comptime blk: {
-        @setEvalBranchQuota(n * 2 + 1000);
+        @setEvalBranchQuota(n * (s.len + 4) + 1000);
         var buf: [s.len * n:0]u8 = undefined;
         for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
         const rep_final = buf;

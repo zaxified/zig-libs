@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — Ported to Zig 0.17.0. comptime `strRepeat` helper: larger `@setEvalBranchQuota` (0.17 counts more branches per iteration).
 - **2026-10-04** — **mvp → core.** New `parse(s, Options) ?Decimal` with `Options`, `Grouping` and
   `locale(name)` (CLDR group/decimal/grouping for 25 locales): UTF-8 separators (U+00A0, U+202F,
   `’`), Indian lakh/crore grouping, `+` and U+2212, parenthesised and trailing-minus negatives,

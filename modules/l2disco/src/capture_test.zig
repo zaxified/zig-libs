@@ -599,7 +599,7 @@ test "real capture: Cisco 3560 CDP frame decodes — device id, address, capabil
     // Addresses 0x02), and an undocumented type (0x1a) -- pass through raw,
     // unfailed, via the TLV iterator.
     var it = f.tlvIterator();
-    var seen_unanchored = std.EnumSet(UnanchoredCdpTlv).initEmpty();
+    var seen_unanchored = std.EnumSet(UnanchoredCdpTlv).empty;
     while (try it.next()) |tlv| {
         switch (tlv.type) {
             0x0008 => seen_unanchored.insert(.hello),
@@ -610,7 +610,7 @@ test "real capture: Cisco 3560 CDP frame decodes — device id, address, capabil
             else => {},
         }
     }
-    try testing.expect(seen_unanchored.eql(std.EnumSet(UnanchoredCdpTlv).initFull()));
+    try testing.expect(seen_unanchored.eql(std.EnumSet(UnanchoredCdpTlv).full));
 }
 
 /// CDP TLV types the Cisco 3560 real capture carries that this codec
