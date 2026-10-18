@@ -85,7 +85,7 @@ test "generators: dalek's PedersenGens B and B_blinding are g and h" {
 
 test "dalek -> here: every dalek proof verifies and re-encodes byte-exact" {
     try std.testing.expect(vectors.dalek_proofs.len >= 12);
-    var widths = std.bit_set.IntegerBitSet(65).initEmpty();
+    var widths = std.bit_set.IntegerBitSet(65).empty;
     for (vectors.dalek_proofs) |c| {
         const bytes = try hexAlloc(c.proof);
         defer talloc.free(bytes);
@@ -158,7 +158,7 @@ fn pointsAlloc(hexes: []const []const u8) ![]Ristretto255 {
 
 test "dalek -> here: every dalek aggregated proof verifies and re-encodes byte-exact" {
     try std.testing.expect(vectors.dalek_multi_proofs.len >= 6);
-    var ms = std.bit_set.IntegerBitSet(9).initEmpty();
+    var ms = std.bit_set.IntegerBitSet(9).empty;
     for (vectors.dalek_multi_proofs) |c| {
         const vs = try pointsAlloc(c.vs);
         defer talloc.free(vs);

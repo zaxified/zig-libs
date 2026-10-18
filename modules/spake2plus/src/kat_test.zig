@@ -190,8 +190,8 @@ test "KAT: verifierConfirm reproduces confirmV byte-exact — with NO confirmP i
 // the Verifier has never seen `confirmP`. This pins the shape of the fix.
 test "verifierConfirm returns confirmV and nothing that reconstructs K_shared" {
     const info = @typeInfo(spake2plus.VerifierConfirmResult).@"struct";
-    try std.testing.expectEqual(@as(usize, 1), info.fields.len);
-    try std.testing.expectEqualStrings("confirm_v", info.fields[0].name);
+    try std.testing.expectEqual(@as(usize, 1), info.field_names.len);
+    try std.testing.expectEqualStrings("confirm_v", info.field_names[0]);
 }
 
 test "KAT: verifierFinish reproduces Z, V, TT, key schedule, confirmV, and K_shared, all byte-exact" {

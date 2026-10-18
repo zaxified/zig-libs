@@ -509,8 +509,8 @@ pub fn prove(m: group.Modulus, x_bytes: []const u8, y_bytes: []const u8, t: u64)
 
 /// Unsigned integer type holding the streaming long-division remainder
 /// (`< l < 2^prime_bits`), plus a one-bit-wider type for its doubling.
-const RemUint = std.meta.Int(.unsigned, prime_bits);
-const RemUintWide = std.meta.Int(.unsigned, prime_bits + 1);
+const RemUint = @Int(.unsigned, prime_bits);
+const RemUintWide = @Int(.unsigned, prime_bits + 1);
 
 /// `x^floor(2^t / l) mod N` WITHOUT ever materializing the ~`t`-bit
 /// quotient `q = floor(2^t / l)`: schoolbook long division of `2^t` by

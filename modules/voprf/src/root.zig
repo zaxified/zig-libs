@@ -1063,9 +1063,9 @@ test "blind/blindEvaluate carry no error a caller could branch on a secret with"
     // never from the multiply. `InvalidBlind` must NOT be back.
     try std.testing.expect(@typeInfo(@TypeOf(blindEvaluate)).@"fn".return_type.? == Element);
     const blind_err = @typeInfo(@typeInfo(@TypeOf(blind)).@"fn".return_type.?).error_union.error_set;
-    const members = @typeInfo(blind_err).error_set.?;
+    const members = @typeInfo(blind_err).error_set.error_names.?;
     try std.testing.expectEqual(@as(usize, 1), members.len);
-    try std.testing.expectEqualStrings("InvalidInput", members[0].name);
+    try std.testing.expectEqualStrings("InvalidInput", members[0]);
 }
 
 test "deserializeScalar enforces canonicity" {

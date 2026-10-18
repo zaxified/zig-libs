@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Ported to Zig 0.17.0. Test only: std 0.17 `Edwards25519.fromBytes` itself now rejects x = 0 with the sign bit set, so the kat_test control expects rejection; `decodeProof` result unchanged.
+
 - **2026-10-10** — tests: deterministic fuzz driver `ECVRF_FUZZ` (testkit) over `decodeProof` (accepted proofs re-encode canonically), `verify` on damaged key/proof pairs, and prove/verify (genuine proof accepted and hashes agree; a flipped bit, another alpha or another key refused). No change to the library code.
 - **2026-10-09** — **BREAKING:** `secretScalar`, `nonceGenerationString`, `nonceGeneration` and `KeyPair.fromSecretKey` no longer take the seed by value or return the secret: `secretScalar(out *[32]u8, sk *const SecretKey)`, `nonceGenerationString(out *[64]u8, sk *const, h_string)`, `nonceGeneration(out *[32]u8, sk *const, h_string)`, `KeyPair.fromSecretKey(out *KeyPair, sk *const)` (all `void`). The first three now burn their stack (`burn.zig`). Probe: `src/stackprobe2_test.zig`; README example, KAT test, old probe and ctgrind harness migrated.
 - **2026-10-08** — **BREAKING + FIX (secrets on the dead stack, HIGH):** the A1 E4 hand probe was not

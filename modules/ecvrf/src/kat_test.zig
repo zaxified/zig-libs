@@ -378,7 +378,8 @@ test "negative: RFC 8032 §5.1.3 strict decoding refuses a non-canonical Gamma, 
     var signed = identity;
     signed[31] = 0x80;
     pi[0..32].* = signed;
-    try std.testing.expect(if (std.crypto.ecc.Edwards25519.fromBytes(signed)) |_| true else |_| false);
+    // zig 0.17: std's `fromBytes` itself now rejects x = 0 with the sign bit set (0.16 accepted it).
+    try std.testing.expect(if (std.crypto.ecc.Edwards25519.fromBytes(signed)) |_| false else |_| true);
     try std.testing.expectError(error.InvalidProof, ecvrf.decodeProof(pi));
     try std.testing.expectError(error.InvalidEncoding, ecvrf.stringToPoint(signed));
 }
