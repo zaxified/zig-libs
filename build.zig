@@ -526,6 +526,11 @@ pub fn build(b: *std.Build) void {
         "montint-asm-unroll",
         "montint: straight-line asm per limb count from 1024 bits up (default true; profile=small false = one looped asm kernel, slower modexp, much less code on ADX/BMI2 CPUs)",
     ));
+    zl_options.addOption(?u32, "ssh_gex_max_bits", b.option(
+        u32,
+        "ssh-gex-max-bits",
+        "ssh: largest DH group-exchange prime the client accepts, 4096..8192 (default 8192; profile=small 4096)",
+    ));
     zl_options_mod = zl_options.createModule();
 
     // Gate for the "a body nothing references is never analysed" class — see

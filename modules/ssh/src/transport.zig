@@ -2256,10 +2256,29 @@ pub const msg_kex_dh_gex_reply: u8 = 33;
 /// `MaximumBits` (2048 / 2048 / 8192). RFC 8270 raised the floor to 2048.
 pub const gex_min_bits: u32 = 2048;
 pub const gex_preferred_bits: u32 = 2048;
-pub const gex_max_bits: u32 = 8192;
+/// **Consumer build option** (CONVENTIONS §4.2): `-Dssh-gex-max-bits=N`
+/// (4096..8192, a multiple of 1024), or `-Dprofile=small` → 4096. The client
+/// then asks for at most N bits and refuses a larger server group with
+/// `error.KexFailed` (`gexGroupBitsOk`), and `GexMod` carries no slot above
+/// N — the same `DynModint(N)` type as rsa's at the same cap, so the two
+/// drop together. Default 8192 (Go's maximum; the graded scope).
+pub const gex_max_bits: u32 = zl_options.ssh_gex_max_bits orelse switch (zl_options.profile) {
+    .default => 8192,
+    .small => 4096,
+};
+comptime {
+    if (gex_max_bits < 4096 or gex_max_bits > 8192 or gex_max_bits % 1024 != 0)
+        @compileError("ssh-gex-max-bits must be 4096..8192 and a multiple of 1024");
+}
+const zl_options = @import("zl_options");
+
+/// Whether a server group of `pbits` bits is in the range the client asked for.
+fn gexGroupBitsOk(pbits: usize) bool {
+    return pbits >= gex_min_bits and pbits <= gex_max_bits;
+}
 
 /// The server-chosen prime runs on montint's run-time modulus (constant-time
-/// `pow`); 8192 bits is the largest group a client here accepts.
+/// `pow`); `gex_max_bits` is the largest group a client here accepts.
 pub const GexMod = montint.DynModint(gex_max_bits);
 pub const gex_max_prime_len = gex_max_bits / 8;
 
@@ -2399,7 +2418,7 @@ fn dhGexKexBody(
     const p = stripLeadingZeros(try gcur.string());
     const g = stripLeadingZeros(try gcur.string());
     const pbits = magnitudeBits(p);
-    if (pbits < gex_min_bits or pbits > gex_max_bits) return error.KexFailed;
+    if (!gexGroupBitsOk(pbits)) return error.KexFailed;
     if (p[p.len - 1] & 1 == 0) return error.KexFailed;
     if (gexRejectsPeerValue(p, g)) return error.KexFailed;
     // `p`/`g` stay in `gbuf`, which no later read touches.
@@ -5386,6 +5405,12 @@ test "dhGexKex (client) group checks: bit length, parity, generator range" {
     try t.expect(!gexRejectsPeerValue(&[_]u8{ 0x01, 0x00 }, &[_]u8{0xfe}));
     try t.expectEqual(@as(usize, 2048), magnitudeBits(&([_]u8{0x80} ++ [_]u8{0} ** 255)));
     try t.expectEqual(@as(usize, 2047), magnitudeBits(&([_]u8{0x7f} ++ [_]u8{0} ** 255)));
+    // The bit range follows the build's cap (`ssh-gex-max-bits`): a bigger
+    // group fails the kex loudly instead of running past `GexMod`'s slots.
+    try t.expect(!gexGroupBitsOk(2047));
+    try t.expect(gexGroupBitsOk(2048));
+    try t.expect(gexGroupBitsOk(gex_max_bits));
+    try t.expect(!gexGroupBitsOk(gex_max_bits + 1));
 }
 
 test "live interop against OpenSSH sshd — aes192-ctr" {

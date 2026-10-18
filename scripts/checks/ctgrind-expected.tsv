@@ -221,7 +221,7 @@ oscore	ReleaseFast	unprotect	1	1	27958d87aa1dac88	ed85db89e3d7e9fd
 # reaches the exchange hash whatever the code does. `ffpow`: POSITIVE CONTROL,
 # the same K through the std.crypto.ff pow dhPowModPrime used until this date
 # — its window select compiles to a jump in ReleaseFast. It must stay >= 1.
-ssh	ReleaseFast	dh	1	4	e0204aaf99b50572	95639ff37028e502
+ssh	ReleaseFast	dh	1	4	8505f526740ccf3b	95639ff37028e502
 ssh	ReleaseFast	ffpow	1	>=1	NO-OWN-SRC	95639ff37028e502
 # ssh ecdh (2026-10-10): ecdh-sha2-nistp256/384/521, the ephemeral scalar tainted
 # through fromScalar, ecdhNistShared and ecdhNistFinish, P-256, P-384, then P-521
@@ -238,8 +238,8 @@ ssh	ReleaseFast	ffpow	1	>=1	NO-OWN-SRC	95639ff37028e502
 # montint's DynModint (the server-chosen prime; group14 and group16 primes
 # here) — 0 contexts in dyn/montint/limbs; the 2 in-file are stripLeadingZeros
 # on e and K (RFC 4251 §5 mpint length, as `dh`).
-ssh	ReleaseFast	gex	1	2	e0204aaf99b50572	2d8d321e6c103efe
-ssh	ReleaseFast	ecdh	1	22	e0204aaf99b50572	8683e4aaf784b64c
+ssh	ReleaseFast	gex	1	2	8505f526740ccf3b	2d8d321e6c103efe
+ssh	ReleaseFast	ecdh	1	22	8505f526740ccf3b	8683e4aaf784b64c
 # ssh pem / pemstd (2026-10-18): HostKey.fromOpenSSH on the ed25519 fixture with the base64
 # characters carrying only seed bits tainted (44 - 2 edge characters; the edges share bits with
 # the private string's 0x40 length and the public-key copy, and tainting them made every later

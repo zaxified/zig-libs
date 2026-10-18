@@ -342,6 +342,25 @@ environment with OpenSSH installed.
   listens, so a port collision can turn one live test into a skip on an individual run (observed
   once in ~10 runs); a run that reports no skips is the one that proves interop.
 
+## Build options
+
+Consumer build options (CONVENTIONS §4.2), added 2026-10-18:
+
+| option | values | default | `-Dprofile=small` |
+|---|---|---|---|
+| `ssh-gex-max-bits` | 4096..8192, multiple of 1024 | 8192 (Go's maximum, graded) | 4096 |
+
+- **Lower cap:** the client's `SSH_MSG_KEX_DH_GEX_REQUEST` asks for at most the cap, and a server group above it fails the key
+  exchange with `error.KexFailed` (`gexGroupBitsOk`, tested at the cap and one bit over); `GexMod = DynModint(cap)` carries
+  no montint slot above it. It is the same type as rsa's `DynModint` at the same cap, so an application lowering both
+  (`-Dprofile=small` does) loses every 8192-bit kernel.
+- **What it buys** (size probe `tools/sizeprobe.zig`: `GexMod` + one `gexPow`; ReleaseSmall, native ADX/BMI2 x86_64,
+  stripped): `-Dssh-gex-max-bits=4096` alone 184 720 → 115 160 B; `-Dprofile=small` (with montint's looped kernel)
+  → 29 440 B.
+- **What the consumer loses:** group exchange with a server that will only offer a group above the cap (OpenSSH's moduli
+  file goes to 8192; a server picks the group closest to the client's preferred 2048, so this is rare). `curve25519`,
+  `ecdh-*`, `mlkem768x25519` and the fixed MODP groups are unaffected.
+
 ## Backlog / deferred
 
 - ~~**Ed25519 host key: the seed is not checked against the public key in ReleaseFast/ReleaseSmall**~~
@@ -366,7 +385,7 @@ environment with OpenSSH installed.
   Later the same day `pem` 1 → **3** with the seed-check fix below it in this list: the derived public
   key's `rejectIdentity` in std's `pcMul16` and its compare with the container's copy — both decide on the
   public key (tainted to memcheck only because it is derived from the seed).
-- **Build option: `ssh-gex-max-bits`** (design 2026-10-17, mechanism and checklist in CONVENTIONS §4.2; measure first — HTTPS sizeprobe or `nm -S --size-sort` on a consumer binary — and add a knob only for a measured gain of roughly ≥ 100 KB or a consumer request). `gex_max_bits = 8192` (src/transport.zig `GexMod = montint.DynModint(gex_max_bits)`)
+- ~~**Build option: `ssh-gex-max-bits`**~~ ✅ DONE 2026-10-18 — see § Build options. Was (design 2026-10-17, mechanism and checklist in CONVENTIONS §4.2; measure first — HTTPS sizeprobe or `nm -S --size-sort` on a consumer binary — and add a knob only for a measured gain of roughly ≥ 100 KB or a consumer request). `gex_max_bits = 8192` (src/transport.zig `GexMod = montint.DynModint(gex_max_bits)`)
   is the SAME type as rsa's `DynModint(8192)`, so lowering rsa alone saves nothing for an ssh consumer: both must drop together.
   `.small` → 4096 (RFC 8270 floor is 2048; a server offering a bigger group than the cap fails the kex loudly — check it does, with a
   test). Measured on the HTTPS sizeprobe (native CPU, ADX/BMI2): `DynModint(8192)` 5.37 MB vs 1.77 MB at 4096. Note for montint's
