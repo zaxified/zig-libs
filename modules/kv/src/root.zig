@@ -5278,7 +5278,7 @@ const child_open_failed: i32 = 73; // could not open a store it should have got
 /// Bounded by construction: this returns even for a child that ignores
 /// everything.
 fn reapBounded(pid: i32, deadline_ms: usize) !u32 {
-    var status: u32 = 0;
+    var status: i32 = 0;
     var waited: usize = 0;
     while (waited < deadline_ms) : (waited += 5) {
         const rc = linux.waitpid(pid, &status, linux.W.NOHANG);
@@ -5286,7 +5286,7 @@ fn reapBounded(pid: i32, deadline_ms: usize) !u32 {
             if (linux.errno(rc) == .INTR) continue;
             return error.WaitFailed;
         }
-        if (rc != 0) return status;
+        if (rc != 0) return @bitCast(status);
         var ts = linux.timespec{ .sec = 0, .nsec = 5 * std.time.ns_per_ms };
         _ = linux.nanosleep(&ts, null);
     }
@@ -5296,7 +5296,7 @@ fn reapBounded(pid: i32, deadline_ms: usize) !u32 {
         if (@as(isize, @bitCast(rc)) < 0 and linux.errno(rc) == .INTR) continue;
         break;
     }
-    return status;
+    return @bitCast(status);
 }
 
 test "lock: a REAL second process is refused by the holder's flock" {

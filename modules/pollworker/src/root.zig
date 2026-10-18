@@ -276,7 +276,7 @@ const OwnedArgv = struct {
             for (args[0..i]) |a| gpa.free(a);
             gpa.free(args);
         }
-        while (i < argv.len) : (i += 1) args[i] = try gpa.dupeZ(u8, argv[i]);
+        while (i < argv.len) : (i += 1) args[i] = try gpa.dupeSentinel(u8, argv[i], 0);
 
         const ptrs = try gpa.allocSentinel(?[*:0]const u8, argv.len, null);
         for (args, 0..) |a, k| ptrs[k] = a.ptr;
@@ -313,7 +313,7 @@ fn runChild(argv_ptrs: [:null]?[*:0]const u8) ProcResult {
         linux.exit_group(127); // execve returned → target missing/not executable
     }
 
-    var status: u32 = 0;
+    var status: i32 = 0;
     while (true) {
         const w = linux.waitpid(@intCast(pid), &status, 0);
         if (@as(isize, @bitCast(w)) < 0) {
@@ -322,7 +322,7 @@ fn runChild(argv_ptrs: [:null]?[*:0]const u8) ProcResult {
         }
         break;
     }
-    return decodeStatus(status);
+    return decodeStatus(@bitCast(status));
 }
 
 /// Decode a `wait(2)` status word into a `ProcResult` (no libc W* macros).

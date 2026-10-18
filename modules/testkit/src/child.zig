@@ -63,7 +63,7 @@ pub fn run(f: anytype, args: anytype, opts: Options) error{ ForkFailed, WaitFail
         // No core dump: under a piped `core_pattern` (systemd-coredump) every
         // crashing candidate was a process handed to the dump handler and a
         // journal entry (the same test: 4.5 s with dumps, 0.07 s without).
-        _ = linux.prctl(@intFromEnum(linux.PR.SET_DUMPABLE), 0, 0, 0, 0);
+        _ = linux.prctl(@backingInt(linux.PR.SET_DUMPABLE), 0, 0, 0, 0);
         const no_core: linux.rlimit = .{ .cur = 0, .max = 0 };
         _ = linux.setrlimit(.CORE, &no_core);
         const null_fd = linux.open("/dev/null", .{ .ACCMODE = .WRONLY }, 0);
@@ -92,10 +92,10 @@ pub fn run(f: anytype, args: anytype, opts: Options) error{ ForkFailed, WaitFail
         // No pidfd (kernel < 5.3): poll the child with WNOHANG.
         const deadline = nowMs() + opts.limit_ms;
         while (true) {
-            var st: u32 = 0;
+            var st: i32 = 0;
             const rc = linux.wait4(pid, &st, linux.W.NOHANG, null);
             if (linux.errno(rc) != .SUCCESS) return error.WaitFailed;
-            if (rc != 0) return decode(st);
+            if (rc != 0) return decode(@bitCast(st));
             if (nowMs() >= deadline) {
                 timed_out = true;
                 break;
@@ -105,19 +105,19 @@ pub fn run(f: anytype, args: anytype, opts: Options) error{ ForkFailed, WaitFail
         }
     }
     if (timed_out) _ = linux.kill(pid, .KILL);
-    var st: u32 = 0;
+    var st: i32 = 0;
     while (true) {
         const rc = linux.wait4(pid, &st, 0, null);
         if (linux.errno(rc) == .INTR) continue;
         if (linux.errno(rc) != .SUCCESS) return error.WaitFailed;
         break;
     }
-    return if (timed_out) .hang else decode(st);
+    return if (timed_out) .hang else decode(@bitCast(st));
 }
 
 fn decode(st: u32) Outcome {
     if (linux.W.IFEXITED(st)) return .{ .exited = linux.W.EXITSTATUS(st) };
-    return .{ .signaled = @intFromEnum(linux.W.TERMSIG(st)) };
+    return .{ .signaled = @backingInt(linux.W.TERMSIG(st)) };
 }
 
 fn nowMs() u64 {
@@ -150,7 +150,7 @@ test "run: an exit code, a signal and a hang are told apart" {
     if (!supported) return error.SkipZigTest;
     try testing.expect((try run(exitWith, .{0}, .{ .limit_ms = 5000 })).eql(.{ .exited = 0 }));
     try testing.expect((try run(exitWith, .{37}, .{ .limit_ms = 5000 })).eql(.{ .exited = 37 }));
-    try testing.expect((try run(raise, .{linux.SIG.USR1}, .{ .limit_ms = 5000 })).eql(.{ .signaled = @intFromEnum(linux.SIG.USR1) }));
+    try testing.expect((try run(raise, .{linux.SIG.USR1}, .{ .limit_ms = 5000 })).eql(.{ .signaled = @backingInt(linux.SIG.USR1) }));
     try testing.expect((try run(spin, .{}, .{ .limit_ms = 50 })).eql(.hang));
 }
 

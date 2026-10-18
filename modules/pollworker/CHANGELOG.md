@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — Ported to Zig 0.17.0. `dupeZ` -> `dupeSentinel(u8, s, 0)`; `waitpid` status is `i32`.
 - **2026-10-05** — Mutation run: 22 of 22 killed, 0 equivalent; 7 tests added
   (`poll` EINTR, `drain` skipping RUNNING, empty argv, `spawnDetached` under
   allocation failure, full argv reaching the child, exit 127 on a failed exec,

@@ -202,7 +202,7 @@ pub const ScriptSource = struct {
                 return all[self.valueRangeAtMost(usize, 0, all.len - 1)];
             },
             .int => |info| {
-                const U = std.meta.Int(.unsigned, info.bits);
+                const U = @Int(.unsigned, info.bits);
                 if (info.bits <= 8) return @bitCast(@as(U, @truncate(self.cur.byte())));
                 var x: U = 0;
                 for (0..(info.bits + 7) / 8) |_| x = (x << 8) | self.cur.byte();

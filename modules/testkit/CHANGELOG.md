@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — Ported to Zig 0.17.0. `std.meta.Int` -> `@Int`; `wait4` status is `i32`. `runSeedsReporting` (and the shrinker's seed search) give every seed its own `std.heap.SafeAllocator` over the caller's allocator, deinit at seed end: a leak fails that seed (`FAIL <name> seed=N: memory leak`, `error.MemoryLeakDetected`) and the 0.17 never-reusing `testing.allocator` no longer grows with the seed count.
 - **2026-10-17** — `stackprobe.Expect.quiet`: a probe expected to fail prints no report (the two positive controls used to write to stderr from a passing test, which a lane treats as a failure).
 
 - **2026-10-17** — `global-alloc-ok` marker on the watchdog test's forked child (`check-global-alloc`). Test only.

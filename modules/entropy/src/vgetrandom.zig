@@ -95,7 +95,7 @@ fn init() void {
 /// must be a defined global/weak function or object, and its DT_VERSYM entry
 /// must name `version` in DT_VERDEF.
 fn vdsoLookup(version: []const u8, name: []const u8) usize {
-    const vdso_addr = linux.getauxval(std.elf.AT_SYSINFO_EHDR);
+    const vdso_addr = linux.getauxval(std.elf.AT.SYSINFO_EHDR);
     if (vdso_addr == 0) return 0;
     return vdsoLookupAt(vdso_addr, version, name);
 }
@@ -109,11 +109,11 @@ fn vdsoLookupAt(vdso_addr: usize, version: []const u8, name: []const u8) usize {
     var dynv_opt: ?[*]const usize = null;
     var load_base: ?usize = null;
     for (0..eh.e_phnum) |i| {
-        const ph: *const elf.Phdr = @ptrFromInt(vdso_addr + eh.e_phoff + i * eh.e_phentsize);
-        switch (ph.p_type) {
+        const ph: *const elf.ElfN.Phdr = @ptrFromInt(vdso_addr + eh.e_phoff + i * eh.e_phentsize);
+        switch (ph.type) {
             // Wrapping: some kernels pre-link the image in the upper half.
-            elf.PT_LOAD => load_base = vdso_addr +% ph.p_offset -% ph.p_vaddr,
-            elf.PT_DYNAMIC => dynv_opt = @ptrFromInt(vdso_addr + ph.p_offset),
+            .LOAD => load_base = vdso_addr +% ph.offset -% ph.vaddr,
+            .DYNAMIC => dynv_opt = @ptrFromInt(vdso_addr + ph.offset),
             else => {},
         }
     }
@@ -180,7 +180,7 @@ fn gnuHashSymCount(gh: [*]const u32) usize {
 fn versionMatches(first: *const std.elf.Verdef, vsym: std.elf.Versym, version: []const u8, strings: [*:0]const u8) bool {
     var def = first;
     while (true) {
-        if (def.flags & std.elf.VER_FLG_BASE == 0 and @intFromEnum(def.ndx) == vsym.VERSION) break;
+        if (def.flags & std.elf.VER_FLG_BASE == 0 and @backingInt(def.ndx) == vsym.VERSION) break;
         if (def.next == 0) return false;
         def = @ptrFromInt(@intFromPtr(def) + def.next);
     }
@@ -239,11 +239,11 @@ fn diagLookup(vdso_addr: usize, s: ModelSym) void {
     var dynv_opt: ?[*]const usize = null;
     var load_base: ?usize = null;
     for (0..eh.e_phnum) |i| {
-        const ph: *const elf.Phdr = @ptrFromInt(vdso_addr + eh.e_phoff + i * eh.e_phentsize);
-        std.debug.print("vdso diag:   phdr {d} type 0x{x} off 0x{x} vaddr 0x{x}\n", .{ i, ph.p_type, ph.p_offset, ph.p_vaddr });
-        switch (ph.p_type) {
-            elf.PT_LOAD => load_base = vdso_addr +% ph.p_offset -% ph.p_vaddr,
-            elf.PT_DYNAMIC => dynv_opt = @ptrFromInt(vdso_addr + ph.p_offset),
+        const ph: *const elf.ElfN.Phdr = @ptrFromInt(vdso_addr + eh.e_phoff + i * eh.e_phentsize);
+        std.debug.print("vdso diag:   phdr {d} type 0x{x} off 0x{x} vaddr 0x{x}\n", .{ i, ph.type, ph.offset, ph.vaddr });
+        switch (ph.type) {
+            .LOAD => load_base = vdso_addr +% ph.offset -% ph.vaddr,
+            .DYNAMIC => dynv_opt = @ptrFromInt(vdso_addr + ph.offset),
             else => {},
         }
     }
@@ -344,7 +344,7 @@ fn modelSymbols(vdso_addr: usize, out: []ModelSym) []ModelSym {
             var found = false;
             for (0..verdef.?.sh_info) |_| {
                 const vd = std.mem.bytesToValue(elf.Verdef, img[off..][0..@sizeOf(elf.Verdef)]);
-                if (vd.flags & elf.VER_FLG_BASE == 0 and @intFromEnum(vd.ndx) == vs) {
+                if (vd.flags & elf.VER_FLG_BASE == 0 and @backingInt(vd.ndx) == vs) {
                     const aux = std.mem.bytesToValue(elf.Verdaux, img[off + vd.aux ..][0..@sizeOf(elf.Verdaux)]);
                     ver = cstr(img, strtab, aux.name);
                     found = true;
@@ -363,7 +363,7 @@ fn modelSymbols(vdso_addr: usize, out: []ModelSym) []ModelSym {
 
 test "vdsoLookup agrees with the section-table model on every exported vDSO symbol" {
     if (builtin.os.tag != .linux or @sizeOf(usize) != 8) return error.SkipZigTest;
-    const vdso_addr = linux.getauxval(std.elf.AT_SYSINFO_EHDR);
+    const vdso_addr = linux.getauxval(std.elf.AT.SYSINFO_EHDR);
     if (vdso_addr == 0) return error.SkipZigTest;
     var buf: [256]ModelSym = undefined;
     const syms = modelSymbols(vdso_addr, &buf);
@@ -430,17 +430,17 @@ test "draw from more threads than slots at once: every buffer filled, no slot le
 
 test "gnuHashSymCount agrees with DT_HASH's nchain where the vDSO carries both" {
     if (builtin.os.tag != .linux or @sizeOf(usize) != 8) return error.SkipZigTest;
-    const vdso_addr = linux.getauxval(std.elf.AT_SYSINFO_EHDR);
+    const vdso_addr = linux.getauxval(std.elf.AT.SYSINFO_EHDR);
     if (vdso_addr == 0) return error.SkipZigTest;
     const elf = std.elf;
     const eh: *const elf.Ehdr = @ptrFromInt(vdso_addr);
     var dynv_opt: ?[*]const usize = null;
     var load_base: ?usize = null;
     for (0..eh.e_phnum) |i| {
-        const ph: *const elf.Phdr = @ptrFromInt(vdso_addr + eh.e_phoff + i * eh.e_phentsize);
-        switch (ph.p_type) {
-            elf.PT_LOAD => load_base = vdso_addr +% ph.p_offset -% ph.p_vaddr,
-            elf.PT_DYNAMIC => dynv_opt = @ptrFromInt(vdso_addr + ph.p_offset),
+        const ph: *const elf.ElfN.Phdr = @ptrFromInt(vdso_addr + eh.e_phoff + i * eh.e_phentsize);
+        switch (ph.type) {
+            .LOAD => load_base = vdso_addr +% ph.offset -% ph.vaddr,
+            .DYNAMIC => dynv_opt = @ptrFromInt(vdso_addr + ph.offset),
             else => {},
         }
     }

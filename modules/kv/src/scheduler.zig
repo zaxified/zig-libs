@@ -347,8 +347,8 @@ test "uniformScheduler: over many draws, exercises every FaultClass and both tim
     // cell that can never be covered by construction, not a coverage gap.
     try testing.expectEqual(@as(usize, 1), cov.uncoveredCount());
     try testing.expectEqual(@as(usize, 0), cov.countOf(.clean, .late));
-    inline for (@typeInfo(FaultClass).@"enum".fields) |f| {
-        const class: FaultClass = @fromBackingInt(@intCast(f.value));
+    inline for (@typeInfo(FaultClass).@"enum".field_names, @typeInfo(FaultClass).@"enum".field_values) |_, v| {
+        const class: FaultClass = @fromBackingInt(@intCast(v));
         if (class == .clean) continue;
         try testing.expect(cov.countOf(class, .early) > 0);
         try testing.expect(cov.countOf(class, .late) > 0);

@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — Ported to Zig 0.17.0. `waitpid` status is `i32` (converted with `@bitCast` at the `reapBounded` boundary); enum `field_names`/`field_values` in a test.
 - **2026-10-14** — Replay reads each data file through a 64 KiB window (one `pread` per window instead of three or more per record): `open` of a 100 000-key store 1.78× → 0.27× rosedb. New comparative benchmark `zig build bench-kv` against github.com/rosedblabs/rosedb/v2 v2.4.0 (`tools/bench.zig`, `tools/go_bench`): ref 0.27–1.01×. Scope now parity with Bitcask → **grade 2**. Found in passing: rosedb v2.4.0's `Options.Sync = true` does not fsync a `Put`.
 
 - **2026-10-14** — Read-only open (S2 survey R5b, Bitcask `open/1`): `Options.read_only` opens a store another `Db` (any process) may be writing — no lock, nothing created, deleted, truncated or written; a mid-write tail is skipped, not cut; a file a concurrent merge deleted makes it re-read the manifest. `Db.refresh()` reloads the view. Mutations on a reader return `error.AccessDenied`. New `OpenError.Busy` (a reader that lost the race to a merging writer 16 times in a row).

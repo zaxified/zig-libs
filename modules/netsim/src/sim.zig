@@ -140,7 +140,7 @@ const fp_prime: u64 = 0x100000001b3; // FNV-ish odd multiplier
 
 fn foldFingerprint(fp: u64, e: LogEntry) u64 {
     var h = fp;
-    h = h *% fp_prime +% @intFromEnum(e.tag);
+    h = h *% fp_prime +% @backingInt(e.tag);
     h = h *% fp_prime +% e.time;
     h = h *% fp_prime +% e.seq;
     h = h *% fp_prime +% @as(u64, @bitCast(e.a));
@@ -676,18 +676,18 @@ pub const Sim = struct {
         switch (fk) {
             .link_down => |l| {
                 if (self.findLink(l.a, l.b)) |link| link.up = false;
-                self.append(.{ .tag = .fault, .a = @intFromEnum(std.meta.activeTag(fk)), .b = l.a, .c = l.b });
+                self.append(.{ .tag = .fault, .a = @backingInt(std.meta.activeTag(fk)), .b = l.a, .c = l.b });
             },
             .link_up => |l| {
                 if (self.findLink(l.a, l.b)) |link| link.up = true;
-                self.append(.{ .tag = .fault, .a = @intFromEnum(std.meta.activeTag(fk)), .b = l.a, .c = l.b });
+                self.append(.{ .tag = .fault, .a = @backingInt(std.meta.activeTag(fk)), .b = l.a, .c = l.b });
             },
             .partition => |p| {
                 const cut = try self.arena.allocator().dupe(NodeId, p.cut);
                 var cut_set = try std.DynamicBitSetUnmanaged.initEmpty(self.arena.allocator(), self.nodes.items.len);
                 for (cut) |n| if (n < self.nodes.items.len) cut_set.set(n);
                 try self.partitions.append(self.gpa, .{ .id = p.id, .cut = cut, .cut_set = cut_set });
-                self.append(.{ .tag = .fault, .a = @intFromEnum(std.meta.activeTag(fk)), .b = p.id, .c = @intCast(p.cut.len) });
+                self.append(.{ .tag = .fault, .a = @backingInt(std.meta.activeTag(fk)), .b = p.id, .c = @intCast(p.cut.len) });
             },
             .heal => |h| {
                 var i: usize = 0;
@@ -696,7 +696,7 @@ pub const Sim = struct {
                         _ = self.partitions.orderedRemove(i);
                     } else i += 1;
                 }
-                self.append(.{ .tag = .fault, .a = @intFromEnum(std.meta.activeTag(fk)), .b = h.id });
+                self.append(.{ .tag = .fault, .a = @backingInt(std.meta.activeTag(fk)), .b = h.id });
             },
             .crash_node => |c| {
                 // audit F1: `replay` is public and takes a trace from
@@ -718,19 +718,19 @@ pub const Sim = struct {
             .clock_jump => |j| {
                 if (j.node >= self.nodes.items.len) return error.UnknownNode;
                 self.nodes.items[j.node].clock_offset += j.delta;
-                self.append(.{ .tag = .fault, .a = @intFromEnum(std.meta.activeTag(fk)), .b = j.node, .c = j.delta });
+                self.append(.{ .tag = .fault, .a = @backingInt(std.meta.activeTag(fk)), .b = j.node, .c = j.delta });
             },
             .drop_once => |l| {
                 if (self.findLink(l.a, l.b)) |link| link.drop_pending += 1;
-                self.append(.{ .tag = .fault, .a = @intFromEnum(std.meta.activeTag(fk)), .b = l.a, .c = l.b });
+                self.append(.{ .tag = .fault, .a = @backingInt(std.meta.activeTag(fk)), .b = l.a, .c = l.b });
             },
             .dup_once => |l| {
                 if (self.findLink(l.a, l.b)) |link| link.dup_pending += 1;
-                self.append(.{ .tag = .fault, .a = @intFromEnum(std.meta.activeTag(fk)), .b = l.a, .c = l.b });
+                self.append(.{ .tag = .fault, .a = @backingInt(std.meta.activeTag(fk)), .b = l.a, .c = l.b });
             },
             .delay_once => |d| {
                 if (self.findLink(d.a, d.b)) |link| link.delay_pending += d.extra;
-                self.append(.{ .tag = .fault, .a = @intFromEnum(std.meta.activeTag(fk)), .b = d.a, .c = d.b });
+                self.append(.{ .tag = .fault, .a = @backingInt(std.meta.activeTag(fk)), .b = d.a, .c = d.b });
             },
         }
     }

@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — Ported to Zig 0.17.0. `bufPrintZ` -> `bufPrintSentinel(.., 0)`; `waitpid` status is `i32`; std 0.17 spells syscall 262 on x86-64 `newfstatat` (was `fstatat64`), the default allow-list test now expects that name and `fstatat64` as the filtered one.
 - **2026-10-11** — **ADDITIVE + one BREAKING edge (error set):** multi-architecture filters and tree dispatch, closing the survey's two testable seccomp gaps (Scope core → parity).
   - `seccomp.buildRulesWith(gpa, rules, default_action, Options)`; `buildRules` is `buildRulesWith(.., .{})` and its output is byte-identical to before.
   - `Options.i386: ?[]const CompatRule` (x86-64 only; `CompatRule.sysno` is a `std.os.linux.syscalls.X86` member): the i386 compat ABI gets its own rule block behind an `arch` dispatch (libseccomp's `seccomp_arch_add`); x32 stays killed.

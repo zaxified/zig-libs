@@ -423,7 +423,9 @@ fn findSeed(comptime harness: anytype) !u64 {
     for (0..100_000) |seed| {
         var prng = std.Random.DefaultPrng.init(seed);
         var rng: Rng = .{ .r = prng.random() };
-        harness(Rng, &rng, testing.allocator) catch return seed;
+        var seed_alloc: std.heap.SafeAllocator = .init(testing.allocator, .{ .stack_trace_frames = 0 });
+        defer _ = seed_alloc.deinit();
+        harness(Rng, &rng, seed_alloc.allocator()) catch return seed;
     }
     return error.NoFailingSeed;
 }
@@ -487,8 +489,8 @@ test "Tape: a recorded run replays to the same draws, every method" {
     try testing.expectEqual(seen[1], @as(u64, @bitCast(@as(i64, plain.valueRangeAtMost(i8, -100, 100)))));
     seen[2] = @intFromBool(a.value(bool));
     try testing.expectEqual(seen[2], @intFromBool(plain.value(bool)));
-    seen[3] = @intFromEnum(a.value(E));
-    try testing.expectEqual(seen[3], @intFromEnum(plain.value(E)));
+    seen[3] = @backingInt(a.value(E));
+    try testing.expectEqual(seen[3], @backingInt(plain.value(E)));
     seen[4] = a.value(u64);
     try testing.expectEqual(seen[4], plain.value(u64));
     const wide = a.value(u128);
@@ -513,7 +515,7 @@ test "Tape: a recorded run replays to the same draws, every method" {
     try testing.expectEqual(seen[0], r.valueRangeAtMost(u16, 3, 900));
     try testing.expectEqual(seen[1], @as(u64, @bitCast(@as(i64, r.valueRangeAtMost(i8, -100, 100)))));
     try testing.expectEqual(seen[2], @intFromBool(r.value(bool)));
-    try testing.expectEqual(seen[3], @intFromEnum(r.value(E)));
+    try testing.expectEqual(seen[3], @backingInt(r.value(E)));
     try testing.expectEqual(seen[4], r.value(u64));
     try testing.expectEqual(wide, r.value(u128));
     try testing.expectEqual(seen[5], r.index(17));

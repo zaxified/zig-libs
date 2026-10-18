@@ -97,7 +97,7 @@ pub const NoNewPrivsError = error{PrctlFailed};
 /// first. The bit is a one-way latch: it cannot be cleared. Never fails on a
 /// kernel ≥ 3.5; the typed error exists only for the theoretical older kernel.
 pub fn noNewPrivs() NoNewPrivsError!void {
-    const rc = linux.prctl(@intFromEnum(linux.PR.SET_NO_NEW_PRIVS), 1, 0, 0, 0);
+    const rc = linux.prctl(@backingInt(linux.PR.SET_NO_NEW_PRIVS), 1, 0, 0, 0);
     if (linux.errno(rc) != .SUCCESS) return error.PrctlFailed;
 }
 
@@ -180,7 +180,7 @@ const cap_probe_ceiling = 64;
 pub fn dropCapabilityBoundingSet() CapabilityError!void {
     var cap: usize = 0;
     while (cap < cap_probe_ceiling) : (cap += 1) {
-        const rc = linux.prctl(@intFromEnum(linux.PR.CAPBSET_DROP), cap, 0, 0, 0);
+        const rc = linux.prctl(@backingInt(linux.PR.CAPBSET_DROP), cap, 0, 0, 0);
         switch (linux.errno(rc)) {
             .SUCCESS => {},
             .INVAL => break, // unknown capability number — past CAP_LAST_CAP
@@ -918,7 +918,7 @@ pub const seccomp = struct {
         // leaf), so jt = m - j, jf = 0 (fall through to the next compare).
         for (allowed, 0..) |sysno, j| {
             const jt: u8 = @intCast(m - @as(u8, @intCast(j)));
-            const nr: u32 = @intCast(@intFromEnum(sysno));
+            const nr: u32 = @intCast(@backingInt(sysno));
             try list.append(gpa, bpf.jump(bpf.jmp | bpf.jeq | bpf.k, nr, jt, 0));
         }
 
@@ -939,7 +939,7 @@ pub const seccomp = struct {
         if (prog.len == 0 or prog.len > std.math.maxInt(u16)) return error.SeccompFailed;
         const fprog = SockFprog{ .len = @intCast(prog.len), .filter = prog.ptr };
         const rc = linux.prctl(
-            @intFromEnum(linux.PR.SET_SECCOMP),
+            @backingInt(linux.PR.SET_SECCOMP),
             linux.SECCOMP.MODE.FILTER,
             @intFromPtr(&fprog),
             0,
@@ -1179,7 +1179,7 @@ pub const seccomp = struct {
         //   ret ALLOW                    ; clean leaf
         for (wx_arg_rules) |rule| {
             if (!containsSyscall(allowed, rule.sysno)) continue;
-            const nr: u32 = @intCast(@intFromEnum(rule.sysno));
+            const nr: u32 = @intCast(@backingInt(rule.sysno));
 
             try list.append(gpa, bpf.stmt(bpf.ld | bpf.w | bpf.abs, off_nr));
             try list.append(gpa, bpf.jump(bpf.jmp | bpf.jeq | bpf.k, nr, 0, 7));
@@ -1199,7 +1199,7 @@ pub const seccomp = struct {
         try list.append(gpa, bpf.stmt(bpf.ld | bpf.w | bpf.abs, off_nr));
         for (allowed, 0..) |sysno, j| {
             const jt: u8 = @intCast(m - @as(u8, @intCast(j)));
-            const nr: u32 = @intCast(@intFromEnum(sysno));
+            const nr: u32 = @intCast(@backingInt(sysno));
             try list.append(gpa, bpf.jump(bpf.jmp | bpf.jeq | bpf.k, nr, jt, 0));
         }
         try list.append(gpa, bpf.stmt(bpf.ret | bpf.k, actionWord(on_deny)));
@@ -1434,7 +1434,7 @@ pub const seccomp = struct {
     };
 
     fn nrOf(r: anytype) u32 {
-        return @intCast(@intFromEnum(r.sysno));
+        return @intCast(@backingInt(r.sysno));
     }
 
     /// Per-rule checks shared by both architectures' lists.
@@ -1685,7 +1685,7 @@ fn runInChild(child: *const fn () void) !ChildResult {
         child();
         linux.exit(0); // child forgot to exit — treat as "did not enforce"
     }
-    var status: u32 = 0;
+    var status: i32 = 0;
     // A failed waitpid must not leave `status = 0` — which `exitedWith(0)`
     // would read as the child having PASSED.
     while (true) {
@@ -1696,7 +1696,7 @@ fn runInChild(child: *const fn () void) !ChildResult {
             else => return error.WaitFailed,
         }
     }
-    return .{ .status = status };
+    return .{ .status = @bitCast(status) };
 }
 
 // ── pure/logic ─────────────────────────────────────────────────────────────
@@ -1714,7 +1714,7 @@ test "struct sizes match the kernel ABI" {
 
 test "seccomp.build emits arch-guard + one compare per syscall + allow/deny leaves" {
     const allowed = [_]linux.SYS{ .read, .write, .exit_group };
-    const prog = try seccomp.build(testing.allocator, &allowed, .{ .errno = @intFromEnum(E.PERM) });
+    const prog = try seccomp.build(testing.allocator, &allowed, .{ .errno = @backingInt(E.PERM) });
     defer testing.allocator.free(prog);
 
     // 3 (arch guard) + 1 (ld nr) + 3 (compares) + 2 (deny, allow) = 9.
@@ -1738,12 +1738,12 @@ test "seccomp.build emits arch-guard + one compare per syscall + allow/deny leav
 
     // Three compares with descending jt (m, m-1, …, 1) so each reaches ALLOW.
     try testing.expectEqual(@as(u8, 3), prog[4].jt);
-    try testing.expectEqual(@as(u32, @intCast(@intFromEnum(linux.SYS.read))), prog[4].k);
+    try testing.expectEqual(@as(u32, @intCast(@backingInt(linux.SYS.read))), prog[4].k);
     try testing.expectEqual(@as(u8, 2), prog[5].jt);
     try testing.expectEqual(@as(u8, 1), prog[6].jt);
 
     // Leaves: deny (ERRNO|EPERM) then ALLOW.
-    try testing.expectEqual(seccomp.ret_errno | @as(u32, @intFromEnum(E.PERM)), prog[7].k);
+    try testing.expectEqual(seccomp.ret_errno | @as(u32, @backingInt(E.PERM)), prog[7].k);
     try testing.expectEqual(@as(u32, seccomp.ret_allow), prog[8].k);
 }
 
@@ -1772,9 +1772,9 @@ test "seccomp default allow-list: named CONTENT, and no silent drop by @hasField
         // `fork` exists only where the arch has it; aarch64 forks via `clone`,
         // which is checked above for every arch.
         try testing.expect(!seccomp.containsSyscall(seccomp.default_allowlist, .fork));
-        // stat-by-path (262) is present under std's spelling …
-        try testing.expect(seccomp.containsSyscall(seccomp.default_allowlist, .fstatat64));
-        // … and `newfstatat` is the ONLY name the arch filter drops here.
+        // stat-by-path (262) is present under std's 0.17 spelling `newfstatat` …
+        try testing.expect(seccomp.containsSyscall(seccomp.default_allowlist, .newfstatat));
+        // … and `fstatat64` (the 0.16 spelling) is the ONLY name the arch filter drops here.
         try testing.expectEqual(seccomp.default_names.len - 1, seccomp.default_allowlist.len);
     }
 }
@@ -1819,7 +1819,7 @@ test "seccomp.buildWx structure: arch guard with its jump targets, one 9-instruc
     // deleted outright (91 -> 88 instructions) or weakened (`jf` 0 -> 1) with
     // the suite green, and either let the i386 `int $0x80` alias through.
     const allowed = [_]linux.SYS{ .exit, .exit_group, .mmap, .mprotect, .read };
-    const prog = try seccomp.buildWx(testing.allocator, &allowed, .{ .errno = @intFromEnum(E.PERM) }, .kill_process);
+    const prog = try seccomp.buildWx(testing.allocator, &allowed, .{ .errno = @backingInt(E.PERM) }, .kill_process);
     defer testing.allocator.free(prog);
 
     // 3 (arch) + 2 blocks x 9 + 1 (ld nr) + 5 compares + 2 leaves.
@@ -1849,8 +1849,8 @@ test "seccomp.buildWx structure: arch guard with its jump targets, one 9-instruc
         try testing.expectEqual(@as(u16, bpf.ld | bpf.w | bpf.abs), b[0].code);
         try testing.expectEqual(@as(u32, seccomp.off_nr), b[0].k);
         try testing.expectEqual(@as(u16, bpf.jmp | bpf.jeq | bpf.k), b[1].code);
-        if (b[1].k == @as(u32, @intCast(@intFromEnum(linux.SYS.mmap)))) seen_mmap = true;
-        if (b[1].k == @as(u32, @intCast(@intFromEnum(linux.SYS.mprotect)))) seen_mprotect = true;
+        if (b[1].k == @as(u32, @intCast(@backingInt(linux.SYS.mmap)))) seen_mmap = true;
+        if (b[1].k == @as(u32, @intCast(@backingInt(linux.SYS.mprotect)))) seen_mprotect = true;
         try testing.expectEqual(@as(u8, 0), b[1].jt);
         try testing.expectEqual(@as(u8, 7), b[1].jf);
         try testing.expectEqual(@as(u32, seccomp.arg2.hi), b[2].k);
@@ -1870,7 +1870,7 @@ test "seccomp.buildWx structure: arch guard with its jump targets, one 9-instruc
     try testing.expectEqual(@as(u32, seccomp.off_nr), prog[pos].k);
     try testing.expectEqual(@as(u8, 5), prog[pos + 1].jt);
     try testing.expectEqual(@as(u8, 1), prog[pos + 5].jt);
-    try testing.expectEqual(seccomp.ret_errno | @as(u32, @intFromEnum(E.PERM)), prog[pos + 6].k);
+    try testing.expectEqual(seccomp.ret_errno | @as(u32, @backingInt(E.PERM)), prog[pos + 6].k);
     try testing.expectEqual(@as(u32, seccomp.ret_allow), prog[pos + 7].k);
 }
 
@@ -1931,7 +1931,7 @@ fn evalList(comptime R: type, rules: []const R, default_action: seccomp.Action, 
     const nr: u32 = @bitCast(d.nr);
     const args = [6]u64{ d.arg0, d.arg1, d.arg2, d.arg3, d.arg4, d.arg5 };
     rules: for (rules) |r| {
-        if (nr != @as(u32, @intCast(@intFromEnum(r.sysno)))) continue;
+        if (nr != @as(u32, @intCast(@backingInt(r.sysno)))) continue;
         for (r.when) |c| {
             const x: u64 = if (c.width == .u32) @as(u32, @truncate(args[c.arg])) else args[c.arg];
             const v: u64 = if (c.width == .u32) @as(u32, @truncate(c.value)) else c.value;
@@ -2067,14 +2067,14 @@ test "seccomp.buildRules: compiled program agrees with the reference evaluator o
             };
             const d = if (arch == seccomp.audit_arch_i386 and n_rules32 != 0) blk: {
                 const target = rules32[r.uintLessThan(usize, n_rules32)];
-                const nr: u32 = if (r.uintLessThan(u8, 4) == 0) @intCast(@intFromEnum(sysnos32[r.uintLessThan(usize, sysnos32.len)])) else @intCast(@intFromEnum(target.sysno));
+                const nr: u32 = if (r.uintLessThan(u8, 4) == 0) @intCast(@backingInt(sysnos32[r.uintLessThan(usize, sysnos32.len)])) else @intCast(@backingInt(target.sysno));
                 break :blk probeData(r, arch, nr, target.when);
             } else blk: {
                 const target = rules[r.uintLessThan(usize, n_rules)];
                 const nr: u32 = switch (r.uintLessThan(u8, 8)) {
-                    0 => @intCast(@intFromEnum(sysnos[r.uintLessThan(usize, sysnos.len)])),
-                    1 => seccomp.x32_syscall_bit | @as(u32, @intCast(@intFromEnum(target.sysno))),
-                    else => @intCast(@intFromEnum(target.sysno)),
+                    0 => @intCast(@backingInt(sysnos[r.uintLessThan(usize, sysnos.len)])),
+                    1 => seccomp.x32_syscall_bit | @as(u32, @intCast(@backingInt(target.sysno))),
+                    else => @intCast(@backingInt(target.sysno)),
                 };
                 break :blk probeData(r, arch, nr, target.when);
             };
@@ -2126,11 +2126,11 @@ test "seccomp.buildRulesWith: long lists (jumps past 255), duplicate numbers, tr
             const on32 = compat != null and n32 != 0 and r.boolean();
             const target = rules[r.uintLessThan(usize, n)];
             const nr: u32 = if (on32)
-                @intCast(@intFromEnum(rules32[r.uintLessThan(usize, n32)].sysno))
+                @intCast(@backingInt(rules32[r.uintLessThan(usize, n32)].sysno))
             else if (r.uintLessThan(u8, 8) == 0)
                 r.int(u32) & 0x3ff // mostly numbers no rule names
             else
-                @intCast(@intFromEnum(target.sysno));
+                @intCast(@backingInt(target.sysno));
             const d = probeData(r, if (on32) seccomp.audit_arch_i386 else audit_arch, nr, target.when);
             const want = evalRules(rules[0..n], compat, .kill_process, &d);
             try testing.expectEqual(want, try runBpf(lin, &d));
@@ -2157,7 +2157,7 @@ test "seccomp.buildRulesWith: the tree reaches a rule in O(log n) instructions; 
     var worst_tree: usize = 0;
     for (rules) |rule| {
         var d = std.mem.zeroes(linux.SECCOMP.data);
-        d.nr = @intCast(@intFromEnum(rule.sysno));
+        d.nr = @intCast(@backingInt(rule.sysno));
         d.arch = audit_arch;
         var s_lin: usize = 0;
         var s_tree: usize = 0;
@@ -2189,12 +2189,12 @@ test "seccomp.buildRulesWith: structure of the two-architecture guard" {
     try testing.expectEqual(bpf.jump(jeq, audit_arch, 1, 0), prog[1]);
     try testing.expectEqual(bpf.stmt(ja, 7), prog[2]);
     try testing.expectEqual(bpf.stmt(bpf.ret | bpf.k, seccomp.ret_kill_process), prog[5]); // x32 guard
-    try testing.expectEqual(bpf.jump(jeq, @intCast(@intFromEnum(linux.SYS.getpid)), 0, 1), prog[7]);
+    try testing.expectEqual(bpf.jump(jeq, @intCast(@backingInt(linux.SYS.getpid)), 0, 1), prog[7]);
     try testing.expectEqual(bpf.stmt(bpf.ret | bpf.k, seccomp.ret_kill_process), prog[9]); // native default
     // i386 block = 2 rules (3 + 3) + default (1) = 7; no x32 guard in it.
     try testing.expectEqual(bpf.jump(jeq, seccomp.audit_arch_i386, 1, 0), prog[10]);
     try testing.expectEqual(bpf.stmt(ja, 7), prog[11]);
-    try testing.expectEqual(bpf.jump(jeq, @intCast(@intFromEnum(X86.getpid)), 0, 1), prog[13]);
+    try testing.expectEqual(bpf.jump(jeq, @intCast(@backingInt(X86.getpid)), 0, 1), prog[13]);
     try testing.expectEqual(bpf.stmt(bpf.ret | bpf.k, seccomp.ret_kill_thread), prog[17]);
     // ...and one KILL for every other arch, at the end.
     try testing.expectEqual(bpf.stmt(bpf.ret | bpf.k, seccomp.ret_kill_process), prog[prog.len - 1]);
@@ -2224,12 +2224,12 @@ test "seccomp.buildRules: structure — arch guard, x32 guard, one self-containe
     }
     // Rule 0: number only — ld nr; jeq getpid (else skip 1); ret allow.
     try testing.expectEqual(bpf.stmt(ld, seccomp.off_nr), prog[i]);
-    try testing.expectEqual(bpf.jump(jeq, @intCast(@intFromEnum(linux.SYS.getpid)), 0, 1), prog[i + 1]);
+    try testing.expectEqual(bpf.jump(jeq, @intCast(@backingInt(linux.SYS.getpid)), 0, 1), prog[i + 1]);
     try testing.expectEqual(bpf.stmt(bpf.ret | bpf.k, seccomp.ret_allow), prog[i + 2]);
     i += 3;
     // Rule 1: ld nr; jeq socket (else skip 3); ld arg0 LOW word only; jeq 1 (else skip 1); ret errno.
     try testing.expectEqual(bpf.stmt(ld, seccomp.off_nr), prog[i]);
-    try testing.expectEqual(bpf.jump(jeq, @intCast(@intFromEnum(linux.SYS.socket)), 0, 3), prog[i + 1]);
+    try testing.expectEqual(bpf.jump(jeq, @intCast(@backingInt(linux.SYS.socket)), 0, 3), prog[i + 1]);
     try testing.expectEqual(bpf.stmt(ld, seccomp.argHalves("arg0").lo), prog[i + 2]);
     try testing.expectEqual(bpf.jump(jeq, 1, 0, 1), prog[i + 3]);
     try testing.expectEqual(bpf.stmt(bpf.ret | bpf.k, seccomp.ret_errno | 1), prog[i + 4]);
@@ -2445,7 +2445,7 @@ test "seccomp default allow-list, installed: the S11 runtime syscalls run, prlim
 
 test "seccomp ERRNO: denied syscall returns -EPERM instead of dying" {
     try requireSeccompFilter();
-    g_errno_prog = try seccomp.build(testing.allocator, &seccomp_min_no_getpid, .{ .errno = @intFromEnum(E.PERM) });
+    g_errno_prog = try seccomp.build(testing.allocator, &seccomp_min_no_getpid, .{ .errno = @backingInt(E.PERM) });
     defer testing.allocator.free(g_errno_prog);
 
     const res = try runInChild(childSeccompErrno);
@@ -2556,7 +2556,7 @@ test "seccomp arch guard (buildWx): the same i386 alias is KILLED through the W^
             // that false CAUGHT), so the allow-list has getpid AND the guarded
             // pair.
             const allowed = [_]linux.SYS{ .exit, .exit_group, .write, .getpid, .mmap, .mprotect };
-            g_alias_wx_prog = try seccomp.buildWx(testing.allocator, &allowed, .kill_process, .{ .errno = @intFromEnum(E.PERM) });
+            g_alias_wx_prog = try seccomp.buildWx(testing.allocator, &allowed, .kill_process, .{ .errno = @backingInt(E.PERM) });
             defer testing.allocator.free(g_alias_wx_prog);
             try expectAliasKilled(try runInChild(X86Alias.childWx));
         },
@@ -2661,7 +2661,7 @@ fn childWx() void {
 test "seccomp W^X guard: RW mprotect/mmap allowed, RWX and crafted hi-word denied" {
     try requireSeccompFilter();
     const allowed = [_]linux.SYS{ .exit, .exit_group, .mmap, .mprotect };
-    g_wx_prog = try seccomp.buildWx(testing.allocator, &allowed, .kill_process, .{ .errno = @intFromEnum(E.PERM) });
+    g_wx_prog = try seccomp.buildWx(testing.allocator, &allowed, .kill_process, .{ .errno = @backingInt(E.PERM) });
     defer testing.allocator.free(g_wx_prog);
 
     const res = try runInChild(childWx);
@@ -2750,7 +2750,7 @@ fn armWatchdog(seconds: isize) void {
         .interval = .{ .sec = 0, .usec = 0 },
         .value = .{ .sec = seconds, .usec = 0 },
     };
-    _ = linux.syscall3(.setitimer, @intCast(@intFromEnum(linux.ITIMER.REAL)), @intFromPtr(&it), 0);
+    _ = linux.syscall3(.setitimer, @intCast(@backingInt(linux.ITIMER.REAL)), @intFromPtr(&it), 0);
 }
 
 fn childTsyncPropagation() void {
@@ -2868,8 +2868,8 @@ const af_inet: u64 = 2;
 /// `close(fd ≥ 1000)` refused with EPERM, everything else allowed.
 fn rulesDenyList(gpa: Allocator) ![]SockFilter {
     return seccomp.buildRules(gpa, &.{
-        .{ .sysno = .socket, .when = &.{.{ .arg = 0, .op = .eq, .width = .u32, .value = af_unix }}, .action = .{ .errno = @intFromEnum(E.PERM) } },
-        .{ .sysno = .close, .when = &.{.{ .arg = 0, .op = .ge, .width = .u32, .value = 1000 }}, .action = .{ .errno = @intFromEnum(E.PERM) } },
+        .{ .sysno = .socket, .when = &.{.{ .arg = 0, .op = .eq, .width = .u32, .value = af_unix }}, .action = .{ .errno = @backingInt(E.PERM) } },
+        .{ .sysno = .close, .when = &.{.{ .arg = 0, .op = .ge, .width = .u32, .value = 1000 }}, .action = .{ .errno = @backingInt(E.PERM) } },
     }, .allow);
 }
 
@@ -3053,13 +3053,13 @@ const LandlockFixture = struct {
         _ = landlockAbiVersion() catch return error.SkipZigTest; // pre-5.13 / disabled
         if (openReadonly(ll_forbidden_file) != .SUCCESS) return error.SkipZigTest; // no /etc/passwd
         const pid = linux.getpid();
-        f.dir = try std.fmt.bufPrintZ(&f.dir_buf, "/tmp/zig_sandbox_ll_{d}", .{pid});
-        f.file = try std.fmt.bufPrintZ(&f.file_buf, "{s}/ok.txt", .{f.dir});
-        f.out_dir = try std.fmt.bufPrintZ(&f.out_dir_buf, "/tmp/zig_sandbox_ll_{d}_outside", .{pid});
-        f.out_victim = try std.fmt.bufPrintZ(&f.out_victim_buf, "{s}/victim.txt", .{f.out_dir});
-        f.out_new = try std.fmt.bufPrintZ(&f.out_new_buf, "{s}/created.txt", .{f.out_dir});
-        f.out_sub = try std.fmt.bufPrintZ(&f.out_sub_buf, "{s}/newdir", .{f.out_dir});
-        f.in_new = try std.fmt.bufPrintZ(&f.in_new_buf, "{s}/written.txt", .{f.dir});
+        f.dir = try std.fmt.bufPrintSentinel(&f.dir_buf, "/tmp/zig_sandbox_ll_{d}", .{pid}, 0);
+        f.file = try std.fmt.bufPrintSentinel(&f.file_buf, "{s}/ok.txt", .{f.dir}, 0);
+        f.out_dir = try std.fmt.bufPrintSentinel(&f.out_dir_buf, "/tmp/zig_sandbox_ll_{d}_outside", .{pid}, 0);
+        f.out_victim = try std.fmt.bufPrintSentinel(&f.out_victim_buf, "{s}/victim.txt", .{f.out_dir}, 0);
+        f.out_new = try std.fmt.bufPrintSentinel(&f.out_new_buf, "{s}/created.txt", .{f.out_dir}, 0);
+        f.out_sub = try std.fmt.bufPrintSentinel(&f.out_sub_buf, "{s}/newdir", .{f.out_dir}, 0);
+        f.in_new = try std.fmt.bufPrintSentinel(&f.in_new_buf, "{s}/written.txt", .{f.dir}, 0);
         _ = linux.mkdir(f.dir.ptr, 0o700); // ignore EEXIST from a prior run
         _ = linux.mkdir(f.out_dir.ptr, 0o700);
         for ([_][:0]const u8{ f.file, f.out_victim }) |p| {
@@ -3132,7 +3132,7 @@ test "landlock: initHandling(read_only) is the explicit, weaker form — access.
 test "landlock: allowPath refuses a symlink by name instead of granting its target (audit S10)" {
     _ = landlockAbiVersion() catch return error.SkipZigTest;
     var link_buf: [64]u8 = undefined;
-    const link_z = try std.fmt.bufPrintZ(&link_buf, "/tmp/zig_sandbox_ll_{d}_link", .{linux.getpid()});
+    const link_z = try std.fmt.bufPrintSentinel(&link_buf, "/tmp/zig_sandbox_ll_{d}_link", .{linux.getpid()}, 0);
     _ = linux.unlink(link_z.ptr);
     if (linux.errno(linux.symlink("/", link_z.ptr)) != .SUCCESS) return error.SkipZigTest; // /tmp not writable
     defer _ = linux.unlink(link_z.ptr);
@@ -3508,12 +3508,12 @@ test "limitAddressSpace sets RLIMIT_AS to the requested value" {
 // SANDBOX_EXPECT_LANDLOCK test below).
 
 fn rawNoNewPrivs() bool {
-    return linux.errno(linux.prctl(@intFromEnum(linux.PR.SET_NO_NEW_PRIVS), 1, 0, 0, 0)) == .SUCCESS;
+    return linux.errno(linux.prctl(@backingInt(linux.PR.SET_NO_NEW_PRIVS), 1, 0, 0, 0)) == .SUCCESS;
 }
 
 fn rawInstallPrctl(prog: []const SockFilter) bool {
     const fprog = SockFprog{ .len = @intCast(prog.len), .filter = prog.ptr };
-    const rc = linux.prctl(@intFromEnum(linux.PR.SET_SECCOMP), linux.SECCOMP.MODE.FILTER, @intFromPtr(&fprog), 0, 0);
+    const rc = linux.prctl(@backingInt(linux.PR.SET_SECCOMP), linux.SECCOMP.MODE.FILTER, @intFromPtr(&fprog), 0, 0);
     return linux.errno(rc) == .SUCCESS;
 }
 
@@ -3527,8 +3527,8 @@ fn rawInstallSeccomp(prog: []const SockFilter) bool {
 fn errnoOneSyscall(nr: linux.SYS, errno: E) [4]SockFilter {
     return .{
         bpf.stmt(bpf.ld | bpf.w | bpf.abs, seccomp.off_nr),
-        bpf.jump(bpf.jmp | bpf.jeq | bpf.k, @intCast(@intFromEnum(nr)), 0, 1),
-        bpf.stmt(bpf.ret | bpf.k, seccomp.ret_errno | @as(u32, @intFromEnum(errno))),
+        bpf.jump(bpf.jmp | bpf.jeq | bpf.k, @intCast(@backingInt(nr)), 0, 1),
+        bpf.stmt(bpf.ret | bpf.k, seccomp.ret_errno | @as(u32, @backingInt(errno))),
         bpf.stmt(bpf.ret | bpf.k, seccomp.ret_allow),
     };
 }
@@ -3541,10 +3541,10 @@ fn errnoOneSyscall(nr: linux.SYS, errno: E) [4]SockFilter {
 fn errnoLandlockCreateOnly(errno: E) [6]SockFilter {
     return .{
         bpf.stmt(bpf.ld | bpf.w | bpf.abs, seccomp.off_nr),
-        bpf.jump(bpf.jmp | bpf.jeq | bpf.k, @intCast(@intFromEnum(linux.SYS.landlock_create_ruleset)), 0, 3),
+        bpf.jump(bpf.jmp | bpf.jeq | bpf.k, @intCast(@backingInt(linux.SYS.landlock_create_ruleset)), 0, 3),
         bpf.stmt(bpf.ld | bpf.w | bpf.abs, seccomp.arg2.lo),
         bpf.jump(bpf.jmp | bpf.jeq | bpf.k, 0, 0, 1),
-        bpf.stmt(bpf.ret | bpf.k, seccomp.ret_errno | @as(u32, @intFromEnum(errno))),
+        bpf.stmt(bpf.ret | bpf.k, seccomp.ret_errno | @as(u32, @backingInt(errno))),
         bpf.stmt(bpf.ret | bpf.k, seccomp.ret_allow),
     };
 }
@@ -3694,7 +3694,7 @@ test "privilege drop: child drops to nobody and cannot regain uid 0 (needs root)
 }
 
 fn capBoundingSetHas(cap: usize) ?bool {
-    const rc = linux.prctl(@intFromEnum(linux.PR.CAPBSET_READ), cap, 0, 0, 0);
+    const rc = linux.prctl(@backingInt(linux.PR.CAPBSET_READ), cap, 0, 0, 0);
     return switch (linux.errno(rc)) {
         .SUCCESS => rc != 0,
         else => null, // EINVAL: past CAP_LAST_CAP

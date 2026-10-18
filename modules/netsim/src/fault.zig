@@ -311,7 +311,7 @@ test "generate: events are sorted by time and stay within bounds" {
 }
 
 test "generate: over many seeds, every fault kind is exercised (teeth)" {
-    var seen = @as([@typeInfo(FaultKind)]bool, @splat(false)).@"union".fields.len;
+    var seen = @as([@typeInfo(FaultKind).@"union".field_names.len]bool, @splat(false));
     var seed: u64 = 1;
     while (seed <= 400) : (seed += 1) {
         var tr = try generate(testing.allocator, seed, sampleTopo(), .{});

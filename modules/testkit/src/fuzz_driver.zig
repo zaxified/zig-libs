@@ -69,7 +69,7 @@ pub const Rng = struct {
 
     pub fn valueRangeAtMost(self: *Rng, comptime T: type, at_least: T, at_most: T) T {
         const t = self.tape orelse return self.r.intRangeAtMost(T, at_least, at_most);
-        const U = std.meta.Int(.unsigned, @bitSizeOf(T));
+        const U = @Int(.unsigned, @bitSizeOf(T));
         const lo: U = @bitCast(at_least);
         const span: U = @as(U, @bitCast(at_most)) -% lo;
         const v: T = switch (t.mode) {
@@ -111,7 +111,7 @@ pub const Rng = struct {
                 }
             },
             else => v: {
-                const U = std.meta.Int(.unsigned, @bitSizeOf(T));
+                const U = @Int(.unsigned, @bitSizeOf(T));
                 switch (t.mode) {
                     .record => {
                         const v = self.r.int(T);
@@ -631,8 +631,14 @@ pub fn runSeedsReporting(comptime harness: anytype, name: []const u8, spec: Spec
         var rng: Rng = .{ .r = prng.random() };
         if (seed_file) |*sf| sf.set(seed);
         enter(seed);
-        harness(Rng, &rng, gpa) catch |e| {
+        // One allocator per seed (std/heap/SafeAllocator.zig:621 init, :653
+        // deinit): the 0.17 `testing.allocator` never reuses memory, so a
+        // loop of thousands of seeds on one allocator only grows. Leaks are
+        // checked at the end of each seed and fail it, with its number.
+        var seed_alloc: std.heap.SafeAllocator = .init(gpa, .{ .stack_trace_frames = 0 });
+        harness(Rng, &rng, seed_alloc.allocator()) catch |e| {
             leave();
+            _ = seed_alloc.deinitLog(false);
             if (report) {
                 std.debug.print("FAIL {s} seed={d}: {t}\n", .{ opts.name, seed, e });
                 printShrinkHint(seed);
@@ -640,6 +646,10 @@ pub fn runSeedsReporting(comptime harness: anytype, name: []const u8, spec: Spec
             return e;
         };
         leave();
+        if (seed_alloc.deinit() != 0) {
+            if (report) std.debug.print("FAIL {s} seed={d}: memory leak\n", .{ opts.name, seed });
+            return error.MemoryLeakDetected;
+        }
         // The clock, for the progress line, every 1024 seeds only.
         if (report and (seed - first) % 1024 == 1023) {
             const now = nowNs();

@@ -502,7 +502,7 @@ fn blockGetrandom() !void {
     const JMP_JEQ_K: u16 = 0x15;
     const RET_K: u16 = 0x06;
 
-    if (std.os.linux.prctl(@intFromEnum(std.os.linux.PR.SET_NO_NEW_PRIVS), 1, 0, 0, 0) != 0)
+    if (std.os.linux.prctl(@backingInt(std.os.linux.PR.SET_NO_NEW_PRIVS), 1, 0, 0, 0) != 0)
         return error.NoNewPrivs;
 
     const filter = [_]sock_filter{
@@ -515,7 +515,7 @@ fn blockGetrandom() !void {
     };
     const prog: sock_fprog = .{ .len = filter.len, .filter = &filter };
     const rc = std.os.linux.prctl(
-        @intFromEnum(std.os.linux.PR.SET_SECCOMP),
+        @backingInt(std.os.linux.PR.SET_SECCOMP),
         std.os.linux.SECCOMP.MODE.FILTER,
         @intFromPtr(&prog),
         0,
@@ -571,7 +571,7 @@ test "fill ABORTS when entropy is unavailable -- it does not return, and does no
     }
     _ = std.os.linux.close(fds[0]);
 
-    var status: u32 = 0;
+    var status: i32 = 0;
     _ = std.os.linux.wait4(@intCast(pid), &status, 0, null);
     const sig = status & 0x7f;
     const exit_code = (status >> 8) & 0xff;
@@ -587,7 +587,7 @@ test "fill ABORTS when entropy is unavailable -- it does not return, and does no
     // SIGABRT (6) is what `@panic` produces. Accept nothing else: an exit
     // code would mean it returned, and a different signal would mean it died
     // of something other than its own refusal.
-    try std.testing.expectEqual(@as(u32, 6), sig);
+    try std.testing.expectEqual(@as(i32, 6), sig);
 
     // And it must be THIS refusal. `unreachable` aborts too, with "reached
     // unreachable code" -- which is a different promise to a reader and, in
@@ -673,7 +673,7 @@ test "fill ABORTS with an honest message when randomSecure violates the blocked-
     }
     _ = std.os.linux.close(fds[0]);
 
-    var status: u32 = 0;
+    var status: i32 = 0;
     _ = std.os.linux.wait4(@intCast(pid), &status, 0, null);
     const sig = status & 0x7f;
     const exit_code = (status >> 8) & 0xff;
@@ -687,7 +687,7 @@ test "fill ABORTS with an honest message when randomSecure violates the blocked-
     }
     // SIGABRT (6) is what `@panic` produces, in every build mode -- unlike
     // `unreachable`, whose ReleaseFast/ReleaseSmall behavior is undefined.
-    try std.testing.expectEqual(@as(u32, 6), sig);
+    try std.testing.expectEqual(@as(i32, 6), sig);
 
     const printed = msg[0..msg_len];
     const needle = canceled_contract_violation_message[0..@min(canceled_contract_violation_message.len, 40)];
@@ -766,7 +766,7 @@ test "fill ABORTS with its own message, before calling it, on an Io whose cancel
         }
         _ = std.os.linux.close(fds[0]);
 
-        var status: u32 = 0;
+        var status: i32 = 0;
         _ = std.os.linux.wait4(@intCast(pid), &status, 0, null);
         const sig = status & 0x7f;
         const exit_code = (status >> 8) & 0xff;
