@@ -50,9 +50,9 @@ const Client = struct {
         try io.randomSecure(&seed);
         const sig = try S.Sig.KeyPair.generateDeterministic(seed);
         try io.randomSecure(&seed);
-        const init_pair = try S.Kem.KeyPair.generateDeterministic(seed);
+        const init_pair = try @as(anyerror!S.Kem.KeyPair, S.Kem.KeyPair.generateDeterministic(seed));
         try io.randomSecure(&seed);
-        const enc_pair = try S.Kem.KeyPair.generateDeterministic(seed);
+        const enc_pair = try @as(anyerror!S.Kem.KeyPair, S.Kem.KeyPair.generateDeterministic(seed));
         seed = @splat(0);
 
         const kp = try mls.createKeyPackage(S, arena, .{

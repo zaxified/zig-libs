@@ -50,7 +50,7 @@ const linux = std.os.linux;
 
 fn errnoOf(r: usize) linux.E {
     const signed: isize = @bitCast(r);
-    if (signed > -4096 and signed < 0) return @enumFromInt(@as(u16, @intCast(-signed)));
+    if (signed > -4096 and signed < 0) return @fromBackingInt(@intCast(@as(u16, @intCast(-signed))));
     return .SUCCESS;
 }
 
@@ -138,17 +138,20 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var t: bolt8.Transport = undefined;
 
     if (is_init) {
-        var initiator = bolt8.Initiator.init(ls, remote_pub);
+        var initiator: bolt8.Initiator = undefined;
+        bolt8.Initiator.init(&initiator, &ls, remote_pub);
         const a1 = try initiator.genAct1(entropy);
         try writeAll(&a1.toBytes());
         var a2b: [50]u8 = undefined;
         try readExact(&a2b);
         try initiator.readAct2(try bolt8.act.Act2.fromBytes(&a2b));
-        const fin = try initiator.genAct3();
-        try writeAll(&fin.msg.toBytes());
-        t = bolt8.Transport.init(fin.result);
+        var fin_result: bolt8.HandshakeResult = undefined;
+        const fin_msg = try initiator.genAct3(&fin_result);
+        try writeAll(&fin_msg.toBytes());
+        bolt8.Transport.init(&t, &fin_result);
     } else {
-        var responder = bolt8.Responder.init(ls);
+        var responder: bolt8.Responder = undefined;
+        bolt8.Responder.init(&responder, &ls);
         var a1b: [50]u8 = undefined;
         try readExact(&a1b);
         try responder.readAct1(try bolt8.act.Act1.fromBytes(&a1b));
@@ -156,8 +159,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
         try writeAll(&a2.toBytes());
         var a3b: [66]u8 = undefined;
         try readExact(&a3b);
-        const res = try responder.readAct3(try bolt8.act.Act3.fromBytes(&a3b));
-        t = bolt8.Transport.init(res);
+        var res: bolt8.HandshakeResult = undefined;
+        try responder.readAct3(try bolt8.act.Act3.fromBytes(&a3b), &res);
+        bolt8.Transport.init(&t, &res);
     }
     note("handshake ok (initiator={})", .{is_init});
 

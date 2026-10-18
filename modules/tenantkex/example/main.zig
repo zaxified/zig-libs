@@ -19,8 +19,8 @@ const tenantkex = @import("tenantkex");
 pub fn main() !void {
     // Fixed seeds keep this example reproducible; a real PE draws its
     // long-term static key once at provisioning time from a CSPRNG.
-    const pe1_static = try tenantkex.KeyPair.generateDeterministic(@as([32]u8, @splat(0x31)));
-    const pe2_static = try tenantkex.KeyPair.generateDeterministic(@as([32]u8, @splat(0x42)));
+    const pe1_static = tenantkex.KeyPair.generateDeterministic(@as([32]u8, @splat(0x31)));
+    const pe2_static = tenantkex.KeyPair.generateDeterministic(@as([32]u8, @splat(0x42)));
 
     const ctx: tenantkex.FabricContext = .{ .isid = 0x00_10_20, .initiator_pe = 1, .responder_pe = 2 };
 
