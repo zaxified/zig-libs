@@ -5,7 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-10-18** — Ported to Zig 0.17.0. No source change beyond the repo-wide codemod (all `@bitCast` sites audited; aesgcm's are x86-64-only, so LE memory order is unchanged).
+- **2026-10-18** — Ported to Zig 0.17.0. No source change beyond the repo-wide codemod (all `@bitCast` sites audited; aesgcm's are x86-64-only, so LE memory order is unchanged). Examples/tools ported to Zig 0.17.0 (bench enum loop -> `field_names`/`field_values`).
 - **2026-10-17** — Stack probe test silent on success (it printed every report; a lane treats stderr from a passing test as a failure). Test only.
 
 - **2026-10-17** — **NO CONSUMER-VISIBLE CHANGE:** `Encryptor`/`Decryptor` `update` burn 512 B → 1 KiB: at CI's `-Dcpu=x86_64_v3+aes+pclmul+adx` `Decryptor(Aes256).update` reaches 719 B (stack probe).

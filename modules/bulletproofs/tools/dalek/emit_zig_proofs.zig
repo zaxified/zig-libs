@@ -38,7 +38,7 @@ pub fn main(init: std.process.Init) !void {
             const commitment = bp.commit(gens, v_bytes, gamma);
 
             var t = bp.Transcript.init(label);
-            const proof = try bp.prove(gpa, gens, &t, &v, gamma);
+            const proof = try bp.prove(gpa, init.io, gens, &t, &v, gamma);
             defer proof.deinit(gpa);
             const bytes = try proof.toBytesAlloc(gpa);
             defer gpa.free(bytes);
@@ -70,7 +70,7 @@ pub fn main(init: std.process.Init) !void {
             try w.print("{s}{x}", .{ if (j == 0) "" else ",", @as([]const u8, &v_enc) });
         }
         var t = bp.Transcript.init(label);
-        const proof = try bp.proveMultiple(gpa, gens, &t, b.values, gammas);
+        const proof = try bp.proveMultiple(gpa, init.io, gens, &t, b.values, gammas);
         defer proof.deinit(gpa);
         const bytes = try proof.toBytesAlloc(gpa);
         defer gpa.free(bytes);

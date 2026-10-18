@@ -21,8 +21,8 @@ const Suite = noise.DefaultSuite;
 pub fn main() !void {
     // Fixed seeds keep this example reproducible; a real caller draws these
     // from a CSPRNG (e.g. `std.crypto.dh.X25519.KeyPair.generate(io)`).
-    const init_static = try Suite.KeyPair.generateDeterministic(@as([32]u8, @splat(0x11)));
-    const resp_static = try Suite.KeyPair.generateDeterministic(@as([32]u8, @splat(0x22)));
+    const init_static = try @as(anyerror!Suite.KeyPair, Suite.KeyPair.generateDeterministic(@as([32]u8, @splat(0x11))));
+    const resp_static = try @as(anyerror!Suite.KeyPair, Suite.KeyPair.generateDeterministic(@as([32]u8, @splat(0x22))));
     var init_rng = std.Random.DefaultPrng.init(0xC0FFEE);
     var resp_rng = std.Random.DefaultPrng.init(0xDECAFBAD);
 

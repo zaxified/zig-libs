@@ -188,12 +188,12 @@ pub fn main(init: std.process.Init) !u8 {
     }
 
     var ws: std.ArrayList(Work) = .empty;
-    inline for (@typeInfo(Op).@"enum".fields) |f| {
-        const op: Op = @enumFromInt(f.value);
+    inline for (@typeInfo(Op).@"enum".field_names, @typeInfo(Op).@"enum".field_values) |f_name, f_value| {
+        const op: Op = @fromBackingInt(@intCast(f_value));
         if (std.mem.indexOfScalar(Op, &openssl_only, op) != null)
-            try ws.append(arena, .{ .name = f.name, .op = op, .ref = f.name, .ref_exe = 1 })
+            try ws.append(arena, .{ .name = f_name, .op = op, .ref = f_name, .ref_exe = 1 })
         else
-            try ws.append(arena, .{ .name = f.name, .op = op, .ref = f.name, .alt = f.name, .ref_exe = 0, .alt_exe = 1 });
+            try ws.append(arena, .{ .name = f_name, .op = op, .ref = f_name, .alt = f_name, .ref_exe = 0, .alt_exe = 1 });
     }
 
     var buf: [4096]u8 = undefined;
