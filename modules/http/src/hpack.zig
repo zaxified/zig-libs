@@ -31,8 +31,11 @@ const Allocator = std.mem.Allocator;
 pub const Field = struct {
     name: []const u8,
     value: []const u8,
-    /// Encoder: emit as never-indexed (§6.2.3) and keep it out of the
-    /// dynamic table (for e.g. passwords / cookies with secrets).
+    /// Encoder: emit as never-indexed (§6.2.3), keep it out of the dynamic
+    /// table and send the value as raw octets, never Huffman-coded (for
+    /// e.g. passwords / cookies with secrets). `authorization`,
+    /// `proxy-authorization` and a `cookie` under 20 octets get this
+    /// without asking (see `Encoder.Options.default_sensitive`).
     /// Decoder: set when the peer sent the field never-indexed, so an
     /// intermediary re-encoding the list can preserve the protection.
     sensitive: bool = false,
@@ -998,18 +1001,32 @@ pub const Decoder = struct {
 
 // ── Encoder ─────────────────────────────────────────────────────────────────
 
+/// The credentials `Encoder.Options.default_sensitive` covers: names as
+/// they travel in HTTP/2 (lowercase, §8.2.1 of RFC 9113).
+pub fn isDefaultSensitive(f: Field) bool {
+    if (std.mem.eql(u8, f.name, "authorization")) return true;
+    if (std.mem.eql(u8, f.name, "proxy-authorization")) return true;
+    return std.mem.eql(u8, f.name, "cookie") and f.value.len < 20;
+}
+
 /// HPACK encoder: owns the sending side's dynamic table. One encoder per
 /// HTTP/2 connection; encode every header block through it in order.
 ///
 /// Strategy: exact (name, value) match in the static or dynamic table →
 /// §6.1 indexed; otherwise a §6.2.1 literal with incremental indexing
 /// (name-indexed when the name is known), which also inserts the field into
-/// the dynamic table. Fields marked `sensitive` are sent §6.2.3
-/// never-indexed and stay out of the table.
+/// the dynamic table. Fields marked `sensitive` — and, by default,
+/// credentials (`isDefaultSensitive`) — are sent §6.2.3 never-indexed, stay
+/// out of the table, and carry their value as raw octets: the Huffman
+/// encoder indexes its code table by each octet, a cache side channel on
+/// the very values the field is protecting (constant-time sweep,
+/// 2026-10-18). The decoder cannot be helped that way: what the peer
+/// Huffman-coded is walked as it came.
 pub const Encoder = struct {
     gpa: Allocator,
     table: DynamicTable,
     huffman: HuffmanMode,
+    default_sensitive: bool,
     /// Pending §6.3 updates to emit at the start of the next block: when
     /// the limit was lowered then raised between blocks, both the minimum
     /// and the final value must be signalled (§4.2).
@@ -1030,6 +1047,14 @@ pub const Encoder = struct {
         /// SETTINGS_HEADER_TABLE_SIZE (4096 unless it said otherwise).
         max_table_size: usize = default_max_table_size,
         huffman: HuffmanMode = .auto,
+        /// Treat `authorization`, `proxy-authorization` and a `cookie`
+        /// value under 20 octets as `sensitive` even when the caller did
+        /// not mark them — nghttp2's never-index policy (it covers
+        /// `authorization` and short cookies, which are guessable once an
+        /// attacker can probe the dynamic table, RFC 7541 §7.1.3), plus the
+        /// proxy credential. `false` indexes them like any other field, as
+        /// Go's x/net/http2 does.
+        default_sensitive: bool = true,
     };
 
     pub fn init(gpa: Allocator, options: Options) Encoder {
@@ -1037,6 +1062,7 @@ pub const Encoder = struct {
             .gpa = gpa,
             .table = .{ .max_size = options.max_table_size, .indexed = true },
             .huffman = options.huffman,
+            .default_sensitive = options.default_sensitive,
         };
     }
 
@@ -1091,10 +1117,10 @@ pub const Encoder = struct {
     }
 
     fn encodeField(e: *Encoder, f: Field, out: *std.ArrayList(u8)) Allocator.Error!void {
-        if (f.sensitive) {
-            // Â§6.2.3 literal never indexed. The name may still travel by
-            // index (only the value is the secret).
-            try e.encodeLiteral(f, 0x10, 4, e.findField(f).name, out);
+        if (f.sensitive or (e.default_sensitive and isDefaultSensitive(f))) {
+            // §6.2.3 literal never indexed. The name may still travel by
+            // index (only the value is the secret); the value goes raw.
+            try e.encodeLiteral(f, 0x10, 4, e.findNameIndex(f.name), out, .never);
             return;
         }
         const m = e.findField(f);
@@ -1104,7 +1130,7 @@ pub const Encoder = struct {
             return;
         }
         // Â§6.2.1 literal with incremental indexing.
-        try e.encodeLiteral(f, 0x40, 6, m.name, out);
+        try e.encodeLiteral(f, 0x40, 6, m.name, out, .auto);
         try e.table.add(e.gpa, f.name, f.value);
     }
 
@@ -1117,19 +1143,20 @@ pub const Encoder = struct {
         prefix_bits: u4,
         name_index: ?u64,
         out: *std.ArrayList(u8),
+        value_mode: HuffmanMode,
     ) Allocator.Error!void {
         if (name_index) |index| {
             try appendInt(e.gpa, out, flags, prefix_bits, index);
         } else {
             try appendInt(e.gpa, out, flags, prefix_bits, 0);
-            try e.appendString(out, f.name);
+            try e.appendString(out, f.name, e.huffman);
         }
-        try e.appendString(out, f.value);
+        try e.appendString(out, f.value, if (value_mode == .never) .never else e.huffman);
     }
 
-    /// Emit a §5.2 string literal, Huffman-coded per `e.huffman`.
-    fn appendString(e: *Encoder, out: *std.ArrayList(u8), s: []const u8) Allocator.Error!void {
-        if (e.huffman == .auto) {
+    /// Emit a §5.2 string literal, Huffman-coded per `mode`.
+    fn appendString(e: *Encoder, out: *std.ArrayList(u8), s: []const u8, mode: HuffmanMode) Allocator.Error!void {
+        if (mode == .auto) {
             const hlen = huffmanEncodedLen(s);
             if (hlen <= s.len) {
                 try appendInt(e.gpa, out, 0x80, 7, hlen);
@@ -1180,6 +1207,22 @@ pub const Encoder = struct {
             return e.scanDynamic(f, m);
         m.exact = static_table.len + t.indexOfSeq(pseq);
         return m;
+    }
+
+    /// Name-only index for a sensitive field: unlike `findField` it never
+    /// hashes or compares the value, so the secret does not pick a map
+    /// bucket or end a comparison early.
+    fn findNameIndex(e: *const Encoder, name: []const u8) ?u64 {
+        if (static_names.get(name)) |run| return run.first;
+        const t = &e.table;
+        if (t.entries.items.len == 0) return null;
+        const seq = t.name_index.get(DynamicTable.hashName(name)) orelse return null;
+        if (std.mem.eql(u8, t.bySeq(seq).name(), name)) return static_table.len + t.indexOfSeq(seq);
+        var i: usize = 1; // 64-bit name-hash collision: the scan decides
+        while (i <= t.count()) : (i += 1) {
+            if (std.mem.eql(u8, t.get(i).?.name(), name)) return static_table.len + i;
+        }
+        return null;
     }
 
     /// The linear newest-first dynamic-table scan the index replaces; the
@@ -2119,8 +2162,8 @@ fn findFieldOld(e: *const Encoder, f: Field) Encoder.Match {
 /// `findField` is never consulted. Same emission code, so any byte difference
 /// comes from the search result alone.
 fn encodeFieldOld(e: *Encoder, f: Field, out: *std.ArrayList(u8)) !void {
-    if (f.sensitive) {
-        try e.encodeLiteral(f, 0x10, 4, findFieldOld(e, f).name, out);
+    if (f.sensitive or (e.default_sensitive and isDefaultSensitive(f))) {
+        try e.encodeLiteral(f, 0x10, 4, findFieldOld(e, f).name, out, .never);
         return;
     }
     const m = findFieldOld(e, f);
@@ -2128,7 +2171,7 @@ fn encodeFieldOld(e: *Encoder, f: Field, out: *std.ArrayList(u8)) !void {
         try appendInt(e.gpa, out, 0x80, 7, index);
         return;
     }
-    try e.encodeLiteral(f, 0x40, 6, m.name, out);
+    try e.encodeLiteral(f, 0x40, 6, m.name, out, .auto);
     try e.table.add(e.gpa, f.name, f.value);
 }
 
@@ -2308,4 +2351,64 @@ test "encoder search: same name+value re-added after eviction, and duplicate nam
     try enc.encodeBlock(&.{.{ .name = "x-k", .value = "1" }}, &out);
     m = enc.findField(.{ .name = "x-k", .value = "1" });
     try testing.expectEqual(@as(?u64, 62), m.exact);
+}
+
+test "sensitive fields: never indexed, value raw even under .auto; credentials by default (nghttp2 policy)" {
+    const gpa = testing.allocator;
+    const bearer = "Bearer eyJhbGciOiJFUzI1NiJ9.e30.c2ln"; // Huffman would be shorter
+    try testing.expect(huffmanEncodedLen(bearer) < bearer.len);
+
+    var enc: Encoder = .init(gpa, .{});
+    defer enc.deinit();
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+
+    // Unmarked `authorization`: §6.2.3 with static name index 23
+    // (0x1f, 23 - 15 = 8), then the value with H = 0 and its raw octets.
+    try enc.encodeBlock(&.{.{ .name = "authorization", .value = bearer }}, &out);
+    try testing.expectEqualSlices(u8, &.{ 0x1f, 0x08, bearer.len }, out.items[0..3]);
+    try testing.expectEqualStrings(bearer, out.items[3..]);
+    try testing.expectEqual(@as(usize, 0), enc.dynamicTableCount());
+
+    // A short cookie is never indexed; a long one is indexed as before.
+    out.clearRetainingCapacity();
+    try enc.encodeBlock(&.{.{ .name = "cookie", .value = "sid=0123456789" }}, &out);
+    try testing.expectEqual(@as(u8, 0x10), out.items[0] & 0xf0);
+    try testing.expectEqual(@as(u8, 0), out.items[2] & 0x80);
+    try testing.expectEqual(@as(usize, 0), enc.dynamicTableCount());
+    out.clearRetainingCapacity();
+    try enc.encodeBlock(&.{.{ .name = "cookie", .value = "theme=dark; lang=cs-CZ" }}, &out);
+    try testing.expectEqual(@as(u8, 0x40), out.items[0] & 0xc0);
+    try testing.expectEqual(@as(usize, 1), enc.dynamicTableCount());
+
+    // `proxy-authorization` (static 49), and a caller-marked field with a
+    // name the encoder must send literally: name may be Huffman, value not.
+    out.clearRetainingCapacity();
+    try enc.encodeBlock(&.{.{ .name = "proxy-authorization", .value = bearer }}, &out);
+    try testing.expectEqualSlices(u8, &.{ 0x1f, 49 - 15, bearer.len }, out.items[0..3]);
+    out.clearRetainingCapacity();
+    try enc.encodeBlock(&.{.{ .name = "x-api-key", .value = bearer, .sensitive = true }}, &out);
+    try testing.expectEqual(@as(u8, 0x10), out.items[0]);
+    const name_len = out.items[1] & 0x7f;
+    try testing.expect(out.items[1] & 0x80 != 0); // the name went Huffman
+    try testing.expectEqual(@as(u8, bearer.len), out.items[2 + name_len]); // H = 0
+    try testing.expectEqualStrings(bearer, out.items[3 + name_len ..]);
+
+    // The decoder sees each as sensitive, so a relay keeps the protection.
+    var dec: Decoder = .init(gpa, .{});
+    defer dec.deinit();
+    var hl = try dec.decodeBlock(out.items);
+    defer hl.deinit(gpa);
+    try testing.expect(hl.fields[0].sensitive);
+}
+
+test "sensitive fields: default_sensitive = false indexes credentials like any field" {
+    const gpa = testing.allocator;
+    var enc: Encoder = .init(gpa, .{ .default_sensitive = false });
+    defer enc.deinit();
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try enc.encodeBlock(&.{.{ .name = "authorization", .value = "Basic dXNlcjpwYXNz" }}, &out);
+    try testing.expectEqual(@as(u8, 0x40), out.items[0] & 0xc0);
+    try testing.expectEqual(@as(usize, 1), enc.dynamicTableCount());
 }

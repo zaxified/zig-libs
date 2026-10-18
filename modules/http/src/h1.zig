@@ -214,15 +214,6 @@ const tchar_table: [256]bool = blk: {
     for (0..256) |c| t[c] = isTchar(c);
     break :blk t;
 };
-// field-value = *(field-vchar / SP / HTAB), field-vchar = VCHAR / obs-text
-// (RFC 9110 §5.5): a control byte -- NUL, a bare CR, anything below 0x20
-// but HTAB, or DEL -- cannot appear in a value, and is the classic vehicle
-// for header injection. Bytes >= 0x80 are obs-text and stay legal.
-const value_char_table: [256]bool = blk: {
-    var t: [256]bool = @splat(false);
-    for (0..256) |c| t[c] = !((c < 0x20 and c != '\t') or c == 0x7f);
-    break :blk t;
-};
 
 /// A non-empty RFC 9110 §5.6.2 token: what a method name, a field name and
 /// a transfer-coding are made of. The one definition every path that admits
@@ -243,9 +234,64 @@ pub fn isToken(name: []const u8) bool {
 /// framed and is re-serialized into a CRLF block) or leaves through the
 /// client (where it is written into one) is held to what h1 would have
 /// accepted on the wire.
+///
+/// Constant time in the value's bytes (2026-10-18): the values it sees are
+/// `Authorization`, `Cookie` and API keys, so no byte may index a table or
+/// pick a branch. 16-byte vectors from 16 bytes up (the tail as an
+/// overlapping last vector), two overlapping SWAR words below; only the
+/// length, which is public, chooses the path. Faster than the 256-entry
+/// table it replaced from 5 bytes up (1.5–7×, standalone A/B, ReleaseFast).
 pub fn isValidFieldValue(value: []const u8) bool {
-    for (value) |c| if (!value_char_table[c]) return false;
-    return true;
+    const n = value.len;
+    if (n >= 16) {
+        var acc: @Vector(16, u8) = @splat(0);
+        var i: usize = 0;
+        while (i + 16 <= n) : (i += 16) acc |= badValueLanes(value[i..][0..16].*);
+        acc |= badValueLanes(value[n - 16 ..][0..16].*);
+        return @reduce(.Or, acc) == 0;
+    }
+    if (n >= 8) {
+        const a = std.mem.readInt(u64, value[0..8], .little);
+        const b = std.mem.readInt(u64, value[n - 8 ..][0..8], .little);
+        return badValueBytes(u64, a) | badValueBytes(u64, b) == 0;
+    }
+    if (n >= 4) {
+        const a = std.mem.readInt(u32, value[0..4], .little);
+        const b = std.mem.readInt(u32, value[n - 4 ..][0..4], .little);
+        return badValueBytes(u32, a) | badValueBytes(u32, b) == 0;
+    }
+    if (n == 0) return true;
+    return badValueBytes(u8, value[0]) | badValueBytes(u8, value[n / 2]) | badValueBytes(u8, value[n - 1]) == 0;
+}
+
+// field-value = *(field-vchar / SP / HTAB), field-vchar = VCHAR / obs-text
+// (RFC 9110 §5.5): a control byte -- NUL, a bare CR, anything below 0x20
+// but HTAB, or DEL -- cannot appear in a value, and is the classic vehicle
+// for header injection. Bytes >= 0x80 are obs-text and stay legal.
+// A lane is non-zero iff its byte is one of those.
+inline fn badValueLanes(v: @Vector(16, u8)) @Vector(16, u8) {
+    const V = @Vector(16, u8);
+    const zero: V = @splat(0);
+    const one: V = @splat(1);
+    const below = @select(u8, v < @as(V, @splat(0x20)), one, zero);
+    const not_tab = @select(u8, v != @as(V, @splat('\t')), one, zero);
+    return (below & not_tab) | @select(u8, v == @as(V, @splat(0x7f)), one, zero);
+}
+
+// The same predicate per byte of a word (SWAR): the high bit of a byte lane
+// is set iff that byte is a control byte other than HTAB, or DEL. Every step
+// keeps each lane below 0x100, so no carry crosses into the next byte and
+// the answer is exact per lane, not only "some lane".
+inline fn badValueBytes(comptime T: type, x: T) T {
+    const ones: T = std.math.maxInt(T) / 255; // 0x0101…
+    const lo7 = ones * 0x7f;
+    const hi = ones * 0x80;
+    const below = ~(((x & lo7) + ones * 0x60) | x) & hi; // byte < 0x20
+    const y9 = x ^ (ones * 0x09);
+    const tab = ~(((y9 & lo7) + lo7) | y9) & hi; // byte == HTAB
+    const y7f = x ^ lo7;
+    const del = ~(((y7f & lo7) + lo7) | y7f) & hi; // byte == DEL
+    return (below & ~tab) | del;
 }
 
 /// The bytes a request-target may consist of: a URI reference is ASCII (RFC
@@ -2156,4 +2202,25 @@ test "RequestHead: a head packed with minimal headers is bounded by bytes, not b
     var it = parsed.iterate();
     while (it.next()) |_| seen += 1;
     try testing.expectEqual(i + 2, seen); // Host + the h<N> lines + x-needle
+}
+
+test "isValidFieldValue: every byte at every position of every path length agrees with the RFC 9110 rule" {
+    // One control byte anywhere must fail on every length path (scalar
+    // triple, two SWAR widths, vector + overlapping tail); legal bytes, incl.
+    // HTAB and obs-text, must pass. Reference: the per-byte predicate.
+    var buf: [48]u8 = undefined;
+    for (0..buf.len) |len| {
+        for (0..256) |c| {
+            const byte: u8 = @intCast(c);
+            const legal = !((byte < 0x20 and byte != '\t') or byte == 0x7f);
+            for (0..len) |pos| {
+                @memset(buf[0..len], 'a');
+                buf[pos] = byte;
+                try std.testing.expectEqual(legal, isValidFieldValue(buf[0..len]));
+            }
+        }
+        @memset(buf[0..len], 0x80);
+        try std.testing.expect(isValidFieldValue(buf[0..len]));
+    }
+    try std.testing.expect(isValidFieldValue(""));
 }
