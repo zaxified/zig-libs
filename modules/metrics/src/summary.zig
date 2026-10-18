@@ -376,6 +376,27 @@ test "validation" {
     try testing.expectError(error.InvalidMaxAge, Summary.init(a, .{ .max_age_ns = 4, .age_buckets = 5 }));
     var ok = try Summary.init(a, .{ .objectives = &.{.{ .quantile = 0, .epsilon = 0 }} });
     ok.deinit();
+    // The upper edges are valid: quantile 1, one-value buffer, 1 ns per bucket.
+    var q1 = try Summary.init(a, .{ .objectives = &.{.{ .quantile = 1, .epsilon = 0.01 }} });
+    q1.deinit();
+    var b1 = try Summary.init(a, .{ .objectives = &std_objectives, .buf_cap = 1 });
+    b1.deinit();
+    var m1 = try Summary.init(a, .{ .max_age_ns = 5, .age_buckets = 5 });
+    m1.deinit();
+}
+
+test "compress: a two-sample list merges when the invariant allows it" {
+    const a = testing.allocator;
+    var st: Stream = .{};
+    defer st.deinit(a);
+    try st.b.ensureTotalCapacityPrecise(a, stream_buf_cap);
+    const targets = [_]Objective{.{ .quantile = 0.5, .epsilon = 0.5 }};
+    try st.insert(a, &targets, 1);
+    try st.insert(a, &targets, 2);
+    try st.flush(a, &targets);
+    // 1 + 1 + 0 <= 2 * 0.5 * (2 - 0) / (1 - 0.5) = 4: one sample of width 2.
+    try testing.expectEqual(@as(usize, 1), st.l.items.len);
+    try testing.expectEqual(@as(f64, 2), st.l.items[0].width);
 }
 
 test "no objectives: only sum and count" {

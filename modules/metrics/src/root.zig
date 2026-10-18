@@ -4812,6 +4812,232 @@ test "registerCollector: a sibling desc colliding with a histogram's derived nam
     }, .{ .collect = Noop.collect }));
 }
 
+// ── tests added by the 2026-10-18 mutation audit ────────────────────────────
+
+test "exemplars: an observation equal to a bound carries its exemplar in that bucket" {
+    var reg = Registry.init(testing.allocator);
+    defer reg.deinit();
+    const h = try reg.histogram("eq_seconds", "h", &.{}, &.{ 1, 5 });
+    try h.observeWithExemplar(1, &.{.{ .name = "s", .value = "x" }}, null);
+    var buf: [1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try reg.writeOpenMetrics(&w);
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "eq_seconds_bucket{le=\"1.0\"} 1 # {s=\"x\"} 1.0\n") != null);
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "eq_seconds_bucket{le=\"5.0\"} 1\n") != null);
+}
+
+test "buckets: fillExponentialBucketsRange accepts min == max, refuses a descending range" {
+    var one: [1]f64 = undefined;
+    try fillExponentialBucketsRange(&one, 2, 2);
+    try testing.expectEqual(@as(f64, 2), one[0]);
+    var three: [3]f64 = undefined;
+    try fillExponentialBucketsRange(&three, 2, 2);
+    for (three) |b| try testing.expectEqual(@as(f64, 2), b);
+    try testing.expectError(error.InvalidBuckets, fillExponentialBucketsRange(&three, 2, 1));
+    var none: [0]f64 = .{};
+    try testing.expectError(error.InvalidBuckets, fillExponentialBucketsRange(&none, 1, 2));
+    try testing.expectError(error.InvalidBuckets, fillLinearBuckets(&none, 1, 1));
+}
+
+test "summary: a refused descriptor leaves no family; options are compared field by field" {
+    var reg = Registry.init(testing.allocator);
+    defer reg.deinit();
+    // max_objectives distinct quantiles, the last one exactly 1, are fine;
+    // one more is not.
+    var objs: [max_objectives + 1]Objective = undefined;
+    for (&objs, 0..) |*o, i| o.* = .{ .quantile = @as(f64, @floatFromInt(i)) / max_objectives, .epsilon = 0.01 };
+    _ = try reg.summary("max_objs", "h", &.{}, .{ .objectives = objs[1..] });
+    try testing.expectError(error.InvalidObjectives, reg.summary("too_many", "h", &.{}, .{ .objectives = &objs }));
+    try testing.expect(reg.family_index.get("too_many") == null);
+
+    const good: Objective = .{ .quantile = 0.5, .epsilon = 0.05 };
+    try testing.expectError(error.InvalidObjectives, reg.summary("b_cap", "h", &.{}, .{ .objectives = &.{good}, .buf_cap = 0 }));
+    try testing.expect(reg.family_index.get("b_cap") == null);
+    try testing.expectError(error.InvalidObjectives, reg.summary("b_age", "h", &.{}, .{ .objectives = &.{good}, .max_age_ns = 4, .age_buckets = 5 }));
+    try testing.expect(reg.family_index.get("b_age") == null);
+    try testing.expectError(error.InvalidObjectives, reg.summary("b_eps", "h", &.{}, .{ .objectives = &.{.{ .quantile = 0.5, .epsilon = 1 }} }));
+    try testing.expect(reg.family_index.get("b_eps") == null);
+
+    const base: SummaryOptions = .{ .objectives = &.{good}, .max_age_ns = 1000, .age_buckets = 2, .buf_cap = 100 };
+    _ = try reg.summary("mm", "h", &.{}, base);
+    _ = try reg.summary("mm", "h", &.{}, base);
+    var o = base;
+    o.buf_cap = 200;
+    try testing.expectError(error.ObjectivesMismatch, reg.summary("mm", "h", &.{}, o));
+    o = base;
+    o.age_buckets = 4;
+    try testing.expectError(error.ObjectivesMismatch, reg.summary("mm", "h", &.{}, o));
+    o = base;
+    o.objectives = &.{.{ .quantile = 0.5, .epsilon = 0.06 }};
+    try testing.expectError(error.ObjectivesMismatch, reg.summary("mm", "h", &.{}, o));
+}
+
+test "callbacks: refusals leave the family clean and never mix callbacks with other series" {
+    const Noop = struct {
+        fn collect(_: ?*anyopaque, _: *Sink) anyerror!void {}
+    };
+    var reg = Registry.init(testing.allocator);
+    defer reg.deinit();
+    var x: f64 = 1;
+    try testing.expectError(error.InvalidUtf8, reg.gaugeFunc("u8_func", "h", &.{.{ .name = "k", .value = "\xff" }}, &x, constValue));
+    try testing.expect(reg.family_index.get("u8_func") == null);
+    // An ordinary series first, a callback with another label value second.
+    _ = try reg.gauge("mixed", "h", &.{.{ .name = "k", .value = "a" }});
+    try testing.expectError(error.AlreadyRegistered, reg.gaugeFunc("mixed", "h", &.{.{ .name = "k", .value = "b" }}, &x, constValue));
+    // A collector's family takes no callbacks.
+    try reg.registerCollector(&.{.{ .name = "owned", .help = "h", .kind = .gauge }}, .{ .collect = Noop.collect });
+    try testing.expectError(error.AlreadyRegistered, reg.gaugeFunc("owned", "h", &.{}, &x, constValue));
+}
+
+test "registerCollector: a repeated name is refused; look-alike names are not collisions" {
+    const Noop = struct {
+        fn collect(_: ?*anyopaque, _: *Sink) anyerror!void {}
+    };
+    var reg = Registry.init(testing.allocator);
+    defer reg.deinit();
+    try testing.expectError(error.AlreadyRegistered, reg.registerCollector(&.{
+        .{ .name = "dup", .help = "h", .kind = .gauge },
+        .{ .name = "dup", .help = "h", .kind = .gauge },
+    }, .{ .collect = Noop.collect }));
+    try testing.expect(reg.family_index.get("dup") == null);
+    // `cc_sum` is not derived from a counter; `lat2_x_sum` has a middle part
+    // `lat2` never emits; `bb_sum` has the length of `aa_sum` but another stem.
+    try reg.registerCollector(&.{
+        .{ .name = "cc", .help = "h", .kind = .counter },
+        .{ .name = "cc_sum", .help = "h", .kind = .counter },
+        .{ .name = "lat2", .help = "h", .kind = .histogram },
+        .{ .name = "lat2_x_sum", .help = "h", .kind = .gauge },
+        .{ .name = "aa", .help = "h", .kind = .histogram },
+        .{ .name = "bb_sum", .help = "h", .kind = .gauge },
+    }, .{ .collect = Noop.collect });
+}
+
+test "OpenMetrics: only a counter's _total suffix is dropped from the announced name" {
+    var reg = Registry.init(testing.allocator);
+    defer reg.deinit();
+    (try reg.gauge("level_total", "h", &.{})).set(2);
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try reg.writeOpenMetrics(&w);
+    try testing.expectEqualStrings("# HELP level_total h\n# TYPE level_total gauge\nlevel_total 2.0\n# EOF\n", w.buffered());
+}
+
+test "collector: Sink refuses desc == len, non-finite or equal bounds, malformed quantile lists" {
+    const Noop = struct {
+        fn collect(_: ?*anyopaque, _: *Sink) anyerror!void {}
+    };
+    var reg = Registry.init(testing.allocator);
+    defer reg.deinit();
+    try reg.registerCollector(&test_descs, .{ .collect = Noop.collect });
+    var buf: [1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var sink: Sink = .{ .w = &w, .entry = reg.families.items[0].collector.?, .format = .text };
+    try testing.expectError(error.InvalidDesc, sink.gauge(test_descs.len, &.{}, 1));
+    try testing.expectError(error.InvalidBuckets, sink.histogram(2, &.{}, &.{ 1, std.math.inf(f64) }, &.{ 1, 2 }, 0, 2));
+    try testing.expectError(error.InvalidBuckets, sink.histogram(2, &.{}, &.{ 1, 1 }, &.{ 1, 2 }, 0, 2));
+    try testing.expectEqualStrings("", w.buffered());
+
+    var reg2 = Registry.init(testing.allocator);
+    defer reg2.deinit();
+    try reg2.registerCollector(&.{.{ .name = "cs", .help = "h", .kind = .summary }}, .{ .collect = Noop.collect });
+    var buf2: [1024]u8 = undefined;
+    var w2: std.Io.Writer = .fixed(&buf2);
+    var sink2: Sink = .{ .w = &w2, .entry = reg2.families.items[0].collector.?, .format = .text };
+    const q5: Objective = .{ .quantile = 0.5, .epsilon = 0 };
+    const q9: Objective = .{ .quantile = 0.9, .epsilon = 0 };
+    try testing.expectError(error.InvalidBuckets, sink2.summary(0, &.{}, &.{ q5, q9 }, &.{1}, 1, 1));
+    try testing.expectError(error.InvalidBuckets, sink2.summary(0, &.{}, &.{ q5, q5 }, &.{ 1, 2 }, 1, 1));
+    try testing.expectEqualStrings("", w2.buffered());
+    // A quantile of exactly 1 is allowed.
+    try sink2.summary(0, &.{}, &.{.{ .quantile = 1, .epsilon = 0 }}, &.{3}, 3, 1);
+    try testing.expect(std.mem.indexOf(u8, w2.buffered(), "cs{quantile=\"1\"} 3\n") != null);
+}
+
+test "Format.negotiate: equal weights prefer the concrete type; a foreign range never matches" {
+    try testing.expectEqual(Format.text, Format.negotiate("*/*;version=1.0.0,text/plain"));
+    try testing.expectEqual(Format.text, Format.negotiate("text/plain,*/*;version=1.0.0"));
+    try testing.expectEqual(Format.text, Format.negotiate("application/json;version=1.0.0"));
+}
+
+test "middleware: the request size counts the declared Content-Length" {
+    var reg = Registry.init(testing.allocator);
+    defer reg.deinit();
+    var rm = try RequestMetrics.init(&reg, .{ .request_size_buckets = &.{100} });
+    var ep: Endpoint = .{ .registry = &reg };
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(rm.middleware());
+    try r.use(ep.middleware());
+    try r.post("/p", hOk);
+    var buf: [8192]u8 = undefined;
+    // "/p" 2 + "POST" 4 + "HTTP/1.1" 8 + "Host"+"t" 5 + "Connection"+"close" 15
+    // + "Content-Length"+"5" 15 + 5 declared body bytes = 54.
+    _ = runWire(&r, "POST /p HTTP/1.1\r\nHost: t\r\nConnection: close\r\nContent-Length: 5\r\n\r\nhello", &buf);
+    const got = runWire(&r, wire("GET", "/metrics"), &buf);
+    try expectBodyLine(got, "http_request_size_bytes_sum{method=\"post\"} 54");
+}
+
+test "ProcessCollector: without a boot time there is no start-time sample" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var reg = Registry.init(testing.allocator);
+    defer reg.deinit();
+    var pc: ProcessCollector = .{ .gpa = testing.allocator, .io = testing.io };
+    try pc.register(&reg, "");
+    pc.btime = 0;
+    var buf: [8192]u8 = undefined;
+    const out = try scrapeInto(&reg, &buf);
+    try testing.expect(std.mem.indexOf(u8, out, "process_start_time_seconds") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "process_open_fds ") != null);
+}
+
+test "Vec: delete with a wrong number of values never matches (the tuple comparison is length-safe)" {
+    var reg = Registry.init(testing.allocator);
+    defer reg.deinit();
+    const v = try reg.counterVec("wl_total", "h", &.{ "a", "b" });
+    for (0..8) |i| {
+        var k: [8]u8 = undefined;
+        const key = std.fmt.bufPrint(&k, "s{d}", .{i}) catch unreachable;
+        _ = try v.with(&.{ key, "x" });
+    }
+    // The map compares a 7-bit fingerprint before the tuples, so over many
+    // probes some land on a stored entry of another length.
+    var removed: usize = 0;
+    for (0..20000) |i| {
+        var k: [16]u8 = undefined;
+        const key = std.fmt.bufPrint(&k, "q{d}", .{i}) catch unreachable;
+        if (v.delete(&.{key})) removed += 1;
+    }
+    try testing.expectEqual(@as(usize, 0), removed);
+    try testing.expectEqual(@as(usize, 8), v.len());
+}
+
+test "retire/reap: freed at once with no scrape; the oldest running ticket decides" {
+    var reg = Registry.init(testing.allocator);
+    defer reg.deinit();
+    const v = try reg.counterVec("rt_total", "h", &.{"k"});
+    _ = try v.with(&.{"z"});
+    try testing.expect(v.delete(&.{"z"}));
+    try testing.expectEqual(@as(usize, 0), reg.retired.items.len);
+
+    // Scrapes 3 and 5 are running; a removal at seq 4 is held by 3 only.
+    try reg.scrapes.append(testing.allocator, 3);
+    try reg.scrapes.append(testing.allocator, 5);
+    reg.scrape_seq = 4;
+    _ = try v.with(&.{"a"});
+    try testing.expect(v.delete(&.{"a"}));
+    reg.reapLocked();
+    try testing.expectEqual(@as(usize, 1), reg.retired.items.len);
+    // A removal at seq 5: scrape 5 started after it, scrape 3 did not.
+    reg.scrape_seq = 5;
+    _ = try v.with(&.{"b"});
+    try testing.expect(v.delete(&.{"b"}));
+    try testing.expectEqual(@as(usize, 2), reg.retired.items.len);
+    // Scrape 3 ends: both are free (ticket 5 cannot hold a series removed at seq 5).
+    _ = reg.scrapes.swapRemove(0);
+    reg.reapLocked();
+    try testing.expectEqual(@as(usize, 0), reg.retired.items.len);
+}
+
 // ── external anchor: client_golang + expfmt + textparse ────────────────────
 // See go_oracle_test.zig / tools/interop.zig / tools/go_oracle.
 test {
