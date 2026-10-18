@@ -859,7 +859,7 @@ fn pemDecodeSecret(label: []const u8, text: []const u8, out: []u8) PemDecodeErro
     const begin = std.fmt.bufPrint(&begin_buf, "-----BEGIN {s}-----", .{label}) catch unreachable;
     const end = std.fmt.bufPrint(&end_buf, "-----END {s}-----", .{label}) catch unreachable;
 
-    const bi = std.mem.indexOf(u8, text, begin) orelse return error.MissingPemBlock;
+    const bi = pemBlockStart(text, label) orelse return error.MissingPemBlock;
     const body_start = bi + begin.len;
     // The END line starts at the first '-' after the body: base64 has none,
     // so this scan's compare is false on every key character and it stops at
@@ -879,7 +879,34 @@ fn pemDecodeSecret(label: []const u8, text: []const u8, out: []u8) PemDecodeErro
     return der_bytes;
 }
 
-/// Number of `-----BEGIN <label>-----` blocks in `text`.
+/// Where the first `-----BEGIN <label>-----` block of `text` starts, or null.
+/// Safe over text that also holds SECRET blocks of other labels (a key file
+/// searched for a label it does not have, a key stored before its chain):
+/// a plain `std.mem.indexOf` for the header is Boyer-Moore-Horspool, which
+/// would run over every body before the match — or over all of them when the
+/// label is absent — indexing its skip table by the key's base64 characters
+/// (2026-10-18). This walks the blocks instead: the searches for
+/// `-----BEGIN ` and for the end of the header line read only text between
+/// blocks and the header lines, and a non-matching block's body is skipped by
+/// a scan for its END line's first '-', a compare that is false on every
+/// base64 character, so it depends on the body's (public) length only.
+pub fn pemBlockStart(text: []const u8, label: []const u8) ?usize {
+    const begin = "-----BEGIN ";
+    const dashes = "-----";
+    var pos: usize = 0;
+    while (std.mem.indexOfPos(u8, text, pos, begin)) |bi| {
+        const label_start = bi + begin.len;
+        const after = text[label_start..];
+        if (std.mem.startsWith(u8, after, label) and std.mem.startsWith(u8, after[label.len..], dashes)) return bi;
+        // Skip this block: past its header line, then to its END line.
+        const line_end = std.mem.indexOfScalarPos(u8, text, label_start, '\n') orelse return null;
+        pos = std.mem.indexOfScalarPos(u8, text, line_end, '-') orelse return null;
+    }
+    return null;
+}
+
+/// Number of `-----BEGIN <label>-----` blocks in `text` (`std.mem.count`:
+/// for public text, see `pemBlockStart`).
 pub fn pemBlockCount(label: []const u8, text: []const u8) error{LabelTooLong}!usize {
     if (label.len > max_pem_label_len) return error.LabelTooLong;
     var begin_buf: [max_pem_label_len + 16]u8 = undefined;
@@ -968,8 +995,8 @@ pub fn rsaPrivateKeyFromPem(out: *rsa.KeyPair, text: []const u8) KeyPemError!voi
 
 noinline fn rsaKeyFromPemUnburned(out: *rsa.KeyPair, text: []const u8) KeyPemError!void {
     errdefer std.crypto.secureZero(u8, std.mem.asBytes(out));
-    const pkcs1 = std.mem.indexOf(u8, text, "-----BEGIN RSA PRIVATE KEY-----");
-    const pkcs8 = std.mem.indexOf(u8, text, "-----BEGIN PRIVATE KEY-----");
+    const pkcs1 = pemBlockStart(text, "RSA PRIVATE KEY");
+    const pkcs8 = pemBlockStart(text, "PRIVATE KEY");
     const start = if (pkcs1 != null and pkcs8 != null) @min(pkcs1.?, pkcs8.?) else (pkcs1 orelse pkcs8 orelse return error.MissingPemBlock);
     rsa.SecretKey.fromPem(&out.secret_key, text[start..]) catch |err| switch (err) {
         error.MissingPemBlock => return error.MissingPemBlock,
@@ -2044,6 +2071,40 @@ test "ecPrivateKeyFromPem: version must be 1 and the private octets at most 32" 
     const pem_long = try pemEncode(testing.allocator, "EC PRIVATE KEY", long_priv);
     defer testing.allocator.free(pem_long);
     try testing.expectError(error.MalformedKey, ecPrivateKeyFromPem(&scratch, testing.allocator, pem_long));
+}
+
+// `pemBlockStart` (2026-10-18) replaced `std.mem.indexOf` for the header in
+// every search over text that may hold a key: it must find what the plain
+// search found, in order, across blocks of other labels.
+test "pemBlockStart: first block of the label, past blocks of other labels; labels match whole" {
+    const key = "-----BEGIN EC PRIVATE KEY-----\nMHcCAQEEIBEND+PRIVATE/KEY\n-----END EC PRIVATE KEY-----\n";
+    const cert = "-----BEGIN CERTIFICATE-----\nMAA=\n-----END CERTIFICATE-----\n";
+    const crlf = "-----BEGIN CERTIFICATE-----\r\nMAE=\r\n-----END CERTIFICATE-----\r\n";
+    const text = "junk\n" ++ key ++ cert ++ crlf;
+    try testing.expectEqual(@as(?usize, 5), pemBlockStart(text, "EC PRIVATE KEY"));
+    try testing.expectEqual(@as(?usize, 5 + key.len), pemBlockStart(text, "CERTIFICATE"));
+    try testing.expectEqual(@as(?usize, 0), pemBlockStart(crlf ++ cert, "CERTIFICATE"));
+    try testing.expectEqual(@as(?usize, key.len), pemBlockStart(key ++ crlf, "CERTIFICATE"));
+    // A label is matched whole: neither a prefix nor a suffix of another.
+    try testing.expectEqual(@as(?usize, null), pemBlockStart(text, "PRIVATE KEY"));
+    try testing.expectEqual(@as(?usize, null), pemBlockStart(text, "EC PRIVATE"));
+    try testing.expectEqual(@as(?usize, null), pemBlockStart(text, "CERTIFICATE REQUEST"));
+    try testing.expectEqual(@as(?usize, null), pemBlockStart("", "CERTIFICATE"));
+    // A block with no END line hides everything after it (no '-' to stop at).
+    try testing.expectEqual(@as(?usize, null), pemBlockStart("-----BEGIN X-----\nAAAA", "CERTIFICATE"));
+
+    // The callers: a PKCS#8 text through `privateKeyFromPem` (its EC search
+    // misses), and the RSA loader over a text whose first block is a cert.
+    const kp = testKeyPair384(0x5a);
+    const pk8 = try pkcs8PrivateKeyToPem(testing.allocator, kp);
+    defer testing.allocator.free(pk8);
+    var any: jws.AnyKeyPair = undefined;
+    try privateKeyFromPem(&any, testing.allocator, pk8);
+    try testing.expectEqualSlices(u8, &kp.secret_key.bytes, &any.es384.secret_key.bytes);
+    const both = try std.mem.concat(testing.allocator, u8, &.{ cert, pk8 });
+    defer testing.allocator.free(both);
+    try privateKeyFromPem(&any, testing.allocator, both);
+    try testing.expectEqualSlices(u8, &kp.secret_key.bytes, &any.es384.secret_key.bytes);
 }
 
 // ── ES384 / PKCS#8 / ARI (2026-10-13) ───────────────────────────────────────

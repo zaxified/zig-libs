@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-10-06 · mutation 2026-08-22 · src ?
 
-**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, SSH_FUZZ; ssh-pubkey added 2026-10-10) · ct 2026-10-10 (ctgrind)
+**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, SSH_FUZZ; ssh-pubkey added 2026-10-10) · ct 2026-10-18 (ctgrind; host-key PEM target `pem` added 2026-10-18)
 
 **Performance:** not measured
 
@@ -344,15 +344,28 @@ environment with OpenSSH installed.
 
 ## Backlog / deferred
 
-- **Constant time: the OpenSSH host-key PEM is decoded with std's table base64** *(found 2026-10-18
-  from acme's ctgrind, not measured here)*: `pemDecodeOpensshBlock` (`server.zig:366`) finds the END
-  line with `std.mem.indexOfPos` (Boyer-Moore-Horspool over the key's base64: a skip-table index
-  by, and a skip length that depends on, each character), strips whitespace with a branch per
-  character, then decodes with `std.base64.standard.Decoder`, whose alphabet table is indexed by the
-  key's characters — the class acme and rsa fixed with `b64ct` (2026-10-13/17). Fix as rsa did:
-  `std.mem.lastIndexOf` for the END line, `b64ct.standard.decodeIgnoring(out, body,
-  b64ct.pem_whitespace)` (new dep `b64ct`), and a ctgrind target for `HostKey.fromOpenSSH`. Effort S;
-  the host key is read once at start, so the exposure is a local observer of that moment.
+- ~~**Ed25519 host key: the seed is not checked against the public key in ReleaseFast/ReleaseSmall**~~
+  — **fixed 2026-10-18**: `parseEd25519Body` derives the pair with `Ed25519.KeyPair.generateDeterministic(seed)`
+  and compares its public key with the container's (std 0.16 `fromSecretKey` re-derives only under runtime
+  safety, so the old check compared the container's copy with itself). Test `parseEd25519Body: a seed that does
+  not derive the container's public key is refused in every mode`, run in ReleaseFast; the old derivation fails it.
+- ~~**Constant time: the OpenSSH host-key PEM is decoded with std's table base64**~~ — **fixed
+  2026-10-18**: `pemDecodeOpensshBlock` finds the END line as the first `'-'` after the body
+  (`std.mem.indexOfScalarPos`; base64 has no `'-'`, so the scan stops at the body's public length)
+  and checks the END line starts there, then decodes straight into the caller's (wiped) buffer with
+  `b64ct.standard.decodeIgnoring(out, body, b64ct.pem_whitespace)` (new dep `b64ct`) — no
+  Boyer-Moore-Horspool skip table, no alphabet table, no per-character whitespace branch, and no
+  stripped base64 copy left on the stack. The first block in the text is used (as rsa's). Error set
+  unchanged (`MissingPemBlock`, `InvalidPem` — also for a body that decodes past the 16 KiB buffer).
+  ctgrind targets `pem` (`HostKey.fromOpenSSH` on the ed25519 fixture, the base64 characters that
+  carry only seed bits tainted): **1** in-file context — `findScalarPos`'s early exit
+  (mem.zig:1298 from `server.zig:382`), whose outcome is public because a key character is never
+  `'-'` — plus the 2-context witness; and `pemstd`, the positive control (the replaced
+  `indexOfPos` + `std.base64` decoder on the same tainted body): 18 contexts in `mem.zig` /
+  `base64.zig`, must stay ≥ 1. Rows and attribution in `scripts/checks/ctgrind-expected.tsv`.
+  Later the same day `pem` 1 → **3** with the seed-check fix below it in this list: the derived public
+  key's `rejectIdentity` in std's `pcMul16` and its compare with the container's copy — both decide on the
+  public key (tainted to memcheck only because it is derived from the seed).
 - **Build option: `ssh-gex-max-bits`** (design 2026-10-17, mechanism and checklist in CONVENTIONS §4.2; measure first — HTTPS sizeprobe or `nm -S --size-sort` on a consumer binary — and add a knob only for a measured gain of roughly ≥ 100 KB or a consumer request). `gex_max_bits = 8192` (src/transport.zig `GexMod = montint.DynModint(gex_max_bits)`)
   is the SAME type as rsa's `DynModint(8192)`, so lowering rsa alone saves nothing for an ssh consumer: both must drop together.
   `.small` → 4096 (RFC 8270 floor is 2048; a server offering a bigger group than the cap fails the kex loudly — check it does, with a

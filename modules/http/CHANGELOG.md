@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — Backlog: header-value table and HPACK Huffman over credential headers are not constant-time (owner decision; pre-tag sweep).
+- **2026-10-18** — **Constant time:** `basicAuth` and `basicAuthHeader` use the constant-time `b64ct` module (new dep) instead of `std.base64.standard`: the Basic credentials carry the client password, and std's codec indexes its alphabet/decode table by each secret character. Results and the `null`/error returns are unchanged. Same for the outbound proxy credentials in `client_proxy.zig`: `Proxy-Authorization` base64 via `b64ct`, the `%XX` userinfo decode via a branch-free hex nibble (technique of `sessions/src/idhex.zig`, local copy), and the decoded password buffers are zeroed after use. The `secret-api-ok` note on `basicAuthHeader` stays (it excuses the missing burn, not the codec).
 - **2026-10-17** — sizeprobe: wires the root build's `zl_options` into its by-path `rsa` (`-Dprofile`, `-Drsa-max-modulus-bits`), so the probe measures a consumer's size profile too. Tool only.
 - **2026-10-17** — `error_headers`: the cap (`max_error_headers`, now 32) counts usable entries only — skipped ones no longer use slots; connection-specific headers HTTP/2 forbids (`keep-alive`, `upgrade`, `proxy-connection`, `te`) are skipped; `usableErrorHeaders` is an iterator.
 

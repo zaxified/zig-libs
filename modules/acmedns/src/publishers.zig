@@ -21,6 +21,7 @@
 
 const std = @import("std");
 const dns = @import("dns");
+const b64ct = @import("b64ct");
 const http = @import("http");
 const netaddr = @import("netaddr");
 const procrun = @import("procrun");
@@ -337,9 +338,11 @@ fn basicAuth(buf: *[512]u8, user: []const u8, password: []const u8) error{Invali
     var plain: [380]u8 = undefined;
     defer std.crypto.secureZero(u8, &plain);
     const joined = std.fmt.bufPrint(&plain, "{s}:{s}", .{ user, password }) catch return error.InvalidCredentials;
-    const enc = std.base64.standard.Encoder;
+    // b64ct, not std.base64: the password is secret, and std indexes its
+    // encode table by each secret sextet (cache side channel).
+    const enc = b64ct.standard;
     const prefix = "Basic ";
-    if (prefix.len + enc.calcSize(joined.len) > buf.len) return error.InvalidCredentials;
+    if (prefix.len + enc.encodedLen(joined.len) > buf.len) return error.InvalidCredentials;
     @memcpy(buf[0..prefix.len], prefix);
     return buf[0 .. prefix.len + enc.encode(buf[prefix.len..], joined).len];
 }

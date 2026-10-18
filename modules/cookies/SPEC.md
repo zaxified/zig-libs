@@ -161,6 +161,7 @@ instants including i64 extremes and cross-mode opens; ctgrind rows tsign/tverify
 (aesgcm's verdict); four more stack-probe entry points.
 
 ## Backlog / deferred
+- **Constant time (low, found 2026-10-18 pre-tag sweep)**: the public `percentEncode`/`percentDecode` helpers use a hex table / `charToDigit` (root.zig ~368-423) and `isCookieValue` switches per byte (~214, ~281-296) — over a session id on Set-Cookie write. Not used internally with secrets; a CT variant if a consumer needs one.
 None recorded before the 2026-09-30 survey.
 
 - **A public punycode / IDNA module** (2026-10-05) — `psl.toAscii` punycodes the list's Unicode

@@ -51,9 +51,9 @@
 //! `std.crypto.hash.blake2.Blake2b512`/`Blake2b256`, `std.crypto.pwhash.
 //! scrypt.{Params, kdf}` (RFC 7914 scrypt; `Params.fromLimits` already
 //! matches libsodium's ops/mem-limit → N/r/p algorithm), and
-//! `std.base64.standard` (RFC 4648 alphabet with `=` padding — the same
-//! alphabet minisign's own hand-rolled `base64.c` uses). Nothing here is a
-//! gap; no sibling module is needed.
+//! the sibling `b64ct` (constant-time standard base64, RFC 4648 alphabet with `=`
+//! padding — the same alphabet minisign's own hand-rolled `base64.c` uses).
+//! Nothing here is a gap.
 //!
 //! Note: multi-part incremental signing (`Ed25519.KeyPair.signer`/
 //! `signerWithBaseNonce`) is deliberately **not** used for the global
@@ -75,6 +75,7 @@
 
 const std = @import("std");
 const entropy = @import("entropy");
+const b64ct = @import("b64ct").standard;
 const burn = @import("burn.zig");
 
 pub const meta = .{
@@ -91,9 +92,10 @@ pub const meta = .{
     .concurrency = .reentrant,
     .model_after = "jedisct1/minisign (C reference, ISC) + jedisct1/zig-minisign (ISC)",
     // entropy: the Ed25519 seed in `KeyPair.generate` — the only secret this
-    // module mints. Everything else is std: std.crypto.sign.Ed25519,
-    // std.crypto.hash.blake2, std.crypto.pwhash.scrypt, std.base64.
-    .deps = .{"entropy"},
+    // module mints. b64ct: the base64 text of an unencrypted secret key IS the
+    // key. Everything else is std: std.crypto.sign.Ed25519,
+    // std.crypto.hash.blake2, std.crypto.pwhash.scrypt.
+    .deps = .{ "entropy", "b64ct" },
 };
 
 // ── field sizes (all format facts from minisign.h) ──────────────────────────
@@ -277,11 +279,13 @@ pub const RawSecretKey = struct {
 
 /// A fixed-size-binary <-> standard-base64 codec (RFC 4648 alphabet, `=`
 /// padding — matches minisign's own hand-rolled `base64.c`).
+///
+/// Constant-time (`b64ct`) for every key and signature alike: for an unencrypted
+/// secret key (kdf_alg none) the base64 text IS the raw Ed25519 secret key, and
+/// std's table codec indexes its alphabet by each secret character/sextet.
 fn Base64Codec(comptime wire_length: usize) type {
-    const Encoder = std.base64.standard.Encoder;
-    const Decoder = std.base64.standard.Decoder;
     return struct {
-        pub const encoded_length = Encoder.calcSize(wire_length);
+        pub const encoded_length = b64ct.encodedLen(wire_length);
 
         pub fn encode(bytes: [wire_length]u8) [encoded_length]u8 {
             var out: [encoded_length]u8 = undefined;
@@ -291,7 +295,7 @@ fn Base64Codec(comptime wire_length: usize) type {
 
         /// By pointer, for the secret-key codec: no copy of the key in a frame.
         pub fn encodeInto(out: *[encoded_length]u8, bytes: *const [wire_length]u8) void {
-            _ = Encoder.encode(out, bytes);
+            _ = b64ct.encode(out, bytes);
         }
 
         pub fn decode(text: []const u8) error{ WrongLength, InvalidBase64 }![wire_length]u8 {
@@ -304,9 +308,9 @@ fn Base64Codec(comptime wire_length: usize) type {
         pub fn decodeInto(out: *[wire_length]u8, text: []const u8) error{ WrongLength, InvalidBase64 }!void {
             errdefer std.crypto.secureZero(u8, out);
             if (text.len != encoded_length) return error.WrongLength;
-            const decoded_len = Decoder.calcSizeForSlice(text) catch return error.InvalidBase64;
+            const decoded_len = b64ct.decodedLen(text) catch return error.InvalidBase64;
             if (decoded_len != wire_length) return error.InvalidBase64;
-            Decoder.decode(out, text) catch return error.InvalidBase64;
+            _ = b64ct.decode(out, text) catch return error.InvalidBase64;
         }
     };
 }

@@ -629,7 +629,8 @@ fn adoptStored(m: *Manager, e: *Entry, t: i64) bool {
         std.crypto.secureZero(u8, blob);
         m.gpa.free(blob);
     }
-    const split = std.mem.indexOf(u8, blob, "-----BEGIN CERTIFICATE-----") orelse return false;
+    // The key comes first: walk the blocks, never search across its body.
+    const split = x509.pemBlockStart(blob, "CERTIFICATE") orelse return false;
     const leaf = checkPair(m.gpa, e.names, blob[split..], blob[0..split], t, m.options.trust_anchors) catch return false;
     // Newer = issued later (a shorter-lived replacement still counts).
     if (e.cert) |ct| if (leaf.not_before <= ct.not_before) return false;
@@ -972,7 +973,7 @@ pub fn tlsAlpnMaterial(m: *Manager, gpa: Allocator, sni_in: []const u8) error{Ou
         else => return null,
     };
     errdefer gpa.free(cert_der);
-    const at = std.mem.indexOf(u8, blob, "-----BEGIN EC PRIVATE KEY-----") orelse {
+    const at = x509.pemBlockStart(blob, "EC PRIVATE KEY") orelse {
         gpa.free(cert_der);
         return null;
     };
@@ -1222,7 +1223,7 @@ fn leafCovers(leaf: []const u8, name: []const u8) bool {
 
 fn checkKey(gpa: Allocator, leaf: []const u8, key_pem: []const u8) CheckError!void {
     const spki = pkix.spkiOf(leaf) catch return error.MalformedChain;
-    if (std.mem.indexOf(u8, key_pem, "-----BEGIN RSA PRIVATE KEY-----") != null) return checkRsaKey(gpa, spki.der, key_pem);
+    if (x509.pemBlockStart(key_pem, "RSA PRIVATE KEY") != null) return checkRsaKey(gpa, spki.der, key_pem);
     var pair: jws.AnyKeyPair = undefined;
     defer std.crypto.secureZero(u8, std.mem.asBytes(&pair));
     x509.privateKeyFromPem(&pair, gpa, key_pem) catch |err| switch (err) {

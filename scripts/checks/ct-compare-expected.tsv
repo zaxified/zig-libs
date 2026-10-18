@@ -48,7 +48,8 @@ modules/otp/src/root.zig	3	0
 # rsa 2026-10-14 (later): 4 -> 3 constant-time: verifyPkcs1v15's whole-encoding compare moved from
 # timing_safe.eql over the 1 KiB capacity to an OR-of-XOR accumulator over the k octets (still
 # branch-free up to the one verdict; the signature and encoding are public anyway).
-modules/rsa/src/root.zig	3	28
+# rsa 2026-10-18: +5 plain compares, all public: BlindingCache.serves' modulus compare (the key's public n) and four test compares of a PRNG's state (did the op draw?).
+modules/rsa/src/root.zig	3	33
 modules/sealedbox/src/xsalsa20poly1305.zig	1	0
 modules/sessions/src/csrf.zig	1	2
 modules/signal/src/xeddsa.zig	2	0
@@ -66,3 +67,5 @@ modules/tlsresume/src/psk.zig	1	0
 modules/voprf/src/root.zig	5	1
 modules/webhooksig/src/root.zig	2	4
 modules/wireguard/src/handshake.zig	4	11
+# wireguard 2026-10-18: keyFromBase64Body's re-encode check moved to timing_safe.eql over the key text (b64ct decode); the 7 plain compares are a peer public-key match (peer merge) and the fuzz harness's round-trip checks (test-only, over its own fixture keys).
+modules/wireguard/src/root.zig	1	7

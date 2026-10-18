@@ -38,7 +38,7 @@ Provenance: see [NOTICE](NOTICE).
 All three files (public key, secret key, signature) are the same shape: a
 `# <n>` fixed-size binary struct, base64-encoded (standard RFC 4648 alphabet,
 `=`-padded — the exact alphabet minisign's own hand-rolled `base64.c` uses,
-same as `std.base64.standard`), framed by one or two comment lines. Struct
+same alphabet as `std.base64.standard`, decoded by the constant-time `b64ct`), framed by one or two comment lines. Struct
 layouts are confirmed against `minisign.h`/`minisign.c`
 (github.com/jedisct1/minisign, tag closest to the installed `minisign 0.12`)
 and cross-checked byte-exact against that binary's real output (see

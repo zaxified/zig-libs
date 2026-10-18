@@ -36,13 +36,13 @@ No foreign source was read; feature claims are from public documentation as reme
 typed errors per fault — accepted text maps injectively to bytes), opt-in leniency exactly
 where authenticator secrets need it, caller buffers with no allocation, Python-anchored KATs.
 **Where we are behind:** no streaming encoder/decoder, no custom or Crockford alphabet, no
-`map01`, no constant-time claim (→ Backlog).
+`map01`.
 
 ## What this module is, and what it is not
 
 A one-shot RFC 4648 §6/§7 codec over caller buffers. Not provided: a streaming
 (incremental) encoder/decoder, base32 variants other than the two RFC alphabets
-(Crockford, z-base-32, Geohash), a constant-time decoder.
+(Crockford, z-base-32, Geohash).
 
 ## Wire format / algorithm
 
@@ -69,14 +69,16 @@ and LF anywhere, including between `=`. Both are off by default (RFC 4648 §3.3)
 
 ## Constant-time contract
 
-⚠ Secrets (TOTP keys) pass through this module. **There is no constant-time
-claim.** Decoding indexes a 256-byte table with input bytes and branches on
-validity, padding and whitespace, so timing and cache footprint depend on the
-text. The tables are 4 × 256 bytes, so a co-resident cache observer could in
-principle learn symbol values. This is the same exposure as the base32 decoders
-in Python, Go and pyotp; a threat model that includes a local cache adversary
-against enrolment-time secret decoding needs a different decoder. The module
-does not zero any buffer: callers own `dest` and should clear it after use.
+Secrets (TOTP keys) pass through this module, so both directions are constant-time
+over the data (since 2026-10-10). `encode` and `decode` index no table and branch on no
+symbol value: each symbol is computed arithmetically (range decisions are borrows turned
+into masks, the technique of `sessions/src/idhex.zig`), and the validity of the decoded
+characters is accumulated as a mask and reported once, after the loop. What still
+branches is public: the options, the lengths, and whether a character is padding or
+skippable whitespace (for canonical text the public length fixes the padding outcome).
+The final `NonCanonical` verdict reads the unused low bits once, at the end. Evidence: the
+ctgrind harness `src/ctgrind_harness.zig` (see Hardening). The module does not zero any
+buffer: callers own `dest` and should clear it after use.
 
 ## Verification
 
@@ -132,8 +134,6 @@ changes nothing.
 
 - ~~**`dnssec` could switch to this module**~~ — done 2026-10-02: `dnssec.nsec3` reads owner-hash labels with `.hex`, `.forbidden` padding, `.insensitive` case. The strict trailing-length check closed an aliasing its private decoder had (a 33-symbol label decoding like the 32-symbol one).
 - Streaming encoder/decoder (for secrets read in pieces): none needed yet.
-- A branch-free table-less decoder, if a consumer ever needs a constant-time
-  claim.
 
 ## Status
 

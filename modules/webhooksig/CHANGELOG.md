@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — **Constant time:** `decodeSecret` / `decodeSigningKey` / `encodeSecret` (`whsec_`/`whsk_` keys) run on `b64ct` instead of `std.base64` (new dep). The padded/unpadded choice no longer branches on the key's last character: a length that is a multiple of 4 uses the padded codec (which also takes an unpadded text), any other the unpadded one. Accepted and refused texts are unchanged; MAC and signature decoding (public data) stays on std.
 - **2026-10-09** — tests: deterministic fuzz driver `WEBHOOKSIG_FUZZ` over the existing harnesses (`verify`, plus a genuine signature (every digest, encoding and prefix) accepted and a flipped digit, prefix, body, secret or truncation refused).
 - **2026-10-09** — **SECURITY FIX (verifier DoS / stack overflow write):** a `v1a` signature
   of exactly 88 base64 characters without `==` padding decodes to 66 octets and was decoded

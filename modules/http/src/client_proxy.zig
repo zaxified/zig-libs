@@ -25,6 +25,7 @@
 
 const std = @import("std");
 const netaddr = @import("netaddr");
+const b64ct = @import("b64ct").standard;
 const http = @import("root.zig");
 
 pub const Proxy = struct {
@@ -100,6 +101,7 @@ pub const Endpoint = struct {
             ep.userinfo = authority[0..at];
             hostport = authority[at + 1 ..];
             var scratch: [max_credentials]u8 = undefined;
+            defer std.crypto.secureZero(u8, &scratch);
             _ = try decodeCredentials(ep.userinfo.?, &scratch);
         }
         if (hostport.len == 0) return error.BadProxy;
@@ -129,14 +131,17 @@ pub const Endpoint = struct {
     pub fn writeAuthorization(ep: Endpoint, w: *std.Io.Writer) std.Io.Writer.Error!void {
         const userinfo = ep.userinfo orelse return;
         var plain: [max_credentials + 1]u8 = undefined;
+        defer std.crypto.secureZero(u8, &plain);
         const decoded = decodeCredentials(userinfo, plain[0..max_credentials]) catch unreachable; // checked by `parse`
         var n = decoded.len;
         if (std.mem.indexOfScalar(u8, userinfo, ':') == null) {
             plain[n] = ':';
             n += 1;
         }
-        var b64: [std.base64.standard.Encoder.calcSize(max_credentials + 1)]u8 = undefined;
-        try w.print("Proxy-Authorization: Basic {s}\r\n", .{std.base64.standard.Encoder.encode(&b64, plain[0..n])});
+        // b64ct, not std.base64: std's encoder indexes its alphabet by each
+        // secret sextet of the proxy password.
+        var b64: [b64ct.encodedLen(max_credentials + 1)]u8 = undefined;
+        try w.print("Proxy-Authorization: Basic {s}\r\n", .{b64ct.encode(&b64, plain[0..n])});
     }
 };
 
@@ -146,20 +151,41 @@ pub const Endpoint = struct {
 fn decodeCredentials(userinfo: []const u8, out: []u8) Proxy.Error![]const u8 {
     var o: usize = 0;
     var i: usize = 0;
+    var ok: u8 = 0xFF;
     while (i < userinfo.len) : (o += 1) {
         if (o == out.len) return error.BadProxy;
         if (userinfo[i] == '%') {
             if (userinfo.len - i < 3) return error.BadProxy;
-            const hi = std.fmt.charToDigit(userinfo[i + 1], 16) catch return error.BadProxy;
-            const lo = std.fmt.charToDigit(userinfo[i + 2], 16) catch return error.BadProxy;
-            out[o] = hi << 4 | lo;
+            // Constant-time hex nibbles (std.fmt.charToDigit branches on the
+            // secret character); validity is a mask, reported once after the loop.
+            const hi = hexValue(userinfo[i + 1]);
+            const lo = hexValue(userinfo[i + 2]);
+            out[o] = hi[0] << 4 | lo[0];
+            ok &= hi[1] & lo[1];
             i += 3;
         } else {
             out[o] = userinfo[i];
             i += 1;
         }
     }
+    if (ok != 0xFF) return error.BadProxy;
     return out[0..o];
+}
+
+/// 0xFF when `x < n`, else 0 -- a borrow, not a comparison branch.
+inline fn below(x: u8, n: u8) u8 {
+    return @truncate((@as(u16, x) -% n) >> 8);
+}
+
+/// One hex character (either case) to its value, plus a 0xFF/0 validity mask.
+/// Local copy of the technique of `sessions/src/idhex.zig` `value()` (no
+/// `sessions` dependency here).
+inline fn hexValue(c: u8) struct { u8, u8 } {
+    const d = c -% '0';
+    const is_digit = below(d, 10);
+    const l = (c | 0x20) -% 'a';
+    const is_letter = below(l, 6);
+    return .{ (d & is_digit) | ((l +% 10) & is_letter), is_digit | is_letter };
 }
 
 fn parsePort(text: []const u8) ?u16 {
@@ -307,6 +333,24 @@ test "Endpoint.writeAuthorization: Basic over the decoded user and password" {
     w = .fixed(&buf);
     try (try Endpoint.parse("p:1")).writeAuthorization(&w);
     try testing.expectEqualStrings("", w.buffered());
+}
+
+// The %XX decode (2026-10-18) is branch-free arithmetic; pin it to std's
+// branching decoder over every byte, and through `decodeCredentials`.
+test "hexValue: agrees with std.fmt.charToDigit(16) on all 256 bytes; %XX errors after the loop" {
+    for (0..256) |i| {
+        const c: u8 = @intCast(i);
+        const v, const ok = hexValue(c);
+        if (std.fmt.charToDigit(c, 16)) |d| {
+            try testing.expectEqual(@as(u8, 0xFF), ok);
+            try testing.expectEqual(d, v);
+        } else |_| try testing.expectEqual(@as(u8, 0), ok);
+    }
+    var out: [max_credentials]u8 = undefined;
+    try testing.expectEqualStrings("a:B\xff\x00", try decodeCredentials("%61%3a%42%Ff%00", &out));
+    for ([_][]const u8{ "%g0", "%0G", "%/0", "%:0", "%@0", "%`0", "ok%zz", "%0", "%" }) |bad| {
+        try testing.expectError(error.BadProxy, decodeCredentials(bad, &out));
+    }
 }
 
 test "fromEnviron: uppercase first, lowercase when unset or empty, REQUEST_METHOD = cgi" {

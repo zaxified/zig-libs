@@ -164,7 +164,9 @@ declare -A TARGETS=(
     [oscore]="derive protect unprotect"
     # 2026-10-02: the MODP DH exponent (dhPowModPrime, montint) + `ffpow`, the
     # positive control that runs the replaced std.crypto.ff pow on the same x.
-    [ssh]="dh ffpow ecdh gex"
+    # 2026-10-18: `pem` = HostKey.fromOpenSSH with the seed's base64 tainted,
+    # `pemstd` its positive control (the replaced indexOfPos + std.base64 decoder).
+    [ssh]="dh ffpow ecdh gex pem pemstd"
     # `comb` (C3's fixed-base comb via `mulBase`), `ladderbase` (the pre-C3
     # window ladder over the comptime table, still reachable as
     # `mul(basePoint, s)`) and `ladder` (C4: runtime-decoded point, runtime
@@ -322,7 +324,7 @@ declare -A TARGETS=(
     # ── 2026-10-13: tlsresume: STEK, resumption secret/PSK/binder key, 0-RTT key schedule ──
     [tlsresume]="stek psk early"
     # ── 2026-10-13: acme: the P-256 account / certificate private key ──
-    [acme]="jws csr pem pem384 pkcs8"
+    [acme]="jws csr pem pem384 pkcs8 anykey"
     # ── 2026-10-13: jwt: HMAC secrets (sign + verify), ES/EdDSA/RS/PS signing keys ──
     [jwt]="hmac ec rsa"
 )
@@ -444,6 +446,8 @@ declare -A PATTERN=(
     [ssh/ffpow]='ff[.]zig'
     [ssh/ecdh]='transport[.]zig'
     [ssh/gex]='transport[.]zig|dyn[.]zig|montint[.]zig|limbs[.]zig'
+    [ssh/pem]='server[.]zig|burn[.]zig'
+    [ssh/pemstd]='mem[.]zig|base64[.]zig'
     # The AEAD's own claim: the tag comparison and the cipher/MAC glue in
     # `root.zig`. Added 2026-09-02 -- the module was listed with the poly1305
     # target alone, so `SPEC.md`'s constant-time sentence about the tag
@@ -775,6 +779,7 @@ declare -A PATTERN=(
     [acme/pem]='x509[.]zig|burn[.]zig'
     [acme/pem384]='x509[.]zig|burn[.]zig'
     [acme/pkcs8]='x509[.]zig|burn[.]zig'
+    [acme/anykey]='x509[.]zig|burn[.]zig'
     # jwt (2026-10-13): the module's own files. `root.zig` also matches the
     # delegated rsa/p521/p256 root.zig frames; the tsv comment itemises them.
     [jwt/hmac]='root[.]zig|encode[.]zig|burn[.]zig'
@@ -857,6 +862,8 @@ declare -A LABEL=(
     [ssh/ffpow]='ssh POSITIVE CONTROL: std ff pow on x'
     [ssh/ecdh]='ssh NIST ECDH scalar (P-256, P-384, P-521)'
     [ssh/gex]='ssh DH-GEX x (montint DynModint)'
+    [ssh/pem]='ssh HostKey.fromOpenSSH ed25519 (seed base64 tainted)'
+    [ssh/pemstd]='ssh POSITIVE CONTROL: old indexOfPos + std.base64 PEM decoder'
     [bn254/field]='bn254 fp.zig'
     [bn254/scalarmul]='bn254 g1+fp+scalar'
     [chachapoly/poly1305]='poly1305.zig'
@@ -1038,6 +1045,7 @@ declare -A LABEL=(
     [acme/pem]='acme ecPrivateKeyToPem + ecPrivateKeyFromPem (key / PEM tainted)'
     [acme/pem384]='acme ecPrivateKeyToPem + ecPrivateKeyFromPem, P-384 (key / PEM tainted)'
     [acme/pkcs8]='acme pkcs8PrivateKeyToPem + pkcs8PrivateKeyFromPem, P-256 + P-384 (key / PEM tainted)'
+    [acme/anykey]='acme privateKeyFromPem on PKCS#8 (EC label absent) + pemBlockStart past a key (PEM tainted)'
     [jwt/hmac]='jwt HS256/384/512 sign + verify accept + reject (secret tainted)'
     [jwt/ec]='jwt ES256/ES384/ES512/EdDSA sign (signing key tainted)'
     [jwt/rsa]='jwt RS256 + PS256 sign (rsa secret members tainted)'

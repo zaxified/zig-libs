@@ -39,6 +39,7 @@ const builtin = @import("builtin");
 const transport = @import("transport.zig");
 const messages = @import("messages.zig");
 const rsa = @import("rsa");
+const b64ct = @import("b64ct");
 const burn = @import("burn.zig");
 
 const Ed25519 = std.crypto.sign.Ed25519;
@@ -362,27 +363,30 @@ fn signEcdsa(kp: anytype, comptime name: []const u8, data: []const u8, w: *std.I
 // ── openssh-key-v1 container parsing (ed25519 + type dispatch) ──────────────
 
 /// Decode the base64 body of a `-----BEGIN OPENSSH PRIVATE KEY-----` PEM
-/// block into `out` (the `rsa` module's PEM decoder is private to it).
+/// block into `out` (the `rsa` module's PEM decoder is private to it). The
+/// first block in `text` is used. Constant time in the body's characters
+/// (the private key): `InvalidPem` for a missing or garbled END line, a body
+/// that is not padded base64 (whitespace ignored), or one that decodes to
+/// more than `out` holds.
 fn pemDecodeOpensshBlock(text: []const u8, out: []u8) HostKey.FromOpenSSHError![]u8 {
     const begin = "-----BEGIN OPENSSH PRIVATE KEY-----";
     const end = "-----END OPENSSH PRIVATE KEY-----";
+    // The text before the body is public (a fixed header line).
     const bi = std.mem.indexOf(u8, text, begin) orelse return error.MissingPemBlock;
     const body_start = bi + begin.len;
-    const ei = std.mem.indexOfPos(u8, text, body_start, end) orelse return error.InvalidPem;
+    // The END line starts at the first '-' after the body: base64 has none,
+    // so this scan's compare is false on every key character and it stops at
+    // the body's (public) length. Not std.mem.indexOfPos: Boyer-Moore-Horspool
+    // indexes its skip table by, and skips by an amount that depends on, the
+    // key's characters (as rsa's and acme's PEM decoders, 2026-10-18).
+    const ei = std.mem.indexOfScalarPos(u8, text, body_start, '-') orelse return error.InvalidPem;
+    if (!std.mem.startsWith(u8, text[ei..], end)) return error.InvalidPem;
 
-    var b64: [24 * 1024]u8 = undefined;
-    var n: usize = 0;
-    for (text[body_start..ei]) |c| {
-        if (c == '\r' or c == '\n' or c == ' ' or c == '\t') continue;
-        if (n >= b64.len) return error.InvalidPem;
-        b64[n] = c;
-        n += 1;
-    }
-    const dec = std.base64.standard.Decoder;
-    const dlen = dec.calcSizeForSlice(b64[0..n]) catch return error.InvalidPem;
-    if (dlen > out.len) return error.InvalidPem;
-    dec.decode(out[0..dlen], b64[0..n]) catch return error.InvalidPem;
-    return out[0..dlen];
+    // Decoded straight from the text into `out` (the caller wipes it), with
+    // no stripped copy of the base64 left on the stack; not std's table
+    // decoder, whose alphabet lookup is indexed by the key's characters.
+    return b64ct.standard.decodeIgnoring(out, text[body_start..ei], b64ct.pem_whitespace) catch
+        return error.InvalidPem;
 }
 
 const ContainerHeader = struct {
@@ -474,12 +478,57 @@ fn parseEd25519Body(out: *Ed25519.KeyPair, bin: []const u8, passphrase: []const 
         if (b != @as(u8, @intCast(i + 1))) return error.InvalidOpenSSH;
     }
 
-    const sk = Ed25519.SecretKey.fromBytes(priv_bytes[0..64].*) catch
-        return error.InvalidPrivateKey;
-    out.* = Ed25519.KeyPair.fromSecretKey(sk) catch return error.InvalidPrivateKey;
-    // fromSecretKey re-derives the public key from the seed; require it to
-    // match the container's copy.
+    // Derive the pair from the seed and require the container's public key
+    // to match. Not `KeyPair.fromSecretKey`: std 0.16 re-derives the public
+    // key there only under runtime safety (ed25519.zig:358), so in
+    // ReleaseFast/ReleaseSmall it took the container's copy and this check
+    // compared that copy with itself — a seed/public mismatch loaded and
+    // advertised a key its own signatures do not verify under (2026-10-18).
+    errdefer std.crypto.secureZero(u8, std.mem.asBytes(out));
+    out.* = Ed25519.KeyPair.generateDeterministic(priv_bytes[0..32].*) catch return error.InvalidPrivateKey;
     if (!std.mem.eql(u8, &out.public_key.toBytes(), pub_bytes)) return error.InvalidPrivateKey;
+}
+
+test "parseEd25519Body: a seed that does not derive the container's public key is refused in every mode" {
+    // Container whose two public copies agree with each other but belong to
+    // ANOTHER seed. Before 2026-10-18 this loaded in ReleaseFast.
+    const t = std.testing;
+    const kp_a = try Ed25519.KeyPair.generateDeterministic(@splat(0xa1));
+    const kp_b = try Ed25519.KeyPair.generateDeterministic(@splat(0xb2));
+    const pub_b = kp_b.public_key.toBytes();
+    var priv64: [64]u8 = undefined;
+    @memcpy(priv64[0..32], kp_a.secret_key.seed()[0..]);
+    @memcpy(priv64[32..], &pub_b);
+
+    var priv_buf: [256]u8 = undefined;
+    var pw: std.Io.Writer = .fixed(&priv_buf);
+    try pw.writeAll(&[_]u8{ 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11 });
+    try messages.writeString(&pw, "ssh-ed25519");
+    try messages.writeString(&pw, &pub_b);
+    try messages.writeString(&pw, &priv64);
+    try messages.writeString(&pw, ""); // comment
+    var i: u8 = 1;
+    while (pw.end % 8 != 0) : (i += 1) try pw.writeByte(i); // "none" pads to 8
+
+    var bin: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&bin);
+    try w.writeAll("openssh-key-v1\x00");
+    try messages.writeString(&w, "none");
+    try messages.writeString(&w, "none");
+    try messages.writeString(&w, "");
+    try w.writeAll(&[_]u8{ 0, 0, 0, 1 });
+    try messages.writeString(&w, ""); // public blob (not consulted by this parser)
+    try messages.writeString(&w, pw.buffered());
+
+    var kp: Ed25519.KeyPair = undefined;
+    try t.expectError(error.InvalidPrivateKey, parseEd25519Body(&kp, w.buffered(), ""));
+    // The consistent container (seed A, public A) still loads.
+    const off = std.mem.indexOf(u8, w.buffered(), &pub_b).?;
+    @memcpy(bin[off..][0..32], &kp_a.public_key.toBytes());
+    const off2 = std.mem.indexOfPos(u8, w.buffered(), off + 32, &pub_b).?;
+    @memcpy(bin[off2..][0..32], &kp_a.public_key.toBytes());
+    try parseEd25519Body(&kp, w.buffered(), "");
+    try t.expectEqualSlices(u8, &kp_a.public_key.toBytes(), &kp.public_key.toBytes());
 }
 
 /// Parse an `ecdsa-sha2-nistp256` private key from an openssh-key-v1
@@ -1841,6 +1890,74 @@ test "HostKey.fromOpenSSH: passphrase-protected ed25519 (ctr, cbc) and ecdsa-p25
         var bad: HostKey = undefined;
         try t.expectError(error.IncorrectPassphrase, HostKey.fromOpenSSH(&bad, c.text, "not the passphrase"));
         try t.expectError(error.IncorrectPassphrase, HostKey.fromOpenSSH(&bad, c.text, null));
+    }
+}
+
+test "pemDecodeOpensshBlock: a body made of the END line's letters decodes; END found as the first '-' after the body" {
+    const t = std.testing;
+    // "ENDOPENSSHPRIVATEKEY" is 20 valid base64 characters (15 bytes): the END
+    // line's own letters inside the body must not end it.
+    const body = "ENDOPENSSHPRIVATEKEY";
+    var want: [15]u8 = undefined;
+    try std.base64.standard.Decoder.decode(&want, body);
+    var out: [64]u8 = undefined;
+    const got = try pemDecodeOpensshBlock("-----BEGIN OPENSSH PRIVATE KEY-----\r\n  " ++ body ++
+        "\r\n-----END OPENSSH PRIVATE KEY-----\r\n", &out);
+    try t.expectEqualSlices(u8, &want, got);
+    // A body that decodes to more than `out` holds is refused, not truncated.
+    try t.expectError(error.InvalidPem, pemDecodeOpensshBlock("-----BEGIN OPENSSH PRIVATE KEY-----\n" ++ body ++
+        "\n-----END OPENSSH PRIVATE KEY-----\n", out[0..14]));
+    // A '-' inside the body is where the END line must start.
+    try t.expectError(error.InvalidPem, pemDecodeOpensshBlock("-----BEGIN OPENSSH PRIVATE KEY-----\nENDO-PENS\n" ++
+        "-----END OPENSSH PRIVATE KEY-----\n", &out));
+    // No BEGIN line at all.
+    try t.expectError(error.MissingPemBlock, pemDecodeOpensshBlock(body, &out));
+}
+
+test "HostKey.fromOpenSSH: END-line letters in the body load; truncated or garbled END refused; the first block is used" {
+    const t = std.testing;
+    const end_line = "-----END OPENSSH PRIVATE KEY-----";
+    const ei = std.mem.indexOf(u8, fixture_ed25519_key, end_line).?;
+    const body_part = fixture_ed25519_key[0..ei]; // BEGIN line + body
+    // The fixture's body carries letters of the END line (BMH skipped by
+    // them); D and P do not occur in it, the decoder test above covers them.
+    for ("ENOSHRIVATKY") |c| try t.expect(std.mem.indexOfScalar(u8, body_part["-----BEGIN".len..], c) != null);
+
+    var hk: HostKey = undefined;
+    try HostKey.fromOpenSSH(&hk, fixture_ed25519_key, null);
+    try t.expectEqualStrings("ssh-ed25519", hk.algorithmName());
+
+    // Truncated, garbled or missing END line.
+    const bad_ends = [_][]const u8{
+        "-----END OPENSSH PRIVATE KE",
+        "-----END OPENSSH PUBLIC KEY-----",
+        "----END OPENSSH PRIVATE KEY-----",
+        "",
+    };
+    for (bad_ends) |e| {
+        const text = try std.mem.concat(t.allocator, u8, &.{ body_part, e });
+        defer t.allocator.free(text);
+        try t.expectError(error.InvalidPem, HostKey.fromOpenSSH(&hk, text, null));
+    }
+
+    // Two blocks: the first one is loaded, whichever key it holds.
+    {
+        const text = try std.mem.concat(t.allocator, u8, &.{ fixture_ed25519_key, "\n", vectors.ecdsa_p256_key });
+        defer t.allocator.free(text);
+        try HostKey.fromOpenSSH(&hk, text, null);
+        try t.expectEqualStrings("ssh-ed25519", hk.algorithmName());
+    }
+    {
+        const text = try std.mem.concat(t.allocator, u8, &.{ vectors.ecdsa_p256_key, "\n", fixture_ed25519_key });
+        defer t.allocator.free(text);
+        try HostKey.fromOpenSSH(&hk, text, null);
+        try t.expectEqualStrings("ecdsa-sha2-nistp256", hk.algorithmName());
+    }
+    // A first block with a broken END is refused even when a good one follows.
+    {
+        const text = try std.mem.concat(t.allocator, u8, &.{ body_part, "-----END OPENSSH PRIVATE KE\n", fixture_ed25519_key });
+        defer t.allocator.free(text);
+        try t.expectError(error.InvalidPem, HostKey.fromOpenSSH(&hk, text, null));
     }
 }
 

@@ -8,6 +8,9 @@
 //! stricter, the oracle's divergence table says so and why.
 
 const std = @import("std");
+// Constant-time base64: Basic credentials carry the client password, and std's
+// codec indexes its alphabet/decode table by each secret character.
+const b64ct = @import("b64ct").standard;
 
 pub const LocationError = error{
     /// The rewritten location does not fit `out`.
@@ -224,10 +227,9 @@ pub fn basicAuth(value: []const u8, out: []u8) ?BasicCredentials {
     const prefix = "Basic ";
     if (value.len < prefix.len or !std.ascii.eqlIgnoreCase(value[0..prefix.len], prefix)) return null;
     const enc = value[prefix.len..];
-    const dec = std.base64.standard.Decoder;
-    const n = dec.calcSizeForSlice(enc) catch return null;
+    const n = b64ct.decodedLen(enc) catch return null;
     if (n > out.len) return null;
-    dec.decode(out[0..n], enc) catch return null;
+    _ = b64ct.decode(out[0..n], enc) catch return null;
     const colon = std.mem.indexOfScalar(u8, out[0..n], ':') orelse return null;
     return .{ .user = out[0..colon], .password = out[colon + 1 .. n] };
 }
@@ -240,8 +242,7 @@ pub fn basicAuth(value: []const u8, out: []u8) ?BasicCredentials {
 pub fn basicAuthHeader(out: []u8, user: []const u8, password: []const u8) error{ NoSpaceLeft, InvalidUser }![]const u8 {
     if (std.mem.indexOfScalar(u8, user, ':') != null) return error.InvalidUser;
     const plain_len = user.len + 1 + password.len;
-    const enc = std.base64.standard.Encoder;
-    const total = "Basic ".len + enc.calcSize(plain_len);
+    const total = "Basic ".len + b64ct.encodedLen(plain_len);
     if (total > out.len) return error.NoSpaceLeft;
     @memcpy(out[0.."Basic ".len], "Basic ");
     // Encode the three pieces as one stream: join them in the tail of `out`
@@ -250,7 +251,7 @@ pub fn basicAuthHeader(out: []u8, user: []const u8, password: []const u8) error{
     @memcpy(tail[0..user.len], user);
     tail[user.len] = ':';
     @memcpy(tail[user.len + 1 ..], password);
-    _ = enc.encode(out["Basic ".len..total], tail);
+    _ = b64ct.encode(out["Basic ".len..total], tail);
     return out[0..total];
 }
 

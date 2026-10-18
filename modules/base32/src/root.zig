@@ -16,9 +16,12 @@
 //! No allocation in the core (`encode`/`decode` write into a caller buffer);
 //! `encodeAlloc`/`decodeAlloc` are thin owning wrappers.
 //!
-//! **Not constant-time**: decoding uses a 256-entry lookup table and branches
-//! on the input, so timing and cache behaviour depend on the text. See
-//! SPEC.md "Constant-time contract".
+//! **Constant-time over the data** (since 2026-10-10): neither direction
+//! indexes a table or branches on the value of a symbol -- each symbol is
+//! computed arithmetically. What still branches is public: the options, the
+//! lengths, and whether a character is padding or skippable whitespace; the
+//! validity verdict is taken once, after the loop. See SPEC.md
+//! "Constant-time contract".
 //!
 //! Provenance: clean-room from RFC 4648 (public IETF specification); vectors
 //! are the RFC's §10 table plus values captured from Python's stdlib as a

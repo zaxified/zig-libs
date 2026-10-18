@@ -392,6 +392,7 @@ directly-exposed parser.
 
 ## Backlog / deferred
 
+- **Constant time: header bytes go through tables (found 2026-10-18, pre-tag sweep; owner decision — hot path)**: `h1.zig` `isValidFieldValue` indexes a 256-entry table by every header-value byte (h1.zig ~221/246), and HPACK's Huffman encoder indexes `huff_codes[b]` by each byte and its decoder walks a tree per bit (hpack.zig ~342-373, ~410-426, ~511-514) — both over `Authorization`, `Cookie` and API-key values (llmclient's `x-api-key` too). Options: an arithmetic range check in `isValidFieldValue` (cost to measure on the h1 bench); for HPACK, emit sensitive fields (`authorization`, `cookie`, `proxy-authorization`, a caller list) as raw never-indexed literals (RFC 7541 §7.1.3 recommends never-indexed for them; Huffman stays for the rest) — the decoder side cannot be helped the same way. Severity low-medium (local cache side channel).
 - **HPACK encoder: fast path for a field repeated from the previous block** *(2026-10-18, qap repin A/B)* —
   static response headers (comptime slices in rodata: `setHeaderStatic`, `security-headers` `applyStatic`,
   `error_headers`) are the same `(name.ptr, value.ptr)` on every response of a connection, yet `Encoder.findField`

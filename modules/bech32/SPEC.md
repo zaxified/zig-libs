@@ -161,6 +161,7 @@ no-overflow case described above.
 
 ## Backlog / deferred
 
+- **No constant-time Base58 (found again 2026-10-18 pre-tag sweep; documented in `base58.zig`'s header)**: WIF (`btcaddr` `wifDecodeBody`/`wifEncode`) and xprv (`bip32` `serializePrivBody`/`parseExtended`) put private keys through the table + carry loops. The payloads are fixed (33/34/78 bytes), so a fixed-iteration CT Base58 is feasible; until then the release notes say so.
 - **Bitcoin script-level address type detection** (P2SH-wrapped segwit, decoding a full
   `scriptPubKey` end-to-end) is out of scope — this module handles the two address *encodings*
   (bech32/bech32m and base58check), not Bitcoin Script.

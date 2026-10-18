@@ -4,7 +4,7 @@
 //! `group16-sha512`).
 //!
 //! Usage: ctgrind-ssh <target> <yes|no>
-//!   targets: dh | ffpow | ecdh | gex
+//!   targets: dh | ffpow | ecdh | gex | pem | pemstd
 //!
 //! * `dh` — taints the DH secret `x` and computes `e = g^x` and `K = f^x` in
 //!   both groups through `dhPowModPrime` (montint `powMont`). Until
@@ -22,6 +22,18 @@
 //! * `gex` — `diffie-hellman-group-exchange-sha256` client (2026-10-10): the
 //!   exponent `x` through `gexPow` on montint's run-time modulus (`DynModint`,
 //!   the server-chosen prime), for the group14 and group16 primes.
+//! * `pem` — `HostKey.fromOpenSSH` on the ed25519 fixture (2026-10-18) with
+//!   the base64 characters that carry only bits of the 32-byte secret seed
+//!   tainted (the edge characters it shares with the length before it and the
+//!   public-key copy after it are not): the PEM decoder's END search and
+//!   `b64ct` decode, then the container parse and the public-key
+//!   re-derivation (std re-derives only under runtime safety, so not in the
+//!   ReleaseFast build measured here). Witness: the loaded seed.
+//! * `pemstd` — the POSITIVE CONTROL for `pem`: the same tainted text through
+//!   the decoder `pemDecodeOpensshBlock` used until 2026-10-18
+//!   (`std.mem.indexOfPos` = Boyer-Moore-Horspool for the END line,
+//!   `std.base64.standard.Decoder`; its whitespace branch is left out, see
+//!   `pem`). Its row must stay non-zero in std's `mem.zig`/`base64.zig`.
 //!
 //! `K` is printed as `ctgrind_result=` (the witness and the output pin). The
 //! one in-file context `dh` keeps is `stripLeadingZeros` on `K`: an SSH mpint
@@ -60,6 +72,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
     if (std.mem.eql(u8, target, "ecdh")) {
         inline for (.{ transport.EcdhNist.p256, transport.EcdhNist.p384, transport.EcdhNist.p521 }) |c| try ecdh(c, random, t);
         return;
+    }
+
+    if (std.mem.eql(u8, target, "pem") or std.mem.eql(u8, target, "pemstd")) {
+        return pem(std.mem.eql(u8, target, "pemstd"), t);
     }
 
     if (std.mem.eql(u8, target, "gex")) {
@@ -140,4 +156,73 @@ fn gex(name: []const u8, random: std.Random, t: Taint) !void {
     var kbuf: [transport.gex_max_prime_len]u8 = undefined;
     const k = try transport.gexPow(&m, f, xb, &kbuf);
     std.debug.print("e_len={d} ctgrind_result={x}\n", .{ e.len, k });
+}
+
+const pem_begin = "-----BEGIN OPENSSH PRIVATE KEY-----";
+const pem_end = "-----END OPENSSH PRIVATE KEY-----";
+
+fn isPemSpace(c: u8) bool {
+    return c == '\r' or c == '\n' or c == ' ' or c == '\t';
+}
+
+fn pem(control: bool, t: Taint) !void {
+    const fixture = @import("hostkey_vectors.zig").ed25519_key;
+    var text_buf: [fixture.len]u8 = fixture.*;
+    const text: []u8 = &text_buf;
+
+    // Locate the seed untainted: the private key string is seed || public
+    // key, the last of the public key's three copies in the container.
+    var hk: root.server.HostKey = undefined;
+    try root.server.HostKey.fromOpenSSH(&hk, text, null);
+    const public = hk.ed25519.public_key.toBytes();
+    const body_start = (std.mem.indexOf(u8, text, pem_begin) orelse return error.NoPem) + pem_begin.len;
+    const body_end = std.mem.indexOfPos(u8, text, body_start, pem_end) orelse return error.NoPem;
+    var b64: [4096]u8 = undefined;
+    var n: usize = 0;
+    for (text[body_start..body_end]) |c| {
+        if (isPemSpace(c)) continue;
+        b64[n] = c;
+        n += 1;
+    }
+    var bin: [3072]u8 = undefined;
+    const bin_len = try std.base64.standard.Decoder.calcSizeForSlice(b64[0..n]);
+    try std.base64.standard.Decoder.decode(bin[0..bin_len], b64[0..n]);
+    const seed_off = (std.mem.lastIndexOf(u8, bin[0..bin_len], &public) orelse return error.NoSeed) - 32;
+
+    // Base64 characters [first, last) carry ONLY the seed's bits. The (at
+    // most two) edge characters that share bits with the private string's
+    // length and the public-key copy stay untainted: tainting them taints that
+    // length, and every layout decision after it reads as a finding (measured
+    // 2026-10-18: 11 contexts, all string/padding bounds on the 0x40 length).
+    const first = (seed_off * 8 + 5) / 6;
+    const last = (seed_off + 32) * 8 / 6;
+    if (t == .yes) {
+        var k: usize = 0;
+        for (text[body_start..body_end]) |*c| {
+            if (isPemSpace(c.*)) continue;
+            if (k >= first and k < last) std.valgrind.memcheck.makeMemUndefined(std.mem.asBytes(c));
+            k += 1;
+        }
+    }
+
+    if (!control) {
+        var out: root.server.HostKey = undefined;
+        try root.server.HostKey.fromOpenSSH(&out, text, null);
+        std.debug.print("seed_chars={d} ctgrind_result={x}\n", .{ last - first, out.ed25519.secret_key.seed() });
+        return;
+    }
+    // The pre-2026-10-18 decoder: the BMH END search over the tainted text,
+    // then std's table decoder over the stripped copy (stripped from the
+    // untainted text above, then tainted the same way). Its per-character
+    // whitespace branch is not reproduced: whether a key character is
+    // whitespace is public by the alphabet, and the branch would land in this
+    // file, which no pattern may name.
+    if (t == .yes) std.valgrind.memcheck.makeMemUndefined(b64[first..last]);
+    const ei = std.mem.indexOfPos(u8, text, body_start, pem_end) orelse return error.NoPem;
+    if (ei != body_end) return error.NoPem;
+    var out2: [3072]u8 = undefined;
+    const dec = std.base64.standard.Decoder;
+    const dlen = try dec.calcSizeForSlice(b64[0..n]);
+    try dec.decode(out2[0..dlen], b64[0..n]);
+    std.debug.print("seed_chars={d} ctgrind_result={x}\n", .{ last - first, out2[seed_off..][0..32] });
 }

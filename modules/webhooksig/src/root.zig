@@ -77,6 +77,7 @@ const std = @import("std");
 const burn = @import("burn.zig");
 const router = @import("router");
 const http = @import("http");
+const b64ct = @import("b64ct");
 
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
@@ -94,7 +95,7 @@ pub const meta = .{
     // safe without locking.
     .concurrency = .threadsafe,
     .model_after = "Standard Webhooks (svix); GitHub/Stripe/Slack webhook signatures; RFC 2104 HMAC",
-    .deps = .{ "router", "http" },
+    .deps = .{ "router", "http", "b64ct" },
 };
 
 const Allocator = std.mem.Allocator;
@@ -441,10 +442,11 @@ pub const standard = struct {
 
     fn encodeSecretBody(out: []u8, key: []const u8) (KeyError || SignError)![]const u8 {
         if (key.len < min_secret_len or key.len > max_secret_len) return error.InvalidKey;
-        const n = secret_prefix.len + std.base64.standard.Encoder.calcSize(key.len);
+        const n = secret_prefix.len + b64ct.standard.encodedLen(key.len);
         if (out.len < n) return error.OutputTooSmall;
         @memcpy(out[0..secret_prefix.len], secret_prefix);
-        _ = std.base64.standard.Encoder.encode(out[secret_prefix.len..n], key);
+        // b64ct: the raw HMAC key, no secret-indexed table (std.base64 has one).
+        _ = b64ct.standard.encode(out[secret_prefix.len..n], key);
         return out[0..n];
     }
 
@@ -598,11 +600,21 @@ pub const standard = struct {
     }
 
     /// Standard-alphabet base64, padded or not, into `out`; the length.
+    ///
+    /// b64ct, not std.base64: this text is a key (`whsec_`/`whsk_`), and std
+    /// indexes its decode table by each secret character. The padded/unpadded
+    /// choice no longer looks at the last character (secret data): a length
+    /// that is a multiple of 4 goes to the padded codec, which accepts both
+    /// `...=` and a text with no padding at all (same bytes as std's
+    /// no-pad decoder there); any other length can only be unpadded.
     fn decodeB64(out: *[64]u8, text: []const u8) KeyError!usize {
-        const d = if (std.mem.endsWith(u8, text, "=")) std.base64.standard.Decoder else std.base64.standard_no_pad.Decoder;
-        const n = d.calcSizeForSlice(text) catch return error.InvalidKey;
+        return if (text.len % 4 == 0) decodeWith(b64ct.standard, out, text) else decodeWith(b64ct.standard_no_pad, out, text);
+    }
+
+    fn decodeWith(comptime C: type, out: *[64]u8, text: []const u8) KeyError!usize {
+        const n = C.decodedLen(text) catch return error.InvalidKey;
         if (n == 0 or n > out.len) return error.InvalidKey;
-        d.decode(out[0..n], text) catch return error.InvalidKey;
+        _ = C.decode(out[0..n], text) catch return error.InvalidKey;
         return n;
     }
 };

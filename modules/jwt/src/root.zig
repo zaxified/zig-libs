@@ -192,6 +192,7 @@ const testkit = @import("testkit");
 const builtin = @import("builtin");
 const http = @import("http");
 const router = @import("router");
+const b64ct = @import("b64ct");
 
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
@@ -206,7 +207,7 @@ pub const meta = .{
     .role = .both, // P6 = a `router` middleware guarding routes (server); P7 = an OAuth2/OIDC client building auth/token requests and accepting ID Tokens (relying party).
     .concurrency = .reentrant, // except Provider — one mutable cache, external sync (inject ResourceServer.lock under a threaded server); VerifiedCache is internally synchronized
     .model_after = "RFC 7515 (JWS) + RFC 7519 (JWT) + RFC 7518 (JWA) verify incl. RS256 (RSASSA-PKCS1-v1_5, RFC 8017) + RFC 7517 (JWK/JWKS key sets), RFC 8725 hardening + OpenID Connect Discovery 1.0 / RFC 8414 (issuer metadata -> jwks_uri/authorization_endpoint/token_endpoint) with cached, rotation-aware Provider; RFC 6750 Bearer resource-server middleware; RFC 7636 PKCE + OIDC Core 1.0 §3.1 authorization code flow + §3.1.3.7 ID Token validation; OAuth2/OIDC resource server AND relying party",
-    .deps = .{ "http", "router", "p256", "p384", "p521", "rsa", "ct25519" }, // p384: ES384 (std's P-384 is 2.8-4.2x golang-jwt); p521: ES512 (std has no P-521); p256 supplies the fast ES256 curve (byte-exact to std.crypto.sign.ecdsa.EcdsaP256Sha256); rsa: RS*/PS* verify and sign; ct25519: the comb behind EdDSA signing
+    .deps = .{ "http", "router", "p256", "p384", "p521", "rsa", "ct25519", "b64ct" }, // p384: ES384 (std's P-384 is 2.8-4.2x golang-jwt); p521: ES512 (std has no P-521); p256 supplies the fast ES256 curve (byte-exact to std.crypto.sign.ecdsa.EcdsaP256Sha256); rsa: RS*/PS* verify and sign; ct25519: the comb behind EdDSA signing
 };
 
 // ── public API ──────────────────────────────────────────────────────────────
@@ -1505,10 +1506,13 @@ fn jwkMaterial(
         .string => |str| str,
         else => return error.MissingMember,
     };
-    const decoder = std.base64.url_safe_no_pad.Decoder;
-    const n = decoder.calcSizeForSlice(s) catch return error.InvalidBase64;
+    // b64ct, not std.base64: this member can be an `oct` HMAC secret (`k`) or
+    // a private-key component, and std indexes its decode table by each secret
+    // character (cache side channel). Same acceptance: unpadded url-safe,
+    // canonical bits, length != 1 (mod 4).
+    const n = b64ct.url_safe_no_pad.decodedLen(s) catch return error.InvalidBase64;
     const buf = try arena.alloc(u8, n);
-    decoder.decode(buf, s) catch return error.InvalidBase64;
+    _ = b64ct.url_safe_no_pad.decode(buf, s) catch return error.InvalidBase64;
     return buf;
 }
 

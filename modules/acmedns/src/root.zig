@@ -35,7 +35,7 @@ pub const meta = .{
     .role = .client,
     .concurrency = .single_owner, // one solver per acme.Client, like the client
     .model_after = "lego (challenge/dns01 + providers rfc2136, acmedns, httpreq, exec) / certmagic DNS01Solver",
-    .deps = .{ "acme", "dns", "http", "netaddr", "procrun" }, // dns: resolver + RFC 2136/TSIG; http: acme-dns, httpreq; procrun: exec; also uses std.json
+    .deps = .{ "acme", "dns", "http", "netaddr", "procrun", "b64ct" }, // dns: resolver + RFC 2136/TSIG; http: acme-dns, httpreq; procrun: exec; also uses std.json
 };
 
 /// The `acme.Client.Solver` for DNS-01.

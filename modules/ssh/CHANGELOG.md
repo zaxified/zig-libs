@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — **Fixed:** an Ed25519 OpenSSH host key whose seed does not derive its public key is refused in every build mode. In ReleaseFast/ReleaseSmall the seed was never checked (std 0.16 `KeyPair.fromSecretKey` re-derives the public key only under runtime safety), so such a container loaded and signed with a key its advertised public key does not verify. Now derived with `generateDeterministic(seed)` and compared.
+- **2026-10-18** — **Constant time:** the OpenSSH host-key PEM (`HostKey.fromOpenSSH`) is decoded constant time in the key's characters: the END line is found as the first `-` after the body instead of with `std.mem.indexOfPos` (Boyer-Moore-Horspool, a skip table indexed by the key's base64), and the body is decoded with `b64ct.standard.decodeIgnoring` instead of std's table decoder, straight into the wiped buffer (no unwiped stripped copy on the stack). `meta.deps` gains `b64ct`. Error set and first-block behaviour unchanged. New ctgrind targets `pem` (1 context, the public END-scan exit) and `pemstd` (positive control, the old decoder: 18). Backlog: the ed25519 seed is not checked against the container's public key in ReleaseFast (std re-derives only under runtime safety).
 - **2026-10-18** — Backlog: the OpenSSH host-key PEM is decoded with std's table base64 and a forward Boyer-Moore-Horspool END search over the key (found from acme's ctgrind; fix plan in SPEC). No code change.
 - **2026-10-10** — **Added:** `knownhosts` — OpenSSH `known_hosts` as a host-key policy (Go's `knownhosts`):
   `check(text, host, port, blob)` gives `accept` / `revoked` / `key_mismatch` / `unknown_host` in OpenSSH's

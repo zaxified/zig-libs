@@ -240,6 +240,24 @@ ssh	ReleaseFast	ffpow	1	>=1	NO-OWN-SRC	95639ff37028e502
 # on e and K (RFC 4251 §5 mpint length, as `dh`).
 ssh	ReleaseFast	gex	1	2	e0204aaf99b50572	2d8d321e6c103efe
 ssh	ReleaseFast	ecdh	1	22	e0204aaf99b50572	8683e4aaf784b64c
+# ssh pem / pemstd (2026-10-18): HostKey.fromOpenSSH on the ed25519 fixture with the base64
+# characters carrying only seed bits tainted (44 - 2 edge characters; the edges share bits with
+# the private string's 0x40 length and the public-key copy, and tainting them made every later
+# string/padding bound read as a finding: 11 contexts on the first measurement). `pem` 1 = the END
+# search, mem.zig:1298 findScalarPos's early exit on its compare mask from pemDecodeOpensshBlock
+# (server.zig:382): a key character is never '-', so the outcome is public by the alphabet (as
+# rsa's and acme's). b64ct declassifies its verdict; nothing in the container parse or burn.
+# Later 2026-10-18: pem 1 -> 3 after the seed check fix (parseEd25519Body now derives the pair with
+# Ed25519.KeyPair.generateDeterministic(seed); ReleaseFast never derived it before): + std
+# edwards25519.zig:266 pcMul16's `rejectIdentity` on the RESULT point (the public key) and +
+# server.zig parseEd25519Body's compare of that derived public key with the container's copy —
+# both decide on the public key, which memcheck sees as tainted because it is derived from the seed.
+# Witness 2 = the printed seed. `pemstd`: POSITIVE CONTROL, the same tainted body through the
+# replaced decoder (std.mem.indexOfPos = Boyer-Moore-Horspool + std.base64 table decode): 18 in
+# mem.zig/base64.zig on the first and second measurement. It must stay >= 1; no witness, since a
+# value loaded through a tainted table index reads as defined to memcheck.
+ssh	ReleaseFast	pem	1	3	9ed841b40dd79831	2ba7559fa99a2188
+ssh	ReleaseFast	pemstd	1	>=1	NO-OWN-SRC	2ba7559fa99a2188
 # ct25519 — columns below are `total_min in_file`, NOT "in_file total_min".
 # Row 1's `1 0` is `total_min=1, in_file=0`: ct25519's OWN code has zero
 # expected contexts (the `total_min=1` is only the harness's print, a
@@ -1318,8 +1336,8 @@ ctap2	ReleaseFast	token	1	0	2023f16e0a17362b	e927dca40cedb432
 # test (root.zig:258, x3; for canonical text the '=' positions are fixed by
 # the public length, so the outcome carries nothing) + the validity verdict
 # taken once at the end (root.zig:287, x2).
-base32	ReleaseFast	encode	1	0	27b91372cf4e0b6e	123eeef97ba0d81b
-base32	ReleaseFast	decode	1	5	27b91372cf4e0b6e	4b6a48f852c57125
+base32	ReleaseFast	encode	1	0	e94632916a01c5b6	123eeef97ba0d81b
+base32	ReleaseFast	decode	1	5	e94632916a01c5b6	4b6a48f852c57125
 # voprf (2026-10-10, ristretto255-SHA512) — server: skS + proof nonce through
 # blindEvaluate/Verifiable/Poprf, evaluate, evaluatePoprf; client: the
 # private input + blinds through blind/finalize/finalizeVerifiable/
@@ -1512,9 +1530,10 @@ tlsresume	ReleaseFast	early	1	0	958e96d1ea73a044	042b8c43588c7881
 # context). Writer side 0. pkcs8 17 (2 of them the findScalarPos above, one per read) = PKCS#8 round trips of the P-256 key (2: keyFromDer's [0]
 # test on the inner ECPrivateKey, p256 comb) and of the P-384 key (13: the pem384 classes); the
 # writer side 0. Read in the --stacks dump of the day; nothing in jws/burn, nothing new in kind.
-acme	ReleaseFast	pem	1	18	7be747ba59558923	e3f3e71bec825dd7
-acme	ReleaseFast	pem384	1	18	7be747ba59558923	5eb84a3bc4959381
-acme	ReleaseFast	pkcs8	1	17	7be747ba59558923	b26448f1c577ca4e
+acme	ReleaseFast	pem	1	18	ae9d23f8b5893e87	e3f3e71bec825dd7
+acme	ReleaseFast	pem384	1	18	ae9d23f8b5893e87	5eb84a3bc4959381
+acme	ReleaseFast	pkcs8	1	17	ae9d23f8b5893e87	b26448f1c577ca4e
+acme	ReleaseFast	anykey	1	5	ae9d23f8b5893e87	7dff1d27c302259e
 # jwt (2026-10-13) — every secret the module holds: HMAC secrets (HS256/384/512,
 # sign and verify), ES256 (p256 module), ES384 (std), ES512 (p521 module), EdDSA
 # (std Ed25519; only the 32-byte seed is tainted) and RSA (RS256 + PS256 through
@@ -1525,7 +1544,7 @@ acme	ReleaseFast	pkcs8	1	17	7be747ba59558923	b26448f1c577ca4e
 # (timing_safe.eql in verifyHmac) yields a tainted verdict that reaches only the
 # harness printer (67 witness); no branch or load of root.zig / encode.zig takes
 # the secret. Needs no declassification: the verdict is public by design.
-jwt	ReleaseFast	hmac	1	0	09a37a7fa79b4936	82c3cf6208c0b9d8
+jwt	ReleaseFast	hmac	1	0	e211169a04e8b37c	82c3cf6208c0b9d8
 # ec 10 = ES256 9 + EdDSA 1. Every ES context carries encode.zig:274
 # (signEc) in its stack, so the pattern attributes the DELEGATED signer to jwt,
 # exactly as acme's p256 contexts; none is a branch in jwt's own code and p256 /
@@ -1542,7 +1561,7 @@ jwt	ReleaseFast	hmac	1	0	09a37a7fa79b4936	82c3cf6208c0b9d8
 #   Left as is (std's basePoint.mul has the same refusal); FINDING for the
 #   coordinator, not fixed here.
 # 2026-10-13: p256 `rejectIdentity` launders its verdict (one `je`, was two) -> every row whose count included the p256 comb/windowed identity check drops by 1 (--stacks diff vs the base: the second jump of `rejectIdentity` gone, no other context moved).
-jwt	ReleaseFast	ec	1	9	09a37a7fa79b4936	6c14c21a4454880c
+jwt	ReleaseFast	ec	1	9	e211169a04e8b37c	6c14c21a4454880c
 # rsa 2 = RS256 1 + PS256 1: rsa/src/root.zig:954 privateOpCrtPtr, the F3
 # Bellcore fault-check verdict `if (!eql(m^e, c)) return error.FaultDetected`
 # (the rsa module's own `crt` row, 2, documents the same verdict). Delegated to
@@ -1552,7 +1571,7 @@ jwt	ReleaseFast	ec	1	9	09a37a7fa79b4936	6c14c21a4454880c
 # blinding verdict (root.zig:906 makeBlinding): since CRT-domain blinding the
 # r⁻¹ checks run mod the secret p, q, folded into ONE branch-once verdict that
 # is false only for r ≡ 0 mod p or q (~2^-1023) and only causes a redraw.
-jwt	ReleaseFast	rsa	1	3	09a37a7fa79b4936	f2bee89c3c58cdaf
+jwt	ReleaseFast	rsa	1	3	e211169a04e8b37c	f2bee89c3c58cdaf
 # aaa-gate (2026-10-17) — the secrets are the gate's stored SHA-256 fingerprints
 # (tokens, API keys, Basic user:password), tainted in place; the presented value
 # is the client's own and the verdict is public. Each target verifies a good and

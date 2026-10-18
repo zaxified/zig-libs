@@ -54,6 +54,9 @@ pub fn build(b: *std.Build) void {
     rsa_mod.addImport("zl_options", zl_options.createModule());
     rsa_mod.addImport("aescbc", dep.mod(b, target, optimize, "aescbc"));
     rsa_mod.addImport("aes192", dep.mod(b, target, optimize, "aes192"));
+    const b64ct_mod = dep.mod(b, target, optimize, "b64ct");
+    rsa_mod.addImport("b64ct", b64ct_mod);
+    http_mod.addImport("b64ct", b64ct_mod);
     const slhdsa_mod = dep.mod(b, target, optimize, "slhdsa");
     const x509_mod = dep.mod(b, target, optimize, "x509");
     x509_mod.addImport("rsa", rsa_mod);

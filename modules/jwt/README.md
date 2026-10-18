@@ -79,7 +79,7 @@ copied.
   `p384` (ES384; std's P-384 was 2.8–4.2× golang-jwt), `p521` (ES512:
   P-521, which std lacks), `rsa` (RS\*/PS\* sign and verify;
   `jwt.rsa` re-exports it for the key types), `ct25519` (the fixed-base comb
-  behind EdDSA signing).
+  behind EdDSA signing), `b64ct` (constant-time base64url for JWK key material).
   The signature core and P7's request/response builders need neither `http`
   nor `router`.
 

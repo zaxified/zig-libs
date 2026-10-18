@@ -36,8 +36,8 @@ const n = try base32.decode(&raw, "jbsw y3dp ehpk 3pxp", .{
 | `encodeAlloc`, `decodeAlloc` | owning wrappers |
 | `DecodeError` | `InvalidCharacter`, `InvalidPadding`, `InvalidLength`, `NonCanonical`, `BufferTooSmall` |
 
-Not constant-time; see `SPEC.md` before feeding it long-lived secrets on a
-shared host.
+Constant-time in the data (arithmetic symbol mapping, one validity verdict at
+the end) — fit for TOTP secrets; see `SPEC.md` § "Constant-time contract".
 
 Provenance: clean-room from RFC 4648 (public IETF specification, §10 vectors
 transcribed); further vectors captured from Python's stdlib

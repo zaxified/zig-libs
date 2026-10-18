@@ -29,6 +29,11 @@
 //!    `p384`.
 //!  * `pkcs8` — `x509.pkcs8PrivateKeyToPem` + `pkcs8PrivateKeyFromPem` (RFC
 //!    5958, `openssl genpkey`'s shape) for a P-256 and a P-384 key.
+//!  * `anykey` — the label search over a text that holds a secret block of
+//!    ANOTHER label (2026-10-18): `privateKeyFromPem` on a PKCS#8 PEM (its
+//!    `EC PRIVATE KEY` search misses and walks past the key's body), and
+//!    `pemBlockStart` for a CERTIFICATE stored after the key (the
+//!    Manager's `.pem` blob). A `std.mem.indexOf` here showed as `findPos`.
 //!
 //! The ECDSA signer is `p256`'s and is claimed there; what is measured here
 //! is the module's own files (and that nothing in them branches on, or
@@ -47,7 +52,7 @@ const acme = @import("root.zig");
 const jws = acme.jws;
 const x509 = acme.x509;
 
-const Target = enum { jws, csr, pem, pem384, pkcs8 };
+const Target = enum { jws, csr, pem, pem384, pkcs8, anykey };
 const Es384 = jws.Es384;
 const Taint = enum { yes, no };
 
@@ -150,6 +155,18 @@ pub fn main(init: std.process.Init.Minimal) !void {
             try roundTrip(.pkcs8, gpa, &kp);
             var k384 = makeKey384(taint);
             try roundTrip(.pkcs8, gpa, &k384);
+        },
+        .anykey => {
+            const pem = try x509.pkcs8PrivateKeyToPem(gpa, &kp);
+            defer gpa.free(pem);
+            show(pem);
+            var back: jws.AnyKeyPair = undefined;
+            try x509.privateKeyFromPem(&back, gpa, pem);
+            show(&back.es256.secret_key.bytes); // the active arm only: the rest is undefined
+            const blob = try std.mem.concat(gpa, u8, &.{ pem, "-----BEGIN CERTIFICATE-----\nMAA=\n-----END CERTIFICATE-----\n" });
+            defer gpa.free(blob);
+            const at = x509.pemBlockStart(blob, "CERTIFICATE") orelse return error.NoCertificate;
+            show(blob[at..]);
         },
     }
 }

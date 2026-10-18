@@ -471,7 +471,7 @@ Worst row 0.99× → P2.
 
 ## Status
 
-`gap · any · both · reentrant (Provider: externally synced)` + deps `http`, `router`, `p256`, `p384`, `p521`, `rsa`, `ct25519` —
+`gap · any · both · reentrant (Provider: externally synced)` + deps `http`, `router`, `p256`, `p384`, `p521`, `rsa`, `ct25519`, `b64ct` —
 canonical source is `pub const meta` in src/root.zig.
 
 ## Anchoring

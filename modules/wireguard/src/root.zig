@@ -58,6 +58,7 @@ const linux = std.os.linux;
 const netlink = @import("netlink");
 const codec = netlink.codec;
 const netaddr = @import("netaddr");
+const b64ct = @import("b64ct");
 const burn = @import("burn.zig");
 const wipe = @import("wipe.zig");
 // Test-only (`build.zig`'s `test_deps`, never `deps`): the fuzz corpus seed
@@ -103,7 +104,7 @@ pub const meta = .{
     // entropy: the cookie secret `Rm` and the cookie-reply XAEAD nonce.
     // netaddr: `AllowedIp.parse`'s CIDR-text parsing delegates to
     // `netaddr.parsePrefix`/`parseIp` rather than duplicating it.
-    .deps = .{ "netlink", "genetlink", "chachapoly", "entropy", "netaddr" },
+    .deps = .{ "netlink", "genetlink", "chachapoly", "entropy", "netaddr", "b64ct" },
 };
 
 // ── kernel UAPI constants (uapi/wireguard.h) ────────────────────────────────
@@ -187,7 +188,9 @@ pub const key_b64_len = 44;
 /// Format a raw 32-byte key as the wg base64 text form.
 pub fn keyToBase64(key: Key) [key_b64_len]u8 {
     var out: [key_b64_len]u8 = undefined;
-    _ = std.base64.standard.Encoder.encode(&out, &key);
+    // b64ct, not std.base64: the key may be private or pre-shared, and std
+    // indexes its alphabet table by each secret sextet (cache side channel).
+    _ = b64ct.standard.encode(&out, &key);
     return out;
 }
 
@@ -217,16 +220,16 @@ pub fn keyFromBase64Into(s: []const u8, out: *Key) KeyParseError!void {
 fn keyFromBase64Body(s: []const u8, out: *Key) KeyParseError!void {
     errdefer std.crypto.secureZero(u8, out);
     if (s.len != key_b64_len) return error.InvalidKey;
-    // 44 base64 characters WITHOUT the trailing `=` decode to 33 octets:
-    // size first, then decode into the 32-octet key (2026-10-09; the
-    // websocket/webhooksig defect shape).
-    const sz = std.base64.standard.Decoder.calcSizeForSlice(s) catch return error.InvalidKey;
-    if (sz != key_len) return error.InvalidKey;
-    std.base64.standard.Decoder.decode(out, s) catch return error.InvalidKey;
-    // Reject non-canonical trailing bits (e.g. "…B=" where "…A=" is meant).
+    // b64ct, not std.base64: constant-time over the key text (std indexes
+    // its tables by each secret character). 44 characters WITHOUT the
+    // trailing `=` decode to 33 octets, which b64ct refuses (NoSpaceLeft into
+    // the 32-octet key; its decodedLen is exact), as std's size check did.
+    // b64ct also rejects non-canonical trailing bits itself; the re-encode
+    // compare below stays as a belt-and-braces check, now constant-time.
+    _ = b64ct.standard.decode(out, s) catch return error.InvalidKey;
     var back = keyToBase64(out.*);
     defer std.crypto.secureZero(u8, &back);
-    if (!std.mem.eql(u8, &back, s)) return error.InvalidKey;
+    if (!std.crypto.timing_safe.eql([key_b64_len]u8, back, s[0..key_b64_len].*)) return error.InvalidKey;
 }
 
 // ── typed model ─────────────────────────────────────────────────────────────
