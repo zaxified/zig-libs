@@ -476,3 +476,80 @@ test "renderNonce: nonce appended to the named directives only; missing directiv
     // no nonce_in -> identical to render
     try testing.expectEqualStrings(helmet_default_csp, try renderNonce(.{}, &nonce, &.{}, &buf));
 }
+
+// ── audit 2026-10-18: runtime-path tests asked for by mutation survivors ────
+// (the comptime `build` tests above exercise the same core at compile time;
+// these pin the rules through the run-time entry points `render` /
+// `renderNonce`, where a defect in the shared core is also reachable.)
+
+test "render (runtime): override position, append and remove equal the comptime build" {
+    const spec: Spec = .{
+        .directives = &.{
+            .{ .name = .script_src, .values = &.{ "'self'", "https://cdn.example" } },
+            .{ .name = .connect_src, .values = &.{"'self'"} },
+        },
+        .remove = &.{ .upgrade_insecure_requests, .font_src },
+    };
+    var buf: [512]u8 = undefined;
+    const got = try render(spec, &buf);
+    try testing.expectEqualStrings("default-src 'self';base-uri 'self';form-action 'self';" ++
+        "frame-ancestors 'self';img-src 'self' data:;object-src 'none';" ++
+        "script-src 'self' https://cdn.example;script-src-attr 'none';" ++
+        "style-src 'self' https: 'unsafe-inline';connect-src 'self'", got);
+    try testing.expectEqualStrings(comptime build(spec), got);
+    // the defaults themselves, run-time
+    try testing.expectEqualStrings(helmet_default_csp, try render(.{}, &buf));
+}
+
+test "render (runtime): flags and sandbox take no value and may stay empty; a flag with a value is refused" {
+    var buf: [256]u8 = undefined;
+    const got = try render(.{ .use_defaults = false, .directives = &.{
+        .{ .name = .sandbox },
+        .{ .name = .block_all_mixed_content },
+        .{ .name = .upgrade_insecure_requests },
+    } }, &buf);
+    try testing.expectEqualStrings("sandbox;block-all-mixed-content;upgrade-insecure-requests", got);
+    try testing.expectError(error.UnexpectedValues, render(.{ .use_defaults = false, .directives = &.{
+        .{ .name = .block_all_mixed_content, .values = &.{"x"} },
+    } }, &buf));
+    // a source list may not stay empty
+    try testing.expectError(error.EmptyDirective, render(.{ .use_defaults = false, .directives = &.{.{ .name = .img_src }} }, &buf));
+}
+
+test "validation: report-to / report-uri values are plain tokens, keyword look-alikes included" {
+    // A reporting group may be named `self`; a relative URL may read `none`.
+    // Only source lists get the keyword-quoting check.
+    try one(.report_to, "self");
+    try one(.report_uri, "none");
+    try one(.report_to, "'q");
+}
+
+test "render: a buffer that fits exactly works when the LAST write is a value, one byte less does not" {
+    const spec: Spec = .{ .use_defaults = false, .directives = &.{.{ .name = .img_src, .values = &.{"'self'"} }} };
+    const want = "img-src 'self'";
+    var exact: [want.len]u8 = undefined;
+    try testing.expectEqualStrings(want, try render(spec, &exact));
+    var short: [want.len - 1]u8 = undefined;
+    try testing.expectError(error.NoSpaceLeft, render(spec, &short));
+    // same for the closing quote of a nonce (the final write there)
+    const nonce = Nonce.fromBytes(&([_]u8{0} ** 16));
+    const want_n = "script-src 'nonce-" ++ ("A" ** 22) ++ "'";
+    const spec_n: Spec = .{ .use_defaults = false, .directives = &.{.{ .name = .script_src }} };
+    var exact_n: [want_n.len]u8 = undefined;
+    try testing.expectEqualStrings(want_n, try renderNonce(spec_n, &nonce, &.{.script_src}, &exact_n));
+    var short_n: [want_n.len - 1]u8 = undefined;
+    try testing.expectError(error.NoSpaceLeft, renderNonce(spec_n, &nonce, &.{.script_src}, &short_n));
+}
+
+test "renderNonce: an empty source list is allowed only because the nonce fills it; 'none' is refused in any case" {
+    const nonce = Nonce.fromBytes(&([_]u8{0} ** 16));
+    var buf: [256]u8 = undefined;
+    const spec: Spec = .{ .use_defaults = false, .directives = &.{.{ .name = .script_src }} };
+    try testing.expectError(error.EmptyDirective, render(spec, &buf));
+    try testing.expectError(error.EmptyDirective, renderNonce(spec, &nonce, &.{}, &buf));
+    try testing.expectEqualStrings("script-src 'nonce-" ++ ("A" ** 22) ++ "'", try renderNonce(spec, &nonce, &.{.script_src}, &buf));
+    // `'none'` is matched case-insensitively (CSP keywords are)
+    try testing.expectError(error.NonceDirectiveInvalid, renderNonce(.{ .use_defaults = false, .directives = &.{
+        .{ .name = .script_src, .values = &.{"'NONE'"} },
+    } }, &nonce, &.{.script_src}, &buf));
+}

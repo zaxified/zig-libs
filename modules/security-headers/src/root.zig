@@ -1491,6 +1491,80 @@ test "the init-time budget sum counts exactly the bytes apply puts on the wire" 
     try testing.expectEqual(wire_bytes, sh.appliedHeaderBytes());
 }
 
+// ── audit 2026-10-18: tests asked for by mutation survivors ────────────────
+
+test "init accepts every RFC 9110 token character in an extra header NAME" {
+    // digits, letters and each punctuation tchar (a dropped class would 500 a
+    // legitimate header at request time, or let it through at config time).
+    const name = "A!#$%&'*+-.^_`|~0123456789z";
+    _ = try SecurityHeaders.init(.{ .extra = &.{.{ .name = name, .value = "v" }} });
+    for ("9.0aZ") |c| {
+        const one_c = [_]u8{ 'X', c };
+        _ = try SecurityHeaders.init(.{ .extra = &.{.{ .name = &one_c, .value = "v" }} });
+    }
+    // and none of the delimiters
+    for ("\"(),/:;<=>?@[\\]{} ") |c| {
+        const bad = [_]u8{ 'X', c };
+        try testing.expectError(error.InvalidExtraHeaderName, SecurityHeaders.init(.{ .extra = &.{.{ .name = &bad, .value = "v" }} }));
+    }
+}
+
+fn expectStaticEqualsRuntime(comptime options: Options) !void {
+    var runtime_buf: [4096]u8 = undefined;
+    var static_buf: [4096]u8 = undefined;
+    var body_buf: [256]u8 = undefined;
+    var chunk_buf: [64]u8 = undefined;
+    var out_r: Writer = .fixed(&runtime_buf);
+    var rw_r: http.Server.ResponseWriter = .init(&out_r, &body_buf, &chunk_buf, .{});
+    const sh: SecurityHeaders = try .init(options);
+    try sh.apply(&rw_r);
+    try rw_r.end();
+    var out_s: Writer = .fixed(&static_buf);
+    var rw_s: http.Server.ResponseWriter = .init(&out_s, &body_buf, &chunk_buf, .{});
+    try SecurityHeaders.applyStatic(options, &rw_s);
+    try rw_s.end();
+    try testing.expectEqualStrings(out_r.buffered(), out_s.buffered());
+    // static pairs are rodata: none of the response's header-byte budget is spent
+    try testing.expectEqual(@as(usize, 0), rw_s.header_buf_len);
+}
+
+test "applyStatic == apply: every optional header on, and the other HSTS flag combinations" {
+    try expectStaticEqualsRuntime(.{
+        .hsts = .{ .max_age_s = 63_072_000, .preload = true },
+        .content_security_policy = csp_api,
+        .content_security_policy_report_only = "default-src 'self'",
+        .permissions_policy = "camera=()",
+        .cross_origin_embedder_policy = "require-corp",
+        .server = "srv",
+        .extra = &.{ .{ .name = "X-Robots-Tag", .value = "noindex" }, .{ .name = "X-Two", .value = "2" } },
+    });
+    try expectStaticEqualsRuntime(.{ .hsts = .{ .max_age_s = 0, .include_subdomains = false } });
+    try expectStaticEqualsRuntime(.{ .hsts = .{ .max_age_s = 1, .include_subdomains = true } });
+    try expectStaticEqualsRuntime(api_options);
+    try expectStaticEqualsRuntime(.{
+        .hsts = null,
+        .x_content_type_options = false,
+        .origin_agent_cluster = false,
+        .x_download_options = false,
+        .x_xss_protection = false,
+        .x_dns_prefetch_control = "on",
+        .x_permitted_cross_domain_policies = "all",
+    });
+    // staticHeaders carries exactly the set applyStatic walks
+    try testing.expectEqual(@as(usize, 17), comptime staticHeaders17().len);
+}
+
+fn staticHeaders17() []const http.Header {
+    return SecurityHeaders.staticHeaders(.{
+        .content_security_policy = csp_api,
+        .content_security_policy_report_only = "default-src 'self'",
+        .permissions_policy = "camera=()",
+        .cross_origin_embedder_policy = "require-corp",
+        .server = "srv",
+        .extra = &.{.{ .name = "X-Robots-Tag", .value = "noindex" }},
+    });
+}
+
 // ── external anchor: headless Chrome against this header set ───────────────
 // See browser_oracle_test.zig / tools/interop.zig / tools/browser_oracle.js.
 test {
