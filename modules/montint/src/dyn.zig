@@ -16,9 +16,14 @@
 //! secrets instead of patching each site.
 //!
 //! **Slots.** A modulus of `n` limbs runs on `Modint(64·L)` with `L` the
-//! smallest multiple of `step` that is `≥ n` (and `≥ min_limbs`). Every
-//! operation dispatches on `L` through an `inline while` over the slots, so
-//! code size grows with `max_bits / (64·step)`. `L` follows from the modulus's
+//! smallest slot `≥ n`. The slots are every `step` limbs up to 1024 bits,
+//! then only the key sizes that occur — 1536, 2048, 3072, 4096, 6144 (ssh
+//! GEX), 8192 bits — and the type's top slot (`slot_sizes`, 2026-10-18). Every
+//! operation dispatches on `L` through an `inline for` over the slots, so code
+//! size grows with their count: on an ADX/BMI2 CPU each slot is straight-line
+//! asm generated for its width, and the old every-`step` list made
+//! `DynModint(8192)` 32 slots and 5.4 MB of `.text`. A modulus of a common size
+//! keeps an exact slot (same speed); another runs one slot up. `L` follows from the modulus's
 //! bit LENGTH, which is treated as public (it is the key size); the modulus's
 //! VALUE is not, and nothing below branches on it — `rsa` builds one of these
 //! for each secret CRT prime.
@@ -57,10 +62,35 @@ const divstepCount = nt.divstepCount;
 const safegcd = @import("safegcd.zig");
 const asm_core = @import("asm_core.zig");
 
-/// Slot granularity in limbs: a modulus runs on the next multiple of this.
+/// Slot granularity in limbs up to 1024 bits (16 limbs).
 pub const step: usize = 4;
 /// Smallest slot.
 pub const min_limbs: usize = 4;
+/// The slots above 1024 bits: the key sizes that occur (RSA, Paillier n and
+/// n², ssh GEX), in limbs. See the file doc.
+const key_slots = [_]usize{ 24, 32, 48, 64, 96, 128 };
+
+/// The slots of a type whose largest is `top` (a multiple of `step`):
+/// every `step` limbs up to 16, `key_slots` below `top`, then `top`.
+fn slotSizes(comptime top: usize) []const usize {
+    comptime {
+        var out: [16 / step + key_slots.len + 1]usize = undefined;
+        var n: usize = 0;
+        var s: usize = min_limbs;
+        while (s <= 16 and s < top) : (s += step) {
+            out[n] = s;
+            n += 1;
+        }
+        for (key_slots) |k| if (k > 16 and k < top) {
+            out[n] = k;
+            n += 1;
+        };
+        out[n] = top;
+        n += 1;
+        const final = out[0..n].*;
+        return &final;
+    }
+}
 
 pub fn DynModint(comptime max_bits: comptime_int) type {
     comptime std.debug.assert(max_bits > 64);
@@ -73,6 +103,8 @@ pub fn DynModint(comptime max_bits: comptime_int) type {
         pub const Error = montint.Error;
         /// Limb capacity of an element (the largest slot).
         pub const max_limbs: usize = top_slot;
+        /// The slot sizes in limbs, ascending; the last is `max_limbs`.
+        pub const slots: []const usize = slotSizes(top_slot);
         /// A normal-domain element, see the file doc.
         pub const Elem = [max_limbs]u64;
         pub const zero: Elem = [_]u64{0} ** max_limbs;
@@ -118,8 +150,22 @@ pub fn DynModint(comptime max_bits: comptime_int) type {
             };
         }
 
+        /// The smallest slot of at least `n` limbs (`n` ≤ `max_limbs`; the
+        /// callers check the bit length first). Arithmetic, no branch: the
+        /// length is public by contract, but `fromLimbs` derives it from the
+        /// value, and an early-return chain added a conditional jump per slot
+        /// to every secret construction (ctgrind paillier keygen 314 → 330,
+        /// threshold_ecdsa auxgen 115 → 119, 2026-10-18).
         fn slotFor(n: usize) usize {
-            return @max(min_limbs, (n + step - 1) / step * step);
+            var r: usize = max_limbs;
+            comptime var i = slots.len - 1;
+            inline while (i > 0) {
+                i -= 1;
+                // r = (n <= slots[i]) ? slots[i] : r, as a mask
+                const fits: usize = @intFromBool(n <= slots[i]);
+                r ^= (r ^ slots[i]) & (0 -% fits);
+            }
+            return r;
         }
 
         // ── construction ────────────────────────────────────────────────────
@@ -160,8 +206,7 @@ pub fn DynModint(comptime max_bits: comptime_int) type {
 
         fn build(v: *const Elem, nbits: usize, comptime public: bool) Self {
             const slot = slotFor((nbits + 63) / 64);
-            comptime var s: usize = min_limbs;
-            inline while (s <= max_limbs) : (s += step) {
+            inline for (slots) |s| {
                 if (s == slot) {
                     // A public modulus starts `R mod m` at `2^(nbits−1)`; a
                     // secret one keeps the derivation from 1, whose work
@@ -357,8 +402,7 @@ pub fn DynModint(comptime max_bits: comptime_int) type {
         /// words below `m`: 64 multiplies per 2048-bit input against a
         /// 1024-bit prime, ~6 % of an RSA-2048 private operation; now 4.)
         fn horner(self: *const Self, src: anytype, total_bits: usize) Elem {
-            comptime var s: usize = min_limbs;
-            inline while (s <= max_limbs) : (s += step) {
+            inline for (slots) |s| {
                 if (s == self.L) {
                     const v = self.view(s);
                     const digit_bits = 64 * s;
@@ -468,8 +512,7 @@ pub fn DynModint(comptime max_bits: comptime_int) type {
         // ── arithmetic (operands `< m`) ─────────────────────────────────────
 
         pub fn add(self: *const Self, a: *const Elem, b: *const Elem) Elem {
-            comptime var s: usize = min_limbs;
-            inline while (s <= max_limbs) : (s += step) {
+            inline for (slots) |s| {
                 if (s == self.L) {
                     return widen(s, &self.view(s).add(a[0..s], b[0..s]));
                 }
@@ -478,8 +521,7 @@ pub fn DynModint(comptime max_bits: comptime_int) type {
         }
 
         pub fn sub(self: *const Self, a: *const Elem, b: *const Elem) Elem {
-            comptime var s: usize = min_limbs;
-            inline while (s <= max_limbs) : (s += step) {
+            inline for (slots) |s| {
                 if (s == self.L) {
                     return widen(s, &self.view(s).sub(a[0..s], b[0..s]));
                 }
@@ -493,8 +535,7 @@ pub fn DynModint(comptime max_bits: comptime_int) type {
 
         /// `a·b mod m` (normal domain: two Montgomery multiplies).
         pub fn mul(self: *const Self, a: *const Elem, b: *const Elem) Elem {
-            comptime var s: usize = min_limbs;
-            inline while (s <= max_limbs) : (s += step) {
+            inline for (slots) |s| {
                 if (s == self.L) {
                     return widen(s, &self.view(s).mul(a[0..s], b[0..s]));
                 }
@@ -511,8 +552,7 @@ pub fn DynModint(comptime max_bits: comptime_int) type {
         /// are read — an exponent must be `< 2^(64·L)`, which every exponent
         /// `< m` (or `< m'` for a modulus `m'` in the same slot) is.
         pub fn pow(self: *const Self, base: *const Elem, exp: *const Elem) Elem {
-            comptime var s: usize = min_limbs;
-            inline while (s <= max_limbs) : (s += step) {
+            inline for (slots) |s| {
                 if (s == self.L) {
                     return widen(s, &self.view(s).powMont(base[0..s], exp[0..s]));
                 }
@@ -525,8 +565,7 @@ pub fn DynModint(comptime max_bits: comptime_int) type {
         /// and one multiply). **Variable-time in `e`** by design; constant-
         /// time in `base` and `m`.
         pub fn powPublic(self: *const Self, base: *const Elem, e_be: []const u8) Elem {
-            comptime var s: usize = min_limbs;
-            inline while (s <= max_limbs) : (s += step) {
+            inline for (slots) |s| {
                 if (s == self.L) {
                     const v = self.view(s);
                     const b_mont = v.toMontgomery(base[0..s]);
@@ -560,8 +599,7 @@ pub fn DynModint(comptime max_bits: comptime_int) type {
         /// time `std.math.big.int.divFloor` it replaces leaked a value derived
         /// from the plaintext and `λ`.
         pub fn divExact(self: *const Self, x: []const u64, q: *Elem) bool {
-            comptime var s: usize = min_limbs;
-            inline while (s <= max_limbs) : (s += step) {
+            inline for (slots) |s| {
                 if (s == self.L) {
                     const m = self.m[0..s];
                     const inv = nt.invPow2(s, m);
@@ -751,8 +789,7 @@ pub fn DynModint(comptime max_bits: comptime_int) type {
             var t = a.*;
             const below: u1 = limbs.subInto(&t, &self.m); // 1 ⟺ a < m
             std.crypto.secureZero(u64, &t);
-            comptime var s: usize = min_limbs;
-            inline while (s <= max_limbs) : (s += step) {
+            inline for (slots) |s| {
                 if (s == self.L) {
                     const ok = self.inverseSlot(s, a, out);
                     return @as(u1, @intFromBool(ok)) & below == 1;
@@ -1658,18 +1695,29 @@ test "DynModint select" {
     try testing.expect(D.eql(&D.select(false, &a, &b), &b));
 }
 
-test "DynModint slots: limb count picks the smallest multiple of step" {
+test "DynModint slots: every 4 limbs to 1024 bits, then the key sizes, then the top" {
     const D = DynModint(4096);
+    try testing.expectEqualSlices(usize, &.{ 4, 8, 12, 16, 24, 32, 48, 64 }, D.slots);
     var v = D.zero;
     v[0] = 1;
     v[1] = 1;
     try testing.expectEqual(@as(usize, 4), (try D.fromLimbs(&v)).L);
     v[4] = 1;
     try testing.expectEqual(@as(usize, 8), (try D.fromLimbs(&v)).L);
+    v[16] = 1; // 17 limbs: no 20-limb slot any more, one slot up
+    try testing.expectEqual(@as(usize, 24), (try D.fromLimbs(&v)).L);
+    v[31] = 1; // 2048 bits exactly: its own slot
+    try testing.expectEqual(@as(usize, 32), (try D.fromLimbs(&v)).L);
+    v[32] = 1;
+    try testing.expectEqual(@as(usize, 48), (try D.fromLimbs(&v)).L);
     v[63] = 1;
     try testing.expectEqual(@as(usize, 64), (try D.fromLimbs(&v)).L);
     try testing.expectEqual(@as(usize, 64), D.max_limbs);
     try testing.expectEqual(@as(usize, 4), DynModint(65).max_limbs);
+    try testing.expectEqualSlices(usize, &.{4}, DynModint(65).slots);
+    // A top that is no key size stays the top slot (5000 bits = 79 limbs → 80).
+    try testing.expectEqualSlices(usize, &.{ 4, 8, 12, 16, 24, 32, 48, 64, 80 }, DynModint(5000).slots);
+    try testing.expectEqual(@as(usize, 10), DynModint(8192).slots.len); // was 32
 }
 
 test "DynModint rejects even, small and oversized moduli" {

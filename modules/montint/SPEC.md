@@ -64,8 +64,10 @@ stay non-zero in `ff.zig` (27 contexts on 2026-10-02). Differential tests
 against `std.crypto.ff` at L=4 (bls12_381 `r`) and L=7 (ed448 `l`).
 
 **`DynModint(max_bits)` (2026-10-02)** is the run-time counterpart of `Field`:
-an odd modulus whose value AND limb count are chosen at run time (slots of 4
-limbs, each operation dispatched to the matching `Modint`), with normal-domain
+an odd modulus whose value AND limb count are chosen at run time (slots every
+4 limbs up to 1024 bits, then the key sizes 1536/2048/3072/4096/6144/8192 bits
+and the type's top — since 2026-10-18; each operation dispatched to the
+matching `Modint`), with normal-domain
 elements (`[max_limbs]u64`, so an element of `p²` is directly an operand mod
 `n²`). API: branchless `loadBE`, canonical `elemFromBytesBE` (CT up to the
 verdict), `toBytesBE`, `reduceLimbs`/`reduceBytesBE` of any width — Horner over
@@ -761,9 +763,11 @@ whole `L`-limb digits through `montMul(digit, R² mod m)` on that basis.
   HTTPS client, ReleaseSafe, musl): baseline x86_64 `DynModint(8192)` 0.27 MB of `.text`; native CPU **5.37 MB** (`pow` 2.65 MB,
   `powPublic` 1.12 MB, `horner` 0.77 MB, `mul` 0.52 MB); with rsa's `.small` cap (4096) 1.77 MB. ssh's `GexMod` is the same type.
   Plan:
-  1. **Default (approved):** slots every 4 limbs up to 1024 bits, then only the sizes that occur — 1536, 2048, 3072, 4096, 6144,
-     8192 (6144 for ssh GEX). Common keys keep an exact slot, so the graded speed is unchanged; an odd size runs one slot up. Re-run
-     rsa/paillier/threshold_ecdsa bench (P axis) and ctgrind; sizeprobe before/after into this SPEC.
+  1. ✅ 2026-10-18 **Default (approved):** slots every 4 limbs up to 1024 bits, then only the sizes that occur — 1536, 2048, 3072,
+     4096, 6144, 8192 (6144 for ssh GEX) — and the type's top slot (`DynModint.slots`; `DynModint(8192)` 32 → 10 slots). Common
+     keys keep an exact slot (the same `Modint(64·L)` instantiation as before, so the same code); an odd size runs one slot up
+     (e.g. a 1100-bit modulus at 1536 bits). **Measured** (rsa sizeprobe, ReleaseSmall, native ADX/BMI2 x86_64, stripped):
+     default 863 144 → 427 536 B, `-Dprofile=small` 436 768 → 319 128 B — the new DEFAULT is smaller than the old `.small`.
   2. **Knob `montint-asm-unroll`** (CONVENTIONS §4.2): default = straight-line asm (as graded); `.small` = the looped engine above
      N limbs. Expected to remove most of what is left on ADX CPUs; costs speed — measure the bench delta and state it.
   Rejected: a non-unrolled generic path for all large slots by default (re-proving constant time for no default gain).
