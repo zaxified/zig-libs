@@ -142,9 +142,10 @@ pub const meta = .{
 /// a multiple of 64), or get 4096 from `-Dprofile=small`. Not below 4096:
 /// public CA roots with 4096-bit keys are common, so a lower cap would make an
 /// HTTPS client refuse ordinary chains. Code size is what it
-/// buys: montint instantiates one slot per 256 bits up to the cap, and on an
-/// ADX/BMI2 CPU each slot is straight-line asm — the HTTPS sizeprobe measured
-/// `DynModint(8192)` at 5.4 MB of `.text` there (0.27 MB on baseline x86_64).
+/// buys: montint instantiates one slot per key size up to the cap (10 at 8192,
+/// 8 at 4096, since 2026-10-18; one per 256 bits before), and on an ADX/BMI2
+/// CPU each slot is straight-line asm — the rsa sizeprobe (ReleaseSmall,
+/// native) is 427 536 B at 8192 and 319 128 B at 4096.
 /// A key above the cap is refused the way any oversized key is
 /// (`error.InvalidPublicKey` / `InvalidPrivateKey` / `InvalidBits`, or
 /// `InvalidDer` when the DER wrapper alone is already too long), never
@@ -2698,13 +2699,14 @@ fn pemDecodeBody(text: []const u8) PemError!PemBlock {
     const body_start = label_end + dashes.len;
     var end_marker_buf: [max_end_marker_len]u8 = undefined;
     const end_marker = std.fmt.bufPrint(&end_marker_buf, "-----END {s}-----", .{label}) catch unreachable;
-    // Searched from the text's end: std's forward search (Boyer-Moore-
-    // Horspool) indexes its skip table by, and skips by an amount that
-    // depends on, the key's base64 characters (acme ctgrind 2026-10-18).
-    // Backward it reads only the END line and what follows. One block of
-    // this label per text; a second would land in `body` and fail decoding.
-    const ei = std.mem.lastIndexOf(u8, text, end_marker) orelse return error.InvalidPem;
-    if (ei < body_start) return error.InvalidPem;
+    // The END line starts at the first '-' after the body: base64 has none, so
+    // this scan's compare is false on every key character and it stops at the
+    // body's (public) length. Not std.mem.indexOfPos: Boyer-Moore-Horspool
+    // indexes its skip table by, and skips by an amount that depends on, the
+    // key's characters (acme ctgrind 2026-10-18). The first block of the label
+    // is used, as documented.
+    const ei = std.mem.indexOfScalarPos(u8, text, body_start, '-') orelse return error.InvalidPem;
+    if (!std.mem.startsWith(u8, text[ei..], end_marker)) return error.InvalidPem;
     const body = text[body_start..ei];
 
     // Constant time in the body's characters (a private key's DER), not
@@ -5156,6 +5158,370 @@ test "PBES2: an iteration count over max_pbkdf2_iterations is refused before any
     const at = std.mem.indexOf(u8, der, &.{ 0x02, 0x03, 0x01, 0x00, 0x00 }).?;
     der[at + 2] = 0x11;
     try testing.expectError(error.KdfIterationsTooLarge, fromPkcs8Encrypted(&test_sk_out, der, "pw"));
+}
+
+// ── audit 2026-10-18: mutation survivors of the 2026-10 additions ───────────
+//
+// Each test below breaks ONE property of an otherwise valid input (or checks
+// one boundary) that a mutant of the new serialisation / PBES2 / F1 code could
+// not be told apart by before; see SPEC.md "Mutation (2026-10-18".
+
+/// An `EncryptedPrivateKeyInfo` (RFC 5958 §3, PBES2-params RFC 8018 A.4) with
+/// optional faults. The defaults are a valid AES-256-CBC / PBKDF2 file shape
+/// (the ciphertext is filler: only `pbes2Params`, the structure walk, reads it).
+const Epki = struct {
+    salt: []const u8 = "0123456789abcdef",
+    iter: []const u8 = &.{ 0x08, 0x00 },
+    key_len: ?[]const u8 = null,
+    prf_last: ?u8 = null,
+    prf_oid_extra: []const u8 = "",
+    prf_params: []const u8 = &.{ 0x05, 0x00 },
+    cipher_last: u8 = 0x2a,
+    cipher_extra: []const u8 = "",
+    iv: []const u8 = "ivivivivivivivi!",
+    data_len: usize = 32,
+    kp_tail: []const u8 = "",
+    kdf_tail: []const u8 = "",
+    enc_tail: []const u8 = "",
+    params_tail: []const u8 = "",
+    alg_tail: []const u8 = "",
+    top_tail: []const u8 = "",
+
+    fn build(o: Epki, a: std.mem.Allocator) ![]const u8 {
+        const d: der_writer.Builder = .{ .a = a };
+        const kl: []const u8 = if (o.key_len) |k| try d.integerRaw(k) else "";
+        const prf: []const u8 = if (o.prf_last) |l| try d.seq(&.{
+            try d.oid(try d.cat(&[_][]const u8{ &marshal.oid_hmac_arc, &[_]u8{l}, o.prf_oid_extra })),
+            o.prf_params,
+        }) else "";
+        const kp = try d.seq(&.{ try d.octetString(o.salt), try d.integerRaw(o.iter), kl, prf, o.kp_tail });
+        const kdf = try d.seq(&.{ try d.oid(&marshal.oid_pbkdf2), kp, o.kdf_tail });
+        const enc = try d.seq(&.{
+            try d.oid(try d.cat(&[_][]const u8{ &marshal.oid_aes_arc, &[_]u8{o.cipher_last}, o.cipher_extra })),
+            try d.octetString(o.iv),
+            o.enc_tail,
+        });
+        const params = try d.seq(&.{ kdf, enc, o.params_tail });
+        const alg = try d.seq(&.{ try d.oid(&marshal.oid_pbes2), params, o.alg_tail });
+        const data = try a.alloc(u8, o.data_len);
+        @memset(data, 0x5a);
+        return d.seq(&.{ alg, try d.octetString(data), o.top_tail });
+    }
+
+    fn expect(o: Epki, a: std.mem.Allocator, want: ?FromEncryptedError) !void {
+        const der = try o.build(a);
+        if (want) |e| {
+            try testing.expectError(e, pbes2Params(der));
+        } else {
+            _ = try pbes2Params(der);
+        }
+    }
+};
+
+test "PBES2 structure walk: every container must end where its last child ends" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const extra = [_]u8{ 0x05, 0x00 }; // a NULL where the container should have ended
+    try (Epki{}).expect(a, null);
+    try (Epki{ .prf_last = 9 }).expect(a, null);
+    try (Epki{ .top_tail = &extra }).expect(a, error.InvalidDer);
+    try (Epki{ .alg_tail = &extra }).expect(a, error.InvalidDer);
+    try (Epki{ .params_tail = &extra }).expect(a, error.InvalidDer);
+    try (Epki{ .kdf_tail = &extra }).expect(a, error.InvalidDer);
+    try (Epki{ .enc_tail = &extra }).expect(a, error.InvalidDer);
+    try (Epki{ .prf_last = 9, .kp_tail = &extra }).expect(a, error.InvalidDer);
+    try (Epki{ .kp_tail = &extra }).expect(a, error.InvalidDer); // after iterations: not a keyLength, not a PRF
+}
+
+test "PBES2 parameters: keyLength, PRF parameters, IV, salt, iteration and ciphertext limits" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // keyLength present: must be the cipher's.
+    try (Epki{ .key_len = &.{0x20} }).expect(a, null);
+    try (Epki{ .key_len = &.{0x18} }).expect(a, error.InvalidDer);
+    // PRF parameters: absent or a real (empty) NULL, nothing else.
+    try (Epki{ .prf_last = 9, .prf_params = "" }).expect(a, null);
+    try (Epki{ .prf_last = 9, .prf_params = &.{ 0x05, 0x01, 0x00 } }).expect(a, error.InvalidDer);
+    // The IV is exactly one block.
+    try (Epki{ .iv = "ivivivivivivivi" }).expect(a, error.InvalidDer);
+    try (Epki{ .iv = "ivivivivivivivi!!" }).expect(a, error.InvalidDer);
+    // Salt: 1 .. max_pbes2_salt_len octets.
+    const salt64 = [_]u8{0x11} ** max_pbes2_salt_len;
+    try (Epki{ .salt = &salt64 }).expect(a, null);
+    try (Epki{ .salt = &(salt64 ++ [_]u8{0x11}) }).expect(a, error.InvalidDer);
+    try (Epki{ .salt = "" }).expect(a, error.InvalidDer);
+    // Iterations: 1 .. 2^20; a non-minimal or negative INTEGER is no count.
+    try (Epki{ .iter = &.{0x01} }).expect(a, null);
+    try (Epki{ .iter = &.{0x00} }).expect(a, error.InvalidDer);
+    try (Epki{ .iter = &.{ 0x10, 0x00, 0x00 } }).expect(a, null);
+    try (Epki{ .iter = &.{ 0x10, 0x00, 0x01 } }).expect(a, error.KdfIterationsTooLarge);
+    try (Epki{ .iter = &.{ 0x00, 0x08, 0x00 } }).expect(a, error.InvalidDer);
+    try (Epki{ .iter = &.{ 0x88, 0x00 } }).expect(a, error.InvalidDer);
+    // Ciphertext: whole blocks, 1 .. max_pkcs8_der_len + 16 octets.
+    const top = (max_pkcs8_der_len + 16) / 16 * 16;
+    try (Epki{ .data_len = 16 }).expect(a, null);
+    try (Epki{ .data_len = top }).expect(a, null);
+    try (Epki{ .data_len = top + 16 }).expect(a, error.InvalidDer);
+    try (Epki{ .data_len = 0 }).expect(a, error.InvalidDer);
+    try (Epki{ .data_len = 17 }).expect(a, error.InvalidDer);
+}
+
+test "PBES2 OIDs: PRF and cipher are single arc octets under their arc, nothing else" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const prfs = [_]Pbes2Prf{ .hmac_sha1, .hmac_sha224, .hmac_sha256, .hmac_sha384, .hmac_sha512 };
+    for (prfs, 7..) |want, last| {
+        const pp = try pbes2Params(try (Epki{ .prf_last = @intCast(last) }).build(a));
+        try testing.expectEqual(want, pp.prf);
+    }
+    const ciphers = [_]struct { Pbes2Cipher, u8 }{ .{ .aes128_cbc, 0x02 }, .{ .aes192_cbc, 0x16 }, .{ .aes256_cbc, 0x2a } };
+    for (ciphers) |c| {
+        const pp = try pbes2Params(try (Epki{ .cipher_last = c[1] }).build(a));
+        try testing.expectEqual(c[0], pp.cipher);
+    }
+    // Neighbours of the HMAC range (2.6 and 2.12 are other algorithms) and of the AES ones.
+    for ([_]u8{ 6, 12 }) |last| try (Epki{ .prf_last = last }).expect(a, error.UnsupportedEncryption);
+    for ([_]u8{ 0x01, 0x03, 0x15, 0x17, 0x29, 0x2b }) |last| try (Epki{ .cipher_last = last }).expect(a, error.UnsupportedEncryption);
+    // A longer OID under the arc is not the algorithm.
+    try (Epki{ .prf_last = 9, .prf_oid_extra = &.{0x01} }).expect(a, error.UnsupportedEncryption);
+    try (Epki{ .cipher_extra = &.{0x01} }).expect(a, error.UnsupportedEncryption);
+}
+
+/// The nine INTEGER contents of a PKCS#1 `RSAPrivateKey`, as DER again with
+/// `d` replaced.
+fn pkcs1WithD(a: std.mem.Allocator, der: []const u8, d_be: []const u8) ![]const u8 {
+    const f = try pkcs1Fields(der);
+    const b: der_writer.Builder = .{ .a = a };
+    var parts: [9][]const u8 = undefined;
+    for (f, 0..) |e, i| parts[i] = try b.integer(if (i == 3) d_be else derView(der, e));
+    return b.seq(&parts);
+}
+
+test "F1: a wire d at or above n is refused although it satisfies both congruences" {
+    // d' = d + φ(n) ≡ d (mod p−1) and (mod q−1), but d' > n.
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var mem: [64 * 1024]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&mem);
+    const gpa = fba.allocator();
+    var p1 = try bigFromBytes(gpa, &kat2048.p);
+    try p1.addScalar(&p1, -1);
+    var q1 = try bigFromBytes(gpa, &kat2048.q);
+    try q1.addScalar(&q1, -1);
+    var phi = try newBig(gpa);
+    try phi.mul(&p1, &q1);
+    var d2 = try bigFromBytes(gpa, &kat2048.d);
+    try d2.add(&d2, &phi);
+    var d2_bytes: [257]u8 = undefined;
+    d2.toConst().writeTwosComplement(&d2_bytes, .big);
+    const der = try pkcs1WithD(a, &kat2048_der.priv_pkcs1, &d2_bytes);
+    try testing.expectError(error.InvalidPrivateKey, SecretKey.fromDer(&test_sk_out, der));
+    // The same rewrite with the original d is the original key (the helper is faithful).
+    const same = try pkcs1WithD(a, &kat2048_der.priv_pkcs1, &kat2048.d);
+    try testing.expectEqualSlices(u8, &kat2048_der.priv_pkcs1, same);
+}
+
+/// Every INTEGER of a `RSAPrivateKey` DER is in minimal two's complement form.
+fn expectMinimalIntegers(der: []const u8) !bool {
+    var top40 = false;
+    for (try pkcs1Fields(der)) |e| {
+        const c = derView(der, e);
+        try testing.expect(c.len > 0 and c[0] & 0x80 == 0); // non-negative
+        if (c.len > 1 and c[0] == 0) try testing.expect(c[1] & 0x80 != 0); // no redundant sign octet
+        if (c[0] >= 0x40 and c[0] < 0x80) top40 = true;
+    }
+    return top40;
+}
+
+test "marshal: INTEGERs are minimal for many exponents; a block-aligned PKCS#8 encrypts and decrypts" {
+    var prng = std.Random.DefaultPrng.init(0x1018);
+    var saw_top40 = false;
+    var aligned: usize = 0;
+    var keys: usize = 0;
+    var e: u32 = 3;
+    while (e < 301) : (e += 2) {
+        var e_bytes: [4]u8 = undefined;
+        std.mem.writeInt(u32, &e_bytes, e, .big);
+        var sk: SecretKey = undefined;
+        SecretKey.fromPrimes(&sk, &kat2048.p, &kat2048.q, std.mem.trimStart(u8, &e_bytes, &.{0})) catch continue;
+        defer sk.deinit();
+        keys += 1;
+        var buf: [max_pkcs1_private_der_len]u8 = undefined;
+        const der = try sk.toPkcs1Der(&buf);
+        if (try expectMinimalIntegers(der)) saw_top40 = true;
+        var back: SecretKey = undefined;
+        try SecretKey.fromDer(&back, der);
+        defer back.deinit();
+        var buf2: [max_pkcs1_private_der_len]u8 = undefined;
+        try testing.expectEqualSlices(u8, der, try back.toPkcs1Der(&buf2));
+
+        var p8: [max_pkcs8_der_len]u8 = undefined;
+        const p8_len = (try sk.toPkcs8Der(&p8)).len;
+        if (p8_len % 16 != 0) continue;
+        aligned += 1; // PKCS#7 then adds a whole block of 16 × 0x10
+        var enc: [max_encrypted_pkcs8_der_len]u8 = undefined;
+        const ed = try sk.toPkcs8Encrypted("pw", prng.random(), .{ .cipher = .aes128_cbc, .iterations = 1 }, &enc);
+        try testing.expectEqual(p8_len + 16, (try pbes2Params(ed)).data.len);
+        var dec: SecretKey = undefined;
+        try fromPkcs8Encrypted(&dec, ed, "pw");
+        defer dec.deinit();
+        try testing.expectEqualSlices(u8, der, try dec.toPkcs1Der(&buf2));
+    }
+    try testing.expect(keys >= 20);
+    try testing.expect(saw_top40);
+    try testing.expect(aligned >= 1);
+}
+
+test "marshal: success zeroes what the DER moved out of; a short buffer still gets the whole result" {
+    var sk = try kat2048.secretKey();
+    defer sk.deinit();
+    const pk = sk.publicKey();
+    var prng = std.Random.DefaultPrng.init(0x2018);
+    var buf: [max_encrypted_pem_len]u8 = undefined;
+    const n = kat2048_der.priv_pkcs1.len;
+    // DER: the copy left at the end of `out` is wiped (here pos ≥ n) ...
+    @memset(&buf, 0xaa);
+    try testing.expectEqualSlices(u8, &kat2048_der.priv_pkcs1, try sk.toPkcs1Der(&buf));
+    for (buf[buf.len - n ..]) |b| try testing.expectEqual(0, b);
+    // ... and with only one spare byte (pos < n) the result is intact.
+    @memset(&buf, 0xaa);
+    try testing.expectEqualSlices(u8, &kat2048_der.priv_pkcs1, try sk.toPkcs1Der(buf[0 .. n + 1]));
+    @memset(&buf, 0xaa);
+    try testing.expectEqualSlices(u8, &kat2048_der.pub_spki, try pk.toSpkiDer(buf[0 .. kat2048_der.pub_spki.len + 1]));
+    // PEM (plain and encrypted): nothing of the DER stays behind the text.
+    @memset(&buf, 0xaa);
+    var pem = try sk.toPem(.pkcs8, &buf);
+    for (buf[pem.len..]) |b| try testing.expectEqual(0, b);
+    @memset(&buf, 0xaa);
+    pem = try sk.toPemEncrypted("pw", prng.random(), .{ .iterations = 1 }, &buf);
+    for (buf[pem.len..]) |b| try testing.expectEqual(0, b);
+    @memset(&buf, 0xaa);
+    pem = try pk.toPem(.spki, &buf);
+    for (buf[pem.len..]) |b| try testing.expectEqual(0, b);
+}
+
+test "marshal: a buffer too small for the DER itself fails with out zeroed, in every writer" {
+    var sk = try kat2048.secretKey();
+    defer sk.deinit();
+    const pk = sk.publicKey();
+    var prng = std.Random.DefaultPrng.init(0x3018);
+    var buf: [100]u8 = undefined;
+    @memset(&buf, 0xaa);
+    try testing.expectError(error.BufferTooSmall, pk.toPem(.spki, &buf));
+    for (buf) |b| try testing.expectEqual(0, b);
+    @memset(&buf, 0xaa);
+    try testing.expectError(error.BufferTooSmall, sk.toPem(.pkcs1, &buf));
+    for (buf) |b| try testing.expectEqual(0, b);
+    @memset(&buf, 0xaa);
+    try testing.expectError(error.BufferTooSmall, sk.toPkcs8Encrypted("pw", prng.random(), .{ .iterations = 1 }, &buf));
+    for (buf) |b| try testing.expectEqual(0, b);
+    @memset(&buf, 0xaa);
+    try testing.expectError(error.BufferTooSmall, sk.toPemEncrypted("pw", prng.random(), .{ .iterations = 1 }, &buf));
+    for (buf) |b| try testing.expectEqual(0, b);
+    // A buffer that holds the plaintext but not the ciphertext + parameters.
+    var mid: [kat2048_der.priv_pkcs8.len + 16]u8 = undefined;
+    @memset(&mid, 0xaa);
+    try testing.expectError(error.BufferTooSmall, sk.toPkcs8Encrypted("pw", prng.random(), .{ .iterations = 1 }, &mid));
+    for (mid) |b| try testing.expectEqual(0, b);
+}
+
+test "PBES2 writer: the option limits are inclusive (2^20 iterations, 64 salt octets)" {
+    var sk = try kat2048.secretKey();
+    defer sk.deinit();
+    var prng = std.Random.DefaultPrng.init(0x4018);
+    var buf: [max_encrypted_pkcs8_der_len]u8 = undefined;
+    const der = try sk.toPkcs8Encrypted("pw", prng.random(), .{ .cipher = .aes128_cbc, .prf = .hmac_sha1, .iterations = max_pbkdf2_iterations, .salt_len = max_pbes2_salt_len }, &buf);
+    const pp = try pbes2Params(der);
+    try testing.expectEqual(max_pbkdf2_iterations, pp.iterations);
+    try testing.expectEqual(max_pbes2_salt_len, pp.salt.len);
+    // Our default shape names hmacWithSHA256 and says so; SHA-1 is the omitted DEFAULT.
+    const d256 = try sk.toPkcs8Encrypted("pw", prng.random(), .{ .iterations = 1 }, &buf);
+    try testing.expectEqual(Pbes2Prf.hmac_sha256, (try pbes2Params(d256)).prf);
+    const d1 = try sk.toPkcs8Encrypted("pw", prng.random(), .{ .prf = .hmac_sha1, .iterations = 1 }, &buf);
+    try testing.expect(std.mem.indexOf(u8, d1, &marshal.oid_hmac_arc) == null);
+    try testing.expectEqual(Pbes2Prf.hmac_sha1, (try pbes2Params(d1)).prf);
+}
+
+test "digest entry points: a digest of the wrong length is refused by all four, long or short" {
+    var sk = try kat2048.secretKey();
+    defer sk.deinit();
+    const pk = sk.publicKey();
+    var prng = std.Random.DefaultPrng.init(0x5018);
+    var out: [256]u8 = undefined;
+    const digest = [_]u8{0x42} ** 65;
+    for ([_]usize{ 31, 33 }) |len| {
+        const dg = digest[0..len];
+        try testing.expectError(error.InvalidDigestLength, signPkcs1v15Digest(&sk, .sha256, dg, &out));
+        try testing.expectError(error.InvalidDigestLength, verifyPkcs1v15Digest(pk, .sha256, dg, &kat2048.sig_sha256));
+        try testing.expectError(error.InvalidDigestLength, signPssDigest(&sk, .sha256, prng.random(), dg, 32, &out));
+        try testing.expectError(error.InvalidDigestLength, verifyPssDigest(pk, .sha256, dg, &kat2048.sig_sha256, null));
+        try testing.expectError(error.InvalidDigestLength, pk.verifyKey().verifyPkcs1v15Digest(.sha256, dg, &kat2048.sig_sha256));
+    }
+}
+
+test "PSS: the smallest key a hash fits (emLen = hLen + 2) signs and verifies with salt 0" {
+    const Sha256 = std.crypto.hash.sha2.Sha256;
+    try testing.expectEqual(0, maxPssSaltLen(272, Sha256).?); // emLen 34 = 32 + 2
+    try testing.expectEqual(null, maxPssSaltLen(264, Sha256)); // emLen 33
+    try testing.expectEqual(0, maxPssSaltLen(273, Sha256).?); // emBits 272: still 34 octets
+    try testing.expectEqual(1, maxPssSaltLen(280, Sha256).?);
+    // 172-bit modulus: emLen = 22 = SHA-1's 20 + 2.
+    const p = comptime hexLit("3bed8e60ed84e75dfc365b");
+    const q = comptime hexLit("33f4814871f502d278fec1");
+    var sk: SecretKey = undefined;
+    try SecretKey.fromPrimes(&sk, &p, &q, &.{ 0x01, 0x00, 0x01 });
+    defer sk.deinit();
+    const pk = sk.publicKey();
+    try testing.expectEqual(172, pk.bits());
+    var prng = std.Random.DefaultPrng.init(0x6018);
+    var sig: [22]u8 = undefined;
+    const s = try signPss(&sk, std.crypto.hash.Sha1, prng.random(), "tiny", 0, &sig);
+    try verifyPss(pk, std.crypto.hash.Sha1, "tiny", s, 0);
+    try testing.expectEqual(0, try verifyPssAuto(pk, std.crypto.hash.Sha1, "tiny", s));
+    try testing.expectError(error.SignatureVerificationFailed, verifyPss(pk, std.crypto.hash.Sha1, "tiny", s, 1));
+}
+
+test "PEM: two blocks of one label load the first; a '-' inside the body is no END line" {
+    const k1 = kat2048_pem.pub_spki;
+    const first = try PublicKey.fromPem(k1);
+    // Two different keys, same label: the first one.
+    const pk3 = try PublicKey.fromBytes(&kat2048.n, &.{0x03}); // same n, e = 3: another key
+    var buf: [max_public_pem_len]u8 = undefined;
+    const other = try pk3.toPem(.spki, &buf);
+    var two: [2 * max_public_pem_len]u8 = undefined;
+    const text = try std.fmt.bufPrint(&two, "{s}{s}", .{ k1, other });
+    try testing.expect(first.equal(&try PublicKey.fromPem(text)));
+    try testing.expect(!first.equal(&pk3));
+    // The reverse order loads the other key.
+    const text2 = try std.fmt.bufPrint(&two, "{s}{s}", .{ other, k1 });
+    try testing.expect(pk3.equal(&try PublicKey.fromPem(text2)));
+    // A '-' that does not start the END line ends the body there: invalid.
+    var junk: [max_public_pem_len + 16]u8 = undefined;
+    const body_end = std.mem.indexOf(u8, k1, "-----END").?;
+    const bad = try std.fmt.bufPrint(&junk, "{s}-{s}", .{ k1[0..body_end], k1[body_end..] });
+    try testing.expectError(error.InvalidPem, PublicKey.fromPem(bad));
+    // END line of another label: invalid.
+    const wrong = try std.fmt.bufPrint(&junk, "-----BEGIN PUBLIC KEY-----\nAAAA\n-----END RSA PUBLIC KEY-----\n", .{});
+    try testing.expectError(error.InvalidPem, PublicKey.fromPem(wrong));
+}
+
+test "PEM: a label of exactly 32 octets is a label, 33 is not; an END line before the BEGIN is no block" {
+    const a32 = "A" ** 32;
+    const ok = "-----BEGIN " ++ a32 ++ "-----\nAAAA\n-----END " ++ a32 ++ "-----\n";
+    try testing.expectError(error.UnsupportedPemLabel, PublicKey.fromPem(ok));
+    try testing.expectError(error.UnsupportedPemLabel, SecretKey.fromPem(&test_sk_out, ok));
+    const a33 = "A" ** 33;
+    const long = "-----BEGIN " ++ a33 ++ "-----\nAAAA\n-----END " ++ a33 ++ "-----\n";
+    try testing.expectError(error.InvalidPem, PublicKey.fromPem(long));
+    const swapped = "-----END PUBLIC KEY-----\n-----BEGIN PUBLIC KEY-----\nAAAA\n";
+    try testing.expectError(error.InvalidPem, PublicKey.fromPem(swapped));
+    // Text around the block, including a block of another label after it, is ignored.
+    const around = "junk\n" ++ kat2048_pem.pub_spki ++ "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n";
+    _ = try PublicKey.fromPem(around);
 }
 
 // ── R7 (2026-10-14): 8192-bit keys ──────────────────────────────────────────
