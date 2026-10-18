@@ -291,8 +291,8 @@ test "the capture covers the frame kinds this module claims to handle" {
     var saw_item_error = false;
     var saw_multi_item = false;
     var saw_control = false;
-    var areas = std.EnumSet(items.Area).initEmpty();
-    var sizes = std.EnumSet(items.TransportSize).initEmpty();
+    var areas = std.EnumSet(items.Area).empty;
+    var sizes = std.EnumSet(items.TransportSize).empty;
 
     for (&table) |g| {
         const frame = bytes(g.hex, &buf);
@@ -305,7 +305,7 @@ test "the capture covers the frame kinds this module claims to handle" {
                 const pdu = try s7.decode(dt.payload);
                 if (pdu.header.rosctr == .userdata) saw_userdata = true;
                 if (pdu.parameters.len == 0) continue;
-                switch (@as(s7.Function, @enumFromInt(pdu.parameters[0]))) {
+                switch (@as(s7.Function, @fromBackingInt(@intCast(pdu.parameters[0])))) {
                     .setup_communication => saw_setup = true,
                     .plc_stop, .pi_service => saw_control = true,
                     .read_var, .write_var => |f| {

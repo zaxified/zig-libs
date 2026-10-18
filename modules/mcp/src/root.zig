@@ -6924,8 +6924,8 @@ test "mcp: spec-anchor classification matches the dispatch surface (canary)" {
     // list `handleMessage`'s exhaustive switch is written over, and
     // `OriginatedMethod` supplies the wire name every emitter prints -- and
     // checks both directions, so neither list can drift from the index.
-    const dispatched = std.meta.fieldNames(DispatchMethod);
-    const originated = std.meta.fieldNames(OriginatedMethod);
+    const dispatched = comptime std.meta.fieldNames(DispatchMethod);
+    const originated = comptime std.meta.fieldNames(OriginatedMethod);
 
     // Direction 1: every method the code really speaks is classified here.
     for (dispatched ++ originated) |name| {
@@ -8649,14 +8649,15 @@ test "tools/list: title, icons and annotations are emitted when set (session pat
 test "mcp: 2026-07-28 spec-anchor classification matches servedStatelessly (canary)" {
     // Both directions, as the session canary: every method a modern request
     // may call is anchored here, and nothing here is unreachable statelessly.
-    inline for (std.meta.fields(DispatchMethod)) |f| {
-        const m: DispatchMethod = @fromBackingInt(@intCast(f.value));
+    const dm_info = @typeInfo(DispatchMethod).@"enum";
+    inline for (dm_info.field_names, dm_info.field_values) |fname, fvalue| {
+        const m: DispatchMethod = @fromBackingInt(@intCast(fvalue));
         var found = false;
         for (modern_spec_anchor_index) |a| {
-            if (eql(a.method, f.name)) found = true;
+            if (eql(a.method, fname)) found = true;
         }
         testing.expectEqual(m.servedStatelessly(), found) catch {
-            std.debug.print("servedStatelessly/anchor mismatch: {s}\n", .{f.name});
+            std.debug.print("servedStatelessly/anchor mismatch: {s}\n", .{fname});
             return error.TestUnexpectedResult;
         };
     }

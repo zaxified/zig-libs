@@ -379,7 +379,7 @@ const Decoder = struct {
 
     fn readUintN(self: *Decoder, comptime nbytes: usize) DecodeError!u64 {
         if (nbytes > self.bytes.len - self.pos) return error.Truncated;
-        const T = std.meta.Int(.unsigned, nbytes * 8);
+        const T = @Int(.unsigned, nbytes * 8);
         const v = std.mem.readInt(T, self.bytes[self.pos..][0..nbytes], .big);
         self.pos += nbytes;
         return @as(u64, v);

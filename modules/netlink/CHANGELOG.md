@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — Ported to Zig 0.17.0. `sockaddr.in` test address via `bytesToValue`; `@typeInfo` struct-of-arrays spellings; `waitpid` status pointer cast.
 - **2026-10-09** — tests: deterministic fuzz driver `NETLINK_FUZZ` over the existing harnesses (codec walkers,
   rtnetlink builders and parsers, bridge builders and parsers).
 

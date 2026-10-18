@@ -197,9 +197,9 @@ const Run = struct {
 };
 
 fn mergeCounters(dst: *Report, src: Report) void {
-    inline for (std.meta.fields(Report)) |f| {
-        if (comptime !std.mem.eql(u8, f.name, "total")) {
-            @field(dst, f.name) +|= @field(src, f.name);
+    inline for (@typeInfo(Report).@"struct".field_names) |fname| {
+        if (comptime !std.mem.eql(u8, fname, "total")) {
+            @field(dst, fname) +|= @field(src, fname);
         }
     }
 }
@@ -471,7 +471,7 @@ fn scanNode(r: *Run, node: *Node) void {
             r.fail(error.OutOfMemory);
             break :scanning;
         };
-        const name_copy = gpa.dupeZ(u8, entry.name) catch {
+        const name_copy = gpa.dupeSentinel(u8, entry.name, 0) catch {
             gpa.destroy(child);
             r.fail(error.OutOfMemory);
             break :scanning;

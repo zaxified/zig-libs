@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — Ported to Zig 0.17.0. Schema derivation iterates fields through `schema.fieldRecs` (0.17 struct-of-arrays `@typeInfo`); `FieldAttributes`/enum `mode` spellings; `wait4` status cast. `pb_fields` is still honoured when `pub` (probed with `@hasDecl`, pub-only in 0.17).
 - **2026-10-04** — **mvp → core** (reference: protocolbuffers/protobuf).
   - **New:** `oneof` — a `?U` field with `U` a `union(enum)` declaring its own `pb_fields`, entry
     `protobuf.oneof` in the message's `pb_fields`; set member always written; decode keeps the last

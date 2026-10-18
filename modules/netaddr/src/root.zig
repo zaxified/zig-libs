@@ -1889,14 +1889,14 @@ pub fn systemSource(dst: Ip) ?Ip {
     const port_discard = std.mem.nativeToBig(u16, 9); // any port works
     switch (dst) {
         .v4 => |q| {
-            var sa: linux.sockaddr.in = .{ .port = port_discard, .addr = @bitCast(q) };
+            var sa: linux.sockaddr.in = .{ .port = port_discard, .addr = std.mem.bytesToValue(u32, &q) }; // 0.17: bytes in memory order (an array @bitCast is LE-logical now)
             if (linux.errno(linux.connect(fd, @ptrCast(&sa), @sizeOf(linux.sockaddr.in))) != .SUCCESS)
                 return null;
             var out: linux.sockaddr.in = undefined;
             var len: linux.socklen_t = @sizeOf(linux.sockaddr.in);
             if (linux.errno(linux.getsockname(fd, @ptrCast(&out), &len)) != .SUCCESS)
                 return null;
-            return .{ .v4 = @bitCast(out.addr) };
+            return .{ .v4 = std.mem.toBytes(out.addr) };
         },
         .v6 => |b| {
             var sa: linux.sockaddr.in6 = .{ .port = port_discard, .flowinfo = 0, .addr = b, .scope_id = 0 };

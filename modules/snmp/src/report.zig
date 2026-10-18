@@ -261,9 +261,9 @@ test "isRecoverable: only unknownEngineIDs and notInTimeWindows" {
 test "toError maps every Reason to a distinct typed error" {
     // `toError` is exhaustive over `Reason` at compile time; check here that no
     // two reasons collapse onto the same error code.
-    const fields = @typeInfo(Reason).@"enum".fields;
-    var codes: [fields.len]anyerror = undefined;
-    inline for (fields, 0..) |f, i| codes[i] = toError(@field(Reason, f.name));
+    const names = @typeInfo(Reason).@"enum".field_names;
+    var codes: [names.len]anyerror = undefined;
+    inline for (names, 0..) |fname, i| codes[i] = toError(@field(Reason, fname));
     for (codes, 0..) |a, i| {
         for (codes[i + 1 ..]) |b| try testing.expect(a != b);
     }
@@ -365,7 +365,7 @@ test "classify: a malformed varbind list is a typed decode error, not a panic" {
     try e.prependInteger(ber.tag.integer, 0);
     try e.prependInteger(ber.tag.integer, 0);
     try e.prependInteger(ber.tag.integer, 1);
-    try e.wrap(@intFromEnum(message.PduType.report), 0);
+    try e.wrap(@backingInt(message.PduType.report), 0);
     const pdu_bytes = e.encoded();
 
     var d = ber.Decoder.init(pdu_bytes);

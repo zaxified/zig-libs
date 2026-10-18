@@ -233,7 +233,7 @@ const MergeBuf = struct {
 fn Lists(comptime T: type) type {
     comptime {
         const inf = schema.infos(T);
-        const Attrs = std.builtin.Type.StructField.Attributes;
+        const Attrs = std.lang.Type.Struct.FieldAttributes;
         var names: [inf.len + 1][]const u8 = undefined;
         var types: [inf.len + 1]type = undefined;
         var attrs: [inf.len + 1]Attrs = undefined;
@@ -311,7 +311,7 @@ fn emptyOneofBufPtr() *const anyopaque {
 
 fn unknownFieldName(comptime T: type) ?[]const u8 {
     @setEvalBranchQuota(20_000);
-    for (@typeInfo(T).@"struct".fields) |sf| {
+    for (schema.fieldRecs(@typeInfo(T).@"struct")) |sf| {
         if (sf.type == Unknown) return sf.name;
     }
     return null;
@@ -544,10 +544,10 @@ fn readValue(
         .bool => (try cur.varint()) != 0,
         .@"enum" => blk: {
             const raw: i32 = @bitCast(@as(u32, @truncate(try cur.varint())));
-            if (@typeInfo(E).@"enum".is_exhaustive) {
+            if (@typeInfo(E).@"enum".mode == .exhaustive) {
                 break :blk std.enums.fromInt(E, raw) orelse return error.InvalidEnumValue;
             }
-            break :blk @enumFromInt(raw);
+            break :blk @fromBackingInt(@intCast(raw));
         },
         .fixed32 => try cur.fixed32(),
         .sfixed32 => @bitCast(try cur.fixed32()),

@@ -202,9 +202,9 @@ test "property: bounded memory — Estimator holds no pointer/slice field" {
     // a pointer), by construction.
     comptime {
         const info = @typeInfo(Estimator).@"struct";
-        for (info.fields) |f| {
-            if (@typeInfo(f.type) == .pointer) {
-                @compileError("Estimator must not hold a pointer/slice field (unbounded-memory risk): " ++ f.name);
+        for (info.field_names, info.field_types) |fname, FT| {
+            if (@typeInfo(FT) == .pointer) {
+                @compileError("Estimator must not hold a pointer/slice field (unbounded-memory risk): " ++ fname);
             }
         }
     }

@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — Ported to Zig 0.17.0. Test "a failed split frees the fields it had already allocated": `fail_index` 2 -> 1, because the 0.17 testing allocator shrinks in place on `remap` so `toOwnedSlice` makes one allocation per field instead of two. Same scenario (failure on the second field), no library change.
 - **2026-10-09** — tests: deterministic fuzz driver `CSVSTREAM_FUZZ` over the existing harnesses.
 - **2026-10-05** — **BEHAVIOURAL: `SplitOptions.trailing_empty_field` is now ON by default.** `a,b,`
   splits into three fields (the last empty), as RFC 4180, Python's `csv` and Go's `encoding/csv` read

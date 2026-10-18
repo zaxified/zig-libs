@@ -212,13 +212,13 @@ pub fn from(arena: std.mem.Allocator, v: anytype) Error!Value {
         },
         .@"struct" => |s| blk: {
             if (s.is_tuple) {
-                var items = try arena.alloc(Value, s.fields.len);
-                inline for (s.fields, 0..) |f, i| items[i] = try from(arena, @field(v, f.name));
+                var items = try arena.alloc(Value, s.field_names.len);
+                inline for (s.field_names, 0..) |fname, i| items[i] = try from(arena, @field(v, fname));
                 break :blk .{ .tuple = items };
             }
-            var pairs = try arena.alloc(Pair, s.fields.len);
-            inline for (s.fields, 0..) |f, i| {
-                pairs[i] = .{ .key = Value.str(f.name), .value = try from(arena, @field(v, f.name)) };
+            var pairs = try arena.alloc(Pair, s.field_names.len);
+            inline for (s.field_names, 0..) |fname, i| {
+                pairs[i] = .{ .key = Value.str(fname), .value = try from(arena, @field(v, fname)) };
             }
             break :blk .{ .map = .{ .pairs = pairs } };
         },

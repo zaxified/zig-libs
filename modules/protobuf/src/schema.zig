@@ -35,6 +35,27 @@
 
 const std = @import("std");
 
+/// Zig 0.17 `@typeInfo` is struct-of-arrays (no `.fields`); this rebuilds the per-field
+/// records (`name`, `type`, `default_value_ptr`) that the derivation code iterates.
+pub const FieldRec = struct {
+    name: [:0]const u8,
+    type: type,
+    default_value_ptr: ?*const anyopaque,
+};
+
+pub fn fieldRecs(comptime info: anytype) [info.field_names.len]FieldRec {
+    var out: [info.field_names.len]FieldRec = undefined;
+    for (info.field_names, info.field_types, 0..) |n, t, i| {
+        const a = info.field_attrs[i];
+        out[i] = .{
+            .name = n,
+            .type = t,
+            .default_value_ptr = if (@hasField(@TypeOf(a), "default_value_ptr")) a.default_value_ptr else null,
+        };
+    }
+    return out;
+}
+
 /// Protobuf scalar/composite types. Names match the `.proto` language so a
 /// struct can be read against a published schema line by line.
 pub const Kind = enum {
@@ -148,7 +169,7 @@ fn defaultOf(comptime kind: Kind, comptime T: type) T {
     return switch (kind) {
         .string, .bytes => "",
         .bool => false,
-        .@"enum" => @enumFromInt(0),
+        .@"enum" => @fromBackingInt(@intCast(0)),
         .message => .{},
         .float, .double => 0.0,
         else => 0,
@@ -210,7 +231,7 @@ fn oneofMembers(comptime Desc: type, comptime struct_fields: anytype) usize {
     for (struct_fields) |sf| {
         if (@hasField(Desc, sf.name) and @FieldType(Desc, sf.name) == Oneof) {
             const U = @typeInfo(sf.type).optional.child;
-            n += @typeInfo(U).@"union".fields.len;
+            n += @typeInfo(U).@"union".field_names.len;
         }
     }
     return n;
@@ -235,8 +256,8 @@ fn infosImpl(comptime T: type) []const Info {
             @compileError("protobuf: " ++ typeName(T) ++ " has no `pub const pb_fields`");
 
         const Desc = @TypeOf(T.pb_fields);
-        const desc_fields = @typeInfo(Desc).@"struct".fields;
-        const struct_fields = @typeInfo(T).@"struct".fields;
+        const desc_fields = fieldRecs(@typeInfo(Desc).@"struct");
+        const struct_fields = fieldRecs(@typeInfo(T).@"struct");
 
         var out: [desc_fields.len + oneofMembers(Desc, struct_fields)]Info = undefined;
         var n: usize = 0;
@@ -266,7 +287,7 @@ fn infosImpl(comptime T: type) []const Info {
                 const U = ti.optional.child;
                 if (!@hasDecl(U, "pb_fields"))
                     @compileError(where ++ ": the oneof union " ++ typeName(U) ++ " has no `pub const pb_fields`");
-                for (@typeInfo(U).@"union".fields) |uf| {
+                for (fieldRecs(@typeInfo(U).@"union")) |uf| {
                     if (!@hasField(@TypeOf(U.pb_fields), uf.name))
                         @compileError(where ++ ": oneof member ." ++ uf.name ++ " has no pb_fields entry");
                     const md: Field = @field(U.pb_fields, uf.name);

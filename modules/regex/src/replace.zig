@@ -251,8 +251,8 @@ pub fn prefixInto(insts: []const syntax.Inst, ranges: []const syntax.Range, buf:
 
 /// `literalPrefix` over a program, writing through `sink.put` (false: stop).
 fn walkPrefix(insts: []const syntax.Inst, ranges: []const syntax.Range, sink: anytype) !bool {
-    var cur: std.StaticBitSet(root.max_insts) = .initEmpty();
-    var nxt: std.StaticBitSet(root.max_insts) = .initEmpty();
+    var cur: std.StaticBitSet(root.max_insts) = .empty;
+    var nxt: std.StaticBitSet(root.max_insts) = .empty;
     var complete = true;
     var stopped = false;
     // At the start: `\A` may be passed.
@@ -290,7 +290,7 @@ fn walkPrefix(insts: []const syntax.Inst, ranges: []const syntax.Range, sink: an
         const cp = if (single.? >= 0xd800 and single.? <= 0xdfff) 0xfffd else single.?;
         const n = std.unicode.utf8Encode(cp, &buf) catch unreachable;
         if (!try sink.put(buf[0..n])) return false;
-        nxt = .initEmpty();
+        nxt = .empty;
         var it3 = cur.iterator(.{});
         while (it3.next()) |pc| reach(insts, &nxt, @intCast(pc + 1), false, &complete, &stopped);
         std.mem.swap(std.StaticBitSet(root.max_insts), &cur, &nxt);
@@ -302,7 +302,7 @@ fn walkPrefix(insts: []const syntax.Inst, ranges: []const syntax.Range, sink: an
 /// without consuming. An assertion stops the prefix (`stopped`), except `\A`
 /// at the start, which only makes it incomplete.
 fn reach(insts: []const syntax.Inst, set: *std.StaticBitSet(root.max_insts), pc0: u16, at_start: bool, complete: *bool, stopped: *bool) void {
-    var seen: std.StaticBitSet(root.max_insts) = .initEmpty();
+    var seen: std.StaticBitSet(root.max_insts) = .empty;
     var stack: [2 * root.max_insts]u16 = undefined;
     var sp: usize = 1;
     stack[0] = pc0;

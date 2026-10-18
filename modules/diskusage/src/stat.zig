@@ -609,8 +609,10 @@ fn fstatatAt(dirfd: i32, basename: [*:0]const u8) StatError!FileStat {
         inline else => |f| {
             const T = comptime familyStruct(f);
             var raw: T = std.mem.zeroes(T);
+            // zig 0.17 renamed this entry `newfstatat` on the 64-bit tables (same number).
+            const nr: linux.SYS = if (@hasField(linux.SYS, "newfstatat")) .newfstatat else .fstatat64;
             const rc = linux.syscall4(
-                .fstatat64,
+                nr,
                 @as(usize, @bitCast(@as(isize, dirfd))),
                 @intFromPtr(basename),
                 @intFromPtr(&raw),

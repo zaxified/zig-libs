@@ -213,7 +213,7 @@ pub const Cursor = struct {
         const number: u64 = raw >> 3;
         if (number == 0) return error.FieldNumberZero;
         if (number > std.math.maxInt(u29)) return error.FieldNumberOutOfRange;
-        const wire: WireType = @enumFromInt(@as(u3, @truncate(raw)));
+        const wire: WireType = @fromBackingInt(@intCast(@as(u3, @truncate(raw))));
         switch (wire) {
             .varint, .i64, .len, .i32 => {},
             .sgroup, .egroup => return error.UnsupportedWireType,
@@ -285,7 +285,7 @@ pub const Emitter = struct {
     }
 
     pub fn tag(self: *Emitter, number: u32, wire: WireType) void {
-        self.varint((@as(u64, number) << 3) | @intFromEnum(wire));
+        self.varint((@as(u64, number) << 3) | @backingInt(wire));
     }
 
     pub fn fixed32(self: *Emitter, value: u32) void {
@@ -302,7 +302,7 @@ pub const Emitter = struct {
 };
 
 pub fn tagLen(number: u32, wire: WireType) usize {
-    return varintLen((@as(u64, number) << 3) | @intFromEnum(wire));
+    return varintLen((@as(u64, number) << 3) | @backingInt(wire));
 }
 
 // ── tests ───────────────────────────────────────────────────────────────────
@@ -477,7 +477,7 @@ test "Emitter aborts with its own message on overflow, in every build mode (F8)"
         _ = std.os.linux.close(fds[0]);
 
         var status: u32 = 0;
-        _ = std.os.linux.wait4(@intCast(pid), &status, 0, null);
+        _ = std.os.linux.wait4(@intCast(pid), @ptrCast(&status), 0, null);
         const sig = status & 0x7f;
         const exit_code = (status >> 8) & 0xff;
         if (sig != 6) {

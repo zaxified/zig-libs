@@ -1122,7 +1122,7 @@ pub fn packDirToPath(io: std.Io, gpa: Allocator, roots: []const []const u8, out_
 fn emitPath(io: std.Io, tw: Writer, fs_path: []const u8, tar_name: []const u8, stats: *PackStats) PackDirError!void {
     const linux = std.os.linux;
     var pathz: [std.fs.max_path_bytes]u8 = undefined;
-    const pz = std.fmt.bufPrintZ(&pathz, "{s}", .{fs_path}) catch return error.PathTooLong;
+    const pz = std.fmt.bufPrintSentinel(&pathz, "{s}", .{fs_path}, 0) catch return error.PathTooLong;
 
     var stx: linux.Statx = undefined;
     if (linux.errno(linux.statx(linux.AT.FDCWD, pz, linux.AT.SYMLINK_NOFOLLOW, linux.STATX.BASIC_STATS, &stx)) != .SUCCESS)

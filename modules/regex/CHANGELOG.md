@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — Ported to Zig 0.17.0. `StaticBitSet` `.initEmpty()` becomes `.empty`; the vector-of-bool `@bitCast` in `findLiteral` is unchanged (bit i = lane i, verified by the existing tests).
 - **2026-10-07** — Instrument: `tools/bench.zig` + `tools/go_bench/` (`zig build
   bench-regex`), the comparative benchmark against Go `regexp` behind the maturity
   card's `**Performance:**` line: 18 workloads, result counts checked against Go;

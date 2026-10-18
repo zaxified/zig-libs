@@ -680,14 +680,14 @@ fn findLiteral(input: []const u8, pos: usize, lit: []const u8) ?usize {
 /// as) is given up.
 fn analyze(insts: []const Inst, ranges: []const Range) Prefilter {
     var pf: Prefilter = .{};
-    var seen: std.StaticBitSet(max_insts) = .initEmpty();
+    var seen: std.StaticBitSet(max_insts) = .empty;
     var stack: [2 * max_insts]u16 = undefined;
     var set: [4]u64 = .{ 0, 0, 0, 0 };
     var any_first = false; // a `.`, an empty match, or U+FFFD: no byte set
     var unanchored = false; // a consuming state or the match before any `\A`
     // Two walks: with `\A` as a wall (anchoring), and through it (first bytes).
     for ([_]bool{ true, false }) |wall| {
-        seen = .initEmpty();
+        seen = .empty;
         var sp: usize = 1;
         stack[0] = 0;
         while (sp != 0) {

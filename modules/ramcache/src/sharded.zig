@@ -1124,16 +1124,16 @@ test "stats() aggregates EVERY Stats field, pinned included" {
     var sum: Stats = .{};
     for (sc.shards) |*sh| {
         const st = sh.cache.stats;
-        inline for (@typeInfo(Stats).@"struct".fields) |f| {
-            @field(sum, f.name) += @field(st, f.name);
+        inline for (@typeInfo(Stats).@"struct".field_names) |fname| {
+            @field(sum, fname) += @field(st, fname);
         }
     }
     const agg = sc.stats();
     // Reflective, so a field added to `Stats` tomorrow cannot be dropped from
     // the aggregator the way `pinned` was — the test enumerates the struct
     // rather than a hand-written list that has to be remembered.
-    inline for (@typeInfo(Stats).@"struct".fields) |f| {
-        try testing.expectEqual(@field(sum, f.name), @field(agg, f.name));
+    inline for (@typeInfo(Stats).@"struct".field_names) |fname| {
+        try testing.expectEqual(@field(sum, fname), @field(agg, fname));
     }
     try testing.expectEqual(@as(usize, 1), agg.pinned); // not vacuous
     try testing.expectEqual(@as(usize, 64), agg.entries);
@@ -1810,8 +1810,8 @@ test "stats() sums admissions, rejections, expired and evictions too -- with non
     var sum: Stats = .{};
     for (sc.shards) |*sh| {
         const st = sh.cache.stats;
-        inline for (@typeInfo(Stats).@"struct".fields) |f| {
-            @field(sum, f.name) += @field(st, f.name);
+        inline for (@typeInfo(Stats).@"struct".field_names) |fname| {
+            @field(sum, fname) += @field(st, fname);
         }
     }
     const agg = sc.stats();
@@ -1821,8 +1821,8 @@ test "stats() sums admissions, rejections, expired and evictions too -- with non
     try testing.expect(agg.evictions > 0);
     try testing.expect(agg.rehashes > 0); // the field the aggregator once dropped
     try testing.expect(agg.entries > 0 and agg.bytes > 0);
-    inline for (@typeInfo(Stats).@"struct".fields) |f| {
-        try testing.expectEqual(@field(sum, f.name), @field(agg, f.name));
+    inline for (@typeInfo(Stats).@"struct".field_names) |fname| {
+        try testing.expectEqual(@field(sum, fname), @field(agg, fname));
     }
 }
 

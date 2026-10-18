@@ -48,6 +48,34 @@
 
 const std = @import("std");
 const root = @import("root.zig");
+
+/// Zig 0.17 `@typeInfo` is struct-of-arrays (no `.fields`); this rebuilds the per-field
+/// records (`name`, `type`, `is_comptime`, `defaultValue()`) that the code below iterates.
+const FieldRec = struct {
+    name: [:0]const u8,
+    type: type,
+    is_comptime: bool,
+    default_value_ptr: ?*const anyopaque,
+
+    fn defaultValue(comptime f: FieldRec) ?f.type {
+        const dp: *const f.type = @ptrCast(@alignCast(f.default_value_ptr orelse return null));
+        return dp.*;
+    }
+};
+
+fn fieldRecs(comptime info: anytype) [info.field_names.len]FieldRec {
+    var out: [info.field_names.len]FieldRec = undefined;
+    for (info.field_names, info.field_types, 0..) |n, t, i| {
+        const a = info.field_attrs[i];
+        out[i] = .{
+            .name = n,
+            .type = t,
+            .is_comptime = if (@hasField(@TypeOf(a), "comptime")) a.@"comptime" else false,
+            .default_value_ptr = if (@hasField(@TypeOf(a), "default_value_ptr")) a.default_value_ptr else null,
+        };
+    }
+    return out;
+}
 const Value = root.Value;
 const MapEntry = root.MapEntry;
 const Allocator = std.mem.Allocator;
@@ -261,7 +289,7 @@ fn valueInto(comptime T: type, comptime as_bytes: bool, arena: Allocator, v: Val
                         .text => |t| if (!as_bytes) t else return error.WrongType,
                         else => return error.WrongType,
                     };
-                    if (info.is_const) return s;
+                    if (info.attrs.@"const") return s;
                     try charge(budget, 1, s.len);
                     return try arena.dupe(u8, s);
                 }
@@ -282,9 +310,9 @@ fn valueInto(comptime T: type, comptime as_bytes: bool, arena: Allocator, v: Val
                     .array => |a| a,
                     else => return error.WrongType,
                 };
-                if (items.len != info.fields.len) return error.LengthMismatch;
+                if (items.len != info.field_names.len) return error.LengthMismatch;
                 var out: T = undefined;
-                inline for (info.fields, 0..) |f, i| out[i] = try valueInto(f.type, false, arena, items[i], options, budget);
+                inline for (fieldRecs(info), 0..) |f, i| out[i] = try valueInto(f.type, false, arena, items[i], options, budget);
                 return out;
             }
             const entries = switch (v) {
@@ -292,10 +320,10 @@ fn valueInto(comptime T: type, comptime as_bytes: bool, arena: Allocator, v: Val
                 else => return error.WrongType,
             };
             var out: T = undefined;
-            var seen: [info.fields.len]bool = @splat(false);
+            var seen: [info.field_names.len]bool = @splat(false);
             for (entries) |e| {
                 var matched = false;
-                inline for (info.fields, 0..) |f, i| {
+                inline for (fieldRecs(info), 0..) |f, i| {
                     if (!f.is_comptime and !matched and keyMatches(e.key, comptime fieldKey(T, f.name))) {
                         if (seen[i]) return error.DuplicateField;
                         seen[i] = true;
@@ -305,7 +333,7 @@ fn valueInto(comptime T: type, comptime as_bytes: bool, arena: Allocator, v: Val
                 }
                 if (!matched and !options.ignore_unknown_fields) return error.UnknownField;
             }
-            inline for (info.fields, 0..) |f, i| {
+            inline for (fieldRecs(info), 0..) |f, i| {
                 if (!f.is_comptime and !seen[i]) {
                     if (f.defaultValue()) |d| {
                         @field(out, f.name) = d;
@@ -324,7 +352,7 @@ fn valueInto(comptime T: type, comptime as_bytes: bool, arena: Allocator, v: Val
             };
             if (entries.len != 1) return error.WrongType;
             const e = entries[0];
-            inline for (info.fields) |f| {
+            inline for (fieldRecs(info)) |f| {
                 if (keyMatches(e.key, comptime fieldKey(T, f.name))) {
                     const payload = try valueInto(f.type, comptime fieldIsBytes(T, f.name), arena, e.value, options, budget);
                     return @unionInit(T, f.name, payload);
@@ -361,7 +389,7 @@ fn valueFrom(comptime T: type, comptime as_bytes: bool, arena: Allocator, x: T) 
         },
         .comptime_float => return .{ .f64 = x },
         .optional => |info| return if (x) |c| valueFrom(info.child, as_bytes, arena, c) else .null_value,
-        .@"enum" => return intValue(@intFromEnum(x)),
+        .@"enum" => return intValue(@backingInt(x)),
         .enum_literal => return .{ .text = @tagName(x) },
         .array => |info| {
             if (info.child == u8) return .{ .bytes = try arena.dupe(u8, &x) };
@@ -388,17 +416,17 @@ fn valueFrom(comptime T: type, comptime as_bytes: bool, arena: Allocator, x: T) 
         },
         .@"struct" => |info| {
             if (info.is_tuple) {
-                const out = try arena.alloc(Value, info.fields.len);
-                inline for (info.fields, 0..) |f, i| out[i] = try valueFrom(f.type, false, arena, x[i]);
+                const out = try arena.alloc(Value, info.field_names.len);
+                inline for (fieldRecs(info), 0..) |f, i| out[i] = try valueFrom(f.type, false, arena, x[i]);
                 return .{ .array = out };
             }
             var n: usize = 0;
-            inline for (info.fields) |f| {
+            inline for (fieldRecs(info)) |f| {
                 if (!isNull(@field(x, f.name))) n += 1;
             }
             const out = try arena.alloc(MapEntry, n);
             var i: usize = 0;
-            inline for (info.fields) |f| {
+            inline for (fieldRecs(info)) |f| {
                 const fv = @field(x, f.name);
                 if (!isNull(fv)) {
                     out[i] = .{

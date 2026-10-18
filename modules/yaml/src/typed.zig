@@ -38,6 +38,34 @@
 
 const std = @import("std");
 const compose = @import("compose.zig");
+
+/// Zig 0.17 `@typeInfo` is struct-of-arrays (no `.fields`); this rebuilds the per-field
+/// records (`name`, `type`, `is_comptime`, `defaultValue()`) that the code below iterates.
+const FieldRec = struct {
+    name: [:0]const u8,
+    type: type,
+    is_comptime: bool,
+    default_value_ptr: ?*const anyopaque,
+
+    fn defaultValue(comptime f: FieldRec) ?f.type {
+        const dp: *const f.type = @ptrCast(@alignCast(f.default_value_ptr orelse return null));
+        return dp.*;
+    }
+};
+
+fn fieldRecs(comptime info: anytype) [info.field_names.len]FieldRec {
+    var out: [info.field_names.len]FieldRec = undefined;
+    for (info.field_names, info.field_types, 0..) |n, t, i| {
+        const a = info.field_attrs[i];
+        out[i] = .{
+            .name = n,
+            .type = t,
+            .is_comptime = if (@hasField(@TypeOf(a), "comptime")) a.@"comptime" else false,
+            .default_value_ptr = if (@hasField(@TypeOf(a), "default_value_ptr")) a.default_value_ptr else null,
+        };
+    }
+    return out;
+}
 const Value = compose.Value;
 const Pair = compose.Pair;
 const Allocator = std.mem.Allocator;
@@ -162,7 +190,7 @@ fn into(comptime T: type, arena: Allocator, v: Value, options: Options, budget: 
                         .string => |s| s,
                         else => return error.WrongType,
                     };
-                    if (info.is_const) return s;
+                    if (info.attrs.@"const") return s;
                     try charge(budget, 1, s.len);
                     return try arena.dupe(u8, s);
                 }
@@ -183,9 +211,9 @@ fn into(comptime T: type, arena: Allocator, v: Value, options: Options, budget: 
                     .sequence => |s| s,
                     else => return error.WrongType,
                 };
-                if (items.len != info.fields.len) return error.LengthMismatch;
+                if (items.len != info.field_names.len) return error.LengthMismatch;
                 var out: T = undefined;
-                inline for (info.fields, 0..) |f, i| out[i] = try into(f.type, arena, items[i], options, budget);
+                inline for (fieldRecs(info), 0..) |f, i| out[i] = try into(f.type, arena, items[i], options, budget);
                 return out;
             }
             const pairs = switch (v) {
@@ -194,7 +222,7 @@ fn into(comptime T: type, arena: Allocator, v: Value, options: Options, budget: 
                 else => return error.WrongType,
             };
             var out: T = undefined;
-            var seen: [info.fields.len]bool = @splat(false);
+            var seen: [info.field_names.len]bool = @splat(false);
             for (pairs) |p| {
                 const k = switch (p.key) {
                     .string => |s| s,
@@ -204,7 +232,7 @@ fn into(comptime T: type, arena: Allocator, v: Value, options: Options, budget: 
                     },
                 };
                 var matched = false;
-                inline for (info.fields, 0..) |f, i| {
+                inline for (fieldRecs(info), 0..) |f, i| {
                     if (!f.is_comptime and !matched and std.mem.eql(u8, k, comptime keyName(T, f.name))) {
                         if (seen[i]) return error.DuplicateField;
                         seen[i] = true;
@@ -214,7 +242,7 @@ fn into(comptime T: type, arena: Allocator, v: Value, options: Options, budget: 
                 }
                 if (!matched and !options.ignore_unknown_fields) return error.UnknownField;
             }
-            inline for (info.fields, 0..) |f, i| {
+            inline for (fieldRecs(info), 0..) |f, i| {
                 if (!f.is_comptime and !seen[i]) {
                     if (f.defaultValue()) |d| {
                         @field(out, f.name) = d;
@@ -228,11 +256,11 @@ fn into(comptime T: type, arena: Allocator, v: Value, options: Options, budget: 
         .@"union" => |info| {
             if (info.tag_type == null) @compileError("yaml.typed: only tagged unions are mapped");
             switch (v) {
-                .string => |s| inline for (info.fields) |f| {
+                .string => |s| inline for (fieldRecs(info)) |f| {
                     if (f.type == void and std.mem.eql(u8, s, f.name)) return @unionInit(T, f.name, {});
                 },
                 .mapping => |m| if (m.len == 1 and m[0].key == .string) {
-                    inline for (info.fields) |f| {
+                    inline for (fieldRecs(info)) |f| {
                         if (std.mem.eql(u8, m[0].key.string, f.name))
                             return @unionInit(T, f.name, try into(f.type, arena, m[0].value, options, budget));
                     }
@@ -297,17 +325,17 @@ fn from(comptime T: type, arena: Allocator, x: T) Allocator.Error!Value {
         },
         .@"struct" => |info| {
             if (info.is_tuple) {
-                const out = try arena.alloc(Value, info.fields.len);
-                inline for (info.fields, 0..) |f, i| out[i] = try from(f.type, arena, x[i]);
+                const out = try arena.alloc(Value, info.field_names.len);
+                inline for (fieldRecs(info), 0..) |f, i| out[i] = try from(f.type, arena, x[i]);
                 return .{ .sequence = out };
             }
             var n: usize = 0;
-            inline for (info.fields) |f| {
+            inline for (fieldRecs(info)) |f| {
                 if (!isNull(@field(x, f.name))) n += 1;
             }
             const out = try arena.alloc(Pair, n);
             var i: usize = 0;
-            inline for (info.fields) |f| {
+            inline for (fieldRecs(info)) |f| {
                 const fv = @field(x, f.name);
                 if (!isNull(fv)) {
                     out[i] = .{ .key = .{ .string = comptime keyName(T, f.name) }, .value = try from(f.type, arena, fv) };

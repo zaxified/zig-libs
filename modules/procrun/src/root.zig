@@ -392,7 +392,7 @@ pub fn waitTolerant(io: std.Io, child: *std.process.Child) Term {
 
 fn reapTolerantPosix(pid: std.posix.pid_t) Term {
     const posix = std.posix;
-    var status: if (builtin.link_libc) c_int else u32 = undefined;
+    var status: if (builtin.link_libc) c_int else i32 = undefined;
     if (have_wait4) {
         while (true) switch (posix.errno(posix.system.wait4(pid, &status, 0, null))) {
             .SUCCESS => return statusToTerm(@bitCast(status)),
@@ -440,7 +440,7 @@ fn deliver(child: *std.process.Child, kind: SigKind, raw: u8) void {
             const sig: std.posix.SIG = switch (kind) {
                 .term => .TERM,
                 .kill => .KILL,
-                .raw => @enumFromInt(raw),
+                .raw => @fromBackingInt(@intCast(raw)),
             };
             if (!stillOurChild(id)) return; // see `stillOurChild`
             std.posix.kill(id, sig) catch {};
@@ -497,7 +497,7 @@ fn deliverGroup(child: *std.process.Child, kind: SigKind, raw: u8, grouped: bool
             const sig: std.posix.SIG = switch (kind) {
                 .term => .TERM,
                 .kill => .KILL,
-                .raw => @enumFromInt(raw),
+                .raw => @fromBackingInt(@intCast(raw)),
             };
             if (!stillOurChild(id)) return; // see `stillOurChild`
             std.posix.kill(-id, sig) catch {};
@@ -720,7 +720,7 @@ fn resolveArgv0ForRlimit(gpa: std.mem.Allocator, io: std.Io, argv0: []const u8) 
     var it = std.mem.tokenizeScalar(u8, path_var, ':');
     while (it.next()) |dir| {
         var buf: [std.Io.Dir.max_path_bytes:0]u8 = undefined;
-        const candidate = std.fmt.bufPrintZ(&buf, "{s}/{s}", .{ dir, argv0 }) catch continue;
+        const candidate = std.fmt.bufPrintSentinel(&buf, "{s}/{s}", .{ dir, argv0 }, 0) catch continue;
         const rc = std.os.linux.access(candidate, std.posix.X_OK);
         if (std.posix.errno(rc) != .SUCCESS) continue;
         return try gpa.dupe(u8, candidate);
@@ -2540,7 +2540,7 @@ test "waitTolerant: ECHILD after out-of-band reap yields .unknown (no panic)" {
     // BEFORE procrun gets to wait. This is the exact condition std's
     // Child.wait panics on.
     const pid = child.id.?;
-    var status: if (builtin.link_libc) c_int else u32 = undefined;
+    var status: if (builtin.link_libc) c_int else i32 = undefined;
     while (true) {
         const rc = std.posix.system.wait4(pid, &status, 0, null);
         if (std.posix.errno(rc) == .INTR) continue;
@@ -2572,10 +2572,10 @@ test "statusToTerm: decodes every wait-status shape from raw bits" {
         try testing.expectEqual(Term{ .exited = 7 }, statusToTerm(7 << 8));
 
         // WIFSIGNALED: low 7 bits carry the signal, top bit is the core-dump flag.
-        try testing.expectEqual(Term{ .signal = posix.SIG.KILL }, statusToTerm(@intFromEnum(posix.SIG.KILL)));
+        try testing.expectEqual(Term{ .signal = posix.SIG.KILL }, statusToTerm(@backingInt(posix.SIG.KILL)));
 
         // WIFSTOPPED: low byte exactly 0x7f, stop signal in bits 8-15.
-        const stopped_status: u32 = 0x7f | (@as(u32, @intFromEnum(posix.SIG.STOP)) << 8);
+        const stopped_status: u32 = 0x7f | (@as(u32, @backingInt(posix.SIG.STOP)) << 8);
         try testing.expectEqual(Term{ .stopped = posix.SIG.STOP }, statusToTerm(stopped_status));
 
         // None of IFEXITED/IFSIGNALED/IFSTOPPED match this status word: falls
@@ -2702,7 +2702,7 @@ test "run: merge env actually INHERITS the parent's variables" {
 /// test flaky against reaper-thread timing).
 fn procStatState(pid: std.posix.pid_t) ?u8 {
     var path_buf: [64:0]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&path_buf, "/proc/{d}/stat", .{pid}) catch return null;
+    const path = std.fmt.bufPrintSentinel(&path_buf, "/proc/{d}/stat", .{pid}, 0) catch return null;
 
     // Deliberately raw syscalls with a manual `errno` switch (not
     // `Io.Dir`/`Io.File`, and not even the higher-level `std.posix.openatZ`/
@@ -3190,7 +3190,7 @@ test "a pid reaped out-of-band is not signalled: stillOurChild is the gate" {
 
     // Kill it for real and let a sibling-style reaper take the status.
     deliver(&child, .kill, 0);
-    var status: if (builtin.link_libc) c_int else u32 = undefined;
+    var status: if (builtin.link_libc) c_int else i32 = undefined;
     while (true) {
         const rc = std.posix.system.wait4(pid, &status, 0, null);
         if (std.posix.errno(rc) == .INTR) continue;

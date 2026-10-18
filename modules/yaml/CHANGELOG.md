@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — Ported to Zig 0.17.0. `typed.zig` iterates struct fields through a small `fieldRecs` shim over the 0.17 struct-of-arrays `@typeInfo`. `yaml_keys` is still honoured when `pub` (probed with `@hasDecl`, pub-only in 0.17).
 - **2026-10-04** — **mvp → core** (reference: libyaml 0.2.5 / libfyaml 1.0).
   - **New: emitter** (`emit.zig`: `stringify`, `writeValue`, `writeAll`, `emit.isSafePlain`) —
     output that composes back to the same `Value` under YAML 1.2 core and under PyYAML (1.1);

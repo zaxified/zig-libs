@@ -865,8 +865,8 @@ pub fn buildBrportRequest(
 }
 
 fn hasBrportOptions(c: BrportChange) bool {
-    inline for (@typeInfo(BrportChange).@"struct".fields) |f| {
-        if (@field(c, f.name) != null) return true;
+    inline for (@typeInfo(BrportChange).@"struct".field_names) |name| {
+        if (@field(c, name) != null) return true;
     }
     return false;
 }

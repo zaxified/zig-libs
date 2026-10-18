@@ -1328,9 +1328,9 @@ test "the privacy salt never repeats across real authPriv requests" {
 
 test "SaltSeed: exactly two arms, production and test are distinct, and nothing else is admitted" {
     const info = @typeInfo(SaltSeed).@"union";
-    try testing.expectEqual(@as(usize, 2), info.fields.len);
-    try testing.expectEqualStrings("csprng", info.fields[0].name);
-    try testing.expectEqualStrings("fixed_for_test", info.fields[1].name);
+    try testing.expectEqual(@as(usize, 2), info.field_names.len);
+    try testing.expectEqualStrings("csprng", info.field_names[0]);
+    try testing.expectEqualStrings("fixed_for_test", info.field_names[1]);
 
     // Same 64 bits, different claim about where they came from — the whole
     // point of the type is that these are not the same value.

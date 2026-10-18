@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — Ported to Zig 0.17.0. Tests: `comptime std.meta.fieldNames(..)` (now returns a slice), enum `field_names`/`field_values`.
 - **2026-10-09** — docs: ct axis recorded as n/a: no auth token, key or crypto; `looksLikeSecretField` checks schema field names only (code review).
 - **2026-10-09** — tests: deterministic fuzz driver `MCP_FUZZ` over the existing harnesses (`handleMessage` on arbitrary and on damaged corpus lines, client responses).
 

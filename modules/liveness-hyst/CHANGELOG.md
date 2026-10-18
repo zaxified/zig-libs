@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — Ported to Zig 0.17.0. Comptime bounded-memory check iterates `field_names`/`field_types` (0.17 `@typeInfo`).
 - **2026-10-06** — FIXED (review of PR #4): `Selector.update` with a `now` behind the
   challenger's start no longer traps (safe modes) or switches at once (ReleaseFast, wrapped
   subtraction); elapsed hold saturates at 0, so a clock that steps back only delays a switch.

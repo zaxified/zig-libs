@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — Ported to Zig 0.17.0. `dupeDeep` iterates `field_names`/`field_types` (0.17 `@typeInfo`).
 - **2026-10-10** — tests: deterministic fuzz driver `IMAP_FUZZ` over the existing harnesses (utf7 decode, command builders, SEARCH and FETCH encoders with CR/LF/NUL/quote bytes injected, response reader); reach labels count real outcomes. No code or API change.
 - **2026-10-05** — Mutation run: 38 of 40 killed, 2 equivalent; 8 tests added
   and 5 extended (literal ceilings at their value and the per-line reset, an

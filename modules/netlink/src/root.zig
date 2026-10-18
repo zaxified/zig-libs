@@ -4517,8 +4517,9 @@ fn netnsStep(name: []const u8) void {
 fn errnoName(code: i32) []const u8 {
     if (code >= 0 or code == std.math.minInt(i32)) return "-";
     const n: u32 = @intCast(-code);
-    inline for (@typeInfo(linux.E).@"enum".fields) |f| {
-        if (f.value == n) return f.name;
+    const info = @typeInfo(linux.E).@"enum";
+    inline for (info.field_names, info.field_values) |name, value| {
+        if (value == n) return name;
     }
     return "?";
 }
@@ -4586,7 +4587,7 @@ test "integration (netns): link/address/route/neighbor write→read round-trip" 
     const pid: i32 = @intCast(rc);
     var status: u32 = 0;
     while (true) {
-        const wrc = linux.waitpid(pid, &status, 0);
+        const wrc = linux.waitpid(pid, @ptrCast(&status), 0);
         switch (linux.errno(wrc)) {
             .SUCCESS => break,
             .INTR => continue,
@@ -4889,7 +4890,7 @@ test "integration (netns): bridge/FDB/VLAN/brport write→read round-trip" {
     const pid: i32 = @intCast(rc);
     var status: u32 = 0;
     while (true) {
-        const wrc = linux.waitpid(pid, &status, 0);
+        const wrc = linux.waitpid(pid, @ptrCast(&status), 0);
         switch (linux.errno(wrc)) {
             .SUCCESS => break,
             .INTR => continue,
@@ -5694,7 +5695,7 @@ test "integration (netns): veth/vlan kind data, rules, lo stats and link events"
     const pid: i32 = @intCast(rc);
     var status: u32 = 0;
     while (true) {
-        const wrc = linux.waitpid(pid, &status, 0);
+        const wrc = linux.waitpid(pid, @ptrCast(&status), 0);
         switch (linux.errno(wrc)) {
             .SUCCESS => break,
             .INTR => continue,
@@ -5813,7 +5814,7 @@ fn netnsCoreOn(nl: *Socket) !void {
         if (linux.errno(fd_rc) != .SUCCESS) return error.TestUdpSocket;
         const fd: i32 = @intCast(fd_rc);
         defer _ = linux.close(fd);
-        var sa: linux.sockaddr.in = .{ .port = std.mem.nativeToBig(u16, 9), .addr = @bitCast([4]u8{ 127, 0, 0, 1 }) };
+        var sa: linux.sockaddr.in = .{ .port = std.mem.nativeToBig(u16, 9), .addr = std.mem.bytesToValue(u32, &[4]u8{ 127, 0, 0, 1 }) };
         if (linux.errno(linux.sendto(fd, "x", 1, 0, @ptrCast(&sa), @sizeOf(linux.sockaddr.in))) != .SUCCESS)
             return error.TestUdpSend;
     }

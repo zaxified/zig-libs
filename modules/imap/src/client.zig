@@ -61,7 +61,7 @@ fn dupeDeep(comptime T: type, gpa: Allocator, v: T) Allocator.Error!T {
         .optional => |o| return if (v) |x| try dupeDeep(o.child, gpa, x) else null,
         .@"struct" => |s| {
             var out: T = v;
-            inline for (s.fields) |f| @field(out, f.name) = try dupeDeep(f.type, gpa, @field(v, f.name));
+            inline for (s.field_names, s.field_types) |fname, FT| @field(out, fname) = try dupeDeep(FT, gpa, @field(v, fname));
             return out;
         },
         .@"union" => switch (v) {

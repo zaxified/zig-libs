@@ -437,7 +437,7 @@ fn varintOf(comptime kind: Kind, comptime E: type, elem: E) u64 {
         .sint32 => wire.zigzagEncode(@as(i64, elem)),
         .sint64 => wire.zigzagEncode(elem),
         .bool => @intFromBool(elem),
-        .@"enum" => wire.signExtend(@as(i64, @intFromEnum(elem))),
+        .@"enum" => wire.signExtend(@as(i64, @backingInt(elem))),
         else => comptime unreachable,
     };
 }
@@ -449,14 +449,14 @@ fn isDefault(comptime kind: Kind, comptime E: type, elem: E) bool {
     return switch (kind) {
         .string, .bytes => elem.len == 0,
         .bool => !elem,
-        .@"enum" => @intFromEnum(elem) == 0,
+        .@"enum" => @backingInt(elem) == 0,
         .message => comptime unreachable, // singular message is always optional
         else => elem == 0,
     };
 }
 
 fn unknownOf(comptime T: type, value: T) Unknown {
-    inline for (@typeInfo(T).@"struct".fields) |sf| {
+    inline for (schema.fieldRecs(@typeInfo(T).@"struct")) |sf| {
         if (sf.type == Unknown) return @field(value, sf.name);
     }
     return .empty;

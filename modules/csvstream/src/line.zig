@@ -1231,7 +1231,10 @@ test "a failed split frees the fields it had already allocated" {
     // failure on the second. Without the errdefer the first one's bytes are
     // unreachable: the caller never receives the slice
     // (W2 re-audit 2026-09-02, `csvstream` F7).
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 2 });
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+    // 0.17: the testing allocator (SafeAllocator) shrinks in place on `remap`, so
+    // `toOwnedSlice` no longer allocates a second time: one allocation per field,
+    // and index 1 is the second field (it was index 2 with two allocations per field).
     const a = failing.allocator();
     var buf: [4][]const u8 = undefined;
     try std.testing.expectError(
