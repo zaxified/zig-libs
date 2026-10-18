@@ -146,7 +146,7 @@ pub const default = Mls128X25519Aes128GcmSha256Ed25519;
 const testing = std.testing;
 
 test "CipherSuiteId: 0x0001 matches RFC 9420 §17.1's registry value" {
-    try testing.expectEqual(@as(u16, 0x0001), @intFromEnum(CipherSuiteId.mls_128_dhkemx25519_aes128gcm_sha256_ed25519));
+    try testing.expectEqual(@as(u16, 0x0001), @backingInt(CipherSuiteId.mls_128_dhkemx25519_aes128gcm_sha256_ed25519));
 }
 
 test "default suite: widths match RFC 9420 §17.1's MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519 row" {

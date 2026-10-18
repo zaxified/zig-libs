@@ -1094,7 +1094,7 @@ test "encryptGroupSecrets/decryptGroupSecrets: round trip, and the encrypted_gro
     const io = threaded.io();
 
     var seed: [32]u8 = @splat(3);
-    const kp = try TestSuite.Kem.KeyPair.generateDeterministic(seed);
+    const kp = TestSuite.Kem.KeyPair.generateDeterministic(seed);
     seed = @splat(0);
 
     const egi = @as([96]u8, @splat(0x9e));
@@ -1128,7 +1128,7 @@ test "join: end-to-end against a Welcome this file also produced" {
     const alloc = testing.allocator;
 
     var seed: [32]u8 = @splat(9);
-    const init_kp = try TestSuite.Kem.KeyPair.generateDeterministic(seed);
+    const init_kp = TestSuite.Kem.KeyPair.generateDeterministic(seed);
     seed = @splat(13);
     const sig_kp = try TestSuite.Sig.KeyPair.generateDeterministic(seed);
     seed = @splat(0);
@@ -1247,7 +1247,7 @@ test "join: a confirmation_tag that does not match the derived confirmation_key 
     const alloc = testing.allocator;
 
     var seed: [32]u8 = @splat(9);
-    const init_kp = try TestSuite.Kem.KeyPair.generateDeterministic(seed);
+    const init_kp = TestSuite.Kem.KeyPair.generateDeterministic(seed);
     seed = @splat(13);
     const sig_kp = try TestSuite.Sig.KeyPair.generateDeterministic(seed);
     seed = @splat(0);

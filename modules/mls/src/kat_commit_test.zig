@@ -264,7 +264,7 @@ test "treekem.json: an UpdatePath GENERATED from the vector's own path_secret[0]
             // this whole test into a round trip.
             const path_secret_0 = seed orelse return error.NoSeedableReceiverInVector;
 
-            const leaf_kp = try S.Kem.KeyPair.generateDeterministic(@splat(0x5c));
+            const leaf_kp = S.Kem.KeyPair.generateDeterministic(@splat(0x5c));
             var staged: treekem.Staged(S) = undefined;
             try treekem.stageUpdatePath(S, arena.allocator(), &staging.tree, sender, .{
                 .group_id = group_id,
@@ -400,7 +400,7 @@ test "treekem.json: a generated UpdatePath is REJECTED when one derived key is c
     const sig_kp = try S.Sig.KeyPair.generateDeterministic(@splat(0x77));
     var wrong_seed: [S.Nh]u8 = @splat(0xa5);
     wrong_seed[0] ^= 0x01;
-    const leaf_kp = try S.Kem.KeyPair.generateDeterministic(@splat(0x5c));
+    const leaf_kp = S.Kem.KeyPair.generateDeterministic(@splat(0x5c));
     var staged: treekem.Staged(S) = undefined;
     try treekem.stageUpdatePath(S, arena.allocator(), &staging.tree, sender, .{
         .group_id = group_id,
@@ -438,8 +438,8 @@ const Newcomer = struct {
 
     fn init(arena: std.mem.Allocator, seed: u8) !Newcomer {
         const sig = try S.Sig.KeyPair.generateDeterministic(@splat(seed));
-        const init_kp = try S.Kem.KeyPair.generateDeterministic(@splat(seed +% 64));
-        const enc_kp = try S.Kem.KeyPair.generateDeterministic(@splat(seed +% 128));
+        const init_kp = S.Kem.KeyPair.generateDeterministic(@splat(seed +% 64));
+        const enc_kp = S.Kem.KeyPair.generateDeterministic(@splat(seed +% 128));
         const kp = try keypackage.create(S, arena, .{
             .signature_key_pair = &sig,
             .init_key = init_kp.public_key,

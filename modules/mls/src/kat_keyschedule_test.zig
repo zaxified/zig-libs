@@ -80,7 +80,7 @@ test "key-schedule.json: RFC 9420 §8's full epoch chain for cipher suite 0x0001
 
     for (parsed.value.array.items) |entry| {
         const cs = asI64(entry.object.get("cipher_suite").?);
-        if (cs != @as(i64, @intFromEnum(S.id))) {
+        if (cs != @as(i64, @backingInt(S.id))) {
             skipped_other_suites += 1;
             continue; // this module only wires suite 0x0001 — see suite.zig
         }
@@ -213,7 +213,7 @@ test "psk_secret.json: RFC 9420 §8.4's psk_secret chain for 0..10 PSKs, byte-ex
 
     for (parsed.value.array.items) |entry| {
         const cs = asI64(entry.object.get("cipher_suite").?);
-        if (cs != @as(i64, @intFromEnum(S.id))) continue;
+        if (cs != @as(i64, @backingInt(S.id))) continue;
         found_suite_1 = true;
 
         const psks_json = entry.object.get("psks").?.array.items;

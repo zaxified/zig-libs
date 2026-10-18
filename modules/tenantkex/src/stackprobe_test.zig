@@ -259,8 +259,8 @@ fn buildNeedles(n: *Needles) !void {
     reset();
     n.addKey("static key I", s_i.secret_key);
     n.addKey("static key R", s_r.secret_key);
-    const e_i = try tk.KeyPair.generateDeterministic(seedOf(prng_i));
-    const e_r = try tk.KeyPair.generateDeterministic(seedOf(prng_r));
+    const e_i = tk.KeyPair.generateDeterministic(seedOf(prng_i));
+    const e_r = tk.KeyPair.generateDeterministic(seedOf(prng_r));
     n.addKey("ephemeral key I", e_i.secret_key);
     n.addKey("ephemeral key R", e_r.secret_key);
     const es = try X25519.scalarmult(e_i.secret_key, s_r.public_key);
@@ -312,8 +312,8 @@ fn skipUnlessOptimized() !void {
 test "STACKPROBE tenantkex (wave 9): no key, DH or HKDF residue on the dead stack after any handshake call" {
     try skipUnlessOptimized();
 
-    s_i = try tk.KeyPair.generateDeterministic(hash("static I"));
-    s_r = try tk.KeyPair.generateDeterministic(hash("static R"));
+    s_i = tk.KeyPair.generateDeterministic(hash("static I"));
+    s_r = tk.KeyPair.generateDeterministic(hash("static R"));
     control = hash("control");
 
     var needles: Needles = .{};

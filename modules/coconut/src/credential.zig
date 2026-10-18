@@ -1363,7 +1363,7 @@ test "corpus: every ShowProof seed reaches fromBytes, and the counts are pinned"
 // ── RNG-seam pin (B6, 2026-08-12) ───────────────────────────────────────────
 
 test "proveCredential takes std.Io; the seeded form exists only under a name that says so" {
-    const gen_params = @typeInfo(@TypeOf(proveCredential)).@"fn".params;
+    const gen_params = @typeInfo(@TypeOf(proveCredential)).@"fn".param_types;
     // Two shows under a nonce stream that repeats (a re-seeded PRNG, a forked
     // process inheriting PRNG state) give two transcripts with the same
     // witnesses `r̃`/`m̃` but a different challenge `c` — the standard
@@ -1372,9 +1372,9 @@ test "proveCredential takes std.Io; the seeded form exists only under a name tha
     // gone. `proveCredential`'s draws go through `Entropy.scalar` →
     // `Fr.random`, fail-closed on `std.Io.randomSecure` (`entropy.fill`), not
     // the silently-degrading `std.Io.random`.
-    try std.testing.expectEqual(std.Io, gen_params[1].type.?);
-    const test_params = @typeInfo(@TypeOf(proveCredentialSeededForTest)).@"fn".params;
-    try std.testing.expectEqual(std.Random, test_params[1].type.?);
+    try std.testing.expectEqual(std.Io, gen_params[1].?);
+    const test_params = @typeInfo(@TypeOf(proveCredentialSeededForTest)).@"fn".param_types;
+    try std.testing.expectEqual(std.Random, test_params[1].?);
 }
 
 // ── fuzz: the whole issue -> show -> verify protocol, with damage ───────────

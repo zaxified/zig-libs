@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — Ported to Zig 0.17.0. `strRepeat` is now `inline fn`: a runtime call made `headerText`'s `++` result a dangling stack temporary (Header.parse tests failed). New regression test pins the header bytes.
 - **2026-10-10** — tests: deterministic fuzz driver `TLOCK_FUZZ` (`tlock-age-decoders`, `tlock-age-file`, `tlock-ciphertext`). New oracles: a payload this module sealed opens and one flipped octet refuses; a genuine age file (real quicknet round-1000 key and signature) decrypts while a flipped octet, a truncation and an appended octet are refused (all 10,000 flips refused, header MAC included); the pristine ciphertext decrypts and no damaged one does. No change in `src/` outside tests.
 - **2026-10-09** — **BREAKING, HIGH: the BF-IBE core and the age layer left their secrets on the
   dead stack.** New ReleaseFast stack probe (`stackprobe_test.zig`; the round signature is public

@@ -503,18 +503,18 @@ fn testIo() std.Io.Threaded {
 }
 
 test "keygen takes std.Io; the seeded form exists only under a name that says so" {
-    const gen_params = @typeInfo(@TypeOf(keygen)).@"fn".params;
+    const gen_params = @typeInfo(@TypeOf(keygen)).@"fn".param_types;
     // `keygen`'s draws go through `Entropy.scalar` → `Fr.random`, fail-closed
     // on `std.Io.randomSecure` (`entropy.fill`), not the silently-degrading
     // `std.Io.random`. If this ever flips back to a bare `std.Random`,
     // `keygen(&out, alloc, prng.random(), …)` compiles again and the Coldcard-shaped
     // mistake is one line away for every consumer.
-    try std.testing.expectEqual(std.Io, gen_params[2].type.?);
+    try std.testing.expectEqual(std.Io, gen_params[2].?);
     // The seeded form still exists, but only under a name that says out loud
     // what it is — it can never be reached by a consumer who merely followed
     // the happy path.
-    const test_params = @typeInfo(@TypeOf(keygenSeededForTest)).@"fn".params;
-    try std.testing.expectEqual(std.Random, test_params[2].type.?);
+    const test_params = @typeInfo(@TypeOf(keygenSeededForTest)).@"fn".param_types;
+    try std.testing.expectEqual(std.Random, test_params[2].?);
 }
 
 test "keygen draws a fresh authority master secret on every call" {

@@ -114,7 +114,7 @@ fn loadEntry(arena: std.mem.Allocator, obj: std.json.ObjectMap) !Entry {
         // `init_priv` is a raw X25519 scalar, so the public half is
         // recovered from it rather than read from the vector — and the
         // KeyPackage's `init_key` check below is what pins that reading.
-        .init_key_pair = try S.Kem.KeyPair.generateDeterministic(init_priv),
+        .init_key_pair = S.Kem.KeyPair.generateDeterministic(init_priv),
         .signer_pub = try S.Sig.PublicKey.fromBytes(signer_pub_bytes),
     };
 }
@@ -141,7 +141,7 @@ test "welcome.json: RFC 9420 §12.4.3.1's whole joining path for suite 0x0001, b
 
     for (parsed.value.array.items) |entry| {
         const obj = entry.object;
-        if (asI64(obj.get("cipher_suite").?) != @as(i64, @intFromEnum(S.id))) {
+        if (asI64(obj.get("cipher_suite").?) != @as(i64, @backingInt(S.id))) {
             skipped_other_suites += 1;
             continue; // this module only wires suite 0x0001 — see suite.zig
         }
@@ -305,7 +305,7 @@ test "welcome.json: each layer's teeth — one flipped byte fails the layer it b
 
     for (parsed.value.array.items) |entry| {
         const obj = entry.object;
-        if (asI64(obj.get("cipher_suite").?) != @as(i64, @intFromEnum(S.id))) continue;
+        if (asI64(obj.get("cipher_suite").?) != @as(i64, @backingInt(S.id))) continue;
 
         const e = try loadEntry(arena, obj);
 

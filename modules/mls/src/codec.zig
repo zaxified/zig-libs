@@ -228,9 +228,9 @@ pub const Writer = struct {
     pub fn writeEnum(self: *Writer, comptime E: type, value: E) Error!void {
         const tag_bits = @bitSizeOf(@typeInfo(E).@"enum".tag_type);
         switch (tag_bits) {
-            8 => try self.writeU8(@intFromEnum(value)),
-            16 => try self.writeU16(@intFromEnum(value)),
-            32 => try self.writeU32(@intFromEnum(value)),
+            8 => try self.writeU8(@backingInt(value)),
+            16 => try self.writeU16(@backingInt(value)),
+            32 => try self.writeU32(@backingInt(value)),
             else => @compileError("mls.codec.writeEnum: unsupported enum tag width (need u8/u16/u32)"),
         }
     }
@@ -331,7 +331,7 @@ pub const Reader = struct {
             32 => try self.readU32(),
             else => @compileError("mls.codec.readEnum: unsupported enum tag width (need u8/u16/u32)"),
         };
-        return @enumFromInt(raw);
+        return @fromBackingInt(@intCast(raw));
     }
 
     pub fn remaining(self: *const Reader) []const u8 {
@@ -495,5 +495,5 @@ test "Writer/Reader: enum round trip, unknown tag decodes to the non-exhaustive 
     var r = Reader.init(out);
     try testing.expectEqual(TestEnum.b, try r.readEnum(TestEnum));
     const unknown = try r.readEnum(TestEnum);
-    try testing.expectEqual(@as(u8, 0xff), @intFromEnum(unknown));
+    try testing.expectEqual(@as(u8, 0xff), @backingInt(unknown));
 }

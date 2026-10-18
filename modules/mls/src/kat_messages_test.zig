@@ -212,10 +212,10 @@ test "messages.json: every Part 5 wire format decodes and re-encodes byte-exact"
             const msg = framing.MLSMessage.decode(alloc, &r) catch |err| return noteDecode(spec[1], i, err);
             defer msg.deinit(alloc);
             if (!r.atEnd()) return noteDecode(spec[1], i, error.TrailingBytes);
-            wire_formats_seen[@intFromEnum(msg.wireFormat())] = true;
+            wire_formats_seen[@backingInt(msg.wireFormat())] = true;
             switch (msg) {
-                .public_message => |pm| content_types_seen[@intFromEnum(pm.content.contentType())] = true,
-                .private_message => |pm| content_types_seen[@intFromEnum(pm.content_type)] = true,
+                .public_message => |pm| content_types_seen[@backingInt(pm.content.contentType())] = true,
+                .private_message => |pm| content_types_seen[@backingInt(pm.content_type)] = true,
                 .key_package, .welcome => {},
                 .group_info => |gi| {
                     // §12.4.3.3's extension really is the same serialization
@@ -247,14 +247,14 @@ test "messages.json: every Part 5 wire format decodes and re-encodes byte-exact"
     // and all three §17.2 wire formats this part decodes — otherwise the
     // `select` arms below `application` would go untested and the vector
     // would still "pass". See `NOTICE` for how the subset was chosen.
-    try testing.expect(content_types_seen[@intFromEnum(framing.ContentType.application)]);
-    try testing.expect(content_types_seen[@intFromEnum(framing.ContentType.proposal)]);
-    try testing.expect(content_types_seen[@intFromEnum(framing.ContentType.commit)]);
-    try testing.expect(wire_formats_seen[@intFromEnum(framing.WireFormat.mls_public_message)]);
-    try testing.expect(wire_formats_seen[@intFromEnum(framing.WireFormat.mls_private_message)]);
-    try testing.expect(wire_formats_seen[@intFromEnum(framing.WireFormat.mls_welcome)]);
-    try testing.expect(wire_formats_seen[@intFromEnum(framing.WireFormat.mls_group_info)]);
-    try testing.expect(wire_formats_seen[@intFromEnum(framing.WireFormat.mls_key_package)]);
+    try testing.expect(content_types_seen[@backingInt(framing.ContentType.application)]);
+    try testing.expect(content_types_seen[@backingInt(framing.ContentType.proposal)]);
+    try testing.expect(content_types_seen[@backingInt(framing.ContentType.commit)]);
+    try testing.expect(wire_formats_seen[@backingInt(framing.WireFormat.mls_public_message)]);
+    try testing.expect(wire_formats_seen[@backingInt(framing.WireFormat.mls_private_message)]);
+    try testing.expect(wire_formats_seen[@backingInt(framing.WireFormat.mls_welcome)]);
+    try testing.expect(wire_formats_seen[@backingInt(framing.WireFormat.mls_group_info)]);
+    try testing.expect(wire_formats_seen[@backingInt(framing.WireFormat.mls_key_package)]);
 }
 
 test "messages.json: the GroupSecrets vectors really do exercise the optional<PathSecret> present arm and a PSK list" {

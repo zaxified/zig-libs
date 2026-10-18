@@ -1298,15 +1298,15 @@ test "public error sets name no variant their function cannot return (L2)" {
         .{ GenerateKE2Error, "InvalidSecretKey" },
         .{ GenerateKE1Error, "InvalidBlind" },
     }) |case| {
-        for (@typeInfo(case[0]).error_set.?) |e| {
-            try std.testing.expect(!std.mem.eql(u8, e.name, case[1]));
+        for (@typeInfo(case[0]).error_set.error_names.?) |e| {
+            try std.testing.expect(!std.mem.eql(u8, e, case[1]));
         }
     }
     // Control: `InvalidBlind` stays where `voprf.finalize` can return it.
     inline for (.{ FinalizeRegistrationError, GenerateKE3Error }) |set| {
         var found = false;
-        for (@typeInfo(set).error_set.?) |e| {
-            if (std.mem.eql(u8, e.name, "InvalidBlind")) found = true;
+        for (@typeInfo(set).error_set.error_names.?) |e| {
+            if (std.mem.eql(u8, e, "InvalidBlind")) found = true;
         }
         try std.testing.expect(found);
     }

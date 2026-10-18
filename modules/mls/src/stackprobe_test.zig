@@ -379,8 +379,8 @@ const Client = struct {
 
     fn init(arena: std.mem.Allocator, name: []const u8, seed: u8) !Client {
         const sig = try S.Sig.KeyPair.generateDeterministic(@splat(seed));
-        const init_kp = try S.Kem.KeyPair.generateDeterministic(@splat(seed +% 64));
-        const enc_kp = try S.Kem.KeyPair.generateDeterministic(@splat(seed +% 128));
+        const init_kp = S.Kem.KeyPair.generateDeterministic(@splat(seed +% 64));
+        const enc_kp = S.Kem.KeyPair.generateDeterministic(@splat(seed +% 128));
         const kp = try mls.keypackage.create(S, arena, .{
             .signature_key_pair = &sig,
             .init_key = init_kp.public_key,
@@ -549,7 +549,7 @@ fn setUp(ci: u8) !void {
     bob = try Client.init(aa, "bob", 2 +% ci *% 8);
     dave = try Client.init(aa, "dave", 3 +% ci *% 8);
     props1[0] = .{ .by_value = .{ .add = bob.kp } };
-    upd_kp = try S.Kem.KeyPair.generateDeterministic(@splat(0x33 +% ci));
+    upd_kp = S.Kem.KeyPair.generateDeterministic(@splat(0x33 +% ci));
 
     // epoch 0
     var a0: G = undefined;
@@ -682,7 +682,7 @@ fn addKn(n: *Needles, kn: *const KN) void {
 }
 
 fn addSecretsAs(n: *Needles, name: []const u8, s: *const Secrets) void {
-    inline for (@typeInfo(Secrets).@"struct".fields) |f| add(n, name, &@field(s, f.name));
+    inline for (@typeInfo(Secrets).@"struct".field_names) |f| add(n, name, &@field(s, f));
 }
 
 fn addSecrets(n: *Needles, s: *const Secrets) void {
@@ -1140,7 +1140,7 @@ test "STACKPROBE: no secret residue on the dead stack (mls building blocks)" {
         lo_init_prev = seedBytes(32, "mls-lo-init", c);
         lo_commit = seedBytes(32, "mls-lo-commit", c);
         lo_pt = seedBytes(32, "mls-lo-plaintext", c);
-        lo_kp = try S.Kem.KeyPair.generateDeterministic(seedBytes(32, "mls-lo-kem", c));
+        lo_kp = S.Kem.KeyPair.generateDeterministic(seedBytes(32, "mls-lo-kem", c));
         keyschedule.externalKeyPair(S, &s2.external_secret, &lo_ek);
 
         // crypto.DeriveSecret / ExpandWithLabel.
@@ -1410,7 +1410,7 @@ test "STACKPROBE: no secret residue on the dead stack (mls building blocks)" {
 
         // treekem.stageUpdatePath.
         {
-            stage_leaf = try S.Kem.KeyPair.generateDeterministic(seedBytes(32, "mls-stage-leaf", c));
+            stage_leaf = S.Kem.KeyPair.generateDeterministic(seedBytes(32, "mls-stage-leaf", c));
             stage_ps0 = seedBytes(32, "mls-stage-ps0", c);
             fillA1();
             var pa: G = undefined;

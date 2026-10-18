@@ -144,7 +144,7 @@ test "every table row maps to its named error and back" {
 }
 
 test "the table covers the whole error set (bar UnknownStatus) with unique codes" {
-    const names = @typeInfo(StatusError).error_set.?;
+    const names = @typeInfo(StatusError).error_set.error_names.?;
     try std.testing.expectEqual(names.len - 1, table.len);
     for (table, 0..) |a, i| {
         for (table[i + 1 ..]) |b| try std.testing.expect(a.code != b.code);

@@ -885,6 +885,12 @@ const good_body_b64 = blk: {
 };
 const good_tlock = "-> tlock 5423142 " ++ qt_chain_hex ++ "\n" ++ good_body_b64;
 
+test "age: headerText builds the exact header bytes from a runtime call (strRepeat must be comptime-known)" {
+    // Regression (Zig 0.17.0): a non-inline strRepeat made the `++` result a stack temporary.
+    const h = headerText("-> x\n");
+    try testing.expectEqualStrings(version_line ++ "\n-> x\n--- " ++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" ++ "\n", h);
+}
+
 test "age: Header.parse accepts the minimal shape and other recipients beside tlock" {
     _ = try Header.parse(headerText(good_tlock));
     const h = try Header.parse(headerText("-> X25519 abc\nAAAA\n" ++ good_tlock ++ "-> some-grease !#$\n\n"));
@@ -1197,7 +1203,7 @@ test "PayloadStream.openChunk refuses every chunk-shape violation before touchin
 }
 
 /// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
-fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     const rep_result = comptime blk: {
         @setEvalBranchQuota(n * (s.len + 4) + 1000);
         var buf: [s.len * n:0]u8 = undefined;

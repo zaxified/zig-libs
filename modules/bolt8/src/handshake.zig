@@ -746,9 +746,9 @@ test "Ephemeral: exactly two arms, production and test are distinct, and nothing
     // so this pins the arm count and both names: adding a third arm, or
     // renaming `csprng` to something that reads as neutral, breaks it.
     const info = @typeInfo(Ephemeral).@"union";
-    try testing.expectEqual(@as(usize, 2), info.fields.len);
-    try testing.expectEqualStrings("csprng", info.fields[0].name);
-    try testing.expectEqualStrings("seeded_for_test", info.fields[1].name);
+    try testing.expectEqual(@as(usize, 2), info.field_names.len);
+    try testing.expectEqualStrings("csprng", info.field_names[0]);
+    try testing.expectEqualStrings("seeded_for_test", info.field_names[1]);
 
     var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x5a)));
     const production: Ephemeral = .{ .csprng = csprng.random() };

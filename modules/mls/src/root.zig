@@ -441,5 +441,5 @@ test "meta.role is .util (no owned transport/socket in Part 1)" {
 
 test "default_suite is RFC 9420's mandatory-to-implement suite, 0x0001" {
     try std.testing.expectEqual(CipherSuiteId.mls_128_dhkemx25519_aes128gcm_sha256_ed25519, default_suite.id);
-    try std.testing.expectEqual(@as(u16, 0x0001), @intFromEnum(default_suite.id));
+    try std.testing.expectEqual(@as(u16, 0x0001), @backingInt(default_suite.id));
 }

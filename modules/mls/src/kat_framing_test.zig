@@ -142,7 +142,7 @@ test "message-protection.json: RFC 9420 §6's whole protect/unprotect path for s
 
     for (parsed.value.array.items) |entry| {
         const obj = entry.object;
-        if (asI64(obj.get("cipher_suite").?) != @as(i64, @intFromEnum(S.id))) {
+        if (asI64(obj.get("cipher_suite").?) != @as(i64, @backingInt(S.id))) {
             skipped_other_suites += 1;
             continue; // this module only wires suite 0x0001 — see suite.zig
         }
@@ -319,7 +319,7 @@ test "message-protection.json: a tampered ciphertext byte fails the content AEAD
 
     for (parsed.value.array.items) |entry| {
         const obj = entry.object;
-        if (asI64(obj.get("cipher_suite").?) != @as(i64, @intFromEnum(S.id))) continue;
+        if (asI64(obj.get("cipher_suite").?) != @as(i64, @backingInt(S.id))) continue;
 
         const vec = try hexDecode(arena, obj.get("application_priv").?.string);
         const encryption_secret = try hexSecret(obj.get("encryption_secret").?.string);
@@ -359,7 +359,7 @@ test "transcript-hashes.json: RFC 9420 §8.2's two hashes for suite 0x0001, byte
 
     for (parsed.value.array.items) |entry| {
         const obj = entry.object;
-        if (asI64(obj.get("cipher_suite").?) != @as(i64, @intFromEnum(S.id))) {
+        if (asI64(obj.get("cipher_suite").?) != @as(i64, @backingInt(S.id))) {
             skipped_other_suites += 1;
             continue;
         }
@@ -421,7 +421,7 @@ test "transcript-hashes.json: the confirmation_tag does NOT verify against the h
 
     for (parsed.value.array.items) |entry| {
         const obj = entry.object;
-        if (asI64(obj.get("cipher_suite").?) != @as(i64, @intFromEnum(S.id))) continue;
+        if (asI64(obj.get("cipher_suite").?) != @as(i64, @backingInt(S.id))) continue;
 
         const ac_bytes = try hexDecode(arena, obj.get("authenticated_content").?.string);
         var r = codec.Reader.init(ac_bytes);

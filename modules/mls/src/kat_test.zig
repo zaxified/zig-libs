@@ -97,7 +97,7 @@ test "crypto-basics.json: cipher suite 0x0001 (MLS_128_DHKEMX25519_AES128GCM_SHA
 
     for (parsed.value.array.items) |entry| {
         const cs = asI64(entry.object.get("cipher_suite").?);
-        if (cs != @as(i64, @intFromEnum(S.id))) {
+        if (cs != @as(i64, @backingInt(S.id))) {
             skipped_other_suites += 1;
             continue; // this Part only wires suite 0x0001 — see suite.zig
         }

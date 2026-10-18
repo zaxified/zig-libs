@@ -1737,7 +1737,7 @@ test "corpus: the MLSMessage seeds reach the decoder, and the counts are pinned"
     var accepted: usize = 0;
     var stamped: usize = 0;
     var stamped_accepted: usize = 0;
-    var formats = std.EnumSet(WireFormat).initEmpty();
+    var formats = std.EnumSet(WireFormat).empty;
     var corpus: MessageCorpus = .{};
     const entries = try corpus.build();
     for (entries) |sd| {

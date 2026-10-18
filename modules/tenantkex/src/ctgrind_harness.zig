@@ -66,8 +66,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     switch (target) {
         .ik => {
-            var pe_a = try tk.KeyPair.generateDeterministic(secretBytes(32, "ctgrind-tenantkex-pe-a-v1"));
-            var pe_b = try tk.KeyPair.generateDeterministic(secretBytes(32, "ctgrind-tenantkex-pe-b-v1"));
+            var pe_a = tk.KeyPair.generateDeterministic(secretBytes(32, "ctgrind-tenantkex-pe-a-v1"));
+            var pe_b = tk.KeyPair.generateDeterministic(secretBytes(32, "ctgrind-tenantkex-pe-b-v1"));
             if (taint_on) {
                 std.valgrind.memcheck.makeMemUndefined(&pe_a.secret_key);
                 std.valgrind.memcheck.makeMemUndefined(&pe_b.secret_key);

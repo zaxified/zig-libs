@@ -402,7 +402,7 @@ fn hx(comptime s: []const u8) [s.len / 2]u8 {
 }
 
 fn kp(priv: [32]u8) KeyPair {
-    return KeyPair.generateDeterministic(priv) catch unreachable;
+    return KeyPair.generateDeterministic(priv);
 }
 
 fn testRandom(seed: u64) std.Random.DefaultPrng {

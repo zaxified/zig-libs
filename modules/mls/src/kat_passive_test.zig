@@ -133,8 +133,8 @@ fn runEntry(
         const msg = try framing.MLSMessage.decode(sa, &r);
         try testing.expect(r.atEnd());
         const kp = msg.key_package;
-        const init_kp = try S.Kem.KeyPair.generateDeterministic(init_priv);
-        const enc_kp = try S.Kem.KeyPair.generateDeterministic(encryption_priv);
+        const init_kp = S.Kem.KeyPair.generateDeterministic(init_priv);
+        const enc_kp = S.Kem.KeyPair.generateDeterministic(encryption_priv);
         const sig_kp = try S.Sig.KeyPair.generateDeterministic(signature_priv);
         try testing.expectEqualSlices(u8, kp.init_key, &init_kp.public_key);
         try testing.expectEqualSlices(u8, kp.leaf_node.encryption_key, &enc_kp.public_key);
@@ -207,7 +207,7 @@ fn runEntry(
 /// silently skipping the entries this module cannot drive.
 fn expectOnlySuite1(items: []const std.json.Value) !void {
     for (items) |e| {
-        try testing.expectEqual(@as(i64, @intFromEnum(S.id)), e.object.get("cipher_suite").?.integer);
+        try testing.expectEqual(@as(i64, @backingInt(S.id)), e.object.get("cipher_suite").?.integer);
     }
 }
 

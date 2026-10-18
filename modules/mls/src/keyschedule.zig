@@ -233,8 +233,8 @@ pub fn EpochSecrets(comptime S: type) type {
         /// granularity lives in `secrettree.zig`'s ratchets) — this is the
         /// coarse "the epoch has ended" sweep.
         pub fn wipe(self: *Self) void {
-            inline for (@typeInfo(Self).@"struct".fields) |f| {
-                std.crypto.secureZero(u8, &@field(self, f.name));
+            inline for (@typeInfo(Self).@"struct".field_names) |f| {
+                std.crypto.secureZero(u8, &@field(self, f));
             }
         }
     };
@@ -1141,7 +1141,7 @@ test "§8.3: sender and receiver derive the same init_secret, and it is bound to
     externalKeyPair(TestSuite, &external_secret, &group_key);
 
     var eph_seed: [32]u8 = @splat(0x77);
-    const eph = try TestSuite.Kem.KeyPair.generateDeterministic(eph_seed);
+    const eph = TestSuite.Kem.KeyPair.generateDeterministic(eph_seed);
     eph_seed = @splat(0);
 
     var sent: ExternalInit(TestSuite) = undefined;

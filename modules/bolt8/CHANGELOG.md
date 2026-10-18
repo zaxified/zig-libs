@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — Ported to Zig 0.17.0. Test: union `@typeInfo` uses `field_names`.
 - **2026-10-09** — **BREAKING (corrects the entry below):** the `out`/pointer key derivation is
   `KeyPair.generateDeterministicInto(out, seed: *const [32]u8)`; `KeyPair.generateDeterministic(seed)
   !KeyPair` and `scalarmult(secret_key: [32]u8, remote_pub)` keep the by-value shape `noise.Suite(DH,

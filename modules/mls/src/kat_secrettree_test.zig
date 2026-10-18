@@ -82,7 +82,7 @@ test "secret-tree.json: RFC 9420 §9's tree, ratchets and §6.3.2 sender data fo
 
     for (parsed.value.array.items) |entry| {
         const cs = asI64(entry.object.get("cipher_suite").?);
-        if (cs != @as(i64, @intFromEnum(S.id))) {
+        if (cs != @as(i64, @backingInt(S.id))) {
             skipped_other_suites += 1;
             continue; // this module only wires suite 0x0001 — see suite.zig
         }

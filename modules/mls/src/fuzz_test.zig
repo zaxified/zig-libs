@@ -91,8 +91,8 @@ const Client = struct {
 
     fn init(arena: std.mem.Allocator, name: []const u8, seed: u8) !Client {
         const sig = try Suite.Sig.KeyPair.generateDeterministic(@splat(seed));
-        const init_kp = try Suite.Kem.KeyPair.generateDeterministic(@splat(seed +% 64));
-        const enc_kp = try Suite.Kem.KeyPair.generateDeterministic(@splat(seed +% 128));
+        const init_kp = Suite.Kem.KeyPair.generateDeterministic(@splat(seed +% 64));
+        const enc_kp = Suite.Kem.KeyPair.generateDeterministic(@splat(seed +% 128));
         const kp = try keypackage_mod.create(Suite, arena, .{
             .signature_key_pair = &sig,
             .init_key = init_kp.public_key,

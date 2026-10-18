@@ -3881,7 +3881,7 @@ test "std.crypto.Certificate.rsa verifies our signature (oracle cross-check)" {
 
     const std_rsa = std.crypto.Certificate.rsa;
     const std_pk = try std_rsa.PublicKey.fromBytes(&kat2048.e, &kat2048.n);
-    try std_rsa.PKCS1v1_5Signature.verify(256, sig[0..256].*, kat2048.msg, std_pk, std.crypto.hash.sha2.Sha256);
+    try std_rsa.PKCS1v1_5Signature.verify(256, sig[0..256], kat2048.msg, std_pk, std.crypto.hash.sha2.Sha256);
 }
 
 test "rsadpCrt equals rsadp on the 2048-bit key" {
@@ -3983,13 +3983,13 @@ test "CRT base blinding round-trips and matches the unblinded result (audit F2)"
 
 test "Blinding: three arms, and the unblinded one is a name rather than a null" {
     const info = @typeInfo(Blinding).@"union";
-    try testing.expectEqual(@as(usize, 3), info.fields.len);
-    try testing.expectEqualStrings("csprng", info.fields[0].name);
-    try testing.expectEqualStrings("none", info.fields[1].name);
-    try testing.expectEqualStrings("cached", info.fields[2].name);
+    try testing.expectEqual(@as(usize, 3), info.field_names.len);
+    try testing.expectEqualStrings("csprng", info.field_names[0]);
+    try testing.expectEqualStrings("none", info.field_names[1]);
+    try testing.expectEqualStrings("cached", info.field_names[2]);
     // `.none` carries no payload — it is a decision, not an absent argument.
-    try testing.expectEqual(void, info.fields[1].type);
-    try testing.expectEqual(*BlindingCache, info.fields[2].type);
+    try testing.expectEqual(void, info.field_types[1]);
+    try testing.expectEqual(*BlindingCache, info.field_types[2]);
 }
 
 // `Blinding.cached` (2026-10-18): the cached pair is squared per op and
@@ -7956,7 +7956,7 @@ test "fuzz harness: seeds in every test run, and they get everywhere" {
 }
 
 /// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
-fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     const rep_result = comptime blk: {
         @setEvalBranchQuota(n * (s.len + 4) + 1000);
         var buf: [s.len * n:0]u8 = undefined;
