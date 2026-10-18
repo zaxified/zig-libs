@@ -525,7 +525,7 @@ bytes.
 
 ## Backlog / deferred
 
-- **Constant time (low, found 2026-10-18 pre-tag sweep)**: `-bin` metadata is std base64 (metadata.zig ~37-38, ~72-77); matters only if an application carries a token there. `b64ct` has the same alphabet.
+- **Constant time — DONE 2026-10-18**: `-bin` metadata now goes through `b64ct.standard_no_pad` (metadata.zig); padding is still trimmed before decoding, so both spellings are accepted.
 Every item below is also listed under *Not implemented, and why*; the survey tags the ones a
 typical grpc-go/tonic user hits in ordinary use.
 

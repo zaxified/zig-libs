@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — Constant time: `-bin` metadata encode/decode use `b64ct.standard_no_pad` instead of `std.base64` (new dep `b64ct`; padded and unpadded still accepted on receive).
 - **2026-10-18** — Backlog: `-bin` metadata is std base64 (low; pre-tag constant-time sweep).
 - **2026-10-10** — tests: deterministic fuzz driver `GRPC_FUZZ` over the existing harnesses (now generic over their choice source; the driver draws a corpus entry with 0-3 octets damaged, maybe truncated) with an in-suite reach test per harness. Harnesses: `deframerNeverPanics`, `fieldValuesNeverPanic`, `responseShape`. Verdict: 200,000 runs each, ReleaseSafe, clean.
 - **2026-09-15** — **BEHAVIOURAL (new memory cap on receive, on by default):** audit `protobuf`

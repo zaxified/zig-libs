@@ -34,12 +34,14 @@ pub fn isBinary(name: []const u8) bool {
     return name.len > 4 and std.ascii.endsWithIgnoreCase(name, "-bin");
 }
 
-const encoder = std.base64.standard_no_pad.Encoder;
-const decoder = std.base64.standard_no_pad.Decoder;
+// Constant time (b64ct): a `-bin` value may carry a token or key, and std's
+// table codec indexes by every character.
+const b64ct = @import("b64ct");
+const codec = b64ct.standard_no_pad;
 
 /// Length of the wire value `encodeValue` will produce for `entry`.
 pub fn encodedValueLen(entry: Entry) usize {
-    return if (isBinary(entry.name)) encoder.calcSize(entry.value.len) else entry.value.len;
+    return if (isBinary(entry.name)) codec.encodedLen(entry.value.len) else entry.value.len;
 }
 
 /// Render `entry`'s wire value into `out` (`out.len >= encodedValueLen`).
@@ -48,7 +50,7 @@ pub fn encodeValue(entry: Entry, out: []u8) []const u8 {
         @memcpy(out[0..entry.value.len], entry.value);
         return out[0..entry.value.len];
     }
-    return encoder.encode(out[0..encoder.calcSize(entry.value.len)], entry.value);
+    return codec.encode(out[0..codec.encodedLen(entry.value.len)], entry.value);
 }
 
 pub const DecodeError = error{ InvalidBinaryValue, OutOfMemory };
@@ -72,10 +74,10 @@ pub fn decodeValue(gpa: Allocator, name: []const u8, wire_value: []const u8) Dec
     // strict, and both spellings are legal input per the spec.
     var trimmed = wire_value;
     while (trimmed.len != 0 and trimmed[trimmed.len - 1] == '=') trimmed.len -= 1;
-    const n = decoder.calcSizeForSlice(trimmed) catch return error.InvalidBinaryValue;
+    const n = codec.decodedLen(trimmed) catch return error.InvalidBinaryValue;
     const out = try gpa.alloc(u8, n);
     errdefer gpa.free(out);
-    decoder.decode(out, trimmed) catch return error.InvalidBinaryValue;
+    _ = codec.decode(out, trimmed) catch return error.InvalidBinaryValue;
     return .{ .bytes = out, .owned = true };
 }
 

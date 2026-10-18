@@ -1171,7 +1171,7 @@ mqtt	ReleaseFast	encode	1	0	10e691c441a4a4a7	f9bc065c9f983504
 mqtt	ReleaseFast	decode	1	0	10e691c441a4a4a7	c3c3038ba153dcbb
 # 2026-10-17: acl.Passwords.verify with the password tainted -- PBKDF2-HMAC-SHA512 then
 # timing_safe.eql; 0 contexts inside acl.zig (the bool it returns is the verdict).
-mqtt	ReleaseFast	pwverify	1	0	39523ea4bc4ee43b	bcc95d04fa79c847
+mqtt	ReleaseFast	pwverify	1	0	7aadf8ff5dd9145d	bcc95d04fa79c847
 # noise (2026-10-10) — hs: Noise_XXpsk3 (DefaultSuite) both roles, statics +
 # every ephemeral seed + the PSK tainted; transport: the split keys tainted
 # through encrypt/decrypt both ways + rekey. Every in-file context is a std

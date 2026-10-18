@@ -70,7 +70,7 @@ pub const meta = .{
     .role = .both,
     .concurrency = .single_owner, // one task drives a Channel's session
     .model_after = "the grpc-over-http2 protocol specification; verified live against Python grpcio (the reference implementation), in both directions",
-    .deps = .{ "http", "protobuf" },
+    .deps = .{ "http", "protobuf", "b64ct" },
 };
 
 const call_mod = @import("call.zig");

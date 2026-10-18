@@ -62,7 +62,7 @@ pub const meta = .{
     .role = .client, // client + reusable wire codec
     .concurrency = .single_owner, // one owner drives feed/poll/tick
     .model_after = "MQTT 3.1.1 + 5.0 (OASIS) / mosquitto+paho behavior",
-    .deps = .{}, // std only
+    .deps = .{"b64ct"}, // b64ct: the `$7$` verifier decode/encode (constant time)
 };
 
 /// Control-packet codec (pure wire logic, no I/O).

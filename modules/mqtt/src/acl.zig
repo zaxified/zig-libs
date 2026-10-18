@@ -58,6 +58,7 @@
 
 const std = @import("std");
 const burn = @import("burn.zig");
+const b64ct = @import("b64ct");
 const broker = @import("broker.zig");
 const topic_rules = @import("topic.zig");
 
@@ -326,13 +327,15 @@ fn parseHash(text: []const u8) ?Parsed {
     if (iter_s.len == 0 or !std.ascii.isDigit(iter_s[0])) return null; // no sign
     const iterations = std.fmt.parseInt(u32, iter_s, 10) catch return null;
     if (iterations == 0 or iterations > max_iterations) return null;
-    const dec = std.base64.standard.Decoder;
+    // Constant-time decode (b64ct): the stored verifier is compared against
+    // a derived key, so its characters must not index a table.
+    const dec = b64ct.standard;
     var p: Parsed = .{ .iterations = iterations, .salt = undefined, .salt_len = 0, .hash = undefined };
-    p.salt_len = dec.calcSizeForSlice(salt_s) catch return null;
+    p.salt_len = dec.decodedLen(salt_s) catch return null;
     if (p.salt_len == 0 or p.salt_len > max_salt_len) return null;
-    dec.decode(p.salt[0..p.salt_len], salt_s) catch return null;
-    if ((dec.calcSizeForSlice(hash_s) catch return null) != hash_len) return null;
-    dec.decode(&p.hash, hash_s) catch return null;
+    _ = dec.decode(p.salt[0..p.salt_len], salt_s) catch return null;
+    if ((dec.decodedLen(hash_s) catch return null) != hash_len) return null;
+    _ = dec.decode(&p.hash, hash_s) catch return null;
     return p;
 }
 
@@ -354,10 +357,10 @@ fn formatHashBody(out: []u8, password: []const u8, salt: []const u8, iterations:
     var dk: [hash_len]u8 = undefined;
     defer std.crypto.secureZero(u8, &dk);
     if (!derive(&dk, password, salt, iterations)) return error.InvalidParameters;
-    var salt_b64: [std.base64.standard.Encoder.calcSize(max_salt_len)]u8 = undefined;
-    var hash_b64: [std.base64.standard.Encoder.calcSize(hash_len)]u8 = undefined;
-    const s = std.base64.standard.Encoder.encode(&salt_b64, salt);
-    const h = std.base64.standard.Encoder.encode(&hash_b64, &dk);
+    var salt_b64: [b64ct.standard.encodedLen(max_salt_len)]u8 = undefined;
+    var hash_b64: [b64ct.standard.encodedLen(hash_len)]u8 = undefined;
+    const s = b64ct.standard.encode(&salt_b64, salt);
+    const h = b64ct.standard.encode(&hash_b64, &dk);
     return std.fmt.bufPrint(out, "$7${d}${s}${s}", .{ iterations, s, h });
 }
 
@@ -669,6 +672,21 @@ test "passwords: lines made by the real mosquitto_passwd verify" {
     var out: [256]u8 = undefined;
     const mine = try formatHash(&out, "hunter2", &salt_bytes, default_iterations);
     try testing.expectEqualStrings(golden_bob["bob:".len..], mine);
+}
+
+test "passwords: a malformed salt or hash is refused (b64ct decode)" {
+    const good_hash = "jn0M3dNRPYhYpWOfsFHQVZJZc0XulVhPZD5Do8iAGJ0qH7G6wdWRd9rFb1WUbIfAD395dO/0HWm3L189aObziw==";
+    try testing.expect(parseHash("$7$1000$" ++ golden_bob_salt ++ "$" ++ good_hash) != null);
+    // character outside the alphabet in the salt / in the hash
+    try testing.expect(parseHash("$7$1000$MDEyMzQ1Njc4OWF*$" ++ good_hash) == null);
+    try testing.expect(parseHash("$7$1000$MDEyMzQ1Njc4OWFi$" ++ "jn0M3dNRPYhYpWOfsFHQVZJZc0XulVhPZD5Do8iAGJ0qH7G6wdWRd9rFb1WUbIfAD395dO_0HWm3L189aObziw==") == null);
+    // missing padding, wrong length, stray low bits, empty salt
+    try testing.expect(parseHash("$7$1000$MDEyMzQ1Njc4OWFi$" ++ good_hash[0 .. good_hash.len - 2]) == null);
+    try testing.expect(parseHash("$7$1000$MDEyMzQ1Njc4OWFi$" ++ good_hash[0 .. good_hash.len - 4] ++ "==") == null);
+    try testing.expect(parseHash("$7$1000$MDEyMzQ1Njc4OWFi$" ++ good_hash[0 .. good_hash.len - 3] ++ "B==") == null);
+    try testing.expect(parseHash("$7$1000$MDEyMzQ1Njc4OWFi$" ++ good_hash[0 .. good_hash.len - 3] ++ "A==") != null);
+    try testing.expect(parseHash("$7$1000$MDEyMzQ1Njc4OWF$" ++ good_hash) == null);
+    try testing.expect(parseHash("$7$1000$$" ++ good_hash) == null);
 }
 
 test "passwords: the stored format and file errors" {
