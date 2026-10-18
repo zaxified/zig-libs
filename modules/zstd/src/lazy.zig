@@ -524,28 +524,20 @@ fn rowUpdateNoCache(ms: *MatchState, w: Base, end: u32, comptime mls: u32, row_l
 /// (`ZSTD_row_getMatchMask`).
 inline fn matchMask(comptime entries: u32, tag_row: []const u8, tag: u8, head: u32) u64 {
     const V = @Vector(entries, u8);
-    const B = std.meta.Int(.unsigned, entries);
+    const B = @Int(.unsigned, entries);
     const v: V = tag_row[0..entries].*;
-    // `@bitCast` of a `@Vector(entries, bool)` must give bit `i` == lane
-    // `i` (`tag_row[i]`'s comparison), the convention libzstd's own SIMD
-    // paths use and its portable SWAR fallback (`zstd_lazy.c`'s
-    // `ZSTD_row_getMatchMask`) goes out of its way to preserve on a
-    // big-endian host too ("reverse bits during extraction", its own
-    // comment) -- `rotr` below, and every caller's `headGrouped +
-    // ZSTD_VecMask_next(matches)`, depend on that mapping being
-    // bit-for-bit the same regardless of target.
+    // `@bitCast` of a `@Vector(entries, bool)` must give bit `i` == lane `i`
+    // (`tag_row[i]`'s comparison), the convention libzstd's own SIMD paths use
+    // (`ZSTD_row_getMatchMask`); `rotr` below, and every caller's `headGrouped +
+    // ZSTD_VecMask_next(matches)`, depend on that mapping on every target.
     //
-    // Zig's `@bitCast` does not honour it: measured directly (a standalone
-    // comparison of the same vector-of-bool bitcast on `x86_64-linux` vs.
-    // `mips-linux-musl`, 32-bit big-endian -- `check-portable`'s
-    // `.linux32`), the big-endian result is the little-endian one with
-    // every bit reversed end to end, not merely a byte swap, at both the
-    // 16- and 32-lane widths this function is instantiated at.
-    // `@bitReverse` on a big-endian target only undoes exactly that, at
-    // zero cost on every currently little-endian target (`.linux64`,
-    // `.windows`) this collapses to a no-op branch.
+    // Zig 0.17: that is what `@bitCast` gives on every target, big-endian
+    // included (re-measured 2026-10-18: a comptime probe compiled for
+    // `mips-linux-musl` and `x86_64-linux` both put lane 0 in bit 0). On 0.16 the
+    // big-endian result was bit-reversed end to end and a `@bitReverse` undid
+    // it; that fix-up must go, or it would now reverse a correct mask.
     const raw: B = @bitCast(v == @as(V, @splat(tag)));
-    const eq: B = if (comptime builtin.cpu.arch.endian() == .big) @bitReverse(raw) else raw;
+    const eq: B = raw;
     return std.math.rotr(B, eq, head);
 }
 

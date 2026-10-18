@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — Ported to Zig 0.17.0: tests: enum iteration via `field_values`; `strRepeat` branch quota scaled with length.
 - **2026-10-09** — tests: deterministic fuzz driver `ENCODING_FUZZ` over the existing harnesses.
 - **2026-10-05** — **Behaviour change:** the labels `cp819` and `ibm819` (IANA's own aliases of
   ISO_8859-1:1987) now select `.iso_8859_1` with the rest of the iso-8859-1 family; they alone selected

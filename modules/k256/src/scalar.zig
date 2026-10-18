@@ -115,7 +115,7 @@ inline fn orderSwap(s: [32]u8) [32]u8 {
 
 // ── tests: GLV decomposition vs std + reconstruction ────────────────────────
 
-const StdEndo = std.crypto.ecc.Secp256k1.Endormorphism;
+const StdEndo = std.crypto.ecc.Secp256k1.Endomorphism;
 
 test "GLV eigenvalue λ is a nontrivial cube root of 1 mod n" {
     // λ ≠ 1 and λ³ ≡ 1 (mod n): the endomorphism has order 3 on the subgroup.

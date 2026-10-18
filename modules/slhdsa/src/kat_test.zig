@@ -321,7 +321,7 @@ test "NIST ACVP sigGen pre-hash: SLH-DSA-SHAKE-128f, byte-exact" {
 }
 
 test "NIST ACVP sigGen pre-hash: all twelve PH functions are covered" {
-    var covered = std.EnumSet(v.PrehashAlg).initEmpty();
+    var covered = std.EnumSet(v.PrehashAlg).empty;
     for (v.prehash_sha2_128f_gen) |c| covered.insert(c.ph);
     for (v.prehash_shake_128f_gen) |c| covered.insert(c.ph);
     try std.testing.expectEqual(@typeInfo(v.PrehashAlg).@"enum".field_names.len, covered.count());

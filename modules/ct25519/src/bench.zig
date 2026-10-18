@@ -74,7 +74,7 @@ fn run(op: Op, iters: usize, scalars: *const [nscalars][32]u8, pv: Ristretto255)
             .ladder_var => ct.mulRistretto(pv, s).toBytes(),
             .std_var => (pv.mul(s) catch unreachable).toBytes(),
             .x25519_comb => ct.X25519.recoverPublicKey(s) catch unreachable,
-            .x25519_std => std.crypto.dh.X25519.recoverPublicKey(s) catch unreachable,
+            .x25519_std => std.crypto.dh.X25519.recoverPublicKey(s),
             .dh_std => dh(.stdlib, s),
             .dh_mulx => dh(.mulx, s),
             .dh_adx => dh(.mulx_adx, s),
@@ -125,7 +125,7 @@ test "bench (opt-in via CT25519_BENCH)" {
     chk ^= pair("base point, ristretto255", .comb_ristretto, .ladder_ristretto, iters, &scalars, pv);
     chk ^= pair("runtime point (control)", .ladder_var, .std_var, iters, &scalars, pv);
     chk ^= pair("X25519 public key", .x25519_comb, .x25519_std, iters, &scalars, pv);
-    peer_u = try std.crypto.dh.X25519.recoverPublicKey(scalars[7]);
+    peer_u = std.crypto.dh.X25519.recoverPublicKey(scalars[7]);
     std.debug.print("X25519 shared secret: this build dispatches to {t}\n", .{ct.test_hooks.default});
     if (ct.test_hooks.available(.mulx_adx)) chk ^= pair("X25519 shared, MULX+ADX", .dh_adx, .dh_std, iters, &scalars, pv);
     if (ct.test_hooks.available(.mulx)) chk ^= pair("X25519 shared, MULX only", .dh_mulx, .dh_std, iters, &scalars, pv);

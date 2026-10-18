@@ -473,6 +473,8 @@ test "F3: Secp256k1.mul(P, s) rejects s ≡ 0 (mod n), same as combMulBase" {
 // positive control shows that comparison can fail.
 
 fn stdOf(p: Secp256k1) !StdCurve {
+    // 0.17: std's `fromAffineCoordinates` rejects (0, 0), so the identity no longer round-trips via SEC1.
+    if (std.meta.isError(p.rejectIdentity())) return StdCurve.identityElement;
     const enc = p.toUncompressedSec1();
     return StdCurve.fromSec1(&enc);
 }

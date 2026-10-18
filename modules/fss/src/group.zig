@@ -17,14 +17,14 @@ const std = @import("std");
 
 /// The additive group Z_{2^{8L}} of `L`-byte little-endian integers.
 /// `L` must be > 0. Common choices: `L=4` (Z_{2^32}), `L=8` (Z_{2^64}),
-/// `L=16` (Z_{2^128}). Arbitrary-width via `std.meta.Int`.
+/// `L=16` (Z_{2^128}). Arbitrary-width via `@Int`.
 pub fn Z2k(comptime L: usize) type {
     if (L == 0) @compileError("Z2k: L must be > 0");
     return struct {
         pub const byte_len = L;
         /// The group element type: an unsigned integer of exactly `8*L` bits,
         /// so ordinary `+%`/`-%` already reduce mod 2^{8L}.
-        pub const Int = std.meta.Int(.unsigned, 8 * L);
+        pub const Int = @Int(.unsigned, 8 * L);
 
         /// group addition (mod 2^{8L})
         pub fn add(a: Int, b: Int) Int {

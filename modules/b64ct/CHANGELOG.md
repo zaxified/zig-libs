@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — Ported to Zig 0.17.0: comptime `strRepeat` branch quota scaled with length.
 - **2026-10-17** — New module: constant-time base64 (RFC 4648 standard and
   URL alphabets, padded and unpadded) for secrets, replacing the private
   `b64ct.zig` copies in acme, dns, smtp and megolm. libsodium's decoder

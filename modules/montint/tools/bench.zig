@@ -107,7 +107,7 @@ fn Case(comptime bits: comptime_int) type {
 }
 
 const Ctx = struct {
-    cases: std.meta.Tuple(&blk: {
+    cases: @Tuple(&blk: {
         var t: [sizes.len]type = undefined;
         for (sizes, 0..) |b, i| t[i] = Case(b);
         break :blk t;

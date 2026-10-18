@@ -52,7 +52,7 @@ pub fn main() !void {
         const msg = data[0..len];
 
         var name: [32]u8 = undefined;
-        const path = std.fmt.bufPrintZ(&name, "blob_{d:0>2}.bin", .{i}) catch unreachable;
+        const path = std.fmt.bufPrintSentinel(&name, "blob_{d:0>2}.bin", .{i}, 0) catch unreachable;
         const fd: i32 = @intCast(linux.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644));
         var w: usize = 0;
         while (w < len) w += linux.write(fd, msg[w..].ptr, len - w);

@@ -1439,8 +1439,8 @@ const WipeCheckingAllocator = struct {
 /// Type of a function's LAST parameter, or `null` if that parameter is itself
 /// generic. Used by the seam test below to read a signature at comptime.
 fn lastParamType(comptime F: type) ?type {
-    const p = @typeInfo(F).@"fn".params;
-    return p[p.len - 1].type;
+    const p = @typeInfo(F).@"fn".param_types;
+    return p[p.len - 1];
 }
 
 test "RNG seam: every production keygen/encrypt takes std.Io, only the ForTest twins take std.Random" {

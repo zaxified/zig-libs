@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — Ported to Zig 0.17.0: tests: std oracle renamed `Crc32Iscsi` -> `@"CRC-32/ISCSI"`.
 - **2026-10-08** — **NO CONSUMER-VISIBLE CHANGE:** `tools/count.tsv` rewritten, 2139 → 1631
   instructions per 4 KiB round (−24 %): the 2026-10-07 `crc32q` chain change below, which the
   baseline had not recorded — found by the new `count amd64` lane on its first local run.

@@ -130,7 +130,7 @@ pub fn DpfWith(comptime P: type, comptime n_bits: usize, comptime out_bytes: usi
         /// output-group element type (Z_{2^{8*out_bytes}})
         pub const Elem = G.Int;
         /// domain index type: an `n`-bit unsigned integer in `0..2^n`
-        pub const Index = std.meta.Int(.unsigned, n_bits);
+        pub const Index = @Int(.unsigned, n_bits);
         /// number of points in the domain (`2^n`)
         pub const domain_size: usize = @as(usize, 1) << @intCast(n_bits);
 

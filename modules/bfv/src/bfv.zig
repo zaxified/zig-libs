@@ -167,7 +167,7 @@ pub fn Bfv(comptime P: params.Params) type {
         /// parameters (`log q ≳ 218`). It is now sized from `P`. The `@max(128,
         /// …)` floor keeps every parameter set that fitted before on exactly
         /// the same type, so their arithmetic is bit-identical to what it was.
-        pub const QU = std.meta.Int(.unsigned, @max(128, q_bits + 1));
+        pub const QU = @Int(.unsigned, @max(128, q_bits + 1));
         /// Unsigned type for the round-half-up rescale numerator `2·t·v + q`
         /// (`v < q`), used by `decrypt` / `noiseBudget`. The tight requirement
         /// is `2t(q−1) + q < 2^bits`, i.e. `q_bits + t_bits + 2` in the worst
@@ -175,7 +175,7 @@ pub fn Bfv(comptime P: params.Params) type {
         /// for every set shipped here `+1` would also fit, so a mutant that
         /// narrows this by one bit survives — by luck of the parameters, not by
         /// equivalence.
-        const QRescale = std.meta.Int(.unsigned, @max(128, q_bits + bitsOf(P.t) + 2));
+        const QRescale = @Int(.unsigned, @max(128, q_bits + bitsOf(P.t) + 2));
 
         /// Full ciphertext modulus `q = ∏ q_i` as an integer. Production RNS
         /// never materialises it in the multiply hot path (see `mulBehz`), but
@@ -242,7 +242,7 @@ pub fn Bfv(comptime P: params.Params) type {
         /// value it ever holds is `< 2^(62·num_aux + 1) ≤ 2^(64·num_aux)`.
         /// Sizing it at exactly `64·num_aux` (rather than one limb wider) keeps
         /// the common `num_aux = 2` case in a NATIVE `u128`.
-        const AuxU = std.meta.Int(.unsigned, 64 * num_aux);
+        const AuxU = @Int(.unsigned, 64 * num_aux);
 
         // ── BEHZ rescale-in-RNS: bounds and basis sizing ─────────────────────
         //
@@ -321,7 +321,7 @@ pub fn Bfv(comptime P: params.Params) type {
         };
         /// Signed integer type the exact tensor and its rescale run in. Sized
         /// from the parameters instead of pinned at `i256`.
-        pub const TensorI = std.meta.Int(.signed, @max(65, rescale_bits));
+        pub const TensorI = @Int(.signed, @max(65, rescale_bits));
 
         /// The `L` per-prime NTT engines + the prime chain, built once.
         engines: [L]Engine,
@@ -480,7 +480,7 @@ pub fn Bfv(comptime P: params.Params) type {
             // ── BEHZ constants ───────────────────────────────────────────────
             // `P = ∏_{j<num_rs} p_j` as a comptime-sized unsigned; `num_rs`
             // primes of < 2^62 fit in `64·num_rs` bits with room to spare.
-            const RsU = std.meta.Int(.unsigned, 64 * num_rs);
+            const RsU = @Int(.unsigned, 64 * num_rs);
             var rs_modulus: RsU = 1;
             for (0..num_rs) |j| rs_modulus *= aux_primes[j];
 
@@ -498,7 +498,7 @@ pub fn Bfv(comptime P: params.Params) type {
 
             // `div_shift` is a comptime_int that can exceed `u64`; reduce it
             // modularly at comptime, once per modulus, via its bit expansion.
-            const ShiftU = std.meta.Int(.unsigned, @max(64, bitsOf(div_shift) + 1));
+            const ShiftU = @Int(.unsigned, @max(64, bitsOf(div_shift) + 1));
             const shift_val: ShiftU = div_shift;
 
             for (0..L) |i| {
@@ -1087,7 +1087,7 @@ pub fn Bfv(comptime P: params.Params) type {
                 b_i.subAssign(&mask, &self.primes); // w^i·s² − (a_i·s + e_i)
                 rlk.b[i] = b_i;
                 rlk.a[i] = a_i;
-                const WPow = std.meta.Int(.unsigned, @as(u16, @bitSizeOf(QU)) + relin_base_log2);
+                const WPow = @Int(.unsigned, @as(u16, @bitSizeOf(QU)) + relin_base_log2);
                 w_pow = @intCast((@as(WPow, w_pow) << relin_base_log2) % @as(WPow, q_product));
             }
         }
@@ -1580,8 +1580,8 @@ fn lastParamType(comptime F: type) ?type {
 /// points that return key material through a trailing `out` pointer carry the
 /// randomness source just before it).
 fn drawParamType(comptime F: type, comptime skip: usize) ?type {
-    const p = @typeInfo(F).@"fn".params;
-    return p[p.len - 1 - skip].type;
+    const p = @typeInfo(F).@"fn".param_types;
+    return p[p.len - 1 - skip];
 }
 
 test "RNG seam: keyGen/encrypt/genRelinKey take std.Io, only the ForTest twins take std.Random" {

@@ -202,7 +202,7 @@ fn diffAgainstFf(comptime p: comptime_int) !void {
     const F = Field(p);
     const Ff = std.crypto.ff.Modulus(F.encoded_bytes * 8);
     var p_be: [F.encoded_bytes]u8 = undefined;
-    std.mem.writeInt(std.meta.Int(.unsigned, F.encoded_bytes * 8), &p_be, p, .big);
+    std.mem.writeInt(@Int(.unsigned, F.encoded_bytes * 8), &p_be, p, .big);
     const ff = try Ff.fromBytes(&p_be, .big);
 
     var prng = std.Random.DefaultPrng.init(0x6d6f6e74_6669656c);

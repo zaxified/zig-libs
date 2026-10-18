@@ -633,7 +633,7 @@ test "SELF: the key encoding is a compile-time constant with no count field" {
         // The decoder's parameter type is a pointer to an array of exactly
         // that length: a compile-time fact, so a mismatched length cannot even
         // be expressed at the call site.
-        const Param = @typeInfo(@TypeOf(M.Key.fromBytes)).@"fn".params[1].type.?;
+        const Param = @typeInfo(@TypeOf(M.Key.fromBytes)).@"fn".param_types[1].?;
         try testing.expectEqual(
             @as(type, *const [M.Key.serialized_len]u8),
             Param,

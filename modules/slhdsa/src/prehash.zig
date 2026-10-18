@@ -96,8 +96,8 @@ test "OID encodings and digest lengths match FIPS 205 / CSOR" {
     const t = std.testing;
     try t.expectEqualSlices(u8, &.{ 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01 }, &PreHash.sha2_256.oid());
     try t.expectEqual(@as(u8, 12), PreHash.shake256.oid()[10]);
-    inline for (@typeInfo(PreHash).@"enum".fields) |f| {
-        const ph: PreHash = @enumFromInt(f.value);
+    inline for (@typeInfo(PreHash).@"enum".field_values) |fv| {
+        const ph: PreHash = @fromBackingInt(@intCast(fv));
         var out: [max_digest_length]u8 = undefined;
         try t.expectEqual(ph.digestLength(), ph.hash("abc", &out).len);
     }

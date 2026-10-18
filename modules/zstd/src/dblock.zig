@@ -415,9 +415,9 @@ fn decodeSeqHeaders(st: *State, nb_seq: *u32, src: []const u8) Error!usize {
 
     if (ip + 1 > iend) return error.SrcSizeWrong;
     if (src[ip] & 3 != 0) return error.CorruptionDetected; // reserved bits
-    const ll_type: EncType = @enumFromInt(src[ip] >> 6);
-    const of_type: EncType = @enumFromInt((src[ip] >> 4) & 3);
-    const ml_type: EncType = @enumFromInt((src[ip] >> 2) & 3);
+    const ll_type: EncType = @fromBackingInt(@intCast(src[ip] >> 6));
+    const of_type: EncType = @fromBackingInt(@intCast((src[ip] >> 4) & 3));
+    const ml_type: EncType = @fromBackingInt(@intCast((src[ip] >> 2) & 3));
     ip += 1;
 
     ip += buildSeqTable(&st.ll, &st.ll_ptr, ll_type, max_ll, ll_fse_log, src[ip..], &ll_base, &seqs.ll_bits, &ll_default, st.fse_entropy) catch return error.CorruptionDetected;
@@ -518,7 +518,7 @@ inline fn copy16(out: []u8, op: usize, src: []const u8, ip: usize) void {
 /// `ZSTD_copy8`/`ZSTD_copy4` within `out` for ranges at least `N` apart:
 /// one load, one store. `std.mem.copyForwards` would be a byte loop.
 inline fn copyWithin(comptime N: usize, out: []u8, op: usize, ip: usize) void {
-    const T = std.meta.Int(.unsigned, N * 8);
+    const T = @Int(.unsigned, N * 8);
     std.mem.writeInt(T, out[op..][0..N], std.mem.readInt(T, out[ip..][0..N], .little), .little);
 }
 

@@ -149,6 +149,9 @@ pub fn sqPortable(a: [4]u64) [4]u64 {
 
 // ── the field element type ──────────────────────────────────────────────────
 
+/// Module-level `field_order` under a name that does not clash with `Fe.field_order`.
+const fe_order = field_order;
+
 /// A secp256k1 base-field element: four full 2^64 little-endian limbs, always
 /// canonical (`value < p`) between operations.
 ///
@@ -177,6 +180,9 @@ pub const Fe = struct {
     /// The field prime as an integer type, for parity with std's `Fe.IntRepr`.
     pub const IntRepr = u256;
 
+    /// The field prime; std's `Ecdsa` reads `Curve.Fe.field_order` (0.17).
+    pub const field_order: comptime_int = fe_order; // comptime_int like std (Ecdsa does `2 * n` at comptime)
+
     inline fn value(fe: Fe) u256 {
         return toU256(fe._limbs);
     }
@@ -191,13 +197,13 @@ pub const Fe = struct {
     /// Reject an encoding of a value `>= p` (non-canonical), matching std.
     pub fn rejectNonCanonical(s: [encoded_length]u8, endian: std.builtin.Endian) NonCanonicalError!void {
         const v = std.mem.readInt(u256, &s, endian);
-        if (v >= field_order) return error.NonCanonical;
+        if (v >= fe_order) return error.NonCanonical;
     }
 
     /// Unpack a field element, rejecting a non-canonical (`>= p`) encoding.
     pub fn fromBytes(s: [encoded_length]u8, endian: std.builtin.Endian) NonCanonicalError!Fe {
         const v = std.mem.readInt(u256, &s, endian);
-        if (v >= field_order) return error.NonCanonical;
+        if (v >= fe_order) return error.NonCanonical;
         return .{ ._limbs = fromU256(v) };
     }
 
@@ -210,7 +216,7 @@ pub const Fe = struct {
 
     /// Create a field element from a comptime integer `< p`.
     pub fn fromInt(comptime x: u256) NonCanonicalError!Fe {
-        if (x >= field_order) return error.NonCanonical;
+        if (x >= fe_order) return error.NonCanonical;
         return .{ ._limbs = fromU256(x) };
     }
 
@@ -290,7 +296,7 @@ pub const Fe = struct {
         // borrow bit is laundered through `blackBox` so the masked add does not
         // become a data-dependent branch (see the barrier note above).
         const mask: u256 = @as(u256, 0) -% @as(u256, blackBox(@as(u64, d[1])));
-        const v = d[0] +% (field_order & mask);
+        const v = d[0] +% (fe_order & mask);
         return .{ ._limbs = fromU256(v) };
     }
 

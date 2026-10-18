@@ -413,7 +413,7 @@ test "every backend agrees with std's implementation at every length and alignme
             for (0..16) |off| {
                 if (n > 2048 and off % 5 != 0) continue; // the long ones at a few offsets
                 const data = buf[off..][0..n];
-                const want = std.hash.crc.Crc32Iscsi.hash(data);
+                const want = std.hash.crc.@"CRC-32/ISCSI".hash(data);
                 try testing.expectEqual(want, hashWith(b, data).?);
             }
         }
@@ -440,7 +440,7 @@ test "extend and the streaming form build the checksum of a whole from its piece
     var buf: [3000]u8 = undefined;
     var prng = std.Random.DefaultPrng.init(7);
     prng.random().bytes(&buf);
-    const whole = std.hash.crc.Crc32Iscsi.hash(&buf);
+    const whole = std.hash.crc.@"CRC-32/ISCSI".hash(&buf);
     for ([_]usize{ 0, 1, 7, 8, 9, 255, 256, 769, 2999, 3000 }) |cut| {
         try testing.expectEqual(whole, extend(hash(buf[0..cut]), buf[cut..]));
         var s = Crc32c.init();
@@ -456,7 +456,7 @@ test "combine joins two checksums without the bytes" {
     defer testing.allocator.free(buf);
     var prng = std.Random.DefaultPrng.init(11);
     prng.random().bytes(buf);
-    const whole = std.hash.crc.Crc32Iscsi.hash(buf);
+    const whole = std.hash.crc.@"CRC-32/ISCSI".hash(buf);
     for ([_]usize{ 0, 1, 3, 8, 1000, 32_768, 69_999, 70_000 }) |cut| {
         const a = hash(buf[0..cut]);
         const b = hash(buf[cut..]);
@@ -528,7 +528,7 @@ fn fuzzHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void 
     const len = src.slice(&fuzz_buf);
     const data = fuzz_buf[0..len];
     if (len == 0) mark(.empty) else if (len < 3 * short_block) mark(.short) else if (len < 3 * long_block) mark(.split_short) else mark(.split_long);
-    const want = std.hash.crc.Crc32Iscsi.hash(data);
+    const want = std.hash.crc.@"CRC-32/ISCSI".hash(data);
     for (all_backends) |b| if (hashWith(b, data)) |got| {
         if (b != .table) mark(.hw_backend);
         try testing.expectEqual(want, got);

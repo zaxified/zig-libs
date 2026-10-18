@@ -2301,7 +2301,7 @@ test "every stream variant: xor and stream byte-exact vs std, both engines, edge
     inline for (stream_pairs) |pair| {
         const Ours = pair[0];
         const Theirs = pair[1];
-        const Counter = @typeInfo(@TypeOf(Theirs.xor)).@"fn".params[2].type.?;
+        const Counter = @typeInfo(@TypeOf(Theirs.xor)).@"fn".param_types[2].?;
         var key: [32]u8 = undefined;
         var nonce: [Ours.nonce_length]u8 = undefined;
         rand.bytes(&key);

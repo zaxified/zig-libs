@@ -42,7 +42,7 @@ const Std = std.crypto.ecc.P256.scalar;
 const StdScalar = Std.Scalar;
 
 /// The scalar field (group) order `n`.
-pub const field_order: u256 = Std.field_order;
+pub const field_order: comptime_int = Std.field_order; // comptime_int like std: Ecdsa evaluates `2 * n` at comptime (0.17)
 
 pub const encoded_length = Std.encoded_length;
 /// A compressed scalar, in canonical form.

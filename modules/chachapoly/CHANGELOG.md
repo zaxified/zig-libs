@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — Ported to Zig 0.17.0: `Fn.params` -> `param_types` (test); `strRepeat` branch quota scaled with length.
 - **2026-10-17** — Instruction-count baseline (`tools/count.tsv`) rewritten for the 2026-10-13 u64-lane Poly1305 (seal 64 B +5.2 %, 1 KiB +7.4 %, 16 KiB −9.3 % instructions). Tooling only.
 
 - **2026-10-13** — **Scope → parity: every variant `std` has.** New types, std's shapes, each with `*Into` twins: `XChaCha20Poly1305`, `XChaCha12Poly1305`, `XChaCha8Poly1305`, `ChaCha12Poly1305`, `ChaCha8Poly1305`, streams `XChaCha20`/`12`/`8`, `ChaCha12`, `ChaCha8`, `ChaCha20With64BitNonce`/`12`/`8` (64-bit counter carried across words 12–13 inside a wide group), and `hchacha20` (Go `chacha20.HChaCha20`, libsodium `crypto_core_hchacha20`). `counterWouldWrap64` for the 64-bit counter. Anchored on Wycheproof `xchacha20_poly1305_test.json` (306 vectors), libsodium 1.0.18 goldens (`tools/libsodium_goldens.py`) and a std differential over all fifteen types; ctgrind `xaead` target; stackprobe needles for the XChaCha subkey. `tools/wycheproof.py` takes the nonce size as a second argument. Additive: `ChaCha20` and `ChaCha20Poly1305` keep their API.

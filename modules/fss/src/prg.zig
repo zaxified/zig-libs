@@ -157,14 +157,14 @@ pub const Sha256Prg = struct {
     /// `convert(L, seed)` — map a leaf seed into the output group Z_{2^{8L}}.
     /// Returns an unsigned integer of `8*L` bits (little-endian of the hash).
     // secret-api-ok: PRG interface, called once per tree node (and per leaf) from dpf/mpf walks, which run under the entry point's burn; a burn per call would multiply the walk cost. Seeds are consumed by value on purpose (register-sized, same-frame copies die with the walk's frame).
-    pub fn convert(_: Sha256Prg, comptime L: usize, seed: Seed) std.meta.Int(.unsigned, 8 * L) {
+    pub fn convert(_: Sha256Prg, comptime L: usize, seed: Seed) @Int(.unsigned, 8 * L) {
         if (L > 32) @compileError("convert: L must be <= 32 (SHA-256 output width)");
         var cv: [32]u8 = undefined;
         var h = Sha256.init(.{});
         h.update(&seed);
         h.update(&[_]u8{0x02});
         h.final(&cv);
-        const Int = std.meta.Int(.unsigned, 8 * L);
+        const Int = @Int(.unsigned, 8 * L);
         var buf: [L]u8 = undefined;
         @memcpy(&buf, cv[0..L]);
         return std.mem.readInt(Int, &buf, .little);
@@ -264,9 +264,9 @@ pub const Aes128Mmo = struct {
     }
 
     // secret-api-ok: PRG interface, called once per tree node (and per leaf) from dpf/mpf walks, which run under the entry point's burn; a burn per call would multiply the walk cost. Seeds are consumed by value on purpose (register-sized, same-frame copies die with the walk's frame).
-    pub fn convert(self: Aes128Mmo, comptime L: usize, seed: Seed) std.meta.Int(.unsigned, 8 * L) {
+    pub fn convert(self: Aes128Mmo, comptime L: usize, seed: Seed) @Int(.unsigned, 8 * L) {
         if (L > 32) @compileError("convert: L must be <= 32 (two AES blocks)");
-        const Int = std.meta.Int(.unsigned, 8 * L);
+        const Int = @Int(.unsigned, 8 * L);
         var cv: [32]u8 = undefined;
         cv[0..16].* = self.h(seed, tweak_convert);
         // A second block only when the output group is wider than one block;
@@ -471,7 +471,7 @@ test "every PRG: convert(L) is the low L bytes of convert(32), for every L" {
         const s: Seed = @as([16]u8, @splat(0x3C));
         const full = p.convert(32, s);
         inline for (1..33) |L| {
-            const T = std.meta.Int(.unsigned, 8 * L);
+            const T = @Int(.unsigned, 8 * L);
             try std.testing.expectEqual(@as(T, @truncate(full)), p.convert(L, s));
         }
     }

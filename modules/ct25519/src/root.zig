@@ -1784,10 +1784,10 @@ test "X25519: recoverPublicKey is bit-exact with std over random and edge seeds"
         var wide: [64]u8 = undefined;
         std.crypto.hash.sha2.Sha512.hash(std.mem.asBytes(&n), &wide, .{});
         seed = wide[0..32].*;
-        try testing.expectEqualSlices(u8, &(try std.crypto.dh.X25519.recoverPublicKey(seed)), &(try X25519.recoverPublicKey(seed)));
+        try testing.expectEqualSlices(u8, &std.crypto.dh.X25519.recoverPublicKey(seed), &(try X25519.recoverPublicKey(seed)));
     }
     for ([_][32]u8{ @splat(0), @splat(0xff), [_]u8{1} ++ @as([31]u8, @splat(0)), @as([31]u8, @splat(0)) ++ [_]u8{0x80}, [_]u8{7} ++ @as([30]u8, @splat(0)) ++ [_]u8{0x40} }) |s| {
-        try testing.expectEqualSlices(u8, &(try std.crypto.dh.X25519.recoverPublicKey(s)), &(try X25519.recoverPublicKey(s)));
+        try testing.expectEqualSlices(u8, &std.crypto.dh.X25519.recoverPublicKey(s), &(try X25519.recoverPublicKey(s)));
     }
 }
 
@@ -1795,7 +1795,7 @@ test "X25519: a key pair from the comb agrees with a std key pair on the shared 
     const seed_a: [32]u8 = @splat(0x42);
     const seed_b: [32]u8 = @splat(0x24);
     const ours = try X25519.KeyPair.generateDeterministic(seed_a);
-    const theirs = try std.crypto.dh.X25519.KeyPair.generateDeterministic(seed_b);
+    const theirs = std.crypto.dh.X25519.KeyPair.generateDeterministic(seed_b);
     const k1 = try x25519Value(&ours.secret_key, theirs.public_key);
     const k2 = try std.crypto.dh.X25519.scalarmult(theirs.secret_key, ours.public_key);
     try testing.expectEqualSlices(u8, &k1, &k2);

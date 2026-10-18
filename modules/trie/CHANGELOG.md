@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — Ported to Zig 0.17.0: `Fn.params` -> `param_types` in the automaton interface check.
 - **2026-10-13** — **core → parity with BurntSushi/fst 0.4 (S2).** New
   `automaton.zig` + `Frozen.search`: every key a byte automaton matches, in
   order, pruned by `canMatch` (also mid-edge in v2) and cut short by

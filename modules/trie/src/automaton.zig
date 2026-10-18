@@ -58,10 +58,10 @@ fn checkFn(comptime A: type, comptime name: []const u8, comptime params: []const
     if (info != .@"fn")
         @compileError("automaton " ++ @typeName(A) ++ ": `" ++ name ++ "` must be a function");
     const f = info.@"fn";
-    if (f.params.len != params.len)
+    if (f.param_types.len != params.len)
         @compileError("automaton " ++ @typeName(A) ++ ": `" ++ name ++ "` takes the wrong number of parameters");
     inline for (params, 0..) |p, i| {
-        if (f.params[i].type != p)
+        if (f.param_types[i] != p)
             @compileError("automaton " ++ @typeName(A) ++ ": parameter " ++ std.fmt.comptimePrint("{d}", .{i}) ++ " of `" ++ name ++ "` must be `" ++ @typeName(p) ++ "`");
     }
     if (f.return_type != ret)

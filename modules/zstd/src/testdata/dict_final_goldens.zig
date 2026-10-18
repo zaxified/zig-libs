@@ -79,9 +79,9 @@ pub const rows = [_]Golden{
 };
 
 /// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
-fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     const rep_result = comptime blk: {
-        @setEvalBranchQuota(n * 2 + 1000);
+        @setEvalBranchQuota(n * (s.len + 4) + 1000);
         var buf: [s.len * n:0]u8 = undefined;
         for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
         const rep_final = buf;
