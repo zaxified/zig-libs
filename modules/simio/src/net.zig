@@ -1062,7 +1062,7 @@ pub const Net = struct {
             // Linux reports a pending socket error only once the queue is read.
             if (s.err) |e| if (avail == 0 or s.rx_shut) return switch (e) {
                 .reset, .refused => error.ConnectionResetByPeer,
-                .timeout => error.Timeout,
+                .timeout => error.ConnectionTimedOut,
             };
             if (avail > 0 and !s.rx_shut) {
                 var cap: usize = 0;

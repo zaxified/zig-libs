@@ -46,9 +46,6 @@ pub const vtable: Io.VTable = blk: {
     vt.netAccept = netAccept;
     vt.netBindIp = netBindIp;
     vt.netConnectIp = netConnectIp;
-    vt.netSend = netSend;
-    vt.netRead = netRead;
-    vt.netWrite = netWrite;
     vt.netClose = netClose;
     vt.netShutdown = netShutdown;
     vt.netLookup = netLookup;
@@ -248,6 +245,21 @@ fn operate(userdata: ?*anyopaque, operation: Io.Operation) Io.Cancelable!Io.Oper
     const h = hostOf(userdata);
     return switch (operation) {
         .net_receive => |op| .{ .net_receive = try h.sim.net.receive(h, op) },
+        .net_send => |op| .{ .net_send = h.sim.net.send(h, op.socket_handle, op.messages) },
+        .net_read => |op| blk: {
+            const n = h.sim.net.read(h, op.socket_handle, op.data) catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+                else => |e| break :blk .{ .net_read = e },
+            };
+            break :blk .{ .net_read = .{ .data_len = n } };
+        },
+        .net_write => |op| blk: {
+            const n = h.sim.net.write(h, op.socket_handle, op.header, op.data, op.splat) catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+                else => |e| break :blk .{ .net_write = e },
+            };
+            break :blk .{ .net_write = n };
+        },
         .file_read_streaming => |op| blk: {
             if (h.sim.current) |me| try h.sim.cancelPoint(me);
             break :blk .{ .file_read_streaming = h.fs.readStreaming(op.file, op.data) };
@@ -362,26 +374,9 @@ fn netConnectIp(userdata: ?*anyopaque, address: *const net.IpAddress, options: n
     return h.sim.net.connect(h, address, options);
 }
 
-fn netSend(userdata: ?*anyopaque, handle: net.Socket.Handle, messages: []net.OutgoingMessage, flags: net.SendFlags) struct { ?net.Socket.SendError, usize } {
-    _ = flags;
+fn netClose(userdata: ?*anyopaque, sockets: []const net.Socket) void {
     const h = hostOf(userdata);
-    const err, const n = h.sim.net.send(h, handle, messages);
-    return .{ err, n };
-}
-
-fn netRead(userdata: ?*anyopaque, src: net.Socket.Handle, data: [][]u8) net.Stream.Reader.Error!usize {
-    const h = hostOf(userdata);
-    return h.sim.net.read(h, src, data);
-}
-
-fn netWrite(userdata: ?*anyopaque, dest: net.Socket.Handle, header: []const u8, data: []const []const u8, splat: usize) net.Stream.Writer.Error!usize {
-    const h = hostOf(userdata);
-    return h.sim.net.write(h, dest, header, data, splat);
-}
-
-fn netClose(userdata: ?*anyopaque, handles: []const net.Socket.Handle) void {
-    const h = hostOf(userdata);
-    h.sim.net.close(h, handles);
+    for (sockets) |s| h.sim.net.close(h, (&s.handle)[0..1]);
 }
 
 fn netShutdown(userdata: ?*anyopaque, handle: net.Socket.Handle, how: net.ShutdownHow) net.ShutdownError!void {

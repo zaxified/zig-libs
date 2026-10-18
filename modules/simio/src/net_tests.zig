@@ -574,7 +574,7 @@ fn rawReader(io: Io, to: net.IpAddress, out: *Reads) !void {
     while (out.total < 32 * 1024) {
         const left = 32 * 1024 - out.total;
         bufs[0] = buf[0..@min(buf.len, left)];
-        const n = try io.vtable.netRead(io.userdata, stream.socket.handle, &bufs);
+        const n = (try stream.readWithControl(io, &bufs, &.{})).data_len;
         if (n == 0) break;
         if (n < bufs[0].len) out.short += 1 else out.full += 1;
         out.total += n;
@@ -895,7 +895,7 @@ test "a stream over a link that loses everything times out instead of looping" {
     _ = sim.runFor(50 * std.time.ns_per_ms);
     try sim.link(a, b, .{ .loss_permille = 1000 });
     _ = sim.runFor(2000 * std.time.ns_per_s);
-    try testing.expectEqual(@as(?anyerror, error.Timeout), err);
+    try testing.expectEqual(@as(?anyerror, error.ConnectionTimedOut), err);
 }
 
 fn twoReceivesOneSocket(io: Io, ok: *bool) !void {

@@ -843,7 +843,7 @@ const CueIo = struct {
         vt.netBindIp = netBindIp;
         vt.netListenIp = netListenIp;
         vt.netAccept = netAccept;
-        vt.netRead = netRead;
+        vt.operate = operate; // 0.17: socket reads are `Operation.net_read` through `vtable.operate`
         vt.batchAwaitConcurrent = batchAwaitConcurrent;
         return .{ .vtable = vt, .userdata = inner.userdata };
     }
@@ -880,7 +880,7 @@ const CueIo = struct {
         if (hold_after_listens != 0 and n + 1 == hold_after_listens) {
             while (go.load(.acquire) == 0) {
                 inner_vtable.checkCancel(userdata) catch |e| {
-                    inner_vtable.netClose(userdata, &.{s.handle});
+                    inner_vtable.netClose(userdata, (&s)[0..1]);
                     return e;
                 };
                 sleepMs(1);
@@ -896,9 +896,9 @@ const CueIo = struct {
         return s;
     }
 
-    fn netRead(userdata: ?*anyopaque, src: std.Io.net.Socket.Handle, data: [][]u8) std.Io.net.Stream.Reader.Error!usize {
-        _ = read_entered.fetchAdd(1, .monotonic);
-        return inner_vtable.netRead(userdata, src, data);
+    fn operate(userdata: ?*anyopaque, op: std.Io.Operation) std.Io.Cancelable!std.Io.Operation.Result {
+        if (op == .net_read) _ = read_entered.fetchAdd(1, .monotonic);
+        return inner_vtable.operate(userdata, op);
     }
 
     /// `Socket.receiveTimeout` is `io.operateTimeout`, which waits here.

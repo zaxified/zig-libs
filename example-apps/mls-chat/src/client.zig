@@ -124,9 +124,9 @@ pub fn init(gpa: std.mem.Allocator, io: std.Io, opts: Options) !Client {
     try io.randomSecure(&seed);
     const sig = try S.Sig.KeyPair.generateDeterministic(seed);
     try io.randomSecure(&seed);
-    const init_pair = try S.Kem.KeyPair.generateDeterministic(seed);
+    const init_pair = S.Kem.KeyPair.generateDeterministic(seed);
     try io.randomSecure(&seed);
-    const enc_pair = try S.Kem.KeyPair.generateDeterministic(seed);
+    const enc_pair = S.Kem.KeyPair.generateDeterministic(seed);
     std.crypto.secureZero(u8, &seed);
 
     // The KeyPackage borrows `opts.name` for its credential and the arena
