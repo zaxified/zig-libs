@@ -1,7 +1,7 @@
-# zig: 0.16.0
+# zig: 0.17.0
 # valgrind: valgrind-3.26.0
 # cpu: x86_64_v3
 # case	rounds	instructions per round (scripts/count-insns)
-aead-seal-64B	2000	2422.0
-aead-seal-1KiB	500	8237.1
-aead-seal-16KiB	50	82757.6
+aead-seal-64B	2000	2044.0
+aead-seal-1KiB	500	8059.1
+aead-seal-16KiB	50	82579.5
