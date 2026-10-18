@@ -1,10 +1,8 @@
 # Zig pitfalls in this repository
 
-General Zig API changes and gotchas live in the `zig` skill (`.claude/skills/zig`,
-vendored from an audited zaxified/zig-skills release — never edit it here). The vendored copy
-is still the 0.16.0 release while this tree builds with 0.17.0: for 0.17 spellings use the
-`zig-0.17` skill (zaxified/zig-skills) until the vendored copy is refreshed. This file holds
-only what is specific to zig-libs.
+General Zig API changes and gotchas live in the `zig-0.17` skill (`.claude/skills/zig-0.17`,
+vendored from an audited zaxified/zig-skills release — never edit it here; update it only with
+that repository's `scripts/install.py`). This file holds only what is specific to zig-libs.
 
 ## Build modes and backends here
 

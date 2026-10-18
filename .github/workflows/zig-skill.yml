@@ -1,15 +1,15 @@
 name: zig-skill
 
-# The zig skill in .claude/skills/zig is vendored from an audited release of
+# The zig-0.17 skill in .claude/skills/zig-0.17 is vendored from an audited release of
 # https://github.com/zaxified/zig-skills (cloud sessions load only what is
 # committed). This checks it is byte for byte the release its manifest names:
 # the tag must point at the recorded commit, and no file may be edited, added
 # or removed. Update it only with that repository's scripts/install.py.
 on:
   push:
-    paths: [".claude/skills/zig/**", ".github/workflows/zig-skill.yml"]
+    paths: [".claude/skills/zig-0.17/**", ".github/workflows/zig-skill.yml"]
   pull_request:
-    paths: [".claude/skills/zig/**", ".github/workflows/zig-skill.yml"]
+    paths: [".claude/skills/zig-0.17/**", ".github/workflows/zig-skill.yml"]
 
 permissions:
   contents: read
@@ -26,7 +26,7 @@ jobs:
         run: |
           python3 - <<'PY'
           import filecmp, json, os, subprocess, sys
-          d = ".claude/skills/zig"
+          d = ".claude/skills/zig-0.17"
           m = json.load(open(os.path.join(d, ".zig-skills-source.json")))
           tag, commit = m["tag"], m["commit"]
           if not tag.startswith("v"):
