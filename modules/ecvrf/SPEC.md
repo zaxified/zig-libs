@@ -196,6 +196,19 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   lines, because both forms end in one branch on a tainted equality at the
   same call site and memcheck counts contexts by address.
 
+  **Zig 0.17.0 (2026-10-18): `verify` 7 / 7 -> 9 / 9, benign.** The two new
+  contexts are std's `Edwards25519.fromBytes` at `edwards25519.zig:46`, once
+  under `stringToPoint` (`ecvrf.zig:367`, the try-and-increment candidate)
+  and once under `verify`'s decode of `H` (`:574`). 0.17's std added
+  `if (x.isZero() and (s[31] >> 7) != 0) return error.InvalidEncoding` —
+  RFC 8032 §5.1.3's "x = 0 and x_0 = 1" refusal, which `stringToPoint` has
+  always made itself one line later (`:368`, A1 E14/E16). Both inputs are
+  functions of `alpha` and the public key only; nothing secret is in `verify`.
+  It also leaves `verify`'s `fromBytes(h_string) catch unreachable` sound:
+  0.17 refuses exactly the strings `stringToPoint` already refused, so `H`
+  (which passed `stringToPoint`) still decodes. The row keeps its `>=1` bound;
+  `prove` is 2 / 0 on 0.17 as on 0.16.
+
   **That swap is caught by `scripts/checks/check-ct-compare.py` instead** (A1 E15),
   which pins this file at one `timing_safe` comparison and zero plain
   `std.mem` ones and runs in every lane that touches the module. Measured

@@ -1134,10 +1134,28 @@ classify_contexts() {
             # location, a formatter frame BELOW the harness (a `format` callback), a
             # truncated stack with no harness frame at all — is not the harness printing
             # its result, so it is not a propagation witness and lands in `unattr`.
-            function frame_file(l,    f) {
+            # Zig 0.16 printed a frame file as its basename (`Writer.zig:1812`); 0.17
+            # prints it relative to its package root (`std/Io/Writer.zig:1944`,
+            # `modules/aescbc/src/ctgrind_harness.zig:144`; compiler_rt frames such as
+            # `memcpy.zig` stay bare). frame_path keeps what was printed, frame_file is
+            # the basename both rules below are keyed by.
+            function frame_path(l,    f) {
                 f = l
                 if (f ~ /:[0-9]+\)[[:space:]]*$/) { sub(/:[0-9]+\)[[:space:]]*$/, "", f); sub(/.*\(/, "", f); return f }
                 return "?"
+            }
+            function frame_file(l,    f) {
+                f = frame_path(l)
+                sub(/.*\//, "", f)
+                return f
+            }
+            # A plumbing frame must belong to std (or to compiler_rt, which prints no
+            # directory). With 0.17 paths that is checkable, so it is checked: a
+            # module file that happens to be called `fmt.zig` or `Writer.zig` is not
+            # std formatting, whatever its basename says.
+            function is_std_path(l,    p) {
+                p = frame_path(l)
+                return (p !~ /\// || p ~ /^std\//)
             }
             function frame_line(l,    s) {
                 s = l
@@ -1155,6 +1173,8 @@ classify_contexts() {
             # in bolt3 and `ctgrind_harness.main (Threaded.zig:0)` in opaque on the same
             # run. The file of a line-0 frame is not evidence; the name still is.
             function is_harness(l,    fn) {
+                # basename: 0.16 `ctgrind_harness.zig:162`, 0.17
+                # `modules/<m>/src/ctgrind_harness.zig:162` (helpers too: `run__func_23`).
                 if (frame_file(l) == "ctgrind_harness.zig") return 1
                 fn = frame_func(l)
                 return (fn == "main" || fn ~ /^ctgrind_harness\./)
@@ -1168,7 +1188,7 @@ classify_contexts() {
                         # A real line number is required of every plumbing frame: that is
                         # what stops a module function that was inlined into the print,
                         # and so reported at `SomeStdFile.zig:0`, from passing as std.
-                        else if (frame_file(L[i]) !~ chain || frame_line(L[i]) < 1) return 0
+                        else if (frame_file(L[i]) !~ chain || frame_line(L[i]) < 1 || !is_std_path(L[i])) return 0
                     } else if (!is_harness(L[i]) && frame_file(L[i]) != "start.zig") return 0
                     k++
                 }
@@ -1374,6 +1394,81 @@ EOF
 ==1==    at 0x1: Io.Writer.printHex (Writer.zig:1812)
 ==1==    by 0x2: inlined (root.zig:0)
 ==1==    by 0x3: ctgrind_harness.main (ctgrind_harness.zig:162)
+EOF
+    # ── Zig 0.17 frame format (2026-10-18) ─────────────────────────────────
+    # 0.17 prints paths relative to the package root (`std/Io/Writer.zig`,
+    # `modules/<m>/src/ctgrind_harness.zig`) and names generic instances
+    # `print__func_N`. Before the basename rule above, every 0.17 witness fell
+    # into `unattr` (CT1 run, 26 modules: 76 of 78 claim rows red, 357
+    # contexts). Copies of that run (~/CML/zig-017/ct017/run2.log).
+    st_case "W8 0.17 result print from a harness helper" witness 0 <<'EOF'
+==1== Use of uninitialised value of size 8
+==1==    at 0x10543CB: Io.Writer.printHex (std/Io/Writer.zig:1944)
+==1==    by 0x107B973: printValue__func_681 (std/Io/Writer.zig:1215)
+==1==    by 0x107B973: print__func_679 (std/Io/Writer.zig:805)
+==1==    by 0x107B973: debug.print__func_25 (std/debug.zig:330)
+==1==    by 0x101BE54: run__func_23 (modules/aeadframe/src/ctgrind_harness.zig:62)
+==1==    by 0x101BE54: main (modules/aeadframe/src/ctgrind_harness.zig:80)
+==1==    by 0x101BE54: callMain (std/start.zig:789)
+==1==    by 0x101BE54: callMainWithArgs (std/start.zig:729)
+==1==    by 0x101BE54: start.posixCallMainAndExit (std/start.zig:681)
+==1==    by 0x101AA4D: (below main) (std/start.zig:248)
+EOF
+    st_case "W9 0.17 stderr flush reaching writev" witness 0 <<'EOF'
+==1== Syscall param writev(vector) points to uninitialised byte(s)
+==1==    at 0x10817AA: errno__func_70 (std/os/linux.zig:1044)
+==1==    by 0x10817AA: Io.Threaded.fileWriteStreaming (std/Io/Threaded.zig:11057)
+==1==    by 0x1088FDB: Io.Threaded.operate (std/Io/Threaded.zig:2550)
+==1==    by 0x10B693A: operate (std/Io.zig:556)
+==1==    by 0x10B693A: writeStreaming (std/Io/File.zig:611)
+==1==    by 0x10B693A: drainStreaming (std/Io/File/Writer.zig:126)
+==1==    by 0x10B693A: Io.File.Writer.drain (std/Io/File/Writer.zig:93)
+==1==    by 0x10331D8: writeByte (std/Io/Writer.zig:831)
+==1==    by 0x10331D8: Io.Writer.printHex (std/Io/Writer.zig:1945)
+==1==    by 0x1032B55: printValue__func_54 (std/Io/Writer.zig:1226)
+==1==    by 0x1032B55: print__func_46 (std/Io/Writer.zig:805)
+==1==    by 0x1032B55: print__func_32 (std/debug.zig:330)
+==1==    by 0x1032B55: main (modules/ctap2pin/src/ctgrind_harness.zig:289)
+==1==    by 0x1032B55: callMain (std/start.zig:789)
+==1==  Address 0x1ffeffebf8 is on thread 1's stack
+==1==  in frame #0, created by Io.Threaded.fileWriteStreaming (std/os/linux.zig:10975)
+EOF
+    st_case "W10 0.17 helper print above an inlined main at :0" witness 0 <<'EOF'
+==1== Use of uninitialised value of size 8
+==1==    at 0x10578EB: Io.Writer.printHex (std/Io/Writer.zig:1944)
+==1==    by 0x10818A6: printValue__func_676 (std/Io/Writer.zig:1226)
+==1==    by 0x10818A6: print__func_675 (std/Io/Writer.zig:805)
+==1==    by 0x10818A6: print__func_674 (std/debug.zig:330)
+==1==    by 0x10818A6: ctgrind_harness.printFp (modules/bls12_381/src/ctgrind_harness.zig:174)
+==1==    by 0x1022ACD: ctgrind_harness.main (modules/bls12_381/src/ctgrind_harness.zig:0)
+==1==    by 0x1022FAD: callMain (std/start.zig:789)
+==1==    by 0x101A95D: (below main) (std/start.zig:248)
+EOF
+    # aescbc pkcs7 on 0.17: unpadPkcs7 fully inlined into the harness main, the
+    # branch reported at `ctgrind_harness.zig:0`. It is the module's branch with
+    # no module frame left, so it must stay unattributed (U6 in 0.17 form).
+    st_case "U9 0.17 module branch inlined into main at :0" unattr 0 <<'EOF'
+==1== Conditional jump or move depends on uninitialised value(s)
+==1==    at 0x101C668: main (modules/aescbc/src/ctgrind_harness.zig:0)
+==1==    by 0x101C668: callMain (std/start.zig:789)
+==1==    by 0x101C668: callMainWithArgs (std/start.zig:729)
+==1==    by 0x101C668: start.posixCallMainAndExit (std/start.zig:681)
+==1==    by 0x1019D8D: (below main) (std/start.zig:248)
+EOF
+    # W8 with one frame swapped for a MODULE file that shares a plumbing
+    # basename: with a directory printed, only std (or bare compiler_rt) counts.
+    st_case "U10 0.17 module fmt.zig is not std formatting" unattr 0 <<'EOF'
+==1== Use of uninitialised value of size 8
+==1==    at 0x10543CB: Io.Writer.printHex (std/Io/Writer.zig:1944)
+==1==    by 0x107B973: hexSecret (modules/keylog/src/fmt.zig:12)
+==1==    by 0x101BE54: run__func_23 (modules/aeadframe/src/ctgrind_harness.zig:62)
+==1==    by 0x101BE54: main (modules/aeadframe/src/ctgrind_harness.zig:80)
+EOF
+    st_case "I2 0.17 module frame with a path wins" in 0 <<'EOF'
+==1== Conditional jump or move depends on uninitialised value(s)
+==1==    at 0x101C9B0: unpadIso7816 (modules/aescbc/src/root.zig:732)
+==1==    by 0x101C9B0: main (modules/aescbc/src/ctgrind_harness.zig:147)
+==1==    by 0x101C9B0: callMain (std/start.zig:789)
 EOF
     if [[ $ST_FAIL -ne 0 ]]; then
         echo "ctgrind: the context classifier failed its own test ($ST_FAIL of $ST_CASES cases)." >&2

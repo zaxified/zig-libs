@@ -304,8 +304,13 @@ decaf448	ReleaseFast	scalarmul	1	0	dd1af0024c4e1323	77a1bd1038ca1053
 # `alpha` only to list its input-dependent branches, and a bound is all it
 # pins. It does NOT catch E15's `timing_safe.eql` -> `mem.eql` mutation
 # (measured, same count). Read no constant-time claim into this row.
-ecvrf	ReleaseFast	prove	1	0	8b01b2b0210de673	f676793e0800a787
-ecvrf	ReleaseFast	verify	1	>=1	8b01b2b0210de673	087c8ff4d336d9b1
+# Zig 0.17.0 (2026-10-18): verify 7/7 -> 9/9. +2 = std 0.17's new RFC 8032
+# "x = 0 with sign bit 1" refusal inside Edwards25519.fromBytes
+# (edwards25519.zig:46), reached via stringToPoint (ecvrf.zig:367) and via
+# verify's decode of H (:574): public alpha only, and the same refusal
+# stringToPoint already made itself at :368 (ecvrf SPEC.md, verify note).
+ecvrf	ReleaseFast	prove	1	0	6ecc5638f6f2ad27	f676793e0800a787
+ecvrf	ReleaseFast	verify	1	>=1	6ecc5638f6f2ad27	087c8ff4d336d9b1
 ed448	ReleaseFast	full	1	3	838a6c0b078b46f2	5853bb35135afb85
 ed448	ReleaseFast	ladder	1	0	a56ef8197ddaa7a3	43db8426e0d6c6e7
 # k256 — the field layer is clean; every group/sign/ecdsa context is a
@@ -553,7 +558,11 @@ bls12_381	ReleaseFast	g2_scalarmul	1	2	17f4aae9d4d3ded9	7f4e15a241002b3f
 # divsteps62Var 3, safegcd inverse 2, affineCoordinatesPublic 2 -- the
 # VARIABLE-TIME inversion of R's z in the self-check verify (public by
 # design); everything else renamed only.
-bip340	ReleaseFast	sign	1	<=90	56c9be55b2ca6758	0ce3274dc49157be
+# Zig 0.17.0 (2026-10-18): 92 total / 90 in-file, as on 0.16. One context's top frame moved:
+# `isOdd (field.zig:227) <- verify (root.zig:625)` is now `verify (root.zig:625)` (isOdd inlined) --
+# the step-10 self-check's `if (r_xy.y.isOdd()) return false` on the public R, same line, still
+# inside this row's pattern. Nothing else moved (normalised stack diff, ~/CML/zig-017/report-CT1.md).
+bip340	ReleaseFast	sign	1	<=90	30c9a464c391b5a5	0ce3274dc49157be
 blindrsa	ReleaseFast	blind	1	<=493	84729d86c80ede27	4352055809b3f3c7
 # blindrsa sign 218 -> 7 (2026-10-02): rsa's CRT path left std.crypto.ff. Left,
 # all on the signature s that is about to be published: blindSign's ff parse of
@@ -773,10 +782,10 @@ bulletproofs	ReleaseFast	ipa	1	0	59c8171ea03060ea	2ade41bb2f418497
 # error.InvalidCiphertext: decrypt's `x = 0` and `x - 1` not a multiple of n
 # (both rows), plus noncrt's malformed-key `lambda = 0`. mul lost its
 # `k.isZero()` short-circuit (montint gives c^0 = 1).
-paillier	ReleaseFast	crt	1	2	e0a597df13aa8f65	ca16fc01b4ebb44c
-paillier	ReleaseFast	noncrt	1	3	e0a597df13aa8f65	ca16fc01b4ebb44c
-paillier	ReleaseFast	mul	1	0	e0a597df13aa8f65	b2221403ad3dad41
-paillier	ReleaseFast	addm	1	0	e0a597df13aa8f65	526f0de009c0cbfb
+paillier	ReleaseFast	crt	1	2	290004aa2c412afd	ca16fc01b4ebb44c
+paillier	ReleaseFast	noncrt	1	3	290004aa2c412afd	ca16fc01b4ebb44c
+paillier	ReleaseFast	mul	1	0	290004aa2c412afd	b2221403ad3dad41
+paillier	ReleaseFast	addm	1	0	290004aa2c412afd	526f0de009c0cbfb
 # paillier keygen (2026-10-03) — fromPrimes (checked factors) on the harness's
 # 1024-bit p, q, tainted. λ = montint.nt.lcm, µ = λ⁻¹ mod n (inverse), the CRT
 # exponents by nt.divExact + reduction, the Garner coefficient by inverse,
@@ -804,7 +813,15 @@ paillier	ReleaseFast	addm	1	0	e0a597df13aa8f65	526f0de009c0cbfb
 # 8 -> 16 contexts of the same lines) — the same class as the 2026-10-06 note above, positions
 # and lengths only. `slotFor` was made branchless first (an early-return chain over the new slot
 # list had added 16 here and 4 to threshold_ecdsa auxgen).
-paillier	ReleaseFast	keygen	1	<=317	e0a597df13aa8f65	61a35e2d95a376cf
+# paillier keygen 317 -> 314 (Zig 0.17.0, 2026-10-18; total 319 -> 316): --stacks diff against the
+# 0.16 base (~/CML/zig-017/b0), keyed by the first frame outside compiler_rt/memcpy/ChaCha/Random:
+# std.crypto.ff `Modulus.fromBytes` carriers of p^2/q^2 -55 -> 32 (0.17's ff: `shrink` 23 -> 0,
+# `shiftIn` 32 -> 28, new `eql` in computeRR 4), the Miller-Rabin witness digit reader
+# (`ByteDigits.at`/`horner`) 46 -> 44, and the witness's ChaCha draw 53 -> 75 -- compiler_rt's
+# 0.17 memset is `memsetSmallPowerOf2`/`shortMemset` recursion, more distinct addresses for the
+# same calls. Every class is one listed above; no new source line, no limb-value branch. Bound
+# tightened to the measurement (output pin unchanged, the run is deterministic).
+paillier	ReleaseFast	keygen	1	<=314	290004aa2c412afd	61a35e2d95a376cf
 # tlock/ibe re-pinned 2026-09-16, after 32e751ad (inversion-free Miller loop):
 # tlock fp12pow 8 -> 2, tlock decrypt 11 -> 3, ibe decrypt 14 -> 7. The counts
 # FELL because the Miller loop stopped inverting -- 32e751ad dropped
@@ -913,8 +930,10 @@ signal	ReleaseFast	ratchet	1	2	769b7983e02f8179	92ab00fad0ce5c41
 # memcpy contexts, all on the same source line as before (core.zig:502 ->
 # :522, the next hop_payloads copied from the offset the decrypted frame
 # gives), chunked differently now that the result is built in processBody.
-sphinx	ReleaseFast	construct	1	7	3ebc454c64a90bd4	cb364f94f78ea089
-sphinx	ReleaseFast	process	1	<=47	3ebc454c64a90bd4	e7c50d755f64b027
+# Zig 0.17.0 (2026-10-18): construct 11/7, process 50/45, as on 0.16; the only shape change is
+# compiler_rt's memset frame (`memsetSmallPowerOf2 <- memset`, was `memset`). Digest re-pinned.
+sphinx	ReleaseFast	construct	1	7	a25085a4c95dd966	cb364f94f78ea089
+sphinx	ReleaseFast	process	1	<=47	a25085a4c95dd966	e7c50d755f64b027
 # bolt3 derive 7 -> 8 (re-pin 2026-10-06; the fix landed 2026-10-05):
 # derivePrivateKey now refuses a per_commitment_secret >= n, so the std scalar
 # canonicality verdict (common.zig:75 via scalar.zig:87, root.zig:98) appears
@@ -974,16 +993,23 @@ dkg	ReleaseFast	combine	1	0	89feb80b007daf9a	6407896882d3491c
 # failure reason, and the scan loop contributes 0 contexts, so there is neither.
 # ⚠ The same `u1`-flag idiom did NOT survive the compiler in fss
 # (`dpf.zig:326`), which is why this is measured rather than reviewed.
-aescbc	ReleaseFast	pkcs7	1	1	78adb9a77465d82e	c4046968725e140d
-aescbc	ReleaseFast	xmlenc	1	1	78adb9a77465d82e	c4046968725e140d
+aescbc	ReleaseFast	pkcs7	1	1	1a3b50fc45e7e9c5	c4046968725e140d
+aescbc	ReleaseFast	xmlenc	1	1	1a3b50fc45e7e9c5	c4046968725e140d
 # 2026-10-16: the three strippers added for RustCrypto parity, same shape. x923
 # and iso7816 end in the same accept/reject branch (1); unpadZero never
 # rejects an aligned buffer, so it has no decision to disclose and measures 0
 # in-file -- its result length IS the secret trailing-zero count, which the
 # API returns by contract.
-aescbc	ReleaseFast	x923	1	1	78adb9a77465d82e	c4046968725e140d
-aescbc	ReleaseFast	iso7816	1	1	78adb9a77465d82e	c4046968725e140d
-aescbc	ReleaseFast	zero	1	0	78adb9a77465d82e	c4046968725e140d
+# Zig 0.17.0 (2026-10-18): the harness first read pkcs7 5/0 and x923 5/0 (+1 unattributed each) and
+# iso7816 6/2. pkcs7/x923: 0.17 inlined every stripper into `main` and tail-merged the two identical
+# verdict jumps into one instruction, which DWARF puts at `ctgrind_harness.zig:0` (objdump: one
+# `jne` at 0x101c668 for both) -- attribution only, fixed in the harness (one noinline instance per
+# stripper). iso7816: LLVM split `if (scan | ~seen)` into two jumps, a path per failure reason --
+# fixed in the source (`rejectIf` asm barrier, all four rejecting strippers; old harness + barrier
+# measured 5/1). All five rows back at 5/1 (zero 4/0), same out_sha.
+aescbc	ReleaseFast	x923	1	1	1a3b50fc45e7e9c5	c4046968725e140d
+aescbc	ReleaseFast	iso7816	1	1	1a3b50fc45e7e9c5	c4046968725e140d
+aescbc	ReleaseFast	zero	1	0	1a3b50fc45e7e9c5	c4046968725e140d
 # ── sealedbox: the secret-key text codecs ──────────────────────────────────
 # ⭐ These four were 8 / 7 / 43 / 47 until 2026-09-09, all of it std's
 # table-driven base64 and hex reached with a SECRET argument: 95 of the 105

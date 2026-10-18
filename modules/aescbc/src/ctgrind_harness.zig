@@ -134,19 +134,37 @@ pub fn main(init: std.process.Init.Minimal) !void {
     if (tainted) std.valgrind.memcheck.makeMemUndefined(padded[0..padded_len]);
     const buf = reloadVolatile(2 * block_len, &padded);
 
+    switch (target) {
+        .pkcs7 => strip(root.unpadPkcs7, buf[0..padded_len]),
+        .xmlenc => strip(root.unpadXmlEnc, buf[0..padded_len]),
+        .x923 => strip(root.unpadAnsiX923, buf[0..padded_len]),
+        .iso7816 => strip(root.unpadIso7816, buf[0..padded_len]),
+        .zero => strip(root.unpadZero, buf[0..padded_len]),
+    }
+}
+
+/// One out-of-line body PER stripper (a distinct instance per `unpad`), with
+/// the stripper inlined into it exactly as a caller would get it.
+///
+/// ⛔ Why not one `switch` in `main` (the shape until 2026-10-18): zig 0.17
+/// inlined all five strippers into `main` and TAIL-MERGED `unpadPkcs7`'s and
+/// `unpadAnsiX923`'s identical `test` / `jne reject` into one instruction. A
+/// merged instruction has no single source line, so DWARF reported it at
+/// `ctgrind_harness.zig:0` with no `root.zig` frame: both rows read in-file 0
+/// and the verdict branch sat in `unattr` (objdump of the 0.17 binary: the one
+/// jump at 0x101c668, shared by both inlined bodies). Separate instances keep
+/// each stripper's code apart, so the branch is attributed to the line it is
+/// on. Nothing is outlined that a caller would not also see: the stripper is
+/// still inlined (or not) at the compiler's choice, only never merged with a
+/// DIFFERENT stripper the harness happens to call from the same function.
+noinline fn strip(comptime unpad: fn ([]const u8) root.PaddingError!usize, buf: []const u8) void {
     // ⚠ The `catch` is a branch on a secret-derived error tag, and it is
     // DELIBERATELY here rather than avoided: it is the accept/reject signal the
     // API hands its caller by contract, so a real consumer writes exactly this.
     // Hiding it in the harness would measure a caller nobody writes. It lands
     // wherever the inliner puts it; see this module's rows in
     // `scripts/checks/ctgrind-expected.tsv` for what was measured.
-    const n = switch (target) {
-        .pkcs7 => root.unpadPkcs7(buf[0..padded_len]),
-        .xmlenc => root.unpadXmlEnc(buf[0..padded_len]),
-        .x923 => root.unpadAnsiX923(buf[0..padded_len]),
-        .iso7816 => root.unpadIso7816(buf[0..padded_len]),
-        .zero => root.unpadZero(buf[0..padded_len]),
-    } catch |err| {
+    const n = unpad(buf) catch |err| {
         std.debug.print("rejected: {t}\n", .{err});
         return;
     };

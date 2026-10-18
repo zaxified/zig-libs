@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-08-06 · mutation 2026-10-05 (17/17) · src ?
 
-**Hardening:** fuzz 2026-10-16 (200,000-run budget per harness clean, AESCBC_FUZZ: cbc, padding, cts, stream) · ct 2026-10-16 (ctgrind: all five unpadders, 1 in-file context each = the accept/reject verdict, 0 for unpadZero)
+**Hardening:** fuzz 2026-10-16 (200,000-run budget per harness clean, AESCBC_FUZZ: cbc, padding, cts, stream) · ct 2026-10-18 on Zig 0.17.0 (ctgrind: all five unpadders, 1 in-file context each = the accept/reject verdict, 0 for unpadZero; the verdict goes through the `rejectIf` asm barrier since 0.17 split iso7816's into two jumps, see `root.zig` `rejectIf`)
 
 **Performance:** ref 0.19–0.83× Go 1.26.8 crypto/cipher · fastest 1.03× OpenSSL 3.5.5 (measured 2026-10-16)
 

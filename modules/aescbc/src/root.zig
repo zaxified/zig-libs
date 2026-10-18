@@ -577,6 +577,31 @@ pub fn padPkcs7(msg: []const u8, out: []u8) error{BufferTooSmall}!usize {
     return padded_len;
 }
 
+/// The one accept/reject branch every unpadder ends in, taken on a flag the
+/// optimiser cannot see inside.
+///
+/// ⛔ LOAD-BEARING, measured. Without it, zig 0.17 / LLVM lowered
+/// `unpadIso7816`'s `if (invalid != 0)` -- `invalid` being `scan | ~seen` --
+/// into TWO jumps to the same reject block (`jne` on the vector scan, then
+/// `je` on `seen`; ctgrind 2 contexts at that line where 0.16 had 1): a
+/// control-flow path per failure reason ("wrong marker" vs "no marker"),
+/// which is exactly what these functions promise not to have. LLVM splits a
+/// branch on an `or` of two `i1`s whenever it likes; laundering the folded
+/// flag through an empty asm makes the OR a value it must compute before the
+/// single test. Same idiom as `fss`/`k256`'s `blackBox`; no-op at runtime.
+/// Measured on the old one-`main` harness (where the split appeared): without
+/// this barrier iso7816 6 contexts / 2 in this file, with it 5 / 1. In the
+/// per-stripper harness the split does not appear either way, so it depends on
+/// the inlining context, which is a consumer's to choose; hence all four
+/// unpadders that reject go through here, not only the one that split.
+inline fn rejectIf(invalid: u1) PaddingError!void {
+    const flag: u8 = if (@inComptime()) invalid else asm volatile (""
+        : [ret] "=r" (-> u8),
+        : [x] "0" (@as(u8, invalid)),
+    );
+    if (flag != 0) return error.InvalidPadding;
+}
+
 /// Strip PKCS#7 padding from a decrypted, block-aligned buffer. Validates
 /// `1 <= N <= block_len` AND that all N trailing bytes equal N, accumulating
 /// every check into a single flag with no secret-dependent early exit (no
@@ -586,7 +611,7 @@ pub fn padPkcs7(msg: []const u8, out: []u8) error{BufferTooSmall}!usize {
 /// ⭐ MEASURED, not reviewed (`src/ctgrind_harness.zig`, target `pkcs7`; the
 /// row is pinned in `scripts/ctgrind-expected.tsv`). With the whole padded
 /// buffer marked undefined, memcheck reports ONE context in this file, at the
-/// `if (invalid != 0)` below — the accept/reject decision this function returns
+/// `rejectIf(invalid)` below — the accept/reject decision this function returns
 /// to its caller anyway. The scan loop contributes none, so there is no early
 /// exit and no per-reason signal, which is what the paragraph above claims.
 /// It is measured because the same `@intFromBool`/`u1` idiom did NOT survive
@@ -606,7 +631,7 @@ pub fn unpadPkcs7(buf: []const u8) PaddingError!usize {
         const mismatch: u1 = @intFromBool(buf[buf.len - 1 - k] != n);
         invalid |= in_pad & mismatch;
     }
-    if (invalid != 0) return error.InvalidPadding;
+    try rejectIf(invalid);
     return buf.len - pad_len;
 }
 
@@ -643,7 +668,7 @@ pub fn unpadXmlEnc(buf: []const u8) PaddingError!usize {
     const n = buf[buf.len - 1];
     const invalid: u1 = @intFromBool(n == 0) | @intFromBool(n > block_len);
     const pad_len: usize = @min(@as(usize, n), block_len);
-    if (invalid != 0) return error.InvalidPadding;
+    try rejectIf(invalid);
     return buf.len - pad_len;
 }
 
@@ -681,7 +706,7 @@ pub fn unpadAnsiX923(buf: []const u8) PaddingError!usize {
         const in_pad: u1 = @intFromBool(k < pad_len);
         invalid |= in_pad & @intFromBool(buf[buf.len - 1 - k] != 0);
     }
-    if (invalid != 0) return error.InvalidPadding;
+    try rejectIf(invalid);
     return buf.len - pad_len;
 }
 
@@ -729,7 +754,7 @@ pub fn unpadIso7816(buf: []const u8) PaddingError!usize {
         seen |= first;
     }
     invalid |= ~seen;
-    if (invalid != 0) return error.InvalidPadding;
+    try rejectIf(invalid);
     return buf.len - pad_len;
 }
 
@@ -1291,6 +1316,108 @@ test "ISO/IEC 7816-4: pad layout, round trip, refusals" {
     try testing.expectEqual(@as(usize, 9), try unpadIso7816(&blk));
 }
 
+// The verdict moved behind `rejectIf`'s asm barrier (2026-10-18, zig 0.17 split
+// unpadIso7816's verdict into two jumps). The constant-time half is the ctgrind
+// row; this is the other half: the barrier changed no accept/reject decision
+// and no length, checked against a plain branchy reference on structured last
+// blocks (every pad length, marker position and corruption position) plus
+// random ones, and once at comptime, where the barrier must step aside.
+fn refPkcs7(b: []const u8) ?usize {
+    const n = b[b.len - 1];
+    if (n == 0 or n > block_len) return null;
+    for (b[b.len - n ..]) |x| if (x != n) return null;
+    return b.len - n;
+}
+fn refXmlEnc(b: []const u8) ?usize {
+    const n = b[b.len - 1];
+    if (n == 0 or n > block_len) return null;
+    return b.len - n;
+}
+fn refX923(b: []const u8) ?usize {
+    const n = b[b.len - 1];
+    if (n == 0 or n > block_len) return null;
+    for (b[b.len - n .. b.len - 1]) |x| if (x != 0) return null;
+    return b.len - n;
+}
+fn refIso7816(b: []const u8) ?usize {
+    var i: usize = b.len;
+    while (i > b.len - block_len) {
+        i -= 1;
+        if (b[i] == 0) continue;
+        return if (b[i] == 0x80) i else null;
+    }
+    return null;
+}
+fn expectSameAsRef(b: []const u8) !void {
+    const pairs = .{
+        .{ unpadPkcs7, refPkcs7 },
+        .{ unpadXmlEnc, refXmlEnc },
+        .{ unpadAnsiX923, refX923 },
+        .{ unpadIso7816, refIso7816 },
+    };
+    inline for (pairs) |p| {
+        const got: ?usize = p[0](b) catch null;
+        try testing.expectEqual(p[1](b), got);
+    }
+}
+
+test "unpadders: barrier verdicts equal a branchy reference" {
+    var blk: [2 * block_len]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(0x7816);
+    const r = prng.random();
+    // Structured: last byte = every value 0..255, the 15 bytes before it
+    // valid for PKCS#7 / X9.23 / 7816 in turn, then one byte corrupted.
+    var last: usize = 0;
+    while (last < 256) : (last += 1) {
+        for ([_]u8{ 0, 1, 2 }) |fill| {
+            var corrupt: usize = 0;
+            while (corrupt <= block_len) : (corrupt += 1) {
+                r.bytes(&blk);
+                const n: u8 = @truncate(last);
+                const tail = blk[block_len..];
+                switch (fill) {
+                    0 => @memset(tail, n), // PKCS#7 shape
+                    1 => @memset(tail, 0), // X9.23 / 7816 zero run
+                    else => {},
+                }
+                tail[block_len - 1] = n;
+                if (fill == 1 and n >= 1 and n <= block_len) tail[block_len - n] = 0x80; // 7816 marker
+                if (corrupt < block_len) tail[corrupt] ^= 0x01;
+                try expectSameAsRef(&blk);
+            }
+        }
+    }
+    // Random last blocks, with the high bytes biased towards 0 / 0x80 / 16.
+    var i: usize = 0;
+    while (i < 20000) : (i += 1) {
+        r.bytes(&blk);
+        for (blk[block_len..]) |*x| {
+            const pick = r.uintLessThan(u8, 8);
+            x.* = switch (pick) {
+                0, 1, 2 => 0,
+                3 => 0x80,
+                4 => r.uintAtMost(u8, block_len),
+                else => x.*,
+            };
+        }
+        try expectSameAsRef(&blk);
+    }
+}
+
+test "unpadders: comptime evaluation bypasses the asm barrier" {
+    const ok = comptime blk: {
+        var b: [block_len]u8 = @splat(4);
+        b[0] = 'x';
+        break :blk unpadPkcs7(&b) catch unreachable;
+    };
+    try testing.expectEqual(@as(usize, block_len - 4), ok);
+    const bad = comptime blk: {
+        const b: [block_len]u8 = @splat(0);
+        break :blk if (unpadIso7816(&b)) |_| false else |_| true;
+    };
+    try testing.expect(bad);
+}
+
 test "ISO 10126 and zero padding" {
     var prng = std.Random.DefaultPrng.init(1);
     var out: [32]u8 = undefined;
@@ -1315,7 +1442,7 @@ test {
 }
 
 /// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
-fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     const rep_result = comptime blk: {
         @setEvalBranchQuota(n * (s.len + 4) + 1000);
         var buf: [s.len * n:0]u8 = undefined;
