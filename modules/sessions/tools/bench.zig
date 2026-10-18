@@ -111,14 +111,14 @@ fn serve(row: *Row, wire: []const u8, out_buf: []u8) []const u8 {
 /// status + one per response carrying a Set-Cookie header + the body length.
 fn tally(resp: []const u8) u64 {
     var sum: u64 = std.fmt.parseInt(u16, resp[9..12], 10) catch 0;
-    if (std.ascii.indexOfIgnoreCase(resp, "\r\nset-cookie:") != null) sum += 1;
+    if (std.ascii.findIgnoreCase(resp, "\r\nset-cookie:") != null) sum += 1;
     if (std.mem.indexOf(u8, resp, "\r\n\r\n")) |i| sum += resp.len - (i + 4);
     return sum;
 }
 
 /// The session id in the response's `Set-Cookie: session=<id>; ...`.
 fn cookieOf(resp: []const u8) []const u8 {
-    const at = std.ascii.indexOfIgnoreCase(resp, "set-cookie: session=") orelse return "";
+    const at = std.ascii.findIgnoreCase(resp, "set-cookie: session=") orelse return "";
     const rest = resp[at + "set-cookie: session=".len ..];
     return rest[0 .. std.mem.indexOfScalar(u8, rest, ';') orelse rest.len];
 }

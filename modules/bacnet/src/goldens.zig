@@ -331,7 +331,7 @@ test "goldens field by field: ReadProperty and its ACKs" {
         // needs two octets, which is where a 1-octet assumption breaks.
         const d = try decodeAll(try bytesOf(find("readproperty_req_proprietary_prop"), &buf));
         const rp = try service.ReadProperty.decode(d.apdu.confirmed_request.data);
-        try testing.expectEqual(@as(u32, 512), @intFromEnum(rp.property));
+        try testing.expectEqual(@as(u32, 512), @backingInt(rp.property));
         try testing.expect(rp.property.isProprietary());
     }
     {
@@ -356,7 +356,7 @@ test "goldens field by field: ReadProperty and its ACKs" {
         try testing.expectEqual(@as(u32, 1), (try ack.scalar()).enumerated);
         try testing.expectEqual(
             types.BinaryPV.active,
-            @as(types.BinaryPV, @enumFromInt((try ack.scalar()).enumerated)),
+            @as(types.BinaryPV, @fromBackingInt(@intCast((try ack.scalar()).enumerated))),
         );
     }
     {
@@ -738,7 +738,7 @@ test "goldens: our own encoders reproduce the third-party service bodies" {
 
 test "goldens: the table covers every PDU type and every modelled service" {
     var buf: [256]u8 = undefined;
-    var seen_pdu = std.EnumSet(apdu.PduType).initEmpty();
+    var seen_pdu = std.EnumSet(apdu.PduType).empty;
     var seen_confirmed = std.AutoHashMap(types.ConfirmedService, void).init(testing.allocator);
     defer seen_confirmed.deinit();
     var seen_unconfirmed = std.AutoHashMap(types.UnconfirmedService, void).init(testing.allocator);

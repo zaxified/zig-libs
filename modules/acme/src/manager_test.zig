@@ -396,8 +396,8 @@ test "issuers: random policy spreads over issuers (seeded)" {
     f.init(day0 + day);
     defer f.deinit();
     const ok: FakeIssuer.Step = .{ .ok = .{ .chain = chainOf(fx.b1_crt), .key = fx.b1_key } };
-    var x: FakeIssuer = .{ .name = "x", .script = &@as([16]u8, @splat(ok)) };
-    var y: FakeIssuer = .{ .name = "y", .script = &@as([16]u8, @splat(ok)) };
+    var x: FakeIssuer = .{ .name = "x", .script = &@as([16]FakeIssuer.Step, @splat(ok)) };
+    var y: FakeIssuer = .{ .name = "y", .script = &@as([16]FakeIssuer.Step, @splat(ok)) };
     // Sixteen managers, sixteen seeds: each issuer goes first sometimes, and
     // only the first is asked (it succeeds).
     for (0..16) |seed| {

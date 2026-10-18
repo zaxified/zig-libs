@@ -339,10 +339,10 @@ fn keyDigest(mac_key: *const [Mac.key_length]u8, context: []const u8, token: []c
     // or excluded like `now_s` — before this compiles again.
     comptime {
         const known = [_][]const u8{ "now_s", "leeway_s", "issuer", "audience", "require_exp", "reject_future_iat" };
-        for (@typeInfo(root.Options).@"struct".fields) |f| {
+        for (@typeInfo(root.Options).@"struct".field_names) |f_name| {
             for (known) |k| {
-                if (std.mem.eql(u8, f.name, k)) break;
-            } else @compileError("jwt.VerifiedCache: fold Options." ++ f.name ++ " into keyDigest");
+                if (std.mem.eql(u8, f_name, k)) break;
+            } else @compileError("jwt.VerifiedCache: fold Options." ++ f_name ++ " into keyDigest");
         }
     }
     var h: Mac = .init(mac_key);
@@ -379,8 +379,8 @@ fn assertPlainData(comptime T: type, comptime what: []const u8) void {
         .array => |a| assertPlainData(a.child, what),
         .vector => |v| assertPlainData(v.child, what),
         .optional => |o| assertPlainData(o.child, what),
-        .@"struct" => |s| for (s.fields) |f| assertPlainData(f.type, what),
-        .@"union" => |u| for (u.fields) |f| assertPlainData(f.type, what),
+        .@"struct" => |s| for (s.field_types) |f_type| assertPlainData(f_type, what),
+        .@"union" => |u| for (u.field_types) |f_type| assertPlainData(f_type, what),
         else => @compileError("jwt.VerifiedCache: Value " ++ what ++ " must be plain data (no " ++ @typeName(T) ++ ")"),
     }
 }

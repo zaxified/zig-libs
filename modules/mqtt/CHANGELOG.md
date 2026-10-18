@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — Ported to Zig 0.17.0. Non-mechanical: `Properties.isEmpty`, a packet test and `tools/bench.zig` reflect with `field_names`/`field_types`/`field_values`; the session fuzz `reach` loop gives every seed its own `SafeAllocator` (0.17 `testing.allocator` never reuses memory; same as testkit's driver).
 - **2026-10-18** — Constant time: the `$7$` verifier decode (`acl.parseHash`) and `formatHash` use `b64ct` instead of `std.base64` (new dep `b64ct`; same accepted/rejected inputs, new malformed salt/hash test).
 - **2026-10-18** — Backlog: the ACL verifier decode is std base64 (low; pre-tag constant-time sweep).
 - **2026-10-17** — **BREAKING:** `Broker.qos1Drops()` removed — it has counted nothing since the clean-session window queue (same day); use `queueDrops()`, which counts every QoS 1/2 delivery dropped for want of queue room, persistent or clean session. **Fix:** a clean-session delivery lost because its queue could not be allocated now counts in `$SYS/broker/publish/messages/dropped` too (it bumped `queueDrops` only); both counters move through one function. Docs of `queueDrops`, `Stats.publish_dropped`, `publishSys` corrected. Found verifying energomonitor's repin note.

@@ -50,10 +50,19 @@ fn Marker(comptime Label: type) type {
             for (0..seeds) |seed| {
                 var prng = std.Random.DefaultPrng.init(seed);
                 var rng: Rng = .{ .r = prng.random() };
-                harness(Rng, &rng, testing.allocator) catch |err| {
+                // One allocator per seed: the 0.17 `testing.allocator` never
+                // reuses memory, so 400 seeds on it only grow (cf. testkit
+                // fuzz_driver.runSeedsReporting). Leaks still fail per seed.
+                var seed_alloc: std.heap.SafeAllocator = .init(testing.allocator, .{ .stack_trace_frames = 0 });
+                harness(Rng, &rng, seed_alloc.allocator()) catch |err| {
+                    _ = seed_alloc.deinitLog(false);
                     std.debug.print(name ++ " seed {d}: {t}\n", .{ seed, err });
                     return err;
                 };
+                if (seed_alloc.deinit() != 0) {
+                    std.debug.print(name ++ " seed {d}: memory leak\n", .{seed});
+                    return error.MemoryLeakDetected;
+                }
             }
             for (counts, 0..) |n, i| if (n == 0) {
                 std.debug.print("reach: " ++ name ++ " label {t} never hit in {d} seeds\n", .{ @as(Label, @fromBackingInt(@intCast(i))), seeds });

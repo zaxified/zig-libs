@@ -480,9 +480,9 @@ pub const Properties = struct {
     shared_subscription_available: ?bool = null,
 
     pub fn isEmpty(p: Properties) bool {
-        inline for (@typeInfo(Properties).@"struct".fields) |f| {
-            const v = @field(p, f.name);
-            if (@typeInfo(f.type) == .optional) {
+        inline for (@typeInfo(Properties).@"struct".field_names, @typeInfo(Properties).@"struct".field_types) |f_name, f_type| {
+            const v = @field(p, f_name);
+            if (@typeInfo(f_type) == .optional) {
                 if (v != null) return false;
             } else if (!v.isEmpty()) return false;
         }
@@ -2833,8 +2833,8 @@ test "v5 decode errors map to the reason code §4.13 answers with" {
     try testing.expectEqual(ReasonCode.protocol_error, reasonForDecodeError(error.ProtocolViolation));
     try testing.expectEqual(ReasonCode.unsupported_protocol_version, reasonForDecodeError(error.UnsupportedProtocol));
     // 3.1.1 return codes and 5.0 reason codes map onto each other where they can.
-    inline for (@typeInfo(ConnectReturnCode).@"enum".fields) |f| {
-        const rc: ConnectReturnCode = @fromBackingInt(@intCast(f.value));
+    inline for (@typeInfo(ConnectReturnCode).@"enum".field_values) |f_value| {
+        const rc: ConnectReturnCode = @fromBackingInt(@intCast(f_value));
         try testing.expectEqual(rc, returnCodeFromReason(reasonFromReturnCode(rc)));
     }
     try testing.expectEqual(ConnectReturnCode.server_unavailable, returnCodeFromReason(.quota_exceeded));

@@ -558,7 +558,7 @@ fn originAllowed(t: *const Transport, req: *const http.Server.Request) bool {
 /// Whether the client's `Accept` header admits an SSE response.
 fn acceptsSse(req: *const http.Server.Request) bool {
     const accept = req.header("accept") orelse return false;
-    return std.ascii.indexOfIgnoreCase(accept, "text/event-stream") != null;
+    return std.ascii.findIgnoreCase(accept, "text/event-stream") != null;
 }
 
 /// Best-effort check whether a POST body is an `initialize` request (so the
@@ -1667,6 +1667,27 @@ test "oversized POST body → 413" {
         \\{"jsonrpc":"2.0","id":9,"method":"tools/list","params":{"padding":"xxxxxxxxxxxx"}}
     ), &buf);
     try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 413"));
+}
+
+test "POST body cap boundary: exactly max_body is accepted, one byte over → 413" {
+    // Zig 0.17 `allocRemaining(.limited(n))` accepts exactly n bytes; the
+    // documented `max_body` is the largest accepted POST body.
+    const gpa = testing.allocator;
+    const json =
+        \\{"jsonrpc":"2.0","id":9,"method":"tools/list"}
+    ;
+    var server = try buildServer(gpa);
+    defer server.deinit();
+
+    var buf: [8192]u8 = undefined;
+    inline for (.{ .{ json.len, false }, .{ json.len - 1, true } }) |c| {
+        var transport = Transport{ .gpa = gpa, .server = &server, .max_body = c[0] };
+        var r = router.Router.init(gpa);
+        defer r.deinit();
+        try r.use(transport.middleware());
+        const got = runWire(&r, post("/mcp", json), &buf);
+        try testing.expectEqual(c[1], std.mem.startsWith(u8, got, "HTTP/1.1 413"));
+    }
 }
 
 // ── server→client requests over HTTP ───────────────────────────────────────

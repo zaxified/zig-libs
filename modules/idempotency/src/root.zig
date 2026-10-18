@@ -619,15 +619,15 @@ fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerr
     // closed (413) instead of silently skipping the check (see the module
     // doc's "Request-fingerprint mismatch" note).
     //
-    // `allocRemaining` treats reaching its limit exactly as `StreamTooLong`
-    // (bytes up to the limit are read either way); probing at
-    // `max_body_bytes + 1` is what makes a body of exactly the configured
-    // cap succeed while one byte more is rejected — the documented boundary.
-    const probe_cap = if (idem.options.max_body_bytes == std.math.maxInt(usize))
-        idem.options.max_body_bytes
+    // Zig 0.17 `allocRemaining(.limited(n))` accepts exactly `n` bytes and
+    // fails with `StreamTooLong` on the next one (0.16 failed at `n`, which
+    // is why this used to probe at `max_body_bytes + 1`) -- exactly the
+    // documented boundary. `maxInt` means unlimited (`n + 1` would overflow).
+    const probe_cap: std.Io.Limit = if (idem.options.max_body_bytes == std.math.maxInt(usize))
+        .unlimited
     else
-        idem.options.max_body_bytes + 1;
-    const body_bytes = ctx.req.reader().allocRemaining(idem.store.alloc(), .limited(probe_cap)) catch |err| switch (err) {
+        .limited(idem.options.max_body_bytes);
+    const body_bytes = ctx.req.reader().allocRemaining(idem.store.alloc(), probe_cap) catch |err| switch (err) {
         error.StreamTooLong => return payloadTooLarge(ctx),
         else => |e| return e,
     };
@@ -1698,9 +1698,9 @@ fn fuzzSequences(comptime use_kv: bool) !void {
         }
     }
 
-    inline for (@typeInfo(@TypeOf(reach)).@"struct".fields) |f| {
-        if (@field(reach, f.name) == 0) {
-            std.debug.print("idempotency model-fuzz: reach class never hit: {s}\n", .{f.name});
+    inline for (@typeInfo(@TypeOf(reach)).@"struct".field_names) |f_name| {
+        if (@field(reach, f_name) == 0) {
+            std.debug.print("idempotency model-fuzz: reach class never hit: {s}\n", .{f_name});
             return error.TestUnexpectedResult;
         }
     }

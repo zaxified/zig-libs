@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — Ported to Zig 0.17.0. Non-mechanical: `cache.zig` reflection over `Options`/`Value` uses `field_names`/`field_types` (struct `.fields` is gone); the `ReadCueIo` test seam counts `Operation.net_read` through `vtable.operate` (`netRead` slot is gone).
 - **2026-10-18** — **Constant time:** `parseJwks` key material (`oct` `k` and every other base64url member, RSA/EC private components included) decodes with `b64ct.url_safe_no_pad` instead of `std.base64` (new dep). Same acceptance and `InvalidBase64` errors.
 - **2026-10-14** — follows rsa's 8192-bit cap: RS*/PS* keys up to 8192 bits are accepted (was 4096; golang-jwt has no upper bound below Go's). Test boundary moved to `rsa.max_modulus_len + 1`.
 - **2026-10-13** — ES384 runs on the new `p384` module (new dep) instead of std's P-384: sign 4.21× → 0.52×, verify 2.80× → 0.59× golang-jwt. `EcdsaP384Sha384` is now `p384.EcdsaP384Sha384` (std's surface; `KeyPair` methods take `*const KeyPair`, `fromSecretKey` refuses d ≥ n). Verification accepts what std's did; ES384 signature BYTES change, because p384's nonces are RFC 6979 exactly — a test pins that std and jwt accept each other's ES384 tokens. Card Performance measured again (ref 0.20–0.99×, P2); ctgrind ec 18 → 10 (std's 8 ES384 contexts gone).

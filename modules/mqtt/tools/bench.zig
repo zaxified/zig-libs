@@ -426,8 +426,9 @@ pub fn main(init: std.process.Init) !u8 {
     var worst: f64 = 0;
     var best_r: f64 = std.math.inf(f64);
     var max_spread: f64 = 0;
-    inline for (@typeInfo(Row).@"enum".fields) |f| {
-        const row: Row = @enumFromInt(f.value);
+    inline for (@typeInfo(Row).@"enum".field_names, @typeInfo(Row).@"enum".field_values) |f_name, f_value| {
+        const f = .{ .name = f_name };
+        const row: Row = @fromBackingInt(@intCast(f_value));
         var hit = filters.len == 0;
         for (filters) |x| hit = hit or std.mem.indexOf(u8, f.name, x) != null;
         if (hit) {

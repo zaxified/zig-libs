@@ -1790,6 +1790,20 @@ test "middleware: a stale delivery is refused before its body is read" {
     try expectStatus(runWire(&rs, buildReqHeaders(&reqbuf, &.{ .{ "X-Slack-Request-Timestamp", "1" }, .{ "X-Slack-Signature", "v0=00" } }, "longer than four"), &respbuf), "401");
 }
 
+test "middleware: max_body_bytes boundary - exactly the cap is read (401 bad MAC), one byte over is 413" {
+    // Zig 0.17 `allocRemaining(.limited(n))` accepts exactly n bytes; the
+    // documented `max_body_bytes` is the largest body read.
+    fixed_now = 1492774577;
+    var vt = try Verifier.init(testing.allocator, .{ .secret = "k", .scheme = .stripe, .clock = fixed_clock, .max_body_bytes = 4 });
+    defer vt.deinit();
+    var rt = try gatedRouter(&vt);
+    defer rt.deinit();
+    var reqbuf: [1024]u8 = undefined;
+    var respbuf: [1024]u8 = undefined;
+    try expectStatus(runWire(&rt, buildReqHeaders(&reqbuf, &.{.{ "Stripe-Signature", "t=1492774577,v1=00" }}, "four"), &respbuf), "401");
+    try expectStatus(runWire(&rt, buildReqHeaders(&reqbuf, &.{.{ "Stripe-Signature", "t=1492774577,v1=00" }}, "fives"), &respbuf), "413");
+}
+
 test "middleware: Stripe and Slack schemes" {
     fixed_now = 1531420618;
     var vs = try Verifier.init(testing.allocator, .{ .secret = slack_secret, .scheme = .slack, .clock = fixed_clock });
