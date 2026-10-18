@@ -1418,9 +1418,9 @@ test "TEETH: the decrypt fuzz harness reaches the header parser" {
 
 test "Entropy: exactly two arms, production and test are distinct, and nothing else is admitted" {
     const info = @typeInfo(Entropy).@"union";
-    try std.testing.expectEqual(@as(usize, 2), info.fields.len);
-    try std.testing.expectEqualStrings("csprng", info.fields[0].name);
-    try std.testing.expectEqualStrings("fixed_for_test", info.fields[1].name);
+    try std.testing.expectEqual(@as(usize, 2), info.field_names.len);
+    try std.testing.expectEqualStrings("csprng", info.field_names[0]);
+    try std.testing.expectEqualStrings("fixed_for_test", info.field_names[1]);
 
     // The SAME generator under the two arms — different claims about the same
     // bytes is precisely the distinction the type exists to carry.

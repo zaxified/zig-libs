@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — Ported to Zig 0.17.0. Enum/struct reflection moved to `field_names` / `field_values` / `field_types` (wire.zig `kindFromByte`, stackprobe_test.zig). No behaviour change.
 - **2026-10-10** — **NO CONSUMER-VISIBLE CHANGE:** the refresh tests share one protocol keygen fixture
   instead of each running its own, and the fault test is split in three; one test doing keygen + refresh
   exceeded CI's 3-minute `--test-timeout` under a full crypto lane.

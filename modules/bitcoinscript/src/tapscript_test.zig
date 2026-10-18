@@ -411,7 +411,8 @@ fn fuzzTapscriptLeaf(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror
     witness[n_stack + 1] = &cb;
 
     var f = consensus_taproot;
-    inline for (@typeInfo(ScriptFlags).@"struct".fields) |fld| {
+    inline for (@typeInfo(ScriptFlags).@"struct".field_names, @typeInfo(ScriptFlags).@"struct".field_types) |f_name, f_type| {
+        const fld = .{ .name = f_name, .type = f_type };
         if (fld.type == bool and comptime std.mem.startsWith(u8, fld.name, "discourage_"))
             @field(f, fld.name) = script_cursor.byte() & 1 == 1;
     }

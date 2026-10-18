@@ -388,7 +388,8 @@ const paillier = @import("paillier");
 /// the nested protocol structs. Public scalars a struct may hold are few
 /// (none in these types) and would show as residue to triage, not hide one.
 fn addSecretsOf(n: *Needles, comptime T: type, v: *const T) void {
-    inline for (@typeInfo(T).@"struct".fields) |f| {
+    inline for (@typeInfo(T).@"struct".field_names, @typeInfo(T).@"struct".field_types) |f_name, f_type| {
+        const f = .{ .name = f_name, .type = f_type };
         const x = &@field(v, f.name);
         switch (f.type) {
             Scalar => n.addScalar(f.name, x.*),

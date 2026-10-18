@@ -391,7 +391,7 @@ fn checkBuiltPath(gpa: std.mem.Allocator, path: []const PathEntry, opts: Options
         if (opts.usages_any_of.len == 0) {
             try checkExtendedKeyUsage(eku_list, leaf_eku, opts.required_eku);
         } else {
-            var wanted: PurposeSet = .initEmpty();
+            var wanted: PurposeSet = .empty;
             for (opts.usages_any_of) |u| wanted.insert(u);
             if (opts.required_eku) |r| wanted.insert(r);
             try checkExtendedKeyUsageAnyOf(eku_list, leaf_eku, wanted);
@@ -1572,7 +1572,7 @@ pub fn checkExtendedKeyUsageAnyOf(
 }
 
 fn narrowByEku(set: PurposeSet, eku_value: []const u8) extensions.ParseExtKeyUsageError!PurposeSet {
-    var listed: PurposeSet = .initEmpty();
+    var listed: PurposeSet = .empty;
     var it = try extensions.parseExtKeyUsage(eku_value);
     while (try it.next()) |entry| {
         const p = entry.known orelse continue;

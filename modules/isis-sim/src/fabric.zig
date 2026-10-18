@@ -709,7 +709,7 @@ pub const Fabric = struct {
     }
 
     fn lsdbConfig(ns: *const NodeState, capacity: u32, opts: Options) isis_lsdb.Config {
-        var bcast = isis_lsdb.InterfaceSet.initEmpty();
+        var bcast = isis_lsdb.InterfaceSet.empty;
         for (ns.lan_circuits) |c| bcast.set(c.iface);
         var cfg: isis_lsdb.Config = .{
             .local_system_id = ns.system_id,
@@ -1396,7 +1396,7 @@ pub const Fabric = struct {
     }
 
     fn upInterfaces(self: *const Fabric, node: NodeId) isis_flood.InterfaceSet {
-        var s = isis_flood.InterfaceSet.initEmpty();
+        var s = isis_flood.InterfaceSet.empty;
         const ns = &self.nodes[node];
         for (ns.link_failed, 0..) |failed, i| {
             if (!failed) s.set(@intCast(i));

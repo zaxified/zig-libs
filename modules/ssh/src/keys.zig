@@ -58,8 +58,8 @@ pub const KeyType = enum {
     /// The inverse of `name`; null for any other string (certificates,
     /// `sk-*` security keys and `ssh-dss` are not supported).
     pub fn fromName(s: []const u8) ?KeyType {
-        inline for (std.meta.fields(KeyType)) |f| {
-            const k: KeyType = @enumFromInt(f.value);
+        inline for (@typeInfo(KeyType).@"enum".field_values) |f_value| {
+            const k: KeyType = @fromBackingInt(@intCast(f_value));
             if (std.mem.eql(u8, s, k.name())) return k;
         }
         return null;

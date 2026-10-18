@@ -2185,8 +2185,8 @@ fn runCase(case: Case) !ClientCtx {
     // up a neighbouring case's label, and the expected stdout no longer
     // matches. (A single local would be reused at the same stack address
     // every run and the substitution would be invisible.)
-    var exec_labels: [std.meta.fields(Case).len]ExecLabel = undefined;
-    inline for (std.meta.fields(Case), 0..) |f, i| exec_labels[i] = .{ .label = f.name };
+    var exec_labels: [@typeInfo(Case).@"enum".field_names.len]ExecLabel = undefined;
+    inline for (@typeInfo(Case).@"enum".field_names, 0..) |f_name, i| exec_labels[i] = .{ .label = f_name };
     const exec_label = &exec_labels[@backingInt(case)];
 
     var port: u16 = 0;

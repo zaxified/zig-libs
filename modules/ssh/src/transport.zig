@@ -1631,7 +1631,7 @@ fn curve25519KexBody(
     var seed: [32]u8 = undefined;
     entropy.fill(&seed);
     defer std.crypto.secureZero(u8, &seed);
-    const kp = X25519.KeyPair.generateDeterministic(seed) catch return error.KexFailed;
+    const kp = X25519.KeyPair.generateDeterministic(seed);
     const q_c = kp.public_key;
 
     // SSH_MSG_KEX_ECDH_INIT: byte || string Q_C.
@@ -2559,7 +2559,7 @@ fn mlkem768x25519KexBody(
     var x_seed: [32]u8 = undefined;
     entropy.fill(&x_seed);
     defer std.crypto.secureZero(u8, &x_seed);
-    const x_kp = X25519.KeyPair.generateDeterministic(x_seed) catch return error.KexFailed;
+    const x_kp = X25519.KeyPair.generateDeterministic(x_seed);
 
     // ML-KEM-768 keypair (we are the decapsulator; we send the encaps key).
     var kem_seed: [MLKem768.seed_length]u8 = undefined;
@@ -3403,8 +3403,8 @@ fn isKexMessage(n: u8) bool {
 /// SSH_MSG_UNIMPLEMENTED by `Transport.recvPacket`.
 fn isRecognized(n: u8) bool {
     if (n >= 60 and n <= 79) return true;
-    inline for (@typeInfo(messages.MessageType).@"enum".fields) |f| {
-        if (n == f.value) return true;
+    inline for (@typeInfo(messages.MessageType).@"enum".field_values) |f_value| {
+        if (n == f_value) return true;
     }
     return false;
 }
@@ -4636,7 +4636,7 @@ test "Entropy.io: the KEXINIT cookie, the padding and the ephemeral key come fro
     if (curve25519Kex(&kr, &empty, &w, .single(&none), entropy, "I_C", "I_S", "V_C", "V_S", unreachable_policy, "ssh-ed25519")) |_|
         return error.TestUnexpectedResult
     else |_| {}
-    const kp = try X25519.KeyPair.generateDeterministic(@splat(0x5a));
+    const kp = X25519.KeyPair.generateDeterministic(@splat(0x5a));
     try std.testing.expect(std.mem.indexOf(u8, w.buffered(), &kp.public_key) != null);
 }
 
@@ -4696,7 +4696,7 @@ fn fakeUnverifiableReply(
 
     // A non-degenerate Q_S so the earlier identity check does not short-
     // circuit before the host-key gate is even reached.
-    const q_s = (try X25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x5c)))).public_key;
+    const q_s = X25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x5c))).public_key;
 
     var payload_buf: [512]u8 = undefined;
     var pw: std.Io.Writer = .fixed(&payload_buf);

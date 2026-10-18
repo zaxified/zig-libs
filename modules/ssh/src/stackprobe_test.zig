@@ -866,7 +866,7 @@ fn clientOf(role: Role, me: *const Recorder, peer: *const Recorder) *const Recor
 
 fn x25519Needles(n: *Needles, mine: [32]u8, theirs: [32]u8) !void {
     n.addBoth("x25519 sk", &mine);
-    const k = try X25519.scalarmult(mine, try X25519.recoverPublicKey(theirs));
+    const k = try X25519.scalarmult(mine, X25519.recoverPublicKey(theirs));
     n.addBoth("x25519 K", &k);
 }
 
@@ -890,7 +890,7 @@ fn kexNeedles(n: *Needles, k: Kex, role: Role, me: *const Recorder, peer: *const
             const sx = s.draw(1)[0..32].*;
             const kp = try MLKem768.KeyPair.generateDeterministic(kem_seed);
             const enc = kp.public_key.encapsDeterministic(&enc_seed);
-            const xk = try X25519.scalarmult(cx, try X25519.recoverPublicKey(sx));
+            const xk = try X25519.scalarmult(cx, X25519.recoverPublicKey(sx));
             if (role == .client) {
                 n.addBoth("x25519 sk", &cx);
                 n.addImage("mlkem seed", &kem_seed);

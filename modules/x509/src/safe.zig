@@ -90,7 +90,7 @@ const Certificate = std.crypto.Certificate;
 /// Bumping the constant below is the reviewer's signal that they re-read
 /// `Certificate.parse` in the new std and either found no new descent point,
 /// or added one to `requireStdDescentPoints` (and to this comment).
-const std_descent_points_verified_against: std.SemanticVersion = .{ .major = 0, .minor = 16, .patch = 0 };
+const std_descent_points_verified_against: std.SemanticVersion = .{ .major = 0, .minor = 17, .patch = 0 };
 comptime {
     if (builtin.zig_version.major != std_descent_points_verified_against.major or
         builtin.zig_version.minor != std_descent_points_verified_against.minor)
@@ -98,7 +98,7 @@ comptime {
         @compileError(
             "requireStdDescentPoints (modules/x509/src/safe.zig) mirrors " ++
                 "std.crypto.Certificate.parse's descent points as verified against Zig " ++
-                "0.16.0. This toolchain is on a different minor/major version. Before " ++
+                "0.17.0. This toolchain is on a different minor/major version. Before " ++
                 "raising std_descent_points_verified_against: re-read " ++
                 "std.crypto.Certificate.parse's source in THIS toolchain, confirm " ++
                 "requireStdDescentPoints still names every position it descends " ++

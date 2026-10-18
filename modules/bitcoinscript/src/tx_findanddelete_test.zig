@@ -47,7 +47,8 @@ fn txidFromDisplayHex(hex: []const u8) ![32]u8 {
 fn flagsFor(v: vectors_mod.Vector, extra_const_scriptcode: bool) ScriptFlags {
     var f: ScriptFlags = if (v.valid) ScriptFlags.standard else ScriptFlags.none;
     for (v.json_flags) |name| {
-        inline for (std.meta.fields(ScriptFlags)) |field| {
+        inline for (@typeInfo(ScriptFlags).@"struct".field_names, @typeInfo(ScriptFlags).@"struct".field_types) |f_name, f_type| {
+            const field = .{ .name = f_name, .type = f_type };
             if (field.type == bool and std.mem.eql(u8, field.name, @tagName(name))) {
                 @field(f, field.name) = !v.valid;
             }

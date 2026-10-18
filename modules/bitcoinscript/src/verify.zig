@@ -531,7 +531,8 @@ fn fuzzScriptBytes(script: *fuzzseed.Cursor, buf: []u8) []u8 {
 /// to come back here.
 fn fuzzFlags(script: *fuzzseed.Cursor) ScriptFlags {
     var sf: ScriptFlags = .{};
-    inline for (@typeInfo(ScriptFlags).@"struct".fields) |f| {
+    inline for (@typeInfo(ScriptFlags).@"struct".field_names, @typeInfo(ScriptFlags).@"struct".field_types) |f_name, f_type| {
+        const f = .{ .name = f_name, .type = f_type };
         if (f.type == bool) @field(sf, f.name) = script.byte() & 1 == 1;
     }
     return sf;
@@ -668,7 +669,8 @@ test "corpus: every seed builds a case, and the limits the corpus crosses are pi
         }
         if (c.script_sig.len > 200 or c.script_pubkey.len > 200) over_200 += 1;
         if (c.script_sig.len >= 10_000 or c.script_pubkey.len >= 10_000) over_10k += 1;
-        inline for (@typeInfo(ScriptFlags).@"struct".fields) |f| {
+        inline for (@typeInfo(ScriptFlags).@"struct".field_names, @typeInfo(ScriptFlags).@"struct".field_types) |f_name, f_type| {
+            const f = .{ .name = f_name, .type = f_type };
             if (f.type == bool and @field(c.flags, f.name)) flags_set += 1;
         }
 

@@ -759,7 +759,7 @@ fn curve25519KexServerBody(
     var seed: [32]u8 = undefined;
     entropy.fill(&seed);
     defer std.crypto.secureZero(u8, &seed);
-    const kp = X25519.KeyPair.generateDeterministic(seed) catch return error.KexFailed;
+    const kp = X25519.KeyPair.generateDeterministic(seed);
     const q_s = kp.public_key;
 
     var shared = X25519.scalarmult(kp.secret_key, q_c_arr) catch return error.KexFailed;
@@ -1231,7 +1231,7 @@ fn mlkem768x25519KexServerBody(
     var x_seed: [32]u8 = undefined;
     entropy.fill(&x_seed);
     defer std.crypto.secureZero(u8, &x_seed);
-    const x_kp = X25519.KeyPair.generateDeterministic(x_seed) catch return error.KexFailed;
+    const x_kp = X25519.KeyPair.generateDeterministic(x_seed);
     var x_shared = X25519.scalarmult(x_kp.secret_key, x_client) catch return error.KexFailed;
     defer std.crypto.secureZero(u8, &x_shared);
 

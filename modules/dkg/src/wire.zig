@@ -49,8 +49,8 @@ pub const Kind = enum(u8) {
 };
 
 pub fn kindFromByte(b: u8) ?Kind {
-    inline for (@typeInfo(Kind).@"enum".fields) |f| {
-        if (b == f.value) return @fromBackingInt(@intCast(f.value));
+    inline for (@typeInfo(Kind).@"enum".field_values) |f_value| {
+        if (b == f_value) return @fromBackingInt(@intCast(f_value));
     }
     return null;
 }

@@ -186,9 +186,8 @@ noinline fn generateEphemeralUnburned(out: *EphemeralKeyPair, curve: Curve, entr
             while (true) {
                 out.private = .{ .x25519 = undefined };
                 random.bytes(&out.private.x25519);
-                // Clamped-scalar identity output is not reachable from
-                // random bytes, but the error union exists — resample.
-                const pk = X25519.recoverPublicKey(out.private.x25519) catch continue;
+                // Zig 0.17: recoverPublicKey no longer returns an error.
+                const pk = X25519.recoverPublicKey(out.private.x25519);
                 out.public = .{ .x25519 = pk };
                 return;
             }

@@ -178,7 +178,7 @@ fn verifyWith(id: []const u8, patch: anytype) chain.VerifyChainError!void {
     const c = find(id) catch |err| std.debug.panic("corpus case {s}: {t}", .{ id, err });
     var usages: [3]extensions.Purpose = undefined;
     var opts = goOptions(&c, &usages);
-    inline for (std.meta.fields(@TypeOf(patch))) |f| @field(opts, f.name) = @field(patch, f.name);
+    inline for (@typeInfo(@TypeOf(patch)).@"struct".field_names) |f_name| @field(opts, f_name) = @field(patch, f_name);
     _ = try chain.verifyChain(std.testing.allocator, c.chainCerts(), c.anchors(), opts);
 }
 

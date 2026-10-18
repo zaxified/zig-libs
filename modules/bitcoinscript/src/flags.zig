@@ -119,11 +119,13 @@ const testing = std.testing;
 
 test "none has every flag off, standard has every implemented flag on" {
     const n = ScriptFlags.none;
-    inline for (std.meta.fields(ScriptFlags)) |f| {
+    inline for (@typeInfo(ScriptFlags).@"struct".field_names, @typeInfo(ScriptFlags).@"struct".field_types) |f_name, f_type| {
+        const f = .{ .name = f_name, .type = f_type };
         if (f.type == bool) try testing.expectEqual(false, @field(n, f.name));
     }
     const s = ScriptFlags.standard;
-    inline for (std.meta.fields(ScriptFlags)) |f| {
+    inline for (@typeInfo(ScriptFlags).@"struct".field_names, @typeInfo(ScriptFlags).@"struct".field_types) |f_name, f_type| {
+        const f = .{ .name = f_name, .type = f_type };
         if (f.type == bool) try testing.expectEqual(true, @field(s, f.name));
     }
 }
