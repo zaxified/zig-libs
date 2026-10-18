@@ -59,7 +59,7 @@ fn buildA(buf: []u8, seq: u32) []const u8 {
 }
 
 fn up(iface: u8) flood.InterfaceSet {
-    var s = flood.InterfaceSet.initEmpty();
+    var s = flood.InterfaceSet.empty;
     s.set(iface);
     return s;
 }

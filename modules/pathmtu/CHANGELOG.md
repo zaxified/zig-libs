@@ -5,7 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-10-18** — Ported to Zig 0.17.0. `sockaddr.in.addr` and the SIOCGIFMTU result are converted with `std.mem.bytesToValue` (memory order; an array `@bitCast` is little-endian-logical in 0.17).
+- **2026-10-18** — Ported to Zig 0.17.0. `sockaddr.in.addr` and the SIOCGIFMTU result are converted with `std.mem.bytesToValue` (memory order; an array `@bitCast` is little-endian-logical in 0.17). Examples/tools ported to Zig 0.17.0 (tools/interop.zig: `dupeZ` -> `dupeSentinel`, `Ast.parse` options struct).
 
 - **2026-10-09** — tests: deterministic fuzz driver `PATHMTU_FUZZ` over the existing harness (`classify` on arbitrary bytes and on damaged real captures).
 
