@@ -69,11 +69,25 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   one literal copy of a 32-byte secret after `checkEncode` and two after `checkDecode` survived on
   the dead stack in ReleaseFast even though the caller had zeroed its own buffer (2026-09-06; a
   stack wipe is justified by §2.1's rule, not by a regression test, which §2.1 says cannot see
-  it). Timing is a separate matter and is not fixed: `alphabet[d]` is indexed by the payload's
-  base-58 digits and the carry loops run a value-dependent number of iterations (ctgrind:
-  13 contexts on `checkEncode`, 3 on `checkDecode`/`decode`). The address path this module exists
-  for is public data; a caller base58-encoding key material on a host with a co-tenant is
-  outside what this module promises. `bech32.zig`/`segwit.zig` hold no secret at all.
+  it). Timing: `encode`/`decode`/`checkEncode`/`checkDecode` are NOT constant-time —
+  `alphabet[d]` is indexed by the payload's base-58 digits and the carry loops run a
+  value-dependent number of iterations — and stay so for public data (addresses, xpub).
+  **Key material goes through `checkEncodeSecret`/`checkDecodeSecret` (2026-10-18)**: the same
+  strings, payloads and errors (pinned against the variable-time pair as the oracle: random
+  fixed-length payloads at every leading-zero count, every byte value at four positions, the
+  fuzz driver checks the verdict on every input), with time and addresses depending only on the
+  public lengths. Every input byte/character goes through every position of a fixed-width
+  accumulator (`maxEncodedLenFor(n)` digits / 132 bytes); digit <-> character is computed by
+  masks, never a table; leading zeros/`1`s are counted with a running mask and the string is
+  moved into place by a masked barrel shifter (its mask laundered through an empty asm, else
+  LLVM unswitched the loop on it: 1 context at `encodeSecret (base58.zig:0)` measured). Public
+  by contract and declassified through `public`: the payload and string lengths, the decoded
+  length (for a valid string of a fixed-length format it is the format's length) and the
+  accept/reject verdict. Measured by `bip32`'s ctgrind `xprv` target (serialize + parse of an
+  xprv with the scalar tainted): **12 in-file before (all in `encode`), 0 after**, witness 2
+  (before: 0 — the table load made the string "defined", hiding the decode side). `encodeSecret`
+  needs `out.len >= maxEncodedLenFor(n)` up front (WIF 51/52, xprv 112) and zero-fills the bytes
+  past the returned slice. `bech32.zig`/`segwit.zig` hold no secret at all.
 
 - **Fail-closed on untrusted input, with a specific typed error per rejection reason** (not one
   catch-all): `bech32.DecodeError` distinguishes `MixedCase` / `NoSeparator` / `EmptyHrp` /
@@ -161,7 +175,7 @@ no-overflow case described above.
 
 ## Backlog / deferred
 
-- **No constant-time Base58 (found again 2026-10-18 pre-tag sweep; documented in `base58.zig`'s header)**: WIF (`btcaddr` `wifDecodeBody`/`wifEncode`) and xprv (`bip32` `serializePrivBody`/`parseExtended`) put private keys through the table + carry loops. The payloads are fixed (33/34/78 bytes), so a fixed-iteration CT Base58 is feasible; until then the release notes say so.
+- ~~**No constant-time Base58 (found again 2026-10-18 pre-tag sweep; documented in `base58.zig`'s header)**: WIF (`btcaddr` `wifDecodeBody`/`wifEncode`) and xprv (`bip32` `serializePrivBody`/`parseExtended`) put private keys through the table + carry loops.~~ **DONE 2026-10-18:** `base58.checkEncodeSecret`/`checkDecodeSecret` (+ `encodeSecret`, `maxEncodedLenFor`), fixed iteration over public lengths, arithmetic alphabet mapping, masked leading-zero handling and barrel shift; WIF and xprv switched. ctgrind bip32 `xprv`: 12 -> 0 in-file (see the constant-time bullet above).
 - **Bitcoin script-level address type detection** (P2SH-wrapped segwit, decoding a full
   `scriptPubKey` end-to-end) is out of scope — this module handles the two address *encodings*
   (bech32/bech32m and base58check), not Bitcoin Script.

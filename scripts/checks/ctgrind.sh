@@ -257,7 +257,7 @@ declare -A TARGETS=(
     # first, so nothing public on the wire is counted as secret
     # (see each harness's module doc comment).
     [opaque]="register login serverke2"
-    [bip32]="master derive seed mnemonic"
+    [bip32]="master derive seed mnemonic xprv"
     # ── 2026-09-28: aesgcm (stitched AES-NI kernel + std-primitive backend) ─
     # Key AND plaintext tainted; see modules/aesgcm/src/ctgrind_harness.zig.
     [aesgcm]="ctx stateless generic"
@@ -678,6 +678,7 @@ declare -A PATTERN=(
     [bip32/derive]='bip32[.]zig'
     [bip32/seed]='bip39[.]zig'
     [bip32/mnemonic]='bip39[.]zig'
+    [bip32/xprv]='base58[.]zig|bip32[.]zig'
     # aesgcm's kernel is its own root.zig; the `generic` backend is std's
     # AES/CTR/GHASH with the key schedule cached, so std's files are named
     # for it -- their constant-time property IS that backend's.
@@ -965,6 +966,7 @@ declare -A LABEL=(
     [bip32/derive]='bip32 derivePath (master scalar)+k256'
     [bip32/seed]='bip39 mnemonicToSeed (PBKDF2)'
     [bip32/mnemonic]='bip39 mnemonicToEntropy (wordIndex search)'
+    [bip32/xprv]='bip32 serializePriv+parseExtended (privkey) via base58'
     [aesgcm/ctx]='aesgcm Context aesni (key+pt)'
     [aesgcm/stateless]='aesgcm stateless aesni (key+pt)'
     [aesgcm/generic]='aesgcm Context generic+std (key+pt)'

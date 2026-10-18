@@ -178,6 +178,16 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   | `derive` — `derivePath` `m/44'/0'/0'/0/0` | master private scalar | 29 | 25 | 4 |
   | `seed` — `mnemonicToSeed` | mnemonic | 2 | **0** | 2 |
   | `mnemonic` — `mnemonicToEntropy` | mnemonic | 5 | **3** | 2 |
+  | `xprv` — `serializePriv` + `parseExtended` | master private scalar | 2 | **0** | 2 |
+
+  - `xprv` (new 2026-10-18): measured first on the old variable-time
+    `checkEncode`/`checkDecode` — 12 in-file, all in `bech32`'s base58
+    `encode` (`alphabet[d]` and the carry loops), witness 0 because the
+    table load left the string "defined" and hid the decode side. On
+    `checkEncodeSecret`/`checkDecodeSecret`, with the public header
+    declassified and the scalar range checked by `scalarInRange`: 0, and the
+    taint reaches the printed key (witness 2). The row's source digest covers
+    `bip32.zig` only; re-run `--check bip32` after a `bech32` base58 edit.
 
   - `master` 1 and `derive`'s `bip32.zig:275`: the `IL == 0` / child-key
     `== 0` tests (`std.mem.allEqual`), each compiled to one `vptest; je` —

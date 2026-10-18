@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — constant time on the xprv paths: `serializePriv`/`parseExtended` use `bech32.base58.checkEncodeSecret`/`checkDecodeSecret` (xpub parsing too), `parseExtended` declassifies the public header before branching on it and checks the private scalar with a constant-time `scalarInRange` (was std `rejectNonCanonical` + `std.mem.allEqual`). Same results and errors. New ctgrind target `xprv` (serialize + parse, scalar tainted): 12 in-file contexts before, 0 after.
 - **2026-10-10** — tests: deterministic fuzz driver `BIP32_FUZZ` (testkit) over `parseExtended` (payload- and string-level damage; accepted keys re-serialize to the same text), derivation (public-parent derivation agrees with private, serialize/parse round trip, changed character and other network refused), BIP-39 mnemonics (accepted phrases re-encode canonically) and `parsePath`. No change to the library code.
 - **2026-10-08** — **NO CONSUMER-VISIBLE CHANGE:** the dead-stack probe (`src/stackprobe_test.zig`) moved to the direct-region
   engine (p256's, 2026-10-08): the call runs under a `PAD`-deep shim, the region is painted and read

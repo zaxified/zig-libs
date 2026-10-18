@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-18** — **API addition:** constant-time Base58Check for secret payloads — `base58.checkEncodeSecret`/`checkDecodeSecret` (same signatures, strings, payloads and errors as `checkEncode`/`checkDecode`; `out` for encode must hold `maxEncodedLenFor(payload.len + 4)`), plus `encodeSecret` and `maxEncodedLenFor`. No table index, branch or loop bound on a secret digit (ctgrind bip32 `xprv`: 12 -> 0). The existing functions are unchanged and remain for public data.
 - **2026-10-18** — Backlog: no constant-time Base58 for WIF/xprv (known, re-recorded by the pre-tag constant-time sweep).
 - **2026-10-10** — tests: deterministic fuzz driver `BECH32_FUZZ` over the bech32, base58 and segwit decode harnesses (generic over their choice source) plus roundtrip oracles (genuine accepted, one substituted character refused, wrong hrp refused). No code change.
 - **2026-09-15** — **API addition, no consumer-visible behaviour change:** `polymod`,

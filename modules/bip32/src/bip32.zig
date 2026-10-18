@@ -372,7 +372,9 @@ noinline fn serializePrivBody(k: *const ExtendedPrivKey, network: Network, out: 
     writeHeader(&payload, network.privVersion(), k.depth, k.parent_fingerprint, k.child_number, k.chain_code);
     payload[45] = 0x00;
     @memcpy(payload[46..78], &k.privkey);
-    return bech32.base58.checkEncode(&payload, out);
+    // Constant-time Base58Check (2026-10-18): the string is the key in
+    // another radix. `out` needs `maxEncodedLenFor(82)` = 112 bytes.
+    return bech32.base58.checkEncodeSecret(&payload, out);
 }
 
 /// Serialize an extended public key as `xpub...` (mainnet) or `tpub...`
@@ -421,6 +423,39 @@ pub fn parseExtended(s: []const u8, network: Network, out: *ParsedKey) ParseErro
     return parseExtendedBody(s, network, out);
 }
 
+/// Tells memcheck that `bytes` (computed from a secret, public by contract)
+/// are defined, so a branch on them is not a ctgrind context. A no-op
+/// without `-fvalgrind`.
+fn publicBytes(bytes: []const u8) void {
+    std.valgrind.memcheck.makeMemDefined(bytes);
+}
+
+/// The group order n, big-endian.
+const order_be: [32]u8 = blk: {
+    var o: [32]u8 = undefined;
+    std.mem.writeInt(u256, &o, Secp256k1.scalar.field_order, .big);
+    break :blk o;
+};
+
+/// `1 <= k < n` in constant time (2026-10-18; was std's
+/// `rejectNonCanonical` + `std.mem.allEqual`, which exits at the first
+/// non-zero byte): the borrow out of `k - n` over all 32 bytes, ANDed with
+/// "some byte is non-zero". Only the verdict is public.
+fn scalarInRange(k: *const [32]u8) bool {
+    var borrow: u16 = 0;
+    var acc: u8 = 0;
+    var i: usize = k.len;
+    while (i > 0) {
+        i -= 1;
+        const d = @as(u16, k[i]) -% order_be[i] -% borrow;
+        borrow = (d >> 8) & 1;
+        acc |= k[i];
+    }
+    var ok: u16 = borrow & ((@as(u16, acc) +% 0xff) >> 8);
+    publicBytes(std.mem.asBytes(&ok));
+    return ok == 1;
+}
+
 noinline fn parseExtendedBody(s: []const u8, network: Network, out: *ParsedKey) ParseError!void {
     var buf: [bech32.base58.max_payload_len]u8 = undefined;
     // CONVENTIONS §2.1 Z1: for an xprv, `buf` holds the decoded private
@@ -430,8 +465,15 @@ noinline fn parseExtendedBody(s: []const u8, network: Network, out: *ParsedKey) 
     // scalar of a malformed xprv (bad length, unknown version, xpub version
     // byte over private payload) sitting in the frame.
     defer std.crypto.secureZero(u8, &buf);
-    const payload = try bech32.base58.checkDecode(s, &buf);
+    // Constant-time Base58Check (2026-10-18), for xpub too: which one the
+    // string is is not known before it is decoded, and the cost is a few µs.
+    const payload = try bech32.base58.checkDecodeSecret(s, &buf);
     if (payload.len != serialized_payload_len) return error.InvalidLength;
+    // The header (version, depth, parent fingerprint, child number) and the
+    // key-type marker are public — the same fields an xpub carries; only the
+    // 32-byte scalar is secret. Declassified for ctgrind before they are
+    // branched on (`public`).
+    publicBytes(payload[0..46]);
 
     const version = std.mem.readInt(u32, payload[0..4], .big);
     const depth = payload[4];
@@ -461,13 +503,7 @@ noinline fn parseExtendedBody(s: []const u8, network: Network, out: *ParsedKey) 
         var priv: [32]u8 = undefined;
         defer std.crypto.secureZero(u8, &priv);
         @memcpy(&priv, payload[46..78]);
-        const canonical = blk: {
-            Secp256k1.scalar.rejectNonCanonical(priv, .big) catch break :blk false;
-            break :blk true;
-        };
-        if (!canonical or std.mem.allEqual(u8, &priv, 0)) {
-            return error.PrivateKeyOutOfRange;
-        }
+        if (!scalarInRange(&priv)) return error.PrivateKeyOutOfRange;
         out.* = .{ .private = .{
             .depth = depth,
             .parent_fingerprint = parent_fp,
@@ -1137,6 +1173,35 @@ fn bentPathSeed(comptime raw: []const u8, comptime bends: []const u64) []const u
         };
         const bytes = std.mem.toBytes(@as(u32, raw.len)) ++ raw[0..raw.len].* ++ words;
     }.bytes;
+}
+
+test "scalarInRange (constant-time) agrees with rejectNonCanonical + non-zero" {
+    const oracle = struct {
+        fn f(k: *const [32]u8) bool {
+            Secp256k1.scalar.rejectNonCanonical(k.*, .big) catch return false;
+            return !std.mem.allEqual(u8, k, 0);
+        }
+    }.f;
+    var edges: [7][32]u8 = undefined;
+    edges[0] = [_]u8{0} ** 32;
+    edges[1] = edges[0];
+    edges[1][31] = 1;
+    edges[2] = order_be;
+    edges[2][31] -= 1; // n - 1
+    edges[3] = order_be; // n
+    edges[4] = order_be;
+    edges[4][31] += 1; // n + 1
+    edges[5] = [_]u8{0xff} ** 32;
+    edges[6] = edges[0];
+    edges[6][0] = 1;
+    for (&edges) |*e| try testing.expectEqual(oracle(e), scalarInRange(e));
+    var prng = std.Random.DefaultPrng.init(0xb1932);
+    for (0..2000) |i| {
+        var k: [32]u8 = undefined;
+        prng.random().bytes(&k);
+        if (i % 2 == 0) @memcpy(k[0..16], order_be[0..16]);
+        try testing.expectEqual(oracle(&k), scalarInRange(&k));
+    }
 }
 
 test "fuzz: parsePath never panics on arbitrary text" {

@@ -386,10 +386,32 @@ const secp256k1_order = [32]u8{
     0xba, 0xae, 0xdc, 0xe6, 0xaf, 0x48, 0xa0, 0x3b, 0xbf, 0xd2, 0x5e, 0x8c, 0xd0, 0x36, 0x41, 0x41,
 };
 
+/// A value computed from the secret that is public by contract (the
+/// accept/reject verdict, the version byte, the compression flag). Without
+/// `-fvalgrind` the identity; with it, memcheck is told the value is
+/// defined, so the one branch taken on it is not a ctgrind context.
+inline fn public(comptime T: type, v: T) T {
+    var x = v;
+    std.valgrind.memcheck.makeMemDefined(std.mem.asBytes(&x));
+    return x;
+}
+
+/// `1 <= key < n`, in constant time (2026-10-18; was `std.mem.eql` +
+/// `std.mem.order`, both early-exit on the first differing byte of the key):
+/// the borrow out of `key - n` over all 32 bytes, ANDed with "some byte is
+/// non-zero". Only the verdict is public.
 fn keyInRange(key: *const [32]u8) bool {
-    const zero = [_]u8{0} ** 32;
-    if (std.mem.eql(u8, key, &zero)) return false;
-    return std.mem.order(u8, key, &secp256k1_order) == .lt;
+    var borrow: u16 = 0;
+    var acc: u8 = 0;
+    var i: usize = key.len;
+    while (i > 0) {
+        i -= 1;
+        const d = @as(u16, key[i]) -% secp256k1_order[i] -% borrow;
+        borrow = (d >> 8) & 1;
+        acc |= key[i];
+    }
+    const nonzero = (@as(u16, acc) +% 0xff) >> 8; // 1 iff acc != 0
+    return public(u16, borrow & nonzero) == 1;
 }
 
 /// A decoded WIF private key. SECRET: call `wipe` when done.
@@ -426,17 +448,21 @@ fn wifDecodeBody(out: *Wif, s: []const u8) WifDecodeError!void {
     errdefer std.crypto.secureZero(u8, &out.key);
     var buf: [34]u8 = undefined;
     defer std.crypto.secureZero(u8, &buf);
-    const payload = base58.checkDecode(s, &buf) catch |e| return switch (e) {
+    // Constant-time Base58Check (2026-10-18): the string IS the key in
+    // another radix. Its length (public) and the verdict are what it reveals.
+    const payload = base58.checkDecodeSecret(s, &buf) catch |e| return switch (e) {
         error.BufferTooSmall => error.InvalidPayloadLength,
         else => e,
     };
     if (payload.len != 33 and payload.len != 34) return error.InvalidPayloadLength;
-    const chains: Chains = switch (payload[0]) {
+    // The version byte (network) and the compression flag are metadata, not
+    // key bits — public, like the string's prefix and length that show them.
+    const chains: Chains = switch (public(u8, payload[0])) {
         0x80 => chains_main,
         0xef => chains_base58_test,
         else => return error.UnknownVersionByte,
     };
-    if (payload.len == 34 and payload[33] != 0x01) return error.InvalidCompressionFlag;
+    if (payload.len == 34 and public(u8, payload[33]) != 0x01) return error.InvalidCompressionFlag;
     if (!keyInRange(payload[1..33])) return error.InvalidKey;
     out.chains = chains;
     out.key = payload[1..33].*;
@@ -458,7 +484,9 @@ fn wifEncodeBody(key: *const [32]u8, compressed: bool, network: Network, out: []
     payload[0] = network.wifVersion();
     payload[1..33].* = key.*;
     payload[33] = 0x01;
-    return base58.checkEncode(payload[0..if (compressed) 34 else 33], out);
+    // Constant-time Base58Check (2026-10-18). `out` needs
+    // `base58.maxEncodedLenFor(37 or 38)` = 51 / 52 bytes (`max_wif_len`).
+    return base58.checkEncodeSecret(payload[0..if (compressed) 34 else 33], out);
 }
 
 // -- helpers: script hash / key hash -> output script ----------------------
@@ -550,4 +578,35 @@ test {
     _ = @import("unit_test.zig");
     _ = @import("fuzz_test.zig");
     _ = @import("stackprobe_test.zig");
+}
+
+test "keyInRange (constant-time) agrees with the byte-order comparison it replaced" {
+    const t = std.testing;
+    const oracle = struct {
+        fn f(key: *const [32]u8) bool {
+            if (std.mem.allEqual(u8, key, 0)) return false;
+            return std.mem.order(u8, key, &secp256k1_order) == .lt;
+        }
+    }.f;
+    var edges: [7][32]u8 = undefined;
+    edges[0] = [_]u8{0} ** 32;
+    edges[1] = edges[0];
+    edges[1][31] = 1;
+    edges[2] = secp256k1_order;
+    edges[2][31] -= 1; // n - 1
+    edges[3] = secp256k1_order; // n
+    edges[4] = secp256k1_order;
+    edges[4][31] += 1; // n + 1
+    edges[5] = [_]u8{0xff} ** 32;
+    edges[6] = edges[0];
+    edges[6][0] = 1; // high byte only
+    for (&edges) |*e| try t.expectEqual(oracle(e), keyInRange(e));
+    var prng = std.Random.DefaultPrng.init(0xb7c);
+    for (0..2000) |i| {
+        var k: [32]u8 = undefined;
+        prng.random().bytes(&k);
+        // Half of them share n's top bytes, so the borrow decides late.
+        if (i % 2 == 0) @memcpy(k[0..16], secp256k1_order[0..16]);
+        try t.expectEqual(oracle(&k), keyInRange(&k));
+    }
 }

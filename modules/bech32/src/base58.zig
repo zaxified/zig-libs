@@ -22,12 +22,14 @@
 //! measured 2026-09-06: without the wipes, one literal copy of a 32-byte
 //! secret after `checkEncode` and two after `checkDecode` survived on the
 //! dead stack in ReleaseFast even though the caller had zeroed its own
-//! buffer. **Not constant-time**: `alphabet[d]` is indexed by the base-58
-//! digits of the payload and the carry loops run a value-dependent number
-//! of iterations (ctgrind: 13 contexts on `checkEncode`, 3 on
-//! `checkDecode`). Key material that must not leak through timing should
-//! not be base58-encoded on a shared host; the wallet-address path this
-//! module exists for is public data.
+//! buffer. **`encode`/`decode`/`checkEncode`/`checkDecode` are not
+//! constant-time**: `alphabet[d]` is indexed by the base-58 digits of the
+//! payload and the carry loops run a value-dependent number of iterations
+//! (ctgrind, bip32 `xprv` target before 2026-10-18: 12 contexts in
+//! `encode`). They stay for public data (addresses, xpub). Key material goes
+//! through `checkEncodeSecret`/`checkDecodeSecret` (2026-10-18): the same
+//! strings and verdicts, with no table index, branch or loop bound on a
+//! secret digit — see "constant-time Base58Check" below.
 
 const std = @import("std");
 const ripemd160 = @import("ripemd160");
@@ -208,6 +210,251 @@ pub fn checkDecode(s: []const u8, out: []u8) CheckError![]const u8 {
     return out[0..payload.len];
 }
 
+// ── constant-time Base58Check, for secret payloads (WIF, xprv) ─────────────
+//
+// `encode`/`decode` above index `alphabet`/`alphabet_rev` by secret digits
+// and characters, and their carry loops stop early on a zero carry and skip
+// leading zeros — the work and the addresses they touch follow the value.
+// The pair below does the same arithmetic with nothing depending on the
+// secret except the values themselves:
+//
+// * every digit/byte position of a fixed-width accumulator is processed for
+//   every input byte/character (the width depends only on public LENGTHS);
+// * digit <-> character is computed — each range decision a borrow turned into
+//   a mask, as in `b64ct` and `sessions/src/idhex.zig` — never a table load;
+// * leading zero bytes / leading `1`s are counted with a running mask, and the
+//   string is moved into place by a barrel shifter whose stages are selected
+//   by masks, never by a branch or a secret-sized copy;
+// * validity (characters, overflow, checksum) is accumulated and branched on
+//   once, at the end, through `public`.
+//
+// What is public, and why: the payload length (`checkEncodeSecret`'s input,
+// fixed per format: 33/34 B for WIF, 78 B for xprv), the string length (it is
+// the output, or the input), the decoded LENGTH (for a well-formed string of a
+// fixed-length format it equals the format's length, so it says nothing about
+// the key), and the accept/reject verdict. `public` is where each becomes a
+// branch.
+
+/// A value computed from secret input that the contract makes public (a
+/// length, the verdict). Without `-fvalgrind` the identity; with it, memcheck
+/// is told the value is defined, so the one branch taken on it is not
+/// reported by ctgrind.
+inline fn public(comptime T: type, v: T) T {
+    var x = v;
+    std.valgrind.memcheck.makeMemDefined(std.mem.asBytes(&x));
+    return x;
+}
+
+/// Optimization barrier (the montint `b199192` class, same idiom as
+/// `fss/src/dpf.zig` and `hqc/src/reedsolomon.zig`): an empty inline asm, so
+/// LLVM loses what it knows about `x` and cannot turn a masked select back
+/// into a branch. No-op at runtime.
+inline fn blackBox(x: u8) u8 {
+    return asm volatile (""
+        : [ret] "=r" (-> u8),
+        : [x] "0" (x),
+    );
+}
+
+/// 1 when `a >= b` (both < 2^15), else 0 — the borrow of `b - 1 - a`.
+inline fn geBit(a: u16, comptime b: u16) u16 {
+    return ((b -% 1 -% a) >> 15) & 1;
+}
+
+/// 0xff when `lo <= c <= hi`, else 0.
+inline fn inRange(c: u8, comptime lo: u8, comptime hi: u8) u8 {
+    const v = (@as(u16, c) -% lo) | (@as(u16, hi) -% c);
+    return ~@as(u8, @truncate(v >> 8));
+}
+
+/// 1 when `b == 0`, else 0.
+inline fn isZeroBit(b: u8) usize {
+    return @as(usize, (@as(u16, b) -% 1) >> 15);
+}
+
+/// A base-58 digit (0..57) to its `alphabet` character, without a table.
+/// The alphabet is six runs: `1-9`, `A-H`, `J-N`, `P-Z`, `a-k`, `m-z`; each
+/// run boundary adds the gap to the next run.
+inline fn digitChar(d: u8) u8 {
+    const w: u16 = d;
+    const c = w + '1' +
+        7 * geBit(w, 9) + // '9'+1 -> 'A'
+        geBit(w, 17) + // skip 'I'
+        geBit(w, 22) + // skip 'O'
+        6 * geBit(w, 33) + // 'Z'+1 -> 'a'
+        geBit(w, 44); // skip 'l'
+    return @truncate(c);
+}
+
+/// An `alphabet` character to its digit, plus 0xff when `c` is in the
+/// alphabet (else 0, with digit 0) — no table, no branch.
+inline fn charDigit(c: u8) struct { u8, u8 } {
+    const r1 = inRange(c, '1', '9');
+    const r2 = inRange(c, 'A', 'H');
+    const r3 = inRange(c, 'J', 'N');
+    const r4 = inRange(c, 'P', 'Z');
+    const r5 = inRange(c, 'a', 'k');
+    const r6 = inRange(c, 'm', 'z');
+    const d = (r1 & (c -% '1')) |
+        (r2 & (c -% 'A' +% 9)) |
+        (r3 & (c -% 'J' +% 17)) |
+        (r4 & (c -% 'P' +% 22)) |
+        (r5 & (c -% 'a' +% 33)) |
+        (r6 & (c -% 'm' +% 44));
+    return .{ d, r1 | r2 | r3 | r4 | r5 | r6 };
+}
+
+/// The longest base58 string a payload of `n` bytes can encode to:
+/// `ceil(n * log(256) / log(58))` (log(256)/log(58) = 1.3656582373...; the
+/// constant is rounded UP, and a test pins the result against exact big-integer
+/// powers for every length this module accepts). WIF: 37 B -> 51, 38 B -> 52;
+/// xprv: 82 B -> 112.
+pub fn maxEncodedLenFor(n: usize) usize {
+    return (n * 1_365_658_238 + 999_999_999) / 1_000_000_000;
+}
+
+/// `encode` for a SECRET payload: the same string, computed in time and
+/// memory-access pattern that depend only on `data.len`. `out` must hold
+/// `maxEncodedLenFor(data.len)` bytes (checked up front; the bytes past the
+/// returned slice are overwritten with zeros).
+pub fn encodeSecret(data: []const u8, out: []u8) Error![]const u8 {
+    if (data.len > max_payload_len) return error.PayloadTooLarge;
+    const ld = maxEncodedLenFor(data.len);
+    if (ld > out.len) return error.BufferTooSmall;
+
+    var b58: [max_encoded_len]u8 = undefined;
+    defer std.crypto.secureZero(u8, &b58); // Z1, see the module doc
+    @memset(b58[0..ld], 0);
+    // Every byte (leading zeros too: they leave the value at 0) into every
+    // digit position. `ld` digits hold any `data.len`-byte value, so the
+    // final carry is always 0.
+    for (data) |byte| {
+        var carry: u32 = byte;
+        var j: usize = ld;
+        while (j > 0) {
+            j -= 1;
+            carry += @as(u32, 256) * b58[j];
+            b58[j] = @intCast(carry % 58);
+            carry /= 58;
+        }
+    }
+
+    // Leading zero bytes `z` and leading zero digits `lzd`, by running masks.
+    var z: usize = 0;
+    var run: usize = 1;
+    for (data) |byte| {
+        run &= isZeroBit(byte);
+        z += run;
+    }
+    var lzd: usize = 0;
+    run = 1;
+    for (b58[0..ld]) |d| {
+        run &= isZeroBit(d);
+        lzd += run;
+    }
+    // Digit 0 IS '1', so `b58` as characters is `lzd` '1's then the digits;
+    // the string wants `z` of them. `lzd >= z`: the value is below
+    // 256^(n-z), so it has at most ceil((n-z)*r) digits, and
+    // ld - ceil((n-z)*r) >= ceil(n*r) - ceil((n-z)*r) >= floor(z*r) >= z.
+    const skip = lzd - z;
+    for (b58[0..ld]) |*d| d.* = digitChar(d.*);
+
+    // Shift left by `skip`: one stage per bit of `skip`, each stage applied
+    // to every position and selected by a mask.
+    var k: u6 = 0;
+    while ((@as(usize, 1) << k) < ld) : (k += 1) {
+        const shift = @as(usize, 1) << k;
+        // Laundered: a mask LLVM can see is 0 or 0xff lets it turn the
+        // select back into a branch and unswitch the loop on it (ctgrind
+        // 2026-10-18: one context at `encodeSecret (base58.zig:0)` without).
+        const m = blackBox(0 -% @as(u8, @truncate((skip >> k) & 1)));
+        for (0..ld) |i| {
+            const src: u8 = if (i + shift < ld) b58[i + shift] else 0;
+            b58[i] = (b58[i] & ~m) | (src & m);
+        }
+    }
+
+    @memcpy(out[0..ld], b58[0..ld]);
+    // Public: the string's length is visible to whoever reads the string.
+    return out[0..public(usize, ld - skip)];
+}
+
+/// `checkEncode` for a SECRET payload (WIF, xprv): `encodeSecret` of
+/// `payload ++ SHA256d(payload)[0..4]`. Same string as `checkEncode`; `out`
+/// must hold `maxEncodedLenFor(payload.len + checksum_len)` bytes.
+pub fn checkEncodeSecret(payload: []const u8, out: []u8) Error![]const u8 {
+    if (payload.len + checksum_len > max_payload_len) return error.PayloadTooLarge;
+    var buf: [max_payload_len]u8 = undefined;
+    defer std.crypto.secureZero(u8, &buf); // Z1: a literal copy of the payload
+    @memcpy(buf[0..payload.len], payload);
+    var h: [32]u8 = undefined;
+    defer std.crypto.secureZero(u8, &h);
+    sha256d(payload, &h);
+    @memcpy(buf[payload.len..][0..checksum_len], h[0..checksum_len]);
+    return encodeSecret(buf[0 .. payload.len + checksum_len], out);
+}
+
+/// `checkDecode` for a SECRET string (WIF, xprv): the same payload and the
+/// same error for every input, computed in time and memory-access pattern
+/// that depend only on `s.len`. The decoded length becomes public once (see
+/// the section comment), then the checksum verdict.
+pub fn checkDecodeSecret(s: []const u8, out: []u8) CheckError![]const u8 {
+    if (s.len > max_encoded_len) return error.InputTooLong;
+    // The width of `checkDecode`'s staging buffer, so both reject the same
+    // strings as too long. 58^180 < 256^132, so a valid-character string
+    // never overflows it; the flag is kept anyway, as a verdict input.
+    const w = max_payload_len + checksum_len;
+    var b256: [w]u8 = undefined;
+    defer std.crypto.secureZero(u8, &b256); // Z1: the decoded payload
+    @memset(&b256, 0);
+
+    var valid: u8 = 0xff;
+    var overflow: u32 = 0;
+    var z: usize = 0;
+    var run: usize = 1;
+    for (s) |c| {
+        const dv = charDigit(c);
+        valid &= dv[1];
+        run &= isZeroBit(c ^ '1');
+        z += run;
+        var carry: u32 = dv[0];
+        var j: usize = w;
+        while (j > 0) {
+            j -= 1;
+            carry += @as(u32, 58) * b256[j];
+            b256[j] = @truncate(carry);
+            carry >>= 8;
+        }
+        overflow |= carry;
+    }
+    if (public(u8, valid) != 0xff) return error.InvalidChar;
+
+    var lzb: usize = 0;
+    run = 1;
+    for (b256) |b| {
+        run &= isZeroBit(b);
+        lzb += run;
+    }
+    // `z` zero bytes, then the value's `w - lzb` significant bytes. When it
+    // fits, that is exactly the last `len` bytes of `b256` (the `lzb - (w -
+    // len)` bytes in front of the value are its zeros).
+    const len = public(usize, z + (w - lzb));
+    if (public(u32, overflow) != 0 or len > w) return error.BufferTooSmall;
+    if (len < checksum_len) return error.TooShort;
+
+    const decoded = b256[w - len ..];
+    const payload = decoded[0 .. len - checksum_len];
+    var h: [32]u8 = undefined;
+    defer std.crypto.secureZero(u8, &h);
+    sha256d(payload, &h);
+    const ok = std.crypto.timing_safe.eql([checksum_len]u8, decoded[len - checksum_len ..][0..checksum_len].*, h[0..checksum_len].*);
+    if (!public(bool, ok)) return error.ChecksumMismatch;
+
+    if (payload.len > out.len) return error.BufferTooSmall;
+    @memcpy(out[0..payload.len], payload);
+    return out[0..payload.len];
+}
+
 // ── Bitcoin address convenience helpers ─────────────────────────────────
 
 /// P2PKH/P2SH Base58Check payload length: 1 version byte + a 20-byte hash.
@@ -350,6 +597,163 @@ test "base58check: every one of the four checksum bytes is compared, not only th
     const address = try encode(&swapped, &enc_buf);
     var out: [64]u8 = undefined;
     try testing.expectError(error.ChecksumMismatch, checkDecode(address, &out));
+}
+
+test "ct base58: digitChar/charDigit agree with the tables on every input" {
+    for (0..58) |d| try testing.expectEqual(alphabet[d], digitChar(@intCast(d)));
+    for (0..256) |c| {
+        const dv = charDigit(@intCast(c));
+        const want = alphabet_rev[c];
+        if (want < 0) {
+            try testing.expectEqual(@as(u8, 0), dv[1]);
+        } else {
+            try testing.expectEqual(@as(u8, 0xff), dv[1]);
+            try testing.expectEqual(@as(u8, @intCast(want)), dv[0]);
+        }
+    }
+}
+
+test "ct base58: maxEncodedLenFor is the exact ceil(n*log(256)/log(58)) for every accepted length" {
+    // Smallest L with 58^L >= 256^n, by exact big-integer powers.
+    const Managed = std.math.big.int.Managed;
+    var p58 = try Managed.initSet(testing.allocator, 1);
+    defer p58.deinit();
+    var p256 = try Managed.initSet(testing.allocator, 1);
+    defer p256.deinit();
+    var c58 = try Managed.initSet(testing.allocator, 58);
+    defer c58.deinit();
+    var l: usize = 0;
+    for (0..max_payload_len + 1) |n| {
+        if (n > 0) try p256.shiftLeft(&p256, 8);
+        while (p58.order(p256) == .lt) {
+            try p58.mul(&p58, &c58);
+            l += 1;
+        }
+        try testing.expectEqual(l, maxEncodedLenFor(n));
+    }
+    try testing.expectEqual(@as(usize, 51), maxEncodedLenFor(37)); // WIF, uncompressed
+    try testing.expectEqual(@as(usize, 52), maxEncodedLenFor(38)); // WIF, compressed
+    try testing.expectEqual(@as(usize, 112), maxEncodedLenFor(82)); // xprv
+    try testing.expect(maxEncodedLenFor(max_payload_len) <= max_encoded_len);
+}
+
+/// The variable-time pair is the oracle: same string, same payload, same error.
+fn expectSecretMatchesOracle(payload: []const u8) !void {
+    var enc_a: [max_encoded_len]u8 = undefined;
+    var enc_b: [max_encoded_len]u8 = undefined;
+    const want_raw = try encode(payload, &enc_a);
+    const got_raw = try encodeSecret(payload, &enc_b);
+    try testing.expectEqualStrings(want_raw, got_raw);
+    if (payload.len + checksum_len > max_payload_len) return;
+
+    const want = try checkEncode(payload, &enc_a);
+    const got = try checkEncodeSecret(payload, &enc_b);
+    try testing.expectEqualStrings(want, got);
+
+    var dec_a: [max_payload_len]u8 = undefined;
+    var dec_b: [max_payload_len]u8 = undefined;
+    try testing.expectEqualSlices(u8, payload, try checkDecode(got, &dec_a));
+    try testing.expectEqualSlices(u8, payload, try checkDecodeSecret(got, &dec_b));
+}
+
+fn expectSameDecodeVerdict(s: []const u8) !void {
+    var dec_a: [max_payload_len]u8 = undefined;
+    var dec_b: [max_payload_len]u8 = undefined;
+    const a = checkDecode(s, &dec_a);
+    const b = checkDecodeSecret(s, &dec_b);
+    if (a) |pa| {
+        try testing.expectEqualSlices(u8, pa, try b);
+    } else |ea| {
+        try testing.expectError(ea, b);
+    }
+}
+
+test "ct base58: random fixed-length payloads, every leading-zero count, match the variable-time codec" {
+    var prng = std.Random.DefaultPrng.init(0x5eed_b58);
+    const rnd = prng.random();
+    // WIF (33/34 B), xprv (78 B), P2PKH (21 B), the edges of both bounds.
+    const lens = [_]usize{ 0, 1, 2, 5, 21, 33, 34, 37, 38, 78, 82, max_payload_len - checksum_len, max_payload_len };
+    var buf: [max_payload_len]u8 = undefined;
+    for (lens) |n| {
+        // Every leading-zero count 0..n, the next byte forced non-zero (else
+        // the count would be larger), twice each.
+        for (0..n + 1) |zeros| {
+            for (0..2) |_| {
+                rnd.bytes(buf[0..n]);
+                @memset(buf[0..zeros], 0);
+                if (zeros < n and buf[zeros] == 0) buf[zeros] = 1 + rnd.uintLessThan(u8, 255);
+                try expectSecretMatchesOracle(buf[0..n]);
+            }
+        }
+        // And plain random payloads, extremes included.
+        for (0..64) |_| {
+            rnd.bytes(buf[0..n]);
+            try expectSecretMatchesOracle(buf[0..n]);
+        }
+        @memset(buf[0..n], 0xff);
+        try expectSecretMatchesOracle(buf[0..n]);
+    }
+}
+
+test "ct base58: Bitcoin Core's base58 vectors through encodeSecret" {
+    var enc_buf: [max_encoded_len]u8 = undefined;
+    var hex_buf: [256]u8 = undefined;
+    for (base58_vectors.vectors) |v| {
+        const payload = std.fmt.hexToBytes(&hex_buf, v.hex) catch unreachable;
+        if (payload.len > max_payload_len) {
+            try testing.expectError(error.PayloadTooLarge, encodeSecret(payload, &enc_buf));
+            continue;
+        }
+        try testing.expectEqualStrings(v.base58, try encodeSecret(payload, &enc_buf));
+    }
+}
+
+test "ct base58: invalid characters, bad checksums and bad lengths get checkDecode's verdict" {
+    // A real envelope (a WIF-shaped payload), then every byte value at the
+    // ends and the middle, and one in-alphabet substitution at every
+    // position: out-of-alphabet characters are InvalidChar, substitutions
+    // break the checksum — both decoders must agree on each.
+    var payload: [34]u8 = undefined;
+    for (&payload, 0..) |*b, i| b.* = @truncate(i * 7 + 0x80);
+    var enc: [max_encoded_len]u8 = undefined;
+    const s = try checkEncodeSecret(&payload, &enc);
+    var t: [max_encoded_len]u8 = undefined;
+    for ([_]usize{ 0, 1, s.len / 2, s.len - 1 }) |pos| {
+        for (0..256) |c| {
+            @memcpy(t[0..s.len], s);
+            t[pos] = @intCast(c);
+            try expectSameDecodeVerdict(t[0..s.len]);
+        }
+    }
+    for (0..s.len) |pos| {
+        @memcpy(t[0..s.len], s);
+        t[pos] = if (s[pos] == 'z') 'y' else 'z';
+        try expectSameDecodeVerdict(t[0..s.len]);
+    }
+    // Each checksum byte flipped, re-encoded raw: ChecksumMismatch.
+    var dec: [max_payload_len]u8 = undefined;
+    var raw: [max_payload_len]u8 = undefined;
+    const full: [38]u8 = (try decode(s, &raw))[0..38].*;
+    for (34..38) |i| {
+        var tampered = full;
+        tampered[i] ^= 0x01;
+        const ts = try encode(&tampered, &t);
+        try testing.expectError(error.ChecksumMismatch, checkDecodeSecret(ts, &dec));
+    }
+    // Lengths and leading-'1' runs.
+    var ones: [max_encoded_len + 1]u8 = undefined;
+    @memset(&ones, '1');
+    for (0..ones.len + 1) |n| try expectSameDecodeVerdict(ones[0..n]);
+    try testing.expectError(error.InputTooLong, checkDecodeSecret(&ones, &dec));
+    try testing.expectError(error.TooShort, checkDecodeSecret("111", &dec));
+    try testing.expectError(error.TooShort, checkDecodeSecret("", &dec));
+    // `out` too small for the payload, and an encode buffer below the bound.
+    var tiny: [8]u8 = undefined;
+    try testing.expectError(error.BufferTooSmall, checkDecodeSecret(s, &tiny));
+    var short: [51]u8 = undefined; // 52 needed for a 38-byte envelope
+    try testing.expectError(error.BufferTooSmall, checkEncodeSecret(&payload, &short));
+    var big: [max_payload_len]u8 = undefined;
+    try testing.expectError(error.PayloadTooLarge, checkEncodeSecret(big[0 .. max_payload_len - checksum_len + 1], &enc));
 }
 
 test "base58 decode: invalid character rejected (0, O, I, l excluded)" {
@@ -521,6 +925,9 @@ fn fuzzDecode(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     for (buf[0..len]) |*c| {
         if (bend and fz.weighted(src, 1, 3)) c.* = alphabet[c.* % alphabet.len];
     }
+    // The constant-time decoder must give the variable-time one's verdict
+    // and payload on every input.
+    try expectSameDecodeVerdict(buf[0..len]);
     var out: [max_payload_len]u8 = undefined;
     _ = decode(buf[0..len], &out) catch {
         DecodeMark.mark(.refused);

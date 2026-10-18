@@ -15,6 +15,8 @@ modules/acme/src/jws.zig	1	12
 modules/aeadframe/src/channel.zig	1	5
 modules/aesgcm/src/root.zig	2	1
 modules/aeskw/src/root.zig	1	0
+# 2026-10-18: checkDecodeSecret compares the Base58Check checksum with timing_safe.eql (CT Base58 for WIF/xprv).
+modules/bech32/src/base58.zig	1	1
 modules/blindrsa/src/root.zig	1	1
 modules/chachapoly/src/root.zig	1	1
 modules/cookies/src/secure.zig	1	0

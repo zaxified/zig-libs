@@ -80,6 +80,15 @@ var back: [64]u8 = undefined;
 const payload2 = try bech32.base58.checkDecode(addr, &back); // error.ChecksumMismatch on tamper
 ```
 
+For SECRET payloads (WIF, `xprv`) use the constant-time pair — same strings, payloads and errors,
+with no table lookup, branch or loop bound on a secret digit; `out` must hold
+`base58.maxEncodedLenFor(payload.len + 4)` bytes:
+
+```zig
+const wif = try bech32.base58.checkEncodeSecret(wif_payload, &out);
+const key_payload = try bech32.base58.checkDecodeSecret(wif, &back);
+```
+
 Convenience helpers for the two Bitcoin pubkey-hash address types (caller supplies the raw
 public-key bytes; this module hashes them via `ripemd160.hash160`):
 

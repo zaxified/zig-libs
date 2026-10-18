@@ -23,6 +23,12 @@
 //!   itself was rewritten from a binary search to a branchless linear scan
 //!   (finding M6-CT, 2026-09-16) — the row records how much either side
 //!   changes, so a regression in either direction is visible.
+//! * `xprv`     — the master PRIVATE SCALAR through `serializePriv` and back
+//!   through `parseExtended` (the Base58Check text of an `xprv` is the secret
+//!   in another radix, so the string is tainted end to end). Added 2026-10-18
+//!   with the constant-time Base58 (`bech32.base58.checkEncodeSecret` /
+//!   `checkDecodeSecret`); the header fields (version, depth, fingerprint,
+//!   child number, chain code) are public and not tainted at the source.
 //!
 //! ## Verdicts are declassified, payloads are not
 //!
@@ -44,9 +50,10 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const bip32 = @import("root.zig");
+const bech32 = @import("bech32");
 const memcheck = std.valgrind.memcheck;
 
-const Target = enum { master, derive, seed, mnemonic };
+const Target = enum { master, derive, seed, mnemonic, xprv };
 const Taint = enum { yes, no };
 
 fn parseTarget(s: []const u8) !Target {
@@ -91,6 +98,16 @@ fn derivePathValue(master: *const bip32.ExtendedPrivKey, path: []const u32) bip3
     var k: bip32.ExtendedPrivKey = undefined;
     try bip32.derivePath(master, path, &k);
     return k;
+}
+
+fn serializePrivValue(k: *const bip32.ExtendedPrivKey, out: []u8) bech32.base58.Error![]const u8 {
+    return bip32.serializePriv(k, .mainnet, out);
+}
+
+fn parseValue(s: []const u8) bip32.ParseError!bip32.ParsedKey {
+    var p: bip32.ParsedKey = undefined;
+    try bip32.parseExtended(s, .mainnet, &p);
+    return p;
 }
 
 fn settle(r: anytype) !@typeInfo(@TypeOf(r)).error_union.payload {
@@ -155,6 +172,18 @@ pub fn main(init: std.process.Init.Minimal) !void {
             // formatter looping over it would witness that, not the bytes.
             _ = try settle(bip32.mnemonic.mnemonicToEntropy(&words, &ent));
             std.debug.print("entropy={x}\n", .{ent[0..16].*});
+        },
+        .xprv => {
+            var master: bip32.ExtendedPrivKey = undefined;
+            try bip32.masterFromSeed(&fixedSeed(), &master); // untainted setup
+            var raw = master.privkey;
+            taintBytes(&raw, &master.privkey, taint);
+            var text_buf: [bip32.max_serialized_len]u8 = undefined;
+            const text = try settle(serializePrivValue(&master, &text_buf));
+            const parsed = try settle(parseValue(text));
+            // The union tag comes from the (public) version bytes; read the
+            // private arm without a switch so no branch is the harness's own.
+            std.debug.print("privkey={x}\n", .{parsed.private.privkey});
         },
     }
 }
