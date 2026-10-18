@@ -292,7 +292,12 @@ pub const Secp256k1 = struct {
     /// and to std. `error.IdentityElement` if the result is the neutral element
     /// (`s ≡ 0 (mod n)`, or `p` itself is the identity).
     pub fn mul(p: Secp256k1, s_: [32]u8, endian: std.builtin.Endian) IdentityElementError!Secp256k1 {
-        const result = mulInner(p, s_, endian);
+        // By pointer to a zeroed local, as `combMulBase` (Zig 0.17: a by-value
+        // `[32]u8` argument is a copy in the calling frame, above the burn).
+        // The caller's own copy of `s_` stays the caller's (see `mulInto`).
+        var s = s_;
+        defer std.crypto.secureZero(u8, &s);
+        const result = mulInner(p, &s, endian);
         burnMulStack();
         return result;
     }
@@ -315,9 +320,9 @@ pub const Secp256k1 = struct {
     }
 
     /// `mul`'s body, one frame down so `burnMulStack` can reach what it left.
-    noinline fn mulInner(p: Secp256k1, s_: [32]u8, endian: std.builtin.Endian) IdentityElementError!Secp256k1 {
+    noinline fn mulInner(p: Secp256k1, s_: *const [32]u8, endian: std.builtin.Endian) IdentityElementError!Secp256k1 {
         const tab = p.varBaseTable();
-        return mulWithTable(&tab, s_, endian);
+        return mulWithTable(&tab, s_.*, endian);
     }
 
     /// A1 k256 R1 (re-audit 2026-09-15). The windowed multiply left the u256
@@ -413,15 +418,25 @@ pub const Secp256k1 = struct {
     /// table already carries the `2^(w·i)` factor. `error.IdentityElement` iff
     /// `s ≡ 0 (mod n)`. See the comb section below for the CT-gather contract.
     pub fn combMulBase(s_: [32]u8, endian: std.builtin.Endian) IdentityElementError!Secp256k1 {
-        const result = combMulBaseInner(s_, endian);
+        // Zig 0.17 (2026-10-19): a `[32]u8` argument to a non-inline Zig-CC
+        // function is no longer passed in four GPRs (0.16) but by reference to
+        // a copy the CALLER makes in its own frame. With `combMulBase` inlined
+        // into its caller, that copy (for `combMulBaseInner`) sat in the
+        // caller's frame, above the burned region, and survived every call
+        // (`stackprobe_test.zig`, ReleaseFast, BE needle at 111 B; bip32
+        // `neuter` the same). So the scalar goes down by pointer to a local
+        // this function owns and zeroes; the burn still covers everything below.
+        var s = s_;
+        defer std.crypto.secureZero(u8, &s);
+        const result = combMulBaseInner(&s, endian);
         burnCombStack();
         return result;
     }
 
     /// `combMulBase`'s body, one frame down so `burnCombStack` can reach what
-    /// it left.
-    noinline fn combMulBaseInner(s_: [32]u8, endian: std.builtin.Endian) IdentityElementError!Secp256k1 {
-        return combMulBaseWithTable(&comb_table, s_, endian);
+    /// it left. The scalar by pointer: see `combMulBase`.
+    noinline fn combMulBaseInner(s_: *const [32]u8, endian: std.builtin.Endian) IdentityElementError!Secp256k1 {
+        return combMulBaseWithTable(&comb_table, s_.*, endian);
     }
 
     /// Review 2026-10-08. Same class as `mul`'s A1 R1: the comb multiply left
