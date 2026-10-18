@@ -216,7 +216,7 @@ pub fn main(init: std.process.Init) !u8 {
     try writeLines(io, dir, arena, "set.txt", in.set_prefixes);
 
     var env = try init.environ_map.clone(arena);
-    try env.put("GOTOOLCHAIN", "go1.26.0");
+    try env.put("GOTOOLCHAIN", "local");
     try env.put("GOPROXY", "off");
     try env.put("GOFLAGS", "-mod=readonly");
     const abs = try cwd.realPathFileAlloc(io, work_dir, arena);

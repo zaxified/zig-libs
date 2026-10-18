@@ -249,7 +249,7 @@ pub fn main(init: std.process.Init) !u8 {
     const d: Data = try setupData(arena);
     _ = .{fastmem};
 
-    const exe = try bench.goBuild(arena, io, bench_name, init.environ_map, .{ .exe = "go", .dir = go_dir, .abs = abs, .toolchain = "go1.26.0" });
+    const exe = try bench.goBuild(arena, io, bench_name, init.environ_map, .{ .exe = "go", .dir = go_dir, .abs = abs });
     var buf: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writerStreaming(io, &buf);
     const w = &stdout.interface;

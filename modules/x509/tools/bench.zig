@@ -6,7 +6,7 @@
 //!
 //! THIS IS A PROGRAM, NOT A TEST. `zig build bench-x509` runs it (always
 //! ReleaseFast); `zig build check-interop` compiles it. Needs go 1.26.0
-//! (`GOTOOLCHAIN=go1.26.0`, `GOPROXY=off`; stdlib only, `tools/go_bench`) and
+//! (`GOTOOLCHAIN=local`, `GOPROXY=off`; stdlib only, `tools/go_bench`) and
 //! no C compiler. Run from the repository root.
 //!
 //! The Go side generates three chains into `.zig-cache/bench-x509/` (fresh
@@ -81,7 +81,7 @@ pub fn main(init: std.process.Init) !u8 {
     const rounds: usize = if (init.environ_map.get("BENCH_ROUNDS")) |r| try std.fmt.parseInt(usize, r, 10) else 3;
 
     var env = try init.environ_map.clone(arena);
-    try env.put("GOTOOLCHAIN", "go1.26.0");
+    try env.put("GOTOOLCHAIN", "local");
     try env.put("GOPROXY", "off");
     try env.put("GOFLAGS", "-mod=readonly");
     const exe = try std.fmt.allocPrint(arena, "{s}/go_bench", .{abs});
