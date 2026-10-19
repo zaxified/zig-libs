@@ -5,6 +5,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-19** — FIX (wrong answers, no memory-safety impact): after a prefilter skip both
+  NFA engines reused the closure's visited marks from the position where the last threads died,
+  so an assertion that had failed there (`\b`, `^`, `$`) was never walked at the new position.
+  `isMatch` answered false for programs over 128 instructions (the lazy DFA's limit, so
+  `runSetOn` answered), e.g. `a?\b+(  *((xxxxa+)xx|()+){2}){1,3}` on `"a1 "` (reported by bxp's
+  differential driver vs Go, 1 in ~20 M inputs). `find`/`captures`/the iterator missed matches
+  wherever the Pike VM ran — every leftmost-longest (POSIX, `Longest`) search, and leftmost-first
+  once the backtracker hands over — e.g. POSIX `(a?^[a-][^a])` on `" a \nabÉ"` (Go: [4 6]). The
+  fuzz harness now pads a quarter of its patterns past the DFA's size with a dead alternative and
+  half of those start `a?\b`-shaped; it finds the bug in ~3 s (it had never reached it).
+
 - **2026-10-18** — Ported to Zig 0.17.0. `StaticBitSet` `.initEmpty()` becomes `.empty`; the vector-of-bool `@bitCast` in `findLiteral` is unchanged (bit i = lane i, verified by the existing tests).
 - **2026-10-07** — Instrument: `tools/bench.zig` + `tools/go_bench/` (`zig build
   bench-regex`), the comparative benchmark against Go `regexp` behind the maturity

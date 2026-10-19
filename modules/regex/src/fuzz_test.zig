@@ -57,7 +57,10 @@ const fuzz_driver = testkit.fuzz.driver;
 
 /// Reach labels: the driver's `hit` (printed by `REGEX_FUZZ` runs) and a
 /// local count the in-suite test checks.
-const Label = enum { refused, compiled, full, matched, group, literal, posix, posix_refused, longest_ref };
+const Label = enum { refused, compiled, full, matched, group, literal, posix, posix_refused, longest_ref, big };
+
+/// `Dfa.max_insts` in root.zig: a longer program is matched by `runSetOn`.
+const dfa_max_insts = 128;
 var reach: [@typeInfo(Label).@"enum".field_names.len]usize = @splat(0);
 
 fn hit(comptime l: Label) void {
@@ -164,6 +167,31 @@ fn harness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     var g: Gen = .{};
     const posix = src.valueRangeAtMost(u8, 0, 2) == 0;
     if (posix) genAltPosix(S, src, &g, 0) else genAlt(S, src, &g, 0);
+    // A share padded past the lazy DFA's size with a dead alternative (`q` is
+    // not in the input alphabet): the same language, but `isMatch` runs the
+    // NFA set simulation (bxp 2026-10-19: a stale closure after a prefilter
+    // skip lived only there; repeating the whole pattern instead hid it —
+    // 0 of 200 000 seeds). Half of them start with an assertion reachable
+    // both from the start and after a consumed code point (`a?\b`): when the
+    // threads die there it has been visited, failing — the shape of that
+    // bug, about one in 10^6 of the plain grammar (0 of 200 000 padded seeds).
+    if (src.valueRangeAtMost(u8, 0, 3) == 0 and g.len != 0) {
+        var body: [256]u8 = undefined;
+        const n = g.len;
+        @memcpy(body[0..n], g.buf[0..n]);
+        g.len = 0;
+        g.meta(if (posix) "(" else "(?:");
+        if (src.value(bool)) {
+            g.asserts = true;
+            if (posix) {
+                g.put(([_][]const u8{ "a?^", "a*$", "[a1]*^" })[src.index(3)]);
+            } else {
+                g.put(([_][]const u8{ "a?\\b", "a*\\b", "[a1]?\\B", "\\w*\\b", "(?m:a?^)", "a*$" })[src.index(6)]);
+            }
+        }
+        g.put(body[0..n]);
+        g.put(")|q{130}");
+    }
     // A share of the patterns is damaged byte-wise: the parser's error paths.
     if (src.valueRangeAtMost(u8, 0, 4) == 0 and g.len != 0) {
         g.literal_only = false;
@@ -202,6 +230,7 @@ fn harness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     };
     defer re.deinit(gpa);
     hit(.compiled);
+    if (re.insts.len > dfa_max_insts) hit(.big);
     var m = try regex.Matcher.init(gpa, &re);
     defer m.deinit();
 

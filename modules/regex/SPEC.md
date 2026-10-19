@@ -263,6 +263,11 @@ matches where `std.mem.indexOf` does), driver `REGEX_FUZZ`.
   small ones stay allocation-free.
 - **An ASCII bitmap per class, a one-pass engine** *(2026-10-07)* — smaller constant factors.
 - **`RegexSet`** *(survey 2026-10-07)* — Rust's and RE2's, not Go's.
+- **Per-call compile + match in ReleaseSafe** *(bxp request 2026-10-19)* — 1.1–3.7× slower than
+  quangd/regex.zig in ReleaseSafe (≈70 % `compiler_rt.memset`: safety fills `undefined` of the
+  ~9 KiB `Builder` and the DFA scratch), 2–7× faster in ReleaseFast/ReleaseSmall. Matters only to
+  consumers that ship ReleaseSafe and compile per call (bxp ships ReleaseSmall); a fix would keep
+  those scratches out of safety's `undefined` fill. Not measured here yet.
 - **Unicode 17.0** — follows Go: regenerate the tables when Go's `unicode` moves.
 - **A byte-stepping DFA state for `trie.search`** *(2026-10-13, from trie's fst parity)* — fst
   searches its index with a `regex-automata` DFA (`start`/`accept(state, byte)`/`isMatch`/

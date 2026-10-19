@@ -329,6 +329,9 @@ pub const Regex = struct {
                 if (@TypeOf(text.*).can_skip and pf.first != null) {
                     pos = text.skip(&pf, pos) orelse return false;
                     prev = text.before(pos);
+                    // `seen` still holds the closure walked where the threads
+                    // died (an assertion that failed there, say): stale here.
+                    cur.clear(words);
                 }
             }
             const here = text.at(pos);
@@ -1121,6 +1124,8 @@ pub const Matcher = struct {
                 if (@TypeOf(text.*).can_skip and pf.first != null) {
                     pos = text.skip(&pf, pos) orelse break;
                     prev = text.before(pos);
+                    // As in `runSetOn`: `seen` is from where the threads died.
+                    cur.clear();
                 }
             }
             const here = text.at(pos);
@@ -1629,6 +1634,45 @@ test "the backtracker and the Pike VM agree on long texts, past the bit budget a
     try testing.expect(dm.bt_jobs.capacity >= Matcher.max_backtrack_jobs); // the jobs did not
     try testing.expectEqual(Span{ .start = 0, .end = long.len }, dg[0].?);
     try testing.expectEqual(Span{ .start = long.len - 2, .end = long.len - 1 }, dg[1].?);
+}
+
+test "isMatch past the DFA's size: a prefilter skip starts with a fresh closure" {
+    // bxp 2026-10-19 (differential driver vs Go): 129 instructions, so `runSetOn`
+    // answers. The threads die after `a` with `\b` visited (it fails between
+    // `a` and `1`); the skip to ` ` reused that `seen` and never walked `\b`
+    // again, where it holds. Go: MatchString true, FindIndex [2 3].
+    const gpa = testing.allocator;
+    var re = try Regex.compile(gpa, "a?\\b+(  *((xxxxa+)xx|()+){2}){1,3}");
+    defer re.deinit(gpa);
+    try testing.expect(re.insts.len > Dfa.max_insts);
+    try testing.expect(re.prefilter.first != null);
+    try testing.expect(re.isMatch("a1 "));
+    const s = (try re.find(gpa, "a1 ")).?;
+    try testing.expectEqual(@as(usize, 2), s.start);
+    try testing.expectEqual(@as(usize, 3), s.end);
+}
+
+test "Pike VM: a prefilter skip starts with a fresh closure" {
+    // The same stale `seen` in `runOn` (found by the fuzz harness once it drew
+    // `a?^`-shaped starts): the threads die after the ` ` before `a`, with `^`
+    // visited and failing there; after the skip to `a` past the newline it
+    // was never walked again. Go (CompilePOSIX, ^ = line start): [4 6].
+    const gpa = testing.allocator;
+    const in = " a \nabÉ";
+    var re = try Regex.compilePosix(gpa, "(a?^[a-][^a])");
+    defer re.deinit(gpa);
+    const s = (try re.find(gpa, in)).?;
+    try testing.expectEqual(@as(usize, 4), s.start);
+    try testing.expectEqual(@as(usize, 6), s.end);
+    // Leftmost-first reaches `runOn` when the backtracker hands over.
+    var re2 = try Regex.compile(gpa, "(?m)(a?^[a-][^a])");
+    defer re2.deinit(gpa);
+    var pm = try Matcher.init(gpa, &re2);
+    defer pm.deinit();
+    pm.pike_only = true;
+    const s2 = pm.find(in, 0).?;
+    try testing.expectEqual(@as(usize, 4), s2.start);
+    try testing.expectEqual(@as(usize, 6), s2.end);
 }
 
 test "the lazy DFA agrees with the NFA: more states than its table, assertions, non-ASCII" {
