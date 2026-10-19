@@ -230,7 +230,7 @@ pub const ConnectionLimiter = struct {
     /// when the address is unlisted. `ip` should already be `unmap`ped.
     pub fn userIndex(cl: *const ConnectionLimiter, ip: netaddr.Ip) ?usize {
         for (cl.options.users, 0..) |u, i| {
-            for (u.prefixes) |p| if (p.contains(ip)) return i;
+            for (u.prefixes) |p| if (canonicalPrefix(p).contains(ip)) return i;
         }
         return null;
     }
@@ -264,6 +264,17 @@ pub const ConnectionLimiter = struct {
         }
     }
 };
+
+/// A v4-mapped v6 prefix of /96 or longer (`::ffff:192.0.2.0/120`) rewritten
+/// as the v4 prefix it denotes (`192.0.2.0/24`) — the same unification
+/// `allowPeerAt` applies to peers. Without it a user configured in the mapped
+/// spelling never matches (peers are unmapped first) and silently falls into
+/// the unlisted pool, under the default limits instead of its own.
+fn canonicalPrefix(p: netaddr.Prefix) netaddr.Prefix {
+    if (p.addr == .v6 and p.bits >= 96 and p.bits <= 128 and p.addr.isIpv4Mapped())
+        return .{ .addr = p.addr.unmap(), .bits = p.bits - 96 };
+    return p;
+}
 
 fn userCfg(options: Options, u: User) TokenBucket.Config {
     return .{
@@ -620,13 +631,24 @@ test "ConnectionLimiter: unmapping never merges two distinct peers" {
     try testing.expect(!cl.allowPeer(addr("::ffff:192.0.2.7")).allowed); // …now drained
     try testing.expectEqual(@as(usize, 2), cl.unlistedKeyCount()); // .7 and .8, not 4
 
-    // The one consequence operators must know: a v4 customer has to be
-    // spelled in v4 CIDR. `::ffff:0:0/96` — the v6 spelling of the whole v4
-    // space — matches nothing, because peers are unmapped before matching.
-    const v6_spelled = [_]User{.{ .name = "wrong", .prefixes = &.{pfx("::ffff:0:0/96")}, .burst = 2 }};
+    // A v4 customer configured in the v4-mapped v6 spelling is canonicalised
+    // like the peers are (audit 2026-10-19, S8-3): `::ffff:0:0/96` is the
+    // whole v4 space and `::ffff:192.0.2.0/120` is `192.0.2.0/24`.
+    const v6_spelled = [_]User{
+        .{ .name = "wrong", .prefixes = &.{pfx("::ffff:192.0.2.0/120")}, .burst = 2 },
+        .{ .name = "all", .prefixes = &.{pfx("::ffff:0:0/96")}, .burst = 2 },
+    };
     var cl2 = try ConnectionLimiter.init(testing.allocator, .{ .users = &v6_spelled, .clock = tc.clock() });
     defer cl2.deinit();
-    try testing.expectEqual(@as(?usize, null), cl2.userIndex(addr("::ffff:192.0.2.7").unmap()));
+    try testing.expectEqual(@as(?usize, 0), cl2.userIndex(addr("::ffff:192.0.2.7").unmap()));
+    try testing.expectEqual(@as(?usize, 0), cl2.userIndex(addr("192.0.2.7")));
+    try testing.expectEqual(@as(?usize, 1), cl2.userIndex(addr("198.51.100.1")));
+    // A v6 peer outside the mapped range is not pulled in.
+    try testing.expectEqual(@as(?usize, null), cl2.userIndex(addr("2001:db8::1")));
+    // The hook path: a mapped peer spends the user's bucket, not the pool.
+    for (0..2) |_| try testing.expect(cl2.allowPeer(addr("::ffff:192.0.2.7")).allowed);
+    try testing.expect(!cl2.allowPeer(addr("192.0.2.9")).allowed);
+    try testing.expectEqual(@as(usize, 0), cl2.unlistedKeyCount());
 }
 
 test "ConnectionLimiter: concurrent accepts admit exactly the user's burst" {

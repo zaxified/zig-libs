@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-19** — **Fix:** `ConnectionLimiter` matched configured user prefixes literally while peers are `unmap`ped, so a user configured as a v4-mapped v6 prefix (`::ffff:192.0.2.0/120`, `::ffff:0:0/96`) never matched a v4 peer and fell into the unlisted pool under the default limits. Prefixes of /96 or longer in the mapped range are now canonicalised to the v4 prefix they denote (as abuseguard does). Test: `ConnectionLimiter: unmapping never merges two distinct peers` (extended).
+
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC statements that Zig has no io-less blocking mutex / `std.Thread` primitives re-checked against the 0.17.0 std (still true).
 
 - **2026-10-11** — x/time/rate parity: `TokenBucket.allowNAt`/`reserveNAt`/`cancelAt`/`tokensAt`/`advanceAt`, `Reservation`; `Limiter.allowN`/`allowNAt`, `waitN` (sleeps on an `Io`; `WaitError`), `setRate`/`setBurst`/`setConfigAt`, `currentConfig`. `Decision` gains `limit` (the burst it was made against; the middleware's `RateLimit-Limit` now reads it, so a concurrent `setBurst` is not a data race) and `retry_after_ms = maxInt(u64)` for `n > burst`. `TokenBucket.tokens` may be negative while reservations are outstanding; `TokenBucket` gains `last_event_ns` (defaulted). A pending reservation keeps its key from the idle-TTL reset. Anchored on 10 captured x/time/rate operation sequences (`src/xrate_ops_vectors.zig`, driver `tools/xrate/ops.go`). Deliberate differences: a second `cancelAt` is a no-op (x/time/rate v0.15.0 restores again), `waitN` cancelled via `io` keeps the tokens.
