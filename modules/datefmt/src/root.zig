@@ -139,7 +139,11 @@ pub fn epochDayToYmd(epoch_day: i64) DateParts {
     const mp: u64 = (5 * doy + 2) / 153; // [0, 11]
     const d: u32 = @intCast(doy - (153 * mp + 2) / 5 + 1); // [1, 31]
     const m: u32 = if (mp < 10) @intCast(mp + 3) else @intCast(mp - 9); // [1, 12]
-    return .{ .year = @intCast(if (m <= 2) y + 1 else y), .month = m, .day = d };
+    // Saturates at the i32 range instead of trapping (Debug/ReleaseSafe) or
+    // being undefined (ReleaseFast): an `i64` Unix instant reaches years of
+    // ~2.9e11, beyond `DateParts.year`.
+    const year = if (m <= 2) y + 1 else y;
+    return .{ .year = @intCast(std.math.clamp(year, std.math.minInt(i32), std.math.maxInt(i32))), .month = m, .day = d };
 }
 
 /// ISO weekday: Monday=1 … Sunday=7. 1970-01-01 (epoch day 0) was Thursday=4.
@@ -194,7 +198,9 @@ pub fn partsToUnix(p: DateParts) i64 {
 /// Inverse of `partsToUnix`: UTC wall-clock `DateParts` for a Unix instant.
 pub fn unixToParts(unix: i64) DateParts {
     const day = @divFloor(unix, 86400);
-    const rem: u32 = @intCast(unix - day * 86400); // [0, 86399]
+    // `@mod`, not `unix - day * 86400`: that product is below minInt(i64) for
+    // unix == minInt(i64) and overflowed.
+    const rem: u32 = @intCast(@mod(unix, 86400)); // [0, 86399]
     var r = epochDayToYmd(day);
     r.hour = rem / 3600;
     r.minute = (rem % 3600) / 60;
@@ -2888,6 +2894,20 @@ test "new tokens are in the vocabulary (firstInvalidFormatChar) and doc table" {
         }
     }
     try testing.expectEqual(@as(usize, 6), found);
+}
+
+test "unixToParts: any i64 instant saturates the year instead of trapping" {
+    // Audit S7 2026-10-19: maxInt(i64) seconds is year ~2.9e11; the `i32`
+    // cast of the year panicked (Debug/ReleaseSafe) or was UB (ReleaseFast).
+    const hi = unixToParts(std.math.maxInt(i64));
+    try testing.expectEqual(@as(i32, std.math.maxInt(i32)), hi.year);
+    try testing.expect(validate(hi));
+    const lo = unixToParts(std.math.minInt(i64));
+    try testing.expectEqual(@as(i32, std.math.minInt(i32)), lo.year);
+    try testing.expect(validate(lo));
+    // In-range instants are unchanged.
+    try testing.expectEqual(@as(i32, 1970), unixToParts(0).year);
+    try testing.expectEqual(@as(i32, 9999), unixToParts(253402300799).year);
 }
 
 test {

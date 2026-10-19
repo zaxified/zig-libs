@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-19** — **Fix (test only):** pin the per-seed leak check of `runSeedsReporting` (a harness leaking in one seed returns `error.MemoryLeakDetected`; self-test, silent via `deinitLog(report)`). The leak log is no longer printed when `report` is false (S7 audit).
+
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README: `std.testing` survey names re-verified against 0.17.0.
 
 - **2026-10-18** — Ported to Zig 0.17.0. `std.meta.Int` -> `@Int`; `wait4` status is `i32`. `runSeedsReporting` (and the shrinker's seed search) give every seed its own `std.heap.SafeAllocator` over the caller's allocator, deinit at seed end: a leak fails that seed (`FAIL <name> seed=N: memory leak`, `error.MemoryLeakDetected`) and the 0.17 never-reusing `testing.allocator` no longer grows with the seed count.

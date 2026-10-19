@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-19** — **Fix:** `unixToParts` (and so `unixNsToParts`, `toUtc`) no longer traps/UB on extreme `i64` instants: the seconds-of-day product `day * 86400` overflowed for `minInt(i64)`, and the year `@intCast` to `i32` overflowed for any instant beyond ~±6.7e16 s; the year now saturates at the `i32` range. In-range results are unchanged (S7 audit).
+
 - **2026-10-11** — Scope core → parity (chrono 0.4, Go `time`). New: `parseRfc2822`/`bufRfc2822`/
   `formatRfc2822` (RFC 5322 `Date:`: obsolete zones, two/three-digit years per §4.3, CFWS and nested
   comments, weekday checked, trailing text refused); `parseDuration`/`bufDuration`/`formatDuration`

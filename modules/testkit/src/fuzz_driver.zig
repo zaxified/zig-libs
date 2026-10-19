@@ -646,7 +646,7 @@ pub fn runSeedsReporting(comptime harness: anytype, name: []const u8, spec: Spec
             return e;
         };
         leave();
-        if (seed_alloc.deinit() != 0) {
+        if (seed_alloc.deinitLog(report) != 0) {
             if (report) std.debug.print("FAIL {s} seed={d}: memory leak\n", .{ opts.name, seed });
             return error.MemoryLeakDetected;
         }
@@ -792,6 +792,23 @@ test "runSeeds: a failing seed stops the run and its error comes back" {
     defer fail_at = null;
     try testing.expectError(error.HarnessFailed, runSeedsReporting(recorder, "rec", .{ .runs = 10, .first = 2 }, testing.allocator, null, false));
     try testing.expectEqualSlices(u64, &.{ 2, 3, 4 }, seen_seeds.items);
+}
+
+var leak_at: u64 = 0;
+
+/// Leaks one allocation at seed `leak_at` only (the seed is read from the PRNG
+/// the same way `recorder` does it).
+fn leaker(comptime S: type, src: *S, a: std.mem.Allocator) anyerror!void {
+    const first_draw = src.value(u64);
+    var p = std.Random.DefaultPrng.init(leak_at);
+    if (p.random().int(u64) == first_draw) _ = try a.alloc(u8, 16);
+}
+
+test "runSeeds: a leak in one seed fails the run (per-seed SafeAllocator is not a false green)" {
+    leak_at = 3;
+    try testing.expectError(error.MemoryLeakDetected, runSeedsReporting(leaker, "leak", .{ .runs = 6, .first = 0 }, testing.allocator, null, false));
+    // The seed range that does not reach the leaking seed is green.
+    try runSeedsReporting(leaker, "leak", .{ .runs = 3, .first = 0 }, testing.allocator, null, false);
 }
 
 test "runSeeds: reach counters are collected and reset after the report" {
