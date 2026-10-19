@@ -2498,6 +2498,48 @@ test "overflow values: a key too long for an overflow reference is EntryTooLarge
     try db.put("after", "ok"); // the Db is not poisoned by it
 }
 
+test "long keys: a tree of near-page-sized keys splits, reads, deletes and reopens consistently" {
+    // Branch separators are copies of keys, so a branch can hold only one or
+    // two of the longest keys. Every key length from "a few per leaf" up to
+    // the longest that fits inline must still build a readable tree.
+    const lens = [_]usize{ 300, 1000, 2000, 2040, 2047, 2048, 3000, 4000 };
+    for (lens) |want_len| {
+        var klen = want_len;
+        while (!format.fitsInline(klen, 1)) klen -= 1;
+        var sim = kv.SimStorage.init(testing.allocator);
+        defer sim.deinit();
+        sim.allow_overwrite = true;
+        const n: usize = 40;
+        {
+            var db = try Db.open(testing.allocator, sim.storage(), "lk.kvt", .{});
+            defer db.close();
+            var key: [page_size]u8 = @splat('k');
+            // A stride coprime to n scatters the insertion order.
+            for (0..n) |i| {
+                const id = (i * 17) % n;
+                key[0] = @intCast(id);
+                try db.put(key[0..klen], &[_]u8{@intCast(id)});
+            }
+            for (0..n) |id| {
+                key[0] = @intCast(id);
+                try expectGet(&db, key[0..klen], &[_]u8{@intCast(id)});
+            }
+            for (0..n) |id| {
+                if (id % 2 == 0) continue;
+                key[0] = @intCast(id);
+                try db.del(key[0..klen]);
+            }
+        }
+        var db = try Db.open(testing.allocator, sim.storage(), "lk.kvt", .{});
+        defer db.close();
+        var key: [page_size]u8 = @splat('k');
+        for (0..n) |id| {
+            key[0] = @intCast(id);
+            if (id % 2 == 0) try expectGet(&db, key[0..klen], &[_]u8{@intCast(id)}) else try expectGet(&db, key[0..klen], null);
+        }
+    }
+}
+
 test "overflow values: a broken chain is Corrupt on read, and recovery refuses a tree that has one" {
     var sim = kv.SimStorage.init(testing.allocator);
     defer sim.deinit();

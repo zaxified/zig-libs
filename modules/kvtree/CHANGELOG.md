@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-19** — Tests: a tree of near-page-sized keys (300..4000 bytes, down to the longest that fits inline) splits, reads, deletes and reopens consistently (audit 2026-10-19; no defect found, the case was unpinned). No behaviour change.
+
 - **2026-10-18** — Ported to Zig 0.17.0. comptime `strRepeat` helper: larger `@setEvalBranchQuota` (0.17 counts more branches per iteration).
 - **2026-10-11** — Performance **P3 → P2**: ref **0.83–1.02×** bbolt v1.5.0 (scan 1.14× → 1.02–1.04×, gets 0.96–1.00×). No kvtree source change: the remaining cost was the `pagecache` borrow per leaf, made cheaper in `ramcache` (a lookup touches three memory pages instead of five; `release` no longer looks the key up again) and `pagecache` (page arithmetic by shift). Route chosen by the owner over an mmap `Storage`, which would have given up the injectable-storage seam for reads.
 

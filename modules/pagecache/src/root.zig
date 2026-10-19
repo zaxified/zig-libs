@@ -463,8 +463,14 @@ pub const PageCache = struct {
                 self.readahead_inserted += 1;
             }
         }
-        const key = pageKey(fid, index);
-        self.cache.put(&key, buf, 0, 0, 0);
+        // The requested page is guarded like the extras: a write that landed
+        // while the inner `pread` was parked has already put its NEWER bytes,
+        // and `buf` (older) must not replace them. The caller still gets the
+        // bytes media held when it read.
+        if (self.epoch == epoch0) {
+            const key = pageKey(fid, index);
+            self.cache.put(&key, buf, 0, 0, 0);
+        }
         return ps;
     }
 
@@ -2648,6 +2654,37 @@ test "read-ahead: a write landing during the inner read is never overwritten by 
     _ = try st.pread(h, &buf, default_page_size); // read-ahead 1..6, hook writes page 3
     _ = try st.pread(h, &buf, 3 * default_page_size);
     for (buf) |x| try testing.expectEqual(@as(u8, 0xEE), x);
+}
+
+fn writeRequestedPageDuringReadAhead(cs: *CountingStorage) void {
+    // The "second fiber" rewrites page 1, the very page the parked read-ahead
+    // was asked for.
+    var fresh: [default_page_size]u8 = undefined;
+    @memset(&fresh, 0xEE);
+    cs.hook_pc.?.storage().writeAll(0, &fresh, 1 * default_page_size) catch unreachable;
+}
+
+test "read-ahead: a write to the REQUESTED page during the inner read is not overwritten by the older bytes" {
+    const gpa = testing.allocator;
+    var sim = kv.SimStorage.init(gpa);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    var cs = CountingStorage{ .inner = sim.storage() };
+    var pc = PageCache.init(gpa, cs.storage(), .{ .max_pages = 16, .read_ahead_pages = 5 });
+    defer pc.deinit();
+    const st = pc.storage();
+    const h = try st.open("f", .create_truncate);
+    try testing.expectEqual(@as(Storage.Handle, 0), h);
+    try fillFile(gpa, st, h, 8, 1);
+    pc.cache.clear();
+    var buf: [default_page_size]u8 = undefined;
+    _ = try st.pread(h, &buf, 0);
+    cs.hook = writeRequestedPageDuringReadAhead;
+    cs.hook_pc = &pc;
+    _ = try st.pread(h, &buf, default_page_size); // read-ahead of 1..6 parks; the hook rewrites page 1
+    for (buf) |x| try testing.expectEqual(@as(u8, 2), x); // what media held when it read
+    _ = try st.pread(h, &buf, default_page_size);
+    for (buf) |x| try testing.expectEqual(@as(u8, 0xEE), x); // never the older bytes from the cache
 }
 
 test "a write landing during a plain miss's inner read is not overwritten by the older bytes" {

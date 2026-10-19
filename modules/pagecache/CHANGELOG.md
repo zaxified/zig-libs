@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-19** — **Fix:** read-ahead inserted the REQUESTED page unconditionally after its parked inner `pread`, so a write to that very page that landed meanwhile (fiber-reentrant caller) was overwritten in the cache by the older bytes and served as a stale hit. The write-epoch guard now covers the requested page like the prefetched extras (the 2026-09-29 test only wrote an extra page).
+
 - **2026-10-18** — Ported to Zig 0.17.0 (test-only: `std.meta.fields` -> `@typeInfo(..).field_names`).
 
 - **2026-10-11** — Performance: page index and alignment by shift and mask for a power-of-two page size (kvtree's always is) instead of two 64-bit divisions per access; the borrow path also gets the cheaper `ramcache` lookup. kvtree scan through this cache 1.12× → 1.02–1.04× bbolt.
